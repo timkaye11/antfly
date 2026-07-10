@@ -258,14 +258,17 @@ fn getenvBool(comptime name: [*:0]const u8) bool {
 fn getenvFlagValue(comptime name: [*:0]const u8) ?bool {
     if (comptime @import("builtin").os.tag == .freestanding) return null;
     // Per-name cache: several callers sit in the decode inner loop and a raw
-    // getenv is an environ scan per call.
+    // getenv is an environ scan per call. The struct must reference `name` or
+    // Zig deduplicates it across instantiations and every env var shares one
+    // cache (first query wins for all names).
     const S = struct {
+        const env_name = name;
         var cached: ??bool = null;
     };
     if (S.cached) |cached| return cached;
     const c_std = @cImport(@cInclude("stdlib.h"));
     const flag: ?bool = blk: {
-        const value = c_std.getenv(name) orelse break :blk null;
+        const value = c_std.getenv(S.env_name) orelse break :blk null;
         const slice = std.mem.span(value);
         break :blk slice.len != 0 and
             !std.mem.eql(u8, slice, "0") and

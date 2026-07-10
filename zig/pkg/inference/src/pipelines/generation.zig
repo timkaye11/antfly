@@ -555,6 +555,10 @@ fn enableGemma4MtpDebug() bool {
     return gemma4_mtp_debug_override or getenvBool("ANTFLY_GEMMA4_MTP_DEBUG") or getenvBool("TERMITE_DEBUG_GEMMA4_MTP");
 }
 
+fn enableGemma4MtpVerifyTrace() bool {
+    return getenvBool("ANTFLY_GEMMA4_MTP_VERIFY_TRACE");
+}
+
 const Gemma4MtpPositionMode = enum {
     target_absolute,
     target_constant,
@@ -916,7 +920,8 @@ fn gemma4MtpActiveMaterializeEnabled() bool {
 }
 
 fn gemma4MtpAcceptBonusDefault(kind: ops.BackendKind) bool {
-    return kind != .metal;
+    _ = kind;
+    return true;
 }
 
 fn gemma4MtpAcceptBonusEnabled(kind: ops.BackendKind) bool {
@@ -2770,6 +2775,8 @@ pub const NativeGenerationPipeline = struct {
                     else
                         @min(@as(usize, @intCast(config.speculative_k)), remaining);
 
+                    const round_trace = enableGemma4MtpVerifyTrace();
+                    const round_started_at = mtpProfileTimestamp(round_trace, self.io);
                     const result = if (use_gemma4_mtp)
                         try self.speculativeDecodeGemma4Mtp(
                             &draft_pipeline,
@@ -2802,6 +2809,17 @@ pub const NativeGenerationPipeline = struct {
                             if (gbnf_grammar != null) &(gbnf_grammar.?) else null,
                         );
 
+                    if (round_trace) {
+                        std.debug.print(
+                            "mtp-round-trace: round_us={d} drafted={d} accepted={d} bonus={}\n",
+                            .{
+                                @divTrunc(mtpProfileElapsedNs(true, self.io, round_started_at), std.time.ns_per_us),
+                                result.drafted,
+                                result.accepted,
+                                result.had_bonus,
+                            },
+                        );
+                    }
                     speculative_stats.rounds += 1;
                     speculative_stats.drafted_tokens += result.drafted;
                     speculative_stats.matched_draft_tokens += result.matched_drafts;
@@ -5021,6 +5039,9 @@ pub const NativeGenerationPipeline = struct {
         if (input_ids.len != total) return error.InvalidTensorShape;
 
         if (self.cb.kind() == .metal) {
+            const verify_trace = enableGemma4MtpVerifyTrace();
+            const trace_stats_before = if (verify_trace) decoder_gated_runtime.getTimingStats() else undefined;
+            const trace_started_at = mtpProfileTimestamp(verify_trace, self.io);
             if (try decoder_gated_runtime.forwardFinalHiddenRows(
                 &self.cb,
                 allocator,
@@ -5030,6 +5051,25 @@ pub const NativeGenerationPipeline = struct {
                 seq_len,
                 decode_context,
             )) |direct| {
+                if (verify_trace) {
+                    const wall_ns = mtpProfileElapsedNs(true, self.io, trace_started_at);
+                    const after = decoder_gated_runtime.getTimingStats();
+                    std.debug.print(
+                        "mtp-verify-trace: rows={d} wall_us={d} embed_us={d} ple_us={d} frame_begin_us={d} layer_spec_us={d} plan_us={d} execute_us={d} block_us={d} finish_us={d}\n",
+                        .{
+                            direct.rows,
+                            @divTrunc(wall_ns, std.time.ns_per_us),
+                            @as(u64, @intCast(@divTrunc(after.prefill_embed_nanos - trace_stats_before.prefill_embed_nanos, std.time.ns_per_us))),
+                            @as(u64, @intCast(@divTrunc(after.prefill_ple_prepare_nanos - trace_stats_before.prefill_ple_prepare_nanos, std.time.ns_per_us))),
+                            @as(u64, @intCast(@divTrunc(after.prefill_frame_begin_nanos - trace_stats_before.prefill_frame_begin_nanos, std.time.ns_per_us))),
+                            @as(u64, @intCast(@divTrunc(after.prefill_frame_layer_spec_nanos - trace_stats_before.prefill_frame_layer_spec_nanos, std.time.ns_per_us))),
+                            @as(u64, @intCast(@divTrunc(after.prefill_frame_plan_nanos - trace_stats_before.prefill_frame_plan_nanos, std.time.ns_per_us))),
+                            @as(u64, @intCast(@divTrunc(after.prefill_frame_execute_nanos - trace_stats_before.prefill_frame_execute_nanos, std.time.ns_per_us))),
+                            @as(u64, @intCast(@divTrunc(after.prefill_block_nanos - trace_stats_before.prefill_block_nanos, std.time.ns_per_us))),
+                            @as(u64, @intCast(@divTrunc(after.prefill_frame_finish_nanos - trace_stats_before.prefill_frame_finish_nanos, std.time.ns_per_us))),
+                        },
+                    );
+                }
                 return .{
                     .cb = &self.cb,
                     .hidden = direct.final_hidden,
@@ -5870,6 +5910,8 @@ pub const NativeGenerationPipeline = struct {
                 const vocab_size_usize: usize = @intCast(self.gpt_config.vocab_size);
                 const target_lm_rows = if (cached_first_target_choice != null) draft_count else verify_len;
                 const logit_base_row = target_query_len - target_lm_rows;
+                const verify_trace = enableGemma4MtpVerifyTrace();
+                const tail_trace_started_at = mtpProfileTimestamp(verify_trace, self.io);
                 var lm_input = target_hidden.hidden;
                 var lm_input_owned = false;
                 defer if (lm_input_owned) self.cb.free(lm_input);
@@ -5877,27 +5919,58 @@ pub const NativeGenerationPipeline = struct {
                     lm_input = try self.cb.sliceRows2D(self.allocator, target_hidden.hidden, logit_base_row, target_lm_rows, hidden_size);
                     lm_input_owned = true;
                 }
+                const trace_slice_us = if (verify_trace) @divTrunc(mtpProfileElapsedNs(true, self.io, tail_trace_started_at), std.time.ns_per_us) else 0;
 
                 const lm_w = try self.graphWeight("lm_head.weight");
                 defer self.cb.free(lm_w);
+                const trace_lmw_us = if (verify_trace) @divTrunc(mtpProfileElapsedNs(true, self.io, tail_trace_started_at), std.time.ns_per_us) else 0;
                 const suppress_token_ids = self.gpt_config.suppressTokenIds();
-                if (cached_first_target_choice) |cached_choice| {
-                    const target_tail_choices = (try self.cb.linearNoBiasArgmaxRowsSuppress(
+                // Prefer the prepared final-lm-head slot (same quantized weight
+                // the planned decode frames use for their tail) over the dense
+                // lm_head fallback inside the generic linearNoBias path.
+                var prepared_tail_choices: ?[]u32 = if (self.cb.kind() == .metal)
+                    try decoder_gated_runtime.forwardPreparedLmHeadArgmaxRows(
+                        &self.cb,
+                        self.gpt_config,
+                        self.gpt_config.num_hidden_layers,
                         lm_input,
-                        lm_w,
                         target_lm_rows,
-                        hidden_size,
-                        vocab_size_usize,
                         suppress_token_ids,
                         allocator,
-                    )) orelse {
-                        std.log.err(
-                            "gemma4_mtp_target_tail_argmax_unsupported: backend={s} rows={d} hidden={d} vocab={d} suppress={d} weight_tying={}",
-                            .{ @tagName(self.cb.kind()), target_lm_rows, hidden_size, vocab_size_usize, suppress_token_ids.len, self.gpt_config.weight_tying },
-                        );
-                        return error.UnsupportedBackend;
+                    )
+                else
+                    null;
+                defer if (prepared_tail_choices) |choices| allocator.free(choices);
+                if (cached_first_target_choice) |cached_choice| {
+                    const target_tail_choices = blk: {
+                        if (prepared_tail_choices) |choices| {
+                            prepared_tail_choices = null;
+                            break :blk choices;
+                        }
+                        break :blk (try self.cb.linearNoBiasArgmaxRowsSuppress(
+                            lm_input,
+                            lm_w,
+                            target_lm_rows,
+                            hidden_size,
+                            vocab_size_usize,
+                            suppress_token_ids,
+                            allocator,
+                        )) orelse {
+                            std.log.err(
+                                "gemma4_mtp_target_tail_argmax_unsupported: backend={s} rows={d} hidden={d} vocab={d} suppress={d} weight_tying={}",
+                                .{ @tagName(self.cb.kind()), target_lm_rows, hidden_size, vocab_size_usize, suppress_token_ids.len, self.gpt_config.weight_tying },
+                            );
+                            return error.UnsupportedBackend;
+                        };
                     };
                     defer allocator.free(target_tail_choices);
+                    if (verify_trace) {
+                        const argmax_done_us = @divTrunc(mtpProfileElapsedNs(true, self.io, tail_trace_started_at), std.time.ns_per_us);
+                        std.debug.print(
+                            "mtp-verify-tail-trace: rows={d} slice_us={d} lmw_us={d} argmax_done_us={d}\n",
+                            .{ target_lm_rows, trace_slice_us, trace_lmw_us, argmax_done_us },
+                        );
+                    }
                     if (target_tail_choices.len < target_lm_rows) return error.InvalidTensorShape;
                     var combined_choices_buf: [17]u32 = undefined;
                     if (verify_len > combined_choices_buf.len) return error.InvalidSpeculativeK;
@@ -5954,7 +6027,12 @@ pub const NativeGenerationPipeline = struct {
                         }
                     }
                     used_fused_verify = true;
-                } else if (gemma4MtpDedicatedRuntimeEnabled()) {
+                } else if (prepared_tail_choices == null and gemma4MtpDedicatedRuntimeEnabled()) {
+                    // The dedicated-runtime verify commit recomputes lm_head
+                    // logits internally through the dense fallback weight;
+                    // when the prepared-slot argmax already produced the
+                    // choices, the plain accept path below consumes them at a
+                    // fraction of the cost.
                     var eos_token_ids_buf: [1 + gpt_mod.max_extra_eos_token_ids]i32 = [_]i32{-1} ** (1 + gpt_mod.max_extra_eos_token_ids);
                     var eos_token_ids_len: usize = 0;
                     if (!config.ignore_eos and self.gpt_config.eos_token_id >= 0) {
@@ -6042,15 +6120,22 @@ pub const NativeGenerationPipeline = struct {
                     }
                 }
                 if (!used_fused_verify) {
-                    if (try self.cb.linearNoBiasArgmaxRowsSuppress(
-                        lm_input,
-                        lm_w,
-                        verify_len,
-                        hidden_size,
-                        vocab_size_usize,
-                        suppress_token_ids,
-                        allocator,
-                    )) |target_choices| {
+                    const maybe_target_choices: ?[]u32 = blk: {
+                        if (prepared_tail_choices) |choices| {
+                            prepared_tail_choices = null;
+                            break :blk choices;
+                        }
+                        break :blk try self.cb.linearNoBiasArgmaxRowsSuppress(
+                            lm_input,
+                            lm_w,
+                            verify_len,
+                            hidden_size,
+                            vocab_size_usize,
+                            suppress_token_ids,
+                            allocator,
+                        );
+                    };
+                    if (maybe_target_choices) |target_choices| {
                         defer allocator.free(target_choices);
                         verify_result = try self.acceptVerifiedDraftTokenChoicesGreedy(
                             token_ids,
@@ -8983,8 +9068,10 @@ test "speculation calibration parser is explicit" {
     try std.testing.expect(parseSpeculationCalibration("true") == null);
 }
 
-test "Gemma4 MTP bonus default is conservative on Metal" {
-    try std.testing.expectEqual(false, gemma4MtpAcceptBonusDefault(.metal));
+test "Gemma4 MTP bonus default is on for all backends" {
+    // Metal joined the default after the P3 verify-cost work: identity gates
+    // hold with bonus on and the measured k=2+bonus config wins.
+    try std.testing.expectEqual(true, gemma4MtpAcceptBonusDefault(.metal));
     try std.testing.expectEqual(true, gemma4MtpAcceptBonusDefault(.cuda));
     try std.testing.expectEqual(true, gemma4MtpAcceptBonusDefault(.native));
 }

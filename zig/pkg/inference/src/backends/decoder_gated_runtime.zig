@@ -6152,6 +6152,70 @@ pub fn forwardFinalHiddenRows(
     };
 }
 
+/// Multi-row lm_head argmax over the prepared final-lm-head slot. The MTP
+/// verify path lands here with 2-3 rows of final (normed) hidden state; the
+/// prepared slot serves the same quantized weight the planned decode frames
+/// use for their tail, unlike the dense lm_head fallback in the generic
+/// linearNoBias path.
+pub fn forwardPreparedLmHeadArgmaxRows(
+    cb: *const ops.ComputeBackend,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    final_hidden: ops.CT,
+    rows: usize,
+    suppress_token_ids: []const i32,
+    allocator: std.mem.Allocator,
+) !?[]u32 {
+    if (!supportsConfig(gpt_config)) return null;
+    if (rows == 0 or rows > 16) return null;
+    const hidden_size: usize = @intCast(gpt_config.hidden_size);
+    const vocab_size: usize = @intCast(gpt_config.vocab_size);
+    const lm_head_slot = finalLmHeadSlot(configured_layer_count);
+    const trace = getenvBool("ANTFLY_GEMMA4_MTP_VERIFY_TRACE");
+    const trace_started_at = if (trace) monotonicNowNs() else 0;
+    // Dispatch the lm_head one row at a time: the per-row mmv route is what
+    // the planned decode frames use for their tail and stays bandwidth-bound
+    // at this out_dim, while the multi-row small-batch kernel collapses on
+    // vocab-sized outputs.
+    const choices = try allocator.alloc(u32, rows);
+    errdefer allocator.free(choices);
+    for (0..rows) |row| {
+        const row_input = try cb.sliceRows2D(allocator, final_hidden, row, 1, hidden_size);
+        defer cb.free(row_input);
+        const row_logits = (try cb.decoderRuntimeApplyLinear(&.{
+            .slot = lm_head_slot,
+            .input = row_input,
+            .in_dim = hidden_size,
+            .out_dim = vocab_size,
+        })) orelse {
+            allocator.free(choices);
+            return null;
+        };
+        defer cb.free(row_logits);
+        const row_choices = (try cb.argmaxRowsSuppress(row_logits, 0, 1, vocab_size, suppress_token_ids, allocator)) orelse {
+            allocator.free(choices);
+            return null;
+        };
+        defer allocator.free(row_choices);
+        if (row_choices.len == 0) {
+            allocator.free(choices);
+            return null;
+        }
+        choices[row] = row_choices[0];
+    }
+    if (trace) {
+        std.debug.print(
+            "prepared-lmhead-argmax-trace: rows={d} suppress={d} total_us={d}\n",
+            .{
+                rows,
+                suppress_token_ids.len,
+                (monotonicNowNs() - trace_started_at) / std.time.ns_per_us,
+            },
+        );
+    }
+    return choices;
+}
+
 pub fn forwardPrefillLastLogits(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,

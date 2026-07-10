@@ -86,14 +86,17 @@ test "metal_compute paged slot attention accepts kernel supported kv formats" {
 fn getenvBool(comptime name: [*:0]const u8) bool {
     if (comptime @import("builtin").os.tag == .freestanding) return false;
     // Per-name cache: several callers sit in the decode inner loop and a raw
-    // getenv is an environ scan per call.
+    // getenv is an environ scan per call. The struct must reference `name` or
+    // Zig deduplicates it across instantiations and every env var shares one
+    // cache (first query wins for all names).
     const S = struct {
+        const env_name = name;
         var cached: ?bool = null;
     };
     if (S.cached) |cached| return cached;
     const c = @cImport(@cInclude("stdlib.h"));
     const enabled = blk: {
-        const value = c.getenv(name) orelse break :blk false;
+        const value = c.getenv(S.env_name) orelse break :blk false;
         const slice = std.mem.span(value);
         break :blk std.mem.eql(u8, slice, "1") or
             std.ascii.eqlIgnoreCase(slice, "true") or
@@ -124,6 +127,10 @@ fn metalPrefillTraceRequested() bool {
 fn traceMetalPrefillFramePlan(comptime fmt: []const u8, args: anytype) void {
     if (!metalPrefillTraceRequested()) return;
     std.debug.print("prefill-trace: metal-prefill-frame-plan " ++ fmt ++ "\n", args);
+}
+
+fn mtpVerifyTraceRequested() bool {
+    return getenvBool("ANTFLY_GEMMA4_MTP_VERIFY_TRACE");
 }
 
 fn traceGatedDeviceRequested() bool {
@@ -7538,6 +7545,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     .in_dim = in_dim,
                     .out_dim = out_dim,
                 })) |tensor| {
+                    if (mtpVerifyTraceRequested()) std.debug.print(
+                        "linear-nobias-route: dense_slot rows={d} out={d} slot={d}\n",
+                        .{ rows, out_dim, slot },
+                    );
                     return tensor;
                 }
             }
@@ -7553,11 +7564,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         .in_dim = in_dim,
                         .out_dim = out_dim,
                     })) |tensor| {
+                        if (mtpVerifyTraceRequested()) std.debug.print(
+                            "linear-nobias-route: dynamic_slot rows={d} out={d}\n",
+                            .{ rows, out_dim },
+                        );
                         return tensor;
                     }
                 }
             }
         }
+        if (mtpVerifyTraceRequested()) std.debug.print(
+            "linear-nobias-route: host_fallback rows={d} out={d} device_input={} quant_weight={}\n",
+            .{ rows, out_dim, input_buf.metal_tensor != null, (toBuf(weight).quantized_storage orelse toBuf(weight).runtime_quantized_storage) != null },
+        );
         const input_data = try hostSliceForBuf(input_buf);
         if (input_data.len != rows * in_dim) return error.InvalidTensorShape;
 
@@ -18972,9 +18991,58 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         allocator: std.mem.Allocator,
     ) anyerror!?[]u32 {
         if (rows == 0 or in_dim == 0 or out_dim == 0) return error.InvalidTensorShape;
+        const trace = mtpVerifyTraceRequested();
+        const trace_started_at = if (trace) monotonicNowNs() else 0;
+        // Vocab-sized outputs at small row counts: the multi-row small-batch
+        // matmul kernels collapse at this out_dim (tens of ms), while the
+        // per-row mmv route stays bandwidth-bound. Split into per-row
+        // linear+argmax dispatches instead of one multi-row linear.
+        if (rows >= 2 and rows <= 8 and out_dim >= 32768) per_row: {
+            const choices = try allocator.alloc(u32, rows);
+            errdefer allocator.free(choices);
+            for (0..rows) |row| {
+                const row_input = sliceRows2DOp(ctx, input, row, 1, in_dim) catch {
+                    allocator.free(choices);
+                    break :per_row;
+                };
+                defer freeOp(ctx, row_input);
+                const row_logits = try linearNoBiasOp(ctx, row_input, weight, 1, in_dim, out_dim);
+                defer freeOp(ctx, row_logits);
+                const row_choices = (try argmaxRowsSuppressOp(ctx, row_logits, 0, 1, out_dim, suppress_token_ids, allocator)) orelse {
+                    allocator.free(choices);
+                    break :per_row;
+                };
+                defer allocator.free(row_choices);
+                if (row_choices.len == 0) {
+                    allocator.free(choices);
+                    break :per_row;
+                }
+                choices[row] = row_choices[0];
+            }
+            if (trace) {
+                std.debug.print(
+                    "mtp-verify-argmax-trace: rows={d} per_row_us={d}\n",
+                    .{ rows, @as(u64, @intCast((monotonicNowNs() - trace_started_at) / std.time.ns_per_us)) },
+                );
+            }
+            return choices;
+        }
         const logits = try linearNoBiasOp(ctx, input, weight, rows, in_dim, out_dim);
+        const trace_linear_done_at = if (trace) monotonicNowNs() else 0;
         defer freeOp(ctx, logits);
-        return argmaxRowsSuppressOp(ctx, logits, 0, rows, out_dim, suppress_token_ids, allocator);
+        const choices = try argmaxRowsSuppressOp(ctx, logits, 0, rows, out_dim, suppress_token_ids, allocator);
+        if (trace) {
+            const trace_argmax_done_at = monotonicNowNs();
+            std.debug.print(
+                "mtp-verify-argmax-trace: rows={d} linear_us={d} argmax_us={d}\n",
+                .{
+                    rows,
+                    @as(u64, @intCast((trace_linear_done_at - trace_started_at) / std.time.ns_per_us)),
+                    @as(u64, @intCast((trace_argmax_done_at - trace_linear_done_at) / std.time.ns_per_us)),
+                },
+            );
+        }
+        return choices;
     }
 
     fn gemma4MtpTokenIsEos(token: usize, eos_token_ids: []const i32) bool {
