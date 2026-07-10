@@ -25089,6 +25089,61 @@ int termite_metal_decode_runtime_apply_linear_argmax_device(
     }
 }
 
+// Frame-tail variant: encode the lm-head linear + argmax (into the runtime's
+// token buffer) as the LAST work of the caller's ACTIVE frame, without
+// submitting. The caller submits+waits the frame through its normal path
+// (which also flushes pending prefill KV device seeds and keeps the frame
+// timing stats honest) and then reads the token from the token buffer. Saves
+// the second command-buffer round-trip the plain device variant pays when the
+// linear's input was produced by a still-active frame (the MTP draft step:
+// forward frame wait + argmax wait become ONE wait).
+int termite_metal_decode_runtime_apply_linear_argmax_device_frame_encode(
+    termite_metal_decode_runtime *runtime,
+    size_t slot,
+    void *input_handle,
+    size_t input_offset,
+    size_t in_dim,
+    size_t out_dim
+) {
+    if (runtime == NULL || input_handle == NULL) return -1;
+    if (runtime->linear_pipeline == nil || runtime->linear_reduce_pipeline == nil || runtime->linear_bf16_pipeline == nil || runtime->linear_bf16_reduce_pipeline == nil || runtime->argmax_logits_pipeline == nil) return -2;
+    if (slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || in_dim == 0 || out_dim == 0) return -3;
+    if (runtime->linear_slot_prepared[slot] == 0) return -4;
+    if (runtime->linear_in_dims[slot] != in_dim || runtime->linear_out_dims[slot] != out_dim) return -5;
+    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX) return -6;
+    if (runtime->active_frame_cb == nil) return -9;
+    // A persistent planned encoder would be corrupted by opening a second
+    // encoder on the same command buffer; only the encoder-per-op active
+    // frame mode is supported.
+    if (runtime->active_planned_compute_encoder != nil) return -9;
+    @autoreleasepool {
+        id<MTLBuffer> input_buffer = (__bridge id<MTLBuffer>)input_handle;
+        const size_t input_bytes = in_dim * sizeof(float);
+        const size_t logits_bytes = out_dim * sizeof(float);
+        if (input_offset + input_bytes > input_buffer.length) return -7;
+        if (termite_metal_decode_runtime_ensure_sample_logits_buffer(runtime, logits_bytes) != 0) return -8;
+        if (runtime->token_capacity < sizeof(uint32_t) || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
+            id<MTLBuffer> token = [runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+            if (token == nil) return -10;
+            runtime->token_buffer = token;
+            runtime->token_capacity = sizeof(uint32_t);
+        }
+        id<MTLCommandBuffer> command_buffer = runtime->active_frame_cb;
+        id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_TAIL);
+        if (encoder == nil) return -11;
+        const int linear_rc = termite_metal_encode_dense_linear_on_encoder(runtime, encoder, slot, input_buffer, input_offset, in_dim, out_dim, runtime->sample_logits_buffer, 0, -11);
+        if (linear_rc != 0) {
+            [encoder endEncoding];
+            return linear_rc;
+        }
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        const int argmax_rc = termite_metal_encode_argmax_logits_on_encoder(runtime, encoder, runtime->sample_logits_buffer, 0, out_dim, -11);
+        [encoder endEncoding];
+        if (argmax_rc != 0) return argmax_rc;
+        return 0;
+    }
+}
+
 int termite_metal_decode_runtime_argmax_from_logits_device(
     termite_metal_decode_runtime *runtime,
     void *logits_handle,
@@ -36144,8 +36199,14 @@ int termite_metal_decode_runtime_attention_span_device(
     }
 }
 
-static int termite_metal_decode_runtime_encode_paged_attention_slot(
+// `runtime` owns the attention span slot (buffers, pipelines); `frame_runtime`
+// owns the command buffer being encoded to (frame resource retention, planned
+// encoder reuse, hazard ranges). They are the same runtime everywhere except
+// the donated-KV on-frame path, where a draft frame consumes the KV owner's
+// slot without a cross-runtime flush.
+static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
     termite_metal_decode_runtime *runtime,
+    termite_metal_decode_runtime *frame_runtime,
     id<MTLCommandBuffer> command_buffer,
     size_t slot,
     uint32_t format,
@@ -36170,7 +36231,7 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot(
     id<MTLBuffer> output_buffer,
     size_t output_offset
 ) {
-    if (runtime == NULL || command_buffer == nil || q_buffer == nil || block_table == NULL || output_buffer == nil) return -1;
+    if (runtime == NULL || frame_runtime == NULL || command_buffer == nil || q_buffer == nil || block_table == NULL || output_buffer == nil) return -1;
     if (slot >= TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY) return -2;
     if (q_len == 0 || kv_tokens == 0 || num_heads == 0 || num_kv_heads == 0 || head_dim == 0 || page_size == 0 || block_count == 0) return -3;
     if (num_heads % num_kv_heads != 0) return -4;
@@ -36245,13 +36306,13 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot(
         ? [runtime->device newBufferWithBytes:sinks length:num_heads * sizeof(float) options:MTLResourceStorageModeShared]
         : [runtime->device newBufferWithBytes:&zero_sink length:sizeof(zero_sink) options:MTLResourceStorageModeShared];
     if (params_buffer == nil || block_table_buffer == nil || sinks_buffer == nil) return -14;
-    if (runtime->active_frame_cb != nil) {
-        if (termite_metal_decode_runtime_retain_frame_resource(runtime, params_buffer) != 0) return -14;
-        if (termite_metal_decode_runtime_retain_frame_resource(runtime, block_table_buffer) != 0) return -14;
-        if (termite_metal_decode_runtime_retain_frame_resource(runtime, sinks_buffer) != 0) return -14;
+    if (frame_runtime->active_frame_cb != nil) {
+        if (termite_metal_decode_runtime_retain_frame_resource(frame_runtime, params_buffer) != 0) return -14;
+        if (termite_metal_decode_runtime_retain_frame_resource(frame_runtime, block_table_buffer) != 0) return -14;
+        if (termite_metal_decode_runtime_retain_frame_resource(frame_runtime, sinks_buffer) != 0) return -14;
     }
 
-    id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
+    id<MTLComputeCommandEncoder> encoder = frame_runtime->active_planned_compute_encoder;
     const BOOL planned_encoder = (encoder != nil);
     if (!planned_encoder) {
         encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION);
@@ -36268,7 +36329,7 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot(
         termite_metal_planned_range_make(runtime->attention_span_encoded_key_buffers[slot], 0, runtime->attention_span_encoded_key_buffers[slot].length, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -15) != 0 ||
         termite_metal_planned_range_make(runtime->attention_span_v_buffers[slot], 0, runtime->attention_span_v_buffers[slot].length, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[2], -15) != 0 ||
         termite_metal_planned_range_make(output_buffer, output_offset, q_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[3], -15) != 0 ||
-        termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 4, -15) != 0)
+        termite_metal_decode_runtime_prepare_planned_compute_accesses(frame_runtime, accesses, 4, -15) != 0)
     {
         return -15;
     }
@@ -36356,7 +36417,8 @@ int termite_metal_decode_runtime_attention_paged_slot_device(
         const bool frame_active = runtime->active_frame_cb != nil;
         id<MTLCommandBuffer> command_buffer = frame_active ? runtime->active_frame_cb : termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -3;
-        const int rc = termite_metal_decode_runtime_encode_paged_attention_slot(
+        const int rc = termite_metal_decode_runtime_encode_paged_attention_slot_ex(
+            runtime,
             runtime,
             command_buffer,
             slot,
@@ -36387,6 +36449,82 @@ int termite_metal_decode_runtime_attention_paged_slot_device(
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
         return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -4;
+    }
+}
+
+// Donated-KV attention without a cross-runtime flush: encode the KV owner's
+// (`kv_runtime`) span-slot attention directly onto `frame_runtime`'s active
+// frame command buffer. Q ordering is covered by same-command-buffer encoder
+// order, and the output completes with the frame's own submit+wait, so neither
+// runtime needs a drain. Requires the KV owner to be quiescent (no active or
+// submitted frame that could still be writing the slot) — the MTP round shape
+// guarantees this: verify submit+waits before the next draft step runs.
+int termite_metal_decode_runtime_attention_paged_slot_device_on_frame(
+    termite_metal_decode_runtime *kv_runtime,
+    termite_metal_decode_runtime *frame_runtime,
+    size_t slot,
+    uint32_t format,
+    void *q_handle,
+    size_t q_offset,
+    const uint32_t *block_table,
+    size_t block_count,
+    size_t page_size,
+    size_t q_len,
+    size_t kv_tokens,
+    size_t num_heads,
+    size_t num_kv_heads,
+    size_t head_dim,
+    size_t key_row_bytes,
+    size_t base_key_row_bytes,
+    size_t query_position_offset,
+    size_t kv_position_offset,
+    size_t sliding_window,
+    float softcap,
+    const float *sinks,
+    size_t sink_count,
+    void *output_handle,
+    size_t output_offset
+) {
+    if (kv_runtime == NULL || frame_runtime == NULL || q_handle == NULL || output_handle == NULL) return -1;
+    if (kv_runtime == frame_runtime) return -2;
+    if (kv_runtime->device != frame_runtime->device) return -3;
+    if (frame_runtime->active_frame_cb == nil) return -4;
+    // A persistent planned encoder would be corrupted by opening a second
+    // encoder on the same command buffer (the P0.5 crash class); this path
+    // only supports the active-frame encoder-per-op mode.
+    if (frame_runtime->active_planned_compute_encoder != nil) return -5;
+    if (kv_runtime->active_frame_cb != nil || kv_runtime->submitted_frame_cb != nil) return -6;
+    @autoreleasepool {
+        id<MTLBuffer> q_buffer = (__bridge id<MTLBuffer>)q_handle;
+        id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
+        if (q_buffer == nil || output_buffer == nil) return -7;
+        return termite_metal_decode_runtime_encode_paged_attention_slot_ex(
+            kv_runtime,
+            frame_runtime,
+            frame_runtime->active_frame_cb,
+            slot,
+            format,
+            q_buffer,
+            q_offset,
+            block_table,
+            block_count,
+            page_size,
+            q_len,
+            kv_tokens,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            key_row_bytes,
+            base_key_row_bytes,
+            query_position_offset,
+            kv_position_offset,
+            sliding_window,
+            softcap,
+            sinks,
+            sink_count,
+            output_buffer,
+            output_offset
+        );
     }
 }
 
@@ -39263,7 +39401,8 @@ int termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_devic
                 }
             }
             if (rc == 0) {
-                rc = termite_metal_decode_runtime_encode_paged_attention_slot(
+                rc = termite_metal_decode_runtime_encode_paged_attention_slot_ex(
+                    runtime,
                     runtime,
                     command_buffer,
                     paged_slot,

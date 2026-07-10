@@ -1,5 +1,28 @@
 # Spec-decode P4 Hand-off: draft-step + cross-runtime overhead (the post-fold levers)
 
+## OUTCOME (2026-07-10) — DONE. Spec k1+bonus+fold reaches plain parity; the handoff's cost model was largely stale, the real levers were found by `sample`-profiling.
+
+**Results (M4, cooled, interleaved A/B, 128 tok, oracle prompt, all six arms token-IDENTICAL):**
+plain 24.9/27.1 tok/s; spec k1+bonus+fold 25.6/27.2 tok/s (**~1.0× plain — was 0.75-0.80× at session start**, 20.3 vs 25.3). Draft 11.9 → **5.0-6.4 ms/step** (assistant 7.1 → **0.45ms**); the one-time MTP seed forward (~0.85s at a 21-token prompt) is GONE. Acceptance 488‰ unchanged in every arm. Gates: POLICY_ONLY exit 0, defer-materialize gates exit 0, suite green.
+
+**What the profiling actually showed (handoff model corrections):**
+- The "~2×{2,512} donated-KV backend-cache host clones per step" (lever 1) were STALE — those fire only in the warm-up round. The real draft-step cost: **the donated-KV attention fell off the paged-slot path entirely** — per step it gathered the full donor KV via `MetalKvStorage.gatherLayerKv` (2 private-buffer downloads), flushed the whole 16-op draft frame just to read Q on the host, and ran the host-shim attention on its own command buffer (~5 syncs + a CPU/host cascade that also pushed one rms_norm per layer onto the host path). The `metal_compute.zig` donated branch at the OLD no-frame site was never hit; the active-frame branch (`gqaPagedAttentionOp` skip_kv_write leg) was.
+- The draft was already ONE frame per step (the earlier "5 frames/step" reading was five draft STEPS); the serializer was the attention fallback above plus the separate argmax round-trip.
+- **Lever 4's "unattributed bucket" was mostly the MTP seed re-forward**: Metal never captured the prefill's last hidden (`prefill_last_hidden` was CUDA-gated), so `replaceGemma4MtpActivationFromPrompt` re-ran the whole prompt through the generic per-op forward (~0.85s at 21 tokens, scaling with prompt length) between prefill and round 1 — invisible in per-round profiling.
+
+**What landed:**
+1. **Donated slot attention on the draft frame** (the big one): `termite_metal_decode_runtime_encode_paged_attention_slot_ex` splits slot-owner vs frame-owner runtimes; new `..._attention_paged_slot_device_on_frame` encodes the KV owner's span-slot attention directly onto the draft's active frame (guards: same device, KV owner quiescent, no planned encoder); wired into BOTH donated read sites in `gqaPagedAttentionOp` (the active-frame skip_kv_write leg is the one the draft hits). No draft-frame flush, no KV gather, no host attention. Kill switch `TERMITE_METAL_DISABLE_DONATED_SLOT_ATTENTION_ON_FRAME`. Draft assistant 7.1 → 0.45 ms/step.
+2. **Metal prefill prepared-tail greedy + hidden capture** (`tryMetalPreparedTailPrefillGreedy`): when MTP seeding is wanted (pure-greedy, no grammar), the last prefill chunk runs `forwardPrefillLastPreparedTail(prefer_greedy_token=true)` and captures the last hidden row POST-final-norm (matching what verify harvests — note the CUDA capture path hands the MTP a PRE-norm row, a likely latent CUDA inconsistency, left untouched). Kills the seed re-forward. Kill switch `ANTFLY_GEMMA4_MTP_DISABLE_METAL_PREFILL_HIDDEN_CAPTURE`.
+3. **Draft argmax frame-tail encode** (`..._apply_linear_argmax_device_frame_encode` + reordered submit in `draftTokenDevice`): folds the lm-head+argmax into the draft frame for one submit+wait per step. Measured NEUTRAL-to-slightly-negative vs flush+own-cb on M4 (both iterations), so **default OFF** — opt-in `TERMITE_METAL_ENABLE_LINEAR_ARGMAX_FRAME_FINAL`. The reorder itself stays (fallbacks self-flush; `argmaxLastRowOp` gained an active-frame drain guard against stale reads).
+
+**Traps for the next session:** `decode_tok_per_s` swings ±35% with thermals on this M4 — trust only interleaved A/B on a cooled machine (the plan already says this; it bit twice this session). `sample`-profile against symbol addresses (atos with the vmmap slide) beats every counter/trace in this codebase for attribution; the frame-trace counters remain partly cosmetic.
+
+**Next levers (measured, in order):** (a) verify tail lm_head apply runs on its OWN command buffer + wait (~407/3071 samples ≈ 13% of decode wall inside verify_ns 49-51ms) — encode it (and the batched argmax) onto/after the verify frame before its single wait; (b) fold acceptance (488‰ with fold vs ~570-640‰ without — P2 Option-B staleness) is now the dominant spec-side loss; (c) k/policy retune + auto defaults (P5) from this new cost basis; (d) draft argmax kernel itself (~2-3.5ms; 268MB f32 dense lm_head read — f16/quantized draft head would halve it, acceptance risk unmeasured).
+
+---
+
+## Original handoff (pre-session; cost model now stale — see OUTCOME)
+
 Workdir `zig/pkg/inference/`, branch `codex/quant-kernel-metal-compiler`.
 **Prerequisite: P2 (fold) has landed** — see `SPEC_DECODE_P2_FOLD_MATERIALIZE_HANDOFF.md`. Re-baseline before starting; numbers below are post-P1 (pre-P2). Memory of record: `~/.claude/.../memory/project_gemma4_spec_decode_fix.md`.
 

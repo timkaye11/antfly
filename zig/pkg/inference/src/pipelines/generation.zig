@@ -3166,6 +3166,60 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
+    /// Metal analog of the CUDA prepared-tail prefill: the planned prefill
+    /// frame plus a prepared-slot greedy tail, capturing the last POST-final-
+    /// norm hidden row for Gemma4 MTP seeding. Without this the MTP seed path
+    /// re-runs the whole prompt through the generic per-op forward (a second
+    /// prompt-length forward that scales with prompt size). Returns null on
+    /// any miss so the caller falls back to the plain logits prefill.
+    fn tryMetalPreparedTailPrefillGreedy(
+        self: *NativeGenerationPipeline,
+        input_ids: []const i64,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        capture_last_hidden: bool,
+    ) !?PrefillOutput {
+        if (self.cb.kind() != .metal) return null;
+        if (platform.env.getenvBool("ANTFLY_GEMMA4_MTP_DISABLE_METAL_PREFILL_HIDDEN_CAPTURE")) return null;
+        if (decode_context.attention_mode != .paged_prefill or decode_context.query_sequence_len != input_ids.len) return null;
+
+        const tail = (try decoder_gated_runtime.forwardPrefillLastPreparedTail(
+            &self.cb,
+            self.allocator,
+            self.gpt_config,
+            self.gpt_config.num_hidden_layers,
+            input_ids,
+            seq_len,
+            decode_context,
+            true,
+        )) orelse return null;
+        defer self.cb.free(tail.final_hidden);
+
+        const greedy_token = tail.greedy_token_id orelse return null;
+
+        var last_hidden: ?ops.CT = null;
+        if (capture_last_hidden) {
+            // MTP `.final` activations are POST-final-norm rows (what the
+            // verify path harvests via forwardFinalHiddenRows); the prepared
+            // tail hands back the pre-norm hidden.
+            last_hidden = (try self.cb.decoderRuntimeApplyRmsNorm(&.{
+                .slot = tail.final_norm_slot,
+                .input = tail.final_hidden,
+                .hidden_size = self.gpt_config.hidden_size,
+                .eps = self.gpt_config.norm_eps,
+            })) orelse return null;
+        }
+        debugGenerationStage(
+            "executePrefill metal_prepared_tail_greedy token={d} capture_hidden={}",
+            .{ greedy_token, capture_last_hidden },
+        );
+        return .{
+            .greedy_token = @intCast(greedy_token),
+            .last_hidden = last_hidden,
+            .last_hidden_rows = if (last_hidden != null) 1 else 0,
+        };
+    }
+
     /// Run the prefill phase: process prompt tokens through the model,
     /// either chunked (for paged KV) or in one pass. Returns the logits
     /// for the last prompt position, or null if handled by the scheduler.
@@ -3191,6 +3245,14 @@ pub const NativeGenerationPipeline = struct {
             self.gpt_config.suppressTokenIds().len > 0,
             enableCudaPrefillGreedyToken(),
         );
+        // Metal: only when the caller wants the MTP prefill-hidden capture —
+        // plain Metal decode keeps the logits prefill path untouched.
+        const use_metal_prefill_greedy_token = self.cb.kind() == .metal and
+            capture_last_hidden and
+            allow_resident_greedy_token and
+            isPureGreedyConfig(config) and
+            config.grammar == null;
+        const use_prefill_greedy_token = use_cuda_prefill_greedy_token or use_metal_prefill_greedy_token;
         debugGenerationStage(
             "executePrefill enter seq_len={d} paged={} scheduler={} compiled_whole_model={} prefill_greedy={}",
             .{
@@ -3293,7 +3355,7 @@ pub const NativeGenerationPipeline = struct {
                 if (self.scheduler) |scheduler| {
                     if (self.scheduler_lease) |lease| {
                         if (self.io) |io| {
-                            if (!(chunk_end == seq_len and use_cuda_prefill_greedy_token)) {
+                            if (!(chunk_end == seq_len and use_prefill_greedy_token)) {
                                 prefill_last_logits = self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, chunk, chunk_end, chunk.len, chunk_end == seq_len) catch |err| {
                                     if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
                                         current_chunk_size = @max(chunk_size / 2, 1);
@@ -3316,7 +3378,15 @@ pub const NativeGenerationPipeline = struct {
                 }
                 try decode_runtime.appendPrefillChunk(chunk.len);
                 const decode_context = decode_runtime.makeDecodeContext(chunk_end, chunk.len);
-                if (chunk_end == seq_len and use_cuda_prefill_greedy_token) {
+                const metal_prepared: ?PrefillOutput = if (chunk_end == seq_len and use_metal_prefill_greedy_token)
+                    try self.tryMetalPreparedTailPrefillGreedy(chunk, chunk_end, &decode_context, capture_last_hidden)
+                else
+                    null;
+                if (metal_prepared) |prepared| {
+                    prefill_greedy_token = prepared.greedy_token;
+                    prefill_last_hidden = prepared.last_hidden;
+                    prefill_last_hidden_rows = prepared.last_hidden_rows;
+                } else if (chunk_end == seq_len and use_cuda_prefill_greedy_token) {
                     if (try self.tryCudaPreparedTailPrefillGreedy(chunk, chunk_end, &decode_context, capture_last_hidden)) |prepared| {
                         prefill_greedy_token = prepared.greedy_token;
                         prefill_last_hidden = prepared.last_hidden;

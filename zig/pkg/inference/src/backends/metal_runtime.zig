@@ -2049,6 +2049,10 @@ pub fn decoderRuntimeApplyAttentionF32(self: anytype, request: anytype) !?MetalT
             output.deviceByteOffset(),
         );
         if (device_rc == 0) return output;
+        if (traceQuantBlockRequested()) std.debug.print(
+            "metal-runtime-attention-f32-device-null rc={d} q_len={d} kv_len={d} heads={d} kv_heads={d} head_dim={d}\n",
+            .{ device_rc, request.q_len, request.kv_len, request.num_heads, request.num_kv_heads, request.head_dim },
+        );
         output.deinit();
     }
 
@@ -2200,6 +2204,76 @@ pub fn decoderRuntimeApplyPagedKvAttentionSlotOnRuntime(runtime: *RawMetalDecode
         }
     }
 
+    return output;
+}
+
+/// Donated-KV attention encoded onto the CALLER's active frame (e.g. the MTP
+/// draft attending target KV): no draft-frame flush, no KV-owner drain — Q
+/// ordering and output completeness ride the frame's own submit+wait. Returns
+/// null when the safety preconditions do not hold (caller falls back to the
+/// flush + on-KV-owner-runtime path).
+pub fn decoderRuntimeApplyPagedKvAttentionSlotOnFrame(
+    kv_runtime: *RawMetalDecodeRuntime,
+    frame_provider: anytype,
+    request: anytype,
+) !?MetalTensor {
+    const frame_runtime = frame_provider.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(frame_runtime) == 0) return null;
+    if (termite_metal_decode_runtime_ready(kv_runtime) == 0) return null;
+    if (termite_metal_decode_runtime_has_active_frame(frame_runtime) == 0) return null;
+    if (!request.q.isDevice()) return null;
+    if (request.q.ndim() != 2) return null;
+    if (request.kv_tokens == 0 or request.num_heads == 0 or request.num_kv_heads == 0 or request.head_dim == 0) return null;
+    if (request.num_heads % request.num_kv_heads != 0) return null;
+
+    const q_rows: usize = @intCast(request.q.dim(0));
+    const attention_input_size = request.num_heads * request.head_dim;
+    if (q_rows == 0 or @as(usize, @intCast(request.q.dim(1))) != attention_input_size) return null;
+    if (request.page_size == 0 or request.block_token_offsets.len == 0) return null;
+
+    const attention_shape = [_]i32{ @intCast(q_rows), @intCast(attention_input_size) };
+    var output = try MetalTensor.deviceAllocate(
+        @ptrCast(frame_runtime),
+        q_rows * attention_input_size * @sizeOf(f32),
+        .private,
+        &attention_shape,
+    );
+    errdefer output.deinit();
+
+    const rc = termite_metal_decode_runtime_attention_paged_slot_device_on_frame(
+        kv_runtime,
+        frame_runtime,
+        request.slot,
+        request.format,
+        request.q.deviceHandle(),
+        request.q.deviceByteOffset(),
+        request.block_token_offsets.ptr,
+        request.block_token_offsets.len,
+        request.page_size,
+        q_rows,
+        request.kv_tokens,
+        request.num_heads,
+        request.num_kv_heads,
+        request.head_dim,
+        request.key_row_bytes,
+        request.base_key_row_bytes,
+        request.query_position_offset,
+        request.kv_position_offset,
+        request.sliding_window,
+        0.0,
+        null,
+        0,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc != 0) {
+        if (traceQuantBlockRequested()) std.debug.print(
+            "metal-runtime-paged-attention-slot-on-frame-null rc={d} slot={d} q_rows={d} kv_tokens={d}\n",
+            .{ rc, request.slot, q_rows, request.kv_tokens },
+        );
+        output.deinit();
+        return null;
+    }
     return output;
 }
 
@@ -3619,6 +3693,37 @@ pub fn decoderRuntimeApplyLinearArgmax(self: anytype, request: anytype) !?usize 
     );
     if (rc != 0) return null;
     return token_id;
+}
+
+/// Frame-tail linear+argmax encode: appends the lm-head linear + argmax (into
+/// the runtime's token buffer) to the runtime's ACTIVE frame without
+/// submitting. Returns true when encoded — the caller must then submit+wait
+/// the frame through its normal path and read the token from the token
+/// buffer. Returns false without touching the frame when preconditions fail.
+pub fn decoderRuntimeApplyLinearArgmaxFrameEncode(self: anytype, request: anytype) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (termite_metal_decode_runtime_has_active_frame(runtime) == 0) return false;
+    if (request.in_dim == 0 or request.out_dim == 0) return false;
+    if (request.slot >= decoder_runtime_linear_slot_capacity) return false;
+    if (!self.raw_linear_slots_prepared[request.slot]) return false;
+    if (self.raw_linear_slot_kinds[request.slot] != .dense) return false;
+    if (self.raw_linear_slot_in_dims[request.slot] != request.in_dim) return false;
+    if (self.raw_linear_slot_out_dims[request.slot] != request.out_dim) return false;
+    if (request.input.ndim() != 2) return false;
+    if (@as(usize, @intCast(request.input.dim(0))) != 1) return false;
+    if (@as(usize, @intCast(request.input.dim(1))) != request.in_dim) return false;
+    if (!request.input.isDevice()) return false;
+
+    const rc = termite_metal_decode_runtime_apply_linear_argmax_device_frame_encode(
+        runtime,
+        request.slot,
+        request.input.deviceHandle(),
+        request.input.deviceByteOffset(),
+        request.in_dim,
+        request.out_dim,
+    );
+    return rc == 0;
 }
 
 pub fn decoderRuntimeApplyRmsNormLinearSample(self: anytype, request: anytype) !?usize {
@@ -8300,6 +8405,14 @@ pub extern fn termite_metal_decode_runtime_apply_linear_argmax_device(
     out_dim: usize,
     output_token_id: [*c]u32,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_apply_linear_argmax_device_frame_encode(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    in_dim: usize,
+    out_dim: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_argmax_from_logits_device(
     runtime: ?*RawMetalDecodeRuntime,
     logits_handle: ?*anyopaque,
@@ -9284,6 +9397,32 @@ pub extern fn termite_metal_decode_runtime_attention_span_device(
 ) c_int;
 pub extern fn termite_metal_decode_runtime_attention_paged_slot_device(
     runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    format: u32,
+    q_handle: ?*anyopaque,
+    q_offset: usize,
+    block_table: [*c]const u32,
+    block_count: usize,
+    page_size: usize,
+    q_len: usize,
+    kv_tokens: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    key_row_bytes: usize,
+    base_key_row_bytes: usize,
+    query_position_offset: usize,
+    kv_position_offset: usize,
+    sliding_window: usize,
+    softcap: f32,
+    sinks: ?[*]const f32,
+    sink_count: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_attention_paged_slot_device_on_frame(
+    kv_runtime: ?*RawMetalDecodeRuntime,
+    frame_runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
     format: u32,
     q_handle: ?*anyopaque,

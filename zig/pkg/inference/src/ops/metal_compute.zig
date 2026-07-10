@@ -9897,6 +9897,47 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             defer if (gathered_full) |*full| full.deinit();
             const source = try attentionKvSource(attention);
             const gathered_k: MetalTensor, const gathered_v: MetalTensor = if (attention.skip_kv_write) blk: {
+                // Donated-KV read under our active frame (the MTP draft
+                // attending target KV): encode the KV owner's paged-slot
+                // attention directly onto our frame. The fallback below
+                // gathers the full donor KV through host downloads and
+                // flushes our frame to read Q — several GPU round-trips
+                // per draft layer.
+                if (attention.attn_or_mask == null and q_mt.isDevice() and
+                    !getenvBool("TERMITE_METAL_DISABLE_DONATED_SLOT_ATTENTION") and
+                    !getenvBool("TERMITE_METAL_DISABLE_DONATED_SLOT_ATTENTION_ON_FRAME"))
+                {
+                    if (try pagedKvLayerFromDeviceHook(attention, num_kv_heads, head_dim)) |paged_layer| {
+                        if (pagedSlotAttentionSupported(paged_layer)) {
+                            if (paged_layer.runtime) |layer_runtime_ptr| {
+                                const block_offsets_opt = try self.pagedKvBlockTokenOffsets(attention, @intCast(paged_layer.page_size_tokens));
+                                defer if (block_offsets_opt) |block_offsets| self.allocator.free(block_offsets);
+                                if (block_offsets_opt) |block_offsets| {
+                                    if (try metal_runtime.decoderRuntimeApplyPagedKvAttentionSlotOnFrame(
+                                        @as(*metal_runtime.RawMetalDecodeRuntime, @ptrCast(@alignCast(layer_runtime_ptr))),
+                                        self.provider_impl,
+                                        .{
+                                            .q = q_mt,
+                                            .slot = paged_layer.slot,
+                                            .format = paged_layer.format,
+                                            .block_token_offsets = block_offsets,
+                                            .page_size = @as(usize, @intCast(paged_layer.page_size_tokens)),
+                                            .kv_tokens = attention.kv_sequence_len,
+                                            .num_heads = num_heads,
+                                            .num_kv_heads = num_kv_heads,
+                                            .head_dim = head_dim,
+                                            .key_row_bytes = paged_layer.key_row_bytes,
+                                            .base_key_row_bytes = paged_layer.base_key_row_bytes,
+                                            .query_position_offset = query_position_offset,
+                                            .kv_position_offset = attention.kv_position_offset,
+                                            .sliding_window = attention.sliding_window,
+                                        },
+                                    )) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+                                }
+                            }
+                        }
+                    }
+                }
                 gathered_full = (try gatherFullKvFromDeviceHook(attention, num_kv_heads, head_dim)) orelse
                     (try self.gatherFullKvFromBackendCache(attention, num_kv_heads, head_dim, false)) orelse
                     return error.KvBytesUnavailable;
@@ -9975,6 +10016,36 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                                 const block_offsets_opt = try self.pagedKvBlockTokenOffsets(attention, @intCast(paged_layer.page_size_tokens));
                                 defer if (block_offsets_opt) |block_offsets| self.allocator.free(block_offsets);
                                 if (block_offsets_opt) |block_offsets| {
+                                    // Preferred: encode the KV owner's slot attention
+                                    // directly onto our active frame — no draft-frame
+                                    // flush and no KV-owner drain (the MTP draft pays
+                                    // ~2 syncs per donated layer on the fallback path).
+                                    if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) and
+                                        !getenvBool("TERMITE_METAL_DISABLE_DONATED_SLOT_ATTENTION_ON_FRAME"))
+                                    {
+                                        if (try metal_runtime.decoderRuntimeApplyPagedKvAttentionSlotOnFrame(
+                                            @as(*metal_runtime.RawMetalDecodeRuntime, @ptrCast(@alignCast(layer_runtime_ptr))),
+                                            self.provider_impl,
+                                            .{
+                                                .q = q_mt,
+                                                .slot = paged_layer.slot,
+                                                .format = paged_layer.format,
+                                                .block_token_offsets = block_offsets,
+                                                .page_size = @as(usize, @intCast(paged_layer.page_size_tokens)),
+                                                .kv_tokens = attention.kv_sequence_len,
+                                                .num_heads = num_heads,
+                                                .num_kv_heads = num_kv_heads,
+                                                .head_dim = head_dim,
+                                                .key_row_bytes = paged_layer.key_row_bytes,
+                                                .base_key_row_bytes = paged_layer.base_key_row_bytes,
+                                                .query_position_offset = query_position_offset,
+                                                .kv_position_offset = attention.kv_position_offset,
+                                                .sliding_window = attention.sliding_window,
+                                            },
+                                        )) |tensor| {
+                                            return self.ctFromOwnedMetalTensor(tensor);
+                                        }
+                                    }
                                     // Q may still be pending in this backend's active
                                     // frame while the slot attention runs inline on the
                                     // KV owner's runtime — drain our frame first.
@@ -18901,6 +18972,37 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer input_mt.deinit();
         var linear_input = try retainedLinearInputView(&input_mt, in_dim);
         defer linear_input.deinit();
+        if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) {
+            // Input pending in our active frame: encode the lm-head+argmax as
+            // the frame's final work, then submit+wait once through the
+            // normal frame path. Opt-in: interleaved A/Bs on M4 measured the
+            // flush-then-own-command-buffer path at parity or slightly ahead
+            // (the saved round-trip does not pay for the longer frame), so
+            // the sync consolidation stays available but default-off.
+            if (getenvBool("TERMITE_METAL_ENABLE_LINEAR_ARGMAX_FRAME_FINAL")) {
+                if (try metal_runtime.decoderRuntimeApplyLinearArgmaxFrameEncode(self.provider_impl, .{
+                    .slot = slot,
+                    .input = linear_input,
+                    .in_dim = in_dim,
+                    .out_dim = out_dim,
+                })) {
+                    var frame_active = true;
+                    try self.submitAndWaitDecoderRuntimeFrame(self.provider_impl.raw_decode_runtime, &frame_active);
+                    if (try metal_runtime.decoderRuntimeReadTokenId(self.provider_impl)) |token_id| {
+                        return @intCast(token_id);
+                    }
+                    return null;
+                }
+            }
+            // The plain path below reads the input on a separate command
+            // buffer with no ordering against the active frame — drain it
+            // first so the input is complete.
+            if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) {
+                if (metal_runtime.termite_metal_decode_runtime_flush_active_frame(self.provider_impl.raw_decode_runtime) != 0) {
+                    return error.MetalFrameSyncFailed;
+                }
+            }
+        }
         const token = try metal_runtime.decoderRuntimeApplyLinearArgmax(self.provider_impl, .{
             .slot = slot,
             .input = linear_input,
@@ -18917,6 +19019,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (buf.quantized_storage != null) return error.UnsupportedTensorType;
         if (buf.metal_tensor) |*metal_tensor| {
             if (metal_tensor.isDevice()) {
+                // The logits may still be pending in our active frame while
+                // argmaxLogitsDevice runs on its own command buffer — drain
+                // the frame first.
+                if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) {
+                    if (metal_runtime.termite_metal_decode_runtime_flush_active_frame(self.provider_impl.raw_decode_runtime) != 0) {
+                        return error.MetalFrameSyncFailed;
+                    }
+                }
                 var last_row = if (rows == 1)
                     try metal_tensor.retainedCopy()
                 else blk: {

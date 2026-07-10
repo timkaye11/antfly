@@ -26,12 +26,25 @@ This branch grows the Metal quant kernel **registry** into a descriptor-driven, 
 
 `termite_paged_attention_kv_prefill_sg` was correct but opt-in (slower than the scalar path) because it gathered every 32-key chunk of K and V into threadgroup memory. For contiguous full chunks (the common prefill case) it now `simdgroup_load`s K (transposed) and V **directly from device memory**, skipping both gathers. Bit-identical tokens (scalar == gather == direct verified); prefill at 1k tokens flips from 7.5% slower to **12.7% faster** than the scalar path; default-on (`TERMITE_METAL_DISABLE_PREFILL_SG_ATTENTION` to opt out, `TERMITE_METAL_DISABLE_PREFILL_SG_DIRECT_LOAD` for the fast path alone).
 
-## Arc 3 — Speculative/MTP decode fixes
+## Arc 3 — Speculative/MTP decode: from broken-and-3×-slower to plain-decode parity
 
-- **Use-after-free fixed** (`termite_metal_decode_runtime_copy_grown_buffer` + `termite_copy_bytes` kernel): span-buffer growth opened a blit encoder while the frame's planned compute encoder was open — corrupting it and segfaulting in the AGX driver. This was both the deterministic `--speculative-k 2` crash and the long-standing `ANTFLY_GEMMA4_MTP_ACCEPT_BONUS` segfault (bonus now works on Metal; tokens bit-identical at k=1/2/4).
-- **Batched multi-row verify argmax**: `argmaxRowsSuppressOp` encoded one command buffer + frame teardown *per row*; now all k+1 rows encode into one command buffer with one sync and one download (offset-parameterized encode helpers; on-device unit test covering multi-row/suppress/row_start/serial paths).
-- **Fast identity hard-gate**: `ANTFLY_INFERENCE_GEMMA4_COMPARE_POLICY_ONLY=1` runs the plain-golden + MTP identity checks (~4 min); previously no fast mode ran them.
-- Measured: spec force-k4 8.44 → 10.66 tok/s; k=2+bonus 12.66 tok/s (both bit-identical to plain decode). Follow-up work (deferred-materialization fold) is scoped in `SPEC_DECODE_P2_FOLD_MATERIALIZE_HANDOFF.md`.
+**Headline: spec decode (k=1 + bonus + deferred-materialize) went 8.4 → 25.6-27.2 tok/s vs plain 24.9-27.1 (cooled interleaved A/B) — ~3×, at parity with plain — tokens bit-identical to plain decode in every configuration throughout.**
+
+Three real bugs fixed:
+- **Use-after-free** (`termite_metal_decode_runtime_copy_grown_buffer` + `termite_copy_bytes` kernel): span-buffer growth opened a blit encoder while the frame's planned compute encoder was open — the deterministic `--speculative-k 2` crash AND the long-standing `ANTFLY_GEMMA4_MTP_ACCEPT_BONUS` segfault, one root cause.
+- **Shared env-flag cache**: `getenvBool`/`getenvFlagValue` in metal_compute/metal_runtime cached ONE value across all env names — every `TERMITE_METAL_*` toggle read through them was order-dependent (pre-existing).
+- **Dedicated-runtime double-argmax**: the verify commit recomputed logits through a dense fallback every no-cached-choice round (55-81ms each).
+
+Performance work (each step identity-gated):
+- **Batched multi-row verify argmax**: one sync for k+1 rows (was one frame teardown per row); on-device unit test.
+- **Deferred-materialization fold** (`ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE`): pending-token state with KV-invariant asserts + five deterministic round-shape tests; landed default-OFF on measured economics, flipped to the winning config once verify costs fell.
+- **Verify frame at rows 2-8**: threadgroup-reduce RMS norm (was a 2-thread serial kernel, ~28ms/frame), q4_0 pair-activation shared-read small-batch kernels, prepared lm_head tail + 2-row shared-read q6_k mmv (pairs of rows share one pass over the ~550MB head). Verify @2 rows: 139 → ~37ms.
+- **Draft step 18 → ~5-6ms**: donated slot attention encoded on the draft frame via a new cross-runtime variant (was: host-download of donor KV + full frame flush + host-shim attention ≈5 GPU round trips/step); masked-embedding argmax default-off (acceptance-neutral, thrice-validated).
+- **MTP seed re-forward eliminated**: Metal now captures the prefill's last hidden (was CUDA-gated; seeding re-ran the whole prompt through the generic forward, scaling with prompt length).
+- **Bonus default-on for Metal**; kill switches on every new route.
+- **Fast identity hard-gate**: `ANTFLY_INFERENCE_GEMMA4_COMPARE_POLICY_ONLY=1` (plain-golden + MTP identity, ~4 min; previously no fast mode ran them) + `scripts/test_gemma4_mtp_defer_materialize.sh` (six-arm fold/bonus sweep).
+
+Follow-ups (scoped in-tree hand-offs + memory, not in this PR): fold the verify-tail lm_head apply into the verify frame (~13% of decode wall), fold-acceptance recovery (488 vs ~640‰), auto-policy retune, PLE row-stride hoist, tail r2 occupancy. ⚠️ Flagged latent issue: the **CUDA** prefill hidden-capture passes a *pre-norm* row where Metal captures *post-final-norm* — verify on a CUDA machine before trusting CUDA MTP seeding.
 
 ## Correctness gates (all green at HEAD)
 

@@ -871,10 +871,11 @@ pub fn draftTokenDevice(request: DraftDeviceRequest) !DraftDeviceResult {
     profileEvalTensor(request.draft_cb, projected, request.profile_sync);
     profile.postprojection_ns = profileElapsedNs(postprojection_started_at);
 
-    if (draft_frame_active) {
-        draft_frame_active = false;
-        try request.draft_cb.decoderRuntimeSubmitAndWaitFrame();
-    }
+    // The frame stays open across the argmax attempt: the device argmax path
+    // encodes the lm-head+argmax as the frame's final work and submits+waits
+    // once for the whole step. Fallback paths flush the frame themselves
+    // before reading tensors; whatever frame state remains is drained after
+    // the token block below.
     const argmax_started_at = profileNow(request.profile_enabled);
     const draft_lm_w = try gpt_arch.getEmbeddingWeight(request.draft_cb, draft_cfg);
     defer request.draft_cb.free(draft_lm_w);
@@ -940,6 +941,15 @@ pub fn draftTokenDevice(request: DraftDeviceRequest) !DraftDeviceResult {
         logit_source = .host_argmax;
         break :blk activations.argmax(logits[0..draft_cfg.vocab_size]);
     };
+    if (draft_frame_active) {
+        draft_frame_active = false;
+        // Consumed by the frame-final argmax on the happy path; fallback
+        // paths may have flushed-and-rebegun (or encoded further ops) — drain
+        // whatever frame is still open so no state leaks out of the step.
+        if (request.draft_cb.decoderRuntimeHasActiveFrame()) {
+            try request.draft_cb.decoderRuntimeSubmitAndWaitFrame();
+        }
+    }
     profile.argmax_ns = profileElapsedNs(argmax_started_at);
 
     return .{
