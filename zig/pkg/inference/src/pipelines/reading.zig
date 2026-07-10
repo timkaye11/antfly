@@ -230,6 +230,7 @@ pub const ReadingPipeline = struct {
         }
 
         if (encoder_outputs.len == 0) return error.NoEncoderOutput;
+        logTensorStatsF32("encoder_hidden(session)", encoder_outputs[0].asFloat32());
         if (debug_cuda_session) std.log.info("reading: decode from encoder outputs start", .{});
         const decode_start = nowNs();
         const result = try self.decodeFromEncoderOutputs(encoder_outputs, null);
@@ -407,6 +408,12 @@ pub const ReadingPipeline = struct {
         )) orelse return null;
         defer cb.free(encoder.hidden);
 
+        if (florenceDebugStats()) {
+            const hidden_host = try cb.toFloat32(encoder.hidden, allocator);
+            defer allocator.free(hidden_host);
+            logTensorStatsF32("encoder_hidden(resident)", hidden_host);
+        }
+
         const encoder_attention_mask = try allocator.alloc(i64, encoder.seq_len);
         defer allocator.free(encoder_attention_mask);
         @memset(encoder_attention_mask, 1);
@@ -424,7 +431,8 @@ pub const ReadingPipeline = struct {
             }
         }
 
-        if (backend == .cuda and !florenceKvCacheDisabled()) {
+        const kv_cache_backend_ok = backend == .cuda or (backend == .metal and florenceMetalKvCacheEnabled());
+        if (kv_cache_backend_ok and !florenceKvCacheDisabled()) {
             last_read_telemetry.kv_cache = true;
             last_read_telemetry.cuda_graph_replay = false;
             last_read_telemetry.cuda_graph_fallback_reason = if (florenceCudaGraphEnabled()) null else "florence_graph_disabled";
@@ -454,6 +462,13 @@ pub const ReadingPipeline = struct {
                 encoder.seq_len,
             )) orelse return null;
             defer cb.free(logits);
+
+            if (florenceDebugStats() and dec_len <= 5) {
+                const logits_host = try cb.toFloat32(logits, allocator);
+                defer allocator.free(logits_host);
+                const last_row = logits_host[(dec_len - 1) * florence_cfg.vocab_size ..][0..florence_cfg.vocab_size];
+                logTopLogits("logits(resident)", dec_len, last_row);
+            }
 
             const suppress_tokens = try buildNoRepeatSuppressTokens(
                 allocator,
@@ -838,6 +853,7 @@ pub const ReadingPipeline = struct {
 
             // Last position logits
             const last_logits = logits[(dec_len - 1) * vocab_size ..][0..vocab_size];
+            if (decoder_steps <= 4) logTopLogits("logits(session)", decoder_steps, last_logits);
 
             // Greedy: argmax
             const best_id = selectGreedyToken(last_logits, dec_ids[0..dec_len], self.config.no_repeat_ngram_size);
@@ -880,6 +896,61 @@ fn readProfileEnabled() bool {
 
 fn florenceKvCacheDisabled() bool {
     return platform.env.getenvBool("ANTFLY_INFERENCE_FLORENCE_DISABLE_KV_CACHE");
+}
+
+fn florenceMetalKvCacheEnabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_FLORENCE_METAL_KV_CACHE");
+}
+
+fn florenceDebugStats() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_FLORENCE_DEBUG_STATS");
+}
+
+fn logTensorStatsF32(label: []const u8, values: []const f32) void {
+    if (!florenceDebugStats()) return;
+    if (values.len == 0) {
+        std.log.info("florence-debug {s}: empty", .{label});
+        return;
+    }
+    var sum: f64 = 0;
+    var absmax: f32 = 0;
+    for (values) |v| {
+        sum += v;
+        const a = @abs(v);
+        if (a > absmax) absmax = a;
+    }
+    const mean = sum / @as(f64, @floatFromInt(values.len));
+    const n_first = @min(values.len, 4);
+    std.log.info("florence-debug {s}: n={d} mean={d:.6} absmax={d:.4} first={any}", .{
+        label, values.len, mean, absmax, values[0..n_first],
+    });
+}
+
+fn logTopLogits(label: []const u8, step: usize, logits: []const f32) void {
+    if (!florenceDebugStats()) return;
+    var top_ids: [3]usize = .{ 0, 0, 0 };
+    var top_vals: [3]f32 = .{ -std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32) };
+    for (logits, 0..) |v, i| {
+        if (v > top_vals[0]) {
+            top_vals[2] = top_vals[1];
+            top_ids[2] = top_ids[1];
+            top_vals[1] = top_vals[0];
+            top_ids[1] = top_ids[0];
+            top_vals[0] = v;
+            top_ids[0] = i;
+        } else if (v > top_vals[1]) {
+            top_vals[2] = top_vals[1];
+            top_ids[2] = top_ids[1];
+            top_vals[1] = v;
+            top_ids[1] = i;
+        } else if (v > top_vals[2]) {
+            top_vals[2] = v;
+            top_ids[2] = i;
+        }
+    }
+    std.log.info("florence-debug {s} step={d}: top=[{d}:{d:.4}, {d}:{d:.4}, {d}:{d:.4}]", .{
+        label, step, top_ids[0], top_vals[0], top_ids[1], top_vals[1], top_ids[2], top_vals[2],
+    });
 }
 
 fn florenceCudaGraphEnabled() bool {
