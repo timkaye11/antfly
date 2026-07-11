@@ -92,6 +92,16 @@ pub const Limits = struct {
     scratch_limit_bytes: usize = 0,
 };
 
+pub fn maxCompositeLimits(a: Limits, b: Limits) Limits {
+    return .{
+        .host_limit_bytes = @max(a.host_limit_bytes, b.host_limit_bytes),
+        .backend_limit_bytes = @max(a.backend_limit_bytes, b.backend_limit_bytes),
+        .combined_limit_bytes = @max(a.combined_limit_bytes, b.combined_limit_bytes),
+        .kv_limit_bytes = @max(a.kv_limit_bytes, b.kv_limit_bytes),
+        .scratch_limit_bytes = @max(a.scratch_limit_bytes, b.scratch_limit_bytes),
+    };
+}
+
 pub const SystemMemoryInfo = struct {
     total_bytes: usize,
     available_bytes: ?usize = null,

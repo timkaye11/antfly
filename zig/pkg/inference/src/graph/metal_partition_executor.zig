@@ -5241,7 +5241,8 @@ fn recordQuantKernelCompilerPlan(
 
 fn quantKernelEpilogueForMetalOp(op: ml.graph.OpCode) quant_kernel_compiler.Epilogue {
     return switch (op) {
-        .fused_linear => .bias,
+        // Metal runs quant matmul first and applies bias as a separate op.
+        .fused_linear => .none,
         .fused_linear_no_bias_pair => .pair,
         else => .none,
     };
@@ -5272,6 +5273,13 @@ test "metal partition executor records pair epilogue in quant kernel compiler st
     try std.testing.expectEqual(@as(u64, 1), no_bias_stats.quant_kernel_generated_production);
     try std.testing.expectEqual(@as(u64, 0), no_bias_stats.quant_kernel_generated_candidates);
     try std.testing.expectEqual(@as(u64, 0), no_bias_stats.quant_kernel_fallback_generated_artifact_missing);
+
+    var bias_stats: PartitionExecutor.ExecutionStats = .{};
+    recordQuantKernelCompilerPlan(&bias_stats, .{ .fused_linear = .{ .rows = 4, .in_dim = 256, .out_dim = 8 } }, op_plan);
+    try std.testing.expectEqual(@as(u64, 1), bias_stats.quant_kernel_planned_ops);
+    try std.testing.expectEqual(@as(u64, 0), bias_stats.quant_kernel_handwritten_production);
+    try std.testing.expectEqual(@as(u64, 1), bias_stats.quant_kernel_generated_production);
+    try std.testing.expectEqual(@as(u64, 0), bias_stats.quant_kernel_generated_candidates);
 }
 
 fn executeRuntimeConv1d(

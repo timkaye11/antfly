@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.inference_generate_chunk_object import InferenceGenerateChunkObject
+from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.inference_generate_chunk_choice import InferenceGenerateChunkChoice
+    from ..models.inference_generate_speculation_status import InferenceGenerateSpeculationStatus
 
 
 T = TypeVar("T", bound="InferenceGenerateChunk")
@@ -25,6 +27,7 @@ class InferenceGenerateChunk:
         created (int):
         model (str):
         choices (list[InferenceGenerateChunkChoice]):
+        speculation (InferenceGenerateSpeculationStatus | None | Unset):
     """
 
     id: str
@@ -32,9 +35,12 @@ class InferenceGenerateChunk:
     created: int
     model: str
     choices: list[InferenceGenerateChunkChoice]
+    speculation: InferenceGenerateSpeculationStatus | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.inference_generate_speculation_status import InferenceGenerateSpeculationStatus
+
         id = self.id
 
         object_ = self.object_.value
@@ -48,6 +54,14 @@ class InferenceGenerateChunk:
             choices_item = choices_item_data.to_dict()
             choices.append(choices_item)
 
+        speculation: dict[str, Any] | None | Unset
+        if isinstance(self.speculation, Unset):
+            speculation = UNSET
+        elif isinstance(self.speculation, InferenceGenerateSpeculationStatus):
+            speculation = self.speculation.to_dict()
+        else:
+            speculation = self.speculation
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -59,12 +73,15 @@ class InferenceGenerateChunk:
                 "choices": choices,
             }
         )
+        if speculation is not UNSET:
+            field_dict["speculation"] = speculation
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.inference_generate_chunk_choice import InferenceGenerateChunkChoice
+        from ..models.inference_generate_speculation_status import InferenceGenerateSpeculationStatus
 
         d = dict(src_dict)
         id = d.pop("id")
@@ -82,12 +99,30 @@ class InferenceGenerateChunk:
 
             choices.append(choices_item)
 
+        def _parse_speculation(data: object) -> InferenceGenerateSpeculationStatus | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                speculation_type_1 = InferenceGenerateSpeculationStatus.from_dict(data)
+
+                return speculation_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(InferenceGenerateSpeculationStatus | None | Unset, data)
+
+        speculation = _parse_speculation(d.pop("speculation", UNSET))
+
         inference_generate_chunk = cls(
             id=id,
             object_=object_,
             created=created,
             model=model,
             choices=choices,
+            speculation=speculation,
         )
 
         inference_generate_chunk.additional_properties = d

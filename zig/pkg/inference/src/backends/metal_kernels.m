@@ -22476,7 +22476,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_q4_k_bias_slot_device(
     size_t output_offset
 ) {
     if (runtime == NULL || input_handle == NULL || bias_handle == NULL || output_handle == NULL) return -1;
-    if (!termite_metal_runtime_candidate_gate(runtime, NULL)) return -2;
+    if (!termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH_BIAS")) return -2;
     if (slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -3;
     if (rows < 2 || rows > 8 || in_dim == 0 || out_dim == 0 || (in_dim & 255u) != 0) return -4;
     if (rows > UINT32_MAX || in_dim > UINT32_MAX || out_dim > UINT32_MAX) return -5;
@@ -22784,7 +22784,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_q5_k_bias_slot_device(
     return termite_metal_decode_runtime_apply_quantized_linear_k_bias_generated_slot_device(
         runtime,
         TERMITE_METAL_QUANT_FORMAT_Q5_K,
-        NULL,
+        "TERMITE_METAL_ENABLE_ANTFLY_Q5_K_SMALL_BATCH_BIAS",
         runtime != NULL ? runtime->antfly_q5_k_small_batch_bias_pipeline : nil,
         runtime != NULL ? &runtime->antfly_q5_k_small_batch_bias_dispatches : NULL,
         TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS,
@@ -22848,7 +22848,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_q6_k_bias_slot_device(
     return termite_metal_decode_runtime_apply_quantized_linear_k_bias_generated_slot_device(
         runtime,
         TERMITE_METAL_QUANT_FORMAT_Q6_K,
-        NULL,
+        "TERMITE_METAL_ENABLE_ANTFLY_Q6_K_SMALL_BATCH_BIAS",
         runtime != NULL ? runtime->antfly_q6_k_small_batch_bias_pipeline : nil,
         runtime != NULL ? &runtime->antfly_q6_k_small_batch_bias_dispatches : NULL,
         TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS,
@@ -22912,7 +22912,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_q8_0_bias_slot_device(
     return termite_metal_decode_runtime_apply_quantized_linear_k_bias_generated_slot_device(
         runtime,
         TERMITE_METAL_QUANT_FORMAT_Q8_0,
-        NULL,
+        "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_BIAS",
         runtime != NULL ? runtime->antfly_q8_0_small_batch_bias_pipeline : nil,
         runtime != NULL ? &runtime->antfly_q8_0_small_batch_bias_dispatches : NULL,
         TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS,
@@ -41839,7 +41839,7 @@ int termite_metal_provider_linear_q8_0_planned(termite_metal_provider *provider,
 
 int termite_metal_provider_linear_q8_0_bias(termite_metal_provider *provider, const float *input, size_t rows, size_t in_dim, const uint8_t *weight_raw, size_t out_dim, const float *bias, float *output) {
     if (in_dim % 32 != 0) return -2;
-    return termite_metal_dispatch_generated_quant_bias(provider, NULL, provider->antfly_q8_0_small_batch_bias_pipeline, TERMITE_METAL_QUANT_FORMAT_Q8_0, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS, input, rows, in_dim, 32u, 34u, weight_raw, out_dim * (in_dim / 32u) * 34u, out_dim, bias, output);
+    return termite_metal_dispatch_generated_quant_bias(provider, "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_BIAS", provider->antfly_q8_0_small_batch_bias_pipeline, TERMITE_METAL_QUANT_FORMAT_Q8_0, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS, input, rows, in_dim, 32u, 34u, weight_raw, out_dim * (in_dim / 32u) * 34u, out_dim, bias, output);
 }
 
 int termite_metal_provider_linear_q8_0_bias_gelu(termite_metal_provider *provider, const float *input, size_t rows, size_t in_dim, const uint8_t *weight_raw, size_t out_dim, const float *bias, float *output) {
@@ -41891,7 +41891,7 @@ int termite_metal_provider_linear_q4_k(termite_metal_provider *provider, const f
 
 int termite_metal_provider_linear_q4_k_bias(termite_metal_provider *provider, const float *input, size_t rows, size_t in_dim, const uint8_t *weight_raw, size_t out_dim, const float *bias, float *output) {
     if (in_dim % 256 != 0) return -2;
-    return termite_metal_dispatch_generated_quant_bias(provider, NULL, provider->antfly_q4_k_small_batch_bias_pipeline, TERMITE_METAL_QUANT_FORMAT_Q4_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS, input, rows, in_dim, 256u, 144u, weight_raw, out_dim * (in_dim / 256u) * 144u, out_dim, bias, output);
+    return termite_metal_dispatch_generated_quant_bias(provider, "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH_BIAS", provider->antfly_q4_k_small_batch_bias_pipeline, TERMITE_METAL_QUANT_FORMAT_Q4_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS, input, rows, in_dim, 256u, 144u, weight_raw, out_dim * (in_dim / 256u) * 144u, out_dim, bias, output);
 }
 
 int termite_metal_provider_linear_q4_k_bias_gelu(termite_metal_provider *provider, const float *input, size_t rows, size_t in_dim, const uint8_t *weight_raw, size_t out_dim, const float *bias, float *output) {
@@ -41907,7 +41907,7 @@ int termite_metal_provider_linear_q5_k(termite_metal_provider *provider, const f
 
 int termite_metal_provider_linear_q5_k_bias(termite_metal_provider *provider, const float *input, size_t rows, size_t in_dim, const uint8_t *weight_raw, size_t out_dim, const float *bias, float *output) {
     if (in_dim % 256 != 0) return -2;
-    return termite_metal_dispatch_generated_quant_bias(provider, NULL, provider->antfly_q5_k_small_batch_bias_pipeline, TERMITE_METAL_QUANT_FORMAT_Q5_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS, input, rows, in_dim, 256u, 176u, weight_raw, out_dim * (in_dim / 256u) * 176u, out_dim, bias, output);
+    return termite_metal_dispatch_generated_quant_bias(provider, "TERMITE_METAL_ENABLE_ANTFLY_Q5_K_SMALL_BATCH_BIAS", provider->antfly_q5_k_small_batch_bias_pipeline, TERMITE_METAL_QUANT_FORMAT_Q5_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS, input, rows, in_dim, 256u, 176u, weight_raw, out_dim * (in_dim / 256u) * 176u, out_dim, bias, output);
 }
 
 int termite_metal_provider_linear_q5_k_bias_gelu(termite_metal_provider *provider, const float *input, size_t rows, size_t in_dim, const uint8_t *weight_raw, size_t out_dim, const float *bias, float *output) {
@@ -41923,7 +41923,7 @@ int termite_metal_provider_linear_q6_k(termite_metal_provider *provider, const f
 
 int termite_metal_provider_linear_q6_k_bias(termite_metal_provider *provider, const float *input, size_t rows, size_t in_dim, const uint8_t *weight_raw, size_t out_dim, const float *bias, float *output) {
     if (in_dim % 256 != 0) return -2;
-    return termite_metal_dispatch_generated_quant_bias(provider, NULL, provider->antfly_q6_k_small_batch_bias_pipeline, TERMITE_METAL_QUANT_FORMAT_Q6_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS, input, rows, in_dim, 256u, 210u, weight_raw, out_dim * (in_dim / 256u) * 210u, out_dim, bias, output);
+    return termite_metal_dispatch_generated_quant_bias(provider, "TERMITE_METAL_ENABLE_ANTFLY_Q6_K_SMALL_BATCH_BIAS", provider->antfly_q6_k_small_batch_bias_pipeline, TERMITE_METAL_QUANT_FORMAT_Q6_K, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS, input, rows, in_dim, 256u, 210u, weight_raw, out_dim * (in_dim / 256u) * 210u, out_dim, bias, output);
 }
 
 int termite_metal_provider_linear_q6_k_bias_gelu(termite_metal_provider *provider, const float *input, size_t rows, size_t in_dim, const uint8_t *weight_raw, size_t out_dim, const float *bias, float *output) {

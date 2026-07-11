@@ -393,7 +393,13 @@ pub fn build(b: *std.Build) void {
         quant_kernel_metal_production_regression_step.dependOn(&run_quant_kernel_metal_production_regression.step);
 
         const refresh_quant_kernel_metal_blocker_evidence = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
-        refresh_quant_kernel_metal_blocker_evidence.addArg("--refresh-blocker-evidence");
+        refresh_quant_kernel_metal_blocker_evidence.has_side_effects = true;
+        refresh_quant_kernel_metal_blocker_evidence.addArgs(&.{
+            "--refresh-blocker-evidence",
+            "--blocker-evidence-dir",
+        });
+        const blocker_evidence_dir_name = b.fmt("antfly-quant-metal-blocker-evidence-{x}", .{b.graph.random_seed});
+        const blocker_evidence_dir = refresh_quant_kernel_metal_blocker_evidence.addOutputDirectoryArg(blocker_evidence_dir_name);
         if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
             refresh_quant_kernel_metal_blocker_evidence.step.dependOn(metal_artifact_check_step);
         }
@@ -401,7 +407,11 @@ pub fn build(b: *std.Build) void {
         quant_kernel_metal_blocker_evidence_refresh_step.dependOn(&refresh_quant_kernel_metal_blocker_evidence.step);
 
         const check_quant_kernel_metal_blocker_evidence = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
-        check_quant_kernel_metal_blocker_evidence.addArg("--check-blocker-evidence");
+        check_quant_kernel_metal_blocker_evidence.addArgs(&.{
+            "--check-blocker-evidence",
+            "--blocker-evidence-dir",
+        });
+        check_quant_kernel_metal_blocker_evidence.addDirectoryArg(blocker_evidence_dir);
         if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
             check_quant_kernel_metal_blocker_evidence.step.dependOn(metal_artifact_check_step);
         }
@@ -413,7 +423,9 @@ pub fn build(b: *std.Build) void {
             "--check-blocker-evidence",
             "--confirm-cleared-blockers",
             "--fail-on-cleared-blocker",
+            "--blocker-evidence-dir",
         });
+        strict_quant_kernel_metal_blocker_evidence.addDirectoryArg(blocker_evidence_dir);
         if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
             strict_quant_kernel_metal_blocker_evidence.step.dependOn(metal_artifact_check_step);
         }

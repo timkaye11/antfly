@@ -8,7 +8,11 @@ on:
     branches: ["main"]
     paths:
       - "go/**"
-      - "specs/openapi/antfly/admin.yaml"
+      - "openapi.yaml"
+      - "specs/openapi/**"
+      - "scripts/join_public_openapi.py"
+      - "scripts/join_openapi.py"
+      - "scripts/openapi_joiner.py"
       - "Makefile"
       - ".github/workflows/antfly-go.yml"
       - "!go/Dockerfile*"
@@ -18,7 +22,11 @@ on:
     branches: ["main"]
     paths:
       - "go/**"
-      - "specs/openapi/antfly/admin.yaml"
+      - "openapi.yaml"
+      - "specs/openapi/**"
+      - "scripts/join_public_openapi.py"
+      - "scripts/join_openapi.py"
+      - "scripts/openapi_joiner.py"
       - "Makefile"
       - ".github/workflows/antfly-go.yml"
       - "!go/Dockerfile*"

@@ -183,6 +183,23 @@ pub const GenerationConfig = struct {
     ignore_eos: bool = false,
 };
 
+pub fn kvPoolConfig(
+    backend: runtime.kv.pool.BackendKind,
+    dtype: runtime.kv.pool.KvDType,
+    config: gpt_mod.Config,
+    force_sliding_trim: bool,
+) runtime.kv.pool.KvPoolConfig {
+    return .{
+        .backend = backend,
+        .dtype = dtype,
+        .page_size_tokens = 16,
+        .num_layers_packed = @intCast(config.num_hidden_layers),
+        .num_kv_heads = config.maxKvHeads(),
+        .head_dim = config.maxHeadDim(),
+        .sliding_window_size = config.kvPoolSlidingWindowSize(force_sliding_trim),
+    };
+}
+
 /// Parsed chat template for rendering messages via Jinja2.
 pub const ChatTemplate = struct {
     template: jinja.Template,

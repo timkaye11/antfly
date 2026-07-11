@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Generated Metal artifact source from graph/quant_kernel_compiler.zig.
+// Dev-only generated Metal shadow artifact from graph/quant_kernel_compiler.zig.
 // plan_id=metal/q8_0/rows_2_8/bias/small_batch
 // kernel_id=antfly_q8_0_small_batch_bias_msl_v1
 // production_baseline=metal_handwritten_quant_matmul
-// production_enabled=true
-// Promoted after sequential Metal runtime evidence cleared correctness,
-// route, provider-route, and speedup gates.
+// production_enabled=false
+// Validated in the direct runtime harness; normal model execution does not
+// call the fused-bias API, so production stays on the no-bias route plus bias op.
 
 #include <metal_stdlib>
 using namespace metal;

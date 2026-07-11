@@ -586,6 +586,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .onnx => return error.UnexpectedOnnxBackend,
         .wasm => return error.UnexpectedWasmBackend,
     };
+    const draft_backend_kind: ?runtime.kv.pool.BackendKind = if (draft_model) |loaded|
+        generationKvBackendKind(loaded.session.backend()) orelse return error.SpeculativeDecodingRequiresNativeBackend
+    else
+        null;
     const requested_kv_dtype = if (opts.cache_dtype) |name|
         runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDtype
     else
@@ -607,6 +611,16 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
     budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
     budget_limits = applyBudgetOverrides(budget_limits, opts);
+    if (draft_model) |loaded| {
+        const draft_budget_backend_class: runtime.tier.memory.BackendClass = switch (draft_backend_kind.?) {
+            .native => .cpu,
+            else => .gpu,
+        };
+        var draft_budget_limits = runtime.tier.memory.defaultLimitsForBackend(draft_budget_backend_class);
+        draft_budget_limits = session_factory.widenBudgetLimitsForSession(loaded.session, draft_budget_limits);
+        draft_budget_limits = applyBudgetOverrides(draft_budget_limits, opts);
+        budget_limits = runtime.tier.memory.maxCompositeLimits(budget_limits, draft_budget_limits);
+    }
     var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
     print("budget: host={d}MB backend={d}MB combined={d}MB\n", .{
         budget_limits.host_limit_bytes / (1024 * 1024),
@@ -631,11 +645,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         const requested_draft_kv_dtype = if (opts.cache_dtype) |name|
             runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDtype
         else
-            session_factory.recommendedKvDTypeForSession(loaded.session, backend_kind);
+            session_factory.recommendedKvDTypeForSession(loaded.session, draft_backend_kind.?);
         break :blk if (draft_gpt_config) |draft_cfg|
             effectiveGenerationKvDType(
                 requested_draft_kv_dtype,
-                backend_kind,
+                draft_backend_kind.?,
                 draft_cfg,
                 prompt_tokens,
                 @intCast(@max(opts.max_tokens, 1)),
@@ -646,7 +660,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (draft_model != null) {
         if (draft_gpt_config) |draft_cfg| {
             run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
-                backend_kind,
+                draft_backend_kind.?,
                 draft_kv_dtype.?,
                 draft_cfg,
                 prompt_tokens,
@@ -685,43 +699,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         null;
     defer if (draft_cb) |*backend| backend.deinit();
 
-    const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-        null
-    else if (gpt_config.sliding_window > 0 and gpt_config.hasGlobalAttentionLayers() and !kvSlidingTrimForced())
-        // Mixed attention (iSWA-style models like Gemma): global layers need
-        // the full KV history, and the pool packs every layer's KV into
-        // shared blocks, so window-trimming the pool silently truncates the
-        // global layers' context. Retain everything; sliding-window layers
-        // still apply their exact window inside the attention kernels, so
-        // their compute stays bounded — only KV memory grows with context.
-        // ANTFLY_INFERENCE_KV_SLIDING_TRIM=1 restores the old
-        // trim-to-window behavior (lower memory, truncated global context).
-        null
-    else if (gpt_config.sliding_window > 0)
-        gpt_config.sliding_window
-    else if (gpt_config.max_position_embeddings > 0)
-        gpt_config.max_position_embeddings
-    else
-        null;
-
-    const pool_id = try kv_manager.addPool(.{
-        .backend = backend_kind,
-        .dtype = kv_dtype,
-        .page_size_tokens = 16,
-        .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-        .num_kv_heads = gpt_config.maxKvHeads(),
-        .head_dim = gpt_config.maxHeadDim(),
-        .sliding_window_size = sliding_window_size,
-    });
-    var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
-        .backend = backend_kind,
-        .dtype = kv_dtype,
-        .page_size_tokens = 16,
-        .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-        .num_kv_heads = gpt_config.maxKvHeads(),
-        .head_dim = gpt_config.maxHeadDim(),
-        .sliding_window_size = sliding_window_size,
-    });
+    const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, kvSlidingTrimForced());
+    const pool_id = try kv_manager.addPool(kv_pool_config);
+    var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config);
     defer kv_storage.deinit();
     try cb.provisionKvDeviceWriteHook(&kv_storage);
 
@@ -756,23 +736,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (draft_model != null) {
         if (draft_gpt_config) |draft_cfg| {
             draft_kv_manager = runtime.kv.manager.KvManager.init(allocator);
-            const draft_sliding_window_size: ?u32 = if (draft_cfg.position_encoding == .absolute)
-                null
-            else if (draft_cfg.sliding_window > 0)
-                draft_cfg.sliding_window
-            else if (draft_cfg.max_position_embeddings > 0)
-                draft_cfg.max_position_embeddings
-            else
-                null;
-            const draft_pool_id = try draft_kv_manager.?.addPool(.{
-                .backend = backend_kind,
-                .dtype = draft_kv_dtype.?,
-                .page_size_tokens = 16,
-                .num_layers_packed = @intCast(draft_cfg.num_hidden_layers),
-                .num_kv_heads = draft_cfg.maxKvHeads(),
-                .head_dim = draft_cfg.maxHeadDim(),
-                .sliding_window_size = draft_sliding_window_size,
-            });
+            const draft_pool_config = generation.kvPoolConfig(draft_backend_kind.?, draft_kv_dtype.?, draft_cfg, kvSlidingTrimForced());
+            const draft_pool_id = try draft_kv_manager.?.addPool(draft_pool_config);
             draft_decode_state = generation.NativeDecodeState.initPaged(allocator, &draft_kv_manager.?, draft_pool_id, null);
         }
     }
@@ -4564,6 +4529,15 @@ fn kvSlidingTrimForced() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_KV_SLIDING_TRIM", false);
 }
 
+fn generationKvBackendKind(backend: backends.BackendType) ?runtime.kv.pool.BackendKind {
+    return switch (backend) {
+        .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+        .onnx, .pjrt, .wasm => null,
+    };
+}
+
 fn cudaGemmaPrefillPrewarmEnabled() bool {
     if (envFlagEnabled("ANTFLY_INFERENCE_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
     if (envFlagEnabled("ANTFLY_INFERENCE_CUDA_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
@@ -5359,42 +5333,9 @@ fn runOnnxWholeModelGraphGenerate(
     const created_backend_at = std.Io.Timestamp.now(io, .awake);
     defer cb.deinit();
 
-    const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-        null
-    else if (gpt_config.sliding_window > 0 and gpt_config.hasGlobalAttentionLayers() and !kvSlidingTrimForced())
-        // Mixed attention (iSWA-style models like Gemma): global layers need
-        // the full KV history, and the pool packs every layer's KV into
-        // shared blocks, so window-trimming the pool silently truncates the
-        // global layers' context. Retain everything; sliding-window layers
-        // still apply their exact window inside the attention kernels, so
-        // their compute stays bounded — only KV memory grows with context.
-        // ANTFLY_INFERENCE_KV_SLIDING_TRIM=1 restores the old
-        // trim-to-window behavior (lower memory, truncated global context).
-        null
-    else if (gpt_config.sliding_window > 0)
-        gpt_config.sliding_window
-    else if (gpt_config.max_position_embeddings > 0)
-        gpt_config.max_position_embeddings
-    else
-        null;
-    const pool_id = try kv_manager.addPool(.{
-        .backend = backend_kind,
-        .dtype = kv_dtype,
-        .page_size_tokens = 16,
-        .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-        .num_kv_heads = gpt_config.maxKvHeads(),
-        .head_dim = gpt_config.maxHeadDim(),
-        .sliding_window_size = sliding_window_size,
-    });
-    var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
-        .backend = backend_kind,
-        .dtype = kv_dtype,
-        .page_size_tokens = 16,
-        .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-        .num_kv_heads = gpt_config.maxKvHeads(),
-        .head_dim = gpt_config.maxHeadDim(),
-        .sliding_window_size = sliding_window_size,
-    });
+    const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, kvSlidingTrimForced());
+    const pool_id = try kv_manager.addPool(kv_pool_config);
+    var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config);
     defer kv_storage.deinit();
     try cb.provisionKvDeviceWriteHook(&kv_storage);
     var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
@@ -6737,6 +6678,25 @@ test "explicit Metal auto draft admission stays Gemma4 MTP-only" {
     };
     try std.testing.expect(shouldSkipMetalAutoDraftLoad(opts, false));
     try std.testing.expect(!shouldSkipMetalAutoDraftLoad(opts, true));
+}
+
+test "draft KV backend follows the loaded draft session" {
+    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, .native), generationKvBackendKind(.native));
+    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, .metal), generationKvBackendKind(.metal));
+    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, null), generationKvBackendKind(.onnx));
+    const mixed_draft: gpt_mod.Config = .{
+        .family = .gemma,
+        .hidden_size = 512,
+        .num_hidden_layers = 6,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 4,
+        .position_encoding = .rope,
+        .sliding_window = 1024,
+        .sliding_window_pattern = 6,
+    };
+    const draft_pool = generation.kvPoolConfig(.native, .f16, mixed_draft, false);
+    try std.testing.expectEqual(runtime.kv.pool.BackendKind.native, draft_pool.backend);
+    try std.testing.expectEqual(@as(?u32, null), draft_pool.sliding_window_size);
 }
 
 test "generate CLI rejects unsupported cache compaction before model loading" {

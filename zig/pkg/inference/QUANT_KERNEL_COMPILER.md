@@ -266,8 +266,9 @@ header; add a `first_metal_runtime_evidence` entry and remove the
 `first_metal_promotion_blocker_evidence` entry (the production-regression suite
 then auto-includes the route via `artifactHasPromotionEvidence`); swap the
 `metal_kernels.m` dispatch gate from `candidate_gate(ENABLE_*)` to
-`promoted_gate(DISABLE_*)` (encoder-family routes) or drop the candidate gate
-(slot-device bias routes, which are pipeline-nil-gated when promoted); and
+`promoted_gate(DISABLE_*)` for encoder-family routes. Fused-bias routes must
+also be called by normal model execution before promotion; direct harness and
+provider API coverage alone are shadow-route evidence, not production use. Then
 update the guardrail count tests (evidence/blocker/route-summary counts, the
 manifest `runtime_gate_env` ENABLE→DISABLE, the route-lowering pins, and the
 `ENABLE`/`DISABLE` env occurrence counts).
@@ -406,11 +407,17 @@ and stays dev-only with blocker evidence, as designed.
 
 ## Current Metal State
 
-The current checked-in state has 11 promoted generated Metal production routes:
-`Q2_K none`, `Q3_K none`, `Q4_K none`, `Q4_K bias`, `Q5_K none`, `Q5_K bias`,
-`Q6_K none`, `Q6_K bias`, `Q8_0 none`, `Q8_0 bias`, and `Q8_K none`.
-The production-regression gate covers 22 generated-vs-handwritten benchmark
-cases for those routes.
+The current checked-in state has 7 promoted generated Metal production routes:
+`Q2_K none`, `Q3_K none`, `Q4_K none`, `Q5_K none`, `Q6_K none`, `Q8_0 none`,
+and `Q8_K none`. The production-regression gate covers 14
+generated-vs-handwritten benchmark cases for those routes.
+
+`Q4_K bias`, `Q5_K bias`, `Q6_K bias`, and `Q8_0 bias` are validated shadow
+routes. Their direct decode-runtime and provider APIs have correctness, route,
+provider-route, and speed evidence, but normal model execution uses the
+promoted no-bias quant route followed by its existing bias op. The fused APIs
+therefore remain fail-closed behind `TERMITE_METAL_ENABLE_ANTFLY_*_BIAS` (or
+the global candidate opt-in) until a model path actually calls them.
 
 Several of these were re-tuned or newly promoted via the schedule-autotuning
 workflow above: the sweep found that 256-value k-quant routes want a
@@ -436,11 +443,12 @@ counts for non-promoted candidates may vary with timing noise; production
 promotion does not rely on route-all speedup alone.
 
 The dedicated blocker evidence table remains intentionally stricter than
-route-all: 14 candidate kernels are guarded, 9 have benchmark-evidence paths
+route-all: all 18 candidate kernels are guarded. Nine have benchmark-evidence paths
 (`speedup_gate_missing` for Q4_0, Q5_0, Q5_1, Q6_K bias+GELU, and Q8_0
 bias+GELU; `unstable_benchmark_timing` for Q4_1, Q4_K bias+GELU, Q5_K
-bias+GELU, and Q8_1 none), and 5 are route-evidence-only
-because their handwritten baseline is unsupported. Cleared one-off evidence for
+bias+GELU, and Q8_1 none), four fused-bias shadows are blocked by
+`runtime_route_only`, and five are route-evidence-only because their handwritten
+baseline is unsupported. Cleared one-off evidence for
 these kernels is production-regression guarded and does not promote the kernel
 by itself.
 
@@ -448,11 +456,11 @@ This is intentional. A slow or noisy candidate is useful for compiler coverage,
 route testing, and future tuning, but it must not silently become the production
 route.
 
-Current Q4_0, Q4_1, Q5_0, Q5_1, Q4_K bias+GELU, Q5_K bias+GELU, Q6_K
+Current Q4_0, Q4_1, Q5_0, Q5_1, Q4_K/Q5_K/Q6_K/Q8_0 bias, Q4_K/Q5_K/Q6_K
 bias+GELU, Q8_0 bias+GELU, and Q8_1 none note: these generated kernels are
 correct and useful for route coverage, but they are not production defaults.
-Their blocker evidence is production-regression guarded; a one-off local
-promotion-ready result is a signal to investigate, not enough to promote.
+The four bias-only routes additionally require a normal model caller before
+promotion; benchmark success in their direct APIs is not enough.
 
 Current Q2_K/Q3_K bias and bias+GELU plus Q8_0 relu note: these generated
 kernels prove correctness and dispatch wiring through route-all, but they do not
@@ -472,8 +480,8 @@ Current local validation snapshot:
 - `zig build quant-kernel-codegen -- --check-metal` compiles the generated and
   promoted Metal sources through `xcrun`.
 - `zig build quant-kernel-metal-production-regression-check -Dmetal=true -Dcuda=false`
-  runs the 11 promoted kernels across 22 generated-vs-handwritten cases.
-  `src/ops/cuda/generated/quant_kernel_benchmarks.json` enumerates those 22
+  runs the 7 promoted kernels across 14 generated-vs-handwritten cases.
+  `src/ops/cuda/generated/quant_kernel_benchmarks.json` enumerates those 14
   Metal production-regression cases with shape, dims, tolerance, source
   fingerprint, and benchmark command metadata. The target fails on hard route
   blockers such as missing generated/provider routes, unsupported production

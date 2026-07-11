@@ -161,14 +161,8 @@ fn generationBackendKind(backend: backends_mod.BackendType) ?runtime.kv.pool.Bac
     };
 }
 
-fn maxBudgetLimits(a: runtime.tier.memory.Limits, b: runtime.tier.memory.Limits) runtime.tier.memory.Limits {
-    return .{
-        .host_limit_bytes = @max(a.host_limit_bytes, b.host_limit_bytes),
-        .backend_limit_bytes = @max(a.backend_limit_bytes, b.backend_limit_bytes),
-        .combined_limit_bytes = @max(a.combined_limit_bytes, b.combined_limit_bytes),
-        .kv_limit_bytes = @max(a.kv_limit_bytes, b.kv_limit_bytes),
-        .scratch_limit_bytes = @max(a.scratch_limit_bytes, b.scratch_limit_bytes),
-    };
+fn generationKvSlidingTrimForced() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_KV_SLIDING_TRIM", false);
 }
 
 fn validateCacheCompactionRatio(ratio: ?f32) !void {
@@ -308,6 +302,10 @@ fn parseGenerateBackendSelection(
         .compiled_attachment_target = compiled_attachment_target,
         .graph_mode_requested = compiled_mode_requested,
     };
+}
+
+fn validateGenerateDraftBackend(selection: GenerateBackendSelection, draft_model: ?[]const u8) !void {
+    if (draft_model != null and selection.native_choice == .onnx) return error.OnnxDraftUnsupported;
 }
 
 fn modelBackendToNativeChoice(value: api.ModelBackend) native_backend_choice.Choice {
@@ -911,32 +909,9 @@ pub const Node = struct {
         };
         defer cb.deinit();
 
-        const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-            null
-        else if (gpt_config.sliding_window > 0)
-            gpt_config.sliding_window
-        else if (gpt_config.max_position_embeddings > 0)
-            gpt_config.max_position_embeddings
-        else
-            null;
-        const pool_id = try kv_manager.addPool(.{
-            .backend = backend_kind,
-            .dtype = kv_dtype,
-            .page_size_tokens = 16,
-            .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-            .num_kv_heads = gpt_config.maxKvHeads(),
-            .head_dim = gpt_config.maxHeadDim(),
-            .sliding_window_size = sliding_window_size,
-        });
-        var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
-            .backend = backend_kind,
-            .dtype = kv_dtype,
-            .page_size_tokens = 16,
-            .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-            .num_kv_heads = gpt_config.maxKvHeads(),
-            .head_dim = gpt_config.maxHeadDim(),
-            .sliding_window_size = sliding_window_size,
-        });
+        const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
+        const pool_id = try kv_manager.addPool(kv_pool_config);
+        var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config);
         defer kv_storage.deinit();
         try cb.provisionKvDeviceWriteHook(&kv_storage);
         var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
@@ -2356,6 +2331,12 @@ pub const Node = struct {
                 },
             });
         };
+        validateGenerateDraftBackend(backend_selection, effective_draft_model_name) catch {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "draft_model is not supported with backend=onnx; use native, metal, or cuda",
+            });
+        };
         const allow_onnx = effective_draft_model_name == null and
             !backend_selection.graph_mode_requested and
             (body.backend == null or backend_selection.native_choice == .onnx);
@@ -2764,7 +2745,7 @@ pub const Node = struct {
                 draft_model.session,
                 runtime.tier.memory.defaultLimitsForBackend(draft_budget_class),
             ));
-            run_budget.limits = maxBudgetLimits(run_budget.limits, draft_budget_limits);
+            run_budget.limits = runtime.tier.memory.maxCompositeLimits(run_budget.limits, draft_budget_limits);
             draft_kv_dtype = if (config.cache_dtype) |name|
                 runtime.kv.pool.parseKvDType(name).?
             else
@@ -2828,33 +2809,10 @@ pub const Node = struct {
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
             };
         }
-        const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-            null
-        else if (gpt_config.sliding_window > 0)
-            gpt_config.sliding_window
-        else if (gpt_config.max_position_embeddings > 0)
-            gpt_config.max_position_embeddings
-        else
-            null;
-        const pool_id = kv_manager.addPool(.{
-            .backend = backend_kind,
-            .dtype = kv_dtype,
-            .page_size_tokens = 16,
-            .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-            .num_kv_heads = gpt_config.maxKvHeads(),
-            .head_dim = gpt_config.maxHeadDim(),
-            .sliding_window_size = sliding_window_size,
-        }) catch |err|
+        const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
+        const pool_id = kv_manager.addPool(kv_pool_config) catch |err|
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
-        var kv_storage = runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, .{
-            .backend = backend_kind,
-            .dtype = kv_dtype,
-            .page_size_tokens = 16,
-            .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-            .num_kv_heads = gpt_config.maxKvHeads(),
-            .head_dim = gpt_config.maxHeadDim(),
-            .sliding_window_size = sliding_window_size,
-        }) catch |err|
+        var kv_storage = runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, kv_pool_config) catch |err|
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         defer kv_storage.deinit();
         cb.provisionKvDeviceWriteHook(&kv_storage) catch |err|
@@ -2869,21 +2827,8 @@ pub const Node = struct {
             if (draft_gpt_config) |draft_cfg| {
                 const draft_kind = draft_backend_kind.?;
                 draft_kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
-                const draft_sliding_window_size: ?u32 = if (draft_cfg.position_encoding == .absolute)
-                    null
-                else if (draft_cfg.sliding_window > 0)
-                    @intCast(draft_cfg.sliding_window)
-                else
-                    null;
-                const draft_pool_id = draft_kv_manager.?.addPool(.{
-                    .backend = draft_kind,
-                    .dtype = draft_kv_dtype.?,
-                    .page_size_tokens = 16,
-                    .num_layers_packed = @intCast(draft_cfg.num_hidden_layers),
-                    .num_kv_heads = draft_cfg.num_key_value_heads,
-                    .head_dim = draft_cfg.hidden_size / draft_cfg.num_attention_heads,
-                    .sliding_window_size = draft_sliding_window_size,
-                }) catch |err|
+                const draft_pool_config = generation.kvPoolConfig(draft_kind, draft_kv_dtype.?, draft_cfg, generationKvSlidingTrimForced());
+                const draft_pool_id = draft_kv_manager.?.addPool(draft_pool_config) catch |err|
                     return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
                 draft_decode_state = generation.NativeDecodeState.initPaged(ctx.allocator, &draft_kv_manager.?, draft_pool_id, null);
             }
@@ -3491,23 +3436,8 @@ pub const Node = struct {
 
                 var kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
                 defer kv_manager.deinit();
-                const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-                    null
-                else if (gpt_config.sliding_window > 0)
-                    gpt_config.sliding_window
-                else if (gpt_config.max_position_embeddings > 0)
-                    gpt_config.max_position_embeddings
-                else
-                    null;
-                const pool_id = kv_manager.addPool(.{
-                    .backend = backend_kind,
-                    .dtype = kv_dtype,
-                    .page_size_tokens = 16,
-                    .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-                    .num_kv_heads = gpt_config.maxKvHeads(),
-                    .head_dim = gpt_config.maxHeadDim(),
-                    .sliding_window_size = sliding_window_size,
-                }) catch |err| {
+                const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
+                const pool_id = kv_manager.addPool(kv_pool_config) catch |err| {
                     for (group_indices.items) |idx| {
                         if (!pending[idx]) continue;
                         results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
@@ -3515,15 +3445,7 @@ pub const Node = struct {
                     }
                     continue;
                 };
-                var kv_storage = runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, .{
-                    .backend = backend_kind,
-                    .dtype = kv_dtype,
-                    .page_size_tokens = 16,
-                    .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-                    .num_kv_heads = gpt_config.maxKvHeads(),
-                    .head_dim = gpt_config.maxHeadDim(),
-                    .sliding_window_size = sliding_window_size,
-                }) catch |err| {
+                var kv_storage = runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, kv_pool_config) catch |err| {
                     for (group_indices.items) |idx| {
                         if (!pending[idx]) continue;
                         results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
@@ -6818,7 +6740,7 @@ test "generate draft resources follow the draft backend" {
     try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, null), generationBackendKind(.pjrt));
     try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, null), generationBackendKind(.wasm));
 
-    const limits = maxBudgetLimits(
+    const limits = runtime.tier.memory.maxCompositeLimits(
         .{ .host_limit_bytes = 2, .backend_limit_bytes = 8, .kv_limit_bytes = 3 },
         .{ .host_limit_bytes = 5, .backend_limit_bytes = 4, .combined_limit_bytes = 9, .scratch_limit_bytes = 7 },
     );
@@ -6827,6 +6749,62 @@ test "generate draft resources follow the draft backend" {
     try std.testing.expectEqual(@as(usize, 9), limits.combined_limit_bytes);
     try std.testing.expectEqual(@as(usize, 3), limits.kv_limit_bytes);
     try std.testing.expectEqual(@as(usize, 7), limits.scratch_limit_bytes);
+}
+
+test "generate draft KV pool uses safe model geometry" {
+    const mha = generation.kvPoolConfig(.native, .f16, .{
+        .hidden_size = 1024,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 0,
+        .position_encoding = .rope,
+        .max_position_embeddings = 4096,
+    }, false);
+    try std.testing.expectEqual(@as(u32, 8), mha.num_kv_heads);
+    try std.testing.expectEqual(@as(u32, 128), mha.head_dim);
+    try std.testing.expectEqual(@as(?u32, 4096), mha.sliding_window_size);
+
+    const gemma4 = generation.kvPoolConfig(.metal, .bf16, .{
+        .family = .gemma,
+        .hidden_size = 512,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 4,
+        .attention_head_dim = 256,
+        .num_global_key_value_heads = 8,
+        .global_head_dim = 512,
+        .position_encoding = .rope,
+        .sliding_window = 1024,
+    }, false);
+    try std.testing.expectEqual(@as(u32, 8), gemma4.num_kv_heads);
+    try std.testing.expectEqual(@as(u32, 512), gemma4.head_dim);
+    try std.testing.expectEqual(@as(?u32, 1024), gemma4.sliding_window_size);
+
+    const mixed_gemma4_config: gpt_model_mod.Config = .{
+        .family = .gemma,
+        .hidden_size = 512,
+        .num_hidden_layers = 6,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 4,
+        .position_encoding = .rope,
+        .sliding_window = 1024,
+        .sliding_window_pattern = 6,
+    };
+    try std.testing.expectEqual(
+        @as(?u32, null),
+        generation.kvPoolConfig(.metal, .bf16, mixed_gemma4_config, false).sliding_window_size,
+    );
+    try std.testing.expectEqual(
+        @as(?u32, 1024),
+        generation.kvPoolConfig(.metal, .bf16, mixed_gemma4_config, true).sliding_window_size,
+    );
+}
+
+test "generate rejects an ONNX draft before model loading" {
+    const onnx = try parseGenerateBackendSelection(.onnx, null, null);
+    try std.testing.expectError(error.OnnxDraftUnsupported, validateGenerateDraftBackend(onnx, "draft"));
+    try validateGenerateDraftBackend(onnx, null);
+    try validateGenerateDraftBackend(try parseGenerateBackendSelection(.native, null, null), "draft");
 }
 
 test "generate speculation outcome metrics classify completed requests" {

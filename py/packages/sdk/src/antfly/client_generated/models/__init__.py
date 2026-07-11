@@ -333,10 +333,13 @@ from .inference_generate_request import InferenceGenerateRequest
 from .inference_generate_request_cache_dtype import InferenceGenerateRequestCacheDtype
 from .inference_generate_request_compiled_target import InferenceGenerateRequestCompiledTarget
 from .inference_generate_request_mode import InferenceGenerateRequestMode
+from .inference_generate_request_speculation_calibration import InferenceGenerateRequestSpeculationCalibration
+from .inference_generate_request_speculation_policy import InferenceGenerateRequestSpeculationPolicy
 from .inference_generate_response import InferenceGenerateResponse
 from .inference_generate_response_format import InferenceGenerateResponseFormat
 from .inference_generate_response_format_type import InferenceGenerateResponseFormatType
 from .inference_generate_response_object import InferenceGenerateResponseObject
+from .inference_generate_speculation_status import InferenceGenerateSpeculationStatus
 from .inference_generate_usage import InferenceGenerateUsage
 from .inference_image_url import InferenceImageURL
 from .inference_image_url_content_part import InferenceImageURLContentPart
@@ -976,10 +979,13 @@ __all__ = (
     "InferenceGenerateRequestCacheDtype",
     "InferenceGenerateRequestCompiledTarget",
     "InferenceGenerateRequestMode",
+    "InferenceGenerateRequestSpeculationCalibration",
+    "InferenceGenerateRequestSpeculationPolicy",
     "InferenceGenerateResponse",
     "InferenceGenerateResponseFormat",
     "InferenceGenerateResponseFormatType",
     "InferenceGenerateResponseObject",
+    "InferenceGenerateSpeculationStatus",
     "InferenceGenerateUsage",
     "InferenceImageURL",
     "InferenceImageURLContentPart",

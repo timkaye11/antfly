@@ -1765,6 +1765,7 @@ const Config = struct {
     require_evidence_kernel: ?[]const u8 = null,
     check_blocker_evidence: bool = false,
     refresh_blocker_evidence: bool = false,
+    blocker_evidence_dir: ?[]const u8 = null,
     confirm_cleared_blockers: bool = false,
     fail_on_cleared_blocker: bool = false,
     promotion_ready_kernel: ?[]const u8 = null,
@@ -1788,7 +1789,7 @@ pub fn main(init: std.process.Init) !void {
     const cfg = try parseArgs(args);
 
     if (cfg.check_blocker_evidence) {
-        const summary = try checkBlockerEvidence(allocator, cfg.confirm_cleared_blockers);
+        const summary = try checkBlockerEvidence(allocator, cfg.blocker_evidence_dir, cfg.confirm_cleared_blockers);
         printBlockerEvidenceAuditSummary(summary);
         try enforceClearedBlockerPolicy(summary, cfg.fail_on_cleared_blocker);
         return;
@@ -1821,7 +1822,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (cfg.refresh_blocker_evidence) {
-        const summary = try refreshBlockerEvidence(allocator, cfg.confirm_cleared_blockers);
+        const summary = try refreshBlockerEvidence(allocator, cfg.blocker_evidence_dir, cfg.confirm_cleared_blockers);
         printBlockerEvidenceAuditSummary(summary);
         try enforceClearedBlockerPolicy(summary, cfg.fail_on_cleared_blocker);
         return;
@@ -2011,6 +2012,11 @@ fn parseArgs(args: []const [:0]const u8) !Config {
         } else if (std.mem.eql(u8, arg, "--refresh-blocker-evidence")) {
             if (cfg.refresh_blocker_evidence) return error.DuplicateRefreshBlockerEvidence;
             cfg.refresh_blocker_evidence = true;
+        } else if (std.mem.eql(u8, arg, "--blocker-evidence-dir")) {
+            if (cfg.blocker_evidence_dir != null) return error.DuplicateBlockerEvidenceDir;
+            i += 1;
+            if (i >= args.len) return error.MissingBlockerEvidenceDir;
+            cfg.blocker_evidence_dir = args[i];
         } else if (std.mem.eql(u8, arg, "--confirm-cleared-blockers")) {
             if (cfg.confirm_cleared_blockers) return error.DuplicateConfirmClearedBlockers;
             cfg.confirm_cleared_blockers = true;
@@ -2078,6 +2084,7 @@ fn parseArgs(args: []const [:0]const u8) !Config {
     if (cfg.refresh_blocker_evidence and cfg.repeat_runs != 1) return error.RefreshBlockerEvidenceConflictsWithRepeatRuns;
     if (cfg.refresh_blocker_evidence and cfg.measure_iters != null) return error.RefreshBlockerEvidenceConflictsWithMeasureIters;
     if (cfg.refresh_blocker_evidence and (cfg.require_promotion_ready or cfg.require_runtime_route_all or cfg.require_kernel != null or cfg.require_evidence_kernel != null or cfg.promotion_ready_kernel != null or cfg.runtime_route_kernel != null or cfg.runtime_route_all or cfg.production_regression_check)) return error.RefreshBlockerEvidenceConflictsWithRuntimeMode;
+    if (cfg.blocker_evidence_dir != null and !cfg.check_blocker_evidence and !cfg.refresh_blocker_evidence) return error.BlockerEvidenceDirRequiresBlockerEvidence;
     if (cfg.confirm_cleared_blockers and !cfg.check_blocker_evidence and !cfg.refresh_blocker_evidence) return error.ConfirmClearedBlockersRequiresBlockerEvidence;
     if (cfg.fail_on_cleared_blocker and !cfg.check_blocker_evidence and !cfg.refresh_blocker_evidence) return error.FailOnClearedBlockerRequiresBlockerEvidence;
     if (cfg.require_promotion_ready and cfg.check_evidence_path == null) return error.PromotionReadyRequiresCheckEvidence;
@@ -2187,9 +2194,10 @@ test "quant kernel metal runtime check parses evidence output flag" {
     try std.testing.expectError(error.ProductionRegressionCheckRequiresMeasureIters, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--repeat-runs", "5", "--measure-iters", "25", "--production-regression-check" }));
     const route_all_check_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-evidence", "/tmp/evidence.json", "--require-runtime-route-all" });
     try std.testing.expect(route_all_check_cfg.require_runtime_route_all);
-    const blocker_check_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-blocker-evidence" });
+    const blocker_check_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-blocker-evidence", "--blocker-evidence-dir", "/tmp/blocker-evidence" });
     try std.testing.expect(blocker_check_cfg.check_blocker_evidence);
-    const blocker_refresh_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--refresh-blocker-evidence" });
+    try std.testing.expectEqualStrings("/tmp/blocker-evidence", blocker_check_cfg.blocker_evidence_dir.?);
+    const blocker_refresh_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--refresh-blocker-evidence", "--blocker-evidence-dir", "/tmp/blocker-evidence" });
     try std.testing.expect(blocker_refresh_cfg.refresh_blocker_evidence);
     const strict_blocker_check_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-blocker-evidence", "--confirm-cleared-blockers", "--fail-on-cleared-blocker" });
     try std.testing.expect(strict_blocker_check_cfg.check_blocker_evidence);
@@ -2217,6 +2225,9 @@ test "quant kernel metal runtime check parses evidence output flag" {
     try std.testing.expectError(error.RefreshBlockerEvidenceConflictsWithCheckEvidence, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--refresh-blocker-evidence", "--check-evidence", "/tmp/evidence.json" }));
     try std.testing.expectError(error.RefreshBlockerEvidenceConflictsWithCheckBlockerEvidence, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--refresh-blocker-evidence", "--check-blocker-evidence" }));
     try std.testing.expectError(error.RefreshBlockerEvidenceConflictsWithRuntimeMode, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--refresh-blocker-evidence", "--runtime-route-all" }));
+    try std.testing.expectError(error.MissingBlockerEvidenceDir, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-blocker-evidence", "--blocker-evidence-dir" }));
+    try std.testing.expectError(error.DuplicateBlockerEvidenceDir, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-blocker-evidence", "--blocker-evidence-dir", "/tmp/a", "--blocker-evidence-dir", "/tmp/b" }));
+    try std.testing.expectError(error.BlockerEvidenceDirRequiresBlockerEvidence, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--blocker-evidence-dir", "/tmp/blocker-evidence" }));
     try std.testing.expectError(error.DuplicateProductionRegressionCheck, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--repeat-runs", "5", "--production-regression-check", "--production-regression-check" }));
     try std.testing.expectError(error.DuplicateRequireRuntimeRouteAll, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-evidence", "/tmp/evidence.json", "--require-runtime-route-all", "--require-runtime-route-all" }));
     try std.testing.expectError(error.RuntimeRouteAllRequiresCheckEvidence, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--require-runtime-route-all" }));
@@ -2228,6 +2239,12 @@ test "quant kernel metal runtime check parses evidence output flag" {
     try std.testing.expectError(error.ProductionRegressionCheckConflictsWithPromotionReadyKernel, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--repeat-runs", "5", "--measure-iters", "500", "--production-regression-check", "--promotion-ready-kernel", quant_kernel_compiler.first_general_metal_q4_kernel_id }));
     try std.testing.expectError(error.ProductionRegressionCheckConflictsWithRuntimeRouteKernel, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--repeat-runs", "5", "--production-regression-check", "--runtime-route-kernel", quant_kernel_compiler.first_general_metal_q8_bias_gelu_kernel_id }));
     try std.testing.expectError(error.ProductionRegressionCheckConflictsWithRuntimeRouteAll, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--repeat-runs", "5", "--production-regression-check", "--runtime-route-all" }));
+}
+
+test "quant kernel metal runtime blocker evidence path can be build owned" {
+    const path = try blockerEvidencePath(std.testing.allocator, quant_kernel_compiler.first_general_metal_q4_0_promotion_evidence_path, "/tmp/build-owned");
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("/tmp/build-owned/antfly-quant-metal-antfly_q4_0_small_batch_msl_v1-promotion-evidence.json", path);
 }
 
 fn parseRepeatRuns(text: []const u8) !u32 {
@@ -4668,6 +4685,7 @@ fn evidenceSummaryHasRouteReadyCoverage(summary: EvidenceSummary) bool {
 fn productionRegressionEvidenceHasHardBlocker(summary: EvidenceSummary) bool {
     if (summary.promotion_case_count == 0) return false;
     return !evidenceSummaryHasRouteReadyCoverage(summary) or
+        (quant_kernel_compiler.first_metal_production_regression_unstable_benchmark_timing_is_hard_gate and summary.blocker_counts.unstable_benchmark_timing != 0) or
         summary.blocker_counts.speedup_gate_missing != 0 or
         summary.blocker_counts.runtime_route_only != 0 or
         summary.blocker_counts.missing_generated_route != 0 or
@@ -4807,7 +4825,7 @@ fn printBlockerEvidenceAuditSummary(summary: BlockerEvidenceAuditSummary) void {
     );
 }
 
-fn refreshBlockerEvidence(allocator: std.mem.Allocator, confirm_cleared_blockers: bool) !BlockerEvidenceAuditSummary {
+fn refreshBlockerEvidence(allocator: std.mem.Allocator, evidence_dir: ?[]const u8, confirm_cleared_blockers: bool) !BlockerEvidenceAuditSummary {
     var checks_storage = metal_runtime_checks;
     for (&checks_storage) |*check| {
         check.measure_iters = quant_kernel_compiler.metal_promotion_measure_iters;
@@ -4816,6 +4834,8 @@ fn refreshBlockerEvidence(allocator: std.mem.Allocator, confirm_cleared_blockers
 
     for (quant_kernel_compiler.first_metal_promotion_blocker_evidence) |evidence| {
         if (evidence.evidence_path.len == 0) continue;
+        const evidence_path = try blockerEvidencePath(allocator, evidence.evidence_path, evidence_dir);
+        defer if (evidence_dir != null) allocator.free(evidence_path);
 
         var selected_checks: [metal_runtime_checks.len]CheckCase = undefined;
         var selected_results: [metal_runtime_checks.len]CheckResult = undefined;
@@ -4829,7 +4849,7 @@ fn refreshBlockerEvidence(allocator: std.mem.Allocator, confirm_cleared_blockers
         if (selected_count == 0) return error.InvalidArgument;
         try writeEvidence(
             allocator,
-            evidence.evidence_path,
+            evidence_path,
             selected_checks[0..selected_count],
             selected_results[0..selected_count],
             repeat_runs,
@@ -4840,11 +4860,16 @@ fn refreshBlockerEvidence(allocator: std.mem.Allocator, confirm_cleared_blockers
             true,
         );
     }
-    return checkBlockerEvidenceWithDetails(allocator, false, confirm_cleared_blockers);
+    return checkBlockerEvidenceWithDetails(allocator, evidence_dir, false, confirm_cleared_blockers);
 }
 
-fn checkBlockerEvidence(allocator: std.mem.Allocator, confirm_cleared_blockers: bool) !BlockerEvidenceAuditSummary {
-    return checkBlockerEvidenceWithDetails(allocator, true, confirm_cleared_blockers);
+fn checkBlockerEvidence(allocator: std.mem.Allocator, evidence_dir: ?[]const u8, confirm_cleared_blockers: bool) !BlockerEvidenceAuditSummary {
+    return checkBlockerEvidenceWithDetails(allocator, evidence_dir, true, confirm_cleared_blockers);
+}
+
+fn blockerEvidencePath(allocator: std.mem.Allocator, path: []const u8, evidence_dir: ?[]const u8) ![]const u8 {
+    const dir = evidence_dir orelse return path;
+    return std.fs.path.join(allocator, &.{ dir, std.fs.path.basename(path) });
 }
 
 fn confirmClearedBlocker(allocator: std.mem.Allocator, kernel_id: []const u8) !EvidenceSummary {
@@ -4899,14 +4924,16 @@ fn confirmClearedBlocker(allocator: std.mem.Allocator, kernel_id: []const u8) !E
     return summary;
 }
 
-fn checkBlockerEvidenceWithDetails(allocator: std.mem.Allocator, print_details: bool, confirm_cleared_blockers: bool) !BlockerEvidenceAuditSummary {
+fn checkBlockerEvidenceWithDetails(allocator: std.mem.Allocator, evidence_dir: ?[]const u8, print_details: bool, confirm_cleared_blockers: bool) !BlockerEvidenceAuditSummary {
     var summary = BlockerEvidenceAuditSummary{
         .table_entry_count = quant_kernel_compiler.first_metal_promotion_blocker_evidence_count,
     };
     for (quant_kernel_compiler.first_metal_promotion_blocker_evidence) |evidence| {
         if (!summary.table_blocker_counts.add(evidence.blocker)) return error.InvalidMetalEvidence;
         if (evidence.evidence_path.len == 0) {
-            if (!std.mem.eql(u8, evidence.blocker, quant_kernel_compiler.metal_blocker_unsupported_handwritten)) {
+            const route_only = std.mem.eql(u8, evidence.blocker, quant_kernel_compiler.metal_blocker_unsupported_handwritten) or
+                std.mem.eql(u8, evidence.blocker, quant_kernel_compiler.metal_blocker_runtime_route_only);
+            if (!route_only) {
                 std.debug.print(
                     "quant-kernel-metal-runtime-check blocker_evidence missing_path kernel={s} blocker={s}\n",
                     .{ evidence.kernel_id, evidence.blocker },
@@ -4916,11 +4943,13 @@ fn checkBlockerEvidenceWithDetails(allocator: std.mem.Allocator, print_details: 
             summary.skipped_no_path_count += 1;
             continue;
         }
+        const evidence_path = try blockerEvidencePath(allocator, evidence.evidence_path, evidence_dir);
+        defer if (evidence_dir != null) allocator.free(evidence_path);
 
-        const evidence_summary = checkEvidenceFileWithSummary(allocator, evidence.evidence_path, false, false, evidence.kernel_id) catch |err| {
+        const evidence_summary = checkEvidenceFileWithSummary(allocator, evidence_path, false, false, evidence.kernel_id) catch |err| {
             std.debug.print(
                 "quant-kernel-metal-runtime-check blocker_evidence invalid kernel={s} blocker={s} path={s} error={s}\n",
-                .{ evidence.kernel_id, evidence.blocker, evidence.evidence_path, @errorName(err) },
+                .{ evidence.kernel_id, evidence.blocker, evidence_path, @errorName(err) },
             );
             return err;
         };
@@ -4933,7 +4962,7 @@ fn checkBlockerEvidenceWithDetails(allocator: std.mem.Allocator, print_details: 
         if (!evidenceSummaryHasRouteReadyCoverage(evidence_summary)) {
             std.debug.print(
                 "quant-kernel-metal-runtime-check blocker_evidence missing_route_ready kernel={s} blocker={s} path={s} route_ready={d}/{d}\n",
-                .{ evidence.kernel_id, evidence.blocker, evidence.evidence_path, evidence_summary.candidate_route_ready_count, evidence_summary.case_count },
+                .{ evidence.kernel_id, evidence.blocker, evidence_path, evidence_summary.candidate_route_ready_count, evidence_summary.case_count },
             );
             return error.MetalBlockerEvidenceRouteMissing;
         }
@@ -4944,7 +4973,7 @@ fn checkBlockerEvidenceWithDetails(allocator: std.mem.Allocator, print_details: 
             if (print_details) {
                 std.debug.print(
                     "quant-kernel-metal-runtime-check blocker_evidence production_regression_guarded kernel={s} table_blocker={s} path={s} promotion_ready={d}/{d}\n",
-                    .{ evidence.kernel_id, evidence.blocker, evidence.evidence_path, evidence_summary.promotion_ready_count, evidence_summary.promotion_case_count },
+                    .{ evidence.kernel_id, evidence.blocker, evidence_path, evidence_summary.promotion_ready_count, evidence_summary.promotion_case_count },
                 );
             }
         } else if (blocker_cleared) {
@@ -4991,7 +5020,7 @@ fn checkBlockerEvidenceWithDetails(allocator: std.mem.Allocator, print_details: 
             if (print_details) {
                 std.debug.print(
                     "quant-kernel-metal-runtime-check blocker_evidence cleared kernel={s} table_blocker={s} path={s} promotion_ready={d}/{d}\n",
-                    .{ evidence.kernel_id, evidence.blocker, evidence.evidence_path, evidence_summary.promotion_ready_count, evidence_summary.promotion_case_count },
+                    .{ evidence.kernel_id, evidence.blocker, evidence_path, evidence_summary.promotion_ready_count, evidence_summary.promotion_case_count },
                 );
             }
         } else if (!promotionBlockerEvidenceMatchesExactly(evidence_summary.blocker_counts, evidence.blocker) and
@@ -5001,21 +5030,21 @@ fn checkBlockerEvidenceWithDetails(allocator: std.mem.Allocator, print_details: 
             if (print_details) {
                 std.debug.print(
                     "quant-kernel-metal-runtime-check blocker_evidence timing_drift kernel={s} table_blocker={s} path={s} evidence_blockers={{speedup_gate:{d},unstable_benchmark:{d}}}\n",
-                    .{ evidence.kernel_id, evidence.blocker, evidence.evidence_path, evidence_summary.blocker_counts.speedup_gate_missing, evidence_summary.blocker_counts.unstable_benchmark_timing },
+                    .{ evidence.kernel_id, evidence.blocker, evidence_path, evidence_summary.blocker_counts.speedup_gate_missing, evidence_summary.blocker_counts.unstable_benchmark_timing },
                 );
             }
         }
         if (!blocker_cleared and !promotionBlockerEvidenceMatches(evidence_summary.blocker_counts, evidence.blocker)) {
             std.debug.print(
                 "quant-kernel-metal-runtime-check blocker_evidence mismatch kernel={s} expected_blocker={s} path={s}\n",
-                .{ evidence.kernel_id, evidence.blocker, evidence.evidence_path },
+                .{ evidence.kernel_id, evidence.blocker, evidence_path },
             );
             return error.MetalBlockerEvidenceMismatch;
         }
         if (!blocker_cleared and (evidence_summary.promotion_case_count == 0 or evidence_summary.promotion_ready_count == evidence_summary.promotion_case_count)) {
             std.debug.print(
                 "quant-kernel-metal-runtime-check blocker_evidence stale_ready kernel={s} expected_blocker={s} path={s} promotion_ready={d}/{d}\n",
-                .{ evidence.kernel_id, evidence.blocker, evidence.evidence_path, evidence_summary.promotion_ready_count, evidence_summary.promotion_case_count },
+                .{ evidence.kernel_id, evidence.blocker, evidence_path, evidence_summary.promotion_ready_count, evidence_summary.promotion_case_count },
             );
             return error.MetalBlockerEvidenceMismatch;
         }
@@ -5138,12 +5167,23 @@ fn checkEvidenceJsonCommandPath(allocator: std.mem.Allocator, bytes: []const u8,
     const root = parsed.value;
     if (root != .object) return error.InvalidMetalEvidence;
     const command = jsonString(root.object.get("benchmark_command")) orelse return error.InvalidMetalEvidence;
-    if (!commandEvidenceOutMatches(command, path)) return error.InvalidMetalEvidence;
+    if (!try commandEvidenceOutMatches(allocator, command, path)) return error.InvalidMetalEvidence;
 }
 
-fn commandEvidenceOutMatches(command: []const u8, path: []const u8) bool {
+fn commandEvidenceOutMatches(allocator: std.mem.Allocator, command: []const u8, path: []const u8) !bool {
     const actual = commandArgValue(command, "--evidence-out") orelse return false;
-    return std.mem.eql(u8, actual, path);
+    if (std.mem.eql(u8, actual, path)) return true;
+    const actual_real = compat.cwd().realPathFileAlloc(compat.io(), actual, allocator) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer allocator.free(actual_real);
+    const expected_real = compat.cwd().realPathFileAlloc(compat.io(), path, allocator) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer allocator.free(expected_real);
+    return std.mem.eql(u8, actual_real, expected_real);
 }
 
 fn commandHasToken(command: []const u8, expected: []const u8) bool {
@@ -6419,8 +6459,11 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     defer std.testing.allocator.free(copied_path);
     try writeFileCreatingParent(std.testing.io, copied_path, actual);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceFile(std.testing.allocator, copied_path, false, false, null));
-    try std.testing.expect(commandEvidenceOutMatches("zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /tmp/a --repeat-runs 3", "/tmp/a"));
-    try std.testing.expect(!commandEvidenceOutMatches("zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /tmp/abc --repeat-runs 3", "/tmp/a"));
+    try std.testing.expect(try commandEvidenceOutMatches(std.testing.allocator, "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /tmp/a --repeat-runs 3", "/tmp/a"));
+    try std.testing.expect(!try commandEvidenceOutMatches(std.testing.allocator, "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /tmp/abc --repeat-runs 3", "/tmp/a"));
+    const absolute_path = try compat.cwd().realPathFileAlloc(std.testing.io, path, std.testing.allocator);
+    defer std.testing.allocator.free(absolute_path);
+    try checkEvidenceJsonCommandPath(std.testing.allocator, actual, absolute_path);
 
     const production_enabled = try replaceOnce(std.testing.allocator, actual, "\"production_enabled\":false", "\"production_enabled\":true");
     defer std.testing.allocator.free(production_enabled);
@@ -6623,7 +6666,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     try std.testing.expect(production_summary.production_regression_check);
     try std.testing.expectEqual(quant_kernel_compiler.first_metal_production_benchmark_case_count, production_summary.compiler_benchmark_manifest_case_count orelse return error.InvalidMetalEvidence);
     try std.testing.expectEqual(quant_kernel_compiler.metalProductionBenchmarkCaseManifestFingerprint(), production_summary.compiler_benchmark_manifest_case_fingerprint orelse return error.InvalidMetalEvidence);
-    const stale_production_manifest_case = try replaceOnce(std.testing.allocator, production_regression_actual, "\"name\":\"q6_k_rows_2_8_bias\"", "\"name\":\"q6_k_rows_2_8_bias_stale\"");
+    const stale_production_manifest_case = try replaceOnce(std.testing.allocator, production_regression_actual, "\"name\":\"q6_k_rows_2_8_none\"", "\"name\":\"q6_k_rows_2_8_none_stale\"");
     defer std.testing.allocator.free(stale_production_manifest_case);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_production_manifest_case, false, false, null));
     const stale_production_manifest_count = try replaceOnce(std.testing.allocator, production_regression_actual, expected_compiler_manifest_case_count, "\"compiler_benchmark_manifest_case_count\":1");

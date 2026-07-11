@@ -11217,6 +11217,19 @@ export interface components {
              */
             speculative_k?: number;
             /**
+             * @description inference-native speculative decoding policy: `auto`, `force`, or `off`.
+             *     Defaults to `auto` when a draft model is requested.
+             * @enum {string}
+             */
+            speculation_policy?: "auto" | "force" | "off";
+            /**
+             * @description inference-native speculative decoding calibration state: `none`, `probe`, or `positive`.
+             *     Defaults to `probe` for `auto` draft requests so they are measured instead of silently disabled,
+             *     and to `none` for `force` or `off`.
+             * @enum {string}
+             */
+            speculation_calibration?: "none" | "probe" | "positive";
+            /**
              * @description inference-native KV cache quantization format. Lower precision reduces memory usage but may
              *     affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
              * @enum {string}
@@ -11227,6 +11240,8 @@ export interface components {
              * @description inference-native KV cache compaction ratio applied after prefill via Attention Matching.
              *     Selects a subset of keys and fits new values via OLS to preserve attention behavior.
              *     0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
+             *     The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`;
+             *     device-backed compaction is not yet supported.
              */
             cache_compaction_ratio?: number;
             backend?: components["schemas"]["InferenceModelBackend"];
@@ -11287,6 +11302,14 @@ export interface components {
             /** @description List of completion choices (currently always 1) */
             choices: components["schemas"]["InferenceGenerateChoice"][];
             usage: components["schemas"]["InferenceGenerateUsage"];
+            speculation?: components["schemas"]["InferenceGenerateSpeculationStatus"] | null;
+        };
+        /** @description Effective speculative-decoding decision for this completion. */
+        InferenceGenerateSpeculationStatus: {
+            policy: string;
+            calibration: string;
+            decision: string;
+            disabled_reason?: string | null;
         };
         /**
          * @description Batch execution mode. Only synchronous batches are implemented.
@@ -11357,6 +11380,7 @@ export interface components {
             created: number;
             model: string;
             choices: components["schemas"]["InferenceGenerateChunkChoice"][];
+            speculation?: components["schemas"]["InferenceGenerateSpeculationStatus"] | null;
         };
         InferenceGenerateChunkChoice: {
             index: number;
