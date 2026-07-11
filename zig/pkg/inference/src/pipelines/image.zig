@@ -185,71 +185,44 @@ test "decode rejects unsupported image format" {
     try std.testing.expectError(error.ImageDecodeFailed, decode(alloc, "not-an-image"));
 }
 
-test "clip preprocessing center crops before resize" {
-    var rgb = [_]u8{
-        10, 0, 0,
-        20, 0, 0,
-        30, 0, 0,
-        40, 0, 0,
-        50, 0, 0,
-        60, 0, 0,
-        70, 0, 0,
-        80, 0, 0,
-    };
-    const img = Image{
-        .data = rgb[0..],
-        .width = 4,
-        .height = 2,
-        .channels = 3,
-    };
-    var out: [12]f32 = undefined;
-
-    preprocessDecodedClip(
-        img,
-        &out,
-        2,
-        .{ 0.0, 0.0, 0.0 },
-        .{ 1.0, 1.0, 1.0 },
-    );
-
-    try std.testing.expectApproxEqAbs(@as(f32, 20.0 / 255.0), out[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 30.0 / 255.0), out[1], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 60.0 / 255.0), out[2], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 70.0 / 255.0), out[3], 1e-6);
+test "clipResizeDims resizes shortest edge to target with aspect preserved" {
+    // torchvision Resize(int): shortest edge -> target, long edge = trunc(target*long/short).
+    const a = clipResizeDims(767, 462, 224); // landscape
+    try std.testing.expectEqual(@as(usize, 371), a.width);
+    try std.testing.expectEqual(@as(usize, 224), a.height);
+    const b = clipResizeDims(598, 728, 224); // portrait
+    try std.testing.expectEqual(@as(usize, 224), b.width);
+    try std.testing.expectEqual(@as(usize, 272), b.height);
+    const c = clipResizeDims(500, 500, 224); // square
+    try std.testing.expectEqual(@as(usize, 224), c.width);
+    try std.testing.expectEqual(@as(usize, 224), c.height);
 }
 
-test "clip preprocessing uses legacy resize source coordinates" {
+test "centerCropOffset uses round-half-to-even like torchvision CenterCrop" {
+    try std.testing.expectEqual(@as(usize, 74), centerCropOffset(371, 224)); // round(73.5) -> 74 (even)
+    try std.testing.expectEqual(@as(usize, 2), centerCropOffset(229, 224)); //  round(2.5)  -> 2  (even)
+    try std.testing.expectEqual(@as(usize, 24), centerCropOffset(272, 224)); // 48/2 = 24 (exact)
+    try std.testing.expectEqual(@as(usize, 0), centerCropOffset(224, 224));
+}
+
+test "clip preprocessing normalizes a target-sized image without resampling" {
+    const alloc = std.testing.allocator;
+    // 2x2 image with target_size=2 => resized dims == source dims => no resize,
+    // zero crop offset, so the output is a pure rescale+normalize (CHW layout).
     var rgb = [_]u8{
-        0,   0, 0,
-        10,  0, 0,
-        100, 0, 0,
-        110, 0, 0,
+        0,   0,   0,
+        255, 255, 255,
+        0,   0,   0,
+        255, 255, 255,
     };
-    const img = Image{
-        .data = rgb[0..],
-        .width = 2,
-        .height = 2,
-        .channels = 3,
-    };
-    var out: [48]f32 = undefined;
-
-    preprocessDecodedClip(
-        img,
-        &out,
-        4,
-        .{ 0.0, 0.0, 0.0 },
-        .{ 1.0, 1.0, 1.0 },
-    );
-
-    const expected_red = [_]f32{
-        0.0,   5.0,   10.0,  10.0,
-        50.0,  55.0,  60.0,  60.0,
-        100.0, 105.0, 110.0, 110.0,
-        100.0, 105.0, 110.0, 110.0,
-    };
-    for (expected_red, 0..) |expected, i| {
-        try std.testing.expectApproxEqAbs(expected / 255.0, out[i], 1e-6);
-    }
+    const img = Image{ .data = rgb[0..], .width = 2, .height = 2, .channels = 3 };
+    var out: [12]f32 = undefined;
+    try preprocessDecodedClip(alloc, img, &out, 2, .{ 0.0, 0.0, 0.0 }, .{ 1.0, 1.0, 1.0 });
+    // channel-0 plane row-major: (0,0)=0, (1,0)=255, (0,1)=0, (1,1)=255.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[3], 1e-6);
 }
 
 test "decode png fixture dimensions are stable" {
@@ -680,16 +653,26 @@ pub fn preprocessBatch(
     return result;
 }
 
-/// Preprocess CLIP embedding images using Antfly's CLIP runtime contract.
+/// Preprocess CLIP embedding images to match the CLIP canonical contract used
+/// by HuggingFace `CLIPImageProcessor` and torchvision
+/// `Resize(size, BICUBIC) + CenterCrop(size)` — the exact preprocessing that
+/// produced the cached clipclap ViT features the CLIP→text bridge was trained
+/// and evaluated against (clipclap `processor_config.json`: `size.shortest_edge
+/// = 224`, `resample = 3` (BICUBIC), `do_center_crop`, CLIP `image_mean`/`std`,
+/// `rescale_factor = 1/255`, RGB).
 ///
-/// The math intentionally matches the legacy Go termite CLIP path in
-/// go/pkg/termite/lib/pipelines/image.go: crop a centered target_size window
-/// capped by source dimensions, resize that crop to target_size using source
-/// coordinates `dst * src_dim / target_dim`, and normalize to CHW f32.
+/// Each image is resized so its SHORTEST edge equals `target_size` (aspect ratio
+/// preserved) with an antialiased separable bicubic resampler (PIL semantics),
+/// center-cropped to `target_size` × `target_size`, rescaled by 1/255, and
+/// normalized with `mean`/`std` into CHW f32.
 ///
-/// This is not the generic vision preprocessor. Use it only for CLIP/ClipClap
-/// image embeddings that must stay compatible with vectors produced by the
-/// legacy Go runtime.
+/// This replaces a previous path that center-cropped a `min(dim, target)` window
+/// at NATIVE resolution and then near-identity-resized it — which never
+/// downsampled large images (charts/figures), so the served image tensor barely
+/// resembled the torchvision-bicubic training features (served-vs-offline image
+/// cosine as low as ~0.15 on charts). Matching PIL's antialiased bicubic recovers
+/// the pixel tensor to cosine ~1.0 vs torchvision. Use only for CLIP/ClipClap
+/// image embeddings.
 pub fn preprocessClipBatch(
     allocator: std.mem.Allocator,
     image_list: []const []const u8,
@@ -706,7 +689,8 @@ pub fn preprocessClipBatch(
         const img = try decode(allocator, image_bytes);
         defer img.deinit(allocator);
 
-        preprocessDecodedClip(
+        try preprocessDecodedClip(
+            allocator,
             img,
             result[i * per_image ..][0..per_image],
             target_size,
@@ -718,48 +702,224 @@ pub fn preprocessClipBatch(
     return result;
 }
 
+const ClipResizeDims = struct { width: usize, height: usize };
+
+/// torchvision `Resize(size=int)` output size: match the SHORTEST edge to
+/// `target` (aspect preserved), long edge = `int(target * long / short)` (Python
+/// truncation of the f64 quotient — reproduced here in f64 to be bit-identical).
+fn clipResizeDims(width: u32, height: u32, target: u32) ClipResizeDims {
+    const t: f64 = @floatFromInt(target);
+    const w: f64 = @floatFromInt(width);
+    const h: f64 = @floatFromInt(height);
+    if (width <= height) {
+        const nh: usize = @max(@as(usize, @intFromFloat(t * h / w)), 1);
+        return .{ .width = target, .height = nh };
+    } else {
+        const nw: usize = @max(@as(usize, @intFromFloat(t * w / h)), 1);
+        return .{ .width = nw, .height = target };
+    }
+}
+
+/// torchvision `CenterCrop` top/left offset: `int(round((dim - target) / 2))`
+/// using Python's round-half-to-even. Returns 0 when the axis is not larger
+/// than the crop.
+fn centerCropOffset(dim: usize, target: usize) usize {
+    if (dim <= target) return 0;
+    const d = dim - target; // >= 1
+    const half = d / 2;
+    if (d % 2 == 0) return half; // exact integer, no rounding needed
+    // d odd => (d/2) ends in .5 => round to the even neighbor (half or half+1).
+    return if (half % 2 == 0) half else half + 1;
+}
+
+/// CLIP canonical preprocessing for a single decoded image. See
+/// `preprocessClipBatch` for the contract. `result` must be `3*target*target`.
 fn preprocessDecodedClip(
+    allocator: std.mem.Allocator,
     img: Image,
     result: []f32,
     target_size: u32,
     mean: [3]f32,
     std_dev: [3]f32,
-) void {
+) !void {
     std.debug.assert(target_size > 0);
     std.debug.assert(img.width > 0 and img.height > 0);
-
     const ts: usize = target_size;
-    const crop_w: u32 = @min(img.width, target_size);
-    const crop_h: u32 = @min(img.height, target_size);
-    const crop_left: u32 = (img.width - crop_w) / 2;
-    const crop_top: u32 = (img.height - crop_h) / 2;
-    const scale_x = @as(f32, @floatFromInt(crop_w)) / @as(f32, @floatFromInt(target_size));
-    const scale_y = @as(f32, @floatFromInt(crop_h)) / @as(f32, @floatFromInt(target_size));
+    std.debug.assert(result.len == 3 * ts * ts);
+
+    const dims = clipResizeDims(img.width, img.height, target_size);
+
+    // Resize (antialiased separable bicubic) to dims, unless already exact.
+    var resized_owned: ?[]u8 = null;
+    defer if (resized_owned) |buf| allocator.free(buf);
+    var resized_data: []const u8 = undefined;
+    var resized_w: usize = undefined;
+    var resized_h: usize = undefined;
+    var resized_ch: usize = undefined;
+
+    if (dims.width == img.width and dims.height == img.height) {
+        resized_data = img.data;
+        resized_w = img.width;
+        resized_h = img.height;
+        resized_ch = img.channels;
+    } else {
+        const buf = try clipResizeBicubic(allocator, img, dims.width, dims.height);
+        resized_owned = buf;
+        resized_data = buf;
+        resized_w = dims.width;
+        resized_h = dims.height;
+        resized_ch = 3;
+    }
+
+    // Center-crop target×target using torchvision's round-half-to-even offsets.
+    const crop_left = centerCropOffset(resized_w, ts);
+    const crop_top = centerCropOffset(resized_h, ts);
 
     for (0..ts) |y| {
-        const src_y = @as(f32, @floatFromInt(y)) * scale_y;
-        const y0: u32 = @intFromFloat(@floor(src_y));
-        const y1: u32 = @min(y0 + 1, crop_h - 1);
-        const fy = src_y - @as(f32, @floatFromInt(y0));
-
+        const src_row = (crop_top + y) * resized_w;
         for (0..ts) |x| {
-            const src_x = @as(f32, @floatFromInt(x)) * scale_x;
-            const x0: u32 = @intFromFloat(@floor(src_x));
-            const x1: u32 = @min(x0 + 1, crop_w - 1);
-            const fx = src_x - @as(f32, @floatFromInt(x0));
-
-            for (0..3) |ch| {
-                const p00 = pixelAt(img, crop_left + x0, crop_top + y0, ch);
-                const p10 = pixelAt(img, crop_left + x1, crop_top + y0, ch);
-                const p01 = pixelAt(img, crop_left + x0, crop_top + y1, ch);
-                const p11 = pixelAt(img, crop_left + x1, crop_top + y1, ch);
-                const top = p00 * (1.0 - fx) + p10 * fx;
-                const bottom = p01 * (1.0 - fx) + p11 * fx;
-                const value = top * (1.0 - fy) + bottom * fy;
-                result[ch * ts * ts + y * ts + x] = (value / 255.0 - mean[ch]) / std_dev[ch];
+            const base = (src_row + crop_left + x) * resized_ch;
+            inline for (0..3) |ch| {
+                const v: f32 = @floatFromInt(resized_data[base + ch]);
+                result[ch * ts * ts + y * ts + x] = (v / 255.0 - mean[ch]) / std_dev[ch];
             }
         }
     }
+}
+
+/// Antialiased separable bicubic resample of a decoded image to `ow`×`oh` u8,
+/// matching PIL's `Image.resize(..., BICUBIC)` (the resampler torchvision uses
+/// for PIL images): separate horizontal then vertical passes over precomputed,
+/// support-scaled, normalized bicubic coefficients with a u8 rounding step
+/// between passes. Caller owns the returned RGB (3-channel) buffer.
+fn clipResizeBicubic(allocator: std.mem.Allocator, img: Image, ow: usize, oh: usize) ![]u8 {
+    const sw: usize = img.width;
+    const sh: usize = img.height;
+    const sc: usize = img.channels;
+
+    // Horizontal pass: sw -> ow, preserving sh rows, emitting 3-channel u8.
+    var hc = try computeBicubicCoeffs(allocator, sw, ow);
+    defer hc.deinit(allocator);
+    const hbuf = try allocator.alloc(u8, sh * ow * 3);
+    defer allocator.free(hbuf);
+    for (0..sh) |y| {
+        for (0..ow) |x| {
+            const xmin: usize = @intCast(hc.bounds_min[x]);
+            const n: usize = @intCast(hc.bounds_size[x]);
+            const wbase = x * hc.ksize;
+            inline for (0..3) |ch| {
+                var acc: f64 = 0;
+                for (0..n) |k| {
+                    const px: f64 = @floatFromInt(img.data[(y * sw + (xmin + k)) * sc + ch]);
+                    acc += px * hc.weights[wbase + k];
+                }
+                hbuf[(y * ow + x) * 3 + ch] = clip8(acc);
+            }
+        }
+    }
+
+    // Vertical pass: sh -> oh over the horizontally-resized 3-channel buffer.
+    var vc = try computeBicubicCoeffs(allocator, sh, oh);
+    defer vc.deinit(allocator);
+    const vbuf = try allocator.alloc(u8, oh * ow * 3);
+    errdefer allocator.free(vbuf);
+    for (0..oh) |y| {
+        const ymin: usize = @intCast(vc.bounds_min[y]);
+        const n: usize = @intCast(vc.bounds_size[y]);
+        const wbase = y * vc.ksize;
+        for (0..ow) |x| {
+            inline for (0..3) |ch| {
+                var acc: f64 = 0;
+                for (0..n) |k| {
+                    const px: f64 = @floatFromInt(hbuf[((ymin + k) * ow + x) * 3 + ch]);
+                    acc += px * vc.weights[wbase + k];
+                }
+                vbuf[(y * ow + x) * 3 + ch] = clip8(acc);
+            }
+        }
+    }
+    return vbuf;
+}
+
+const BicubicCoeffs = struct {
+    bounds_min: []i32, // [out] first source index contributing to each output pixel
+    bounds_size: []i32, // [out] number of source pixels contributing
+    weights: []f64, // [out * ksize] normalized filter weights
+    ksize: usize,
+
+    fn deinit(self: *BicubicCoeffs, allocator: std.mem.Allocator) void {
+        allocator.free(self.bounds_min);
+        allocator.free(self.bounds_size);
+        allocator.free(self.weights);
+        self.* = undefined;
+    }
+};
+
+/// Precompute PIL-style bicubic resample coefficients for a 1-D axis
+/// (`in_size` -> `out_size`). Mirrors PIL's `precompute_coeffs`: the filter
+/// support scales with the downsampling factor (antialiasing), the sampling
+/// window is clamped to the source, and weights are normalized to sum to 1.
+fn computeBicubicCoeffs(allocator: std.mem.Allocator, in_size: usize, out_size: usize) !BicubicCoeffs {
+    const in_f: f64 = @floatFromInt(in_size);
+    const out_f: f64 = @floatFromInt(out_size);
+    const scale = in_f / out_f;
+    const filterscale = @max(scale, 1.0);
+    const support = 2.0 * filterscale; // bicubic filter support = 2.0
+    const ksize: usize = @as(usize, @intFromFloat(@ceil(support))) * 2 + 1;
+    const ss = 1.0 / filterscale;
+    const in_i: i64 = @intCast(in_size);
+
+    const bounds_min = try allocator.alloc(i32, out_size);
+    errdefer allocator.free(bounds_min);
+    const bounds_size = try allocator.alloc(i32, out_size);
+    errdefer allocator.free(bounds_size);
+    const weights = try allocator.alloc(f64, out_size * ksize);
+    errdefer allocator.free(weights);
+    @memset(weights, 0);
+
+    for (0..out_size) |xx| {
+        const center = (@as(f64, @floatFromInt(xx)) + 0.5) * scale;
+        // PIL: (int)(center - support + 0.5) / (int)(center + support + 0.5).
+        var xmin_i: i64 = @intFromFloat(center - support + 0.5);
+        if (xmin_i < 0) xmin_i = 0;
+        var xmax_i: i64 = @intFromFloat(center + support + 0.5);
+        if (xmax_i > in_i) xmax_i = in_i;
+        const xmin: usize = @intCast(xmin_i);
+        var n: usize = @intCast(xmax_i - xmin_i);
+        if (n > ksize) n = ksize;
+
+        var ww: f64 = 0;
+        for (0..n) |k| {
+            const arg = (@as(f64, @floatFromInt(k + xmin)) - center + 0.5) * ss;
+            const w = bicubicKernel(arg);
+            weights[xx * ksize + k] = w;
+            ww += w;
+        }
+        if (ww != 0.0) {
+            for (0..n) |k| weights[xx * ksize + k] /= ww;
+        }
+        bounds_min[xx] = @intCast(xmin);
+        bounds_size[xx] = @intCast(n);
+    }
+
+    return .{ .bounds_min = bounds_min, .bounds_size = bounds_size, .weights = weights, .ksize = ksize };
+}
+
+/// Keys cubic convolution kernel with a = -0.5 (PIL/torchvision BICUBIC).
+fn bicubicKernel(x: f64) f64 {
+    const a: f64 = -0.5;
+    const t = @abs(x);
+    if (t < 1.0) return ((a + 2.0) * t - (a + 3.0)) * t * t + 1.0;
+    if (t < 2.0) return (((t - 5.0) * t + 8.0) * t - 4.0) * a;
+    return 0.0;
+}
+
+/// Round a resampled value to u8 with saturation (PIL's clip8: `(int)(v + 0.5)`
+/// clamped to [0, 255]).
+fn clip8(v: f64) u8 {
+    if (v <= 0.0) return 0;
+    if (v >= 255.0) return 255;
+    return @intFromFloat(v + 0.5);
 }
 
 fn toSharedImage(img: Image) ImageU8 {
@@ -773,4 +933,43 @@ fn toSharedImage(img: Image) ImageU8 {
             else => .rgb8,
         },
     };
+}
+
+// Permanent parity guard for the CLIP/clipclap served image path. The server's
+// image preprocessing had never been parity-checked against the CLIP-canonical
+// torchvision pipeline the clipclap ViT features + CLIP→text bridge were trained
+// on, which let a resize/crop skew ship (served-vs-offline image cosine ~0.15 on
+// charts). This asserts the server-preprocessed pixel tensor matches a committed
+// torchvision reference (Resize(224, BICUBIC) + CenterCrop(224) + rescale +
+// CLIP-normalize) at cosine >= 0.99. Regenerate the fixtures with
+// `testdata/clip_preprocess/gen_reference.py`.
+test "clip preprocessing matches torchvision CLIP canonical" {
+    const alloc = std.testing.allocator;
+    const png = @embedFile("testdata/clip_preprocess/input.png");
+    const ref_bytes = @embedFile("testdata/clip_preprocess/reference_chw_f16.bin");
+
+    const n = 3 * 224 * 224;
+    try std.testing.expectEqual(@as(usize, n * @sizeOf(f16)), ref_bytes.len);
+
+    const img = try decode(alloc, png);
+    defer img.deinit(alloc);
+
+    const out = try alloc.alloc(f32, n);
+    defer alloc.free(out);
+    try preprocessDecodedClip(alloc, img, out, 224, IMAGENET_MEAN, IMAGENET_STD);
+
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
+    for (0..n) |i| {
+        const bits = std.mem.readInt(u16, ref_bytes[i * 2 ..][0..2], .little);
+        const ref: f64 = @floatCast(@as(f16, @bitCast(bits)));
+        const a: f64 = out[i];
+        dot += a * ref;
+        na += a * a;
+        nb += ref * ref;
+    }
+    const cosine = dot / (@sqrt(na) * @sqrt(nb) + 1e-12);
+    std.debug.print("[clip-preprocess-parity] cosine(server, torchvision) = {d:.6}\n", .{cosine});
+    try std.testing.expect(cosine >= 0.99);
 }
