@@ -2075,6 +2075,9 @@ fn encoderBlock(
     const ffn_dim = config.encoder_ffn_dim;
     const total = batch * seq_len;
 
+    const profile = readProfileEnabled();
+
+    const qkv_start = nowNs();
     const q_weights = try encoderLinearWeights(cb, layer, "self_attn.q_proj", buf);
     const k_weights = try encoderLinearWeights(cb, layer, "self_attn.k_proj", buf);
     const v_weights = try encoderLinearWeights(cb, layer, "self_attn.v_proj", buf);
@@ -2082,18 +2085,26 @@ fn encoderBlock(
     defer cb.free(qkv.first);
     defer cb.free(qkv.second);
     defer cb.free(qkv.third);
+    if (profile) logFlorenceProfileStep("enc_qkv_linear", layer, qkv_start);
 
+    const attn_start = nowNs();
     const attn = try cb.scaledDotProductAttention(qkv.first, qkv.second, qkv.third, attention_mask, null, batch, seq_len, num_heads, head_dim);
     defer cb.free(attn);
+    if (profile) logFlorenceProfileStep("enc_sdpa", layer, attn_start);
+    const proj_start = nowNs();
     const proj = try encoderLinearProj(cb, attn, layer, "self_attn.out_proj", total, d_model, d_model, buf);
     defer cb.free(proj);
     const attn_res = try cb.add(hidden, proj);
+    if (profile) logFlorenceProfileStep("enc_out_proj_add", layer, proj_start);
 
+    const ln0_start = nowNs();
     const ln0_w = try encoderLayerWeight(cb, layer, "self_attn_layer_norm.weight", buf);
     const ln0_b = try encoderLayerWeight(cb, layer, "self_attn_layer_norm.bias", buf);
     const attn_normed = try cb.layerNorm(attn_res, ln0_w, ln0_b, d_model, 1e-5);
     cb.free(attn_res);
+    if (profile) logFlorenceProfileStep("enc_ln0", layer, ln0_start);
 
+    const fc1_start = nowNs();
     const fc1_weights = try encoderLinearWeights(cb, layer, "fc1", buf);
     const activated = if (try cb.linearGelu(attn_normed, fc1_weights.weight, fc1_weights.bias, total, d_model, ffn_dim)) |fused|
         fused
@@ -2103,7 +2114,9 @@ fn encoderBlock(
         break :blk try cb.gelu(fc1);
     };
     defer cb.free(activated);
+    if (profile) logFlorenceProfileStep("enc_fc1_gelu", layer, fc1_start);
 
+    const fc2_start = nowNs();
     const fc2_weights = try encoderLinearWeights(cb, layer, "fc2", buf);
     const ffn_res = if (try cb.linearAdd(activated, fc2_weights.weight, fc2_weights.bias, attn_normed, total, ffn_dim, d_model)) |fused|
         fused
@@ -2113,6 +2126,7 @@ fn encoderBlock(
         break :blk try cb.add(attn_normed, fc2);
     };
     cb.free(attn_normed);
+    if (profile) logFlorenceProfileStep("enc_fc2_add", layer, fc2_start);
 
     const ln1_w = try encoderLayerWeight(cb, layer, "final_layer_norm.weight", buf);
     const ln1_b = try encoderLayerWeight(cb, layer, "final_layer_norm.bias", buf);
