@@ -57,9 +57,15 @@ pub const ModalityCaps = struct {
     /// Derive capabilities from a resolved model manifest. CLIP exposes a
     /// vision tower (native `clip` hint or a `visual_model_path`); CLAP exposes
     /// an audio tower (native `clap` hint or an `audio_model_path`).
+    ///
+    /// A packaged CLIP→text bridge head (`has_bridge`) makes the embedder
+    /// image-only: its bridged image vectors live in a text embedder's retrieval
+    /// space, but its own text tower produces native CLIP text vectors (a
+    /// different space), so text chunks must be rejected to prevent cross-modal
+    /// misuse. Text queries are served by the separate text embedder.
     pub fn fromManifest(m: *const manifest_mod.ModelManifest) ModalityCaps {
         return .{
-            .text = true,
+            .text = !m.has_bridge,
             .image = m.native_arch_hint == .clip or m.visual_model_path != null,
             .audio = m.native_arch_hint == .clap or m.audio_model_path != null,
         };
@@ -391,6 +397,15 @@ test "ModalityCaps derives towers from manifest" {
     var plain = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     const plain_caps = ModalityCaps.fromManifest(&plain);
     try std.testing.expect(plain_caps.text and !plain_caps.isMultimodal());
+
+    // A clipclap image embedder carrying a CLIP→text bridge head is image-only:
+    // its bridged image vectors live in the text retrieval space, so text chunks
+    // are rejected (served by the separate text embedder).
+    var bridged = manifest_mod.ModelManifest{ .allocator = std.testing.allocator, .native_arch_hint = .clip, .has_bridge = true };
+    const bridged_caps = ModalityCaps.fromManifest(&bridged);
+    try std.testing.expect(!bridged_caps.text and bridged_caps.image and !bridged_caps.audio);
+    try std.testing.expect(bridged_caps.isMultimodal());
+    try std.testing.expect(!bridged_caps.supports(.text) and bridged_caps.supports(.image));
 }
 
 test "embedChunks routes each modality to its tower and preserves order" {

@@ -242,6 +242,12 @@ const commands = [_]common.CommandSpec{
         .imports = &.{.inference_internal},
     },
     .{
+        .name = "export-clip-bridge-model",
+        .root_source_file = "src/finetune/tools/export_clip_bridge_model.zig",
+        .description = "Package a base clipclap image embedder plus a trained CLIP→text bridge head into a new serving model directory",
+        .imports = &.{.inference_internal},
+    },
+    .{
         .name = "train-eval-reranker-head",
         .root_source_file = "src/finetune/train/train_eval_reranker_head.zig",
         .description = "Train and evaluate a bounded termite-owned reranker head",

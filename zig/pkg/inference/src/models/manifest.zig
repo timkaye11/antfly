@@ -161,6 +161,18 @@ pub const ModelManifest = struct {
     has_splade: bool = false,
     splade_vocab_size: u32 = 50368,
 
+    // Learned CLIP→text-embedder bridge head packaged alongside a multimodal
+    // (clipclap) image embedder. When `bridge_head.safetensors` (a 3-layer MLP
+    // under the `clip_bridge_head/` namespace) is present in the model dir, image
+    // embeddings are projected from native CLIP space (post visual_projection,
+    // L2-normalized) into the target text embedder's 768-d retrieval space (nomic
+    // `search_document:`) inside EmbeddingPipeline.embedImages. File presence is
+    // authoritative for has_bridge so packaging is a pure filesystem step. The
+    // bridge is additive and image-only: a bridge-less clipclap dir produces
+    // byte-identical native CLIP output. See pipelines/embedding.zig applyBridge.
+    bridge_weight_path: ?[]const u8 = null,
+    has_bridge: bool = false,
+
     // Architecture (from config.json)
     hidden_size: u32 = 768,
     intermediate_size: u32 = 3072,
@@ -244,6 +256,7 @@ pub const ModelManifest = struct {
         if (self.visual_projection_path) |p| self.allocator.free(p);
         if (self.audio_projection_path) |p| self.allocator.free(p);
         if (self.splade_weight_path) |p| self.allocator.free(p);
+        if (self.bridge_weight_path) |p| self.allocator.free(p);
         if (self.id2label) |labels| {
             for (labels) |l| {
                 if (l.len > 0) self.allocator.free(l);
@@ -486,6 +499,11 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
     // authoritative for has_splade so packaging is a pure filesystem step.
     if (manifest.splade_weight_path == null) manifest.splade_weight_path = try findFileInSubdirs(allocator, model_dir_path, &.{"splade_head.safetensors"}, &.{""});
     if (manifest.splade_weight_path != null) manifest.has_splade = true;
+    // A packaged bridge head (bridge_head.safetensors) projects native CLIP image
+    // embeddings into the target text embedder's retrieval space. File presence is
+    // authoritative for has_bridge (additive, image-only serving path).
+    if (manifest.bridge_weight_path == null) manifest.bridge_weight_path = try findFileInSubdirs(allocator, model_dir_path, &.{"bridge_head.safetensors"}, &.{""});
+    if (manifest.bridge_weight_path != null) manifest.has_bridge = true;
     if (manifest.config_path == null) manifest.config_path = try findFileInSubdirs(allocator, model_dir_path, &.{"config.json"}, &.{""});
     if (manifest.model_manifest_path == null) manifest.model_manifest_path = try findFileInSubdirs(allocator, model_dir_path, &.{"model_manifest.json"}, &.{""});
     if (manifest.tokenizer_json_path == null) manifest.tokenizer_json_path = try findFileInSubdirs(allocator, model_dir_path, &.{"tokenizer.json"}, &.{""});
@@ -605,6 +623,11 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     // authoritative for has_splade so packaging is a pure filesystem step.
     if (manifest.splade_weight_path == null) manifest.splade_weight_path = try findFileInSubdirs(allocator, model_dir_path, &.{"splade_head.safetensors"}, &.{""});
     if (manifest.splade_weight_path != null) manifest.has_splade = true;
+    // A packaged bridge head (bridge_head.safetensors) projects native CLIP image
+    // embeddings into the target text embedder's retrieval space. File presence is
+    // authoritative for has_bridge (additive, image-only serving path).
+    if (manifest.bridge_weight_path == null) manifest.bridge_weight_path = try findFileInSubdirs(allocator, model_dir_path, &.{"bridge_head.safetensors"}, &.{""});
+    if (manifest.bridge_weight_path != null) manifest.has_bridge = true;
     if (manifest.config_path == null) manifest.config_path = try findFileInSubdirs(allocator, model_dir_path, &.{"config.json"}, &.{""});
     if (manifest.model_manifest_path == null) manifest.model_manifest_path = try findFileInSubdirs(allocator, model_dir_path, &.{"model_manifest.json"}, &.{""});
     if (manifest.tokenizer_json_path == null) manifest.tokenizer_json_path = try findFileInSubdirs(allocator, model_dir_path, &.{"tokenizer.json"}, &.{""});
@@ -2689,6 +2712,46 @@ test "manifest without splade head leaves has_splade false" {
 
     try std.testing.expect(!manifest.has_splade);
     try std.testing.expect(manifest.splade_weight_path == null);
+}
+
+test "manifest discovers packaged bridge head and sets has_bridge" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A clipclap image embedder with a packaged CLIP→text bridge head sidecar.
+    // File presence is authoritative for has_bridge (additive, image-only).
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = "weights" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bridge_head.safetensors", .data = "bridge" });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+
+    try std.testing.expect(manifest.has_bridge);
+    try std.testing.expect(manifest.bridge_weight_path != null);
+    try std.testing.expect(std.mem.endsWith(u8, manifest.bridge_weight_path.?, "bridge_head.safetensors"));
+}
+
+test "manifest without bridge head leaves has_bridge false" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = "weights" });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+
+    try std.testing.expect(!manifest.has_bridge);
+    try std.testing.expect(manifest.bridge_weight_path == null);
 }
 
 test "manifest does not treat projector-only gguf as decoder weights" {

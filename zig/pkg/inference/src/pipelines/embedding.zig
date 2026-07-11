@@ -60,6 +60,153 @@ pub const PoolingStrategy = enum {
     last,
 };
 
+/// Safetensors tensor names for the packaged CLIP→text bridge head
+/// (`bridge_head.safetensors`). The bridge is a 3-layer MLP that projects a
+/// native, L2-normalized CLIP image embedding into a text embedder's retrieval
+/// space (nomic modernbert-embed-base `search_document:`, 768-d). PyTorch stores
+/// each Linear weight as [out, in] with y = x·Wᵀ + b; GELU is exact (erf). Dims
+/// are read from tensor shape at load; only the `net.0.weight` input dim is
+/// validated against the clipclap projection output (512) at first use.
+pub const clip_bridge_head_keys = struct {
+    pub const net0_weight = "clip_bridge_head/net.0.weight"; // [hidden0, in]
+    pub const net0_bias = "clip_bridge_head/net.0.bias"; // [hidden0]
+    pub const net2_weight = "clip_bridge_head/net.2.weight"; // [hidden1, hidden0]
+    pub const net2_bias = "clip_bridge_head/net.2.bias"; // [hidden1]
+    pub const net4_weight = "clip_bridge_head/net.4.weight"; // [out, hidden1]
+    pub const net4_bias = "clip_bridge_head/net.4.bias"; // [out]
+};
+
+/// Loaded 3-layer bridge MLP (owned f32 buffers) + shapes read at load. Applied
+/// by `applyClipBridge` as a host-CPU forward:
+///   a0 = gelu(x·W0ᵀ + b0)   [in → hidden0]
+///   a1 = gelu(a0·W2ᵀ + b2)  [hidden0 → hidden1]
+///   y  = a1·W4ᵀ + b4        [hidden1 → out]
+///   out = L2normalize(y)
+pub const ClipBridgeHead = struct {
+    w0: []f32,
+    b0: []f32,
+    w2: []f32,
+    b2: []f32,
+    w4: []f32,
+    b4: []f32,
+    in: usize,
+    hidden0: usize,
+    hidden1: usize,
+    out: usize,
+
+    pub fn deinit(self: *ClipBridgeHead, allocator: std.mem.Allocator) void {
+        allocator.free(self.w0);
+        allocator.free(self.b0);
+        allocator.free(self.w2);
+        allocator.free(self.b2);
+        allocator.free(self.w4);
+        allocator.free(self.b4);
+        self.* = undefined;
+    }
+};
+
+/// Exact-form GELU used by the trained bridge MLP (PyTorch nn.GELU, erf form):
+/// 0.5 * x * (1 + erf(x / sqrt(2))). Computed in f64 for fidelity; the bridge
+/// runs over a handful of images on the host CPU, so cost is negligible.
+fn bridgeGelu(x: f32) f32 {
+    const xd: f64 = x;
+    return @floatCast(0.5 * xd * (1.0 + bridgeErfF64(xd * 0.7071067811865476)));
+}
+
+// Abramowitz & Stegun 7.1.26 in f64 (max abs error ~1.5e-7), matching PyTorch's
+// exact erf closely enough that the bridged vector cosine-matches the offline
+// bridge output to within ~1e-7.
+fn bridgeErfF64(x: f64) f64 {
+    const a1: f64 = 0.254829592;
+    const a2: f64 = -0.284496736;
+    const a3: f64 = 1.421413741;
+    const a4: f64 = -1.453152027;
+    const a5: f64 = 1.061405429;
+    const p: f64 = 0.3275911;
+    const sign: f64 = if (x < 0) -1.0 else 1.0;
+    const ax = @abs(x);
+    const t = 1.0 / (1.0 + p * ax);
+    const poly = ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t;
+    return sign * (1.0 - poly * @exp(-ax * ax));
+}
+
+/// Add a per-column bias to a row-major [rows, cols] buffer in place, then apply
+/// exact GELU when `activate` is set.
+fn bridgeAddBias(buf: []f32, bias: []const f32, rows: usize, cols: usize, activate: bool) void {
+    std.debug.assert(bias.len == cols);
+    for (0..rows) |r| {
+        const row = buf[r * cols ..][0..cols];
+        if (activate) {
+            for (row, bias) |*v, bb| v.* = bridgeGelu(v.* + bb);
+        } else {
+            for (row, bias) |*v, bb| v.* += bb;
+        }
+    }
+}
+
+/// Host-CPU forward of the 3-layer bridge MLP over a batch of native image
+/// embeddings. Each `native` row must be `head.in`-dimensional and is
+/// defensively L2-normalized (the bridge's training-input contract) before the
+/// MLP. Returns freshly-allocated [batch][head.out] L2-normalized bridged
+/// embeddings in the target text-embedder space. `native` is NOT freed. The
+/// three linear layers route through the shared tiled/threaded SGEMM
+/// (`inference_linalg.sgemmTransBSync`) exactly like the SPLADE head.
+pub fn applyClipBridge(
+    allocator: std.mem.Allocator,
+    native: []const []f32,
+    head: *const ClipBridgeHead,
+) ![][]f32 {
+    const batch = native.len;
+    const in = head.in;
+    const h0 = head.hidden0;
+    const h1 = head.hidden1;
+    const out_dim = head.out;
+
+    const result = try allocator.alloc([]f32, batch);
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |r| allocator.free(r);
+        allocator.free(result);
+    }
+    if (batch == 0) return result;
+
+    // Pack + L2-normalize inputs into a dense [batch, in] buffer.
+    const x = try allocator.alloc(f32, batch * in);
+    defer allocator.free(x);
+    for (native, 0..) |row, b| {
+        if (row.len != in) return error.BridgeInputDimMismatch;
+        @memcpy(x[b * in ..][0..in], row);
+    }
+    linalg.l2Normalize(x, in);
+
+    // Layer 0: a0[batch, h0] = x[batch, in] @ W0[h0, in]ᵀ + b0, then GELU.
+    const a0 = try allocator.alloc(f32, batch * h0);
+    defer allocator.free(a0);
+    linalg.sgemmTransBSync(batch, h0, in, 1.0, x, head.w0, 0.0, a0);
+    bridgeAddBias(a0, head.b0, batch, h0, true);
+
+    // Layer 2: a1[batch, h1] = a0[batch, h0] @ W2[h1, h0]ᵀ + b2, then GELU.
+    const a1 = try allocator.alloc(f32, batch * h1);
+    defer allocator.free(a1);
+    linalg.sgemmTransBSync(batch, h1, h0, 1.0, a0, head.w2, 0.0, a1);
+    bridgeAddBias(a1, head.b2, batch, h1, true);
+
+    // Layer 4: y[batch, out] = a1[batch, h1] @ W4[out, h1]ᵀ + b4 (no activation).
+    const y = try allocator.alloc(f32, batch * out_dim);
+    defer allocator.free(y);
+    linalg.sgemmTransBSync(batch, out_dim, h1, 1.0, a1, head.w4, 0.0, y);
+    bridgeAddBias(y, head.b4, batch, out_dim, false);
+    linalg.l2Normalize(y, out_dim);
+
+    for (0..batch) |b| {
+        const row = try allocator.alloc(f32, out_dim);
+        @memcpy(row, y[b * out_dim ..][0..out_dim]);
+        result[b] = row;
+        initialized += 1;
+    }
+    return result;
+}
+
 pub const ImagePreprocessProfile = enum {
     default,
     clip,
@@ -185,6 +332,12 @@ pub const EmbeddingPipeline = struct {
     /// /chunk SPLADE serving.
     splade_weight: ?[]const f32 = null,
     splade_vocab_size: u32 = 50368,
+    /// Optional learned CLIP→text bridge head, borrowed (owned by the
+    /// LoadedModel). When set, `embedImages` projects native CLIP image
+    /// embeddings into the target text embedder's retrieval space via
+    /// `applyClipBridge`. Additive + image-only: a bridge-less multimodal
+    /// embedder returns byte-identical native CLIP output.
+    bridge_head: ?*const ClipBridgeHead = null,
     /// Print phase timings for CLI/debug callers. TERMITE_EMBED_TIMING still
     /// enables the same logs for server and legacy workflows.
     print_timing: bool = false,
@@ -661,9 +814,23 @@ pub const EmbeddingPipeline = struct {
         return embeddings;
     }
 
-    /// Embed a batch of images (raw JPEG/PNG bytes), returning [batch][projection_dim] embeddings.
-    /// Requires a vision_session (CLIP/SigLIP model).
+    /// Embed a batch of images (raw JPEG/PNG bytes), returning [batch][dim]
+    /// embeddings in the shared retrieval space. When a CLIP→text bridge head is
+    /// packaged (`bridge_head`), the native CLIP embeddings are projected into the
+    /// text embedder's 768-d space (additive, image-only); otherwise the native
+    /// CLIP embeddings pass through byte-identically. All callers (Route A /chunk,
+    /// server, native_embed) transparently pick up the bridge when present.
     pub fn embedImages(self: *EmbeddingPipeline, images: []const []const u8) anyerror![][]f32 {
+        const native = try self.embedImagesNative(images);
+        const head = self.bridge_head orelse return native;
+        // The bridge copies native rows into a fresh result; free native after.
+        defer freeEmbeddingSlices(self.allocator, native);
+        return try applyClipBridge(self.allocator, native, head);
+    }
+
+    /// Embed a batch of images (raw JPEG/PNG bytes), returning [batch][projection_dim]
+    /// native CLIP embeddings (no bridge). Requires a vision_session (CLIP/SigLIP model).
+    pub fn embedImagesNative(self: *EmbeddingPipeline, images: []const []const u8) anyerror![][]f32 {
         const vs = self.vision_session orelse if (sessionHasInput(self.session, "pixel_values")) self.session else return error.NoVisionSession;
         if (images.len == 0) return try self.allocator.alloc([]f32, 0);
 
@@ -784,7 +951,9 @@ pub const EmbeddingPipeline = struct {
             alloc.free(embeddings);
         }
         for (images, 0..) |img, i| {
-            const single = try self.embedImages(&.{img});
+            // Native single-image path (this is the batched-native fallback; the
+            // bridge is applied once by the outer embedImages wrapper).
+            const single = try self.embedImagesNative(&.{img});
             defer alloc.free(single);
             embeddings[i] = single[0];
             initialized += 1;
@@ -2325,6 +2494,148 @@ test "resident 2d embedding extraction normalizes before host readback" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.6), embeddings[0][0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), embeddings[0][1], 1e-6);
     try std.testing.expectEqualSlices(f32, &.{ 0.0, 0.0 }, embeddings[1]);
+}
+
+test "applyClipBridge matches a hand-computed 3-layer MLP forward and L2-normalizes" {
+    const allocator = std.testing.allocator;
+
+    // in=2, hidden0=3, hidden1=2, out=2. Weights scale the GELU pre-activations
+    // into the near-linear (large-positive) regime, giving an independent
+    // closed-form reference that also exercises the [out,in] transpose layout
+    // (asymmetric W0 row 2 catches a swapped-dim matmul bug).
+    var w0 = [_]f32{ 10, 0, 0, 10, 10, 10 }; // [3,2] row-major (out=3, in=2)
+    var b0 = [_]f32{ 0, 0, 0 };
+    var w2 = [_]f32{ 1, 0, 0, 0, 1, 0 }; // [2,3] row-major (out=2, in=3)
+    var b2 = [_]f32{ 0, 0 };
+    var w4 = [_]f32{ 1, 0, 0, 1 }; // [2,2] row-major
+    var b4 = [_]f32{ 0, 0 };
+    var head = ClipBridgeHead{
+        .w0 = w0[0..],
+        .b0 = b0[0..],
+        .w2 = w2[0..],
+        .b2 = b2[0..],
+        .w4 = w4[0..],
+        .b4 = b4[0..],
+        .in = 2,
+        .hidden0 = 3,
+        .hidden1 = 2,
+        .out = 2,
+    };
+
+    // row0 [3,4] → L2 [0.6,0.8] → a0≈[6,8,14] → a1≈[6,8] → y=[6,8] → out≈[0.6,0.8]
+    // row1 [0,5] → L2 [0,1]     → a0≈[0,10,10] → a1≈[0,10] → y=[0,10] → out≈[0,1]
+    var row0 = [_]f32{ 3, 4 };
+    var row1 = [_]f32{ 0, 5 };
+    const native = [_][]f32{ row0[0..], row1[0..] };
+
+    const out = try applyClipBridge(allocator, &native, &head);
+    defer freeEmbeddingSlices(allocator, out);
+
+    try std.testing.expectEqual(@as(usize, 2), out.len);
+    try std.testing.expectEqual(@as(usize, 2), out[0].len);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), out[0][0], 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), out[0][1], 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[1][0], 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[1][1], 1e-3);
+
+    // native rows are read-only (normalization happens on an internal copy).
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, row0[0..]);
+
+    // Each output row is L2-normalized.
+    for (out) |r| {
+        var norm: f32 = 0;
+        for (r) |v| norm += v * v;
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), norm, 1e-4);
+    }
+}
+
+test "applyClipBridge produces a 768-d L2-normalized vector from a 512-d input" {
+    const allocator = std.testing.allocator;
+
+    // Production arch shapes (512 → 1024 → 1024 → 768) with zeroed weights and a
+    // one-hot output bias: gelu(0)=0 through both hidden layers, so y = b4 and
+    // out = L2normalize(b4). Verifies the target dim flip and normalization.
+    const in: usize = 512;
+    const h0: usize = 1024;
+    const h1: usize = 1024;
+    const out_dim: usize = 768;
+
+    const w0 = try allocator.alloc(f32, h0 * in);
+    defer allocator.free(w0);
+    const b0 = try allocator.alloc(f32, h0);
+    defer allocator.free(b0);
+    const w2 = try allocator.alloc(f32, h1 * h0);
+    defer allocator.free(w2);
+    const b2 = try allocator.alloc(f32, h1);
+    defer allocator.free(b2);
+    const w4 = try allocator.alloc(f32, out_dim * h1);
+    defer allocator.free(w4);
+    const b4 = try allocator.alloc(f32, out_dim);
+    defer allocator.free(b4);
+    @memset(w0, 0);
+    @memset(b0, 0);
+    @memset(w2, 0);
+    @memset(b2, 0);
+    @memset(w4, 0);
+    @memset(b4, 0);
+    b4[0] = 5.0; // unnormalized one-hot → out = [1, 0, ..., 0]
+
+    var head = ClipBridgeHead{
+        .w0 = w0,
+        .b0 = b0,
+        .w2 = w2,
+        .b2 = b2,
+        .w4 = w4,
+        .b4 = b4,
+        .in = in,
+        .hidden0 = h0,
+        .hidden1 = h1,
+        .out = out_dim,
+    };
+
+    const native_row = try allocator.alloc(f32, in);
+    defer allocator.free(native_row);
+    for (native_row, 0..) |*v, i| v.* = @floatFromInt(i % 7);
+    const native = [_][]f32{native_row};
+
+    const out = try applyClipBridge(allocator, &native, &head);
+    defer freeEmbeddingSlices(allocator, out);
+
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+    try std.testing.expectEqual(@as(usize, 768), out[0].len);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[0][0], 1e-6);
+    for (out[0][1..]) |v| try std.testing.expectApproxEqAbs(@as(f32, 0.0), v, 1e-6);
+
+    var norm: f32 = 0;
+    for (out[0]) |v| norm += v * v;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), norm, 1e-5);
+}
+
+test "applyClipBridge rejects an input dim that does not match the bridge" {
+    const allocator = std.testing.allocator;
+
+    var w0 = [_]f32{ 1, 0, 0, 1 };
+    var b0 = [_]f32{ 0, 0 };
+    var w2 = [_]f32{ 1, 0, 0, 1 };
+    var b2 = [_]f32{ 0, 0 };
+    var w4 = [_]f32{ 1, 0, 0, 1 };
+    var b4 = [_]f32{ 0, 0 };
+    var head = ClipBridgeHead{
+        .w0 = w0[0..],
+        .b0 = b0[0..],
+        .w2 = w2[0..],
+        .b2 = b2[0..],
+        .w4 = w4[0..],
+        .b4 = b4[0..],
+        .in = 2,
+        .hidden0 = 2,
+        .hidden1 = 2,
+        .out = 2,
+    };
+
+    var bad_row = [_]f32{ 1, 2, 3 }; // len 3, head.in = 2
+    const native = [_][]f32{bad_row[0..]};
+    try std.testing.expectError(error.BridgeInputDimMismatch, applyClipBridge(allocator, &native, &head));
 }
 
 test "embedImages uses one vision session run for an image batch" {

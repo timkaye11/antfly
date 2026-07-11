@@ -664,6 +664,12 @@ pub const LoadedModel = struct {
     /// /chunk sparse serving). Loaded once from manifest.splade_weight_path and
     /// cached under embedding_session_lock.
     splade_weight: ?[]f32 = null,
+    /// Lazily materialized learned CLIP→text bridge head (3-layer MLP) for a
+    /// multimodal image embedder that projects native CLIP embeddings into the
+    /// target text embedder's retrieval space. Loaded once from
+    /// manifest.bridge_weight_path and cached under embedding_session_lock;
+    /// applied inside EmbeddingPipeline.embedImages (additive, image-only).
+    bridge_head: ?embedding_mod.ClipBridgeHead = null,
 
     pub fn getTokenizer(self: *LoadedModel) tokenizer_mod.Tokenizer {
         if (self.hf_tok) |ht| return ht.tokenizer();
@@ -715,6 +721,10 @@ pub const LoadedModel = struct {
         if (include_image) {
             try self.ensureOptionalSession(&self.vision_session, self.manifest.visual_model_path);
             try self.ensureOptionalSession(&self.visual_projection, self.manifest.visual_projection_path);
+            // Load the learned CLIP→text bridge head (additive, image-only) if the
+            // model dir packages one, so embedImages projects into the target text
+            // retrieval space. Lock is already held; use the lock-free loader.
+            try self.loadBridgeHeadLocked();
         }
         if (include_audio) {
             try self.ensureOptionalSession(&self.audio_session, self.manifest.audio_model_path);
@@ -761,6 +771,26 @@ pub const LoadedModel = struct {
         self.splade_weight = dst;
     }
 
+    /// Load and cache the packaged CLIP→text bridge head as a 3-layer MLP.
+    /// Idempotent; safe to call before embeddingPipeline when image assets are
+    /// requested. Returns error.BridgeHeadUnavailable when the embedder has no
+    /// bridge head. Mirrors ensureSpladeHead's locking.
+    pub fn ensureBridgeHead(self: *LoadedModel) !void {
+        spinLock(&self.embedding_session_lock);
+        defer self.embedding_session_lock.unlock();
+        if (self.bridge_head != null) return;
+        if (self.manifest.bridge_weight_path == null) return error.BridgeHeadUnavailable;
+        try self.loadBridgeHeadLocked();
+    }
+
+    /// Load + cache the bridge head under an already-held embedding_session_lock.
+    /// No-op when the model has no bridge head or it is already cached.
+    fn loadBridgeHeadLocked(self: *LoadedModel) !void {
+        if (self.bridge_head != null) return;
+        const path = self.manifest.bridge_weight_path orelse return;
+        self.bridge_head = try loadClipBridgeHead(self.allocator, path);
+    }
+
     pub fn embeddingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) EmbeddingPipeline {
         const tok = self.getTokenizer();
         var pipeline = EmbeddingPipeline.init(allocator, self.session, tok, .{
@@ -801,6 +831,7 @@ pub const LoadedModel = struct {
         pipeline.resident_projection_stats = &self.resident_projection_stats;
         pipeline.splade_weight = self.splade_weight;
         pipeline.splade_vocab_size = self.manifest.splade_vocab_size;
+        pipeline.bridge_head = if (self.bridge_head) |*bh| bh else null;
         return pipeline;
     }
 
@@ -952,10 +983,85 @@ pub const LoadedModel = struct {
             self.allocator.destroy(head);
         }
         if (self.splade_weight) |w| self.allocator.free(w);
+        if (self.bridge_head) |*bh| bh.deinit(self.allocator);
         self.manifest.deinit();
         self.allocator.free(self.model_dir);
     }
 };
+
+/// Read one F32 bridge tensor into an owned, f32-aligned buffer of exactly
+/// `expected_len` elements. A raw checkpoint can land the mmap data section at a
+/// non-4-byte-aligned address, so validate the element count from byte length
+/// and copy into an aligned buffer (little-endian on all targets), mirroring
+/// ensureSpladeHead.
+fn readBridgeTensorF32(
+    allocator: std.mem.Allocator,
+    reader: *const safetensors_mod.MMapReader,
+    name: []const u8,
+    expected_len: usize,
+) ![]f32 {
+    var tensor = try reader.readTensor(name);
+    defer tensor.deinit();
+    if (tensor.dtype != .f32) return error.BridgeWeightDtypeUnsupported;
+    const elem_count = tensor.data.len / @sizeOf(f32);
+    if (elem_count != expected_len) return error.BridgeWeightShapeMismatch;
+    const dst = try allocator.alloc(f32, expected_len);
+    errdefer allocator.free(dst);
+    if (tensor.asFloat32IfAligned()) |src| {
+        @memcpy(dst, src);
+    } else {
+        @memcpy(std.mem.sliceAsBytes(dst), tensor.data[0 .. expected_len * @sizeOf(f32)]);
+    }
+    return dst;
+}
+
+/// Load the 3-layer bridge MLP (`clip_bridge_head/net.{0,2,4}.{weight,bias}`)
+/// from a `bridge_head.safetensors`. Dims are read from tensor shape and checked
+/// for internal consistency; the input dim is validated against the actual
+/// clipclap projection output at first use (applyClipBridge → BridgeInputDimMismatch).
+fn loadClipBridgeHead(allocator: std.mem.Allocator, path: []const u8) !embedding_mod.ClipBridgeHead {
+    const keys = embedding_mod.clip_bridge_head_keys;
+    var reader = try safetensors_mod.MMapReader.openFileAbsolute(allocator, path);
+    defer reader.deinit();
+
+    const w0_meta = reader.header.tensors.get(keys.net0_weight) orelse return error.BridgeWeightMissing;
+    const w2_meta = reader.header.tensors.get(keys.net2_weight) orelse return error.BridgeWeightMissing;
+    const w4_meta = reader.header.tensors.get(keys.net4_weight) orelse return error.BridgeWeightMissing;
+    if (w0_meta.shape.len != 2 or w2_meta.shape.len != 2 or w4_meta.shape.len != 2) return error.BridgeWeightShapeMismatch;
+
+    // PyTorch Linear weight is [out, in]; the MLP is in → hidden0 → hidden1 → out.
+    const hidden0: usize = @intCast(w0_meta.shape[0]);
+    const in: usize = @intCast(w0_meta.shape[1]);
+    const hidden1: usize = @intCast(w2_meta.shape[0]);
+    const out_dim: usize = @intCast(w4_meta.shape[0]);
+    if (@as(usize, @intCast(w2_meta.shape[1])) != hidden0) return error.BridgeWeightShapeMismatch;
+    if (@as(usize, @intCast(w4_meta.shape[1])) != hidden1) return error.BridgeWeightShapeMismatch;
+
+    var head = embedding_mod.ClipBridgeHead{
+        .w0 = undefined,
+        .b0 = undefined,
+        .w2 = undefined,
+        .b2 = undefined,
+        .w4 = undefined,
+        .b4 = undefined,
+        .in = in,
+        .hidden0 = hidden0,
+        .hidden1 = hidden1,
+        .out = out_dim,
+    };
+    head.w0 = try readBridgeTensorF32(allocator, &reader, keys.net0_weight, hidden0 * in);
+    errdefer allocator.free(head.w0);
+    head.b0 = try readBridgeTensorF32(allocator, &reader, keys.net0_bias, hidden0);
+    errdefer allocator.free(head.b0);
+    head.w2 = try readBridgeTensorF32(allocator, &reader, keys.net2_weight, hidden1 * hidden0);
+    errdefer allocator.free(head.w2);
+    head.b2 = try readBridgeTensorF32(allocator, &reader, keys.net2_bias, hidden1);
+    errdefer allocator.free(head.b2);
+    head.w4 = try readBridgeTensorF32(allocator, &reader, keys.net4_weight, out_dim * hidden1);
+    errdefer allocator.free(head.w4);
+    head.b4 = try readBridgeTensorF32(allocator, &reader, keys.net4_bias, out_dim);
+    return head;
+}
 
 fn isJinaStyleEmbeddingManifest(manifest: *const manifest_mod.ModelManifest) bool {
     return std.mem.eql(u8, manifest.config_model_arch, "jina_embeddings_v5") or
