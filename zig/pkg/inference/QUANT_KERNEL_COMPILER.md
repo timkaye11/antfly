@@ -117,11 +117,13 @@ device via a sister FFI (`termite_metal_run_generated_microkernel_check`) agains
 a self-contained CPU reference (validated bit-identical vs the hand-written kernel,
 `max_abs_error ≤ ~3e-6` across `n∈{1,2,3,4} × d∈{64,128,512,2048,4096}`).
 
-**Attention (next).** Attention routes plug in as `op_kind = .attention` with an
-`AttentionSchedule` and a `renderAttention` skeleton, gated the same way. Because
-attention feeds the whole model, its correctness gate is **bit-identical model
-tokens** (`scripts/compare_metal_gemma4_e4b_qat.sh` oracle text + greedy token-id
-prefix), not raw-float conformance — argmax is robust to summation-order drift.
+**Attention (landed as dev-only candidates).** The compiler owns generated
+decode-1x paged-attention and flash-prefill routes under `op_kind = .attention`,
+with `AttentionSchedule` and `renderAttention` providing the shared lowering.
+Because attention feeds the whole model, their correctness gate is
+**bit-identical model tokens** (`scripts/compare_metal_gemma4_e4b_qat.sh` oracle
+text + greedy token-id prefix), not raw-float conformance — argmax is robust to
+summation-order drift.
 
 ## Compile Flow
 
@@ -423,7 +425,9 @@ Runtime-wired generated candidates that are not promoted stay on handwritten
 production dispatch by default. They remain opt-in through
 `TERMITE_METAL_ENABLE_ANTFLY_*` gates, or all at once with
 `ANTFLY_METAL_GENERATED_QUANT=1` / `TERMITE_METAL_ENABLE_ANTFLY_GENERATED_QUANT=1`,
-and are tracked with explicit blockers.
+and are tracked with explicit blockers. Setting
+`TERMITE_METAL_DISABLE_ANTFLY_GENERATED_QUANT=1` overrides both candidate and
+promoted gates, providing one handwritten-only oracle switch.
 The route-all evidence covers 50 generated cases: all 50 must be route-ready,
 46 must have provider-route evidence, and every non-promoted candidate must
 explain itself with an explicit blocker such as `speedup_gate_missing`,
@@ -432,11 +436,10 @@ counts for non-promoted candidates may vary with timing noise; production
 promotion does not rely on route-all speedup alone.
 
 The dedicated blocker evidence table remains intentionally stricter than
-route-all: 17 candidate kernels are guarded, 12 have benchmark-evidence paths
-(`speedup_gate_missing` for Q4_0, Q5_0, Q5_1, Q4_K none, Q6_K bias+GELU, and
-Q8_0 bias+GELU; `unstable_benchmark_timing` for Q4_1, Q4_K bias+GELU,
-Q5_K none, Q5_K bias+GELU, Q8_1 none, and Q8_K none), and 5 are
-route-evidence-only
+route-all: 14 candidate kernels are guarded, 9 have benchmark-evidence paths
+(`speedup_gate_missing` for Q4_0, Q5_0, Q5_1, Q6_K bias+GELU, and Q8_0
+bias+GELU; `unstable_benchmark_timing` for Q4_1, Q4_K bias+GELU, Q5_K
+bias+GELU, and Q8_1 none), and 5 are route-evidence-only
 because their handwritten baseline is unsupported. Cleared one-off evidence for
 these kernels is production-regression guarded and does not promote the kernel
 by itself.
@@ -445,12 +448,11 @@ This is intentional. A slow or noisy candidate is useful for compiler coverage,
 route testing, and future tuning, but it must not silently become the production
 route.
 
-Current Q4_0, Q4_1, Q5_0, Q5_1, Q4_K none/bias+GELU, Q5_K none/bias+GELU,
-Q6_K bias+GELU, Q8_0 bias+GELU, Q8_1 none, and Q8_K none note: these
-generated kernels are correct and useful for route coverage, but they are not
-production defaults. Their blocker evidence is production-regression guarded; a
-one-off local promotion-ready result is a signal to investigate, not enough to
-promote.
+Current Q4_0, Q4_1, Q5_0, Q5_1, Q4_K bias+GELU, Q5_K bias+GELU, Q6_K
+bias+GELU, Q8_0 bias+GELU, and Q8_1 none note: these generated kernels are
+correct and useful for route coverage, but they are not production defaults.
+Their blocker evidence is production-regression guarded; a one-off local
+promotion-ready result is a signal to investigate, not enough to promote.
 
 Current Q2_K/Q3_K bias and bias+GELU plus Q8_0 relu note: these generated
 kernels prove correctness and dispatch wiring through route-all, but they do not
@@ -470,8 +472,8 @@ Current local validation snapshot:
 - `zig build quant-kernel-codegen -- --check-metal` compiles the generated and
   promoted Metal sources through `xcrun`.
 - `zig build quant-kernel-metal-production-regression-check -Dmetal=true -Dcuda=false`
-  runs the 8 promoted kernels across 16 generated-vs-handwritten cases.
-  `src/ops/cuda/generated/quant_kernel_benchmarks.json` enumerates those 16
+  runs the 11 promoted kernels across 22 generated-vs-handwritten cases.
+  `src/ops/cuda/generated/quant_kernel_benchmarks.json` enumerates those 22
   Metal production-regression cases with shape, dims, tolerance, source
   fingerprint, and benchmark command metadata. The target fails on hard route
   blockers such as missing generated/provider routes, unsupported production
@@ -484,10 +486,11 @@ Current local validation snapshot:
   blockers instead of silently promoting candidates.
 - `zig build quant-kernel-metal-industry-local-check -Dmetal=true -Dcuda=false`
   adds blocker evidence refresh/strict checks and the Gemma4 generated-route
-  prefill-frame smoke. The generated-route smoke now gates model-level
-  generated-family coverage: the local Gemma4 E4B path must report at least two
-  generated quant families, with `q4_0` as the top family and Q8_0/Q4_0
-  generated dispatch counters present.
+  prefill-frame smoke. The generated-route smoke first records an exact-token
+  oracle with generated routes disabled, then requires both normal and
+  stage-synchronized generated runs to match it. The local Gemma4 E4B path must
+  also report at least two generated quant families, with `q4_0` as the top
+  family and Q8_0/Q4_0 generated dispatch counters present.
 
 Metal-named evidence targets are macOS-only by contract. They report a clear
 build failure off macOS so a Linux/CUDA VM can still run CUDA/source checks
@@ -524,7 +527,7 @@ evidence file also records the compiler benchmark manifest schema, case count,
 and case fingerprint, and the evidence checker rejects stale or partial case
 sets before trusting benchmark speedups. Successful production-regression checks
 also print the identity in the summary line as:
-`benchmark_manifest=antfly.quant_kernel_benchmarks.v5:16:<fingerprint>`.
+`benchmark_manifest=antfly.quant_kernel_benchmarks.v5:22:<fingerprint>`.
 
 ## Runtime Observability
 

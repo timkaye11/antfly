@@ -111,7 +111,12 @@ static BOOL termite_metal_env_bool_default(const char *env_name, BOOL default_va
     return termite_metal_env_flag_enabled(value) ? YES : NO;
 }
 
+static BOOL termite_metal_generated_quant_disabled(void) {
+    return termite_metal_env_bool_default("TERMITE_METAL_DISABLE_ANTFLY_GENERATED_QUANT", NO);
+}
+
 static BOOL termite_metal_generated_quant_candidate_enabled(const char *env_name) {
+    if (termite_metal_generated_quant_disabled()) return NO;
     if (env_name == NULL) return YES;
     // An explicit per-kernel setting (including =0) overrides the global gates.
     if (getenv(env_name) != NULL) return termite_metal_env_bool_default(env_name, NO);
@@ -1023,6 +1028,8 @@ typedef struct termite_metal_decode_runtime {
     uint64_t q6_k_linear_reduce_f16_input;
     uint64_t antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_COUNT][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_COUNT];
     uint64_t rms_norm_add_sumsq;
+    BOOL generated_quant_disabled;
+    BOOL generated_quant_disabled_initialized;
     termite_metal_generated_gate_entry generated_gate_cache[TERMITE_METAL_GENERATED_GATE_CACHE_CAPACITY];
     size_t generated_gate_cache_len;
 } termite_metal_decode_runtime;
@@ -1052,7 +1059,17 @@ static void termite_metal_runtime_generated_gate_store(termite_metal_decode_runt
     runtime->generated_gate_cache_len += 1;
 }
 
+static BOOL termite_metal_runtime_generated_quant_disabled(termite_metal_decode_runtime *runtime) {
+    if (runtime == NULL) return termite_metal_generated_quant_disabled();
+    if (!runtime->generated_quant_disabled_initialized) {
+        runtime->generated_quant_disabled = termite_metal_generated_quant_disabled();
+        runtime->generated_quant_disabled_initialized = YES;
+    }
+    return runtime->generated_quant_disabled;
+}
+
 static BOOL termite_metal_runtime_candidate_gate(termite_metal_decode_runtime *runtime, const char *env_name) {
+    if (termite_metal_runtime_generated_quant_disabled(runtime)) return NO;
     if (env_name == NULL) return YES;
     if (runtime == NULL) return termite_metal_generated_quant_candidate_enabled(env_name);
     BOOL enabled;
@@ -1064,6 +1081,7 @@ static BOOL termite_metal_runtime_candidate_gate(termite_metal_decode_runtime *r
 
 // YES when the promoted generated route is allowed (its DISABLE env is not truthy).
 static BOOL termite_metal_runtime_promoted_gate(termite_metal_decode_runtime *runtime, const char *disable_env_name) {
+    if (termite_metal_runtime_generated_quant_disabled(runtime)) return NO;
     if (runtime == NULL) return !termite_metal_env_bool_default(disable_env_name, NO);
     BOOL enabled;
     if (termite_metal_runtime_generated_gate_lookup(runtime, disable_env_name, &enabled)) return enabled;
@@ -22458,6 +22476,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_q4_k_bias_slot_device(
     size_t output_offset
 ) {
     if (runtime == NULL || input_handle == NULL || bias_handle == NULL || output_handle == NULL) return -1;
+    if (!termite_metal_runtime_candidate_gate(runtime, NULL)) return -2;
     if (slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -3;
     if (rows < 2 || rows > 8 || in_dim == 0 || out_dim == 0 || (in_dim & 255u) != 0) return -4;
     if (rows > UINT32_MAX || in_dim > UINT32_MAX || out_dim > UINT32_MAX) return -5;

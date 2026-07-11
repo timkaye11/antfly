@@ -389,30 +389,36 @@ fn ensureParentDir(io: std.Io, path: []const u8) !void {
 }
 
 fn checkMetalArtifacts(allocator: std.mem.Allocator, io: std.Io) !void {
+    const temp_dir = try std.fmt.allocPrint(allocator, "/tmp/antfly-quant-kernel-codegen-metal-{d}", .{std.posix.system.getpid()});
+    defer allocator.free(temp_dir);
+    std.Io.Dir.cwd().deleteTree(io, temp_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, temp_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, temp_dir) catch {};
+
     var count: usize = 0;
     for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
         if (artifact.backend != .metal) continue;
-        try checkMetalArtifact(allocator, io, artifact);
+        try checkMetalArtifact(allocator, io, temp_dir, artifact);
         count += 1;
     }
     for (quant_kernel_compiler.first_generated_microkernel_artifacts) |artifact| {
         if (artifact.backend != .metal) continue;
-        try checkMetalArtifact(allocator, io, artifact);
+        try checkMetalArtifact(allocator, io, temp_dir, artifact);
         count += 1;
     }
     for (quant_kernel_compiler.first_generated_attention_artifacts) |artifact| {
         if (artifact.backend != .metal) continue;
-        try checkMetalArtifact(allocator, io, artifact);
+        try checkMetalArtifact(allocator, io, temp_dir, artifact);
         count += 1;
     }
-    const v2_count = try checkMetalRenderedV2(allocator, io);
+    const v2_count = try checkMetalRenderedV2(allocator, io, temp_dir);
     print("quant kernel generated Metal check: {d} artifacts + {d} rendered v2\n", .{ count, v2_count });
 }
 
 // Renders every metal_production_schedules route through the descriptor-driven
 // renderer and compiles it with `xcrun metal`. Shadow-only: these v2 sources are
 // not checked in; this proves the renderer emits compilable MSL for every route.
-fn checkMetalRenderedV2(allocator: std.mem.Allocator, io: std.Io) !usize {
+fn checkMetalRenderedV2(allocator: std.mem.Allocator, io: std.Io, temp_dir: []const u8) !usize {
     const renderer = quant_kernel_compiler_renderer;
     var count: usize = 0;
     for (quant_kernel_compiler.metal_production_schedules) |entry| {
@@ -430,9 +436,9 @@ fn checkMetalRenderedV2(allocator: std.mem.Allocator, io: std.Io) !usize {
         defer allocator.free(body);
         const full = try std.fmt.allocPrint(allocator, "#include <metal_stdlib>\nusing namespace metal;\n{s}", .{body});
         defer allocator.free(full);
-        const src_path = try std.fmt.allocPrint(allocator, "/tmp/{s}.metal", .{kernel_id});
+        const src_path = try std.fmt.allocPrint(allocator, "{s}/{s}.metal", .{ temp_dir, kernel_id });
         defer allocator.free(src_path);
-        const air_path = try std.fmt.allocPrint(allocator, "/tmp/{s}.air", .{kernel_id});
+        const air_path = try std.fmt.allocPrint(allocator, "{s}/{s}.air", .{ temp_dir, kernel_id });
         defer allocator.free(air_path);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = src_path, .data = full });
         var child = try std.process.spawn(io, .{
@@ -454,10 +460,12 @@ fn checkMetalRenderedV2(allocator: std.mem.Allocator, io: std.Io) !usize {
     return count;
 }
 
-fn checkMetalArtifact(allocator: std.mem.Allocator, io: std.Io, artifact: quant_kernel_compiler.GeneratedArtifact) !void {
+fn checkMetalArtifact(allocator: std.mem.Allocator, io: std.Io, temp_dir: []const u8, artifact: quant_kernel_compiler.GeneratedArtifact) !void {
     const source_path = try existingSourcePath(allocator, io, artifact.source_path);
     defer if (source_path.owned) allocator.free(source_path.value);
-    const output_path = metalCheckOutputPath(artifact.check_command) orelse return error.InvalidMetalCheckCommand;
+    _ = metalCheckOutputPath(artifact.check_command) orelse return error.InvalidMetalCheckCommand;
+    const output_path = try std.fmt.allocPrint(allocator, "{s}/{s}.air", .{ temp_dir, artifact.kernel_id });
+    defer allocator.free(output_path);
     var child = try std.process.spawn(io, .{
         .argv = &.{ "xcrun", "--toolchain", "Metal", "metal", "-c", source_path.value, "-o", output_path },
         .stdin = .ignore,

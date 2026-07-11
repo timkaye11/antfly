@@ -79,9 +79,132 @@ fn shouldSkipAutoMtpDraftLoad(config: generation.GenerationConfig, draft_cfg: gp
     if (config.speculation_policy != .auto) return false;
     if (!draft_cfg.gemma4_mtp_assistant) return false;
     if (config.speculation_calibration == .none) return true;
-    if (!generation.gemma4MtpTargetReplayLikelyActive()) return true;
     const requested_max_tokens: usize = @intCast(@max(config.max_tokens, 1));
     return requested_max_tokens < generation.gemma4MtpAutoMinGenerationTokens();
+}
+
+const GenerateSpeculationOptions = struct {
+    k: u32,
+    policy: generation.SpeculationPolicy,
+    calibration: generation.SpeculationCalibration,
+};
+
+fn parseGenerateSpeculationOptions(
+    draft_requested: bool,
+    speculative_k: ?i64,
+    policy_raw: ?[]const u8,
+    calibration_raw: ?[]const u8,
+) !GenerateSpeculationOptions {
+    const k = speculative_k orelse 4;
+    if (k < 1 or k > 16) return error.InvalidSpeculativeK;
+    if (!draft_requested and (policy_raw != null or calibration_raw != null)) {
+        return error.SpeculationRequiresDraftModel;
+    }
+    const policy: generation.SpeculationPolicy = if (policy_raw) |raw|
+        generation.parseSpeculationPolicy(raw) orelse return error.InvalidSpeculationPolicy
+    else
+        .auto;
+    const calibration: generation.SpeculationCalibration = if (calibration_raw) |raw| blk: {
+        if (!std.mem.eql(u8, raw, "none") and
+            !std.mem.eql(u8, raw, "probe") and
+            !std.mem.eql(u8, raw, "positive"))
+        {
+            return error.InvalidSpeculationCalibration;
+        }
+        break :blk generation.parseSpeculationCalibration(raw).?;
+    } else if (draft_requested and policy == .auto) .probe else .none;
+    return .{
+        .k = @intCast(k),
+        .policy = policy,
+        .calibration = calibration,
+    };
+}
+
+fn generateSpeculationStatus(stats: ?generation.SpeculativeDecodeStats) ?api.GenerateSpeculationStatus {
+    const value = stats orelse return null;
+    return .{
+        .policy = value.speculation_policy.name(),
+        .calibration = value.speculation_calibration.name(),
+        .decision = value.speculation_policy_decision.name(),
+        .disabled_reason = value.mtp_disabled_reason orelse switch (value.speculation_policy_decision) {
+            .disabled_off => "speculation_policy_off",
+            .disabled_unavailable => "draft_backend_unavailable",
+            .disabled_uncalibrated => "speculation_calibration_required",
+            .disabled_low_acceptance => "mtp_auto_low_acceptance",
+            .disabled_zero_match => "mtp_auto_zero_match",
+            .disabled_slow => "mtp_auto_cost_probe_slow",
+            .disabled_insufficient_probe => "mtp_auto_insufficient_cost_probe",
+            .inactive, .active, .forced => null,
+        },
+    };
+}
+
+fn shouldResolveDraftModel(policy: generation.SpeculationPolicy) bool {
+    return policy != .off;
+}
+
+fn effectiveDraftModelName(requested: ?[]const u8, policy: generation.SpeculationPolicy) ?[]const u8 {
+    return if (shouldResolveDraftModel(policy)) requested else null;
+}
+
+fn generateQueueUnitsForSpeculation(base_units: usize, draft_requested: bool, policy: generation.SpeculationPolicy) usize {
+    if (!draft_requested or !shouldResolveDraftModel(policy)) return base_units;
+    return std.math.add(usize, base_units, base_units) catch std.math.maxInt(usize);
+}
+
+fn generationBackendKind(backend: backends_mod.BackendType) ?runtime.kv.pool.BackendKind {
+    return switch (backend) {
+        .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+        .onnx, .pjrt, .wasm => null,
+    };
+}
+
+fn maxBudgetLimits(a: runtime.tier.memory.Limits, b: runtime.tier.memory.Limits) runtime.tier.memory.Limits {
+    return .{
+        .host_limit_bytes = @max(a.host_limit_bytes, b.host_limit_bytes),
+        .backend_limit_bytes = @max(a.backend_limit_bytes, b.backend_limit_bytes),
+        .combined_limit_bytes = @max(a.combined_limit_bytes, b.combined_limit_bytes),
+        .kv_limit_bytes = @max(a.kv_limit_bytes, b.kv_limit_bytes),
+        .scratch_limit_bytes = @max(a.scratch_limit_bytes, b.scratch_limit_bytes),
+    };
+}
+
+fn validateCacheCompactionRatio(ratio: ?f32) !void {
+    if (ratio) |value| try (runtime.kv.compaction.CompactionConfig{ .target_ratio = value }).validate();
+}
+
+fn effectiveSpeculationStats(
+    stats: ?generation.SpeculativeDecodeStats,
+    requested: bool,
+    policy: generation.SpeculationPolicy,
+    calibration: generation.SpeculationCalibration,
+) ?generation.SpeculativeDecodeStats {
+    if (stats != null) return stats;
+    if (!requested or policy != .off) return null;
+    return .{
+        .speculation_policy = policy,
+        .speculation_calibration = calibration,
+        .speculation_policy_decision = .disabled_off,
+        .mtp_disabled_reason = "speculation_policy_off",
+    };
+}
+
+fn recordSpeculationOutcome(metrics: *metrics_mod.Metrics, stats: ?generation.SpeculativeDecodeStats) void {
+    const value = stats orelse return;
+    switch (value.speculation_policy_decision) {
+        .active, .forced => metrics.incSpeculationActive(),
+        .inactive,
+        .disabled_off,
+        .disabled_unavailable,
+        .disabled_uncalibrated,
+        .disabled_low_acceptance,
+        .disabled_zero_match,
+        .disabled_slow,
+        .disabled_insufficient_probe,
+        => metrics.incSpeculationDisabled(),
+    }
 }
 
 pub const BudgetOverrides = struct {
@@ -736,7 +859,7 @@ pub const Node = struct {
         if (timing != null) {
             std.log.info("direct generator loaded model={s} backend={s}", .{ model_name, @tagName(model.session.backend()) });
         }
-        model.lockNativeGeneration();
+        model.lockNativeGeneration(io);
         defer model.unlockNativeGeneration();
         const gpt_config = session_factory.getGptConfig(model.session) orelse return error.UnsupportedGeneratorProvider;
         const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
@@ -2150,15 +2273,59 @@ pub const Node = struct {
             }
         }
 
-        const same_named_draft_model = if (body.draft_model) |draft_model_name|
-            body.model.len > 0 and std.mem.eql(u8, draft_model_name, body.model)
-        else
-            false;
-        const effective_draft_model_name: ?[]const u8 = if (same_named_draft_model) null else body.draft_model;
+        const requested_draft_model_name = body.draft_model;
+        if (requested_draft_model_name != null and requested_draft_model_name.?.len == 0) {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "draft_model must not be empty",
+            });
+        }
+        const speculation = parseGenerateSpeculationOptions(
+            requested_draft_model_name != null,
+            body.speculative_k,
+            body.speculation_policy,
+            body.speculation_calibration,
+        ) catch |err| {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = switch (err) {
+                    error.InvalidSpeculativeK => "speculative_k must be between 1 and 16",
+                    error.InvalidSpeculationPolicy => "speculation_policy must be auto, force, or off",
+                    error.InvalidSpeculationCalibration => "speculation_calibration must be none, probe, or positive",
+                    error.SpeculationRequiresDraftModel => "speculation_policy and speculation_calibration require draft_model",
+                },
+            });
+        };
+        const effective_draft_model_name = effectiveDraftModelName(requested_draft_model_name, speculation.policy);
+        if (effective_draft_model_name) |draft_model_name| {
+            if (body.model.len > 0 and std.mem.eql(u8, draft_model_name, body.model)) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "draft_model must identify a model different from model",
+                });
+            }
+        }
+        validateCacheCompactionRatio(body.cache_compaction_ratio) catch {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "cache_compaction_ratio must be finite, greater than 0, and at most 1",
+            });
+        };
+        if (body.cache_compaction_ratio != null) {
+            return ctx.status(400).json(.{
+                .@"error" = "UNSUPPORTED_FEATURE",
+                .message = "cache_compaction_ratio is not supported by resident server generation",
+            });
+        }
+        if (requested_draft_model_name != null) self.metrics.incSpeculationRequested();
 
         const want_stream = body.stream orelse false;
         const configured_max_tokens: i32 = if (body.max_tokens) |mt| @intCast(mt) else 256;
-        const queue_units = self.estimateGenerateQueueUnits(messages.items, configured_max_tokens);
+        const queue_units = generateQueueUnitsForSpeculation(
+            self.estimateGenerateQueueUnits(messages.items, configured_max_tokens),
+            effective_draft_model_name != null,
+            speculation.policy,
+        );
         if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
         defer self.releaseSlotUnits(queue_units);
 
@@ -2171,11 +2338,10 @@ pub const Node = struct {
             .repetition_penalty = body.repetition_penalty orelse 1.0,
             .frequency_penalty = body.frequency_penalty orelse 0,
             .presence_penalty = body.presence_penalty orelse 0,
-            .speculative_k = if (effective_draft_model_name != null)
-                if (body.speculative_k) |k| @intCast(@max(k, 1)) else 4
-            else
-                4,
-            .speculation_requested = effective_draft_model_name != null,
+            .speculative_k = speculation.k,
+            .speculation_requested = requested_draft_model_name != null,
+            .speculation_policy = speculation.policy,
+            .speculation_calibration = speculation.calibration,
             .prefill_chunk_size = 256,
             .cache_dtype = body.cache_dtype,
             .cache_compaction_ratio = body.cache_compaction_ratio,
@@ -2314,6 +2480,12 @@ pub const Node = struct {
                 result.prompt_tokens,
                 result.tokens_used,
                 parsed_tool_calls,
+                effectiveSpeculationStats(
+                    result.speculative,
+                    config.speculation_requested,
+                    config.speculation_policy,
+                    config.speculation_calibration,
+                ),
             );
         }
 
@@ -2420,6 +2592,12 @@ pub const Node = struct {
                     result.prompt_tokens,
                     result.tokens_used,
                     parsed_tool_calls,
+                    effectiveSpeculationStats(
+                        result.speculative,
+                        config.speculation_requested,
+                        config.speculation_policy,
+                        config.speculation_calibration,
+                    ),
                 );
             }
         }
@@ -2432,8 +2610,6 @@ pub const Node = struct {
                 return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
         } else self.model_manager.loadFromDir(model_path) catch |err|
             return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
-        model.lockNativeGeneration();
-        defer model.unlockNativeGeneration();
         const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
         const prompt_tokens = self.estimateNativePromptTokens(ctx.allocator, model, messages.items) catch |err|
             return ctx.status(500).json(.{ .@"error" = "TOKENIZE_FAILED", .message = @errorName(err) });
@@ -2455,14 +2631,8 @@ pub const Node = struct {
                 .@"error" = "INVALID_MODEL",
                 .message = "model does not support generation (not a GPT-family model)",
             });
-        const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
-            .native => .native,
-            .metal => .metal,
-            .cuda => .cuda,
-            .pjrt => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected PJRT backend in native generation path" }),
-            .onnx => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected ONNX backend in native generation path" }),
-            .wasm => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected WASM backend in server generation path" }),
-        };
+        const backend_kind = generationBackendKind(model.session.backend()) orelse
+            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unsupported backend in native generation path" });
         const kv_dtype = if (config.cache_dtype) |name|
             runtime.kv.pool.parseKvDType(name) orelse
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid cache_dtype value" })
@@ -2499,6 +2669,9 @@ pub const Node = struct {
         var draft_cb: ?ops.ComputeBackend = null;
         defer if (draft_cb) |*cb_value| cb_value.deinit();
         var draft_gpt_config: ?@import("../models/gpt.zig").Config = null;
+        var loaded_draft_model: ?*model_manager_mod.LoadedModel = null;
+        var draft_backend_kind: ?runtime.kv.pool.BackendKind = null;
+        var draft_kv_dtype: ?runtime.kv.pool.KvDType = null;
         var pjrt_client: ?pjrt_lib.pjrt.Client = null;
         defer if (pjrt_client) |*client| client.deinit();
         var pjrt_plugin_path: ?[:0]u8 = null;
@@ -2514,64 +2687,119 @@ pub const Node = struct {
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         }
 
-        if (effective_draft_model_name) |draft_model_name| {
+        if (effective_draft_model_name) |draft_model_name| if (shouldResolveDraftModel(config.speculation_policy)) {
             const draft_model_path = self.resolveModelPath(ctx.io, draft_model_name, "generators") catch
                 return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "draft model not found" });
-            if (!std.mem.eql(u8, draft_model_path, model_path)) {
-                config.draft_model = draft_model_path;
-                var load_draft_backend = true;
-                if (config.speculation_policy == .auto) {
-                    var draft_manifest = manifest_mod.loadFromDir(ctx.allocator, draft_model_path) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
-                    defer draft_manifest.deinit();
-                    const draft_cfg = session_factory.loadGptConfigFromModelDir(ctx.allocator, draft_model_path, draft_manifest) catch |err|
-                        return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) });
-                    if (shouldSkipAutoMtpDraftLoad(config, draft_cfg)) {
-                        draft_gpt_config = draft_cfg;
-                        load_draft_backend = false;
-                    }
-                }
-                if (load_draft_backend) {
-                    const draft_model = if (backend_selection.native_choice != .auto) blk: {
-                        var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
-                        configureGenerateBackendPreference(&request_session_manager, backend_selection);
-                        break :blk self.model_manager.loadFromDirWithPreferredBackends(draft_model_path, request_session_manager.preferred_backends, false) catch |err|
-                            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
-                    } else self.model_manager.loadFromDir(draft_model_path) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
-                    const draft_cfg = session_factory.getGptConfig(draft_model.session) orelse
-                        return ctx.status(400).json(.{
-                            .@"error" = "INVALID_MODEL",
-                            .message = "draft_model does not support generation",
-                        });
-                    const draft_tok = draft_model.getTokenizer();
-                    const target_special = tok.specialTokens();
-                    const draft_special = draft_tok.specialTokens();
-                    if (draft_tok.vocabSize() != tok.vocabSize() or
-                        draft_cfg.vocab_size != gpt_config.vocab_size or
-                        draft_special.cls_id != target_special.cls_id or
-                        draft_special.sep_id != target_special.sep_id or
-                        draft_special.pad_id != target_special.pad_id or
-                        draft_special.unk_id != target_special.unk_id)
-                    {
-                        return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "draft_model tokenizer is incompatible with target model",
-                        });
-                    }
-
-                    draft_cb = session_factory.getComputeBackendWithBudget(draft_model.session, ctx.allocator, &run_budget) catch |err| {
-                        if (err == error.MemoryBudgetExceeded) {
-                            return ctx.status(507).json(.{
-                                .@"error" = "MEMORY_BUDGET_EXCEEDED",
-                                .message = memoryBudgetExceededMessage(ctx.allocator, draft_model.session, &run_budget),
-                            });
-                        }
-                        return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
-                    };
+            if (std.mem.eql(u8, draft_model_path, model_path)) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "draft_model must resolve to a model different from model",
+                });
+            }
+            config.draft_model = draft_model_path;
+            var load_draft_backend = true;
+            if (config.speculation_policy == .auto) {
+                var draft_manifest = manifest_mod.loadFromDir(ctx.allocator, draft_model_path) catch |err|
+                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                defer draft_manifest.deinit();
+                const draft_cfg = session_factory.loadGptConfigFromModelDir(ctx.allocator, draft_model_path, draft_manifest) catch |err|
+                    return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) });
+                if (shouldSkipAutoMtpDraftLoad(config, draft_cfg)) {
                     draft_gpt_config = draft_cfg;
+                    load_draft_backend = false;
                 }
             }
+            if (load_draft_backend) {
+                const draft_model = if (backend_selection.native_choice != .auto) blk: {
+                    var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
+                    configureGenerateBackendPreference(&request_session_manager, backend_selection);
+                    break :blk self.model_manager.loadFromDirWithPreferredBackends(draft_model_path, request_session_manager.preferred_backends, false) catch |err|
+                        return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                } else self.model_manager.loadFromDir(draft_model_path) catch |err|
+                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                if (draft_model == model) {
+                    return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = "draft_model must resolve to a model different from model",
+                    });
+                }
+                const draft_cfg = session_factory.getGptConfig(draft_model.session) orelse
+                    return ctx.status(400).json(.{
+                        .@"error" = "INVALID_MODEL",
+                        .message = "draft_model does not support generation",
+                    });
+                const draft_tok = draft_model.getTokenizer();
+                const target_special = tok.specialTokens();
+                const draft_special = draft_tok.specialTokens();
+                if (draft_tok.vocabSize() != tok.vocabSize() or
+                    draft_cfg.vocab_size != gpt_config.vocab_size or
+                    draft_special.cls_id != target_special.cls_id or
+                    draft_special.sep_id != target_special.sep_id or
+                    draft_special.pad_id != target_special.pad_id or
+                    draft_special.unk_id != target_special.unk_id)
+                {
+                    return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = "draft_model tokenizer is incompatible with target model",
+                    });
+                }
+                draft_backend_kind = generationBackendKind(draft_model.session.backend()) orelse
+                    return ctx.status(400).json(.{
+                        .@"error" = "INVALID_MODEL",
+                        .message = "draft_model backend does not support native speculative generation",
+                    });
+                loaded_draft_model = draft_model;
+                draft_gpt_config = draft_cfg;
+            }
+        };
+
+        if (loaded_draft_model) |draft_model| {
+            const draft_cfg = draft_gpt_config.?;
+            const draft_kind = draft_backend_kind.?;
+            const draft_budget_class: runtime.tier.memory.BackendClass = switch (draft_kind) {
+                .native => .cpu,
+                .metal, .cuda => .gpu,
+            };
+            const draft_budget_limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(
+                draft_model.session,
+                runtime.tier.memory.defaultLimitsForBackend(draft_budget_class),
+            ));
+            run_budget.limits = maxBudgetLimits(run_budget.limits, draft_budget_limits);
+            draft_kv_dtype = if (config.cache_dtype) |name|
+                runtime.kv.pool.parseKvDType(name).?
+            else
+                session_factory.recommendedKvDTypeForSession(draft_model.session, draft_kind);
+            run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
+                draft_kind,
+                draft_kv_dtype.?,
+                draft_cfg,
+                prompt_tokens,
+                @intCast(@max(config.max_tokens, 1)),
+                admission_prefill_chunk,
+            )) catch |err| {
+                if (err == error.MemoryBudgetExceeded) {
+                    return ctx.status(507).json(.{
+                        .@"error" = "MEMORY_BUDGET_EXCEEDED",
+                        .message = memoryBudgetExceededMessage(ctx.allocator, draft_model.session, &run_budget),
+                    });
+                }
+                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+            };
+        }
+
+        const first_locked_model = if (loaded_draft_model) |draft_model|
+            if (@intFromPtr(draft_model) < @intFromPtr(model)) draft_model else model
+        else
+            model;
+        const second_locked_model: ?*model_manager_mod.LoadedModel = if (loaded_draft_model) |draft_model|
+            if (first_locked_model == model) draft_model else model
+        else
+            null;
+        first_locked_model.lockNativeGeneration(ctx.io);
+        if (second_locked_model) |second| second.lockNativeGeneration(ctx.io);
+        defer {
+            if (second_locked_model) |second| second.unlockNativeGeneration();
+            first_locked_model.unlockNativeGeneration();
         }
 
         var kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
@@ -2589,6 +2817,17 @@ pub const Node = struct {
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         };
         defer cb.deinit();
+        if (loaded_draft_model) |draft_model| {
+            draft_cb = session_factory.getComputeBackendWithBudget(draft_model.session, ctx.allocator, &run_budget) catch |err| {
+                if (err == error.MemoryBudgetExceeded) {
+                    return ctx.status(507).json(.{
+                        .@"error" = "MEMORY_BUDGET_EXCEEDED",
+                        .message = memoryBudgetExceededMessage(ctx.allocator, draft_model.session, &run_budget),
+                    });
+                }
+                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+            };
+        }
         const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
             null
         else if (gpt_config.sliding_window > 0)
@@ -2628,10 +2867,7 @@ pub const Node = struct {
 
         if (draft_cb != null) {
             if (draft_gpt_config) |draft_cfg| {
-                // Draft model uses the same backend kind as the target — they run
-                // on the same machine so the available backends are identical.
-                const draft_backend_kind = backend_kind;
-                const draft_kv_dtype = session_factory.recommendedKvDTypeForGptConfig(draft_cfg, draft_backend_kind);
+                const draft_kind = draft_backend_kind.?;
                 draft_kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
                 const draft_sliding_window_size: ?u32 = if (draft_cfg.position_encoding == .absolute)
                     null
@@ -2640,8 +2876,8 @@ pub const Node = struct {
                 else
                     null;
                 const draft_pool_id = draft_kv_manager.?.addPool(.{
-                    .backend = draft_backend_kind,
-                    .dtype = draft_kv_dtype,
+                    .backend = draft_kind,
+                    .dtype = draft_kv_dtype.?,
                     .page_size_tokens = 16,
                     .num_layers_packed = @intCast(draft_cfg.num_hidden_layers),
                     .num_kv_heads = draft_cfg.num_key_value_heads,
@@ -2755,6 +2991,12 @@ pub const Node = struct {
             result.prompt_tokens,
             result.tokens_used,
             parsed_tool_calls,
+            effectiveSpeculationStats(
+                result.speculative,
+                config.speculation_requested,
+                config.speculation_policy,
+                config.speculation_calibration,
+            ),
         );
     }
 
@@ -2887,6 +3129,11 @@ pub const Node = struct {
     fn generateBatchUnsupportedReasonPreflight(body: api.GenerateRequest) ?api.GenerateBatchError {
         if (body.stream orelse false) return .{ .code = "UNSUPPORTED_STREAM", .message = "batch generation does not support stream=true", .retryable = false };
         if (body.tools != null or body.tool_choice != null) return .{ .code = "UNSUPPORTED_TOOLS", .message = "batch generation does not support tools yet", .retryable = false };
+        if (body.cache_compaction_ratio) |ratio| {
+            validateCacheCompactionRatio(ratio) catch
+                return .{ .code = "INVALID_CACHE_COMPACTION_RATIO", .message = "cache_compaction_ratio must be finite, greater than 0, and at most 1", .retryable = false };
+            return .{ .code = "UNSUPPORTED_CACHE_COMPACTION", .message = "batch generation does not support cache_compaction_ratio", .retryable = false };
+        }
         if (body.draft_model != null) return .{ .code = "UNSUPPORTED_DRAFT_MODEL", .message = "batch generation does not support draft_model yet", .retryable = false };
         if (body.mode) |mode| {
             if (!std.mem.eql(u8, mode, "eager")) return .{ .code = "UNSUPPORTED_MODE", .message = "batch generation requires eager native mode", .retryable = false };
@@ -2930,6 +3177,12 @@ pub const Node = struct {
     }
 
     fn generateConfigFromBody(allocator: std.mem.Allocator, body: api.GenerateRequest) !generation.GenerationConfig {
+        const speculation = try parseGenerateSpeculationOptions(
+            body.draft_model != null,
+            body.speculative_k,
+            body.speculation_policy,
+            body.speculation_calibration,
+        );
         var config = generation.GenerationConfig{
             .max_tokens = if (body.max_tokens) |mt| @intCast(mt) else 256,
             .temperature = body.temperature orelse 0,
@@ -2939,8 +3192,10 @@ pub const Node = struct {
             .repetition_penalty = body.repetition_penalty orelse 1.0,
             .frequency_penalty = body.frequency_penalty orelse 0,
             .presence_penalty = body.presence_penalty orelse 0,
-            .speculative_k = 4,
+            .speculative_k = speculation.k,
             .speculation_requested = false,
+            .speculation_policy = speculation.policy,
+            .speculation_calibration = speculation.calibration,
             .prefill_chunk_size = 256,
             .cache_dtype = body.cache_dtype,
             .cache_compaction_ratio = body.cache_compaction_ratio,
@@ -3142,7 +3397,7 @@ pub const Node = struct {
                 continue;
             };
 
-            model.lockNativeGeneration();
+            model.lockNativeGeneration(ctx.io);
             {
                 defer model.unlockNativeGeneration();
 
@@ -3487,6 +3742,7 @@ pub const Node = struct {
             result.text,
             result.finish_reason,
             tool_parser,
+            result.speculative,
         ) catch |err| {
             writer.writeEvent("error", @errorName(err)) catch {};
             writer.close() catch {};
@@ -3598,7 +3854,7 @@ pub const Node = struct {
     }
 
     fn buildGenerateResponse(
-        _: *Node,
+        self: *Node,
         ctx: *httpx.Context,
         model_name: []const u8,
         response_text: []const u8,
@@ -3606,7 +3862,9 @@ pub const Node = struct {
         prompt_tokens: usize,
         completion_tokens: usize,
         tool_calls: ?[]const tool_parser_mod.ToolCall,
+        speculative: ?generation.SpeculativeDecodeStats,
     ) !httpx.Response {
+        recordSpeculationOutcome(&self.metrics, speculative);
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
         const alloc = arena.allocator();
@@ -3649,6 +3907,7 @@ pub const Node = struct {
                 .completion_tokens = @intCast(completion_tokens),
                 .total_tokens = @intCast(prompt_tokens + completion_tokens),
             },
+            .speculation = generateSpeculationStatus(speculative),
         });
     }
 
@@ -3700,7 +3959,7 @@ pub const Node = struct {
     /// SSE streaming generation: sends token-by-token events via chunked transfer encoding.
     /// OpenAI-compatible format: data: {"choices":[{"delta":{"content":"token"}}]}\n\n
     fn streamGenerate(
-        _: *Node,
+        self: *Node,
         ctx: *httpx.Context,
         model_name: []const u8,
         pipeline: anytype,
@@ -3727,37 +3986,37 @@ pub const Node = struct {
             errored: bool = false,
 
             fn onToken(raw_ctx: *anyopaque, token_text: []const u8) bool {
-                const self: *@This() = @ptrCast(@alignCast(raw_ctx));
-                if (self.parser) |parser| {
+                const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
+                if (stream.parser) |parser| {
                     const update = parser.feed(token_text) catch {
-                        self.errored = true;
+                        stream.errored = true;
                         return false;
                     };
                     if (update.ready_text.len > 0) {
-                        emitContentDelta(self.writer, self.allocator, self.stream_id, self.stream_created, self.model_name, update.ready_text) catch {
-                            self.errored = true;
+                        emitContentDelta(stream.writer, stream.allocator, stream.stream_id, stream.stream_created, stream.model_name, update.ready_text) catch {
+                            stream.errored = true;
                             return false;
                         };
                     }
                     if (!parser.streamsIncrementalToolDeltas() and update.new_calls.len > 0) {
                         for (update.new_calls, 0..) |call, idx| {
-                            emitToolCallDelta(self.writer, self.allocator, self.stream_id, self.stream_created, self.model_name, update.call_start_index + idx, call) catch {
-                                self.errored = true;
+                            emitToolCallDelta(stream.writer, stream.allocator, stream.stream_id, stream.stream_created, stream.model_name, update.call_start_index + idx, call) catch {
+                                stream.errored = true;
                                 return false;
                             };
                         }
                     }
                     if (update.active_tool_delta) |delta| {
-                        emitToolCallDeltaUpdate(self.writer, self.allocator, self.stream_id, self.stream_created, self.model_name, delta) catch {
-                            self.errored = true;
+                        emitToolCallDeltaUpdate(stream.writer, stream.allocator, stream.stream_id, stream.stream_created, stream.model_name, delta) catch {
+                            stream.errored = true;
                             return false;
                         };
                     }
                     return true;
                 }
                 // Build OpenAI-compatible SSE chunk
-                emitContentDelta(self.writer, self.allocator, self.stream_id, self.stream_created, self.model_name, token_text) catch {
-                    self.errored = true;
+                emitContentDelta(stream.writer, stream.allocator, stream.stream_id, stream.stream_created, stream.model_name, token_text) catch {
+                    stream.errored = true;
                     return false;
                 };
                 return true;
@@ -3798,14 +4057,22 @@ pub const Node = struct {
             return ctx.response.build();
         }
 
+        const speculative = effectiveSpeculationStats(
+            result.speculative,
+            config.speculation_requested,
+            config.speculation_policy,
+            config.speculation_calibration,
+        );
+        recordSpeculationOutcome(&self.metrics, speculative);
+
         if (tool_parser != null) {
-            flushStreamParserState(ctx.allocator, &writer, stream_id, stream_created, model_name, result.finish_reason, tool_parser.?) catch |err| {
+            flushStreamParserState(ctx.allocator, &writer, stream_id, stream_created, model_name, result.finish_reason, tool_parser.?, speculative) catch |err| {
                 writer.writeEvent("error", @errorName(err)) catch {};
                 writer.close() catch {};
                 return ctx.response.build();
             };
         } else {
-            emitFinishDelta(&writer, ctx.allocator, stream_id, stream_created, model_name, result.finish_reason) catch {};
+            emitFinishDelta(&writer, ctx.allocator, stream_id, stream_created, model_name, result.finish_reason, speculative) catch {};
         }
 
         // Send the final [DONE] event (OpenAI convention)
@@ -3824,6 +4091,7 @@ pub const Node = struct {
         full_text: []const u8,
         default_finish_reason: []const u8,
         tool_parser: ?*tool_parser_mod.Parser,
+        speculative: ?generation.SpeculativeDecodeStats,
     ) !void {
         if (tool_parser) |parser| {
             parser.reset();
@@ -3840,16 +4108,16 @@ pub const Node = struct {
                     .name = call.function.name,
                     .arguments = call.function.arguments,
                 });
-                try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, "tool_calls");
+                try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, "tool_calls", speculative);
                 return;
             }
             if (remaining.len == 0 and full_text.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, full_text);
-            try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, default_finish_reason);
+            try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, default_finish_reason, speculative);
             return;
         }
 
         if (full_text.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, full_text);
-        try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, default_finish_reason);
+        try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, default_finish_reason, speculative);
     }
 
     fn flushStreamParserState(
@@ -3860,12 +4128,13 @@ pub const Node = struct {
         model_name: []const u8,
         default_finish_reason: []const u8,
         parser: *tool_parser_mod.Parser,
+        speculative: ?generation.SpeculativeDecodeStats,
     ) !void {
         const remaining = try parser.finishRemainingText(allocator);
         defer allocator.free(remaining);
         if (remaining.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, remaining);
         const finish_reason = if (parser.toolCalls().len > 0) "tool_calls" else default_finish_reason;
-        try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, finish_reason);
+        try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, finish_reason, speculative);
     }
 
     fn parseFinishReason(s: []const u8) api.FinishReason {
@@ -3986,6 +4255,7 @@ pub const Node = struct {
         stream_created: i64,
         model_name: []const u8,
         finish_reason: []const u8,
+        speculative: ?generation.SpeculativeDecodeStats,
     ) !void {
         const choices = [_]api.GenerateChunkChoice{.{
             .index = 0,
@@ -3998,6 +4268,7 @@ pub const Node = struct {
             .created = stream_created,
             .model = model_name,
             .choices = &choices,
+            .speculation = generateSpeculationStatus(speculative),
         });
     }
 
@@ -6471,6 +6742,145 @@ test "node config accepts shared scraping config" {
     };
     try std.testing.expectEqual(@as(?bool, true), cfg.content_security.?.block_private_ips);
     try std.testing.expectEqualStrings("s3.amazonaws.com", cfg.s3_credentials.?.endpoint.?);
+}
+
+test "generate speculation options validate the HTTP trust boundary" {
+    const defaults = try parseGenerateSpeculationOptions(true, null, null, null);
+    try std.testing.expectEqual(@as(u32, 4), defaults.k);
+    try std.testing.expectEqual(generation.SpeculationPolicy.auto, defaults.policy);
+    try std.testing.expectEqual(generation.SpeculationCalibration.probe, defaults.calibration);
+    const forced = try parseGenerateSpeculationOptions(true, null, "force", null);
+    try std.testing.expectEqual(generation.SpeculationCalibration.none, forced.calibration);
+    try std.testing.expect(!shouldResolveDraftModel(.off));
+    try std.testing.expectEqual(@as(usize, 7), generateQueueUnitsForSpeculation(7, false, .auto));
+    try std.testing.expectEqual(@as(usize, 7), generateQueueUnitsForSpeculation(7, true, .off));
+    try std.testing.expectEqual(@as(usize, 14), generateQueueUnitsForSpeculation(7, true, .auto));
+    try std.testing.expectEqual(std.math.maxInt(usize), generateQueueUnitsForSpeculation(std.math.maxInt(usize), true, .force));
+    try std.testing.expectError(error.SpeculationRequiresDraftModel, parseGenerateSpeculationOptions(false, null, "auto", null));
+    try std.testing.expectError(error.SpeculationRequiresDraftModel, parseGenerateSpeculationOptions(false, null, null, "probe"));
+    try std.testing.expectError(error.InvalidSpeculativeK, parseGenerateSpeculationOptions(true, 0, null, null));
+    try std.testing.expectError(error.InvalidSpeculativeK, parseGenerateSpeculationOptions(true, 17, null, null));
+    try std.testing.expectError(error.InvalidSpeculationPolicy, parseGenerateSpeculationOptions(true, 4, "sometimes", null));
+    try std.testing.expectError(error.InvalidSpeculationCalibration, parseGenerateSpeculationOptions(true, 4, null, "calibrate"));
+    try std.testing.expectError(error.InvalidSpeculationCalibration, parseGenerateSpeculationOptions(true, 4, null, "unknown"));
+}
+
+test "generate speculation status exposes disabled decisions" {
+    const status = generateSpeculationStatus(.{
+        .speculation_policy = .auto,
+        .speculation_calibration = .none,
+        .speculation_policy_decision = .disabled_uncalibrated,
+        .mtp_disabled_reason = "speculation_calibration_required",
+    }).?;
+    try std.testing.expectEqualStrings("auto", status.policy);
+    try std.testing.expectEqualStrings("none", status.calibration);
+    try std.testing.expectEqualStrings("disabled_uncalibrated", status.decision);
+    try std.testing.expectEqualStrings("speculation_calibration_required", status.disabled_reason.?);
+
+    const unavailable = generateSpeculationStatus(.{ .speculation_policy_decision = .disabled_unavailable }).?;
+    try std.testing.expectEqualStrings("draft_backend_unavailable", unavailable.disabled_reason.?);
+}
+
+test "generate policy off has no effective draft and reports disabled" {
+    try std.testing.expect(effectiveDraftModelName("draft", .off) == null);
+    try std.testing.expectEqualStrings("draft", effectiveDraftModelName("draft", .auto).?);
+
+    const stats = effectiveSpeculationStats(null, true, .off, .none).?;
+    try std.testing.expectEqual(generation.SpeculativeDecodeStats.PolicyDecision.disabled_off, stats.speculation_policy_decision);
+    try std.testing.expectEqualStrings("speculation_policy_off", stats.mtp_disabled_reason.?);
+    try std.testing.expect(effectiveSpeculationStats(null, false, .off, .none) == null);
+}
+
+test "generate auto MTP probe does not require replay" {
+    const threshold = generation.gemma4MtpAutoMinGenerationTokens();
+    var config: generation.GenerationConfig = .{
+        .max_tokens = @intCast(threshold),
+        .speculation_policy = .auto,
+        .speculation_calibration = .probe,
+    };
+    const draft_config: gpt_model_mod.Config = .{ .gemma4_mtp_assistant = true };
+    try std.testing.expect(!shouldSkipAutoMtpDraftLoad(config, draft_config));
+
+    config.max_tokens = @intCast(threshold - 1);
+    try std.testing.expect(shouldSkipAutoMtpDraftLoad(config, draft_config));
+    config.max_tokens = @intCast(threshold);
+    config.speculation_calibration = .none;
+    try std.testing.expect(shouldSkipAutoMtpDraftLoad(config, draft_config));
+    config.speculation_policy = .force;
+    try std.testing.expect(!shouldSkipAutoMtpDraftLoad(config, draft_config));
+}
+
+test "generate draft resources follow the draft backend" {
+    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, .native), generationBackendKind(.native));
+    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, .metal), generationBackendKind(.metal));
+    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, .cuda), generationBackendKind(.cuda));
+    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, null), generationBackendKind(.onnx));
+    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, null), generationBackendKind(.pjrt));
+    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, null), generationBackendKind(.wasm));
+
+    const limits = maxBudgetLimits(
+        .{ .host_limit_bytes = 2, .backend_limit_bytes = 8, .kv_limit_bytes = 3 },
+        .{ .host_limit_bytes = 5, .backend_limit_bytes = 4, .combined_limit_bytes = 9, .scratch_limit_bytes = 7 },
+    );
+    try std.testing.expectEqual(@as(usize, 5), limits.host_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 8), limits.backend_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 9), limits.combined_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 3), limits.kv_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 7), limits.scratch_limit_bytes);
+}
+
+test "generate speculation outcome metrics classify completed requests" {
+    var metrics = metrics_mod.Metrics.default;
+    recordSpeculationOutcome(&metrics, .{ .speculation_policy_decision = .active });
+    recordSpeculationOutcome(&metrics, .{ .speculation_policy_decision = .disabled_off });
+    recordSpeculationOutcome(&metrics, null);
+
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+    try metrics.render(&writer.writer);
+    const output = writer.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_speculation_active_total 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_speculation_disabled_total 1\n") != null);
+}
+
+test "generate cache compaction ratio validates the HTTP trust boundary" {
+    try validateCacheCompactionRatio(null);
+    try validateCacheCompactionRatio(0.01);
+    try validateCacheCompactionRatio(1.0);
+    try std.testing.expectError(error.InvalidCompactionRatio, validateCacheCompactionRatio(0.0));
+    try std.testing.expectError(error.InvalidCompactionRatio, validateCacheCompactionRatio(-0.1));
+    try std.testing.expectError(error.InvalidCompactionRatio, validateCacheCompactionRatio(1.01));
+    try std.testing.expectError(error.InvalidCompactionRatio, validateCacheCompactionRatio(std.math.nan(f32)));
+    try std.testing.expectError(error.InvalidCompactionRatio, validateCacheCompactionRatio(std.math.inf(f32)));
+}
+
+test "generate batch rejects draft models instead of ignoring them" {
+    const request_json =
+        \\{"model":"m","draft_model":"draft","messages":[{"role":"user","content":"hello"}]}
+    ;
+    var parsed = try std.json.parseFromSlice(api.GenerateRequest, std.testing.allocator, request_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    const reason = Node.generateBatchUnsupportedReasonPreflight(parsed.value) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("UNSUPPORTED_DRAFT_MODEL", reason.code);
+}
+
+test "generate batch rejects cache compaction clearly" {
+    const unsupported_json =
+        \\{"model":"m","cache_compaction_ratio":0.5,"messages":[{"role":"user","content":"hello"}]}
+    ;
+    var unsupported = try std.json.parseFromSlice(api.GenerateRequest, std.testing.allocator, unsupported_json, .{ .ignore_unknown_fields = true });
+    defer unsupported.deinit();
+    const unsupported_reason = Node.generateBatchUnsupportedReasonPreflight(unsupported.value) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("UNSUPPORTED_CACHE_COMPACTION", unsupported_reason.code);
+
+    const invalid_json =
+        \\{"model":"m","cache_compaction_ratio":0,"messages":[{"role":"user","content":"hello"}]}
+    ;
+    var invalid = try std.json.parseFromSlice(api.GenerateRequest, std.testing.allocator, invalid_json, .{ .ignore_unknown_fields = true });
+    defer invalid.deinit();
+    const invalid_reason = Node.generateBatchUnsupportedReasonPreflight(invalid.value) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("INVALID_CACHE_COMPACTION_RATIO", invalid_reason.code);
 }
 
 test "generate batch preflight rejects image content without parsing media" {

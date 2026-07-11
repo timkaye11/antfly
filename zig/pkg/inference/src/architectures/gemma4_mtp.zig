@@ -942,13 +942,13 @@ pub fn draftTokenDevice(request: DraftDeviceRequest) !DraftDeviceResult {
         break :blk activations.argmax(logits[0..draft_cfg.vocab_size]);
     };
     if (draft_frame_active) {
-        draft_frame_active = false;
         // Consumed by the frame-final argmax on the happy path; fallback
         // paths may have flushed-and-rebegun (or encoded further ops) — drain
         // whatever frame is still open so no state leaks out of the step.
         if (request.draft_cb.decoderRuntimeHasActiveFrame()) {
             try request.draft_cb.decoderRuntimeSubmitAndWaitFrame();
         }
+        draft_frame_active = false;
     }
     profile.argmax_ns = profileElapsedNs(argmax_started_at);
 

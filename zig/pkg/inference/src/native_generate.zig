@@ -130,8 +130,15 @@ fn shouldSkipMetalAutoDraftLoad(opts: Options, draft_is_gemma4_mtp: bool) bool {
         (!draft_is_gemma4_mtp or !generation.gemma4MtpMetalAutoEnabled());
 }
 
+fn validateCacheCompactionOption(ratio: ?f32) !void {
+    const value = ratio orelse return;
+    try (runtime.kv.compaction.CompactionConfig{ .target_ratio = value }).validate();
+    return error.KvStorageCompactionNotSupported;
+}
+
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const opts = try parseArgs(args);
+    try validateCacheCompactionOption(opts.cache_compaction_ratio);
     try native_backend_choice.validate(opts.backend);
     var preflight_draft_gpt_config: ?gpt_mod.Config = null;
     const effective_draft_model = if (opts.speculation_policy == .off) null else if (opts.backend == .metal and opts.speculation_policy == .auto) blk: {
@@ -6730,6 +6737,12 @@ test "explicit Metal auto draft admission stays Gemma4 MTP-only" {
     };
     try std.testing.expect(shouldSkipMetalAutoDraftLoad(opts, false));
     try std.testing.expect(!shouldSkipMetalAutoDraftLoad(opts, true));
+}
+
+test "generate CLI rejects unsupported cache compaction before model loading" {
+    try validateCacheCompactionOption(null);
+    try std.testing.expectError(error.InvalidCompactionRatio, validateCacheCompactionOption(0.0));
+    try std.testing.expectError(error.KvStorageCompactionNotSupported, validateCacheCompactionOption(0.5));
 }
 
 test "parseArgs accepts artifact dir" {

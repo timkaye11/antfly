@@ -250,6 +250,7 @@ pub const InferenceGenerateMessage = types.InferenceGenerateMessage;
 pub const InferenceGenerateRequest = types.InferenceGenerateRequest;
 pub const InferenceGenerateResponse = types.InferenceGenerateResponse;
 pub const InferenceGenerateResponseFormat = types.InferenceGenerateResponseFormat;
+pub const InferenceGenerateSpeculationStatus = types.InferenceGenerateSpeculationStatus;
 pub const InferenceGenerateUsage = types.InferenceGenerateUsage;
 pub const InferenceImageURL = types.InferenceImageURL;
 pub const InferenceImageURLContentPart = types.InferenceImageURLContentPart;

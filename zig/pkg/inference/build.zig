@@ -357,19 +357,16 @@ pub fn build(b: *std.Build) void {
         }
         quant_kernel_metal_sweep_step.dependOn(&run_quant_kernel_metal_sweep.step);
 
-        const route_all_evidence_path = "/private/tmp/antfly-quant-metal-runtime-route-all-evidence.json";
         const run_quant_kernel_metal_runtime_route_all = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
-        run_quant_kernel_metal_runtime_route_all.addArgs(&.{
-            "--evidence-out",
-            route_all_evidence_path,
-            "--runtime-route-all",
-        });
+        run_quant_kernel_metal_runtime_route_all.has_side_effects = true;
+        run_quant_kernel_metal_runtime_route_all.addArg("--evidence-out");
+        const route_all_evidence_name = b.fmt("antfly-quant-metal-runtime-route-all-evidence-{x}.json", .{b.graph.random_seed});
+        const route_all_evidence = run_quant_kernel_metal_runtime_route_all.addOutputFileArg(route_all_evidence_name);
+        run_quant_kernel_metal_runtime_route_all.addArg("--runtime-route-all");
         const check_quant_kernel_metal_runtime_route_all = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
-        check_quant_kernel_metal_runtime_route_all.addArgs(&.{
-            "--check-evidence",
-            route_all_evidence_path,
-            "--require-runtime-route-all",
-        });
+        check_quant_kernel_metal_runtime_route_all.addArg("--check-evidence");
+        check_quant_kernel_metal_runtime_route_all.addFileArg(route_all_evidence);
+        check_quant_kernel_metal_runtime_route_all.addArg("--require-runtime-route-all");
         if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
             run_quant_kernel_metal_runtime_route_all.step.dependOn(metal_artifact_check_step);
             check_quant_kernel_metal_runtime_route_all.step.dependOn(metal_artifact_check_step);
@@ -377,11 +374,12 @@ pub fn build(b: *std.Build) void {
         check_quant_kernel_metal_runtime_route_all.step.dependOn(&run_quant_kernel_metal_runtime_route_all.step);
         quant_kernel_metal_runtime_route_all_step.dependOn(&check_quant_kernel_metal_runtime_route_all.step);
 
-        const production_regression_evidence_path = "/private/tmp/antfly-quant-metal-production-regression-evidence.json";
         const run_quant_kernel_metal_production_regression = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
+        run_quant_kernel_metal_production_regression.has_side_effects = true;
+        run_quant_kernel_metal_production_regression.addArg("--evidence-out");
+        const production_regression_evidence_name = b.fmt("antfly-quant-metal-production-regression-evidence-{x}.json", .{b.graph.random_seed});
+        _ = run_quant_kernel_metal_production_regression.addOutputFileArg(production_regression_evidence_name);
         run_quant_kernel_metal_production_regression.addArgs(&.{
-            "--evidence-out",
-            production_regression_evidence_path,
             "--repeat-runs",
             "5",
             "--measure-iters",
@@ -528,7 +526,7 @@ pub fn build(b: *std.Build) void {
     metal_gemma4_prefill_frame_test.addFileArg(exe.getEmittedBin());
     const metal_gemma4_prefill_frame_test_step = b.step(
         "test-metal-gemma4-prefill-frame",
-        "Run the local Metal Gemma4 prefill-frame no-fallback/stage-sync smoke test",
+        "Run the local Metal Gemma4 handwritten/generated stage-sync parity smoke test",
     );
     metal_gemma4_prefill_frame_test_step.dependOn(&metal_gemma4_prefill_frame_test.step);
 
@@ -543,7 +541,7 @@ pub fn build(b: *std.Build) void {
     );
     const metal_gemma4_prefill_frame_generated_q8_test_step = b.step(
         "test-metal-gemma4-prefill-frame-generated-q8",
-        "Run the local Metal Gemma4 prefill-frame generated-Q8_0 smoke test",
+        "Run the local Metal Gemma4 generated-Q8_0 parity smoke against handwritten",
     );
     metal_gemma4_prefill_frame_generated_q8_test_step.dependOn(&metal_gemma4_prefill_frame_generated_q8_test.step);
 
@@ -558,7 +556,7 @@ pub fn build(b: *std.Build) void {
     );
     const metal_gemma4_prefill_frame_e4b_test_step = b.step(
         "test-metal-gemma4-prefill-frame-e4b",
-        "Run the local Metal Gemma4 E4B prefill-frame no-fallback/stage-sync smoke test",
+        "Run the local Metal Gemma4 E4B handwritten/generated stage-sync parity smoke",
     );
     metal_gemma4_prefill_frame_e4b_test_step.dependOn(&metal_gemma4_prefill_frame_e4b_test.step);
 
@@ -572,7 +570,7 @@ pub fn build(b: *std.Build) void {
     metal_gemma4_prefill_frame_e4b_generated_q8_test.addFileArg(exe.getEmittedBin());
     const metal_gemma4_prefill_frame_e4b_generated_q8_test_step = b.step(
         "test-metal-gemma4-prefill-frame-e4b-generated-q8",
-        "Run the local Metal Gemma4 E4B generated-Q8_0 route smoke test",
+        "Run the local Metal Gemma4 E4B generated-Q8_0 parity smoke against handwritten",
     );
     metal_gemma4_prefill_frame_e4b_generated_q8_test_step.dependOn(&metal_gemma4_prefill_frame_e4b_generated_q8_test.step);
 
@@ -591,7 +589,7 @@ pub fn build(b: *std.Build) void {
     metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test.addFileArg(exe.getEmittedBin());
     const metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test_step = b.step(
         "test-metal-gemma4-prefill-frame-e4b-generated-q8-q4-0",
-        "Run the local Metal Gemma4 E4B generated-Q8_0/Q4_0 route smoke test",
+        "Run the local Metal Gemma4 E4B generated-Q8_0/Q4_0 parity smoke against handwritten",
     );
     metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test_step.dependOn(&metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test.step);
 

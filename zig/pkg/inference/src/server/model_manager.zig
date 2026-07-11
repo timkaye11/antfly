@@ -726,7 +726,7 @@ pub const LoadedModel = struct {
     shared_prefetch: ?*runtime.tier.shared.SharedPrefetchState = null,
     native_generate_coordinator: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = null,
     native_generation_graph_cache: graph_mod.cache.GraphCache,
-    // ponytail: per-model native generation lock; replace with Metal-safe batching if throughput matters.
+    // ponytail: model-wide safety lock; replace with per-request backend state only when continuous batching is proven safe.
     native_generate_lock: std.atomic.Mutex = .unlocked,
     // Multimodal sessions (CLIP/CLAP/CLIPCLAP)
     embedding_session_lock: std.atomic.Mutex = .unlocked,
@@ -746,8 +746,8 @@ pub const LoadedModel = struct {
         unreachable;
     }
 
-    pub fn lockNativeGeneration(self: *LoadedModel) void {
-        spinLock(&self.native_generate_lock);
+    pub fn lockNativeGeneration(self: *LoadedModel, io: std.Io) void {
+        platform.sync.lockYieldingIo(&self.native_generate_lock, io);
     }
 
     pub fn unlockNativeGeneration(self: *LoadedModel) void {

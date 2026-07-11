@@ -217,13 +217,22 @@ pub const KernelSchedule = struct {
         }
         switch (self.reduction) {
             .simd_sum => if (self.threads_per_threadgroup != 32) return error.SimdSumNeeds32Threads,
-            .threadgroup_tree, .hybrid_simd => if (self.threads_per_threadgroup < 64) return error.MultiSimdgroupNeeds64Threads,
+            .threadgroup_tree => {
+                if (self.threads_per_threadgroup < 64) return error.MultiSimdgroupNeeds64Threads;
+                if (!std.math.isPowerOfTwo(self.threads_per_threadgroup)) return error.ThreadgroupTreeNeedsPowerOfTwoThreads;
+            },
+            .hybrid_simd => if (self.threads_per_threadgroup < 64) return error.MultiSimdgroupNeeds64Threads,
         }
         if (block_values == 0 or (block_values & (block_values - 1)) != 0) {
             return error.BlockValuesNotPowerOfTwo;
         }
     }
 };
+
+test "quant kernel compiler threadgroup tree schedule requires power-of-two threads" {
+    const schedule = KernelSchedule{ .threads_per_threadgroup = 96, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree };
+    try std.testing.expectError(error.ThreadgroupTreeNeedsPowerOfTwoThreads, schedule.validate(256));
+}
 
 /// One (format, row_bucket, epilogue) -> schedule mapping. The
 /// `metal_production_schedules` table below enumerates every currently
@@ -9265,10 +9274,9 @@ test "quant kernel compiler docs describe compile API guardrail" {
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "The route-all evidence covers 50 generated cases"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "all 50 must be route-ready"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "46 must have provider-route evidence"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "17 candidate kernels are guarded"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "`speedup_gate_missing` for Q4_0, Q5_0, Q5_1, Q4_K none, Q6_K bias+GELU, and\nQ8_0 bias+GELU"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "`unstable_benchmark_timing` for Q4_1, Q4_K bias+GELU"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "Q5_K none, Q5_K bias+GELU, Q8_1 none, and Q8_K none"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "14 candidate kernels are guarded, 9 have benchmark-evidence paths"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "`speedup_gate_missing` for Q4_0, Q5_0, Q5_1, Q6_K bias+GELU, and Q8_0\nbias+GELU"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "`unstable_benchmark_timing` for Q4_1, Q4_K bias+GELU, Q5_K\nbias+GELU, and Q8_1 none"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "and 5 are"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "route-evidence-only"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "because their handwritten baseline is unsupported"));
@@ -9280,7 +9288,7 @@ test "quant kernel compiler docs describe compile API guardrail" {
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "Unsupported-handwritten-baseline candidates are route-evidence-only"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "cannot be promoted"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "by the sequential speedup gate"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "benchmark_manifest=antfly.quant_kernel_benchmarks.v5:16:<fingerprint>"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "benchmark_manifest=antfly.quant_kernel_benchmarks.v5:22:<fingerprint>"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "Runtime Observability"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "`fast_path_misses`: the sum of explicit, mutually exclusive fallback reasons"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "Actual generated Metal dispatch counters are not treated as handwritten\nfallbacks"));
@@ -9392,6 +9400,10 @@ test "quant kernel compiler production Metal source includes only runtime-wired 
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, contents, "TERMITE_METAL_DISABLE_ANTFLY_Q5_K_SMALL_BATCH"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q6_K_SMALL_BATCH"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, contents, "TERMITE_METAL_DISABLE_ANTFLY_Q6_K_SMALL_BATCH"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "TERMITE_METAL_DISABLE_ANTFLY_GENERATED_QUANT"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "static BOOL termite_metal_runtime_generated_quant_disabled"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 2, "if (termite_metal_runtime_generated_quant_disabled(runtime)) return NO;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "if (!termite_metal_runtime_candidate_gate(runtime, NULL)) return -2;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "typedef enum termite_metal_generated_quant_epilogue"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "TERMITE_METAL_GENERATED_QUANT_EPILOGUE_BIAS"));
@@ -9714,12 +9726,17 @@ test "quant kernel compiler Metal build check covers generated and promoted arti
     try std.testing.expect(!std.mem.containsAtLeast(u8, contents, 1, "run_quant_kernel_metal_runtime_default_check"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, contents, 1, "quant_kernel_metal_runtime_default_check_step"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "quant-kernel-metal-runtime-route-all"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "run_quant_kernel_metal_runtime_route_all.has_side_effects = true"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "--runtime-route-all"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "--require-runtime-route-all"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "quant-kernel-metal-production-regression-check"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "\"500\",\n            \"--production-regression-check\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "--production-regression-check"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "/private/tmp/antfly-quant-metal-production-regression-evidence.json"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "run_quant_kernel_metal_production_regression.has_side_effects = true"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "antfly-quant-metal-runtime-route-all-evidence-{x}.json"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "addOutputFileArg(route_all_evidence_name)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "antfly-quant-metal-production-regression-evidence-{x}.json"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "addOutputFileArg(production_regression_evidence_name)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "quant-kernel-metal-blocker-evidence-refresh"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "--refresh-blocker-evidence"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "quant-kernel-metal-blocker-strict-check"));

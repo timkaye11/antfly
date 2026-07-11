@@ -248,7 +248,7 @@ pub const DocumentClassificationObject = struct {
     prefix: []const u8,
     input: std.json.Value,
     features: DocumentClassificationFeatures,
-    best: ?std.json.Value = null,
+    best: ?DocumentClassificationResult = null,
     scores: []const DocumentClassificationResult,
 };
 
@@ -308,7 +308,7 @@ pub const DocumentTokenClassificationPrediction = struct {
     text: []const u8,
     bbox: []const i64,
     features: DocumentTokenClassificationFeatures,
-    best: ?std.json.Value = null,
+    best: ?DocumentTokenClassificationResult = null,
     scores: []const DocumentTokenClassificationResult,
 };
 
@@ -589,6 +589,7 @@ pub const GenerateChunk = struct {
     created: i64,
     model: []const u8,
     choices: []const GenerateChunkChoice,
+    speculation: ?GenerateSpeculationStatus = null,
 };
 
 pub const GenerateChunkChoice = struct {
@@ -656,9 +657,13 @@ pub const GenerateRequest = struct {
     draft_model: ?[]const u8 = null,
     /// inference-native speculative decoding extension. Number of draft tokens proposed per verification round.
     speculative_k: ?i64 = null,
+    /// inference-native speculative decoding policy: `auto`, `force`, or `off`. Defaults to `auto` when a draft model is requested.
+    speculation_policy: ?[]const u8 = null,
+    /// inference-native speculative decoding calibration state: `none`, `probe`, or `positive`. Defaults to `probe` for `auto` draft requests so they are measured instead of silently disabled, and to `none` for `force` or `off`.
+    speculation_calibration: ?[]const u8 = null,
     /// inference-native KV cache quantization format. Lower precision reduces memory usage but may affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
     cache_dtype: ?[]const u8 = null,
-    /// inference-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
+    /// inference-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction. The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`; device-backed compaction is not yet supported.
     cache_compaction_ratio: ?f32 = null,
     backend: ?ModelBackend = null,
     /// inference-native graph execution mode. `eager` keeps the direct runtime path when possible. `compiled` runs inference graph planning, partitioning, and backend executor attachment.
@@ -682,6 +687,7 @@ pub const GenerateResponse = struct {
     /// List of completion choices (currently always 1)
     choices: []const GenerateChoice,
     usage: GenerateUsage,
+    speculation: ?GenerateSpeculationStatus = null,
 };
 
 pub const GenerateResponseFormat = struct {
@@ -689,6 +695,14 @@ pub const GenerateResponseFormat = struct {
     type: []const u8,
     /// Optional schema payload for `type=json_schema`. Enforced during native constrained decoding and validated after generation.
     json_schema: ?GenerateJsonSchemaConfig = null,
+};
+
+/// Effective speculative-decoding decision for this completion.
+pub const GenerateSpeculationStatus = struct {
+    policy: []const u8,
+    calibration: []const u8,
+    decision: []const u8,
+    disabled_reason: ?[]const u8 = null,
 };
 
 pub const GenerateUsage = struct {

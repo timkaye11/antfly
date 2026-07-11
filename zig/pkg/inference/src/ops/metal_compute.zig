@@ -18314,6 +18314,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn submitAndWaitDecoderRuntimeFrame(self: *MetalCompute, runtime: ?*metal_runtime.RawMetalDecodeRuntime, active: *bool) !void {
         if (!active.*) return;
+        errdefer self.cancelDecoderRuntimeFrame(runtime, active);
         const rt = runtime orelse {
             active.* = false;
             return;

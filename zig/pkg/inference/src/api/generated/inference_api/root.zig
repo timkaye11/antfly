@@ -65,6 +65,7 @@ pub const GenerateMessage = types.GenerateMessage;
 pub const GenerateRequest = types.GenerateRequest;
 pub const GenerateResponse = types.GenerateResponse;
 pub const GenerateResponseFormat = types.GenerateResponseFormat;
+pub const GenerateSpeculationStatus = types.GenerateSpeculationStatus;
 pub const GenerateUsage = types.GenerateUsage;
 pub const ImageURL = types.ImageURL;
 pub const ImageURLContentPart = types.ImageURLContentPart;

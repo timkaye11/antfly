@@ -2097,6 +2097,7 @@ fn parseArgs(args: []const [:0]const u8) !Config {
     if (cfg.production_regression_check and cfg.promotion_ready_kernel != null) return error.ProductionRegressionCheckConflictsWithPromotionReadyKernel;
     if (cfg.production_regression_check and cfg.runtime_route_kernel != null) return error.ProductionRegressionCheckConflictsWithRuntimeRouteKernel;
     if (cfg.production_regression_check and cfg.runtime_route_all) return error.ProductionRegressionCheckConflictsWithRuntimeRouteAll;
+    if (cfg.production_regression_check and cfg.measure_iters != quant_kernel_compiler.metal_promotion_measure_iters) return error.ProductionRegressionCheckRequiresMeasureIters;
     if (cfg.promotion_ready_kernel) |kernel| {
         if (!std.mem.containsAtLeast(u8, cfg.evidence_out_path.?, 1, kernel)) return error.PromotionReadyKernelRequiresKernelEvidencePath;
     }
@@ -2179,8 +2180,11 @@ test "quant kernel metal runtime check parses evidence output flag" {
     try std.testing.expectEqual(@as(u32, 100), measure_cfg.measure_iters.?);
     const route_all_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--runtime-route-all" });
     try std.testing.expect(route_all_cfg.runtime_route_all);
-    const production_regression_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--repeat-runs", "5", "--production-regression-check" });
+    const production_regression_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--repeat-runs", "5", "--measure-iters", "500", "--production-regression-check" });
     try std.testing.expect(production_regression_cfg.production_regression_check);
+    try std.testing.expectEqual(quant_kernel_compiler.metal_promotion_measure_iters, production_regression_cfg.measure_iters.?);
+    try std.testing.expectError(error.ProductionRegressionCheckRequiresMeasureIters, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--repeat-runs", "5", "--production-regression-check" }));
+    try std.testing.expectError(error.ProductionRegressionCheckRequiresMeasureIters, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--repeat-runs", "5", "--measure-iters", "25", "--production-regression-check" }));
     const route_all_check_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-evidence", "/tmp/evidence.json", "--require-runtime-route-all" });
     try std.testing.expect(route_all_check_cfg.require_runtime_route_all);
     const blocker_check_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-blocker-evidence" });
@@ -2600,8 +2604,8 @@ fn appendSweepScheduleJson(allocator: std.mem.Allocator, out: *std.ArrayListUnma
 // Flash schedule JSON carries the attention knobs the matmul schedule JSON omits.
 fn appendFlashScheduleJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), schedule: quant_kernel_compiler.KernelSchedule) !void {
     const chunk = try std.fmt.allocPrint(allocator, "{{\"threads\": {d}, \"cols\": {d}, \"reduction\": \"{s}\", \"key_chunk\": {d}, \"skip_rescale\": {s}}}", .{
-        schedule.threads_per_threadgroup, schedule.cols_per_threadgroup, reductionName(schedule.reduction),
-        schedule.key_chunk, if (schedule.skip_rescale) "true" else "false",
+        schedule.threads_per_threadgroup, schedule.cols_per_threadgroup,                  reductionName(schedule.reduction),
+        schedule.key_chunk,               if (schedule.skip_rescale) "true" else "false",
     });
     defer allocator.free(chunk);
     try out.appendSlice(allocator, chunk);
@@ -3132,39 +3136,20 @@ fn runHandwrittenBaselineIfSupported(
     expected: []const f32,
 ) !?u64 {
     if (!handwrittenBaselineSupported(check)) return null;
+    const master_disable_env = "TERMITE_METAL_DISABLE_ANTFLY_GENERATED_QUANT";
+    const old_master_disable = std.c.getenv(master_disable_env);
+    const old_master_disable_copy = if (old_master_disable) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+    defer if (old_master_disable_copy) |value| allocator.free(value);
+    if (setenv(master_disable_env, "1", 1) != 0) return error.MetalRuntimeUnavailable;
+    defer if (old_master_disable_copy) |value| {
+        _ = setenv(master_disable_env, value.ptr, 1);
+    } else {
+        _ = unsetenv(master_disable_env);
+    };
+
     if (isQuantBiasEpilogue(check)) {
         return try runQuantBiasSplitBaseline(allocator, check, raw_weight, input, bias, expected);
     }
-    const enable_env = enableEnvForGeneratedCandidateRoute(check);
-    const old_enable = if (enable_env) |env_name| std.c.getenv(env_name) else null;
-    const old_enable_copy = if (old_enable) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
-    defer if (old_enable_copy) |value| allocator.free(value);
-    if (enable_env) |env_name| {
-        if (unsetenv(env_name) != 0) return error.MetalRuntimeUnavailable;
-    }
-    defer if (enable_env) |env_name| {
-        if (old_enable_copy) |value| {
-            _ = setenv(env_name, value.ptr, 1);
-        } else {
-            _ = unsetenv(env_name);
-        }
-    };
-
-    const disable_env = disableEnvForGeneratedProductionRoute(check);
-    const old_disable = if (disable_env) |env_name| std.c.getenv(env_name) else null;
-    const old_disable_copy = if (old_disable) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
-    defer if (old_disable_copy) |value| allocator.free(value);
-    if (disable_env) |env_name| {
-        if (setenv(env_name, "1", 1) != 0) return error.MetalRuntimeUnavailable;
-    }
-    defer if (disable_env) |env_name| {
-        if (old_disable_copy) |value| {
-            _ = setenv(env_name, value.ptr, 1);
-        } else {
-            _ = unsetenv(env_name);
-        }
-    };
-
     return try runDecodeRuntime(allocator, check, raw_weight, input, null, expected, "handwritten", false);
 }
 
@@ -3960,6 +3945,7 @@ fn writeEvidence(
         if (!hasPromotionRepeatRuns(repeat_runs)) return error.InvalidArgument;
         for (checks) |check| {
             if (!productionMetalRuntimeCheck(check)) return error.InvalidArgument;
+            if (check.measure_iters != quant_kernel_compiler.metal_promotion_measure_iters) return error.InvalidArgument;
         }
     }
     if (production_regression_check and (promotion_ready_kernel != null or runtime_route_kernel != null or runtime_route_all)) return error.InvalidArgument;
@@ -3981,6 +3967,7 @@ fn writeEvidence(
     const route_args = try std.fmt.allocPrint(allocator, "{s}{s}", .{ promotion_arg, runtime_route_arg });
     defer allocator.free(route_args);
     const measure_iters = if (checks.len == 0) default_measure_iters else checks[0].measure_iters;
+    if (production_regression_check and measure_iters != quant_kernel_compiler.metal_promotion_measure_iters) return error.InvalidArgument;
     const measure_iters_arg = if (measure_iters != default_measure_iters)
         try std.fmt.allocPrint(allocator, " --measure-iters {d}", .{measure_iters})
     else
@@ -5222,6 +5209,7 @@ fn checkEvidenceJson(allocator: std.mem.Allocator, bytes: []const u8, require_pr
     if (production_regression_check) {
         if (!commandHasToken(benchmark_command, "--production-regression-check")) return error.InvalidMetalEvidence;
         if (!hasPromotionRepeatRuns(repeat_runs)) return error.InvalidMetalEvidence;
+        if (measure_iters_override != quant_kernel_compiler.metal_promotion_measure_iters) return error.InvalidMetalEvidence;
         const compiler_manifest_schema = jsonString(root.object.get("compiler_benchmark_manifest_schema")) orelse return error.InvalidMetalEvidence;
         if (!std.mem.eql(u8, compiler_manifest_schema, quant_kernel_compiler.first_benchmark_manifest_schema)) return error.InvalidMetalEvidence;
         const compiler_manifest_case_count = jsonUsize(root.object.get("compiler_benchmark_manifest_case_count")) orelse return error.InvalidMetalEvidence;
@@ -5797,7 +5785,7 @@ fn evidenceCaseHasConsistentRepeatTimings(
     handwritten_ns: u64,
     minimum_repeat_speedup: f64,
 ) bool {
-    const generated_value = case_value.object.get("repeat_generated_ns") orelse return true;
+    const generated_value = case_value.object.get("repeat_generated_ns") orelse return repeat_runs == 1;
     var generated_values: [max_evidence_repeat_runs]u64 = undefined;
     const generated = jsonU64Array(generated_value, &generated_values) orelse return false;
     if (generated.len != repeat_runs) return false;
@@ -5814,22 +5802,21 @@ fn evidenceCaseHasConsistentRepeatTimings(
     const speedups = jsonF64Array(speedups_value, &speedup_values) orelse return false;
     if (speedups.len != repeat_runs) return false;
 
-    var min_speedup = speedups[0];
-    for (speedups, generated, handwritten) |actual_speedup, generated_elapsed, handwritten_elapsed| {
+    var minimum_index: usize = 0;
+    for (speedups, generated, handwritten, 0..) |actual_speedup, generated_elapsed, handwritten_elapsed, i| {
         const expected_speedup = speedup(handwritten_elapsed, generated_elapsed);
         if (!approximately(actual_speedup, expected_speedup, 0.000001)) return false;
-        min_speedup = @min(min_speedup, actual_speedup);
+        if (actual_speedup < speedups[minimum_index]) minimum_index = i;
     }
-    const minimum_index = jsonUsize(case_value.object.get("minimum_repeat_index")) orelse return false;
-    if (minimum_index >= speedups.len) return false;
-    if (!approximately(speedups[minimum_index], min_speedup, 0.000001)) return false;
-    const gate_speedup = if (case_value.object.get("repeat_gate_index")) |gate_value| gate: {
-        const gate_index = jsonUsize(gate_value) orelse return false;
-        if (gate_index >= speedups.len) return false;
-        if (!approximately(speedups[gate_index], repeatGateSpeedup(speedups), 0.000001)) return false;
-        break :gate speedups[gate_index];
-    } else min_speedup;
-    return approximately(gate_speedup, minimum_repeat_speedup, 0.000001);
+    const recorded_minimum_index = jsonUsize(case_value.object.get("minimum_repeat_index")) orelse return false;
+    if (recorded_minimum_index >= speedups.len) return false;
+    if (!approximately(speedups[recorded_minimum_index], speedups[minimum_index], 0.000001)) return false;
+
+    const gate_index = jsonUsize(case_value.object.get("repeat_gate_index")) orelse return false;
+    if (gate_index >= speedups.len) return false;
+    const gate_speedup = repeatGateSpeedup(speedups);
+    if (!approximately(speedups[gate_index], gate_speedup, 0.000001)) return false;
+    return approximately(speedups[gate_index], minimum_repeat_speedup, 0.000001);
 }
 
 fn evidenceCaseHasConsistentPromotionBlocker(case_value: std.json.Value) bool {
@@ -6572,7 +6559,9 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     for (metal_runtime_checks, repeat_results) |check, result| {
         if (!productionMetalRuntimeCheck(check)) continue;
         production_checks[production_count] = check;
+        production_checks[production_count].measure_iters = quant_kernel_compiler.metal_promotion_measure_iters;
         production_results[production_count] = result;
+        production_results[production_count].measure_iters = quant_kernel_compiler.metal_promotion_measure_iters;
         production_results[production_count].generated_route_checked = true;
         production_results[production_count].generated_timing_route = .decode_runtime_generated;
         production_results[production_count].provider_route_checked = providerRouteSupported(check);
@@ -6591,6 +6580,11 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
 
     const production_regression_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "metal", "production-regression-evidence.json" });
     defer std.testing.allocator.free(production_regression_path);
+    if (production_count != 0) {
+        var short_production_checks = production_checks;
+        short_production_checks[0].measure_iters = default_measure_iters;
+        try std.testing.expectError(error.InvalidArgument, writeEvidence(std.testing.allocator, production_regression_path, short_production_checks[0..production_count], production_results[0..production_count], promotion_repeat_runs, null, null, false, true, false));
+    }
     try writeEvidence(std.testing.allocator, production_regression_path, production_checks[0..production_count], production_results[0..production_count], promotion_repeat_runs, null, null, false, true, false);
     const production_regression_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, production_regression_path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(production_regression_actual);
@@ -6616,6 +6610,10 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
         try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, "\"promotion_worst_repeat_case\":"));
     }
     try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, " --production-regression-check"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, " --measure-iters 500"));
+    const stale_production_measure_iters = try replaceOnce(std.testing.allocator, production_regression_actual, " --measure-iters 500", " --measure-iters 25");
+    defer std.testing.allocator.free(stale_production_measure_iters);
+    try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_production_measure_iters, false, false, null));
     try std.testing.expectEqual(production_count, std.mem.count(u8, production_regression_actual, "\"promotion_ready\":true"));
     try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, "\"candidate_route_ready_count\":"));
     try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, "\"candidate_benchmark_ready_count\":"));
@@ -6665,6 +6663,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     try std.testing.expect(std.mem.containsAtLeast(u8, repeat_actual, 1, "\"repeat_handwritten_ns\":["));
     try std.testing.expect(std.mem.containsAtLeast(u8, repeat_actual, 1, "\"repeat_speedups\":["));
     try std.testing.expect(std.mem.containsAtLeast(u8, repeat_actual, 1, "\"minimum_repeat_index\":"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, repeat_actual, 1, "\"repeat_gate_index\":"));
     try std.testing.expect(std.mem.containsAtLeast(u8, repeat_actual, 1, " --repeat-runs 5"));
     try checkEvidenceJson(std.testing.allocator, repeat_actual, false, false, null);
 
@@ -6804,21 +6803,28 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
 
 test "quant kernel metal runtime benchmark math gates on minimum repeat speedup" {
     const good =
-        \\{"measure_iters":25,"generated_ns":2500,"generated_avg_us":0.100,"benchmark_passed":true,"handwritten_baseline_supported":true,"handwritten_ns":5000,"handwritten_avg_us":0.200,"measured_speedup":2.000000,"minimum_repeat_speedup":1.100000,"repeat_runs":5}
+        \\{"measure_iters":25,"generated_ns":2500,"generated_avg_us":0.100,"benchmark_passed":true,"handwritten_baseline_supported":true,"handwritten_ns":5000,"handwritten_avg_us":0.200,"measured_speedup":2.000000,"minimum_repeat_speedup":1.100000,"repeat_runs":5,"repeat_generated_ns":[2500,2500,2500,2500,2500],"repeat_handwritten_ns":[2750,2750,5000,5000,5000],"repeat_speedups":[1.100000,1.100000,2.000000,2.000000,2.000000],"minimum_repeat_index":0,"repeat_gate_index":0}
     ;
     var parsed_good = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, good, .{});
     defer parsed_good.deinit();
     try std.testing.expect(evidenceCaseHasConsistentBenchmarkMath(parsed_good.value));
 
+    const stripped_repeat_evidence =
+        \\{"measure_iters":25,"generated_ns":2500,"generated_avg_us":0.100,"benchmark_passed":true,"handwritten_baseline_supported":true,"handwritten_ns":5000,"handwritten_avg_us":0.200,"measured_speedup":2.000000,"minimum_repeat_speedup":1.100000,"repeat_runs":5}
+    ;
+    var parsed_stripped_repeat_evidence = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, stripped_repeat_evidence, .{});
+    defer parsed_stripped_repeat_evidence.deinit();
+    try std.testing.expect(!evidenceCaseHasConsistentBenchmarkMath(parsed_stripped_repeat_evidence.value));
+
     const borderline =
-        \\{"measure_iters":25,"generated_ns":2500,"generated_avg_us":0.100,"benchmark_passed":false,"handwritten_baseline_supported":true,"handwritten_ns":5000,"handwritten_avg_us":0.200,"measured_speedup":2.000000,"minimum_repeat_speedup":1.099999,"repeat_runs":5}
+        \\{"measure_iters":25,"generated_ns":1000000,"generated_avg_us":40.000,"benchmark_passed":false,"handwritten_baseline_supported":true,"handwritten_ns":2000000,"handwritten_avg_us":80.000,"measured_speedup":2.000000,"minimum_repeat_speedup":1.099999,"repeat_runs":5,"repeat_generated_ns":[1000000,1000000,1000000,1000000,1000000],"repeat_handwritten_ns":[1099999,1099999,2000000,2000000,2000000],"repeat_speedups":[1.099999,1.099999,2.000000,2.000000,2.000000],"minimum_repeat_index":0,"repeat_gate_index":0}
     ;
     var parsed_borderline = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, borderline, .{});
     defer parsed_borderline.deinit();
     try std.testing.expect(evidenceCaseHasConsistentBenchmarkMath(parsed_borderline.value));
 
     const bad =
-        \\{"measure_iters":25,"generated_ns":2500,"generated_avg_us":0.100,"benchmark_passed":true,"handwritten_baseline_supported":true,"handwritten_ns":5000,"handwritten_avg_us":0.200,"measured_speedup":2.000000,"minimum_repeat_speedup":1.098000,"repeat_runs":5}
+        \\{"measure_iters":25,"generated_ns":1000000,"generated_avg_us":40.000,"benchmark_passed":true,"handwritten_baseline_supported":true,"handwritten_ns":2000000,"handwritten_avg_us":80.000,"measured_speedup":2.000000,"minimum_repeat_speedup":1.098000,"repeat_runs":5,"repeat_generated_ns":[1000000,1000000,1000000,1000000,1000000],"repeat_handwritten_ns":[1098000,1098000,2000000,2000000,2000000],"repeat_speedups":[1.098000,1.098000,2.000000,2.000000,2.000000],"minimum_repeat_index":0,"repeat_gate_index":0}
     ;
     var parsed_bad = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bad, .{});
     defer parsed_bad.deinit();
@@ -6830,6 +6836,22 @@ test "quant kernel metal runtime benchmark math gates on minimum repeat speedup"
     var parsed_bad_average = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bad_average, .{});
     defer parsed_bad_average.deinit();
     try std.testing.expect(!evidenceCaseHasConsistentBenchmarkMath(parsed_bad_average.value));
+}
+
+test "quant kernel metal runtime benchmark math accepts rounded repeat index aliases" {
+    const rounded_minimum_alias =
+        \\{"measure_iters":25,"generated_ns":10000000,"generated_avg_us":400.000,"benchmark_passed":true,"handwritten_baseline_supported":true,"handwritten_ns":20000000,"handwritten_avg_us":800.000,"measured_speedup":2.000000,"minimum_repeat_speedup":1.100000,"repeat_runs":5,"repeat_generated_ns":[10000000,10000000,10000000,10000000,10000000],"repeat_handwritten_ns":[11000004,11000003,20000000,20000000,20000000],"repeat_speedups":[1.100000,1.100000,2.000000,2.000000,2.000000],"minimum_repeat_index":1,"repeat_gate_index":0}
+    ;
+    var parsed_minimum_alias = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, rounded_minimum_alias, .{});
+    defer parsed_minimum_alias.deinit();
+    try std.testing.expect(evidenceCaseHasConsistentBenchmarkMath(parsed_minimum_alias.value));
+
+    const rounded_gate_alias =
+        \\{"measure_iters":25,"generated_ns":10000000,"generated_avg_us":400.000,"benchmark_passed":false,"handwritten_baseline_supported":true,"handwritten_ns":10000011,"handwritten_avg_us":400.000,"measured_speedup":1.000001,"minimum_repeat_speedup":1.000000,"repeat_runs":5,"repeat_generated_ns":[10000000,10000000,10000000,10000000,10000000],"repeat_handwritten_ns":[10000011,10000000,5000000,20000000,20000000],"repeat_speedups":[1.000001,1.000000,0.500000,2.000000,2.000000],"minimum_repeat_index":2,"repeat_gate_index":1}
+    ;
+    var parsed_gate_alias = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, rounded_gate_alias, .{});
+    defer parsed_gate_alias.deinit();
+    try std.testing.expect(evidenceCaseHasConsistentBenchmarkMath(parsed_gate_alias.value));
 }
 
 test "quant kernel metal runtime benchmark math tolerates one repeat outlier" {

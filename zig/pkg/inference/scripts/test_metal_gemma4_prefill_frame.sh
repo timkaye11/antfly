@@ -35,7 +35,7 @@ MIN_GENERATED_TOP_COUNT="${ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_TOP_COUNT:-0}"
 MIN_GENERATED_FAMILY_COUNT="${ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_FAMILY_COUNT:-0}"
 JSON_TIMING="${ANTFLY_INFERENCE_GEMMA4_JSON_TIMING:-1}"
 RAW_PROMPT="${ANTFLY_INFERENCE_GEMMA4_PREFILL_RAW_PROMPT:-0}"
-OUT_DIR="${OUT_DIR:-/tmp/antfly-inference-metal-gemma4-prefill-frame-test}"
+OUT_DIR="${OUT_DIR:-}"
 SELF_TEST=0
 
 while [[ $# -gt 0 ]]; do
@@ -90,6 +90,24 @@ if (( MIN_GENERATED_Q4_SMALL_BATCH > 0 )); then
 fi
 if (( MIN_GENERATED_Q6_SMALL_BATCH > 0 )); then
   unset TERMITE_METAL_DISABLE_ANTFLY_Q6_K_SMALL_BATCH
+fi
+
+# The runtime master gate keeps this oracle on handwritten quant routes even as
+# new generated formats and epilogues are added.
+HANDWRITTEN_BASELINE_ENV=(TERMITE_METAL_DISABLE_ANTFLY_GENERATED_QUANT=1)
+
+GENERATED_ROUTE_ENV=(
+  TERMITE_METAL_DISABLE_ANTFLY_GENERATED_QUANT=0
+  TERMITE_METAL_DISABLE_ANTFLY_Q8_0_SMALL_BATCH=0
+)
+if (( MIN_GENERATED_Q4_SMALL_BATCH > 0 )); then
+  GENERATED_ROUTE_ENV+=(TERMITE_METAL_DISABLE_ANTFLY_Q4_K_SMALL_BATCH=0)
+fi
+if (( MIN_GENERATED_Q5_SMALL_BATCH > 0 )); then
+  GENERATED_ROUTE_ENV+=(TERMITE_METAL_DISABLE_ANTFLY_Q5_K_SMALL_BATCH=0)
+fi
+if (( MIN_GENERATED_Q6_SMALL_BATCH > 0 )); then
+  GENERATED_ROUTE_ENV+=(TERMITE_METAL_DISABLE_ANTFLY_Q6_K_SMALL_BATCH=0)
 fi
 
 run_case() {
@@ -199,9 +217,42 @@ assert_json_counter_at_least() {
   fi
 }
 
+assert_no_generated_dispatch() {
+  local label="$1"
+  local out="$2"
+  if ! awk '
+    /^metal_generated_quant_dispatch:/ {
+      seen = 1
+      for (i = 2; i <= NF; i++) {
+        split($i, pair, "=")
+        if (pair[2] + 0 != 0) nonzero = 1
+      }
+    }
+    END { exit (!seen || nonzero) }
+  ' "$out"; then
+    echo "generated quant dispatch was not disabled for $label" >&2
+    echo "output: $out" >&2
+    sed -n '1,220p' "$out" >&2
+    exit 1
+  fi
+  if [[ "$JSON_TIMING" != "0" ]]; then
+    local json="${out%.txt}.json"
+    local generated_total
+    generated_total="$(json_counter_from "$json" metal_generated_quant)"
+    if [[ "$generated_total" != "0" ]]; then
+      echo "JSON timing reported generated quant dispatch for $label" >&2
+      echo "expected: 0" >&2
+      echo "actual: ${generated_total:-<missing>}" >&2
+      echo "json: $json" >&2
+      exit 1
+    fi
+  fi
+}
+
 assert_json_timing_anchor() {
   local label="$1"
   local out="$2"
+  local generated_mode="${3:-enabled}"
   if [[ "$JSON_TIMING" == "0" ]]; then
     return
   fi
@@ -247,6 +298,9 @@ assert_json_timing_anchor() {
     echo "json: $json" >&2
     sed -n '1,220p' "$json" >&2 || true
     exit 1
+  fi
+  if [[ "$generated_mode" == "disabled" ]]; then
+    return
   fi
   if (( MIN_GENERATED_Q8_0_SMALL_BATCH > 0 )); then
     assert_json_counter_at_least "$label" "$json" q8_0_small_batch "$MIN_GENERATED_Q8_0_SMALL_BATCH"
@@ -295,6 +349,7 @@ assert_json_timing_anchor() {
 assert_anchor() {
   local label="$1"
   local out="$2"
+  local generated_mode="${3:-enabled}"
   local actual
   actual="$(token_ids_from "$label" "$out")"
   if [[ "$actual" != "$EXPECTED_TOKEN_IDS" ]]; then
@@ -328,6 +383,18 @@ assert_anchor() {
     echo "Metal runtime command operators used fallback for $label" >&2
     echo "output: $out" >&2
     exit 1
+  fi
+
+  if ! grep -q 'attn_out_linear=0 attn_post_norm=0 attn_residual_add=0' "$out"; then
+    echo "attention residual path fell back to split prefill ops for $label" >&2
+    echo "output: $out" >&2
+    exit 1
+  fi
+
+  if [[ "$generated_mode" == "disabled" ]]; then
+    assert_no_generated_dispatch "$label" "$out"
+    assert_json_timing_anchor "$label" "$out" disabled
+    return
   fi
 
   generated_dispatch_count() {
@@ -432,13 +499,7 @@ assert_anchor() {
     fi
   done
 
-  assert_json_timing_anchor "$label" "$out"
-
-  if ! grep -q 'attn_out_linear=0 attn_post_norm=0 attn_residual_add=0' "$out"; then
-    echo "attention residual path fell back to split prefill ops for $label" >&2
-    echo "output: $out" >&2
-    exit 1
-  fi
+  assert_json_timing_anchor "$label" "$out" enabled
 }
 
 if [[ "$SELF_TEST" == "1" ]]; then
@@ -485,6 +546,24 @@ OUT
 "metal_generated_quant_top_count":5
 }
 JSON
+  baseline_sample="$tmp_dir/baseline.txt"
+  cat >"$baseline_sample" <<'OUT'
+metal_generated_quant_dispatch: q8_0_small_batch=0 q4_0_small_batch=0 q4_k_small_batch=0 q5_k_small_batch=0 q6_k_small_batch=0
+OUT
+  cat >"${baseline_sample%.txt}.json" <<'JSON'
+{
+"metal_generated_quant":0
+}
+JSON
+  assert_no_generated_dispatch self-test-baseline-pass "$baseline_sample"
+  if ( assert_no_generated_dispatch self-test-baseline-fail "$sample" ) 2>"$tmp_dir/baseline-fail.err"; then
+    echo "expected generated-disabled baseline gate failure" >&2
+    exit 1
+  fi
+  if ! grep -q 'generated quant dispatch was not disabled' "$tmp_dir/baseline-fail.err"; then
+    cat "$tmp_dir/baseline-fail.err" >&2
+    exit 1
+  fi
   EXPECTED_TOKEN_IDS=1
   MIN_GENERATED_Q8_0_SMALL_BATCH=1
   MIN_GENERATED_Q4_0_SMALL_BATCH=1
@@ -611,17 +690,43 @@ if [[ ! -d "$MODEL_DIR" ]]; then
   exit 2
 fi
 
-mkdir -p "$OUT_DIR"
-
-default_out="$(run_case default env)" || exit $?
-if [[ -z "$EXPECTED_TOKEN_IDS" ]]; then
-  EXPECTED_TOKEN_IDS="$(token_ids_from default "$default_out")"
+OUTPUT_DIR_IS_TEMP=0
+if [[ -z "$OUT_DIR" ]]; then
+  OUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/antfly-inference-metal-gemma4-prefill-frame-test.XXXXXX")"
+  OUTPUT_DIR_IS_TEMP=1
+  cleanup_default_output_dir() {
+    local rc=$?
+    if (( BASH_SUBSHELL > 0 )); then
+      return
+    fi
+    if (( rc == 0 )); then
+      rm -rf "$OUT_DIR"
+    else
+      echo "retaining failed Metal Gemma4 smoke artifacts: $OUT_DIR" >&2
+    fi
+  }
+  trap cleanup_default_output_dir EXIT
+else
+  mkdir -p "$OUT_DIR"
 fi
+
+baseline_out="$(run_case handwritten-baseline env "${HANDWRITTEN_BASELINE_ENV[@]}")" || exit $?
+if [[ -z "$EXPECTED_TOKEN_IDS" ]]; then
+  EXPECTED_TOKEN_IDS="$(token_ids_from handwritten-baseline "$baseline_out")"
+fi
+assert_anchor handwritten-baseline "$baseline_out" disabled
+
+default_out="$(run_case default env "${GENERATED_ROUTE_ENV[@]}")" || exit $?
 assert_anchor default "$default_out"
 
-sync_out="$(run_case stage-sync env TERMITE_METAL_SYNC_GATED_FAMILY_STAGES=1)" || exit $?
+sync_out="$(run_case stage-sync env "${GENERATED_ROUTE_ENV[@]}" TERMITE_METAL_SYNC_GATED_FAMILY_STAGES=1)" || exit $?
 assert_anchor stage-sync "$sync_out"
 
-echo "metal Gemma4 prefill-frame no-fallback/stage-sync smoke passed"
-echo "default:    $default_out"
-echo "stage-sync: $sync_out"
+echo "metal Gemma4 handwritten-baseline/generated/stage-sync smoke passed"
+if (( OUTPUT_DIR_IS_TEMP == 1 )); then
+  echo "temporary artifacts (cleaned on success): $OUT_DIR"
+else
+  echo "handwritten baseline: $baseline_out"
+  echo "default:              $default_out"
+  echo "stage-sync:           $sync_out"
+fi

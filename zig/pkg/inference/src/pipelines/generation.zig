@@ -1427,10 +1427,9 @@ pub const NativeDecodeState = struct {
         }
         self.syncPagedKvBlockTable() catch {};
         if (self.kv_compacted) {
-            const current_kv_tokens = if (self.kv_view) |view|
-                @min(view.token_count + 1, self.total_tokens)
-            else
-                @min(@as(usize, 1), self.total_tokens);
+            const manager = self.kv_manager orelse return;
+            const sequence_id = self.sequence_id orelse return;
+            const current_kv_tokens = @min(manager.tokenCount(sequence_id) orelse 0, self.total_tokens);
             self.setPagedKvView(current_kv_tokens, self.total_tokens - current_kv_tokens);
             return;
         }
@@ -1630,7 +1629,9 @@ pub const NativeDecodeState = struct {
     /// sequence with a smaller one containing fitted K/V values that preserve
     /// attention output. Call after prefill, before the decode loop.
     pub fn compactKvCache(self: *NativeDecodeState, config: runtime.kv.compaction.CompactionConfig) !usize {
+        try config.validate();
         if (self.deepseek_v4_compressed_cache != null) return error.DeepSeekV4CompressedKvCompactionNotSupported;
+        if (self.kv_storage != null) return error.KvStorageCompactionNotSupported;
         const lock = self.lockPagedKv();
         defer if (lock) |mutex| mutex.unlock();
         const manager = self.kv_manager orelse return 0;
@@ -1661,13 +1662,20 @@ pub const NativeDecodeState = struct {
             );
         }
 
+        // Complete every fallible step before releasing the old sequence so
+        // a failed compaction leaves the original state intact.
+        const new_state = try manager.sequenceMut(new_seq_id);
+        new_state.compacted = true;
+        var new_block_ids = std.ArrayListUnmanaged(runtime.kv.block.KvBlockId).empty;
+        errdefer new_block_ids.deinit(self.allocator);
+        _ = try manager.logicalBlocksWithReservations(new_seq_id, &new_block_ids);
+
         // Swap: release old sequence, adopt new one.
         try manager.releaseSequence(seq_id);
         self.sequence_id = new_seq_id;
-
-        // Mark compacted so sliding window trimming is skipped.
-        const new_state = try manager.sequenceMut(new_seq_id);
-        new_state.compacted = true;
+        self.kv_block_ids.deinit(self.allocator);
+        self.kv_block_ids = new_block_ids;
+        new_block_ids = .empty;
         self.kv_compacted = true;
         self.setPagedKvView(compacted.retained_count, self.total_tokens - compacted.retained_count);
         // total_tokens stays the same for position encoding continuity.
@@ -8728,6 +8736,70 @@ test "native decode state batched append refreshes paged block table" {
     try std.testing.expectEqual(@as(usize, 4), view.token_count);
 }
 
+test "native decode state compacted batched append advances the full accepted count" {
+    const allocator = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f16,
+        .page_size_tokens = 4,
+        .num_kv_heads = 1,
+        .head_dim = 8,
+    });
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    defer state.deinit();
+
+    // Model a six-token prompt compacted to two retained KV entries without
+    // invoking the numerical compactor; this test targets view accounting.
+    try state.notePrefill(2);
+    state.total_tokens = 6;
+    state.kv_compacted = true;
+    (try manager.sequenceMut(state.sequence_id.?)).compacted = true;
+    state.setPagedKvView(2, 4);
+
+    try state.appendGeneratedTokens(3);
+    const view = state.kvView().?;
+    try std.testing.expectEqual(@as(usize, 5), view.token_count);
+    try std.testing.expectEqual(@as(usize, 4), view.position_offset);
+    try std.testing.expectEqual(@as(usize, 9), state.total_tokens);
+}
+
+test "native decode state compaction publishes the replacement block table" {
+    const allocator = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 4,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    });
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    defer state.deinit();
+
+    try state.notePrefill(6);
+    const old_sequence_id = state.sequence_id.?;
+    const old_blocks = state.kvView().?.logical_blocks.?;
+    var old_block_ids: [2]runtime.kv.block.KvBlockId = undefined;
+    @memcpy(&old_block_ids, old_blocks);
+
+    const layer_kv = [_]f32{ 1, 0, 0, 1, 1, 1, 2, 1, 1, 2, 2, 2 };
+    try manager.writeFullLayerKv(old_sequence_id, 0, 6, &layer_kv, &layer_kv);
+
+    try std.testing.expectEqual(@as(usize, 6), try state.compactKvCache(.{ .target_ratio = 1.0 }));
+    const view = state.kvView().?;
+    try std.testing.expect(state.sequence_id.? != old_sequence_id);
+    try std.testing.expectEqual(@as(usize, 6), view.token_count);
+    try std.testing.expectEqual(@as(usize, 0), view.position_offset);
+    try std.testing.expectEqual(@as(usize, 2), view.logical_blocks.?.len);
+    try std.testing.expect(!std.mem.eql(runtime.kv.block.KvBlockId, &old_block_ids, view.logical_blocks.?));
+}
+
 test "native decode state sliding-window view stays block-aligned" {
     // Regression: the paged kernels index the front-trimmed block table with
     // view-relative positions, so the decode view offset must always equal
@@ -8954,6 +9026,34 @@ test "native decode state rejects KV compaction for DeepSeek V4 compressed cache
 
     try std.testing.expectError(
         error.DeepSeekV4CompressedKvCompactionNotSupported,
+        state.compactKvCache(.{ .target_ratio = 0.5 }),
+    );
+}
+
+test "native decode state rejects KV compaction when device storage is attached" {
+    const allocator = std.testing.allocator;
+    const pool_config = runtime.kv.pool.KvPoolConfig{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 4,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 8,
+    };
+
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+    const pool_id = try manager.addPool(pool_config);
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, pool_config);
+    defer storage.deinit();
+
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    state.kv_storage = &storage;
+    defer state.deinit();
+    try state.notePrefill(4);
+
+    try std.testing.expectError(
+        error.KvStorageCompactionNotSupported,
         state.compactKvCache(.{ .target_ratio = 0.5 }),
     );
 }
