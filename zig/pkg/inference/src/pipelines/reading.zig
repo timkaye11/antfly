@@ -431,7 +431,9 @@ pub const ReadingPipeline = struct {
             }
         }
 
-        const kv_cache_backend_ok = backend == .cuda or (backend == .metal and florenceMetalKvCacheEnabled());
+        // Incremental KV-cache decode is default-on for both device backends;
+        // ANTFLY_INFERENCE_FLORENCE_DISABLE_KV_CACHE is the kill switch.
+        const kv_cache_backend_ok = backend == .cuda or backend == .metal;
         if (kv_cache_backend_ok and !florenceKvCacheDisabled()) {
             last_read_telemetry.kv_cache = true;
             last_read_telemetry.cuda_graph_replay = false;
@@ -896,10 +898,6 @@ fn readProfileEnabled() bool {
 
 fn florenceKvCacheDisabled() bool {
     return platform.env.getenvBool("ANTFLY_INFERENCE_FLORENCE_DISABLE_KV_CACHE");
-}
-
-fn florenceMetalKvCacheEnabled() bool {
-    return platform.env.getenvBool("ANTFLY_INFERENCE_FLORENCE_METAL_KV_CACHE");
 }
 
 fn florenceDebugStats() bool {
