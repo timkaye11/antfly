@@ -512,6 +512,33 @@ pub fn build(b: *std.Build) void {
     const clipclap_native_bench_step = b.step("bench-clipclap-native", "Run end-to-end CLIP/CLAP native encoder benches with random quantized weights");
     clipclap_native_bench_step.dependOn(&run_clipclap_native_bench.step);
 
+    const onnx_forward_dump_exe = b.addExecutable(.{
+        .name = "antfly-inference-onnx-forward-dump",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/onnx_forward_dump.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    onnx_forward_dump_exe.root_module.addImport("build_options", build_options_mod);
+    onnx_forward_dump_exe.root_module.addImport("ml", ml_mod);
+    onnx_forward_dump_exe.root_module.addImport("pjrt", pjrt_mod);
+    onnx_forward_dump_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    onnx_forward_dump_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    onnx_forward_dump_exe.root_module.addImport("antfly_image", antfly_image_mod);
+    onnx_forward_dump_exe.root_module.addImport("inference_audio", inference_audio_mod);
+    onnx_forward_dump_exe.root_module.addImport("protobuf", protobuf_mod);
+    onnx_forward_dump_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
+    onnx_forward_dump_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    configureNativeTool(b, onnx_forward_dump_exe, target, enable_system_blas, blas_root, enable_metal);
+    configureOnnxRuntime(b, onnx_forward_dump_exe.root_module, enable_onnx, effective_onnx_root);
+    const run_onnx_forward_dump = b.addRunArtifact(onnx_forward_dump_exe);
+    if (b.args) |args| {
+        run_onnx_forward_dump.addArgs(args);
+    }
+    const onnx_forward_dump_step = b.step("onnx-forward-dump", "Run an ONNX model via the native importer and dump all output tensors");
+    onnx_forward_dump_step.dependOn(&run_onnx_forward_dump.step);
+
     const clipclap_e2e_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-clipclap-e2e-bench",
         .root_module = b.createModule(.{

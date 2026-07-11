@@ -57,6 +57,27 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
+        t.root_module.addImport("protobuf", protobuf_mod);
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+
+    // convert.zig / ops.zig tests need ml + protobuf injected.
+    const ml_mod = b.createModule(.{
+        .root_source_file = b.path("../ml/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const dep_tests = [_][]const u8{ "src/convert.zig", "src/ops.zig" };
+    for (dep_tests) |file| {
+        const t = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(file),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        t.root_module.addImport("ml", ml_mod);
+        t.root_module.addImport("protobuf", protobuf_mod);
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
 }

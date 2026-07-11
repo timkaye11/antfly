@@ -2033,14 +2033,18 @@ fn convertExpand(builder: *Builder, inputs: []const NodeId) ConvertError!NodeId 
         if (same) return inputs[0];
     }
 
-    // Use broadcast_in_dim
-    var broadcast_axes: [8]u8 = .{0} ** 8;
+    // Reshape the input up to the full output rank first (prepend leading
+    // 1-dims) so broadcast_in_dim receives a full-rank operand and can use the
+    // canonical identity axis mapping (matching broadcastTo()).
+    //
+    // Previously broadcast_axes/num_axes were computed for the ORIGINAL (lower)
+    // input rank but then paired with the reshaped full-rank operand.  That
+    // inconsistency made evalBroadcast bail (`num_axes != in_rank`) and left the
+    // runtime broadcast to collapse a rank-expanding Expand onto element 0 — the
+    // CLIP ViT class-token `Expand([hidden] -> [1,1,hidden])` was materialized as
+    // `hidden` copies of `class_embedding[0]`, zeroing out the CLS token that
+    // becomes the pooled image embedding.
     const start = out_rank - in_rank;
-    for (0..in_rank) |i| {
-        broadcast_axes[i] = @intCast(start + i);
-    }
-
-    // If input needs prepended 1-dims first, reshape
     var src = inputs[0];
     if (in_rank < out_rank) {
         var padded_dims: [8]i64 = .{0} ** 8;
@@ -2050,11 +2054,17 @@ fn convertExpand(builder: *Builder, inputs: []const NodeId) ConvertError!NodeId 
         src = try builder.reshape(src, padded_shape);
     }
 
+    // `src` now has rank `out_rank` in every case (`out_rank == max(target_rank,
+    // in_rank) >= in_rank`), so map each input axis to the matching output axis;
+    // size-1 dims broadcast up.
+    var broadcast_axes: [8]u8 = .{0} ** 8;
+    for (0..out_rank) |i| broadcast_axes[i] = @intCast(i);
+
     return builder.graph.addNode(.{
         .op = .{ .broadcast_in_dim = .{
             .target_shape = out_shape,
             .broadcast_axes = broadcast_axes,
-            .num_axes = @min(in_rank, out_rank),
+            .num_axes = out_rank,
         } },
         .output_shape = out_shape,
         .inputs = .{ src, null_node, null_node, null_node },

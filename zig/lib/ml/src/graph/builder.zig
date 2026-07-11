@@ -157,12 +157,33 @@ pub const Builder = struct {
     // ── Primitive Elementwise Binary ───────────────────────────────────
 
     fn binaryOp(self: *Builder, comptime op: std.meta.Tag(OpCode), a: NodeId, b: NodeId) !NodeId {
-        // Use the shape with more elements (handles scalar broadcasting).
+        // Pick the broadcasted result shape.  Prefer the higher-rank operand:
+        // that is the broadcast result whenever one operand is a scalar/low-rank
+        // constant (the common case for decompositions like sigmoid/quick-gelu).
+        //
+        // NOTE: `numElements()` returns null for shapes with a dynamic dim
+        // (e.g. batch = -1).  The old code used `numElements() orelse 1`, which
+        // treated a dynamic-shaped activation `[-1, 50, 3072]` as a single
+        // element and then collapsed it onto a static scalar `1.0` constant.
+        // That produced a scalar output shape, and a later broadcast of the
+        // full-data tensor from `[1,1,1]` read only element 0 (input-invariant
+        // collapse).  Preferring higher rank — and treating a dynamic dim as
+        // "larger than any static count" on rank ties — keeps the real shape.
         const a_shape = self.graph.node(a).output_shape;
         const b_shape = self.graph.node(b).output_shape;
-        const a_elems = a_shape.numElements() orelse 1;
-        const b_elems = b_shape.numElements() orelse 1;
-        const s = if (a_elems >= b_elems) a_shape else b_shape;
+        const a_rank = a_shape.rank();
+        const b_rank = b_shape.rank();
+        const s = if (a_rank != b_rank)
+            (if (a_rank > b_rank) a_shape else b_shape)
+        else blk: {
+            const a_elems = a_shape.numElements();
+            const b_elems = b_shape.numElements();
+            if (a_elems) |ae| {
+                if (b_elems) |be| break :blk if (ae >= be) a_shape else b_shape;
+                break :blk b_shape; // b has a dynamic dim → treat as larger
+            }
+            break :blk a_shape; // a has a dynamic dim (or both) → keep a
+        };
         return self.graph.addNode(.{
             .op = @unionInit(OpCode, @tagName(op), {}),
             .output_shape = s,
@@ -996,6 +1017,36 @@ test "Builder.scalarConst caching" {
     const c3 = try b.scalarConst(.f32, 2.0);
     try std.testing.expectEqual(c1, c2); // cached
     try std.testing.expect(c1 != c3); // different value
+}
+
+test "binaryOp keeps a dynamic-shaped operand's shape against a scalar" {
+    // Regression: the CLIP quick-gelu / sigmoid decomposition combines a scalar
+    // `1.0` constant with a dynamic-batch activation `[-1, 50, 3072]`.  Because
+    // `numElements()` is null for shapes with a dynamic dim, the old
+    // `numElements() orelse 1` heuristic treated the activation as a single
+    // element and collapsed it onto the scalar, producing a scalar output shape.
+    // That later triggered an input-invariant broadcast (every element read from
+    // index 0), collapsing the served image embedding.  The result must keep the
+    // activation's rank-3 shape regardless of operand order.
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const scalar = try b.scalarConst(.f32, 1.0);
+    const act = try b.parameter("act", Shape.init(.f32, &.{ -1, 50, 3072 }));
+
+    const sum_ls = try b.add(scalar, act); // scalar on the left
+    const sum_rs = try b.add(act, scalar); // scalar on the right
+    const quotient = try b.div(scalar, act);
+
+    for ([_]NodeId{ sum_ls, sum_rs, quotient }) |node_id| {
+        const s = g.node(node_id).output_shape;
+        try std.testing.expectEqual(@as(u8, 3), s.rank());
+        try std.testing.expectEqual(@as(i64, -1), s.dim(0));
+        try std.testing.expectEqual(@as(i64, 50), s.dim(1));
+        try std.testing.expectEqual(@as(i64, 3072), s.dim(2));
+    }
 }
 
 test "Builder.linear emits fused + decomposed" {
