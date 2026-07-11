@@ -1,0 +1,200 @@
+name: CUDA Gemma 4 L4 Evidence
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      gate:
+        description: "Collect current evidence or enforce the release performance contract"
+        required: true
+        default: nightly
+        type: choice
+        options:
+          - nightly
+          - release
+      e2b_model:
+        description: "Absolute path to the Gemma 4 E2B QAT GGUF on the runner (optional)"
+        required: false
+        type: string
+      gemma12b_q4_model:
+        description: "Absolute path to the Gemma 4 12B Q4_K_M GGUF on the runner (optional)"
+        required: false
+        type: string
+      llama_cpp_bin:
+        description: "Absolute path to llama.cpp llama-completion on the runner (optional)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# An L4 is an exclusive performance resource. Queue evidence runs rather than
+# letting separate scheduled/manual runs perturb each other's measurements.
+concurrency:
+  group: cuda-gemma4-l4-evidence
+  cancel-in-progress: false
+
+jobs:
+  l4-evidence:
+    name: Gemma 4 CUDA evidence (L4 / SM89)
+    # Configure ANTFLY_CUDA_L4_RUNNER_LABELS_JSON as a repository variable with
+    # the labels assigned to the L4 runner, for example
+    # ["self-hosted","linux","x64","gpu-l4"]. The generic default avoids
+    # guessing an unavailable repository-specific label; the gate verifies the
+    # actual visible device is an NVIDIA L4 with compute capability 8.9.
+    runs-on: ${{ fromJSON(vars.ANTFLY_CUDA_L4_RUNNER_LABELS_JSON || '["self-hosted"]') }}
+    timeout-minutes: 240
+    env:
+      CUDA_EVIDENCE_DIR: ${{ github.workspace }}/artifacts/cuda-gemma4-l4
+      ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/antfly-zig-local
+      ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/antfly-zig-global
+      CUDA_VISIBLE_DEVICES: ${{ vars.ANTFLY_CUDA_VISIBLE_DEVICES || '0' }}
+      CUDA_RELEASE_MODE: ${{ inputs.gate || 'nightly' }}
+      E2B_MODEL: ${{ inputs.e2b_model || vars.ANTFLY_CUDA_E2B_MODEL || '' }}
+      GEMMA12B_Q4_MODEL: ${{ inputs.gemma12b_q4_model || vars.ANTFLY_CUDA_GEMMA12B_Q4_MODEL || '' }}
+      LLAMA_CPP_BIN: ${{ inputs.llama_cpp_bin || vars.ANTFLY_CUDA_LLAMA_CPP_BIN || '/tmp/llama.cpp/build/bin/llama-completion' }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Prepare CUDA evidence inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$CUDA_EVIDENCE_DIR" "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+
+          if [[ -z "$E2B_MODEL" ]]; then
+            E2B_MODEL="$GITHUB_WORKSPACE/.models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf"
+          fi
+          if [[ -z "$GEMMA12B_Q4_MODEL" ]]; then
+            GEMMA12B_Q4_MODEL="$GITHUB_WORKSPACE/.models/google/gemma-4-12B-it-q4_k/gemma-4-12B-it-Q4_K_M.gguf"
+          fi
+
+          for item in \
+            "E2B_MODEL:$E2B_MODEL" \
+            "GEMMA12B_Q4_MODEL:$GEMMA12B_Q4_MODEL" \
+            "LLAMA_CPP_BIN:$LLAMA_CPP_BIN"; do
+            name="${item%%:*}"
+            path="${item#*:}"
+            if [[ ! -f "$path" ]]; then
+              echo "missing $name: $path" >&2
+              echo "Configure the matching workflow input or repository variable." >&2
+              exit 1
+            fi
+          done
+
+          command -v nvidia-smi
+          command -v nvcc
+          command -v python3
+          nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv,noheader
+          nvcc --version
+          zig version
+
+          {
+            echo "E2B_MODEL=$E2B_MODEL"
+            echo "GEMMA12B_Q4_MODEL=$GEMMA12B_Q4_MODEL"
+          } >> "$GITHUB_ENV"
+
+      - name: Check generated CUDA sources
+        working-directory: zig/pkg/inference
+        run: |
+          set -euo pipefail
+          zig build quant-kernel-codegen \
+            -Dcuda=true -Dmetal=false -Dcuda-artifacts=sm89 \
+            -Doptimize=ReleaseFast -- --check
+
+      - name: Check CUDA artifacts
+        working-directory: zig/pkg/inference
+        run: |
+          set -euo pipefail
+          bash scripts/regen-cuda-artifacts.sh --check --all
+
+      - name: Build ReleaseFast CUDA inference
+        working-directory: zig/pkg/inference
+        run: |
+          set -euo pipefail
+          zig build -Dcuda=true -Dmetal=false -Dcuda-artifacts=sm89 \
+            -Doptimize=ReleaseFast -j4
+
+      - name: Run CUDA smoke test
+        working-directory: zig/pkg/inference
+        run: |
+          set -euo pipefail
+          zig-out/bin/antfly-inference cuda-info --smoke
+
+      - name: Verify exact F32 E2B FFN raw parity
+        working-directory: zig/pkg/inference
+        run: |
+          set -euo pipefail
+          zig build quant-kernel-cuda-ffn-diff \
+            -Dcuda=true -Dmetal=false -Dcuda-artifacts=sm89 \
+            -Doptimize=ReleaseFast -- --json
+
+      - name: Collect fixed E2B and 12B release evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(
+            python3 zig/pkg/inference/scripts/gemma4_cuda_l4_release_gate.py
+            --binary "$GITHUB_WORKSPACE/zig/pkg/inference/zig-out/bin/antfly-inference"
+            --llama-cpp-bin "$LLAMA_CPP_BIN"
+            --e2b-model "$E2B_MODEL"
+            --gemma12b-q4-model "$GEMMA12B_Q4_MODEL"
+            --output-dir "$CUDA_EVIDENCE_DIR"
+            --warmups 1
+            --repeats 3
+            --timeout-sec 600
+          )
+          case "$CUDA_RELEASE_MODE" in
+            nightly)
+              ;;
+            release)
+              args+=(--enforce-performance --min-comparable-ratio 0.80 --verify-artifacts)
+              ;;
+            *)
+              echo "unsupported CUDA_RELEASE_MODE=$CUDA_RELEASE_MODE" >&2
+              exit 2
+              ;;
+          esac
+          "${args[@]}"
+
+      - name: Publish evidence summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          summary="$CUDA_EVIDENCE_DIR/release_summary.json"
+          if [[ ! -f "$summary" ]]; then
+            echo "CUDA evidence did not produce release_summary.json" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 - "$summary" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          summary = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          print("## CUDA Gemma 4 L4 Evidence")
+          print()
+          print("```json")
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          print("```")
+          PY
+
+      - name: Upload CUDA evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cuda-gemma4-l4-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CUDA_EVIDENCE_DIR }}
+          if-no-files-found: warn
+          retention-days: 30

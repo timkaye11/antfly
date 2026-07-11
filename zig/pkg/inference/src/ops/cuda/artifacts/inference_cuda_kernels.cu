@@ -20,6 +20,16 @@ using namespace nvcuda;
 
 __device__ __forceinline__ void termite_store_half_bytes(unsigned char* dst, float value);
 __device__ __forceinline__ float termite_warp_reduce_max_f32(float v);
+__device__ __forceinline__ float termite_tq_decode_polar4_scalar(unsigned char code);
+__device__ __forceinline__ float termite_tq_decode_polar4_at(const unsigned char* encoded, unsigned int value_index);
+__device__ __forceinline__ unsigned int termite_tq_physical_token(
+    unsigned int logical_token,
+    const unsigned int* block_table,
+    unsigned int block_count,
+    unsigned int page_size_tokens,
+    unsigned int physical_token_capacity
+);
+__device__ __forceinline__ float termite_tq_f16_value(const unsigned char* row, unsigned int value_index);
 
 extern "C" __global__ void termite_fill_f32(float* dst, unsigned int n, float value) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -3466,8 +3476,9 @@ extern "C" __global__ void termite_gqa_attention_decode_scalars_f32(
     }
 }
 
+// quant-kernel-codegen:begin generated CUDA attention kernels (do not edit; run: zig build quant-kernel-codegen -- --write)
 // Opt-in generated attention candidate from graph/quant_kernel_compiler.zig.
-// kernel_id=antfly_gqa_attention_decode_scalars_hd256_f32_v1 plan_id=cuda/attention/decode_1x/hd256/device_scalars
+// kernel_id=antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1 plan_id=cuda/attention/decode_1x/hd256/gqa16/split8/min512/f32/device_scalars
 extern "C" __global__ void antfly_gqa_attention_decode_scalars_hd256_f32_v1(
     float* dst,
     const float* q,
@@ -3487,6 +3498,110 @@ extern "C" __global__ void antfly_gqa_attention_decode_scalars_hd256_f32_v1(
     unsigned int total_sequence_len,
     unsigned int mask_len,
     unsigned int bias_mode,
+    unsigned int split_kv_min_tokens,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) {
+        kv_position_offset = decode_scalars[4];
+        query_position_offset = decode_scalars[1];
+        kv_seq_len = decode_scalars[2];
+    }
+    if (kv_seq_len >= split_kv_min_tokens) return;
+    const unsigned int block = blockIdx.x;
+    if (batch != 1u || q_seq_len != 1u || mask_len != 0u || bias_mode != 0u ||
+        block >= num_heads || head_dim != 256u || blockDim.x != 256u ||
+        num_kv_heads == 0u || num_heads == 0u || (num_heads % num_kv_heads) != 0u ||
+        (num_heads / num_kv_heads) > 16u || num_heads > 32u) return;
+    __shared__ float warp_sums[16];
+    __shared__ float shared_max_score;
+    __shared__ float shared_denom;
+    __shared__ float shared_alpha;
+    __shared__ float shared_beta;
+    const unsigned int lane = threadIdx.x;
+    const unsigned int head = block;
+    const unsigned int query_pos = query_position_offset;
+    unsigned int key_start = 0u;
+    unsigned int key_end = 0u;
+    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
+        const unsigned int visible = query_pos - kv_position_offset + 1u;
+        key_end = visible < kv_seq_len ? visible : kv_seq_len;
+        if (sliding_window != 0u) {
+            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
+            if (window_start_abs > kv_position_offset) {
+                key_start = window_start_abs - kv_position_offset;
+                if (key_start > key_end) key_start = key_end;
+            }
+        }
+    }
+    const unsigned int heads_per_group = num_heads / num_kv_heads;
+    const unsigned int kv_head = head / heads_per_group;
+    const unsigned int kv_hidden = num_kv_heads * head_dim;
+    const unsigned int q_base = head * head_dim;
+    const float scale_input = (float)head_dim;
+    float scale;
+    asm volatile ("rsqrt.approx.f32 %0, %1;" : "=f"(scale) : "f"(scale_input));
+    if (lane == 0u) {
+        shared_max_score = -3.402823466e+38f;
+        shared_denom = 0.0f;
+    }
+    __syncthreads();
+
+    float acc = 0.0f;
+    for (unsigned int ki = key_start; ki < key_end; ++ki) {
+        float partial = 0.0f;
+        if (lane < head_dim) {
+            const unsigned int k_base = ki * kv_hidden + kv_head * head_dim;
+            partial = q[q_base + lane] * k[k_base + lane];
+        }
+        const float dot = termite_block_reduce_sum_f32(partial, warp_sums);
+        if (lane == 0u) {
+            const float score = dot * scale;
+            const float next_max = fmaxf(shared_max_score, score);
+            shared_alpha = expf(shared_max_score - next_max);
+            shared_beta = expf(score - next_max);
+            shared_denom = shared_denom * shared_alpha + shared_beta;
+            shared_max_score = next_max;
+        }
+        __syncthreads();
+        if (lane < head_dim) {
+            const unsigned int v_idx = ki * kv_hidden + kv_head * head_dim + lane;
+            acc = acc * shared_alpha + shared_beta * v[v_idx];
+        }
+        __syncthreads();
+    }
+
+    if (lane < head_dim) {
+        const unsigned int out_idx = head * head_dim + lane;
+        dst[out_idx] = shared_denom > 0.0f ? acc / shared_denom : 0.0f;
+    }
+
+    (void)attn_or_mask;
+    (void)bias;
+    (void)total_sequence_len;
+}
+
+extern "C" __global__ void antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1(
+    float* partial_values,
+    float* partial_max,
+    float* partial_denom,
+    const float* q,
+    const float* k,
+    const float* v,
+    const unsigned char* attn_or_mask,
+    const float* bias,
+    unsigned int batch,
+    unsigned int q_seq_len,
+    unsigned int kv_seq_len,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int query_position_offset,
+    unsigned int kv_position_offset,
+    unsigned int sliding_window,
+    unsigned int total_sequence_len,
+    unsigned int mask_len,
+    unsigned int bias_mode,
+    unsigned int split_kv_min_tokens,
     const unsigned int* decode_scalars
 ) {
     if (decode_scalars != 0) {
@@ -3495,80 +3610,2131 @@ extern "C" __global__ void antfly_gqa_attention_decode_scalars_hd256_f32_v1(
         kv_seq_len = decode_scalars[2];
         total_sequence_len = decode_scalars[3];
     }
+    if (kv_seq_len < split_kv_min_tokens) return;
+    if (batch != 1u || q_seq_len != 1u || mask_len != 0u || bias_mode != 0u ||
+        head_dim != 256u || blockDim.x != 256u ||
+        num_kv_heads == 0u || num_heads == 0u || (num_heads % num_kv_heads) != 0u ||
+        (num_heads / num_kv_heads) > 16u || num_heads > 32u) return;
+    const unsigned int splits = 8u;
+    const unsigned int split = blockIdx.x % splits;
+    const unsigned int head_block = blockIdx.x / splits;
+    const unsigned int head = head_block % num_heads;
+    const unsigned int b = head_block / num_heads;
+    if (b >= batch) return;
+    const unsigned int heads_per_kv = num_heads / num_kv_heads;
+    const unsigned int kv_head = head / heads_per_kv;
+    const unsigned int query_pos = query_position_offset;
+    unsigned int key_start = 0u;
+    unsigned int key_end = 0u;
+    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
+        const unsigned int visible = query_pos - kv_position_offset + 1u;
+        key_end = visible < kv_seq_len ? visible : kv_seq_len;
+        if (sliding_window != 0u) {
+            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
+            if (window_start_abs > kv_position_offset) {
+                key_start = window_start_abs - kv_position_offset;
+                if (key_start > key_end) key_start = key_end;
+            }
+        }
+    }
+    unsigned int split_begin = (kv_seq_len * split) / splits;
+    unsigned int split_end = (kv_seq_len * (split + 1u)) / splits;
+    if (split_begin < key_start) split_begin = key_start;
+    if (split_end > key_end) split_end = key_end;
+    if (split_begin > split_end) split_begin = split_end;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int q_hidden = num_heads * head_dim;
+    const unsigned int kv_hidden = num_kv_heads * head_dim;
+    const unsigned int q_base = (b * q_seq_len) * q_hidden + head * head_dim;
+    const float scale_input = (float)head_dim;
+    float scale;
+    asm volatile ("rsqrt.approx.f32 %0, %1;" : "=f"(scale) : "f"(scale_input));
 
-    __shared__ float warp_sums[4];
+    __shared__ float warp_sums[8];
+    __shared__ float head_max;
+    __shared__ float head_denom;
+    __shared__ float head_alpha;
+    __shared__ float head_beta;
+    float q_values[1];
+    float acc[1];
+#pragma unroll
+    for (unsigned int item = 0u; item < 1u; ++item) {
+        const unsigned int d = tid + item * blockDim.x;
+        q_values[item] = q[q_base + d];
+        acc[item] = 0.0f;
+    }
+    if (tid == 0u) {
+        head_max = -3.402823466e+38f;
+        head_denom = 0.0f;
+        head_alpha = 0.0f;
+        head_beta = 0.0f;
+    }
+    __syncthreads();
+
+    for (unsigned int ki = split_begin; ki < split_end; ++ki) {
+        const unsigned int key_pos = kv_position_offset + ki;
+        const unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
+        const bool future_allowed = attn_or_mask != 0 && mask_idx < mask_len && attn_or_mask[mask_idx] != 0u;
+        const bool future_blocked = key_pos > query_pos && !future_allowed;
+        const bool past_blocked = key_pos > query_pos || (sliding_window != 0u && (query_pos - key_pos) >= sliding_window);
+        const bool valid = !(future_blocked || past_blocked);
+        const unsigned int kv_base = (b * kv_seq_len + ki) * kv_hidden + kv_head * head_dim;
+
+        float dot = 0.0f;
+#pragma unroll
+        for (unsigned int item = 0u; item < 1u; ++item) {
+            const unsigned int d = tid + item * blockDim.x;
+            const float key_value = valid ? k[kv_base + d] : 0.0f;
+            dot += q_values[item] * key_value;
+        }
+        for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        }
+        if (lane == 0u) warp_sums[warp] = dot;
+        __syncthreads();
+
+        float block_dot = (warp == 0u && lane < 8u) ? warp_sums[lane] : 0.0f;
+        if (warp == 0u) {
+            for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+                block_dot += __shfl_down_sync(0xffffffffu, block_dot, offset);
+            }
+            if (lane == 0u) {
+                float score = valid ? block_dot * scale : -3.402823466e+38f;
+                if (valid && bias_mode == 1u) score += bias[head * kv_seq_len + ki];
+                if (valid && bias_mode == 2u) score += bias[(b * num_heads + head) * kv_seq_len + ki];
+                const float next_max = fmaxf(head_max, score);
+                const float alpha = head_denom > 0.0f ? expf(head_max - next_max) : 0.0f;
+                const float beta = valid ? expf(score - next_max) : 0.0f;
+                head_denom = head_denom * alpha + beta;
+                head_max = next_max;
+                head_alpha = alpha;
+                head_beta = beta;
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (unsigned int item = 0u; item < 1u; ++item) {
+            const unsigned int d = tid + item * blockDim.x;
+            const float value = valid ? v[kv_base + d] : 0.0f;
+            acc[item] = acc[item] * head_alpha + head_beta * value;
+        }
+    }
+
+    const unsigned int partial = (b * num_heads + head) * splits + split;
+#pragma unroll
+    for (unsigned int item = 0u; item < 1u; ++item) {
+        const unsigned int d = tid + item * blockDim.x;
+        partial_values[(size_t)partial * head_dim + d] = acc[item];
+    }
+    if (tid == 0u) {
+        partial_max[partial] = head_max;
+        partial_denom[partial] = head_denom;
+    }
+}
+
+extern "C" __global__ void antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1(
+    float* dst,
+    const float* partial_values,
+    const float* partial_max,
+    const float* partial_denom,
+    unsigned int batch,
+    unsigned int num_heads,
+    unsigned int head_dim,
+    unsigned int kv_seq_len,
+    unsigned int split_kv_min_tokens,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) kv_seq_len = decode_scalars[2];
+    if (kv_seq_len < split_kv_min_tokens) return;
+    if (batch != 1u || head_dim != 256u || blockDim.x != 256u || num_heads > 32u) return;
+    const unsigned int head_block = blockIdx.x;
+    if (head_block >= batch * num_heads) return;
+    const unsigned int splits = 8u;
+    __shared__ float merged_denom;
+    __shared__ float merge_alpha[8];
+    __shared__ float merge_beta[8];
+    if (threadIdx.x == 0u) {
+        float merged_max = -3.402823466e+38f;
+        float denom = 0.0f;
+        for (unsigned int split = 0u; split < splits; ++split) {
+            const unsigned int partial = head_block * splits + split;
+            const float local_denom = partial_denom[partial];
+            if (local_denom > 0.0f) {
+                const float next_max = fmaxf(merged_max, partial_max[partial]);
+                const float alpha = denom > 0.0f ? expf(merged_max - next_max) : 0.0f;
+                const float beta = expf(partial_max[partial] - next_max);
+                denom = denom * alpha + local_denom * beta;
+                merged_max = next_max;
+                merge_alpha[split] = alpha;
+                merge_beta[split] = beta;
+            } else {
+                merge_alpha[split] = 1.0f;
+                merge_beta[split] = 0.0f;
+            }
+        }
+        merged_denom = denom;
+    }
+    __syncthreads();
+#pragma unroll
+    for (unsigned int item = 0u; item < 1u; ++item) {
+        const unsigned int d = threadIdx.x + item * blockDim.x;
+        float numerator = 0.0f;
+#pragma unroll
+        for (unsigned int split = 0u; split < splits; ++split) {
+            const unsigned int partial = head_block * splits + split;
+            numerator = numerator * merge_alpha[split] + partial_values[(size_t)partial * head_dim + d] * merge_beta[split];
+        }
+        dst[(size_t)head_block * head_dim + d] = merged_denom > 0.0f ? numerator / merged_denom : 0.0f;
+    }
+}
+
+// Opt-in generated attention candidate from graph/quant_kernel_compiler.zig.
+// kernel_id=antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1 plan_id=cuda/attention/decode_1x/hd512/gqa16/split8/min512/f32/device_scalars
+extern "C" __global__ void antfly_gqa_attention_decode_scalars_hd512_f32_v1(
+    float* dst,
+    const float* q,
+    const float* k,
+    const float* v,
+    const unsigned char* attn_or_mask,
+    const float* bias,
+    unsigned int batch,
+    unsigned int q_seq_len,
+    unsigned int kv_seq_len,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int query_position_offset,
+    unsigned int kv_position_offset,
+    unsigned int sliding_window,
+    unsigned int total_sequence_len,
+    unsigned int mask_len,
+    unsigned int bias_mode,
+    unsigned int split_kv_min_tokens,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) {
+        kv_position_offset = decode_scalars[4];
+        query_position_offset = decode_scalars[1];
+        kv_seq_len = decode_scalars[2];
+    }
+    if (kv_seq_len >= split_kv_min_tokens) return;
+    const unsigned int block = blockIdx.x;
+    if (batch != 1u || q_seq_len != 1u || mask_len != 0u || bias_mode != 0u ||
+        block >= num_heads || head_dim != 512u || blockDim.x != 512u ||
+        num_kv_heads == 0u || num_heads == 0u || (num_heads % num_kv_heads) != 0u ||
+        (num_heads / num_kv_heads) > 16u || num_heads > 32u) return;
+    __shared__ float warp_sums[16];
     __shared__ float shared_max_score;
     __shared__ float shared_denom;
     __shared__ float shared_alpha;
     __shared__ float shared_beta;
-    unsigned int lane = threadIdx.x;
-    unsigned int block = blockIdx.x;
-    unsigned int total_blocks = batch * q_seq_len * num_heads;
-    if (block >= total_blocks || q_seq_len != 1u || head_dim != 256u || blockDim.x != 128u || num_kv_heads == 0u || (num_heads % num_kv_heads) != 0u) return;
-
-    unsigned int head = block % num_heads;
-    unsigned int tmp = block / num_heads;
-    unsigned int qi = tmp % q_seq_len;
-    unsigned int b = tmp / q_seq_len;
-    unsigned int heads_per_group = num_heads / num_kv_heads;
-    unsigned int kv_head = head / heads_per_group;
-    unsigned int q_hidden = num_heads * head_dim;
-    unsigned int kv_hidden = num_kv_heads * head_dim;
-    unsigned int query_pos = query_position_offset + qi;
-    unsigned int q_base = (b * q_seq_len + qi) * q_hidden + head * head_dim;
-    float scale = rsqrtf((float)head_dim);
-    unsigned int warp = lane >> 5;
-    unsigned int warp_lane = lane & 31u;
+    const unsigned int lane = threadIdx.x;
+    const unsigned int head = block;
+    const unsigned int query_pos = query_position_offset;
+    unsigned int key_start = 0u;
+    unsigned int key_end = 0u;
+    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
+        const unsigned int visible = query_pos - kv_position_offset + 1u;
+        key_end = visible < kv_seq_len ? visible : kv_seq_len;
+        if (sliding_window != 0u) {
+            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
+            if (window_start_abs > kv_position_offset) {
+                key_start = window_start_abs - kv_position_offset;
+                if (key_start > key_end) key_start = key_end;
+            }
+        }
+    }
+    const unsigned int heads_per_group = num_heads / num_kv_heads;
+    const unsigned int kv_head = head / heads_per_group;
+    const unsigned int kv_hidden = num_kv_heads * head_dim;
+    const unsigned int q_base = head * head_dim;
+    const float scale_input = (float)head_dim;
+    float scale;
+    asm volatile ("rsqrt.approx.f32 %0, %1;" : "=f"(scale) : "f"(scale_input));
     if (lane == 0u) {
         shared_max_score = -3.402823466e+38f;
         shared_denom = 0.0f;
     }
     __syncthreads();
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    for (unsigned int ki = 0; ki < kv_seq_len; ++ki) {
-        unsigned int key_pos = kv_position_offset + ki;
-        unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
-        bool future_allowed = attn_or_mask != 0 && mask_idx < mask_len && attn_or_mask[mask_idx] != 0u;
-        bool future_blocked = key_pos > query_pos && !future_allowed;
-        bool past_blocked = key_pos > query_pos || (sliding_window != 0u && (query_pos - key_pos) >= sliding_window);
-        bool valid = !(future_blocked || past_blocked);
-        unsigned int k_base = (b * kv_seq_len + ki) * kv_hidden + kv_head * head_dim;
-        float dot = valid ? q[q_base + lane] * k[k_base + lane] + q[q_base + lane + 128u] * k[k_base + lane + 128u] : 0.0f;
-        for (unsigned int offset = 16u; offset > 0u; offset >>= 1) {
-            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+    float acc = 0.0f;
+    for (unsigned int ki = key_start; ki < key_end; ++ki) {
+        float partial = 0.0f;
+        if (lane < head_dim) {
+            const unsigned int k_base = ki * kv_hidden + kv_head * head_dim;
+            partial = q[q_base + lane] * k[k_base + lane];
         }
-        if (warp_lane == 0u) warp_sums[warp] = dot;
-        __syncthreads();
-        if (warp == 0u) {
-            float block_dot = warp_lane < 4u ? warp_sums[warp_lane] : 0.0f;
-            for (unsigned int offset = 16u; offset > 0u; offset >>= 1) {
-                block_dot += __shfl_down_sync(0xffffffffu, block_dot, offset);
-            }
-            if (warp_lane == 0u) {
-                float score = valid ? block_dot * scale : -3.402823466e+38f;
-                if (valid && bias_mode == 1u) score += bias[(head * q_seq_len + qi) * kv_seq_len + ki];
-                if (valid && bias_mode == 2u) score += bias[((b * num_heads + head) * q_seq_len + qi) * kv_seq_len + ki];
-                float next_max = fmaxf(shared_max_score, score);
-                float alpha = shared_denom > 0.0f ? expf(shared_max_score - next_max) : 0.0f;
-                float beta = valid ? expf(score - next_max) : 0.0f;
-                shared_denom = shared_denom * alpha + beta;
-                shared_max_score = next_max;
-                shared_alpha = alpha;
-                shared_beta = beta;
-            }
+        const float dot = termite_block_reduce_sum_f32(partial, warp_sums);
+        if (lane == 0u) {
+            const float score = dot * scale;
+            const float next_max = fmaxf(shared_max_score, score);
+            shared_alpha = expf(shared_max_score - next_max);
+            shared_beta = expf(score - next_max);
+            shared_denom = shared_denom * shared_alpha + shared_beta;
+            shared_max_score = next_max;
         }
         __syncthreads();
-        unsigned int v_idx = (b * kv_seq_len + ki) * kv_hidden + kv_head * head_dim + lane;
-        acc0 = acc0 * shared_alpha + shared_beta * v[v_idx];
-        acc1 = acc1 * shared_alpha + shared_beta * v[v_idx + 128u];
+        if (lane < head_dim) {
+            const unsigned int v_idx = ki * kv_hidden + kv_head * head_dim + lane;
+            acc = acc * shared_alpha + shared_beta * v[v_idx];
+        }
+        __syncthreads();
     }
 
-    unsigned int out_idx = (b * q_seq_len + qi) * q_hidden + head * head_dim + lane;
-    dst[out_idx] = shared_denom > 0.0f ? acc0 / shared_denom : 0.0f;
-    dst[out_idx + 128u] = shared_denom > 0.0f ? acc1 / shared_denom : 0.0f;
+    if (lane < head_dim) {
+        const unsigned int out_idx = head * head_dim + lane;
+        dst[out_idx] = shared_denom > 0.0f ? acc / shared_denom : 0.0f;
+    }
+
+    (void)attn_or_mask;
+    (void)bias;
+    (void)total_sequence_len;
 }
+
+extern "C" __global__ void antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1(
+    float* partial_values,
+    float* partial_max,
+    float* partial_denom,
+    const float* q,
+    const float* k,
+    const float* v,
+    const unsigned char* attn_or_mask,
+    const float* bias,
+    unsigned int batch,
+    unsigned int q_seq_len,
+    unsigned int kv_seq_len,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int query_position_offset,
+    unsigned int kv_position_offset,
+    unsigned int sliding_window,
+    unsigned int total_sequence_len,
+    unsigned int mask_len,
+    unsigned int bias_mode,
+    unsigned int split_kv_min_tokens,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) {
+        kv_position_offset = decode_scalars[4];
+        query_position_offset = decode_scalars[1];
+        kv_seq_len = decode_scalars[2];
+        total_sequence_len = decode_scalars[3];
+    }
+    if (kv_seq_len < split_kv_min_tokens) return;
+    if (batch != 1u || q_seq_len != 1u || mask_len != 0u || bias_mode != 0u ||
+        head_dim != 512u || blockDim.x != 512u ||
+        num_kv_heads == 0u || num_heads == 0u || (num_heads % num_kv_heads) != 0u ||
+        (num_heads / num_kv_heads) > 16u || num_heads > 32u) return;
+    const unsigned int splits = 8u;
+    const unsigned int split = blockIdx.x % splits;
+    const unsigned int head_block = blockIdx.x / splits;
+    const unsigned int head = head_block % num_heads;
+    const unsigned int b = head_block / num_heads;
+    if (b >= batch) return;
+    const unsigned int heads_per_kv = num_heads / num_kv_heads;
+    const unsigned int kv_head = head / heads_per_kv;
+    const unsigned int query_pos = query_position_offset;
+    unsigned int key_start = 0u;
+    unsigned int key_end = 0u;
+    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
+        const unsigned int visible = query_pos - kv_position_offset + 1u;
+        key_end = visible < kv_seq_len ? visible : kv_seq_len;
+        if (sliding_window != 0u) {
+            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
+            if (window_start_abs > kv_position_offset) {
+                key_start = window_start_abs - kv_position_offset;
+                if (key_start > key_end) key_start = key_end;
+            }
+        }
+    }
+    unsigned int split_begin = (kv_seq_len * split) / splits;
+    unsigned int split_end = (kv_seq_len * (split + 1u)) / splits;
+    if (split_begin < key_start) split_begin = key_start;
+    if (split_end > key_end) split_end = key_end;
+    if (split_begin > split_end) split_begin = split_end;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int q_hidden = num_heads * head_dim;
+    const unsigned int kv_hidden = num_kv_heads * head_dim;
+    const unsigned int q_base = (b * q_seq_len) * q_hidden + head * head_dim;
+    const float scale_input = (float)head_dim;
+    float scale;
+    asm volatile ("rsqrt.approx.f32 %0, %1;" : "=f"(scale) : "f"(scale_input));
+
+    __shared__ float warp_sums[16];
+    __shared__ float head_max;
+    __shared__ float head_denom;
+    __shared__ float head_alpha;
+    __shared__ float head_beta;
+    float q_values[1];
+    float acc[1];
+#pragma unroll
+    for (unsigned int item = 0u; item < 1u; ++item) {
+        const unsigned int d = tid + item * blockDim.x;
+        q_values[item] = q[q_base + d];
+        acc[item] = 0.0f;
+    }
+    if (tid == 0u) {
+        head_max = -3.402823466e+38f;
+        head_denom = 0.0f;
+        head_alpha = 0.0f;
+        head_beta = 0.0f;
+    }
+    __syncthreads();
+
+    for (unsigned int ki = split_begin; ki < split_end; ++ki) {
+        const unsigned int key_pos = kv_position_offset + ki;
+        const unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
+        const bool future_allowed = attn_or_mask != 0 && mask_idx < mask_len && attn_or_mask[mask_idx] != 0u;
+        const bool future_blocked = key_pos > query_pos && !future_allowed;
+        const bool past_blocked = key_pos > query_pos || (sliding_window != 0u && (query_pos - key_pos) >= sliding_window);
+        const bool valid = !(future_blocked || past_blocked);
+        const unsigned int kv_base = (b * kv_seq_len + ki) * kv_hidden + kv_head * head_dim;
+
+        float dot = 0.0f;
+#pragma unroll
+        for (unsigned int item = 0u; item < 1u; ++item) {
+            const unsigned int d = tid + item * blockDim.x;
+            const float key_value = valid ? k[kv_base + d] : 0.0f;
+            dot += q_values[item] * key_value;
+        }
+        for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        }
+        if (lane == 0u) warp_sums[warp] = dot;
+        __syncthreads();
+
+        float block_dot = (warp == 0u && lane < 16u) ? warp_sums[lane] : 0.0f;
+        if (warp == 0u) {
+            for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+                block_dot += __shfl_down_sync(0xffffffffu, block_dot, offset);
+            }
+            if (lane == 0u) {
+                float score = valid ? block_dot * scale : -3.402823466e+38f;
+                if (valid && bias_mode == 1u) score += bias[head * kv_seq_len + ki];
+                if (valid && bias_mode == 2u) score += bias[(b * num_heads + head) * kv_seq_len + ki];
+                const float next_max = fmaxf(head_max, score);
+                const float alpha = head_denom > 0.0f ? expf(head_max - next_max) : 0.0f;
+                const float beta = valid ? expf(score - next_max) : 0.0f;
+                head_denom = head_denom * alpha + beta;
+                head_max = next_max;
+                head_alpha = alpha;
+                head_beta = beta;
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (unsigned int item = 0u; item < 1u; ++item) {
+            const unsigned int d = tid + item * blockDim.x;
+            const float value = valid ? v[kv_base + d] : 0.0f;
+            acc[item] = acc[item] * head_alpha + head_beta * value;
+        }
+    }
+
+    const unsigned int partial = (b * num_heads + head) * splits + split;
+#pragma unroll
+    for (unsigned int item = 0u; item < 1u; ++item) {
+        const unsigned int d = tid + item * blockDim.x;
+        partial_values[(size_t)partial * head_dim + d] = acc[item];
+    }
+    if (tid == 0u) {
+        partial_max[partial] = head_max;
+        partial_denom[partial] = head_denom;
+    }
+}
+
+extern "C" __global__ void antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1(
+    float* dst,
+    const float* partial_values,
+    const float* partial_max,
+    const float* partial_denom,
+    unsigned int batch,
+    unsigned int num_heads,
+    unsigned int head_dim,
+    unsigned int kv_seq_len,
+    unsigned int split_kv_min_tokens,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) kv_seq_len = decode_scalars[2];
+    if (kv_seq_len < split_kv_min_tokens) return;
+    if (batch != 1u || head_dim != 512u || blockDim.x != 512u || num_heads > 32u) return;
+    const unsigned int head_block = blockIdx.x;
+    if (head_block >= batch * num_heads) return;
+    const unsigned int splits = 8u;
+    __shared__ float merged_denom;
+    __shared__ float merge_alpha[8];
+    __shared__ float merge_beta[8];
+    if (threadIdx.x == 0u) {
+        float merged_max = -3.402823466e+38f;
+        float denom = 0.0f;
+        for (unsigned int split = 0u; split < splits; ++split) {
+            const unsigned int partial = head_block * splits + split;
+            const float local_denom = partial_denom[partial];
+            if (local_denom > 0.0f) {
+                const float next_max = fmaxf(merged_max, partial_max[partial]);
+                const float alpha = denom > 0.0f ? expf(merged_max - next_max) : 0.0f;
+                const float beta = expf(partial_max[partial] - next_max);
+                denom = denom * alpha + local_denom * beta;
+                merged_max = next_max;
+                merge_alpha[split] = alpha;
+                merge_beta[split] = beta;
+            } else {
+                merge_alpha[split] = 1.0f;
+                merge_beta[split] = 0.0f;
+            }
+        }
+        merged_denom = denom;
+    }
+    __syncthreads();
+#pragma unroll
+    for (unsigned int item = 0u; item < 1u; ++item) {
+        const unsigned int d = threadIdx.x + item * blockDim.x;
+        float numerator = 0.0f;
+#pragma unroll
+        for (unsigned int split = 0u; split < splits; ++split) {
+            const unsigned int partial = head_block * splits + split;
+            numerator = numerator * merge_alpha[split] + partial_values[(size_t)partial * head_dim + d] * merge_beta[split];
+        }
+        dst[(size_t)head_block * head_dim + d] = merged_denom > 0.0f ? numerator / merged_denom : 0.0f;
+    }
+}
+
+// Opt-in generated attention candidate from graph/quant_kernel_compiler.zig.
+// kernel_id=antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1 plan_id=cuda/attention/decode_1x/hd256/gqa16/split2/min512/f32/device_scalars
+extern "C" __global__ void antfly_gqa_attention_decode_scalars_split2_hd256_f32_v1(
+    float* dst,
+    const float* q,
+    const float* k,
+    const float* v,
+    const unsigned char* attn_or_mask,
+    const float* bias,
+    unsigned int batch,
+    unsigned int q_seq_len,
+    unsigned int kv_seq_len,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int query_position_offset,
+    unsigned int kv_position_offset,
+    unsigned int sliding_window,
+    unsigned int total_sequence_len,
+    unsigned int mask_len,
+    unsigned int bias_mode,
+    unsigned int split_kv_min_tokens,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) {
+        kv_position_offset = decode_scalars[4];
+        query_position_offset = decode_scalars[1];
+        kv_seq_len = decode_scalars[2];
+    }
+    if (kv_seq_len >= split_kv_min_tokens) return;
+    const unsigned int block = blockIdx.x;
+    if (batch != 1u || q_seq_len != 1u || mask_len != 0u || bias_mode != 0u ||
+        block >= num_heads || head_dim != 256u || blockDim.x != 256u ||
+        num_kv_heads == 0u || num_heads == 0u || (num_heads % num_kv_heads) != 0u ||
+        (num_heads / num_kv_heads) > 16u || num_heads > 32u) return;
+    __shared__ float warp_sums[16];
+    __shared__ float shared_max_score;
+    __shared__ float shared_denom;
+    __shared__ float shared_alpha;
+    __shared__ float shared_beta;
+    const unsigned int lane = threadIdx.x;
+    const unsigned int head = block;
+    const unsigned int query_pos = query_position_offset;
+    unsigned int key_start = 0u;
+    unsigned int key_end = 0u;
+    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
+        const unsigned int visible = query_pos - kv_position_offset + 1u;
+        key_end = visible < kv_seq_len ? visible : kv_seq_len;
+        if (sliding_window != 0u) {
+            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
+            if (window_start_abs > kv_position_offset) {
+                key_start = window_start_abs - kv_position_offset;
+                if (key_start > key_end) key_start = key_end;
+            }
+        }
+    }
+    const unsigned int heads_per_group = num_heads / num_kv_heads;
+    const unsigned int kv_head = head / heads_per_group;
+    const unsigned int kv_hidden = num_kv_heads * head_dim;
+    const unsigned int q_base = head * head_dim;
+    const float scale_input = (float)head_dim;
+    float scale;
+    asm volatile ("rsqrt.approx.f32 %0, %1;" : "=f"(scale) : "f"(scale_input));
+    if (lane == 0u) {
+        shared_max_score = -3.402823466e+38f;
+        shared_denom = 0.0f;
+    }
+    __syncthreads();
+
+    float acc = 0.0f;
+    for (unsigned int ki = key_start; ki < key_end; ++ki) {
+        float partial = 0.0f;
+        if (lane < head_dim) {
+            const unsigned int k_base = ki * kv_hidden + kv_head * head_dim;
+            partial = q[q_base + lane] * k[k_base + lane];
+        }
+        const float dot = termite_block_reduce_sum_f32(partial, warp_sums);
+        if (lane == 0u) {
+            const float score = dot * scale;
+            const float next_max = fmaxf(shared_max_score, score);
+            shared_alpha = expf(shared_max_score - next_max);
+            shared_beta = expf(score - next_max);
+            shared_denom = shared_denom * shared_alpha + shared_beta;
+            shared_max_score = next_max;
+        }
+        __syncthreads();
+        if (lane < head_dim) {
+            const unsigned int v_idx = ki * kv_hidden + kv_head * head_dim + lane;
+            acc = acc * shared_alpha + shared_beta * v[v_idx];
+        }
+        __syncthreads();
+    }
+
+    if (lane < head_dim) {
+        const unsigned int out_idx = head * head_dim + lane;
+        dst[out_idx] = shared_denom > 0.0f ? acc / shared_denom : 0.0f;
+    }
+
+    (void)attn_or_mask;
+    (void)bias;
+    (void)total_sequence_len;
+}
+
+extern "C" __global__ void antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1(
+    float* partial_values,
+    float* partial_max,
+    float* partial_denom,
+    const float* q,
+    const float* k,
+    const float* v,
+    const unsigned char* attn_or_mask,
+    const float* bias,
+    unsigned int batch,
+    unsigned int q_seq_len,
+    unsigned int kv_seq_len,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int query_position_offset,
+    unsigned int kv_position_offset,
+    unsigned int sliding_window,
+    unsigned int total_sequence_len,
+    unsigned int mask_len,
+    unsigned int bias_mode,
+    unsigned int split_kv_min_tokens,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) {
+        kv_position_offset = decode_scalars[4];
+        query_position_offset = decode_scalars[1];
+        kv_seq_len = decode_scalars[2];
+        total_sequence_len = decode_scalars[3];
+    }
+    if (kv_seq_len < split_kv_min_tokens) return;
+    if (batch != 1u || q_seq_len != 1u || mask_len != 0u || bias_mode != 0u ||
+        head_dim != 256u || blockDim.x != 256u ||
+        num_kv_heads == 0u || num_heads == 0u || (num_heads % num_kv_heads) != 0u ||
+        (num_heads / num_kv_heads) > 16u || num_heads > 32u) return;
+    const unsigned int splits = 2u;
+    const unsigned int split = blockIdx.x % splits;
+    const unsigned int head_block = blockIdx.x / splits;
+    const unsigned int head = head_block % num_heads;
+    const unsigned int b = head_block / num_heads;
+    if (b >= batch) return;
+    const unsigned int heads_per_kv = num_heads / num_kv_heads;
+    const unsigned int kv_head = head / heads_per_kv;
+    const unsigned int query_pos = query_position_offset;
+    unsigned int key_start = 0u;
+    unsigned int key_end = 0u;
+    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
+        const unsigned int visible = query_pos - kv_position_offset + 1u;
+        key_end = visible < kv_seq_len ? visible : kv_seq_len;
+        if (sliding_window != 0u) {
+            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
+            if (window_start_abs > kv_position_offset) {
+                key_start = window_start_abs - kv_position_offset;
+                if (key_start > key_end) key_start = key_end;
+            }
+        }
+    }
+    unsigned int split_begin = (kv_seq_len * split) / splits;
+    unsigned int split_end = (kv_seq_len * (split + 1u)) / splits;
+    if (split_begin < key_start) split_begin = key_start;
+    if (split_end > key_end) split_end = key_end;
+    if (split_begin > split_end) split_begin = split_end;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int q_hidden = num_heads * head_dim;
+    const unsigned int kv_hidden = num_kv_heads * head_dim;
+    const unsigned int q_base = (b * q_seq_len) * q_hidden + head * head_dim;
+    const float scale_input = (float)head_dim;
+    float scale;
+    asm volatile ("rsqrt.approx.f32 %0, %1;" : "=f"(scale) : "f"(scale_input));
+
+    __shared__ float warp_sums[8];
+    __shared__ float head_max;
+    __shared__ float head_denom;
+    __shared__ float head_alpha;
+    __shared__ float head_beta;
+    float q_values[1];
+    float acc[1];
+#pragma unroll
+    for (unsigned int item = 0u; item < 1u; ++item) {
+        const unsigned int d = tid + item * blockDim.x;
+        q_values[item] = q[q_base + d];
+        acc[item] = 0.0f;
+    }
+    if (tid == 0u) {
+        head_max = -3.402823466e+38f;
+        head_denom = 0.0f;
+        head_alpha = 0.0f;
+        head_beta = 0.0f;
+    }
+    __syncthreads();
+
+    for (unsigned int ki = split_begin; ki < split_end; ++ki) {
+        const unsigned int key_pos = kv_position_offset + ki;
+        const unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
+        const bool future_allowed = attn_or_mask != 0 && mask_idx < mask_len && attn_or_mask[mask_idx] != 0u;
+        const bool future_blocked = key_pos > query_pos && !future_allowed;
+        const bool past_blocked = key_pos > query_pos || (sliding_window != 0u && (query_pos - key_pos) >= sliding_window);
+        const bool valid = !(future_blocked || past_blocked);
+        const unsigned int kv_base = (b * kv_seq_len + ki) * kv_hidden + kv_head * head_dim;
+
+        float dot = 0.0f;
+#pragma unroll
+        for (unsigned int item = 0u; item < 1u; ++item) {
+            const unsigned int d = tid + item * blockDim.x;
+            const float key_value = valid ? k[kv_base + d] : 0.0f;
+            dot += q_values[item] * key_value;
+        }
+        for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        }
+        if (lane == 0u) warp_sums[warp] = dot;
+        __syncthreads();
+
+        float block_dot = (warp == 0u && lane < 8u) ? warp_sums[lane] : 0.0f;
+        if (warp == 0u) {
+            for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+                block_dot += __shfl_down_sync(0xffffffffu, block_dot, offset);
+            }
+            if (lane == 0u) {
+                float score = valid ? block_dot * scale : -3.402823466e+38f;
+                if (valid && bias_mode == 1u) score += bias[head * kv_seq_len + ki];
+                if (valid && bias_mode == 2u) score += bias[(b * num_heads + head) * kv_seq_len + ki];
+                const float next_max = fmaxf(head_max, score);
+                const float alpha = head_denom > 0.0f ? expf(head_max - next_max) : 0.0f;
+                const float beta = valid ? expf(score - next_max) : 0.0f;
+                head_denom = head_denom * alpha + beta;
+                head_max = next_max;
+                head_alpha = alpha;
+                head_beta = beta;
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (unsigned int item = 0u; item < 1u; ++item) {
+            const unsigned int d = tid + item * blockDim.x;
+            const float value = valid ? v[kv_base + d] : 0.0f;
+            acc[item] = acc[item] * head_alpha + head_beta * value;
+        }
+    }
+
+    const unsigned int partial = (b * num_heads + head) * splits + split;
+#pragma unroll
+    for (unsigned int item = 0u; item < 1u; ++item) {
+        const unsigned int d = tid + item * blockDim.x;
+        partial_values[(size_t)partial * head_dim + d] = acc[item];
+    }
+    if (tid == 0u) {
+        partial_max[partial] = head_max;
+        partial_denom[partial] = head_denom;
+    }
+}
+
+extern "C" __global__ void antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1(
+    float* dst,
+    const float* partial_values,
+    const float* partial_max,
+    const float* partial_denom,
+    unsigned int batch,
+    unsigned int num_heads,
+    unsigned int head_dim,
+    unsigned int kv_seq_len,
+    unsigned int split_kv_min_tokens,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) kv_seq_len = decode_scalars[2];
+    if (kv_seq_len < split_kv_min_tokens) return;
+    if (batch != 1u || head_dim != 256u || blockDim.x != 256u || num_heads > 32u) return;
+    const unsigned int head_block = blockIdx.x;
+    if (head_block >= batch * num_heads) return;
+    const unsigned int splits = 2u;
+    __shared__ float merged_denom;
+    __shared__ float merge_alpha[2];
+    __shared__ float merge_beta[2];
+    if (threadIdx.x == 0u) {
+        float merged_max = -3.402823466e+38f;
+        float denom = 0.0f;
+        for (unsigned int split = 0u; split < splits; ++split) {
+            const unsigned int partial = head_block * splits + split;
+            const float local_denom = partial_denom[partial];
+            if (local_denom > 0.0f) {
+                const float next_max = fmaxf(merged_max, partial_max[partial]);
+                const float alpha = denom > 0.0f ? expf(merged_max - next_max) : 0.0f;
+                const float beta = expf(partial_max[partial] - next_max);
+                denom = denom * alpha + local_denom * beta;
+                merged_max = next_max;
+                merge_alpha[split] = alpha;
+                merge_beta[split] = beta;
+            } else {
+                merge_alpha[split] = 1.0f;
+                merge_beta[split] = 0.0f;
+            }
+        }
+        merged_denom = denom;
+    }
+    __syncthreads();
+#pragma unroll
+    for (unsigned int item = 0u; item < 1u; ++item) {
+        const unsigned int d = threadIdx.x + item * blockDim.x;
+        float numerator = 0.0f;
+#pragma unroll
+        for (unsigned int split = 0u; split < splits; ++split) {
+            const unsigned int partial = head_block * splits + split;
+            numerator = numerator * merge_alpha[split] + partial_values[(size_t)partial * head_dim + d] * merge_beta[split];
+        }
+        dst[(size_t)head_block * head_dim + d] = merged_denom > 0.0f ? numerator / merged_denom : 0.0f;
+    }
+}
+
+// Opt-in generated attention candidate from graph/quant_kernel_compiler.zig.
+// kernel_id=antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1 plan_id=cuda/attention/decode_1x/hd512/gqa16/split2/min512/f32/device_scalars
+extern "C" __global__ void antfly_gqa_attention_decode_scalars_split2_hd512_f32_v1(
+    float* dst,
+    const float* q,
+    const float* k,
+    const float* v,
+    const unsigned char* attn_or_mask,
+    const float* bias,
+    unsigned int batch,
+    unsigned int q_seq_len,
+    unsigned int kv_seq_len,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int query_position_offset,
+    unsigned int kv_position_offset,
+    unsigned int sliding_window,
+    unsigned int total_sequence_len,
+    unsigned int mask_len,
+    unsigned int bias_mode,
+    unsigned int split_kv_min_tokens,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) {
+        kv_position_offset = decode_scalars[4];
+        query_position_offset = decode_scalars[1];
+        kv_seq_len = decode_scalars[2];
+    }
+    if (kv_seq_len >= split_kv_min_tokens) return;
+    const unsigned int block = blockIdx.x;
+    if (batch != 1u || q_seq_len != 1u || mask_len != 0u || bias_mode != 0u ||
+        block >= num_heads || head_dim != 512u || blockDim.x != 512u ||
+        num_kv_heads == 0u || num_heads == 0u || (num_heads % num_kv_heads) != 0u ||
+        (num_heads / num_kv_heads) > 16u || num_heads > 32u) return;
+    __shared__ float warp_sums[16];
+    __shared__ float shared_max_score;
+    __shared__ float shared_denom;
+    __shared__ float shared_alpha;
+    __shared__ float shared_beta;
+    const unsigned int lane = threadIdx.x;
+    const unsigned int head = block;
+    const unsigned int query_pos = query_position_offset;
+    unsigned int key_start = 0u;
+    unsigned int key_end = 0u;
+    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
+        const unsigned int visible = query_pos - kv_position_offset + 1u;
+        key_end = visible < kv_seq_len ? visible : kv_seq_len;
+        if (sliding_window != 0u) {
+            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
+            if (window_start_abs > kv_position_offset) {
+                key_start = window_start_abs - kv_position_offset;
+                if (key_start > key_end) key_start = key_end;
+            }
+        }
+    }
+    const unsigned int heads_per_group = num_heads / num_kv_heads;
+    const unsigned int kv_head = head / heads_per_group;
+    const unsigned int kv_hidden = num_kv_heads * head_dim;
+    const unsigned int q_base = head * head_dim;
+    const float scale_input = (float)head_dim;
+    float scale;
+    asm volatile ("rsqrt.approx.f32 %0, %1;" : "=f"(scale) : "f"(scale_input));
+    if (lane == 0u) {
+        shared_max_score = -3.402823466e+38f;
+        shared_denom = 0.0f;
+    }
+    __syncthreads();
+
+    float acc = 0.0f;
+    for (unsigned int ki = key_start; ki < key_end; ++ki) {
+        float partial = 0.0f;
+        if (lane < head_dim) {
+            const unsigned int k_base = ki * kv_hidden + kv_head * head_dim;
+            partial = q[q_base + lane] * k[k_base + lane];
+        }
+        const float dot = termite_block_reduce_sum_f32(partial, warp_sums);
+        if (lane == 0u) {
+            const float score = dot * scale;
+            const float next_max = fmaxf(shared_max_score, score);
+            shared_alpha = expf(shared_max_score - next_max);
+            shared_beta = expf(score - next_max);
+            shared_denom = shared_denom * shared_alpha + shared_beta;
+            shared_max_score = next_max;
+        }
+        __syncthreads();
+        if (lane < head_dim) {
+            const unsigned int v_idx = ki * kv_hidden + kv_head * head_dim + lane;
+            acc = acc * shared_alpha + shared_beta * v[v_idx];
+        }
+        __syncthreads();
+    }
+
+    if (lane < head_dim) {
+        const unsigned int out_idx = head * head_dim + lane;
+        dst[out_idx] = shared_denom > 0.0f ? acc / shared_denom : 0.0f;
+    }
+
+    (void)attn_or_mask;
+    (void)bias;
+    (void)total_sequence_len;
+}
+
+extern "C" __global__ void antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1(
+    float* partial_values,
+    float* partial_max,
+    float* partial_denom,
+    const float* q,
+    const float* k,
+    const float* v,
+    const unsigned char* attn_or_mask,
+    const float* bias,
+    unsigned int batch,
+    unsigned int q_seq_len,
+    unsigned int kv_seq_len,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int query_position_offset,
+    unsigned int kv_position_offset,
+    unsigned int sliding_window,
+    unsigned int total_sequence_len,
+    unsigned int mask_len,
+    unsigned int bias_mode,
+    unsigned int split_kv_min_tokens,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) {
+        kv_position_offset = decode_scalars[4];
+        query_position_offset = decode_scalars[1];
+        kv_seq_len = decode_scalars[2];
+        total_sequence_len = decode_scalars[3];
+    }
+    if (kv_seq_len < split_kv_min_tokens) return;
+    if (batch != 1u || q_seq_len != 1u || mask_len != 0u || bias_mode != 0u ||
+        head_dim != 512u || blockDim.x != 512u ||
+        num_kv_heads == 0u || num_heads == 0u || (num_heads % num_kv_heads) != 0u ||
+        (num_heads / num_kv_heads) > 16u || num_heads > 32u) return;
+    const unsigned int splits = 2u;
+    const unsigned int split = blockIdx.x % splits;
+    const unsigned int head_block = blockIdx.x / splits;
+    const unsigned int head = head_block % num_heads;
+    const unsigned int b = head_block / num_heads;
+    if (b >= batch) return;
+    const unsigned int heads_per_kv = num_heads / num_kv_heads;
+    const unsigned int kv_head = head / heads_per_kv;
+    const unsigned int query_pos = query_position_offset;
+    unsigned int key_start = 0u;
+    unsigned int key_end = 0u;
+    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
+        const unsigned int visible = query_pos - kv_position_offset + 1u;
+        key_end = visible < kv_seq_len ? visible : kv_seq_len;
+        if (sliding_window != 0u) {
+            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
+            if (window_start_abs > kv_position_offset) {
+                key_start = window_start_abs - kv_position_offset;
+                if (key_start > key_end) key_start = key_end;
+            }
+        }
+    }
+    unsigned int split_begin = (kv_seq_len * split) / splits;
+    unsigned int split_end = (kv_seq_len * (split + 1u)) / splits;
+    if (split_begin < key_start) split_begin = key_start;
+    if (split_end > key_end) split_end = key_end;
+    if (split_begin > split_end) split_begin = split_end;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int q_hidden = num_heads * head_dim;
+    const unsigned int kv_hidden = num_kv_heads * head_dim;
+    const unsigned int q_base = (b * q_seq_len) * q_hidden + head * head_dim;
+    const float scale_input = (float)head_dim;
+    float scale;
+    asm volatile ("rsqrt.approx.f32 %0, %1;" : "=f"(scale) : "f"(scale_input));
+
+    __shared__ float warp_sums[16];
+    __shared__ float head_max;
+    __shared__ float head_denom;
+    __shared__ float head_alpha;
+    __shared__ float head_beta;
+    float q_values[1];
+    float acc[1];
+#pragma unroll
+    for (unsigned int item = 0u; item < 1u; ++item) {
+        const unsigned int d = tid + item * blockDim.x;
+        q_values[item] = q[q_base + d];
+        acc[item] = 0.0f;
+    }
+    if (tid == 0u) {
+        head_max = -3.402823466e+38f;
+        head_denom = 0.0f;
+        head_alpha = 0.0f;
+        head_beta = 0.0f;
+    }
+    __syncthreads();
+
+    for (unsigned int ki = split_begin; ki < split_end; ++ki) {
+        const unsigned int key_pos = kv_position_offset + ki;
+        const unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
+        const bool future_allowed = attn_or_mask != 0 && mask_idx < mask_len && attn_or_mask[mask_idx] != 0u;
+        const bool future_blocked = key_pos > query_pos && !future_allowed;
+        const bool past_blocked = key_pos > query_pos || (sliding_window != 0u && (query_pos - key_pos) >= sliding_window);
+        const bool valid = !(future_blocked || past_blocked);
+        const unsigned int kv_base = (b * kv_seq_len + ki) * kv_hidden + kv_head * head_dim;
+
+        float dot = 0.0f;
+#pragma unroll
+        for (unsigned int item = 0u; item < 1u; ++item) {
+            const unsigned int d = tid + item * blockDim.x;
+            const float key_value = valid ? k[kv_base + d] : 0.0f;
+            dot += q_values[item] * key_value;
+        }
+        for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        }
+        if (lane == 0u) warp_sums[warp] = dot;
+        __syncthreads();
+
+        float block_dot = (warp == 0u && lane < 16u) ? warp_sums[lane] : 0.0f;
+        if (warp == 0u) {
+            for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+                block_dot += __shfl_down_sync(0xffffffffu, block_dot, offset);
+            }
+            if (lane == 0u) {
+                float score = valid ? block_dot * scale : -3.402823466e+38f;
+                if (valid && bias_mode == 1u) score += bias[head * kv_seq_len + ki];
+                if (valid && bias_mode == 2u) score += bias[(b * num_heads + head) * kv_seq_len + ki];
+                const float next_max = fmaxf(head_max, score);
+                const float alpha = head_denom > 0.0f ? expf(head_max - next_max) : 0.0f;
+                const float beta = valid ? expf(score - next_max) : 0.0f;
+                head_denom = head_denom * alpha + beta;
+                head_max = next_max;
+                head_alpha = alpha;
+                head_beta = beta;
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (unsigned int item = 0u; item < 1u; ++item) {
+            const unsigned int d = tid + item * blockDim.x;
+            const float value = valid ? v[kv_base + d] : 0.0f;
+            acc[item] = acc[item] * head_alpha + head_beta * value;
+        }
+    }
+
+    const unsigned int partial = (b * num_heads + head) * splits + split;
+#pragma unroll
+    for (unsigned int item = 0u; item < 1u; ++item) {
+        const unsigned int d = tid + item * blockDim.x;
+        partial_values[(size_t)partial * head_dim + d] = acc[item];
+    }
+    if (tid == 0u) {
+        partial_max[partial] = head_max;
+        partial_denom[partial] = head_denom;
+    }
+}
+
+extern "C" __global__ void antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1(
+    float* dst,
+    const float* partial_values,
+    const float* partial_max,
+    const float* partial_denom,
+    unsigned int batch,
+    unsigned int num_heads,
+    unsigned int head_dim,
+    unsigned int kv_seq_len,
+    unsigned int split_kv_min_tokens,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) kv_seq_len = decode_scalars[2];
+    if (kv_seq_len < split_kv_min_tokens) return;
+    if (batch != 1u || head_dim != 512u || blockDim.x != 512u || num_heads > 32u) return;
+    const unsigned int head_block = blockIdx.x;
+    if (head_block >= batch * num_heads) return;
+    const unsigned int splits = 2u;
+    __shared__ float merged_denom;
+    __shared__ float merge_alpha[2];
+    __shared__ float merge_beta[2];
+    if (threadIdx.x == 0u) {
+        float merged_max = -3.402823466e+38f;
+        float denom = 0.0f;
+        for (unsigned int split = 0u; split < splits; ++split) {
+            const unsigned int partial = head_block * splits + split;
+            const float local_denom = partial_denom[partial];
+            if (local_denom > 0.0f) {
+                const float next_max = fmaxf(merged_max, partial_max[partial]);
+                const float alpha = denom > 0.0f ? expf(merged_max - next_max) : 0.0f;
+                const float beta = expf(partial_max[partial] - next_max);
+                denom = denom * alpha + local_denom * beta;
+                merged_max = next_max;
+                merge_alpha[split] = alpha;
+                merge_beta[split] = beta;
+            } else {
+                merge_alpha[split] = 1.0f;
+                merge_beta[split] = 0.0f;
+            }
+        }
+        merged_denom = denom;
+    }
+    __syncthreads();
+#pragma unroll
+    for (unsigned int item = 0u; item < 1u; ++item) {
+        const unsigned int d = threadIdx.x + item * blockDim.x;
+        float numerator = 0.0f;
+#pragma unroll
+        for (unsigned int split = 0u; split < splits; ++split) {
+            const unsigned int partial = head_block * splits + split;
+            numerator = numerator * merge_alpha[split] + partial_values[(size_t)partial * head_dim + d] * merge_beta[split];
+        }
+        dst[(size_t)head_block * head_dim + d] = merged_denom > 0.0f ? numerator / merged_denom : 0.0f;
+    }
+}
+
+// Opt-in generated attention candidate from graph/quant_kernel_compiler.zig.
+// kernel_id=antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1 plan_id=cuda/attention/decode_1x/hd256/gqa16/split4/min512/f32/device_scalars
+extern "C" __global__ void antfly_gqa_attention_decode_scalars_split4_hd256_f32_v1(
+    float* dst,
+    const float* q,
+    const float* k,
+    const float* v,
+    const unsigned char* attn_or_mask,
+    const float* bias,
+    unsigned int batch,
+    unsigned int q_seq_len,
+    unsigned int kv_seq_len,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int query_position_offset,
+    unsigned int kv_position_offset,
+    unsigned int sliding_window,
+    unsigned int total_sequence_len,
+    unsigned int mask_len,
+    unsigned int bias_mode,
+    unsigned int split_kv_min_tokens,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) {
+        kv_position_offset = decode_scalars[4];
+        query_position_offset = decode_scalars[1];
+        kv_seq_len = decode_scalars[2];
+    }
+    if (kv_seq_len >= split_kv_min_tokens) return;
+    const unsigned int block = blockIdx.x;
+    if (batch != 1u || q_seq_len != 1u || mask_len != 0u || bias_mode != 0u ||
+        block >= num_heads || head_dim != 256u || blockDim.x != 256u ||
+        num_kv_heads == 0u || num_heads == 0u || (num_heads % num_kv_heads) != 0u ||
+        (num_heads / num_kv_heads) > 16u || num_heads > 32u) return;
+    __shared__ float warp_sums[16];
+    __shared__ float shared_max_score;
+    __shared__ float shared_denom;
+    __shared__ float shared_alpha;
+    __shared__ float shared_beta;
+    const unsigned int lane = threadIdx.x;
+    const unsigned int head = block;
+    const unsigned int query_pos = query_position_offset;
+    unsigned int key_start = 0u;
+    unsigned int key_end = 0u;
+    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
+        const unsigned int visible = query_pos - kv_position_offset + 1u;
+        key_end = visible < kv_seq_len ? visible : kv_seq_len;
+        if (sliding_window != 0u) {
+            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
+            if (window_start_abs > kv_position_offset) {
+                key_start = window_start_abs - kv_position_offset;
+                if (key_start > key_end) key_start = key_end;
+            }
+        }
+    }
+    const unsigned int heads_per_group = num_heads / num_kv_heads;
+    const unsigned int kv_head = head / heads_per_group;
+    const unsigned int kv_hidden = num_kv_heads * head_dim;
+    const unsigned int q_base = head * head_dim;
+    const float scale_input = (float)head_dim;
+    float scale;
+    asm volatile ("rsqrt.approx.f32 %0, %1;" : "=f"(scale) : "f"(scale_input));
+    if (lane == 0u) {
+        shared_max_score = -3.402823466e+38f;
+        shared_denom = 0.0f;
+    }
+    __syncthreads();
+
+    float acc = 0.0f;
+    for (unsigned int ki = key_start; ki < key_end; ++ki) {
+        float partial = 0.0f;
+        if (lane < head_dim) {
+            const unsigned int k_base = ki * kv_hidden + kv_head * head_dim;
+            partial = q[q_base + lane] * k[k_base + lane];
+        }
+        const float dot = termite_block_reduce_sum_f32(partial, warp_sums);
+        if (lane == 0u) {
+            const float score = dot * scale;
+            const float next_max = fmaxf(shared_max_score, score);
+            shared_alpha = expf(shared_max_score - next_max);
+            shared_beta = expf(score - next_max);
+            shared_denom = shared_denom * shared_alpha + shared_beta;
+            shared_max_score = next_max;
+        }
+        __syncthreads();
+        if (lane < head_dim) {
+            const unsigned int v_idx = ki * kv_hidden + kv_head * head_dim + lane;
+            acc = acc * shared_alpha + shared_beta * v[v_idx];
+        }
+        __syncthreads();
+    }
+
+    if (lane < head_dim) {
+        const unsigned int out_idx = head * head_dim + lane;
+        dst[out_idx] = shared_denom > 0.0f ? acc / shared_denom : 0.0f;
+    }
+
+    (void)attn_or_mask;
+    (void)bias;
+    (void)total_sequence_len;
+}
+
+extern "C" __global__ void antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1(
+    float* partial_values,
+    float* partial_max,
+    float* partial_denom,
+    const float* q,
+    const float* k,
+    const float* v,
+    const unsigned char* attn_or_mask,
+    const float* bias,
+    unsigned int batch,
+    unsigned int q_seq_len,
+    unsigned int kv_seq_len,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int query_position_offset,
+    unsigned int kv_position_offset,
+    unsigned int sliding_window,
+    unsigned int total_sequence_len,
+    unsigned int mask_len,
+    unsigned int bias_mode,
+    unsigned int split_kv_min_tokens,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) {
+        kv_position_offset = decode_scalars[4];
+        query_position_offset = decode_scalars[1];
+        kv_seq_len = decode_scalars[2];
+        total_sequence_len = decode_scalars[3];
+    }
+    if (kv_seq_len < split_kv_min_tokens) return;
+    if (batch != 1u || q_seq_len != 1u || mask_len != 0u || bias_mode != 0u ||
+        head_dim != 256u || blockDim.x != 256u ||
+        num_kv_heads == 0u || num_heads == 0u || (num_heads % num_kv_heads) != 0u ||
+        (num_heads / num_kv_heads) > 16u || num_heads > 32u) return;
+    const unsigned int splits = 4u;
+    const unsigned int split = blockIdx.x % splits;
+    const unsigned int head_block = blockIdx.x / splits;
+    const unsigned int head = head_block % num_heads;
+    const unsigned int b = head_block / num_heads;
+    if (b >= batch) return;
+    const unsigned int heads_per_kv = num_heads / num_kv_heads;
+    const unsigned int kv_head = head / heads_per_kv;
+    const unsigned int query_pos = query_position_offset;
+    unsigned int key_start = 0u;
+    unsigned int key_end = 0u;
+    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
+        const unsigned int visible = query_pos - kv_position_offset + 1u;
+        key_end = visible < kv_seq_len ? visible : kv_seq_len;
+        if (sliding_window != 0u) {
+            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
+            if (window_start_abs > kv_position_offset) {
+                key_start = window_start_abs - kv_position_offset;
+                if (key_start > key_end) key_start = key_end;
+            }
+        }
+    }
+    unsigned int split_begin = (kv_seq_len * split) / splits;
+    unsigned int split_end = (kv_seq_len * (split + 1u)) / splits;
+    if (split_begin < key_start) split_begin = key_start;
+    if (split_end > key_end) split_end = key_end;
+    if (split_begin > split_end) split_begin = split_end;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int q_hidden = num_heads * head_dim;
+    const unsigned int kv_hidden = num_kv_heads * head_dim;
+    const unsigned int q_base = (b * q_seq_len) * q_hidden + head * head_dim;
+    const float scale_input = (float)head_dim;
+    float scale;
+    asm volatile ("rsqrt.approx.f32 %0, %1;" : "=f"(scale) : "f"(scale_input));
+
+    __shared__ float warp_sums[8];
+    __shared__ float head_max;
+    __shared__ float head_denom;
+    __shared__ float head_alpha;
+    __shared__ float head_beta;
+    float q_values[1];
+    float acc[1];
+#pragma unroll
+    for (unsigned int item = 0u; item < 1u; ++item) {
+        const unsigned int d = tid + item * blockDim.x;
+        q_values[item] = q[q_base + d];
+        acc[item] = 0.0f;
+    }
+    if (tid == 0u) {
+        head_max = -3.402823466e+38f;
+        head_denom = 0.0f;
+        head_alpha = 0.0f;
+        head_beta = 0.0f;
+    }
+    __syncthreads();
+
+    for (unsigned int ki = split_begin; ki < split_end; ++ki) {
+        const unsigned int key_pos = kv_position_offset + ki;
+        const unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
+        const bool future_allowed = attn_or_mask != 0 && mask_idx < mask_len && attn_or_mask[mask_idx] != 0u;
+        const bool future_blocked = key_pos > query_pos && !future_allowed;
+        const bool past_blocked = key_pos > query_pos || (sliding_window != 0u && (query_pos - key_pos) >= sliding_window);
+        const bool valid = !(future_blocked || past_blocked);
+        const unsigned int kv_base = (b * kv_seq_len + ki) * kv_hidden + kv_head * head_dim;
+
+        float dot = 0.0f;
+#pragma unroll
+        for (unsigned int item = 0u; item < 1u; ++item) {
+            const unsigned int d = tid + item * blockDim.x;
+            const float key_value = valid ? k[kv_base + d] : 0.0f;
+            dot += q_values[item] * key_value;
+        }
+        for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        }
+        if (lane == 0u) warp_sums[warp] = dot;
+        __syncthreads();
+
+        float block_dot = (warp == 0u && lane < 8u) ? warp_sums[lane] : 0.0f;
+        if (warp == 0u) {
+            for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+                block_dot += __shfl_down_sync(0xffffffffu, block_dot, offset);
+            }
+            if (lane == 0u) {
+                float score = valid ? block_dot * scale : -3.402823466e+38f;
+                if (valid && bias_mode == 1u) score += bias[head * kv_seq_len + ki];
+                if (valid && bias_mode == 2u) score += bias[(b * num_heads + head) * kv_seq_len + ki];
+                const float next_max = fmaxf(head_max, score);
+                const float alpha = head_denom > 0.0f ? expf(head_max - next_max) : 0.0f;
+                const float beta = valid ? expf(score - next_max) : 0.0f;
+                head_denom = head_denom * alpha + beta;
+                head_max = next_max;
+                head_alpha = alpha;
+                head_beta = beta;
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (unsigned int item = 0u; item < 1u; ++item) {
+            const unsigned int d = tid + item * blockDim.x;
+            const float value = valid ? v[kv_base + d] : 0.0f;
+            acc[item] = acc[item] * head_alpha + head_beta * value;
+        }
+    }
+
+    const unsigned int partial = (b * num_heads + head) * splits + split;
+#pragma unroll
+    for (unsigned int item = 0u; item < 1u; ++item) {
+        const unsigned int d = tid + item * blockDim.x;
+        partial_values[(size_t)partial * head_dim + d] = acc[item];
+    }
+    if (tid == 0u) {
+        partial_max[partial] = head_max;
+        partial_denom[partial] = head_denom;
+    }
+}
+
+extern "C" __global__ void antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1(
+    float* dst,
+    const float* partial_values,
+    const float* partial_max,
+    const float* partial_denom,
+    unsigned int batch,
+    unsigned int num_heads,
+    unsigned int head_dim,
+    unsigned int kv_seq_len,
+    unsigned int split_kv_min_tokens,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) kv_seq_len = decode_scalars[2];
+    if (kv_seq_len < split_kv_min_tokens) return;
+    if (batch != 1u || head_dim != 256u || blockDim.x != 256u || num_heads > 32u) return;
+    const unsigned int head_block = blockIdx.x;
+    if (head_block >= batch * num_heads) return;
+    const unsigned int splits = 4u;
+    __shared__ float merged_denom;
+    __shared__ float merge_alpha[4];
+    __shared__ float merge_beta[4];
+    if (threadIdx.x == 0u) {
+        float merged_max = -3.402823466e+38f;
+        float denom = 0.0f;
+        for (unsigned int split = 0u; split < splits; ++split) {
+            const unsigned int partial = head_block * splits + split;
+            const float local_denom = partial_denom[partial];
+            if (local_denom > 0.0f) {
+                const float next_max = fmaxf(merged_max, partial_max[partial]);
+                const float alpha = denom > 0.0f ? expf(merged_max - next_max) : 0.0f;
+                const float beta = expf(partial_max[partial] - next_max);
+                denom = denom * alpha + local_denom * beta;
+                merged_max = next_max;
+                merge_alpha[split] = alpha;
+                merge_beta[split] = beta;
+            } else {
+                merge_alpha[split] = 1.0f;
+                merge_beta[split] = 0.0f;
+            }
+        }
+        merged_denom = denom;
+    }
+    __syncthreads();
+#pragma unroll
+    for (unsigned int item = 0u; item < 1u; ++item) {
+        const unsigned int d = threadIdx.x + item * blockDim.x;
+        float numerator = 0.0f;
+#pragma unroll
+        for (unsigned int split = 0u; split < splits; ++split) {
+            const unsigned int partial = head_block * splits + split;
+            numerator = numerator * merge_alpha[split] + partial_values[(size_t)partial * head_dim + d] * merge_beta[split];
+        }
+        dst[(size_t)head_block * head_dim + d] = merged_denom > 0.0f ? numerator / merged_denom : 0.0f;
+    }
+}
+
+// Opt-in generated attention candidate from graph/quant_kernel_compiler.zig.
+// kernel_id=antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1 plan_id=cuda/attention/decode_1x/hd512/gqa16/split4/min512/f32/device_scalars
+extern "C" __global__ void antfly_gqa_attention_decode_scalars_split4_hd512_f32_v1(
+    float* dst,
+    const float* q,
+    const float* k,
+    const float* v,
+    const unsigned char* attn_or_mask,
+    const float* bias,
+    unsigned int batch,
+    unsigned int q_seq_len,
+    unsigned int kv_seq_len,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int query_position_offset,
+    unsigned int kv_position_offset,
+    unsigned int sliding_window,
+    unsigned int total_sequence_len,
+    unsigned int mask_len,
+    unsigned int bias_mode,
+    unsigned int split_kv_min_tokens,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) {
+        kv_position_offset = decode_scalars[4];
+        query_position_offset = decode_scalars[1];
+        kv_seq_len = decode_scalars[2];
+    }
+    if (kv_seq_len >= split_kv_min_tokens) return;
+    const unsigned int block = blockIdx.x;
+    if (batch != 1u || q_seq_len != 1u || mask_len != 0u || bias_mode != 0u ||
+        block >= num_heads || head_dim != 512u || blockDim.x != 512u ||
+        num_kv_heads == 0u || num_heads == 0u || (num_heads % num_kv_heads) != 0u ||
+        (num_heads / num_kv_heads) > 16u || num_heads > 32u) return;
+    __shared__ float warp_sums[16];
+    __shared__ float shared_max_score;
+    __shared__ float shared_denom;
+    __shared__ float shared_alpha;
+    __shared__ float shared_beta;
+    const unsigned int lane = threadIdx.x;
+    const unsigned int head = block;
+    const unsigned int query_pos = query_position_offset;
+    unsigned int key_start = 0u;
+    unsigned int key_end = 0u;
+    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
+        const unsigned int visible = query_pos - kv_position_offset + 1u;
+        key_end = visible < kv_seq_len ? visible : kv_seq_len;
+        if (sliding_window != 0u) {
+            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
+            if (window_start_abs > kv_position_offset) {
+                key_start = window_start_abs - kv_position_offset;
+                if (key_start > key_end) key_start = key_end;
+            }
+        }
+    }
+    const unsigned int heads_per_group = num_heads / num_kv_heads;
+    const unsigned int kv_head = head / heads_per_group;
+    const unsigned int kv_hidden = num_kv_heads * head_dim;
+    const unsigned int q_base = head * head_dim;
+    const float scale_input = (float)head_dim;
+    float scale;
+    asm volatile ("rsqrt.approx.f32 %0, %1;" : "=f"(scale) : "f"(scale_input));
+    if (lane == 0u) {
+        shared_max_score = -3.402823466e+38f;
+        shared_denom = 0.0f;
+    }
+    __syncthreads();
+
+    float acc = 0.0f;
+    for (unsigned int ki = key_start; ki < key_end; ++ki) {
+        float partial = 0.0f;
+        if (lane < head_dim) {
+            const unsigned int k_base = ki * kv_hidden + kv_head * head_dim;
+            partial = q[q_base + lane] * k[k_base + lane];
+        }
+        const float dot = termite_block_reduce_sum_f32(partial, warp_sums);
+        if (lane == 0u) {
+            const float score = dot * scale;
+            const float next_max = fmaxf(shared_max_score, score);
+            shared_alpha = expf(shared_max_score - next_max);
+            shared_beta = expf(score - next_max);
+            shared_denom = shared_denom * shared_alpha + shared_beta;
+            shared_max_score = next_max;
+        }
+        __syncthreads();
+        if (lane < head_dim) {
+            const unsigned int v_idx = ki * kv_hidden + kv_head * head_dim + lane;
+            acc = acc * shared_alpha + shared_beta * v[v_idx];
+        }
+        __syncthreads();
+    }
+
+    if (lane < head_dim) {
+        const unsigned int out_idx = head * head_dim + lane;
+        dst[out_idx] = shared_denom > 0.0f ? acc / shared_denom : 0.0f;
+    }
+
+    (void)attn_or_mask;
+    (void)bias;
+    (void)total_sequence_len;
+}
+
+extern "C" __global__ void antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1(
+    float* partial_values,
+    float* partial_max,
+    float* partial_denom,
+    const float* q,
+    const float* k,
+    const float* v,
+    const unsigned char* attn_or_mask,
+    const float* bias,
+    unsigned int batch,
+    unsigned int q_seq_len,
+    unsigned int kv_seq_len,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int query_position_offset,
+    unsigned int kv_position_offset,
+    unsigned int sliding_window,
+    unsigned int total_sequence_len,
+    unsigned int mask_len,
+    unsigned int bias_mode,
+    unsigned int split_kv_min_tokens,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) {
+        kv_position_offset = decode_scalars[4];
+        query_position_offset = decode_scalars[1];
+        kv_seq_len = decode_scalars[2];
+        total_sequence_len = decode_scalars[3];
+    }
+    if (kv_seq_len < split_kv_min_tokens) return;
+    if (batch != 1u || q_seq_len != 1u || mask_len != 0u || bias_mode != 0u ||
+        head_dim != 512u || blockDim.x != 512u ||
+        num_kv_heads == 0u || num_heads == 0u || (num_heads % num_kv_heads) != 0u ||
+        (num_heads / num_kv_heads) > 16u || num_heads > 32u) return;
+    const unsigned int splits = 4u;
+    const unsigned int split = blockIdx.x % splits;
+    const unsigned int head_block = blockIdx.x / splits;
+    const unsigned int head = head_block % num_heads;
+    const unsigned int b = head_block / num_heads;
+    if (b >= batch) return;
+    const unsigned int heads_per_kv = num_heads / num_kv_heads;
+    const unsigned int kv_head = head / heads_per_kv;
+    const unsigned int query_pos = query_position_offset;
+    unsigned int key_start = 0u;
+    unsigned int key_end = 0u;
+    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
+        const unsigned int visible = query_pos - kv_position_offset + 1u;
+        key_end = visible < kv_seq_len ? visible : kv_seq_len;
+        if (sliding_window != 0u) {
+            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
+            if (window_start_abs > kv_position_offset) {
+                key_start = window_start_abs - kv_position_offset;
+                if (key_start > key_end) key_start = key_end;
+            }
+        }
+    }
+    unsigned int split_begin = (kv_seq_len * split) / splits;
+    unsigned int split_end = (kv_seq_len * (split + 1u)) / splits;
+    if (split_begin < key_start) split_begin = key_start;
+    if (split_end > key_end) split_end = key_end;
+    if (split_begin > split_end) split_begin = split_end;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int q_hidden = num_heads * head_dim;
+    const unsigned int kv_hidden = num_kv_heads * head_dim;
+    const unsigned int q_base = (b * q_seq_len) * q_hidden + head * head_dim;
+    const float scale_input = (float)head_dim;
+    float scale;
+    asm volatile ("rsqrt.approx.f32 %0, %1;" : "=f"(scale) : "f"(scale_input));
+
+    __shared__ float warp_sums[16];
+    __shared__ float head_max;
+    __shared__ float head_denom;
+    __shared__ float head_alpha;
+    __shared__ float head_beta;
+    float q_values[1];
+    float acc[1];
+#pragma unroll
+    for (unsigned int item = 0u; item < 1u; ++item) {
+        const unsigned int d = tid + item * blockDim.x;
+        q_values[item] = q[q_base + d];
+        acc[item] = 0.0f;
+    }
+    if (tid == 0u) {
+        head_max = -3.402823466e+38f;
+        head_denom = 0.0f;
+        head_alpha = 0.0f;
+        head_beta = 0.0f;
+    }
+    __syncthreads();
+
+    for (unsigned int ki = split_begin; ki < split_end; ++ki) {
+        const unsigned int key_pos = kv_position_offset + ki;
+        const unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
+        const bool future_allowed = attn_or_mask != 0 && mask_idx < mask_len && attn_or_mask[mask_idx] != 0u;
+        const bool future_blocked = key_pos > query_pos && !future_allowed;
+        const bool past_blocked = key_pos > query_pos || (sliding_window != 0u && (query_pos - key_pos) >= sliding_window);
+        const bool valid = !(future_blocked || past_blocked);
+        const unsigned int kv_base = (b * kv_seq_len + ki) * kv_hidden + kv_head * head_dim;
+
+        float dot = 0.0f;
+#pragma unroll
+        for (unsigned int item = 0u; item < 1u; ++item) {
+            const unsigned int d = tid + item * blockDim.x;
+            const float key_value = valid ? k[kv_base + d] : 0.0f;
+            dot += q_values[item] * key_value;
+        }
+        for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        }
+        if (lane == 0u) warp_sums[warp] = dot;
+        __syncthreads();
+
+        float block_dot = (warp == 0u && lane < 16u) ? warp_sums[lane] : 0.0f;
+        if (warp == 0u) {
+            for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+                block_dot += __shfl_down_sync(0xffffffffu, block_dot, offset);
+            }
+            if (lane == 0u) {
+                float score = valid ? block_dot * scale : -3.402823466e+38f;
+                if (valid && bias_mode == 1u) score += bias[head * kv_seq_len + ki];
+                if (valid && bias_mode == 2u) score += bias[(b * num_heads + head) * kv_seq_len + ki];
+                const float next_max = fmaxf(head_max, score);
+                const float alpha = head_denom > 0.0f ? expf(head_max - next_max) : 0.0f;
+                const float beta = valid ? expf(score - next_max) : 0.0f;
+                head_denom = head_denom * alpha + beta;
+                head_max = next_max;
+                head_alpha = alpha;
+                head_beta = beta;
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (unsigned int item = 0u; item < 1u; ++item) {
+            const unsigned int d = tid + item * blockDim.x;
+            const float value = valid ? v[kv_base + d] : 0.0f;
+            acc[item] = acc[item] * head_alpha + head_beta * value;
+        }
+    }
+
+    const unsigned int partial = (b * num_heads + head) * splits + split;
+#pragma unroll
+    for (unsigned int item = 0u; item < 1u; ++item) {
+        const unsigned int d = tid + item * blockDim.x;
+        partial_values[(size_t)partial * head_dim + d] = acc[item];
+    }
+    if (tid == 0u) {
+        partial_max[partial] = head_max;
+        partial_denom[partial] = head_denom;
+    }
+}
+
+extern "C" __global__ void antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1(
+    float* dst,
+    const float* partial_values,
+    const float* partial_max,
+    const float* partial_denom,
+    unsigned int batch,
+    unsigned int num_heads,
+    unsigned int head_dim,
+    unsigned int kv_seq_len,
+    unsigned int split_kv_min_tokens,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) kv_seq_len = decode_scalars[2];
+    if (kv_seq_len < split_kv_min_tokens) return;
+    if (batch != 1u || head_dim != 512u || blockDim.x != 512u || num_heads > 32u) return;
+    const unsigned int head_block = blockIdx.x;
+    if (head_block >= batch * num_heads) return;
+    const unsigned int splits = 4u;
+    __shared__ float merged_denom;
+    __shared__ float merge_alpha[4];
+    __shared__ float merge_beta[4];
+    if (threadIdx.x == 0u) {
+        float merged_max = -3.402823466e+38f;
+        float denom = 0.0f;
+        for (unsigned int split = 0u; split < splits; ++split) {
+            const unsigned int partial = head_block * splits + split;
+            const float local_denom = partial_denom[partial];
+            if (local_denom > 0.0f) {
+                const float next_max = fmaxf(merged_max, partial_max[partial]);
+                const float alpha = denom > 0.0f ? expf(merged_max - next_max) : 0.0f;
+                const float beta = expf(partial_max[partial] - next_max);
+                denom = denom * alpha + local_denom * beta;
+                merged_max = next_max;
+                merge_alpha[split] = alpha;
+                merge_beta[split] = beta;
+            } else {
+                merge_alpha[split] = 1.0f;
+                merge_beta[split] = 0.0f;
+            }
+        }
+        merged_denom = denom;
+    }
+    __syncthreads();
+#pragma unroll
+    for (unsigned int item = 0u; item < 1u; ++item) {
+        const unsigned int d = threadIdx.x + item * blockDim.x;
+        float numerator = 0.0f;
+#pragma unroll
+        for (unsigned int split = 0u; split < splits; ++split) {
+            const unsigned int partial = head_block * splits + split;
+            numerator = numerator * merge_alpha[split] + partial_values[(size_t)partial * head_dim + d] * merge_beta[split];
+        }
+        dst[(size_t)head_block * head_dim + d] = merged_denom > 0.0f ? numerator / merged_denom : 0.0f;
+    }
+}
+
+// Opt-in generated attention candidate from graph/quant_kernel_compiler.zig.
+// kernel_id=antfly_gqa_attention_decode_turboquant_score_prework_hd256_f32_v1 plan_id=cuda/attention/decode_1x/hd256/gqa16/score-prework/max4096/f32/device_scalars
+extern "C" __global__ void antfly_gqa_attention_decode_turboquant_score_prework_hd256_f32_v1(
+    float* scores,
+    const float* q,
+    const unsigned char* k,
+    const unsigned int* block_table,
+    unsigned int batch,
+    unsigned int q_seq_len,
+    unsigned int kv_seq_len,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int query_position_offset,
+    unsigned int kv_position_offset,
+    unsigned int sliding_window,
+    unsigned int total_sequence_len,
+    unsigned int key_row_bytes,
+    unsigned int base_key_row_bytes,
+    unsigned int block_count,
+    unsigned int page_size_tokens,
+    unsigned int format,
+    unsigned int physical_token_capacity,
+    unsigned int score_capacity,
+    unsigned int chunk_size,
+    unsigned int chunk_count,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) {
+        kv_position_offset = decode_scalars[4];
+        query_position_offset = decode_scalars[1];
+        kv_seq_len = decode_scalars[2];
+        total_sequence_len = decode_scalars[3];
+    }
+    if (batch != 1u || q_seq_len != 1u || head_dim != 256u || blockDim.x != 256u ||
+        score_capacity == 0u || score_capacity > 4096u || chunk_size == 0u ||
+        chunk_count != 128u || key_row_bytes == 0u || base_key_row_bytes != key_row_bytes ||
+        (format != 0u && format != 2u) || num_kv_heads == 0u || num_heads == 0u ||
+        (num_heads % num_kv_heads) != 0u || (num_heads / num_kv_heads) > 16u ||
+        num_heads > 32u) return;
+    const unsigned int block = blockIdx.x;
+    const unsigned int head = block / chunk_count;
+    const unsigned int chunk = block - head * chunk_count;
+    if (head >= num_heads) return;
+    __shared__ float warp_sums[8];
+    const unsigned int lane = threadIdx.x;
+    const unsigned int query_pos = query_position_offset;
+    unsigned int key_start = 0u;
+    unsigned int key_end = 0u;
+    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
+        const unsigned int visible = query_pos - kv_position_offset + 1u;
+        key_end = visible < kv_seq_len ? visible : kv_seq_len;
+        if (sliding_window != 0u) {
+            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
+            if (window_start_abs > kv_position_offset) {
+                key_start = window_start_abs - kv_position_offset;
+                if (key_start > key_end) key_start = key_end;
+            }
+        }
+    }
+    if (key_end > score_capacity) key_end = score_capacity;
+    unsigned int chunk_begin = chunk * chunk_size;
+    unsigned int chunk_end = chunk_begin + chunk_size;
+    if (chunk_end > score_capacity) chunk_end = score_capacity;
+    if (chunk_begin < key_start) chunk_begin = key_start;
+    if (chunk_end > key_end) chunk_end = key_end;
+    if (chunk_begin >= chunk_end) return;
+    const unsigned int heads_per_group = num_heads / num_kv_heads;
+    const unsigned int kv_head = head / heads_per_group;
+    const unsigned int q_base = head * head_dim;
+    const float scale_input = (float)head_dim;
+    float scale;
+    asm volatile ("rsqrt.approx.f32 %0, %1;" : "=f"(scale) : "f"(scale_input));
+    for (unsigned int ki = chunk_begin; ki < chunk_end; ++ki) {
+        const unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);
+        const bool valid = physical_token != 0xffffffffu;
+        const unsigned char* k_row = valid ? k + (size_t)physical_token * key_row_bytes : k;
+        float partial = 0.0f;
+        if (valid && lane < head_dim) {
+            const unsigned int value_index = kv_head * head_dim + lane;
+            const float key_value = format == 0u
+                ? termite_tq_decode_polar4_at(k_row, value_index)
+                : termite_tq_f16_value(k_row, value_index);
+            partial = q[q_base + lane] * key_value;
+        }
+        const float dot = termite_block_reduce_sum_f32(partial, warp_sums);
+        if (lane == 0u && valid) scores[(size_t)head * score_capacity + ki] = dot * scale;
+    }
+    (void)total_sequence_len;
+}
+
+
+extern "C" __global__ void antfly_gqa_attention_decode_turboquant_score_prework_serial_hd256_f32_v1(
+    float* dst,
+    const float* scores,
+    const unsigned char* v,
+    const unsigned int* block_table,
+    unsigned int batch,
+    unsigned int q_seq_len,
+    unsigned int kv_seq_len,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int query_position_offset,
+    unsigned int kv_position_offset,
+    unsigned int sliding_window,
+    unsigned int total_sequence_len,
+    unsigned int value_row_bytes,
+    unsigned int block_count,
+    unsigned int page_size_tokens,
+    unsigned int value_format,
+    unsigned int physical_token_capacity,
+    unsigned int score_capacity,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) {
+        kv_position_offset = decode_scalars[4];
+        query_position_offset = decode_scalars[1];
+        kv_seq_len = decode_scalars[2];
+        total_sequence_len = decode_scalars[3];
+    }
+    const unsigned int head = blockIdx.x;
+    if (batch != 1u || q_seq_len != 1u || head >= num_heads ||
+        head_dim != 256u || blockDim.x != 256u || value_row_bytes == 0u ||
+        value_format != 0u || score_capacity == 0u || score_capacity > 4096u || num_kv_heads == 0u ||
+        num_heads == 0u || (num_heads % num_kv_heads) != 0u ||
+        (num_heads / num_kv_heads) > 16u || num_heads > 32u) return;
+    __shared__ float shared_max_score;
+    __shared__ float shared_denom;
+    __shared__ float shared_alpha;
+    __shared__ float shared_beta;
+    const unsigned int lane = threadIdx.x;
+    const unsigned int query_pos = query_position_offset;
+    unsigned int key_start = 0u;
+    unsigned int key_end = 0u;
+    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
+        const unsigned int visible = query_pos - kv_position_offset + 1u;
+        key_end = visible < kv_seq_len ? visible : kv_seq_len;
+        if (sliding_window != 0u) {
+            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
+            if (window_start_abs > kv_position_offset) {
+                key_start = window_start_abs - kv_position_offset;
+                if (key_start > key_end) key_start = key_end;
+            }
+        }
+    }
+    if (key_end > score_capacity) key_end = score_capacity;
+    if (key_start > key_end) key_start = key_end;
+    const unsigned int heads_per_group = num_heads / num_kv_heads;
+    const unsigned int kv_head = head / heads_per_group;
+    if (lane == 0u) {
+        shared_max_score = -3.402823466e+38f;
+        shared_denom = 0.0f;
+    }
+    __syncthreads();
+    float acc = 0.0f;
+    for (unsigned int ki = key_start; ki < key_end; ++ki) {
+        const unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);
+        const bool valid = physical_token != 0xffffffffu;
+        if (lane == 0u) {
+            if (valid) {
+                const float score = scores[(size_t)head * score_capacity + ki];
+                const float next_max = fmaxf(shared_max_score, score);
+                shared_alpha = expf(shared_max_score - next_max);
+                shared_beta = expf(score - next_max);
+                shared_denom = shared_denom * shared_alpha + shared_beta;
+                shared_max_score = next_max;
+            } else {
+                shared_alpha = 1.0f;
+                shared_beta = 0.0f;
+            }
+        }
+        __syncthreads();
+        if (lane < head_dim) {
+            acc *= shared_alpha;
+            if (valid) {
+                const unsigned char* v_row = v + (size_t)physical_token * value_row_bytes;
+                const float value = reinterpret_cast<const float*>(v_row)[kv_head * head_dim + lane];
+                acc += shared_beta * value;
+            }
+        }
+        __syncthreads();
+    }
+    if (lane < head_dim) dst[head * head_dim + lane] = shared_denom > 0.0f ? acc / shared_denom : 0.0f;
+    (void)total_sequence_len;
+}
+
+// Opt-in generated attention candidate from graph/quant_kernel_compiler.zig.
+// kernel_id=antfly_gqa_attention_decode_turboquant_score_prework_hd512_f32_v1 plan_id=cuda/attention/decode_1x/hd512/gqa16/score-prework/max4096/f32/device_scalars
+extern "C" __global__ void antfly_gqa_attention_decode_turboquant_score_prework_hd512_f32_v1(
+    float* scores,
+    const float* q,
+    const unsigned char* k,
+    const unsigned int* block_table,
+    unsigned int batch,
+    unsigned int q_seq_len,
+    unsigned int kv_seq_len,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int query_position_offset,
+    unsigned int kv_position_offset,
+    unsigned int sliding_window,
+    unsigned int total_sequence_len,
+    unsigned int key_row_bytes,
+    unsigned int base_key_row_bytes,
+    unsigned int block_count,
+    unsigned int page_size_tokens,
+    unsigned int format,
+    unsigned int physical_token_capacity,
+    unsigned int score_capacity,
+    unsigned int chunk_size,
+    unsigned int chunk_count,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) {
+        kv_position_offset = decode_scalars[4];
+        query_position_offset = decode_scalars[1];
+        kv_seq_len = decode_scalars[2];
+        total_sequence_len = decode_scalars[3];
+    }
+    if (batch != 1u || q_seq_len != 1u || head_dim != 512u || blockDim.x != 512u ||
+        score_capacity == 0u || score_capacity > 4096u || chunk_size == 0u ||
+        chunk_count != 128u || key_row_bytes == 0u || base_key_row_bytes != key_row_bytes ||
+        (format != 0u && format != 2u) || num_kv_heads == 0u || num_heads == 0u ||
+        (num_heads % num_kv_heads) != 0u || (num_heads / num_kv_heads) > 16u ||
+        num_heads > 32u) return;
+    const unsigned int block = blockIdx.x;
+    const unsigned int head = block / chunk_count;
+    const unsigned int chunk = block - head * chunk_count;
+    if (head >= num_heads) return;
+    __shared__ float warp_sums[16];
+    const unsigned int lane = threadIdx.x;
+    const unsigned int query_pos = query_position_offset;
+    unsigned int key_start = 0u;
+    unsigned int key_end = 0u;
+    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
+        const unsigned int visible = query_pos - kv_position_offset + 1u;
+        key_end = visible < kv_seq_len ? visible : kv_seq_len;
+        if (sliding_window != 0u) {
+            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
+            if (window_start_abs > kv_position_offset) {
+                key_start = window_start_abs - kv_position_offset;
+                if (key_start > key_end) key_start = key_end;
+            }
+        }
+    }
+    if (key_end > score_capacity) key_end = score_capacity;
+    unsigned int chunk_begin = chunk * chunk_size;
+    unsigned int chunk_end = chunk_begin + chunk_size;
+    if (chunk_end > score_capacity) chunk_end = score_capacity;
+    if (chunk_begin < key_start) chunk_begin = key_start;
+    if (chunk_end > key_end) chunk_end = key_end;
+    if (chunk_begin >= chunk_end) return;
+    const unsigned int heads_per_group = num_heads / num_kv_heads;
+    const unsigned int kv_head = head / heads_per_group;
+    const unsigned int q_base = head * head_dim;
+    const float scale_input = (float)head_dim;
+    float scale;
+    asm volatile ("rsqrt.approx.f32 %0, %1;" : "=f"(scale) : "f"(scale_input));
+    for (unsigned int ki = chunk_begin; ki < chunk_end; ++ki) {
+        const unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);
+        const bool valid = physical_token != 0xffffffffu;
+        const unsigned char* k_row = valid ? k + (size_t)physical_token * key_row_bytes : k;
+        float partial = 0.0f;
+        if (valid && lane < head_dim) {
+            const unsigned int value_index = kv_head * head_dim + lane;
+            const float key_value = format == 0u
+                ? termite_tq_decode_polar4_at(k_row, value_index)
+                : termite_tq_f16_value(k_row, value_index);
+            partial = q[q_base + lane] * key_value;
+        }
+        const float dot = termite_block_reduce_sum_f32(partial, warp_sums);
+        if (lane == 0u && valid) scores[(size_t)head * score_capacity + ki] = dot * scale;
+    }
+    (void)total_sequence_len;
+}
+
+
+extern "C" __global__ void antfly_gqa_attention_decode_turboquant_score_prework_serial_hd512_f32_v1(
+    float* dst,
+    const float* scores,
+    const unsigned char* v,
+    const unsigned int* block_table,
+    unsigned int batch,
+    unsigned int q_seq_len,
+    unsigned int kv_seq_len,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int query_position_offset,
+    unsigned int kv_position_offset,
+    unsigned int sliding_window,
+    unsigned int total_sequence_len,
+    unsigned int value_row_bytes,
+    unsigned int block_count,
+    unsigned int page_size_tokens,
+    unsigned int value_format,
+    unsigned int physical_token_capacity,
+    unsigned int score_capacity,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) {
+        kv_position_offset = decode_scalars[4];
+        query_position_offset = decode_scalars[1];
+        kv_seq_len = decode_scalars[2];
+        total_sequence_len = decode_scalars[3];
+    }
+    const unsigned int head = blockIdx.x;
+    if (batch != 1u || q_seq_len != 1u || head >= num_heads ||
+        head_dim != 512u || blockDim.x != 512u || value_row_bytes == 0u ||
+        value_format != 0u || score_capacity == 0u || score_capacity > 4096u || num_kv_heads == 0u ||
+        num_heads == 0u || (num_heads % num_kv_heads) != 0u ||
+        (num_heads / num_kv_heads) > 16u || num_heads > 32u) return;
+    __shared__ float shared_max_score;
+    __shared__ float shared_denom;
+    __shared__ float shared_alpha;
+    __shared__ float shared_beta;
+    const unsigned int lane = threadIdx.x;
+    const unsigned int query_pos = query_position_offset;
+    unsigned int key_start = 0u;
+    unsigned int key_end = 0u;
+    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
+        const unsigned int visible = query_pos - kv_position_offset + 1u;
+        key_end = visible < kv_seq_len ? visible : kv_seq_len;
+        if (sliding_window != 0u) {
+            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
+            if (window_start_abs > kv_position_offset) {
+                key_start = window_start_abs - kv_position_offset;
+                if (key_start > key_end) key_start = key_end;
+            }
+        }
+    }
+    if (key_end > score_capacity) key_end = score_capacity;
+    if (key_start > key_end) key_start = key_end;
+    const unsigned int heads_per_group = num_heads / num_kv_heads;
+    const unsigned int kv_head = head / heads_per_group;
+    if (lane == 0u) {
+        shared_max_score = -3.402823466e+38f;
+        shared_denom = 0.0f;
+    }
+    __syncthreads();
+    float acc = 0.0f;
+    for (unsigned int ki = key_start; ki < key_end; ++ki) {
+        const unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);
+        const bool valid = physical_token != 0xffffffffu;
+        if (lane == 0u) {
+            if (valid) {
+                const float score = scores[(size_t)head * score_capacity + ki];
+                const float next_max = fmaxf(shared_max_score, score);
+                shared_alpha = expf(shared_max_score - next_max);
+                shared_beta = expf(score - next_max);
+                shared_denom = shared_denom * shared_alpha + shared_beta;
+                shared_max_score = next_max;
+            } else {
+                shared_alpha = 1.0f;
+                shared_beta = 0.0f;
+            }
+        }
+        __syncthreads();
+        if (lane < head_dim) {
+            acc *= shared_alpha;
+            if (valid) {
+                const unsigned char* v_row = v + (size_t)physical_token * value_row_bytes;
+                const float value = reinterpret_cast<const float*>(v_row)[kv_head * head_dim + lane];
+                acc += shared_beta * value;
+            }
+        }
+        __syncthreads();
+    }
+    if (lane < head_dim) dst[head * head_dim + lane] = shared_denom > 0.0f ? acc / shared_denom : 0.0f;
+    (void)total_sequence_len;
+}
+// quant-kernel-codegen:end generated CUDA attention kernels
 
 extern "C" __global__ void termite_kv_write_suffix_decode_scalars_f32(
     float* k_dst,
@@ -13556,3 +15722,958 @@ extern "C" __global__ void antfly_q4_0_down_q8_1_mmv_v1(
         if (col < out_dim) dst[(size_t)row * out_dim + col] = y;
     }
 }
+
+static __device__ __forceinline__ float antfly_q6_k_sub_scale_f32(
+    const unsigned char *block,
+    unsigned int sub
+) {
+    const signed char *scales = (const signed char *)(block + 192u);
+    const unsigned short d_bits = (unsigned short)block[208] | ((unsigned short)block[209] << 8);
+    return antfly_half_bits_to_float(d_bits) * (float)scales[sub];
+}
+
+// quant-kernel-codegen:begin generated CUDA runtime-wired dev matmul candidates (do not edit; run: zig build quant-kernel-codegen -- --write)
+// Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
+// kernel_id=antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1 plan_id=cuda/q4_0/rows_1/pair_activation/mmv
+extern "C" __global__ void antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1(
+    unsigned char *dst_q8,
+    const unsigned char *q8_input,
+    const unsigned char *weight_gate,
+    const unsigned char *weight_up,
+    unsigned int activation,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    if (rows == 0u || (in_dim & 31u) != 0u || (out_dim & 31u) != 0u) return;
+    const unsigned int row_blocks = in_dim >> 5;
+    const unsigned int out_row_blocks = out_dim >> 5;
+    const unsigned int group_cols = 4u;
+    const unsigned int groups_per_wave = 4u;
+    const unsigned int waves = 2u;
+
+    const unsigned int out_block = blockIdx.x % out_row_blocks;
+    const unsigned int row = blockIdx.x / out_row_blocks;
+    const unsigned int col_block = out_block * 32u;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int group = warp / 3u;
+    const unsigned int group_warp = warp - group * 3u;
+    if (blockDim.x != 384u || row >= rows) return;
+
+    __shared__ float gate_partial[4][4][3];
+    __shared__ float up_partial[4][4][3];
+    __shared__ float activated[32];
+
+    #pragma unroll
+    for (unsigned int wave = 0u; wave < waves; ++wave) {
+        if (group < groups_per_wave) {
+            const unsigned int local_tid = group_warp * 32u + lane;
+            const unsigned int col_tile = col_block + (wave * groups_per_wave + group) * group_cols;
+            float gate_acc[4];
+            float up_acc[4];
+            #pragma unroll
+            for (unsigned int c = 0u; c < group_cols; ++c) {
+                gate_acc[c] = 0.0f;
+                up_acc[c] = 0.0f;
+            }
+
+            const unsigned int iqs = (local_tid & 1u) * 2u;
+            for (unsigned int block = local_tid >> 1u; block < row_blocks; block += 48u) {
+                const unsigned char *q8_bp = q8_input + (row * row_blocks + block) * 36u;
+                const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
+                const signed char *q8_values = (const signed char *)(q8_bp + 4u);
+                const unsigned int q8_base0 = iqs * 4u;
+                const unsigned int q8_base1 = q8_base0 + 4u;
+                const int q8_low0 = *(const int *)(q8_values + q8_base0);
+                const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
+                const int q8_low1 = *(const int *)(q8_values + q8_base1);
+                const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
+
+                #pragma unroll
+                for (unsigned int c = 0u; c < group_cols; ++c) {
+                    const unsigned int col = col_tile + c;
+                    const unsigned char *gate_bp = weight_gate + ((size_t)col * row_blocks + block) * 18u;
+                    const unsigned char *up_bp = weight_up + ((size_t)col * row_blocks + block) * 18u;
+                    gate_acc[c] += antfly_q4_0_q8_dot16(gate_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+                    up_acc[c] += antfly_q4_0_q8_dot16(up_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+                }
+            }
+
+            #pragma unroll
+            for (unsigned int c = 0u; c < group_cols; ++c) {
+                const float gate_sum = antfly_warp_reduce_sum_f32(gate_acc[c]);
+                const float up_sum = antfly_warp_reduce_sum_f32(up_acc[c]);
+                if (lane == 0u) {
+                    gate_partial[group][c][group_warp] = gate_sum;
+                    up_partial[group][c][group_warp] = up_sum;
+                }
+            }
+        }
+        __syncthreads();
+        if (tid < 16u) {
+            const unsigned int out_group = tid >> 2u;
+            const unsigned int c = tid & 3u;
+            float gate_y = 0.0f;
+            float up_y = 0.0f;
+            #pragma unroll
+            for (unsigned int w = 0u; w < 3u; ++w) {
+                gate_y += gate_partial[out_group][c][w];
+                up_y += up_partial[out_group][c][w];
+            }
+            activated[wave * 16u + out_group * group_cols + c] = antfly_decoder_activation_f32(gate_y, activation) * up_y;
+        }
+        __syncthreads();
+    }
+
+    if (warp == 0u) {
+        const float x = activated[lane];
+        const float amax = antfly_warp_reduce_max_f32(fabsf(x));
+        const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
+        int q = 0;
+        if (d > 0.0f) {
+            q = __float2int_rn(x / d);
+            q = max(-127, min(127, q));
+        }
+        unsigned char *bp = dst_q8 + ((size_t)row * out_row_blocks + out_block) * 36u;
+        bp[4u + lane] = (unsigned char)(signed char)q;
+        if (lane == 0u) {
+            const unsigned short d_bits = __half_as_ushort(__float2half(d));
+            bp[0] = (unsigned char)(d_bits & 0xffu);
+            bp[1] = (unsigned char)(d_bits >> 8);
+            bp[2] = 0u;
+            bp[3] = 0u;
+        }
+    }
+}
+
+// Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
+// kernel_id=antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1 plan_id=cuda/q4_0/rows_1/pair_activation/mmv
+extern "C" __global__ void antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1(
+    unsigned char *dst_q8,
+    const unsigned char *q8_input,
+    const unsigned char *weight_gate,
+    const unsigned char *weight_up,
+    unsigned int activation,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    if (rows == 0u || (in_dim & 31u) != 0u || (out_dim & 31u) != 0u) return;
+    const unsigned int row_blocks = in_dim >> 5;
+    const unsigned int out_row_blocks = out_dim >> 5;
+    const unsigned int group_cols = 4u;
+    const unsigned int groups_per_wave = 4u;
+    const unsigned int waves = 2u;
+
+    const unsigned int out_block = blockIdx.x % out_row_blocks;
+    const unsigned int row = blockIdx.x / out_row_blocks;
+    const unsigned int col_block = out_block * 32u;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int group = warp / 3u;
+    const unsigned int group_warp = warp - group * 3u;
+    if (blockDim.x != 384u || row >= rows) return;
+
+    __shared__ float gate_partial[4][4][3];
+    __shared__ float up_partial[4][4][3];
+    __shared__ float activated[32];
+
+    #pragma unroll
+    for (unsigned int wave = 0u; wave < waves; ++wave) {
+        if (group < groups_per_wave) {
+            const unsigned int local_tid = group_warp * 32u + lane;
+            const unsigned int col_tile = col_block + (wave * groups_per_wave + group) * group_cols;
+            float gate_acc[4];
+            float up_acc[4];
+            #pragma unroll
+            for (unsigned int c = 0u; c < group_cols; ++c) {
+                gate_acc[c] = 0.0f;
+                up_acc[c] = 0.0f;
+            }
+
+            const unsigned int iqs = (local_tid & 1u) * 2u;
+            for (unsigned int block = local_tid >> 1u; block < row_blocks; block += 48u) {
+                const unsigned char *q8_bp = q8_input + (row * row_blocks + block) * 36u;
+                const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
+                const signed char *q8_values = (const signed char *)(q8_bp + 4u);
+                const unsigned int q8_base0 = iqs * 4u;
+                const unsigned int q8_base1 = q8_base0 + 4u;
+                const int q8_low0 = *(const int *)(q8_values + q8_base0);
+                const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
+                const int q8_low1 = *(const int *)(q8_values + q8_base1);
+                const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
+
+                #pragma unroll
+                for (unsigned int c = 0u; c < group_cols; ++c) {
+                    const unsigned int col = col_tile + c;
+                    const unsigned char *gate_bp = weight_gate + ((size_t)col * row_blocks + block) * 18u;
+                    const unsigned char *up_bp = weight_up + ((size_t)col * row_blocks + block) * 18u;
+                    gate_acc[c] += antfly_q4_0_q8_dot16(gate_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+                    up_acc[c] += antfly_q4_0_q8_dot16(up_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+                }
+            }
+
+            #pragma unroll
+            for (unsigned int c = 0u; c < group_cols; ++c) {
+                const float gate_sum = antfly_warp_reduce_sum_f32(gate_acc[c]);
+                const float up_sum = antfly_warp_reduce_sum_f32(up_acc[c]);
+                if (lane == 0u) {
+                    gate_partial[group][c][group_warp] = gate_sum;
+                    up_partial[group][c][group_warp] = up_sum;
+                }
+            }
+        }
+        __syncthreads();
+        if (tid < 16u) {
+            const unsigned int out_group = tid >> 2u;
+            const unsigned int c = tid & 3u;
+            float gate_y = 0.0f;
+            float up_y = 0.0f;
+            #pragma unroll
+            for (unsigned int w = 0u; w < 3u; ++w) {
+                gate_y += gate_partial[out_group][c][w];
+                up_y += up_partial[out_group][c][w];
+            }
+            activated[wave * 16u + out_group * group_cols + c] = antfly_decoder_activation_f32(gate_y, activation) * up_y;
+        }
+        __syncthreads();
+    }
+
+    if (warp == 0u) {
+        const float x = activated[lane];
+        const float amax = antfly_warp_reduce_max_f32(fabsf(x));
+        const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
+        int q = 0;
+        if (d > 0.0f) {
+            q = __float2int_rn(x / d);
+            q = max(-127, min(127, q));
+        }
+        unsigned char *bp = dst_q8 + ((size_t)row * out_row_blocks + out_block) * 36u;
+        bp[4u + lane] = (unsigned char)(signed char)q;
+        if (lane == 0u) {
+            const unsigned short d_bits = __half_as_ushort(__float2half(d));
+            bp[0] = (unsigned char)(d_bits & 0xffu);
+            bp[1] = (unsigned char)(d_bits >> 8);
+            bp[2] = 0u;
+            bp[3] = 0u;
+        }
+    }
+}
+
+// Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
+// kernel_id=antfly_q4_0_down_q8_1_e2b_6144_mmv_v1 plan_id=cuda/q4_0/rows_1/gated_down/mmv
+extern "C" __global__ void antfly_q4_0_down_q8_1_e2b_6144_mmv_v1(
+    float *dst,
+    const unsigned char *q8_input,
+    const unsigned char *weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    const unsigned int cols = 4u;
+    if (rows == 0u || (in_dim & 31u) != 0u || out_dim == 0u) return;
+    const unsigned int row_blocks = in_dim >> 5;
+    const unsigned int col_tiles = (out_dim + cols - 1u) / cols;
+    const unsigned int row = blockIdx.x / col_tiles;
+    const unsigned int col_tile = (blockIdx.x % col_tiles) * cols;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    if (blockDim.x != 128u || row >= rows) return;
+
+    __shared__ float warp_partial[4][4];
+    float acc[4];
+    #pragma unroll
+    for (unsigned int c = 0u; c < cols; ++c) acc[c] = 0.0f;
+
+    const unsigned int iqs = (tid & 1u) * 2u;
+    for (unsigned int block = tid >> 1u; block < row_blocks; block += 64u) {
+        const unsigned char *q8_bp = q8_input + ((size_t)row * row_blocks + block) * 36u;
+        const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
+        const signed char *q8_values = (const signed char *)(q8_bp + 4u);
+        const unsigned int q8_base0 = iqs * 4u;
+        const unsigned int q8_base1 = q8_base0 + 4u;
+        const int q8_low0 = *(const int *)(q8_values + q8_base0);
+        const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
+        const int q8_low1 = *(const int *)(q8_values + q8_base1);
+        const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
+
+        #pragma unroll
+        for (unsigned int c = 0u; c < cols; ++c) {
+            const unsigned int col = col_tile + c;
+            if (col < out_dim) {
+                const unsigned char *bp = weight + ((size_t)col * row_blocks + block) * 18u;
+                acc[c] += antfly_q4_0_q8_dot16(bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (unsigned int c = 0u; c < cols; ++c) {
+        const float sum = antfly_warp_reduce_sum_f32(acc[c]);
+        if (lane == 0u) warp_partial[c][warp] = sum;
+    }
+    __syncthreads();
+    if (tid < 4u) {
+        float y = 0.0f;
+        #pragma unroll
+        for (unsigned int w = 0u; w < 4u; ++w) y += warp_partial[tid][w];
+        const unsigned int col = col_tile + tid;
+        if (col < out_dim) dst[(size_t)row * out_dim + col] = y;
+    }
+}
+
+// Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
+// kernel_id=antfly_q4_0_down_q8_1_e2b_12288_mmv_v1 plan_id=cuda/q4_0/rows_1/gated_down/mmv
+extern "C" __global__ void antfly_q4_0_down_q8_1_e2b_12288_mmv_v1(
+    float *dst,
+    const unsigned char *q8_input,
+    const unsigned char *weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    const unsigned int cols = 4u;
+    if (rows == 0u || (in_dim & 31u) != 0u || out_dim == 0u) return;
+    const unsigned int row_blocks = in_dim >> 5;
+    const unsigned int col_tiles = (out_dim + cols - 1u) / cols;
+    const unsigned int row = blockIdx.x / col_tiles;
+    const unsigned int col_tile = (blockIdx.x % col_tiles) * cols;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    if (blockDim.x != 256u || row >= rows) return;
+
+    __shared__ float warp_partial[4][8];
+    float acc[4];
+    #pragma unroll
+    for (unsigned int c = 0u; c < cols; ++c) acc[c] = 0.0f;
+
+    const unsigned int iqs = (tid & 1u) * 2u;
+    for (unsigned int block = tid >> 1u; block < row_blocks; block += 128u) {
+        const unsigned char *q8_bp = q8_input + ((size_t)row * row_blocks + block) * 36u;
+        const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
+        const signed char *q8_values = (const signed char *)(q8_bp + 4u);
+        const unsigned int q8_base0 = iqs * 4u;
+        const unsigned int q8_base1 = q8_base0 + 4u;
+        const int q8_low0 = *(const int *)(q8_values + q8_base0);
+        const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
+        const int q8_low1 = *(const int *)(q8_values + q8_base1);
+        const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
+
+        #pragma unroll
+        for (unsigned int c = 0u; c < cols; ++c) {
+            const unsigned int col = col_tile + c;
+            if (col < out_dim) {
+                const unsigned char *bp = weight + ((size_t)col * row_blocks + block) * 18u;
+                acc[c] += antfly_q4_0_q8_dot16(bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (unsigned int c = 0u; c < cols; ++c) {
+        const float sum = antfly_warp_reduce_sum_f32(acc[c]);
+        if (lane == 0u) warp_partial[c][warp] = sum;
+    }
+    __syncthreads();
+    if (tid < 4u) {
+        float y = 0.0f;
+        #pragma unroll
+        for (unsigned int w = 0u; w < 8u; ++w) y += warp_partial[tid][w];
+        const unsigned int col = col_tile + tid;
+        if (col < out_dim) dst[(size_t)row * out_dim + col] = y;
+    }
+}
+
+// Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
+// kernel_id=antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1 plan_id=cuda/q4_0/rows_1/pair_activation/mmv
+extern "C" __global__ void antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1(
+    float* dst,
+    const float* input,
+    const unsigned char* weight_gate,
+    const unsigned char* weight_up,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int activation
+) {
+    const unsigned int cols = 4u;
+    const unsigned int tiles = (out_dim + cols - 1u) / cols;
+    const unsigned int row = blockIdx.x / tiles;
+    const unsigned int col_tile = (blockIdx.x - row * tiles) * cols;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int row_blocks = in_dim / 32u;
+    if (rows != 1u || in_dim != 1536u || out_dim != 6144u || blockDim.x != 128u || row >= rows) return;
+
+    __shared__ float gate_partial[4][4];
+    __shared__ float up_partial[4][4];
+    float gate_acc[4];
+    float up_acc[4];
+    #pragma unroll
+    for (unsigned int c = 0u; c < 4u; ++c) {
+        gate_acc[c] = 0.0f;
+        up_acc[c] = 0.0f;
+    }
+
+    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
+        const float x = input[row * in_dim + i];
+        const unsigned int block = i / 32u;
+        const unsigned int value_lane = i - block * 32u;
+        const unsigned int q_offset = 2u + (value_lane & 15u);
+        const unsigned int high_nibble = value_lane >> 4u;
+        #pragma unroll
+        for (unsigned int c = 0u; c < 4u; ++c) {
+            const unsigned int col = col_tile + c;
+            if (col < out_dim) {
+                const unsigned char* gate_bp = weight_gate + (col * row_blocks + block) * 18u;
+                const unsigned char* up_bp = weight_up + (col * row_blocks + block) * 18u;
+                gate_acc[c] += x * termite_q4_0_value_nibble(gate_bp, q_offset, high_nibble);
+                up_acc[c] += x * termite_q4_0_value_nibble(up_bp, q_offset, high_nibble);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (unsigned int c = 0u; c < 4u; ++c) {
+        const float gate_sum = termite_warp_reduce_sum(gate_acc[c]);
+        const float up_sum = termite_warp_reduce_sum(up_acc[c]);
+        if (lane == 0u && warp < 4u) {
+            gate_partial[c][warp] = gate_sum;
+            up_partial[c][warp] = up_sum;
+        }
+    }
+    __syncthreads();
+    if (tid == 0u) {
+        #pragma unroll
+        for (unsigned int c = 0u; c < 4u; ++c) {
+            const unsigned int col = col_tile + c;
+            if (col < out_dim) {
+                float gate_y = 0.0f;
+                float up_y = 0.0f;
+                #pragma unroll
+                for (unsigned int w = 0u; w < 4u; ++w) {
+                    gate_y += gate_partial[c][w];
+                    up_y += up_partial[c][w];
+                }
+                dst[row * out_dim + col] = termite_decoder_activation_f32(gate_y, activation) * up_y;
+            }
+        }
+    }
+}
+
+// Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
+// kernel_id=antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1 plan_id=cuda/q4_0/rows_1/pair_activation/mmv
+extern "C" __global__ void antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1(
+    float* dst,
+    const float* input,
+    const unsigned char* weight_gate,
+    const unsigned char* weight_up,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int activation
+) {
+    const unsigned int cols = 4u;
+    const unsigned int tiles = (out_dim + cols - 1u) / cols;
+    const unsigned int row = blockIdx.x / tiles;
+    const unsigned int col_tile = (blockIdx.x - row * tiles) * cols;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int row_blocks = in_dim / 32u;
+    if (rows != 1u || in_dim != 1536u || out_dim != 12288u || blockDim.x != 128u || row >= rows) return;
+
+    __shared__ float gate_partial[4][4];
+    __shared__ float up_partial[4][4];
+    float gate_acc[4];
+    float up_acc[4];
+    #pragma unroll
+    for (unsigned int c = 0u; c < 4u; ++c) {
+        gate_acc[c] = 0.0f;
+        up_acc[c] = 0.0f;
+    }
+
+    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
+        const float x = input[row * in_dim + i];
+        const unsigned int block = i / 32u;
+        const unsigned int value_lane = i - block * 32u;
+        const unsigned int q_offset = 2u + (value_lane & 15u);
+        const unsigned int high_nibble = value_lane >> 4u;
+        #pragma unroll
+        for (unsigned int c = 0u; c < 4u; ++c) {
+            const unsigned int col = col_tile + c;
+            if (col < out_dim) {
+                const unsigned char* gate_bp = weight_gate + (col * row_blocks + block) * 18u;
+                const unsigned char* up_bp = weight_up + (col * row_blocks + block) * 18u;
+                gate_acc[c] += x * termite_q4_0_value_nibble(gate_bp, q_offset, high_nibble);
+                up_acc[c] += x * termite_q4_0_value_nibble(up_bp, q_offset, high_nibble);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (unsigned int c = 0u; c < 4u; ++c) {
+        const float gate_sum = termite_warp_reduce_sum(gate_acc[c]);
+        const float up_sum = termite_warp_reduce_sum(up_acc[c]);
+        if (lane == 0u && warp < 4u) {
+            gate_partial[c][warp] = gate_sum;
+            up_partial[c][warp] = up_sum;
+        }
+    }
+    __syncthreads();
+    if (tid == 0u) {
+        #pragma unroll
+        for (unsigned int c = 0u; c < 4u; ++c) {
+            const unsigned int col = col_tile + c;
+            if (col < out_dim) {
+                float gate_y = 0.0f;
+                float up_y = 0.0f;
+                #pragma unroll
+                for (unsigned int w = 0u; w < 4u; ++w) {
+                    gate_y += gate_partial[c][w];
+                    up_y += up_partial[c][w];
+                }
+                dst[row * out_dim + col] = termite_decoder_activation_f32(gate_y, activation) * up_y;
+            }
+        }
+    }
+}
+
+// Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
+// kernel_id=antfly_q4_0_down_f32_e2b_6144_exact_v1 plan_id=cuda/q4_0/rows_1/gated_down/mmv
+extern "C" __global__ void antfly_q4_0_down_f32_e2b_6144_exact_v1(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    const unsigned int cols = 4u;
+    const unsigned int col_tile = blockIdx.x * cols;
+    const unsigned int row = 0u;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int row_blocks = in_dim / 32u;
+    if (rows != 1u || in_dim != 6144u || out_dim != 1536u || blockDim.x != 256u) return;
+
+    __shared__ float warp_partial[4][8];
+    float acc[4];
+    #pragma unroll
+    for (unsigned int c = 0u; c < 4u; ++c) acc[c] = 0.0f;
+
+    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
+        const float x = input[row * in_dim + i];
+        const unsigned int block = i / 32u;
+        const unsigned int value_lane = i - block * 32u;
+        const unsigned int q_offset = 2u + (value_lane & 15u);
+        const unsigned int high_nibble = value_lane >> 4u;
+        #pragma unroll
+        for (unsigned int c = 0u; c < 4u; ++c) {
+            const unsigned int col = col_tile + c;
+            if (col < out_dim) {
+                const unsigned char* bp = weight + (col * row_blocks + block) * 18u;
+                acc[c] += x * termite_q4_0_value_nibble(bp, q_offset, high_nibble);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (unsigned int c = 0u; c < 4u; ++c) {
+        const float sum = termite_warp_reduce_sum(acc[c]);
+        if (lane == 0u && warp < 8u) warp_partial[c][warp] = sum;
+    }
+    __syncthreads();
+    if (tid == 0u) {
+        #pragma unroll
+        for (unsigned int c = 0u; c < 4u; ++c) {
+            const unsigned int col = col_tile + c;
+            if (col < out_dim) {
+                float y = 0.0f;
+                #pragma unroll
+                for (unsigned int w = 0u; w < 8u; ++w) y += warp_partial[c][w];
+                dst[row * out_dim + col] = y;
+            }
+        }
+    }
+}
+
+// Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
+// kernel_id=antfly_q4_0_down_f32_e2b_12288_exact_v1 plan_id=cuda/q4_0/rows_1/gated_down/mmv
+extern "C" __global__ void antfly_q4_0_down_f32_e2b_12288_exact_v1(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    const unsigned int cols = 4u;
+    const unsigned int col_tile = blockIdx.x * cols;
+    const unsigned int row = 0u;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int row_blocks = in_dim / 32u;
+    if (rows != 1u || in_dim != 12288u || out_dim != 1536u || blockDim.x != 256u) return;
+
+    __shared__ float warp_partial[4][8];
+    float acc[4];
+    #pragma unroll
+    for (unsigned int c = 0u; c < 4u; ++c) acc[c] = 0.0f;
+
+    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
+        const float x = input[row * in_dim + i];
+        const unsigned int block = i / 32u;
+        const unsigned int value_lane = i - block * 32u;
+        const unsigned int q_offset = 2u + (value_lane & 15u);
+        const unsigned int high_nibble = value_lane >> 4u;
+        #pragma unroll
+        for (unsigned int c = 0u; c < 4u; ++c) {
+            const unsigned int col = col_tile + c;
+            if (col < out_dim) {
+                const unsigned char* bp = weight + (col * row_blocks + block) * 18u;
+                acc[c] += x * termite_q4_0_value_nibble(bp, q_offset, high_nibble);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (unsigned int c = 0u; c < 4u; ++c) {
+        const float sum = termite_warp_reduce_sum(acc[c]);
+        if (lane == 0u && warp < 8u) warp_partial[c][warp] = sum;
+    }
+    __syncthreads();
+    if (tid == 0u) {
+        #pragma unroll
+        for (unsigned int c = 0u; c < 4u; ++c) {
+            const unsigned int col = col_tile + c;
+            if (col < out_dim) {
+                float y = 0.0f;
+                #pragma unroll
+                for (unsigned int w = 0u; w < 8u; ++w) y += warp_partial[c][w];
+                dst[row * out_dim + col] = y;
+            }
+        }
+    }
+}
+
+// Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
+// kernel_id=antfly_q4_0_q8_1_argmax_rows_stage1_tile8_v1 plan_id=cuda/q4_0/rows_1/argmax/mmv
+extern "C" __global__ void antfly_q4_0_q8_1_argmax_rows_stage1_tile8_v1(
+    float* partial_values,
+    unsigned int* partial_indices,
+    const unsigned char* q8_input,
+    const unsigned char* weight,
+    const int* suppress_token_ids,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int suppress_count
+) {
+    const unsigned int cols = 8u;
+    const unsigned int row_blocks = 48u;
+    if (rows != 1u || in_dim != 1536u || out_dim != 262144u || blockDim.x != 96u) return;
+
+    const unsigned int global_tile = blockIdx.x;
+    const unsigned int col_tile = global_tile * cols;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    __shared__ float warp_partial[8][3];
+    float acc[8];
+#pragma unroll
+    for (unsigned int c = 0u; c < cols; ++c) acc[c] = 0.0f;
+
+    const unsigned int iqs = (tid & 1u) * 2u;
+    const unsigned int block = tid >> 1u;
+    if (block < row_blocks) {
+        const unsigned char* q8_bp = q8_input + block * 36u;
+        const float q8_d = antfly_half_bits_to_float(((const unsigned short*)q8_bp)[0]);
+        const signed char* q8_values = (const signed char*)(q8_bp + 4u);
+        const unsigned int q8_base0 = iqs * 4u;
+        const unsigned int q8_base1 = q8_base0 + 4u;
+        const int q8_low0 = *(const int*)(q8_values + q8_base0);
+        const int q8_high0 = *(const int*)(q8_values + q8_base0 + 16u);
+        const int q8_low1 = *(const int*)(q8_values + q8_base1);
+        const int q8_high1 = *(const int*)(q8_values + q8_base1 + 16u);
+#pragma unroll
+        for (unsigned int c = 0u; c < cols; ++c) {
+            const unsigned int col = col_tile + c;
+            const unsigned char* bp = weight + ((size_t)col * row_blocks + block) * 18u;
+            acc[c] = antfly_q4_0_q8_dot16(bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+        }
+    }
+
+#pragma unroll
+    for (unsigned int c = 0u; c < cols; ++c) {
+        const float sum = antfly_warp_reduce_sum_f32(acc[c]);
+        if (lane == 0u) warp_partial[c][warp] = sum;
+    }
+    __syncthreads();
+    if (tid != 0u) return;
+
+    float best_value = -3.402823466e+38f;
+    unsigned int best_index = 0xffffffffu;
+#pragma unroll
+    for (unsigned int c = 0u; c < cols; ++c) {
+        const unsigned int col = col_tile + c;
+        float value = 0.0f;
+#pragma unroll
+        for (unsigned int w = 0u; w < 3u; ++w) value += warp_partial[c][w];
+        bool suppressed = false;
+        for (unsigned int j = 0u; j < suppress_count; ++j) {
+            const int token_id = suppress_token_ids[j];
+            if (token_id >= 0 && (unsigned int)token_id == col) {
+                suppressed = true;
+                break;
+            }
+        }
+        if (!suppressed && (value > best_value || (value == best_value && col < best_index))) {
+            best_value = value;
+            best_index = col;
+        }
+    }
+    partial_values[global_tile] = best_value;
+    partial_indices[global_tile] = best_index;
+}
+
+// Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
+// kernel_id=antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1 plan_id=cuda/q6_k/rows_1/argmax/mmv
+static __device__ __forceinline__ int antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1_q6_k_pack4(
+    const unsigned char* ql,
+    const unsigned char* qh,
+    unsigned int nibble_shift,
+    unsigned int qh_shift,
+    unsigned int offset
+) {
+    const unsigned int q0 = ((unsigned int)(ql[offset + 0u] >> nibble_shift) & 0x0fu) | (((unsigned int)(qh[offset + 0u] >> qh_shift) & 0x03u) << 4u);
+    const unsigned int q1 = ((unsigned int)(ql[offset + 1u] >> nibble_shift) & 0x0fu) | (((unsigned int)(qh[offset + 1u] >> qh_shift) & 0x03u) << 4u);
+    const unsigned int q2 = ((unsigned int)(ql[offset + 2u] >> nibble_shift) & 0x0fu) | (((unsigned int)(qh[offset + 2u] >> qh_shift) & 0x03u) << 4u);
+    const unsigned int q3 = ((unsigned int)(ql[offset + 3u] >> nibble_shift) & 0x0fu) | (((unsigned int)(qh[offset + 3u] >> qh_shift) & 0x03u) << 4u);
+    const unsigned int p0 = (q0 - 32u) & 0xffu;
+    const unsigned int p1 = (q1 - 32u) & 0xffu;
+    const unsigned int p2 = (q2 - 32u) & 0xffu;
+    const unsigned int p3 = (q3 - 32u) & 0xffu;
+    return (int)(p0 | (p1 << 8u) | (p2 << 16u) | (p3 << 24u));
+}
+
+static __device__ __forceinline__ int antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1_q6_k_q8_1_dot16_sub(
+    const unsigned char* block,
+    unsigned int sub,
+    int q8_pack0,
+    int q8_pack1,
+    int q8_pack2,
+    int q8_pack3
+) {
+    const unsigned int half = sub >> 3u;
+    const unsigned int group = (sub & 7u) >> 1u;
+    const unsigned int l_base = (sub & 1u) * 16u;
+    const unsigned int ql_off = half * 64u + (group & 1u) * 32u;
+    const unsigned int qh_off = half * 32u;
+    const unsigned int qh_shift = group << 1u;
+    const unsigned int nibble_shift = (group >> 1u) << 2u;
+    const unsigned char* ql = block + ql_off + l_base;
+    const unsigned char* qh = block + 128u + qh_off + l_base;
+    int sumi = 0;
+    sumi = __dp4a(antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1_q6_k_pack4(ql, qh, nibble_shift, qh_shift, 0u), q8_pack0, sumi);
+    sumi = __dp4a(antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1_q6_k_pack4(ql, qh, nibble_shift, qh_shift, 4u), q8_pack1, sumi);
+    sumi = __dp4a(antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1_q6_k_pack4(ql, qh, nibble_shift, qh_shift, 8u), q8_pack2, sumi);
+    sumi = __dp4a(antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1_q6_k_pack4(ql, qh, nibble_shift, qh_shift, 12u), q8_pack3, sumi);
+    return sumi;
+}
+extern "C" __global__ void antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1(
+    float* partial_values,
+    unsigned int* partial_indices,
+    const unsigned char* q8_input,
+    const unsigned char* weight,
+    const int* suppress_token_ids,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int suppress_count
+) {
+    (void)suppress_token_ids;
+    const unsigned int cols = 8u;
+    const unsigned int row_blocks = 10u;
+    const unsigned int task_threads = 160u;
+    if (rows != 1u || in_dim != 2560u || out_dim != 262144u || suppress_count != 0u || blockDim.x != 160u) return;
+
+    const unsigned int global_tile = blockIdx.x;
+    const unsigned int col_tile = global_tile * cols;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    __shared__ float warp_partial[8][5];
+    float acc[8];
+#pragma unroll
+    for (unsigned int c = 0u; c < cols; ++c) acc[c] = 0.0f;
+
+    if (tid < task_threads) {
+        const unsigned int block = tid >> 4u;
+        const unsigned int sub = tid & 15u;
+        const unsigned int q8_sub_block = sub >> 1u;
+        const unsigned int q8_lane_base = (sub & 1u) * 16u;
+        const unsigned char* q8_bp = q8_input + (block * 8u + q8_sub_block) * 36u;
+        const float q8_d = antfly_half_bits_to_float(((const unsigned short*)q8_bp)[0]);
+        const signed char* q8_values = (const signed char*)(q8_bp + 4u);
+        const int q8_pack0 = *(const int*)(q8_values + q8_lane_base + 0u);
+        const int q8_pack1 = *(const int*)(q8_values + q8_lane_base + 4u);
+        const int q8_pack2 = *(const int*)(q8_values + q8_lane_base + 8u);
+        const int q8_pack3 = *(const int*)(q8_values + q8_lane_base + 12u);
+#pragma unroll
+        for (unsigned int c = 0u; c < cols; ++c) {
+            const unsigned char* bp = weight + ((col_tile + c) * row_blocks + block) * 210u;
+            const int sumi = antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1_q6_k_q8_1_dot16_sub(bp, sub, q8_pack0, q8_pack1, q8_pack2, q8_pack3);
+            acc[c] = (q8_d * antfly_q6_k_sub_scale_f32(bp, sub)) * (float)sumi;
+        }
+    }
+
+#pragma unroll
+    for (unsigned int c = 0u; c < cols; ++c) {
+        const float sum = antfly_warp_reduce_sum_f32(acc[c]);
+        if (lane == 0u) warp_partial[c][warp] = sum;
+    }
+    __syncthreads();
+    if (tid != 0u) return;
+
+    float best_value = -3.402823466e+38f;
+    unsigned int best_index = 0xffffffffu;
+#pragma unroll
+    for (unsigned int c = 0u; c < cols; ++c) {
+        float value = 0.0f;
+#pragma unroll
+        for (unsigned int w = 0u; w < 5u; ++w) value += warp_partial[c][w];
+        const unsigned int col = col_tile + c;
+        if (value > best_value || (value == best_value && col < best_index)) {
+            best_value = value;
+            best_index = col;
+        }
+    }
+    partial_values[global_tile] = best_value;
+    partial_indices[global_tile] = best_index;
+}
+
+// Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.
+// kernel_id=antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1 plan_id=cuda/q6_k/rows_1/argmax/mmv
+static __device__ __forceinline__ int antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1_q6_k_pack4(
+    const unsigned char* ql,
+    const unsigned char* qh,
+    unsigned int nibble_shift,
+    unsigned int qh_shift,
+    unsigned int offset
+) {
+    const unsigned int q0 = ((unsigned int)(ql[offset + 0u] >> nibble_shift) & 0x0fu) | (((unsigned int)(qh[offset + 0u] >> qh_shift) & 0x03u) << 4u);
+    const unsigned int q1 = ((unsigned int)(ql[offset + 1u] >> nibble_shift) & 0x0fu) | (((unsigned int)(qh[offset + 1u] >> qh_shift) & 0x03u) << 4u);
+    const unsigned int q2 = ((unsigned int)(ql[offset + 2u] >> nibble_shift) & 0x0fu) | (((unsigned int)(qh[offset + 2u] >> qh_shift) & 0x03u) << 4u);
+    const unsigned int q3 = ((unsigned int)(ql[offset + 3u] >> nibble_shift) & 0x0fu) | (((unsigned int)(qh[offset + 3u] >> qh_shift) & 0x03u) << 4u);
+    const unsigned int p0 = (q0 - 32u) & 0xffu;
+    const unsigned int p1 = (q1 - 32u) & 0xffu;
+    const unsigned int p2 = (q2 - 32u) & 0xffu;
+    const unsigned int p3 = (q3 - 32u) & 0xffu;
+    return (int)(p0 | (p1 << 8u) | (p2 << 16u) | (p3 << 24u));
+}
+
+static __device__ __forceinline__ int antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1_q6_k_q8_1_dot16_sub(
+    const unsigned char* block,
+    unsigned int sub,
+    int q8_pack0,
+    int q8_pack1,
+    int q8_pack2,
+    int q8_pack3
+) {
+    const unsigned int half = sub >> 3u;
+    const unsigned int group = (sub & 7u) >> 1u;
+    const unsigned int l_base = (sub & 1u) * 16u;
+    const unsigned int ql_off = half * 64u + (group & 1u) * 32u;
+    const unsigned int qh_off = half * 32u;
+    const unsigned int qh_shift = group << 1u;
+    const unsigned int nibble_shift = (group >> 1u) << 2u;
+    const unsigned char* ql = block + ql_off + l_base;
+    const unsigned char* qh = block + 128u + qh_off + l_base;
+    int sumi = 0;
+    sumi = __dp4a(antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1_q6_k_pack4(ql, qh, nibble_shift, qh_shift, 0u), q8_pack0, sumi);
+    sumi = __dp4a(antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1_q6_k_pack4(ql, qh, nibble_shift, qh_shift, 4u), q8_pack1, sumi);
+    sumi = __dp4a(antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1_q6_k_pack4(ql, qh, nibble_shift, qh_shift, 8u), q8_pack2, sumi);
+    sumi = __dp4a(antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1_q6_k_pack4(ql, qh, nibble_shift, qh_shift, 12u), q8_pack3, sumi);
+    return sumi;
+}
+extern "C" __global__ void antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1(
+    float* partial_values,
+    unsigned int* partial_indices,
+    const unsigned char* q8_input,
+    const unsigned char* weight,
+    const int* suppress_token_ids,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int suppress_count
+) {
+    (void)suppress_token_ids;
+    const unsigned int cols = 8u;
+    const unsigned int row_blocks = 15u;
+    const unsigned int task_threads = 240u;
+    if (rows != 1u || in_dim != 3840u || out_dim != 262144u || suppress_count != 0u || blockDim.x != 256u) return;
+
+    const unsigned int global_tile = blockIdx.x;
+    const unsigned int col_tile = global_tile * cols;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    __shared__ float warp_partial[8][8];
+    float acc[8];
+#pragma unroll
+    for (unsigned int c = 0u; c < cols; ++c) acc[c] = 0.0f;
+
+    if (tid < task_threads) {
+        const unsigned int block = tid >> 4u;
+        const unsigned int sub = tid & 15u;
+        const unsigned int q8_sub_block = sub >> 1u;
+        const unsigned int q8_lane_base = (sub & 1u) * 16u;
+        const unsigned char* q8_bp = q8_input + (block * 8u + q8_sub_block) * 36u;
+        const float q8_d = antfly_half_bits_to_float(((const unsigned short*)q8_bp)[0]);
+        const signed char* q8_values = (const signed char*)(q8_bp + 4u);
+        const int q8_pack0 = *(const int*)(q8_values + q8_lane_base + 0u);
+        const int q8_pack1 = *(const int*)(q8_values + q8_lane_base + 4u);
+        const int q8_pack2 = *(const int*)(q8_values + q8_lane_base + 8u);
+        const int q8_pack3 = *(const int*)(q8_values + q8_lane_base + 12u);
+#pragma unroll
+        for (unsigned int c = 0u; c < cols; ++c) {
+            const unsigned char* bp = weight + ((col_tile + c) * row_blocks + block) * 210u;
+            const int sumi = antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1_q6_k_q8_1_dot16_sub(bp, sub, q8_pack0, q8_pack1, q8_pack2, q8_pack3);
+            acc[c] = (q8_d * antfly_q6_k_sub_scale_f32(bp, sub)) * (float)sumi;
+        }
+    }
+
+#pragma unroll
+    for (unsigned int c = 0u; c < cols; ++c) {
+        const float sum = antfly_warp_reduce_sum_f32(acc[c]);
+        if (lane == 0u) warp_partial[c][warp] = sum;
+    }
+    __syncthreads();
+    if (tid != 0u) return;
+
+    float best_value = -3.402823466e+38f;
+    unsigned int best_index = 0xffffffffu;
+#pragma unroll
+    for (unsigned int c = 0u; c < cols; ++c) {
+        float value = 0.0f;
+#pragma unroll
+        for (unsigned int w = 0u; w < 8u; ++w) value += warp_partial[c][w];
+        const unsigned int col = col_tile + c;
+        if (value > best_value || (value == best_value && col < best_index)) {
+            best_value = value;
+            best_index = col;
+        }
+    }
+    partial_values[global_tile] = best_value;
+    partial_indices[global_tile] = best_index;
+}
+// quant-kernel-codegen:end generated CUDA runtime-wired dev matmul candidates

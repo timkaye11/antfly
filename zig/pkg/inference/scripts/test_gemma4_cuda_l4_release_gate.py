@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import pathlib
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+from gemma4_cuda_l4_release_gate import (
+    CAPTURE_KV_CAPACITY,
+    DEFAULT_MIN_COMPARABLE_RATIO,
+    E2B_ANTFLY_TOKENS,
+    E2B_LLAMA_TOKENS,
+    FROZEN_PROFILE,
+    GEMMA12B_TOKENS,
+    MAX_TOK_S_CV,
+    TOKEN_IDS_RE,
+    canonical_sha256,
+    disabled_candidate_errors,
+    e2b_contract_errors,
+    e2b_pair_contract_errors,
+    frozen_profile,
+    gemma12b_evidence,
+    generation_replay_errors,
+    gpu_provenance,
+    l4_errors,
+    matrix_command,
+    parse_token_ids,
+    path_provenance,
+    release_environment,
+)
+
+
+def matrix(ratio: float = 0.81, passed: bool = True) -> dict:
+    return {
+        "entries": [{
+            "output_tokens": E2B_LLAMA_TOKENS,
+            "pair_ok": True,
+            "graph_replay_ok": True,
+            "comparable_ratio": ratio,
+        }],
+        "passed": passed,
+    }
+
+
+def pair() -> dict:
+    return {
+        "ok": True,
+        "ok_graph_replay": True,
+        "ok_lm_head_argmax": True,
+        "comparison": {
+            "antfly_tokens": E2B_ANTFLY_TOKENS,
+            "llama_tokens": E2B_LLAMA_TOKENS,
+            "antfly_cache_dtype": "f32",
+            "llama_cache_type_k": "f32",
+            "llama_cache_type_v": "f32",
+            "antfly_generated_attention_decode": "0",
+            "antfly_generated_q6_k_q8_1_lm_head_argmax": "0",
+            "antfly_generated_q4_0_e2b_ffn": "0",
+            "antfly_generated_q4_0_e2b_ffn_exact": "0",
+            "antfly_q4_0_q8_1_lm_head_argmax": "1",
+        },
+        "rows": [{
+            "antfly_generated_q6_lm_head_argmax": 0,
+            "antfly_generated_q6_lm_head_argmax_fallbacks": 0,
+            "antfly_generated_e2b_pair": 0,
+            "antfly_generated_e2b_down": 0,
+            "antfly_generated_e2b_pair_fallbacks": 0,
+            "antfly_generated_e2b_down_fallbacks": 0,
+            "antfly_generated_e2b_exact_pair": 0,
+            "antfly_generated_e2b_exact_down": 0,
+            "antfly_generated_e2b_exact_pair_fallbacks": 0,
+            "antfly_generated_e2b_exact_down_fallbacks": 0,
+            "antfly_generated_attention": 0,
+        }],
+    }
+
+
+def generation_run() -> dict:
+    return {
+        "returncode": 0,
+        "token_ids": list(range(GEMMA12B_TOKENS)),
+        "timing_data": {
+            "tokens": GEMMA12B_TOKENS,
+            "decode_tok_per_s": 42.0,
+            "cuda": {
+                "graph_capture_persistent_replays": GEMMA12B_TOKENS - 1,
+                "graph_capture_discards": 0,
+                "graph_capture_capacity_skips": 0,
+                "launch_attention_gqa_decode_generated": 0,
+                "lm_head_argmax_generated_q6_k_q8_1_hits": 0,
+                "lm_head_argmax_generated_q6_k_q8_1_fallbacks": 0,
+                "q4_0_generated_e2b_pair_q8_hits": 0,
+                "q4_0_generated_e2b_down_q8_hits": 0,
+                "q4_0_generated_e2b_pair_q8_fallbacks": 0,
+                "q4_0_generated_e2b_down_q8_fallbacks": 0,
+                "q4_0_generated_e2b_exact_pair_f32_hits": 0,
+                "q4_0_generated_e2b_exact_down_f32_hits": 0,
+                "q4_0_generated_e2b_exact_pair_f32_fallbacks": 0,
+                "q4_0_generated_e2b_exact_down_f32_fallbacks": 0,
+            },
+        },
+    }
+
+
+class L4ReleaseGateTest(unittest.TestCase):
+    def test_profile_locks_candidate_gates_and_returns_a_copy(self) -> None:
+        profile = frozen_profile()
+        self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE"])
+        self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK"])
+        self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION"])
+        self.assertEqual("853", profile["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD"])
+        self.assertEqual("2500", profile["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP"])
+        self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q6_K_Q8_1_LM_HEAD_ARGMAX"])
+        self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN"])
+        self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_CATALOG_FFN_CANDIDATES"])
+        self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT"])
+        self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX"])
+        self.assertEqual("required", profile["ANTFLY_DECODE_GRAPH_REPLAY"])
+        self.assertEqual(str(CAPTURE_KV_CAPACITY), profile["ANTFLY_CAPTURE_FORCE_KV_CAPACITY"])
+        self.assertEqual("1", profile["ANTFLY_INFERENCE_DISABLE_CONTINUOUS_BATCHING"])
+        profile["ANTFLY_DECODE_GRAPH_REPLAY"] = "off"
+        self.assertEqual("required", FROZEN_PROFILE["ANTFLY_DECODE_GRAPH_REPLAY"])
+
+    def test_release_environment_discards_inherited_experiment_switches(self) -> None:
+        args = argparse.Namespace(
+            binary=pathlib.Path("/binary"),
+            llama_cpp_bin=pathlib.Path("/llama"),
+            e2b_model=pathlib.Path("/model.gguf"),
+            timeout_sec=123,
+        )
+        with mock.patch.dict(os.environ, {
+            "CUDA_VISIBLE_DEVICES": "0",
+            "ANTFLY_INFERENCE_CUDA_GENERATED_Q6_K_Q8_1_LM_HEAD_ARGMAX": "1",
+            "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT": "1",
+            "ANTFLY_EXPERIMENTAL_SWITCH": "1",
+            "REQUIRE_LM_HEAD_ARGMAX": "0",
+            "LLAMA_CACHE_TYPE_K": "q8_0",
+        }, clear=True):
+            environment = release_environment(args)
+        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q6_K_Q8_1_LM_HEAD_ARGMAX"])
+        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT"])
+        self.assertEqual("1", environment["REQUIRE_LM_HEAD_ARGMAX"])
+        self.assertEqual("f32", environment["LLAMA_CACHE_TYPE_K"])
+        self.assertNotIn("ANTFLY_EXPERIMENTAL_SWITCH", environment)
+        self.assertEqual("0", environment["CUDA_VISIBLE_DEVICES"])
+        self.assertEqual("123", environment["TIMEOUT"])
+
+    def test_matrix_ratio_is_only_a_failure_when_enforced(self) -> None:
+        self.assertEqual([], e2b_contract_errors(matrix(0.72, passed=False), False, DEFAULT_MIN_COMPARABLE_RATIO))
+        errors = e2b_contract_errors(matrix(0.72, passed=False), True, DEFAULT_MIN_COMPARABLE_RATIO)
+        self.assertTrue(any("below required 0.800" in error for error in errors))
+        self.assertTrue(any("did not pass" in error for error in errors))
+
+    def test_matrix_contract_rejects_replay_or_pair_failures(self) -> None:
+        bad = matrix()
+        bad["entries"][0]["pair_ok"] = False
+        bad["entries"][0]["graph_replay_ok"] = False
+        errors = e2b_contract_errors(bad, False, DEFAULT_MIN_COMPARABLE_RATIO)
+        self.assertTrue(any("paired benchmark" in error for error in errors))
+        self.assertTrue(any("persistent graph replay" in error for error in errors))
+
+    def test_pair_contract_rejects_generated_q6_and_profile_drift(self) -> None:
+        self.assertEqual([], e2b_pair_contract_errors(pair()))
+        bad = pair()
+        bad["comparison"]["antfly_generated_q6_k_q8_1_lm_head_argmax"] = "1"
+        bad["rows"][0]["antfly_generated_q6_lm_head_argmax"] = 1
+        errors = e2b_pair_contract_errors(bad)
+        self.assertTrue(any("profile drifted" in error for error in errors))
+        self.assertTrue(any("generated Q6 LM-head" in error for error in errors))
+
+    def test_pair_contract_rejects_exact_ffn_and_profile_drift(self) -> None:
+        bad = pair()
+        bad["comparison"]["antfly_generated_q4_0_e2b_ffn_exact"] = "1"
+        bad["rows"][0]["antfly_generated_e2b_exact_pair"] = 1
+        errors = e2b_pair_contract_errors(bad)
+        self.assertTrue(any("antfly_generated_q4_0_e2b_ffn_exact" in error for error in errors))
+        self.assertTrue(any("antfly_generated_e2b_exact_pair" in error for error in errors))
+
+    def test_12b_replay_contract_requires_exact_tokens_and_disabled_candidates(self) -> None:
+        run = generation_run()
+        self.assertEqual([], generation_replay_errors(run, GEMMA12B_TOKENS, "12B"))
+        run["timing_data"]["cuda"]["lm_head_argmax_generated_q6_k_q8_1_hits"] = 1
+        errors = generation_replay_errors(run, GEMMA12B_TOKENS, "12B")
+        self.assertTrue(any("generated_q6" in error for error in errors))
+
+    def test_12b_evidence_detects_nondeterministic_token_ids(self) -> None:
+        first = generation_run()
+        second = generation_run()
+        second["token_ids"][17] = 999
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = argparse.Namespace(
+                output_dir=pathlib.Path(temp_dir),
+                gemma12b_q4_model=pathlib.Path("/model.gguf"),
+            )
+            with mock.patch(
+                "gemma4_cuda_l4_release_gate.run_generation_case",
+                side_effect=[first, second],
+            ):
+                evidence = gemma12b_evidence(args, {}, {"path": "/model.gguf", "exists": True})
+        self.assertFalse(evidence["passed"])
+        self.assertFalse(evidence["checks"]["deterministic_tokens"])
+        self.assertTrue(any("differ at index 17" in error for error in evidence["errors"]))
+
+    def test_disabled_candidate_counter_errors_are_specific(self) -> None:
+        timing = {"cuda": {"launch_attention_gqa_decode_generated": 2}}
+        errors = disabled_candidate_errors(timing, "run")
+        self.assertEqual(["run unexpectedly used disabled candidate counter launch_attention_gqa_decode_generated"], errors)
+
+        timing = {"cuda": {"launch_attention_gqa_decode_score_prework": 2}}
+        errors = disabled_candidate_errors(timing, "run")
+        self.assertEqual(
+            ["run unexpectedly used disabled candidate counter launch_attention_gqa_decode_score_prework"],
+            errors,
+        )
+
+        timing = {"cuda": {"q4_0_generated_e2b_exact_pair_f32_hits": 2}}
+        errors = disabled_candidate_errors(timing, "run")
+        self.assertEqual(
+            ["run unexpectedly used disabled candidate counter q4_0_generated_e2b_exact_pair_f32_hits"],
+            errors,
+        )
+
+    def test_l4_requirement_is_exact(self) -> None:
+        self.assertEqual([], l4_errors({"devices": [{"name": "NVIDIA L4", "compute_capability": "8.9"}]}))
+        self.assertIn("expected NVIDIA L4", l4_errors({"devices": [{"name": "NVIDIA A10", "compute_capability": "8.9"}]})[0])
+        self.assertIn("expected exactly one", l4_errors({"devices": []})[0])
+
+    def test_gpu_provenance_honors_numeric_cuda_visible_devices(self) -> None:
+        output = "0, NVIDIA L4, 550.54, 8.9\n1, NVIDIA L4, 550.54, 8.9\n"
+        with mock.patch("gemma4_cuda_l4_release_gate.command_output", return_value=output), \
+                mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "1"}, clear=True):
+            provenance = gpu_provenance()
+        self.assertEqual(["1"], [device["index"] for device in provenance["devices"]])
+        self.assertEqual([], l4_errors(provenance))
+
+    def test_matrix_command_freezes_256_token_contract(self) -> None:
+        args = argparse.Namespace(
+            matrix_script=pathlib.Path("/matrix.py"),
+            output_dir=pathlib.Path("/tmp/release"),
+            warmups=1,
+            repeats=3,
+            enforce_performance=True,
+            min_comparable_ratio=0.80,
+        )
+        command = matrix_command(args)
+        self.assertIn("--lengths", command)
+        self.assertEqual(str(E2B_LLAMA_TOKENS), command[command.index("--lengths") + 1])
+        self.assertEqual(str(E2B_LLAMA_TOKENS), command[command.index("--target-length") + 1])
+        self.assertEqual("0.8", command[command.index("--min-comparable-ratio") + 1])
+        self.assertIn("--no-require-generated-attention", command)
+        self.assertIn("--no-require-generated-q6-lm-head-argmax", command)
+        self.assertEqual(str(MAX_TOK_S_CV), command[command.index("--max-cv") + 1])
+
+    def test_token_parsing_and_provenance_fingerprint_are_stable(self) -> None:
+        self.assertIsNotNone(TOKEN_IDS_RE.search("token_ids: 1 2 3\n"))
+        self.assertEqual([1, 2, 3], parse_token_ids("before\ntoken_ids: 1 2 3\nafter\n"))
+        self.assertEqual([], parse_token_ids("token_ids=unavailable\n"))
+        self.assertEqual(canonical_sha256({"a": 1, "b": 2}), canonical_sha256({"b": 2, "a": 1}))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = pathlib.Path(temp_dir) / "artifact.bin"
+            path.write_bytes(b"artifact")
+            provenance = path_provenance(path)
+        self.assertTrue(provenance["exists"])
+        self.assertEqual(hashlib.sha256(b"artifact").hexdigest(), provenance["sha256"])
+
+
+if __name__ == "__main__":
+    unittest.main()

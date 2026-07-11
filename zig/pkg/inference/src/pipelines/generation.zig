@@ -1104,6 +1104,22 @@ fn isPureGreedyConfig(config: GenerationConfig) bool {
     return config.temperature <= 0 and !hasSamplingPenalties(config);
 }
 
+fn requiresCudaDecodeGraphBeforeEagerFallback(
+    backend_kind: ops.BackendKind,
+    graph_replay_required: bool,
+    pure_greedy: bool,
+    query_seq_len: usize,
+    has_external_graph_runtime: bool,
+    has_grammar: bool,
+) bool {
+    return graph_replay_required and
+        backend_kind == .cuda and
+        pure_greedy and
+        query_seq_len == 1 and
+        !has_external_graph_runtime and
+        !has_grammar;
+}
+
 fn hasSamplingPenalties(config: GenerationConfig) bool {
     return config.repetition_penalty != 1.0 or
         config.frequency_penalty != 0 or
@@ -3735,6 +3751,16 @@ pub const NativeGenerationPipeline = struct {
                         next_device_token_tensor = token.token_tensor;
                         break :blk .{ .token = token.token, .grammar_complete = false };
                     }
+                    const fallback_query_seq_len = if (decode_runtime.kvView() != null and
+                        (tokens_generated > 0 or prefill_last_logits.* == null)) 1 else seq_len.*;
+                    if (requiresCudaDecodeGraphBeforeEagerFallback(
+                        self.cb.kind(),
+                        gpt_arch.cudaDecodeGraphReplayRequired(),
+                        isPureGreedyConfig(config),
+                        fallback_query_seq_len,
+                        self.graph_cache != null or self.compiled_partition_backend != null,
+                        token_table != null or json_grammar.* != null or gbnf_grammar != null,
+                    )) return error.CudaGraphReplayRequired;
                 }
 
                 var owns_last_logits = false;
@@ -4319,7 +4345,9 @@ pub const NativeGenerationPipeline = struct {
         if (input_token_tensor) |token_tensor| {
             if (enableCudaGreedyDeviceTokenHandoff()) {
                 decoder_runtime_debug_stats.device_token_handoff_attempts += 1;
-                if (enableCudaGatedTokenTensorDecode()) {
+                if (enableCudaGatedTokenTensorDecode() and
+                    (backend_kind != .cuda or !gpt_arch.cudaDecodeGraphReplayRequired()))
+                {
                     if (try decoder_gated_runtime.forwardGreedyTokenFromTokenTensor(
                         &self.cb,
                         self.allocator,
@@ -4411,7 +4439,7 @@ pub const NativeGenerationPipeline = struct {
         self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
         const decode_context = decode_runtime.makeDecodeContext(seq_len, 1);
         decoder_runtime_debug_stats.device_token_handoff_attempts += 1;
-        if (enableCudaGatedTokenTensorDecode()) {
+        if (enableCudaGatedTokenTensorDecode() and !gpt_arch.cudaDecodeGraphReplayRequired()) {
             if (try decoder_gated_runtime.forwardGreedyTokenTensorOnlyFromTokenTensor(
                 &self.cb,
                 self.allocator,
@@ -8630,6 +8658,16 @@ test "cuda prefill first token path is narrowly gated" {
     try std.testing.expect(!shouldUsePrefillFirstTokenPath(.native, 1, false, true));
     try std.testing.expect(!shouldUsePrefillFirstTokenPath(.metal, 1, false, true));
     try std.testing.expect(!shouldUsePrefillFirstTokenPath(.cuda, 1, false, false));
+}
+
+test "required cuda decode graph blocks only eligible eager fallbacks" {
+    try std.testing.expect(requiresCudaDecodeGraphBeforeEagerFallback(.cuda, true, true, 1, false, false));
+    try std.testing.expect(!requiresCudaDecodeGraphBeforeEagerFallback(.cuda, false, true, 1, false, false));
+    try std.testing.expect(!requiresCudaDecodeGraphBeforeEagerFallback(.metal, true, true, 1, false, false));
+    try std.testing.expect(!requiresCudaDecodeGraphBeforeEagerFallback(.cuda, true, false, 1, false, false));
+    try std.testing.expect(!requiresCudaDecodeGraphBeforeEagerFallback(.cuda, true, true, 2, false, false));
+    try std.testing.expect(!requiresCudaDecodeGraphBeforeEagerFallback(.cuda, true, true, 1, true, false));
+    try std.testing.expect(!requiresCudaDecodeGraphBeforeEagerFallback(.cuda, true, true, 1, false, true));
 }
 
 test "cuda prefill greedy token path is pure greedy only" {

@@ -474,6 +474,7 @@
       "correctness_evidence_path": "",
       "benchmark_evidence_path": "",
       "benchmark_mode": "",
+      "target_fingerprint": 12235806616289468765,
       "production_enabled": false,
       "promotion_ready": false,
       "promotion_blocker": "production_disabled"
@@ -499,6 +500,7 @@
       "correctness_evidence_path": "src/ops/cuda/generated/evidence/q4_0_mmv_benchmark.json",
       "benchmark_evidence_path": "src/ops/cuda/generated/evidence/q4_0_mmv_benchmark.json",
       "benchmark_mode": "sequential",
+      "target_fingerprint": 12235806616289468765,
       "production_enabled": true,
       "promotion_ready": true,
       "promotion_blocker": "none"
@@ -524,6 +526,7 @@
       "correctness_evidence_path": "src/ops/cuda/generated/evidence/q4_0_mm_benchmark.json",
       "benchmark_evidence_path": "src/ops/cuda/generated/evidence/q4_0_mm_benchmark.json",
       "benchmark_mode": "sequential",
+      "target_fingerprint": 12235806616289468765,
       "production_enabled": true,
       "promotion_ready": true,
       "promotion_blocker": "none"
@@ -549,6 +552,7 @@
       "correctness_evidence_path": "src/ops/cuda/generated/evidence/q4_0_pair_benchmark.json",
       "benchmark_evidence_path": "src/ops/cuda/generated/evidence/q4_0_pair_benchmark.json",
       "benchmark_mode": "sequential",
+      "target_fingerprint": 12235806616289468765,
       "production_enabled": true,
       "promotion_ready": true,
       "promotion_blocker": "none"
@@ -574,6 +578,7 @@
       "correctness_evidence_path": "src/ops/cuda/generated/evidence/q4_0_pair_q8_benchmark.json",
       "benchmark_evidence_path": "src/ops/cuda/generated/evidence/q4_0_pair_q8_benchmark.json",
       "benchmark_mode": "sequential",
+      "target_fingerprint": 12235806616289468765,
       "production_enabled": true,
       "promotion_ready": true,
       "promotion_blocker": "none"
@@ -599,6 +604,7 @@
       "correctness_evidence_path": "src/ops/cuda/generated/evidence/q4_0_down_q8_benchmark.json",
       "benchmark_evidence_path": "src/ops/cuda/generated/evidence/q4_0_down_q8_benchmark.json",
       "benchmark_mode": "sequential",
+      "target_fingerprint": 12235806616289468765,
       "production_enabled": true,
       "promotion_ready": true,
       "promotion_blocker": "none"
@@ -615,6 +621,7 @@
       "correctness_evidence_path": "src/ops/cuda/generated/evidence/q4_0_mmv_benchmark.json",
       "benchmark_evidence_path": "src/ops/cuda/generated/evidence/q4_0_mmv_benchmark.json",
       "benchmark_mode": "sequential",
+      "target_fingerprint": 12235806616289468765,
       "repeat_runs": 3,
       "correctness_passed": true,
       "benchmark_passed": true,
@@ -630,6 +637,7 @@
       "correctness_evidence_path": "src/ops/cuda/generated/evidence/q4_0_mm_benchmark.json",
       "benchmark_evidence_path": "src/ops/cuda/generated/evidence/q4_0_mm_benchmark.json",
       "benchmark_mode": "sequential",
+      "target_fingerprint": 12235806616289468765,
       "repeat_runs": 3,
       "correctness_passed": true,
       "benchmark_passed": true,
@@ -645,6 +653,7 @@
       "correctness_evidence_path": "src/ops/cuda/generated/evidence/q4_0_pair_benchmark.json",
       "benchmark_evidence_path": "src/ops/cuda/generated/evidence/q4_0_pair_benchmark.json",
       "benchmark_mode": "sequential",
+      "target_fingerprint": 12235806616289468765,
       "repeat_runs": 3,
       "correctness_passed": true,
       "benchmark_passed": true,
@@ -660,6 +669,7 @@
       "correctness_evidence_path": "src/ops/cuda/generated/evidence/q4_0_pair_q8_benchmark.json",
       "benchmark_evidence_path": "src/ops/cuda/generated/evidence/q4_0_pair_q8_benchmark.json",
       "benchmark_mode": "sequential",
+      "target_fingerprint": 12235806616289468765,
       "repeat_runs": 3,
       "correctness_passed": true,
       "benchmark_passed": true,
@@ -675,6 +685,7 @@
       "correctness_evidence_path": "src/ops/cuda/generated/evidence/q4_0_down_q8_benchmark.json",
       "benchmark_evidence_path": "src/ops/cuda/generated/evidence/q4_0_down_q8_benchmark.json",
       "benchmark_mode": "sequential",
+      "target_fingerprint": 12235806616289468765,
       "repeat_runs": 3,
       "correctness_passed": true,
       "benchmark_passed": true,

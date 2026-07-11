@@ -6415,7 +6415,12 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     defer std.testing.allocator.free(stale_slow_fallback_summary);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_slow_fallback_summary, false, true, null));
 
-    const promoted_artifact = quant_kernel_compiler.first_generated_matmul_artifacts[1];
+    const promoted_artifact = blk: {
+        for (quant_kernel_compiler.first_generated_matmul_artifacts) |artifact| {
+            if (artifact.backend == .metal and artifact.production_enabled) break :blk artifact;
+        }
+        return error.MissingPromotedMetalArtifact;
+    };
     const cases_value = parsed.value.object.get("cases").?;
     var found_promoted_artifact_case = false;
     for (cases_value.array.items) |case_value| {

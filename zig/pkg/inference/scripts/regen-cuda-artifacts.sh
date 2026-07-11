@@ -166,6 +166,23 @@ required_symbols=(
   termite_gqa_attention_prefill_fast_f32
   termite_gqa_attention_decode_scalars_f32
   antfly_gqa_attention_decode_scalars_hd256_f32_v1
+  antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1
+  antfly_gqa_attention_decode_split_kv_hd256_f32_stage2_v1
+  antfly_gqa_attention_decode_scalars_hd512_f32_v1
+  antfly_gqa_attention_decode_split_kv_hd512_f32_stage1_v1
+  antfly_gqa_attention_decode_split_kv_hd512_f32_stage2_v1
+  antfly_gqa_attention_decode_scalars_split2_hd256_f32_v1
+  antfly_gqa_attention_decode_split2_kv_hd256_f32_stage1_v1
+  antfly_gqa_attention_decode_split2_kv_hd256_f32_stage2_v1
+  antfly_gqa_attention_decode_scalars_split2_hd512_f32_v1
+  antfly_gqa_attention_decode_split2_kv_hd512_f32_stage1_v1
+  antfly_gqa_attention_decode_split2_kv_hd512_f32_stage2_v1
+  antfly_gqa_attention_decode_scalars_split4_hd256_f32_v1
+  antfly_gqa_attention_decode_split4_kv_hd256_f32_stage1_v1
+  antfly_gqa_attention_decode_split4_kv_hd256_f32_stage2_v1
+  antfly_gqa_attention_decode_scalars_split4_hd512_f32_v1
+  antfly_gqa_attention_decode_split4_kv_hd512_f32_stage1_v1
+  antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1
   termite_kv_write_suffix_decode_scalars_f32
   termite_gqa_attention_decode_turboquant_fast_f32
   termite_gqa_attention_prefill_turboquant_fast_f32
@@ -225,6 +242,13 @@ required_symbols=(
   termite_linear_q4_0_q8_1_f32_tile4_w8_rows4
   termite_linear_q4_0_q8_1_f32_tile4_w8_rows8_c4
   termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows
+  antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1
+  antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1
+  antfly_q4_0_down_q8_1_e2b_6144_mmv_v1
+  antfly_q4_0_down_q8_1_e2b_12288_mmv_v1
+  antfly_q4_0_q8_1_argmax_rows_stage1_tile8_v1
+  antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1
+  antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1
   termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn
   termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn
   termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2
@@ -273,8 +297,8 @@ required_symbols=(
 check_required_symbols() {
   local file="$1"
   for symbol in "${required_symbols[@]}"; do
-    if ! grep -q "$symbol" "$file"; then
-      printf 'error: generated PTX is missing symbol %s\n' "$symbol" >&2
+    if ! grep -a -q "$symbol" "$file"; then
+      printf 'error: generated CUDA artifact is missing symbol %s\n' "$symbol" >&2
       exit 1
     fi
   done
@@ -330,6 +354,7 @@ build_fatbin() {
     printf 'error: generated fatbin is empty\n' >&2
     exit 1
   fi
+  check_required_symbols "$tmp_fatbin"
   if [ -n "$cuobjdump" ]; then
     dump="$("$cuobjdump" --dump-elf "$tmp_fatbin" 2>/dev/null || true)"
     for arch in sm_75 sm_80 sm_89 sm_90 sm_100 sm_110 sm_120; do
@@ -349,6 +374,7 @@ build_sm89() {
     printf 'error: generated sm89 cubin is empty\n' >&2
     exit 1
   fi
+  check_required_symbols "$tmp_sm89"
   if [ -n "$cuobjdump" ]; then
     dump="$("$cuobjdump" --dump-elf "$tmp_sm89" 2>/dev/null || true)"
     if ! grep -q "sm_89" <<<"$dump"; then

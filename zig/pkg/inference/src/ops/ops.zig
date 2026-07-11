@@ -963,9 +963,9 @@ pub const ComputeBackend = struct {
         return op(self.ptr, input);
     }
 
-    pub fn debugCudaGraphPrepareFinalHiddenReplayInput(self: *const ComputeBackend, label: []const u8, input: CT) !?CT {
+    pub fn debugCudaGraphPrepareFinalHiddenReplayInput(self: *const ComputeBackend, label: []const u8, input: CT, kv_seq_len: usize) !?CT {
         const op = self.vtable.debugCudaGraphPrepareFinalHiddenReplayInput orelse return null;
-        return op(self.ptr, label, input);
+        return op(self.ptr, label, input, kv_seq_len);
     }
 
     pub fn debugCudaGraphPrepareFinalHiddenReplayAuxInput(self: *const ComputeBackend, input: CT) !?CT {
@@ -1028,7 +1028,7 @@ pub const ComputeBackend = struct {
         debugCudaGraphRegisterFinalHiddenReplayBoundary: ?*const fn (ctx: *anyopaque, input: CT, output: CT) anyerror!void = null,
         debugCudaGraphRegisterFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!void = null,
         debugCudaGraphRegisterFinalHiddenReplayAuxInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!void = null,
-        debugCudaGraphPrepareFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, label: []const u8, input: CT) anyerror!?CT = null,
+        debugCudaGraphPrepareFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, label: []const u8, input: CT, kv_seq_len: usize) anyerror!?CT = null,
         debugCudaGraphPrepareFinalHiddenReplayAuxInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
         debugCudaGraphReplayFinalHidden: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
         debugCudaGraphReplayFinalHiddenDiscard: ?*const fn (ctx: *anyopaque, input: CT) anyerror!bool = null,

@@ -267,9 +267,13 @@ pub fn build(b: *std.Build) void {
     const inference_internal_mod = runtime_graph.inference_internal_mod;
 
     const exe = runtime_build.addStandaloneExecutable(b, runtime_graph, target, optimize, "", link_libc);
+    const install_exe = b.addInstallArtifact(exe, .{
+        .dest_sub_path = "antfly-inference",
+    });
+    b.getInstallStep().dependOn(&install_exe.step);
 
     const run_exe = b.addRunArtifact(exe);
-    run_exe.step.dependOn(b.getInstallStep());
+    run_exe.step.dependOn(&install_exe.step);
     if (b.args) |args| {
         run_exe.addArgs(args);
     }
@@ -284,6 +288,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    quant_kernel_codegen_exe.root_module.addImport("build_options", build_options_mod);
+    quant_kernel_codegen_exe.root_module.link_libc = link_libc;
     const quant_kernel_codegen_check = b.addRunArtifact(quant_kernel_codegen_exe);
     if (b.args) |args| {
         quant_kernel_codegen_check.addArgs(args);
@@ -461,6 +467,113 @@ pub fn build(b: *std.Build) void {
     });
     const cuda_artifacts_check_step = b.step("cuda-artifacts-check", "Verify checked-in CUDA artifacts with CUDA 13.2");
     cuda_artifacts_check_step.dependOn(&cuda_artifacts_freshness_check.step);
+
+    const quant_kernel_cuda_attention_diff_step = b.step(
+        "quant-kernel-cuda-attention-diff",
+        "Run raw handwritten-vs-generated CUDA decode-attention differential checks",
+    );
+    if (enable_cuda and targetRunsOnBuildHost(b, target)) {
+        const quant_kernel_cuda_attention_diff_exe = b.addExecutable(.{
+            .name = "antfly-quant-kernel-cuda-attention-diff",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/quant_kernel_cuda_attention_diff.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        quant_kernel_cuda_attention_diff_exe.root_module.addImport("build_options", build_options_mod);
+        quant_kernel_cuda_attention_diff_exe.root_module.link_libc = true;
+        const run_quant_kernel_cuda_attention_diff = b.addRunArtifact(quant_kernel_cuda_attention_diff_exe);
+        if (b.args) |args| run_quant_kernel_cuda_attention_diff.addArgs(args);
+        run_quant_kernel_cuda_attention_diff.step.dependOn(&cuda_artifact_source_policy_check.step);
+        quant_kernel_cuda_attention_diff_step.dependOn(&run_quant_kernel_cuda_attention_diff.step);
+    } else {
+        const cuda_attention_diff_unavailable = b.addFail(
+            "quant-kernel-cuda-attention-diff requires a host CUDA build; pass -Dcuda=true",
+        );
+        quant_kernel_cuda_attention_diff_step.dependOn(&cuda_attention_diff_unavailable.step);
+    }
+
+    const quant_kernel_cuda_paged_attention_diff_step = b.step(
+        "quant-kernel-cuda-paged-attention-diff",
+        "Run raw production-vs-generated paged CUDA decode-attention differential checks",
+    );
+    if (enable_cuda and targetRunsOnBuildHost(b, target)) {
+        const compile_score_prework_hd256 = b.addSystemCommand(&.{
+            "bash",
+            "scripts/compile-generated-cuda-candidate.sh",
+        });
+        compile_score_prework_hd256.addFileArg(b.path("src/ops/cuda/generated/attention_decode_score_prework_hd256.cu"));
+        const score_prework_hd256_cubin = compile_score_prework_hd256.addOutputFileArg("attention_decode_score_prework_hd256.sm89.cubin");
+
+        const compile_score_prework_hd512 = b.addSystemCommand(&.{
+            "bash",
+            "scripts/compile-generated-cuda-candidate.sh",
+        });
+        compile_score_prework_hd512.addFileArg(b.path("src/ops/cuda/generated/attention_decode_score_prework_hd512.cu"));
+        const score_prework_hd512_cubin = compile_score_prework_hd512.addOutputFileArg("attention_decode_score_prework_hd512.sm89.cubin");
+
+        const quant_kernel_cuda_paged_attention_diff_exe = b.addExecutable(.{
+            .name = "antfly-quant-kernel-cuda-paged-attention-diff",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/quant_kernel_cuda_paged_attention_diff.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        quant_kernel_cuda_paged_attention_diff_exe.root_module.addImport("build_options", build_options_mod);
+        quant_kernel_cuda_paged_attention_diff_exe.root_module.link_libc = true;
+        const quant_kernel_cuda_paged_attention_diff_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/quant_kernel_cuda_paged_attention_diff.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        quant_kernel_cuda_paged_attention_diff_tests.root_module.addImport("build_options", build_options_mod);
+        quant_kernel_cuda_paged_attention_diff_tests.root_module.link_libc = true;
+        const run_quant_kernel_cuda_paged_attention_diff_tests = b.addRunArtifact(quant_kernel_cuda_paged_attention_diff_tests);
+        const run_quant_kernel_cuda_paged_attention_diff = b.addRunArtifact(quant_kernel_cuda_paged_attention_diff_exe);
+        run_quant_kernel_cuda_paged_attention_diff.addArg("--candidate-hd256");
+        run_quant_kernel_cuda_paged_attention_diff.addFileArg(score_prework_hd256_cubin);
+        run_quant_kernel_cuda_paged_attention_diff.addArg("--candidate-hd512");
+        run_quant_kernel_cuda_paged_attention_diff.addFileArg(score_prework_hd512_cubin);
+        if (b.args) |args| run_quant_kernel_cuda_paged_attention_diff.addArgs(args);
+        run_quant_kernel_cuda_paged_attention_diff.step.dependOn(&cuda_artifact_source_policy_check.step);
+        run_quant_kernel_cuda_paged_attention_diff.step.dependOn(&run_quant_kernel_cuda_paged_attention_diff_tests.step);
+        quant_kernel_cuda_paged_attention_diff_step.dependOn(&run_quant_kernel_cuda_paged_attention_diff.step);
+    } else {
+        const cuda_paged_attention_diff_unavailable = b.addFail(
+            "quant-kernel-cuda-paged-attention-diff requires a host CUDA build; pass -Dcuda=true",
+        );
+        quant_kernel_cuda_paged_attention_diff_step.dependOn(&cuda_paged_attention_diff_unavailable.step);
+    }
+
+    const quant_kernel_cuda_ffn_diff_step = b.step(
+        "quant-kernel-cuda-ffn-diff",
+        "Run raw handwritten-vs-generated CUDA exact F32 E2B FFN differential checks",
+    );
+    if (enable_cuda and targetRunsOnBuildHost(b, target)) {
+        const quant_kernel_cuda_ffn_diff_exe = b.addExecutable(.{
+            .name = "antfly-quant-kernel-cuda-ffn-diff",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/quant_kernel_cuda_ffn_diff.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        quant_kernel_cuda_ffn_diff_exe.root_module.addImport("build_options", build_options_mod);
+        quant_kernel_cuda_ffn_diff_exe.root_module.link_libc = true;
+        const run_quant_kernel_cuda_ffn_diff = b.addRunArtifact(quant_kernel_cuda_ffn_diff_exe);
+        if (b.args) |args| run_quant_kernel_cuda_ffn_diff.addArgs(args);
+        run_quant_kernel_cuda_ffn_diff.step.dependOn(&cuda_artifact_source_policy_check.step);
+        quant_kernel_cuda_ffn_diff_step.dependOn(&run_quant_kernel_cuda_ffn_diff.step);
+    } else {
+        const cuda_ffn_diff_unavailable = b.addFail(
+            "quant-kernel-cuda-ffn-diff requires a host CUDA build; pass -Dcuda=true",
+        );
+        quant_kernel_cuda_ffn_diff_step.dependOn(&cuda_ffn_diff_unavailable.step);
+    }
 
     const quant_kernel_local_check_step = b.step("quant-kernel-local-check", "Run local quant kernel compiler readiness checks");
     const quant_kernel_metal_local_check_step = b.step("quant-kernel-metal-local-check", "Run local Metal quant kernel compiler readiness checks");

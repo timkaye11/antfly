@@ -15,7 +15,11 @@
 // Antfly inference: ML service for embeddings, chunking, and reranking.
 // Zig implementation with ONNX Runtime, Metal, CUDA, WASM, and native backends.
 
+const std = @import("std");
 const build_options = @import("build_options");
+
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn unsetenv(name: [*:0]const u8) c_int;
 
 pub const backends = @import("backends/backends.zig");
 pub const sentencepiece = @import("inference_tokenizer").sentencepiece;
@@ -68,6 +72,8 @@ pub const compare_generate = @import("cli/compare_generate.zig");
 pub const native_smoke = @import("native_smoke.zig");
 pub const cuda_info = @import("cuda_info.zig");
 pub const cuda_microbench = @import("bench/cuda_microbench.zig");
+pub const cuda_attention_diff = @import("quant_kernel_cuda_attention_diff.zig");
+pub const cuda_ffn_diff = @import("quant_kernel_cuda_ffn_diff.zig");
 pub const metal_runtime = @import("backends/metal_runtime.zig");
 pub const native_compute = struct {
     pub const native = @import("ops/native_compute.zig");
@@ -127,10 +133,108 @@ test {
     _ = native_smoke;
     _ = cuda_info;
     _ = cuda_microbench;
+    _ = cuda_attention_diff;
+    _ = cuda_ffn_diff;
     _ = native_compute;
     if (build_options.enable_cuda) {
         _ = native_compute.cuda;
         _ = @import("ops/cuda/kernels.zig");
     }
     _ = @import("ml");
+}
+
+test "non-device-scalar GQA attention never returns generated decode" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const buffer_mod = @import("ops/cuda/buffer.zig");
+    const context_mod = @import("ops/cuda/context.zig");
+    const driver_mod = @import("ops/cuda/driver.zig");
+    const kernels_mod = @import("ops/cuda/kernels.zig");
+    const Mocks = struct {
+        fn setCurrent(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
+            return driver_mod.CUDA_SUCCESS;
+        }
+
+        fn launchKernel(
+            _: driver_mod.CUfunction,
+            _: c_uint,
+            _: c_uint,
+            _: c_uint,
+            _: c_uint,
+            _: c_uint,
+            _: c_uint,
+            _: c_uint,
+            _: driver_mod.CUstream,
+            _: ?[*]?*anyopaque,
+            _: ?[*]?*anyopaque,
+        ) callconv(.c) driver_mod.CUresult {
+            return driver_mod.CUDA_SUCCESS;
+        }
+    };
+
+    const env_name = "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE";
+    const old_value = std.c.getenv(env_name);
+    const old_value_copy = if (old_value) |value| try std.testing.allocator.dupeZ(u8, std.mem.span(value)) else null;
+    defer {
+        if (old_value_copy) |value| {
+            _ = setenv(env_name, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(env_name);
+        }
+    }
+    try std.testing.expectEqual(@as(c_int, 0), setenv(env_name, "1", 1));
+
+    const fake_function: driver_mod.CUfunction = @ptrFromInt(1);
+    var module: kernels_mod.KernelModule = .{
+        .gqa_attention_f32 = fake_function,
+        .gqa_attention_decode_f32 = fake_function,
+    };
+    var ctx = context_mod.CudaContext{
+        .driver = .{ .lib = undefined, .fns = undefined },
+        .device = 0,
+        .ctx = @ptrFromInt(1),
+        .stream = @ptrFromInt(1),
+        .info = .{},
+    };
+    ctx.driver.fns.cuCtxSetCurrent = &Mocks.setCurrent;
+    ctx.driver.fns.cuLaunchKernel = &Mocks.launchKernel;
+
+    const buffer = buffer_mod.DeviceBuffer{ .ptr = 1, .len = 256 * @sizeOf(f32) };
+    const kind = try module.launchGqaAttentionF32(
+        &ctx,
+        buffer,
+        buffer,
+        buffer,
+        buffer,
+        .{},
+        .{},
+        1,
+        1,
+        1,
+        1,
+        1,
+        256,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+    );
+    try std.testing.expectEqual(kernels_mod.GqaAttentionLaunchKind.decode, kind);
+    try std.testing.expect(kind != .decode_generated);
+    try std.testing.expectEqual(@as(usize, 1), ctx.stats.kernel_launches);
+}
+
+test "raw CUDA attention differential surface reports output drift" {
+    const reference = [_]f32{ 0.0, 1.0, -2.0, 4.0 };
+    const candidate = [_]f32{ -0.0, 1.0000001, -2.0, 3.5 };
+    const stats = try cuda_attention_diff.compareOutputs(&reference, &candidate);
+    try std.testing.expectEqual(@as(usize, 3), stats.bitwise_mismatch_count);
+    try std.testing.expectEqual(@as(usize, 0), stats.first_mismatch_index.?);
+    try std.testing.expect(stats.max_abs >= 0.5);
+    try std.testing.expect(stats.max_ulp > 0);
+    try std.testing.expectError(error.InvalidHeadDim, cuda_attention_diff.parseConfig(&.{ "--head-dim", "128" }));
 }
