@@ -294,6 +294,7 @@ fn mergeArtifactRepairResult(dst: *db_mod.types.ArtifactRepairResult, src: db_mo
     dst.failed += src.failed;
     dst.unsupported += src.unsupported;
     dst.unresolved += src.unresolved;
+    dst.in_progress += src.in_progress;
     dst.indexes_rebuilt += src.indexes_rebuilt;
     dst.indexes_degraded += src.indexes_degraded;
     dst.debt_remaining = dst.debt_remaining or src.debt_remaining;
@@ -342,6 +343,9 @@ fn artifactRepairRunRequestForShard(
         .limit = limit,
         .cursor = cursor,
         .force = req.force,
+        .repair_job_id = req.repair_job_id,
+        .repair_attempt_id = req.repair_attempt_id,
+        .repair_cancel_base_uri = req.repair_cancel_base_uri,
     };
 }
 
@@ -353,6 +357,9 @@ test "artifact repair shard run request preserves repair target" {
         .limit = 10,
         .cursor = "idx_b",
         .force = true,
+        .repair_job_id = 42,
+        .repair_attempt_id = 7,
+        .repair_cancel_base_uri = "http://node-a",
     }, 2, "idx_c");
 
     try std.testing.expectEqual(db_mod.types.RepairTarget.index, shard_req.target);
@@ -361,6 +368,9 @@ test "artifact repair shard run request preserves repair target" {
     try std.testing.expectEqual(@as(u32, 2), shard_req.limit);
     try std.testing.expectEqualStrings("idx_c", shard_req.cursor.?);
     try std.testing.expect(shard_req.force);
+    try std.testing.expectEqual(@as(u64, 42), shard_req.repair_job_id.?);
+    try std.testing.expectEqual(@as(u64, 7), shard_req.repair_attempt_id.?);
+    try std.testing.expectEqualStrings("http://node-a", shard_req.repair_cancel_base_uri.?);
 }
 
 fn cloneArtifactRepairIssueAlloc(alloc: std.mem.Allocator, issue: db_mod.types.ArtifactRepairIssue) !db_mod.types.ArtifactRepairIssue {
@@ -425,6 +435,7 @@ fn parseArtifactRepairResultAlloc(alloc: std.mem.Allocator, body: []const u8) !d
         .failed = parsed.value.failed,
         .unsupported = parsed.value.unsupported,
         .unresolved = parsed.value.unresolved,
+        .in_progress = parsed.value.in_progress,
         .indexes_rebuilt = parsed.value.indexes_rebuilt,
         .indexes_degraded = parsed.value.indexes_degraded,
         .limit = parsed.value.limit,
@@ -735,6 +746,7 @@ pub const ProvisionedTableWriteCache = struct {
         auto_bulk_ingest_finish_requested: bool = false,
 
         fn detachRuntimeHooks(self: *Entry) void {
+            self.db.setQueryVisibilityHook(null);
             self.db.setResolutionCandidateSource(null);
             self.db.setEntitySink(null);
             self.db.setPromotionOwner(null);
@@ -2884,6 +2896,13 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             req: db_mod.types.ArtifactRepairRunRequest,
         ) anyerror!?db_mod.types.ArtifactRepairResult = null,
+        repair_artifact_issues_controlled: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.ArtifactRepairRunRequest,
+            options: db_mod.types.ArtifactRepairRunOptions,
+        ) anyerror!?db_mod.types.ArtifactRepairResult = null,
         update_document_artifact_child_range_placement: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -2930,6 +2949,14 @@ pub const TableWriteSource = struct {
             group_id: u64,
             table_name: []const u8,
             req: db_mod.types.ArtifactRepairRunRequest,
+        ) anyerror!?db_mod.types.ArtifactRepairResult = null,
+        repair_artifact_issues_group_local_controlled: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.ArtifactRepairRunRequest,
+            options: db_mod.types.ArtifactRepairRunOptions,
         ) anyerror!?db_mod.types.ArtifactRepairResult = null,
         update_document_artifact_child_range_placement_group_local: ?*const fn (
             ptr: *anyopaque,
@@ -3250,6 +3277,20 @@ pub const TableWriteSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, req);
     }
 
+    pub fn repairArtifactIssuesControlled(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+        options: db_mod.types.ArtifactRepairRunOptions,
+    ) !?db_mod.types.ArtifactRepairResult {
+        const fn_ptr = self.vtable.repair_artifact_issues_controlled orelse {
+            if (options.cancelled()) return error.Canceled;
+            return try self.repairArtifactIssues(alloc, table_name, req);
+        };
+        return try fn_ptr(self.ptr, alloc, table_name, req, options);
+    }
+
     pub fn listArtifactRepairIssuesGroupLocal(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -3270,6 +3311,21 @@ pub const TableWriteSource = struct {
     ) !?db_mod.types.ArtifactRepairResult {
         const fn_ptr = self.vtable.repair_artifact_issues_group_local orelse return null;
         return try fn_ptr(self.ptr, alloc, group_id, table_name, req);
+    }
+
+    pub fn repairArtifactIssuesGroupLocalControlled(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+        options: db_mod.types.ArtifactRepairRunOptions,
+    ) !?db_mod.types.ArtifactRepairResult {
+        const fn_ptr = self.vtable.repair_artifact_issues_group_local_controlled orelse {
+            if (options.cancelled()) return error.Canceled;
+            return try self.repairArtifactIssuesGroupLocal(alloc, group_id, table_name, req);
+        };
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, options);
     }
 
     pub fn updateDocumentArtifactChildRangePlacement(
@@ -3469,8 +3525,10 @@ pub const BoundTableWriteSource = struct {
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
                 .list_artifact_repair_issues = listArtifactRepairIssues,
                 .repair_artifact_issues = repairArtifactIssues,
+                .repair_artifact_issues_controlled = repairArtifactIssuesControlled,
                 .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
                 .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
+                .repair_artifact_issues_group_local_controlled = repairArtifactIssuesGroupLocalControlled,
                 .update_document_artifact_child_range_placement = updateDocumentArtifactChildRangePlacement,
                 .apply_document_artifact_child_range_batch = applyDocumentArtifactChildRangeBatch,
                 .apply_document_artifact_child_range_batch_group_local = applyDocumentArtifactChildRangeBatchGroupLocal,
@@ -3552,6 +3610,18 @@ pub const BoundTableWriteSource = struct {
         return try self.db.repairArtifactIssuesWithRequest(alloc, req);
     }
 
+    fn repairArtifactIssuesControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+        options: db_mod.types.ArtifactRepairRunOptions,
+    ) !?db_mod.types.ArtifactRepairResult {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        return try self.db.repairArtifactIssuesWithRequestOptions(alloc, req, options);
+    }
+
     fn listArtifactRepairIssuesGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -3572,6 +3642,18 @@ pub const BoundTableWriteSource = struct {
     ) !?db_mod.types.ArtifactRepairResult {
         _ = group_id;
         return try repairArtifactIssues(ptr, alloc, table_name, req);
+    }
+
+    fn repairArtifactIssuesGroupLocalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+        options: db_mod.types.ArtifactRepairRunOptions,
+    ) !?db_mod.types.ArtifactRepairResult {
+        _ = group_id;
+        return try repairArtifactIssuesControlled(ptr, alloc, table_name, req, options);
     }
 
     fn updateDocumentArtifactChildRangePlacement(
@@ -6580,10 +6662,11 @@ pub const ProvisionedTableWriteSource = struct {
         // only load query-visible index state when the cheap snapshot is
         // clearly missing dense visibility for existing primary documents.
         const snapshot_cache = self.runtime_status_cache orelse return null;
-        const cached = (try snapshot_cache.snapshot(alloc, table_name)) orelse return null;
-        if (!runtimeStatusesNeedColdVisibilityRefresh(&cached)) return cached;
-        var owned_cached = cached;
-        owned_cached.deinit(alloc);
+        var cached = (try snapshot_cache.snapshot(alloc, table_name)) orelse return null;
+        const needs_cold_refresh = runtimeStatusesNeedColdVisibilityRefresh(&cached);
+        self.overlayManagedWriterReplayTargetsBestEffort(table_name, &cached);
+        if (!needs_cold_refresh) return cached;
+        cached.deinit(alloc);
 
         var recovered = (try snapshotLocalTableRuntimeStatusesUncachedMode(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, .status_only)) orelse return null;
         errdefer recovered.deinit(alloc);
@@ -6593,6 +6676,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
         markRecoveredRuntimeStatuses(&recovered);
         for (recovered.items) |item| try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, item);
+        self.overlayManagedWriterReplayTargetsBestEffort(table_name, &recovered);
         return recovered;
     }
 
@@ -7719,12 +7803,14 @@ pub const ProvisionedTableWriteSource = struct {
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
                 .list_artifact_repair_issues = listArtifactRepairIssues,
                 .repair_artifact_issues = repairArtifactIssues,
+                .repair_artifact_issues_controlled = repairArtifactIssuesControlled,
                 .update_document_artifact_child_range_placement = updateDocumentArtifactChildRangePlacement,
                 .apply_document_artifact_child_range_batch = applyDocumentArtifactChildRangeBatch,
                 .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
                 .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
                 .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
                 .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
+                .repair_artifact_issues_group_local_controlled = repairArtifactIssuesGroupLocalControlled,
                 .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
                 .apply_document_artifact_child_range_batch_group_local = applyDocumentArtifactChildRangeBatchGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
@@ -7827,6 +7913,7 @@ pub const ProvisionedTableWriteSource = struct {
             }
             const seed_create_table_writer = self.seed_create_table_writers and self.write_cache != null;
             const open_mode: ManagedDbOpenMode = if (seed_create_table_writer) .default else .startup_catch_up;
+            const effective_ha_mirror = haMirrorForManagedDbOpenMode(open_mode, self.ha_async_mirror);
             var opened: ?db_mod.DB = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                 alloc,
                 path,
@@ -7844,6 +7931,10 @@ pub const ProvisionedTableWriteSource = struct {
                 .{
                     .inference_api_url = self.inference_api_url,
                     .drain_resolver_backfill = false,
+                    .ha_write_gate = self.ha_write_gate,
+                    .ha_async_effect_mirror = effective_ha_mirror,
+                    .ha_async_batch_mirror = effective_ha_mirror,
+                    .ha_async_metadata_mirror = effective_ha_mirror,
                 },
             );
             defer if (opened) |*db| db.close();
@@ -8196,6 +8287,25 @@ pub const ProvisionedTableWriteSource = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
+
+        // A merged batch is only correct when the waiters touch disjoint
+        // keys: DB batch application resolves writes before deletes
+        // regardless of request order, so cross-waiter same-key merging
+        // would invert enqueue order (an earlier delete beating a later
+        // write), and collapsing ops per key would acknowledge a waiter
+        // whose operation was never validated or applied. On any overlap,
+        // fall back to applying the waiters individually in enqueue order,
+        // which preserves per-key last-operation-wins and per-waiter error
+        // isolation.
+        const overlap = coalescedEntriesShareKeys(arena_alloc, entries) catch |err| {
+            self.finishCoalescedEntries(entries, err);
+            return;
+        };
+        if (overlap) {
+            self.applyCoalescedEntriesIndividually(alloc, table_name, entries);
+            return;
+        }
+
         var merged = GroupBatch{ .group_id = group_id };
         merged.writes.ensureTotalCapacity(arena_alloc, totalCoalescedWrites(entries)) catch |err| {
             self.finishCoalescedEntries(entries, err);
@@ -8242,6 +8352,26 @@ pub const ProvisionedTableWriteSource = struct {
             };
             self.finishCoalescedEntry(entry, apply_err);
         }
+    }
+
+    // True when any key appears more than once across the coalesced waiters'
+    // writes and deletes (including twice within one waiter's batch).
+    fn coalescedEntriesShareKeys(
+        arena_alloc: std.mem.Allocator,
+        entries: []const *WriteCoalesceEntry,
+    ) !bool {
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        for (entries) |entry| {
+            for (entry.group.writes.items) |write| {
+                const gop = try seen.getOrPut(arena_alloc, write.key);
+                if (gop.found_existing) return true;
+            }
+            for (entry.group.deletes.items) |key| {
+                const gop = try seen.getOrPut(arena_alloc, key);
+                if (gop.found_existing) return true;
+            }
+        }
+        return false;
     }
 
     fn totalCoalescedWrites(entries: []const *WriteCoalesceEntry) usize {
@@ -8413,17 +8543,16 @@ pub const ProvisionedTableWriteSource = struct {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         if (self.write_cache) |cache| {
-            const deadline_ns = platform_time.monotonicNs() + 30 * std.time.ns_per_s;
-            var cached = while (true) {
-                break self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null) catch |err| switch (err) {
-                    error.LsmRootWriterAlreadyOpen => {
-                        if (platform_time.monotonicNs() >= deadline_ns) return err;
-                        sleepNs(10 * std.time.ns_per_ms);
-                        continue;
-                    },
-                    else => return err,
-                };
-            };
+            const target_generation = self.visibleRootGeneration(group_id);
+            var cached = try self.getOrOpenCachedDbForLocalMutation(
+                alloc,
+                cache,
+                path,
+                group_id,
+                target_generation,
+                table_name,
+                true,
+            );
             defer cached.deinit(alloc);
             return try backupManagedDbShard(alloc, cached.db, path, group_id, plan);
         }
@@ -9363,8 +9492,29 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         req: db_mod.types.ArtifactRepairRunRequest,
     ) !?db_mod.types.ArtifactRepairResult {
+        return try repairArtifactIssuesWithOptions(ptr, alloc, table_name, req, .{});
+    }
+
+    fn repairArtifactIssuesControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+        options: db_mod.types.ArtifactRepairRunOptions,
+    ) !?db_mod.types.ArtifactRepairResult {
+        return try repairArtifactIssuesWithOptions(ptr, alloc, table_name, req, options);
+    }
+
+    fn repairArtifactIssuesWithOptions(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+        options: db_mod.types.ArtifactRepairRunOptions,
+    ) !?db_mod.types.ArtifactRepairResult {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (self.localWriteOwnerSource()) |owner| return try owner.repairArtifactIssues(alloc, table_name, req);
+        if (self.localWriteOwnerSource()) |owner| return try owner.repairArtifactIssuesControlled(alloc, table_name, req, options);
+        if (options.cancelled()) return error.Canceled;
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
@@ -9394,6 +9544,7 @@ pub const ProvisionedTableWriteSource = struct {
         errdefer total.deinit(alloc);
         var groups_scanned: usize = 0;
         for (group_ids[start_index..], start_index..) |group_id, idx| {
+            if (options.cancelled()) return error.Canceled;
             if (groups_scanned >= artifact_repair_max_groups_per_request) {
                 total.has_more = true;
                 total.debt_remaining = true;
@@ -9407,11 +9558,11 @@ pub const ProvisionedTableWriteSource = struct {
                 break;
             }
             const remaining: u32 = if (req.limit == 0) 0 else @intCast(req.limit - @as(u32, @intCast(total.scanned)));
-            var result = (try repairArtifactIssuesGroupLocal(ptr, alloc, group_id, table_name, artifactRepairRunRequestForShard(
+            var result = (try repairArtifactIssuesGroupLocalControlled(ptr, alloc, group_id, table_name, artifactRepairRunRequestForShard(
                 req,
                 remaining,
                 if (idx == start_index) start_cursor else null,
-            ))) orelse continue;
+            ), options)) orelse continue;
             defer result.deinit(alloc);
             groups_scanned += 1;
             result.groups_scanned += 1;
@@ -9774,8 +9925,31 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         req: db_mod.types.ArtifactRepairRunRequest,
     ) !?db_mod.types.ArtifactRepairResult {
+        return try repairArtifactIssuesGroupLocalWithOptions(ptr, alloc, group_id, table_name, req, .{});
+    }
+
+    fn repairArtifactIssuesGroupLocalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+        options: db_mod.types.ArtifactRepairRunOptions,
+    ) !?db_mod.types.ArtifactRepairResult {
+        return try repairArtifactIssuesGroupLocalWithOptions(ptr, alloc, group_id, table_name, req, options);
+    }
+
+    fn repairArtifactIssuesGroupLocalWithOptions(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+        options: db_mod.types.ArtifactRepairRunOptions,
+    ) !?db_mod.types.ArtifactRepairResult {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (self.localWriteOwnerSource()) |owner| return try owner.repairArtifactIssuesGroupLocal(alloc, group_id, table_name, req);
+        if (self.localWriteOwnerSource()) |owner| return try owner.repairArtifactIssuesGroupLocalControlled(alloc, group_id, table_name, req, options);
+        if (options.cancelled()) return error.Canceled;
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
@@ -9787,7 +9961,7 @@ pub const ProvisionedTableWriteSource = struct {
         var result = if (self.write_cache) |cache| blk: {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
             defer cached.deinit(alloc);
-            break :blk try cached.db.repairArtifactIssuesWithRequest(alloc, req);
+            break :blk try cached.db.repairArtifactIssuesWithRequestOptions(alloc, req, options);
         } else blk: {
             const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
             defer if (indexes_json) |value| alloc.free(value);
@@ -9811,7 +9985,7 @@ pub const ProvisionedTableWriteSource = struct {
                 try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            const group_result = try db.repairArtifactIssuesWithRequest(alloc, req);
+            const group_result = try db.repairArtifactIssuesWithRequestOptions(alloc, req, options);
             if (group_result.scanned > 0) self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
             break :blk group_result;
         };
@@ -10224,12 +10398,14 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
                 .list_artifact_repair_issues = listArtifactRepairIssues,
                 .repair_artifact_issues = repairArtifactIssues,
+                .repair_artifact_issues_controlled = repairArtifactIssuesControlled,
                 .update_document_artifact_child_range_placement = updateDocumentArtifactChildRangePlacement,
                 .apply_document_artifact_child_range_batch = applyDocumentArtifactChildRangeBatch,
                 .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
                 .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
                 .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
                 .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
+                .repair_artifact_issues_group_local_controlled = repairArtifactIssuesGroupLocalControlled,
                 .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
                 .apply_document_artifact_child_range_batch_group_local = applyDocumentArtifactChildRangeBatchGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
@@ -10866,7 +11042,28 @@ pub const HostedProvisionedTableWriteSource = struct {
         table_name: []const u8,
         req: db_mod.types.ArtifactRepairRunRequest,
     ) !?db_mod.types.ArtifactRepairResult {
+        return try repairArtifactIssuesWithOptions(ptr, alloc, table_name, req, .{});
+    }
+
+    fn repairArtifactIssuesControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+        options: db_mod.types.ArtifactRepairRunOptions,
+    ) !?db_mod.types.ArtifactRepairResult {
+        return try repairArtifactIssuesWithOptions(ptr, alloc, table_name, req, options);
+    }
+
+    fn repairArtifactIssuesWithOptions(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+        options: db_mod.types.ArtifactRepairRunOptions,
+    ) !?db_mod.types.ArtifactRepairResult {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (options.cancelled()) return error.Canceled;
         const group_ids = try table_catalog.resolveGroupsForSpanEventually(
             alloc,
             self.catalog,
@@ -10890,8 +11087,14 @@ pub const HostedProvisionedTableWriteSource = struct {
 
         var total = db_mod.types.ArtifactRepairResult{ .limit = req.limit };
         errdefer total.deinit(alloc);
+        var repair_cancel_base_uri: ?[]u8 = null;
+        defer if (repair_cancel_base_uri) |uri| alloc.free(uri);
+        if (req.repair_job_id != null and req.repair_attempt_id != null) {
+            repair_cancel_base_uri = try self.router.nodeBaseUri(alloc, self.router.localNodeId());
+        }
         var groups_scanned: usize = 0;
         for (group_ids[start_index..], start_index..) |group_id, idx| {
+            if (options.cancelled()) return error.Canceled;
             if (groups_scanned >= artifact_repair_max_groups_per_request) {
                 total.has_more = true;
                 total.debt_remaining = true;
@@ -10906,15 +11109,24 @@ pub const HostedProvisionedTableWriteSource = struct {
             }
             const remaining: u32 = if (req.limit == 0) 0 else @intCast(req.limit - @as(u32, @intCast(total.scanned)));
             const group_req = artifactRepairRunRequestForShard(req, remaining, if (idx == start_index) start_cursor else null);
-            const body = try std.json.Stringify.valueAlloc(alloc, group_req, .{ .emit_null_optional_fields = false });
-            defer alloc.free(body);
 
             var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
             var group_result = if (resolved_route) |*route| blk: {
                 defer route.deinit(alloc);
                 break :blk switch (route.*) {
-                    .local => (try repairArtifactIssuesGroupLocal(ptr, alloc, group_id, table_name, group_req)) orelse continue,
+                    .local => (try repairArtifactIssuesGroupLocalControlled(ptr, alloc, group_id, table_name, group_req, options)) orelse continue,
                     .remote => |remote| remote_blk: {
+                        if (options.cancelled()) return error.Canceled;
+                        var remote_req = group_req;
+                        if (repair_cancel_base_uri) |uri| {
+                            remote_req.repair_cancel_base_uri = uri;
+                        } else {
+                            remote_req.repair_job_id = null;
+                            remote_req.repair_attempt_id = null;
+                            remote_req.repair_cancel_base_uri = null;
+                        }
+                        const body = try std.json.Stringify.valueAlloc(alloc, remote_req, .{ .emit_null_optional_fields = false });
+                        defer alloc.free(body);
                         var client = http_client.ApiHttpClient.init(alloc, self.executor);
                         var response = client.fetchGroupArtifactRepairRun(remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
                             else => return err,
@@ -10923,7 +11135,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                         break :remote_blk try parseArtifactRepairResultAlloc(alloc, response.body);
                     },
                 };
-            } else (try repairArtifactIssuesGroupLocal(ptr, alloc, group_id, table_name, group_req)) orelse continue;
+            } else (try repairArtifactIssuesGroupLocalControlled(ptr, alloc, group_id, table_name, group_req, options)) orelse continue;
             defer group_result.deinit(alloc);
             groups_scanned += 1;
             group_result.groups_scanned += 1;
@@ -11123,14 +11335,37 @@ pub const HostedProvisionedTableWriteSource = struct {
         table_name: []const u8,
         req: db_mod.types.ArtifactRepairRunRequest,
     ) !?db_mod.types.ArtifactRepairResult {
+        return try repairArtifactIssuesGroupLocalWithOptions(ptr, alloc, group_id, table_name, req, .{});
+    }
+
+    fn repairArtifactIssuesGroupLocalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+        options: db_mod.types.ArtifactRepairRunOptions,
+    ) !?db_mod.types.ArtifactRepairResult {
+        return try repairArtifactIssuesGroupLocalWithOptions(ptr, alloc, group_id, table_name, req, options);
+    }
+
+    fn repairArtifactIssuesGroupLocalWithOptions(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.ArtifactRepairRunRequest,
+        options: db_mod.types.ArtifactRepairRunOptions,
+    ) !?db_mod.types.ArtifactRepairResult {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (options.cancelled()) return error.Canceled;
         self.invalidateManagedCache(table_name);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
         defer cached.deinit(hosted_cache.write_cache.alloc);
-        var result = try cached.db.repairArtifactIssuesWithRequest(alloc, req);
+        var result = try cached.db.repairArtifactIssuesWithRequestOptions(alloc, req, options);
         errdefer result.deinit(alloc);
         if (result.scanned > 0) {
             try drainManagedDbBeforeClose(cached.db);
@@ -11908,11 +12143,10 @@ fn reconcileCachedLocalTableIndexDrop(
                 return err;
             },
         };
-        cached.db.runUntilIdle() catch |err| {
-            cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
-            cached_active = false;
-            return err;
-        };
+        // DB.deleteIndex removes the target worker synchronously. Do not wait for
+        // global derived/maintenance idle here: unrelated managed workers may be
+        // rate-limited or retrying, and delete-index must stay a bounded metadata
+        // operation instead of inheriting that background latency.
         publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db) catch |err| {
             cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
             cached_active = false;
@@ -13603,6 +13837,13 @@ fn overlayRuntimeStatusReplayTargetFromDb(status: *runtime_status.LocalTableRunt
     const async_stats = db.snapshotAsyncIndexingStats();
     status.stats.async_indexing = async_stats;
     for (status.stats.indexes) |*item| {
+        const prior_backfill_active = item.backfill_active;
+        const prior_backfill_progress = item.backfill_progress;
+        const preserve_non_replay_backfill = runtimeStatusHasNonReplayBackfillSignal(item.*);
+        if (db.executor.appliedSequence(item.name)) |live_applied| {
+            item.replay_applied_sequence = @max(item.replay_applied_sequence, live_applied);
+            item.replay_target_sequence = @max(item.replay_target_sequence, live_applied);
+        }
         if (target_sequence > item.replay_target_sequence) {
             item.replay_target_sequence = target_sequence;
             item.catch_up_target_sequence = target_sequence;
@@ -13610,11 +13851,39 @@ fn overlayRuntimeStatusReplayTargetFromDb(status: *runtime_status.LocalTableRunt
         if (item.catch_up_target_sequence < item.replay_target_sequence) {
             item.catch_up_target_sequence = item.replay_target_sequence;
         }
-        item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence;
         item.catch_up_applied_sequence = item.replay_applied_sequence;
         item.catch_up_active = item.kind == .dense_vector and async_stats.dense_catch_up.active;
         item.catch_up_phase = if (item.kind == .dense_vector) async_stats.dense_catch_up.phase else .idle;
+        item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence;
+        if (item.catch_up_active or item.replay_catch_up_required) {
+            item.backfill_active = true;
+            if (item.replay_target_sequence > 0) {
+                item.backfill_progress = @min(
+                    1.0,
+                    @as(f64, @floatFromInt(item.replay_applied_sequence)) /
+                        @as(f64, @floatFromInt(item.replay_target_sequence)),
+                );
+            }
+        } else if (prior_backfill_active and preserve_non_replay_backfill) {
+            item.backfill_active = true;
+            item.backfill_progress = prior_backfill_progress;
+        } else {
+            item.backfill_active = false;
+            if (item.replay_target_sequence > 0) item.backfill_progress = 1.0;
+        }
     }
+}
+
+fn runtimeStatusHasNonReplayBackfillSignal(item: db_mod.types.DBIndexStats) bool {
+    if (!item.backfill_active) return false;
+    if (item.load_error != null) return true;
+    if (item.enrichment_failed) return true;
+    if (item.repair_degraded or item.repair_issue_count != 0) return true;
+    if (!item.repair_summary_ready) return true;
+    if (!std.mem.eql(u8, item.projection_checkpoint_status, "clean")) return true;
+    if (item.algebraic_active_progress != null) return true;
+    if (item.algebraic_adaptive_backfilling_count != 0) return true;
+    return false;
 }
 
 fn startupCatchUpStatsForPhase(
@@ -15635,8 +15904,13 @@ test "bound table write source enforces string length and object cardinality" {
 
 test "bound table write source backs up and restores a local table" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-backup-restore";
-    const backup_root = "/tmp/antfly-api-table-backup-restore-out";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/api-table-backup-restore/table-db", .{tmp.sub_path});
+    defer alloc.free(path);
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/api-table-backup-restore/backup", .{tmp.sub_path});
+    defer alloc.free(backup_root);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -15693,8 +15967,13 @@ test "bound table write source backs up and restores a local table" {
 
 test "bound table write source backs up and restores a portable local table" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-portable-backup-restore";
-    const backup_root = "/tmp/antfly-api-table-portable-backup-restore-out";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/api-table-portable-backup-restore/table-db", .{tmp.sub_path});
+    defer alloc.free(path);
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/api-table-portable-backup-restore/backup", .{tmp.sub_path});
+    defer alloc.free(backup_root);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -18794,12 +19073,16 @@ const ProvisionedWriteCoalesceProbe = struct {
 const ProvisionedWriteCoalesceBatchWorker = struct {
     source: *ProvisionedTableWriteSource,
     key: []const u8,
-    value: []const u8,
+    value: []const u8 = "",
+    delete: bool = false,
     err: ?anyerror = null,
 
     fn run(self: *@This()) void {
+        const writes: []const db_mod.types.BatchWrite = if (self.delete) &.{} else &.{.{ .key = self.key, .value = self.value }};
+        const deletes: []const []const u8 = if (self.delete) &.{self.key} else &.{};
         _ = self.source.source().batch(std.heap.page_allocator, "docs", .{
-            .writes = &.{.{ .key = self.key, .value = self.value }},
+            .writes = writes,
+            .deletes = deletes,
             .sync_level = .write,
         }) catch |err| {
             self.err = err;
@@ -18861,6 +19144,112 @@ test "provisioned table write source coalesces same-group waiters" {
     var gamma = (try cached.db.lookup(alloc, "doc:c", .{})).?;
     defer gamma.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, gamma.json, "\"gamma\"") != null);
+}
+
+test "provisioned table write source preserves same-key delete then write across coalesced waiters" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-provisioned-batch-coalesce-delete-write-order";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+    defer alloc.free(db_path);
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(path, ProvisionedWriteCoalesceTestCatalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+
+    _ = try source.source().createTable(alloc, "docs", .{});
+
+    var probe = ProvisionedWriteCoalesceProbe{};
+    test_before_batch_execution_hook = .{ .ptr = &probe, .run = ProvisionedWriteCoalesceProbe.beforeBatch };
+    defer test_before_batch_execution_hook = null;
+
+    var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{\"title\":\"alpha\"}" };
+    const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    while (!probe.first_entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    var second = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:order", .delete = true };
+    var third = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:order", .value = "{\"title\":\"beta\"}" };
+    const second_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&second});
+    try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 1);
+    const third_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&third});
+
+    try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
+    probe.release_first.store(true, .release);
+
+    first_thread.join();
+    second_thread.join();
+    third_thread.join();
+    if (first.err) |err| return err;
+    if (second.err) |err| return err;
+    if (third.err) |err| return err;
+
+    var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, db_path, 7001, "docs", .default, null, null);
+    defer cached.deinit(alloc);
+    try drainManagedDbBeforeClose(cached.db);
+    var order = (try cached.db.lookup(alloc, "doc:order", .{})).?;
+    defer order.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, order.json, "\"beta\"") != null);
+}
+
+test "provisioned table write coalescer isolates invalid waiter on same-key overlap" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-provisioned-batch-coalesce-overlap-isolation";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+    defer alloc.free(db_path);
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(path, ProvisionedWriteCoalesceTestCatalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+
+    _ = try source.source().createTable(alloc, "docs", .{});
+
+    var probe = ProvisionedWriteCoalesceProbe{};
+    test_before_batch_execution_hook = .{ .ptr = &probe, .run = ProvisionedWriteCoalesceProbe.beforeBatch };
+    defer test_before_batch_execution_hook = null;
+
+    var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{\"title\":\"alpha\"}" };
+    const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    while (!probe.first_entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    // An invalid write and a later delete of the same key land in one
+    // coalesced flush. Same-key merging must not swallow the invalid
+    // operation: its waiter has to receive the validation error while the
+    // delete succeeds independently.
+    var second = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:order", .value = "{not json" };
+    var third = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:order", .delete = true };
+    const second_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&second});
+    try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 1);
+    const third_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&third});
+
+    try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
+    probe.release_first.store(true, .release);
+
+    first_thread.join();
+    second_thread.join();
+    third_thread.join();
+    if (first.err) |err| return err;
+    try std.testing.expect(second.err != null);
+    if (third.err) |err| return err;
+
+    var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, db_path, 7001, "docs", .default, null, null);
+    defer cached.deinit(alloc);
+    try drainManagedDbBeforeClose(cached.db);
+    try std.testing.expect((try cached.db.lookup(alloc, "doc:order", .{})) == null);
 }
 
 test "provisioned table write coalescer isolates failed waiters" {
@@ -22395,24 +22784,6 @@ test "provisioned runtime status overlays live writer replay target without repu
     const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
     defer alloc.free(path);
 
-    {
-        var seeded = try openManagedDbWithIndexesJsonAndCacheMode(
-            alloc,
-            path,
-            "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
-            null,
-            null,
-            0,
-            null,
-            .writer_no_replay,
-        );
-        defer seeded.close();
-        _ = try seeded.batch(.{
-            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,2]}" }},
-            .sync_level = .write,
-        });
-    }
-
     var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
     defer snapshot_cache.deinit();
     var write_cache = ProvisionedTableWriteCache.init(alloc);
@@ -22422,27 +22793,20 @@ test "provisioned runtime status overlays live writer replay target without repu
     source.write_cache = &write_cache;
     source.runtime_status_cache = &snapshot_cache;
 
-    {
-        var initial = try openManagedDbWithIndexesJsonAndCacheMode(
-            alloc,
-            path,
-            "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
-            null,
-            null,
-            0,
-            null,
-            .writer_no_replay,
-        );
-        defer initial.close();
-        try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &initial));
-    }
-
     var cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
     defer cached.deinit(alloc);
+    _ = try cached.db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,2]}" }},
+        .sync_level = .write,
+    });
+    try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
+    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
+
     _ = try cached.db.batch(.{
         .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\",\"embedding\":[2,3]}" }},
         .sync_level = .write,
     });
+    try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
 
     var cached_only = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer cached_only.deinit(alloc);
@@ -22453,7 +22817,284 @@ test "provisioned runtime status overlays live writer replay target without repu
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(@as(usize, 1), statuses.items[0].stats.indexes.len);
     try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_target_sequence);
-    try std.testing.expect(statuses.items[0].stats.indexes[0].replay_catch_up_required);
+    try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_applied_sequence);
+    try std.testing.expect(!statuses.items[0].stats.indexes[0].replay_catch_up_required);
+    try std.testing.expect(!statuses.items[0].stats.indexes[0].backfill_active);
+}
+
+test "provisioned runtime status live replay overlay preserves cold dense visibility refresh" {
+    const alloc = std.testing.allocator;
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-live-overlay-cold-visibility", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    source.write_cache = &write_cache;
+    source.runtime_status_cache = &snapshot_cache;
+
+    var cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
+    defer cached.deinit(alloc);
+    _ = try cached.db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,2]}" }},
+        .sync_level = .full_index,
+    });
+    try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
+
+    var sparse = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7001,
+        .metadata = .{
+            .updated_at_ns = 1,
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+        },
+        .stats = .{
+            .doc_count = 1,
+            .index_count = 1,
+            .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
+        },
+    };
+    defer sparse.deinit(alloc);
+    sparse.stats.indexes[0] = .{
+        .name = try alloc.dupe(u8, "dv_v1"),
+        .kind = .dense_vector,
+    };
+    try snapshot_cache.upsertGroupStatus("docs", sparse);
+
+    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items[0].stats.indexes.len);
+    try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.doc_count);
+    try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.indexes[0].doc_count);
+    try std.testing.expect(statuses.items[0].stats.indexes[0].replay_target_sequence > 0);
+}
+
+test "provisioned runtime status live replay overlay clears ambiguous replay-only backfill" {
+    const alloc = std.testing.allocator;
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-live-replay-clear-ambiguous-backfill", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    source.write_cache = &write_cache;
+    source.runtime_status_cache = &snapshot_cache;
+
+    var cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
+    defer cached.deinit(alloc);
+    _ = try cached.db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,2]}" }},
+        .sync_level = .write,
+    });
+    try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
+    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
+
+    {
+        var cached_statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
+        defer cached_statuses.deinit(alloc);
+        cached_statuses.items[0].stats.indexes[0].replay_applied_sequence = 1;
+        cached_statuses.items[0].stats.indexes[0].replay_target_sequence = 2;
+        cached_statuses.items[0].stats.indexes[0].replay_catch_up_required = true;
+        cached_statuses.items[0].stats.indexes[0].catch_up_active = false;
+        cached_statuses.items[0].stats.indexes[0].catch_up_phase = .idle;
+        cached_statuses.items[0].stats.indexes[0].catch_up_applied_sequence = 1;
+        cached_statuses.items[0].stats.indexes[0].catch_up_target_sequence = 2;
+        cached_statuses.items[0].stats.indexes[0].backfill_active = true;
+        cached_statuses.items[0].stats.indexes[0].backfill_progress = 0.256;
+        try snapshot_cache.upsertGroupStatus("docs", cached_statuses.items[0]);
+    }
+
+    _ = try cached.db.batch(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\",\"embedding\":[2,3]}" }},
+        .sync_level = .write,
+    });
+    try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
+
+    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_target_sequence);
+    try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_applied_sequence);
+    try std.testing.expect(!statuses.items[0].stats.indexes[0].replay_catch_up_required);
+    try std.testing.expect(!statuses.items[0].stats.indexes[0].backfill_active);
+    try std.testing.expectEqual(@as(f64, 1.0), statuses.items[0].stats.indexes[0].backfill_progress);
+}
+
+test "provisioned runtime status live replay overlay preserves non-replay backfill" {
+    const alloc = std.testing.allocator;
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-live-replay-preserve-backfill", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    source.write_cache = &write_cache;
+    source.runtime_status_cache = &snapshot_cache;
+
+    var cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
+    defer cached.deinit(alloc);
+    _ = try cached.db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,2]}" }},
+        .sync_level = .write,
+    });
+    try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
+    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
+
+    {
+        var cached_statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
+        defer cached_statuses.deinit(alloc);
+        cached_statuses.items[0].stats.indexes[0].replay_applied_sequence = 1;
+        cached_statuses.items[0].stats.indexes[0].replay_target_sequence = 1;
+        cached_statuses.items[0].stats.indexes[0].replay_catch_up_required = false;
+        cached_statuses.items[0].stats.indexes[0].catch_up_active = false;
+        cached_statuses.items[0].stats.indexes[0].catch_up_phase = .idle;
+        cached_statuses.items[0].stats.indexes[0].catch_up_applied_sequence = 1;
+        cached_statuses.items[0].stats.indexes[0].catch_up_target_sequence = 1;
+        cached_statuses.items[0].stats.indexes[0].backfill_active = true;
+        cached_statuses.items[0].stats.indexes[0].backfill_progress = 0.42;
+        cached_statuses.items[0].stats.indexes[0].projection_checkpoint_status = "rebuilding";
+        try snapshot_cache.upsertGroupStatus("docs", cached_statuses.items[0]);
+    }
+
+    _ = try cached.db.batch(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\",\"embedding\":[2,3]}" }},
+        .sync_level = .write,
+    });
+    try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
+
+    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_target_sequence);
+    try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_applied_sequence);
+    try std.testing.expect(!statuses.items[0].stats.indexes[0].replay_catch_up_required);
+    try std.testing.expect(statuses.items[0].stats.indexes[0].backfill_active);
+    try std.testing.expectEqual(@as(f64, 0.42), statuses.items[0].stats.indexes[0].backfill_progress);
 }
 
 test "provisioned table read source serves profiled dense query without runtime status warmup" {

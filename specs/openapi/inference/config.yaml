@@ -231,81 +231,14 @@ components:
     # Chunking Types - reference existing schemas
     Chunk:
       $ref: "../shared/chunking.yaml#/components/schemas/Chunk"
-
     VADOptions:
-      type: object
-      description: "Options for Voice Activity Detection (VAD) based audio segmentation. Antfly inference-specific."
-      properties:
-        min_silence_duration_ms:
-          type: integer
-          description: "Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300."
-        min_speech_duration_ms:
-          type: integer
-          description: "Minimum speech duration (ms) for a segment to be kept. Shorter segments are discarded. Default: 250."
-        speech_pad_ms:
-          type: integer
-          description: "Padding (ms) added before and after detected speech. Default: 30."
-        max_segment_duration_ms:
-          type: integer
-          description: "Maximum segment duration (ms). Segments longer than this are split. Useful for Whisper-compatible chunking. Default: 30000."
-
+      $ref: "../shared/chunking.yaml#/components/schemas/VADOptions"
     AudioChunkConfig:
-      type: object
-      description: "Audio chunking configuration for Antfly inference, including VAD options."
-      properties:
-        window_duration_ms:
-          type: integer
-          description: "Window duration in milliseconds for fixed-window audio chunking (default: 30000)."
-        overlap_duration_ms:
-          type: integer
-          description: "Overlap duration in milliseconds between audio chunks (default: 0)."
-        vad:
-          $ref: "#/components/schemas/VADOptions"
-
+      $ref: "../shared/chunking.yaml#/components/schemas/InferenceAudioChunkConfig"
     ChunkConfig:
-      type: object
-      description: |
-        Configuration for chunking requests to Antfly inference.
-        Combines shared text options with inference-specific audio/VAD options.
-      properties:
-        model:
-          type: string
-          description: "The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/."
-          default: "fixed"
-          example: "fixed"
-        max_chunks:
-          type: integer
-          description: "Maximum number of chunks to generate per document."
-        threshold:
-          type: number
-          format: float
-          description: "Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models."
-        text:
-          $ref: "../shared/chunking.yaml#/components/schemas/TextChunkOptions"
-        audio:
-          $ref: "#/components/schemas/AudioChunkConfig"
-
+      $ref: "../shared/chunking.yaml#/components/schemas/InferenceChunkConfig"
     ChunkRequest:
-      type: object
-      properties:
-        input:
-          description: |
-            Input content to chunk. Supports two formats:
-            - Text string: `"This is a long document..."` (backward compatible)
-            - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}`
-            - ContentPart: `{"type": "text", "text": "..."}`
-          oneOf:
-            - type: string
-              description: "Text to chunk (backward compatible)"
-            - $ref: "#/components/schemas/ContentPart"
-              description: "Content part (text or media)"
-        text:
-          type: string
-          deprecated: true
-          description: "DEPRECATED: Use 'input' instead. Text to chunk."
-          example: "This is a long document that needs to be split into smaller chunks..."
-        config:
-          $ref: "#/components/schemas/ChunkConfig"
+      $ref: "../shared/chunking.yaml#/components/schemas/InferenceChunkRequest"
 
     ChunkResponse:
       type: object
@@ -769,6 +702,8 @@ components:
           example: "microsoft/trocr-base-printed"
         images:
           type: array
+          minItems: 1
+          maxItems: 64
           items:
             $ref: "#/components/schemas/ImageURL"
           description: |
@@ -1227,6 +1162,98 @@ components:
           description: List of completion choices (currently always 1)
         usage:
           $ref: "#/components/schemas/GenerateUsage"
+
+    GenerateBatchMode:
+      type: string
+      enum: ["sync"]
+      description: Batch execution mode. Only synchronous batches are implemented.
+
+    GenerateBatchRequest:
+      type: object
+      required:
+        - requests
+      properties:
+        mode:
+          $ref: "#/components/schemas/GenerateBatchMode"
+        requests:
+          type: array
+          minItems: 1
+          maxItems: 128
+          items:
+            $ref: "#/components/schemas/GenerateBatchRequestItem"
+
+    GenerateBatchRequestItem:
+      type: object
+      required:
+        - custom_id
+        - body
+      properties:
+        custom_id:
+          type: string
+          description: Caller-supplied identifier echoed in the result item.
+        body:
+          $ref: "#/components/schemas/GenerateRequest"
+
+    GenerateBatchError:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        retryable:
+          type: boolean
+          default: false
+
+    GenerateBatchResultItem:
+      type: object
+      required:
+        - custom_id
+        - index
+      properties:
+        custom_id:
+          type: string
+        index:
+          type: integer
+          description: Zero-based request index from the submitted batch.
+        response:
+          $ref: "#/components/schemas/GenerateResponse"
+        error:
+          $ref: "#/components/schemas/GenerateBatchError"
+
+    GenerateBatchSummary:
+      type: object
+      required:
+        - total
+        - succeeded
+        - failed
+      properties:
+        total:
+          type: integer
+        succeeded:
+          type: integer
+        failed:
+          type: integer
+
+    GenerateBatchResponse:
+      type: object
+      required:
+        - object
+        - data
+        - summary
+      properties:
+        object:
+          type: string
+          enum: ["generate.batch"]
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/GenerateBatchResultItem"
+        summary:
+          $ref: "#/components/schemas/GenerateBatchSummary"
 
     GenerateChoice:
       type: object
@@ -1816,6 +1843,50 @@ paths:
                 $ref: "#/components/schemas/Error"
         "503":
           description: Generation service unavailable (no models configured)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /generate/batch:
+    post:
+      summary: Generate text for a synchronous batch of requests
+      description: |
+        Runs multiple non-streaming generation requests as one synchronous batch.
+        Compatible native requests for the same model are executed through the
+        native batched KV decoder; unsupported per-item options are returned as
+        per-item errors without failing sibling requests.
+
+        This endpoint implements the synchronous form only. Future async durable
+        batching will use the same request item shape with `mode: async`.
+      operationId: generateBatchContent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenerateBatchRequest"
+      responses:
+        "200":
+          description: Batch generation results in request order
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenerateBatchResponse"
+        "400":
+          description: Invalid batch envelope
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Generation service unavailable
           content:
             application/json:
               schema:

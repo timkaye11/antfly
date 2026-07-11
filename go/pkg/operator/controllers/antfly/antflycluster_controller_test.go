@@ -431,11 +431,11 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 				var payload map[string]any
 				g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
 				g.Expect(payload["slot_name"]).To(Equal("standby-a"))
-				g.Expect(payload["manifest_id"]).To(Equal("base-standby-a-5"))
+				g.Expect(payload["manifest_id"]).To(Equal("base-standby-a-10"))
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-10","action_kind":"base_backup_begin","target":"base-standby-a-10","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-10","backup_lsn":10,"start_record_lsn":10}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected HA admin API request: %s %s", req.Method, req.URL.Path)
@@ -645,6 +645,365 @@ func TestReconcileHAAdminJobsFailsWhenConfiguredAdminTokenEnvVarMissing(t *testi
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("configured HA admin token env var MISSING_HA_ADMIN_TOKEN is empty or unset"))
+}
+
+func TestReconcileHAAdminJobsFallsBackToCLIJobWhenConfiguredAdminTokenEnvVarComesFromEnvFrom(t *testing.T) {
+	g := NewWithT(t)
+	t.Setenv("MISSING_HA_ADMIN_TOKEN", "")
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+					TokenEnvVar:           "MISSING_HA_ADMIN_TOKEN",
+					EnvFrom: []corev1.EnvFromSource{{
+						SecretRef: &corev1.SecretEnvSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						},
+					}},
+				},
+				Runtime: &antflyv1.HARuntimeSpec{
+					AdminTokenEnvVar: "MISSING_HA_ADMIN_TOKEN",
+					AdminTokenSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						Key:                  "token",
+					},
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:         string(haActionResumeSlot),
+					Executor:     string(haActionExecutorAdminAPI),
+					SlotName:     "standby-a",
+					AdminCommand: []string{"slot", "resume", "--slot", "standby-a"},
+					AdminURL:     "http://primary-ha.default.svc:8081",
+					AdminNodeID:  "primary-a",
+					AdminMethod:  "PUT",
+					AdminPath:    "/admin/v1/ha/replication-slots/standby-a/resume",
+				}},
+			},
+		},
+	}
+
+	called := false
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			called = true
+			return nil, fmt.Errorf("unexpected direct admin request: %s %s", req.Method, req.URL.String())
+		})},
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(called).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).NotTo(Equal(haAdminDirectAPIName))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(BeEmpty())
+
+	var jobs batchv1.JobList
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(HaveLen(1))
+	container := jobs.Items[0].Spec.Template.Spec.Containers[0]
+	g.Expect(container.Args).To(Equal([]string{
+		"ha",
+		"--ha-url", "http://primary-ha.default.svc:8081",
+		"--ha-token-env", "MISSING_HA_ADMIN_TOKEN",
+		"--",
+		"slot", "resume", "--slot", "standby-a",
+	}))
+	g.Expect(container.EnvFrom).To(Equal(cluster.Spec.HighAvailability.Admin.EnvFrom))
+	g.Expect(container.Env).To(HaveLen(1))
+	g.Expect(container.Env[0].Name).To(Equal("MISSING_HA_ADMIN_TOKEN"))
+	g.Expect(container.Env[0].ValueFrom).NotTo(BeNil())
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef).NotTo(BeNil())
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Name).To(Equal("ha-admin-token"))
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Key).To(Equal("token"))
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Optional).NotTo(BeNil())
+	g.Expect(*container.Env[0].ValueFrom.SecretKeyRef.Optional).To(BeFalse())
+}
+
+func TestReconcileHAAdminJobsFallsBackToCLIJobWhenConfiguredAdminTokenEnvVarComesFromRuntimeSecret(t *testing.T) {
+	g := NewWithT(t)
+	t.Setenv("MISSING_HA_ADMIN_TOKEN", "")
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+					TokenEnvVar:           "MISSING_HA_ADMIN_TOKEN",
+				},
+				Runtime: &antflyv1.HARuntimeSpec{
+					AdminTokenEnvVar: "MISSING_HA_ADMIN_TOKEN",
+					AdminTokenSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						Key:                  "token",
+					},
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:         string(haActionResumeSlot),
+					Executor:     string(haActionExecutorAdminAPI),
+					SlotName:     "standby-a",
+					AdminCommand: []string{"slot", "resume", "--slot", "standby-a"},
+					AdminURL:     "http://primary-ha.default.svc:8081",
+					AdminNodeID:  "primary-a",
+					AdminMethod:  "PUT",
+					AdminPath:    "/admin/v1/ha/replication-slots/standby-a/resume",
+				}},
+			},
+		},
+	}
+
+	called := false
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			called = true
+			return nil, fmt.Errorf("unexpected direct admin request: %s %s", req.Method, req.URL.String())
+		})},
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(called).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).NotTo(Equal(haAdminDirectAPIName))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(BeEmpty())
+
+	var jobs batchv1.JobList
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(HaveLen(1))
+	container := jobs.Items[0].Spec.Template.Spec.Containers[0]
+	g.Expect(container.EnvFrom).To(BeEmpty())
+	g.Expect(container.Env).To(HaveLen(1))
+	g.Expect(container.Env[0].Name).To(Equal("MISSING_HA_ADMIN_TOKEN"))
+	g.Expect(container.Env[0].ValueFrom).NotTo(BeNil())
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef).NotTo(BeNil())
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Name).To(Equal("ha-admin-token"))
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Key).To(Equal("token"))
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Optional).NotTo(BeNil())
+	g.Expect(*container.Env[0].ValueFrom.SecretKeyRef.Optional).To(BeFalse())
+}
+
+func TestReconcileHAAdminJobsRecoversStaleDirectAPIMissingTokenFailureWithEnvFromFallback(t *testing.T) {
+	g := NewWithT(t)
+	t.Setenv("MISSING_HA_ADMIN_TOKEN", "")
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+					TokenEnvVar:           "MISSING_HA_ADMIN_TOKEN",
+					EnvFrom: []corev1.EnvFromSource{{
+						SecretRef: &corev1.SecretEnvSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						},
+					}},
+				},
+				Runtime: &antflyv1.HARuntimeSpec{
+					AdminTokenEnvVar: "MISSING_HA_ADMIN_TOKEN",
+					AdminTokenSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						Key:                  "token",
+					},
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:          string(haActionResumeSlot),
+					Executor:      string(haActionExecutorAdminAPI),
+					SlotName:      "standby-a",
+					AdminCommand:  []string{"slot", "resume", "--slot", "standby-a"},
+					AdminURL:      "http://primary-ha.default.svc:8081",
+					AdminNodeID:   "primary-a",
+					AdminMethod:   "PUT",
+					AdminPath:     "/admin/v1/ha/replication-slots/standby-a/resume",
+					AdminJobName:  haAdminDirectAPIName,
+					AdminJobPhase: haAdminJobPhaseFailed,
+					AdminError:    "configured HA admin token env var MISSING_HA_ADMIN_TOKEN is empty or unset",
+				}},
+			},
+		},
+	}
+
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).NotTo(Equal(haAdminDirectAPIName))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(BeEmpty())
+
+	var jobs batchv1.JobList
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(HaveLen(1))
+	container := jobs.Items[0].Spec.Template.Spec.Containers[0]
+	g.Expect(container.Env).To(HaveLen(1))
+	g.Expect(container.Env[0].Name).To(Equal("MISSING_HA_ADMIN_TOKEN"))
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Name).To(Equal("ha-admin-token"))
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Key).To(Equal("token"))
+}
+
+func TestHAAdminBearerTokenDoesNotReadRuntimeSecretRef(t *testing.T) {
+	g := NewWithT(t)
+	t.Setenv("MISSING_HA_ADMIN_TOKEN", "")
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Admin: &antflyv1.HAAdminSpec{
+					TokenEnvVar: "MISSING_HA_ADMIN_TOKEN",
+				},
+				Runtime: &antflyv1.HARuntimeSpec{
+					AdminTokenSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						Key:                  "token",
+					},
+				},
+			},
+		},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "ha-admin-token", Namespace: "default"},
+		Data:       map[string][]byte{"token": []byte("secret-token")},
+	}
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, secret).Build(),
+		Scheme: s,
+	}
+
+	_, err := reconciler.haAdminBearerToken(cluster)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("configured HA admin token env var MISSING_HA_ADMIN_TOKEN is empty or unset"))
+}
+
+func TestReconcileHAAdminJobsRecreatesMissingFailedFallbackJob(t *testing.T) {
+	g := NewWithT(t)
+	t.Setenv("MISSING_HA_ADMIN_TOKEN", "")
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:         string(haActionResumeSlot),
+		Executor:     string(haActionExecutorAdminAPI),
+		SlotName:     "standby-a",
+		AdminCommand: []string{"slot", "resume", "--slot", "standby-a"},
+		AdminURL:     "http://primary-ha.default.svc:8081",
+		AdminNodeID:  "primary-a",
+		AdminMethod:  "PUT",
+		AdminPath:    "/admin/v1/ha/replication-slots/standby-a/resume",
+	}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+					TokenEnvVar:           "MISSING_HA_ADMIN_TOKEN",
+					EnvFrom: []corev1.EnvFromSource{{
+						SecretRef: &corev1.SecretEnvSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						},
+					}},
+				},
+				Runtime: &antflyv1.HARuntimeSpec{
+					AdminTokenEnvVar: "MISSING_HA_ADMIN_TOKEN",
+					AdminTokenSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						Key:                  "token",
+					},
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{action},
+			},
+		},
+	}
+	cluster.Status.HAStatus.PlannedActions[0].AdminJobName = haAdminJobName(cluster, action)
+	cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase = haAdminJobPhaseFailed
+
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminJobName(cluster, action)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(BeEmpty())
+
+	var jobs batchv1.JobList
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(HaveLen(1))
+	container := jobs.Items[0].Spec.Template.Spec.Containers[0]
+	g.Expect(container.Env).To(HaveLen(1))
+	g.Expect(container.Env[0].Name).To(Equal("MISSING_HA_ADMIN_TOKEN"))
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Name).To(Equal("ha-admin-token"))
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Key).To(Equal("token"))
 }
 
 func TestHAAdminSDKResponseHelpersPreserveTypedErrors(t *testing.T) {
@@ -2673,8 +3032,8 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 					Name:             "standby-a",
 					InitialLSN:       &initial,
 					AdminURL:         "http://standby-a-ha.default.svc:8081",
-					SeedManifestPath: "/backup/base-standby-a-5.afha",
-					SeedContentRoot:  "/backup/base-standby-a-5",
+					SeedManifestPath: "/backup/base-standby-a-10.afha",
+					SeedContentRoot:  "/backup/base-standby-a-10",
 				}},
 			},
 		},
@@ -2700,26 +3059,26 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-10","action_kind":"base_backup_begin","target":"base-standby-a-10","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-10","backup_lsn":10,"start_record_lsn":10}`)),
 				}, nil
 			case "/admin/v1/ha/base-backups/finish":
 				var body map[string]any
 				g.Expect(json.NewDecoder(req.Body).Decode(&body)).To(Succeed())
-				g.Expect(body).To(HaveKeyWithValue("manifest_path", "/backup/base-standby-a-5.afha"))
+				g.Expect(body).To(HaveKeyWithValue("manifest_path", "/backup/base-standby-a-10.afha"))
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_finish:base-standby-a-5","action_kind":"base_backup_finish","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_finish:base-standby-a-10","action_kind":"base_backup_finish","target":"base-standby-a-10","state":"applied","node_id":"primary-a"},"manifest_id":"base-standby-a-10","backup_lsn":10,"end_record_lsn":10}`)),
 				}, nil
 			case "/admin/v1/ha/standby/bootstrap":
 				var body map[string]any
 				g.Expect(json.NewDecoder(req.Body).Decode(&body)).To(Succeed())
-				g.Expect(body).To(HaveKeyWithValue("manifest_path", "/backup/base-standby-a-5.afha"))
-				g.Expect(body).To(HaveKeyWithValue("content_root", "/backup/base-standby-a-5"))
+				g.Expect(body).To(HaveKeyWithValue("manifest_path", "/backup/base-standby-a-10.afha"))
+				g.Expect(body).To(HaveKeyWithValue("content_root", "/backup/base-standby-a-10"))
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"standby_bootstrap:base-standby-a-5","action_kind":"standby_bootstrap","target":"base-standby-a-5","state":"applied","node_id":"standby-a"},"manifest_id":"base-standby-a-5","backup_lsn":5,"checkpoint_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"standby_bootstrap:base-standby-a-10","action_kind":"standby_bootstrap","target":"base-standby-a-10","state":"applied","node_id":"standby-a"},"manifest_id":"base-standby-a-10","backup_lsn":10,"checkpoint_lsn":10}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected direct HA admin request: %s", req.URL.Path)
@@ -2741,25 +3100,25 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.SlotAction).To(Equal("create"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.SlotName).To(Equal("standby-a"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult).NotTo(BeNil())
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ActionID).To(Equal("base_backup_begin:base-standby-a-5"))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ManifestID).To(Equal("base-standby-a-5"))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.BackupLSN).To(Equal(uint64(5)))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.StartRecordLSN).To(Equal(uint64(5)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ActionID).To(Equal("base_backup_begin:base-standby-a-10"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ManifestID).To(Equal("base-standby-a-10"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.BackupLSN).To(Equal(uint64(10)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.StartRecordLSN).To(Equal(uint64(10)))
 	finish := cluster.Status.HAStatus.PlannedActions[2]
 	g.Expect(finish.Kind).To(Equal(string(haActionFinishStandbySeed)))
 	g.Expect(finish.AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(finish.AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(finish.AdminResult).NotTo(BeNil())
-	g.Expect(finish.AdminResult.ActionID).To(Equal("base_backup_finish:base-standby-a-5"))
-	g.Expect(finish.AdminResult.EndRecordLSN).To(Equal(uint64(5)))
+	g.Expect(finish.AdminResult.ActionID).To(Equal("base_backup_finish:base-standby-a-10"))
+	g.Expect(finish.AdminResult.EndRecordLSN).To(Equal(uint64(10)))
 
 	bootstrap := cluster.Status.HAStatus.PlannedActions[3]
 	g.Expect(bootstrap.Kind).To(Equal(string(haActionBootstrapStandbySeed)))
 	g.Expect(bootstrap.AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(bootstrap.AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(bootstrap.AdminResult).NotTo(BeNil())
-	g.Expect(bootstrap.AdminResult.ActionID).To(Equal("standby_bootstrap:base-standby-a-5"))
-	g.Expect(bootstrap.AdminResult.CheckpointLSN).To(Equal(uint64(5)))
+	g.Expect(bootstrap.AdminResult.ActionID).To(Equal("standby_bootstrap:base-standby-a-10"))
+	g.Expect(bootstrap.AdminResult.CheckpointLSN).To(Equal(uint64(10)))
 	g.Expect(observed).To(Equal([]string{
 		"POST /admin/v1/ha/replication-slots",
 		"POST /admin/v1/ha/base-backups",
@@ -4620,6 +4979,78 @@ func TestHARejoinSDKResultSatisfiesOperatorEvidenceGates(t *testing.T) {
 		}
 	}
 
+	demoteCluster := &antflyv1.AntflyCluster{
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				LastPromotion: &antflyv1.HAPromotionStatus{
+					ClusterID:         9002003,
+					ShardID:           1024863633216429947,
+					TableID:           7062478063073158706,
+					OldPrimaryID:      "primary-a",
+					PromotedStandbyID: "standby-a",
+					ParentTimelineID:  1,
+					ParentEpoch:       1,
+					NewTimelineID:     2,
+					NewEpoch:          2,
+					SwitchLSN:         4,
+					RequiredLSN:       3,
+					ObservedLSN:       3,
+					FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceGeneration:   1,
+					FenceToken:        "ha-fence-token",
+				},
+			},
+		},
+	}
+	demoteAction := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionDemoteFormerPrimary),
+		StandbyName:     "primary-a",
+		TargetLSN:       4,
+		ObservedLSN:     4,
+		RetainedFromLSN: 3,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration: 1,
+		AdminJobName:    haAdminDirectAPIName,
+		AdminNodeID:     "primary-a",
+	}
+	demoteResponse := adminsdk.HARejoinAssessResponse{
+		SchemaVersion: 1,
+		Action: adminsdk.HAActionReceipt{
+			ActionId:   "rejoin_assess:primary-a",
+			ActionKind: adminsdk.HAActionKindRejoinAssess,
+			Target:     "primary-a",
+			State:      adminsdk.HAActionStateAssessed,
+			NodeId:     "primary-a",
+		},
+		Assessment: adminsdk.HARejoinAssessment{
+			Action:            adminsdk.HARejoinActionRejectUnfenced,
+			Reason:            adminsdk.HARejoinReasonNoFence,
+			FormerNodeId:      "primary-a",
+			TargetTimelineId:  1,
+			TargetEpoch:       1,
+			ParentClusterId:   9002003,
+			ParentShardId:     1024863633216429947,
+			ParentTableId:     7062478063073158706,
+			ParentTimelineId:  1,
+			ParentEpoch:       1,
+			ForkLsn:           4,
+			FormerLastLsn:     4,
+			RetainedFromLsn:   3,
+			DataLossDiscarded: false,
+		},
+	}
+	reconciler := &AntflyClusterReconciler{}
+	g.Expect(reconciler.applyHADirectRejoinAssessResultFromSDK(demoteCluster, &demoteAction, demoteResponse)).To(BeTrue())
+	demoteAction.AdminJobName = haAdminDirectAPIName
+	demoteAction.AdminJobPhase = haAdminJobPhaseSucceeded
+	g.Expect(demoteAction.AdminResult).NotTo(BeNil())
+	g.Expect(demoteAction.AdminResult.RejoinAction).To(Equal("reject_unfenced"))
+	g.Expect(haAdminActionSucceededWithStatusEvidence(demoteCluster.Status.HAStatus, demoteAction)).To(BeTrue())
+	g.Expect(demoteCluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
+	g.Expect(demoteCluster.Status.HAStatus.FormerPrimary.Action).To(Equal(string(haActionDemoteFormerPrimary)))
+	g.Expect(demoteCluster.Status.HAStatus.FormerPrimary.Fenced).To(BeFalse())
+	g.Expect(demoteCluster.Status.HAStatus.FormerPrimary.Reason).To(Equal("no_fence"))
+
 	cluster := newRejoinCluster()
 	rewindAction := antflyv1.HAPlannedActionStatus{
 		Kind:            string(haActionRewindFormerPrimary),
@@ -4670,7 +5101,6 @@ func TestHARejoinSDKResultSatisfiesOperatorEvidenceGates(t *testing.T) {
 		},
 	}
 
-	reconciler := &AntflyClusterReconciler{}
 	g.Expect(reconciler.applyHADirectRejoinAssessResultFromSDK(cluster, &rewindAction, response)).To(BeTrue())
 	g.Expect(rewindAction.AdminResult).NotTo(BeNil())
 	g.Expect(rewindAction.AdminResult.RejoinAction).To(Equal("rewind"))
@@ -4678,6 +5108,21 @@ func TestHARejoinSDKResultSatisfiesOperatorEvidenceGates(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.NodeID).To(Equal("primary-a"))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.Action).To(Equal(string(haActionRewindFormerPrimary)))
+
+	staleObservedAction := rewindAction
+	staleObservedAction.AdminResult = nil
+	staleObservedAction.ObservedLSN = 13
+	staleObservedResponse := response
+	staleObservedResponse.Assessment.FormerLastLsn = 12
+	staleObservedResponse.Assessment.DataLossDiscarded = false
+	staleObservedResponse.Rewind.PreviousLastLsn = 12
+	staleObservedResponse.Rewind.CurrentLastLsn = 12
+	staleObservedResponse.Rewind.DiscardedLsnCount = 0
+	staleObservedResponse.Rewind.DataLossDiscarded = false
+	staleObservedCluster := newRejoinCluster()
+	g.Expect(reconciler.applyHADirectRejoinAssessResultFromSDK(staleObservedCluster, &staleObservedAction, staleObservedResponse)).To(BeTrue())
+	g.Expect(staleObservedAction.AdminResult).NotTo(BeNil())
+	g.Expect(staleObservedAction.AdminResult.FormerLastLSN).To(Equal(uint64(12)))
 
 	reseedAction := antflyv1.HAPlannedActionStatus{
 		Kind:            string(haActionReseedFormerPrimary),
@@ -4875,6 +5320,17 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 func TestParseHAAdminActionResultTable(t *testing.T) {
 	g := NewWithT(t)
 
+	slotResume, ok := parseHAAdminActionResultTable(`{"schema_version":1,"action":{"action_id":"replication_slot_resume:standby-a","action_kind":"replication_slot_resume","target":"standby-a","state":"applied","node_id":"primary-a"},"slot_action":"resume","slot":{"slot_name":"standby-a","timeline_id":1,"restart_lsn":0,"received_lsn":0,"applied_lsn":0,"safe_read_lsn":0,"active":true,"reseed_required":false,"last_error":null,"current_lsn":0,"dropped":false}}`)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(slotResume.SchemaVersion).To(Equal(uint32(1)))
+	g.Expect(slotResume.ActionID).To(Equal("replication_slot_resume:standby-a"))
+	g.Expect(slotResume.ActionKind).To(Equal("replication_slot_resume"))
+	g.Expect(slotResume.ActionTarget).To(Equal("standby-a"))
+	g.Expect(slotResume.ActionState).To(Equal("applied"))
+	g.Expect(slotResume.ActionNodeID).To(Equal("primary-a"))
+	g.Expect(slotResume.SlotAction).To(Equal("resume"))
+	g.Expect(slotResume.SlotName).To(Equal("standby-a"))
+
 	finish, ok := parseHAAdminActionResultTable(strings.Join([]string{
 		"result=seed_finish",
 		"action.action_id=base_backup_finish:base-standby-a-5",
@@ -5006,6 +5462,31 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 	g.Expect(rejoin.FormerLastLSN).To(Equal(uint64(13)))
 	g.Expect(rejoin.RetainedFromLSN).To(Equal(uint64(8)))
 	g.Expect(rejoin.DataLossDiscarded).To(BeTrue())
+}
+
+func TestCompletedSlotAdminJobResultSatisfiesReceiptEvidence(t *testing.T) {
+	g := NewWithT(t)
+
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:        string(haActionResumeSlot),
+		SlotName:    "standby-a",
+		AdminNodeID: "primary-a",
+		AdminURL:    "http://primary-ha.default.svc:8081",
+		AdminMethod: "PUT",
+		AdminPath:   "/admin/v1/ha/replication-slots/standby-a/resume",
+	}
+	action.AdminResult = haCompletedSlotAdminJobResult(action)
+
+	g.Expect(action.AdminResult).NotTo(BeNil())
+	g.Expect(action.AdminResult.ActionID).To(Equal("replication_slot_resume:standby-a"))
+	g.Expect(action.AdminResult.ActionKind).To(Equal("replication_slot_resume"))
+	g.Expect(action.AdminResult.ActionTarget).To(Equal("standby-a"))
+	g.Expect(action.AdminResult.ActionState).To(Equal("applied"))
+	g.Expect(action.AdminResult.ActionNodeID).To(Equal("primary-a"))
+	g.Expect(action.AdminResult.SlotAction).To(Equal("resume"))
+	g.Expect(action.AdminResult.SlotName).To(Equal("standby-a"))
+	g.Expect(haActionHasRequiredAdminResult(action)).To(BeTrue())
+	g.Expect(haDirectAdminActionReceiptMatches(action)).To(BeTrue())
 }
 
 func TestParseHARejoinJobResult(t *testing.T) {
