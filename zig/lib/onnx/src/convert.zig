@@ -1187,6 +1187,75 @@ test "Model.convertToGraph preserves large int64 scalar initializer" {
     try std.testing.expect(found);
 }
 
+test "Model.convertToGraph rank-expanding Expand emits a full-rank identity broadcast" {
+    // Regression: `Expand([N] -> [1, 1, N])` must lay the N input values along
+    // the last output axis.  The old converter reshaped the input up to the full
+    // output rank but left broadcast_in_dim's `num_axes`/`broadcast_axes`
+    // describing the ORIGINAL rank-1 input (num_axes=1, axes={2}).  That
+    // inconsistency collapsed every output element onto input[0] at runtime, e.g.
+    // the CLIP ViT class-token became `hidden` copies of class_embedding[0].
+    const allocator = std.testing.allocator;
+
+    var node_inputs = [_][]const u8{ "x", "expand_shape" };
+    var node_outputs = [_][]const u8{"y"};
+    var nodes = [_]NodeProto{
+        .{ .op_type = "Expand", .inputs = &node_inputs, .outputs = &node_outputs },
+    };
+    const shape_values = [_]i64{ 1, 1, 4 };
+    const shape_raw = std.mem.sliceAsBytes(&shape_values);
+    var shape_dims = [_]i64{3};
+    var initializers = [_]TensorProto{
+        .{ .name = "expand_shape", .dims = &shape_dims, .data_type = .int64, .raw_data = shape_raw },
+    };
+
+    var x_dims = [_]proto.TensorShapeProto.Dimension{.{ .dim_value = 4 }};
+    const x_shape_proto = proto.TensorShapeProto{ .dims = &x_dims };
+    const x_tensor_type = proto.TensorTypeProto{ .elem_type = .float32, .shape = x_shape_proto };
+    const x_type = proto.TypeProto{ .tensor_type = x_tensor_type };
+    var input_infos = [_]ValueInfoProto{
+        .{ .name = "x", .type_proto = x_type },
+        .{ .name = "expand_shape" },
+    };
+    var output_infos = [_]ValueInfoProto{.{ .name = "y" }};
+    const graph_proto = GraphProto{
+        .nodes = &nodes,
+        .initializers = &initializers,
+        .inputs = &input_infos,
+        .outputs = &output_infos,
+    };
+    _ = &nodes;
+    _ = &initializers;
+    _ = &input_infos;
+    _ = &output_infos;
+    _ = &x_dims;
+    _ = &shape_dims;
+
+    var model = try Model.init(allocator, .{ .graph = graph_proto });
+    defer {
+        model.output_to_node.deinit(allocator);
+        model.initializer_map.deinit(allocator);
+        model.input_set.deinit(allocator);
+    }
+
+    var result = try model.convertToGraph(allocator);
+    defer result.deinit(allocator);
+
+    var found = false;
+    for (result.graph.nodes.items) |node| {
+        if (node.op != .broadcast_in_dim) continue;
+        found = true;
+        const attrs = node.op.broadcast_in_dim;
+        // The reshaped operand is full-rank [1,1,4], so the broadcast must use an
+        // identity axis mapping over the full output rank, never num_axes=1.
+        try std.testing.expectEqual(@as(u8, 3), attrs.target_shape.rank());
+        try std.testing.expectEqual(@as(u8, 3), attrs.num_axes);
+        try std.testing.expectEqual(@as(u8, 0), attrs.broadcast_axes[0]);
+        try std.testing.expectEqual(@as(u8, 1), attrs.broadcast_axes[1]);
+        try std.testing.expectEqual(@as(u8, 2), attrs.broadcast_axes[2]);
+    }
+    try std.testing.expect(found);
+}
+
 test "Model.convertToGraph errors on missing input" {
     const allocator = std.testing.allocator;
 
