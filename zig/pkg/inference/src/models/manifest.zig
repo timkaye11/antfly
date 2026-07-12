@@ -181,6 +181,11 @@ pub const ModelManifest = struct {
     num_attention_heads: u32 = 12,
     bert_model_type: bert.ModelType = .bert,
     config_model_arch: []const u8 = "",
+    /// Vision encoder input resolution (from `vision_config.image_size`, e.g.
+    /// CLIP 224, SigLIP2 512). 0 = unset (image pipeline falls back to its
+    /// default). Needed because imported-ONNX vision sessions do not carry a
+    /// native ArchSession clip config to source the resolution from.
+    vision_image_size: u32 = 0,
 
     // Pipeline config
     pooling: PoolingStrategy = .mean,
@@ -1165,6 +1170,22 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
             if (tc.object.get("max_position_embeddings")) |v| {
                 if (jsonU32(v)) |val| manifest.max_position_embeddings = val;
             }
+        }
+    }
+
+    // Vision encoder input resolution: `vision_config.image_size` (CLIP/SigLIP),
+    // with a top-level `image_size` fallback. Drives the served image pipeline's
+    // resize target for imported-ONNX vision embedders.
+    if (obj.get("vision_config")) |vc| {
+        if (vc == .object) {
+            if (vc.object.get("image_size")) |v| {
+                if (jsonU32(v)) |val| manifest.vision_image_size = val;
+            }
+        }
+    }
+    if (manifest.vision_image_size == 0) {
+        if (obj.get("image_size")) |v| {
+            if (jsonU32(v)) |val| manifest.vision_image_size = val;
         }
     }
 }

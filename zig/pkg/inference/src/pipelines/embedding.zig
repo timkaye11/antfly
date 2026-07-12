@@ -210,6 +210,7 @@ pub fn applyClipBridge(
 pub const ImagePreprocessProfile = enum {
     default,
     clip,
+    siglip,
 };
 
 pub const EmbeddingConfig = struct {
@@ -854,6 +855,13 @@ pub const EmbeddingPipeline = struct {
                 img_size,
                 image.IMAGENET_MEAN,
                 image.IMAGENET_STD,
+            ),
+            .siglip => try image.preprocessSiglipBatch(
+                alloc,
+                images,
+                img_size,
+                image.SIGLIP_MEAN,
+                image.SIGLIP_STD,
             ),
         };
         defer alloc.free(pixel_values);

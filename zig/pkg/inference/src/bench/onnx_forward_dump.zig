@@ -73,10 +73,22 @@ pub fn main(init: std.process.Init) !void {
     for (0..n) |i| {
         floats[i] = @bitCast(std.mem.readInt(u32, input_bytes[i * 4 ..][0..4], .little));
     }
-    if (n != 1 * 3 * 224 * 224) {
-        std.debug.print("warning: input element count {d} != 150528 (expected [1,3,224,224])\n", .{n});
+    // Infer a square [1,3,S,S] pixel tensor from the element count so this harness
+    // works for any vision resolution (CLIP 224, SigLIP 512, ...). An optional 4th
+    // positional arg overrides the spatial side explicitly.
+    var side: usize = 224;
+    if (args_iter.next()) |side_arg| {
+        side = std.fmt.parseInt(usize, side_arg, 10) catch 224;
+    } else if (n % 3 == 0) {
+        const hw = n / 3;
+        const s: usize = std.math.sqrt(hw);
+        if (s * s == hw) side = s;
     }
-    const shape = [_]i64{ 1, 3, 224, 224 };
+    if (n != 3 * side * side) {
+        std.debug.print("warning: input element count {d} != {d} (expected [1,3,{d},{d}])\n", .{ n, 3 * side * side, side, side });
+    }
+    const shape = [_]i64{ 1, 3, @intCast(side), @intCast(side) };
+    std.debug.print("input shape [1,3,{d},{d}] ({d} elems)\n", .{ side, side, n });
 
     var pv = try Tensor.initFloat32(allocator, "pixel_values", &shape, floats);
     defer pv.deinit();

@@ -816,13 +816,33 @@ pub const LoadedModel = struct {
         }
         if (session_factory.getClipConfig(self.session)) |cfg| {
             pipeline.config.image_size = cfg.image_size;
-            if (cfg.family == .clip) pipeline.config.image_preprocess_profile = .clip;
+            pipeline.config.image_preprocess_profile = switch (cfg.family) {
+                .clip => .clip,
+                .siglip => .siglip,
+            };
         } else if (self.vision_session) |vs| {
             if (session_factory.getClipConfig(vs)) |cfg| {
                 pipeline.config.image_size = cfg.image_size;
-                if (cfg.family == .clip) pipeline.config.image_preprocess_profile = .clip;
+                pipeline.config.image_preprocess_profile = switch (cfg.family) {
+                .clip => .clip,
+                .siglip => .siglip,
+            };
             }
         }
+        // Imported-ONNX vision embedders (e.g. a served SigLIP/CLIP vision ONNX)
+        // do not carry a native ArchSession clip config, so getClipConfig above
+        // returns null for them. Drive the SigLIP image-preprocess profile and
+        // the input resolution from the manifest (config.json / clip_config.json)
+        // instead, so a SigLIP2@512 embedder squashes to 512 with 0.5/0.5 norm.
+        if (std.mem.eql(u8, self.manifest.config_model_arch, "siglip") or
+            std.mem.eql(u8, self.manifest.config_model_arch, "siglip_text_model"))
+        {
+            pipeline.config.image_preprocess_profile = .siglip;
+        }
+        if (self.manifest.vision_image_size > 0) {
+            pipeline.config.image_size = self.manifest.vision_image_size;
+        }
+
         pipeline.vision_session = self.vision_session;
         pipeline.audio_session = self.audio_session;
         pipeline.text_projection = self.text_projection;

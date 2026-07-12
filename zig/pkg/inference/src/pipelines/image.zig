@@ -25,6 +25,11 @@ const shared = antfly_image.processing;
 pub const IMAGENET_MEAN = [3]f32{ 0.48145466, 0.4578275, 0.40821073 };
 pub const IMAGENET_STD = [3]f32{ 0.26862954, 0.26130258, 0.27577711 };
 
+/// SigLIP / SigLIP2 normalization: mean/std 0.5 per channel (maps [0,1] -> [-1,1]).
+/// See `google/siglip2-*` `preprocessor_config.json` (`image_mean`/`image_std`).
+pub const SIGLIP_MEAN = [3]f32{ 0.5, 0.5, 0.5 };
+pub const SIGLIP_STD = [3]f32{ 0.5, 0.5, 0.5 };
+
 pub const Resample = shared.Resample;
 pub const PixelFormat = shared.PixelFormat;
 pub const ImageU8 = shared.ImageU8;
@@ -763,7 +768,7 @@ fn preprocessDecodedClip(
         resized_h = img.height;
         resized_ch = img.channels;
     } else {
-        const buf = try clipResizeBicubic(allocator, img, dims.width, dims.height);
+        const buf = try resizeAntialiasSeparable(allocator, img, dims.width, dims.height, .bicubic);
         resized_owned = buf;
         resized_data = buf;
         resized_w = dims.width;
@@ -787,18 +792,105 @@ fn preprocessDecodedClip(
     }
 }
 
-/// Antialiased separable bicubic resample of a decoded image to `ow`×`oh` u8,
-/// matching PIL's `Image.resize(..., BICUBIC)` (the resampler torchvision uses
-/// for PIL images): separate horizontal then vertical passes over precomputed,
-/// support-scaled, normalized bicubic coefficients with a u8 rounding step
-/// between passes. Caller owns the returned RGB (3-channel) buffer.
-fn clipResizeBicubic(allocator: std.mem.Allocator, img: Image, ow: usize, oh: usize) ![]u8 {
+/// SigLIP canonical preprocessing for a single decoded image: resize the whole
+/// image to `target`×`target` SQUARE (aspect ratio is NOT preserved — SigLIP
+/// squashes to square: no shortest-edge resize and no center crop) with an
+/// antialiased separable **bilinear** resampler (PIL `resample=2` semantics),
+/// rescale by 1/255, and normalize with `mean`/`std` into CHW f32. Matches
+/// HuggingFace `SiglipImageProcessor` (`google/siglip2-base-patch16-512`
+/// `preprocessor_config.json`: `size={512,512}`, `resample=2` (BILINEAR),
+/// `rescale_factor=1/255`, `image_mean`/`image_std`=0.5, RGB).
+fn preprocessDecodedSiglip(
+    allocator: std.mem.Allocator,
+    img: Image,
+    result: []f32,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+) !void {
+    std.debug.assert(target_size > 0);
+    std.debug.assert(img.width > 0 and img.height > 0);
+    const ts: usize = target_size;
+    std.debug.assert(result.len == 3 * ts * ts);
+
+    // Resize the whole image to ts×ts (antialiased separable bilinear), unless
+    // it is already exactly square at the target size.
+    var resized_owned: ?[]u8 = null;
+    defer if (resized_owned) |buf| allocator.free(buf);
+    var resized_data: []const u8 = undefined;
+    var resized_ch: usize = undefined;
+
+    if (img.width == ts and img.height == ts) {
+        resized_data = img.data;
+        resized_ch = img.channels;
+    } else {
+        const buf = try resizeAntialiasSeparable(allocator, img, ts, ts, .bilinear);
+        resized_owned = buf;
+        resized_data = buf;
+        resized_ch = 3;
+    }
+
+    for (0..ts) |y| {
+        const src_row = y * ts;
+        for (0..ts) |x| {
+            const base = (src_row + x) * resized_ch;
+            inline for (0..3) |ch| {
+                const v: f32 = @floatFromInt(resized_data[base + ch]);
+                result[ch * ts * ts + y * ts + x] = (v / 255.0 - mean[ch]) / std_dev[ch];
+            }
+        }
+    }
+}
+
+/// Preprocess SigLIP embedding images to match `SiglipImageProcessor`: square
+/// bilinear resize (no crop) + rescale 1/255 + 0.5/0.5 normalize into CHW f32.
+/// Returns [batch, 3, target_size, target_size]. Use for SigLIP/SigLIP2 image
+/// embeddings (the SigLIP→text bridge is trained on these pixel tensors).
+pub fn preprocessSiglipBatch(
+    allocator: std.mem.Allocator,
+    image_list: []const []const u8,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+) ![]f32 {
+    const ts: usize = target_size;
+    const per_image = 3 * ts * ts;
+    const result = try allocator.alloc(f32, image_list.len * per_image);
+    errdefer allocator.free(result);
+
+    for (image_list, 0..) |image_bytes, i| {
+        const img = try decode(allocator, image_bytes);
+        defer img.deinit(allocator);
+
+        try preprocessDecodedSiglip(
+            allocator,
+            img,
+            result[i * per_image ..][0..per_image],
+            target_size,
+            mean,
+            std_dev,
+        );
+    }
+
+    return result;
+}
+
+/// Antialiased separable resample filter selector.
+const ResampleFilter = enum { bilinear, bicubic };
+
+/// Antialiased separable resample of a decoded image to `ow`×`oh` u8, matching
+/// PIL's `Image.resize(..., filter)` (the resampler torchvision uses for PIL
+/// images): separate horizontal then vertical passes over precomputed,
+/// support-scaled, normalized coefficients with a u8 rounding step between
+/// passes. `filter` selects the kernel (bilinear support 1.0 / bicubic support
+/// 2.0). Caller owns the returned RGB (3-channel) buffer.
+fn resizeAntialiasSeparable(allocator: std.mem.Allocator, img: Image, ow: usize, oh: usize, filter: ResampleFilter) ![]u8 {
     const sw: usize = img.width;
     const sh: usize = img.height;
     const sc: usize = img.channels;
 
     // Horizontal pass: sw -> ow, preserving sh rows, emitting 3-channel u8.
-    var hc = try computeBicubicCoeffs(allocator, sw, ow);
+    var hc = try computeResampleCoeffs(allocator, sw, ow, filter);
     defer hc.deinit(allocator);
     const hbuf = try allocator.alloc(u8, sh * ow * 3);
     defer allocator.free(hbuf);
@@ -819,7 +911,7 @@ fn clipResizeBicubic(allocator: std.mem.Allocator, img: Image, ow: usize, oh: us
     }
 
     // Vertical pass: sh -> oh over the horizontally-resized 3-channel buffer.
-    var vc = try computeBicubicCoeffs(allocator, sh, oh);
+    var vc = try computeResampleCoeffs(allocator, sh, oh, filter);
     defer vc.deinit(allocator);
     const vbuf = try allocator.alloc(u8, oh * ow * 3);
     errdefer allocator.free(vbuf);
@@ -855,16 +947,21 @@ const BicubicCoeffs = struct {
     }
 };
 
-/// Precompute PIL-style bicubic resample coefficients for a 1-D axis
-/// (`in_size` -> `out_size`). Mirrors PIL's `precompute_coeffs`: the filter
-/// support scales with the downsampling factor (antialiasing), the sampling
-/// window is clamped to the source, and weights are normalized to sum to 1.
-fn computeBicubicCoeffs(allocator: std.mem.Allocator, in_size: usize, out_size: usize) !BicubicCoeffs {
+/// Precompute PIL-style resample coefficients for a 1-D axis (`in_size` ->
+/// `out_size`) for the given `filter`. Mirrors PIL's `precompute_coeffs`: the
+/// filter support scales with the downsampling factor (antialiasing), the
+/// sampling window is clamped to the source, and weights are normalized to sum
+/// to 1. Base support is 1.0 for bilinear (triangle) and 2.0 for bicubic (Keys).
+fn computeResampleCoeffs(allocator: std.mem.Allocator, in_size: usize, out_size: usize, filter: ResampleFilter) !BicubicCoeffs {
     const in_f: f64 = @floatFromInt(in_size);
     const out_f: f64 = @floatFromInt(out_size);
     const scale = in_f / out_f;
     const filterscale = @max(scale, 1.0);
-    const support = 2.0 * filterscale; // bicubic filter support = 2.0
+    const base_support: f64 = switch (filter) {
+        .bilinear => 1.0,
+        .bicubic => 2.0,
+    };
+    const support = base_support * filterscale;
     const ksize: usize = @as(usize, @intFromFloat(@ceil(support))) * 2 + 1;
     const ss = 1.0 / filterscale;
     const in_i: i64 = @intCast(in_size);
@@ -891,7 +988,10 @@ fn computeBicubicCoeffs(allocator: std.mem.Allocator, in_size: usize, out_size: 
         var ww: f64 = 0;
         for (0..n) |k| {
             const arg = (@as(f64, @floatFromInt(k + xmin)) - center + 0.5) * ss;
-            const w = bicubicKernel(arg);
+            const w = switch (filter) {
+                .bilinear => bilinearKernel(arg),
+                .bicubic => bicubicKernel(arg),
+            };
             weights[xx * ksize + k] = w;
             ww += w;
         }
@@ -903,6 +1003,13 @@ fn computeBicubicCoeffs(allocator: std.mem.Allocator, in_size: usize, out_size: 
     }
 
     return .{ .bounds_min = bounds_min, .bounds_size = bounds_size, .weights = weights, .ksize = ksize };
+}
+
+/// Triangle (linear) kernel, support 1.0 (PIL/torchvision BILINEAR).
+fn bilinearKernel(x: f64) f64 {
+    const t = @abs(x);
+    if (t < 1.0) return 1.0 - t;
+    return 0.0;
 }
 
 /// Keys cubic convolution kernel with a = -0.5 (PIL/torchvision BICUBIC).
@@ -971,5 +1078,43 @@ test "clip preprocessing matches torchvision CLIP canonical" {
     }
     const cosine = dot / (@sqrt(na) * @sqrt(nb) + 1e-12);
     std.debug.print("[clip-preprocess-parity] cosine(server, torchvision) = {d:.6}\n", .{cosine});
+    try std.testing.expect(cosine >= 0.99);
+}
+
+// Permanent parity guard for the SigLIP/SigLIP2 served image path. Asserts the
+// server-preprocessed pixel tensor (square antialiased-bilinear resize to 512,
+// no crop, rescale 1/255, 0.5/0.5 normalize) matches a committed HuggingFace
+// `SiglipImageProcessor` reference (google/siglip2-base-patch16-512) at cosine
+// >= 0.99. Regenerate the fixtures with
+// `testdata/siglip_preprocess/gen_reference.py`.
+test "siglip preprocessing matches SiglipImageProcessor canonical" {
+    const alloc = std.testing.allocator;
+    const png = @embedFile("testdata/siglip_preprocess/input.png");
+    const ref_bytes = @embedFile("testdata/siglip_preprocess/reference_chw_f16.bin");
+
+    const ts: u32 = 512;
+    const n = 3 * @as(usize, ts) * @as(usize, ts);
+    try std.testing.expectEqual(@as(usize, n * @sizeOf(f16)), ref_bytes.len);
+
+    const img = try decode(alloc, png);
+    defer img.deinit(alloc);
+
+    const out = try alloc.alloc(f32, n);
+    defer alloc.free(out);
+    try preprocessDecodedSiglip(alloc, img, out, ts, SIGLIP_MEAN, SIGLIP_STD);
+
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
+    for (0..n) |i| {
+        const bits = std.mem.readInt(u16, ref_bytes[i * 2 ..][0..2], .little);
+        const ref: f64 = @floatCast(@as(f16, @bitCast(bits)));
+        const a: f64 = out[i];
+        dot += a * ref;
+        na += a * a;
+        nb += ref * ref;
+    }
+    const cosine = dot / (@sqrt(na) * @sqrt(nb) + 1e-12);
+    std.debug.print("[siglip-preprocess-parity] cosine(server, SiglipImageProcessor) = {d:.6}\n", .{cosine});
     try std.testing.expect(cosine >= 0.99);
 }
