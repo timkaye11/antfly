@@ -1146,6 +1146,22 @@ fn isPureGreedyConfig(config: GenerationConfig) bool {
     return config.temperature <= 0 and !hasSamplingPenalties(config);
 }
 
+fn requiresCudaDecodeGraphBeforeEagerFallback(
+    backend_kind: ops.BackendKind,
+    graph_replay_required: bool,
+    pure_greedy: bool,
+    query_seq_len: usize,
+    has_external_graph_runtime: bool,
+    has_grammar: bool,
+) bool {
+    return graph_replay_required and
+        backend_kind == .cuda and
+        pure_greedy and
+        query_seq_len == 1 and
+        !has_external_graph_runtime and
+        !has_grammar;
+}
+
 fn hasSamplingPenalties(config: GenerationConfig) bool {
     return config.repetition_penalty != 1.0 or
         config.frequency_penalty != 0 or
@@ -1900,7 +1916,7 @@ pub fn buildOwnedBatchDecodeContext(
                 .kv_storage = ctx.kv_cache.?.kv_storage,
             },
             .kv_manager = ctx.kv_manager.?,
-            .kv_storage = ctx.kv_storage,
+            .kv_storage = ctx.kv_storage orelse ctx.kv_cache.?.kv_storage,
         };
     }
 
@@ -1984,7 +2000,7 @@ pub fn buildOwnedMixedBatchDecodeContext(
                 .kv_storage = ctx.kv_cache.?.kv_storage,
             },
             .kv_manager = ctx.kv_manager.?,
-            .kv_storage = ctx.kv_storage,
+            .kv_storage = ctx.kv_storage orelse ctx.kv_cache.?.kv_storage,
             .per_item_query_len = item.query_sequence_len,
             .per_item_total_len = item.total_sequence_len,
             .per_item_kv_len = item.kv_sequence_len,
@@ -2144,6 +2160,9 @@ pub const NativeGenerationPipeline = struct {
     decode_state: ?*NativeDecodeState = null,
     scheduler: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = null,
     scheduler_lease: ?*runtime.scheduler.native_generate.Lease = null,
+    /// Serializes the shared model backend for one claimed scheduler step.
+    /// Request-local tokenization and sampling remain outside this lock.
+    execution_lock: ?*std.atomic.Mutex = null,
     /// Optional smaller draft model for speculative decoding. When set
     /// together with `GenerationConfig.draft_model`, the generate loop
     /// proposes K tokens with the draft and verifies them against the
@@ -2202,7 +2221,7 @@ pub const NativeGenerationPipeline = struct {
         seq_len: usize,
         logits: ?[]f32 = null,
         failure: ?anyerror = null,
-        ready: bool = false,
+        ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     };
 
     const PendingPrefillBatchWork = struct {
@@ -2214,7 +2233,7 @@ pub const NativeGenerationPipeline = struct {
         wants_last_logits: bool,
         logits: ?[]f32 = null,
         failure: ?anyerror = null,
-        ready: bool = false,
+        ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     };
 
     pub fn generate(self: *NativeGenerationPipeline, messages: []const Message, config: GenerationConfig) !GenerationResult {
@@ -3180,6 +3199,25 @@ pub const NativeGenerationPipeline = struct {
         last_hidden_rows: usize = 0,
     };
 
+    /// Prepared decoder tails expose the input to final RMSNorm. Gemma4 MTP's
+    /// `.final` activation contract is the post-norm row used by verification.
+    fn capturePreparedTailPostNormHidden(
+        cb: *const ComputeBackend,
+        capture: bool,
+        pre_norm_hidden: ops.CT,
+        final_norm_slot: usize,
+        hidden_size: usize,
+        eps: f32,
+    ) !?ops.CT {
+        if (!capture) return null;
+        return cb.decoderRuntimeApplyRmsNorm(&.{
+            .slot = final_norm_slot,
+            .input = pre_norm_hidden,
+            .hidden_size = hidden_size,
+            .eps = eps,
+        });
+    }
+
     fn tryCudaPreparedTailPrefillGreedy(
         self: *NativeGenerationPipeline,
         input_ids: []const i64,
@@ -3220,14 +3258,21 @@ pub const NativeGenerationPipeline = struct {
             greedy.token_tensor = null;
         }
 
-        const last_hidden = if (capture_last_hidden) blk: {
-            owns_hidden = false;
-            break :blk tail.final_hidden;
-        } else blk: {
+        const last_hidden = try capturePreparedTailPostNormHidden(
+            &self.cb,
+            capture_last_hidden,
+            tail.final_hidden,
+            tail.final_norm_slot,
+            self.gpt_config.hidden_size,
+            self.gpt_config.norm_eps,
+        );
+        if (capture_last_hidden and last_hidden == null) {
             self.cb.free(tail.final_hidden);
             owns_hidden = false;
-            break :blk null;
-        };
+            return null;
+        }
+        self.cb.free(tail.final_hidden);
+        owns_hidden = false;
         debugGenerationStage(
             "executePrefill prepared_tail_greedy token={d} capture_hidden={}",
             .{ greedy.token_id, capture_last_hidden },
@@ -3270,18 +3315,15 @@ pub const NativeGenerationPipeline = struct {
 
         const greedy_token = tail.greedy_token_id orelse return null;
 
-        var last_hidden: ?ops.CT = null;
-        if (capture_last_hidden) {
-            // MTP `.final` activations are POST-final-norm rows (what the
-            // verify path harvests via forwardFinalHiddenRows); the prepared
-            // tail hands back the pre-norm hidden.
-            last_hidden = (try self.cb.decoderRuntimeApplyRmsNorm(&.{
-                .slot = tail.final_norm_slot,
-                .input = tail.final_hidden,
-                .hidden_size = self.gpt_config.hidden_size,
-                .eps = self.gpt_config.norm_eps,
-            })) orelse return null;
-        }
+        const last_hidden = try capturePreparedTailPostNormHidden(
+            &self.cb,
+            capture_last_hidden,
+            tail.final_hidden,
+            tail.final_norm_slot,
+            self.gpt_config.hidden_size,
+            self.gpt_config.norm_eps,
+        );
+        if (capture_last_hidden and last_hidden == null) return null;
         debugGenerationStage(
             "executePrefill metal_prepared_tail_greedy token={d} capture_hidden={}",
             .{ greedy_token, capture_last_hidden },
@@ -3311,13 +3353,18 @@ pub const NativeGenerationPipeline = struct {
         var prefill_last_hidden: ?ops.CT = null;
         var prefill_last_hidden_rows: usize = 0;
         errdefer if (prefill_last_hidden) |hidden| self.cb.free(hidden);
-        const use_cuda_prefill_greedy_token = shouldUseCudaPrefillGreedyToken(
-            self.cb.kind(),
-            config,
-            allow_resident_greedy_token,
-            self.gpt_config.suppressTokenIds().len > 0,
-            enableCudaPrefillGreedyToken(),
-        );
+        const has_batching_peers = if (self.scheduler) |scheduler| scheduler.shouldBatchCurrentRequests() else false;
+        // A sole CUDA request keeps the device-greedy fast path. If a peer
+        // arrives after this check, execution_lock still serializes the
+        // direct forward against scheduler-driven work.
+        const use_cuda_prefill_greedy_token = (self.execution_lock == null or !has_batching_peers) and
+            shouldUseCudaPrefillGreedyToken(
+                self.cb.kind(),
+                config,
+                allow_resident_greedy_token,
+                self.gpt_config.suppressTokenIds().len > 0,
+                enableCudaPrefillGreedyToken(),
+            );
         // Metal: only when the caller wants the MTP prefill-hidden capture —
         // plain Metal decode keeps the logits prefill path untouched.
         const use_metal_prefill_greedy_token = self.cb.kind() == .metal and
@@ -3333,7 +3380,7 @@ pub const NativeGenerationPipeline = struct {
                 decode_state.isPaged(),
                 self.scheduler != null,
                 self.compiled_partition_backend != null and self.compiled_attachment_target == .whole_model and self.graph_cache != null,
-                use_cuda_prefill_greedy_token,
+                use_prefill_greedy_token,
             },
         );
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
@@ -3449,6 +3496,11 @@ pub const NativeGenerationPipeline = struct {
                         if (self.io) |io| scheduler.awaitTurn(lease, .prefill, io);
                     }
                 }
+                const direct_execution_mutex = if (use_cuda_prefill_greedy_token) self.execution_lock else null;
+                if (direct_execution_mutex) |mutex| {
+                    platform.sync.lockYielding(mutex);
+                }
+                defer if (direct_execution_mutex) |mutex| mutex.unlock();
                 try decode_runtime.appendPrefillChunk(chunk.len);
                 const decode_context = decode_runtime.makeDecodeContext(chunk_end, chunk.len);
                 const metal_prepared: ?PrefillOutput = if (chunk_end == seq_len and use_metal_prefill_greedy_token)
@@ -3822,35 +3874,37 @@ pub const NativeGenerationPipeline = struct {
         var tokens_generated: usize = 0;
         var finish_reason: []const u8 = "length";
         var device_token_tensor: ?ops.CT = null;
-        defer if (device_token_tensor) |tensor| self.cb.free(tensor);
+        defer if (device_token_tensor) |tensor| self.freeDeviceTokenTensor(tensor);
         debugGenerationStage(
             "standardDecode enter seq_len={d} max_tokens={d} prefill_cached={}",
             .{ seq_len.*, max_tokens, prefill_last_logits.* != null },
         );
-        if (try self.standardDecodeCudaPendingTokenReadback(
-            token_ids,
-            seq_len,
-            decode_state,
-            config,
-            prefill_last_logits,
-            prefill_greedy_token,
-            penalty_state,
-            token_table,
-            json_grammar,
-            gbnf_grammar,
-            max_tokens,
-            prompt_token_count,
-            on_token_fn,
-            on_token_ctx,
-            emitted_text,
-        )) |pending_result| {
-            return pending_result;
+        if (self.execution_lock == null) {
+            if (try self.standardDecodeCudaPendingTokenReadback(
+                token_ids,
+                seq_len,
+                decode_state,
+                config,
+                prefill_last_logits,
+                prefill_greedy_token,
+                penalty_state,
+                token_table,
+                json_grammar,
+                gbnf_grammar,
+                max_tokens,
+                prompt_token_count,
+                on_token_fn,
+                on_token_ctx,
+                emitted_text,
+            )) |pending_result| {
+                return pending_result;
+            }
         }
 
         while (tokens_generated < max_tokens) {
             var used_decode_microbatch = false;
             var next_device_token_tensor: ?ops.CT = null;
-            errdefer if (next_device_token_tensor) |tensor| self.cb.free(tensor);
+            errdefer if (next_device_token_tensor) |tensor| self.freeDeviceTokenTensor(tensor);
             debugGenerationStage(
                 "standardDecode iter={d} seq_len={d} device_token_handoff={}",
                 .{ tokens_generated, seq_len.*, device_token_tensor != null },
@@ -3881,21 +3935,50 @@ pub const NativeGenerationPipeline = struct {
                 }
 
                 const has_cached_prefill_logits = tokens_generated == 0 and prefill_last_logits.* != null;
-                if (!has_cached_prefill_logits) {
-                    if (try self.forwardGreedyDeviceDecodeToken(
-                        token_ids,
-                        seq_len.*,
-                        tokens_generated,
-                        decode_state,
-                        config,
-                        token_table,
-                        json_grammar,
-                        gbnf_grammar,
-                        device_token_tensor,
-                    )) |token| {
+                const allow_direct_device_decode = self.execution_lock == null or
+                    (if (self.scheduler) |scheduler| !scheduler.shouldBatchCurrentRequests() else true);
+                if (!has_cached_prefill_logits and allow_direct_device_decode) {
+                    const direct_token = direct_token_blk: {
+                        // Above the batching rollout cap the scheduler emits
+                        // singleton work, but direct device decode must still
+                        // claim its fair turn before taking the shared model.
+                        if (self.execution_lock != null) {
+                            if (self.scheduler) |scheduler| {
+                                if (self.scheduler_lease) |lease| {
+                                    if (self.io) |io| scheduler.awaitTurn(lease, .decode, io);
+                                }
+                            }
+                        }
+                        if (self.execution_lock) |mutex| {
+                            platform.sync.lockYielding(mutex);
+                        }
+                        defer if (self.execution_lock) |mutex| mutex.unlock();
+                        break :direct_token_blk try self.forwardGreedyDeviceDecodeToken(
+                            token_ids,
+                            seq_len.*,
+                            tokens_generated,
+                            decode_state,
+                            config,
+                            token_table,
+                            json_grammar,
+                            gbnf_grammar,
+                            device_token_tensor,
+                        );
+                    };
+                    if (direct_token) |token| {
                         next_device_token_tensor = token.token_tensor;
                         break :blk .{ .token = token.token, .grammar_complete = false };
                     }
+                    const fallback_query_seq_len = if (decode_runtime.kvView() != null and
+                        (tokens_generated > 0 or prefill_last_logits.* == null)) 1 else seq_len.*;
+                    if (requiresCudaDecodeGraphBeforeEagerFallback(
+                        self.cb.kind(),
+                        gpt_arch.cudaDecodeGraphReplayRequired(),
+                        isPureGreedyConfig(config),
+                        fallback_query_seq_len,
+                        self.graph_cache != null or self.compiled_partition_backend != null,
+                        token_table != null or json_grammar.* != null or gbnf_grammar != null,
+                    )) return error.CudaGraphReplayRequired;
                 }
 
                 var owns_last_logits = false;
@@ -3974,7 +4057,7 @@ pub const NativeGenerationPipeline = struct {
             // Check EOS
             if (self.shouldStopOnEos(config, next_token)) {
                 if (next_device_token_tensor) |tensor| {
-                    self.cb.free(tensor);
+                    self.freeDeviceTokenTensor(tensor);
                     next_device_token_tensor = null;
                 }
                 finish_reason = "stop";
@@ -3985,7 +4068,7 @@ pub const NativeGenerationPipeline = struct {
                 next_device_token_tensor = try self.makeDeviceTokenTensor(next_token);
                 if (next_device_token_tensor != null) decoder_runtime_debug_stats.device_token_handoff_seeds += 1;
             }
-            if (device_token_tensor) |tensor| self.cb.free(tensor);
+            if (device_token_tensor) |tensor| self.freeDeviceTokenTensor(tensor);
             device_token_tensor = next_device_token_tensor;
             next_device_token_tensor = null;
 
@@ -4480,7 +4563,9 @@ pub const NativeGenerationPipeline = struct {
         if (input_token_tensor) |token_tensor| {
             if (enableCudaGreedyDeviceTokenHandoff()) {
                 decoder_runtime_debug_stats.device_token_handoff_attempts += 1;
-                if (enableCudaGatedTokenTensorDecode()) {
+                if (enableCudaGatedTokenTensorDecode() and
+                    (backend_kind != .cuda or !gpt_arch.cudaDecodeGraphReplayRequired()))
+                {
                     if (try decoder_gated_runtime.forwardGreedyTokenFromTokenTensor(
                         &self.cb,
                         self.allocator,
@@ -4572,7 +4657,7 @@ pub const NativeGenerationPipeline = struct {
         self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
         const decode_context = decode_runtime.makeDecodeContext(seq_len, 1);
         decoder_runtime_debug_stats.device_token_handoff_attempts += 1;
-        if (enableCudaGatedTokenTensorDecode()) {
+        if (enableCudaGatedTokenTensorDecode() and !gpt_arch.cudaDecodeGraphReplayRequired()) {
             if (try decoder_gated_runtime.forwardGreedyTokenTensorOnlyFromTokenTensor(
                 &self.cb,
                 self.allocator,
@@ -4625,9 +4710,21 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn makeDeviceTokenTensor(self: *NativeGenerationPipeline, token_id: usize) !?ops.CT {
+        if (self.execution_lock) |mutex| {
+            platform.sync.lockYielding(mutex);
+        }
+        defer if (self.execution_lock) |mutex| mutex.unlock();
         const data = [_]i32{@intCast(token_id)};
         const shape = [_]i32{1};
         return try self.cb.fromInt32Shape(&data, &shape);
+    }
+
+    fn freeDeviceTokenTensor(self: *NativeGenerationPipeline, tensor: ops.CT) void {
+        if (self.execution_lock) |mutex| {
+            platform.sync.lockYielding(mutex);
+        }
+        defer if (self.execution_lock) |mutex| mutex.unlock();
+        self.cb.free(tensor);
     }
 
     fn forwardLastLogits(
@@ -4856,12 +4953,16 @@ pub const NativeGenerationPipeline = struct {
         }
 
         /// Every committed token except the pending one must have KV written.
-        fn assertKvTokensInSync(self: *const Gemma4MtpActivationState, decode_state: *const NativeDecodeState, seq_len: usize) void {
-            std.debug.assert(decode_state.total_tokens + self.pendingCount() == seq_len);
+        /// This is a production invariant: a mismatch shifts the verify suffix
+        /// write onto the wrong KV rows, so fail closed in ReleaseFast too.
+        fn validateKvTokensInSync(self: *const Gemma4MtpActivationState, decode_state: *const NativeDecodeState, seq_len: usize) !void {
+            const accounted_tokens = std.math.add(usize, decode_state.total_tokens, self.pendingCount()) catch
+                return error.InvalidSpeculativeState;
+            if (accounted_tokens != seq_len) return error.InvalidSpeculativeState;
         }
 
-        fn notePendingUnmaterialized(self: *Gemma4MtpActivationState) void {
-            std.debug.assert(!self.pending_unmaterialized);
+        fn notePendingUnmaterialized(self: *Gemma4MtpActivationState) !void {
+            if (self.pending_unmaterialized) return error.InvalidSpeculativeState;
             self.pending_unmaterialized = true;
         }
 
@@ -5846,7 +5947,7 @@ pub const NativeGenerationPipeline = struct {
 
         const defer_materialize = gemma4MtpDeferMaterializeEnabled(self.cb.kind());
         const entry_pending = mtp_activation.pendingCount();
-        mtp_activation.assertKvTokensInSync(decode_state, seq_len.*);
+        try mtp_activation.validateKvTokensInSync(decode_state, seq_len.*);
 
         var draft_tokens: [16]i64 = undefined;
         var draft_logits: [16]?[]f32 = [_]?[]f32{null} ** 16;
@@ -6041,9 +6142,9 @@ pub const NativeGenerationPipeline = struct {
         // unmaterialized token: the verify's suffix write covers its query
         // rows, so row 0 writes the pending token's KV. The KV layer cannot
         // detect a miscounted append (the suffix write would silently shift),
-        // hence the assert.
+        // hence the release-mode check.
         _ = try decode_runtime.appendGeneratedTokens(draft_count + entry_pending);
-        std.debug.assert(decode_state.total_tokens == verify_seq);
+        if (decode_state.total_tokens != verify_seq) return error.InvalidSpeculativeState;
         mtp_activation.cached_target_choice = null;
         const target_forward_len = if (cached_first_target_choice != null) draft_count else verify_len;
         const target_query_len: usize = if (decode_runtime.kvView() != null) target_forward_len else verify_seq;
@@ -6577,7 +6678,7 @@ pub const NativeGenerationPipeline = struct {
                     }
                 }
                 next_cached_target_choice = null;
-                mtp_activation.notePendingUnmaterialized();
+                try mtp_activation.notePendingUnmaterialized();
                 if (mtp_profile.enabled) {
                     mtp_profile.deferred_materializations += 1;
                 }
@@ -6644,7 +6745,7 @@ pub const NativeGenerationPipeline = struct {
         }
         mtp_activation.cached_target_choice = next_cached_target_choice;
         seq_len.* += accepted;
-        mtp_activation.assertKvTokensInSync(decode_state, seq_len.*);
+        try mtp_activation.validateKvTokensInSync(decode_state, seq_len.*);
         try penalty_state.noteTokens(allocator, token_ids[round_start..seq_len.*]);
 
         return .{
@@ -7357,11 +7458,11 @@ pub const NativeGenerationPipeline = struct {
         mtp_profile: *MtpProfileStats,
     ) !void {
         if (mtp_activation.pendingCount() == 0) return;
-        mtp_activation.assertKvTokensInSync(decode_state, seq_len);
+        try mtp_activation.validateKvTokensInSync(decode_state, seq_len);
         const flush_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
         mtp_activation.cached_target_choice = try self.materializeAcceptedTokenKvForMtp(token_ids, seq_len, decode_state, hidden_source);
         mtp_activation.notePendingKvWritten();
-        mtp_activation.assertKvTokensInSync(decode_state, seq_len);
+        try mtp_activation.validateKvTokensInSync(decode_state, seq_len);
         if (mtp_profile.enabled) {
             mtp_profile.pending_flushes += 1;
             mtp_profile.materialization_ns +|= mtpProfileElapsedNs(true, self.io, flush_started_at);
@@ -7539,7 +7640,16 @@ pub const NativeGenerationPipeline = struct {
         };
         const pending_options = pendingWorkOptionsFromState(decode_state, 1);
         try scheduler.enqueueDecodeWork(lease.*, @ptrCast(&work), seq_len, decode_ctx.kv_sequence_len, decode_ctx.kv_position_offset, pending_options);
-        defer if (!work.ready) scheduler.cancelDecodeWork(@ptrCast(&work));
+        defer if (!work.ready.load(.acquire)) scheduler.cancelDecodeWork(@ptrCast(&work));
+
+        const coalesce_delay_us = if (self.execution_lock != null)
+            scheduler.decodeCoalesceDelayUs(lease.*)
+        else
+            0;
+        if (coalesce_delay_us > 0) {
+            scheduler.noteDecodeCoalesceWait(coalesce_delay_us);
+            io.sleep(std.Io.Duration.fromMicroseconds(coalesce_delay_us), .awake) catch {};
+        }
 
         var driver = DecodeStepDriver{
             .pipeline = self,
@@ -7576,9 +7686,14 @@ pub const NativeGenerationPipeline = struct {
             .query_seq_len = query_seq_len,
             .wants_last_logits = wants_last_logits,
         };
-        const pending_options = pendingWorkOptionsFromState(decode_state, query_seq_len);
+        var pending_options = pendingWorkOptionsFromState(decode_state, query_seq_len);
+        if (self.execution_lock != null) {
+            // CUDA row-batched prefill is not response-equivalent yet. Keep
+            // prefill as a singleton; decode remains continuously batchable.
+            pending_options.exclusive_step = true;
+        }
         try scheduler.enqueuePrefillWork(lease.*, @ptrCast(&work), seq_len, query_seq_len, decode_ctx.kv_sequence_len, decode_ctx.kv_position_offset, pending_options);
-        defer if (!work.ready) scheduler.cancelPrefillWork(@ptrCast(&work));
+        defer if (!work.ready.load(.acquire)) scheduler.cancelPrefillWork(@ptrCast(&work));
 
         var driver = PrefillStepDriver{
             .pipeline = self,
@@ -7708,6 +7823,13 @@ pub const NativeGenerationPipeline = struct {
         lease: *runtime.scheduler.native_generate.Lease,
         claimed: []const runtime.scheduler.native_generate.StepItem,
     ) void {
+        if (self.execution_lock) |mutex| {
+            platform.sync.lockYielding(mutex);
+        }
+        defer if (self.execution_lock) |mutex| mutex.unlock();
+
+        self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
+
         const result = self.forwardScheduledStep(claimed) catch |err| {
             markStepFailed(claimed, err);
             scheduler.completeStep(lease, claimed);
@@ -7779,12 +7901,12 @@ pub const NativeGenerationPipeline = struct {
                 .decode => {
                     const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
                     work.failure = err;
-                    work.ready = true;
+                    work.ready.store(true, .release);
                 },
                 .prefill => {
                     const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
                     work.failure = err;
-                    work.ready = true;
+                    work.ready.store(true, .release);
                 },
                 .waiting => {},
             }
@@ -7807,12 +7929,12 @@ pub const NativeGenerationPipeline = struct {
                     .decode => {
                         const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
                         work.failure = error.InvalidBatchDecodeState;
-                        work.ready = true;
+                        work.ready.store(true, .release);
                     },
                     .prefill => {
                         const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
                         if (work.wants_last_logits) work.failure = error.InvalidBatchDecodeState;
-                        work.ready = true;
+                        work.ready.store(true, .release);
                     },
                     .waiting => {},
                 }
@@ -7831,7 +7953,7 @@ pub const NativeGenerationPipeline = struct {
                     } else |dupe_err| {
                         work.failure = dupe_err;
                     }
-                    work.ready = true;
+                    work.ready.store(true, .release);
                 },
                 .prefill => {
                     const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
@@ -7842,7 +7964,7 @@ pub const NativeGenerationPipeline = struct {
                             work.failure = dupe_err;
                         }
                     }
-                    work.ready = true;
+                    work.ready.store(true, .release);
                 },
                 .waiting => {},
             }
@@ -7874,6 +7996,7 @@ fn runStepLoop(
 
     var step = std.ArrayListUnmanaged(runtime.scheduler.native_generate.StepItem).empty;
     defer step.deinit(allocator);
+    var wait_error: ?anyerror = null;
 
     while (!driver.isReady()) {
         if (@hasDecl(DriverChild, "preStep")) driver.preStep();
@@ -7881,9 +8004,18 @@ fn runStepLoop(
         if (try scheduler.claimStep(allocator, lease, leader_work_ptr, leader_phase, budget, &step)) {
             driver.execute(scheduler, lease, step.items);
         } else {
-            io.sleep(std.Io.Duration.fromMilliseconds(0), .awake) catch break;
+            if (wait_error == null) {
+                io.sleep(std.Io.Duration.fromMilliseconds(0), .awake) catch |err| {
+                    wait_error = err;
+                };
+            } else {
+                // A peer may already own the stack-backed work pointer. Keep
+                // its lifetime until ready, then return the saved Io error.
+                std.Thread.yield() catch {};
+            }
         }
     }
+    if (wait_error) |err| return err;
 }
 
 const DecodeStepDriver = struct {
@@ -7893,7 +8025,7 @@ const DecodeStepDriver = struct {
     decode_state: *NativeDecodeState,
 
     fn isReady(self: *const DecodeStepDriver) bool {
-        return self.work.ready;
+        return self.work.ready.load(.acquire);
     }
 
     fn stepBudget(self: *const DecodeStepDriver) runtime.scheduler.native_generate.StepBudget {
@@ -7901,6 +8033,7 @@ const DecodeStepDriver = struct {
     }
 
     fn preStep(self: *DecodeStepDriver) void {
+        if (self.pipeline.execution_lock != null) return;
         self.pipeline.cb.drainPrefetchBudget(NativeGenerationPipeline.prefetch_drain_budget_per_step);
     }
 
@@ -7921,7 +8054,7 @@ const PrefillStepDriver = struct {
     decode_state: *NativeDecodeState,
 
     fn isReady(self: *const PrefillStepDriver) bool {
-        return self.work.ready;
+        return self.work.ready.load(.acquire);
     }
 
     fn stepBudget(self: *const PrefillStepDriver) runtime.scheduler.native_generate.StepBudget {
@@ -8215,11 +8348,11 @@ test "markStepFailed marks every claimed work failed and ready" {
 
     NativeGenerationPipeline.markStepFailed(&items, error.OutOfMemory);
 
-    try std.testing.expect(dec_a.ready);
+    try std.testing.expect(dec_a.ready.load(.acquire));
     try std.testing.expectEqual(@as(?anyerror, error.OutOfMemory), dec_a.failure);
     try std.testing.expect(dec_a.logits == null);
 
-    try std.testing.expect(pre_a.ready);
+    try std.testing.expect(pre_a.ready.load(.acquire));
     try std.testing.expectEqual(@as(?anyerror, error.OutOfMemory), pre_a.failure);
     try std.testing.expect(pre_a.logits == null);
 }
@@ -8276,11 +8409,11 @@ test "dispatchStepLogits dupes per-item rows and respects wants_last_logits" {
 
     NativeGenerationPipeline.dispatchStepLogits(vocab_size, &items, &logits, max_query);
 
-    try std.testing.expect(dec_w.ready);
+    try std.testing.expect(dec_w.ready.load(.acquire));
     try std.testing.expectEqualSlices(f32, &.{ 10, 11 }, dec_w.logits.?);
-    try std.testing.expect(pre_with_logits.ready);
+    try std.testing.expect(pre_with_logits.ready.load(.acquire));
     try std.testing.expectEqualSlices(f32, &.{ 22, 23 }, pre_with_logits.logits.?);
-    try std.testing.expect(pre_no_logits.ready);
+    try std.testing.expect(pre_no_logits.ready.load(.acquire));
     try std.testing.expect(pre_no_logits.logits == null);
 }
 
@@ -8326,16 +8459,16 @@ test "dispatchStepLogits records dupe failure per-work without aborting peers" {
 
     NativeGenerationPipeline.dispatchStepLogits(vocab_size, &items, &logits, 1);
 
-    try std.testing.expect(dec_a.ready);
+    try std.testing.expect(dec_a.ready.load(.acquire));
     try std.testing.expect(dec_a.failure == null);
     try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, dec_a.logits.?);
 
-    try std.testing.expect(dec_b.ready);
+    try std.testing.expect(dec_b.ready.load(.acquire));
     try std.testing.expect(dec_b.failure != null);
     try std.testing.expect(dec_b.logits == null);
 
     // The failing dupe must not stop dec_c's dispatch.
-    try std.testing.expect(dec_c.ready);
+    try std.testing.expect(dec_c.ready.load(.acquire));
     try std.testing.expect(dec_c.failure == null);
     try std.testing.expectEqualSlices(f32, &.{ 5, 6 }, dec_c.logits.?);
 }
@@ -9139,6 +9272,16 @@ test "cuda prefill first token path is narrowly gated" {
     try std.testing.expect(!shouldUsePrefillFirstTokenPath(.cuda, 1, false, false));
 }
 
+test "required cuda decode graph blocks only eligible eager fallbacks" {
+    try std.testing.expect(requiresCudaDecodeGraphBeforeEagerFallback(.cuda, true, true, 1, false, false));
+    try std.testing.expect(!requiresCudaDecodeGraphBeforeEagerFallback(.cuda, false, true, 1, false, false));
+    try std.testing.expect(!requiresCudaDecodeGraphBeforeEagerFallback(.metal, true, true, 1, false, false));
+    try std.testing.expect(!requiresCudaDecodeGraphBeforeEagerFallback(.cuda, true, false, 1, false, false));
+    try std.testing.expect(!requiresCudaDecodeGraphBeforeEagerFallback(.cuda, true, true, 2, false, false));
+    try std.testing.expect(!requiresCudaDecodeGraphBeforeEagerFallback(.cuda, true, true, 1, true, false));
+    try std.testing.expect(!requiresCudaDecodeGraphBeforeEagerFallback(.cuda, true, true, 1, false, true));
+}
+
 test "cuda prefill greedy token path is pure greedy only" {
     const greedy: GenerationConfig = .{ .max_tokens = 32, .temperature = 0 };
     try std.testing.expect(shouldUseCudaPrefillGreedyToken(.cuda, greedy, true, false, true));
@@ -9420,6 +9563,61 @@ test "gemma4 mtp target hidden source parser defaults safely" {
     try std.testing.expectEqual(Gemma4MtpTargetHiddenSource.final, parseGemma4MtpTargetHiddenSource("unknown"));
 }
 
+test "prepared tail MTP capture applies the final RMS norm contract" {
+    const Probe = struct {
+        called: bool = false,
+        input: ?ops.CT = null,
+        slot: usize = 0,
+        hidden_size: usize = 0,
+        eps: f32 = 0.0,
+        output: ops.CT,
+
+        fn applyRmsNorm(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyRmsNormRequest) anyerror!?ops.CT {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.called = true;
+            self.input = request.input;
+            self.slot = request.slot;
+            self.hidden_size = request.hidden_size;
+            self.eps = request.eps;
+            return self.output;
+        }
+    };
+
+    var pre_norm_storage: u8 = 0;
+    var post_norm_storage: u8 = 0;
+    const pre_norm: ops.CT = @ptrCast(&pre_norm_storage);
+    const post_norm: ops.CT = @ptrCast(&post_norm_storage);
+    var probe = Probe{ .output = post_norm };
+    var vtable: ops.ComputeBackend.VTable = undefined;
+    vtable.decoderRuntimeApplyRmsNorm = Probe.applyRmsNorm;
+    const cb = ComputeBackend{ .ptr = @ptrCast(&probe), .vtable = &vtable };
+
+    try std.testing.expect((try NativeGenerationPipeline.capturePreparedTailPostNormHidden(
+        &cb,
+        false,
+        pre_norm,
+        7,
+        1536,
+        1e-6,
+    )) == null);
+    try std.testing.expect(!probe.called);
+
+    const captured = (try NativeGenerationPipeline.capturePreparedTailPostNormHidden(
+        &cb,
+        true,
+        pre_norm,
+        7,
+        1536,
+        1e-6,
+    )) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(post_norm, captured);
+    try std.testing.expect(probe.called);
+    try std.testing.expectEqual(pre_norm, probe.input.?);
+    try std.testing.expectEqual(@as(usize, 7), probe.slot);
+    try std.testing.expectEqual(@as(usize, 1536), probe.hidden_size);
+    try std.testing.expectEqual(@as(f32, 1e-6), probe.eps);
+}
+
 test "speculation calibration parser is explicit" {
     try std.testing.expectEqual(SpeculationCalibration.none, parseSpeculationCalibration("none").?);
     try std.testing.expectEqual(SpeculationCalibration.none, parseSpeculationCalibration("off").?);
@@ -9482,6 +9680,11 @@ test "gemma4 mtp pending token bookkeeping holds kv invariant across round shape
     var seq_len: usize = 8;
     try std.testing.expectEqual(@as(usize, 0), mtp_activation.pendingCount());
     try std.testing.expectEqual(seq_len, decode.total_tokens + mtp_activation.pendingCount());
+    try mtp_activation.validateKvTokensInSync(&decode, seq_len);
+    try std.testing.expectError(
+        error.InvalidSpeculativeState,
+        mtp_activation.validateKvTokensInSync(&decode, seq_len + 1),
+    );
 
     // Round A: k=2, mismatch at draft index 1 -> correction committed, fold
     // leaves it pending instead of materializing.
@@ -9491,11 +9694,12 @@ test "gemma4 mtp pending token bookkeeping holds kv invariant across round shape
         try decode.appendGeneratedTokens(draft_count + mtp_activation.pendingCount());
         mtp_activation.notePendingKvWritten(); // verify forward succeeded
         try decode.truncateTokens(draft_count - matched_drafts);
-        mtp_activation.notePendingUnmaterialized();
+        try mtp_activation.notePendingUnmaterialized();
+        try std.testing.expectError(error.InvalidSpeculativeState, mtp_activation.notePendingUnmaterialized());
         seq_len += matched_drafts + 1;
         try std.testing.expectEqual(@as(usize, 1), mtp_activation.pendingCount());
         try std.testing.expectEqual(seq_len, decode.total_tokens + mtp_activation.pendingCount());
-        mtp_activation.assertKvTokensInSync(&decode, seq_len);
+        try mtp_activation.validateKvTokensInSync(&decode, seq_len);
     }
 
     // Round B: enters pending; k=2 pure accept. The verify appends k+1 slots
@@ -9519,10 +9723,10 @@ test "gemma4 mtp pending token bookkeeping holds kv invariant across round shape
         const draft_count: usize = 2;
         try decode.appendGeneratedTokens(draft_count + mtp_activation.pendingCount());
         mtp_activation.notePendingKvWritten();
-        mtp_activation.notePendingUnmaterialized();
+        try mtp_activation.notePendingUnmaterialized();
         seq_len += draft_count + 1;
         try std.testing.expectEqual(seq_len, decode.total_tokens + mtp_activation.pendingCount());
-        mtp_activation.assertKvTokensInSync(&decode, seq_len);
+        try mtp_activation.validateKvTokensInSync(&decode, seq_len);
     }
 
     // Round D: verify forward fails while pending -> roll back the entire
@@ -9549,9 +9753,10 @@ test "gemma4 mtp pending token bookkeeping holds kv invariant across round shape
     try decode.appendGeneratedTokens(1 + mtp_activation.pendingCount());
     mtp_activation.notePendingKvWritten();
     try decode.truncateTokens(1);
-    mtp_activation.notePendingUnmaterialized();
+    try mtp_activation.notePendingUnmaterialized();
     seq_len += 1;
     try std.testing.expectEqual(seq_len, decode.total_tokens + mtp_activation.pendingCount());
+    try mtp_activation.validateKvTokensInSync(&decode, seq_len);
 }
 
 test "Gemma4 MTP cached first choice requires multi draft" {

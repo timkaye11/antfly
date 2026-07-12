@@ -406,12 +406,14 @@ PY
 check_mtp_policy() {
   local target_json="$1"
   local mtp_json="$2"
-  python3 - "$target_json" "$mtp_json" "$mtp_min_active_speed_ratio" <<'PY'
+  python3 - "$target_json" "$mtp_json" "$mtp_min_active_speed_ratio" "$mtp_tokens" <<'PY'
 import json
+import os
 import sys
 
-target_path, mtp_path, min_ratio = sys.argv[1:4]
+target_path, mtp_path, min_ratio, expected_tokens = sys.argv[1:5]
 min_ratio = float(min_ratio)
+expected_tokens = int(expected_tokens)
 with open(target_path, "r", encoding="utf-8") as f:
     target = json.load(f)
 with open(mtp_path, "r", encoding="utf-8") as f:
@@ -420,11 +422,23 @@ with open(mtp_path, "r", encoding="utf-8") as f:
 errors = []
 target_tps = float(target.get("decode_tok_per_s", 0.0))
 mtp_tps = float(mtp.get("decode_tok_per_s", 0.0))
+target_token_ids = target.get("token_ids")
+mtp_token_ids = mtp.get("token_ids")
 spec = mtp.get("speculative")
 if target_tps <= 0:
     errors.append(f"target decode_tok_per_s={target_tps}, expected > 0")
 if mtp_tps <= 0:
     errors.append(f"mtp decode_tok_per_s={mtp_tps}, expected > 0")
+if int(target.get("tokens", 0)) != expected_tokens:
+    errors.append(f"target tokens={target.get('tokens')}, expected {expected_tokens}")
+if int(mtp.get("tokens", 0)) != expected_tokens:
+    errors.append(f"mtp tokens={mtp.get('tokens')}, expected {expected_tokens}")
+if not isinstance(target_token_ids, list) or len(target_token_ids) != expected_tokens:
+    errors.append(f"target token_ids length={len(target_token_ids) if isinstance(target_token_ids, list) else 'missing'}, expected {expected_tokens}")
+if not isinstance(mtp_token_ids, list) or len(mtp_token_ids) != expected_tokens:
+    errors.append(f"mtp token_ids length={len(mtp_token_ids) if isinstance(mtp_token_ids, list) else 'missing'}, expected {expected_tokens}")
+if isinstance(target_token_ids, list) and isinstance(mtp_token_ids, list) and target_token_ids != mtp_token_ids:
+    errors.append("MTP token_ids differ from target-only greedy token_ids")
 if not isinstance(spec, dict):
     errors.append("MTP run did not emit speculative telemetry")
     spec = {}
@@ -453,8 +467,12 @@ if spec.get("mtp_enabled"):
         errors.append("mtp_enabled=true but drafted <= 0")
     cuda = mtp.get("cuda") or {}
     cuda_generate = mtp.get("cuda_generate") or {}
+    device_hits = int(cuda.get("mtp_verify_commit_device_hits", 0)) + int(cuda_generate.get("mtp_verify_commit_device_hits", 0))
     device_fallbacks = int(cuda.get("mtp_verify_commit_device_fallbacks", 0)) + int(cuda_generate.get("mtp_verify_commit_device_fallbacks", 0))
-    if device_fallbacks != 0:
+    device_verify_required = os.environ.get("ANTFLY_GEMMA4_MTP_VERIFY_DEVICE_RESULT") == "1"
+    if device_verify_required and device_hits <= 0:
+        errors.append(f"mtp_verify_commit_device_hits={device_hits}, expected > 0")
+    if device_verify_required and device_fallbacks != 0:
         errors.append(f"mtp_verify_commit_device_fallbacks={device_fallbacks}, expected 0")
     if decision == "active" and mtp_tps < target_tps * min_ratio:
         errors.append(
@@ -471,7 +489,8 @@ if errors:
 
 print(
     f"PASS mtp_policy: target_tok_s={target_tps:.3f} mtp_tok_s={mtp_tps:.3f} "
-    f"decision={decision} acceptance_permille={spec.get('mtp_acceptance_permille')}"
+    f"decision={decision} acceptance_permille={spec.get('mtp_acceptance_permille')} "
+    f"device_verify_hits={device_hits if spec.get('mtp_enabled') else 0}"
 )
 PY
 }
@@ -522,7 +541,9 @@ if [ "$run_mtp" != "off" ]; then
       --temperature 0 \
       --raw-prompt \
       --no-chat-template \
+      --ignore-eos \
       --print-token-count \
+      --print-token-ids \
       --print-timing \
       --combined-budget-mb 16000 \
       --backend-budget-mb 12000 \
@@ -540,7 +561,9 @@ if [ "$run_mtp" != "off" ]; then
       --temperature 0 \
       --raw-prompt \
       --no-chat-template \
+      --ignore-eos \
       --print-token-count \
+      --print-token-ids \
       --print-timing \
       --combined-budget-mb 16000 \
       --backend-budget-mb 12000 \

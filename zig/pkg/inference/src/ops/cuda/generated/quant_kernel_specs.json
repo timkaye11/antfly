@@ -178,6 +178,7 @@
       "supported_epilogues": [
         "none",
         "pair",
+        "argmax",
         "pair_activation",
         "gated_down"
       ],
@@ -787,7 +788,8 @@
       "supported_epilogues": [
         "none",
         "bias",
-        "bias_gelu"
+        "bias_gelu",
+        "argmax"
       ],
       "supported_backends": [
         "cuda",

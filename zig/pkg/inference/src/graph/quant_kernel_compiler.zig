@@ -25,6 +25,8 @@ const backend_contracts = @import("backend_contracts.zig");
 const quant_matmul = @import("quant_matmul.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
 const tensor_types = @import("../gguf/tensor_types.zig");
+const quant_kernel_op = @import("quant_kernel_op.zig");
+const cuda_renderer = @import("quant_kernel_cuda_renderer.zig");
 const metal_renderer = @import("quant_kernel_metal_renderer.zig");
 
 pub const metal_promotion_min_speedup: f64 = 1.10;
@@ -49,35 +51,401 @@ pub const Backend = enum(u8) {
     metal,
 };
 
+pub const TargetResourceLimits = struct {
+    max_threads_per_block: u16 = 1024,
+    max_shared_memory_bytes: u32 = 0,
+    max_registers_per_thread: u16 = 255,
+    max_registers_per_block: u32 = 0,
+
+    pub fn validate(self: TargetResourceLimits) !void {
+        if (self.max_threads_per_block == 0 or self.max_threads_per_block > 1024) {
+            return error.InvalidTargetThreadLimit;
+        }
+        if (self.max_registers_per_thread == 0) return error.InvalidTargetRegisterLimit;
+    }
+};
+
+/// Exact AOT compilation target. `architecture` is a canonical backend-owned
+/// name such as `sm_89` or `apple_family_9`; model names never participate in
+/// target selection.
+pub const Target = struct {
+    backend: Backend,
+    architecture: []const u8,
+    required_features: u64 = 0,
+    limits: TargetResourceLimits = .{},
+
+    pub fn validate(self: Target) !void {
+        if (!isCanonicalCatalogToken(self.architecture)) return error.InvalidTargetArchitecture;
+        try self.limits.validate();
+    }
+
+    pub fn matches(self: Target, available: Target) bool {
+        return self.backend == available.backend and
+            std.mem.eql(u8, self.architecture, available.architecture) and
+            (available.required_features & self.required_features) == self.required_features;
+    }
+
+    pub fn overlaps(a: Target, b: Target) bool {
+        // Feature requirements are monotone. A target supporting the union of
+        // both masks would match both entries, so masks cannot disambiguate.
+        return a.backend == b.backend and std.mem.eql(u8, a.architecture, b.architecture);
+    }
+};
+
+/// Machine-readable target identity for the checked-in CUDA promotion
+/// evidence. Catalogs must reuse this target rather than independently naming
+/// an architecture that the evidence did not measure.
+pub const cuda_sm89_promotion_target = Target{
+    .backend = .cuda,
+    .architecture = "sm_89",
+    .limits = .{
+        .max_threads_per_block = 1024,
+        .max_shared_memory_bytes = 99 * 1024,
+        .max_registers_per_thread = 255,
+        .max_registers_per_block = 64 * 1024,
+    },
+};
+
+pub const cuda_sm89_promotion_target_fingerprint = targetFingerprint(cuda_sm89_promotion_target);
+
+pub const ScheduleResources = struct {
+    static_shared_memory_bytes: u32 = 0,
+    dynamic_shared_memory_bytes: u32 = 0,
+    registers_per_thread: u16 = 0,
+};
+
+/// Backend-neutral AOT schedule identity. Backend render plans may carry more
+/// lowering detail; these fields are the dispatch/resource contract required
+/// for deterministic selection and catalog validation.
+pub const Schedule = struct {
+    family: []const u8,
+    threads_per_block: u16,
+    rows_per_block: u16 = 1,
+    cols_per_block: u16 = 1,
+    vector_width: u8 = 1,
+    split_count: u16 = 1,
+    resources: ScheduleResources = .{},
+
+    pub fn validateForTarget(self: Schedule, target: Target) !void {
+        if (!isCanonicalCatalogToken(self.family)) return error.InvalidScheduleFamily;
+        if (self.threads_per_block == 0 or self.threads_per_block > target.limits.max_threads_per_block) {
+            return error.ScheduleThreadsExceedTarget;
+        }
+        if (self.rows_per_block == 0 or self.cols_per_block == 0 or self.vector_width == 0 or self.split_count == 0) {
+            return error.InvalidScheduleTile;
+        }
+
+        const shared_bytes = @as(u64, self.resources.static_shared_memory_bytes) +
+            @as(u64, self.resources.dynamic_shared_memory_bytes);
+        if (target.limits.max_shared_memory_bytes != 0 and shared_bytes > target.limits.max_shared_memory_bytes) {
+            return error.ScheduleSharedMemoryExceedsTarget;
+        }
+        if (self.resources.registers_per_thread != 0) {
+            if (self.resources.registers_per_thread > target.limits.max_registers_per_thread) {
+                return error.ScheduleRegistersExceedTarget;
+            }
+            const block_registers = @as(u64, self.resources.registers_per_thread) * self.threads_per_block;
+            if (target.limits.max_registers_per_block != 0 and block_registers > target.limits.max_registers_per_block) {
+                return error.ScheduleRegisterFileExceedsTarget;
+            }
+        }
+    }
+};
+
+pub const CatalogEntry = struct {
+    signature: quant_kernel_op.SpecializationSignature,
+    runtime: quant_kernel_op.RuntimeConstraints,
+    target: Target,
+    schedule: Schedule,
+    kernel_id: []const u8,
+    source_fingerprint: u64 = 0,
+    production_enabled: bool = false,
+
+    pub fn validate(self: CatalogEntry) !void {
+        try self.signature.validate();
+        try self.runtime.validateExactFor(self.signature);
+        try self.target.validate();
+        try self.schedule.validateForTarget(self.target);
+        if (!isCanonicalCatalogToken(self.kernel_id)) return error.InvalidCatalogKernelId;
+    }
+
+    pub fn fingerprint(self: CatalogEntry) u64 {
+        return catalogEntryFingerprint(self);
+    }
+
+    pub fn id(self: CatalogEntry, allocator: std.mem.Allocator) ![]u8 {
+        return catalogEntryId(allocator, self);
+    }
+};
+
+pub const CatalogQuery = struct {
+    signature: quant_kernel_op.SpecializationSignature,
+    runtime: quant_kernel_op.RuntimeShape,
+    target: Target,
+};
+
+pub const Catalog = struct {
+    entries: []const CatalogEntry,
+
+    pub fn validate(self: Catalog) !void {
+        for (self.entries, 0..) |entry, index| {
+            try entry.validate();
+            for (self.entries[index + 1 ..]) |other| {
+                if (!entry.signature.eql(other.signature)) continue;
+                if (!Target.overlaps(entry.target, other.target)) continue;
+                if (!quant_kernel_op.RuntimeConstraints.overlaps(entry.runtime, other.runtime)) continue;
+                return error.AmbiguousCatalogEntry;
+            }
+        }
+    }
+
+    pub fn resolve(self: Catalog, query: CatalogQuery) !?CatalogEntry {
+        var match: ?CatalogEntry = null;
+        for (self.entries) |entry| {
+            if (!entry.signature.eql(query.signature) or
+                !entry.target.matches(query.target) or
+                !entry.runtime.matches(query.runtime))
+            {
+                continue;
+            }
+            if (match != null) return error.AmbiguousCatalogEntry;
+            match = entry;
+        }
+        return match;
+    }
+};
+
+pub const AotTarget = Target;
+pub const AotSchedule = Schedule;
+pub const AotCatalogEntry = CatalogEntry;
+pub const AotCatalog = Catalog;
+
+const catalog_fingerprint_seed: u64 = 0x414e_5446_4c59_414f; // "ANTFLYAO"
+
+pub fn targetFingerprint(target: Target) u64 {
+    var hasher = std.hash.Wyhash.init(catalog_fingerprint_seed ^ 0x5441_5247_4554_0001);
+    catalogHashU8(&hasher, 1);
+    catalogHashU8(&hasher, @intFromEnum(target.backend));
+    catalogHashBytes(&hasher, target.architecture);
+    catalogHashU64(&hasher, target.required_features);
+    return hasher.final();
+}
+
+pub fn scheduleFingerprint(schedule: Schedule) u64 {
+    var hasher = std.hash.Wyhash.init(catalog_fingerprint_seed ^ 0x5343_4845_4455_4c45);
+    catalogHashU8(&hasher, 1);
+    catalogHashBytes(&hasher, schedule.family);
+    catalogHashU16(&hasher, schedule.threads_per_block);
+    catalogHashU16(&hasher, schedule.rows_per_block);
+    catalogHashU16(&hasher, schedule.cols_per_block);
+    catalogHashU8(&hasher, schedule.vector_width);
+    catalogHashU16(&hasher, schedule.split_count);
+    catalogHashU32(&hasher, schedule.resources.static_shared_memory_bytes);
+    catalogHashU32(&hasher, schedule.resources.dynamic_shared_memory_bytes);
+    catalogHashU16(&hasher, schedule.resources.registers_per_thread);
+    return hasher.final();
+}
+
+/// Stable specialization fingerprint. Source bytes and promotion state are
+/// intentionally excluded: recompiling the same semantic schedule must retain
+/// its identity, while source provenance remains separately attestable.
+pub fn catalogEntryFingerprint(entry: CatalogEntry) u64 {
+    var hasher = std.hash.Wyhash.init(catalog_fingerprint_seed);
+    catalogHashU8(&hasher, 1);
+    catalogHashU64(&hasher, quant_kernel_op.specializationSignatureFingerprint(entry.signature));
+    catalogHashU64(&hasher, quant_kernel_op.runtimeConstraintsFingerprint(entry.runtime));
+    catalogHashU64(&hasher, targetFingerprint(entry.target));
+    catalogHashU64(&hasher, scheduleFingerprint(entry.schedule));
+    return hasher.final();
+}
+
+pub fn catalogEntryId(allocator: std.mem.Allocator, entry: CatalogEntry) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "antfly.kernel.aot.v1/{s}/{s}/{s}/{x:0>16}",
+        .{
+            @tagName(entry.target.backend),
+            entry.target.architecture,
+            @tagName(entry.signature.opKind()),
+            catalogEntryFingerprint(entry),
+        },
+    );
+}
+
+pub const specializationFingerprint = catalogEntryFingerprint;
+pub const specializationId = catalogEntryId;
+
+fn isCanonicalCatalogToken(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |char| switch (char) {
+        'a'...'z', '0'...'9', '_', '-', '.' => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn catalogHashBytes(hasher: *std.hash.Wyhash, bytes: []const u8) void {
+    catalogHashU32(hasher, @intCast(bytes.len));
+    hasher.update(bytes);
+}
+
+fn catalogHashU8(hasher: *std.hash.Wyhash, value: u8) void {
+    hasher.update(&.{value});
+}
+
+fn catalogHashU16(hasher: *std.hash.Wyhash, value: u16) void {
+    var bytes: [2]u8 = undefined;
+    std.mem.writeInt(u16, &bytes, value, .little);
+    hasher.update(&bytes);
+}
+
+fn catalogHashU32(hasher: *std.hash.Wyhash, value: u32) void {
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bytes, value, .little);
+    hasher.update(&bytes);
+}
+
+fn catalogHashU64(hasher: *std.hash.Wyhash, value: u64) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .little);
+    hasher.update(&bytes);
+}
+
+fn testAotCatalogEntry(output_dim: u32) CatalogEntry {
+    return .{
+        .signature = .{ .small_batch_matmul = .{
+            .format = .q4_0,
+            .row_bucket = .rows_1,
+            .dispatch = .mmv,
+            .epilogue = .none,
+            .activation = .q8_1,
+        } },
+        .runtime = .exactMatmul(1, 1536, output_dim),
+        .target = .{
+            .backend = .cuda,
+            .architecture = "sm_89",
+            .required_features = 0b0011,
+            .limits = .{
+                .max_threads_per_block = 1024,
+                .max_shared_memory_bytes = 64 * 1024,
+                .max_registers_per_thread = 255,
+                .max_registers_per_block = 64 * 1024,
+            },
+        },
+        .schedule = .{
+            .family = "mmvq",
+            .threads_per_block = 128,
+            .cols_per_block = 1,
+            .vector_width = 2,
+            .resources = .{
+                .static_shared_memory_bytes = 512,
+                .registers_per_thread = 32,
+            },
+        },
+        .kernel_id = if (output_dim == 6144) "antfly_q4_0_q8_1_1536x6144_sm89" else "antfly_q4_0_q8_1_1536x12288_sm89",
+    };
+}
+
+test "quant kernel compiler AOT catalog identities are semantic and stable" {
+    try std.testing.expectEqualStrings("sm_89", cuda_sm89_promotion_target.architecture);
+    try std.testing.expectEqual(@as(u64, 0xa9ce_514a_184e_e15d), cuda_sm89_promotion_target_fingerprint);
+
+    const entry = testAotCatalogEntry(6144);
+    try entry.validate();
+    try std.testing.expectEqual(@as(u64, 0x860a_6d1e_5aa3_40b2), entry.fingerprint());
+
+    var provenance_changed = entry;
+    provenance_changed.source_fingerprint = 0xfeed_beef;
+    provenance_changed.production_enabled = true;
+    try std.testing.expectEqual(entry.fingerprint(), provenance_changed.fingerprint());
+
+    var limit_changed = entry;
+    limit_changed.target.limits.max_shared_memory_bytes = 96 * 1024;
+    try std.testing.expectEqual(entry.fingerprint(), limit_changed.fingerprint());
+
+    const id = try entry.id(std.testing.allocator);
+    defer std.testing.allocator.free(id);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        id,
+        "antfly.kernel.aot.v1/cuda/sm_89/small_batch_matmul/",
+    ));
+}
+
+test "quant kernel compiler AOT catalog requires exact compute shapes" {
+    var entry = testAotCatalogEntry(6144);
+    entry.runtime.input_dim = .{ .min = 1024, .max = 2048, .multiple_of = 32 };
+    try std.testing.expectError(error.InexactMatmulRuntimeConstraint, entry.validate());
+
+    entry = testAotCatalogEntry(6144);
+    entry.runtime.input_dim = .{ .min = 1536, .max = 1536 };
+    try entry.validate();
+}
+
+test "quant kernel compiler AOT catalog rejects ambiguous runtime entries" {
+    const first = testAotCatalogEntry(6144);
+    var ambiguous = first;
+    ambiguous.kernel_id = "antfly_q4_0_q8_1_1536x6144_sm89_alt";
+    ambiguous.schedule.threads_per_block = 256;
+    const ambiguous_entries = [_]CatalogEntry{ first, ambiguous };
+    try std.testing.expectError(error.AmbiguousCatalogEntry, (Catalog{ .entries = &ambiguous_entries }).validate());
+
+    const second = testAotCatalogEntry(12288);
+    const entries = [_]CatalogEntry{ first, second };
+    const catalog = Catalog{ .entries = &entries };
+    try catalog.validate();
+
+    const resolved = (try catalog.resolve(.{
+        .signature = first.signature,
+        .runtime = .{ .rows = 1, .input_dim = 1536, .output_dim = 12288 },
+        .target = .{
+            .backend = .cuda,
+            .architecture = "sm_89",
+            .required_features = 0b1111,
+        },
+    })) orelse return error.MissingAotCatalogEntry;
+    try std.testing.expectEqualStrings(second.kernel_id, resolved.kernel_id);
+
+    try std.testing.expect((try catalog.resolve(.{
+        .signature = first.signature,
+        .runtime = .{ .rows = 2, .input_dim = 1536, .output_dim = 12288 },
+        .target = .{ .backend = .cuda, .architecture = "sm_89", .required_features = 0b1111 },
+    })) == null);
+}
+
+test "quant kernel compiler AOT catalog validates target resources" {
+    var entry = testAotCatalogEntry(6144);
+    entry.schedule.threads_per_block = 1024;
+    entry.target.limits.max_threads_per_block = 512;
+    try std.testing.expectError(error.ScheduleThreadsExceedTarget, entry.validate());
+
+    entry = testAotCatalogEntry(6144);
+    entry.schedule.resources.dynamic_shared_memory_bytes = 64 * 1024;
+    try std.testing.expectError(error.ScheduleSharedMemoryExceedsTarget, entry.validate());
+
+    entry = testAotCatalogEntry(6144);
+    entry.schedule.resources.registers_per_thread = 129;
+    entry.schedule.threads_per_block = 512;
+    try std.testing.expectError(error.ScheduleRegisterFileExceedsTarget, entry.validate());
+}
+
 /// The kind of kernel a generated artifact represents. The renderer, evidence,
 /// and manifest machinery are keyed by `kernel_id` and are op-agnostic; `op_kind`
 /// is the routing dimension that selects which skeleton/spec a route uses. Today
 /// every generated route is `small_batch_matmul`; `attention` and `microkernel`
 /// are the extension points (a family of narrowly-routed attention kernels and
 /// fused attention-adjacent microkernels — RMSNorm/rope/KV read-write).
-pub const OpKind = enum(u8) {
-    small_batch_matmul,
-    attention,
-    microkernel,
-};
-
-pub const Epilogue = enum(u8) {
-    none,
-    bias,
-    bias_gelu,
-    pair,
-    triple,
-    relu,
-    gelu,
-    add,
-    argmax,
-    /// Fused FFN gate+up: two projections sharing one q8_1-quantized input,
-    /// activation multiply, q8_1-requantized output (CUDA decode contract).
-    pair_activation,
-    /// FFN down projection consuming the q8_1-quantized activated vector
-    /// produced by `pair_activation`, f32 output (CUDA decode contract).
-    gated_down,
-};
+pub const OpKind = quant_kernel_op.OpKind;
+pub const MicrokernelKind = quant_kernel_op.MicrokernelKind;
+pub const AttentionKind = quant_kernel_op.AttentionKind;
+pub const Epilogue = quant_kernel_op.Epilogue;
+pub const ActivationEncoding = quant_kernel_op.ActivationEncoding;
+pub const ActivationFunction = quant_kernel_op.ActivationFunction;
+pub const OutputEncoding = quant_kernel_op.OutputEncoding;
+pub const SpecializationSignature = quant_kernel_op.SpecializationSignature;
+pub const RuntimeDimensionConstraint = quant_kernel_op.RuntimeDimensionConstraint;
+pub const RuntimeShape = quant_kernel_op.RuntimeShape;
+pub const RuntimeConstraints = quant_kernel_op.RuntimeConstraints;
 
 pub const DType = enum(u8) {
     f32,
@@ -138,6 +506,7 @@ pub const IROp = enum(u8) {
     apply_bias,
     apply_gelu,
     write_output,
+    write_argmax_pair,
 };
 
 pub const QuantKernelIR = struct {
@@ -201,6 +570,14 @@ pub const KernelSchedule = struct {
     ///    otherwise). ALU-only; layout-neutral.
     key_chunk: u16 = 32,
     skip_rescale: bool = false,
+    attention_serial_threads_per_threadgroup: u16 = 0,
+    attention_stage2_threads_per_threadgroup: u16 = 0,
+    attention_kv_splits: u8 = 1,
+    attention_query_heads_per_kv_head: u8 = 1,
+    attention_split_kv_min_tokens: u16 = 0,
+    attention_max_kv_tokens: u16 = 0,
+    attention_storage: AttentionStorage = .f32,
+    attention_key_storage: AttentionStorage = .f32,
 
     /// A block's lanes are processed strided across threads when the block has
     /// more values than the threadgroup has threads.
@@ -209,7 +586,7 @@ pub const KernelSchedule = struct {
     }
 
     pub fn validate(self: KernelSchedule, block_values: usize) !void {
-        if (self.threads_per_threadgroup % 32 != 0 or self.threads_per_threadgroup == 0) {
+        if (self.threads_per_threadgroup % 32 != 0 or self.threads_per_threadgroup == 0 or self.threads_per_threadgroup > 1024) {
             return error.InvalidThreadCount;
         }
         if (self.cols_per_threadgroup != 1 and self.cols_per_threadgroup != 2) {
@@ -219,7 +596,7 @@ pub const KernelSchedule = struct {
             .simd_sum => if (self.threads_per_threadgroup != 32) return error.SimdSumNeeds32Threads,
             .threadgroup_tree => {
                 if (self.threads_per_threadgroup < 64) return error.MultiSimdgroupNeeds64Threads;
-                if (!std.math.isPowerOfTwo(self.threads_per_threadgroup)) return error.ThreadgroupTreeNeedsPowerOfTwoThreads;
+                if (!std.math.isPowerOfTwo(self.threads_per_threadgroup)) return error.TreeReductionNeedsPowerOfTwoThreads;
             },
             .hybrid_simd => if (self.threads_per_threadgroup < 64) return error.MultiSimdgroupNeeds64Threads,
         }
@@ -229,9 +606,19 @@ pub const KernelSchedule = struct {
     }
 };
 
-test "quant kernel compiler threadgroup tree schedule requires power-of-two threads" {
-    const schedule = KernelSchedule{ .threads_per_threadgroup = 96, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree };
-    try std.testing.expectError(error.ThreadgroupTreeNeedsPowerOfTwoThreads, schedule.validate(256));
+pub const AttentionStorage = enum {
+    f32,
+    f16,
+    bf16,
+    paged_f16_or_polar4,
+};
+
+test "quant kernel compiler rejects unsafe Metal reduction thread counts" {
+    const non_power_of_two_tree = KernelSchedule{ .threads_per_threadgroup = 96, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree };
+    try std.testing.expectError(error.TreeReductionNeedsPowerOfTwoThreads, non_power_of_two_tree.validate(256));
+
+    const oversized_hybrid = KernelSchedule{ .threads_per_threadgroup = 1056, .cols_per_threadgroup = 1, .reduction = .hybrid_simd };
+    try std.testing.expectError(error.InvalidThreadCount, oversized_hybrid.validate(256));
 }
 
 /// One (format, row_bucket, epilogue) -> schedule mapping. The
@@ -415,6 +802,7 @@ pub const BenchmarkCase = struct {
     correctness_evidence_path: []const u8,
     benchmark_evidence_path: []const u8,
     benchmark_mode: []const u8,
+    target_fingerprint: u64,
     production_enabled: bool,
 };
 
@@ -461,10 +849,48 @@ const BenchmarkEvidence = struct {
     correctness_evidence_path: []const u8,
     benchmark_evidence_path: []const u8,
     benchmark_mode: []const u8,
+    target_fingerprint: u64,
     repeat_runs: usize,
     correctness_passed: bool,
     benchmark_passed: bool,
     measured_speedup: f64,
+};
+
+const CudaQ4EvidenceShape = struct {
+    label: []const u8,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    baseline_ns: u64,
+    generated_ns: u64,
+    speedup: f64,
+};
+
+const CudaQ4EvidenceFile = struct {
+    schema: []const u8,
+    kernel_id: []const u8,
+    generated_source_path: []const u8,
+    generated_source_fingerprint: u64,
+    generated_ptx_path: []const u8,
+    generated_ptx_command: []const u8,
+    benchmark_command: []const u8,
+    correctness_evidence_path: []const u8,
+    benchmark_evidence_path: []const u8,
+    benchmark_mode: []const u8,
+    repeat_runs: usize,
+    runtime_min_in_dim: usize,
+    production_enabled: bool,
+    correctness_passed: bool,
+    benchmark_passed: bool,
+    promotion_ready: bool,
+    measured_speedup: f64,
+    worst_shape_speedup: f64,
+    minimum_speedup: f64,
+    correctness_tolerance_abs: f64,
+    baseline_kernel: []const u8,
+    warmup_iters: usize,
+    measure_iters: usize,
+    shapes: []const CudaQ4EvidenceShape,
 };
 
 const MetalRuntimeEvidence = struct {
@@ -532,6 +958,7 @@ const BenchmarkManifestRecord = struct {
     correctness_evidence_path: []const u8,
     benchmark_evidence_path: []const u8,
     benchmark_mode: []const u8,
+    target_fingerprint: u64,
     production_enabled: bool,
     promotion_ready: bool,
     promotion_blocker: []const u8,
@@ -561,6 +988,7 @@ const MetalProductionBenchmarkManifestRecord = struct {
 const ArtifactManifest = struct {
     schema: []const u8,
     artifact_count: usize,
+    registry_artifact_count: usize,
     checked_in_metal_evidence_count: usize,
     metal_promotion_blocker_evidence_count: usize,
     metal_promotion_blocker_evidence_path_count: usize,
@@ -599,8 +1027,49 @@ const ArtifactManifest = struct {
     metal_production_regression_build_command: []const u8,
     metal_production_regression_evidence_command: []const u8,
     metal_blocker_strict_check_command: []const u8,
+    registry_artifacts: []const ArtifactRegistryManifestRecord,
     artifacts: []const ArtifactManifestRecord,
     metal_evidence_records: []const MetalRuntimeEvidence,
+};
+
+const ArtifactRegistryManifestRecord = struct {
+    backend: []const u8,
+    op_kind: []const u8,
+    kernel_id: []const u8,
+    source_path: []const u8,
+    generated_source_fingerprint: u64,
+    check_command: []const u8,
+    production_enabled: bool,
+    runtime_min_in_dim: usize,
+    cuda_kernel: ?[]const u8 = null,
+    cuda_launch: ?cuda_renderer.LaunchMetadata = null,
+    cuda_serial_kernel: ?[]const u8 = null,
+    cuda_serial_launch: ?cuda_renderer.LaunchMetadata = null,
+    cuda_reduction_kernel: ?[]const u8 = null,
+    cuda_reduction_launch: ?cuda_renderer.LaunchMetadata = null,
+    cuda_attention_source_id: ?[]const u8 = null,
+    cuda_attention_split_count: ?u8 = null,
+    cuda_attention_workspace: ?cuda_renderer.AttentionWorkspaceLayout = null,
+    matmul: ?MatmulArtifactManifestOp = null,
+    microkernel: ?MicrokernelArtifactManifestOp = null,
+    attention: ?AttentionArtifactManifestOp = null,
+};
+
+const MatmulArtifactManifestOp = struct {
+    format: []const u8,
+    row_bucket: []const u8,
+    epilogue: []const u8,
+};
+
+const MicrokernelArtifactManifestOp = struct {
+    kind: []const u8,
+    schedule: KernelSchedule,
+};
+
+const AttentionArtifactManifestOp = struct {
+    kind: []const u8,
+    head_dim: u16,
+    schedule: KernelSchedule,
 };
 
 const ArtifactManifestRecord = struct {
@@ -617,9 +1086,13 @@ const ArtifactManifestRecord = struct {
     promotion_evidence_command: []const u8,
     promotion_check_command: []const u8,
     promotion_policy: []const u8,
+    promotion_target_fingerprint: u64,
     production_enabled: bool,
     runtime_wired: bool,
     runtime_gate_env: []const u8,
+    runtime_min_in_dim: usize,
+    cuda_kernel: ?[]const u8,
+    cuda_launch: ?cuda_renderer.LaunchMetadata,
     production_regression_checked: bool,
     production_regression_command: []const u8,
     metal_promotion_min_speedup: f64,
@@ -706,11 +1179,38 @@ const ConformanceManifestRecord = struct {
     metal_fallback_reason: []const u8,
 };
 
-pub const GeneratedArtifact = struct {
-    backend: Backend,
+pub const MatmulArtifactOp = struct {
     format: quant_matmul.Format,
     row_bucket: quant_matmul.RowBucket,
     epilogue: Epilogue,
+    activation: ActivationEncoding = .f32,
+    /// `null` means the kernel accepts the activation function at runtime.
+    function: ?ActivationFunction = null,
+    output: OutputEncoding = .f32,
+};
+
+pub const MicrokernelArtifactOp = struct {
+    kind: MicrokernelKind,
+    schedule: KernelSchedule,
+};
+
+pub const AttentionArtifactOp = struct {
+    kind: AttentionKind,
+    head_dim: u16 = 0,
+    schedule: KernelSchedule,
+};
+
+/// Backend-independent operation descriptor used by the artifact registry.
+/// Only the active operation carries format- or schedule-specific metadata, so
+/// non-matmul routes cannot acquire meaning through placeholder quant fields.
+pub const GeneratedOp = union(OpKind) {
+    small_batch_matmul: MatmulArtifactOp,
+    attention: AttentionArtifactOp,
+    microkernel: MicrokernelArtifactOp,
+};
+
+pub const GeneratedArtifact = struct {
+    backend: Backend,
     kernel_id: []const u8,
     source_path: []const u8,
     check_command: []const u8,
@@ -718,9 +1218,109 @@ pub const GeneratedArtifact = struct {
     promotion_evidence_command: []const u8 = "",
     promotion_check_command: []const u8 = "",
     production_enabled: bool,
-    /// Routing dimension for the codegen renderer. Defaults to the only op-kind
-    /// generated today; `attention`/`microkernel` routes are wired in later.
-    op_kind: OpKind = .small_batch_matmul,
+    runtime_shape: RuntimeShapeConstraint = .{},
+    cuda_kernel: ?cuda_renderer.KernelKind = null,
+    cuda_attention_kernel: ?cuda_renderer.AttentionKernelKind = null,
+    op: GeneratedOp,
+
+    pub fn opKind(self: GeneratedArtifact) OpKind {
+        return std.meta.activeTag(self.op);
+    }
+
+    pub fn matmulOp(self: GeneratedArtifact) ?MatmulArtifactOp {
+        return switch (self.op) {
+            .small_batch_matmul => |op| op,
+            else => null,
+        };
+    }
+
+    pub fn microkernelOp(self: GeneratedArtifact) ?MicrokernelArtifactOp {
+        return switch (self.op) {
+            .microkernel => |op| op,
+            else => null,
+        };
+    }
+
+    pub fn attentionOp(self: GeneratedArtifact) ?AttentionArtifactOp {
+        return switch (self.op) {
+            .attention => |op| op,
+            else => null,
+        };
+    }
+};
+
+/// Matmul-only compatibility view for the promotion, benchmark, and routing
+/// machinery. Values are derived from `first_generated_artifacts`; this is not
+/// an independently authored registry.
+pub const GeneratedMatmulArtifact = struct {
+    backend: Backend,
+    format: quant_matmul.Format,
+    row_bucket: quant_matmul.RowBucket,
+    epilogue: Epilogue,
+    activation: ActivationEncoding = .f32,
+    function: ?ActivationFunction = null,
+    output: OutputEncoding = .f32,
+    kernel_id: []const u8,
+    source_path: []const u8,
+    check_command: []const u8,
+    runtime_evidence_command: []const u8 = "",
+    promotion_evidence_command: []const u8 = "",
+    promotion_check_command: []const u8 = "",
+    production_enabled: bool,
+    runtime_shape: RuntimeShapeConstraint = .{},
+    cuda_kernel: ?cuda_renderer.KernelKind = null,
+    cuda_attention_kernel: ?cuda_renderer.AttentionKernelKind = null,
+
+    pub fn opKind(_: GeneratedMatmulArtifact) OpKind {
+        return .small_batch_matmul;
+    }
+
+    pub fn matmulOp(self: GeneratedMatmulArtifact) ?MatmulArtifactOp {
+        return .{
+            .format = self.format,
+            .row_bucket = self.row_bucket,
+            .epilogue = self.epilogue,
+            .activation = self.activation,
+            .function = self.function,
+            .output = self.output,
+        };
+    }
+
+    pub fn attentionOp(_: GeneratedMatmulArtifact) ?AttentionArtifactOp {
+        return null;
+    }
+
+    pub fn asGeneratedArtifact(self: GeneratedMatmulArtifact) GeneratedArtifact {
+        return .{
+            .backend = self.backend,
+            .kernel_id = self.kernel_id,
+            .source_path = self.source_path,
+            .check_command = self.check_command,
+            .runtime_evidence_command = self.runtime_evidence_command,
+            .promotion_evidence_command = self.promotion_evidence_command,
+            .promotion_check_command = self.promotion_check_command,
+            .production_enabled = self.production_enabled,
+            .runtime_shape = self.runtime_shape,
+            .cuda_kernel = self.cuda_kernel,
+            .cuda_attention_kernel = self.cuda_attention_kernel,
+            .op = .{ .small_batch_matmul = .{
+                .format = self.format,
+                .row_bucket = self.row_bucket,
+                .epilogue = self.epilogue,
+                .activation = self.activation,
+                .function = self.function,
+                .output = self.output,
+            } },
+        };
+    }
+};
+
+pub const RuntimeShapeConstraint = struct {
+    min_in_dim: usize = 0,
+
+    pub fn matches(self: RuntimeShapeConstraint, plan: quant_matmul.Plan) bool {
+        return plan.in_dim >= self.min_in_dim;
+    }
 };
 
 pub const QuantKernelCompileRequest = struct {
@@ -735,12 +1335,13 @@ pub const QuantKernelCompiledSource = struct {
     spec: QuantKernelSpec,
     ir: QuantKernelIR,
     lowering: QuantKernelLowering,
-    artifact: GeneratedArtifact,
+    artifact: GeneratedMatmulArtifact,
     source: []const u8,
     source_path: []const u8,
     check_command: []const u8,
     runtime_gate_env: ?[*:0]const u8,
     production_enabled: bool,
+    cuda_render_plan: ?cuda_renderer.RenderPlan = null,
 };
 
 pub const EmittedCompiledSource = struct {
@@ -1175,10 +1776,11 @@ const first_epilogues = [_]Epilogue{ .none, .bias, .bias_gelu, .pair };
 const q8_0_epilogues = [_]Epilogue{ .none, .bias, .bias_gelu, .pair, .relu };
 const coverage_epilogues = [_]Epilogue{ .none, .bias, .bias_gelu, .pair, .triple, .relu, .gelu, .add, .argmax, .pair_activation, .gated_down };
 const no_bias_epilogues = [_]Epilogue{.none};
-const q4_0_epilogues = [_]Epilogue{ .none, .pair, .pair_activation, .gated_down };
+const q4_0_epilogues = [_]Epilogue{ .none, .pair, .argmax, .pair_activation, .gated_down };
 const q2_k_epilogues = [_]Epilogue{ .none, .bias, .bias_gelu };
 const q3_k_epilogues = [_]Epilogue{ .none, .bias, .bias_gelu };
 const k_quant_epilogues = [_]Epilogue{ .none, .bias, .bias_gelu };
+const q6_k_epilogues = [_]Epilogue{ .none, .bias, .bias_gelu, .argmax };
 const first_backends = [_]Backend{ .cuda, .metal };
 const metal_backends = [_]Backend{.metal};
 
@@ -1501,7 +2103,7 @@ const q6_k_spec = QuantKernelSpec{
     .block_fields = &q6_k_block_fields,
     .decode_ops = &q6_k_decode_ops,
     .supported_schedules = &first_schedules,
-    .supported_epilogues = &k_quant_epilogues,
+    .supported_epilogues = &q6_k_epilogues,
     .accumulator_dtype = .f32,
     .output_dtype = .f32,
     .supported_backends = &first_backends,
@@ -1576,8 +2178,23 @@ const ir_ops_bias_gelu = [_]IROp{
     .write_output,
 };
 
+const ir_ops_argmax = [_]IROp{
+    .load_input_row,
+    .load_quant_block,
+    .decode_quant_lane,
+    .multiply_accumulate,
+    .reduce_accumulator,
+    .write_argmax_pair,
+};
+
 pub const first_lazy_benchmark_evidence_path = "src/ops/cuda/generated/evidence/q4_k_small_batch_bias_gelu_benchmark.json";
 pub const first_lazy_cuda_source_fingerprint = sourceFingerprint(first_lazy_cuda_source);
+
+pub const first_general_cuda_q4_k_mmv_kernel_id = "antfly_q4_k_mmv_f32_v1";
+pub const first_general_cuda_q4_k_mmv_source_path = "src/ops/cuda/generated/quant_kernel_q4_k_mmv.cu";
+pub const first_general_cuda_q4_k_mmv_ptx_path = "/tmp/antfly_q4_k_mmv_f32_v1.fatbin";
+pub const first_general_cuda_q4_k_mmv_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_general_cuda_q4_k_mmv_source_path ++ " -o " ++ first_general_cuda_q4_k_mmv_ptx_path;
+pub const first_general_cuda_q4_k_mmv_source_fingerprint = sourceFingerprint(first_general_cuda_q4_k_mmv_source);
 
 pub const first_lazy_benchmark = BenchmarkCase{
     .name = "q4_k_small_batch_bias_gelu",
@@ -1588,9 +2205,9 @@ pub const first_lazy_benchmark = BenchmarkCase{
     .generated_kernel_id = "antfly_q4_k_small_batch_bias_gelu_f32_v1",
     .generated_source_path = "src/ops/cuda/generated/quant_kernel_q4_k_small_batch_bias_gelu.cu",
     .generated_source_fingerprint = first_lazy_cuda_source_fingerprint,
-    .generated_ptx_path = "/tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.ptx",
-    .generated_ptx_command = "nvcc -ptx -arch=compute_75 src/ops/cuda/generated/quant_kernel_q4_k_small_batch_bias_gelu.cu -o /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.ptx",
-    .benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.ptx --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_lazy_benchmark_evidence_path,
+    .generated_ptx_path = "/tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin",
+    .generated_ptx_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " src/ops/cuda/generated/quant_kernel_q4_k_small_batch_bias_gelu.cu -o /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin",
+    .benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_lazy_benchmark_evidence_path,
     .generated_ptx_arg = "--quant-compiler-generated-ptx",
     .handwritten_baseline = "termite_linear_q4_k_bias_gelu_f32_tile4_r2",
     .correctness_tolerance_abs = 0.01,
@@ -1598,6 +2215,7 @@ pub const first_lazy_benchmark = BenchmarkCase{
     .correctness_evidence_path = "",
     .benchmark_evidence_path = "",
     .benchmark_mode = "",
+    .target_fingerprint = cuda_sm89_promotion_target_fingerprint,
     .production_enabled = false,
 };
 
@@ -1623,6 +2241,7 @@ pub const first_q4_0_mmv_benchmark = BenchmarkCase{
     .correctness_evidence_path = first_general_cuda_q4_0_mmv_evidence_path,
     .benchmark_evidence_path = first_general_cuda_q4_0_mmv_evidence_path,
     .benchmark_mode = "sequential",
+    .target_fingerprint = cuda_sm89_promotion_target_fingerprint,
     .production_enabled = true,
 };
 
@@ -1645,6 +2264,7 @@ pub const first_q4_0_mm_benchmark = BenchmarkCase{
     .correctness_evidence_path = first_general_cuda_q4_0_mm_evidence_path,
     .benchmark_evidence_path = first_general_cuda_q4_0_mm_evidence_path,
     .benchmark_mode = "sequential",
+    .target_fingerprint = cuda_sm89_promotion_target_fingerprint,
     .production_enabled = true,
 };
 
@@ -1669,6 +2289,7 @@ pub const first_q4_0_pair_benchmark = BenchmarkCase{
     .correctness_evidence_path = first_general_cuda_q4_0_pair_evidence_path,
     .benchmark_evidence_path = first_general_cuda_q4_0_pair_evidence_path,
     .benchmark_mode = "sequential",
+    .target_fingerprint = cuda_sm89_promotion_target_fingerprint,
     .production_enabled = true,
 };
 
@@ -1694,6 +2315,7 @@ pub const first_q4_0_pair_q8_benchmark = BenchmarkCase{
     .correctness_evidence_path = first_general_cuda_q4_0_pair_q8_evidence_path,
     .benchmark_evidence_path = first_general_cuda_q4_0_pair_q8_evidence_path,
     .benchmark_mode = "sequential",
+    .target_fingerprint = cuda_sm89_promotion_target_fingerprint,
     .production_enabled = true,
 };
 
@@ -1716,6 +2338,7 @@ pub const first_q4_0_down_q8_benchmark = BenchmarkCase{
     .correctness_evidence_path = first_general_cuda_q4_0_down_q8_evidence_path,
     .benchmark_evidence_path = first_general_cuda_q4_0_down_q8_evidence_path,
     .benchmark_mode = "sequential",
+    .target_fingerprint = cuda_sm89_promotion_target_fingerprint,
     .production_enabled = true,
 };
 
@@ -1734,6 +2357,7 @@ const first_benchmark_evidence = [_]BenchmarkEvidence{
         .correctness_evidence_path = first_general_cuda_q4_0_mmv_evidence_path,
         .benchmark_evidence_path = first_general_cuda_q4_0_mmv_evidence_path,
         .benchmark_mode = "sequential",
+        .target_fingerprint = cuda_sm89_promotion_target_fingerprint,
         .repeat_runs = 3,
         .correctness_passed = true,
         .benchmark_passed = true,
@@ -1749,10 +2373,11 @@ const first_benchmark_evidence = [_]BenchmarkEvidence{
         .correctness_evidence_path = first_general_cuda_q4_0_mm_evidence_path,
         .benchmark_evidence_path = first_general_cuda_q4_0_mm_evidence_path,
         .benchmark_mode = "sequential",
+        .target_fingerprint = cuda_sm89_promotion_target_fingerprint,
         .repeat_runs = 3,
         .correctness_passed = true,
         .benchmark_passed = true,
-        .measured_speedup = 3.528543,
+        .measured_speedup = 5.911449,
     },
     .{
         .kernel_id = first_general_cuda_q4_0_pair_kernel_id,
@@ -1764,6 +2389,7 @@ const first_benchmark_evidence = [_]BenchmarkEvidence{
         .correctness_evidence_path = first_general_cuda_q4_0_pair_evidence_path,
         .benchmark_evidence_path = first_general_cuda_q4_0_pair_evidence_path,
         .benchmark_mode = "sequential",
+        .target_fingerprint = cuda_sm89_promotion_target_fingerprint,
         .repeat_runs = 3,
         .correctness_passed = true,
         .benchmark_passed = true,
@@ -1779,10 +2405,11 @@ const first_benchmark_evidence = [_]BenchmarkEvidence{
         .correctness_evidence_path = first_general_cuda_q4_0_pair_q8_evidence_path,
         .benchmark_evidence_path = first_general_cuda_q4_0_pair_q8_evidence_path,
         .benchmark_mode = "sequential",
+        .target_fingerprint = cuda_sm89_promotion_target_fingerprint,
         .repeat_runs = 3,
         .correctness_passed = true,
         .benchmark_passed = true,
-        .measured_speedup = 1.278555,
+        .measured_speedup = 1.247815,
     },
     .{
         .kernel_id = first_general_cuda_q4_0_down_q8_kernel_id,
@@ -1794,11 +2421,20 @@ const first_benchmark_evidence = [_]BenchmarkEvidence{
         .correctness_evidence_path = first_general_cuda_q4_0_down_q8_evidence_path,
         .benchmark_evidence_path = first_general_cuda_q4_0_down_q8_evidence_path,
         .benchmark_mode = "sequential",
+        .target_fingerprint = cuda_sm89_promotion_target_fingerprint,
         .repeat_runs = 3,
         .correctness_passed = true,
         .benchmark_passed = true,
-        .measured_speedup = 1.312934,
+        .measured_speedup = 1.089808,
     },
+};
+
+const first_cuda_q4_evidence_json = [_][]const u8{
+    @embedFile("../ops/cuda/generated/evidence/q4_0_mmv_benchmark.json"),
+    @embedFile("../ops/cuda/generated/evidence/q4_0_mm_benchmark.json"),
+    @embedFile("../ops/cuda/generated/evidence/q4_0_pair_benchmark.json"),
+    @embedFile("../ops/cuda/generated/evidence/q4_0_pair_q8_benchmark.json"),
+    @embedFile("../ops/cuda/generated/evidence/q4_0_down_q8_benchmark.json"),
 };
 const first_metal_runtime_evidence = [_]MetalRuntimeEvidence{
     .{
@@ -1950,44 +2586,92 @@ pub const first_metal_promotion_blocker_evidence_expected_case_count = metalProm
 pub const first_metal_promotion_blocker_evidence_expected_route_ready_count = first_metal_promotion_blocker_evidence_expected_case_count;
 pub const first_metal_production_benchmark_cases = buildMetalProductionBenchmarkCases();
 pub const first_metal_production_benchmark_case_count = first_metal_production_benchmark_cases.len;
-pub const first_artifact_manifest_schema = "antfly.quant_kernel_artifacts.v3";
+pub const first_artifact_manifest_schema = "antfly.quant_kernel_artifacts.v4";
 pub const first_benchmark_manifest_schema = "antfly.quant_kernel_benchmarks.v5";
 pub const first_lazy_benchmark_check_command = "zig-out/bin/antfly-inference bench-cuda --quant-compiler-check-evidence " ++ first_lazy_benchmark_evidence_path ++ " --quant-compiler-require-promotion-ready";
 pub const first_spec_manifest_path = "src/ops/cuda/generated/quant_kernel_specs.json";
 pub const first_artifact_manifest_path = "src/ops/cuda/generated/quant_kernel_artifacts.json";
 pub const first_benchmark_manifest_path = "src/ops/cuda/generated/quant_kernel_benchmarks.json";
 pub const first_conformance_manifest_path = "src/ops/cuda/generated/quant_kernel_conformance.json";
+pub const first_cuda_generated_fatbin_options = "-gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_75,code=compute_75";
 
 pub const first_general_cuda_q4_0_mmv_kernel_id = "antfly_q4_0_mmv_f32_v1";
 pub const first_general_cuda_q4_0_mmv_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_mmv.cu";
-pub const first_general_cuda_q4_0_mmv_ptx_path = "/tmp/antfly_q4_0_mmv_f32_v1.ptx";
-pub const first_general_cuda_q4_0_mmv_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_mmv_source_path ++ " -o " ++ first_general_cuda_q4_0_mmv_ptx_path;
+pub const first_general_cuda_q4_0_mmv_ptx_path = "/tmp/antfly_q4_0_mmv_f32_v1.fatbin";
+pub const first_general_cuda_q4_0_mmv_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_general_cuda_q4_0_mmv_source_path ++ " -o " ++ first_general_cuda_q4_0_mmv_ptx_path;
 pub const first_general_cuda_q4_0_mmv_evidence_path = "src/ops/cuda/generated/evidence/q4_0_mmv_benchmark.json";
 pub const first_general_cuda_q4_0_mmv_benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-mmv-ptx " ++ first_general_cuda_q4_0_mmv_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_mmv_evidence_path;
 pub const first_general_cuda_q4_0_mm_kernel_id = "antfly_q4_0_mm_f32_v1";
 pub const first_general_cuda_q4_0_mm_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_mm.cu";
-pub const first_general_cuda_q4_0_mm_ptx_path = "/tmp/antfly_q4_0_mm_f32_v1.ptx";
-pub const first_general_cuda_q4_0_mm_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_mm_source_path ++ " -o " ++ first_general_cuda_q4_0_mm_ptx_path;
+pub const first_general_cuda_q4_0_mm_ptx_path = "/tmp/antfly_q4_0_mm_f32_v1.fatbin";
+pub const first_general_cuda_q4_0_mm_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_general_cuda_q4_0_mm_source_path ++ " -o " ++ first_general_cuda_q4_0_mm_ptx_path;
 pub const first_general_cuda_q4_0_mm_evidence_path = "src/ops/cuda/generated/evidence/q4_0_mm_benchmark.json";
 pub const first_general_cuda_q4_0_mm_benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-mm-ptx " ++ first_general_cuda_q4_0_mm_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_mm_evidence_path;
 pub const first_general_cuda_q4_0_pair_kernel_id = "antfly_q4_0_pair_mmv_f32_v1";
 pub const first_general_cuda_q4_0_pair_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_pair_mmv.cu";
-pub const first_general_cuda_q4_0_pair_ptx_path = "/tmp/antfly_q4_0_pair_mmv_f32_v1.ptx";
-pub const first_general_cuda_q4_0_pair_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_pair_source_path ++ " -o " ++ first_general_cuda_q4_0_pair_ptx_path;
+pub const first_general_cuda_q4_0_pair_ptx_path = "/tmp/antfly_q4_0_pair_mmv_f32_v1.fatbin";
+pub const first_general_cuda_q4_0_pair_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_general_cuda_q4_0_pair_source_path ++ " -o " ++ first_general_cuda_q4_0_pair_ptx_path;
 pub const first_general_cuda_q4_0_pair_evidence_path = "src/ops/cuda/generated/evidence/q4_0_pair_benchmark.json";
 pub const first_general_cuda_q4_0_pair_benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-pair-ptx " ++ first_general_cuda_q4_0_pair_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_pair_evidence_path;
 pub const first_general_cuda_q4_0_pair_q8_kernel_id = "antfly_q4_0_pair_activation_q8_1_mmv_v1";
 pub const first_general_cuda_q4_0_pair_q8_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_pair_activation_q8_1.cu";
-pub const first_general_cuda_q4_0_pair_q8_ptx_path = "/tmp/antfly_q4_0_pair_activation_q8_1_mmv_v1.ptx";
-pub const first_general_cuda_q4_0_pair_q8_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_pair_q8_source_path ++ " -o " ++ first_general_cuda_q4_0_pair_q8_ptx_path;
+pub const first_general_cuda_q4_0_pair_q8_ptx_path = "/tmp/antfly_q4_0_pair_activation_q8_1_mmv_v1.fatbin";
+pub const first_general_cuda_q4_0_pair_q8_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_general_cuda_q4_0_pair_q8_source_path ++ " -o " ++ first_general_cuda_q4_0_pair_q8_ptx_path;
 pub const first_general_cuda_q4_0_pair_q8_evidence_path = "src/ops/cuda/generated/evidence/q4_0_pair_q8_benchmark.json";
 pub const first_general_cuda_q4_0_pair_q8_benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-pair-q8-ptx " ++ first_general_cuda_q4_0_pair_q8_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_pair_q8_evidence_path;
 pub const first_general_cuda_q4_0_down_q8_kernel_id = "antfly_q4_0_down_q8_1_mmv_v1";
 pub const first_general_cuda_q4_0_down_q8_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_down_q8_1.cu";
-pub const first_general_cuda_q4_0_down_q8_ptx_path = "/tmp/antfly_q4_0_down_q8_1_mmv_v1.ptx";
-pub const first_general_cuda_q4_0_down_q8_check_command = "nvcc -ptx -arch=compute_75 " ++ first_general_cuda_q4_0_down_q8_source_path ++ " -o " ++ first_general_cuda_q4_0_down_q8_ptx_path;
+pub const first_general_cuda_q4_0_down_q8_ptx_path = "/tmp/antfly_q4_0_down_q8_1_mmv_v1.fatbin";
+pub const first_general_cuda_q4_0_down_q8_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_general_cuda_q4_0_down_q8_source_path ++ " -o " ++ first_general_cuda_q4_0_down_q8_ptx_path;
 pub const first_general_cuda_q4_0_down_q8_evidence_path = "src/ops/cuda/generated/evidence/q4_0_down_q8_benchmark.json";
 pub const first_general_cuda_q4_0_down_q8_benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-down-q8-ptx " ++ first_general_cuda_q4_0_down_q8_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_down_q8_evidence_path;
+pub const first_e2b_cuda_q4_0_pair_q8_6144_kernel_id = "antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1";
+pub const first_e2b_cuda_q4_0_pair_q8_6144_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_pair_activation_q8_1_e2b_6144.cu";
+pub const first_e2b_cuda_q4_0_pair_q8_6144_ptx_path = "/tmp/antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1.fatbin";
+pub const first_e2b_cuda_q4_0_pair_q8_6144_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_e2b_cuda_q4_0_pair_q8_6144_source_path ++ " -o " ++ first_e2b_cuda_q4_0_pair_q8_6144_ptx_path;
+pub const first_e2b_cuda_q4_0_pair_q8_12288_kernel_id = "antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1";
+pub const first_e2b_cuda_q4_0_pair_q8_12288_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_pair_activation_q8_1_e2b_12288.cu";
+pub const first_e2b_cuda_q4_0_pair_q8_12288_ptx_path = "/tmp/antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1.fatbin";
+pub const first_e2b_cuda_q4_0_pair_q8_12288_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_e2b_cuda_q4_0_pair_q8_12288_source_path ++ " -o " ++ first_e2b_cuda_q4_0_pair_q8_12288_ptx_path;
+pub const first_e2b_cuda_q4_0_down_q8_6144_kernel_id = "antfly_q4_0_down_q8_1_e2b_6144_mmv_v1";
+pub const first_e2b_cuda_q4_0_down_q8_6144_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_down_q8_1_e2b_6144.cu";
+pub const first_e2b_cuda_q4_0_down_q8_6144_ptx_path = "/tmp/antfly_q4_0_down_q8_1_e2b_6144_mmv_v1.fatbin";
+pub const first_e2b_cuda_q4_0_down_q8_6144_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_e2b_cuda_q4_0_down_q8_6144_source_path ++ " -o " ++ first_e2b_cuda_q4_0_down_q8_6144_ptx_path;
+pub const first_e2b_cuda_q4_0_down_q8_12288_kernel_id = "antfly_q4_0_down_q8_1_e2b_12288_mmv_v1";
+pub const first_e2b_cuda_q4_0_down_q8_12288_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_down_q8_1_e2b_12288.cu";
+pub const first_e2b_cuda_q4_0_down_q8_12288_ptx_path = "/tmp/antfly_q4_0_down_q8_1_e2b_12288_mmv_v1.fatbin";
+pub const first_e2b_cuda_q4_0_down_q8_12288_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_e2b_cuda_q4_0_down_q8_12288_source_path ++ " -o " ++ first_e2b_cuda_q4_0_down_q8_12288_ptx_path;
+pub const first_e2b_cuda_q4_0_pair_f32_6144_exact_kernel_id = "antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1";
+pub const first_e2b_cuda_q4_0_pair_f32_6144_exact_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_pair_activation_f32_e2b_6144_exact.cu";
+pub const first_e2b_cuda_q4_0_pair_f32_6144_exact_ptx_path = "/tmp/antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1.fatbin";
+pub const first_e2b_cuda_q4_0_pair_f32_6144_exact_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_e2b_cuda_q4_0_pair_f32_6144_exact_source_path ++ " -o " ++ first_e2b_cuda_q4_0_pair_f32_6144_exact_ptx_path;
+pub const first_e2b_cuda_q4_0_pair_f32_12288_exact_kernel_id = "antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1";
+pub const first_e2b_cuda_q4_0_pair_f32_12288_exact_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_pair_activation_f32_e2b_12288_exact.cu";
+pub const first_e2b_cuda_q4_0_pair_f32_12288_exact_ptx_path = "/tmp/antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1.fatbin";
+pub const first_e2b_cuda_q4_0_pair_f32_12288_exact_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_e2b_cuda_q4_0_pair_f32_12288_exact_source_path ++ " -o " ++ first_e2b_cuda_q4_0_pair_f32_12288_exact_ptx_path;
+pub const first_e2b_cuda_q4_0_down_f32_6144_exact_kernel_id = "antfly_q4_0_down_f32_e2b_6144_exact_v1";
+pub const first_e2b_cuda_q4_0_down_f32_6144_exact_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_down_f32_e2b_6144_exact.cu";
+pub const first_e2b_cuda_q4_0_down_f32_6144_exact_ptx_path = "/tmp/antfly_q4_0_down_f32_e2b_6144_exact_v1.fatbin";
+pub const first_e2b_cuda_q4_0_down_f32_6144_exact_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_e2b_cuda_q4_0_down_f32_6144_exact_source_path ++ " -o " ++ first_e2b_cuda_q4_0_down_f32_6144_exact_ptx_path;
+pub const first_e2b_cuda_q4_0_down_f32_12288_exact_kernel_id = "antfly_q4_0_down_f32_e2b_12288_exact_v1";
+pub const first_e2b_cuda_q4_0_down_f32_12288_exact_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_down_f32_e2b_12288_exact.cu";
+pub const first_e2b_cuda_q4_0_down_f32_12288_exact_ptx_path = "/tmp/antfly_q4_0_down_f32_e2b_12288_exact_v1.fatbin";
+pub const first_e2b_cuda_q4_0_down_f32_12288_exact_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_e2b_cuda_q4_0_down_f32_12288_exact_source_path ++ " -o " ++ first_e2b_cuda_q4_0_down_f32_12288_exact_ptx_path;
+pub const first_e2b_cuda_q4_0_ffn_benchmark_command = "scripts/benchmark_gemma4_cuda_e2b_ffn.sh";
+pub const first_e2b_cuda_q4_0_q8_1_argmax_kernel_id = "antfly_q4_0_q8_1_argmax_rows_stage1_tile8_v1";
+pub const first_e2b_cuda_q4_0_q8_1_argmax_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_q8_1_argmax_e2b_tile8.cu";
+pub const first_e2b_cuda_q4_0_q8_1_argmax_ptx_path = "/tmp/antfly_q4_0_q8_1_argmax_rows_stage1_tile8_v1.fatbin";
+pub const first_e2b_cuda_q4_0_q8_1_argmax_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_e2b_cuda_q4_0_q8_1_argmax_source_path ++ " -o " ++ first_e2b_cuda_q4_0_q8_1_argmax_ptx_path;
+pub const first_cuda_q6_k_q8_1_argmax_k2560_kernel_id = "antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1";
+pub const first_cuda_q6_k_q8_1_argmax_k2560_source_path = "src/ops/cuda/generated/quant_kernel_q6_k_q8_1_argmax_k2560_tile8.cu";
+pub const first_cuda_q6_k_q8_1_argmax_k2560_ptx_path = "/tmp/antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1.fatbin";
+pub const first_cuda_q6_k_q8_1_argmax_k2560_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_cuda_q6_k_q8_1_argmax_k2560_source_path ++ " -o " ++ first_cuda_q6_k_q8_1_argmax_k2560_ptx_path;
+pub const first_cuda_q6_k_q8_1_argmax_k2560_source_fingerprint = sourceFingerprint(first_cuda_q6_k_q8_1_argmax_k2560_source);
+pub const first_cuda_q6_k_q8_1_argmax_k3840_kernel_id = "antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1";
+pub const first_cuda_q6_k_q8_1_argmax_k3840_source_path = "src/ops/cuda/generated/quant_kernel_q6_k_q8_1_argmax_k3840_tile8.cu";
+pub const first_cuda_q6_k_q8_1_argmax_k3840_ptx_path = "/tmp/antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1.fatbin";
+pub const first_cuda_q6_k_q8_1_argmax_k3840_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_cuda_q6_k_q8_1_argmax_k3840_source_path ++ " -o " ++ first_cuda_q6_k_q8_1_argmax_k3840_ptx_path;
+pub const first_cuda_q6_k_q8_1_argmax_k3840_source_fingerprint = sourceFingerprint(first_cuda_q6_k_q8_1_argmax_k3840_source);
 pub const first_lazy_metal_kernel_id = "antfly_q4_k_small_batch_bias_gelu_msl_v1";
 pub const first_lazy_metal_source_path = "src/ops/metal/generated/quant_kernel_q4_k_small_batch_bias_gelu.metal";
 pub const first_lazy_metal_air_path = "/tmp/antfly_q4_k_small_batch_bias_gelu_msl_v1.air";
@@ -2027,6 +2711,81 @@ pub const first_decode_attention_1x_metal_check_command = "xcrun --toolchain Met
 /// route is byte-for-byte the hand-written one; the flash-prefill slice is where
 /// NT/NSG become a `--sweep` knob.
 pub const first_decode_attention_1x_metal_schedule = KernelSchedule{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree };
+
+// CUDA split-KV decode candidates. Each generated source is one atomic artifact
+// containing a serial short-context kernel, a KV-head-centric partial kernel,
+// and a stable merge kernel. All three launches use the same device-scalar KV
+// length so a captured graph can cross the split threshold without recapture.
+//
+// Split count is a first-class schedule choice. The legacy split-8 IDs remain
+// runtime-owned for ABI compatibility; split-2 and split-4 are embedded
+// dev-only candidates selected explicitly by the CUDA generated-attention gate.
+pub const first_decode_attention_1x_cuda_kernel_id = cuda_renderer.generated_attention_hd256_stage1_kernel_id;
+pub const first_decode_attention_1x_cuda_source_path = "src/ops/cuda/generated/attention_decode_scalars_hd256.cu";
+pub const first_decode_attention_1x_cuda_fatbin_path = "/tmp/antfly_gqa_attention_decode_split_kv_hd256_f32_v1.fatbin";
+pub const first_decode_attention_1x_cuda_check_command = "nvcc -fatbin -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_75,code=compute_75 src/ops/cuda/generated/attention_decode_scalars_hd256.cu -o /tmp/antfly_gqa_attention_decode_split_kv_hd256_f32_v1.fatbin";
+pub const first_decode_attention_1x_cuda_schedule = cudaAttentionSchedule(256, .split8);
+pub const first_decode_attention_1x_cuda_hd512_kernel_id = cuda_renderer.generated_attention_hd512_stage1_kernel_id;
+pub const first_decode_attention_1x_cuda_hd512_source_path = "src/ops/cuda/generated/attention_decode_scalars_hd512.cu";
+pub const first_decode_attention_1x_cuda_hd512_fatbin_path = "/tmp/antfly_gqa_attention_decode_split_kv_hd512_f32_v1.fatbin";
+pub const first_decode_attention_1x_cuda_hd512_check_command = "nvcc -fatbin -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_75,code=compute_75 src/ops/cuda/generated/attention_decode_scalars_hd512.cu -o /tmp/antfly_gqa_attention_decode_split_kv_hd512_f32_v1.fatbin";
+pub const first_decode_attention_1x_cuda_hd512_schedule = cudaAttentionSchedule(512, .split8);
+
+pub const first_decode_attention_1x_cuda_split2_hd256_kernel_id = cuda_renderer.generated_attention_hd256_split2_stage1_kernel_id;
+pub const first_decode_attention_1x_cuda_split2_hd256_source_path = "src/ops/cuda/generated/attention_decode_scalars_split2_hd256.cu";
+pub const first_decode_attention_1x_cuda_split2_hd256_fatbin_path = "/tmp/antfly_gqa_attention_decode_split2_kv_hd256_f32_v1.fatbin";
+pub const first_decode_attention_1x_cuda_split2_hd256_check_command = "nvcc -fatbin -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_75,code=compute_75 src/ops/cuda/generated/attention_decode_scalars_split2_hd256.cu -o /tmp/antfly_gqa_attention_decode_split2_kv_hd256_f32_v1.fatbin";
+pub const first_decode_attention_1x_cuda_split2_hd256_schedule = cudaAttentionSchedule(256, .split2);
+
+pub const first_decode_attention_1x_cuda_split2_hd512_kernel_id = cuda_renderer.generated_attention_hd512_split2_stage1_kernel_id;
+pub const first_decode_attention_1x_cuda_split2_hd512_source_path = "src/ops/cuda/generated/attention_decode_scalars_split2_hd512.cu";
+pub const first_decode_attention_1x_cuda_split2_hd512_fatbin_path = "/tmp/antfly_gqa_attention_decode_split2_kv_hd512_f32_v1.fatbin";
+pub const first_decode_attention_1x_cuda_split2_hd512_check_command = "nvcc -fatbin -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_75,code=compute_75 src/ops/cuda/generated/attention_decode_scalars_split2_hd512.cu -o /tmp/antfly_gqa_attention_decode_split2_kv_hd512_f32_v1.fatbin";
+pub const first_decode_attention_1x_cuda_split2_hd512_schedule = cudaAttentionSchedule(512, .split2);
+
+pub const first_decode_attention_1x_cuda_split4_hd256_kernel_id = cuda_renderer.generated_attention_hd256_split4_stage1_kernel_id;
+pub const first_decode_attention_1x_cuda_split4_hd256_source_path = "src/ops/cuda/generated/attention_decode_scalars_split4_hd256.cu";
+pub const first_decode_attention_1x_cuda_split4_hd256_fatbin_path = "/tmp/antfly_gqa_attention_decode_split4_kv_hd256_f32_v1.fatbin";
+pub const first_decode_attention_1x_cuda_split4_hd256_check_command = "nvcc -fatbin -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_75,code=compute_75 src/ops/cuda/generated/attention_decode_scalars_split4_hd256.cu -o /tmp/antfly_gqa_attention_decode_split4_kv_hd256_f32_v1.fatbin";
+pub const first_decode_attention_1x_cuda_split4_hd256_schedule = cudaAttentionSchedule(256, .split4);
+
+pub const first_decode_attention_1x_cuda_split4_hd512_kernel_id = cuda_renderer.generated_attention_hd512_split4_stage1_kernel_id;
+pub const first_decode_attention_1x_cuda_split4_hd512_source_path = "src/ops/cuda/generated/attention_decode_scalars_split4_hd512.cu";
+pub const first_decode_attention_1x_cuda_split4_hd512_fatbin_path = "/tmp/antfly_gqa_attention_decode_split4_kv_hd512_f32_v1.fatbin";
+pub const first_decode_attention_1x_cuda_split4_hd512_check_command = "nvcc -fatbin -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_75,code=compute_75 src/ops/cuda/generated/attention_decode_scalars_split4_hd512.cu -o /tmp/antfly_gqa_attention_decode_split4_kv_hd512_f32_v1.fatbin";
+pub const first_decode_attention_1x_cuda_split4_hd512_schedule = cudaAttentionSchedule(512, .split4);
+
+pub const first_decode_attention_1x_cuda_score_prework_hd256_kernel_id = cuda_renderer.generated_attention_hd256_score_prework_kernel_id;
+pub const first_decode_attention_1x_cuda_score_prework_hd256_source_path = "src/ops/cuda/generated/attention_decode_score_prework_hd256.cu";
+pub const first_decode_attention_1x_cuda_score_prework_hd256_check_command = "nvcc -fatbin -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_75,code=compute_75 src/ops/cuda/generated/attention_decode_score_prework_hd256.cu -o /tmp/antfly_gqa_attention_decode_score_prework_hd256_f32_v1.fatbin";
+pub const first_decode_attention_1x_cuda_score_prework_hd256_schedule = cudaAttentionSchedule(256, .score_prework);
+
+pub const first_decode_attention_1x_cuda_score_prework_hd512_kernel_id = cuda_renderer.generated_attention_hd512_score_prework_kernel_id;
+pub const first_decode_attention_1x_cuda_score_prework_hd512_source_path = "src/ops/cuda/generated/attention_decode_score_prework_hd512.cu";
+pub const first_decode_attention_1x_cuda_score_prework_hd512_check_command = "nvcc -fatbin -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_75,code=compute_75 src/ops/cuda/generated/attention_decode_score_prework_hd512.cu -o /tmp/antfly_gqa_attention_decode_score_prework_hd512_f32_v1.fatbin";
+pub const first_decode_attention_1x_cuda_score_prework_hd512_schedule = cudaAttentionSchedule(512, .score_prework);
+
+fn cudaAttentionSchedule(head_dim: u16, split_variant: cuda_renderer.AttentionSplitVariant) KernelSchedule {
+    return .{
+        .threads_per_threadgroup = head_dim,
+        .cols_per_threadgroup = 1,
+        .reduction = .threadgroup_tree,
+        .attention_serial_threads_per_threadgroup = head_dim,
+        .attention_stage2_threads_per_threadgroup = head_dim,
+        .attention_kv_splits = split_variant.kvSplits(),
+        .attention_query_heads_per_kv_head = cuda_renderer.generated_attention_query_heads_per_kv_head,
+        .attention_split_kv_min_tokens = if (split_variant == .score_prework)
+            0
+        else
+            cuda_renderer.generated_attention_split_kv_min_tokens_default,
+        .attention_max_kv_tokens = if (split_variant == .score_prework)
+            cuda_renderer.generated_attention_score_prework_max_kv_tokens
+        else
+            0,
+        .attention_storage = .f32,
+        .attention_key_storage = if (split_variant == .score_prework) .paged_f16_or_polar4 else .f32,
+    };
+}
 
 // Second `op_kind = .attention` route: the simdgroup-MMA flash prefill kernel
 // (`termite_paged_attention_kv_prefill_sg`), brought under the compiler as a
@@ -2254,21 +3013,39 @@ pub const first_general_metal_q6_bias_gelu_promotion_check_command = first_metal
 pub const first_generated_artifacts = [_]GeneratedArtifact{
     .{
         .backend = .cuda,
-        .format = first_lazy_benchmark.format,
-        .row_bucket = first_lazy_benchmark.row_bucket,
-        .epilogue = first_lazy_benchmark.epilogue,
+        .op = .{ .small_batch_matmul = .{
+            .format = first_lazy_benchmark.format,
+            .row_bucket = first_lazy_benchmark.row_bucket,
+            .epilogue = first_lazy_benchmark.epilogue,
+        } },
         .kernel_id = first_lazy_benchmark.generated_kernel_id,
         .source_path = first_lazy_benchmark.generated_source_path,
         .check_command = first_lazy_benchmark.generated_ptx_command,
         .runtime_evidence_command = first_lazy_benchmark.benchmark_command,
         .promotion_check_command = first_lazy_benchmark_check_command,
         .production_enabled = first_lazy_benchmark.production_enabled,
+        .cuda_kernel = .q4_k_small_batch_bias_gelu,
+    },
+    .{
+        .backend = .cuda,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q4_k,
+            .row_bucket = .rows_1,
+            .epilogue = .none,
+        } },
+        .kernel_id = first_general_cuda_q4_k_mmv_kernel_id,
+        .source_path = first_general_cuda_q4_k_mmv_source_path,
+        .check_command = first_general_cuda_q4_k_mmv_check_command,
+        .production_enabled = false,
+        .cuda_kernel = .q4_k_mmv,
     },
     .{
         .backend = .metal,
-        .format = first_lazy_benchmark.format,
-        .row_bucket = first_lazy_benchmark.row_bucket,
-        .epilogue = first_lazy_benchmark.epilogue,
+        .op = .{ .small_batch_matmul = .{
+            .format = first_lazy_benchmark.format,
+            .row_bucket = first_lazy_benchmark.row_bucket,
+            .epilogue = first_lazy_benchmark.epilogue,
+        } },
         .kernel_id = first_lazy_metal_kernel_id,
         .source_path = first_lazy_metal_source_path,
         .check_command = first_lazy_metal_check_command,
@@ -2279,9 +3056,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q4_0,
-        .row_bucket = .rows_2_8,
-        .epilogue = .none,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q4_0,
+            .row_bucket = .rows_2_8,
+            .epilogue = .none,
+        } },
         .kernel_id = first_general_metal_q4_0_kernel_id,
         .source_path = first_general_metal_q4_0_source_path,
         .check_command = first_general_metal_q4_0_check_command,
@@ -2292,9 +3071,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q4_1,
-        .row_bucket = .rows_2_8,
-        .epilogue = .none,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q4_1,
+            .row_bucket = .rows_2_8,
+            .epilogue = .none,
+        } },
         .kernel_id = first_general_metal_q4_1_kernel_id,
         .source_path = first_general_metal_q4_1_source_path,
         .check_command = first_general_metal_q4_1_check_command,
@@ -2305,9 +3086,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q5_0,
-        .row_bucket = .rows_2_8,
-        .epilogue = .none,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q5_0,
+            .row_bucket = .rows_2_8,
+            .epilogue = .none,
+        } },
         .kernel_id = first_general_metal_q5_0_kernel_id,
         .source_path = first_general_metal_q5_0_source_path,
         .check_command = first_general_metal_q5_0_check_command,
@@ -2318,9 +3101,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q5_1,
-        .row_bucket = .rows_2_8,
-        .epilogue = .none,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q5_1,
+            .row_bucket = .rows_2_8,
+            .epilogue = .none,
+        } },
         .kernel_id = first_general_metal_q5_1_kernel_id,
         .source_path = first_general_metal_q5_1_source_path,
         .check_command = first_general_metal_q5_1_check_command,
@@ -2331,9 +3116,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q2_k,
-        .row_bucket = .rows_2_8,
-        .epilogue = .none,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q2_k,
+            .row_bucket = .rows_2_8,
+            .epilogue = .none,
+        } },
         .kernel_id = first_general_metal_q2_kernel_id,
         .source_path = first_general_metal_q2_source_path,
         .check_command = first_general_metal_q2_check_command,
@@ -2344,9 +3131,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q2_k,
-        .row_bucket = .rows_2_8,
-        .epilogue = .bias,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q2_k,
+            .row_bucket = .rows_2_8,
+            .epilogue = .bias,
+        } },
         .kernel_id = first_general_metal_q2_bias_kernel_id,
         .source_path = first_general_metal_q2_bias_source_path,
         .check_command = first_general_metal_q2_bias_check_command,
@@ -2357,9 +3146,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q2_k,
-        .row_bucket = .rows_2_8,
-        .epilogue = .bias_gelu,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q2_k,
+            .row_bucket = .rows_2_8,
+            .epilogue = .bias_gelu,
+        } },
         .kernel_id = first_general_metal_q2_bias_gelu_kernel_id,
         .source_path = first_general_metal_q2_bias_gelu_source_path,
         .check_command = first_general_metal_q2_bias_gelu_check_command,
@@ -2370,9 +3161,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q3_k,
-        .row_bucket = .rows_2_8,
-        .epilogue = .none,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q3_k,
+            .row_bucket = .rows_2_8,
+            .epilogue = .none,
+        } },
         .kernel_id = first_general_metal_q3_kernel_id,
         .source_path = first_general_metal_q3_source_path,
         .check_command = first_general_metal_q3_check_command,
@@ -2383,9 +3176,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q3_k,
-        .row_bucket = .rows_2_8,
-        .epilogue = .bias,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q3_k,
+            .row_bucket = .rows_2_8,
+            .epilogue = .bias,
+        } },
         .kernel_id = first_general_metal_q3_bias_kernel_id,
         .source_path = first_general_metal_q3_bias_source_path,
         .check_command = first_general_metal_q3_bias_check_command,
@@ -2396,9 +3191,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q3_k,
-        .row_bucket = .rows_2_8,
-        .epilogue = .bias_gelu,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q3_k,
+            .row_bucket = .rows_2_8,
+            .epilogue = .bias_gelu,
+        } },
         .kernel_id = first_general_metal_q3_bias_gelu_kernel_id,
         .source_path = first_general_metal_q3_bias_gelu_source_path,
         .check_command = first_general_metal_q3_bias_gelu_check_command,
@@ -2409,9 +3206,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q4_k,
-        .row_bucket = .rows_2_8,
-        .epilogue = .bias,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q4_k,
+            .row_bucket = .rows_2_8,
+            .epilogue = .bias,
+        } },
         .kernel_id = first_general_metal_q4_bias_kernel_id,
         .source_path = first_general_metal_q4_bias_source_path,
         .check_command = first_general_metal_q4_bias_check_command,
@@ -2422,9 +3221,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q4_k,
-        .row_bucket = .rows_2_8,
-        .epilogue = .none,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q4_k,
+            .row_bucket = .rows_2_8,
+            .epilogue = .none,
+        } },
         .kernel_id = first_general_metal_q4_kernel_id,
         .source_path = first_general_metal_q4_source_path,
         .check_command = first_general_metal_q4_check_command,
@@ -2435,9 +3236,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q8_0,
-        .row_bucket = .rows_2_8,
-        .epilogue = .none,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q8_0,
+            .row_bucket = .rows_2_8,
+            .epilogue = .none,
+        } },
         .kernel_id = first_general_metal_q8_kernel_id,
         .source_path = first_general_metal_q8_source_path,
         .check_command = first_general_metal_q8_check_command,
@@ -2448,9 +3251,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q8_0,
-        .row_bucket = .rows_2_8,
-        .epilogue = .bias,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q8_0,
+            .row_bucket = .rows_2_8,
+            .epilogue = .bias,
+        } },
         .kernel_id = first_general_metal_q8_bias_kernel_id,
         .source_path = first_general_metal_q8_bias_source_path,
         .check_command = first_general_metal_q8_bias_check_command,
@@ -2461,9 +3266,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q8_0,
-        .row_bucket = .rows_2_8,
-        .epilogue = .bias_gelu,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q8_0,
+            .row_bucket = .rows_2_8,
+            .epilogue = .bias_gelu,
+        } },
         .kernel_id = first_general_metal_q8_bias_gelu_kernel_id,
         .source_path = first_general_metal_q8_bias_gelu_source_path,
         .check_command = first_general_metal_q8_bias_gelu_check_command,
@@ -2474,9 +3281,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q8_0,
-        .row_bucket = .rows_2_8,
-        .epilogue = .relu,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q8_0,
+            .row_bucket = .rows_2_8,
+            .epilogue = .relu,
+        } },
         .kernel_id = first_general_metal_q8_relu_kernel_id,
         .source_path = first_general_metal_q8_relu_source_path,
         .check_command = first_general_metal_q8_relu_check_command,
@@ -2487,9 +3296,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q8_1,
-        .row_bucket = .rows_2_8,
-        .epilogue = .none,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q8_1,
+            .row_bucket = .rows_2_8,
+            .epilogue = .none,
+        } },
         .kernel_id = first_general_metal_q8_1_kernel_id,
         .source_path = first_general_metal_q8_1_source_path,
         .check_command = first_general_metal_q8_1_check_command,
@@ -2500,9 +3311,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q8_k,
-        .row_bucket = .rows_2_8,
-        .epilogue = .none,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q8_k,
+            .row_bucket = .rows_2_8,
+            .epilogue = .none,
+        } },
         .kernel_id = first_general_metal_q8_k_kernel_id,
         .source_path = first_general_metal_q8_k_source_path,
         .check_command = first_general_metal_q8_k_check_command,
@@ -2513,9 +3326,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q5_k,
-        .row_bucket = .rows_2_8,
-        .epilogue = .none,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q5_k,
+            .row_bucket = .rows_2_8,
+            .epilogue = .none,
+        } },
         .kernel_id = first_general_metal_q5_kernel_id,
         .source_path = first_general_metal_q5_source_path,
         .check_command = first_general_metal_q5_check_command,
@@ -2526,9 +3341,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q5_k,
-        .row_bucket = .rows_2_8,
-        .epilogue = .bias,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q5_k,
+            .row_bucket = .rows_2_8,
+            .epilogue = .bias,
+        } },
         .kernel_id = first_general_metal_q5_bias_kernel_id,
         .source_path = first_general_metal_q5_bias_source_path,
         .check_command = first_general_metal_q5_bias_check_command,
@@ -2539,9 +3356,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q5_k,
-        .row_bucket = .rows_2_8,
-        .epilogue = .bias_gelu,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q5_k,
+            .row_bucket = .rows_2_8,
+            .epilogue = .bias_gelu,
+        } },
         .kernel_id = first_general_metal_q5_bias_gelu_kernel_id,
         .source_path = first_general_metal_q5_bias_gelu_source_path,
         .check_command = first_general_metal_q5_bias_gelu_check_command,
@@ -2552,9 +3371,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q6_k,
-        .row_bucket = .rows_2_8,
-        .epilogue = .none,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q6_k,
+            .row_bucket = .rows_2_8,
+            .epilogue = .none,
+        } },
         .kernel_id = first_general_metal_q6_kernel_id,
         .source_path = first_general_metal_q6_source_path,
         .check_command = first_general_metal_q6_check_command,
@@ -2565,9 +3386,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q6_k,
-        .row_bucket = .rows_2_8,
-        .epilogue = .bias,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q6_k,
+            .row_bucket = .rows_2_8,
+            .epilogue = .bias,
+        } },
         .kernel_id = first_general_metal_q6_bias_kernel_id,
         .source_path = first_general_metal_q6_bias_source_path,
         .check_command = first_general_metal_q6_bias_check_command,
@@ -2578,9 +3401,11 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .format = .q6_k,
-        .row_bucket = .rows_2_8,
-        .epilogue = .bias_gelu,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q6_k,
+            .row_bucket = .rows_2_8,
+            .epilogue = .bias_gelu,
+        } },
         .kernel_id = first_general_metal_q6_bias_gelu_kernel_id,
         .source_path = first_general_metal_q6_bias_gelu_source_path,
         .check_command = first_general_metal_q6_bias_gelu_check_command,
@@ -2591,104 +3416,367 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .cuda,
-        .format = .q4_0,
-        .row_bucket = .rows_1,
-        .epilogue = .none,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q4_0,
+            .row_bucket = .rows_1,
+            .epilogue = .none,
+        } },
         .kernel_id = first_general_cuda_q4_0_mmv_kernel_id,
         .source_path = first_general_cuda_q4_0_mmv_source_path,
         .check_command = first_general_cuda_q4_0_mmv_check_command,
         .runtime_evidence_command = first_general_cuda_q4_0_mmv_benchmark_command,
         .promotion_evidence_command = first_general_cuda_q4_0_mmv_benchmark_command,
         .production_enabled = true,
+        .cuda_kernel = .q4_0_mmv,
     },
     .{
         .backend = .cuda,
-        .format = .q4_0,
-        .row_bucket = .rows_9_64,
-        .epilogue = .none,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q4_0,
+            .row_bucket = .rows_9_64,
+            .epilogue = .none,
+        } },
         .kernel_id = first_general_cuda_q4_0_mm_kernel_id,
         .source_path = first_general_cuda_q4_0_mm_source_path,
         .check_command = first_general_cuda_q4_0_mm_check_command,
         .runtime_evidence_command = first_general_cuda_q4_0_mm_benchmark_command,
         .promotion_evidence_command = first_general_cuda_q4_0_mm_benchmark_command,
         .production_enabled = true,
+        .runtime_shape = .{ .min_in_dim = 512 },
+        .cuda_kernel = .q4_0_mm,
     },
     .{
         .backend = .cuda,
-        .format = .q4_0,
-        .row_bucket = .rows_1,
-        .epilogue = .pair,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q4_0,
+            .row_bucket = .rows_1,
+            .epilogue = .pair,
+        } },
         .kernel_id = first_general_cuda_q4_0_pair_kernel_id,
         .source_path = first_general_cuda_q4_0_pair_source_path,
         .check_command = first_general_cuda_q4_0_pair_check_command,
         .runtime_evidence_command = first_general_cuda_q4_0_pair_benchmark_command,
         .promotion_evidence_command = first_general_cuda_q4_0_pair_benchmark_command,
         .production_enabled = true,
+        .cuda_kernel = .q4_0_pair_mmv,
     },
     .{
         .backend = .cuda,
-        .format = .q4_0,
-        .row_bucket = .rows_1,
-        .epilogue = .pair_activation,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q4_0,
+            .row_bucket = .rows_1,
+            .epilogue = .pair_activation,
+            .activation = .q8_1,
+            .output = .q8_1,
+        } },
         .kernel_id = first_general_cuda_q4_0_pair_q8_kernel_id,
         .source_path = first_general_cuda_q4_0_pair_q8_source_path,
         .check_command = first_general_cuda_q4_0_pair_q8_check_command,
         .runtime_evidence_command = first_general_cuda_q4_0_pair_q8_benchmark_command,
         .promotion_evidence_command = first_general_cuda_q4_0_pair_q8_benchmark_command,
         .production_enabled = true,
+        .cuda_kernel = .q4_0_pair_activation_q8_1,
     },
     .{
         .backend = .cuda,
-        .format = .q4_0,
-        .row_bucket = .rows_1,
-        .epilogue = .gated_down,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q4_0,
+            .row_bucket = .rows_1,
+            .epilogue = .gated_down,
+            .activation = .q8_1,
+        } },
         .kernel_id = first_general_cuda_q4_0_down_q8_kernel_id,
         .source_path = first_general_cuda_q4_0_down_q8_source_path,
         .check_command = first_general_cuda_q4_0_down_q8_check_command,
         .runtime_evidence_command = first_general_cuda_q4_0_down_q8_benchmark_command,
         .promotion_evidence_command = first_general_cuda_q4_0_down_q8_benchmark_command,
         .production_enabled = true,
+        .cuda_kernel = .q4_0_down_q8_1,
     },
-};
-
-/// Generated non-matmul (op_kind `.microkernel`) artifacts. Kept in a distinct
-/// list from `first_generated_artifacts` so the matmul manifest / evidence /
-/// benchmark / production-regression machinery — all of which assumes matmul
-/// dims and a hand-written matmul baseline — stays byte-identical. The codegen
-/// (`.metal` files + runtime region) and the on-device conformance harness
-/// consume both lists; the op_kind framework seam is exercised end-to-end. As
-/// microkernel routes gain promotion evidence they can graduate into the shared
-/// list, but they start here as dev-only candidates.
-pub const first_generated_microkernel_artifacts = [_]GeneratedArtifact{
+    .{
+        .backend = .cuda,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q4_0,
+            .row_bucket = .rows_1,
+            .epilogue = .pair_activation,
+            .activation = .q8_1,
+            .output = .q8_1,
+        } },
+        .kernel_id = first_e2b_cuda_q4_0_pair_q8_6144_kernel_id,
+        .source_path = first_e2b_cuda_q4_0_pair_q8_6144_source_path,
+        .check_command = first_e2b_cuda_q4_0_pair_q8_6144_check_command,
+        .production_enabled = false,
+        .cuda_kernel = .q4_0_pair_activation_q8_1_e2b_6144,
+    },
+    .{
+        .backend = .cuda,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q4_0,
+            .row_bucket = .rows_1,
+            .epilogue = .pair_activation,
+            .activation = .q8_1,
+            .output = .q8_1,
+        } },
+        .kernel_id = first_e2b_cuda_q4_0_pair_q8_12288_kernel_id,
+        .source_path = first_e2b_cuda_q4_0_pair_q8_12288_source_path,
+        .check_command = first_e2b_cuda_q4_0_pair_q8_12288_check_command,
+        .production_enabled = false,
+        .cuda_kernel = .q4_0_pair_activation_q8_1_e2b_12288,
+    },
+    .{
+        .backend = .cuda,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q4_0,
+            .row_bucket = .rows_1,
+            .epilogue = .gated_down,
+            .activation = .q8_1,
+        } },
+        .kernel_id = first_e2b_cuda_q4_0_down_q8_6144_kernel_id,
+        .source_path = first_e2b_cuda_q4_0_down_q8_6144_source_path,
+        .check_command = first_e2b_cuda_q4_0_down_q8_6144_check_command,
+        .production_enabled = false,
+        .cuda_kernel = .q4_0_down_q8_1_e2b_6144,
+    },
+    .{
+        .backend = .cuda,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q4_0,
+            .row_bucket = .rows_1,
+            .epilogue = .gated_down,
+            .activation = .q8_1,
+        } },
+        .kernel_id = first_e2b_cuda_q4_0_down_q8_12288_kernel_id,
+        .source_path = first_e2b_cuda_q4_0_down_q8_12288_source_path,
+        .check_command = first_e2b_cuda_q4_0_down_q8_12288_check_command,
+        .production_enabled = false,
+        .cuda_kernel = .q4_0_down_q8_1_e2b_12288,
+    },
+    .{
+        .backend = .cuda,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q4_0,
+            .row_bucket = .rows_1,
+            .epilogue = .pair_activation,
+            .activation = .f32,
+            .output = .f32,
+        } },
+        .kernel_id = first_e2b_cuda_q4_0_pair_f32_6144_exact_kernel_id,
+        .source_path = first_e2b_cuda_q4_0_pair_f32_6144_exact_source_path,
+        .check_command = first_e2b_cuda_q4_0_pair_f32_6144_exact_check_command,
+        .production_enabled = false,
+        .cuda_kernel = .q4_0_pair_activation_f32_e2b_6144_exact,
+    },
+    .{
+        .backend = .cuda,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q4_0,
+            .row_bucket = .rows_1,
+            .epilogue = .pair_activation,
+            .activation = .f32,
+            .output = .f32,
+        } },
+        .kernel_id = first_e2b_cuda_q4_0_pair_f32_12288_exact_kernel_id,
+        .source_path = first_e2b_cuda_q4_0_pair_f32_12288_exact_source_path,
+        .check_command = first_e2b_cuda_q4_0_pair_f32_12288_exact_check_command,
+        .production_enabled = false,
+        .cuda_kernel = .q4_0_pair_activation_f32_e2b_12288_exact,
+    },
+    .{
+        .backend = .cuda,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q4_0,
+            .row_bucket = .rows_1,
+            .epilogue = .gated_down,
+            .activation = .f32,
+            .output = .f32,
+        } },
+        .kernel_id = first_e2b_cuda_q4_0_down_f32_6144_exact_kernel_id,
+        .source_path = first_e2b_cuda_q4_0_down_f32_6144_exact_source_path,
+        .check_command = first_e2b_cuda_q4_0_down_f32_6144_exact_check_command,
+        .production_enabled = false,
+        .cuda_kernel = .q4_0_down_f32_e2b_6144_exact,
+    },
+    .{
+        .backend = .cuda,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q4_0,
+            .row_bucket = .rows_1,
+            .epilogue = .gated_down,
+            .activation = .f32,
+            .output = .f32,
+        } },
+        .kernel_id = first_e2b_cuda_q4_0_down_f32_12288_exact_kernel_id,
+        .source_path = first_e2b_cuda_q4_0_down_f32_12288_exact_source_path,
+        .check_command = first_e2b_cuda_q4_0_down_f32_12288_exact_check_command,
+        .production_enabled = false,
+        .cuda_kernel = .q4_0_down_f32_e2b_12288_exact,
+    },
+    .{
+        .backend = .cuda,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q4_0,
+            .row_bucket = .rows_1,
+            .epilogue = .argmax,
+            .activation = .q8_1,
+            .output = .i32,
+        } },
+        .kernel_id = first_e2b_cuda_q4_0_q8_1_argmax_kernel_id,
+        .source_path = first_e2b_cuda_q4_0_q8_1_argmax_source_path,
+        .check_command = first_e2b_cuda_q4_0_q8_1_argmax_check_command,
+        .production_enabled = false,
+        .cuda_kernel = .q4_0_q8_1_argmax_e2b_tile8,
+    },
+    .{
+        .backend = .cuda,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q6_k,
+            .row_bucket = .rows_1,
+            .epilogue = .argmax,
+            .activation = .q8_1,
+            .output = .i32,
+        } },
+        .kernel_id = first_cuda_q6_k_q8_1_argmax_k2560_kernel_id,
+        .source_path = first_cuda_q6_k_q8_1_argmax_k2560_source_path,
+        .check_command = first_cuda_q6_k_q8_1_argmax_k2560_check_command,
+        .production_enabled = false,
+        .cuda_kernel = .q6_k_q8_1_argmax_k2560_tile8,
+    },
+    .{
+        .backend = .cuda,
+        .op = .{ .small_batch_matmul = .{
+            .format = .q6_k,
+            .row_bucket = .rows_1,
+            .epilogue = .argmax,
+            .activation = .q8_1,
+            .output = .i32,
+        } },
+        .kernel_id = first_cuda_q6_k_q8_1_argmax_k3840_kernel_id,
+        .source_path = first_cuda_q6_k_q8_1_argmax_k3840_source_path,
+        .check_command = first_cuda_q6_k_q8_1_argmax_k3840_check_command,
+        .production_enabled = false,
+        .cuda_kernel = .q6_k_q8_1_argmax_k3840_tile8,
+    },
     .{
         .backend = .metal,
-        .op_kind = .microkernel,
-        .format = .f32,
-        .row_bucket = .rows_2_8,
-        .epilogue = .none,
+        .op = .{ .microkernel = .{
+            .kind = .rms_norm,
+            .schedule = first_rms_norm_metal_schedule,
+        } },
         .kernel_id = first_rms_norm_metal_kernel_id,
         .source_path = first_rms_norm_metal_source_path,
         .check_command = first_rms_norm_metal_check_command,
         .production_enabled = false,
     },
-};
-
-/// Generated `op_kind = .attention` artifacts. Distinct list for the same reason
-/// as `first_generated_microkernel_artifacts`: the matmul manifest / evidence /
-/// benchmark / production-regression machinery assumes matmul dims + a matmul
-/// baseline, so attention routes (which the correctness gate validates by
-/// bit-identical *model tokens*, not an isolated float compare) must never be
-/// handed to it. The codegen (`.metal` files + runtime region) and the on-device
-/// conformance harness consume this list too. `format`/`row_bucket`/`epilogue`
-/// are inert sentinels (attention has no dequant decoder / epilogue), matching
-/// the microkernel convention.
-pub const first_generated_attention_artifacts = [_]GeneratedArtifact{
+    .{
+        .backend = .cuda,
+        .op = .{ .attention = .{
+            .kind = .decode_1x,
+            .head_dim = 256,
+            .schedule = first_decode_attention_1x_cuda_schedule,
+        } },
+        .kernel_id = first_decode_attention_1x_cuda_kernel_id,
+        .source_path = first_decode_attention_1x_cuda_source_path,
+        .check_command = first_decode_attention_1x_cuda_check_command,
+        .production_enabled = false,
+        .cuda_attention_kernel = .gqa_decode_split_kv_hd256_f32,
+    },
+    .{
+        .backend = .cuda,
+        .op = .{ .attention = .{
+            .kind = .decode_1x,
+            .head_dim = 512,
+            .schedule = first_decode_attention_1x_cuda_hd512_schedule,
+        } },
+        .kernel_id = first_decode_attention_1x_cuda_hd512_kernel_id,
+        .source_path = first_decode_attention_1x_cuda_hd512_source_path,
+        .check_command = first_decode_attention_1x_cuda_hd512_check_command,
+        .production_enabled = false,
+        .cuda_attention_kernel = .gqa_decode_split_kv_hd512_f32,
+    },
+    .{
+        .backend = .cuda,
+        .op = .{ .attention = .{
+            .kind = .decode_1x,
+            .head_dim = 256,
+            .schedule = first_decode_attention_1x_cuda_split2_hd256_schedule,
+        } },
+        .kernel_id = first_decode_attention_1x_cuda_split2_hd256_kernel_id,
+        .source_path = first_decode_attention_1x_cuda_split2_hd256_source_path,
+        .check_command = first_decode_attention_1x_cuda_split2_hd256_check_command,
+        .production_enabled = false,
+        .cuda_attention_kernel = .gqa_decode_split2_kv_hd256_f32,
+    },
+    .{
+        .backend = .cuda,
+        .op = .{ .attention = .{
+            .kind = .decode_1x,
+            .head_dim = 512,
+            .schedule = first_decode_attention_1x_cuda_split2_hd512_schedule,
+        } },
+        .kernel_id = first_decode_attention_1x_cuda_split2_hd512_kernel_id,
+        .source_path = first_decode_attention_1x_cuda_split2_hd512_source_path,
+        .check_command = first_decode_attention_1x_cuda_split2_hd512_check_command,
+        .production_enabled = false,
+        .cuda_attention_kernel = .gqa_decode_split2_kv_hd512_f32,
+    },
+    .{
+        .backend = .cuda,
+        .op = .{ .attention = .{
+            .kind = .decode_1x,
+            .head_dim = 256,
+            .schedule = first_decode_attention_1x_cuda_split4_hd256_schedule,
+        } },
+        .kernel_id = first_decode_attention_1x_cuda_split4_hd256_kernel_id,
+        .source_path = first_decode_attention_1x_cuda_split4_hd256_source_path,
+        .check_command = first_decode_attention_1x_cuda_split4_hd256_check_command,
+        .production_enabled = false,
+        .cuda_attention_kernel = .gqa_decode_split4_kv_hd256_f32,
+    },
+    .{
+        .backend = .cuda,
+        .op = .{ .attention = .{
+            .kind = .decode_1x,
+            .head_dim = 512,
+            .schedule = first_decode_attention_1x_cuda_split4_hd512_schedule,
+        } },
+        .kernel_id = first_decode_attention_1x_cuda_split4_hd512_kernel_id,
+        .source_path = first_decode_attention_1x_cuda_split4_hd512_source_path,
+        .check_command = first_decode_attention_1x_cuda_split4_hd512_check_command,
+        .production_enabled = false,
+        .cuda_attention_kernel = .gqa_decode_split4_kv_hd512_f32,
+    },
+    .{
+        .backend = .cuda,
+        .op = .{ .attention = .{
+            .kind = .decode_1x,
+            .head_dim = 256,
+            .schedule = first_decode_attention_1x_cuda_score_prework_hd256_schedule,
+        } },
+        .kernel_id = first_decode_attention_1x_cuda_score_prework_hd256_kernel_id,
+        .source_path = first_decode_attention_1x_cuda_score_prework_hd256_source_path,
+        .check_command = first_decode_attention_1x_cuda_score_prework_hd256_check_command,
+        .production_enabled = false,
+        .cuda_attention_kernel = .gqa_decode_score_prework_hd256_f32,
+    },
+    .{
+        .backend = .cuda,
+        .op = .{ .attention = .{
+            .kind = .decode_1x,
+            .head_dim = 512,
+            .schedule = first_decode_attention_1x_cuda_score_prework_hd512_schedule,
+        } },
+        .kernel_id = first_decode_attention_1x_cuda_score_prework_hd512_kernel_id,
+        .source_path = first_decode_attention_1x_cuda_score_prework_hd512_source_path,
+        .check_command = first_decode_attention_1x_cuda_score_prework_hd512_check_command,
+        .production_enabled = false,
+        .cuda_attention_kernel = .gqa_decode_score_prework_hd512_f32,
+    },
     .{
         .backend = .metal,
-        .op_kind = .attention,
-        .format = .f32,
-        .row_bucket = .rows_2_8,
-        .epilogue = .none,
+        .op = .{ .attention = .{
+            .kind = .decode_1x,
+            .schedule = first_decode_attention_1x_metal_schedule,
+        } },
         .kernel_id = first_decode_attention_1x_metal_kernel_id,
         .source_path = first_decode_attention_1x_metal_source_path,
         .check_command = first_decode_attention_1x_metal_check_command,
@@ -2696,16 +3784,158 @@ pub const first_generated_attention_artifacts = [_]GeneratedArtifact{
     },
     .{
         .backend = .metal,
-        .op_kind = .attention,
-        .format = .f32,
-        .row_bucket = .rows_2_8,
-        .epilogue = .none,
+        .op = .{ .attention = .{
+            .kind = .prefill_flash,
+            .schedule = first_prefill_flash_metal_schedule,
+        } },
         .kernel_id = first_prefill_flash_metal_kernel_id,
         .source_path = first_prefill_flash_metal_source_path,
         .check_command = first_prefill_flash_metal_check_command,
         .production_enabled = false,
     },
 };
+
+fn generatedArtifactCount(comptime kind: OpKind) usize {
+    var count: usize = 0;
+    for (first_generated_artifacts) |artifact| {
+        if (artifact.opKind() == kind) count += 1;
+    }
+    return count;
+}
+
+pub fn matmulArtifactView(artifact: GeneratedArtifact) GeneratedMatmulArtifact {
+    const op = artifact.matmulOp() orelse unreachable;
+    return .{
+        .backend = artifact.backend,
+        .format = op.format,
+        .row_bucket = op.row_bucket,
+        .epilogue = op.epilogue,
+        .activation = op.activation,
+        .function = op.function,
+        .output = op.output,
+        .kernel_id = artifact.kernel_id,
+        .source_path = artifact.source_path,
+        .check_command = artifact.check_command,
+        .runtime_evidence_command = artifact.runtime_evidence_command,
+        .promotion_evidence_command = artifact.promotion_evidence_command,
+        .promotion_check_command = artifact.promotion_check_command,
+        .production_enabled = artifact.production_enabled,
+        .runtime_shape = artifact.runtime_shape,
+        .cuda_kernel = artifact.cuda_kernel,
+        .cuda_attention_kernel = artifact.cuda_attention_kernel,
+    };
+}
+
+/// Matmul-only compatibility view for routing, benchmark, and promotion code.
+/// The unified registry above remains the only authored artifact list.
+pub const first_generated_matmul_artifacts = blk: {
+    var artifacts: [generatedArtifactCount(.small_batch_matmul)]GeneratedMatmulArtifact = undefined;
+    var index: usize = 0;
+    for (first_generated_artifacts) |artifact| {
+        if (artifact.opKind() != .small_batch_matmul) continue;
+        artifacts[index] = matmulArtifactView(artifact);
+        index += 1;
+    }
+    break :blk artifacts;
+};
+
+/// Compatibility filters used by the on-device operation-specific harnesses.
+/// They are derived from the same authoritative registry as matmul artifacts.
+pub const first_generated_microkernel_artifacts = blk: {
+    var artifacts: [generatedArtifactCount(.microkernel)]GeneratedArtifact = undefined;
+    var index: usize = 0;
+    for (first_generated_artifacts) |artifact| {
+        if (artifact.opKind() != .microkernel) continue;
+        artifacts[index] = artifact;
+        index += 1;
+    }
+    break :blk artifacts;
+};
+
+pub const first_generated_attention_artifacts = blk: {
+    var artifacts: [generatedArtifactCount(.attention)]GeneratedArtifact = undefined;
+    var index: usize = 0;
+    for (first_generated_artifacts) |artifact| {
+        if (artifact.opKind() != .attention) continue;
+        artifacts[index] = artifact;
+        index += 1;
+    }
+    break :blk artifacts;
+};
+
+/// Structural gate shared by codegen write/check modes. Registry mistakes must
+/// fail normal builds, not only the compiler's unit-test target.
+pub fn validateGeneratedArtifactRegistry() !void {
+    for (first_generated_artifacts, 0..) |artifact, index| {
+        if (artifact.kernel_id.len == 0) return error.GeneratedArtifactKernelIdMissing;
+        if (artifact.source_path.len == 0) return error.GeneratedArtifactSourcePathMissing;
+        if (artifact.check_command.len == 0) return error.GeneratedArtifactCheckCommandMissing;
+        if (artifact.backend == .cuda) {
+            switch (artifact.opKind()) {
+                .small_batch_matmul => {
+                    if (artifact.cuda_kernel == null or artifact.cuda_attention_kernel != null) return error.GeneratedArtifactCudaPlanMissing;
+                    if (cudaRenderPlanForArtifact(artifact) == null) return error.GeneratedArtifactCudaPlanInvalid;
+                },
+                .attention => {
+                    if (artifact.cuda_attention_kernel == null or artifact.cuda_kernel != null) return error.GeneratedArtifactCudaPlanMissing;
+                    if (cudaAttentionRenderPlanForArtifact(artifact) == null) return error.GeneratedArtifactCudaPlanInvalid;
+                },
+                .microkernel => return error.GeneratedArtifactCudaPlanMissing,
+            }
+        } else if (artifact.cuda_kernel != null or artifact.cuda_attention_kernel != null) {
+            return error.GeneratedArtifactCudaPlanOnWrongBackend;
+        }
+        if (generatedSourceForArtifact(artifact) == null) return error.GeneratedArtifactSourceMissing;
+
+        switch (artifact.op) {
+            .small_batch_matmul => |op| {
+                if (specFor(op.format) == null) return error.GeneratedArtifactFormatUnsupported;
+            },
+            .microkernel => |op| {
+                if (op.schedule.threads_per_threadgroup == 0) return error.GeneratedArtifactScheduleInvalid;
+            },
+            .attention => |op| {
+                if (op.schedule.threads_per_threadgroup == 0 or op.schedule.key_chunk == 0) {
+                    return error.GeneratedArtifactScheduleInvalid;
+                }
+                if (artifact.backend == .cuda and (op.head_dim == 0 or
+                    op.schedule.attention_serial_threads_per_threadgroup == 0 or
+                    op.schedule.attention_stage2_threads_per_threadgroup == 0 or
+                    op.schedule.attention_kv_splits == 0 or
+                    op.schedule.attention_query_heads_per_kv_head == 0))
+                {
+                    return error.GeneratedArtifactScheduleInvalid;
+                }
+                if (artifact.backend == .cuda) {
+                    const score_prework = op.schedule.attention_key_storage == .paged_f16_or_polar4;
+                    if (score_prework) {
+                        if (op.schedule.attention_split_kv_min_tokens != 0 or
+                            op.schedule.attention_max_kv_tokens == 0)
+                        {
+                            return error.GeneratedArtifactScheduleInvalid;
+                        }
+                    } else if (op.schedule.attention_split_kv_min_tokens == 0 or
+                        op.schedule.attention_max_kv_tokens != 0)
+                    {
+                        return error.GeneratedArtifactScheduleInvalid;
+                    }
+                }
+            },
+        }
+
+        for (first_generated_artifacts[index + 1 ..]) |other| {
+            if (std.mem.eql(u8, artifact.kernel_id, other.kernel_id)) return error.GeneratedArtifactKernelIdDuplicate;
+            if (std.mem.eql(u8, artifact.source_path, other.source_path)) return error.GeneratedArtifactSourcePathDuplicate;
+            if (cudaAttentionRenderPlanForArtifact(artifact)) |plan| {
+                if (cudaAttentionRenderPlanForArtifact(other)) |other_plan| {
+                    if (std.mem.eql(u8, plan.source_id, other_plan.source_id)) {
+                        return error.GeneratedArtifactCudaAttentionSourceIdDuplicate;
+                    }
+                }
+            }
+        }
+    }
+}
 
 const first_route_expectations = [_]RouteExpectation{
     .{
@@ -2757,6 +3987,16 @@ const first_route_expectations = [_]RouteExpectation{
         .production_route = .generated_production,
         .candidate_route = .unsupported,
         .fallback_reason = .none,
+    },
+    .{
+        .backend = .cuda,
+        .format = .q4_0,
+        .row_bucket = .rows_1,
+        .epilogue = .argmax,
+        .dispatch = .mmv,
+        .production_route = .handwritten_production,
+        .candidate_route = .generated_dev_candidate,
+        .fallback_reason = .generated_runtime_not_wired,
     },
     .{
         .backend = .cuda,
@@ -3010,772 +4250,68 @@ const first_route_expectations = [_]RouteExpectation{
     },
 };
 
-const first_lazy_cuda_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Dev-only generated kernel candidate from graph/quant_kernel_compiler.zig.
-    \\// plan_id=cuda/q4_k/rows_2_8/bias_gelu/small_batch
-    \\// kernel_id=antfly_q4_k_small_batch_bias_gelu_f32_v1
-    \\// production_baseline=termite_linear_q4_k_bias_gelu_f32_tile4_r2
-    \\// production_enabled=false
-    \\// Not compiled into production artifacts until correctness and benchmark gates
-    \\// beat the handwritten CUDA baseline.
-    \\
-    \\#include <cuda_fp16.h>
-    \\#include <math.h>
-    \\#include <stdint.h>
-    \\
-    \\struct antfly_q4_k_block_view {
-    \\    const uint8_t *d;
-    \\    const uint8_t *dmin;
-    \\    const uint8_t *scales;
-    \\    const uint8_t *qs;
-    \\};
-    \\
-    \\static __device__ __forceinline__ float antfly_half_le_to_float(const uint8_t *p) {
-    \\    const uint16_t bits = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-    \\    return __half2float(__ushort_as_half(bits));
-    \\}
-    \\
-    \\static __device__ __forceinline__ float antfly_gelu(float x) {
-    \\    const float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
-    \\    return 0.5f * x * (1.0f + tanhf(inner));
-    \\}
-    \\
-    \\static __device__ __forceinline__ void antfly_q4_k_unpack_scale_min(
-    \\    const uint8_t *scales,
-    \\    int sub,
-    \\    float *scale,
-    \\    float *min_v
-    \\) {
-    \\    if (sub < 4) {
-    \\        *scale = (float)(scales[sub] & 63u);
-    \\        *min_v = (float)(scales[sub + 4] & 63u);
-    \\        return;
-    \\    }
-    \\
-    \\    *scale = (float)((scales[sub + 4] & 0x0fu) | ((scales[sub - 4] >> 6) << 4));
-    \\    *min_v = (float)((scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4));
-    \\}
-    \\
-    \\static __device__ __forceinline__ float antfly_q4_k_dequant_lane(const uint8_t *block, int lane) {
-    \\    antfly_q4_k_block_view view = {
-    \\        block,
-    \\        block + 2,
-    \\        block + 4,
-    \\        block + 16,
-    \\    };
-    \\    const int sub = lane >> 5;
-    \\    const int q_index = (sub >> 1) * 32 + (lane & 31);
-    \\    const uint8_t packed = view.qs[q_index];
-    \\    const uint8_t q = (sub & 1) == 0 ? (packed & 0x0fu) : (packed >> 4);
-    \\    const float d = antfly_half_le_to_float(view.d);
-    \\    const float dmin = antfly_half_le_to_float(view.dmin);
-    \\    float raw_scale = 0.0f;
-    \\    float raw_min = 0.0f;
-    \\    antfly_q4_k_unpack_scale_min(view.scales, sub, &raw_scale, &raw_min);
-    \\    return d * raw_scale * (float)q - dmin * raw_min;
-    \\}
-    \\
-    \\extern "C" __global__ void antfly_q4_k_small_batch_bias_gelu_f32_v1(
-    \\    const float *input,
-    \\    const uint8_t *weight_q4_k,
-    \\    const float *bias,
-    \\    float *output,
-    \\    int rows,
-    \\    int in_dim,
-    \\    int out_dim
-    \\) {
-    \\    const int row = blockIdx.y;
-    \\    const int col = blockIdx.x;
-    \\    if (row >= rows || rows < 2 || rows > 8 || col >= out_dim) return;
-    \\    if (blockDim.x != 128) return;
-    \\    if ((in_dim & 255) != 0) return;
-    \\
-    \\    float acc = 0.0f;
-    \\    const int block_count = in_dim >> 8;
-    \\    for (int block_idx = 0; block_idx < block_count; ++block_idx) {
-    \\        const uint8_t *block = weight_q4_k + ((col * block_count + block_idx) * 144);
-    \\        const int base = block_idx << 8;
-    \\        for (int lane = threadIdx.x; lane < 256; lane += blockDim.x) {
-    \\            acc += input[row * in_dim + base + lane] * antfly_q4_k_dequant_lane(block, lane);
-    \\        }
-    \\    }
-    \\
-    \\    __shared__ float partial[128];
-    \\    partial[threadIdx.x] = acc;
-    \\    __syncthreads();
-    \\    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-    \\        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-    \\        __syncthreads();
-    \\    }
-    \\    if (threadIdx.x == 0) output[row * out_dim + col] = antfly_gelu(partial[0] + bias[col]);
-    \\}
-    \\
-;
+fn renderCudaKernelSource(comptime kind: cuda_renderer.KernelKind) []const u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(50_000_000);
+        var buf: [1 << 17]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        const rendered = cuda_renderer.renderKernel(fba.allocator(), cuda_renderer.planFor(kind)) catch
+            @compileError("CUDA renderKernel failed for " ++ @tagName(kind));
+        const source: [rendered.len]u8 = rendered[0..rendered.len].*;
+        break :blk &source;
+    };
+}
 
-const first_general_cuda_q4_0_mmv_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Promoted generated kernel from graph/quant_kernel_compiler.zig.
-    \\// plan_id=cuda/q4_0/rows_1/none/mmv
-    \\// kernel_id=antfly_q4_0_mmv_f32_v1
-    \\// production_baseline=termite_linear_q4_0_f32_tile4
-    \\// production_enabled=true
-    \\// Promoted on sequential benchmark evidence vs the handwritten CUDA baseline;
-    \\// runtime dispatch is default-on behind ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MMV.
-    \\
-    \\#include <cuda_fp16.h>
-    \\#include <stdint.h>
-    \\
-    \\static __device__ __forceinline__ float antfly_half_le_to_float(const uint8_t *p) {
-    \\    const uint16_t bits = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-    \\    return __half2float(__ushort_as_half(bits));
-    \\}
-    \\
-    \\static __device__ __forceinline__ float antfly_warp_reduce_sum(float value) {
-    \\    value += __shfl_down_sync(0xffffffffu, value, 16);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 8);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 4);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 2);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 1);
-    \\    return value;
-    \\}
-    \\
-    \\extern "C" __global__ void antfly_q4_0_mmv_f32_v1(
-    \\    const float *input,
-    \\    const uint8_t *weight_q4_0,
-    \\    float *output,
-    \\    int rows,
-    \\    int in_dim,
-    \\    int out_dim
-    \\) {
-    \\    const int col0 = blockIdx.x << 2;
-    \\    if (rows != 1 || col0 >= out_dim) return;
-    \\    if (blockDim.x != 256) return;
-    \\    if ((in_dim & 31) != 0) return;
-    \\
-    \\    const int row_blocks = in_dim >> 5;
-    \\    const int half_bytes = in_dim >> 1;
-    \\    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    \\    for (int byte_idx = threadIdx.x; byte_idx < half_bytes; byte_idx += 256) {
-    \\        const int block_idx = byte_idx >> 4;
-    \\        const int offset = byte_idx & 15;
-    \\        const int base = block_idx << 5;
-    \\        const float x_lo = input[base + offset];
-    \\        const float x_hi = input[base + offset + 16];
-    \\#pragma unroll
-    \\        for (int c = 0; c < 4; ++c) {
-    \\            if (col0 + c >= out_dim) continue;
-    \\            const uint8_t *block = weight_q4_0 + ((size_t)(col0 + c) * row_blocks + block_idx) * 18;
-    \\            const float d = antfly_half_le_to_float(block);
-    \\            const int packed = (int)block[2 + offset];
-    \\            acc[c] += d * (x_lo * (float)((packed & 15) - 8) + x_hi * (float)((packed >> 4) - 8));
-    \\        }
-    \\    }
-    \\
-    \\    __shared__ float partial[4][8];
-    \\    const int lane = threadIdx.x & 31;
-    \\    const int warp = threadIdx.x >> 5;
-    \\#pragma unroll
-    \\    for (int c = 0; c < 4; ++c) {
-    \\        const float total = antfly_warp_reduce_sum(acc[c]);
-    \\        if (lane == 0) partial[c][warp] = total;
-    \\    }
-    \\    __syncthreads();
-    \\    if (threadIdx.x < 4) {
-    \\        float total = 0.0f;
-    \\#pragma unroll
-    \\        for (int w = 0; w < 8; ++w) total += partial[threadIdx.x][w];
-    \\        if (col0 + threadIdx.x < out_dim) output[col0 + threadIdx.x] = total;
-    \\    }
-    \\}
-    \\
-;
+fn renderCudaAttentionSource(comptime kind: cuda_renderer.AttentionKernelKind) []const u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(50_000_000);
+        var buf: [1 << 17]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        const rendered = cuda_renderer.renderAttentionKernel(fba.allocator(), cuda_renderer.attentionPlanFor(kind)) catch
+            @compileError("CUDA renderAttentionKernel failed for " ++ @tagName(kind));
+        const source: [rendered.len]u8 = rendered[0..rendered.len].*;
+        break :blk &source;
+    };
+}
 
-const first_general_cuda_q4_0_mm_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Promoted generated kernel from graph/quant_kernel_compiler.zig.
-    \\// plan_id=cuda/q4_0/rows_9_64/none/mm
-    \\// kernel_id=antfly_q4_0_mm_f32_v1
-    \\// production_baseline=termite_linear_q4_0_f32
-    \\// production_enabled=true
-    \\// Promoted on sequential benchmark evidence vs the handwritten CUDA baseline;
-    \\// runtime dispatch is default-on behind ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MM.
-    \\
-    \\#include <cuda_fp16.h>
-    \\#include <stdint.h>
-    \\
-    \\static __device__ __forceinline__ float antfly_half_le_to_float(const uint8_t *p) {
-    \\    const uint16_t bits = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-    \\    return __half2float(__ushort_as_half(bits));
-    \\}
-    \\
-    \\static __device__ __forceinline__ float antfly_warp_reduce_sum(float value) {
-    \\    value += __shfl_down_sync(0xffffffffu, value, 16);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 8);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 4);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 2);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 1);
-    \\    return value;
-    \\}
-    \\
-    \\extern "C" __global__ void antfly_q4_0_mm_f32_v1(
-    \\    const float *input,
-    \\    const uint8_t *weight_q4_0,
-    \\    float *output,
-    \\    int rows,
-    \\    int in_dim,
-    \\    int out_dim
-    \\) {
-    \\    const int col0 = blockIdx.x << 2;
-    \\    const int row0 = blockIdx.y << 3;
-    \\    if (rows < 9 || rows > 64) return;
-    \\    if (col0 >= out_dim || row0 >= rows) return;
-    \\    if (blockDim.x != 256) return;
-    \\    if ((in_dim & 31) != 0) return;
-    \\
-    \\    const int row_blocks = in_dim >> 5;
-    \\    const int half_bytes = in_dim >> 1;
-    \\    float acc[4][8];
-    \\#pragma unroll
-    \\    for (int c = 0; c < 4; ++c) {
-    \\#pragma unroll
-    \\        for (int r = 0; r < 8; ++r) acc[c][r] = 0.0f;
-    \\    }
-    \\
-    \\    for (int byte_idx = threadIdx.x; byte_idx < half_bytes; byte_idx += 256) {
-    \\        const int block_idx = byte_idx >> 4;
-    \\        const int offset = byte_idx & 15;
-    \\        const int base = block_idx << 5;
-    \\        float x_lo[8];
-    \\        float x_hi[8];
-    \\#pragma unroll
-    \\        for (int r = 0; r < 8; ++r) {
-    \\            const int row = row0 + r;
-    \\            x_lo[r] = row < rows ? input[(size_t)row * in_dim + base + offset] : 0.0f;
-    \\            x_hi[r] = row < rows ? input[(size_t)row * in_dim + base + offset + 16] : 0.0f;
-    \\        }
-    \\#pragma unroll
-    \\        for (int c = 0; c < 4; ++c) {
-    \\            if (col0 + c >= out_dim) continue;
-    \\            const uint8_t *block = weight_q4_0 + ((size_t)(col0 + c) * row_blocks + block_idx) * 18;
-    \\            const float d = antfly_half_le_to_float(block);
-    \\            const int packed = (int)block[2 + offset];
-    \\            const float w_lo = d * (float)((packed & 15) - 8);
-    \\            const float w_hi = d * (float)((packed >> 4) - 8);
-    \\#pragma unroll
-    \\            for (int r = 0; r < 8; ++r) acc[c][r] += w_lo * x_lo[r] + w_hi * x_hi[r];
-    \\        }
-    \\    }
-    \\
-    \\    __shared__ float partial[4][8][8];
-    \\    const int lane = threadIdx.x & 31;
-    \\    const int warp = threadIdx.x >> 5;
-    \\#pragma unroll
-    \\    for (int c = 0; c < 4; ++c) {
-    \\#pragma unroll
-    \\        for (int r = 0; r < 8; ++r) {
-    \\            const float total = antfly_warp_reduce_sum(acc[c][r]);
-    \\            if (lane == 0) partial[c][r][warp] = total;
-    \\        }
-    \\    }
-    \\    __syncthreads();
-    \\    if (threadIdx.x < 32) {
-    \\        const int c = threadIdx.x >> 3;
-    \\        const int r = threadIdx.x & 7;
-    \\        float total = 0.0f;
-    \\#pragma unroll
-    \\        for (int w = 0; w < 8; ++w) total += partial[c][r][w];
-    \\        const int col = col0 + c;
-    \\        const int row = row0 + r;
-    \\        if (col < out_dim && row < rows) output[(size_t)row * out_dim + col] = total;
-    \\    }
-    \\}
-    \\
-;
+const first_lazy_cuda_source = renderCudaKernelSource(.q4_k_small_batch_bias_gelu);
+const first_general_cuda_q4_k_mmv_source = renderCudaKernelSource(.q4_k_mmv);
+const first_general_cuda_q4_0_mmv_source = renderCudaKernelSource(.q4_0_mmv);
+const first_general_cuda_q4_0_mm_source = renderCudaKernelSource(.q4_0_mm);
+const first_general_cuda_q4_0_pair_source = renderCudaKernelSource(.q4_0_pair_mmv);
+const first_general_cuda_q4_0_pair_q8_source = renderCudaKernelSource(.q4_0_pair_activation_q8_1);
+const first_general_cuda_q4_0_down_q8_source = renderCudaKernelSource(.q4_0_down_q8_1);
+const first_e2b_cuda_q4_0_pair_q8_6144_source = renderCudaKernelSource(.q4_0_pair_activation_q8_1_e2b_6144);
+const first_e2b_cuda_q4_0_pair_q8_12288_source = renderCudaKernelSource(.q4_0_pair_activation_q8_1_e2b_12288);
+const first_e2b_cuda_q4_0_down_q8_6144_source = renderCudaKernelSource(.q4_0_down_q8_1_e2b_6144);
+const first_e2b_cuda_q4_0_down_q8_12288_source = renderCudaKernelSource(.q4_0_down_q8_1_e2b_12288);
+const first_e2b_cuda_q4_0_pair_f32_6144_exact_source = renderCudaKernelSource(.q4_0_pair_activation_f32_e2b_6144_exact);
+const first_e2b_cuda_q4_0_pair_f32_12288_exact_source = renderCudaKernelSource(.q4_0_pair_activation_f32_e2b_12288_exact);
+const first_e2b_cuda_q4_0_down_f32_6144_exact_source = renderCudaKernelSource(.q4_0_down_f32_e2b_6144_exact);
+const first_e2b_cuda_q4_0_down_f32_12288_exact_source = renderCudaKernelSource(.q4_0_down_f32_e2b_12288_exact);
+const first_e2b_cuda_q4_0_q8_1_argmax_source = renderCudaKernelSource(.q4_0_q8_1_argmax_e2b_tile8);
+const first_cuda_q6_k_q8_1_argmax_k2560_source = renderCudaKernelSource(.q6_k_q8_1_argmax_k2560_tile8);
+const first_cuda_q6_k_q8_1_argmax_k3840_source = renderCudaKernelSource(.q6_k_q8_1_argmax_k3840_tile8);
+const first_decode_attention_1x_cuda_source = renderCudaAttentionSource(.gqa_decode_split_kv_hd256_f32);
+const first_decode_attention_1x_cuda_hd512_source = renderCudaAttentionSource(.gqa_decode_split_kv_hd512_f32);
+const first_decode_attention_1x_cuda_split2_hd256_source = renderCudaAttentionSource(.gqa_decode_split2_kv_hd256_f32);
+const first_decode_attention_1x_cuda_split2_hd512_source = renderCudaAttentionSource(.gqa_decode_split2_kv_hd512_f32);
+const first_decode_attention_1x_cuda_split4_hd256_source = renderCudaAttentionSource(.gqa_decode_split4_kv_hd256_f32);
+const first_decode_attention_1x_cuda_split4_hd512_source = renderCudaAttentionSource(.gqa_decode_split4_kv_hd512_f32);
+const first_decode_attention_1x_cuda_score_prework_hd256_source = renderCudaAttentionSource(.gqa_decode_score_prework_hd256_f32);
+const first_decode_attention_1x_cuda_score_prework_hd512_source = renderCudaAttentionSource(.gqa_decode_score_prework_hd512_f32);
 
-const first_general_cuda_q4_0_pair_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Promoted generated kernel from graph/quant_kernel_compiler.zig.
-    \\// plan_id=cuda/q4_0/rows_1/pair/mmv
-    \\// kernel_id=antfly_q4_0_pair_mmv_f32_v1
-    \\// production_baseline=termite_linear_q4_0_pair_nobias_f32_tile4_w4
-    \\// production_enabled=true
-    \\// Promoted on sequential benchmark evidence vs the handwritten CUDA baseline;
-    \\// runtime dispatch is default-on behind ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR.
-    \\
-    \\#include <cuda_fp16.h>
-    \\#include <stdint.h>
-    \\
-    \\static __device__ __forceinline__ float antfly_half_le_to_float(const uint8_t *p) {
-    \\    const uint16_t bits = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-    \\    return __half2float(__ushort_as_half(bits));
-    \\}
-    \\
-    \\static __device__ __forceinline__ float antfly_warp_reduce_sum(float value) {
-    \\    value += __shfl_down_sync(0xffffffffu, value, 16);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 8);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 4);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 2);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 1);
-    \\    return value;
-    \\}
-    \\
-    \\extern "C" __global__ void antfly_q4_0_pair_mmv_f32_v1(
-    \\    const float *input,
-    \\    const uint8_t *weight_a_q4_0,
-    \\    const uint8_t *weight_b_q4_0,
-    \\    float *output_a,
-    \\    float *output_b,
-    \\    int rows,
-    \\    int in_dim,
-    \\    int out_dim
-    \\) {
-    \\    const int col0 = blockIdx.x << 2;
-    \\    if (rows != 1 || col0 >= out_dim) return;
-    \\    if (blockDim.x != 256) return;
-    \\    if ((in_dim & 31) != 0) return;
-    \\
-    \\    const int row_blocks = in_dim >> 5;
-    \\    const int half_bytes = in_dim >> 1;
-    \\    float acc[2][4];
-    \\#pragma unroll
-    \\    for (int w = 0; w < 2; ++w) {
-    \\#pragma unroll
-    \\        for (int c = 0; c < 4; ++c) acc[w][c] = 0.0f;
-    \\    }
-    \\
-    \\    for (int byte_idx = threadIdx.x; byte_idx < half_bytes; byte_idx += 256) {
-    \\        const int block_idx = byte_idx >> 4;
-    \\        const int offset = byte_idx & 15;
-    \\        const int base = block_idx << 5;
-    \\        const float x_lo = input[base + offset];
-    \\        const float x_hi = input[base + offset + 16];
-    \\#pragma unroll
-    \\        for (int w = 0; w < 2; ++w) {
-    \\            const uint8_t *weight = w == 0 ? weight_a_q4_0 : weight_b_q4_0;
-    \\#pragma unroll
-    \\            for (int c = 0; c < 4; ++c) {
-    \\                if (col0 + c >= out_dim) continue;
-    \\                const uint8_t *block = weight + ((size_t)(col0 + c) * row_blocks + block_idx) * 18;
-    \\                const float d = antfly_half_le_to_float(block);
-    \\                const int packed = (int)block[2 + offset];
-    \\                acc[w][c] += d * (x_lo * (float)((packed & 15) - 8) + x_hi * (float)((packed >> 4) - 8));
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    __shared__ float partial[2][4][8];
-    \\    const int lane = threadIdx.x & 31;
-    \\    const int warp = threadIdx.x >> 5;
-    \\#pragma unroll
-    \\    for (int w = 0; w < 2; ++w) {
-    \\#pragma unroll
-    \\        for (int c = 0; c < 4; ++c) {
-    \\            const float total = antfly_warp_reduce_sum(acc[w][c]);
-    \\            if (lane == 0) partial[w][c][warp] = total;
-    \\        }
-    \\    }
-    \\    __syncthreads();
-    \\    if (threadIdx.x < 8) {
-    \\        const int w = threadIdx.x >> 2;
-    \\        const int c = threadIdx.x & 3;
-    \\        float total = 0.0f;
-    \\#pragma unroll
-    \\        for (int i = 0; i < 8; ++i) total += partial[w][c][i];
-    \\        if (col0 + c < out_dim) {
-    \\            float *output = w == 0 ? output_a : output_b;
-    \\            output[col0 + c] = total;
-    \\        }
-    \\    }
-    \\}
-    \\
-;
-
-const first_general_cuda_q4_0_pair_q8_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Promoted generated kernel from graph/quant_kernel_compiler.zig.
-    \\// plan_id=cuda/q4_0/rows_1/pair_activation/mmv
-    \\// kernel_id=antfly_q4_0_pair_activation_q8_1_mmv_v1
-    \\// production_baseline=termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn
-    \\// production_enabled=true
-    \\// Promoted on sequential benchmark evidence vs the handwritten CUDA baseline;
-    \\// runtime dispatch is default-on behind ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR_Q8.
-    \\
-    \\#include <cuda_fp16.h>
-    \\
-    \\static __device__ __forceinline__ float antfly_half_bits_to_float(unsigned short bits) {
-    \\    return __half2float(__ushort_as_half(bits));
-    \\}
-    \\
-    \\static __device__ __forceinline__ float antfly_warp_reduce_sum_f32(float value) {
-    \\    value += __shfl_down_sync(0xffffffffu, value, 16);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 8);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 4);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 2);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 1);
-    \\    return value;
-    \\}
-    \\
-    \\static __device__ __forceinline__ float antfly_warp_reduce_max_f32(float value) {
-    \\    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 16));
-    \\    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 8));
-    \\    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 4));
-    \\    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 2));
-    \\    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 1));
-    \\    return __shfl_sync(0xffffffffu, value, 0);
-    \\}
-    \\
-    \\static __device__ __forceinline__ float antfly_decoder_activation_f32(float x, unsigned int activation) {
-    \\    if (activation <= 1u) {
-    \\        const float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
-    \\        return 0.5f * x * (1.0f + tanhf(inner));
-    \\    }
-    \\    if (activation == 2u) return x / (1.0f + __expf(-x));
-    \\    if (activation == 3u) return fmaxf(x, 0.0f);
-    \\    if (activation == 4u) return x / (1.0f + __expf(-1.702f * x));
-    \\    const float r = fmaxf(x, 0.0f);
-    \\    return r * r;
-    \\}
-    \\
-    \\// q4_0 payload bytes live at bp+2; bp is always 2-byte aligned (18-byte
-    \\// blocks), so every 4-byte word can be assembled from two aligned u16 loads.
-    \\static __device__ __forceinline__ unsigned int antfly_q4_0_word_u16(const unsigned char *payload) {
-    \\    const unsigned short *halves = (const unsigned short *)payload;
-    \\    return (unsigned int)halves[0] | ((unsigned int)halves[1] << 16);
-    \\}
-    \\
-    \\static __device__ __forceinline__ float antfly_q4_0_q8_dot16(
-    \\    const unsigned char *q4_bp,
-    \\    float q8_d,
-    \\    unsigned int iqs,
-    \\    int q8_low0,
-    \\    int q8_high0,
-    \\    int q8_low1,
-    \\    int q8_high1
-    \\) {
-    \\    const float q4_d = antfly_half_bits_to_float(((const unsigned short *)q4_bp)[0]);
-    \\    const unsigned int base0 = iqs * 4u;
-    \\    const unsigned int word0 = antfly_q4_0_word_u16(q4_bp + 2u + base0);
-    \\    const unsigned int word1 = antfly_q4_0_word_u16(q4_bp + 2u + base0 + 4u);
-    \\    const unsigned int low0 = __vadd4(word0 & 0x0f0f0f0fu, 0xf8f8f8f8u);
-    \\    const unsigned int high0 = __vadd4((word0 >> 4) & 0x0f0f0f0fu, 0xf8f8f8f8u);
-    \\    const unsigned int low1 = __vadd4(word1 & 0x0f0f0f0fu, 0xf8f8f8f8u);
-    \\    const unsigned int high1 = __vadd4((word1 >> 4) & 0x0f0f0f0fu, 0xf8f8f8f8u);
-    \\    int sumi = __dp4a((int)low0, q8_low0, 0);
-    \\    sumi = __dp4a((int)high0, q8_high0, sumi);
-    \\    sumi = __dp4a((int)low1, q8_low1, sumi);
-    \\    sumi = __dp4a((int)high1, q8_high1, sumi);
-    \\    return q4_d * q8_d * (float)sumi;
-    \\}
-    \\
-    \\extern "C" __global__ void antfly_q4_0_pair_activation_q8_1_mmv_v1(
-    \\    unsigned char *dst_q8,
-    \\    const unsigned char *q8_input,
-    \\    const unsigned char *weight_gate,
-    \\    const unsigned char *weight_up,
-    \\    unsigned int activation
-    \\) {
-    \\    const unsigned int row_blocks = 80u;
-    \\    const unsigned int out_row_blocks = 320u;
-    \\    const unsigned int group_cols = 4u;
-    \\    const unsigned int groups_per_wave = 4u;
-    \\    const unsigned int waves = 2u;
-    \\
-    \\    const unsigned int out_block = blockIdx.x % out_row_blocks;
-    \\    const unsigned int row = blockIdx.x / out_row_blocks;
-    \\    const unsigned int col_block = out_block * 32u;
-    \\    const unsigned int tid = threadIdx.x;
-    \\    const unsigned int lane = tid & 31u;
-    \\    const unsigned int warp = tid >> 5u;
-    \\    const unsigned int group = warp / 5u;
-    \\    const unsigned int group_warp = warp - group * 5u;
-    \\    if (blockDim.x != 640u) return;
-    \\
-    \\    __shared__ float gate_partial[4][4][5];
-    \\    __shared__ float up_partial[4][4][5];
-    \\    __shared__ float activated[32];
-    \\
-    \\    #pragma unroll
-    \\    for (unsigned int wave = 0u; wave < waves; ++wave) {
-    \\        if (group < groups_per_wave) {
-    \\            const unsigned int local_tid = group_warp * 32u + lane;
-    \\            const unsigned int col_tile = col_block + (wave * groups_per_wave + group) * group_cols;
-    \\            float gate_acc[4];
-    \\            float up_acc[4];
-    \\            #pragma unroll
-    \\            for (unsigned int c = 0u; c < group_cols; ++c) {
-    \\                gate_acc[c] = 0.0f;
-    \\                up_acc[c] = 0.0f;
-    \\            }
-    \\
-    \\            const unsigned int iqs = (local_tid & 1u) * 2u;
-    \\            for (unsigned int block = local_tid >> 1u; block < row_blocks; block += 80u) {
-    \\                const unsigned char *q8_bp = q8_input + (row * row_blocks + block) * 36u;
-    \\                const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
-    \\                const signed char *q8_values = (const signed char *)(q8_bp + 4u);
-    \\                const unsigned int q8_base0 = iqs * 4u;
-    \\                const unsigned int q8_base1 = q8_base0 + 4u;
-    \\                const int q8_low0 = *(const int *)(q8_values + q8_base0);
-    \\                const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
-    \\                const int q8_low1 = *(const int *)(q8_values + q8_base1);
-    \\                const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
-    \\
-    \\                #pragma unroll
-    \\                for (unsigned int c = 0u; c < group_cols; ++c) {
-    \\                    const unsigned int col = col_tile + c;
-    \\                    const unsigned char *gate_bp = weight_gate + ((size_t)col * row_blocks + block) * 18u;
-    \\                    const unsigned char *up_bp = weight_up + ((size_t)col * row_blocks + block) * 18u;
-    \\                    gate_acc[c] += antfly_q4_0_q8_dot16(gate_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-    \\                    up_acc[c] += antfly_q4_0_q8_dot16(up_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-    \\                }
-    \\            }
-    \\
-    \\            #pragma unroll
-    \\            for (unsigned int c = 0u; c < group_cols; ++c) {
-    \\                const float gate_sum = antfly_warp_reduce_sum_f32(gate_acc[c]);
-    \\                const float up_sum = antfly_warp_reduce_sum_f32(up_acc[c]);
-    \\                if (lane == 0u) {
-    \\                    gate_partial[group][c][group_warp] = gate_sum;
-    \\                    up_partial[group][c][group_warp] = up_sum;
-    \\                }
-    \\            }
-    \\        }
-    \\        __syncthreads();
-    \\        if (tid < 16u) {
-    \\            const unsigned int out_group = tid >> 2u;
-    \\            const unsigned int c = tid & 3u;
-    \\            float gate_y = 0.0f;
-    \\            float up_y = 0.0f;
-    \\            #pragma unroll
-    \\            for (unsigned int w = 0u; w < 5u; ++w) {
-    \\                gate_y += gate_partial[out_group][c][w];
-    \\                up_y += up_partial[out_group][c][w];
-    \\            }
-    \\            activated[wave * 16u + out_group * group_cols + c] = antfly_decoder_activation_f32(gate_y, activation) * up_y;
-    \\        }
-    \\        __syncthreads();
-    \\    }
-    \\
-    \\    if (warp == 0u) {
-    \\        const float x = activated[lane];
-    \\        const float amax = antfly_warp_reduce_max_f32(fabsf(x));
-    \\        const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
-    \\        int q = 0;
-    \\        if (d > 0.0f) {
-    \\            q = __float2int_rn(x / d);
-    \\            q = max(-127, min(127, q));
-    \\        }
-    \\        unsigned char *bp = dst_q8 + ((size_t)row * out_row_blocks + out_block) * 36u;
-    \\        bp[4u + lane] = (unsigned char)(signed char)q;
-    \\        if (lane == 0u) {
-    \\            const unsigned short d_bits = __half_as_ushort(__float2half(d));
-    \\            bp[0] = (unsigned char)(d_bits & 0xffu);
-    \\            bp[1] = (unsigned char)(d_bits >> 8);
-    \\            bp[2] = 0u;
-    \\            bp[3] = 0u;
-    \\        }
-    \\    }
-    \\}
-    \\
-;
-
-const first_general_cuda_q4_0_down_q8_source =
-    \\// Copyright 2026 Antfly, Inc.
-    \\//
-    \\// Licensed under the Apache License, Version 2.0 (the "License");
-    \\// you may not use this file except in compliance with the License.
-    \\// You may obtain a copy of the License at
-    \\//
-    \\//     http://www.apache.org/licenses/LICENSE-2.0
-    \\//
-    \\// Unless required by applicable law or agreed to in writing, software
-    \\// distributed under the License is distributed on an "AS IS" BASIS,
-    \\// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    \\// See the License for the specific language governing permissions and
-    \\// limitations under the License.
-    \\
-    \\// Promoted generated kernel from graph/quant_kernel_compiler.zig.
-    \\// plan_id=cuda/q4_0/rows_1/gated_down/mmv
-    \\// kernel_id=antfly_q4_0_down_q8_1_mmv_v1
-    \\// production_baseline=termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down
-    \\// production_enabled=true
-    \\// Promoted on sequential benchmark evidence vs the handwritten CUDA baseline;
-    \\// runtime dispatch is default-on behind ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_DOWN_Q8.
-    \\
-    \\#include <cuda_fp16.h>
-    \\
-    \\static __device__ __forceinline__ float antfly_half_bits_to_float(unsigned short bits) {
-    \\    return __half2float(__ushort_as_half(bits));
-    \\}
-    \\
-    \\static __device__ __forceinline__ float antfly_warp_reduce_sum_f32(float value) {
-    \\    value += __shfl_down_sync(0xffffffffu, value, 16);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 8);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 4);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 2);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 1);
-    \\    return value;
-    \\}
-    \\
-    \\static __device__ __forceinline__ unsigned int antfly_q4_0_word_u16(const unsigned char *payload) {
-    \\    const unsigned short *halves = (const unsigned short *)payload;
-    \\    return (unsigned int)halves[0] | ((unsigned int)halves[1] << 16);
-    \\}
-    \\
-    \\static __device__ __forceinline__ float antfly_q4_0_q8_dot16(
-    \\    const unsigned char *q4_bp,
-    \\    float q8_d,
-    \\    unsigned int iqs,
-    \\    int q8_low0,
-    \\    int q8_high0,
-    \\    int q8_low1,
-    \\    int q8_high1
-    \\) {
-    \\    const float q4_d = antfly_half_bits_to_float(((const unsigned short *)q4_bp)[0]);
-    \\    const unsigned int base0 = iqs * 4u;
-    \\    const unsigned int word0 = antfly_q4_0_word_u16(q4_bp + 2u + base0);
-    \\    const unsigned int word1 = antfly_q4_0_word_u16(q4_bp + 2u + base0 + 4u);
-    \\    const unsigned int low0 = __vadd4(word0 & 0x0f0f0f0fu, 0xf8f8f8f8u);
-    \\    const unsigned int high0 = __vadd4((word0 >> 4) & 0x0f0f0f0fu, 0xf8f8f8f8u);
-    \\    const unsigned int low1 = __vadd4(word1 & 0x0f0f0f0fu, 0xf8f8f8f8u);
-    \\    const unsigned int high1 = __vadd4((word1 >> 4) & 0x0f0f0f0fu, 0xf8f8f8f8u);
-    \\    int sumi = __dp4a((int)low0, q8_low0, 0);
-    \\    sumi = __dp4a((int)high0, q8_high0, sumi);
-    \\    sumi = __dp4a((int)low1, q8_low1, sumi);
-    \\    sumi = __dp4a((int)high1, q8_high1, sumi);
-    \\    return q4_d * q8_d * (float)sumi;
-    \\}
-    \\
-    \\extern "C" __global__ void antfly_q4_0_down_q8_1_mmv_v1(
-    \\    float *dst,
-    \\    const unsigned char *q8_input,
-    \\    const unsigned char *weight
-    \\) {
-    \\    const unsigned int cols = 4u;
-    \\    const unsigned int row_blocks = 320u;
-    \\    const unsigned int col_tile = blockIdx.x * cols;
-    \\    const unsigned int tid = threadIdx.x;
-    \\    const unsigned int lane = tid & 31u;
-    \\    const unsigned int warp = tid >> 5u;
-    \\    if (blockDim.x != 256u) return;
-    \\
-    \\    __shared__ float warp_partial[4][8];
-    \\    float acc[4];
-    \\    #pragma unroll
-    \\    for (unsigned int c = 0u; c < cols; ++c) acc[c] = 0.0f;
-    \\
-    \\    const unsigned int iqs = (tid & 1u) * 2u;
-    \\    for (unsigned int block = tid >> 1u; block < row_blocks; block += 128u) {
-    \\        const unsigned char *q8_bp = q8_input + block * 36u;
-    \\        const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
-    \\        const signed char *q8_values = (const signed char *)(q8_bp + 4u);
-    \\        const unsigned int q8_base0 = iqs * 4u;
-    \\        const unsigned int q8_base1 = q8_base0 + 4u;
-    \\        const int q8_low0 = *(const int *)(q8_values + q8_base0);
-    \\        const int q8_high0 = *(const int *)(q8_values + q8_base0 + 16u);
-    \\        const int q8_low1 = *(const int *)(q8_values + q8_base1);
-    \\        const int q8_high1 = *(const int *)(q8_values + q8_base1 + 16u);
-    \\
-    \\        #pragma unroll
-    \\        for (unsigned int c = 0u; c < cols; ++c) {
-    \\            const unsigned int col = col_tile + c;
-    \\            const unsigned char *bp = weight + ((size_t)col * row_blocks + block) * 18u;
-    \\            acc[c] += antfly_q4_0_q8_dot16(bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-    \\        }
-    \\    }
-    \\
-    \\    #pragma unroll
-    \\    for (unsigned int c = 0u; c < cols; ++c) {
-    \\        const float sum = antfly_warp_reduce_sum_f32(acc[c]);
-    \\        if (lane == 0u) warp_partial[c][warp] = sum;
-    \\    }
-    \\    __syncthreads();
-    \\    if (tid < 4u) {
-    \\        float y = 0.0f;
-    \\        #pragma unroll
-    \\        for (unsigned int w = 0u; w < 8u; ++w) y += warp_partial[tid][w];
-    \\        dst[col_tile + tid] = y;
-    \\    }
-    \\}
-    \\
-;
-
-// ---------------------------------------------------------------------------
-// Codegen-owned Metal small-batch quant kernel region.
-//
-// The MSL text below is the single source of truth for both the checked-in
-// generated sources under src/ops/metal/generated/ and the runtime-embedded
-// copy in src/backends/metal_kernels.m (the marker-delimited region that
-// `zig build quant-kernel-codegen -- --write` rewrites). Production Metal
-// compiles the metal_kernels.m region, which the codegen tool renders from
-// the same descriptor-driven renderer as these sources, so the two copies
-// cannot drift by construction.
-// ---------------------------------------------------------------------------
+/// Source fingerprints cover the plan header, including the explicit split
+/// schedule/source ID. They are independent for each candidate even where the
+/// lowering body is otherwise structurally identical.
+pub const first_decode_attention_1x_cuda_source_fingerprint = sourceFingerprint(first_decode_attention_1x_cuda_source);
+pub const first_decode_attention_1x_cuda_hd512_source_fingerprint = sourceFingerprint(first_decode_attention_1x_cuda_hd512_source);
+pub const first_decode_attention_1x_cuda_split2_hd256_source_fingerprint = sourceFingerprint(first_decode_attention_1x_cuda_split2_hd256_source);
+pub const first_decode_attention_1x_cuda_split2_hd512_source_fingerprint = sourceFingerprint(first_decode_attention_1x_cuda_split2_hd512_source);
+pub const first_decode_attention_1x_cuda_split4_hd256_source_fingerprint = sourceFingerprint(first_decode_attention_1x_cuda_split4_hd256_source);
+pub const first_decode_attention_1x_cuda_split4_hd512_source_fingerprint = sourceFingerprint(first_decode_attention_1x_cuda_split4_hd512_source);
+pub const first_decode_attention_1x_cuda_score_prework_hd256_source_fingerprint = sourceFingerprint(first_decode_attention_1x_cuda_score_prework_hd256_source);
+pub const first_decode_attention_1x_cuda_score_prework_hd512_source_fingerprint = sourceFingerprint(first_decode_attention_1x_cuda_score_prework_hd512_source);
 
 const metal_generated_source_license_header =
     \\// Copyright 2026 Antfly, Inc.
@@ -3822,6 +4358,110 @@ pub const metal_runtime_external_helpers = [_][]const u8{
     metal_rt_external_helper_paged_attention_params,
 };
 
+/// Returns whether a CUDA attention artifact is linked into the runtime module.
+/// Every entry remains dev-only (`production_enabled = false`); this only means
+/// the explicit generated-attention selector can load the schedule for a
+/// benchmark. Keep this exhaustive so a new schedule cannot be linked without
+/// an intentional dispatch policy.
+pub fn cudaAttentionArtifactRuntimeWired(artifact: GeneratedArtifact) bool {
+    if (artifact.backend != .cuda or artifact.opKind() != .attention) return false;
+    const kind = artifact.cuda_attention_kernel orelse return false;
+    return switch (kind) {
+        .gqa_decode_split_kv_hd256_f32,
+        .gqa_decode_split_kv_hd512_f32,
+        .gqa_decode_split2_kv_hd256_f32,
+        .gqa_decode_split2_kv_hd512_f32,
+        .gqa_decode_split4_kv_hd256_f32,
+        .gqa_decode_split4_kv_hd512_f32,
+        .gqa_decode_score_prework_hd256_f32,
+        .gqa_decode_score_prework_hd512_f32,
+        => true,
+    };
+}
+
+/// Renders the marker-delimited generated attention region embedded in
+/// `inference_cuda_kernels.cu`. Registry order is authoritative and each entry
+/// carries its plan metadata immediately before the renderer-owned kernel body.
+pub fn renderCudaRuntimeAttentionRegion(allocator: std.mem.Allocator) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    var emitted: usize = 0;
+    for (first_generated_attention_artifacts) |artifact| {
+        if (!cudaAttentionArtifactRuntimeWired(artifact)) continue;
+        const plan = cudaAttentionRenderPlanForArtifact(artifact) orelse return error.MissingCudaAttentionRenderPlan;
+        const plan_id = try cuda_renderer.attentionPlanId(plan, allocator);
+        defer allocator.free(plan_id);
+        const body = try cuda_renderer.renderAttentionBodyAlloc(allocator, plan);
+        defer allocator.free(body);
+
+        if (emitted != 0) try out.append(allocator, '\n');
+        try out.appendSlice(allocator, "// Opt-in generated attention candidate from graph/quant_kernel_compiler.zig.\n");
+        try appendFmt(allocator, &out, "// kernel_id={s} plan_id={s}\n", .{ plan.kernel_id, plan_id });
+        try out.appendSlice(allocator, body);
+        emitted += 1;
+    }
+    if (emitted == 0) return error.MissingCudaAttentionRenderPlan;
+    return out.toOwnedSlice(allocator);
+}
+
+/// The attention runtime region emits bodies only. Keep the block-reduction
+/// helpers shared with the handwritten fast baseline byte-compatible and
+/// positioned before the generated region.
+pub fn validateCudaRuntimeAttentionExternalHelpers(prefix: []const u8) !void {
+    for (cuda_renderer.attention_runtime_external_helpers) |helper| {
+        if (std.mem.count(u8, prefix, helper.source) != 1) {
+            return error.CudaRuntimeAttentionExternalHelperDrift;
+        }
+    }
+    for (cuda_renderer.attention_score_prework_runtime_external_declarations) |declaration| {
+        if (std.mem.count(u8, prefix, declaration.source) != 1) {
+            return error.CudaRuntimeAttentionExternalHelperDrift;
+        }
+    }
+}
+
+/// Renders runtime-wired CUDA matmul candidates that remain dev-only. These
+/// bodies live in their own bundle region after the shared Antfly Q4/Q8 helper
+/// definitions, so renderer output can reference those helpers directly.
+pub fn renderCudaRuntimeDevMatmulRegion(allocator: std.mem.Allocator) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    var emitted: usize = 0;
+    for (first_generated_matmul_artifacts) |artifact| {
+        if (artifact.backend != .cuda or artifact.production_enabled or !artifactRuntimeWired(artifact)) continue;
+        const plan = cudaRenderPlanForArtifact(artifact) orelse return error.MissingCudaRenderPlan;
+        const plan_id = try cuda_renderer.planId(plan, allocator);
+        defer allocator.free(plan_id);
+        const body = try cuda_renderer.renderBodyAlloc(allocator, plan);
+        defer allocator.free(body);
+
+        if (emitted != 0) try out.append(allocator, '\n');
+        try out.appendSlice(allocator, "// Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.\n");
+        try appendFmt(allocator, &out, "// kernel_id={s} plan_id={s}\n", .{ plan.kernel_id, plan_id });
+        try out.appendSlice(allocator, body);
+        if (body.len == 0 or body[body.len - 1] != '\n') try out.append(allocator, '\n');
+        emitted += 1;
+    }
+    if (emitted == 0) return error.MissingCudaRenderPlan;
+    return out.toOwnedSlice(allocator);
+}
+
+/// Verifies that renderer helpers intentionally kept outside the owned dev
+/// matmul region are defined exactly once before it. This prevents a fresh
+/// region from compiling against stale or reordered helper implementations.
+pub fn validateCudaRuntimeDevMatmulExternalHelpers(prefix: []const u8) !void {
+    var checked_candidates: usize = 0;
+    for (first_generated_matmul_artifacts) |artifact| {
+        if (artifact.backend != .cuda or artifact.production_enabled or !artifactRuntimeWired(artifact)) continue;
+        const plan = cudaRenderPlanForArtifact(artifact) orelse return error.MissingCudaRenderPlan;
+        for (cuda_renderer.supportFor(plan.lowering).helpers) |helper| {
+            if (std.mem.count(u8, prefix, helper.source) != 1) return error.CudaRuntimeDevMatmulExternalHelperDrift;
+        }
+        checked_candidates += 1;
+    }
+    if (checked_candidates == 0) return error.MissingCudaRenderPlan;
+}
+
 // Renders the runtime-embedded quant kernel region of
 // src/backends/metal_kernels.m as Objective-C string fragment lines. The
 // codegen tool rewrites the marker-delimited region of that file with this
@@ -3849,39 +4489,34 @@ pub fn renderMetalRuntimeQuantRegion(allocator: std.mem.Allocator) ![]u8 {
     const arena = arena_state.allocator();
 
     var kernels = std.ArrayListUnmanaged(metal_renderer.RegionKernel).empty;
-    for (metal_production_schedules) |route| {
-        const decoder = metal_renderer.decoderFor(route.format) orelse return error.MissingDecoder;
-        try kernels.append(arena, .{
-            .kernel_id = try metalRuntimeKernelId(arena, route.format, route.epilogue),
-            .decoder = decoder,
-            .schedule = route.schedule,
-            .epilogue = route.epilogue,
-        });
+    for (first_generated_artifacts) |artifact| {
+        if (artifact.backend != .metal) continue;
+        switch (artifact.op) {
+            .small_batch_matmul => |op| {
+                const decoder = metal_renderer.decoderFor(op.format) orelse return error.MissingDecoder;
+                const schedule = metalRouteScheduleFor(op.format, op.row_bucket, op.epilogue) orelse
+                    return error.MissingMetalRouteSchedule;
+                try kernels.append(arena, .{
+                    .kernel_id = artifact.kernel_id,
+                    .decoder = decoder,
+                    .schedule = schedule,
+                    .epilogue = op.epilogue,
+                });
+            },
+            .microkernel => |op| try kernels.append(arena, .{
+                .kernel_id = artifact.kernel_id,
+                .op_kind = .microkernel,
+                .microkernel = op.kind,
+                .schedule = op.schedule,
+            }),
+            .attention => |op| try kernels.append(arena, .{
+                .kernel_id = artifact.kernel_id,
+                .op_kind = .attention,
+                .attention = op.kind,
+                .schedule = op.schedule,
+            }),
+        }
     }
-    // Microkernel (non-matmul) routes share the region so their bodies compile
-    // into the same precise runtime library, single-sourced from the renderer.
-    try kernels.append(arena, .{
-        .kernel_id = first_rms_norm_metal_kernel_id,
-        .op_kind = .microkernel,
-        .microkernel = .rms_norm,
-        .schedule = first_rms_norm_metal_schedule,
-    });
-    // Attention routes likewise share the region: the self-contained params
-    // struct + paging helper join the dedup set (emitted once, shared by both
-    // attention kernels), then each body is emitted, so the runtime region carries
-    // byte-identical bytes to the checked-in `.metal`.
-    try kernels.append(arena, .{
-        .kernel_id = first_decode_attention_1x_metal_kernel_id,
-        .op_kind = .attention,
-        .attention = .decode_1x,
-        .schedule = first_decode_attention_1x_metal_schedule,
-    });
-    try kernels.append(arena, .{
-        .kernel_id = first_prefill_flash_metal_kernel_id,
-        .op_kind = .attention,
-        .attention = .prefill_flash,
-        .schedule = first_prefill_flash_metal_schedule,
-    });
     const body = try metal_renderer.renderRuntimeRegion(arena, kernels.items);
 
     var out = std.ArrayListUnmanaged(u8).empty;
@@ -4526,9 +5161,9 @@ pub fn buildIr(format: quant_matmul.Format, row_bucket: quant_matmul.RowBucket, 
 
 fn supportsEpilogueForBackend(spec: QuantKernelSpec, backend: Backend, epilogue: Epilogue) bool {
     if (!spec.supportsEpilogue(epilogue)) return false;
-    if (backend == .cuda and spec.format == .q6_k and epilogue != .none) return false;
+    if (backend == .cuda and spec.format == .q6_k and epilogue != .none and epilogue != .argmax) return false;
     if (backend == .metal and spec.format == .q4_0 and epilogue == .pair) return false;
-    if (backend == .metal and (epilogue == .pair_activation or epilogue == .gated_down)) return false;
+    if (backend == .metal and (epilogue == .argmax or epilogue == .pair_activation or epilogue == .gated_down)) return false;
     return true;
 }
 
@@ -4769,23 +5404,28 @@ pub fn benchmarkManifestJson(allocator: std.mem.Allocator) ![]u8 {
 }
 
 pub fn artifactManifestJson(allocator: std.mem.Allocator) ![]u8 {
-    var records: [first_generated_artifacts.len]ArtifactManifestRecord = undefined;
-    var owned_route_commands = [_][]const u8{""} ** first_generated_artifacts.len;
-    var owned_blocker_check_commands = [_][]const u8{""} ** first_generated_artifacts.len;
+    var registry_records: [first_generated_artifacts.len]ArtifactRegistryManifestRecord = undefined;
+    for (first_generated_artifacts, 0..) |artifact, index| {
+        registry_records[index] = artifactRegistryManifestRecord(artifact);
+    }
+    var records: [first_generated_matmul_artifacts.len]ArtifactManifestRecord = undefined;
+    var owned_route_commands = [_][]const u8{""} ** first_generated_matmul_artifacts.len;
+    var owned_blocker_check_commands = [_][]const u8{""} ** first_generated_matmul_artifacts.len;
     defer for (owned_route_commands) |command| {
         if (command.len != 0) allocator.free(command);
     };
     defer for (owned_blocker_check_commands) |command| {
         if (command.len != 0) allocator.free(command);
     };
-    for (first_generated_artifacts, 0..) |artifact, index| {
+    for (first_generated_matmul_artifacts, 0..) |artifact, index| {
         owned_route_commands[index] = try artifactRuntimeRouteEvidenceCommand(allocator, artifact);
         owned_blocker_check_commands[index] = try artifactPromotionBlockerCheckCommand(allocator, artifact);
         records[index] = artifactManifestRecord(artifact, owned_route_commands[index], owned_blocker_check_commands[index]);
     }
     return std.json.Stringify.valueAlloc(allocator, ArtifactManifest{
         .schema = first_artifact_manifest_schema,
-        .artifact_count = first_generated_artifacts.len,
+        .artifact_count = first_generated_matmul_artifacts.len,
+        .registry_artifact_count = first_generated_artifacts.len,
         .checked_in_metal_evidence_count = first_metal_runtime_evidence_count,
         .metal_promotion_blocker_evidence_count = first_metal_promotion_blocker_evidence_count,
         .metal_promotion_blocker_evidence_path_count = metalPromotionBlockerEvidencePathCount(),
@@ -4824,9 +5464,54 @@ pub fn artifactManifestJson(allocator: std.mem.Allocator) ![]u8 {
         .metal_production_regression_build_command = first_metal_production_regression_build_command,
         .metal_production_regression_evidence_command = first_metal_production_regression_evidence_command,
         .metal_blocker_strict_check_command = first_metal_blocker_strict_check_command,
+        .registry_artifacts = &registry_records,
         .artifacts = &records,
         .metal_evidence_records = &first_metal_runtime_evidence,
     }, .{ .whitespace = .indent_2 });
+}
+
+fn artifactRegistryManifestRecord(artifact: GeneratedArtifact) ArtifactRegistryManifestRecord {
+    var record = ArtifactRegistryManifestRecord{
+        .backend = @tagName(artifact.backend),
+        .op_kind = @tagName(artifact.opKind()),
+        .kernel_id = artifact.kernel_id,
+        .source_path = artifact.source_path,
+        .generated_source_fingerprint = artifactSourceFingerprint(artifact),
+        .check_command = artifact.check_command,
+        .production_enabled = artifact.production_enabled,
+        .runtime_min_in_dim = artifact.runtime_shape.min_in_dim,
+    };
+    if (cudaRenderPlanForArtifact(artifact)) |plan| {
+        record.cuda_kernel = @tagName(plan.kind);
+        record.cuda_launch = plan.launch;
+    } else if (cudaAttentionRenderPlanForArtifact(artifact)) |plan| {
+        record.cuda_kernel = @tagName(plan.kind);
+        record.cuda_launch = plan.launch;
+        record.cuda_serial_kernel = plan.serial_kernel_id;
+        record.cuda_serial_launch = plan.serial_launch;
+        record.cuda_reduction_kernel = plan.reduction_kernel_id;
+        record.cuda_reduction_launch = plan.reduction_launch;
+        record.cuda_attention_source_id = plan.source_id;
+        record.cuda_attention_split_count = plan.lowering.kv_splits;
+        record.cuda_attention_workspace = cuda_renderer.generatedAttentionWorkspaceLayoutFor(plan.lowering.kv_splits) orelse unreachable;
+    }
+    switch (artifact.op) {
+        .small_batch_matmul => |op| record.matmul = .{
+            .format = @tagName(op.format),
+            .row_bucket = @tagName(op.row_bucket),
+            .epilogue = @tagName(op.epilogue),
+        },
+        .microkernel => |op| record.microkernel = .{
+            .kind = @tagName(op.kind),
+            .schedule = op.schedule,
+        },
+        .attention => |op| record.attention = .{
+            .kind = @tagName(op.kind),
+            .head_dim = op.head_dim,
+            .schedule = op.schedule,
+        },
+    }
+    return record;
 }
 
 pub fn specManifestJson(allocator: std.mem.Allocator) ![]u8 {
@@ -4862,7 +5547,7 @@ pub fn conformanceManifestJson(allocator: std.mem.Allocator) ![]u8 {
 fn metalProductionBenchmarkCaseCount() comptime_int {
     @setEvalBranchQuota(10_000);
     var count: comptime_int = 0;
-    inline for (first_generated_artifacts) |artifact| {
+    inline for (first_generated_matmul_artifacts) |artifact| {
         if (artifact.backend == .metal and artifactHasPromotionEvidence(artifact)) count += 2;
     }
     return count;
@@ -4872,7 +5557,7 @@ fn buildMetalProductionBenchmarkCases() [metalProductionBenchmarkCaseCount()]Met
     @setEvalBranchQuota(10_000);
     var cases: [metalProductionBenchmarkCaseCount()]MetalProductionBenchmarkCase = undefined;
     var index: usize = 0;
-    inline for (first_generated_artifacts) |artifact| {
+    inline for (first_generated_matmul_artifacts) |artifact| {
         if (artifact.backend == .metal and artifactHasPromotionEvidence(artifact)) {
             cases[index] = metalProductionBenchmarkCaseForArtifactShape(artifact, .small);
             index += 1;
@@ -4909,7 +5594,7 @@ pub fn metalProductionBenchmarkCaseManifestFingerprint() u64 {
     return hasher.final();
 }
 
-fn metalProductionBenchmarkCaseForArtifactShape(comptime artifact: GeneratedArtifact, comptime shape: MetalBenchmarkShape) MetalProductionBenchmarkCase {
+fn metalProductionBenchmarkCaseForArtifactShape(comptime artifact: GeneratedMatmulArtifact, comptime shape: MetalBenchmarkShape) MetalProductionBenchmarkCase {
     const dims = metalBenchmarkDimsForArtifact(artifact, shape);
     return .{
         .name = metalBenchmarkCaseName(artifact, shape),
@@ -4933,14 +5618,14 @@ fn metalProductionBenchmarkCaseForArtifactShape(comptime artifact: GeneratedArti
     };
 }
 
-pub fn metalBenchmarkCaseName(comptime artifact: GeneratedArtifact, comptime shape: MetalBenchmarkShape) []const u8 {
+pub fn metalBenchmarkCaseName(comptime artifact: GeneratedMatmulArtifact, comptime shape: MetalBenchmarkShape) []const u8 {
     return switch (shape) {
         .small => std.fmt.comptimePrint("{s}_rows_2_8_{s}", .{ @tagName(artifact.format), @tagName(artifact.epilogue) }),
         .wide => std.fmt.comptimePrint("{s}_rows_8_cols_7_{s}", .{ @tagName(artifact.format), @tagName(artifact.epilogue) }),
     };
 }
 
-pub fn metalBenchmarkDimsForArtifact(comptime artifact: GeneratedArtifact, comptime shape: MetalBenchmarkShape) MetalBenchmarkDims {
+pub fn metalBenchmarkDimsForArtifact(comptime artifact: GeneratedMatmulArtifact, comptime shape: MetalBenchmarkShape) MetalBenchmarkDims {
     return switch (shape) {
         .small => .{
             .rows = if (artifact.format == .q4_k and artifact.epilogue == .bias_gelu) 4 else 3,
@@ -5032,6 +5717,7 @@ fn benchmarkManifestRecord(bench: BenchmarkCase) BenchmarkManifestRecord {
         .correctness_evidence_path = bench.correctness_evidence_path,
         .benchmark_evidence_path = bench.benchmark_evidence_path,
         .benchmark_mode = bench.benchmark_mode,
+        .target_fingerprint = bench.target_fingerprint,
         .production_enabled = bench.production_enabled,
         .promotion_ready = benchmarkHasPromotionEvidence(bench),
         .promotion_blocker = benchmarkPromotionBlocker(bench),
@@ -5061,7 +5747,8 @@ fn metalProductionBenchmarkManifestRecord(case: MetalProductionBenchmarkCase) Me
     };
 }
 
-fn artifactManifestRecord(artifact: GeneratedArtifact, runtime_route_evidence_command: []const u8, promotion_blocker_check_command: []const u8) ArtifactManifestRecord {
+fn artifactManifestRecord(artifact: GeneratedMatmulArtifact, runtime_route_evidence_command: []const u8, promotion_blocker_check_command: []const u8) ArtifactManifestRecord {
+    const cuda_plan = cudaRenderPlanForArtifact(artifact);
     return .{
         .backend = @tagName(artifact.backend),
         .format = @tagName(artifact.format),
@@ -5076,9 +5763,13 @@ fn artifactManifestRecord(artifact: GeneratedArtifact, runtime_route_evidence_co
         .promotion_evidence_command = artifact.promotion_evidence_command,
         .promotion_check_command = artifact.promotion_check_command,
         .promotion_policy = artifactPromotionPolicy(artifact),
+        .promotion_target_fingerprint = artifactPromotionTargetFingerprint(artifact) orelse 0,
         .production_enabled = artifact.production_enabled,
         .runtime_wired = artifactRuntimeWired(artifact),
         .runtime_gate_env = artifactRuntimeGateEnvText(artifact),
+        .runtime_min_in_dim = artifact.runtime_shape.min_in_dim,
+        .cuda_kernel = if (cuda_plan) |plan| @tagName(plan.kind) else null,
+        .cuda_launch = if (cuda_plan) |plan| plan.launch else null,
         .production_regression_checked = artifactProductionRegressionChecked(artifact),
         .production_regression_command = artifactProductionRegressionCommand(artifact),
         .metal_promotion_min_speedup = if (artifact.backend == .metal) metal_promotion_min_speedup else 0.0,
@@ -5093,7 +5784,7 @@ fn artifactManifestRecord(artifact: GeneratedArtifact, runtime_route_evidence_co
     };
 }
 
-fn artifactRuntimeRouteEvidenceCommand(allocator: std.mem.Allocator, artifact: GeneratedArtifact) ![]const u8 {
+fn artifactRuntimeRouteEvidenceCommand(allocator: std.mem.Allocator, artifact: GeneratedMatmulArtifact) ![]const u8 {
     if (!artifactNeedsRuntimeRouteEvidence(artifact)) return "";
     return std.fmt.allocPrint(
         allocator,
@@ -5102,11 +5793,11 @@ fn artifactRuntimeRouteEvidenceCommand(allocator: std.mem.Allocator, artifact: G
     );
 }
 
-pub fn artifactNeedsRuntimeRouteEvidence(artifact: GeneratedArtifact) bool {
+pub fn artifactNeedsRuntimeRouteEvidence(artifact: GeneratedMatmulArtifact) bool {
     return artifact.backend == .metal and artifactRuntimeWired(artifact) and !artifactHasPromotionEvidence(artifact);
 }
 
-fn artifactPromotionPolicy(artifact: GeneratedArtifact) []const u8 {
+fn artifactPromotionPolicy(artifact: GeneratedMatmulArtifact) []const u8 {
     if (artifact.backend == .metal and std.mem.eql(u8, artifactPromotionBlocker(artifact), metal_blocker_unsupported_handwritten)) {
         return "route_evidence_only_no_promotion";
     }
@@ -5125,7 +5816,7 @@ fn artifactPromotionPolicy(artifact: GeneratedArtifact) []const u8 {
     return "unsupported";
 }
 
-fn artifactPromotionBlockerCheckCommand(allocator: std.mem.Allocator, artifact: GeneratedArtifact) ![]const u8 {
+fn artifactPromotionBlockerCheckCommand(allocator: std.mem.Allocator, artifact: GeneratedMatmulArtifact) ![]const u8 {
     const path = artifactPromotionBlockerEvidencePath(artifact);
     if (path.len == 0) return "";
     return std.fmt.allocPrint(
@@ -5135,18 +5826,31 @@ fn artifactPromotionBlockerCheckCommand(allocator: std.mem.Allocator, artifact: 
     );
 }
 
-pub fn artifactRuntimeWired(artifact: GeneratedArtifact) bool {
+pub fn artifactRuntimeWired(artifact: GeneratedMatmulArtifact) bool {
     if (artifact.backend == .cuda) {
-        if (artifact.format == .q4_0 and artifact.epilogue == .none) {
-            return artifact.row_bucket == .rows_1 or artifact.row_bucket == .rows_9_64;
-        }
-        if (artifact.format == .q4_0 and artifact.epilogue == .pair) {
-            return artifact.row_bucket == .rows_1;
-        }
-        if (artifact.format == .q4_0 and (artifact.epilogue == .pair_activation or artifact.epilogue == .gated_down)) {
-            return artifact.row_bucket == .rows_1;
-        }
-        return false;
+        const kind = artifact.cuda_kernel orelse return false;
+        return switch (kind) {
+            .q4_0_mmv,
+            .q4_0_mm,
+            .q4_0_pair_mmv,
+            .q4_0_pair_activation_q8_1,
+            .q4_0_pair_activation_q8_1_e2b_6144,
+            .q4_0_pair_activation_q8_1_e2b_12288,
+            .q4_0_down_q8_1,
+            .q4_0_down_q8_1_e2b_6144,
+            .q4_0_down_q8_1_e2b_12288,
+            .q4_0_pair_activation_f32_e2b_6144_exact,
+            .q4_0_pair_activation_f32_e2b_12288_exact,
+            .q4_0_down_f32_e2b_6144_exact,
+            .q4_0_down_f32_e2b_12288_exact,
+            .q4_0_q8_1_argmax_e2b_tile8,
+            .q6_k_q8_1_argmax_k2560_tile8,
+            .q6_k_q8_1_argmax_k3840_tile8,
+            => true,
+            .q4_k_small_batch_bias_gelu,
+            .q4_k_mmv,
+            => false,
+        };
     }
     if (artifact.backend != .metal or artifact.row_bucket != .rows_2_8) return false;
     if (artifact.format == .q4_0 and artifact.epilogue == .none) return true;
@@ -5169,7 +5873,7 @@ pub fn artifactRuntimeWired(artifact: GeneratedArtifact) bool {
 
 fn metalRuntimeRouteAllExpectedCaseCount() usize {
     var count: usize = 0;
-    for (first_generated_artifacts) |artifact| {
+    for (first_generated_matmul_artifacts) |artifact| {
         if (artifact.backend != .metal) continue;
         if (artifactRuntimeWired(artifact)) count += 2;
     }
@@ -5178,7 +5882,7 @@ fn metalRuntimeRouteAllExpectedCaseCount() usize {
 
 fn metalRuntimeRouteAllExpectedProviderRouteCount() usize {
     var count: usize = 0;
-    for (first_generated_artifacts) |artifact| {
+    for (first_generated_matmul_artifacts) |artifact| {
         if (artifactHasMetalProviderRouteEvidence(artifact)) count += 2;
     }
     return count;
@@ -5194,7 +5898,7 @@ fn metalPromotionBlockerEvidenceExpectedCaseCount() usize {
 
 fn metalProductionRegressionExpectedKernelCount() usize {
     var count: usize = 0;
-    for (first_generated_artifacts) |artifact| {
+    for (first_generated_matmul_artifacts) |artifact| {
         if (artifactProductionRegressionChecked(artifact)) count += 1;
     }
     return count;
@@ -5204,16 +5908,34 @@ fn metalProductionRegressionExpectedCaseCount() usize {
     return metalProductionRegressionExpectedKernelCount() * 2;
 }
 
-fn artifactRuntimeGateEnvText(artifact: GeneratedArtifact) []const u8 {
+fn artifactRuntimeGateEnvText(artifact: GeneratedMatmulArtifact) []const u8 {
     return if (artifactRuntimeGateEnv(artifact)) |env| std.mem.span(env) else "";
 }
 
-fn artifactCandidateOptInGateEnv(artifact: GeneratedArtifact) ?[*:0]const u8 {
+fn artifactCandidateOptInGateEnv(artifact: GeneratedMatmulArtifact) ?[*:0]const u8 {
     if (!artifactRuntimeWired(artifact)) return null;
     if (artifact.backend == .cuda) {
+        const kind = artifact.cuda_kernel orelse return null;
+        switch (kind) {
+            .q4_0_pair_activation_q8_1_e2b_6144,
+            .q4_0_pair_activation_q8_1_e2b_12288,
+            .q4_0_down_q8_1_e2b_6144,
+            .q4_0_down_q8_1_e2b_12288,
+            => return "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN",
+            .q4_0_pair_activation_f32_e2b_6144_exact,
+            .q4_0_pair_activation_f32_e2b_12288_exact,
+            .q4_0_down_f32_e2b_6144_exact,
+            .q4_0_down_f32_e2b_12288_exact,
+            => return "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT",
+            .q6_k_q8_1_argmax_k2560_tile8,
+            .q6_k_q8_1_argmax_k3840_tile8,
+            => return "ANTFLY_INFERENCE_CUDA_GENERATED_Q6_K_Q8_1_LM_HEAD_ARGMAX",
+            else => {},
+        }
         return switch (artifact.row_bucket) {
             .rows_1 => switch (artifact.epilogue) {
                 .pair => "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR",
+                .argmax => "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX",
                 .pair_activation => "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR_Q8",
                 .gated_down => "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_DOWN_Q8",
                 else => "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MMV",
@@ -5264,15 +5986,15 @@ fn artifactCandidateOptInGateEnv(artifact: GeneratedArtifact) ?[*:0]const u8 {
     };
 }
 
-fn artifactProductionRegressionChecked(artifact: GeneratedArtifact) bool {
+fn artifactProductionRegressionChecked(artifact: GeneratedMatmulArtifact) bool {
     return artifact.backend == .metal and artifactHasPromotionEvidence(artifact);
 }
 
-fn artifactProductionRegressionCommand(artifact: GeneratedArtifact) []const u8 {
+fn artifactProductionRegressionCommand(artifact: GeneratedMatmulArtifact) []const u8 {
     return if (artifactProductionRegressionChecked(artifact)) first_metal_production_regression_build_command else "";
 }
 
-pub fn artifactRuntimeGateEnv(artifact: GeneratedArtifact) ?[*:0]const u8 {
+pub fn artifactRuntimeGateEnv(artifact: GeneratedMatmulArtifact) ?[*:0]const u8 {
     if (!artifactRuntimeWired(artifact)) return null;
     if (artifact.backend == .cuda) {
         if (artifactHasPromotionEvidence(artifact)) {
@@ -5326,14 +6048,20 @@ pub fn artifactRuntimeGateEnv(artifact: GeneratedArtifact) ?[*:0]const u8 {
     };
 }
 
-fn artifactCandidateStatus(artifact: GeneratedArtifact) []const u8 {
+fn artifactCandidateStatus(artifact: GeneratedMatmulArtifact) []const u8 {
     if (artifactHasPromotionEvidence(artifact)) return "promoted";
     if (metalPromotionBlockerEvidenceFor(artifact) != null) return "blocked_by_evidence";
     if (artifact.production_enabled) return "promotion_blocked";
     return "dev_only_candidate";
 }
 
-fn artifactSourceFingerprint(artifact: GeneratedArtifact) u64 {
+fn cudaRuntimeWiredDevCandidate(artifact: GeneratedMatmulArtifact) bool {
+    return artifact.backend == .cuda and
+        !artifact.production_enabled and
+        artifactRuntimeWired(artifact);
+}
+
+pub fn artifactSourceFingerprint(artifact: anytype) u64 {
     @setEvalBranchQuota(24_000_000);
     const source = generatedSourceForArtifact(artifact) orelse return 0;
     return std.hash.Wyhash.hash(0, source);
@@ -5341,7 +6069,7 @@ fn artifactSourceFingerprint(artifact: GeneratedArtifact) u64 {
 
 fn candidateSourceFingerprint(lowering: QuantKernelLowering) u64 {
     if (lowering.candidate_route != .generated_dev_candidate) return 0;
-    for (first_generated_artifacts) |artifact| {
+    for (first_generated_matmul_artifacts) |artifact| {
         if (artifact.backend == lowering.backend and
             artifact.format == lowering.format and
             artifact.row_bucket == lowering.row_bucket and
@@ -5451,8 +6179,8 @@ pub fn generatedArtifactForCandidate(
     format: quant_matmul.Format,
     row_bucket: quant_matmul.RowBucket,
     epilogue: Epilogue,
-) ?GeneratedArtifact {
-    for (first_generated_artifacts) |artifact| {
+) ?GeneratedMatmulArtifact {
+    for (first_generated_matmul_artifacts) |artifact| {
         if (artifact.backend == backend and
             artifact.format == format and
             artifact.row_bucket == row_bucket and
@@ -5464,7 +6192,19 @@ pub fn generatedArtifactForCandidate(
     return null;
 }
 
-pub fn generatedArtifactForKernel(backend: Backend, kernel_id: []const u8) ?GeneratedArtifact {
+pub fn generatedArtifactForKernel(backend: Backend, kernel_id: []const u8) ?GeneratedMatmulArtifact {
+    for (first_generated_matmul_artifacts) |artifact| {
+        if (artifact.backend == backend and std.mem.eql(u8, artifact.kernel_id, kernel_id)) {
+            return artifact;
+        }
+    }
+    return null;
+}
+
+/// Typed registry lookup used by AOT catalogs. Unlike the matmul compatibility
+/// view above, this preserves attention/microkernel operation metadata and the
+/// semantic activation/output ABI of matmul artifacts.
+pub fn generatedRegistryArtifactForKernel(backend: Backend, kernel_id: []const u8) ?GeneratedArtifact {
     for (first_generated_artifacts) |artifact| {
         if (artifact.backend == backend and std.mem.eql(u8, artifact.kernel_id, kernel_id)) {
             return artifact;
@@ -5541,12 +6281,8 @@ fn generatedCandidateFallbackReason(backend: Backend, kernel_id: []const u8) Fal
         return .generated_runtime_not_wired;
     }
     if (backend == .cuda) {
-        if (std.mem.eql(u8, kernel_id, first_general_cuda_q4_0_mmv_kernel_id) or
-            std.mem.eql(u8, kernel_id, first_general_cuda_q4_0_mm_kernel_id) or
-            std.mem.eql(u8, kernel_id, first_general_cuda_q4_0_pair_kernel_id))
-        {
-            return .generated_runtime_not_wired;
-        }
+        const artifact = generatedArtifactForKernel(backend, kernel_id) orelse return .generated_artifact_missing;
+        if (artifactRuntimeWired(artifact)) return .generated_runtime_not_wired;
     }
     return .generated_artifact_missing;
 }
@@ -5652,7 +6388,7 @@ fn appendFmt(
     try out.appendSlice(allocator, chunk);
 }
 
-pub fn metalGeneratedCounterNameForArtifact(artifact: GeneratedArtifact) ?[]const u8 {
+pub fn metalGeneratedCounterNameForArtifact(artifact: GeneratedMatmulArtifact) ?[]const u8 {
     if (artifact.backend != .metal or !artifactRuntimeWired(artifact)) return null;
     return switch (artifact.format) {
         .q8_0 => switch (artifact.epilogue) {
@@ -5707,7 +6443,7 @@ pub fn metalRuntimeRouteSummaryJson(allocator: std.mem.Allocator) ![]u8 {
     errdefer out.deinit(allocator);
     try out.append(allocator, '{');
     var first = true;
-    for (first_generated_artifacts) |artifact| {
+    for (first_generated_matmul_artifacts) |artifact| {
         const counter_name = metalGeneratedCounterNameForArtifact(artifact) orelse continue;
         const lowering = loweringFor(.metal, artifact.format, artifact.row_bucket, artifact.epilogue);
         const plan_name = try planIdName(allocator, lowering.plan_id);
@@ -5787,6 +6523,30 @@ pub fn registryLoweringFor(
         return unsupportedLowering(backend, format, row_bucket, epilogue, dispatch, .unsupported_shape);
     }
     return loweringFor(backend, format, row_bucket, epilogue);
+}
+
+pub fn registryLoweringForPlan(
+    backend: Backend,
+    plan: quant_matmul.Plan,
+    epilogue: Epilogue,
+) QuantKernelLowering {
+    const lowering = registryLoweringFor(backend, plan.format, plan.row_bucket, epilogue, plan.dispatch);
+    const artifact = promotedArtifactFor(lowering) orelse return lowering;
+    if (artifact.runtime_shape.matches(plan)) return lowering;
+
+    var handwritten = lowering;
+    handwritten.production_route = .handwritten_production;
+    handwritten.production_kernel_id = productionKernelId(backend, plan.format, plan.row_bucket, epilogue);
+    return handwritten;
+}
+
+pub fn generatedArtifactSupportsPlan(
+    backend: Backend,
+    plan: quant_matmul.Plan,
+    epilogue: Epilogue,
+) bool {
+    const artifact = generatedArtifactForCandidate(backend, plan.format, plan.row_bucket, epilogue) orelse return false;
+    return artifact.runtime_shape.matches(plan);
 }
 
 // registryLoweringFor is a linear scan over the full route registry, and the
@@ -5889,9 +6649,9 @@ pub fn addCountersToStats(stats: anytype, counters: PlanCounters) void {
     }
 }
 
-fn promotedArtifactFor(lowering: QuantKernelLowering) ?GeneratedArtifact {
+fn promotedArtifactFor(lowering: QuantKernelLowering) ?GeneratedMatmulArtifact {
     if (lowering.production_route != .generated_production) return null;
-    for (first_generated_artifacts) |artifact| {
+    for (first_generated_matmul_artifacts) |artifact| {
         if (artifactHasPromotionEvidence(artifact) and
             artifact.backend == lowering.backend and
             artifact.format == lowering.format and
@@ -5907,14 +6667,29 @@ fn promotedArtifactFor(lowering: QuantKernelLowering) ?GeneratedArtifact {
 
 fn promoteLoweringIfArtifactReady(lowering: QuantKernelLowering) QuantKernelLowering {
     if (lowering.candidate_route != .generated_dev_candidate) return lowering;
-    for (first_generated_artifacts) |artifact| {
+    for (first_generated_matmul_artifacts) |artifact| {
         if (!artifactHasPromotionEvidence(artifact)) continue;
         if (promotedLoweringForArtifact(lowering, artifact)) |promoted| return promoted;
     }
     return lowering;
 }
 
-fn promotedLoweringForArtifact(lowering: QuantKernelLowering, artifact: GeneratedArtifact) ?QuantKernelLowering {
+fn cudaScheduleForArtifact(artifact: GeneratedMatmulArtifact) ?QuantKernelSchedule {
+    const plan = cudaRenderPlanForArtifact(artifact) orelse return null;
+    return .{
+        .dispatch = plan.route.dispatch,
+        .row_bucket = plan.route.row_bucket,
+        .tile_rows = plan.launch.output_rows_per_block,
+        .tile_cols = plan.launch.output_cols_per_block,
+        .vector_width = plan.launch.output_cols_per_block,
+        .threads_per_block = plan.launch.threads_per_block,
+        .shared_memory_bytes = plan.launch.static_shared_memory_bytes + plan.launch.dynamic_shared_memory_bytes,
+        .register_pressure_hint = 8,
+        .tensor_core_eligible = false,
+    };
+}
+
+fn promotedLoweringForArtifact(lowering: QuantKernelLowering, artifact: GeneratedMatmulArtifact) ?QuantKernelLowering {
     if (lowering.candidate_route != .generated_dev_candidate) return null;
     if (artifact.backend != lowering.backend or
         artifact.format != lowering.format or
@@ -5932,14 +6707,26 @@ fn promotedLoweringForArtifact(lowering: QuantKernelLowering, artifact: Generate
     promoted.fallback_reason = .none;
     promoted.kernel_id = "";
     promoted.candidate_source_path = "";
+    if (artifact.backend == .cuda) {
+        promoted.schedule = cudaScheduleForArtifact(artifact) orelse return null;
+    }
     return promoted;
 }
 
-pub fn artifactHasPromotionEvidence(artifact: GeneratedArtifact) bool {
+pub fn artifactHasPromotionEvidence(artifact: GeneratedMatmulArtifact) bool {
     return std.mem.eql(u8, artifactPromotionBlocker(artifact), metal_blocker_none);
 }
 
-fn artifactPromotionBlocker(artifact: GeneratedArtifact) []const u8 {
+/// Target attested by the benchmark record used to promote this artifact.
+/// `null` means an exact-target catalog must keep the artifact disabled.
+pub fn artifactPromotionTargetFingerprint(artifact: GeneratedMatmulArtifact) ?u64 {
+    if (artifact.backend != .cuda) return null;
+    const bench = benchmarkForArtifact(artifact) orelse return null;
+    if (bench.target_fingerprint == 0) return null;
+    return bench.target_fingerprint;
+}
+
+fn artifactPromotionBlocker(artifact: GeneratedMatmulArtifact) []const u8 {
     if (!artifact.production_enabled) return disabledArtifactPromotionBlocker(artifact);
     return switch (artifact.backend) {
         .cuda => blk: {
@@ -5950,17 +6737,17 @@ fn artifactPromotionBlocker(artifact: GeneratedArtifact) []const u8 {
     };
 }
 
-fn artifactPromotionBlockerEvidencePath(artifact: GeneratedArtifact) []const u8 {
+fn artifactPromotionBlockerEvidencePath(artifact: GeneratedMatmulArtifact) []const u8 {
     if (metalPromotionBlockerEvidenceFor(artifact)) |evidence| return evidence.evidence_path;
     return "";
 }
 
-fn artifactPromotionBlockerRequiresProductionRegressionClear(artifact: GeneratedArtifact) bool {
+fn artifactPromotionBlockerRequiresProductionRegressionClear(artifact: GeneratedMatmulArtifact) bool {
     if (metalPromotionBlockerEvidenceFor(artifact)) |evidence| return evidence.requires_production_regression_clear;
     return false;
 }
 
-fn disabledArtifactPromotionBlocker(artifact: GeneratedArtifact) []const u8 {
+fn disabledArtifactPromotionBlocker(artifact: GeneratedMatmulArtifact) []const u8 {
     if (metalPromotionBlockerEvidenceFor(artifact)) |evidence| return evidence.blocker;
     if (!artifactRuntimeWired(artifact)) return "production_disabled";
     return switch (artifact.backend) {
@@ -5969,7 +6756,7 @@ fn disabledArtifactPromotionBlocker(artifact: GeneratedArtifact) []const u8 {
     };
 }
 
-fn metalPromotionBlockerEvidenceFor(artifact: GeneratedArtifact) ?MetalPromotionBlockerEvidence {
+fn metalPromotionBlockerEvidenceFor(artifact: GeneratedMatmulArtifact) ?MetalPromotionBlockerEvidence {
     @setEvalBranchQuota(10_000);
     if (artifact.backend != .metal) return null;
     for (first_metal_promotion_blocker_evidence) |evidence| {
@@ -5994,11 +6781,11 @@ fn metalPromotionBlockerEvidencePathCount() usize {
     return count;
 }
 
-fn metalArtifactPromotionBlocker(artifact: GeneratedArtifact) []const u8 {
+fn metalArtifactPromotionBlocker(artifact: GeneratedMatmulArtifact) []const u8 {
     return metalArtifactPromotionBlockerWithEvidence(artifact, &first_metal_runtime_evidence);
 }
 
-fn metalArtifactPromotionBlockerWithEvidence(artifact: GeneratedArtifact, evidence_records: []const MetalRuntimeEvidence) []const u8 {
+fn metalArtifactPromotionBlockerWithEvidence(artifact: GeneratedMatmulArtifact, evidence_records: []const MetalRuntimeEvidence) []const u8 {
     if (artifact.backend != .metal) return "non_metal_artifact";
     if (!artifact.production_enabled) return disabledArtifactPromotionBlocker(artifact);
     if (!std.mem.endsWith(u8, artifact.source_path, ".metal")) return "missing_metal_source_path";
@@ -6068,7 +6855,7 @@ pub fn metalProviderRouteRequiredForKernel(kernel_id: []const u8) bool {
         std.mem.eql(u8, kernel_id, first_general_metal_q6_bias_gelu_kernel_id);
 }
 
-pub fn artifactHasMetalProviderRouteEvidence(artifact: GeneratedArtifact) bool {
+pub fn artifactHasMetalProviderRouteEvidence(artifact: GeneratedMatmulArtifact) bool {
     if (artifact.backend != .metal or !artifactRuntimeWired(artifact)) return false;
     return switch (artifact.format) {
         .q8_0 => artifact.epilogue == .none or artifact.epilogue == .bias or artifact.epilogue == .bias_gelu or artifact.epilogue == .relu,
@@ -6080,7 +6867,7 @@ pub fn artifactHasMetalProviderRouteEvidence(artifact: GeneratedArtifact) bool {
     };
 }
 
-fn metalPromotionEvidenceCommandMatchesPolicy(artifact: GeneratedArtifact) bool {
+fn metalPromotionEvidenceCommandMatchesPolicy(artifact: GeneratedMatmulArtifact) bool {
     const evidence_path = commandArgValue(artifact.promotion_evidence_command, "--evidence-out") orelse return false;
     return std.mem.startsWith(u8, artifact.promotion_evidence_command, first_metal_promotion_evidence_command) and
         std.mem.containsAtLeast(u8, evidence_path, 1, artifact.kernel_id) and
@@ -6088,7 +6875,7 @@ fn metalPromotionEvidenceCommandMatchesPolicy(artifact: GeneratedArtifact) bool 
         commandHasArgValue(artifact.promotion_evidence_command, "--measure-iters", metal_promotion_measure_iters_text);
 }
 
-fn metalPromotionCommandsUseSameEvidencePath(artifact: GeneratedArtifact) bool {
+fn metalPromotionCommandsUseSameEvidencePath(artifact: GeneratedMatmulArtifact) bool {
     const evidence_path = commandArgValue(artifact.promotion_evidence_command, "--evidence-out") orelse return false;
     return commandHasArgValue(artifact.promotion_check_command, "--check-evidence", evidence_path);
 }
@@ -6104,14 +6891,18 @@ fn benchmarkPromotionBlocker(bench: BenchmarkCase) []const u8 {
 fn benchmarkPromotionBlockerWithEvidence(bench: BenchmarkCase, evidence_records: []const BenchmarkEvidence) []const u8 {
     if (!bench.production_enabled) return "production_disabled";
     if (bench.backend != .cuda) return "non_cuda_benchmark";
+    if (bench.target_fingerprint == 0) return "missing_target_fingerprint";
     if (bench.generated_kernel_id.len == 0) return "missing_kernel_id";
     if (bench.generated_source_path.len == 0) return "missing_source_path";
     if (bench.generated_source_fingerprint == 0) return "missing_source_fingerprint";
     if (!benchmarkPtxArgRecognized(bench.generated_ptx_arg)) return "wrong_generated_ptx_arg";
     if (bench.handwritten_baseline.len == 0) return "missing_handwritten_baseline";
-    if (!isPtxPath(bench.generated_ptx_path)) return "missing_generated_ptx_path";
-    if (!commandHasToken(bench.generated_ptx_command, "nvcc") or !commandHasToken(bench.generated_ptx_command, "-ptx")) return "missing_nvcc_ptx_command";
-    if (!commandHasToken(bench.generated_ptx_command, "-arch=compute_75")) return "wrong_ptx_arch";
+    if (!isCudaModulePath(bench.generated_ptx_path)) return "missing_generated_ptx_path";
+    const builds_ptx = commandHasToken(bench.generated_ptx_command, "-ptx");
+    const builds_fatbin = commandHasToken(bench.generated_ptx_command, "-fatbin");
+    if (!commandHasToken(bench.generated_ptx_command, "nvcc") or (!builds_ptx and !builds_fatbin)) return "missing_nvcc_ptx_command";
+    if (builds_ptx and !commandHasToken(bench.generated_ptx_command, "-arch=compute_75")) return "wrong_ptx_arch";
+    if (builds_fatbin and !commandHasToken(bench.generated_ptx_command, "-gencode=arch=compute_89,code=sm_89")) return "missing_native_fatbin_arch";
     if (!commandHasToken(bench.generated_ptx_command, bench.generated_source_path)) return "ptx_command_missing_source";
     if (!commandHasArgValue(bench.generated_ptx_command, "-o", bench.generated_ptx_path)) return "ptx_command_missing_output";
     if (!commandFirstTokenEquals(bench.benchmark_command, "zig-out/bin/antfly-inference") or !commandHasToken(bench.benchmark_command, "bench-cuda")) return "missing_bench_cuda_command";
@@ -6173,25 +6964,126 @@ fn benchmarkMeasuredSpeedup(bench: BenchmarkCase) f64 {
     return evidence.measured_speedup;
 }
 
-test "quant kernel compiler promoted CUDA kernel bodies stay in sync with the production bundle" {
+fn normalizeCudaBundleTypes(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    const uint8_normalized = try std.mem.replaceOwned(u8, allocator, source, "uint8_t", "unsigned char");
+    defer allocator.free(uint8_normalized);
+    return std.mem.replaceOwned(u8, allocator, uint8_normalized, "uint16_t", "unsigned short");
+}
+
+test "quant kernel compiler promoted CUDA renderer fragments stay in sync with the production bundle" {
     const bundle = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/ops/cuda/artifacts/inference_cuda_kernels.cu", std.testing.allocator, .limited(4 * 1024 * 1024));
     defer std.testing.allocator.free(bundle);
-    const promoted_sources = [_][]const u8{
-        first_general_cuda_q4_0_mmv_source,
-        first_general_cuda_q4_0_mm_source,
-        first_general_cuda_q4_0_pair_source,
-        first_general_cuda_q4_0_pair_q8_source,
-        first_general_cuda_q4_0_down_q8_source,
-    };
-    for (promoted_sources) |source| {
-        const marker = "extern \"C\" __global__ void ";
-        const start = std.mem.indexOf(u8, source, marker) orelse return error.MissingGeneratedKernelBody;
-        const uint8_normalized = try std.mem.replaceOwned(u8, std.testing.allocator, source[start..], "uint8_t", "unsigned char");
-        defer std.testing.allocator.free(uint8_normalized);
-        const normalized = try std.mem.replaceOwned(u8, std.testing.allocator, uint8_normalized, "uint16_t", "unsigned short");
-        defer std.testing.allocator.free(normalized);
-        try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, normalized));
+    for (first_generated_matmul_artifacts) |artifact| {
+        if (artifact.backend != .cuda or !artifact.production_enabled) continue;
+        const plan = cudaRenderPlanForArtifact(artifact) orelse return error.MissingCudaRenderPlan;
+        const route_id = try cuda_renderer.planId(plan, std.testing.allocator);
+        defer std.testing.allocator.free(route_id);
+        const bundle_metadata = try std.fmt.allocPrint(std.testing.allocator, "kernel_id={s} plan_id={s}", .{ plan.kernel_id, route_id });
+        defer std.testing.allocator.free(bundle_metadata);
+        try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, bundle_metadata));
+
+        const support = cuda_renderer.supportFor(plan.lowering);
+        for (support.helpers) |helper| {
+            const normalized = try normalizeCudaBundleTypes(std.testing.allocator, helper.source);
+            defer std.testing.allocator.free(normalized);
+            try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, normalized));
+        }
+
+        const body = try cuda_renderer.renderBodyAlloc(std.testing.allocator, plan);
+        defer std.testing.allocator.free(body);
+        const normalized_body = try normalizeCudaBundleTypes(std.testing.allocator, body);
+        defer std.testing.allocator.free(normalized_body);
+        try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, normalized_body));
     }
+}
+
+test "quant kernel compiler renders the runtime-wired CUDA attention region deterministically" {
+    const first = try renderCudaRuntimeAttentionRegion(std.testing.allocator);
+    defer std.testing.allocator.free(first);
+    const second = try renderCudaRuntimeAttentionRegion(std.testing.allocator);
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualStrings(first, second);
+
+    var runtime_wired_count: usize = 0;
+    for (first_generated_attention_artifacts) |artifact| {
+        if (!cudaAttentionArtifactRuntimeWired(artifact)) continue;
+        runtime_wired_count += 1;
+        const plan = cudaAttentionRenderPlanForArtifact(artifact) orelse return error.MissingCudaAttentionRenderPlan;
+        const plan_id = try cuda_renderer.attentionPlanId(plan, std.testing.allocator);
+        defer std.testing.allocator.free(plan_id);
+        const metadata = try std.fmt.allocPrint(std.testing.allocator, "kernel_id={s} plan_id={s}", .{ plan.kernel_id, plan_id });
+        defer std.testing.allocator.free(metadata);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, metadata));
+
+        const body = try cuda_renderer.renderAttentionBodyAlloc(std.testing.allocator, plan);
+        defer std.testing.allocator.free(body);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, body));
+    }
+    try std.testing.expectEqual(@as(usize, 8), runtime_wired_count);
+    try std.testing.expect(!std.mem.containsAtLeast(u8, first, 1, first_decode_attention_1x_metal_kernel_id));
+    for (cuda_renderer.attention_runtime_external_helpers) |helper| {
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, first, helper.source));
+    }
+}
+
+test "quant kernel compiler renders runtime-wired dev CUDA matmul candidates deterministically" {
+    const first = try renderCudaRuntimeDevMatmulRegion(std.testing.allocator);
+    defer std.testing.allocator.free(first);
+    const second = try renderCudaRuntimeDevMatmulRegion(std.testing.allocator);
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualStrings(first, second);
+
+    var runtime_dev_count: usize = 0;
+    for (first_generated_matmul_artifacts) |artifact| {
+        if (artifact.backend != .cuda or artifact.production_enabled or !artifactRuntimeWired(artifact)) continue;
+        runtime_dev_count += 1;
+        const plan = cudaRenderPlanForArtifact(artifact) orelse return error.MissingCudaRenderPlan;
+        const plan_id = try cuda_renderer.planId(plan, std.testing.allocator);
+        defer std.testing.allocator.free(plan_id);
+        const metadata = try std.fmt.allocPrint(std.testing.allocator, "kernel_id={s} plan_id={s}", .{ plan.kernel_id, plan_id });
+        defer std.testing.allocator.free(metadata);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, metadata));
+
+        const body = try cuda_renderer.renderBodyAlloc(std.testing.allocator, plan);
+        defer std.testing.allocator.free(body);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, body));
+        const declaration = try std.fmt.allocPrint(std.testing.allocator, "extern \"C\" __global__ void {s}(", .{plan.kernel_id});
+        defer std.testing.allocator.free(declaration);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, declaration));
+    }
+    try std.testing.expectEqual(@as(usize, 11), runtime_dev_count);
+    try std.testing.expect(!std.mem.containsAtLeast(u8, first, 1, first_general_cuda_q4_0_mmv_kernel_id));
+}
+
+test "quant kernel compiler CUDA attention candidate stays in sync with the runtime bundle" {
+    const bundle = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/ops/cuda/artifacts/inference_cuda_kernels.cu", std.testing.allocator, .limited(4 * 1024 * 1024));
+    defer std.testing.allocator.free(bundle);
+    const attention_marker = "// quant-kernel-codegen:begin generated CUDA attention kernels";
+    const attention_region_begin = std.mem.indexOf(u8, bundle, attention_marker) orelse return error.MissingCudaAttentionRuntimeMarker;
+    try validateCudaRuntimeAttentionExternalHelpers(bundle[0..attention_region_begin]);
+    var runtime_cuda_attention_count: usize = 0;
+    var standalone_cuda_attention_count: usize = 0;
+    for (first_generated_attention_artifacts) |artifact| {
+        if (artifact.backend != .cuda) continue;
+        const plan = cudaAttentionRenderPlanForArtifact(artifact) orelse return error.MissingCudaAttentionRenderPlan;
+        if (!cudaAttentionArtifactRuntimeWired(artifact)) {
+            standalone_cuda_attention_count += 1;
+            try std.testing.expect(!std.mem.containsAtLeast(u8, bundle, 1, plan.kernel_id));
+            continue;
+        }
+        runtime_cuda_attention_count += 1;
+        const route_id = try cuda_renderer.attentionPlanId(plan, std.testing.allocator);
+        defer std.testing.allocator.free(route_id);
+        const bundle_metadata = try std.fmt.allocPrint(std.testing.allocator, "kernel_id={s} plan_id={s}", .{ plan.kernel_id, route_id });
+        defer std.testing.allocator.free(bundle_metadata);
+        try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, bundle_metadata));
+
+        const body = try cuda_renderer.renderAttentionBodyAlloc(std.testing.allocator, plan);
+        defer std.testing.allocator.free(body);
+        try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, body));
+    }
+    try std.testing.expectEqual(@as(usize, 8), runtime_cuda_attention_count);
+    try std.testing.expectEqual(@as(usize, 0), standalone_cuda_attention_count);
 }
 
 fn benchmarkPtxArgRecognized(arg: []const u8) bool {
@@ -6219,7 +7111,8 @@ fn benchmarkEvidenceFor(bench: BenchmarkCase, evidence_records: []const Benchmar
             std.mem.eql(u8, evidence.benchmark_command, bench.benchmark_command) and
             std.mem.eql(u8, evidence.correctness_evidence_path, bench.correctness_evidence_path) and
             std.mem.eql(u8, evidence.benchmark_evidence_path, bench.benchmark_evidence_path) and
-            std.mem.eql(u8, evidence.benchmark_mode, bench.benchmark_mode))
+            std.mem.eql(u8, evidence.benchmark_mode, bench.benchmark_mode) and
+            evidence.target_fingerprint == bench.target_fingerprint)
         {
             return evidence;
         }
@@ -6227,7 +7120,7 @@ fn benchmarkEvidenceFor(bench: BenchmarkCase, evidence_records: []const Benchmar
     return null;
 }
 
-fn metalRuntimeEvidenceFor(artifact: GeneratedArtifact, evidence_records: []const MetalRuntimeEvidence) ?MetalRuntimeEvidence {
+fn metalRuntimeEvidenceFor(artifact: GeneratedMatmulArtifact, evidence_records: []const MetalRuntimeEvidence) ?MetalRuntimeEvidence {
     const expected_source_path = generatedMetalSourcePathForKernel(artifact.kernel_id) orelse return null;
     const expected_check_command = generatedMetalCheckCommandForKernel(artifact.kernel_id) orelse return null;
     for (evidence_records) |evidence| {
@@ -6266,14 +7159,14 @@ pub fn generatedMetalCheckCommandForKernel(kernel_id: []const u8) ?[]const u8 {
     return artifact.check_command;
 }
 
-fn metalRuntimeEvidenceCommandMatchesArtifact(evidence: MetalRuntimeEvidence, artifact: GeneratedArtifact) bool {
+fn metalRuntimeEvidenceCommandMatchesArtifact(evidence: MetalRuntimeEvidence, artifact: GeneratedMatmulArtifact) bool {
     if (evidence.production_enabled or evidence.promotion_ready) {
         return std.mem.eql(u8, evidence.runtime_evidence_command, artifact.promotion_evidence_command);
     }
     return std.mem.eql(u8, evidence.runtime_evidence_command, artifact.runtime_evidence_command);
 }
 
-fn benchmarkForArtifact(artifact: GeneratedArtifact) ?BenchmarkCase {
+fn benchmarkForArtifact(artifact: GeneratedMatmulArtifact) ?BenchmarkCase {
     for (first_benchmarks) |bench| {
         if (artifact.backend == bench.backend and
             artifact.format == bench.format and
@@ -6288,8 +7181,8 @@ fn benchmarkForArtifact(artifact: GeneratedArtifact) ?BenchmarkCase {
     return null;
 }
 
-fn isPtxPath(path: []const u8) bool {
-    return std.mem.endsWith(u8, path, ".ptx");
+fn isCudaModulePath(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".ptx") or std.mem.endsWith(u8, path, ".fatbin");
 }
 
 fn metalAirPathForKernel(kernel_id: []const u8) ?[]const u8 {
@@ -6297,16 +7190,162 @@ fn metalAirPathForKernel(kernel_id: []const u8) ?[]const u8 {
     return commandArgValue(command, "-o");
 }
 
+fn cudaEpilogueFor(epilogue: Epilogue) ?cuda_renderer.EpilogueKind {
+    return switch (epilogue) {
+        .none => .none,
+        .bias => .bias,
+        .bias_gelu => .bias_gelu,
+        .pair => .pair,
+        .triple => .triple,
+        .relu => .relu,
+        .gelu => .gelu,
+        .add => .add,
+        .argmax => .argmax,
+        .pair_activation => .pair_activation,
+        .gated_down => .gated_down,
+    };
+}
+
+fn cudaProductionBaselineForArtifact(artifact: anytype, op: MatmulArtifactOp) []const u8 {
+    const kind = artifact.cuda_kernel orelse
+        return productionKernelId(.cuda, op.format, op.row_bucket, op.epilogue);
+    return switch (kind) {
+        .q4_0_pair_activation_f32_e2b_6144_exact,
+        .q4_0_pair_activation_f32_e2b_12288_exact,
+        => "termite_linear_q4_0_pair_activation_f32_tile4_w4",
+        .q4_0_down_f32_e2b_6144_exact,
+        .q4_0_down_f32_e2b_12288_exact,
+        => "termite_linear_q4_0_f32_tile4",
+        .q6_k_q8_1_argmax_k3840_tile8 => "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8+termite_argmax_reduce_rows_pairs_f32_w16",
+        else => productionKernelId(.cuda, op.format, op.row_bucket, op.epilogue),
+    };
+}
+
+/// Builds the canonical CUDA backend plan from the authoritative artifact
+/// operation. The renderer descriptor is accepted only when every route and
+/// promotion field agrees with the compiler registry.
+pub fn cudaRenderPlanForArtifact(artifact: anytype) ?cuda_renderer.RenderPlan {
+    if (artifact.backend != .cuda) return null;
+    const kind = artifact.cuda_kernel orelse return null;
+    const op = artifact.matmulOp() orelse return null;
+    const epilogue = cudaEpilogueFor(op.epilogue) orelse return null;
+    const dispatch = dispatchForRowBucket(op.row_bucket) orelse return null;
+    const plan = cuda_renderer.planFor(kind);
+    if (plan.route.format != op.format or
+        plan.route.row_bucket != op.row_bucket or
+        plan.route.epilogue != epilogue or
+        plan.route.dispatch != dispatch or
+        !std.mem.eql(u8, plan.kernel_id, artifact.kernel_id) or
+        plan.production_enabled != artifact.production_enabled)
+    {
+        return null;
+    }
+    const baseline = cudaProductionBaselineForArtifact(artifact, op);
+    if (!std.mem.eql(u8, plan.production_baseline, baseline)) return null;
+    plan.validate() catch return null;
+    return plan;
+}
+
+pub fn cudaAttentionRenderPlanForArtifact(artifact: anytype) ?cuda_renderer.AttentionRenderPlan {
+    if (artifact.backend != .cuda) return null;
+    const kind = artifact.cuda_attention_kernel orelse return null;
+    const op = artifact.attentionOp() orelse return null;
+    const plan = cuda_renderer.attentionPlanFor(kind);
+    const storage_matches = switch (op.schedule.attention_storage) {
+        .f32 => plan.lowering.query_storage == .f32,
+        .f16 => plan.lowering.query_storage == .f16,
+        .bf16 => plan.lowering.query_storage == .bf16,
+        .paged_f16_or_polar4 => plan.lowering.query_storage == .paged_f16_or_polar4,
+    };
+    const key_storage_matches = switch (op.schedule.attention_key_storage) {
+        .f32 => plan.lowering.key_storage == .f32,
+        .f16 => plan.lowering.key_storage == .f16,
+        .bf16 => plan.lowering.key_storage == .bf16,
+        .paged_f16_or_polar4 => plan.lowering.key_storage == .paged_f16_or_polar4,
+    };
+    if (plan.lowering.kind != op.kind or
+        plan.lowering.head_dim != op.head_dim or
+        plan.serial_launch.threads_per_block != op.schedule.attention_serial_threads_per_threadgroup or
+        plan.launch.threads_per_block != op.schedule.threads_per_threadgroup or
+        plan.reduction_launch.threads_per_block != op.schedule.attention_stage2_threads_per_threadgroup or
+        plan.lowering.kv_splits != op.schedule.attention_kv_splits or
+        plan.lowering.query_heads_per_kv_head != op.schedule.attention_query_heads_per_kv_head or
+        plan.lowering.split_kv_min_tokens_default != op.schedule.attention_split_kv_min_tokens or
+        plan.lowering.max_kv_tokens != op.schedule.attention_max_kv_tokens or
+        !storage_matches or !key_storage_matches or
+        !std.mem.eql(u8, plan.kernel_id, artifact.kernel_id) or
+        plan.production_enabled != artifact.production_enabled)
+    {
+        return null;
+    }
+    plan.validate() catch return null;
+    return plan;
+}
+
+fn cudaSourceForKind(kind: cuda_renderer.KernelKind) []const u8 {
+    return switch (kind) {
+        .q4_k_small_batch_bias_gelu => first_lazy_cuda_source,
+        .q4_k_mmv => first_general_cuda_q4_k_mmv_source,
+        .q4_0_mmv => first_general_cuda_q4_0_mmv_source,
+        .q4_0_mm => first_general_cuda_q4_0_mm_source,
+        .q4_0_pair_mmv => first_general_cuda_q4_0_pair_source,
+        .q4_0_pair_activation_q8_1 => first_general_cuda_q4_0_pair_q8_source,
+        .q4_0_pair_activation_q8_1_e2b_6144 => first_e2b_cuda_q4_0_pair_q8_6144_source,
+        .q4_0_pair_activation_q8_1_e2b_12288 => first_e2b_cuda_q4_0_pair_q8_12288_source,
+        .q4_0_down_q8_1 => first_general_cuda_q4_0_down_q8_source,
+        .q4_0_down_q8_1_e2b_6144 => first_e2b_cuda_q4_0_down_q8_6144_source,
+        .q4_0_down_q8_1_e2b_12288 => first_e2b_cuda_q4_0_down_q8_12288_source,
+        .q4_0_pair_activation_f32_e2b_6144_exact => first_e2b_cuda_q4_0_pair_f32_6144_exact_source,
+        .q4_0_pair_activation_f32_e2b_12288_exact => first_e2b_cuda_q4_0_pair_f32_12288_exact_source,
+        .q4_0_down_f32_e2b_6144_exact => first_e2b_cuda_q4_0_down_f32_6144_exact_source,
+        .q4_0_down_f32_e2b_12288_exact => first_e2b_cuda_q4_0_down_f32_12288_exact_source,
+        .q4_0_q8_1_argmax_e2b_tile8 => first_e2b_cuda_q4_0_q8_1_argmax_source,
+        .q6_k_q8_1_argmax_k2560_tile8 => first_cuda_q6_k_q8_1_argmax_k2560_source,
+        .q6_k_q8_1_argmax_k3840_tile8 => first_cuda_q6_k_q8_1_argmax_k3840_source,
+    };
+}
+
+fn cudaAttentionSourceForKind(kind: cuda_renderer.AttentionKernelKind) []const u8 {
+    return switch (kind) {
+        .gqa_decode_split_kv_hd256_f32 => first_decode_attention_1x_cuda_source,
+        .gqa_decode_split_kv_hd512_f32 => first_decode_attention_1x_cuda_hd512_source,
+        .gqa_decode_split2_kv_hd256_f32 => first_decode_attention_1x_cuda_split2_hd256_source,
+        .gqa_decode_split2_kv_hd512_f32 => first_decode_attention_1x_cuda_split2_hd512_source,
+        .gqa_decode_split4_kv_hd256_f32 => first_decode_attention_1x_cuda_split4_hd256_source,
+        .gqa_decode_split4_kv_hd512_f32 => first_decode_attention_1x_cuda_split4_hd512_source,
+        .gqa_decode_score_prework_hd256_f32 => first_decode_attention_1x_cuda_score_prework_hd256_source,
+        .gqa_decode_score_prework_hd512_f32 => first_decode_attention_1x_cuda_score_prework_hd512_source,
+    };
+}
+
 pub fn compileQuantKernelSource(request: QuantKernelCompileRequest) ?QuantKernelCompiledSource {
+    const artifact = generatedArtifactForCandidate(request.backend, request.format, request.row_bucket, request.epilogue) orelse return null;
+    return compileQuantKernelArtifactSource(artifact);
+}
+
+/// Compiles one registry artifact by identity. Multiple fixed-shape CUDA
+/// candidates may share a logical matmul route while retaining distinct typed
+/// render plans; route-based compilation continues to select the default plan.
+pub fn compileQuantKernelArtifactSource(artifact: GeneratedMatmulArtifact) ?QuantKernelCompiledSource {
+    const request = QuantKernelCompileRequest{
+        .backend = artifact.backend,
+        .format = artifact.format,
+        .row_bucket = artifact.row_bucket,
+        .epilogue = artifact.epilogue,
+    };
     const spec = specFor(request.format) orelse return null;
     const ir = buildIr(request.format, request.row_bucket, request.epilogue) orelse return null;
-    const artifact = generatedArtifactForCandidate(request.backend, request.format, request.row_bucket, request.epilogue) orelse return null;
     const source = generatedSourceForArtifact(artifact) orelse return null;
-    const lowering = registryLoweringFor(request.backend, request.format, request.row_bucket, request.epilogue, ir.dispatch);
+    const lowering = loweringForCompiledArtifact(artifact, ir.dispatch) orelse return null;
     const runtime_gate_env = if (request.backend == .metal)
         artifactRuntimeGateEnv(artifact)
     else
         null;
+    const cuda_render_plan = if (request.backend == .cuda)
+        cudaRenderPlanForArtifact(artifact)
+    else
+        null;
+    if (request.backend == .cuda and cuda_render_plan == null) return null;
     const compiled = QuantKernelCompiledSource{
         .request = request,
         .spec = spec,
@@ -6318,9 +7357,50 @@ pub fn compileQuantKernelSource(request: QuantKernelCompileRequest) ?QuantKernel
         .check_command = artifact.check_command,
         .runtime_gate_env = runtime_gate_env,
         .production_enabled = artifact.production_enabled,
+        .cuda_render_plan = cuda_render_plan,
     };
     if (!compiledSourceMatchesRoute(compiled)) return null;
     return compiled;
+}
+
+fn loweringForCompiledArtifact(
+    artifact: GeneratedMatmulArtifact,
+    dispatch: quant_matmul.DispatchKind,
+) ?QuantKernelLowering {
+    if (artifact.backend == .metal) {
+        return registryLoweringFor(artifact.backend, artifact.format, artifact.row_bucket, artifact.epilogue, dispatch);
+    }
+    const schedule = cudaScheduleForArtifact(artifact) orelse return null;
+    if (artifactHasPromotionEvidence(artifact)) {
+        return .{
+            .plan_id = planId(artifact.backend, artifact.format, artifact.row_bucket, artifact.epilogue, dispatch),
+            .backend = artifact.backend,
+            .format = artifact.format,
+            .row_bucket = artifact.row_bucket,
+            .epilogue = artifact.epilogue,
+            .schedule = schedule,
+            .production_route = .generated_production,
+            .candidate_route = .unsupported,
+            .production_kernel_id = artifact.kernel_id,
+            .fallback_reason = .none,
+            .kernel_id = "",
+            .candidate_source_path = "",
+        };
+    }
+    return .{
+        .plan_id = planId(artifact.backend, artifact.format, artifact.row_bucket, artifact.epilogue, dispatch),
+        .backend = artifact.backend,
+        .format = artifact.format,
+        .row_bucket = artifact.row_bucket,
+        .epilogue = artifact.epilogue,
+        .schedule = schedule,
+        .production_route = .handwritten_production,
+        .candidate_route = .generated_dev_candidate,
+        .production_kernel_id = cudaProductionBaselineForArtifact(artifact, artifact.matmulOp().?),
+        .fallback_reason = if (artifactRuntimeWired(artifact)) .generated_runtime_not_wired else .generated_artifact_missing,
+        .kernel_id = artifact.kernel_id,
+        .candidate_source_path = artifact.source_path,
+    };
 }
 
 pub fn compiledSourceMatchesRoute(compiled: QuantKernelCompiledSource) bool {
@@ -6342,8 +7422,12 @@ pub fn compiledSourceMatchesRoute(compiled: QuantKernelCompiledSource) bool {
     if (compiled.request.backend == .metal) {
         const expected_gate = artifactRuntimeGateEnv(compiled.artifact);
         if (!optionalCStringEquals(compiled.runtime_gate_env, expected_gate)) return false;
+        if (compiled.cuda_render_plan != null) return false;
     } else {
         if (compiled.runtime_gate_env != null) return false;
+        const expected_plan = cudaRenderPlanForArtifact(compiled.artifact) orelse return false;
+        const actual_plan = compiled.cuda_render_plan orelse return false;
+        if (!std.meta.eql(expected_plan, actual_plan)) return false;
     }
     if (compiled.spec.format != compiled.request.format or
         compiled.ir.format != compiled.request.format or
@@ -6396,10 +7480,12 @@ pub fn compileMetalKernelSource(
 }
 
 pub fn emitCompiledSource(allocator: std.mem.Allocator, compiled: QuantKernelCompiledSource) !EmittedCompiledSource {
-    // Metal small-batch sources are the descriptor-rendered constants (shared
-    // vocabulary helpers + body from the renderer); CUDA sources are borrowed
-    // verbatim. Either way compiled.source is already the canonical text.
-    _ = allocator;
+    if (compiled.cuda_render_plan) |plan| {
+        return .{
+            .data = try cuda_renderer.renderKernel(allocator, plan),
+            .owned = true,
+        };
+    }
     return .{ .data = compiled.source };
 }
 
@@ -6431,12 +7517,15 @@ fn sourceHeaderMatchesCompiledPlan(
     defer allocator.free(kernel_metadata);
     if (!std.mem.containsAtLeast(u8, source, 1, kernel_metadata)) return false;
 
-    const baseline_id = productionKernelId(
-        compiled.artifact.backend,
-        compiled.artifact.format,
-        compiled.artifact.row_bucket,
-        compiled.artifact.epilogue,
-    );
+    const baseline_id = if (compiled.artifact.backend == .cuda)
+        cudaProductionBaselineForArtifact(compiled.artifact, compiled.artifact.matmulOp().?)
+    else
+        productionKernelId(
+            compiled.artifact.backend,
+            compiled.artifact.format,
+            compiled.artifact.row_bucket,
+            compiled.artifact.epilogue,
+        );
     const baseline_metadata = try std.fmt.allocPrint(allocator, "production_baseline={s}", .{baseline_id});
     defer allocator.free(baseline_metadata);
     if (!std.mem.containsAtLeast(u8, source, 1, baseline_metadata)) return false;
@@ -6451,32 +7540,21 @@ fn sourceHeaderMatchesCompiledPlan(
     return true;
 }
 
-pub fn generatedSourceForArtifact(artifact: GeneratedArtifact) ?[]const u8 {
-    if (artifact.backend == .cuda and std.mem.eql(u8, artifact.kernel_id, first_lazy_benchmark.generated_kernel_id)) {
-        return first_lazy_cuda_source;
+pub fn generatedSourceForArtifact(artifact: anytype) ?[]const u8 {
+    if (artifact.backend == .cuda) {
+        if (cudaAttentionRenderPlanForArtifact(artifact)) |plan| {
+            return cudaAttentionSourceForKind(plan.kind);
+        }
+        const plan = cudaRenderPlanForArtifact(artifact) orelse return null;
+        return cudaSourceForKind(plan.kind);
     }
-    if (artifact.backend == .cuda and std.mem.eql(u8, artifact.kernel_id, first_general_cuda_q4_0_mmv_kernel_id)) {
-        return first_general_cuda_q4_0_mmv_source;
-    }
-    if (artifact.backend == .cuda and std.mem.eql(u8, artifact.kernel_id, first_general_cuda_q4_0_mm_kernel_id)) {
-        return first_general_cuda_q4_0_mm_source;
-    }
-    if (artifact.backend == .cuda and std.mem.eql(u8, artifact.kernel_id, first_general_cuda_q4_0_pair_kernel_id)) {
-        return first_general_cuda_q4_0_pair_source;
-    }
-    if (artifact.backend == .cuda and std.mem.eql(u8, artifact.kernel_id, first_general_cuda_q4_0_pair_q8_kernel_id)) {
-        return first_general_cuda_q4_0_pair_q8_source;
-    }
-    if (artifact.backend == .cuda and std.mem.eql(u8, artifact.kernel_id, first_general_cuda_q4_0_down_q8_kernel_id)) {
-        return first_general_cuda_q4_0_down_q8_source;
-    }
-    if (artifact.backend == .metal and artifact.op_kind == .microkernel and std.mem.eql(u8, artifact.kernel_id, first_rms_norm_metal_kernel_id)) {
+    if (artifact.backend == .metal and artifact.opKind() == .microkernel and std.mem.eql(u8, artifact.kernel_id, first_rms_norm_metal_kernel_id)) {
         return first_rms_norm_metal_source;
     }
-    if (artifact.backend == .metal and artifact.op_kind == .attention and std.mem.eql(u8, artifact.kernel_id, first_decode_attention_1x_metal_kernel_id)) {
+    if (artifact.backend == .metal and artifact.opKind() == .attention and std.mem.eql(u8, artifact.kernel_id, first_decode_attention_1x_metal_kernel_id)) {
         return first_decode_attention_1x_metal_source;
     }
-    if (artifact.backend == .metal and artifact.op_kind == .attention and std.mem.eql(u8, artifact.kernel_id, first_prefill_flash_metal_kernel_id)) {
+    if (artifact.backend == .metal and artifact.opKind() == .attention and std.mem.eql(u8, artifact.kernel_id, first_prefill_flash_metal_kernel_id)) {
         return first_prefill_flash_metal_source;
     }
     if (artifact.backend == .metal and std.mem.eql(u8, artifact.kernel_id, first_lazy_metal_kernel_id)) {
@@ -6580,6 +7658,12 @@ fn productionKernelId(
                 else => "cuda_handwritten_quant_matmul",
             };
         }
+        if (format == .q4_0 and epilogue == .argmax) {
+            return switch (row_bucket) {
+                .rows_1 => "termite_linear_q4_0_q8_1_f32_tile4+termite_argmax_last_row_f32",
+                else => "cuda_handwritten_quant_matmul",
+            };
+        }
         if (format == .q4_0 and epilogue == .pair_activation) {
             return switch (row_bucket) {
                 .rows_1 => "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn",
@@ -6601,6 +7685,9 @@ fn productionKernelId(
             };
         }
         if (format == .q6_k and epilogue == .none) return "termite_linear_q6_k_f32_tile4";
+        if (format == .q6_k and epilogue == .argmax and row_bucket == .rows_1) {
+            return "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b+termite_argmax_reduce_rows_pairs_f32_w16";
+        }
     }
     return switch (backend) {
         .cuda => "cuda_handwritten_quant_matmul",
@@ -6791,6 +7878,11 @@ fn scheduleFor(row_bucket: quant_matmul.RowBucket, dispatch: quant_matmul.Dispat
 
 fn candidateScheduleFor(lowering: QuantKernelLowering) QuantKernelSchedule {
     if (lowering.candidate_route != .generated_dev_candidate) return emptyCandidateSchedule(lowering.row_bucket, lowering.schedule.dispatch);
+    if (lowering.backend == .cuda) {
+        const artifact = generatedArtifactForKernel(lowering.backend, lowering.kernel_id) orelse
+            return emptyCandidateSchedule(lowering.row_bucket, lowering.schedule.dispatch);
+        return cudaScheduleForArtifact(artifact) orelse emptyCandidateSchedule(lowering.row_bucket, lowering.schedule.dispatch);
+    }
     const tile_cols: usize = if (lowering.backend == .metal)
         metalGeneratedColsPerThreadgroup(lowering.format, lowering.row_bucket, lowering.epilogue)
     else
@@ -6863,6 +7955,7 @@ fn irOpsForEpilogue(epilogue: Epilogue) []const IROp {
         .none, .pair => &ir_ops_basic,
         .bias => &ir_ops_bias,
         .bias_gelu => &ir_ops_bias_gelu,
+        .argmax => &ir_ops_argmax,
         else => &ir_ops_basic,
     };
 }
@@ -7267,9 +8360,25 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     defer std.testing.allocator.free(manifest);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_artifact_manifest_schema));
-    const artifact_count = try std.fmt.allocPrint(std.testing.allocator, "\"artifact_count\": {d}", .{first_generated_artifacts.len});
+    const artifact_count = try std.fmt.allocPrint(std.testing.allocator, "\"artifact_count\": {d}", .{first_generated_matmul_artifacts.len});
     defer std.testing.allocator.free(artifact_count);
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, artifact_count));
+    const registry_artifact_count = try std.fmt.allocPrint(std.testing.allocator, "\"registry_artifact_count\": {d}", .{first_generated_artifacts.len});
+    defer std.testing.allocator.free(registry_artifact_count);
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, registry_artifact_count));
+    try expectManifestArrayCount(manifest, "registry_artifact_count", "registry_artifacts", first_generated_artifacts.len);
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"op_kind\": \"small_batch_matmul\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"op_kind\": \"microkernel\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"op_kind\": \"attention\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"kind\": \"rms_norm\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"kind\": \"decode_1x\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"kind\": \"prefill_flash\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"cuda_kernel\": \"q4_0_pair_activation_q8_1\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"grid\": \"flattened_rows_by_output_blocks\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"threads_per_block\": 640"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"output_cols_per_block\": 32"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"static_shared_memory_bytes\": 768"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"dynamic_shared_memory_bytes\": 0"));
     const metal_evidence_count_field = try std.fmt.allocPrint(std.testing.allocator, "\"checked_in_metal_evidence_count\": {d}", .{first_metal_runtime_evidence_count});
     defer std.testing.allocator.free(metal_evidence_count_field);
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, metal_evidence_count_field));
@@ -7339,7 +8448,7 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"metal_production_regression_unstable_benchmark_timing_is_hard_gate\": false"));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"metal_promotion_warmup_repeat_runs\": 2"));
     try std.testing.expectEqual(first_metal_runtime_evidence_count, metalProductionRegressionExpectedKernelCount());
-    try expectManifestArrayCount(manifest, "artifact_count", "artifacts", first_generated_artifacts.len);
+    try expectManifestArrayCount(manifest, "artifact_count", "artifacts", first_generated_matmul_artifacts.len);
     try expectManifestArrayCount(manifest, "checked_in_metal_evidence_count", "metal_evidence_records", first_metal_runtime_evidence.len);
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"metal_blocker_strict_check_command\": \"" ++ first_metal_blocker_strict_check_command ++ "\""));
     var runtime_evidence_count: usize = 0;
@@ -7352,7 +8461,12 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     var promoted_speedup_policy_count: usize = 0;
     var production_disabled_policy_count: usize = 0;
     var cuda_policy_count: usize = 0;
-    for (first_generated_artifacts) |artifact| {
+    var dev_only_candidate_count: usize = 0;
+    var promotion_ready_false_count: usize = 0;
+    var promotion_blocker_none_count: usize = 0;
+    var promotion_blocker_production_disabled_count: usize = 0;
+    var promotion_blocker_awaiting_cuda_count: usize = 0;
+    for (first_generated_matmul_artifacts) |artifact| {
         if (artifact.runtime_evidence_command.len != 0) runtime_evidence_count += 1;
         if (artifact.backend == .metal and artifactRuntimeWired(artifact) and !artifactHasPromotionEvidence(artifact)) runtime_route_evidence_count += 1;
         if (artifact.promotion_evidence_command.len != 0) promotion_evidence_count += 1;
@@ -7364,6 +8478,12 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
         if (std.mem.eql(u8, promotion_policy, "promoted_speedup_vs_handwritten")) promoted_speedup_policy_count += 1;
         if (std.mem.eql(u8, promotion_policy, "production_disabled")) production_disabled_policy_count += 1;
         if (std.mem.eql(u8, promotion_policy, "driver_artifact_policy")) cuda_policy_count += 1;
+        if (std.mem.eql(u8, artifactCandidateStatus(artifact), "dev_only_candidate")) dev_only_candidate_count += 1;
+        if (!artifactHasPromotionEvidence(artifact)) promotion_ready_false_count += 1;
+        const promotion_blocker = artifactPromotionBlocker(artifact);
+        if (std.mem.eql(u8, promotion_blocker, "none")) promotion_blocker_none_count += 1;
+        if (std.mem.eql(u8, promotion_blocker, "production_disabled")) promotion_blocker_production_disabled_count += 1;
+        if (std.mem.eql(u8, promotion_blocker, "awaiting_cuda_promotion_evidence")) promotion_blocker_awaiting_cuda_count += 1;
     }
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"backend\": \"cuda\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"backend\": \"metal\""));
@@ -7371,10 +8491,10 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_lazy_benchmark.generated_ptx_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_lazy_benchmark.benchmark_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_lazy_benchmark_check_command));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, first_generated_artifacts.len, "\"generated_source_fingerprint\":"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, first_generated_matmul_artifacts.len, "\"generated_source_fingerprint\":"));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_lazy_metal_kernel_id));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_lazy_metal_check_command));
-    try std.testing.expectEqual(first_generated_artifacts.len + first_metal_runtime_evidence.len, std.mem.count(u8, manifest, "\"source_path\":"));
+    try std.testing.expectEqual(first_generated_artifacts.len + first_generated_matmul_artifacts.len + first_metal_runtime_evidence.len, std.mem.count(u8, manifest, "\"source_path\":"));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, manifest, "\"artifact_source_path\":"));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, manifest, "\"generated_check_command\":"));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"source_path\": \"" ++ first_general_metal_q5_1_source_path ++ "\""));
@@ -7432,7 +8552,7 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, promotion_evidence_count, "\"promotion_evidence_command\":"));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, promotion_check_count, "\"promotion_check_command\":"));
     const blocked_unsupported_handwritten_count = metalPromotionBlockerEvidenceCount("unsupported_handwritten_baseline");
-    try std.testing.expectEqual(first_generated_artifacts.len, std.mem.count(u8, manifest, "\"promotion_policy\":"));
+    try std.testing.expectEqual(first_generated_matmul_artifacts.len, std.mem.count(u8, manifest, "\"promotion_policy\":"));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, route_only_no_promotion_policy_count, "\"promotion_policy\": \"route_evidence_only_no_promotion\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, speedup_policy_count, "\"promotion_policy\": \"speedup_vs_handwritten\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, promoted_speedup_policy_count, "\"promotion_policy\": \"promoted_speedup_vs_handwritten\""));
@@ -7454,9 +8574,9 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_metal_production_regression_evidence_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_metal_production_regression_evidence_path));
     try std.testing.expectEqual(first_metal_runtime_evidence_count, std.mem.count(u8, manifest, "\"production_regression_checked\": true"));
-    try std.testing.expectEqual(first_generated_artifacts.len - first_metal_runtime_evidence_count, std.mem.count(u8, manifest, "\"production_regression_checked\": false"));
+    try std.testing.expectEqual(first_generated_matmul_artifacts.len - first_metal_runtime_evidence_count, std.mem.count(u8, manifest, "\"production_regression_checked\": false"));
     try std.testing.expectEqual(first_metal_runtime_evidence_count + 1, std.mem.count(u8, manifest, first_metal_production_regression_build_command));
-    try std.testing.expectEqual(first_generated_artifacts.len - first_metal_runtime_evidence_count, std.mem.count(u8, manifest, "\"production_regression_command\": \"\""));
+    try std.testing.expectEqual(first_generated_matmul_artifacts.len - first_metal_runtime_evidence_count, std.mem.count(u8, manifest, "\"production_regression_command\": \"\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, metal_evidence_count, first_metal_promotion_evidence_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, metal_evidence_count, first_metal_promotion_check_command));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, metal_evidence_count, "--require-kernel"));
@@ -7492,40 +8612,49 @@ test "quant kernel compiler artifact manifest serializes generated candidates" {
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q6_source_path));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, first_general_metal_q6_bias_gelu_source_path));
     const blocked_metal_promotion_count = first_metal_promotion_blocker_evidence_count;
-    const dev_only_candidate_count = first_generated_artifacts.len - first_metal_runtime_evidence_count - blocked_metal_promotion_count - 5;
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, dev_only_candidate_count, "\"candidate_status\": \"dev_only_candidate\""));
+    try std.testing.expectEqual(dev_only_candidate_count, std.mem.count(u8, manifest, "\"candidate_status\": \"dev_only_candidate\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, first_metal_runtime_evidence_count, "\"candidate_status\": \"promoted\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, blocked_metal_promotion_count, "\"candidate_status\": \"blocked_by_evidence\""));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, first_generated_artifacts.len - first_metal_runtime_evidence_count - 5, "\"promotion_ready\": false"));
+    try std.testing.expectEqual(promotion_ready_false_count, std.mem.count(u8, manifest, "\"promotion_ready\": false"));
     const runtime_wired_artifacts = first_metal_runtime_route_all_expected_case_count / 2;
     var cuda_runtime_wired_count: usize = 0;
-    for (first_generated_artifacts) |artifact| {
-        if (artifact.backend == .cuda and artifactRuntimeWired(artifact)) cuda_runtime_wired_count += 1;
+    var cuda_runtime_wired_dev_count: usize = 0;
+    for (first_generated_matmul_artifacts) |artifact| {
+        if (artifact.backend == .cuda and artifactRuntimeWired(artifact)) {
+            cuda_runtime_wired_count += 1;
+            if (!artifact.production_enabled) cuda_runtime_wired_dev_count += 1;
+        }
     }
-    try std.testing.expectEqual(@as(usize, 5), cuda_runtime_wired_count);
+    try std.testing.expectEqual(@as(usize, 16), cuda_runtime_wired_count);
+    try std.testing.expectEqual(@as(usize, 11), cuda_runtime_wired_dev_count);
     const awaiting_metal_promotion_count = runtime_wired_artifacts - first_metal_runtime_evidence_count - blocked_metal_promotion_count;
     const blocked_speedup_count = metalPromotionBlockerEvidenceCount("speedup_gate_missing");
     const blocked_evidence_path_count = metalPromotionBlockerEvidencePathCount();
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, awaiting_metal_promotion_count, "\"promotion_blocker\": \"awaiting_metal_promotion_evidence\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, blocked_speedup_count, "\"promotion_blocker\": \"speedup_gate_missing\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, blocked_unsupported_handwritten_count, "\"promotion_blocker\": \"unsupported_handwritten_baseline\""));
-    try std.testing.expect(!std.mem.containsAtLeast(u8, manifest, 1, "\"promotion_blocker\": \"awaiting_cuda_promotion_evidence\""));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, cuda_runtime_wired_count, "\"promotion_blocker\": \"none\""));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, first_generated_artifacts.len - runtime_wired_artifacts - cuda_runtime_wired_count, "\"promotion_blocker\": \"production_disabled\""));
-    try std.testing.expectEqual(first_generated_artifacts.len, std.mem.count(u8, manifest, "\"promotion_blocker_evidence_path\":"));
+    try std.testing.expectEqual(cuda_runtime_wired_dev_count, promotion_blocker_awaiting_cuda_count);
+    try std.testing.expectEqual(promotion_blocker_awaiting_cuda_count, std.mem.count(u8, manifest, "\"promotion_blocker\": \"awaiting_cuda_promotion_evidence\""));
+    try std.testing.expectEqual(promotion_blocker_none_count, std.mem.count(u8, manifest, "\"promotion_blocker\": \"none\""));
+    try std.testing.expectEqual(promotion_blocker_production_disabled_count, std.mem.count(u8, manifest, "\"promotion_blocker\": \"production_disabled\""));
+    try std.testing.expectEqual(first_generated_matmul_artifacts.len, std.mem.count(u8, manifest, "\"promotion_blocker_evidence_path\":"));
     try std.testing.expectEqual(blocked_evidence_path_count, std.mem.count(u8, manifest, "\"promotion_blocker_evidence_path\": \"/private/tmp/antfly-quant-metal-"));
-    try std.testing.expectEqual(first_generated_artifacts.len - blocked_evidence_path_count, std.mem.count(u8, manifest, "\"promotion_blocker_evidence_path\": \"\""));
-    try std.testing.expectEqual(first_generated_artifacts.len, std.mem.count(u8, manifest, "\"promotion_blocker_check_command\":"));
+    try std.testing.expectEqual(first_generated_matmul_artifacts.len - blocked_evidence_path_count, std.mem.count(u8, manifest, "\"promotion_blocker_evidence_path\": \"\""));
+    try std.testing.expectEqual(first_generated_matmul_artifacts.len, std.mem.count(u8, manifest, "\"promotion_blocker_check_command\":"));
     try std.testing.expectEqual(blocked_evidence_path_count, std.mem.count(u8, manifest, "\"promotion_blocker_check_command\": \"zig build quant-kernel-metal-runtime-check"));
     try std.testing.expectEqual(blocked_evidence_path_count, std.mem.count(u8, manifest, "--require-evidence-kernel"));
-    try std.testing.expectEqual(first_generated_artifacts.len - blocked_evidence_path_count, std.mem.count(u8, manifest, "\"promotion_blocker_check_command\": \"\""));
+    try std.testing.expectEqual(first_generated_matmul_artifacts.len - blocked_evidence_path_count, std.mem.count(u8, manifest, "\"promotion_blocker_check_command\": \"\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "--require-evidence-kernel " ++ first_general_metal_q4_0_kernel_id));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, runtime_wired_artifacts + cuda_runtime_wired_count, "\"runtime_wired\": true"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, first_generated_artifacts.len - runtime_wired_artifacts - cuda_runtime_wired_count, "\"runtime_wired\": false"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, first_generated_artifacts.len - runtime_wired_artifacts - cuda_runtime_wired_count, "\"runtime_gate_env\": \"\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, first_generated_matmul_artifacts.len - runtime_wired_artifacts - cuda_runtime_wired_count, "\"runtime_wired\": false"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, first_generated_matmul_artifacts.len - runtime_wired_artifacts - cuda_runtime_wired_count, "\"runtime_gate_env\": \"\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MMV\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MM\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 4, "\"runtime_gate_env\": \"ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 4, "\"runtime_gate_env\": \"ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 2, "\"runtime_gate_env\": \"ANTFLY_INFERENCE_CUDA_GENERATED_Q6_K_Q8_1_LM_HEAD_ARGMAX\""));
     try std.testing.expect(!std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_DISABLE_ANTFLY_Q8_0_SMALL_BATCH\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"runtime_gate_env\": \"TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_RELU\""));
@@ -7587,7 +8716,7 @@ test "quant kernel compiler checked-in Metal evidence matches generated source" 
         try std.testing.expectEqualStrings(source_path, evidence.source_path);
 
         var found = false;
-        for (first_generated_artifacts) |artifact| {
+        for (first_generated_matmul_artifacts) |artifact| {
             if (!std.mem.eql(u8, artifact.kernel_id, evidence.kernel_id)) continue;
             found = true;
             try std.testing.expectEqual(artifactSourceFingerprint(artifact), evidence.source_fingerprint);
@@ -7628,9 +8757,9 @@ test "quant kernel compiler checked-in Metal blocker evidence matches generated 
 }
 
 test "quant kernel compiler Metal promotion requires route evidence where routed" {
-    var artifact: GeneratedArtifact = undefined;
+    var artifact: GeneratedMatmulArtifact = undefined;
     var found_artifact = false;
-    for (first_generated_artifacts) |candidate| {
+    for (first_generated_matmul_artifacts) |candidate| {
         if (!std.mem.eql(u8, candidate.kernel_id, first_general_metal_q6_kernel_id)) continue;
         artifact = candidate;
         found_artifact = true;
@@ -7673,7 +8802,7 @@ test "quant kernel compiler Metal promotion requires route evidence where routed
 
 test "quant kernel compiler route-all covers every generated Metal artifact" {
     var metal_artifacts: usize = 0;
-    for (first_generated_artifacts) |artifact| {
+    for (first_generated_matmul_artifacts) |artifact| {
         if (artifact.backend != .metal) continue;
         metal_artifacts += 1;
         try std.testing.expect(artifactRuntimeWired(artifact));
@@ -7894,6 +9023,48 @@ test "quant kernel compiler keeps shape-dependent CUDA routes generic" {
     try std.testing.expectEqualStrings("cuda_handwritten_quant_matmul", loweringFor(.cuda, .q4_k, .rows_9_64, .bias).production_kernel_id);
 }
 
+test "quant kernel compiler applies CUDA production shape constraints" {
+    const artifact = generatedArtifactForKernel(.cuda, first_general_cuda_q4_0_mm_kernel_id).?;
+    try std.testing.expectEqual(@as(usize, 512), artifact.runtime_shape.min_in_dim);
+
+    const narrow = quant_matmul.plan(.{
+        .rows = 22,
+        .in_dim = 256,
+        .out_dim = 1536,
+        .format = .q4_0,
+    });
+    const narrow_lowering = registryLoweringForPlan(.cuda, narrow, .none);
+    try std.testing.expectEqual(LoweringRoute.handwritten_production, narrow_lowering.production_route);
+    try std.testing.expectEqualStrings("termite_linear_q4_0_f32", narrow_lowering.production_kernel_id);
+    try std.testing.expect(!generatedArtifactSupportsPlan(.cuda, narrow, .none));
+
+    const wide = quant_matmul.plan(.{
+        .rows = 22,
+        .in_dim = 512,
+        .out_dim = 1536,
+        .format = .q4_0,
+    });
+    const wide_lowering = registryLoweringForPlan(.cuda, wide, .none);
+    try std.testing.expectEqual(LoweringRoute.generated_production, wide_lowering.production_route);
+    try std.testing.expectEqualStrings(first_general_cuda_q4_0_mm_kernel_id, wide_lowering.production_kernel_id);
+    try std.testing.expect(generatedArtifactSupportsPlan(.cuda, wide, .none));
+}
+
+test "quant kernel compiler uses exact CUDA renderer launch schedules" {
+    for (first_generated_matmul_artifacts) |artifact| {
+        if (artifact.backend != .cuda) continue;
+        const expected = cudaScheduleForArtifact(artifact) orelse return error.MissingCudaRenderPlan;
+        const compiled = compileQuantKernelArtifactSource(artifact) orelse return error.MissingCompiledQuantKernelSource;
+        try std.testing.expectEqual(expected, compiled.lowering.schedule);
+    }
+
+    const fused = generatedArtifactForKernel(.cuda, first_general_cuda_q4_0_pair_q8_kernel_id) orelse return error.MissingGeneratedArtifact;
+    const fused_schedule = cudaScheduleForArtifact(fused) orelse return error.MissingCudaRenderPlan;
+    try std.testing.expectEqual(@as(usize, 640), fused_schedule.threads_per_block);
+    try std.testing.expectEqual(@as(usize, 32), fused_schedule.tile_cols);
+    try std.testing.expectEqual(@as(usize, 768), fused_schedule.shared_memory_bytes);
+}
+
 test "quant kernel compiler dev candidates never occupy production route slots" {
     for (first_registry.entries) |entry| {
         try std.testing.expect(entry.production_route != .generated_dev_candidate);
@@ -8009,18 +9180,18 @@ test "quant kernel compiler registry route summary is golden" {
 
     const cuda = by_backend[@intFromEnum(@as(Backend, .cuda))];
     try std.testing.expectEqual(@as(usize, 1232), cuda.quant_kernel_planned_ops);
-    try std.testing.expectEqual(@as(usize, 51), cuda.quant_kernel_handwritten_production);
+    try std.testing.expectEqual(@as(usize, 59), cuda.quant_kernel_handwritten_production);
     try std.testing.expectEqual(@as(usize, 5), cuda.quant_kernel_generated_production);
-    try std.testing.expectEqual(@as(usize, 1176), cuda.quant_kernel_unsupported_routes);
-    try std.testing.expectEqual(@as(usize, 1), cuda.quant_kernel_generated_candidates);
-    try std.testing.expectEqual(@as(usize, 1), cuda.quant_kernel_fallback_generated_artifact_missing);
-    try std.testing.expectEqual(@as(usize, 0), cuda.quant_kernel_fallback_generated_runtime_not_wired);
+    try std.testing.expectEqual(@as(usize, 1168), cuda.quant_kernel_unsupported_routes);
+    try std.testing.expectEqual(@as(usize, 4), cuda.quant_kernel_generated_candidates);
+    try std.testing.expectEqual(@as(usize, 2), cuda.quant_kernel_fallback_generated_artifact_missing);
+    try std.testing.expectEqual(@as(usize, 2), cuda.quant_kernel_fallback_generated_runtime_not_wired);
     try std.testing.expectEqual(@as(usize, 0), cuda.quant_kernel_fallback_unsupported_format);
     try std.testing.expectEqual(@as(usize, 0), cuda.quant_kernel_fallback_unsupported_shape);
-    try std.testing.expectEqual(@as(usize, 120), cuda.quant_kernel_fallback_unsupported_epilogue);
+    try std.testing.expectEqual(@as(usize, 112), cuda.quant_kernel_fallback_unsupported_epilogue);
     try std.testing.expectEqual(@as(usize, 1056), cuda.quant_kernel_fallback_unsupported_backend);
     try std.testing.expectEqual(@as(usize, 0), cuda.quant_kernel_fallback_tensor_core_repack_required);
-    try std.testing.expectEqual(@as(usize, 1176), cuda.quant_kernel_fallback_unsupported);
+    try std.testing.expectEqual(@as(usize, 1168), cuda.quant_kernel_fallback_unsupported);
 
     const metal = by_backend[@intFromEnum(@as(Backend, .metal))];
     try std.testing.expectEqual(@as(usize, 1232), metal.quant_kernel_planned_ops);
@@ -8087,8 +9258,8 @@ test "quant kernel compiler benchmark manifest maps to conformance rows" {
                 try std.testing.expect(bench.generated_kernel_id.len != 0);
                 try std.testing.expect(bench.generated_source_path.len != 0);
                 try std.testing.expect(bench.generated_source_fingerprint != 0);
-                try std.testing.expect(isPtxPath(bench.generated_ptx_path));
-                try std.testing.expect(std.mem.containsAtLeast(u8, bench.generated_ptx_command, 1, "nvcc -ptx"));
+                try std.testing.expect(isCudaModulePath(bench.generated_ptx_path));
+                try std.testing.expect(std.mem.containsAtLeast(u8, bench.generated_ptx_command, 1, "nvcc -fatbin"));
                 try std.testing.expect(std.mem.containsAtLeast(u8, bench.generated_ptx_command, 1, bench.generated_source_path));
                 try std.testing.expect(std.mem.containsAtLeast(u8, bench.generated_ptx_command, 1, bench.generated_ptx_path));
                 try std.testing.expect(std.mem.containsAtLeast(u8, bench.benchmark_command, 1, "zig-out/bin/antfly-inference bench-cuda"));
@@ -8142,10 +9313,10 @@ test "quant kernel compiler conformance manifest serializes the route matrix" {
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"epilogue_count\": 11"));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"backend_count\": 2"));
     try expectManifestNestedInteger(manifest, "cuda_route_summary", "quant_kernel_planned_ops", 1232);
-    try expectManifestNestedInteger(manifest, "cuda_route_summary", "quant_kernel_generated_candidates", 1);
-    try expectManifestNestedInteger(manifest, "cuda_route_summary", "quant_kernel_fallback_generated_artifact_missing", 1);
-    try expectManifestNestedInteger(manifest, "cuda_route_summary", "quant_kernel_fallback_generated_runtime_not_wired", 0);
-    try expectManifestNestedInteger(manifest, "cuda_route_summary", "quant_kernel_fallback_unsupported_epilogue", 120);
+    try expectManifestNestedInteger(manifest, "cuda_route_summary", "quant_kernel_generated_candidates", 4);
+    try expectManifestNestedInteger(manifest, "cuda_route_summary", "quant_kernel_fallback_generated_artifact_missing", 2);
+    try expectManifestNestedInteger(manifest, "cuda_route_summary", "quant_kernel_fallback_generated_runtime_not_wired", 2);
+    try expectManifestNestedInteger(manifest, "cuda_route_summary", "quant_kernel_fallback_unsupported_epilogue", 112);
     try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_planned_ops", 1232);
     try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_generated_production", 7);
     try expectManifestNestedInteger(manifest, "metal_route_summary", "quant_kernel_generated_candidates", 18);
@@ -8180,7 +9351,7 @@ test "quant kernel compiler conformance manifest serializes the route matrix" {
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"cuda_production_kernel_id\": \"termite_linear_q4_k_bias_gelu_f32_tile4_r2\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"cuda_candidate_kernel_id\": \"antfly_q4_k_small_batch_bias_gelu_f32_v1\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"cuda_candidate_source_path\": \"src/ops/cuda/generated/quant_kernel_q4_k_small_batch_bias_gelu.cu\""));
-    const cuda_candidate_fingerprint = try std.fmt.allocPrint(std.testing.allocator, "\"cuda_candidate_source_fingerprint\": {d}", .{artifactSourceFingerprint(first_generated_artifacts[0])});
+    const cuda_candidate_fingerprint = try std.fmt.allocPrint(std.testing.allocator, "\"cuda_candidate_source_fingerprint\": {d}", .{artifactSourceFingerprint(first_generated_matmul_artifacts[0])});
     defer std.testing.allocator.free(cuda_candidate_fingerprint);
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, cuda_candidate_fingerprint));
     try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "\"cuda_fallback_reason\": \"generated_artifact_missing\""));
@@ -8220,7 +9391,7 @@ test "quant kernel compiler conformance fingerprints match generated artifacts" 
             try std.testing.expectEqual(@as(u64, 0), record.metal_candidate_source_fingerprint);
         }
     }
-    try std.testing.expectEqual(@as(usize, 1), cuda_candidates);
+    try std.testing.expectEqual(@as(usize, 4), cuda_candidates);
     try std.testing.expectEqual(@as(usize, 18), metal_candidates);
 }
 
@@ -8237,7 +9408,7 @@ test "quant kernel compiler benchmark promotion evidence is complete" {
     try std.testing.expect(!benchmarkHasPromotionEvidence(bench));
     try std.testing.expectEqualStrings("ptx_command_missing_source", benchmarkPromotionBlocker(bench));
 
-    bench.generated_ptx_command = "nvcc -ptx -arch=compute_75 src/ops/cuda/artifacts/inference_cuda_kernels.cu -o /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.ptx";
+    bench.generated_ptx_command = "nvcc -fatbin -gencode=arch=compute_89,code=sm_89 src/ops/cuda/artifacts/inference_cuda_kernels.cu -o /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin";
     try std.testing.expect(!benchmarkHasPromotionEvidence(bench));
     try std.testing.expectEqualStrings("missing_correctness_evidence", benchmarkPromotionBlocker(bench));
 
@@ -8268,6 +9439,7 @@ test "quant kernel compiler benchmark promotion evidence is complete" {
         .correctness_evidence_path = bench.correctness_evidence_path,
         .benchmark_evidence_path = bench.benchmark_evidence_path,
         .benchmark_mode = bench.benchmark_mode,
+        .target_fingerprint = bench.target_fingerprint,
         .repeat_runs = metal_promotion_repeat_runs,
         .correctness_passed = true,
         .benchmark_passed = true,
@@ -8282,6 +9454,14 @@ test "quant kernel compiler benchmark promotion evidence is complete" {
     var wrong_evidence_source_fingerprint = passing_evidence;
     wrong_evidence_source_fingerprint[0].generated_source_fingerprint = bench.generated_source_fingerprint +% 1;
     try std.testing.expectEqualStrings("missing_matching_evidence_record", benchmarkPromotionBlockerWithEvidence(bench, &wrong_evidence_source_fingerprint));
+
+    var wrong_evidence_target = passing_evidence;
+    wrong_evidence_target[0].target_fingerprint +%= 1;
+    try std.testing.expectEqualStrings("missing_matching_evidence_record", benchmarkPromotionBlockerWithEvidence(bench, &wrong_evidence_target));
+
+    var missing_target = bench;
+    missing_target.target_fingerprint = 0;
+    try std.testing.expectEqualStrings("missing_target_fingerprint", benchmarkPromotionBlockerWithEvidence(missing_target, &passing_evidence));
 
     var wrong_evidence_ptx = passing_evidence;
     wrong_evidence_ptx[0].generated_ptx_path = "/tmp/other.ptx";
@@ -8341,27 +9521,27 @@ test "quant kernel compiler benchmark promotion evidence is complete" {
     try std.testing.expectEqualStrings("benchmark_missing_generated_ptx_arg", benchmarkPromotionBlocker(missing_ptx_arg));
 
     var missing_repeat = bench;
-    missing_repeat.benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.ptx --quant-compiler-evidence-out src/ops/cuda/generated/evidence/q4_k_small_batch_bias_gelu_benchmark.json";
+    missing_repeat.benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin --quant-compiler-evidence-out src/ops/cuda/generated/evidence/q4_k_small_batch_bias_gelu_benchmark.json";
     try std.testing.expect(!benchmarkHasPromotionEvidence(missing_repeat));
     try std.testing.expectEqualStrings("missing_benchmark_repeat_runs", benchmarkPromotionBlocker(missing_repeat));
 
     var wrong_ptx_path_value = bench;
-    wrong_ptx_path_value.benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/wrong.ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.ptx --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out src/ops/cuda/generated/evidence/q4_k_small_batch_bias_gelu_benchmark.json";
+    wrong_ptx_path_value.benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/wrong.fatbin /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out src/ops/cuda/generated/evidence/q4_k_small_batch_bias_gelu_benchmark.json";
     try std.testing.expect(!benchmarkHasPromotionEvidence(wrong_ptx_path_value));
     try std.testing.expectEqualStrings("benchmark_missing_generated_ptx_path", benchmarkPromotionBlocker(wrong_ptx_path_value));
 
     var missing_evidence_out = bench;
-    missing_evidence_out.benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.ptx --quant-compiler-repeat-runs 3";
+    missing_evidence_out.benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin --quant-compiler-repeat-runs 3";
     try std.testing.expect(!benchmarkHasPromotionEvidence(missing_evidence_out));
     try std.testing.expectEqualStrings("benchmark_missing_evidence_out_arg", benchmarkPromotionBlocker(missing_evidence_out));
 
     var wrong_evidence_path = bench;
-    wrong_evidence_path.benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.ptx --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out /tmp/wrong-evidence.json";
+    wrong_evidence_path.benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out /tmp/wrong-evidence.json";
     try std.testing.expect(!benchmarkHasPromotionEvidence(wrong_evidence_path));
     try std.testing.expectEqualStrings("benchmark_missing_evidence_out_path", benchmarkPromotionBlocker(wrong_evidence_path));
 
     var missing_iters = bench;
-    missing_iters.benchmark_command = "zig-out/bin/antfly-inference bench-cuda --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.ptx";
+    missing_iters.benchmark_command = "zig-out/bin/antfly-inference bench-cuda --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin";
     try std.testing.expect(!benchmarkHasPromotionEvidence(missing_iters));
     try std.testing.expectEqualStrings("missing_warmup_iters", benchmarkPromotionBlocker(missing_iters));
 
@@ -8395,6 +9575,7 @@ test "quant kernel compiler benchmark promotion evidence is complete" {
         .correctness_evidence_path = bench.correctness_evidence_path,
         .benchmark_evidence_path = bench.benchmark_evidence_path,
         .benchmark_mode = bench.benchmark_mode,
+        .target_fingerprint = bench.target_fingerprint,
         .repeat_runs = metal_promotion_repeat_runs,
         .correctness_passed = true,
         .benchmark_passed = true,
@@ -8403,12 +9584,96 @@ test "quant kernel compiler benchmark promotion evidence is complete" {
     try std.testing.expectEqualStrings("speedup_gate_missing", benchmarkPromotionBlockerWithEvidence(bench, &nan_speedup_evidence));
 }
 
+test "quant kernel compiler checked-in CUDA promotion evidence is fresh and route eligible" {
+    const ExpectedShape = struct { label: []const u8, rows: usize, in_dim: usize, out_dim: usize };
+    const mmv_shapes = [_]ExpectedShape{
+        .{ .label = "E2B PLE proj", .rows = 1, .in_dim = 256, .out_dim = 1536 },
+        .{ .label = "E2B attn out", .rows = 1, .in_dim = 2048, .out_dim = 1536 },
+        .{ .label = "E2B FFN down", .rows = 1, .in_dim = 12288, .out_dim = 1536 },
+        .{ .label = "E2B FFN up", .rows = 1, .in_dim = 1536, .out_dim = 8960 },
+        .{ .label = "E2B LM head", .rows = 1, .in_dim = 1536, .out_dim = 262144 },
+    };
+    const mm_shapes = [_]ExpectedShape{
+        .{ .label = "E2B PLE proj", .rows = 22, .in_dim = 256, .out_dim = 1536 },
+        .{ .label = "E2B attn out", .rows = 22, .in_dim = 2048, .out_dim = 1536 },
+        .{ .label = "E2B FFN down", .rows = 22, .in_dim = 12288, .out_dim = 1536 },
+        .{ .label = "E2B FFN up", .rows = 22, .in_dim = 1536, .out_dim = 8960 },
+    };
+    const pair_shapes = [_]ExpectedShape{
+        .{ .label = "E2B FFN gate+up", .rows = 1, .in_dim = 1536, .out_dim = 8960 },
+        .{ .label = "E4B FFN gate+up", .rows = 1, .in_dim = 2560, .out_dim = 10240 },
+    };
+    const pair_q8_shapes = [_]ExpectedShape{.{ .label = "E4B FFN gate+up q8_1", .rows = 1, .in_dim = 2560, .out_dim = 10240 }};
+    const down_q8_shapes = [_]ExpectedShape{.{ .label = "E4B FFN down q8_1", .rows = 1, .in_dim = 10240, .out_dim = 2560 }};
+    const expected_shapes = [_][]const ExpectedShape{ &mmv_shapes, &mm_shapes, &pair_shapes, &pair_q8_shapes, &down_q8_shapes };
+
+    try std.testing.expectEqual(first_benchmark_evidence.len, first_cuda_q4_evidence_json.len);
+    try std.testing.expectEqual(first_benchmark_evidence.len, first_benchmarks.len - 1);
+
+    for (first_cuda_q4_evidence_json, first_benchmarks[1..], first_benchmark_evidence, expected_shapes) |json, bench, record, expected| {
+        var parsed = try std.json.parseFromSlice(CudaQ4EvidenceFile, std.testing.allocator, json, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const evidence = parsed.value;
+        const artifact = generatedArtifactForKernel(.cuda, bench.generated_kernel_id) orelse return error.MissingGeneratedArtifact;
+
+        try std.testing.expectEqual(cuda_sm89_promotion_target_fingerprint, bench.target_fingerprint);
+        try std.testing.expectEqual(bench.target_fingerprint, record.target_fingerprint);
+        try std.testing.expectEqualStrings("antfly.quant_kernel_q4_0_benchmark_evidence.v1", evidence.schema);
+        try std.testing.expectEqualStrings(bench.generated_kernel_id, evidence.kernel_id);
+        try std.testing.expectEqualStrings(bench.generated_source_path, evidence.generated_source_path);
+        try std.testing.expectEqual(bench.generated_source_fingerprint, evidence.generated_source_fingerprint);
+        try std.testing.expectEqualStrings(bench.generated_ptx_path, evidence.generated_ptx_path);
+        try std.testing.expectEqualStrings(bench.generated_ptx_command, evidence.generated_ptx_command);
+        try std.testing.expectEqualStrings(bench.benchmark_command, evidence.benchmark_command);
+        try std.testing.expectEqualStrings(bench.correctness_evidence_path, evidence.correctness_evidence_path);
+        try std.testing.expectEqualStrings(bench.benchmark_evidence_path, evidence.benchmark_evidence_path);
+        try std.testing.expectEqualStrings(bench.benchmark_mode, evidence.benchmark_mode);
+        try std.testing.expectEqualStrings(bench.handwritten_baseline, evidence.baseline_kernel);
+        try std.testing.expectEqual(artifact.runtime_shape.min_in_dim, evidence.runtime_min_in_dim);
+        try std.testing.expectEqual(record.repeat_runs, evidence.repeat_runs);
+        try std.testing.expectEqual(bench.production_enabled, evidence.production_enabled);
+        try std.testing.expect(evidence.correctness_passed);
+        try std.testing.expect(evidence.benchmark_passed);
+        try std.testing.expect(evidence.promotion_ready);
+        try std.testing.expectEqual(@as(usize, 5), evidence.warmup_iters);
+        try std.testing.expectEqual(@as(usize, 50), evidence.measure_iters);
+        try std.testing.expectApproxEqAbs(bench.minimum_speedup, evidence.minimum_speedup, 0.000001);
+        try std.testing.expectApproxEqAbs(@as(f64, @floatCast(bench.correctness_tolerance_abs)), evidence.correctness_tolerance_abs, 0.000001);
+        try std.testing.expectEqual(expected.len, evidence.shapes.len);
+
+        var eligible_count: usize = 0;
+        var log_sum: f64 = 0.0;
+        var worst = std.math.inf(f64);
+        for (evidence.shapes, expected) |shape, expected_shape| {
+            try std.testing.expectEqualStrings(expected_shape.label, shape.label);
+            try std.testing.expectEqual(expected_shape.rows, shape.rows);
+            try std.testing.expectEqual(expected_shape.in_dim, shape.in_dim);
+            try std.testing.expectEqual(expected_shape.out_dim, shape.out_dim);
+            try std.testing.expect(shape.baseline_ns != 0 and shape.generated_ns != 0);
+            const measured = @as(f64, @floatFromInt(shape.baseline_ns)) / @as(f64, @floatFromInt(shape.generated_ns));
+            try std.testing.expectApproxEqAbs(measured, shape.speedup, 0.000001);
+            const plan = quant_matmul.plan(.{ .rows = shape.rows, .in_dim = shape.in_dim, .out_dim = shape.out_dim, .format = bench.format });
+            if (!artifact.runtime_shape.matches(plan)) continue;
+            eligible_count += 1;
+            log_sum += @log(shape.speedup);
+            worst = @min(worst, shape.speedup);
+        }
+        try std.testing.expect(eligible_count != 0);
+        const geomean = @exp(log_sum / @as(f64, @floatFromInt(eligible_count)));
+        try std.testing.expect(worst >= bench.minimum_speedup);
+        try std.testing.expect(geomean >= bench.minimum_speedup);
+        try std.testing.expectApproxEqAbs(geomean, evidence.measured_speedup, 0.00001);
+        try std.testing.expectApproxEqAbs(worst, evidence.worst_shape_speedup, 0.000001);
+        try std.testing.expectApproxEqAbs(record.measured_speedup, evidence.measured_speedup, 0.000001);
+    }
+}
+
 test "quant kernel compiler production artifacts require promotion evidence" {
-    for (first_generated_artifacts) |artifact| {
+    for (first_generated_matmul_artifacts) |artifact| {
         try std.testing.expectEqual(artifact.production_enabled, artifactHasPromotionEvidence(artifact));
     }
 
-    var cuda_artifact = first_generated_artifacts[0];
+    var cuda_artifact = first_generated_matmul_artifacts[0];
     try std.testing.expect(benchmarkForArtifact(cuda_artifact) != null);
     cuda_artifact.production_enabled = true;
     cuda_artifact.source_path = "src/ops/cuda/artifacts/inference_cuda_kernels.cu";
@@ -8547,32 +9812,53 @@ test "quant kernel compiler production artifacts require promotion evidence" {
 }
 
 test "quant kernel compiler generated artifacts have unique ids and paths" {
+    try validateGeneratedArtifactRegistry();
     for (first_generated_artifacts, 0..) |artifact, i| {
         try std.testing.expect(artifact.kernel_id.len != 0);
         try std.testing.expect(artifact.source_path.len != 0);
-        const lookup = generatedArtifactForCandidate(artifact.backend, artifact.format, artifact.row_bucket, artifact.epilogue) orelse return error.MissingGeneratedArtifactLookup;
-        try std.testing.expectEqualStrings(artifact.kernel_id, lookup.kernel_id);
-        try std.testing.expectEqualStrings(artifact.source_path, lookup.source_path);
-        const kernel_lookup = generatedArtifactForKernel(artifact.backend, artifact.kernel_id) orelse return error.MissingGeneratedArtifactLookup;
-        try std.testing.expectEqualStrings(artifact.source_path, kernel_lookup.source_path);
+        try std.testing.expect(generatedSourceForArtifact(artifact) != null);
         for (first_generated_artifacts[i + 1 ..]) |other| {
             try std.testing.expect(!std.mem.eql(u8, artifact.source_path, other.source_path));
             try std.testing.expect(!std.mem.eql(u8, artifact.kernel_id, other.kernel_id));
-            try std.testing.expect(!(artifact.backend == other.backend and
+        }
+    }
+
+    for (first_generated_matmul_artifacts, 0..) |artifact, i| {
+        const lookup = generatedArtifactForCandidate(artifact.backend, artifact.format, artifact.row_bucket, artifact.epilogue) orelse return error.MissingGeneratedArtifactLookup;
+        try std.testing.expectEqual(artifact.backend, lookup.backend);
+        try std.testing.expectEqual(artifact.format, lookup.format);
+        try std.testing.expectEqual(artifact.row_bucket, lookup.row_bucket);
+        try std.testing.expectEqual(artifact.epilogue, lookup.epilogue);
+        const kernel_lookup = generatedArtifactForKernel(artifact.backend, artifact.kernel_id) orelse return error.MissingGeneratedArtifactLookup;
+        try std.testing.expectEqualStrings(artifact.source_path, kernel_lookup.source_path);
+        for (first_generated_matmul_artifacts[i + 1 ..]) |other| {
+            try std.testing.expect(!std.mem.eql(u8, artifact.source_path, other.source_path));
+            try std.testing.expect(!std.mem.eql(u8, artifact.kernel_id, other.kernel_id));
+            if (artifact.backend == other.backend and
                 artifact.format == other.format and
                 artifact.row_bucket == other.row_bucket and
-                artifact.epilogue == other.epilogue));
+                artifact.epilogue == other.epilogue and
+                artifact.activation == other.activation and
+                artifact.function == other.function and
+                artifact.output == other.output)
+            {
+                const artifact_plan = cudaRenderPlanForArtifact(artifact) orelse return error.DuplicateRouteWithoutCudaPlan;
+                const other_plan = cudaRenderPlanForArtifact(other) orelse return error.DuplicateRouteWithoutCudaPlan;
+                try std.testing.expect(artifact_plan.launch.input_dim.fixed != other_plan.launch.input_dim.fixed or
+                    artifact_plan.launch.output_dim.fixed != other_plan.launch.output_dim.fixed);
+            }
         }
     }
 }
 
 test "quant kernel compiler generated artifact manifest maps to route candidates" {
-    for (first_generated_artifacts) |artifact| {
+    for (first_generated_matmul_artifacts) |artifact| {
         try std.testing.expect(artifactSourceFingerprint(artifact) != 0);
         try std.testing.expect(artifact.check_command.len != 0);
         try std.testing.expect(std.mem.containsAtLeast(u8, artifact.check_command, 1, artifact.source_path));
 
-        const route = loweringFor(artifact.backend, artifact.format, artifact.row_bucket, artifact.epilogue);
+        const compiled = compileQuantKernelArtifactSource(artifact) orelse return error.MissingCompiledQuantKernelSource;
+        const route = compiled.lowering;
         if (artifact.production_enabled) {
             try std.testing.expectEqual(LoweringRoute.generated_production, route.production_route);
             try std.testing.expectEqual(LoweringRoute.unsupported, route.candidate_route);
@@ -8599,11 +9885,11 @@ test "quant kernel compiler generated artifact manifest maps to route candidates
             const expected_tile_cols: usize = if (artifact.backend == .metal)
                 metalGeneratedColsPerThreadgroup(artifact.format, artifact.row_bucket, artifact.epilogue)
             else
-                1;
+                (cudaScheduleForArtifact(artifact) orelse return error.MissingCudaRenderPlan).tile_cols;
             const expected_threads_per_block: usize = if (artifact.backend == .metal)
                 metalGeneratedThreadsPerThreadgroup(artifact.format, artifact.row_bucket, artifact.epilogue)
             else
-                128;
+                (cudaScheduleForArtifact(artifact) orelse return error.MissingCudaRenderPlan).threads_per_block;
             try std.testing.expectEqual(@as(usize, 1), candidate_schedule.tile_rows);
             try std.testing.expectEqual(expected_tile_cols, candidate_schedule.tile_cols);
             try std.testing.expectEqual(expected_threads_per_block, candidate_schedule.threads_per_block);
@@ -8611,12 +9897,6 @@ test "quant kernel compiler generated artifact manifest maps to route candidates
 
         const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, artifact.source_path, std.testing.allocator, .limited(128 * 1024));
         defer std.testing.allocator.free(contents);
-        const compiled = compileQuantKernelSource(.{
-            .backend = artifact.backend,
-            .format = artifact.format,
-            .row_bucket = artifact.row_bucket,
-            .epilogue = artifact.epilogue,
-        }) orelse return error.MissingGeneratedSource;
         const emitted = try emitCompiledSource(std.testing.allocator, compiled);
         defer emitted.deinit(std.testing.allocator);
         try std.testing.expectEqualStrings(emitted.data, contents);
@@ -8624,14 +9904,22 @@ test "quant kernel compiler generated artifact manifest maps to route candidates
         try std.testing.expect(try compiledSourceHeaderMatchesSource(std.testing.allocator, compiled, emitted.data));
         switch (artifact.backend) {
             .cuda => {
-                try std.testing.expect(std.mem.containsAtLeast(u8, artifact.check_command, 1, "nvcc -ptx"));
-                try std.testing.expect(std.mem.containsAtLeast(u8, artifact.check_command, 1, ".ptx"));
+                try std.testing.expect(std.mem.containsAtLeast(u8, artifact.check_command, 1, "nvcc -fatbin"));
+                try std.testing.expect(std.mem.containsAtLeast(u8, artifact.check_command, 1, ".fatbin"));
                 if (std.mem.eql(u8, artifact.kernel_id, first_lazy_benchmark.generated_kernel_id)) {
                     try std.testing.expectEqualStrings(first_lazy_benchmark.benchmark_command, artifact.runtime_evidence_command);
                     try std.testing.expectEqualStrings(first_lazy_benchmark_check_command, artifact.promotion_check_command);
-                } else {
+                } else if (artifact.runtime_evidence_command.len != 0) {
                     try std.testing.expect(std.mem.containsAtLeast(u8, artifact.runtime_evidence_command, 1, "bench-cuda"));
                     try std.testing.expect(std.mem.containsAtLeast(u8, artifact.runtime_evidence_command, 1, artifact.kernel_id));
+                } else {
+                    try std.testing.expect(!artifact.production_enabled);
+                    if (cudaRuntimeWiredDevCandidate(artifact)) {
+                        try std.testing.expect(artifactRuntimeGateEnv(artifact) != null);
+                        try std.testing.expectEqualStrings("awaiting_cuda_promotion_evidence", artifactPromotionBlocker(artifact));
+                    } else {
+                        try std.testing.expect(!artifactRuntimeWired(artifact));
+                    }
                 }
             },
             .metal => {
@@ -8670,7 +9958,8 @@ test "quant kernel compiler generated production routes require promoted artifac
     dev_route.fallback_reason = .generated_artifact_missing;
     dev_route.kernel_id = first_lazy_metal_kernel_id;
     dev_route.candidate_source_path = first_lazy_metal_source_path;
-    const promoted_artifact = first_generated_artifacts[1];
+    const promoted_artifact = generatedArtifactForKernel(.metal, first_lazy_metal_kernel_id) orelse
+        return error.MissingGeneratedArtifact;
     const promoted = promotedLoweringForArtifact(dev_route, promoted_artifact).?;
     try std.testing.expectEqual(LoweringRoute.generated_production, promoted.production_route);
     try std.testing.expectEqual(LoweringRoute.unsupported, promoted.candidate_route);
@@ -9012,19 +10301,53 @@ test "quant kernel compiler compiles promoted Metal source from descriptor route
     try std.testing.expect(!try sourceHeaderMatchesCompiledPlan(std.testing.allocator, compiled, wrong_kernel_header));
 }
 
-test "quant kernel compiler generated artifacts are all small_batch_matmul op_kind" {
-    // The shared matmul list stays op_kind-homogeneous: non-matmul routes live
-    // in `first_generated_microkernel_artifacts` so the matmul manifest /
-    // evidence / benchmark machinery is never handed a non-matmul artifact.
-    for (first_generated_artifacts) |artifact| {
-        try std.testing.expectEqual(OpKind.small_batch_matmul, artifact.op_kind);
+test "quant kernel compiler derived matmul artifacts are operation homogeneous" {
+    for (first_generated_matmul_artifacts) |artifact| {
+        try std.testing.expectEqual(OpKind.small_batch_matmul, artifact.opKind());
     }
 }
 
-test "quant kernel compiler microkernel artifacts are all microkernel op_kind with a single-sourced Metal body" {
+test "quant kernel compiler operation views partition the unified registry" {
+    try std.testing.expectEqual(
+        first_generated_artifacts.len,
+        first_generated_matmul_artifacts.len + first_generated_microkernel_artifacts.len + first_generated_attention_artifacts.len,
+    );
+
+    for (first_generated_artifacts) |artifact| {
+        var matches: usize = 0;
+        switch (artifact.opKind()) {
+            .small_batch_matmul => for (first_generated_matmul_artifacts) |candidate| {
+                if (candidate.backend == artifact.backend and std.mem.eql(u8, candidate.kernel_id, artifact.kernel_id)) matches += 1;
+            },
+            .microkernel => for (first_generated_microkernel_artifacts) |candidate| {
+                if (candidate.backend == artifact.backend and std.mem.eql(u8, candidate.kernel_id, artifact.kernel_id)) matches += 1;
+            },
+            .attention => for (first_generated_attention_artifacts) |candidate| {
+                if (candidate.backend == artifact.backend and std.mem.eql(u8, candidate.kernel_id, artifact.kernel_id)) matches += 1;
+            },
+        }
+        try std.testing.expectEqual(@as(usize, 1), matches);
+    }
+}
+
+test "quant kernel compiler Metal runtime renderer covers the unified registry" {
+    const region = try renderMetalRuntimeQuantRegion(std.testing.allocator);
+    defer std.testing.allocator.free(region);
+    for (first_generated_artifacts) |artifact| {
+        if (artifact.backend != .metal) continue;
+        const declaration = try std.fmt.allocPrint(std.testing.allocator, "kernel void {s}(", .{artifact.kernel_id});
+        defer std.testing.allocator.free(declaration);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, region, declaration));
+    }
+}
+
+test "quant kernel compiler microkernel artifacts carry typed render plans" {
     try std.testing.expect(first_generated_microkernel_artifacts.len > 0);
     for (first_generated_microkernel_artifacts) |artifact| {
-        try std.testing.expectEqual(OpKind.microkernel, artifact.op_kind);
+        try std.testing.expectEqual(OpKind.microkernel, artifact.opKind());
+        const op = artifact.microkernelOp() orelse return error.MissingMicrokernelArtifactOp;
+        try std.testing.expectEqual(MicrokernelKind.rms_norm, op.kind);
+        try std.testing.expect(op.schedule.threads_per_threadgroup > 0);
         try std.testing.expectEqual(Backend.metal, artifact.backend);
         try std.testing.expect(!artifact.production_enabled);
         const source = generatedSourceForArtifact(artifact) orelse return error.MissingGeneratedSource;
@@ -9036,6 +10359,226 @@ test "quant kernel compiler microkernel artifacts are all microkernel op_kind wi
     }
 }
 
+test "quant kernel compiler carries shape-specific E2B Q8 FFN candidates" {
+    const expected = [_]struct {
+        kernel_id: []const u8,
+        kind: cuda_renderer.KernelKind,
+        in_dim: u32,
+        out_dim: u32,
+        threads: u16,
+    }{
+        .{ .kernel_id = first_e2b_cuda_q4_0_pair_q8_6144_kernel_id, .kind = .q4_0_pair_activation_q8_1_e2b_6144, .in_dim = 1536, .out_dim = 6144, .threads = 384 },
+        .{ .kernel_id = first_e2b_cuda_q4_0_pair_q8_12288_kernel_id, .kind = .q4_0_pair_activation_q8_1_e2b_12288, .in_dim = 1536, .out_dim = 12288, .threads = 384 },
+        .{ .kernel_id = first_e2b_cuda_q4_0_down_q8_6144_kernel_id, .kind = .q4_0_down_q8_1_e2b_6144, .in_dim = 6144, .out_dim = 1536, .threads = 128 },
+        .{ .kernel_id = first_e2b_cuda_q4_0_down_q8_12288_kernel_id, .kind = .q4_0_down_q8_1_e2b_12288, .in_dim = 12288, .out_dim = 1536, .threads = 256 },
+    };
+    for (expected) |item| {
+        const artifact = generatedArtifactForKernel(.cuda, item.kernel_id) orelse return error.MissingGeneratedArtifact;
+        try std.testing.expect(!artifact.production_enabled);
+        try std.testing.expect(artifactRuntimeWired(artifact));
+        try std.testing.expectEqualStrings(
+            "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN",
+            std.mem.span(artifactRuntimeGateEnv(artifact).?),
+        );
+        try std.testing.expect(artifact.runtime_evidence_command.len == 0);
+        const plan = cudaRenderPlanForArtifact(artifact) orelse return error.MissingCudaRenderPlan;
+        try std.testing.expectEqual(item.kind, plan.kind);
+        try std.testing.expectEqual(item.in_dim, plan.launch.input_dim.fixed);
+        try std.testing.expectEqual(item.out_dim, plan.launch.output_dim.fixed);
+        try std.testing.expectEqual(item.threads, plan.launch.threads_per_block);
+        const compiled = compileQuantKernelArtifactSource(artifact) orelse return error.MissingCompiledQuantKernelSource;
+        try std.testing.expectEqualStrings(item.kernel_id, compiled.artifact.kernel_id);
+        try std.testing.expectEqual(LoweringRoute.handwritten_production, compiled.lowering.production_route);
+        try std.testing.expectEqual(LoweringRoute.generated_dev_candidate, compiled.lowering.candidate_route);
+        try std.testing.expectEqual(FallbackReason.generated_runtime_not_wired, compiled.lowering.fallback_reason);
+        try std.testing.expectEqualStrings("awaiting_cuda_promotion_evidence", artifactPromotionBlocker(artifact));
+        try std.testing.expect(std.mem.containsAtLeast(u8, compiled.source, 1, item.kernel_id));
+    }
+
+    const default_pair = compileQuantKernelSource(.{
+        .backend = .cuda,
+        .format = .q4_0,
+        .row_bucket = .rows_1,
+        .epilogue = .pair_activation,
+    }) orelse return error.MissingCompiledQuantKernelSource;
+    try std.testing.expectEqualStrings(first_general_cuda_q4_0_pair_q8_kernel_id, default_pair.artifact.kernel_id);
+    const default_down = compileQuantKernelSource(.{
+        .backend = .cuda,
+        .format = .q4_0,
+        .row_bucket = .rows_1,
+        .epilogue = .gated_down,
+    }) orelse return error.MissingCompiledQuantKernelSource;
+    try std.testing.expectEqualStrings(first_general_cuda_q4_0_down_q8_kernel_id, default_down.artifact.kernel_id);
+}
+
+test "quant kernel compiler carries exact F32 E2B FFN candidates" {
+    const expected = [_]struct {
+        kernel_id: []const u8,
+        kind: cuda_renderer.KernelKind,
+        in_dim: u32,
+        out_dim: u32,
+        threads: u16,
+        activation: ActivationEncoding,
+        output: OutputEncoding,
+    }{
+        .{
+            .kernel_id = first_e2b_cuda_q4_0_pair_f32_6144_exact_kernel_id,
+            .kind = .q4_0_pair_activation_f32_e2b_6144_exact,
+            .in_dim = 1536,
+            .out_dim = 6144,
+            .threads = 128,
+            .activation = .f32,
+            .output = .f32,
+        },
+        .{
+            .kernel_id = first_e2b_cuda_q4_0_pair_f32_12288_exact_kernel_id,
+            .kind = .q4_0_pair_activation_f32_e2b_12288_exact,
+            .in_dim = 1536,
+            .out_dim = 12_288,
+            .threads = 128,
+            .activation = .f32,
+            .output = .f32,
+        },
+        .{
+            .kernel_id = first_e2b_cuda_q4_0_down_f32_6144_exact_kernel_id,
+            .kind = .q4_0_down_f32_e2b_6144_exact,
+            .in_dim = 6144,
+            .out_dim = 1536,
+            .threads = 256,
+            .activation = .f32,
+            .output = .f32,
+        },
+        .{
+            .kernel_id = first_e2b_cuda_q4_0_down_f32_12288_exact_kernel_id,
+            .kind = .q4_0_down_f32_e2b_12288_exact,
+            .in_dim = 12_288,
+            .out_dim = 1536,
+            .threads = 256,
+            .activation = .f32,
+            .output = .f32,
+        },
+    };
+    for (expected) |item| {
+        const artifact = generatedArtifactForKernel(.cuda, item.kernel_id) orelse return error.MissingGeneratedArtifact;
+        try std.testing.expect(!artifact.production_enabled);
+        try std.testing.expect(artifactRuntimeWired(artifact));
+        try std.testing.expectEqual(item.activation, artifact.activation);
+        try std.testing.expectEqual(item.output, artifact.output);
+        try std.testing.expectEqualStrings(
+            "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT",
+            std.mem.span(artifactRuntimeGateEnv(artifact).?),
+        );
+        const plan = cudaRenderPlanForArtifact(artifact) orelse return error.MissingCudaRenderPlan;
+        try std.testing.expectEqual(item.kind, plan.kind);
+        try std.testing.expectEqual(item.in_dim, plan.launch.input_dim.fixed);
+        try std.testing.expectEqual(item.out_dim, plan.launch.output_dim.fixed);
+        try std.testing.expectEqual(item.threads, plan.launch.threads_per_block);
+        try std.testing.expectEqual(@as(u32, 128), plan.launch.static_shared_memory_bytes);
+        const compiled = compileQuantKernelArtifactSource(artifact) orelse return error.MissingCompiledQuantKernelSource;
+        try std.testing.expectEqualStrings(item.kernel_id, compiled.artifact.kernel_id);
+        try std.testing.expectEqual(LoweringRoute.handwritten_production, compiled.lowering.production_route);
+        try std.testing.expectEqual(LoweringRoute.generated_dev_candidate, compiled.lowering.candidate_route);
+        try std.testing.expectEqual(FallbackReason.generated_runtime_not_wired, compiled.lowering.fallback_reason);
+        try std.testing.expectEqualStrings("awaiting_cuda_promotion_evidence", artifactPromotionBlocker(artifact));
+        try std.testing.expect(std.mem.containsAtLeast(u8, compiled.source, 1, item.kernel_id));
+    }
+}
+
+test "quant kernel compiler carries runtime-wired E2B Q8 LM argmax candidate" {
+    const artifact = generatedArtifactForKernel(.cuda, first_e2b_cuda_q4_0_q8_1_argmax_kernel_id) orelse
+        return error.MissingGeneratedArtifact;
+    try std.testing.expect(!artifact.production_enabled);
+    try std.testing.expect(artifactRuntimeWired(artifact));
+    try std.testing.expectEqualStrings(
+        "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX",
+        std.mem.span(artifactRuntimeGateEnv(artifact).?),
+    );
+    const plan = cudaRenderPlanForArtifact(artifact) orelse return error.MissingCudaRenderPlan;
+    try std.testing.expectEqual(cuda_renderer.KernelKind.q4_0_q8_1_argmax_e2b_tile8, plan.kind);
+    try std.testing.expectEqual(@as(u32, 1536), plan.launch.input_dim.fixed);
+    try std.testing.expectEqual(@as(u32, 262144), plan.launch.output_dim.fixed);
+    try std.testing.expectEqual(@as(u16, 96), plan.launch.threads_per_block);
+    const compiled = compileQuantKernelArtifactSource(artifact) orelse return error.MissingCompiledQuantKernelSource;
+    try std.testing.expectEqual(LoweringRoute.handwritten_production, compiled.lowering.production_route);
+    try std.testing.expectEqual(LoweringRoute.generated_dev_candidate, compiled.lowering.candidate_route);
+    try std.testing.expectEqual(FallbackReason.generated_runtime_not_wired, compiled.lowering.fallback_reason);
+    try std.testing.expectEqualStrings("awaiting_cuda_promotion_evidence", artifactPromotionBlocker(artifact));
+    const route = loweringFor(.cuda, .q4_0, .rows_1, .argmax);
+    try std.testing.expectEqualStrings(first_e2b_cuda_q4_0_q8_1_argmax_kernel_id, route.kernel_id);
+    try std.testing.expectEqual(FallbackReason.generated_runtime_not_wired, route.fallback_reason);
+    try std.testing.expectEqual(IROp.write_argmax_pair, compiled.ir.ops[compiled.ir.ops.len - 1]);
+    try std.testing.expect(std.mem.containsAtLeast(u8, compiled.source, 1, "value == best_value && col < best_index"));
+}
+
+test "quant kernel compiler carries standalone K2560 Q6_K Q8_1 argmax candidate" {
+    const artifact = generatedArtifactForKernel(.cuda, first_cuda_q6_k_q8_1_argmax_k2560_kernel_id) orelse
+        return error.MissingGeneratedArtifact;
+    try std.testing.expect(!artifact.production_enabled);
+    try std.testing.expect(artifactRuntimeWired(artifact));
+    try std.testing.expectEqualStrings(
+        "ANTFLY_INFERENCE_CUDA_GENERATED_Q6_K_Q8_1_LM_HEAD_ARGMAX",
+        std.mem.span(artifactRuntimeGateEnv(artifact).?),
+    );
+    try std.testing.expectEqualStrings("awaiting_cuda_promotion_evidence", artifactPromotionBlocker(artifact));
+
+    const plan = cudaRenderPlanForArtifact(artifact) orelse return error.MissingCudaRenderPlan;
+    try std.testing.expectEqual(cuda_renderer.KernelKind.q6_k_q8_1_argmax_k2560_tile8, plan.kind);
+    try std.testing.expectEqual(@as(u32, 2560), plan.launch.input_dim.fixed);
+    try std.testing.expectEqual(@as(u32, 262144), plan.launch.output_dim.fixed);
+    try std.testing.expectEqual(@as(u16, 160), plan.launch.threads_per_block);
+    try std.testing.expectEqualStrings(
+        "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b+termite_argmax_reduce_rows_pairs_f32_w16",
+        plan.production_baseline,
+    );
+
+    const compiled = compileQuantKernelArtifactSource(artifact) orelse return error.MissingCompiledQuantKernelSource;
+    try std.testing.expectEqual(LoweringRoute.handwritten_production, compiled.lowering.production_route);
+    try std.testing.expectEqual(LoweringRoute.generated_dev_candidate, compiled.lowering.candidate_route);
+    try std.testing.expectEqual(FallbackReason.generated_runtime_not_wired, compiled.lowering.fallback_reason);
+    try std.testing.expectEqual(IROp.write_argmax_pair, compiled.ir.ops[compiled.ir.ops.len - 1]);
+    try std.testing.expect(std.mem.containsAtLeast(u8, compiled.source, 1, first_cuda_q6_k_q8_1_argmax_k2560_kernel_id));
+    try std.testing.expect(std.mem.containsAtLeast(u8, compiled.source, 1, "antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1_q6_k_q8_1_dot16_sub"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, compiled.source, 1, "sumi = __dp4a(antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1_q6_k_pack4"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, compiled.source, 1, "sumi = __dp4a(antfly_pack_q6_k_i8x4_sub"));
+    try std.testing.expect(first_cuda_q6_k_q8_1_argmax_k2560_source_fingerprint != 0);
+}
+
+test "quant kernel compiler carries standalone K3840 Q6_K Q8_1 argmax candidate" {
+    const artifact = generatedArtifactForKernel(.cuda, first_cuda_q6_k_q8_1_argmax_k3840_kernel_id) orelse
+        return error.MissingGeneratedArtifact;
+    try std.testing.expect(!artifact.production_enabled);
+    try std.testing.expect(artifactRuntimeWired(artifact));
+    try std.testing.expectEqualStrings(
+        "ANTFLY_INFERENCE_CUDA_GENERATED_Q6_K_Q8_1_LM_HEAD_ARGMAX",
+        std.mem.span(artifactRuntimeGateEnv(artifact).?),
+    );
+    try std.testing.expectEqual(ActivationEncoding.q8_1, artifact.activation);
+    try std.testing.expectEqual(OutputEncoding.i32, artifact.output);
+
+    const plan = cudaRenderPlanForArtifact(artifact) orelse return error.MissingCudaRenderPlan;
+    try std.testing.expectEqual(cuda_renderer.KernelKind.q6_k_q8_1_argmax_k3840_tile8, plan.kind);
+    try std.testing.expectEqual(@as(u32, 3840), plan.launch.input_dim.fixed);
+    try std.testing.expectEqual(@as(u32, 262144), plan.launch.output_dim.fixed);
+    try std.testing.expectEqual(@as(u16, 256), plan.launch.threads_per_block);
+    try std.testing.expectEqual(@as(u32, 256), plan.launch.static_shared_memory_bytes);
+    try std.testing.expectEqualStrings(
+        "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8+termite_argmax_reduce_rows_pairs_f32_w16",
+        plan.production_baseline,
+    );
+
+    const compiled = compileQuantKernelArtifactSource(artifact) orelse return error.MissingCompiledQuantKernelSource;
+    try std.testing.expectEqual(LoweringRoute.handwritten_production, compiled.lowering.production_route);
+    try std.testing.expectEqual(LoweringRoute.generated_dev_candidate, compiled.lowering.candidate_route);
+    try std.testing.expectEqual(FallbackReason.generated_runtime_not_wired, compiled.lowering.fallback_reason);
+    try std.testing.expectEqualStrings(plan.production_baseline, compiled.lowering.production_kernel_id);
+    try std.testing.expect(std.mem.containsAtLeast(u8, compiled.source, 1, "const unsigned int task_threads = 240u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, compiled.source, 1, "if (tid < task_threads)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, compiled.source, 1, "antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1_q6_k_q8_1_dot16_sub"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, compiled.source, 1, "sumi = __dp4a(antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1_q6_k_pack4"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, compiled.source, 1, "sumi = __dp4a(antfly_pack_q6_k_i8x4_sub"));
+    try std.testing.expect(first_cuda_q6_k_q8_1_argmax_k3840_source_fingerprint != 0);
+}
+
 test "quant kernel compiler runtime region embeds the RMSNorm microkernel body" {
     const region = try renderMetalRuntimeQuantRegion(std.testing.allocator);
     defer std.testing.allocator.free(region);
@@ -9044,23 +10587,114 @@ test "quant kernel compiler runtime region embeds the RMSNorm microkernel body" 
     try std.testing.expect(std.mem.containsAtLeast(u8, region, 1, "antfly_q4_k_small_batch"));
 }
 
-test "quant kernel compiler attention artifacts are all attention op_kind with a single-sourced Metal body" {
+test "quant kernel compiler attention artifacts carry typed render plans" {
     try std.testing.expect(first_generated_attention_artifacts.len > 0);
+    var cuda_artifact_count: usize = 0;
+    var runtime_cuda_artifact_count: usize = 0;
+    var standalone_cuda_artifact_count: usize = 0;
     for (first_generated_attention_artifacts) |artifact| {
-        try std.testing.expectEqual(OpKind.attention, artifact.op_kind);
-        try std.testing.expectEqual(Backend.metal, artifact.backend);
+        try std.testing.expectEqual(OpKind.attention, artifact.opKind());
+        const op = artifact.attentionOp() orelse return error.MissingAttentionArtifactOp;
+        try std.testing.expect(op.schedule.threads_per_threadgroup > 0);
         // Dev-only candidate until the model-token gate promotes it.
         try std.testing.expect(!artifact.production_enabled);
         const source = generatedSourceForArtifact(artifact) orelse return error.MissingGeneratedSource;
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, artifact.kernel_id));
-        const kernel_decl = try std.fmt.allocPrint(std.testing.allocator, "kernel void {s}(", .{artifact.kernel_id});
+        const kernel_decl = switch (artifact.backend) {
+            .metal => try std.fmt.allocPrint(std.testing.allocator, "kernel void {s}(", .{artifact.kernel_id}),
+            .cuda => try std.fmt.allocPrint(std.testing.allocator, "extern \"C\" __global__ void {s}(", .{artifact.kernel_id}),
+        };
         defer std.testing.allocator.free(kernel_decl);
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, kernel_decl));
-        // Self-contained: the standalone `.metal` carries its own params struct +
-        // paging helper (so `xcrun` compiles it with no metal_kernels.m dep).
-        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "struct antfly_paged_attention_1x_params {"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "inline uint antfly_paged_attention_1x_page_token("));
+        if (artifact.backend == .metal) {
+            // Self-contained: the standalone `.metal` carries its own params struct +
+            // paging helper (so `xcrun` compiles it with no metal_kernels.m dep).
+            try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "struct antfly_paged_attention_1x_params {"));
+            try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "inline uint antfly_paged_attention_1x_page_token("));
+        } else {
+            cuda_artifact_count += 1;
+            const plan = cudaAttentionRenderPlanForArtifact(artifact) orelse return error.MissingCudaAttentionRenderPlan;
+            try std.testing.expect(op.head_dim == 256 or op.head_dim == 512);
+            try std.testing.expectEqual(plan.lowering.kv_splits, op.schedule.attention_kv_splits);
+            try std.testing.expectEqual(plan.lowering.split_variant.kvSplits(), op.schedule.attention_kv_splits);
+            try std.testing.expectEqual(cuda_renderer.generated_attention_query_heads_per_kv_head, op.schedule.attention_query_heads_per_kv_head);
+            try std.testing.expectEqual(plan.lowering.split_kv_min_tokens_default, op.schedule.attention_split_kv_min_tokens);
+            try std.testing.expectEqual(plan.lowering.max_kv_tokens, op.schedule.attention_max_kv_tokens);
+            try std.testing.expectEqual(AttentionStorage.f32, op.schedule.attention_storage);
+            try std.testing.expectEqual(
+                if (plan.lowering.split_variant == .score_prework)
+                    AttentionStorage.paged_f16_or_polar4
+                else
+                    AttentionStorage.f32,
+                op.schedule.attention_key_storage,
+            );
+            try std.testing.expect(op.schedule.attention_serial_threads_per_threadgroup > 0);
+            try std.testing.expect(op.schedule.attention_stage2_threads_per_threadgroup > 0);
+            inline for (.{ plan.serial_kernel_id, plan.kernel_id, plan.reduction_kernel_id }) |kernel_id| {
+                const cuda_decl = try std.fmt.allocPrint(std.testing.allocator, "extern \"C\" __global__ void {s}(", .{kernel_id});
+                defer std.testing.allocator.free(cuda_decl);
+                try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, cuda_decl));
+            }
+            try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const unsigned int* decode_scalars"));
+            const source_id_header = try std.fmt.allocPrint(std.testing.allocator, "// source_id={s}", .{plan.source_id});
+            defer std.testing.allocator.free(source_id_header);
+            try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, source_id_header));
+            if (cudaAttentionArtifactRuntimeWired(artifact)) {
+                runtime_cuda_artifact_count += 1;
+            } else {
+                standalone_cuda_artifact_count += 1;
+                try std.testing.expect(!artifact.production_enabled);
+            }
+        }
     }
+    try std.testing.expectEqual(@as(usize, 8), cuda_artifact_count);
+    try std.testing.expectEqual(@as(usize, 8), runtime_cuda_artifact_count);
+    try std.testing.expectEqual(@as(usize, 0), standalone_cuda_artifact_count);
+}
+
+test "quant kernel compiler registers runtime-wired split-KV schedule variants" {
+    const expected = [_]struct {
+        kernel_id: []const u8,
+        split_count: u8,
+        source_fingerprint: u64,
+    }{
+        .{ .kernel_id = first_decode_attention_1x_cuda_split2_hd256_kernel_id, .split_count = 2, .source_fingerprint = first_decode_attention_1x_cuda_split2_hd256_source_fingerprint },
+        .{ .kernel_id = first_decode_attention_1x_cuda_split2_hd512_kernel_id, .split_count = 2, .source_fingerprint = first_decode_attention_1x_cuda_split2_hd512_source_fingerprint },
+        .{ .kernel_id = first_decode_attention_1x_cuda_split4_hd256_kernel_id, .split_count = 4, .source_fingerprint = first_decode_attention_1x_cuda_split4_hd256_source_fingerprint },
+        .{ .kernel_id = first_decode_attention_1x_cuda_split4_hd512_kernel_id, .split_count = 4, .source_fingerprint = first_decode_attention_1x_cuda_split4_hd512_source_fingerprint },
+    };
+    for (expected) |candidate| {
+        const artifact = generatedRegistryArtifactForKernel(.cuda, candidate.kernel_id) orelse return error.MissingSplitKvVariantArtifact;
+        const plan = cudaAttentionRenderPlanForArtifact(artifact) orelse return error.MissingSplitKvVariantPlan;
+        try std.testing.expectEqual(candidate.split_count, plan.lowering.kv_splits);
+        try std.testing.expectEqual(candidate.source_fingerprint, artifactSourceFingerprint(artifact));
+        try std.testing.expect(cudaAttentionArtifactRuntimeWired(artifact));
+        try std.testing.expect(!artifact.production_enabled);
+        const source = generatedSourceForArtifact(artifact) orelse return error.MissingSplitKvVariantSource;
+        const split_text = try std.fmt.allocPrint(std.testing.allocator, "split{d}", .{candidate.split_count});
+        defer std.testing.allocator.free(split_text);
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, split_text));
+    }
+}
+
+test "quant kernel compiler manifests split-KV schedule/source identities" {
+    const manifest = try artifactManifestJson(std.testing.allocator);
+    defer std.testing.allocator.free(manifest);
+    const kernel_ids = [_][]const u8{
+        first_decode_attention_1x_cuda_split2_hd256_kernel_id,
+        first_decode_attention_1x_cuda_split2_hd512_kernel_id,
+        first_decode_attention_1x_cuda_split4_hd256_kernel_id,
+        first_decode_attention_1x_cuda_split4_hd512_kernel_id,
+    };
+    for (kernel_ids) |kernel_id| {
+        try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, kernel_id));
+    }
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, manifest, "\"cuda_attention_split_count\": 2"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, manifest, "\"cuda_attention_split_count\": 4"));
+    // Legacy split-8 entries keep their ABI-stable kernel IDs but record a
+    // canonical split-aware source identity in the registry manifest.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, manifest, "\"cuda_attention_split_count\": 8"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, manifest, 1, "antfly_gqa_attention_decode_split8_kv_hd256_f32_v1"));
 }
 
 test "quant kernel compiler runtime region embeds the decode-1x attention body" {
@@ -9096,10 +10730,34 @@ test "quant kernel compiler pins the paged-attention params layout drift guard" 
     inline for (.{ "uint q_len;", "uint kv_tokens;", "uint num_heads;", "uint num_kv_heads;", "uint head_dim;", "uint key_row_bytes;", "uint v_row_stride;", "uint page_size;", "uint block_count;", "uint contiguous_base_token;", "uint contiguous_blocks;", "uint format;", "uint v_element_bytes;", "uint has_sinks;", "float softcap;" }) |field| {
         try std.testing.expect(std.mem.containsAtLeast(u8, metal_renderer.paged_attention_params_field_body, 1, field));
     }
+
+    const host_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(host_source);
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "_Static_assert(sizeof(termite_metal_paged_attention_params) == 76"));
+    try std.testing.expectEqual(@as(usize, 19), std.mem.count(u8, host_source, "_Static_assert(offsetof(termite_metal_paged_attention_params"));
+
+    const decode_threads = try std.fmt.allocPrint(std.testing.allocator, "#define TERMITE_METAL_GENERATED_DECODE_THREADS {d}u", .{first_decode_attention_1x_metal_schedule.threads_per_threadgroup});
+    defer std.testing.allocator.free(decode_threads);
+    const flash_threads = try std.fmt.allocPrint(std.testing.allocator, "#define TERMITE_METAL_GENERATED_FLASH_THREADS {d}u", .{first_prefill_flash_metal_schedule.threads_per_threadgroup});
+    defer std.testing.allocator.free(flash_threads);
+    const flash_key_chunk = try std.fmt.allocPrint(std.testing.allocator, "#define TERMITE_METAL_GENERATED_FLASH_KEY_CHUNK {d}u", .{first_prefill_flash_metal_schedule.key_chunk});
+    defer std.testing.allocator.free(flash_key_chunk);
+    const rms_threads = try std.fmt.allocPrint(std.testing.allocator, "#define TERMITE_METAL_GENERATED_RMS_THREADS {d}u", .{first_rms_norm_metal_schedule.threads_per_threadgroup});
+    defer std.testing.allocator.free(rms_threads);
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, decode_threads));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, flash_threads));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, flash_key_chunk));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, rms_threads));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "termite_metal_threadgroup_memory_16(TERMITE_METAL_GENERATED_FLASH_MEMORY_BYTES(head_dim))"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "BOOL missing_requested_generated_pipeline"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "runtime->generated_attention_decode_1x_calls += 1"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "runtime->generated_attention_flash_prefill_calls += 1"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "runtime->generated_rms_norm_calls += 1"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "return termite_metal_encode_rms_norm_generated("));
 }
 
-test "quant kernel compiler emits single-sourced Metal source for every generated artifact" {
-    for (first_generated_artifacts) |artifact| {
+test "quant kernel compiler emits single-sourced backend source for every generated artifact" {
+    for (first_generated_matmul_artifacts) |artifact| {
         if (artifact.backend != .metal) continue;
         const compiled = compileQuantKernelSource(.{
             .backend = artifact.backend,
@@ -9127,18 +10785,24 @@ test "quant kernel compiler emits single-sourced Metal source for every generate
         try std.testing.expect(std.mem.endsWith(u8, emitted.data, rendered_kernel));
     }
 
-    // CUDA sources keep their existing borrowed-source path.
-    const cuda_q4 = compileQuantKernelSource(.{
-        .backend = .cuda,
-        .format = .q4_k,
-        .row_bucket = .rows_2_8,
-        .epilogue = .bias_gelu,
-    }).?;
-    const emitted_cuda_q4 = try emitCompiledSource(std.testing.allocator, cuda_q4);
-    defer emitted_cuda_q4.deinit(std.testing.allocator);
+    // Every CUDA source is rendered from the typed backend plan at emit time.
+    // The checked-in files are full-byte goldens, so source fingerprints and
+    // promotion evidence remain stable through the architecture migration.
+    for (first_generated_matmul_artifacts) |artifact| {
+        if (artifact.backend != .cuda) continue;
+        const compiled = compileQuantKernelArtifactSource(artifact) orelse return error.MissingGeneratedSource;
+        const plan = compiled.cuda_render_plan orelse return error.MissingCudaRenderPlan;
+        try plan.validate();
 
-    try std.testing.expect(!emitted_cuda_q4.owned);
-    try std.testing.expectEqualStrings(cuda_q4.source, emitted_cuda_q4.data);
+        const emitted = try emitCompiledSource(std.testing.allocator, compiled);
+        defer emitted.deinit(std.testing.allocator);
+        try std.testing.expect(emitted.owned);
+        try std.testing.expectEqualStrings(compiled.source, emitted.data);
+
+        const checked_in = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, artifact.source_path, std.testing.allocator, .limited(1 << 20));
+        defer std.testing.allocator.free(checked_in);
+        try std.testing.expectEqualStrings(checked_in, emitted.data);
+    }
 }
 
 test "quant kernel compiler compile API requires a generated artifact" {
@@ -9154,13 +10818,8 @@ test "quant kernel compiler compile API rejects route metadata drift" {
     var checked: usize = 0;
     var promoted_checked: usize = 0;
     var candidate_checked: usize = 0;
-    for (first_generated_artifacts) |artifact| {
-        const compiled = compileQuantKernelSource(.{
-            .backend = artifact.backend,
-            .format = artifact.format,
-            .row_bucket = artifact.row_bucket,
-            .epilogue = artifact.epilogue,
-        }) orelse return error.MissingCompiledQuantKernelSource;
+    for (first_generated_matmul_artifacts) |artifact| {
+        const compiled = compileQuantKernelArtifactSource(artifact) orelse return error.MissingCompiledQuantKernelSource;
         try std.testing.expect(compiledSourceMatchesRoute(compiled));
         checked += 1;
         if (artifactHasPromotionEvidence(artifact)) {
@@ -9173,7 +10832,7 @@ test "quant kernel compiler compile API rejects route metadata drift" {
             try std.testing.expectEqualStrings(artifact.kernel_id, compiled.lowering.kernel_id);
         }
     }
-    try std.testing.expectEqual(first_generated_artifacts.len, checked);
+    try std.testing.expectEqual(first_generated_matmul_artifacts.len, checked);
     try std.testing.expect(promoted_checked > 0);
     try std.testing.expect(candidate_checked > 0);
 
@@ -9271,7 +10930,7 @@ fn metalRuntimeGeneratedEpilogueConstant(epilogue: Epilogue) ?[]const u8 {
 }
 
 test "quant kernel compiler production Metal source includes only runtime-wired generated kernels" {
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(3 * 1024 * 1024));
+    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(contents);
 
     try std.testing.expect(!std.mem.containsAtLeast(u8, contents, 1, "src/ops/metal/generated"));
@@ -9456,7 +11115,7 @@ test "quant kernel compiler production Metal source includes only runtime-wired 
     try std.testing.expect(launch_table < launch_helper);
     try std.testing.expect(launch_helper < none_encoder);
     const launch_region_body = contents[launch_table..launch_helper_end];
-    for (first_generated_artifacts) |artifact| {
+    for (first_generated_matmul_artifacts) |artifact| {
         if (artifact.backend != .metal or artifact.row_bucket != .rows_2_8) continue;
         const format_constant = metalRuntimeQuantFormatConstant(artifact.format) orelse continue;
         const epilogue_constant = metalRuntimeGeneratedEpilogueConstant(artifact.epilogue) orelse continue;
@@ -9476,7 +11135,7 @@ test "quant kernel compiler production Metal source includes only runtime-wired 
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "return termite_metal_dispatch_quant_matmul_none(provider, TERMITE_METAL_QUANT_FORMAT_Q6_K"));
 }
 
-fn metalCEnvArgForArtifact(allocator: std.mem.Allocator, artifact: GeneratedArtifact) ![]u8 {
+fn metalCEnvArgForArtifact(allocator: std.mem.Allocator, artifact: GeneratedMatmulArtifact) ![]u8 {
     if (artifactRuntimeGateEnv(artifact)) |env| {
         return try std.fmt.allocPrint(allocator, "\"{s}\"", .{std.mem.span(env)});
     }
@@ -9486,7 +11145,7 @@ fn metalCEnvArgForArtifact(allocator: std.mem.Allocator, artifact: GeneratedArti
 fn metalCBespokeRuntimeWrapperHasArtifact(
     allocator: std.mem.Allocator,
     contents: []const u8,
-    artifact: GeneratedArtifact,
+    artifact: GeneratedMatmulArtifact,
     counter_name: []const u8,
     format_constant: []const u8,
     epilogue_constant: []const u8,
@@ -9529,12 +11188,12 @@ fn metalCBespokeRuntimeWrapperHasArtifact(
 }
 
 test "quant kernel compiler generated Metal wrapper gates follow artifact metadata" {
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(3 * 1024 * 1024));
+    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(contents);
 
     var runtime_checked: usize = 0;
     var provider_checked: usize = 0;
-    for (first_generated_artifacts) |artifact| {
+    for (first_generated_matmul_artifacts) |artifact| {
         if (artifact.backend != .metal or !artifactRuntimeWired(artifact)) continue;
         const provider_helper: []const u8 = switch (artifact.epilogue) {
             .bias, .bias_gelu => "termite_metal_dispatch_generated_quant_bias",
@@ -9574,7 +11233,7 @@ test "quant kernel compiler generated Metal wrapper gates follow artifact metada
 }
 
 test "quant kernel compiler embedded Metal source keeps generated q5 q6 bias reduction" {
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(3 * 1024 * 1024));
+    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(contents);
 
     // The hybrid-simd reduction structure, independent of the simdgroup count
@@ -9616,7 +11275,7 @@ test "quant kernel compiler generated q5 k and q6 k sources share the qk half he
 }
 
 test "quant kernel compiler generated Metal headers match production state" {
-    for (first_generated_artifacts) |artifact| {
+    for (first_generated_matmul_artifacts) |artifact| {
         if (artifact.backend != .metal) continue;
         const compiled = compileQuantKernelSource(.{
             .backend = artifact.backend,
@@ -9711,7 +11370,7 @@ test "quant kernel compiler Metal build check covers generated and promoted arti
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "quant_kernel_metal_industry_local_check_step.dependOn(quant_kernel_metal_model_local_check_step)"));
 
     var metal_artifact_count: usize = 0;
-    for (first_generated_artifacts) |artifact| {
+    for (first_generated_matmul_artifacts) |artifact| {
         if (artifact.backend != .metal) continue;
         metal_artifact_count += 1;
         try std.testing.expect(std.mem.containsAtLeast(u8, artifact.check_command, 1, artifact.source_path));

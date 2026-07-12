@@ -754,6 +754,10 @@ pub const LoadedModel = struct {
         self.native_generate_lock.unlock();
     }
 
+    pub fn nativeGenerationMutex(self: *LoadedModel) *std.atomic.Mutex {
+        return &self.native_generate_lock;
+    }
+
     pub fn wholeModelExecutor(self: *LoadedModel, allocator: std.mem.Allocator, kv_dtype: ?runtime.kv.pool.KvDType) !?graph_mod.model_runtime.ModelExecutor {
         const gpt_config = session_factory.getGptConfig(self.session) orelse return null;
         if (build_options.enable_metal and shouldUseMetalWholeModelExecutor(self.session) and graph_mod.metal_executor.supportsSession(self.session)) {

@@ -1326,9 +1326,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         },
                     );
                     print(
-                        "cuda_generate_attention_launch_breakdown: gqa_decode={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_prefill_fast={d} gqa_prefill_tiled={d} gqa_prefill_mma={d} gqa_prefill_mma_m32={d} gqa_scalar={d}\n",
+                        "cuda_generate_attention_launch_breakdown: gqa_decode={d} gqa_generated={d} gqa_score_prework={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_prefill_fast={d} gqa_prefill_tiled={d} gqa_prefill_mma={d} gqa_prefill_mma_m32={d} gqa_scalar={d}\n",
                         .{
                             generate_stats.launch_attention_gqa_decode,
+                            generate_stats.launch_attention_gqa_decode_generated,
+                            generate_stats.launch_attention_gqa_decode_score_prework,
                             generate_stats.launch_attention_gqa_decode_fast,
                             generate_stats.launch_attention_gqa_decode_fast_fallbacks,
                             generate_stats.launch_attention_gqa_prefill_fast,
@@ -1361,12 +1363,16 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         },
                     );
                     print(
-                        "cuda_generate_lm_head_argmax_counts: fused_q8={d} fused_q4_0={d} fused_q4={d} fused_q6={d} fallbacks={d}\n",
+                        "cuda_generate_lm_head_argmax_counts: fused_q8={d} fused_q4_0={d} fused_q4_0_q8_1={d} q4_0_q8_1_fallbacks={d} fused_q4={d} fused_q6={d} generated_q6_k_q8_1_hits={d} generated_q6_k_q8_1_fallbacks={d} fallbacks={d}\n",
                         .{
                             generate_stats.lm_head_argmax_fused_q8,
                             generate_stats.lm_head_argmax_fused_q4_0,
+                            generate_stats.lm_head_argmax_fused_q4_0_q8_1,
+                            generate_stats.lm_head_argmax_q4_0_q8_1_fallbacks,
                             generate_stats.lm_head_argmax_fused_q4,
                             generate_stats.lm_head_argmax_fused_q6,
+                            generate_stats.lm_head_argmax_generated_q6_k_q8_1_hits,
+                            generate_stats.lm_head_argmax_generated_q6_k_q8_1_fallbacks,
                             generate_stats.lm_head_argmax_fallbacks,
                         },
                     );
@@ -1585,9 +1591,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_attention_launch_breakdown: gqa_decode={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_prefill_fast={d} gqa_prefill_tiled={d} gqa_prefill_mma={d} gqa_prefill_mma_m32={d} gqa_scalar={d}\n",
+                    "cuda_attention_launch_breakdown: gqa_decode={d} gqa_generated={d} gqa_score_prework={d} gqa_fast={d} gqa_fast_fallbacks={d} gqa_prefill_fast={d} gqa_prefill_tiled={d} gqa_prefill_mma={d} gqa_prefill_mma_m32={d} gqa_scalar={d}\n",
                     .{
                         cuda_stats.launch_attention_gqa_decode,
+                        cuda_stats.launch_attention_gqa_decode_generated,
+                        cuda_stats.launch_attention_gqa_decode_score_prework,
                         cuda_stats.launch_attention_gqa_decode_fast,
                         cuda_stats.launch_attention_gqa_decode_fast_fallbacks,
                         cuda_stats.launch_attention_gqa_prefill_fast,
@@ -1731,12 +1739,16 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_lm_head_argmax_counts: fused_q8={d} fused_q4_0={d} fused_q4={d} fused_q6={d} fallbacks={d}\n",
+                    "cuda_lm_head_argmax_counts: fused_q8={d} fused_q4_0={d} fused_q4_0_q8_1={d} q4_0_q8_1_fallbacks={d} fused_q4={d} fused_q6={d} generated_q6_k_q8_1_hits={d} generated_q6_k_q8_1_fallbacks={d} fallbacks={d}\n",
                     .{
                         cuda_stats.lm_head_argmax_fused_q8,
                         cuda_stats.lm_head_argmax_fused_q4_0,
+                        cuda_stats.lm_head_argmax_fused_q4_0_q8_1,
+                        cuda_stats.lm_head_argmax_q4_0_q8_1_fallbacks,
                         cuda_stats.lm_head_argmax_fused_q4,
                         cuda_stats.lm_head_argmax_fused_q6,
+                        cuda_stats.lm_head_argmax_generated_q6_k_q8_1_hits,
+                        cuda_stats.lm_head_argmax_generated_q6_k_q8_1_fallbacks,
                         cuda_stats.lm_head_argmax_fallbacks,
                     },
                 );
@@ -1803,7 +1815,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_q4_0_generated_counts: mmv_hits={d} mmv_fallbacks={d} mm_hits={d} mm_fallbacks={d} pair_hits={d} pair_fallbacks={d} pair_q8_hits={d} pair_q8_fallbacks={d} down_q8_hits={d} down_q8_fallbacks={d}\n",
+                    "cuda_q4_0_generated_counts: mmv_hits={d} mmv_fallbacks={d} mm_hits={d} mm_fallbacks={d} pair_hits={d} pair_fallbacks={d} pair_q8_hits={d} pair_q8_fallbacks={d} down_q8_hits={d} down_q8_fallbacks={d} e2b_pair_q8_hits={d} e2b_pair_q8_fallbacks={d} e2b_down_q8_hits={d} e2b_down_q8_fallbacks={d} e2b_exact_pair_f32_hits={d} e2b_exact_pair_f32_fallbacks={d} e2b_exact_down_f32_hits={d} e2b_exact_down_f32_fallbacks={d} catalog_resolve_attempts={d} catalog_resolve_misses={d} catalog_hits={d} catalog_fallbacks={d}\n",
                     .{
                         cuda_stats.q4_0_generated_mmv_hits,
                         cuda_stats.q4_0_generated_mmv_fallbacks,
@@ -1815,6 +1827,18 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         cuda_stats.q4_0_generated_pair_q8_fallbacks,
                         cuda_stats.q4_0_generated_down_q8_hits,
                         cuda_stats.q4_0_generated_down_q8_fallbacks,
+                        cuda_stats.q4_0_generated_e2b_pair_q8_hits,
+                        cuda_stats.q4_0_generated_e2b_pair_q8_fallbacks,
+                        cuda_stats.q4_0_generated_e2b_down_q8_hits,
+                        cuda_stats.q4_0_generated_e2b_down_q8_fallbacks,
+                        cuda_stats.q4_0_generated_e2b_exact_pair_f32_hits,
+                        cuda_stats.q4_0_generated_e2b_exact_pair_f32_fallbacks,
+                        cuda_stats.q4_0_generated_e2b_exact_down_f32_hits,
+                        cuda_stats.q4_0_generated_e2b_exact_down_f32_fallbacks,
+                        cuda_stats.generated_kernel_catalog_resolve_attempts,
+                        cuda_stats.generated_kernel_catalog_resolve_misses,
+                        cuda_stats.generated_kernel_catalog_hits,
+                        cuda_stats.generated_kernel_catalog_fallbacks,
                     },
                 );
                 print(
@@ -2513,9 +2537,25 @@ fn cudaStatsCompactJson(
         \\"decode_profile_graph_replay_us":{d},
         \\"lm_head_argmax_fused_q8":{d},
         \\"lm_head_argmax_fused_q4_0":{d},
+        \\"lm_head_argmax_fused_q4_0_q8_1":{d},
+        \\"lm_head_argmax_q4_0_q8_1_fallbacks":{d},
         \\"lm_head_argmax_fused_q4":{d},
         \\"lm_head_argmax_fused_q6":{d},
+        \\"lm_head_argmax_generated_q6_k_q8_1_hits":{d},
+        \\"lm_head_argmax_generated_q6_k_q8_1_fallbacks":{d},
         \\"lm_head_argmax_fallbacks":{d},
+        \\"q4_0_generated_e2b_pair_q8_hits":{d},
+        \\"q4_0_generated_e2b_pair_q8_fallbacks":{d},
+        \\"q4_0_generated_e2b_down_q8_hits":{d},
+        \\"q4_0_generated_e2b_down_q8_fallbacks":{d},
+        \\"q4_0_generated_e2b_exact_pair_f32_hits":{d},
+        \\"q4_0_generated_e2b_exact_pair_f32_fallbacks":{d},
+        \\"q4_0_generated_e2b_exact_down_f32_hits":{d},
+        \\"q4_0_generated_e2b_exact_down_f32_fallbacks":{d},
+        \\"generated_kernel_catalog_resolve_attempts":{d},
+        \\"generated_kernel_catalog_resolve_misses":{d},
+        \\"generated_kernel_catalog_hits":{d},
+        \\"generated_kernel_catalog_fallbacks":{d},
         \\
     ,
         .{
@@ -2531,9 +2571,25 @@ fn cudaStatsCompactJson(
             stats.decode_profile_graph_replay_us,
             stats.lm_head_argmax_fused_q8,
             stats.lm_head_argmax_fused_q4_0,
+            stats.lm_head_argmax_fused_q4_0_q8_1,
+            stats.lm_head_argmax_q4_0_q8_1_fallbacks,
             stats.lm_head_argmax_fused_q4,
             stats.lm_head_argmax_fused_q6,
+            stats.lm_head_argmax_generated_q6_k_q8_1_hits,
+            stats.lm_head_argmax_generated_q6_k_q8_1_fallbacks,
             stats.lm_head_argmax_fallbacks,
+            stats.q4_0_generated_e2b_pair_q8_hits,
+            stats.q4_0_generated_e2b_pair_q8_fallbacks,
+            stats.q4_0_generated_e2b_down_q8_hits,
+            stats.q4_0_generated_e2b_down_q8_fallbacks,
+            stats.q4_0_generated_e2b_exact_pair_f32_hits,
+            stats.q4_0_generated_e2b_exact_pair_f32_fallbacks,
+            stats.q4_0_generated_e2b_exact_down_f32_hits,
+            stats.q4_0_generated_e2b_exact_down_f32_fallbacks,
+            stats.generated_kernel_catalog_resolve_attempts,
+            stats.generated_kernel_catalog_resolve_misses,
+            stats.generated_kernel_catalog_hits,
+            stats.generated_kernel_catalog_fallbacks,
         },
     );
     try appendFmt(
@@ -2649,6 +2705,33 @@ fn cudaStatsCompactJson(
         },
     );
     return try out.toOwnedSlice(allocator);
+}
+
+test "compact CUDA stats serialize generated catalog and legacy FFN counters" {
+    if (build_options.enable_cuda) {
+        var stats = session_factory.CudaRuntimeStats{};
+        stats.q4_0_generated_e2b_pair_q8_hits = 11;
+        stats.q4_0_generated_e2b_pair_q8_fallbacks = 12;
+        stats.q4_0_generated_e2b_down_q8_hits = 13;
+        stats.q4_0_generated_e2b_down_q8_fallbacks = 14;
+        stats.generated_kernel_catalog_resolve_attempts = 15;
+        stats.generated_kernel_catalog_resolve_misses = 16;
+        stats.generated_kernel_catalog_hits = 17;
+        stats.generated_kernel_catalog_fallbacks = 18;
+        const json = try cudaStatsCompactJson(std.testing.allocator, stats, 1);
+        defer std.testing.allocator.free(json);
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"q4_0_generated_e2b_pair_q8_hits\":11"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"q4_0_generated_e2b_pair_q8_fallbacks\":12"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"q4_0_generated_e2b_down_q8_hits\":13"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"q4_0_generated_e2b_down_q8_fallbacks\":14"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"generated_kernel_catalog_resolve_attempts\":15"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"generated_kernel_catalog_resolve_misses\":16"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"generated_kernel_catalog_hits\":17"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"generated_kernel_catalog_fallbacks\":18"));
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .object);
+    }
 }
 
 fn metalStatsCompactJson(
@@ -3397,6 +3480,8 @@ fn writeJsonTiming(
                 \\"launch_rope":{d},
                 \\"launch_attention":{d},
                 \\"launch_attention_gqa_decode":{d},
+                \\"launch_attention_gqa_decode_generated":{d},
+                \\"launch_attention_gqa_decode_score_prework":{d},
                 \\"launch_attention_gqa_decode_fast":{d},
                 \\"launch_attention_gqa_decode_fast_fallbacks":{d},
                 \\"launch_attention_gqa_prefill_fast":{d},
@@ -3417,6 +3502,8 @@ fn writeJsonTiming(
                     cuda_stats.launch_rope,
                     cuda_stats.launch_attention,
                     cuda_stats.launch_attention_gqa_decode,
+                    cuda_stats.launch_attention_gqa_decode_generated,
+                    cuda_stats.launch_attention_gqa_decode_score_prework,
                     cuda_stats.launch_attention_gqa_decode_fast,
                     cuda_stats.launch_attention_gqa_decode_fast_fallbacks,
                     cuda_stats.launch_attention_gqa_prefill_fast,
@@ -3560,8 +3647,12 @@ fn writeJsonTiming(
                 &cuda_out,
                 \\"lm_head_argmax_fused_q8":{d},
                 \\"lm_head_argmax_fused_q4_0":{d},
+                \\"lm_head_argmax_fused_q4_0_q8_1":{d},
+                \\"lm_head_argmax_q4_0_q8_1_fallbacks":{d},
                 \\"lm_head_argmax_fused_q4":{d},
                 \\"lm_head_argmax_fused_q6":{d},
+                \\"lm_head_argmax_generated_q6_k_q8_1_hits":{d},
+                \\"lm_head_argmax_generated_q6_k_q8_1_fallbacks":{d},
                 \\"lm_head_argmax_fallbacks":{d},
                 \\"q4k_decode_fast_hits":{d},
                 \\"q4k_decode_fast_fallbacks":{d},
@@ -3575,6 +3666,67 @@ fn writeJsonTiming(
                 \\"q4_0_generated_pair_q8_fallbacks":{d},
                 \\"q4_0_generated_down_q8_hits":{d},
                 \\"q4_0_generated_down_q8_fallbacks":{d},
+                \\"q4_0_generated_e2b_pair_q8_hits":{d},
+                \\"q4_0_generated_e2b_pair_q8_fallbacks":{d},
+                \\"q4_0_generated_e2b_down_q8_hits":{d},
+                \\"q4_0_generated_e2b_down_q8_fallbacks":{d},
+                \\"q4_0_generated_e2b_exact_pair_f32_hits":{d},
+                \\"q4_0_generated_e2b_exact_pair_f32_fallbacks":{d},
+                \\"q4_0_generated_e2b_exact_down_f32_hits":{d},
+                \\"q4_0_generated_e2b_exact_down_f32_fallbacks":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.lm_head_argmax_fused_q8,
+                    cuda_stats.lm_head_argmax_fused_q4_0,
+                    cuda_stats.lm_head_argmax_fused_q4_0_q8_1,
+                    cuda_stats.lm_head_argmax_q4_0_q8_1_fallbacks,
+                    cuda_stats.lm_head_argmax_fused_q4,
+                    cuda_stats.lm_head_argmax_fused_q6,
+                    cuda_stats.lm_head_argmax_generated_q6_k_q8_1_hits,
+                    cuda_stats.lm_head_argmax_generated_q6_k_q8_1_fallbacks,
+                    cuda_stats.lm_head_argmax_fallbacks,
+                    cuda_stats.q4k_decode_fast_hits,
+                    cuda_stats.q4k_decode_fast_fallbacks,
+                    cuda_stats.q4_0_generated_mmv_hits,
+                    cuda_stats.q4_0_generated_mmv_fallbacks,
+                    cuda_stats.q4_0_generated_mm_hits,
+                    cuda_stats.q4_0_generated_mm_fallbacks,
+                    cuda_stats.q4_0_generated_pair_hits,
+                    cuda_stats.q4_0_generated_pair_fallbacks,
+                    cuda_stats.q4_0_generated_pair_q8_hits,
+                    cuda_stats.q4_0_generated_pair_q8_fallbacks,
+                    cuda_stats.q4_0_generated_down_q8_hits,
+                    cuda_stats.q4_0_generated_down_q8_fallbacks,
+                    cuda_stats.q4_0_generated_e2b_pair_q8_hits,
+                    cuda_stats.q4_0_generated_e2b_pair_q8_fallbacks,
+                    cuda_stats.q4_0_generated_e2b_down_q8_hits,
+                    cuda_stats.q4_0_generated_e2b_down_q8_fallbacks,
+                    cuda_stats.q4_0_generated_e2b_exact_pair_f32_hits,
+                    cuda_stats.q4_0_generated_e2b_exact_pair_f32_fallbacks,
+                    cuda_stats.q4_0_generated_e2b_exact_down_f32_hits,
+                    cuda_stats.q4_0_generated_e2b_exact_down_f32_fallbacks,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
+                \\"generated_kernel_catalog_resolve_attempts":{d},
+                \\"generated_kernel_catalog_resolve_misses":{d},
+                \\"generated_kernel_catalog_hits":{d},
+                \\"generated_kernel_catalog_fallbacks":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.generated_kernel_catalog_resolve_attempts,
+                    cuda_stats.generated_kernel_catalog_resolve_misses,
+                    cuda_stats.generated_kernel_catalog_hits,
+                    cuda_stats.generated_kernel_catalog_fallbacks,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
                 \\"bf16_cublaslt_linear_calls":{d},
                 \\"bf16_cublaslt_qkv_calls":{d},
                 \\"bf16_cublaslt_activation_staging_calls":{d},
@@ -3590,23 +3742,6 @@ fn writeJsonTiming(
                 \\
             ,
                 .{
-                    cuda_stats.lm_head_argmax_fused_q8,
-                    cuda_stats.lm_head_argmax_fused_q4_0,
-                    cuda_stats.lm_head_argmax_fused_q4,
-                    cuda_stats.lm_head_argmax_fused_q6,
-                    cuda_stats.lm_head_argmax_fallbacks,
-                    cuda_stats.q4k_decode_fast_hits,
-                    cuda_stats.q4k_decode_fast_fallbacks,
-                    cuda_stats.q4_0_generated_mmv_hits,
-                    cuda_stats.q4_0_generated_mmv_fallbacks,
-                    cuda_stats.q4_0_generated_mm_hits,
-                    cuda_stats.q4_0_generated_mm_fallbacks,
-                    cuda_stats.q4_0_generated_pair_hits,
-                    cuda_stats.q4_0_generated_pair_fallbacks,
-                    cuda_stats.q4_0_generated_pair_q8_hits,
-                    cuda_stats.q4_0_generated_pair_q8_fallbacks,
-                    cuda_stats.q4_0_generated_down_q8_hits,
-                    cuda_stats.q4_0_generated_down_q8_fallbacks,
                     cuda_stats.bf16_cublaslt_linear_calls,
                     cuda_stats.bf16_cublaslt_qkv_calls,
                     cuda_stats.bf16_cublaslt_activation_staging_calls,
@@ -4047,6 +4182,8 @@ fn writeJsonTiming(
                 \\"launch_norm_head_rope":{d},
                 \\"launch_attention":{d},
                 \\"launch_attention_gqa_decode":{d},
+                \\"launch_attention_gqa_decode_generated":{d},
+                \\"launch_attention_gqa_decode_score_prework":{d},
                 \\"launch_attention_gqa_decode_fast":{d},
                 \\"launch_attention_gqa_decode_fast_fallbacks":{d},
                 \\"launch_attention_gqa_prefill_fast":{d},
@@ -4057,15 +4194,6 @@ fn writeJsonTiming(
                 \\"launch_elementwise":{d},
                 \\"launch_scalar":{d},
                 \\"launch_argmax":{d},
-                \\"lm_head_argmax_fused_q8":{d},
-                \\"lm_head_argmax_fused_q4_0":{d},
-                \\"lm_head_argmax_fused_q4":{d},
-                \\"lm_head_argmax_fused_q6":{d},
-                \\"lm_head_argmax_fallbacks":{d},
-                \\"mtp_verify_commit_device_hits":{d},
-                \\"mtp_verify_commit_device_fallbacks":{d},
-                \\"mtp_verify_commit_result_downloads":{d},
-                \\"mtp_verify_commit_choice_downloads":{d},
                 \\
             ,
                 .{
@@ -4080,6 +4208,8 @@ fn writeJsonTiming(
                     cuda_stats.launch_norm_head_rope,
                     cuda_stats.launch_attention,
                     cuda_stats.launch_attention_gqa_decode,
+                    cuda_stats.launch_attention_gqa_decode_generated,
+                    cuda_stats.launch_attention_gqa_decode_score_prework,
                     cuda_stats.launch_attention_gqa_decode_fast,
                     cuda_stats.launch_attention_gqa_decode_fast_fallbacks,
                     cuda_stats.launch_attention_gqa_prefill_fast,
@@ -4090,10 +4220,35 @@ fn writeJsonTiming(
                     cuda_stats.launch_elementwise,
                     cuda_stats.launch_scalar,
                     cuda_stats.launch_argmax,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
+                \\"lm_head_argmax_fused_q8":{d},
+                \\"lm_head_argmax_fused_q4_0":{d},
+                \\"lm_head_argmax_fused_q4_0_q8_1":{d},
+                \\"lm_head_argmax_q4_0_q8_1_fallbacks":{d},
+                \\"lm_head_argmax_fused_q4":{d},
+                \\"lm_head_argmax_fused_q6":{d},
+                \\"lm_head_argmax_generated_q6_k_q8_1_hits":{d},
+                \\"lm_head_argmax_generated_q6_k_q8_1_fallbacks":{d},
+                \\"lm_head_argmax_fallbacks":{d},
+                \\"mtp_verify_commit_device_hits":{d},
+                \\"mtp_verify_commit_device_fallbacks":{d},
+                \\"mtp_verify_commit_result_downloads":{d},
+                \\"mtp_verify_commit_choice_downloads":{d},
+                \\
+            ,
+                .{
                     cuda_stats.lm_head_argmax_fused_q8,
                     cuda_stats.lm_head_argmax_fused_q4_0,
+                    cuda_stats.lm_head_argmax_fused_q4_0_q8_1,
+                    cuda_stats.lm_head_argmax_q4_0_q8_1_fallbacks,
                     cuda_stats.lm_head_argmax_fused_q4,
                     cuda_stats.lm_head_argmax_fused_q6,
+                    cuda_stats.lm_head_argmax_generated_q6_k_q8_1_hits,
+                    cuda_stats.lm_head_argmax_generated_q6_k_q8_1_fallbacks,
                     cuda_stats.lm_head_argmax_fallbacks,
                     cuda_stats.mtp_verify_commit_device_hits,
                     cuda_stats.mtp_verify_commit_device_fallbacks,
@@ -4409,8 +4564,13 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
         },
     );
     print(
-        "metal_attention_dispatch: paged_1x={d}\n",
-        .{metal_snapshot.provider.metal_runtime_paged_attention_1x_calls},
+        "metal_attention_dispatch: paged_1x={d} generated_decode_1x={d} generated_flash_prefill={d} generated_rms_norm={d}\n",
+        .{
+            metal_snapshot.provider.metal_runtime_paged_attention_1x_calls,
+            metal_snapshot.provider.metal_runtime_generated_attention_decode_1x_calls,
+            metal_snapshot.provider.metal_runtime_generated_attention_flash_prefill_calls,
+            metal_snapshot.provider.metal_runtime_generated_rms_norm_calls,
+        },
     );
     print(
         "metal_q4_0_dispatch: linear_reduce={d} linear_reduce_rows={d}/{d}/{d}/{d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",

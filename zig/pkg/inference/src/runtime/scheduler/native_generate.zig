@@ -49,6 +49,15 @@ pub const Policy = struct {
     /// Default query-token cap for a unified step. Decode items contribute 1
     /// token; prefill items contribute their `query_sequence_len`.
     max_step_query_tokens: usize = 512,
+    /// Backends opt in after heterogeneous position/KV batching passes their
+    /// response-equivalence gate.
+    allow_mixed_sequence_lengths: bool = false,
+    /// Optional rollout cap on the active request set. Above this count the
+    /// coordinator preserves fairness but emits singleton forward steps.
+    max_active_requests_for_batching: ?usize = null,
+    /// Maximum time a singleton decode may wait for an already-admitted peer.
+    /// The wait is skipped when this is the only active request.
+    max_decode_wait_us: u32 = 1_000,
 
     pub fn defaultStepBudget(self: Policy) StepBudget {
         return .{
@@ -90,6 +99,12 @@ pub const Stats = struct {
     step_query_tokens_total: u64 = 0,
     step_singleton_batches_total: u64 = 0,
     step_kv_block_skips_total: u64 = 0,
+    decode_coalesce_waits_total: u64 = 0,
+    decode_coalesce_wait_us_total: u64 = 0,
+    step_batch_size_2_total: u64 = 0,
+    step_batch_size_3_4_total: u64 = 0,
+    step_batch_size_5_8_total: u64 = 0,
+    step_batch_size_9_16_total: u64 = 0,
 };
 
 const Entry = struct {
@@ -169,18 +184,31 @@ pub const NativeGenerateCoordinator = struct {
         return .{ .allocator = allocator };
     }
 
+    fn lockCoordinator(self: *const NativeGenerateCoordinator) void {
+        spinLock(&@constCast(self).mutex);
+    }
+
+    fn unlockCoordinator(self: *const NativeGenerateCoordinator) void {
+        @constCast(self).mutex.unlock();
+    }
+
+    pub fn setPolicy(self: *NativeGenerateCoordinator, policy: Policy) void {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        self.policy = policy;
+    }
+
     pub fn deinit(self: *NativeGenerateCoordinator) void {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         self.entries.deinit(self.allocator);
         self.pending_prefill.deinit(self.allocator);
         self.pending_decode.deinit(self.allocator);
     }
 
     pub fn acquire(self: *NativeGenerateCoordinator, admission: Admission) !Lease {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
-
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         const request_id = self.next_request_id;
         self.next_request_id += 1;
         const reserved_units = @max(admission.requested_units, 1);
@@ -204,9 +232,8 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     pub fn release(self: *NativeGenerateCoordinator, lease: Lease) void {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
-
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         const idx = self.indexOf(lease.request_id) orelse return;
         const entry = self.entries.items[idx];
         self.removePendingPrefillByRequest(lease.request_id);
@@ -233,9 +260,8 @@ pub const NativeGenerateCoordinator = struct {
         kv_position_offset: usize,
         options: PendingWorkOptions,
     ) !void {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
-
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         if (self.findPendingPrefill(work_ptr) != null) return;
         try self.pending_prefill.append(self.allocator, .{
             .request_id = lease.request_id,
@@ -250,8 +276,8 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     pub fn cancelPrefillWork(self: *NativeGenerateCoordinator, work_ptr: *anyopaque) void {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         self.removePendingPrefill(work_ptr);
     }
 
@@ -264,9 +290,8 @@ pub const NativeGenerateCoordinator = struct {
         kv_position_offset: usize,
         options: PendingWorkOptions,
     ) !void {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
-
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         if (self.findPendingDecode(work_ptr) != null) return;
         try self.pending_decode.append(self.allocator, .{
             .request_id = lease.request_id,
@@ -280,14 +305,49 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     pub fn cancelDecodeWork(self: *NativeGenerateCoordinator, work_ptr: *anyopaque) void {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         self.removePendingDecode(work_ptr);
     }
 
     /// Default per-step admission budget derived from the configured policy.
     pub fn defaultStepBudget(self: *const NativeGenerateCoordinator) StepBudget {
-        return self.policy.defaultStepBudget();
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        var budget = self.policy.defaultStepBudget();
+        if (self.policy.max_active_requests_for_batching) |limit| {
+            if (self.entries.items.len > limit) budget.max_items = 1;
+        }
+        return budget;
+    }
+
+    /// Return the configured coalescing delay only when waiting can form a
+    /// useful decode batch. A sole request never pays the latency tax.
+    pub fn decodeCoalesceDelayUs(self: *const NativeGenerateCoordinator, lease: Lease) u32 {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        if (self.policy.max_decode_wait_us == 0 or self.entries.items.len <= 1) return 0;
+        if (self.in_turn != null or self.pending_decode.items.len != 1) return 0;
+        if (self.pending_decode.items[0].request_id != lease.request_id) return 0;
+        return self.policy.max_decode_wait_us;
+    }
+
+    pub fn shouldBatchCurrentRequests(self: *const NativeGenerateCoordinator) bool {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        if (self.entries.items.len <= 1 or self.policy.max_step_items <= 1) return false;
+        if (self.policy.max_active_requests_for_batching) |limit| {
+            if (self.entries.items.len > limit) return false;
+        }
+        return true;
+    }
+
+    pub fn noteDecodeCoalesceWait(self: *NativeGenerateCoordinator, delay_us: u32) void {
+        if (delay_us == 0) return;
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        self.stats.decode_coalesce_waits_total += 1;
+        self.stats.decode_coalesce_wait_us_total += delay_us;
     }
 
     /// Record an estimated KV-block cost for an already-enqueued pending item.
@@ -299,9 +359,8 @@ pub const NativeGenerateCoordinator = struct {
         phase: Phase,
         blocks: usize,
     ) void {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
-
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         switch (phase) {
             .decode => {
                 if (self.findPendingDecode(work_ptr)) |idx| {
@@ -326,9 +385,8 @@ pub const NativeGenerateCoordinator = struct {
         work_ptr: *anyopaque,
         phase: Phase,
     ) ?usize {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
-
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         switch (phase) {
             .decode => {
                 const idx = self.findPendingDecode(work_ptr) orelse return null;
@@ -351,9 +409,8 @@ pub const NativeGenerateCoordinator = struct {
         phase: Phase,
         exclusive: bool,
     ) void {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
-
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         switch (phase) {
             .decode => {
                 if (self.findPendingDecode(work_ptr)) |idx| {
@@ -374,9 +431,8 @@ pub const NativeGenerateCoordinator = struct {
         work_ptr: *anyopaque,
         phase: Phase,
     ) ?bool {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
-
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         switch (phase) {
             .decode => {
                 const idx = self.findPendingDecode(work_ptr) orelse return null;
@@ -407,9 +463,8 @@ pub const NativeGenerateCoordinator = struct {
         budget: StepBudget,
         out: *std.ArrayListUnmanaged(StepItem),
     ) !bool {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
-
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         if (self.in_turn) |owner| {
             if (owner != lease.request_id) return false;
         } else {
@@ -425,6 +480,9 @@ pub const NativeGenerateCoordinator = struct {
         var query_tokens_total: usize = 0;
         var kv_blocks_total: usize = 0;
         var leader_exclusive = false;
+        var leader_total_sequence_len: usize = 0;
+        var leader_kv_sequence_len: usize = 0;
+        var leader_kv_position_offset: usize = 0;
 
         switch (leader_phase) {
             .decode => {
@@ -441,6 +499,9 @@ pub const NativeGenerateCoordinator = struct {
                 query_tokens_total = 1;
                 kv_blocks_total = pending.kv_blocks_estimate;
                 leader_exclusive = pending.exclusive_step;
+                leader_total_sequence_len = pending.total_sequence_len;
+                leader_kv_sequence_len = pending.kv_sequence_len;
+                leader_kv_position_offset = pending.kv_position_offset;
             },
             .prefill => {
                 const leader_idx = self.findPendingPrefill(leader_work_ptr) orelse return false;
@@ -472,6 +533,13 @@ pub const NativeGenerateCoordinator = struct {
             if (out.items.len >= max_items) break;
             if (pending.work_ptr == leader_work_ptr) continue;
             if (pending.exclusive_step) continue;
+            if (!self.policy.allow_mixed_sequence_lengths and
+                (pending.total_sequence_len != leader_total_sequence_len or
+                    pending.kv_sequence_len != leader_kv_sequence_len or
+                    pending.kv_position_offset != leader_kv_position_offset))
+            {
+                continue;
+            }
             const next_query = query_tokens_total + 1;
             if (next_query > max_query_tokens) break;
             if (budget.max_kv_blocks) |limit| {
@@ -538,9 +606,8 @@ pub const NativeGenerateCoordinator = struct {
         lease: *Lease,
         items: []const StepItem,
     ) void {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
-
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         var prefill_count: u64 = 0;
         var decode_count: u64 = 0;
         var query_tokens: u64 = 0;
@@ -563,6 +630,13 @@ pub const NativeGenerateCoordinator = struct {
         self.stats.step_prefill_items_total += prefill_count;
         self.stats.step_decode_items_total += decode_count;
         self.stats.step_query_tokens_total += query_tokens;
+        switch (items.len) {
+            0, 1 => {},
+            2 => self.stats.step_batch_size_2_total += 1,
+            3...4 => self.stats.step_batch_size_3_4_total += 1,
+            5...8 => self.stats.step_batch_size_5_8_total += 1,
+            else => self.stats.step_batch_size_9_16_total += 1,
+        }
         if (prefill_count + decode_count <= 1) {
             self.stats.step_singleton_batches_total += 1;
         }
@@ -578,14 +652,14 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     fn noteTurnYield(self: *NativeGenerateCoordinator) void {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         self.stats.turn_yields_total += 1;
     }
 
     pub fn tryAcquireTurn(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase) bool {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         return self.tryAcquireTurnUnlocked(lease, phase);
     }
 
@@ -604,8 +678,8 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     pub fn finishTurn(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase) void {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         self.finishTurnUnlocked(lease, phase);
     }
 
@@ -627,9 +701,8 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     pub fn notePrefillProgress(self: *NativeGenerateCoordinator, lease: *Lease, processed_tokens: usize, total_prompt_tokens: usize) void {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
-
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         const idx = self.indexOf(lease.request_id) orelse return;
         var entry = &self.entries.items[idx];
         entry.phase = .prefill;
@@ -639,9 +712,8 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     pub fn beginDecode(self: *NativeGenerateCoordinator, lease: *Lease, total_prompt_tokens: usize) void {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
-
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         const idx = self.indexOf(lease.request_id) orelse return;
         var entry = &self.entries.items[idx];
         entry.phase = .decode;
@@ -651,18 +723,17 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     pub fn noteDecodeProgress(self: *NativeGenerateCoordinator, lease: *Lease, generated_tokens: usize) void {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
-
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         const idx = self.indexOf(lease.request_id) orelse return;
         var entry = &self.entries.items[idx];
         entry.phase = .decode;
         entry.generated_tokens = generated_tokens;
     }
 
-    pub fn snapshot(self: *NativeGenerateCoordinator) Snapshot {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
+    pub fn snapshot(self: *const NativeGenerateCoordinator) Snapshot {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         return self.snapshotUnlocked();
     }
 
@@ -685,15 +756,15 @@ pub const NativeGenerateCoordinator = struct {
         };
     }
 
-    pub fn schedulerStats(self: *NativeGenerateCoordinator) Stats {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
+    pub fn schedulerStats(self: *const NativeGenerateCoordinator) Stats {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         return self.stats;
     }
 
-    pub fn recommendPrefillChunkFor(self: *NativeGenerateCoordinator, request_id: RequestId) usize {
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
+    pub fn recommendPrefillChunkFor(self: *const NativeGenerateCoordinator, request_id: RequestId) usize {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
         return self.recommendPrefillChunkForUnlocked(request_id);
     }
 
@@ -774,35 +845,35 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     fn pickPendingDecodeRoundRobin(self: *const NativeGenerateCoordinator, last_granted: ?RequestId) ?RequestId {
-        if (self.pending_decode.items.len == 0) return null;
+        if (self.pending_decode.items.len == 0 or self.entries.items.len == 0) return null;
 
         var start_idx: usize = 0;
         if (last_granted) |last_id| {
-            if (self.findPendingDecodeByRequest(last_id)) |idx| {
-                start_idx = (idx + 1) % self.pending_decode.items.len;
+            if (self.indexOf(last_id)) |idx| {
+                start_idx = (idx + 1) % self.entries.items.len;
             }
         }
 
-        for (0..self.pending_decode.items.len) |offset| {
-            const idx = (start_idx + offset) % self.pending_decode.items.len;
-            return self.pending_decode.items[idx].request_id;
+        for (0..self.entries.items.len) |offset| {
+            const entry = self.entries.items[(start_idx + offset) % self.entries.items.len];
+            if (self.findPendingDecodeByRequest(entry.id) != null) return entry.id;
         }
         return null;
     }
 
     fn pickPendingPrefillRoundRobin(self: *const NativeGenerateCoordinator, last_granted: ?RequestId) ?RequestId {
-        if (self.pending_prefill.items.len == 0) return null;
+        if (self.pending_prefill.items.len == 0 or self.entries.items.len == 0) return null;
 
         var start_idx: usize = 0;
         if (last_granted) |last_id| {
-            if (self.findPendingPrefillByRequest(last_id)) |idx| {
-                start_idx = (idx + 1) % self.pending_prefill.items.len;
+            if (self.indexOf(last_id)) |idx| {
+                start_idx = (idx + 1) % self.entries.items.len;
             }
         }
 
-        for (0..self.pending_prefill.items.len) |offset| {
-            const idx = (start_idx + offset) % self.pending_prefill.items.len;
-            return self.pending_prefill.items[idx].request_id;
+        for (0..self.entries.items.len) |offset| {
+            const entry = self.entries.items[(start_idx + offset) % self.entries.items.len];
+            if (self.findPendingPrefillByRequest(entry.id) != null) return entry.id;
         }
         return null;
     }
@@ -901,6 +972,12 @@ pub fn aggregateStats(models: anytype) struct { snapshot: Snapshot, stats: Stats
         stats.step_query_tokens_total += st.step_query_tokens_total;
         stats.step_singleton_batches_total += st.step_singleton_batches_total;
         stats.step_kv_block_skips_total += st.step_kv_block_skips_total;
+        stats.decode_coalesce_waits_total += st.decode_coalesce_waits_total;
+        stats.decode_coalesce_wait_us_total += st.decode_coalesce_wait_us_total;
+        stats.step_batch_size_2_total += st.step_batch_size_2_total;
+        stats.step_batch_size_3_4_total += st.step_batch_size_3_4_total;
+        stats.step_batch_size_5_8_total += st.step_batch_size_5_8_total;
+        stats.step_batch_size_9_16_total += st.step_batch_size_9_16_total;
     }
 
     return .{ .snapshot = snapshot, .stats = stats };
@@ -1710,4 +1787,144 @@ test "scheduler step batches drain decode-only workload with high density" {
     // turn rotation).
     try std.testing.expectEqual(@as(u64, n_leases * rounds), coordinator.stats.step_decode_items_total);
     try std.testing.expect(coordinator.stats.step_batches_total <= rounds * 2);
+}
+
+test "decode coalescing skips a sole request and records a two-item batch" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+    coordinator.policy.max_decode_wait_us = 1_000;
+
+    var first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 32, .max_tokens = 8 });
+    defer coordinator.release(first);
+    coordinator.beginDecode(&first, 4);
+    var first_work: u8 = 1;
+    try coordinator.enqueueDecodeWork(first, @ptrCast(&first_work), 5, 5, 0, .{});
+    try std.testing.expectEqual(@as(u32, 0), coordinator.decodeCoalesceDelayUs(first));
+
+    var second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 32, .max_tokens = 8 });
+    defer coordinator.release(second);
+    coordinator.beginDecode(&second, 4);
+    try std.testing.expectEqual(@as(u32, 1_000), coordinator.decodeCoalesceDelayUs(first));
+    coordinator.noteDecodeCoalesceWait(1_000);
+
+    var second_work: u8 = 2;
+    try coordinator.enqueueDecodeWork(second, @ptrCast(&second_work), 5, 5, 0, .{});
+    try std.testing.expectEqual(@as(u32, 0), coordinator.decodeCoalesceDelayUs(first));
+
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(allocator);
+    try std.testing.expect(try coordinator.claimStep(
+        allocator,
+        &first,
+        @ptrCast(&first_work),
+        .decode,
+        coordinator.defaultStepBudget(),
+        &step,
+    ));
+    try std.testing.expectEqual(@as(usize, 2), step.items.len);
+    coordinator.completeStep(&first, step.items);
+    try std.testing.expectEqual(@as(u64, 1), coordinator.stats.decode_coalesce_waits_total);
+    try std.testing.expectEqual(@as(u64, 1_000), coordinator.stats.decode_coalesce_wait_us_total);
+    try std.testing.expectEqual(@as(u64, 1), coordinator.stats.step_batch_size_2_total);
+}
+
+test "coordinator serializes concurrent acquire and release" {
+    const Worker = struct {
+        fn run(coordinator: *NativeGenerateCoordinator) void {
+            for (0..128) |_| {
+                const lease = coordinator.acquire(.{
+                    .requested_units = 1,
+                    .prompt_bytes = 32,
+                    .max_tokens = 8,
+                }) catch @panic("coordinator acquire failed");
+                coordinator.release(lease);
+            }
+        }
+    };
+
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{&coordinator});
+    }
+    for (&threads) |*thread| thread.join();
+
+    const state = coordinator.snapshot();
+    try std.testing.expectEqual(@as(usize, 0), state.active_units);
+    try std.testing.expectEqual(@as(usize, 0), state.waiting_requests);
+    try std.testing.expectEqual(@as(RequestId, 513), coordinator.next_request_id);
+}
+
+test "active request rollout cap forces singleton budgets" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{
+        .max_step_items = 8,
+        .max_active_requests_for_batching = 2,
+    });
+
+    const first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    defer coordinator.release(first);
+    const second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    defer coordinator.release(second);
+    try std.testing.expectEqual(@as(usize, 8), coordinator.defaultStepBudget().max_items);
+
+    const third = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    defer coordinator.release(third);
+    try std.testing.expectEqual(@as(usize, 1), coordinator.defaultStepBudget().max_items);
+}
+
+test "rollout cap singleton turns rotate across stable request order" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{
+        .max_step_items = 8,
+        .max_active_requests_for_batching = 2,
+    });
+
+    var leases = [_]Lease{
+        try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 }),
+        try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 }),
+        try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 }),
+    };
+    defer for (leases) |lease| coordinator.release(lease);
+    for (&leases) |*lease| coordinator.beginDecode(lease, 4);
+
+    var work: [6]u8 = undefined;
+    for (0..3) |idx| {
+        work[idx] = @intCast(idx);
+        try coordinator.enqueueDecodeWork(leases[idx], @ptrCast(&work[idx]), 5, 5, 0, .{});
+    }
+
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(allocator);
+    for (0..6) |turn| {
+        const lease_idx = turn % leases.len;
+        try std.testing.expect(try coordinator.claimStep(
+            allocator,
+            &leases[lease_idx],
+            @ptrCast(&work[turn]),
+            .decode,
+            coordinator.defaultStepBudget(),
+            &step,
+        ));
+        try std.testing.expectEqual(@as(usize, 1), step.items.len);
+        try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&work[turn])), step.items[0].work_ptr);
+        coordinator.completeStep(&leases[lease_idx], step.items);
+
+        if (turn < leases.len) {
+            work[turn + leases.len] = @intCast(turn + leases.len);
+            try coordinator.enqueueDecodeWork(
+                leases[lease_idx],
+                @ptrCast(&work[turn + leases.len]),
+                6,
+                6,
+                0,
+                .{},
+            );
+        }
+    }
 }

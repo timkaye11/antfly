@@ -771,18 +771,19 @@ fn buildMicrokernelRuntimeChecks() [microkernel_runtime_check_count]CheckCase {
 }
 
 fn microkernelRuntimeCheck(comptime artifact: quant_kernel_compiler.GeneratedArtifact, comptime shape: RmsNormShape) CheckCase {
+    const op = artifact.microkernelOp() orelse @compileError("expected a generated microkernel artifact");
     return .{
         .name = std.fmt.comptimePrint("{s}_n{d}_d{d}", .{ artifact.kernel_id, shape.n, shape.d }),
         .source = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse @compileError("missing generated microkernel source"),
         .kernel_name = artifact.kernel_id,
-        .format = artifact.format,
-        .epilogue = artifact.epilogue,
-        .op_kind = artifact.op_kind,
+        .format = .f32,
+        .epilogue = .none,
+        .op_kind = artifact.opKind(),
         // rows=n, in_dim=out_dim=d so input/output are both n*d and the weight is d.
         .rows = shape.n,
         .in_dim = shape.d,
         .out_dim = shape.d,
-        .threads_per_threadgroup = @intCast(quant_kernel_compiler.first_rms_norm_metal_schedule.threads_per_threadgroup),
+        .threads_per_threadgroup = @intCast(op.schedule.threads_per_threadgroup),
         .cols_per_threadgroup = 1,
         // f32 RMSNorm: near bit-exact vs the CPU oracle; the only divergence is
         // GPU tree-reduction vs CPU sequential summation order. Measured on-device
@@ -933,8 +934,8 @@ const attention_runtime_checks = buildAttentionRuntimeChecks();
 /// / decode shmem. The flash-prefill route (different grid / 128 threads / shmem)
 /// has its own oracle + runner, so it is excluded here.
 fn isDecodeAttentionArtifact(comptime artifact: quant_kernel_compiler.GeneratedArtifact) bool {
-    return artifact.backend == .metal and artifact.op_kind == .attention and
-        std.mem.eql(u8, artifact.kernel_id, quant_kernel_compiler.first_decode_attention_1x_metal_kernel_id);
+    const op = artifact.attentionOp() orelse return false;
+    return artifact.backend == .metal and op.kind == .decode_1x;
 }
 
 fn attentionRuntimeCheckCount() comptime_int {
@@ -959,11 +960,12 @@ fn buildAttentionRuntimeChecks() [attention_runtime_check_count]AttentionCheckCa
 }
 
 fn attentionRuntimeCheck(comptime artifact: quant_kernel_compiler.GeneratedArtifact, comptime shape: AttentionShape) AttentionCheckCase {
+    const op = artifact.attentionOp() orelse @compileError("expected a generated attention artifact");
     return .{
         .name = std.fmt.comptimePrint("{s}_kv{d}_h{d}_kvh{d}_hd{d}_sw{d}", .{ artifact.kernel_id, shape.kv_tokens, shape.num_heads, shape.num_kv_heads, shape.head_dim, shape.sliding_window }),
         .source = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse @compileError("missing generated attention source"),
         .kernel_name = artifact.kernel_id,
-        .threads_per_threadgroup = @intCast(quant_kernel_compiler.first_decode_attention_1x_metal_schedule.threads_per_threadgroup),
+        .threads_per_threadgroup = @intCast(op.schedule.threads_per_threadgroup),
         // f16 KV + f32 accumulation: kernel and oracle read the same half values,
         // so only GPU tree-reduction vs sequential summation order differs. This
         // is a loose sanity gate (the model-token gate is the real one); 2e-2 abs
@@ -1036,7 +1038,7 @@ fn referenceGqaAttention1x(
 
         var sum: f32 = 0;
         for (0..kv) |ki| {
-            var e = @exp(scores[ki] - best);
+            var e: f32 = if (best > -3.0e+38 and scores[ki] > -3.0e+38) @exp(scores[ki] - best) else 0;
             if (!std.math.isFinite(e)) e = 0;
             scores[ki] = e;
             sum += e;
@@ -1194,8 +1196,8 @@ const flash_prefill_check_count = flashPrefillRuntimeCheckCount();
 const flash_prefill_checks = buildFlashPrefillRuntimeChecks();
 
 fn isFlashPrefillArtifact(comptime artifact: quant_kernel_compiler.GeneratedArtifact) bool {
-    return artifact.backend == .metal and artifact.op_kind == .attention and
-        std.mem.eql(u8, artifact.kernel_id, quant_kernel_compiler.first_prefill_flash_metal_kernel_id);
+    const op = artifact.attentionOp() orelse return false;
+    return artifact.backend == .metal and op.kind == .prefill_flash;
 }
 
 fn flashPrefillRuntimeCheckCount() comptime_int {
@@ -1220,11 +1222,12 @@ fn buildFlashPrefillRuntimeChecks() [flash_prefill_check_count]FlashPrefillCheck
 }
 
 fn flashPrefillRuntimeCheck(comptime artifact: quant_kernel_compiler.GeneratedArtifact, comptime shape: FlashPrefillShape) FlashPrefillCheckCase {
+    const op = artifact.attentionOp() orelse @compileError("expected a generated flash-prefill artifact");
     return .{
         .name = std.fmt.comptimePrint("{s}_q{d}_kv{d}_h{d}_kvh{d}_hd{d}_sw{d}", .{ artifact.kernel_id, shape.q_len, shape.kv_tokens, shape.num_heads, shape.num_kv_heads, shape.head_dim, shape.sliding_window }),
         .source = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse @compileError("missing generated flash prefill source"),
         .kernel_name = artifact.kernel_id,
-        .key_chunk = @intCast(quant_kernel_compiler.first_prefill_flash_metal_schedule.key_chunk),
+        .key_chunk = @intCast(op.schedule.key_chunk),
         // Loose sanity bound: the flash online softmax rounds Q and the P weights
         // through f16 and accumulates in a different order than the f32 reference,
         // so the divergence on O(0.3) outputs runs a few 1e-2. 5e-2 keeps a wide
@@ -1400,7 +1403,7 @@ fn runFlashPrefillCheck(allocator: std.mem.Allocator, check: FlashPrefillCheckCa
 
 fn metalRuntimeCheckCount() comptime_int {
     var count: comptime_int = 0;
-    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+    for (quant_kernel_compiler.first_generated_matmul_artifacts) |artifact| {
         if (artifact.backend == .metal) count += 2;
     }
     return count;
@@ -1409,7 +1412,7 @@ fn metalRuntimeCheckCount() comptime_int {
 fn buildMetalRuntimeChecks() [metal_runtime_check_count]CheckCase {
     var checks: [metal_runtime_check_count]CheckCase = undefined;
     var index: usize = 0;
-    inline for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+    inline for (quant_kernel_compiler.first_generated_matmul_artifacts) |artifact| {
         if (artifact.backend == .metal) {
             checks[index] = metalRuntimeCheckForArtifactShape(artifact, .small);
             index += 1;
@@ -1420,7 +1423,7 @@ fn buildMetalRuntimeChecks() [metal_runtime_check_count]CheckCase {
     return checks;
 }
 
-fn metalRuntimeCheckForArtifactShape(comptime artifact: quant_kernel_compiler.GeneratedArtifact, comptime shape: RuntimeCheckShape) CheckCase {
+fn metalRuntimeCheckForArtifactShape(comptime artifact: quant_kernel_compiler.GeneratedMatmulArtifact, comptime shape: RuntimeCheckShape) CheckCase {
     const dims = metalRuntimeDimsForArtifact(artifact, shape);
     return .{
         .name = metalRuntimeCheckName(artifact, shape),
@@ -1437,17 +1440,17 @@ fn metalRuntimeCheckForArtifactShape(comptime artifact: quant_kernel_compiler.Ge
     };
 }
 
-fn metalRuntimeCheckName(comptime artifact: quant_kernel_compiler.GeneratedArtifact, comptime shape: RuntimeCheckShape) []const u8 {
+fn metalRuntimeCheckName(comptime artifact: quant_kernel_compiler.GeneratedMatmulArtifact, comptime shape: RuntimeCheckShape) []const u8 {
     return quant_kernel_compiler.metalBenchmarkCaseName(artifact, shape);
 }
 
-fn metalRuntimeDimsForArtifact(comptime artifact: quant_kernel_compiler.GeneratedArtifact, comptime shape: RuntimeCheckShape) RuntimeCheckDims {
+fn metalRuntimeDimsForArtifact(comptime artifact: quant_kernel_compiler.GeneratedMatmulArtifact, comptime shape: RuntimeCheckShape) RuntimeCheckDims {
     return quant_kernel_compiler.metalBenchmarkDimsForArtifact(artifact, shape);
 }
 
 test "quant kernel metal runtime checks cover generated Metal artifacts" {
     var artifact_count: usize = 0;
-    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+    for (quant_kernel_compiler.first_generated_matmul_artifacts) |artifact| {
         if (artifact.backend != .metal) continue;
         artifact_count += 1;
 
@@ -1484,7 +1487,7 @@ test "quant kernel metal runtime checks cover generated Metal artifacts" {
 
     for (metal_runtime_checks) |check| {
         var found = false;
-        for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+        for (quant_kernel_compiler.first_generated_matmul_artifacts) |artifact| {
             if (artifact.backend != .metal) continue;
             if (!std.mem.eql(u8, artifact.kernel_id, check.kernel_name)) continue;
             found = true;
@@ -5379,7 +5382,7 @@ fn checkEvidenceJson(allocator: std.mem.Allocator, bytes: []const u8, require_pr
         return error.InvalidMetalEvidence;
     }
 
-    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+    for (quant_kernel_compiler.first_generated_matmul_artifacts) |artifact| {
         if (artifact.backend != .metal or artifact.runtime_evidence_command.len == 0) continue;
         if (route_kernel) |kernel| {
             if (!std.mem.eql(u8, artifact.kernel_id, kernel)) continue;
@@ -5542,12 +5545,12 @@ fn expectedProductionRegressionEvidenceCaseCount() usize {
     return count;
 }
 
-fn runtimeRouteArtifactSupported(artifact: quant_kernel_compiler.GeneratedArtifact) bool {
+fn runtimeRouteArtifactSupported(artifact: quant_kernel_compiler.GeneratedMatmulArtifact) bool {
     const check = metalRuntimeCheckForArtifact(artifact) orelse return false;
     return runtimeRouteAllSupported(check);
 }
 
-fn productionMetalRuntimeArtifact(artifact: quant_kernel_compiler.GeneratedArtifact) bool {
+fn productionMetalRuntimeArtifact(artifact: quant_kernel_compiler.GeneratedMatmulArtifact) bool {
     if (artifact.backend != .metal or !quant_kernel_compiler.artifactHasPromotionEvidence(artifact)) return false;
     return metalRuntimeCheckForArtifact(artifact) != null;
 }
@@ -5558,7 +5561,7 @@ fn productionMetalRuntimeCheck(check: CheckCase) bool {
 }
 
 fn productionMetalRuntimeKernel(kernel_id: []const u8) bool {
-    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+    for (quant_kernel_compiler.first_generated_matmul_artifacts) |artifact| {
         if (artifact.backend == .metal and quant_kernel_compiler.artifactHasPromotionEvidence(artifact) and std.mem.eql(u8, artifact.kernel_id, kernel_id)) return true;
     }
     return false;
@@ -5622,7 +5625,7 @@ fn productionEvidenceCaseMatchesCompilerManifest(case_value: std.json.Value, exp
     return true;
 }
 
-fn evidenceCaseMatchesArtifact(allocator: std.mem.Allocator, case_value: std.json.Value, artifact: quant_kernel_compiler.GeneratedArtifact) bool {
+fn evidenceCaseMatchesArtifact(allocator: std.mem.Allocator, case_value: std.json.Value, artifact: quant_kernel_compiler.GeneratedMatmulArtifact) bool {
     if (case_value != .object) return false;
     const backend = jsonString(case_value.object.get("backend")) orelse return false;
     if (!std.mem.eql(u8, backend, @tagName(artifact.backend))) return false;
@@ -5665,7 +5668,7 @@ fn evidenceCaseMatchesArtifact(allocator: std.mem.Allocator, case_value: std.jso
     return std.mem.eql(u8, route_fallback_reason, quant_kernel_compiler.fallbackReasonName(lowering.fallback_reason));
 }
 
-fn metalRuntimeCheckForArtifact(artifact: quant_kernel_compiler.GeneratedArtifact) ?CheckCase {
+fn metalRuntimeCheckForArtifact(artifact: quant_kernel_compiler.GeneratedMatmulArtifact) ?CheckCase {
     for (metal_runtime_checks) |check| {
         if (std.mem.eql(u8, check.kernel_name, artifact.kernel_id) and
             check.format == artifact.format and
@@ -6006,7 +6009,7 @@ fn generatedSourcePathFor(check: CheckCase) []const u8 {
     return artifact.source_path;
 }
 
-fn metalArtifactForCheck(check: CheckCase) ?quant_kernel_compiler.GeneratedArtifact {
+fn metalArtifactForCheck(check: CheckCase) ?quant_kernel_compiler.GeneratedMatmulArtifact {
     const artifact = quant_kernel_compiler.generatedArtifactForCandidate(.metal, check.format, quant_matmul.rowBucket(check.rows), check.epilogue) orelse return null;
     return if (std.mem.eql(u8, artifact.kernel_id, check.kernel_name)) artifact else null;
 }
@@ -6313,7 +6316,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     try std.testing.expectEqual(expected_provider_route_checked, summary.provider_route_checked_count);
     try std.testing.expectEqual(expected_candidate_route_ready, summary.candidate_route_ready_count);
     try std.testing.expectEqual(expected_candidate_benchmark_ready, summary.candidate_benchmark_ready_count);
-    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+    for (quant_kernel_compiler.first_generated_matmul_artifacts) |artifact| {
         if (artifact.backend != .metal) continue;
         const promotion_ready = quant_kernel_compiler.artifactHasPromotionEvidence(artifact);
         const source_path = if (promotion_ready)
@@ -6439,7 +6442,12 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     defer std.testing.allocator.free(stale_slow_fallback_summary);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_slow_fallback_summary, false, true, null));
 
-    const promoted_artifact = quant_kernel_compiler.first_generated_artifacts[1];
+    const promoted_artifact = blk: {
+        for (quant_kernel_compiler.first_generated_matmul_artifacts) |artifact| {
+            if (artifact.backend == .metal and artifact.production_enabled) break :blk artifact;
+        }
+        return error.MissingPromotedMetalArtifact;
+    };
     const cases_value = parsed.value.object.get("cases").?;
     var found_promoted_artifact_case = false;
     for (cases_value.array.items) |case_value| {

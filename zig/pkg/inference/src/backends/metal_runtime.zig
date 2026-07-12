@@ -6571,6 +6571,9 @@ pub const RawRuntimeMemoryStats = extern struct {
     deberta_attention_gemm_calls: u64 = 0,
     deberta_attention_gemm_fallbacks: u64 = 0,
     paged_attention_1x_calls: u64 = 0,
+    generated_attention_decode_1x_calls: u64 = 0,
+    generated_attention_flash_prefill_calls: u64 = 0,
+    generated_rms_norm_calls: u64 = 0,
     compute_encoder_count: u64 = 0,
     blit_encoder_count: u64 = 0,
     last_frame_compute_encoder_count: u64 = 0,
@@ -6666,6 +6669,18 @@ pub const RawRuntimeMemoryStats = extern struct {
     antfly_generated_dispatch_counts: quant_matmul.GeneratedQuantDispatchCounts = quant_matmul.generated_quant_dispatch_counts_zero,
     rms_norm_add_sumsq: u64 = 0,
 };
+
+test "metal generated attention and RMS opt-ins are fail-closed and execution-counted" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "BOOL missing_requested_generated_pipeline"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "missing_requested_generated_pipeline || missing_quant_reduce_pipeline"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "runtime->generated_attention_decode_1x_calls += 1"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "runtime->generated_attention_flash_prefill_calls += 1"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "runtime->generated_rms_norm_calls += 1"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "return termite_metal_encode_rms_norm_generated("));
+}
 
 pub extern fn termite_metal_device_available() c_int;
 
@@ -27397,6 +27412,84 @@ test "metal native decoder runtime activation scratch pool and hidden state" {
     for (handles[0..capacity]) |h| {
         if (h) |ptr| releaseScratch(runtime, ptr);
     }
+}
+
+test "metal donated KV on-frame attention fails closed on unsafe runtime state" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const kv_runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(kv_runtime);
+    defer _ = termite_metal_decode_runtime_reset_state(kv_runtime);
+    const frame_runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(frame_runtime);
+    defer _ = termite_metal_decode_runtime_reset_state(frame_runtime);
+    if (termite_metal_decode_runtime_ready(kv_runtime) == 0 or
+        termite_metal_decode_runtime_ready(frame_runtime) == 0)
+    {
+        return error.SkipZigTest;
+    }
+
+    var q = try testDeviceTensorFromSlice(frame_runtime, &[_]f32{1.0}, &[_]i32{ 1, 1 });
+    defer q.deinit();
+    var output = try MetalTensor.deviceAllocate(frame_runtime, @sizeOf(f32), .private, &[_]i32{ 1, 1 });
+    defer output.deinit();
+    const block_table = [_]u32{0};
+
+    const GuardCall = struct {
+        fn run(
+            owner: *RawMetalDecodeRuntime,
+            frame: *RawMetalDecodeRuntime,
+            query: MetalTensor,
+            out: MetalTensor,
+            blocks: []const u32,
+        ) c_int {
+            return termite_metal_decode_runtime_attention_paged_slot_device_on_frame(
+                owner,
+                frame,
+                0,
+                3,
+                query.deviceHandle(),
+                query.deviceByteOffset(),
+                blocks.ptr,
+                blocks.len,
+                16,
+                1,
+                1,
+                1,
+                1,
+                1,
+                @sizeOf(f16),
+                @sizeOf(f16),
+                0,
+                0,
+                0,
+                0.0,
+                null,
+                0,
+                out.deviceHandle(),
+                out.deviceByteOffset(),
+            );
+        }
+    };
+
+    // The fast path must have a distinct, active caller frame.
+    try std.testing.expectEqual(@as(c_int, -4), GuardCall.run(kv_runtime, frame_runtime, q, output, &block_table));
+    try beginFrame(frame_runtime);
+    try std.testing.expectEqual(@as(c_int, -2), GuardCall.run(frame_runtime, frame_runtime, q, output, &block_table));
+
+    // Never read the owner's KV slot while its queue may still be writing it.
+    try beginFrame(kv_runtime);
+    try std.testing.expectEqual(@as(c_int, -6), GuardCall.run(kv_runtime, frame_runtime, q, output, &block_table));
+    try submitFrame(kv_runtime);
+    try std.testing.expectEqual(@as(c_int, -6), GuardCall.run(kv_runtime, frame_runtime, q, output, &block_table));
+    try waitFrame(kv_runtime);
+
+    // Opening an encoder-per-op beside a persistent planned encoder is unsafe.
+    try beginPlannedComputeScope(frame_runtime, @intFromEnum(ComputeSource.attention), .attention);
+    try std.testing.expectEqual(@as(c_int, -5), GuardCall.run(kv_runtime, frame_runtime, q, output, &block_table));
+    try submitFrame(frame_runtime);
+    try waitFrame(frame_runtime);
 }
 
 test "metal native decoder runtime frame API batches device ops into one command buffer" {

@@ -22,7 +22,9 @@ const cuda_artifact = if (build_options.enable_cuda) @import("../ops/cuda/artifa
     const image = "";
 };
 const native_embed = @import("../native_embed.zig");
+const backend_contracts = @import("../graph/backend_contracts.zig");
 const quant_kernel_compiler = @import("../graph/quant_kernel_compiler.zig");
+const quant_matmul = @import("../graph/quant_matmul.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
 const compat = @import("../io/compat.zig");
 
@@ -82,6 +84,142 @@ const quant_compiler_q4_0_mmv_extra_dims = [_]Shape{
 };
 const quant_compiler_q4_0_max_reference_out_dim: usize = 16384;
 
+const q4_0_q8_1_lm_argmax_e2b_rows: usize = 1;
+const q4_0_q8_1_lm_argmax_e2b_in_dim: usize = 1536;
+const q4_0_q8_1_lm_argmax_e2b_out_dim: usize = 262144;
+const q4_0_q8_1_lm_argmax_tile8: usize = 8;
+const q4_0_q8_1_lm_argmax_stage_threads: usize = 96;
+const q4_0_q8_1_lm_argmax_reduce_threads: usize = 512;
+const q4_0_q8_1_lm_argmax_default_warmups: usize = 20;
+const q4_0_q8_1_lm_argmax_default_iterations: usize = 200;
+const q4_0_q8_1_lm_argmax_default_repeats: usize = 5;
+const q4_0_q8_1_lm_argmax_candidate_symbol = "antfly_q4_0_q8_1_argmax_rows_stage1_tile8_v1";
+
+const q6_k_values_per_block: usize = 256;
+const q6_k_block_bytes: usize = 210;
+const q6_k_q8_1_lm_argmax_rows: usize = 1;
+const q6_k_q8_1_lm_argmax_out_dim: usize = 262144;
+const q6_k_q8_1_lm_argmax_tile8: usize = 8;
+const q6_k_q8_1_lm_argmax_reduce_threads: usize = 512;
+const q6_k_q8_1_lm_argmax_default_warmups: usize = 20;
+const q6_k_q8_1_lm_argmax_default_iterations: usize = 200;
+const q6_k_q8_1_lm_argmax_default_repeats: usize = 5;
+
+const Q6KQ8_1LmArgmaxBaseline = enum {
+    e4b,
+    generic,
+};
+
+const Q6KQ8_1LmArgmaxVariant = struct {
+    in_dim: usize,
+    candidate_symbol: [:0]const u8,
+    candidate_threads: usize,
+    baseline: Q6KQ8_1LmArgmaxBaseline,
+};
+
+const q6_k_q8_1_lm_argmax_variants = [_]Q6KQ8_1LmArgmaxVariant{
+    .{
+        .in_dim = 2560,
+        .candidate_symbol = "antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1",
+        .candidate_threads = 160,
+        .baseline = .e4b,
+    },
+    .{
+        .in_dim = 3840,
+        .candidate_symbol = "antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1",
+        .candidate_threads = 256,
+        .baseline = .generic,
+    },
+};
+
+const q4_0_q8_1_e2b_ffn_rows: usize = 1;
+const q4_0_q8_1_e2b_ffn_hidden_dim: usize = 1536;
+const q4_0_q8_1_e2b_ffn_activation: u32 = @intFromEnum(backend_contracts.DecoderRuntimeActivationKind.gelu_new);
+const q4_0_q8_1_e2b_ffn_pair_threads: usize = 384;
+const q4_0_q8_1_e2b_ffn_production_down_threads: usize = 256;
+const q4_0_q8_1_e2b_ffn_default_warmups: usize = 20;
+const q4_0_q8_1_e2b_ffn_default_iterations: usize = 200;
+const q4_0_q8_1_e2b_ffn_default_repeats: usize = 5;
+const q4_0_q8_1_e2b_ffn_pair_float_tolerance_abs: f32 = 0.001;
+const q4_0_q8_1_e2b_ffn_down_tolerance_abs: f32 = 0.01;
+
+const E2BFfnCandidateSpec = struct {
+    kernel_id: []const u8,
+    source_path: []const u8,
+    artifact_filename: []const u8,
+    threads: usize,
+    production_enabled: bool = false,
+};
+
+const E2BFfnVariant = struct {
+    inner_dim: usize,
+    pair: E2BFfnCandidateSpec,
+    down: E2BFfnCandidateSpec,
+};
+
+const q4_0_q8_1_e2b_ffn_variants = [_]E2BFfnVariant{
+    .{
+        .inner_dim = 6144,
+        .pair = .{
+            .kernel_id = quant_kernel_compiler.first_e2b_cuda_q4_0_pair_q8_6144_kernel_id,
+            .source_path = quant_kernel_compiler.first_e2b_cuda_q4_0_pair_q8_6144_source_path,
+            .artifact_filename = "antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1.sm89.cubin",
+            .threads = q4_0_q8_1_e2b_ffn_pair_threads,
+        },
+        .down = .{
+            .kernel_id = quant_kernel_compiler.first_e2b_cuda_q4_0_down_q8_6144_kernel_id,
+            .source_path = quant_kernel_compiler.first_e2b_cuda_q4_0_down_q8_6144_source_path,
+            .artifact_filename = "antfly_q4_0_down_q8_1_e2b_6144_mmv_v1.sm89.cubin",
+            .threads = 128,
+        },
+    },
+    .{
+        .inner_dim = 12288,
+        .pair = .{
+            .kernel_id = quant_kernel_compiler.first_e2b_cuda_q4_0_pair_q8_12288_kernel_id,
+            .source_path = quant_kernel_compiler.first_e2b_cuda_q4_0_pair_q8_12288_source_path,
+            .artifact_filename = "antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1.sm89.cubin",
+            .threads = q4_0_q8_1_e2b_ffn_pair_threads,
+        },
+        .down = .{
+            .kernel_id = quant_kernel_compiler.first_e2b_cuda_q4_0_down_q8_12288_kernel_id,
+            .source_path = quant_kernel_compiler.first_e2b_cuda_q4_0_down_q8_12288_source_path,
+            .artifact_filename = "antfly_q4_0_down_q8_1_e2b_12288_mmv_v1.sm89.cubin",
+            .threads = 256,
+        },
+    },
+};
+
+const TimingRunSummary = struct {
+    median_ns: u64,
+    mean_ns: f64,
+    stddev_ns: f64,
+    cv_percent: f64,
+};
+
+fn summarizeTimingRuns(runs: []const u64) !TimingRunSummary {
+    if (runs.len == 0 or runs.len > 31) return error.InvalidTimingRuns;
+    var sorted: [31]u64 = undefined;
+    @memcpy(sorted[0..runs.len], runs);
+    std.mem.sort(u64, sorted[0..runs.len], {}, std.sort.asc(u64));
+
+    var sum: f64 = 0;
+    for (runs) |run| sum += @floatFromInt(run);
+    const mean = sum / @as(f64, @floatFromInt(runs.len));
+    var variance_sum: f64 = 0;
+    for (runs) |run| {
+        const delta = @as(f64, @floatFromInt(run)) - mean;
+        variance_sum += delta * delta;
+    }
+    const stddev = @sqrt(variance_sum / @as(f64, @floatFromInt(runs.len)));
+    return .{
+        .median_ns = sorted[runs.len / 2],
+        .mean_ns = mean,
+        .stddev_ns = stddev,
+        .cv_percent = if (mean == 0) 0 else (stddev / mean) * 100.0,
+    };
+}
+
 const QuantCompilerQ4_0Kind = enum { mmv, mm };
 
 const Config = struct {
@@ -91,6 +229,9 @@ const Config = struct {
     text: []const u8 = "a photo of a document with audio metadata",
     full_iters: usize = 1,
     gemma4_shapes: bool = false,
+    q4_0_q8_1_lm_argmax_e2b: bool = false,
+    q6_k_q8_1_lm_argmax: bool = false,
+    q4_0_q8_1_e2b_ffn_sm89_dir: ?[]const u8 = null,
     quant_compiler_lazy_target: bool = false,
     quant_compiler_generated_ptx_path: ?[]const u8 = null,
     quant_compiler_q4_0_mmv_ptx_path: ?[]const u8 = null,
@@ -128,6 +269,23 @@ const BenchModule = if (build_options.enable_cuda) struct {
     linear_q4_0_pair_nobias_f32_tile4_w4: cuda_driver.CUfunction = null,
     linear_q4_0_pair_activation_q8_1_e4b: cuda_driver.CUfunction = null,
     linear_q4_0_q8_1_e4b_down: cuda_driver.CUfunction = null,
+    linear_q4_0_pair_activation_q8_1_f32_tile4: cuda_driver.CUfunction = null,
+    linear_q4_0_q8_1_f32_tile4_w8: cuda_driver.CUfunction = null,
+    quantize_f32_q8_1_rows: cuda_driver.CUfunction = null,
+    linear_q4_0_q8_1_f32_tile4: cuda_driver.CUfunction = null,
+    argmax_last_row_f32: cuda_driver.CUfunction = null,
+    argmax_reduce_rows_pairs_f32_w16: cuda_driver.CUfunction = null,
+    linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b: cuda_driver.CUfunction = null,
+    linear_q6_k_q8_1_argmax_rows_stage1_tile8: cuda_driver.CUfunction = null,
+    linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b: cuda_driver.CUfunction = null,
+    linear_q6_k_q8_1_argmax_generated_k2560: cuda_driver.CUfunction = null,
+    linear_q6_k_q8_1_argmax_generated_k3840: cuda_driver.CUfunction = null,
+
+    fn loadOptional(ctx: *cuda_context.CudaContext, module: cuda_driver.CUmodule, name: [*:0]const u8) cuda_driver.CUfunction {
+        var function: cuda_driver.CUfunction = null;
+        ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&function, module, name)) catch return null;
+        return function;
+    }
 
     fn load(ctx: *cuda_context.CudaContext) cuda_driver.Error!BenchModule {
         try ctx.makeCurrent();
@@ -173,6 +331,23 @@ const BenchModule = if (build_options.enable_cuda) struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_0_pair_activation_q8_1_e4b, module, "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn"));
         var linear_q4_0_q8_1_e4b_down: cuda_driver.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_0_q8_1_e4b_down, module, "termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down"));
+        var linear_q4_0_pair_activation_q8_1_f32_tile4: cuda_driver.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_0_pair_activation_q8_1_f32_tile4, module, "termite_linear_q4_0_pair_activation_q8_1_f32_tile4"));
+        var linear_q4_0_q8_1_f32_tile4_w8: cuda_driver.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_0_q8_1_f32_tile4_w8, module, "termite_linear_q4_0_q8_1_f32_tile4_w8"));
+        var quantize_f32_q8_1_rows: cuda_driver.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&quantize_f32_q8_1_rows, module, "termite_quantize_f32_q8_1_rows"));
+        var linear_q4_0_q8_1_f32_tile4: cuda_driver.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_0_q8_1_f32_tile4, module, "termite_linear_q4_0_q8_1_f32_tile4"));
+        var argmax_last_row_f32: cuda_driver.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&argmax_last_row_f32, module, "termite_argmax_last_row_f32"));
+        var argmax_reduce_rows_pairs_f32_w16: cuda_driver.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&argmax_reduce_rows_pairs_f32_w16, module, "termite_argmax_reduce_rows_pairs_f32_w16"));
+        const linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b = loadOptional(ctx, module, q4_0_q8_1_lm_argmax_candidate_symbol);
+        const linear_q6_k_q8_1_argmax_rows_stage1_tile8 = loadOptional(ctx, module, "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8");
+        const linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b = loadOptional(ctx, module, "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b");
+        const linear_q6_k_q8_1_argmax_generated_k2560 = loadOptional(ctx, module, q6_k_q8_1_lm_argmax_variants[0].candidate_symbol);
+        const linear_q6_k_q8_1_argmax_generated_k3840 = loadOptional(ctx, module, q6_k_q8_1_lm_argmax_variants[1].candidate_symbol);
 
         return .{
             .module = module,
@@ -195,6 +370,17 @@ const BenchModule = if (build_options.enable_cuda) struct {
             .linear_q4_0_pair_nobias_f32_tile4_w4 = linear_q4_0_pair_nobias_f32_tile4_w4,
             .linear_q4_0_pair_activation_q8_1_e4b = linear_q4_0_pair_activation_q8_1_e4b,
             .linear_q4_0_q8_1_e4b_down = linear_q4_0_q8_1_e4b_down,
+            .linear_q4_0_pair_activation_q8_1_f32_tile4 = linear_q4_0_pair_activation_q8_1_f32_tile4,
+            .linear_q4_0_q8_1_f32_tile4_w8 = linear_q4_0_q8_1_f32_tile4_w8,
+            .quantize_f32_q8_1_rows = quantize_f32_q8_1_rows,
+            .linear_q4_0_q8_1_f32_tile4 = linear_q4_0_q8_1_f32_tile4,
+            .argmax_last_row_f32 = argmax_last_row_f32,
+            .argmax_reduce_rows_pairs_f32_w16 = argmax_reduce_rows_pairs_f32_w16,
+            .linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b = linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b,
+            .linear_q6_k_q8_1_argmax_rows_stage1_tile8 = linear_q6_k_q8_1_argmax_rows_stage1_tile8,
+            .linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b = linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b,
+            .linear_q6_k_q8_1_argmax_generated_k2560 = linear_q6_k_q8_1_argmax_generated_k2560,
+            .linear_q6_k_q8_1_argmax_generated_k3840 = linear_q6_k_q8_1_argmax_generated_k3840,
         };
     }
 
@@ -222,6 +408,17 @@ const BenchModule = if (build_options.enable_cuda) struct {
             self.linear_q4_0_pair_nobias_f32_tile4_w4 = null;
             self.linear_q4_0_pair_activation_q8_1_e4b = null;
             self.linear_q4_0_q8_1_e4b_down = null;
+            self.linear_q4_0_pair_activation_q8_1_f32_tile4 = null;
+            self.linear_q4_0_q8_1_f32_tile4_w8 = null;
+            self.quantize_f32_q8_1_rows = null;
+            self.linear_q4_0_q8_1_f32_tile4 = null;
+            self.argmax_last_row_f32 = null;
+            self.argmax_reduce_rows_pairs_f32_w16 = null;
+            self.linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b = null;
+            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8 = null;
+            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b = null;
+            self.linear_q6_k_q8_1_argmax_generated_k2560 = null;
+            self.linear_q6_k_q8_1_argmax_generated_k3840 = null;
         }
     }
 } else struct {};
@@ -252,37 +449,62 @@ fn parseArgs(args: []const []const u8) !Config {
     var cfg = Config{};
     var seen_quant_compiler_lazy_target = false;
     var seen_benchmark_option = false;
+    var seen_warmup_iters = false;
+    var seen_measure_iters = false;
+    var seen_repeat_runs = false;
+    var seen_standard_benchmark_option = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--warmup-iters")) {
             seen_benchmark_option = true;
+            seen_warmup_iters = true;
             i += 1;
             if (i >= args.len) return error.MissingWarmupIters;
             cfg.warmup_iters = try std.fmt.parseInt(usize, args[i], 10);
         } else if (std.mem.eql(u8, arg, "--measure-iters")) {
             seen_benchmark_option = true;
+            seen_measure_iters = true;
             i += 1;
             if (i >= args.len) return error.MissingMeasureIters;
             cfg.measure_iters = try std.fmt.parseInt(usize, args[i], 10);
         } else if (std.mem.eql(u8, arg, "--model")) {
             seen_benchmark_option = true;
+            seen_standard_benchmark_option = true;
             i += 1;
             if (i >= args.len) return error.MissingModelPath;
             cfg.model_path = args[i];
         } else if (std.mem.eql(u8, arg, "--text")) {
             seen_benchmark_option = true;
+            seen_standard_benchmark_option = true;
             i += 1;
             if (i >= args.len) return error.MissingText;
             cfg.text = args[i];
         } else if (std.mem.eql(u8, arg, "--full-iters")) {
             seen_benchmark_option = true;
+            seen_standard_benchmark_option = true;
             i += 1;
             if (i >= args.len) return error.MissingFullIters;
             cfg.full_iters = try std.fmt.parseInt(usize, args[i], 10);
         } else if (std.mem.eql(u8, arg, "--gemma4-shapes")) {
             seen_benchmark_option = true;
+            seen_standard_benchmark_option = true;
             cfg.gemma4_shapes = true;
+        } else if (std.mem.eql(u8, arg, "--q4-0-q8-1-lm-argmax-e2b")) {
+            if (cfg.q4_0_q8_1_lm_argmax_e2b) return error.DuplicateQ4_0Q8_1LmArgmaxE2B;
+            seen_benchmark_option = true;
+            cfg.q4_0_q8_1_lm_argmax_e2b = true;
+        } else if (std.mem.eql(u8, arg, "--q6-k-q8-1-lm-argmax")) {
+            if (cfg.q6_k_q8_1_lm_argmax) return error.DuplicateQ6KQ8_1LmArgmax;
+            seen_benchmark_option = true;
+            cfg.q6_k_q8_1_lm_argmax = true;
+        } else if (std.mem.eql(u8, arg, "--q4-0-q8-1-e2b-ffn-sm89")) {
+            if (cfg.q4_0_q8_1_e2b_ffn_sm89_dir != null) return error.DuplicateQ4_0Q8_1E2BFfnSm89Dir;
+            seen_benchmark_option = true;
+            i += 1;
+            if (i >= args.len) return error.MissingQ4_0Q8_1E2BFfnSm89Dir;
+            if (args[i].len == 0) return error.MissingQ4_0Q8_1E2BFfnSm89Dir;
+            cfg.q4_0_q8_1_e2b_ffn_sm89_dir = args[i];
         } else if (std.mem.eql(u8, arg, "--quant-compiler-lazy-target")) {
             if (seen_quant_compiler_lazy_target) return error.DuplicateQuantCompilerLazyTarget;
             seen_quant_compiler_lazy_target = true;
@@ -339,14 +561,16 @@ fn parseArgs(args: []const []const u8) !Config {
         } else if (std.mem.eql(u8, arg, "--quant-compiler-require-promotion-ready")) {
             if (cfg.quant_compiler_require_promotion_ready) return error.DuplicateQuantCompilerRequirePromotionReady;
             cfg.quant_compiler_require_promotion_ready = true;
-        } else if (std.mem.eql(u8, arg, "--quant-compiler-repeat-runs")) {
-            if (cfg.quant_compiler_repeat_runs != 1) return error.DuplicateQuantCompilerRepeatRuns;
+        } else if (std.mem.eql(u8, arg, "--quant-compiler-repeat-runs") or std.mem.eql(u8, arg, "--repeat-runs")) {
+            if (seen_repeat_runs) return error.DuplicateQuantCompilerRepeatRuns;
+            seen_repeat_runs = true;
             seen_benchmark_option = true;
             i += 1;
             if (i >= args.len) return error.MissingQuantCompilerRepeatRuns;
             cfg.quant_compiler_repeat_runs = try parseQuantCompilerRepeatRuns(args[i]);
         } else if (std.mem.eql(u8, arg, "--json-out")) {
             seen_benchmark_option = true;
+            seen_standard_benchmark_option = true;
             i += 1;
             if (i >= args.len) return error.MissingJsonOutPath;
             cfg.json_out_path = args[i];
@@ -361,11 +585,29 @@ fn parseArgs(args: []const []const u8) !Config {
         if (seen_benchmark_option) return error.QuantCompilerCheckEvidenceConflictsWithBenchmark;
         return cfg;
     }
+    if (cfg.q4_0_q8_1_lm_argmax_e2b) {
+        if (!seen_warmup_iters) cfg.warmup_iters = q4_0_q8_1_lm_argmax_default_warmups;
+        if (!seen_measure_iters) cfg.measure_iters = q4_0_q8_1_lm_argmax_default_iterations;
+        if (!seen_repeat_runs) cfg.quant_compiler_repeat_runs = q4_0_q8_1_lm_argmax_default_repeats;
+    }
+    if (cfg.q6_k_q8_1_lm_argmax) {
+        if (!seen_warmup_iters) cfg.warmup_iters = q6_k_q8_1_lm_argmax_default_warmups;
+        if (!seen_measure_iters) cfg.measure_iters = q6_k_q8_1_lm_argmax_default_iterations;
+        if (!seen_repeat_runs) cfg.quant_compiler_repeat_runs = q6_k_q8_1_lm_argmax_default_repeats;
+    }
+    if (cfg.q4_0_q8_1_e2b_ffn_sm89_dir != null) {
+        if (!seen_warmup_iters) cfg.warmup_iters = q4_0_q8_1_e2b_ffn_default_warmups;
+        if (!seen_measure_iters) cfg.measure_iters = q4_0_q8_1_e2b_ffn_default_iterations;
+        if (!seen_repeat_runs) cfg.quant_compiler_repeat_runs = q4_0_q8_1_e2b_ffn_default_repeats;
+    }
     if (cfg.measure_iters == 0) return error.InvalidArgument;
     if (cfg.full_iters == 0) return error.InvalidArgument;
     if (cfg.quant_compiler_lazy_target and cfg.quant_compiler_generated_ptx_path == null) return error.MissingGeneratedPtxPath;
     if (cfg.quant_compiler_lazy_target and (cfg.quant_compiler_q4_0_mmv_ptx_path != null or cfg.quant_compiler_q4_0_mm_ptx_path != null or cfg.quant_compiler_q4_0_pair_ptx_path != null or cfg.quant_compiler_q4_0_pair_q8_ptx_path != null or cfg.quant_compiler_q4_0_down_q8_ptx_path != null)) return error.QuantCompilerQ4_0ConflictsWithLazyTarget;
     const q4_0_target_count: usize = @as(usize, @intFromBool(cfg.quant_compiler_q4_0_mmv_ptx_path != null)) + @as(usize, @intFromBool(cfg.quant_compiler_q4_0_mm_ptx_path != null)) + @as(usize, @intFromBool(cfg.quant_compiler_q4_0_pair_ptx_path != null)) + @as(usize, @intFromBool(cfg.quant_compiler_q4_0_pair_q8_ptx_path != null)) + @as(usize, @intFromBool(cfg.quant_compiler_q4_0_down_q8_ptx_path != null));
+    if (cfg.q4_0_q8_1_lm_argmax_e2b and (cfg.q6_k_q8_1_lm_argmax or cfg.quant_compiler_lazy_target or q4_0_target_count != 0 or cfg.quant_compiler_evidence_out_path != null or cfg.gemma4_shapes or cfg.model_path != null or cfg.json_out_path != null)) return error.Q4_0Q8_1LmArgmaxE2BConflictsWithOtherBenchmark;
+    if (cfg.q6_k_q8_1_lm_argmax and (cfg.quant_compiler_lazy_target or q4_0_target_count != 0 or cfg.quant_compiler_evidence_out_path != null or seen_standard_benchmark_option or cfg.q4_0_q8_1_e2b_ffn_sm89_dir != null)) return error.Q6KQ8_1LmArgmaxConflictsWithOtherBenchmark;
+    if (cfg.q4_0_q8_1_e2b_ffn_sm89_dir != null and (cfg.q4_0_q8_1_lm_argmax_e2b or cfg.q6_k_q8_1_lm_argmax or cfg.quant_compiler_lazy_target or q4_0_target_count != 0 or cfg.quant_compiler_evidence_out_path != null or seen_standard_benchmark_option)) return error.Q4_0Q8_1E2BFfnSm89ConflictsWithOtherBenchmark;
     if (cfg.quant_compiler_evidence_out_path != null and !cfg.quant_compiler_lazy_target and q4_0_target_count == 0) return error.QuantCompilerEvidenceRequiresLazyTarget;
     if (cfg.quant_compiler_evidence_out_path != null and q4_0_target_count > 1) return error.QuantCompilerEvidenceRequiresSingleQ4_0Target;
     if (cfg.quant_compiler_evidence_out_path != null and (cfg.warmup_iters != 5 or cfg.measure_iters != 50)) return error.QuantCompilerEvidenceRequiresManifestIterations;
@@ -436,11 +678,110 @@ test "cuda microbench quant compiler flags select lazy target" {
     try std.testing.expectError(error.QuantCompilerCheckEvidenceConflictsWithBenchmark, parseArgs(&.{ "--quant-compiler-check-evidence", "/tmp/evidence.json", "--quant-compiler-q4-0-mmv-ptx", "/tmp/mmv.ptx" }));
 }
 
+test "cuda microbench E2B LM argmax mode defaults and gate are exact" {
+    const defaults = try parseArgs(&.{"--q4-0-q8-1-lm-argmax-e2b"});
+    try std.testing.expect(defaults.q4_0_q8_1_lm_argmax_e2b);
+    try std.testing.expectEqual(q4_0_q8_1_lm_argmax_default_warmups, defaults.warmup_iters);
+    try std.testing.expectEqual(q4_0_q8_1_lm_argmax_default_iterations, defaults.measure_iters);
+    try std.testing.expectEqual(q4_0_q8_1_lm_argmax_default_repeats, defaults.quant_compiler_repeat_runs);
+
+    const overridden = try parseArgs(&.{ "--q4-0-q8-1-lm-argmax-e2b", "--warmup-iters", "7", "--measure-iters", "11", "--repeat-runs", "3" });
+    try std.testing.expectEqual(@as(usize, 7), overridden.warmup_iters);
+    try std.testing.expectEqual(@as(usize, 11), overridden.measure_iters);
+    try std.testing.expectEqual(@as(usize, 3), overridden.quant_compiler_repeat_runs);
+    try std.testing.expectError(error.DuplicateQ4_0Q8_1LmArgmaxE2B, parseArgs(&.{ "--q4-0-q8-1-lm-argmax-e2b", "--q4-0-q8-1-lm-argmax-e2b" }));
+    try std.testing.expectError(error.DuplicateQuantCompilerRepeatRuns, parseArgs(&.{ "--q4-0-q8-1-lm-argmax-e2b", "--repeat-runs", "3", "--quant-compiler-repeat-runs", "5" }));
+    try std.testing.expectError(error.Q4_0Q8_1LmArgmaxE2BConflictsWithOtherBenchmark, parseArgs(&.{ "--q4-0-q8-1-lm-argmax-e2b", "--gemma4-shapes" }));
+
+    try validateQ4_0Q8_1LmArgmaxBenchmarkGate(false, false);
+    try validateQ4_0Q8_1LmArgmaxBenchmarkGate(true, true);
+    try std.testing.expectError(error.CudaKernelUnavailable, validateQ4_0Q8_1LmArgmaxBenchmarkGate(true, false));
+}
+
+test "cuda microbench Q6_K Q8_1 LM argmax mode defaults and gate are exact" {
+    const defaults = try parseArgs(&.{"--q6-k-q8-1-lm-argmax"});
+    try std.testing.expect(defaults.q6_k_q8_1_lm_argmax);
+    try std.testing.expectEqual(q6_k_q8_1_lm_argmax_default_warmups, defaults.warmup_iters);
+    try std.testing.expectEqual(q6_k_q8_1_lm_argmax_default_iterations, defaults.measure_iters);
+    try std.testing.expectEqual(q6_k_q8_1_lm_argmax_default_repeats, defaults.quant_compiler_repeat_runs);
+
+    const overridden = try parseArgs(&.{ "--q6-k-q8-1-lm-argmax", "--warmup-iters", "7", "--measure-iters", "11", "--repeat-runs", "3" });
+    try std.testing.expectEqual(@as(usize, 7), overridden.warmup_iters);
+    try std.testing.expectEqual(@as(usize, 11), overridden.measure_iters);
+    try std.testing.expectEqual(@as(usize, 3), overridden.quant_compiler_repeat_runs);
+    try std.testing.expectError(error.DuplicateQ6KQ8_1LmArgmax, parseArgs(&.{ "--q6-k-q8-1-lm-argmax", "--q6-k-q8-1-lm-argmax" }));
+    try std.testing.expectError(error.DuplicateQuantCompilerRepeatRuns, parseArgs(&.{ "--q6-k-q8-1-lm-argmax", "--repeat-runs", "3", "--quant-compiler-repeat-runs", "5" }));
+    try std.testing.expectError(error.Q6KQ8_1LmArgmaxConflictsWithOtherBenchmark, parseArgs(&.{ "--q6-k-q8-1-lm-argmax", "--gemma4-shapes" }));
+
+    for (q6_k_q8_1_lm_argmax_variants) |variant| {
+        try validateQ6KQ8_1LmArgmaxVariant(variant);
+    }
+    try validateQ6KQ8_1LmArgmaxBenchmarkGate(false, false);
+    try validateQ6KQ8_1LmArgmaxBenchmarkGate(true, true);
+    try std.testing.expectError(error.CudaKernelUnavailable, validateQ6KQ8_1LmArgmaxBenchmarkGate(true, false));
+}
+
+test "cuda microbench E2B FFN SM89 mode defaults and gate are exact" {
+    const defaults = try parseArgs(&.{ "--q4-0-q8-1-e2b-ffn-sm89", "/tmp/e2b-sm89" });
+    try std.testing.expectEqualStrings("/tmp/e2b-sm89", defaults.q4_0_q8_1_e2b_ffn_sm89_dir.?);
+    try std.testing.expectEqual(q4_0_q8_1_e2b_ffn_default_warmups, defaults.warmup_iters);
+    try std.testing.expectEqual(q4_0_q8_1_e2b_ffn_default_iterations, defaults.measure_iters);
+    try std.testing.expectEqual(q4_0_q8_1_e2b_ffn_default_repeats, defaults.quant_compiler_repeat_runs);
+
+    const overridden = try parseArgs(&.{ "--q4-0-q8-1-e2b-ffn-sm89", "/tmp/e2b-sm89", "--warmup-iters", "7", "--measure-iters", "11", "--repeat-runs", "3" });
+    try std.testing.expectEqual(@as(usize, 7), overridden.warmup_iters);
+    try std.testing.expectEqual(@as(usize, 11), overridden.measure_iters);
+    try std.testing.expectEqual(@as(usize, 3), overridden.quant_compiler_repeat_runs);
+    try std.testing.expectError(error.MissingQ4_0Q8_1E2BFfnSm89Dir, parseArgs(&.{"--q4-0-q8-1-e2b-ffn-sm89"}));
+    try std.testing.expectError(error.DuplicateQ4_0Q8_1E2BFfnSm89Dir, parseArgs(&.{ "--q4-0-q8-1-e2b-ffn-sm89", "/tmp/a", "--q4-0-q8-1-e2b-ffn-sm89", "/tmp/b" }));
+    try std.testing.expectError(error.Q4_0Q8_1E2BFfnSm89ConflictsWithOtherBenchmark, parseArgs(&.{ "--q4-0-q8-1-e2b-ffn-sm89", "/tmp/a", "--q4-0-q8-1-lm-argmax-e2b" }));
+    try std.testing.expectError(error.Q4_0Q8_1E2BFfnSm89ConflictsWithOtherBenchmark, parseArgs(&.{ "--q4-0-q8-1-e2b-ffn-sm89", "/tmp/a", "--gemma4-shapes" }));
+
+    try validateQ4_0Q8_1E2BFfnSm89Gate(false, 8, 0);
+    try validateQ4_0Q8_1E2BFfnSm89Gate(true, 8, 9);
+    try std.testing.expectError(error.CudaComputeCapabilityMismatch, validateQ4_0Q8_1E2BFfnSm89Gate(true, 9, 0));
+    try std.testing.expectEqual(@as(u32, @intFromEnum(backend_contracts.DecoderRuntimeActivationKind.gelu_new)), q4_0_q8_1_e2b_ffn_activation);
+    try std.testing.expectEqual(@as(usize, 256), q4_0_q8_1_e2b_ffn_production_down_threads);
+
+    for (q4_0_q8_1_e2b_ffn_variants) |variant| {
+        try validateQ4_0Q8_1E2BFfnVariant(variant);
+        try std.testing.expect(!variant.pair.production_enabled);
+        try std.testing.expect(!variant.down.production_enabled);
+    }
+    var invalid_variant = q4_0_q8_1_e2b_ffn_variants[0];
+    invalid_variant.down.threads = 256;
+    try std.testing.expectError(error.InvalidE2BFfnVariant, validateQ4_0Q8_1E2BFfnVariant(invalid_variant));
+}
+
+test "cuda microbench timing summary reports median and CV" {
+    const summary = try summarizeTimingRuns(&.{ 90, 100, 100, 100, 110 });
+    try std.testing.expectEqual(@as(u64, 100), summary.median_ns);
+    try std.testing.expectApproxEqAbs(@as(f64, 100.0), summary.mean_ns, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 6.324555320336759), summary.stddev_ns, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 6.324555320336759), summary.cv_percent, 0.000001);
+    try std.testing.expectError(error.InvalidTimingRuns, summarizeTimingRuns(&.{}));
+}
+
+test "cuda microbench exact byte comparison reports first mismatch" {
+    try std.testing.expectEqual(@as(?usize, null), try firstByteMismatch(&.{ 1, 2, 3 }, &.{ 1, 2, 3 }));
+    try std.testing.expectEqual(@as(?usize, 1), try firstByteMismatch(&.{ 1, 2, 3 }, &.{ 1, 9, 3 }));
+    try std.testing.expectError(error.InvalidArgument, firstByteMismatch(&.{1}, &.{ 1, 2 }));
+}
+
+test "cuda microbench exact byte comparison preserves f32 bit patterns" {
+    const positive_zero = [_]f32{0.0};
+    const negative_zero = [_]f32{@bitCast(@as(u32, 0x80000000))};
+    try std.testing.expect((try firstByteMismatch(std.mem.asBytes(&positive_zero), std.mem.asBytes(&negative_zero))) != null);
+}
+
 fn printUsage() void {
     print(
         \\usage: antfly inference bench-cuda [--warmup-iters N] [--measure-iters N]
         \\                         [--model <clipclap-model-dir>] [--text <prompt>] [--full-iters N]
         \\                         [--gemma4-shapes] [--json-out PATH]
+        \\                         [--q4-0-q8-1-lm-argmax-e2b] [--repeat-runs N]
+        \\                         [--q6-k-q8-1-lm-argmax]
+        \\                         [--q4-0-q8-1-e2b-ffn-sm89 CUBIN_DIR]
         \\                         [--quant-compiler-lazy-target --quant-compiler-generated-ptx PATH]
         \\                         [--quant-compiler-q4-0-mmv-ptx PATH] [--quant-compiler-q4-0-mm-ptx PATH]
         \\                         [--quant-compiler-q4-0-pair-ptx PATH]
@@ -452,6 +793,12 @@ fn printUsage() void {
         \\
         \\Benchmarks CUDA Q4_K linear kernels on CLIP/CLAP-sized shapes.
         \\With --gemma4-shapes, also benchmarks Gemma4 Q8_0/Q4_K decode-sized matmuls.
+        \\With --q4-0-q8-1-lm-argmax-e2b, compares complete E2B Q8_1 LM-head
+        \\chains at 1536->262144. Defaults: 20 warmups, 200 iterations, 5 repeats.
+        \\With --q6-k-q8-1-lm-argmax, compares complete Q6_K x Q8_1 LM-head
+        \\chains at 2560->262144 and 3840->262144. Defaults: 20 warmups, 200 iterations, 5 repeats.
+        \\With --q4-0-q8-1-e2b-ffn-sm89, compares the four unbundled E2B FFN
+        \\SM89 cubins at inner sizes 6144 and 12288. Cubins remain dev-only.
         \\With --quant-compiler-generated-ptx, compares the dev generated Q4_K rows 2..8 bias_gelu
         \\candidate against the checked-in handwritten CUDA baseline and CPU quant reference.
         \\With --quant-compiler-q4-0-mmv-ptx / --quant-compiler-q4-0-mm-ptx, compares the
@@ -467,12 +814,53 @@ fn printUsage() void {
     , .{});
 }
 
+fn validateQ4_0Q8_1LmArgmaxBenchmarkGate(enabled: bool, candidate_available: bool) !void {
+    if (enabled and !candidate_available) return error.CudaKernelUnavailable;
+}
+
+fn validateQ6KQ8_1LmArgmaxBenchmarkGate(enabled: bool, candidate_available: bool) !void {
+    if (enabled and !candidate_available) return error.CudaKernelUnavailable;
+}
+
+fn validateQ4_0Q8_1E2BFfnSm89Gate(enabled: bool, compute_major: i32, compute_minor: i32) !void {
+    if (enabled and (compute_major != 8 or compute_minor != 9)) return error.CudaComputeCapabilityMismatch;
+}
+
 fn runKernelBench(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
     var ctx = try cuda_context.CudaContext.initDefault();
     defer ctx.deinit();
 
     var module = try BenchModule.load(&ctx);
     defer module.unload(&ctx);
+
+    if (cfg.q4_0_q8_1_e2b_ffn_sm89_dir) |cubin_dir| {
+        validateQ4_0Q8_1E2BFfnSm89Gate(true, ctx.info.compute_major, ctx.info.compute_minor) catch |err| {
+            print(
+                "CUDA E2B Q4_0 x Q8_1 FFN SM89 benchmark unavailable: device={s} cc={d}.{d} required=8.9\n",
+                .{ ctx.info.nameSlice(), ctx.info.compute_major, ctx.info.compute_minor },
+            );
+            return err;
+        };
+        try benchQ4_0Q8_1E2BFfnSm89(allocator, io, &ctx, &module, cfg, cubin_dir);
+        return;
+    }
+
+    if (cfg.q4_0_q8_1_lm_argmax_e2b) {
+        validateQ4_0Q8_1LmArgmaxBenchmarkGate(true, module.linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b != null) catch |err| {
+            print(
+                "CUDA E2B Q4_0 x Q8_1 LM argmax benchmark unavailable: missing symbol={s} artifact={s}\n",
+                .{ q4_0_q8_1_lm_argmax_candidate_symbol, cuda_artifact.target },
+            );
+            return err;
+        };
+        try benchQ4_0Q8_1LmArgmaxE2B(allocator, &ctx, &module, cfg);
+        return;
+    }
+
+    if (cfg.q6_k_q8_1_lm_argmax) {
+        try benchQ6KQ8_1LmArgmax(allocator, &ctx, &module, cfg);
+        return;
+    }
 
     if (cfg.quant_compiler_lazy_target) {
         try benchQuantCompilerLazyTarget(allocator, io, &ctx, &module, cfg);
@@ -558,6 +946,620 @@ fn runKernelBench(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
     if (cfg.gemma4_shapes) {
         try runGemma4KernelBench(allocator, io, &ctx, &module, cfg);
     }
+}
+
+fn benchQ4_0Q8_1LmArgmaxE2B(
+    allocator: std.mem.Allocator,
+    ctx: *cuda_context.CudaContext,
+    module: *BenchModule,
+    cfg: Config,
+) !void {
+    const rows = q4_0_q8_1_lm_argmax_e2b_rows;
+    const in_dim = q4_0_q8_1_lm_argmax_e2b_in_dim;
+    const out_dim = q4_0_q8_1_lm_argmax_e2b_out_dim;
+    const row_blocks = in_dim / q4_0_values_per_block;
+    const q8_bytes = try checkedMul(try checkedMul(rows, row_blocks), q8_1_block_bytes);
+    const weight_bytes = try checkedMul(try checkedMul(out_dim, row_blocks), q4_0_block_bytes);
+    const partial_count = try checkedMul(rows, (out_dim + q4_0_q8_1_lm_argmax_tile8 - 1) / q4_0_q8_1_lm_argmax_tile8);
+    const candidate_function = module.linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b orelse return error.CudaKernelUnavailable;
+
+    print(
+        "CUDA E2B Q4_0 x Q8_1 LM argmax: device={s} rows={d} in={d} out={d} warmup={d} measure={d} repeats={d}\n",
+        .{ ctx.info.nameSlice(), rows, in_dim, out_dim, cfg.warmup_iters, cfg.measure_iters, cfg.quant_compiler_repeat_runs },
+    );
+
+    const input_host = try allocator.alloc(f32, rows * in_dim);
+    defer allocator.free(input_host);
+    const weight_host = try allocator.alloc(u8, weight_bytes);
+    defer allocator.free(weight_host);
+    fillInput(input_host);
+    fillQ4_0LmArgmaxWeights(weight_host);
+
+    var input = try cuda_buffer.DeviceBuffer.alloc(ctx, input_host.len * @sizeOf(f32));
+    defer input.free(ctx);
+    var input_q8_1 = try cuda_buffer.DeviceBuffer.alloc(ctx, q8_bytes);
+    defer input_q8_1.free(ctx);
+    var weight = try cuda_buffer.DeviceBuffer.alloc(ctx, weight_bytes);
+    defer weight.free(ctx);
+    var logits = try cuda_buffer.DeviceBuffer.alloc(ctx, out_dim * @sizeOf(f32));
+    defer logits.free(ctx);
+    var baseline_token = try cuda_buffer.DeviceBuffer.alloc(ctx, @sizeOf(u32));
+    defer baseline_token.free(ctx);
+    var candidate_token = try cuda_buffer.DeviceBuffer.alloc(ctx, @sizeOf(u32));
+    defer candidate_token.free(ctx);
+    var partial_values = try cuda_buffer.DeviceBuffer.alloc(ctx, partial_count * @sizeOf(f32));
+    defer partial_values.free(ctx);
+    var partial_indices = try cuda_buffer.DeviceBuffer.alloc(ctx, partial_count * @sizeOf(u32));
+    defer partial_indices.free(ctx);
+
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(input_host));
+    try weight.copyFromHost(ctx, weight_host);
+    try ctx.synchronize();
+
+    try launchQ4_0Q8_1LmArgmaxBaseline(module, ctx, baseline_token, logits, input_q8_1, input, weight, rows, in_dim, out_dim);
+    try launchQ4_0Q8_1LmArgmaxCandidate(candidate_function, module, ctx, candidate_token, partial_values, partial_indices, input_q8_1, input, weight, rows, in_dim, out_dim);
+    try ctx.synchronize();
+    var baseline_token_host: u32 = undefined;
+    var candidate_token_host: u32 = undefined;
+    try baseline_token.copyToHost(ctx, std.mem.asBytes(&baseline_token_host));
+    try candidate_token.copyToHost(ctx, std.mem.asBytes(&candidate_token_host));
+    try ctx.synchronize();
+    if (baseline_token_host != candidate_token_host) {
+        print("CUDA E2B Q4_0 x Q8_1 LM argmax token mismatch: baseline={d} candidate={d}\n", .{ baseline_token_host, candidate_token_host });
+        return error.CudaSmokeMismatch;
+    }
+
+    var baseline_runs: [31]u64 = undefined;
+    var candidate_runs: [31]u64 = undefined;
+    const repeat_runs = cfg.quant_compiler_repeat_runs;
+    for (0..repeat_runs) |run| {
+        if (run % 2 == 0) {
+            baseline_runs[run] = try timeCudaStep(ctx, cfg, launchQ4_0Q8_1LmArgmaxBaseline, .{ module, ctx, baseline_token, logits, input_q8_1, input, weight, rows, in_dim, out_dim });
+            candidate_runs[run] = try timeCudaStep(ctx, cfg, launchQ4_0Q8_1LmArgmaxCandidate, .{ candidate_function, module, ctx, candidate_token, partial_values, partial_indices, input_q8_1, input, weight, rows, in_dim, out_dim });
+        } else {
+            candidate_runs[run] = try timeCudaStep(ctx, cfg, launchQ4_0Q8_1LmArgmaxCandidate, .{ candidate_function, module, ctx, candidate_token, partial_values, partial_indices, input_q8_1, input, weight, rows, in_dim, out_dim });
+            baseline_runs[run] = try timeCudaStep(ctx, cfg, launchQ4_0Q8_1LmArgmaxBaseline, .{ module, ctx, baseline_token, logits, input_q8_1, input, weight, rows, in_dim, out_dim });
+        }
+    }
+    const baseline_summary = try summarizeTimingRuns(baseline_runs[0..repeat_runs]);
+    const candidate_summary = try summarizeTimingRuns(candidate_runs[0..repeat_runs]);
+    print("CUDA E2B Q4_0 x Q8_1 LM argmax runs: baseline_ns={any} candidate_ns={any}\n", .{ baseline_runs[0..repeat_runs], candidate_runs[0..repeat_runs] });
+    print(
+        "CUDA E2B Q4_0 x Q8_1 LM argmax summary: token={d} exact=true baseline_median_ns={d} baseline_mean_ns={d:.3} baseline_stddev_ns={d:.3} baseline_cv_pct={d:.4} candidate_median_ns={d} candidate_mean_ns={d:.3} candidate_stddev_ns={d:.3} candidate_cv_pct={d:.4} speedup={d:.6}\n",
+        .{
+            baseline_token_host,
+            baseline_summary.median_ns,
+            baseline_summary.mean_ns,
+            baseline_summary.stddev_ns,
+            baseline_summary.cv_percent,
+            candidate_summary.median_ns,
+            candidate_summary.mean_ns,
+            candidate_summary.stddev_ns,
+            candidate_summary.cv_percent,
+            speedup(baseline_summary.median_ns, candidate_summary.median_ns),
+        },
+    );
+}
+
+fn q6KQ8_1LmArgmaxCandidateFunction(module: *const BenchModule, variant: Q6KQ8_1LmArgmaxVariant) cuda_driver.CUfunction {
+    return switch (variant.in_dim) {
+        2560 => module.linear_q6_k_q8_1_argmax_generated_k2560,
+        3840 => module.linear_q6_k_q8_1_argmax_generated_k3840,
+        else => null,
+    };
+}
+
+fn q6KQ8_1LmArgmaxBaselineFunction(module: *const BenchModule, variant: Q6KQ8_1LmArgmaxVariant) cuda_driver.CUfunction {
+    return switch (variant.baseline) {
+        .e4b => module.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b,
+        .generic => module.linear_q6_k_q8_1_argmax_rows_stage1_tile8,
+    };
+}
+
+fn q6KQ8_1LmArgmaxBaselineName(variant: Q6KQ8_1LmArgmaxVariant) []const u8 {
+    return switch (variant.baseline) {
+        .e4b => "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b",
+        .generic => "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8",
+    };
+}
+
+fn q6KQ8_1LmArgmaxBaselineThreads(variant: Q6KQ8_1LmArgmaxVariant) usize {
+    return switch (variant.baseline) {
+        .e4b => 160,
+        .generic => 256,
+    };
+}
+
+fn benchQ6KQ8_1LmArgmax(
+    allocator: std.mem.Allocator,
+    ctx: *cuda_context.CudaContext,
+    module: *BenchModule,
+    cfg: Config,
+) !void {
+    for (q6_k_q8_1_lm_argmax_variants) |variant| {
+        try validateQ6KQ8_1LmArgmaxVariant(variant);
+        validateQ6KQ8_1LmArgmaxBenchmarkGate(true, q6KQ8_1LmArgmaxCandidateFunction(module, variant) != null) catch |err| {
+            print(
+                "CUDA Q6_K x Q8_1 LM argmax benchmark unavailable: missing candidate symbol={s} in={d} artifact={s}\n",
+                .{ variant.candidate_symbol, variant.in_dim, cuda_artifact.target },
+            );
+            return err;
+        };
+        if (q6KQ8_1LmArgmaxBaselineFunction(module, variant) == null) {
+            print(
+                "CUDA Q6_K x Q8_1 LM argmax benchmark unavailable: missing baseline stage1={s} in={d} artifact={s}\n",
+                .{ q6KQ8_1LmArgmaxBaselineName(variant), variant.in_dim, cuda_artifact.target },
+            );
+            return error.CudaKernelUnavailable;
+        }
+    }
+
+    print(
+        "CUDA Q6_K x Q8_1 LM argmax: device={s} rows={d} out={d} warmup={d} measure={d} repeats={d}\n",
+        .{ ctx.info.nameSlice(), q6_k_q8_1_lm_argmax_rows, q6_k_q8_1_lm_argmax_out_dim, cfg.warmup_iters, cfg.measure_iters, cfg.quant_compiler_repeat_runs },
+    );
+    for (q6_k_q8_1_lm_argmax_variants) |variant| {
+        const baseline_function = q6KQ8_1LmArgmaxBaselineFunction(module, variant) orelse return error.CudaKernelUnavailable;
+        const candidate_function = q6KQ8_1LmArgmaxCandidateFunction(module, variant) orelse return error.CudaKernelUnavailable;
+        try benchQ6KQ8_1LmArgmaxVariant(allocator, ctx, module, cfg, variant, baseline_function, candidate_function);
+    }
+}
+
+fn benchQ6KQ8_1LmArgmaxVariant(
+    allocator: std.mem.Allocator,
+    ctx: *cuda_context.CudaContext,
+    module: *BenchModule,
+    cfg: Config,
+    variant: Q6KQ8_1LmArgmaxVariant,
+    baseline_function: cuda_driver.CUfunction,
+    candidate_function: cuda_driver.CUfunction,
+) !void {
+    const rows = q6_k_q8_1_lm_argmax_rows;
+    const in_dim = variant.in_dim;
+    const out_dim = q6_k_q8_1_lm_argmax_out_dim;
+    const row_blocks = in_dim / q6_k_values_per_block;
+    const q8_bytes = try checkedMul(try checkedMul(rows, in_dim / q8_1_values_per_block), q8_1_block_bytes);
+    const weight_bytes = try checkedMul(try checkedMul(out_dim, row_blocks), q6_k_block_bytes);
+    const partial_count = try checkedMul(rows, (out_dim + q6_k_q8_1_lm_argmax_tile8 - 1) / q6_k_q8_1_lm_argmax_tile8);
+
+    const input_host = try allocator.alloc(f32, rows * in_dim);
+    defer allocator.free(input_host);
+    const weight_host = try allocator.alloc(u8, weight_bytes);
+    defer allocator.free(weight_host);
+    fillInput(input_host);
+    fillQ6_KLmArgmaxWeights(weight_host);
+
+    var input = try cuda_buffer.DeviceBuffer.alloc(ctx, input_host.len * @sizeOf(f32));
+    defer input.free(ctx);
+    var input_q8_1 = try cuda_buffer.DeviceBuffer.alloc(ctx, q8_bytes);
+    defer input_q8_1.free(ctx);
+    var weight = try cuda_buffer.DeviceBuffer.alloc(ctx, weight_bytes);
+    defer weight.free(ctx);
+    var baseline_token = try cuda_buffer.DeviceBuffer.alloc(ctx, @sizeOf(u32));
+    defer baseline_token.free(ctx);
+    var candidate_token = try cuda_buffer.DeviceBuffer.alloc(ctx, @sizeOf(u32));
+    defer candidate_token.free(ctx);
+    var baseline_partial_values = try cuda_buffer.DeviceBuffer.alloc(ctx, partial_count * @sizeOf(f32));
+    defer baseline_partial_values.free(ctx);
+    var baseline_partial_indices = try cuda_buffer.DeviceBuffer.alloc(ctx, partial_count * @sizeOf(u32));
+    defer baseline_partial_indices.free(ctx);
+    var candidate_partial_values = try cuda_buffer.DeviceBuffer.alloc(ctx, partial_count * @sizeOf(f32));
+    defer candidate_partial_values.free(ctx);
+    var candidate_partial_indices = try cuda_buffer.DeviceBuffer.alloc(ctx, partial_count * @sizeOf(u32));
+    defer candidate_partial_indices.free(ctx);
+    const baseline_partial_values_host = try allocator.alloc(f32, partial_count);
+    defer allocator.free(baseline_partial_values_host);
+    const candidate_partial_values_host = try allocator.alloc(f32, partial_count);
+    defer allocator.free(candidate_partial_values_host);
+    const baseline_partial_indices_host = try allocator.alloc(u32, partial_count);
+    defer allocator.free(baseline_partial_indices_host);
+    const candidate_partial_indices_host = try allocator.alloc(u32, partial_count);
+    defer allocator.free(candidate_partial_indices_host);
+
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(input_host));
+    try weight.copyFromHost(ctx, weight_host);
+    try ctx.synchronize();
+
+    try launchQ6KQ8_1LmArgmaxBaseline(baseline_function, module, ctx, baseline_token, baseline_partial_values, baseline_partial_indices, input_q8_1, input, weight, rows, in_dim, out_dim, q6KQ8_1LmArgmaxBaselineThreads(variant));
+    try launchQ6KQ8_1LmArgmaxCandidate(candidate_function, module, ctx, candidate_token, candidate_partial_values, candidate_partial_indices, input_q8_1, input, weight, rows, in_dim, out_dim, variant.candidate_threads);
+    try ctx.synchronize();
+    var baseline_token_host: u32 = undefined;
+    var candidate_token_host: u32 = undefined;
+    try baseline_token.copyToHost(ctx, std.mem.asBytes(&baseline_token_host));
+    try candidate_token.copyToHost(ctx, std.mem.asBytes(&candidate_token_host));
+    // The reducer only reads these buffers, so their contents are the stage-one outputs.
+    try baseline_partial_values.copyToHost(ctx, std.mem.sliceAsBytes(baseline_partial_values_host));
+    try candidate_partial_values.copyToHost(ctx, std.mem.sliceAsBytes(candidate_partial_values_host));
+    try baseline_partial_indices.copyToHost(ctx, std.mem.sliceAsBytes(baseline_partial_indices_host));
+    try candidate_partial_indices.copyToHost(ctx, std.mem.sliceAsBytes(candidate_partial_indices_host));
+    try ctx.synchronize();
+    if (try firstByteMismatch(std.mem.sliceAsBytes(baseline_partial_indices_host), std.mem.sliceAsBytes(candidate_partial_indices_host))) |byte_index| {
+        const partial_index = byte_index / @sizeOf(u32);
+        print(
+            "CUDA Q6_K x Q8_1 LM argmax stage1 index mismatch: in={d} partial={d} baseline={d} candidate={d}\n",
+            .{ in_dim, partial_index, baseline_partial_indices_host[partial_index], candidate_partial_indices_host[partial_index] },
+        );
+        return error.CudaSmokeMismatch;
+    }
+    if (try firstByteMismatch(std.mem.sliceAsBytes(baseline_partial_values_host), std.mem.sliceAsBytes(candidate_partial_values_host))) |byte_index| {
+        const partial_index = byte_index / @sizeOf(f32);
+        const baseline_bits: u32 = @bitCast(baseline_partial_values_host[partial_index]);
+        const candidate_bits: u32 = @bitCast(candidate_partial_values_host[partial_index]);
+        print(
+            "CUDA Q6_K x Q8_1 LM argmax stage1 value mismatch: in={d} partial={d} baseline_bits=0x{x:0>8} candidate_bits=0x{x:0>8}\n",
+            .{ in_dim, partial_index, baseline_bits, candidate_bits },
+        );
+        return error.CudaSmokeMismatch;
+    }
+    if (baseline_token_host != candidate_token_host) {
+        print(
+            "CUDA Q6_K x Q8_1 LM argmax token mismatch: in={d} baseline={d} candidate={d}\n",
+            .{ in_dim, baseline_token_host, candidate_token_host },
+        );
+        return error.CudaSmokeMismatch;
+    }
+
+    var baseline_runs: [31]u64 = undefined;
+    var candidate_runs: [31]u64 = undefined;
+    const repeat_runs = cfg.quant_compiler_repeat_runs;
+    for (0..repeat_runs) |run| {
+        if (run % 2 == 0) {
+            baseline_runs[run] = try timeCudaStep(ctx, cfg, launchQ6KQ8_1LmArgmaxBaseline, .{ baseline_function, module, ctx, baseline_token, baseline_partial_values, baseline_partial_indices, input_q8_1, input, weight, rows, in_dim, out_dim, q6KQ8_1LmArgmaxBaselineThreads(variant) });
+            candidate_runs[run] = try timeCudaStep(ctx, cfg, launchQ6KQ8_1LmArgmaxCandidate, .{ candidate_function, module, ctx, candidate_token, candidate_partial_values, candidate_partial_indices, input_q8_1, input, weight, rows, in_dim, out_dim, variant.candidate_threads });
+        } else {
+            candidate_runs[run] = try timeCudaStep(ctx, cfg, launchQ6KQ8_1LmArgmaxCandidate, .{ candidate_function, module, ctx, candidate_token, candidate_partial_values, candidate_partial_indices, input_q8_1, input, weight, rows, in_dim, out_dim, variant.candidate_threads });
+            baseline_runs[run] = try timeCudaStep(ctx, cfg, launchQ6KQ8_1LmArgmaxBaseline, .{ baseline_function, module, ctx, baseline_token, baseline_partial_values, baseline_partial_indices, input_q8_1, input, weight, rows, in_dim, out_dim, q6KQ8_1LmArgmaxBaselineThreads(variant) });
+        }
+    }
+    const baseline_summary = try summarizeTimingRuns(baseline_runs[0..repeat_runs]);
+    const candidate_summary = try summarizeTimingRuns(candidate_runs[0..repeat_runs]);
+    print("CUDA Q6_K x Q8_1 LM argmax runs: in={d} baseline_ns={any} candidate_ns={any}\n", .{ in_dim, baseline_runs[0..repeat_runs], candidate_runs[0..repeat_runs] });
+    print(
+        "CUDA Q6_K x Q8_1 LM argmax summary: in={d} baseline={s} candidate={s} token={d} exact=true baseline_median_ns={d} baseline_mean_ns={d:.3} baseline_stddev_ns={d:.3} baseline_cv_pct={d:.4} candidate_median_ns={d} candidate_mean_ns={d:.3} candidate_stddev_ns={d:.3} candidate_cv_pct={d:.4} speedup={d:.6}\n",
+        .{
+            in_dim,
+            q6KQ8_1LmArgmaxBaselineName(variant),
+            variant.candidate_symbol,
+            baseline_token_host,
+            baseline_summary.median_ns,
+            baseline_summary.mean_ns,
+            baseline_summary.stddev_ns,
+            baseline_summary.cv_percent,
+            candidate_summary.median_ns,
+            candidate_summary.mean_ns,
+            candidate_summary.stddev_ns,
+            candidate_summary.cv_percent,
+            speedup(baseline_summary.median_ns, candidate_summary.median_ns),
+        },
+    );
+}
+
+const E2BFfnVariantBenchResult = struct {
+    pair_speedup: f64,
+    down_speedup: f64,
+    chain_speedup: f64,
+};
+
+fn benchQ4_0Q8_1E2BFfnSm89(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ctx: *cuda_context.CudaContext,
+    module: *BenchModule,
+    cfg: Config,
+    cubin_dir: []const u8,
+) !void {
+    print(
+        "CUDA E2B Q4_0 x Q8_1 FFN SM89: device={s} cc={d}.{d} rows=1 hidden={d} activation=gelu_new({d}) warmup={d} measure={d} repeats={d} cubin_dir={s} production=false\n",
+        .{ ctx.info.nameSlice(), ctx.info.compute_major, ctx.info.compute_minor, q4_0_q8_1_e2b_ffn_hidden_dim, q4_0_q8_1_e2b_ffn_activation, cfg.warmup_iters, cfg.measure_iters, cfg.quant_compiler_repeat_runs, cubin_dir },
+    );
+
+    var pair_log_sum: f64 = 0;
+    var down_log_sum: f64 = 0;
+    var chain_log_sum: f64 = 0;
+    var worst_pair_speedup = std.math.inf(f64);
+    var worst_down_speedup = std.math.inf(f64);
+    var worst_chain_speedup = std.math.inf(f64);
+    for (q4_0_q8_1_e2b_ffn_variants) |variant| {
+        try validateQ4_0Q8_1E2BFfnVariant(variant);
+        const result = try benchQ4_0Q8_1E2BFfnSm89Variant(allocator, io, ctx, module, cfg, cubin_dir, variant);
+        pair_log_sum += @log(result.pair_speedup);
+        down_log_sum += @log(result.down_speedup);
+        chain_log_sum += @log(result.chain_speedup);
+        worst_pair_speedup = @min(worst_pair_speedup, result.pair_speedup);
+        worst_down_speedup = @min(worst_down_speedup, result.down_speedup);
+        worst_chain_speedup = @min(worst_chain_speedup, result.chain_speedup);
+    }
+    const variant_count: f64 = @floatFromInt(q4_0_q8_1_e2b_ffn_variants.len);
+    print(
+        "CUDA E2B Q4_0 x Q8_1 FFN SM89 overall: candidates=4 variants=2 production=false correctness=pair_exact+down_tolerance+chain_tolerance pair_geomean_speedup={d:.6} pair_worst_speedup={d:.6} down_geomean_speedup={d:.6} down_worst_speedup={d:.6} chain_geomean_speedup={d:.6} chain_worst_speedup={d:.6}\n",
+        .{
+            @exp(pair_log_sum / variant_count),
+            worst_pair_speedup,
+            @exp(down_log_sum / variant_count),
+            worst_down_speedup,
+            @exp(chain_log_sum / variant_count),
+            worst_chain_speedup,
+        },
+    );
+}
+
+fn loadQ4_0Q8_1E2BFfnSm89Candidate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ctx: *cuda_context.CudaContext,
+    cubin_dir: []const u8,
+    spec: E2BFfnCandidateSpec,
+) !GeneratedCandidateModule {
+    const cubin_path = try std.fs.path.join(allocator, &.{ cubin_dir, spec.artifact_filename });
+    defer allocator.free(cubin_path);
+    const candidate = GeneratedCandidateModule.load(allocator, io, ctx, cubin_path, spec.kernel_id) catch |err| {
+        print(
+            "CUDA E2B FFN SM89 candidate unavailable: kernel={s} cubin={s} error={s}\ncompile: nvcc -cubin -arch=sm_89 {s} -o {s}\n",
+            .{ spec.kernel_id, cubin_path, @errorName(err), spec.source_path, cubin_path },
+        );
+        return error.CudaKernelUnavailable;
+    };
+    print("CUDA E2B FFN SM89 candidate loaded: kernel={s} cubin={s} production={}\n", .{ spec.kernel_id, cubin_path, spec.production_enabled });
+    return candidate;
+}
+
+fn benchQ4_0Q8_1E2BFfnSm89Variant(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ctx: *cuda_context.CudaContext,
+    module: *BenchModule,
+    cfg: Config,
+    cubin_dir: []const u8,
+    variant: E2BFfnVariant,
+) !E2BFfnVariantBenchResult {
+    var pair_candidate = try loadQ4_0Q8_1E2BFfnSm89Candidate(allocator, io, ctx, cubin_dir, variant.pair);
+    defer pair_candidate.unload(ctx);
+    var down_candidate = try loadQ4_0Q8_1E2BFfnSm89Candidate(allocator, io, ctx, cubin_dir, variant.down);
+    defer down_candidate.unload(ctx);
+
+    const rows = q4_0_q8_1_e2b_ffn_rows;
+    const hidden_dim = q4_0_q8_1_e2b_ffn_hidden_dim;
+    const inner_dim = variant.inner_dim;
+    const hidden_blocks = hidden_dim / q8_1_values_per_block;
+    const inner_blocks = inner_dim / q8_1_values_per_block;
+    const hidden_q8_bytes = try checkedMul(try checkedMul(rows, hidden_blocks), q8_1_block_bytes);
+    const inner_q8_bytes = try checkedMul(try checkedMul(rows, inner_blocks), q8_1_block_bytes);
+    const pair_weight_bytes = try checkedMul(try checkedMul(inner_dim, hidden_blocks), q4_0_block_bytes);
+    const down_weight_bytes = try checkedMul(try checkedMul(hidden_dim, inner_blocks), q4_0_block_bytes);
+
+    const hidden_host = try allocator.alloc(f32, rows * hidden_dim);
+    defer allocator.free(hidden_host);
+    const gate_weight_host = try allocator.alloc(u8, pair_weight_bytes);
+    defer allocator.free(gate_weight_host);
+    const up_weight_host = try allocator.alloc(u8, pair_weight_bytes);
+    defer allocator.free(up_weight_host);
+    const down_weight_host = try allocator.alloc(u8, down_weight_bytes);
+    defer allocator.free(down_weight_host);
+    fillInput(hidden_host);
+    fillQ4_0LmArgmaxWeights(gate_weight_host);
+    fillQ4_0WeightsAlt(up_weight_host);
+    fillQ4_0LmArgmaxWeights(down_weight_host);
+
+    var hidden = try cuda_buffer.DeviceBuffer.alloc(ctx, hidden_host.len * @sizeOf(f32));
+    defer hidden.free(ctx);
+    var hidden_q8 = try cuda_buffer.DeviceBuffer.alloc(ctx, hidden_q8_bytes);
+    defer hidden_q8.free(ctx);
+    var gate_weight = try cuda_buffer.DeviceBuffer.alloc(ctx, pair_weight_bytes);
+    defer gate_weight.free(ctx);
+    var up_weight = try cuda_buffer.DeviceBuffer.alloc(ctx, pair_weight_bytes);
+    defer up_weight.free(ctx);
+    var down_weight = try cuda_buffer.DeviceBuffer.alloc(ctx, down_weight_bytes);
+    defer down_weight.free(ctx);
+    var pair_f32 = try cuda_buffer.DeviceBuffer.alloc(ctx, inner_dim * @sizeOf(f32));
+    defer pair_f32.free(ctx);
+    var baseline_pair_q8 = try cuda_buffer.DeviceBuffer.alloc(ctx, inner_q8_bytes);
+    defer baseline_pair_q8.free(ctx);
+    var candidate_pair_q8 = try cuda_buffer.DeviceBuffer.alloc(ctx, inner_q8_bytes);
+    defer candidate_pair_q8.free(ctx);
+    var baseline_down = try cuda_buffer.DeviceBuffer.alloc(ctx, hidden_dim * @sizeOf(f32));
+    defer baseline_down.free(ctx);
+    var candidate_down = try cuda_buffer.DeviceBuffer.alloc(ctx, hidden_dim * @sizeOf(f32));
+    defer candidate_down.free(ctx);
+
+    try hidden.copyFromHost(ctx, std.mem.sliceAsBytes(hidden_host));
+    try gate_weight.copyFromHost(ctx, gate_weight_host);
+    try up_weight.copyFromHost(ctx, up_weight_host);
+    try down_weight.copyFromHost(ctx, down_weight_host);
+    try ctx.synchronize();
+
+    try launchQ4_0Q8_1LmQuantize(module, ctx, hidden_q8, hidden, rows, hidden_dim);
+    try launchQ4_0Q8_1E2BFfnPairBaseline(module, ctx, pair_f32, baseline_pair_q8, hidden_q8, gate_weight, up_weight, rows, hidden_dim, inner_dim);
+    try poisonDeviceBytes(allocator, ctx, candidate_pair_q8, inner_q8_bytes);
+    try launchQ4_0Q8_1E2BFfnPairCandidate(pair_candidate.function, ctx, candidate_pair_q8, hidden_q8, gate_weight, up_weight, variant);
+    try ctx.synchronize();
+
+    const hidden_q8_host = try allocator.alloc(u8, hidden_q8_bytes);
+    defer allocator.free(hidden_q8_host);
+    const baseline_pair_q8_host = try allocator.alloc(u8, inner_q8_bytes);
+    defer allocator.free(baseline_pair_q8_host);
+    const candidate_pair_q8_host = try allocator.alloc(u8, inner_q8_bytes);
+    defer allocator.free(candidate_pair_q8_host);
+    try hidden_q8.copyToHost(ctx, hidden_q8_host);
+    try baseline_pair_q8.copyToHost(ctx, baseline_pair_q8_host);
+    try candidate_pair_q8.copyToHost(ctx, candidate_pair_q8_host);
+    try ctx.synchronize();
+    if (try firstByteMismatch(baseline_pair_q8_host, candidate_pair_q8_host)) |mismatch| {
+        print(
+            "CUDA E2B FFN SM89 exact mismatch: inner={d} stage=pair byte={d} baseline=0x{x:0>2} candidate=0x{x:0>2}\n",
+            .{ inner_dim, mismatch, baseline_pair_q8_host[mismatch], candidate_pair_q8_host[mismatch] },
+        );
+        return error.GeneratedCandidateMismatch;
+    }
+
+    const hidden_dequant = try allocator.alloc(f32, hidden_dim);
+    defer allocator.free(hidden_dequant);
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q8_1 }, hidden_q8_host, hidden_dequant);
+    const gate_ref = try allocator.alloc(f32, inner_dim);
+    defer allocator.free(gate_ref);
+    const up_ref = try allocator.alloc(f32, inner_dim);
+    defer allocator.free(up_ref);
+    try quant_kernel_compiler.referenceMatmulNoBias(allocator, .q4_0, gate_weight_host, hidden_dequant, rows, hidden_dim, inner_dim, gate_ref);
+    try quant_kernel_compiler.referenceMatmulNoBias(allocator, .q4_0, up_weight_host, hidden_dequant, rows, hidden_dim, inner_dim, up_ref);
+    const activated_ref = try allocator.alloc(f32, inner_dim);
+    defer allocator.free(activated_ref);
+    var activated_amax: f32 = 0;
+    for (activated_ref, 0..) |*value, index| {
+        value.* = geluTanhF32(gate_ref[index]) * up_ref[index];
+        activated_amax = @max(activated_amax, @abs(value.*));
+    }
+    const pair_tolerance_abs = activated_amax / 127.0 + q4_0_q8_1_e2b_ffn_pair_float_tolerance_abs;
+    const baseline_pair_dequant = try allocator.alloc(f32, inner_dim);
+    defer allocator.free(baseline_pair_dequant);
+    const candidate_pair_dequant = try allocator.alloc(f32, inner_dim);
+    defer allocator.free(candidate_pair_dequant);
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q8_1 }, baseline_pair_q8_host, baseline_pair_dequant);
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q8_1 }, candidate_pair_q8_host, candidate_pair_dequant);
+    const baseline_pair_cpu_diff = try maxAbsDiffFinite(baseline_pair_dequant, activated_ref);
+    const candidate_pair_cpu_diff = try maxAbsDiffFinite(candidate_pair_dequant, activated_ref);
+    if (baseline_pair_cpu_diff > pair_tolerance_abs) return error.HandwrittenBaselineMismatch;
+    if (candidate_pair_cpu_diff > pair_tolerance_abs) return error.GeneratedCandidateMismatch;
+
+    try launchQ4_0Q8_1E2BFfnDownBaseline(module, ctx, baseline_down, baseline_pair_q8, down_weight, variant);
+    try poisonDeviceOutput(allocator, ctx, candidate_down, hidden_dim);
+    try launchQ4_0Q8_1E2BFfnDownCandidate(down_candidate.function, ctx, candidate_down, baseline_pair_q8, down_weight, variant);
+    try ctx.synchronize();
+    const baseline_down_host = try allocator.alloc(f32, hidden_dim);
+    defer allocator.free(baseline_down_host);
+    const candidate_down_host = try allocator.alloc(f32, hidden_dim);
+    defer allocator.free(candidate_down_host);
+    try baseline_down.copyToHost(ctx, std.mem.sliceAsBytes(baseline_down_host));
+    try candidate_down.copyToHost(ctx, std.mem.sliceAsBytes(candidate_down_host));
+    try ctx.synchronize();
+    const down_exact = (try firstByteMismatch(std.mem.sliceAsBytes(baseline_down_host), std.mem.sliceAsBytes(candidate_down_host))) == null;
+
+    const down_ref = try allocator.alloc(f32, hidden_dim);
+    defer allocator.free(down_ref);
+    try quant_kernel_compiler.referenceMatmulNoBias(allocator, .q4_0, down_weight_host, baseline_pair_dequant, rows, inner_dim, hidden_dim, down_ref);
+    const baseline_down_cpu_diff = try maxAbsDiffFinite(baseline_down_host, down_ref);
+    const candidate_down_cpu_diff = try maxAbsDiffFinite(candidate_down_host, down_ref);
+    const baseline_candidate_down_diff = try maxAbsDiffFinite(baseline_down_host, candidate_down_host);
+    if (baseline_down_cpu_diff > q4_0_q8_1_e2b_ffn_down_tolerance_abs) return error.HandwrittenBaselineMismatch;
+    if (candidate_down_cpu_diff > q4_0_q8_1_e2b_ffn_down_tolerance_abs) return error.GeneratedCandidateMismatch;
+    if (baseline_candidate_down_diff > q4_0_q8_1_e2b_ffn_down_tolerance_abs) return error.GeneratedCandidateMismatch;
+
+    try launchQ4_0Q8_1E2BFfnChainBaseline(module, ctx, baseline_down, pair_f32, baseline_pair_q8, hidden_q8, hidden, gate_weight, up_weight, down_weight, variant);
+    try poisonDeviceBytes(allocator, ctx, candidate_pair_q8, inner_q8_bytes);
+    try poisonDeviceOutput(allocator, ctx, candidate_down, hidden_dim);
+    try launchQ4_0Q8_1E2BFfnChainCandidate(pair_candidate.function, down_candidate.function, module, ctx, candidate_down, candidate_pair_q8, hidden_q8, hidden, gate_weight, up_weight, down_weight, variant);
+    try ctx.synchronize();
+    try baseline_down.copyToHost(ctx, std.mem.sliceAsBytes(baseline_down_host));
+    try candidate_down.copyToHost(ctx, std.mem.sliceAsBytes(candidate_down_host));
+    try ctx.synchronize();
+    const chain_exact = (try firstByteMismatch(std.mem.sliceAsBytes(baseline_down_host), std.mem.sliceAsBytes(candidate_down_host))) == null;
+    const baseline_chain_cpu_diff = try maxAbsDiffFinite(baseline_down_host, down_ref);
+    const candidate_chain_cpu_diff = try maxAbsDiffFinite(candidate_down_host, down_ref);
+    const baseline_candidate_chain_diff = try maxAbsDiffFinite(baseline_down_host, candidate_down_host);
+    if (baseline_chain_cpu_diff > q4_0_q8_1_e2b_ffn_down_tolerance_abs) return error.HandwrittenBaselineMismatch;
+    if (candidate_chain_cpu_diff > q4_0_q8_1_e2b_ffn_down_tolerance_abs) return error.GeneratedCandidateMismatch;
+    if (baseline_candidate_chain_diff > q4_0_q8_1_e2b_ffn_down_tolerance_abs) return error.GeneratedCandidateMismatch;
+
+    print(
+        "CUDA E2B FFN SM89 correctness: inner={d} pair_exact=true pair_tolerance={d:.6} pair_baseline_cpu_max_abs_diff={d:.6} pair_candidate_cpu_max_abs_diff={d:.6} down_exact={} down_tolerance={d:.6} down_baseline_cpu_max_abs_diff={d:.6} down_candidate_cpu_max_abs_diff={d:.6} down_baseline_candidate_max_abs_diff={d:.6} chain_exact={} chain_baseline_cpu_max_abs_diff={d:.6} chain_candidate_cpu_max_abs_diff={d:.6} chain_baseline_candidate_max_abs_diff={d:.6}\n",
+        .{
+            inner_dim,
+            pair_tolerance_abs,
+            baseline_pair_cpu_diff,
+            candidate_pair_cpu_diff,
+            down_exact,
+            q4_0_q8_1_e2b_ffn_down_tolerance_abs,
+            baseline_down_cpu_diff,
+            candidate_down_cpu_diff,
+            baseline_candidate_down_diff,
+            chain_exact,
+            baseline_chain_cpu_diff,
+            candidate_chain_cpu_diff,
+            baseline_candidate_chain_diff,
+        },
+    );
+
+    var pair_baseline_runs: [31]u64 = undefined;
+    var pair_candidate_runs: [31]u64 = undefined;
+    try timeAlternatingCudaSteps(
+        ctx,
+        cfg,
+        launchQ4_0Q8_1E2BFfnPairBaseline,
+        .{ module, ctx, pair_f32, baseline_pair_q8, hidden_q8, gate_weight, up_weight, rows, hidden_dim, inner_dim },
+        launchQ4_0Q8_1E2BFfnPairCandidate,
+        .{ pair_candidate.function, ctx, candidate_pair_q8, hidden_q8, gate_weight, up_weight, variant },
+        pair_baseline_runs[0..cfg.quant_compiler_repeat_runs],
+        pair_candidate_runs[0..cfg.quant_compiler_repeat_runs],
+    );
+    const pair_speedup = try reportQ4_0Q8_1E2BFfnTiming(inner_dim, "pair", "termite_linear_q4_0_pair_activation_q8_1_f32_tile4+termite_quantize_f32_q8_1_rows", variant.pair.kernel_id, true, pair_baseline_runs[0..cfg.quant_compiler_repeat_runs], pair_candidate_runs[0..cfg.quant_compiler_repeat_runs]);
+
+    var down_baseline_runs: [31]u64 = undefined;
+    var down_candidate_runs: [31]u64 = undefined;
+    try timeAlternatingCudaSteps(
+        ctx,
+        cfg,
+        launchQ4_0Q8_1E2BFfnDownBaseline,
+        .{ module, ctx, baseline_down, baseline_pair_q8, down_weight, variant },
+        launchQ4_0Q8_1E2BFfnDownCandidate,
+        .{ down_candidate.function, ctx, candidate_down, baseline_pair_q8, down_weight, variant },
+        down_baseline_runs[0..cfg.quant_compiler_repeat_runs],
+        down_candidate_runs[0..cfg.quant_compiler_repeat_runs],
+    );
+    const down_speedup = try reportQ4_0Q8_1E2BFfnTiming(inner_dim, "down", "termite_linear_q4_0_q8_1_f32_tile4_w8", variant.down.kernel_id, down_exact, down_baseline_runs[0..cfg.quant_compiler_repeat_runs], down_candidate_runs[0..cfg.quant_compiler_repeat_runs]);
+
+    var chain_baseline_runs: [31]u64 = undefined;
+    var chain_candidate_runs: [31]u64 = undefined;
+    try timeAlternatingCudaSteps(
+        ctx,
+        cfg,
+        launchQ4_0Q8_1E2BFfnChainBaseline,
+        .{ module, ctx, baseline_down, pair_f32, baseline_pair_q8, hidden_q8, hidden, gate_weight, up_weight, down_weight, variant },
+        launchQ4_0Q8_1E2BFfnChainCandidate,
+        .{ pair_candidate.function, down_candidate.function, module, ctx, candidate_down, candidate_pair_q8, hidden_q8, hidden, gate_weight, up_weight, down_weight, variant },
+        chain_baseline_runs[0..cfg.quant_compiler_repeat_runs],
+        chain_candidate_runs[0..cfg.quant_compiler_repeat_runs],
+    );
+    const chain_speedup = try reportQ4_0Q8_1E2BFfnTiming(inner_dim, "chain", "termite_quantize_f32_q8_1_rows+termite_linear_q4_0_pair_activation_q8_1_f32_tile4+termite_quantize_f32_q8_1_rows+termite_linear_q4_0_q8_1_f32_tile4_w8", "termite_quantize_f32_q8_1_rows+generated_pair_q8_1+generated_down_f32", chain_exact, chain_baseline_runs[0..cfg.quant_compiler_repeat_runs], chain_candidate_runs[0..cfg.quant_compiler_repeat_runs]);
+
+    return .{
+        .pair_speedup = pair_speedup,
+        .down_speedup = down_speedup,
+        .chain_speedup = chain_speedup,
+    };
+}
+
+fn reportQ4_0Q8_1E2BFfnTiming(
+    inner_dim: usize,
+    stage: []const u8,
+    baseline_name: []const u8,
+    candidate_name: []const u8,
+    exact: bool,
+    baseline_runs: []const u64,
+    candidate_runs: []const u64,
+) !f64 {
+    const baseline_summary = try summarizeTimingRuns(baseline_runs);
+    const candidate_summary = try summarizeTimingRuns(candidate_runs);
+    const candidate_speedup = speedup(baseline_summary.median_ns, candidate_summary.median_ns);
+    print(
+        "CUDA E2B FFN SM89 runs: inner={d} stage={s} baseline={s} candidate={s} baseline_ns={any} candidate_ns={any}\n",
+        .{ inner_dim, stage, baseline_name, candidate_name, baseline_runs, candidate_runs },
+    );
+    print(
+        "CUDA E2B FFN SM89 summary: inner={d} stage={s} exact={} production=false baseline_median_ns={d} baseline_mean_ns={d:.3} baseline_stddev_ns={d:.3} baseline_cv_pct={d:.4} candidate_median_ns={d} candidate_mean_ns={d:.3} candidate_stddev_ns={d:.3} candidate_cv_pct={d:.4} speedup={d:.6}\n",
+        .{
+            inner_dim,
+            stage,
+            exact,
+            baseline_summary.median_ns,
+            baseline_summary.mean_ns,
+            baseline_summary.stddev_ns,
+            baseline_summary.cv_percent,
+            candidate_summary.median_ns,
+            candidate_summary.mean_ns,
+            candidate_summary.stddev_ns,
+            candidate_summary.cv_percent,
+            candidate_speedup,
+        },
+    );
+    return candidate_speedup;
 }
 
 fn benchShape(
@@ -833,6 +1835,7 @@ fn benchQuantCompilerQ4_0Target(
 
     var worst_speedup: f64 = std.math.inf(f64);
     var speedup_log_sum: f64 = 0.0;
+    var eligible_shape_count: usize = 0;
     var shape_details = std.ArrayListUnmanaged(u8).empty;
     defer shape_details.deinit(allocator);
     for (dims_list.items, 0..) |dims, shape_index| {
@@ -900,8 +1903,16 @@ fn benchQuantCompilerQ4_0Target(
         if (has_cpu_reference and cpu_max_abs_diff > correctness_tolerance_abs) return error.GeneratedCandidateMismatch;
 
         const candidate_speedup = speedup(baseline_ns, generated_ns);
-        worst_speedup = @min(worst_speedup, candidate_speedup);
-        speedup_log_sum += @log(candidate_speedup);
+        const production_route_eligible = quant_kernel_compiler.generatedArtifactSupportsPlan(
+            .cuda,
+            quant_matmul.plan(.{ .rows = shape.rows, .in_dim = shape.in_dim, .out_dim = shape.out_dim, .format = .q4_0 }),
+            .none,
+        );
+        if (production_route_eligible) {
+            worst_speedup = @min(worst_speedup, candidate_speedup);
+            speedup_log_sum += @log(candidate_speedup);
+            eligible_shape_count += 1;
+        }
         print("shape={s} rows={d} in={d} out={d} baseline_ns={d} generated_ns={d} speedup={d:.6} cpu_reference={} baseline_cpu_max_abs_diff={d:.6} generated_cpu_max_abs_diff={d:.6} generated_baseline_max_abs_diff={d:.6}\n", .{
             shape.label,
             shape.rows,
@@ -916,7 +1927,7 @@ fn benchQuantCompilerQ4_0Target(
             baseline_max_abs_diff,
         });
         try appendJsonFmt(allocator, &shape_details,
-            \\{s}{{"label":{f},"rows":{d},"in_dim":{d},"out_dim":{d},"baseline_ns":{d},"generated_ns":{d},"speedup":{d:.6},"cpu_reference":{},"baseline_cpu_max_abs_diff":{d:.6},"generated_cpu_max_abs_diff":{d:.6},"generated_baseline_max_abs_diff":{d:.6}}}
+            \\{s}{{"label":{f},"rows":{d},"in_dim":{d},"out_dim":{d},"baseline_ns":{d},"generated_ns":{d},"speedup":{d:.6},"production_route_eligible":{},"cpu_reference":{},"baseline_cpu_max_abs_diff":{d:.6},"generated_cpu_max_abs_diff":{d:.6},"generated_baseline_max_abs_diff":{d:.6}}}
         , .{
             if (shape_index == 0) "" else ",",
             std.json.fmt(shape.label, .{}),
@@ -926,14 +1937,16 @@ fn benchQuantCompilerQ4_0Target(
             baseline_ns,
             generated_ns,
             candidate_speedup,
+            production_route_eligible,
             has_cpu_reference,
             baseline_cpu_max_abs_diff,
             cpu_max_abs_diff,
             baseline_max_abs_diff,
         });
     }
-    const geomean_speedup = @exp(speedup_log_sum / @as(f64, @floatFromInt(dims_list.items.len)));
-    print("q4_0 {s} summary: geomean_speedup={d:.6} worst_speedup={d:.6} shapes={d}\n", .{ @tagName(kind), geomean_speedup, worst_speedup, dims_list.items.len });
+    if (eligible_shape_count == 0) return error.NoProductionEligibleBenchmarkShapes;
+    const geomean_speedup = @exp(speedup_log_sum / @as(f64, @floatFromInt(eligible_shape_count)));
+    print("q4_0 {s} summary: geomean_speedup={d:.6} worst_speedup={d:.6} eligible_shapes={d} measured_shapes={d}\n", .{ @tagName(kind), geomean_speedup, worst_speedup, eligible_shape_count, dims_list.items.len });
     if (cfg.quant_compiler_evidence_out_path) |evidence_path| {
         try writeQuantCompilerQ4_0Evidence(allocator, io, evidence_path, bench, cfg, geomean_speedup, worst_speedup, shape_details.items);
         print("wrote quant compiler evidence: {s}\n", .{evidence_path});
@@ -1181,7 +2194,7 @@ fn benchQuantCompilerQ4_0PairQ8Target(
 
     try poisonDeviceBytes(allocator, ctx, dst_q8, out_blocks * q8_1_block_bytes);
 
-    const generated_ns = try repeatCudaStep(allocator, ctx, cfg, launchQ4_0PairQ8, .{ generated.function, ctx, dst_q8, q8_input, weight_gate, weight_up, out_blocks });
+    const generated_ns = try repeatCudaStep(allocator, ctx, cfg, launchGeneratedQ4_0PairQ8, .{ generated.function, ctx, dst_q8, q8_input, weight_gate, weight_up, 1, in_dim, out_dim, out_blocks });
     const generated_q8_host = try allocator.alloc(u8, out_blocks * q8_1_block_bytes);
     defer allocator.free(generated_q8_host);
     try dst_q8.copyToHost(ctx, generated_q8_host);
@@ -1293,7 +2306,7 @@ fn benchQuantCompilerQ4_0DownQ8Target(
 
     try poisonDeviceOutput(allocator, ctx, output, out_dim);
 
-    const generated_ns = try repeatCudaStep(allocator, ctx, cfg, launchQ4_0DownQ8, .{ generated.function, ctx, output, q8_input, weight, out_dim });
+    const generated_ns = try repeatCudaStep(allocator, ctx, cfg, launchGeneratedQ4_0DownQ8, .{ generated.function, ctx, output, q8_input, weight, 1, in_dim, out_dim });
     const generated_host = try allocator.alloc(f32, out_dim);
     defer allocator.free(generated_host);
     try output.copyToHost(ctx, std.mem.sliceAsBytes(generated_host));
@@ -1334,6 +2347,529 @@ fn benchQuantCompilerQ4_0DownQ8Target(
     }
 }
 
+fn validateQ4_0Q8_1LmArgmaxShape(rows: usize, in_dim: usize, out_dim: usize) cuda_driver.Error!void {
+    if (rows != q4_0_q8_1_lm_argmax_e2b_rows or
+        in_dim != q4_0_q8_1_lm_argmax_e2b_in_dim or
+        out_dim != q4_0_q8_1_lm_argmax_e2b_out_dim)
+    {
+        return error.InvalidCudaState;
+    }
+}
+
+fn launchQ4_0Q8_1LmQuantize(
+    module: *BenchModule,
+    ctx: *cuda_context.CudaContext,
+    dst_q8_1: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+) cuda_driver.Error!void {
+    const row_blocks = in_dim / q8_1_values_per_block;
+    const total_blocks = try checkedMul(rows, row_blocks);
+    try checkRawBytes(dst_q8_1, try checkedMul(total_blocks, q8_1_block_bytes));
+    try checkF32Bytes(input, try checkedMul(rows, in_dim));
+    var dst_ptr = dst_q8_1.ptr;
+    var input_ptr = input.ptr;
+    var rows_u32 = try toU32(rows);
+    var in_dim_u32 = try toU32(in_dim);
+    var params = [_]?*anyopaque{
+        @ptrCast(&dst_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&in_dim_u32),
+    };
+    try launchBlocks(ctx, module.quantize_f32_q8_1_rows, (total_blocks + 3) / 4, 128, &params);
+}
+
+fn launchQ4_0Q8_1LmArgmaxBaseline(
+    module: *BenchModule,
+    ctx: *cuda_context.CudaContext,
+    token: cuda_buffer.DeviceBuffer,
+    logits: cuda_buffer.DeviceBuffer,
+    input_q8_1: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) cuda_driver.Error!void {
+    try validateQ4_0Q8_1LmArgmaxShape(rows, in_dim, out_dim);
+    const row_blocks = in_dim / q4_0_values_per_block;
+    try checkRawBytes(token, try checkedMul(rows, @sizeOf(u32)));
+    try checkF32Bytes(logits, try checkedMul(rows, out_dim));
+    try checkRawBytes(input_q8_1, try checkedMul(try checkedMul(rows, row_blocks), q8_1_block_bytes));
+    try checkF32Bytes(input, try checkedMul(rows, in_dim));
+    try checkRawBytes(weight, try checkedMul(try checkedMul(out_dim, row_blocks), q4_0_block_bytes));
+    try launchQ4_0Q8_1LmQuantize(module, ctx, input_q8_1, input, rows, in_dim);
+
+    var logits_ptr = logits.ptr;
+    var input_ptr = input_q8_1.ptr;
+    var weight_ptr = weight.ptr;
+    var rows_u32 = try toU32(rows);
+    var in_dim_u32 = try toU32(in_dim);
+    var out_dim_u32 = try toU32(out_dim);
+    var linear_params = [_]?*anyopaque{
+        @ptrCast(&logits_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&in_dim_u32),
+        @ptrCast(&out_dim_u32),
+    };
+    try launch2d(ctx, module.linear_q4_0_q8_1_f32_tile4, (out_dim + 3) / 4, rows, 128, &linear_params);
+
+    var token_ptr = token.ptr;
+    var argmax_params = [_]?*anyopaque{
+        @ptrCast(&token_ptr),
+        @ptrCast(&logits_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&out_dim_u32),
+    };
+    try launchBlocks(ctx, module.argmax_last_row_f32, 1, 256, &argmax_params);
+}
+
+fn launchQ4_0Q8_1LmArgmaxCandidate(
+    candidate_function: cuda_driver.CUfunction,
+    module: *BenchModule,
+    ctx: *cuda_context.CudaContext,
+    token: cuda_buffer.DeviceBuffer,
+    partial_values: cuda_buffer.DeviceBuffer,
+    partial_indices: cuda_buffer.DeviceBuffer,
+    input_q8_1: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) cuda_driver.Error!void {
+    try validateQ4_0Q8_1LmArgmaxShape(rows, in_dim, out_dim);
+    const row_blocks = in_dim / q4_0_values_per_block;
+    const col_tiles = (out_dim + q4_0_q8_1_lm_argmax_tile8 - 1) / q4_0_q8_1_lm_argmax_tile8;
+    const partial_count = try checkedMul(rows, col_tiles);
+    try checkRawBytes(token, try checkedMul(rows, @sizeOf(u32)));
+    try checkF32Bytes(partial_values, partial_count);
+    try checkRawBytes(partial_indices, try checkedMul(partial_count, @sizeOf(u32)));
+    try checkRawBytes(input_q8_1, try checkedMul(try checkedMul(rows, row_blocks), q8_1_block_bytes));
+    try checkF32Bytes(input, try checkedMul(rows, in_dim));
+    try checkRawBytes(weight, try checkedMul(try checkedMul(out_dim, row_blocks), q4_0_block_bytes));
+    try launchQ4_0Q8_1LmQuantize(module, ctx, input_q8_1, input, rows, in_dim);
+
+    var partial_values_ptr = partial_values.ptr;
+    var partial_indices_ptr = partial_indices.ptr;
+    var input_ptr = input_q8_1.ptr;
+    var weight_ptr = weight.ptr;
+    var suppress_ptr: cuda_driver.CUdeviceptr = 0;
+    var rows_u32 = try toU32(rows);
+    var in_dim_u32 = try toU32(in_dim);
+    var out_dim_u32 = try toU32(out_dim);
+    var suppress_count_u32: u32 = 0;
+    var stage_params = [_]?*anyopaque{
+        @ptrCast(&partial_values_ptr),
+        @ptrCast(&partial_indices_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_ptr),
+        @ptrCast(&suppress_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&in_dim_u32),
+        @ptrCast(&out_dim_u32),
+        @ptrCast(&suppress_count_u32),
+    };
+    try launchBlocks(ctx, candidate_function, partial_count, q4_0_q8_1_lm_argmax_stage_threads, &stage_params);
+
+    var token_ptr = token.ptr;
+    var col_tiles_u32 = try toU32(col_tiles);
+    var reduce_params = [_]?*anyopaque{
+        @ptrCast(&token_ptr),
+        @ptrCast(&partial_values_ptr),
+        @ptrCast(&partial_indices_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&col_tiles_u32),
+    };
+    try launchBlocks(ctx, module.argmax_reduce_rows_pairs_f32_w16, rows, q4_0_q8_1_lm_argmax_reduce_threads, &reduce_params);
+}
+
+fn validateQ6KQ8_1LmArgmaxVariant(variant: Q6KQ8_1LmArgmaxVariant) !void {
+    if (variant.in_dim != 2560 and variant.in_dim != 3840) return error.InvalidQ6KQ8_1LmArgmaxVariant;
+    const expected_candidate_threads: usize = if (variant.in_dim == 2560) 160 else 256;
+    if (variant.candidate_threads != expected_candidate_threads) return error.InvalidQ6KQ8_1LmArgmaxVariant;
+    if (variant.candidate_symbol.len == 0) return error.InvalidQ6KQ8_1LmArgmaxVariant;
+    const expected_baseline: Q6KQ8_1LmArgmaxBaseline = if (variant.in_dim == 2560) .e4b else .generic;
+    if (variant.baseline != expected_baseline) return error.InvalidQ6KQ8_1LmArgmaxVariant;
+}
+
+fn validateQ6KQ8_1LmArgmaxShape(rows: usize, in_dim: usize, out_dim: usize) cuda_driver.Error!void {
+    if (rows != q6_k_q8_1_lm_argmax_rows or
+        (in_dim != 2560 and in_dim != 3840) or
+        out_dim != q6_k_q8_1_lm_argmax_out_dim)
+    {
+        return error.InvalidCudaState;
+    }
+}
+
+fn launchQ6KQ8_1LmArgmaxBaseline(
+    baseline_function: cuda_driver.CUfunction,
+    module: *BenchModule,
+    ctx: *cuda_context.CudaContext,
+    token: cuda_buffer.DeviceBuffer,
+    partial_values: cuda_buffer.DeviceBuffer,
+    partial_indices: cuda_buffer.DeviceBuffer,
+    input_q8_1: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    stage_threads: usize,
+) cuda_driver.Error!void {
+    try validateQ6KQ8_1LmArgmaxShape(rows, in_dim, out_dim);
+    const row_blocks = in_dim / q6_k_values_per_block;
+    const q8_blocks = in_dim / q8_1_values_per_block;
+    const col_tiles = (out_dim + q6_k_q8_1_lm_argmax_tile8 - 1) / q6_k_q8_1_lm_argmax_tile8;
+    const partial_count = try checkedMul(rows, col_tiles);
+    try checkRawBytes(token, try checkedMul(rows, @sizeOf(u32)));
+    try checkF32Bytes(partial_values, partial_count);
+    try checkRawBytes(partial_indices, try checkedMul(partial_count, @sizeOf(u32)));
+    try checkRawBytes(input_q8_1, try checkedMul(try checkedMul(rows, q8_blocks), q8_1_block_bytes));
+    try checkF32Bytes(input, try checkedMul(rows, in_dim));
+    try checkRawBytes(weight, try checkedMul(try checkedMul(out_dim, row_blocks), q6_k_block_bytes));
+    try launchQ4_0Q8_1LmQuantize(module, ctx, input_q8_1, input, rows, in_dim);
+
+    var partial_values_ptr = partial_values.ptr;
+    var partial_indices_ptr = partial_indices.ptr;
+    var input_ptr = input_q8_1.ptr;
+    var weight_ptr = weight.ptr;
+    var suppress_ptr: cuda_driver.CUdeviceptr = 0;
+    var rows_u32 = try toU32(rows);
+    var in_dim_u32 = try toU32(in_dim);
+    var out_dim_u32 = try toU32(out_dim);
+    var suppress_count_u32: u32 = 0;
+    var stage_params = [_]?*anyopaque{
+        @ptrCast(&partial_values_ptr),
+        @ptrCast(&partial_indices_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_ptr),
+        @ptrCast(&suppress_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&in_dim_u32),
+        @ptrCast(&out_dim_u32),
+        @ptrCast(&suppress_count_u32),
+    };
+    try launchBlocks(ctx, baseline_function, partial_count, stage_threads, &stage_params);
+
+    var token_ptr = token.ptr;
+    var col_tiles_u32 = try toU32(col_tiles);
+    var reduce_params = [_]?*anyopaque{
+        @ptrCast(&token_ptr),
+        @ptrCast(&partial_values_ptr),
+        @ptrCast(&partial_indices_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&col_tiles_u32),
+    };
+    try launchBlocks(ctx, module.argmax_reduce_rows_pairs_f32_w16, rows, q6_k_q8_1_lm_argmax_reduce_threads, &reduce_params);
+}
+
+fn launchQ6KQ8_1LmArgmaxCandidate(
+    candidate_function: cuda_driver.CUfunction,
+    module: *BenchModule,
+    ctx: *cuda_context.CudaContext,
+    token: cuda_buffer.DeviceBuffer,
+    partial_values: cuda_buffer.DeviceBuffer,
+    partial_indices: cuda_buffer.DeviceBuffer,
+    input_q8_1: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    stage_threads: usize,
+) cuda_driver.Error!void {
+    try validateQ6KQ8_1LmArgmaxShape(rows, in_dim, out_dim);
+    const expected_stage_threads: usize = if (in_dim == 2560) 160 else 256;
+    if (stage_threads != expected_stage_threads) return error.InvalidCudaState;
+    const row_blocks = in_dim / q6_k_values_per_block;
+    const q8_blocks = in_dim / q8_1_values_per_block;
+    const col_tiles = (out_dim + q6_k_q8_1_lm_argmax_tile8 - 1) / q6_k_q8_1_lm_argmax_tile8;
+    const partial_count = try checkedMul(rows, col_tiles);
+    try checkRawBytes(token, try checkedMul(rows, @sizeOf(u32)));
+    try checkF32Bytes(partial_values, partial_count);
+    try checkRawBytes(partial_indices, try checkedMul(partial_count, @sizeOf(u32)));
+    try checkRawBytes(input_q8_1, try checkedMul(try checkedMul(rows, q8_blocks), q8_1_block_bytes));
+    try checkF32Bytes(input, try checkedMul(rows, in_dim));
+    try checkRawBytes(weight, try checkedMul(try checkedMul(out_dim, row_blocks), q6_k_block_bytes));
+    try launchQ4_0Q8_1LmQuantize(module, ctx, input_q8_1, input, rows, in_dim);
+
+    var partial_values_ptr = partial_values.ptr;
+    var partial_indices_ptr = partial_indices.ptr;
+    var input_ptr = input_q8_1.ptr;
+    var weight_ptr = weight.ptr;
+    var suppress_ptr: cuda_driver.CUdeviceptr = 0;
+    var rows_u32 = try toU32(rows);
+    var in_dim_u32 = try toU32(in_dim);
+    var out_dim_u32 = try toU32(out_dim);
+    var suppress_count_u32: u32 = 0;
+    var stage_params = [_]?*anyopaque{
+        @ptrCast(&partial_values_ptr),
+        @ptrCast(&partial_indices_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_ptr),
+        @ptrCast(&suppress_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&in_dim_u32),
+        @ptrCast(&out_dim_u32),
+        @ptrCast(&suppress_count_u32),
+    };
+    try launchBlocks(ctx, candidate_function, partial_count, stage_threads, &stage_params);
+
+    var token_ptr = token.ptr;
+    var col_tiles_u32 = try toU32(col_tiles);
+    var reduce_params = [_]?*anyopaque{
+        @ptrCast(&token_ptr),
+        @ptrCast(&partial_values_ptr),
+        @ptrCast(&partial_indices_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&col_tiles_u32),
+    };
+    try launchBlocks(ctx, module.argmax_reduce_rows_pairs_f32_w16, rows, q6_k_q8_1_lm_argmax_reduce_threads, &reduce_params);
+}
+
+fn validateQ4_0Q8_1E2BFfnVariant(variant: E2BFfnVariant) !void {
+    if (variant.inner_dim != 6144 and variant.inner_dim != 12288) return error.InvalidE2BFfnVariant;
+    if (variant.pair.threads != q4_0_q8_1_e2b_ffn_pair_threads) return error.InvalidE2BFfnVariant;
+    const expected_down_threads: usize = if (variant.inner_dim == 6144) 128 else 256;
+    if (variant.down.threads != expected_down_threads) return error.InvalidE2BFfnVariant;
+    if (variant.pair.kernel_id.len == 0 or variant.down.kernel_id.len == 0) return error.InvalidE2BFfnVariant;
+    if (!std.mem.endsWith(u8, variant.pair.artifact_filename, ".sm89.cubin") or
+        !std.mem.endsWith(u8, variant.down.artifact_filename, ".sm89.cubin")) return error.InvalidE2BFfnVariant;
+    if (variant.pair.production_enabled or variant.down.production_enabled) return error.InvalidE2BFfnVariant;
+}
+
+fn validateQ4_0Q8_1E2BFfnShape(rows: usize, hidden_dim: usize, inner_dim: usize) cuda_driver.Error!void {
+    if (rows != q4_0_q8_1_e2b_ffn_rows or hidden_dim != q4_0_q8_1_e2b_ffn_hidden_dim or
+        (inner_dim != 6144 and inner_dim != 12288)) return error.InvalidCudaState;
+}
+
+fn launchQ4_0Q8_1E2BFfnPairBaseline(
+    module: *BenchModule,
+    ctx: *cuda_context.CudaContext,
+    pair_f32: cuda_buffer.DeviceBuffer,
+    dst_q8: cuda_buffer.DeviceBuffer,
+    hidden_q8: cuda_buffer.DeviceBuffer,
+    gate_weight: cuda_buffer.DeviceBuffer,
+    up_weight: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    hidden_dim: usize,
+    inner_dim: usize,
+) cuda_driver.Error!void {
+    try validateQ4_0Q8_1E2BFfnShape(rows, hidden_dim, inner_dim);
+    const hidden_blocks = hidden_dim / q8_1_values_per_block;
+    const inner_blocks = inner_dim / q8_1_values_per_block;
+    const pair_weight_bytes = try checkedMul(try checkedMul(inner_dim, hidden_blocks), q4_0_block_bytes);
+    try checkF32Bytes(pair_f32, try checkedMul(rows, inner_dim));
+    try checkRawBytes(dst_q8, try checkedMul(try checkedMul(rows, inner_blocks), q8_1_block_bytes));
+    try checkRawBytes(hidden_q8, try checkedMul(try checkedMul(rows, hidden_blocks), q8_1_block_bytes));
+    try checkRawBytes(gate_weight, pair_weight_bytes);
+    try checkRawBytes(up_weight, pair_weight_bytes);
+
+    var dst_ptr = pair_f32.ptr;
+    var input_ptr = hidden_q8.ptr;
+    var gate_weight_ptr = gate_weight.ptr;
+    var up_weight_ptr = up_weight.ptr;
+    var rows_u32 = try toU32(rows);
+    var hidden_dim_u32 = try toU32(hidden_dim);
+    var inner_dim_u32 = try toU32(inner_dim);
+    var activation_u32: u32 = q4_0_q8_1_e2b_ffn_activation;
+    var params = [_]?*anyopaque{
+        @ptrCast(&dst_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&gate_weight_ptr),
+        @ptrCast(&up_weight_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&hidden_dim_u32),
+        @ptrCast(&inner_dim_u32),
+        @ptrCast(&activation_u32),
+    };
+    try launchBlocks(ctx, module.linear_q4_0_pair_activation_q8_1_f32_tile4, try checkedMul(rows, (inner_dim + 3) / 4), 128, &params);
+    try launchQ4_0Q8_1LmQuantize(module, ctx, dst_q8, pair_f32, rows, inner_dim);
+}
+
+fn launchQ4_0Q8_1E2BFfnPairCandidate(
+    function: cuda_driver.CUfunction,
+    ctx: *cuda_context.CudaContext,
+    dst_q8: cuda_buffer.DeviceBuffer,
+    hidden_q8: cuda_buffer.DeviceBuffer,
+    gate_weight: cuda_buffer.DeviceBuffer,
+    up_weight: cuda_buffer.DeviceBuffer,
+    variant: E2BFfnVariant,
+) cuda_driver.Error!void {
+    const rows = q4_0_q8_1_e2b_ffn_rows;
+    const hidden_dim = q4_0_q8_1_e2b_ffn_hidden_dim;
+    const inner_dim = variant.inner_dim;
+    try validateQ4_0Q8_1E2BFfnShape(rows, hidden_dim, inner_dim);
+    const hidden_blocks = hidden_dim / q8_1_values_per_block;
+    const inner_blocks = inner_dim / q8_1_values_per_block;
+    const pair_weight_bytes = try checkedMul(try checkedMul(inner_dim, hidden_blocks), q4_0_block_bytes);
+    try checkRawBytes(dst_q8, try checkedMul(try checkedMul(rows, inner_blocks), q8_1_block_bytes));
+    try checkRawBytes(hidden_q8, try checkedMul(try checkedMul(rows, hidden_blocks), q8_1_block_bytes));
+    try checkRawBytes(gate_weight, pair_weight_bytes);
+    try checkRawBytes(up_weight, pair_weight_bytes);
+
+    var dst_ptr = dst_q8.ptr;
+    var input_ptr = hidden_q8.ptr;
+    var gate_weight_ptr = gate_weight.ptr;
+    var up_weight_ptr = up_weight.ptr;
+    var activation_u32: u32 = q4_0_q8_1_e2b_ffn_activation;
+    var rows_u32 = try toU32(rows);
+    var hidden_dim_u32 = try toU32(hidden_dim);
+    var inner_dim_u32 = try toU32(inner_dim);
+    var params = [_]?*anyopaque{
+        @ptrCast(&dst_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&gate_weight_ptr),
+        @ptrCast(&up_weight_ptr),
+        @ptrCast(&activation_u32),
+        @ptrCast(&rows_u32),
+        @ptrCast(&hidden_dim_u32),
+        @ptrCast(&inner_dim_u32),
+    };
+    try launchBlocks(ctx, function, try checkedMul(rows, inner_blocks), variant.pair.threads, &params);
+}
+
+fn launchQ4_0Q8_1E2BFfnDownBaseline(
+    module: *BenchModule,
+    ctx: *cuda_context.CudaContext,
+    output: cuda_buffer.DeviceBuffer,
+    activated_q8: cuda_buffer.DeviceBuffer,
+    down_weight: cuda_buffer.DeviceBuffer,
+    variant: E2BFfnVariant,
+) cuda_driver.Error!void {
+    const rows = q4_0_q8_1_e2b_ffn_rows;
+    const hidden_dim = q4_0_q8_1_e2b_ffn_hidden_dim;
+    const inner_dim = variant.inner_dim;
+    try validateQ4_0Q8_1E2BFfnShape(rows, hidden_dim, inner_dim);
+    const inner_blocks = inner_dim / q8_1_values_per_block;
+    try checkF32Bytes(output, try checkedMul(rows, hidden_dim));
+    try checkRawBytes(activated_q8, try checkedMul(try checkedMul(rows, inner_blocks), q8_1_block_bytes));
+    try checkRawBytes(down_weight, try checkedMul(try checkedMul(hidden_dim, inner_blocks), q4_0_block_bytes));
+
+    const function = module.linear_q4_0_q8_1_f32_tile4_w8;
+    var dst_ptr = output.ptr;
+    var input_ptr = activated_q8.ptr;
+    var weight_ptr = down_weight.ptr;
+    var rows_u32 = try toU32(rows);
+    var inner_dim_u32 = try toU32(inner_dim);
+    var hidden_dim_u32 = try toU32(hidden_dim);
+    var params = [_]?*anyopaque{
+        @ptrCast(&dst_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&inner_dim_u32),
+        @ptrCast(&hidden_dim_u32),
+    };
+    try launch2d(ctx, function, (hidden_dim + 3) / 4, rows, q4_0_q8_1_e2b_ffn_production_down_threads, &params);
+}
+
+fn launchQ4_0Q8_1E2BFfnDownCandidate(
+    function: cuda_driver.CUfunction,
+    ctx: *cuda_context.CudaContext,
+    output: cuda_buffer.DeviceBuffer,
+    activated_q8: cuda_buffer.DeviceBuffer,
+    down_weight: cuda_buffer.DeviceBuffer,
+    variant: E2BFfnVariant,
+) cuda_driver.Error!void {
+    const rows = q4_0_q8_1_e2b_ffn_rows;
+    const hidden_dim = q4_0_q8_1_e2b_ffn_hidden_dim;
+    const inner_dim = variant.inner_dim;
+    try validateQ4_0Q8_1E2BFfnShape(rows, hidden_dim, inner_dim);
+    const inner_blocks = inner_dim / q8_1_values_per_block;
+    try checkF32Bytes(output, try checkedMul(rows, hidden_dim));
+    try checkRawBytes(activated_q8, try checkedMul(try checkedMul(rows, inner_blocks), q8_1_block_bytes));
+    try checkRawBytes(down_weight, try checkedMul(try checkedMul(hidden_dim, inner_blocks), q4_0_block_bytes));
+
+    var dst_ptr = output.ptr;
+    var input_ptr = activated_q8.ptr;
+    var weight_ptr = down_weight.ptr;
+    var rows_u32 = try toU32(rows);
+    var inner_dim_u32 = try toU32(inner_dim);
+    var hidden_dim_u32 = try toU32(hidden_dim);
+    var params = [_]?*anyopaque{
+        @ptrCast(&dst_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&inner_dim_u32),
+        @ptrCast(&hidden_dim_u32),
+    };
+    try launchBlocks(ctx, function, try checkedMul(rows, (hidden_dim + 3) / 4), variant.down.threads, &params);
+}
+
+fn launchQ4_0Q8_1E2BFfnChainBaseline(
+    module: *BenchModule,
+    ctx: *cuda_context.CudaContext,
+    output: cuda_buffer.DeviceBuffer,
+    pair_f32: cuda_buffer.DeviceBuffer,
+    activated_q8: cuda_buffer.DeviceBuffer,
+    hidden_q8: cuda_buffer.DeviceBuffer,
+    hidden: cuda_buffer.DeviceBuffer,
+    gate_weight: cuda_buffer.DeviceBuffer,
+    up_weight: cuda_buffer.DeviceBuffer,
+    down_weight: cuda_buffer.DeviceBuffer,
+    variant: E2BFfnVariant,
+) cuda_driver.Error!void {
+    try launchQ4_0Q8_1LmQuantize(module, ctx, hidden_q8, hidden, q4_0_q8_1_e2b_ffn_rows, q4_0_q8_1_e2b_ffn_hidden_dim);
+    try launchQ4_0Q8_1E2BFfnPairBaseline(module, ctx, pair_f32, activated_q8, hidden_q8, gate_weight, up_weight, q4_0_q8_1_e2b_ffn_rows, q4_0_q8_1_e2b_ffn_hidden_dim, variant.inner_dim);
+    try launchQ4_0Q8_1E2BFfnDownBaseline(module, ctx, output, activated_q8, down_weight, variant);
+}
+
+fn launchQ4_0Q8_1E2BFfnChainCandidate(
+    pair_function: cuda_driver.CUfunction,
+    down_function: cuda_driver.CUfunction,
+    module: *BenchModule,
+    ctx: *cuda_context.CudaContext,
+    output: cuda_buffer.DeviceBuffer,
+    activated_q8: cuda_buffer.DeviceBuffer,
+    hidden_q8: cuda_buffer.DeviceBuffer,
+    hidden: cuda_buffer.DeviceBuffer,
+    gate_weight: cuda_buffer.DeviceBuffer,
+    up_weight: cuda_buffer.DeviceBuffer,
+    down_weight: cuda_buffer.DeviceBuffer,
+    variant: E2BFfnVariant,
+) cuda_driver.Error!void {
+    try launchQ4_0Q8_1LmQuantize(module, ctx, hidden_q8, hidden, q4_0_q8_1_e2b_ffn_rows, q4_0_q8_1_e2b_ffn_hidden_dim);
+    try launchQ4_0Q8_1E2BFfnPairCandidate(pair_function, ctx, activated_q8, hidden_q8, gate_weight, up_weight, variant);
+    try launchQ4_0Q8_1E2BFfnDownCandidate(down_function, ctx, output, activated_q8, down_weight, variant);
+}
+
+fn firstByteMismatch(expected: []const u8, actual: []const u8) !?usize {
+    if (expected.len != actual.len) return error.InvalidArgument;
+    for (expected, actual, 0..) |expected_byte, actual_byte, index| {
+        if (expected_byte != actual_byte) return index;
+    }
+    return null;
+}
+
+fn timeAlternatingCudaSteps(
+    ctx: *cuda_context.CudaContext,
+    cfg: Config,
+    comptime baseline_step: anytype,
+    baseline_args: anytype,
+    comptime candidate_step: anytype,
+    candidate_args: anytype,
+    baseline_runs: []u64,
+    candidate_runs: []u64,
+) !void {
+    if (baseline_runs.len == 0 or baseline_runs.len != candidate_runs.len or baseline_runs.len > 31) return error.InvalidTimingRuns;
+    for (baseline_runs, candidate_runs, 0..) |*baseline_run, *candidate_run, run| {
+        if (run % 2 == 0) {
+            baseline_run.* = try timeCudaStep(ctx, cfg, baseline_step, baseline_args);
+            candidate_run.* = try timeCudaStep(ctx, cfg, candidate_step, candidate_args);
+        } else {
+            candidate_run.* = try timeCudaStep(ctx, cfg, candidate_step, candidate_args);
+            baseline_run.* = try timeCudaStep(ctx, cfg, baseline_step, baseline_args);
+        }
+    }
+}
+
 fn launchQ4_0DownQ8(
     function: cuda_driver.CUfunction,
     ctx: *cuda_context.CudaContext,
@@ -1351,6 +2887,33 @@ fn launchQ4_0DownQ8(
         @ptrCast(&weight_ptr),
     };
     try launchBlocks(ctx, function, out_dim / 4, 256, &params);
+}
+
+fn launchGeneratedQ4_0DownQ8(
+    function: cuda_driver.CUfunction,
+    ctx: *cuda_context.CudaContext,
+    output: cuda_buffer.DeviceBuffer,
+    q8_input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) cuda_driver.Error!void {
+    var dst_ptr = output.ptr;
+    var input_ptr = q8_input.ptr;
+    var weight_ptr = weight.ptr;
+    var rows_u32: u32 = @intCast(rows);
+    var in_dim_u32: u32 = @intCast(in_dim);
+    var out_dim_u32: u32 = @intCast(out_dim);
+    var params = [_]?*anyopaque{
+        @ptrCast(&dst_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&in_dim_u32),
+        @ptrCast(&out_dim_u32),
+    };
+    try launchBlocks(ctx, function, rows * ((out_dim + 3) / 4), 256, &params);
 }
 
 fn launchQ4_0PairQ8(
@@ -1375,6 +2938,39 @@ fn launchQ4_0PairQ8(
         @ptrCast(&activation_u32),
     };
     try launchBlocks(ctx, function, out_blocks, 640, &params);
+}
+
+fn launchGeneratedQ4_0PairQ8(
+    function: cuda_driver.CUfunction,
+    ctx: *cuda_context.CudaContext,
+    dst_q8: cuda_buffer.DeviceBuffer,
+    q8_input: cuda_buffer.DeviceBuffer,
+    weight_gate: cuda_buffer.DeviceBuffer,
+    weight_up: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    out_blocks: usize,
+) cuda_driver.Error!void {
+    var dst_ptr = dst_q8.ptr;
+    var input_ptr = q8_input.ptr;
+    var weight_gate_ptr = weight_gate.ptr;
+    var weight_up_ptr = weight_up.ptr;
+    var activation_u32: u32 = quant_compiler_q4_0_pair_q8_activation;
+    var rows_u32: u32 = @intCast(rows);
+    var in_dim_u32: u32 = @intCast(in_dim);
+    var out_dim_u32: u32 = @intCast(out_dim);
+    var params = [_]?*anyopaque{
+        @ptrCast(&dst_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_gate_ptr),
+        @ptrCast(&weight_up_ptr),
+        @ptrCast(&activation_u32),
+        @ptrCast(&rows_u32),
+        @ptrCast(&in_dim_u32),
+        @ptrCast(&out_dim_u32),
+    };
+    try launchBlocks(ctx, function, rows * out_blocks, 640, &params);
 }
 
 fn poisonDeviceBytes(
@@ -1469,7 +3065,8 @@ fn writeQuantCompilerQ4_0Evidence(
     worst_speedup: f64,
     shape_details_json: []const u8,
 ) !void {
-    const benchmark_passed = std.math.isFinite(geomean_speedup) and geomean_speedup >= bench.minimum_speedup;
+    const benchmark_passed = std.math.isFinite(geomean_speedup) and std.math.isFinite(worst_speedup) and geomean_speedup >= bench.minimum_speedup and worst_speedup >= bench.minimum_speedup;
+    const runtime_shape = (quant_kernel_compiler.generatedArtifactForKernel(.cuda, bench.generated_kernel_id) orelse return error.MissingGeneratedArtifact).runtime_shape;
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(allocator);
     try appendJsonFmt(allocator, &out,
@@ -1485,6 +3082,7 @@ fn writeQuantCompilerQ4_0Evidence(
         \\"benchmark_evidence_path":{f},
         \\"benchmark_mode":"sequential",
         \\"repeat_runs":{d},
+        \\"runtime_min_in_dim":{d},
         \\"timing_aggregation":"median",
         \\"production_enabled":{},
         \\"correctness_passed":true,
@@ -1510,6 +3108,7 @@ fn writeQuantCompilerQ4_0Evidence(
         std.json.fmt(bench.correctness_evidence_path, .{}),
         std.json.fmt(bench.benchmark_evidence_path, .{}),
         cfg.quant_compiler_repeat_runs,
+        runtime_shape.min_in_dim,
         bench.production_enabled,
         benchmark_passed,
         benchmark_passed,
@@ -3111,6 +4710,49 @@ fn fillQ4_0Weights(bytes: []u8) void {
             value.* = (lane - 14.0) * 0.01;
         }
         quant_codec.quantizeQ4_0Block(&block_input, bytes[offset..][0..q4_0_block_bytes]);
+    }
+}
+
+fn fillQ4_0LmArgmaxWeights(bytes: []u8) void {
+    const pattern_blocks = 29;
+    var patterns: [pattern_blocks][q4_0_block_bytes]u8 = undefined;
+    for (&patterns, 0..) |*pattern, block_index| {
+        var block_input: [q4_0_values_per_block]f32 = undefined;
+        for (&block_input, 0..) |*value, i| {
+            const lane: f32 = @floatFromInt((i + block_index * 11) % pattern_blocks);
+            value.* = (lane - 14.0) * 0.01;
+        }
+        quant_codec.quantizeQ4_0Block(&block_input, pattern);
+    }
+    var offset: usize = 0;
+    var block_index: usize = 0;
+    while (offset < bytes.len) : ({
+        offset += q4_0_block_bytes;
+        block_index += 1;
+    }) {
+        @memcpy(bytes[offset..][0..q4_0_block_bytes], &patterns[block_index % pattern_blocks]);
+    }
+}
+
+fn fillQ6_KLmArgmaxWeights(bytes: []u8) void {
+    const pattern_blocks = 29;
+    std.debug.assert(bytes.len % q6_k_block_bytes == 0);
+    var patterns: [pattern_blocks][q6_k_block_bytes]u8 = undefined;
+    for (&patterns, 0..) |*pattern, block_index| {
+        var block_input: [q6_k_values_per_block]f32 = undefined;
+        for (&block_input, 0..) |*value, i| {
+            const lane: f32 = @floatFromInt((i + block_index * 17) % pattern_blocks);
+            value.* = (lane - 14.0) * 0.01;
+        }
+        quant_codec.quantizeQ6_KBlock(&block_input, pattern);
+    }
+    var offset: usize = 0;
+    var block_index: usize = 0;
+    while (offset < bytes.len) : ({
+        offset += q6_k_block_bytes;
+        block_index += 1;
+    }) {
+        @memcpy(bytes[offset..][0..q6_k_block_bytes], &patterns[block_index % pattern_blocks]);
     }
 }
 

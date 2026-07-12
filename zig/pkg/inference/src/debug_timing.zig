@@ -265,8 +265,14 @@ pub fn printBackendTimingDetails(
         },
     );
     std.debug.print(
-        "{s}_attention_dispatch: paged_1x={d}\n",
-        .{ prefix, provider_stats.metal_runtime_paged_attention_1x_calls },
+        "{s}_attention_dispatch: paged_1x={d} generated_decode_1x={d} generated_flash_prefill={d} generated_rms_norm={d}\n",
+        .{
+            prefix,
+            provider_stats.metal_runtime_paged_attention_1x_calls,
+            provider_stats.metal_runtime_generated_attention_decode_1x_calls,
+            provider_stats.metal_runtime_generated_attention_flash_prefill_calls,
+            provider_stats.metal_runtime_generated_rms_norm_calls,
+        },
     );
     std.debug.print(
         "{s}_q4_0_dispatch: linear_reduce={d} linear_reduce_rows={d}/{d}/{d}/{d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",

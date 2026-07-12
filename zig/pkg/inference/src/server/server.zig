@@ -230,6 +230,70 @@ pub const NodeConfig = struct {
     max_concurrent_requests: usize = 32,
     pool_size: usize = 2,
     generation_budget_overrides: BudgetOverrides = .{},
+    generation_batching: GenerationBatchingConfig = .{},
+};
+
+pub const GenerationBatchingMode = enum {
+    off,
+    auto,
+    on,
+};
+
+fn cudaDecodeGraphReplayRequested(raw_opt: ?[]const u8) bool {
+    const raw = raw_opt orelse return false;
+    return !(std.mem.eql(u8, raw, "off") or
+        std.mem.eql(u8, raw, "0") or
+        std.mem.eql(u8, raw, "false") or
+        std.mem.eql(u8, raw, "no"));
+}
+
+pub const GenerationBatchingConfig = struct {
+    // Explicit CUDA production rollout: prefill remains singleton and decode
+    // batches homogeneous sequence positions up to the validated row envelope.
+    // Keep the default and `auto` serialized until the release throughput gate
+    // passes; `mode: on` is the explicit opt-in for the validated row envelope.
+    mode: GenerationBatchingMode = .off,
+    max_step_items: usize = 2,
+    max_step_query_tokens: usize = 512,
+    max_decode_wait_us: u32 = 1_000,
+
+    pub fn enabledForBackend(self: @This(), backend: backends_mod.BackendType) bool {
+        if (backend != .cuda) return false;
+        if (platform.env.getenvBool("ANTFLY_INFERENCE_DISABLE_CONTINUOUS_BATCHING")) return false;
+        // Request-scoped CUDA graph state is shared by the model backend. If a
+        // deployment enables graph reset manually, preserve the model-wide
+        // lock even when the server config requests batching.
+        if (platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET")) return false;
+        if (cudaDecodeGraphReplayRequested(platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY"))) return false;
+        return self.mode == .on;
+    }
+
+    pub fn enabledForRequest(
+        self: @This(),
+        backend: backends_mod.BackendType,
+        graph_mode: bool,
+        speculation_requested: bool,
+        has_multimodal_input: bool,
+    ) bool {
+        if (!self.enabledForBackend(backend)) return false;
+        // These paths issue CUDA work outside the row scheduler. They retain
+        // the model-wide generation lock until their execution is scheduler-
+        // aware, while ordinary decode requests remain batchable.
+        return !graph_mode and !speculation_requested and !has_multimodal_input;
+    }
+
+    pub fn schedulerPolicy(self: @This()) runtime.scheduler.native_generate.Policy {
+        const validated_max_items: usize = 2;
+        return .{
+            .max_step_items = @min(@max(self.max_step_items, 1), validated_max_items),
+            .max_step_query_tokens = @max(self.max_step_query_tokens, 1),
+            .max_decode_wait_us = if (self.mode == .on) self.max_decode_wait_us else 0,
+            // Wider active sets currently lose response equivalence even when
+            // individual steps are capped to two rows. Preserve the proven
+            // direct path until the multi-wave row scheduler is validated.
+            .max_active_requests_for_batching = validated_max_items,
+        };
+    }
 };
 
 pub const WarmModelKind = enum {
@@ -2591,6 +2655,21 @@ pub const Node = struct {
                 return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
         } else self.model_manager.loadFromDir(model_path) catch |err|
             return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+        const graph_mode = backend_selection.graph_mode_requested or
+            backend_selection.compiled_partition_backend != null or
+            graphModeEnabled();
+        const continuous_batching = self.config.generation_batching.enabledForRequest(
+            model.session.backend(),
+            graph_mode,
+            config.speculation_requested,
+            decoded_images.items.len != 0,
+        );
+        var continuous_generation_lock_held = false;
+        if (continuous_batching) {
+            model.lockNativeGeneration(ctx.io);
+            continuous_generation_lock_held = true;
+        }
+        defer if (continuous_generation_lock_held) model.unlockNativeGeneration();
         const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
         const prompt_tokens = self.estimateNativePromptTokens(ctx.allocator, model, messages.items) catch |err|
             return ctx.status(500).json(.{ .@"error" = "TOKENIZE_FAILED", .message = @errorName(err) });
@@ -2599,6 +2678,7 @@ pub const Node = struct {
             if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
         };
         if (model.native_generate_coordinator) |coordinator| {
+            coordinator.setPolicy(self.config.generation_batching.schedulerPolicy());
             native_generate_lease = try coordinator.acquire(.{
                 .requested_units = queue_units,
                 .prompt_bytes = prompt_bytes,
@@ -2648,7 +2728,12 @@ pub const Node = struct {
 
         const tok = model.getTokenizer();
         var draft_cb: ?ops.ComputeBackend = null;
-        defer if (draft_cb) |*cb_value| cb_value.deinit();
+        defer if (draft_cb) |*cb_value| {
+            const reacquire = continuous_batching and !continuous_generation_lock_held;
+            if (reacquire) model.lockNativeGeneration(ctx.io);
+            defer if (reacquire) model.unlockNativeGeneration();
+            cb_value.deinit();
+        };
         var draft_gpt_config: ?@import("../models/gpt.zig").Config = null;
         var loaded_draft_model: ?*model_manager_mod.LoadedModel = null;
         var draft_backend_kind: ?runtime.kv.pool.BackendKind = null;
@@ -2776,12 +2861,14 @@ pub const Node = struct {
             if (first_locked_model == model) draft_model else model
         else
             null;
-        first_locked_model.lockNativeGeneration(ctx.io);
-        if (second_locked_model) |second| second.lockNativeGeneration(ctx.io);
-        defer {
+        if (!continuous_batching) {
+            first_locked_model.lockNativeGeneration(ctx.io);
+            if (second_locked_model) |second| second.lockNativeGeneration(ctx.io);
+        }
+        defer if (!continuous_batching) {
             if (second_locked_model) |second| second.unlockNativeGeneration();
             first_locked_model.unlockNativeGeneration();
-        }
+        };
 
         var kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
         defer kv_manager.deinit();
@@ -2797,7 +2884,12 @@ pub const Node = struct {
             }
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         };
-        defer cb.deinit();
+        defer {
+            const reacquire = continuous_batching and !continuous_generation_lock_held;
+            if (reacquire) model.lockNativeGeneration(ctx.io);
+            defer if (reacquire) model.unlockNativeGeneration();
+            cb.deinit();
+        }
         if (loaded_draft_model) |draft_model| {
             draft_cb = session_factory.getComputeBackendWithBudget(draft_model.session, ctx.allocator, &run_budget) catch |err| {
                 if (err == error.MemoryBudgetExceeded) {
@@ -2814,14 +2906,29 @@ pub const Node = struct {
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         var kv_storage = runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, kv_pool_config) catch |err|
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
-        defer kv_storage.deinit();
+        defer {
+            const reacquire = continuous_batching and !continuous_generation_lock_held;
+            if (reacquire) model.lockNativeGeneration(ctx.io);
+            defer if (reacquire) model.unlockNativeGeneration();
+            kv_storage.deinit();
+        }
         cb.provisionKvDeviceWriteHook(&kv_storage) catch |err|
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         var decode_state = generation.NativeDecodeState.initPaged(ctx.allocator, &kv_manager, pool_id, model.shared_moe_cache);
         decode_state.kv_storage = &kv_storage;
-        defer decode_state.deinit();
+        defer {
+            const reacquire = continuous_batching and !continuous_generation_lock_held;
+            if (reacquire) model.lockNativeGeneration(ctx.io);
+            defer if (reacquire) model.unlockNativeGeneration();
+            decode_state.deinit();
+        }
         var draft_decode_state: ?generation.NativeDecodeState = null;
-        defer if (draft_decode_state) |*state| state.deinit();
+        defer if (draft_decode_state) |*state| {
+            const reacquire = continuous_batching and !continuous_generation_lock_held;
+            if (reacquire) model.lockNativeGeneration(ctx.io);
+            defer if (reacquire) model.unlockNativeGeneration();
+            state.deinit();
+        };
 
         if (draft_cb != null) {
             if (draft_gpt_config) |draft_cfg| {
@@ -2834,9 +2941,6 @@ pub const Node = struct {
             }
         }
 
-        const graph_mode = backend_selection.graph_mode_requested or
-            backend_selection.compiled_partition_backend != null or
-            graphModeEnabled();
         const use_scheduler = !graph_mode;
         const use_model_graph_cache = graph_mode and
             build_options.enable_metal and
@@ -2880,6 +2984,7 @@ pub const Node = struct {
             .decode_state = &decode_state,
             .scheduler = if (use_scheduler) model.native_generate_coordinator else null,
             .scheduler_lease = if (use_scheduler) if (native_generate_lease) |*lease| lease else null else null,
+            .execution_lock = if (continuous_batching and use_scheduler) model.nativeGenerationMutex() else null,
             .draft_cb = if (draft_cb) |cb_value| cb_value else null,
             .draft_gpt_config = draft_gpt_config,
             .draft_decode_state = if (draft_decode_state) |*state| state else null,
@@ -2888,6 +2993,11 @@ pub const Node = struct {
             .compiled_attachment_target = backend_selection.compiled_attachment_target,
             .pjrt_client = if (pjrt_client) |*client| client else null,
         };
+
+        if (continuous_batching and use_scheduler) {
+            model.unlockNativeGeneration();
+            continuous_generation_lock_held = false;
+        }
 
         if (want_stream) {
             return self.streamGenerate(ctx, body.model, &pipeline, messages.items, config, if (tool_parser) |*parser| parser else null);
@@ -5641,6 +5751,12 @@ pub const Node = struct {
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_query_tokens_total", "counter", "Total query tokens fused across unified scheduler steps", aggregate.stats.step_query_tokens_total);
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_singleton_batches_total", "counter", "Total unified scheduler steps that contained only the leader item", aggregate.stats.step_singleton_batches_total);
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_kv_block_skips_total", "counter", "Total pending items skipped due to per-step KV-block budget", aggregate.stats.step_kv_block_skips_total);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_decode_coalesce_waits_total", "counter", "Decode steps intentionally delayed to form a batch", aggregate.stats.decode_coalesce_waits_total);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_decode_coalesce_wait_us_total", "counter", "Configured microseconds spent waiting to coalesce decode work", aggregate.stats.decode_coalesce_wait_us_total);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_2_total", "counter", "Unified scheduler steps containing two items", aggregate.stats.step_batch_size_2_total);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_3_4_total", "counter", "Unified scheduler steps containing three or four items", aggregate.stats.step_batch_size_3_4_total);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_5_8_total", "counter", "Unified scheduler steps containing five through eight items", aggregate.stats.step_batch_size_5_8_total);
+        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_9_16_total", "counter", "Unified scheduler steps containing nine through sixteen items", aggregate.stats.step_batch_size_9_16_total);
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_turn_yields_total", "counter", "Total cooperative scheduler yields while waiting for turns", aggregate.stats.turn_yields_total);
         try appendResidentProjectionMetrics(&writer.writer, aggregateResidentProjectionStats(node.model_manager.loaded));
         try appendGraphExecutorMetrics(&writer.writer, graph_mod.executor_stats.snapshot());
@@ -7001,6 +7117,42 @@ test "budget overrides apply selectively" {
     try std.testing.expectEqual(@as(usize, 350), applied.combined_limit_bytes);
     try std.testing.expectEqual(@as(usize, 400), applied.kv_limit_bytes);
     try std.testing.expectEqual(@as(usize, 600), applied.scratch_limit_bytes);
+}
+
+test "generation batching exposes the validated CUDA production envelope" {
+    const config = GenerationBatchingConfig{};
+    try std.testing.expectEqual(GenerationBatchingMode.off, config.mode);
+    try std.testing.expect(!(GenerationBatchingConfig{ .mode = .auto }).enabledForRequest(.cuda, false, false, false));
+
+    const policy = config.schedulerPolicy();
+    try std.testing.expectEqual(@as(usize, 2), policy.max_step_items);
+    try std.testing.expectEqual(@as(?usize, 2), policy.max_active_requests_for_batching);
+    try std.testing.expectEqual(@as(u32, 0), policy.max_decode_wait_us);
+
+    const enabled_policy = (GenerationBatchingConfig{ .mode = .on }).schedulerPolicy();
+    try std.testing.expectEqual(@as(u32, 1_000), enabled_policy.max_decode_wait_us);
+
+    const clamped = (GenerationBatchingConfig{ .max_step_items = 128 }).schedulerPolicy();
+    try std.testing.expectEqual(@as(usize, 2), clamped.max_step_items);
+}
+
+test "generation batching treats every requested CUDA graph replay mode as serialized" {
+    try std.testing.expect(!cudaDecodeGraphReplayRequested(null));
+    inline for (.{ "off", "0", "false", "no" }) |value| {
+        try std.testing.expect(!cudaDecodeGraphReplayRequested(value));
+    }
+    inline for (.{ "auto", "required", "on", "1", "true", "yes", "unknown", "" }) |value| {
+        try std.testing.expect(cudaDecodeGraphReplayRequested(value));
+    }
+}
+
+test "generation batching serializes request paths outside the row scheduler" {
+    const config = GenerationBatchingConfig{ .mode = .on };
+    try std.testing.expect(config.enabledForRequest(.cuda, false, false, false));
+    try std.testing.expect(!config.enabledForRequest(.cuda, true, false, false));
+    try std.testing.expect(!config.enabledForRequest(.cuda, false, true, false));
+    try std.testing.expect(!config.enabledForRequest(.cuda, false, false, true));
+    try std.testing.expect(!config.enabledForRequest(.metal, false, false, false));
 }
 
 test "taskMatchesModelListing derives extractors from recognizer capabilities" {
