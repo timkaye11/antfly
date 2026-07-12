@@ -209,7 +209,9 @@ jobs:
           esac
           "${args[@]}"
 
-      - name: Collect fixed-corpus MTP diagnostics
+      - name: Collect experimental fixed-corpus MTP diagnostics
+        if: ${{ (inputs.gate || 'nightly') == 'nightly' }}
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -260,7 +262,8 @@ jobs:
             'requested_speculative_k=1' \
             'auto_max_k=1' \
             'effective_speculative_k_when_active=1' \
-            "production_gate_exit_code=$mtp_status" \
+            'release_contract=none; experimental diagnostic only' \
+            "diagnostic_exit_code=$mtp_status" \
             > "$mtp_dir/mtp_collection_profile.txt"
 
       - name: Publish evidence summary
@@ -281,6 +284,8 @@ jobs:
           summary = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
           print("## CUDA Gemma 4 L4 Evidence")
           print()
+          print(f"**Release scope:** `{summary.get('release_scope', 'missing')}`")
+          print()
           print("```json")
           print(json.dumps(summary, indent=2, sort_keys=True))
           print("```")
@@ -291,7 +296,7 @@ jobs:
               print()
               print("## CUDA Gemma 4 MTP Diagnostics")
               print()
-              print("Collection only; this is not paired or interleaved with llama.cpp and is not a release performance gate.")
+              print("Experimental nightly collection only; this is non-gating, is not paired or interleaved with llama.cpp, and does not certify production readiness or performance superiority.")
           if mtp_path.is_file():
               print()
               print("```json")

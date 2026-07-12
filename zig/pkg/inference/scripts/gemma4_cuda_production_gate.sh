@@ -5,8 +5,9 @@ usage() {
   cat <<'USAGE'
 usage: gemma4_cuda_production_gate.sh [--quick|--full|--bench-only|--mtp-only]
 
-Runs the Gemma4 CUDA production-readiness gate for resident target inference,
-TurboQuant compressed KV, and MTP auto-policy behavior.
+Runs the Gemma4 CUDA production-readiness gate for resident target inference
+and TurboQuant compressed KV. MTP mode is an experimental diagnostic only; it
+does not certify production readiness or claim superiority over llama.cpp.
 
 Environment overrides:
   ZIG_BIN                       path to Zig 0.16 binary

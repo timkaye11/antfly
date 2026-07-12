@@ -26,9 +26,16 @@ antfly inference generate /path/to/google/gemma-4-E2B-it \
   "Explain speculative decoding in one paragraph." \
   --draft-model /path/to/google/gemma-4-E2B-it-assistant \
   --speculative-k 4 \
+  --speculation-policy auto \
+  --speculation-calibration positive \
   --backend metal \
   --print-timing
 ```
+
+Calibrated auto policy requires `--speculation-calibration positive`; CLI
+calibration otherwise defaults to `none`, which does not activate Gemma 4 MTP
+auto mode. Metal auto policy currently defaults to an effective speculative
+window of `k=1` unless an explicitly validated override raises the cap.
 
 The drafter must use the same tokenizer vocabulary and special token ids as the
 target. Speculative decoding is currently native text-only generation; it is not
@@ -241,6 +248,12 @@ official safetensors assistant and the local GGUF target, quantization effects i
 the target, or a still-missing detail in the clustered output head.
 
 ### CUDA Branch Status
+
+CUDA MTP remains experimental. Its diagnostics are not a production-readiness
+certification and are not a paired llama.cpp comparison; no throughput result
+from that path should be described as superiority over llama.cpp. The CUDA
+release contract covers target-only Gemma 4 QAT, while strict MTP certification
+and promotion remain follow-up work.
 
 Update 2026-07-07 on branch `codex/quant-kernel-metal-compiler`: the quant
 kernel compiler now ships 5 promoted generated CUDA Q4_0 kernels default-on
@@ -516,8 +529,11 @@ MLX streams/providers for the `.mlx` backend. The repaired smoke
 - Sampling, repetition penalties, and grammar masks must be applied from the
   target logits during verification.
 - Rejected draft suffixes must be rolled back from KV state.
-- Correction and bonus tokens must be materialized into target KV before the
-  next round. Gemma 4 MTP assistants have no drafter KV; they keep only the
+- Correction and bonus tokens must be present in target KV before they are
+  consumed by later target work. The supported deferred-materialization path
+  may fold that materialization into the next verify round; it flushes any
+  pending token before another operation that requires committed target KV.
+  Gemma 4 MTP assistants have no drafter KV; they keep only the
   target-prediction activation needed to seed the next draft round.
 - MTP must fall back to standard decoding if the assistant is missing,
   incompatible, or slower for the current backend.

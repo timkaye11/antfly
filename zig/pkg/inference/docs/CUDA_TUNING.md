@@ -99,7 +99,8 @@ route is promoted.
 The checked-in exact catalog currently targets CUDA `sm_89` only. Its scope is
 selected Q4_0 and Q4_K row-1 matmuls, Q4_0 x Q8_1 fused FFN shapes, Q6_K x
 Q8_1 K=2560 and K=3840 tile-argmax candidates, and Gemma 4 decode-attention
-topologies.
+topologies. In the merged unified generated-artifact registry, 21 CUDA entries
+are non-promoted; no single Q4_K route represents the remaining candidate set.
 Default-on generated Q4 runtime routes are therefore enabled only on SM89.
 Other compute capabilities use the handwritten fallback even when their code
 objects are present in the fatbin. Development experiments can bypass this
@@ -467,13 +468,18 @@ the 12B Q4_K_M f32 replay case twice and
 requires identical token IDs, healthy replay, and zero disabled-candidate
 counters.
 
-Use manual `gate=release` only for the commit intended for release. That mode
+Use manual `gate=release` only for the commit intended for release. Its
+`release_scope` is `target_only`: CUDA MTP is not executed or certified. That mode
 requires the E2B comparable llama.cpp ratio to be at least `0.80` and a token
 throughput CV no higher than `0.02`; nightly collection keeps the same
 correctness/replay contract without asserting the future throughput target.
 Each run uploads `release_summary.json`, `release_provenance.json`, paired raw
 logs/timing, and 12B timing evidence. A release requires a fresh passing manual
 release-mode artifact for its exact commit.
+
+CUDA MTP diagnostics run only in `gate=nightly`. They are experimental,
+optional, and non-gating, and they make no production-readiness or
+llama.cpp-superiority claim. Strict CUDA MTP certification is follow-up work.
 
 For an equivalent local evidence run after a ReleaseFast CUDA build:
 

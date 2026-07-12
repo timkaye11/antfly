@@ -22,6 +22,7 @@ from gemma4_cuda_l4_release_gate import (
     FROZEN_PROFILE,
     GEMMA12B_TOKENS,
     MAX_TOK_S_CV,
+    RELEASE_SCOPE,
     TOKEN_IDS_RE,
     canonical_sha256,
     disabled_candidate_errors,
@@ -115,6 +116,18 @@ def generation_run() -> dict:
 
 
 class L4ReleaseGateTest(unittest.TestCase):
+    def test_release_scope_is_target_only(self) -> None:
+        self.assertEqual("target_only", RELEASE_SCOPE)
+
+    def test_workflow_runs_mtp_only_as_non_gating_nightly_diagnostics(self) -> None:
+        workflow = (pathlib.Path(__file__).resolve().parents[4] / ".github/workflows/cuda-gemma4-l4.yml").read_text(encoding="utf-8")
+        start = workflow.index("- name: Collect experimental fixed-corpus MTP diagnostics")
+        end = workflow.index("- name: Publish evidence summary", start)
+        mtp_step = workflow[start:end]
+        self.assertIn("if: ${{ (inputs.gate || 'nightly') == 'nightly' }}", mtp_step)
+        self.assertIn("continue-on-error: true", mtp_step)
+        self.assertIn("release_contract=none; experimental diagnostic only", mtp_step)
+
     def test_profile_locks_candidate_gates_and_returns_a_copy(self) -> None:
         profile = frozen_profile()
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE"])

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Collect reproducible Gemma 4 CUDA L4 release evidence.
+"""Collect reproducible target-only Gemma 4 CUDA L4 release evidence.
 
 The production target deliberately keeps generated attention, generated E2B
 Q8-intermediate and exact-F32 FFN, and generated Q6_K LM-head candidates
 disabled. This command proves the fixed E2B QAT decode contract against
 llama.cpp and records a separate 12B Q4_K_M deterministic/replay regression
 without changing that policy.
+
+CUDA MTP is outside this release contract. It remains experimental and is not
+executed, certified, or compared with llama.cpp by this command.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from typing import Any
 
 
 RELEASE_SCHEMA = "antfly.gemma4_cuda_l4_release_gate.v1"
+RELEASE_SCOPE = "target_only"
 E2B_PROMPT = "Here is a sentence about ants:"
 E2B_ANTFLY_TOKENS = 255
 E2B_LLAMA_TOKENS = 256
@@ -650,6 +654,7 @@ def main() -> None:
     gemma12b_model_provenance = path_provenance(args.gemma12b_q4_model)
     provenance = {
         "schema": RELEASE_SCHEMA,
+        "release_scope": RELEASE_SCOPE,
         "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "git": git_provenance(repo_root()),
         "gpu": gpu,
@@ -720,6 +725,7 @@ def main() -> None:
 
     result = {
         "schema": RELEASE_SCHEMA,
+        "release_scope": RELEASE_SCOPE,
         "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "config": {
             "enforce_performance": args.enforce_performance,
@@ -748,6 +754,7 @@ def main() -> None:
     target = result["e2b"]["target"] or {}
     print(
         "gemma4_cuda_l4_release_gate "
+        f"release_scope={RELEASE_SCOPE} "
         f"comparable_ratio={float_value(target.get('comparable_ratio')):.3f} "
         f"enforced={str(args.enforce_performance).lower()} "
         f"passed={str(not errors).lower()} output={summary_path}"

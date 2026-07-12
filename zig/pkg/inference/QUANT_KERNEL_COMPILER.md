@@ -427,9 +427,12 @@ still end in `-ptx` for compatibility, but their paths are CUDA module images an
 accept PTX, cubin, or fatbin through `cuModuleLoadDataEx`. Use the exact
 manifest command and `.fatbin` path when refreshing evidence.
 
-The remaining non-promoted CUDA candidate is the first lazy Q4_K
-`rows_2_8`/`bias_gelu` kernel, which loses to its handwritten baseline (0.74x)
-and stays dev-only with blocker evidence, as designed.
+The unified generated-artifact registry currently contains 21 non-promoted
+CUDA entries across matmul and attention families. The first lazy Q4_K
+`rows_2_8`/`bias_gelu` kernel is one of them; it loses to its handwritten
+baseline (0.74x) and stays dev-only with blocker evidence, as designed. The
+other entries likewise remain candidates until their route-specific correctness
+and performance gates are satisfied.
 
 ## Current Metal State
 

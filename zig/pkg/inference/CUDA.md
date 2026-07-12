@@ -225,11 +225,12 @@ The equivalent Linux CUDA 13.2 build target is
 Quant matmul codegen is a build/dev-time lane, not runtime JIT. The compiler
 spec lives in `pkg/inference/src/graph/quant_kernel_compiler.zig`; generated
 dev candidates and manifests live under `pkg/inference/src/ops/cuda/generated`
-and `pkg/inference/src/ops/metal/generated`. The Metal lane now covers 25
-small-batch quant routes across Q2/Q3/Q4/Q5/Q6/Q8 families, with 11 promoted
-routes, plus opt-in generated RMSNorm, decode-1x paged attention, and flash
-prefill attention. `QUANT_KERNEL_COMPILER.md` is the authoritative route and
-evidence inventory.
+and `pkg/inference/src/ops/metal/generated`. The unified generated-artifact
+registry currently has 7 promoted Metal routes and 21 non-promoted CUDA
+entries. The Metal lane covers 25 small-batch quant routes across
+Q2/Q3/Q4/Q5/Q6/Q8 families, plus opt-in generated RMSNorm, decode-1x paged
+attention, and flash-prefill attention. `QUANT_KERNEL_COMPILER.md` is the
+authoritative route and evidence inventory.
 
 Use `zig build quant-kernel-codegen -- --check` to verify generated sources and
 manifests, or `zig build quant-kernel-codegen -- --write` after intentionally
