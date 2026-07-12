@@ -7,6 +7,7 @@ import unittest
 
 
 TUNING_SCRIPT = pathlib.Path(__file__).resolve().with_name("gemma4_qat_cuda_tuning.sh")
+WRAPPER_SCRIPT = pathlib.Path(__file__).resolve().with_name("with_gemma4_qat_cuda_tuning.sh")
 
 
 def configured_environment(**overrides: str) -> dict[str, str]:
@@ -26,6 +27,18 @@ def configured_environment(**overrides: str) -> dict[str, str]:
         text=True,
     )
     return dict(line.split("=", 1) for line in completed.stdout.splitlines())
+
+
+def wrapped_environment(**overrides: str) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment.update(overrides)
+    return subprocess.run(
+        [str(WRAPPER_SCRIPT), "/usr/bin/env"],
+        check=False,
+        capture_output=True,
+        env=environment,
+        text=True,
+    )
 
 
 class Gemma4QatCudaTuningTest(unittest.TestCase):
@@ -70,6 +83,32 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT"])
         self.assertEqual("853", environment["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD"])
         self.assertEqual("2500", environment["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP"])
+        self.assertEqual("1", environment["ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET"])
+
+    def test_graph_off_removes_graph_only_temp_and_request_state(self):
+        environment = configured_environment(ANTFLY_DECODE_GRAPH_REPLAY="off")
+        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD"])
+        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP"])
+        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET"])
+        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY"])
+
+    def test_batching_wrapper_requires_graph_replay_off(self):
+        rejected = wrapped_environment(
+            ANTFLY_SERVER_DISABLE_CONTINUOUS_BATCHING="0",
+            ANTFLY_SERVER_DECODE_GRAPH_REPLAY="required",
+        )
+        self.assertEqual(2, rejected.returncode)
+        self.assertIn("requires ANTFLY_SERVER_DECODE_GRAPH_REPLAY=off", rejected.stderr)
+
+        accepted = wrapped_environment(
+            ANTFLY_SERVER_DISABLE_CONTINUOUS_BATCHING="0",
+            ANTFLY_SERVER_DECODE_GRAPH_REPLAY="off",
+        )
+        self.assertEqual(0, accepted.returncode, accepted.stderr)
+        environment = dict(line.split("=", 1) for line in accepted.stdout.splitlines() if "=" in line)
+        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET"])
+        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD"])
+        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP"])
 
     def test_temp_slot_schedule_honors_ambient_overrides(self):
         for name in (

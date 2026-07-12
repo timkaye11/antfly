@@ -59,6 +59,8 @@ pub const ActivationEncoding = enum(u8) {
     f16 = 1,
     bf16 = 2,
     q8_1 = 3,
+    /// Page-table-addressed KV keys whose runtime tag selects F16 or Polar4.
+    paged_f16_or_polar4 = 4,
 };
 
 /// Mathematical activation applied by a fused epilogue. This is independent

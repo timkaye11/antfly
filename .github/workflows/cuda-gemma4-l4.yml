@@ -139,6 +139,40 @@ jobs:
             -Dcuda=true -Dmetal=false -Dcuda-artifacts=sm89 \
             -Doptimize=ReleaseFast -- --json
 
+      - name: Verify paged Polar4 and F16 attention parity
+        working-directory: zig/pkg/inference
+        run: |
+          set -euo pipefail
+          zig build quant-kernel-cuda-paged-attention-diff \
+            -Dcuda=true -Dmetal=false -Dcuda-artifacts=sm89 \
+            -Doptimize=ReleaseFast -- \
+            --candidate-hd256 src/ops/cuda/artifacts/inference_cuda_kernels.fatbin \
+            --candidate-hd512 src/ops/cuda/artifacts/inference_cuda_kernels.fatbin \
+            --kv-len 1024 --pattern all --key-format all --json \
+            | tee "$CUDA_EVIDENCE_DIR/paged_attention_diff.json"
+
+      - name: Validate Polar4 server batching
+        run: |
+          set -euo pipefail
+          args=(
+            python3 zig/pkg/inference/scripts/benchmark_gemma4_cuda_batching.py
+            --antfly-bin "$GITHUB_WORKSPACE/zig/pkg/inference/zig-out/bin/antfly-inference"
+            --model "$E2B_MODEL"
+            --models-dir "$GITHUB_WORKSPACE/.models"
+            --output-dir "$CUDA_EVIDENCE_DIR/batching"
+            --cache-dtype polar4
+            --tokens 64
+            --concurrency 1 2
+            --warmups 1
+            --repeats 2
+          )
+          if [[ "$CUDA_RELEASE_MODE" == "nightly" ]]; then
+            # Nightly proves row isolation and keeps a regression floor. The
+            # release mode retains the benchmark's 1.5x promotion threshold.
+            args+=(--min-c2-speedup 0.40 --max-c1-p95-ratio 1.20)
+          fi
+          "${args[@]}"
+
       - name: Collect fixed E2B and 12B release evidence
         shell: bash
         run: |

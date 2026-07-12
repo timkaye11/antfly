@@ -1640,7 +1640,9 @@
           "attention_kv_splits": 1,
           "attention_query_heads_per_kv_head": 1,
           "attention_split_kv_min_tokens": 0,
-          "attention_storage": "f32"
+          "attention_max_kv_tokens": 0,
+          "attention_storage": "f32",
+          "attention_key_storage": "f32"
         }
       },
       "attention": null
@@ -1759,7 +1761,9 @@
           "attention_kv_splits": 8,
           "attention_query_heads_per_kv_head": 16,
           "attention_split_kv_min_tokens": 512,
-          "attention_storage": "f32"
+          "attention_max_kv_tokens": 0,
+          "attention_storage": "f32",
+          "attention_key_storage": "f32"
         }
       }
     },
@@ -1877,7 +1881,9 @@
           "attention_kv_splits": 8,
           "attention_query_heads_per_kv_head": 16,
           "attention_split_kv_min_tokens": 512,
-          "attention_storage": "f32"
+          "attention_max_kv_tokens": 0,
+          "attention_storage": "f32",
+          "attention_key_storage": "f32"
         }
       }
     },
@@ -1995,7 +2001,9 @@
           "attention_kv_splits": 2,
           "attention_query_heads_per_kv_head": 16,
           "attention_split_kv_min_tokens": 512,
-          "attention_storage": "f32"
+          "attention_max_kv_tokens": 0,
+          "attention_storage": "f32",
+          "attention_key_storage": "f32"
         }
       }
     },
@@ -2113,7 +2121,9 @@
           "attention_kv_splits": 2,
           "attention_query_heads_per_kv_head": 16,
           "attention_split_kv_min_tokens": 512,
-          "attention_storage": "f32"
+          "attention_max_kv_tokens": 0,
+          "attention_storage": "f32",
+          "attention_key_storage": "f32"
         }
       }
     },
@@ -2231,7 +2241,9 @@
           "attention_kv_splits": 4,
           "attention_query_heads_per_kv_head": 16,
           "attention_split_kv_min_tokens": 512,
-          "attention_storage": "f32"
+          "attention_max_kv_tokens": 0,
+          "attention_storage": "f32",
+          "attention_key_storage": "f32"
         }
       }
     },
@@ -2349,7 +2361,9 @@
           "attention_kv_splits": 4,
           "attention_query_heads_per_kv_head": 16,
           "attention_split_kv_min_tokens": 512,
-          "attention_storage": "f32"
+          "attention_max_kv_tokens": 0,
+          "attention_storage": "f32",
+          "attention_key_storage": "f32"
         }
       }
     },
@@ -2395,7 +2409,7 @@
         "threads_per_block": 256,
         "output_rows_per_block": 1,
         "output_cols_per_block": 256,
-        "static_shared_memory_bytes": 80,
+        "static_shared_memory_bytes": 16,
         "dynamic_shared_memory_bytes": 0,
         "rows": {
           "min": 1,
@@ -2466,8 +2480,10 @@
           "attention_stage2_threads_per_threadgroup": 256,
           "attention_kv_splits": 128,
           "attention_query_heads_per_kv_head": 16,
-          "attention_split_kv_min_tokens": 4096,
-          "attention_storage": "f32"
+          "attention_split_kv_min_tokens": 0,
+          "attention_max_kv_tokens": 4096,
+          "attention_storage": "f32",
+          "attention_key_storage": "paged_f16_or_polar4"
         }
       }
     },
@@ -2513,7 +2529,7 @@
         "threads_per_block": 512,
         "output_rows_per_block": 1,
         "output_cols_per_block": 512,
-        "static_shared_memory_bytes": 80,
+        "static_shared_memory_bytes": 16,
         "dynamic_shared_memory_bytes": 0,
         "rows": {
           "min": 1,
@@ -2584,8 +2600,10 @@
           "attention_stage2_threads_per_threadgroup": 512,
           "attention_kv_splits": 128,
           "attention_query_heads_per_kv_head": 16,
-          "attention_split_kv_min_tokens": 4096,
-          "attention_storage": "f32"
+          "attention_split_kv_min_tokens": 0,
+          "attention_max_kv_tokens": 4096,
+          "attention_storage": "f32",
+          "attention_key_storage": "paged_f16_or_polar4"
         }
       }
     },
@@ -2623,7 +2641,9 @@
           "attention_kv_splits": 1,
           "attention_query_heads_per_kv_head": 1,
           "attention_split_kv_min_tokens": 0,
-          "attention_storage": "f32"
+          "attention_max_kv_tokens": 0,
+          "attention_storage": "f32",
+          "attention_key_storage": "f32"
         }
       }
     },
@@ -2661,7 +2681,9 @@
           "attention_kv_splits": 1,
           "attention_query_heads_per_kv_head": 1,
           "attention_split_kv_min_tokens": 0,
-          "attention_storage": "f32"
+          "attention_max_kv_tokens": 0,
+          "attention_storage": "f32",
+          "attention_key_storage": "f32"
         }
       }
     }

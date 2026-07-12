@@ -125,8 +125,8 @@ pub const GenerationBatchingMode = enum {
 pub const GenerationBatchingConfig = struct {
     // Explicit CUDA production rollout: prefill remains singleton and decode
     // batches homogeneous sequence positions up to the validated row envelope.
-    // Keep the default off until the long-generation singleton-equivalence and
-    // throughput gates pass; `mode: on` no longer needs an experimental env.
+    // Keep the default and `auto` serialized until the release throughput gate
+    // passes; `mode: on` is the explicit opt-in for the validated row envelope.
     mode: GenerationBatchingMode = .off,
     max_step_items: usize = 2,
     max_step_query_tokens: usize = 512,
@@ -134,8 +134,26 @@ pub const GenerationBatchingConfig = struct {
 
     pub fn enabledForBackend(self: @This(), backend: backends_mod.BackendType) bool {
         if (platform.env.getenvBool("ANTFLY_INFERENCE_DISABLE_CONTINUOUS_BATCHING")) return false;
+        // Request-scoped CUDA graph state is shared by the model backend. If a
+        // deployment enables graph reset manually, preserve the model-wide
+        // lock even when the server config requests batching.
+        if (platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET")) return false;
         if (backend != .cuda) return false;
-        return self.mode != .off;
+        return self.mode == .on;
+    }
+
+    pub fn enabledForRequest(
+        self: @This(),
+        backend: backends_mod.BackendType,
+        graph_mode: bool,
+        speculation_requested: bool,
+        has_multimodal_input: bool,
+    ) bool {
+        if (!self.enabledForBackend(backend)) return false;
+        // These paths issue CUDA work outside the row scheduler. They retain
+        // the model-wide generation lock until their execution is scheduler-
+        // aware, while ordinary decode requests remain batchable.
+        return !graph_mode and !speculation_requested and !has_multimodal_input;
     }
 
     pub fn schedulerPolicy(self: @This()) runtime.scheduler.native_generate.Policy {
@@ -2589,7 +2607,15 @@ pub const Node = struct {
                 return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
         } else self.model_manager.loadFromDir(model_path) catch |err|
             return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
-        const continuous_batching = self.config.generation_batching.enabledForBackend(model.session.backend());
+        const graph_mode = backend_selection.graph_mode_requested or
+            backend_selection.compiled_partition_backend != null or
+            graphModeEnabled();
+        const continuous_batching = self.config.generation_batching.enabledForRequest(
+            model.session.backend(),
+            graph_mode,
+            config.speculation_requested,
+            decoded_images.items.len != 0,
+        );
         model.lockNativeGeneration();
         var generation_lock_held = true;
         defer if (generation_lock_held) model.unlockNativeGeneration();
@@ -2833,9 +2859,6 @@ pub const Node = struct {
             }
         }
 
-        const graph_mode = backend_selection.graph_mode_requested or
-            backend_selection.compiled_partition_backend != null or
-            graphModeEnabled();
         const use_scheduler = !graph_mode;
         const use_model_graph_cache = graph_mode and
             build_options.enable_metal and
@@ -6037,6 +6060,7 @@ test "budget overrides apply selectively" {
 test "generation batching exposes the validated CUDA production envelope" {
     const config = GenerationBatchingConfig{};
     try std.testing.expectEqual(GenerationBatchingMode.off, config.mode);
+    try std.testing.expect(!(GenerationBatchingConfig{ .mode = .auto }).enabledForRequest(.cuda, false, false, false));
 
     const policy = config.schedulerPolicy();
     try std.testing.expectEqual(@as(usize, 2), policy.max_step_items);
@@ -6044,6 +6068,15 @@ test "generation batching exposes the validated CUDA production envelope" {
 
     const clamped = (GenerationBatchingConfig{ .max_step_items = 128 }).schedulerPolicy();
     try std.testing.expectEqual(@as(usize, 2), clamped.max_step_items);
+}
+
+test "generation batching serializes request paths outside the row scheduler" {
+    const config = GenerationBatchingConfig{ .mode = .on };
+    try std.testing.expect(config.enabledForRequest(.cuda, false, false, false));
+    try std.testing.expect(!config.enabledForRequest(.cuda, true, false, false));
+    try std.testing.expect(!config.enabledForRequest(.cuda, false, true, false));
+    try std.testing.expect(!config.enabledForRequest(.cuda, false, false, true));
+    try std.testing.expect(!config.enabledForRequest(.metal, false, false, false));
 }
 
 test "taskMatchesModelListing derives extractors from recognizer capabilities" {

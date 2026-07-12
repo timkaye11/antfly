@@ -557,17 +557,17 @@ fn writeResultsJson(writer: anytype, results: []const CaseResult, ctx: *const cu
 fn writeUsage(writer: anytype) !void {
     try writer.writeAll(
         \\Usage: zig build quant-kernel-cuda-ffn-diff -Dcuda=true -Dcuda-artifacts=sm89 -- [options]
-        \\ 
+        \\
         \\Launch the production F32 E2B FFN pair/down kernels and their generated
         \\exact candidates from the same checked-in CUDA artifact. Every result is
         \\a strict F32 bit-pattern comparison.
-        \\ 
+        \\
         \\Options:
         \\  --inner-dim 6144|12288|all  Default: all
         \\  --pattern random|cancellation|all
         \\  --seed N                     Decimal or 0x-prefixed deterministic seed
         \\  --json                       Emit antfly.cuda_ffn_diff.v1 JSON
-        \\ 
+        \\
     );
 }
 

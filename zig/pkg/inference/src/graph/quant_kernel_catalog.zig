@@ -438,6 +438,7 @@ fn activationEncodingForAttentionStorage(storage: anytype) op.ActivationEncoding
         .f32 => .f32,
         .f16 => .f16,
         .bf16 => .bf16,
+        .paged_f16_or_polar4 => .paged_f16_or_polar4,
     };
 }
 
@@ -446,6 +447,7 @@ fn outputEncodingForAttentionStorage(storage: anytype) op.OutputEncoding {
         .f32 => .f32,
         .f16 => .f16,
         .bf16 => .bf16,
+        .paged_f16_or_polar4 => unreachable,
     };
 }
 

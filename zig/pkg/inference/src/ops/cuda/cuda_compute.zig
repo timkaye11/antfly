@@ -895,12 +895,16 @@ pub const CudaCompute = struct {
         {
             warmupCublasLtBf16(&cublaslt.?, &ctx);
         }
+        const generated_q4_0_gates = GeneratedQ4_0Gates.resolveForTarget(
+            ctx.info.compute_major,
+            ctx.info.compute_minor,
+        );
         return .{
             .allocator = allocator,
             .ctx = ctx,
             .kernels = kernels,
             .cublaslt = cublaslt,
-            .generated_q4_0_gates = GeneratedQ4_0Gates.resolve(),
+            .generated_q4_0_gates = generated_q4_0_gates,
         };
     }
 
@@ -3038,8 +3042,8 @@ pub const GeneratedQ4_0Gates = struct {
     catalog_ffn_candidates: bool = false,
     exact_ffn_candidates: bool = false,
 
-    fn resolve() GeneratedQ4_0Gates {
-        return .{
+    fn resolveForTarget(compute_major: i32, compute_minor: i32) GeneratedQ4_0Gates {
+        const requested = GeneratedQ4_0Gates{
             .mmv = cudaQ4_0GeneratedMmvEnabled(),
             .mm = cudaQ4_0GeneratedMmEnabled(),
             .pair = cudaQ4_0GeneratedPairEnabled(),
@@ -3048,8 +3052,57 @@ pub const GeneratedQ4_0Gates = struct {
             .catalog_ffn_candidates = cudaQ4_0GeneratedCatalogFfnCandidatesEnabled(),
             .exact_ffn_candidates = cudaQ4_0GeneratedExactFfnCandidatesEnabled(),
         };
+        return requested.restrictToPromotedTarget(
+            compute_major,
+            compute_minor,
+            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_ALLOW_UNPROMOTED_GENERATED_KERNELS", false),
+        );
+    }
+
+    fn restrictToPromotedTarget(
+        self: GeneratedQ4_0Gates,
+        compute_major: i32,
+        compute_minor: i32,
+        allow_unpromoted: bool,
+    ) GeneratedQ4_0Gates {
+        if (allow_unpromoted or quant_kernel_catalog.targetForComputeCapability(compute_major, compute_minor) != null) {
+            return self;
+        }
+        return .{
+            .mmv = false,
+            .mm = false,
+            .pair = false,
+            .pair_q8 = false,
+            .down_q8 = false,
+            .catalog_ffn_candidates = false,
+            .exact_ffn_candidates = false,
+        };
     }
 };
+
+test "generated Q4 routes require promoted CUDA target evidence" {
+    const requested = GeneratedQ4_0Gates{
+        .mmv = true,
+        .mm = true,
+        .pair = true,
+        .pair_q8 = true,
+        .down_q8 = true,
+        .catalog_ffn_candidates = true,
+        .exact_ffn_candidates = true,
+    };
+    try std.testing.expect(std.meta.eql(requested, requested.restrictToPromotedTarget(8, 9, false)));
+
+    const blocked = requested.restrictToPromotedTarget(8, 0, false);
+    try std.testing.expect(!blocked.mmv);
+    try std.testing.expect(!blocked.mm);
+    try std.testing.expect(!blocked.pair);
+    try std.testing.expect(!blocked.pair_q8);
+    try std.testing.expect(!blocked.down_q8);
+    try std.testing.expect(!blocked.catalog_ffn_candidates);
+    try std.testing.expect(!blocked.exact_ffn_candidates);
+
+    try std.testing.expect(std.meta.eql(requested, requested.restrictToPromotedTarget(9, 0, true)));
+}
 
 const GeneratedQ4_0CatalogFfnRoute = struct {
     pair_kernel_id: []const u8,
@@ -8159,7 +8212,13 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
                             error.CudaKernelUnavailable, error.InvalidCudaState => try launchLinearQ4_0Tile4ThenBaseF32(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
                             else => return tile4w4_err,
                         };
-                    } else if (rows == 1 and self.generated_q4_0_gates.mmv) {
+                    } else if (rows == 1 and self.generated_q4_0_gates.mmv and
+                        quant_kernel_compiler.generatedArtifactSupportsPlan(
+                            .cuda,
+                            quant_matmul.plan(.{ .rows = rows, .in_dim = in_dim, .out_dim = out_dim, .format = .q4_0 }),
+                            .none,
+                        ))
+                    {
                         if (self.kernels.launchLinearQ4_0GeneratedMmvF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
                             self.stats.q4_0_generated_mmv_hits += 1;
                         } else |generated_err| switch (generated_err) {
@@ -12484,11 +12543,23 @@ fn gqaPagedAttentionBatchWithDeviceKv(
     try ensureCount(k_tensor, try checkedMul(q_rows, h_kv));
     try ensureCount(v_tensor, try checkedMul(q_rows, h_kv));
 
+    // Validate every descriptor before the first stream operation. This keeps
+    // malformed multi-row requests from entering an asynchronous error path.
+    for (kv_batch) |view| {
+        const item_q_len = view.per_item_query_len orelse max_q_len;
+        const item_total_len = view.per_item_total_len orelse attention.total_sequence_len;
+        const item_kv_len = view.per_item_kv_len orelse attention.kv_sequence_len;
+        if (item_q_len == 0 or item_q_len > max_q_len or item_total_len < item_q_len or item_kv_len < item_q_len) {
+            self.stats.device_kv_fail_shape += 1;
+            return error.InvalidShape;
+        }
+    }
+
     const output_count = try checkedMul(q_rows, h_q);
     const output_shape = try dupeShape(self.allocator, q_tensor.shape);
     errdefer self.allocator.free(output_shape);
     var output = try allocDeviceBuffer(self, try checkedMul(output_count, @sizeOf(f32)));
-    errdefer output.free(&self.ctx);
+    errdefer releaseDeviceBuffer(self, &output);
     try self.kernels.launchFillF32(&self.ctx, output, output_count, 0.0);
 
     for (kv_batch, 0..) |view, batch_index| {
@@ -12496,11 +12567,6 @@ fn gqaPagedAttentionBatchWithDeviceKv(
         const item_total_len = view.per_item_total_len orelse attention.total_sequence_len;
         const item_kv_len = view.per_item_kv_len orelse attention.kv_sequence_len;
         const item_kv_position_offset = view.per_item_kv_position_offset orelse attention.kv_position_offset;
-        if (item_q_len == 0 or item_q_len > max_q_len or item_total_len < item_q_len or item_kv_len < item_q_len) {
-            self.stats.device_kv_fail_shape += 1;
-            return error.InvalidShape;
-        }
-
         const row_offset = try checkedMul(batch_index, max_q_len);
         const item_q = try sliceRows2DOp(self, q_ct, row_offset, item_q_len, h_q);
         defer freeTensor(self, item_q);

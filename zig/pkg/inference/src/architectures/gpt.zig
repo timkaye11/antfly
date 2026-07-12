@@ -7251,6 +7251,11 @@ pub fn applyPreparedAttention(
     return result;
 }
 
+fn attentionQueryRopeScale(global_head_dim: u32, head_dim: u32) ?f32 {
+    if (global_head_dim == 0) return null;
+    return @sqrt(@as(f32, @floatFromInt(head_dim)));
+}
+
 fn applyAttentionWithSink(
     cb: *const ComputeBackend,
     config: Config,
@@ -7305,8 +7310,17 @@ fn applyAttentionWithSink(
             const kv_batch_views = dc.kv_batch.?;
             const max_q_len = attention.query_sequence_len;
             const rope_started_at = monotonicNowNs();
-            const Q_rope = try applyPerItemRope(cb, Q, kv_batch_views, batch, max_q_len, num_heads * head_dim, head_dim, rope_dim, rope_theta, config.rope_freq_scale, rope_consecutive_pairs);
-            defer cb.free(Q_rope);
+            const unscaled_q_rope = try applyPerItemRope(cb, Q, kv_batch_views, batch, max_q_len, num_heads * head_dim, head_dim, rope_dim, rope_theta, config.rope_freq_scale, rope_consecutive_pairs);
+            defer cb.free(unscaled_q_rope);
+            const scaled_q_rope: ?CT = if (attentionQueryRopeScale(config.global_head_dim, head_dim)) |scale| blk: {
+                if (try cb.multiplyScalar(unscaled_q_rope, scale)) |scaled| break :blk scaled;
+                const scale_shape = [_]i32{1};
+                const scale_ct = try cb.fromFloat32Shape(&[_]f32{scale}, &scale_shape);
+                defer cb.free(scale_ct);
+                break :blk try cb.multiply(unscaled_q_rope, scale_ct);
+            } else null;
+            defer if (scaled_q_rope) |scaled| cb.free(scaled);
+            const Q_rope = scaled_q_rope orelse unscaled_q_rope;
             const K_rope = try applyPerItemRope(cb, K, kv_batch_views, batch, max_q_len, num_kv_heads * head_dim, head_dim, rope_dim, rope_theta, config.rope_freq_scale, rope_consecutive_pairs);
             defer cb.free(K_rope);
             debug_timing_stats.attention_rope_nanos += @intCast(monotonicNowNs() - rope_started_at);
@@ -7322,8 +7336,7 @@ fn applyAttentionWithSink(
 
         const position_offset = positionOffset(seq_len, attention.query_sequence_len, decode_context);
         const rope_started_at = monotonicNowNs();
-        const Q_rope = if (config.global_head_dim != 0) blk: {
-            const scale = @sqrt(@as(f32, @floatFromInt(head_dim)));
+        const Q_rope = if (attentionQueryRopeScale(config.global_head_dim, head_dim)) |scale| blk: {
             if (try cb.ropeScaled(Q, scale, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs)) |scaled_rope| break :blk scaled_rope;
             const scaled = if (try cb.multiplyScalar(Q, scale)) |scaled_q|
                 scaled_q
@@ -7579,8 +7592,7 @@ pub fn applyAttentionResidual(
         };
         const position_offset = positionOffset(seq_len, attention.query_sequence_len, decode_context);
         const rope_started_at = monotonicNowNs();
-        const Q_rope = if (config.global_head_dim != 0) blk: {
-            const scale = @sqrt(@as(f32, @floatFromInt(head_dim)));
+        const Q_rope = if (attentionQueryRopeScale(config.global_head_dim, head_dim)) |scale| blk: {
             if (try cb.ropeScaled(Q, scale, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs)) |scaled_rope| break :blk scaled_rope;
             const scaled = if (try cb.multiplyScalar(Q, scale)) |scaled_q|
                 scaled_q
@@ -10210,6 +10222,9 @@ fn applyReluSquared(cb: *const ComputeBackend, input: CT) !CT {
 // --- Embedding weight helper ---
 
 test "gemma4 q attention scale is not duplicated for rope attention" {
+    try std.testing.expect(attentionQueryRopeScale(0, 256) == null);
+    try std.testing.expectEqual(@as(f32, 16.0), attentionQueryRopeScale(256, 256).?);
+
     const llama_cfg: Config = .{ .family = .llama };
     try std.testing.expect(!shouldScaleGemma4QBeforeAttention(llama_cfg, false));
 

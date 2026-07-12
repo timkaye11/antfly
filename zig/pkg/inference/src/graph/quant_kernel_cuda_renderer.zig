@@ -456,13 +456,13 @@ pub const AttentionSoftmax = enum {
     online_chronological,
 };
 
-/// Storage is part of the attention semantic plan even though the first
-/// production candidate is deliberately F32-only. Future F16/BF16 candidates
-/// must select a distinct plan instead of changing pointer interpretation.
+/// Storage is part of the attention semantic plan. Paged compressed keys use
+/// a distinct value because their pointer and page-table ABI is not F32.
 pub const AttentionStorage = enum {
     f32,
     f16,
     bf16,
+    paged_f16_or_polar4,
 };
 
 /// A split-KV partition count is an owned schedule parameter, not a hidden
@@ -612,6 +612,7 @@ pub const AttentionLowering = struct {
     value_storage: AttentionStorage,
     output_storage: AttentionStorage,
     split_kv_min_tokens_default: u16,
+    max_kv_tokens: u16,
 
     pub fn validate(self: AttentionLowering) !void {
         if (self.kind != .decode_1x or
@@ -620,15 +621,16 @@ pub const AttentionLowering = struct {
             self.kv_splits != self.split_variant.kvSplits() or
             self.query_heads_per_kv_head == 0 or
             self.query_heads_per_kv_head > generated_attention_query_heads_per_kv_head or
-            self.query_storage != .f32 or self.key_storage != .f32 or
-            self.value_storage != .f32 or self.output_storage != .f32)
+            self.query_storage != .f32 or self.value_storage != .f32 or
+            self.output_storage != .f32)
         {
             return error.InvalidCudaAttentionLowering;
         }
         switch (self.reduction) {
             .split_kv_two_stage => {
                 if (self.softmax != .online_partials_stable_merge or self.split_variant == .score_prework or
-                    self.split_kv_min_tokens_default == 0)
+                    self.key_storage != .f32 or self.split_kv_min_tokens_default == 0 or
+                    self.max_kv_tokens != 0)
                 {
                     return error.InvalidCudaAttentionLowering;
                 }
@@ -636,7 +638,9 @@ pub const AttentionLowering = struct {
             .parallel_scores_then_serial => {
                 if (self.softmax != .online_chronological or self.split_variant != .score_prework or
                     self.kv_splits != generated_attention_score_prework_chunks or
-                    self.split_kv_min_tokens_default != generated_attention_score_prework_max_kv_tokens)
+                    self.key_storage != .paged_f16_or_polar4 or
+                    self.split_kv_min_tokens_default != 0 or
+                    self.max_kv_tokens != generated_attention_score_prework_max_kv_tokens)
                 {
                     return error.InvalidCudaAttentionLowering;
                 }
@@ -1219,6 +1223,7 @@ fn attentionPlan(
             .value_storage = .f32,
             .output_storage = .f32,
             .split_kv_min_tokens_default = generated_attention_split_kv_min_tokens_default,
+            .max_kv_tokens = 0,
         },
     };
 }
@@ -1246,7 +1251,7 @@ fn scorePreworkAttentionPlan(
             .threads_per_block = threads,
             .output_rows_per_block = 1,
             .output_cols_per_block = head_dim,
-            .static_shared_memory_bytes = 20 * @sizeOf(f32),
+            .static_shared_memory_bytes = 4 * @sizeOf(f32),
             .rows = .{ .min = 1, .max = 1, .fixed = 1 },
             .input_dim = .{ .min = head_dim, .max = head_dim, .fixed = head_dim },
             .output_dim = .{},
@@ -1282,10 +1287,11 @@ fn scorePreworkAttentionPlan(
             .kv_splits = generated_attention_score_prework_chunks,
             .query_heads_per_kv_head = generated_attention_query_heads_per_kv_head,
             .query_storage = .f32,
-            .key_storage = .f32,
+            .key_storage = .paged_f16_or_polar4,
             .value_storage = .f32,
             .output_storage = .f32,
-            .split_kv_min_tokens_default = generated_attention_score_prework_max_kv_tokens,
+            .split_kv_min_tokens_default = 0,
+            .max_kv_tokens = generated_attention_score_prework_max_kv_tokens,
         },
     };
 }
@@ -1415,7 +1421,7 @@ pub fn attentionPlanId(plan: AttentionRenderPlan, allocator: std.mem.Allocator) 
             @tagName(plan.lowering.kind),
             plan.lowering.head_dim,
             plan.lowering.query_heads_per_kv_head,
-            plan.lowering.split_kv_min_tokens_default,
+            plan.lowering.max_kv_tokens,
             @tagName(plan.lowering.query_storage),
         }),
     };
@@ -4108,7 +4114,11 @@ test "cuda renderer emits paged score prework with chronological softmax" {
         try std.testing.expectEqual(AttentionSoftmax.online_chronological, plan.lowering.softmax);
         try std.testing.expectEqual(AttentionSplitVariant.score_prework, plan.lowering.split_variant);
         try std.testing.expectEqual(generated_attention_score_prework_chunks, plan.lowering.kv_splits);
-        try std.testing.expectEqual(generated_attention_score_prework_max_kv_tokens, plan.lowering.split_kv_min_tokens_default);
+        try std.testing.expectEqual(@as(u16, 0), plan.lowering.split_kv_min_tokens_default);
+        try std.testing.expectEqual(generated_attention_score_prework_max_kv_tokens, plan.lowering.max_kv_tokens);
+        try std.testing.expectEqual(AttentionStorage.paged_f16_or_polar4, plan.lowering.key_storage);
+        try std.testing.expectEqual(@as(u32, 4 * @sizeOf(f32)), plan.serial_launch.static_shared_memory_bytes);
+        try std.testing.expectEqual(plan.serial_launch.static_shared_memory_bytes, plan.reduction_launch.static_shared_memory_bytes);
         try std.testing.expectEqualStrings("termite_gqa_attention_decode_turboquant_fast_f32", plan.production_baseline);
         try std.testing.expect(!plan.production_enabled);
 

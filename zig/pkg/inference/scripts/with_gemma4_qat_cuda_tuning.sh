@@ -11,8 +11,7 @@ fi
 
 # The server resets the pinned-temp capture sequence whenever it provisions a
 # new request-owned KV storage. Batching stays disabled by default so replay
-# state cannot cross concurrently active requests. The batching gate sets this
-# to 0 together with graph replay off.
+# state cannot cross concurrently active requests.
 case "${ANTFLY_SERVER_DISABLE_CONTINUOUS_BATCHING:-1}" in
   1|true|yes|on)
     disable_continuous_batching=1
@@ -26,8 +25,17 @@ case "${ANTFLY_SERVER_DISABLE_CONTINUOUS_BATCHING:-1}" in
     ;;
 esac
 antfly_decode_graph_replay="${ANTFLY_SERVER_DECODE_GRAPH_REPLAY:-required}"
+if [[ "$disable_continuous_batching" -eq 0 ]]; then
+  case "$antfly_decode_graph_replay" in
+    off|0|false)
+      ;;
+    *)
+      echo "continuous batching requires ANTFLY_SERVER_DECODE_GRAPH_REPLAY=off" >&2
+      exit 2
+      ;;
+  esac
+fi
 gemma4_qat_cuda_tuning_env "${ANTFLY_CAPTURE_FORCE_KV_CAPACITY:-544}"
 exec env "${GEMMA4_QAT_CUDA_ENV[@]}" \
-  ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET=1 \
   ANTFLY_INFERENCE_DISABLE_CONTINUOUS_BATCHING="$disable_continuous_batching" \
   "$@"

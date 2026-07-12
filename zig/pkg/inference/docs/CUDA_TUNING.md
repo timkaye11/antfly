@@ -24,10 +24,11 @@ zig/pkg/inference/scripts/with_gemma4_qat_cuda_tuning.sh \
   --host 127.0.0.1 --port 8080 --models-dir .models --config server.json
 ```
 
-The wrapper sets `ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET=1` and
-disables continuous batching so graph state cannot cross active requests. The
-default graph KV capacity is 544 tokens. For longer requests, set a capacity
-covering prompt and output tokens, rounded up to a KV page:
+With its default graph profile, the wrapper sets
+`ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET=1` and disables continuous
+batching so graph state cannot cross active requests. The default graph KV
+capacity is 544 tokens. For longer requests, set a capacity covering prompt
+and output tokens, rounded up to a KV page:
 
 ```sh
 ANTFLY_CAPTURE_FORCE_KV_CAPACITY=1056 \
@@ -42,6 +43,28 @@ iteration. `ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD` (or
 topology; do not reuse the E2B value without an allocation trace. Request reset
 clears prior slot ABI mappings before rewinding the sequence and fails closed if
 any slot is still live.
+
+Continuous batching and request-scoped graph replay are mutually exclusive.
+Set both server controls explicitly when running the batching profile:
+
+```sh
+ANTFLY_SERVER_DISABLE_CONTINUOUS_BATCHING=0 \
+ANTFLY_SERVER_DECODE_GRAPH_REPLAY=off \
+  zig/pkg/inference/scripts/with_gemma4_qat_cuda_tuning.sh \
+  zig/pkg/inference/zig-out/bin/antfly-inference run \
+  --host 127.0.0.1 --port 8080 --models-dir .models --config server.json
+```
+
+Graph-off mode forces the pinned slot period, skip, and request reset to zero.
+The wrapper rejects batching with any other graph mode, and the server retains
+the model-wide lock for graph, speculative/MTP, and multimodal requests.
+`generation_batching.mode: auto` also remains serialized until the CUDA release
+throughput gate is promoted; use `mode: on` only for an explicit row-2 run.
+
+`scripts/benchmark_gemma4_cuda_batching.py` uses distinguishable equal-length
+prompts, alternating row order, and a staggered mixed-length/page-growth probe.
+Scheduled CI enforces that correctness corpus and a regression floor. Release
+runs retain the `1.5x` C2 aggregate-throughput promotion threshold.
 
 ## Model-Neutral Kernel Catalog
 
@@ -77,6 +100,12 @@ The checked-in exact catalog currently targets CUDA `sm_89` only. Its scope is
 selected Q4_0 and Q4_K row-1 matmuls, Q4_0 x Q8_1 fused FFN shapes, Q6_K x
 Q8_1 K=2560 and K=3840 tile-argmax candidates, and Gemma 4 decode-attention
 topologies.
+Default-on generated Q4 runtime routes are therefore enabled only on SM89.
+Other compute capabilities use the handwritten fallback even when their code
+objects are present in the fatbin. Development experiments can bypass this
+promotion guard with
+`ANTFLY_INFERENCE_CUDA_ALLOW_UNPROMOTED_GENERATED_KERNELS=1`; results from that
+mode are not production evidence.
 Production-enabled entries may route without a candidate opt-in. The 1536-wide
 FFN, Q4_K, Q6_K argmax, and generated-attention entries remain candidates; the
 2560 x 10240 FFN pair/down entries are production-enabled. Q4_K candidates are

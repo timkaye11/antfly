@@ -17,6 +17,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from typing import Any
 
 
 VALID_CACHE_DTYPES = frozenset({"f16", "f32", "int8", "fp8", "int4", "polar4", "turbo3"})
@@ -133,6 +134,7 @@ def response_fingerprint(response: dict) -> str:
 def response_summary(response: dict) -> dict:
     choice = response["choices"][0]
     return {
+        "prompt_tokens": int(response.get("usage", {}).get("prompt_tokens", 0)),
         "completion_tokens": int(response.get("usage", {}).get("completion_tokens", 0)),
         "finish_reason": choice.get("finish_reason"),
         "content": choice.get("message", {}).get("content", choice.get("text", "")),
@@ -233,45 +235,84 @@ class Server:
         return raw, require_scheduler_counters(raw)
 
 
-def run_wave(server: Server, body: dict, concurrency: int) -> dict:
+RequestCase = tuple[str, dict[str, Any]]
+
+
+def run_wave(
+    server: Server,
+    cases: list[RequestCase],
+    concurrency: int,
+    *,
+    offset: int = 0,
+    stagger_ms: float = 0.0,
+) -> dict:
+    if not cases:
+        raise ValueError("at least one request case is required")
     barrier = threading.Barrier(concurrency)
 
-    def request() -> tuple[float, dict]:
+    def request(index: int, case: RequestCase) -> tuple[str, float, dict]:
         barrier.wait()
-        return post_json(server.generate_url, body)
+        if stagger_ms > 0:
+            time.sleep(index * stagger_ms / 1000.0)
+        elapsed_ms, response = post_json(server.generate_url, case[1])
+        return case[0], elapsed_ms, response
 
     started = time.monotonic()
+    selected = [cases[(offset + index) % len(cases)] for index in range(concurrency)]
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = [pool.submit(request) for _ in range(concurrency)]
+        futures = [pool.submit(request, index, case) for index, case in enumerate(selected)]
         results = [future.result() for future in futures]
     wall_ms = (time.monotonic() - started) * 1000.0
-    latencies = [elapsed for elapsed, _ in results]
-    tokens = [int(response.get("usage", {}).get("completion_tokens", 0)) for _, response in results]
+    case_ids = [case_id for case_id, _, _ in results]
+    latencies = [elapsed for _, elapsed, _ in results]
+    tokens = [int(response.get("usage", {}).get("completion_tokens", 0)) for _, _, response in results]
     return {
         "wall_ms": wall_ms,
         "latencies_ms": latencies,
         "completion_tokens": tokens,
         "aggregate_tok_s": sum(tokens) * 1000.0 / wall_ms,
-        "fingerprints": [response_fingerprint(response) for _, response in results],
-        "responses": [response_summary(response) for _, response in results],
+        "case_ids": case_ids,
+        "fingerprints": [response_fingerprint(response) for _, _, response in results],
+        "responses": [response_summary(response) for _, _, response in results],
     }
 
 
-def measure_mode(server: Server, body: dict, concurrencies: list[int], warmups: int, repeats: int) -> dict:
-    for _ in range(warmups):
-        run_wave(server, body, 1)
+def keyed_wave_values(waves: list[dict], field: str) -> dict[str, list[Any]]:
+    values: dict[str, set[Any]] = {}
+    for wave in waves:
+        for case_id, value in zip(wave["case_ids"], wave[field], strict=True):
+            values.setdefault(case_id, set()).add(value)
+    return {case_id: sorted(items) for case_id, items in sorted(values.items())}
+
+
+def measure_mode(server: Server, cases: list[RequestCase], concurrencies: list[int], warmups: int, repeats: int) -> dict:
+    for warmup in range(warmups):
+        for case_offset in range(len(cases)):
+            run_wave(server, cases, 1, offset=warmup + case_offset)
     measured = {}
     final_metrics = ""
     final_counters: dict[str, int | float] = {}
     for concurrency in concurrencies:
         _, before = server.scheduler_metrics()
-        waves = [run_wave(server, body, concurrency) for _ in range(repeats)]
+        wave_count = max(repeats, len(cases)) if concurrency == 1 else repeats
+        waves = [run_wave(server, cases, concurrency, offset=repeat) for repeat in range(wave_count)]
         final_metrics, after = server.scheduler_metrics()
         measured[str(concurrency)] = {
             "aggregate_tok_s": stats([wave["aggregate_tok_s"] for wave in waves]),
             "wall_ms": stats([wave["wall_ms"] for wave in waves]),
             "request_latency_ms": stats([value for wave in waves for value in wave["latencies_ms"]]),
             "fingerprints": sorted({fingerprint for wave in waves for fingerprint in wave["fingerprints"]}),
+            "fingerprints_by_case": keyed_wave_values(waves, "fingerprints"),
+            "prompt_tokens_by_case": keyed_wave_values(
+                [
+                    {
+                        "case_ids": wave["case_ids"],
+                        "prompt_tokens": [response["prompt_tokens"] for response in wave["responses"]],
+                    }
+                    for wave in waves
+                ],
+                "prompt_tokens",
+            ),
             "scheduler_counter_delta": counter_delta(before, after),
             "waves": waves,
         }
@@ -288,6 +329,7 @@ def evaluate_acceptance(
     batched: dict,
     min_c2_speedup: float,
     max_c1_p95_ratio: float,
+    isolation_probe: dict,
 ) -> dict:
     baseline_c1 = baseline["measurements"]["1"]
     batched_c1 = batched["measurements"]["1"]
@@ -299,9 +341,26 @@ def evaluate_acceptance(
     if baseline_p95 <= 0:
         raise ValueError("off-mode C1 p95 latency must be positive")
 
-    expected_fingerprints = baseline_c1["fingerprints"]
-    c1_exact = len(expected_fingerprints) == 1 and batched_c1["fingerprints"] == expected_fingerprints
-    c2_exact = len(expected_fingerprints) == 1 and batched_c2["fingerprints"] == expected_fingerprints
+    expected_fingerprints = baseline_c1["fingerprints_by_case"]
+
+    def exact_by_case(measurement: dict) -> bool:
+        observed = measurement["fingerprints_by_case"]
+        return (
+            bool(expected_fingerprints)
+            and observed.keys() == expected_fingerprints.keys()
+            and all(len(values) == 1 and observed[case_id] == values for case_id, values in expected_fingerprints.items())
+        )
+
+    expected_values = [values[0] for values in expected_fingerprints.values() if len(values) == 1]
+    baseline_cases_distinct = len(expected_values) == len(expected_fingerprints) and len(set(expected_values)) == len(expected_values)
+    prompt_token_values = baseline_c1["prompt_tokens_by_case"]
+    prompt_token_lengths_equal = (
+        len(prompt_token_values) == len(expected_fingerprints)
+        and all(len(values) == 1 and values[0] > 0 for values in prompt_token_values.values())
+        and len({values[0] for values in prompt_token_values.values()}) == 1
+    )
+    c1_exact = exact_by_case(batched_c1)
+    c2_exact = exact_by_case(batched_c2)
     c2_speedup = batched_c2["aggregate_tok_s"]["median"] / baseline_tok_s
     c1_p95_ratio = batched_c1["request_latency_ms"]["p95"] / baseline_p95
     row_two_steps = batched_c2["scheduler_counter_delta"][ROW_TWO_COUNTER]
@@ -312,7 +371,7 @@ def evaluate_acceptance(
             continue
         diagnostics[concurrency] = {
             "aggregate_throughput_ratio_vs_off_c1": measurement["aggregate_tok_s"]["median"] / baseline_tok_s,
-            "exact_response_fingerprints": len(expected_fingerprints) == 1 and measurement["fingerprints"] == expected_fingerprints,
+            "exact_response_fingerprints": exact_by_case(measurement),
             "scheduler_counter_delta": measurement["scheduler_counter_delta"],
         }
 
@@ -321,6 +380,9 @@ def evaluate_acceptance(
         and c1_p95_ratio <= max_c1_p95_ratio
         and c1_exact
         and c2_exact
+        and baseline_cases_distinct
+        and prompt_token_lengths_equal
+        and isolation_probe["passed"]
         and row_two_steps > 0
     )
     return {
@@ -330,9 +392,56 @@ def evaluate_acceptance(
         "max_c1_p95_latency_ratio": max_c1_p95_ratio,
         "c1_exact_response_fingerprints": c1_exact,
         "c2_exact_response_fingerprints": c2_exact,
+        "baseline_case_fingerprints_distinct": baseline_cases_distinct,
+        "prompt_token_lengths_equal": prompt_token_lengths_equal,
+        "isolation_probe": isolation_probe,
         "c2_step_batch_size_2_total": row_two_steps,
         "c2_row_two_steps_positive": row_two_steps > 0,
         "concurrency_4_plus_diagnostics": diagnostics,
+        "passed": passed,
+    }
+
+
+def evaluate_isolation_probe(
+    baseline_measurement: dict,
+    waves: list[dict],
+    scheduler_counter_delta: dict[str, int | float],
+    cases: list[RequestCase],
+    stagger_ms: float,
+) -> dict:
+    expected = baseline_measurement["fingerprints_by_case"]
+    observed = keyed_wave_values(waves, "fingerprints")
+    exact = (
+        observed.keys() == expected.keys()
+        and bool(expected)
+        and all(len(values) == 1 and observed[case_id] == values for case_id, values in expected.items())
+    )
+    expected_values = [values[0] for values in expected.values() if len(values) == 1]
+    distinct = len(expected_values) == len(expected) and len(set(expected_values)) == len(expected_values)
+    requested_limits = sorted({int(body["max_tokens"]) for _, body in cases})
+    mixed_output_limits = len(requested_limits) > 1
+    repeated_kv_growth = len(waves) >= 2 and max(requested_limits, default=0) > 16
+    row_two_steps = scheduler_counter_delta[ROW_TWO_COUNTER]
+    passed = (
+        exact
+        and distinct
+        and stagger_ms > 0
+        and mixed_output_limits
+        and repeated_kv_growth
+    )
+    return {
+        "expected_fingerprints_by_case": expected,
+        "observed_fingerprints_by_case": observed,
+        "exact_response_fingerprints": exact,
+        "baseline_case_fingerprints_distinct": distinct,
+        "stagger_ms": stagger_ms,
+        "staggered_arrivals": stagger_ms > 0,
+        "requested_max_tokens": requested_limits,
+        "mixed_output_limits": mixed_output_limits,
+        "wave_count": len(waves),
+        "repeated_kv_page_growth": repeated_kv_growth,
+        "scheduler_counter_delta": scheduler_counter_delta,
+        "row_two_steps_positive": row_two_steps > 0,
         "passed": passed,
     }
 
@@ -361,6 +470,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 2, 4, 8, 16])
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--stagger-ms", type=float, default=25.0)
     parser.add_argument("--decode-wait-us", type=int, default=1000)
     parser.add_argument("--max-step-items", type=int, default=2)
     parser.add_argument("--min-c2-speedup", type=float, default=1.5)
@@ -378,11 +488,11 @@ def parse_args() -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> None:
     if not args.antfly_bin.exists() or not args.model.exists():
         raise ValueError("antfly binary or model does not exist")
-    if args.tokens < 1 or args.warmups < 0 or args.repeats < 1:
-        raise ValueError("tokens/repeats must be positive and warmups non-negative")
+    if args.tokens < 32 or args.warmups < 0 or args.repeats < 1:
+        raise ValueError("tokens must be at least 32, repeats positive, and warmups non-negative")
     if args.decode_wait_us < 0 or args.max_step_items < 2:
         raise ValueError("decode wait must be non-negative and max-step-items must be at least 2")
-    if args.min_c2_speedup <= 0 or args.max_c1_p95_ratio <= 0 or args.startup_timeout <= 0:
+    if args.min_c2_speedup <= 0 or args.max_c1_p95_ratio <= 0 or args.startup_timeout <= 0 or args.stagger_ms <= 0:
         raise ValueError("acceptance thresholds and startup timeout must be positive")
     if any(value < 1 for value in args.concurrency):
         raise ValueError("concurrency values must be positive")
@@ -400,35 +510,79 @@ def validate_args(args: argparse.Namespace) -> None:
 def benchmark_dtype(args: argparse.Namespace, cache_dtype: str) -> dict:
     output_dir = args.output_dir / cache_dtype
     output_dir.mkdir(parents=True, exist_ok=True)
-    body = {
+    base_body = {
         "model": str(args.model.resolve()),
         "backend": "cuda",
-        "messages": [{"role": "user", "content": args.prompt}],
-        "max_tokens": args.tokens,
         "temperature": 0,
         "stream": False,
         "cache_dtype": cache_dtype,
     }
 
+    def request_case(case_id: str, prompt: str, max_tokens: int) -> RequestCase:
+        return (
+            case_id,
+            {
+                **base_body,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+            },
+        )
+
+    prompt_a = f"{args.prompt}\nBegin the answer with A:"
+    prompt_b = f"{args.prompt}\nBegin the answer with B:"
+    primary_cases = [
+        request_case("primary_a", prompt_a, args.tokens),
+        request_case("primary_b", prompt_b, args.tokens),
+    ]
+    short_tokens = args.tokens - max(1, min(16, args.tokens // 4))
+    isolation_cases = [
+        request_case("staggered_long_a", prompt_a, args.tokens),
+        request_case("staggered_short_b", prompt_b, short_tokens),
+    ]
+
     with Server(args, "off", output_dir) as server:
-        baseline = measure_mode(server, body, [1], args.warmups, args.repeats)
+        baseline = measure_mode(server, primary_cases, [1], args.warmups, args.repeats)
+        isolation_baseline = measure_mode(server, isolation_cases, [1], 0, max(2, args.repeats))
     with Server(args, "on", output_dir) as server:
-        batched = measure_mode(server, body, args.concurrency, args.warmups, args.repeats)
+        batched = measure_mode(server, primary_cases, args.concurrency, args.warmups, args.repeats)
+        _, isolation_before = server.scheduler_metrics()
+        isolation_waves = [
+            run_wave(
+                server,
+                isolation_cases,
+                2,
+                offset=repeat,
+                stagger_ms=args.stagger_ms,
+            )
+            for repeat in range(max(2, args.repeats))
+        ]
+        _, isolation_after = server.scheduler_metrics()
+
+    isolation_probe = evaluate_isolation_probe(
+        isolation_baseline["measurements"]["1"],
+        isolation_waves,
+        counter_delta(isolation_before, isolation_after),
+        isolation_cases,
+        args.stagger_ms,
+    )
 
     acceptance = evaluate_acceptance(
         baseline,
         batched,
         args.min_c2_speedup,
         args.max_c1_p95_ratio,
+        isolation_probe,
     )
     summary = {
         "config": {
             "model": str(args.model.resolve()),
             "tokens": args.tokens,
             "cache_dtype": cache_dtype,
+            "prompts": [prompt_a, prompt_b],
             "concurrency": args.concurrency,
             "decode_wait_us": args.decode_wait_us,
             "max_step_items": args.max_step_items,
+            "stagger_ms": args.stagger_ms,
         },
         "baseline": baseline,
         "batched": batched,
@@ -455,6 +609,7 @@ def main() -> None:
             "concurrency": args.concurrency,
             "decode_wait_us": args.decode_wait_us,
             "max_step_items": args.max_step_items,
+            "stagger_ms": args.stagger_ms,
             "warmups": args.warmups,
             "repeats": args.repeats,
             "server_prefix": args.server_prefix,

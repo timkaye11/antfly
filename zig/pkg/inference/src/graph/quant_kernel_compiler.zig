@@ -575,7 +575,9 @@ pub const KernelSchedule = struct {
     attention_kv_splits: u8 = 1,
     attention_query_heads_per_kv_head: u8 = 1,
     attention_split_kv_min_tokens: u16 = 0,
+    attention_max_kv_tokens: u16 = 0,
     attention_storage: AttentionStorage = .f32,
+    attention_key_storage: AttentionStorage = .f32,
 
     /// A block's lanes are processed strided across threads when the block has
     /// more values than the threadgroup has threads.
@@ -608,6 +610,7 @@ pub const AttentionStorage = enum {
     f32,
     f16,
     bf16,
+    paged_f16_or_polar4,
 };
 
 test "quant kernel compiler rejects unsafe Metal reduction thread counts" {
@@ -2835,10 +2838,15 @@ fn cudaAttentionSchedule(head_dim: u16, split_variant: cuda_renderer.AttentionSp
         .attention_kv_splits = split_variant.kvSplits(),
         .attention_query_heads_per_kv_head = cuda_renderer.generated_attention_query_heads_per_kv_head,
         .attention_split_kv_min_tokens = if (split_variant == .score_prework)
-            cuda_renderer.generated_attention_score_prework_max_kv_tokens
+            0
         else
             cuda_renderer.generated_attention_split_kv_min_tokens_default,
+        .attention_max_kv_tokens = if (split_variant == .score_prework)
+            cuda_renderer.generated_attention_score_prework_max_kv_tokens
+        else
+            0,
         .attention_storage = .f32,
+        .attention_key_storage = if (split_variant == .score_prework) .paged_f16_or_polar4 else .f32,
     };
 }
 
@@ -3957,10 +3965,23 @@ pub fn validateGeneratedArtifactRegistry() !void {
                     op.schedule.attention_serial_threads_per_threadgroup == 0 or
                     op.schedule.attention_stage2_threads_per_threadgroup == 0 or
                     op.schedule.attention_kv_splits == 0 or
-                    op.schedule.attention_query_heads_per_kv_head == 0 or
-                    op.schedule.attention_split_kv_min_tokens == 0))
+                    op.schedule.attention_query_heads_per_kv_head == 0))
                 {
                     return error.GeneratedArtifactScheduleInvalid;
+                }
+                if (artifact.backend == .cuda) {
+                    const score_prework = op.schedule.attention_key_storage == .paged_f16_or_polar4;
+                    if (score_prework) {
+                        if (op.schedule.attention_split_kv_min_tokens != 0 or
+                            op.schedule.attention_max_kv_tokens == 0)
+                        {
+                            return error.GeneratedArtifactScheduleInvalid;
+                        }
+                    } else if (op.schedule.attention_split_kv_min_tokens == 0 or
+                        op.schedule.attention_max_kv_tokens != 0)
+                    {
+                        return error.GeneratedArtifactScheduleInvalid;
+                    }
                 }
             },
         }
@@ -7296,6 +7317,13 @@ pub fn cudaAttentionRenderPlanForArtifact(artifact: anytype) ?cuda_renderer.Atte
         .f32 => plan.lowering.query_storage == .f32,
         .f16 => plan.lowering.query_storage == .f16,
         .bf16 => plan.lowering.query_storage == .bf16,
+        .paged_f16_or_polar4 => plan.lowering.query_storage == .paged_f16_or_polar4,
+    };
+    const key_storage_matches = switch (op.schedule.attention_key_storage) {
+        .f32 => plan.lowering.key_storage == .f32,
+        .f16 => plan.lowering.key_storage == .f16,
+        .bf16 => plan.lowering.key_storage == .bf16,
+        .paged_f16_or_polar4 => plan.lowering.key_storage == .paged_f16_or_polar4,
     };
     if (plan.lowering.kind != op.kind or
         plan.lowering.head_dim != op.head_dim or
@@ -7305,7 +7333,8 @@ pub fn cudaAttentionRenderPlanForArtifact(artifact: anytype) ?cuda_renderer.Atte
         plan.lowering.kv_splits != op.schedule.attention_kv_splits or
         plan.lowering.query_heads_per_kv_head != op.schedule.attention_query_heads_per_kv_head or
         plan.lowering.split_kv_min_tokens_default != op.schedule.attention_split_kv_min_tokens or
-        !storage_matches or
+        plan.lowering.max_kv_tokens != op.schedule.attention_max_kv_tokens or
+        !storage_matches or !key_storage_matches or
         !std.mem.eql(u8, plan.kernel_id, artifact.kernel_id) or
         plan.production_enabled != artifact.production_enabled)
     {
@@ -10643,7 +10672,15 @@ test "quant kernel compiler attention artifacts carry typed render plans" {
             try std.testing.expectEqual(plan.lowering.split_variant.kvSplits(), op.schedule.attention_kv_splits);
             try std.testing.expectEqual(cuda_renderer.generated_attention_query_heads_per_kv_head, op.schedule.attention_query_heads_per_kv_head);
             try std.testing.expectEqual(plan.lowering.split_kv_min_tokens_default, op.schedule.attention_split_kv_min_tokens);
+            try std.testing.expectEqual(plan.lowering.max_kv_tokens, op.schedule.attention_max_kv_tokens);
             try std.testing.expectEqual(AttentionStorage.f32, op.schedule.attention_storage);
+            try std.testing.expectEqual(
+                if (plan.lowering.split_variant == .score_prework)
+                    AttentionStorage.paged_f16_or_polar4
+                else
+                    AttentionStorage.f32,
+                op.schedule.attention_key_storage,
+            );
             try std.testing.expect(op.schedule.attention_serial_threads_per_threadgroup > 0);
             try std.testing.expect(op.schedule.attention_stage2_threads_per_threadgroup > 0);
             inline for (.{ plan.serial_kernel_id, plan.kernel_id, plan.reduction_kernel_id }) |kernel_id| {
