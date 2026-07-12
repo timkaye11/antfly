@@ -113,6 +113,7 @@ jobs:
             "${jobs_arg[@]}" \
             --archive-name "antfly-zig-${{ matrix.arch }}.tar.gz" \
             --out-dir "$RUNNER_TEMP" \
+            --onnx true \
             --metal false \
             --system-blas false
 

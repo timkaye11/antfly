@@ -93,6 +93,7 @@ jobs:
             "${jobs_arg[@]}" \
             --archive-name "$archive" \
             --out-dir dist/release-archives \
+            --onnx true \
             --metal "${{ matrix.metal }}" \
             --system-blas "${{ matrix.system_blas }}"
 

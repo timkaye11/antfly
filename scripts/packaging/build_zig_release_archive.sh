@@ -3,7 +3,13 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--metal true|false] [--system-blas true|false] [--optimize MODE] [--jobs N]
+usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--metal true|false] [--system-blas true|false] [--onnx true|false] [--optimize MODE] [--jobs N]
+
+  --onnx  Enable the ONNX Runtime backend for embedded inference (default: true).
+          ORT libraries are auto-provisioned via
+          zig/pkg/inference/scripts/download-onnxruntime.sh. Upstream ORT is
+          glibc/macOS only; for *-linux-musl targets ORT is skipped with a
+          warning (the binary still builds, without ORT).
 
 Builds the native Antfly Zig runtime and writes a release archive whose root
 contains:
@@ -22,6 +28,12 @@ metal=false
 system_blas=false
 optimize=ReleaseFast
 jobs=
+# Production/release builds enable ONNX Runtime so the embedded inference server
+# serves imported-ONNX models (e.g. SigLIP2@512 image tower) through ORT
+# (~0.30 s/img) instead of the native interpreter (~17 s/img). Dev builds are
+# unaffected: they use zig/Makefile or `zig build` directly, where -Donnx
+# defaults OFF (zig/build.zig). Overridable with --onnx false.
+onnx=true
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -47,6 +59,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --system-blas)
       system_blas="${2:?missing --system-blas value}"
+      shift 2
+      ;;
+    --onnx)
+      onnx="${2:?missing --onnx value}"
       shift 2
       ;;
     --optimize)
@@ -89,6 +105,15 @@ case "$optimize" in
     ;;
 esac
 
+case "$onnx" in
+  true|false) ;;
+  *)
+    usage
+    echo "--onnx must be true or false; got: $onnx" >&2
+    exit 2
+    ;;
+esac
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 work_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/antfly-zig-release-${target}"
 prefix="${work_root}/zig-out"
@@ -102,6 +127,64 @@ fi
 rm -rf "$work_root"
 mkdir -p "$prefix" "$stage" "$cache_root/global" "$out_dir"
 
+# ---------------------------------------------------------------------------
+# ONNX Runtime provisioning.
+#
+# When --onnx is enabled (default for release/production), download the pinned
+# ORT libraries (via zig/pkg/inference/scripts/download-onnxruntime.sh, the same
+# vendored fetch used by go/Dockerfile.omni) into the location the Zig build
+# discovers by default: zig/pkg/inference/onnxruntime/<os>-<arch>. The embedded
+# inference graph then links libonnxruntime and serves imported-ONNX models
+# through ORT.
+#
+# Upstream (Microsoft) ORT is glibc + macOS only. For *-linux-musl targets there
+# is no compatible ORT build, so ORT is skipped with a warning and the binary is
+# built without it (non-fatal). Provisioning/download failures also degrade to a
+# no-ORT build rather than breaking the release.
+# ---------------------------------------------------------------------------
+onnx_root=
+if [ "$onnx" = "true" ]; then
+  case "$target" in
+    *-linux-musl|*musl*)
+      echo "[onnx] target '$target' is musl; upstream ONNX Runtime is glibc-only -> building WITHOUT ORT (native interpreter). See report: the Linux runtime image (Alpine/musl) needs a glibc base to serve imported-ONNX via ORT." >&2
+      onnx=false
+      ;;
+    *)
+      case "$target" in
+        x86_64-*) ort_arch=amd64 ;;
+        aarch64-*) ort_arch=arm64 ;;
+        *) ort_arch= ;;
+      esac
+      case "$target" in
+        *-macos*|*-darwin*) ort_os=darwin ;;
+        *-linux-*|*-linux) ort_os=linux ;;
+        *) ort_os= ;;
+      esac
+      if [ -z "$ort_os" ] || [ -z "$ort_arch" ]; then
+        echo "[onnx] cannot map target '$target' to an ORT platform -> building WITHOUT ORT" >&2
+        onnx=false
+      else
+        ort_platform="${ort_os}-${ort_arch}"
+        ort_base="$repo_root/zig/pkg/inference/onnxruntime"
+        onnx_root="$ort_base/$ort_platform"
+        if [ ! -f "$onnx_root/include/onnxruntime_c_api.h" ]; then
+          echo "[onnx] provisioning ONNX Runtime for $ort_platform into $ort_base"
+          if ! ONNXRUNTIME_ROOT="$ort_base" "$repo_root/zig/pkg/inference/scripts/download-onnxruntime.sh"; then
+            echo "[onnx] download-onnxruntime.sh reported failures (partial platform availability is expected); continuing" >&2
+          fi
+        fi
+        if [ -f "$onnx_root/include/onnxruntime_c_api.h" ] && [ -d "$onnx_root/lib" ]; then
+          echo "[onnx] ONNX Runtime ready at $onnx_root -> building WITH ORT"
+        else
+          echo "[onnx] ONNX Runtime not available at $onnx_root -> building WITHOUT ORT" >&2
+          onnx=false
+          onnx_root=
+        fi
+      fi
+      ;;
+  esac
+fi
+
 zig_build_args=(
   -Dtarget="$target"
   -Doptimize="$optimize"
@@ -109,13 +192,16 @@ zig_build_args=(
   -Dedition=full
   -Dantfly-bin-name=antfly
   -Dantfly-version="$version"
-  -Donnx=false
+  -Donnx="$onnx"
   -Dmetal="$metal"
   -Dsystem-blas="$system_blas"
   install
   --prefix "$prefix"
   --global-cache-dir "$cache_root/global"
 )
+if [ "$onnx" = "true" ] && [ -n "$onnx_root" ]; then
+  zig_build_args+=(-Donnx-root="$onnx_root")
+fi
 
 (
   cd "$repo_root/zig"
