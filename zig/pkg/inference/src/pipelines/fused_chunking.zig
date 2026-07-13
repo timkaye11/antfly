@@ -60,6 +60,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const platform = @import("antfly_platform");
 const lib_chunker = @import("inference_chunker");
 const hf_tokenizer = @import("inference_hf_tokenizer");
 const fused_chunker = @import("../finetune/fused_chunker.zig");
@@ -102,6 +103,53 @@ else
 /// is not chunked (the tokenizer truncates); at max_seq_len=384 this allows
 /// ~85 forward windows per request.
 pub const max_serving_tokens: usize = 32768;
+
+/// Batch-size ladder for the boundary window forward (Metal only). A document's
+/// full max_seq_len windows are packed into padded batched MPSGraph executions
+/// (rows beyond the real window count are attention-masked padding). Capping at
+/// 16 and looping the remainder bounds the geometry cache; the ragged final
+/// window is never batched (it runs the eager/row-wise window path).
+const boundary_batch_ladder = [_]usize{ 1, 2, 4, 8, 16 };
+const boundary_max_batch = boundary_batch_ladder[boundary_batch_ladder.len - 1];
+
+/// Kill switch for batched boundary windows (default ON). Off (or a failed
+/// startup self-check) keeps the one-window-per-execution path. A/B toggle for
+/// batched-vs-batch=1 boundary latency on one binary.
+pub const serving_batched_env_flag = "ANTFLY_FUSED_CHUNKER_SERVING_BATCHED";
+
+fn servingBatchedEnvEnabled() bool {
+    return platform.env.getenvBoolDefault(serving_batched_env_flag, true);
+}
+
+/// Whether a batched boundary window group has cleared its startup self-check.
+const BoundaryBatchMode = enum { unchecked, batched, rowwise };
+
+/// Max boundary-logit delta (batched vs batch=1 compiled) tolerated by the
+/// batched self-check. Batched matmul reduction order differs from batch=1 by
+/// cross-kernel noise; identical chunk spans require this to stay well under
+/// the boundary decode's decision margin.
+const boundary_batch_logit_tol: f32 = 1e-3;
+
+/// Peak-RSS ceiling (bytes) for admitting a NEW batched boundary geometry.
+/// Env override in whole GiB via ANTFLY_FUSED_CHUNKER_SERVING_RSS_CEIL_GIB.
+const boundary_rss_ceiling_env_flag = "ANTFLY_FUSED_CHUNKER_SERVING_RSS_CEIL_GIB";
+const boundary_default_rss_ceiling_gib: usize = 18;
+
+fn boundaryRssCeilingBytes() usize {
+    const gib = platform.env.getenvUsize(boundary_rss_ceiling_env_flag) orelse boundary_default_rss_ceiling_gib;
+    return gib * 1024 * 1024 * 1024;
+}
+
+fn boundaryPeakRssBytes() usize {
+    const usage = std.posix.getrusage(std.posix.rusage.SELF);
+    if (usage.maxrss <= 0) return 0;
+    const maxrss: usize = @intCast(usage.maxrss);
+    return switch (@import("builtin").os.tag) {
+        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => maxrss,
+        .linux => std.math.mul(usize, maxrss, 1024) catch std.math.maxInt(usize),
+        else => maxrss,
+    };
+}
 
 const boundary_dense1_weight_name = "fused_chunker_embedder/boundary_head/mlp_dense1/weight";
 const embedding_proj_weight_name = "fused_chunker_embedder/embedding_head/proj/weight";
@@ -177,7 +225,20 @@ pub const FusedChunkerPipeline = struct {
     /// Compiled MPSGraph segment forward over the merged base weights (Metal
     /// only; null when disabled, unsupported, or failed to compile at load).
     /// Its `failed` flag latches the eager fallback after a first failure.
+    /// This is the batch=1 (row-wise) geometry: the ragged-window path, the
+    /// batched self-check reference, and the fallback when batching is off.
     compiled_forward: ?CompiledForwardT = null,
+    /// Lazily-built batched boundary geometries at seq=max_seq_len, one per
+    /// batch rung > 1 (index i -> boundary_batch_ladder[i]; slot 0 unused,
+    /// batch=1 lives in `compiled_forward`).
+    compiled_forward_batched: [boundary_batch_ladder.len]?CompiledForwardT =
+        [_]?CompiledForwardT{null} ** boundary_batch_ladder.len,
+    /// Resolved by the first batched forward's self-check.
+    boundary_batch_mode: BoundaryBatchMode = .unchecked,
+    /// Latched max boundary-logit delta from the batched self-check.
+    boundary_batch_delta: f32 = 0,
+    /// Set once if a batched geometry compile was skipped for the RSS ceiling.
+    boundary_rss_ceiling_hit: bool = false,
     /// Lazily materialized f32 SPLADE projection [vocab_size * hidden_size].
     splade_weight: ?[]f32 = null,
     /// Serializes forward passes (GPU command submission / weight residency).
@@ -302,7 +363,7 @@ pub const FusedChunkerPipeline = struct {
         var cef = fused_chunker_compiled_forward.CompiledEvalForward.initMergedBase(
             self.allocator,
             graph_config,
-            1, // one layer per segment: the segmentation eval/training validated
+            fused_chunker_compiled_forward.servingLayersPerSegment(),
         ) catch |err| {
             std.log.warn(
                 "fused chunker: compiled serving forward init failed ({s}); using eager forward",
@@ -331,6 +392,9 @@ pub const FusedChunkerPipeline = struct {
         if (self.use_metal) {
             if (comptime build_options.enable_metal) {
                 if (self.compiled_forward) |*cef| cef.deinit();
+                for (&self.compiled_forward_batched) |*slot| {
+                    if (slot.*) |*cef| cef.deinit();
+                }
                 fused_chunker_weights.deinitMetalWeightStore(allocator, &self.metal_store);
                 self.metal_backend.deinit();
             }
@@ -437,6 +501,246 @@ pub const FusedChunkerPipeline = struct {
         return true;
     }
 
+    /// Smallest boundary batch rung that fits `n` (`n <= boundary_max_batch`).
+    fn boundaryBatchLadderIndex(n: usize) usize {
+        for (boundary_batch_ladder, 0..) |rung, i| if (n <= rung) return i;
+        return boundary_batch_ladder.len - 1;
+    }
+
+    /// Build (once) the batched boundary geometry for one batch rung (seq =
+    /// max_seq_len). Refuses a new geometry past the RSS ceiling.
+    fn ensureBoundaryBatchedSession(self: *FusedChunkerPipeline, batch_idx: usize) !*CompiledForwardT {
+        if (comptime !build_options.enable_metal) return error.MetalDisabled;
+        const slot = &self.compiled_forward_batched[batch_idx];
+        if (slot.* == null) {
+            if (boundaryPeakRssBytes() >= boundaryRssCeilingBytes()) {
+                self.boundary_rss_ceiling_hit = true;
+                return error.RssCeiling;
+            }
+            const graph_config = try fused_chunker_compiled_forward.graphConfigFromBertConfig(
+                self.config.modernBertConfig(),
+            );
+            var cef = try fused_chunker_compiled_forward.CompiledEvalForward.initMergedBase(
+                self.allocator,
+                graph_config,
+                fused_chunker_compiled_forward.servingLayersPerSegment(),
+            );
+            errdefer cef.deinit();
+            try cef.warmup(boundary_batch_ladder[batch_idx], self.max_seq_len);
+            slot.* = cef;
+        }
+        return &slot.*.?;
+    }
+
+    /// First-use self-check for batched boundary windows: run window 0 both
+    /// batch=1 (the shipped, eager-parity-gated compiled forward) and padded
+    /// batch=2, and require their boundary logits to agree within
+    /// `boundary_batch_logit_tol`. Latches `.batched` or `.rowwise`. Must hold
+    /// `inference_lock`.
+    fn boundaryBatchSelfCheck(
+        self: *FusedChunkerPipeline,
+        allocator: std.mem.Allocator,
+        cb: *const ComputeBackend,
+        cfg: fused_chunker.Config,
+        enc_ids: []const i32,
+        msl: usize,
+    ) void {
+        if (comptime !build_options.enable_metal) {
+            self.boundary_batch_mode = .rowwise;
+            return;
+        }
+        if (self.compiled_forward == null or self.compiled_forward.?.failed) {
+            self.boundary_batch_mode = .rowwise;
+            return;
+        }
+        const H: usize = @intCast(cfg.hidden_size);
+        var no_lora: [0]fused_chunker_lora.LoRALayer = .{};
+
+        const ids0 = allocator.alloc(i64, msl) catch {
+            self.boundary_batch_mode = .rowwise;
+            return;
+        };
+        defer allocator.free(ids0);
+        const mask0 = allocator.alloc(i64, msl) catch {
+            self.boundary_batch_mode = .rowwise;
+            return;
+        };
+        defer allocator.free(mask0);
+        for (0..msl) |t| {
+            ids0[t] = enc_ids[t];
+            mask0[t] = 1;
+        }
+
+        // Reference: batch=1 compiled forward -> boundary logits.
+        const ref_cef = &self.compiled_forward.?;
+        const ref_hidden = ref_cef.forward(cb, cfg.modernBertConfig(), ids0, mask0, 1, msl, &no_lora) catch {
+            self.boundary_batch_mode = .rowwise;
+            return;
+        };
+        defer self.allocator.free(ref_hidden);
+        const ref_logits = fused_chunker.forwardBoundaryOnlyFromHidden(cb, allocator, cfg, ref_hidden, 1, msl) catch {
+            self.boundary_batch_mode = .rowwise;
+            return;
+        };
+        defer allocator.free(ref_logits);
+
+        // Test: padded batch=2 (window 0 real + 1 masked padding row).
+        const sc_batch_idx: usize = 1; // rung 2
+        const B = boundary_batch_ladder[sc_batch_idx];
+        const test_cef = self.ensureBoundaryBatchedSession(sc_batch_idx) catch {
+            self.boundary_batch_mode = .rowwise;
+            return;
+        };
+        const pad_ids = allocator.alloc(i64, B * msl) catch {
+            self.boundary_batch_mode = .rowwise;
+            return;
+        };
+        defer allocator.free(pad_ids);
+        const pad_mask = allocator.alloc(i64, B * msl) catch {
+            self.boundary_batch_mode = .rowwise;
+            return;
+        };
+        defer allocator.free(pad_mask);
+        for (0..msl) |t| {
+            pad_ids[t] = enc_ids[t];
+            pad_mask[t] = 1;
+        }
+        @memset(pad_ids[msl .. B * msl], 0);
+        @memset(pad_mask[msl .. B * msl], 0);
+        const test_hidden = test_cef.forward(cb, cfg.modernBertConfig(), pad_ids, pad_mask, B, msl, &no_lora) catch {
+            self.boundary_batch_mode = .rowwise;
+            return;
+        };
+        defer self.allocator.free(test_hidden);
+        const test_logits = fused_chunker.forwardBoundaryOnlyFromHidden(cb, allocator, cfg, test_hidden[0 .. msl * H], 1, msl) catch {
+            self.boundary_batch_mode = .rowwise;
+            return;
+        };
+        defer allocator.free(test_logits);
+
+        var max_delta: f32 = 0;
+        for (ref_logits, test_logits) |a, b| max_delta = @max(max_delta, @abs(a - b));
+        self.boundary_batch_delta = max_delta;
+        if (max_delta < boundary_batch_logit_tol) {
+            self.boundary_batch_mode = .batched;
+            std.log.info(
+                "fused chunker: boundary batched self-check PASSED (max logit delta {e:.3} < {e:.3}); batching full windows (batch ladder up to {d}; set {s}=0 to force row-wise)",
+                .{ max_delta, boundary_batch_logit_tol, boundary_max_batch, serving_batched_env_flag },
+            );
+        } else {
+            self.boundary_batch_mode = .rowwise;
+            std.log.warn(
+                "fused chunker: boundary batched self-check FAILED (max logit delta {e:.3} >= {e:.3}); keeping row-wise windows",
+                .{ max_delta, boundary_batch_logit_tol },
+            );
+        }
+    }
+
+    /// Batched boundary forward over the document's FULL max_seq_len windows.
+    /// Full windows are packed into padded (batch rung, msl) MPSGraph
+    /// executions (padding rows attention-masked), one head pass per group.
+    /// Returns the number of leading full windows written; the caller runs the
+    /// remaining windows (the ragged tail, or everything on 0) through the
+    /// row-wise window path. Runs the startup self-check on first use.
+    fn forwardBoundaryWindowsBatched(
+        self: *FusedChunkerPipeline,
+        allocator: std.mem.Allocator,
+        cb: *const ComputeBackend,
+        cfg: fused_chunker.Config,
+        enc_ids: []const i32,
+        full_windows: usize,
+        need_token_outputs: bool,
+        boundary_dst_all: []f32,
+        embedding_dst_all: []f32,
+        emb_dim: usize,
+    ) usize {
+        if (comptime !build_options.enable_metal) return 0;
+        if (full_windows == 0) return 0;
+        const msl = self.max_seq_len;
+
+        if (self.boundary_batch_mode == .unchecked) {
+            self.boundaryBatchSelfCheck(allocator, cb, cfg, enc_ids, msl);
+        }
+        if (self.boundary_batch_mode != .batched) return 0;
+
+        const H: usize = @intCast(cfg.hidden_size);
+        var no_lora: [0]fused_chunker_lora.LoRALayer = .{};
+
+        const pad_ids = allocator.alloc(i64, boundary_max_batch * msl) catch return 0;
+        defer allocator.free(pad_ids);
+        const pad_mask = allocator.alloc(i64, boundary_max_batch * msl) catch return 0;
+        defer allocator.free(pad_mask);
+
+        var win: usize = 0;
+        while (win < full_windows) {
+            const g = @min(full_windows - win, boundary_max_batch);
+            const batch_idx = boundaryBatchLadderIndex(g);
+            const B = boundary_batch_ladder[batch_idx];
+
+            for (0..g) |r| {
+                const src = (win + r) * msl;
+                const dst = r * msl;
+                for (0..msl) |t| {
+                    pad_ids[dst + t] = enc_ids[src + t];
+                    pad_mask[dst + t] = 1;
+                }
+            }
+            @memset(pad_ids[g * msl .. B * msl], 0);
+            @memset(pad_mask[g * msl .. B * msl], 0);
+
+            const cef = self.ensureBoundaryBatchedSession(batch_idx) catch {
+                // RSS ceiling / compile failure: stop batching here; caller
+                // finishes the remaining windows row-wise.
+                return win;
+            };
+            const hidden = cef.forward(cb, cfg.modernBertConfig(), pad_ids[0 .. B * msl], pad_mask[0 .. B * msl], B, msl, &no_lora) catch |err| {
+                cef.failed = true;
+                std.log.warn(
+                    "fused chunker: batched boundary forward failed ({s}); finishing row-wise",
+                    .{@errorName(err)},
+                );
+                return win;
+            };
+            defer self.allocator.free(hidden);
+            const real_hidden = hidden[0 .. g * msl * H];
+
+            if (need_token_outputs) {
+                var result = fused_chunker.forwardFromHidden(cb, allocator, cfg, real_hidden, g, msl) catch |err| {
+                    cef.failed = true;
+                    std.log.warn(
+                        "fused chunker: batched boundary head forward failed ({s}); finishing row-wise",
+                        .{@errorName(err)},
+                    );
+                    return win;
+                };
+                defer result.deinit(allocator);
+                for (0..g) |r| {
+                    const wi = win + r;
+                    const tok0 = wi * msl;
+                    @memcpy(boundary_dst_all[tok0 * 2 .. (tok0 + msl) * 2], result.boundary_logits[r * msl * 2 .. (r + 1) * msl * 2]);
+                    @memcpy(embedding_dst_all[tok0 * emb_dim .. (tok0 + msl) * emb_dim], result.token_embeddings[r * msl * emb_dim .. (r + 1) * msl * emb_dim]);
+                }
+            } else {
+                const logits = fused_chunker.forwardBoundaryOnlyFromHidden(cb, allocator, cfg, real_hidden, g, msl) catch |err| {
+                    cef.failed = true;
+                    std.log.warn(
+                        "fused chunker: batched boundary head forward failed ({s}); finishing row-wise",
+                        .{@errorName(err)},
+                    );
+                    return win;
+                };
+                defer allocator.free(logits);
+                for (0..g) |r| {
+                    const wi = win + r;
+                    const tok0 = wi * msl;
+                    @memcpy(boundary_dst_all[tok0 * 2 .. (tok0 + msl) * 2], logits[r * msl * 2 .. (r + 1) * msl * 2]);
+                }
+            }
+            win += g;
+        }
+        return full_windows;
+    }
+
     /// Chunk a text document. Returned chunks (and their owned embeddings)
     /// are allocated from `allocator`; free with lib_chunker.types.freeChunks.
     pub fn chunkText(
@@ -517,7 +821,30 @@ pub const FusedChunkerPipeline = struct {
             const msl = self.max_seq_len;
             const windows = numWindows(valid_len, msl);
             phase.windows = @intCast(windows);
+
+            // Batched compiled path over the document's full max_seq_len windows
+            // (Metal, default ON, startup-self-check gated). Returns how many
+            // leading full windows it wrote; the row-wise loop below finishes
+            // the rest (the ragged tail, or every window if batching is
+            // off/failed/self-check-rejected).
             var w: usize = 0;
+            if (comptime build_options.enable_metal) {
+                if (self.compiled_forward != null and servingBatchedEnvEnabled()) {
+                    const full_windows = valid_len / msl;
+                    w = self.forwardBoundaryWindowsBatched(
+                        allocator,
+                        &cb,
+                        cfg,
+                        enc.ids[0..valid_len],
+                        full_windows,
+                        need_token_outputs,
+                        boundary_logits,
+                        token_embeddings,
+                        emb_dim,
+                    );
+                }
+            }
+
             while (w < windows) : (w += 1) {
                 const start = w * msl;
                 const end = @min(start + msl, valid_len);

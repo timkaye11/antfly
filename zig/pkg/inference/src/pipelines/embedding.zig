@@ -49,7 +49,15 @@ const length_bucketing_env_flag = "ANTFLY_EMBED_LENGTH_BUCKETING";
 /// larger amortizes per-forward dispatch over more rows. 2048 groups the
 /// 33..512-token ModernBERT chunk mix into a handful of tight sub-batches. A
 /// single sequence longer than the budget still forms its own sub-batch.
-const length_bucket_token_budget: usize = 2048;
+/// Raising this (env `ANTFLY_EMBED_LENGTH_BUCKET_TOKEN_BUDGET`) feeds the Metal
+/// compiled forward larger batches, which it then packs into padded batched
+/// MPSGraph executions — fewer, larger GPU round-trips for many-chunk docs.
+const length_bucket_token_budget_env = "ANTFLY_EMBED_LENGTH_BUCKET_TOKEN_BUDGET";
+const length_bucket_token_budget_default: usize = 2048;
+
+fn lengthBucketTokenBudget() usize {
+    return platform.env.getenvUsize(length_bucket_token_budget_env) orelse length_bucket_token_budget_default;
+}
 
 fn lengthBucketingEnabled() bool {
     return platform.env.getenvBoolDefault(length_bucketing_env_flag, true);
@@ -752,11 +760,12 @@ pub const EmbeddingPipeline = struct {
     /// padded token count (rows * max-len-in-bucket) stays within the budget; a
     /// single over-budget sequence still forms a one-element bucket.
     fn growLengthBucket(order: []const usize, lens: []const usize, gi: usize) usize {
+        const budget = lengthBucketTokenBudget();
         var gj = gi;
         var gmax = lens[order[gi]];
         while (gj + 1 < order.len) {
             const cand_max = @max(gmax, lens[order[gj + 1]]);
-            if ((gj + 2 - gi) * cand_max > length_bucket_token_budget) break;
+            if ((gj + 2 - gi) * cand_max > budget) break;
             gmax = cand_max;
             gj += 1;
         }

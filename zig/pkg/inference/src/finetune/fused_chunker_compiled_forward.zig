@@ -72,6 +72,20 @@ pub fn servingEnvEnabled() bool {
     return policy.servingCompiledForwardEnabled(platform.env.getenv(serving_env_flag));
 }
 
+/// Layers fused into each compiled serving segment. Default 1 (the shipped,
+/// parity-validated per-layer segmentation). Larger values fuse more encoder
+/// layers into one MPSGraph execution — fewer GPU round-trips and fewer
+/// inter-segment host hidden-state copies per forward — at the cost of a bigger
+/// compiled graph and more transient GPU memory per execution. Used by both the
+/// fused-chunker boundary forward and the frozen embedder's compiled forward.
+pub const serving_layers_per_segment_env = "ANTFLY_FUSED_CHUNKER_SERVING_LAYERS_PER_SEGMENT";
+
+pub fn servingLayersPerSegment() u32 {
+    const v = platform.env.getenvUsize(serving_layers_per_segment_env) orelse return 1;
+    if (v == 0) return 1;
+    return std.math.cast(u32, v) orelse 1;
+}
+
 /// ModernBERT-base head count; the fused chunker encoder is not configurable
 /// on this axis (matches the eager `modern_bert.Config` default and the
 /// trainer's compiled forward config).
