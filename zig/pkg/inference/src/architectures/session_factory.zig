@@ -4214,7 +4214,7 @@ const ArchSession = struct {
     /// lock for compile/execute/phase transitions.
     modernbert_compiled: ?*anyopaque = null,
     /// Serializes lazy creation of `modernbert_compiled`.
-    compiled_init_lock: std.Thread.Mutex = .{},
+    compiled_init_lock: std.atomic.Mutex = .unlocked,
 };
 
 /// Attach a runtime Io to a Session created by this factory so its
@@ -4539,7 +4539,7 @@ fn ensureModernBertCompiled(
         if (self.backend_type != .metal) return null;
         if (!modernbert_compiled_embedder.envEnabled()) return null;
         if (self.modernbert_compiled) |ptr| return ptr;
-        self.compiled_init_lock.lock();
+        while (!self.compiled_init_lock.tryLock()) std.atomic.spinLoopHint();
         defer self.compiled_init_lock.unlock();
         if (self.modernbert_compiled) |ptr| return ptr;
         const mc = modernbert_compiled_embedder.ModernBertCompiledForward.create(self.allocator, cfg) catch |err| {

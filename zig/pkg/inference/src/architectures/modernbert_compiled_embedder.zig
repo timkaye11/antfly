@@ -47,6 +47,14 @@ const fused_chunker_compiled_forward = @import("../finetune/fused_chunker_compil
 const fused_chunker_lora = @import("../finetune/lora_adapter_set.zig");
 const CompiledEvalForward = fused_chunker_compiled_forward.CompiledEvalForward;
 
+/// This Zig fork's `std.atomic.Mutex` exposes only `tryLock`/`unlock`; callers
+/// spin (matching pipelines/fused_chunking.zig and server/model_manager.zig).
+fn spinLock(m: *std.atomic.Mutex) void {
+    while (!m.tryLock()) {
+        std.atomic.spinLoopHint();
+    }
+}
+
 /// Kill switch. Default ON: the pipeline attempts the compiled forward, but the
 /// startup parity self-check must pass before it actually serves compiled
 /// features. Set to "0"/"false"/"no"/"off" to force the eager forward.
@@ -58,10 +66,14 @@ pub fn envEnabled() bool {
 
 /// Fixed geometry ladder (in tokens). A serving `run` call rounds its sequence
 /// length up to the smallest rung that fits and runs every row batch=1 at that
-/// rung, so at most `bucket_ladder.len` MPSGraph geometries are ever compiled.
-/// Split-encoder chunk batches span ~33..512 tokens; sequences longer than the
-/// last rung fall back to the eager forward.
-const bucket_ladder = [_]usize{ 64, 128, 192, 256, 320, 384, 448, 512 };
+/// rung, so at most `bucket_ladder.len` MPSGraph geometries are ever compiled
+/// (rungs build lazily, only as chunk lengths demand). Fused-chunker chunk
+/// token spans are capped at 512, and the nomic `search_document: ` prefix +
+/// [CLS]/[SEP] push the max embedder sequence to ~517, so the 576 rung is the
+/// one the largest chunks land on. The 768/1024 rungs give headroom for raw
+/// (non-chunk) embedding of longer texts; anything past the last rung falls
+/// back to the eager forward.
+const bucket_ladder = [_]usize{ 128, 256, 384, 512, 576, 768, 1024 };
 
 /// The hard parity gate: served dense/SPLADE embeddings must stay at least this
 /// cosine-similar to the eager output (protects the 0.335 retrieval).
@@ -79,7 +91,7 @@ pub const ModernBertCompiledForward = struct {
     sessions: [bucket_ladder.len]?CompiledEvalForward = [_]?CompiledEvalForward{null} ** bucket_ladder.len,
     phase: Phase = .unchecked,
     /// Serializes lazy compile, GPU submission, and phase transitions.
-    lock: std.Thread.Mutex = .{},
+    lock: std.atomic.Mutex = .unlocked,
     /// Latched parity result for logging/introspection.
     checked_cosine: f32 = 0,
 
@@ -106,7 +118,7 @@ pub const ModernBertCompiledForward = struct {
     }
 
     pub fn currentPhase(self: *ModernBertCompiledForward) Phase {
-        self.lock.lock();
+        spinLock(&self.lock);
         defer self.lock.unlock();
         return self.phase;
     }
@@ -149,7 +161,7 @@ pub const ModernBertCompiledForward = struct {
         batch: usize,
         seq_len: usize,
     ) !?[]f32 {
-        self.lock.lock();
+        spinLock(&self.lock);
         defer self.lock.unlock();
         if (self.phase == .disabled) return null;
         return self.forwardLocked(result_allocator, cb, ids_i64, mask_i64, batch, seq_len);
@@ -241,7 +253,7 @@ pub const ModernBertCompiledForward = struct {
         seq_len: usize,
         eager_hidden: []const f32,
     ) void {
-        self.lock.lock();
+        spinLock(&self.lock);
         defer self.lock.unlock();
         if (self.phase != .unchecked) return;
         if (batch == 0 or seq_len == 0) return;
@@ -261,9 +273,9 @@ pub const ModernBertCompiledForward = struct {
         var min_cos: f32 = 1.0;
         var sum_cos: f64 = 0;
         var rows: usize = 0;
-        var pooled_eager = self.allocator.alloc(f32, H) catch return;
+        const pooled_eager = self.allocator.alloc(f32, H) catch return;
         defer self.allocator.free(pooled_eager);
-        var pooled_comp = self.allocator.alloc(f32, H) catch return;
+        const pooled_comp = self.allocator.alloc(f32, H) catch return;
         defer self.allocator.free(pooled_comp);
 
         for (0..batch) |b| {
@@ -345,11 +357,14 @@ fn rowPooledCosine(
 
 test "ladderIndex rounds up to the smallest fitting rung" {
     try std.testing.expectEqual(@as(?usize, 0), ModernBertCompiledForward.ladderIndex(1));
-    try std.testing.expectEqual(@as(?usize, 0), ModernBertCompiledForward.ladderIndex(64));
-    try std.testing.expectEqual(@as(?usize, 1), ModernBertCompiledForward.ladderIndex(65));
-    try std.testing.expectEqual(@as(?usize, 5), ModernBertCompiledForward.ladderIndex(384));
-    try std.testing.expectEqual(@as(?usize, 7), ModernBertCompiledForward.ladderIndex(512));
-    try std.testing.expectEqual(@as(?usize, null), ModernBertCompiledForward.ladderIndex(513));
+    try std.testing.expectEqual(@as(?usize, 0), ModernBertCompiledForward.ladderIndex(128));
+    try std.testing.expectEqual(@as(?usize, 1), ModernBertCompiledForward.ladderIndex(129));
+    try std.testing.expectEqual(@as(?usize, 2), ModernBertCompiledForward.ladderIndex(384));
+    try std.testing.expectEqual(@as(?usize, 3), ModernBertCompiledForward.ladderIndex(512));
+    // 512-token chunks + prefix/specials (~517) round up to the 576 rung.
+    try std.testing.expectEqual(@as(?usize, 4), ModernBertCompiledForward.ladderIndex(517));
+    try std.testing.expectEqual(@as(?usize, 6), ModernBertCompiledForward.ladderIndex(1024));
+    try std.testing.expectEqual(@as(?usize, null), ModernBertCompiledForward.ladderIndex(1025));
 }
 
 test "rowPooledCosine is 1.0 for identical rows and ignores masked tokens" {
