@@ -261,10 +261,10 @@ fn cudaDecodeGraphReplayRequested(raw_opt: ?[]const u8) bool {
 }
 
 pub const GenerationBatchingConfig = struct {
-    // Explicit CUDA production rollout: prefill remains singleton and decode
-    // batches homogeneous sequence positions up to the validated row envelope.
-    // Keep the default and `auto` serialized until the release throughput gate
-    // passes; `mode: on` is the explicit opt-in for the validated row envelope.
+    // Experimental CUDA batching: prefill remains singleton and decode batches
+    // homogeneous sequence positions within the bounded row-2 envelope. Keep
+    // the default and `auto` serialized until the promotion gate passes;
+    // `mode: on` is an explicit opt-in for validation and benchmarking.
     mode: GenerationBatchingMode = .off,
     max_step_items: usize = 2,
     max_step_query_tokens: usize = 512,
@@ -7191,7 +7191,7 @@ test "budget overrides apply selectively" {
     try std.testing.expectEqual(@as(usize, 600), applied.scratch_limit_bytes);
 }
 
-test "generation batching exposes the validated CUDA production envelope" {
+test "generation batching keeps the experimental CUDA envelope default-off" {
     const config = GenerationBatchingConfig{};
     try std.testing.expectEqual(GenerationBatchingMode.off, config.mode);
     try std.testing.expect(!(GenerationBatchingConfig{ .mode = .auto }).enabledForRequest(.cuda, false, false, false));

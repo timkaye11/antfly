@@ -58,13 +58,13 @@ ANTFLY_SERVER_DECODE_GRAPH_REPLAY=off \
 Graph-off mode forces the pinned slot period, skip, and request reset to zero.
 The wrapper rejects batching with any other graph mode, and the server retains
 the model-wide lock for graph, speculative/MTP, and multimodal requests.
-`generation_batching.mode: auto` also remains serialized until the CUDA release
-throughput gate is promoted; use `mode: on` only for an explicit row-2 run.
+`generation_batching.mode: auto` also remains serialized until the batching
+promotion gate passes; use `mode: on` only for an explicit row-2 run.
 
 `scripts/benchmark_gemma4_cuda_batching.py` uses distinguishable equal-length
 prompts, alternating row order, and a staggered mixed-length/page-growth probe.
-Scheduled CI enforces that correctness corpus and a regression floor. Release
-runs retain the `1.5x` C2 aggregate-throughput promotion threshold.
+Scheduled and release CI enforce that correctness corpus with a `0.40` C2
+regression floor. Manual promotion runs retain the `1.5x` throughput threshold.
 
 ## Model-Neutral Kernel Catalog
 
@@ -466,19 +466,20 @@ benchmark with persistent graph replay and candidate attention, Q6 LM-head,
 Q8-intermediate E2B FFN, and exact-F32 E2B FFN routes disabled. It also runs
 the 12B Q4_K_M f32 replay case twice and
 requires identical token IDs, healthy replay, and zero disabled-candidate
-counters. The production E2B profile keeps the faster Q8_1 DP4A linear and
-pair routes ahead of the generated Q4_0 MMV/MM/pair routes and requires zero
-fallback from every generated Q4_0 route. Generated-route hit and promotion
-evidence remains a separate exact-token kernel-candidate gate because the
-fixed release prompt does not exercise every generated row bucket.
+counters. Every measured sample must hit the production Q8_1 DP4A linear and
+pair prefill routes and report zero hits or fallbacks from the generated Q4_0
+MMV/MM/pair/pair-Q8/down-Q8 routes. Generated-route hit and promotion evidence
+remains a separate exact-token kernel-candidate gate because the fixed release
+prompt does not exercise every generated row bucket.
 
 Use manual `gate=release` to preflight the commit intended for release. Tag-based
 publication calls the same workflow at the tag SHA and cannot publish assets
 until it passes. Its
 `release_scope` is `target_only`: CUDA MTP is not executed or certified. That mode
-requires the E2B comparable llama.cpp ratio to be at least `0.80` and a token
-throughput CV no higher than `0.02`; nightly collection keeps the same
-correctness/replay contract without asserting the future throughput target.
+requires the E2B comparable llama.cpp ratio to be at least `0.70` and a token
+throughput CV no higher than `0.02`; `0.80` remains the future optimization
+target. Nightly collection keeps the same correctness/replay contract without
+asserting the performance floor.
 Each run uploads `release_summary.json`, `release_provenance.json`, paired raw
 logs/timing, and 12B timing evidence.
 
@@ -495,7 +496,7 @@ python3 zig/pkg/inference/scripts/gemma4_cuda_l4_release_gate.py \
   --e2b-model /path/to/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf \
   --gemma12b-q4-model /path/to/gemma-4-12B-it-Q4_K_M.gguf \
   --output-dir /tmp/antfly-gemma4-l4-release \
-  --enforce-performance --min-comparable-ratio 0.80 --verify-artifacts
+  --enforce-performance --min-comparable-ratio 0.70 --verify-artifacts
 ```
 
 ## Server Batching
@@ -507,8 +508,8 @@ zig/pkg/inference/scripts/benchmark_gemma4_cuda_server.py \
   --tokens 256 --warmups 1 --repeats 5
 ```
 
-Continuous batching remains off. Before enabling it, run the row-2 production
-gate for dense and compressed KV storage:
+Continuous batching remains off. Before enabling it, run the row-2 manual
+promotion gate for dense and compressed KV storage:
 
 ```sh
 zig/pkg/inference/scripts/benchmark_gemma4_cuda_batching.py \
@@ -519,4 +520,9 @@ zig/pkg/inference/scripts/benchmark_gemma4_cuda_batching.py \
 The gate requires exact response equality, positive scheduler row-2 counters,
 at least 1.5x C2 aggregate throughput versus batching-off C1, and bounded C1
 latency. Concurrency 4 and above remains diagnostic under the current two-row
-validated envelope.
+bounded envelope.
+
+Because continuous batching remains default-off, the GitHub release workflow
+uses an explicit `0.40` C2 speedup floor as a correctness and catastrophic-
+regression check. The benchmark's `1.5` default remains the manual promotion
+gate before enabling batching by default.

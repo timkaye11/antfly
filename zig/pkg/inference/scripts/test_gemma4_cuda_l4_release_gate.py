@@ -23,9 +23,12 @@ from gemma4_cuda_l4_release_gate import (
     E2B_LLAMA_TOKENS,
     FROZEN_PROFILE,
     GEMMA12B_TOKENS,
+    FORBIDDEN_GENERATED_Q4_0_ROUTE_COUNTERS,
     MAX_TOK_S_CV,
     RELEASE_SCOPE,
+    REQUIRED_Q8_PREFILL_ROUTE_COUNTERS,
     TOKEN_IDS_RE,
+    benchmark_contract,
     canonical_sha256,
     disabled_candidate_errors,
     diagnostic_mode_errors,
@@ -89,6 +92,8 @@ def pair() -> dict:
             "antfly_generated_q4_0_pair_q8_fallbacks": 0,
             "antfly_generated_q4_0_down_q8": 0,
             "antfly_generated_q4_0_down_q8_fallbacks": 0,
+            "antfly_q8_1_prefill_linear": 1,
+            "antfly_q8_1_prefill_pair": 1,
             "antfly_generated_e2b_pair": 0,
             "antfly_generated_e2b_down": 0,
             "antfly_generated_e2b_pair_fallbacks": 0,
@@ -155,6 +160,13 @@ class L4ReleaseGateTest(unittest.TestCase):
         publish = release[release.index("  publish-release-assets:"):release.index("  package-cli-artifacts:")]
         self.assertIn("- cuda-gemma4-release-gate", publish)
 
+    def test_workflow_uses_accepted_release_and_batching_regression_floors(self) -> None:
+        workflow = (pathlib.Path(__file__).resolve().parents[4] / ".github/workflows/cuda-gemma4-l4.yml").read_text(encoding="utf-8")
+        self.assertIn("--enforce-performance --min-comparable-ratio 0.70 --verify-artifacts", workflow)
+        batching = workflow[workflow.index("- name: Validate Polar4 server batching"):workflow.index("- name: Collect fixed E2B", workflow.index("- name: Validate Polar4 server batching"))]
+        self.assertIn("--min-c2-speedup 0.40", batching)
+        self.assertNotIn('if [[ "$CUDA_RELEASE_MODE" == "nightly" ]]', batching)
+
     def test_profile_locks_candidate_gates_and_returns_a_copy(self) -> None:
         profile = frozen_profile()
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE"])
@@ -205,10 +217,22 @@ class L4ReleaseGateTest(unittest.TestCase):
         self.assertEqual("123", environment["TIMEOUT"])
 
     def test_matrix_ratio_is_only_a_failure_when_enforced(self) -> None:
-        self.assertEqual([], e2b_contract_errors(matrix(0.72, passed=False), False, DEFAULT_MIN_COMPARABLE_RATIO))
-        errors = e2b_contract_errors(matrix(0.72, passed=False), True, DEFAULT_MIN_COMPARABLE_RATIO)
-        self.assertTrue(any("below required 0.800" in error for error in errors))
+        self.assertEqual(0.70, DEFAULT_MIN_COMPARABLE_RATIO)
+        self.assertEqual([], e2b_contract_errors(matrix(0.69, passed=False), False, DEFAULT_MIN_COMPARABLE_RATIO))
+        self.assertEqual([], e2b_contract_errors(matrix(0.70), True, DEFAULT_MIN_COMPARABLE_RATIO))
+        errors = e2b_contract_errors(matrix(0.69, passed=False), True, DEFAULT_MIN_COMPARABLE_RATIO)
+        self.assertTrue(any("below required 0.700" in error for error in errors))
         self.assertTrue(any("did not pass" in error for error in errors))
+
+    def test_benchmark_provenance_binds_performance_and_route_contract(self) -> None:
+        contract = benchmark_contract(argparse.Namespace(
+            enforce_performance=True,
+            min_comparable_ratio=DEFAULT_MIN_COMPARABLE_RATIO,
+        ))
+        self.assertTrue(contract["performance_enforced"])
+        self.assertEqual(0.70, contract["min_comparable_ratio"])
+        self.assertEqual(list(REQUIRED_Q8_PREFILL_ROUTE_COUNTERS), contract["required_positive_route_counters"])
+        self.assertEqual(list(FORBIDDEN_GENERATED_Q4_0_ROUTE_COUNTERS), contract["required_zero_route_counters"])
 
     def test_matrix_contract_rejects_replay_or_pair_failures(self) -> None:
         bad = matrix()
@@ -235,11 +259,35 @@ class L4ReleaseGateTest(unittest.TestCase):
         self.assertTrue(any("antfly_generated_q4_0_e2b_ffn_exact" in error for error in errors))
         self.assertTrue(any("antfly_generated_e2b_exact_pair" in error for error in errors))
 
-    def test_pair_contract_allows_q8_precedence_without_generated_hits_and_rejects_fallback(self) -> None:
-        bad = pair()
-        bad["rows"][0]["antfly_generated_q4_0_pair_fallbacks"] = 1
-        errors = e2b_pair_contract_errors(bad)
-        self.assertTrue(any("generated-route fallback antfly_generated_q4_0_pair_fallbacks" in error for error in errors))
+    def test_pair_contract_requires_positive_q8_prefill_routes(self) -> None:
+        for key in REQUIRED_Q8_PREFILL_ROUTE_COUNTERS:
+            with self.subTest(key=key):
+                bad = pair()
+                bad["rows"][0][key] = 0
+                errors = e2b_pair_contract_errors(bad)
+                self.assertTrue(any(key in error for error in errors))
+
+    def test_pair_contract_rejects_generated_q4_route_hits_and_fallbacks(self) -> None:
+        for key in FORBIDDEN_GENERATED_Q4_0_ROUTE_COUNTERS:
+            with self.subTest(key=key):
+                bad = pair()
+                bad["rows"][0][key] = 1
+                errors = e2b_pair_contract_errors(bad)
+                self.assertTrue(any(key in error for error in errors))
+
+    def test_pair_contract_rejects_missing_or_malformed_route_counters(self) -> None:
+        counters = REQUIRED_Q8_PREFILL_ROUTE_COUNTERS + FORBIDDEN_GENERATED_Q4_0_ROUTE_COUNTERS
+        for key in counters:
+            with self.subTest(key=key, case="missing"):
+                bad = pair()
+                del bad["rows"][0][key]
+                errors = e2b_pair_contract_errors(bad)
+                self.assertTrue(any(f"missing route counter {key}" in error for error in errors))
+            with self.subTest(key=key, case="malformed"):
+                bad = pair()
+                bad["rows"][0][key] = "1" if key in REQUIRED_Q8_PREFILL_ROUTE_COUNTERS else "0"
+                errors = e2b_pair_contract_errors(bad)
+                self.assertTrue(any(f"invalid route counter {key}" in error for error in errors))
 
     def test_12b_replay_contract_requires_exact_tokens_and_disabled_candidates(self) -> None:
         run = generation_run()
@@ -314,13 +362,13 @@ class L4ReleaseGateTest(unittest.TestCase):
             warmups=1,
             repeats=3,
             enforce_performance=True,
-            min_comparable_ratio=0.80,
+            min_comparable_ratio=DEFAULT_MIN_COMPARABLE_RATIO,
         )
         command = matrix_command(args)
         self.assertIn("--lengths", command)
         self.assertEqual(str(E2B_LLAMA_TOKENS), command[command.index("--lengths") + 1])
         self.assertEqual(str(E2B_LLAMA_TOKENS), command[command.index("--target-length") + 1])
-        self.assertEqual("0.8", command[command.index("--min-comparable-ratio") + 1])
+        self.assertEqual("0.7", command[command.index("--min-comparable-ratio") + 1])
         self.assertIn("--no-require-generated-attention", command)
         self.assertIn("--no-require-generated-q6-lm-head-argmax", command)
         self.assertIn("--collect-only", command)

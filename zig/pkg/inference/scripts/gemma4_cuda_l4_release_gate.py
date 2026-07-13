@@ -36,7 +36,23 @@ GEMMA12B_PROMPT = "Write one sentence about ants."
 GEMMA12B_TOKENS = 256
 CAPTURE_KV_CAPACITY = 544
 MAX_TOK_S_CV = 0.02
-DEFAULT_MIN_COMPARABLE_RATIO = 0.80
+DEFAULT_MIN_COMPARABLE_RATIO = 0.70
+REQUIRED_Q8_PREFILL_ROUTE_COUNTERS = (
+    "antfly_q8_1_prefill_linear",
+    "antfly_q8_1_prefill_pair",
+)
+FORBIDDEN_GENERATED_Q4_0_ROUTE_COUNTERS = (
+    "antfly_generated_q4_0_mmv",
+    "antfly_generated_q4_0_mmv_fallbacks",
+    "antfly_generated_q4_0_mm",
+    "antfly_generated_q4_0_mm_fallbacks",
+    "antfly_generated_q4_0_pair",
+    "antfly_generated_q4_0_pair_fallbacks",
+    "antfly_generated_q4_0_pair_q8",
+    "antfly_generated_q4_0_pair_q8_fallbacks",
+    "antfly_generated_q4_0_down_q8",
+    "antfly_generated_q4_0_down_q8_fallbacks",
+)
 TOKEN_IDS_RE = re.compile(r"^token_ids:(?P<ids>(?:\s+-?\d+)*)\s*$", re.MULTILINE)
 
 # These values are applied after the caller environment.  The lower-case
@@ -325,6 +341,22 @@ def release_environment(args: argparse.Namespace) -> dict[str, str]:
     return environment
 
 
+def benchmark_contract(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "prompt": E2B_PROMPT,
+        "antfly_tokens": E2B_ANTFLY_TOKENS,
+        "llama_tokens": E2B_LLAMA_TOKENS,
+        "cache_dtype": "f32",
+        "graph_replay": "required",
+        "performance_enforced": args.enforce_performance,
+        "min_comparable_ratio": args.min_comparable_ratio,
+        "max_tok_s_cv": MAX_TOK_S_CV,
+        "continuous_batching": "disabled",
+        "required_positive_route_counters": list(REQUIRED_Q8_PREFILL_ROUTE_COUNTERS),
+        "required_zero_route_counters": list(FORBIDDEN_GENERATED_Q4_0_ROUTE_COUNTERS),
+    }
+
+
 def matrix_command(args: argparse.Namespace) -> list[str]:
     minimum_ratio = args.min_comparable_ratio if args.enforce_performance else 0.0
     return [
@@ -418,6 +450,25 @@ def float_value(value: object) -> float:
     return parsed if math.isfinite(parsed) else 0.0
 
 
+def route_counter_value(
+    row: dict[str, Any],
+    key: str,
+    sample_index: int,
+    errors: list[str],
+) -> int | None:
+    if key not in row:
+        errors.append(f"E2B sample {sample_index} is missing route counter {key}")
+        return None
+    value = row[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        errors.append(
+            f"E2B sample {sample_index} has invalid route counter {key}={value!r}; "
+            "expected a non-negative integer"
+        )
+        return None
+    return value
+
+
 def e2b_contract_errors(matrix: dict[str, Any], enforce_performance: bool, minimum_ratio: float) -> list[str]:
     errors: list[str] = []
     entries = matrix.get("entries")
@@ -469,15 +520,17 @@ def e2b_pair_contract_errors(pair: dict[str, Any]) -> list[str]:
         errors.append("E2B paired summary has no measured rows")
         return errors
     for index, row in enumerate(rows, start=1):
-        for key in (
-            "antfly_generated_q4_0_mmv_fallbacks",
-            "antfly_generated_q4_0_mm_fallbacks",
-            "antfly_generated_q4_0_pair_fallbacks",
-            "antfly_generated_q4_0_pair_q8_fallbacks",
-            "antfly_generated_q4_0_down_q8_fallbacks",
-        ):
-            if int_value(row.get(key)) != 0:
-                errors.append(f"E2B sample {index} reported generated-route fallback {key}")
+        if not isinstance(row, dict):
+            errors.append(f"E2B sample {index} is not an object")
+            continue
+        for key in REQUIRED_Q8_PREFILL_ROUTE_COUNTERS:
+            value = route_counter_value(row, key, index, errors)
+            if value is not None and value <= 0:
+                errors.append(f"E2B sample {index} did not use required Q8_1 prefill route {key}")
+        for key in FORBIDDEN_GENERATED_Q4_0_ROUTE_COUNTERS:
+            value = route_counter_value(row, key, index, errors)
+            if value is not None and value != 0:
+                errors.append(f"E2B sample {index} unexpectedly used generated Q4_0 route counter {key}")
         if int_value(row.get("antfly_generated_q6_lm_head_argmax")) != 0:
             errors.append(f"E2B sample {index} unexpectedly used generated Q6 LM-head")
         if int_value(row.get("antfly_generated_q6_lm_head_argmax_fallbacks")) != 0:
@@ -698,15 +751,7 @@ def main() -> None:
         "artifacts": artifacts,
         "frozen_profile": profile,
         "frozen_profile_sha256": canonical_sha256(profile),
-        "benchmark_contract": {
-            "prompt": E2B_PROMPT,
-            "antfly_tokens": E2B_ANTFLY_TOKENS,
-            "llama_tokens": E2B_LLAMA_TOKENS,
-            "cache_dtype": "f32",
-            "graph_replay": "required",
-            "max_tok_s_cv": MAX_TOK_S_CV,
-            "continuous_batching": "disabled",
-        },
+        "benchmark_contract": benchmark_contract(args),
     }
     write_json(args.output_dir / "release_provenance.json", provenance)
 

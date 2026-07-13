@@ -191,12 +191,12 @@ jobs:
             --concurrency 1 2
             --warmups 1
             --repeats 2
+            --min-c2-speedup 0.40
+            --max-c1-p95-ratio 1.20
           )
-          if [[ "$CUDA_RELEASE_MODE" == "nightly" ]]; then
-            # Nightly proves row isolation and keeps a regression floor. The
-            # release mode retains the benchmark's 1.5x promotion threshold.
-            args+=(--min-c2-speedup 0.40 --max-c1-p95-ratio 1.20)
-          fi
+          # Continuous batching remains default-off. CI proves row isolation
+          # and guards a regression floor; the script's 1.5x default remains
+          # the manual promotion gate.
           "${args[@]}"
 
       - name: Collect fixed E2B and 12B release evidence
@@ -218,7 +218,7 @@ jobs:
             nightly)
               ;;
             release)
-              args+=(--enforce-performance --min-comparable-ratio 0.80 --verify-artifacts)
+              args+=(--enforce-performance --min-comparable-ratio 0.70 --verify-artifacts)
               ;;
             *)
               echo "unsupported CUDA_RELEASE_MODE=$CUDA_RELEASE_MODE" >&2

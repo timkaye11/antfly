@@ -7823,9 +7823,38 @@ pub const NativeGenerationPipeline = struct {
     }
 
     /// Drive a claimed step end-to-end. Always calls `scheduler.completeStep`
-    /// before returning so pending entries never leak. Per-item failures are
-    /// surfaced via `work.failure`/`work.ready`; the function itself does not
-    /// return errors to the caller.
+    /// before publishing `work.ready`, so a waiter can never observe ready
+    /// work that the scheduler still owns. Per-item failures are surfaced via
+    /// `work.failure`/`work.ready`; the function itself does not return errors
+    /// to the caller.
+    fn completeClaimedStepBeforePublish(
+        scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
+        lease: *runtime.scheduler.native_generate.Lease,
+        claimed: []const runtime.scheduler.native_generate.StepItem,
+        publisher: anytype,
+    ) void {
+        scheduler.completeStep(lease, claimed);
+        publisher.publish(claimed);
+    }
+
+    const FailedStepPublisher = struct {
+        err: anyerror,
+
+        fn publish(self: @This(), claimed: []const runtime.scheduler.native_generate.StepItem) void {
+            markStepFailed(claimed, self.err);
+        }
+    };
+
+    const SuccessfulStepPublisher = struct {
+        vocab_size: usize,
+        logits: ?[]const f32,
+        max_query_seq_len: usize,
+
+        fn publish(self: @This(), claimed: []const runtime.scheduler.native_generate.StepItem) void {
+            dispatchStepLogits(self.vocab_size, claimed, self.logits, self.max_query_seq_len);
+        }
+    };
+
     fn executeClaimedStep(
         self: *NativeGenerationPipeline,
         scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
@@ -7840,14 +7869,16 @@ pub const NativeGenerationPipeline = struct {
         self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
 
         const result = self.forwardScheduledStep(claimed) catch |err| {
-            markStepFailed(claimed, err);
-            scheduler.completeStep(lease, claimed);
+            completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = err });
             return;
         };
         defer if (result.logits) |logits| self.allocator.free(logits);
 
-        dispatchStepLogits(self.gpt_config.vocab_size, claimed, result.logits, result.max_query_seq_len);
-        scheduler.completeStep(lease, claimed);
+        completeClaimedStepBeforePublish(scheduler, lease, claimed, SuccessfulStepPublisher{
+            .vocab_size = self.gpt_config.vocab_size,
+            .logits = result.logits,
+            .max_query_seq_len = result.max_query_seq_len,
+        });
     }
 
     fn reserveScheduledPrefillState(decode_state: *NativeDecodeState, target_total_seq_len: usize) !usize {
@@ -8382,6 +8413,91 @@ test "markStepFailed marks every claimed work failed and ready" {
     try std.testing.expect(pre_a.logits == null);
 }
 
+test "completeClaimedStepBeforePublish removes scheduler work before ready publication" {
+    const allocator = std.testing.allocator;
+    var coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+
+    var lease = try coordinator.acquire(.{
+        .requested_units = 1,
+        .prompt_bytes = 64,
+        .max_tokens = 8,
+    });
+    defer coordinator.release(lease);
+    var peer_lease = try coordinator.acquire(.{
+        .requested_units = 1,
+        .prompt_bytes = 64,
+        .max_tokens = 8,
+    });
+    defer coordinator.release(peer_lease);
+
+    var dummy_state = NativeDecodeState.initContiguous(allocator);
+    defer dummy_state.deinit();
+    var work = NativeGenerationPipeline.PendingDecodeBatchWork{
+        .allocator = allocator,
+        .decode_state = &dummy_state,
+        .token_id = 7,
+        .seq_len = 4,
+    };
+
+    coordinator.beginDecode(&lease, 4);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work), 5, 5, 0, .{});
+    var peer_work: u8 = 0;
+    coordinator.beginDecode(&peer_lease, 4);
+    try coordinator.enqueueDecodeWork(peer_lease, @ptrCast(&peer_work), 5, 5, 0, .{});
+
+    var claimed = std.ArrayListUnmanaged(runtime.scheduler.native_generate.StepItem).empty;
+    defer claimed.deinit(allocator);
+    try std.testing.expect(try coordinator.claimStep(
+        allocator,
+        &lease,
+        @ptrCast(&work),
+        .decode,
+        .{ .max_items = 1, .max_query_tokens = 1 },
+        &claimed,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), claimed.items.len);
+
+    var pending_was_removed = false;
+    var ownership_was_released = false;
+    var ready_was_clear = false;
+    const ProbePublisher = struct {
+        scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
+        work: *NativeGenerationPipeline.PendingDecodeBatchWork,
+        peer_lease: *runtime.scheduler.native_generate.Lease,
+        pending_was_removed: *bool,
+        ownership_was_released: *bool,
+        ready_was_clear: *bool,
+
+        fn publish(self: @This(), _: []const runtime.scheduler.native_generate.StepItem) void {
+            self.pending_was_removed.* = self.scheduler.pendingKvBlocksEstimate(@ptrCast(self.work), .decode) == null;
+            self.ownership_was_released.* = self.scheduler.tryAcquireTurn(self.peer_lease, .decode);
+            if (self.ownership_was_released.*) self.scheduler.finishTurn(self.peer_lease, .decode);
+            self.ready_was_clear.* = !self.work.ready.load(.acquire);
+            self.work.ready.store(true, .release);
+        }
+    };
+
+    NativeGenerationPipeline.completeClaimedStepBeforePublish(
+        &coordinator,
+        &lease,
+        claimed.items,
+        ProbePublisher{
+            .scheduler = &coordinator,
+            .work = &work,
+            .peer_lease = &peer_lease,
+            .pending_was_removed = &pending_was_removed,
+            .ownership_was_released = &ownership_was_released,
+            .ready_was_clear = &ready_was_clear,
+        },
+    );
+
+    try std.testing.expect(pending_was_removed);
+    try std.testing.expect(ownership_was_released);
+    try std.testing.expect(ready_was_clear);
+    try std.testing.expect(work.ready.load(.acquire));
+}
+
 test "dispatchStepLogits dupes per-item rows and respects wants_last_logits" {
     const allocator = std.testing.allocator;
     var dummy_state = NativeDecodeState.initContiguous(allocator);
@@ -8902,6 +9018,29 @@ test "scheduled prefill refreshes KV geometry after chunk reservation" {
     try std.testing.expectEqual(@as(usize, 256), second_chunk.kv_sequence_len);
     try std.testing.expectEqual(@as(usize, 0), second_chunk.kv_position_offset);
     try std.testing.expectEqual(@as(usize, 128), second_chunk.kv_sequence_len - second_chunk.query_sequence_len);
+
+    var work = NativeGenerationPipeline.PendingPrefillBatchWork{
+        .allocator = allocator,
+        .decode_state = &state,
+        .token_ids = &.{},
+        .seq_len = 256,
+        .query_seq_len = 128,
+        .wants_last_logits = false,
+    };
+    const claimed = [_]runtime.scheduler.native_generate.StepItem{
+        .{ .work_ptr = @ptrCast(&work), .phase = .prefill, .query_sequence_len = 128, .total_sequence_len = 256, .kv_sequence_len = 128, .kv_position_offset = 0 },
+    };
+    const reserved = [_]usize{second_reserved};
+
+    NativeGenerationPipeline.rollbackPrefillReservations(&claimed, &reserved, 1);
+
+    try std.testing.expectEqual(@as(usize, 128), state.total_tokens);
+    const rolled_back = state.kvView().?;
+    try std.testing.expectEqual(@as(usize, 128), rolled_back.token_count);
+    try std.testing.expectEqual(@as(usize, 8), rolled_back.logical_block_count);
+    try std.testing.expectEqual(@as(usize, 8), rolled_back.logical_blocks.?.len);
+    try std.testing.expectEqual(@as(u16, 16), rolled_back.tail_tokens);
+    try std.testing.expectEqual(@as(usize, 0), rolled_back.position_offset);
 }
 
 test "native decode state paged kv grows in pages" {
