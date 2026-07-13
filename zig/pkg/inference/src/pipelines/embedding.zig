@@ -38,6 +38,23 @@ const fused_chunker_splade = @import("../finetune/fused_chunker_splade.zig");
 
 const qwen3_embedding_resident_override_level = 4;
 
+/// Kill switch for length-bucketed encoder batching (default ON). The
+/// optimization is value-preserving (padding is attention-masked), so it
+/// defaults on; set ANTFLY_EMBED_LENGTH_BUCKETING=0 to force the single
+/// batch-wide-max forward for A/B comparison or debugging.
+const length_bucketing_env_flag = "ANTFLY_EMBED_LENGTH_BUCKETING";
+
+/// Padded-token budget (batch_rows * per-batch max seq) per length-bucket
+/// sub-batch. Smaller keeps each sub-batch length-homogeneous (less padding);
+/// larger amortizes per-forward dispatch over more rows. 2048 groups the
+/// 33..512-token ModernBERT chunk mix into a handful of tight sub-batches. A
+/// single sequence longer than the budget still forms its own sub-batch.
+const length_bucket_token_budget: usize = 2048;
+
+fn lengthBucketingEnabled() bool {
+    return platform.env.getenvBoolDefault(length_bucketing_env_flag, true);
+}
+
 const TextInputTensorSet = struct {
     items: [3]Tensor = undefined,
     len: usize = 0,
@@ -395,6 +412,7 @@ pub const EmbeddingPipeline = struct {
             for (encoded[0..encoded_count]) |*result| result.deinit();
         }
 
+        const tokenize_start = embedTimingStart(self.print_timing);
         var effective_len: usize = if (self.config.trim_padding_to_batch_max and !fixed_len) 1 else max_len;
         for (texts, 0..) |text, i| {
             const token_text = if (self.config.text_prefix.len > 0)
@@ -408,6 +426,24 @@ pub const EmbeddingPipeline = struct {
             if (self.config.trim_padding_to_batch_max and !fixed_len) {
                 effective_len = @max(effective_len, activeTokenLength(encoded[i].attention_mask));
             }
+        }
+        logEmbedTiming("text.tokenize", batch, tokenize_start);
+
+        // Length-bucketed forward (value-preserving): trim-pad ModernBERT chunk
+        // batches span 33..512 tokens; a single batch-wide-max forward pads
+        // every sequence to the longest (~45% wasted compute). Sorting by length
+        // and running greedy same-length sub-batches recovers most of it, with
+        // identical pooled vectors (padding is attention-masked, RoPE is
+        // position-absolute). Excludes projection/resident-qwen3 embedders and
+        // fixed-length ONNX shapes.
+        if (self.text_projection == null and
+            !self.config.resident_qwen3_embedding and
+            self.config.trim_padding_to_batch_max and
+            !fixed_len and
+            batch > 1 and
+            lengthBucketingEnabled())
+        {
+            return try self.embedBucketed(encoded[0..batch], text_session);
         }
 
         const all_ids = try alloc.alloc(i32, batch * effective_len);
@@ -535,6 +571,16 @@ pub const EmbeddingPipeline = struct {
             }
         }
 
+        // Length-bucketed forward (value-preserving), mirroring the dense path.
+        if (!self.config.resident_qwen3_embedding and
+            self.config.trim_padding_to_batch_max and
+            !fixed_len and
+            batch > 1 and
+            lengthBucketingEnabled())
+        {
+            return try self.forwardTextHiddenBucketed(encoded[0..batch], effective_len, text_session);
+        }
+
         const all_mask = try alloc.alloc(i32, batch * effective_len);
         errdefer alloc.free(all_mask);
         const all_ids = try alloc.alloc(i32, batch * effective_len);
@@ -616,6 +662,8 @@ pub const EmbeddingPipeline = struct {
         defer hb.deinit(alloc);
         if (hb.hidden * V != weight.len) return error.SpladeWeightShapeMismatch;
 
+        const head_start = embedTimingStart(self.print_timing);
+        defer logEmbedTiming("splade.head", texts.len, head_start);
         const out = try alloc.alloc([]f32, hb.batch);
         var initialized: usize = 0;
         errdefer {
@@ -692,6 +740,219 @@ pub const EmbeddingPipeline = struct {
         }
 
         return embeddings;
+    }
+
+    fn cmpEncodedLenAsc(lens: []const usize, a: usize, b: usize) bool {
+        return lens[a] < lens[b];
+    }
+
+    /// Greedily grow a length-bucket sub-batch starting at sorted position `gi`,
+    /// returning the exclusive end index. `order` holds chunk indices sorted by
+    /// ascending active length. The bucket absorbs the next chunk while the
+    /// padded token count (rows * max-len-in-bucket) stays within the budget; a
+    /// single over-budget sequence still forms a one-element bucket.
+    fn growLengthBucket(order: []const usize, lens: []const usize, gi: usize) usize {
+        var gj = gi;
+        var gmax = lens[order[gi]];
+        while (gj + 1 < order.len) {
+            const cand_max = @max(gmax, lens[order[gj + 1]]);
+            if ((gj + 2 - gi) * cand_max > length_bucket_token_budget) break;
+            gmax = cand_max;
+            gj += 1;
+        }
+        return gj + 1;
+    }
+
+    /// Dense embed via length-sorted sub-batches (see the call site in `embed`).
+    /// Returns one pooled vector per input chunk in ORIGINAL order.
+    fn embedBucketed(
+        self: *EmbeddingPipeline,
+        encoded: []const EncodeResult,
+        text_session: backends.Session,
+    ) ![][]f32 {
+        const alloc = self.allocator;
+        const batch = encoded.len;
+
+        const lens = try alloc.alloc(usize, batch);
+        defer alloc.free(lens);
+        const order = try alloc.alloc(usize, batch);
+        defer alloc.free(order);
+        for (encoded, 0..) |e, i| {
+            lens[i] = activeTokenLength(e.attention_mask);
+            order[i] = i;
+        }
+        std.mem.sort(usize, order, @as([]const usize, lens), cmpEncodedLenAsc);
+
+        const result = try alloc.alloc([]f32, batch);
+        var done: usize = 0;
+        errdefer {
+            for (order[0..done]) |oi| alloc.free(result[oi]);
+            alloc.free(result);
+        }
+
+        const encoder_start = embedTimingStart(self.print_timing);
+        var gi: usize = 0;
+        while (gi < batch) {
+            const gend = growLengthBucket(order, lens, gi);
+            const group = order[gi..gend];
+            const sb_max = @max(lens[order[gend - 1]], 1); // sorted asc -> last is max
+            const vecs = try self.forwardPoolSubBatch(encoded, group, sb_max, text_session);
+            defer alloc.free(vecs);
+            for (group, 0..) |oi, k| {
+                result[oi] = vecs[k];
+                done += 1;
+            }
+            gi = gend;
+        }
+        logEmbedTiming("text.encoder.bucketed", batch, encoder_start);
+        return result;
+    }
+
+    /// Build [sb, sb_max] input tensors for a length-bucket sub-batch and run
+    /// the encoder, returning its raw output tensors (caller deinits). `sb_max`
+    /// bounds padding to the bucket's longest sequence; each chunk contributes
+    /// its first `sb_max` token ids/mask (padding masked). Also writes the flat
+    /// [sb*sb_max] i32 attention mask into `mask_i32_out` for pooling/gather.
+    fn runEncoderSubBatch(
+        self: *EmbeddingPipeline,
+        encoded: []const EncodeResult,
+        group: []const usize,
+        sb_max: usize,
+        mask_i32_out: []i32,
+        text_session: backends.Session,
+    ) ![]Tensor {
+        const alloc = self.allocator;
+        const input_info = text_session.inputInfo();
+        const sb = group.len;
+
+        const ids_i64 = try alloc.alloc(i64, sb * sb_max);
+        defer alloc.free(ids_i64);
+        const mask_i64 = try alloc.alloc(i64, sb * sb_max);
+        defer alloc.free(mask_i64);
+
+        for (group, 0..) |oi, k| {
+            const src_ids = encoded[oi].ids;
+            const src_mask = encoded[oi].attention_mask;
+            for (0..sb_max) |s| {
+                const id: i32 = if (s < src_ids.len) src_ids[s] else 0;
+                const m: i32 = if (s < src_mask.len) src_mask[s] else 0;
+                ids_i64[k * sb_max + s] = @intCast(id);
+                mask_i64[k * sb_max + s] = @intCast(m);
+                mask_i32_out[k * sb_max + s] = m;
+            }
+        }
+
+        const shape = [_]i64{ @intCast(sb), @intCast(sb_max) };
+        var input_ids_tensor = try Tensor.initInt64(alloc, "input_ids", &shape, ids_i64);
+        defer input_ids_tensor.deinit();
+        var attention_mask_tensor = try Tensor.initInt64(alloc, "attention_mask", &shape, mask_i64);
+        defer attention_mask_tensor.deinit();
+        var input_set = try textInputTensorSet(alloc, input_info, input_ids_tensor, attention_mask_tensor, &shape);
+        defer input_set.deinit();
+
+        return try text_session.run(input_set.slice(), alloc);
+    }
+
+    /// Run one length-bucket sub-batch and pool it (dense path). Padded only to
+    /// `sb_max`; returns pooled vectors in `group` order.
+    fn forwardPoolSubBatch(
+        self: *EmbeddingPipeline,
+        encoded: []const EncodeResult,
+        group: []const usize,
+        sb_max: usize,
+        text_session: backends.Session,
+    ) ![][]f32 {
+        const alloc = self.allocator;
+        const sb = group.len;
+        const mask_i32 = try alloc.alloc(i32, sb * sb_max);
+        defer alloc.free(mask_i32);
+
+        var outputs = try self.runEncoderSubBatch(encoded, group, sb_max, mask_i32, text_session);
+        defer {
+            for (outputs) |*o| o.deinit();
+            alloc.free(outputs);
+        }
+        if (outputs.len == 0) return error.NoOutputTensors;
+        const output = &outputs[0];
+        return switch (output.shape.len) {
+            3 => try self.pool3D(output, mask_i32, sb, sb_max, self.text_projection == null),
+            2 => try self.extract2D(output, sb, self.text_projection == null),
+            else => error.UnexpectedOutputShape,
+        };
+    }
+
+    /// SPLADE raw-hidden forward via length-sorted sub-batches. Scatters each
+    /// chunk's active-token hidden states into a single [batch, effective_len,
+    /// hidden] buffer (padding rows zeroed, masked out downstream) so the caller
+    /// (`embedSplade`) is unchanged. Value-preserving vs the single padded batch.
+    fn forwardTextHiddenBucketed(
+        self: *EmbeddingPipeline,
+        encoded: []const EncodeResult,
+        effective_len: usize,
+        text_session: backends.Session,
+    ) !HiddenBatch {
+        const alloc = self.allocator;
+        const batch = encoded.len;
+
+        const all_mask = try alloc.alloc(i32, batch * effective_len);
+        errdefer alloc.free(all_mask);
+        for (encoded, 0..) |e, i| {
+            @memcpy(all_mask[i * effective_len .. (i + 1) * effective_len], e.attention_mask[0..effective_len]);
+        }
+
+        const lens = try alloc.alloc(usize, batch);
+        defer alloc.free(lens);
+        const order = try alloc.alloc(usize, batch);
+        defer alloc.free(order);
+        for (encoded, 0..) |e, i| {
+            lens[i] = activeTokenLength(e.attention_mask);
+            order[i] = i;
+        }
+        std.mem.sort(usize, order, @as([]const usize, lens), cmpEncodedLenAsc);
+
+        var data: ?[]f32 = null;
+        errdefer if (data) |d| alloc.free(d);
+        var hidden: usize = 0;
+
+        const scratch_mask = try alloc.alloc(i32, batch * effective_len);
+        defer alloc.free(scratch_mask);
+
+        const encoder_start = embedTimingStart(self.print_timing);
+        var gi: usize = 0;
+        while (gi < batch) {
+            const gend = growLengthBucket(order, lens, gi);
+            const group = order[gi..gend];
+            const sb_max = @max(lens[order[gend - 1]], 1);
+
+            var outputs = try self.runEncoderSubBatch(encoded, group, sb_max, scratch_mask[0 .. group.len * sb_max], text_session);
+            defer {
+                for (outputs) |*o| o.deinit();
+                alloc.free(outputs);
+            }
+            if (outputs.len == 0) return error.NoOutputTensors;
+            const output = &outputs[0];
+            if (output.shape.len != 3) return error.SpladeUnsupportedEmbedder;
+            const h: usize = @intCast(output.shape[2]);
+            if (data == null) {
+                hidden = h;
+                const buf = try alloc.alloc(f32, batch * effective_len * hidden);
+                @memset(buf, 0);
+                data = buf;
+            } else if (h != hidden) {
+                return error.UnexpectedOutputShape;
+            }
+            const src = output.asFloat32();
+            for (group, 0..) |oi, k| {
+                const copy_rows = @min(lens[oi], sb_max);
+                const src_base = k * sb_max * hidden;
+                const dst_base = oi * effective_len * hidden;
+                @memcpy(data.?[dst_base .. dst_base + copy_rows * hidden], src[src_base .. src_base + copy_rows * hidden]);
+            }
+            gi = gend;
+        }
+        logEmbedTiming("splade.encoder.bucketed", batch, encoder_start);
+
+        return .{ .data = data.?, .mask = all_mask, .batch = batch, .seq_len = effective_len, .hidden = hidden };
     }
 
     fn activeTokenLength(mask: []const i32) usize {
