@@ -89,6 +89,21 @@ pub const Config = struct {
     /// Global attention every N layers. Segment callers use this to choose
     /// the per-layer RoPE table and local-attention mask.
     global_attn_every_n_layers: u32 = 3,
+    /// RoPE pairing convention (mirrors `modern_bert.Config.rope_interleaved`).
+    /// Default `true` rotates interleaved adjacent lanes (2j, 2j+1) — the
+    /// convention the gopeft-trained fused chunker the compiled boundary path
+    /// serves was trained under. Set `false` for HF/nomic modernbert-embed-base
+    /// (`rotate_half`: lanes j and j+head_dim/2), i.e. the frozen text embedder
+    /// served through the compiled forward. The per-pair RoPE cos/sin table is
+    /// convention-independent (see segmented_encoder.buildBackendRopeTable), so
+    /// this only flips the `consecutive_pairs` flag of the rope op.
+    rope_interleaved: bool = true,
+    /// Layer-0 pre-attention norm (mirrors `modern_bert.Config.attn_norm0_identity`).
+    /// Default `false` applies a LayerNorm with gamma=1/beta=0 — the fused
+    /// chunker's trained behavior. Set `true` for HF ModernBERT, where layer 0's
+    /// attn_norm is `nn.Identity` (embeddings.norm already applied the affine),
+    /// i.e. the frozen text embedder.
+    attn_norm0_identity: bool = false,
 };
 
 /// Result of graph construction. All NodeIds live in the `Graph` that was
@@ -1051,10 +1066,14 @@ fn encoderLayer(
     const total: u32 = batch * seq_len;
 
     // ── Pre-attention LayerNorm ────────────────────────────────────────
-    // Layer 0 has no checkpoint attn_norm tensors; the eager path still
-    // applies layer norm with gamma=1 and beta=0, so the graph VJP must do the
-    // same to keep segment-local gradients isomorphic to the forward path.
+    // Layer 0 has no checkpoint attn_norm tensors. The fused chunker's eager
+    // path still applies a layer norm with gamma=1 and beta=0, so the graph VJP
+    // must do the same to keep segment-local gradients isomorphic to the forward
+    // path. HF/nomic ModernBERT instead uses `nn.Identity` at layer 0 (the
+    // embeddings.norm already applied the affine); `attn_norm0_identity` selects
+    // that pass-through so the compiled forward matches the eager text embedder.
     const attn_normed = if (layer == 0) blk: {
+        if (config.attn_norm0_identity) break :blk hidden_in;
         const attn_ln_w = try constantVector(bld, H, 1.0);
         const attn_ln_b = try constantVector(bld, H, 0.0);
         break :blk try bld.layerNorm(hidden_in, attn_ln_w, attn_ln_b, H, config.layer_norm_eps);
@@ -1103,7 +1122,7 @@ fn encoderLayer(
         head_dim,
         head_dim,
         rope_theta,
-        true,
+        config.rope_interleaved,
     );
     const k_roped = try bld.ropeWithOptions(
         k_bhsd,
@@ -1113,7 +1132,7 @@ fn encoderLayer(
         head_dim,
         head_dim,
         rope_theta,
-        true,
+        config.rope_interleaved,
     );
 
     // ── Manual masked scaled dot-product attention ─────────────────────

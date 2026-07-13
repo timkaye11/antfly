@@ -101,6 +101,8 @@ pub fn graphConfigForEval(
         .local_rope_theta = eager_defaults.local_rope_theta,
         .local_attention_window = eager_defaults.local_attention_window,
         .global_attn_every_n_layers = eager_defaults.global_attn_every_n_layers,
+        .rope_interleaved = eager_defaults.rope_interleaved,
+        .attn_norm0_identity = eager_defaults.attn_norm0_identity,
     };
 }
 
@@ -130,6 +132,13 @@ pub fn graphConfigFromBertConfig(bert: modern_bert.Config) !modern_bert_graph.Co
         .local_rope_theta = bert.local_rope_theta,
         .local_attention_window = bert.local_attention_window,
         .global_attn_every_n_layers = bert.global_attn_every_n_layers,
+        // Carry the eager forward's RoPE/layer-0 conventions so the compiled
+        // segments match the exact `modern_bert.forward` the pipeline would run.
+        // Fused chunker exports keep the defaults (interleaved RoPE, layer-0
+        // LayerNorm); the frozen text embedder sets rotate_half + layer-0
+        // Identity via session_factory.parseModernBertConfig.
+        .rope_interleaved = bert.rope_interleaved,
+        .attn_norm0_identity = bert.attn_norm0_identity,
     };
 }
 
@@ -448,6 +457,16 @@ test "graphConfigFromBertConfig maps the export's eager config" {
         .layer_norm_eps = 1e-5,
     };
     const cfg = try graphConfigFromBertConfig(bert);
+    // Default (fused chunker) conventions carry through.
+    try std.testing.expectEqual(true, cfg.rope_interleaved);
+    try std.testing.expectEqual(false, cfg.attn_norm0_identity);
+    // The frozen text embedder's HF conventions carry through too.
+    var embedder = bert;
+    embedder.rope_interleaved = false;
+    embedder.attn_norm0_identity = true;
+    const embedder_cfg = try graphConfigFromBertConfig(embedder);
+    try std.testing.expectEqual(false, embedder_cfg.rope_interleaved);
+    try std.testing.expectEqual(true, embedder_cfg.attn_norm0_identity);
     try std.testing.expectEqual(bert.vocab_size, cfg.vocab_size);
     try std.testing.expectEqual(bert.hidden_size, cfg.hidden_size);
     try std.testing.expectEqual(bert.num_hidden_layers, cfg.num_hidden_layers);

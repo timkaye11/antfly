@@ -55,6 +55,13 @@ const manifest_mod = @import("../models/manifest.zig");
 const ops = @import("../ops/ops.zig");
 const NativeCompute = @import("../ops/native_compute.zig").NativeCompute;
 const metal_compute_mod = @import("../ops/metal_compute.zig");
+// Parity-gated compiled MPSGraph forward for the frozen ModernBERT text
+// embedder. Metal-only (MPSGraph externs link only under -Dmetal); a struct{}
+// stand-in keeps non-Metal builds compiling.
+const modernbert_compiled_embedder = if (build_options.enable_metal)
+    @import("modernbert_compiled_embedder.zig")
+else
+    struct {};
 const MetalCompute = metal_compute_mod.MetalCompute;
 const weight_source_mod = @import("../models/weight_source.zig");
 const SafetensorsSource = @import("../models/weight_source.zig").SafetensorsSource;
@@ -4199,6 +4206,15 @@ const ArchSession = struct {
     /// when this is set; other architectures fall through to their
     /// existing eager path.
     graph_runtime_strategy: ?graph_runtime.Strategy = null,
+    /// Lazily-built, parity-gated compiled MPSGraph forward for a Metal
+    /// ModernBERT (generic-task) embedder session. Type-erased pointer to a
+    /// `modernbert_compiled_embedder.ModernBertCompiledForward` (Metal builds
+    /// only); null until the first `.modernbert` forward attempts to build it.
+    /// Guarded by `compiled_init_lock` for creation; the target owns its own
+    /// lock for compile/execute/phase transitions.
+    modernbert_compiled: ?*anyopaque = null,
+    /// Serializes lazy creation of `modernbert_compiled`.
+    compiled_init_lock: std.Thread.Mutex = .{},
 };
 
 /// Attach a runtime Io to a Session created by this factory so its
@@ -4509,6 +4525,76 @@ pub fn attachSharedPrefetchState(session: Session, shared_prefetch: *runtime.tie
     }
 }
 
+/// Lazily build (once) the parity-gated compiled ModernBERT forward for this
+/// Metal embedder session, returning a type-erased pointer to the
+/// `ModernBertCompiledForward`, or null when Metal is off / not a Metal
+/// session / the kill switch is set / creation failed. Double-checked under
+/// `compiled_init_lock`. The `?*anyopaque` signature keeps non-Metal builds
+/// (where the concrete type does not exist) compiling.
+fn ensureModernBertCompiled(
+    self: *ArchSession,
+    cfg: modern_bert_arch.Config,
+) ?*anyopaque {
+    if (comptime build_options.enable_metal) {
+        if (self.backend_type != .metal) return null;
+        if (!modernbert_compiled_embedder.envEnabled()) return null;
+        if (self.modernbert_compiled) |ptr| return ptr;
+        self.compiled_init_lock.lock();
+        defer self.compiled_init_lock.unlock();
+        if (self.modernbert_compiled) |ptr| return ptr;
+        const mc = modernbert_compiled_embedder.ModernBertCompiledForward.create(self.allocator, cfg) catch |err| {
+            std.log.warn(
+                "modernbert compiled forward: init failed ({s}); using eager forward",
+                .{@errorName(err)},
+            );
+            return null;
+        };
+        self.modernbert_compiled = mc;
+        return mc;
+    }
+    return null;
+}
+
+/// Encoder forward for a generic-task ModernBERT session. On the Metal backend
+/// this routes through the parity-gated compiled MPSGraph forward once its
+/// startup self-check confirms >= 0.9995 pooled cosine vs eager; every other
+/// case (self-check pending, sequence out of ladder range, disabled/failed,
+/// or non-Metal) runs the eager `modern_bert.forward`. The returned buffer is
+/// always owned by `allocator`, matching the eager path.
+fn runModernBertForward(
+    self: *ArchSession,
+    cb: *ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    cfg: modern_bert_arch.Config,
+    input_ids: []const i64,
+    attention_mask: []const i64,
+    batch: usize,
+    seq_len: usize,
+) ![]f32 {
+    if (comptime build_options.enable_metal) {
+        if (ensureModernBertCompiled(self, cfg)) |mc_ptr| {
+            const compiled: *modernbert_compiled_embedder.ModernBertCompiledForward = @ptrCast(@alignCast(mc_ptr));
+            switch (compiled.currentPhase()) {
+                .active => {
+                    if (try compiled.tryForward(allocator, cb, input_ids, attention_mask, batch, seq_len)) |hidden| {
+                        return hidden;
+                    }
+                    // Fallback (out-of-ladder sequence or latched failure): eager.
+                },
+                .unchecked => {
+                    // Run eager (the served result) and self-check compiled
+                    // against it to decide whether to enable the compiled path.
+                    const hidden = try modern_bert_arch.forward(cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
+                    compiled.recordSelfCheck(cb, input_ids, attention_mask, batch, seq_len, hidden);
+                    return hidden;
+                },
+                .disabled => {},
+            }
+        }
+    }
+    return modern_bert_arch.forward(cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
+}
+
 fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
 
@@ -4573,7 +4659,7 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             const input_ids = input_ids_tensor.asInt64();
             const attention_mask = inputs[1].asInt64();
             if (self.task != .generic) return error.UnsupportedTask;
-            const hidden = try modern_bert_arch.forward(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
+            const hidden = try runModernBertForward(self, &cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
             defer allocator.free(hidden);
 
             const shape = [_]i64{ @intCast(batch), @intCast(seq_len), @intCast(cfg.hidden_size) };
@@ -5424,6 +5510,13 @@ fn archBackend(ptr: *anyopaque) BackendType {
 
 fn archClose(ptr: *anyopaque) void {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (comptime build_options.enable_metal) {
+        if (self.modernbert_compiled) |mc_ptr| {
+            const mc: *modernbert_compiled_embedder.ModernBertCompiledForward = @ptrCast(@alignCast(mc_ptr));
+            mc.deinit();
+            self.modernbert_compiled = null;
+        }
+    }
     switch (self.backend_type) {
         .native => {
             native_mod.stopPrefetchWorker(&self.backend_data.native);
