@@ -72,18 +72,21 @@ pub fn servingEnvEnabled() bool {
     return policy.servingCompiledForwardEnabled(platform.env.getenv(serving_env_flag));
 }
 
-/// Layers fused into each compiled serving segment. Default 1 (the shipped,
-/// parity-validated per-layer segmentation). Larger values fuse more encoder
-/// layers into one MPSGraph execution — fewer GPU round-trips and fewer
-/// inter-segment host hidden-state copies per forward — at the cost of a bigger
-/// compiled graph and more transient GPU memory per execution. Used by both the
-/// fused-chunker boundary forward and the frozen embedder's compiled forward.
+/// Layers fused into each compiled serving segment. Default 11 (two segments
+/// for the 22-layer ModernBERT-base encoder these paths serve): fusing more
+/// encoder layers into one MPSGraph execution removes ~20 per-forward host
+/// hidden-state round-trips and GPU dispatches, which — combined with batching
+/// — is what brings a 20KB +dense /chunk under the latency target. Set to 1 to
+/// restore the original per-layer segmentation (parity is identical either way;
+/// the serving self-checks gate correctness). Used by both the fused-chunker
+/// boundary forward and the frozen embedder's compiled forward.
 pub const serving_layers_per_segment_env = "ANTFLY_FUSED_CHUNKER_SERVING_LAYERS_PER_SEGMENT";
+const serving_layers_per_segment_default: u32 = 11;
 
 pub fn servingLayersPerSegment() u32 {
-    const v = platform.env.getenvUsize(serving_layers_per_segment_env) orelse return 1;
-    if (v == 0) return 1;
-    return std.math.cast(u32, v) orelse 1;
+    const v = platform.env.getenvUsize(serving_layers_per_segment_env) orelse return serving_layers_per_segment_default;
+    if (v == 0) return serving_layers_per_segment_default;
+    return std.math.cast(u32, v) orelse serving_layers_per_segment_default;
 }
 
 /// ModernBERT-base head count; the fused chunker encoder is not configurable

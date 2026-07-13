@@ -53,7 +53,11 @@ const length_bucketing_env_flag = "ANTFLY_EMBED_LENGTH_BUCKETING";
 /// compiled forward larger batches, which it then packs into padded batched
 /// MPSGraph executions — fewer, larger GPU round-trips for many-chunk docs.
 const length_bucket_token_budget_env = "ANTFLY_EMBED_LENGTH_BUCKET_TOKEN_BUDGET";
-const length_bucket_token_budget_default: usize = 2048;
+// 8192 (vs the original tight 2048) feeds the Metal compiled forward batches of
+// ~16 rows at the 384-token rung, packed into one padded batched MPSGraph
+// execution — the round-trip amortization that halves many-chunk embed latency.
+// Set back to 2048 to restore the pre-batching sub-batch sizing.
+const length_bucket_token_budget_default: usize = 8192;
 
 fn lengthBucketTokenBudget() usize {
     return platform.env.getenvUsize(length_bucket_token_budget_env) orelse length_bucket_token_budget_default;
