@@ -466,16 +466,19 @@ benchmark with persistent graph replay and candidate attention, Q6 LM-head,
 Q8-intermediate E2B FFN, and exact-F32 E2B FFN routes disabled. It also runs
 the 12B Q4_K_M f32 replay case twice and
 requires identical token IDs, healthy replay, and zero disabled-candidate
-counters.
+counters. The E2B contract also requires the promoted Q4_0 MMV, MM, and pair
+routes to be used in every measured run, with zero fallback from any promoted
+Q4_0 route.
 
-Use manual `gate=release` only for the commit intended for release. Its
+Use manual `gate=release` to preflight the commit intended for release. Tag-based
+publication calls the same workflow at the tag SHA and cannot publish assets
+until it passes. Its
 `release_scope` is `target_only`: CUDA MTP is not executed or certified. That mode
 requires the E2B comparable llama.cpp ratio to be at least `0.80` and a token
 throughput CV no higher than `0.02`; nightly collection keeps the same
 correctness/replay contract without asserting the future throughput target.
 Each run uploads `release_summary.json`, `release_provenance.json`, paired raw
-logs/timing, and 12B timing evidence. A release requires a fresh passing manual
-release-mode artifact for its exact commit.
+logs/timing, and 12B timing evidence.
 
 CUDA MTP diagnostics run only in `gate=nightly`. They are experimental,
 optional, and non-gating, and they make no production-readiness or

@@ -3,6 +3,24 @@ name: CUDA Gemma 4 L4 Evidence
 on:
   schedule:
     - cron: "0 5 * * *"
+  workflow_call:
+    inputs:
+      gate:
+        required: false
+        default: release
+        type: string
+      e2b_model:
+        required: false
+        type: string
+      gemma12b_q4_model:
+        required: false
+        type: string
+      llama_cpp_bin:
+        required: false
+        type: string
+      mtp_draft_model:
+        required: false
+        type: string
   workflow_dispatch:
     inputs:
       gate:

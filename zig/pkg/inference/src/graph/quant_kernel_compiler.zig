@@ -11349,7 +11349,7 @@ test "quant kernel compiler Metal build check covers generated and promoted arti
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "quant_kernel_metal_local_check_step.dependOn(&run_quant_kernel_compiler_tests.step)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "quant_kernel_local_check_step.dependOn(&quant_kernel_codegen_test_check.step)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "quant_kernel_local_check_step.dependOn(&cuda_artifact_source_policy_check.step)"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "if (target.result.os.tag == .macos) {\n        quant_kernel_local_check_step.dependOn(quant_kernel_metal_local_check_step);\n    }"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "if (enable_metal and target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {\n        quant_kernel_local_check_step.dependOn(quant_kernel_metal_local_check_step);\n    }"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, contents, 1, "quant_kernel_local_check_step.dependOn(quant_kernel_metal_runtime_route_all_step)"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, contents, 1, "quant_kernel_local_check_step.dependOn(quant_kernel_metal_production_regression_step)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "if (targetRunsOnBuildHost(b, target)) {\n        quant_kernel_local_check_step.dependOn(&run_quant_kernel_compiler_tests.step);\n        quant_kernel_metal_local_check_step.dependOn(&run_quant_kernel_compiler_tests.step);\n    }"));

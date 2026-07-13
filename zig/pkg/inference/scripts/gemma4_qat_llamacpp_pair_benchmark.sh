@@ -519,6 +519,16 @@ for index in range(1, repeats + 1):
     antfly_lm_head_argmax_fallbacks = int(cuda.get("lm_head_argmax_q4_0_q8_1_fallbacks") or 0)
     antfly_generated_q6_lm_head_argmax = int(cuda.get("lm_head_argmax_generated_q6_k_q8_1_hits") or 0)
     antfly_generated_q6_lm_head_argmax_fallbacks = int(cuda.get("lm_head_argmax_generated_q6_k_q8_1_fallbacks") or 0)
+    antfly_generated_q4_0_mmv = int(cuda.get("q4_0_generated_mmv_hits") or 0)
+    antfly_generated_q4_0_mmv_fallbacks = int(cuda.get("q4_0_generated_mmv_fallbacks") or 0)
+    antfly_generated_q4_0_mm = int(cuda.get("q4_0_generated_mm_hits") or 0)
+    antfly_generated_q4_0_mm_fallbacks = int(cuda.get("q4_0_generated_mm_fallbacks") or 0)
+    antfly_generated_q4_0_pair = int(cuda.get("q4_0_generated_pair_hits") or 0)
+    antfly_generated_q4_0_pair_fallbacks = int(cuda.get("q4_0_generated_pair_fallbacks") or 0)
+    antfly_generated_q4_0_pair_q8 = int(cuda.get("q4_0_generated_pair_q8_hits") or 0)
+    antfly_generated_q4_0_pair_q8_fallbacks = int(cuda.get("q4_0_generated_pair_q8_fallbacks") or 0)
+    antfly_generated_q4_0_down_q8 = int(cuda.get("q4_0_generated_down_q8_hits") or 0)
+    antfly_generated_q4_0_down_q8_fallbacks = int(cuda.get("q4_0_generated_down_q8_fallbacks") or 0)
     antfly_generated_e2b_pair = int(cuda.get("q4_0_generated_e2b_pair_q8_hits") or 0)
     antfly_generated_e2b_down = int(cuda.get("q4_0_generated_e2b_down_q8_hits") or 0)
     antfly_generated_e2b_pair_fallbacks = int(cuda.get("q4_0_generated_e2b_pair_q8_fallbacks") or 0)
@@ -631,6 +641,16 @@ for index in range(1, repeats + 1):
             "antfly_lm_head_argmax_fallbacks": antfly_lm_head_argmax_fallbacks,
             "antfly_generated_q6_lm_head_argmax": antfly_generated_q6_lm_head_argmax,
             "antfly_generated_q6_lm_head_argmax_fallbacks": antfly_generated_q6_lm_head_argmax_fallbacks,
+            "antfly_generated_q4_0_mmv": antfly_generated_q4_0_mmv,
+            "antfly_generated_q4_0_mmv_fallbacks": antfly_generated_q4_0_mmv_fallbacks,
+            "antfly_generated_q4_0_mm": antfly_generated_q4_0_mm,
+            "antfly_generated_q4_0_mm_fallbacks": antfly_generated_q4_0_mm_fallbacks,
+            "antfly_generated_q4_0_pair": antfly_generated_q4_0_pair,
+            "antfly_generated_q4_0_pair_fallbacks": antfly_generated_q4_0_pair_fallbacks,
+            "antfly_generated_q4_0_pair_q8": antfly_generated_q4_0_pair_q8,
+            "antfly_generated_q4_0_pair_q8_fallbacks": antfly_generated_q4_0_pair_q8_fallbacks,
+            "antfly_generated_q4_0_down_q8": antfly_generated_q4_0_down_q8,
+            "antfly_generated_q4_0_down_q8_fallbacks": antfly_generated_q4_0_down_q8_fallbacks,
             "antfly_generated_e2b_pair": antfly_generated_e2b_pair,
             "antfly_generated_e2b_down": antfly_generated_e2b_down,
             "antfly_generated_e2b_pair_fallbacks": antfly_generated_e2b_pair_fallbacks,
@@ -829,6 +849,16 @@ with (out_dir / "paired_summary.tsv").open("w", encoding="utf-8") as f:
         "antfly_lm_head_argmax_fallbacks",
         "antfly_generated_q6_lm_head_argmax",
         "antfly_generated_q6_lm_head_argmax_fallbacks",
+        "antfly_generated_q4_0_mmv",
+        "antfly_generated_q4_0_mmv_fallbacks",
+        "antfly_generated_q4_0_mm",
+        "antfly_generated_q4_0_mm_fallbacks",
+        "antfly_generated_q4_0_pair",
+        "antfly_generated_q4_0_pair_fallbacks",
+        "antfly_generated_q4_0_pair_q8",
+        "antfly_generated_q4_0_pair_q8_fallbacks",
+        "antfly_generated_q4_0_down_q8",
+        "antfly_generated_q4_0_down_q8_fallbacks",
         "antfly_generated_e2b_pair",
         "antfly_generated_e2b_down",
         "antfly_generated_e2b_pair_fallbacks",

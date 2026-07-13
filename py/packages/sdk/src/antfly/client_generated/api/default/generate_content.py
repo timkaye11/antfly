@@ -58,6 +58,11 @@ def _parse_response(
 
         return response_503
 
+    if response.status_code == 507:
+        response_507 = InferenceError.from_dict(response.json())
+
+        return response_507
+
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
     else:

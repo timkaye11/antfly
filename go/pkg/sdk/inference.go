@@ -646,12 +646,16 @@ func (c *InferenceClient) Transcribe(ctx context.Context, model string, audio []
 
 // GenerateConfig contains configuration for text generation.
 type GenerateConfig struct {
-	MaxTokens   int
-	Temperature float32
-	TopP        float32
-	TopK        int
-	Tools       []oapi.InferenceTool
-	ToolChoice  oapi.InferenceToolChoice
+	MaxTokens              int
+	Temperature            float32
+	TopP                   float32
+	TopK                   int
+	DraftModel             string
+	SpeculativeK           int
+	SpeculationPolicy      oapi.InferenceGenerateRequestSpeculationPolicy
+	SpeculationCalibration oapi.InferenceGenerateRequestSpeculationCalibration
+	Tools                  []oapi.InferenceTool
+	ToolChoice             oapi.InferenceToolChoice
 }
 
 // ToolChoiceAuto returns a ToolChoice that lets the model decide whether to call a tool.
@@ -707,6 +711,18 @@ func (c *InferenceClient) Generate(ctx context.Context, model string, messages [
 		if config.TopK > 0 {
 			req.TopK = config.TopK
 		}
+		if config.DraftModel != "" {
+			req.DraftModel = config.DraftModel
+		}
+		if config.SpeculativeK != 0 {
+			req.SpeculativeK = config.SpeculativeK
+		}
+		if config.SpeculationPolicy != "" {
+			req.SpeculationPolicy = config.SpeculationPolicy
+		}
+		if config.SpeculationCalibration != "" {
+			req.SpeculationCalibration = config.SpeculationCalibration
+		}
 		if len(config.Tools) > 0 {
 			req.Tools = config.Tools
 		}
@@ -729,6 +745,9 @@ func (c *InferenceClient) Generate(ctx context.Context, model string, messages [
 	}
 	if resp.JSON503 != nil {
 		return nil, fmt.Errorf("service unavailable: %s", resp.JSON503.Error)
+	}
+	if resp.JSON507 != nil {
+		return nil, fmt.Errorf("memory budget exceeded: %s", resp.JSON507.Error)
 	}
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))

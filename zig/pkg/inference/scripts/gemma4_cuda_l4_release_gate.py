@@ -21,6 +21,7 @@ import math
 import os
 import pathlib
 import re
+import signal
 import subprocess
 import sys
 from typing import Any
@@ -73,6 +74,11 @@ FROZEN_PROFILE = {
     "antfly_generated_q4_0_e2b_ffn": "0",
     "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT": "0",
     "antfly_generated_q4_0_e2b_ffn_exact": "0",
+    "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MMV": "1",
+    "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MM": "1",
+    "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR": "1",
+    "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR_Q8": "1",
+    "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_DOWN_Q8": "1",
     "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
     "antfly_q4_0_q8_1_lm_head_argmax": "1",
     "REQUIRE_GRAPH_REPLAY": "1",
@@ -350,31 +356,47 @@ def matrix_process_errors(returncode: int) -> list[str]:
     return [] if returncode == 0 else [f"E2B matrix exited {returncode}"]
 
 
+def matrix_timeout_sec(args: argparse.Namespace) -> int:
+    return args.timeout_sec * (2 * (args.warmups + args.repeats) + 1)
+
+
 def write_json(path: pathlib.Path, value: object) -> None:
     path.write_text(json.dumps(value, allow_nan=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def run_logged(command: list[str], environment: dict[str, str], log_path: pathlib.Path, timeout_sec: int) -> tuple[int, str]:
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=repo_root(),
             env=environment,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=timeout_sec,
-            check=False,
+            start_new_session=True,
         )
-        output = completed.stdout
-        returncode = completed.returncode
-    except subprocess.TimeoutExpired as exc:
-        partial = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        output = partial + f"\ncommand timed out after {timeout_sec}s\n"
-        returncode = 124
     except OSError as exc:
         output = f"could not start command: {exc}\n"
         returncode = 127
+    else:
+        try:
+            output, _ = process.communicate(timeout=timeout_sec)
+            returncode = process.returncode
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                output, _ = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                output, _ = process.communicate()
+            output = (output or "") + f"\ncommand timed out after {timeout_sec}s\n"
+            returncode = 124
     log_path.write_text(output, encoding="utf-8")
     return returncode, output
 
@@ -445,6 +467,22 @@ def e2b_pair_contract_errors(pair: dict[str, Any]) -> list[str]:
         errors.append("E2B paired summary has no measured rows")
         return errors
     for index, row in enumerate(rows, start=1):
+        for key in (
+            "antfly_generated_q4_0_mmv",
+            "antfly_generated_q4_0_mm",
+            "antfly_generated_q4_0_pair",
+        ):
+            if int_value(row.get(key)) <= 0:
+                errors.append(f"E2B sample {index} did not use promoted route {key}")
+        for key in (
+            "antfly_generated_q4_0_mmv_fallbacks",
+            "antfly_generated_q4_0_mm_fallbacks",
+            "antfly_generated_q4_0_pair_fallbacks",
+            "antfly_generated_q4_0_pair_q8_fallbacks",
+            "antfly_generated_q4_0_down_q8_fallbacks",
+        ):
+            if int_value(row.get(key)) != 0:
+                errors.append(f"E2B sample {index} reported promoted-route fallback {key}")
         if int_value(row.get("antfly_generated_q6_lm_head_argmax")) != 0:
             errors.append(f"E2B sample {index} unexpectedly used generated Q6 LM-head")
         if int_value(row.get("antfly_generated_q6_lm_head_argmax_fallbacks")) != 0:
@@ -692,7 +730,7 @@ def main() -> None:
 
     matrix_path, pair_path = reset_matrix_outputs(args.output_dir)
     matrix_log = args.output_dir / "e2b_matrix.log"
-    matrix_returncode, _ = run_logged(matrix_command(args), environment, matrix_log, args.timeout_sec)
+    matrix_returncode, _ = run_logged(matrix_command(args), environment, matrix_log, matrix_timeout_sec(args))
     errors.extend(matrix_process_errors(matrix_returncode))
     matrix: dict[str, Any] = {}
     if matrix_path.is_file():

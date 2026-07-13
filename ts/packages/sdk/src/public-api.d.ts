@@ -15600,6 +15600,15 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            /** @description Generation request exceeds the configured memory budget */
+            507: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
         };
     };
     generateBatchContent: {
@@ -15708,6 +15717,15 @@ export interface operations {
             };
             /** @description Generation service unavailable (no models configured) */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Generation request exceeds the configured memory budget */
+            507: {
                 headers: {
                     [name: string]: unknown;
                 };

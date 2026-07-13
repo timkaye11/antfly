@@ -128,6 +128,17 @@ const PendingDecode = struct {
     exclusive_step: bool = false,
 };
 
+fn decodeWorkCompatible(
+    pending: PendingDecode,
+    total_sequence_len: usize,
+    kv_sequence_len: usize,
+    kv_position_offset: usize,
+) bool {
+    return pending.total_sequence_len == total_sequence_len and
+        pending.kv_sequence_len == kv_sequence_len and
+        pending.kv_position_offset == kv_position_offset;
+}
+
 const PendingPrefill = struct {
     request_id: RequestId,
     work_ptr: *anyopaque,
@@ -326,9 +337,16 @@ pub const NativeGenerateCoordinator = struct {
     pub fn decodeCoalesceDelayUs(self: *const NativeGenerateCoordinator, lease: Lease) u32 {
         self.lockCoordinator();
         defer self.unlockCoordinator();
-        if (self.policy.max_decode_wait_us == 0 or self.entries.items.len <= 1) return 0;
+        if (self.policy.max_decode_wait_us == 0) return 0;
         if (self.in_turn != null or self.pending_decode.items.len != 1) return 0;
-        if (self.pending_decode.items[0].request_id != lease.request_id) return 0;
+        const leader = self.pending_decode.items[0];
+        if (leader.request_id != lease.request_id) return 0;
+        if (!self.hasCompatibleDecodePeerUnlocked(
+            lease,
+            leader.total_sequence_len,
+            leader.kv_sequence_len,
+            leader.kv_position_offset,
+        )) return 0;
         return self.policy.max_decode_wait_us;
     }
 
@@ -340,6 +358,54 @@ pub const NativeGenerateCoordinator = struct {
             if (self.entries.items.len > limit) return false;
         }
         return true;
+    }
+
+    pub fn shouldBatchDecode(
+        self: *const NativeGenerateCoordinator,
+        lease: Lease,
+        total_sequence_len: usize,
+        kv_sequence_len: usize,
+        kv_position_offset: usize,
+    ) bool {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        if (self.policy.max_step_items <= 1) return false;
+        if (self.policy.max_active_requests_for_batching) |limit| {
+            if (self.entries.items.len > limit) return false;
+        }
+        return self.hasCompatibleDecodePeerUnlocked(
+            lease,
+            total_sequence_len,
+            kv_sequence_len,
+            kv_position_offset,
+        );
+    }
+
+    fn hasCompatibleDecodePeerUnlocked(
+        self: *const NativeGenerateCoordinator,
+        lease: Lease,
+        total_sequence_len: usize,
+        kv_sequence_len: usize,
+        kv_position_offset: usize,
+    ) bool {
+        const current_idx = self.indexOf(lease.request_id) orelse return false;
+        if (self.entries.items[current_idx].phase != .decode) return false;
+
+        for (self.entries.items) |entry| {
+            if (entry.id == lease.request_id or entry.phase != .decode) continue;
+            if (self.findPendingDecodeByRequest(entry.id)) |pending_idx| {
+                if (decodeWorkCompatible(
+                    self.pending_decode.items[pending_idx],
+                    total_sequence_len,
+                    kv_sequence_len,
+                    kv_position_offset,
+                )) return true;
+                continue;
+            }
+            const peer_total = std.math.add(usize, entry.total_prompt_tokens, entry.generated_tokens) catch continue;
+            if (peer_total == total_sequence_len) return true;
+        }
+        return false;
     }
 
     pub fn noteDecodeCoalesceWait(self: *NativeGenerateCoordinator, delay_us: u32) void {
@@ -534,9 +600,12 @@ pub const NativeGenerateCoordinator = struct {
             if (pending.work_ptr == leader_work_ptr) continue;
             if (pending.exclusive_step) continue;
             if (!self.policy.allow_mixed_sequence_lengths and
-                (pending.total_sequence_len != leader_total_sequence_len or
-                    pending.kv_sequence_len != leader_kv_sequence_len or
-                    pending.kv_position_offset != leader_kv_position_offset))
+                !decodeWorkCompatible(
+                    pending,
+                    leader_total_sequence_len,
+                    leader_kv_sequence_len,
+                    leader_kv_position_offset,
+                ))
             {
                 continue;
             }
@@ -1798,13 +1867,19 @@ test "decode coalescing skips a sole request and records a two-item batch" {
     var first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 32, .max_tokens = 8 });
     defer coordinator.release(first);
     coordinator.beginDecode(&first, 4);
+    coordinator.noteDecodeProgress(&first, 1);
     var first_work: u8 = 1;
     try coordinator.enqueueDecodeWork(first, @ptrCast(&first_work), 5, 5, 0, .{});
     try std.testing.expectEqual(@as(u32, 0), coordinator.decodeCoalesceDelayUs(first));
 
     var second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 32, .max_tokens = 8 });
     defer coordinator.release(second);
+    try std.testing.expect(!coordinator.shouldBatchDecode(first, 5, 5, 0));
     coordinator.beginDecode(&second, 4);
+    try std.testing.expect(!coordinator.shouldBatchDecode(first, 5, 5, 0));
+    try std.testing.expectEqual(@as(u32, 0), coordinator.decodeCoalesceDelayUs(first));
+    coordinator.noteDecodeProgress(&second, 1);
+    try std.testing.expect(coordinator.shouldBatchDecode(first, 5, 5, 0));
     try std.testing.expectEqual(@as(u32, 1_000), coordinator.decodeCoalesceDelayUs(first));
     coordinator.noteDecodeCoalesceWait(1_000);
 
@@ -1827,6 +1902,43 @@ test "decode coalescing skips a sole request and records a two-item batch" {
     try std.testing.expectEqual(@as(u64, 1), coordinator.stats.decode_coalesce_waits_total);
     try std.testing.expectEqual(@as(u64, 1_000), coordinator.stats.decode_coalesce_wait_us_total);
     try std.testing.expectEqual(@as(u64, 1), coordinator.stats.step_batch_size_2_total);
+}
+
+test "decode batching ignores incompatible pending peers" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+    coordinator.policy.max_decode_wait_us = 1_000;
+
+    var first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 32, .max_tokens = 8 });
+    defer coordinator.release(first);
+    coordinator.beginDecode(&first, 4);
+    coordinator.noteDecodeProgress(&first, 1);
+    var first_work: u8 = 1;
+    try coordinator.enqueueDecodeWork(first, @ptrCast(&first_work), 5, 5, 0, .{});
+
+    var second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+    defer coordinator.release(second);
+    coordinator.beginDecode(&second, 8);
+    coordinator.noteDecodeProgress(&second, 1);
+    var second_work: u8 = 2;
+    try coordinator.enqueueDecodeWork(second, @ptrCast(&second_work), 9, 9, 0, .{});
+
+    try std.testing.expect(!coordinator.shouldBatchDecode(first, 5, 5, 0));
+    try std.testing.expectEqual(@as(u32, 0), coordinator.decodeCoalesceDelayUs(first));
+
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(allocator);
+    try std.testing.expect(try coordinator.claimStep(
+        allocator,
+        &first,
+        @ptrCast(&first_work),
+        .decode,
+        coordinator.defaultStepBudget(),
+        &step,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), step.items.len);
+    coordinator.completeStep(&first, step.items);
 }
 
 test "coordinator serializes concurrent acquire and release" {

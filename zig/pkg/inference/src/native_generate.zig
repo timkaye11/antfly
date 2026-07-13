@@ -140,6 +140,22 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const opts = try parseArgs(args);
     try validateCacheCompactionOption(opts.cache_compaction_ratio);
     try native_backend_choice.validate(opts.backend);
+    if (opts.raw_decode_bench and (opts.image_count > 0 or opts.audio_count > 0)) return error.RawDecodeBenchRequiresTextOnly;
+    if (opts.raw_decode_bench and opts.draft_model != null and opts.speculation_policy != .off) return error.RawDecodeBenchSpeculationUnsupported;
+    if (opts.raw_decode_bench and opts.stream) return error.RawDecodeBenchStreamingUnsupported;
+    const require_server = requireWarmServer(opts);
+    if (opts.server_url orelse platform.env.getenv("ANTFLY_INFERENCE_SERVER_URL")) |server_url| {
+        if (opts.raw_decode_bench) return error.RawDecodeBenchRequiresLocalBackend;
+        var server_opts = opts;
+        server_opts.server_url = server_url;
+        if (defaultServerModelName(opts.model_dir)) |model_name| server_opts.model_dir = model_name;
+        return try runServerGenerate(allocator, io, server_opts, false);
+    }
+    if (require_server) {
+        if (!serverGenerateSupportsOptions(opts)) return error.UnsupportedServerGenerateOption;
+        return error.WarmInferenceServerUnavailable;
+    }
+
     var preflight_draft_gpt_config: ?gpt_mod.Config = null;
     const effective_draft_model = if (opts.speculation_policy == .off) null else if (opts.backend == .metal and opts.speculation_policy == .auto) blk: {
         const draft_model_dir = opts.draft_model orelse break :blk null;
@@ -152,22 +168,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         }
         break :blk draft_model_dir;
     } else opts.draft_model;
-    if (opts.raw_decode_bench and (opts.image_count > 0 or opts.audio_count > 0)) return error.RawDecodeBenchRequiresTextOnly;
-    if (opts.raw_decode_bench and effective_draft_model != null) return error.RawDecodeBenchSpeculationUnsupported;
-    if (opts.raw_decode_bench and opts.stream) return error.RawDecodeBenchStreamingUnsupported;
-    const require_server = requireWarmServer(opts);
     if (effective_draft_model != null and opts.backend == .onnx) return error.SpeculativeDecodingRequiresNativeBackend;
-    if (opts.server_url orelse platform.env.getenv("ANTFLY_INFERENCE_SERVER_URL")) |server_url| {
-        if (opts.raw_decode_bench) return error.RawDecodeBenchRequiresLocalBackend;
-        var server_opts = opts;
-        server_opts.server_url = server_url;
-        if (defaultServerModelName(opts.model_dir)) |model_name| server_opts.model_dir = model_name;
-        return try runServerGenerate(allocator, io, server_opts, false);
-    }
-    if (require_server) {
-        if (!serverGenerateSupportsOptions(opts)) return error.UnsupportedServerGenerateOption;
-        return error.WarmInferenceServerUnavailable;
-    }
     const started_at = std.Io.Timestamp.now(io, .awake);
 
     var preflight_manifest = try manifest_mod.loadFromDir(allocator, opts.model_dir);
@@ -5677,6 +5678,29 @@ fn generateWithOptionalStreaming(
     return result;
 }
 
+fn serverGenerateRequest(opts: Options, messages: []const api.ChatMessage) api.GenerateRequest {
+    const draft_requested = opts.draft_model != null;
+    return .{
+        .model = opts.model_dir,
+        .messages = messages,
+        .max_tokens = opts.max_tokens,
+        .temperature = opts.temperature,
+        .top_p = opts.top_p,
+        .top_k = opts.top_k,
+        .repetition_penalty = opts.repetition_penalty,
+        .stream = if (opts.stream) true else null,
+        .draft_model = opts.draft_model,
+        .speculative_k = if (draft_requested) opts.speculative_k else null,
+        .speculation_policy = if (draft_requested) opts.speculation_policy.name() else null,
+        .speculation_calibration = if (draft_requested) opts.speculation_calibration.name() else null,
+        .cache_dtype = opts.cache_dtype,
+        .cache_compaction_ratio = opts.cache_compaction_ratio,
+        .backend = generateBackendOverrideForChoice(opts.backend),
+        .mode = serverGenerateModeName(opts),
+        .compiled_target = serverGenerateCompiledTargetName(opts),
+    };
+}
+
 fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, quiet_errors: bool) !void {
     if (!serverGenerateSupportsOptions(opts)) {
         return error.UnsupportedServerGenerateOption;
@@ -5694,21 +5718,7 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
         .role = .user,
         .content = .{ .string = opts.prompt },
     }};
-    const request = api.GenerateRequest{
-        .model = opts.model_dir,
-        .messages = &messages,
-        .max_tokens = opts.max_tokens,
-        .temperature = opts.temperature,
-        .top_p = opts.top_p,
-        .top_k = opts.top_k,
-        .repetition_penalty = opts.repetition_penalty,
-        .stream = if (opts.stream) true else null,
-        .cache_dtype = opts.cache_dtype,
-        .cache_compaction_ratio = opts.cache_compaction_ratio,
-        .backend = generateBackendOverrideForChoice(opts.backend),
-        .mode = serverGenerateModeName(opts),
-        .compiled_target = serverGenerateCompiledTargetName(opts),
-    };
+    const request = serverGenerateRequest(opts, &messages);
     const body = try httpx.json.Json.stringify(allocator, request);
     defer allocator.free(body);
 
@@ -5751,6 +5761,11 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
             @as(f64, @floatFromInt(parsed.value.usage.completion_tokens)) * 1000.0 / @as(f64, @floatFromInt(total_ms))
         else
             0;
+        if (parsed.value.speculation) |status| {
+            const summary = try formatServerSpeculationStatus(allocator, status);
+            defer allocator.free(summary);
+            print("{s}\n", .{summary});
+        }
         print("timing_ms: server_request={d} total={d} tokens_per_sec={d:.2}\n", .{ total_ms, total_ms, tokens_per_sec });
     }
 }
@@ -5772,14 +5787,24 @@ const SseEventBoundary = struct {
     delimiter_len: usize,
 };
 
+fn formatServerSpeculationStatus(allocator: std.mem.Allocator, status: api.GenerateSpeculationStatus) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "speculation: policy={s} calibration={s} decision={s} disabled_reason={s}",
+        .{ status.policy, status.calibration, status.decision, status.disabled_reason orelse "none" },
+    );
+}
+
 const ServerGenerateSseWriter = struct {
     allocator: std.mem.Allocator,
     buffer: std.ArrayListUnmanaged(u8) = .empty,
     finish_reason: ?api.FinishReason = null,
+    speculation_summary: ?[]u8 = null,
     stream_error: bool = false,
 
     fn deinit(self: *@This()) void {
         self.buffer.deinit(self.allocator);
+        if (self.speculation_summary) |summary| self.allocator.free(summary);
     }
 
     pub fn writeAll(self: *@This(), data: []const u8) !void {
@@ -5833,6 +5858,11 @@ const ServerGenerateSseWriter = struct {
 
         var parsed = try std.json.parseFromSlice(api.GenerateChunk, self.allocator, data.items, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
+        if (parsed.value.speculation) |status| {
+            const summary = try formatServerSpeculationStatus(self.allocator, status);
+            if (self.speculation_summary) |old| self.allocator.free(old);
+            self.speculation_summary = summary;
+        }
         for (parsed.value.choices) |choice| {
             if (choice.delta.content) |content| {
                 print("{s}", .{content});
@@ -5905,6 +5935,7 @@ fn runServerGenerateStream(
     }
     if (opts.print_timing) {
         const total_ms = durationMillis(started_at, finished_at);
+        if (stream_writer.speculation_summary) |summary| print("{s}\n", .{summary});
         print("timing_ms: server_request={d} total={d}\n", .{ total_ms, total_ms });
     }
 }
@@ -5936,9 +5967,8 @@ fn serverGenerateSupportsOptions(opts: Options) bool {
         !opts.raw_decode_bench and
         !opts.ignore_eos and
         !opts.no_chat_template and
-        opts.draft_model == null and
-        opts.speculation_policy == .auto and
-        opts.speculation_calibration == .none and
+        (opts.draft_model != null or opts.speculation_policy == .auto) and
+        (opts.draft_model != null or opts.speculation_calibration == .none) and
         !opts.debug_mtp and
         !opts.debug_gemma4_target and
         !opts.disable_gemma_embedding_scale and
@@ -6981,6 +7011,45 @@ test "server generate rejects unsupported server options" {
         .backend = .cuda,
         .ignore_eos = true,
     }));
+}
+
+test "server generate forwards supported speculation options" {
+    const opts = Options{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .cuda,
+        .draft_model = "gemma-e2b-mtp",
+        .speculative_k = 7,
+        .speculation_policy = .force,
+        .speculation_calibration = .positive,
+    };
+    try std.testing.expect(serverGenerateSupportsOptions(opts));
+
+    const messages = [_]api.ChatMessage{.{
+        .role = .user,
+        .content = .{ .string = opts.prompt },
+    }};
+    const request = serverGenerateRequest(opts, &messages);
+    const body = try httpx.json.Json.stringify(std.testing.allocator, request);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"draft_model\":\"gemma-e2b-mtp\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"speculative_k\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"speculation_policy\":\"force\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"speculation_calibration\":\"positive\"") != null);
+}
+
+test "server generate stream retains final speculation status" {
+    var writer = ServerGenerateSseWriter{ .allocator = std.testing.allocator };
+    defer writer.deinit();
+    try writer.writeAll(
+        "data: {\"id\":\"chunk-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gemma-e2b\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"speculation\":{\"policy\":\"auto\",\"calibration\":\"probe\",\"decision\":\"disabled_slow\",\"disabled_reason\":\"mtp_auto_cost_probe_slow\"}}\n\n",
+    );
+    try writer.finish();
+    try std.testing.expectEqualStrings(
+        "speculation: policy=auto calibration=probe decision=disabled_slow disabled_reason=mtp_auto_cost_probe_slow",
+        writer.speculation_summary.?,
+    );
+    try std.testing.expectEqual(api.FinishReason.stop, writer.finish_reason.?);
 }
 
 test "server model name strips local models dir prefix" {

@@ -48,6 +48,16 @@ class PairBenchmarkAccountingTest(unittest.TestCase):
                     "lm_head_argmax_q4_0_q8_1_fallbacks": int(os.environ.get("FAKE_LM_FALLBACKS", "0")),
                     "lm_head_argmax_generated_q6_k_q8_1_hits": int(os.environ.get("FAKE_GENERATED_Q6_LM_HITS", "0")),
                     "lm_head_argmax_generated_q6_k_q8_1_fallbacks": int(os.environ.get("FAKE_GENERATED_Q6_LM_FALLBACKS", "0")),
+                    "q4_0_generated_mmv_hits": 11,
+                    "q4_0_generated_mmv_fallbacks": 0,
+                    "q4_0_generated_mm_hits": 12,
+                    "q4_0_generated_mm_fallbacks": 0,
+                    "q4_0_generated_pair_hits": 13,
+                    "q4_0_generated_pair_fallbacks": 0,
+                    "q4_0_generated_pair_q8_hits": 14,
+                    "q4_0_generated_pair_q8_fallbacks": 0,
+                    "q4_0_generated_down_q8_hits": 15,
+                    "q4_0_generated_down_q8_fallbacks": 0,
                     "q4_0_generated_e2b_pair_q8_hits": 1,
                     "q4_0_generated_e2b_down_q8_hits": 1,
                     "q4_0_generated_e2b_pair_q8_fallbacks": 0,
@@ -121,11 +131,17 @@ class PairBenchmarkAccountingTest(unittest.TestCase):
         self.assertTrue(summary["ok_lm_head_argmax"])
         self.assertEqual("0", summary["comparison"]["antfly_generated_q4_0_e2b_ffn_exact"])
         self.assertEqual(0, summary["rows"][0]["antfly_generated_e2b_exact_pair"])
+        self.assertEqual(11, summary["rows"][0]["antfly_generated_q4_0_mmv"])
+        self.assertEqual(12, summary["rows"][0]["antfly_generated_q4_0_mm"])
+        self.assertEqual(13, summary["rows"][0]["antfly_generated_q4_0_pair"])
+        self.assertEqual(14, summary["rows"][0]["antfly_generated_q4_0_pair_q8"])
+        self.assertEqual(15, summary["rows"][0]["antfly_generated_q4_0_down_q8"])
 
         header, row = (output_dir / "paired_summary.tsv").read_text().splitlines()
         fields = header.split("\t")
         self.assertEqual(len(fields), len(row.split("\t")))
         self.assertIn("antfly_generated_tokens", fields)
+        self.assertIn("antfly_generated_q4_0_mmv", fields)
 
     def test_rejects_truncated_antfly_generation(self) -> None:
         completed, _ = self.run_case(FAKE_ANTFLY_ACTUAL_TOKENS="2")

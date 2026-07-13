@@ -597,7 +597,7 @@ pub fn build(b: *std.Build) void {
     quant_kernel_metal_local_check_step.dependOn(quant_kernel_metal_blocker_strict_step);
     quant_kernel_local_check_step.dependOn(&quant_kernel_codegen_test_check.step);
     quant_kernel_local_check_step.dependOn(&cuda_artifact_source_policy_check.step);
-    if (target.result.os.tag == .macos) {
+    if (enable_metal and target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
         quant_kernel_local_check_step.dependOn(quant_kernel_metal_local_check_step);
     }
 

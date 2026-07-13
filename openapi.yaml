@@ -6059,6 +6059,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '507':
+          description: Generation request exceeds the configured memory budget
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/generate/batch:
     post:
       summary: Generate text for a synchronous batch of requests
@@ -6154,6 +6160,12 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
         '503':
           description: Generation service unavailable (no models configured)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '507':
+          description: Generation request exceeds the configured memory budget
           content:
             application/json:
               schema:
@@ -19693,6 +19705,8 @@ components:
           example: What type of document is this?
         max_tokens:
           type: integer
+          minimum: 1
+          maximum: 1024
           description: Maximum tokens to generate
           default: 256
           example: 256
@@ -20073,6 +20087,8 @@ components:
           description: Conversation messages (OpenAI-compatible format)
         max_tokens:
           type: integer
+          minimum: 1
+          maximum: 2147483647
           description: Maximum tokens to generate
           default: 256
           example: 256
@@ -20089,6 +20105,8 @@ components:
           default: 1
         top_k:
           type: integer
+          minimum: 0
+          maximum: 2147483647
           description: Top-k sampling (inference extension, not in OpenAI API)
           default: 50
         stream:
@@ -20292,6 +20310,7 @@ components:
         usage:
           $ref: '#/components/schemas/InferenceGenerateUsage'
         speculation:
+          x-go-type-skip-optional-pointer: false
           nullable: true
           allOf:
             - $ref: '#/components/schemas/InferenceGenerateSpeculationStatus'
@@ -20474,6 +20493,7 @@ components:
           items:
             $ref: '#/components/schemas/InferenceGenerateChunkChoice'
         speculation:
+          x-go-type-skip-optional-pointer: false
           nullable: true
           allOf:
             - $ref: '#/components/schemas/InferenceGenerateSpeculationStatus'

@@ -14,6 +14,12 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  cuda-gemma4-release-gate:
+    name: CUDA Gemma 4 release gate
+    uses: ./.github/workflows/cuda-gemma4-l4.yml
+    with:
+      gate: release
+
   build-zig-runtime-archives:
     name: Build Zig archive (${{ matrix.artifact_name }})
     runs-on: ${{ matrix.runner }}
@@ -108,7 +114,9 @@ jobs:
 
   publish-release-assets:
     name: Publish release assets
-    needs: build-zig-runtime-archives
+    needs:
+      - build-zig-runtime-archives
+      - cuda-gemma4-release-gate
     runs-on: arc-antfly-standard
     steps:
       - name: Checkout

@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -751,4 +752,59 @@ func TestClient_URLNormalization(t *testing.T) {
 	ctx := context.Background()
 	_, err = inferenceClient.ListModels(ctx)
 	require.NoError(t, err)
+}
+
+func TestClient_Generate_Speculation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/ai/v1/generate", r.URL.Path)
+		var req map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		assert.Equal(t, "draft", req["draft_model"])
+		assert.Equal(t, float64(3), req["speculative_k"])
+		assert.Equal(t, "auto", req["speculation_policy"])
+		assert.Equal(t, "probe", req["speculation_calibration"])
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "chatcmpl-test", "object": "chat.completion", "created": 1, "model": "target",
+			"choices": []map[string]any{{
+				"index": 0, "finish_reason": "stop",
+				"message": map[string]any{"role": "assistant", "content": "ok"},
+			}},
+			"usage":       map[string]any{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+			"speculation": map[string]any{"policy": "auto", "calibration": "probe", "decision": "active"},
+		})
+	}))
+	defer server.Close()
+
+	client, err := NewInferenceClient(server.URL, nil)
+	require.NoError(t, err)
+	resp, err := client.Generate(context.Background(), "target", []oapi.InferenceChatMessage{NewUserMessage("hello")}, &GenerateConfig{
+		DraftModel:             "draft",
+		SpeculativeK:           3,
+		SpeculationPolicy:      oapi.InferenceGenerateRequestSpeculationPolicyAuto,
+		SpeculationCalibration: oapi.InferenceGenerateRequestSpeculationCalibrationProbe,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp.Speculation)
+	assert.Equal(t, "active", resp.Speculation.Decision)
+
+	var withoutSpeculation oapi.InferenceGenerateResponse
+	require.NoError(t, json.Unmarshal([]byte(`{"speculation":null}`), &withoutSpeculation))
+	assert.Nil(t, withoutSpeculation.Speculation)
+}
+
+func TestClient_Generate_MemoryBudgetExceeded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInsufficientStorage)
+		_, _ = io.WriteString(w, `{"error":"MEMORY_BUDGET_EXCEEDED"}`)
+	}))
+	defer server.Close()
+
+	client, err := NewInferenceClient(server.URL, nil)
+	require.NoError(t, err)
+	_, err = client.Generate(context.Background(), "target", []oapi.InferenceChatMessage{NewUserMessage("hello")}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "memory budget exceeded")
 }

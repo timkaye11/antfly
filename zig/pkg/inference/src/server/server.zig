@@ -89,6 +89,19 @@ const GenerateSpeculationOptions = struct {
     calibration: generation.SpeculationCalibration,
 };
 
+const GenerateNumericOptions = struct {
+    max_tokens: i32,
+    top_k: i32,
+};
+
+fn parseGenerateNumericOptions(max_tokens_raw: ?i64, top_k_raw: ?i64) !GenerateNumericOptions {
+    const max_tokens = std.math.cast(i32, max_tokens_raw orelse 256) orelse return error.InvalidMaxTokens;
+    if (max_tokens < 1) return error.InvalidMaxTokens;
+    const top_k = std.math.cast(i32, top_k_raw orelse 0) orelse return error.InvalidTopK;
+    if (top_k < 0) return error.InvalidTopK;
+    return .{ .max_tokens = max_tokens, .top_k = top_k };
+}
+
 fn parseGenerateSpeculationOptions(
     draft_requested: bool,
     speculative_k: ?i64,
@@ -321,6 +334,7 @@ pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 const max_generate_batch_items: usize = 128;
 const max_read_batch_images: usize = 64;
+const max_read_tokens: usize = 1024;
 const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
 
 const GenerateBackendSelection = struct {
@@ -1213,6 +1227,7 @@ pub const Node = struct {
     ) ![]readers_api.Result {
         if (request.images.len == 0) return try allocator.alloc(readers_api.Result, 0);
         if (request.images.len > max_read_batch_images) return error.ReadBatchTooLarge;
+        const max_tokens = try validateReadMaxTokens(request.max_tokens);
         try self.request_queue.acquire();
         self.updateQueueMetrics();
         defer self.releaseSlot();
@@ -1255,7 +1270,7 @@ pub const Node = struct {
 
         const results = try reader.readBatch(image_datas, .{
             .prompt = request.prompt,
-            .max_tokens = if (request.max_tokens) |mt| @intCast(mt) else null,
+            .max_tokens = max_tokens,
         });
         defer {
             for (results) |result| {
@@ -2115,6 +2130,16 @@ pub const Node = struct {
         self.metrics.incRequest("generate");
         defer self.metrics.decActive();
 
+        const numeric = parseGenerateNumericOptions(body.max_tokens, body.top_k) catch |err| {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = switch (err) {
+                    error.InvalidMaxTokens => "max_tokens must be between 1 and 2147483647",
+                    error.InvalidTopK => "top_k must be between 0 and 2147483647",
+                },
+            });
+        };
+
         // Resolve model
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
         const model_path = self.resolveModelPath(ctx.io, model_name, "generators") catch
@@ -2359,7 +2384,7 @@ pub const Node = struct {
         if (requested_draft_model_name != null) self.metrics.incSpeculationRequested();
 
         const want_stream = body.stream orelse false;
-        const configured_max_tokens: i32 = if (body.max_tokens) |mt| @intCast(mt) else 256;
+        const configured_max_tokens = numeric.max_tokens;
         const queue_units = generateQueueUnitsForSpeculation(
             self.estimateGenerateQueueUnits(messages.items, configured_max_tokens),
             effective_draft_model_name != null,
@@ -2372,7 +2397,7 @@ pub const Node = struct {
             .max_tokens = configured_max_tokens,
             .temperature = body.temperature orelse 0,
             .top_p = body.top_p orelse 0,
-            .top_k = if (body.top_k) |tk| @intCast(tk) else 0,
+            .top_k = numeric.top_k,
             .min_p = body.min_p orelse 0,
             .repetition_penalty = body.repetition_penalty orelse 1.0,
             .frequency_penalty = body.frequency_penalty orelse 0,
@@ -3184,6 +3209,14 @@ pub const Node = struct {
     fn generateBatchUnsupportedReasonPreflight(body: api.GenerateRequest) ?api.GenerateBatchError {
         if (body.stream orelse false) return .{ .code = "UNSUPPORTED_STREAM", .message = "batch generation does not support stream=true", .retryable = false };
         if (body.tools != null or body.tool_choice != null) return .{ .code = "UNSUPPORTED_TOOLS", .message = "batch generation does not support tools yet", .retryable = false };
+        _ = parseGenerateNumericOptions(body.max_tokens, body.top_k) catch |err| return .{
+            .code = "INVALID_REQUEST",
+            .message = switch (err) {
+                error.InvalidMaxTokens => "max_tokens must be between 1 and 2147483647",
+                error.InvalidTopK => "top_k must be between 0 and 2147483647",
+            },
+            .retryable = false,
+        };
         if (body.cache_compaction_ratio) |ratio| {
             validateCacheCompactionRatio(ratio) catch
                 return .{ .code = "INVALID_CACHE_COMPACTION_RATIO", .message = "cache_compaction_ratio must be finite, greater than 0, and at most 1", .retryable = false };
@@ -3232,6 +3265,7 @@ pub const Node = struct {
     }
 
     fn generateConfigFromBody(allocator: std.mem.Allocator, body: api.GenerateRequest) !generation.GenerationConfig {
+        const numeric = try parseGenerateNumericOptions(body.max_tokens, body.top_k);
         const speculation = try parseGenerateSpeculationOptions(
             body.draft_model != null,
             body.speculative_k,
@@ -3239,10 +3273,10 @@ pub const Node = struct {
             body.speculation_calibration,
         );
         var config = generation.GenerationConfig{
-            .max_tokens = if (body.max_tokens) |mt| @intCast(mt) else 256,
+            .max_tokens = numeric.max_tokens,
             .temperature = body.temperature orelse 0,
             .top_p = body.top_p orelse 0,
-            .top_k = if (body.top_k) |tk| @intCast(tk) else 0,
+            .top_k = numeric.top_k,
             .min_p = body.min_p orelse 0,
             .repetition_penalty = body.repetition_penalty orelse 1.0,
             .frequency_penalty = body.frequency_penalty orelse 0,
@@ -5038,6 +5072,11 @@ pub const Node = struct {
                 .message = try std.fmt.allocPrint(ctx.allocator, "'images' must contain at most {d} items", .{max_read_batch_images}),
             });
         }
+        const max_tokens = validateReadMaxTokens(body.max_tokens) catch
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "'max_tokens' must be between 1 and 1024",
+            });
 
         // Resolve model
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
@@ -5117,7 +5156,7 @@ pub const Node = struct {
 
         const results = reader.readBatch(image_datas, .{
             .prompt = body.prompt,
-            .max_tokens = if (body.max_tokens) |mt| @intCast(mt) else null,
+            .max_tokens = max_tokens,
         }) catch |err|
             return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
         defer {
@@ -5355,6 +5394,14 @@ pub const Node = struct {
                 .message = try std.fmt.allocPrint(ctx.allocator, "'images' must contain at most {d} items", .{max_read_batch_images}),
             });
         }
+        const max_tokens = if (has_images)
+            validateReadMaxTokens(body.max_tokens) catch
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "'max_tokens' must be between 1 and 1024",
+                })
+        else
+            null;
         const schemas = extraction_mod.parseSchemas(ctx.allocator, &body.schema) catch |err| {
             const message = try std.fmt.allocPrint(ctx.allocator, "invalid schema: {s}", .{@errorName(err)});
             defer ctx.allocator.free(message);
@@ -5393,7 +5440,7 @@ pub const Node = struct {
             }
             break :blk extractor.extractImages(extractor_ctx, schemas, config, image_datas, .{
                 .prompt = body.prompt,
-                .max_tokens = if (body.max_tokens) |mt| @intCast(mt) else null,
+                .max_tokens = max_tokens,
             });
         }) catch |err| switch (err) {
             error.UnsupportedInput => return ctx.status(400).json(.{
@@ -5988,7 +6035,7 @@ fn parseExtractionOptionsJson(allocator: std.mem.Allocator, raw: []const u8) !Di
     out.include_confidence = jsonBoolField(obj, "include_confidence");
     out.include_spans = jsonBoolField(obj, "include_spans");
     if (jsonStringField(obj, "prompt")) |prompt| out.prompt = try allocator.dupe(u8, prompt);
-    out.max_tokens = jsonUsizeField(obj, "max_tokens");
+    out.max_tokens = try readMaxTokensJsonField(obj, "max_tokens");
     return out;
 }
 
@@ -6129,15 +6176,6 @@ fn jsonFloatField(obj: std.json.ObjectMap, name: []const u8) ?f32 {
         .float => |number| @floatCast(number),
         .integer => |number| @floatFromInt(number),
         .number_string => |raw| std.fmt.parseFloat(f32, raw) catch null,
-        else => null,
-    };
-}
-
-fn jsonUsizeField(obj: std.json.ObjectMap, name: []const u8) ?usize {
-    const value = obj.get(name) orelse return null;
-    return switch (value) {
-        .integer => |number| if (number >= 0) @intCast(number) else null,
-        .number_string => |raw| std.fmt.parseInt(usize, raw, 10) catch null,
         else => null,
     };
 }
@@ -6803,6 +6841,16 @@ test "generate speculation options validate the HTTP trust boundary" {
     try std.testing.expectError(error.InvalidSpeculationCalibration, parseGenerateSpeculationOptions(true, 4, null, "unknown"));
 }
 
+test "generate numeric options validate narrowing at the HTTP trust boundary" {
+    const defaults = try parseGenerateNumericOptions(null, null);
+    try std.testing.expectEqual(@as(i32, 256), defaults.max_tokens);
+    try std.testing.expectEqual(@as(i32, 0), defaults.top_k);
+    try std.testing.expectError(error.InvalidMaxTokens, parseGenerateNumericOptions(0, null));
+    try std.testing.expectError(error.InvalidMaxTokens, parseGenerateNumericOptions(std.math.maxInt(i64), null));
+    try std.testing.expectError(error.InvalidTopK, parseGenerateNumericOptions(null, -1));
+    try std.testing.expectError(error.InvalidTopK, parseGenerateNumericOptions(null, std.math.maxInt(i64)));
+}
+
 test "generate speculation status exposes disabled decisions" {
     const status = generateSpeculationStatus(.{
         .speculation_policy = .auto,
@@ -7027,6 +7075,30 @@ test "read batch downloaded byte accounting enforces aggregate cap" {
     };
     try std.testing.expectEqual(@as(usize, 14), try addReadBatchDownloadedBytes(0, item, 14));
     try std.testing.expectError(error.ReadBatchTooLarge, addReadBatchDownloadedBytes(10, item, 14));
+}
+
+test "read max tokens rejects unsafe signed values" {
+    try std.testing.expectEqual(@as(?usize, null), try validateReadMaxTokens(null));
+    try std.testing.expectEqual(@as(?usize, 1), try validateReadMaxTokens(1));
+    try std.testing.expectEqual(@as(?usize, max_read_tokens), try validateReadMaxTokens(@intCast(max_read_tokens)));
+    try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(-1));
+    try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(0));
+    try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(@intCast(max_read_tokens + 1)));
+    try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(std.math.maxInt(i64)));
+}
+
+test "direct extraction validates read max tokens" {
+    var valid = try parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":1024}");
+    defer valid.deinit();
+    try std.testing.expectEqual(@as(?usize, max_read_tokens), valid.max_tokens);
+    try std.testing.expectError(
+        error.InvalidMaxTokens,
+        parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":-1}"),
+    );
+    try std.testing.expectError(
+        error.InvalidMaxTokens,
+        parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":1025}"),
+    );
 }
 
 test "registerRoutesOn prefixes embed aliases and metrics route" {
@@ -9043,6 +9115,22 @@ fn downloadReadBatchContent(
 
 fn readBatchMaxBytes() usize {
     return @max(@as(usize, 1), platform.env.getenvUsize("ANTFLY_INFERENCE_READ_BATCH_BYTES") orelse default_max_read_batch_bytes);
+}
+
+fn validateReadMaxTokens(value: ?i64) !?usize {
+    const requested = value orelse return null;
+    if (requested < 1 or requested > @as(i64, @intCast(max_read_tokens))) return error.InvalidMaxTokens;
+    return @intCast(requested);
+}
+
+fn readMaxTokensJsonField(obj: std.json.ObjectMap, name: []const u8) !?usize {
+    const value = obj.get(name) orelse return null;
+    const requested = switch (value) {
+        .integer => |number| number,
+        .number_string => |raw| std.fmt.parseInt(i64, raw, 10) catch return error.InvalidMaxTokens,
+        else => return error.InvalidMaxTokens,
+    };
+    return validateReadMaxTokens(requested);
 }
 
 fn addReadBatchDownloadedBytes(current: usize, item: scraping.DownloadedContent, max_bytes: usize) !usize {

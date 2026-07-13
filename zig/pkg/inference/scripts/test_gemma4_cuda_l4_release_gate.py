@@ -6,6 +6,8 @@ import argparse
 import hashlib
 import os
 import pathlib
+import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -36,10 +38,12 @@ from gemma4_cuda_l4_release_gate import (
     l4_errors,
     matrix_command,
     matrix_process_errors,
+    matrix_timeout_sec,
     parse_token_ids,
     path_provenance,
     release_environment,
     reset_matrix_outputs,
+    run_logged,
 )
 
 
@@ -75,6 +79,16 @@ def pair() -> dict:
         "rows": [{
             "antfly_generated_q6_lm_head_argmax": 0,
             "antfly_generated_q6_lm_head_argmax_fallbacks": 0,
+            "antfly_generated_q4_0_mmv": 1,
+            "antfly_generated_q4_0_mmv_fallbacks": 0,
+            "antfly_generated_q4_0_mm": 1,
+            "antfly_generated_q4_0_mm_fallbacks": 0,
+            "antfly_generated_q4_0_pair": 1,
+            "antfly_generated_q4_0_pair_fallbacks": 0,
+            "antfly_generated_q4_0_pair_q8": 0,
+            "antfly_generated_q4_0_pair_q8_fallbacks": 0,
+            "antfly_generated_q4_0_down_q8": 0,
+            "antfly_generated_q4_0_down_q8_fallbacks": 0,
             "antfly_generated_e2b_pair": 0,
             "antfly_generated_e2b_down": 0,
             "antfly_generated_e2b_pair_fallbacks": 0,
@@ -131,6 +145,16 @@ class L4ReleaseGateTest(unittest.TestCase):
         self.assertIn('> "$mtp_dir/mtp_collection_profile.txt"', missing_draft)
         self.assertIn("release_contract=none; experimental diagnostic only", mtp_step)
 
+    def test_release_publication_depends_on_exact_sha_cuda_gate(self) -> None:
+        repo = pathlib.Path(__file__).resolve().parents[4]
+        workflow = (repo / ".github/workflows/cuda-gemma4-l4.yml").read_text(encoding="utf-8")
+        release = (repo / ".github/workflows/antfly-release.yml").read_text(encoding="utf-8")
+        self.assertIn("workflow_call:", workflow)
+        self.assertIn("uses: ./.github/workflows/cuda-gemma4-l4.yml", release)
+        self.assertIn("gate: release", release)
+        publish = release[release.index("  publish-release-assets:"):release.index("  package-cli-artifacts:")]
+        self.assertIn("- cuda-gemma4-release-gate", publish)
+
     def test_profile_locks_candidate_gates_and_returns_a_copy(self) -> None:
         profile = frozen_profile()
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE"])
@@ -142,6 +166,11 @@ class L4ReleaseGateTest(unittest.TestCase):
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN"])
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_CATALOG_FFN_CANDIDATES"])
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT"])
+        self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MMV"])
+        self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MM"])
+        self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR"])
+        self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR_Q8"])
+        self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_DOWN_Q8"])
         self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX"])
         self.assertEqual("required", profile["ANTFLY_DECODE_GRAPH_REPLAY"])
         self.assertEqual(str(CAPTURE_KV_CAPACITY), profile["ANTFLY_CAPTURE_FORCE_KV_CAPACITY"])
@@ -203,6 +232,14 @@ class L4ReleaseGateTest(unittest.TestCase):
         errors = e2b_pair_contract_errors(bad)
         self.assertTrue(any("antfly_generated_q4_0_e2b_ffn_exact" in error for error in errors))
         self.assertTrue(any("antfly_generated_e2b_exact_pair" in error for error in errors))
+
+    def test_pair_contract_requires_promoted_q4_routes_without_fallback(self) -> None:
+        bad = pair()
+        bad["rows"][0]["antfly_generated_q4_0_mmv"] = 0
+        bad["rows"][0]["antfly_generated_q4_0_pair_fallbacks"] = 1
+        errors = e2b_pair_contract_errors(bad)
+        self.assertTrue(any("did not use promoted route antfly_generated_q4_0_mmv" in error for error in errors))
+        self.assertTrue(any("promoted-route fallback antfly_generated_q4_0_pair_fallbacks" in error for error in errors))
 
     def test_12b_replay_contract_requires_exact_tokens_and_disabled_candidates(self) -> None:
         run = generation_run()
@@ -306,6 +343,24 @@ class L4ReleaseGateTest(unittest.TestCase):
     def test_nonzero_matrix_process_is_one_infrastructure_error(self) -> None:
         self.assertEqual([], matrix_process_errors(0))
         self.assertEqual(["E2B matrix exited 17"], matrix_process_errors(17))
+
+    def test_matrix_timeout_covers_every_paired_command(self) -> None:
+        args = argparse.Namespace(timeout_sec=123, warmups=1, repeats=3)
+        self.assertEqual(123 * 9, matrix_timeout_sec(args))
+
+    def test_run_logged_terminates_the_process_group_on_timeout(self) -> None:
+        process = mock.Mock(pid=4321, returncode=-signal.SIGTERM)
+        process.communicate.side_effect = [subprocess.TimeoutExpired(["slow"], 1), ("stopped", None)]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log = pathlib.Path(temp_dir) / "command.log"
+            with mock.patch("gemma4_cuda_l4_release_gate.subprocess.Popen", return_value=process) as popen, \
+                    mock.patch("gemma4_cuda_l4_release_gate.os.killpg") as killpg:
+                returncode, output = run_logged(["slow"], {}, log, 1)
+            self.assertIn("timed out", log.read_text())
+        self.assertEqual(124, returncode)
+        self.assertIn("timed out", output)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        killpg.assert_called_once_with(4321, signal.SIGTERM)
 
     def test_token_parsing_and_provenance_fingerprint_are_stable(self) -> None:
         self.assertIsNotNone(TOKEN_IDS_RE.search("token_ids: 1 2 3\n"))

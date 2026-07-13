@@ -3935,8 +3935,20 @@ pub const NativeGenerationPipeline = struct {
                 }
 
                 const has_cached_prefill_logits = tokens_generated == 0 and prefill_last_logits.* != null;
-                const allow_direct_device_decode = self.execution_lock == null or
-                    (if (self.scheduler) |scheduler| !scheduler.shouldBatchCurrentRequests() else true);
+                const batch_decode_context = decode_runtime.makeDecodeContext(seq_len.*, 1);
+                const should_batch_decode = if (self.scheduler) |scheduler|
+                    if (self.scheduler_lease) |lease|
+                        scheduler.shouldBatchDecode(
+                            lease.*,
+                            seq_len.*,
+                            batch_decode_context.kv_sequence_len,
+                            batch_decode_context.kv_position_offset,
+                        )
+                    else
+                        false
+                else
+                    false;
+                const allow_direct_device_decode = self.execution_lock == null or !should_batch_decode;
                 if (!has_cached_prefill_logits and allow_direct_device_decode) {
                     const direct_token = direct_token_blk: {
                         // Above the batching rollout cap the scheduler emits
