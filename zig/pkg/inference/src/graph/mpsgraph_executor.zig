@@ -90,6 +90,23 @@ pub const CompiledGraph = struct {
     output_shapes: []Shape,
 
     pub fn compile(allocator: std.mem.Allocator, graph: *const Graph) !CompiledGraph {
+        return compileWithPretransposedWeights(allocator, graph, &.{});
+    }
+
+    /// Like `compile`, but the parameter nodes whose ids appear in
+    /// `pretransposed_weight_ids` are treated as ALREADY holding W^T (declared
+    /// with the transposed [in, out] shape) when consumed as the weight of a
+    /// `fused_linear` / `fused_linear_no_bias`: the per-execute `transpose(W)`
+    /// op is dropped and the matmul consumes the fed buffer directly. The caller
+    /// is responsible for (a) declaring those parameter nodes with the [in, out]
+    /// shape and (b) feeding pre-transposed bytes. Byte-equivalent to `compile`
+    /// — the matmul sees the same operand values; only WHERE the transpose
+    /// happens moves from every-execute (GPU) to once-at-load (host).
+    pub fn compileWithPretransposedWeights(
+        allocator: std.mem.Allocator,
+        graph: *const Graph,
+        pretransposed_weight_ids: []const NodeId,
+    ) !CompiledGraph {
         const support = supportSummary(graph);
         if (!support.allSupported()) {
             std.log.warn(
@@ -109,6 +126,7 @@ pub const CompiledGraph = struct {
         defer termite_mpsgraph_context_destroy(ctx);
 
         var lowerer = Lowerer.init(allocator, graph, ctx);
+        lowerer.pretransposed_weight_ids = pretransposed_weight_ids;
         defer lowerer.deinit();
         try lowerer.lower();
 
@@ -302,6 +320,9 @@ const Lowerer = struct {
     feed_shapes: std.ArrayListUnmanaged(Shape) = .empty,
     feed_ranks: std.ArrayListUnmanaged(c_int) = .empty,
     feed_shape_flat: std.ArrayListUnmanaged(i64) = .empty,
+    /// Parameter node ids whose fed buffer is already W^T ([in, out]); the
+    /// consuming linear skips the in-graph `transpose(W)`. Not owned.
+    pretransposed_weight_ids: []const NodeId = &.{},
 
     fn init(allocator: std.mem.Allocator, graph: *const Graph, ctx: ?*anyopaque) Lowerer {
         return .{
@@ -422,8 +443,8 @@ const Lowerer = struct {
             .slice => |attrs| return self.slice(try self.input(node_id, 0), self.graph.node(node.inputs[0]).output_shape, attrs),
             .concat_prim => |attrs| return self.concat(try self.input(node_id, 0), try self.input(node_id, 1), attrs.axis),
             .dot_general => |attrs| return self.dotGeneral(try self.input(node_id, 0), self.graph.node(node.inputs[0]).output_shape, try self.input(node_id, 1), self.graph.node(node.inputs[1]).output_shape, attrs),
-            .fused_linear => |attrs| return self.linear(try self.input(node_id, 0), try self.input(node_id, 1), try self.input(node_id, 2), attrs),
-            .fused_linear_no_bias => |attrs| return self.linearNoBias(try self.input(node_id, 0), try self.input(node_id, 1), attrs),
+            .fused_linear => |attrs| return self.linear(try self.input(node_id, 0), try self.input(node_id, 1), try self.input(node_id, 2), attrs, self.weightIsPretransposed(node.inputs[1])),
+            .fused_linear_no_bias => |attrs| return self.linearNoBias(try self.input(node_id, 0), try self.input(node_id, 1), attrs, self.weightIsPretransposed(node.inputs[1])),
             .fused_layer_norm => |attrs| return self.layerNorm(try self.input(node_id, 0), try self.input(node_id, 1), try self.input(node_id, 2), self.graph.node(node.inputs[0]).output_shape, attrs.eps),
             .fused_gelu => return self.gelu(try self.input(node_id, 0)),
             .fused_softmax => return self.softmax(try self.input(node_id, 0), self.graph.node(node.inputs[0]).output_shape),
@@ -606,14 +627,29 @@ const Lowerer = struct {
         return error.MpsGraphUnsupportedDotGeneral;
     }
 
-    fn linearNoBias(self: *Lowerer, input_: ?*anyopaque, weight: ?*anyopaque, attrs: ml.graph.node.LinearAttrs) !?*anyopaque {
+    /// True when `weight_id` is a parameter fed pre-transposed (W^T, [in, out]);
+    /// the caller declared its node shape transposed and feeds transposed bytes,
+    /// so the linear must NOT re-transpose it in-graph.
+    fn weightIsPretransposed(self: *const Lowerer, weight_id: NodeId) bool {
+        if (weight_id == null_node) return false;
+        for (self.pretransposed_weight_ids) |id| {
+            if (id == weight_id) return true;
+        }
+        return false;
+    }
+
+    fn linearNoBias(self: *Lowerer, input_: ?*anyopaque, weight: ?*anyopaque, attrs: ml.graph.node.LinearAttrs, weight_pretransposed: bool) !?*anyopaque {
         _ = attrs;
+        // Y = X @ W^T. When the weight buffer is already W^T ([in, out]) we feed
+        // it straight into the matmul; otherwise transpose [out, in] -> [in, out]
+        // here (the per-execute op this pre-transpose path exists to eliminate).
+        if (weight_pretransposed) return self.matmul(input_, weight);
         const weight_t = try self.transposeExplicit(weight, &.{ 1, 0 });
         return self.matmul(input_, weight_t);
     }
 
-    fn linear(self: *Lowerer, input_: ?*anyopaque, weight: ?*anyopaque, bias: ?*anyopaque, attrs: ml.graph.node.LinearAttrs) !?*anyopaque {
-        const no_bias = try self.linearNoBias(input_, weight, attrs);
+    fn linear(self: *Lowerer, input_: ?*anyopaque, weight: ?*anyopaque, bias: ?*anyopaque, attrs: ml.graph.node.LinearAttrs, weight_pretransposed: bool) !?*anyopaque {
+        const no_bias = try self.linearNoBias(input_, weight, attrs, weight_pretransposed);
         return self.binary(.add, no_bias, bias);
     }
 

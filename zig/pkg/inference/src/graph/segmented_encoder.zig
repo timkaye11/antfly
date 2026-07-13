@@ -71,6 +71,19 @@ pub fn onlyFinalForwardOutputEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_FUSED_CHUNKER_FORWARD_ONLY_FINAL_OUTPUT", true);
 }
 
+/// Default ON (kill switch ANTFLY_FUSED_CHUNKER_WEIGHT_PRETRANSPOSE=0): store
+/// each frozen linear weight PRE-TRANSPOSED (W^T, [in, out]) in the base-weight
+/// cache once, declare its parameter node with the transposed shape, and drop
+/// the per-execute `transpose(W)` op the MPSGraph lowerer would otherwise emit
+/// for every `linear` on every (batch, seq) geometry. Memory-neutral (one
+/// transposed buffer replaces the original) and byte-equivalent (the matmul
+/// consumes the same operand values; only WHERE the transpose runs moves from
+/// every-execute GPU to once-at-load host). Set to 0 to feed weights in their
+/// stored [out, in] layout and transpose in-graph (the pre-pretranspose path).
+pub fn weightPretransposeEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_FUSED_CHUNKER_WEIGHT_PRETRANSPOSE", true);
+}
+
 /// Per-step cache for the ModernBERT segment attention biases. Every layer in
 /// a step shares one of exactly two bias tensors (local sliding-window or
 /// global), both pure functions of the step's attention mask — build each at
@@ -325,6 +338,13 @@ pub const SegmentVJPProfile = struct {
 const ParamBinding = struct {
     node_id: NodeId,
     name: []const u8,
+    /// When true this base weight is the [out, in] operand of a linear whose
+    /// parameter node was re-declared [in, out]; `execute` transposes the fed
+    /// bytes to W^T once (cached) so the lowered matmul consumes them directly.
+    /// `weight_out`/`weight_in` are the ORIGINAL (stored) [out, in] extents.
+    pretranspose: bool = false,
+    weight_out: u32 = 0,
+    weight_in: u32 = 0,
 
     fn deinit(self: *ParamBinding, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -1805,7 +1825,35 @@ pub const ModernBertSegmentForwardSession = struct {
                 .target_patterns = segment_lora_targets[0..],
             });
         }
-        const final_graph: *const Graph = if (lora_result_opt) |*lr| &lr.graph else &g;
+        const mutable_graph: *Graph = if (lora_result_opt) |*lr| &lr.graph else &g;
+        const final_graph: *const Graph = mutable_graph;
+
+        // Weight pre-transpose: flag every parameter node consumed as the weight
+        // ([out, in]) input of a plain (non-LoRA) linear. Those are re-declared
+        // [in, out] and fed pre-transposed so the lowerer drops the per-execute
+        // transpose(W) op. A LoRA-rewritten linear consumes a combined
+        // (W + BA) node (op != .parameter) here, so it is naturally excluded.
+        const pretranspose_enabled = weightPretransposeEnabled();
+        var linear_weight_flags = try allocator.alloc(bool, mutable_graph.nodeCount());
+        defer allocator.free(linear_weight_flags);
+        @memset(linear_weight_flags, false);
+        if (pretranspose_enabled) {
+            for (0..mutable_graph.nodeCount()) |raw_id| {
+                const nid: NodeId = @intCast(raw_id);
+                const nn = mutable_graph.node(nid);
+                const is_linear = switch (nn.op) {
+                    .fused_linear, .fused_linear_no_bias => true,
+                    else => false,
+                };
+                if (!is_linear) continue;
+                const w = nn.inputs[1];
+                if (w == null_node) continue;
+                if (mutable_graph.node(w).op == .parameter) linear_weight_flags[w] = true;
+            }
+        }
+
+        var pretransposed_ids: std.ArrayListUnmanaged(NodeId) = .empty;
+        defer pretransposed_ids.deinit(allocator);
 
         var base_params_list: std.ArrayListUnmanaged(ParamBinding) = .empty;
         errdefer {
@@ -1824,7 +1872,26 @@ pub const ModernBertSegmentForwardSession = struct {
             }
             const owned_name = try allocator.dupe(u8, name);
             errdefer allocator.free(owned_name);
+
+            var pretranspose = false;
+            var weight_out: u32 = 0;
+            var weight_in: u32 = 0;
+            if (pretranspose_enabled and linear_weight_flags[param_id] and n.output_shape.rank() == 2) {
+                const dtype = n.output_shape.dtype;
+                weight_out = @intCast(n.output_shape.dim(0));
+                weight_in = @intCast(n.output_shape.dim(1));
+                // Re-declare [out, in] -> [in, out]: the placeholder now matches
+                // the pre-transposed bytes execute() feeds, and the lowered
+                // linear consumes W^T directly (no in-graph transpose).
+                mutable_graph.nodeMut(param_id).output_shape =
+                    Shape.init(dtype, &.{ @intCast(weight_in), @intCast(weight_out) });
+                try pretransposed_ids.append(allocator, param_id);
+                pretranspose = true;
+            }
             try base_params_list.append(allocator, .{
+                .pretranspose = pretranspose,
+                .weight_out = weight_out,
+                .weight_in = weight_in,
                 .node_id = param_id,
                 .name = owned_name,
             });
@@ -1865,7 +1932,11 @@ pub const ModernBertSegmentForwardSession = struct {
             }
         }
 
-        var compiled = try mpsgraph_executor.CompiledGraph.compile(allocator, final_graph);
+        var compiled = try mpsgraph_executor.CompiledGraph.compileWithPretransposedWeights(
+            allocator,
+            final_graph,
+            pretransposed_ids.items,
+        );
         errdefer compiled.deinit();
 
         return .{
@@ -1975,7 +2046,19 @@ pub const ModernBertSegmentForwardSession = struct {
                 try host_feeds.append(self.allocator, .{ .node_id = binding.node_id, .data = cached });
                 continue;
             }
-            const host = try fetchBaseWeightHostBuffer(self.allocator, cb, binding.name, self.config.hidden_size);
+            const raw = try fetchBaseWeightHostBuffer(self.allocator, cb, binding.name, self.config.hidden_size);
+            // Pre-transposed linear weights: permute [out,in] -> [in,out] ONCE
+            // here (then cache W^T) so the compiled matmul consumes it directly.
+            // Exact byte permutation — no arithmetic, so byte-identical results.
+            const host = if (binding.pretranspose) blk: {
+                defer self.allocator.free(raw);
+                const rows: usize = binding.weight_out;
+                const cols: usize = binding.weight_in;
+                if (raw.len != rows * cols) return error.InvalidSegmentTensorShape;
+                const t = try self.allocator.alloc(f32, raw.len);
+                transposeRowMajor(t, raw, rows, cols);
+                break :blk t;
+            } else raw;
             errdefer self.allocator.free(host);
             if (can_cache_base_weights) {
                 slot.* = host;
@@ -2220,6 +2303,21 @@ fn buildBackendRopeTable(
 
 /// Download one frozen base weight as an owned host f32 buffer, with the
 /// same missing-bias fallback as the backend-tensor path.
+/// Transpose a row-major `[rows, cols]` f32 matrix into a row-major
+/// `[cols, rows]` one (`dst[c*rows + r] = src[r*cols + c]`). A pure element
+/// permutation — no arithmetic — so a weight fed this way yields byte-identical
+/// matmul results to transposing the same buffer in-graph every execute.
+fn transposeRowMajor(dst: []f32, src: []const f32, rows: usize, cols: usize) void {
+    var r: usize = 0;
+    while (r < rows) : (r += 1) {
+        const src_row = src[r * cols ..][0..cols];
+        var c: usize = 0;
+        while (c < cols) : (c += 1) {
+            dst[c * rows + r] = src_row[c];
+        }
+    }
+}
+
 fn fetchBaseWeightHostBuffer(
     allocator: std.mem.Allocator,
     cb: *const ComputeBackend,
