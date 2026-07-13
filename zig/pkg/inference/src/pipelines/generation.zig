@@ -3935,20 +3935,17 @@ pub const NativeGenerationPipeline = struct {
                 }
 
                 const has_cached_prefill_logits = tokens_generated == 0 and prefill_last_logits.* != null;
-                const batch_decode_context = decode_runtime.makeDecodeContext(seq_len.*, 1);
-                const should_batch_decode = if (self.scheduler) |scheduler|
-                    if (self.scheduler_lease) |lease|
-                        scheduler.shouldBatchDecode(
-                            lease.*,
-                            seq_len.*,
-                            batch_decode_context.kv_sequence_len,
-                            batch_decode_context.kv_position_offset,
-                        )
-                    else
-                        false
-                else
-                    false;
-                const allow_direct_device_decode = self.execution_lock == null or !should_batch_decode;
+                // Once a second request is admitted inside the validated C2
+                // envelope, keep both requests on the scheduler path. A
+                // compatibility-only check here races with the later
+                // enqueue/turn acquisition: one request can commit to a
+                // direct step while its peer observes the old decode position
+                // and waits for work that will never be enqueued. The
+                // scheduler still admits only full-geometry-compatible work,
+                // and incompatible peers do not pay a coalescing delay.
+                const route_decode_through_scheduler = self.execution_lock != null and self.scheduler_lease != null and
+                    (if (self.scheduler) |scheduler| scheduler.shouldBatchCurrentRequests() else false);
+                const allow_direct_device_decode = !route_decode_through_scheduler;
                 if (!has_cached_prefill_logits and allow_direct_device_decode) {
                     const direct_token = direct_token_blk: {
                         // Above the batching rollout cap the scheduler emits
@@ -7808,6 +7805,11 @@ pub const NativeGenerationPipeline = struct {
             const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
             reserved[idx] = try reserveScheduledPrefillState(work.decode_state, work.seq_len);
             reserved_count = idx + 1;
+            // The scheduler item captures KV geometry before this chunk is
+            // reserved. Refresh it from the now-current state so paged KV
+            // writes append the chunk instead of reusing the prior chunk's
+            // suffix range.
+            refreshReservedPrefillGeometry(&items[idx]);
         }
 
         var owned_ctx = try buildOwnedMixedBatchDecodeContext(self.allocator, items);
@@ -7856,6 +7858,13 @@ pub const NativeGenerationPipeline = struct {
     fn reserveScheduledPrefillState(decode_state: *NativeDecodeState, target_total_seq_len: usize) !usize {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         return decode_runtime.reservePrefillTo(target_total_seq_len);
+    }
+
+    fn refreshReservedPrefillGeometry(item: *MixedBatchDecodeItem) void {
+        var decode_runtime = BorrowedDecodeStateRuntime.init(item.state);
+        const decode_ctx = decode_runtime.makeDecodeContext(item.total_sequence_len, item.query_sequence_len);
+        item.kv_sequence_len = decode_ctx.kv_sequence_len;
+        item.kv_position_offset = decode_ctx.kv_position_offset;
     }
 
     fn rollbackScheduledPrefillState(decode_state: *NativeDecodeState, reserved: usize) !void {
@@ -8841,6 +8850,40 @@ test "rollbackPrefillReservations skips decode-phase entries within bounds" {
     // truncateGeneratedTokens. The fact that this returns cleanly without
     // touching the unconfigured state proves the skip works.
     NativeGenerationPipeline.rollbackPrefillReservations(&items, &reserved, 1);
+}
+
+test "scheduled prefill refreshes KV geometry after chunk reservation" {
+    const allocator = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f16,
+        .page_size_tokens = 16,
+        .num_kv_heads = 1,
+        .head_dim = 8,
+    });
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    defer state.deinit();
+
+    _ = try NativeGenerationPipeline.reserveScheduledPrefillState(&state, 128);
+    var second_chunk = MixedBatchDecodeItem{
+        .state = &state,
+        .total_sequence_len = 256,
+        .query_sequence_len = 128,
+        // This is the geometry captured while the first chunk was current.
+        .kv_sequence_len = 128,
+        .kv_position_offset = 0,
+        .attention_mode = .paged_prefill,
+    };
+
+    _ = try NativeGenerationPipeline.reserveScheduledPrefillState(&state, 256);
+    NativeGenerationPipeline.refreshReservedPrefillGeometry(&second_chunk);
+
+    try std.testing.expectEqual(@as(usize, 256), second_chunk.kv_sequence_len);
+    try std.testing.expectEqual(@as(usize, 0), second_chunk.kv_position_offset);
+    try std.testing.expectEqual(@as(usize, 128), second_chunk.kv_sequence_len - second_chunk.query_sequence_len);
 }
 
 test "native decode state paged kv grows in pages" {

@@ -153,6 +153,7 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
         environment = configured_environment(
             ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE="0",
             ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A="0",
+            ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A="0",
             ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A="0",
             ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A="0",
             ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN="0",
@@ -160,6 +161,7 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
         )
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE"])
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A"])
+        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A"])
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A"])
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A"])
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN"])

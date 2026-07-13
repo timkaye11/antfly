@@ -38,6 +38,7 @@ gemma4_qat_cuda_tuning_env() {
   local generated_e2b_ffn="${ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN:-${antfly_generated_q4_0_e2b_ffn:-0}}"
   local generated_e2b_ffn_exact="${ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT:-${antfly_generated_q4_0_e2b_ffn_exact:-0}}"
   local linear_q8_1_dp4a="${ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A:-1}"
+  local pair_q8_1_dp4a="${ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A:-1}"
   local pair_activation_q8_1_dp4a="${ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A:-1}"
   local gated_down_q8_1_dp4a="${ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A:-1}"
   local async_i32_download_staging="${ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING:-1}"
@@ -75,7 +76,7 @@ gemma4_qat_cuda_tuning_env() {
     ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A="$linear_q8_1_dp4a"
     ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A=1
     ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8=1
-    ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A=1
+    ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A="$pair_q8_1_dp4a"
     ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A="$pair_activation_q8_1_dp4a"
     ANTFLY_INFERENCE_CUDA_Q4_0_ACTIVATION_SLICE_Q8_1_DP4A=1
     ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A="$gated_down_q8_1_dp4a"

@@ -79,6 +79,8 @@ FROZEN_PROFILE = {
     "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR": "1",
     "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR_Q8": "1",
     "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_DOWN_Q8": "1",
+    "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
+    "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
     "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
     "antfly_q4_0_q8_1_lm_head_argmax": "1",
     "REQUIRE_GRAPH_REPLAY": "1",
@@ -468,13 +470,6 @@ def e2b_pair_contract_errors(pair: dict[str, Any]) -> list[str]:
         return errors
     for index, row in enumerate(rows, start=1):
         for key in (
-            "antfly_generated_q4_0_mmv",
-            "antfly_generated_q4_0_mm",
-            "antfly_generated_q4_0_pair",
-        ):
-            if int_value(row.get(key)) <= 0:
-                errors.append(f"E2B sample {index} did not use promoted route {key}")
-        for key in (
             "antfly_generated_q4_0_mmv_fallbacks",
             "antfly_generated_q4_0_mm_fallbacks",
             "antfly_generated_q4_0_pair_fallbacks",
@@ -482,7 +477,7 @@ def e2b_pair_contract_errors(pair: dict[str, Any]) -> list[str]:
             "antfly_generated_q4_0_down_q8_fallbacks",
         ):
             if int_value(row.get(key)) != 0:
-                errors.append(f"E2B sample {index} reported promoted-route fallback {key}")
+                errors.append(f"E2B sample {index} reported generated-route fallback {key}")
         if int_value(row.get("antfly_generated_q6_lm_head_argmax")) != 0:
             errors.append(f"E2B sample {index} unexpectedly used generated Q6 LM-head")
         if int_value(row.get("antfly_generated_q6_lm_head_argmax_fallbacks")) != 0:

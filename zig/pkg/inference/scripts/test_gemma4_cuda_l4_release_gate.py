@@ -79,11 +79,11 @@ def pair() -> dict:
         "rows": [{
             "antfly_generated_q6_lm_head_argmax": 0,
             "antfly_generated_q6_lm_head_argmax_fallbacks": 0,
-            "antfly_generated_q4_0_mmv": 1,
+            "antfly_generated_q4_0_mmv": 0,
             "antfly_generated_q4_0_mmv_fallbacks": 0,
-            "antfly_generated_q4_0_mm": 1,
+            "antfly_generated_q4_0_mm": 0,
             "antfly_generated_q4_0_mm_fallbacks": 0,
-            "antfly_generated_q4_0_pair": 1,
+            "antfly_generated_q4_0_pair": 0,
             "antfly_generated_q4_0_pair_fallbacks": 0,
             "antfly_generated_q4_0_pair_q8": 0,
             "antfly_generated_q4_0_pair_q8_fallbacks": 0,
@@ -170,6 +170,8 @@ class L4ReleaseGateTest(unittest.TestCase):
         self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MM"])
         self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR"])
         self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR_Q8"])
+        self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A"])
+        self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A"])
         self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_DOWN_Q8"])
         self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX"])
         self.assertEqual("required", profile["ANTFLY_DECODE_GRAPH_REPLAY"])
@@ -233,13 +235,11 @@ class L4ReleaseGateTest(unittest.TestCase):
         self.assertTrue(any("antfly_generated_q4_0_e2b_ffn_exact" in error for error in errors))
         self.assertTrue(any("antfly_generated_e2b_exact_pair" in error for error in errors))
 
-    def test_pair_contract_requires_promoted_q4_routes_without_fallback(self) -> None:
+    def test_pair_contract_allows_q8_precedence_without_generated_hits_and_rejects_fallback(self) -> None:
         bad = pair()
-        bad["rows"][0]["antfly_generated_q4_0_mmv"] = 0
         bad["rows"][0]["antfly_generated_q4_0_pair_fallbacks"] = 1
         errors = e2b_pair_contract_errors(bad)
-        self.assertTrue(any("did not use promoted route antfly_generated_q4_0_mmv" in error for error in errors))
-        self.assertTrue(any("promoted-route fallback antfly_generated_q4_0_pair_fallbacks" in error for error in errors))
+        self.assertTrue(any("generated-route fallback antfly_generated_q4_0_pair_fallbacks" in error for error in errors))
 
     def test_12b_replay_contract_requires_exact_tokens_and_disabled_candidates(self) -> None:
         run = generation_run()

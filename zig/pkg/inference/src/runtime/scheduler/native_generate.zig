@@ -116,6 +116,12 @@ const Entry = struct {
     prompt_tokens_processed: usize = 0,
     total_prompt_tokens: usize = 0,
     generated_tokens: usize = 0,
+    /// Total sequence length of the next decode work this request is expected
+    /// to enqueue. This bridges the gap after a scheduled forward completes
+    /// and before its owner samples the result and enqueues the next step.
+    /// A null value means decode work is already pending or the next geometry
+    /// is not known yet.
+    next_decode_work_total_sequence_len: ?usize = null,
 };
 
 const PendingDecode = struct {
@@ -313,6 +319,9 @@ pub const NativeGenerateCoordinator = struct {
             .kv_blocks_estimate = options.kv_blocks_estimate,
             .exclusive_step = options.exclusive_step,
         });
+        if (self.indexOf(lease.request_id)) |entry_idx| {
+            self.entries.items[entry_idx].next_decode_work_total_sequence_len = null;
+        }
     }
 
     pub fn cancelDecodeWork(self: *NativeGenerateCoordinator, work_ptr: *anyopaque) void {
@@ -402,8 +411,13 @@ pub const NativeGenerateCoordinator = struct {
                 )) return true;
                 continue;
             }
-            const peer_total = std.math.add(usize, entry.total_prompt_tokens, entry.generated_tokens) catch continue;
-            if (peer_total == total_sequence_len) return true;
+            // Do not infer readiness from total_prompt_tokens +
+            // generated_tokens alone. That value stays at the just-executed
+            // input position while the owner is sampling its result, so it
+            // can describe work that will never be enqueued again. The
+            // explicit next-work position is advanced when a step completes
+            // and cleared when that work is actually enqueued.
+            if (entry.next_decode_work_total_sequence_len == total_sequence_len) return true;
         }
         return false;
     }
@@ -688,6 +702,13 @@ pub const NativeGenerateCoordinator = struct {
                     query_tokens += @intCast(item.query_sequence_len);
                 },
                 .decode => {
+                    if (self.findPendingDecode(item.work_ptr)) |pending_idx| {
+                        const request_id = self.pending_decode.items[pending_idx].request_id;
+                        if (self.indexOf(request_id)) |entry_idx| {
+                            self.entries.items[entry_idx].next_decode_work_total_sequence_len =
+                                std.math.add(usize, item.total_sequence_len, 1) catch null;
+                        }
+                    }
                     self.removePendingDecode(item.work_ptr);
                     decode_count += 1;
                     query_tokens += 1;
@@ -788,6 +809,7 @@ pub const NativeGenerateCoordinator = struct {
         entry.phase = .decode;
         entry.prompt_tokens_processed = total_prompt_tokens;
         entry.total_prompt_tokens = total_prompt_tokens;
+        entry.next_decode_work_total_sequence_len = null;
         lease.prefill_chunk_size = self.recommendPrefillChunkForUnlocked(lease.request_id);
     }
 
@@ -798,6 +820,11 @@ pub const NativeGenerateCoordinator = struct {
         var entry = &self.entries.items[idx];
         entry.phase = .decode;
         entry.generated_tokens = generated_tokens;
+        entry.next_decode_work_total_sequence_len = std.math.add(
+            usize,
+            entry.total_prompt_tokens,
+            generated_tokens,
+        ) catch null;
     }
 
     pub fn snapshot(self: *const NativeGenerateCoordinator) Snapshot {
@@ -1874,6 +1901,7 @@ test "decode coalescing skips a sole request and records a two-item batch" {
 
     var second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 32, .max_tokens = 8 });
     defer coordinator.release(second);
+    try std.testing.expect(coordinator.shouldBatchCurrentRequests());
     try std.testing.expect(!coordinator.shouldBatchDecode(first, 5, 5, 0));
     coordinator.beginDecode(&second, 4);
     try std.testing.expect(!coordinator.shouldBatchDecode(first, 5, 5, 0));
@@ -1904,6 +1932,106 @@ test "decode coalescing skips a sole request and records a two-item batch" {
     try std.testing.expectEqual(@as(u64, 1), coordinator.stats.step_batch_size_2_total);
 }
 
+test "completed decode advertises next work instead of stale progress" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+    coordinator.policy.max_decode_wait_us = 1_000;
+
+    var first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 32, .max_tokens = 8 });
+    defer coordinator.release(first);
+    var second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 32, .max_tokens = 8 });
+    defer coordinator.release(second);
+    coordinator.beginDecode(&first, 4);
+    coordinator.beginDecode(&second, 4);
+    coordinator.noteDecodeProgress(&first, 1);
+    coordinator.noteDecodeProgress(&second, 1);
+
+    var second_work: u8 = 1;
+    try coordinator.enqueueDecodeWork(second, @ptrCast(&second_work), 5, 5, 0, .{});
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(allocator);
+    try std.testing.expect(try coordinator.claimStep(
+        allocator,
+        &second,
+        @ptrCast(&second_work),
+        .decode,
+        coordinator.defaultStepBudget(),
+        &step,
+    ));
+    coordinator.completeStep(&second, step.items);
+
+    // The second entry still reports one generated token until its owner
+    // samples the completed logits. Its next work is nevertheless position
+    // six, so a position-five leader must not pay a stale coalescing wait.
+    var first_work: u8 = 2;
+    try coordinator.enqueueDecodeWork(first, @ptrCast(&first_work), 5, 5, 0, .{});
+    try std.testing.expect(!coordinator.shouldBatchDecode(first, 5, 5, 0));
+    try std.testing.expectEqual(@as(u32, 0), coordinator.decodeCoalesceDelayUs(first));
+    coordinator.cancelDecodeWork(@ptrCast(&first_work));
+}
+
+test "C2 scheduler routing survives decode progress skew" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+    coordinator.policy.max_step_items = 2;
+    coordinator.policy.max_active_requests_for_batching = 2;
+    coordinator.policy.max_decode_wait_us = 1_000;
+
+    var first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 32, .max_tokens = 8 });
+    defer coordinator.release(first);
+    var second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 32, .max_tokens = 8 });
+    defer coordinator.release(second);
+    coordinator.beginDecode(&first, 4);
+    coordinator.beginDecode(&second, 4);
+    coordinator.noteDecodeProgress(&first, 1);
+
+    // A compatibility-only routing decision would send the lagging request
+    // direct here. C2 routing must keep it on the scheduler so the requests
+    // can rendezvous after the lagging step catches up.
+    try std.testing.expect(coordinator.shouldBatchCurrentRequests());
+    try std.testing.expect(!coordinator.shouldBatchDecode(second, 4, 4, 0));
+
+    var lagging_work: u8 = 1;
+    try coordinator.enqueueDecodeWork(second, @ptrCast(&lagging_work), 4, 4, 0, .{});
+    try std.testing.expectEqual(@as(u32, 0), coordinator.decodeCoalesceDelayUs(second));
+
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(allocator);
+    try std.testing.expect(try coordinator.claimStep(
+        allocator,
+        &second,
+        @ptrCast(&lagging_work),
+        .decode,
+        coordinator.defaultStepBudget(),
+        &step,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), step.items.len);
+    coordinator.completeStep(&second, step.items);
+    coordinator.noteDecodeProgress(&second, 1);
+
+    // Once aligned, the first pending request waits and the second request is
+    // guaranteed to take the same scheduler route, producing a row-two step.
+    var first_work: u8 = 2;
+    var second_work: u8 = 3;
+    try coordinator.enqueueDecodeWork(first, @ptrCast(&first_work), 5, 5, 0, .{});
+    try std.testing.expectEqual(@as(u32, 1_000), coordinator.decodeCoalesceDelayUs(first));
+    try coordinator.enqueueDecodeWork(second, @ptrCast(&second_work), 5, 5, 0, .{});
+    try std.testing.expect(try coordinator.claimStep(
+        allocator,
+        &first,
+        @ptrCast(&first_work),
+        .decode,
+        coordinator.defaultStepBudget(),
+        &step,
+    ));
+    try std.testing.expectEqual(@as(usize, 2), step.items.len);
+    coordinator.completeStep(&first, step.items);
+    try std.testing.expectEqual(@as(u64, 1), coordinator.stats.step_batch_size_2_total);
+    try std.testing.expectEqual(@as(u64, 0), coordinator.stats.decode_coalesce_waits_total);
+}
+
 test "decode batching ignores incompatible pending peers" {
     const allocator = std.testing.allocator;
     var coordinator = NativeGenerateCoordinator.init(allocator);
@@ -1924,6 +2052,7 @@ test "decode batching ignores incompatible pending peers" {
     var second_work: u8 = 2;
     try coordinator.enqueueDecodeWork(second, @ptrCast(&second_work), 9, 9, 0, .{});
 
+    try std.testing.expect(coordinator.shouldBatchCurrentRequests());
     try std.testing.expect(!coordinator.shouldBatchDecode(first, 5, 5, 0));
     try std.testing.expectEqual(@as(u32, 0), coordinator.decodeCoalesceDelayUs(first));
 

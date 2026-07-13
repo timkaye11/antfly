@@ -466,9 +466,11 @@ benchmark with persistent graph replay and candidate attention, Q6 LM-head,
 Q8-intermediate E2B FFN, and exact-F32 E2B FFN routes disabled. It also runs
 the 12B Q4_K_M f32 replay case twice and
 requires identical token IDs, healthy replay, and zero disabled-candidate
-counters. The E2B contract also requires the promoted Q4_0 MMV, MM, and pair
-routes to be used in every measured run, with zero fallback from any promoted
-Q4_0 route.
+counters. The production E2B profile keeps the faster Q8_1 DP4A linear and
+pair routes ahead of the generated Q4_0 MMV/MM/pair routes and requires zero
+fallback from every generated Q4_0 route. Generated-route hit and promotion
+evidence remains a separate exact-token kernel-candidate gate because the
+fixed release prompt does not exercise every generated row bucket.
 
 Use manual `gate=release` to preflight the commit intended for release. Tag-based
 publication calls the same workflow at the tag SHA and cannot publish assets
