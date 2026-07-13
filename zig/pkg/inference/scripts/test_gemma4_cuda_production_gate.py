@@ -15,6 +15,11 @@ GATE = pathlib.Path(__file__).resolve().with_name("gemma4_cuda_production_gate.s
 
 
 class Gemma4CudaProductionGateTest(unittest.TestCase):
+    def test_mtp_is_off_by_default(self) -> None:
+        gate = GATE.read_text(encoding="utf-8")
+        self.assertIn("RUN_MTP                       auto|required|off (default: off; --mtp-only: required)", gate)
+        self.assertIn('default_run_mtp="off"', gate)
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
@@ -58,10 +63,10 @@ class Gemma4CudaProductionGateTest(unittest.TestCase):
 
     def run_gate(self, mtp_ids: str) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
+        env.pop("RUN_MTP", None)
         env.update({
             "ANTFLY_BIN": str(self.antfly),
             "OUT_DIR": str(self.root / f"out-{mtp_ids.replace(',', '-') }"),
-            "RUN_MTP": "required",
             "RUN_RESIDENT": "off",
             "MTP_TARGET_MODEL": str(self.target),
             "MTP_DRAFT_MODEL": str(self.draft),

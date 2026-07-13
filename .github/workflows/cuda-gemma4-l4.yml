@@ -219,6 +219,10 @@ jobs:
           mkdir -p "$mtp_dir"
           if [[ ! -f "$MTP_DRAFT_MODEL" ]]; then
             echo "SKIP MTP evidence: draft model missing: $MTP_DRAFT_MODEL"
+            printf '%s\n' \
+              'diagnostic_status=skipped_missing_draft' \
+              'release_contract=none; experimental diagnostic only' \
+              > "$mtp_dir/mtp_collection_profile.txt"
             exit 0
           fi
 

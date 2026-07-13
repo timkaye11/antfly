@@ -126,6 +126,9 @@ class L4ReleaseGateTest(unittest.TestCase):
         mtp_step = workflow[start:end]
         self.assertIn("if: ${{ (inputs.gate || 'nightly') == 'nightly' }}", mtp_step)
         self.assertIn("continue-on-error: true", mtp_step)
+        missing_draft = mtp_step[mtp_step.index('if [[ ! -f "$MTP_DRAFT_MODEL" ]]'):mtp_step.index("exit 0")]
+        self.assertIn("diagnostic_status=skipped_missing_draft", missing_draft)
+        self.assertIn('> "$mtp_dir/mtp_collection_profile.txt"', missing_draft)
         self.assertIn("release_contract=none; experimental diagnostic only", mtp_step)
 
     def test_profile_locks_candidate_gates_and_returns_a_copy(self) -> None:

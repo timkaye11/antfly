@@ -28,7 +28,7 @@ Environment overrides:
   RESIDENT_PORT                 resident server port (default: auto)
   MAX_RESIDENT_WARM_COLD_RATIO  warm/cold E2E ratio ceiling (default: 0.75)
   MIN_RESIDENT_WARM_TOK_S       warm resident E2E tok/s floor (default: 10.0)
-  RUN_MTP                       auto|required|off (default: auto)
+  RUN_MTP                       auto|required|off (default: off; --mtp-only: required)
   MTP_TARGET_MODEL              MTP target model (default: E2B_MODEL)
   MTP_DRAFT_MODEL               MTP assistant GGUF
   MTP_TOKENS                    MTP comparison tokens (default: 128)
@@ -78,7 +78,11 @@ mtp_prompt="${MTP_PROMPT:-Explain why database indexes improve reads but slow do
 mtp_tokens="${MTP_TOKENS:-128}"
 mtp_speculative_k="${MTP_SPECULATIVE_K:-2}"
 mtp_min_active_speed_ratio="${MTP_MIN_ACTIVE_SPEED_RATIO:-1.0}"
-run_mtp="${RUN_MTP:-auto}"
+default_run_mtp="off"
+if [ "$mode" = "mtp-only" ]; then
+  default_run_mtp="required"
+fi
+run_mtp="${RUN_MTP:-$default_run_mtp}"
 run_resident="${RUN_RESIDENT:-auto}"
 resident_model="${RESIDENT_MODEL:-$e2b_model}"
 resident_prompt="${RESIDENT_PROMPT:-Write one sentence about ants.}"
