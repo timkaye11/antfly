@@ -7803,13 +7803,8 @@ pub const NativeGenerationPipeline = struct {
         for (claimed, 0..) |item, idx| {
             if (item.phase != .prefill) continue;
             const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
-            reserved[idx] = try reserveScheduledPrefillState(work.decode_state, work.seq_len);
+            reserved[idx] = try reserveAndRefreshScheduledPrefill(&items[idx], work.seq_len);
             reserved_count = idx + 1;
-            // The scheduler item captures KV geometry before this chunk is
-            // reserved. Refresh it from the now-current state so paged KV
-            // writes append the chunk instead of reusing the prior chunk's
-            // suffix range.
-            refreshReservedPrefillGeometry(&items[idx]);
         }
 
         var owned_ctx = try buildOwnedMixedBatchDecodeContext(self.allocator, items);
@@ -7858,6 +7853,15 @@ pub const NativeGenerationPipeline = struct {
     fn reserveScheduledPrefillState(decode_state: *NativeDecodeState, target_total_seq_len: usize) !usize {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         return decode_runtime.reservePrefillTo(target_total_seq_len);
+    }
+
+    fn reserveAndRefreshScheduledPrefill(item: *MixedBatchDecodeItem, target_total_seq_len: usize) !usize {
+        const reserved = try reserveScheduledPrefillState(item.state, target_total_seq_len);
+        // The scheduler item captures KV geometry before this chunk is
+        // reserved. Refresh it from the now-current state so paged KV writes
+        // append the chunk instead of reusing the prior chunk's suffix range.
+        refreshReservedPrefillGeometry(item);
+        return reserved;
     }
 
     fn refreshReservedPrefillGeometry(item: *MixedBatchDecodeItem) void {
@@ -8867,20 +8871,34 @@ test "scheduled prefill refreshes KV geometry after chunk reservation" {
     var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
     defer state.deinit();
 
-    _ = try NativeGenerationPipeline.reserveScheduledPrefillState(&state, 128);
+    var first_chunk = MixedBatchDecodeItem{
+        .state = &state,
+        .total_sequence_len = 128,
+        .query_sequence_len = 128,
+        .kv_sequence_len = 0,
+        .kv_position_offset = 99,
+        .attention_mode = .paged_prefill,
+    };
+    const first_reserved = try NativeGenerationPipeline.reserveAndRefreshScheduledPrefill(&first_chunk, 128);
+    try std.testing.expectEqual(@as(usize, 128), first_reserved);
+    try std.testing.expectEqual(@as(usize, 128), state.total_tokens);
+    try std.testing.expectEqual(@as(usize, 128), first_chunk.kv_sequence_len);
+    try std.testing.expectEqual(@as(usize, 0), first_chunk.kv_position_offset);
+
     var second_chunk = MixedBatchDecodeItem{
         .state = &state,
         .total_sequence_len = 256,
         .query_sequence_len = 128,
         // This is the geometry captured while the first chunk was current.
         .kv_sequence_len = 128,
-        .kv_position_offset = 0,
+        .kv_position_offset = 99,
         .attention_mode = .paged_prefill,
     };
 
-    _ = try NativeGenerationPipeline.reserveScheduledPrefillState(&state, 256);
-    NativeGenerationPipeline.refreshReservedPrefillGeometry(&second_chunk);
+    const second_reserved = try NativeGenerationPipeline.reserveAndRefreshScheduledPrefill(&second_chunk, 256);
 
+    try std.testing.expectEqual(@as(usize, 128), second_reserved);
+    try std.testing.expectEqual(@as(usize, 256), state.total_tokens);
     try std.testing.expectEqual(@as(usize, 256), second_chunk.kv_sequence_len);
     try std.testing.expectEqual(@as(usize, 0), second_chunk.kv_position_offset);
     try std.testing.expectEqual(@as(usize, 128), second_chunk.kv_sequence_len - second_chunk.query_sequence_len);
