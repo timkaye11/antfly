@@ -664,6 +664,10 @@ pub const LoadedModel = struct {
     /// /chunk sparse serving). Loaded once from manifest.splade_weight_path and
     /// cached under embedding_session_lock.
     splade_weight: ?[]f32 = null,
+    /// Persistent GPU SPLADE-head cache (resident device weight + parity-gate
+    /// state). Borrowed by each per-request EmbeddingPipeline so the 155MB device
+    /// weight is uploaded once and the self-check runs once. Freed in deinit.
+    splade_gpu_cache: embedding_mod.SpladeGpuCache = .{},
     /// Lazily materialized learned CLIP→text bridge head (3-layer MLP) for a
     /// multimodal image embedder that projects native CLIP embeddings into the
     /// target text embedder's retrieval space. Loaded once from
@@ -850,6 +854,7 @@ pub const LoadedModel = struct {
         pipeline.audio_projection = self.audio_projection;
         pipeline.resident_projection_stats = &self.resident_projection_stats;
         pipeline.splade_weight = self.splade_weight;
+        pipeline.splade_gpu_cache = &self.splade_gpu_cache;
         pipeline.splade_vocab_size = self.manifest.splade_vocab_size;
         pipeline.bridge_head = if (self.bridge_head) |*bh| bh else null;
         return pipeline;
@@ -1002,6 +1007,7 @@ pub const LoadedModel = struct {
             head.deinit();
             self.allocator.destroy(head);
         }
+        embedding_mod.freeSpladeGpuCache(&self.splade_gpu_cache, self.session, self.allocator);
         if (self.splade_weight) |w| self.allocator.free(w);
         if (self.bridge_head) |*bh| bh.deinit(self.allocator);
         self.manifest.deinit();

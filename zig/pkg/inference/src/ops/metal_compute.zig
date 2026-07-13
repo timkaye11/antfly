@@ -798,6 +798,125 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return false;
     }
 
+    /// Upload a row-major host f32 matrix [rows, cols] into a resident (Private)
+    /// device buffer, returning an owned CT the caller caches for the process
+    /// lifetime (free with `cb.free`). Used to keep the SPLADE vocab-head weight
+    /// [vocab, hidden] on-device across requests. Returns null when the backend
+    /// is not Metal or has no decoder runtime (caller stays on the CPU head).
+    pub fn uploadDenseDeviceWeight(
+        cb: *const ops.ComputeBackend,
+        data: []const f32,
+        rows: usize,
+        cols: usize,
+    ) !?CT {
+        if (cb.kind() != .metal) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (!self.provider_impl.hasDecoderRuntime()) return null;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        if (data.len != rows * cols) return null;
+        const dims = [_]i32{ @intCast(rows), @intCast(cols) };
+        var device_tensor = MetalTensor.deviceAllocate(runtime, data.len * @sizeOf(f32), .private, &dims) catch return null;
+        errdefer device_tensor.deinit();
+        var host_tensor = MetalTensor.borrowed(@constCast(data.ptr), data.len, &dims);
+        host_tensor.copyInto(&device_tensor) catch {
+            return null;
+        };
+        return try self.ctFromOwnedMetalTensor(device_tensor);
+    }
+
+    /// GPU SPLADE vocab-head for one chunk. On-device:
+    ///   logits[t, v] = hidden[t, :] · weight[v, :]     (f32 dot-general GEMM)
+    /// then on CPU (a cheap tail): max-pool over tokens followed by log1p(relu):
+    ///   out[v] = log1p(relu( max_t logits[t, v] )).
+    ///
+    /// This matches the CPU reference `computeSpladeActivation` (max of per-token
+    /// log1p(relu)) up to the GEMM's own f32 rounding, because `log1p(relu(·))` is
+    /// monotonic non-decreasing so `max_t f(x_t) = f(max_t x_t)`. Pooling the raw
+    /// logits first also collapses the per-token log1p to a single pass over the
+    /// vocab, and reading back only [n_tok, V] (never batched across chunks)
+    /// bounds the device/host intermediate to <=512*V f32.
+    ///
+    /// `weight_device` must be a resident device tensor [vocab, hidden] (see
+    /// `uploadDenseDeviceWeight`). `out` must be length `vocab_size`. Returns
+    /// false when the device path is unavailable so the caller falls back to the
+    /// CPU head (out is only mutated on the success path or the n_tok==0 guard).
+    pub fn spladeHeadDeviceMaxPool(
+        cb: *const ops.ComputeBackend,
+        weight_device: CT,
+        hidden: []const f32,
+        n_tok: usize,
+        hidden_size: usize,
+        vocab_size: usize,
+        out: []f32,
+    ) !bool {
+        if (cb.kind() != .metal) return false;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (!self.provider_impl.hasDecoderRuntime()) return false;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        if (out.len != vocab_size) return false;
+        if (n_tok == 0) {
+            @memset(out, 0);
+            return true;
+        }
+        if (hidden.len != n_tok * hidden_size) return false;
+
+        var weight_tensor = self.ownedMetalTensorFromCt(weight_device) catch return false;
+        defer weight_tensor.deinit();
+        if (!weight_tensor.isDevice() or weight_tensor.elemCount() != vocab_size * hidden_size) return false;
+
+        // Upload hidden [n_tok, H] to a device tensor.
+        const h_dims = [_]i32{ @intCast(n_tok), @intCast(hidden_size) };
+        var hidden_dev = MetalTensor.deviceAllocate(runtime, hidden.len * @sizeOf(f32), .private, &h_dims) catch return false;
+        defer hidden_dev.deinit();
+        {
+            var host_hidden = MetalTensor.borrowed(@constCast(hidden.ptr), hidden.len, &h_dims);
+            host_hidden.copyInto(&hidden_dev) catch return false;
+        }
+
+        // C[n_tok, V] = A[n_tok, H] · B[V, H]^T  (rhs_contract_axis = 1). This
+        // device dot-general dispatches an MPSMatrixMultiplication for the large
+        // (m>=16, n>=16, k>=64) SPLADE shape (naive kernel only for tiny chunks),
+        // which is both fast and robust — unlike the decoder multi-row linear
+        // kernel, which is not exercised at a 50368-wide output and faults there.
+        var logits_dev = (metal_runtime.decoderRuntimeDotGeneral2DF32Device(
+            self.provider_impl,
+            hidden_dev,
+            weight_tensor,
+            n_tok,
+            vocab_size,
+            hidden_size,
+            1,
+        ) catch return false) orelse return false;
+        defer logits_dev.deinit();
+
+        const logits = logits_dev.toHostSlice() catch return false;
+        if (logits.len != n_tok * vocab_size) return false;
+
+        // Running max over tokens (out doubles as the pooled-logit accumulator),
+        // then the single log1p(relu) transform.
+        @memcpy(out, logits[0..vocab_size]);
+        var t: usize = 1;
+        while (t < n_tok) : (t += 1) {
+            vectorMaxInto(out, logits[t * vocab_size ..][0..vocab_size]);
+        }
+        for (out) |*x| x.* = std.math.log1p(@max(@as(f32, 0.0), x.*));
+        return true;
+    }
+
+    /// dst[i] = max(dst[i], src[i]) over equal-length slices (SIMD-widened).
+    fn vectorMaxInto(dst: []f32, src: []const f32) void {
+        const lanes = 8;
+        const Vec = @Vector(lanes, f32);
+        var i: usize = 0;
+        const n = dst.len;
+        while (i + lanes <= n) : (i += lanes) {
+            const a: Vec = dst[i..][0..lanes].*;
+            const b: Vec = src[i..][0..lanes].*;
+            dst[i..][0..lanes].* = @max(a, b);
+        }
+        while (i < n) : (i += 1) dst[i] = @max(dst[i], src[i]);
+    }
+
     pub fn applyPleResidual(
         cb: *const ops.ComputeBackend,
         hidden: CT,

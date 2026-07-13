@@ -35,8 +35,128 @@ const gpt_arch = @import("../architectures/gpt.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
 const resident_ops = @import("../graph/resident_ops.zig");
 const fused_chunker_splade = @import("../finetune/fused_chunker_splade.zig");
+const build_options = @import("build_options");
+const metal_compute = if (build_options.enable_metal) @import("../ops/metal_compute.zig") else struct {};
 
 const qwen3_embedding_resident_override_level = 4;
+
+/// Kill switch for the GPU (Metal) SPLADE vocab-head. When on (default), the
+/// 768->50368 projection runs as a device dot-general GEMM instead of the CPU
+/// SGEMM, gated by a one-shot parity self-check that latches back to CPU on any
+/// top-k/cosine drift. Set ANTFLY_FUSED_CHUNKER_SPLADE_GPU_HEAD=0 to force CPU
+/// (used by the A/B parity toggle in the same binary).
+const splade_gpu_head_env_flag = "ANTFLY_FUSED_CHUNKER_SPLADE_GPU_HEAD";
+
+fn spladeGpuHeadEnabled() bool {
+    return platform.env.getenvBoolDefault(splade_gpu_head_env_flag, true);
+}
+
+/// GPU SPLADE-head gate. `.unchecked` until the first eligible embedSplade call
+/// runs the parity self-check, which latches `.active` (GPU) or `.disabled`
+/// (permanent CPU fallback for this process).
+const SpladeGpuState = enum { unchecked, active, disabled };
+
+/// Persistent SPLADE GPU-head cache. `EmbeddingPipeline` is rebuilt per request,
+/// so the resident device weight and the parity-gate state must live on the
+/// long-lived owner (the LoadedModel) — otherwise every request re-uploads the
+/// 155MB weight and re-runs the CPU+GPU self-check. The pipeline borrows this by
+/// pointer; free the device weight with `freeSpladeGpuCache` at model teardown.
+pub const SpladeGpuCache = struct {
+    weight_device: ?ops_mod.CT = null,
+    state: SpladeGpuState = .unchecked,
+};
+
+/// Release the cached device weight (Metal only). Safe to call with a null
+/// weight or on a non-metal build.
+pub fn freeSpladeGpuCache(
+    cache: *SpladeGpuCache,
+    session: backends.Session,
+    allocator: std.mem.Allocator,
+) void {
+    if (comptime !build_options.enable_metal) return;
+    const wd = cache.weight_device orelse return;
+    if (session_factory.getComputeBackend(session, allocator)) |cb_val| {
+        var cb = cb_val;
+        cb.free(wd);
+        cb.deinit();
+    } else |_| {}
+    cache.weight_device = null;
+}
+
+/// Top-k used by the SPLADE GPU-head parity self-check (matches the default
+/// served sparse_top_k). Jaccard of these index sets must be 1.0 to pass.
+const splade_self_check_k: usize = 256;
+/// Minimum cosine (GPU vs CPU dense SPLADE vector) accepted by the self-check.
+const splade_gpu_cosine_min: f32 = 0.9995;
+
+const SpladeParity = struct { jaccard: f32, cosine: f32 };
+
+/// Compare a GPU-produced dense SPLADE vector against the CPU reference:
+/// full-vector cosine and Jaccard of the top-`k` (by value) index sets.
+fn spladeParityMetrics(alloc: std.mem.Allocator, a: []const f32, b: []const f32, k: usize) !SpladeParity {
+    std.debug.assert(a.len == b.len);
+    const n = a.len;
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
+    for (a, b) |x, y| {
+        dot += @as(f64, x) * @as(f64, y);
+        na += @as(f64, x) * @as(f64, x);
+        nb += @as(f64, y) * @as(f64, y);
+    }
+    const cosine: f32 = if (na > 0 and nb > 0)
+        @floatCast(dot / (@sqrt(na) * @sqrt(nb)))
+    else if (na == 0 and nb == 0)
+        1.0
+    else
+        0.0;
+
+    const kk = @min(k, n);
+    if (kk == 0) return .{ .jaccard = 1.0, .cosine = cosine };
+    const idx_a = try topKIndices(alloc, a, kk);
+    defer alloc.free(idx_a);
+    const idx_b = try topKIndices(alloc, b, kk);
+    defer alloc.free(idx_b);
+
+    // Both index arrays are sorted ascending; count the intersection.
+    var inter: usize = 0;
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < kk and j < kk) {
+        if (idx_a[i] == idx_b[j]) {
+            inter += 1;
+            i += 1;
+            j += 1;
+        } else if (idx_a[i] < idx_b[j]) {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    const uni = 2 * kk - inter;
+    const jaccard: f32 = @as(f32, @floatFromInt(inter)) / @as(f32, @floatFromInt(uni));
+    return .{ .jaccard = jaccard, .cosine = cosine };
+}
+
+/// Indices of the `k` largest values in `v`, returned ascending. One-shot use
+/// (self-check), so a full index sort is fine.
+fn topKIndices(alloc: std.mem.Allocator, v: []const f32, k: usize) ![]u32 {
+    const n = v.len;
+    const order = try alloc.alloc(u32, n);
+    defer alloc.free(order);
+    for (order, 0..) |*o, idx| o.* = @intCast(idx);
+    const ByValueDesc = struct {
+        vals: []const f32,
+        fn lessThan(ctx: @This(), x: u32, y: u32) bool {
+            return ctx.vals[x] > ctx.vals[y];
+        }
+    };
+    std.sort.pdq(u32, order, ByValueDesc{ .vals = v }, ByValueDesc.lessThan);
+    const top = try alloc.alloc(u32, k);
+    @memcpy(top, order[0..k]);
+    std.sort.pdq(u32, top, {}, comptime std.sort.asc(u32));
+    return top;
+}
 
 /// Kill switch for length-bucketed encoder batching (default ON). The
 /// optimization is value-preserving (padding is attention-masked), so it
@@ -362,6 +482,10 @@ pub const EmbeddingPipeline = struct {
     /// /chunk SPLADE serving.
     splade_weight: ?[]const f32 = null,
     splade_vocab_size: u32 = 50368,
+    /// Borrowed persistent GPU SPLADE-head cache (resident device weight +
+    /// parity-gate state), owned by the LoadedModel. null for standalone/mock
+    /// pipelines, which then always use the CPU head.
+    splade_gpu_cache: ?*SpladeGpuCache = null,
     /// Optional learned CLIP→text bridge head, borrowed (owned by the
     /// LoadedModel). When set, `embedImages` projects native CLIP image
     /// embeddings into the target text embedder's retrieval space via
@@ -637,15 +761,25 @@ pub const EmbeddingPipeline = struct {
         return .{ .data = data, .mask = all_mask, .batch = batch, .seq_len = effective_len, .hidden = hidden };
     }
 
-    /// SPLADE sparse activations for a batch of texts, one dense
-    /// [splade_vocab_size] vector per input (post log1p(relu) + max-pool over the
-    /// masked tokens). Requires a packaged SPLADE weight (`splade_weight`). The
-    /// caller sparsifies (threshold + top_k) — see multimodal_chunk_embedding
-    /// embedTextChunksSparse. Caller owns and frees the returned slices.
-    ///
-    /// The projection reuses fused_chunker_splade.computeSpladeActivation, whose
-    /// hidden->vocab matmul runs through the tiled/multithreaded SGEMM (NOT a
-    /// scalar triple loop — that was the 97s/step regression).
+    /// Lazily upload the SPLADE weight [vocab, hidden] to a resident device
+    /// tensor and cache it on the persistent `cache`. Returns null when the Metal
+    /// device path is unavailable so the caller stays on the CPU head.
+    fn ensureSpladeWeightDevice(
+        cache: *SpladeGpuCache,
+        cb: *const ops_mod.ComputeBackend,
+        weight: []const f32,
+        vocab: usize,
+        hidden: usize,
+    ) !?ops_mod.CT {
+        if (cache.weight_device) |w| return w;
+        if (comptime build_options.enable_metal) {
+            const dev = (try metal_compute.MetalCompute.uploadDenseDeviceWeight(cb, weight, vocab, hidden)) orelse return null;
+            cache.weight_device = dev;
+            return dev;
+        }
+        return null;
+    }
+
     pub fn embedSplade(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
         const weight = self.splade_weight orelse return error.SpladeWeightUnavailable;
         const V: usize = @intCast(self.splade_vocab_size);
@@ -687,6 +821,42 @@ pub const EmbeddingPipeline = struct {
         const scratch = try alloc.alloc(f32, hb.seq_len * hb.hidden);
         defer alloc.free(scratch);
 
+        // Try to route the 768->vocab projection through the Metal device
+        // dot-general (an MPSMatrixMultiplication for this large shape); see
+        // metal_compute.spladeHeadDeviceMaxPool. The weight is uploaded once and
+        // cached on the persistent LoadedModel cache; a one-shot parity self-check
+        // (below) latches the CPU fallback if the top-k / cosine drift.
+        var attempt_gpu = false;
+        var cb_opt: ?ops_mod.ComputeBackend = null;
+        var weight_dev: ops_mod.CT = undefined;
+        defer if (cb_opt) |*c| c.deinit();
+        const cache = self.splade_gpu_cache;
+        if (comptime build_options.enable_metal) {
+            if (cache) |c| {
+                if (spladeGpuHeadEnabled() and
+                    c.state != .disabled and
+                    self.textEncodingSession().backend() == .metal)
+                {
+                    if (session_factory.getComputeBackend(self.textEncodingSession(), alloc)) |cb_val| {
+                        cb_opt = cb_val;
+                        if (ensureSpladeWeightDevice(c, &cb_opt.?, weight, V, hb.hidden) catch null) |wd| {
+                            weight_dev = wd;
+                            attempt_gpu = true;
+                        }
+                    } else |_| {}
+                }
+            }
+        }
+
+        // One-shot self-check on the first GPU-eligible call: run BOTH the GPU
+        // head and the CPU reference for every chunk, compare top-256 Jaccard +
+        // cosine, and latch .active/.disabled. Serve the CPU result on any drift.
+        const self_check = attempt_gpu and cache.?.state == .unchecked;
+        var check_failed = false;
+        var worst_jaccard: f32 = 1.0;
+        var worst_cosine: f32 = 1.0;
+        var checked_chunks: usize = 0;
+
         for (0..hb.batch) |b| {
             const dense = try alloc.alloc(f32, V);
             errdefer alloc.free(dense);
@@ -701,20 +871,85 @@ pub const EmbeddingPipeline = struct {
                 @memcpy(scratch[dst_base .. dst_base + hb.hidden], hb.data[src_base .. src_base + hb.hidden]);
                 n_tokens += 1;
             }
+            const chunk_hidden = scratch[0 .. n_tokens * hb.hidden];
 
-            try fused_chunker_splade.computeSpladeActivation(
-                alloc,
-                scratch[0 .. n_tokens * hb.hidden],
-                weight,
-                dense,
-                n_tokens,
-                hb.hidden,
-                self.splade_vocab_size,
-                .max,
-            );
+            var dense_ready = false;
+            if (comptime build_options.enable_metal) {
+                if (attempt_gpu and !check_failed) {
+                    const gpu_ok = metal_compute.MetalCompute.spladeHeadDeviceMaxPool(
+                        &cb_opt.?,
+                        weight_dev,
+                        chunk_hidden,
+                        n_tokens,
+                        hb.hidden,
+                        V,
+                        dense,
+                    ) catch false;
+                    if (gpu_ok) {
+                        dense_ready = true;
+                        if (self_check) {
+                            const ref = try alloc.alloc(f32, V);
+                            defer alloc.free(ref);
+                            @memset(ref, 0);
+                            try fused_chunker_splade.computeSpladeActivation(
+                                alloc,
+                                chunk_hidden,
+                                weight,
+                                ref,
+                                n_tokens,
+                                hb.hidden,
+                                self.splade_vocab_size,
+                                .max,
+                            );
+                            const m = try spladeParityMetrics(alloc, dense, ref, splade_self_check_k);
+                            worst_jaccard = @min(worst_jaccard, m.jaccard);
+                            worst_cosine = @min(worst_cosine, m.cosine);
+                            checked_chunks += 1;
+                            if (m.jaccard < 1.0 or m.cosine < splade_gpu_cosine_min) {
+                                check_failed = true;
+                                @memcpy(dense, ref); // serve the CPU reference
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!dense_ready) {
+                try fused_chunker_splade.computeSpladeActivation(
+                    alloc,
+                    chunk_hidden,
+                    weight,
+                    dense,
+                    n_tokens,
+                    hb.hidden,
+                    self.splade_vocab_size,
+                    .max,
+                );
+            }
 
             out[b] = dense;
             initialized += 1;
+        }
+
+        if (self_check) {
+            if (checked_chunks == 0) {
+                // GPU head never engaged (no device runtime / linear slot). Latch
+                // CPU so later requests stop re-attempting the device path.
+                cache.?.state = .disabled;
+                std.log.info("splade GPU head: device matmul unavailable; using CPU head", .{});
+            } else if (check_failed) {
+                cache.?.state = .disabled;
+                std.log.warn(
+                    "splade GPU head: parity self-check FAILED (worst jaccard={d:.4} cosine={d:.6} over {d} chunks); using CPU head",
+                    .{ worst_jaccard, worst_cosine, checked_chunks },
+                );
+            } else {
+                cache.?.state = .active;
+                std.log.info(
+                    "splade GPU head: parity self-check passed (worst jaccard={d:.4} cosine={d:.6} over {d} chunks); device MPS matmul active",
+                    .{ worst_jaccard, worst_cosine, checked_chunks },
+                );
+            }
         }
 
         return out;
@@ -1482,6 +1717,8 @@ pub const EmbeddingPipeline = struct {
     }
 
     pub fn deinit(self: *EmbeddingPipeline) void {
+        // The GPU SPLADE cache is borrowed (owned by the LoadedModel); nothing to
+        // free here.
         self.session.close();
         if (self.vision_session) |vs| vs.close();
         if (self.audio_session) |as_| as_.close();
