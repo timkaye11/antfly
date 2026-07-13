@@ -58,6 +58,17 @@ pub fn vjpFeedCacheEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_FUSED_CHUNKER_VJP_FEED_CACHE", false);
 }
 
+/// Diagnostic (profile_forward branch): when set, an eval/serving segment
+/// forward (no activation captures) marks ONLY the final layer's hidden_out as
+/// a graph output instead of every layer's. The serving path consumes only the
+/// segment's last hidden state, so the intermediate per-layer hidden_out
+/// downloads are pure waste; dropping them removes ~(layers-1) device->host
+/// copies per segment execute and lets MPSGraph fuse across the residual
+/// boundaries. Byte-identical final hidden state.
+pub fn onlyFinalForwardOutputEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_FUSED_CHUNKER_FORWARD_ONLY_FINAL_OUTPUT", false);
+}
+
 /// Per-step cache for the ModernBERT segment attention biases. Every layer in
 /// a step shares one of exactly two bias tensors (local sliding-window or
 /// global), both pure functions of the step's attention mask — build each at
@@ -1666,6 +1677,8 @@ pub const ModernBertSegmentForwardSession = struct {
     /// captures the training path needs. Eval-only sessions set this to
     /// false and only download each layer's `hidden_out`.
     emit_captures: bool,
+    /// Diagnostic: graph marks only the final layer's hidden_out as output.
+    only_final_output: bool = false,
     rope_cache: ?[]RopeTable = null,
     base_weight_cache: ?[]?[]f32 = null,
 
@@ -1760,13 +1773,23 @@ pub const ModernBertSegmentForwardSession = struct {
         // Output order consumed by execute(): per layer
         // [attn_normed, attn_merged, mlp_activated, hidden_out] with
         // captures enabled, or just [hidden_out] without.
-        for (layer_nodes) |nodes| {
-            if (emit_captures) {
-                try g.markOutput(nodes.attn_normed_node);
-                try g.markOutput(nodes.attn_merged_node);
-                try g.markOutput(nodes.mlp_activated_node);
+        //
+        // Diagnostic only_final_output (serving/eval, no captures): mark ONLY
+        // the final layer's hidden_out. Intermediate per-layer hidden_out
+        // downloads are pure waste on the serving path and dropping the
+        // extra output targets lets MPSGraph fuse across residual boundaries.
+        const only_final_output = onlyFinalForwardOutputEnabled() and !emit_captures;
+        if (only_final_output) {
+            try g.markOutput(layer_nodes[layer_nodes.len - 1].hidden_out_node);
+        } else {
+            for (layer_nodes) |nodes| {
+                if (emit_captures) {
+                    try g.markOutput(nodes.attn_normed_node);
+                    try g.markOutput(nodes.attn_merged_node);
+                    try g.markOutput(nodes.mlp_activated_node);
+                }
+                try g.markOutput(nodes.hidden_out_node);
             }
-            try g.markOutput(nodes.hidden_out_node);
         }
 
         // lora_rank == 0: skip adapter injection entirely and compile the
@@ -1856,6 +1879,7 @@ pub const ModernBertSegmentForwardSession = struct {
             .adapters = try adapter_list.toOwnedSlice(allocator),
             .compiled = compiled,
             .emit_captures = emit_captures,
+            .only_final_output = only_final_output,
         };
     }
 
@@ -1990,6 +2014,29 @@ pub const ModernBertSegmentForwardSession = struct {
         );
         var exec_owned = true;
         defer if (exec_owned) exec_result.deinit();
+
+        // Diagnostic only_final_output: the graph emitted a single output (the
+        // segment's final hidden state). Return a 1-element capture list.
+        if (self.only_final_output) {
+            if (exec_result.outputs.len != 1) return error.InvalidSegmentForwardOutputs;
+            if (exec_result.outputs[0].len != total * H) return error.InvalidSegmentForwardOutputs;
+            const layers = try self.allocator.alloc(SegmentForwardLayerCapture, 1);
+            errdefer self.allocator.free(layers);
+            layers[0] = .{
+                .layer_idx = self.end_layer - 1,
+                .attn_normed = try self.allocator.alloc(f32, 0),
+                .attn_merged = try self.allocator.alloc(f32, 0),
+                .mlp_activated = try self.allocator.alloc(f32, 0),
+                .hidden_out = exec_result.outputs[0],
+            };
+            self.allocator.free(exec_result.outputs);
+            exec_owned = false;
+            return .{
+                .allocator = self.allocator,
+                .hidden_out = layers[0].hidden_out,
+                .layers = layers,
+            };
+        }
 
         const num_layers: usize = @intCast(self.end_layer - self.start_layer);
         const outputs_per_layer: usize = if (self.emit_captures) 4 else 1;

@@ -89,6 +89,18 @@ pub fn servingLayersPerSegment() u32 {
     return std.math.cast(u32, v) orelse serving_layers_per_segment_default;
 }
 
+/// Diagnostic (profile_forward branch): when set, `CompiledEvalForward.forward`
+/// prints a per-call cost breakdown (embeddings download, each segment execute,
+/// inter-segment host copy, final LayerNorm) to stderr. Passive; no numerics
+/// change.
+pub fn forwardProfileEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_FUSED_CHUNKER_FORWARD_PROFILE", false);
+}
+
+fn nowNs() u64 {
+    return platform.time.monotonicNs();
+}
+
 /// ModernBERT-base head count; the fused chunker encoder is not configurable
 /// on this axis (matches the eager `modern_bert.Config` default and the
 /// trainer's compiled forward config).
@@ -325,6 +337,16 @@ pub const CompiledEvalForward = struct {
         if (self.sessions.len < num_layers) return error.MissingCompiledForwardSessions;
         if (ids_i64.len != total_tokens or mask_i64.len != total_tokens) return error.UnexpectedOutputShape;
 
+        const prof = forwardProfileEnabled();
+        const t_start: u64 = if (prof) nowNs() else 0;
+        var emb_ns: u64 = 0;
+        var seg_exec_ns: u64 = 0;
+        var copy_ns: u64 = 0;
+        var final_ns: u64 = 0;
+        var seg_count: usize = 0;
+        var seg0_ns: u64 = 0;
+        var seg1_ns: u64 = 0;
+
         const attn_mask_f32 = try allocator.alloc(f32, total_tokens);
         defer allocator.free(attn_mask_f32);
         for (mask_i64, attn_mask_f32) |m, *out| out.* = @floatFromInt(m);
@@ -341,6 +363,7 @@ pub const CompiledEvalForward = struct {
 
         // Embeddings stay on the eager path (token gather + LayerNorm), so
         // their numerics match modern_bert.forward exactly. No captures.
+        const t_emb: u64 = if (prof) nowNs() else 0;
         const emb_ct = try modern_bert.embeddingsForwardCT(
             cb,
             allocator,
@@ -354,6 +377,7 @@ pub const CompiledEvalForward = struct {
             defer cb.free(emb_ct);
             break :blk try cb.toFloat32(emb_ct, allocator);
         };
+        if (prof) emb_ns = nowNs() - t_emb;
         var hidden_owned: []f32 = embedding_host;
         defer allocator.free(hidden_owned);
         if (hidden_owned.len != total_tokens * H) return error.UnexpectedOutputShape;
@@ -364,16 +388,26 @@ pub const CompiledEvalForward = struct {
 
             const session = try self.ensureSession(segment_start, segment_end, actual_batch, max_seq);
 
+            const t_seg: u64 = if (prof) nowNs() else 0;
             var result = try session.execute(cb, hidden_owned, attn_mask_f32, lora_layers, &shared_bias);
             defer result.deinit();
+            const this_seg_ns: u64 = if (prof) nowNs() - t_seg else 0;
+            if (prof) {
+                seg_exec_ns += this_seg_ns;
+                if (seg_count == 0) seg0_ns = this_seg_ns else if (seg_count == 1) seg1_ns = this_seg_ns;
+                seg_count += 1;
+            }
 
+            const t_copy: u64 = if (prof) nowNs() else 0;
             const next_hidden = try allocator.dupe(f32, result.hidden_out);
             allocator.free(hidden_owned);
             hidden_owned = next_hidden;
+            if (prof) copy_ns += nowNs() - t_copy;
             segment_start = segment_end;
         }
 
         // Final LayerNorm through the same backend op as the eager forward.
+        const t_final: u64 = if (prof) nowNs() else 0;
         const hidden_ct = try cb.fromFloat32Shape(hidden_owned, &.{ @intCast(total_tokens), @intCast(H) });
         defer cb.free(hidden_ct);
         const fn_w = try cb.getWeight("model.final_norm.weight");
@@ -388,7 +422,27 @@ pub const CompiledEvalForward = struct {
         defer cb.free(fn_b);
         const normed_ct = try cb.layerNorm(hidden_ct, fn_w, fn_b, H, bert_config.layer_norm_eps);
         defer cb.free(normed_ct);
-        return cb.toFloat32(normed_ct, allocator);
+        const out = try cb.toFloat32(normed_ct, allocator);
+        if (prof) {
+            final_ns = nowNs() - t_final;
+            const total_ns = nowNs() - t_start;
+            const us = 1000.0;
+            std.debug.print(
+                "FWD_PROFILE b={d} seq={d} segs={d} lps={d} total={d:.2}ms emb={d:.2} seg_exec={d:.2}(s0={d:.2} s1={d:.2}) copy={d:.2} final={d:.2} (ms)\n",
+                .{
+                    actual_batch,          max_seq,                       seg_count,
+                    self.layers_per_segment,
+                    @as(f64, @floatFromInt(total_ns)) / (us * us),
+                    @as(f64, @floatFromInt(emb_ns)) / (us * us),
+                    @as(f64, @floatFromInt(seg_exec_ns)) / (us * us),
+                    @as(f64, @floatFromInt(seg0_ns)) / (us * us),
+                    @as(f64, @floatFromInt(seg1_ns)) / (us * us),
+                    @as(f64, @floatFromInt(copy_ns)) / (us * us),
+                    @as(f64, @floatFromInt(final_ns)) / (us * us),
+                },
+            );
+        }
+        return out;
     }
 };
 
