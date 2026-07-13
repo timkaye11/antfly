@@ -352,8 +352,23 @@ const Lowerer = struct {
         // that has not been lowered yet (MpsGraphMissingInput).
         var stack: std.ArrayListUnmanaged(NodeId) = .empty;
         defer stack.deinit(self.allocator);
-        for (0..self.graph.nodeCount()) |raw_id| {
-            try self.lowerSubgraph(@intCast(raw_id), &stack);
+        if (self.pretransposed_weight_ids.len > 0) {
+            // Pre-transposing a linear weight rewrites its parameter node from
+            // [out, in] to [in, out]. Every fused linear the builder emits also
+            // carries a DEAD `vjp_alternate` subgraph — an explicit
+            // transpose(W)+matmul over that SAME weight param — that is never
+            // reachable from the forward outputs. Lowering it (as the raw-id
+            // pass does) would feed the now-[in, out] weight into a
+            // transpose([1,0]) sized for [out, in] and fail MPSGraph
+            // verification. Lower only nodes reachable from the graph outputs so
+            // the dead subgraph is never created; the live forward is identical.
+            for (self.graph.outputs.items) |out_id| {
+                try self.lowerSubgraph(out_id, &stack);
+            }
+        } else {
+            for (0..self.graph.nodeCount()) |raw_id| {
+                try self.lowerSubgraph(@intCast(raw_id), &stack);
+            }
         }
     }
 
