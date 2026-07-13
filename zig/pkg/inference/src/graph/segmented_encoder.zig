@@ -58,15 +58,17 @@ pub fn vjpFeedCacheEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_FUSED_CHUNKER_VJP_FEED_CACHE", false);
 }
 
-/// Diagnostic (profile_forward branch): when set, an eval/serving segment
-/// forward (no activation captures) marks ONLY the final layer's hidden_out as
-/// a graph output instead of every layer's. The serving path consumes only the
-/// segment's last hidden state, so the intermediate per-layer hidden_out
-/// downloads are pure waste; dropping them removes ~(layers-1) device->host
-/// copies per segment execute and lets MPSGraph fuse across the residual
-/// boundaries. Byte-identical final hidden state.
+/// Default ON (kill switch ANTFLY_FUSED_CHUNKER_FORWARD_ONLY_FINAL_OUTPUT=0):
+/// an eval/serving segment forward (no activation captures) marks ONLY the
+/// final layer's hidden_out as a graph output instead of every layer's. The
+/// serving path consumes only the segment's last hidden state, so the
+/// intermediate per-layer hidden_out downloads are pure waste; dropping them
+/// removes ~(layers-1) device->host copies per segment execute and lets
+/// MPSGraph fuse across the residual boundaries. Byte-identical final hidden
+/// state (parity self-check logit delta 0.0). Scoped by construction to the
+/// capture-free (eval/serving) path — training keeps every layer output.
 pub fn onlyFinalForwardOutputEnabled() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_FUSED_CHUNKER_FORWARD_ONLY_FINAL_OUTPUT", false);
+    return platform.env.getenvBoolDefault("ANTFLY_FUSED_CHUNKER_FORWARD_ONLY_FINAL_OUTPUT", true);
 }
 
 /// Per-step cache for the ModernBERT segment attention biases. Every layer in

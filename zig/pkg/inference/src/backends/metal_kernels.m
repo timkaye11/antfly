@@ -1893,15 +1893,24 @@ void termite_mpsgraph_executable_destroy(void *handle) {
     }
 }
 
-// Opt-in (default off): wrap MPSGraph execute inputs in no-copy NSData views
-// of the caller's buffers instead of copying them. Safe because
-// termite_mpsgraph_execute_f32 is fully synchronous (waitUntilCompleted before
-// returning) and the caller keeps every input buffer alive across the call.
+// Default ON (kill switch TERMITE_MPSGRAPH_EXECUTE_NOCOPY_INPUTS=0): wrap
+// MPSGraph execute inputs in no-copy NSData views of the caller's buffers
+// instead of malloc+memcpy'ing them (the dominant per-execute cost is the
+// re-fed ~440MB base weights). Safe because termite_mpsgraph_execute_f32 is
+// fully synchronous (commit + waitUntilCompleted before returning) and its
+// sole caller (mpsgraph_executor.zig CompiledGraph.executeWithHostInputs)
+// keeps every input buffer — borrowed host slices and owned f32 temporaries
+// alike — alive until after the call returns; no caller can free a fed buffer
+// while blocked in the synchronous execute. Blast radius is exactly the
+// MPSGraph CompiledGraph path (fused-chunker segment forward serving + the
+// graph training/eval harness); SigLIP/decoder/imported-ONNX serving run
+// through the custom metal_partition_executor and are untouched by this flag.
 static bool termite_mpsgraph_execute_nocopy_inputs_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *raw = getenv("TERMITE_MPSGRAPH_EXECUTE_NOCOPY_INPUTS");
-        cached = (raw != NULL && raw[0] != '\0' && strcmp(raw, "0") != 0) ? 1 : 0;
+        // Default ON; only an explicit "0" disables (kill switch).
+        cached = (raw != NULL && strcmp(raw, "0") == 0) ? 0 : 1;
     }
     return cached == 1;
 }
