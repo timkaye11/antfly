@@ -13,12 +13,18 @@
 // limitations under the License.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const buffer_mod = @import("buffer.zig");
 const context_mod = @import("context.zig");
 const driver_mod = @import("driver.zig");
 const cuda_artifact = @import("artifact.zig");
+const nvrtc_mod = @import("nvrtc.zig");
+const kernel_jit = @import("../../graph/kernel_jit.zig");
+const io_compat = @import("../../io/compat.zig");
 const quant_kernel_compiler = @import("../../graph/quant_kernel_compiler.zig");
+const quant_matmul = @import("../../graph/quant_matmul.zig");
 const cuda_kernel_renderer = @import("../../graph/quant_kernel_cuda_renderer.zig");
+const quant_codec = @import("../../gguf/quant_codec.zig");
 const platform = @import("antfly_platform");
 const turboquant = @import("../../runtime/kv/turboquant.zig");
 const kv_pool_mod = @import("../../runtime/kv/pool.zig");
@@ -240,8 +246,620 @@ pub const Q4_0Q8_1PrefillRowsVariant = enum {
     e4b_down_rows,
 };
 
+pub const JitProductionRoutes = struct {
+    mmv: bool = false,
+    mm: bool = false,
+    pair: bool = false,
+    pair_q8: bool = false,
+    down_q8: bool = false,
+
+    fn enableArtifact(self: *JitProductionRoutes, artifact: quant_kernel_compiler.GeneratedArtifact) bool {
+        const kind = artifact.cuda_kernel orelse return false;
+        switch (kind) {
+            .q4_0_mmv => self.mmv = true,
+            .q4_0_mm => self.mm = true,
+            .q4_0_pair_mmv => self.pair = true,
+            .q4_0_pair_activation_q8_1 => self.pair_q8 = true,
+            .q4_0_down_q8_1 => self.down_q8 = true,
+            else => return false,
+        }
+        return true;
+    }
+
+    fn disableArtifact(self: *JitProductionRoutes, artifact: quant_kernel_compiler.GeneratedArtifact) bool {
+        const kind = artifact.cuda_kernel orelse return false;
+        switch (kind) {
+            .q4_0_mmv => self.mmv = false,
+            .q4_0_mm => self.mm = false,
+            .q4_0_pair_mmv => self.pair = false,
+            .q4_0_pair_activation_q8_1 => self.pair_q8 = false,
+            .q4_0_down_q8_1 => self.down_q8 = false,
+            else => return false,
+        }
+        return true;
+    }
+
+    pub fn includesArtifact(self: JitProductionRoutes, artifact: quant_kernel_compiler.GeneratedArtifact) bool {
+        const kind = artifact.cuda_kernel orelse return false;
+        return switch (kind) {
+            .q4_0_mmv => self.mmv,
+            .q4_0_mm => self.mm,
+            .q4_0_pair_mmv => self.pair,
+            .q4_0_pair_activation_q8_1 => self.pair_q8,
+            .q4_0_down_q8_1 => self.down_q8,
+            else => false,
+        };
+    }
+
+    pub fn any(self: JitProductionRoutes) bool {
+        return self.mmv or self.mm or self.pair or self.pair_q8 or self.down_q8;
+    }
+
+    fn intersect(self: JitProductionRoutes, allowed: JitProductionRoutes) JitProductionRoutes {
+        return .{
+            .mmv = self.mmv and allowed.mmv,
+            .mm = self.mm and allowed.mm,
+            .pair = self.pair and allowed.pair,
+            .pair_q8 = self.pair_q8 and allowed.pair_q8,
+            .down_q8 = self.down_q8 and allowed.down_q8,
+        };
+    }
+
+    fn eql(self: JitProductionRoutes, other: JitProductionRoutes) bool {
+        return self.mmv == other.mmv and
+            self.mm == other.mm and
+            self.pair == other.pair and
+            self.pair_q8 == other.pair_q8 and
+            self.down_q8 == other.down_q8;
+    }
+};
+
+pub const JitModelProfile = enum {
+    clipclap,
+    deberta_reranker,
+    gliner2,
+    florence2,
+    gemma4,
+};
+
+pub const JitRouteScope = struct {
+    pub const max_observed_shapes = 16;
+
+    production: JitProductionRoutes = .{},
+    // Deterministically sorted distinct [out_dim, in_dim] Q4_0 shapes that can
+    // reach generated dispatch for this model. They define the live
+    // conformance domain and are part of the exact qualification cache key.
+    observed_shapes: [max_observed_shapes][2]usize = [_][2]usize{.{ 0, 0 }} ** max_observed_shapes,
+    observed_shape_count: usize = 0,
+    prefill_shapes: [max_observed_shapes][2]usize = [_][2]usize{.{ 0, 0 }} ** max_observed_shapes,
+    prefill_shape_count: usize = 0,
+    pair_shapes: [max_observed_shapes][2]usize = [_][2]usize{.{ 0, 0 }} ** max_observed_shapes,
+    pair_shape_count: usize = 0,
+    conformance_complete: bool = true,
+
+    pub fn maximumForProfile(profile: JitModelProfile) JitRouteScope {
+        return switch (profile) {
+            // Current production CUDA JIT evidence is exclusively Gemma4
+            // E2B/E4B Q4_0. Encoder models keep the bundled runtime.
+            .clipclap, .deberta_reranker, .gliner2, .florence2 => .{},
+            .gemma4 => .{ .production = .{
+                .mmv = true,
+                .mm = true,
+                .pair = true,
+                .pair_q8 = true,
+                .down_q8 = true,
+            } },
+        };
+    }
+
+    pub fn forObservedRoutes(profile: JitModelProfile, observed: JitProductionRoutes) JitRouteScope {
+        return .{
+            .production = observed.intersect(maximumForProfile(profile).production),
+        };
+    }
+
+    pub fn includesArtifact(self: JitRouteScope, artifact: quant_kernel_compiler.GeneratedArtifact) bool {
+        return artifact.production_enabled and self.production.includesArtifact(artifact);
+    }
+
+    pub fn enabled(self: JitRouteScope) bool {
+        return self.production.any();
+    }
+
+    pub fn containsMmvShape(self: JitRouteScope, out_dim: usize, in_dim: usize) bool {
+        return containsJitShape(self.observed_shapes[0..self.observed_shape_count], out_dim, in_dim);
+    }
+
+    pub fn containsMmShape(self: JitRouteScope, out_dim: usize, in_dim: usize) bool {
+        return containsJitShape(self.prefill_shapes[0..self.prefill_shape_count], out_dim, in_dim);
+    }
+
+    pub fn containsPairShape(self: JitRouteScope, out_dim: usize, in_dim: usize) bool {
+        return containsJitShape(self.pair_shapes[0..self.pair_shape_count], out_dim, in_dim);
+    }
+
+    fn mergeQualified(self: *JitRouteScope, other: JitRouteScope) void {
+        self.production.mmv = self.production.mmv or other.production.mmv;
+        self.production.mm = self.production.mm or other.production.mm;
+        self.production.pair = self.production.pair or other.production.pair;
+        self.production.pair_q8 = self.production.pair_q8 or other.production.pair_q8;
+        self.production.down_q8 = self.production.down_q8 or other.production.down_q8;
+        for (other.observed_shapes[0..other.observed_shape_count]) |shape| {
+            self.conformance_complete = mergeQualifiedJitShape(
+                &self.observed_shapes,
+                &self.observed_shape_count,
+                shape,
+            ) and self.conformance_complete;
+        }
+        for (other.prefill_shapes[0..other.prefill_shape_count]) |shape| {
+            self.conformance_complete = mergeQualifiedJitShape(
+                &self.prefill_shapes,
+                &self.prefill_shape_count,
+                shape,
+            ) and self.conformance_complete;
+        }
+        for (other.pair_shapes[0..other.pair_shape_count]) |shape| {
+            self.conformance_complete = mergeQualifiedJitShape(
+                &self.pair_shapes,
+                &self.pair_shape_count,
+                shape,
+            ) and self.conformance_complete;
+        }
+    }
+};
+
+fn containsJitShape(shapes: []const [2]usize, out_dim: usize, in_dim: usize) bool {
+    for (shapes) |shape| {
+        if (shape[0] == out_dim and shape[1] == in_dim) return true;
+    }
+    return false;
+}
+
+fn mergeQualifiedJitShape(
+    shapes: *[JitRouteScope.max_observed_shapes][2]usize,
+    count: *usize,
+    shape: [2]usize,
+) bool {
+    if (containsJitShape(shapes[0..count.*], shape[0], shape[1])) return true;
+    if (count.* == shapes.len) return false;
+    var insert_at = count.*;
+    for (shapes[0..count.*], 0..) |existing, index| {
+        if (shape[0] < existing[0] or (shape[0] == existing[0] and shape[1] < existing[1])) {
+            insert_at = index;
+            break;
+        }
+    }
+    var index = count.*;
+    while (index > insert_at) : (index -= 1) shapes[index] = shapes[index - 1];
+    shapes[insert_at] = shape;
+    count.* += 1;
+    return true;
+}
+
+pub const JitRouteScopeBuilder = struct {
+    profile: JitModelProfile,
+    routes: JitProductionRoutes = .{},
+    observed_shapes: [JitRouteScope.max_observed_shapes][2]usize = undefined,
+    observed_shape_count: usize = 0,
+    prefill_shapes: [JitRouteScope.max_observed_shapes][2]usize = undefined,
+    prefill_shape_count: usize = 0,
+    gate_shapes: [JitRouteScope.max_observed_shapes][2]usize = undefined,
+    gate_shape_count: usize = 0,
+    up_shapes: [JitRouteScope.max_observed_shapes][2]usize = undefined,
+    up_shape_count: usize = 0,
+    pair_shapes: [JitRouteScope.max_observed_shapes][2]usize = undefined,
+    pair_shape_count: usize = 0,
+    conformance_complete: bool = true,
+    pair_shape_observed: bool = false,
+    e4b_gate_observed: bool = false,
+    e4b_up_observed: bool = false,
+    e4b_down_observed: bool = false,
+
+    pub fn init(profile: JitModelProfile) JitRouteScopeBuilder {
+        return .{ .profile = profile };
+    }
+
+    /// Observe a matrix that will remain Q4_0 on CUDA after upload. Shapes are
+    /// logical [out_dim, in_dim]; callers pass whether rows>1 can still reach
+    /// quant dispatch (false when a BF16 mirror intercepts prefill).
+    pub fn observeQ4_0Matrix(
+        self: *JitRouteScopeBuilder,
+        name: []const u8,
+        out_dim: usize,
+        in_dim: usize,
+        multi_row_quant_reachable: bool,
+    ) void {
+        if (self.profile != .gemma4 or in_dim == 0 or out_dim == 0) return;
+        const decode_plan = quant_matmul.plan(.{
+            .rows = 1,
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .format = .q4_0,
+        });
+        const decode_supported = quant_kernel_compiler.generatedArtifactSupportsPlan(.cuda, decode_plan, .none);
+        if (decode_supported) {
+            self.routes.mmv = true;
+            self.conformance_complete = appendDistinctJitShape(
+                &self.observed_shapes,
+                &self.observed_shape_count,
+                .{ out_dim, in_dim },
+            ) and self.conformance_complete;
+        }
+        if (multi_row_quant_reachable) {
+            const prefill_plan = quant_matmul.plan(.{
+                .rows = 22,
+                .in_dim = in_dim,
+                .out_dim = out_dim,
+                .format = .q4_0,
+            });
+            if (quant_kernel_compiler.generatedArtifactSupportsPlan(.cuda, prefill_plan, .none)) {
+                self.routes.mm = true;
+                self.conformance_complete = appendDistinctJitShape(
+                    &self.prefill_shapes,
+                    &self.prefill_shape_count,
+                    .{ out_dim, in_dim },
+                ) and self.conformance_complete;
+            }
+        }
+
+        const shape = [2]usize{ out_dim, in_dim };
+        if (std.mem.endsWith(u8, name, ".mlp.gate_proj.weight")) {
+            for (self.up_shapes[0..self.up_shape_count]) |up| {
+                if (up[0] == shape[0] and up[1] == shape[1] and jitPairShapeSupported(shape)) {
+                    self.pair_shape_observed = true;
+                    self.conformance_complete = appendDistinctJitShape(
+                        &self.pair_shapes,
+                        &self.pair_shape_count,
+                        shape,
+                    ) and self.conformance_complete;
+                }
+            }
+            self.conformance_complete = appendDistinctJitShape(
+                &self.gate_shapes,
+                &self.gate_shape_count,
+                shape,
+            ) and self.conformance_complete;
+            if (out_dim == generated_q4_0_q8_e4b_intermediate_dim and
+                in_dim == generated_q4_0_q8_e4b_hidden_dim)
+            {
+                self.e4b_gate_observed = true;
+            }
+        }
+        if (std.mem.endsWith(u8, name, ".mlp.up_proj.weight")) {
+            for (self.gate_shapes[0..self.gate_shape_count]) |gate| {
+                if (gate[0] == shape[0] and gate[1] == shape[1] and jitPairShapeSupported(shape)) {
+                    self.pair_shape_observed = true;
+                    self.conformance_complete = appendDistinctJitShape(
+                        &self.pair_shapes,
+                        &self.pair_shape_count,
+                        shape,
+                    ) and self.conformance_complete;
+                }
+            }
+            self.conformance_complete = appendDistinctJitShape(
+                &self.up_shapes,
+                &self.up_shape_count,
+                shape,
+            ) and self.conformance_complete;
+            if (out_dim == generated_q4_0_q8_e4b_intermediate_dim and
+                in_dim == generated_q4_0_q8_e4b_hidden_dim)
+            {
+                self.e4b_up_observed = true;
+            }
+        }
+        if (std.mem.endsWith(u8, name, ".mlp.down_proj.weight") and
+            out_dim == generated_q4_0_q8_e4b_hidden_dim and
+            in_dim == generated_q4_0_q8_e4b_intermediate_dim)
+        {
+            self.e4b_down_observed = true;
+        }
+    }
+
+    pub fn finish(self: JitRouteScopeBuilder) JitRouteScope {
+        var observed = self.routes;
+        if (self.pair_shape_observed) {
+            // The general pair artifact has the same runtime-shape contract as
+            // the observed standalone Q4_0 decode projections.
+            observed.pair = true;
+        }
+        observed.pair_q8 = self.e4b_gate_observed and self.e4b_up_observed;
+        observed.down_q8 = observed.pair_q8 and self.e4b_down_observed;
+        var result = JitRouteScope.forObservedRoutes(self.profile, observed);
+        result.observed_shape_count = self.observed_shape_count;
+        @memcpy(
+            result.observed_shapes[0..self.observed_shape_count],
+            self.observed_shapes[0..self.observed_shape_count],
+        );
+        result.prefill_shape_count = self.prefill_shape_count;
+        @memcpy(
+            result.prefill_shapes[0..self.prefill_shape_count],
+            self.prefill_shapes[0..self.prefill_shape_count],
+        );
+        result.pair_shape_count = self.pair_shape_count;
+        @memcpy(
+            result.pair_shapes[0..self.pair_shape_count],
+            self.pair_shapes[0..self.pair_shape_count],
+        );
+        result.conformance_complete = self.conformance_complete and
+            liveRuntimeJitScopeWithinFixtureBudget(result);
+        return result;
+    }
+
+    fn appendDistinctJitShape(
+        shapes: *[JitRouteScope.max_observed_shapes][2]usize,
+        count: *usize,
+        shape: [2]usize,
+    ) bool {
+        for (shapes[0..count.*]) |existing| {
+            if (existing[0] == shape[0] and existing[1] == shape[1]) return true;
+        }
+        if (count.* == shapes.len) return false;
+        var insert_at = count.*;
+        for (shapes[0..count.*], 0..) |existing, index| {
+            if (shape[0] < existing[0] or (shape[0] == existing[0] and shape[1] < existing[1])) {
+                insert_at = index;
+                break;
+            }
+        }
+        var index = count.*;
+        while (index > insert_at) : (index -= 1) shapes[index] = shapes[index - 1];
+        shapes[insert_at] = shape;
+        count.* += 1;
+        return true;
+    }
+
+    fn jitPairShapeSupported(shape: [2]usize) bool {
+        return quant_kernel_compiler.generatedArtifactSupportsPlan(
+            .cuda,
+            quant_matmul.plan(.{
+                .rows = 1,
+                .in_dim = shape[1],
+                .out_dim = shape[0],
+                .format = .q4_0,
+            }),
+            .pair,
+        );
+    }
+};
+
+const max_runtime_jit_functions_per_artifact = 3;
+
+const RuntimeJitFunctionMapping = struct {
+    slots: [max_runtime_jit_functions_per_artifact]?*driver_mod.CUfunction =
+        [_]?*driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact,
+    names: [max_runtime_jit_functions_per_artifact][]const u8 =
+        [_][]const u8{""} ** max_runtime_jit_functions_per_artifact,
+    count: usize = 0,
+
+    fn one(slot: *driver_mod.CUfunction, name: []const u8) RuntimeJitFunctionMapping {
+        return .{ .slots = .{ slot, null, null }, .names = .{ name, "", "" }, .count = 1 };
+    }
+
+    fn two(
+        first_slot: *driver_mod.CUfunction,
+        first_name: []const u8,
+        second_slot: *driver_mod.CUfunction,
+        second_name: []const u8,
+    ) RuntimeJitFunctionMapping {
+        return .{
+            .slots = .{ first_slot, second_slot, null },
+            .names = .{ first_name, second_name, "" },
+            .count = 2,
+        };
+    }
+
+    fn three(
+        first_slot: *driver_mod.CUfunction,
+        first_name: []const u8,
+        second_slot: *driver_mod.CUfunction,
+        second_name: []const u8,
+        third_slot: *driver_mod.CUfunction,
+        third_name: []const u8,
+    ) RuntimeJitFunctionMapping {
+        return .{
+            .slots = .{ first_slot, second_slot, third_slot },
+            .names = .{ first_name, second_name, third_name },
+            .count = 3,
+        };
+    }
+};
+
+pub const RuntimeJitQualificationRequest = struct {
+    allocator: std.mem.Allocator,
+    ctx: *context_mod.CudaContext,
+    module: *KernelModule,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    candidate_functions: [max_runtime_jit_functions_per_artifact]driver_mod.CUfunction,
+    scope: JitRouteScope = .{},
+    cancellation: ?RuntimeJitCancellation = null,
+
+    fn checkCanceled(self: RuntimeJitQualificationRequest) !void {
+        if (self.cancellation) |cancellation| {
+            if (cancellation.isCanceled()) return error.KernelJitCanceled;
+        }
+    }
+};
+
+pub const RuntimeJitCancellation = struct {
+    context: *anyopaque,
+    isCanceledFn: *const fn (*anyopaque) bool,
+
+    fn isCanceled(self: RuntimeJitCancellation) bool {
+        return self.isCanceledFn(self.context);
+    }
+};
+
+fn runtimeJitMonotonicNowNs() u64 {
+    const value = std.Io.Clock.awake.now(io_compat.io()).nanoseconds;
+    if (value <= 0) return 0;
+    return @intCast(@min(value, std.math.maxInt(u64)));
+}
+
+const RuntimeJitWorkControl = struct {
+    deadline_ns: ?u64 = null,
+
+    fn foreground(config: kernel_jit.Config) RuntimeJitWorkControl {
+        if (config.mode.failClosed()) return .{};
+        const now = runtimeJitMonotonicNowNs();
+        if (now == 0) return .{};
+        const budget_ns = std.math.mul(
+            u64,
+            config.preload_budget_ms,
+            std.time.ns_per_ms,
+        ) catch std.math.maxInt(u64);
+        return .{ .deadline_ns = now +| budget_ns };
+    }
+
+    fn deadlineReached(self: *const RuntimeJitWorkControl) bool {
+        const deadline = self.deadline_ns orelse return false;
+        const now = runtimeJitMonotonicNowNs();
+        return now != 0 and now >= deadline;
+    }
+
+    fn stopped(self: *const RuntimeJitWorkControl) bool {
+        return self.deadlineReached();
+    }
+
+    fn isCanceledRaw(raw: *anyopaque) bool {
+        const self: *const RuntimeJitWorkControl = @ptrCast(@alignCast(raw));
+        return self.stopped();
+    }
+
+    fn cancellation(self: *RuntimeJitWorkControl) RuntimeJitCancellation {
+        return .{ .context = self, .isCanceledFn = isCanceledRaw };
+    }
+};
+
+const RuntimeJitLoadDisposition = enum { bundled, qualify, reject_required };
+
+fn runtimeJitLoadDisposition(
+    mode: kernel_jit.Mode,
+    scope: JitRouteScope,
+    load_context: kernel_jit.LoadContext,
+) RuntimeJitLoadDisposition {
+    if (!mode.compiles()) return .bundled;
+    if (!scope.enabled() or !load_context.allowsQualification()) {
+        return if (mode.failClosed()) .reject_required else .bundled;
+    }
+    return .qualify;
+}
+
+// CUDA driver compilation and qualification consume process-global compiler
+// and GPU resources. Serialize the exact cache-check -> compile -> qualify ->
+// cache-write transaction so concurrent sessions do not benchmark together and
+// waiters re-read the first session's completed cache entry.
+var runtime_jit_process_mutex: std.atomic.Mutex = .unlocked;
+
+const runtime_jit_rejection_ttl_ns: u64 = std.time.ns_per_hour;
+const runtime_jit_rejection_capacity: usize = 256;
+
+const RuntimeJitRejectionMemo = struct {
+    const Entry = struct {
+        key: kernel_jit.ArtifactKey = [_]u8{0} ** @sizeOf(kernel_jit.ArtifactKey),
+        rejected_at_ns: u64 = 0,
+        valid: bool = false,
+    };
+
+    entries: [runtime_jit_rejection_capacity]Entry = [_]Entry{.{}} ** runtime_jit_rejection_capacity,
+    next_evict: usize = 0,
+
+    fn activeAt(self: *RuntimeJitRejectionMemo, key: kernel_jit.ArtifactKey, now_ns: u64) bool {
+        if (now_ns == 0) return false;
+        for (&self.entries) |*entry| {
+            if (!entry.valid or !std.mem.eql(u8, &entry.key, &key)) continue;
+            if (now_ns < entry.rejected_at_ns or now_ns - entry.rejected_at_ns >= runtime_jit_rejection_ttl_ns) {
+                entry.valid = false;
+                return false;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    fn rememberAt(self: *RuntimeJitRejectionMemo, key: kernel_jit.ArtifactKey, now_ns: u64) void {
+        if (now_ns == 0) return;
+        var free_index: ?usize = null;
+        for (&self.entries, 0..) |*entry, index| {
+            if (entry.valid and std.mem.eql(u8, &entry.key, &key)) {
+                entry.rejected_at_ns = now_ns;
+                return;
+            }
+            if (!entry.valid and free_index == null) free_index = index;
+        }
+        const index = free_index orelse self.next_evict;
+        self.entries[index] = .{ .key = key, .rejected_at_ns = now_ns, .valid = true };
+        if (free_index == null) self.next_evict = (self.next_evict + 1) % self.entries.len;
+    }
+
+    fn clear(self: *RuntimeJitRejectionMemo, key: kernel_jit.ArtifactKey) void {
+        for (&self.entries) |*entry| {
+            if (entry.valid and std.mem.eql(u8, &entry.key, &key)) {
+                entry.valid = false;
+                return;
+            }
+        }
+    }
+};
+
+// Protected by runtime_jit_process_mutex. Qualification rejection is exact-key
+// and deliberately process-local: positive evidence remains persistent, while
+// a changed device/compiler/source/policy key retries immediately.
+var runtime_jit_rejections = RuntimeJitRejectionMemo{};
+
+fn lockRuntimeJitProcess(control: ?*const RuntimeJitWorkControl) !bool {
+    while (!runtime_jit_process_mutex.tryLock()) {
+        if (control) |value| {
+            if (value.deadlineReached()) return false;
+        }
+        platform.time.yieldBriefly();
+    }
+    if (control) |value| {
+        if (value.deadlineReached()) {
+            runtime_jit_process_mutex.unlock();
+            return false;
+        }
+    }
+    return true;
+}
+
+pub const RuntimeJitQualifier = struct {
+    context: ?*anyopaque = null,
+    runFn: *const fn (?*anyopaque, RuntimeJitQualificationRequest) anyerror!?kernel_jit.QualificationRecord,
+
+    pub fn live() RuntimeJitQualifier {
+        return .{ .runFn = liveRuntimeJitQualification };
+    }
+
+    fn run(
+        self: RuntimeJitQualifier,
+        request: RuntimeJitQualificationRequest,
+    ) !?kernel_jit.QualificationRecord {
+        return self.runFn(self.context, request);
+    }
+};
+
+pub const RuntimeJitStats = struct {
+    qualification_cache_hits: usize = 0,
+    qualification_cache_misses: usize = 0,
+    compiled: usize = 0,
+    qualified: usize = 0,
+    active: usize = 0,
+    rejected: usize = 0,
+    quarantined: usize = 0,
+    sync_elapsed_ms: u64 = 0,
+    budget_reached: bool = false,
+    skipped_dynamic: bool = false,
+};
+
 pub const KernelModule = struct {
     module: driver_mod.CUmodule = null,
+    runtime_jit_modules: [quant_kernel_compiler.first_generated_artifacts.len]driver_mod.CUmodule =
+        [_]driver_mod.CUmodule{null} ** quant_kernel_compiler.first_generated_artifacts.len,
+    runtime_jit_module_count: usize = 0,
+    runtime_jit_routes: JitProductionRoutes = .{},
+    runtime_jit_pending_routes: JitProductionRoutes = .{},
+    runtime_jit_qualified_scope: JitRouteScope = .{},
+    runtime_jit_stats: RuntimeJitStats = .{},
     fill_f32: driver_mod.CUfunction = null,
     copy_f32: driver_mod.CUfunction = null,
     copy_u8: driver_mod.CUfunction = null,
@@ -400,6 +1018,8 @@ pub const KernelModule = struct {
     linear_q8_0_gated_down_f32_tile4: driver_mod.CUfunction = null,
     quantize_f32_q8_1_rows: driver_mod.CUfunction = null,
     quantize_gated_f32_q8_1_rows: driver_mod.CUfunction = null,
+    linear_q4_k_generated_bias_gelu: driver_mod.CUfunction = null,
+    linear_q4_k_generated_mmv: driver_mod.CUfunction = null,
     linear_q4_0_f32: driver_mod.CUfunction = null,
     linear_q4_0_generated_mmv: driver_mod.CUfunction = null,
     linear_q4_0_generated_mm: driver_mod.CUfunction = null,
@@ -520,6 +1140,641 @@ pub const KernelModule = struct {
     embedding_add_weighted_i32_q6_k_f32: driver_mod.CUfunction = null,
     rms_norm_add_weighted_embedding_i32_q6_k_f32: driver_mod.CUfunction = null,
     slice_last_dim_f32: driver_mod.CUfunction = null,
+
+    fn generatedFunctionMapping(
+        self: *KernelModule,
+        artifact: quant_kernel_compiler.GeneratedArtifact,
+    ) ?RuntimeJitFunctionMapping {
+        if (artifact.cuda_kernel) |kind| {
+            const slot = switch (kind) {
+                .q4_k_small_batch_bias_gelu => &self.linear_q4_k_generated_bias_gelu,
+                .q4_k_mmv => &self.linear_q4_k_generated_mmv,
+                .q4_0_mmv => &self.linear_q4_0_generated_mmv,
+                .q4_0_mm => &self.linear_q4_0_generated_mm,
+                .q4_0_pair_mmv => &self.linear_q4_0_generated_pair,
+                .q4_0_pair_activation_q8_1 => &self.linear_q4_0_generated_pair_q8,
+                .q4_0_pair_activation_q8_1_e2b_6144 => &self.linear_q4_0_generated_pair_q8_e2b_6144,
+                .q4_0_pair_activation_q8_1_e2b_12288 => &self.linear_q4_0_generated_pair_q8_e2b_12288,
+                .q4_0_down_q8_1 => &self.linear_q4_0_generated_down_q8,
+                .q4_0_down_q8_1_e2b_6144 => &self.linear_q4_0_generated_down_q8_e2b_6144,
+                .q4_0_down_q8_1_e2b_12288 => &self.linear_q4_0_generated_down_q8_e2b_12288,
+                .q4_0_pair_activation_f32_e2b_6144_exact => &self.linear_q4_0_generated_pair_f32_e2b_6144_exact,
+                .q4_0_pair_activation_f32_e2b_12288_exact => &self.linear_q4_0_generated_pair_f32_e2b_12288_exact,
+                .q4_0_down_f32_e2b_6144_exact => &self.linear_q4_0_generated_down_f32_e2b_6144_exact,
+                .q4_0_down_f32_e2b_12288_exact => &self.linear_q4_0_generated_down_f32_e2b_12288_exact,
+                .q4_0_q8_1_argmax_e2b_tile8 => &self.linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b,
+                .q6_k_q8_1_argmax_k2560_tile8 => &self.linear_q6_k_q8_1_argmax_generated_k2560,
+                .q6_k_q8_1_argmax_k3840_tile8 => &self.linear_q6_k_q8_1_argmax_generated_k3840,
+            };
+            return RuntimeJitFunctionMapping.one(slot, artifact.kernel_id);
+        }
+        if (artifact.cuda_attention_kernel) |kind| {
+            const plan = cuda_kernel_renderer.attentionPlanFor(kind);
+            return switch (kind) {
+                .gqa_decode_split_kv_hd256_f32 => RuntimeJitFunctionMapping.three(
+                    &self.gqa_attention_decode_split_kv_hd256_stage1_f32,
+                    plan.kernel_id,
+                    &self.gqa_attention_decode_split_kv_hd256_stage2_f32,
+                    plan.reduction_kernel_id,
+                    &self.gqa_attention_decode_scalars_generated_hd256_f32,
+                    plan.serial_kernel_id,
+                ),
+                .gqa_decode_split_kv_hd512_f32 => RuntimeJitFunctionMapping.three(
+                    &self.gqa_attention_decode_split_kv_hd512_stage1_f32,
+                    plan.kernel_id,
+                    &self.gqa_attention_decode_split_kv_hd512_stage2_f32,
+                    plan.reduction_kernel_id,
+                    &self.gqa_attention_decode_scalars_generated_hd512_f32,
+                    plan.serial_kernel_id,
+                ),
+                .gqa_decode_split2_kv_hd256_f32 => RuntimeJitFunctionMapping.three(
+                    &self.gqa_attention_decode_split2_kv_hd256_stage1_f32,
+                    plan.kernel_id,
+                    &self.gqa_attention_decode_split2_kv_hd256_stage2_f32,
+                    plan.reduction_kernel_id,
+                    &self.gqa_attention_decode_scalars_generated_hd256_f32,
+                    plan.serial_kernel_id,
+                ),
+                .gqa_decode_split2_kv_hd512_f32 => RuntimeJitFunctionMapping.three(
+                    &self.gqa_attention_decode_split2_kv_hd512_stage1_f32,
+                    plan.kernel_id,
+                    &self.gqa_attention_decode_split2_kv_hd512_stage2_f32,
+                    plan.reduction_kernel_id,
+                    &self.gqa_attention_decode_scalars_generated_hd512_f32,
+                    plan.serial_kernel_id,
+                ),
+                .gqa_decode_split4_kv_hd256_f32 => RuntimeJitFunctionMapping.three(
+                    &self.gqa_attention_decode_split4_kv_hd256_stage1_f32,
+                    plan.kernel_id,
+                    &self.gqa_attention_decode_split4_kv_hd256_stage2_f32,
+                    plan.reduction_kernel_id,
+                    &self.gqa_attention_decode_scalars_generated_hd256_f32,
+                    plan.serial_kernel_id,
+                ),
+                .gqa_decode_split4_kv_hd512_f32 => RuntimeJitFunctionMapping.three(
+                    &self.gqa_attention_decode_split4_kv_hd512_stage1_f32,
+                    plan.kernel_id,
+                    &self.gqa_attention_decode_split4_kv_hd512_stage2_f32,
+                    plan.reduction_kernel_id,
+                    &self.gqa_attention_decode_scalars_generated_hd512_f32,
+                    plan.serial_kernel_id,
+                ),
+                .gqa_decode_score_prework_hd256_f32 => RuntimeJitFunctionMapping.two(
+                    &self.gqa_attention_decode_score_prework_hd256_f32,
+                    plan.kernel_id,
+                    &self.gqa_attention_decode_score_prework_consume_hd256_f32,
+                    plan.serial_kernel_id,
+                ),
+                .gqa_decode_score_prework_hd512_f32 => RuntimeJitFunctionMapping.two(
+                    &self.gqa_attention_decode_score_prework_hd512_f32,
+                    plan.kernel_id,
+                    &self.gqa_attention_decode_score_prework_consume_hd512_f32,
+                    plan.serial_kernel_id,
+                ),
+            };
+        }
+        return null;
+    }
+
+    fn retainRuntimeJitModule(self: *KernelModule, module: driver_mod.CUmodule) !void {
+        if (module == null) return error.InvalidCudaJitModule;
+        if (self.runtime_jit_module_count >= self.runtime_jit_modules.len) {
+            return error.CudaJitModuleCapacityExceeded;
+        }
+        self.runtime_jit_modules[self.runtime_jit_module_count] = module;
+        self.runtime_jit_module_count += 1;
+    }
+
+    fn popRuntimeJitModule(self: *KernelModule) ?driver_mod.CUmodule {
+        if (self.runtime_jit_module_count == 0) return null;
+        self.runtime_jit_module_count -= 1;
+        const module = self.runtime_jit_modules[self.runtime_jit_module_count];
+        self.runtime_jit_modules[self.runtime_jit_module_count] = null;
+        return module;
+    }
+
+    fn installRuntimeJitFunctions(
+        self: *KernelModule,
+        artifact: quant_kernel_compiler.GeneratedArtifact,
+        mapping: RuntimeJitFunctionMapping,
+        functions: [max_runtime_jit_functions_per_artifact]driver_mod.CUfunction,
+        mode: kernel_jit.Mode,
+        qualified: bool,
+    ) bool {
+        if (!mode.activates() or !artifact.production_enabled or !qualified) return true;
+        var routes = self.runtime_jit_routes;
+        if (!routes.enableArtifact(artifact)) return false;
+        for (0..mapping.count) |index| {
+            _ = mapping.slots[index] orelse return false;
+            if (functions[index] == null) return false;
+        }
+        for (0..mapping.count) |index| mapping.slots[index].?.* = functions[index];
+        self.runtime_jit_routes = routes;
+        return true;
+    }
+
+    pub fn loadWithKernelJit(
+        ctx: *context_mod.CudaContext,
+        allocator: std.mem.Allocator,
+        config: kernel_jit.Config,
+    ) !KernelModule {
+        return loadWithKernelJitAndLoadContext(ctx, allocator, config, .dynamic);
+    }
+
+    pub fn loadWithKernelJitAndLoadContext(
+        ctx: *context_mod.CudaContext,
+        allocator: std.mem.Allocator,
+        config: kernel_jit.Config,
+        load_context: kernel_jit.LoadContext,
+    ) !KernelModule {
+        return loadWithKernelJitScopedAndLoadContext(
+            ctx,
+            allocator,
+            config,
+            .{},
+            null,
+            load_context,
+        );
+    }
+
+    pub fn loadWithKernelJitForScope(
+        ctx: *context_mod.CudaContext,
+        allocator: std.mem.Allocator,
+        config: kernel_jit.Config,
+        profile: JitModelProfile,
+        scope: JitRouteScope,
+    ) !KernelModule {
+        return loadWithKernelJitForScopeAndLoadContext(
+            ctx,
+            allocator,
+            config,
+            profile,
+            scope,
+            .dynamic,
+        );
+    }
+
+    pub fn loadWithKernelJitForScopeAndLoadContext(
+        ctx: *context_mod.CudaContext,
+        allocator: std.mem.Allocator,
+        config: kernel_jit.Config,
+        profile: JitModelProfile,
+        scope: JitRouteScope,
+        load_context: kernel_jit.LoadContext,
+    ) !KernelModule {
+        try config.validate();
+        if (config.mode.failClosed() and !scope.enabled()) {
+            std.log.warn(
+                "CUDA runtime JIT required mode found zero eligible production routes for profile {s}",
+                .{@tagName(profile)},
+            );
+            return error.CudaJitRequiredRouteFailed;
+        }
+        if (!scope.conformance_complete) {
+            if (config.mode.failClosed()) return error.CudaJitRequiredRouteFailed;
+            std.log.warn(
+                "CUDA runtime JIT model scope exceeds bounded conformance capacity; oversized or excess shapes keep bundled fallback",
+                .{},
+            );
+        }
+        const allowed = JitRouteScope.forObservedRoutes(profile, scope.production);
+        if (!scope.production.eql(allowed.production) or
+            scope.observed_shape_count > scope.observed_shapes.len or
+            scope.prefill_shape_count > scope.prefill_shapes.len or
+            scope.pair_shape_count > scope.pair_shapes.len)
+        {
+            return error.InvalidCudaJitRouteScope;
+        }
+        return loadWithKernelJitScopedAndLoadContext(
+            ctx,
+            allocator,
+            config,
+            scope,
+            RuntimeJitQualifier.live(),
+            load_context,
+        );
+    }
+
+    pub fn loadWithKernelJitScoped(
+        ctx: *context_mod.CudaContext,
+        allocator: std.mem.Allocator,
+        config: kernel_jit.Config,
+        scope: JitRouteScope,
+        qualifier: ?RuntimeJitQualifier,
+    ) !KernelModule {
+        return loadWithKernelJitScopedAndLoadContext(
+            ctx,
+            allocator,
+            config,
+            scope,
+            qualifier,
+            .dynamic,
+        );
+    }
+
+    pub fn loadWithKernelJitScopedAndLoadContext(
+        ctx: *context_mod.CudaContext,
+        allocator: std.mem.Allocator,
+        config: kernel_jit.Config,
+        scope: JitRouteScope,
+        qualifier: ?RuntimeJitQualifier,
+        load_context: kernel_jit.LoadContext,
+    ) !KernelModule {
+        try config.validate();
+        switch (runtimeJitLoadDisposition(config.mode, scope, load_context)) {
+            .reject_required => return error.CudaJitRequiredRouteFailed,
+            .bundled => {
+                var fallback = try KernelModule.load(ctx);
+                if (config.mode.compiles() and scope.enabled()) {
+                    fallback.runtime_jit_pending_routes = scope.production;
+                    fallback.runtime_jit_stats.skipped_dynamic = true;
+                }
+                return fallback;
+            },
+            .qualify => {},
+        }
+        var control = RuntimeJitWorkControl.foreground(config);
+        return loadWithKernelJitScopedControlled(
+            ctx,
+            allocator,
+            config,
+            scope,
+            qualifier,
+            &control,
+        );
+    }
+
+    fn loadWithKernelJitScopedControlled(
+        ctx: *context_mod.CudaContext,
+        allocator: std.mem.Allocator,
+        config: kernel_jit.Config,
+        scope: JitRouteScope,
+        qualifier: ?RuntimeJitQualifier,
+        control: ?*RuntimeJitWorkControl,
+    ) !KernelModule {
+        try config.validate();
+        var result = try KernelModule.load(ctx);
+        errdefer result.unload(ctx);
+        if (!config.mode.compiles() or !scope.enabled()) return result;
+        result.runtime_jit_pending_routes = scope.production;
+        result.loadRuntimeJit(ctx, allocator, config, scope, qualifier, control) catch |err| {
+            try handleRuntimeJitLoadFailure(config.mode, err);
+        };
+        return result;
+    }
+
+    fn loadRuntimeJit(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        allocator: std.mem.Allocator,
+        config: kernel_jit.Config,
+        scope: JitRouteScope,
+        qualifier: ?RuntimeJitQualifier,
+        control: ?*RuntimeJitWorkControl,
+    ) !void {
+        const mode = config.mode;
+        const sync_started_ns = runtimeJitMonotonicNowNs();
+        defer {
+            const finished_ns = runtimeJitMonotonicNowNs();
+            if (sync_started_ns != 0 and finished_ns >= sync_started_ns) {
+                self.runtime_jit_stats.sync_elapsed_ms =
+                    (finished_ns - sync_started_ns) / std.time.ns_per_ms;
+            }
+        }
+        if (!try lockRuntimeJitProcess(control)) {
+            self.runtime_jit_stats.budget_reached = true;
+            std.log.warn(
+                "CUDA runtime JIT {s} preload budget exhausted while waiting for process-wide qualification; remaining routes keep bundled fallback",
+                .{@tagName(mode)},
+            );
+            if (mode.failClosed()) return error.CudaJitRequiredRouteFailed;
+            return;
+        }
+        defer runtime_jit_process_mutex.unlock();
+        const major = std.math.cast(u8, ctx.info.compute_major) orelse return error.InvalidCudaJitComputeCapability;
+        const minor = std.math.cast(u8, ctx.info.compute_minor) orelse return error.InvalidCudaJitComputeCapability;
+        const capability: nvrtc_mod.ComputeCapability = .{ .major = major, .minor = minor };
+        var compiler = try nvrtc_mod.Nvrtc.open();
+        defer compiler.deinit();
+
+        const cache_path = try config.resolveCacheDir(allocator, platform.env.getenv("HOME"));
+        defer if (cache_path) |path| allocator.free(path);
+        var cache: ?kernel_jit.ArtifactCache = null;
+        defer if (cache) |*value| value.deinit();
+        if (cache_path) |path| {
+            cache = kernel_jit.ArtifactCache.initPath(
+                allocator,
+                io_compat.io(),
+                path,
+                try config.maxCacheBytes(),
+            ) catch |err| blk: {
+                handleRuntimeJitCacheFailure("initialization", @errorName(err));
+                break :blk null;
+            };
+        }
+
+        var target_buffer: [32]u8 = undefined;
+        const target_identity = std.fmt.bufPrint(&target_buffer, "sm_{d}{d}", .{ major, minor }) catch
+            return error.InvalidCudaJitCacheIdentity;
+        var device_buffer: [320]u8 = undefined;
+        const device_identity = std.fmt.bufPrint(
+            &device_buffer,
+            "{s}/driver-{d}",
+            .{ ctx.info.nameSlice(), ctx.info.driver_version },
+        ) catch return error.InvalidCudaJitCacheIdentity;
+        var compiler_buffer: [32]u8 = undefined;
+        const compiler_identity = std.fmt.bufPrint(
+            &compiler_buffer,
+            "nvrtc/{d}.{d}",
+            .{ compiler.version_major, compiler.version_minor },
+        ) catch return error.InvalidCudaJitCacheIdentity;
+        var option_buffer: [48]u8 = undefined;
+        const compiler_options = try capability.option(&option_buffer);
+        const bundled_image_sha256 = cudaBundledImageSha256Hex();
+
+        artifact_loop: for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+            if (artifact.backend != .cuda or !scope.includesArtifact(artifact)) continue;
+            if (control) |value| {
+                if (value.deadlineReached()) {
+                    self.runtime_jit_stats.budget_reached = true;
+                    std.log.warn(
+                        "CUDA runtime JIT {s} preload budget exhausted before {s}; remaining routes keep bundled fallback",
+                        .{ @tagName(mode), artifact.kernel_id },
+                    );
+                    if (mode.failClosed()) return error.CudaJitRequiredRouteFailed;
+                    return;
+                }
+            }
+            const required_route = scope.includesArtifact(artifact);
+            const qualification_scopes = RuntimeJitQualificationScopes.forArtifact(artifact, scope);
+            if (qualification_scopes.count == 0) {
+                std.log.warn(
+                    "CUDA runtime JIT has no bounded qualification shapes for {s}; dispatch keeps bundled fallback",
+                    .{artifact.kernel_id},
+                );
+                if (mode.failClosed()) return error.CudaJitRequiredRouteFailed;
+                continue;
+            }
+            const emitted = quant_kernel_compiler.emitRuntimeArtifactSource(allocator, artifact) catch |err| {
+                try handleRuntimeJitFailure(mode, required_route, artifact, "source emission", @errorName(err), "");
+                continue;
+            };
+            defer emitted.deinit(allocator);
+            const mapping = self.generatedFunctionMapping(artifact) orelse {
+                try handleRuntimeJitFailure(mode, required_route, artifact, "field mapping", "missing generated-function bundle", "");
+                continue;
+            };
+
+            const compile_key = runtimeJitCompileKey(
+                artifact,
+                emitted.data,
+                target_identity,
+                compiler_identity,
+                compiler_options,
+            );
+            var cached_ptx = loadRuntimeJitCachedPtx(if (cache) |*value| value else null, compile_key) catch |err| blk: {
+                handleRuntimeJitCacheFailure("load", @errorName(err));
+                break :blk null;
+            };
+            defer if (cached_ptx) |ptx| allocator.free(ptx);
+            if (cached_ptx) |ptx| {
+                if (!validRuntimeJitPtx(ptx)) {
+                    allocator.free(ptx);
+                    cached_ptx = null;
+                    handleRuntimeJitCacheFailure("validation", "invalid cached PTX");
+                }
+            }
+
+            const kernel_name = allocator.dupeZ(u8, artifact.kernel_id) catch |err| {
+                try handleRuntimeJitFailure(mode, required_route, artifact, "kernel name allocation", @errorName(err), "");
+                continue;
+            };
+            defer allocator.free(kernel_name);
+            var compilation: ?nvrtc_mod.Compilation = null;
+            defer if (compilation) |*value| value.deinit(allocator);
+            const ptx = cached_ptx orelse blk: {
+                compilation = compiler.compile(
+                    allocator,
+                    kernel_name,
+                    emitted.data,
+                    capability,
+                    &.{},
+                ) catch |err| {
+                    try handleRuntimeJitFailure(mode, required_route, artifact, "NVRTC invocation", @errorName(err), "");
+                    continue;
+                };
+                if (!compilation.?.succeeded()) {
+                    try handleRuntimeJitFailure(
+                        mode,
+                        required_route,
+                        artifact,
+                        "NVRTC compilation",
+                        compilation.?.message,
+                        compilation.?.log,
+                    );
+                    continue;
+                }
+                self.runtime_jit_stats.compiled += 1;
+                const compiled_ptx = compilation.?.ptx.?;
+                if (cache) |*value| {
+                    value.store(.cuda_ptx, compile_key, compiled_ptx) catch |err| {
+                        handleRuntimeJitCacheFailure("store", @errorName(err));
+                    };
+                }
+                break :blk compiled_ptx;
+            };
+            const candidate_ptx_sha256 = runtimeJitSha256(ptx);
+
+            var module: driver_mod.CUmodule = null;
+            loadPtxModuleWithJitLog(ctx, &module, ptx, artifact.kernel_id) catch |err| {
+                try handleRuntimeJitFailure(mode, required_route, artifact, "PTX module load", @errorName(err), "");
+                continue;
+            };
+            var functions = [_]driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact;
+            var all_symbols_resolved = true;
+            for (0..mapping.count) |index| {
+                const symbol_name = allocator.dupeZ(u8, mapping.names[index]) catch |err| {
+                    _ = ctx.driver.fns.cuModuleUnload(module);
+                    try handleRuntimeJitFailure(mode, required_route, artifact, "symbol name allocation", @errorName(err), "");
+                    all_symbols_resolved = false;
+                    break;
+                };
+                defer allocator.free(symbol_name);
+                const symbol_status = ctx.driver.fns.cuModuleGetFunction(
+                    &functions[index],
+                    module,
+                    symbol_name.ptr,
+                );
+                if (symbol_status != driver_mod.CUDA_SUCCESS or functions[index] == null) {
+                    _ = ctx.driver.fns.cuModuleUnload(module);
+                    std.log.warn(
+                        "CUDA runtime JIT required symbol {s} is unavailable in {s}",
+                        .{ mapping.names[index], artifact.kernel_id },
+                    );
+                    try handleRuntimeJitFailure(
+                        mode,
+                        required_route,
+                        artifact,
+                        "symbol resolution",
+                        ctx.driver.errorName(symbol_status),
+                        ctx.driver.errorString(symbol_status),
+                    );
+                    all_symbols_resolved = false;
+                    break;
+                }
+            }
+            if (!all_symbols_resolved) continue;
+            var any_qualified = false;
+            var all_qualified = qualification_scopes.complete;
+            var qualified_scope = JitRouteScope{};
+            qualification_loop: for (qualification_scopes.scopes[0..qualification_scopes.count]) |qualification_scope| {
+                if (control) |value| {
+                    if (value.deadlineReached()) {
+                        _ = ctx.driver.fns.cuModuleUnload(module);
+                        self.runtime_jit_stats.budget_reached = true;
+                        std.log.warn(
+                            "CUDA runtime JIT {s} preload budget exhausted while qualifying {s}; remaining shapes keep bundled fallback",
+                            .{ @tagName(mode), artifact.kernel_id },
+                        );
+                        if (mode.failClosed()) return error.CudaJitRequiredRouteFailed;
+                        return;
+                    }
+                }
+                const qualification_key = runtimeJitQualificationKey(
+                    artifact,
+                    qualification_scope,
+                    compile_key,
+                    candidate_ptx_sha256,
+                    &bundled_image_sha256,
+                    device_identity,
+                );
+                const cached_qualification = loadRuntimeJitQualification(
+                    allocator,
+                    if (cache) |*value| value else null,
+                    qualification_key,
+                    artifact,
+                );
+                if (cached_qualification != null) {
+                    self.runtime_jit_stats.qualification_cache_hits += 1;
+                    runtime_jit_rejections.clear(qualification_key);
+                } else {
+                    self.runtime_jit_stats.qualification_cache_misses += 1;
+                }
+                if (cached_qualification == null and
+                    runtime_jit_rejections.activeAt(qualification_key, runtimeJitMonotonicNowNs()))
+                {
+                    self.runtime_jit_stats.quarantined += 1;
+                    all_qualified = false;
+                    std.log.warn(
+                        "CUDA runtime JIT qualification for {s} shape is quarantined after a recent rejection",
+                        .{artifact.kernel_id},
+                    );
+                    if (mode.failClosed()) {
+                        _ = ctx.driver.fns.cuModuleUnload(module);
+                        return error.CudaJitRequiredRouteFailed;
+                    }
+                    continue :qualification_loop;
+                }
+                const qualification = resolveRuntimeJitQualification(
+                    mode,
+                    required_route,
+                    cached_qualification,
+                    qualifier,
+                    .{
+                        .allocator = allocator,
+                        .ctx = ctx,
+                        .module = self,
+                        .artifact = artifact,
+                        .candidate_functions = functions,
+                        .scope = qualification_scope,
+                        .cancellation = if (control) |value| value.cancellation() else null,
+                    },
+                ) catch |err| {
+                    if (control) |value| {
+                        if (value.deadlineReached()) {
+                            _ = ctx.driver.fns.cuModuleUnload(module);
+                            self.runtime_jit_stats.budget_reached = true;
+                            std.log.warn(
+                                "CUDA runtime JIT {s} preload budget exhausted while qualifying {s}; remaining shapes keep bundled fallback",
+                                .{ @tagName(mode), artifact.kernel_id },
+                            );
+                            if (mode.failClosed()) return error.CudaJitRequiredRouteFailed;
+                            return;
+                        }
+                    }
+                    self.runtime_jit_stats.rejected += 1;
+                    all_qualified = false;
+                    handleRuntimeJitFailure(
+                        mode,
+                        required_route,
+                        artifact,
+                        "live qualification",
+                        @errorName(err),
+                        "",
+                    ) catch |failure| {
+                        _ = ctx.driver.fns.cuModuleUnload(module);
+                        return failure;
+                    };
+                    continue :qualification_loop;
+                };
+                if (qualification.measured_live) {
+                    if (qualification.record) |record| {
+                        runtime_jit_rejections.clear(qualification_key);
+                        if (cache) |*value| {
+                            if (record.encode()) |encoded| {
+                                value.store(.qualification, qualification_key, &encoded) catch |err| {
+                                    handleRuntimeJitCacheFailure("qualification store", @errorName(err));
+                                };
+                            } else |err| {
+                                handleRuntimeJitCacheFailure("qualification encode", @errorName(err));
+                            }
+                        }
+                    } else {
+                        runtime_jit_rejections.rememberAt(qualification_key, runtimeJitMonotonicNowNs());
+                    }
+                }
+                if (qualification.record != null) {
+                    any_qualified = true;
+                    self.runtime_jit_stats.qualified += 1;
+                    qualified_scope.mergeQualified(qualification_scope);
+                } else {
+                    all_qualified = false;
+                    if (qualification.measured_live) self.runtime_jit_stats.rejected += 1;
+                    std.log.warn(
+                        "CUDA runtime JIT route {s} shape lacks qualifying live evidence; that shape keeps bundled fallback",
+                        .{artifact.kernel_id},
+                    );
+                    if (mode.failClosed()) {
+                        _ = ctx.driver.fns.cuModuleUnload(module);
+                        return error.CudaJitRequiredRouteUnqualified;
+                    }
+                }
+            }
+            if (all_qualified) _ = self.runtime_jit_pending_routes.disableArtifact(artifact);
+            const activate = shouldActivateRuntimeJitArtifact(artifact, mode, required_route, any_qualified) catch |err| {
+                _ = ctx.driver.fns.cuModuleUnload(module);
+                return err;
+            };
+            if (!activate) {
+                _ = ctx.driver.fns.cuModuleUnload(module);
+                continue :artifact_loop;
+            }
+            self.retainRuntimeJitModule(module) catch |err| {
+                _ = ctx.driver.fns.cuModuleUnload(module);
+                try handleRuntimeJitFailure(mode, required_route, artifact, "module retention", @errorName(err), "");
+                continue;
+            };
+            if (!self.installRuntimeJitFunctions(artifact, mapping, functions, mode, any_qualified)) {
+                const retained = self.popRuntimeJitModule().?;
+                _ = ctx.driver.fns.cuModuleUnload(retained);
+                try handleRuntimeJitFailure(mode, required_route, artifact, "route activation", "missing production gate mapping", "");
+                continue;
+            }
+            self.runtime_jit_qualified_scope.mergeQualified(qualified_scope);
+            self.runtime_jit_stats.active += 1;
+        }
+        try ensureRuntimeJitRequiredComplete(mode, self.runtime_jit_pending_routes);
+    }
 
     pub fn load(ctx: *context_mod.CudaContext) driver_mod.Error!KernelModule {
         try ctx.makeCurrent();
@@ -1201,6 +2456,19 @@ pub const KernelModule = struct {
 
     pub fn unload(self: *KernelModule, ctx: *context_mod.CudaContext) void {
         self.gqa_attention_generated_workspace.free(ctx);
+        if (self.runtime_jit_module_count > 0) ctx.makeCurrent() catch {};
+        while (self.popRuntimeJitModule()) |module| {
+            _ = ctx.driver.fns.cuModuleUnload(module);
+        }
+        self.runtime_jit_routes = .{};
+        self.runtime_jit_pending_routes = .{};
+        self.runtime_jit_qualified_scope = .{};
+        self.runtime_jit_stats = .{};
+        for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+            if (artifact.backend != .cuda) continue;
+            const mapping = self.generatedFunctionMapping(artifact) orelse continue;
+            for (0..mapping.count) |index| mapping.slots[index].?.* = null;
+        }
         if (self.module != null) {
             ctx.makeCurrent() catch {};
             _ = ctx.driver.fns.cuModuleUnload(self.module);
@@ -1354,6 +2622,8 @@ pub const KernelModule = struct {
             self.linear_q8_0_bias_add_f32_tc_hmma = null;
             self.quantize_f32_q8_1_rows = null;
             self.quantize_gated_f32_q8_1_rows = null;
+            self.linear_q4_k_generated_bias_gelu = null;
+            self.linear_q4_k_generated_mmv = null;
             self.linear_q4_0_f32 = null;
             self.linear_q4_0_generated_mmv = null;
             self.linear_q4_0_generated_mm = null;
@@ -11778,13 +13048,13 @@ fn generatedQ4_0Q8_1ArgmaxLaunchBounds(rows: usize, in_dim: usize, out_dim: usiz
     };
 }
 
-fn generatedQ4_0PairQ8E4BShapeEligible(rows: usize, in_dim: usize, out_dim: usize) bool {
+pub fn generatedQ4_0PairQ8E4BShapeEligible(rows: usize, in_dim: usize, out_dim: usize) bool {
     return rows == generated_q4_0_q8_e4b_rows and
         in_dim == generated_q4_0_q8_e4b_hidden_dim and
         out_dim == generated_q4_0_q8_e4b_intermediate_dim;
 }
 
-fn generatedQ4_0DownQ8E4BShapeEligible(rows: usize, in_dim: usize, out_dim: usize) bool {
+pub fn generatedQ4_0DownQ8E4BShapeEligible(rows: usize, in_dim: usize, out_dim: usize) bool {
     return rows == generated_q4_0_q8_e4b_rows and
         in_dim == generated_q4_0_q8_e4b_intermediate_dim and
         out_dim == generated_q4_0_q8_e4b_hidden_dim;
@@ -12000,7 +13270,1967 @@ fn loadOptionalFunction(ctx: *context_mod.CudaContext, module: driver_mod.CUmodu
     return function;
 }
 
+const LiveRuntimeJitRoute = enum {
+    mmv,
+    mm,
+    pair,
+    pair_q8,
+    down_q8,
+};
+
+const LiveRuntimeJitShape = struct {
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+};
+
+const LiveRuntimeJitFixture = struct {
+    shape: LiveRuntimeJitShape,
+    measure: bool,
+};
+
+// Qualification allocates deterministic host and device fixtures. Keep the
+// peak allocation bounded even if a model contains an unexpected giant 2-D
+// table that otherwise resembles a quantized linear weight.
+const live_runtime_jit_max_fixture_bytes: usize = 128 * 1024 * 1024;
+const live_runtime_jit_sampled_output_count: usize = 8;
+const live_runtime_jit_weight_pattern_count: usize = 29;
+const live_runtime_jit_conformance_policy_identity =
+    "cuda-runtime-jit-conformance/v4:sampled-output8-all-input-rows;weight-pattern-bank29-row-strided;input-row-strided;fixture-heap-accounted";
+
+const LiveRuntimeJitConformance = struct {
+    const max_fixtures = JitRouteScope.max_observed_shapes * 3 + 3;
+
+    fixtures: [max_fixtures]LiveRuntimeJitFixture = undefined,
+    count: usize = 0,
+
+    fn append(self: *LiveRuntimeJitConformance, shape: LiveRuntimeJitShape, measure: bool) void {
+        for (self.fixtures[0..self.count]) |*fixture| {
+            if (fixture.shape.rows == shape.rows and
+                fixture.shape.in_dim == shape.in_dim and
+                fixture.shape.out_dim == shape.out_dim)
+            {
+                fixture.measure = fixture.measure or measure;
+                return;
+            }
+        }
+        if (self.count == self.fixtures.len) return;
+        self.fixtures[self.count] = .{ .shape = shape, .measure = measure };
+        self.count += 1;
+    }
+
+    fn forRoute(route: LiveRuntimeJitRoute, scope: JitRouteScope) LiveRuntimeJitConformance {
+        var result = LiveRuntimeJitConformance{};
+        switch (route) {
+            .mmv => {
+                // Minimum reduction domain plus output/reduction tile tails.
+                result.append(.{ .rows = 1, .in_dim = 512, .out_dim = 33 }, false);
+                result.append(.{ .rows = 1, .in_dim = 544, .out_dim = 64 }, false);
+                for (scope.observed_shapes[0..scope.observed_shape_count]) |shape| {
+                    result.append(.{ .rows = 1, .in_dim = shape[1], .out_dim = shape[0] }, true);
+                }
+                if (!hasMeasuredFixture(result)) {
+                    result.append(.{ .rows = 1, .in_dim = 1536, .out_dim = 8960 }, true);
+                }
+            },
+            .mm => {
+                // The dispatch bucket is rows 9...64. Exercise both boundaries,
+                // row/output tails, and each model-observed prefill shape.
+                result.append(.{ .rows = 9, .in_dim = 512, .out_dim = 33 }, false);
+                result.append(.{ .rows = 64, .in_dim = 544, .out_dim = 64 }, false);
+                for (scope.prefill_shapes[0..scope.prefill_shape_count]) |shape| {
+                    result.append(.{ .rows = 9, .in_dim = shape[1], .out_dim = shape[0] }, true);
+                    result.append(.{ .rows = 22, .in_dim = shape[1], .out_dim = shape[0] }, true);
+                    result.append(.{ .rows = 64, .in_dim = shape[1], .out_dim = shape[0] }, true);
+                }
+                if (!hasMeasuredFixture(result)) {
+                    result.append(.{ .rows = 9, .in_dim = 1536, .out_dim = 8960 }, true);
+                    result.append(.{ .rows = 22, .in_dim = 1536, .out_dim = 8960 }, true);
+                    result.append(.{ .rows = 64, .in_dim = 1536, .out_dim = 8960 }, true);
+                }
+            },
+            .pair => {
+                result.append(.{ .rows = 1, .in_dim = 512, .out_dim = 33 }, false);
+                result.append(.{ .rows = 1, .in_dim = 544, .out_dim = 64 }, false);
+                for (scope.pair_shapes[0..scope.pair_shape_count]) |shape| {
+                    result.append(.{ .rows = 1, .in_dim = shape[1], .out_dim = shape[0] }, true);
+                }
+                if (!hasMeasuredFixture(result)) {
+                    result.append(.{ .rows = 1, .in_dim = 1536, .out_dim = 8960 }, true);
+                }
+            },
+            .pair_q8 => result.append(.{ .rows = 1, .in_dim = 2560, .out_dim = 10240 }, true),
+            .down_q8 => result.append(.{ .rows = 1, .in_dim = 10240, .out_dim = 2560 }, true),
+        }
+        return result;
+    }
+
+    fn hasMeasuredFixture(self: LiveRuntimeJitConformance) bool {
+        for (self.fixtures[0..self.count]) |fixture| if (fixture.measure) return true;
+        return false;
+    }
+
+    fn identity(self: LiveRuntimeJitConformance, route: LiveRuntimeJitRoute) kernel_jit.ArtifactKey {
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(live_runtime_jit_conformance_policy_identity);
+        hasher.update(&.{@intFromEnum(route)});
+        var budget_encoded: [@sizeOf(u64)]u8 = undefined;
+        std.mem.writeInt(u64, &budget_encoded, live_runtime_jit_max_fixture_bytes, .little);
+        hasher.update(&budget_encoded);
+        for (self.fixtures[0..self.count]) |fixture| {
+            var encoded: [@sizeOf(u64) * 3 + 1]u8 = undefined;
+            std.mem.writeInt(u64, encoded[0..8], fixture.shape.rows, .little);
+            std.mem.writeInt(u64, encoded[8..16], fixture.shape.in_dim, .little);
+            std.mem.writeInt(u64, encoded[16..24], fixture.shape.out_dim, .little);
+            encoded[24] = @intFromBool(fixture.measure);
+            hasher.update(&encoded);
+        }
+        var digest: kernel_jit.ArtifactKey = undefined;
+        hasher.final(&digest);
+        return digest;
+    }
+};
+
+fn liveRuntimeJitFixtureAllocationBytes(
+    route: LiveRuntimeJitRoute,
+    fixture: LiveRuntimeJitFixture,
+) ?usize {
+    const shape = fixture.shape;
+    if (shape.rows == 0 or shape.in_dim == 0 or shape.out_dim == 0 or
+        shape.in_dim % q4_0_values_per_block != 0)
+    {
+        return null;
+    }
+    const input_count = std.math.mul(usize, shape.rows, shape.in_dim) catch return null;
+    const output_count = std.math.mul(usize, shape.rows, shape.out_dim) catch return null;
+    const input_f32_bytes = std.math.mul(usize, input_count, @sizeOf(f32)) catch return null;
+    const output_f32_bytes = std.math.mul(usize, output_count, @sizeOf(f32)) catch return null;
+    const row_blocks = shape.in_dim / q4_0_values_per_block;
+    const weight_bytes = std.math.mul(
+        usize,
+        std.math.mul(usize, shape.out_dim, row_blocks) catch return null,
+        q4_0_block_bytes,
+    ) catch return null;
+    const q8_input = route == .pair_q8 or route == .down_q8;
+    const q8_output = route == .pair_q8;
+    const paired = route == .pair or route == .pair_q8;
+
+    var total: usize = 0;
+    total = std.math.add(usize, total, input_f32_bytes) catch return null;
+    if (q8_input) {
+        if (input_count % q8_1_values_per_block != 0) return null;
+        const input_q8_bytes = std.math.mul(
+            usize,
+            input_count / q8_1_values_per_block,
+            q8_1_block_bytes,
+        ) catch return null;
+        // Quantized input remains resident in host and device memory while the
+        // original f32 host input is retained for deterministic generation.
+        total = std.math.add(
+            usize,
+            total,
+            std.math.mul(usize, input_q8_bytes, 2) catch return null,
+        ) catch return null;
+    } else {
+        total = std.math.add(usize, total, input_f32_bytes) catch return null;
+    }
+    // One host and one device copy per weight; pair routes hold two weights.
+    total = std.math.add(
+        usize,
+        total,
+        std.math.mul(usize, weight_bytes, if (paired) 4 else 2) catch return null,
+    ) catch return null;
+
+    const output_bytes = if (q8_output) blk: {
+        if (output_count % q8_1_values_per_block != 0) return null;
+        break :blk std.math.mul(
+            usize,
+            output_count / q8_1_values_per_block,
+            q8_1_block_bytes,
+        ) catch return null;
+    } else output_f32_bytes;
+    total = std.math.add(
+        usize,
+        total,
+        std.math.mul(usize, output_bytes, if (route == .pair) 4 else 2) catch return null,
+    ) catch return null;
+    if (q8_output) {
+        total = std.math.add(
+            usize,
+            total,
+            std.math.mul(usize, output_bytes, 2) catch return null,
+        ) catch return null;
+        total = std.math.add(
+            usize,
+            total,
+            std.math.mul(usize, output_f32_bytes, 2) catch return null,
+        ) catch return null;
+    } else {
+        total = std.math.add(
+            usize,
+            total,
+            std.math.mul(usize, output_f32_bytes, if (route == .pair) 4 else 2) catch return null,
+        ) catch return null;
+    }
+    const cpu_oracle_bytes = if (q8_input)
+        // Sparse Q8 oracles hold a dequantized input and one Q4 weight row.
+        std.math.mul(usize, shape.in_dim, 2 * @sizeOf(f32)) catch return null
+    else if (fixture.measure)
+        // Observed-shape oracles dequantize one sampled Q4 output row at a time.
+        std.math.mul(usize, shape.in_dim, @sizeOf(f32)) catch return null
+    else blk: {
+        // Boundary fixtures use the full independent oracle. Its dense f32
+        // weight and returned f32 output coexist at the helper's peak.
+        const dense_weight_bytes = std.math.mul(
+            usize,
+            std.math.mul(usize, shape.out_dim, shape.in_dim) catch return null,
+            @sizeOf(f32),
+        ) catch return null;
+        break :blk std.math.add(usize, dense_weight_bytes, output_f32_bytes) catch return null;
+    };
+    total = std.math.add(usize, total, cpu_oracle_bytes) catch return null;
+    return total;
+}
+
+fn liveRuntimeJitScopeWithinFixtureBudget(scope: JitRouteScope) bool {
+    const routes = [_]struct { enabled: bool, route: LiveRuntimeJitRoute }{
+        .{ .enabled = scope.production.mmv, .route = .mmv },
+        .{ .enabled = scope.production.mm, .route = .mm },
+        .{ .enabled = scope.production.pair, .route = .pair },
+        .{ .enabled = scope.production.pair_q8, .route = .pair_q8 },
+        .{ .enabled = scope.production.down_q8, .route = .down_q8 },
+    };
+    for (routes) |entry| {
+        if (!entry.enabled) continue;
+        const conformance = LiveRuntimeJitConformance.forRoute(entry.route, scope);
+        for (conformance.fixtures[0..conformance.count]) |fixture| {
+            const bytes = liveRuntimeJitFixtureAllocationBytes(entry.route, fixture) orelse
+                return false;
+            if (bytes > live_runtime_jit_max_fixture_bytes) return false;
+        }
+    }
+    return true;
+}
+
+const RuntimeJitQualificationScopes = struct {
+    scopes: [JitRouteScope.max_observed_shapes]JitRouteScope =
+        [_]JitRouteScope{.{}} ** JitRouteScope.max_observed_shapes,
+    count: usize = 0,
+    complete: bool = true,
+
+    fn forArtifact(
+        artifact: quant_kernel_compiler.GeneratedArtifact,
+        scope: JitRouteScope,
+    ) RuntimeJitQualificationScopes {
+        var result = RuntimeJitQualificationScopes{ .complete = scope.conformance_complete };
+        const route = liveRuntimeJitRoute(artifact) orelse return result;
+        switch (route) {
+            .mmv => for (scope.observed_shapes[0..scope.observed_shape_count]) |shape| {
+                var candidate = JitRouteScope{ .production = .{ .mmv = true } };
+                candidate.observed_shapes[0] = shape;
+                candidate.observed_shape_count = 1;
+                result.appendIfBounded(candidate);
+            },
+            .mm => for (scope.prefill_shapes[0..scope.prefill_shape_count]) |shape| {
+                var candidate = JitRouteScope{ .production = .{ .mm = true } };
+                candidate.prefill_shapes[0] = shape;
+                candidate.prefill_shape_count = 1;
+                result.appendIfBounded(candidate);
+            },
+            .pair => for (scope.pair_shapes[0..scope.pair_shape_count]) |shape| {
+                var candidate = JitRouteScope{ .production = .{ .pair = true } };
+                candidate.pair_shapes[0] = shape;
+                candidate.pair_shape_count = 1;
+                result.appendIfBounded(candidate);
+            },
+            .pair_q8 => result.appendIfBounded(.{ .production = .{ .pair_q8 = true } }),
+            .down_q8 => result.appendIfBounded(.{ .production = .{ .down_q8 = true } }),
+        }
+        return result;
+    }
+
+    fn appendIfBounded(self: *RuntimeJitQualificationScopes, scope: JitRouteScope) void {
+        if (!liveRuntimeJitScopeWithinFixtureBudget(scope) or self.count == self.scopes.len) {
+            self.complete = false;
+            return;
+        }
+        self.scopes[self.count] = scope;
+        self.count += 1;
+    }
+};
+
+const LiveRuntimeJitStep = struct {
+    route: LiveRuntimeJitRoute,
+    generated: bool,
+    module: *KernelModule,
+    ctx: *context_mod.CudaContext,
+    output: buffer_mod.DeviceBuffer,
+    output_b: buffer_mod.DeviceBuffer = .{},
+    input: buffer_mod.DeviceBuffer,
+    weight: buffer_mod.DeviceBuffer,
+    weight_b: buffer_mod.DeviceBuffer = .{},
+    shape: LiveRuntimeJitShape,
+
+    fn run(self: LiveRuntimeJitStep) !void {
+        switch (self.route) {
+            .mmv => if (self.generated)
+                try self.module.launchLinearQ4_0GeneratedMmvF32(
+                    self.ctx,
+                    self.output,
+                    self.input,
+                    self.weight,
+                    self.shape.rows,
+                    self.shape.in_dim,
+                    self.shape.out_dim,
+                )
+            else
+                try self.module.launchLinearQ4_0Tile4F32(
+                    self.ctx,
+                    self.output,
+                    self.input,
+                    self.weight,
+                    self.shape.rows,
+                    self.shape.in_dim,
+                    self.shape.out_dim,
+                ),
+            .mm => if (self.generated)
+                try self.module.launchLinearQ4_0GeneratedMmF32(
+                    self.ctx,
+                    self.output,
+                    self.input,
+                    self.weight,
+                    self.shape.rows,
+                    self.shape.in_dim,
+                    self.shape.out_dim,
+                )
+            else
+                try self.module.launchLinearQ4_0F32(
+                    self.ctx,
+                    self.output,
+                    self.input,
+                    self.weight,
+                    self.shape.rows,
+                    self.shape.in_dim,
+                    self.shape.out_dim,
+                ),
+            .pair => if (self.generated)
+                try self.module.launchLinearQ4_0GeneratedPairF32(
+                    self.ctx,
+                    self.output,
+                    self.output_b,
+                    self.input,
+                    self.weight,
+                    self.weight_b,
+                    self.shape.rows,
+                    self.shape.in_dim,
+                    self.shape.out_dim,
+                )
+            else
+                try self.module.launchLinearQ4_0PairNoBiasTile4W4F32(
+                    self.ctx,
+                    self.output,
+                    self.output_b,
+                    self.input,
+                    self.weight,
+                    self.weight_b,
+                    self.shape.rows,
+                    self.shape.in_dim,
+                    self.shape.out_dim,
+                ),
+            .pair_q8 => if (self.generated)
+                try self.module.launchLinearQ4_0GeneratedPairQ8(
+                    self.ctx,
+                    self.output,
+                    self.input,
+                    self.weight,
+                    self.weight_b,
+                    self.shape.rows,
+                    self.shape.in_dim,
+                    self.shape.out_dim,
+                    0,
+                )
+            else
+                try self.module.launchLinearQ4_0PairActivationQ8_1Tile32W5E4BFfnQ8_1(
+                    self.ctx,
+                    self.output,
+                    self.input,
+                    self.weight,
+                    self.weight_b,
+                    self.shape.rows,
+                    self.shape.in_dim,
+                    self.shape.out_dim,
+                    0,
+                ),
+            .down_q8 => if (self.generated)
+                try self.module.launchLinearQ4_0GeneratedDownQ8(
+                    self.ctx,
+                    self.output,
+                    self.input,
+                    self.weight,
+                    self.shape.rows,
+                    self.shape.in_dim,
+                    self.shape.out_dim,
+                )
+            else
+                try self.module.launchLinearQ4_0Q8_1Tile4W8F32(
+                    self.ctx,
+                    self.output,
+                    self.input,
+                    self.weight,
+                    self.shape.rows,
+                    self.shape.in_dim,
+                    self.shape.out_dim,
+                ),
+        }
+    }
+};
+
+const LiveRuntimeJitErrors = struct {
+    max_absolute: f64 = 0,
+    max_relative: f64 = 0,
+
+    fn merge(self: *LiveRuntimeJitErrors, other: LiveRuntimeJitErrors) void {
+        self.max_absolute = @max(self.max_absolute, other.max_absolute);
+        self.max_relative = @max(self.max_relative, other.max_relative);
+    }
+};
+
+fn liveRuntimeJitRoute(artifact: quant_kernel_compiler.GeneratedArtifact) ?LiveRuntimeJitRoute {
+    const kind = artifact.cuda_kernel orelse return null;
+    return switch (kind) {
+        .q4_0_mmv => .mmv,
+        .q4_0_mm => .mm,
+        .q4_0_pair_mmv => .pair,
+        .q4_0_pair_activation_q8_1 => .pair_q8,
+        .q4_0_down_q8_1 => .down_q8,
+        else => null,
+    };
+}
+
+fn liveRuntimeJitCandidateModule(request: RuntimeJitQualificationRequest) !KernelModule {
+    const function = request.candidate_functions[0];
+    if (function == null) return error.CudaJitCandidateSymbolMissing;
+    var candidate = request.module.*;
+    switch (liveRuntimeJitRoute(request.artifact) orelse return error.CudaJitQualificationUnsupported) {
+        .mmv => candidate.linear_q4_0_generated_mmv = function,
+        .mm => candidate.linear_q4_0_generated_mm = function,
+        .pair => candidate.linear_q4_0_generated_pair = function,
+        .pair_q8 => candidate.linear_q4_0_generated_pair_q8 = function,
+        .down_q8 => candidate.linear_q4_0_generated_down_q8 = function,
+    }
+    return candidate;
+}
+
+fn liveRuntimeJitMul(a: usize, b: usize) !usize {
+    return std.math.mul(usize, a, b) catch error.CudaJitQualificationSizeOverflow;
+}
+
+fn fillLiveRuntimeJitInput(values: []f32, shape: LiveRuntimeJitShape) !void {
+    if (values.len != try liveRuntimeJitMul(shape.rows, shape.in_dim) or shape.in_dim == 0) {
+        return error.CudaJitQualificationInvalidInputSize;
+    }
+    for (values, 0..) |*value, index| {
+        const row = index / shape.in_dim;
+        const column = index % shape.in_dim;
+        const lane: f32 = @floatFromInt((column * 5 + row * 17) % 97);
+        value.* = (lane - 48.0) * 0.005;
+    }
+}
+
+fn fillLiveRuntimeJitQ4_0(bytes: []u8, blocks_per_row: usize, alternate: bool) !void {
+    if (blocks_per_row == 0 or bytes.len % q4_0_block_bytes != 0) {
+        return error.CudaJitQualificationInvalidWeightSize;
+    }
+    const block_count = bytes.len / q4_0_block_bytes;
+    if (block_count % blocks_per_row != 0) return error.CudaJitQualificationInvalidWeightSize;
+    var patterns: [live_runtime_jit_weight_pattern_count][q4_0_block_bytes]u8 = undefined;
+    for (&patterns, 0..) |*pattern, block_index| {
+        var block: [q4_0_values_per_block]f32 = undefined;
+        for (&block, 0..) |*value, index| {
+            const lane: f32 = if (alternate)
+                @floatFromInt((index * 3 + block_index * 17) % 23)
+            else
+                @floatFromInt((index + block_index * 11) % 29);
+            value.* = if (alternate) (lane - 11.0) * 0.012 else (lane - 14.0) * 0.01;
+        }
+        quant_codec.quantizeQ4_0Block(&block, pattern);
+    }
+    for (0..block_count) |block_index| {
+        const output_row = block_index / blocks_per_row;
+        const local_block = block_index % blocks_per_row;
+        const pattern_index = (local_block * 7 + output_row * 11) % patterns.len;
+        const offset = block_index * q4_0_block_bytes;
+        @memcpy(bytes[offset..][0..q4_0_block_bytes], &patterns[pattern_index]);
+    }
+}
+
+fn compareLiveRuntimeJitF32(expected: []const f32, actual: []const f32) !LiveRuntimeJitErrors {
+    if (expected.len != actual.len) return error.CudaJitQualificationOutputSizeMismatch;
+    var result = LiveRuntimeJitErrors{};
+    for (expected, actual) |baseline, candidate| {
+        if (!std.math.isFinite(baseline) or !std.math.isFinite(candidate)) {
+            return error.CudaJitQualificationNonFiniteOutput;
+        }
+        const absolute: f64 = @floatCast(@abs(candidate - baseline));
+        const denominator = @max(@as(f64, @floatCast(@abs(baseline))), 1.0e-12);
+        result.max_absolute = @max(result.max_absolute, absolute);
+        result.max_relative = @max(result.max_relative, absolute / denominator);
+    }
+    return result;
+}
+
+fn liveRuntimeJitCpuQ4Reference(
+    allocator: std.mem.Allocator,
+    input: []const f32,
+    weight_bytes: []const u8,
+    shape: LiveRuntimeJitShape,
+) ![]f32 {
+    const weight_count = try liveRuntimeJitMul(shape.out_dim, shape.in_dim);
+    const weights = try allocator.alloc(f32, weight_count);
+    defer allocator.free(weights);
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, weight_bytes, weights);
+    const output_count = try liveRuntimeJitMul(shape.rows, shape.out_dim);
+    const output = try allocator.alloc(f32, output_count);
+    errdefer allocator.free(output);
+    for (0..shape.rows) |row| {
+        const input_row = input[row * shape.in_dim ..][0..shape.in_dim];
+        for (0..shape.out_dim) |out| {
+            const weight_row = weights[out * shape.in_dim ..][0..shape.in_dim];
+            var sum: f32 = 0;
+            for (input_row, weight_row) |lhs, rhs| sum += lhs * rhs;
+            output[row * shape.out_dim + out] = sum;
+        }
+    }
+    return output;
+}
+
+fn liveRuntimeJitCpuDot(input: []const f32, weight: []const f32) f32 {
+    std.debug.assert(input.len == weight.len);
+    var sum: f32 = 0;
+    for (input, weight) |lhs, rhs| sum += lhs * rhs;
+    return sum;
+}
+
+// Validate observed model strides without materializing a dense f32 weight.
+// Eight evenly spaced output rows are dequantized independently and checked
+// against both CUDA implementations for every input row.
+fn liveRuntimeJitCpuSampledQ4ReferenceErrors(
+    allocator: std.mem.Allocator,
+    input: []const f32,
+    weight_bytes: []const u8,
+    shape: LiveRuntimeJitShape,
+    baseline: []const f32,
+    candidate: []const f32,
+) !LiveRuntimeJitErrors {
+    const input_count = try liveRuntimeJitMul(shape.rows, shape.in_dim);
+    const output_count = try liveRuntimeJitMul(shape.rows, shape.out_dim);
+    if (shape.rows == 0 or shape.in_dim == 0 or shape.out_dim == 0 or
+        shape.in_dim % q4_0_values_per_block != 0 or
+        input.len != input_count or baseline.len != output_count or
+        candidate.len != output_count)
+    {
+        return error.CudaJitQualificationInvalidReferenceShape;
+    }
+    const weight_row_bytes = try liveRuntimeJitMul(
+        shape.in_dim / q4_0_values_per_block,
+        q4_0_block_bytes,
+    );
+    if (weight_bytes.len != try liveRuntimeJitMul(shape.out_dim, weight_row_bytes)) {
+        return error.CudaJitQualificationInvalidReferenceShape;
+    }
+
+    const weight_row = try allocator.alloc(f32, shape.in_dim);
+    defer allocator.free(weight_row);
+    const sample_count = @min(shape.out_dim, live_runtime_jit_sampled_output_count);
+    var result = LiveRuntimeJitErrors{};
+    for (0..sample_count) |sample_index| {
+        const output_row = if (sample_count == 1)
+            0
+        else
+            @as(usize, @intCast(
+                (@as(u128, sample_index) * @as(u128, shape.out_dim - 1)) /
+                    @as(u128, sample_count - 1),
+            ));
+        try quant_codec.dequantizeRow(
+            .{ .known = .Q4_0 },
+            weight_bytes,
+            shape.in_dim,
+            output_row,
+            weight_row,
+        );
+        for (0..shape.rows) |input_row_index| {
+            const input_row = input[input_row_index * shape.in_dim ..][0..shape.in_dim];
+            const expected = [_]f32{liveRuntimeJitCpuDot(input_row, weight_row)};
+            const output_index = input_row_index * shape.out_dim + output_row;
+            result.merge(try compareLiveRuntimeJitF32(
+                &expected,
+                baseline[output_index..][0..1],
+            ));
+            result.merge(try compareLiveRuntimeJitF32(
+                &expected,
+                candidate[output_index..][0..1],
+            ));
+        }
+    }
+    return result;
+}
+
+fn liveRuntimeJitCpuGelu(value: f32) f32 {
+    const inner = 0.7978845608028654 *
+        (value + 0.044715 * value * value * value);
+    return 0.5 * value * (1.0 + std.math.tanh(inner));
+}
+
+// The production pair-Q8 kernel is only eligible for the full E4B shape, so a
+// reduced-shape fixture cannot reach it. Instead, independently reconstruct a
+// sparse set of complete output quantization blocks. The samples span the
+// first two blocks, an interior block, and the final block, which covers both
+// weight-row indexing and output-block boundary behavior without materializing
+// either 100 MiB dense weight matrix.
+fn liveRuntimeJitCpuPairQ8ReferenceErrors(
+    allocator: std.mem.Allocator,
+    input_q8: []const u8,
+    weight_gate: []const u8,
+    weight_up: []const u8,
+    shape: LiveRuntimeJitShape,
+    baseline: []const f32,
+    candidate: []const f32,
+) !LiveRuntimeJitErrors {
+    if (shape.rows != 1 or shape.in_dim % q4_0_values_per_block != 0 or
+        shape.out_dim < q8_1_values_per_block or
+        shape.out_dim % q8_1_values_per_block != 0 or
+        baseline.len != shape.out_dim or candidate.len != shape.out_dim)
+    {
+        return error.CudaJitQualificationInvalidReferenceShape;
+    }
+
+    const input = try allocator.alloc(f32, shape.in_dim);
+    defer allocator.free(input);
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q8_1 }, input_q8, input);
+    const weight_row = try allocator.alloc(f32, shape.in_dim);
+    defer allocator.free(weight_row);
+    const weight_row_bytes = try liveRuntimeJitMul(
+        shape.in_dim / q4_0_values_per_block,
+        q4_0_block_bytes,
+    );
+    const expected_weight_bytes = try liveRuntimeJitMul(shape.out_dim, weight_row_bytes);
+    if (weight_gate.len != expected_weight_bytes or weight_up.len != expected_weight_bytes) {
+        return error.CudaJitQualificationInvalidReferenceShape;
+    }
+    const output_blocks = shape.out_dim / q8_1_values_per_block;
+    const sample_blocks = [_]usize{ 0, 1, output_blocks / 2, output_blocks - 1 };
+    var result = LiveRuntimeJitErrors{};
+
+    for (sample_blocks) |block_index| {
+        var activated: [q8_1_values_per_block]f32 = undefined;
+        for (&activated, 0..) |*value, lane| {
+            const output_index = block_index * q8_1_values_per_block + lane;
+            const gate_row = weight_gate[output_index * weight_row_bytes ..][0..weight_row_bytes];
+            try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, gate_row, weight_row);
+            const gate = liveRuntimeJitCpuDot(input, weight_row);
+            const up_row = weight_up[output_index * weight_row_bytes ..][0..weight_row_bytes];
+            try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, up_row, weight_row);
+            const up = liveRuntimeJitCpuDot(input, weight_row);
+            value.* = liveRuntimeJitCpuGelu(gate) * up;
+        }
+
+        var expected_q8: [q8_1_block_bytes]u8 = undefined;
+        quant_codec.quantizeQ8_1Block(&activated, &expected_q8);
+        var expected: [q8_1_values_per_block]f32 = undefined;
+        try quant_codec.dequantizeToFloat32(.{ .known = .Q8_1 }, &expected_q8, &expected);
+        const output_offset = block_index * q8_1_values_per_block;
+        result.merge(try compareLiveRuntimeJitF32(
+            &expected,
+            baseline[output_offset..][0..q8_1_values_per_block],
+        ));
+        result.merge(try compareLiveRuntimeJitF32(
+            &expected,
+            candidate[output_offset..][0..q8_1_values_per_block],
+        ));
+    }
+    return result;
+}
+
+// The down-Q8 route also has one exact E4B shape. Sample both sides of its
+// four-column launch tiles, a 32-column boundary, the midpoint, and the final
+// two output rows using a scalar Q8-by-Q4 reference.
+fn liveRuntimeJitCpuDownQ8ReferenceErrors(
+    allocator: std.mem.Allocator,
+    input_q8: []const u8,
+    weight_bytes: []const u8,
+    shape: LiveRuntimeJitShape,
+    baseline: []const f32,
+    candidate: []const f32,
+) !LiveRuntimeJitErrors {
+    if (shape.rows != 1 or shape.in_dim % q4_0_values_per_block != 0 or
+        shape.out_dim < 33 or baseline.len != shape.out_dim or
+        candidate.len != shape.out_dim)
+    {
+        return error.CudaJitQualificationInvalidReferenceShape;
+    }
+
+    const input = try allocator.alloc(f32, shape.in_dim);
+    defer allocator.free(input);
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q8_1 }, input_q8, input);
+    const weight_row = try allocator.alloc(f32, shape.in_dim);
+    defer allocator.free(weight_row);
+    const weight_row_bytes = try liveRuntimeJitMul(
+        shape.in_dim / q4_0_values_per_block,
+        q4_0_block_bytes,
+    );
+    if (weight_bytes.len != try liveRuntimeJitMul(shape.out_dim, weight_row_bytes)) {
+        return error.CudaJitQualificationInvalidReferenceShape;
+    }
+    const sample_outputs = [_]usize{
+        0,
+        3,
+        4,
+        31,
+        32,
+        shape.out_dim / 2,
+        shape.out_dim - 2,
+        shape.out_dim - 1,
+    };
+    var result = LiveRuntimeJitErrors{};
+    for (sample_outputs) |output_index| {
+        const weight_row_raw = weight_bytes[output_index * weight_row_bytes ..][0..weight_row_bytes];
+        try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, weight_row_raw, weight_row);
+        const expected = [_]f32{liveRuntimeJitCpuDot(input, weight_row)};
+        result.merge(try compareLiveRuntimeJitF32(&expected, baseline[output_index..][0..1]));
+        result.merge(try compareLiveRuntimeJitF32(&expected, candidate[output_index..][0..1]));
+    }
+    return result;
+}
+
+fn timeLiveRuntimeJitStep(step: LiveRuntimeJitStep) !u64 {
+    const pair = try step.ctx.beginProfileEventPair();
+    try step.run();
+    const elapsed_us = try step.ctx.endProfileEventPairUs(pair);
+    return @max(try std.math.mul(u64, elapsed_us, std.time.ns_per_us), 1);
+}
+
+fn qualifyLiveRuntimeJitTimings(
+    baseline: LiveRuntimeJitStep,
+    candidate: LiveRuntimeJitStep,
+    errors: LiveRuntimeJitErrors,
+    cancellation: ?RuntimeJitCancellation,
+) !?kernel_jit.QualificationRecord {
+    for (0..kernel_jit.warmup_repeats) |repeat| {
+        if (cancellation) |value| if (value.isCanceled()) return error.KernelJitCanceled;
+        if (repeat % 2 == 0) {
+            try baseline.run();
+            try candidate.run();
+        } else {
+            try candidate.run();
+            try baseline.run();
+        }
+        try baseline.ctx.synchronize();
+    }
+
+    var baseline_nanos: [kernel_jit.measurement_repeats]u64 = undefined;
+    var candidate_nanos: [kernel_jit.measurement_repeats]u64 = undefined;
+    for (0..kernel_jit.measurement_repeats) |repeat| {
+        if (cancellation) |value| if (value.isCanceled()) return error.KernelJitCanceled;
+        if (repeat % 2 == 0) {
+            baseline_nanos[repeat] = try timeLiveRuntimeJitStep(baseline);
+            candidate_nanos[repeat] = try timeLiveRuntimeJitStep(candidate);
+        } else {
+            candidate_nanos[repeat] = try timeLiveRuntimeJitStep(candidate);
+            baseline_nanos[repeat] = try timeLiveRuntimeJitStep(baseline);
+        }
+    }
+    const evidence = try kernel_jit.evidenceFromPairedNanos(
+        0,
+        true,
+        &baseline_nanos,
+        &candidate_nanos,
+    );
+    if (!kernel_jit.qualifies(evidence)) return null;
+    return .{
+        .candidate_index = 0,
+        .repeat_count = kernel_jit.measurement_repeats,
+        .correctness_passed = true,
+        .measured_speedup = evidence.measured_speedup,
+        .minimum_repeat_speedup = evidence.minimum_repeat_speedup,
+        .max_absolute_error = errors.max_absolute,
+        .max_relative_error = errors.max_relative,
+    };
+}
+
+const LiveRuntimeJitFixtureResult = struct {
+    errors: LiveRuntimeJitErrors,
+    correctness_passed: bool,
+    record: ?kernel_jit.QualificationRecord = null,
+};
+
+fn qualifyLiveRuntimeJitFixture(
+    request: RuntimeJitQualificationRequest,
+    route: LiveRuntimeJitRoute,
+    fixture: LiveRuntimeJitFixture,
+) !LiveRuntimeJitFixtureResult {
+    try request.checkCanceled();
+    const shape = fixture.shape;
+    const input_count = try liveRuntimeJitMul(shape.rows, shape.in_dim);
+    const output_count = try liveRuntimeJitMul(shape.rows, shape.out_dim);
+    const row_blocks = shape.in_dim / q4_0_values_per_block;
+    const weight_bytes = try liveRuntimeJitMul(
+        try liveRuntimeJitMul(shape.out_dim, row_blocks),
+        q4_0_block_bytes,
+    );
+    const q8_input = route == .pair_q8 or route == .down_q8;
+    const q8_output = route == .pair_q8;
+    const paired = route == .pair or route == .pair_q8;
+
+    const input_host = try request.allocator.alloc(f32, input_count);
+    defer request.allocator.free(input_host);
+    try fillLiveRuntimeJitInput(input_host, shape);
+    const input_q8_host = if (q8_input)
+        try quant_codec.quantizeQ8_1FromF32(request.allocator, input_host)
+    else
+        null;
+    defer if (input_q8_host) |bytes| request.allocator.free(bytes);
+    const input_bytes: []const u8 = if (input_q8_host) |bytes|
+        bytes
+    else
+        std.mem.sliceAsBytes(input_host);
+
+    const weight_host = try request.allocator.alloc(u8, weight_bytes);
+    defer request.allocator.free(weight_host);
+    try fillLiveRuntimeJitQ4_0(weight_host, row_blocks, false);
+    const weight_b_host = if (paired) try request.allocator.alloc(u8, weight_bytes) else null;
+    defer if (weight_b_host) |bytes| request.allocator.free(bytes);
+    if (weight_b_host) |bytes| try fillLiveRuntimeJitQ4_0(bytes, row_blocks, true);
+    try request.checkCanceled();
+
+    const output_bytes = if (q8_output)
+        try liveRuntimeJitMul(output_count / q8_1_values_per_block, q8_1_block_bytes)
+    else
+        try liveRuntimeJitMul(output_count, @sizeOf(f32));
+
+    var input = try buffer_mod.DeviceBuffer.alloc(request.ctx, input_bytes.len);
+    defer input.free(request.ctx);
+    var weight = try buffer_mod.DeviceBuffer.alloc(request.ctx, weight_bytes);
+    defer weight.free(request.ctx);
+    var weight_b = if (paired)
+        try buffer_mod.DeviceBuffer.alloc(request.ctx, weight_bytes)
+    else
+        buffer_mod.DeviceBuffer{};
+    defer weight_b.free(request.ctx);
+    var baseline_output = try buffer_mod.DeviceBuffer.alloc(request.ctx, output_bytes);
+    defer baseline_output.free(request.ctx);
+    var candidate_output = try buffer_mod.DeviceBuffer.alloc(request.ctx, output_bytes);
+    defer candidate_output.free(request.ctx);
+    var baseline_output_b = if (route == .pair)
+        try buffer_mod.DeviceBuffer.alloc(request.ctx, output_bytes)
+    else
+        buffer_mod.DeviceBuffer{};
+    defer baseline_output_b.free(request.ctx);
+    var candidate_output_b = if (route == .pair)
+        try buffer_mod.DeviceBuffer.alloc(request.ctx, output_bytes)
+    else
+        buffer_mod.DeviceBuffer{};
+    defer candidate_output_b.free(request.ctx);
+
+    try input.copyFromHost(request.ctx, input_bytes);
+    try weight.copyFromHost(request.ctx, weight_host);
+    if (weight_b_host) |bytes| try weight_b.copyFromHost(request.ctx, bytes);
+    try request.ctx.synchronize();
+    try request.checkCanceled();
+
+    var candidate_module = try liveRuntimeJitCandidateModule(request);
+    const baseline_step = LiveRuntimeJitStep{
+        .route = route,
+        .generated = false,
+        .module = request.module,
+        .ctx = request.ctx,
+        .output = baseline_output,
+        .output_b = baseline_output_b,
+        .input = input,
+        .weight = weight,
+        .weight_b = weight_b,
+        .shape = shape,
+    };
+    const candidate_step = LiveRuntimeJitStep{
+        .route = route,
+        .generated = true,
+        .module = &candidate_module,
+        .ctx = request.ctx,
+        .output = candidate_output,
+        .output_b = candidate_output_b,
+        .input = input,
+        .weight = weight,
+        .weight_b = weight_b,
+        .shape = shape,
+    };
+
+    try baseline_step.run();
+    var errors = LiveRuntimeJitErrors{};
+    if (q8_output) {
+        const baseline_raw = try request.allocator.alloc(u8, output_bytes);
+        defer request.allocator.free(baseline_raw);
+        const candidate_raw = try request.allocator.alloc(u8, output_bytes);
+        defer request.allocator.free(candidate_raw);
+        @memset(candidate_raw, 0x7f);
+        try candidate_output.copyFromHost(request.ctx, candidate_raw);
+        try candidate_step.run();
+        try baseline_output.copyToHost(request.ctx, baseline_raw);
+        try candidate_output.copyToHost(request.ctx, candidate_raw);
+        try request.ctx.synchronize();
+        const baseline_f32 = try request.allocator.alloc(f32, output_count);
+        defer request.allocator.free(baseline_f32);
+        const candidate_f32 = try request.allocator.alloc(f32, output_count);
+        defer request.allocator.free(candidate_f32);
+        try quant_codec.dequantizeToFloat32(.{ .known = .Q8_1 }, baseline_raw, baseline_f32);
+        try quant_codec.dequantizeToFloat32(.{ .known = .Q8_1 }, candidate_raw, candidate_f32);
+        errors = try compareLiveRuntimeJitF32(baseline_f32, candidate_f32);
+        errors.merge(try liveRuntimeJitCpuPairQ8ReferenceErrors(
+            request.allocator,
+            input_q8_host.?,
+            weight_host,
+            weight_b_host.?,
+            shape,
+            baseline_f32,
+            candidate_f32,
+        ));
+    } else {
+        const baseline_f32 = try request.allocator.alloc(f32, output_count);
+        defer request.allocator.free(baseline_f32);
+        const candidate_f32 = try request.allocator.alloc(f32, output_count);
+        defer request.allocator.free(candidate_f32);
+        @memset(candidate_f32, std.math.nan(f32));
+        try candidate_output.copyFromHost(request.ctx, std.mem.sliceAsBytes(candidate_f32));
+        try candidate_step.run();
+        try baseline_output.copyToHost(request.ctx, std.mem.sliceAsBytes(baseline_f32));
+        try candidate_output.copyToHost(request.ctx, std.mem.sliceAsBytes(candidate_f32));
+        if (route == .pair) {
+            const baseline_b = try request.allocator.alloc(f32, output_count);
+            defer request.allocator.free(baseline_b);
+            const candidate_b = try request.allocator.alloc(f32, output_count);
+            defer request.allocator.free(candidate_b);
+            @memset(candidate_b, std.math.nan(f32));
+            try candidate_output_b.copyFromHost(request.ctx, std.mem.sliceAsBytes(candidate_b));
+            // Re-run after poisoning both candidate outputs: a fused kernel must
+            // prove that it writes the complete output bundle in one launch.
+            @memset(candidate_f32, std.math.nan(f32));
+            try candidate_output.copyFromHost(request.ctx, std.mem.sliceAsBytes(candidate_f32));
+            try candidate_step.run();
+            try candidate_output.copyToHost(request.ctx, std.mem.sliceAsBytes(candidate_f32));
+            try baseline_output_b.copyToHost(request.ctx, std.mem.sliceAsBytes(baseline_b));
+            try candidate_output_b.copyToHost(request.ctx, std.mem.sliceAsBytes(candidate_b));
+            try request.ctx.synchronize();
+            errors.merge(try compareLiveRuntimeJitF32(baseline_b, candidate_b));
+            if (fixture.measure) {
+                errors.merge(try liveRuntimeJitCpuSampledQ4ReferenceErrors(
+                    request.allocator,
+                    input_host,
+                    weight_b_host.?,
+                    shape,
+                    baseline_b,
+                    candidate_b,
+                ));
+            } else {
+                const reference_b = try liveRuntimeJitCpuQ4Reference(
+                    request.allocator,
+                    input_host,
+                    weight_b_host.?,
+                    shape,
+                );
+                defer request.allocator.free(reference_b);
+                errors.merge(try compareLiveRuntimeJitF32(reference_b, baseline_b));
+                errors.merge(try compareLiveRuntimeJitF32(reference_b, candidate_b));
+            }
+        } else {
+            try request.ctx.synchronize();
+        }
+        errors.merge(try compareLiveRuntimeJitF32(baseline_f32, candidate_f32));
+        if (route == .down_q8) {
+            errors.merge(try liveRuntimeJitCpuDownQ8ReferenceErrors(
+                request.allocator,
+                input_q8_host.?,
+                weight_host,
+                shape,
+                baseline_f32,
+                candidate_f32,
+            ));
+        } else if (fixture.measure) {
+            errors.merge(try liveRuntimeJitCpuSampledQ4ReferenceErrors(
+                request.allocator,
+                input_host,
+                weight_host,
+                shape,
+                baseline_f32,
+                candidate_f32,
+            ));
+        } else {
+            const reference = try liveRuntimeJitCpuQ4Reference(
+                request.allocator,
+                input_host,
+                weight_host,
+                shape,
+            );
+            defer request.allocator.free(reference);
+            errors.merge(try compareLiveRuntimeJitF32(reference, baseline_f32));
+            errors.merge(try compareLiveRuntimeJitF32(reference, candidate_f32));
+        }
+    }
+    try request.checkCanceled();
+
+    const tolerance: f64 = 0.01;
+    if (errors.max_absolute > tolerance) {
+        std.log.warn(
+            "CUDA runtime JIT correctness rejected {s} rows={d} in={d} out={d}: max_abs={d:.6} tolerance={d:.6}",
+            .{ request.artifact.kernel_id, shape.rows, shape.in_dim, shape.out_dim, errors.max_absolute, tolerance },
+        );
+        return .{ .errors = errors, .correctness_passed = false };
+    }
+    if (!fixture.measure) return .{ .errors = errors, .correctness_passed = true };
+    const record = try qualifyLiveRuntimeJitTimings(
+        baseline_step,
+        candidate_step,
+        errors,
+        request.cancellation,
+    );
+    if (record == null) {
+        std.log.warn(
+            "CUDA runtime JIT timing rejected {s} rows={d} in={d} out={d}: requires median and every repeat >= {d:.2}x",
+            .{ request.artifact.kernel_id, shape.rows, shape.in_dim, shape.out_dim, kernel_jit.minimum_speedup },
+        );
+    }
+    return .{ .errors = errors, .correctness_passed = true, .record = record };
+}
+
+fn liveRuntimeJitQualification(
+    _: ?*anyopaque,
+    request: RuntimeJitQualificationRequest,
+) !?kernel_jit.QualificationRecord {
+    const route = liveRuntimeJitRoute(request.artifact) orelse
+        return error.CudaJitQualificationUnsupported;
+    const conformance = LiveRuntimeJitConformance.forRoute(route, request.scope);
+    var aggregate_errors = LiveRuntimeJitErrors{};
+    var aggregate_record: ?kernel_jit.QualificationRecord = null;
+    for (conformance.fixtures[0..conformance.count]) |fixture| {
+        const result = try qualifyLiveRuntimeJitFixture(request, route, fixture);
+        aggregate_errors.merge(result.errors);
+        if (!result.correctness_passed) return null;
+        if (!fixture.measure) continue;
+        const record = result.record orelse return null;
+        if (aggregate_record) |*aggregate| {
+            aggregate.measured_speedup = @min(aggregate.measured_speedup, record.measured_speedup);
+            aggregate.minimum_repeat_speedup = @min(
+                aggregate.minimum_repeat_speedup,
+                record.minimum_repeat_speedup,
+            );
+        } else {
+            aggregate_record = record;
+        }
+    }
+    var qualified = aggregate_record orelse return null;
+    qualified.max_absolute_error = aggregate_errors.max_absolute;
+    qualified.max_relative_error = aggregate_errors.max_relative;
+    std.log.info(
+        "CUDA runtime JIT qualified {s}: fixtures={d} median_floor={d:.3} worst_floor={d:.3} max_abs={d:.6}",
+        .{
+            request.artifact.kernel_id,
+            conformance.count,
+            qualified.measured_speedup,
+            qualified.minimum_repeat_speedup,
+            qualified.max_absolute_error,
+        },
+    );
+    return qualified;
+}
+
+fn handleRuntimeJitFailure(
+    mode: kernel_jit.Mode,
+    required_route: bool,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    stage: []const u8,
+    message: []const u8,
+    detail: []const u8,
+) !void {
+    if (detail.len == 0) {
+        std.log.warn("CUDA runtime JIT {s} failed for {s}: {s}", .{ stage, artifact.kernel_id, message });
+    } else {
+        std.log.warn("CUDA runtime JIT {s} failed for {s}: {s}: {s}", .{ stage, artifact.kernel_id, message, detail });
+    }
+    if (mode.failClosed() and required_route) return error.CudaJitRequiredRouteFailed;
+}
+
+fn handleRuntimeJitLoadFailure(mode: kernel_jit.Mode, err: anyerror) !void {
+    if (mode.failClosed()) {
+        std.log.warn(
+            "CUDA runtime JIT required scope failed before activation: {s}",
+            .{@errorName(err)},
+        );
+        return error.CudaJitRequiredRouteFailed;
+    }
+    std.log.warn("CUDA runtime JIT unavailable; using bundled kernels: {s}", .{@errorName(err)});
+}
+
+fn handleRuntimeJitCacheFailure(stage: []const u8, message: []const u8) void {
+    std.log.warn("CUDA runtime JIT cache {s} failed: {s}", .{ stage, message });
+}
+
+fn runtimeJitBaseline(artifact: quant_kernel_compiler.GeneratedArtifact) []const u8 {
+    if (artifact.cuda_kernel) |kind| return cuda_kernel_renderer.planFor(kind).production_baseline;
+    if (artifact.cuda_attention_kernel) |kind| return cuda_kernel_renderer.attentionPlanFor(kind).production_baseline;
+    return artifact.source_path;
+}
+
+fn runtimeJitCompileKey(
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    source: []const u8,
+    target_identity: []const u8,
+    compiler_identity: []const u8,
+    compiler_options: []const u8,
+) kernel_jit.ArtifactKey {
+    return kernel_jit.compileArtifactKey(.{
+        .backend = .cuda,
+        .semantic_identity = artifact.kernel_id,
+        .runtime_identity = @tagName(artifact.opKind()),
+        .target_identity = target_identity,
+        .device_identity = "",
+        .schedule_identity = artifact.source_path,
+        .baseline_identity = "",
+        .compiler_identity = compiler_identity,
+        .compiler_options = compiler_options,
+        .source = source,
+    });
+}
+
+fn runtimeJitQualificationKey(
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    scope: JitRouteScope,
+    compile_key: kernel_jit.ArtifactKey,
+    candidate_ptx_sha256: kernel_jit.ArtifactKey,
+    bundled_image_sha256: []const u8,
+    device_identity: []const u8,
+) kernel_jit.ArtifactKey {
+    var conformance_hex_buffer: [@sizeOf(kernel_jit.ArtifactKey) * 2]u8 = @splat('0');
+    if (liveRuntimeJitRoute(artifact)) |route| {
+        const conformance = LiveRuntimeJitConformance.forRoute(route, scope);
+        conformance_hex_buffer = std.fmt.bytesToHex(conformance.identity(route), .lower);
+    }
+    var baseline_identity_buffer: [1024]u8 = undefined;
+    const baseline_identity = std.fmt.bufPrint(
+        &baseline_identity_buffer,
+        "{s};artifact_mode={s};artifact_format={s};artifact_target={s};artifact_image_sha256={s};bundle_sha256={s};qualifier_sha256={s};dispatch_sha256={s};conformance_sha256={s}",
+        .{
+            runtimeJitBaseline(artifact),
+            cuda_artifact.mode,
+            cuda_artifact.format,
+            cuda_artifact.target,
+            bundled_image_sha256,
+            build_options.cuda_jit_baseline_implementation_sha256,
+            build_options.cuda_jit_qualification_implementation_sha256,
+            build_options.cuda_jit_dispatch_implementation_sha256,
+            &conformance_hex_buffer,
+        },
+    ) catch unreachable;
+    const compile_key_hex = kernel_jit.artifactKeyHex(compile_key);
+    return kernel_jit.artifactKey(.{
+        .backend = .cuda,
+        .semantic_identity = artifact.kernel_id,
+        .runtime_identity = @tagName(artifact.opKind()),
+        .target_identity = &compile_key_hex,
+        .device_identity = device_identity,
+        .schedule_identity = &conformance_hex_buffer,
+        .baseline_identity = baseline_identity,
+        .compiler_identity = "",
+        .compiler_options = "",
+        .source = &candidate_ptx_sha256,
+    });
+}
+
+fn runtimeJitSha256(bytes: []const u8) kernel_jit.ArtifactKey {
+    var digest: kernel_jit.ArtifactKey = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return digest;
+}
+
+fn cudaBundledImageSha256Hex() [std.crypto.hash.sha2.Sha256.digest_length * 2]u8 {
+    return std.fmt.bytesToHex(runtimeJitSha256(cuda_artifact.image), .lower);
+}
+
+fn loadRuntimeJitCachedPtx(
+    cache: ?*kernel_jit.ArtifactCache,
+    key: kernel_jit.ArtifactKey,
+) !?[]u8 {
+    const value = cache orelse return null;
+    return value.load(.cuda_ptx, key);
+}
+
+fn validRuntimeJitPtx(ptx: []const u8) bool {
+    return ptx.len > 0 and ptx.len <= nvrtc_mod.max_ptx_bytes and ptx[ptx.len - 1] == 0;
+}
+
+fn loadRuntimeJitQualification(
+    allocator: std.mem.Allocator,
+    cache: ?*kernel_jit.ArtifactCache,
+    key: kernel_jit.ArtifactKey,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+) ?kernel_jit.QualificationRecord {
+    const value = cache orelse return null;
+    const encoded = value.load(.qualification, key) catch |err| {
+        handleRuntimeJitCacheFailure("qualification load", @errorName(err));
+        return null;
+    } orelse return null;
+    defer allocator.free(encoded);
+    const record = kernel_jit.QualificationRecord.decode(encoded) catch |err| {
+        std.log.warn(
+            "CUDA runtime JIT qualification for {s} is invalid: {s}",
+            .{ artifact.kernel_id, @errorName(err) },
+        );
+        return null;
+    };
+    return if (record.eligible()) record else null;
+}
+
+const RuntimeJitQualificationResolution = struct {
+    record: ?kernel_jit.QualificationRecord = null,
+    measured_live: bool = false,
+};
+
+fn resolveRuntimeJitQualification(
+    mode: kernel_jit.Mode,
+    required_route: bool,
+    cached: ?kernel_jit.QualificationRecord,
+    qualifier: ?RuntimeJitQualifier,
+    request: RuntimeJitQualificationRequest,
+) !RuntimeJitQualificationResolution {
+    if (cached) |record| return .{ .record = record };
+    _ = mode;
+    if (!required_route) return .{};
+    const runner = qualifier orelse return .{ .measured_live = true };
+    const measured = try runner.run(request);
+    return .{
+        .record = if (measured) |record| if (record.eligible()) record else null else null,
+        .measured_live = true,
+    };
+}
+
+fn shouldActivateRuntimeJitArtifact(
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    mode: kernel_jit.Mode,
+    required_route: bool,
+    qualified: bool,
+) !bool {
+    if (!artifact.production_enabled or !required_route or !mode.activates()) return false;
+    if (qualified) return true;
+    if (mode.failClosed()) return error.CudaJitRequiredRouteUnqualified;
+    return false;
+}
+
+fn ensureRuntimeJitRequiredComplete(
+    mode: kernel_jit.Mode,
+    pending: JitProductionRoutes,
+) !void {
+    if (mode.failClosed() and pending.any()) return error.CudaJitRequiredRouteFailed;
+}
+
+test "CUDA runtime JIT mappings cover complete artifact function bundles" {
+    var module = KernelModule{};
+    var cuda_artifacts: usize = 0;
+    var attention_artifacts: usize = 0;
+    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+        if (artifact.backend != .cuda) continue;
+        cuda_artifacts += 1;
+        const mapping = module.generatedFunctionMapping(artifact) orelse
+            return error.MissingCudaRuntimeJitFunctionMapping;
+        try std.testing.expectEqualStrings(artifact.kernel_id, mapping.names[0]);
+        const expected_count: usize = if (artifact.cuda_attention_kernel == null)
+            1
+        else switch (artifact.cuda_attention_kernel.?) {
+            .gqa_decode_score_prework_hd256_f32, .gqa_decode_score_prework_hd512_f32 => @as(usize, 2),
+            else => @as(usize, 3),
+        };
+        try std.testing.expectEqual(expected_count, mapping.count);
+        if (artifact.cuda_attention_kernel != null) attention_artifacts += 1;
+        for (0..mapping.count) |index| {
+            try std.testing.expect(mapping.slots[index] != null);
+            try std.testing.expect(mapping.names[index].len > 0);
+        }
+    }
+    try std.testing.expect(cuda_artifacts > 0);
+    try std.testing.expect(attention_artifacts > 0);
+}
+
+test "CUDA runtime JIT profile scope covers only Gemma4 production routes" {
+    inline for (.{
+        JitModelProfile.clipclap,
+        JitModelProfile.deberta_reranker,
+        JitModelProfile.gliner2,
+        JitModelProfile.florence2,
+    }) |profile| {
+        try std.testing.expect(!JitRouteScope.maximumForProfile(profile).enabled());
+    }
+
+    const scope = JitRouteScope.maximumForProfile(.gemma4);
+    try std.testing.expect(scope.enabled());
+    try std.testing.expect(scope.production.mmv);
+    try std.testing.expect(scope.production.mm);
+    try std.testing.expect(scope.production.pair);
+    try std.testing.expect(scope.production.pair_q8);
+    try std.testing.expect(scope.production.down_q8);
+    var selected: usize = 0;
+    var production: usize = 0;
+    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+        if (artifact.backend != .cuda) continue;
+        if (artifact.production_enabled) production += 1;
+        if (!scope.includesArtifact(artifact)) continue;
+        selected += 1;
+        try std.testing.expect(artifact.production_enabled);
+        try std.testing.expect(liveRuntimeJitRoute(artifact) != null);
+    }
+    try std.testing.expectEqual(@as(usize, 5), production);
+    try std.testing.expectEqual(production, selected);
+}
+
+test "CUDA runtime JIT required mode rejects an empty model scope before CUDA access" {
+    try std.testing.expectError(
+        error.CudaJitRequiredRouteFailed,
+        KernelModule.loadWithKernelJitForScope(
+            @ptrFromInt(4096),
+            std.testing.allocator,
+            .{ .mode = .required },
+            .gliner2,
+            .{},
+        ),
+    );
+}
+
+test "CUDA runtime JIT load context gates all live work before CUDA access" {
+    const scope = JitRouteScope.maximumForProfile(.gemma4);
+    try std.testing.expectEqual(
+        RuntimeJitLoadDisposition.bundled,
+        runtimeJitLoadDisposition(.on, scope, .dynamic),
+    );
+    try std.testing.expectEqual(
+        RuntimeJitLoadDisposition.bundled,
+        runtimeJitLoadDisposition(.shadow, scope, .dynamic),
+    );
+    try std.testing.expectEqual(
+        RuntimeJitLoadDisposition.qualify,
+        runtimeJitLoadDisposition(.on, scope, .startup_preload),
+    );
+    try std.testing.expectEqual(
+        RuntimeJitLoadDisposition.reject_required,
+        runtimeJitLoadDisposition(.required, scope, .dynamic),
+    );
+    try std.testing.expectError(
+        error.CudaJitRequiredRouteFailed,
+        KernelModule.loadWithKernelJitForScope(
+            @ptrFromInt(4096),
+            std.testing.allocator,
+            .{ .mode = .required },
+            .gemma4,
+            scope,
+        ),
+    );
+}
+
+test "CUDA runtime JIT route builder derives required scope from observed Q4_0 shapes" {
+    var unsupported = JitRouteScopeBuilder.init(.gliner2);
+    unsupported.observeQ4_0Matrix("model.layers.0.mlp.gate_proj.weight", 10240, 2560, true);
+    try std.testing.expect(!unsupported.finish().enabled());
+
+    var generic = JitRouteScopeBuilder.init(.gemma4);
+    generic.observeQ4_0Matrix("model.layers.0.self_attn.q_proj.weight", 2048, 1536, true);
+    const generic_scope = generic.finish();
+    try std.testing.expect(generic_scope.production.mmv);
+    try std.testing.expect(generic_scope.production.mm);
+    try std.testing.expect(!generic_scope.production.pair);
+    try std.testing.expect(!generic_scope.production.pair_q8);
+    try std.testing.expect(!generic_scope.production.down_q8);
+
+    var decode_only = JitRouteScopeBuilder.init(.gemma4);
+    decode_only.observeQ4_0Matrix("model.layers.0.self_attn.q_proj.weight", 2048, 1536, false);
+    const decode_scope = decode_only.finish();
+    try std.testing.expect(decode_scope.production.mmv);
+    try std.testing.expect(!decode_scope.production.mm);
+
+    var e2b = JitRouteScopeBuilder.init(.gemma4);
+    e2b.observeQ4_0Matrix("model.layers.0.mlp.gate_proj.weight", 8960, 1536, true);
+    e2b.observeQ4_0Matrix("model.layers.0.mlp.up_proj.weight", 8960, 1536, true);
+    e2b.observeQ4_0Matrix("model.layers.0.mlp.down_proj.weight", 1536, 8960, true);
+    const e2b_scope = e2b.finish();
+    try std.testing.expect(e2b_scope.production.pair);
+    try std.testing.expect(!e2b_scope.production.pair_q8);
+    try std.testing.expect(!e2b_scope.production.down_q8);
+
+    var e4b = JitRouteScopeBuilder.init(.gemma4);
+    e4b.observeQ4_0Matrix("model.layers.0.mlp.gate_proj.weight", 10240, 2560, true);
+    e4b.observeQ4_0Matrix("model.layers.0.mlp.up_proj.weight", 10240, 2560, true);
+    e4b.observeQ4_0Matrix("model.layers.0.mlp.down_proj.weight", 2560, 10240, true);
+    // Later heterogeneous layers must not erase an already reachable trio.
+    e4b.observeQ4_0Matrix("model.layers.1.mlp.gate_proj.weight", 8960, 1536, true);
+    e4b.observeQ4_0Matrix("model.layers.1.mlp.up_proj.weight", 6144, 1536, true);
+    e4b.observeQ4_0Matrix("model.layers.1.mlp.down_proj.weight", 1536, 6144, true);
+    const e4b_scope = e4b.finish();
+    try std.testing.expect(e4b_scope.production.pair);
+    try std.testing.expect(e4b_scope.production.pair_q8);
+    try std.testing.expect(e4b_scope.production.down_q8);
+}
+
+test "CUDA runtime JIT conformance covers row boundaries tails and observed shapes" {
+    var builder = JitRouteScopeBuilder.init(.gemma4);
+    builder.observeQ4_0Matrix("model.layers.0.mlp.gate_proj.weight", 8960, 1536, true);
+    builder.observeQ4_0Matrix("model.layers.0.mlp.up_proj.weight", 8960, 1536, true);
+    builder.observeQ4_0Matrix("model.layers.0.mlp.down_proj.weight", 1536, 8960, true);
+    const scope = builder.finish();
+    try std.testing.expect(scope.conformance_complete);
+    try std.testing.expect(scope.observed_shape_count >= 2);
+    try std.testing.expectEqual(@as(usize, 1), scope.pair_shape_count);
+
+    const mm = LiveRuntimeJitConformance.forRoute(.mm, scope);
+    var saw_min_rows_tail = false;
+    var saw_max_rows_tail = false;
+    var saw_observed = false;
+    var saw_observed_min_rows = false;
+    var saw_observed_max_rows = false;
+    for (mm.fixtures[0..mm.count]) |fixture| {
+        if (fixture.shape.rows == 9 and fixture.shape.in_dim == 512 and fixture.shape.out_dim == 33) {
+            saw_min_rows_tail = true;
+        }
+        if (fixture.shape.rows == 64 and fixture.shape.in_dim == 544 and fixture.shape.out_dim == 64) {
+            saw_max_rows_tail = true;
+        }
+        if (fixture.measure and fixture.shape.rows == 22 and
+            fixture.shape.in_dim == 1536 and fixture.shape.out_dim == 8960)
+        {
+            saw_observed = true;
+        }
+        if (fixture.measure and fixture.shape.rows == 9 and
+            fixture.shape.in_dim == 1536 and fixture.shape.out_dim == 8960)
+        {
+            saw_observed_min_rows = true;
+        }
+        if (fixture.measure and fixture.shape.rows == 64 and
+            fixture.shape.in_dim == 1536 and fixture.shape.out_dim == 8960)
+        {
+            saw_observed_max_rows = true;
+        }
+    }
+    try std.testing.expect(saw_min_rows_tail);
+    try std.testing.expect(saw_max_rows_tail);
+    try std.testing.expect(saw_observed);
+    try std.testing.expect(saw_observed_min_rows);
+    try std.testing.expect(saw_observed_max_rows);
+
+    const pair = LiveRuntimeJitConformance.forRoute(.pair, scope);
+    var saw_exact_pair = false;
+    for (pair.fixtures[0..pair.count]) |fixture| {
+        if (fixture.measure and fixture.shape.rows == 1 and
+            fixture.shape.in_dim == 1536 and fixture.shape.out_dim == 8960)
+        {
+            saw_exact_pair = true;
+        }
+    }
+    try std.testing.expect(saw_exact_pair);
+}
+
+test "CUDA runtime JIT observed shape overflow fails conformance closed" {
+    var builder = JitRouteScopeBuilder.init(.gemma4);
+    var index: usize = 0;
+    while (index <= JitRouteScope.max_observed_shapes) : (index += 1) {
+        builder.observeQ4_0Matrix(
+            "model.layers.0.self_attn.q_proj.weight",
+            1024 + index,
+            512 + index * q4_0_values_per_block,
+            true,
+        );
+    }
+    const scope = builder.finish();
+    try std.testing.expect(scope.production.mmv);
+    try std.testing.expect(!scope.conformance_complete);
+    try std.testing.expectEqual(JitRouteScope.max_observed_shapes, scope.observed_shape_count);
+}
+
+test "CUDA runtime JIT sampled oracle spans rows and fixture patterns vary output rows" {
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        live_runtime_jit_conformance_policy_identity,
+        1,
+        "sampled-output8-all-input-rows",
+    ));
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        live_runtime_jit_conformance_policy_identity,
+        1,
+        "weight-pattern-bank29-row-strided",
+    ));
+
+    var row_strided_weights: [2 * live_runtime_jit_weight_pattern_count * q4_0_block_bytes]u8 = undefined;
+    try fillLiveRuntimeJitQ4_0(
+        &row_strided_weights,
+        live_runtime_jit_weight_pattern_count,
+        false,
+    );
+    const second_row_offset = live_runtime_jit_weight_pattern_count * q4_0_block_bytes;
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        row_strided_weights[0..q4_0_block_bytes],
+        row_strided_weights[second_row_offset..][0..q4_0_block_bytes],
+    ));
+
+    const shape = LiveRuntimeJitShape{ .rows = 2, .in_dim = 32, .out_dim = 15 };
+    var input: [shape.rows * shape.in_dim]f32 = undefined;
+    try fillLiveRuntimeJitInput(&input, shape);
+    try std.testing.expect(!std.mem.eql(
+        f32,
+        input[0..shape.in_dim],
+        input[shape.in_dim..][0..shape.in_dim],
+    ));
+    var raw_weight: [shape.out_dim * q4_0_block_bytes]u8 = undefined;
+    try fillLiveRuntimeJitQ4_0(&raw_weight, 1, false);
+    const reference = try liveRuntimeJitCpuQ4Reference(
+        std.testing.allocator,
+        &input,
+        &raw_weight,
+        shape,
+    );
+    defer std.testing.allocator.free(reference);
+    const candidate = try std.testing.allocator.dupe(f32, reference);
+    defer std.testing.allocator.free(candidate);
+    const clean = try liveRuntimeJitCpuSampledQ4ReferenceErrors(
+        std.testing.allocator,
+        &input,
+        &raw_weight,
+        shape,
+        reference,
+        candidate,
+    );
+    try std.testing.expectEqual(@as(f64, 0), clean.max_absolute);
+    candidate[(shape.rows - 1) * shape.out_dim + shape.out_dim - 1] += 1;
+    const corrupted = try liveRuntimeJitCpuSampledQ4ReferenceErrors(
+        std.testing.allocator,
+        &input,
+        &raw_weight,
+        shape,
+        reference,
+        candidate,
+    );
+    try std.testing.expect(corrupted.max_absolute > 0.9);
+
+    const measured_bytes = liveRuntimeJitFixtureAllocationBytes(
+        .mm,
+        .{ .shape = shape, .measure = true },
+    ).?;
+    const full_oracle_bytes = liveRuntimeJitFixtureAllocationBytes(
+        .mm,
+        .{ .shape = shape, .measure = false },
+    ).?;
+    try std.testing.expect(full_oracle_bytes > measured_bytes);
+}
+
+test "CUDA runtime JIT oversized fixture allocation fails conformance closed" {
+    const oversized = LiveRuntimeJitShape{
+        .rows = 1,
+        .in_dim = 2560,
+        .out_dim = 262_144,
+    };
+    try std.testing.expect(
+        liveRuntimeJitFixtureAllocationBytes(.pair, .{ .shape = oversized, .measure = true }).? >
+            live_runtime_jit_max_fixture_bytes,
+    );
+
+    var builder = JitRouteScopeBuilder.init(.gemma4);
+    builder.observeQ4_0Matrix(
+        "model.layers.0.self_attn.q_proj.weight",
+        oversized.out_dim,
+        oversized.in_dim,
+        true,
+    );
+    const scope = builder.finish();
+    try std.testing.expect(scope.enabled());
+    try std.testing.expect(!scope.conformance_complete);
+}
+
+test "CUDA runtime JIT qualification scopes retain bounded body and omit oversized head" {
+    var builder = JitRouteScopeBuilder.init(.gemma4);
+    builder.observeQ4_0Matrix("model.layers.0.mlp.gate_proj.weight", 10_240, 2_560, true);
+    builder.observeQ4_0Matrix("lm_head.weight", 262_144, 2_560, true);
+    const scope = builder.finish();
+    try std.testing.expect(!scope.conformance_complete);
+
+    const mmv_artifact = blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+            const route = liveRuntimeJitRoute(artifact) orelse continue;
+            if (route == .mmv) break :blk artifact;
+        }
+        return error.MissingCudaRuntimeJitProductionArtifact;
+    };
+    const mm_artifact = blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+            const route = liveRuntimeJitRoute(artifact) orelse continue;
+            if (route == .mm) break :blk artifact;
+        }
+        return error.MissingCudaRuntimeJitProductionArtifact;
+    };
+    const mmv_scopes = RuntimeJitQualificationScopes.forArtifact(mmv_artifact, scope);
+    const mm_scopes = RuntimeJitQualificationScopes.forArtifact(mm_artifact, scope);
+    try std.testing.expectEqual(@as(usize, 1), mmv_scopes.count);
+    try std.testing.expectEqual(@as(usize, 1), mm_scopes.count);
+    try std.testing.expect(!mmv_scopes.complete);
+    try std.testing.expect(!mm_scopes.complete);
+    try std.testing.expect(mmv_scopes.scopes[0].containsMmvShape(10_240, 2_560));
+    try std.testing.expect(mm_scopes.scopes[0].containsMmShape(10_240, 2_560));
+    try std.testing.expect(!mmv_scopes.scopes[0].containsMmvShape(262_144, 2_560));
+    try std.testing.expect(!mm_scopes.scopes[0].containsMmShape(262_144, 2_560));
+
+    var installed = JitRouteScope{};
+    installed.mergeQualified(mmv_scopes.scopes[0]);
+    installed.mergeQualified(mm_scopes.scopes[0]);
+    try std.testing.expect(installed.containsMmvShape(10_240, 2_560));
+    try std.testing.expect(installed.containsMmShape(10_240, 2_560));
+    try std.testing.expect(!installed.containsMmShape(262_144, 2_560));
+}
+
+test "CUDA runtime JIT negative qualification memo is exact bounded and expiring" {
+    var memo = RuntimeJitRejectionMemo{};
+    var key = [_]u8{0} ** @sizeOf(kernel_jit.ArtifactKey);
+    key[0] = 1;
+    var other = key;
+    other[0] = 2;
+    const started: u64 = 10;
+    try std.testing.expect(!memo.activeAt(key, started));
+    memo.rememberAt(key, started);
+    try std.testing.expect(memo.activeAt(key, started));
+    try std.testing.expect(!memo.activeAt(other, started));
+    try std.testing.expect(memo.activeAt(key, started + runtime_jit_rejection_ttl_ns - 1));
+    try std.testing.expect(!memo.activeAt(key, started + runtime_jit_rejection_ttl_ns));
+}
+
+test "CUDA runtime JIT live qualifier is prepublication-sync and injectable" {
+    const Fake = struct {
+        calls: usize = 0,
+        result: ?kernel_jit.QualificationRecord,
+
+        fn run(
+            raw: ?*anyopaque,
+            _: RuntimeJitQualificationRequest,
+        ) !?kernel_jit.QualificationRecord {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return self.result;
+        }
+    };
+    const artifact = blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |candidate| {
+            if (candidate.backend == .cuda and candidate.production_enabled) break :blk candidate;
+        }
+        return error.MissingCudaRuntimeJitProductionArtifact;
+    };
+    const qualified = kernel_jit.QualificationRecord{
+        .candidate_index = 0,
+        .repeat_count = kernel_jit.measurement_repeats,
+        .correctness_passed = true,
+        .measured_speedup = 1.20,
+        .minimum_repeat_speedup = 1.11,
+        .max_absolute_error = 0.001,
+        .max_relative_error = 0.01,
+    };
+    var module = KernelModule{};
+    var fake = Fake{ .result = qualified };
+    const qualifier = RuntimeJitQualifier{ .context = &fake, .runFn = Fake.run };
+    const request = RuntimeJitQualificationRequest{
+        .allocator = std.testing.allocator,
+        .ctx = @ptrFromInt(4096),
+        .module = &module,
+        .artifact = artifact,
+        .candidate_functions = [_]driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact,
+    };
+
+    const cached = try resolveRuntimeJitQualification(.on, true, qualified, qualifier, request);
+    try std.testing.expect(cached.record != null);
+    try std.testing.expect(!cached.measured_live);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+
+    inline for (.{ kernel_jit.Mode.shadow, kernel_jit.Mode.on }) |mode| {
+        const miss = try resolveRuntimeJitQualification(mode, true, null, qualifier, request);
+        try std.testing.expect(miss.record != null);
+        try std.testing.expect(miss.measured_live);
+    }
+    const irrelevant = try resolveRuntimeJitQualification(.required, false, null, qualifier, request);
+    try std.testing.expect(irrelevant.record == null);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+
+    const live = try resolveRuntimeJitQualification(.required, true, null, qualifier, request);
+    try std.testing.expect(live.record != null);
+    try std.testing.expect(live.measured_live);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+
+    var rejected = qualified;
+    rejected.minimum_repeat_speedup = 1.09;
+    fake.result = rejected;
+    const rejected_live = try resolveRuntimeJitQualification(.required, true, null, qualifier, request);
+    try std.testing.expect(rejected_live.record == null);
+    try std.testing.expect(rejected_live.measured_live);
+    try std.testing.expectEqual(@as(usize, 4), fake.calls);
+
+    const Canceling = struct {
+        fn run(
+            _: ?*anyopaque,
+            _: RuntimeJitQualificationRequest,
+        ) !?kernel_jit.QualificationRecord {
+            return error.KernelJitCanceled;
+        }
+    };
+    try std.testing.expectError(
+        error.KernelJitCanceled,
+        resolveRuntimeJitQualification(
+            .required,
+            true,
+            null,
+            .{ .runFn = Canceling.run },
+            request,
+        ),
+    );
+}
+
+test "CUDA runtime JIT required boundary canonicalizes every scoped failure" {
+    try handleRuntimeJitLoadFailure(.on, error.OutOfMemory);
+    try std.testing.expectError(
+        error.CudaJitRequiredRouteFailed,
+        handleRuntimeJitLoadFailure(.required, error.OutOfMemory),
+    );
+    try std.testing.expect(kernel_jit.isRequiredFailure(
+        .required,
+        error.CudaJitRequiredRouteFailed,
+    ));
+    try ensureRuntimeJitRequiredComplete(.on, .{ .mmv = true });
+    try std.testing.expectError(
+        error.CudaJitRequiredRouteFailed,
+        ensureRuntimeJitRequiredComplete(.required, .{ .mmv = true }),
+    );
+    try ensureRuntimeJitRequiredComplete(.required, .{});
+}
+
+test "CUDA runtime JIT expired budget does not spin waiting for process lock" {
+    try std.testing.expect(runtime_jit_process_mutex.tryLock());
+    defer runtime_jit_process_mutex.unlock();
+    const expired = RuntimeJitWorkControl{ .deadline_ns = 1 };
+    try std.testing.expect(!(try lockRuntimeJitProcess(&expired)));
+    try std.testing.expect(expired.deadlineReached());
+}
+
+test "CUDA runtime JIT activation requires exact qualification and publishes bundles atomically" {
+    const production = blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+            if (artifact.backend == .cuda and artifact.production_enabled) break :blk artifact;
+        }
+        return error.MissingCudaRuntimeJitProductionArtifact;
+    };
+    var module = KernelModule{};
+    const mapping = module.generatedFunctionMapping(production).?;
+    var functions = [_]driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact;
+    for (0..mapping.count) |index| functions[index] = @ptrFromInt(index + 1);
+
+    try std.testing.expect(module.installRuntimeJitFunctions(production, mapping, functions, .shadow, true));
+    try std.testing.expectEqual(@as(driver_mod.CUfunction, null), mapping.slots[0].?.*);
+    try std.testing.expect(module.installRuntimeJitFunctions(production, mapping, functions, .on, false));
+    try std.testing.expectEqual(@as(driver_mod.CUfunction, null), mapping.slots[0].?.*);
+    try std.testing.expectError(
+        error.CudaJitRequiredRouteUnqualified,
+        shouldActivateRuntimeJitArtifact(production, .required, true, false),
+    );
+    try std.testing.expect(try shouldActivateRuntimeJitArtifact(production, .on, true, true));
+    try std.testing.expect(module.installRuntimeJitFunctions(production, mapping, functions, .on, true));
+    try std.testing.expectEqual(functions[0], mapping.slots[0].?.*);
+
+    const attention_artifact = blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+            if (artifact.backend == .cuda and artifact.cuda_attention_kernel != null) break :blk artifact;
+        }
+        return error.MissingCudaRuntimeJitAttentionArtifact;
+    };
+    var promoted_attention = attention_artifact;
+    promoted_attention.production_enabled = true;
+    var attention_module = KernelModule{};
+    const attention_mapping = attention_module.generatedFunctionMapping(promoted_attention).?;
+    var old_functions = [_]driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact;
+    var new_functions = [_]driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact;
+    for (0..attention_mapping.count) |index| {
+        old_functions[index] = @ptrFromInt(index + 11);
+        new_functions[index] = @ptrFromInt(index + 21);
+        attention_mapping.slots[index].?.* = old_functions[index];
+    }
+    try std.testing.expect(!attention_module.installRuntimeJitFunctions(
+        promoted_attention,
+        attention_mapping,
+        new_functions,
+        .on,
+        true,
+    ));
+    for (0..attention_mapping.count) |index| {
+        try std.testing.expectEqual(old_functions[index], attention_mapping.slots[index].?.*);
+    }
+}
+
+test "CUDA runtime JIT retained modules pop in reverse ownership order" {
+    var module = KernelModule{};
+    const first: driver_mod.CUmodule = @ptrFromInt(1);
+    const second: driver_mod.CUmodule = @ptrFromInt(2);
+    try module.retainRuntimeJitModule(first);
+    try module.retainRuntimeJitModule(second);
+    try std.testing.expectEqual(second, module.popRuntimeJitModule().?);
+    try std.testing.expectEqual(first, module.popRuntimeJitModule().?);
+    try std.testing.expectEqual(@as(?driver_mod.CUmodule, null), module.popRuntimeJitModule());
+    try std.testing.expectEqual(@as(usize, 0), module.runtime_jit_module_count);
+}
+
+test "CUDA runtime JIT cache misses then reuses exact keyed PTX and qualification" {
+    const artifact = blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |candidate| {
+            if (candidate.backend == .cuda and candidate.production_enabled) break :blk candidate;
+        }
+        return error.MissingCudaRuntimeJitProductionArtifact;
+    };
+    const source = "extern \"C\" __global__ void generated() {}";
+    const scope = JitRouteScope.maximumForProfile(.gemma4);
+    const compile_key = runtimeJitCompileKey(
+        artifact,
+        source,
+        "sm_89",
+        "nvrtc/12.0",
+        "--gpu-architecture=compute_89",
+    );
+    const bundled_image_sha256 = cudaBundledImageSha256Hex();
+    const candidate_ptx_sha256 = runtimeJitSha256("ptx\x00");
+    const qualification_key = runtimeJitQualificationKey(
+        artifact,
+        scope,
+        compile_key,
+        candidate_ptx_sha256,
+        &bundled_image_sha256,
+        "test-device/driver-12000",
+    );
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var cache = try kernel_jit.ArtifactCache.initDir(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        1024 * 1024,
+    );
+    defer cache.deinit();
+
+    try std.testing.expectEqual(@as(?[]u8, null), try loadRuntimeJitCachedPtx(&cache, compile_key));
+    try cache.store(.cuda_ptx, compile_key, "ptx\x00");
+    const ptx = (try loadRuntimeJitCachedPtx(&cache, compile_key)).?;
+    defer std.testing.allocator.free(ptx);
+    try std.testing.expect(validRuntimeJitPtx(ptx));
+
+    const record = kernel_jit.QualificationRecord{
+        .candidate_index = 0,
+        .repeat_count = kernel_jit.measurement_repeats,
+        .correctness_passed = true,
+        .measured_speedup = 1.20,
+        .minimum_repeat_speedup = 1.11,
+        .max_absolute_error = 0,
+        .max_relative_error = 0,
+    };
+    const encoded = try record.encode();
+    try cache.store(.qualification, qualification_key, &encoded);
+    try std.testing.expect(loadRuntimeJitQualification(
+        std.testing.allocator,
+        &cache,
+        qualification_key,
+        artifact,
+    ) != null);
+
+    const changed_target_key = runtimeJitCompileKey(
+        artifact,
+        source,
+        "sm_90",
+        "nvrtc/12.0",
+        "--gpu-architecture=compute_90",
+    );
+    try std.testing.expectEqual(
+        @as(?[]u8, null),
+        try loadRuntimeJitCachedPtx(&cache, changed_target_key),
+    );
+
+    var changed_scope = scope;
+    changed_scope.observed_shapes[0] = .{ 2048, 1536 };
+    changed_scope.observed_shape_count = 1;
+    const changed_scope_qualification_key = runtimeJitQualificationKey(
+        artifact,
+        changed_scope,
+        compile_key,
+        candidate_ptx_sha256,
+        &bundled_image_sha256,
+        "test-device/driver-12000",
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &qualification_key,
+        &changed_scope_qualification_key,
+    ));
+    const changed_candidate_qualification_key = runtimeJitQualificationKey(
+        artifact,
+        scope,
+        compile_key,
+        runtimeJitSha256("different-ptx\x00"),
+        &bundled_image_sha256,
+        "test-device/driver-12000",
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &qualification_key,
+        &changed_candidate_qualification_key,
+    ));
+    var changed_bundled_image_sha256 = bundled_image_sha256;
+    changed_bundled_image_sha256[0] = if (changed_bundled_image_sha256[0] == '0') '1' else '0';
+    const changed_baseline_qualification_key = runtimeJitQualificationKey(
+        artifact,
+        scope,
+        compile_key,
+        candidate_ptx_sha256,
+        &changed_bundled_image_sha256,
+        "test-device/driver-12000",
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &qualification_key,
+        &changed_baseline_qualification_key,
+    ));
+    const reused_ptx = (try loadRuntimeJitCachedPtx(&cache, compile_key)).?;
+    defer std.testing.allocator.free(reused_ptx);
+    try std.testing.expect(validRuntimeJitPtx(reused_ptx));
+    try std.testing.expectEqual(
+        @as(?kernel_jit.QualificationRecord, null),
+        loadRuntimeJitQualification(
+            std.testing.allocator,
+            &cache,
+            changed_scope_qualification_key,
+            artifact,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 64), build_options.cuda_jit_baseline_implementation_sha256.len);
+    try std.testing.expectEqual(@as(usize, 64), build_options.cuda_jit_qualification_implementation_sha256.len);
+    try std.testing.expectEqual(@as(usize, 64), build_options.cuda_jit_dispatch_implementation_sha256.len);
+}
+
 fn loadModuleWithJitLog(ctx: *context_mod.CudaContext, module: *driver_mod.CUmodule) driver_mod.Error!void {
+    if (cuda_artifact.uses_jit) {
+        return loadPtxModuleWithJitLog(ctx, module, cuda_artifact.image, cuda_artifact.format);
+    }
+    const result = ctx.driver.fns.cuModuleLoadDataEx(module, cuda_artifact.image.ptr, 0, null, null);
+    if (result == driver_mod.CUDA_SUCCESS) return;
+    std.debug.print(
+        "cuda {s}: module load failed: {s}: {s}\n",
+        .{ cuda_artifact.format, ctx.driver.errorName(result), ctx.driver.errorString(result) },
+    );
+    return error.CudaDriverError;
+}
+
+fn loadPtxModuleWithJitLog(
+    ctx: *context_mod.CudaContext,
+    module: *driver_mod.CUmodule,
+    ptx: []const u8,
+    label: []const u8,
+) driver_mod.Error!void {
     var info_log: [4096]u8 = .{0} ** 4096;
     var error_log: [4096]u8 = .{0} ** 4096;
     var options = [_]driver_mod.CUjit_option{
@@ -12015,15 +15245,12 @@ fn loadModuleWithJitLog(ctx: *context_mod.CudaContext, module: *driver_mod.CUmod
         @ptrCast(error_log[0..].ptr),
         @ptrFromInt(error_log.len),
     };
-    const result = if (cuda_artifact.uses_jit)
-        ctx.driver.fns.cuModuleLoadDataEx(module, cuda_artifact.image.ptr, options.len, &options, &values)
-    else
-        ctx.driver.fns.cuModuleLoadDataEx(module, cuda_artifact.image.ptr, 0, null, null);
+    const result = ctx.driver.fns.cuModuleLoadDataEx(module, ptx.ptr, options.len, &options, &values);
     if (result == driver_mod.CUDA_SUCCESS) return;
 
     std.debug.print(
         "cuda {s}: module load failed: {s}: {s}\n",
-        .{ cuda_artifact.format, ctx.driver.errorName(result), ctx.driver.errorString(result) },
+        .{ label, ctx.driver.errorName(result), ctx.driver.errorString(result) },
     );
     const error_message = trimCudaLog(&error_log);
     if (error_message.len > 0) std.debug.print("cuda jit error log:\n{s}\n", .{error_message});

@@ -99,6 +99,27 @@ pub const Config = struct {
     };
 
     pub const InferenceConfig = struct {
+        pub const KernelJitConfig = struct {
+            mode: inference_server.graph.kernel_jit.Mode = .off,
+            cache_dir: ?[]u8 = null,
+            max_cache_bytes_mb: usize = 1024,
+            preload_budget_ms: u64 = 300_000,
+
+            pub fn runtime(self: KernelJitConfig) inference_server.graph.kernel_jit.Config {
+                return .{
+                    .mode = self.mode,
+                    .cache_dir = self.cache_dir,
+                    .max_cache_bytes_mb = self.max_cache_bytes_mb,
+                    .preload_budget_ms = self.preload_budget_ms,
+                };
+            }
+
+            fn deinit(self: *KernelJitConfig, alloc: std.mem.Allocator) void {
+                if (self.cache_dir) |value| alloc.free(value);
+                self.* = undefined;
+            }
+        };
+
         pub const PromptCacheConfig = struct {
             pub const Mode = enum {
                 simple,
@@ -146,6 +167,7 @@ pub const Config = struct {
         /// Zero disables the admission limit. Positive values bound concurrent
         /// inference work units; excess HTTP requests are rejected with 503.
         max_concurrent_requests: ?usize = null,
+        kernel_jit: KernelJitConfig = .{},
         prompt_cache: PromptCacheConfig = .{},
         query_embedding_cache: QueryEmbeddingCacheConfig = .{},
 
@@ -158,6 +180,7 @@ pub const Config = struct {
             if (self.s3_credentials) |*credentials| credentials.deinit(alloc);
             for (self.preload) |*model| model.deinit(alloc);
             if (self.preload.len > 0) alloc.free(self.preload);
+            self.kernel_jit.deinit(alloc);
             self.* = undefined;
         }
     };
@@ -415,6 +438,11 @@ pub const Config = struct {
             try promptCacheFromOpenApi(inference.prompt_cache)
         else
             Config.InferenceConfig.PromptCacheConfig{};
+        var kernel_jit = if (validated.value.inference) |inference|
+            try kernelJitFromOpenApi(alloc, inference.kernel_jit)
+        else
+            Config.InferenceConfig.KernelJitConfig{};
+        errdefer kernel_jit.deinit(alloc);
         return .{
             .registry = registry,
             .transcribers = transcribers,
@@ -451,6 +479,7 @@ pub const Config = struct {
                     std.math.cast(usize, value) orelse return error.InvalidConfig
                 else
                     null,
+                .kernel_jit = kernel_jit,
                 .prompt_cache = prompt_cache,
                 .query_embedding_cache = query_embedding_cache,
             } else .{},
@@ -1056,6 +1085,31 @@ fn queryEmbeddingCacheFromOpenApi(
     };
 }
 
+fn kernelJitFromOpenApi(
+    alloc: std.mem.Allocator,
+    value: ?inference_config_openapi.KernelJitConfig,
+) !Config.InferenceConfig.KernelJitConfig {
+    const config = value orelse return .{};
+    const max_cache_bytes_mb = std.math.cast(usize, config.max_cache_bytes_mb orelse 1024) orelse
+        return error.InvalidConfig;
+    const preload_budget_ms = std.math.cast(u64, config.preload_budget_ms orelse 300_000) orelse
+        return error.InvalidConfig;
+    var result = Config.InferenceConfig.KernelJitConfig{
+        .mode = if (config.mode) |mode| switch (mode) {
+            .off => .off,
+            .shadow => .shadow,
+            .on => .on,
+            .required => .required,
+        } else .off,
+        .cache_dir = if (config.cache_dir) |path| try alloc.dupe(u8, path) else null,
+        .max_cache_bytes_mb = max_cache_bytes_mb,
+        .preload_budget_ms = preload_budget_ms,
+    };
+    errdefer result.deinit(alloc);
+    result.runtime().validate() catch return error.InvalidConfig;
+    return result;
+}
+
 fn promptCacheFromOpenApi(
     value: ?inference_config_openapi.PromptCacheConfig,
 ) !Config.InferenceConfig.PromptCacheConfig {
@@ -1295,6 +1349,12 @@ test "common config extracts antfly settings" {
         \\    "models_dir": "/tmp/models",
         \\    "ml_dir": "/tmp/ml",
         \\    "max_concurrent_requests": 7,
+        \\    "kernel_jit": {
+        \\      "mode": "shadow",
+        \\      "cache_dir": "/tmp/antfly-jit",
+        \\      "max_cache_bytes_mb": 256,
+        \\      "preload_budget_ms": 120000
+        \\    },
         \\    "prompt_cache": {
         \\      "enabled": true,
         \\      "mode": "simple",
@@ -1334,6 +1394,10 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference.models_dir.?);
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference.ml_dir.?);
     try std.testing.expectEqual(@as(?usize, 7), cfg.inference.max_concurrent_requests);
+    try std.testing.expectEqual(inference_server.graph.kernel_jit.Mode.shadow, cfg.inference.kernel_jit.mode);
+    try std.testing.expectEqualStrings("/tmp/antfly-jit", cfg.inference.kernel_jit.cache_dir.?);
+    try std.testing.expectEqual(@as(usize, 256), cfg.inference.kernel_jit.max_cache_bytes_mb);
+    try std.testing.expectEqual(@as(u64, 120_000), cfg.inference.kernel_jit.preload_budget_ms);
     try std.testing.expect(cfg.inference.prompt_cache.enabled);
     try std.testing.expectEqual(Config.InferenceConfig.PromptCacheConfig.Mode.simple, cfg.inference.prompt_cache.mode);
     try std.testing.expectEqual(@as(usize, 256), cfg.inference.prompt_cache.max_bytes_mb);
@@ -1453,6 +1517,26 @@ test "common config rejects invalid prompt cache policy" {
     );
     defer alloc.free(bytes_overflow);
     try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, bytes_overflow));
+}
+
+test "common config rejects invalid kernel JIT policy" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
+        \\{
+        \\  "inference": {
+        \\    "api_url": "http://127.0.0.1:8090",
+        \\    "kernel_jit": { "preload_budget_ms": 999 }
+        \\  }
+        \\}
+    ));
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
+        \\{
+        \\  "inference": {
+        \\    "api_url": "http://127.0.0.1:8090",
+        \\    "kernel_jit": { "cache_dir": "" }
+        \\  }
+        \\}
+    ));
 }
 
 test "common config defaults shard scalar fields" {
@@ -2039,6 +2123,10 @@ test "common config parses minimal config with runtime defaults" {
     try std.testing.expectEqual(@as(u64, default_max_shard_size_bytes), cfg.shard_allocation.max_shard_size_bytes);
     try std.testing.expectEqual(@as(u32, default_max_shards_per_table), cfg.shard_allocation.max_shards_per_table);
     try std.testing.expect(cfg.shard_allocation.disable_shard_alloc);
+    try std.testing.expectEqual(inference_server.graph.kernel_jit.Mode.off, cfg.inference.kernel_jit.mode);
+    try std.testing.expect(cfg.inference.kernel_jit.cache_dir == null);
+    try std.testing.expectEqual(@as(usize, 1024), cfg.inference.kernel_jit.max_cache_bytes_mb);
+    try std.testing.expectEqual(@as(u64, 300_000), cfg.inference.kernel_jit.preload_budget_ms);
     try std.testing.expect(!cfg.inference.prompt_cache.enabled);
     try std.testing.expectEqual(Config.InferenceConfig.PromptCacheConfig.Mode.block_hash, cfg.inference.prompt_cache.mode);
     try std.testing.expectEqual(@as(usize, 512), cfg.inference.prompt_cache.max_bytes_mb);

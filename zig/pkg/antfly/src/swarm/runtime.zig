@@ -62,6 +62,7 @@ const CliConfig = struct {
     inference_combined_budget_mb: usize = 0,
     inference_kv_budget_mb: usize = 0,
     inference_scratch_budget_mb: usize = 0,
+    inference_kernel_jit_mode: ?inference.graph.kernel_jit.Mode = null,
     inference_preload_models: std.ArrayListUnmanaged(inference.server.WarmModel) = .empty,
     data_dir: ?[]const u8 = null,
     replica_root_dir: ?[]const u8 = null,
@@ -923,10 +924,15 @@ pub fn runFromIterator(
         .generation_budget_overrides = resolveInferenceBudgetOverrides(cli),
         .preload = resolved_warm_models.items,
     };
-    if (loaded_config) |*cfg| applyCommonInferenceConfig(&antfly_node_cfg, cfg);
+    if (loaded_config) |*cfg| try applyCommonInferenceConfig(&antfly_node_cfg, cfg);
+    try applyKernelJitModeOverride(
+        &antfly_node_cfg.kernel_jit,
+        platform.env.getenv("ANTFLY_INFERENCE_KERNEL_JIT_MODE"),
+        cli.inference_kernel_jit_mode,
+    );
     var antfly_node = try inference.server.Node.init(alloc, antfly_node_cfg);
     defer antfly_node.deinit();
-    try antfly_node.warmConfiguredModels(alloc);
+    try antfly_node.warmConfiguredModelsBeforeServing(alloc);
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,
@@ -1194,10 +1200,12 @@ pub fn runFromIterator(
 fn applyCommonInferenceConfig(
     node_cfg: *inference.server.NodeConfig,
     cfg: *const antfly.common.config.Config,
-) void {
+) !void {
     if (cfg.effectiveAntflyContentSecurity()) |security| node_cfg.content_security = security.*;
     if (cfg.inference.s3_credentials) |creds| node_cfg.s3_credentials = creds;
     if (cfg.inference.max_concurrent_requests) |limit| node_cfg.max_concurrent_requests = limit;
+    node_cfg.kernel_jit = cfg.inference.kernel_jit.runtime();
+    try node_cfg.kernel_jit.validate();
     node_cfg.prompt_cache = .{
         .enabled = cfg.inference.prompt_cache.enabled,
         .mode = switch (cfg.inference.prompt_cache.mode) {
@@ -1208,6 +1216,19 @@ fn applyCommonInferenceConfig(
         .min_tokens = cfg.inference.prompt_cache.min_tokens,
         .ttl_ms = cfg.inference.prompt_cache.ttl_ms,
     };
+}
+
+fn applyKernelJitModeOverride(
+    config: *inference.graph.kernel_jit.Config,
+    env_mode: ?[]const u8,
+    cli_mode: ?inference.graph.kernel_jit.Mode,
+) !void {
+    if (cli_mode) |mode|
+        config.mode = mode
+    else if (env_mode) |raw|
+        config.mode = std.meta.stringToEnum(inference.graph.kernel_jit.Mode, raw) orelse
+            return error.InvalidArguments;
+    try config.validate();
 }
 
 fn localAntflyProvider(node: *inference.server.Node) antfly.inference.managed_embedder.AntflyProvider {
@@ -2718,6 +2739,13 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.inference_scratch_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--kernel-jit-mode")) {
+            cfg.inference_kernel_jit_mode = std.meta.stringToEnum(
+                inference.graph.kernel_jit.Mode,
+                args.next() orelse return error.InvalidArguments,
+            ) orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--preload-model")) {
             try cfg.inference_preload_models.append(alloc, try parsePreloadModelFlag(args.next() orelse return error.InvalidArguments));
             continue;
@@ -3455,6 +3483,7 @@ fn printUsage() void {
         \\  --inference-combined-budget-mb <n>    Embedded inference native generation combined budget override
         \\  --inference-kv-budget-mb <n>          Embedded inference native generation KV cache budget override
         \\  --inference-scratch-budget-mb <n>     Embedded inference native generation scratch budget override
+        \\  --kernel-jit-mode <off|shadow|on|required> Embedded inference runtime JIT mode override
         \\  --preload-model <kind:name|kind:backend:name> Preload and warm an embedded model before serving
         \\  --data-dir <path>                     Local Antfly data directory root
         \\  --replica-root-dir <path>             Replica root directory
@@ -5053,6 +5082,8 @@ test "parse cli accepts inference budget overrides" {
         "2048",
         "--inference-scratch-budget-mb",
         "1024",
+        "--kernel-jit-mode",
+        "required",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     var cfg = try parseCli(std.testing.allocator, &iter);
@@ -5062,6 +5093,16 @@ test "parse cli accepts inference budget overrides" {
     try std.testing.expectEqual(@as(usize, 16384), cfg.inference_combined_budget_mb);
     try std.testing.expectEqual(@as(usize, 2048), cfg.inference_kv_budget_mb);
     try std.testing.expectEqual(@as(usize, 1024), cfg.inference_scratch_budget_mb);
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.required, cfg.inference_kernel_jit_mode.?);
+}
+
+test "swarm kernel JIT mode precedence is CLI then environment then config" {
+    var config = inference.graph.kernel_jit.Config{ .mode = .shadow };
+    try applyKernelJitModeOverride(&config, "on", null);
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.on, config.mode);
+    try applyKernelJitModeOverride(&config, "invalid", .required);
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.required, config.mode);
+    try std.testing.expectError(error.InvalidArguments, applyKernelJitModeOverride(&config, "invalid", null));
 }
 
 test "inference config falls back to common config" {
@@ -5076,6 +5117,12 @@ test "inference config falls back to common config" {
             .models_dir = try alloc.dupe(u8, "/tmp/antfly-models"),
             .ml_dir = try alloc.dupe(u8, "/tmp/antfly-ml"),
             .max_concurrent_requests = 0,
+            .kernel_jit = .{
+                .mode = .shadow,
+                .cache_dir = try alloc.dupe(u8, "/tmp/antfly-jit"),
+                .max_cache_bytes_mb = 256,
+                .preload_budget_ms = 120_000,
+            },
             .prompt_cache = .{
                 .enabled = true,
                 .mode = .simple,
@@ -5108,8 +5155,12 @@ test "inference config falls back to common config" {
     try std.testing.expectEqualStrings("q4_k", warm_models.items[0].quantization.?);
 
     var node_cfg = inference.server.NodeConfig{};
-    applyCommonInferenceConfig(&node_cfg, &cfg);
+    try applyCommonInferenceConfig(&node_cfg, &cfg);
     try std.testing.expectEqual(@as(usize, 0), node_cfg.max_concurrent_requests);
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.shadow, node_cfg.kernel_jit.mode);
+    try std.testing.expectEqualStrings("/tmp/antfly-jit", node_cfg.kernel_jit.cache_dir.?);
+    try std.testing.expectEqual(@as(usize, 256), node_cfg.kernel_jit.max_cache_bytes_mb);
+    try std.testing.expectEqual(@as(u64, 120_000), node_cfg.kernel_jit.preload_budget_ms);
     try std.testing.expect(node_cfg.prompt_cache.enabled);
     try std.testing.expectEqual(inference.runtime.kv.prompt_cache.Mode.simple, node_cfg.prompt_cache.mode);
     try std.testing.expectEqual(@as(usize, 256), node_cfg.prompt_cache.max_bytes_mb);

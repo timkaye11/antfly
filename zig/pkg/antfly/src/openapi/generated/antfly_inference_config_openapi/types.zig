@@ -101,6 +101,7 @@ pub const Config = struct {
     pool_size: ?i64 = null,
     /// Native generator prompt KV cache settings.
     prompt_cache: ?PromptCacheConfig = null,
+    kernel_jit: ?KernelJitConfig = null,
     /// Legacy compatibility field. The current Zig inference runtime selects a backend from model metadata, explicit preload settings, and compiled capabilities; configuring this list has no effect.
     backend_priority: ?[]const []const u8 = null,
     /// Maximum concurrent weighted inference admission units in the Zig runtime. Request body size, generation workload, and image byte/count reservations can consume more than one unit. Read and image-extraction admission reserves the effective downloaded-byte ceiling at 16 MiB per unit and at least one unit per two images. A positive capacity also clamps each such request's downloaded-image ceiling to 16 MiB times this value. Set to 0 disables both admission accounting and that capacity-derived clamp. When a positive limit is exhausted, new requests are rejected immediately with 503 Service Unavailable and Retry-After: 1; they are not retained in an in-process queue. Set to 0 only as an operational escape hatch for trusted testing environments; unlimited admission is not recommended for production native generation. Use a positive production limit. The default is 32.
@@ -109,7 +110,7 @@ pub const Config = struct {
     max_queue_size: ?i64 = null,
     /// Legacy Go-runtime queue/request timeout. The current Zig runtime ignores this field; its HTTP listener applies a separate fixed transport timeout.
     request_timeout: ?[]const u8 = null,
-    /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind.
+    /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind. When runtime kernel JIT is enabled, every vision, audio, and projection session declared by a preloaded model is also loaded without running media inference. Runtime kernel JIT `required` mode rejects an empty preload list.
     preload: ?[]const ModelRef = null,
     /// Legacy compatibility field. The current Zig runtime uses explicit host, backend, combined, KV, and scratch budgets instead and ignores this field.
     max_memory_mb: ?i64 = null,
@@ -452,6 +453,49 @@ pub const ImageURLContentPart = struct {
     image_url: ImageURL,
 };
 
+/// Runtime Metal and CUDA kernel JIT configuration. Live compilation and GPU qualification run only for models in the configured startup `preload` list, before serving begins. A cold dynamic model load never benchmarks against an in-use GPU: `on` and `shadow` retain bundled kernels, while `required` rejects the load. When runtime JIT is enabled, startup also materializes every vision, audio, and projection session declared by each preloaded model without running media inference. Preload every model that must use runtime-JIT kernels; `required` rejects an empty preload list.
+pub const KernelJitConfig = struct {
+    mode: ?KernelJitMode = null,
+    /// Persistent artifact cache directory on Linux and macOS. Omit to use ~/.antfly/inference/jit when HOME is available.
+    cache_dir: ?[]const u8 = null,
+    /// Persistent cache size limit in MiB. Set to 0 to disable disk persistence.
+    max_cache_bytes_mb: ?i64 = null,
+    /// Per direct model session pre-publication start budget for best-effort `on` and `shadow` JIT work. A compiler or qualification operation already started may overrun the budget. Multimodal model preloads may create several direct sessions, each with this budget. `required` completes or fails all required routes and may exceed this value.
+    preload_budget_ms: ?i64 = null,
+};
+
+/// Runtime kernel JIT operating mode. `off` disables compilation. `shadow` compiles and validates without dispatching JIT kernels. `on` may activate qualified kernels while preserving the production fallback. `required` fails model loading when there are no eligible routes or any scoped route cannot qualify, rejects sessions that are not direct Metal or CUDA sessions, and requires at least one configured startup preload. Backend preference remains separately configured; this mode neither enables nor selects a backend. Runtime JIT is currently supported on Linux and macOS; other platforms reject non-`off` modes rather than silently degrading.
+pub const KernelJitMode = enum {
+    off,
+    shadow,
+    on,
+    required,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .off => "off",
+            .shadow => "shadow",
+            .on => "on",
+            .required => "required",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "off", .off },
+            .{ "shadow", .shadow },
+            .{ "on", .on },
+            .{ "required", .required },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Binary or URL media content for providers that support non-image media parts.
 pub const MediaContentPart = struct {
     type: []const u8,
@@ -626,7 +670,7 @@ pub const ModelQuantization = enum {
     }
 };
 
-/// Model reference used by startup preload and model-loading configuration.
+/// Model reference used by startup preload and model-loading configuration. When a preload selects an explicit backend, that warmed session also becomes the model's default in-process session for later `auto` requests; callers do not need to repeat the backend on every request.
 pub const ModelRef = struct {
     kind: ModelKind,
     /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.

@@ -66,6 +66,47 @@
 #define TERMITE_METAL_PLAN_OP_COUNTER_COUNT 32
 #define TERMITE_METAL_OPERATOR_COUNTER_COUNT 16
 #define TERMITE_METAL_QUANT_DISPATCH_COUNTER_COUNT 4
+#define TERMITE_METAL_GENERATED_SOURCE_MAX_BYTES (16u * 1024u * 1024u)
+
+// Stable ABI shared with MetalJitPipelineSlot in metal_runtime.zig. Keep this
+// list append-only: persisted qualification keys identify these exact routes.
+typedef enum termite_metal_jit_pipeline_slot {
+    TERMITE_METAL_JIT_SLOT_Q4_K_BIAS_GELU = 0,
+    TERMITE_METAL_JIT_SLOT_Q4_0 = 1,
+    TERMITE_METAL_JIT_SLOT_Q4_1 = 2,
+    TERMITE_METAL_JIT_SLOT_Q5_0 = 3,
+    TERMITE_METAL_JIT_SLOT_Q5_1 = 4,
+    TERMITE_METAL_JIT_SLOT_Q2_K = 5,
+    TERMITE_METAL_JIT_SLOT_Q2_K_BIAS = 6,
+    TERMITE_METAL_JIT_SLOT_Q2_K_BIAS_GELU = 7,
+    TERMITE_METAL_JIT_SLOT_Q3_K = 8,
+    TERMITE_METAL_JIT_SLOT_Q3_K_BIAS = 9,
+    TERMITE_METAL_JIT_SLOT_Q3_K_BIAS_GELU = 10,
+    TERMITE_METAL_JIT_SLOT_Q4_K_BIAS = 11,
+    TERMITE_METAL_JIT_SLOT_Q4_K = 12,
+    TERMITE_METAL_JIT_SLOT_Q8_0 = 13,
+    TERMITE_METAL_JIT_SLOT_Q8_0_BIAS = 14,
+    TERMITE_METAL_JIT_SLOT_Q8_0_BIAS_GELU = 15,
+    TERMITE_METAL_JIT_SLOT_Q8_0_RELU = 16,
+    TERMITE_METAL_JIT_SLOT_Q8_1 = 17,
+    TERMITE_METAL_JIT_SLOT_Q8_K = 18,
+    TERMITE_METAL_JIT_SLOT_Q5_K = 19,
+    TERMITE_METAL_JIT_SLOT_Q5_K_BIAS = 20,
+    TERMITE_METAL_JIT_SLOT_Q5_K_BIAS_GELU = 21,
+    TERMITE_METAL_JIT_SLOT_Q6_K = 22,
+    TERMITE_METAL_JIT_SLOT_Q6_K_BIAS = 23,
+    TERMITE_METAL_JIT_SLOT_Q6_K_BIAS_GELU = 24,
+    TERMITE_METAL_JIT_SLOT_COUNT = 25,
+} termite_metal_jit_pipeline_slot;
+
+_Static_assert(TERMITE_METAL_JIT_SLOT_COUNT <= 64, "Metal JIT route mask overflow");
+
+#define TERMITE_METAL_JIT_MAX_QUALIFIED_SHAPES_PER_ROUTE 16u
+
+typedef struct termite_metal_jit_qualified_shape {
+    size_t out_dim;
+    size_t in_dim;
+} termite_metal_jit_qualified_shape;
 
 #define TERMITE_METAL_PLAN_OP_UNKNOWN 0u
 #define TERMITE_METAL_PLAN_OP_DECODE_ATTENTION_PRE_NORM 1u
@@ -380,7 +421,9 @@ typedef struct termite_metal_provider {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     id<MTLComputePipelineState> q4_0_pipeline;
+    id<MTLComputePipelineState> antfly_q4_0_small_batch_pipeline;
     id<MTLComputePipelineState> q4_1_pipeline;
+    id<MTLComputePipelineState> antfly_q4_1_small_batch_pipeline;
     id<MTLComputePipelineState> q5_0_pipeline;
     id<MTLComputePipelineState> q5_1_pipeline;
     id<MTLComputePipelineState> q8_0_pipeline;
@@ -429,8 +472,42 @@ typedef struct termite_metal_provider {
     id<MTLComputePipelineState> tl2_pipeline;
     id<MTLComputePipelineState> polar4_key_scores_pipeline;
     id<MTLComputePipelineState> turbo3_key_scores_pipeline;
+    uint64_t jit_generated_route_mask;
+    termite_metal_jit_qualified_shape jit_qualified_shapes[TERMITE_METAL_JIT_SLOT_COUNT][TERMITE_METAL_JIT_MAX_QUALIFIED_SHAPES_PER_ROUTE];
+    uint8_t jit_qualified_shape_counts[TERMITE_METAL_JIT_SLOT_COUNT];
     uint64_t antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_COUNT][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_COUNT];
 } termite_metal_provider;
+
+typedef struct termite_metal_generated_pipeline {
+    id<MTLDevice> device;
+    id<MTLLibrary> library;
+    id<MTLComputePipelineState> pipeline;
+} termite_metal_generated_pipeline;
+
+typedef struct termite_metal_device_info {
+    uint64_t registry_id;
+    uint64_t recommended_max_working_set_size;
+    uint64_t max_buffer_length;
+    uint32_t max_threads_per_threadgroup_width;
+    uint32_t max_threads_per_threadgroup_height;
+    uint32_t max_threads_per_threadgroup_depth;
+    uint32_t max_threadgroup_memory_length;
+    uint16_t apple_gpu_family;
+    uint16_t mac_gpu_family;
+    uint16_t common_gpu_family;
+    uint16_t metal_gpu_family;
+    uint8_t has_unified_memory;
+    uint8_t reserved[7];
+} termite_metal_device_info;
+
+typedef struct termite_metal_generated_pipeline_info {
+    uint64_t static_threadgroup_memory_length;
+    uint32_t thread_execution_width;
+    uint32_t max_total_threads_per_threadgroup;
+} termite_metal_generated_pipeline_info;
+
+_Static_assert(sizeof(termite_metal_device_info) == 56, "Metal device info ABI size drift");
+_Static_assert(sizeof(termite_metal_generated_pipeline_info) == 16, "Metal generated pipeline info ABI size drift");
 
 #define TERMITE_METAL_PLANNED_RANGE_CAPACITY 256u
 
@@ -1039,6 +1116,9 @@ typedef struct termite_metal_decode_runtime {
     uint64_t q6_k_linear_reduce_f16_input;
     uint64_t antfly_generated_dispatch_counts[TERMITE_METAL_GENERATED_QUANT_FORMAT_COUNT][TERMITE_METAL_GENERATED_QUANT_EPILOGUE_COUNT];
     uint64_t rms_norm_add_sumsq;
+    uint64_t jit_generated_route_mask;
+    termite_metal_jit_qualified_shape jit_qualified_shapes[TERMITE_METAL_JIT_SLOT_COUNT][TERMITE_METAL_JIT_MAX_QUALIFIED_SHAPES_PER_ROUTE];
+    uint8_t jit_qualified_shape_counts[TERMITE_METAL_JIT_SLOT_COUNT];
     BOOL generated_quant_disabled;
     BOOL generated_quant_disabled_initialized;
     termite_metal_generated_gate_entry generated_gate_cache[TERMITE_METAL_GENERATED_GATE_CACHE_CAPACITY];
@@ -1079,15 +1159,133 @@ static BOOL termite_metal_runtime_generated_quant_disabled(termite_metal_decode_
     return runtime->generated_quant_disabled;
 }
 
-static BOOL termite_metal_runtime_candidate_gate(termite_metal_decode_runtime *runtime, const char *env_name) {
+typedef struct termite_metal_jit_gate_route {
+    const char *env_name;
+    termite_metal_jit_pipeline_slot slot;
+} termite_metal_jit_gate_route;
+
+static int termite_metal_jit_route_slot_for_env(const char *env_name) {
+    static const termite_metal_jit_gate_route routes[] = {
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH_BIAS_GELU", TERMITE_METAL_JIT_SLOT_Q4_K_BIAS_GELU},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q4_0_SMALL_BATCH", TERMITE_METAL_JIT_SLOT_Q4_0},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q4_1_SMALL_BATCH", TERMITE_METAL_JIT_SLOT_Q4_1},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q5_0_SMALL_BATCH", TERMITE_METAL_JIT_SLOT_Q5_0},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q5_1_SMALL_BATCH", TERMITE_METAL_JIT_SLOT_Q5_1},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q2_K_SMALL_BATCH", TERMITE_METAL_JIT_SLOT_Q2_K},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q2_K_SMALL_BATCH_BIAS", TERMITE_METAL_JIT_SLOT_Q2_K_BIAS},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q2_K_SMALL_BATCH_BIAS_GELU", TERMITE_METAL_JIT_SLOT_Q2_K_BIAS_GELU},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q3_K_SMALL_BATCH", TERMITE_METAL_JIT_SLOT_Q3_K},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q3_K_SMALL_BATCH_BIAS", TERMITE_METAL_JIT_SLOT_Q3_K_BIAS},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q3_K_SMALL_BATCH_BIAS_GELU", TERMITE_METAL_JIT_SLOT_Q3_K_BIAS_GELU},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH_BIAS", TERMITE_METAL_JIT_SLOT_Q4_K_BIAS},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH", TERMITE_METAL_JIT_SLOT_Q4_K},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH", TERMITE_METAL_JIT_SLOT_Q8_0},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_BIAS", TERMITE_METAL_JIT_SLOT_Q8_0_BIAS},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_BIAS_GELU", TERMITE_METAL_JIT_SLOT_Q8_0_BIAS_GELU},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_RELU", TERMITE_METAL_JIT_SLOT_Q8_0_RELU},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q8_1_SMALL_BATCH", TERMITE_METAL_JIT_SLOT_Q8_1},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q8_K_SMALL_BATCH", TERMITE_METAL_JIT_SLOT_Q8_K},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q5_K_SMALL_BATCH", TERMITE_METAL_JIT_SLOT_Q5_K},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q5_K_SMALL_BATCH_BIAS", TERMITE_METAL_JIT_SLOT_Q5_K_BIAS},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q5_K_SMALL_BATCH_BIAS_GELU", TERMITE_METAL_JIT_SLOT_Q5_K_BIAS_GELU},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q6_K_SMALL_BATCH", TERMITE_METAL_JIT_SLOT_Q6_K},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q6_K_SMALL_BATCH_BIAS", TERMITE_METAL_JIT_SLOT_Q6_K_BIAS},
+        {"TERMITE_METAL_ENABLE_ANTFLY_Q6_K_SMALL_BATCH_BIAS_GELU", TERMITE_METAL_JIT_SLOT_Q6_K_BIAS_GELU},
+    };
+    if (env_name == NULL) return -1;
+    for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); ++i) {
+        if (strcmp(routes[i].env_name, env_name) == 0) return (int)routes[i].slot;
+    }
+    return -1;
+}
+
+static BOOL termite_metal_jit_shape_is_qualified(
+    const termite_metal_jit_qualified_shape shapes[TERMITE_METAL_JIT_SLOT_COUNT][TERMITE_METAL_JIT_MAX_QUALIFIED_SHAPES_PER_ROUTE],
+    const uint8_t counts[TERMITE_METAL_JIT_SLOT_COUNT],
+    size_t slot,
+    size_t out_dim,
+    size_t in_dim
+) {
+    if (slot >= TERMITE_METAL_JIT_SLOT_COUNT || out_dim == 0 || in_dim == 0) return NO;
+    const size_t count = counts[slot];
+    if (count > TERMITE_METAL_JIT_MAX_QUALIFIED_SHAPES_PER_ROUTE) return NO;
+    for (size_t index = 0; index < count; ++index) {
+        if (shapes[slot][index].out_dim == out_dim && shapes[slot][index].in_dim == in_dim) return YES;
+    }
+    return NO;
+}
+
+static BOOL termite_metal_runtime_candidate_gate(
+    termite_metal_decode_runtime *runtime,
+    const char *env_name,
+    size_t out_dim,
+    size_t in_dim
+) {
     if (termite_metal_runtime_generated_quant_disabled(runtime)) return NO;
     if (env_name == NULL) return YES;
     if (runtime == NULL) return termite_metal_generated_quant_candidate_enabled(env_name);
+    const int jit_route_slot = termite_metal_jit_route_slot_for_env(env_name);
+    if (jit_route_slot >= 0 && (runtime->jit_generated_route_mask & (UINT64_C(1) << jit_route_slot)) != 0) {
+        // A runtime-installed pipeline replaces the format-wide pipeline
+        // pointer, so its route must fail closed for every matrix that was not
+        // part of the exact live-qualified model scope.
+        return termite_metal_jit_shape_is_qualified(
+            runtime->jit_qualified_shapes,
+            runtime->jit_qualified_shape_counts,
+            (size_t)jit_route_slot,
+            out_dim,
+            in_dim
+        );
+    }
     BOOL enabled;
     if (termite_metal_runtime_generated_gate_lookup(runtime, env_name, &enabled)) return enabled;
     enabled = termite_metal_generated_quant_candidate_enabled(env_name);
     termite_metal_runtime_generated_gate_store(runtime, env_name, enabled);
     return enabled;
+}
+
+static BOOL termite_metal_provider_candidate_gate(
+    termite_metal_provider *provider,
+    const char *env_name,
+    size_t out_dim,
+    size_t in_dim
+) {
+    if (termite_metal_generated_quant_disabled()) return NO;
+    const int jit_route_slot = termite_metal_jit_route_slot_for_env(env_name);
+    if (provider != NULL && jit_route_slot >= 0 &&
+        (provider->jit_generated_route_mask & (UINT64_C(1) << jit_route_slot)) != 0) {
+        return termite_metal_jit_shape_is_qualified(
+            provider->jit_qualified_shapes,
+            provider->jit_qualified_shape_counts,
+            (size_t)jit_route_slot,
+            out_dim,
+            in_dim
+        );
+    }
+    return termite_metal_generated_quant_candidate_enabled(env_name);
+}
+
+// Pure diagnostic hook used to prove that a runtime-installed route bypasses
+// its legacy opt-in env gate while the global emergency disable remains
+// authoritative. No Metal device is needed.
+int termite_metal_jit_route_gate_probe(
+    uint32_t raw_slot,
+    const char *env_name,
+    size_t qualified_out_dim,
+    size_t qualified_in_dim,
+    size_t query_out_dim,
+    size_t query_in_dim
+) {
+    if (raw_slot >= TERMITE_METAL_JIT_SLOT_COUNT || env_name == NULL ||
+        qualified_out_dim == 0 || qualified_in_dim == 0 || query_out_dim == 0 || query_in_dim == 0) return -1;
+    termite_metal_decode_runtime runtime = {0};
+    runtime.jit_generated_route_mask = UINT64_C(1) << raw_slot;
+    runtime.jit_qualified_shapes[raw_slot][0] = (termite_metal_jit_qualified_shape){
+        .out_dim = qualified_out_dim,
+        .in_dim = qualified_in_dim,
+    };
+    runtime.jit_qualified_shape_counts[raw_slot] = 1;
+    return termite_metal_runtime_candidate_gate(&runtime, env_name, query_out_dim, query_in_dim) ? 1 : 0;
 }
 
 typedef struct termite_metal_attention_gated_block_timing {
@@ -1804,6 +2002,256 @@ size_t termite_metal_copy_device_name(char *buffer, size_t capacity) {
     }
 }
 
+size_t termite_metal_copy_compiler_identity(char *buffer, size_t capacity) {
+    @autoreleasepool {
+        NSString *version = NSProcessInfo.processInfo.operatingSystemVersionString;
+        if (version == nil) return 0;
+        NSString *identity = [@"Apple-Metal/newLibraryWithSource/" stringByAppendingString:version];
+        const char *utf8 = identity.UTF8String;
+        if (utf8 == NULL) return 0;
+        const size_t length = strlen(utf8);
+        if (length == 0) return 0;
+        if (buffer != NULL && capacity >= length) memcpy(buffer, utf8, length);
+        return length;
+    }
+}
+
+int termite_metal_device_info_get(termite_metal_device_info *info) {
+    if (info == NULL) return -1;
+    memset(info, 0, sizeof(*info));
+    @autoreleasepool {
+        id<MTLDevice> device = termite_metal_shared_device();
+        if (device == nil) return -2;
+
+        const MTLSize max_threads = device.maxThreadsPerThreadgroup;
+        info->registry_id = device.registryID;
+        info->recommended_max_working_set_size = device.recommendedMaxWorkingSetSize;
+        info->max_buffer_length = (uint64_t)device.maxBufferLength;
+        info->max_threads_per_threadgroup_width = (uint32_t)max_threads.width;
+        info->max_threads_per_threadgroup_height = (uint32_t)max_threads.height;
+        info->max_threads_per_threadgroup_depth = (uint32_t)max_threads.depth;
+        info->max_threadgroup_memory_length = (uint32_t)device.maxThreadgroupMemoryLength;
+        info->has_unified_memory = device.hasUnifiedMemory ? 1u : 0u;
+
+        if ([device respondsToSelector:@selector(supportsFamily:)]) {
+            for (uint16_t family = 1; family <= 10; ++family) {
+                if ([device supportsFamily:(MTLGPUFamily)(1000 + family)]) info->apple_gpu_family = family;
+            }
+            for (uint16_t family = 1; family <= 2; ++family) {
+                if ([device supportsFamily:(MTLGPUFamily)(2000 + family)]) info->mac_gpu_family = family;
+            }
+            for (uint16_t family = 1; family <= 3; ++family) {
+                if ([device supportsFamily:(MTLGPUFamily)(3000 + family)]) info->common_gpu_family = family;
+            }
+            for (uint16_t family = 1; family <= 2; ++family) {
+                if ([device supportsFamily:(MTLGPUFamily)(5000 + family)]) info->metal_gpu_family = family;
+            }
+        }
+        return 0;
+    }
+}
+
+static void termite_metal_generated_pipeline_set_error(char *buffer, size_t capacity, NSString *message) {
+    if (buffer == NULL || capacity == 0) return;
+    buffer[0] = '\0';
+    const char *utf8 = message.UTF8String;
+    if (utf8 == NULL) return;
+    const size_t length = strlen(utf8);
+    const size_t copy_length = length < capacity - 1 ? length : capacity - 1;
+    memcpy(buffer, utf8, copy_length);
+    buffer[copy_length] = '\0';
+}
+
+termite_metal_generated_pipeline *termite_metal_generated_pipeline_create(
+    const char *source,
+    size_t source_len,
+    const char *kernel_name,
+    int precise_math,
+    char *error_buffer,
+    size_t error_capacity
+) {
+    if (error_buffer != NULL && error_capacity > 0) error_buffer[0] = '\0';
+    if (source == NULL || source_len == 0 || source_len > TERMITE_METAL_GENERATED_SOURCE_MAX_BYTES || kernel_name == NULL) {
+        termite_metal_generated_pipeline_set_error(error_buffer, error_capacity, @"invalid generated Metal pipeline input");
+        return NULL;
+    }
+    const size_t kernel_name_len = strnlen(kernel_name, 4097);
+    if (kernel_name_len == 0 || kernel_name_len > 4096) {
+        termite_metal_generated_pipeline_set_error(error_buffer, error_capacity, @"invalid generated Metal kernel name");
+        return NULL;
+    }
+
+    @autoreleasepool {
+        id<MTLDevice> device = termite_metal_shared_device();
+        if (device == nil) {
+            termite_metal_generated_pipeline_set_error(error_buffer, error_capacity, @"Metal device unavailable");
+            return NULL;
+        }
+
+        NSString *source_string = [[NSString alloc] initWithBytes:source length:source_len encoding:NSUTF8StringEncoding];
+        if (source_string == nil) {
+            termite_metal_generated_pipeline_set_error(error_buffer, error_capacity, @"generated Metal source is not valid UTF-8");
+            return NULL;
+        }
+        NSString *kernel = [[NSString alloc] initWithBytes:kernel_name length:kernel_name_len encoding:NSUTF8StringEncoding];
+        if (kernel == nil) {
+            termite_metal_generated_pipeline_set_error(error_buffer, error_capacity, @"generated Metal kernel name is not valid UTF-8");
+            return NULL;
+        }
+
+        MTLCompileOptions *options = [MTLCompileOptions new];
+        if (precise_math != 0 && options != nil) options.mathMode = MTLMathModeSafe;
+        NSError *error = nil;
+        id<MTLLibrary> library = [device newLibraryWithSource:source_string options:options error:&error];
+        if (library == nil) {
+            termite_metal_generated_pipeline_set_error(
+                error_buffer,
+                error_capacity,
+                [NSString stringWithFormat:@"generated Metal library compile failed: %@", error.localizedDescription ?: @"unknown error"]
+            );
+            return NULL;
+        }
+
+        id<MTLFunction> function = [library newFunctionWithName:kernel];
+        if (function == nil) {
+            termite_metal_generated_pipeline_set_error(
+                error_buffer,
+                error_capacity,
+                [NSString stringWithFormat:@"generated Metal kernel not found: %@", kernel]
+            );
+            return NULL;
+        }
+        id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+        if (pipeline == nil) {
+            termite_metal_generated_pipeline_set_error(
+                error_buffer,
+                error_capacity,
+                [NSString stringWithFormat:@"generated Metal pipeline compile failed: %@", error.localizedDescription ?: @"unknown error"]
+            );
+            return NULL;
+        }
+
+        termite_metal_generated_pipeline *result = calloc(1, sizeof(*result));
+        if (result == NULL) {
+            termite_metal_generated_pipeline_set_error(error_buffer, error_capacity, @"generated Metal pipeline allocation failed");
+            return NULL;
+        }
+        result->device = device;
+        result->library = library;
+        result->pipeline = pipeline;
+        return result;
+    }
+}
+
+int termite_metal_generated_pipeline_info_get(
+    const termite_metal_generated_pipeline *generated,
+    termite_metal_generated_pipeline_info *info
+) {
+    if (generated == NULL || generated->pipeline == nil || info == NULL) return -1;
+    @autoreleasepool {
+        memset(info, 0, sizeof(*info));
+        info->static_threadgroup_memory_length = (uint64_t)generated->pipeline.staticThreadgroupMemoryLength;
+        info->thread_execution_width = (uint32_t)generated->pipeline.threadExecutionWidth;
+        info->max_total_threads_per_threadgroup = (uint32_t)generated->pipeline.maxTotalThreadsPerThreadgroup;
+        return 0;
+    }
+}
+
+int termite_metal_jit_route_activation_allowed(uint32_t raw_slot) {
+    if (raw_slot >= TERMITE_METAL_JIT_SLOT_COUNT) return -1;
+    // The legacy generated-quant kill switch remains authoritative.
+    if (termite_metal_generated_quant_disabled()) return 0;
+    return 1;
+}
+
+int termite_metal_generated_pipeline_install(
+    termite_metal_provider *provider,
+    termite_metal_decode_runtime *runtime,
+    const termite_metal_generated_pipeline *generated,
+    uint32_t raw_slot,
+    const size_t *qualified_shape_pairs,
+    size_t qualified_shape_count
+) {
+    if (generated == NULL || generated->pipeline == nil || raw_slot >= TERMITE_METAL_JIT_SLOT_COUNT) return -1;
+    if (termite_metal_jit_route_activation_allowed(raw_slot) != 1) return -4;
+    const termite_metal_jit_pipeline_slot slot = (termite_metal_jit_pipeline_slot)raw_slot;
+    if (qualified_shape_pairs == NULL || qualified_shape_count == 0 ||
+        qualified_shape_count > TERMITE_METAL_JIT_MAX_QUALIFIED_SHAPES_PER_ROUTE) return -5;
+    for (size_t index = 0; index < qualified_shape_count; ++index) {
+        const size_t out_dim = qualified_shape_pairs[index * 2u];
+        const size_t in_dim = qualified_shape_pairs[index * 2u + 1u];
+        if (out_dim == 0 || in_dim == 0) return -5;
+        if (index > 0) {
+            const size_t previous_out = qualified_shape_pairs[(index - 1u) * 2u];
+            const size_t previous_in = qualified_shape_pairs[(index - 1u) * 2u + 1u];
+            if (out_dim < previous_out || (out_dim == previous_out && in_dim <= previous_in)) return -5;
+        }
+    }
+    id<MTLComputePipelineState> pipeline = generated->pipeline;
+
+#define TERMITE_METAL_INSTALL_JIT_MATMUL(field) \
+    do { \
+        if (provider == NULL || runtime == NULL) return -2; \
+        provider->field = pipeline; \
+        runtime->field = pipeline; \
+    } while (0)
+
+    switch (slot) {
+        case TERMITE_METAL_JIT_SLOT_Q4_K_BIAS_GELU: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q4_k_small_batch_bias_gelu_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q4_0: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q4_0_small_batch_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q4_1: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q4_1_small_batch_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q5_0: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q5_0_small_batch_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q5_1: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q5_1_small_batch_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q2_K: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q2_k_small_batch_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q2_K_BIAS: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q2_k_small_batch_bias_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q2_K_BIAS_GELU: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q2_k_small_batch_bias_gelu_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q3_K: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q3_k_small_batch_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q3_K_BIAS: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q3_k_small_batch_bias_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q3_K_BIAS_GELU: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q3_k_small_batch_bias_gelu_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q4_K_BIAS: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q4_k_small_batch_bias_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q4_K: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q4_k_small_batch_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q8_0: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q8_0_small_batch_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q8_0_BIAS: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q8_0_small_batch_bias_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q8_0_BIAS_GELU: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q8_0_small_batch_bias_gelu_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q8_0_RELU: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q8_0_small_batch_relu_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q8_1: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q8_1_small_batch_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q8_K: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q8_k_small_batch_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q5_K: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q5_k_small_batch_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q5_K_BIAS: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q5_k_small_batch_bias_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q5_K_BIAS_GELU: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q5_k_small_batch_bias_gelu_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q6_K: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q6_k_small_batch_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q6_K_BIAS: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q6_k_small_batch_bias_pipeline); break;
+        case TERMITE_METAL_JIT_SLOT_Q6_K_BIAS_GELU: TERMITE_METAL_INSTALL_JIT_MATMUL(antfly_q6_k_small_batch_bias_gelu_pipeline); break;
+        default: return -3;
+    }
+#undef TERMITE_METAL_INSTALL_JIT_MATMUL
+
+    for (size_t index = 0; index < qualified_shape_count; ++index) {
+        const termite_metal_jit_qualified_shape shape = {
+            .out_dim = qualified_shape_pairs[index * 2u],
+            .in_dim = qualified_shape_pairs[index * 2u + 1u],
+        };
+        provider->jit_qualified_shapes[raw_slot][index] = shape;
+        runtime->jit_qualified_shapes[raw_slot][index] = shape;
+    }
+    provider->jit_qualified_shape_counts[raw_slot] = (uint8_t)qualified_shape_count;
+    runtime->jit_qualified_shape_counts[raw_slot] = (uint8_t)qualified_shape_count;
+    const uint64_t route_bit = UINT64_C(1) << raw_slot;
+    if (provider != NULL) provider->jit_generated_route_mask |= route_bit;
+    if (runtime != NULL) runtime->jit_generated_route_mask |= route_bit;
+    return 0;
+}
+
+void termite_metal_generated_pipeline_destroy(termite_metal_generated_pipeline *generated) {
+    if (generated == NULL) return;
+    @autoreleasepool {
+        generated->pipeline = nil;
+        generated->library = nil;
+        generated->device = nil;
+        free(generated);
+    }
+}
+
 int termite_metal_run_generated_quant_kernel_check(
     const char *source,
     size_t source_len,
@@ -2011,6 +2459,146 @@ typedef struct termite_metal_linear_params {
     uint32_t weight_offset;
     uint32_t second_weight_offset;
 } termite_metal_linear_params;
+
+typedef enum termite_metal_jit_qualification_implementation {
+    TERMITE_METAL_JIT_QUALIFICATION_BASELINE = 0,
+    TERMITE_METAL_JIT_QUALIFICATION_CANDIDATE = 1,
+} termite_metal_jit_qualification_implementation;
+
+static id<MTLComputePipelineState> termite_metal_jit_handwritten_quant_pipeline(
+    termite_metal_provider *provider,
+    uint32_t format,
+    size_t *values_per_block,
+    size_t *bytes_per_block
+) {
+    if (provider == NULL || values_per_block == NULL || bytes_per_block == NULL) return nil;
+    switch (format) {
+        case TERMITE_METAL_QUANT_FORMAT_Q2_K:
+            *values_per_block = 256u; *bytes_per_block = 84u; return provider->q2_k_pipeline;
+        case TERMITE_METAL_QUANT_FORMAT_Q3_K:
+            *values_per_block = 256u; *bytes_per_block = 110u; return provider->q3_k_pipeline;
+        case TERMITE_METAL_QUANT_FORMAT_Q4_K:
+            *values_per_block = 256u; *bytes_per_block = 144u; return provider->q4_k_pipeline;
+        case TERMITE_METAL_QUANT_FORMAT_Q5_K:
+            *values_per_block = 256u; *bytes_per_block = 176u; return provider->q5_k_pipeline;
+        case TERMITE_METAL_QUANT_FORMAT_Q6_K:
+            *values_per_block = 256u; *bytes_per_block = 210u; return provider->q6_k_pipeline;
+        case TERMITE_METAL_QUANT_FORMAT_Q8_0:
+            *values_per_block = 32u; *bytes_per_block = 34u; return provider->q8_0_pipeline;
+        case TERMITE_METAL_QUANT_FORMAT_Q8_K:
+            *values_per_block = 256u; *bytes_per_block = 292u; return provider->q8_k_pipeline;
+        default:
+            return nil;
+    }
+}
+
+// Runs one implementation of the exact production no-bias route against a
+// retained JIT pipeline. Both implementations share device, queue, buffers,
+// inputs, and command submission structure; only the pipeline ABI and launch
+// geometry differ. This keeps paired qualification timings comparable while
+// the Zig harness independently checks both outputs against its CPU oracle.
+int termite_metal_run_jit_quant_route_check(
+    termite_metal_provider *provider,
+    const termite_metal_generated_pipeline *generated,
+    uint32_t format,
+    uint32_t implementation,
+    const float *input,
+    size_t input_count,
+    const uint8_t *weight,
+    size_t weight_count,
+    float *output,
+    size_t output_count,
+    uint32_t rows,
+    uint32_t in_dim,
+    uint32_t out_dim,
+    uint32_t threads_per_threadgroup,
+    uint32_t cols_per_threadgroup,
+    uint32_t warmup_iters,
+    uint32_t measure_iters,
+    uint64_t *elapsed_nanos
+) {
+    if (provider == NULL || generated == NULL || generated->pipeline == nil || input == NULL || weight == NULL || output == NULL) return -1;
+    if (implementation > TERMITE_METAL_JIT_QUALIFICATION_CANDIDATE || rows == 0 || in_dim == 0 || out_dim == 0) return -2;
+    if (input_count != (size_t)rows * (size_t)in_dim || output_count != (size_t)rows * (size_t)out_dim) return -3;
+    if (measure_iters == 0 || warmup_iters > 1024u || measure_iters > 1024u) return -4;
+    if (threads_per_threadgroup == 0 || cols_per_threadgroup == 0) return -5;
+
+    size_t values_per_block = 0;
+    size_t bytes_per_block = 0;
+    id<MTLComputePipelineState> baseline = termite_metal_jit_handwritten_quant_pipeline(
+        provider,
+        format,
+        &values_per_block,
+        &bytes_per_block
+    );
+    if (baseline == nil || in_dim % values_per_block != 0) return -6;
+    const size_t expected_weight_count = (size_t)out_dim * ((size_t)in_dim / values_per_block) * bytes_per_block;
+    if (weight_count != expected_weight_count) return -7;
+    if (generated->device != provider->device) return -8;
+
+    @autoreleasepool {
+        id<MTLBuffer> input_buffer = [provider->device newBufferWithBytes:input length:input_count * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> weight_buffer = [provider->device newBufferWithBytes:weight length:weight_count options:MTLResourceStorageModeShared];
+        id<MTLBuffer> output_buffer = [provider->device newBufferWithLength:output_count * sizeof(float) options:MTLResourceStorageModeShared];
+        if (input_buffer == nil || weight_buffer == nil || output_buffer == nil) return -9;
+        memset(output_buffer.contents, 0, output_count * sizeof(float));
+
+        termite_metal_linear_params params = {
+            .rows = rows,
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .row_blocks = in_dim / (uint32_t)values_per_block,
+            .weight_offset = 0,
+            .second_weight_offset = 0,
+        };
+        const NSUInteger candidate_threads = (NSUInteger)threads_per_threadgroup;
+        const NSUInteger candidate_cols = (NSUInteger)cols_per_threadgroup;
+        if (generated->pipeline.maxTotalThreadsPerThreadgroup < candidate_threads) return -10;
+        const NSUInteger candidate_grid_cols = ((NSUInteger)out_dim + candidate_cols - 1u) / candidate_cols;
+        const NSUInteger baseline_total = (NSUInteger)rows * (NSUInteger)out_dim;
+        NSUInteger baseline_threads = baseline.maxTotalThreadsPerThreadgroup;
+        if (baseline_threads == 0) baseline_threads = 64u;
+        if (baseline_threads > baseline_total) baseline_threads = baseline_total;
+
+        uint64_t started_at = 0;
+        const uint32_t total_iters = warmup_iters + measure_iters;
+        for (uint32_t iter = 0; iter < total_iters; ++iter) {
+            if (iter == warmup_iters) started_at = termite_metal_clock_monotonic_nanos();
+            id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(provider->queue, __func__);
+            if (command_buffer == nil) return -11;
+            id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+            if (encoder == nil) return -12;
+            if (implementation == TERMITE_METAL_JIT_QUALIFICATION_CANDIDATE) {
+                [encoder setComputePipelineState:generated->pipeline];
+                [encoder setBuffer:input_buffer offset:0 atIndex:0];
+                [encoder setBuffer:weight_buffer offset:0 atIndex:1];
+                [encoder setBuffer:output_buffer offset:0 atIndex:2];
+                [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
+                [encoder setBytes:&in_dim length:sizeof(in_dim) atIndex:4];
+                [encoder setBytes:&out_dim length:sizeof(out_dim) atIndex:5];
+                [encoder dispatchThreadgroups:MTLSizeMake(candidate_grid_cols, (NSUInteger)rows, 1)
+                        threadsPerThreadgroup:MTLSizeMake(candidate_threads, 1, 1)];
+            } else {
+                [encoder setComputePipelineState:baseline];
+                [encoder setBuffer:input_buffer offset:0 atIndex:0];
+                [encoder setBuffer:weight_buffer offset:0 atIndex:1];
+                [encoder setBuffer:output_buffer offset:0 atIndex:2];
+                [encoder setBytes:&params length:sizeof(params) atIndex:3];
+                [encoder dispatchThreads:MTLSizeMake(baseline_total, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(baseline_threads, 1, 1)];
+            }
+            [encoder endEncoding];
+            [command_buffer commit];
+            [command_buffer waitUntilCompleted];
+            if (command_buffer.status != MTLCommandBufferStatusCompleted) return -13;
+        }
+        const uint64_t finished_at = termite_metal_clock_monotonic_nanos();
+        if (started_at == 0 || finished_at < started_at) return -14;
+        if (elapsed_nanos != NULL) *elapsed_nanos = finished_at - started_at;
+        memcpy(output, output_buffer.contents, output_count * sizeof(float));
+        return 0;
+    }
+}
 
 typedef struct termite_metal_qkv_linear_params {
     uint32_t rows;
@@ -9192,7 +9780,7 @@ static int termite_metal_encode_quant_matmul_none_on_encoder_family(
         family == TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH") &&
+        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH", descriptor->out_dim, descriptor->in_dim) &&
         runtime->antfly_q8_0_small_batch_pipeline != nil);
     const BOOL use_mmv = (!use_mm_sg &&
         !use_mm &&
@@ -9919,7 +10507,7 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
             : runtime->q4_0_reduce_f16_input_pipeline;
     const BOOL q4_0_reduce_selected_small = q4_0_reduce_selected_pipeline == runtime->q4_0_reduce_small_pipeline;
     const BOOL q4_0_reduce_f16_input_selected_small = q4_0_reduce_f16_input_selected_pipeline == runtime->q4_0_reduce_f16_input_small_pipeline;
-    const BOOL antfly_q4_0_small_batch_enabled = termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q4_0_SMALL_BATCH");
+    const BOOL antfly_q4_0_small_batch_enabled = termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q4_0_SMALL_BATCH", descriptor->out_dim, descriptor->in_dim);
     if (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q4_0 &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
@@ -10199,14 +10787,14 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q2_K_SMALL_BATCH") &&
+        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q2_K_SMALL_BATCH", descriptor->out_dim, descriptor->in_dim) &&
         runtime->antfly_q2_k_small_batch_pipeline != nil);
     const BOOL use_antfly_q3_k_small_batch = (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q3_K &&
         f32_activation_buffers &&
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q3_K_SMALL_BATCH") &&
+        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q3_K_SMALL_BATCH", descriptor->out_dim, descriptor->in_dim) &&
         runtime->antfly_q3_k_small_batch_pipeline != nil);
     const BOOL use_antfly_q4_0_small_batch = (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q4_0 &&
         f32_activation_buffers &&
@@ -10220,63 +10808,63 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q4_1_SMALL_BATCH") &&
+        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q4_1_SMALL_BATCH", descriptor->out_dim, descriptor->in_dim) &&
         runtime->antfly_q4_1_small_batch_pipeline != nil);
     const BOOL use_antfly_q5_0_small_batch = (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q5_0 &&
         f32_activation_buffers &&
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q5_0_SMALL_BATCH") &&
+        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q5_0_SMALL_BATCH", descriptor->out_dim, descriptor->in_dim) &&
         runtime->antfly_q5_0_small_batch_pipeline != nil);
     const BOOL use_antfly_q5_1_small_batch = (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q5_1 &&
         f32_activation_buffers &&
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q5_1_SMALL_BATCH") &&
+        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q5_1_SMALL_BATCH", descriptor->out_dim, descriptor->in_dim) &&
         runtime->antfly_q5_1_small_batch_pipeline != nil);
     const BOOL use_antfly_q8_1_small_batch = (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q8_1 &&
         f32_activation_buffers &&
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q8_1_SMALL_BATCH") &&
+        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q8_1_SMALL_BATCH", descriptor->out_dim, descriptor->in_dim) &&
         runtime->antfly_q8_1_small_batch_pipeline != nil);
     const BOOL use_antfly_q8_k_small_batch = (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q8_K &&
         f32_activation_buffers &&
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q8_K_SMALL_BATCH") &&
+        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q8_K_SMALL_BATCH", descriptor->out_dim, descriptor->in_dim) &&
         runtime->antfly_q8_k_small_batch_pipeline != nil);
     const BOOL use_antfly_q8_0_small_batch = (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q8_0 &&
         f32_activation_buffers &&
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH") &&
+        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH", descriptor->out_dim, descriptor->in_dim) &&
         runtime->antfly_q8_0_small_batch_pipeline != nil);
     const BOOL use_antfly_q4_k_small_batch = (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q4_K &&
         f32_activation_buffers &&
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH") &&
+        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH", descriptor->out_dim, descriptor->in_dim) &&
         runtime->antfly_q4_k_small_batch_pipeline != nil);
     const BOOL use_antfly_q5_k_small_batch = (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q5_K &&
         f32_activation_buffers &&
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q5_K_SMALL_BATCH") &&
+        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q5_K_SMALL_BATCH", descriptor->out_dim, descriptor->in_dim) &&
         runtime->antfly_q5_k_small_batch_pipeline != nil);
     const BOOL use_antfly_q6_k_small_batch = (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q6_K &&
         f32_activation_buffers &&
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q6_K_SMALL_BATCH") &&
+        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q6_K_SMALL_BATCH", descriptor->out_dim, descriptor->in_dim) &&
         runtime->antfly_q6_k_small_batch_pipeline != nil);
     if (use_antfly_q2_k_small_batch || use_antfly_q3_k_small_batch || use_antfly_q4_0_small_batch || use_antfly_q4_1_small_batch || use_antfly_q5_0_small_batch || use_antfly_q5_1_small_batch || use_antfly_q8_0_small_batch || use_antfly_q8_1_small_batch || use_antfly_q8_k_small_batch || use_antfly_q4_k_small_batch || use_antfly_q5_k_small_batch || use_antfly_q6_k_small_batch) {
         termite_metal_generated_quant_launch_shape launch_shape;
@@ -14563,7 +15151,9 @@ void termite_metal_provider_destroy(termite_metal_provider *provider) {
     if (provider == NULL) return;
     @autoreleasepool {
         provider->q4_0_pipeline = nil;
+        provider->antfly_q4_0_small_batch_pipeline = nil;
         provider->q4_1_pipeline = nil;
+        provider->antfly_q4_1_small_batch_pipeline = nil;
         provider->q5_0_pipeline = nil;
         provider->antfly_q5_0_small_batch_pipeline = nil;
         provider->q5_1_pipeline = nil;
@@ -22487,7 +23077,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_q4_k_bias_gelu_slot_devi
     size_t output_offset
 ) {
     if (runtime == NULL || input_handle == NULL || bias_handle == NULL || output_handle == NULL) return -1;
-    if (!termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH_BIAS_GELU")) return -2;
+    if (!termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH_BIAS_GELU", out_dim, in_dim)) return -2;
     if (slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -3;
     if (rows < 2 || rows > 8 || in_dim == 0 || out_dim == 0 || (in_dim & 255u) != 0) return -4;
     if (rows > UINT32_MAX || in_dim > UINT32_MAX || out_dim > UINT32_MAX) return -5;
@@ -22545,7 +23135,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_q4_k_bias_slot_device(
     size_t output_offset
 ) {
     if (runtime == NULL || input_handle == NULL || bias_handle == NULL || output_handle == NULL) return -1;
-    if (!termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH_BIAS")) return -2;
+    if (!termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH_BIAS", out_dim, in_dim)) return -2;
     if (slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -3;
     if (rows < 2 || rows > 8 || in_dim == 0 || out_dim == 0 || (in_dim & 255u) != 0) return -4;
     if (rows > UINT32_MAX || in_dim > UINT32_MAX || out_dim > UINT32_MAX) return -5;
@@ -22608,7 +23198,7 @@ static int termite_metal_decode_runtime_apply_quantized_linear_k_bias_generated_
     size_t output_offset
 ) {
     if (runtime == NULL || dispatch_counter == NULL || input_handle == NULL || bias_handle == NULL || output_handle == NULL) return -1;
-    if (!termite_metal_runtime_candidate_gate(runtime, env_name)) return -2;
+    if (!termite_metal_runtime_candidate_gate(runtime, env_name, out_dim, in_dim)) return -2;
     if (slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -3;
     if (rows < 2 || rows > 8 || in_dim == 0 || out_dim == 0) return -4;
     if (rows > UINT32_MAX || in_dim > UINT32_MAX || out_dim > UINT32_MAX) return -5;
@@ -22669,7 +23259,7 @@ static int termite_metal_decode_runtime_apply_quantized_linear_generated_slot_de
     size_t output_offset
 ) {
     if (runtime == NULL || dispatch_counter == NULL || input_handle == NULL || output_handle == NULL) return -1;
-    if (!termite_metal_runtime_candidate_gate(runtime, env_name)) return -2;
+    if (!termite_metal_runtime_candidate_gate(runtime, env_name, out_dim, in_dim)) return -2;
     if (slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -3;
     if (rows < 2 || rows > 8 || in_dim == 0 || out_dim == 0) return -4;
     if (rows > UINT32_MAX || in_dim > UINT32_MAX || out_dim > UINT32_MAX) return -5;
@@ -41485,10 +42075,17 @@ static int termite_metal_dispatch_quant_matmul_none(termite_metal_provider *prov
         id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
         if (encoder == nil) return -6;
         termite_metal_decode_runtime runtime = {0};
+        runtime.jit_generated_route_mask = provider->jit_generated_route_mask;
+        memcpy(runtime.jit_qualified_shapes, provider->jit_qualified_shapes, sizeof(runtime.jit_qualified_shapes));
+        memcpy(runtime.jit_qualified_shape_counts, provider->jit_qualified_shape_counts, sizeof(runtime.jit_qualified_shape_counts));
         runtime.q2_k_pipeline = provider->q2_k_pipeline;
         runtime.antfly_q2_k_small_batch_pipeline = provider->antfly_q2_k_small_batch_pipeline;
         runtime.q3_k_pipeline = provider->q3_k_pipeline;
         runtime.antfly_q3_k_small_batch_pipeline = provider->antfly_q3_k_small_batch_pipeline;
+        runtime.q4_0_pipeline = provider->q4_0_pipeline;
+        runtime.antfly_q4_0_small_batch_pipeline = provider->antfly_q4_0_small_batch_pipeline;
+        runtime.q4_1_pipeline = provider->q4_1_pipeline;
+        runtime.antfly_q4_1_small_batch_pipeline = provider->antfly_q4_1_small_batch_pipeline;
         runtime.q5_0_pipeline = provider->q5_0_pipeline;
         runtime.antfly_q5_0_small_batch_pipeline = provider->antfly_q5_0_small_batch_pipeline;
         runtime.q5_1_pipeline = provider->q5_1_pipeline;
@@ -41546,7 +42143,7 @@ static int termite_metal_dispatch_quant_matmul_none(termite_metal_provider *prov
 }
 
 static int termite_metal_dispatch_generated_quant_bias(termite_metal_provider *provider, const char *env_name, id<MTLComputePipelineState> pipeline, uint32_t format, termite_metal_generated_quant_epilogue epilogue, const float *input, size_t rows, size_t in_dim, size_t values_per_block, size_t bytes_per_block, const uint8_t *weight_raw, size_t weight_bytes, size_t out_dim, const float *bias, float *output) {
-    if (!termite_metal_generated_quant_candidate_enabled(env_name)) return -9;
+    if (!termite_metal_provider_candidate_gate(provider, env_name, out_dim, in_dim)) return -9;
     if (provider == NULL || pipeline == nil || input == NULL || weight_raw == NULL || bias == NULL || output == NULL) return -1;
     if (values_per_block == 0 || in_dim % values_per_block != 0) return -2;
     if (weight_bytes != out_dim * (in_dim / values_per_block) * bytes_per_block) return -3;
@@ -41596,7 +42193,7 @@ static int termite_metal_dispatch_generated_quant_bias(termite_metal_provider *p
 }
 
 static int termite_metal_dispatch_generated_quant_relu(termite_metal_provider *provider, const char *env_name, id<MTLComputePipelineState> pipeline, uint32_t format, termite_metal_generated_quant_epilogue epilogue, const float *input, size_t rows, size_t in_dim, size_t values_per_block, size_t bytes_per_block, const uint8_t *weight_raw, size_t weight_bytes, size_t out_dim, float *output) {
-    if (!termite_metal_generated_quant_candidate_enabled(env_name)) return -9;
+    if (!termite_metal_provider_candidate_gate(provider, env_name, out_dim, in_dim)) return -9;
     if (provider == NULL || pipeline == nil || input == NULL || weight_raw == NULL || output == NULL) return -1;
     if (values_per_block == 0 || in_dim % values_per_block != 0) return -2;
     if (weight_bytes != out_dim * (in_dim / values_per_block) * bytes_per_block) return -3;
@@ -41874,6 +42471,9 @@ int termite_metal_provider_linear_q8_0_planned(termite_metal_provider *provider,
         id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
         if (encoder == nil) return -5;
         termite_metal_decode_runtime runtime = {0};
+        runtime.jit_generated_route_mask = provider->jit_generated_route_mask;
+        memcpy(runtime.jit_qualified_shapes, provider->jit_qualified_shapes, sizeof(runtime.jit_qualified_shapes));
+        memcpy(runtime.jit_qualified_shape_counts, provider->jit_qualified_shape_counts, sizeof(runtime.jit_qualified_shape_counts));
         runtime.q8_0_pipeline = provider->q8_0_pipeline;
         runtime.q8_0_mmv_pipeline = provider->q8_0_mmv_pipeline;
         runtime.q8_0_small_batch_r2_pipeline = provider->q8_0_small_batch_r2_pipeline;

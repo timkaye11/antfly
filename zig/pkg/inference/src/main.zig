@@ -65,14 +65,14 @@ const RunConfig = struct {
     max_concurrent_requests: ?usize = null,
     pool_size: ?usize = null,
     generation_batching: ?inference.server.GenerationBatchingConfig = null,
+    kernel_jit: ?inference.graph.kernel_jit.Config = null,
     prompt_cache: ?PromptCacheConfig = null,
 };
 
-fn loadRunConfig(allocator: std.mem.Allocator, path: []const u8) !RunConfig {
+fn loadRunConfig(allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(RunConfig) {
     const raw = try inference.util.c_file.readFileMax(allocator, path, std.math.maxInt(usize));
     defer allocator.free(raw);
-    const parsed = try parseRunConfig(allocator, raw);
-    return parsed.value;
+    return try parseRunConfig(allocator, raw);
 }
 
 fn parseRunConfig(allocator: std.mem.Allocator, raw: []const u8) !std.json.Parsed(RunConfig) {
@@ -90,6 +90,7 @@ fn parseRunConfig(allocator: std.mem.Allocator, raw: []const u8) !std.json.Parse
             .ttl_ms = value.ttl_ms,
         }).validate();
     }
+    if (parsed.value.kernel_jit) |value| try value.validate();
     return parsed;
 }
 
@@ -138,6 +139,24 @@ fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
 
 fn parseAdmissionLimit(value: []const u8) !usize {
     return try std.fmt.parseInt(usize, value, 10);
+}
+
+fn parseKernelJitMode(value: []const u8) !inference.graph.kernel_jit.Mode {
+    return std.meta.stringToEnum(inference.graph.kernel_jit.Mode, value) orelse error.InvalidArguments;
+}
+
+fn resolveKernelJitConfig(
+    config: ?inference.graph.kernel_jit.Config,
+    env_mode: ?[]const u8,
+    cli_mode: ?inference.graph.kernel_jit.Mode,
+) !inference.graph.kernel_jit.Config {
+    var resolved: inference.graph.kernel_jit.Config = config orelse .{};
+    if (cli_mode) |value|
+        resolved.mode = value
+    else if (env_mode) |value|
+        resolved.mode = try parseKernelJitMode(value);
+    try resolved.validate();
+    return resolved;
 }
 
 fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConfig.WarmModelConfig) ![]inference.server.WarmModel {
@@ -260,6 +279,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var ml_dir: []const u8 = defaultMlDir(allocator);
     var config_path: ?[]const u8 = null;
     var max_concurrent_requests_override: ?usize = null;
+    var kernel_jit_mode_override: ?inference.graph.kernel_jit.Mode = null;
     var allow_insecure_public_bind = false;
     var models_overridden = false;
     var ml_overridden = false;
@@ -288,16 +308,24 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         } else if (std.mem.eql(u8, args[i], "--max-concurrent-requests") and i + 1 < args.len) {
             max_concurrent_requests_override = try parseAdmissionLimit(args[i + 1]);
             i += 1;
+        } else if (std.mem.eql(u8, args[i], "--kernel-jit-mode")) {
+            if (i + 1 >= args.len) return error.MissingKernelJitMode;
+            kernel_jit_mode_override = try parseKernelJitMode(args[i + 1]);
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--preload-model") and i + 1 < args.len) {
             try preload_models.append(allocator, try parsePreloadModelFlag(args[i + 1]));
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--allow-insecure-public-bind")) {
             allow_insecure_public_bind = true;
+        } else {
+            return error.InvalidArguments;
         }
     }
 
-    const loaded_cfg = if (config_path) |path| try loadRunConfig(allocator, path) else null;
-    if (loaded_cfg) |cfg| {
+    var loaded_cfg: ?std.json.Parsed(RunConfig) = if (config_path) |path| try loadRunConfig(allocator, path) else null;
+    defer if (loaded_cfg) |*parsed| parsed.deinit();
+    if (loaded_cfg) |parsed| {
+        const cfg = parsed.value;
         if (!models_overridden) {
             if (cfg.models_dir) |value| models_dir = value;
         }
@@ -330,7 +358,8 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         .preload = preload_models.items,
         .allow_insecure_public_bind = allow_insecure_public_bind,
     };
-    if (loaded_cfg) |cfg| {
+    if (loaded_cfg) |parsed| {
+        const cfg = parsed.value;
         node_cfg.content_security = cfg.content_security;
         node_cfg.s3_credentials = cfg.s3_credentials;
         if (preload_models.items.len == 0) {
@@ -350,13 +379,23 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             .ttl_ms = value.ttl_ms,
         };
     }
+    node_cfg.kernel_jit = try resolveKernelJitConfig(
+        if (loaded_cfg) |parsed| parsed.value.kernel_jit else null,
+        platform.env.getenv("ANTFLY_INFERENCE_KERNEL_JIT_MODE"),
+        kernel_jit_mode_override,
+    );
+    print("kernel jit: mode={s} cache_mb={d} preload_budget_ms={d}\n", .{
+        @tagName(node_cfg.kernel_jit.mode),
+        node_cfg.kernel_jit.max_cache_bytes_mb,
+        node_cfg.kernel_jit.preload_budget_ms,
+    });
     if (max_concurrent_requests_override) |value| node_cfg.max_concurrent_requests = value;
 
     var node = try inference.server.Node.init(allocator, node_cfg);
     defer node.deinit();
     node.attachIo(io);
 
-    try node.warmConfiguredModels(allocator);
+    try node.warmConfiguredModelsBeforeServing(allocator);
     print("listening on {s}:{d}\n", .{ host, port });
     try node.serve(allocator, io, host, port);
 
@@ -502,7 +541,9 @@ fn printUsage(usage_name: []const u8) void {
         \\  --port <port>     Listen port (default: 8090)
         \\  --models-dir <dir>    AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>        Traditional ML directory (default: ~/.antfly/inference/ml)
+        \\  --config <path>       JSON runtime configuration, including full kernel JIT policy
         \\  --max-concurrent-requests <n> Bound weighted in-flight request capacity before returning 503
+        \\  --kernel-jit-mode <off|shadow|on|required> JIT startup-preloaded Metal/CUDA models
         \\  --preload-model <kind:name|kind:backend:name> Preload and warm a configured model before serving
         \\
         \\Pull options:
@@ -543,6 +584,7 @@ test "run config parses shared scraping fields and ignores api_url" {
         \\    "max_step_query_tokens": 256,
         \\    "max_decode_wait_us": 750
         \\  },
+        \\  "kernel_jit": { "mode": "shadow", "cache_dir": "/tmp/jit", "max_cache_bytes_mb": 256, "preload_budget_ms": 120000 },
         \\  "prompt_cache": { "enabled": true, "mode": "block_hash", "max_bytes_mb": 64, "min_tokens": 32, "ttl_ms": 1000 }
         \\}
     ;
@@ -565,6 +607,10 @@ test "run config parses shared scraping fields and ignores api_url" {
     try std.testing.expectEqual(@as(usize, 8), parsed.value.generation_batching.?.max_step_items);
     try std.testing.expectEqual(@as(usize, 256), parsed.value.generation_batching.?.max_step_query_tokens);
     try std.testing.expectEqual(@as(u32, 750), parsed.value.generation_batching.?.max_decode_wait_us);
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.shadow, parsed.value.kernel_jit.?.mode);
+    try std.testing.expectEqualStrings("/tmp/jit", parsed.value.kernel_jit.?.cache_dir.?);
+    try std.testing.expectEqual(@as(usize, 256), parsed.value.kernel_jit.?.max_cache_bytes_mb);
+    try std.testing.expectEqual(@as(u64, 120_000), parsed.value.kernel_jit.?.preload_budget_ms);
     try std.testing.expectEqual(true, parsed.value.prompt_cache.?.enabled);
     try std.testing.expectEqual(inference.runtime.kv.prompt_cache.Mode.block_hash, parsed.value.prompt_cache.?.mode);
     try std.testing.expectEqual(@as(usize, 64), parsed.value.prompt_cache.?.max_bytes_mb);
@@ -589,6 +635,49 @@ test "run config rejects unrepresentable prompt cache values" {
     );
     defer allocator.free(ttl_overflow);
     try std.testing.expectError(error.InvalidPromptCacheConfig, parseRunConfig(allocator, ttl_overflow));
+}
+
+test "kernel JIT config defaults off and rejects invalid budgets" {
+    const parsed = try parseRunConfig(std.testing.allocator, "{\"kernel_jit\":{}}");
+    defer parsed.deinit();
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.off, parsed.value.kernel_jit.?.mode);
+    try std.testing.expectEqual(@as(usize, 1024), parsed.value.kernel_jit.?.max_cache_bytes_mb);
+    try std.testing.expectEqual(@as(u64, 300_000), parsed.value.kernel_jit.?.preload_budget_ms);
+
+    try std.testing.expectError(
+        error.InvalidKernelJitPreloadBudget,
+        parseRunConfig(std.testing.allocator, "{\"kernel_jit\":{\"preload_budget_ms\":999}}"),
+    );
+    try std.testing.expectError(
+        error.InvalidKernelJitCacheDir,
+        parseRunConfig(std.testing.allocator, "{\"kernel_jit\":{\"cache_dir\":\"\"}}"),
+    );
+}
+
+test "kernel JIT mode precedence is CLI then environment then config" {
+    const configured = inference.graph.kernel_jit.Config{ .mode = .shadow, .max_cache_bytes_mb = 256 };
+    const from_config = try resolveKernelJitConfig(configured, null, null);
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.shadow, from_config.mode);
+
+    const from_env = try resolveKernelJitConfig(configured, "on", null);
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.on, from_env.mode);
+    try std.testing.expectEqual(@as(usize, 256), from_env.max_cache_bytes_mb);
+
+    const from_cli = try resolveKernelJitConfig(configured, "on", .required);
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.required, from_cli.mode);
+    const from_cli_over_invalid_env = try resolveKernelJitConfig(configured, "invalid", .required);
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.required, from_cli_over_invalid_env.mode);
+
+    const defaults = try resolveKernelJitConfig(null, null, null);
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.off, defaults.mode);
+    try std.testing.expectError(error.InvalidArguments, resolveKernelJitConfig(null, "invalid", null));
+}
+
+test "inference run rejects unknown flags instead of silently disabling policy" {
+    try std.testing.expectError(
+        error.InvalidArguments,
+        runServer(std.heap.page_allocator, std.testing.io, &.{ "--kernel-jti-mode", "required" }),
+    );
 }
 
 test "run max concurrent request parser accepts zero as unlimited" {

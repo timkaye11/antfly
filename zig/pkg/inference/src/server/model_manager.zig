@@ -728,12 +728,72 @@ pub fn isManifestPotentiallyLoadableInCurrentBuild(man: manifest_mod.ModelManife
     return false;
 }
 
+const DeclaredOptionalSessionKind = enum {
+    vision,
+    audio,
+    text_projection,
+    visual_projection,
+    audio_projection,
+};
+
+const DeclaredOptionalSession = struct {
+    kind: DeclaredOptionalSessionKind,
+    path: ?[]const u8,
+};
+
+const declared_optional_session_count = @typeInfo(DeclaredOptionalSessionKind).@"enum".fields.len;
+
+fn declaredOptionalSessions(manifest: *const manifest_mod.ModelManifest) [declared_optional_session_count]DeclaredOptionalSession {
+    return .{
+        .{ .kind = .vision, .path = manifest.visual_model_path },
+        .{ .kind = .audio, .path = manifest.audio_model_path },
+        .{ .kind = .text_projection, .path = manifest.text_projection_path },
+        .{ .kind = .visual_projection, .path = manifest.visual_projection_path },
+        .{ .kind = .audio_projection, .path = manifest.audio_projection_path },
+    };
+}
+
+fn declaredOptionalSessionsComplete(
+    manifest: *const manifest_mod.ModelManifest,
+    loaded: [declared_optional_session_count]bool,
+) bool {
+    for (declaredOptionalSessions(manifest), loaded) |declared, is_loaded| {
+        if (declared.path != null and !is_loaded) return false;
+    }
+    return true;
+}
+
+fn ownSelectedFirstBackendPreference(
+    allocator: std.mem.Allocator,
+    preferred: []const backends.BackendType,
+    selected: backends.BackendType,
+) ![]backends.BackendType {
+    var count: usize = 1;
+    for (preferred) |backend| {
+        if (backend != selected) count += 1;
+    }
+    const result = try allocator.alloc(backends.BackendType, count);
+    result[0] = selected;
+    var index: usize = 1;
+    for (preferred) |backend| {
+        if (backend == selected) continue;
+        result[index] = backend;
+        index += 1;
+    }
+    return result;
+}
+
 pub const LoadedModel = struct {
     manifest: manifest_mod.ModelManifest,
     hf_tok: ?*hf_tokenizer.HfTokenizer,
     sp_tok: ?*sentencepiece.Processor,
     session: backends.Session,
     session_manager: *backends.SessionManager,
+    /// Backend order captured when the primary session was loaded, with the
+    /// selected backend first. Optional vision/audio/projection sessions use
+    /// this owned order while inheriting the manager's current JIT load
+    /// context, so an explicit startup preload backend cannot silently drift.
+    optional_session_preferred_backends: []backends.BackendType,
     model_dir: []const u8,
     allocator: std.mem.Allocator,
     chat_tmpl: ?*ChatTemplate = null,
@@ -808,7 +868,49 @@ pub const LoadedModel = struct {
         if (slot.* != null) return;
         const session_path = path orelse return;
         const shared_ctx = backends.imported_onnx_session.sharedBackendContext(self.session);
-        slot.* = try self.session_manager.loadModelWithImportedOnnxContext(session_path, shared_ctx);
+        var session_manager = self.session_manager.*.withPreferredBackends(
+            self.allocator,
+            self.optional_session_preferred_backends,
+        );
+        slot.* = try session_manager.loadModelWithImportedOnnxContext(session_path, shared_ctx);
+    }
+
+    /// Load every optional model/projection declared by the manifest without
+    /// running media inference. Startup preload calls this while the node owns
+    /// the exclusive JIT qualification phase, preventing a first media request
+    /// from triggering dynamic compiler work after publication.
+    pub fn materializeDeclaredOptionalSessions(self: *LoadedModel) !void {
+        spinLock(&self.embedding_session_lock);
+        defer self.embedding_session_lock.unlock();
+
+        for (declaredOptionalSessions(&self.manifest)) |declared| {
+            switch (declared.kind) {
+                .vision => try self.ensureOptionalSession(&self.vision_session, declared.path),
+                .audio => try self.ensureOptionalSession(&self.audio_session, declared.path),
+                .text_projection => try self.ensureOptionalSession(&self.text_projection, declared.path),
+                .visual_projection => try self.ensureOptionalSession(&self.visual_projection, declared.path),
+                .audio_projection => try self.ensureOptionalSession(&self.audio_projection, declared.path),
+            }
+        }
+        if (!self.declaredOptionalSessionsMaterializedUnlocked()) {
+            return error.OptionalSessionMaterializationIncomplete;
+        }
+    }
+
+    pub fn declaredOptionalSessionsMaterialized(self: *LoadedModel) bool {
+        spinLock(&self.embedding_session_lock);
+        defer self.embedding_session_lock.unlock();
+        return self.declaredOptionalSessionsMaterializedUnlocked();
+    }
+
+    fn declaredOptionalSessionsMaterializedUnlocked(self: *const LoadedModel) bool {
+        return declaredOptionalSessionsComplete(&self.manifest, .{
+            self.vision_session != null,
+            self.audio_session != null,
+            self.text_projection != null,
+            self.visual_projection != null,
+            self.audio_projection != null,
+        });
     }
 
     pub fn ensureVisionSession(self: *LoadedModel) !void {
@@ -998,6 +1100,7 @@ pub const LoadedModel = struct {
             sp.deinit();
             self.allocator.destroy(sp);
         }
+        self.allocator.free(self.optional_session_preferred_backends);
         if (self.chat_tmpl) |ct| {
             var ct_mut = @constCast(ct);
             ct_mut.deinit();
@@ -1183,7 +1286,7 @@ pub const ModelManager = struct {
         // waited for duplicate-load suppression.
         if (try self.findLoadedModel(model_dir, preferred_backends, use_default_alias)) |model| return model;
 
-        var session_manager = sessionManagerForPreferredBackends(self.allocator, preferred_backends, &self.session_manager);
+        var session_manager = self.session_manager.withPreferredBackends(self.allocator, preferred_backends);
         const model = try self.loadFromDirUncached(model_dir, &session_manager);
         errdefer destroyLoadedModel(self, model);
 
@@ -1257,6 +1360,12 @@ pub const ModelManager = struct {
         // Load session.
         const session = try loadSessionForPreferredBackends(self.allocator, sm.preferred_backends, model_dir, man, sm);
         errdefer session.close();
+        const optional_session_preferred_backends = try ownSelectedFirstBackendPreference(
+            self.allocator,
+            sm.preferred_backends,
+            session.backend(),
+        );
+        errdefer self.allocator.free(optional_session_preferred_backends);
 
         // Load chat template if available (for generator models)
         const chat_tmpl: ?*ChatTemplate = if (man.chat_template) |ct_source| blk2: {
@@ -1326,6 +1435,7 @@ pub const ModelManager = struct {
             .sp_tok = sp_tok,
             .session = session,
             .session_manager = &self.session_manager,
+            .optional_session_preferred_backends = optional_session_preferred_backends,
             .model_dir = owned_model_dir,
             .allocator = self.allocator,
             .chat_tmpl = chat_tmpl,
@@ -1442,19 +1552,6 @@ fn effectiveLoadBackends(
     return scratch[0..idx];
 }
 
-fn sessionManagerForPreferredBackends(
-    allocator: std.mem.Allocator,
-    preferred_backends: []const backends.BackendType,
-    source: *const backends.SessionManager,
-) backends.SessionManager {
-    return .{
-        .allocator = allocator,
-        .preferred_backends = preferred_backends,
-        .graph_runtime_strategy = source.graph_runtime_strategy,
-        .io = source.io,
-    };
-}
-
 fn loadSessionForPreferredBackends(
     allocator: std.mem.Allocator,
     preferred_backends: []const backends.BackendType,
@@ -1466,12 +1563,18 @@ fn loadSessionForPreferredBackends(
     const effective_backends = effectiveLoadBackends(&effective_scratch, preferred_backends, man);
     for (effective_backends) |backend| {
         if (!backend.supportsDirectSessionLoad()) continue;
+        if (source_session_manager.kernel_jit.mode.failClosed() and
+            !backend.supportsKernelJitSession()) continue;
         const candidate_path = preferredModelPathForBackend(model_dir, man, backend) orelse continue;
+        if (source_session_manager.kernel_jit.mode.failClosed() and
+            std.mem.endsWith(u8, candidate_path, ".onnx")) continue;
         var single_backend = [_]backends.BackendType{backend};
-        var backend_session_manager = sessionManagerForPreferredBackends(allocator, single_backend[0..], source_session_manager);
+        var backend_session_manager = source_session_manager.*.withPreferredBackends(allocator, single_backend[0..]);
         if (backend_session_manager.loadModel(candidate_path)) |session| {
             return session;
-        } else |_| {}
+        } else |err| {
+            if (graph_mod.kernel_jit.isRequiredFailure(source_session_manager.kernel_jit.mode, err)) return err;
+        }
     }
 
     std.log.err("loadModel({s}) failed: no backend accepted model", .{model_dir});
@@ -1483,6 +1586,9 @@ fn loadSessionForPreferredBackends(
         man.visual_projection_path,
         man.audio_projection_path,
     });
+    if (source_session_manager.kernel_jit.mode.failClosed()) {
+        return error.KernelJitRequiredBackendUnavailable;
+    }
     return error.NoModelFileFound;
 }
 
@@ -1500,14 +1606,50 @@ test "shouldPreferNativeSession prefers native GLiNER weights" {
     try std.testing.expect(shouldPreferNativeSession(man));
 }
 
-test "model manager backend clones preserve explicit graph runtime" {
-    var source = backends.SessionManager.init(std.testing.allocator);
-    source.graph_runtime_strategy = .partitioned;
-    const preferred = [_]backends.BackendType{.onnx};
+test "optional sessions retain the selected backend before fallbacks" {
+    const preferred = [_]backends.BackendType{ .metal, .native };
+    const owned = try ownSelectedFirstBackendPreference(
+        std.testing.allocator,
+        &preferred,
+        .native,
+    );
+    defer std.testing.allocator.free(owned);
+    try std.testing.expectEqualSlices(backends.BackendType, &.{ .native, .metal }, owned);
 
-    const cloned = sessionManagerForPreferredBackends(std.testing.allocator, preferred[0..], &source);
-    try std.testing.expectEqual(source.graph_runtime_strategy, cloned.graph_runtime_strategy);
-    try std.testing.expectEqualSlices(backends.BackendType, preferred[0..], cloned.preferred_backends);
+    const added = try ownSelectedFirstBackendPreference(
+        std.testing.allocator,
+        &preferred,
+        .cuda,
+    );
+    defer std.testing.allocator.free(added);
+    try std.testing.expectEqualSlices(backends.BackendType, &.{ .cuda, .metal, .native }, added);
+}
+
+test "required preload completeness includes every declared optional session" {
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .visual_model_path = "vision.gguf",
+        .audio_model_path = "audio.gguf",
+        .text_projection_path = "text-projection.onnx",
+        .visual_projection_path = "visual-projection.onnx",
+        .audio_projection_path = "audio-projection.onnx",
+    };
+    const declared = declaredOptionalSessions(&manifest);
+    try std.testing.expectEqual(@as(usize, 5), declared.len);
+    try std.testing.expect(!declaredOptionalSessionsComplete(
+        &manifest,
+        .{ true, true, true, true, false },
+    ));
+    try std.testing.expect(declaredOptionalSessionsComplete(
+        &manifest,
+        .{ true, true, true, true, true },
+    ));
+
+    const text_only = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    try std.testing.expect(declaredOptionalSessionsComplete(
+        &text_only,
+        .{ false, false, false, false, false },
+    ));
 }
 
 test "preferredModelPathForBackend keeps metal/native on model directory when native assets exist" {

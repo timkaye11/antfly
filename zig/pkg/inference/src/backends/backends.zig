@@ -16,6 +16,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const manifest_mod = @import("../models/manifest.zig");
 const c_file = @import("../util/c_file.zig");
+const kernel_jit_mod = @import("../graph/kernel_jit.zig");
 const graph_runtime_mod = @import("../graph/runtime.zig");
 
 pub const Session = @import("session.zig").Session;
@@ -72,6 +73,13 @@ pub const BackendType = enum {
         };
     }
 
+    pub fn supportsKernelJitSession(self: BackendType) bool {
+        return switch (self) {
+            .metal, .cuda => true,
+            else => false,
+        };
+    }
+
     /// Whether SessionManager.loadModel can create a Session directly for this backend.
     pub fn supportsDirectSessionLoad(self: BackendType) bool {
         return switch (self) {
@@ -88,6 +96,8 @@ pub const SessionManager = struct {
     allocator: std.mem.Allocator,
     preferred_backends: []const BackendType,
     graph_runtime_strategy: ?graph_runtime_mod.Strategy = null,
+    kernel_jit: kernel_jit_mod.Config = .{},
+    kernel_jit_load_context: kernel_jit_mod.LoadContext = .dynamic,
     /// Optional Io runtime threaded into compute backends so parallel GEMM
     /// dispatch goes through the caller's thread pool (linalg.sgemm*Io).
     /// Null means backends use the process-wide futex pool inside lib/linalg.
@@ -108,6 +118,17 @@ pub const SessionManager = struct {
         };
     }
 
+    pub fn withPreferredBackends(
+        self: SessionManager,
+        allocator: std.mem.Allocator,
+        preferred_backends: []const BackendType,
+    ) SessionManager {
+        var copy = self;
+        copy.allocator = allocator;
+        copy.preferred_backends = preferred_backends;
+        return copy;
+    }
+
     pub fn loadModel(self: *SessionManager, model_path: []const u8) !Session {
         return self.loadModelWithImportedOnnxContext(model_path, null);
     }
@@ -120,7 +141,12 @@ pub const SessionManager = struct {
         var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch null;
         defer if (manifest) |*m| m.deinit();
         var effective_buf: [backend_order_capacity]BackendType = undefined;
-        const effective_backends = effectiveBackendOrder(self.allocator, &effective_buf, self.preferred_backends, if (manifest) |m| m else null);
+        const effective_backends = effectiveBackendOrder(
+            self.allocator,
+            &effective_buf,
+            self.preferred_backends,
+            if (manifest) |m| m else null,
+        );
 
         for (effective_backends) |backend| {
             if (!backend.available()) continue;
@@ -131,11 +157,14 @@ pub const SessionManager = struct {
                 );
                 continue;
             }
-            std.log.info("trying backend {s} for {s}", .{ @tagName(backend), model_path });
             const effective_model_path = switch (backend) {
                 .onnx, .wasm => if (manifest) |m| m.onnx_path orelse model_path else model_path,
                 else => model_path,
             };
+            const jit_capable_session = backend.supportsKernelJitSession() and
+                !isOnnxFilePath(effective_model_path);
+            if (self.kernel_jit.mode.failClosed() and !jit_capable_session) continue;
+            std.log.info("trying backend {s} for {s}", .{ @tagName(backend), model_path });
 
             const session = switch (backend) {
                 .onnx => if (comptime build_options.enable_onnx) blk: {
@@ -151,8 +180,14 @@ pub const SessionManager = struct {
                         continue;
                     }
                 else if (build_options.enable_metal)
-                    session_factory.createMetalSession(self.allocator, model_path) catch |err| {
+                    session_factory.createMetalSessionWithKernelJitAndLoadContext(
+                        self.allocator,
+                        model_path,
+                        self.kernel_jit,
+                        self.kernel_jit_load_context,
+                    ) catch |err| {
                         std.log.err("Metal session create failed for {s}: {s}", .{ model_path, @errorName(err) });
+                        if (kernel_jit_mod.isRequiredFailure(self.kernel_jit.mode, err)) return err;
                         continue;
                     }
                 else
@@ -163,8 +198,14 @@ pub const SessionManager = struct {
                         continue;
                     }
                 else if (build_options.enable_cuda)
-                    session_factory.createCudaSession(self.allocator, model_path) catch |err| {
+                    session_factory.createCudaSessionWithKernelJitAndLoadContext(
+                        self.allocator,
+                        model_path,
+                        self.kernel_jit,
+                        self.kernel_jit_load_context,
+                    ) catch |err| {
                         std.log.err("CUDA session create failed for {s}: {s}", .{ model_path, @errorName(err) });
+                        if (kernel_jit_mod.isRequiredFailure(self.kernel_jit.mode, err)) return err;
                         continue;
                     }
                 else
@@ -201,9 +242,16 @@ pub const SessionManager = struct {
             if (self.graph_runtime_strategy) |strategy| {
                 session_factory.attachGraphRuntimeStrategy(session, strategy);
             }
+            if (self.kernel_jit.mode.compiles() and !jit_capable_session) {
+                std.log.warn(
+                    "kernel_jit_skipped mode={s} selected_backend={s} scoped_routes=0 reason=backend_not_jit_capable",
+                    .{ @tagName(self.kernel_jit.mode), @tagName(backend) },
+                );
+            }
             std.log.info("selected backend {s} for {s}", .{ @tagName(backend), model_path });
             return session;
         }
+        if (self.kernel_jit.mode.failClosed()) return error.KernelJitRequiredBackendUnavailable;
         return error.NoBackendAvailable;
     }
 
@@ -231,8 +279,17 @@ pub const SessionManager = struct {
     }
 
     pub fn bestAvailable(self: *const SessionManager) ?BackendType {
+        if (self.kernel_jit.mode.failClosed()) return self.bestKernelJitBackend();
         for (self.preferred_backends) |backend| {
             if (backend.available() and backend.supportsDirectSessionLoad()) return backend;
+        }
+        return null;
+    }
+
+    pub fn bestKernelJitBackend(self: *const SessionManager) ?BackendType {
+        for (self.preferred_backends) |backend| {
+            if (backend.supportsKernelJitSession() and backend.available() and
+                backend.supportsDirectSessionLoad()) return backend;
         }
         return null;
     }
@@ -296,6 +353,45 @@ test "explicit graph runtime is independent from onnx runtime backend availabili
     try std.testing.expectEqual(build_options.enable_onnx, manager.shouldUseExternalOnnxRuntime("model.onnx"));
     try std.testing.expect(!manager.shouldUseImportedOnnxGraphRuntime("model.gguf"));
     try std.testing.expect(!manager.shouldUseExternalOnnxRuntime("model.gguf"));
+}
+
+test "session manager defaults runtime kernel JIT off" {
+    const manager = SessionManager.init(std.testing.allocator);
+    try std.testing.expectEqual(kernel_jit_mod.Mode.off, manager.kernel_jit.mode);
+}
+
+test "required runtime kernel JIT accepts only direct GPU session backends" {
+    try std.testing.expect(BackendType.metal.supportsKernelJitSession());
+    try std.testing.expect(BackendType.cuda.supportsKernelJitSession());
+    try std.testing.expect(!BackendType.native.supportsKernelJitSession());
+    try std.testing.expect(!BackendType.onnx.supportsKernelJitSession());
+
+    var manager = SessionManager.init(std.testing.allocator);
+    manager.kernel_jit.mode = .required;
+    manager.preferred_backends = &.{.native};
+    try std.testing.expectEqual(@as(?BackendType, null), manager.bestAvailable());
+}
+
+test "session manager preferred-backend clone preserves runtime kernel JIT" {
+    var source = SessionManager.init(std.testing.allocator);
+    source.graph_runtime_strategy = .partitioned;
+    source.kernel_jit = .{
+        .mode = .shadow,
+        .cache_dir = "/tmp/antfly-jit",
+        .max_cache_bytes_mb = 256,
+        .preload_budget_ms = 120_000,
+    };
+    source.kernel_jit_load_context = .startup_preload;
+    const preferred = [_]BackendType{.onnx};
+
+    const cloned = source.withPreferredBackends(std.testing.allocator, &preferred);
+    try std.testing.expectEqual(source.graph_runtime_strategy, cloned.graph_runtime_strategy);
+    try std.testing.expectEqual(source.kernel_jit.mode, cloned.kernel_jit.mode);
+    try std.testing.expectEqualStrings(source.kernel_jit.cache_dir.?, cloned.kernel_jit.cache_dir.?);
+    try std.testing.expectEqual(source.kernel_jit.max_cache_bytes_mb, cloned.kernel_jit.max_cache_bytes_mb);
+    try std.testing.expectEqual(source.kernel_jit.preload_budget_ms, cloned.kernel_jit.preload_budget_ms);
+    try std.testing.expectEqual(source.kernel_jit_load_context, cloned.kernel_jit_load_context);
+    try std.testing.expectEqualSlices(BackendType, &preferred, cloned.preferred_backends);
 }
 
 test "auto backend order keeps external onnx runtime opt-in" {

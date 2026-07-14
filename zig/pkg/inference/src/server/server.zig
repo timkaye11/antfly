@@ -443,6 +443,7 @@ pub const NodeConfig = struct {
     pool_size: usize = 2,
     generation_budget_overrides: BudgetOverrides = .{},
     generation_batching: GenerationBatchingConfig = .{},
+    kernel_jit: graph_mod.kernel_jit.Config = .{},
     prompt_cache: PromptCacheConfig = .{},
     prompt_cache_resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver = null,
     allow_insecure_public_bind: bool = false,
@@ -569,6 +570,34 @@ pub const WarmModel = struct {
     format: ?[]const u8 = null,
     quantization: ?[]const u8 = null,
 };
+
+fn warmModelTaskDir(kind: WarmModelKind) []const u8 {
+    return switch (kind) {
+        .generator => "generators",
+        .embedder => "embedders",
+        .reranker => "rerankers",
+        .chunker => "chunkers",
+        .classifier => "classifiers",
+        .recognizer => "recognizers",
+        .rewriter => "rewriters",
+        .reader => "readers",
+        .transcriber => "transcribers",
+        .extractor => "extractors",
+    };
+}
+
+fn ensureKernelJitRequestSurfacesPublishable(
+    mode: graph_mod.kernel_jit.Mode,
+    startup_preloads_materialized: bool,
+) !void {
+    if (mode.failClosed() and !startup_preloads_materialized) {
+        return error.KernelJitRequiredPreloadUnmaterialized;
+    }
+}
+
+fn kernelJitMaterializesOptionalSessions(mode: graph_mod.kernel_jit.Mode) bool {
+    return mode.compiles();
+}
 
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
@@ -1182,6 +1211,13 @@ pub const Node = struct {
     embed_cache: cache_mod.ResultCache([]const f32),
     metrics: metrics_mod.Metrics,
     request_queue: request_queue_mod.RequestQueue,
+    /// Set before this Node is exposed through any HTTP routing surface.
+    /// Runtime-kernel qualification is deliberately limited to the earlier,
+    /// single-threaded startup phase.
+    request_surfaces_published: bool = false,
+    /// Set only after every configured preload, including manifest-declared
+    /// optional sessions, has completed successfully.
+    startup_preloads_materialized: bool = false,
 
     pub const DirectSparseEmbedding = sparse_embedding_mod.SparseVector;
 
@@ -1269,12 +1305,28 @@ pub const Node = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, config: NodeConfig) !Node {
+        try config.kernel_jit.validate();
         try config.prompt_cache.validate();
+        var session_manager = backends_mod.SessionManager.init(allocator);
+        session_manager.kernel_jit = config.kernel_jit;
+        if (config.kernel_jit.mode.compiles()) {
+            if (session_manager.bestKernelJitBackend()) |backend| {
+                std.log.info(
+                    "kernel_jit_backend mode={s} preferred_backend={s}",
+                    .{ @tagName(config.kernel_jit.mode), @tagName(backend) },
+                );
+            } else {
+                std.log.warn(
+                    "kernel_jit_backend mode={s} preferred_backend=none; backend preference is configured separately (set ANTFLY_INFERENCE_PREFERRED_BACKEND=cuda for CUDA)",
+                    .{@tagName(config.kernel_jit.mode)},
+                );
+            }
+        }
         var node: Node = .{
             .config = config,
             .allocator = allocator,
-            .session_manager = backends_mod.SessionManager.init(allocator),
-            .model_manager = model_manager_mod.ModelManager.init(allocator, backends_mod.SessionManager.init(allocator)),
+            .session_manager = session_manager,
+            .model_manager = model_manager_mod.ModelManager.init(allocator, session_manager),
             .registry = registry_mod.ModelRegistry.init(allocator, config.models_dir),
             .tabular_registry = tabular_mod.registry.Registry.init(allocator),
             .embed_cache = cache_mod.ResultCache([]const f32).init(allocator, 120_000),
@@ -1422,7 +1474,7 @@ pub const Node = struct {
             };
         }
 
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null);
     }
 
     pub fn generateMessagesDirect(
@@ -1431,7 +1483,7 @@ pub const Node = struct {
         model_name: []const u8,
         messages: []const generation.Message,
     ) ![]u8 {
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null);
     }
 
     pub fn beginDirectGenerateAdmission(
@@ -1508,6 +1560,7 @@ pub const Node = struct {
             messages,
             admission,
             null,
+            false,
             null,
         );
     }
@@ -1554,6 +1607,7 @@ pub const Node = struct {
         messages: []const generation.Message,
         max_tokens: i32,
         preferred_backends: ?[]const backends_mod.BackendType,
+        cache_default_alias: bool,
         timing: ?*DirectGenerateTiming,
     ) ![]u8 {
         if (messages.len == 0) return error.InvalidGenerationRequest;
@@ -1566,6 +1620,7 @@ pub const Node = struct {
             messages,
             &admission,
             preferred_backends,
+            cache_default_alias,
             timing,
         );
     }
@@ -1577,6 +1632,7 @@ pub const Node = struct {
         messages: []const generation.Message,
         admission: *DirectGenerateAdmission,
         preferred_backends: ?[]const backends_mod.BackendType,
+        cache_default_alias: bool,
         timing: ?*DirectGenerateTiming,
     ) ![]u8 {
         if (messages.len == 0) return error.InvalidGenerationRequest;
@@ -1597,7 +1653,7 @@ pub const Node = struct {
         defer self.allocator.free(model_path);
         const resolved_at_ns = embedTimingNowNs();
         const model = (if (preferred_backends) |backends|
-            self.model_manager.loadFromDirWithPreferredBackends(model_path, backends, false)
+            self.model_manager.loadFromDirWithPreferredBackends(model_path, backends, cache_default_alias)
         else
             self.model_manager.loadFromDir(model_path)) catch |err| {
             std.log.err("direct generator load failed model={s} path={s}: {s}", .{ model_name, model_path, @errorName(err) });
@@ -1740,8 +1796,38 @@ pub const Node = struct {
         }
     }
 
-    pub fn warmConfiguredGenerators(self: *Node, allocator: std.mem.Allocator) !void {
+    /// Warm configured models while the caller still owns the exclusive
+    /// pre-serving startup phase. This is the only server path allowed to run
+    /// live kernel compilation and GPU qualification. Call before publishing
+    /// any listener or request handler that can reach this Node.
+    pub fn warmConfiguredModelsBeforeServing(self: *Node, allocator: std.mem.Allocator) !void {
+        if (self.request_surfaces_published) return error.KernelJitStartupWindowClosed;
+        // A retry must earn readiness again. Otherwise a failed second warm
+        // could leave a stale successful latch and permit route publication.
+        self.startup_preloads_materialized = false;
+        if (self.config.kernel_jit.mode.failClosed() and self.config.preload.len == 0) {
+            if (!builtin.is_test) {
+                std.log.err(
+                    "kernel_jit mode=required needs at least one startup preload; configure inference.preload before serving",
+                    .{},
+                );
+            }
+            return error.KernelJitRequiredPreloadMissing;
+        }
+        const model_previous = self.model_manager.session_manager.kernel_jit_load_context;
+        const direct_previous = self.session_manager.kernel_jit_load_context;
+        self.model_manager.session_manager.kernel_jit_load_context = .startup_preload;
+        self.session_manager.kernel_jit_load_context = .startup_preload;
+        defer {
+            self.model_manager.session_manager.kernel_jit_load_context = model_previous;
+            self.session_manager.kernel_jit_load_context = direct_previous;
+        }
         try self.warmConfiguredModels(allocator);
+        self.startup_preloads_materialized = true;
+    }
+
+    pub fn warmConfiguredGenerators(self: *Node, allocator: std.mem.Allocator) !void {
+        try self.warmConfiguredModelsBeforeServing(allocator);
     }
 
     pub fn warmModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
@@ -1750,6 +1836,27 @@ pub const Node = struct {
             .embedder => try self.warmEmbedder(allocator, model.name, model.backend),
             .reranker => try self.warmReranker(allocator, model.name, model.backend),
             .chunker, .classifier, .recognizer, .rewriter, .reader, .transcriber, .extractor => try self.warmLoadOnlyModel(allocator, model),
+        }
+        if (kernelJitMaterializesOptionalSessions(self.config.kernel_jit.mode)) {
+            try self.materializeWarmModelOptionalSessions(allocator, model);
+        }
+    }
+
+    fn materializeWarmModelOptionalSessions(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const model_path = try self.resolveModelPath(io_impl.io(), model.name, warmModelTaskDir(model.kind));
+        defer self.allocator.free(model_path);
+        const loaded = if (model.backend) |backend|
+            try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(backend), true)
+        else
+            try self.model_manager.loadFromDir(model_path);
+
+        try loaded.materializeDeclaredOptionalSessions();
+        if (self.config.kernel_jit.mode.failClosed() and
+            !loaded.declaredOptionalSessionsMaterialized())
+        {
+            return error.KernelJitRequiredOptionalSessionUnmaterialized;
         }
     }
 
@@ -1767,7 +1874,7 @@ pub const Node = struct {
             .content = "ping",
         }};
         var timing = DirectGenerateTiming{};
-        const text = try self.generateMessagesDirectMaxTokens(allocator, model_name, &messages, 1, preferred_backends, &timing);
+        const text = try self.generateMessagesDirectMaxTokens(allocator, model_name, &messages, 1, preferred_backends, true, &timing);
         defer allocator.free(text);
         const elapsed_ms = elapsedMs(started_at_ns, embedTimingNowNs());
         std.log.info(
@@ -1794,7 +1901,7 @@ pub const Node = struct {
         const model_path = try self.resolveModelPath(io_impl.io(), model_name, "embedders");
         defer self.allocator.free(model_path);
         const model = if (backend) |value|
-            try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(value), false)
+            try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(value), true)
         else
             try self.model_manager.loadFromDir(model_path);
 
@@ -1832,7 +1939,7 @@ pub const Node = struct {
         const model_path = try self.resolveModelPath(io_impl.io(), model_name, "rerankers");
         defer self.allocator.free(model_path);
         const model = if (backend) |value|
-            try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(value), false)
+            try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(value), true)
         else
             try self.model_manager.loadFromDir(model_path);
         var pipeline = model.rerankingPipeline(allocator);
@@ -1843,16 +1950,7 @@ pub const Node = struct {
 
     fn warmLoadOnlyModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
         if (model.name.len == 0) return error.InvalidGenerationRequest;
-        const task_dir = switch (model.kind) {
-            .chunker => "chunkers",
-            .classifier => "classifiers",
-            .recognizer => "recognizers",
-            .rewriter => "rewriters",
-            .reader => "readers",
-            .transcriber => "transcribers",
-            .extractor => "extractors",
-            else => return error.UnsupportedWarmModelKind,
-        };
+        const task_dir = warmModelTaskDir(model.kind);
         const started_at_ns = embedTimingNowNs();
         std.log.info("loading inference {s} model={s}", .{ @tagName(model.kind), model.name });
         var io_impl = std.Io.Threaded.init(allocator, .{});
@@ -1860,7 +1958,7 @@ pub const Node = struct {
         const model_path = try self.resolveModelPath(io_impl.io(), model.name, task_dir);
         defer self.allocator.free(model_path);
         _ = if (model.backend) |backend|
-            try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(backend), false)
+            try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(backend), true)
         else
             try self.model_manager.loadFromDir(model_path);
         std.log.info("loaded inference {s} model={s} elapsed_ms={d}", .{ @tagName(model.kind), model.name, elapsedMs(started_at_ns, embedTimingNowNs()) });
@@ -7247,6 +7345,11 @@ pub const Node = struct {
     /// Register inference API routes on an external server with a compile-time prefix.
     /// Used by swarm mode to register on the unified httpx.Server.
     pub fn registerRoutesOn(self: *Node, comptime prefix: []const u8, server: anytype) !void {
+        try ensureKernelJitRequestSurfacesPublishable(
+            self.config.kernel_jit.mode,
+            self.startup_preloads_materialized,
+        );
+        self.request_surfaces_published = true;
         const router = api.ServerRouter(Node).init(self);
         var prefixed = PrefixedServer(prefix, @TypeOf(server.*)){ .inner = server };
         if (comptime std.mem.eql(u8, prefix, public_api_prefix)) {
@@ -7260,6 +7363,11 @@ pub const Node = struct {
 
     /// Register AI routes without the Traditional ML predictor endpoints.
     pub fn registerAiRoutesOn(self: *Node, comptime prefix: []const u8, server: anytype) !void {
+        try ensureKernelJitRequestSurfacesPublishable(
+            self.config.kernel_jit.mode,
+            self.startup_preloads_materialized,
+        );
+        self.request_surfaces_published = true;
         const router = api.ServerRouter(Node).init(self);
         var prefixed = AiPrefixedServer(prefix, @TypeOf(server.*)){ .inner = server };
         try router.register(&prefixed);
@@ -9998,6 +10106,113 @@ test "node attachIo wires model session manager" {
 
     try std.testing.expect(node.session_manager.io != null);
     try std.testing.expect(node.model_manager.session_manager.io != null);
+}
+
+test "node init propagates runtime kernel JIT config to model loading" {
+    const kernel_jit = graph_mod.kernel_jit.Config{
+        .mode = .shadow,
+        .cache_dir = "/tmp/antfly-jit",
+        .max_cache_bytes_mb = 256,
+        .preload_budget_ms = 120_000,
+    };
+    var node = try Node.init(std.testing.allocator, .{ .kernel_jit = kernel_jit });
+    defer node.deinit();
+
+    try std.testing.expectEqual(kernel_jit.mode, node.session_manager.kernel_jit.mode);
+    try std.testing.expectEqual(kernel_jit.mode, node.model_manager.session_manager.kernel_jit.mode);
+    try std.testing.expectEqualStrings(kernel_jit.cache_dir.?, node.model_manager.session_manager.kernel_jit.cache_dir.?);
+}
+
+test "required runtime kernel JIT rejects an empty preload list at warm time" {
+    var node = try Node.init(std.testing.allocator, .{
+        .kernel_jit = .{ .mode = .required },
+    });
+    defer node.deinit();
+    try std.testing.expectError(
+        error.KernelJitRequiredPreloadMissing,
+        node.warmConfiguredModelsBeforeServing(std.testing.allocator),
+    );
+    try std.testing.expect(!node.startup_preloads_materialized);
+}
+
+test "warm model task directories cover every preload kind" {
+    try std.testing.expectEqualStrings("generators", warmModelTaskDir(.generator));
+    try std.testing.expectEqualStrings("embedders", warmModelTaskDir(.embedder));
+    try std.testing.expectEqualStrings("rerankers", warmModelTaskDir(.reranker));
+    try std.testing.expectEqualStrings("chunkers", warmModelTaskDir(.chunker));
+    try std.testing.expectEqualStrings("classifiers", warmModelTaskDir(.classifier));
+    try std.testing.expectEqualStrings("recognizers", warmModelTaskDir(.recognizer));
+    try std.testing.expectEqualStrings("rewriters", warmModelTaskDir(.rewriter));
+    try std.testing.expectEqualStrings("readers", warmModelTaskDir(.reader));
+    try std.testing.expectEqualStrings("transcribers", warmModelTaskDir(.transcriber));
+    try std.testing.expectEqualStrings("extractors", warmModelTaskDir(.extractor));
+}
+
+test "only enabled runtime JIT modes materialize optional preload sessions" {
+    try std.testing.expect(!kernelJitMaterializesOptionalSessions(.off));
+    try std.testing.expect(kernelJitMaterializesOptionalSessions(.shadow));
+    try std.testing.expect(kernelJitMaterializesOptionalSessions(.on));
+    try std.testing.expect(kernelJitMaterializesOptionalSessions(.required));
+}
+
+test "required runtime kernel JIT cannot publish when startup warming was skipped" {
+    const preload = [_]WarmModel{.{ .name = "configured-model" }};
+    var node = try Node.init(std.testing.allocator, .{
+        .kernel_jit = .{ .mode = .required },
+        .preload = &preload,
+    });
+    defer node.deinit();
+    var server = RecordingServer{ .allocator = std.testing.allocator };
+    defer server.deinit();
+
+    try std.testing.expectError(
+        error.KernelJitRequiredPreloadUnmaterialized,
+        node.registerRoutesOn(public_api_prefix, &server),
+    );
+    try std.testing.expect(!node.request_surfaces_published);
+    try ensureKernelJitRequestSurfacesPublishable(.required, true);
+    try ensureKernelJitRequestSurfacesPublishable(.on, false);
+}
+
+test "failed startup warming never publishes the preload latch" {
+    const preload = [_]WarmModel{.{ .name = "" }};
+    var node = try Node.init(std.testing.allocator, .{
+        .kernel_jit = .{ .mode = .required },
+        .preload = &preload,
+    });
+    defer node.deinit();
+    node.startup_preloads_materialized = true;
+
+    try std.testing.expectError(
+        error.InvalidGenerationRequest,
+        node.warmConfiguredModelsBeforeServing(std.testing.allocator),
+    );
+    try std.testing.expect(!node.startup_preloads_materialized);
+}
+
+test "startup model warming restores safe dynamic JIT load context" {
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+
+    try std.testing.expectEqual(graph_mod.kernel_jit.LoadContext.dynamic, node.session_manager.kernel_jit_load_context);
+    try std.testing.expectEqual(graph_mod.kernel_jit.LoadContext.dynamic, node.model_manager.session_manager.kernel_jit_load_context);
+    try node.warmConfiguredModelsBeforeServing(std.testing.allocator);
+    try std.testing.expect(node.startup_preloads_materialized);
+    try std.testing.expectEqual(graph_mod.kernel_jit.LoadContext.dynamic, node.session_manager.kernel_jit_load_context);
+    try std.testing.expectEqual(graph_mod.kernel_jit.LoadContext.dynamic, node.model_manager.session_manager.kernel_jit_load_context);
+}
+
+test "startup model warming rejects a published request surface" {
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+
+    node.request_surfaces_published = true;
+    try std.testing.expectError(
+        error.KernelJitStartupWindowClosed,
+        node.warmConfiguredModelsBeforeServing(std.testing.allocator),
+    );
+    try std.testing.expectEqual(graph_mod.kernel_jit.LoadContext.dynamic, node.session_manager.kernel_jit_load_context);
+    try std.testing.expectEqual(graph_mod.kernel_jit.LoadContext.dynamic, node.model_manager.session_manager.kernel_jit_load_context);
 }
 
 test "registerAiRoutesOn excludes Traditional ML predictor routes" {

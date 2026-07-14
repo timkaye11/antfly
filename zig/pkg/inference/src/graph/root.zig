@@ -39,6 +39,7 @@ pub const compiled_backend = @import("compiled_backend.zig");
 pub const compiled_registry = @import("compiled_registry.zig");
 pub const backend_contracts = @import("backend_contracts.zig");
 pub const quant_kernel_compiler = @import("quant_kernel_compiler.zig");
+pub const kernel_jit = @import("kernel_jit.zig");
 pub const quant_kernel_catalog = @import("quant_kernel_catalog.zig");
 pub const quant_kernel_model_catalog = @import("quant_kernel_model_catalog.zig");
 pub const quant_kernel_metal_renderer = @import("quant_kernel_metal_renderer.zig");
@@ -145,6 +146,7 @@ test {
     _ = compiled_registry;
     _ = backend_contracts;
     _ = quant_kernel_compiler;
+    _ = kernel_jit;
     _ = quant_kernel_catalog;
     _ = quant_kernel_model_catalog;
     _ = quant_kernel_metal_renderer;

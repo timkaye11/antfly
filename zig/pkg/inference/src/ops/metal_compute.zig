@@ -35,6 +35,7 @@ const runtime_root = @import("../runtime/root.zig");
 const model_runtime = @import("../graph/model_runtime.zig");
 const backend_contracts = @import("../graph/backend_contracts.zig");
 const metal_command_planner = @import("../graph/metal_command_planner.zig");
+const kernel_jit = @import("../graph/kernel_jit.zig");
 const graph_quant_matmul = @import("../graph/quant_matmul.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
 const linalg = @import("inference_linalg");
@@ -544,7 +545,50 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         data: *WeightStore,
         run_budget: ?*@import("../runtime/root.zig").tier.memory.RunBudget,
     ) !MetalCompute {
-        return initWithOptionalIo(allocator, data, run_budget, null);
+        return initWithOptionalIo(allocator, data, run_budget, null, .{});
+    }
+
+    pub fn initWithKernelJit(
+        allocator: std.mem.Allocator,
+        data: *WeightStore,
+        run_budget: ?*@import("../runtime/root.zig").tier.memory.RunBudget,
+        config: kernel_jit.Config,
+    ) !MetalCompute {
+        return initWithOptionalIo(allocator, data, run_budget, null, .{ .config = config });
+    }
+
+    pub fn initWithKernelJitScope(
+        allocator: std.mem.Allocator,
+        data: *WeightStore,
+        run_budget: ?*@import("../runtime/root.zig").tier.memory.RunBudget,
+        config: kernel_jit.Config,
+        scope: metal_runtime.MetalJitRouteScope,
+    ) !MetalCompute {
+        return initWithOptionalIo(allocator, data, run_budget, null, .{ .config = config, .scope = scope });
+    }
+
+    pub fn initWithKernelJitScopeAndLoadContext(
+        allocator: std.mem.Allocator,
+        data: *WeightStore,
+        run_budget: ?*@import("../runtime/root.zig").tier.memory.RunBudget,
+        config: kernel_jit.Config,
+        scope: metal_runtime.MetalJitRouteScope,
+        load_context: kernel_jit.LoadContext,
+    ) !MetalCompute {
+        return initWithOptionalIo(allocator, data, run_budget, null, .{
+            .config = config,
+            .scope = scope,
+            .load_context = load_context,
+        });
+    }
+
+    pub fn initWithKernelJitOptions(
+        allocator: std.mem.Allocator,
+        data: *WeightStore,
+        run_budget: ?*@import("../runtime/root.zig").tier.memory.RunBudget,
+        options: metal_runtime.MetalJitOptions,
+    ) !MetalCompute {
+        return initWithOptionalIo(allocator, data, run_budget, null, options);
     }
 
     fn initWithOptionalIo(
@@ -552,12 +596,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         data: *WeightStore,
         run_budget: ?*@import("../runtime/root.zig").tier.memory.RunBudget,
         io: ?std.Io,
+        kernel_jit_options: metal_runtime.MetalJitOptions,
     ) !MetalCompute {
         _ = run_budget;
-        if (io == null and !builtin.is_test) {
+        try kernel_jit_options.config.validate();
+        if (!kernel_jit_options.config.mode.compiles() and io == null and !builtin.is_test) {
             const provider_impl = try std.heap.c_allocator.create(MetalNativeProvider);
             errdefer std.heap.c_allocator.destroy(provider_impl);
-            provider_impl.* = try MetalNativeProvider.create();
+            provider_impl.* = try MetalNativeProvider.createWithKernelJitOptions(kernel_jit_options);
             return .{
                 .allocator = allocator,
                 .data = data,
@@ -572,10 +618,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const provider_impl = data.shared_metal_native_provider orelse blk: {
             const created = try std.heap.c_allocator.create(MetalNativeProvider);
             errdefer std.heap.c_allocator.destroy(created);
-            created.* = try MetalNativeProvider.create();
+            created.* = try MetalNativeProvider.createWithKernelJitOptions(kernel_jit_options);
             data.shared_metal_native_provider = created;
             break :blk created;
         };
+        if (provider_impl.jit_mode != kernel_jit_options.config.mode or
+            !provider_impl.jit_scope.eql(kernel_jit_options.scope)) return error.MetalKernelJitConfigConflict;
         return .{
             .allocator = allocator,
             .data = data,
@@ -591,7 +639,44 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         run_budget: ?*@import("../runtime/root.zig").tier.memory.RunBudget,
         io: std.Io,
     ) !MetalCompute {
-        return initWithOptionalIo(allocator, data, run_budget, io);
+        return initWithOptionalIo(allocator, data, run_budget, io, .{});
+    }
+
+    pub fn initWithIoAndKernelJit(
+        allocator: std.mem.Allocator,
+        data: *WeightStore,
+        run_budget: ?*@import("../runtime/root.zig").tier.memory.RunBudget,
+        io: std.Io,
+        config: kernel_jit.Config,
+    ) !MetalCompute {
+        return initWithOptionalIo(allocator, data, run_budget, io, .{ .config = config });
+    }
+
+    pub fn initWithIoAndKernelJitScope(
+        allocator: std.mem.Allocator,
+        data: *WeightStore,
+        run_budget: ?*@import("../runtime/root.zig").tier.memory.RunBudget,
+        io: std.Io,
+        config: kernel_jit.Config,
+        scope: metal_runtime.MetalJitRouteScope,
+    ) !MetalCompute {
+        return initWithOptionalIo(allocator, data, run_budget, io, .{ .config = config, .scope = scope });
+    }
+
+    pub fn initWithIoAndKernelJitScopeAndLoadContext(
+        allocator: std.mem.Allocator,
+        data: *WeightStore,
+        run_budget: ?*@import("../runtime/root.zig").tier.memory.RunBudget,
+        io: std.Io,
+        config: kernel_jit.Config,
+        scope: metal_runtime.MetalJitRouteScope,
+        load_context: kernel_jit.LoadContext,
+    ) !MetalCompute {
+        return initWithOptionalIo(allocator, data, run_budget, io, .{
+            .config = config,
+            .scope = scope,
+            .load_context = load_context,
+        });
     }
 
     pub fn dequantizeTensorToFloat32(cb: *const ops.ComputeBackend, tensor: CT, allocator: std.mem.Allocator) ![]f32 {

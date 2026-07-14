@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// JIT-free Metal provider for termite's decoder runtime.
+// Metal-native provider for termite's decoder runtime.
 //
 // Mirrors the Metal-native portion of `MetalProvider` (metal_provider.zig)
-// without any JIT JIT kernel fields or `c.backend_array`-typed methods. Used by
+// without any `c.backend_array`-typed methods. Used by
 // `MetalCompute` when the build has `-Dmetal=true`. The fields
 // are laid out to match what `metal_runtime.zig` duck-types on `self` so the
 // same helper functions work for both provider variants.
@@ -23,6 +23,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const metal_runtime = @import("metal_runtime.zig");
+const kernel_jit = @import("../graph/kernel_jit.zig");
 const metal_tensor = @import("metal_tensor.zig");
 const weight_source_mod = @import("../models/weight_source.zig");
 
@@ -42,6 +43,13 @@ const GatheredSpanEntry = metal_runtime.GatheredSpanEntry;
 pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     raw_provider: ?*RawMetalProvider,
     raw_decode_runtime: ?*RawMetalDecodeRuntime,
+    jit_mode: kernel_jit.Mode = .off,
+    jit_scope: metal_runtime.MetalJitRouteScope = metal_runtime.MetalJitRouteScope.none(),
+    jit_session: ?*metal_runtime.MetalJitSession = null,
+    jit_pipeline_owners: metal_runtime.MetalJitPipelineOwners = metal_runtime.empty_metal_jit_pipeline_owners,
+    jit_artifact_keys: metal_runtime.MetalJitArtifactKeys = metal_runtime.empty_metal_jit_artifact_keys,
+    jit_route_states: metal_runtime.MetalJitRouteStates = metal_runtime.empty_metal_jit_route_states,
+    jit_qualified_routes: metal_runtime.MetalJitQualifiedRoutes = metal_runtime.empty_metal_jit_qualified_routes,
     raw_decoder_family_prepared: bool = false,
     raw_decoder_prepared_kv_tokens: usize = 0,
     raw_absolute_embeddings_prepared: bool = false,
@@ -73,14 +81,27 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     gathered_spans: std.AutoHashMapUnmanaged(GatheredSpanKey, GatheredSpanEntry) = .empty,
 
     pub fn create() !MetalNativeProvider {
+        return createWithKernelJit(.{});
+    }
+
+    pub fn createWithKernelJit(config: kernel_jit.Config) !MetalNativeProvider {
+        return createWithKernelJitOptions(.{ .config = config });
+    }
+
+    pub fn createWithKernelJitOptions(options: metal_runtime.MetalJitOptions) !MetalNativeProvider {
         const raw_provider = metal_runtime.termite_metal_provider_create();
-        errdefer metal_runtime.termite_metal_provider_destroy(raw_provider);
         const raw_decode_runtime = metal_runtime.termite_metal_decode_runtime_create();
-        errdefer metal_runtime.termite_metal_decode_runtime_destroy(raw_decode_runtime);
-        return .{
+        var result = MetalNativeProvider{
             .raw_provider = raw_provider,
             .raw_decode_runtime = raw_decode_runtime,
         };
+        errdefer result.deinitOwned();
+        // Compilation, qualification lookup, and every slot install finish
+        // before publication. Routes not admitted before the preload budget
+        // expires keep their bundled implementation; no GPU benchmark runs
+        // against a published provider.
+        try metal_runtime.initializeMetalKernelJitWithOptions(&result, options);
+        return result;
     }
 
     pub fn hasDecoderRuntime(self: *const MetalNativeProvider) bool {
@@ -94,6 +115,10 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     }
 
     pub fn deinitOwned(self: *MetalNativeProvider) void {
+        // Release the synchronous JIT session before provider, cache, or
+        // pipeline dependencies are released.
+        metal_runtime.destroyMetalJitSession(self.jit_session);
+        self.jit_session = null;
         metal_runtime.flushActiveFrame(self.raw_decode_runtime) catch {};
         if (metal_runtime.hasActiveFrame(self.raw_decode_runtime)) {
             metal_runtime.waitFrame(self.raw_decode_runtime) catch {};
@@ -112,5 +137,16 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         }
         metal_runtime.termite_metal_provider_destroy(self.raw_provider);
         metal_runtime.termite_metal_decode_runtime_destroy(self.raw_decode_runtime);
+        self.raw_provider = null;
+        self.raw_decode_runtime = null;
+        for (&self.jit_pipeline_owners) |*generated| {
+            metal_runtime.termite_metal_generated_pipeline_destroy(generated.*);
+            generated.* = null;
+        }
+        self.jit_artifact_keys = metal_runtime.empty_metal_jit_artifact_keys;
+        self.jit_route_states = metal_runtime.empty_metal_jit_route_states;
+        self.jit_qualified_routes = metal_runtime.empty_metal_jit_qualified_routes;
+        self.jit_mode = .off;
+        self.jit_scope = metal_runtime.MetalJitRouteScope.none();
     }
 } else void;

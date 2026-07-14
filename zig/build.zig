@@ -4749,6 +4749,7 @@ pub fn build(b: *std.Build) void {
             "swarm public HTTP server uses public API request body limit",
             "swarm rejects configured server TLS instead of serving plaintext",
             "parse cli accepts inference budget overrides",
+            "swarm kernel JIT mode precedence is CLI then environment then config",
             "inference config falls back to common config",
             "swarm prompt cache detaches resource observer before owner teardown",
             "swarm runtime resolves paths from common storage base dir",

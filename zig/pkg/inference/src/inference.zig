@@ -74,6 +74,7 @@ pub const cuda_info = @import("cuda_info.zig");
 pub const cuda_microbench = @import("bench/cuda_microbench.zig");
 pub const cuda_attention_diff = @import("quant_kernel_cuda_attention_diff.zig");
 pub const cuda_ffn_diff = @import("quant_kernel_cuda_ffn_diff.zig");
+pub const cuda_nvrtc = @import("ops/cuda/nvrtc.zig");
 pub const metal_runtime = @import("backends/metal_runtime.zig");
 pub const native_compute = struct {
     pub const native = @import("ops/native_compute.zig");
@@ -135,7 +136,11 @@ test {
     _ = cuda_microbench;
     _ = cuda_attention_diff;
     _ = cuda_ffn_diff;
+    _ = cuda_nvrtc;
     _ = native_compute;
+    if (build_options.enable_metal) {
+        _ = metal_runtime;
+    }
     if (build_options.enable_cuda) {
         _ = native_compute.cuda;
         _ = @import("ops/cuda/kernels.zig");

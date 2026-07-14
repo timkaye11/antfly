@@ -96,6 +96,29 @@ pub fn parseOptionalBackendType(value: ?[]const u8) !?inference.backends.Backend
     return parseBackendType(raw) orelse error.InvalidArguments;
 }
 
+fn parseKernelJitMode(value: []const u8) !inference.graph.kernel_jit.Mode {
+    return std.meta.stringToEnum(inference.graph.kernel_jit.Mode, value) orelse error.InvalidArguments;
+}
+
+fn resolveKernelJitConfig(
+    env_mode: ?[]const u8,
+    cli_mode: ?inference.graph.kernel_jit.Mode,
+    cli_cache_dir: ?[]const u8,
+    cli_max_cache_bytes_mb: ?usize,
+    cli_preload_budget_ms: ?u64,
+) !inference.graph.kernel_jit.Config {
+    var resolved = inference.graph.kernel_jit.Config{};
+    if (cli_mode) |value|
+        resolved.mode = value
+    else if (env_mode) |value|
+        resolved.mode = try parseKernelJitMode(value);
+    if (cli_cache_dir) |value| resolved.cache_dir = value;
+    if (cli_max_cache_bytes_mb) |value| resolved.max_cache_bytes_mb = value;
+    if (cli_preload_budget_ms) |value| resolved.preload_budget_ms = value;
+    try resolved.validate();
+    return resolved;
+}
+
 fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
     inline for (std.meta.fields(inference.server.WarmModelKind)) |field| {
         if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
@@ -208,6 +231,10 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var models_dir: []const u8 = defaultModelsDir(alloc);
     var ml_dir: []const u8 = defaultMlDir(alloc);
     var budget_overrides_mb = BudgetOverridesMb{};
+    var kernel_jit_mode_override: ?inference.graph.kernel_jit.Mode = null;
+    var kernel_jit_cache_dir_override: ?[]const u8 = null;
+    var kernel_jit_max_cache_bytes_mb_override: ?usize = null;
+    var kernel_jit_preload_budget_ms_override: ?u64 = null;
     var allow_insecure_public_bind = false;
     var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
     defer preload_models.deinit(alloc);
@@ -233,20 +260,52 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
             budget_overrides_mb.scratch_budget_mb = try parseBudgetMbArg(args);
         } else if (std.mem.eql(u8, arg, "--preload-model")) {
             try preload_models.append(alloc, try parsePreloadModelFlag(args.next() orelse return error.InvalidArguments));
+        } else if (std.mem.eql(u8, arg, "--kernel-jit-mode")) {
+            kernel_jit_mode_override = try parseKernelJitMode(args.next() orelse return error.MissingKernelJitMode);
+        } else if (std.mem.eql(u8, arg, "--kernel-jit-cache-dir")) {
+            kernel_jit_cache_dir_override = args.next() orelse return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--kernel-jit-max-cache-mb")) {
+            kernel_jit_max_cache_bytes_mb_override = try std.fmt.parseInt(
+                usize,
+                args.next() orelse return error.InvalidArguments,
+                10,
+            );
+        } else if (std.mem.eql(u8, arg, "--kernel-jit-preload-budget-ms")) {
+            kernel_jit_preload_budget_ms_override = try std.fmt.parseInt(
+                u64,
+                args.next() orelse return error.InvalidArguments,
+                10,
+            );
         } else if (std.mem.eql(u8, arg, "--allow-insecure-public-bind")) {
             allow_insecure_public_bind = true;
+        } else {
+            return error.InvalidArguments;
         }
     }
+
+    const kernel_jit = try resolveKernelJitConfig(
+        platform.env.getenv("ANTFLY_INFERENCE_KERNEL_JIT_MODE"),
+        kernel_jit_mode_override,
+        kernel_jit_cache_dir_override,
+        kernel_jit_max_cache_bytes_mb_override,
+        kernel_jit_preload_budget_ms_override,
+    );
 
     std.debug.print("antfly inference\n", .{});
     std.debug.print("ai models: {s}\n", .{models_dir});
     std.debug.print("ml models: {s}\n", .{ml_dir});
+    std.debug.print("kernel jit: mode={s} cache_mb={d} preload_budget_ms={d}\n", .{
+        @tagName(kernel_jit.mode),
+        kernel_jit.max_cache_bytes_mb,
+        kernel_jit.preload_budget_ms,
+    });
 
     var node = try inference.server.Node.init(alloc, .{
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .generation_budget_overrides = budgetOverridesFromMb(budget_overrides_mb),
         .preload = preload_models.items,
+        .kernel_jit = kernel_jit,
         .allow_insecure_public_bind = allow_insecure_public_bind,
     });
     defer node.deinit();
@@ -467,6 +526,10 @@ fn printUsage() void {
         \\  --combined-budget-mb <n>  Native generation combined budget override
         \\  --kv-budget-mb <n>        Native generation KV cache budget override
         \\  --scratch-budget-mb <n>   Native generation scratch budget override
+        \\  --kernel-jit-mode <off|shadow|on|required> JIT startup-preloaded Metal/CUDA models
+        \\  --kernel-jit-cache-dir <dir> Persistent JIT artifact cache directory
+        \\  --kernel-jit-max-cache-mb <n> Persistent JIT cache limit; 0 disables persistence
+        \\  --kernel-jit-preload-budget-ms <n> Per-session best-effort startup JIT budget
         \\  --preload-model <kind:name|kind:backend:name>  Preload and warm a configured model before serving
         \\
         \\Pull options:
@@ -492,4 +555,32 @@ test "parseBackendType accepts warm generator backends" {
     try std.testing.expectEqual(inference.backends.BackendType.wasm, parseBackendType("webgpu").?);
     try std.testing.expectEqual(inference.backends.BackendType.pjrt, parseBackendType("xla").?);
     try std.testing.expect(try parseOptionalBackendType("auto") == null);
+}
+
+test "kernel JIT mode precedence is CLI then environment then default" {
+    const from_env = try resolveKernelJitConfig("on", null, null, null, null);
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.on, from_env.mode);
+
+    const from_cli = try resolveKernelJitConfig("shadow", .required, "/tmp/jit", 256, 120_000);
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.required, from_cli.mode);
+    try std.testing.expectEqualStrings("/tmp/jit", from_cli.cache_dir.?);
+    try std.testing.expectEqual(@as(usize, 256), from_cli.max_cache_bytes_mb);
+    try std.testing.expectEqual(@as(u64, 120_000), from_cli.preload_budget_ms);
+
+    const from_cli_over_invalid_env = try resolveKernelJitConfig("invalid", .required, null, null, null);
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.required, from_cli_over_invalid_env.mode);
+
+    const defaults = try resolveKernelJitConfig(null, null, null, null, null);
+    try std.testing.expectEqual(inference.graph.kernel_jit.Mode.off, defaults.mode);
+    try std.testing.expectError(error.InvalidArguments, resolveKernelJitConfig("invalid", null, null, null, null));
+    try std.testing.expectError(error.InvalidKernelJitCacheDir, resolveKernelJitConfig(null, null, "", null, null));
+}
+
+test "inference run rejects unknown flags instead of silently disabling policy" {
+    var argv = [_][*:0]const u8{ "--kernel-jti-mode", "required" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    try std.testing.expectError(
+        error.InvalidArguments,
+        runServer(std.heap.page_allocator, std.testing.io, &iter),
+    );
 }

@@ -1438,7 +1438,11 @@ components:
 
     ModelRef:
       type: object
-      description: Model reference used by startup preload and model-loading configuration.
+      description: |
+        Model reference used by startup preload and model-loading configuration.
+        When a preload selects an explicit backend, that warmed session also
+        becomes the model's default in-process session for later `auto`
+        requests; callers do not need to repeat the backend on every request.
       required: [kind, name]
       properties:
         kind:
@@ -1453,6 +1457,60 @@ components:
           $ref: "#/components/schemas/ModelFormat"
         quantization:
           $ref: "#/components/schemas/ModelQuantization"
+
+    KernelJitMode:
+      type: string
+      description: |
+        Runtime kernel JIT operating mode. `off` disables compilation. `shadow`
+        compiles and validates without dispatching JIT kernels. `on` may activate
+        qualified kernels while preserving the production fallback. `required`
+        fails model loading when there are no eligible routes or any scoped
+        route cannot qualify, rejects sessions that are not direct Metal or
+        CUDA sessions, and requires at least one configured startup preload.
+        Backend preference remains separately configured; this mode neither
+        enables nor selects a backend. Runtime JIT is currently supported on
+        Linux and macOS; other platforms reject non-`off` modes rather than
+        silently degrading.
+      enum: ["off", shadow, "on", required]
+
+    KernelJitConfig:
+      type: object
+      description: |
+        Runtime Metal and CUDA kernel JIT configuration. Live compilation and
+        GPU qualification run only for models in the configured startup
+        `preload` list, before serving begins. A cold dynamic model load never
+        benchmarks against an in-use GPU: `on` and `shadow` retain bundled
+        kernels, while `required` rejects the load. When runtime JIT is enabled,
+        startup also materializes every vision, audio, and projection session
+        declared by each preloaded model without running media inference.
+        Preload every model that must use runtime-JIT kernels; `required`
+        rejects an empty preload list.
+      properties:
+        mode:
+          $ref: "#/components/schemas/KernelJitMode"
+          default: "off"
+        cache_dir:
+          type: string
+          minLength: 1
+          description: Persistent artifact cache directory on Linux and macOS. Omit to use ~/.antfly/inference/jit when HOME is available.
+        max_cache_bytes_mb:
+          type: integer
+          minimum: 0
+          maximum: 1048576
+          default: 1024
+          description: Persistent cache size limit in MiB. Set to 0 to disable disk persistence.
+        preload_budget_ms:
+          type: integer
+          minimum: 1000
+          maximum: 3600000
+          default: 300000
+          description: |
+            Per direct model session pre-publication start budget for
+            best-effort `on` and `shadow` JIT work. A compiler or qualification
+            operation already started may overrun the budget. Multimodal model
+            preloads may create several direct sessions, each with this budget.
+            `required` completes or fails all required routes and may exceed
+            this value.
 
     PromptCacheConfig:
       type: object
@@ -1589,6 +1647,8 @@ components:
         prompt_cache:
           $ref: "#/components/schemas/PromptCacheConfig"
           description: Native generator prompt KV cache settings.
+        kernel_jit:
+          $ref: "#/components/schemas/KernelJitConfig"
         backend_priority:
           type: array
           items:
@@ -1634,7 +1694,10 @@ components:
             Models to preload and warm at startup. Generators run a tiny generation
             request so native/Metal weights, KV setup, and kernels use the same
             budgeted path as request-time generation. Other model kinds use the
-            best available warm path for that kind.
+            best available warm path for that kind. When runtime kernel JIT is
+            enabled, every vision, audio, and projection session declared by a
+            preloaded model is also loaded without running media inference.
+            Runtime kernel JIT `required` mode rejects an empty preload list.
           items:
             $ref: "#/components/schemas/ModelRef"
           example:

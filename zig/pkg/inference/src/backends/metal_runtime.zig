@@ -21,6 +21,8 @@ const decoder_gpt_runtime = @import("decoder_gpt_runtime.zig");
 const ops = @import("../ops/ops.zig");
 const model_runtime = @import("../graph/model_runtime.zig");
 const metal_command_planner = @import("../graph/metal_command_planner.zig");
+const kernel_jit = @import("../graph/kernel_jit.zig");
+const quant_kernel_compiler = @import("../graph/quant_kernel_compiler.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
 const quant_matmul = @import("../graph/quant_matmul.zig");
 const gguf_tensor_types = @import("../gguf/tensor_types.zig");
@@ -30,6 +32,29 @@ const metal_tensor = @import("metal_tensor.zig");
 const native = @import("native.zig");
 const runtime_root = @import("../runtime/root.zig");
 const turboquant = @import("../runtime/kv/turboquant.zig");
+const io_compat = @import("../io/compat.zig");
+
+// Qualification evidence is valid only for the exact generated candidate,
+// handwritten baseline, and backend-specific qualification implementation.
+// The build graph hashes the checked-in source files once; runtime keys carry
+// those identities without embedding or repeatedly hashing multi-megabyte
+// sources during model load.
+const unavailable_source_sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+const metal_jit_baseline_implementation_sha256 = if (@hasDecl(build_options, "metal_jit_baseline_implementation_sha256"))
+    build_options.metal_jit_baseline_implementation_sha256
+else
+    unavailable_source_sha256;
+const metal_jit_qualification_implementation_sha256 = if (@hasDecl(build_options, "metal_jit_qualification_implementation_sha256"))
+    build_options.metal_jit_qualification_implementation_sha256
+else
+    unavailable_source_sha256;
+const metal_jit_max_observed_shapes_per_format = 16;
+const metal_jit_quant_format_count = 12;
+const metal_jit_max_fixture_bytes = 256 * 1024 * 1024;
+const metal_jit_fixture_safety_margin_bytes = 16 * 1024 * 1024;
+const metal_jit_measure_target_macs: u64 = 128 * 1024 * 1024;
+const metal_jit_max_measure_iters: u32 = 500;
+const metal_jit_qualification_policy_identity = "metal-v4:correctness=generic-rows2-through8-small-dense-oracle-plus-model-shapes-rows2-8-sampled-columns8,weight-pattern-bank29-row-strided;benchmark=all-model-shapes-rows2-8,target-macs134217728,iters1-500,warmup2,paired5;fixture-peak-max-bytes268435456,safety-margin16777216,observed-sampled-row-oracle,gpu-shared-copies;scope-max-shapes-per-format16";
 
 pub const QuantizedStorage = weight_source_mod.QuantizedStorage;
 const c_file = @import("../util/c_file.zig");
@@ -60,6 +85,564 @@ const metal_tensor_bridge = struct {
 
 pub const RawMetalProvider = opaque {};
 pub const RawMetalDecodeRuntime = opaque {};
+pub const RawMetalGeneratedPipeline = opaque {};
+
+pub const MetalDeviceInfo = extern struct {
+    registry_id: u64 = 0,
+    recommended_max_working_set_size: u64 = 0,
+    max_buffer_length: u64 = 0,
+    max_threads_per_threadgroup_width: u32 = 0,
+    max_threads_per_threadgroup_height: u32 = 0,
+    max_threads_per_threadgroup_depth: u32 = 0,
+    max_threadgroup_memory_length: u32 = 0,
+    apple_gpu_family: u16 = 0,
+    mac_gpu_family: u16 = 0,
+    common_gpu_family: u16 = 0,
+    metal_gpu_family: u16 = 0,
+    has_unified_memory: u8 = 0,
+    reserved: [7]u8 = @splat(0),
+};
+
+pub const MetalGeneratedPipelineInfo = extern struct {
+    static_threadgroup_memory_length: u64 = 0,
+    thread_execution_width: u32 = 0,
+    max_total_threads_per_threadgroup: u32 = 0,
+};
+
+/// Stable ABI shared with termite_metal_jit_pipeline_slot. Values are persisted
+/// indirectly through ArtifactKey-qualified route records, so append only.
+pub const MetalJitPipelineSlot = enum(c_uint) {
+    q4_k_bias_gelu,
+    q4_0,
+    q4_1,
+    q5_0,
+    q5_1,
+    q2_k,
+    q2_k_bias,
+    q2_k_bias_gelu,
+    q3_k,
+    q3_k_bias,
+    q3_k_bias_gelu,
+    q4_k_bias,
+    q4_k,
+    q8_0,
+    q8_0_bias,
+    q8_0_bias_gelu,
+    q8_0_relu,
+    q8_1,
+    q8_k,
+    q5_k,
+    q5_k_bias,
+    q5_k_bias_gelu,
+    q6_k,
+    q6_k_bias,
+    q6_k_bias_gelu,
+};
+
+pub const metal_jit_pipeline_slot_count = @typeInfo(MetalJitPipelineSlot).@"enum".fields.len;
+
+pub const MetalJitRoute = struct {
+    slot: MetalJitPipelineSlot,
+    kernel_id: []const u8,
+    gate_env: ?[]const u8,
+};
+
+/// Mapping from typed Metal matmul artifacts to existing production dispatch
+/// slots. RMSNorm and attention candidates stay in the offline registry until
+/// they have model-scope derivation and live qualification; they are not
+/// advertised as runtime-JIT routes.
+pub const metal_jit_routes = [_]MetalJitRoute{
+    .{ .slot = .q4_k_bias_gelu, .kernel_id = quant_kernel_compiler.first_lazy_metal_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH_BIAS_GELU" },
+    .{ .slot = .q4_0, .kernel_id = quant_kernel_compiler.first_general_metal_q4_0_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q4_0_SMALL_BATCH" },
+    .{ .slot = .q4_1, .kernel_id = quant_kernel_compiler.first_general_metal_q4_1_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q4_1_SMALL_BATCH" },
+    .{ .slot = .q5_0, .kernel_id = quant_kernel_compiler.first_general_metal_q5_0_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q5_0_SMALL_BATCH" },
+    .{ .slot = .q5_1, .kernel_id = quant_kernel_compiler.first_general_metal_q5_1_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q5_1_SMALL_BATCH" },
+    .{ .slot = .q2_k, .kernel_id = quant_kernel_compiler.first_general_metal_q2_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q2_K_SMALL_BATCH" },
+    .{ .slot = .q2_k_bias, .kernel_id = quant_kernel_compiler.first_general_metal_q2_bias_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q2_K_SMALL_BATCH_BIAS" },
+    .{ .slot = .q2_k_bias_gelu, .kernel_id = quant_kernel_compiler.first_general_metal_q2_bias_gelu_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q2_K_SMALL_BATCH_BIAS_GELU" },
+    .{ .slot = .q3_k, .kernel_id = quant_kernel_compiler.first_general_metal_q3_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q3_K_SMALL_BATCH" },
+    .{ .slot = .q3_k_bias, .kernel_id = quant_kernel_compiler.first_general_metal_q3_bias_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q3_K_SMALL_BATCH_BIAS" },
+    .{ .slot = .q3_k_bias_gelu, .kernel_id = quant_kernel_compiler.first_general_metal_q3_bias_gelu_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q3_K_SMALL_BATCH_BIAS_GELU" },
+    .{ .slot = .q4_k_bias, .kernel_id = quant_kernel_compiler.first_general_metal_q4_bias_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH_BIAS" },
+    .{ .slot = .q4_k, .kernel_id = quant_kernel_compiler.first_general_metal_q4_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH" },
+    .{ .slot = .q8_0, .kernel_id = quant_kernel_compiler.first_general_metal_q8_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH" },
+    .{ .slot = .q8_0_bias, .kernel_id = quant_kernel_compiler.first_general_metal_q8_bias_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_BIAS" },
+    .{ .slot = .q8_0_bias_gelu, .kernel_id = quant_kernel_compiler.first_general_metal_q8_bias_gelu_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_BIAS_GELU" },
+    .{ .slot = .q8_0_relu, .kernel_id = quant_kernel_compiler.first_general_metal_q8_relu_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH_RELU" },
+    .{ .slot = .q8_1, .kernel_id = quant_kernel_compiler.first_general_metal_q8_1_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q8_1_SMALL_BATCH" },
+    .{ .slot = .q8_k, .kernel_id = quant_kernel_compiler.first_general_metal_q8_k_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q8_K_SMALL_BATCH" },
+    .{ .slot = .q5_k, .kernel_id = quant_kernel_compiler.first_general_metal_q5_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q5_K_SMALL_BATCH" },
+    .{ .slot = .q5_k_bias, .kernel_id = quant_kernel_compiler.first_general_metal_q5_bias_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q5_K_SMALL_BATCH_BIAS" },
+    .{ .slot = .q5_k_bias_gelu, .kernel_id = quant_kernel_compiler.first_general_metal_q5_bias_gelu_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q5_K_SMALL_BATCH_BIAS_GELU" },
+    .{ .slot = .q6_k, .kernel_id = quant_kernel_compiler.first_general_metal_q6_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q6_K_SMALL_BATCH" },
+    .{ .slot = .q6_k_bias, .kernel_id = quant_kernel_compiler.first_general_metal_q6_bias_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q6_K_SMALL_BATCH_BIAS" },
+    .{ .slot = .q6_k_bias_gelu, .kernel_id = quant_kernel_compiler.first_general_metal_q6_bias_gelu_kernel_id, .gate_env = "TERMITE_METAL_ENABLE_ANTFLY_Q6_K_SMALL_BATCH_BIAS_GELU" },
+};
+
+pub fn metalJitRouteForArtifact(artifact: quant_kernel_compiler.GeneratedArtifact) ?MetalJitRoute {
+    if (artifact.backend != .metal) return null;
+    for (metal_jit_routes) |route| {
+        if (std.mem.eql(u8, route.kernel_id, artifact.kernel_id)) return route;
+    }
+    return null;
+}
+
+pub const MetalJitPipelineOwners = [metal_jit_pipeline_slot_count]?*RawMetalGeneratedPipeline;
+pub const MetalJitArtifactKeys = [metal_jit_pipeline_slot_count]?kernel_jit.ArtifactKey;
+pub const MetalJitRouteStates = [metal_jit_pipeline_slot_count]kernel_jit.RouteState;
+pub const MetalJitQualifiedRoutes = [metal_jit_pipeline_slot_count]bool;
+
+pub const empty_metal_jit_pipeline_owners: MetalJitPipelineOwners = [_]?*RawMetalGeneratedPipeline{null} ** metal_jit_pipeline_slot_count;
+pub const empty_metal_jit_artifact_keys: MetalJitArtifactKeys = [_]?kernel_jit.ArtifactKey{null} ** metal_jit_pipeline_slot_count;
+pub const empty_metal_jit_route_states: MetalJitRouteStates = [_]kernel_jit.RouteState{.missing} ** metal_jit_pipeline_slot_count;
+pub const empty_metal_jit_qualified_routes: MetalJitQualifiedRoutes = [_]bool{false} ** metal_jit_pipeline_slot_count;
+
+/// Model-specific JIT surface. Session construction fills this from the GGUF
+/// tensor types it actually loaded plus the model operations it can execute.
+/// Required mode therefore fails closed only for routes that the model can
+/// reach, never for an unrelated format in the global artifact registry.
+pub const MetalJitScopeInvalidReason = enum {
+    none,
+    invalid_shape,
+    fixture_resource_limit,
+    shape_capacity,
+    dimension_overflow,
+    scope_discovery,
+};
+
+pub const MetalJitRouteScope = struct {
+    quant_format_mask: u16 = 0,
+    // Deterministically sorted distinct [out_dim, in_dim] matrices that fit
+    // bounded live qualification. An activated format-wide pipeline is still
+    // dispatched only for these exact shapes; any rejected/oversized shape
+    // remains on the bundled fallback.
+    observed_shapes: [metal_jit_quant_format_count][metal_jit_max_observed_shapes_per_format][2]usize =
+        [_][metal_jit_max_observed_shapes_per_format][2]usize{
+            [_][2]usize{.{ 0, 0 }} ** metal_jit_max_observed_shapes_per_format,
+        } ** metal_jit_quant_format_count,
+    observed_shape_counts: [metal_jit_quant_format_count]u8 = @splat(0),
+    conformance_complete: bool = true,
+    invalid_reason: MetalJitScopeInvalidReason = .none,
+    invalid_format: quant_matmul.Format = .unknown,
+    invalid_shape: [2]usize = .{ 0, 0 },
+    const all_quant_formats: u16 = (@as(u16, 1) << metal_jit_quant_format_count) - 1;
+
+    pub fn none() MetalJitRouteScope {
+        return .{};
+    }
+
+    pub fn all() MetalJitRouteScope {
+        return .{
+            .quant_format_mask = all_quant_formats,
+        };
+    }
+
+    pub fn fromTensorTypes(types: []const gguf_tensor_types.KnownTensorType) MetalJitRouteScope {
+        var result = MetalJitRouteScope.none();
+        for (types) |tensor_type| result.includeTensorType(tensor_type);
+        return result;
+    }
+
+    pub fn includeTensorType(self: *MetalJitRouteScope, tensor_type: gguf_tensor_types.KnownTensorType) void {
+        const format = quantFormatForTensorType(tensor_type) orelse return;
+        self.includeQuantFormat(format);
+    }
+
+    pub fn quantFormatForTensorType(tensor_type: gguf_tensor_types.KnownTensorType) ?quant_matmul.Format {
+        return switch (tensor_type) {
+            .Q4_0 => .q4_0,
+            .Q4_1 => .q4_1,
+            .Q5_0 => .q5_0,
+            .Q5_1 => .q5_1,
+            .Q8_0 => .q8_0,
+            .Q8_1 => .q8_1,
+            .Q2_K => .q2_k,
+            .Q3_K => .q3_k,
+            .Q4_K => .q4_k,
+            .Q5_K => .q5_k,
+            .Q6_K => .q6_k,
+            .Q8_K => .q8_k,
+            else => null,
+        };
+    }
+
+    pub fn includeQuantFormat(self: *MetalJitRouteScope, format: quant_matmul.Format) void {
+        const bit = metalJitQuantFormatBit(format) orelse return;
+        self.quant_format_mask |= bit;
+    }
+
+    /// Record one model-observed matrix. Invalid, over-budget, or excess
+    /// shapes make the overall scope incomplete. Required mode fails closed;
+    /// optional modes may still qualify supported shapes because dispatch has
+    /// an exact-shape allowlist and falls back for every omitted shape.
+    pub fn includeQuantShape(
+        self: *MetalJitRouteScope,
+        format: quant_matmul.Format,
+        out_dim: usize,
+        in_dim: usize,
+    ) bool {
+        self.includeQuantFormat(format);
+        if (out_dim > @as(usize, std.math.maxInt(u32)) or in_dim > @as(usize, std.math.maxInt(u32))) {
+            self.invalidate(.dimension_overflow, format, out_dim, in_dim);
+            return false;
+        }
+        const format_index = metalJitQuantFormatIndex(format) orelse {
+            self.invalidate(.invalid_shape, format, out_dim, in_dim);
+            return false;
+        };
+        _ = metalJitFixtureBytes(format, 8, in_dim, out_dim) catch |err| {
+            self.invalidate(
+                if (err == error.MetalJitFixtureResourceLimit) .fixture_resource_limit else .invalid_shape,
+                format,
+                out_dim,
+                in_dim,
+            );
+            return false;
+        };
+        const count = &self.observed_shape_counts[format_index];
+        const shapes = &self.observed_shapes[format_index];
+        const shape = [2]usize{ out_dim, in_dim };
+        for (shapes[0..count.*]) |existing| {
+            if (existing[0] == out_dim and existing[1] == in_dim) return true;
+        }
+        if (count.* == shapes.len) {
+            self.invalidate(.shape_capacity, format, out_dim, in_dim);
+            return false;
+        }
+        var insert_at: usize = count.*;
+        for (shapes[0..count.*], 0..) |existing, index| {
+            if (out_dim < existing[0] or (out_dim == existing[0] and in_dim < existing[1])) {
+                insert_at = index;
+                break;
+            }
+        }
+        var index: usize = count.*;
+        while (index > insert_at) : (index -= 1) shapes[index] = shapes[index - 1];
+        shapes[insert_at] = shape;
+        count.* += 1;
+        return true;
+    }
+
+    pub fn invalidate(
+        self: *MetalJitRouteScope,
+        reason: MetalJitScopeInvalidReason,
+        format: quant_matmul.Format,
+        out_dim: usize,
+        in_dim: usize,
+    ) void {
+        if (self.conformance_complete) {
+            self.invalid_reason = reason;
+            self.invalid_format = format;
+            self.invalid_shape = .{ out_dim, in_dim };
+        }
+        self.conformance_complete = false;
+    }
+
+    pub fn observedShapes(self: *const MetalJitRouteScope, format: quant_matmul.Format) []const [2]usize {
+        const format_index = metalJitQuantFormatIndex(format) orelse return &.{};
+        return self.observed_shapes[format_index][0..self.observed_shape_counts[format_index]];
+    }
+
+    pub fn includes(self: MetalJitRouteScope, artifact: quant_kernel_compiler.GeneratedArtifact) bool {
+        return switch (artifact.op) {
+            .small_batch_matmul => |op| if (metalJitQuantFormatBit(op.format)) |bit|
+                (self.quant_format_mask & bit) != 0 and self.observedShapes(op.format).len != 0
+            else
+                false,
+            .microkernel, .attention => false,
+        };
+    }
+
+    pub fn eql(a: MetalJitRouteScope, b: MetalJitRouteScope) bool {
+        return a.quant_format_mask == b.quant_format_mask and
+            a.conformance_complete == b.conformance_complete and
+            a.invalid_reason == b.invalid_reason and
+            a.invalid_format == b.invalid_format and
+            a.invalid_shape[0] == b.invalid_shape[0] and
+            a.invalid_shape[1] == b.invalid_shape[1] and
+            std.meta.eql(a.observed_shape_counts, b.observed_shape_counts) and
+            std.meta.eql(a.observed_shapes, b.observed_shapes);
+    }
+};
+
+fn metalJitQuantFormatIndex(format: quant_matmul.Format) ?u4 {
+    return switch (format) {
+        .q4_0 => 0,
+        .q4_1 => 1,
+        .q5_0 => 2,
+        .q5_1 => 3,
+        .q8_0 => 4,
+        .q8_1 => 5,
+        .q2_k => 6,
+        .q3_k => 7,
+        .q4_k => 8,
+        .q5_k => 9,
+        .q6_k => 10,
+        .q8_k => 11,
+        else => null,
+    };
+}
+
+fn metalJitQuantFormatBit(format: quant_matmul.Format) ?u16 {
+    const index = metalJitQuantFormatIndex(format) orelse return null;
+    return @as(u16, 1) << index;
+}
+
+fn metalJitPreciseMath(artifact: quant_kernel_compiler.GeneratedArtifact) bool {
+    return artifact.opKind() != .small_batch_matmul;
+}
+
+fn metalJitBaselineIdentity(source: []const u8) ?[]const u8 {
+    const prefix = "production_baseline=";
+    const start = (std.mem.indexOf(u8, source, prefix) orelse return null) + prefix.len;
+    const tail = source[start..];
+    var end: usize = 0;
+    while (end < tail.len and !std.ascii.isWhitespace(tail[end])) : (end += 1) {}
+    if (end == 0) return null;
+    return tail[0..end];
+}
+
+fn metalJitRuntimeIdentity(
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    buffer: []u8,
+) ![]const u8 {
+    return switch (artifact.op) {
+        .small_batch_matmul => |op| std.fmt.bufPrint(
+            buffer,
+            "op=small_batch_matmul,format={s},rows={s},epilogue={s},activation={s},function={s},output={s},min_in_dim={d}",
+            .{
+                @tagName(op.format),
+                @tagName(op.row_bucket),
+                @tagName(op.epilogue),
+                @tagName(op.activation),
+                if (op.function) |function| @tagName(function) else "runtime",
+                @tagName(op.output),
+                artifact.runtime_shape.min_in_dim,
+            },
+        ),
+        .microkernel => |op| std.fmt.bufPrint(buffer, "op=microkernel,kind={s}", .{@tagName(op.kind)}),
+        .attention => |op| std.fmt.bufPrint(
+            buffer,
+            "op=attention,kind={s},head_dim={d}",
+            .{ @tagName(op.kind), op.head_dim },
+        ),
+    };
+}
+
+fn metalJitScheduleIdentity(
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    buffer: []u8,
+) ![]const u8 {
+    const schedule = switch (artifact.op) {
+        .small_batch_matmul => |op| return std.fmt.bufPrint(
+            buffer,
+            "threads={d},cols={d}",
+            .{
+                quant_kernel_compiler.metalGeneratedThreadsPerThreadgroup(op.format, op.row_bucket, op.epilogue),
+                quant_kernel_compiler.metalGeneratedColsPerThreadgroup(op.format, op.row_bucket, op.epilogue),
+            },
+        ),
+        .microkernel => |op| op.schedule,
+        .attention => |op| op.schedule,
+    };
+    return std.fmt.bufPrint(
+        buffer,
+        "threads={d},cols={d},reduction={s},key_chunk={d},skip_rescale={d},serial_threads={d},stage2_threads={d},kv_splits={d},query_heads_per_kv={d},split_min_tokens={d},max_kv_tokens={d},storage={s},key_storage={s}",
+        .{
+            schedule.threads_per_threadgroup,
+            schedule.cols_per_threadgroup,
+            @tagName(schedule.reduction),
+            schedule.key_chunk,
+            @intFromBool(schedule.skip_rescale),
+            schedule.attention_serial_threads_per_threadgroup,
+            schedule.attention_stage2_threads_per_threadgroup,
+            schedule.attention_kv_splits,
+            schedule.attention_query_heads_per_kv_head,
+            schedule.attention_split_kv_min_tokens,
+            schedule.attention_max_kv_tokens,
+            @tagName(schedule.attention_storage),
+            @tagName(schedule.attention_key_storage),
+        },
+    );
+}
+
+fn metalJitRequiredThreads(artifact: quant_kernel_compiler.GeneratedArtifact) usize {
+    return switch (artifact.op) {
+        .small_batch_matmul => |op| quant_kernel_compiler.metalGeneratedThreadsPerThreadgroup(op.format, op.row_bucket, op.epilogue),
+        .microkernel => |op| op.schedule.threads_per_threadgroup,
+        .attention => |op| op.schedule.threads_per_threadgroup,
+    };
+}
+
+fn align16(value: usize) usize {
+    return (value + 15) & ~@as(usize, 15);
+}
+
+fn metalJitMaximumDynamicThreadgroupMemory(artifact: quant_kernel_compiler.GeneratedArtifact) usize {
+    const op = artifact.attentionOp() orelse return 0;
+    return switch (op.kind) {
+        .decode_1x => align16((4096 * 2 + 256) * @sizeOf(f32)),
+        .prefill_flash => align16(80 * 256 + 2016),
+    };
+}
+
+pub fn validateMetalJitSchedule(
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    device: MetalDeviceInfo,
+    pipeline: MetalGeneratedPipelineInfo,
+) !void {
+    const threads = metalJitRequiredThreads(artifact);
+    if (threads == 0 or
+        threads > device.max_threads_per_threadgroup_width or
+        threads > pipeline.max_total_threads_per_threadgroup)
+    {
+        return error.MetalJitThreadgroupLimitExceeded;
+    }
+    const dynamic_bytes = metalJitMaximumDynamicThreadgroupMemory(artifact);
+    const total_bytes = std.math.add(usize, @intCast(pipeline.static_threadgroup_memory_length), dynamic_bytes) catch
+        return error.MetalJitThreadgroupMemoryLimitExceeded;
+    if (total_bytes > device.max_threadgroup_memory_length) {
+        return error.MetalJitThreadgroupMemoryLimitExceeded;
+    }
+}
+
+fn metalJitConformanceIdentity(
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    scope: *const MetalJitRouteScope,
+) kernel_jit.ArtifactKey {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("metal-runtime-jit-conformance/v3");
+    hasher.update(metal_jit_qualification_policy_identity);
+    if (artifact.matmulOp()) |op| {
+        var format_bytes: [2]u8 = undefined;
+        std.mem.writeInt(u16, &format_bytes, @intFromEnum(op.format), .little);
+        hasher.update(&format_bytes);
+        for (scope.observedShapes(op.format)) |shape| {
+            var encoded: [16]u8 = undefined;
+            std.mem.writeInt(u64, encoded[0..8], @intCast(shape[0]), .little);
+            std.mem.writeInt(u64, encoded[8..16], @intCast(shape[1]), .little);
+            hasher.update(&encoded);
+        }
+    }
+    var digest: kernel_jit.ArtifactKey = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn metalJitArtifactKey(
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    source: []const u8,
+    device: MetalDeviceInfo,
+    device_name: []const u8,
+    compiler_identity: []const u8,
+    scope: *const MetalJitRouteScope,
+) !kernel_jit.ArtifactKey {
+    const baseline_symbol = metalJitBaselineIdentity(source) orelse
+        return error.MissingMetalJitBaselineIdentity;
+    const conformance_hex = std.fmt.bytesToHex(metalJitConformanceIdentity(artifact, scope), .lower);
+    var baseline_buffer: [768]u8 = undefined;
+    const baseline_identity = try std.fmt.bufPrint(
+        &baseline_buffer,
+        "symbol={s},implementation_sha256={s},qualification_sha256={s},conformance_sha256={s},policy={s}",
+        .{
+            baseline_symbol,
+            metal_jit_baseline_implementation_sha256,
+            metal_jit_qualification_implementation_sha256,
+            &conformance_hex,
+            metal_jit_qualification_policy_identity,
+        },
+    );
+    var runtime_buffer: [320]u8 = undefined;
+    const runtime_identity = try metalJitRuntimeIdentity(artifact, &runtime_buffer);
+    var schedule_buffer: [384]u8 = undefined;
+    const schedule_identity = try metalJitScheduleIdentity(artifact, &schedule_buffer);
+    var target_buffer: [160]u8 = undefined;
+    const target_identity = try std.fmt.bufPrint(
+        &target_buffer,
+        "apple={d},mac={d},common={d},metal={d}",
+        .{ device.apple_gpu_family, device.mac_gpu_family, device.common_gpu_family, device.metal_gpu_family },
+    );
+    var device_buffer: [512]u8 = undefined;
+    const device_identity = try std.fmt.bufPrint(
+        &device_buffer,
+        "name={s},registry={x},unified={d},max_threads={d},threadgroup_memory={d}",
+        .{
+            device_name,
+            device.registry_id,
+            device.has_unified_memory,
+            device.max_threads_per_threadgroup_width,
+            device.max_threadgroup_memory_length,
+        },
+    );
+    return kernel_jit.artifactKey(.{
+        .backend = .metal,
+        .semantic_identity = artifact.kernel_id,
+        .runtime_identity = runtime_identity,
+        .target_identity = target_identity,
+        .device_identity = device_identity,
+        .schedule_identity = schedule_identity,
+        .baseline_identity = baseline_identity,
+        .compiler_identity = compiler_identity,
+        .compiler_options = if (metalJitPreciseMath(artifact)) "math=safe" else "math=default",
+        .source = source,
+    });
+}
+
+// Model sessions have independent JIT state, but they all target the same
+// process-wide Metal device. Keep source compilation and live qualification
+// from competing for that device when several models cold-load concurrently.
+// Exact-key cache reuse avoids most repeat qualifications; this lock provides
+// the bounded fallback when two sessions miss the same key at once.
+var metal_jit_process_gpu_mutex: std.Io.Mutex = .init;
+
+const metal_jit_rejection_memo_capacity = 128;
+const metal_jit_rejection_ttl_ns: u128 = std.time.ns_per_hour;
+
+const MetalJitRejectionMemoEntry = struct {
+    key: kernel_jit.ArtifactKey = @splat(0),
+    rejected_at_ns: u128 = 0,
+    occupied: bool = false,
+};
+
+// Guarded by metal_jit_process_gpu_mutex. This bounded process-local negative
+// cache prevents a broken or unprofitable exact artifact from being benchmarked
+// once per concurrently loaded model. It deliberately expires so transient
+// device pressure cannot quarantine a candidate forever.
+var metal_jit_rejection_memo = [_]MetalJitRejectionMemoEntry{.{}} ** metal_jit_rejection_memo_capacity;
+
+fn metalJitRejectionMemoContains(key: kernel_jit.ArtifactKey, now_ns: u128) bool {
+    for (&metal_jit_rejection_memo) |*entry| {
+        if (!entry.occupied) continue;
+        if (now_ns < entry.rejected_at_ns or now_ns - entry.rejected_at_ns >= metal_jit_rejection_ttl_ns) {
+            entry.* = .{};
+            continue;
+        }
+        if (std.mem.eql(u8, &entry.key, &key)) return true;
+    }
+    return false;
+}
+
+fn metalJitRejectionMemoRecord(key: kernel_jit.ArtifactKey, now_ns: u128) void {
+    var victim: *MetalJitRejectionMemoEntry = &metal_jit_rejection_memo[0];
+    for (&metal_jit_rejection_memo) |*entry| {
+        if (entry.occupied and std.mem.eql(u8, &entry.key, &key)) {
+            entry.rejected_at_ns = now_ns;
+            return;
+        }
+        if (!entry.occupied) {
+            victim = entry;
+            break;
+        }
+        if (entry.rejected_at_ns < victim.rejected_at_ns) victim = entry;
+    }
+    victim.* = .{ .key = key, .rejected_at_ns = now_ns, .occupied = true };
+}
+
+fn metalJitRejectionMemoClear(key: kernel_jit.ArtifactKey) void {
+    for (&metal_jit_rejection_memo) |*entry| {
+        if (entry.occupied and std.mem.eql(u8, &entry.key, &key)) entry.* = .{};
+    }
+}
 
 pub const decoder_runtime_layer_norm_slot_capacity: usize = 256;
 pub const decoder_runtime_rms_norm_slot_capacity: usize = 512;
@@ -6683,6 +7266,1668 @@ test "metal generated attention and RMS opt-ins are fail-closed and execution-co
 }
 
 pub extern fn termite_metal_device_available() c_int;
+pub extern fn termite_metal_copy_device_name(buffer: [*c]u8, capacity: usize) usize;
+pub extern fn termite_metal_copy_compiler_identity(buffer: [*c]u8, capacity: usize) usize;
+pub extern fn termite_metal_device_info_get(info: *MetalDeviceInfo) c_int;
+pub extern fn termite_metal_generated_pipeline_create(
+    source: [*]const u8,
+    source_len: usize,
+    kernel_name: [*:0]const u8,
+    precise_math: c_int,
+    error_buffer: [*c]u8,
+    error_capacity: usize,
+) ?*RawMetalGeneratedPipeline;
+pub extern fn termite_metal_generated_pipeline_info_get(
+    generated: ?*const RawMetalGeneratedPipeline,
+    info: *MetalGeneratedPipelineInfo,
+) c_int;
+pub extern fn termite_metal_jit_route_activation_allowed(slot: c_uint) c_int;
+pub extern fn termite_metal_jit_route_gate_probe(
+    slot: c_uint,
+    env_name: [*:0]const u8,
+    qualified_out_dim: usize,
+    qualified_in_dim: usize,
+    query_out_dim: usize,
+    query_in_dim: usize,
+) c_int;
+pub extern fn termite_metal_generated_pipeline_install(
+    provider: ?*RawMetalProvider,
+    runtime: ?*RawMetalDecodeRuntime,
+    generated: ?*const RawMetalGeneratedPipeline,
+    slot: c_uint,
+    qualified_shape_pairs: [*c]const usize,
+    qualified_shape_count: usize,
+) c_int;
+pub extern fn termite_metal_generated_pipeline_destroy(generated: ?*RawMetalGeneratedPipeline) void;
+pub extern fn termite_metal_run_jit_quant_route_check(
+    provider: ?*RawMetalProvider,
+    generated: ?*const RawMetalGeneratedPipeline,
+    format: c_uint,
+    implementation: c_uint,
+    input: [*]const f32,
+    input_count: usize,
+    weight: [*]const u8,
+    weight_count: usize,
+    output: [*]f32,
+    output_count: usize,
+    rows: c_uint,
+    in_dim: c_uint,
+    out_dim: c_uint,
+    threads_per_threadgroup: c_uint,
+    cols_per_threadgroup: c_uint,
+    warmup_iters: c_uint,
+    measure_iters: c_uint,
+    elapsed_nanos: *u64,
+) c_int;
+
+pub const MetalJitQualificationImplementation = enum(c_uint) {
+    baseline,
+    candidate,
+};
+
+pub const MetalJitQualificationMeasurements = struct {
+    correctness_passed: bool,
+    timing_passed: bool = true,
+    aggregate_measured_speedup: ?f64 = null,
+    aggregate_minimum_repeat_speedup: ?f64 = null,
+    max_absolute_error: f64,
+    max_relative_error: f64,
+    baseline_nanos: [kernel_jit.measurement_repeats]u64,
+    candidate_nanos: [kernel_jit.measurement_repeats]u64,
+};
+
+pub const MetalJitQualificationRequest = struct {
+    allocator: std.mem.Allocator,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    scope: *const MetalJitRouteScope,
+    provider: ?*RawMetalProvider,
+    generated: *const RawMetalGeneratedPipeline,
+};
+
+pub const MetalJitQualificationHarness = struct {
+    context: ?*anyopaque = null,
+    qualify_fn: *const fn (
+        context: ?*anyopaque,
+        request: MetalJitQualificationRequest,
+    ) anyerror!MetalJitQualificationMeasurements = liveMetalJitQualification,
+
+    pub fn qualify(
+        self: MetalJitQualificationHarness,
+        request: MetalJitQualificationRequest,
+    ) !MetalJitQualificationMeasurements {
+        return self.qualify_fn(self.context, request);
+    }
+};
+
+pub const MetalJitOptions = struct {
+    config: kernel_jit.Config = .{},
+    load_context: kernel_jit.LoadContext = .dynamic,
+    // Callers must derive model scope explicitly. A legacy/direct constructor
+    // remains dormant instead of silently treating the global registry as the
+    // loaded model's required surface.
+    scope: MetalJitRouteScope = MetalJitRouteScope.none(),
+    qualification_harness: MetalJitQualificationHarness = .{},
+};
+
+const MetalJitQualificationOutcome = enum(u8) {
+    qualified,
+    active,
+    rejected,
+};
+
+const MetalJitQualificationJob = struct {
+    session: *MetalJitSession,
+    raw_provider: ?*RawMetalProvider,
+    raw_decode_runtime: ?*RawMetalDecodeRuntime,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    route: MetalJitRoute,
+    key: kernel_jit.ArtifactKey,
+    generated: *RawMetalGeneratedPipeline,
+    mode: kernel_jit.Mode,
+    outcome: MetalJitQualificationOutcome = .rejected,
+};
+
+/// Heap-stable cache/harness state retained by the provider until teardown.
+/// All compilation and qualification is synchronous during startup preload.
+pub const MetalJitSession = struct {
+    allocator: std.mem.Allocator,
+    cache: ?kernel_jit.ArtifactCache = null,
+    qualification_harness: MetalJitQualificationHarness,
+    scope: MetalJitRouteScope,
+};
+
+pub fn destroyMetalJitSession(session: ?*MetalJitSession) void {
+    const value = session orelse return;
+    if (value.cache) |*cache| cache.deinit();
+    const allocator = value.allocator;
+    allocator.destroy(value);
+}
+
+fn metalJitMonotonicNowNs() u128 {
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => return 0,
+    }
+}
+
+fn metalJitCFormat(format: quant_matmul.Format) ?c_uint {
+    return switch (format) {
+        .q2_k => 4,
+        .q3_k => 5,
+        .q4_k => 8,
+        .q5_k => 11,
+        .q6_k => 12,
+        .q8_0 => 13,
+        .q8_k => 15,
+        else => null,
+    };
+}
+
+fn metalJitQuantizeFixture(
+    allocator: std.mem.Allocator,
+    format: quant_matmul.Format,
+    dense_weight: []const f32,
+) ![]u8 {
+    return switch (format) {
+        .q2_k => quant_codec.quantizeQ2_KFromF32(allocator, dense_weight),
+        .q3_k => quant_codec.quantizeQ3_KFromF32(allocator, dense_weight),
+        .q4_k => quant_codec.quantizeQ4_KFromF32(allocator, dense_weight),
+        .q5_k => quant_codec.quantizeQ5_KFromF32(allocator, dense_weight),
+        .q6_k => quant_codec.quantizeQ6_KFromF32(allocator, dense_weight),
+        .q8_0 => quant_codec.quantizeQ8_0FromF32(allocator, dense_weight),
+        .q8_k => quant_codec.quantizeQ8_KFromF32(allocator, dense_weight),
+        else => error.UnsupportedMetalJitQualificationFormat,
+    };
+}
+
+fn runMetalJitQuantFixture(
+    request: MetalJitQualificationRequest,
+    format: quant_matmul.Format,
+    implementation: MetalJitQualificationImplementation,
+    input: []const f32,
+    weight: []const u8,
+    output: []f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    threads: usize,
+    cols: usize,
+    warmup_iters: u32,
+    measure_iters: u32,
+) !u64 {
+    var elapsed_nanos: u64 = 0;
+    const rc = termite_metal_run_jit_quant_route_check(
+        request.provider,
+        request.generated,
+        metalJitCFormat(format) orelse return error.UnsupportedMetalJitQualificationFormat,
+        @intFromEnum(implementation),
+        input.ptr,
+        input.len,
+        weight.ptr,
+        weight.len,
+        output.ptr,
+        output.len,
+        @intCast(rows),
+        @intCast(in_dim),
+        @intCast(out_dim),
+        @intCast(threads),
+        @intCast(cols),
+        warmup_iters,
+        measure_iters,
+        &elapsed_nanos,
+    );
+    if (rc != 0) {
+        std.log.warn("Metal runtime JIT qualification dispatch failed for {s}: rc={d}", .{ request.artifact.kernel_id, rc });
+        return error.MetalJitQualificationDispatchFailed;
+    }
+    if (elapsed_nanos == 0) return error.InvalidKernelJitMeasurements;
+    return elapsed_nanos;
+}
+
+const MetalJitConformanceShape = struct {
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+};
+
+fn metalJitFixtureBytes(
+    format: quant_matmul.Format,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !usize {
+    if (rows == 0 or in_dim == 0 or out_dim == 0) return error.InvalidMetalJitFixtureShape;
+    const values_per_block = format.valuesPerBlock() orelse return error.UnsupportedMetalJitQualificationFormat;
+    const bytes_per_block = format.bytesPerBlock() orelse return error.UnsupportedMetalJitQualificationFormat;
+    if (values_per_block == 0 or bytes_per_block == 0 or in_dim % values_per_block != 0) {
+        return error.InvalidMetalJitFixtureShape;
+    }
+    const blocks_per_row = in_dim / values_per_block;
+    const weight_blocks = try std.math.mul(usize, out_dim, blocks_per_row);
+    const weight_bytes = try std.math.mul(usize, weight_blocks, bytes_per_block);
+    const input_elements = try std.math.mul(usize, rows, in_dim);
+    const input_bytes = try std.math.mul(usize, input_elements, @sizeOf(f32));
+    const output_elements = try std.math.mul(usize, rows, out_dim);
+    const one_output_bytes = try std.math.mul(usize, output_elements, @sizeOf(f32));
+    // Observed-shape correctness samples output columns with one dequantized
+    // f32 weight row; it never materializes the full dense matrix. The peak
+    // GPU phase keeps host W+I+2O while the C harness owns shared Metal W+I+O.
+    // Account both phases with checked arithmetic, then reserve headroom for
+    // allocator/command-buffer overhead.
+    const two_weight_bytes = try std.math.mul(usize, weight_bytes, 2);
+    const two_input_bytes = try std.math.mul(usize, input_bytes, 2);
+    const three_output_bytes = try std.math.mul(usize, one_output_bytes, 3);
+    const gpu_peak_without_margin = try std.math.add(
+        usize,
+        try std.math.add(usize, two_weight_bytes, two_input_bytes),
+        three_output_bytes,
+    );
+    const two_output_bytes = try std.math.mul(usize, one_output_bytes, 2);
+    const sampled_weight_row_bytes = try std.math.mul(usize, in_dim, @sizeOf(f32));
+    const cpu_peak_without_margin = try std.math.add(
+        usize,
+        try std.math.add(
+            usize,
+            try std.math.add(usize, weight_bytes, input_bytes),
+            two_output_bytes,
+        ),
+        sampled_weight_row_bytes,
+    );
+    const peak_bytes = @max(gpu_peak_without_margin, cpu_peak_without_margin);
+    const admitted_bytes = try std.math.add(usize, peak_bytes, metal_jit_fixture_safety_margin_bytes);
+    if (admitted_bytes > metal_jit_max_fixture_bytes) return error.MetalJitFixtureResourceLimit;
+    return admitted_bytes;
+}
+
+fn metalJitPatternWeight(
+    allocator: std.mem.Allocator,
+    format: quant_matmul.Format,
+    in_dim: usize,
+    out_dim: usize,
+    seed: usize,
+) ![]u8 {
+    _ = try metalJitFixtureBytes(format, 8, in_dim, out_dim);
+    const values_per_block = format.valuesPerBlock().?;
+    const bytes_per_block = format.bytesPerBlock().?;
+    const block_count = try std.math.mul(usize, out_dim, in_dim / values_per_block);
+    const raw_len = try std.math.mul(usize, block_count, bytes_per_block);
+    const raw = try allocator.alloc(u8, raw_len);
+    errdefer allocator.free(raw);
+    const pattern_count = @min(block_count, @as(usize, 29));
+    const pattern_bank = try allocator.alloc(u8, try std.math.mul(usize, pattern_count, bytes_per_block));
+    defer allocator.free(pattern_bank);
+    const dense_block = try allocator.alloc(f32, values_per_block);
+    defer allocator.free(dense_block);
+    for (0..pattern_count) |pattern_index| {
+        fillMetalJitFixture(dense_block, 7 + pattern_index * 2, 23 + pattern_index % 7, 11, 16.0, seed + pattern_index * 17);
+        const encoded_block = try metalJitQuantizeFixture(allocator, format, dense_block);
+        defer allocator.free(encoded_block);
+        if (encoded_block.len != bytes_per_block) return error.InvalidMetalJitQuantizedBlock;
+        const offset = pattern_index * bytes_per_block;
+        @memcpy(pattern_bank[offset..][0..bytes_per_block], encoded_block);
+    }
+    const blocks_per_row = in_dim / values_per_block;
+    for (0..block_count) |block_index| {
+        const output_row = block_index / blocks_per_row;
+        const local_block = block_index % blocks_per_row;
+        const pattern_index = (local_block * 7 + output_row * 11) % pattern_count;
+        const source_offset = pattern_index * bytes_per_block;
+        const destination_offset = block_index * bytes_per_block;
+        @memcpy(raw[destination_offset..][0..bytes_per_block], pattern_bank[source_offset..][0..bytes_per_block]);
+    }
+    return raw;
+}
+
+fn metalJitMeasureIterations(rows: usize, in_dim: usize, out_dim: usize) u32 {
+    const macs = @as(u128, rows) * @as(u128, in_dim) * @as(u128, out_dim);
+    if (macs == 0) return 1;
+    const scaled = @as(u128, metal_jit_measure_target_macs) / macs;
+    return @intCast(@max(@as(u128, 1), @min(@as(u128, metal_jit_max_measure_iters), scaled)));
+}
+
+const metal_jit_conformance_shape_count = 7;
+
+fn metalJitConformanceShapes(format: quant_matmul.Format) ![metal_jit_conformance_shape_count]MetalJitConformanceShape {
+    const values_per_block: usize = switch (format) {
+        .q8_0 => 32,
+        .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .q8_k => 256,
+        else => return error.UnsupportedMetalJitQualificationFormat,
+    };
+    const base_in_dim = @max(@as(usize, 512), values_per_block * 2);
+    return .{
+        .{ .rows = 2, .in_dim = base_in_dim, .out_dim = 255 },
+        .{ .rows = 3, .in_dim = base_in_dim + values_per_block, .out_dim = 257 },
+        .{ .rows = 4, .in_dim = base_in_dim * 2, .out_dim = 256 },
+        .{ .rows = 5, .in_dim = base_in_dim, .out_dim = 257 },
+        .{ .rows = 6, .in_dim = base_in_dim + values_per_block, .out_dim = 255 },
+        .{ .rows = 7, .in_dim = base_in_dim * 2, .out_dim = 257 },
+        .{ .rows = 8, .in_dim = base_in_dim + values_per_block, .out_dim = 256 },
+    };
+}
+
+fn metalJitQualificationTolerance(format: quant_matmul.Format) f64 {
+    return if (format == .q2_k or format == .q3_k or format == .q8_k) 0.001 else 0.0005;
+}
+
+fn fillMetalJitFixture(values: []f32, multiplier: usize, modulus: usize, center: i32, divisor: f32, seed: usize) void {
+    for (values, 0..) |*value, index| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast(((index + seed) * multiplier) % modulus)) - center)) / divisor;
+    }
+}
+
+const MetalJitConformanceResult = struct {
+    passed: bool,
+    max_absolute_error: f64,
+    max_relative_error: f64,
+};
+
+fn runMetalJitConformanceShape(
+    request: MetalJitQualificationRequest,
+    format: quant_matmul.Format,
+    shape: MetalJitConformanceShape,
+    threads: usize,
+    cols: usize,
+    seed: usize,
+) !MetalJitConformanceResult {
+    const dense_weight = try request.allocator.alloc(f32, shape.in_dim * shape.out_dim);
+    defer request.allocator.free(dense_weight);
+    fillMetalJitFixture(dense_weight, 7, 23, 11, 16.0, seed);
+    const raw_weight = try metalJitQuantizeFixture(request.allocator, format, dense_weight);
+    defer request.allocator.free(raw_weight);
+    const input = try request.allocator.alloc(f32, shape.rows * shape.in_dim);
+    defer request.allocator.free(input);
+    fillMetalJitFixture(input, 5, 19, 9, 48.0, seed + 3);
+    const expected = try request.allocator.alloc(f32, shape.rows * shape.out_dim);
+    defer request.allocator.free(expected);
+    try quant_kernel_compiler.referenceMatmulNoBias(
+        request.allocator,
+        format,
+        raw_weight,
+        input,
+        shape.rows,
+        shape.in_dim,
+        shape.out_dim,
+        expected,
+    );
+    const baseline_output = try request.allocator.alloc(f32, expected.len);
+    defer request.allocator.free(baseline_output);
+    const candidate_output = try request.allocator.alloc(f32, expected.len);
+    defer request.allocator.free(candidate_output);
+    @memset(baseline_output, 0);
+    @memset(candidate_output, 0);
+    _ = try runMetalJitQuantFixture(request, format, .baseline, input, raw_weight, baseline_output, shape.rows, shape.in_dim, shape.out_dim, threads, cols, 0, 1);
+    _ = try runMetalJitQuantFixture(request, format, .candidate, input, raw_weight, candidate_output, shape.rows, shape.in_dim, shape.out_dim, threads, cols, 0, 1);
+
+    const tolerance = metalJitQualificationTolerance(format);
+    var result = MetalJitConformanceResult{
+        .passed = true,
+        .max_absolute_error = 0,
+        .max_relative_error = 0,
+    };
+    for (expected, baseline_output, candidate_output) |want_f32, baseline_f32, candidate_f32| {
+        const want: f64 = want_f32;
+        const baseline: f64 = baseline_f32;
+        const candidate: f64 = candidate_f32;
+        if (!std.math.isFinite(baseline) or !std.math.isFinite(candidate)) {
+            result.passed = false;
+            continue;
+        }
+        const baseline_diff = @abs(baseline - want);
+        const candidate_diff = @abs(candidate - want);
+        const diff = @max(baseline_diff, candidate_diff);
+        result.max_absolute_error = @max(result.max_absolute_error, diff);
+        result.max_relative_error = @max(result.max_relative_error, diff / @max(@abs(want), 1.0e-6));
+        if (baseline_diff > tolerance or candidate_diff > tolerance) result.passed = false;
+    }
+    return result;
+}
+
+fn metalJitTensorTypeForFormat(format: quant_matmul.Format) ?gguf_tensor_types.TensorType {
+    return switch (format) {
+        .q2_k => .{ .known = .Q2_K },
+        .q3_k => .{ .known = .Q3_K },
+        .q4_k => .{ .known = .Q4_K },
+        .q5_k => .{ .known = .Q5_K },
+        .q6_k => .{ .known = .Q6_K },
+        .q8_0 => .{ .known = .Q8_0 },
+        .q8_k => .{ .known = .Q8_K },
+        else => null,
+    };
+}
+
+/// Independently validate real model strides without materializing the full
+/// f32 weight matrix. Eight deterministic, range-spanning output columns are
+/// dequantized one at a time and checked for every routed input row against
+/// both the bundled and generated GPU results.
+fn runMetalJitSampledObservedOracle(
+    request: MetalJitQualificationRequest,
+    format: quant_matmul.Format,
+    raw_weight: []const u8,
+    input: []const f32,
+    baseline_output: []const f32,
+    candidate_output: []const f32,
+    shape: MetalJitConformanceShape,
+) !MetalJitConformanceResult {
+    const input_len = try std.math.mul(usize, shape.rows, shape.in_dim);
+    const output_len = try std.math.mul(usize, shape.rows, shape.out_dim);
+    if (input.len != input_len or baseline_output.len != output_len or candidate_output.len != output_len) {
+        return error.InvalidMetalJitFixtureShape;
+    }
+    const tensor_type = metalJitTensorTypeForFormat(format) orelse
+        return error.UnsupportedMetalJitQualificationFormat;
+    const weight_row = try request.allocator.alloc(f32, shape.in_dim);
+    defer request.allocator.free(weight_row);
+    const sample_count = @min(shape.out_dim, @as(usize, 8));
+    const tolerance = metalJitQualificationTolerance(format);
+    var result = MetalJitConformanceResult{
+        .passed = true,
+        .max_absolute_error = 0,
+        .max_relative_error = 0,
+    };
+    for (0..sample_count) |sample_index| {
+        const output_column = if (sample_count == 1)
+            0
+        else
+            @as(usize, @intCast(
+                (@as(u128, sample_index) * @as(u128, shape.out_dim - 1)) /
+                    @as(u128, sample_count - 1),
+            ));
+        try quant_codec.dequantizeRow(tensor_type, raw_weight, shape.in_dim, output_column, weight_row);
+        for (0..shape.rows) |row| {
+            var expected: f32 = 0;
+            const input_row = input[row * shape.in_dim ..][0..shape.in_dim];
+            for (input_row, weight_row) |input_value, weight_value| expected += input_value * weight_value;
+            const output_index = row * shape.out_dim + output_column;
+            const want: f64 = expected;
+            const baseline: f64 = baseline_output[output_index];
+            const candidate: f64 = candidate_output[output_index];
+            if (!std.math.isFinite(want) or !std.math.isFinite(baseline) or !std.math.isFinite(candidate)) {
+                result.passed = false;
+                continue;
+            }
+            const baseline_diff = @abs(baseline - want);
+            const candidate_diff = @abs(candidate - want);
+            const diff = @max(baseline_diff, candidate_diff);
+            result.max_absolute_error = @max(result.max_absolute_error, diff);
+            result.max_relative_error = @max(result.max_relative_error, diff / @max(@abs(want), 1.0e-6));
+            if (baseline_diff > tolerance or candidate_diff > tolerance) result.passed = false;
+        }
+    }
+    return result;
+}
+
+fn runMetalJitObservedShape(
+    request: MetalJitQualificationRequest,
+    format: quant_matmul.Format,
+    shape: MetalJitConformanceShape,
+    threads: usize,
+    cols: usize,
+    seed: usize,
+) !MetalJitQualificationMeasurements {
+    _ = try metalJitFixtureBytes(format, shape.rows, shape.in_dim, shape.out_dim);
+    const raw_weight = try metalJitPatternWeight(request.allocator, format, shape.in_dim, shape.out_dim, seed);
+    defer request.allocator.free(raw_weight);
+    const input_len = try std.math.mul(usize, shape.rows, shape.in_dim);
+    const input = try request.allocator.alloc(f32, input_len);
+    defer request.allocator.free(input);
+    fillMetalJitFixture(input, 5, 19, 9, 48.0, seed + 3);
+    const output_len = try std.math.mul(usize, shape.rows, shape.out_dim);
+    const baseline_output = try request.allocator.alloc(f32, output_len);
+    defer request.allocator.free(baseline_output);
+    const candidate_output = try request.allocator.alloc(f32, output_len);
+    defer request.allocator.free(candidate_output);
+    @memset(baseline_output, 0);
+    @memset(candidate_output, 0);
+    _ = try runMetalJitQuantFixture(request, format, .baseline, input, raw_weight, baseline_output, shape.rows, shape.in_dim, shape.out_dim, threads, cols, 0, 1);
+    _ = try runMetalJitQuantFixture(request, format, .candidate, input, raw_weight, candidate_output, shape.rows, shape.in_dim, shape.out_dim, threads, cols, 0, 1);
+
+    const correctness = try runMetalJitSampledObservedOracle(
+        request,
+        format,
+        raw_weight,
+        input,
+        baseline_output,
+        candidate_output,
+        shape,
+    );
+    if (!correctness.passed) return .{
+        .correctness_passed = false,
+        .max_absolute_error = correctness.max_absolute_error,
+        .max_relative_error = correctness.max_relative_error,
+        .baseline_nanos = @splat(0),
+        .candidate_nanos = @splat(0),
+    };
+
+    const measure_iters = metalJitMeasureIterations(shape.rows, shape.in_dim, shape.out_dim);
+    var baseline_nanos: [kernel_jit.measurement_repeats]u64 = undefined;
+    var candidate_nanos: [kernel_jit.measurement_repeats]u64 = undefined;
+    for (0..kernel_jit.measurement_repeats) |repeat| {
+        const warmup_iters: u32 = if (repeat == 0) quant_kernel_compiler.metal_promotion_warmup_repeat_runs else 0;
+        if (repeat % 2 == 0) {
+            baseline_nanos[repeat] = try runMetalJitQuantFixture(request, format, .baseline, input, raw_weight, baseline_output, shape.rows, shape.in_dim, shape.out_dim, threads, cols, warmup_iters, measure_iters);
+            candidate_nanos[repeat] = try runMetalJitQuantFixture(request, format, .candidate, input, raw_weight, candidate_output, shape.rows, shape.in_dim, shape.out_dim, threads, cols, warmup_iters, measure_iters);
+        } else {
+            candidate_nanos[repeat] = try runMetalJitQuantFixture(request, format, .candidate, input, raw_weight, candidate_output, shape.rows, shape.in_dim, shape.out_dim, threads, cols, warmup_iters, measure_iters);
+            baseline_nanos[repeat] = try runMetalJitQuantFixture(request, format, .baseline, input, raw_weight, baseline_output, shape.rows, shape.in_dim, shape.out_dim, threads, cols, warmup_iters, measure_iters);
+        }
+    }
+    return .{
+        .correctness_passed = true,
+        .max_absolute_error = correctness.max_absolute_error,
+        .max_relative_error = correctness.max_relative_error,
+        .baseline_nanos = baseline_nanos,
+        .candidate_nanos = candidate_nanos,
+    };
+}
+
+fn liveMetalJitQualification(
+    _: ?*anyopaque,
+    request: MetalJitQualificationRequest,
+) !MetalJitQualificationMeasurements {
+    const op = request.artifact.matmulOp() orelse return error.UnsupportedMetalJitQualificationOp;
+    if (!request.artifact.production_enabled or op.epilogue != .none or metalJitCFormat(op.format) == null) {
+        return error.UnsupportedMetalJitQualificationOp;
+    }
+    const threads = metalJitRequiredThreads(request.artifact);
+    const cols = quant_kernel_compiler.metalGeneratedColsPerThreadgroup(op.format, op.row_bucket, op.epilogue);
+    var max_absolute_error: f64 = 0;
+    var max_relative_error: f64 = 0;
+    // Correctness covers the full routed row bucket and representative input
+    // block/output tail boundaries before any benchmark work begins. Timing
+    // can never compensate for one failed matrix cell.
+    const conformance_shapes = try metalJitConformanceShapes(op.format);
+    for (conformance_shapes, 0..) |shape, shape_index| {
+        const result = try runMetalJitConformanceShape(request, op.format, shape, threads, cols, shape_index * 11 + 1);
+        max_absolute_error = @max(max_absolute_error, result.max_absolute_error);
+        max_relative_error = @max(max_relative_error, result.max_relative_error);
+        if (!result.passed) {
+            return .{
+                .correctness_passed = false,
+                .max_absolute_error = max_absolute_error,
+                .max_relative_error = max_relative_error,
+                .baseline_nanos = @splat(0),
+                .candidate_nanos = @splat(0),
+            };
+        }
+    }
+
+    // A format-wide slot is model-safe only when every observed matrix passes
+    // its sampled real-stride CPU oracle and the speedup gate at both routed
+    // row boundaries.
+    // Persisted median and worst-repeat speedups are componentwise minima over
+    // the whole domain; any slower cell rejects the route. Iterations scale
+    // inversely with matrix work so a large
+    // model cannot turn one admitted qualification into an unbounded preload.
+    const observed_shapes = request.scope.observedShapes(op.format);
+    if (observed_shapes.len == 0) return error.MissingMetalJitObservedShape;
+    const routed_rows = [_]usize{ 2, 8 };
+    var representative_measurements: ?MetalJitQualificationMeasurements = null;
+    var aggregate_measured_speedup: f64 = std.math.inf(f64);
+    var aggregate_minimum_repeat_speedup: f64 = std.math.inf(f64);
+    for (observed_shapes, 0..) |observed, shape_index| {
+        for (routed_rows, 0..) |rows, row_index| {
+            var cell = try runMetalJitObservedShape(
+                request,
+                op.format,
+                .{ .rows = rows, .in_dim = observed[1], .out_dim = observed[0] },
+                threads,
+                cols,
+                101 + shape_index * 17 + row_index * 5,
+            );
+            max_absolute_error = @max(max_absolute_error, cell.max_absolute_error);
+            max_relative_error = @max(max_relative_error, cell.max_relative_error);
+            if (!cell.correctness_passed) {
+                cell.max_absolute_error = max_absolute_error;
+                cell.max_relative_error = max_relative_error;
+                return cell;
+            }
+            const record = metalJitQualificationRecord(cell) catch {
+                cell.timing_passed = false;
+                cell.max_absolute_error = max_absolute_error;
+                cell.max_relative_error = max_relative_error;
+                return cell;
+            };
+            aggregate_measured_speedup = @min(aggregate_measured_speedup, record.measured_speedup);
+            aggregate_minimum_repeat_speedup = @min(aggregate_minimum_repeat_speedup, record.minimum_repeat_speedup);
+            if (representative_measurements == null) representative_measurements = cell;
+        }
+    }
+    var result = representative_measurements orelse return error.MissingMetalJitObservedShape;
+    result.aggregate_measured_speedup = aggregate_measured_speedup;
+    result.aggregate_minimum_repeat_speedup = aggregate_minimum_repeat_speedup;
+    result.max_absolute_error = max_absolute_error;
+    result.max_relative_error = max_relative_error;
+    return result;
+}
+
+pub fn metalJitQualificationRecord(
+    measurements: MetalJitQualificationMeasurements,
+) !kernel_jit.QualificationRecord {
+    // A failed correctness pass never enters the timing/evidence machinery and
+    // can therefore never create a persistent qualification record.
+    if (!measurements.correctness_passed) return error.MetalJitCorrectnessFailed;
+    if (!measurements.timing_passed) return error.MetalJitQualificationRejected;
+    const evidence = try kernel_jit.evidenceFromPairedNanos(
+        0,
+        true,
+        &measurements.baseline_nanos,
+        &measurements.candidate_nanos,
+    );
+    const record = kernel_jit.QualificationRecord{
+        .candidate_index = @intCast(evidence.candidate_index),
+        .repeat_count = kernel_jit.measurement_repeats,
+        .correctness_passed = evidence.correctness_passed,
+        .measured_speedup = @min(evidence.measured_speedup, measurements.aggregate_measured_speedup orelse std.math.inf(f64)),
+        .minimum_repeat_speedup = @min(evidence.minimum_repeat_speedup, measurements.aggregate_minimum_repeat_speedup orelse std.math.inf(f64)),
+        .max_absolute_error = measurements.max_absolute_error,
+        .max_relative_error = measurements.max_relative_error,
+    };
+    try record.validate();
+    if (!record.eligible()) return error.MetalJitQualificationRejected;
+    return record;
+}
+
+fn metalJitRouteFailure(
+    mode: kernel_jit.Mode,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    stage: []const u8,
+    detail: []const u8,
+) !void {
+    std.log.warn("Metal runtime JIT {s} failed for {s}: {s}", .{ stage, artifact.kernel_id, detail });
+    if (mode.failClosed() and artifact.production_enabled) return error.MetalJitRequiredRouteFailed;
+}
+
+fn metalJitCachedQualification(
+    allocator: std.mem.Allocator,
+    cache: ?*kernel_jit.ArtifactCache,
+    key: kernel_jit.ArtifactKey,
+) ?kernel_jit.QualificationRecord {
+    const value = cache orelse return null;
+    const payload = value.load(.qualification, key) catch |err| {
+        // Cache I/O is never a required-mode fatal error. A missing valid
+        // qualification still makes the individual required route fail closed.
+        std.log.warn("Metal runtime JIT qualification cache load failed: {s}", .{@errorName(err)});
+        return null;
+    } orelse return null;
+    defer allocator.free(payload);
+    const record = kernel_jit.QualificationRecord.decode(payload) catch |err| {
+        std.log.warn("Metal runtime JIT qualification payload rejected: {s}", .{@errorName(err)});
+        return null;
+    };
+    // There is one candidate per typed Metal route in this round.
+    if (record.candidate_index != 0 or !record.eligible()) return null;
+    return record;
+}
+
+fn metalJitQualificationWork(job: *MetalJitQualificationJob) anyerror!void {
+    metal_jit_process_gpu_mutex.lockUncancelable(io_compat.io());
+    defer metal_jit_process_gpu_mutex.unlock(io_compat.io());
+
+    // Re-read the shared exact-key cache after taking the process GPU lock so
+    // concurrent startup preloads singleflight.
+    if (metalJitCachedQualification(
+        job.session.allocator,
+        if (job.session.cache) |*cache| cache else null,
+        job.key,
+    ) != null) {
+        metalJitRejectionMemoClear(job.key);
+        return metalJitActivateQualifiedJob(job);
+    }
+    if (metalJitRejectionMemoContains(job.key, metalJitMonotonicNowNs())) {
+        job.outcome = .rejected;
+        return error.MetalJitQualificationQuarantined;
+    }
+
+    const measurements = job.session.qualification_harness.qualify(.{
+        .allocator = job.session.allocator,
+        .artifact = job.artifact,
+        .scope = &job.session.scope,
+        .provider = job.raw_provider,
+        .generated = job.generated,
+    }) catch |err| {
+        job.outcome = .rejected;
+        // Dispatch/device/allocation errors may be transient. Only a completed
+        // deterministic correctness/timing rejection below enters the 1h memo.
+        std.log.warn("Metal runtime JIT live qualification failed for {s}: {s}", .{ job.artifact.kernel_id, @errorName(err) });
+        return err;
+    };
+    const record = metalJitQualificationRecord(measurements) catch |err| {
+        job.outcome = .rejected;
+        metalJitRejectionMemoRecord(job.key, metalJitMonotonicNowNs());
+        std.log.warn("Metal runtime JIT live qualification rejected {s}: {s}", .{ job.artifact.kernel_id, @errorName(err) });
+        return err;
+    };
+
+    // The exact ArtifactKey is also the cache lookup key. No timing record is
+    // written until correctness, median speedup, and every repeat have passed.
+    if (job.session.cache) |*cache| {
+        const encoded = record.encode() catch |err| {
+            std.log.warn("Metal runtime JIT qualification encoding failed for {s}: {s}", .{ job.artifact.kernel_id, @errorName(err) });
+            return err;
+        };
+        cache.store(.qualification, job.key, &encoded) catch |err| {
+            // Persistence is an optimization, including in required mode. A
+            // valid live qualification can still activate this session.
+            std.log.warn("Metal runtime JIT qualification cache write failed for {s}: {s}", .{ job.artifact.kernel_id, @errorName(err) });
+        };
+    }
+    metalJitRejectionMemoClear(job.key);
+    return metalJitActivateQualifiedJob(job);
+}
+
+fn metalJitActivateQualifiedJob(job: *MetalJitQualificationJob) !void {
+    job.outcome = .qualified;
+    if (!job.mode.activates()) return;
+    if (termite_metal_jit_route_activation_allowed(@intFromEnum(job.route.slot)) != 1) {
+        job.outcome = .rejected;
+        return error.MetalJitActivationDisabled;
+    }
+    const qualified_shapes = metalJitArtifactQualifiedShapes(&job.session.scope, job.artifact);
+    if (termite_metal_generated_pipeline_install(
+        job.raw_provider,
+        job.raw_decode_runtime,
+        job.generated,
+        @intFromEnum(job.route.slot),
+        if (qualified_shapes.len == 0) null else @ptrCast(qualified_shapes.ptr),
+        qualified_shapes.len,
+    ) != 0) {
+        job.outcome = .rejected;
+        return error.MetalJitActivationFailed;
+    }
+    job.outcome = .active;
+}
+
+fn metalJitArtifactQualifiedShapes(
+    scope: *const MetalJitRouteScope,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+) []const [2]usize {
+    return switch (artifact.op) {
+        .small_batch_matmul => |op| scope.observedShapes(op.format),
+        else => &.{},
+    };
+}
+
+pub fn metalJitProductionRouteCount(scope: MetalJitRouteScope) usize {
+    var count: usize = 0;
+    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+        if (artifact.backend == .metal and artifact.production_enabled and scope.includes(artifact)) count += 1;
+    }
+    return count;
+}
+
+fn logMetalJitCompletion(
+    owner: anytype,
+    scope: MetalJitRouteScope,
+    started_at_ns: u128,
+    load_context: kernel_jit.LoadContext,
+    preload_stop: MetalJitPreloadStop,
+) void {
+    const scoped_routes = metalJitProductionRouteCount(scope);
+    var compiled: usize = 0;
+    var qualified: usize = 0;
+    var active: usize = 0;
+    var rejected: usize = 0;
+    var pending: usize = 0;
+    for (owner.jit_route_states, owner.jit_qualified_routes) |state, is_qualified| {
+        if (state != .missing) compiled += 1;
+        if (is_qualified) qualified += 1;
+        switch (state) {
+            .active => active += 1,
+            .rejected, .quarantined => rejected += 1,
+            .queued, .compiling, .validating, .tuning => pending += 1,
+            else => {},
+        }
+    }
+    const finished_at_ns = metalJitMonotonicNowNs();
+    const elapsed_ms: u128 = if (finished_at_ns >= started_at_ns)
+        (finished_at_ns - started_at_ns) / std.time.ns_per_ms
+    else
+        0;
+    std.log.info(
+        "metal_jit_complete backend=metal mode={s} load_context={s} scoped_routes={d} compiled={d} qualified={d} active={d} rejected={d} pending={d} elapsed_ms={d} reason={s} preload_stop={s} preload_deadline_reached={} postpublication_gpu_work=false",
+        .{
+            @tagName(owner.jit_mode),
+            @tagName(load_context),
+            scoped_routes,
+            compiled,
+            qualified,
+            active,
+            rejected,
+            pending,
+            elapsed_ms,
+            @tagName(preload_stop),
+            @tagName(preload_stop),
+            preload_stop == .deadline,
+        },
+    );
+}
+
+fn scheduleMetalJitQualification(
+    owner: anytype,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    route: MetalJitRoute,
+    key: kernel_jit.ArtifactKey,
+    generated: *RawMetalGeneratedPipeline,
+) !void {
+    const session = owner.jit_session orelse return error.MissingMetalJitSession;
+    const slot_index = @intFromEnum(route.slot);
+    var job = MetalJitQualificationJob{
+        .session = session,
+        .raw_provider = owner.raw_provider,
+        .raw_decode_runtime = owner.raw_decode_runtime,
+        .artifact = artifact,
+        .route = route,
+        .key = key,
+        .generated = generated,
+        .mode = owner.jit_mode,
+    };
+    metalJitQualificationWork(&job) catch |err| {
+        owner.jit_route_states[slot_index] = .rejected;
+        return err;
+    };
+    switch (job.outcome) {
+        .qualified => {
+            owner.jit_qualified_routes[slot_index] = true;
+            owner.jit_route_states[slot_index] = .eligible;
+        },
+        .active => {
+            owner.jit_qualified_routes[slot_index] = true;
+            owner.jit_route_states[slot_index] = .active;
+        },
+        .rejected => owner.jit_route_states[slot_index] = .rejected,
+    }
+}
+
+const MetalJitLoadContext = struct {
+    allocator: std.mem.Allocator,
+    config: kernel_jit.Config,
+    scope: MetalJitRouteScope,
+    device: MetalDeviceInfo,
+    device_name: []const u8,
+    compiler_identity: []const u8,
+    cache: ?*kernel_jit.ArtifactCache,
+    started_at_ns: u128,
+
+    fn remainingBudgetNs(self: MetalJitLoadContext) u64 {
+        const budget_ns = self.config.preload_budget_ms * std.time.ns_per_ms;
+        const now_ns = metalJitMonotonicNowNs();
+        if (now_ns == 0 or now_ns < self.started_at_ns) return budget_ns;
+        const elapsed_ns = now_ns - self.started_at_ns;
+        return if (elapsed_ns >= budget_ns) 0 else @intCast(budget_ns - elapsed_ns);
+    }
+};
+
+const MetalJitPreloadStop = enum {
+    complete,
+    deadline,
+    dynamic_load,
+    empty_scope,
+    unsupported_shape,
+};
+
+/// Compile only production-wired routes synchronously. Candidate-only registry
+/// entries have no runtime activation/qualification contract and must not spend
+/// a model's preload budget or delay production qualification. Metal currently
+/// persists qualification evidence only: MSL/pipeline objects are recompiled at
+/// each model/process load until a trusted, budget-accounted binary cache exists.
+fn compileMetalJitProduction(
+    owner: anytype,
+    context: MetalJitLoadContext,
+) !MetalJitPreloadStop {
+    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+        if (artifact.backend != .metal) continue;
+        if (!context.scope.includes(artifact)) continue;
+        if (!artifact.production_enabled) continue;
+        if (!context.config.mode.failClosed() and context.remainingBudgetNs() == 0) {
+            std.log.warn("Metal runtime JIT preload admission budget exhausted before {s}", .{artifact.kernel_id});
+            return .deadline;
+        }
+
+        const route = metalJitRouteForArtifact(artifact) orelse {
+            try metalJitRouteFailure(context.config.mode, artifact, "slot mapping", "missing provider/runtime slot");
+            continue;
+        };
+        const slot_index = @intFromEnum(route.slot);
+        owner.jit_route_states[slot_index] = .compiling;
+
+        const emitted = quant_kernel_compiler.emitRuntimeArtifactSource(context.allocator, artifact) catch |err| {
+            owner.jit_route_states[slot_index] = .rejected;
+            try metalJitRouteFailure(context.config.mode, artifact, "source emission", @errorName(err));
+            continue;
+        };
+        defer emitted.deinit(context.allocator);
+
+        const key = metalJitArtifactKey(
+            artifact,
+            emitted.data,
+            context.device,
+            context.device_name,
+            context.compiler_identity,
+            &context.scope,
+        ) catch |err| {
+            owner.jit_route_states[slot_index] = .rejected;
+            try metalJitRouteFailure(context.config.mode, artifact, "artifact identity", @errorName(err));
+            continue;
+        };
+        owner.jit_artifact_keys[slot_index] = key;
+        const qualification = metalJitCachedQualification(context.allocator, context.cache, key);
+        owner.jit_qualified_routes[slot_index] = qualification != null;
+
+        const kernel_name = context.allocator.dupeZ(u8, artifact.kernel_id) catch |err| {
+            owner.jit_route_states[slot_index] = .rejected;
+            try metalJitRouteFailure(context.config.mode, artifact, "kernel name allocation", @errorName(err));
+            continue;
+        };
+        defer context.allocator.free(kernel_name);
+        var error_buffer: [4096]u8 = @splat(0);
+        const generated = blk: {
+            metal_jit_process_gpu_mutex.lockUncancelable(io_compat.io());
+            defer metal_jit_process_gpu_mutex.unlock(io_compat.io());
+            break :blk termite_metal_generated_pipeline_create(
+                emitted.data.ptr,
+                emitted.data.len,
+                kernel_name.ptr,
+                @intFromBool(metalJitPreciseMath(artifact)),
+                error_buffer[0..].ptr,
+                error_buffer.len,
+            );
+        };
+        const owned_generated = generated orelse {
+            owner.jit_route_states[slot_index] = .rejected;
+            const detail = std.mem.sliceTo(error_buffer[0..], 0);
+            try metalJitRouteFailure(
+                context.config.mode,
+                artifact,
+                "pipeline compilation",
+                if (detail.len == 0) "unknown Metal compiler error" else detail,
+            );
+            continue;
+        };
+        owner.jit_route_states[slot_index] = .validating;
+        var pipeline_info: MetalGeneratedPipelineInfo = .{};
+        if (termite_metal_generated_pipeline_info_get(owned_generated, &pipeline_info) != 0) {
+            termite_metal_generated_pipeline_destroy(owned_generated);
+            owner.jit_route_states[slot_index] = .rejected;
+            try metalJitRouteFailure(context.config.mode, artifact, "pipeline reflection", "Metal pipeline info unavailable");
+            continue;
+        }
+        validateMetalJitSchedule(artifact, context.device, pipeline_info) catch |err| {
+            termite_metal_generated_pipeline_destroy(owned_generated);
+            owner.jit_route_states[slot_index] = .rejected;
+            try metalJitRouteFailure(context.config.mode, artifact, "schedule validation", @errorName(err));
+            continue;
+        };
+        if (owner.jit_pipeline_owners[slot_index] != null) {
+            termite_metal_generated_pipeline_destroy(owned_generated);
+            owner.jit_route_states[slot_index] = .rejected;
+            try metalJitRouteFailure(context.config.mode, artifact, "pipeline retention", "duplicate slot owner");
+            continue;
+        }
+        owner.jit_pipeline_owners[slot_index] = owned_generated;
+        owner.jit_route_states[slot_index] = .eligible;
+
+        if (qualification == null) {
+            // Pipeline compilation is non-preemptible and may consume the
+            // remaining admission window. Recheck before starting any live
+            // GPU qualification; optional modes retain the compiled pipeline
+            // but leave the route uninstalled on bundled fallback.
+            if (!context.config.mode.failClosed() and context.remainingBudgetNs() == 0) {
+                std.log.warn("Metal runtime JIT preload admission budget exhausted before qualifying {s}", .{artifact.kernel_id});
+                return .deadline;
+            }
+            scheduleMetalJitQualification(owner, artifact, route, key, owned_generated) catch |err| {
+                owner.jit_route_states[slot_index] = .rejected;
+                try metalJitRouteFailure(context.config.mode, artifact, "live qualification", @errorName(err));
+                continue;
+            };
+            continue;
+        }
+        if (!context.config.mode.activates()) continue;
+        if (termite_metal_jit_route_activation_allowed(@intFromEnum(route.slot)) != 1) {
+            try metalJitRouteFailure(
+                context.config.mode,
+                artifact,
+                "activation",
+                "legacy generated-quant kill switch is active",
+            );
+            continue;
+        }
+        const qualified_shapes = metalJitArtifactQualifiedShapes(&context.scope, artifact);
+        if (termite_metal_generated_pipeline_install(
+            owner.raw_provider,
+            owner.raw_decode_runtime,
+            owned_generated,
+            @intFromEnum(route.slot),
+            if (qualified_shapes.len == 0) null else @ptrCast(qualified_shapes.ptr),
+            qualified_shapes.len,
+        ) != 0) {
+            try metalJitRouteFailure(context.config.mode, artifact, "activation", "provider/runtime slot install failed");
+            continue;
+        }
+        owner.jit_route_states[slot_index] = .active;
+    }
+    return .complete;
+}
+
+pub fn initializeMetalKernelJit(owner: anytype, config: kernel_jit.Config) !void {
+    return initializeMetalKernelJitWithOptions(owner, .{ .config = config });
+}
+
+pub fn initializeMetalKernelJitWithOptions(owner: anytype, options: MetalJitOptions) !void {
+    try options.config.validate();
+    owner.jit_mode = options.config.mode;
+    owner.jit_scope = options.scope;
+    if (!options.config.mode.compiles()) return;
+    const started_at_ns = metalJitMonotonicNowNs();
+
+    // A dynamic model load can overlap inference on an already-published
+    // model. Do not let source compilation or qualification contend with that
+    // shared Metal device. Only the explicit pre-serving preload phase owns a
+    // safe live-qualification window.
+    if (!options.load_context.allowsQualification()) {
+        logMetalJitCompletion(owner, options.scope, started_at_ns, options.load_context, .dynamic_load);
+        if (options.config.mode.failClosed()) return error.MetalJitRequiredRouteFailed;
+        return;
+    }
+    if (!options.scope.conformance_complete) {
+        std.log.warn(
+            "Metal runtime JIT scope incomplete reason={s} format={s} out_dim={d} in_dim={d}; affected shapes remain on bundled kernels",
+            .{
+                @tagName(options.scope.invalid_reason),
+                @tagName(options.scope.invalid_format),
+                options.scope.invalid_shape[0],
+                options.scope.invalid_shape[1],
+            },
+        );
+        if (options.config.mode.failClosed()) {
+            logMetalJitCompletion(owner, options.scope, started_at_ns, options.load_context, .unsupported_shape);
+            return error.MetalJitRequiredRouteFailed;
+        }
+    }
+    if (metalJitProductionRouteCount(options.scope) == 0) {
+        logMetalJitCompletion(
+            owner,
+            options.scope,
+            started_at_ns,
+            options.load_context,
+            if (options.scope.conformance_complete) .empty_scope else .unsupported_shape,
+        );
+        if (options.config.mode.failClosed()) return error.MetalJitRequiredRouteFailed;
+        return;
+    }
+
+    var device: MetalDeviceInfo = .{};
+    if (termite_metal_device_info_get(&device) != 0) {
+        if (options.config.mode.failClosed()) return error.MetalJitRequiredRouteFailed;
+        std.log.warn("Metal runtime JIT unavailable: Metal device info query failed", .{});
+        return;
+    }
+    var device_name_buffer: [4096]u8 = undefined;
+    const device_name_len = termite_metal_copy_device_name(null, 0);
+    if (device_name_len == 0 or device_name_len > device_name_buffer.len or
+        termite_metal_copy_device_name(device_name_buffer[0..].ptr, device_name_buffer.len) != device_name_len)
+    {
+        if (options.config.mode.failClosed()) return error.MetalJitRequiredRouteFailed;
+        std.log.warn("Metal runtime JIT unavailable: device identity query failed", .{});
+        return;
+    }
+    var compiler_buffer: [4096]u8 = undefined;
+    const compiler_len = termite_metal_copy_compiler_identity(null, 0);
+    if (compiler_len == 0 or compiler_len > compiler_buffer.len or
+        termite_metal_copy_compiler_identity(compiler_buffer[0..].ptr, compiler_buffer.len) != compiler_len)
+    {
+        if (options.config.mode.failClosed()) return error.MetalJitRequiredRouteFailed;
+        std.log.warn("Metal runtime JIT unavailable: compiler identity query failed", .{});
+        return;
+    }
+
+    const allocator = std.heap.c_allocator;
+    const session = allocator.create(MetalJitSession) catch |err| {
+        if (options.config.mode.failClosed()) return error.MetalJitRequiredRouteFailed;
+        std.log.warn("Metal runtime JIT session allocation failed: {s}", .{@errorName(err)});
+        return;
+    };
+    session.* = .{
+        .allocator = allocator,
+        .qualification_harness = options.qualification_harness,
+        .scope = options.scope,
+    };
+    owner.jit_session = session;
+
+    const home: ?[]const u8 = if (std.c.getenv("HOME")) |value| std.mem.span(value) else null;
+    const cache_path = options.config.resolveCacheDir(allocator, home) catch |err| blk: {
+        std.log.warn("Metal runtime JIT cache path resolution failed: {s}", .{@errorName(err)});
+        break :blk null;
+    };
+    defer if (cache_path) |path| allocator.free(path);
+    if (cache_path) |path| {
+        session.cache = kernel_jit.ArtifactCache.initPath(
+            allocator,
+            io_compat.io(),
+            path,
+            options.config.maxCacheBytes() catch 0,
+        ) catch |err| blk: {
+            // Always soft: required mode will fail the affected route if it
+            // cannot obtain a valid qualification through another source.
+            std.log.warn("Metal runtime JIT cache initialization failed: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+
+    const context = MetalJitLoadContext{
+        .allocator = allocator,
+        .config = options.config,
+        .scope = options.scope,
+        .device = device,
+        .device_name = device_name_buffer[0..device_name_len],
+        .compiler_identity = compiler_buffer[0..compiler_len],
+        .cache = if (session.cache) |*value| value else null,
+        .started_at_ns = started_at_ns,
+    };
+    const preload_stop = try compileMetalJitProduction(owner, context);
+    logMetalJitCompletion(
+        owner,
+        options.scope,
+        context.started_at_ns,
+        options.load_context,
+        if (!options.scope.conformance_complete and preload_stop == .complete) .unsupported_shape else preload_stop,
+    );
+}
+
+test "metal runtime JIT maps every typed artifact to one existing slot and full cache identity" {
+    try std.testing.expectEqual(metal_jit_pipeline_slot_count, metal_jit_routes.len);
+    var seen_slots = [_]bool{false} ** metal_jit_pipeline_slot_count;
+    var seen_keys = empty_metal_jit_artifact_keys;
+    var metal_count: usize = 0;
+    var production_count: usize = 0;
+    const device = MetalDeviceInfo{
+        .registry_id = 0x1234,
+        .max_threads_per_threadgroup_width = 1024,
+        .max_threadgroup_memory_length = 64 * 1024,
+        .apple_gpu_family = 9,
+        .common_gpu_family = 3,
+        .metal_gpu_family = 2,
+        .has_unified_memory = 1,
+    };
+    var scope = MetalJitRouteScope.none();
+    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+        if (artifact.matmulOp()) |op| {
+            const values_per_block = op.format.valuesPerBlock() orelse continue;
+            _ = scope.includeQuantShape(op.format, 256, @max(@as(usize, 512), values_per_block * 2));
+        }
+    }
+    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+        if (artifact.backend != .metal or artifact.matmulOp() == null) {
+            try std.testing.expect(metalJitRouteForArtifact(artifact) == null);
+            continue;
+        }
+        metal_count += 1;
+        const route = metalJitRouteForArtifact(artifact) orelse return error.MissingMetalJitRoute;
+        const slot_index = @intFromEnum(route.slot);
+        try std.testing.expect(slot_index < seen_slots.len);
+        try std.testing.expect(!seen_slots[slot_index]);
+        seen_slots[slot_index] = true;
+        if (artifact.production_enabled) {
+            production_count += 1;
+            try std.testing.expect(route.gate_env != null);
+        }
+        const compiler_gate = quant_kernel_compiler.artifactRuntimeGateEnv(
+            quant_kernel_compiler.matmulArtifactView(artifact),
+        ) orelse return error.MissingMetalJitGate;
+        try std.testing.expectEqualStrings(std.mem.span(compiler_gate), route.gate_env.?);
+        const source = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse
+            return error.MissingMetalJitSource;
+        try std.testing.expect(metalJitBaselineIdentity(source) != null);
+        const key = try metalJitArtifactKey(
+            artifact,
+            source,
+            device,
+            "test-metal-device",
+            "Apple-Metal/newLibraryWithSource/test-os",
+            &scope,
+        );
+        for (seen_keys) |prior| {
+            if (prior) |value| try std.testing.expect(!std.mem.eql(u8, &value, &key));
+        }
+        seen_keys[slot_index] = key;
+    }
+    try std.testing.expectEqual(metal_jit_routes.len, metal_count);
+    try std.testing.expectEqual(@as(usize, 7), production_count);
+    for (seen_slots) |seen| try std.testing.expect(seen);
+}
+
+test "metal runtime JIT route scope is model and operation specific" {
+    var scope = MetalJitRouteScope.fromTensorTypes(&.{ .Q2_K, .Q4_0, .F16 });
+    _ = scope.includeQuantShape(.q2_k, 256, 512);
+    _ = scope.includeQuantShape(.q4_0, 256, 512);
+    var included_production: usize = 0;
+    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+        if (artifact.backend != .metal) continue;
+        const included = scope.includes(artifact);
+        switch (artifact.op) {
+            .small_batch_matmul => |op| {
+                const expected = op.format == .q2_k or op.format == .q4_0;
+                try std.testing.expectEqual(expected, included);
+                if (included and artifact.production_enabled) included_production += 1;
+            },
+            .microkernel => try std.testing.expect(!included),
+            .attention => try std.testing.expect(!included),
+        }
+    }
+    // Q4_0 is still a candidate; only Q2_K is a required production route.
+    try std.testing.expectEqual(@as(usize, 1), included_production);
+    try std.testing.expect(!scope.eql(MetalJitRouteScope.all()));
+    try std.testing.expect(MetalJitRouteScope.none().eql(.{}));
+
+    var oversized_scope = MetalJitRouteScope.none();
+    const too_large_for_c_abi = @as(usize, std.math.maxInt(u32)) + 1;
+    try std.testing.expect(!oversized_scope.includeQuantShape(.q2_k, too_large_for_c_abi, 512));
+    try std.testing.expectEqual(MetalJitScopeInvalidReason.dimension_overflow, oversized_scope.invalid_reason);
+    try std.testing.expectEqual(@as(usize, 0), oversized_scope.observedShapes(.q2_k).len);
+}
+
+test "metal runtime JIT artifact identity includes exact qualified shapes" {
+    const artifact = comptime blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |candidate| {
+            if (candidate.backend == .metal and candidate.production_enabled) break :blk candidate;
+        }
+        @compileError("missing production Metal artifact");
+    };
+    const op = artifact.matmulOp().?;
+    const in_dim = @max(@as(usize, 512), op.format.valuesPerBlock().? * 2);
+    var first_scope = MetalJitRouteScope.none();
+    _ = first_scope.includeQuantShape(op.format, 256, in_dim);
+    var second_scope = MetalJitRouteScope.none();
+    _ = second_scope.includeQuantShape(op.format, 257, in_dim);
+    const source = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse
+        return error.MissingMetalJitSource;
+    const device = MetalDeviceInfo{
+        .registry_id = 0x1234,
+        .max_threads_per_threadgroup_width = 1024,
+        .max_threadgroup_memory_length = 64 * 1024,
+        .apple_gpu_family = 9,
+        .common_gpu_family = 3,
+        .metal_gpu_family = 2,
+        .has_unified_memory = 1,
+    };
+    const first_key = try metalJitArtifactKey(
+        artifact,
+        source,
+        device,
+        "test-metal-device",
+        "Apple-Metal/newLibraryWithSource/test-os",
+        &first_scope,
+    );
+    const second_key = try metalJitArtifactKey(
+        artifact,
+        source,
+        device,
+        "test-metal-device",
+        "Apple-Metal/newLibraryWithSource/test-os",
+        &second_scope,
+    );
+    try std.testing.expect(!std.mem.eql(u8, &first_key, &second_key));
+}
+
+test "metal runtime JIT correctness matrix covers routed row and tile boundaries" {
+    const q8_shapes = try metalJitConformanceShapes(.q8_0);
+    try std.testing.expectEqualDeep([_]MetalJitConformanceShape{
+        .{ .rows = 2, .in_dim = 512, .out_dim = 255 },
+        .{ .rows = 3, .in_dim = 544, .out_dim = 257 },
+        .{ .rows = 4, .in_dim = 1024, .out_dim = 256 },
+        .{ .rows = 5, .in_dim = 512, .out_dim = 257 },
+        .{ .rows = 6, .in_dim = 544, .out_dim = 255 },
+        .{ .rows = 7, .in_dim = 1024, .out_dim = 257 },
+        .{ .rows = 8, .in_dim = 544, .out_dim = 256 },
+    }, q8_shapes);
+    const k_shapes = try metalJitConformanceShapes(.q4_k);
+    try std.testing.expectEqualDeep([_]MetalJitConformanceShape{
+        .{ .rows = 2, .in_dim = 512, .out_dim = 255 },
+        .{ .rows = 3, .in_dim = 768, .out_dim = 257 },
+        .{ .rows = 4, .in_dim = 1024, .out_dim = 256 },
+        .{ .rows = 5, .in_dim = 512, .out_dim = 257 },
+        .{ .rows = 6, .in_dim = 768, .out_dim = 255 },
+        .{ .rows = 7, .in_dim = 1024, .out_dim = 257 },
+        .{ .rows = 8, .in_dim = 768, .out_dim = 256 },
+    }, k_shapes);
+    try std.testing.expectError(error.UnsupportedMetalJitQualificationFormat, metalJitConformanceShapes(.q4_0));
+    try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "rows2-through8"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "sampled-columns8"));
+    try std.testing.expectEqual(@as(usize, 64), metal_jit_baseline_implementation_sha256.len);
+    try std.testing.expectEqual(@as(usize, 64), metal_jit_qualification_implementation_sha256.len);
+}
+
+test "metal runtime JIT observed fixtures vary blocks and account peak shared memory" {
+    const raw = try metalJitPatternWeight(std.testing.allocator, .q8_0, 32, 30, 7);
+    defer std.testing.allocator.free(raw);
+    const block_bytes: usize = 34;
+    try std.testing.expect(!std.mem.eql(u8, raw[0..block_bytes], raw[block_bytes..][0..block_bytes]));
+    try std.testing.expectEqualSlices(u8, raw[0..block_bytes], raw[29 * block_bytes ..][0..block_bytes]);
+    const row_varied = try metalJitPatternWeight(std.testing.allocator, .q8_0, 29 * 32, 2, 7);
+    defer std.testing.allocator.free(row_varied);
+    const second_row_offset = 29 * block_bytes;
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        row_varied[0..block_bytes],
+        row_varied[second_row_offset..][0..block_bytes],
+    ));
+
+    const in_dim: usize = 4096;
+    const out_dim: usize = 4096;
+    const rows: usize = 8;
+    const weight_bytes = out_dim * (in_dim / 256) * 292;
+    const input_bytes = rows * in_dim * @sizeOf(f32);
+    const output_bytes = rows * out_dim * @sizeOf(f32);
+    const expected_peak = 2 * weight_bytes + 2 * input_bytes + 3 * output_bytes + metal_jit_fixture_safety_margin_bytes;
+    try std.testing.expectEqual(expected_peak, try metalJitFixtureBytes(.q8_k, rows, in_dim, out_dim));
+    try std.testing.expectError(
+        error.MetalJitFixtureResourceLimit,
+        metalJitFixtureBytes(.q8_k, rows, in_dim, 32768),
+    );
+}
+
+test "metal runtime JIT negative memo is exact bounded and expires" {
+    const first: kernel_jit.ArtifactKey = @splat(0x11);
+    var other = first;
+    other[0] = 0x22;
+    metal_jit_process_gpu_mutex.lockUncancelable(std.testing.io);
+    defer metal_jit_process_gpu_mutex.unlock(std.testing.io);
+    metalJitRejectionMemoClear(first);
+    metalJitRejectionMemoClear(other);
+    defer metalJitRejectionMemoClear(first);
+    metalJitRejectionMemoRecord(first, 1_000);
+    try std.testing.expect(metalJitRejectionMemoContains(first, 1_001));
+    try std.testing.expect(!metalJitRejectionMemoContains(other, 1_001));
+    try std.testing.expect(!metalJitRejectionMemoContains(first, 1_000 + metal_jit_rejection_ttl_ns));
+}
+
+test "metal runtime JIT qualification requires correctness median and every repeat" {
+    const eligible = try metalJitQualificationRecord(.{
+        .correctness_passed = true,
+        .max_absolute_error = 0.0001,
+        .max_relative_error = 0.001,
+        .baseline_nanos = .{ 120, 130, 125, 140, 150 },
+        .candidate_nanos = .{ 100, 100, 100, 100, 100 },
+    });
+    try std.testing.expect(eligible.eligible());
+    try std.testing.expectApproxEqAbs(@as(f64, 1.3), eligible.measured_speedup, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.2), eligible.minimum_repeat_speedup, 0.000001);
+
+    try std.testing.expectError(error.MetalJitCorrectnessFailed, metalJitQualificationRecord(.{
+        .correctness_passed = false,
+        .max_absolute_error = 1,
+        .max_relative_error = 1,
+        .baseline_nanos = @splat(0),
+        .candidate_nanos = @splat(0),
+    }));
+    try std.testing.expectError(error.MetalJitQualificationRejected, metalJitQualificationRecord(.{
+        .correctness_passed = true,
+        .max_absolute_error = 0,
+        .max_relative_error = 0,
+        .baseline_nanos = .{ 120, 120, 109, 120, 120 },
+        .candidate_nanos = .{ 100, 100, 100, 100, 100 },
+    }));
+}
+
+test "metal runtime JIT qualification harness is injectable without a GPU" {
+    const FakeHarness = struct {
+        calls: usize = 0,
+
+        fn qualify(
+            raw: ?*anyopaque,
+            request: MetalJitQualificationRequest,
+        ) !MetalJitQualificationMeasurements {
+            const self: *@This() = @ptrCast(@alignCast(raw orelse return error.MissingContext));
+            try std.testing.expect(request.artifact.production_enabled);
+            self.calls += 1;
+            return .{
+                .correctness_passed = true,
+                .max_absolute_error = 0.0001,
+                .max_relative_error = 0.001,
+                .baseline_nanos = @splat(120),
+                .candidate_nanos = @splat(100),
+            };
+        }
+    };
+    const artifact = comptime blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |candidate| {
+            if (candidate.backend == .metal and candidate.production_enabled) break :blk candidate;
+        }
+        @compileError("missing production Metal artifact");
+    };
+    var context = FakeHarness{};
+    const harness = MetalJitQualificationHarness{ .context = &context, .qualify_fn = FakeHarness.qualify };
+    var scope = MetalJitRouteScope.none();
+    const op = artifact.matmulOp().?;
+    _ = scope.includeQuantShape(op.format, 256, @max(@as(usize, 512), op.format.valuesPerBlock().? * 2));
+    const measurements = try harness.qualify(.{
+        .allocator = std.testing.allocator,
+        .artifact = artifact,
+        .scope = &scope,
+        .provider = null,
+        .generated = @ptrFromInt(16),
+    });
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    try std.testing.expect((try metalJitQualificationRecord(measurements)).eligible());
+}
+
+test "metal runtime JIT schedule validation enforces reflected device limits" {
+    const matmul = comptime blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+            if (artifact.backend == .metal and artifact.production_enabled) break :blk artifact;
+        }
+        @compileError("missing production Metal artifact");
+    };
+    const decode = comptime blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+            if (artifact.backend == .metal and artifact.opKind() == .attention and
+                artifact.attentionOp().?.kind == .decode_1x) break :blk artifact;
+        }
+        @compileError("missing generated Metal decode attention artifact");
+    };
+    var device = MetalDeviceInfo{
+        .max_threads_per_threadgroup_width = 1024,
+        .max_threadgroup_memory_length = 64 * 1024,
+    };
+    var pipeline = MetalGeneratedPipelineInfo{ .max_total_threads_per_threadgroup = 1024 };
+    try validateMetalJitSchedule(matmul, device, pipeline);
+    device.max_threads_per_threadgroup_width = 1;
+    try std.testing.expectError(error.MetalJitThreadgroupLimitExceeded, validateMetalJitSchedule(matmul, device, pipeline));
+    device.max_threads_per_threadgroup_width = 1024;
+    pipeline.max_total_threads_per_threadgroup = 1;
+    try std.testing.expectError(error.MetalJitThreadgroupLimitExceeded, validateMetalJitSchedule(matmul, device, pipeline));
+    pipeline.max_total_threads_per_threadgroup = 1024;
+    device.max_threadgroup_memory_length = 32 * 1024;
+    try std.testing.expectError(error.MetalJitThreadgroupMemoryLimitExceeded, validateMetalJitSchedule(decode, device, pipeline));
+}
+
+test "metal runtime JIT accepts only eligible qualification at the exact artifact key" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var cache = try kernel_jit.ArtifactCache.initDir(std.testing.allocator, std.testing.io, tmp.dir, 1024 * 1024);
+    defer cache.deinit();
+    const key = kernel_jit.artifactKey(.{
+        .backend = .metal,
+        .semantic_identity = "route",
+        .runtime_identity = "runtime",
+        .target_identity = "target",
+        .device_identity = "device",
+        .schedule_identity = "schedule",
+        .baseline_identity = "baseline",
+        .compiler_identity = "compiler",
+        .compiler_options = "math=default",
+        .source = "source",
+    });
+    const record = kernel_jit.QualificationRecord{
+        .candidate_index = 0,
+        .repeat_count = kernel_jit.measurement_repeats,
+        .correctness_passed = true,
+        .measured_speedup = 1.20,
+        .minimum_repeat_speedup = 1.11,
+        .max_absolute_error = 0.0001,
+        .max_relative_error = 0.001,
+    };
+    const encoded = try record.encode();
+    try cache.store(.qualification, key, &encoded);
+    try std.testing.expect(metalJitCachedQualification(std.testing.allocator, &cache, key) != null);
+    var other_key = key;
+    other_key[0] ^= 1;
+    try std.testing.expect(metalJitCachedQualification(std.testing.allocator, &cache, other_key) == null);
+}
+
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn unsetenv(name: [*:0]const u8) c_int;
+
+test "metal runtime JIT activation honors the generated quant kill switch" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const env_name = "TERMITE_METAL_DISABLE_ANTFLY_GENERATED_QUANT";
+    const original = if (std.c.getenv(env_name)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    defer {
+        if (original) |value| {
+            _ = setenv(env_name, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(env_name);
+        }
+    }
+    try std.testing.expectEqual(@as(c_int, 0), setenv(env_name, "1", 1));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_jit_route_activation_allowed(@intFromEnum(MetalJitPipelineSlot.q2_k)));
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(env_name));
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_jit_route_activation_allowed(@intFromEnum(MetalJitPipelineSlot.q2_k)));
+}
+
+test "metal runtime JIT installed route bypasses legacy opt-in but not global disable" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const disable_env = "TERMITE_METAL_DISABLE_ANTFLY_GENERATED_QUANT";
+    const route_env = "TERMITE_METAL_ENABLE_ANTFLY_Q2_K_SMALL_BATCH";
+    const original_disable = if (std.c.getenv(disable_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    const original_route = if (std.c.getenv(route_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    defer {
+        if (original_disable) |value| {
+            _ = setenv(disable_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(disable_env);
+        }
+        if (original_route) |value| {
+            _ = setenv(route_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(route_env);
+        }
+    }
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(disable_env));
+    try std.testing.expectEqual(@as(c_int, 0), setenv(route_env, "0", 1));
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_jit_route_gate_probe(
+        @intFromEnum(MetalJitPipelineSlot.q2_k),
+        route_env,
+        256,
+        512,
+        256,
+        512,
+    ));
+    // Once a generated route replaces the pipeline pointer, a shape outside
+    // the exact live-qualified allowlist must use the bundled fallback even
+    // when the route itself is active.
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_jit_route_gate_probe(
+        @intFromEnum(MetalJitPipelineSlot.q2_k),
+        route_env,
+        256,
+        512,
+        262144,
+        4096,
+    ));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_jit_route_gate_probe(
+        @intFromEnum(MetalJitPipelineSlot.q3_k),
+        route_env,
+        256,
+        512,
+        256,
+        512,
+    ));
+    try std.testing.expectEqual(@as(c_int, 0), setenv(disable_env, "1", 1));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_jit_route_gate_probe(
+        @intFromEnum(MetalJitPipelineSlot.q2_k),
+        route_env,
+        256,
+        512,
+        256,
+        512,
+    ));
+}
+
+test "metal runtime JIT C ABI layouts match the Objective-C bridge" {
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(MetalDeviceInfo));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(MetalGeneratedPipelineInfo));
+}
+
+test "metal runtime JIT compiles a generated conformance pipeline and owns its lifetime" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    var device_info: MetalDeviceInfo = .{};
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_device_info_get(&device_info));
+    try std.testing.expect(device_info.max_threads_per_threadgroup_width > 0);
+    try std.testing.expect(device_info.max_threadgroup_memory_length > 0);
+    try std.testing.expect(device_info.max_buffer_length > 0);
+
+    var device_name: [4096]u8 = undefined;
+    const device_name_len = termite_metal_copy_device_name(null, 0);
+    try std.testing.expect(device_name_len > 0 and device_name_len <= device_name.len);
+    try std.testing.expectEqual(device_name_len, termite_metal_copy_device_name(device_name[0..].ptr, device_name.len));
+
+    const compiler = @import("../graph/quant_kernel_compiler.zig");
+    const artifact = comptime blk: {
+        for (compiler.first_generated_matmul_artifacts) |candidate| {
+            if (candidate.backend == .metal) break :blk candidate;
+        }
+        @compileError("missing generated Metal conformance artifact");
+    };
+    const source = compiler.generatedSourceForArtifact(artifact) orelse return error.MissingGeneratedMetalSource;
+    const kernel_name = try std.testing.allocator.dupeZ(u8, artifact.kernel_id);
+    defer std.testing.allocator.free(kernel_name);
+
+    var error_buffer: [4096]u8 = undefined;
+    const generated = termite_metal_generated_pipeline_create(
+        source.ptr,
+        source.len,
+        kernel_name.ptr,
+        0,
+        error_buffer[0..].ptr,
+        error_buffer.len,
+    ) orelse {
+        std.debug.print("generated Metal JIT pipeline compile failed: {s}\n", .{std.mem.sliceTo(error_buffer[0..], 0)});
+        return error.GeneratedMetalPipelineCompileFailed;
+    };
+    defer termite_metal_generated_pipeline_destroy(generated);
+
+    var pipeline_info: MetalGeneratedPipelineInfo = .{};
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_generated_pipeline_info_get(generated, &pipeline_info));
+    try std.testing.expect(pipeline_info.thread_execution_width > 0);
+    try std.testing.expect(pipeline_info.max_total_threads_per_threadgroup > 0);
+
+    termite_metal_generated_pipeline_destroy(null);
+    const rejected = termite_metal_generated_pipeline_create(
+        source.ptr,
+        0,
+        kernel_name.ptr,
+        0,
+        error_buffer[0..].ptr,
+        error_buffer.len,
+    );
+    try std.testing.expect(rejected == null);
+    try std.testing.expect(std.mem.sliceTo(error_buffer[0..], 0).len > 0);
+}
 
 fn metalDeviceProbeTraceEnabled() bool {
     return std.c.getenv("TERMITE_METAL_TRACE_DEVICE_AVAILABLE") != null;

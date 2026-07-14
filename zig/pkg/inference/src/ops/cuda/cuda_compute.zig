@@ -31,6 +31,7 @@ const quant_codec = @import("../../gguf/quant_codec.zig");
 const backend_contracts = @import("../../graph/backend_contracts.zig");
 const quant_matmul = @import("../../graph/quant_matmul.zig");
 const quant_kernel_compiler = @import("../../graph/quant_kernel_compiler.zig");
+const kernel_jit = @import("../../graph/kernel_jit.zig");
 const quant_kernel_catalog = @import("../../graph/quant_kernel_catalog.zig");
 const quant_kernel_op = @import("../../graph/quant_kernel_op.zig");
 const operator_plan = @import("../../graph/operator_plan.zig");
@@ -79,6 +80,188 @@ pub const CapabilityProfile = enum {
     florence2,
     gemma4,
 };
+
+pub const KernelJitRouteScope = kernels_mod.JitRouteScope;
+
+fn jitModelProfile(profile: CapabilityProfile) kernels_mod.JitModelProfile {
+    return switch (profile) {
+        .clipclap => .clipclap,
+        .deberta_reranker => .deberta_reranker,
+        .gliner2 => .gliner2,
+        .florence2 => .florence2,
+        .gemma4 => .gemma4,
+    };
+}
+
+fn kernelJitRouteCount(routes: kernels_mod.JitProductionRoutes) usize {
+    return @as(usize, @intFromBool(routes.mmv)) +
+        @as(usize, @intFromBool(routes.mm)) +
+        @as(usize, @intFromBool(routes.pair)) +
+        @as(usize, @intFromBool(routes.pair_q8)) +
+        @as(usize, @intFromBool(routes.down_q8));
+}
+
+fn logKernelJitCompletion(
+    config: kernel_jit.Config,
+    profile: CapabilityProfile,
+    scope: KernelJitRouteScope,
+    load_context: kernel_jit.LoadContext,
+    kernels: *const kernels_mod.KernelModule,
+) void {
+    if (!config.mode.compiles()) return;
+    const stats = kernels.runtime_jit_stats;
+    const pending = kernels.runtime_jit_pending_routes;
+    const outcome: []const u8 = if (stats.skipped_dynamic) "skipped_dynamic" else "ready";
+    const reason: []const u8 = if (stats.skipped_dynamic) "dynamic_load" else "none";
+    std.log.info(
+        "cuda_jit_complete backend=cuda outcome={s} reason={s} mode={s} profile={s} load_context={s} scoped_routes={d} conformance_complete={} routes_mmv={} routes_mm={} routes_pair={} routes_pair_q8={} routes_down_q8={} qualified_mmv_shapes={d} qualified_mm_shapes={d} qualified_pair_shapes={d} qualification_cache_hits={d} qualification_cache_misses={d} compiled={d} qualified={d} active={d} pending={d} rejected={d} quarantined={d} sync_elapsed_ms={d} sync_budget_ms={d} budget_reached={} skipped_dynamic={} background_queued=false postpublication_work=false",
+        .{
+            outcome,
+            reason,
+            @tagName(config.mode),
+            @tagName(profile),
+            @tagName(load_context),
+            kernelJitRouteCount(scope.production),
+            scope.conformance_complete,
+            scope.production.mmv,
+            scope.production.mm,
+            scope.production.pair,
+            scope.production.pair_q8,
+            scope.production.down_q8,
+            kernels.runtime_jit_qualified_scope.observed_shape_count,
+            kernels.runtime_jit_qualified_scope.prefill_shape_count,
+            kernels.runtime_jit_qualified_scope.pair_shape_count,
+            stats.qualification_cache_hits,
+            stats.qualification_cache_misses,
+            stats.compiled,
+            stats.qualified,
+            stats.active,
+            kernelJitRouteCount(pending),
+            stats.rejected,
+            stats.quarantined,
+            stats.sync_elapsed_ms,
+            config.preload_budget_ms,
+            stats.budget_reached,
+            stats.skipped_dynamic,
+        },
+    );
+}
+
+fn logKernelJitFailure(
+    config: kernel_jit.Config,
+    profile: CapabilityProfile,
+    scope: KernelJitRouteScope,
+    load_context: kernel_jit.LoadContext,
+    err: anyerror,
+) void {
+    if (!config.mode.compiles()) return;
+    std.log.warn(
+        "cuda_jit_complete backend=cuda outcome=failed mode={s} profile={s} load_context={s} scoped_routes={d} conformance_complete={} qualified=0 active=0 pending={d} rejected=0 quarantined=0 sync_elapsed_ms=0 sync_budget_ms={d} budget_reached=false skipped_dynamic=false background_queued=false postpublication_work=false error={s}",
+        .{
+            @tagName(config.mode),
+            @tagName(profile),
+            @tagName(load_context),
+            kernelJitRouteCount(scope.production),
+            scope.conformance_complete,
+            kernelJitRouteCount(scope.production),
+            config.preload_budget_ms,
+            @errorName(err),
+        },
+    );
+}
+
+/// A resident 2-D tensor is not necessarily a linear route. Proven lookup-only
+/// tables must not expand the JIT conformance domain merely because their
+/// storage is quantized. Output heads and genuinely tied token embeddings are
+/// retained because generic logits fallbacks can reach linearNoBias.
+fn cudaKernelJitLinearWeightKey(key: []const u8, token_embedding_is_lookup_only: bool) bool {
+    if (!std.mem.endsWith(u8, key, ".weight")) return false;
+    const token_embedding = isTiedTokenEmbeddingWeightName(key) or
+        std.mem.endsWith(u8, key, ".embed_tokens.weight") or
+        std.mem.endsWith(u8, key, ".token_embd.weight");
+    if (token_embedding and token_embedding_is_lookup_only) return false;
+    if (std.mem.indexOf(u8, key, "per_layer_token_embd") != null or
+        std.mem.indexOf(u8, key, "embed_tokens_per_layer") != null)
+    {
+        return false;
+    }
+    const non_linear_tables = [_][]const u8{
+        "embedding",
+        "embeddings",
+        "position_embeddings",
+        "token_type_embeddings",
+        "word_embeddings",
+        "rope_freqs",
+        "layernorm",
+        "layer_norm",
+        ".norm",
+        "wpe.weight",
+        "wte.weight",
+    };
+    for (non_linear_tables) |needle| {
+        if (std.mem.indexOf(u8, key, needle) != null) return false;
+    }
+    return true;
+}
+
+test "CUDA runtime JIT scope excludes lookup-only tables but retains reachable heads" {
+    try std.testing.expect(cudaKernelJitLinearWeightKey(
+        "model.layers.0.self_attn.q_proj.weight",
+        true,
+    ));
+    try std.testing.expect(cudaKernelJitLinearWeightKey(
+        "model.layers.0.mlp.down_proj.weight",
+        true,
+    ));
+    try std.testing.expect(cudaKernelJitLinearWeightKey("model.embed_tokens.weight", false));
+    try std.testing.expect(cudaKernelJitLinearWeightKey("token_embd.weight", false));
+    try std.testing.expect(!cudaKernelJitLinearWeightKey("model.embed_tokens.weight", true));
+    try std.testing.expect(!cudaKernelJitLinearWeightKey("model.per_layer_input.per_layer_token_embd.weight", false));
+    try std.testing.expect(cudaKernelJitLinearWeightKey("lm_head.weight", true));
+    try std.testing.expect(cudaKernelJitLinearWeightKey("model.language_model.lm_head.weight", true));
+    try std.testing.expect(cudaKernelJitLinearWeightKey("output.weight", true));
+    try std.testing.expect(!cudaKernelJitLinearWeightKey("position_embeddings.weight", true));
+    try std.testing.expect(!cudaKernelJitLinearWeightKey("model.layers.0.input_layernorm.weight", true));
+}
+
+pub fn kernelJitRouteScopeForLoadedWeights(
+    profile: CapabilityProfile,
+    weights: *const std.StringHashMapUnmanaged(weight_source_mod.LoadedWeight),
+) KernelJitRouteScope {
+    var builder = kernels_mod.JitRouteScopeBuilder.init(jitModelProfile(profile));
+    const has_separate_output_head = blk: {
+        var names = weights.iterator();
+        while (names.next()) |entry| {
+            const key = entry.key_ptr.*;
+            if (std.mem.eql(u8, key, "output.weight") or
+                std.mem.eql(u8, key, "lm_head.weight") or
+                std.mem.endsWith(u8, key, ".lm_head.weight")) break :blk true;
+        }
+        break :blk false;
+    };
+    var iterator = weights.iterator();
+    while (iterator.next()) |entry| {
+        const storage = entry.value_ptr.quantized_storage orelse continue;
+        if (!cudaKernelJitLinearWeightKey(entry.key_ptr.*, has_separate_output_head) or
+            !isKnownQuantStorage(storage, .Q4_0) or
+            cudaDequantizeQuantWeightsOnUpload() or
+            cudaShouldDequantizeQ4_0MatrixWeightToBf16OnUpload(entry.key_ptr.*, storage) or
+            cudaShouldDequantizeWeightOnUpload(entry.key_ptr.*, storage) or
+            storage.shape.len != 2)
+        {
+            continue;
+        }
+        const out_dim = std.math.cast(usize, storage.shape[0]) orelse continue;
+        const in_dim = std.math.cast(usize, storage.shape[1]) orelse continue;
+        builder.observeQ4_0Matrix(
+            entry.key_ptr.*,
+            out_dim,
+            in_dim,
+            !cudaShouldAttachBf16MirrorToQ4Weight(entry.key_ptr.*, storage),
+        );
+    }
+    return builder.finish();
+}
 
 const CudaDispatchOp = enum {
     linear,
@@ -873,12 +1056,90 @@ pub const CudaCompute = struct {
     stats: RuntimeStats = .{},
     dispatch_stats: CudaDispatchStats = .{},
     generated_q4_0_gates: GeneratedQ4_0Gates = .{},
+    runtime_jit_shape_gating: bool = false,
     owned_by_backend: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) !CudaCompute {
+        return initWithKernelJit(allocator, .{});
+    }
+
+    pub fn initWithKernelJit(allocator: std.mem.Allocator, jit_config: kernel_jit.Config) !CudaCompute {
+        return initWithKernelJitProfile(allocator, jit_config, null, .{}, .dynamic);
+    }
+
+    /// Capability-only initialization is deliberately JIT-empty. Callers that
+    /// own model weights must use initWithKernelJitForScope so required mode
+    /// never demands routes absent from the loaded quantization and shapes.
+    pub fn initWithKernelJitForProfile(
+        allocator: std.mem.Allocator,
+        jit_config: kernel_jit.Config,
+        profile: CapabilityProfile,
+    ) !CudaCompute {
+        return initWithKernelJitProfile(allocator, jit_config, profile, .{}, .dynamic);
+    }
+
+    pub fn initWithKernelJitForScope(
+        allocator: std.mem.Allocator,
+        jit_config: kernel_jit.Config,
+        profile: CapabilityProfile,
+        scope: KernelJitRouteScope,
+    ) !CudaCompute {
+        return initWithKernelJitForScopeAndLoadContext(
+            allocator,
+            jit_config,
+            profile,
+            scope,
+            .dynamic,
+        );
+    }
+
+    pub fn initWithKernelJitForScopeAndLoadContext(
+        allocator: std.mem.Allocator,
+        jit_config: kernel_jit.Config,
+        profile: CapabilityProfile,
+        scope: KernelJitRouteScope,
+        load_context: kernel_jit.LoadContext,
+    ) !CudaCompute {
+        return initWithKernelJitProfile(allocator, jit_config, profile, scope, load_context);
+    }
+
+    fn initWithKernelJitProfile(
+        allocator: std.mem.Allocator,
+        jit_config: kernel_jit.Config,
+        profile: ?CapabilityProfile,
+        scope: KernelJitRouteScope,
+        load_context: kernel_jit.LoadContext,
+    ) !CudaCompute {
+        try jit_config.validate();
+        if (jit_config.mode.failClosed() and
+            (!scope.enabled() or !scope.conformance_complete or
+                !load_context.allowsQualification()))
+        {
+            const err = error.CudaJitRequiredRouteFailed;
+            if (profile) |value| logKernelJitFailure(jit_config, value, scope, load_context, err);
+            return err;
+        }
         var ctx = try context_mod.CudaContext.initDefault();
         errdefer ctx.deinit();
-        const kernels = try kernels_mod.KernelModule.load(&ctx);
+        const kernels = if (profile) |value|
+            kernels_mod.KernelModule.loadWithKernelJitForScopeAndLoadContext(
+                &ctx,
+                allocator,
+                jit_config,
+                jitModelProfile(value),
+                scope,
+                load_context,
+            ) catch |err| {
+                logKernelJitFailure(jit_config, value, scope, load_context, err);
+                return err;
+            }
+        else
+            try kernels_mod.KernelModule.loadWithKernelJitAndLoadContext(
+                &ctx,
+                allocator,
+                jit_config,
+                load_context,
+            );
         errdefer {
             var kernels_mut = kernels;
             kernels_mut.unload(&ctx);
@@ -895,16 +1156,18 @@ pub const CudaCompute = struct {
         {
             warmupCublasLtBf16(&cublaslt.?, &ctx);
         }
-        const generated_q4_0_gates = GeneratedQ4_0Gates.resolveForTarget(
-            ctx.info.compute_major,
-            ctx.info.compute_minor,
-        );
+        const generated_q4_0_gates = if (jit_config.mode.activates())
+            GeneratedQ4_0Gates.fromJitRoutes(kernels.runtime_jit_routes).withExplicitDisables()
+        else
+            GeneratedQ4_0Gates.resolveForTarget(ctx.info.compute_major, ctx.info.compute_minor);
+        if (profile) |value| logKernelJitCompletion(jit_config, value, scope, load_context, &kernels);
         return .{
             .allocator = allocator,
             .ctx = ctx,
             .kernels = kernels,
             .cublaslt = cublaslt,
             .generated_q4_0_gates = generated_q4_0_gates,
+            .runtime_jit_shape_gating = jit_config.mode.activates(),
         };
     }
 
@@ -3077,6 +3340,34 @@ pub const GeneratedQ4_0Gates = struct {
         ));
     }
 
+    fn fromJitRoutes(routes: kernels_mod.JitProductionRoutes) GeneratedQ4_0Gates {
+        return .{
+            .mmv = routes.mmv,
+            .mm = routes.mm,
+            .pair = routes.pair,
+            .pair_q8 = routes.pair_q8,
+            .down_q8 = routes.down_q8,
+        };
+    }
+
+    fn withExplicitDisables(self: GeneratedQ4_0Gates) GeneratedQ4_0Gates {
+        var result = self;
+        result.mmv = result.mmv and
+            !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MMV", false);
+        result.mm = result.mm and
+            !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MM", false);
+        result.pair = result.pair and
+            !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR", false);
+        result.pair_q8 = result.pair_q8 and
+            !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR_Q8", false);
+        result.down_q8 = result.down_q8 and
+            !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_DOWN_Q8", false);
+        return result.withMasterDisable(platform.env.getenvBoolDefault(
+            "ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0",
+            false,
+        ));
+    }
+
     fn withMasterDisable(self: GeneratedQ4_0Gates, disabled: bool) GeneratedQ4_0Gates {
         return if (disabled) allDisabled() else self;
     }
@@ -3105,6 +3396,45 @@ pub const GeneratedQ4_0Gates = struct {
         return allDisabled();
     }
 };
+
+const RuntimeJitShapeRoute = enum { mmv, mm, pair, pair_q8, down_q8 };
+
+fn runtimeJitShapeAllows(
+    enabled: bool,
+    scope: kernels_mod.JitRouteScope,
+    route: RuntimeJitShapeRoute,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) bool {
+    if (!enabled) return true;
+    return switch (route) {
+        .mmv => rows == 1 and scope.production.mmv and scope.containsMmvShape(out_dim, in_dim),
+        .mm => rows >= 9 and rows <= 64 and scope.production.mm and scope.containsMmShape(out_dim, in_dim),
+        .pair => rows == 1 and scope.production.pair and scope.containsPairShape(out_dim, in_dim),
+        .pair_q8 => scope.production.pair_q8 and
+            kernels_mod.generatedQ4_0PairQ8E4BShapeEligible(rows, in_dim, out_dim),
+        .down_q8 => scope.production.down_q8 and
+            kernels_mod.generatedQ4_0DownQ8E4BShapeEligible(rows, in_dim, out_dim),
+    };
+}
+
+fn runtimeJitShapeAllowsForCompute(
+    self: *const CudaCompute,
+    route: RuntimeJitShapeRoute,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) bool {
+    return runtimeJitShapeAllows(
+        self.runtime_jit_shape_gating,
+        self.kernels.runtime_jit_qualified_scope,
+        route,
+        rows,
+        in_dim,
+        out_dim,
+    );
+}
 
 test "generated Q4 routes require promoted CUDA target evidence" {
     const requested = GeneratedQ4_0Gates{
@@ -3154,6 +3484,48 @@ test "generated Q4 routes are opt in and master disable wins" {
     };
     try std.testing.expect(std.meta.eql(enabled, enabled.withMasterDisable(false)));
     try std.testing.expect(std.meta.eql(GeneratedQ4_0Gates.allDisabled(), enabled.withMasterDisable(true)));
+}
+
+test "runtime JIT gates mirror only installed production routes" {
+    const gates = GeneratedQ4_0Gates.fromJitRoutes(.{
+        .mmv = true,
+        .pair_q8 = true,
+        .down_q8 = true,
+    });
+    try std.testing.expect(gates.mmv);
+    try std.testing.expect(!gates.mm);
+    try std.testing.expect(!gates.pair);
+    try std.testing.expect(gates.pair_q8);
+    try std.testing.expect(gates.down_q8);
+    try std.testing.expect(!gates.catalog_ffn_candidates);
+    try std.testing.expect(!gates.exact_ffn_candidates);
+}
+
+test "CUDA runtime JIT dispatch shape gate keeps oversized head on bundled kernels" {
+    var qualified = kernels_mod.JitRouteScope{ .production = .{
+        .mmv = true,
+        .mm = true,
+        .pair = true,
+    } };
+    qualified.observed_shapes[0] = .{ 10_240, 2_560 };
+    qualified.observed_shape_count = 1;
+    qualified.prefill_shapes[0] = .{ 10_240, 2_560 };
+    qualified.prefill_shape_count = 1;
+    qualified.pair_shapes[0] = .{ 10_240, 2_560 };
+    qualified.pair_shape_count = 1;
+    qualified.production.pair_q8 = true;
+    qualified.production.down_q8 = true;
+
+    try std.testing.expect(runtimeJitShapeAllows(true, qualified, .mmv, 1, 2_560, 10_240));
+    try std.testing.expect(runtimeJitShapeAllows(true, qualified, .mm, 22, 2_560, 10_240));
+    try std.testing.expect(runtimeJitShapeAllows(true, qualified, .pair, 1, 2_560, 10_240));
+    try std.testing.expect(runtimeJitShapeAllows(true, qualified, .pair_q8, 1, 2_560, 10_240));
+    try std.testing.expect(runtimeJitShapeAllows(true, qualified, .down_q8, 1, 10_240, 2_560));
+    try std.testing.expect(!runtimeJitShapeAllows(true, qualified, .mmv, 1, 2_560, 262_144));
+    try std.testing.expect(!runtimeJitShapeAllows(true, qualified, .mm, 22, 2_560, 262_144));
+    try std.testing.expect(!runtimeJitShapeAllows(true, qualified, .pair_q8, 1, 1_536, 8_960));
+    // Legacy explicitly-enabled generated kernels retain their pre-JIT behavior.
+    try std.testing.expect(runtimeJitShapeAllows(false, .{}, .mm, 22, 2_560, 262_144));
 }
 
 const GeneratedQ4_0CatalogFfnRoute = struct {
@@ -8294,6 +8666,7 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
                             else => return tile4w4_err,
                         };
                     } else if (rows == 1 and self.generated_q4_0_gates.mmv and
+                        runtimeJitShapeAllowsForCompute(self, .mmv, rows, in_dim, out_dim) and
                         quant_kernel_compiler.generatedArtifactSupportsPlan(
                             .cuda,
                             quant_matmul.plan(.{ .rows = rows, .in_dim = in_dim, .out_dim = out_dim, .format = .q4_0 }),
@@ -8311,11 +8684,14 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
                         }
                     } else if (rows == 1) {
                         try launchLinearQ4_0Tile4ThenBaseF32(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
-                    } else if (rows >= 9 and rows <= 64 and self.generated_q4_0_gates.mm and quant_kernel_compiler.generatedArtifactSupportsPlan(
-                        .cuda,
-                        quant_matmul.plan(.{ .rows = rows, .in_dim = in_dim, .out_dim = out_dim, .format = .q4_0 }),
-                        .none,
-                    )) {
+                    } else if (rows >= 9 and rows <= 64 and self.generated_q4_0_gates.mm and
+                        runtimeJitShapeAllowsForCompute(self, .mm, rows, in_dim, out_dim) and
+                        quant_kernel_compiler.generatedArtifactSupportsPlan(
+                            .cuda,
+                            quant_matmul.plan(.{ .rows = rows, .in_dim = in_dim, .out_dim = out_dim, .format = .q4_0 }),
+                            .none,
+                        ))
+                    {
                         if (self.kernels.launchLinearQ4_0GeneratedMmF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
                             self.stats.q4_0_generated_mm_hits += 1;
                         } else |generated_err| switch (generated_err) {
@@ -10207,7 +10583,9 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
         };
         if (!used_q4_0_q8_1_dp4a and !used_q4_0_tile8) {
             const used_q4_0_generated_pair = blk: {
-                if (rows == 1 and self.generated_q4_0_gates.pair) {
+                if (rows == 1 and self.generated_q4_0_gates.pair and
+                    runtimeJitShapeAllowsForCompute(self, .pair, rows, in_dim, out_dim))
+                {
                     self.kernels.launchLinearQ4_0GeneratedPairF32(
                         &self.ctx,
                         device_a,
@@ -13876,8 +14254,20 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
 
     const generated_catalog_ffn_resolution = generatedQ4_0CatalogFfnRoute(
         self.generated_q4_0_gates.catalog_ffn_candidates,
-        self.generated_q4_0_gates.pair_q8,
-        self.generated_q4_0_gates.down_q8,
+        self.generated_q4_0_gates.pair_q8 and runtimeJitShapeAllowsForCompute(
+            self,
+            .pair_q8,
+            rows,
+            request.hidden_size,
+            request.intermediate_size,
+        ),
+        self.generated_q4_0_gates.down_q8 and runtimeJitShapeAllowsForCompute(
+            self,
+            .down_q8,
+            rows,
+            request.intermediate_size,
+            request.hidden_size,
+        ),
         rows,
         request.hidden_size,
         request.intermediate_size,
@@ -13982,7 +14372,14 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
             noteGeneratedQ4_0CatalogFfnResult(&self.stats, .pair_q8, true);
             break :blk true;
         }
-        if (rows != 1 or !self.generated_q4_0_gates.pair_q8) break :blk false;
+        if (rows != 1 or !self.generated_q4_0_gates.pair_q8 or
+            !runtimeJitShapeAllowsForCompute(
+                self,
+                .pair_q8,
+                rows,
+                request.hidden_size,
+                request.intermediate_size,
+            )) break :blk false;
         self.kernels.launchLinearQ4_0GeneratedPairQ8(
             &self.ctx,
             q8_activated,
@@ -14051,7 +14448,14 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
             noteGeneratedQ4_0CatalogFfnResult(&self.stats, .down_q8, true);
             break :blk true;
         }
-        if (rows != 1 or !self.generated_q4_0_gates.down_q8) break :blk false;
+        if (rows != 1 or !self.generated_q4_0_gates.down_q8 or
+            !runtimeJitShapeAllowsForCompute(
+                self,
+                .down_q8,
+                rows,
+                request.intermediate_size,
+                request.hidden_size,
+            )) break :blk false;
         self.kernels.launchLinearQ4_0GeneratedDownQ8(
             &self.ctx,
             projected_device,

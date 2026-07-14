@@ -15,9 +15,9 @@
 //! Domain-specific quant matmul compiler scaffolding.
 //!
 //! This is intentionally tiny: packed GGUF block decode, matmul schedules, and
-//! common epilogues only. Production dispatch still uses existing handwritten
-//! CUDA/Metal paths until a generated kernel is promoted into checked-in
-//! backend artifacts.
+//! common epilogues only. Checked-in AOT promotion remains a separate path;
+//! runtime JIT dispatch may use a generated candidate only after exact,
+//! pre-publication qualification against the bundled production kernel.
 
 const std = @import("std");
 const platform = @import("antfly_platform");
@@ -26,6 +26,7 @@ const quant_matmul = @import("quant_matmul.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
 const tensor_types = @import("../gguf/tensor_types.zig");
 const quant_kernel_op = @import("quant_kernel_op.zig");
+const kernel_jit = @import("kernel_jit.zig");
 const cuda_renderer = @import("quant_kernel_cuda_renderer.zig");
 const metal_renderer = @import("quant_kernel_metal_renderer.zig");
 
@@ -1384,6 +1385,19 @@ pub const EmittedCompiledSource = struct {
     owned: bool = false,
 
     pub fn deinit(self: EmittedCompiledSource, allocator: std.mem.Allocator) void {
+        if (self.owned) allocator.free(self.data);
+    }
+};
+
+/// Runtime-facing source view for every typed artifact in the unified
+/// registry. CUDA renderers allocate complete translation units; checked-in
+/// Metal source is immutable and can be borrowed directly.
+pub const RuntimeArtifactSource = struct {
+    artifact: GeneratedArtifact,
+    data: []const u8,
+    owned: bool = false,
+
+    pub fn deinit(self: RuntimeArtifactSource, allocator: std.mem.Allocator) void {
         if (self.owned) allocator.free(self.data);
     }
 };
@@ -7634,6 +7648,33 @@ pub fn emitCompiledSource(allocator: std.mem.Allocator, compiled: QuantKernelCom
     return .{ .data = compiled.source };
 }
 
+pub fn emitRuntimeArtifactSource(
+    allocator: std.mem.Allocator,
+    artifact: GeneratedArtifact,
+) !RuntimeArtifactSource {
+    if (artifact.backend == .cuda) {
+        const source = switch (artifact.opKind()) {
+            .small_batch_matmul => blk: {
+                const plan = cudaRenderPlanForArtifact(artifact) orelse
+                    return error.MissingCudaRuntimeRenderPlan;
+                break :blk try cuda_renderer.renderKernel(allocator, plan);
+            },
+            .attention => blk: {
+                const plan = cudaAttentionRenderPlanForArtifact(artifact) orelse
+                    return error.MissingCudaRuntimeRenderPlan;
+                break :blk try cuda_renderer.renderAttentionKernel(allocator, plan);
+            },
+            .microkernel => return error.UnsupportedCudaRuntimeMicrokernel,
+        };
+        return .{ .artifact = artifact, .data = source, .owned = true };
+    }
+    return .{
+        .artifact = artifact,
+        .data = generatedSourceForArtifact(artifact) orelse
+            return error.MissingMetalRuntimeSource,
+    };
+}
+
 pub fn compiledSourceHeaderMatchesPlan(allocator: std.mem.Allocator, compiled: QuantKernelCompiledSource) !bool {
     return sourceHeaderMatchesCompiledPlan(allocator, compiled, compiled.source);
 }
@@ -10616,6 +10657,19 @@ test "quant kernel compiler operation views partition the unified registry" {
             },
         }
         try std.testing.expectEqual(@as(usize, 1), matches);
+    }
+}
+
+test "quant kernel compiler runtime source emitter covers every typed artifact" {
+    for (first_generated_artifacts) |artifact| {
+        const emitted = try emitRuntimeArtifactSource(std.testing.allocator, artifact);
+        defer emitted.deinit(std.testing.allocator);
+        try std.testing.expectEqual(artifact.backend, emitted.artifact.backend);
+        try std.testing.expectEqualStrings(artifact.kernel_id, emitted.artifact.kernel_id);
+        try std.testing.expect(emitted.data.len > 0);
+        try std.testing.expect(emitted.data.len <= kernel_jit.maximum_source_bytes);
+        try std.testing.expect(std.mem.containsAtLeast(u8, emitted.data, 1, artifact.kernel_id));
+        try std.testing.expectEqual(artifact.backend == .cuda, emitted.owned);
     }
 }
 
