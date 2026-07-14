@@ -166,7 +166,7 @@ pub const Config = struct {
     models_dir: ?[]const u8 = null,
     /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
     ml_dir: ?[]const u8 = null,
-    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, HTTP(S) allowlist entries must be canonical globally routable IP literals and DNS hostnames are rejected. Setting it to false explicitly enables allowlisted hostnames but disables this address-safety gate until DNS pinning is available. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
+    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
     content_security: ?ContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?Credentials = null,
@@ -176,6 +176,8 @@ pub const Config = struct {
     max_loaded_models: ?i64 = null,
     /// Legacy compatibility field. The current Zig inference runtime does not create per-model pipeline pools from this setting; configuring it has no effect.
     pool_size: ?i64 = null,
+    /// Native generator prompt KV cache settings.
+    prompt_cache: ?PromptCacheConfig = null,
     /// Legacy compatibility field. The current Zig inference runtime selects a backend from model metadata, explicit preload settings, and compiled capabilities; configuring this list has no effect.
     backend_priority: ?[]const BackendPriorityEntry = null,
     /// Maximum concurrent weighted inference admission units in the Zig runtime. Request body size, generation workload, and image byte/count reservations can consume more than one unit. Read and image-extraction admission reserves the effective downloaded-byte ceiling at 16 MiB per unit and at least one unit per two images. A positive capacity also clamps each such request's downloaded-image ceiling to 16 MiB times this value. Set to 0 disables both admission accounting and that capacity-derived clamp. When a positive limit is exhausted, new requests are rejected immediately with 503 Service Unavailable and Retry-After: 1; they are not retained in an in-process queue. Set to 0 only as an operational escape hatch for trusted testing environments; unlimited admission is not recommended for production native generation. Use a positive production limit. The default is 32.
@@ -199,13 +201,13 @@ pub const ContentPart = antfly_generating_openapi.ContentPart;
 
 /// Inference merges configured fields over a fail-closed baseline. HTTP(S), file, and S3 content require explicit allowlists; data URIs remain allowed within the configured size budget.
 pub const ContentSecurityConfig = struct {
-    /// Explicit HTTP(S) host allowlist for inference downloads. Omission and an explicit empty list both deny all hosts. With block_private_ips enabled, entries must be canonical globally routable IP literals; hostname entries require explicitly disabling that policy.
+    /// Explicit HTTP(S) host allowlist for inference downloads. Omission and an explicit empty list both deny all hosts. With block_private_ips enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable; the connection is pinned to a vetted address.
     allowed_hosts: ?[]const []const u8 = null,
-    /// Fail closed unless the HTTP(S) host is a canonical globally routable IP literal. This rejects DNS hostnames and loopback, private, link-local, carrier-grade NAT, reserved, and multicast addresses. Set false explicitly to allow hostname fetching; that disables this address-safety gate until DNS resolution can be vetted and pinned.
+    /// Reject loopback, private, link-local, carrier-grade NAT, reserved, and multicast destinations. Allowlisted DNS hostnames are resolved, every result is filtered by this policy, and the connection is pinned to a vetted address. Set false only as an explicit opt-out that permits private and special destinations.
     block_private_ips: ?bool = null,
     /// Maximum size of downloaded content in bytes
     max_download_size_bytes: ?i64 = null,
-    /// Reserved for future download timeout enforcement; currently parsed but not applied by the scraper.
+    /// Maximum HTTP download duration in seconds. Defaults to 30; 0 disables the deadline.
     download_timeout_seconds: ?i64 = null,
     /// Maximum source-image width or height for accepted inference image inputs, including generate/chat, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Headers exceeding this limit are rejected before model execution; images are not resized. Batch generation rejects multimodal content before fetch. Non-inference scraping consumers do not enforce this setting.
     max_image_dimension: ?i64 = null,
@@ -671,6 +673,10 @@ pub const GenerateRequest = struct {
     cache_dtype: ?[]const u8 = null,
     /// inference-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction. The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`; device-backed compaction is not yet supported.
     cache_compaction_ratio: ?f32 = null,
+    /// inference-native prompt prefix cache namespace key. Requests with the same key can reuse matching prompt-prefix KV on the same node. Required to enable prompt caching; requests without a key are never cached.
+    prompt_cache_key: ?[]const u8 = null,
+    /// inference-native prompt prefix cache control. False bypasses prompt cache for this request.
+    prompt_cache: ?bool = null,
     backend: ?ModelBackend = null,
     /// inference-native graph execution mode. `eager` keeps the direct runtime path when possible. `compiled` runs inference graph planning, partitioning, and backend executor attachment.
     mode: ?[]const u8 = null,
@@ -718,6 +724,8 @@ pub const GenerateUsage = struct {
     completion_tokens: i64,
     /// Total tokens used (prompt + completion)
     total_tokens: i64,
+    /// Prompt tokens served from inference-native prefix KV cache
+    cached_prompt_tokens: ?i64 = null,
 };
 
 pub const ImageURL = antfly_generating_openapi.ImageURL;
@@ -1025,6 +1033,20 @@ pub const PredictorsResponse = struct {
     object: []const u8,
     /// Traditional ML predictors keyed by predictor name.
     predictors: std.json.ArrayHashMap(PredictorInfo),
+};
+
+/// Native generator prompt KV cache configuration.
+pub const PromptCacheConfig = struct {
+    /// Enable inference-native prompt KV cache reuse for generator requests.
+    enabled: ?bool = null,
+    /// Prompt KV cache implementation. `block_hash` (default) uses hash-addressed full KV blocks under prompt_cache_key with O(1) block lookup and is the scalable production mode. `simple` keeps the linear-scan retained-prefix cache and is only suitable for small caches or debugging.
+    mode: ?[]const u8 = null,
+    /// Node-wide target for live entries in the single process-stable model cache. The first model to activate prompt caching owns it for the process lifetime; requests to other models bypass prompt caching. The owner evicts using estimated metadata and logical host/device KV bytes. Backend allocators may retain reusable capacity, so this is not a hard process or accelerator cap.
+    max_bytes_mb: ?i64 = null,
+    /// Minimum prompt length eligible for prompt KV caching.
+    min_tokens: ?i64 = null,
+    /// Idle time-to-live for prompt KV cache entries. Refreshed on every cache hit, so only entries left unused for this duration expire.
+    ttl_ms: ?i64 = null,
 };
 
 pub const ReadObject = struct {

@@ -1075,6 +1075,10 @@ pub fn runFromIterator(
     }, local_metadata.catalogSource(), local_metadata.statusSource());
     defer data_server.deinit();
 
+    antfly_node.config.prompt_cache_resource_usage_observer = promptCacheResourceUsageObserver(&data_server.provisioned_storage.resource_manager);
+    // Later listener defers drain request users first; this defer then removes
+    // the borrowed observer before the earlier DataServer defer frees its owner.
+    defer antfly_node.detachPromptCacheResourceUsageObserver();
     data_server.setAntflyProvider(localAntflyProvider(&antfly_node));
 
     // Initialize API server (wires caches + sources) without binding a listener.
@@ -1194,14 +1198,26 @@ fn applyCommonInferenceConfig(
     if (cfg.effectiveAntflyContentSecurity()) |security| node_cfg.content_security = security.*;
     if (cfg.inference.s3_credentials) |creds| node_cfg.s3_credentials = creds;
     if (cfg.inference.max_concurrent_requests) |limit| node_cfg.max_concurrent_requests = limit;
+    node_cfg.prompt_cache = .{
+        .enabled = cfg.inference.prompt_cache.enabled,
+        .mode = switch (cfg.inference.prompt_cache.mode) {
+            .simple => .simple,
+            .block_hash => .block_hash,
+        },
+        .max_bytes_mb = cfg.inference.prompt_cache.max_bytes_mb,
+        .min_tokens = cfg.inference.prompt_cache.min_tokens,
+        .ttl_ms = cfg.inference.prompt_cache.ttl_ms,
+    };
 }
 
 fn localAntflyProvider(node: *inference.server.Node) antfly.inference.managed_embedder.AntflyProvider {
     return .{
         .ptr = node,
         .embed_dense_texts = localAntflyEmbedDenseTexts,
+        .embed_dense_texts_with_context = localAntflyEmbedDenseTextsWithContext,
         .embed_sparse_texts = localAntflyEmbedSparseTexts,
         .embed_dense_parts = localAntflyEmbedDenseParts,
+        .embed_dense_parts_with_context = localAntflyEmbedDensePartsWithContext,
         .rerank_texts = localAntflyRerankTexts,
         .generate_text = localAntflyGenerateText,
         .generate_messages = localAntflyGenerateMessages,
@@ -1210,6 +1226,67 @@ fn localAntflyProvider(node: *inference.server.Node) antfly.inference.managed_em
         .extract = localAntflyExtract,
         .list_models_json = localAntflyListModelsJson,
     };
+}
+
+fn promptCacheResourceUsageObserver(manager: *antfly.resource_manager.ResourceManager) inference.runtime.kv.prompt_cache.ResourceUsageObserver {
+    return .{
+        .context = manager,
+        .update = observePromptCacheResourceUsage,
+    };
+}
+
+fn observePromptCacheResourceUsage(context: *anyopaque, current: *u64, next: u64) void {
+    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
+    manager.observeUsage(.inference_prompt_cache, current, next);
+}
+
+test "swarm prompt cache detaches resource observer before owner teardown" {
+    const Observer = struct {
+        manager: *antfly.resource_manager.ResourceManager,
+        alive: bool = true,
+        callbacks_after_teardown: usize = 0,
+
+        fn update(context: *anyopaque, current: *u64, next: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (!self.alive) {
+                self.callbacks_after_teardown += 1;
+                return;
+            }
+            self.manager.observeUsage(.inference_prompt_cache, current, next);
+        }
+    };
+
+    var resource_manager = antfly.resource_manager.ResourceManager.init(.{});
+    var observer = Observer{ .manager = &resource_manager };
+    var cache = inference.runtime.kv.prompt_cache.PromptPrefixCache.init(std.testing.allocator);
+    cache.configure(.{
+        .enabled = true,
+        .mode = .simple,
+        .min_tokens = 2,
+        .max_bytes = 1 << 20,
+        .resource_usage_observer = .{
+            .context = &observer,
+            .update = Observer.update,
+        },
+    });
+    const pool_id = (try cache.ensurePool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    })).?;
+    const sequence_id = try cache.manager.attachSequence(pool_id);
+    try cache.manager.appendTokens(sequence_id, 2);
+    try cache.storeFromSequence("shutdown", &.{ 1, 2 }, sequence_id);
+    try std.testing.expect(resource_manager.sliceStats(.inference_prompt_cache).used_bytes > 0);
+
+    cache.detachResourceUsageObserver();
+    try std.testing.expectEqual(@as(u64, 0), resource_manager.sliceStats(.inference_prompt_cache).used_bytes);
+    observer.alive = false;
+    cache.deinit();
+    try std.testing.expectEqual(@as(usize, 0), observer.callbacks_after_teardown);
 }
 
 fn localAntflyListModelsJson(ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
@@ -1229,16 +1306,40 @@ fn localAntflyEmbedDenseTexts(
     return try node.embedDenseTextsDirect(alloc, model, texts);
 }
 
+fn localAntflyEmbedDenseTextsWithContext(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    texts: []const []const u8,
+    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
+) anyerror![][]f32 {
+    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
+    return try node.embedDenseTextsDirectWithContext(alloc, context.io, context.deadline_ns, model, texts);
+}
+
 fn localAntflyEmbedDenseParts(
     ptr: *anyopaque,
     alloc: std.mem.Allocator,
     model: []const u8,
     parts: []const antfly.template.ContentPart,
 ) anyerror![][]f32 {
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    return try localAntflyEmbedDensePartsWithExecutionContext(ptr, alloc, model, parts, io_impl.io(), null);
+}
+
+fn localAntflyEmbedDensePartsWithExecutionContext(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    parts: []const antfly.template.ContentPart,
+    io: std.Io,
+    deadline_ns: ?u64,
+) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     const direct_parts = try localAntflyDirectDenseParts(alloc, parts);
     defer alloc.free(direct_parts);
-    return try node.embedDensePartsDirect(alloc, model, direct_parts);
+    return try node.embedDensePartsDirectWithContext(alloc, io, deadline_ns, model, direct_parts);
 }
 
 fn localAntflyDirectDenseParts(
@@ -1255,6 +1356,16 @@ fn localAntflyDirectDenseParts(
         } },
     };
     return out;
+}
+
+fn localAntflyEmbedDensePartsWithContext(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    parts: []const antfly.template.ContentPart,
+    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
+) anyerror![][]f32 {
+    return try localAntflyEmbedDensePartsWithExecutionContext(ptr, alloc, model, parts, context.io, context.deadline_ns);
 }
 
 fn localAntflyEmbedSparseTexts(
@@ -1719,6 +1830,9 @@ fn inferenceAuthMiddleware() httpx.Middleware {
                     else => return inferenceUnauthorizedResponse(ctx),
                 };
                 defer identity.deinit(server.alloc);
+                if (!antfly.public_api.http_server.permissionsAllow(identity.permissions, .inference, "*", .read)) {
+                    return inferenceForbiddenResponse(ctx);
+                }
                 return next.call(ctx);
             }
         }.handler,
@@ -1959,6 +2073,14 @@ fn inferenceUnauthorizedResponse(ctx: *httpx.Context) !httpx.Response {
     return ctx.status(401).json(.{
         .@"error" = "unauthorized",
         .message = "valid Basic, Bearer, or ApiKey credentials are required",
+        .retryable = false,
+    });
+}
+
+fn inferenceForbiddenResponse(ctx: *httpx.Context) !httpx.Response {
+    return ctx.status(403).json(.{
+        .@"error" = "forbidden",
+        .message = "inference read permission is required",
         .retryable = false,
     });
 }
@@ -3597,6 +3719,11 @@ test "swarm inference middleware reuses public API authentication" {
                     "Basic realm=\"antfly\", Bearer realm=\"antfly\", ApiKey realm=\"antfly\"",
                     response.headers.get("WWW-Authenticate").?,
                 );
+            } else if (expected_status == 403) {
+                try std.testing.expectEqualStrings(
+                    "{\"error\":\"forbidden\",\"message\":\"inference read permission is required\",\"retryable\":false}",
+                    response.body.?,
+                );
             } else if (expected_status == 503) {
                 try std.testing.expectEqualStrings(
                     "{\"error\":\"not_ready\",\"message\":\"inference authentication is not ready\",\"retryable\":true}",
@@ -3634,11 +3761,25 @@ test "swarm inference middleware reuses public API authentication" {
     active_api_server = &api_server;
 
     const middleware = inferenceAuthMiddleware();
+    var table_read = try antfly.usermgr.Permission.initOwned(alloc, .table, "documents", .read);
+    defer table_read.deinit(alloc);
+    try manager.addPermissionToUser("admin", table_read);
     for ([_][]const u8{ "/ai/v1/models", "/ml/v1/metrics" }) |path| {
         try Harness.expect(middleware, path, null, 401);
         try Harness.expect(middleware, path, "Basic YWRtaW46d3Jvbmc=", 401);
+        try Harness.expect(middleware, path, "Basic YWRtaW46YWRtaW4=", 403);
+    }
+
+    var inference_read = try antfly.usermgr.Permission.initOwned(alloc, .inference, "*", .read);
+    defer inference_read.deinit(alloc);
+    try manager.addPermissionToUser("admin", inference_read);
+    for ([_][]const u8{ "/ai/v1/models", "/ml/v1/metrics" }) |path| {
         try Harness.expect(middleware, path, "Basic YWRtaW46YWRtaW4=", 204);
     }
+
+    var global_read = try antfly.usermgr.Permission.initOwned(alloc, .@"*", "*", .read);
+    defer global_read.deinit(alloc);
+    try std.testing.expect(antfly.public_api.http_server.permissionsAllow(&.{global_read}, .inference, "*", .read));
 
     for ([_][]const u8{ "/ai/v10/models", "/ml/v1evil/metrics", "/healthz", "/auth/v1/login" }) |path| {
         try Harness.expect(middleware, path, null, 204);
@@ -4935,6 +5076,13 @@ test "inference config falls back to common config" {
             .models_dir = try alloc.dupe(u8, "/tmp/antfly-models"),
             .ml_dir = try alloc.dupe(u8, "/tmp/antfly-ml"),
             .max_concurrent_requests = 0,
+            .prompt_cache = .{
+                .enabled = true,
+                .mode = .simple,
+                .max_bytes_mb = 256,
+                .min_tokens = 48,
+                .ttl_ms = 120_000,
+            },
             .preload = try alloc.dupe(antfly.common.config.Config.InferenceConfig.WarmModelConfig, &.{
                 .{
                     .kind = try alloc.dupe(u8, "generator"),
@@ -4962,6 +5110,11 @@ test "inference config falls back to common config" {
     var node_cfg = inference.server.NodeConfig{};
     applyCommonInferenceConfig(&node_cfg, &cfg);
     try std.testing.expectEqual(@as(usize, 0), node_cfg.max_concurrent_requests);
+    try std.testing.expect(node_cfg.prompt_cache.enabled);
+    try std.testing.expectEqual(inference.runtime.kv.prompt_cache.Mode.simple, node_cfg.prompt_cache.mode);
+    try std.testing.expectEqual(@as(usize, 256), node_cfg.prompt_cache.max_bytes_mb);
+    try std.testing.expectEqual(@as(usize, 48), node_cfg.prompt_cache.min_tokens);
+    try std.testing.expectEqual(@as(u64, 120_000), node_cfg.prompt_cache.ttl_ms);
 }
 
 test "swarm runtime resolves paths from common storage base dir" {

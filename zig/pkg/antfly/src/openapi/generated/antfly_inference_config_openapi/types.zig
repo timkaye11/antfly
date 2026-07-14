@@ -88,16 +88,19 @@ pub const Config = struct {
     models_dir: ?[]const u8 = null,
     /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
     ml_dir: ?[]const u8 = null,
-    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, HTTP(S) allowlist entries must be canonical globally routable IP literals and DNS hostnames are rejected. Setting it to false explicitly enables allowlisted hostnames but disables this address-safety gate until DNS pinning is available. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
+    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
     content_security: ?antfly_scraping_openapi.ContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?antfly_s3_openapi.Credentials = null,
+    query_embedding_cache: ?QueryEmbeddingCacheConfig = null,
     /// Legacy compatibility field. The current Zig inference runtime does not unload idle models from this setting; configuring it has no effect.
     keep_alive: ?[]const u8 = null,
     /// Legacy compatibility field. The current Zig inference runtime does not evict loaded models from this setting; configuring it has no effect.
     max_loaded_models: ?i64 = null,
     /// Legacy compatibility field. The current Zig inference runtime does not create per-model pipeline pools from this setting; configuring it has no effect.
     pool_size: ?i64 = null,
+    /// Native generator prompt KV cache settings.
+    prompt_cache: ?PromptCacheConfig = null,
     /// Legacy compatibility field. The current Zig inference runtime selects a backend from model metadata, explicit preload settings, and compiled capabilities; configuring this list has no effect.
     backend_priority: ?[]const []const u8 = null,
     /// Maximum concurrent weighted inference admission units in the Zig runtime. Request body size, generation workload, and image byte/count reservations can consume more than one unit. Read and image-extraction admission reserves the effective downloaded-byte ceiling at 16 MiB per unit and at least one unit per two images. A positive capacity also clamps each such request's downloaded-image ceiling to 16 MiB times this value. Set to 0 disables both admission accounting and that capacity-derived clamp. When a positive limit is exhausted, new requests are rejected immediately with 503 Service Unavailable and Retry-After: 1; they are not retained in an in-process queue. Set to 0 only as an operational escape hatch for trusted testing environments; unlimited admission is not recommended for production native generation. Use a positive production limit. The default is 32.
@@ -403,6 +406,10 @@ pub const GenerateRequest = struct {
     stream: ?bool = null,
     /// List of tools (functions) the model can call. Only supported by models with tool_call_format configured.
     tools: ?[]const Tool = null,
+    /// inference-native prompt prefix cache namespace key. Requests with the same key can reuse matching prompt-prefix KV on the same node. Required to enable prompt caching; requests without a key are never cached.
+    prompt_cache_key: ?[]const u8 = null,
+    /// inference-native prompt prefix cache control. False bypasses prompt cache for this request.
+    prompt_cache: ?bool = null,
     /// Controls how the model uses tools
     tool_choice: ?ToolChoice = null,
 };
@@ -429,6 +436,8 @@ pub const GenerateUsage = struct {
     completion_tokens: i64,
     /// Total tokens used (prompt + completion)
     total_tokens: i64,
+    /// Prompt tokens served from inference-native prefix KV cache
+    cached_prompt_tokens: ?i64 = null,
 };
 
 /// Image URL or data URI
@@ -655,6 +664,32 @@ pub const ModelsResponse = struct {
     readers: std.json.ArrayHashMap(ModelInfo),
     /// Available transcriber/speech-to-text models from models_dir/transcribers/
     transcribers: std.json.ArrayHashMap(ModelInfo),
+};
+
+/// Native generator prompt KV cache configuration.
+pub const PromptCacheConfig = struct {
+    /// Enable inference-native prompt KV cache reuse for generator requests.
+    enabled: ?bool = null,
+    /// Prompt KV cache implementation. `block_hash` (default) uses hash-addressed full KV blocks under prompt_cache_key with O(1) block lookup and is the scalable production mode. `simple` keeps the linear-scan retained-prefix cache and is only suitable for small caches or debugging.
+    mode: ?[]const u8 = null,
+    /// Node-wide target for live entries in the single process-stable model cache. The first model to activate prompt caching owns it for the process lifetime; requests to other models bypass prompt caching. The owner evicts using estimated metadata and logical host/device KV bytes. Backend allocators may retain reusable capacity, so this is not a hard process or accelerator cap.
+    max_bytes_mb: ?i64 = null,
+    /// Minimum prompt length eligible for prompt KV caching.
+    min_tokens: ?i64 = null,
+    /// Idle time-to-live for prompt KV cache entries. Refreshed on every cache hit, so only entries left unused for this duration expire.
+    ttl_ms: ?i64 = null,
+};
+
+/// Process-local cache for dense query embeddings. Cache lookup and singleflight happen before provider pacing and local inference queueing. Entries are isolated by the server-derived security domain and effective embedding operation. Templated and multimodal queries bypass retention and singleflight but share the max_inflight provider admission bound.
+pub const QueryEmbeddingCacheConfig = struct {
+    /// Enable query embedding result caching and concurrent miss coalescing. Provider admission control remains active when false.
+    enabled: ?bool = null,
+    /// Maximum retained cache memory in MiB. Set to 0 for singleflight without result retention.
+    max_bytes_mb: ?i64 = null,
+    /// Idle expiration in milliseconds. Cache hits refresh the expiry time.
+    ttl_ms: ?i64 = null,
+    /// Maximum query embedding provider computations in flight, including uncached templated and multimodal requests. Existing-key waiters continue to coalesce when this limit is reached. The conservative default bounds transient memory before provider responses are decoded; raise it only after measuring provider and node capacity.
+    max_inflight: ?i64 = null,
 };
 
 pub const ReadRequest = struct {

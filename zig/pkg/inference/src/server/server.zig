@@ -199,7 +199,7 @@ fn generateSpeculationErrorMessage(err: anyerror) []const u8 {
         error.InvalidSpeculationPolicy => "speculation_policy must be auto, force, or off",
         error.InvalidSpeculationCalibration => "speculation_calibration must be none, probe, or positive",
         error.SpeculationRequiresDraftModel => "speculative_k, speculation_policy, and speculation_calibration require draft_model",
-        else => @errorName(err),
+        else => "speculation options are invalid",
     };
 }
 
@@ -302,6 +302,135 @@ pub const BudgetOverrides = struct {
     }
 };
 
+pub const PromptCacheConfig = struct {
+    enabled: bool = false,
+    mode: runtime.kv.prompt_cache.Mode = .block_hash,
+    max_bytes_mb: usize = 512,
+    min_tokens: usize = 64,
+    ttl_ms: u64 = 300_000,
+
+    pub fn validate(self: @This()) !void {
+        if (self.max_bytes_mb > runtime.kv.prompt_cache.max_config_bytes_mb or
+            self.ttl_ms > runtime.kv.prompt_cache.max_config_ttl_ms)
+        {
+            return error.InvalidPromptCacheConfig;
+        }
+    }
+
+    /// max_bytes_mb is the node-wide target for the single active model cache.
+    pub fn runtimeConfig(
+        self: @This(),
+        resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver,
+    ) runtime.kv.prompt_cache.Config {
+        return .{
+            .enabled = self.enabled,
+            .mode = self.mode,
+            // Node.init rejects overflow; saturation also keeps this boundary
+            // safe if an embedding mutates the public config after init.
+            .max_bytes = std.math.mul(usize, self.max_bytes_mb, runtime.kv.prompt_cache.bytes_per_mebibyte) catch std.math.maxInt(usize),
+            .min_tokens = self.min_tokens,
+            .ttl_ms = self.ttl_ms,
+            .resource_usage_observer = resource_usage_observer,
+        };
+    }
+};
+
+test "prompt cache config reports node target in bytes" {
+    const cfg = PromptCacheConfig{ .enabled = true, .max_bytes_mb = 512 };
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), cfg.runtimeConfig(null).max_bytes);
+}
+
+test "prompt cache config rejects unrepresentable runtime values" {
+    try std.testing.expectError(error.InvalidPromptCacheConfig, (PromptCacheConfig{
+        .max_bytes_mb = runtime.kv.prompt_cache.max_config_bytes_mb + 1,
+    }).validate());
+    try std.testing.expectError(error.InvalidPromptCacheConfig, (PromptCacheConfig{
+        .ttl_ms = runtime.kv.prompt_cache.max_config_ttl_ms + 1,
+    }).validate());
+}
+
+test "native prompt cache seeds a second request from cache-owned storage" {
+    const allocator = std.testing.allocator;
+    var cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    defer cache.deinit();
+    cache.configure(.{
+        .enabled = true,
+        .mode = .block_hash,
+        .min_tokens = 2,
+        .max_bytes = 1 << 20,
+    });
+
+    const pool_config = runtime.kv.pool.KvPoolConfig{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    };
+    const storage = (try cache.ensureStorage(pool_config)).?.storage;
+    const pool_id = cache.pool_id.?;
+
+    const source_id = try cache.manager.attachSequence(pool_id);
+    try cache.manager.appendTokens(source_id, 4);
+    const storage_source_id = try storage.attachSequence(storage.poolId());
+    try std.testing.expectEqual(source_id, storage_source_id);
+    try storage.appendTokens(storage_source_id, 4);
+    try cache.storeFromSequence("native", &.{ 1, 2, 3, 4 }, source_id);
+    try cache.manager.releaseSequence(source_id);
+    try storage.releaseSequence(storage_source_id);
+
+    const hit = (try cache.attachLongestPrefix("native", &.{ 1, 2, 3, 9 }, 2)).?;
+    var decode_state = generation.NativeDecodeState.initPaged(allocator, cache.managerPtr(), pool_id, null);
+    decode_state.kv_storage = storage;
+    defer decode_state.deinit();
+    try decode_state.seedAttachedPrefix(hit.sequence_id, hit.token_count);
+
+    try std.testing.expectEqual(@as(usize, 2), hit.token_count);
+    try std.testing.expectEqual(@as(?usize, 2), cache.manager.tokenCount(hit.sequence_id));
+    try std.testing.expectEqual(@as(?usize, 2), storage.tokenCount(hit.sequence_id));
+}
+
+test "model manager prompt cache has one stable owner" {
+    const allocator = std.testing.allocator;
+    var manager = model_manager_mod.ModelManager.init(allocator, backends_mod.SessionManager.init(allocator));
+    defer manager.deinit();
+
+    var first: model_manager_mod.LoadedModel = undefined;
+    first.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    defer first.prompt_prefix_cache.deinit();
+    var second: model_manager_mod.LoadedModel = undefined;
+    second.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    defer second.prompt_prefix_cache.deinit();
+
+    const config = runtime.kv.prompt_cache.Config{
+        .enabled = true,
+        .mode = .simple,
+        .min_tokens = 2,
+        .max_bytes = 1 << 20,
+    };
+
+    try std.testing.expect(manager.tryActivatePromptCache(std.testing.io, &first, config));
+    try std.testing.expect(manager.tryActivatePromptCache(std.testing.io, &first, config));
+    try std.testing.expect(!manager.tryActivatePromptCache(std.testing.io, &second, config));
+    try std.testing.expectEqual(config.max_bytes, first.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expect(!second.prompt_prefix_cache.config.enabled);
+}
+
+test "model manager registry guard remains available during a cold load" {
+    var manager = model_manager_mod.ModelManager.init(std.testing.allocator, backends_mod.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+
+    try std.testing.expect(manager.load_mutex.tryLock());
+    defer manager.load_mutex.unlock();
+    var guard = manager.lockLoadedModels(std.testing.io);
+    try std.testing.expect(!manager.state_mutex.tryLock());
+    guard.deinit();
+
+    try std.testing.expect(manager.state_mutex.tryLock());
+    manager.state_mutex.unlock();
+}
+
 pub const NodeConfig = struct {
     models_dir: []const u8 = "./models",
     ml_dir: []const u8 = "./ml",
@@ -314,7 +443,35 @@ pub const NodeConfig = struct {
     pool_size: usize = 2,
     generation_budget_overrides: BudgetOverrides = .{},
     generation_batching: GenerationBatchingConfig = .{},
+    prompt_cache: PromptCacheConfig = .{},
+    prompt_cache_resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver = null,
+    allow_insecure_public_bind: bool = false,
 };
+
+fn isLoopbackBindHost(host: []const u8) bool {
+    const address = std.Io.net.IpAddress.parse(host, 0) catch return false;
+    return switch (address) {
+        .ip4 => |ip4| ip4.bytes[0] == 127,
+        .ip6 => |ip6| blk: {
+            const loopback = std.Io.net.Ip6Address.loopback(0);
+            break :blk std.mem.eql(u8, &ip6.bytes, &loopback.bytes);
+        },
+    };
+}
+
+fn validateStandaloneBind(host: []const u8, allow_insecure_public_bind: bool) !void {
+    if (!allow_insecure_public_bind and !isLoopbackBindHost(host)) return error.InsecurePublicBind;
+}
+
+test "standalone inference bind is loopback-only unless explicitly overridden" {
+    for ([_][]const u8{ "127.0.0.1", "127.42.0.9", "::1" }) |host| {
+        try validateStandaloneBind(host, false);
+    }
+    for ([_][]const u8{ "0.0.0.0", "::", "192.168.1.10", "localhost", "inference.internal" }) |host| {
+        try std.testing.expectError(error.InsecurePublicBind, validateStandaloneBind(host, false));
+    }
+    try validateStandaloneBind("0.0.0.0", true);
+}
 
 pub const GenerationBatchingMode = enum {
     off,
@@ -378,6 +535,19 @@ pub const GenerationBatchingConfig = struct {
         };
     }
 };
+
+fn promptCacheEligibleForNativeRequest(
+    enabled: bool,
+    continuous_batching: bool,
+    backend: runtime.kv.pool.BackendKind,
+    has_compiled_partition: bool,
+    has_draft: bool,
+    has_compaction: bool,
+) bool {
+    return enabled and !continuous_batching and
+        (backend == .native or backend == .metal or backend == .cuda) and
+        !has_compiled_partition and !has_draft and !has_compaction;
+}
 
 pub const WarmModelKind = enum {
     generator,
@@ -515,6 +685,119 @@ fn embedTimingNowNs() u128 {
         .SUCCESS => @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => 0,
     };
+}
+
+const DenseEmbedRequestContext = struct {
+    io: std.Io,
+    deadline_ns: ?u64 = null,
+};
+
+fn remainingDirectEmbeddingDeadlineMs(deadline_ns: ?u64, now_ns: u128) !?u64 {
+    const deadline: u128 = deadline_ns orelse return null;
+    if (now_ns >= deadline) return error.Timeout;
+    const remaining_ns = deadline - now_ns;
+    const timeout_ms = (remaining_ns - 1) / std.time.ns_per_ms + 1;
+    return @intCast(timeout_ms);
+}
+
+fn denseEmbedDownloadContext(context: DenseEmbedRequestContext) !scraping.DownloadContext {
+    return .{
+        .io = context.io,
+        .timeout_ms = try remainingDirectEmbeddingDeadlineMs(context.deadline_ns, embedTimingNowNs()),
+    };
+}
+
+fn ensureDirectEmbeddingDeadline(deadline_ns: ?u64) !void {
+    _ = try remainingDirectEmbeddingDeadlineMs(deadline_ns, embedTimingNowNs());
+}
+
+test "dense embed download deadline is a nonzero remaining ceiling" {
+    try std.testing.expect((try remainingDirectEmbeddingDeadlineMs(null, 100)) == null);
+    try std.testing.expectError(error.Timeout, remainingDirectEmbeddingDeadlineMs(100, 100));
+    try std.testing.expectError(error.Timeout, remainingDirectEmbeddingDeadlineMs(99, 100));
+    try std.testing.expectEqual(@as(?u64, 1), try remainingDirectEmbeddingDeadlineMs(101, 100));
+    try std.testing.expectEqual(@as(?u64, 1), try remainingDirectEmbeddingDeadlineMs(std.time.ns_per_ms, 0));
+    try std.testing.expectEqual(@as(?u64, 2), try remainingDirectEmbeddingDeadlineMs(std.time.ns_per_ms + 1, 0));
+}
+
+test "dense embed parser contexts reject expired image fetches" {
+    const allocator = std.testing.allocator;
+    var node: Node = undefined;
+    node.config = .{};
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .embedder,
+        .visual_model_path = "visual.onnx",
+    };
+    const context = DenseEmbedRequestContext{ .io = std.testing.io, .deadline_ns = 0 };
+
+    var fail_fast_input = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "[{\"type\":\"image_url\",\"image_url\":\"data:image/png;base64,AA==\"}]",
+        .{},
+    );
+    defer fail_fast_input.deinit();
+    var fail_fast_budget = RequestMediaBudget.init(1024);
+    resetRequestWorkTestCounters();
+    try std.testing.expectError(
+        error.Timeout,
+        parseDenseEmbedInputsWithBudgetAndContext(
+            &node,
+            allocator,
+            &manifest,
+            fail_fast_input.value,
+            &fail_fast_budget,
+            context,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), fail_fast_budget.used_bytes);
+
+    var per_item_input = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AA==\"}}]",
+        .{},
+    );
+    defer per_item_input.deinit();
+    var per_item_budget = RequestMediaBudget.init(1024);
+    resetRequestWorkTestCounters();
+    try std.testing.expectError(
+        error.Timeout,
+        parseDenseEmbedInputsPerItemWithBudgetAndContext(
+            &node,
+            allocator,
+            &manifest,
+            per_item_input.value,
+            &per_item_budget,
+            context,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), per_item_budget.used_bytes);
+
+    const parts = [_]Node.DirectDenseEmbedPart{.{ .image_url = "data:image/png;base64,AA==" }};
+    var direct_budget = RequestMediaBudget.init(1024);
+    resetRequestWorkTestCounters();
+    try std.testing.expectError(
+        error.Timeout,
+        parseDirectDenseEmbedInputsWithContext(
+            &node,
+            allocator,
+            &manifest,
+            &parts,
+            &direct_budget,
+            context,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), direct_budget.used_bytes);
+}
+
+fn freeDirectDenseVectors(allocator: std.mem.Allocator, vectors: [][]f32) void {
+    for (vectors) |vector| allocator.free(vector);
+    allocator.free(vectors);
 }
 
 fn embedTimingStart() u128 {
@@ -699,80 +982,20 @@ fn incrementModelCount(counts: *ModelCounts, task: []const u8) void {
     if (std.mem.eql(u8, task, "embedders")) counts.embedders += 1 else if (std.mem.eql(u8, task, "rerankers")) counts.rerankers += 1 else if (std.mem.eql(u8, task, "chunkers")) counts.chunkers += 1 else if (std.mem.eql(u8, task, "generators")) counts.generators += 1 else if (std.mem.eql(u8, task, "recognizers")) counts.recognizers += 1 else if (std.mem.eql(u8, task, "classifiers")) counts.classifiers += 1 else if (std.mem.eql(u8, task, "rewriters")) counts.rewriters += 1 else if (std.mem.eql(u8, task, "readers")) counts.readers += 1 else if (std.mem.eql(u8, task, "transcribers")) counts.transcribers += 1 else if (std.mem.eql(u8, task, "extractors")) counts.extractors += 1;
 }
 
-fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) ModelCounts {
+fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Allocator, io: std.Io) !ModelCounts {
     const task_names = [_][]const u8{
         "embedders",  "rerankers",   "chunkers",
         "generators", "recognizers", "classifiers",
         "rewriters",  "readers",     "transcribers",
         "extractors",
     };
-    var counts = ModelCounts{};
-
-    const ra = node.registry.allocator;
-    const discovered = node.registry.discover(io) catch &[_]registry_mod.ModelEntry{};
-    defer {
-        for (discovered) |entry| {
-            ra.free(entry.name);
-            ra.free(entry.path);
-        }
-        if (discovered.len > 0) ra.free(discovered);
-    }
-
-    for (discovered) |entry| {
-        if (!model_manager_mod.isModelDirPotentiallyLoadableInCurrentBuild(allocator, entry.path)) continue;
-
-        var maybe_manifest: ?manifest_mod.ModelManifest = manifest_mod.loadFromDir(allocator, entry.path) catch null;
-        defer if (maybe_manifest) |*man| man.deinit();
-
-        const tasks = if (maybe_manifest) |*man| man.tasks else &.{};
-        const capabilities = if (maybe_manifest) |*man| man.capabilities else &.{};
-        const gliner_model_type = if (maybe_manifest) |*man| man.gliner_model_type else "";
-
-        for (task_names) |task| {
-            if (std.mem.eql(u8, task, "chunkers")) continue;
-            if (std.mem.eql(u8, task, "readers") and !readers_mod.isSupportedModelDir(allocator, entry.path)) continue;
-            if (taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities)) {
-                incrementModelCount(&counts, task);
-            }
-        }
-    }
-
-    var it = node.model_manager.loaded.iterator();
-    while (it.next()) |entry| {
-        var already_listed = false;
-        for (discovered) |d| {
-            if (std.mem.eql(u8, d.path, entry.key_ptr.*)) {
-                already_listed = true;
-                break;
-            }
-        }
-        if (already_listed) continue;
-
-        const model = entry.value_ptr.*;
-        const model_task = @tagName(model.manifest.model_type);
-        for (task_names) |task| {
-            if (std.mem.eql(u8, task, "chunkers")) continue;
-            if (taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) {
-                incrementModelCount(&counts, task);
-            }
-        }
-    }
-
-    return counts;
-}
-
-fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Allocator, io: std.Io) ModelCounts {
-    const task_names = [_][]const u8{
-        "embedders",  "rerankers",   "chunkers",
-        "generators", "recognizers", "classifiers",
-        "rewriters",  "readers",     "transcribers",
-        "extractors",
-    };
-    var counts = ModelCounts{};
+    // Fixed chunking is always available, even when no external models are
+    // installed. Keep readiness and the advertised model counts aligned.
+    var counts = ModelCounts{ .chunkers = 2 };
 
     var registry = registry_mod.ModelRegistry.init(allocator, models_dir);
     defer registry.deinit();
-    const discovered = registry.discover(io) catch &[_]registry_mod.ModelEntry{};
+    const discovered = try registry.discover(io);
     defer {
         for (discovered) |entry| {
             allocator.free(entry.name);
@@ -801,6 +1024,23 @@ fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Alloc
     }
 
     return counts;
+}
+
+fn discoveredModelsReadinessResponse(
+    ctx: *httpx.Context,
+    discovered_counts: anyerror!ModelCounts,
+) !httpx.Response {
+    const counts = discovered_counts catch |err| {
+        if (!builtin.is_test) std.log.err("inference readiness model discovery failed: {s}", .{@errorName(err)});
+        return ctx.status(503).json(.{
+            .status = "not_ready",
+            .models = ModelCounts{},
+        });
+    };
+    return ctx.status(200).json(.{
+        .status = "ready",
+        .models = counts,
+    });
 }
 
 fn validateRequestModelIdentifier(raw: []const u8) !void {
@@ -848,6 +1088,65 @@ fn realPathExistingAlloc(allocator: std.mem.Allocator, io: std.Io, path: []const
 fn pathHasComponentPrefix(path: []const u8, prefix: []const u8) bool {
     if (prefix.len == 0 or !std.mem.startsWith(u8, path, prefix)) return false;
     return path.len == prefix.len or prefix[prefix.len - 1] == std.fs.path.sep or path[prefix.len] == std.fs.path.sep;
+}
+
+fn discoveredContainsModelDir(discovered: []const registry_mod.ModelEntry, model_dir: []const u8) bool {
+    for (discovered) |entry| {
+        if (std.mem.eql(u8, entry.path, model_dir)) return true;
+    }
+    return false;
+}
+
+fn stringSliceContains(values: []const []const u8, needle: []const u8) bool {
+    for (values) |value| {
+        if (std.mem.eql(u8, value, needle)) return true;
+    }
+    return false;
+}
+
+/// Return the exact request identifier for an existing canonical model path.
+/// Internal cache keys and paths outside models_dir deliberately have no
+/// public identifier.
+fn loadedModelRequestIdentifier(canonical_models_dir: []const u8, canonical_model_dir: []const u8) ?[]const u8 {
+    if (!pathHasComponentPrefix(canonical_model_dir, canonical_models_dir) or
+        canonical_model_dir.len == canonical_models_dir.len)
+    {
+        return null;
+    }
+
+    const relative_start = canonical_models_dir.len + @intFromBool(canonical_models_dir[canonical_models_dir.len - 1] != std.fs.path.sep);
+    if (relative_start >= canonical_model_dir.len) return null;
+    const identifier = canonical_model_dir[relative_start..];
+    if (std.mem.indexOfScalar(u8, identifier, ':') != null) return null;
+    for (identifier) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return null;
+    }
+    validateRequestModelIdentifier(identifier) catch return null;
+    return identifier;
+}
+
+test "loaded model listing uses model directories and safe relative identifiers" {
+    const discovered = [_]registry_mod.ModelEntry{.{
+        .name = "owner/model",
+        .kind = .embedder,
+        .path = "models/owner/model",
+        .variant = "auto",
+    }};
+
+    try std.testing.expect(discoveredContainsModelDir(&discovered, "models/owner/model"));
+    try std.testing.expect(!discoveredContainsModelDir(&discovered, "models/owner/model\nbackend=metal"));
+    // Canonical comparison closes the relative-vs-absolute spelling gap.
+    try std.testing.expect(!discoveredContainsModelDir(&discovered, "/srv/models/owner/model"));
+    try std.testing.expect(stringSliceContains(&.{ "/srv/models/owner/model", "/srv/models/other" }, "/srv/models/owner/model"));
+    try std.testing.expectEqualStrings(
+        "embedders/owner/model",
+        loadedModelRequestIdentifier("/srv/models", "/srv/models/embedders/owner/model").?,
+    );
+    try std.testing.expect(loadedModelRequestIdentifier("/srv/models", "/srv/models") == null);
+    try std.testing.expect(loadedModelRequestIdentifier("/srv/models", "/srv/models-old/owner/model") == null);
+    try std.testing.expect(loadedModelRequestIdentifier("/srv/models", "/tmp/private-model") == null);
+    try std.testing.expect(loadedModelRequestIdentifier("/srv/models", "/srv/models/owner/model\nbackend=metal") == null);
+    try std.testing.expect(loadedModelRequestIdentifier("/srv/models", "/srv/models/owner/model:q4") == null);
 }
 
 const RequestModelResolutionErrorKind = enum { invalid, missing, internal };
@@ -970,6 +1269,7 @@ pub const Node = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, config: NodeConfig) !Node {
+        try config.prompt_cache.validate();
         var node: Node = .{
             .config = config,
             .allocator = allocator,
@@ -997,30 +1297,57 @@ pub const Node = struct {
         return self.model_manager.loadFromDir(model_path);
     }
 
+    pub fn attachIo(self: *Node, io: std.Io) void {
+        self.session_manager.io = io;
+        self.model_manager.attachIo(io);
+    }
+
+    pub fn detachPromptCacheResourceUsageObserver(self: *Node) void {
+        self.config.prompt_cache_resource_usage_observer = null;
+        self.model_manager.detachPromptCacheResourceUsageObserver();
+    }
+
     pub fn embedDenseTextsDirect(
         self: *Node,
         allocator: std.mem.Allocator,
         model_name: []const u8,
         texts: []const []const u8,
     ) ![][]f32 {
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        return try self.embedDenseTextsDirectWithContext(allocator, io_impl.io(), null, model_name, texts);
+    }
+
+    pub fn embedDenseTextsDirectWithContext(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        deadline_ns: ?u64,
+        model_name: []const u8,
+        texts: []const []const u8,
+    ) ![][]f32 {
         if (texts.len == 0) return try allocator.alloc([]f32, 0);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         try self.request_queue.acquire();
         self.updateQueueMetrics();
         defer self.releaseSlot();
         self.metrics.incRequest("embed.local");
         defer self.metrics.decActive();
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-
-        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "embedders");
+        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
         defer self.allocator.free(model_path);
-        const model = try self.model_manager.loadFromDir(model_path);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
+        const model = try self.loadRequestModelFromDir(model_path);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         try model.ensureEmbeddingAssets(true, false, false);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
 
         var pipeline = model.embeddingPipeline(allocator);
-        return try pipeline.embed(texts);
+        const vectors = try pipeline.embed(texts);
+        errdefer freeDirectDenseVectors(allocator, vectors);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
+        return vectors;
     }
 
     pub fn embedSparseTextsDirect(
@@ -1545,6 +1872,20 @@ pub const Node = struct {
         model_name: []const u8,
         input: std.json.Value,
     ) ![][]f32 {
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        return try self.embedDenseJsonInputDirectWithContext(allocator, io_impl.io(), null, model_name, input);
+    }
+
+    pub fn embedDenseJsonInputDirectWithContext(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        deadline_ns: ?u64,
+        model_name: []const u8,
+        input: std.json.Value,
+    ) ![][]f32 {
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         const media_admission = requestMediaAdmission(self, denseEmbedRequestMediaShape(input));
         try self.request_queue.acquireUnits(media_admission.units);
         self.updateQueueMetrics();
@@ -1553,17 +1894,23 @@ pub const Node = struct {
         self.metrics.incRequest("embed.local");
         defer self.metrics.decActive();
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-
-        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "embedders");
+        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
         defer self.allocator.free(model_path);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
         defer admission_manifest.deinit();
         if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+        try ensureDirectEmbeddingDeadline(deadline_ns);
 
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
-        var parsed = try parseDenseEmbedInputsWithBudget(self, allocator, &admission_manifest, input, &media_budget);
+        var parsed = try parseDenseEmbedInputsWithBudgetAndContext(
+            self,
+            allocator,
+            &admission_manifest,
+            input,
+            &media_budget,
+            .{ .io = io, .deadline_ns = deadline_ns },
+        );
         defer parsed.deinit(allocator);
         return try self.embedParsedDenseInputsDirect(
             allocator,
@@ -1571,6 +1918,7 @@ pub const Node = struct {
             media_admission,
             &parsed,
             &reserved_units,
+            deadline_ns,
         );
     }
 
@@ -1580,7 +1928,21 @@ pub const Node = struct {
         model_name: []const u8,
         parts: []const DirectDenseEmbedPart,
     ) ![][]f32 {
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        return try self.embedDensePartsDirectWithContext(allocator, io_impl.io(), null, model_name, parts);
+    }
+
+    pub fn embedDensePartsDirectWithContext(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        deadline_ns: ?u64,
+        model_name: []const u8,
+        parts: []const DirectDenseEmbedPart,
+    ) ![][]f32 {
         if (parts.len == 0) return try allocator.alloc([]f32, 0);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
 
         const preflight = try directDenseEmbedPreflight(parts);
         const media_admission = requestMediaAdmission(self, preflight.shape);
@@ -1608,22 +1970,21 @@ pub const Node = struct {
         self.metrics.incRequest("embed.local");
         defer self.metrics.decActive();
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-
-        const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "embedders");
+        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
         defer self.allocator.free(model_path);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
         defer admission_manifest.deinit();
         if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
 
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
-        var parsed = try parseDirectDenseEmbedInputs(
+        var parsed = try parseDirectDenseEmbedInputsWithContext(
             self,
             allocator,
             &admission_manifest,
             parts,
             &media_budget,
+            .{ .io = io, .deadline_ns = deadline_ns },
         );
         defer parsed.deinit(allocator);
         return try self.embedParsedDenseInputsDirect(
@@ -1632,6 +1993,7 @@ pub const Node = struct {
             media_admission,
             &parsed,
             &reserved_units,
+            deadline_ns,
         );
     }
 
@@ -1642,8 +2004,10 @@ pub const Node = struct {
         media_admission: ReadRequestAdmission,
         parsed: *ParsedDenseEmbedInputs,
         reserved_units: *usize,
+        deadline_ns: ?u64,
     ) ![][]f32 {
         if (parsed.total_count == 0) return try allocator.alloc([]f32, 0);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
 
         var audio_decode_working_bytes = default_max_audio_decode_working_bytes;
 
@@ -1666,10 +2030,15 @@ pub const Node = struct {
         }
 
         const model = try self.loadRequestModelFromDir(model_path);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         try model.ensureEmbeddingAssets(parsed.texts.items.len > 0, parsed.images.items.len > 0, parsed.audio.items.len > 0);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
         var pipeline = model.embeddingPipeline(allocator);
         pipeline.config.max_audio_decode_working_bytes = audio_decode_working_bytes;
-        return try embedDenseInputs(allocator, &pipeline, parsed);
+        const vectors = try embedDenseInputs(allocator, &pipeline, parsed);
+        errdefer freeDirectDenseVectors(allocator, vectors);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
+        return vectors;
     }
 
     pub fn readImagesDirect(
@@ -1964,7 +2333,7 @@ pub const Node = struct {
             }),
             .internal => ctx.status(500).json(.{
                 .@"error" = "MODEL_RESOLUTION_FAILED",
-                .message = @errorName(err),
+                .message = internalErrorMessage("MODEL_RESOLUTION_FAILED", err),
             }),
         };
     }
@@ -2452,7 +2821,7 @@ pub const Node = struct {
         var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
             return ctx.status(500).json(.{
                 .@"error" = "MODEL_LOAD_FAILED",
-                .message = @errorName(err),
+                .message = internalErrorMessage("MODEL_LOAD_FAILED", err),
             });
         defer admission_manifest.deinit();
 
@@ -2477,7 +2846,7 @@ pub const Node = struct {
             const model = self.loadRequestModelFromDir(model_path) catch |err|
                 return ctx.status(500).json(.{
                     .@"error" = "MODEL_LOAD_FAILED",
-                    .message = @errorName(err),
+                    .message = internalErrorMessage("MODEL_LOAD_FAILED", err),
                 });
             var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
                 .allocator = ctx.allocator,
@@ -2486,7 +2855,7 @@ pub const Node = struct {
                 .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
             };
             const sparse_vecs = pipeline.embed(sparse_texts) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
             defer {
                 for (sparse_vecs) |*sv| @constCast(sv).deinit(ctx.allocator);
                 ctx.allocator.free(sparse_vecs);
@@ -2500,12 +2869,13 @@ pub const Node = struct {
         }
 
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
+        const download_context = DenseEmbedRequestContext{ .io = ctx.io };
         var inputs = switch (request.error_policy) {
-            .fail_fast => parseDenseEmbedInputsWithBudget(self, ctx.allocator, &admission_manifest, request.input, &media_budget),
-            .per_item => parseDenseEmbedInputsPerItemWithBudget(self, ctx.allocator, &admission_manifest, request.input, &media_budget),
+            .fail_fast => parseDenseEmbedInputsWithBudgetAndContext(self, ctx.allocator, &admission_manifest, request.input, &media_budget, download_context),
+            .per_item => parseDenseEmbedInputsPerItemWithBudgetAndContext(self, ctx.allocator, &admission_manifest, request.input, &media_budget, download_context),
         } catch |err| {
             if (isRemoteContentRequestError(err)) return remoteContentErrorResponse(ctx, err);
-            if (err == error.OutOfMemory) return err;
+            if (isDenseEmbedRequestAbort(err)) return err;
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = embedInputParseErrorMessage(err),
@@ -2539,14 +2909,14 @@ pub const Node = struct {
         const model = self.loadRequestModelFromDir(model_path) catch |err|
             return ctx.status(500).json(.{
                 .@"error" = "MODEL_LOAD_FAILED",
-                .message = @errorName(err),
+                .message = internalErrorMessage("MODEL_LOAD_FAILED", err),
             });
         model.ensureEmbeddingAssets(
             inputs.texts.items.len > 0,
             inputs.images.items.len > 0,
             inputs.audio.items.len > 0,
         ) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
 
         var pipeline = model.embeddingPipeline(ctx.allocator);
         pipeline.config.max_audio_decode_working_bytes = audio_decode_working_bytes;
@@ -2649,7 +3019,7 @@ pub const Node = struct {
         }
 
         const chunks = lib_chunker.fixed_multimodal.chunkInput(ctx.allocator, input, config) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "CHUNKING_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "CHUNKING_FAILED", .message = internalErrorMessage("CHUNKING_FAILED", err) });
         defer lib_chunker.types.freeChunks(ctx.allocator, chunks);
 
         const api_chunks = try ctx.allocator.alloc(api.ChunkObject, chunks.len);
@@ -2719,11 +3089,11 @@ pub const Node = struct {
         defer ctx.allocator.free(model_path);
 
         const model = self.loadRequestModelFromDir(model_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
 
         var pipeline = model.rerankingPipeline(ctx.allocator);
         const scores = pipeline.rerank(body.query, body.prompts) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
         defer ctx.allocator.free(scores);
 
         const prompt_tokens =
@@ -2760,7 +3130,7 @@ pub const Node = struct {
             var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
                 return ctx.status(500).json(.{
                     .@"error" = "MODEL_LOAD_FAILED",
-                    .message = @errorName(err),
+                    .message = internalErrorMessage("MODEL_LOAD_FAILED", err),
                 });
             defer admission_manifest.deinit();
             if (!(admission_manifest.hasCapability("colqwen") or admission_manifest.hasCapability("multimodal_late_interaction"))) {
@@ -2789,8 +3159,8 @@ pub const Node = struct {
                 error.RemoteContentUnavailable,
                 => return remoteContentErrorResponse(ctx, err),
                 error.UnsupportedContentPartType => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "multimodal rerank documents only support text and image content parts" }),
-                error.OutOfMemory => return err,
-                else => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
+                error.OutOfMemory, error.Timeout, error.Canceled => return err,
+                else => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid multimodal rerank document content" }),
             };
             image_count = std.math.add(usize, image_count, parsed.images.len) catch std.math.maxInt(usize);
             try parsed_docs.append(ctx.allocator, parsed);
@@ -2806,7 +3176,7 @@ pub const Node = struct {
         }
 
         const model = self.loadRequestModelFromDir(model_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
 
         if (image_count == 0) {
             const flat_texts = try ctx.allocator.alloc([]const u8, parsed_docs.items.len);
@@ -2815,7 +3185,7 @@ pub const Node = struct {
 
             var pipeline = model.rerankingPipeline(ctx.allocator);
             const scores = pipeline.rerank(body.query, flat_texts) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
             defer ctx.allocator.free(scores);
             const prompt_tokens =
                 (countTokenizerTokens(ctx.allocator, model.getTokenizer(), body.query) catch estimateTextTokens(body.query)) * flat_texts.len +
@@ -2831,18 +3201,18 @@ pub const Node = struct {
         }
 
         model.ensureVisionSession() catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
         const vision_session = model.vision_session;
         const gpt_cfg = session_factory.getGptConfig(model.session) orelse
             return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = "multimodal late-interaction reranking currently requires a native qwen/gpt text session" });
         if (vision_session == null and !gpt_cfg.supportsNativeQwen2VlVision()) {
             return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = "model lacks both visual_model.onnx and native qwen2-vl vision config" });
         }
-        const prep_cfg = multimodal_qwen_adapter.loadPreprocessorConfig(ctx.allocator, model_path) catch |err|
-            return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) });
+        const prep_cfg = multimodal_qwen_adapter.loadPreprocessorConfig(ctx.allocator, model_path) catch
+            return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = "model preprocessor configuration is unsupported" });
 
-        var cb = session_factory.getComputeBackend(model.session, ctx.allocator) catch |err|
-            return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) });
+        var cb = session_factory.getComputeBackend(model.session, ctx.allocator) catch
+            return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = "model backend does not support multimodal reranking" });
         defer cb.deinit();
 
         var mm_pipeline = multimodal_reranker.Pipeline.init(
@@ -2858,7 +3228,7 @@ pub const Node = struct {
         );
 
         var query_encoded = mm_pipeline.encodeQueryText(body.query) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
         defer query_encoded.deinit();
 
         const scores = try ctx.allocator.alloc(f32, parsed_docs.items.len);
@@ -2868,7 +3238,7 @@ pub const Node = struct {
             if (doc.images.len == 0) {
                 var text_pipeline = model.rerankingPipeline(ctx.allocator);
                 const text_scores = text_pipeline.rerank(body.query, &.{doc.text}) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                    return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
                 defer ctx.allocator.free(text_scores);
                 scores[idx] = text_scores[0];
                 continue;
@@ -2879,9 +3249,9 @@ pub const Node = struct {
                 doc.text,
                 doc.images,
             ) catch |err| switch (err) {
-                error.InvalidImageDataUri, error.UnsupportedContentPartType => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
-                error.ImageTokenLengthMismatch, error.ImageProjectionSizeMismatch, error.UnexpectedOutputShape => return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) }),
-                else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+                error.InvalidImageDataUri, error.UnsupportedContentPartType => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid multimodal document content" }),
+                error.ImageTokenLengthMismatch, error.ImageProjectionSizeMismatch, error.UnexpectedOutputShape => return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = "model image and text projection shapes are incompatible" }),
+                else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
             };
         }
 
@@ -2899,6 +3269,14 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
+        if (body.prompt_cache_key) |key| {
+            if (key.len > runtime.kv.prompt_cache.max_namespace_bytes) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "prompt_cache_key is too long",
+                });
+            }
+        }
         self.metrics.incRequest("generate");
         defer self.metrics.decActive();
 
@@ -2999,7 +3377,7 @@ pub const Node = struct {
                         .@"error" = "INVALID_MODEL",
                         .message = "model has an unsupported tool_call_format",
                     }),
-                    else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) }),
+                    else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) }),
                 };
                 if (tool_parser == null) {
                     return ctx.status(400).json(.{
@@ -3098,6 +3476,12 @@ pub const Node = struct {
         if (requested_draft_model_name != null) self.metrics.incSpeculationRequested();
 
         const want_stream = body.stream orelse false;
+        // Caching requires an explicit non-empty key: keyless requests would all
+        // share one per-model namespace, leaking prompt presence across callers.
+        const prompt_cache_key: ?[]const u8 = if (body.prompt_cache_key) |key|
+            (if (key.len > 0) key else null)
+        else
+            null;
         const configured_max_tokens = numeric.max_tokens;
 
         var config = generation.GenerationConfig{
@@ -3116,6 +3500,8 @@ pub const Node = struct {
             .prefill_chunk_size = 256,
             .cache_dtype = body.cache_dtype,
             .cache_compaction_ratio = body.cache_compaction_ratio,
+            .prompt_cache_enabled = self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and prompt_cache_key != null and !want_stream,
+            .prompt_cache_key = prompt_cache_key,
         };
         const backend_selection = parseGenerateBackendSelection(body.backend, body.mode, body.compiled_target) catch |err| {
             return ctx.status(400).json(.{
@@ -3155,10 +3541,10 @@ pub const Node = struct {
                         .message = "response_format.json_schema.schema is required for type=json_schema",
                     });
                 };
-                owned_response_format_grammar = grammar_mod.buildJsonSchemaGrammar(ctx.allocator, schema) catch |err| {
+                owned_response_format_grammar = grammar_mod.buildJsonSchemaGrammar(ctx.allocator, schema) catch {
                     return ctx.status(400).json(.{
                         .@"error" = "INVALID_REQUEST",
-                        .message = @errorName(err),
+                        .message = "response_format JSON schema is invalid",
                     });
                 };
                 config.grammar = owned_response_format_grammar;
@@ -3178,10 +3564,10 @@ pub const Node = struct {
                 });
             }
             if (!std.mem.eql(u8, grammar, "json")) {
-                var compiled = grammar_mod.GbnfGrammar.parse(ctx.allocator, grammar) catch |err| {
+                var compiled = grammar_mod.GbnfGrammar.parse(ctx.allocator, grammar) catch {
                     return ctx.status(400).json(.{
                         .@"error" = "INVALID_REQUEST",
-                        .message = @errorName(err),
+                        .message = "grammar is invalid",
                     });
                 };
                 compiled.deinit();
@@ -3211,7 +3597,7 @@ pub const Node = struct {
             }
 
             var pipeline = onnx_decoder_only_vlm.Pipeline.load(ctx.allocator, model_path) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
             defer pipeline.deinit();
             pipeline.prompt_override = if (prompt_override) |prompt| prompt else null;
 
@@ -3227,7 +3613,7 @@ pub const Node = struct {
             }
 
             var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err) });
             defer result.deinit();
 
             var response_text = result.text;
@@ -3236,9 +3622,9 @@ pub const Node = struct {
             const parsed_tool_calls = if (tool_parser) |*parser| blk: {
                 parser.reset();
                 _ = parser.feed(result.text) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err) });
                 tool_response_text = parser.finishText(ctx.allocator) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err) });
                 response_text = tool_response_text.?;
                 if (response_text.len == 0) response_text = result.text;
                 const calls = parser.toolCalls();
@@ -3263,6 +3649,7 @@ pub const Node = struct {
                 if (parsed_tool_calls != null) "tool_calls" else result.finish_reason,
                 result.prompt_tokens,
                 result.tokens_used,
+                0,
                 parsed_tool_calls,
                 effectiveSpeculationStats(
                     result.speculative,
@@ -3280,7 +3667,7 @@ pub const Node = struct {
             defer if (ort_model_dir) |prepared| ctx.allocator.free(prepared);
             if (ort_model_dir) |prepared_model_dir| {
                 var ort_manifest = manifest_mod.loadFromDir(ctx.allocator, prepared_model_dir) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
                 defer ort_manifest.deinit();
 
                 const use_functiongemma_prompt_override = if (tool_parser) |*parser|
@@ -3317,7 +3704,7 @@ pub const Node = struct {
                 }
 
                 var gen_model = ortgenai.GenAiModel.load(ctx.allocator, prepared_model_dir) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
                 defer gen_model.deinit();
 
                 var pipeline = generation.GenerationPipeline{
@@ -3339,7 +3726,7 @@ pub const Node = struct {
                 }
 
                 var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err) });
                 defer result.deinit();
 
                 var response_text = result.text;
@@ -3348,9 +3735,9 @@ pub const Node = struct {
                 const parsed_tool_calls = if (tool_parser) |*parser| blk: {
                     parser.reset();
                     _ = parser.feed(result.text) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                        return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err) });
                     tool_response_text = parser.finishText(ctx.allocator) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                        return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err) });
                     response_text = tool_response_text.?;
                     if (response_text.len == 0) response_text = result.text;
                     const calls = parser.toolCalls();
@@ -3375,6 +3762,7 @@ pub const Node = struct {
                     if (parsed_tool_calls != null) "tool_calls" else result.finish_reason,
                     result.prompt_tokens,
                     result.tokens_used,
+                    0,
                     parsed_tool_calls,
                     effectiveSpeculationStats(
                         result.speculative,
@@ -3386,14 +3774,14 @@ pub const Node = struct {
             }
         }
 
-        // Fall back to native generation (native/Metal with GPT arch forward pass)
+        // Fall back to native generation (CPU/GPU GPT arch forward pass).
         const model = if (backend_selection.native_choice != .auto) blk: {
             var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
             configureGenerateBackendPreference(&request_session_manager, backend_selection);
             break :blk self.model_manager.loadFromDirWithPreferredBackends(model_path, request_session_manager.preferred_backends, false) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
         } else self.model_manager.loadFromDir(model_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
         const graph_mode = backend_selection.graph_mode_requested or
             backend_selection.compiled_partition_backend != null or
             graphModeEnabled();
@@ -3411,7 +3799,7 @@ pub const Node = struct {
         defer if (continuous_generation_lock_held) model.unlockNativeGeneration();
         const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
         const prompt_tokens = self.estimateNativePromptTokens(ctx.allocator, model, messages.items) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZE_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "TOKENIZE_FAILED", .message = internalErrorMessage("TOKENIZE_FAILED", err) });
         var native_generate_lease: ?runtime.scheduler.native_generate.Lease = null;
         defer if (native_generate_lease) |lease| {
             if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
@@ -3461,7 +3849,7 @@ pub const Node = struct {
                     .message = memoryBudgetExceededMessage(ctx.allocator, model.session, &run_budget),
                 });
             }
-            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
         };
 
         const tok = model.getTokenizer();
@@ -3488,7 +3876,7 @@ pub const Node = struct {
                     .message = "xla backend requires TERMITE_XLA_PLUGIN or TERMITE_PJRT_PLUGIN",
                 });
             pjrt_client = pjrt_lib.pjrt.Client.init(plugin_path) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
         }
 
         if (effective_draft_model_name) |draft_model_name| if (shouldResolveDraftModel(config.speculation_policy)) {
@@ -3505,10 +3893,10 @@ pub const Node = struct {
             var load_draft_backend = true;
             if (config.speculation_policy == .auto) {
                 var draft_manifest = manifest_mod.loadFromDir(ctx.allocator, draft_model_path) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
                 defer draft_manifest.deinit();
-                const draft_cfg = session_factory.loadGptConfigFromModelDir(ctx.allocator, draft_model_path, draft_manifest) catch |err|
-                    return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) });
+                const draft_cfg = session_factory.loadGptConfigFromModelDir(ctx.allocator, draft_model_path, draft_manifest) catch
+                    return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = "draft model generation configuration is invalid or unsupported" });
                 if (shouldSkipAutoMtpDraftLoad(config, draft_cfg)) {
                     draft_gpt_config = draft_cfg;
                     load_draft_backend = false;
@@ -3519,9 +3907,9 @@ pub const Node = struct {
                     var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
                     configureGenerateBackendPreference(&request_session_manager, backend_selection);
                     break :blk self.model_manager.loadFromDirWithPreferredBackends(draft_model_path, request_session_manager.preferred_backends, false) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                        return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
                 } else self.model_manager.loadFromDir(draft_model_path) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
                 if (draft_model == model) {
                     return ctx.status(400).json(.{
                         .@"error" = "INVALID_REQUEST",
@@ -3588,7 +3976,7 @@ pub const Node = struct {
                         .message = memoryBudgetExceededMessage(ctx.allocator, draft_model.session, &run_budget),
                     });
                 }
-                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
             };
         }
 
@@ -3621,7 +4009,7 @@ pub const Node = struct {
                     .message = memoryBudgetExceededMessage(ctx.allocator, model.session, &run_budget),
                 });
             }
-            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
         };
         defer {
             const reacquire = continuous_batching and !continuous_generation_lock_held;
@@ -3637,24 +4025,80 @@ pub const Node = struct {
                         .message = memoryBudgetExceededMessage(ctx.allocator, draft_model.session, &run_budget),
                     });
                 }
-                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
             };
         }
-        const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
-        const pool_id = kv_manager.addPool(kv_pool_config) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
-        var kv_storage = runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, kv_pool_config) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
-        defer {
+        const pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
+
+        var prompt_cache: ?*runtime.kv.prompt_cache.PromptPrefixCache = null;
+        var active_kv_manager: *runtime.kv.manager.KvManager = &kv_manager;
+        var active_kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null;
+        var pool_id: runtime.kv.block.KvPoolId = undefined;
+        if (promptCacheEligibleForNativeRequest(
+            config.prompt_cache_enabled,
+            continuous_batching,
+            backend_kind,
+            backend_selection.compiled_partition_backend != null,
+            effective_draft_model_name != null,
+            config.cache_compaction_ratio != null,
+        ) and self.model_manager.tryActivatePromptCache(
+            ctx.io,
+            model,
+            self.config.prompt_cache.runtimeConfig(self.config.prompt_cache_resource_usage_observer),
+        )) {
+            const cache_ready = blk: {
+                const ensured = model.prompt_prefix_cache.ensureStorage(pool_config) catch |err|
+                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
+                const storage = if (ensured) |result| result.storage else break :blk false;
+                if (backend_kind != .metal and backend_kind != .cuda) {
+                    active_kv_storage = storage;
+                    break :blk true;
+                }
+                if (storage.device_write_hook == null) {
+                    cb.provisionKvDeviceWriteHook(storage) catch |err|
+                        return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
+                }
+                if (storage.device_write_hook == null) break :blk false;
+                active_kv_storage = storage;
+                break :blk true;
+            };
+
+            if (cache_ready) {
+                active_kv_manager = model.prompt_prefix_cache.managerPtr();
+                pool_id = model.prompt_prefix_cache.pool_id.?;
+                prompt_cache = &model.prompt_prefix_cache;
+            } else {
+                pool_id = kv_manager.addPool(pool_config) catch |err|
+                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
+                config.prompt_cache_enabled = false;
+            }
+        } else {
+            config.prompt_cache_enabled = false;
+            pool_id = kv_manager.addPool(pool_config) catch |err|
+                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
+        }
+
+        var kv_storage: ?runtime.kv.storage_runtime.KvStorageRuntime = if (active_kv_storage == null)
+            runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, pool_config) catch |err|
+                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) })
+        else
+            null;
+        defer if (kv_storage) |*storage| {
             const reacquire = continuous_batching and !continuous_generation_lock_held;
             if (reacquire) model.lockNativeGeneration(ctx.io);
             defer if (reacquire) model.unlockNativeGeneration();
-            kv_storage.deinit();
+            storage.deinit();
+        };
+        if (kv_storage) |*storage| {
+            cb.provisionKvDeviceWriteHook(storage) catch |err|
+                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
         }
-        cb.provisionKvDeviceWriteHook(&kv_storage) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
-        var decode_state = generation.NativeDecodeState.initPaged(ctx.allocator, &kv_manager, pool_id, model.shared_moe_cache);
-        decode_state.kv_storage = &kv_storage;
+        var decode_state = generation.NativeDecodeState.initPaged(ctx.allocator, active_kv_manager, pool_id, model.shared_moe_cache);
+        if (active_kv_storage) |storage| {
+            decode_state.kv_storage = storage;
+        } else if (kv_storage) |*storage| {
+            decode_state.kv_storage = storage;
+        }
         defer {
             const reacquire = continuous_batching and !continuous_generation_lock_held;
             if (reacquire) model.lockNativeGeneration(ctx.io);
@@ -3675,7 +4119,7 @@ pub const Node = struct {
                 draft_kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
                 const draft_pool_config = generation.kvPoolConfig(draft_kind, draft_kv_dtype.?, draft_cfg, generationKvSlidingTrimForced());
                 const draft_pool_id = draft_kv_manager.?.addPool(draft_pool_config) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
                 draft_decode_state = generation.NativeDecodeState.initPaged(ctx.allocator, &draft_kv_manager.?, draft_pool_id, null);
             }
         }
@@ -3727,6 +4171,7 @@ pub const Node = struct {
             .draft_cb = if (draft_cb) |cb_value| cb_value else null,
             .draft_gpt_config = draft_gpt_config,
             .draft_decode_state = if (draft_decode_state) |*state| state else null,
+            .prompt_cache = prompt_cache,
             .graph_cache = graph_cache,
             .compiled_partition_backend = backend_selection.compiled_partition_backend,
             .compiled_attachment_target = backend_selection.compiled_attachment_target,
@@ -3743,7 +4188,7 @@ pub const Node = struct {
         }
 
         var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err) });
         defer result.deinit();
         if (debug_metal_timing) {
             if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
@@ -3757,9 +4202,9 @@ pub const Node = struct {
         const parsed_tool_calls = if (tool_parser) |*parser| blk: {
             parser.reset();
             _ = parser.feed(result.text) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err) });
             tool_response_text = parser.finishText(ctx.allocator) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err) });
             response_text = tool_response_text.?;
             if (response_text.len == 0) response_text = result.text;
             const calls = parser.toolCalls();
@@ -3784,6 +4229,7 @@ pub const Node = struct {
             if (parsed_tool_calls != null) "tool_calls" else result.finish_reason,
             result.prompt_tokens,
             result.tokens_used,
+            result.cached_prompt_tokens,
             parsed_tool_calls,
             effectiveSpeculationStats(
                 result.speculative,
@@ -4174,7 +4620,7 @@ pub const Node = struct {
 
         fn run(self: *@This()) std.Io.Cancelable!void {
             self.runInner() catch |err| {
-                self.out.@"error" = .{ .code = "GENERATION_FAILED", .message = @errorName(err), .retryable = true };
+                self.out.@"error" = .{ .code = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err), .retryable = true };
             };
         }
 
@@ -4302,7 +4748,7 @@ pub const Node = struct {
                 results[first_idx].@"error" = switch (requestModelResolutionErrorKind(err)) {
                     .invalid => .{ .code = "INVALID_REQUEST", .message = "model must be a relative identifier within models_dir", .retryable = false },
                     .missing => .{ .code = "MODEL_NOT_FOUND", .message = "model not found", .retryable = false },
-                    .internal => .{ .code = "MODEL_RESOLUTION_FAILED", .message = @errorName(err), .retryable = true },
+                    .internal => .{ .code = "MODEL_RESOLUTION_FAILED", .message = internalErrorMessage("MODEL_RESOLUTION_FAILED", err), .retryable = true },
                 };
                 pending[first_idx] = false;
                 continue;
@@ -4332,14 +4778,14 @@ pub const Node = struct {
                 configureGenerateBackendPreference(&request_session_manager, selection);
                 break :blk self.model_manager.loadFromDirWithPreferredBackends(model_path, request_session_manager.preferred_backends, false) catch |err| {
                     for (group_indices.items) |idx| {
-                        results[idx].@"error" = .{ .code = "MODEL_LOAD_FAILED", .message = @errorName(err), .retryable = true };
+                        results[idx].@"error" = .{ .code = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err), .retryable = true };
                         pending[idx] = false;
                     }
                     continue;
                 };
             } else self.model_manager.loadFromDir(model_path) catch |err| {
                 for (group_indices.items) |idx| {
-                    results[idx].@"error" = .{ .code = "MODEL_LOAD_FAILED", .message = @errorName(err), .retryable = true };
+                    results[idx].@"error" = .{ .code = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err), .retryable = true };
                     pending[idx] = false;
                 }
                 continue;
@@ -4387,12 +4833,13 @@ pub const Node = struct {
                 var valid_count: usize = 0;
                 for (group_indices.items, 0..) |idx, pos| {
                     configs[pos] = generateConfigFromBody(ctx.allocator, body.requests[idx].body, &owned_grammars[pos]) catch |err| {
-                        results[idx].@"error" = .{ .code = "INVALID_REQUEST", .message = @errorName(err), .retryable = false };
+                        if (err == error.OutOfMemory) return err;
+                        results[idx].@"error" = .{ .code = "INVALID_REQUEST", .message = "generation request options are invalid", .retryable = false };
                         pending[idx] = false;
                         continue;
                     };
                     prompt_tokens[pos] = self.estimateNativePromptTokens(ctx.allocator, model, owned_messages[idx].messages) catch |err| {
-                        results[idx].@"error" = .{ .code = "TOKENIZE_FAILED", .message = @errorName(err), .retryable = false };
+                        results[idx].@"error" = .{ .code = "TOKENIZE_FAILED", .message = internalErrorMessage("TOKENIZE_FAILED", err), .retryable = false };
                         pending[idx] = false;
                         continue;
                     };
@@ -4431,7 +4878,7 @@ pub const Node = struct {
                         @intCast(@max(configs[pos].max_tokens, 1)),
                         admission_prefill_chunk,
                     )) catch |err| {
-                        results[idx].@"error" = .{ .code = "MEMORY_BUDGET_EXCEEDED", .message = @errorName(err), .retryable = true };
+                        results[idx].@"error" = .{ .code = "MEMORY_BUDGET_EXCEEDED", .message = internalErrorMessage("MEMORY_BUDGET_EXCEEDED", err), .retryable = true };
                         pending[idx] = false;
                     };
                 }
@@ -4439,7 +4886,7 @@ pub const Node = struct {
                 var cb = session_factory.getComputeBackendWithBudget(model.session, ctx.allocator, &run_budget) catch |err| {
                     for (group_indices.items) |idx| {
                         if (!pending[idx]) continue;
-                        results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
+                        results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err), .retryable = true };
                         pending[idx] = false;
                     }
                     continue;
@@ -4452,7 +4899,7 @@ pub const Node = struct {
                 const pool_id = kv_manager.addPool(kv_pool_config) catch |err| {
                     for (group_indices.items) |idx| {
                         if (!pending[idx]) continue;
-                        results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
+                        results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err), .retryable = true };
                         pending[idx] = false;
                     }
                     continue;
@@ -4460,7 +4907,7 @@ pub const Node = struct {
                 var kv_storage = runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, kv_pool_config) catch |err| {
                     for (group_indices.items) |idx| {
                         if (!pending[idx]) continue;
-                        results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
+                        results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err), .retryable = true };
                         pending[idx] = false;
                     }
                     continue;
@@ -4469,7 +4916,7 @@ pub const Node = struct {
                 cb.provisionKvDeviceWriteHook(&kv_storage) catch |err| {
                     for (group_indices.items) |idx| {
                         if (!pending[idx]) continue;
-                        results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
+                        results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err), .retryable = true };
                         pending[idx] = false;
                     }
                     continue;
@@ -4523,7 +4970,7 @@ pub const Node = struct {
                             .prompt_bytes = prompt_bytes[pos],
                             .max_tokens = configs[pos].max_tokens,
                         }) catch |err| {
-                            results[idx].@"error" = .{ .code = "QUEUE_FULL", .message = @errorName(err), .retryable = true };
+                            results[idx].@"error" = .{ .code = "QUEUE_FULL", .message = internalErrorMessage("QUEUE_FULL", err), .retryable = true };
                             pending[idx] = false;
                             continue;
                         };
@@ -4667,14 +5114,14 @@ pub const Node = struct {
     ) !httpx.Response {
         var writer = ctx.streamResponse(200) catch |err| {
             std.debug.print("streamResponse failed: {}\n", .{err});
-            return ctx.status(500).json(.{ .@"error" = "STREAM_INIT_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "STREAM_INIT_FAILED", .message = internalErrorMessage("STREAM_INIT_FAILED", err) });
         };
         const stream_id = try allocCompletionId(ctx.allocator);
         defer ctx.allocator.free(stream_id);
         const stream_created = completionCreatedTimestamp();
 
         emitRoleDelta(&writer, ctx.allocator, stream_id, stream_created, model_name) catch |err| {
-            writer.writeEvent("error", @errorName(err)) catch {};
+            writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
             writer.close() catch {};
             return ctx.response.build();
         };
@@ -4690,7 +5137,7 @@ pub const Node = struct {
             tool_parser,
             result.speculative,
         ) catch |err| {
-            writer.writeEvent("error", @errorName(err)) catch {};
+            writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
             writer.close() catch {};
             return ctx.response.build();
         };
@@ -4828,6 +5275,7 @@ pub const Node = struct {
         finish_reason: []const u8,
         prompt_tokens: usize,
         completion_tokens: usize,
+        cached_prompt_tokens: usize,
         tool_calls: ?[]const tool_parser_mod.ToolCall,
         speculative: ?generation.SpeculativeDecodeStats,
     ) !httpx.Response {
@@ -4873,6 +5321,7 @@ pub const Node = struct {
                 .prompt_tokens = @intCast(prompt_tokens),
                 .completion_tokens = @intCast(completion_tokens),
                 .total_tokens = @intCast(prompt_tokens + completion_tokens),
+                .cached_prompt_tokens = if (cached_prompt_tokens == 0) null else @intCast(cached_prompt_tokens),
             },
             .speculation = generateSpeculationStatus(speculative),
         });
@@ -4938,7 +5387,7 @@ pub const Node = struct {
     ) !httpx.Response {
         var writer = ctx.streamResponse(200) catch |err| {
             std.debug.print("streamResponse failed: {}\n", .{err});
-            return ctx.status(500).json(.{ .@"error" = "STREAM_INIT_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "STREAM_INIT_FAILED", .message = internalErrorMessage("STREAM_INIT_FAILED", err) });
         };
         const stream_id = try allocCompletionId(ctx.allocator);
         defer ctx.allocator.free(stream_id);
@@ -5002,7 +5451,7 @@ pub const Node = struct {
         };
 
         emitRoleDelta(&writer, ctx.allocator, stream_id, stream_created, model_name) catch |err| {
-            writer.writeEvent("error", @errorName(err)) catch {};
+            writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
             writer.close() catch {};
             return ctx.response.build();
         };
@@ -5014,14 +5463,15 @@ pub const Node = struct {
             StreamCtx.onToken,
         ) catch |err| {
             // Try to send an error event before closing
-            writer.writeEvent("error", @errorName(err)) catch {};
+            writeInternalStreamError(&writer, "GENERATION_FAILED", err);
             writer.close() catch {};
             return ctx.response.build();
         };
         defer result.deinit();
 
         if (stream_ctx.errored) {
-            writer.writeEvent("error", "STREAM_WRITE_FAILED") catch {};
+            if (!builtin.is_test) std.log.err("inference request failed code=STREAM_WRITE_FAILED", .{});
+            writer.writeEvent("error", internal_error_message) catch {};
             writer.close() catch {};
             return ctx.response.build();
         }
@@ -5036,7 +5486,7 @@ pub const Node = struct {
 
         if (tool_parser != null) {
             flushStreamParserState(ctx.allocator, &writer, stream_id, stream_created, model_name, result.finish_reason, tool_parser.?, speculative) catch |err| {
-                writer.writeEvent("error", @errorName(err)) catch {};
+                writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
                 writer.close() catch {};
                 return ctx.response.build();
             };
@@ -5261,7 +5711,7 @@ pub const Node = struct {
         }
 
         const model = self.model_manager.loadFromDir(model_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
 
         // Use GLiNER pipeline for GLiNER models, standard NER for BIO models
         if (model.isGlinerModel()) {
@@ -5276,7 +5726,7 @@ pub const Node = struct {
 
         var pipeline = model.nerPipeline(ctx.allocator);
         const all_entities = pipeline.recognizeBatch(body.texts) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
         defer {
             for (all_entities) |entities| {
                 for (entities) |e| ctx.allocator.free(e.text);
@@ -5302,36 +5752,36 @@ pub const Node = struct {
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
         const hf_tokenizer = @import("inference_hf_tokenizer");
 
-        const paths = enc_dec_mod.findEncoderDecoderPaths(ctx.allocator, model_path) catch |err|
-            return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) });
+        const paths = enc_dec_mod.findEncoderDecoderPaths(ctx.allocator, model_path) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = "model is not a supported encoder-decoder recognizer" });
         defer ctx.allocator.free(paths.encoder);
         defer ctx.allocator.free(paths.decoder);
 
         const tok_path = std.fmt.allocPrint(ctx.allocator, "{s}/tokenizer.json", .{model_path}) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
         defer ctx.allocator.free(tok_path);
 
         const tok_bytes = c_file.readFile(ctx.allocator, tok_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
         defer ctx.allocator.free(tok_bytes);
 
         var hf_tok = hf_tokenizer.HfTokenizer.loadFromBytes(ctx.allocator, tok_bytes) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
         defer hf_tok.deinitSelf();
 
         var config = rebel_mod.loadConfig(ctx.allocator, model_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
 
         const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
         if (dec_config.max_length > 0) config.max_length = dec_config.max_length;
 
         const sessions = blk: {
             var encoder_session = self.session_manager.loadModel(paths.encoder) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
             errdefer encoder_session.close();
 
             const decoder_session = self.session_manager.loadModel(paths.decoder) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
 
             break :blk .{
                 .encoder = encoder_session,
@@ -5355,7 +5805,7 @@ pub const Node = struct {
         if (body.relation_labels) |relation_labels| {
             if (relation_labels.len > 0) {
                 const extracted = pipeline.extractRelationsBatch(body.texts, body.labels, relation_labels) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                    return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
                 defer {
                     for (extracted.entities) |entities| {
                         for (entities) |entity| ctx.allocator.free(entity.text);
@@ -5381,7 +5831,7 @@ pub const Node = struct {
         }
 
         const all_entities = pipeline.recognizeBatch(body.texts) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
         defer {
             for (all_entities) |entities| {
                 for (entities) |entity| ctx.allocator.free(entity.text);
@@ -5422,7 +5872,7 @@ pub const Node = struct {
 
             const relation_labels = body.relation_labels.?;
             const extracted = pipeline.extractRelationsBatch(body.texts, labels, relation_labels) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
             defer {
                 for (extracted.entities) |entities| {
                     for (entities) |e| ctx.allocator.free(e.text);
@@ -5447,7 +5897,7 @@ pub const Node = struct {
         }
 
         const all_entities = pipeline.recognizeBatch(body.texts, labels) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
         defer {
             for (all_entities) |entities| {
                 for (entities) |e| ctx.allocator.free(e.text);
@@ -5539,7 +5989,7 @@ pub const Node = struct {
         if (self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "classifiers")) |model_path| {
             defer ctx.allocator.free(model_path);
             const model = self.model_manager.loadFromDir(model_path) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
 
             // Detect entailment index from id2label (varies by NLI model)
             const entailment_idx: ?usize = if (model.manifest.id2label) |labels| blk: {
@@ -5560,7 +6010,7 @@ pub const Node = struct {
             var pipeline = model.classificationPipeline(ctx.allocator, config);
 
             const all_results = pipeline.classifyBatch(body.texts, body.labels) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
             defer {
                 for (all_results) |r| ctx.allocator.free(r);
                 ctx.allocator.free(all_results);
@@ -5578,7 +6028,7 @@ pub const Node = struct {
         if (self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "recognizers")) |model_path| {
             defer ctx.allocator.free(model_path);
             const model = self.model_manager.loadFromDir(model_path) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
             if (!model.isGlinerModel() or !model.supportsClassification()) {
                 return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
             }
@@ -5588,8 +6038,8 @@ pub const Node = struct {
                 .threshold = 0.0,
                 .multi_label = body.multi_label orelse false,
             }) catch |err| switch (err) {
-                error.MissingSpecialTokenIds => return ctx.status(500).json(.{ .@"error" = "MODEL_CONFIG_INVALID", .message = @errorName(err) }),
-                else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+                error.MissingSpecialTokenIds => return ctx.status(500).json(.{ .@"error" = "MODEL_CONFIG_INVALID", .message = internalErrorMessage("MODEL_CONFIG_INVALID", err) }),
+                else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
             };
             defer {
                 for (all_results) |r| ctx.allocator.free(r);
@@ -5629,12 +6079,12 @@ pub const Node = struct {
                 .@"error" = "CHECKPOINT_NOT_FOUND",
                 .message = "layoutdoc_sequence_head.safetensors not found",
             }),
-            else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) }),
+            else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) }),
         };
         defer ctx.allocator.free(checkpoint_path);
 
         var head = document_classification.Head.load(ctx.allocator, checkpoint_path, prefix) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
         defer head.deinit();
 
         const num_tokens: usize = std.math.cast(usize, body.num_tokens) orelse
@@ -5647,7 +6097,7 @@ pub const Node = struct {
 
         const features = document_classification.extractFeatures(ctx.allocator, input) catch |err| switch (err) {
             error.FileNotFound => return ctx.status(404).json(.{ .@"error" = "IMAGE_NOT_FOUND", .message = "image not found" }),
-            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
         };
 
         const results = document_classification.classifyWithHead(ctx.allocator, &head, body.labels, input) catch |err| switch (err) {
@@ -5656,7 +6106,7 @@ pub const Node = struct {
                 .message = "label count does not match checkpoint output width",
             }),
             error.FileNotFound => return ctx.status(404).json(.{ .@"error" = "IMAGE_NOT_FOUND", .message = "image not found" }),
-            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
         };
         defer ctx.allocator.free(results);
 
@@ -5731,12 +6181,12 @@ pub const Node = struct {
                 .@"error" = "CHECKPOINT_NOT_FOUND",
                 .message = "layoutdoc_token_head.safetensors not found",
             }),
-            else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) }),
+            else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) }),
         };
         defer ctx.allocator.free(checkpoint_path);
 
         var head = document_token_classification.Head.load(ctx.allocator, checkpoint_path, prefix) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
         defer head.deinit();
 
         const tokens = try ctx.allocator.alloc(document_token_classification.TokenBox, body.tokens.len);
@@ -5761,7 +6211,7 @@ pub const Node = struct {
                 .@"error" = "INVALID_REQUEST",
                 .message = "label count does not match checkpoint output width",
             }),
-            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
         };
         defer {
             for (predictions) |pred| ctx.allocator.free(pred.scores);
@@ -5892,11 +6342,11 @@ pub const Node = struct {
         defer if (close_decoder) decoder_session.close();
 
         encoder_session = self.session_manager.loadModel(paths.encoder) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
         close_encoder = true;
 
         decoder_session = self.session_manager.loadModel(paths.decoder) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
         close_decoder = true;
 
         // Parse decoder config
@@ -5905,15 +6355,15 @@ pub const Node = struct {
         // Load tokenizer
         const hf_tokenizer = @import("inference_hf_tokenizer");
         const tok_path = std.fmt.allocPrint(ctx.allocator, "{s}/tokenizer.json", .{model_path}) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
         defer ctx.allocator.free(tok_path);
 
         const tok_bytes = c_file.readFile(ctx.allocator, tok_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
         defer ctx.allocator.free(tok_bytes);
 
         var hf_tok = hf_tokenizer.HfTokenizer.loadFromBytes(ctx.allocator, tok_bytes) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
         defer hf_tok.deinitSelf();
 
         const rewriting = @import("../pipelines/rewriting.zig");
@@ -5944,7 +6394,7 @@ pub const Node = struct {
         var completion_tokens: usize = 0;
         for (body.inputs, 0..) |input_text, i| {
             var result = pipeline.rewrite(input_text) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
             defer result.deinit();
 
             const inner = try ctx.allocator.alloc([]const u8, 1);
@@ -6081,7 +6531,7 @@ pub const Node = struct {
                 .@"error" = "INVALID_MODEL",
                 .message = "multi-stage OCR model uses unsupported stages or configuration",
             }),
-            else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) }),
+            else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) }),
         };
         defer reader.deinit();
 
@@ -6090,7 +6540,7 @@ pub const Node = struct {
             .max_tokens = max_tokens,
         }) catch |err| switch (err) {
             error.ImageDecodeFailed => return readImageErrorResponse(ctx, err),
-            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
         };
         defer {
             for (results) |result| {
@@ -6100,7 +6550,7 @@ pub const Node = struct {
             ctx.allocator.free(results);
         }
         if (results.len != body.images.len)
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = "InvalidReadResultCount" });
+            return internalErrorResponse(ctx, "INFERENCE_FAILED", error.InvalidReadResultCount);
 
         var completion_tokens: usize = 0;
         for (results, 0..) |result, i| {
@@ -6231,29 +6681,29 @@ pub const Node = struct {
             defer ctx.allocator.free(paths.decoder);
 
             encoder_session = self.session_manager.loadModel(paths.encoder) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
             close_encoder = true;
 
             decoder_session = self.session_manager.loadModel(paths.decoder) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
             close_decoder = true;
 
             const tok_path = std.fmt.allocPrint(ctx.allocator, "{s}/tokenizer.json", .{model_path}) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
             defer ctx.allocator.free(tok_path);
 
             const tok_bytes = c_file.readFile(ctx.allocator, tok_path) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
             defer ctx.allocator.free(tok_bytes);
 
             hf_tok_owned = hf_tokenizer.HfTokenizer.loadFromBytes(ctx.allocator, tok_bytes) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
             if (hf_tok_owned) |hf_tok| {
                 tokenizer = hf_tok.tokenizer();
             }
         } else |_| {
             const model = self.model_manager.loadFromDir(model_path) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
             if (session_factory.getWhisperConfig(model.session) == null) {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_MODEL",
@@ -6291,7 +6741,7 @@ pub const Node = struct {
         var result = pipeline.transcribePcm(decoded.samples, decoded.sample_rate) catch |err| switch (err) {
             error.UnsupportedAudioFormat => return unsupportedAudioResponse(ctx, "unsupported audio input"),
             error.OutOfMemory => return err,
-            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) }),
+            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
         };
         defer result.deinit();
 
@@ -6362,10 +6812,8 @@ pub const Node = struct {
         defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("extract");
         defer self.metrics.decActive();
-        const schemas = extraction_mod.parseSchemas(ctx.allocator, &body.schema) catch |err| {
-            const message = try std.fmt.allocPrint(ctx.allocator, "invalid schema: {s}", .{@errorName(err)});
-            defer ctx.allocator.free(message);
-            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = message });
+        const schemas = extraction_mod.parseSchemas(ctx.allocator, &body.schema) catch {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "schema is invalid" });
         };
         defer {
             for (schemas) |*schema| schema.deinit(ctx.allocator);
@@ -6470,7 +6918,7 @@ pub const Node = struct {
                 .message = "reader stage failed during extraction",
             }),
             error.OutOfMemory => return err,
-            else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) }),
+            else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) }),
         };
         defer {
             for (results) |*result| result.deinit(ctx.allocator);
@@ -6558,6 +7006,92 @@ pub const Node = struct {
             "rewriters",  "readers",     "transcribers",
             "extractors",
         };
+        // Listing metadata is immutable after publication, and loaded models
+        // remain manager-owned until Node teardown. Snapshot pointers while
+        // holding the registry lock so filesystem canonicalization and
+        // manifest rendering cannot stall inference lookups or publication.
+        var loaded_model_snapshot = std.ArrayListUnmanaged(*model_manager_mod.LoadedModel).empty;
+        defer loaded_model_snapshot.deinit(a);
+        {
+            var loaded_models = self.model_manager.lockLoadedModels(io);
+            defer loaded_models.deinit();
+            var loaded_it = loaded_models.models().valueIterator();
+            while (loaded_it.next()) |model| try loaded_model_snapshot.append(a, model.*);
+        }
+
+        const LoadedListing = struct {
+            model: *model_manager_mod.LoadedModel,
+            canonical_model_dir: []u8,
+            identifier: []const u8,
+        };
+        var loaded_listings = std.ArrayListUnmanaged(LoadedListing).empty;
+        var selected_loaded_dirs = std.ArrayListUnmanaged([]const u8).empty;
+        var canonical_discovered_dirs = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (loaded_listings.items) |listing| a.free(listing.canonical_model_dir);
+            for (canonical_discovered_dirs.items) |path| a.free(path);
+            loaded_listings.deinit(a);
+            selected_loaded_dirs.deinit(a);
+            canonical_discovered_dirs.deinit(a);
+        }
+
+        for (discovered) |entry| {
+            const canonical_path = realPathExistingAlloc(a, io, entry.path) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                continue;
+            };
+            if (stringSliceContains(canonical_discovered_dirs.items, canonical_path)) {
+                a.free(canonical_path);
+                continue;
+            }
+            canonical_discovered_dirs.append(a, canonical_path) catch |err| {
+                a.free(canonical_path);
+                return err;
+            };
+        }
+
+        const canonical_models_dir: ?[]u8 = realPathExistingAlloc(a, io, self.config.models_dir) catch |err| blk: {
+            if (err == error.OutOfMemory) return err;
+            break :blk null;
+        };
+        defer if (canonical_models_dir) |path| a.free(path);
+
+        if (canonical_models_dir) |models_root| {
+            for (loaded_model_snapshot.items) |model| {
+                if (discoveredContainsModelDir(discovered, model.model_dir)) continue;
+
+                const canonical_model_dir = realPathExistingAlloc(a, io, model.model_dir) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    continue;
+                };
+                if (stringSliceContains(canonical_discovered_dirs.items, canonical_model_dir)) {
+                    a.free(canonical_model_dir);
+                    continue;
+                }
+                const identifier = loadedModelRequestIdentifier(models_root, canonical_model_dir) orelse {
+                    a.free(canonical_model_dir);
+                    continue;
+                };
+                if (stringSliceContains(selected_loaded_dirs.items, canonical_model_dir)) {
+                    a.free(canonical_model_dir);
+                    continue;
+                }
+
+                loaded_listings.append(a, .{
+                    .model = model,
+                    .canonical_model_dir = canonical_model_dir,
+                    .identifier = identifier,
+                }) catch |err| {
+                    a.free(canonical_model_dir);
+                    return err;
+                };
+                selected_loaded_dirs.append(a, canonical_model_dir) catch |err| {
+                    loaded_listings.items.len -= 1;
+                    a.free(canonical_model_dir);
+                    return err;
+                };
+            }
+        }
 
         for (task_names, 0..) |task, task_idx| {
             if (task_idx > 0) try body.append(a, ',');
@@ -6601,42 +7135,32 @@ pub const Node = struct {
                 model_count += 1;
             }
 
-            // Add loaded models not yet listed (loaded by path, not discovered by name)
-            var it = self.model_manager.loaded.iterator();
-            while (it.next()) |entry| {
-                const model = entry.value_ptr.*;
+            // Add each undiscovered loaded directory once. Internal backend
+            // variant keys are intentionally never part of the response.
+            for (loaded_listings.items) |listing| {
+                const model = listing.model;
                 const model_task = @tagName(model.manifest.model_type);
                 if (!taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) continue;
 
-                // Skip if already listed from discovery
-                var already_listed = false;
-                for (discovered) |d| {
-                    if (std.mem.eql(u8, d.path, entry.key_ptr.*)) {
-                        already_listed = true;
-                        break;
-                    }
+                if (model_count > 0) try body.append(a, ',');
+                try jsonEncodeString(&body, a, listing.identifier);
+                try body.append(a, ':');
+                try appendModelInfo(
+                    &body,
+                    a,
+                    model_task,
+                    model.manifest.gliner_model_type,
+                    model.manifest.capabilities,
+                    model.manifest.inputs,
+                    model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
+                    model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
+                );
+                if (isOpenAiListTask(task)) {
+                    if (openai_data_count > 0) try openai_data.append(a, ',');
+                    try appendOpenAiModelEntry(&openai_data, a, listing.identifier, list_created);
+                    openai_data_count += 1;
                 }
-                if (!already_listed) {
-                    if (model_count > 0) try body.append(a, ',');
-                    try jsonEncodeString(&body, a, entry.key_ptr.*);
-                    try body.append(a, ':');
-                    try appendModelInfo(
-                        &body,
-                        a,
-                        model_task,
-                        model.manifest.gliner_model_type,
-                        model.manifest.capabilities,
-                        model.manifest.inputs,
-                        model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
-                        model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
-                    );
-                    if (isOpenAiListTask(task)) {
-                        if (openai_data_count > 0) try openai_data.append(a, ',');
-                        try appendOpenAiModelEntry(&openai_data, a, entry.key_ptr.*, list_created);
-                        openai_data_count += 1;
-                    }
-                    model_count += 1;
-                }
+                model_count += 1;
             }
 
             try body.append(a, '}');
@@ -6688,7 +7212,7 @@ pub const Node = struct {
             error.BatchTooLarge => return ctx.status(413).json(.{ .@"error" = "BATCH_TOO_LARGE", .message = "batch too large" }),
             error.FeatureMismatch => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "feature vector length mismatch" }),
             error.LoadFailed => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = "failed to load predictor" }),
-            else => return ctx.status(500).json(.{ .@"error" = "INTERNAL_ERROR", .message = @errorName(err) }),
+            else => return ctx.status(500).json(.{ .@"error" = "INTERNAL_ERROR", .message = internalErrorMessage("INTERNAL_ERROR", err) }),
         };
 
         return ctx.json(api.PredictResponse{
@@ -6747,6 +7271,14 @@ pub const Node = struct {
     }
 
     pub fn serve(self: *Node, allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !void {
+        validateStandaloneBind(host, self.config.allow_insecure_public_bind) catch |err| {
+            std.log.err(
+                "refusing non-loopback inference bind {s}:{d}: standalone inference has no built-in auth or TLS; pass --allow-insecure-public-bind only behind trusted network controls",
+                .{ host, port },
+            );
+            return err;
+        };
+        self.attachIo(io);
         var server = httpx.Server.initWithConfig(allocator, io, .{
             .host = host,
             .port = port,
@@ -6783,7 +7315,9 @@ pub const Node = struct {
         try @constCast(&node.metrics).render(&writer.writer);
 
         // Scheduler metrics (computed on-the-fly from loaded models)
-        const aggregate = runtime.scheduler.native_generate.aggregateStats(node.model_manager.loaded);
+        var loaded_models = node.model_manager.lockLoadedModels(ctx.io);
+        defer loaded_models.deinit();
+        const aggregate = runtime.scheduler.native_generate.aggregateStats(loaded_models.models());
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_waiting_requests", "gauge", "Waiting native scheduler requests across loaded models", aggregate.snapshot.waiting_requests);
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_prefill_requests", "gauge", "Prefill-phase native scheduler requests across loaded models", aggregate.snapshot.prefill_requests);
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_decode_requests", "gauge", "Decode-phase native scheduler requests across loaded models", aggregate.snapshot.decode_requests);
@@ -6801,8 +7335,9 @@ pub const Node = struct {
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_5_8_total", "counter", "Unified scheduler steps containing five through eight items", aggregate.stats.step_batch_size_5_8_total);
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_9_16_total", "counter", "Unified scheduler steps containing nine through sixteen items", aggregate.stats.step_batch_size_9_16_total);
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_turn_yields_total", "counter", "Total cooperative scheduler yields while waiting for turns", aggregate.stats.turn_yields_total);
-        try appendResidentProjectionMetrics(&writer.writer, aggregateResidentProjectionStats(node.model_manager.loaded));
+        try appendResidentProjectionMetrics(&writer.writer, aggregateResidentProjectionStats(loaded_models.models()));
         try appendGraphExecutorMetrics(&writer.writer, graph_mod.executor_stats.snapshot());
+        try appendPromptCacheMetrics(&writer.writer, loaded_models.models());
 
         try ctx.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
         return ctx.text(writer.writer.buffered());
@@ -6815,37 +7350,12 @@ pub const Node = struct {
     fn readyzHandler(ctx: *httpx.Context) anyerror!httpx.Response {
         const models_dir = active_models_dir orelse return ctx.status(503).json(.{
             .status = "not_ready",
-            .models = .{
-                .embedders = 0,
-                .rerankers = 0,
-                .chunkers = 0,
-                .generators = 0,
-                .recognizers = 0,
-                .classifiers = 0,
-                .rewriters = 0,
-                .readers = 0,
-                .transcribers = 0,
-                .extractors = 0,
-            },
+            .models = ModelCounts{},
         });
-        const counts = collectDiscoveredModelCounts(models_dir, ctx.allocator, ctx.io);
-        const status_text = if (counts.total() > 0) "ready" else "not_ready";
-        const status_code: u16 = if (counts.total() > 0) 200 else 503;
-        return ctx.status(status_code).json(.{
-            .status = status_text,
-            .models = .{
-                .embedders = counts.embedders,
-                .rerankers = counts.rerankers,
-                .chunkers = counts.chunkers,
-                .generators = counts.generators,
-                .recognizers = counts.recognizers,
-                .classifiers = counts.classifiers,
-                .rewriters = counts.rewriters,
-                .readers = counts.readers,
-                .transcribers = counts.transcribers,
-                .extractors = counts.extractors,
-            },
-        });
+        return discoveredModelsReadinessResponse(
+            ctx,
+            collectDiscoveredModelCounts(models_dir, ctx.allocator, ctx.io),
+        );
     }
 };
 
@@ -7566,6 +8076,46 @@ fn appendGraphExecutorMetrics(writer: *std.Io.Writer, stats: graph_mod.executor_
         "# HELP inference_quant_kernel_top_fallback_reason Current top quant kernel fallback reason by count\n# TYPE inference_quant_kernel_top_fallback_reason gauge\ninference_quant_kernel_top_fallback_reason{{reason=\"{s}\"}} {d}\n",
         .{ top_fallback.name, top_fallback.count },
     );
+}
+
+fn appendPromptCacheMetrics(writer: *std.Io.Writer, models: anytype) !void {
+    var hits: u64 = 0;
+    var misses: u64 = 0;
+    var evictions: u64 = 0;
+    var cached_tokens: u64 = 0;
+    var live_entries: u64 = 0;
+    var live_bytes: u64 = 0;
+    var block_hash_hits: u64 = 0;
+    var block_hash_misses: u64 = 0;
+    var block_hash_evictions: u64 = 0;
+    var block_hash_cached_blocks: u64 = 0;
+    var block_hash_collision_guards: u64 = 0;
+    var it = models.iterator();
+    while (it.next()) |entry| {
+        const stats = entry.value_ptr.*.prompt_prefix_cache.stats();
+        hits += stats.hits;
+        misses += stats.misses;
+        evictions += stats.evictions;
+        cached_tokens += stats.cached_tokens;
+        live_entries += @intCast(stats.live_entries);
+        live_bytes += @intCast(stats.live_bytes);
+        block_hash_hits += stats.block_hash_hits;
+        block_hash_misses += stats.block_hash_misses;
+        block_hash_evictions += stats.block_hash_evictions;
+        block_hash_cached_blocks += @intCast(stats.block_hash_cached_blocks);
+        block_hash_collision_guards += stats.block_hash_collision_guards;
+    }
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_hits_total", "counter", "Total prompt prefix cache hits", hits);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_misses_total", "counter", "Total prompt prefix cache misses", misses);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_evictions_total", "counter", "Total prompt prefix cache evictions", evictions);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_cached_tokens", "gauge", "Prompt prefix cache retained prompt tokens", cached_tokens);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_live_entries", "gauge", "Prompt prefix cache live entries", live_entries);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_live_bytes", "gauge", "Prompt prefix cache estimated logical bytes", live_bytes);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_hits_total", "counter", "Total block-hash prompt cache hits", block_hash_hits);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_misses_total", "counter", "Total block-hash prompt cache misses", block_hash_misses);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_evictions_total", "counter", "Total block-hash prompt cache evictions", block_hash_evictions);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_cached_blocks", "gauge", "Block-hash prompt cache retained KV blocks", block_hash_cached_blocks);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_collision_guards_total", "counter", "Total block-hash prompt cache collisions detected", block_hash_collision_guards);
 }
 
 fn aggregateResidentProjectionStats(models: anytype) embedding_mod.ResidentProjectionStats {
@@ -9440,6 +9990,16 @@ test "registerRoutesOn prefixes embed aliases and metrics route" {
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/readyz"));
 }
 
+test "node attachIo wires model session manager" {
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+
+    node.attachIo(std.testing.io);
+
+    try std.testing.expect(node.session_manager.io != null);
+    try std.testing.expect(node.model_manager.session_manager.io != null);
+}
+
 test "registerAiRoutesOn excludes Traditional ML predictor routes" {
     var node = try Node.init(std.testing.allocator, .{});
     defer node.deinit();
@@ -9467,6 +10027,70 @@ test "root operational routes stay outside inference API prefix" {
     try std.testing.expect(server.hasRoute(.get, "/readyz"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/healthz"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/readyz"));
+}
+
+test "readiness is healthy with fixed chunkers and no discovered models" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "models");
+    const models_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_dir);
+
+    const counts = try collectDiscoveredModelCounts(models_dir, allocator, std.testing.io);
+    try std.testing.expectEqual(@as(usize, 2), counts.chunkers);
+    try std.testing.expectEqual(@as(usize, 2), counts.total());
+
+    var request = try httpx.Request.init(allocator, .GET, "/readyz");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try discoveredModelsReadinessResponse(&ctx, counts);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"status\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"chunkers\":2") != null);
+}
+
+test "readiness fails closed when model discovery fails" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "models");
+    const models_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_dir);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const discovery_result = collectDiscoveredModelCounts(models_dir, failing.allocator(), std.testing.io);
+
+    var request = try httpx.Request.init(allocator, .GET, "/readyz");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try discoveredModelsReadinessResponse(&ctx, discovery_result);
+    defer response.deinit();
+
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"status\":\"not_ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "OutOfMemory") == null);
+}
+
+test "internal error response hides implementation error names" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .GET, "/ai/v1/models");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try internalErrorResponse(&ctx, "MODEL_LOAD_FAILED", error.SecretModelFilesystemFailure);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 500), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"error\":\"MODEL_LOAD_FAILED\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, internal_error_message) != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "SecretModelFilesystemFailure") == null);
 }
 
 test "registerRoutesOn supports alternate prefixes through the shared router" {
@@ -9561,6 +10185,11 @@ test "generation batching serializes request paths outside the row scheduler" {
     try std.testing.expect(!config.enabledForRequest(.cuda, false, true, false));
     try std.testing.expect(!config.enabledForRequest(.cuda, false, false, true));
     try std.testing.expect(!config.enabledForRequest(.metal, false, false, false));
+}
+
+test "prompt cache stays disabled while CUDA continuous batching releases the model lock" {
+    try std.testing.expect(promptCacheEligibleForNativeRequest(true, false, .cuda, false, false, false));
+    try std.testing.expect(!promptCacheEligibleForNativeRequest(true, true, .cuda, false, false, false));
 }
 
 test "taskMatchesModelListing derives extractors from recognizer capabilities" {
@@ -9793,7 +10422,11 @@ test "remote content request errors preserve client, policy, capacity, and upstr
         try std.testing.expectEqual(case.retryable, failure.retryable);
     }
     try std.testing.expectEqual(error.OutOfMemory, normalizeRemoteContentRequestError(error.OutOfMemory));
+    try std.testing.expectEqual(error.Timeout, normalizeRemoteContentRequestError(error.Timeout));
+    try std.testing.expectEqual(error.Canceled, normalizeRemoteContentRequestError(error.Canceled));
     try std.testing.expect(remoteContentRequestFailure(error.OutOfMemory) == null);
+    try std.testing.expect(remoteContentRequestFailure(error.Timeout) == null);
+    try std.testing.expect(remoteContentRequestFailure(error.Canceled) == null);
 }
 
 test "request media budget accounting is cumulative and overflow safe" {
@@ -10501,6 +11134,28 @@ fn parseDenseEmbedInputsWithBudget(
     input: std.json.Value,
     media_budget: *RequestMediaBudget,
 ) !ParsedDenseEmbedInputs {
+    return parseDenseEmbedInputsWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, null);
+}
+
+fn parseDenseEmbedInputsWithBudgetAndContext(
+    self: *Node,
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    input: std.json.Value,
+    media_budget: *RequestMediaBudget,
+    request_context: DenseEmbedRequestContext,
+) !ParsedDenseEmbedInputs {
+    return parseDenseEmbedInputsWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, request_context);
+}
+
+fn parseDenseEmbedInputsWithBudgetOptionalContext(
+    self: *Node,
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    input: std.json.Value,
+    media_budget: *RequestMediaBudget,
+    request_context: ?DenseEmbedRequestContext,
+) !ParsedDenseEmbedInputs {
     var parsed: ParsedDenseEmbedInputs = .{};
     errdefer parsed.deinit(allocator);
 
@@ -10514,7 +11169,7 @@ fn parseDenseEmbedInputsWithBudget(
             if (arr.items.len == 0) return parsed;
 
             for (arr.items, 0..) |item, index| {
-                try appendDenseEmbedInput(self, allocator, manifest, &parsed, item, index, media_budget);
+                try appendDenseEmbedInput(self, allocator, manifest, &parsed, item, index, media_budget, request_context);
             }
 
             parsed.total_count = arr.items.len;
@@ -10531,6 +11186,28 @@ fn parseDirectDenseEmbedInputs(
     manifest: *const manifest_mod.ModelManifest,
     parts: []const Node.DirectDenseEmbedPart,
     media_budget: *RequestMediaBudget,
+) !ParsedDenseEmbedInputs {
+    return parseDirectDenseEmbedInputsOptionalContext(self, allocator, manifest, parts, media_budget, null);
+}
+
+fn parseDirectDenseEmbedInputsWithContext(
+    self: *Node,
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    parts: []const Node.DirectDenseEmbedPart,
+    media_budget: *RequestMediaBudget,
+    request_context: DenseEmbedRequestContext,
+) !ParsedDenseEmbedInputs {
+    return parseDirectDenseEmbedInputsOptionalContext(self, allocator, manifest, parts, media_budget, request_context);
+}
+
+fn parseDirectDenseEmbedInputsOptionalContext(
+    self: *Node,
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    parts: []const Node.DirectDenseEmbedPart,
+    media_budget: *RequestMediaBudget,
+    request_context: ?DenseEmbedRequestContext,
 ) !ParsedDenseEmbedInputs {
     var parsed: ParsedDenseEmbedInputs = .{};
     errdefer parsed.deinit(allocator);
@@ -10554,6 +11231,7 @@ fn parseDirectDenseEmbedInputs(
             url,
             index,
             media_budget,
+            request_context,
         ),
         .media => |media| {
             try appendDenseEmbedBinary(
@@ -10588,22 +11266,44 @@ fn parseDenseEmbedInputsPerItemWithBudget(
     input: std.json.Value,
     media_budget: *RequestMediaBudget,
 ) !ParsedDenseEmbedInputs {
+    return parseDenseEmbedInputsPerItemWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, null);
+}
+
+fn parseDenseEmbedInputsPerItemWithBudgetAndContext(
+    self: *Node,
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    input: std.json.Value,
+    media_budget: *RequestMediaBudget,
+    request_context: DenseEmbedRequestContext,
+) !ParsedDenseEmbedInputs {
+    return parseDenseEmbedInputsPerItemWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, request_context);
+}
+
+fn parseDenseEmbedInputsPerItemWithBudgetOptionalContext(
+    self: *Node,
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    input: std.json.Value,
+    media_budget: *RequestMediaBudget,
+    request_context: ?DenseEmbedRequestContext,
+) !ParsedDenseEmbedInputs {
     var parsed: ParsedDenseEmbedInputs = .{};
     errdefer parsed.deinit(allocator);
 
     switch (input) {
         .string => |value| {
             parsed.total_count = 1;
-            appendDenseEmbedInput(self, allocator, manifest, &parsed, .{ .string = value }, 0, media_budget) catch |err| {
-                if (err == error.OutOfMemory) return err;
+            appendDenseEmbedInput(self, allocator, manifest, &parsed, .{ .string = value }, 0, media_budget, request_context) catch |err| {
+                if (isDenseEmbedRequestAbort(err)) return err;
                 try parsed.parse_errors.append(allocator, embedInputItemFailure(0, err));
             };
         },
         .array => |arr| {
             parsed.total_count = arr.items.len;
             for (arr.items, 0..) |item, index| {
-                appendDenseEmbedInput(self, allocator, manifest, &parsed, item, index, media_budget) catch |err| {
-                    if (err == error.OutOfMemory) return err;
+                appendDenseEmbedInput(self, allocator, manifest, &parsed, item, index, media_budget, request_context) catch |err| {
+                    if (isDenseEmbedRequestAbort(err)) return err;
                     try parsed.parse_errors.append(allocator, embedInputItemFailure(index, err));
                 };
             }
@@ -10622,9 +11322,13 @@ fn appendDenseEmbedImageUrl(
     url: []const u8,
     index: usize,
     media_budget: *RequestMediaBudget,
+    request_context: ?DenseEmbedRequestContext,
 ) !void {
     if (!model_caps.modelAcceptsInput(manifest, "image")) return error.ModelDoesNotSupportImageInput;
-    const downloaded = try downloadRemoteContentWithBudgetForRequest(self, allocator, url, media_budget);
+    const downloaded = if (request_context) |context|
+        try downloadRemoteContentWithBudgetForRequestWithContext(self, allocator, context, url, media_budget)
+    else
+        try downloadRemoteContentWithBudgetForRequest(self, allocator, url, media_budget);
     errdefer allocator.free(downloaded.data);
     defer allocator.free(downloaded.content_type);
 
@@ -10678,6 +11382,7 @@ fn appendDenseEmbedInput(
     item: std.json.Value,
     index: usize,
     media_budget: *RequestMediaBudget,
+    request_context: ?DenseEmbedRequestContext,
 ) !void {
     if (item == .string) {
         if (!model_caps.modelAcceptsInput(manifest, "text")) return error.ModelDoesNotSupportTextInput;
@@ -10711,7 +11416,7 @@ fn appendDenseEmbedInput(
             },
             else => return error.ImageUrlContentPartMissingUrl,
         };
-        return appendDenseEmbedImageUrl(self, allocator, manifest, parsed, url, index, media_budget);
+        return appendDenseEmbedImageUrl(self, allocator, manifest, parsed, url, index, media_budget, request_context);
     }
 
     if (std.mem.eql(u8, part_type, "media")) {
@@ -10790,7 +11495,7 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
         else => .{
             .status = 500,
             .code = "INFERENCE_FAILED",
-            .message = @errorName(err),
+            .message = internalErrorMessage("INFERENCE_FAILED", err),
         },
     };
 }
@@ -10877,7 +11582,7 @@ fn embedItemFailure(index: usize, err: anyerror, stage: []const u8) EmbedItemErr
         else => .{
             .index = @intCast(index),
             .code = "INFERENCE_FAILED",
-            .message = @errorName(err),
+            .message = internalErrorMessage("INFERENCE_FAILED", err),
             .stage = stage,
             .retryable = true,
             .status = 500,
@@ -10954,7 +11659,7 @@ fn embedInputItemFailure(index: usize, err: anyerror) EmbedItemError {
         else => .{
             .index = @intCast(index),
             .code = "INPUT_PREP_FAILED",
-            .message = @errorName(err),
+            .message = internalErrorMessage("INPUT_PREP_FAILED", err),
             .stage = "parse",
             .retryable = true,
             .status = 500,
@@ -12247,7 +12952,7 @@ const RemoteContentRequestFailure = struct {
 
 fn normalizeRemoteContentRequestError(err: anyerror) anyerror {
     return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
+        error.OutOfMemory, error.Timeout, error.Canceled => err,
         error.StreamTooLong => error.RemoteContentTooLarge,
         error.HostNotAllowed,
         error.PathNotAllowed,
@@ -12272,9 +12977,33 @@ fn normalizeRemoteContentRequestError(err: anyerror) anyerror {
     };
 }
 
+fn isDenseEmbedRequestAbort(err: anyerror) bool {
+    return err == error.OutOfMemory or err == error.Timeout or err == error.Canceled;
+}
+
 fn downloadRemoteContentWithBudgetForRequest(
     self: *Node,
     alloc: std.mem.Allocator,
+    url: []const u8,
+    budget: *RequestMediaBudget,
+) !scraping.DownloadedContent {
+    return downloadRemoteContentWithBudgetForRequestOptionalContext(self, alloc, null, url, budget);
+}
+
+fn downloadRemoteContentWithBudgetForRequestWithContext(
+    self: *Node,
+    alloc: std.mem.Allocator,
+    request_context: DenseEmbedRequestContext,
+    url: []const u8,
+    budget: *RequestMediaBudget,
+) !scraping.DownloadedContent {
+    return downloadRemoteContentWithBudgetForRequestOptionalContext(self, alloc, request_context, url, budget);
+}
+
+fn downloadRemoteContentWithBudgetForRequestOptionalContext(
+    self: *Node,
+    alloc: std.mem.Allocator,
+    request_context: ?DenseEmbedRequestContext,
     url: []const u8,
     budget: *RequestMediaBudget,
 ) !scraping.DownloadedContent {
@@ -12297,8 +13026,15 @@ fn downloadRemoteContentWithBudgetForRequest(
     else
         remaining_u64;
     const s3_credentials = if (self.config.s3_credentials) |*cfg| cfg else null;
+    const download_context = if (request_context) |context|
+        try denseEmbedDownloadContext(context)
+    else
+        null;
     if (comptime builtin.is_test) request_work_test_counters.media_fetch_attempts += 1;
-    var downloaded = scraping.downloadContentAlloc(alloc, url, &bounded_security, s3_credentials) catch |err|
+    var downloaded = (if (download_context) |context|
+        scraping.downloadContentAllocWithContext(alloc, context, url, &bounded_security, s3_credentials)
+    else
+        scraping.downloadContentAlloc(alloc, url, &bounded_security, s3_credentials)) catch |err|
         return normalizeRemoteContentRequestError(err);
     errdefer downloaded.deinit(alloc);
     try budget.add(inline_budget_bytes orelse downloaded.data.len);
@@ -12343,6 +13079,28 @@ fn remoteContentRequestFailure(err: anyerror) ?RemoteContentRequestFailure {
 
 fn isRemoteContentRequestError(err: anyerror) bool {
     return remoteContentRequestFailure(err) != null;
+}
+
+const internal_error_message = "internal inference error";
+
+fn internalErrorMessage(code: []const u8, err: anyerror) []const u8 {
+    if (!builtin.is_test) std.log.err("inference request failed code={s}: {s}", .{ code, @errorName(err) });
+    return internal_error_message;
+}
+
+fn internalErrorResponse(ctx: *httpx.Context, code: []const u8, err: anyerror) !httpx.Response {
+    return ctx.status(500).json(.{
+        .@"error" = code,
+        .message = internalErrorMessage(code, err),
+    });
+}
+
+fn writeInternalStreamError(
+    writer: *httpx.Context.StreamWriter,
+    stage: []const u8,
+    err: anyerror,
+) void {
+    writer.writeEvent("error", internalErrorMessage(stage, err)) catch {};
 }
 
 fn remoteContentErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {

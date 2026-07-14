@@ -13,10 +13,12 @@
 // limitations under the License.
 
 const std = @import("std");
+const httpx = @import("httpx");
 const objectstore = @import("objectstore");
 
 const Allocator = std.mem.Allocator;
 const default_max_download_size_bytes: u64 = 100 * 1024 * 1024;
+const default_download_timeout_ms: u64 = 30_000;
 
 pub const DownloadedContent = struct {
     content_type: []u8,
@@ -32,6 +34,9 @@ pub const DownloadedContent = struct {
 pub const HttpError = struct {
     status: u16,
     message: []const u8,
+    /// Bytes buffered before the non-success status was classified. Callers
+    /// with aggregate budgets must charge these just like successful bodies.
+    downloaded_bytes: u64 = 0,
 };
 
 pub const DownloadOutcome = union(enum) {
@@ -42,6 +47,16 @@ pub const DownloadOutcome = union(enum) {
 pub const HTTPHeader = struct {
     name: []const u8,
     value: []const u8,
+};
+
+/// Execution context for one remote-content operation. For HTTP/S3,
+/// `timeout_ms` is an additional ceiling and the configured timeout (or 30s
+/// default) still applies. File I/O uses caller cancellation when this is null;
+/// a nonzero file deadline fails closed because std.Io files cannot enforce it.
+/// Zero disables that individual ceiling rather than the configured one.
+pub const DownloadContext = struct {
+    io: std.Io,
+    timeout_ms: ?u64 = null,
 };
 
 pub const ContentSecurityConfig = struct {
@@ -156,11 +171,19 @@ pub fn downloadContentAlloc(
     security: ?*const ContentSecurityConfig,
     s3_credentials: ?*const S3CredentialsConfig,
 ) !DownloadedContent {
-    const outcome = try downloadContentOutcomeAlloc(alloc, uri, security, s3_credentials);
-    return switch (outcome) {
-        .ok => |downloaded| downloaded,
-        .http_error => error.HttpFetchFailed,
-    };
+    const outcome = try downloadContentOutcomeAllocImpl(alloc, null, uri, security, s3_credentials, null);
+    return downloadOutcomeContent(outcome);
+}
+
+pub fn downloadContentAllocWithContext(
+    alloc: Allocator,
+    context: DownloadContext,
+    uri: []const u8,
+    security: ?*const ContentSecurityConfig,
+    s3_credentials: ?*const S3CredentialsConfig,
+) !DownloadedContent {
+    const outcome = try downloadContentOutcomeAllocImpl(alloc, context, uri, security, s3_credentials, null);
+    return downloadOutcomeContent(outcome);
 }
 
 pub fn downloadContentOutcomeAlloc(
@@ -169,7 +192,17 @@ pub fn downloadContentOutcomeAlloc(
     security: ?*const ContentSecurityConfig,
     s3_credentials: ?*const S3CredentialsConfig,
 ) !DownloadOutcome {
-    return try downloadContentOutcomeAllocWithHeaders(alloc, uri, security, s3_credentials, null);
+    return downloadContentOutcomeAllocImpl(alloc, null, uri, security, s3_credentials, null);
+}
+
+pub fn downloadContentOutcomeAllocWithContext(
+    alloc: Allocator,
+    context: DownloadContext,
+    uri: []const u8,
+    security: ?*const ContentSecurityConfig,
+    s3_credentials: ?*const S3CredentialsConfig,
+) !DownloadOutcome {
+    return downloadContentOutcomeAllocImpl(alloc, context, uri, security, s3_credentials, null);
 }
 
 pub fn downloadContentOutcomeAllocWithHeaders(
@@ -179,23 +212,64 @@ pub fn downloadContentOutcomeAllocWithHeaders(
     s3_credentials: ?*const S3CredentialsConfig,
     http_headers: ?[]const HTTPHeader,
 ) !DownloadOutcome {
-    if (std.mem.startsWith(u8, uri, "data:")) {
-        return .{ .ok = try parseDataUriAlloc(alloc, uri, security) };
+    return downloadContentOutcomeAllocImpl(alloc, null, uri, security, s3_credentials, http_headers);
+}
+
+pub fn downloadContentOutcomeAllocWithHeadersAndContext(
+    alloc: Allocator,
+    context: DownloadContext,
+    uri: []const u8,
+    security: ?*const ContentSecurityConfig,
+    s3_credentials: ?*const S3CredentialsConfig,
+    http_headers: ?[]const HTTPHeader,
+) !DownloadOutcome {
+    return downloadContentOutcomeAllocImpl(alloc, context, uri, security, s3_credentials, http_headers);
+}
+
+fn downloadOutcomeContent(outcome: DownloadOutcome) !DownloadedContent {
+    return switch (outcome) {
+        .ok => |downloaded| downloaded,
+        .http_error => error.HttpFetchFailed,
+    };
+}
+
+fn downloadContentOutcomeAllocImpl(
+    alloc: Allocator,
+    maybe_context: ?DownloadContext,
+    uri: []const u8,
+    security: ?*const ContentSecurityConfig,
+    s3_credentials: ?*const S3CredentialsConfig,
+    http_headers: ?[]const HTTPHeader,
+) !DownloadOutcome {
+    if (maybe_context) |context| try context.io.checkCancel();
+    if (uri.len >= "data:".len and std.ascii.eqlIgnoreCase(uri[0.."data:".len], "data:")) {
+        const maybe_ceiling: ?DownloadCeiling = if (maybe_context) |context|
+            try DownloadCeiling.init(context, security)
+        else
+            null;
+        var downloaded = try parseDataUriAlloc(alloc, uri, security);
+        errdefer downloaded.deinit(alloc);
+        if (maybe_ceiling) |ceiling| try ceiling.check();
+        return .{ .ok = downloaded };
     }
 
     const parsed = try std.Uri.parse(uri);
-    if (std.mem.eql(u8, parsed.scheme, "http") or std.mem.eql(u8, parsed.scheme, "https")) {
+    if (std.ascii.eqlIgnoreCase(parsed.scheme, "http") or std.ascii.eqlIgnoreCase(parsed.scheme, "https")) {
         try validateUrlSecurity(parsed, security);
-        return try downloadHttpOutcomeAlloc(alloc, parsed, security, http_headers);
+        if (maybe_context) |context| return downloadHttpOutcomeAlloc(alloc, context, uri, security, http_headers);
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        return downloadHttpOutcomeAlloc(alloc, .{ .io = io_impl.io() }, uri, security, http_headers);
     }
-    if (std.mem.eql(u8, parsed.scheme, "file")) {
+    if (std.ascii.eqlIgnoreCase(parsed.scheme, "file")) {
         const path_buf = try alloc.dupe(u8, parsed.path.percent_encoded);
         defer alloc.free(path_buf);
         const path = std.Uri.percentDecodeInPlace(path_buf);
+        if (maybe_context) |context| return .{ .ok = try downloadFileAllocWithContext(alloc, context, path, security) };
         return .{ .ok = try downloadFileAlloc(alloc, path, security) };
     }
-    if (std.mem.eql(u8, parsed.scheme, "s3")) {
-        return .{ .ok = try downloadS3Alloc(alloc, parsed, security, s3_credentials) };
+    if (std.ascii.eqlIgnoreCase(parsed.scheme, "s3")) {
+        return .{ .ok = try downloadS3Alloc(alloc, maybe_context, parsed, security, s3_credentials) };
     }
     return error.UnsupportedUrlScheme;
 }
@@ -230,14 +304,14 @@ fn freeOwnedStringSlice(alloc: std.mem.Allocator, values: []const []u8) void {
 
 pub fn dataUriDecodedSize(uri: []const u8) !usize {
     const prefix = "data:";
-    if (!std.mem.startsWith(u8, uri, prefix)) return error.InvalidDataUri;
+    if (uri.len < prefix.len or !std.ascii.eqlIgnoreCase(uri[0..prefix.len], prefix)) return error.InvalidDataUri;
 
     const payload = uri[prefix.len..];
     const comma = std.mem.indexOfScalar(u8, payload, ',') orelse return error.InvalidDataUri;
     const meta = payload[0..comma];
     const body = payload[comma + 1 ..];
 
-    if (std.mem.endsWith(u8, meta, ";base64")) {
+    if (std.ascii.endsWithIgnoreCase(meta, ";base64")) {
         return std.base64.standard.Decoder.calcSizeForSlice(body) catch return error.InvalidBase64;
     }
 
@@ -278,14 +352,14 @@ fn maxDownloadSize(security: ?*const ContentSecurityConfig) usize {
 
 fn parseDataUriAlloc(alloc: Allocator, uri: []const u8, security: ?*const ContentSecurityConfig) !DownloadedContent {
     const prefix = "data:";
-    if (!std.mem.startsWith(u8, uri, prefix)) return error.InvalidDataUri;
+    if (uri.len < prefix.len or !std.ascii.eqlIgnoreCase(uri[0..prefix.len], prefix)) return error.InvalidDataUri;
 
     const payload = uri[prefix.len..];
     const comma = std.mem.indexOfScalar(u8, payload, ',') orelse return error.InvalidDataUri;
     const meta = payload[0..comma];
     const body = payload[comma + 1 ..];
 
-    if (std.mem.endsWith(u8, meta, ";base64")) {
+    if (std.ascii.endsWithIgnoreCase(meta, ";base64")) {
         const mime = meta[0 .. meta.len - ";base64".len];
         const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(body) catch return error.InvalidBase64;
         try validateDownloadSize(decoded_len, security);
@@ -318,76 +392,172 @@ fn parseDataUriAlloc(alloc: Allocator, uri: []const u8, security: ?*const Conten
 
 fn downloadHttpOutcomeAlloc(
     alloc: Allocator,
-    uri: std.Uri,
+    context: DownloadContext,
+    uri: []const u8,
     security: ?*const ContentSecurityConfig,
     http_headers: ?[]const HTTPHeader,
 ) !DownloadOutcome {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-
-    var client = std.http.Client{
-        .allocator = alloc,
-        .io = io_impl.io(),
-    };
+    try context.io.checkCancel();
+    const timeout_ms = effectiveDownloadTimeoutMs(context, security);
+    var client = httpx.Client.initWithConfig(alloc, context.io, httpClientConfig(security));
     defer client.deinit();
 
-    var headers = std.ArrayListUnmanaged(std.http.Header).empty;
+    var headers = std.ArrayListUnmanaged([2][]const u8).empty;
     defer headers.deinit(alloc);
-    try headers.append(alloc, .{
-        .name = "User-Agent",
-        .value = if (security) |cfg| cfg.user_agent orelse "AntflyDB/1.0" else "AntflyDB/1.0",
-    });
     if (http_headers) |extra_headers| {
         for (extra_headers) |header| {
             if (header.name.len == 0) continue;
-            try headers.append(alloc, .{ .name = header.name, .value = header.value });
+            try headers.append(alloc, .{ header.name, header.value });
         }
     }
 
-    var request = try std.http.Client.request(&client, .GET, uri, httpRequestOptions(headers.items));
-    defer request.deinit();
-
-    try request.sendBodiless();
-    var response = try request.receiveHead(&.{});
-    if (response.head.status.class() != .success) {
+    var response = client.request(.GET, uri, httpRequestOptions(headers.items, timeout_ms)) catch |err| switch (err) {
+        error.AddressRejected => return error.PrivateIpBlocked,
+        error.ResponseTooLarge => return error.StreamTooLong,
+        else => return err,
+    };
+    defer response.deinit();
+    if (!response.ok()) {
         return .{
             .http_error = .{
-                .status = @intFromEnum(response.head.status),
+                .status = response.status.code,
                 .message = "remote fetch failed",
+                .downloaded_bytes = if (response.body) |body| @intCast(body.len) else 0,
             },
         };
     }
 
-    const mime = if (response.head.content_type) |value|
+    const mime = if (response.contentType()) |value|
         trimMimeParameters(value)
     else
         "application/octet-stream";
+    const owned_mime = try alloc.dupe(u8, mime);
+    errdefer alloc.free(owned_mime);
 
-    const max_size = maxDownloadSize(security);
-
-    var transfer_buffer: [512]u8 = undefined;
-    const body = try response.reader(&transfer_buffer).allocRemaining(alloc, .limited(max_size));
+    const body = if (response.body) |data| blk: {
+        if (response.body_owned) {
+            response.body = null;
+            response.body_owned = false;
+            break :blk @constCast(data);
+        }
+        break :blk try alloc.dupe(u8, data);
+    } else try alloc.alloc(u8, 0);
     errdefer alloc.free(body);
 
     return .{ .ok = .{
-        .content_type = try alloc.dupe(u8, mime),
+        .content_type = owned_mime,
         .data = body,
     } };
 }
 
-fn httpRequestOptions(extra_headers: []const std.http.Header) std.http.Client.RequestOptions {
+fn httpRequestOptions(
+    headers: []const [2][]const u8,
+    timeout_ms: u64,
+) httpx.RequestOptions {
     return .{
-        .keep_alive = false,
-        // Redirect targets must be parsed and revalidated before any follow-up
-        // request. This downloader intentionally returns 3xx as a bounded HTTP
-        // error instead of relying on an empty redirect buffer to stop follows.
-        .redirect_behavior = .unhandled,
-        .extra_headers = extra_headers,
+        .headers = headers,
+        // Redirect targets must be parsed and revalidated before any follow-up;
+        // caller-supplied credential headers therefore never cross origins.
+        .follow_redirects = false,
+        .timeout_ms = timeout_ms,
     };
+}
+
+fn httpClientConfig(security: ?*const ContentSecurityConfig) httpx.ClientConfig {
+    const block_private = if (security) |cfg| cfg.block_private_ips orelse true else false;
+    return .{
+        .user_agent = if (security) |cfg| cfg.user_agent orelse "AntflyDB/1.0" else "AntflyDB/1.0",
+        .max_response_size = maxDownloadSize(security),
+        .keep_alive = false,
+        .retry_policy = .noRetry(),
+        .redirect_policy = .noFollow(),
+        .address_filter = if (block_private) allowGlobalAddress else null,
+    };
+}
+
+fn effectiveDownloadTimeoutMs(context: DownloadContext, security: ?*const ContentSecurityConfig) u64 {
+    const configured_ms = if (security) |cfg|
+        if (cfg.download_timeout_seconds) |seconds| @as(u64, seconds) * 1000 else default_download_timeout_ms
+    else
+        default_download_timeout_ms;
+    const context_ms = context.timeout_ms orelse return configured_ms;
+    if (configured_ms == 0) return context_ms;
+    if (context_ms == 0) return configured_ms;
+    return @min(configured_ms, context_ms);
+}
+
+const DownloadCeiling = struct {
+    io: std.Io,
+    timeout_ms: u64,
+    started_at: std.Io.Timestamp,
+
+    fn init(context: DownloadContext, security: ?*const ContentSecurityConfig) !DownloadCeiling {
+        try context.io.checkCancel();
+        return .{
+            .io = context.io,
+            .timeout_ms = effectiveDownloadTimeoutMs(context, security),
+            .started_at = std.Io.Timestamp.now(context.io, .awake),
+        };
+    }
+
+    fn remainingTimeoutMs(self: *const DownloadCeiling) !u64 {
+        try self.io.checkCancel();
+        if (self.timeout_ms == 0) return 0;
+        const elapsed_ns = std.Io.Timestamp.durationTo(
+            self.started_at,
+            std.Io.Timestamp.now(self.io, .awake),
+        ).toNanoseconds();
+        return remainingDownloadTimeoutMs(self.timeout_ms, elapsed_ns);
+    }
+
+    fn check(self: *const DownloadCeiling) !void {
+        _ = try self.remainingTimeoutMs();
+    }
+};
+
+fn remainingDownloadTimeoutMs(timeout_ms: u64, elapsed_ns: i96) !u64 {
+    if (timeout_ms == 0) return 0;
+    const timeout_ns = @as(i96, timeout_ms) * std.time.ns_per_ms;
+    const bounded_elapsed_ns = @max(@as(i96, 0), elapsed_ns);
+    if (bounded_elapsed_ns >= timeout_ns) return error.Timeout;
+    const remaining_ns = timeout_ns - bounded_elapsed_ns;
+    return @intCast(@max(
+        @as(i96, 1),
+        @divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms),
+    ));
 }
 
 fn downloadFileAlloc(
     alloc: Allocator,
+    path: []const u8,
+    security: ?*const ContentSecurityConfig,
+) !DownloadedContent {
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    return downloadFileAllocWithIo(alloc, io_impl.io(), path, security);
+}
+
+fn downloadFileAllocWithContext(
+    alloc: Allocator,
+    context: DownloadContext,
+    path: []const u8,
+    security: ?*const ContentSecurityConfig,
+) !DownloadedContent {
+    // std.Io file operations are cancelable but do not accept a deadline.
+    // Waiting for a canceled blocking filesystem task can itself remain
+    // blocked on a network filesystem, so reject a claimed time ceiling
+    // instead of returning after it has already expired.
+    if ((context.timeout_ms orelse 0) != 0) return error.FileTimeoutUnsupported;
+    try context.io.checkCancel();
+    var downloaded = try downloadFileAllocWithIo(alloc, context.io, path, security);
+    errdefer downloaded.deinit(alloc);
+    try context.io.checkCancel();
+    return downloaded;
+}
+
+fn downloadFileAllocWithIo(
+    alloc: Allocator,
+    io: std.Io,
     path: []const u8,
     security: ?*const ContentSecurityConfig,
 ) !DownloadedContent {
@@ -397,16 +567,13 @@ fn downloadFileAlloc(
         }
     }
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-
     const limit = maxDownloadSize(security);
-    try validateFilePathSecurityBeforeOpen(alloc, io_impl.io(), path, security);
-    var file = try std.Io.Dir.openFileAbsolute(io_impl.io(), path, .{});
-    defer file.close(io_impl.io());
-    try validateOpenFilePathSecurity(alloc, io_impl.io(), file, security);
-    var reader = file.reader(io_impl.io(), &.{});
-    const data = try reader.interface.allocRemaining(alloc, .limited(limit));
+    try validateFilePathSecurityBeforeOpen(alloc, io, path, security);
+    var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    try validateOpenFilePathSecurity(alloc, io, file, security);
+    var reader = file.reader(io, &.{});
+    const data = try allocRemainingBounded(&reader.interface, alloc, limit);
     errdefer alloc.free(data);
     return .{
         .content_type = try alloc.dupe(u8, guessMimeType(path)),
@@ -414,12 +581,35 @@ fn downloadFileAlloc(
     };
 }
 
+fn allocRemainingBounded(reader: *std.Io.Reader, alloc: Allocator, max_size: usize) ![]u8 {
+    // Io's limited reader needs one byte of probe room to distinguish exact
+    // fit from overflow. The returned payload never exceeds max_size.
+    const probe_limit: ?usize = std.math.add(usize, max_size, 1) catch null;
+    const data = if (probe_limit) |limit|
+        try reader.allocRemaining(alloc, .limited(limit))
+    else
+        try reader.allocRemaining(alloc, .unlimited);
+    if (data.len > max_size) {
+        alloc.free(data);
+        return error.StreamTooLong;
+    }
+    return data;
+}
+
 fn downloadS3Alloc(
     alloc: Allocator,
+    maybe_context: ?DownloadContext,
     parsed: std.Uri,
     security: ?*const ContentSecurityConfig,
     s3_credentials: ?*const S3CredentialsConfig,
 ) !DownloadedContent {
+    var local_io_impl: ?std.Io.Threaded = if (maybe_context == null)
+        std.Io.Threaded.init(alloc, .{})
+    else
+        null;
+    defer if (local_io_impl) |*io_impl| io_impl.deinit();
+    const context = maybe_context orelse DownloadContext{ .io = local_io_impl.?.io() };
+    const ceiling = try DownloadCeiling.init(context, security);
     const creds_cfg = s3_credentials orelse return error.MissingS3Credentials;
     const configured_endpoint = creds_cfg.endpoint orelse return error.MissingEndpoint;
     var resolved_endpoint = try objectstore.resolveS3EndpointAlloc(
@@ -443,9 +633,16 @@ fn downloadS3Alloc(
     try validateS3PathSecurity(joined_path, security);
 
     var creds = try allocS3Credentials(alloc, resolved_endpoint.endpoint, resolved_endpoint.use_ssl, creds_cfg);
-    var client = objectstore.S3.Client.init(alloc, .{
+    var client = objectstore.S3.Client.initWithHttpContext(alloc, .{
         .credentials = creds,
         .addressing_style = .path,
+    }, .{
+        .io = ceiling.io,
+        .timeout_ms = ceiling.remainingTimeoutMs() catch |err| {
+            creds.deinit(alloc);
+            return err;
+        },
+        .client_config = httpClientConfig(security),
     }) catch |err| {
         creds.deinit(alloc);
         return err;
@@ -454,20 +651,32 @@ fn downloadS3Alloc(
 
     var store_client = client.client();
     const max_size = maxDownloadSizeBytes(security);
-    var metadata = try store_client.statObject(bucket, key);
-    defer metadata.deinit(alloc);
-    if (metadata.content_length > max_size) return error.StreamTooLong;
-
+    // getObject performs the metadata HEAD needed to populate its result.
+    // A second preflight stat would turn every download into HEAD+HEAD+GET.
     const range_length = std.math.add(u64, max_size, 1) catch null;
-    var result = try store_client.getObject(bucket, key, .{
+    var result = store_client.getObject(bucket, key, .{
         .range = if (range_length) |length| .{ .offset = 0, .length = length } else null,
-    });
+    }) catch |err| return normalizeS3DownloadError(err);
     defer result.deinit(alloc);
     if (result.body.len > max_size) return error.StreamTooLong;
 
-    return .{
-        .content_type = try alloc.dupe(u8, result.metadata.content_type orelse guessMimeType(key)),
-        .data = try alloc.dupe(u8, result.body),
+    const content_type = try alloc.dupe(u8, result.metadata.content_type orelse guessMimeType(key));
+    errdefer alloc.free(content_type);
+    const data = try alloc.dupe(u8, result.body);
+    errdefer alloc.free(data);
+    try ceiling.check();
+    const downloaded = DownloadedContent{
+        .content_type = content_type,
+        .data = data,
+    };
+    return downloaded;
+}
+
+fn normalizeS3DownloadError(err: anyerror) anyerror {
+    return switch (err) {
+        error.ResponseTooLarge => error.StreamTooLong,
+        error.AddressRejected => error.PrivateIpBlocked,
+        else => err,
     };
 }
 
@@ -512,16 +721,44 @@ fn parseS3LocationAlloc(
 
     if (try s3AuthorityMatchesEndpoint(alloc, host_text, parsed.port, configured_endpoint, use_ssl)) {
         const slash = std.mem.indexOfScalar(u8, path, '/') orelse return error.InvalidS3Url;
+        const bucket = try alloc.dupe(u8, path[0..slash]);
+        errdefer alloc.free(bucket);
         return .{
-            try alloc.dupe(u8, path[0..slash]),
+            bucket,
             try alloc.dupe(u8, path[slash + 1 ..]),
         };
     }
 
+    const bucket = try alloc.dupe(u8, host_text);
+    errdefer alloc.free(bucket);
     return .{
-        try alloc.dupe(u8, host_text),
+        bucket,
         try alloc.dupe(u8, path),
     };
+}
+
+/// Returns the canonical bucket used by the S3 downloader for both
+/// `s3://bucket/key` and endpoint-style `s3://endpoint/bucket/key` URLs.
+pub fn s3BucketAlloc(
+    alloc: Allocator,
+    parsed: std.Uri,
+    configured_endpoint: []const u8,
+    use_ssl: ?bool,
+) ![]u8 {
+    var resolved_endpoint = try objectstore.resolveS3EndpointAlloc(
+        alloc,
+        configured_endpoint,
+        use_ssl orelse true,
+    );
+    defer resolved_endpoint.deinit(alloc);
+    const bucket, const key = try parseS3LocationAlloc(
+        alloc,
+        parsed,
+        resolved_endpoint.endpoint,
+        resolved_endpoint.use_ssl,
+    );
+    defer alloc.free(key);
+    return bucket;
 }
 
 fn s3AuthorityMatchesEndpoint(
@@ -564,13 +801,9 @@ fn validateUrlSecurity(parsed: std.Uri, security: ?*const ContentSecurityConfig)
         if (!allowed) return error.HostNotAllowed;
     }
 
-    if (cfg.block_private_ips orelse true) {
-        // std.http resolves hostnames internally, so this layer cannot verify
-        // and pin the address it ultimately connects to. Fail closed for DNS
-        // names until the transport exposes that guarantee; operators can use
-        // the existing explicit `block_private_ips = false` opt-out.
-        if (!isCanonicalIpLiteral(host) or isNonGlobalHost(host)) return error.PrivateIpBlocked;
-    }
+    // Reject dangerous literal spellings before network I/O. DNS names are
+    // vetted and pinned by httpx's connection-time address filter.
+    if (cfg.block_private_ips orelse true and isNonGlobalHost(host)) return error.PrivateIpBlocked;
 }
 
 fn validateOpenFilePathSecurity(
@@ -649,19 +882,16 @@ fn hasComponentPrefix(path: []const u8, prefix: []const u8, separator: u8) bool 
     return path.len == prefix.len or prefix[prefix.len - 1] == separator or path[prefix.len] == separator;
 }
 
-fn isCanonicalIpLiteral(host: []const u8) bool {
-    var literal = host;
-    if (literal.len >= 2 and literal[0] == '[' and literal[literal.len - 1] == ']') {
-        literal = literal[1 .. literal.len - 1];
-    }
-    if (std.mem.indexOfScalar(u8, literal, '%') != null) return false;
-    _ = std.Io.net.IpAddress.parse(literal, 0) catch return false;
-    return true;
+fn allowGlobalAddress(address: std.Io.net.IpAddress) bool {
+    return switch (address) {
+        .ip4 => |ip4| !isNonGlobalIpv4(ip4.bytes),
+        .ip6 => |ip6| ip6.interface.isNone() and !isNonGlobalIpv6(ip6.bytes),
+    };
 }
 
 /// `block_private_ips` rejects literal addresses that are not globally
-/// reachable, not only RFC 1918 addresses. Safe-mode callers reject hostnames
-/// before reaching this helper because std.http cannot pin a vetted DNS result.
+/// reachable, not only RFC 1918 addresses. Hostnames are classified after DNS
+/// resolution by `allowGlobalAddress` at the connection boundary.
 fn isNonGlobalHost(host: []const u8) bool {
     var normalized = std.mem.trimEnd(u8, host, ".");
     if (normalized.len >= 2 and normalized[0] == '[' and normalized[normalized.len - 1] == ']') {
@@ -804,11 +1034,66 @@ test "effective content security falls back when primary is empty" {
 }
 
 test "HTTP downloads leave redirects unhandled for target revalidation" {
-    const headers = [_]std.http.Header{.{ .name = "User-Agent", .value = "test" }};
-    const options = httpRequestOptions(&headers);
-    try std.testing.expectEqual(std.http.Client.Request.RedirectBehavior.unhandled, options.redirect_behavior);
-    try std.testing.expect(!options.keep_alive);
-    try std.testing.expectEqual(@as(usize, 1), options.extra_headers.len);
+    const headers = [_][2][]const u8{.{ "Authorization", "secret" }};
+    const options = httpRequestOptions(&headers, 1234);
+    try std.testing.expectEqual(@as(?bool, false), options.follow_redirects);
+    try std.testing.expectEqual(@as(?u64, 1234), options.timeout_ms);
+    try std.testing.expectEqual(@as(usize, 1), options.headers.?.len);
+    try std.testing.expectEqualStrings("Authorization", options.headers.?[0][0]);
+}
+
+test "HTTP client applies address response and redirect boundaries" {
+    const security = ContentSecurityConfig{
+        .block_private_ips = true,
+        .max_download_size_bytes = 4,
+    };
+    const config = httpClientConfig(&security);
+    try std.testing.expect(config.address_filter != null);
+    try std.testing.expect(!config.keep_alive);
+    try std.testing.expect(!config.redirect_policy.follow_redirects);
+    try std.testing.expectEqual(@as(usize, 4), config.max_response_size);
+
+    const global = try std.Io.net.IpAddress.parse("8.8.8.8", 443);
+    const private = try std.Io.net.IpAddress.parse("127.0.0.1", 80);
+    try std.testing.expect(config.address_filter.?(global));
+    try std.testing.expect(!config.address_filter.?(private));
+}
+
+test "download context timeout cannot lengthen configured deadline" {
+    const security = ContentSecurityConfig{ .download_timeout_seconds = 7 };
+    try std.testing.expectEqual(
+        @as(u64, 1234),
+        effectiveDownloadTimeoutMs(.{ .io = std.testing.io, .timeout_ms = 1234 }, &security),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 7000),
+        effectiveDownloadTimeoutMs(.{ .io = std.testing.io, .timeout_ms = 30_000 }, &security),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 7000),
+        effectiveDownloadTimeoutMs(.{ .io = std.testing.io, .timeout_ms = 0 }, &security),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 7000),
+        effectiveDownloadTimeoutMs(.{ .io = std.testing.io }, &security),
+    );
+    try std.testing.expectEqual(
+        default_download_timeout_ms,
+        effectiveDownloadTimeoutMs(.{ .io = std.testing.io }, null),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 1234),
+        effectiveDownloadTimeoutMs(
+            .{ .io = std.testing.io, .timeout_ms = 1234 },
+            &.{ .download_timeout_seconds = 0 },
+        ),
+    );
+}
+
+test "download ceiling reports the remaining total operation timeout" {
+    try std.testing.expectEqual(@as(u64, 0), try remainingDownloadTimeoutMs(0, std.time.ns_per_s));
+    try std.testing.expectEqual(@as(u64, 1), try remainingDownloadTimeoutMs(100, 99 * std.time.ns_per_ms + 1));
+    try std.testing.expectError(error.Timeout, remainingDownloadTimeoutMs(100, 100 * std.time.ns_per_ms));
 }
 
 test "download content parses data uri" {
@@ -817,6 +1102,30 @@ test "download content parses data uri" {
     defer downloaded.deinit(alloc);
     try std.testing.expectEqualStrings("text/plain", downloaded.content_type);
     try std.testing.expectEqualStrings("hello", downloaded.data);
+}
+
+test "contextual data URI and URI scheme dispatch are case insensitive" {
+    const alloc = std.testing.allocator;
+    var downloaded = try downloadContentAllocWithContext(
+        alloc,
+        .{ .io = std.testing.io, .timeout_ms = 1000 },
+        "DATA:text/plain;base64,aGVsbG8=",
+        null,
+        null,
+    );
+    defer downloaded.deinit(alloc);
+    try std.testing.expectEqualStrings("hello", downloaded.data);
+
+    const allowed_hosts = [_][]u8{@constCast("allowed.example")};
+    try std.testing.expectError(
+        error.HostNotAllowed,
+        downloadContentAlloc(
+            alloc,
+            "HTTPS://blocked.example/content",
+            &.{ .allowed_hosts = &allowed_hosts },
+            null,
+        ),
+    );
 }
 
 test "download content percent decodes non-base64 data uri" {
@@ -865,6 +1174,57 @@ test "download content reads percent encoded file uri" {
     defer downloaded.deinit(alloc);
     try std.testing.expectEqualStrings("image/png", downloaded.content_type);
     try std.testing.expectEqualStrings("png-bytes", downloaded.data);
+}
+
+test "deadline-bound file downloads fail closed when file IO cannot enforce timeouts" {
+    const context = DownloadContext{ .io = std.testing.io, .timeout_ms = 1 };
+    try std.testing.expectError(
+        error.FileTimeoutUnsupported,
+        downloadContentOutcomeAllocWithContext(
+            std.testing.allocator,
+            context,
+            "file:///not-opened-because-timeout-is-unsupported.txt",
+            null,
+            null,
+        ),
+    );
+}
+
+test "caller-owned IO preserves file downloads without a request deadline" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "context.txt", .data = "bounded by size" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "context.txt", alloc);
+    defer alloc.free(path);
+
+    var downloaded = try downloadFileAllocWithContext(
+        alloc,
+        .{ .io = std.testing.io },
+        path,
+        null,
+    );
+    defer downloaded.deinit(alloc);
+    try std.testing.expectEqualStrings("bounded by size", downloaded.data);
+}
+
+test "file download accepts an exact cap and rejects cap plus one" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "exact.txt", .data = "abcd" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "over.txt", .data = "abcde" });
+
+    const exact = try tmp.dir.realPathFileAlloc(std.testing.io, "exact.txt", alloc);
+    defer alloc.free(exact);
+    const over = try tmp.dir.realPathFileAlloc(std.testing.io, "over.txt", alloc);
+    defer alloc.free(over);
+    const security = ContentSecurityConfig{ .max_download_size_bytes = 4 };
+
+    var downloaded = try downloadFileAlloc(alloc, exact, &security);
+    defer downloaded.deinit(alloc);
+    try std.testing.expectEqualStrings("abcd", downloaded.data);
+    try std.testing.expectError(error.StreamTooLong, downloadFileAlloc(alloc, over, &security));
 }
 
 test "file path security requires canonical component containment" {
@@ -963,6 +1323,12 @@ test "s3 path security requires component containment" {
     try std.testing.expectError(error.PathNotAllowed, validateS3PathSecurity("bucket/prefix-sibling/object.png", &security));
 }
 
+test "S3 transport boundary errors keep scraper semantics" {
+    try std.testing.expectEqual(error.StreamTooLong, normalizeS3DownloadError(error.ResponseTooLarge));
+    try std.testing.expectEqual(error.PrivateIpBlocked, normalizeS3DownloadError(error.AddressRejected));
+    try std.testing.expectEqual(error.Timeout, normalizeS3DownloadError(error.Timeout));
+}
+
 test "s3 locations always use the configured endpoint" {
     const alloc = std.testing.allocator;
 
@@ -990,6 +1356,24 @@ test "s3 locations always use the configured endpoint" {
     try std.testing.expect(!resolved.use_ssl);
     try std.testing.expectEqualStrings("bucket", port_bucket);
     try std.testing.expectEqualStrings("object.png", port_key);
+
+    const canonical_endpoint_bucket = try s3BucketAlloc(
+        alloc,
+        endpoint_uri,
+        "https://s3.internal.example",
+        null,
+    );
+    defer alloc.free(canonical_endpoint_bucket);
+    try std.testing.expectEqualStrings("bucket", canonical_endpoint_bucket);
+
+    const canonical_bucket_style = try s3BucketAlloc(
+        alloc,
+        bucket_uri,
+        "https://s3.internal.example",
+        null,
+    );
+    defer alloc.free(canonical_bucket_style);
+    try std.testing.expectEqualStrings("attacker.example", canonical_bucket_style);
 }
 
 test "s3 credential construction validates and owns every field" {
@@ -1020,13 +1404,29 @@ test "download content blocks disallowed hosts" {
     }, null));
 }
 
-test "safe HTTP policy rejects an allowlisted hostname without DNS pinning" {
+test "safe HTTP policy accepts allowlisted DNS for connection-time vetting" {
     const allowed_hosts = [_][]u8{@constCast("cdn.example.com")};
     const uri = try std.Uri.parse("https://cdn.example.com/image.png");
-    try std.testing.expectError(error.PrivateIpBlocked, validateUrlSecurity(uri, &.{
+    const security = ContentSecurityConfig{
         .allowed_hosts = &allowed_hosts,
         .block_private_ips = true,
-    }));
+    };
+    try validateUrlSecurity(uri, &security);
+    try std.testing.expect(httpClientConfig(&security).address_filter != null);
+}
+
+test "safe HTTP policy rejects private DNS at the connection boundary" {
+    const allowed_hosts = [_][]u8{@constCast("localhost")};
+    try std.testing.expectError(
+        error.PrivateIpBlocked,
+        downloadContentAllocWithContext(
+            std.testing.allocator,
+            .{ .io = std.testing.io, .timeout_ms = 1000 },
+            "http://localhost/image.png",
+            &.{ .allowed_hosts = &allowed_hosts, .block_private_ips = true },
+            null,
+        ),
+    );
 }
 
 test "explicit private-IP opt out permits an allowlisted hostname" {

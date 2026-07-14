@@ -89,9 +89,10 @@ pub const Stream = struct {
     got_headers: bool = false,
     /// True once all frames for this stream have been received (END_STREAM or error).
     completed: bool = false,
-    /// Optional semaphore posted by the receive loop when this stream completes.
-    /// Owned by the requesting fiber (stack-allocated); the receive loop only calls post().
-    completion_sem: ?*Io.Semaphore = null,
+    /// Set by the receive loop when this stream completes. Embedded in the
+    /// stream so a canceled request never leaves the receive loop with a
+    /// pointer to waiter-owned synchronization state.
+    completion_event: Io.Event = .unset,
     /// Semaphore posted by the receive loop on every DATA frame and on HEADERS.
     /// Consumer fibers wait on this to read data incrementally.
     /// Owned by the consumer fiber; the receive loop only calls post().
@@ -180,8 +181,7 @@ pub const Stream = struct {
         if (self.read_offset == 0) return;
         const remaining = self.data_buf.items.len - self.read_offset;
         if (remaining > 0) {
-            std.mem.copyForwards(u8, self.data_buf.items[0..remaining],
-                self.data_buf.items[self.read_offset..]);
+            std.mem.copyForwards(u8, self.data_buf.items[0..remaining], self.data_buf.items[self.read_offset..]);
         }
         self.data_buf.items.len = remaining;
         self.read_offset = 0;
@@ -235,7 +235,6 @@ pub const StreamManager = struct {
     /// Highest stream ID that has been removed. Used to distinguish late
     /// frames for closed streams from truly invalid stream IDs.
     max_closed_stream_id: u31 = 0,
-
 
     /// Separate HPACK contexts for encoder and decoder (RFC 7541 §2.2).
     /// Each endpoint maintains two independent dynamic tables: one for
@@ -368,7 +367,7 @@ pub const StreamManager = struct {
     /// Applies initial window size change from SETTINGS to open/half-closed-remote
     /// streams per RFC 7540 §6.9.2. Skips streams in states where send window is
     /// irrelevant. Individual stream overflow is a stream error, not connection error.
-    pub fn applyInitialWindowSizeChange(self: *Self, old_size: u32, new_size: u32) !void {
+    pub fn applyInitialWindowSizeChange(self: *Self, io: Io, old_size: u32, new_size: u32) !void {
         if (new_size > std.math.maxInt(i32) or old_size > std.math.maxInt(i32)) return error.FlowControlError;
         const delta = @as(i32, @intCast(new_size)) - @as(i32, @intCast(old_size));
         var it = self.streams.iterator();
@@ -381,6 +380,8 @@ pub const StreamManager = struct {
                 // stream error (FLOW_CONTROL_ERROR), not connection error.
                 s.stream_error = error.FlowControlError;
                 s.completed = true;
+                if (s.data_event) |event| event.set(io);
+                s.completion_event.set(io);
             };
         }
     }
@@ -591,6 +592,28 @@ test "Stream state transitions" {
 
     stream.receiveEndStream();
     try std.testing.expectEqual(StreamState.closed, stream.state);
+}
+
+test "completion event wait is cancelable and stream-owned" {
+    const allocator = std.testing.allocator;
+    var stream = Stream.init(1);
+    defer stream.deinit(allocator);
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const Waiter = struct {
+        fn run(target: *Stream, waiter_io: Io) anyerror!void {
+            try target.completion_event.wait(waiter_io);
+        }
+    };
+    var future = try io.concurrent(Waiter.run, .{ &stream, io });
+    try std.testing.expectError(error.Canceled, future.cancel(io));
+
+    // The receive side can still signal safely after the waiter is gone.
+    stream.completion_event.set(io);
+    try std.testing.expect(stream.completion_event.isSet());
 }
 
 test "Stream manager create and get" {

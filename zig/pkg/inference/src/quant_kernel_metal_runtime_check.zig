@@ -1765,6 +1765,20 @@ test "quant kernel metal runtime production benchmark cases match compiler manif
     try std.testing.expectEqual(quant_kernel_compiler.first_metal_production_benchmark_case_count, index);
 }
 
+test "quant kernel metal runtime enables qualified opt-in production routes" {
+    var qualified_count: usize = 0;
+    for (metal_runtime_checks) |check| {
+        if (!productionMetalRuntimeCheck(check)) continue;
+        const artifact = metalArtifactForCheck(check) orelse return error.MissingGeneratedArtifact;
+        if (artifact.runtime_default_enabled) continue;
+        const override = productionRouteGateOverride(check) orelse return error.MissingRuntimeGate;
+        try std.testing.expect(override.enable);
+        try std.testing.expect(std.mem.startsWith(u8, std.mem.span(override.name), "TERMITE_METAL_ENABLE_"));
+        qualified_count += 1;
+    }
+    try std.testing.expect(qualified_count > 0);
+}
+
 const Config = struct {
     evidence_out_path: ?[]const u8 = null,
     check_evidence_path: ?[]const u8 = null,
@@ -3525,21 +3539,25 @@ fn runProductionRouteIfGenerated(
 ) !?u64 {
     const route = quant_kernel_compiler.loweringFor(.metal, check.format, quant_matmul.rowBucket(check.rows), check.epilogue);
     if (route.production_route != .generated_production) return null;
-    var disabled_env_name: ?[*:0]const u8 = null;
-    var disabled_old_value_copy: ?[:0]u8 = null;
-    defer if (disabled_old_value_copy) |value| allocator.free(value);
-    defer if (disabled_env_name) |env_name| {
-        if (disabled_old_value_copy) |value| {
+    const gate_override = productionRouteGateOverride(check);
+    const route_env_name = if (gate_override) |override| override.name else null;
+    var old_value_copy: ?[:0]u8 = null;
+    defer if (old_value_copy) |value| allocator.free(value);
+    defer if (route_env_name) |env_name| {
+        if (old_value_copy) |value| {
             _ = setenv(env_name, value.ptr, 1);
         } else {
             _ = unsetenv(env_name);
         }
     };
-    if (disableEnvForGeneratedProductionRoute(check)) |env_name| {
+    if (route_env_name) |env_name| {
         const old_value = std.c.getenv(env_name);
-        disabled_old_value_copy = if (old_value) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
-        disabled_env_name = env_name;
-        if (unsetenv(env_name) != 0) return error.MetalRuntimeUnavailable;
+        old_value_copy = if (old_value) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+        if (gate_override.?.enable) {
+            if (setenv(env_name, "1", 1) != 0) return error.MetalRuntimeUnavailable;
+        } else if (unsetenv(env_name) != 0) {
+            return error.MetalRuntimeUnavailable;
+        }
     }
     return try runDecodeRuntime(allocator, check, raw_weight, input, bias, expected, "production", true);
 }
@@ -3694,6 +3712,17 @@ fn disableEnvForGeneratedProductionRoute(check: CheckCase) ?[*:0]const u8 {
     const artifact = metalArtifactForCheck(check) orelse return null;
     const env_name = quant_kernel_compiler.artifactRuntimeGateEnv(artifact) orelse return null;
     return if (std.mem.startsWith(u8, std.mem.span(env_name), "TERMITE_METAL_DISABLE_")) env_name else null;
+}
+
+const ProductionRouteGateOverride = struct {
+    name: [*:0]const u8,
+    enable: bool,
+};
+
+fn productionRouteGateOverride(check: CheckCase) ?ProductionRouteGateOverride {
+    if (disableEnvForGeneratedProductionRoute(check)) |name| return .{ .name = name, .enable = false };
+    if (enableEnvForGeneratedCandidateRoute(check)) |name| return .{ .name = name, .enable = true };
+    return null;
 }
 
 fn disableEnvForSplitBaselineLinearRoute(check: CheckCase) ?[*:0]const u8 {

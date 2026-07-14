@@ -588,6 +588,21 @@ pub fn loadSentencePieceTokenizerFromDirOrGguf(
     return sp;
 }
 
+fn adoptAndConfigureSentencePieceTokenizer(
+    owned: *?*sentencepiece.Processor,
+    sp: *sentencepiece.Processor,
+    man: manifest_mod.ModelManifest,
+    model_dir: []const u8,
+    allocator: std.mem.Allocator,
+) !void {
+    std.debug.assert(owned.* == null);
+    owned.* = sp;
+    if (shouldEnableGemmaSentencePieceCompat(man, model_dir, allocator)) {
+        sp.setPreserveInlineSpecialsAfterLiteralBos(true);
+    }
+    try loadSentencePieceAddedTokens(model_dir, allocator, sp);
+}
+
 fn loadSentencePieceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []const u8) !sentencepiece.Processor {
     var region = try c_file.MmapRegion.init(allocator, gguf_path);
     defer region.deinit();
@@ -724,6 +739,7 @@ pub const LoadedModel = struct {
     chat_tmpl: ?*ChatTemplate = null,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = null,
     shared_prefetch: ?*runtime.tier.shared.SharedPrefetchState = null,
+    prompt_prefix_cache: runtime.kv.prompt_cache.PromptPrefixCache,
     native_generate_coordinator: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = null,
     native_generation_graph_cache: graph_mod.cache.GraphCache,
     // ponytail: model-wide safety lock; replace with per-request backend state only when continuous batching is proven safe.
@@ -744,6 +760,15 @@ pub const LoadedModel = struct {
         if (self.hf_tok) |ht| return ht.tokenizer();
         if (self.sp_tok) |sp| return sp.tokenizer();
         unreachable;
+    }
+
+    pub fn attachIo(self: *LoadedModel, io: std.Io) void {
+        session_factory.attachIo(self.session, io);
+        if (self.vision_session) |session| session_factory.attachIo(session, io);
+        if (self.audio_session) |session| session_factory.attachIo(session, io);
+        if (self.text_projection) |session| session_factory.attachIo(session, io);
+        if (self.visual_projection) |session| session_factory.attachIo(session, io);
+        if (self.audio_projection) |session| session_factory.attachIo(session, io);
     }
 
     pub fn lockNativeGeneration(self: *LoadedModel, io: std.Io) void {
@@ -961,6 +986,7 @@ pub const LoadedModel = struct {
 
     pub fn deinit(self: *LoadedModel) void {
         self.native_generation_graph_cache.deinit();
+        self.prompt_prefix_cache.deinit();
         self.session.close();
         if (self.vision_session) |vs| vs.close();
         if (self.audio_session) |as_| as_.close();
@@ -1010,21 +1036,70 @@ fn usesClipImagePreprocessProfile(manifest: *const manifest_mod.ModelManifest) b
 }
 
 pub const ModelManager = struct {
+    const LoadedModelMap = std.StringHashMapUnmanaged(*LoadedModel);
+
+    pub const LoadedModelsGuard = struct {
+        manager: *ModelManager,
+
+        pub fn models(self: *const @This()) *const LoadedModelMap {
+            return &self.manager.loaded;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.manager.state_mutex.unlock();
+            self.* = undefined;
+        }
+    };
+
     allocator: std.mem.Allocator,
     session_manager: backends.SessionManager,
-    loaded: std.StringHashMapUnmanaged(*LoadedModel),
-    loaded_aliases: std.StringHashMapUnmanaged(*LoadedModel),
+    loaded: LoadedModelMap,
+    loaded_aliases: LoadedModelMap,
+    /// Serializes every loaded-map read, mutation, and iteration, plus prompt
+    /// cache ownership. Cold loading happens outside this lock so operational
+    /// endpoints can still inspect the registry while a model starts.
+    state_mutex: std.atomic.Mutex = .unlocked,
+    /// Suppresses duplicate cold loads while keeping the state lock brief.
+    // ponytail: serialize cold loads until measured startup contention justifies
+    // a per-model singleflight table and its extra ownership states.
+    load_mutex: std.atomic.Mutex = .unlocked,
+    prompt_cache_owner: ?*LoadedModel = null,
 
     pub fn init(allocator: std.mem.Allocator, session_manager: backends.SessionManager) ModelManager {
         return .{
             .allocator = allocator,
             .session_manager = session_manager,
-            .loaded = std.StringHashMapUnmanaged(*LoadedModel){},
-            .loaded_aliases = std.StringHashMapUnmanaged(*LoadedModel){},
+            .loaded = LoadedModelMap{},
+            .loaded_aliases = LoadedModelMap{},
         };
     }
 
+    fn lockMutex(mutex: *std.atomic.Mutex, io: ?std.Io) void {
+        if (io) |active_io| {
+            platform.sync.lockYieldingIo(mutex, active_io);
+        } else {
+            platform.sync.lockYielding(mutex);
+        }
+    }
+
+    fn lockState(self: *ModelManager, io: ?std.Io) void {
+        lockMutex(&self.state_mutex, io);
+    }
+
+    fn lockLoad(self: *ModelManager, io: ?std.Io) void {
+        lockMutex(&self.load_mutex, io);
+    }
+
+    pub fn lockLoadedModels(self: *ModelManager, io: std.Io) LoadedModelsGuard {
+        self.lockState(io);
+        return .{ .manager = self };
+    }
+
     pub fn deinit(self: *ModelManager) void {
+        self.lockLoad(null);
+        defer self.load_mutex.unlock();
+        self.lockState(null);
+        defer self.state_mutex.unlock();
         var it = self.loaded.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit();
@@ -1037,13 +1112,50 @@ pub const ModelManager = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.loaded_aliases.deinit(self.allocator);
+        self.prompt_cache_owner = null;
+    }
+
+    pub fn attachIo(self: *ModelManager, io: std.Io) void {
+        self.lockLoad(io);
+        defer self.load_mutex.unlock();
+        self.lockState(io);
+        defer self.state_mutex.unlock();
+        self.session_manager.io = io;
+        var it = self.loaded.iterator();
+        while (it.next()) |entry| entry.value_ptr.*.attachIo(io);
+    }
+
+    /// Claim the node-wide prompt cache for one process-stable loaded model.
+    /// Different models fail closed instead of mutating an active model's KV
+    /// manager from outside that model's generation lock.
+    pub fn tryActivatePromptCache(
+        self: *ModelManager,
+        io: std.Io,
+        model: *LoadedModel,
+        node_config: runtime.kv.prompt_cache.Config,
+    ) bool {
+        self.lockState(io);
+        defer self.state_mutex.unlock();
+        if (!node_config.enabled) return false;
+        if (self.prompt_cache_owner) |owner| {
+            if (owner != model) return false;
+        } else {
+            self.prompt_cache_owner = model;
+        }
+        model.prompt_prefix_cache.configure(node_config);
+        return true;
+    }
+
+    pub fn detachPromptCacheResourceUsageObserver(self: *ModelManager) void {
+        self.lockState(null);
+        defer self.state_mutex.unlock();
+        var it = self.loaded.valueIterator();
+        while (it.next()) |model| model.*.prompt_prefix_cache.detachResourceUsageObserver();
     }
 
     /// Load a model from a directory path. Returns a cached model if already loaded.
     pub fn loadFromDir(self: *ModelManager, model_dir: []const u8) !*LoadedModel {
-        if (self.loaded.get(model_dir)) |model| return model;
-        if (self.loaded_aliases.get(model_dir)) |model| return model;
-        return self.loadFromDirWithPreferredBackends(model_dir, self.session_manager.preferred_backends, true);
+        return self.loadFromDirImpl(model_dir, self.session_manager.preferred_backends, true, true);
     }
 
     pub fn loadFromDirWithPreferredBackends(
@@ -1052,6 +1164,47 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
     ) !*LoadedModel {
+        return self.loadFromDirImpl(model_dir, preferred_backends, cache_default_alias, false);
+    }
+
+    fn loadFromDirImpl(
+        self: *ModelManager,
+        model_dir: []const u8,
+        preferred_backends: []const backends.BackendType,
+        cache_default_alias: bool,
+        use_default_alias: bool,
+    ) !*LoadedModel {
+        if (try self.findLoadedModel(model_dir, preferred_backends, use_default_alias)) |model| return model;
+
+        self.lockLoad(null);
+        defer self.load_mutex.unlock();
+
+        // A different caller may have completed the same load while this one
+        // waited for duplicate-load suppression.
+        if (try self.findLoadedModel(model_dir, preferred_backends, use_default_alias)) |model| return model;
+
+        var session_manager = sessionManagerForPreferredBackends(self.allocator, preferred_backends, &self.session_manager);
+        const model = try self.loadFromDirUncached(model_dir, &session_manager);
+        errdefer destroyLoadedModel(self, model);
+
+        const published = try self.publishLoadedModel(model_dir, model, cache_default_alias);
+        if (published != model) destroyLoadedModel(self, model);
+        return published;
+    }
+
+    fn findLoadedModel(
+        self: *ModelManager,
+        model_dir: []const u8,
+        preferred_backends: []const backends.BackendType,
+        use_default_alias: bool,
+    ) !?*LoadedModel {
+        self.lockState(null);
+        defer self.state_mutex.unlock();
+
+        if (use_default_alias) {
+            if (self.loaded.get(model_dir)) |model| return model;
+            if (self.loaded_aliases.get(model_dir)) |model| return model;
+        }
         for (preferred_backends) |backend| {
             if (!backend.supportsDirectSessionLoad()) continue;
             const variant_key = try backendVariantCacheKey(self.allocator, model_dir, backend);
@@ -1059,16 +1212,13 @@ pub const ModelManager = struct {
             if (self.loaded.get(variant_key)) |model| return model;
             if (self.loaded_aliases.get(variant_key)) |model| return model;
         }
-
-        var session_manager = sessionManagerForPreferredBackends(self.allocator, preferred_backends, &self.session_manager);
-        return self.loadFromDirUncached(model_dir, &session_manager, cache_default_alias);
+        return null;
     }
 
     fn loadFromDirUncached(
         self: *ModelManager,
         model_dir: []const u8,
         sm: *backends.SessionManager,
-        cache_default_alias: bool,
     ) !*LoadedModel {
         // Load manifest
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
@@ -1100,16 +1250,13 @@ pub const ModelManager = struct {
             },
             .sentencepiece => {
                 const sp = try loadSentencePieceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
-                if (shouldEnableGemmaSentencePieceCompat(man, model_dir, self.allocator)) {
-                    sp.setPreserveInlineSpecialsAfterLiteralBos(true);
-                }
-                try loadSentencePieceAddedTokens(model_dir, self.allocator, sp);
-                sp_tok = sp;
+                try adoptAndConfigureSentencePieceTokenizer(&sp_tok, sp, man, model_dir, self.allocator);
             },
         }
 
         // Load session.
         const session = try loadSessionForPreferredBackends(self.allocator, sm.preferred_backends, model_dir, man, sm);
+        errdefer session.close();
 
         // Load chat template if available (for generator models)
         const chat_tmpl: ?*ChatTemplate = if (man.chat_template) |ct_source| blk2: {
@@ -1128,6 +1275,11 @@ pub const ModelManager = struct {
             };
             break :blk2 ct;
         } else null;
+        errdefer if (chat_tmpl) |ct| {
+            var ct_mut = @constCast(ct);
+            ct_mut.deinit();
+            self.allocator.destroy(ct_mut);
+        };
 
         // Create loaded model
         const shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = blk: {
@@ -1147,6 +1299,10 @@ pub const ModelManager = struct {
         const shared_prefetch: ?*runtime.tier.shared.SharedPrefetchState = if (session_factory.getGptConfig(session)) |_| blk: {
             const state = try self.allocator.create(runtime.tier.shared.SharedPrefetchState);
             state.* = runtime.tier.shared.SharedPrefetchState.init(self.allocator);
+            errdefer {
+                state.deinit();
+                self.allocator.destroy(state);
+            }
             try session_factory.attachSharedPrefetchState(session, state);
             break :blk state;
         } else null;
@@ -1160,18 +1316,22 @@ pub const ModelManager = struct {
             break :blk coordinator;
         } else null;
         errdefer if (native_generate_coordinator) |coordinator| self.allocator.destroy(coordinator);
+        const owned_model_dir = try self.allocator.dupe(u8, model_dir);
+        errdefer self.allocator.free(owned_model_dir);
         const model = try self.allocator.create(LoadedModel);
+        errdefer self.allocator.destroy(model);
         model.* = .{
             .manifest = man,
             .hf_tok = hf_tok,
             .sp_tok = sp_tok,
             .session = session,
             .session_manager = &self.session_manager,
-            .model_dir = try self.allocator.dupe(u8, model_dir),
+            .model_dir = owned_model_dir,
             .allocator = self.allocator,
             .chat_tmpl = chat_tmpl,
             .shared_moe_cache = shared_moe_cache,
             .shared_prefetch = shared_prefetch,
+            .prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(self.allocator),
             .native_generate_coordinator = native_generate_coordinator,
             .native_generation_graph_cache = graph_mod.cache.GraphCache.init(self.allocator),
             .vision_session = null,
@@ -1191,15 +1351,49 @@ pub const ModelManager = struct {
             }
         }
 
-        // Cache by actual loaded session backend.
-        const variant_key = try backendVariantCacheKey(self.allocator, model_dir, model.session.backend());
-        try self.loaded.put(self.allocator, variant_key, model);
-        if (cache_default_alias and self.loaded.get(model_dir) == null and self.loaded_aliases.get(model_dir) == null) {
-            const alias_key = try self.allocator.dupe(u8, model_dir);
-            try self.loaded_aliases.put(self.allocator, alias_key, model);
-        }
-
         return model;
+    }
+
+    fn publishLoadedModel(
+        self: *ModelManager,
+        model_dir: []const u8,
+        model: *LoadedModel,
+        cache_default_alias: bool,
+    ) !*LoadedModel {
+        const variant_key = try backendVariantCacheKey(self.allocator, model_dir, model.session.backend());
+        var variant_key_owned = true;
+        defer if (variant_key_owned) self.allocator.free(variant_key);
+
+        const maybe_alias_key = if (cache_default_alias) try self.allocator.dupe(u8, model_dir) else null;
+        var alias_key_owned = maybe_alias_key != null;
+        defer if (alias_key_owned) self.allocator.free(maybe_alias_key.?);
+
+        self.lockState(null);
+        defer self.state_mutex.unlock();
+
+        var inserted_variant = false;
+        const published = self.loaded.get(variant_key) orelse blk: {
+            try self.loaded.put(self.allocator, variant_key, model);
+            variant_key_owned = false;
+            inserted_variant = true;
+            break :blk model;
+        };
+        errdefer if (inserted_variant) {
+            if (self.loaded.fetchRemove(variant_key)) |removed| self.allocator.free(removed.key);
+        };
+
+        if (maybe_alias_key) |alias_key| {
+            if (self.loaded.get(model_dir) == null and self.loaded_aliases.get(model_dir) == null) {
+                try self.loaded_aliases.put(self.allocator, alias_key, published);
+                alias_key_owned = false;
+            }
+        }
+        return published;
+    }
+
+    fn destroyLoadedModel(self: *ModelManager, model: *LoadedModel) void {
+        model.deinit();
+        self.allocator.destroy(model);
     }
 };
 
@@ -1653,6 +1847,47 @@ test "shouldEnableGemmaSentencePieceCompat applies to gguf-only gemma dirs" {
 
     try std.testing.expect(shouldEnableGemmaSentencePieceCompat(man, dir_path, allocator));
     try std.testing.expect(!shouldPreferSentencePieceOverride(man, dir_path, allocator));
+}
+
+test "sentencepiece tokenizer is owned before added-token failure" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "added_tokens.json",
+        .data = "]",
+    });
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(dir_path);
+    const man = manifest_mod.ModelManifest{ .allocator = allocator };
+
+    const Harness = struct {
+        fn run(a: std.mem.Allocator, model_dir: []const u8, manifest: manifest_mod.ModelManifest) !void {
+            var owned: ?*sentencepiece.Processor = null;
+            errdefer if (owned) |sp| {
+                sp.deinit();
+                a.destroy(sp);
+            };
+
+            const sp = try a.create(sentencepiece.Processor);
+            errdefer if (owned == null) a.destroy(sp);
+            sp.* = try sentencepiece.Processor.initFromPieces(a, &.{
+                .{ .text = "<unk>", .score = 0, .piece_type = 2 },
+                .{ .text = "token", .score = -1, .piece_type = 1 },
+            }, .{});
+
+            try adoptAndConfigureSentencePieceTokenizer(&owned, sp, manifest, model_dir, a);
+
+            // Keep an unexpected success leak-free so expectError reports only
+            // the missing post-load failure.
+            sp.deinit();
+            a.destroy(sp);
+            owned = null;
+        }
+    };
+
+    try std.testing.expectError(error.SyntaxError, Harness.run(allocator, dir_path, man));
 }
 
 test "loadSentencePieceAddedTokens overlays gemma special tokens from tokenizer json" {

@@ -602,7 +602,7 @@ jobs:
           ANTFLY_FS_PATH_DEBUG: "1"
         run: |
           chmod +x ./zig-out/bin/antfly
-          uv run --project e2e/antfly pytest -q -x e2e/antfly
+          uv run --project e2e/antfly pytest -q e2e/antfly
 
       - name: Run Antfly inference full E2E
         if: ${{ success() || steps.antfly_full_e2e.outcome == 'failure' }}
@@ -611,4 +611,4 @@ jobs:
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_INFERENCE_DOWNLOAD: "1"
           ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: openai-community/gpt2
-        run: uv run --project e2e/inference pytest -q -x e2e/inference
+        run: uv run --project e2e/inference pytest -q e2e/inference

@@ -57,6 +57,16 @@ pub const ProviderKind = enum {
     antfly,
 };
 
+pub const EmbeddingRequestContext = struct {
+    io: std.Io,
+    deadline_ns: ?u64,
+
+    pub fn check(self: EmbeddingRequestContext) !void {
+        const deadline = self.deadline_ns orelse return;
+        if (monotonicNowNs() >= deadline) return error.Timeout;
+    }
+};
+
 pub const AntflyProvider = struct {
     ptr: *anyopaque,
     embed_dense_texts: *const fn (
@@ -65,6 +75,13 @@ pub const AntflyProvider = struct {
         model: []const u8,
         texts: []const []const u8,
     ) anyerror![][]f32,
+    embed_dense_texts_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        texts: []const []const u8,
+        context: EmbeddingRequestContext,
+    ) anyerror![][]f32 = null,
     embed_sparse_texts: *const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -76,6 +93,13 @@ pub const AntflyProvider = struct {
         alloc: std.mem.Allocator,
         model: []const u8,
         parts: []const template_mod.ContentPart,
+    ) anyerror![][]f32 = null,
+    embed_dense_parts_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        parts: []const template_mod.ContentPart,
+        context: EmbeddingRequestContext,
     ) anyerror![][]f32 = null,
     rerank_texts: ?*const fn (
         ptr: *anyopaque,
@@ -131,6 +155,8 @@ pub const AntflyProvider = struct {
 
 pub const InitOptions = struct {
     antfly_provider: ?AntflyProvider = null,
+    io: ?std.Io = null,
+    deadline_ns: ?u64 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_url: ?[]const u8 = null,
@@ -149,6 +175,8 @@ pub const QueryTemplateError = error{
 
 const default_pacing_burst: u32 = 1;
 const pacing_safety_margin_ns: u64 = 50 * std.time.ns_per_ms;
+const max_embedding_request_timeout_ms: u64 = 30_000;
+const query_cache_secret_refresh_interval_ns: u64 = std.time.ns_per_s;
 const dimension_probe_text = "antfly embedding dimension probe";
 
 fn monotonicNowNs() u64 {
@@ -157,24 +185,6 @@ fn monotonicNowNs() u64 {
         .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => return 0,
     }
-}
-
-fn sleepNs(duration_ns: u64) void {
-    if (comptime builtin.os.tag == .freestanding) return;
-    if (@hasDecl(std.Thread, "sleep")) {
-        std.Thread.sleep(duration_ns);
-        return;
-    }
-
-    var req = std.posix.timespec{
-        .sec = @intCast(duration_ns / std.time.ns_per_s),
-        .nsec = @intCast(duration_ns % std.time.ns_per_s),
-    };
-    while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        else => return,
-    };
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
@@ -207,10 +217,21 @@ const RequestPacer = struct {
         };
     }
 
-    fn acquire(self: *RequestPacer) void {
+    fn acquire(self: *RequestPacer, io: std.Io, deadline_ns: ?u64) !void {
         if (self.capacity <= 1.0) {
-            self.beginSerialRequest();
-            self.endSerialRequest();
+            lockAtomic(&self.mutex);
+            const now_ns = monotonicNowNs();
+            const send_at_ns = @max(now_ns, self.next_send_ns);
+            const wait_ns = send_at_ns - now_ns;
+            if (deadline_ns) |deadline| {
+                if (now_ns >= deadline or wait_ns >= deadline - now_ns) {
+                    self.mutex.unlock();
+                    return error.Timeout;
+                }
+            }
+            self.next_send_ns = send_at_ns +| self.interval_ns +| pacing_safety_margin_ns;
+            self.mutex.unlock();
+            if (wait_ns > 0) try io.sleep(.fromNanoseconds(@intCast(wait_ns)), .awake);
             return;
         }
 
@@ -231,25 +252,11 @@ const RequestPacer = struct {
             const deficit = 1.0 - self.tokens;
             const wait_ns = @max(@as(u64, 1), @as(u64, @intFromFloat(@ceil(deficit / self.refill_per_ns)))) + pacing_safety_margin_ns;
             self.mutex.unlock();
-            sleepNs(wait_ns);
+            if (deadline_ns) |deadline| {
+                if (now_ns >= deadline or wait_ns >= deadline - now_ns) return error.Timeout;
+            }
+            try io.sleep(.fromNanoseconds(@intCast(wait_ns)), .awake);
         }
-    }
-
-    fn beginSerialRequest(self: *RequestPacer) void {
-        lockAtomic(&self.mutex);
-        while (true) {
-            const now_ns = monotonicNowNs();
-            if (now_ns >= self.next_send_ns) return;
-            const wait_ns = self.next_send_ns - now_ns;
-            self.mutex.unlock();
-            sleepNs(wait_ns);
-            lockAtomic(&self.mutex);
-        }
-    }
-
-    fn endSerialRequest(self: *RequestPacer) void {
-        self.next_send_ns = monotonicNowNs() +| self.interval_ns +| pacing_safety_margin_ns;
-        self.mutex.unlock();
     }
 };
 
@@ -359,6 +366,8 @@ fn releaseSharedRequestPacer(scope_key: []const u8) void {
 
 pub const ManagedEmbeddingEntry = struct {
     alloc: std.mem.Allocator,
+    io: ?std.Io = null,
+    deadline_ns: ?u64 = null,
     index_name: []u8,
     embedding_name: []u8 = "",
     provider: ProviderKind,
@@ -616,6 +625,7 @@ pub const ManagedEmbedder = struct {
             .dense_embed_fn = embedDense,
             .dense_embed_batch_fn = embedDenseBatch,
             .dense_embed_parts_fn = embedDenseParts,
+            .media_part_limit_fn = denseMediaPartLimit,
             .deinit_fn = deinitDenseEmbedder,
         };
     }
@@ -690,6 +700,41 @@ pub const ManagedEmbedder = struct {
         return try embedWithEntry(alloc, entry, text, entry.dimensions);
     }
 
+    /// Digest the effective dense-text embedding operation. Table and index
+    /// names are intentionally excluded so equivalent configurations share
+    /// results; the server-derived scope prevents cross-principal reuse.
+    pub fn queryCacheKey(
+        self: *const ManagedEmbedder,
+        index_name: []const u8,
+        security_domain: QueryCacheSecurityDomain,
+        security_scope: []const u8,
+        text: []const u8,
+    ) ![32]u8 {
+        const entry = self.findEntry(index_name) orelse return error.EmbeddingIndexNotFound;
+        if (entry.sparse or entry.multimodal) return error.QueryEmbeddingNotCacheable;
+        if (entry.secret_store) |store| {
+            _ = try store.refreshIfChangedThrottled(query_cache_secret_refresh_interval_ns);
+        }
+
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hashQueryCacheField(&hasher, "antfly-query-embedding-v1");
+        hashQueryCacheField(&hasher, @tagName(security_domain));
+        hashQueryCacheField(&hasher, security_scope);
+        hashQueryCacheField(&hasher, @tagName(entry.provider));
+        hashQueryCacheField(&hasher, entry.base_url);
+        hashQueryCacheField(&hasher, entry.model);
+        hashQueryCacheField(&hasher, entry.region);
+        hashQueryCacheField(&hasher, entry.input_type);
+        hashQueryCacheField(&hasher, entry.truncate);
+        hashQueryCacheU64(&hasher, entry.dimensions);
+        hashQueryCacheSecretIdentity(&hasher, entry.api_key);
+        hashQueryCacheU64(&hasher, if (entry.secret_store) |store| store.generationFast() else 0);
+        hashQueryCacheField(&hasher, text);
+        var digest: [32]u8 = undefined;
+        hasher.final(&digest);
+        return digest;
+    }
+
     pub fn embedQueryWithTemplate(
         self: *const ManagedEmbedder,
         alloc: std.mem.Allocator,
@@ -700,6 +745,7 @@ pub const ManagedEmbedder = struct {
         const entry = self.findEntry(index_name) orelse return error.EmbeddingIndexNotFound;
         const rendered = try renderQueryTemplateWithEntry(alloc, embedding_template, text, entry);
         defer alloc.free(rendered);
+        try ensureEntryDeadline(entry);
         try validateRenderedTemplate(alloc, rendered);
         const parts = try template_mod.textToParts(alloc, rendered);
         defer template_mod.freeContentParts(alloc, parts);
@@ -749,6 +795,12 @@ pub const ManagedEmbedder = struct {
         return try embedWithEntryParts(alloc, entry, parts, dims);
     }
 
+    fn denseMediaPartLimit(ptr: *anyopaque, embedding_name: []const u8) ?usize {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const entry = self.findEntry(embedding_name) orelse return null;
+        return if (isAntflyProvider(entry.provider)) 1 else null;
+    }
+
     fn deinitDenseEmbedder(ptr: *anyopaque, alloc: std.mem.Allocator) void {
         _ = alloc;
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
@@ -785,24 +837,176 @@ pub const ManagedEmbedder = struct {
     }
 };
 
-fn waitForEntryPacer(entry: *const ManagedEmbeddingEntry) void {
-    const pacer = entry.pacer orelse return;
-    pacer.acquire();
+pub const QueryCacheSecurityDomain = enum {
+    anonymous,
+    principal,
+    internal,
+};
+
+fn hashQueryCacheField(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    hashQueryCacheU64(hasher, value.len);
+    hasher.update(value);
 }
 
-fn beginEntryPacedRequest(entry: *const ManagedEmbeddingEntry) ?*RequestPacer {
-    const pacer = entry.pacer orelse return null;
-    if (pacer.capacity <= 1.0) {
-        pacer.beginSerialRequest();
-        return pacer;
+fn hashQueryCacheU64(hasher: *std.crypto.hash.sha2.Sha256, value: anytype) void {
+    var encoded = std.mem.nativeToLittle(u64, @intCast(value));
+    hasher.update(std.mem.asBytes(&encoded));
+}
+
+fn hashQueryCacheSecretIdentity(hasher: *std.crypto.hash.sha2.Sha256, maybe_secret: ?common_secrets.SecretValue) void {
+    const secret = maybe_secret orelse {
+        hashQueryCacheField(hasher, "none");
+        return;
+    };
+    switch (secret) {
+        .literal => |value| {
+            hashQueryCacheField(hasher, "literal");
+            hashQueryCacheField(hasher, value);
+        },
+        .secret_ref => |value| {
+            hashQueryCacheField(hasher, "secret_ref");
+            hashQueryCacheField(hasher, value);
+        },
+        .env_var => |value| {
+            hashQueryCacheField(hasher, "env_var");
+            hashQueryCacheField(hasher, value);
+        },
     }
-    pacer.acquire();
-    return null;
 }
 
-fn endEntryPacedRequest(serial_pacer: ?*RequestPacer) void {
-    const pacer = serial_pacer orelse return;
-    pacer.endSerialRequest();
+fn waitForEntryPacer(entry: *const ManagedEmbeddingEntry) !void {
+    try ensureEntryDeadline(entry);
+    const pacer = entry.pacer orelse return;
+    try pacer.acquire(embeddingIo(entry), entry.deadline_ns);
+    try ensureEntryDeadline(entry);
+}
+
+fn embeddingIo(entry: *const ManagedEmbeddingEntry) std.Io {
+    return entry.io orelse std.Io.Threaded.global_single_threaded.io();
+}
+
+fn embeddingRequestContext(entry: *const ManagedEmbeddingEntry) EmbeddingRequestContext {
+    return .{ .io = embeddingIo(entry), .deadline_ns = entry.deadline_ns };
+}
+
+fn ensureEntryDeadline(entry: *const ManagedEmbeddingEntry) !void {
+    const deadline = entry.deadline_ns orelse return;
+    if (monotonicNowNs() >= deadline) return error.Timeout;
+}
+
+fn embeddingHttpClientConfig(entry: *const ManagedEmbeddingEntry) !httpx.ClientConfig {
+    var config = httpx.ClientConfig{
+        .keep_alive = false,
+        .max_response_size = 4 << 20,
+    };
+    const deadline = entry.deadline_ns orelse return config;
+    const now_ns = monotonicNowNs();
+    if (now_ns >= deadline) return error.Timeout;
+    const remaining_ns = deadline - now_ns;
+    const timeout_ms = @min(
+        max_embedding_request_timeout_ms,
+        @max(@as(u64, 1), (remaining_ns +| std.time.ns_per_ms - 1) / std.time.ns_per_ms),
+    );
+    config.timeouts = httpx.Timeouts.uniform(timeout_ms);
+    config.timeouts.request_ms = timeout_ms;
+    return config;
+}
+
+pub fn testEmbeddingProviderDeadlines() !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var pacer = RequestPacer.init(60, 1);
+    try pacer.acquire(io, null);
+    try std.testing.expect(pacer.mutex.tryLock());
+    pacer.mutex.unlock();
+    try std.testing.expectError(error.Timeout, pacer.acquire(io, monotonicNowNs() + std.time.ns_per_ms));
+
+    const indexes_json =
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small"}}}
+    ;
+    const expired_deadline = monotonicNowNs();
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(std.testing.allocator, indexes_json, .{
+        .deadline_ns = expired_deadline,
+    });
+    defer managed.deinit();
+    try std.testing.expectEqual(expired_deadline, managed.entries[0].deadline_ns.?);
+    try std.testing.expectError(error.Timeout, embeddingHttpClientConfig(&managed.entries[0]));
+    try std.testing.expectError(
+        error.Timeout,
+        renderQueryTemplateWithEntry(std.testing.allocator, "{{this}}", "query", &managed.entries[0]),
+    );
+
+    managed.entries[0].deadline_ns = monotonicNowNs() + 5 * std.time.ns_per_s;
+    const config = try embeddingHttpClientConfig(&managed.entries[0]);
+    try std.testing.expectEqual(@as(usize, 4 << 20), config.max_response_size);
+    try std.testing.expect(config.timeouts.request_ms > 0);
+    try std.testing.expect(config.timeouts.request_ms <= 5_000);
+
+    const Local = struct {
+        context_calls: usize = 0,
+
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn denseWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, texts: []const []const u8, context: EmbeddingRequestContext) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.check();
+            try std.testing.expect(context.deadline_ns != null);
+            self.context_calls += 1;
+            const vectors = try alloc.alloc([]f32, texts.len);
+            errdefer alloc.free(vectors);
+            var initialized: usize = 0;
+            errdefer for (vectors[0..initialized]) |vector| alloc.free(vector);
+            for (vectors) |*vector| {
+                vector.* = try alloc.dupe(f32, &.{ 1, 2, 3 });
+                initialized += 1;
+            }
+            return vectors;
+        }
+
+        fn sparse(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]db_embedder.SparseEmbedding {
+            return try alloc.alloc(db_embedder.SparseEmbedding, 0);
+        }
+    };
+    var local = Local{};
+    var deadline_aware = try ManagedEmbedder.initFromIndexesJsonWithOptions(std.testing.allocator,
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"}}}
+    , .{
+        .antfly_provider = .{
+            .ptr = &local,
+            .embed_dense_texts = Local.dense,
+            .embed_dense_texts_with_context = Local.denseWithContext,
+            .embed_sparse_texts = Local.sparse,
+        },
+        .deadline_ns = monotonicNowNs() + std.time.ns_per_s,
+    });
+    defer deadline_aware.deinit();
+    const local_vector = try deadline_aware.embedQuery(std.testing.allocator, "semantic_idx", "deadline aware");
+    defer std.testing.allocator.free(local_vector);
+    try std.testing.expectEqual(@as(usize, 1), local.context_calls);
+}
+
+pub fn testEmbeddingProviderResultValidation() !void {
+    const valid_vector = [_]f32{ 0.25, -0.5 };
+    const valid_batch = [_][]const f32{&valid_vector};
+    try validateDenseBatch(&valid_batch, 1, 2);
+    try std.testing.expectError(error.InvalidEmbeddingResponse, validateDenseBatch(&valid_batch, 2, 2));
+    try std.testing.expectError(error.InvalidEmbeddingDimensions, validateDenseBatch(&valid_batch, 1, 3));
+
+    const invalid_vector = [_]f32{ std.math.nan(f32), std.math.inf(f32) };
+    try std.testing.expectError(error.InvalidEmbeddingResponse, validateDenseVector(&invalid_vector, 2));
+
+    var sparse_indices = [_]u32{ 1, 3 };
+    var sparse_values = [_]f32{ 0.5, std.math.inf(f32) };
+    const sparse_batch = [_]db_embedder.SparseEmbedding{.{
+        .indices = &sparse_indices,
+        .values = &sparse_values,
+    }};
+    try std.testing.expectError(error.InvalidEmbeddingResponse, validateSparseBatch(&sparse_batch, 1));
+    try std.testing.expectError(error.InvalidEmbeddingResponse, validateSparseBatch(&sparse_batch, 2));
+    sparse_values[1] = 0.25;
+    sparse_indices[1] = 1;
+    try std.testing.expectError(error.InvalidEmbeddingResponse, validateSparseBatch(&sparse_batch, 1));
 }
 
 pub fn translateEmbeddingsIndexConfigJson(
@@ -1160,6 +1364,8 @@ fn buildManagedEmbeddingEntry(
 
     return .{
         .alloc = alloc,
+        .io = options.io,
+        .deadline_ns = options.deadline_ns,
         .index_name = owned_index_name,
         .embedding_name = owned_embedding_name,
         .provider = provider,
@@ -1442,8 +1648,6 @@ const QueryTemplateRenderContext = struct {
     alloc: std.mem.Allocator,
 };
 
-threadlocal var active_query_template_render_context: ?*QueryTemplateRenderContext = null;
-
 fn renderQueryTemplate(
     alloc: std.mem.Allocator,
     embedding_template: []const u8,
@@ -1452,21 +1656,18 @@ fn renderQueryTemplate(
     const query_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(text, .{})});
     defer alloc.free(query_json);
 
+    var render_ctx = QueryTemplateRenderContext{
+        .alloc = alloc,
+    };
+
     var helper_arena_state = std.heap.ArenaAllocator.init(alloc);
     defer helper_arena_state.deinit();
     const helper_arena = helper_arena_state.allocator();
 
     var extra_helpers: hbs.HelperMap = .{};
-    try extra_helpers.put(helper_arena, "remoteMedia", hbs.Helper.from(&remoteMediaQueryHelper));
-    try extra_helpers.put(helper_arena, "remotePDF", hbs.Helper.from(&remotePdfQueryHelper));
-    try extra_helpers.put(helper_arena, "remoteText", hbs.Helper.from(&remoteTextQueryHelper));
-
-    var render_ctx = QueryTemplateRenderContext{
-        .alloc = alloc,
-    };
-    const prev_ctx = active_query_template_render_context;
-    active_query_template_render_context = &render_ctx;
-    defer active_query_template_render_context = prev_ctx;
+    try extra_helpers.put(helper_arena, "remoteMedia", hbs.Helper.withData(&remoteMediaQueryHelper, @ptrCast(&render_ctx)));
+    try extra_helpers.put(helper_arena, "remotePDF", hbs.Helper.withData(&remotePdfQueryHelper, @ptrCast(&render_ctx)));
+    try extra_helpers.put(helper_arena, "remoteText", hbs.Helper.withData(&remoteTextQueryHelper, @ptrCast(&render_ctx)));
 
     return try template_mod.renderDocumentWithHelpers(alloc, embedding_template, query_json, &extra_helpers);
 }
@@ -1477,6 +1678,7 @@ fn renderQueryTemplateWithEntry(
     text: []const u8,
     entry: *const ManagedEmbeddingEntry,
 ) ![]const u8 {
+    try ensureEntryDeadline(entry);
     if (comptime builtin.is_test) {
         return try renderQueryTemplate(alloc, embedding_template, text);
     }
@@ -1487,6 +1689,15 @@ fn renderQueryTemplateWithEntry(
     }
     if (comptime @hasField(template_remote.RenderConfig, "secret_store")) {
         config.secret_store = entry.secret_store;
+    }
+    if (comptime @hasField(template_remote.RenderConfig, "io")) {
+        config.io = embeddingIo(entry);
+    }
+    if (comptime @hasField(template_remote.RenderConfig, "deadline_ns")) {
+        config.deadline_ns = entry.deadline_ns;
+    }
+    if (comptime @hasField(template_remote.RenderConfig, "max_media_parts")) {
+        if (isAntflyProvider(entry.provider)) config.max_media_parts = 1;
     }
     const query_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(text, .{})});
     defer alloc.free(query_json);
@@ -1518,7 +1729,7 @@ fn remoteMediaQueryHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
         return .{ .safe_string = result };
     }
 
-    const render_ctx = active_query_template_render_context orelse {
+    const render_ctx = queryTemplateRenderContext(ctx) orelse {
         const result = try template_mod.formatErrorDirective(ctx.arena, 0, "remoteMedia missing HTTP context");
         return .{ .safe_string = result };
     };
@@ -1565,7 +1776,7 @@ fn remoteTextQueryHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
     };
     if (url_str.len == 0) return .{ .string = "" };
 
-    const render_ctx = active_query_template_render_context orelse {
+    const render_ctx = queryTemplateRenderContext(ctx) orelse {
         const result = try template_mod.formatErrorDirective(ctx.arena, 0, "remoteText missing HTTP context");
         return .{ .safe_string = result };
     };
@@ -1600,7 +1811,7 @@ fn remotePdfQueryHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
     };
     if (url_str.len == 0) return .{ .safe_string = "" };
 
-    const render_ctx = active_query_template_render_context orelse {
+    const render_ctx = queryTemplateRenderContext(ctx) orelse {
         const result = try template_mod.formatErrorDirective(ctx.arena, 0, "remotePDF missing HTTP context");
         return .{ .safe_string = result };
     };
@@ -1625,6 +1836,11 @@ fn remotePdfQueryHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
 
     const result = try template_mod.formatErrorDirective(ctx.arena, 0, "remotePDF extraction is unsupported");
     return .{ .safe_string = result };
+}
+
+fn queryTemplateRenderContext(ctx: hbs.HelperContext) ?*QueryTemplateRenderContext {
+    const userdata = ctx.userdata orelse return null;
+    return @ptrCast(@alignCast(userdata));
 }
 
 fn flattenContentPartsToText(
@@ -1652,6 +1868,36 @@ fn flattenContentPartsToText(
     return try out.toOwnedSlice(alloc);
 }
 
+fn validateDenseVector(vector: []const f32, dims: u32) !void {
+    if (vector.len == 0) return error.InvalidEmbeddingResponse;
+    if (dims > 0 and vector.len != dims) return error.InvalidEmbeddingDimensions;
+    for (vector) |value| {
+        if (!std.math.isFinite(value)) return error.InvalidEmbeddingResponse;
+    }
+}
+
+fn validateDenseBatch(vectors: []const []const f32, expected_count: usize, dims: u32) !void {
+    if (vectors.len == 0) return error.EmptyEmbeddingResponse;
+    if (vectors.len != expected_count) return error.InvalidEmbeddingResponse;
+    for (vectors) |vector| try validateDenseVector(vector, dims);
+}
+
+fn validateSparseBatch(embeddings: []const db_embedder.SparseEmbedding, expected_count: usize) !void {
+    if (embeddings.len == 0) return error.EmptyEmbeddingResponse;
+    if (embeddings.len != expected_count) return error.InvalidEmbeddingResponse;
+    for (embeddings) |embedding| {
+        if (embedding.indices.len != embedding.values.len) return error.InvalidEmbeddingResponse;
+        for (embedding.indices, embedding.values, 0..) |index, value, i| {
+            if (i > 0 and embedding.indices[i - 1] >= index) return error.InvalidEmbeddingResponse;
+            if (!std.math.isFinite(value)) return error.InvalidEmbeddingResponse;
+        }
+    }
+}
+
+fn normalizeLocalEmbeddingError(err: anyerror) anyerror {
+    return if (err == error.QueueFull) error.EmbedTransientFailure else err;
+}
+
 fn embedWithEntryParts(
     alloc: std.mem.Allocator,
     entry: *const ManagedEmbeddingEntry,
@@ -1659,11 +1905,8 @@ fn embedWithEntryParts(
     dims: u32,
 ) ![]f32 {
     if (entry.provider == .bedrock and (entry.multimodal or partsContainMedia(parts))) {
-        waitForEntryPacer(entry);
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        defer io_impl.deinit();
-
-        var http = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+        try waitForEntryPacer(entry);
+        var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
         defer http.deinit();
 
         var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, &http, .{
@@ -1678,7 +1921,8 @@ fn embedWithEntryParts(
         var result = try provider.embedParts(alloc, entry.model, parts);
         defer result.deinit();
         if (result.vectors.len == 0) return error.EmptyEmbeddingResponse;
-        if (dims > 0 and result.vectors[0].len != dims) return error.InvalidEmbeddingDimensions;
+        if (result.vectors.len != 1) return error.InvalidEmbeddingResponse;
+        try validateDenseVector(result.vectors[0], dims);
         return try alloc.dupe(f32, result.vectors[0]);
     }
 
@@ -1687,20 +1931,24 @@ fn embedWithEntryParts(
         const selected_parts = [_]template_mod.ContentPart{selected};
         if (entry.antfly_provider) |local| {
             if (local.embed_dense_parts) |embed_parts| {
-                waitForEntryPacer(entry);
-                const vectors = try embed_parts(local.ptr, alloc, entry.model, &selected_parts);
+                try waitForEntryPacer(entry);
+                const context = embeddingRequestContext(entry);
+                try context.check();
+                const vectors = if (local.embed_dense_parts_with_context) |embed_parts_with_context|
+                    embed_parts_with_context(local.ptr, alloc, entry.model, &selected_parts, context) catch |err| return normalizeLocalEmbeddingError(err)
+                else
+                    embed_parts(local.ptr, alloc, entry.model, &selected_parts) catch |err| return normalizeLocalEmbeddingError(err);
                 defer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
-                try validateSingleAntflyDensePartVector(vectors.len);
-                if (dims > 0 and vectors[0].len != dims) return error.InvalidEmbeddingDimensions;
+                try context.check();
+                if (vectors.len == 0) return error.EmptyEmbeddingResponse;
+                if (vectors.len != 1) return error.InvalidEmbeddingResponse;
+                try validateDenseVector(vectors[0], dims);
                 return try alloc.dupe(f32, vectors[0]);
             }
             return error.UnsupportedEmbeddingProvider;
         }
-        waitForEntryPacer(entry);
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        defer io_impl.deinit();
-
-        var http = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+        try waitForEntryPacer(entry);
+        var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
         defer http.deinit();
 
         var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
@@ -1717,8 +1965,9 @@ fn embedWithEntryParts(
             else => return err,
         };
         defer result.deinit();
-        try validateSingleAntflyDensePartVector(result.vectors.len);
-        if (dims > 0 and result.vectors[0].len != dims) return error.InvalidEmbeddingDimensions;
+        if (result.vectors.len == 0) return error.EmptyEmbeddingResponse;
+        if (result.vectors.len != 1) return error.InvalidEmbeddingResponse;
+        try validateDenseVector(result.vectors[0], dims);
         return try alloc.dupe(f32, result.vectors[0]);
     }
 
@@ -1752,16 +2001,14 @@ fn embedSparseBatchWithEntry(
     switch (entry.provider) {
         .antfly => {
             if (entry.antfly_provider) |local| {
-                waitForEntryPacer(entry);
-                const embeddings = try local.embed_sparse_texts(local.ptr, alloc, entry.model, texts);
-                if (embeddings.len == 0) return error.EmptyEmbeddingResponse;
+                try waitForEntryPacer(entry);
+                const embeddings = local.embed_sparse_texts(local.ptr, alloc, entry.model, texts) catch |err| return normalizeLocalEmbeddingError(err);
+                errdefer db_embedder.freeSparseEmbeddingBatch(alloc, embeddings);
+                try validateSparseBatch(embeddings, texts.len);
                 return embeddings;
             }
-            waitForEntryPacer(entry);
-            var io_impl = std.Io.Threaded.init(alloc, .{});
-            defer io_impl.deinit();
-
-            var http = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+            try waitForEntryPacer(entry);
+            var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
             defer http.deinit();
 
             var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
@@ -1776,6 +2023,7 @@ fn embedSparseBatchWithEntry(
             var result = try provider.embedSparse(alloc, entry.model, texts);
             defer result.deinit();
             if (result.indices.len == 0) return error.EmptyEmbeddingResponse;
+            if (result.indices.len != texts.len or result.values.len != texts.len) return error.InvalidEmbeddingResponse;
 
             const embeddings = try alloc.alloc(db_embedder.SparseEmbedding, result.indices.len);
             var initialized: usize = 0;
@@ -1785,6 +2033,10 @@ fn embedSparseBatchWithEntry(
             }
 
             for (result.indices, result.values, 0..) |src_indices, src_values, i| {
+                if (src_indices.len != src_values.len) return error.InvalidEmbeddingResponse;
+                for (src_values) |value| {
+                    if (!std.math.isFinite(value)) return error.InvalidEmbeddingResponse;
+                }
                 const indices = try alloc.alloc(u32, src_indices.len);
                 errdefer alloc.free(indices);
                 for (src_indices, 0..) |value, j| {
@@ -1797,6 +2049,7 @@ fn embedSparseBatchWithEntry(
                 };
                 initialized += 1;
             }
+            try validateSparseBatch(embeddings, texts.len);
             return embeddings;
         },
         .openai, .ollama, .bedrock => return error.UnsupportedEmbeddingProvider,
@@ -1811,11 +2064,6 @@ fn partsContainMedia(parts: []const template_mod.ContentPart) bool {
         }
     }
     return false;
-}
-
-fn validateSingleAntflyDensePartVector(count: usize) !void {
-    if (count == 0) return error.EmptyEmbeddingResponse;
-    if (count != 1) return error.InvalidEmbeddingResponse;
 }
 
 fn selectAntflyEmbedPart(parts: []const template_mod.ContentPart) ?template_mod.ContentPart {
@@ -1968,20 +2216,23 @@ fn embedBatchWithEntry(
         },
         .antfly => {
             if (entry.antfly_provider) |local| {
-                waitForEntryPacer(entry);
-                const vectors = try local.embed_dense_texts(local.ptr, alloc, entry.model, texts);
+                try waitForEntryPacer(entry);
+                const context = embeddingRequestContext(entry);
+                try context.check();
+                const vectors = if (local.embed_dense_texts_with_context) |embed_with_context|
+                    embed_with_context(local.ptr, alloc, entry.model, texts, context) catch |err| return normalizeLocalEmbeddingError(err)
+                else
+                    local.embed_dense_texts(local.ptr, alloc, entry.model, texts) catch |err| return normalizeLocalEmbeddingError(err);
                 errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
-                if (vectors.len == 0) return error.EmptyEmbeddingResponse;
-                for (vectors) |vector| {
-                    if (dims > 0 and vector.len != dims) return error.InvalidEmbeddingDimensions;
-                }
+                context.check() catch |err| {
+                    db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
+                    return err;
+                };
+                try validateDenseBatch(vectors, texts.len, dims);
                 return vectors;
             }
-            waitForEntryPacer(entry);
-            var io_impl = std.Io.Threaded.init(alloc, .{});
-            defer io_impl.deinit();
-
-            var http = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+            try waitForEntryPacer(entry);
+            var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
             defer http.deinit();
 
             var provider = antfly_provider_mod.Provider.init(alloc, &http, entry.base_url);
@@ -1995,10 +2246,7 @@ fn embedBatchWithEntry(
 
             var result = try provider.embedder().embed(alloc, entry.model, texts);
             errdefer result.deinit();
-            if (result.vectors.len == 0) return error.EmptyEmbeddingResponse;
-            for (result.vectors) |vector| {
-                if (dims > 0 and vector.len != dims) return error.InvalidEmbeddingDimensions;
-            }
+            try validateDenseBatch(result.vectors, texts.len, dims);
             return try adoptDenseBatchResult(alloc, &result);
         },
     }
@@ -2017,25 +2265,10 @@ fn embedBatchWithBedrock(
         out.deinit(alloc);
     }
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-
-    var http = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
-    defer http.deinit();
-
-    var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, &http, .{
-        .region = entry.region,
-        .endpoint = entry.base_url,
-        .input_type = entry.input_type,
-        .truncate = entry.truncate,
-        .dimension = dims,
-    }, &@constCast(entry).bedrock_credentials);
-    defer provider.deinit();
-
     var offset: usize = 0;
     while (offset < texts.len) {
         const end = @min(texts.len, offset + max_batch);
-        const vectors = try embedBatchWithBedrockRequest(alloc, entry, &provider, texts[offset..end], dims);
+        const vectors = try embedBatchWithBedrockRequest(alloc, entry, texts[offset..end], dims);
         errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
         try out.ensureUnusedCapacity(alloc, vectors.len);
         for (vectors) |vector| out.appendAssumeCapacity(vector);
@@ -2048,17 +2281,23 @@ fn embedBatchWithBedrock(
 fn embedBatchWithBedrockRequest(
     alloc: std.mem.Allocator,
     entry: *const ManagedEmbeddingEntry,
-    provider: *bedrock_provider.Provider,
     texts: []const []const u8,
     dims: u32,
 ) ![]const []const f32 {
-    waitForEntryPacer(entry);
+    try waitForEntryPacer(entry);
+    var http = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
+    defer http.deinit();
+    var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, &http, .{
+        .region = entry.region,
+        .endpoint = entry.base_url,
+        .input_type = entry.input_type,
+        .truncate = entry.truncate,
+        .dimension = dims,
+    }, &@constCast(entry).bedrock_credentials);
+    defer provider.deinit();
     var result = try provider.embedText(alloc, entry.model, texts);
     errdefer result.deinit();
-    if (result.vectors.len == 0) return error.EmptyEmbeddingResponse;
-    for (result.vectors) |vector| {
-        if (dims > 0 and vector.len != dims) return error.InvalidEmbeddingDimensions;
-    }
+    try validateDenseBatch(result.vectors, texts.len, dims);
     return try adoptDenseBatchResult(alloc, &result);
 }
 
@@ -2101,23 +2340,12 @@ fn embedBatchWithOpenAiCompatible(
         },
     };
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-
-    var client = std.http.Client{
-        .allocator = alloc,
-        .io = io_impl.io(),
-    };
-    defer client.deinit();
-
     var input_array = std.json.Array.init(alloc);
     defer input_array.deinit();
     for (texts) |text| try input_array.append(.{ .string = text });
 
     const url = try std.fmt.allocPrint(alloc, "{s}/embeddings", .{entry.base_url});
     defer alloc.free(url);
-    const uri = std.Uri.parse(url) catch |err| return err;
-
     const json_body = try httpx.json.Json.stringify(alloc, Request{
         .model = .{ .string = entry.model },
         .input = .{ .array = input_array },
@@ -2131,38 +2359,31 @@ fn embedBatchWithOpenAiCompatible(
         null;
     defer if (auth_header) |value| alloc.free(value);
 
-    var headers_buf: [2]std.http.Header = undefined;
-    headers_buf[0] = .{ .name = "content-type", .value = "application/json" };
+    var headers_buf: [2][2][]const u8 = undefined;
+    headers_buf[0] = .{ "content-type", "application/json" };
     const header_count: usize = if (auth_header != null) 2 else 1;
     if (auth_header) |value| {
-        headers_buf[1] = .{ .name = "authorization", .value = value };
+        headers_buf[1] = .{ "authorization", value };
     }
 
-    const serial_pacer = beginEntryPacedRequest(entry);
-    defer endEntryPacedRequest(serial_pacer);
+    try waitForEntryPacer(entry);
 
-    var request = std.http.Client.request(&client, .POST, uri, .{
-        .extra_headers = headers_buf[0..header_count],
-    }) catch |err| return err;
-    defer request.deinit();
+    var client = httpx.Client.initWithConfig(alloc, embeddingIo(entry), try embeddingHttpClientConfig(entry));
+    defer client.deinit();
 
-    request.transfer_encoding = .{ .content_length = json_body.len };
-    var body_writer = try request.sendBodyUnflushed(&.{});
-    try body_writer.writer.writeAll(json_body);
-    try body_writer.end();
-    try request.connection.?.flush();
-
-    var response = request.receiveHead(&.{}) catch |err| return err;
-    if (response.head.status.class() != .success) return mapEmbedStatus(response.head.status);
-
-    var transfer_buffer: [512]u8 = undefined;
-    const response_body = response.reader(&transfer_buffer).allocRemaining(alloc, .limited(4 << 20)) catch |err| return err;
-    defer alloc.free(response_body);
+    var response = try client.post(url, .{
+        .json = json_body,
+        .headers = headers_buf[0..header_count],
+    });
+    defer response.deinit();
+    if (!response.ok()) return mapEmbedStatus(response.status.code);
+    const response_body = response.body orelse return error.EmptyEmbeddingResponse;
 
     var parsed = std.json.parseFromSlice(Response, alloc, response_body, .{ .ignore_unknown_fields = true }) catch |err| return err;
     defer parsed.deinit();
 
     if (parsed.value.data.len == 0) return error.EmptyEmbeddingResponse;
+    if (parsed.value.data.len != texts.len) return error.InvalidEmbeddingResponse;
 
     const vectors = try alloc.alloc([]const f32, parsed.value.data.len);
     var initialized: usize = 0;
@@ -2171,7 +2392,7 @@ fn embedBatchWithOpenAiCompatible(
         alloc.free(vectors);
     }
     for (parsed.value.data, 0..) |item, i| {
-        if (dims > 0 and item.embedding.len != dims) return error.InvalidEmbeddingDimensions;
+        try validateDenseVector(item.embedding, dims);
         vectors[i] = try alloc.dupe(f32, item.embedding);
         initialized += 1;
     }
@@ -2192,15 +2413,15 @@ fn optionalBearerAuthHeaderOwned(
     };
 }
 
-fn mapEmbedStatus(status: std.http.Status) anyerror {
+fn mapEmbedStatus(status: u16) anyerror {
     return switch (status) {
-        .too_many_requests => error.EmbedRateLimited,
-        .request_timeout,
-        .bad_gateway,
-        .service_unavailable,
-        .gateway_timeout,
+        429 => error.EmbedRateLimited,
+        408,
+        502,
+        503,
+        504,
         => error.EmbedTransientFailure,
-        else => if (status.class() == .server_error) error.EmbedTransientFailure else error.EmbedRequestFailed,
+        else => if (status >= 500 and status < 600) error.EmbedTransientFailure else error.EmbedRequestFailed,
     };
 }
 
@@ -2357,6 +2578,48 @@ test "managed embedder parses local antfly and antfly entries from indexes metad
     try std.testing.expectEqualStrings("", managed.entries[0].base_url);
     try std.testing.expectEqual(ProviderKind.antfly, managed.entries[1].provider);
     try std.testing.expectEqualStrings("", managed.entries[1].base_url);
+}
+
+pub fn testQueryEmbeddingCacheKeys() !void {
+    var local = TestLocalDenseProvider{ .dimensions = 3 };
+    const test_io = std.Io.Threaded.global_single_threaded.io();
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(std.testing.allocator,
+        \\{
+        \\  "first":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}},
+        \\  "second":{"type":"embeddings","field":"title","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+        \\}
+    , .{ .antfly_provider = local.provider(), .io = test_io });
+    defer managed.deinit();
+
+    try std.testing.expect(managed.entries[0].io.?.userdata == test_io.userdata);
+    try std.testing.expect(managed.entries[0].io.?.vtable == test_io.vtable);
+
+    const first = try managed.queryCacheKey("first", .principal, "alice", "exact input");
+    const equivalent = try managed.queryCacheKey("second", .principal, "alice", "exact input");
+    const other_principal = try managed.queryCacheKey("second", .principal, "bob", "exact input");
+    const anonymous = try managed.queryCacheKey("second", .anonymous, "alice", "exact input");
+    const changed_text = try managed.queryCacheKey("second", .principal, "alice", "exact input ");
+
+    var first_credentials = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+        \\{"dense":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","api_key":"credential-a"}}}
+    );
+    defer first_credentials.deinit();
+    var second_credentials = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+        \\{"dense":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","api_key":"credential-b"}}}
+    );
+    defer second_credentials.deinit();
+    const credential_a = try first_credentials.queryCacheKey("dense", .principal, "alice", "exact input");
+    const credential_b = try second_credentials.queryCacheKey("dense", .principal, "alice", "exact input");
+
+    try std.testing.expectEqual(first, equivalent);
+    try std.testing.expect(!std.mem.eql(u8, &first, &other_principal));
+    try std.testing.expect(!std.mem.eql(u8, &first, &anonymous));
+    try std.testing.expect(!std.mem.eql(u8, &first, &changed_text));
+    try std.testing.expect(!std.mem.eql(u8, &credential_a, &credential_b));
+}
+
+test "query embedding cache keys share equivalent indexes and isolate security domains" {
+    try testQueryEmbeddingCacheKeys();
 }
 
 test "managed embedder rejects legacy antfly api path" {
@@ -2740,8 +3003,12 @@ pub fn testFileBackedApiKeyRotation() !void {
     , .{base_uri});
     defer alloc.free(indexes_json);
 
-    var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes_json, .{ .secret_store = &secret_store });
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes_json, .{
+        .secret_store = &secret_store,
+        .deadline_ns = monotonicNowNs() + 30 * std.time.ns_per_s,
+    });
     defer managed.deinit();
+    const first_cache_key = try managed.queryCacheKey("semantic_idx", .principal, "alice", "same query");
 
     const first = try managed.embedQuery(alloc, "semantic_idx", "alpha concept");
     defer alloc.free(first);
@@ -2751,6 +3018,10 @@ pub fn testFileBackedApiKeyRotation() !void {
         .sub_path = store_path,
         .data = "{\"secrets\":[{\"key\":\"openai.api_key\",\"value\":\"second-key-longer\",\"created_at_ns\":1,\"updated_at_ns\":2}]}",
     });
+
+    _ = try secret_store.refreshIfChanged();
+    const rotated_cache_key = try managed.queryCacheKey("semantic_idx", .principal, "alice", "same query");
+    try std.testing.expect(!std.mem.eql(u8, &first_cache_key, &rotated_cache_key));
 
     const second = try managed.embedQuery(alloc, "semantic_idx", "beta concept");
     defer alloc.free(second);
@@ -3202,6 +3473,78 @@ test "managed embedder routes antfly model to local provider" {
     try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.5, 0.75 }, vector);
 }
 
+pub fn testLocalAdmissionOverloadNormalization() !void {
+    const Local = struct {
+        failure: anyerror = error.QueueFull,
+
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn denseWithContext(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const []const u8,
+            _: EmbeddingRequestContext,
+        ) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+
+        fn sparse(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+
+        fn parts(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const template_mod.ContentPart) anyerror![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn partsWithContext(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const template_mod.ContentPart,
+            _: EmbeddingRequestContext,
+        ) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+    };
+
+    var local = Local{};
+    const provider = AntflyProvider{
+        .ptr = &local,
+        .embed_dense_texts = Local.dense,
+        .embed_dense_texts_with_context = Local.denseWithContext,
+        .embed_sparse_texts = Local.sparse,
+        .embed_dense_parts = Local.parts,
+        .embed_dense_parts_with_context = Local.partsWithContext,
+    };
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
+        \\{
+        \\  "dense_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"local-model"}},
+        \\  "sparse_idx":{"type":"embeddings","field":"body","sparse":true,"embedder":{"provider":"antfly","model":"local-model"}},
+        \\  "multimodal_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"local-model","multimodal":true}}
+        \\}
+    , provider);
+    defer managed.deinit();
+
+    const media_parts = [_]template_mod.ContentPart{.{ .media_url = "data:image/png;base64,aaa" }};
+    const sparse_entry = managed.findEntry("sparse_idx").?;
+    const multimodal_entry = managed.findEntry("multimodal_idx").?;
+
+    try std.testing.expectError(error.EmbedTransientFailure, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
+    try std.testing.expectError(error.EmbedTransientFailure, embedSparseWithEntry(std.testing.allocator, sparse_entry, "query"));
+    try std.testing.expectError(error.EmbedTransientFailure, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
+
+    local.failure = error.TestUnexpectedResult;
+    try std.testing.expectError(error.TestUnexpectedResult, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
+    try std.testing.expectError(error.TestUnexpectedResult, embedSparseWithEntry(std.testing.allocator, sparse_entry, "query"));
+    try std.testing.expectError(error.TestUnexpectedResult, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
+}
+
 test "managed embedder routes antfly without api_url to local provider" {
     const Local = struct {
         calls: usize = 0,
@@ -3428,6 +3771,15 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
     ;
     var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator, indexes_json, provider);
     defer managed.deinit();
+    const dense_interface = managed.denseInterface();
+    try std.testing.expectEqual(@as(?usize, 1), dense_interface.mediaPartLimit("semantic_idx"));
+    try std.testing.expectEqual(@as(?usize, null), dense_interface.mediaPartLimit("missing"));
+
+    var bedrock_managed = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+        \\{"bedrock_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"bedrock","model":"amazon.titan-embed-image-v1","region":"us-east-1","multimodal":true}}}
+    );
+    defer bedrock_managed.deinit();
+    try std.testing.expectEqual(@as(?usize, null), bedrock_managed.denseInterface().mediaPartLimit("bedrock_idx"));
 
     const parts = [_]template_mod.ContentPart{
         .{ .text = "caption" },

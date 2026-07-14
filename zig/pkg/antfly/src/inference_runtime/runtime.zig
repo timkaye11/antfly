@@ -69,6 +69,7 @@ const EmbeddedServerConfig = struct {
     s3_credentials: ?common_config.Config.S3CredentialsConfig = null,
     generation_budget_overrides: ServerBudgetOverrides = .{},
     preload: []const inference.server.WarmModel = &.{},
+    allow_insecure_public_bind: bool = false,
 };
 
 const BudgetOverridesMb = struct {
@@ -207,6 +208,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var models_dir: []const u8 = defaultModelsDir(alloc);
     var ml_dir: []const u8 = defaultMlDir(alloc);
     var budget_overrides_mb = BudgetOverridesMb{};
+    var allow_insecure_public_bind = false;
     var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
     defer preload_models.deinit(alloc);
 
@@ -231,6 +233,8 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
             budget_overrides_mb.scratch_budget_mb = try parseBudgetMbArg(args);
         } else if (std.mem.eql(u8, arg, "--preload-model")) {
             try preload_models.append(alloc, try parsePreloadModelFlag(args.next() orelse return error.InvalidArguments));
+        } else if (std.mem.eql(u8, arg, "--allow-insecure-public-bind")) {
+            allow_insecure_public_bind = true;
         }
     }
 
@@ -243,6 +247,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         .ml_dir = ml_dir,
         .generation_budget_overrides = budgetOverridesFromMb(budget_overrides_mb),
         .preload = preload_models.items,
+        .allow_insecure_public_bind = allow_insecure_public_bind,
     });
     defer node.deinit();
 
@@ -265,6 +270,7 @@ pub fn spawnServerProcess(
         .ml_dir = config.ml_dir orelse defaultMlDir(alloc),
         .generation_budget_overrides = config.generation_budget_overrides,
         .preload = config.preload,
+        .allow_insecure_public_bind = config.allow_insecure_public_bind,
     };
     if (config.content_security) |sec| node_cfg.content_security = sec;
     if (config.s3_credentials) |creds| node_cfg.s3_credentials = creds;
@@ -452,6 +458,7 @@ fn printUsage() void {
         \\
         \\Run options:
         \\  --host <addr>    Listen address (default: 127.0.0.1)
+        \\  --allow-insecure-public-bind Allow a non-loopback listener without built-in auth or TLS
         \\  --port <port>    Listen port (default: 8090)
         \\  --models-dir <dir> AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>     Traditional ML directory (default: ~/.antfly/inference/ml)

@@ -47,6 +47,14 @@ const RunConfig = struct {
         quantization: ?[]const u8 = null,
     };
 
+    const PromptCacheConfig = struct {
+        enabled: bool = false,
+        mode: inference.runtime.kv.prompt_cache.Mode = .block_hash,
+        max_bytes_mb: usize = 512,
+        min_tokens: usize = 64,
+        ttl_ms: u64 = 300_000,
+    };
+
     models_dir: ?[]const u8 = null,
     ml_dir: ?[]const u8 = null,
     content_security: ?inference.scraping.ContentSecurityConfig = null,
@@ -57,16 +65,32 @@ const RunConfig = struct {
     max_concurrent_requests: ?usize = null,
     pool_size: ?usize = null,
     generation_batching: ?inference.server.GenerationBatchingConfig = null,
+    prompt_cache: ?PromptCacheConfig = null,
 };
 
 fn loadRunConfig(allocator: std.mem.Allocator, path: []const u8) !RunConfig {
     const raw = try inference.util.c_file.readFileMax(allocator, path, std.math.maxInt(usize));
     defer allocator.free(raw);
+    const parsed = try parseRunConfig(allocator, raw);
+    return parsed.value;
+}
+
+fn parseRunConfig(allocator: std.mem.Allocator, raw: []const u8) !std.json.Parsed(RunConfig) {
     const parsed = try std.json.parseFromSlice(RunConfig, allocator, raw, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
-    return parsed.value;
+    errdefer parsed.deinit();
+    if (parsed.value.prompt_cache) |value| {
+        try (inference.server.PromptCacheConfig{
+            .enabled = value.enabled,
+            .mode = value.mode,
+            .max_bytes_mb = value.max_bytes_mb,
+            .min_tokens = value.min_tokens,
+            .ttl_ms = value.ttl_ms,
+        }).validate();
+    }
+    return parsed;
 }
 
 fn parseBackendType(value: []const u8) ?inference.backends.BackendType {
@@ -236,6 +260,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var ml_dir: []const u8 = defaultMlDir(allocator);
     var config_path: ?[]const u8 = null;
     var max_concurrent_requests_override: ?usize = null;
+    var allow_insecure_public_bind = false;
     var models_overridden = false;
     var ml_overridden = false;
     var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
@@ -266,6 +291,8 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         } else if (std.mem.eql(u8, args[i], "--preload-model") and i + 1 < args.len) {
             try preload_models.append(allocator, try parsePreloadModelFlag(args[i + 1]));
             i += 1;
+        } else if (std.mem.eql(u8, args[i], "--allow-insecure-public-bind")) {
+            allow_insecure_public_bind = true;
         }
     }
 
@@ -301,6 +328,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .preload = preload_models.items,
+        .allow_insecure_public_bind = allow_insecure_public_bind,
     };
     if (loaded_cfg) |cfg| {
         node_cfg.content_security = cfg.content_security;
@@ -314,11 +342,19 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         if (cfg.max_concurrent_requests) |value| node_cfg.max_concurrent_requests = value;
         if (cfg.pool_size) |value| node_cfg.pool_size = value;
         if (cfg.generation_batching) |value| node_cfg.generation_batching = value;
+        if (cfg.prompt_cache) |value| node_cfg.prompt_cache = .{
+            .enabled = value.enabled,
+            .mode = value.mode,
+            .max_bytes_mb = value.max_bytes_mb,
+            .min_tokens = value.min_tokens,
+            .ttl_ms = value.ttl_ms,
+        };
     }
     if (max_concurrent_requests_override) |value| node_cfg.max_concurrent_requests = value;
 
     var node = try inference.server.Node.init(allocator, node_cfg);
     defer node.deinit();
+    node.attachIo(io);
 
     try node.warmConfiguredModels(allocator);
     print("listening on {s}:{d}\n", .{ host, port });
@@ -462,6 +498,7 @@ fn printUsage(usage_name: []const u8) void {
         \\
         \\Run options:
         \\  --host <addr>     Listen address (default: 127.0.0.1)
+        \\  --allow-insecure-public-bind Allow a non-loopback listener without built-in auth or TLS
         \\  --port <port>     Listen port (default: 8090)
         \\  --models-dir <dir>    AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>        Traditional ML directory (default: ~/.antfly/inference/ml)
@@ -505,13 +542,11 @@ test "run config parses shared scraping fields and ignores api_url" {
         \\    "max_step_items": 8,
         \\    "max_step_query_tokens": 256,
         \\    "max_decode_wait_us": 750
-        \\  }
+        \\  },
+        \\  "prompt_cache": { "enabled": true, "mode": "block_hash", "max_bytes_mb": 64, "min_tokens": 32, "ttl_ms": 1000 }
         \\}
     ;
-    const parsed = try std.json.parseFromSlice(RunConfig, std.testing.allocator, raw, .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
-    });
+    const parsed = try parseRunConfig(std.testing.allocator, raw);
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("/tmp/models", parsed.value.models_dir.?);
@@ -530,6 +565,30 @@ test "run config parses shared scraping fields and ignores api_url" {
     try std.testing.expectEqual(@as(usize, 8), parsed.value.generation_batching.?.max_step_items);
     try std.testing.expectEqual(@as(usize, 256), parsed.value.generation_batching.?.max_step_query_tokens);
     try std.testing.expectEqual(@as(u32, 750), parsed.value.generation_batching.?.max_decode_wait_us);
+    try std.testing.expectEqual(true, parsed.value.prompt_cache.?.enabled);
+    try std.testing.expectEqual(inference.runtime.kv.prompt_cache.Mode.block_hash, parsed.value.prompt_cache.?.mode);
+    try std.testing.expectEqual(@as(usize, 64), parsed.value.prompt_cache.?.max_bytes_mb);
+    try std.testing.expectEqual(@as(usize, 32), parsed.value.prompt_cache.?.min_tokens);
+    try std.testing.expectEqual(@as(u64, 1000), parsed.value.prompt_cache.?.ttl_ms);
+}
+
+test "run config rejects unrepresentable prompt cache values" {
+    const allocator = std.testing.allocator;
+    const bytes_overflow = try std.fmt.allocPrint(
+        allocator,
+        "{{\"prompt_cache\":{{\"max_bytes_mb\":{d}}}}}",
+        .{inference.runtime.kv.prompt_cache.max_config_bytes_mb + 1},
+    );
+    defer allocator.free(bytes_overflow);
+    try std.testing.expectError(error.InvalidPromptCacheConfig, parseRunConfig(allocator, bytes_overflow));
+
+    const ttl_overflow = try std.fmt.allocPrint(
+        allocator,
+        "{{\"prompt_cache\":{{\"ttl_ms\":{d}}}}}",
+        .{inference.runtime.kv.prompt_cache.max_config_ttl_ms + 1},
+    );
+    defer allocator.free(ttl_overflow);
+    try std.testing.expectError(error.InvalidPromptCacheConfig, parseRunConfig(allocator, ttl_overflow));
 }
 
 test "run max concurrent request parser accepts zero as unlimited" {

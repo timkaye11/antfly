@@ -1377,7 +1377,7 @@ tags:
          - Allowed host whitelist
          - Private IP blocking (prevents SSRF attacks)
          - Download size limits (default: 100MB)
-         - Download timeouts are not currently enforced; configure them at the proxy or egress layer
+         - HTTP downloads time out after 30 seconds by default; zero disables the deadline
          - Image dimension limits (default: 2048px, auto-resized)
 
          See: https://antfly.io/docs/configuration#security--cors
@@ -12024,6 +12024,7 @@ components:
             boost: 1.0
         semantic_search:
           type: string
+          x-antfly-max-utf8-bytes: 1048576
           description: >
             Natural language query for vector similarity search. Results are ranked by semantic similarity
 
@@ -12032,14 +12033,20 @@ components:
 
             The semantic_search string is automatically embedded using the configured embedding model
 
-            for the specified indexes. Use `embedding_template` for multimodal queries.
+            for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for
+
+            multimodal queries.
           example: artificial intelligence and machine learning applications
         embedding_template:
           type: string
+          x-antfly-max-utf8-bytes: 65536
           description: >
             Optional Handlebars template for multimodal embedding of the semantic_search query.
 
             The template has access to `this` which contains the semantic_search string value.
+
+
+            UTF-8 template input is limited to 64 KiB.
 
 
             Use this when you want to embed multimodal content (images, PDFs, etc.) instead of
@@ -12261,7 +12268,9 @@ components:
 
             sorting, and response post-processing. If the deadline expires before the query
 
-            completes, the HTTP API returns 504.
+            completes, the HTTP API returns 504. When omitted, semantic query embedding planning
+
+            and provider I/O use a 30-second default deadline.
           example: 5000
         order_by:
           type: array
@@ -14257,8 +14266,10 @@ components:
       enum:
         - table
         - user
+        - inference
         - '*'
-      description: Type of the resource, e.g., table, user, or global ('*').
+      description: 'Type of resource: table, user, inference, or global (''*''). Use inference with resource
+        ''*'' to grant access to unified inference routes.'
       example: table
     PermissionType:
       type: string
@@ -14273,7 +14284,8 @@ components:
       properties:
         resource:
           type: string
-          description: Resource name (e.g., table name, target username, or '*' for global).
+          description: Resource name (e.g., table name, target username, or '*' for all inference operations
+            or a global grant).
           example: orders_table
         resource_type:
           $ref: '#/components/schemas/ResourceType'
@@ -14976,7 +14988,7 @@ components:
            - Allowed host whitelist
            - Private IP blocking (prevents SSRF attacks)
            - Download size limits (default: 100MB)
-           - Download timeouts are not currently enforced; configure them at the proxy or egress layer
+           - HTTP downloads time out after 30 seconds by default; zero disables the deadline
            - Image dimension limits (default: 2048px, auto-resized)
 
            See: https://antfly.io/docs/configuration#security--cors
@@ -20611,6 +20623,19 @@ components:
             The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`;
 
             device-backed compaction is not yet supported.
+        prompt_cache_key:
+          type: string
+          maxLength: 256
+          description: >
+            inference-native prompt prefix cache namespace key. Requests with the same key can
+
+            reuse matching prompt-prefix KV on the same node. Required to enable prompt caching;
+
+            requests without a key are never cached.
+        prompt_cache:
+          type: boolean
+          description: >
+            inference-native prompt prefix cache control. False bypasses prompt cache for this request.
         backend:
           $ref: '#/components/schemas/InferenceModelBackend'
         mode:
@@ -20860,6 +20885,9 @@ components:
         total_tokens:
           type: integer
           description: Total tokens used (prompt + completion)
+        cached_prompt_tokens:
+          type: integer
+          description: Prompt tokens served from inference-native prefix KV cache
     InferenceGenerateChunk:
       type: object
       description: Streaming generation chunk (SSE event data)
@@ -21050,6 +21078,57 @@ components:
           $ref: '#/components/schemas/InferenceModelFormat'
         quantization:
           $ref: '#/components/schemas/InferenceModelQuantization'
+    InferencePromptCacheConfig:
+      type: object
+      description: Native generator prompt KV cache configuration.
+      properties:
+        enabled:
+          type: boolean
+          description: Enable inference-native prompt KV cache reuse for generator requests.
+          default: false
+        mode:
+          type: string
+          description: >
+            Prompt KV cache implementation. `block_hash` (default) uses hash-addressed
+
+            full KV blocks under prompt_cache_key with O(1) block lookup and is the
+
+            scalable production mode. `simple` keeps the linear-scan retained-prefix
+
+            cache and is only suitable for small caches or debugging.
+          enum:
+            - simple
+            - block_hash
+          default: block_hash
+        max_bytes_mb:
+          type: integer
+          minimum: 0
+          maximum: 17592186044415
+          description: >
+            Node-wide target for live entries in the single process-stable model cache.
+
+            The first model to activate prompt caching owns it for the process lifetime;
+
+            requests to other models bypass prompt caching. The owner evicts using
+
+            estimated metadata and logical host/device KV bytes. Backend allocators may
+
+            retain reusable capacity, so this is not a hard process or accelerator cap.
+          default: 512
+        min_tokens:
+          type: integer
+          minimum: 0
+          description: Minimum prompt length eligible for prompt KV caching.
+          default: 64
+        ttl_ms:
+          type: integer
+          minimum: 0
+          maximum: 9223372036854775807
+          description: >
+            Idle time-to-live for prompt KV cache entries. Refreshed on every cache
+
+            hit, so only entries left unused for this duration expire.
+          default: 300000
     InferenceConfig:
       type: object
       required:
@@ -21098,19 +21177,18 @@ components:
             Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts
             and allowed_paths remain explicit deny-all lists even when another field is configured. Enable
             remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled,
-            HTTP(S) allowlist entries must be canonical globally routable IP literals and DNS hostnames
-            are rejected. Setting it to false explicitly enables allowlisted hostnames but disables this
-            address-safety gate until DNS pinning is available. Across generate, dense embed, and multimodal
-            rerank, downloaded and inline encoded media is capped cumulatively per request at the lower
-            of 100 MiB, max_download_size_bytes, and—when max_concurrent_requests is positive—16 MiB times
-            that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential
-            is reserved before fetch, while inline sources use their actual encoded size. Accepted image
-            inputs also undergo header-only dimension and aggregate decoded-pixel admission before model
-            execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription
-            and extraction use the configured encoded-media per-call ceiling, and direct dense embedding
-            also applies pre-allocation and decoded-image admission. In unified Antfly configuration,
-            an empty inference policy may first inherit a nonempty remote_content security policy, which
-            is then merged over this baseline.
+            IP literals and every address resolved from an allowlisted DNS hostname must be globally routable,
+            and the connection is pinned to a vetted address. Setting it to false explicitly opts into
+            private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded
+            and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes,
+            and—when max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes
+            disables nonempty media. Remote URL byte potential is reserved before fetch, while inline
+            sources use their actual encoded size. Accepted image inputs also undergo header-only dimension
+            and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal
+            content before fetch. Embedded direct transcription and extraction use the configured encoded-media
+            per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image
+            admission. In unified Antfly configuration, an empty inference policy may first inherit a
+            nonempty remote_content security policy, which is then merged over this baseline.
         s3_credentials:
           $ref: '#/components/schemas/InferenceCredentials'
           description: S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
@@ -21135,6 +21213,9 @@ components:
 
             create per-model pipeline pools from this setting; configuring it has no effect.
           deprecated: true
+        prompt_cache:
+          $ref: '#/components/schemas/InferencePromptCacheConfig'
+          description: Native generator prompt KV cache settings.
         backend_priority:
           type: array
           items:
@@ -21311,18 +21392,19 @@ components:
         allowed_hosts:
           type: array
           description: Explicit HTTP(S) host allowlist for inference downloads. Omission and an explicit
-            empty list both deny all hosts. With block_private_ips enabled, entries must be canonical
-            globally routable IP literals; hostname entries require explicitly disabling that policy.
+            empty list both deny all hosts. With block_private_ips enabled, IP literals and every address
+            resolved from an allowlisted DNS hostname must be globally routable; the connection is pinned
+            to a vetted address.
           items:
             type: string
           example:
             - 93.184.216.34
         block_private_ips:
           type: boolean
-          description: Fail closed unless the HTTP(S) host is a canonical globally routable IP literal.
-            This rejects DNS hostnames and loopback, private, link-local, carrier-grade NAT, reserved,
-            and multicast addresses. Set false explicitly to allow hostname fetching; that disables this
-            address-safety gate until DNS resolution can be vetted and pinned.
+          description: Reject loopback, private, link-local, carrier-grade NAT, reserved, and multicast
+            destinations. Allowlisted DNS hostnames are resolved, every result is filtered by this policy,
+            and the connection is pinned to a vetted address. Set false only as an explicit opt-out that
+            permits private and special destinations.
           default: true
         max_download_size_bytes:
           type: integer
@@ -21333,10 +21415,9 @@ components:
           x-go-type: int64
         download_timeout_seconds:
           type: integer
-          description: Reserved for future download timeout enforcement; currently parsed but not applied
-            by the scraper.
-          deprecated: true
-          minimum: 1
+          description: Maximum HTTP download duration in seconds. Defaults to 30; 0 disables the deadline.
+          default: 30
+          minimum: 0
         max_image_dimension:
           type: integer
           description: Maximum source-image width or height for accepted inference image inputs, including
