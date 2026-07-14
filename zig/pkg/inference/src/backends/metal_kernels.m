@@ -1090,17 +1090,6 @@ static BOOL termite_metal_runtime_candidate_gate(termite_metal_decode_runtime *r
     return enabled;
 }
 
-// YES when the promoted generated route is allowed (its DISABLE env is not truthy).
-static BOOL termite_metal_runtime_promoted_gate(termite_metal_decode_runtime *runtime, const char *disable_env_name) {
-    if (termite_metal_runtime_generated_quant_disabled(runtime)) return NO;
-    if (runtime == NULL) return !termite_metal_env_bool_default(disable_env_name, NO);
-    BOOL enabled;
-    if (termite_metal_runtime_generated_gate_lookup(runtime, disable_env_name, &enabled)) return enabled;
-    enabled = !termite_metal_env_bool_default(disable_env_name, NO);
-    termite_metal_runtime_generated_gate_store(runtime, disable_env_name, enabled);
-    return enabled;
-}
-
 typedef struct termite_metal_attention_gated_block_timing {
     uint64_t replace_span_nanos;
     uint64_t attention_span_nanos;
@@ -1799,6 +1788,19 @@ static void termite_metal_debug_dump_buffer_finite(
 int termite_metal_device_available(void) {
     @autoreleasepool {
         return termite_metal_shared_device() != nil ? 1 : 0;
+    }
+}
+
+size_t termite_metal_copy_device_name(char *buffer, size_t capacity) {
+    @autoreleasepool {
+        id<MTLDevice> device = termite_metal_shared_device();
+        if (device == nil || device.name == nil) return 0;
+        const char *name = device.name.UTF8String;
+        if (name == NULL) return 0;
+        const size_t length = strlen(name);
+        if (length == 0) return 0;
+        if (buffer != NULL && capacity >= length) memcpy(buffer, name, length);
+        return length;
     }
 }
 
@@ -7919,6 +7921,11 @@ static int termite_metal_encode_quant_matmul_q4_k_pair_activation_mul_on_encoder
     id<MTLComputeCommandEncoder> encoder,
     const termite_metal_quant_matmul_descriptor *descriptor
 );
+static bool termite_metal_q4_0_pair_activation_small_batch_enabled(void) {
+    return termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_SMALL_BATCH")) &&
+        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_SMALL_BATCH"));
+}
+
 static int termite_metal_encode_quant_matmul_q4_0_pair_activation_mul_on_encoder(
     termite_metal_decode_runtime *runtime,
     id<MTLComputeCommandEncoder> encoder,
@@ -8201,11 +8208,11 @@ static int termite_metal_encode_quant_matmul_q4_0_pair_activation_mul_on_encoder
         descriptor->second_weight_buffer == nil ||
         descriptor->output_buffer == nil) return failure_code;
     if (!f32_activation_buffers && !use_f16_output) return failure_code;
-    // rows 2-8 with f32 output ride the shared-read small-batch pair kernels
-    // (weights streamed once for all rows — the MTP verify shape). f16 output
-    // and rows > 8 keep the original rows==1-only behavior.
+    // The rows 2-8 shared-read MTP kernel is explicit opt-in; f16 output and
+    // rows > 8 keep the original rows==1-only behavior.
     const BOOL use_small_batch = f32_activation_buffers &&
         descriptor->rows >= 2u && descriptor->rows <= 8u &&
+        termite_metal_q4_0_pair_activation_small_batch_enabled() &&
         runtime->q4_0_pair_activation_small_batch_pipeline != nil;
     if (descriptor->format != TERMITE_METAL_QUANT_FORMAT_Q4_0 ||
         (descriptor->rows != 1u && !use_small_batch) ||
@@ -9185,7 +9192,7 @@ static int termite_metal_encode_quant_matmul_none_on_encoder_family(
         family == TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_promoted_gate(runtime, "TERMITE_METAL_DISABLE_ANTFLY_Q8_0_SMALL_BATCH") &&
+        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH") &&
         runtime->antfly_q8_0_small_batch_pipeline != nil);
     const BOOL use_mmv = (!use_mm_sg &&
         !use_mm &&
@@ -10103,6 +10110,7 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
             } else if (descriptor->rows >= 2 && descriptor->rows <= 8 && !use_f16_input &&
                 descriptor->out_dim >= 32768u &&
                 runtime->q6_k_r2_reduce_pipeline != nil &&
+                termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_Q6_K_R2_REDUCE")) &&
                 !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_Q6_K_R2_REDUCE"))) {
                 // Vocab-sized out_dim at small rows (the MTP verify lm_head tail):
                 // pairs of input rows share one pass over the weight stream. The
@@ -10191,14 +10199,14 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_promoted_gate(runtime, "TERMITE_METAL_DISABLE_ANTFLY_Q2_K_SMALL_BATCH") &&
+        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q2_K_SMALL_BATCH") &&
         runtime->antfly_q2_k_small_batch_pipeline != nil);
     const BOOL use_antfly_q3_k_small_batch = (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q3_K &&
         f32_activation_buffers &&
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_promoted_gate(runtime, "TERMITE_METAL_DISABLE_ANTFLY_Q3_K_SMALL_BATCH") &&
+        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q3_K_SMALL_BATCH") &&
         runtime->antfly_q3_k_small_batch_pipeline != nil);
     const BOOL use_antfly_q4_0_small_batch = (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q4_0 &&
         f32_activation_buffers &&
@@ -10240,35 +10248,35 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_promoted_gate(runtime, "TERMITE_METAL_DISABLE_ANTFLY_Q8_K_SMALL_BATCH") &&
+        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q8_K_SMALL_BATCH") &&
         runtime->antfly_q8_k_small_batch_pipeline != nil);
     const BOOL use_antfly_q8_0_small_batch = (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q8_0 &&
         f32_activation_buffers &&
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_promoted_gate(runtime, "TERMITE_METAL_DISABLE_ANTFLY_Q8_0_SMALL_BATCH") &&
+        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q8_0_SMALL_BATCH") &&
         runtime->antfly_q8_0_small_batch_pipeline != nil);
     const BOOL use_antfly_q4_k_small_batch = (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q4_K &&
         f32_activation_buffers &&
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_promoted_gate(runtime, "TERMITE_METAL_DISABLE_ANTFLY_Q4_K_SMALL_BATCH") &&
+        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH") &&
         runtime->antfly_q4_k_small_batch_pipeline != nil);
     const BOOL use_antfly_q5_k_small_batch = (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q5_K &&
         f32_activation_buffers &&
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_promoted_gate(runtime, "TERMITE_METAL_DISABLE_ANTFLY_Q5_K_SMALL_BATCH") &&
+        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q5_K_SMALL_BATCH") &&
         runtime->antfly_q5_k_small_batch_pipeline != nil);
     const BOOL use_antfly_q6_k_small_batch = (descriptor->format == TERMITE_METAL_QUANT_FORMAT_Q6_K &&
         f32_activation_buffers &&
         !use_reduce &&
         descriptor->rows >= 2u &&
         descriptor->rows <= 8u &&
-        termite_metal_runtime_promoted_gate(runtime, "TERMITE_METAL_DISABLE_ANTFLY_Q6_K_SMALL_BATCH") &&
+        termite_metal_runtime_candidate_gate(runtime, "TERMITE_METAL_ENABLE_ANTFLY_Q6_K_SMALL_BATCH") &&
         runtime->antfly_q6_k_small_batch_pipeline != nil);
     if (use_antfly_q2_k_small_batch || use_antfly_q3_k_small_batch || use_antfly_q4_0_small_batch || use_antfly_q4_1_small_batch || use_antfly_q5_0_small_batch || use_antfly_q5_1_small_batch || use_antfly_q8_0_small_batch || use_antfly_q8_1_small_batch || use_antfly_q8_k_small_batch || use_antfly_q4_k_small_batch || use_antfly_q5_k_small_batch || use_antfly_q6_k_small_batch) {
         termite_metal_generated_quant_launch_shape launch_shape;
@@ -11826,11 +11834,12 @@ static bool termite_metal_block_table_contiguous(const uint32_t *block_table, si
     return true;
 }
 
-// Kill switch for the prefill-sg flash-attention direct-device K/V load fast path.
-// When set, forces contiguous_blocks=0 so the kernel falls back to the shmem-gather
-// path (bit-identical results) — used for A/B measuring the direct-load optimization.
+// The prefill-sg direct-device K/V load is an explicit opt-in until current
+// model-level correctness and runtime evidence is checked in. The legacy
+// disable switch remains an overriding rollback for A/B runs.
 static bool termite_metal_prefill_sg_direct_load_disabled(void) {
-    return termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_PREFILL_SG_DIRECT_LOAD"));
+    return !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD")) ||
+        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_PREFILL_SG_DIRECT_LOAD"));
 }
 
 static int termite_metal_encode_paged_attention_slot_on_encoder(
@@ -14129,13 +14138,11 @@ static int termite_metal_encode_rms_norm_add_rows_for(
     );
 }
 
-// Small row counts over a wide hidden dim (the MTP-verify shapes) route to
+// Small row counts over a wide hidden dim (the MTP-verify shapes) may route to
 // the threadgroup-per-row reduce kernel: the thread-per-row kernel dispatches
 // only `rows` threads total, each serially scanning hidden_size twice, which
 // on the serial planned frame encoder is a near-idle GPU stall per norm. The
-// gate is deliberately narrow — rows 2-8 AND hidden >= 1024 — so plain-decode
-// v_norm (rows=kv_heads over head_dim) and real prefill (rows > 8) keep their
-// existing kernel and stay byte-identical.
+// shape gate is deliberately narrow, and rollout remains explicit opt-in.
 static bool termite_metal_rms_norm_rows_reduce_preferred(
     termite_metal_decode_runtime *runtime,
     size_t rows,
@@ -14147,8 +14154,8 @@ static bool termite_metal_rms_norm_rows_reduce_preferred(
     if (runtime->rms_norm_rows_reduce_pipeline.maxTotalThreadsPerThreadgroup < 256) return false;
     static int enabled = -1;
     if (enabled < 0) {
-        const char *disabled = getenv("TERMITE_METAL_DISABLE_SMALL_ROWS_NORM_REDUCE");
-        enabled = (disabled == NULL || disabled[0] == '\0' || strcmp(disabled, "0") == 0) ? 1 : 0;
+        enabled = termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_SMALL_ROWS_NORM_REDUCE")) &&
+            !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_SMALL_ROWS_NORM_REDUCE"));
     }
     return enabled == 1;
 }
@@ -14683,9 +14690,13 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         if (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_ATTENTION_1X_GENERATED"))) {
             runtime->attention_1x_generated_pipeline = termite_metal_make_pipeline(device, precise_library, @"antfly_paged_attention_1x_generated_msl_v1");
         }
-        // Default-on: the flash-attention prefill kernel beats the scalar kv_1x path at prefill
-        // (direct-device K/V load, ~13% faster at 1k prompt). Opt out with TERMITE_METAL_DISABLE_PREFILL_SG_ATTENTION.
-        runtime->attention_paged_prefill_sg_pipeline = termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_PREFILL_SG_ATTENTION")) ? nil : termite_metal_make_pipeline(device, precise_library, @"termite_paged_attention_kv_prefill_sg");
+        // Hand-written flash-prefill remains an explicit opt-in pending current
+        // model-level release evidence; the disable switch overrides the opt-in.
+        runtime->attention_paged_prefill_sg_pipeline =
+            termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_PREFILL_SG_ATTENTION")) &&
+                !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_PREFILL_SG_ATTENTION"))
+            ? termite_metal_make_pipeline(device, precise_library, @"termite_paged_attention_kv_prefill_sg")
+            : nil;
         // Generated flash-prefill paged attention: opt-in candidate, from the same
         // precise library. The baseline (key_chunk=32) is byte-identical to the
         // hand-written prefill kernel, so when built it replaces it in the prefill
@@ -34227,12 +34238,11 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
             gate_up_activation_done = gate_up_status == 0;
             gated_buffer_f16 = gate_up_activation_done ? YES : NO;
         } else if (!pre_gate_pair_done && !split_gate_up_linear && block_q4_0 &&
-            // rows 2-8 (the MTP verify shape) default to the fused shared-read
-            // small-batch pair kernels (weights streamed once for all rows);
-            // rows==1 keeps the historical split-vs-fusion decision (opt-in).
+            // rows 2-8 may use the explicit-opt-in shared-read MTP kernels;
+            // rows==1 keeps the historical split-vs-fusion decision.
             ((rows >= 2 && rows <= 8 &&
                 runtime->q4_0_pair_activation_small_batch_pipeline != nil &&
-                !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_SMALL_BATCH"))) ||
+                termite_metal_q4_0_pair_activation_small_batch_enabled()) ||
              (rows == 1 && enable_q4_0_pair_activation_fusion)) &&
             runtime->q4_0_pair_activation_reduce_pipeline != nil) {
             termite_metal_quant_matmul_descriptor descriptor = {

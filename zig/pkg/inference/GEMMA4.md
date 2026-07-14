@@ -34,8 +34,36 @@ antfly inference generate /path/to/google/gemma-4-E2B-it \
 
 Calibrated auto policy requires `--speculation-calibration positive`; CLI
 calibration otherwise defaults to `none`, which does not activate Gemma 4 MTP
-auto mode. Metal auto policy currently defaults to an effective speculative
-window of `k=1` unless an explicitly validated override raises the cap.
+auto mode. Metal auto policy is also runtime-default-off; set
+`ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO=1` to evaluate it. The inherited adaptive
+cap (`k=2`) and acceptance threshold remain unchanged.
+
+Branch-added Metal MTP accelerators remain explicit rollout opt-ins until
+current model-level token-parity and runtime evidence is checked in:
+
+- `ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE=1` and
+  `ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE_TARGET_ACTIVATION=1` enable deferred
+  correction/bonus materialization and target-activation reuse.
+- `ANTFLY_GEMMA4_MTP_ACCEPT_BONUS=1` enables Metal bonus-token acceptance;
+  CUDA and native retain their inherited default.
+- `TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME=1` enables the prepared
+  verify-tail LM-head/argmax frame.
+- `TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME=1` enables direct
+  donated-KV slot attention on the draft frame. The inherited
+  `TERMITE_METAL_DISABLE_DONATED_SLOT_ATTENTION=1` remains the master rollback.
+- `TERMITE_METAL_ENABLE_Q6_K_R2_REDUCE=1` and
+  `TERMITE_METAL_ENABLE_SMALL_ROWS_NORM_REDUCE=1` enable the small-row MTP
+  verify kernels. Their corresponding `DISABLE_` variables override opt-ins.
+- `TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_SMALL_BATCH=1` enables the
+  rows-2-to-8 shared-read gate/up kernel; its `DISABLE_` variable overrides it.
+- `ANTFLY_GEMMA4_MTP_ENABLE_METAL_PREFILL_HIDDEN_CAPTURE=1` enables the
+  prepared-tail prefill/hidden-state handoff; its `DISABLE_` variable overrides
+  it.
+
+The hand-written Metal flash-prefill path likewise requires
+`TERMITE_METAL_ENABLE_PREFILL_SG_ATTENTION=1`; its new direct K/V load requires
+the additional `TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD=1`. Both retain
+their corresponding `DISABLE_` rollback variables.
 
 The drafter must use the same tokenizer vocabulary and special token ids as the
 target. Speculative decoding is currently native text-only generation; it is not
@@ -255,9 +283,10 @@ from that path should be described as superiority over llama.cpp. The CUDA
 release contract covers target-only Gemma 4 QAT, while strict MTP certification
 and promotion remain follow-up work.
 
-Update 2026-07-07 on branch `codex/quant-kernel-metal-compiler`: the quant
-kernel compiler now ships 5 promoted generated CUDA Q4_0 kernels default-on
-for the Gemma4 QAT path (`antfly_q4_0_mmv_f32_v1`, `antfly_q4_0_mm_f32_v1`,
+Update 2026-07-13 on branch `codex/quant-kernel-metal-compiler`: the quant
+kernel compiler ships 5 promoted generated CUDA Q4_0 artifacts as runtime
+opt-ins for the Gemma4 QAT path (`antfly_q4_0_mmv_f32_v1`,
+`antfly_q4_0_mm_f32_v1`,
 `antfly_q4_0_pair_mmv_f32_v1`, plus the q8_1/DP4A pair
 `antfly_q4_0_pair_activation_q8_1_mmv_v1` and
 `antfly_q4_0_down_q8_1_mmv_v1` inside the opt-in
@@ -269,8 +298,11 @@ Measured on E4B QAT in the tuned llama.cpp pair-harness config: E2E median
 8197 ms vs 8370 ms with the q8_1 kernels disabled (about -2.1%), decode 63.4
 vs about 61.5 tok/s; the paired margin vs llama.cpp roughly halved. Launch
 counts appear in `--print-timing`/`--json-timing` as
-`cuda_q4_0_generated_counts:`. Per-kernel opt-out:
-`ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_{MMV,MM,PAIR,PAIR_Q8,DOWN_Q8}`.
+`cuda_q4_0_generated_counts:`. Enable one route at a time with
+`ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_{MMV,MM,PAIR,PAIR_Q8,DOWN_Q8}=1` for
+model-level validation. The matching per-kernel `DISABLE_` variables override
+the opt-in; `ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0=1` disables every
+generated Q4_0 route and candidate.
 Details and promotion evidence: `QUANT_KERNEL_COMPILER.md` (Current CUDA
 State).
 

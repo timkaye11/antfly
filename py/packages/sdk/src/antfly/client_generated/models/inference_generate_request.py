@@ -32,10 +32,10 @@ class InferenceGenerateRequest:
         model (str): Name of the generator model from models_dir/generators/ Example: google/gemma-3-1b-it.
         messages (list[InferenceChatMessage]): Conversation messages (OpenAI-compatible format)
         max_tokens (int | Unset): Maximum tokens to generate Default: 256. Example: 256.
-        temperature (float | Unset): Sampling temperature (0.0 = deterministic, higher = more random) Default: 1.0.
+        temperature (float | Unset): Sampling temperature (0.0 = deterministic, higher = more random) Default: 0.0.
             Example: 0.7.
-        top_p (float | Unset): Nucleus sampling probability Default: 1.0.
-        top_k (int | Unset): Top-k sampling (inference extension, not in OpenAI API) Default: 50.
+        top_p (float | Unset): Nucleus sampling probability Default: 0.0.
+        top_k (int | Unset): Top-k sampling (inference extension, not in OpenAI API) Default: 0.
         stream (bool | Unset): If true, partial message deltas will be sent as SSE events Default: False.
         tools (list[InferenceTool] | Unset): List of tools (functions) the model can call.
             Only supported by models with tool_call_format configured.
@@ -55,7 +55,6 @@ class InferenceGenerateRequest:
             smaller draft model.
         speculative_k (int | Unset): inference-native speculative decoding extension. Number of draft tokens proposed
             per verification round.
-             Default: 4.
         speculation_policy (InferenceGenerateRequestSpeculationPolicy | Unset): inference-native speculative decoding
             policy: `auto`, `force`, or `off`.
             Defaults to `auto` when a draft model is requested.
@@ -97,9 +96,9 @@ class InferenceGenerateRequest:
     model: str
     messages: list[InferenceChatMessage]
     max_tokens: int | Unset = 256
-    temperature: float | Unset = 1.0
-    top_p: float | Unset = 1.0
-    top_k: int | Unset = 50
+    temperature: float | Unset = 0.0
+    top_p: float | Unset = 0.0
+    top_k: int | Unset = 0
     stream: bool | Unset = False
     tools: list[InferenceTool] | Unset = UNSET
     min_p: float | Unset = 0.0
@@ -109,7 +108,7 @@ class InferenceGenerateRequest:
     response_format: InferenceGenerateResponseFormat | Unset = UNSET
     grammar: str | Unset = UNSET
     draft_model: str | Unset = UNSET
-    speculative_k: int | Unset = 4
+    speculative_k: int | Unset = UNSET
     speculation_policy: InferenceGenerateRequestSpeculationPolicy | Unset = UNSET
     speculation_calibration: InferenceGenerateRequestSpeculationCalibration | Unset = UNSET
     cache_dtype: InferenceGenerateRequestCacheDtype | Unset = UNSET

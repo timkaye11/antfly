@@ -1,32 +1,44 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-T = TypeVar("T", bound="InferenceToolChoiceType1Function")
+from ..models.inference_tool_choice_type_1_type import InferenceToolChoiceType1Type
+
+if TYPE_CHECKING:
+    from ..models.inference_tool_choice_function import InferenceToolChoiceFunction
+
+
+T = TypeVar("T", bound="InferenceToolChoiceType1")
 
 
 @_attrs_define
-class InferenceToolChoiceType1Function:
-    """
+class InferenceToolChoiceType1:
+    """Force a specific function to be called
+
     Attributes:
-        name (str): The name of the function to call
+        type_ (InferenceToolChoiceType1Type):
+        function (InferenceToolChoiceFunction):
     """
 
-    name: str
+    type_: InferenceToolChoiceType1Type
+    function: InferenceToolChoiceFunction
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        name = self.name
+        type_ = self.type_.value
+
+        function = self.function.to_dict()
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
-                "name": name,
+                "type": type_,
+                "function": function,
             }
         )
 
@@ -34,15 +46,20 @@ class InferenceToolChoiceType1Function:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        d = dict(src_dict)
-        name = d.pop("name")
+        from ..models.inference_tool_choice_function import InferenceToolChoiceFunction
 
-        inference_tool_choice_type_1_function = cls(
-            name=name,
+        d = dict(src_dict)
+        type_ = InferenceToolChoiceType1Type(d.pop("type"))
+
+        function = InferenceToolChoiceFunction.from_dict(d.pop("function"))
+
+        inference_tool_choice_type_1 = cls(
+            type_=type_,
+            function=function,
         )
 
-        inference_tool_choice_type_1_function.additional_properties = d
-        return inference_tool_choice_type_1_function
+        inference_tool_choice_type_1.additional_properties = d
+        return inference_tool_choice_type_1
 
     @property
     def additional_keys(self) -> list[str]:

@@ -292,6 +292,11 @@ fn getenvBool(comptime name: [*:0]const u8) bool {
         std.ascii.eqlIgnoreCase(slice, "on");
 }
 
+fn gemma4MtpVerifyTailFrameEnabled() bool {
+    return getenvBool("TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME") and
+        !getenvBool("TERMITE_METAL_DISABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME");
+}
+
 fn gatedFamilyCompareRequested() bool {
     return getenvBool("TERMITE_METAL_COMPARE_GATED_FAMILY") or gemmaPrefillCompareRequested();
 }
@@ -6154,7 +6159,7 @@ fn forwardFinalHiddenRowsInternal(
     var prepared_tail_choices: ?[]u32 = null;
     errdefer if (prepared_tail_choices) |choices| allocator.free(choices);
     if (prepared_tail_suppress_token_ids) |suppress_token_ids| {
-        if (!getenvBool("TERMITE_METAL_DISABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME")) {
+        if (gemma4MtpVerifyTailFrameEnabled()) {
             prepared_tail_choices = try forwardPreparedLmHeadArgmaxRows(
                 cb,
                 gpt_config,
@@ -6563,6 +6568,10 @@ pub fn forwardSampledToken(
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.sampled_tail_nanos += finished_at - started_at;
     return token;
+}
+
+test "Gemma4 MTP verify-tail frame defaults off" {
+    try std.testing.expect(!gemma4MtpVerifyTailFrameEnabled());
 }
 
 test "raw whole-token gated supports multimodal decode-only gemma config" {

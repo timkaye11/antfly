@@ -20,14 +20,16 @@ import json
 import math
 import os
 import pathlib
+import platform
 import re
+import shutil
 import signal
 import subprocess
 import sys
 from typing import Any
 
 
-RELEASE_SCHEMA = "antfly.gemma4_cuda_l4_release_gate.v1"
+RELEASE_SCHEMA = "antfly.gemma4_cuda_l4_release_gate.v2"
 RELEASE_SCOPE = "target_only"
 E2B_PROMPT = "Here is a sentence about ants:"
 E2B_ANTFLY_TOKENS = 255
@@ -54,6 +56,7 @@ FORBIDDEN_GENERATED_Q4_0_ROUTE_COUNTERS = (
     "antfly_generated_q4_0_down_q8_fallbacks",
 )
 TOKEN_IDS_RE = re.compile(r"^token_ids:(?P<ids>(?:\s+-?\d+)*)\s*$", re.MULTILINE)
+SOURCE_PATHS = (".github", "go", "py", "scripts", "specs", "ts", "zig")
 
 # These values are applied after the caller environment.  The lower-case
 # aliases matter because the shared tuning shell function accepts both forms.
@@ -90,11 +93,13 @@ FROZEN_PROFILE = {
     "antfly_generated_q4_0_e2b_ffn": "0",
     "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT": "0",
     "antfly_generated_q4_0_e2b_ffn_exact": "0",
-    "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MMV": "1",
-    "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MM": "1",
-    "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR": "1",
-    "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR_Q8": "1",
-    "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_DOWN_Q8": "1",
+    # This gate certifies the default release path. Candidate lanes have
+    # separate exact-kernel gates that require positive generated-route hits.
+    "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MMV": "0",
+    "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MM": "0",
+    "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR": "0",
+    "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR_Q8": "0",
+    "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_DOWN_Q8": "0",
     "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A": "1",
     "ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A": "1",
     "ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX": "1",
@@ -233,14 +238,135 @@ def command_output(*command: str) -> str | None:
         return None
 
 
-def git_provenance(repo: pathlib.Path) -> dict[str, Any]:
-    status = command_output("git", "-C", str(repo), "status", "--porcelain=v1")
-    return {
-        "commit": command_output("git", "-C", str(repo), "rev-parse", "HEAD"),
-        "describe": command_output("git", "-C", str(repo), "describe", "--always", "--dirty", "--long"),
-        "dirty": bool(status),
-        "status_sha256": hashlib.sha256((status or "").encode("utf-8")).hexdigest(),
+def command_capture(*command: str) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "command": list(command),
+        "returncode": None,
+        "stdout": None,
+        "stderr": None,
     }
+    try:
+        completed = subprocess.run(command, text=True, capture_output=True, check=False)
+    except OSError:
+        return result
+    result.update({
+        "returncode": completed.returncode,
+        "stdout": completed.stdout.strip() or None,
+        "stderr": completed.stderr.strip() or None,
+    })
+    return result
+
+
+def _status_sha256(status: str | None) -> str | None:
+    return hashlib.sha256(status.encode("utf-8")).hexdigest() if status is not None else None
+
+
+def _untracked_paths(status: str | None) -> list[str]:
+    if status is None:
+        return []
+    return sorted(line[3:] for line in status.splitlines() if line.startswith("?? "))
+
+
+def git_provenance(repo: pathlib.Path) -> dict[str, Any]:
+    commit = command_capture("git", "-C", str(repo), "rev-parse", "HEAD")
+    describe = command_capture("git", "-C", str(repo), "describe", "--always", "--dirty", "--long")
+    tracked = command_capture("git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=no")
+    source = command_capture(
+        "git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=all", "--", *SOURCE_PATHS,
+    )
+    worktree = command_capture("git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=all")
+    tracked_status = (tracked["stdout"] or "") if tracked["returncode"] == 0 else None
+    source_status = (source["stdout"] or "") if source["returncode"] == 0 else None
+    worktree_status = (worktree["stdout"] or "") if worktree["returncode"] == 0 else None
+    return {
+        "commit": commit["stdout"] if commit["returncode"] == 0 else None,
+        "commit_returncode": commit["returncode"],
+        "describe": describe["stdout"] if describe["returncode"] == 0 else None,
+        "describe_returncode": describe["returncode"],
+        "tracked_dirty": bool(tracked_status) if tracked_status is not None else None,
+        "tracked_status_returncode": tracked["returncode"],
+        "tracked_status_sha256": _status_sha256(tracked_status),
+        "source_untracked_paths": _untracked_paths(source_status),
+        "source_status_returncode": source["returncode"],
+        "source_status_sha256": _status_sha256(source_status),
+        "dirty": bool(worktree_status) if worktree_status is not None else None,
+        "status_returncode": worktree["returncode"],
+        "status_sha256": _status_sha256(worktree_status),
+    }
+
+
+def _configured_cuda_tool(env_name: str, binary_name: str) -> str:
+    if configured := os.environ.get(env_name):
+        return configured
+    if cuda_home := os.environ.get("CUDA_HOME"):
+        candidate = pathlib.Path(cuda_home) / "bin" / binary_name
+        if candidate.is_file():
+            return str(candidate)
+    pinned = pathlib.Path("/usr/local/cuda-13.2/bin") / binary_name
+    return str(pinned) if pinned.is_file() else binary_name
+
+
+def executable_provenance(executable: str, *version_args: str) -> dict[str, Any]:
+    resolved = shutil.which(executable)
+    capture = command_capture(resolved or executable, *version_args) if resolved else {
+        "returncode": None,
+        "stdout": None,
+        "stderr": None,
+    }
+    artifact = path_provenance(pathlib.Path(resolved)) if resolved else {}
+    return {
+        "command": [executable, *version_args],
+        "path": artifact.get("path"),
+        "sha256": artifact.get("sha256"),
+        "version": capture.get("stdout") or capture.get("stderr"),
+        "returncode": capture.get("returncode"),
+    }
+
+
+def toolchain_provenance() -> dict[str, Any]:
+    return {
+        "python": executable_provenance(sys.executable, "--version"),
+        "git": executable_provenance("git", "--version"),
+        "zig": executable_provenance("zig", "version"),
+        "nvcc": executable_provenance(_configured_cuda_tool("NVCC", "nvcc"), "--version"),
+        "cuobjdump": executable_provenance(_configured_cuda_tool("CUOBJDUMP", "cuobjdump"), "--version"),
+        "nvidia_smi": executable_provenance("nvidia-smi", "--version"),
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "python_implementation": platform.python_implementation(),
+        },
+    }
+
+
+def provenance_errors(provenance: dict[str, Any]) -> list[str]:
+    errors = []
+    git = provenance.get("git") or {}
+    commit = git.get("commit")
+    if git.get("commit_returncode") != 0 or not isinstance(commit, str) or re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit) is None:
+        errors.append("Git commit provenance is unavailable or invalid")
+    if git.get("tracked_status_returncode") != 0 or git.get("tracked_dirty") is None:
+        errors.append("Git tracked-source status is unavailable")
+    elif git["tracked_dirty"]:
+        errors.append("Git tracked source differs from the recorded commit")
+    if git.get("source_status_returncode") != 0:
+        errors.append("Git untracked-source status is unavailable")
+    elif git.get("source_untracked_paths"):
+        errors.append("untracked source files are present: " + ", ".join(git["source_untracked_paths"]))
+
+    toolchains = provenance.get("toolchains") or {}
+    for name in ("python", "git", "zig", "nvcc", "cuobjdump", "nvidia_smi"):
+        tool = toolchains.get(name) or {}
+        if tool.get("returncode") != 0 or not tool.get("path") or not tool.get("sha256") or not tool.get("version"):
+            errors.append(f"{name} toolchain provenance is unavailable")
+    zig_version = (toolchains.get("zig") or {}).get("version")
+    if zig_version and zig_version.strip() != "0.16.0":
+        errors.append(f"expected Zig 0.16.0, got {zig_version!r}")
+    nvcc_version = (toolchains.get("nvcc") or {}).get("version")
+    if nvcc_version and "release 13.2" not in nvcc_version:
+        errors.append("expected CUDA toolkit 13.2 in nvcc provenance")
+    return errors
 
 
 def gpu_provenance() -> dict[str, Any]:
@@ -285,6 +411,8 @@ def l4_errors(gpu: dict[str, Any]) -> list[str]:
         return [f"expected NVIDIA L4, got {device.get('name')!r}"]
     if device.get("compute_capability") not in {"8.9", "8.9 "}:
         return [f"expected compute capability 8.9, got {device.get('compute_capability')!r}"]
+    if not isinstance(device.get("driver_version"), str) or not device["driver_version"].strip():
+        return ["NVIDIA driver version is missing from GPU provenance"]
     return []
 
 
@@ -307,6 +435,10 @@ def artifact_provenance(repo: pathlib.Path) -> dict[str, dict[str, Any]]:
         "runtime_sm89_cubin": root / "artifacts/inference_cuda_kernels_sm89.cubin",
     }
     return {name: path_provenance(path) for name, path in paths.items()}
+
+
+def provenance_binding(path: pathlib.Path) -> dict[str, str]:
+    return {"provenance": path.name, "provenance_sha256": sha256_file(path)}
 
 
 def frozen_profile() -> dict[str, str]:
@@ -744,6 +876,7 @@ def main() -> None:
         "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "git": git_provenance(repo_root()),
         "gpu": gpu,
+        "toolchains": toolchain_provenance(),
         "binary": path_provenance(args.binary),
         "llama_cpp_binary": path_provenance(args.llama_cpp_bin),
         "e2b_model": path_provenance(args.e2b_model),
@@ -753,9 +886,12 @@ def main() -> None:
         "frozen_profile_sha256": canonical_sha256(profile),
         "benchmark_contract": benchmark_contract(args),
     }
-    write_json(args.output_dir / "release_provenance.json", provenance)
+    provenance_path = args.output_dir / "release_provenance.json"
+    write_json(provenance_path, provenance)
+    provenance_ref = provenance_binding(provenance_path)
 
     errors = diagnostic_mode_errors(args.require_l4, args.skip_12b)
+    errors.extend(provenance_errors(provenance))
     if args.require_l4:
         errors.extend(l4_errors(gpu))
     missing_artifacts = [name for name, value in artifacts.items() if not value.get("exists")]
@@ -814,7 +950,7 @@ def main() -> None:
             "verify_artifacts": args.verify_artifacts,
             "skip_12b": args.skip_12b,
         },
-        "provenance": "release_provenance.json",
+        **provenance_ref,
         "artifact_check": artifact_result,
         "e2b": {
             "matrix_log": str(matrix_log),

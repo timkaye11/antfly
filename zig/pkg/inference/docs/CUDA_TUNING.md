@@ -101,18 +101,20 @@ selected Q4_0 and Q4_K row-1 matmuls, Q4_0 x Q8_1 fused FFN shapes, Q6_K x
 Q8_1 K=2560 and K=3840 tile-argmax candidates, and Gemma 4 decode-attention
 topologies. In the merged unified generated-artifact registry, 21 CUDA entries
 are non-promoted; no single Q4_K route represents the remaining candidate set.
-Default-on generated Q4 runtime routes are therefore enabled only on SM89.
-Other compute capabilities use the handwritten fallback even when their code
-objects are present in the fatbin. Development experiments can bypass this
-promotion guard with
+The generated Q4 runtime routes are default-off. When a route is explicitly
+enabled, it is target-guarded to SM89; other compute capabilities use the
+handwritten fallback even when their code objects are present in the fatbin.
+Development experiments can bypass this target and promotion guard with
 `ANTFLY_INFERENCE_CUDA_ALLOW_UNPROMOTED_GENERATED_KERNELS=1`; results from that
 mode are not production evidence.
-Production-enabled entries may route without a candidate opt-in. The 1536-wide
-FFN, Q4_K, Q6_K argmax, and generated-attention entries remain candidates; the
-2560 x 10240 FFN pair/down entries are production-enabled. Q4_K candidates are
-not runtime-wired. The Q6_K argmax stage-1 candidates are runtime-wired behind
-a disabled opt-in and must pass device parity and target-specific performance
-gates before promotion. The dense split-KV attention route remains dev-only
+`production_enabled` records benchmark qualification; it does not imply
+runtime-default dispatch. The five qualified Q4_0 routes require their positive
+runtime opt-ins, and the master disable gate remains authoritative. The
+1536-wide FFN, Q4_K, Q6_K argmax, and generated-attention entries remain
+candidates; the 2560 x 10240 FFN pair/down entries are production-qualified but
+runtime-default-off. Q4_K candidates are not runtime-wired. The Q6_K argmax
+stage-1 candidates are runtime-wired behind a disabled opt-in and must pass
+device parity and target-specific performance gates before promotion. The dense split-KV attention route remains dev-only
 because its reordered partial-softmax merge does not satisfy the long-output
 parity contract. The paged score-prework route instead parallelizes only QK
 scores and retains the production chronological softmax recurrence.
@@ -472,9 +474,16 @@ MMV/MM/pair/pair-Q8/down-Q8 routes. Generated-route hit and promotion evidence
 remains a separate exact-token kernel-candidate gate because the fixed release
 prompt does not exercise every generated row bucket.
 
-Use manual `gate=release` to preflight the commit intended for release. Tag-based
-publication calls the same workflow at the tag SHA and cannot publish assets
-until it passes. Its
+Those five generated Q4_0 routes therefore remain runtime opt-ins despite the
+checked-in isolated-kernel benchmarks. Enable them individually with
+`ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_{MMV,MM,PAIR,PAIR_Q8,DOWN_Q8}=1` only for
+a model-level validation run. Per-route `DISABLE_` variables override the
+matching opt-in, and `ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0=1` is the
+single emergency rollback for all generated Q4_0 routes and candidates.
+
+Use manual `gate=release` to collect CUDA evidence for the commit intended for
+release. Tag release archives are explicitly built with `-Dcuda=false`, so tag
+publication does not invoke or claim certification from this lane. Its
 `release_scope` is `target_only`: CUDA MTP is not executed or certified. That mode
 requires the E2B comparable llama.cpp ratio to be at least `0.70` and a token
 throughput CV no higher than `0.02`; `0.80` remains the future optimization

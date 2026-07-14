@@ -664,11 +664,26 @@ pub const Server = struct {
     pre_route_hooks: std.ArrayListUnmanaged(PreRouteHook) = .empty,
     global_handler: ?Handler = null,
     listener: ?TcpListener = null,
-    running: bool = false,
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    listening: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    stopped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    lifecycle_mutex: Io.Mutex = .init,
+    lifecycle_changed: Io.Condition = .init,
+    group_finalizing: bool = false,
+    active_connections: ?*Connection = null,
     connections: Io.Group = Io.Group.init,
     conn_semaphore: Io.Semaphore,
 
     const Self = @This();
+
+    // The heap node is the socket's sole owner. lifecycle_mutex protects list
+    // membership; stop only shuts listed sockets down, and finishConnection
+    // unlinks before the one close/destroy shared by async and sync paths.
+    const Connection = struct {
+        socket: Socket,
+        prev: ?*Connection = null,
+        next: ?*Connection = null,
+    };
 
     /// Creates a server with default configuration.
     pub fn init(allocator: Allocator, io: Io) Self {
@@ -694,6 +709,7 @@ pub const Server = struct {
 
     /// Releases all server resources.
     pub fn deinit(self: *Self) void {
+        std.debug.assert(!self.listening.load(.acquire));
         self.router.deinit();
         self.middleware.deinit(self.allocator);
         self.pre_route_hooks.deinit(self.allocator);
@@ -789,12 +805,41 @@ pub const Server = struct {
     }
 
     /// Starts the server and begins accepting connections.
-    /// Uses Io.Group.concurrent to spawn a fiber per connection when
-    /// the Io backend supports it (Kqueue on macOS, io_uring on Linux).
+    /// Uses Io.Group.concurrent to spawn a task per connection when
+    /// the Io backend supports grouped concurrency (including the standard
+    /// process Threaded backend used by Zig 0.16).
     /// Falls back to synchronous handling if concurrency is unavailable.
     pub fn listen(self: *Self) !void {
-        if (self.listener == null) try self.bind();
-        self.running = true;
+        return self.listenWithReady(null);
+    }
+
+    /// Starts the server and signals once the listener has been captured and
+    /// the accept loop is safe to stop from another thread. Callers that own a
+    /// background listener thread should wait for `ready` before calling
+    /// `stop()` and joining that thread.
+    pub fn listenWithReady(self: *Self, ready: ?*std.atomic.Value(bool)) !void {
+        if (self.listening.swap(true, .acq_rel)) return error.AlreadyListening;
+        defer {
+            self.listening.store(false, .release);
+            self.lifecycle_mutex.lockUncancelable(self.io);
+            self.lifecycle_changed.broadcast(self.io);
+            self.lifecycle_mutex.unlock(self.io);
+        }
+
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        if (self.stopped.load(.acquire)) {
+            self.lifecycle_mutex.unlock(self.io);
+            return error.ServerStopped;
+        }
+        if (self.listener == null) self.bind() catch |err| {
+            self.lifecycle_mutex.unlock(self.io);
+            return err;
+        };
+        var listener = self.listener.?;
+        self.running.store(true, .release);
+        self.lifecycle_mutex.unlock(self.io);
+        if (ready) |value| value.store(true, .release);
+        defer if (ready) |value| value.store(false, .release);
 
         if (self.config.tls_cert_path != null or self.config.tls_key_path != null) {
             std.debug.print("Warning: tls_cert_path/tls_key_path are set but server TLS is not yet supported (Zig 0.16). Use a TLS-terminating reverse proxy.\n", .{});
@@ -802,66 +847,145 @@ pub const Server = struct {
 
         std.debug.print("Server listening on {s}:{d}\n", .{ self.config.host, self.config.port });
 
-        while (self.running) {
+        while (self.running.load(.acquire)) {
             // Block accept loop when at max concurrent connections.
             // Gate before accept so we don't hold open sockets while waiting.
             self.conn_semaphore.waitUncancelable(self.io);
-
-            const conn = self.listener.?.accept() catch |err| {
+            if (!self.running.load(.acquire)) {
                 self.conn_semaphore.post(self.io);
-                if (!self.running or self.listener == null) break;
+                break;
+            }
+
+            const conn = listener.accept() catch |err| {
+                self.conn_semaphore.post(self.io);
+                if (!self.running.load(.acquire)) break;
                 std.debug.print("Accept error: {}\n", .{err});
                 continue;
             };
 
-            // Spawn a lightweight fiber to handle this connection concurrently.
+            // Spawn a task to handle this connection concurrently.
             // If the Io backend doesn't support concurrency, fall back to sync.
-            self.connections.concurrent(self.io, handleConnectionFiber, .{ self, conn.socket }) catch {
-                self.handleConnection(conn.socket) catch |err| {
+            const connection = self.allocator.create(Connection) catch {
+                var socket = conn.socket;
+                socket.close();
+                self.conn_semaphore.post(self.io);
+                continue;
+            };
+            connection.* = .{ .socket = conn.socket };
+
+            self.lifecycle_mutex.lockUncancelable(self.io);
+            if (!self.running.load(.acquire)) {
+                self.lifecycle_mutex.unlock(self.io);
+                connection.socket.close();
+                self.allocator.destroy(connection);
+                self.conn_semaphore.post(self.io);
+                break;
+            }
+            connection.next = self.active_connections;
+            if (self.active_connections) |first| first.prev = connection;
+            self.active_connections = connection;
+
+            self.connections.concurrent(self.io, handleConnectionFiber, .{ self, connection }) catch {
+                self.lifecycle_mutex.unlock(self.io);
+                self.handleConnection(connection) catch |err| {
                     logConnectionError(err);
                 };
+                continue;
             };
+            self.lifecycle_mutex.unlock(self.io);
         }
-
-        // Wait for all in-flight connections to finish before returning.
-        self.connections.await(self.io) catch {};
     }
 
     /// Stops the server immediately, cancelling all in-flight connections.
+    /// Call this from the server's owning thread, then join any thread running
+    /// `listen`; a connection handler must not stop the group that owns it.
     pub fn stop(self: *Self) void {
-        self.running = false;
-        self.connections.cancel(self.io);
+        self.stopped.store(true, .release);
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        self.running.store(false, .release);
         if (self.listener) |*l| {
+            l.shutdown();
             l.deinit();
             self.listener = null;
         }
+        self.shutdownActiveConnectionsLocked();
+        self.lifecycle_mutex.unlock(self.io);
+        self.cancelConnectionsAndWait();
     }
 
     /// Gracefully shuts down the server: stops accepting new connections and
-    /// waits up to `timeout_ms` for in-flight requests to complete before
-    /// forcefully cancelling them. Similar to Go's http.Server.Shutdown.
+    /// waits up to `timeout_ms` for accepted connections to close before
+    /// forcefully cancelling them. Idle keep-alive connections count as active.
     ///
-    /// Must be called from a fiber context (e.g. a route handler or a
-    /// dedicated shutdown fiber) because it calls `io.sleep`. For signal-safe
-    /// stopping without a fiber, use `stop()` instead.
+    /// Must be called from an external owner fiber because it calls `io.sleep`
+    /// and then cancels the connection group. For non-fiber stopping, use
+    /// `stop()` instead, then join the listener thread before deinitializing.
     pub fn shutdown(self: *Self, timeout_ms: u64) void {
-        self.running = false;
+        self.stopped.store(true, .release);
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        self.running.store(false, .release);
         if (self.listener) |*l| {
+            l.shutdown();
             l.deinit();
             self.listener = null;
         }
-        // Give in-flight connections time to finish.
-        if (timeout_ms > 0) {
-            self.io.sleep(Io.Duration.fromMilliseconds(@intCast(timeout_ms)), .awake) catch {};
+        self.lifecycle_mutex.unlock(self.io);
+        // Give in-flight connections time to finish, returning promptly once
+        // the active list drains instead of always sleeping the full timeout.
+        const timeout_i64 = std.math.cast(i64, timeout_ms) orelse std.math.maxInt(i64);
+        const deadline_ms = std.math.add(i64, milliTimestamp(self.io), timeout_i64) catch std.math.maxInt(i64);
+        while (timeout_ms > 0) {
+            self.lifecycle_mutex.lockUncancelable(self.io);
+            const drained = self.active_connections == null;
+            self.lifecycle_mutex.unlock(self.io);
+            if (drained) break;
+
+            const now_ms = milliTimestamp(self.io);
+            if (now_ms >= deadline_ms) break;
+            const remaining_ms = deadline_ms - now_ms;
+            self.io.sleep(
+                Io.Duration.fromMilliseconds(@min(remaining_ms, 10)),
+                .awake,
+            ) catch break;
         }
         // Force-cancel any remaining connections.
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        self.shutdownActiveConnectionsLocked();
+        self.lifecycle_mutex.unlock(self.io);
+        self.cancelConnectionsAndWait();
+    }
+
+    fn shutdownActiveConnectionsLocked(self: *Self) void {
+        var connection = self.active_connections;
+        while (connection) |active| : (connection = active.next) active.socket.shutdown();
+    }
+
+    /// `Group.cancel` and `Group.concurrent` are not generally threadsafe.
+    /// `running=false` plus lifecycle_mutex prevents new group members, while
+    /// group_finalizing serializes terminal operations without holding the
+    /// mutex across handler completion. Lock order is lifecycle_mutex before
+    /// Group.concurrent; Group.cancel runs only after releasing lifecycle_mutex.
+    fn cancelConnectionsAndWait(self: *Self) void {
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        while (self.group_finalizing) self.lifecycle_changed.waitUncancelable(self.io, &self.lifecycle_mutex);
+        self.group_finalizing = true;
+        self.lifecycle_mutex.unlock(self.io);
+
         self.connections.cancel(self.io);
+
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        while (self.active_connections != null or self.listening.load(.acquire)) {
+            self.lifecycle_changed.waitUncancelable(self.io, &self.lifecycle_mutex);
+        }
+        self.group_finalizing = false;
+        self.lifecycle_changed.broadcast(self.io);
+        self.lifecycle_mutex.unlock(self.io);
     }
 
     /// Fiber entry point for concurrent connection handling.
     /// Signature returns `Io.Cancelable!void` as required by Group.concurrent.
-    fn handleConnectionFiber(self: *Self, socket: Socket) Io.Cancelable!void {
-        self.handleConnection(socket) catch |err| {
+    fn handleConnectionFiber(self: *Self, connection: *Connection) Io.Cancelable!void {
+        self.handleConnection(connection) catch |err| {
             logConnectionError(err);
         };
     }
@@ -873,11 +997,27 @@ pub const Server = struct {
         }
     }
 
+    fn finishConnection(self: *Self, connection: *Connection) void {
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        if (connection.prev) |prev| {
+            prev.next = connection.next;
+        } else {
+            std.debug.assert(self.active_connections == connection);
+            self.active_connections = connection.next;
+        }
+        if (connection.next) |next| next.prev = connection.prev;
+        self.lifecycle_changed.broadcast(self.io);
+        self.lifecycle_mutex.unlock(self.io);
+
+        connection.socket.close();
+        self.allocator.destroy(connection);
+    }
+
     /// Handles a single connection.
-    fn handleConnection(self: *Self, socket: Socket) !void {
+    fn handleConnection(self: *Self, connection: *Connection) !void {
         defer self.conn_semaphore.post(self.io);
-        var sock = socket;
-        defer sock.close();
+        const sock = &connection.socket;
+        defer self.finishConnection(connection);
 
         // Set initial timeout once; only update when transitioning to keep-alive.
         if (self.config.request_timeout_ms > 0) {
@@ -892,7 +1032,7 @@ pub const Server = struct {
         if (first_n == 0) return;
 
         if (first_n >= 24 and mem.eql(u8, peek_buf[0..24], http.HTTP2_PREFACE)) {
-            return self.handleH2Connection(&sock, peek_buf[24..first_n]);
+            return self.handleH2Connection(sock, peek_buf[24..first_n]);
         }
 
         // HTTP/1.1 path — feed the already-read bytes to the parser.
@@ -906,7 +1046,7 @@ pub const Server = struct {
         var first_recv_done = true; // We already did the first recv.
         var buffer: [8192]u8 = undefined;
         var leftover: usize = 0;
-        while (self.running) {
+        while (self.running.load(.acquire)) {
             parser.reset();
 
             // Wall-clock deadline prevents slow-loris attacks where an attacker
@@ -919,15 +1059,15 @@ pub const Server = struct {
             if (leftover > 0) {
                 const consumed = parser.feed(buffer[0..leftover]) catch |err| switch (err) {
                     error.BodyTooLarge => {
-                        try self.sendError(&sock, 413);
+                        try self.sendError(sock, 413);
                         return;
                     },
                     error.HeaderTooLarge, error.TooManyHeaders => {
-                        try self.sendError(&sock, 431);
+                        try self.sendError(sock, 431);
                         return;
                     },
                     error.InvalidHeader, error.InvalidChunkEncoding => {
-                        try self.sendError(&sock, 400);
+                        try self.sendError(sock, 400);
                         return;
                     },
                     else => return err,
@@ -937,14 +1077,14 @@ pub const Server = struct {
                 }
                 leftover -= consumed;
                 if (parser.isError()) {
-                    try self.sendError(&sock, 400);
+                    try self.sendError(sock, 400);
                     return;
                 }
             }
 
             while (!parser.isComplete()) {
                 if (deadline_ms > 0 and milliTimestamp(self.io) >= deadline_ms) {
-                    try self.sendError(&sock, 408);
+                    try self.sendError(sock, 408);
                     return;
                 }
                 // On the very first iteration, feed the bytes we already read
@@ -957,15 +1097,15 @@ pub const Server = struct {
                 if (n == 0) return;
                 const consumed = parser.feed(buffer[0..n]) catch |err| switch (err) {
                     error.BodyTooLarge => {
-                        try self.sendError(&sock, 413);
+                        try self.sendError(sock, 413);
                         return;
                     },
                     error.HeaderTooLarge, error.TooManyHeaders => {
-                        try self.sendError(&sock, 431);
+                        try self.sendError(sock, 431);
                         return;
                     },
                     error.InvalidHeader, error.InvalidChunkEncoding => {
-                        try self.sendError(&sock, 400);
+                        try self.sendError(sock, 400);
                         return;
                     },
                     else => return err,
@@ -976,7 +1116,7 @@ pub const Server = struct {
                 }
                 leftover = n - consumed;
                 if (parser.isError()) {
-                    try self.sendError(&sock, 400);
+                    try self.sendError(sock, 400);
                     return;
                 }
             }
@@ -1021,18 +1161,18 @@ pub const Server = struct {
             // Pass any bytes beyond the parsed request (H2 preface pipelined
             // in the same TCP segment) as initial_data for the H2 reader.
             if (first_request and http.isH2cUpgradeRequest(&req.headers)) {
-                return self.handleH2cUpgrade(&sock, &req, buffer[0..leftover]);
+                return self.handleH2cUpgrade(sock, &req, buffer[0..leftover]);
             }
 
             var ctx = Context.init(self.allocator, self.io, &req);
             ctx.max_file_size = self.config.max_file_size;
-            ctx.h1_sock = &sock;
+            ctx.h1_sock = sock;
             defer ctx.deinit();
 
             for (self.pre_route_hooks.items) |hook| {
                 hook(&ctx) catch |err| {
                     std.debug.print("Pre-route hook error: {}\n", .{err});
-                    return self.sendError(&sock, 500);
+                    return self.sendError(sock, 500);
                 };
             }
 
@@ -1055,7 +1195,7 @@ pub const Server = struct {
             if (route_result) |r| {
                 response = self.executeMiddleware(&ctx, r.handler) catch |err| {
                     std.debug.print("Route handler error: {}\n", .{err});
-                    return self.sendError(&sock, routeErrorStatus(err));
+                    return self.sendError(sock, routeErrorStatus(err));
                 };
             } else {
                 var allow_methods: [16]types.Method = undefined;
@@ -1072,10 +1212,10 @@ pub const Server = struct {
                 } else if (self.global_handler) |global_handler| {
                     response = self.executeMiddleware(&ctx, global_handler) catch |err| {
                         std.debug.print("Global handler error: {}\n", .{err});
-                        return self.sendError(&sock, 500);
+                        return self.sendError(sock, 500);
                     };
                 } else {
-                    return self.sendError(&sock, 404);
+                    return self.sendError(sock, 404);
                 }
             }
 
@@ -1130,7 +1270,7 @@ pub const Server = struct {
             try ensureContentLengthHeader(&response);
             try ensureDateHeader(self.io, &response);
 
-            try sendBuffered(self.allocator, &sock, &response);
+            try sendBuffered(self.allocator, sock, &response);
 
             if (!keep_alive) return;
 
@@ -1250,7 +1390,7 @@ pub const Server = struct {
         // Count stream 1 (the upgraded request) toward h2_max_requests.
         var h2c_request_count: u32 = 1;
         var last_activity: i64 = milliTimestamp(self.io);
-        while (!h2.goaway_received and self.running) {
+        while (!h2.goaway_received and self.running.load(.acquire)) {
             // H2 idle timeout (mirrors handleH2Connection).
             if (self.config.h2_idle_timeout_ms > 0 and
                 h2.stream_manager.activeStreamCount() == 0)
@@ -1380,7 +1520,7 @@ pub const Server = struct {
         // serialized with handler fibers' response writes.
         var h2_request_count: u32 = 0;
         var last_activity: i64 = milliTimestamp(self.io);
-        while (!h2.goaway_received and self.running) {
+        while (!h2.goaway_received and self.running.load(.acquire)) {
             // H2 idle timeout: initiate graceful shutdown if no streams are
             // active and idle threshold is exceeded.
             if (self.config.h2_idle_timeout_ms > 0 and
@@ -2514,25 +2654,69 @@ test "shutdown with zero timeout closes listener and cancels connections" {
     defer server.deinit();
 
     // Simulate running state.
-    server.running = true;
+    server.running.store(true, .release);
 
     // shutdown(0) should set running=false and not call io.sleep.
     server.shutdown(0);
-    try std.testing.expect(!server.running);
+    try std.testing.expect(!server.running.load(.acquire));
     try std.testing.expect(server.listener == null);
 }
 
-test "shutdown with nonzero timeout sleeps then cancels" {
-    const allocator = std.testing.allocator;
-    var server = Server.init(allocator, std.testing.io);
+test "shutdown with nonzero timeout returns once an active connection drains" {
+    const Runner = struct {
+        fn listen(server: *Server, ready: *std.atomic.Value(bool), failed: *std.atomic.Value(bool)) void {
+            server.listenWithReady(ready) catch failed.store(true, .release);
+        }
+
+        fn shutdown(server: *Server, elapsed_ms: *std.atomic.Value(i64)) void {
+            const start_ms = milliTimestamp(server.io);
+            server.shutdown(2_000);
+            elapsed_ms.store(milliTimestamp(server.io) - start_ms, .release);
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(std.testing.allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+    });
     defer server.deinit();
+    try server.bind();
+    const address = server.boundAddress().?;
 
-    server.running = true;
+    var ready = std.atomic.Value(bool).init(false);
+    var failed = std.atomic.Value(bool).init(false);
+    const listener_thread = try std.Thread.spawn(.{}, Runner.listen, .{ &server, &ready, &failed });
+    while (!ready.load(.acquire)) std.Thread.yield() catch {};
 
-    // shutdown with a small timeout should sleep (uses .awake clock)
-    // then cancel connections. This verifies the clock enum is valid.
-    server.shutdown(1);
-    try std.testing.expect(!server.running);
+    var client = try Socket.connect(address, io_impl.io());
+    defer client.close();
+    try client.sendAll("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+
+    var accepted = false;
+    for (0..100_000) |_| {
+        server.lifecycle_mutex.lockUncancelable(server.io);
+        accepted = server.active_connections != null;
+        server.lifecycle_mutex.unlock(server.io);
+        if (accepted and server.connections.token.load(.acquire) != null) break;
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(accepted);
+    try std.testing.expect(server.connections.token.load(.acquire) != null);
+
+    var elapsed_ms = std.atomic.Value(i64).init(std.math.maxInt(i64));
+    const shutdown_thread = try std.Thread.spawn(.{}, Runner.shutdown, .{ &server, &elapsed_ms });
+    while (server.running.load(.acquire)) std.Thread.yield() catch {};
+    try client.sendAll("\r\n");
+
+    shutdown_thread.join();
+    listener_thread.join();
+
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expect(elapsed_ms.load(.acquire) < 2_000);
+    try std.testing.expect(server.active_connections == null);
+    try std.testing.expect(server.connections.token.load(.acquire) == null);
 }
 
 test "stop cancels connections immediately" {
@@ -2540,10 +2724,181 @@ test "stop cancels connections immediately" {
     var server = Server.init(allocator, std.testing.io);
     defer server.deinit();
 
-    server.running = true;
+    server.running.store(true, .release);
     server.stop();
-    try std.testing.expect(!server.running);
+    try std.testing.expect(!server.running.load(.acquire));
     try std.testing.expect(server.listener == null);
+}
+
+test "listenWithReady stop wakes an idle accept thread" {
+    const Runner = struct {
+        fn run(
+            server: *Server,
+            ready: *std.atomic.Value(bool),
+            finished: *std.atomic.Value(bool),
+            failed: *std.atomic.Value(bool),
+        ) void {
+            server.listenWithReady(ready) catch failed.store(true, .release);
+            finished.store(true, .release);
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(std.testing.allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+    });
+    defer server.deinit();
+    try server.bind();
+
+    var ready = std.atomic.Value(bool).init(false);
+    var finished = std.atomic.Value(bool).init(false);
+    var failed = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{ &server, &ready, &finished, &failed });
+    while (!ready.load(.acquire) and !finished.load(.acquire)) std.Thread.yield() catch {};
+    const saw_ready = ready.load(.acquire);
+
+    server.stop();
+    thread.join();
+    server.stop();
+    try std.testing.expectError(error.ServerStopped, server.listen());
+
+    try std.testing.expect(saw_ready);
+    try std.testing.expect(finished.load(.acquire));
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expect(server.listener == null);
+}
+
+test "shutdown force-cancels an accepted connection after a nonzero timeout" {
+    const Runner = struct {
+        fn run(server: *Server, ready: *std.atomic.Value(bool), failed: *std.atomic.Value(bool)) void {
+            server.listenWithReady(ready) catch failed.store(true, .release);
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(std.testing.allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+    });
+    defer server.deinit();
+    try server.bind();
+    const address = server.boundAddress().?;
+
+    var ready = std.atomic.Value(bool).init(false);
+    var failed = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{ &server, &ready, &failed });
+    while (!ready.load(.acquire)) std.Thread.yield() catch {};
+
+    var client = try Socket.connect(address, io_impl.io());
+    defer client.close();
+    try client.sendAll("G");
+
+    var accepted = false;
+    for (0..100_000) |_| {
+        server.lifecycle_mutex.lockUncancelable(server.io);
+        accepted = server.active_connections != null;
+        server.lifecycle_mutex.unlock(server.io);
+        if (accepted and server.connections.token.load(.acquire) != null) break;
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(accepted);
+    try std.testing.expect(server.connections.token.load(.acquire) != null);
+
+    server.shutdown(1);
+    thread.join();
+
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expect(server.active_connections == null);
+    try std.testing.expect(server.connections.token.load(.acquire) == null);
+}
+
+test "stop wakes the synchronous connection fallback" {
+    const Runner = struct {
+        fn run(server: *Server, ready: *std.atomic.Value(bool), failed: *std.atomic.Value(bool)) void {
+            server.listenWithReady(ready) catch failed.store(true, .release);
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{ .concurrent_limit = .nothing });
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(std.testing.allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+    });
+    defer server.deinit();
+    try server.bind();
+    const address = server.boundAddress().?;
+
+    var ready = std.atomic.Value(bool).init(false);
+    var failed = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{ &server, &ready, &failed });
+    while (!ready.load(.acquire)) std.Thread.yield() catch {};
+
+    var client = try Socket.connect(address, io_impl.io());
+    defer client.close();
+    try client.sendAll("G");
+
+    var accepted = false;
+    for (0..100_000) |_| {
+        server.lifecycle_mutex.lockUncancelable(server.io);
+        accepted = server.active_connections != null;
+        server.lifecycle_mutex.unlock(server.io);
+        if (accepted) break;
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(accepted);
+    try std.testing.expect(server.connections.token.load(.acquire) == null);
+
+    server.stop();
+    thread.join();
+
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expect(server.active_connections == null);
+}
+
+test "stop racing accept cannot add a connection after cancellation" {
+    const Runner = struct {
+        fn listen(server: *Server, ready: *std.atomic.Value(bool), failed: *std.atomic.Value(bool)) void {
+            server.listenWithReady(ready) catch failed.store(true, .release);
+        }
+
+        fn stop(server: *Server) void {
+            server.stop();
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(std.testing.allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+    });
+    defer server.deinit();
+    try server.bind();
+    const address = server.boundAddress().?;
+
+    var ready = std.atomic.Value(bool).init(false);
+    var failed = std.atomic.Value(bool).init(false);
+    const listener_thread = try std.Thread.spawn(.{}, Runner.listen, .{ &server, &ready, &failed });
+    while (!ready.load(.acquire)) std.Thread.yield() catch {};
+
+    server.lifecycle_mutex.lockUncancelable(server.io);
+    var client = try Socket.connect(address, io_impl.io());
+    defer client.close();
+    try client.sendAll("G");
+    const stop_thread = try std.Thread.spawn(.{}, Runner.stop, .{&server});
+    while (!server.stopped.load(.acquire)) std.Thread.yield() catch {};
+    server.lifecycle_mutex.unlock(server.io);
+
+    stop_thread.join();
+    listener_thread.join();
+
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expect(server.active_connections == null);
+    try std.testing.expect(server.connections.token.load(.acquire) == null);
 }
 
 test "containsTraversal rejects double-encoded dot-dot" {

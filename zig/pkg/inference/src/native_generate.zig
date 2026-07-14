@@ -124,10 +124,14 @@ const Options = struct {
     json_timing_path: ?[]const u8 = null,
 };
 
-fn shouldSkipMetalAutoDraftLoad(opts: Options, draft_is_gemma4_mtp: bool) bool {
+fn shouldSkipMetalAutoDraftLoadWithGate(opts: Options, draft_is_gemma4_mtp: bool, metal_auto_enabled: bool) bool {
     return opts.backend == .metal and
         opts.speculation_policy == .auto and
-        (!draft_is_gemma4_mtp or !generation.gemma4MtpMetalAutoEnabled());
+        (!draft_is_gemma4_mtp or !metal_auto_enabled);
+}
+
+fn shouldSkipMetalAutoDraftLoad(opts: Options, draft_is_gemma4_mtp: bool) bool {
+    return shouldSkipMetalAutoDraftLoadWithGate(opts, draft_is_gemma4_mtp, generation.gemma4MtpMetalAutoEnabled());
 }
 
 fn validateCacheCompactionOption(ratio: ?f32) !void {
@@ -6859,15 +6863,17 @@ test "raw decode bench json includes metal compact stats" {
     try std.testing.expectEqual(@as(i64, 2), metal.get("quant_kernel_plan").?.object.get("top_fallback_count").?.integer);
 }
 
-test "explicit Metal auto draft admission stays Gemma4 MTP-only" {
+test "Metal auto draft admission defaults off and stays Gemma4 MTP-only" {
     const opts = Options{
         .model_dir = "model",
         .prompt = "prompt",
         .backend = .metal,
         .speculation_policy = .auto,
     };
-    try std.testing.expect(shouldSkipMetalAutoDraftLoad(opts, false));
-    try std.testing.expect(!shouldSkipMetalAutoDraftLoad(opts, true));
+    try std.testing.expect(shouldSkipMetalAutoDraftLoadWithGate(opts, false, false));
+    try std.testing.expect(shouldSkipMetalAutoDraftLoadWithGate(opts, true, false));
+    try std.testing.expect(shouldSkipMetalAutoDraftLoadWithGate(opts, false, true));
+    try std.testing.expect(!shouldSkipMetalAutoDraftLoadWithGate(opts, true, true));
 }
 
 test "draft KV backend follows the loaded draft session" {

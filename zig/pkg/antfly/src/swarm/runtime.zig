@@ -30,6 +30,9 @@ const public_api_max_requests_per_connection: u32 = 64;
 const public_api_max_body_size: usize = antfly.common.http.default_max_request_bytes;
 const local_schema_migration_finalize_interval_ms: u64 = std.time.ms_per_s;
 const default_public_port: u16 = 8080;
+const cors_default_methods = [_][]const u8{ "GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH" };
+const cors_default_headers = [_][]const u8{ "Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin" };
+const cors_default_max_age: u32 = 3600;
 const antfarm_max_file_bytes: usize = 64 * 1024 * 1024;
 const antfarm_installed_asset_root = "../share/antfly/antfarm";
 const antfarm_asset_roots = [_][]const u8{
@@ -876,6 +879,18 @@ pub fn runFromIterator(
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
 
+    validateServerTlsConfig(if (loaded_config) |*cfg| cfg.tls else null) catch |err| {
+        std.log.err(
+            "swarm startup rejected configured tls: built-in server TLS is unsupported; remove the tls configuration and terminate TLS at a trusted reverse proxy",
+            .{},
+        );
+        return err;
+    };
+    validateCorsConfig(configuredCors(if (loaded_config) |*cfg| cfg else null)) catch |err| {
+        std.log.err("swarm startup rejected invalid cors configuration err={}", .{err});
+        return err;
+    };
+
     const data_dir = try resolveLocalBaseDir(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer alloc.free(data_dir);
     try antfly.common.data_format.ensureCompatible(alloc, data_dir);
@@ -908,10 +923,7 @@ pub fn runFromIterator(
         .generation_budget_overrides = resolveInferenceBudgetOverrides(cli),
         .preload = resolved_warm_models.items,
     };
-    if (loaded_config) |*cfg| {
-        if (cfg.effectiveAntflyContentSecurity()) |security| antfly_node_cfg.content_security = security.*;
-        if (cfg.inference.s3_credentials) |creds| antfly_node_cfg.s3_credentials = creds;
-    }
+    if (loaded_config) |*cfg| applyCommonInferenceConfig(&antfly_node_cfg, cfg);
     var antfly_node = try inference.server.Node.init(alloc, antfly_node_cfg);
     defer antfly_node.deinit();
     try antfly_node.warmConfiguredModels(alloc);
@@ -1088,23 +1100,46 @@ pub fn runFromIterator(
 
     const bind_host = public_listener.bind_host;
     const bind_port = public_listener.bind_port;
+    var unified_io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer unified_io_impl.deinit();
+    var unified_server = httpx.Server.initWithConfig(
+        alloc,
+        unified_io_impl.io(),
+        publicHttpServerConfig(bind_host, bind_port),
+    );
+    defer unified_server.deinit();
+
+    active_api_server = api_server;
+    defer active_api_server = null;
+    active_cors_config = configuredCors(api_server.cfg.node_config);
+    defer active_cors_config = null;
+
+    configureUnifiedServer(&unified_server, &handler, &antfly_node) catch |err| {
+        std.log.err("swarm startup failed step=configure_unified_http err={}", .{err});
+        return err;
+    };
+    unified_server.bind() catch |err| {
+        std.log.err("swarm startup failed step=bind_unified_http err={}", .{err});
+        return err;
+    };
+
+    if (unified_server.boundAddress()) |addr| {
+        std.debug.print("swarm public api listening on http://{}\n", .{addr});
+    }
+
     var unified_api_ready = std.atomic.Value(bool).init(false);
+    var unified_api_finished = std.atomic.Value(bool).init(false);
 
     const thread = std.Thread.spawn(.{}, serveUnified, .{
-        alloc,
-        bind_host,
-        bind_port,
-        &handler,
-        &antfly_node,
-        api_server,
+        &unified_server,
         &unified_api_ready,
+        &unified_api_finished,
     }) catch |err| {
         std.log.err("swarm startup failed step=spawn_unified_http err={}", .{err});
         return err;
     };
-    _ = thread; // detach happens on process exit
+    defer stopUnifiedServer(&unified_server, thread, &unified_api_ready, &unified_api_finished);
 
-    // Print bound address. The thread will print it after bind().
     std.debug.print("swarm local metadata enabled (raft disabled)\n", .{});
 
     var swarm_health = SwarmHealthSource{
@@ -1152,6 +1187,15 @@ pub fn runFromIterator(
     }
 }
 
+fn applyCommonInferenceConfig(
+    node_cfg: *inference.server.NodeConfig,
+    cfg: *const antfly.common.config.Config,
+) void {
+    if (cfg.effectiveAntflyContentSecurity()) |security| node_cfg.content_security = security.*;
+    if (cfg.inference.s3_credentials) |creds| node_cfg.s3_credentials = creds;
+    if (cfg.inference.max_concurrent_requests) |limit| node_cfg.max_concurrent_requests = limit;
+}
+
 fn localAntflyProvider(node: *inference.server.Node) antfly.inference.managed_embedder.AntflyProvider {
     return .{
         .ptr = node,
@@ -1192,56 +1236,25 @@ fn localAntflyEmbedDenseParts(
     parts: []const antfly.template.ContentPart,
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    var values = std.json.Array.init(alloc);
-    defer values.deinit();
-    var encoded_buffers = std.ArrayListUnmanaged([]u8).empty;
-    defer {
-        for (encoded_buffers.items) |buf| alloc.free(buf);
-        encoded_buffers.deinit(alloc);
-    }
+    const direct_parts = try localAntflyDirectDenseParts(alloc, parts);
+    defer alloc.free(direct_parts);
+    return try node.embedDensePartsDirect(alloc, model, direct_parts);
+}
 
-    for (parts) |part| {
-        switch (part) {
-            .text => |text| {
-                var obj = std.json.ObjectMap.empty;
-                errdefer obj.deinit(alloc);
-                try obj.put(alloc, "type", .{ .string = "text" });
-                try obj.put(alloc, "text", .{ .string = text });
-                try values.append(.{ .object = obj });
-            },
-            .media_url => |url| {
-                var image_url = std.json.ObjectMap.empty;
-                errdefer image_url.deinit(alloc);
-                try image_url.put(alloc, "url", .{ .string = url });
-
-                var obj = std.json.ObjectMap.empty;
-                errdefer obj.deinit(alloc);
-                try obj.put(alloc, "type", .{ .string = "image_url" });
-                try obj.put(alloc, "image_url", .{ .object = image_url });
-                try values.append(.{ .object = obj });
-            },
-            .binary => |binary_part| {
-                const encoded_len = std.base64.standard.Encoder.calcSize(binary_part.data.len);
-                const encoded = try alloc.alloc(u8, encoded_len);
-                errdefer alloc.free(encoded);
-                _ = std.base64.standard.Encoder.encode(encoded, binary_part.data);
-                try encoded_buffers.append(alloc, encoded);
-
-                var obj = std.json.ObjectMap.empty;
-                errdefer {
-                    obj.deinit(alloc);
-                    _ = encoded_buffers.pop();
-                    alloc.free(encoded);
-                }
-                try obj.put(alloc, "type", .{ .string = "media" });
-                try obj.put(alloc, "data", .{ .string = encoded });
-                try obj.put(alloc, "mime_type", .{ .string = binary_part.mime_type });
-                try values.append(.{ .object = obj });
-            },
-        }
-    }
-
-    return try node.embedDenseJsonInputDirect(alloc, model, .{ .array = values });
+fn localAntflyDirectDenseParts(
+    alloc: std.mem.Allocator,
+    parts: []const antfly.template.ContentPart,
+) ![]inference.server.Node.DirectDenseEmbedPart {
+    const out = try alloc.alloc(inference.server.Node.DirectDenseEmbedPart, parts.len);
+    for (parts, out) |part, *direct| direct.* = switch (part) {
+        .text => |text| .{ .text = text },
+        .media_url => |url| .{ .image_url = url },
+        .binary => |media| .{ .media = .{
+            .mime_type = media.mime_type,
+            .data = media.data,
+        } },
+    };
+    return out;
 }
 
 fn localAntflyEmbedSparseTexts(
@@ -1297,9 +1310,14 @@ fn localAntflyGenerateMessages(
     messages: []const antfly.inference.ChatMessage,
 ) anyerror![]u8 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    var converted = try convertLocalGenerateMessages(alloc, messages);
+    if (messages.len == 0) return error.InvalidGenerationRequest;
+    const preflight = try preflightLocalGenerateMessages(messages);
+    var admission = try node.beginDirectGenerateAdmission(preflight, 256);
+    defer admission.deinit();
+
+    var converted = try convertLocalGenerateMessages(alloc, messages, preflight.decoded_media_bytes);
     defer converted.deinit(alloc);
-    return try node.generateMessagesDirect(alloc, model, converted.messages);
+    return try node.generateMessagesDirectAdmitted(alloc, model, converted.messages, &admission);
 }
 
 fn localAntflyReadImages(
@@ -1353,18 +1371,114 @@ const LocalGenerateMessages = struct {
     }
 };
 
+const LocalGenerateMediaDescriptor = struct {
+    payload: []const u8,
+    mime_type: []const u8,
+    encoded_bytes: usize,
+    decoded_bytes: usize,
+};
+
+const LocalGenerateDecodeBudget = struct {
+    remaining_bytes: usize,
+
+    fn reserve(self: *@This(), bytes: usize) !void {
+        if (bytes > self.remaining_bytes) return error.RemoteContentTooLarge;
+        self.remaining_bytes -= bytes;
+    }
+};
+
+fn inspectLocalGenerateDataUri(
+    raw: []const u8,
+    declared_mime_type: ?[]const u8,
+) !LocalGenerateMediaDescriptor {
+    var mime_type = declared_mime_type orelse "application/octet-stream";
+    var payload = raw;
+    if (std.mem.startsWith(u8, raw, "data:")) {
+        const comma = std.mem.indexOfScalar(u8, raw, ',') orelse return error.UnsupportedGeneratorProvider;
+        const meta = raw["data:".len..comma];
+        if (!std.mem.endsWith(u8, meta, ";base64")) return error.UnsupportedGeneratorProvider;
+        const embedded_mime = meta[0 .. meta.len - ";base64".len];
+        if (embedded_mime.len > 0) {
+            if (declared_mime_type) |declared| {
+                if (!std.mem.eql(u8, declared, embedded_mime)) return error.UnsupportedGeneratorProvider;
+            }
+            mime_type = embedded_mime;
+        }
+        payload = raw[comma + 1 ..];
+    }
+
+    return .{
+        .payload = payload,
+        .mime_type = mime_type,
+        .encoded_bytes = raw.len,
+        .decoded_bytes = try std.base64.standard.Decoder.calcSizeForSlice(payload),
+    };
+}
+
+fn addLocalGenerateBytes(total: *usize, amount: usize) !void {
+    total.* = std.math.add(usize, total.*, amount) catch return error.RemoteContentTooLarge;
+}
+
+fn addLocalGenerateMediaPreflight(
+    preflight: *inference.server.Node.DirectGeneratePreflight,
+    descriptor: LocalGenerateMediaDescriptor,
+    image_only: bool,
+) !void {
+    const is_image = std.mem.startsWith(u8, descriptor.mime_type, "image/");
+    const is_audio = std.mem.startsWith(u8, descriptor.mime_type, "audio/");
+    if (!is_image and (image_only or !is_audio)) return error.UnsupportedGeneratorProvider;
+
+    try addLocalGenerateBytes(&preflight.encoded_media_bytes, descriptor.encoded_bytes);
+    try addLocalGenerateBytes(&preflight.decoded_media_bytes, descriptor.decoded_bytes);
+    try addLocalGenerateBytes(&preflight.media_count, 1);
+    if (is_image) {
+        try addLocalGenerateBytes(&preflight.image_count, 1);
+    } else {
+        preflight.has_audio = true;
+    }
+}
+
+fn preflightLocalGenerateMessages(
+    messages: []const antfly.inference.ChatMessage,
+) !inference.server.Node.DirectGeneratePreflight {
+    var preflight: inference.server.Node.DirectGeneratePreflight = .{};
+    for (messages) |message| {
+        const content = message.content orelse continue;
+        switch (content) {
+            .text => |text_value| try addLocalGenerateBytes(&preflight.text_bytes, text_value.len),
+            .parts => |parts| for (parts) |part| switch (part) {
+                .text => |text_value| try addLocalGenerateBytes(&preflight.text_bytes, text_value.len),
+                .image_url => |image_url| try addLocalGenerateMediaPreflight(
+                    &preflight,
+                    try inspectLocalGenerateDataUri(image_url.url, null),
+                    true,
+                ),
+                .media => |media| try addLocalGenerateMediaPreflight(
+                    &preflight,
+                    try inspectLocalGenerateDataUri(media.url orelse media.data, media.mime_type),
+                    false,
+                ),
+            },
+        }
+    }
+    return preflight;
+}
+
 fn convertLocalGenerateMessages(
     alloc: std.mem.Allocator,
     messages: []const antfly.inference.ChatMessage,
+    decoded_media_bytes: usize,
 ) !LocalGenerateMessages {
     var out = LocalGenerateMessages{
         .messages = try alloc.alloc(inference.pipelines.GenerationMessage, messages.len),
     };
     errdefer out.deinit(alloc);
+    var decode_budget = LocalGenerateDecodeBudget{ .remaining_bytes = decoded_media_bytes };
 
     for (messages, 0..) |message, i| {
-        out.messages[i] = try convertLocalGenerateMessage(alloc, &out, message);
+        out.messages[i] = try convertLocalGenerateMessage(alloc, &out, message, &decode_budget);
     }
+    if (decode_budget.remaining_bytes != 0) return error.InvalidGenerationAdmission;
     return out;
 }
 
@@ -1372,6 +1486,7 @@ fn convertLocalGenerateMessage(
     alloc: std.mem.Allocator,
     owner: *LocalGenerateMessages,
     message: antfly.inference.ChatMessage,
+    decode_budget: *LocalGenerateDecodeBudget,
 ) !inference.pipelines.GenerationMessage {
     const role = message.role.toSlice();
     const content = message.content orelse {
@@ -1392,7 +1507,7 @@ fn convertLocalGenerateMessage(
             text_owned = false;
             break :blk .{ .role = role, .content = text };
         },
-        .parts => |parts| try convertLocalGenerateParts(alloc, owner, role, parts),
+        .parts => |parts| try convertLocalGenerateParts(alloc, owner, role, parts, decode_budget),
     };
 }
 
@@ -1401,6 +1516,7 @@ fn convertLocalGenerateParts(
     owner: *LocalGenerateMessages,
     role: []const u8,
     parts: []const antfly.inference.ContentPart,
+    decode_budget: *LocalGenerateDecodeBudget,
 ) !inference.pipelines.GenerationMessage {
     var text_buf = std.ArrayListUnmanaged(u8).empty;
     errdefer text_buf.deinit(alloc);
@@ -1420,7 +1536,7 @@ fn convertLocalGenerateParts(
                 try out_parts.append(alloc, .{ .text = text });
             },
             .image_url => |image_url| {
-                const decoded = try decodeLocalGenerateDataUri(alloc, image_url.url, null);
+                const decoded = try decodeLocalGenerateDataUri(alloc, image_url.url, null, decode_budget);
                 var decoded_owned = true;
                 errdefer if (decoded_owned) alloc.free(decoded.data);
                 if (!std.mem.startsWith(u8, decoded.mime_type, "image/")) {
@@ -1433,7 +1549,7 @@ fn convertLocalGenerateParts(
             },
             .media => |media| {
                 const raw = media.url orelse media.data;
-                const decoded = try decodeLocalGenerateDataUri(alloc, raw, media.mime_type);
+                const decoded = try decodeLocalGenerateDataUri(alloc, raw, media.mime_type, decode_budget);
                 var decoded_owned = true;
                 errdefer if (decoded_owned) alloc.free(decoded.data);
                 if (std.mem.startsWith(u8, decoded.mime_type, "image/")) {
@@ -1501,28 +1617,14 @@ fn decodeLocalGenerateDataUri(
     alloc: std.mem.Allocator,
     raw: []const u8,
     declared_mime_type: ?[]const u8,
+    decode_budget: *LocalGenerateDecodeBudget,
 ) !DecodedLocalMedia {
-    var mime_type = declared_mime_type orelse "application/octet-stream";
-    var payload = raw;
-    if (std.mem.startsWith(u8, raw, "data:")) {
-        const comma = std.mem.indexOfScalar(u8, raw, ',') orelse return error.UnsupportedGeneratorProvider;
-        const meta = raw["data:".len..comma];
-        if (!std.mem.endsWith(u8, meta, ";base64")) return error.UnsupportedGeneratorProvider;
-        const embedded_mime = meta[0 .. meta.len - ";base64".len];
-        if (embedded_mime.len > 0) {
-            if (declared_mime_type) |declared| {
-                if (!std.mem.eql(u8, declared, embedded_mime)) return error.UnsupportedGeneratorProvider;
-            }
-            mime_type = embedded_mime;
-        }
-        payload = raw[comma + 1 ..];
-    }
-
-    const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(payload);
-    const decoded = try alloc.alloc(u8, decoded_len);
+    const descriptor = try inspectLocalGenerateDataUri(raw, declared_mime_type);
+    try decode_budget.reserve(descriptor.decoded_bytes);
+    const decoded = try alloc.alloc(u8, descriptor.decoded_bytes);
     errdefer alloc.free(decoded);
-    try std.base64.standard.Decoder.decode(decoded, payload);
-    return .{ .data = decoded, .mime_type = mime_type };
+    try std.base64.standard.Decoder.decode(decoded, descriptor.payload);
+    return .{ .data = decoded, .mime_type = descriptor.mime_type };
 }
 
 // ---------------------------------------------------------------
@@ -1530,49 +1632,52 @@ fn decodeLocalGenerateDataUri(
 // ---------------------------------------------------------------
 
 fn serveUnified(
-    alloc: std.mem.Allocator,
-    bind_host: []const u8,
-    bind_port: u16,
-    handler: *AntflyApiHandler,
-    antfly_node: ?*inference.server.Node,
-    api_server: *antfly.public_api.http_server.ApiHttpServer,
+    server: *httpx.Server,
     unified_api_ready: *std.atomic.Value(bool),
+    unified_api_finished: *std.atomic.Value(bool),
 ) void {
-    serveUnifiedInner(alloc, bind_host, bind_port, handler, antfly_node, api_server, unified_api_ready) catch |err| {
-        unified_api_ready.store(false, .release);
+    defer unified_api_finished.store(true, .release);
+    server.listenWithReady(unified_api_ready) catch |err| {
         std.debug.print("unified server error: {}\n", .{err});
     };
 }
 
-fn serveUnifiedInner(
-    alloc: std.mem.Allocator,
-    bind_host: []const u8,
-    bind_port: u16,
+fn stopUnifiedServer(
+    server: *httpx.Server,
+    thread: std.Thread,
+    unified_api_ready: *std.atomic.Value(bool),
+    unified_api_finished: *const std.atomic.Value(bool),
+) void {
+    while (!unified_api_ready.load(.acquire) and !unified_api_finished.load(.acquire)) {
+        std.Thread.yield() catch {};
+    }
+    unified_api_ready.store(false, .release);
+    server.stop();
+    thread.join();
+}
+
+fn configureUnifiedServer(
+    server: *httpx.Server,
     handler: *AntflyApiHandler,
     antfly_node: ?*inference.server.Node,
-    api_server: *antfly.public_api.http_server.ApiHttpServer,
-    unified_api_ready: *std.atomic.Value(bool),
 ) !void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-
-    var server = httpx.Server.initWithConfig(alloc, io_impl.io(), publicHttpServerConfig(bind_host, bind_port));
-    defer server.deinit();
+    if (corsEnabled(active_cors_config)) try server.use(corsMiddleware());
+    try server.use(inferenceAuthMiddleware());
 
     // Register inference AI routes under /ai/v1 and Traditional ML routes under /ml/v1.
     if (antfly_node) |node| {
-        try node.registerRoutesOn(inference.server.public_api_prefix, &server);
-        try node.registerAiRoutesOn(inference.server.ai_api_prefix, &server);
+        try node.registerRoutesOn(inference.server.public_api_prefix, server);
+        try node.registerAiRoutesOn(inference.server.ai_api_prefix, server);
     }
 
     // Register antfly public API routes under /db/v1
     const public_router = metadata_openapi.server.ServerRouter(AntflyApiHandler).init(handler);
-    var public_prefixed = PrefixedServer("/db/v1", httpx.Server){ .inner = &server };
+    var public_prefixed = PrefixedServer("/db/v1", httpx.Server){ .inner = server };
     try public_router.register(&public_prefixed);
 
     // Register user management routes under /auth/v1
     const usermgr_router = usermgr_openapi.server.ServerRouter(AntflyApiHandler).init(handler);
-    try usermgr_router.register(&server);
+    try usermgr_router.register(server);
 
     // Health/ready at root level
     try server.get("/healthz", healthzHandler);
@@ -1580,22 +1685,291 @@ fn serveUnifiedInner(
 
     // Internal group routes are still served by the legacy ApiHttpServer
     // implementation, but the shared httpx server owns the route table.
-    active_api_server = api_server;
-    try registerHAAdminRoutes(&server);
-    try registerHAInternalRoutes(&server);
-    try registerMcpRoutes(&server);
-    try registerExtensionRoutes(&server);
-    try registerInternalGroupRoutes(&server);
-    try registerAntfarmRoutes(&server);
+    try registerHAAdminRoutes(server);
+    try registerHAInternalRoutes(server);
+    try registerMcpRoutes(server);
+    try registerExtensionRoutes(server);
+    try registerInternalGroupRoutes(server);
+    try registerAntfarmRoutes(server);
+}
 
-    try server.bind();
-    unified_api_ready.store(true, .release);
+fn inferenceAuthMiddleware() httpx.Middleware {
+    return .{
+        .name = "inference_auth",
+        .handler = struct {
+            fn handler(ctx: *httpx.Context, next: *httpx.Next) anyerror!httpx.Response {
+                if (!isInferenceApiPath(ctx.request.uri.path)) return next.call(ctx);
 
-    if (server.boundAddress()) |addr| {
-        std.debug.print("swarm public api listening on http://{}\n", .{addr});
+                const server = active_api_server orelse return inferenceNotReadyResponse(ctx);
+                if (!server.cfg.auth_enabled and server.cfg.trusted_principal_secret == null) {
+                    return next.call(ctx);
+                }
+                if (server.cfg.auth_enabled and
+                    server.cfg.user_manager == null and
+                    server.cfg.trusted_principal_secret == null)
+                {
+                    return inferenceNotReadyResponse(ctx);
+                }
+
+                var identity = server.authenticateRequest(.{
+                    .authorization = ctx.header("authorization"),
+                    .trusted_principal = ctx.header(antfly.public_api.http_server.trusted_principal_header),
+                }) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return inferenceUnauthorizedResponse(ctx),
+                };
+                defer identity.deinit(server.alloc);
+                return next.call(ctx);
+            }
+        }.handler,
+    };
+}
+
+fn corsMiddleware() httpx.Middleware {
+    return .{
+        .name = "cors",
+        .handler = struct {
+            fn handler(ctx: *httpx.Context, next: *httpx.Next) anyerror!httpx.Response {
+                const config = active_cors_config orelse return next.call(ctx);
+                if (!(config.enabled orelse true)) return next.call(ctx);
+
+                const origin = ctx.header("origin") orelse return next.call(ctx);
+                const requested_method = if (ctx.request.method == .OPTIONS)
+                    ctx.header("access-control-request-method")
+                else
+                    null;
+                const is_preflight = requested_method != null;
+                const allowed_origin = corsAllowedOrigin(config, origin);
+
+                if (allowed_origin == null or
+                    (is_preflight and !corsMethodAllowed(config, requested_method.?)) or
+                    (is_preflight and !corsRequestHeadersAllowed(config, ctx.header("access-control-request-headers"))) or
+                    (!is_preflight and !corsMethodAllowed(config, ctx.request.method.toString())))
+                {
+                    if (!is_preflight) {
+                        try ctx.response.headers.append("Vary", "Origin");
+                        return next.call(ctx);
+                    }
+                    try appendCorsPreflightVary(&ctx.response.headers, true);
+                    return ctx.status(403).text("CORS request denied");
+                }
+
+                try applyCorsOriginHeaders(&ctx.response.headers, config, allowed_origin.?);
+                if (!is_preflight) {
+                    try applyCorsExposedHeaders(ctx, config);
+                    return next.call(ctx);
+                }
+
+                try appendCorsPreflightVary(&ctx.response.headers, false);
+                try applyCorsPreflightHeaders(ctx, config);
+                return ctx.status(204).text("");
+            }
+        }.handler,
+    };
+}
+
+fn applyCorsOriginHeaders(
+    headers: *httpx.Headers,
+    config: *const antfly.common.config.Config.CorsConfig,
+    allowed_origin: []const u8,
+) !void {
+    try headers.set("Access-Control-Allow-Origin", allowed_origin);
+    if (!std.mem.eql(u8, allowed_origin, "*")) try headers.append("Vary", "Origin");
+    if (config.allow_credentials orelse false) try headers.set("Access-Control-Allow-Credentials", "true");
+}
+
+fn appendCorsPreflightVary(headers: *httpx.Headers, include_origin: bool) !void {
+    if (include_origin) try headers.append("Vary", "Origin");
+    try headers.append("Vary", "Access-Control-Request-Method");
+    try headers.append("Vary", "Access-Control-Request-Headers");
+}
+
+fn applyCorsExposedHeaders(ctx: *httpx.Context, config: *const antfly.common.config.Config.CorsConfig) !void {
+    const exposed = config.exposed_headers orelse return;
+    if (exposed.len == 0) return;
+    const joined = try joinCorsValues(ctx.allocator, exposed);
+    defer ctx.allocator.free(joined);
+    try ctx.response.headers.set("Access-Control-Expose-Headers", joined);
+}
+
+fn applyCorsPreflightHeaders(ctx: *httpx.Context, config: *const antfly.common.config.Config.CorsConfig) !void {
+    const methods = if (config.allowed_methods) |values|
+        try joinCorsValues(ctx.allocator, values)
+    else
+        try joinCorsValues(ctx.allocator, &cors_default_methods);
+    defer ctx.allocator.free(methods);
+    try ctx.response.headers.set("Access-Control-Allow-Methods", methods);
+
+    // With credentials, Fetch treats `*` as the literal header name rather
+    // than a wildcard. The request list has already been token-validated, so
+    // reflect it explicitly to preserve the configured "allow any" intent.
+    const credentialed_wildcard_headers = (config.allow_credentials orelse false) and corsAllowsAnyHeader(config);
+    const headers = if (credentialed_wildcard_headers and ctx.header("access-control-request-headers") != null)
+        try ctx.allocator.dupe(u8, ctx.header("access-control-request-headers").?)
+    else if (config.allowed_headers) |values|
+        try joinCorsValues(ctx.allocator, values)
+    else
+        try joinCorsValues(ctx.allocator, &cors_default_headers);
+    defer ctx.allocator.free(headers);
+    try ctx.response.headers.set("Access-Control-Allow-Headers", headers);
+
+    var max_age_buf: [10]u8 = undefined;
+    const max_age = try std.fmt.bufPrint(&max_age_buf, "{d}", .{config.max_age orelse cors_default_max_age});
+    try ctx.response.headers.set("Access-Control-Max-Age", max_age);
+}
+
+fn joinCorsValues(alloc: std.mem.Allocator, values: anytype) ![]u8 {
+    var size: usize = 0;
+    for (values, 0..) |value, i| size += value.len + @as(usize, if (i == 0) 0 else 2);
+    const joined = try alloc.alloc(u8, size);
+    var offset: usize = 0;
+    for (values, 0..) |value, i| {
+        if (i != 0) {
+            @memcpy(joined[offset..][0..2], ", ");
+            offset += 2;
+        }
+        @memcpy(joined[offset..][0..value.len], value);
+        offset += value.len;
+    }
+    return joined;
+}
+
+fn corsAllowedOrigin(config: *const antfly.common.config.Config.CorsConfig, origin: []const u8) ?[]const u8 {
+    if (!isSafeCorsOrigin(origin)) return null;
+    if (config.allowed_origins) |origins| {
+        if (origins.len != 0) {
+            for (origins) |allowed| if (std.mem.eql(u8, allowed, "*")) return "*";
+            for (origins) |allowed| {
+                if (std.mem.eql(u8, allowed, origin)) return origin;
+            }
+            return null;
+        }
+    }
+    return "*";
+}
+
+fn corsMethodAllowed(config: *const antfly.common.config.Config.CorsConfig, method: []const u8) bool {
+    if (config.allowed_methods) |methods| {
+        for (methods) |allowed| if (std.mem.eql(u8, allowed, method)) return true;
+        return false;
+    }
+    for (cors_default_methods) |allowed| if (std.mem.eql(u8, allowed, method)) return true;
+    return false;
+}
+
+fn corsRequestHeadersAllowed(config: *const antfly.common.config.Config.CorsConfig, requested: ?[]const u8) bool {
+    const raw = requested orelse return true;
+    var values = std.mem.splitScalar(u8, raw, ',');
+    while (values.next()) |value| {
+        const name = std.mem.trim(u8, value, " \t");
+        if (!isHttpToken(name) or !corsHeaderAllowed(config, name)) return false;
+    }
+    return true;
+}
+
+fn corsHeaderAllowed(config: *const antfly.common.config.Config.CorsConfig, name: []const u8) bool {
+    if (config.allowed_headers) |headers| {
+        for (headers) |allowed| {
+            if (std.mem.eql(u8, allowed, "*") or std.ascii.eqlIgnoreCase(allowed, name)) return true;
+        }
+        return false;
+    }
+    for (cors_default_headers) |allowed| if (std.ascii.eqlIgnoreCase(allowed, name)) return true;
+    return false;
+}
+
+fn corsAllowsAnyHeader(config: *const antfly.common.config.Config.CorsConfig) bool {
+    const headers = config.allowed_headers orelse return false;
+    for (headers) |allowed| if (std.mem.eql(u8, allowed, "*")) return true;
+    return false;
+}
+
+fn configuredCors(config: ?*const antfly.common.config.Config) ?*const antfly.common.config.Config.CorsConfig {
+    const loaded = config orelse return null;
+    return if (loaded.cors) |*cors| cors else null;
+}
+
+fn corsEnabled(config: ?*const antfly.common.config.Config.CorsConfig) bool {
+    const cors = config orelse return false;
+    return cors.enabled orelse true;
+}
+
+fn validateCorsConfig(config: ?*const antfly.common.config.Config.CorsConfig) !void {
+    const cors = config orelse return;
+    if (!(cors.enabled orelse true)) return;
+
+    const allow_credentials = cors.allow_credentials orelse false;
+    if (cors.allowed_origins) |origins| {
+        if (origins.len == 0 and allow_credentials) return error.CorsCredentialsWithWildcardOrigin;
+        for (origins) |origin| {
+            if (!isSafeCorsOrigin(origin)) return error.InvalidCorsOrigin;
+            if (allow_credentials and std.mem.eql(u8, origin, "*")) return error.CorsCredentialsWithWildcardOrigin;
+            if (allow_credentials and std.mem.eql(u8, origin, "null")) return error.CorsCredentialsWithOpaqueOrigin;
+        }
+    } else if (allow_credentials) {
+        return error.CorsCredentialsWithWildcardOrigin;
     }
 
-    try server.listen();
+    if (cors.allowed_methods) |methods| for (methods) |method| {
+        if (httpx.Method.fromString(method) == null) return error.InvalidCorsMethod;
+    };
+    if (cors.allowed_headers) |headers| for (headers) |header| {
+        if (!isHttpToken(header)) return error.InvalidCorsHeader;
+    };
+    if (cors.exposed_headers) |headers| for (headers) |header| {
+        if (!isHttpToken(header)) return error.InvalidCorsHeader;
+        if (allow_credentials and std.mem.eql(u8, header, "*")) return error.CorsCredentialsWithWildcardExposedHeaders;
+    };
+}
+
+fn isSafeCorsOrigin(origin: []const u8) bool {
+    if (std.mem.eql(u8, origin, "*") or std.mem.eql(u8, origin, "null")) return true;
+    const scheme_end = std.mem.indexOf(u8, origin, "://") orelse return false;
+    if (scheme_end == 0 or scheme_end + 3 == origin.len or !std.ascii.isAlphabetic(origin[0])) return false;
+    for (origin[1..scheme_end]) |char| {
+        if (!std.ascii.isAlphanumeric(char) and char != '+' and char != '-' and char != '.') return false;
+    }
+    for (origin[scheme_end + 3 ..]) |char| {
+        if (char <= ' ' or char >= 0x7f or char == '/' or char == '?' or char == '#' or char == '@' or char == ',') return false;
+    }
+    return true;
+}
+
+fn isHttpToken(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |char| switch (char) {
+        'a'...'z', 'A'...'Z', '0'...'9', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn isInferenceApiPath(path: []const u8) bool {
+    return hasPathComponentPrefix(path, inference.server.ai_api_prefix) or
+        hasPathComponentPrefix(path, inference.server.public_api_prefix);
+}
+
+fn hasPathComponentPrefix(path: []const u8, prefix: []const u8) bool {
+    return std.mem.eql(u8, path, prefix) or
+        (std.mem.startsWith(u8, path, prefix) and path.len > prefix.len and path[prefix.len] == '/');
+}
+
+fn inferenceUnauthorizedResponse(ctx: *httpx.Context) !httpx.Response {
+    try ctx.setHeader("WWW-Authenticate", "Basic realm=\"antfly\", Bearer realm=\"antfly\", ApiKey realm=\"antfly\"");
+    return ctx.status(401).json(.{
+        .@"error" = "unauthorized",
+        .message = "valid Basic, Bearer, or ApiKey credentials are required",
+        .retryable = false,
+    });
+}
+
+fn inferenceNotReadyResponse(ctx: *httpx.Context) !httpx.Response {
+    try ctx.setHeader("Retry-After", "1");
+    return ctx.status(503).json(.{
+        .@"error" = "not_ready",
+        .message = "inference authentication is not ready",
+        .retryable = true,
+    });
 }
 
 fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerConfig {
@@ -1635,7 +2009,13 @@ fn healthzHandler(ctx: *httpx.Context) anyerror!httpx.Response {
 }
 
 fn readyzHandler(ctx: *httpx.Context) anyerror!httpx.Response {
-    return ctx.json(.{ .status = "ready" });
+    const server = active_api_server orelse {
+        try ctx.setHeader("Retry-After", "1");
+        return ctx.status(503).json(.{ .status = "not_ready" });
+    };
+    var response = try server.handle(.{ .method = .GET, .uri = antfly.public_api.http_routes.Routes.readyz });
+    if (response.status == 503) try ctx.setHeader("Retry-After", "1");
+    return AntflyApiHandler.respond(ctx, &response);
 }
 
 fn registerMcpRoutes(server: anytype) !void {
@@ -2084,6 +2464,7 @@ fn extensionBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
 // Module-level pointer set by the serve thread before listen().
 // Used by explicitly registered protocol/internal bridge handlers.
 var active_api_server: ?*antfly.public_api.http_server.ApiHttpServer = null;
+var active_cors_config: ?*const antfly.common.config.Config.CorsConfig = null;
 
 // ---------------------------------------------------------------
 // CLI parsing
@@ -2542,6 +2923,10 @@ fn resolvePublicListener(cli: CliConfig) antfly.metadata.runtime.ListenerConfig 
     };
 }
 
+fn validateServerTlsConfig(tls: ?antfly.common.config.Config.TlsConfig) !void {
+    if (tls != null) return error.ServerTlsUnsupported;
+}
+
 fn haPrimaryRequested(cli: CliConfig) bool {
     return cli.ha_primary_log != null or
         cli.ha_primary_slots != null or
@@ -2932,6 +3317,7 @@ fn printUsage() void {
         \\  --config <path>                       JSON common config file
         \\  --host <host>                         Public API host (default: 127.0.0.1)
         \\  --port <port>                         Public API port (default: 8080)
+        \\  --auth <true|false>                   Enable authentication for public APIs (default: false)
         \\  --id <node-id>                        Local node id (default: 1)
         \\  --health <true|false>                 Enable health/metrics server (default: true)
         \\  --health-port <port>                  Dedicated health/metrics port on --host (default: 4200)
@@ -3092,7 +3478,15 @@ test "swarm runtime local generator accepts media url data uris" {
         } },
     }};
 
-    var converted = try convertLocalGenerateMessages(alloc, &messages);
+    const preflight = try preflightLocalGenerateMessages(&messages);
+    try std.testing.expectEqual(@as(usize, "describe".len), preflight.text_bytes);
+    try std.testing.expectEqual(@as(usize, "data:image/png;base64,AQI=".len), preflight.encoded_media_bytes);
+    try std.testing.expectEqual(@as(usize, 2), preflight.decoded_media_bytes);
+    try std.testing.expectEqual(@as(usize, 1), preflight.media_count);
+    try std.testing.expectEqual(@as(usize, 1), preflight.image_count);
+    try std.testing.expect(!preflight.has_audio);
+
+    var converted = try convertLocalGenerateMessages(alloc, &messages, preflight.decoded_media_bytes);
     defer converted.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), converted.messages.len);
@@ -3104,10 +3498,333 @@ test "swarm runtime local generator accepts media url data uris" {
     try std.testing.expectEqual(@as(usize, 0), message.content_parts.?[1].image);
 }
 
+test "swarm runtime local dense embed preserves borrowed binary media" {
+    const raw = [_]u8{ 1, 2, 3 };
+    const parts = [_]antfly.template.ContentPart{
+        .{ .text = "caption" },
+        .{ .media_url = "data:image/png;base64,AA==" },
+        .{ .binary = .{ .mime_type = "image/png", .data = &raw } },
+    };
+    const direct = try localAntflyDirectDenseParts(std.testing.allocator, &parts);
+    defer std.testing.allocator.free(direct);
+
+    try std.testing.expectEqual(@as(usize, 3), direct.len);
+    try std.testing.expectEqualStrings("caption", direct[0].text);
+    try std.testing.expectEqualStrings("data:image/png;base64,AA==", direct[1].image_url);
+    try std.testing.expectEqualStrings("image/png", direct[2].media.mime_type);
+    try std.testing.expectEqual(@intFromPtr(raw[0..].ptr), @intFromPtr(direct[2].media.data.ptr));
+    try std.testing.expectEqualSlices(u8, &raw, direct[2].media.data);
+}
+
+test "swarm runtime local generator preflights mixed resident media exactly" {
+    const messages = [_]antfly.inference.ChatMessage{.{
+        .role = .user,
+        .content = .{ .parts = &.{
+            .{ .text = "listen" },
+            .{ .media = .{
+                .data = "AQID",
+                .mime_type = "audio/wav",
+            } },
+            .{ .image_url = .{ .url = "data:image/png;base64,BAU=" } },
+        } },
+    }};
+
+    const preflight = try preflightLocalGenerateMessages(&messages);
+    try std.testing.expectEqual(@as(usize, "listen".len), preflight.text_bytes);
+    try std.testing.expectEqual(
+        @as(usize, "AQID".len + "data:image/png;base64,BAU=".len),
+        preflight.encoded_media_bytes,
+    );
+    try std.testing.expectEqual(@as(usize, 5), preflight.decoded_media_bytes);
+    try std.testing.expectEqual(@as(usize, 2), preflight.media_count);
+    try std.testing.expectEqual(@as(usize, 1), preflight.image_count);
+    try std.testing.expect(preflight.has_audio);
+}
+
+test "swarm runtime local generator refuses decode allocation beyond preflight" {
+    var no_storage: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&no_storage);
+    var budget = LocalGenerateDecodeBudget{ .remaining_bytes = 1 };
+
+    try std.testing.expectError(
+        error.RemoteContentTooLarge,
+        decodeLocalGenerateDataUri(
+            fixed.allocator(),
+            "data:image/png;base64,AQI=",
+            null,
+            &budget,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), budget.remaining_bytes);
+}
+
 test "swarm runtime leaves auth disabled unless config or cli enables it" {
     try std.testing.expect(!resolveAuthEnabled(.{}, null));
     try std.testing.expect(resolveAuthEnabled(.{ .auth_enabled = true }, null));
     try std.testing.expect(!resolveAuthEnabled(.{ .auth_enabled = false }, null));
+}
+
+test "swarm inference middleware reuses public API authentication" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        fn next(_: *httpx.Next, ctx: *httpx.Context) anyerror!httpx.Response {
+            return ctx.status(204).text("next");
+        }
+
+        fn expect(
+            middleware: httpx.Middleware,
+            path: []const u8,
+            authorization: ?[]const u8,
+            expected_status: u16,
+        ) !void {
+            var request = try httpx.Request.init(std.testing.allocator, .GET, path);
+            defer request.deinit();
+            if (authorization) |value| try request.setHeader("authorization", value);
+
+            var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+            defer ctx.deinit();
+            var next_handler = httpx.Next{ ._call = next };
+            var response = try middleware.handler(&ctx, &next_handler);
+            defer response.deinit();
+
+            try std.testing.expectEqual(expected_status, response.status.code);
+            if (expected_status == 401) {
+                try std.testing.expectEqualStrings(
+                    "{\"error\":\"unauthorized\",\"message\":\"valid Basic, Bearer, or ApiKey credentials are required\",\"retryable\":false}",
+                    response.body.?,
+                );
+                try std.testing.expectEqualStrings(
+                    "Basic realm=\"antfly\", Bearer realm=\"antfly\", ApiKey realm=\"antfly\"",
+                    response.headers.get("WWW-Authenticate").?,
+                );
+            } else if (expected_status == 503) {
+                try std.testing.expectEqualStrings(
+                    "{\"error\":\"not_ready\",\"message\":\"inference authentication is not ready\",\"retryable\":true}",
+                    response.body.?,
+                );
+                try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
+            }
+        }
+    };
+
+    const previous_active_server = active_api_server;
+    active_api_server = null;
+    defer active_api_server = previous_active_server;
+    try Harness.expect(inferenceAuthMiddleware(), "/ai/v1/models", null, 503);
+
+    var store = antfly.usermgr.MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = antfly.casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+    var manager = try antfly.usermgr.UserManager.init(
+        alloc,
+        store.iface(),
+        try antfly.usermgr.initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+    var user = try manager.createUser("admin", "admin", &.{});
+    defer user.deinit(alloc);
+
+    var api_server = antfly.public_api.http_server.ApiHttpServer.init(alloc, .{
+        .auth_enabled = true,
+        .user_manager = &manager,
+    }, .{ .ptr = undefined, .vtable = undefined }, null, null);
+    defer api_server.deinit();
+
+    active_api_server = &api_server;
+
+    const middleware = inferenceAuthMiddleware();
+    for ([_][]const u8{ "/ai/v1/models", "/ml/v1/metrics" }) |path| {
+        try Harness.expect(middleware, path, null, 401);
+        try Harness.expect(middleware, path, "Basic YWRtaW46d3Jvbmc=", 401);
+        try Harness.expect(middleware, path, "Basic YWRtaW46YWRtaW4=", 204);
+    }
+
+    for ([_][]const u8{ "/ai/v10/models", "/ml/v1evil/metrics", "/healthz", "/auth/v1/login" }) |path| {
+        try Harness.expect(middleware, path, null, 204);
+    }
+
+    api_server.cfg.user_manager = null;
+    try Harness.expect(middleware, "/ai/v1/models", null, 503);
+
+    api_server.cfg.auth_enabled = false;
+    api_server.cfg.user_manager = &manager;
+    try Harness.expect(middleware, "/ai/v1/models", null, 204);
+
+    api_server.cfg.user_manager = null;
+    api_server.cfg.trusted_principal_secret = "test-secret";
+    try Harness.expect(middleware, "/ai/v1/models", null, 401);
+}
+
+test "swarm CORS middleware enforces dynamic configuration" {
+    const Harness = struct {
+        fn next(_: *httpx.Next, ctx: *httpx.Context) anyerror!httpx.Response {
+            return ctx.status(209).text("next");
+        }
+
+        fn execute(
+            config: *const antfly.common.config.Config.CorsConfig,
+            method: httpx.Method,
+            origin: ?[]const u8,
+            requested_method: ?[]const u8,
+            requested_headers: ?[]const u8,
+        ) !httpx.Response {
+            var request = try httpx.Request.init(std.testing.allocator, method, "/ai/v1/models");
+            defer request.deinit();
+            if (origin) |value| try request.setHeader("origin", value);
+            if (requested_method) |value| try request.setHeader("access-control-request-method", value);
+            if (requested_headers) |value| try request.setHeader("access-control-request-headers", value);
+
+            var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+            defer ctx.deinit();
+            var next_handler = httpx.Next{ ._call = next };
+            const previous = active_cors_config;
+            active_cors_config = config;
+            defer active_cors_config = previous;
+            return corsMiddleware().handler(&ctx, &next_handler);
+        }
+    };
+
+    var defaults: antfly.common.config.Config.CorsConfig = .{};
+    try validateCorsConfig(&defaults);
+    {
+        var response = try Harness.execute(&defaults, .GET, "https://any.example", null, null);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 209), response.status.code);
+        try std.testing.expectEqualStrings("*", response.headers.get("Access-Control-Allow-Origin").?);
+    }
+    {
+        var response = try Harness.execute(
+            &defaults,
+            .OPTIONS,
+            "https://any.example",
+            "POST",
+            "content-type, AUTHORIZATION",
+        );
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 204), response.status.code);
+        try std.testing.expectEqualStrings("GET, POST, PUT, DELETE, OPTIONS, PATCH", response.headers.get("Access-Control-Allow-Methods").?);
+        try std.testing.expectEqualStrings("Content-Type, Authorization, X-Requested-With, Accept, Origin", response.headers.get("Access-Control-Allow-Headers").?);
+        try std.testing.expectEqualStrings("3600", response.headers.get("Access-Control-Max-Age").?);
+    }
+    {
+        var response = try Harness.execute(&defaults, .OPTIONS, "https://any.example", "BREW", null);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 403), response.status.code);
+        try std.testing.expect(response.headers.get("Access-Control-Allow-Origin") == null);
+    }
+    {
+        var response = try Harness.execute(&defaults, .OPTIONS, null, "POST", null);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 209), response.status.code);
+    }
+
+    var exact_origin = "https://allowed.example".*;
+    var post_method = "POST".*;
+    var allowed_header = "X-Token".*;
+    var exposed_header = "X-Request-Id".*;
+    var exact_origins = [_][]u8{exact_origin[0..]};
+    var post_methods = [_][]u8{post_method[0..]};
+    var allowed_headers = [_][]u8{allowed_header[0..]};
+    var exposed_headers = [_][]u8{exposed_header[0..]};
+    var exact = antfly.common.config.Config.CorsConfig{
+        .allowed_origins = &exact_origins,
+        .allowed_methods = &post_methods,
+        .allowed_headers = &allowed_headers,
+        .exposed_headers = &exposed_headers,
+        .allow_credentials = true,
+        .max_age = 7,
+    };
+    try validateCorsConfig(&exact);
+    {
+        var response = try Harness.execute(&exact, .POST, exact_origin[0..], null, null);
+        defer response.deinit();
+        try std.testing.expectEqualStrings(exact_origin[0..], response.headers.get("Access-Control-Allow-Origin").?);
+        try std.testing.expectEqualStrings("true", response.headers.get("Access-Control-Allow-Credentials").?);
+        try std.testing.expectEqualStrings("X-Request-Id", response.headers.get("Access-Control-Expose-Headers").?);
+    }
+    {
+        var response = try Harness.execute(&exact, .POST, "https://denied.example", null, null);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 209), response.status.code);
+        try std.testing.expect(response.headers.get("Access-Control-Allow-Origin") == null);
+        try std.testing.expectEqualStrings("Origin", response.headers.get("Vary").?);
+    }
+    {
+        var response = try Harness.execute(&exact, .GET, exact_origin[0..], null, null);
+        defer response.deinit();
+        try std.testing.expect(response.headers.get("Access-Control-Allow-Origin") == null);
+        try std.testing.expectEqualStrings("Origin", response.headers.get("Vary").?);
+    }
+    {
+        var response = try Harness.execute(&exact, .OPTIONS, exact_origin[0..], "POST", "x-token");
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 204), response.status.code);
+        try std.testing.expectEqualStrings("POST", response.headers.get("Access-Control-Allow-Methods").?);
+        try std.testing.expectEqualStrings("X-Token", response.headers.get("Access-Control-Allow-Headers").?);
+        try std.testing.expectEqualStrings("7", response.headers.get("Access-Control-Max-Age").?);
+    }
+
+    var wildcard = "*".*;
+    var wildcard_origins = [_][]u8{wildcard[0..]};
+    var wildcard_credentials = antfly.common.config.Config.CorsConfig{
+        .allowed_origins = &wildcard_origins,
+        .allow_credentials = true,
+    };
+    try std.testing.expectError(error.CorsCredentialsWithWildcardOrigin, validateCorsConfig(&wildcard_credentials));
+    var default_wildcard_credentials = antfly.common.config.Config.CorsConfig{ .allow_credentials = true };
+    try std.testing.expectError(error.CorsCredentialsWithWildcardOrigin, validateCorsConfig(&default_wildcard_credentials));
+    var opaque_origin = "null".*;
+    var opaque_origins = [_][]u8{opaque_origin[0..]};
+    var opaque_credentials = antfly.common.config.Config.CorsConfig{
+        .allowed_origins = &opaque_origins,
+        .allow_credentials = true,
+    };
+    try std.testing.expectError(error.CorsCredentialsWithOpaqueOrigin, validateCorsConfig(&opaque_credentials));
+
+    var wildcard_header = "*".*;
+    var wildcard_headers = [_][]u8{wildcard_header[0..]};
+    var credentialed_any_header = antfly.common.config.Config.CorsConfig{
+        .allowed_origins = &exact_origins,
+        .allowed_methods = &post_methods,
+        .allowed_headers = &wildcard_headers,
+        .allow_credentials = true,
+    };
+    try validateCorsConfig(&credentialed_any_header);
+    {
+        var response = try Harness.execute(
+            &credentialed_any_header,
+            .OPTIONS,
+            exact_origin[0..],
+            "POST",
+            "X-Trace-Id, X-Client-Version",
+        );
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 204), response.status.code);
+        try std.testing.expectEqualStrings(
+            "X-Trace-Id, X-Client-Version",
+            response.headers.get("Access-Control-Allow-Headers").?,
+        );
+    }
+
+    var credentialed_wildcard_exposed = credentialed_any_header;
+    credentialed_wildcard_exposed.exposed_headers = &wildcard_headers;
+    try std.testing.expectError(
+        error.CorsCredentialsWithWildcardExposedHeaders,
+        validateCorsConfig(&credentialed_wildcard_exposed),
+    );
+
+    var injected_origin = "https://allowed.example\r\nX-Injected: true".*;
+    var injected_origins = [_][]u8{injected_origin[0..]};
+    var unsafe = antfly.common.config.Config.CorsConfig{ .allowed_origins = &injected_origins };
+    try std.testing.expectError(error.InvalidCorsOrigin, validateCorsConfig(&unsafe));
+    unsafe.enabled = false;
+    try validateCorsConfig(&unsafe);
+
+    var injected_header = "X-Safe\r\nX-Injected".*;
+    var injected_headers = [_][]u8{injected_header[0..]};
+    var unsafe_header = antfly.common.config.Config.CorsConfig{ .allowed_headers = &injected_headers };
+    try std.testing.expectError(error.InvalidCorsHeader, validateCorsConfig(&unsafe_header));
 }
 
 test "swarm bridge shared adapter preserves protocol headers and absent body" {
@@ -4120,6 +4837,11 @@ test "swarm public HTTP server uses public API request body limit" {
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_body_size);
 }
 
+test "swarm rejects configured server TLS instead of serving plaintext" {
+    try validateServerTlsConfig(null);
+    try std.testing.expectError(error.ServerTlsUnsupported, validateServerTlsConfig(.{}));
+}
+
 test "antfly config uses cli override before common config" {
     const alloc = std.testing.allocator;
     var cfg = antfly.common.config.Config{
@@ -4161,6 +4883,23 @@ test "swarm readiness follows api initialization and unified listener" {
     try std.testing.expect(swarmReadyFromState(true, true));
 }
 
+test "swarm public ready endpoint fails closed before API initialization" {
+    const previous_active_server = active_api_server;
+    active_api_server = null;
+    defer active_api_server = previous_active_server;
+
+    var request = try httpx.Request.init(std.testing.allocator, .GET, "/readyz");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try readyzHandler(&ctx);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings("{\"status\":\"not_ready\"}", response.body.?);
+    try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
+}
+
 test "parse cli accepts inference budget overrides" {
     var argv = [_][*:0]const u8{
         "--inference-host-budget-mb",
@@ -4195,6 +4934,7 @@ test "inference config falls back to common config" {
             .api_url = try alloc.dupe(u8, "http://127.0.0.1:8089"),
             .models_dir = try alloc.dupe(u8, "/tmp/antfly-models"),
             .ml_dir = try alloc.dupe(u8, "/tmp/antfly-ml"),
+            .max_concurrent_requests = 0,
             .preload = try alloc.dupe(antfly.common.config.Config.InferenceConfig.WarmModelConfig, &.{
                 .{
                     .kind = try alloc.dupe(u8, "generator"),
@@ -4218,6 +4958,10 @@ test "inference config falls back to common config" {
     try std.testing.expectEqual(inference.backends.BackendType.metal, warm_models.items[0].backend.?);
     try std.testing.expectEqualStrings("gguf", warm_models.items[0].format.?);
     try std.testing.expectEqualStrings("q4_k", warm_models.items[0].quantization.?);
+
+    var node_cfg = inference.server.NodeConfig{};
+    applyCommonInferenceConfig(&node_cfg, &cfg);
+    try std.testing.expectEqual(@as(usize, 0), node_cfg.max_concurrent_requests);
 }
 
 test "swarm runtime resolves paths from common storage base dir" {

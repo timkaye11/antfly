@@ -107,6 +107,15 @@ fn getenvBool(comptime name: [*:0]const u8) bool {
     return enabled;
 }
 
+fn donatedSlotAttentionOnFrameEnabled() bool {
+    return getenvBool("TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME") and
+        !getenvBool("TERMITE_METAL_DISABLE_DONATED_SLOT_ATTENTION_ON_FRAME");
+}
+
+test "metal donated-slot on-frame attention defaults off" {
+    try std.testing.expect(!donatedSlotAttentionOnFrameEnabled());
+}
+
 fn getenvUsize(comptime name: [*:0]const u8) ?usize {
     if (comptime @import("builtin").os.tag == .freestanding) return null;
     const c = @cImport(@cInclude("stdlib.h"));
@@ -9996,7 +10005,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             defer if (gathered_full) |*full| full.deinit();
             const source = try attentionKvSource(attention);
             const gathered_k: MetalTensor, const gathered_v: MetalTensor = if (attention.skip_kv_write) blk: {
-                // Donated-KV read under our active frame (the MTP draft
+                // Explicit opt-in donated-KV read under our active frame (the MTP draft
                 // attending target KV): encode the KV owner's paged-slot
                 // attention directly onto our frame. The fallback below
                 // gathers the full donor KV through host downloads and
@@ -10004,7 +10013,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 // per draft layer.
                 if (attention.attn_or_mask == null and q_mt.isDevice() and
                     !getenvBool("TERMITE_METAL_DISABLE_DONATED_SLOT_ATTENTION") and
-                    !getenvBool("TERMITE_METAL_DISABLE_DONATED_SLOT_ATTENTION_ON_FRAME"))
+                    donatedSlotAttentionOnFrameEnabled())
                 {
                     if (try pagedKvLayerFromDeviceHook(attention, num_kv_heads, head_dim)) |paged_layer| {
                         if (pagedSlotAttentionSupported(paged_layer)) {
@@ -10115,12 +10124,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                                 const block_offsets_opt = try self.pagedKvBlockTokenOffsets(attention, @intCast(paged_layer.page_size_tokens));
                                 defer if (block_offsets_opt) |block_offsets| self.allocator.free(block_offsets);
                                 if (block_offsets_opt) |block_offsets| {
-                                    // Preferred: encode the KV owner's slot attention
+                                    // When opted in, encode the KV owner's slot attention
                                     // directly onto our active frame — no draft-frame
                                     // flush and no KV-owner drain (the MTP draft pays
                                     // ~2 syncs per donated layer on the fallback path).
                                     if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) and
-                                        !getenvBool("TERMITE_METAL_DISABLE_DONATED_SLOT_ATTENTION_ON_FRAME"))
+                                        donatedSlotAttentionOnFrameEnabled())
                                     {
                                         if (try metal_runtime.decoderRuntimeApplyPagedKvAttentionSlotOnFrame(
                                             @as(*metal_runtime.RawMetalDecodeRuntime, @ptrCast(@alignCast(layer_runtime_ptr))),

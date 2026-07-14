@@ -206,6 +206,8 @@ Build flags:
 - `-Dcuda-artifacts=portable`: embed the checked-in portable PTX only.
 - `-Dcuda-artifacts=fatbin`: embed the checked-in multi-arch fatbin. This is
   the default.
+- `-Dcuda-artifacts=sm89`: embed the checked-in SM89 cubin for an exact L4-class
+  deployment or candidate gate; it is rejected on other compute capabilities.
 - `-Dcuda-libs=auto`: use optional CUDA library acceleration when available.
 - `-Dcuda-libs=required`: require CUDA libraries such as cuBLASLt to load.
 - `-Dcuda-libs=off`: do not load optional CUDA libraries.
@@ -226,7 +228,8 @@ Quant matmul codegen is a build/dev-time lane, not runtime JIT. The compiler
 spec lives in `pkg/inference/src/graph/quant_kernel_compiler.zig`; generated
 dev candidates and manifests live under `pkg/inference/src/ops/cuda/generated`
 and `pkg/inference/src/ops/metal/generated`. The unified generated-artifact
-registry currently has 7 promoted Metal routes and 21 non-promoted CUDA
+registry currently has 7 production-qualified, runtime-default-off Metal routes
+and 21 non-promoted CUDA
 entries. The Metal lane covers 25 small-batch quant routes across
 Q2/Q3/Q4/Q5/Q6/Q8 families, plus opt-in generated RMSNorm, decode-1x paged
 attention, and flash-prefill attention. `QUANT_KERNEL_COMPILER.md` is the
@@ -234,10 +237,12 @@ authoritative route and evidence inventory.
 
 Use `zig build quant-kernel-codegen -- --check` to verify generated sources and
 manifests, or `zig build quant-kernel-codegen -- --write` after intentionally
-changing the spec. Generated CUDA source files are never direct production
-artifact inputs. Promotion requires correctness and sequential benchmark
-evidence, then a reviewed copy of the generated body into the canonical
-`artifacts/inference_cuda_kernels.cu` bundle and CUDA 13.2 artifact regeneration.
+changing the spec. Standalone generated CUDA source files are never direct
+artifact inputs. The canonical `artifacts/inference_cuda_kernels.cu` contains
+both benchmark-qualified generated kernels and a compiler-managed region of
+default-off, runtime-wired dev candidates; the manifest records the distinction.
+Promotion requires correctness and sequential benchmark evidence, then CUDA
+13.2 artifact regeneration.
 
 Use `zig build quant-kernel-local-check -Dmetal=false -Dcuda=false` for the
 cross-platform compiler gate: generated-source freshness, compiler/renderer and
@@ -480,10 +485,11 @@ by ClipClap, GLiNER2, and DeBERTa reranker sessions:
   normalization, embedding, concat, convolution, and attention helpers
 - optional cuBLASLt f16/bf16 matmul dispatch for eligible dense weights
 - GGUF `Q8_0`, `Q4_0`, and `Q4_K` linear kernels
-- 5 promoted compiler-generated `Q4_0` kernels (decode GEMV, prefill rows
+- 5 benchmark-qualified compiler-generated `Q4_0` kernels (decode GEMV, prefill rows
   9-64, FFN gate+up pair, and the q8_1/DP4A E4B fused-FFN pair+down),
-  default-on with per-kernel disable envs; see `QUANT_KERNEL_COMPILER.md`
-  (Current CUDA State) for measured speedups and promotion evidence
+  runtime-default-off behind positive per-kernel opt-ins, with per-kernel and
+  master disable gates; see `QUANT_KERNEL_COMPILER.md` (Current CUDA State) for
+  measured speedups, qualification evidence, and exact gate names
 - an opt-in generated GQA decode-attention candidate specialized for
   `q_seq_len=1`, `head_dim=256`, and the nullable device-scalar ABI. Enable it
   with `ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE=1`; module loading
@@ -770,20 +776,21 @@ Server continuous batching is typed configuration and defaults off:
 {
   "generation_batching": {
     "mode": "on",
-    "max_step_items": 1,
+    "max_step_items": 2,
     "max_step_query_tokens": 512,
     "max_decode_wait_us": 1000
   }
 }
 ```
 
-The CUDA production rollout is deliberately serialized because the two-row
-decode path still fails the long-run KV page-boundary gate. Prefill is
-singleton, and the coordinator plus CUDA resource teardown are thread-safe.
-Developers can exercise homogeneous two-row decode with
-`ANTFLY_INFERENCE_CUDA_EXPERIMENTAL_BATCH_ROWS=1`; it is not a production
-setting. Set
+With `mode: on`, the current safety envelope admits homogeneous two-row decode;
+prefill stays singleton and more than two active requests use the optimized
+singleton route. The row-two path has repeated paged-KV growth coverage but
+remains experimental because long generation may differ from singleton token
+output and the optimized singleton decoder is currently faster. Set
 `ANTFLY_INFERENCE_DISABLE_CONTINUOUS_BATCHING=1` for the global rollback.
+See [docs/CUDA_BATCHING.md](docs/CUDA_BATCHING.md) for the canonical rollout
+contract and promotion gate.
 
 Run the hardware gate with:
 

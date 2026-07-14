@@ -96,7 +96,7 @@ class EmbeddingsIndexConfig:
                    - Allowed host whitelist
                    - Private IP blocking (prevents SSRF attacks)
                    - Download size limits (default: 100MB)
-                   - Download timeouts (default: 30s)
+                   - Download timeouts are not currently enforced; configure them at the proxy or egress layer
                    - Image dimension limits (default: 2048px, auto-resized)
 
                    See: https://antfly.io/docs/configuration#security--cors

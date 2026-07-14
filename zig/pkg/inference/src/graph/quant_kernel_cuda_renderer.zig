@@ -1314,20 +1314,20 @@ fn promotionComment(kind: KernelKind) []const u8 {
         \\// until target-specific microbench and full-model promotion gates pass.
         ,
         .q4_0_mmv =>
-        \\// Promoted on sequential benchmark evidence vs the handwritten CUDA baseline;
-        \\// runtime dispatch is default-on behind ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MMV.
+        \\// Qualified on sequential benchmark evidence vs the handwritten CUDA baseline;
+        \\// runtime dispatch requires ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MMV=1.
         ,
         .q4_0_mm =>
-        \\// Promoted on sequential benchmark evidence vs the handwritten CUDA baseline;
-        \\// runtime dispatch is default-on behind ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MM.
+        \\// Qualified on sequential benchmark evidence vs the handwritten CUDA baseline;
+        \\// runtime dispatch requires ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MM=1.
         ,
         .q4_0_pair_mmv =>
-        \\// Promoted on sequential benchmark evidence vs the handwritten CUDA baseline;
-        \\// runtime dispatch is default-on behind ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR.
+        \\// Qualified on sequential benchmark evidence vs the handwritten CUDA baseline;
+        \\// runtime dispatch requires ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR=1.
         ,
         .q4_0_pair_activation_q8_1 =>
-        \\// Promoted on sequential benchmark evidence vs the handwritten CUDA baseline;
-        \\// runtime dispatch is default-on behind ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR_Q8.
+        \\// Qualified on sequential benchmark evidence vs the handwritten CUDA baseline;
+        \\// runtime dispatch requires ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR_Q8=1.
         ,
         .q4_0_pair_activation_q8_1_e2b_6144,
         .q4_0_pair_activation_q8_1_e2b_12288,
@@ -1357,8 +1357,8 @@ fn promotionComment(kind: KernelKind) []const u8 {
         \\// remains authoritative until exact-token and target-specific speed gates pass.
         ,
         .q4_0_down_q8_1 =>
-        \\// Promoted on sequential benchmark evidence vs the handwritten CUDA baseline;
-        \\// runtime dispatch is default-on behind ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_DOWN_Q8.
+        \\// Qualified on sequential benchmark evidence vs the handwritten CUDA baseline;
+        \\// runtime dispatch requires ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_DOWN_Q8=1.
         ,
     };
 }

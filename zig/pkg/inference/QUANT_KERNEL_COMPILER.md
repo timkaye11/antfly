@@ -76,10 +76,13 @@ Generated artifacts are checked in:
   file copy).
 - `src/ops/cuda/generated/quant_kernel_*.cu`: generated CUDA candidates.
   These files are rendered from typed plans rather than stored source templates.
-  Promoted CUDA kernels are additionally embedded in the production
+  Benchmark-qualified CUDA kernels and explicitly runtime-wired dev candidates
+  are also embedded in the
   `src/ops/cuda/artifacts/inference_cuda_kernels.{cu,ptx,fatbin,_sm89.cubin}`
-  bundle via `scripts/regen-cuda-artifacts.sh`. Compiler tests validate every
-  renderer-owned helper fragment and complete kernel body against that bundle.
+  bundle. The dev candidates remain default-off and keep
+  `production_enabled: false`; standalone generated files are never direct
+  artifact inputs. Compiler tests validate every renderer-owned helper fragment
+  and complete kernel body against the canonical bundle source.
 - `src/ops/cuda/generated/evidence/*.json`: checked-in CUDA promotion
   benchmark evidence.
 - `src/ops/cuda/generated/quant_kernel_*.json`: spec, artifact, benchmark, and
@@ -170,7 +173,8 @@ defer emitted.deinit(allocator);
 
 // emitted.data is the canonical generated source text.
 // compiled.source_path, check_command, runtime_gate_env,
-// and production_enabled describe how that source is checked and routed.
+// artifact.runtime_default_enabled, and production_enabled describe how that
+// source is checked and routed.
 ```
 
 `emitCompiledSource(...)` is the source emission boundary. Metal small-batch
@@ -287,14 +291,15 @@ timing is the real arbiter — verify a genuine improvement via a before/after A
 `GeneratedArtifact.production_enabled` to true and update the source constant's
 header; add a `first_metal_runtime_evidence` entry and remove the
 `first_metal_promotion_blocker_evidence` entry (the production-regression suite
-then auto-includes the route via `artifactHasPromotionEvidence`); swap the
-`metal_kernels.m` dispatch gate from `candidate_gate(ENABLE_*)` to
-`promoted_gate(DISABLE_*)` for encoder-family routes. Fused-bias routes must
-also be called by normal model execution before promotion; direct harness and
-provider API coverage alone are shadow-route evidence, not production use. Then
-update the guardrail count tests (evidence/blocker/route-summary counts, the
-manifest `runtime_gate_env` ENABLE→DISABLE, the route-lowering pins, and the
-`ENABLE`/`DISABLE` env occurrence counts).
+then auto-includes the route via `artifactHasPromotionEvidence`). Qualification
+does not imply rollout: leave `runtime_default_enabled = false` and the positive
+`ENABLE_*` gate in place until normal model-path release evidence supports a
+default-on route. At that point, set `runtime_default_enabled = true` and swap
+the `metal_kernels.m` dispatch gate to `promoted_gate(DISABLE_*)`. Fused-bias
+routes must also be called by normal model execution before rollout; direct
+harness and provider API coverage alone are shadow-route evidence. Then update
+the guardrail count tests (evidence/blocker/route-summary counts, manifest
+rollout fields, route-lowering pins, and `ENABLE`/`DISABLE` env counts).
 
 ## Promotion Policy
 
@@ -332,16 +337,17 @@ command is sequential `bench-cuda` with `--warmup-iters 5 --measure-iters 50
 measured geomean speedup must clear `minimum_speedup` (1.0) against the named
 handwritten baseline with CPU-reference correctness inside tolerance, and a
 matching comptime `BenchmarkEvidence` record plus the checked-in evidence JSON
-are required before `production_enabled` may flip. Promoted CUDA kernels are
-embedded in the production artifact bundle, so runtime dispatch stays
-driver-only (`cuModuleLoadDataEx`; nvcc is dev-time only).
+are required before `production_enabled` may flip. Qualified kernels share the
+driver-loaded artifact bundle with compiler-managed, default-off dev candidates;
+the manifest preserves that distinction. Runtime dispatch stays driver-only
+(`cuModuleLoadDataEx`; nvcc is dev-time only).
 
 ## Current CUDA State
 
-The current checked-in state has 5 promoted generated CUDA production routes,
-all Q4_0, promoted on sequential benchmark evidence measured on an NVIDIA L4
-(driver 580.159.03, CUDA 13.2 nvcc; evidence JSONs under
-`src/ops/cuda/generated/evidence/`):
+The current checked-in state has 5 promotion-evidenced generated CUDA
+artifacts, all Q4_0, measured on an NVIDIA L4 (driver 580.159.03, CUDA 13.2
+nvcc; evidence JSONs under `src/ops/cuda/generated/evidence/`). Their runtime
+routes remain explicit opt-ins pending model-level release evidence:
 
 | kernel | plan | handwritten baseline | measured speedup (geomean) |
 |---|---|---|---|
@@ -357,9 +363,9 @@ also fuses the activation multiply and q8_1 output requantization; both are
 hardcoded to the 2560/10240 E4B dims and CUDA-only). Their win over the tuned
 handwritten kernels comes from fetching q4_0 weight words as aligned u16 pairs
 instead of four single-byte loads. They dispatch inside the existing opt-in
-`ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE` path; within
-that path they are default-on with per-kernel disable envs
-(`ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR_Q8`, `..._DOWN_Q8`).
+`ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE` path and also
+require their own `ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR_Q8=1` or
+`..._DOWN_Q8=1` opt-in.
 Measured e2e on the tuned E4B QAT llama.cpp pair harness: about -2.1% Antfly
 E2E median and +3% decode from the pair kernel (the down kernel's increment is
 below the harness noise floor); the paired margin vs llama.cpp roughly halved.
@@ -381,7 +387,7 @@ generated-vs-baseline on device (the CPU reference is skipped above
 weight tensor to dense f32).
 
 End-to-end impact, Gemma4 E2B QAT (`--backend cuda`, 128 tokens, generated
-kernels default-on vs disabled, interleaved runs, bit-identical output):
+kernels explicitly enabled vs disabled, interleaved runs, bit-identical output):
 
 - prefill: 146-151 ms vs 200-201 ms (about -25%).
 - decode: 61.1/60.8 tok/s vs 59.6/59.5 tok/s (about +2.4%).
@@ -394,12 +400,17 @@ quant matmuls ride the q4_k tensor-core route), and gliner2 passes the
 `scripts/verify_gliner2_cuda.sh` native/CUDA parity gate with identical entity
 counts and warm extraction timing unchanged (12.0 vs 12.1 ms).
 
-Runtime dispatch for the promoted CUDA routes is default-on and per-kernel
-opt-out via `ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MMV`, `..._MM`,
-`..._PAIR`, `..._PAIR_Q8`, and `..._DOWN_Q8` (recorded per artifact as
-`runtime_gate_env` in `quant_kernel_artifacts.json`; the two `_Q8` kernels
-dispatch inside the opt-in
-`ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE` tuned path).
+Runtime dispatch for the five promoted CUDA routes is default-off. Their
+manifest records keep `production_enabled: true` for benchmark qualification,
+set `runtime_default_enabled: false`, and report the positive opt-in variable
+as `runtime_gate_env`. Enable only
+the route under evaluation with `ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MMV=1`,
+`..._MM=1`, `..._PAIR=1`, `..._PAIR_Q8=1`, or `..._DOWN_Q8=1`; target
+restrictions still apply. The corresponding per-kernel `DISABLE_` variables
+override those opt-ins. `ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0=1` is the master
+rollback and disables every generated Q4_0 route, including FFN candidates.
+The two `_Q8` kernels additionally require the opt-in
+`ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE` tuned path.
 Actual launch counts are reported by `generate --print-timing` as
 `cuda_q4_0_generated_counts:` with per-kernel hit/fallback counters (also in
 `--json-timing`); a fallback dispatches the handwritten baseline for that
@@ -409,12 +420,12 @@ The Q4_0 `pair` epilogue (two no-bias projections sharing one input) is
 CUDA-only; Metal is carved out in `supportsEpilogueForBackend` and keeps its
 own Q4_0 small-batch route unchanged.
 
-Dispatch precedence note: in the rows==1 Q4_0 pair route the promoted
+Dispatch precedence note: when explicitly enabled, the rows==1 Q4_0 pair
 generated kernel runs ahead of the default-on handwritten
 `ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_TILE4_W4` path (that env defaults to true, so
 it is the production default rather than an opt-in experiment). To select the
-handwritten pair kernel — for A/B timing or to rule out the generated kernel —
-set `ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR=1`. The plain
+handwritten pair kernel during an opt-in A/B, set
+`ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR=1`. The plain
 `linearNoBias` route keeps the opposite order: the genuinely opt-in tile8 and
 tile4_w4 experiment envs (default off) still take precedence over the
 generated mmv kernel when explicitly enabled.
@@ -436,10 +447,12 @@ and performance gates are satisfied.
 
 ## Current Metal State
 
-The current checked-in state has 7 promoted generated Metal production routes:
+The current checked-in state has 7 production-qualified generated Metal routes:
 `Q2_K none`, `Q3_K none`, `Q4_K none`, `Q5_K none`, `Q6_K none`, `Q8_0 none`,
-and `Q8_K none`. The production-regression gate covers 14
-generated-vs-handwritten benchmark cases for those routes.
+and `Q8_K none`. Qualification is distinct from rollout: all 7 keep
+`runtime_default_enabled: false` and require their positive
+`TERMITE_METAL_ENABLE_ANTFLY_*` gate. The production-regression gate covers 14
+generated-vs-handwritten benchmark cases for those qualified routes.
 
 `Q4_K bias`, `Q5_K bias`, `Q6_K bias`, and `Q8_0 bias` are validated shadow
 routes. Their direct decode-runtime and provider APIs have correctness, route,
@@ -448,22 +461,22 @@ promoted no-bias quant route followed by its existing bias op. The fused APIs
 therefore remain fail-closed behind `TERMITE_METAL_ENABLE_ANTFLY_*_BIAS` (or
 the global candidate opt-in) until a model path actually calls them.
 
-Several of these were re-tuned or newly promoted via the schedule-autotuning
+Several of these were re-tuned or newly qualified via the schedule-autotuning
 workflow above: the sweep found that 256-value k-quant routes want a
 higher-thread hybrid-simd reduction (rather than the original simd_sum /
 threadgroup-tree), which the decode-runtime gate confirmed at 2–5x kernel
 speedups vs handwritten. `Q4_K none`, `Q5_K none`, and `Q8_K none` were dev
-candidates that only crossed the promotion bar after that re-tune. `Q4_K
+candidates that only crossed the qualification bar after that re-tune. `Q4_K
 bias_gelu` clears the bar too but is intentionally left as a dev candidate: it
 is the `first_lazy_*` route that anchors the blocked-candidate test coverage.
 
-Runtime-wired generated candidates that are not promoted stay on handwritten
-production dispatch by default. They remain opt-in through
+All generated Metal routes stay on handwritten production dispatch by default.
+The 7 production-qualified routes and 18 dev candidates remain opt-in through
 `TERMITE_METAL_ENABLE_ANTFLY_*` gates, or all at once with
 `ANTFLY_METAL_GENERATED_QUANT=1` / `TERMITE_METAL_ENABLE_ANTFLY_GENERATED_QUANT=1`,
 and are tracked with explicit blockers. Setting
-`TERMITE_METAL_DISABLE_ANTFLY_GENERATED_QUANT=1` overrides both candidate and
-promoted gates, providing one handwritten-only oracle switch.
+`TERMITE_METAL_DISABLE_ANTFLY_GENERATED_QUANT=1` overrides every positive
+opt-in, providing one handwritten-only oracle switch.
 The route-all evidence covers 50 generated cases: all 50 must be route-ready,
 46 must have provider-route evidence, and every non-promoted candidate must
 explain itself with an explicit blocker such as `speedup_gate_missing`,
@@ -537,7 +550,7 @@ when Metal runtime evidence is required.
 
 ## Evidence Commands
 
-Metal runtime evidence uses the `antfly.quant_kernel_metal_runtime_evidence.v9`
+Metal runtime evidence uses the `antfly.quant_kernel_metal_runtime_evidence.v11`
 schema. In addition to per-case timings, each evidence file records the
 machine-checked compiled-vs-handwritten summary:
 `benchmark_supported_count`, `benchmark_speedup_pass_count`,
@@ -547,6 +560,25 @@ checker recomputes these fields from the case list and rejects stale summaries.
 Repeated timing evidence also records `repeat_gate_index`, allowing the
 promotion gate to tolerate one isolated outlier while still requiring the sorted
 repeat speedup gate to clear.
+
+Version 11 provides an explicit, locally attested promotion path. Evidence still
+defaults to `provenance_status: local_unattested` with the hard blocker
+`missing_reproducible_provenance`. Passing `--attest-provenance` instead collects
+an `attested_v1` record from the running system: clean Git commit and status
+digest, host OS and architecture, the selected Metal device, Metal compiler and
+Zig versions, and a UTC capture time. The promotion checker recollects and
+matches the source, host, device, and toolchain fields. Missing or forged fields,
+a dirty source tree, or local-only evidence fail closed. This is local machine
+attestation; external signing remains outside this evidence contract.
+
+The seven production-qualified Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, and Q8_K
+routes predate that contract. Their typed evidence records are deliberately
+marked `legacy_unattested` with `missing_reproducible_provenance` and a
+kernel-ID-scoped `legacy_production_exception`. The exception preserves their
+qualification and regression history, not rollout: their manifests keep
+`runtime_default_enabled: false`, runtime dispatch requires a positive opt-in,
+and clean attested evidence is required before any default-on transition. The
+exception cannot be used by a new kernel ID.
 
 Route-all evidence is an observability check, not a promotion decision. Promoted
 generated-production routes report an empty `promotion_blocker` when route
@@ -564,7 +596,7 @@ evidence file also records the compiler benchmark manifest schema, case count,
 and case fingerprint, and the evidence checker rejects stale or partial case
 sets before trusting benchmark speedups. Successful production-regression checks
 also print the identity in the summary line as:
-`benchmark_manifest=antfly.quant_kernel_benchmarks.v5:22:<fingerprint>`.
+`benchmark_manifest=antfly.quant_kernel_benchmarks.v6:22:<fingerprint>`.
 
 ## Runtime Observability
 
@@ -599,6 +631,7 @@ zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- \
   --evidence-out /private/tmp/antfly-quant-metal-<kernel_id>-promotion-evidence.json \
   --repeat-runs 5 \
   --measure-iters 500 \
+  --attest-provenance \
   --promotion-ready-kernel <kernel_id>
 ```
 

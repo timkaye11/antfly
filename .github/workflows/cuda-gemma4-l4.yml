@@ -69,8 +69,6 @@ jobs:
     timeout-minutes: 240
     env:
       CUDA_EVIDENCE_DIR: ${{ github.workspace }}/artifacts/cuda-gemma4-l4
-      ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/antfly-zig-local
-      ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/antfly-zig-global
       CUDA_VISIBLE_DEVICES: ${{ vars.ANTFLY_CUDA_VISIBLE_DEVICES || '0' }}
       CUDA_RELEASE_MODE: ${{ inputs.gate || 'nightly' }}
       E2B_MODEL: ${{ inputs.e2b_model || vars.ANTFLY_CUDA_E2B_MODEL || '' }}
@@ -93,6 +91,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          export ZIG_LOCAL_CACHE_DIR="$RUNNER_TEMP/antfly-zig-local"
+          export ZIG_GLOBAL_CACHE_DIR="$RUNNER_TEMP/antfly-zig-global"
+          {
+            echo "ZIG_LOCAL_CACHE_DIR=$ZIG_LOCAL_CACHE_DIR"
+            echo "ZIG_GLOBAL_CACHE_DIR=$ZIG_GLOBAL_CACHE_DIR"
+          } >> "$GITHUB_ENV"
           mkdir -p "$CUDA_EVIDENCE_DIR" "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
 
           if [[ -z "$E2B_MODEL" ]]; then

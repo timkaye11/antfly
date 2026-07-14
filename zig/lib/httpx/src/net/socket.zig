@@ -126,6 +126,11 @@ pub const Socket = struct {
         return self.io.vtable.netRead(self.io.userdata, self.handle, &bufs) catch return error.RecvFailed;
     }
 
+    /// Interrupts a concurrent read or write without closing the handle.
+    pub fn shutdown(self: *Self) void {
+        self.io.vtable.netShutdown(self.io.userdata, self.handle, .both) catch {};
+    }
+
     /// Enables or disables TCP_NODELAY (Nagle's algorithm).
     pub fn setNoDelay(self: *Self, enable: bool) !void {
         const value: u32 = if (enable) 1 else 0;
@@ -778,6 +783,13 @@ pub const TcpListener = struct {
     /// Closes the listener.
     pub fn deinit(self: *Self) void {
         self.server.deinit(self.io);
+    }
+
+    /// Interrupts a concurrent accept without closing the underlying handle.
+    /// Call this before `deinit` when another thread may be blocked in accept.
+    pub fn shutdown(self: *Self) void {
+        var socket = Socket.fromHandle(self.server.socket.handle, self.io);
+        socket.shutdown();
     }
 
     /// Accepts an incoming connection.

@@ -25,6 +25,7 @@ from gemma4_cuda_l4_release_gate import (
     GEMMA12B_TOKENS,
     FORBIDDEN_GENERATED_Q4_0_ROUTE_COUNTERS,
     MAX_TOK_S_CV,
+    RELEASE_SCHEMA,
     RELEASE_SCOPE,
     REQUIRED_Q8_PREFILL_ROUTE_COUNTERS,
     TOKEN_IDS_RE,
@@ -37,6 +38,7 @@ from gemma4_cuda_l4_release_gate import (
     frozen_profile,
     gemma12b_evidence,
     generation_replay_errors,
+    git_provenance,
     gpu_provenance,
     l4_errors,
     matrix_command,
@@ -44,9 +46,12 @@ from gemma4_cuda_l4_release_gate import (
     matrix_timeout_sec,
     parse_token_ids,
     path_provenance,
+    provenance_binding,
+    provenance_errors,
     release_environment,
     reset_matrix_outputs,
     run_logged,
+    toolchain_provenance,
 )
 
 
@@ -135,6 +140,9 @@ def generation_run() -> dict:
 
 
 class L4ReleaseGateTest(unittest.TestCase):
+    def test_release_schema_versions_bound_provenance(self) -> None:
+        self.assertEqual("antfly.gemma4_cuda_l4_release_gate.v2", RELEASE_SCHEMA)
+
     def test_release_scope_is_target_only(self) -> None:
         self.assertEqual("target_only", RELEASE_SCOPE)
 
@@ -150,15 +158,25 @@ class L4ReleaseGateTest(unittest.TestCase):
         self.assertIn('> "$mtp_dir/mtp_collection_profile.txt"', missing_draft)
         self.assertIn("release_contract=none; experimental diagnostic only", mtp_step)
 
-    def test_release_publication_depends_on_exact_sha_cuda_gate(self) -> None:
+    def test_cuda_evidence_workflow_sets_runner_temp_caches_at_runtime(self) -> None:
+        workflow = (pathlib.Path(__file__).resolve().parents[4] / ".github/workflows/cuda-gemma4-l4.yml").read_text(encoding="utf-8")
+        prepare = workflow[workflow.index("- name: Prepare CUDA evidence inputs"):workflow.index("- name: Check generated CUDA sources")]
+        self.assertNotIn("${{ runner.temp }}", workflow)
+        self.assertIn('ZIG_LOCAL_CACHE_DIR="$RUNNER_TEMP/antfly-zig-local"', prepare)
+        self.assertIn('ZIG_GLOBAL_CACHE_DIR="$RUNNER_TEMP/antfly-zig-global"', prepare)
+        self.assertIn('>> "$GITHUB_ENV"', prepare)
+
+    def test_release_publication_does_not_depend_on_unpublished_cuda_artifact(self) -> None:
         repo = pathlib.Path(__file__).resolve().parents[4]
         workflow = (repo / ".github/workflows/cuda-gemma4-l4.yml").read_text(encoding="utf-8")
         release = (repo / ".github/workflows/antfly-release.yml").read_text(encoding="utf-8")
-        self.assertIn("workflow_call:", workflow)
-        self.assertIn("uses: ./.github/workflows/cuda-gemma4-l4.yml", release)
-        self.assertIn("gate: release", release)
+        archive_builder = (repo / "scripts/packaging/build_zig_release_archive.sh").read_text(encoding="utf-8")
+        self.assertIn("schedule:", workflow)
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertNotIn("uses: ./.github/workflows/cuda-gemma4-l4.yml", release)
+        self.assertIn("-Dcuda=false", archive_builder)
         publish = release[release.index("  publish-release-assets:"):release.index("  package-cli-artifacts:")]
-        self.assertIn("- cuda-gemma4-release-gate", publish)
+        self.assertNotIn("cuda-gemma4-release-gate", publish)
 
     def test_workflow_uses_accepted_release_and_batching_regression_floors(self) -> None:
         workflow = (pathlib.Path(__file__).resolve().parents[4] / ".github/workflows/cuda-gemma4-l4.yml").read_text(encoding="utf-8")
@@ -178,13 +196,13 @@ class L4ReleaseGateTest(unittest.TestCase):
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN"])
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_CATALOG_FFN_CANDIDATES"])
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT"])
-        self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MMV"])
-        self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MM"])
-        self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR"])
-        self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR_Q8"])
+        self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MMV"])
+        self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MM"])
+        self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR"])
+        self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR_Q8"])
         self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A"])
         self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A"])
-        self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_DOWN_Q8"])
+        self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_DOWN_Q8"])
         self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX"])
         self.assertEqual("required", profile["ANTFLY_DECODE_GRAPH_REPLAY"])
         self.assertEqual(str(CAPTURE_KV_CAPACITY), profile["ANTFLY_CAPTURE_FORCE_KV_CAPACITY"])
@@ -334,9 +352,88 @@ class L4ReleaseGateTest(unittest.TestCase):
         )
 
     def test_l4_requirement_is_exact(self) -> None:
-        self.assertEqual([], l4_errors({"devices": [{"name": "NVIDIA L4", "compute_capability": "8.9"}]}))
-        self.assertIn("expected NVIDIA L4", l4_errors({"devices": [{"name": "NVIDIA A10", "compute_capability": "8.9"}]})[0])
+        l4 = {"name": "NVIDIA L4", "compute_capability": "8.9", "driver_version": "580.159.03"}
+        self.assertEqual([], l4_errors({"devices": [l4]}))
+        self.assertIn("expected NVIDIA L4", l4_errors({"devices": [{**l4, "name": "NVIDIA A10"}]})[0])
+        self.assertIn("driver version", l4_errors({"devices": [{**l4, "driver_version": ""}]})[0])
         self.assertIn("expected exactly one", l4_errors({"devices": []})[0])
+
+    def test_git_provenance_separates_tracked_and_source_untracked_drift(self) -> None:
+        clean = {"returncode": 0, "stdout": None, "stderr": None}
+        captures = [
+            {**clean, "stdout": "a" * 40},
+            {**clean, "stdout": "a" * 40},
+            clean,
+            {**clean, "stdout": "?? zig/pkg/inference/new_source.zig"},
+            {**clean, "stdout": "?? artifacts/cuda-gemma4-l4/release_summary.json"},
+        ]
+        with mock.patch("gemma4_cuda_l4_release_gate.command_capture", side_effect=captures):
+            provenance = git_provenance(pathlib.Path("/repo"))
+        self.assertIs(provenance["tracked_dirty"], False)
+        self.assertIs(provenance["dirty"], True)
+        self.assertEqual(["zig/pkg/inference/new_source.zig"], provenance["source_untracked_paths"])
+
+    def test_provenance_errors_fail_closed_on_git_absence_and_source_drift(self) -> None:
+        tool = {"returncode": 0, "path": "/tool", "sha256": "f" * 64, "version": "ok"}
+        toolchains = {name: dict(tool) for name in ("python", "git", "cuobjdump", "nvidia_smi")}
+        toolchains["zig"] = {**tool, "version": "0.16.0"}
+        toolchains["nvcc"] = {**tool, "version": "Cuda compilation tools, release 13.2"}
+        base = {
+            "git": {
+                "commit": "a" * 40,
+                "commit_returncode": 0,
+                "tracked_status_returncode": 0,
+                "tracked_dirty": False,
+                "source_status_returncode": 0,
+                "source_untracked_paths": [],
+            },
+            "toolchains": toolchains,
+        }
+        self.assertEqual([], provenance_errors(base))
+
+        missing = {"git": {}, "toolchains": toolchains}
+        errors = provenance_errors(missing)
+        self.assertTrue(any("commit provenance" in error for error in errors))
+        self.assertTrue(any("tracked-source status" in error for error in errors))
+        self.assertTrue(any("untracked-source status" in error for error in errors))
+
+        drift = {"git": {**base["git"], "tracked_dirty": True, "source_untracked_paths": ["zig/new.zig"]}, "toolchains": toolchains}
+        errors = provenance_errors(drift)
+        self.assertTrue(any("tracked source differs" in error for error in errors))
+        self.assertTrue(any("untracked source files" in error for error in errors))
+
+    def test_toolchain_provenance_shape_is_deterministic_on_missing_tools(self) -> None:
+        with mock.patch("gemma4_cuda_l4_release_gate.shutil.which", return_value=None), \
+                mock.patch("gemma4_cuda_l4_release_gate.pathlib.Path.is_file", return_value=False):
+            provenance = toolchain_provenance()
+        self.assertEqual(
+            {"python", "git", "zig", "nvcc", "cuobjdump", "nvidia_smi", "platform"},
+            set(provenance),
+        )
+        for name in ("python", "git", "zig", "nvcc", "cuobjdump", "nvidia_smi"):
+            self.assertEqual({"command", "path", "sha256", "version", "returncode"}, set(provenance[name]))
+            self.assertIsNone(provenance[name]["path"])
+        errors = provenance_errors({
+            "git": {
+                "commit": "a" * 40,
+                "commit_returncode": 0,
+                "tracked_status_returncode": 0,
+                "tracked_dirty": False,
+                "source_status_returncode": 0,
+                "source_untracked_paths": [],
+            },
+            "toolchains": provenance,
+        })
+        self.assertTrue(any("nvcc toolchain provenance is unavailable" in error for error in errors))
+        self.assertTrue(any("cuobjdump toolchain provenance is unavailable" in error for error in errors))
+
+    def test_provenance_binding_hashes_exact_written_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = pathlib.Path(temp_dir) / "release_provenance.json"
+            path.write_bytes(b'{"schema":"test"}\n')
+            binding = provenance_binding(path)
+        self.assertEqual("release_provenance.json", binding["provenance"])
+        self.assertEqual(hashlib.sha256(b'{"schema":"test"}\n').hexdigest(), binding["provenance_sha256"])
 
     def test_diagnostic_bypasses_cannot_pass_release_summary(self) -> None:
         self.assertEqual([], diagnostic_mode_errors(True, False))

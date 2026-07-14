@@ -183,6 +183,10 @@ jobs:
         working-directory: zig/pkg/inference
         run: zig build quant-kernel-local-check -Dmetal=false -Dcuda=false
 
+      - name: Test standalone inference CLI configuration
+        working-directory: zig
+        run: zig build inference-cli-test -Dedition=inference -Dmetal=false -Dcuda=false -Donnx=false -Dsystem-blas=false
+
       - name: Run CUDA benchmark contract tests
         working-directory: zig/pkg/inference
         run: |
@@ -590,6 +594,7 @@ jobs:
           echo "LD_LIBRARY_PATH=$root/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Run Antfly full E2E
+        id: antfly_full_e2e
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
@@ -600,6 +605,7 @@ jobs:
           uv run --project e2e/antfly pytest -q -x e2e/antfly
 
       - name: Run Antfly inference full E2E
+        if: ${{ success() || steps.antfly_full_e2e.outcome == 'failure' }}
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly

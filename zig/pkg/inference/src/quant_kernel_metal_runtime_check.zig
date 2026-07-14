@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const quant_kernel_compiler = @import("graph/quant_kernel_compiler.zig");
 const quant_kernel_metal_renderer = @import("graph/quant_kernel_metal_renderer.zig");
 const quant_matmul = @import("graph/quant_matmul.zig");
@@ -36,11 +37,16 @@ const metal_quant_format_q8_1: u32 = 14;
 const metal_quant_format_q8_k: u32 = 15;
 const metal_storage_private: c_int = 1;
 const metal_quant_evidence_contract = "antfly.quant_kernel_metal_evidence.v1";
-const metal_runtime_evidence_schema = "antfly.quant_kernel_metal_runtime_evidence.v9";
+const metal_runtime_evidence_schema = "antfly.quant_kernel_metal_runtime_evidence.v11";
+const metal_runtime_evidence_provenance_local = "local_unattested";
+const metal_runtime_evidence_provenance_attested = "attested_v1";
+const metal_runtime_evidence_provenance_missing = "missing_reproducible_provenance";
+const clean_source_status_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn unsetenv(name: [*:0]const u8) c_int;
 extern fn termite_metal_device_available() c_int;
+extern fn termite_metal_copy_device_name(buffer: [*c]u8, capacity: usize) usize;
 extern fn termite_metal_provider_create() ?*RawMetalProvider;
 extern fn termite_metal_provider_destroy(provider: ?*RawMetalProvider) void;
 extern fn termite_metal_provider_linear_q2_k(
@@ -1762,6 +1768,7 @@ test "quant kernel metal runtime production benchmark cases match compiler manif
 const Config = struct {
     evidence_out_path: ?[]const u8 = null,
     check_evidence_path: ?[]const u8 = null,
+    attest_provenance: bool = false,
     require_promotion_ready: bool = false,
     require_runtime_route_all: bool = false,
     require_kernel: ?[]const u8 = null,
@@ -1783,6 +1790,113 @@ const Config = struct {
     measure_iters: ?u32 = null,
 };
 
+const AttestedProvenance = struct {
+    source_commit: []const u8,
+    source_tree_clean: bool,
+    source_status_sha256: []const u8,
+    host_os: []const u8,
+    host_arch: []const u8,
+    accelerator_name: []const u8,
+    metal_compiler_version: []const u8,
+    zig_version: []const u8,
+    recorded_at_utc: []const u8,
+};
+
+const CollectedAttestedProvenance = struct {
+    value: AttestedProvenance,
+
+    fn deinit(self: *CollectedAttestedProvenance, allocator: std.mem.Allocator) void {
+        allocator.free(self.value.source_commit);
+        allocator.free(self.value.source_status_sha256);
+        allocator.free(self.value.host_os);
+        allocator.free(self.value.host_arch);
+        allocator.free(self.value.accelerator_name);
+        allocator.free(self.value.metal_compiler_version);
+        allocator.free(self.value.zig_version);
+        allocator.free(self.value.recorded_at_utc);
+        self.* = undefined;
+    }
+};
+
+fn runAttestationCommandRaw(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8, stdout_limit: usize) ![]u8 {
+    const result = try std.process.run(allocator, io, .{
+        .argv = argv,
+        .stdout_limit = .limited(stdout_limit),
+        .stderr_limit = .limited(64 * 1024),
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } },
+    });
+    defer allocator.free(result.stderr);
+    errdefer allocator.free(result.stdout);
+    switch (result.term) {
+        .exited => |code| if (code != 0) return error.MetalAttestationCommandFailed,
+        else => return error.MetalAttestationCommandFailed,
+    }
+    return result.stdout;
+}
+
+fn runAttestationCommandTrimmed(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8, stdout_limit: usize) ![]u8 {
+    const raw = try runAttestationCommandRaw(allocator, io, argv, stdout_limit);
+    defer allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return error.MetalAttestationMetadataMissing;
+    return allocator.dupe(u8, trimmed);
+}
+
+fn cleanSourceStatusSha256Alloc(allocator: std.mem.Allocator, status: []const u8) ![]u8 {
+    if (status.len != 0) return error.MetalEvidenceDirtySourceTree;
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(status, &digest, .{});
+    return std.fmt.allocPrint(allocator, "{s}", .{std.fmt.bytesToHex(digest, .lower)});
+}
+
+fn collectMetalDeviceName(allocator: std.mem.Allocator) ![]u8 {
+    // The broad inference unit-test binary intentionally does not link the
+    // Objective-C Metal provider. Pure provenance parsing/matching is tested
+    // below; live device collection remains fail-closed in that test build.
+    if (builtin.is_test) return error.MetalAttestationDeviceIdentityMissing;
+    const length = termite_metal_copy_device_name(null, 0);
+    if (length == 0 or length > 4096) return error.MetalAttestationDeviceIdentityMissing;
+    const name = try allocator.alloc(u8, length);
+    errdefer allocator.free(name);
+    if (termite_metal_copy_device_name(name.ptr, name.len) != length) return error.MetalAttestationDeviceIdentityMissing;
+    return name;
+}
+
+fn collectAttestedProvenance(allocator: std.mem.Allocator, io: std.Io) !CollectedAttestedProvenance {
+    const source_commit = try runAttestationCommandTrimmed(allocator, io, &.{ "/usr/bin/git", "rev-parse", "--verify", "HEAD" }, 1024);
+    errdefer allocator.free(source_commit);
+
+    const source_status = try runAttestationCommandRaw(allocator, io, &.{ "/usr/bin/git", "status", "--porcelain=v1", "--untracked-files=all" }, 1024 * 1024);
+    defer allocator.free(source_status);
+    const source_status_sha256 = try cleanSourceStatusSha256Alloc(allocator, source_status);
+    errdefer allocator.free(source_status_sha256);
+
+    const accelerator_name = try collectMetalDeviceName(allocator);
+    errdefer allocator.free(accelerator_name);
+    const metal_compiler_version = try runAttestationCommandTrimmed(allocator, io, &.{ "/usr/bin/xcrun", "--toolchain", "Metal", "metal", "--version" }, 64 * 1024);
+    errdefer allocator.free(metal_compiler_version);
+    const recorded_at_utc = try runAttestationCommandTrimmed(allocator, io, &.{ "/bin/date", "-u", "+%Y-%m-%dT%H:%M:%SZ" }, 1024);
+    errdefer allocator.free(recorded_at_utc);
+    const host_os = try runAttestationCommandTrimmed(allocator, io, &.{ "/usr/bin/uname", "-s" }, 1024);
+    errdefer allocator.free(host_os);
+    const host_arch = try runAttestationCommandTrimmed(allocator, io, &.{ "/usr/bin/uname", "-m" }, 1024);
+    errdefer allocator.free(host_arch);
+    const zig_version = try allocator.dupe(u8, builtin.zig_version_string);
+    errdefer allocator.free(zig_version);
+
+    return .{ .value = .{
+        .source_commit = source_commit,
+        .source_tree_clean = true,
+        .source_status_sha256 = source_status_sha256,
+        .host_os = host_os,
+        .host_arch = host_arch,
+        .accelerator_name = accelerator_name,
+        .metal_compiler_version = metal_compiler_version,
+        .zig_version = zig_version,
+        .recorded_at_utc = recorded_at_utc,
+    } };
+}
+
 const promotion_min_repeat_runs: usize = quant_kernel_compiler.metal_promotion_repeat_runs;
 const max_evidence_repeat_runs: usize = 31;
 
@@ -1801,7 +1915,7 @@ pub fn main(init: std.process.Init) !void {
     if (cfg.check_evidence_path) |path| {
         const required_evidence_kernel = cfg.require_kernel orelse cfg.require_evidence_kernel;
         const summary = checkEvidenceFileWithSummary(allocator, path, cfg.require_promotion_ready, cfg.require_runtime_route_all, required_evidence_kernel) catch |err| {
-            if (err == error.MetalEvidencePromotionNotReady) {
+            if (err == error.MetalEvidencePromotionNotReady or err == error.MetalEvidenceReproducibleProvenanceMissing) {
                 if (checkEvidenceFileWithSummary(allocator, path, false, cfg.require_runtime_route_all, required_evidence_kernel)) |summary| {
                     printEvidenceSummary(path, "not_ready", summary);
                 } else |_| {}
@@ -1929,7 +2043,24 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (cfg.evidence_out_path) |path| {
-        try writeEvidence(allocator, path, checks, results, cfg.repeat_runs, cfg.promotion_ready_kernel, cfg.runtime_route_kernel, cfg.runtime_route_all, cfg.production_regression_check, true);
+        var collected_provenance: ?CollectedAttestedProvenance = if (cfg.attest_provenance)
+            try collectAttestedProvenance(allocator, compat.io())
+        else
+            null;
+        defer if (collected_provenance) |*provenance| provenance.deinit(allocator);
+        try writeEvidence(
+            allocator,
+            path,
+            checks,
+            results,
+            cfg.repeat_runs,
+            cfg.promotion_ready_kernel,
+            cfg.runtime_route_kernel,
+            cfg.runtime_route_all,
+            cfg.production_regression_check,
+            true,
+            if (collected_provenance) |provenance| provenance.value else null,
+        );
         std.debug.print("quant-kernel-metal-runtime-check evidence_out={s}\n", .{path});
         if (cfg.production_regression_check) {
             const summary = try checkEvidenceFileWithSummary(allocator, path, false, false, null);
@@ -1988,6 +2119,9 @@ fn parseArgs(args: []const [:0]const u8) !Config {
             i += 1;
             if (i >= args.len) return error.MissingEvidenceOutPath;
             cfg.evidence_out_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--attest-provenance")) {
+            if (cfg.attest_provenance) return error.DuplicateAttestProvenance;
+            cfg.attest_provenance = true;
         } else if (std.mem.eql(u8, arg, "--check-evidence")) {
             if (cfg.check_evidence_path != null) return error.DuplicateCheckEvidence;
             i += 1;
@@ -2074,6 +2208,7 @@ fn parseArgs(args: []const [:0]const u8) !Config {
         }
     }
     if (cfg.check_evidence_path != null and cfg.evidence_out_path != null) return error.CheckEvidenceConflictsWithEvidenceOut;
+    if (cfg.attest_provenance and cfg.evidence_out_path == null) return error.AttestProvenanceRequiresEvidenceOut;
     if (cfg.check_evidence_path != null and cfg.repeat_runs != 1) return error.CheckEvidenceConflictsWithRepeatRuns;
     if (cfg.check_evidence_path != null and cfg.measure_iters != null) return error.CheckEvidenceConflictsWithMeasureIters;
     if (cfg.check_blocker_evidence and cfg.evidence_out_path != null) return error.CheckBlockerEvidenceConflictsWithEvidenceOut;
@@ -2151,7 +2286,11 @@ test "quant kernel metal runtime sweep enumerates valid variants" {
 test "quant kernel metal runtime check parses evidence output flag" {
     const cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json" });
     try std.testing.expectEqualStrings("/tmp/evidence.json", cfg.evidence_out_path.?);
+    const attested_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--attest-provenance" });
+    try std.testing.expect(attested_cfg.attest_provenance);
     try std.testing.expectError(error.MissingEvidenceOutPath, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out" }));
+    try std.testing.expectError(error.AttestProvenanceRequiresEvidenceOut, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--attest-provenance" }));
+    try std.testing.expectError(error.DuplicateAttestProvenance, parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--evidence-out", "/tmp/evidence.json", "--attest-provenance", "--attest-provenance" }));
 
     const check_cfg = try parseArgs(&.{ "antfly-quant-kernel-metal-runtime-check", "--check-evidence", "/tmp/evidence.json", "--require-promotion-ready", "--require-kernel", quant_kernel_compiler.first_general_metal_q4_kernel_id });
     try std.testing.expectEqualStrings("/tmp/evidence.json", check_cfg.check_evidence_path.?);
@@ -3951,6 +4090,7 @@ fn writeEvidence(
     runtime_route_all: bool,
     production_regression_check: bool,
     emit_promotion_diagnostics: bool,
+    attested_provenance: ?AttestedProvenance,
 ) !void {
     if (checks.len != results.len) return error.InvalidArgument;
     if (promotion_ready_kernel) |kernel| {
@@ -3986,6 +4126,7 @@ fn writeEvidence(
     defer if (runtime_route_kernel != null) allocator.free(runtime_route_arg);
     const route_args = try std.fmt.allocPrint(allocator, "{s}{s}", .{ promotion_arg, runtime_route_arg });
     defer allocator.free(route_args);
+    const attestation_arg = if (attested_provenance != null) " --attest-provenance" else "";
     const measure_iters = if (checks.len == 0) default_measure_iters else checks[0].measure_iters;
     if (production_regression_check and measure_iters != quant_kernel_compiler.metal_promotion_measure_iters) return error.InvalidArgument;
     const measure_iters_arg = if (measure_iters != default_measure_iters)
@@ -3996,14 +4137,14 @@ fn writeEvidence(
     const benchmark_command = if (repeat_runs == 1)
         try std.fmt.allocPrint(
             allocator,
-            "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out {s}{s}{s}",
-            .{ path, measure_iters_arg, route_args },
+            "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out {s}{s}{s}{s}",
+            .{ path, measure_iters_arg, attestation_arg, route_args },
         )
     else
         try std.fmt.allocPrint(
             allocator,
-            "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out {s} --repeat-runs {d}{s}{s}",
-            .{ path, repeat_runs, measure_iters_arg, route_args },
+            "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out {s} --repeat-runs {d}{s}{s}{s}",
+            .{ path, repeat_runs, measure_iters_arg, attestation_arg, route_args },
         );
     defer allocator.free(benchmark_command);
     const production_enabled = promotion_ready_kernel != null or production_regression_check;
@@ -4021,6 +4162,17 @@ fn writeEvidence(
         \\{{
         \\"evidence_contract":"{s}",
         \\"schema":"{s}",
+        \\"provenance_status":{f},
+        \\"provenance_blocker":{f},
+        \\"source_commit":{f},
+        \\"source_tree_clean":{s},
+        \\"source_status_sha256":{f},
+        \\"host_os":{f},
+        \\"host_arch":{f},
+        \\"accelerator_name":{f},
+        \\"metal_compiler_version":{f},
+        \\"zig_version":{f},
+        \\"recorded_at_utc":{f},
         \\"benchmark_command":{f},
         \\"benchmark_mode":"sequential",
         \\"repeat_runs":{d},
@@ -4041,6 +4193,17 @@ fn writeEvidence(
     , .{
         metal_quant_evidence_contract,
         metal_runtime_evidence_schema,
+        std.json.fmt(if (attested_provenance != null) metal_runtime_evidence_provenance_attested else metal_runtime_evidence_provenance_local, .{}),
+        std.json.fmt(if (attested_provenance != null) "" else metal_runtime_evidence_provenance_missing, .{}),
+        std.json.fmt(if (attested_provenance) |provenance| provenance.source_commit else "", .{}),
+        jsonBool(if (attested_provenance) |provenance| provenance.source_tree_clean else false),
+        std.json.fmt(if (attested_provenance) |provenance| provenance.source_status_sha256 else "", .{}),
+        std.json.fmt(if (attested_provenance) |provenance| provenance.host_os else "", .{}),
+        std.json.fmt(if (attested_provenance) |provenance| provenance.host_arch else "", .{}),
+        std.json.fmt(if (attested_provenance) |provenance| provenance.accelerator_name else "", .{}),
+        std.json.fmt(if (attested_provenance) |provenance| provenance.metal_compiler_version else "", .{}),
+        std.json.fmt(if (attested_provenance) |provenance| provenance.zig_version else "", .{}),
+        std.json.fmt(if (attested_provenance) |provenance| provenance.recorded_at_utc else "", .{}),
         std.json.fmt(benchmark_command, .{}),
         repeat_runs,
         warmup_repeat_runs,
@@ -4861,6 +5024,7 @@ fn refreshBlockerEvidence(allocator: std.mem.Allocator, evidence_dir: ?[]const u
             false,
             false,
             true,
+            null,
         );
     }
     return checkBlockerEvidenceWithDetails(allocator, evidence_dir, false, confirm_cleared_blockers);
@@ -5075,9 +5239,29 @@ fn checkEvidenceFile(allocator: std.mem.Allocator, path: []const u8, require_pro
 }
 
 fn checkEvidenceFileWithSummary(allocator: std.mem.Allocator, path: []const u8, require_promotion_ready: bool, require_runtime_route_all: bool, require_kernel: ?[]const u8) !EvidenceSummary {
+    return checkEvidenceFileWithSummaryExpected(allocator, path, require_promotion_ready, require_runtime_route_all, require_kernel, null);
+}
+
+fn checkEvidenceFileWithSummaryExpected(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    require_promotion_ready: bool,
+    require_runtime_route_all: bool,
+    require_kernel: ?[]const u8,
+    expected_provenance_override: ?AttestedProvenance,
+) !EvidenceSummary {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(compat.io(), path, allocator, .limited(1024 * 1024));
     defer allocator.free(bytes);
     try checkEvidenceJson(allocator, bytes, require_promotion_ready, require_runtime_route_all, require_kernel);
+    if (require_promotion_ready) {
+        if (expected_provenance_override) |expected_provenance| {
+            try checkEvidenceProvenanceMatches(allocator, bytes, expected_provenance);
+        } else {
+            var expected_provenance = try collectAttestedProvenance(allocator, compat.io());
+            defer expected_provenance.deinit(allocator);
+            try checkEvidenceProvenanceMatches(allocator, bytes, expected_provenance.value);
+        }
+    }
     try checkEvidenceJsonCommandPath(allocator, bytes, path);
     return evidenceSummaryFromJson(allocator, bytes);
 }
@@ -5212,6 +5396,95 @@ fn commandArgValue(command: []const u8, arg: []const u8) ?[]const u8 {
     return null;
 }
 
+fn isLowerHex(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
+    return true;
+}
+
+fn isUtcSecondTimestamp(value: []const u8) bool {
+    if (value.len != 20 or value[4] != '-' or value[7] != '-' or value[10] != 'T' or value[13] != ':' or value[16] != ':' or value[19] != 'Z') return false;
+    for (value, 0..) |byte, index| {
+        if (index == 4 or index == 7 or index == 10 or index == 13 or index == 16 or index == 19) continue;
+        if (!std.ascii.isDigit(byte)) return false;
+    }
+    const month = std.fmt.parseInt(u8, value[5..7], 10) catch return false;
+    const day = std.fmt.parseInt(u8, value[8..10], 10) catch return false;
+    const hour = std.fmt.parseInt(u8, value[11..13], 10) catch return false;
+    const minute = std.fmt.parseInt(u8, value[14..16], 10) catch return false;
+    const second = std.fmt.parseInt(u8, value[17..19], 10) catch return false;
+    return month >= 1 and month <= 12 and day >= 1 and day <= 31 and hour <= 23 and minute <= 59 and second <= 60;
+}
+
+fn parseEvidenceProvenance(root: std.json.Value, benchmark_command: []const u8, require_promotion_ready: bool) !?AttestedProvenance {
+    const status = jsonString(root.object.get("provenance_status")) orelse return error.InvalidMetalEvidence;
+    const blocker = jsonString(root.object.get("provenance_blocker")) orelse return error.InvalidMetalEvidence;
+    const source_commit = jsonString(root.object.get("source_commit")) orelse return error.InvalidMetalEvidence;
+    const source_tree_clean = jsonBoolValue(root.object.get("source_tree_clean")) orelse return error.InvalidMetalEvidence;
+    const source_status_sha256 = jsonString(root.object.get("source_status_sha256")) orelse return error.InvalidMetalEvidence;
+    const host_os = jsonString(root.object.get("host_os")) orelse return error.InvalidMetalEvidence;
+    const host_arch = jsonString(root.object.get("host_arch")) orelse return error.InvalidMetalEvidence;
+    const accelerator_name = jsonString(root.object.get("accelerator_name")) orelse return error.InvalidMetalEvidence;
+    const metal_compiler_version = jsonString(root.object.get("metal_compiler_version")) orelse return error.InvalidMetalEvidence;
+    const zig_version = jsonString(root.object.get("zig_version")) orelse return error.InvalidMetalEvidence;
+    const recorded_at_utc = jsonString(root.object.get("recorded_at_utc")) orelse return error.InvalidMetalEvidence;
+
+    if (std.mem.eql(u8, status, metal_runtime_evidence_provenance_local)) {
+        if (!std.mem.eql(u8, blocker, metal_runtime_evidence_provenance_missing) or
+            source_commit.len != 0 or source_tree_clean or source_status_sha256.len != 0 or
+            host_os.len != 0 or host_arch.len != 0 or accelerator_name.len != 0 or
+            metal_compiler_version.len != 0 or zig_version.len != 0 or recorded_at_utc.len != 0 or
+            commandHasToken(benchmark_command, "--attest-provenance"))
+        {
+            return error.InvalidMetalEvidence;
+        }
+        if (require_promotion_ready) return error.MetalEvidenceReproducibleProvenanceMissing;
+        return null;
+    }
+
+    if (!std.mem.eql(u8, status, metal_runtime_evidence_provenance_attested) or blocker.len != 0) return error.InvalidMetalEvidence;
+    if (!commandHasToken(benchmark_command, "--attest-provenance")) return error.InvalidMetalEvidence;
+    if (!source_tree_clean or !std.mem.eql(u8, source_status_sha256, clean_source_status_sha256)) return error.InvalidMetalEvidence;
+    if ((source_commit.len != 40 and source_commit.len != 64) or !isLowerHex(source_commit)) return error.InvalidMetalEvidence;
+    if (host_os.len == 0 or host_arch.len == 0 or accelerator_name.len == 0 or metal_compiler_version.len == 0 or zig_version.len == 0) return error.InvalidMetalEvidence;
+    if (!isUtcSecondTimestamp(recorded_at_utc)) return error.InvalidMetalEvidence;
+
+    return .{
+        .source_commit = source_commit,
+        .source_tree_clean = source_tree_clean,
+        .source_status_sha256 = source_status_sha256,
+        .host_os = host_os,
+        .host_arch = host_arch,
+        .accelerator_name = accelerator_name,
+        .metal_compiler_version = metal_compiler_version,
+        .zig_version = zig_version,
+        .recorded_at_utc = recorded_at_utc,
+    };
+}
+
+fn attestedProvenanceMatches(actual: AttestedProvenance, expected: AttestedProvenance) bool {
+    return actual.source_tree_clean == expected.source_tree_clean and
+        std.mem.eql(u8, actual.source_commit, expected.source_commit) and
+        std.mem.eql(u8, actual.source_status_sha256, expected.source_status_sha256) and
+        std.mem.eql(u8, actual.host_os, expected.host_os) and
+        std.mem.eql(u8, actual.host_arch, expected.host_arch) and
+        std.mem.eql(u8, actual.accelerator_name, expected.accelerator_name) and
+        std.mem.eql(u8, actual.metal_compiler_version, expected.metal_compiler_version) and
+        std.mem.eql(u8, actual.zig_version, expected.zig_version);
+}
+
+fn checkEvidenceProvenanceMatches(allocator: std.mem.Allocator, bytes: []const u8, expected: AttestedProvenance) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const root = parsed.value;
+    if (root != .object) return error.InvalidMetalEvidence;
+    const benchmark_command = jsonString(root.object.get("benchmark_command")) orelse return error.InvalidMetalEvidence;
+    const actual = (try parseEvidenceProvenance(root, benchmark_command, true)) orelse return error.MetalEvidenceReproducibleProvenanceMissing;
+    if (!attestedProvenanceMatches(actual, expected)) return error.MetalEvidenceProvenanceMismatch;
+}
+
 fn checkEvidenceJson(allocator: std.mem.Allocator, bytes: []const u8, require_promotion_ready: bool, require_runtime_route_all: bool, require_kernel: ?[]const u8) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
     defer parsed.deinit();
@@ -5224,6 +5497,7 @@ fn checkEvidenceJson(allocator: std.mem.Allocator, bytes: []const u8, require_pr
     if (!std.mem.eql(u8, schema, metal_runtime_evidence_schema)) return error.InvalidMetalEvidence;
     const benchmark_command = jsonString(root.object.get("benchmark_command")) orelse return error.InvalidMetalEvidence;
     if (!std.mem.startsWith(u8, benchmark_command, "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out ")) return error.InvalidMetalEvidence;
+    _ = try parseEvidenceProvenance(root, benchmark_command, require_promotion_ready);
     const benchmark_mode = jsonString(root.object.get("benchmark_mode")) orelse return error.InvalidMetalEvidence;
     if (!std.mem.eql(u8, benchmark_mode, "sequential")) return error.InvalidMetalEvidence;
     const repeat_runs = jsonUsize(root.object.get("repeat_runs")) orelse return error.InvalidMetalEvidence;
@@ -6171,6 +6445,13 @@ fn jsonBool(value: bool) []const u8 {
     return if (value) "true" else "false";
 }
 
+test "quant kernel metal attestation rejects dirty source status" {
+    try std.testing.expectError(error.MetalEvidenceDirtySourceTree, cleanSourceStatusSha256Alloc(std.testing.allocator, " M src/file.zig\n"));
+    const clean_digest = try cleanSourceStatusSha256Alloc(std.testing.allocator, "");
+    defer std.testing.allocator.free(clean_digest);
+    try std.testing.expectEqualStrings(clean_source_status_sha256, clean_digest);
+}
+
 test "quant kernel metal runtime evidence records dev-only benchmark results" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6196,14 +6477,18 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
         }
     }
 
-    try writeEvidence(std.testing.allocator, path, &metal_runtime_checks, &results, 1, null, null, false, false, false);
+    try writeEvidence(std.testing.allocator, path, &metal_runtime_checks, &results, 1, null, null, false, false, false, null);
     const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(actual);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, actual, .{});
     defer parsed.deinit();
 
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"evidence_contract\":\"antfly.quant_kernel_metal_evidence.v1\""));
-    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"schema\":\"antfly.quant_kernel_metal_runtime_evidence.v9\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"schema\":\"antfly.quant_kernel_metal_runtime_evidence.v11\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"provenance_status\":\"local_unattested\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"provenance_blocker\":\"missing_reproducible_provenance\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"source_commit\":\"\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"source_tree_clean\":false"));
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"generated_timing_route\":\"standalone_generated\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"generated_timing_scope\":\"standalone_command_buffer\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"promotion_worst_repeat_speedup\":null"));
@@ -6352,7 +6637,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
 
     const route_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "metal", "q8-route-evidence.json" });
     defer std.testing.allocator.free(route_path);
-    try writeEvidence(std.testing.allocator, route_path, route_checks[0..route_count], route_results[0..route_count], 1, null, route_kernel, false, false, false);
+    try writeEvidence(std.testing.allocator, route_path, route_checks[0..route_count], route_results[0..route_count], 1, null, route_kernel, false, false, false, null);
     const route_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, route_path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(route_actual);
     try std.testing.expect(std.mem.containsAtLeast(u8, route_actual, 1, "\"runtime_route_kernel\":\"" ++ route_kernel ++ "\""));
@@ -6362,7 +6647,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, route_actual, "\"promotion_blocker\":\"\""));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, route_actual, "\"promotion_blocker\":\"runtime_route_only\""));
     try checkEvidenceFile(std.testing.allocator, route_path, false, false, null);
-    try std.testing.expectError(error.MetalEvidencePromotionNotReady, checkEvidenceFile(std.testing.allocator, route_path, true, false, route_kernel));
+    try std.testing.expectError(error.MetalEvidenceReproducibleProvenanceMissing, checkEvidenceFile(std.testing.allocator, route_path, true, false, route_kernel));
 
     var route_all_checks: [metal_runtime_checks.len]CheckCase = undefined;
     var route_all_results: [metal_runtime_checks.len]CheckResult = undefined;
@@ -6382,7 +6667,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
 
     const route_all_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "metal", "all-route-evidence.json" });
     defer std.testing.allocator.free(route_all_path);
-    try writeEvidence(std.testing.allocator, route_all_path, route_all_checks[0..route_all_count], route_all_results[0..route_all_count], 1, null, null, true, false, false);
+    try writeEvidence(std.testing.allocator, route_all_path, route_all_checks[0..route_all_count], route_all_results[0..route_all_count], 1, null, null, true, false, false, null);
     const route_all_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, route_all_path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(route_all_actual);
     try std.testing.expect(std.mem.containsAtLeast(u8, route_all_actual, 1, "\"runtime_route_kernel\":null"));
@@ -6461,7 +6746,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     try checkEvidenceFile(std.testing.allocator, path, false, false, null);
     try checkEvidenceFile(std.testing.allocator, path, false, false, quant_kernel_compiler.first_general_metal_q4_0_kernel_id);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceFile(std.testing.allocator, path, false, false, "missing_kernel"));
-    try std.testing.expectError(error.MetalEvidencePromotionNotReady, checkEvidenceFile(std.testing.allocator, path, true, false, null));
+    try std.testing.expectError(error.MetalEvidenceReproducibleProvenanceMissing, checkEvidenceFile(std.testing.allocator, path, true, false, null));
 
     const copied_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "metal", "copied-evidence.json" });
     defer std.testing.allocator.free(copied_path);
@@ -6476,7 +6761,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     const production_enabled = try replaceOnce(std.testing.allocator, actual, "\"production_enabled\":false", "\"production_enabled\":true");
     defer std.testing.allocator.free(production_enabled);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, production_enabled, false, false, null));
-    try std.testing.expectError(error.MetalEvidencePromotionNotReady, checkEvidenceJson(std.testing.allocator, production_enabled, true, false, null));
+    try std.testing.expectError(error.MetalEvidenceReproducibleProvenanceMissing, checkEvidenceJson(std.testing.allocator, production_enabled, true, false, null));
     const impossible_ready = try replaceOnce(
         std.testing.allocator,
         actual,
@@ -6485,6 +6770,14 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     );
     defer std.testing.allocator.free(impossible_ready);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, impossible_ready, false, false, null));
+    const forged_provenance = try replaceOnce(
+        std.testing.allocator,
+        actual,
+        "\"provenance_status\":\"local_unattested\"",
+        "\"provenance_status\":\"attested_v1\"",
+    );
+    defer std.testing.allocator.free(forged_provenance);
+    try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, forged_provenance, false, false, null));
 
     const bad = try replaceOnce(
         std.testing.allocator,
@@ -6508,7 +6801,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     const parallel = try replaceOnce(std.testing.allocator, actual, "\"benchmark_mode\":\"sequential\"", "\"benchmark_mode\":\"parallel\"");
     defer std.testing.allocator.free(parallel);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, parallel, false, false, null));
-    const stale_schema = try replaceOnce(std.testing.allocator, actual, "\"schema\":\"antfly.quant_kernel_metal_runtime_evidence.v9\"", "\"schema\":\"antfly.quant_kernel_metal_runtime_evidence.v3\"");
+    const stale_schema = try replaceOnce(std.testing.allocator, actual, "\"schema\":\"antfly.quant_kernel_metal_runtime_evidence.v11\"", "\"schema\":\"antfly.quant_kernel_metal_runtime_evidence.v3\"");
     defer std.testing.allocator.free(stale_schema);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_schema, false, false, null));
 
@@ -6634,9 +6927,9 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     if (production_count != 0) {
         var short_production_checks = production_checks;
         short_production_checks[0].measure_iters = default_measure_iters;
-        try std.testing.expectError(error.InvalidArgument, writeEvidence(std.testing.allocator, production_regression_path, short_production_checks[0..production_count], production_results[0..production_count], promotion_repeat_runs, null, null, false, true, false));
+        try std.testing.expectError(error.InvalidArgument, writeEvidence(std.testing.allocator, production_regression_path, short_production_checks[0..production_count], production_results[0..production_count], promotion_repeat_runs, null, null, false, true, false, null));
     }
-    try writeEvidence(std.testing.allocator, production_regression_path, production_checks[0..production_count], production_results[0..production_count], promotion_repeat_runs, null, null, false, true, false);
+    try writeEvidence(std.testing.allocator, production_regression_path, production_checks[0..production_count], production_results[0..production_count], promotion_repeat_runs, null, null, false, true, false, null);
     const production_regression_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, production_regression_path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(production_regression_actual);
     try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, "\"production_regression_check\":true"));
@@ -6669,8 +6962,11 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, "\"candidate_route_ready_count\":"));
     try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, "\"candidate_benchmark_ready_count\":"));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, production_regression_actual, "\"promotion_blocker\":\"speedup_gate_missing\""));
-    try checkEvidenceFile(std.testing.allocator, production_regression_path, production_count != 0, false, null);
-    const production_summary = try checkEvidenceFileWithSummary(std.testing.allocator, production_regression_path, production_count != 0, false, null);
+    try checkEvidenceFile(std.testing.allocator, production_regression_path, false, false, null);
+    if (production_count != 0) {
+        try std.testing.expectError(error.MetalEvidenceReproducibleProvenanceMissing, checkEvidenceFile(std.testing.allocator, production_regression_path, true, false, null));
+    }
+    const production_summary = try checkEvidenceFileWithSummary(std.testing.allocator, production_regression_path, false, false, null);
     try std.testing.expect(production_summary.production_regression_check);
     try std.testing.expectEqual(quant_kernel_compiler.first_metal_production_benchmark_case_count, production_summary.compiler_benchmark_manifest_case_count orelse return error.InvalidMetalEvidence);
     try std.testing.expectEqual(quant_kernel_compiler.metalProductionBenchmarkCaseManifestFingerprint(), production_summary.compiler_benchmark_manifest_case_fingerprint orelse return error.InvalidMetalEvidence);
@@ -6704,7 +7000,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
 
     const repeat_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "metal", "evidence-repeat.json" });
     defer std.testing.allocator.free(repeat_path);
-    try writeEvidence(std.testing.allocator, repeat_path, &metal_runtime_checks, &repeat_results, promotion_repeat_runs, null, null, false, false, false);
+    try writeEvidence(std.testing.allocator, repeat_path, &metal_runtime_checks, &repeat_results, promotion_repeat_runs, null, null, false, false, false, null);
     const repeat_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, repeat_path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(repeat_actual);
     try std.testing.expect(std.mem.containsAtLeast(u8, repeat_actual, 1, "\"repeat_runs\":5"));
@@ -6724,7 +7020,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     for (&longer_results) |*result| result.measure_iters = 100;
     const longer_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "metal", "evidence-repeat-longer.json" });
     defer std.testing.allocator.free(longer_path);
-    try writeEvidence(std.testing.allocator, longer_path, &longer_checks, &longer_results, promotion_repeat_runs, null, null, false, false, false);
+    try writeEvidence(std.testing.allocator, longer_path, &longer_checks, &longer_results, promotion_repeat_runs, null, null, false, false, false, null);
     const longer_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, longer_path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(longer_actual);
     try std.testing.expect(std.mem.containsAtLeast(u8, longer_actual, 1, " --measure-iters 100"));
@@ -6757,7 +7053,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
         }
     }
     try std.testing.expectEqual(@as(usize, 2), q6_promotion_count);
-    try writeEvidence(std.testing.allocator, promoted_path, q6_promotion_checks[0..q6_promotion_count], q6_promotion_results_scoped[0..q6_promotion_count], promotion_repeat_runs, quant_kernel_compiler.first_general_metal_q6_kernel_id, null, false, false, false);
+    try writeEvidence(std.testing.allocator, promoted_path, q6_promotion_checks[0..q6_promotion_count], q6_promotion_results_scoped[0..q6_promotion_count], promotion_repeat_runs, quant_kernel_compiler.first_general_metal_q6_kernel_id, null, false, false, false, null);
     const promoted_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, promoted_path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(promoted_actual);
     try std.testing.expect(std.mem.containsAtLeast(u8, promoted_actual, 1, "\"production_enabled\":true"));
@@ -6770,8 +7066,85 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     try std.testing.expect(std.mem.containsAtLeast(u8, promoted_actual, 1, "--promotion-ready-kernel " ++ quant_kernel_compiler.first_general_metal_q6_kernel_id));
     try std.testing.expect(std.mem.containsAtLeast(u8, promoted_actual, 1, "\"promotion_ready\":true,\"promotion_blocker\":\"\""));
     try checkEvidenceJson(std.testing.allocator, promoted_actual, false, false, null);
-    try checkEvidenceJson(std.testing.allocator, promoted_actual, true, false, null);
-    try checkEvidenceJson(std.testing.allocator, promoted_actual, true, false, quant_kernel_compiler.first_general_metal_q6_kernel_id);
+    try std.testing.expectError(error.MetalEvidenceReproducibleProvenanceMissing, checkEvidenceJson(std.testing.allocator, promoted_actual, true, false, null));
+    try std.testing.expectError(error.MetalEvidenceReproducibleProvenanceMissing, checkEvidenceJson(std.testing.allocator, promoted_actual, true, false, quant_kernel_compiler.first_general_metal_q6_kernel_id));
+
+    const test_attested_provenance = AttestedProvenance{
+        .source_commit = "0123456789abcdef0123456789abcdef01234567",
+        .source_tree_clean = true,
+        .source_status_sha256 = clean_source_status_sha256,
+        .host_os = "macos",
+        .host_arch = "aarch64",
+        .accelerator_name = "Apple Test Metal Device",
+        .metal_compiler_version = "Apple metal version test",
+        .zig_version = "0.16.0",
+        .recorded_at_utc = "2026-07-13T12:34:56Z",
+    };
+    const attested_promoted_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "metal", "antfly_q6_k_small_batch_msl_v1-attested-promotion-evidence.json" });
+    defer std.testing.allocator.free(attested_promoted_path);
+    try writeEvidence(
+        std.testing.allocator,
+        attested_promoted_path,
+        q6_promotion_checks[0..q6_promotion_count],
+        q6_promotion_results_scoped[0..q6_promotion_count],
+        promotion_repeat_runs,
+        quant_kernel_compiler.first_general_metal_q6_kernel_id,
+        null,
+        false,
+        false,
+        false,
+        test_attested_provenance,
+    );
+    const attested_promoted_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, attested_promoted_path, std.testing.allocator, .limited(128 * 1024));
+    defer std.testing.allocator.free(attested_promoted_actual);
+    try std.testing.expect(std.mem.containsAtLeast(u8, attested_promoted_actual, 1, "\"provenance_status\":\"attested_v1\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, attested_promoted_actual, 1, " --attest-provenance"));
+    try checkEvidenceJson(std.testing.allocator, attested_promoted_actual, true, false, quant_kernel_compiler.first_general_metal_q6_kernel_id);
+    try checkEvidenceProvenanceMatches(std.testing.allocator, attested_promoted_actual, test_attested_provenance);
+    _ = try checkEvidenceFileWithSummaryExpected(
+        std.testing.allocator,
+        attested_promoted_path,
+        true,
+        false,
+        quant_kernel_compiler.first_general_metal_q6_kernel_id,
+        test_attested_provenance,
+    );
+
+    const missing_attested_field = try replaceOnce(
+        std.testing.allocator,
+        attested_promoted_actual,
+        "\"host_arch\":\"aarch64\"",
+        "\"missing_host_arch\":\"aarch64\"",
+    );
+    defer std.testing.allocator.free(missing_attested_field);
+    try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, missing_attested_field, true, false, quant_kernel_compiler.first_general_metal_q6_kernel_id));
+    try writeFileCreatingParent(std.testing.io, attested_promoted_path, missing_attested_field);
+    try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceFileWithSummaryExpected(std.testing.allocator, attested_promoted_path, true, false, quant_kernel_compiler.first_general_metal_q6_kernel_id, test_attested_provenance));
+
+    const bad_clean_status_digest = try replaceOnce(
+        std.testing.allocator,
+        attested_promoted_actual,
+        clean_source_status_sha256,
+        "0000000000000000000000000000000000000000000000000000000000000000",
+    );
+    defer std.testing.allocator.free(bad_clean_status_digest);
+    try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, bad_clean_status_digest, true, false, quant_kernel_compiler.first_general_metal_q6_kernel_id));
+    try writeFileCreatingParent(std.testing.io, attested_promoted_path, bad_clean_status_digest);
+    try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceFileWithSummaryExpected(std.testing.allocator, attested_promoted_path, true, false, quant_kernel_compiler.first_general_metal_q6_kernel_id, test_attested_provenance));
+
+    const forged_attested_device = try replaceOnce(
+        std.testing.allocator,
+        attested_promoted_actual,
+        "Apple Test Metal Device",
+        "Forged Metal Device",
+    );
+    defer std.testing.allocator.free(forged_attested_device);
+    try checkEvidenceJson(std.testing.allocator, forged_attested_device, true, false, quant_kernel_compiler.first_general_metal_q6_kernel_id);
+    try std.testing.expectError(error.MetalEvidenceProvenanceMismatch, checkEvidenceProvenanceMatches(std.testing.allocator, forged_attested_device, test_attested_provenance));
+    try writeFileCreatingParent(std.testing.io, attested_promoted_path, forged_attested_device);
+    try std.testing.expectError(error.MetalEvidenceProvenanceMismatch, checkEvidenceFileWithSummaryExpected(std.testing.allocator, attested_promoted_path, true, false, quant_kernel_compiler.first_general_metal_q6_kernel_id, test_attested_provenance));
+    try writeFileCreatingParent(std.testing.io, attested_promoted_path, attested_promoted_actual);
+
     const stale_promoted_ready_count = try replaceOnce(std.testing.allocator, promoted_actual, "\"promotion_ready_count\":2", "\"promotion_ready_count\":1");
     defer std.testing.allocator.free(stale_promoted_ready_count);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_promoted_ready_count, false, false, null));
@@ -6780,17 +7153,17 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_promoted_benchmark_count, false, false, null));
     const wrong_promoted_case_kernel = try replaceOnce(
         std.testing.allocator,
-        promoted_actual,
+        attested_promoted_actual,
         "\"kernel_id\":\"antfly_q6_k_small_batch_msl_v1\"",
         "\"kernel_id\":\"antfly_q5_k_small_batch_msl_v1\"",
     );
     defer std.testing.allocator.free(wrong_promoted_case_kernel);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, wrong_promoted_case_kernel, true, false, quant_kernel_compiler.first_general_metal_q6_kernel_id));
-    try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, promoted_actual, true, false, "missing_kernel"));
+    try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, attested_promoted_actual, true, false, "missing_kernel"));
 
     const shared_promoted_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "metal", "evidence-promoted.json" });
     defer std.testing.allocator.free(shared_promoted_path);
-    try std.testing.expectError(error.InvalidMetalEvidence, writeEvidence(std.testing.allocator, shared_promoted_path, &metal_runtime_checks, &q6_promotion_results, promotion_repeat_runs, quant_kernel_compiler.first_general_metal_q6_kernel_id, null, false, false, false));
+    try std.testing.expectError(error.InvalidMetalEvidence, writeEvidence(std.testing.allocator, shared_promoted_path, &metal_runtime_checks, &q6_promotion_results, promotion_repeat_runs, quant_kernel_compiler.first_general_metal_q6_kernel_id, null, false, false, false, null));
 
     const slow_promoted_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "metal", "antfly_q5_k_small_batch_msl_v1-promotion-evidence.json" });
     defer std.testing.allocator.free(slow_promoted_path);
@@ -6815,7 +7188,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
         }
     }
     try std.testing.expectEqual(@as(usize, 2), q5_promotion_count);
-    try writeEvidence(std.testing.allocator, slow_promoted_path, q5_promotion_checks[0..q5_promotion_count], q5_promotion_results_scoped[0..q5_promotion_count], promotion_repeat_runs, quant_kernel_compiler.first_general_metal_q5_kernel_id, null, false, false, false);
+    try writeEvidence(std.testing.allocator, slow_promoted_path, q5_promotion_checks[0..q5_promotion_count], q5_promotion_results_scoped[0..q5_promotion_count], promotion_repeat_runs, quant_kernel_compiler.first_general_metal_q5_kernel_id, null, false, false, false, null);
     const slow_promoted_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, slow_promoted_path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(slow_promoted_actual);
     try std.testing.expect(std.mem.containsAtLeast(u8, slow_promoted_actual, 1, "\"promotion_case_count\":2"));
@@ -6831,12 +7204,12 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     try std.testing.expectEqual(@as(usize, 0), slow_summary.candidate_benchmark_ready_count);
     try std.testing.expectEqual(@as(usize, 2), slow_summary.blocker_counts.speedup_gate_missing);
     try checkEvidenceJson(std.testing.allocator, slow_promoted_actual, false, false, null);
-    try std.testing.expectError(error.MetalEvidencePromotionNotReady, checkEvidenceJson(std.testing.allocator, slow_promoted_actual, true, false, quant_kernel_compiler.first_general_metal_q5_kernel_id));
+    try std.testing.expectError(error.MetalEvidenceReproducibleProvenanceMissing, checkEvidenceJson(std.testing.allocator, slow_promoted_actual, true, false, quant_kernel_compiler.first_general_metal_q5_kernel_id));
     const stale_slow_case_count = try replaceOnce(std.testing.allocator, slow_promoted_actual, "\"promotion_case_count\":2", "\"promotion_case_count\":1");
     defer std.testing.allocator.free(stale_slow_case_count);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, stale_slow_case_count, false, false, null));
-    try std.testing.expectError(error.InvalidArgument, writeEvidence(std.testing.allocator, promoted_path, &metal_runtime_checks, &repeat_results, promotion_repeat_runs, "missing_kernel", null, false, false, false));
-    try std.testing.expectError(error.InvalidArgument, writeEvidence(std.testing.allocator, promoted_path, &metal_runtime_checks, &repeat_results, 1, quant_kernel_compiler.first_general_metal_q4_kernel_id, null, false, false, false));
+    try std.testing.expectError(error.InvalidArgument, writeEvidence(std.testing.allocator, promoted_path, &metal_runtime_checks, &repeat_results, promotion_repeat_runs, "missing_kernel", null, false, false, false, null));
+    try std.testing.expectError(error.InvalidArgument, writeEvidence(std.testing.allocator, promoted_path, &metal_runtime_checks, &repeat_results, 1, quant_kernel_compiler.first_general_metal_q4_kernel_id, null, false, false, false, null));
 
     const stale_repeat = try replaceOnce(std.testing.allocator, repeat_actual, " --repeat-runs 5", " --repeat-runs 2");
     defer std.testing.allocator.free(stale_repeat);
@@ -6849,7 +7222,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
 
     var mismatched_repeat_results = results;
     mismatched_repeat_results[0].repeat_runs = 2;
-    try std.testing.expectError(error.InvalidArgument, writeEvidence(std.testing.allocator, repeat_path, &metal_runtime_checks, &mismatched_repeat_results, 1, null, null, false, false, false));
+    try std.testing.expectError(error.InvalidArgument, writeEvidence(std.testing.allocator, repeat_path, &metal_runtime_checks, &mismatched_repeat_results, 1, null, null, false, false, false, null));
 }
 
 test "quant kernel metal runtime benchmark math gates on minimum repeat speedup" {

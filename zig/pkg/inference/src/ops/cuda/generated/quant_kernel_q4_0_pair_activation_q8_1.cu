@@ -17,8 +17,8 @@
 // kernel_id=antfly_q4_0_pair_activation_q8_1_mmv_v1
 // production_baseline=termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn
 // production_enabled=true
-// Promoted on sequential benchmark evidence vs the handwritten CUDA baseline;
-// runtime dispatch is default-on behind ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR_Q8.
+// Qualified on sequential benchmark evidence vs the handwritten CUDA baseline;
+// runtime dispatch requires ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR_Q8=1.
 
 #include <cuda_fp16.h>
 

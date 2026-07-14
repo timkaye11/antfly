@@ -88,7 +88,83 @@ pub const EmbeddingConfig = struct {
     image_preprocess_profile: ImagePreprocessProfile = .default,
     /// For CLAP audio models: mel spectrogram configuration.
     audio_config: audio.AudioConfig = audio.CLAP_CONFIG,
+    /// Aggregate audio working-set budget shared by retained decoded PCM,
+    /// CLAP preprocessing, and duplicated backend input tensors. The field
+    /// retains its decode-specific name for source compatibility.
+    max_audio_decode_working_bytes: usize = audio.default_decode_working_bytes,
 };
+
+/// CLAP preprocessing handles clips sequentially, but its peak includes the
+/// resampled 60-second window, centered-STFT padding, mel buffers, and FFT
+/// scratch while the batch feature buffer remains resident. This conservative
+/// bound is shared by every batch item rather than multiplied by batch size.
+const clap_per_clip_preprocess_working_bytes: usize = 32 * 1024 * 1024;
+
+const ClapBatchFeatureWorkingSet = struct {
+    elements: usize,
+    reserve_bytes: usize,
+};
+
+fn clapBatchFeatureWorkingSet(
+    batch: usize,
+    channels: usize,
+    frames: usize,
+    mels: usize,
+) !ClapBatchFeatureWorkingSet {
+    const batch_channels = std.math.mul(usize, batch, channels) catch return error.AudioTooLarge;
+    const batch_frames = std.math.mul(usize, batch_channels, frames) catch return error.AudioTooLarge;
+    const elements = std.math.mul(usize, batch_frames, mels) catch return error.AudioTooLarge;
+    const feature_bytes = std.math.mul(usize, elements, @sizeOf(f32)) catch return error.AudioTooLarge;
+
+    // clapFeaturesFromPcm's temporary output coexists with all_mels while each
+    // clip is copied into the aggregate batch buffer.
+    const preprocessing_reserve = std.math.add(usize, feature_bytes, clap_per_clip_preprocess_working_bytes) catch
+        return error.AudioTooLarge;
+
+    // Tensor.initFloat32 and Tensor.initBool duplicate their inputs, so both
+    // the original and backend-owned copies coexist until session execution.
+    const duplicated_feature_bytes = std.math.mul(usize, feature_bytes, 2) catch return error.AudioTooLarge;
+    const duplicated_flags_bytes = std.math.mul(usize, batch, 2) catch return error.AudioTooLarge;
+    const tensor_reserve = std.math.add(usize, duplicated_feature_bytes, duplicated_flags_bytes) catch
+        return error.AudioTooLarge;
+
+    return .{ .elements = elements, .reserve_bytes = @max(preprocessing_reserve, tensor_reserve) };
+}
+
+fn ensureClapWorkingSet(retained_pcm_bytes: usize, feature_reserve_bytes: usize, max_working_bytes: usize) !void {
+    const peak = std.math.add(usize, retained_pcm_bytes, feature_reserve_bytes) catch return error.AudioTooLarge;
+    if (peak > max_working_bytes) return error.AudioTooLarge;
+}
+
+const ClapBatchPlan = struct {
+    channels: usize,
+    frames: usize,
+    mels: usize,
+    feature_elements: usize,
+    feature_reserve_bytes: usize,
+    fusion_enabled: bool,
+};
+
+fn clapBatchPlan(session: backends.Session, batch: usize) !ClapBatchPlan {
+    var channels: usize = 1;
+    const fusion_enabled = if (session_factory.getClapConfig(session)) |clap_cfg| blk: {
+        channels = if (clap_cfg.audio_config.enable_fusion and batch == 1) 4 else 1;
+        break :blk clap_cfg.audio_config.enable_fusion;
+    } else false;
+    const default_frames = audio.CLAP_CONFIG.chunk_length_s * audio.CLAP_CONFIG.sample_rate / audio.CLAP_CONFIG.hop_length + 1;
+    const frames = clapInputFeatureFrames(session, default_frames);
+    const mels = audio.CLAP_CONFIG.n_mels;
+    const working = try clapBatchFeatureWorkingSet(batch, channels, frames, mels);
+
+    return .{
+        .channels = channels,
+        .frames = frames,
+        .mels = mels,
+        .feature_elements = working.elements,
+        .feature_reserve_bytes = working.reserve_bytes,
+        .fusion_enabled = fusion_enabled,
+    };
+}
 
 pub const ResidentProjectionModality = enum { text, image, audio };
 pub const ResidentProjectionOutcome = enum { success, fallback };
@@ -620,6 +696,11 @@ pub const EmbeddingPipeline = struct {
     /// Embed a batch of supported encoded audio clips, returning [batch][embed_dim] embeddings.
     /// Requires an audio_session (CLAP model).
     pub fn embedAudio(self: *EmbeddingPipeline, audio_clips: []const []const u8) ![][]f32 {
+        if (audio_clips.len > 0) {
+            const audio_session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
+            const feature_plan = try clapBatchPlan(audio_session, audio_clips.len);
+            try ensureClapWorkingSet(0, feature_plan.feature_reserve_bytes, self.config.max_audio_decode_working_bytes);
+        }
         const alloc = self.allocator;
         const clips = try alloc.alloc(EncodedAudioClip, audio_clips.len);
         defer alloc.free(clips);
@@ -637,6 +718,10 @@ pub const EmbeddingPipeline = struct {
     ) ![][]f32 {
         if (audio_clips.len == 0) return try self.allocator.alloc([]f32, 0);
 
+        const audio_session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
+        const feature_plan = try clapBatchPlan(audio_session, audio_clips.len);
+        try ensureClapWorkingSet(0, feature_plan.feature_reserve_bytes, self.config.max_audio_decode_working_bytes);
+
         const alloc = self.allocator;
         const decoded = try alloc.alloc(audio.Audio, audio_clips.len);
         var initialized: usize = 0;
@@ -649,9 +734,19 @@ pub const EmbeddingPipeline = struct {
         defer alloc.free(pcm_inputs);
 
         const decode_start = embedTimingStart(self.print_timing);
+        var remaining_decode_bytes = self.config.max_audio_decode_working_bytes - feature_plan.feature_reserve_bytes;
         for (audio_clips, 0..) |clip, i| {
-            decoded[i] = try audio.decode(alloc, clip.bytes, clip.decode_options);
+            decoded[i] = try audio.decodeBounded(
+                alloc,
+                clip.bytes,
+                clip.decode_options,
+                remaining_decode_bytes,
+            );
             initialized += 1;
+            const retained_bytes = std.math.mul(usize, decoded[i].samples.len, @sizeOf(f32)) catch
+                return error.AudioTooLarge;
+            if (retained_bytes > remaining_decode_bytes) return error.AudioTooLarge;
+            remaining_decode_bytes -= retained_bytes;
             pcm_inputs[i] = .{
                 .samples = decoded[i].samples,
                 .sample_rate = decoded[i].sample_rate,
@@ -669,6 +764,22 @@ pub const EmbeddingPipeline = struct {
         audio_clips: []const audio.PcmAudioInterleaved,
     ) ![][]f32 {
         if (audio_clips.len == 0) return try self.allocator.alloc([]f32, 0);
+
+        const audio_session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
+        const feature_plan = try clapBatchPlan(audio_session, audio_clips.len);
+        try ensureClapWorkingSet(0, feature_plan.feature_reserve_bytes, self.config.max_audio_decode_working_bytes);
+        var retained_mono_bytes: usize = 0;
+        for (audio_clips) |clip| {
+            if (clip.channels == 0 or clip.samples.len % clip.channels != 0) return error.UnsupportedAudioFormat;
+            const mono_samples = clip.samples.len / clip.channels;
+            const mono_bytes = std.math.mul(usize, mono_samples, @sizeOf(f32)) catch return error.AudioTooLarge;
+            retained_mono_bytes = std.math.add(usize, retained_mono_bytes, mono_bytes) catch return error.AudioTooLarge;
+        }
+        try ensureClapWorkingSet(
+            retained_mono_bytes,
+            feature_plan.feature_reserve_bytes,
+            self.config.max_audio_decode_working_bytes,
+        );
 
         const alloc = self.allocator;
         var mono_storage = try alloc.alloc([]f32, audio_clips.len);
@@ -705,19 +816,24 @@ pub const EmbeddingPipeline = struct {
 
         const alloc = self.allocator;
         const batch = audio_clips.len;
-        var clap_channels: usize = 1;
-        const clap_fusion_enabled = if (session_factory.getClapConfig(as)) |clap_cfg| blk: {
-            clap_channels = if (clap_cfg.audio_config.enable_fusion and audio_clips.len == 1) 4 else 1;
-            break :blk clap_cfg.audio_config.enable_fusion;
-        } else false;
-        var is_longer = try alloc.alloc(u8, batch);
-        defer alloc.free(is_longer);
+        const feature_plan = try clapBatchPlan(as, batch);
+        try ensureClapWorkingSet(0, feature_plan.feature_reserve_bytes, self.config.max_audio_decode_working_bytes);
 
         // Process each audio clip to official CLAP input features and concatenate.
-        const default_frames = audio.CLAP_CONFIG.chunk_length_s * audio.CLAP_CONFIG.sample_rate / audio.CLAP_CONFIG.hop_length + 1;
-        const n_frames = clapInputFeatureFrames(as, default_frames);
-        const n_mels = audio.CLAP_CONFIG.n_mels;
-        const all_mels = try alloc.alloc(f32, batch * clap_channels * n_frames * n_mels);
+        var retained_pcm_bytes: usize = 0;
+        for (audio_clips) |clip| {
+            const clip_bytes = std.math.mul(usize, clip.samples.len, @sizeOf(f32)) catch return error.AudioTooLarge;
+            retained_pcm_bytes = std.math.add(usize, retained_pcm_bytes, clip_bytes) catch return error.AudioTooLarge;
+        }
+        try ensureClapWorkingSet(
+            retained_pcm_bytes,
+            feature_plan.feature_reserve_bytes,
+            self.config.max_audio_decode_working_bytes,
+        );
+
+        var is_longer = try alloc.alloc(u8, batch);
+        defer alloc.free(is_longer);
+        const all_mels = try alloc.alloc(f32, feature_plan.feature_elements);
         @memset(all_mels, 0.0);
         defer alloc.free(all_mels);
 
@@ -727,27 +843,28 @@ pub const EmbeddingPipeline = struct {
                 alloc,
                 audio_clips[b].samples,
                 audio_clips[b].sample_rate,
-                clap_channels,
+                feature_plan.channels,
             );
             defer features.deinit();
 
-            const dst = all_mels[b * clap_channels * n_frames * n_mels ..][0 .. clap_channels * n_frames * n_mels];
-            const src_frames = @min(features.time_frames, n_frames);
-            const src_channels = @min(features.channels, clap_channels);
+            const per_clip_elements = feature_plan.feature_elements / batch;
+            const dst = all_mels[b * per_clip_elements ..][0..per_clip_elements];
+            const src_frames = @min(features.time_frames, feature_plan.frames);
+            const src_channels = @min(features.channels, feature_plan.channels);
             const src_plane = features.time_frames * features.mel_bins;
-            const dst_plane = n_frames * n_mels;
+            const dst_plane = feature_plan.frames * feature_plan.mels;
             for (0..src_channels) |ch| {
                 for (0..src_frames) |frame| {
                     const src_off = ch * src_plane + frame * features.mel_bins;
-                    const dst_off = ch * dst_plane + frame * n_mels;
-                    @memcpy(dst[dst_off..][0..n_mels], features.data[src_off..][0..n_mels]);
+                    const dst_off = ch * dst_plane + frame * feature_plan.mels;
+                    @memcpy(dst[dst_off..][0..feature_plan.mels], features.data[src_off..][0..feature_plan.mels]);
                 }
             }
             is_longer[b] = if (features.is_longer) 1 else 0;
         }
         logEmbedTiming("audio.features", batch, features_start);
 
-        if (clap_fusion_enabled) {
+        if (feature_plan.fusion_enabled) {
             var any_long = false;
             for (is_longer) |flag| {
                 if (flag != 0) {
@@ -765,7 +882,7 @@ pub const EmbeddingPipeline = struct {
         }
 
         // Build input tensor: [batch, channels, n_frames, n_mels]
-        const mel_shape = [_]i64{ @intCast(batch), @intCast(clap_channels), @intCast(n_frames), @intCast(n_mels) };
+        const mel_shape = [_]i64{ @intCast(batch), @intCast(feature_plan.channels), @intCast(feature_plan.frames), @intCast(feature_plan.mels) };
         var mel_tensor = try Tensor.initFloat32(alloc, "input_features", &mel_shape, all_mels);
         defer mel_tensor.deinit();
         const longer_shape = [_]i64{ @intCast(batch), 1 };
@@ -1588,6 +1705,30 @@ fn hasFixedTextSequenceLength(input_info: []const backends.TensorInfo) bool {
         return info.shape.len >= 2 and info.shape[1] > 0;
     }
     return false;
+}
+
+test "clap aggregate feature working set is checked before allocation" {
+    const frames = audio.CLAP_CONFIG.chunk_length_s * audio.CLAP_CONFIG.sample_rate / audio.CLAP_CONFIG.hop_length + 1;
+    const mels = audio.CLAP_CONFIG.n_mels;
+    const one = try clapBatchFeatureWorkingSet(1, 1, frames, mels);
+    try std.testing.expectEqual(frames * mels, one.elements);
+    try ensureClapWorkingSet(0, one.reserve_bytes, audio.default_decode_working_bytes);
+
+    const feature_bytes_per_clip = frames * mels * @sizeOf(f32);
+    const oversized_batch = audio.default_decode_working_bytes / (2 * feature_bytes_per_clip) + 1;
+    const oversized = try clapBatchFeatureWorkingSet(oversized_batch, 1, frames, mels);
+    try std.testing.expectError(
+        error.AudioTooLarge,
+        ensureClapWorkingSet(0, oversized.reserve_bytes, audio.default_decode_working_bytes),
+    );
+    try std.testing.expectError(
+        error.AudioTooLarge,
+        ensureClapWorkingSet(audio.default_decode_working_bytes, one.reserve_bytes, audio.default_decode_working_bytes),
+    );
+    try std.testing.expectError(
+        error.AudioTooLarge,
+        clapBatchFeatureWorkingSet(std.math.maxInt(usize), 2, frames, mels),
+    );
 }
 
 test "embedding text inputs follow declared model arity" {

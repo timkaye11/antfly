@@ -1,3 +1,7 @@
+# Antfly's built-in server does not terminate TLS. Put a trusted reverse proxy
+# or load balancer in front of these endpoints and configure certificates there.
+# A non-null `tls` object is rejected at startup so plaintext is never served
+# under a configuration that claims to be encrypted.
 metadata:
   orchestration_urls:
     b: "https://127.0.0.1:12277"
@@ -5,9 +9,6 @@ metadata:
     d: "https://127.0.0.1:12279"
 inference:
   api_url: "http://127.0.0.1:11433"
-tls:
-  cert: "certificate.crt"
-  key: "private.key"
 max_shard_size_bytes: 64000000
 replication_factor: 3
 disable_shard_alloc: true

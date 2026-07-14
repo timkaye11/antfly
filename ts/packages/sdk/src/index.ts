@@ -39,7 +39,7 @@ export {
   DEFAULT_WRITE_MAX_REQUEST_BYTES,
   DEFAULT_WRITE_MAX_RESPONSE_BYTES,
 } from "./client.js";
-export { InferenceClient } from "./inference-client.js";
+export { InferenceAPIError, InferenceClient } from "./inference-client.js";
 export { deserializeEmbeddings, serializeEmbeddings } from "./inference-codec.js";
 export type {
   Chunk,
@@ -60,8 +60,12 @@ export type {
   ExtractRelation,
   ExtractRequest,
   ExtractResponse,
+  GenerateChunk,
+  GenerateRequest,
+  GenerateResponse,
   ImageURL,
   ImageURLContentPart,
+  InferenceChatMessage,
   InferenceConfig,
   InferenceError,
   Level,
@@ -226,7 +230,6 @@ export type {
   QueryOptions,
   QueryProfile,
   QueryRequest,
-  SortProfile,
   // Core types
   QueryResponses,
   QueryResult,
@@ -246,6 +249,7 @@ export type {
   SemanticQueryMode,
   ShardsProfile,
   SignificanceAlgorithm,
+  SortProfile,
   SparseEmbedding,
   SSEStepStarted,
   // Table types

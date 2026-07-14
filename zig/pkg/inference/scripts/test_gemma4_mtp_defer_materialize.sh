@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Deterministic gates for default-on ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE
+# Deterministic gates for explicitly enabled ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE
 # (spec-decode P2 fold): with the fold on, every run must produce token ids identical to the
 # plain target, materializations must drop to 0 (replaced by
 # deferred_materializations), and pending tokens must be flushed before the
@@ -97,6 +97,8 @@ run_spec() {
     calibration_args="--speculation-calibration positive"
   fi
   (
+    export ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE=1
+    export ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE_TARGET_ACTIVATION=1
     local kv
     for kv in "$@"; do export "${kv?}"; done
     export ANTFLY_GEMMA4_MTP_PROFILE=1
@@ -210,6 +212,7 @@ echo "== fold-off control: force k=2 + bonus (no behavior change) =="
 out="$OUT_DIR/foldoff-k2.txt"
 run_spec "$out" 2 force \
   ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE=0 \
+  ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE_TARGET_ACTIVATION=0 \
   ANTFLY_GEMMA4_MTP_ACCEPT_BONUS=1
 check_identity "foldoff-k2" "$out"
 deferred="$(profile_counter "$out" deferred_materializations)"

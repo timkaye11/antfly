@@ -70,25 +70,43 @@ check_source_policy() {
 
   case "$src" in
     "$dev_generated_src_dir"/*)
-      printf 'error: dev-generated CUDA kernels are not production artifact inputs: %s\n' "$src" >&2
+      printf 'error: standalone dev-generated CUDA files are not direct artifact inputs: %s\n' "$src" >&2
       exit 1
       ;;
   esac
 
   if grep -Eq '^[[:space:]]*#include[[:space:]]*[<"][^">]*generated/' "$src"; then
-    printf 'error: production CUDA artifact source must not include dev-generated kernels\n' >&2
+    printf 'error: CUDA artifact source must not directly include standalone generated kernels\n' >&2
     exit 1
   fi
 
+  # Benchmark-qualified generated kernels live in the canonical section.
+  # Dev-only runtime-wired candidates are permitted only in the compiler-owned
+  # marker region; standalone generated files must never be copied wholesale.
   if grep -Eq 'Dev-only generated .*candidate from graph/quant_kernel_compiler\.zig|^[[:space:]]*//[[:space:]]*production_enabled=false' "$src"; then
-    printf 'error: production CUDA artifact source must not contain dev-only quant kernel candidates\n' >&2
+    printf 'error: standalone dev-only source was copied into the CUDA artifact bundle; use the compiler-managed runtime region\n' >&2
     exit 1
   fi
+
+  local runtime_dev_begin='// quant-kernel-codegen:begin generated CUDA runtime-wired dev matmul candidates (do not edit; run: zig build quant-kernel-codegen -- --write)'
+  local runtime_dev_end='// quant-kernel-codegen:end generated CUDA runtime-wired dev matmul candidates'
+  local runtime_dev_begin_count runtime_dev_end_count runtime_dev_candidate_count
+  runtime_dev_begin_count=$(grep -Fxc "$runtime_dev_begin" "$src" || true)
+  runtime_dev_end_count=$(grep -Fxc "$runtime_dev_end" "$src" || true)
+  runtime_dev_candidate_count=$(grep -Fc '// Opt-in runtime-wired generated CUDA matmul candidate from graph/quant_kernel_compiler.zig.' "$src" || true)
+  if [ "$runtime_dev_begin_count" -ne 1 ] || [ "$runtime_dev_end_count" -ne 1 ]; then
+    printf 'error: CUDA artifact source must contain one compiler-managed runtime-wired candidate region (found begin=%s end=%s)\n' \
+      "$runtime_dev_begin_count" "$runtime_dev_end_count" >&2
+    exit 1
+  fi
+
+  CUDA_RUNTIME_WIRED_DEV_CANDIDATE_COUNT="$runtime_dev_candidate_count"
 }
 
 check_source_policy
 if [ "$source_policy_only" = "true" ]; then
-  printf 'CUDA artifact source policy is up to date: %s\n' "$src"
+  printf 'CUDA artifact source policy passes: %s (%s compiler-managed dev-only runtime-wired candidates included)\n' \
+    "$src" "$CUDA_RUNTIME_WIRED_DEV_CANDIDATE_COUNT"
   exit 0
 fi
 

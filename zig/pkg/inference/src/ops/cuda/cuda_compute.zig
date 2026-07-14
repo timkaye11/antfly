@@ -3000,29 +3000,41 @@ fn cudaQ4_0LinearQ8_1Dp4aEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A", false);
 }
 
+fn generatedQ4_0RouteDefaultEnabled(comptime kernel_id: []const u8) bool {
+    const artifact = quant_kernel_compiler.generatedArtifactForKernel(.cuda, kernel_id) orelse
+        @compileError("missing generated Q4_0 artifact: " ++ kernel_id);
+    return artifact.runtime_default_enabled;
+}
+
+const generated_q4_0_mmv_default_enabled = generatedQ4_0RouteDefaultEnabled(quant_kernel_compiler.first_general_cuda_q4_0_mmv_kernel_id);
+const generated_q4_0_mm_default_enabled = generatedQ4_0RouteDefaultEnabled(quant_kernel_compiler.first_general_cuda_q4_0_mm_kernel_id);
+const generated_q4_0_pair_default_enabled = generatedQ4_0RouteDefaultEnabled(quant_kernel_compiler.first_general_cuda_q4_0_pair_kernel_id);
+const generated_q4_0_pair_q8_default_enabled = generatedQ4_0RouteDefaultEnabled(quant_kernel_compiler.first_general_cuda_q4_0_pair_q8_kernel_id);
+const generated_q4_0_down_q8_default_enabled = generatedQ4_0RouteDefaultEnabled(quant_kernel_compiler.first_general_cuda_q4_0_down_q8_kernel_id);
+
 fn cudaQ4_0GeneratedMmvEnabled() bool {
     if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MMV", false)) return false;
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MMV", true);
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MMV", generated_q4_0_mmv_default_enabled);
 }
 
 fn cudaQ4_0GeneratedMmEnabled() bool {
     if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_MM", false)) return false;
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MM", true);
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MM", generated_q4_0_mm_default_enabled);
 }
 
 fn cudaQ4_0GeneratedPairEnabled() bool {
     if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR", false)) return false;
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR", true);
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR", generated_q4_0_pair_default_enabled);
 }
 
 fn cudaQ4_0GeneratedPairQ8Enabled() bool {
     if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_PAIR_Q8", false)) return false;
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR_Q8", true);
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR_Q8", generated_q4_0_pair_q8_default_enabled);
 }
 
 fn cudaQ4_0GeneratedDownQ8Enabled() bool {
     if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0_DOWN_Q8", false)) return false;
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_DOWN_Q8", true);
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_DOWN_Q8", generated_q4_0_down_q8_default_enabled);
 }
 
 fn cudaQ4_0GeneratedCatalogFfnCandidatesEnabled() bool {
@@ -3037,11 +3049,11 @@ fn cudaQ4_0GeneratedExactFfnCandidatesEnabled() bool {
 // Resolved once at CudaCompute.init: these gates sit on the per-op linear
 // dispatch path and getenv is a linear scan of environ.
 pub const GeneratedQ4_0Gates = struct {
-    mmv: bool = true,
-    mm: bool = true,
-    pair: bool = true,
-    pair_q8: bool = true,
-    down_q8: bool = true,
+    mmv: bool = generated_q4_0_mmv_default_enabled,
+    mm: bool = generated_q4_0_mm_default_enabled,
+    pair: bool = generated_q4_0_pair_default_enabled,
+    pair_q8: bool = generated_q4_0_pair_q8_default_enabled,
+    down_q8: bool = generated_q4_0_down_q8_default_enabled,
     catalog_ffn_candidates: bool = false,
     exact_ffn_candidates: bool = false,
 
@@ -3059,7 +3071,26 @@ pub const GeneratedQ4_0Gates = struct {
             compute_major,
             compute_minor,
             platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_ALLOW_UNPROMOTED_GENERATED_KERNELS", false),
-        );
+        ).withMasterDisable(platform.env.getenvBoolDefault(
+            "ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0",
+            false,
+        ));
+    }
+
+    fn withMasterDisable(self: GeneratedQ4_0Gates, disabled: bool) GeneratedQ4_0Gates {
+        return if (disabled) allDisabled() else self;
+    }
+
+    fn allDisabled() GeneratedQ4_0Gates {
+        return .{
+            .mmv = false,
+            .mm = false,
+            .pair = false,
+            .pair_q8 = false,
+            .down_q8 = false,
+            .catalog_ffn_candidates = false,
+            .exact_ffn_candidates = false,
+        };
     }
 
     fn restrictToPromotedTarget(
@@ -3071,15 +3102,7 @@ pub const GeneratedQ4_0Gates = struct {
         if (allow_unpromoted or quant_kernel_catalog.targetForComputeCapability(compute_major, compute_minor) != null) {
             return self;
         }
-        return .{
-            .mmv = false,
-            .mm = false,
-            .pair = false,
-            .pair_q8 = false,
-            .down_q8 = false,
-            .catalog_ffn_candidates = false,
-            .exact_ffn_candidates = false,
-        };
+        return allDisabled();
     }
 };
 
@@ -3105,6 +3128,32 @@ test "generated Q4 routes require promoted CUDA target evidence" {
     try std.testing.expect(!blocked.exact_ffn_candidates);
 
     try std.testing.expect(std.meta.eql(requested, requested.restrictToPromotedTarget(9, 0, true)));
+}
+
+test "generated Q4 routes are opt in and master disable wins" {
+    try std.testing.expect(!generated_q4_0_mmv_default_enabled);
+    try std.testing.expect(!generated_q4_0_mm_default_enabled);
+    try std.testing.expect(!generated_q4_0_pair_default_enabled);
+    try std.testing.expect(!generated_q4_0_pair_q8_default_enabled);
+    try std.testing.expect(!generated_q4_0_down_q8_default_enabled);
+    const defaults = GeneratedQ4_0Gates{};
+    try std.testing.expect(!defaults.mmv);
+    try std.testing.expect(!defaults.mm);
+    try std.testing.expect(!defaults.pair);
+    try std.testing.expect(!defaults.pair_q8);
+    try std.testing.expect(!defaults.down_q8);
+
+    const enabled = GeneratedQ4_0Gates{
+        .mmv = true,
+        .mm = true,
+        .pair = true,
+        .pair_q8 = true,
+        .down_q8 = true,
+        .catalog_ffn_candidates = true,
+        .exact_ffn_candidates = true,
+    };
+    try std.testing.expect(std.meta.eql(enabled, enabled.withMasterDisable(false)));
+    try std.testing.expect(std.meta.eql(GeneratedQ4_0Gates.allDisabled(), enabled.withMasterDisable(true)));
 }
 
 const GeneratedQ4_0CatalogFfnRoute = struct {

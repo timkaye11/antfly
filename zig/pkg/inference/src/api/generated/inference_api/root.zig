@@ -112,6 +112,7 @@ pub const Tool = types.Tool;
 pub const ToolCallDelta = types.ToolCallDelta;
 pub const ToolCallFunctionDelta = types.ToolCallFunctionDelta;
 pub const ToolChoice = types.ToolChoice;
+pub const ToolChoiceFunction = types.ToolChoiceFunction;
 pub const TranscribeObject = types.TranscribeObject;
 pub const TranscribeRequest = types.TranscribeRequest;
 pub const TranscribeResponse = types.TranscribeResponse;

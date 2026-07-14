@@ -79,3 +79,7 @@ test "managed embedder configured inference api url precedence" {
 test "managed embedder artifact backed embedding translation" {
     try managed_embedder.testArtifactBackedEmbeddingTranslation();
 }
+
+test "managed embedder sends antfly media parts when local provider is configured" {
+    try managed_embedder.testAntflyEmbedPartSelectionAndCardinality();
+}

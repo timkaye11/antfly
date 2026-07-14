@@ -49,7 +49,7 @@ pub const Config = struct {
     cors: ?antfly_middleware_openapi.CORSConfig = null,
     /// How many replicas of each shard should be maintained.
     replication_factor: ?i64 = null,
-    /// Enables authentication and authorization (RBAC) for the API.
+    /// Enables authentication for the unified API and authorization on routes with defined RBAC policies. Inference routes require a valid principal when enabled, but do not currently enforce per-model or per-operation inference RBAC.
     enable_auth: ?bool = null,
     /// Disables automatic shard reallocation (splitting/merging).
     disable_shard_alloc: ?bool = null,
@@ -266,10 +266,11 @@ pub const StorageConfig = struct {
     s3: ?S3Info = null,
 };
 
+/// Unsupported by the built-in Zig server. Any non-null `tls` object causes startup to fail closed. Terminate TLS at a trusted reverse proxy or load balancer.
 pub const TLSInfo = struct {
-    /// Path to TLS certificate file
+    /// Legacy certificate path; rejected by the current Zig server.
     cert: ?[]const u8 = null,
-    /// Path to TLS key file
+    /// Legacy private-key path; rejected by the current Zig server.
     key: ?[]const u8 = null,
 };
 

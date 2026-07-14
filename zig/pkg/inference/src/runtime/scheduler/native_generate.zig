@@ -330,6 +330,31 @@ pub const NativeGenerateCoordinator = struct {
         self.removePendingDecode(work_ptr);
     }
 
+    /// Cancel work only when no claimed step can still reference its pointer.
+    /// A claimed step keeps `in_turn` set until it removes its pending items;
+    /// publication happens immediately afterward, so callers must keep waiting
+    /// when this returns false.
+    pub fn cancelPendingWorkIfIdle(
+        self: *NativeGenerateCoordinator,
+        work_ptr: *anyopaque,
+        phase: Phase,
+    ) bool {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        if (self.in_turn != null) return false;
+        return switch (phase) {
+            .decode => if (self.findPendingDecode(work_ptr)) |idx| blk: {
+                _ = self.pending_decode.swapRemove(idx);
+                break :blk true;
+            } else false,
+            .prefill => if (self.findPendingPrefill(work_ptr)) |idx| blk: {
+                _ = self.pending_prefill.swapRemove(idx);
+                break :blk true;
+            } else false,
+            .waiting => false,
+        };
+    }
+
     /// Default per-step admission budget derived from the configured policy.
     pub fn defaultStepBudget(self: *const NativeGenerateCoordinator) StepBudget {
         self.lockCoordinator();
@@ -347,6 +372,10 @@ pub const NativeGenerateCoordinator = struct {
         self.lockCoordinator();
         defer self.unlockCoordinator();
         if (self.policy.max_decode_wait_us == 0) return 0;
+        if (self.policy.max_step_items <= 1) return 0;
+        if (self.policy.max_active_requests_for_batching) |limit| {
+            if (self.entries.items.len > limit) return 0;
+        }
         if (self.in_turn != null or self.pending_decode.items.len != 1) return 0;
         const leader = self.pending_decode.items[0];
         if (leader.request_id != lease.request_id) return 0;
@@ -367,6 +396,15 @@ pub const NativeGenerateCoordinator = struct {
             if (self.entries.items.len > limit) return false;
         }
         return true;
+    }
+
+    /// Whether concurrent requests must rendezvous through scheduler turns.
+    /// This remains true above the batching rollout cap: the step budget then
+    /// becomes singleton, but direct lock racing would lose round-robin fairness.
+    pub fn shouldCoordinateCurrentRequests(self: *const NativeGenerateCoordinator) bool {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        return self.entries.items.len > 1;
     }
 
     pub fn shouldBatchDecode(
@@ -568,6 +606,7 @@ pub const NativeGenerateCoordinator = struct {
             .decode => {
                 const leader_idx = self.findPendingDecode(leader_work_ptr) orelse return false;
                 const pending = self.pending_decode.items[leader_idx];
+                if (pending.request_id != lease.request_id) return false;
                 try out.append(allocator, .{
                     .work_ptr = pending.work_ptr,
                     .phase = .decode,
@@ -586,6 +625,7 @@ pub const NativeGenerateCoordinator = struct {
             .prefill => {
                 const leader_idx = self.findPendingPrefill(leader_work_ptr) orelse return false;
                 const pending = self.pending_prefill.items[leader_idx];
+                if (pending.request_id != lease.request_id) return false;
                 try out.append(allocator, .{
                     .work_ptr = pending.work_ptr,
                     .phase = .prefill,
@@ -681,9 +721,8 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     /// Mark a unified step complete. Removes pending entries, updates step_*
-    /// stats, and releases the turn. Streak fairness is biased toward decode
-    /// when any decode item executed (so prefill chunks served alongside
-    /// decode don't double-charge the prefill rotation).
+    /// stats, and releases the turn. Fairness follows the claimed leader phase;
+    /// peer work packed into the same forward does not own the turn rotation.
     pub fn completeStep(
         self: *NativeGenerateCoordinator,
         lease: *Lease,
@@ -730,14 +769,14 @@ pub const NativeGenerateCoordinator = struct {
         if (prefill_count + decode_count <= 1) {
             self.stats.step_singleton_batches_total += 1;
         }
-        const phase: Phase = if (decode_count > 0) .decode else .prefill;
+        const phase = self.in_turn_phase orelse if (decode_count > 0) Phase.decode else Phase.prefill;
         self.finishTurnUnlocked(lease, phase);
     }
 
-    pub fn awaitTurn(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase, io: std.Io) void {
+    pub fn awaitTurn(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase, io: std.Io) !void {
         while (!self.tryAcquireTurn(lease, phase)) {
             self.noteTurnYield();
-            io.sleep(std.Io.Duration.fromMilliseconds(0), .awake) catch return;
+            try io.sleep(std.Io.Duration.fromMilliseconds(0), .awake);
         }
     }
 
@@ -758,8 +797,10 @@ pub const NativeGenerateCoordinator = struct {
             return owner == lease.request_id and self.in_turn_phase == phase;
         }
 
-        const selected = self.pickNextTurn() orelse return true;
-        if (selected != lease.request_id) return false;
+        if (self.indexOf(lease.request_id) == null) return false;
+        if (self.pickNextTurn()) |selected| {
+            if (selected != lease.request_id) return false;
+        }
 
         self.in_turn = lease.request_id;
         self.in_turn_phase = phase;
@@ -941,37 +982,11 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     fn pickPendingDecodeRoundRobin(self: *const NativeGenerateCoordinator, last_granted: ?RequestId) ?RequestId {
-        if (self.pending_decode.items.len == 0 or self.entries.items.len == 0) return null;
-
-        var start_idx: usize = 0;
-        if (last_granted) |last_id| {
-            if (self.indexOf(last_id)) |idx| {
-                start_idx = (idx + 1) % self.entries.items.len;
-            }
-        }
-
-        for (0..self.entries.items.len) |offset| {
-            const entry = self.entries.items[(start_idx + offset) % self.entries.items.len];
-            if (self.findPendingDecodeByRequest(entry.id) != null) return entry.id;
-        }
-        return null;
+        return pickPendingRequestRoundRobin(self.pending_decode.items, last_granted);
     }
 
     fn pickPendingPrefillRoundRobin(self: *const NativeGenerateCoordinator, last_granted: ?RequestId) ?RequestId {
-        if (self.pending_prefill.items.len == 0 or self.entries.items.len == 0) return null;
-
-        var start_idx: usize = 0;
-        if (last_granted) |last_id| {
-            if (self.indexOf(last_id)) |idx| {
-                start_idx = (idx + 1) % self.entries.items.len;
-            }
-        }
-
-        for (0..self.entries.items.len) |offset| {
-            const entry = self.entries.items[(start_idx + offset) % self.entries.items.len];
-            if (self.findPendingPrefillByRequest(entry.id) != null) return entry.id;
-        }
-        return null;
+        return pickPendingRequestRoundRobin(self.pending_prefill.items, last_granted);
     }
 
     fn findPendingPrefill(self: *const NativeGenerateCoordinator, work_ptr: *anyopaque) ?usize {
@@ -1041,6 +1056,24 @@ pub const NativeGenerateCoordinator = struct {
         return value - (value % alignment);
     }
 };
+
+/// Request IDs are allocated monotonically and never reused. Like `acquire`'s
+/// increment, this ordering assumes a coordinator does not survive u64 wrap.
+/// Scanning by ID gives stable acquisition-order round robin without rescanning
+/// the active-entry array under the lock.
+fn pickPendingRequestRoundRobin(pending: anytype, last_granted: ?RequestId) ?RequestId {
+    var first: ?RequestId = null;
+    var next: ?RequestId = null;
+    for (pending) |item| {
+        if (first == null or item.request_id < first.?) first = item.request_id;
+        if (last_granted) |last_id| {
+            if (item.request_id > last_id and (next == null or item.request_id < next.?)) {
+                next = item.request_id;
+            }
+        }
+    }
+    return next orelse first;
+}
 
 pub fn aggregateStats(models: anytype) struct { snapshot: Snapshot, stats: Stats } {
     var snapshot = Snapshot{
@@ -1162,6 +1195,176 @@ test "native generate coordinator round-robins turns and prioritizes decode" {
     try coordinator.enqueueDecodeWork(first, @ptrFromInt(1), 512, 512, 0, .{});
     try std.testing.expect(coordinator.tryAcquireTurn(&first, .decode));
     try std.testing.expect(!coordinator.tryAcquireTurn(&second, .prefill));
+}
+
+test "direct turns without pending work still hold ownership" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+
+    var first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    defer coordinator.release(first);
+    var second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    defer coordinator.release(second);
+    coordinator.beginDecode(&first, 4);
+    coordinator.beginDecode(&second, 4);
+
+    try std.testing.expect(coordinator.tryAcquireTurn(&first, .decode));
+    try std.testing.expectEqual(first.request_id, coordinator.in_turn.?);
+    try std.testing.expect(!coordinator.tryAcquireTurn(&second, .decode));
+    coordinator.finishTurn(&first, .decode);
+
+    try std.testing.expect(coordinator.tryAcquireTurn(&second, .decode));
+    try std.testing.expectEqual(second.request_id, coordinator.in_turn.?);
+    coordinator.finishTurn(&second, .decode);
+}
+
+test "pending round robin preserves request order after release swap-removes an entry" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+
+    var first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    defer coordinator.release(first);
+    var second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    var third = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    defer coordinator.release(third);
+    var fourth = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    defer coordinator.release(fourth);
+
+    var work: [4]u8 = undefined;
+    const leases = [_]*Lease{ &first, &second, &third, &fourth };
+    for (leases, 0..) |lease, idx| {
+        coordinator.beginDecode(lease, 4);
+        try coordinator.enqueueDecodeWork(lease.*, @ptrCast(&work[idx]), 5, 5, 0, .{});
+    }
+
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(allocator);
+    try std.testing.expect(try coordinator.claimStep(
+        allocator,
+        &first,
+        @ptrCast(&work[0]),
+        .decode,
+        .{ .max_items = 1, .max_query_tokens = 1 },
+        &step,
+    ));
+    coordinator.completeStep(&first, step.items);
+
+    // Releasing the second entry swaps the fourth into its array slot. Turn
+    // order must remain 1, 3, 4 rather than following that storage order.
+    coordinator.release(second);
+    try std.testing.expectEqual(fourth.request_id, coordinator.entries.items[1].id);
+    try std.testing.expectEqual(third.request_id, coordinator.pickPendingDecodeRoundRobin(first.request_id).?);
+    try std.testing.expect(try coordinator.claimStep(
+        allocator,
+        &third,
+        @ptrCast(&work[2]),
+        .decode,
+        .{ .max_items = 1, .max_query_tokens = 1 },
+        &step,
+    ));
+    coordinator.completeStep(&third, step.items);
+    try std.testing.expectEqual(fourth.request_id, coordinator.pickPendingDecodeRoundRobin(third.request_id).?);
+}
+
+test "awaitTurn propagates cancellation without stealing the active turn" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+
+    var first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    defer coordinator.release(first);
+    var second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    defer coordinator.release(second);
+    var first_work: u8 = 1;
+    var second_work: u8 = 2;
+    coordinator.beginDecode(&first, 4);
+    coordinator.beginDecode(&second, 4);
+    try coordinator.enqueueDecodeWork(first, @ptrCast(&first_work), 5, 5, 0, .{});
+    try coordinator.enqueueDecodeWork(second, @ptrCast(&second_work), 5, 5, 0, .{});
+    try std.testing.expect(coordinator.tryAcquireTurn(&first, .decode));
+
+    const Waiter = struct {
+        fn run(target: *NativeGenerateCoordinator, lease: *Lease, io: std.Io) anyerror!void {
+            try target.awaitTurn(lease, .decode, io);
+        }
+    };
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var future = try io.concurrent(Waiter.run, .{ &coordinator, &second, io });
+    try std.testing.expectError(error.Canceled, future.cancel(io));
+    try std.testing.expectEqual(first.request_id, coordinator.in_turn.?);
+}
+
+test "deferred turn cleanup releases ownership after post-acquire failure" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+
+    var first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    defer coordinator.release(first);
+    var second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    defer coordinator.release(second);
+    var first_work: u8 = 1;
+    var second_work: u8 = 2;
+    coordinator.beginDecode(&first, 4);
+    coordinator.beginDecode(&second, 4);
+    try coordinator.enqueueDecodeWork(first, @ptrCast(&first_work), 5, 5, 0, .{});
+    try coordinator.enqueueDecodeWork(second, @ptrCast(&second_work), 5, 5, 0, .{});
+
+    const FailingStep = struct {
+        fn run(target: *NativeGenerateCoordinator, lease: *Lease, io: std.Io) !void {
+            try target.awaitTurn(lease, .decode, io);
+            defer target.finishTurn(lease, .decode);
+            return error.InjectedFailure;
+        }
+    };
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    try std.testing.expectError(error.InjectedFailure, FailingStep.run(&coordinator, &first, io_impl.io()));
+    try std.testing.expectEqual(@as(?RequestId, null), coordinator.in_turn);
+
+    coordinator.cancelDecodeWork(@ptrCast(&first_work));
+    try std.testing.expect(coordinator.tryAcquireTurn(&second, .decode));
+}
+
+test "idle cancellation removes pending work but never a claimed pointer" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+
+    var first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    defer coordinator.release(first);
+    var second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    defer coordinator.release(second);
+    var first_work: u8 = 1;
+    var second_work: u8 = 2;
+    coordinator.beginDecode(&first, 4);
+    coordinator.beginDecode(&second, 4);
+    try coordinator.enqueueDecodeWork(first, @ptrCast(&first_work), 5, 5, 0, .{});
+    try coordinator.enqueueDecodeWork(second, @ptrCast(&second_work), 5, 5, 0, .{});
+
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(allocator);
+    try std.testing.expect(try coordinator.claimStep(
+        allocator,
+        &first,
+        @ptrCast(&first_work),
+        .decode,
+        .{ .max_items = 2, .max_query_tokens = 2 },
+        &step,
+    ));
+    try std.testing.expectEqual(@as(usize, 2), step.items.len);
+    try std.testing.expect(!coordinator.cancelPendingWorkIfIdle(@ptrCast(&second_work), .decode));
+
+    coordinator.completeStep(&first, step.items);
+    try std.testing.expect(!coordinator.cancelPendingWorkIfIdle(@ptrCast(&second_work), .decode));
+
+    try coordinator.enqueueDecodeWork(second, @ptrCast(&second_work), 6, 6, 0, .{});
+    try std.testing.expect(coordinator.cancelPendingWorkIfIdle(@ptrCast(&second_work), .decode));
+    try std.testing.expectEqual(@as(usize, 0), coordinator.pending_decode.items.len);
 }
 
 test "claimStep packs decode leader with extra decode and prefill work" {
@@ -1574,6 +1777,37 @@ test "claimStep refuses to take a turn that belongs to another request" {
     try std.testing.expectEqual(@as(usize, 0), step.items.len);
 }
 
+test "claimStep rejects a peer pointer presented by the selected lease" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+
+    var first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+    defer coordinator.release(first);
+    var second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+    defer coordinator.release(second);
+    coordinator.beginDecode(&first, 4);
+    coordinator.beginDecode(&second, 4);
+
+    var first_work: u8 = 1;
+    var second_work: u8 = 2;
+    try coordinator.enqueueDecodeWork(first, @ptrCast(&first_work), 5, 5, 0, .{});
+    try coordinator.enqueueDecodeWork(second, @ptrCast(&second_work), 5, 5, 0, .{});
+
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(allocator);
+    try std.testing.expect(!(try coordinator.claimStep(
+        allocator,
+        &first,
+        @ptrCast(&second_work),
+        .decode,
+        coordinator.defaultStepBudget(),
+        &step,
+    )));
+    try std.testing.expectEqual(@as(usize, 0), step.items.len);
+    try std.testing.expectEqual(@as(?RequestId, null), coordinator.in_turn);
+}
+
 test "completeStep updates step stats and removes pending work" {
     const allocator = std.testing.allocator;
     var coordinator = NativeGenerateCoordinator.init(allocator);
@@ -1613,6 +1847,52 @@ test "completeStep updates step stats and removes pending work" {
     try std.testing.expectEqual(@as(?usize, null), coordinator.findPendingDecode(@ptrCast(&dec_w)));
     try std.testing.expectEqual(@as(?usize, null), coordinator.findPendingPrefill(@ptrCast(&pre_w)));
     try std.testing.expectEqual(@as(?RequestId, null), coordinator.in_turn);
+}
+
+test "mixed step fairness follows the prefill leader" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+    coordinator.policy.max_step_items = 2;
+    coordinator.policy.allow_mixed_sequence_lengths = true;
+
+    var first_prefill = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 128, .max_tokens = 8 });
+    defer coordinator.release(first_prefill);
+    var second_prefill = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 128, .max_tokens = 8 });
+    defer coordinator.release(second_prefill);
+    var decode = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+    defer coordinator.release(decode);
+
+    coordinator.notePrefillProgress(&first_prefill, 0, 8);
+    coordinator.notePrefillProgress(&second_prefill, 0, 8);
+    coordinator.beginDecode(&decode, 4);
+    coordinator.consecutive_decode_turns = coordinator.max_decode_streak_before_prefill;
+
+    var first_work: u8 = 1;
+    var second_work: u8 = 2;
+    var decode_work: u8 = 3;
+    try coordinator.enqueuePrefillWork(first_prefill, @ptrCast(&first_work), 8, 4, 4, 0, .{});
+    try coordinator.enqueuePrefillWork(second_prefill, @ptrCast(&second_work), 8, 4, 4, 0, .{});
+    try coordinator.enqueueDecodeWork(decode, @ptrCast(&decode_work), 5, 5, 0, .{});
+
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(allocator);
+    try std.testing.expect(try coordinator.claimStep(
+        allocator,
+        &first_prefill,
+        @ptrCast(&first_work),
+        .prefill,
+        coordinator.defaultStepBudget(),
+        &step,
+    ));
+    try std.testing.expectEqual(@as(usize, 2), step.items.len);
+    try std.testing.expectEqual(Phase.prefill, step.items[0].phase);
+    try std.testing.expectEqual(Phase.decode, step.items[1].phase);
+
+    coordinator.completeStep(&first_prefill, step.items);
+    try std.testing.expectEqual(first_prefill.request_id, coordinator.last_prefill_granted.?);
+    try std.testing.expectEqual(@as(usize, 0), coordinator.consecutive_decode_turns);
+    try std.testing.expectEqual(second_prefill.request_id, coordinator.pickNextTurn().?);
 }
 
 test "completeStep records singleton steps" {
@@ -2115,6 +2395,33 @@ test "active request rollout cap forces singleton budgets" {
     const third = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
     defer coordinator.release(third);
     try std.testing.expectEqual(@as(usize, 1), coordinator.defaultStepBudget().max_items);
+    try std.testing.expect(!coordinator.shouldBatchCurrentRequests());
+    try std.testing.expect(coordinator.shouldCoordinateCurrentRequests());
+}
+
+test "rollout cap disables pointless decode coalescing" {
+    var coordinator = NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{
+        .max_step_items = 2,
+        .max_active_requests_for_batching = 2,
+        .max_decode_wait_us = 1_000,
+    });
+
+    var first = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    defer coordinator.release(first);
+    var second = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    defer coordinator.release(second);
+    const third = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 });
+    defer coordinator.release(third);
+    coordinator.beginDecode(&first, 4);
+    coordinator.beginDecode(&second, 4);
+    coordinator.noteDecodeProgress(&first, 1);
+    coordinator.noteDecodeProgress(&second, 1);
+
+    var work: u8 = 1;
+    try coordinator.enqueueDecodeWork(first, @ptrCast(&work), 5, 5, 0, .{});
+    try std.testing.expectEqual(@as(u32, 0), coordinator.decodeCoalesceDelayUs(first));
 }
 
 test "rollout cap singleton turns rotate across stable request order" {
