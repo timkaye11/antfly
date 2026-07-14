@@ -22,6 +22,7 @@ const runtime_status = @import("../api/runtime_status.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const lsm_backend_mod = @import("../storage/lsm_backend.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
+const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
 const data_raft_batch = @import("raft_batch.zig");
@@ -36,6 +37,7 @@ const setup_io_thread_stack_size = 1 * 1024 * 1024;
 const local_group_status_cache_ttl_ms: u64 = 60 * std.time.ms_per_s;
 const store_status_report_interval_ticks: usize = 40;
 const store_status_heartbeat_interval_ms: u64 = 30 * std.time.ms_per_s;
+const StoreStatusReportKind = enum { none, heartbeat, full };
 const metadata_head_cache_ttl_ms: u64 = std.time.ms_per_s;
 const metadata_snapshot_cache_ttl_ms: u64 = std.time.ms_per_s;
 const provision_head_poll_startup_interval_ms: u64 = std.time.ms_per_s;
@@ -46,11 +48,15 @@ const runtime_status_disk_usage_refresh_interval_ns: u64 = 30 * std.time.ns_per_
 const auto_bulk_finish_poll_interval_ms: u64 = 250;
 const provisioned_startup_catch_up_interval_ms: u64 = std.time.ms_per_s;
 const metrics_lsm_maintenance_snapshot_ttl_ns: u64 = 60 * std.time.ns_per_s;
-const data_raft_batch_leader_wait_ns: u64 = 25 * std.time.ns_per_s;
+const data_raft_batch_leader_wait_ns: u64 = 5 * std.time.ns_per_s;
 const data_raft_batch_leader_retry_sleep_ns: u64 = 50 * std.time.ns_per_ms;
 const data_raft_metadata_resync_interval_ns: u64 = 500 * std.time.ns_per_ms;
 const data_raft_campaign_retry_interval_ns: u64 = 500 * std.time.ns_per_ms;
 const data_raft_metadata_sync_interval_ms: u64 = 250;
+const metadata_bootstrap_retry_base_ms: u64 = 250;
+const metadata_bootstrap_retry_max_ms: u64 = 5 * std.time.ms_per_s;
+const metadata_bootstrap_retry_jitter_ms: u64 = 250;
+const public_api_max_connection_threads: u32 = 64;
 const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
 
@@ -63,6 +69,10 @@ const CliConfig = struct {
     raft_bind_host: ?[]const u8 = null,
     raft_bind_port: ?u16 = null,
     auth_enabled: ?bool = null,
+    ard_base_url: ?[]const u8 = null,
+    ard_publisher_domain: ?[]const u8 = null,
+    ard_display_name: ?[]const u8 = null,
+    ard_public_catalog_enabled: bool = false,
     metadata_apis: std.ArrayListUnmanaged([]const u8) = .empty,
     node_id: ?u64 = null,
     store_id: ?u64 = null,
@@ -73,10 +83,12 @@ const CliConfig = struct {
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
     snapshot_root_dir: ?[]const u8 = null,
-    secret_store_path: ?[]const u8 = null,
+    extension_package_store_dir: ?[]const u8 = null,
+    secret_store_paths: std.ArrayListUnmanaged([]const u8) = .empty,
     help: bool = false,
 
     fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
+        self.secret_store_paths.deinit(alloc);
         self.metadata_apis.deinit(alloc);
         self.* = undefined;
     }
@@ -87,12 +99,14 @@ const ResolvedPaths = struct {
     replica_catalog_path: []u8,
     snapshot_root_dir: []u8,
     auth_store_root_dir: []u8,
+    extension_package_store_dir: []u8,
 
     fn deinit(self: ResolvedPaths, alloc: std.mem.Allocator) void {
         alloc.free(self.replica_root_dir);
         alloc.free(self.replica_catalog_path);
         alloc.free(self.snapshot_root_dir);
         alloc.free(self.auth_store_root_dir);
+        alloc.free(self.extension_package_store_dir);
     }
 };
 
@@ -109,12 +123,16 @@ fn publicApiListenerConfig(bind_host: []const u8, bind_port: u16) antfly.raft.tr
         .bind_host = bind_host,
         .bind_port = bind_port,
         .max_request_bytes = antfly.public_api.http_server.public_api_max_request_body_bytes,
+        .serve_in_connection_threads = true,
+        .max_connection_threads = public_api_max_connection_threads,
     };
 }
 
 test "data public API listener uses public API request body limit" {
     const cfg = publicApiListenerConfig("127.0.0.1", 8080);
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_request_bytes);
+    try std.testing.expect(cfg.serve_in_connection_threads);
+    try std.testing.expectEqual(public_api_max_connection_threads, cfg.max_connection_threads);
 }
 
 const DataDescriptorFactory = struct {
@@ -362,7 +380,8 @@ pub const HealthSource = struct {
         const runtime_summary = self.data_server.provisioned_storage.runtime_status_cache.summary();
         const read_cache_stats = self.data_server.provisioned_storage.read_cache.cacheStats();
         const write_cache_stats = self.data_server.provisioned_storage.write_cache.cacheStats();
-        const auto_bulk_stats = self.data_server.write_source.autoBulkIngestStatsBestEffort();
+        const live_write_source = self.data_server.liveRuntimeWriteSource();
+        const auto_bulk_stats = live_write_source.autoBulkIngestStatsBestEffort();
         const fanout_metrics = antfly.public_api.table_reads.parallelFanoutMetricsSnapshot();
         const graph_fanout_metrics = antfly.public_api.distributed_graph.graphFanoutMetricsSnapshot();
         const api_request_stats = if (self.data_server.http_server) |*http_server|
@@ -378,6 +397,24 @@ pub const HealthSource = struct {
         );
         try health_metrics.appendPromMetric(writer, "antfly_data_api_requests_total", "counter", "Requests handled by the local API server process", api_request_stats.request_count);
         try health_metrics.appendPromMetric(writer, "antfly_data_api_first_request_elapsed_ms", "gauge", "Milliseconds from API server initialization until the first handled request", api_request_stats.first_request_elapsed_ms);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_hits_total", "counter", "Query embedding cache hits", api_request_stats.query_embedding_cache.hits);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_misses_total", "counter", "Query embedding cache producer misses", api_request_stats.query_embedding_cache.misses);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_coalesced_waiters_total", "counter", "Query embedding requests coalesced behind an in-flight producer", api_request_stats.query_embedding_cache.coalesced_waiters);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_producers_total", "counter", "Query embedding producer computations", api_request_stats.query_embedding_cache.producer_computations);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_uncached_computations_total", "counter", "Uncached query embedding computations admitted through the shared provider bound", api_request_stats.query_embedding_cache.uncached_computations);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_producer_compute_ns_total", "counter", "Nanoseconds spent computing admitted query embeddings", api_request_stats.query_embedding_cache.producer_compute_ns_total);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_inflight_rejections_total", "counter", "Query embedding computations rejected by the in-flight admission limit", api_request_stats.query_embedding_cache.inflight_rejections);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_waiter_timeouts_total", "counter", "Coalesced query embedding waiters that reached their request deadline", api_request_stats.query_embedding_cache.waiter_timeouts);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_inflight", "gauge", "Distinct query embedding computations currently in flight", api_request_stats.query_embedding_cache.inflight);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_inflight_limit", "gauge", "Maximum distinct query embedding computations allowed in flight", api_request_stats.query_embedding_cache.max_inflight);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_evictions_total", "counter", "Query embedding cache LRU evictions", api_request_stats.query_embedding_cache.evictions);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_expirations_total", "counter", "Expired query embedding cache entries", api_request_stats.query_embedding_cache.expirations);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_rejected_admissions_total", "counter", "Query embedding results rejected by cache admission control", api_request_stats.query_embedding_cache.rejected_admissions);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_entries", "gauge", "Live query embedding cache entries", api_request_stats.query_embedding_cache.entries);
+        try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_live_bytes", "gauge", "Accounted live query embedding cache bytes", api_request_stats.query_embedding_cache.live_bytes);
+        try health_metrics.appendPromMetric(writer, "antfly_inference_cache_budget_bytes", "gauge", "Shared inference cache bytes in use", api_request_stats.inference_cache_budget.used_bytes);
+        try health_metrics.appendPromMetric(writer, "antfly_inference_cache_budget_limit_bytes", "gauge", "Shared inference cache byte limit", api_request_stats.inference_cache_budget.max_bytes);
+        try health_metrics.appendPromMetric(writer, "antfly_inference_cache_budget_rejected_reservations_total", "counter", "Shared inference cache reservations rejected by the hard limit", api_request_stats.inference_cache_budget.rejected_reservations);
         try health_metrics.appendPromMetric(writer, "antfly_data_runtime_status_tables", "gauge", "Tables currently represented in the cached local runtime-status snapshot", runtime_summary.table_count);
         try health_metrics.appendPromMetric(writer, "antfly_data_runtime_status_groups", "gauge", "Local provisioned groups represented in the cached local runtime-status snapshot", runtime_summary.group_count);
         try health_metrics.appendPromMetric(writer, "antfly_data_runtime_status_indexes", "gauge", "Indexes represented in the cached local runtime-status snapshot", runtime_summary.index_count);
@@ -447,6 +484,7 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_data_replay_debt_indexes", "gauge", "Cached local indexes that still report replay catch-up debt", runtime_summary.indexes_with_replay_debt);
         try health_metrics.appendPromMetric(writer, "antfly_data_replay_debt_sequences", "gauge", "Total cached replay backlog measured as target minus applied sequence across local indexes", runtime_summary.outstanding_replay_sequences);
         try health_metrics.appendPromMetric(writer, "antfly_data_replay_debt_max_index_sequences", "gauge", "Largest cached replay backlog for any single local index", runtime_summary.max_index_replay_backlog);
+        try self.writeHAMetrics(writer);
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_warmup_active", "gauge", "Whether the provisioned cache warmup worker is currently active", if (self.data_server.provisioned_warmup_active.load(.acquire)) 1 else 0);
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_warmup_started_total", "counter", "Provisioned cache warmup runs started", self.data_server.provisioned_warmup_started.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_warmup_completed_total", "counter", "Provisioned cache warmup runs completed", self.data_server.provisioned_warmup_completed.load(.monotonic));
@@ -468,11 +506,11 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_write_cache_misses_total", "counter", "Provisioned write-cache opens that had to open a local table DB", write_cache_stats.miss_count);
         try writeResourceMetrics(writer, &self.data_server.provisioned_storage.resource_manager);
         try writeLsmCacheMetrics(writer, self.data_server.provisioned_storage.lsm_cache.snapshotStats());
-        try writeLsmNativeStorageMetrics(writer, self.data_server.write_source.lsmNativeStorageStatsBestEffort());
-        try writeFullTextMemoryMetrics(writer, self.data_server.write_source.textMemoryAttributionStatsBestEffort());
+        try writeLsmNativeStorageMetrics(writer, live_write_source.lsmNativeStorageStatsBestEffort());
+        try writeFullTextMemoryMetrics(writer, live_write_source.textMemoryAttributionStatsBestEffort());
         try writeProcessMemoryMetrics(writer, process_memory_mod.snapshot());
-        try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_score", "gauge", "Maximum cached table LSM maintenance pressure score; 1 can mean debt exists but exact score has not been refreshed", self.data_server.write_source.lsmMaintenanceScoreBestEffort());
-        try health_metrics.appendPromMetric(writer, "antfly_lsm_cached_write_dbs", "gauge", "Cached writable table DBs with local LSM state", @intCast(self.data_server.write_source.cachedWriteDbCountBestEffort()));
+        try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_score", "gauge", "Maximum cached table LSM maintenance pressure score; 1 can mean debt exists but exact score has not been refreshed", live_write_source.lsmMaintenanceScoreBestEffort());
+        try health_metrics.appendPromMetric(writer, "antfly_lsm_cached_write_dbs", "gauge", "Cached writable table DBs with local LSM state", @intCast(live_write_source.cachedWriteDbCountBestEffort()));
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_active", "gauge", "Whether the data server LSM maintenance background worker is currently active", if (self.data_server.lsm_maintenance_active.load(.acquire)) 1 else 0);
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_started_total", "counter", "Data server LSM maintenance background worker wake cycles started", self.data_server.lsm_maintenance_started.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_completed_total", "counter", "Data server LSM maintenance background worker wake cycles completed with no immediate work remaining", self.data_server.lsm_maintenance_completed.load(.monotonic));
@@ -484,10 +522,53 @@ pub const HealthSource = struct {
         const lsm_maintenance_stats = self.cachedLsmMaintenanceStats();
         try writeLsmMaintenanceSnapshotMetrics(writer, lsm_maintenance_stats);
         try writeLsmMaintenanceMetrics(writer, lsm_maintenance_stats.stats);
-        try writeLsmWriteMetrics(writer, self.data_server.write_source.lsmWriteStatsBestEffort());
-        try writeTextMergeMetrics(writer, self.data_server.write_source.textMergeStatsBestEffort());
-        try writeAsyncIndexingMetrics(writer, self.data_server.write_source.asyncIndexingStatsBestEffort());
+        try writeLsmWriteMetrics(writer, live_write_source.lsmWriteStatsBestEffort());
+        try writeTextMergeMetrics(writer, live_write_source.textMergeStatsBestEffort());
+        try writeAsyncIndexingMetrics(writer, live_write_source.asyncIndexingStatsBestEffort());
         try antfly.db.query_metrics.writePrometheus(writer);
+    }
+
+    fn writeHAMetrics(self: *HealthSource, writer: *std.Io.Writer) !void {
+        const ds = self.data_server;
+        const ctx = ds.ha_cfg.admin_context;
+        const primary = if (ctx) |ha_ctx|
+            ha_ctx.primary orelse ds.ha_cfg.internal_primary
+        else
+            ds.ha_cfg.internal_primary;
+        const standby = if (ctx) |ha_ctx| ha_ctx.standby else null;
+
+        try health_metrics.appendPromMetric(writer, "antfly_ha_runtime_configured", "gauge", "Whether this data runtime has any HA role configured", if (primary != null or standby != null) 1 else 0);
+
+        if (primary) |handle| {
+            var snapshot = try antfly.ha.status.primarySnapshot(ds.alloc, handle, ds.ha_cfg.primary_retention_policy, ds.ha_cfg.primary_sync_policy);
+            defer snapshot.deinit(ds.alloc);
+            var metrics = try antfly.ha.metrics.fromPrimarySnapshot(ds.alloc, snapshot);
+            defer metrics.deinit(ds.alloc);
+            const text = try antfly.ha.metrics.renderPrimaryPrometheusAlloc(ds.alloc, metrics);
+            defer ds.alloc.free(text);
+            try writer.print("{s}", .{text});
+        }
+
+        try health_metrics.appendPromMetric(writer, "antfly_ha_primary_mirror_last_lsn", "gauge", "Last HA replication LSN mirrored by this data runtime", ds.ha_primary_mirror_last_lsn.load(.acquire));
+        try health_metrics.appendPromMetric(writer, "antfly_ha_primary_mirror_failures_total", "counter", "HA primary replication mirror failures observed by this data runtime", ds.ha_primary_mirror_failure_count.load(.acquire));
+        try health_metrics.appendPromMetric(writer, "antfly_ha_primary_sync_rejects_total", "counter", "HA synchronous commit decisions rejected before local commit", ds.ha_primary_mirror_sync_reject_count.load(.acquire));
+        try health_metrics.appendPromMetric(writer, "antfly_ha_primary_sync_waits_total", "counter", "HA synchronous commit waits observed by this data runtime", ds.ha_primary_mirror_sync_wait_count.load(.acquire));
+        try health_metrics.appendPromMetric(writer, "antfly_ha_primary_sync_degraded_total", "counter", "HA synchronous commit decisions degraded to async by policy", ds.ha_primary_mirror_sync_degraded_count.load(.acquire));
+        try health_metrics.appendPromMetric(writer, "antfly_ha_standby_replication_failures_total", "counter", "HA standby replication rounds that exited early with an error", ds.ha_standby_replication_failure_count.load(.acquire));
+        try health_metrics.appendPromMetric(writer, "antfly_ha_standby_replication_last_attempt_ns", "gauge", "Monotonic timestamp for the most recent HA standby replication attempt", ds.ha_standby_replication_last_attempt_ns.load(.acquire));
+        try health_metrics.appendPromMetric(writer, "antfly_ha_standby_replication_last_success_ns", "gauge", "Monotonic timestamp for the most recent successful HA standby replication round", ds.ha_standby_replication_last_success_ns.load(.acquire));
+
+        if (standby) |handle| {
+            const upstream_lsn = if (ds.ha_cfg.standby_replication != null)
+                handle.currentProgress().received_lsn
+            else
+                null;
+            const snapshot = antfly.ha.status.standbySnapshot(handle, upstream_lsn);
+            const metrics = antfly.ha.metrics.fromStandbySnapshot(snapshot);
+            const text = try antfly.ha.metrics.renderStandbyPrometheusAlloc(ds.alloc, metrics);
+            defer ds.alloc.free(text);
+            try writer.print("{s}", .{text});
+        }
     }
 
     fn cachedLsmMaintenanceStats(self: *HealthSource) CachedLsmMaintenanceStats {
@@ -503,7 +584,7 @@ pub const HealthSource = struct {
         if (!should_refresh) return cached;
 
         const refresh_started_ns: u64 = @intCast(platform_time.monotonicNs());
-        const refreshed_stats = self.data_server.write_source.lsmMaintenanceStatsBestEffort();
+        const refreshed_stats = self.data_server.liveRuntimeWriteSource().lsmMaintenanceStatsBestEffort();
         const refresh_finished_ns: u64 = @intCast(platform_time.monotonicNs());
 
         lockAtomic(&self.lsm_maintenance_metrics_mutex);
@@ -817,6 +898,7 @@ fn writeAsyncIndexingMetrics(writer: *std.Io.Writer, stats: antfly.db.types.Asyn
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_failed", "gauge", "LSM-backed stores that failed startup open", stats.startup.lsm_open_failed);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_total_ns", "gauge", "Summed LSM open duration across startup stores", stats.startup.lsm_open_total_ns);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_initializing_storage_ns", "gauge", "Summed LSM storage initialization duration during startup open", stats.startup.lsm_open_initializing_storage_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_recovered_temp_cleanup_ns", "gauge", "Summed recovered table temp file cleanup duration during startup open", stats.startup.lsm_open_recovered_temp_cleanup_ns);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_manifest_ns", "gauge", "Summed LSM manifest load duration during startup open", stats.startup.lsm_open_manifest_ns);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_ensuring_dirs_ns", "gauge", "Summed LSM directory creation duration during startup open", stats.startup.lsm_open_ensuring_dirs_ns);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_wal_replay_ns", "gauge", "Summed LSM WAL replay duration during startup open", stats.startup.lsm_open_wal_replay_ns);
@@ -825,6 +907,8 @@ fn writeAsyncIndexingMetrics(writer: *std.Io.Writer, stats: antfly.db.types.Asyn
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_obsolete_paths", "gauge", "LSM obsolete paths loaded during startup open", stats.startup.lsm_open_obsolete_paths);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_mutable_entries_after_replay", "gauge", "LSM mutable entries after startup WAL replay", stats.startup.lsm_open_mutable_entries_after_replay);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_immutable_memtables_after_replay", "gauge", "LSM immutable memtables after startup WAL replay", stats.startup.lsm_open_immutable_memtables_after_replay);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_recovered_temp_files_deleted", "gauge", "Recovered table temp files deleted during startup open", stats.startup.lsm_open_recovered_temp_files_deleted);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_recovered_temp_bytes_deleted", "gauge", "Recovered table temp bytes deleted during startup open", stats.startup.lsm_open_recovered_temp_bytes_deleted);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_records", "gauge", "Observed LSM WAL replay records during startup index open", stats.startup.wal_replay_records);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_entries", "gauge", "Observed LSM WAL replay entries during startup index open", stats.startup.wal_replay_entries);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_bytes", "gauge", "Observed LSM WAL replay bytes during startup index open", stats.startup.wal_replay_bytes);
@@ -974,6 +1058,10 @@ fn writeResourceMetricFamily(
         resource_manager_mod.Slice.derived_backlog,
         resource_manager_mod.Slice.text_merge_buffers,
         resource_manager_mod.Slice.algebraic_tensor_accumulators,
+        resource_manager_mod.Slice.lite_native_page_cache,
+        resource_manager_mod.Slice.lite_native_link_cache,
+        resource_manager_mod.Slice.lite_docstore_snapshot_cache,
+        resource_manager_mod.Slice.inference_prompt_cache,
     }) |slice| {
         const stats = snapshot.slices[@intFromEnum(slice)];
         try health_metrics.appendPromSampleLabeled(writer, name, &.{
@@ -1417,7 +1505,336 @@ pub const DataServerConfig = struct {
     query_async_limit: std.Io.Limit = .limited(8),
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
+    ha: DataServerHAConfig = .{},
 };
+
+pub const DataServerHAConfig = struct {
+    admin_context: ?antfly.ha.admin_exec.Context = null,
+    standby_owner: ?*?antfly.ha.standby.Standby = null,
+    admin_bearer_token: ?[]const u8 = null,
+    internal_primary: ?*antfly.ha.primary.Primary = null,
+    primary_retention_policy: antfly.ha.slot_store.RetentionPolicy = .{},
+    primary_sync_policy: antfly.ha.primary.SyncPolicy = .{},
+    primary_sync_wait: HASyncWaitConfig = .{},
+    standby_replication: ?HAStandbyReplicationConfig = null,
+};
+
+pub const HASyncWaitConfig = struct {
+    max_rounds: usize = 200,
+    sleep_ns: u64 = 10 * std.time.ns_per_ms,
+    poll_ctx: ?*anyopaque = null,
+    poll_fn: ?antfly.db.HAProgressPollFn = null,
+};
+
+fn haPrimarySyncWaitFromConfig(cfg: HASyncWaitConfig) antfly.db.HAPrimaryProgressSyncWait {
+    return .{
+        .max_rounds = cfg.max_rounds,
+        .sleep_ns = cfg.sleep_ns,
+        .poll_ctx = cfg.poll_ctx,
+        .poll_fn = cfg.poll_fn,
+    };
+}
+
+pub const HAStandbyReplicationConfig = struct {
+    upstream_base_uri: []const u8,
+    slot_name: []const u8,
+    standby_log_path: ?[]const u8 = null,
+    standby_progress_path: ?[]const u8 = null,
+    options: HAStandbyReplicationOptions = .{},
+    catch_up_until_end_of_wal: bool = false,
+    executor: ?antfly.common.http.RequestExecutor = null,
+};
+
+pub const HAStandbyReplicationOptions = antfly.ha.http_replication_client.ReplicateOptions;
+pub const HAStandbyReplicationResult = antfly.ha.http_replication_client.Result;
+pub const HAStandbyReplicationLoopResult = antfly.ha.http_replication_client.LoopResult;
+
+const HAStandbyReplicationErrorCode = enum(u8) {
+    none = 0,
+    HttpConnectionClosing,
+    ConnectionResetByPeer,
+    ConnectionRefused,
+    BrokenPipe,
+    EndOfStream,
+    UnexpectedHttpStatus,
+    NotListening,
+    UnsupportedReplicationFormat,
+    ReplicationResponseLsnMismatch,
+    ReplicationResponseEndOfWalMismatch,
+    ReplicationFrameLsnMismatch,
+    UnexpectedRecordLsn,
+    UnexpectedPreviousLsn,
+    RecordAlreadyReceived,
+    ConflictingReceivedRecord,
+    MissingReceivedRecord,
+    WrongCluster,
+    WrongShard,
+    WrongTable,
+    WrongTimeline,
+    WrongEpoch,
+    InvalidTimelineSwitch,
+    HAReplicationRecordMissingTableId,
+    HAReplicationRecordMissingShardId,
+    HAReplicationRecordUnknownTable,
+    HAReplicationRecordUnknownShard,
+    HAReplicationRecordApplyUnsupported,
+    UnsupportedBatchMutationCodec,
+    UnsupportedBatchMutationPayloadVersion,
+    UnsupportedRecordKind,
+    UnsupportedPayloadCodec,
+    InvalidMagic,
+    HeaderCrcMismatch,
+    PayloadCrcMismatch,
+    Other,
+};
+
+fn haStandbyReplicationErrorCode(err: anyerror) HAStandbyReplicationErrorCode {
+    return switch (err) {
+        error.HttpConnectionClosing => .HttpConnectionClosing,
+        error.ConnectionResetByPeer => .ConnectionResetByPeer,
+        error.ConnectionRefused => .ConnectionRefused,
+        error.BrokenPipe => .BrokenPipe,
+        error.EndOfStream => .EndOfStream,
+        error.UnexpectedHttpStatus => .UnexpectedHttpStatus,
+        error.NotListening => .NotListening,
+        error.UnsupportedReplicationFormat => .UnsupportedReplicationFormat,
+        error.ReplicationResponseLsnMismatch => .ReplicationResponseLsnMismatch,
+        error.ReplicationResponseEndOfWalMismatch => .ReplicationResponseEndOfWalMismatch,
+        error.ReplicationFrameLsnMismatch => .ReplicationFrameLsnMismatch,
+        error.UnexpectedRecordLsn => .UnexpectedRecordLsn,
+        error.UnexpectedPreviousLsn => .UnexpectedPreviousLsn,
+        error.RecordAlreadyReceived => .RecordAlreadyReceived,
+        error.ConflictingReceivedRecord => .ConflictingReceivedRecord,
+        error.MissingReceivedRecord => .MissingReceivedRecord,
+        error.WrongCluster => .WrongCluster,
+        error.WrongShard => .WrongShard,
+        error.WrongTable => .WrongTable,
+        error.WrongTimeline => .WrongTimeline,
+        error.WrongEpoch => .WrongEpoch,
+        error.InvalidTimelineSwitch => .InvalidTimelineSwitch,
+        error.HAReplicationRecordMissingTableId => .HAReplicationRecordMissingTableId,
+        error.HAReplicationRecordMissingShardId => .HAReplicationRecordMissingShardId,
+        error.HAReplicationRecordUnknownTable => .HAReplicationRecordUnknownTable,
+        error.HAReplicationRecordUnknownShard => .HAReplicationRecordUnknownShard,
+        error.HAReplicationRecordApplyUnsupported => .HAReplicationRecordApplyUnsupported,
+        error.UnsupportedBatchMutationCodec => .UnsupportedBatchMutationCodec,
+        error.UnsupportedBatchMutationPayloadVersion => .UnsupportedBatchMutationPayloadVersion,
+        error.UnsupportedRecordKind => .UnsupportedRecordKind,
+        error.UnsupportedPayloadCodec => .UnsupportedPayloadCodec,
+        error.InvalidMagic => .InvalidMagic,
+        error.HeaderCrcMismatch => .HeaderCrcMismatch,
+        error.PayloadCrcMismatch => .PayloadCrcMismatch,
+        else => .Other,
+    };
+}
+
+fn haStandbyReplicationErrorName(code: HAStandbyReplicationErrorCode) ?[]const u8 {
+    return switch (code) {
+        .none => null,
+        .HttpConnectionClosing => "HttpConnectionClosing",
+        .ConnectionResetByPeer => "ConnectionResetByPeer",
+        .ConnectionRefused => "ConnectionRefused",
+        .BrokenPipe => "BrokenPipe",
+        .EndOfStream => "EndOfStream",
+        .UnexpectedHttpStatus => "UnexpectedHttpStatus",
+        .NotListening => "NotListening",
+        .UnsupportedReplicationFormat => "UnsupportedReplicationFormat",
+        .ReplicationResponseLsnMismatch => "ReplicationResponseLsnMismatch",
+        .ReplicationResponseEndOfWalMismatch => "ReplicationResponseEndOfWalMismatch",
+        .ReplicationFrameLsnMismatch => "ReplicationFrameLsnMismatch",
+        .UnexpectedRecordLsn => "UnexpectedRecordLsn",
+        .UnexpectedPreviousLsn => "UnexpectedPreviousLsn",
+        .RecordAlreadyReceived => "RecordAlreadyReceived",
+        .ConflictingReceivedRecord => "ConflictingReceivedRecord",
+        .MissingReceivedRecord => "MissingReceivedRecord",
+        .WrongCluster => "WrongCluster",
+        .WrongShard => "WrongShard",
+        .WrongTable => "WrongTable",
+        .WrongTimeline => "WrongTimeline",
+        .WrongEpoch => "WrongEpoch",
+        .InvalidTimelineSwitch => "InvalidTimelineSwitch",
+        .HAReplicationRecordMissingTableId => "HAReplicationRecordMissingTableId",
+        .HAReplicationRecordMissingShardId => "HAReplicationRecordMissingShardId",
+        .HAReplicationRecordUnknownTable => "HAReplicationRecordUnknownTable",
+        .HAReplicationRecordUnknownShard => "HAReplicationRecordUnknownShard",
+        .HAReplicationRecordApplyUnsupported => "HAReplicationRecordApplyUnsupported",
+        .UnsupportedBatchMutationCodec => "UnsupportedBatchMutationCodec",
+        .UnsupportedBatchMutationPayloadVersion => "UnsupportedBatchMutationPayloadVersion",
+        .UnsupportedRecordKind => "UnsupportedRecordKind",
+        .UnsupportedPayloadCodec => "UnsupportedPayloadCodec",
+        .InvalidMagic => "InvalidMagic",
+        .HeaderCrcMismatch => "HeaderCrcMismatch",
+        .PayloadCrcMismatch => "PayloadCrcMismatch",
+        .Other => "Other",
+    };
+}
+
+fn isNonFatalHAStandbyReplicationError(err: anyerror) bool {
+    return switch (err) {
+        error.HttpConnectionClosing,
+        error.ConnectionResetByPeer,
+        error.ConnectionRefused,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.UnexpectedHttpStatus,
+        error.NotListening,
+        error.UnsupportedReplicationFormat,
+        error.InternalReplicationDidNotAdvance,
+        error.ReplicationResponseLsnMismatch,
+        error.ReplicationResponseEndOfWalMismatch,
+        error.ReplicationFrameLsnMismatch,
+        error.UnexpectedRecordLsn,
+        error.UnexpectedPreviousLsn,
+        error.RecordAlreadyReceived,
+        error.ConflictingReceivedRecord,
+        error.MissingReceivedRecord,
+        error.WrongCluster,
+        error.WrongShard,
+        error.WrongTable,
+        error.WrongTimeline,
+        error.WrongEpoch,
+        error.NonMonotonicTimeline,
+        error.InvalidTimelineSwitch,
+        error.TimelineSwitchRequiresAppliedProgress,
+        error.HAReplicationRecordMissingTableId,
+        error.HAReplicationRecordMissingShardId,
+        error.HAReplicationRecordUnknownTable,
+        error.HAReplicationRecordUnknownShard,
+        error.HAReplicationRecordApplyUnsupported,
+        error.NotBatchMutationRecord,
+        error.UnsupportedBatchMutationCodec,
+        error.UnsupportedBatchMutationPayloadVersion,
+        error.NotMetadataMutationRecord,
+        error.UnsupportedMetadataMutationCodec,
+        error.UnsupportedMetadataMutationPayloadVersion,
+        error.UnsupportedMetadataMutationKind,
+        error.UnsupportedRecordKind,
+        error.UnsupportedPayloadCodec,
+        error.UnsupportedVersion,
+        error.UnsupportedHeaderLength,
+        error.InvalidMagic,
+        error.HeaderCrcMismatch,
+        error.PayloadCrcMismatch,
+        error.TrailingBytes,
+        => true,
+        else => false,
+    };
+}
+
+fn isRetryableMetadataBootstrapError(err: anyerror) bool {
+    return switch (err) {
+        error.HttpConnectionClosing,
+        error.ConnectionResetByPeer,
+        error.ConnectionRefused,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.UnexpectedHttpStatus,
+        error.NotListening,
+        error.NotLeader,
+        error.ProposalDropped,
+        error.LeaderTransferInProgress,
+        error.StoreRegistrationNotVisible,
+        => true,
+        else => false,
+    };
+}
+
+fn metadataBootstrapRetryDelayMs(registration: ?StoreRegistrationConfig, attempts: u32, now_ms: u64) u64 {
+    const capped_attempts = @min(attempts, 5);
+    const exponential = metadata_bootstrap_retry_base_ms << @intCast(capped_attempts -| 1);
+    const bounded = @min(exponential, metadata_bootstrap_retry_max_ms);
+    var hasher = std.hash.Wyhash.init(0x8d6a_2026_4c1f_b007);
+    hashU64(&hasher, now_ms);
+    hashU64(&hasher, attempts);
+    if (registration) |record| {
+        hashU64(&hasher, record.node_id);
+        hashU64(&hasher, record.store_id);
+    }
+    const jitter = hasher.final() % (metadata_bootstrap_retry_jitter_ms + 1);
+    return @min(bounded +| jitter, metadata_bootstrap_retry_max_ms + metadata_bootstrap_retry_jitter_ms);
+}
+
+fn chooseStoreStatusReportKind(
+    ticks: usize,
+    dirty: bool,
+    last_report_at_ms: u64,
+    due_heartbeat: bool,
+    due_full_refresh: bool,
+    due_data_raft_refresh: bool,
+) StoreStatusReportKind {
+    if (last_report_at_ms == 0 or dirty) return .full;
+    const tick_due = ticks >= store_status_report_interval_ticks;
+    if (!tick_due) return .none;
+    if (due_full_refresh or due_data_raft_refresh) return .full;
+    if (due_heartbeat) return .heartbeat;
+    return .none;
+}
+
+test "data runtime treats metadata leadership churn as retryable bootstrap failure" {
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.NotLeader));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.ProposalDropped));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.LeaderTransferInProgress));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.ConnectionRefused));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.StoreRegistrationNotVisible));
+    try std.testing.expect(!isRetryableMetadataBootstrapError(error.InvalidArguments));
+}
+
+test "data runtime metadata bootstrap retry delay is bounded and jittered" {
+    const registration = StoreRegistrationConfig{
+        .node_id = 7,
+        .store_id = 11,
+        .role = "data",
+    };
+    const first = metadataBootstrapRetryDelayMs(registration, 1, 1000);
+    const later = metadataBootstrapRetryDelayMs(registration, 4, 1000);
+    const capped = metadataBootstrapRetryDelayMs(registration, 16, 1000);
+    try std.testing.expect(first >= metadata_bootstrap_retry_base_ms);
+    try std.testing.expect(first <= metadata_bootstrap_retry_base_ms + metadata_bootstrap_retry_jitter_ms);
+    try std.testing.expect(later >= first);
+    try std.testing.expect(capped <= metadata_bootstrap_retry_max_ms + metadata_bootstrap_retry_jitter_ms);
+}
+
+test "data runtime store status scheduler publishes first and dirty reports immediately" {
+    try std.testing.expectEqual(
+        StoreStatusReportKind.full,
+        chooseStoreStatusReportKind(0, true, 0, true, false, false),
+    );
+    try std.testing.expectEqual(
+        StoreStatusReportKind.full,
+        chooseStoreStatusReportKind(0, false, 0, true, false, false),
+    );
+    try std.testing.expectEqual(
+        StoreStatusReportKind.full,
+        chooseStoreStatusReportKind(0, true, 42, false, false, false),
+    );
+}
+
+test "data runtime store status scheduler keeps clean periodic reports tick gated" {
+    try std.testing.expectEqual(
+        StoreStatusReportKind.none,
+        chooseStoreStatusReportKind(store_status_report_interval_ticks - 1, false, 42, true, false, false),
+    );
+    try std.testing.expectEqual(
+        StoreStatusReportKind.none,
+        chooseStoreStatusReportKind(store_status_report_interval_ticks - 1, false, 42, false, false, true),
+    );
+    try std.testing.expectEqual(
+        StoreStatusReportKind.none,
+        chooseStoreStatusReportKind(store_status_report_interval_ticks - 1, false, 42, false, true, false),
+    );
+    try std.testing.expectEqual(
+        StoreStatusReportKind.heartbeat,
+        chooseStoreStatusReportKind(store_status_report_interval_ticks, false, 42, true, false, false),
+    );
+    try std.testing.expectEqual(
+        StoreStatusReportKind.full,
+        chooseStoreStatusReportKind(store_status_report_interval_ticks, false, 42, false, true, false),
+    );
+    try std.testing.expectEqual(
+        StoreStatusReportKind.full,
+        chooseStoreStatusReportKind(store_status_report_interval_ticks, false, 42, false, false, true),
+    );
+}
 
 pub const StoreRegistrationConfig = struct {
     node_id: u64,
@@ -1628,6 +2045,9 @@ pub const DataServer = struct {
     metadata_local_providers_registered: bool = false,
     store_registration: ?StoreRegistrationConfig = null,
     store_registration_confirmed: bool = false,
+    metadata_bootstrap_retry_mutex: std.atomic.Mutex = .unlocked,
+    metadata_bootstrap_retry_attempts: u32 = 0,
+    next_metadata_bootstrap_retry_at_ms: u64 = 0,
     group_leadership_source: ?GroupLeadershipSource = null,
     group_membership_source: ?GroupMembershipSource = null,
     local_transition_runtime: ?antfly.raft.TransitionRuntime = null,
@@ -1636,6 +2056,7 @@ pub const DataServer = struct {
     last_store_status_report_at_ms: u64 = 0,
     last_data_raft_metadata_sync_at_ms: u64 = 0,
     last_data_raft_placement_fingerprint: ?u64 = null,
+    last_data_raft_status_fingerprint: ?u64 = null,
     provision_ticks: usize = 0,
     last_provision_fingerprint: ?u64 = null,
     last_provision_metadata_epoch: ?u64 = null,
@@ -1727,6 +2148,25 @@ pub const DataServer = struct {
     status_source: antfly.public_api.http_server.StatusSource,
     http_server: ?antfly.public_api.ApiHttpServer = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
+    ha_cfg: DataServerHAConfig = .{},
+    ha_state_mutex: std.atomic.Mutex = .unlocked,
+    ha_public_gate_state: antfly.ha.public_gate_state.State = .{},
+    ha_admin_server: ?antfly.ha.http_admin.Server = null,
+    ha_internal_server: ?antfly.ha.http_internal.Server = null,
+    ha_standby_replication_http_executor: ?antfly.common.http.StdHttpExecutor = null,
+    ha_promoted_primary: ?antfly.ha.primary.Primary = null,
+    ha_primary_sync_wait: antfly.db.HAPrimaryProgressSyncWait = .{},
+    ha_primary_mirror_last_lsn: std.atomic.Value(u64) = .init(0),
+    ha_primary_mirror_failure_count: std.atomic.Value(u64) = .init(0),
+    ha_primary_mirror_last_gate_lsn: std.atomic.Value(u64) = .init(0),
+    ha_primary_mirror_last_gate_action: std.atomic.Value(u8) = .init(255),
+    ha_primary_mirror_sync_reject_count: std.atomic.Value(u64) = .init(0),
+    ha_primary_mirror_sync_wait_count: std.atomic.Value(u64) = .init(0),
+    ha_primary_mirror_sync_degraded_count: std.atomic.Value(u64) = .init(0),
+    ha_standby_replication_failure_count: std.atomic.Value(u64) = .init(0),
+    ha_standby_replication_last_error: std.atomic.Value(u8) = .init(@intFromEnum(HAStandbyReplicationErrorCode.none)),
+    ha_standby_replication_last_attempt_ns: std.atomic.Value(u64) = .init(0),
+    ha_standby_replication_last_success_ns: std.atomic.Value(u64) = .init(0),
     query_async_limit: std.Io.Limit,
     backend_runtime_mutex: std.atomic.Mutex = .unlocked,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
@@ -1758,6 +2198,8 @@ pub const DataServer = struct {
     // fixed cadence and retries quickly only while repairs are landing.
     const dense_posting_maintenance_idle_interval_ns = 30 * std.time.ns_per_s;
     const dense_posting_maintenance_retry_interval_ns = 1 * std.time.ns_per_s;
+    const ha_replication_default_max_records_per_apply = 256;
+    const ha_replication_default_max_encoded_bytes_per_apply = 4 * 1024 * 1024;
 
     const ProvisionedWarmupStats = struct {
         warmed_group_count: u64 = 0,
@@ -1845,6 +2287,8 @@ pub const DataServer = struct {
             ),
             .status_source = status_source,
             .api_server_cfg = cfg.api_server_cfg,
+            .ha_cfg = cfg.ha,
+            .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
             .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
@@ -1875,6 +2319,8 @@ pub const DataServer = struct {
             ),
             .status_source = antfly.public_api.http_server.StatusSource.fromMetadataService(svc),
             .api_server_cfg = cfg.api_server_cfg,
+            .ha_cfg = cfg.ha,
+            .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
             .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
@@ -1905,6 +2351,8 @@ pub const DataServer = struct {
             ),
             .status_source = antfly.public_api.http_server.StatusSource.fromMetadataHttpService(svc),
             .api_server_cfg = cfg.api_server_cfg,
+            .ha_cfg = cfg.ha,
+            .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
             .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
@@ -1920,6 +2368,8 @@ pub const DataServer = struct {
         api_server_cfg.shard_ops = self.localShardOperationAdapter();
         api_server_cfg.shard_db_adapter = self.localShardDbAdapter();
         api_server_cfg.backend_runtime = self.backend_runtime;
+        self.configureHAPublicGateState();
+        self.attachHaExecutors(&api_server_cfg);
         if (self.query_io_impl == null) {
             self.query_io_impl = std.Io.Threaded.init(self.alloc, .{
                 .async_limit = self.query_async_limit,
@@ -1934,13 +2384,21 @@ pub const DataServer = struct {
             self.provisioned_storage.attachBackendRuntime(runtime, &self.read_source, &self.write_source);
         }
         self.provisioned_storage.attachSources(&self.read_source, &self.write_source);
+        _ = self.read_source.withHAReadGate(self.haReadGate());
+        const ha_write_gate = self.haWriteGate();
+        const ha_primary_mirror = self.haPrimaryMirror();
+        _ = self.write_source.withHAWriteGate(ha_write_gate);
+        _ = self.write_source.withHAMirror(ha_primary_mirror);
         if (self.data_raft_apply) |apply_sm| {
             apply_sm.attachProvisionedStorage(&self.provisioned_storage);
             _ = apply_sm.write_source.withSecretStore(api_server_cfg.secret_store);
             apply_sm.write_cache.secret_store = api_server_cfg.secret_store;
             _ = apply_sm.write_source.withRemoteContent(api_server_cfg.remote_content);
             apply_sm.write_cache.remote_content = api_server_cfg.remote_content;
+            _ = apply_sm.write_source.withHAWriteGate(ha_write_gate);
+            _ = apply_sm.write_source.withHAMirror(ha_primary_mirror);
             apply_sm.write_source.setLocalChangeHook(self.localChangeHook());
+            _ = self.write_source.withLocalWriteOwner(&apply_sm.write_source);
         }
         self.read_source.primary_lookup_db = self.localPrimaryLookupDbSource();
         self.write_source.setLocalChangeHook(self.localChangeHook());
@@ -1975,6 +2433,7 @@ pub const DataServer = struct {
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withEntitySink(entity_sink);
         }
+        self.syncInferenceRuntimeConfig();
         self.http_server = antfly.public_api.ApiHttpServer.init(
             self.alloc,
             api_server_cfg,
@@ -1983,6 +2442,441 @@ pub const DataServer = struct {
             self.write_source.source(),
         );
         self.http_server.?.antfly_provider = self.read_source.antfly_provider;
+    }
+
+    pub fn applyHAReplicationRecord(self: *DataServer, record: antfly.ha.replication_record.RecordView) !void {
+        var snapshot = try self.write_source.catalog.adminSnapshot();
+        defer self.write_source.catalog.freeAdminSnapshot(&snapshot);
+        const route = try resolveHAReplicationRecordRoute(&snapshot, record);
+        try self.write_source.applyHAReplicationRecordGroupLocal(
+            self.alloc,
+            route.group_id,
+            route.table_name,
+            record,
+        );
+    }
+
+    pub fn applyHAReplicationRecordCallback(ctx: *anyopaque, record: antfly.ha.replication_record.RecordView) anyerror!void {
+        const self: *DataServer = @ptrCast(@alignCast(ctx));
+        try self.applyHAReplicationRecord(record);
+    }
+
+    const HAStandbyFetchSnapshot = struct {
+        identity: antfly.ha.standby.Identity,
+        requested_lsn: u64,
+    };
+
+    pub fn replicateHAStandbyAvailable(
+        self: *DataServer,
+        executor: antfly.common.http.RequestExecutor,
+        upstream_base_uri: []const u8,
+        slot_name: []const u8,
+        options: HAStandbyReplicationOptions,
+    ) !HAStandbyReplicationResult {
+        if (self.http_server == null) self.initApiServer();
+        var client = antfly.ha.http_replication_client.Client.init(self.alloc, executor);
+        return try self.replicateHAStandbyAvailableWithClient(&client, upstream_base_uri, slot_name, options);
+    }
+
+    pub fn replicateHAStandbyUntilCaughtUp(
+        self: *DataServer,
+        executor: antfly.common.http.RequestExecutor,
+        upstream_base_uri: []const u8,
+        slot_name: []const u8,
+        options: HAStandbyReplicationOptions,
+    ) !HAStandbyReplicationLoopResult {
+        if (self.http_server == null) self.initApiServer();
+        var client = antfly.ha.http_replication_client.Client.init(self.alloc, executor);
+        var iterations: usize = 0;
+        var received_count: usize = 0;
+        var applied_count: usize = 0;
+        var batch_options = options;
+
+        while (true) {
+            const result = try self.replicateHAStandbyAvailableWithClient(
+                &client,
+                upstream_base_uri,
+                slot_name,
+                batch_options,
+            );
+            batch_options.verify_upstream = false;
+            iterations += 1;
+            received_count += result.received_count;
+            applied_count += result.applied_count;
+
+            if (result.end_of_wal) {
+                return .{
+                    .iterations = iterations,
+                    .received_count = received_count,
+                    .applied_count = applied_count,
+                    .progress = result.progress,
+                    .current_lsn = result.current_lsn,
+                    .last_sent_lsn = result.last_sent_lsn,
+                    .next_lsn = result.next_lsn,
+                };
+            }
+            if (result.received_count == 0 and result.applied_count == 0) {
+                return error.InternalReplicationDidNotAdvance;
+            }
+        }
+    }
+
+    fn replicateHAStandbyAvailableWithClient(
+        self: *DataServer,
+        client: *antfly.ha.http_replication_client.Client,
+        upstream_base_uri: []const u8,
+        slot_name: []const u8,
+        options: HAStandbyReplicationOptions,
+    ) !HAStandbyReplicationResult {
+        const snapshot = try self.snapshotHAStandbyForFetch();
+        var batch_options = options;
+        if (batch_options.max_records == 0) {
+            batch_options.max_records = ha_replication_default_max_records_per_apply;
+        }
+        if (batch_options.max_encoded_bytes == 0) {
+            batch_options.max_encoded_bytes = ha_replication_default_max_encoded_bytes_per_apply;
+        }
+        var batch = try client.fetchAvailable(
+            upstream_base_uri,
+            slot_name,
+            snapshot.identity,
+            snapshot.requested_lsn,
+            batch_options,
+        );
+        defer batch.deinit();
+
+        lockAtomic(&self.ha_state_mutex);
+        const ctx = self.ha_cfg.admin_context orelse {
+            self.ha_state_mutex.unlock();
+            return error.HAStandbyStateChanged;
+        };
+        const standby = ctx.standby orelse {
+            self.ha_state_mutex.unlock();
+            return error.HAStandbyStateChanged;
+        };
+        if (!std.meta.eql(standby.identity, snapshot.identity) or
+            standby.nextReceiveLsn() != snapshot.requested_lsn)
+        {
+            self.ha_state_mutex.unlock();
+            return error.HAStandbyStateChanged;
+        }
+
+        const applied = client.applyFetched(
+            &batch,
+            standby,
+            self,
+            DataServer.applyHAReplicationRecordCallback,
+        ) catch |err| {
+            const status_identity = standby.identity;
+            const status_progress = standby.currentProgress();
+            self.ha_public_gate_state.publishStandbyProgress(status_progress);
+            self.ha_state_mutex.unlock();
+            _ = client.updateStandbyStatusSnapshot(
+                upstream_base_uri,
+                slot_name,
+                status_identity,
+                status_progress,
+            ) catch {};
+            return err;
+        };
+        const status_identity = standby.identity;
+        self.ha_public_gate_state.publishStandbyProgress(applied.progress);
+        self.ha_state_mutex.unlock();
+
+        try client.updateStandbyStatusSnapshot(
+            upstream_base_uri,
+            slot_name,
+            status_identity,
+            applied.progress,
+        );
+        return .{
+            .received_count = applied.received_count,
+            .applied_count = applied.applied_count,
+            .progress = applied.progress,
+            .current_lsn = batch.current_lsn,
+            .last_sent_lsn = batch.last_sent_lsn,
+            .next_lsn = batch.next_lsn,
+            .end_of_wal = batch.end_of_wal,
+        };
+    }
+
+    fn snapshotHAStandbyForFetch(self: *DataServer) !HAStandbyFetchSnapshot {
+        lockAtomic(&self.ha_state_mutex);
+        defer self.ha_state_mutex.unlock();
+        const ctx = self.ha_cfg.admin_context orelse return error.HAStandbyNotConfigured;
+        const standby = ctx.standby orelse return error.HAStandbyNotConfigured;
+        return .{
+            .identity = standby.identity,
+            .requested_lsn = standby.nextReceiveLsn(),
+        };
+    }
+
+    fn runHAStandbyReplicationRound(self: *DataServer) !void {
+        const cfg = self.ha_cfg.standby_replication orelse return;
+        lockAtomic(&self.ha_state_mutex);
+        const promoted = self.openPromotedPrimaryFromStandbyIfReady(cfg) catch |err| {
+            self.ha_state_mutex.unlock();
+            return err;
+        };
+        self.ha_state_mutex.unlock();
+        if (promoted) return;
+        const executor = try self.haStandbyReplicationExecutor(cfg);
+        self.recordHAStandbyReplicationAttempt();
+        if (cfg.catch_up_until_end_of_wal) {
+            _ = try self.replicateHAStandbyUntilCaughtUp(
+                executor,
+                cfg.upstream_base_uri,
+                cfg.slot_name,
+                cfg.options,
+            );
+        } else {
+            _ = try self.replicateHAStandbyAvailable(
+                executor,
+                cfg.upstream_base_uri,
+                cfg.slot_name,
+                cfg.options,
+            );
+        }
+        self.recordHAStandbyReplicationSuccess();
+    }
+
+    fn openPromotedPrimaryFromStandbyIfReady(self: *DataServer, cfg: HAStandbyReplicationConfig) !bool {
+        if (self.ha_cfg.admin_context == null) return false;
+        if (self.ha_cfg.admin_context.?.standby == null) return false;
+        if (self.ha_promoted_primary != null) return true;
+
+        const standby = self.ha_cfg.admin_context.?.standby.?;
+        const handoff = standby.promotedPrimaryHandoff() catch |err| switch (err) {
+            error.StandbyNotPromoted, error.PromotionNotApplied => return false,
+            else => return err,
+        };
+        const log_path = cfg.standby_log_path orelse return error.HAPromotedPrimaryLogMissing;
+        const progress_path = cfg.standby_progress_path orelse return error.HAPromotedPrimarySlotsMissing;
+        try self.validateHAStandbyPromotionOwner(standby);
+
+        const log_path_z = try self.alloc.dupeZ(u8, log_path);
+        defer self.alloc.free(log_path_z);
+        const slots_path_buf = try std.fmt.allocPrint(self.alloc, "{s}.promoted-primary-slots", .{progress_path});
+        defer self.alloc.free(slots_path_buf);
+        const slots_path = try self.alloc.dupeZ(u8, slots_path_buf);
+        defer self.alloc.free(slots_path);
+
+        var promoted_primary = try antfly.ha.primary.Primary.openPromotedFromStandby(
+            self.alloc,
+            log_path_z.ptr,
+            slots_path.ptr,
+            handoff,
+            .{},
+        );
+        errdefer promoted_primary.close();
+
+        self.ha_public_gate_state.beginPromotion();
+        try self.consumeHAStandbyForPromotion(standby);
+        self.ha_cfg.admin_context.?.standby = null;
+        if (self.ha_admin_server) |*server| {
+            server.ctx.standby = null;
+        }
+
+        self.ha_promoted_primary = promoted_primary;
+        const promoted_primary_handle = &self.ha_promoted_primary.?;
+        self.ha_cfg.internal_primary = promoted_primary_handle;
+        self.ha_cfg.standby_replication = null;
+        const promoted_node_id = self.ha_cfg.admin_context.?.standby_node_id;
+        self.ha_cfg.admin_context.?.primary = promoted_primary_handle;
+        self.ha_cfg.admin_context.?.primary_node_id = promoted_node_id;
+        self.ha_cfg.admin_context.?.promoted_standby_handoff = handoff;
+        if (self.ha_admin_server) |*server| {
+            server.ctx.primary = promoted_primary_handle;
+            server.ctx.primary_node_id = promoted_node_id;
+            server.ctx.promoted_standby_handoff = handoff;
+        }
+        self.ha_internal_server = null;
+        self.api_server_cfg.ha_internal_executor = null;
+        if (self.ha_cfg.admin_context.?.primary) |handle| {
+            self.ha_internal_server = antfly.ha.http_internal.Server.initWithOptions(self.alloc, handle, .{
+                .state_mutex = &self.ha_state_mutex,
+            });
+            self.api_server_cfg.ha_internal_executor = self.ha_internal_server.?.executor();
+        }
+        if (self.http_server) |*server| {
+            server.setHAInternalExecutor(self.api_server_cfg.ha_internal_executor);
+        }
+        self.rewireHAPromotionMirrors();
+        self.ha_public_gate_state.publishPrimary(
+            promoted_primary_handle,
+            haContextPrimaryIsFenced(self.ha_cfg.admin_context.?),
+        );
+        return true;
+    }
+
+    fn validateHAStandbyPromotionOwner(self: *DataServer, standby: *antfly.ha.standby.Standby) !void {
+        const owner = self.ha_cfg.standby_owner orelse return error.HAStandbyOwnershipRequired;
+        if (owner.*) |*owned| {
+            if (owned != standby) return error.HAStandbyOwnerMismatch;
+            return;
+        }
+        return error.HAStandbyOwnershipRequired;
+    }
+
+    fn consumeHAStandbyForPromotion(self: *DataServer, standby: *antfly.ha.standby.Standby) !void {
+        const owner = self.ha_cfg.standby_owner orelse return error.HAStandbyOwnershipRequired;
+        if (owner.*) |*owned| {
+            if (owned != standby) return error.HAStandbyOwnerMismatch;
+            owned.close();
+            owner.* = null;
+            return;
+        }
+        return error.HAStandbyOwnershipRequired;
+    }
+
+    fn rewireHAPromotionMirrors(self: *DataServer) void {
+        const ha_primary_mirror = self.haPrimaryMirror();
+        _ = self.write_source.withHAMirror(ha_primary_mirror);
+        if (self.data_raft_apply) |apply_sm| {
+            _ = apply_sm.write_source.withHAMirror(ha_primary_mirror);
+        }
+    }
+
+    fn haStandbyReplicationExecutor(
+        self: *DataServer,
+        cfg: HAStandbyReplicationConfig,
+    ) !antfly.common.http.RequestExecutor {
+        if (cfg.executor) |executor| return executor;
+        if (self.ha_standby_replication_http_executor == null) {
+            self.ha_standby_replication_http_executor = antfly.common.http.StdHttpExecutor.init(self.alloc, .{});
+        }
+        return self.ha_standby_replication_http_executor.?.executor();
+    }
+
+    fn configureHAPublicGateState(self: *DataServer) void {
+        const ctx = self.ha_cfg.admin_context orelse return;
+        if (ctx.standby) |standby| {
+            self.publishHAStandbyPublicGateState(standby, true);
+            return;
+        }
+        if (ctx.primary) |primary| {
+            self.ha_public_gate_state.configurePrimary(primary, haContextPrimaryIsFenced(ctx));
+        }
+    }
+
+    fn refreshHAPublicGateState(self: *DataServer) void {
+        const ctx = self.ha_cfg.admin_context orelse return;
+        if (ctx.standby) |standby| {
+            self.publishHAStandbyPublicGateState(standby, false);
+            return;
+        }
+        if (ctx.primary != null) {
+            self.ha_public_gate_state.publishPrimaryFence(haContextPrimaryIsFenced(ctx));
+        }
+    }
+
+    fn publishHAStandbyPublicGateState(
+        self: *DataServer,
+        standby: *antfly.ha.standby.Standby,
+        configure_role: bool,
+    ) void {
+        _ = standby.promotedPrimaryHandoff() catch |err| switch (err) {
+            error.StandbyNotPromoted, error.PromotionNotApplied => {
+                if (configure_role) {
+                    self.ha_public_gate_state.configureStandby(standby.currentProgress());
+                } else {
+                    self.ha_public_gate_state.publishStandbyProgress(standby.currentProgress());
+                }
+                return;
+            },
+            else => {
+                self.ha_public_gate_state.beginPromotion();
+                return;
+            },
+        };
+        self.ha_public_gate_state.beginPromotion();
+    }
+
+    fn haPublicGateStateChangedCallback(ptr: *anyopaque) void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        self.refreshHAPublicGateState();
+    }
+
+    fn haWriteGate(self: *DataServer) ?antfly.db.HAWriteGate {
+        const ctx = self.ha_cfg.admin_context orelse return null;
+        if (ctx.standby != null or ctx.primary != null) return .{ .shared = .{
+            .state = &self.ha_public_gate_state,
+        } };
+        return null;
+    }
+
+    fn haPrimaryMirror(self: *DataServer) ?antfly.db.HAAsyncEffectMirror {
+        if (self.ha_cfg.admin_context) |ctx| {
+            if (ctx.standby != null) return null;
+            if (ctx.primary) |primary| return self.haPrimaryMirrorFor(primary);
+        }
+        if (self.ha_cfg.internal_primary) |primary| return self.haPrimaryMirrorFor(primary);
+        return null;
+    }
+
+    fn haPrimaryMirrorFor(self: *DataServer, primary: *antfly.ha.primary.Primary) antfly.db.HAAsyncEffectMirror {
+        var mirror = antfly.db.HAAsyncEffectMirror{
+            .primary = primary,
+            .last_lsn = &self.ha_primary_mirror_last_lsn,
+            .failure_count = &self.ha_primary_mirror_failure_count,
+            .sync_policy = self.ha_cfg.primary_sync_policy,
+            .last_gate_lsn = &self.ha_primary_mirror_last_gate_lsn,
+            .last_gate_action = &self.ha_primary_mirror_last_gate_action,
+            .sync_reject_count = &self.ha_primary_mirror_sync_reject_count,
+            .sync_wait_count = &self.ha_primary_mirror_sync_wait_count,
+            .sync_degraded_count = &self.ha_primary_mirror_sync_degraded_count,
+        };
+        if (mirror.sync_policy.mode != .async and mirror.sync_policy.failure_policy == .block) {
+            mirror.sync_wait_ctx = &self.ha_primary_sync_wait;
+            mirror.sync_wait_fn = antfly.db.HAPrimaryProgressSyncWait.wait;
+        }
+        return mirror;
+    }
+
+    fn haReadGate(self: *DataServer) ?antfly.public_api.HAReadGate {
+        const ctx = self.ha_cfg.admin_context orelse return null;
+        if (ctx.standby != null or ctx.primary != null) return .{ .shared = &self.ha_public_gate_state };
+        return null;
+    }
+
+    fn haOwnerJobCanRun(
+        self: *DataServer,
+        kind: antfly.ha.owner_job_gate.JobKind,
+    ) bool {
+        _ = kind;
+        return self.ha_public_gate_state.ownerJobsCanRun();
+    }
+
+    fn attachHaExecutors(self: *DataServer, api_server_cfg: *antfly.public_api.http_server.ApiHttpServerConfig) void {
+        if (api_server_cfg.ha_admin_executor == null) {
+            if (self.ha_cfg.admin_context) |ctx| {
+                self.ha_admin_server = antfly.ha.http_admin.Server.initWithOptions(self.alloc, ctx, .{
+                    .bearer_token = self.ha_cfg.admin_bearer_token,
+                    .state_mutex = if (ctx.primary != null or ctx.standby != null) &self.ha_state_mutex else null,
+                    .state_changed = .{
+                        .ptr = self,
+                        .run_fn = DataServer.haPublicGateStateChangedCallback,
+                    },
+                    .standby_status_extras = .{
+                        .ptr = self,
+                        .last_error = haStandbyReplicationLastErrorCallback,
+                        .last_attempt_ns = haStandbyReplicationLastAttemptNsCallback,
+                        .last_success_ns = haStandbyReplicationLastSuccessNsCallback,
+                        .replication_failures_total = haStandbyReplicationFailuresTotalCallback,
+                    },
+                });
+                api_server_cfg.ha_admin_executor = self.ha_admin_server.?.executor();
+            }
+        }
+        if (api_server_cfg.ha_internal_executor == null) {
+            const primary = self.ha_cfg.internal_primary orelse if (self.ha_cfg.admin_context) |ctx| ctx.primary else null;
+            if (primary) |handle| {
+                self.ha_internal_server = antfly.ha.http_internal.Server.initWithOptions(self.alloc, handle, .{
+                    .state_mutex = &self.ha_state_mutex,
+                });
+                api_server_cfg.ha_internal_executor = self.ha_internal_server.?.executor();
+            }
+        }
     }
 
     pub fn setAntflyProvider(
@@ -1996,6 +2890,22 @@ pub const DataServer = struct {
             apply_sm.write_cache.antfly_provider = provider;
         }
         if (self.http_server) |*server| server.antfly_provider = provider;
+        self.syncInferenceRuntimeConfig();
+    }
+
+    fn configuredInferenceAPIURL(self: *const DataServer) ?[]const u8 {
+        const node_config = self.api_server_cfg.node_config orelse return null;
+        return node_config.inference.api_url;
+    }
+
+    fn syncInferenceRuntimeConfig(self: *DataServer) void {
+        const inference_api_url = self.configuredInferenceAPIURL();
+        _ = self.read_source.withInferenceAPIURL(inference_api_url);
+        _ = self.write_source.withInferenceAPIURL(inference_api_url);
+        if (self.data_raft_apply) |apply_sm| {
+            _ = apply_sm.write_source.withInferenceAPIURL(inference_api_url);
+            apply_sm.write_cache.inference_api_url = inference_api_url;
+        }
     }
 
     pub fn start(self: *DataServer) !void {
@@ -2047,7 +2957,67 @@ pub const DataServer = struct {
         };
     }
 
+    fn metadataBootstrapRetryDue(self: *DataServer, now_ms: u64) bool {
+        lockAtomic(&self.metadata_bootstrap_retry_mutex);
+        defer self.metadata_bootstrap_retry_mutex.unlock();
+        return self.next_metadata_bootstrap_retry_at_ms == 0 or
+            now_ms >= self.next_metadata_bootstrap_retry_at_ms;
+    }
+
+    fn clearMetadataBootstrapRetry(self: *DataServer) void {
+        lockAtomic(&self.metadata_bootstrap_retry_mutex);
+        defer self.metadata_bootstrap_retry_mutex.unlock();
+        self.metadata_bootstrap_retry_attempts = 0;
+        self.next_metadata_bootstrap_retry_at_ms = 0;
+    }
+
+    fn deferMetadataBootstrapRetry(self: *DataServer, now_ms: u64) void {
+        lockAtomic(&self.metadata_bootstrap_retry_mutex);
+        defer self.metadata_bootstrap_retry_mutex.unlock();
+        self.metadata_bootstrap_retry_attempts = self.metadata_bootstrap_retry_attempts +| 1;
+        const delay_ms = metadataBootstrapRetryDelayMs(
+            self.store_registration,
+            self.metadata_bootstrap_retry_attempts,
+            now_ms,
+        );
+        self.next_metadata_bootstrap_retry_at_ms = now_ms +| delay_ms;
+    }
+
+    fn recordMetadataBootstrapError(self: *DataServer, err: anyerror, now_ms: u64) !void {
+        if (!isRetryableMetadataBootstrapError(err)) return err;
+        self.deferMetadataBootstrapRetry(now_ms);
+    }
+
+    fn recordProvisionedRootRefreshMetadataError(self: *DataServer, err: anyerror, now_ms: u64) !void {
+        if (!isRetryableMetadataBootstrapError(err)) return err;
+        self.provisioned_root_refresh_dirty.store(true, .release);
+        self.deferMetadataBootstrapRetry(now_ms);
+    }
+
+    fn metadataBootstrapRetryAttemptsForTest(self: *DataServer) u32 {
+        lockAtomic(&self.metadata_bootstrap_retry_mutex);
+        defer self.metadata_bootstrap_retry_mutex.unlock();
+        return self.metadata_bootstrap_retry_attempts;
+    }
+
+    fn nextMetadataBootstrapRetryAtMsForTest(self: *DataServer) u64 {
+        lockAtomic(&self.metadata_bootstrap_retry_mutex);
+        defer self.metadata_bootstrap_retry_mutex.unlock();
+        return self.next_metadata_bootstrap_retry_at_ms;
+    }
+
     pub fn runRound(self: *DataServer) !void {
+        const ha_standby_replication_ok = blk: {
+            self.runHAStandbyReplicationRound() catch |err| {
+                _ = self.ha_standby_replication_failure_count.fetchAdd(1, .monotonic);
+                self.recordHAStandbyReplicationError(err);
+                if (!isNonFatalHAStandbyReplicationError(err)) return err;
+                std.log.warn("HA standby replication round skipped err={}", .{err});
+                break :blk false;
+            };
+            break :blk true;
+        };
+        if (ha_standby_replication_ok) self.clearHAStandbyReplicationError();
         if (self.data_raft) |raft| {
             lockAtomic(&self.data_raft_mutex);
             defer self.data_raft_mutex.unlock();
@@ -2069,83 +3039,74 @@ pub const DataServer = struct {
             }
         }
         if (self.remote_metadata != null and self.store_registration != null) {
-            if (!self.store_registration_confirmed) {
-                self.registerNodeIfConfigured() catch |register_err| switch (register_err) {
-                    error.HttpConnectionClosing,
-                    error.ConnectionResetByPeer,
-                    error.ConnectionRefused,
-                    error.BrokenPipe,
-                    error.EndOfStream,
-                    error.UnexpectedHttpStatus,
-                    error.NotListening,
-                    => {},
-                    else => return register_err,
-                };
-            }
-            self.store_status_ticks += 1;
             const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
-            const due_store_status_heartbeat = self.last_store_status_report_at_ms == 0 or
-                now_ms -| self.last_store_status_report_at_ms >= store_status_heartbeat_interval_ms;
-            const due_full_store_status = self.localGroupStatusCacheStale(now_ms);
-            const due_data_raft_status_refresh = self.data_raft != null;
-            if (self.store_status_ticks >= store_status_report_interval_ticks and
-                (self.store_status_dirty or due_store_status_heartbeat or due_full_store_status or due_data_raft_status_refresh))
-            {
-                self.store_status_ticks = 0;
-                const result = if (self.store_status_dirty or due_full_store_status or due_data_raft_status_refresh)
-                    self.reportStoreStatus()
-                else
-                    self.reportStoreStatusHeartbeat();
-                result catch |err| switch (err) {
-                    // Split runtime can briefly observe placement before the
-                    // local replica root is fully provisioned on disk.
-                    error.FileNotFound,
-                    error.UnknownGroup,
-                    error.LmdbUnexpected,
-                    error.Corrupted,
-                    error.HttpConnectionClosing,
-                    error.ConnectionResetByPeer,
-                    error.ConnectionRefused,
-                    error.BrokenPipe,
-                    error.EndOfStream,
-                    error.UnexpectedHttpStatus,
-                    => {},
-                    error.UnknownStore => {
-                        self.store_registration_confirmed = false;
-                        self.registerNodeIfConfigured() catch |register_err| switch (register_err) {
-                            error.HttpConnectionClosing,
-                            error.ConnectionResetByPeer,
-                            error.ConnectionRefused,
-                            error.BrokenPipe,
-                            error.EndOfStream,
-                            error.UnexpectedHttpStatus,
-                            => {},
-                            else => return register_err,
+            if (self.metadataBootstrapRetryDue(now_ms)) {
+                const registration_ready = blk: {
+                    if (!self.store_registration_confirmed) {
+                        self.registerNodeIfConfigured() catch |err| {
+                            try self.recordMetadataBootstrapError(err, now_ms);
+                            break :blk false;
                         };
-                    },
-                    else => return err,
+                    }
+                    break :blk true;
                 };
-            }
+                if (registration_ready) {
+                    self.store_status_ticks += 1;
+                    const due_store_status_heartbeat = self.last_store_status_report_at_ms == 0 or
+                        now_ms -| self.last_store_status_report_at_ms >= store_status_heartbeat_interval_ms;
+                    const due_full_store_status = self.localGroupStatusCacheStale(now_ms);
+                    const due_data_raft_status_refresh = self.data_raft != null;
+                    const report_kind = chooseStoreStatusReportKind(
+                        self.store_status_ticks,
+                        self.store_status_dirty,
+                        self.last_store_status_report_at_ms,
+                        due_store_status_heartbeat,
+                        due_full_store_status,
+                        due_data_raft_status_refresh,
+                    );
+                    if (report_kind != .none) {
+                        self.store_status_ticks = 0;
+                        const result = switch (report_kind) {
+                            .full => self.reportStoreStatus(),
+                            .heartbeat => self.reportStoreStatusHeartbeat(),
+                            .none => unreachable,
+                        };
+                        result catch |err| switch (err) {
+                            // Split runtime can briefly observe placement before the
+                            // local replica root is fully provisioned on disk.
+                            error.LsmRootWriterAlreadyOpen,
+                            error.FileNotFound,
+                            error.UnknownGroup,
+                            error.LmdbUnexpected,
+                            error.Corrupted,
+                            => {},
+                            error.UnknownStore => {
+                                self.store_registration_confirmed = false;
+                                self.registerNodeIfConfigured() catch |register_err| try self.recordMetadataBootstrapError(register_err, now_ms);
+                            },
+                            else => |retry_err| try self.recordMetadataBootstrapError(retry_err, now_ms),
+                        };
+                    }
+                }
 
-            self.provision_ticks += 1;
-            if (self.provision_ticks >= 4) {
-                self.provision_ticks = 0;
-                self.maybeRequestProvisionedRootRefresh() catch |err| switch (err) {
-                    // Local split-runtime provisioning can race with active writes.
-                    // Treat those as transient and retry on the next provision tick.
-                    error.WriterLocked,
-                    error.FileNotFound,
-                    error.UnknownGroup,
-                    error.LmdbUnexpected,
-                    error.Corrupted,
-                    error.HttpConnectionClosing,
-                    error.ConnectionResetByPeer,
-                    error.ConnectionRefused,
-                    error.BrokenPipe,
-                    error.EndOfStream,
-                    => {},
-                    else => return err,
-                };
+                if (self.metadataBootstrapRetryDue(now_ms)) {
+                    self.provision_ticks += 1;
+                    if (self.provision_ticks >= 4) {
+                        self.provision_ticks = 0;
+                        self.maybeRequestProvisionedRootRefresh() catch |err| switch (err) {
+                            // Local split-runtime provisioning can race with active writes.
+                            // Treat those as transient and retry on the next provision tick.
+                            error.LsmRootWriterAlreadyOpen,
+                            error.WriterLocked,
+                            error.FileNotFound,
+                            error.UnknownGroup,
+                            error.LmdbUnexpected,
+                            error.Corrupted,
+                            => {},
+                            else => |retry_err| try self.recordProvisionedRootRefreshMetadataError(retry_err, now_ms),
+                        };
+                    }
+                }
             }
         }
         try self.maybeRequestRuntimeStatusRefresh();
@@ -2164,6 +3125,9 @@ pub const DataServer = struct {
         self.clearProvisionedStartupCatchUpTarget();
         if (self.listener) |*listener| listener.deinit();
         if (self.http_server) |*http_server| http_server.deinit();
+        if (self.ha_admin_server) |*server| server.deinit();
+        if (self.ha_promoted_primary) |*primary| primary.close();
+        if (self.ha_standby_replication_http_executor) |*executor| executor.deinit();
         if (self.data_raft) |raft| {
             raft.stop();
             raft.deinit();
@@ -2196,6 +3160,10 @@ pub const DataServer = struct {
         if (self.query_io_impl) |*io_impl| io_impl.deinit();
         self.listener = null;
         self.http_server = null;
+        self.ha_admin_server = null;
+        self.ha_standby_replication_http_executor = null;
+        self.ha_promoted_primary = null;
+        self.ha_internal_server = null;
         self.data_raft = null;
         self.data_raft_factory = null;
         self.data_raft_apply = null;
@@ -2226,7 +3194,9 @@ pub const DataServer = struct {
     }
 
     fn runLsmMaintenanceForegroundRound(self: *DataServer) !void {
-        _ = self.write_source.runLsmMaintenanceRound() catch |err| switch (err) {
+        if (!self.haOwnerJobCanRun(.compaction_publish)) return;
+        _ = self.liveRuntimeWriteSource().runLsmMaintenanceRound() catch |err| switch (err) {
+            error.LsmRootWriterAlreadyOpen,
             error.ReadOnly,
             error.FileNotFound,
             error.LmdbUnexpected,
@@ -2237,6 +3207,7 @@ pub const DataServer = struct {
     }
 
     fn requestLsmMaintenanceBackground(self: *DataServer) !void {
+        if (!self.haOwnerJobCanRun(.compaction_publish)) return;
         const now_ns = platform_time.monotonicNs();
         if (now_ns < self.lsm_maintenance_next_eligible_ns.load(.monotonic)) return;
         if (self.resourcePressureDefersBackgroundMaintenance()) {
@@ -2252,19 +3223,76 @@ pub const DataServer = struct {
         }
     }
 
+    fn clearHAStandbyReplicationError(self: *DataServer) void {
+        self.ha_standby_replication_last_error.store(@intFromEnum(HAStandbyReplicationErrorCode.none), .release);
+    }
+
+    fn recordHAStandbyReplicationAttempt(self: *DataServer) void {
+        self.ha_standby_replication_last_attempt_ns.store(platform_time.monotonicNs(), .release);
+    }
+
+    fn recordHAStandbyReplicationSuccess(self: *DataServer) void {
+        self.ha_standby_replication_last_success_ns.store(platform_time.monotonicNs(), .release);
+    }
+
+    fn recordHAStandbyReplicationError(self: *DataServer, err: anyerror) void {
+        self.ha_standby_replication_last_error.store(@intFromEnum(haStandbyReplicationErrorCode(err)), .release);
+    }
+
+    fn haStandbyReplicationLastError(self: *DataServer) ?[]const u8 {
+        const code: HAStandbyReplicationErrorCode = @enumFromInt(self.ha_standby_replication_last_error.load(.acquire));
+        return haStandbyReplicationErrorName(code);
+    }
+
+    fn haStandbyReplicationLastErrorCallback(ptr: *anyopaque) ?[]const u8 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.haStandbyReplicationLastError();
+    }
+
+    fn haStandbyReplicationLastAttemptNs(self: *DataServer) ?u64 {
+        const value = self.ha_standby_replication_last_attempt_ns.load(.acquire);
+        return if (value == 0) null else value;
+    }
+
+    fn haStandbyReplicationLastAttemptNsCallback(ptr: *anyopaque) ?u64 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.haStandbyReplicationLastAttemptNs();
+    }
+
+    fn haStandbyReplicationLastSuccessNs(self: *DataServer) ?u64 {
+        const value = self.ha_standby_replication_last_success_ns.load(.acquire);
+        return if (value == 0) null else value;
+    }
+
+    fn haStandbyReplicationLastSuccessNsCallback(ptr: *anyopaque) ?u64 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.haStandbyReplicationLastSuccessNs();
+    }
+
+    fn haStandbyReplicationFailuresTotal(self: *DataServer) ?u64 {
+        return self.ha_standby_replication_failure_count.load(.acquire);
+    }
+
+    fn haStandbyReplicationFailuresTotalCallback(ptr: *anyopaque) ?u64 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.haStandbyReplicationFailuresTotal();
+    }
+
     fn densePostingMaintenanceDue(self: *DataServer, now_ns: u64) bool {
         return now_ns >= self.dense_posting_maintenance_next_eligible_ns.load(.monotonic);
     }
 
     fn backgroundMaintenanceDue(self: *DataServer, now_ns: u64) bool {
-        if (self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
+        if (!self.haOwnerJobCanRun(.compaction_publish)) return false;
+        const live_write_source = self.liveRuntimeWriteSource();
+        if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
             self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
             return true;
         }
         if (self.densePostingMaintenanceDue(now_ns)) return true;
         const obsolete_due_ns = self.lsm_maintenance_obsolete_reclaim_due_ns.load(.monotonic);
         if (obsolete_due_ns != 0 and now_ns < obsolete_due_ns) return false;
-        if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+        if (live_write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
             if (delay_ns > 0) {
                 self.deferLsmObsoleteReclaim(now_ns, delay_ns);
                 return false;
@@ -2314,6 +3342,10 @@ pub const DataServer = struct {
                 sleepLsmMaintenanceWorker();
                 continue;
             }
+            if (!self.haOwnerJobCanRun(.compaction_publish)) {
+                sleepLsmMaintenanceWorker();
+                continue;
+            }
             if (self.resourcePressureDefersBackgroundMaintenance()) {
                 self.deferLsmMaintenance(now_ns, lsm_maintenance_worker_pressure_defer_ns);
                 _ = self.lsm_maintenance_capacity_denied.fetchAdd(1, .monotonic);
@@ -2331,10 +3363,11 @@ pub const DataServer = struct {
 
             self.lsm_maintenance_active.store(true, .release);
             _ = self.lsm_maintenance_started.fetchAdd(1, .monotonic);
+            const live_write_source = self.liveRuntimeWriteSource();
             var completed = false;
             var steps: usize = 0;
             while (steps < lsm_maintenance_worker_max_steps_per_wake and !self.lsm_maintenance_stop.load(.acquire)) : (steps += 1) {
-                const did_work = self.write_source.runLsmMaintenanceRoundBestEffort() catch |err| {
+                const did_work = live_write_source.runLsmMaintenanceRoundBestEffort() catch |err| {
                     switch (err) {
                         error.ReadOnly,
                         error.FileNotFound,
@@ -2347,10 +3380,10 @@ pub const DataServer = struct {
                     break;
                 };
                 if (!did_work) {
-                    if (self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
+                    if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
                         _ = self.lsm_maintenance_lock_deferred.fetchAdd(1, .monotonic);
                         self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
-                    } else if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                    } else if (live_write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
                         if (delay_ns > 0) self.deferLsmObsoleteReclaim(platform_time.monotonicNs(), delay_ns);
                     }
                     completed = true;
@@ -2358,9 +3391,9 @@ pub const DataServer = struct {
                 }
             }
             if (steps >= lsm_maintenance_worker_max_steps_per_wake) {
-                if (self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
+                if (live_write_source.lsmMaintenanceScoreBestEffort() > 0) {
                     self.deferLsmMaintenance(platform_time.monotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
-                } else if (self.write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                } else if (live_write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
                     if (delay_ns > 0) self.deferLsmObsoleteReclaim(platform_time.monotonicNs(), delay_ns);
                 }
             }
@@ -2371,7 +3404,7 @@ pub const DataServer = struct {
             // work alongside the regular LSM maintenance.
             const posting_now_ns = platform_time.monotonicNs();
             if (self.densePostingMaintenanceDue(posting_now_ns)) {
-                const posting_steps = self.write_source.runDensePostingMaintenanceRoundBestEffort() catch 0;
+                const posting_steps = live_write_source.runDensePostingMaintenanceRoundBestEffort() catch 0;
                 const next_delay_ns: u64 = if (posting_steps > 0)
                     dense_posting_maintenance_retry_interval_ns
                 else
@@ -2397,7 +3430,7 @@ pub const DataServer = struct {
                 .SUCCESS => return,
                 .INTR => continue,
                 else => {
-                    std.Thread.yield() catch {};
+                    platform.time.yieldBriefly();
                     return;
                 },
             }
@@ -2548,7 +3581,7 @@ pub const DataServer = struct {
                     const status = raft.host.http_host.host.raftStatus(group_id);
                     local_status_missing = status == null;
                     leader_node_id = if (status) |raft_status| raft_status.soft.leader_id else null;
-                    if (leader_node_id == null and localRaftStatusIsVoter(status, local_node_id)) {
+                    if (leader_node_id == null and localRaftStatusShouldBootstrapCampaign(status, local_node_id)) {
                         const now_ns = platform_time.monotonicNs();
                         if (last_local_campaign_ns == 0 or
                             now_ns -| last_local_campaign_ns >= data_raft_campaign_retry_interval_ns)
@@ -2569,7 +3602,8 @@ pub const DataServer = struct {
                 if (req.sync_level != .propose) {
                     try self.waitForLocalRaftBatchApply(group_id, index, deadline_ns);
                 }
-                try self.write_source.syncReplicatedBatchGroupLocal(alloc, group_id, table_name, req.sync_level);
+                const sync_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
+                try sync_source.syncReplicatedBatchGroupLocal(alloc, group_id, table_name, req.sync_level);
                 return;
             }
 
@@ -2589,6 +3623,7 @@ pub const DataServer = struct {
                             const body = try antfly.public_api.batch.encodeBatchRequest(alloc, req);
                             defer alloc.free(body);
                             var response = client.fetchGroupBatch(base_uri, group_id, table_name, body) catch |err| switch (err) {
+                                error.LeaderUnavailable,
                                 error.UnexpectedHttpStatus,
                                 error.HttpConnectionClosing,
                                 error.ConnectionResetByPeer,
@@ -2718,6 +3753,7 @@ pub const DataServer = struct {
         const body = try antfly.public_api.batch.encodeBatchRequest(alloc, req);
         defer alloc.free(body);
         var response = client.fetchGroupBatch(target_store.api_url, group_id, table_name, body) catch |err| switch (err) {
+            error.LeaderUnavailable,
             error.UnexpectedHttpStatus,
             error.HttpConnectionClosing,
             error.ConnectionResetByPeer,
@@ -2769,6 +3805,16 @@ pub const DataServer = struct {
         return false;
     }
 
+    fn localRaftStatusShouldBootstrapCampaign(status: ?raft_engine.core.Status, local_node_id: u64) bool {
+        const raft_status = status orelse return false;
+        if (raft_status.soft.leader_id != null) return false;
+        switch (raft_status.soft.role) {
+            .follower, .pre_candidate => {},
+            .candidate, .leader => return false,
+        }
+        return localRaftStatusIsVoter(raft_status, local_node_id);
+    }
+
     fn sleepDataRaftBatchLeaderRetry() void {
         var req = std.posix.timespec{
             .sec = @intCast(@divTrunc(data_raft_batch_leader_retry_sleep_ns, std.time.ns_per_s)),
@@ -2780,7 +3826,7 @@ pub const DataServer = struct {
                 .SUCCESS => return,
                 .INTR => continue,
                 else => {
-                    std.Thread.yield() catch {};
+                    platform.time.yieldBriefly();
                     return;
                 },
             }
@@ -2841,13 +3887,11 @@ pub const DataServer = struct {
             .data => self.markLocalGroupDataChanged(),
             .structural => {
                 self.invalidateLocalGroupStatusCache();
-                self.refreshVisibleProvisionedReplicaState() catch |err| {
-                    std.log.warn("failed to refresh provisioned replica state after structural change table={s} err={}", .{
-                        table_name,
-                        err,
-                    });
-                };
                 if (self.data_raft_apply) |apply_sm| {
+                    // Raft-backed tables write through the apply state machine.
+                    // Move create-time seeded writers before refreshing visible
+                    // roots so status reconciliation and the first batch share
+                    // one root writer owner.
                     _ = self.write_source.transferAdoptableWriteCacheEntriesTo(&apply_sm.write_source, table_name) catch |err| {
                         std.log.warn("failed to transfer provisioned write cache to raft apply table={s} err={}", .{
                             table_name,
@@ -2855,22 +3899,72 @@ pub const DataServer = struct {
                         });
                     };
                 }
+                self.refreshVisibleProvisionedReplicaState() catch |err| {
+                    std.log.warn("failed to refresh provisioned replica state after structural change table={s} err={}", .{
+                        table_name,
+                        err,
+                    });
+                };
                 self.syncDataRaftFromRemoteMetadata() catch |err| {
                     std.log.warn("failed to sync data raft placement after structural change table={s} err={}", .{
                         table_name,
                         err,
                     });
                 };
+                self.reportStoreStatusAfterStructuralChange(table_name);
             },
         }
         self.markRuntimeStatusDirty(table_name, kind);
     }
 
+    fn reportStoreStatusAfterStructuralChange(self: *DataServer, table_name: []const u8) void {
+        if (self.remote_metadata == null or self.store_registration == null) return;
+        if (!self.store_registration_confirmed) {
+            self.registerNodeIfConfigured() catch |err| {
+                std.log.warn("failed to register store before structural status report table={s} err={}", .{
+                    table_name,
+                    err,
+                });
+                return;
+            };
+        }
+        self.reportStoreStatus() catch |err| switch (err) {
+            error.FileNotFound,
+            error.UnknownGroup,
+            error.LmdbUnexpected,
+            error.Corrupted,
+            => {},
+            else => std.log.warn("failed to report store status after structural change table={s} err={}", .{
+                table_name,
+                err,
+            }),
+        };
+    }
+
     fn markLocalGroupDataChanged(self: *DataServer) void {
-        _ = self;
         // Data writes can be high-frequency during ingest. Keep serving the
         // cached group-status snapshot until its TTL expires; structural
-        // changes still invalidate immediately.
+        // changes still invalidate immediately. Runtime index status is
+        // already cached by the writer, so mark the store report dirty without
+        // forcing a local group-status refresh. The next runtime round should
+        // publish promptly; otherwise slow debug builds can sit behind the
+        // periodic tick gate even though fresh writer status is available.
+        self.markStoreStatusDirtyImmediate();
+    }
+
+    fn markStoreStatusDirtyImmediate(self: *DataServer) void {
+        self.store_status_dirty = true;
+        self.store_status_ticks = store_status_report_interval_ticks;
+    }
+
+    fn observeDataRaftStatusFingerprint(self: *DataServer, fingerprint: u64) void {
+        if (self.last_data_raft_status_fingerprint != null and
+            self.last_data_raft_status_fingerprint.? == fingerprint)
+        {
+            return;
+        }
+        self.last_data_raft_status_fingerprint = fingerprint;
+        self.markStoreStatusDirtyImmediate();
     }
 
     fn markRuntimeStatusDirty(
@@ -2880,7 +3974,9 @@ pub const DataServer = struct {
     ) void {
         _ = table_name;
         self.runtime_status_dirty.store(true, .release);
-        if (kind == .data) self.provisioned_startup_catch_up_dirty.store(true, .release);
+        switch (kind) {
+            .data, .structural => self.provisioned_startup_catch_up_dirty.store(true, .release),
+        }
     }
 
     fn markLocalSplitKeyCacheDirty(self: *DataServer) void {
@@ -3257,17 +4353,43 @@ pub const DataServer = struct {
         return db.core.identity_namespace;
     }
 
+    fn tableNameForLocalGroupAlloc(self: *DataServer, group_id: u64) !?[]u8 {
+        var snapshot = try self.write_source.catalog.adminSnapshot();
+        defer self.write_source.catalog.freeAdminSnapshot(&snapshot);
+        const range = findRangeByGroupId(snapshot.ranges, group_id) orelse return null;
+        const table = findTableById(snapshot.tables, range.table_id) orelse return null;
+        return try self.alloc.dupe(u8, table.name);
+    }
+
     fn ensureSplitSourceApplyStoreSeeded(self: *DataServer, source_root_dir: []const u8, source_group_id: u64) !void {
         var source_store = try antfly.data.RaftApplyStore.init(self.alloc, .{ .root_dir = source_root_dir });
         defer source_store.deinit();
         if ((try source_store.latestBatch(source_group_id)) != null) return;
+
+        if (try self.tableNameForLocalGroupAlloc(source_group_id)) |table_name| {
+            defer self.alloc.free(table_name);
+            if (try self.liveRuntimeWriteSource().leaseCachedGroupWriter(self.alloc, source_group_id, table_name)) |cached_db| {
+                var cached = cached_db;
+                defer cached.deinit(self.alloc);
+                try self.seedSplitSourceApplyStoreFromDb(&source_store, source_group_id, cached.db);
+                return;
+            }
+        }
 
         var db = antfly.db.DB.open(self.alloc, source_root_dir, .{}) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
         defer db.close();
+        try self.seedSplitSourceApplyStoreFromDb(&source_store, source_group_id, &db);
+    }
 
+    fn seedSplitSourceApplyStoreFromDb(
+        self: *DataServer,
+        source_store: *antfly.data.RaftApplyStore,
+        source_group_id: u64,
+        db: *antfly.db.DB,
+    ) !void {
         var ops = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (ops.items) |op| self.alloc.free(op);
@@ -3387,7 +4509,7 @@ pub const DataServer = struct {
             uri
         else
             "";
-        try remote_metadata.registerNode(.{
+        const record: antfly.metadata.table_manager.StoreRecord = .{
             .store_id = registration.store_id,
             .node_id = registration.node_id,
             .api_url = api_url,
@@ -3396,8 +4518,13 @@ pub const DataServer = struct {
             .health_class = "healthy",
             .failure_domain = registration.failure_domain,
             .live = true,
-        });
+        };
+        try remote_metadata.registerNode(record);
+        var snapshot = try remote_metadata.fetchSnapshot();
+        defer freeAdminSnapshotOwned(self.alloc, &snapshot);
+        if (!storeRegistrationVisible(snapshot.stores, record)) return error.StoreRegistrationNotVisible;
         self.store_registration_confirmed = true;
+        self.clearMetadataBootstrapRetry();
         // Startup should not block on reopening every local group DB just to
         // compute an initial best-effort status report. Mark the store dirty
         // and let the main run loop publish status once listeners are up.
@@ -3671,7 +4798,9 @@ pub const DataServer = struct {
                         continue;
                     }
 
-                    switch (self.probeManagedWriterGroupBestEffort(table.name, group_id)) {
+                    var writer_probe = self.probeManagedWriterGroupBestEffort(table.name, group_id);
+                    defer writer_probe.deinit();
+                    switch (writer_probe) {
                         .leased => {
                             if (try self.snapshotCachedLocalGroupStatusReport(alloc, group_id, generation, fingerprint, true)) |cached| {
                                 try reports.append(alloc, cached);
@@ -3929,6 +5058,7 @@ pub const DataServer = struct {
         try self.storeStatusHeartbeatCacheReplace(report);
         self.store_status_dirty = false;
         self.last_store_status_report_at_ms = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        self.clearMetadataBootstrapRetry();
     }
 
     fn syncDataRaftFromRemoteMetadata(self: *DataServer) !void {
@@ -3956,18 +5086,16 @@ pub const DataServer = struct {
                 snapshot.placement_intents,
                 intent.record.group_id,
             );
-            try local_intents.append(self.alloc, .{
-                .record = intent.record,
-                .store_id = intent.store_id,
-                .peer_node_ids = peer_node_ids,
-            });
+            var local_intent = intent;
+            local_intent.peer_node_ids = peer_node_ids;
+            try local_intents.append(self.alloc, local_intent);
         }
         const placement_fingerprint = dataRaftPlacementIntentsFingerprint(local_intents.items);
         const placement_changed = self.last_data_raft_placement_fingerprint == null or self.last_data_raft_placement_fingerprint.? != placement_fingerprint;
         if (placement_changed) {
             self.last_data_raft_placement_fingerprint = placement_fingerprint;
             self.invalidateLocalGroupStatusCache();
-            self.store_status_dirty = true;
+            self.markStoreStatusDirtyImmediate();
         }
 
         var updates = std.ArrayListUnmanaged(antfly.raft.MetadataUpdate).empty;
@@ -4008,9 +5136,21 @@ pub const DataServer = struct {
         if (updates.items.len > 0) try raft.host.applyBatch(updates.items);
         var campaigned = false;
         for (local_intents.items) |intent| {
-            if (!localIntentPreferredCampaigner(intent, registration.node_id)) continue;
             const status = raft.host.http_host.host.raftStatus(intent.record.group_id);
-            if (status == null or status.?.soft.leader_id != null or !localRaftStatusIsVoter(status, registration.node_id)) continue;
+            if (drainingLeaderShouldHandoff(snapshot.placement_intents, status, intent, registration.node_id)) {
+                raft.host.http_host.campaignGroup(intent.record.group_id) catch |err| {
+                    std.log.warn("data raft draining leader handoff campaign failed group_id={} node_id={} err={}", .{
+                        intent.record.group_id,
+                        registration.node_id,
+                        err,
+                    });
+                    continue;
+                };
+                campaigned = true;
+                continue;
+            }
+            if (!localIntentPreferredCampaigner(intent, registration.node_id)) continue;
+            if (!localRaftStatusShouldBootstrapCampaign(status, registration.node_id)) continue;
             raft.host.http_host.campaignGroup(intent.record.group_id) catch |err| {
                 std.log.warn("data raft bootstrap campaign failed group_id={} node_id={} err={}", .{
                     intent.record.group_id,
@@ -4026,6 +5166,8 @@ pub const DataServer = struct {
                 std.log.warn("data raft bootstrap campaign drive failed node_id={} err={}", .{ registration.node_id, err });
             };
         }
+
+        self.observeDataRaftStatusFingerprint(dataRaftLocalStatusFingerprint(raft, local_intents.items));
     }
 
     fn reportStoreStatusHeartbeat(self: *DataServer) !void {
@@ -4035,6 +5177,7 @@ pub const DataServer = struct {
         defer freeStoreStatusReportOwned(self.alloc, &report);
         try remote_metadata.reportNodeStatus(report);
         self.last_store_status_report_at_ms = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        self.clearMetadataBootstrapRetry();
     }
 
     fn cloneHeartbeatStoreStatusReport(
@@ -4572,7 +5715,15 @@ pub const DataServer = struct {
                     };
                     defer self.clearProvisionedStartupCatchUpTarget();
 
-                    break :result_blk antfly.public_api.ProvisionedTableWriteSource.catchUpTableGroupBestEffortWithIndexesJson(&self.write_source, self.alloc, group_id, table.name, table.indexes_json) catch |err| {
+                    break :result_blk antfly.public_api.ProvisionedTableWriteSource.catchUpTableGroupBestEffortWithMetadata(&self.write_source, self.alloc, group_id, table.name, .{
+                        .indexes_json = table.indexes_json,
+                        .schema_json = table.schema_json,
+                        .identity_namespace = .{
+                            .table_id = table.table_id,
+                            .shard_id = antfly.metadata.table_manager.rangeDocIdentityShardId(range),
+                            .range_id = antfly.metadata.table_manager.rangeDocIdentityRangeId(range),
+                        },
+                    }) catch |err| {
                         _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
                         std.log.warn("provisioned startup catch-up failed group={} table={s} err={}", .{ group_id, table.name, err });
                         stats.debt_remaining = true;
@@ -4582,11 +5733,24 @@ pub const DataServer = struct {
                 stats.group_count += 1;
                 if (result.busy) {
                     stats.busy_groups += 1;
-                    stats.debt_remaining = true;
+                    if (self.runtime_status_dirty.load(.acquire) or self.runtime_status_refresh_active.load(.acquire)) {
+                        stats.debt_remaining = true;
+                        continue;
+                    }
+                    const cached_debt: ?bool = self.cachedRuntimeStatusHasStartupCatchUpDebt(table.name, group_id) catch true;
+                    if (cached_debt orelse true) {
+                        stats.debt_remaining = true;
+                    }
                     continue;
                 }
                 if (!result.had_debt) continue;
                 stats.groups_with_debt += 1;
+                if (result.terminal_degraded) {
+                    std.log.warn("provisioned startup catch-up found terminal degraded state group={} table={s}", .{ group_id, table.name });
+                    self.runtime_status_dirty.store(true, .release);
+                    self.store_status_dirty = true;
+                    continue;
+                }
                 if (result.cleared_debt) {
                     stats.groups_cleared += 1;
                 } else {
@@ -4852,7 +6016,7 @@ pub const DataServer = struct {
         _ = self.auto_bulk_finish_started.fetchAdd(1, .monotonic);
         defer self.auto_bulk_finish_last_duration_ns.store(platform_time.monotonicNs() - started_ns, .monotonic);
 
-        const finished = self.write_source.tryFinishExpiredAutoBulkIngestAndPublishStatus(self.alloc) orelse {
+        const finished = self.liveRuntimeWriteSource().tryFinishExpiredAutoBulkIngestAndPublishStatus(self.alloc) orelse {
             _ = self.auto_bulk_finish_lock_deferred.fetchAdd(1, .monotonic);
             _ = self.auto_bulk_finish_completed.fetchAdd(1, .monotonic);
             return;
@@ -4973,6 +6137,13 @@ pub const DataServer = struct {
             }
         }
         return false;
+    }
+
+    fn cachedRuntimeStatusHasStartupCatchUpDebt(self: *DataServer, table_name: []const u8, group_id: u64) !?bool {
+        const status = try self.provisioned_storage.runtime_status_cache.snapshotGroupStatus(self.alloc, table_name, group_id);
+        var owned = status orelse return null;
+        defer owned.deinit(self.alloc);
+        return runtimeStatusStartupCatchUpDebtPresent((&[_]runtime_status.LocalTableRuntimeStatus{owned})[0..]);
     }
 
     fn setProvisionedStartupCatchUpTarget(self: *DataServer, group_id: u64, table_name: []const u8) !void {
@@ -5465,11 +6636,15 @@ pub const DataServer = struct {
         defer self.provisioned_root_refresh_last_duration_ns.store(platform_time.monotonicNs() - started_ns, .monotonic);
 
         self.refreshProvisionedReplicaRoot() catch |err| {
-            self.provisioned_root_refresh_dirty.store(true, .release);
+            const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+            self.recordProvisionedRootRefreshMetadataError(err, now_ms) catch {
+                self.provisioned_root_refresh_dirty.store(true, .release);
+            };
             _ = self.provisioned_root_refresh_failed.fetchAdd(1, .monotonic);
             std.log.warn("provisioned replica-root refresh failed err={}", .{err});
             return;
         };
+        self.clearMetadataBootstrapRetry();
         _ = self.provisioned_root_refresh_completed.fetchAdd(1, .monotonic);
     }
 
@@ -5491,10 +6666,12 @@ pub const DataServer = struct {
             local_group_ids = fallback_group_ids;
         }
         defer self.alloc.free(local_group_ids);
+        const refresh_write_source = self.liveRuntimeWriteSource();
         self.provisioned_storage.pruneGroupVisibleRootGenerations(local_group_ids);
         if (local_group_ids.len == 0) {
             self.provisioned_storage.read_cache.clear();
-            self.write_source.clearWriteCache();
+            refresh_write_source.clearWriteCache();
+            if (refresh_write_source != &self.write_source) self.write_source.clearWriteCache();
             self.last_provision_fingerprint = null;
             self.last_provision_metadata_epoch = head.metadata_epoch;
             self.invalidateLocalGroupStatusCache();
@@ -5514,30 +6691,50 @@ pub const DataServer = struct {
         }
 
         const fingerprint = blk: {
-            lockAtomic(self.write_source.localDbMutex());
-            defer self.write_source.localDbMutex().unlock();
+            const next_fingerprint = blk_fingerprint: {
+                lockAtomic(refresh_write_source.localDbMutex());
+                defer refresh_write_source.localDbMutex().unlock();
 
-            try self.reportLocalSchemaProgress(head.metadata_group_id, registration.node_id, local_group_ids, snapshot.tables, snapshot.ranges);
+                try self.reportLocalSchemaProgress(head.metadata_group_id, registration.node_id, local_group_ids, snapshot.tables, snapshot.ranges);
 
-            const next_fingerprint = antfly.metadata.table_provisioner.provisioningFingerprint(
-                head.metadata_group_id,
-                local_group_ids,
-                snapshot.tables,
-                snapshot.ranges,
-            );
+                break :blk_fingerprint antfly.metadata.table_provisioner.provisioningFingerprint(
+                    head.metadata_group_id,
+                    local_group_ids,
+                    snapshot.tables,
+                    snapshot.ranges,
+                );
+            };
             if (self.last_provision_fingerprint == next_fingerprint) {
                 self.last_provision_metadata_epoch = head.metadata_epoch;
                 return;
             }
-            _ = try self.write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
-                self.alloc,
-                head.metadata_group_id,
-                local_group_ids,
-                snapshot.tables,
-                snapshot.ranges,
-                try self.ensureBackendRuntime(),
-            );
-            try self.provisioned_storage.bumpGroupVisibleRootGenerations(local_group_ids);
+
+            const backend_runtime = try self.ensureBackendRuntime();
+            for (local_group_ids) |group_id| {
+                if (group_id == head.metadata_group_id) continue;
+                const range = findRangeByGroupId(snapshot.ranges, group_id) orelse continue;
+                const table = findTableById(snapshot.tables, range.table_id) orelse continue;
+
+                {
+                    var activity = refresh_write_source.beginGroupRefreshActivity(table.name, group_id);
+                    defer activity.deinit();
+
+                    var group_ids_one = [_]u64{group_id};
+                    {
+                        lockAtomic(refresh_write_source.localDbMutex());
+                        defer refresh_write_source.localDbMutex().unlock();
+                        _ = try refresh_write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
+                            self.alloc,
+                            head.metadata_group_id,
+                            group_ids_one[0..],
+                            snapshot.tables,
+                            snapshot.ranges,
+                            backend_runtime,
+                        );
+                    }
+                    try self.provisioned_storage.bumpGroupVisibleRootGenerations(group_ids_one[0..]);
+                }
+            }
             self.provisioned_storage.read_cache.clear();
             break :blk next_fingerprint;
         };
@@ -5694,10 +6891,7 @@ pub const DataServer = struct {
                             .replica_catalog_path = cfg.replica_catalog_path,
                             .replica_state_backend = cfg.data_raft_state_backend,
                         },
-                        .listener = .{
-                            .bind_host = cfg.raft_bind_host,
-                            .bind_port = cfg.raft_bind_port,
-                        },
+                        .listener = antfly.raft.httpListenerConfig(cfg.raft_bind_host, cfg.raft_bind_port),
                         .transport = .{
                             .snapshot = .{
                                 .root_dir = cfg.snapshot_root_dir orelse cfg.replica_root_dir,
@@ -5743,6 +6937,7 @@ pub const DataServer = struct {
             ),
             .status_source = remote_metadata.statusSource(),
             .api_server_cfg = cfg.api_server_cfg,
+            .ha_cfg = cfg.ha,
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = backend_runtime,
             .owned_backend_runtime = owned_backend_runtime,
@@ -5759,6 +6954,14 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
     // waiter — on CPU-constrained hosts (CI runners) that starves the very
     // threads that would release the lock.
     platform_sync.lockYielding(mutex);
+}
+
+fn haContextPrimaryIsFenced(ctx: antfly.ha.admin_exec.Context) bool {
+    const primary = ctx.primary orelse return false;
+    const fence_store = ctx.fence_store orelse return false;
+    const node_id = ctx.primary_node_id orelse return false;
+    const receipt = fence_store.currentBorrowed() orelse return false;
+    return antfly.ha.write_gate.primaryFencedByReceipt(primary.identity, node_id, receipt);
 }
 
 fn appendUniqueNodeId(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(u64), node_id: u64) !void {
@@ -5820,6 +7023,10 @@ fn appendOwnedPeerRouteUpsert(
 }
 
 const RemoteMetadataSource = struct {
+    const TestFaults = if (@import("builtin").is_test) struct {
+        fetch_head_error: ?anyerror = null,
+    } else struct {};
+
     alloc: std.mem.Allocator,
     base_uris: [][]u8,
     preferred_base_uri_index: usize = 0,
@@ -5828,6 +7035,7 @@ const RemoteMetadataSource = struct {
     cached_head_at_ms: u64 = 0,
     cached_snapshot: ?antfly.metadata_api.AdminSnapshot = null,
     cached_snapshot_at_ms: u64 = 0,
+    test_faults: TestFaults = .{},
 
     fn init(alloc: std.mem.Allocator, base_uris: []const []const u8) !RemoteMetadataSource {
         if (base_uris.len == 0) return error.MissingMetadataApi;
@@ -5870,6 +7078,9 @@ const RemoteMetadataSource = struct {
     }
 
     fn fetchHead(self: *RemoteMetadataSource) !antfly.metadata_api.MetadataHead {
+        if (@import("builtin").is_test) {
+            if (self.test_faults.fetch_head_error) |err| return err;
+        }
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         lockAtomic(&self.cache_mutex);
         if (self.cached_head) |head| {
@@ -5985,6 +7196,8 @@ const RemoteMetadataSource = struct {
                 .update_schema = remoteUpdateSchema,
                 .create_index = remoteCreateIndex,
                 .drop_index = remoteDropIndex,
+                .put_artifact_enrichment = remotePutArtifactEnrichment,
+                .delete_artifact_enrichment = remoteDeleteArtifactEnrichment,
                 .wait_table_lifecycle = remoteWaitTableLifecycle,
                 .wait_table_projection = remoteWaitTableProjection,
                 .install_extension = remoteInstallExtension,
@@ -6162,6 +7375,26 @@ const RemoteMetadataSource = struct {
                 try client.dropIndex(base_uri, ctx.table_name, ctx.index_name);
             }
         }.call, .{ .table_name = table_name, .index_name = index_name });
+        self.invalidateCache();
+    }
+
+    fn remotePutArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) !void {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        try self.withMetadataApiClient(void, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !void {
+                try client.putArtifactEnrichment(base_uri, ctx.table_name, ctx.artifact_name, ctx.enrichment_json);
+            }
+        }.call, .{ .table_name = table_name, .artifact_name = artifact_name, .enrichment_json = enrichment_json });
+        self.invalidateCache();
+    }
+
+    fn remoteDeleteArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) !void {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        try self.withMetadataApiClient(void, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !void {
+                try client.deleteArtifactEnrichment(base_uri, ctx.table_name, ctx.artifact_name);
+            }
+        }.call, .{ .table_name = table_name, .artifact_name = artifact_name });
         self.invalidateCache();
     }
 
@@ -6807,6 +8040,21 @@ fn hasSingleRoleStore(
     return matching_store_id != null and matching_store_id.? == store_id;
 }
 
+fn storeRegistrationVisible(
+    stores: []const antfly.metadata.table_manager.StoreRecord,
+    record: antfly.metadata.table_manager.StoreRecord,
+) bool {
+    for (stores) |store| {
+        if (store.store_id != record.store_id) continue;
+        if (store.node_id != record.node_id) continue;
+        if (!std.mem.eql(u8, store.role, record.role)) continue;
+        if (!std.mem.eql(u8, store.api_url, record.api_url)) continue;
+        if (!std.mem.eql(u8, store.raft_url, record.raft_url)) continue;
+        return true;
+    }
+    return false;
+}
+
 fn findRangeByGroupId(
     ranges: []const antfly.metadata.table_manager.RangeRecord,
     group_id: u64,
@@ -6833,6 +8081,34 @@ fn findTableById(
         if (table.table_id == table_id) return table;
     }
     return null;
+}
+
+const HAReplicationRecordRoute = struct {
+    group_id: u64,
+    table_name: []const u8,
+};
+
+fn resolveHAReplicationRecordRoute(
+    snapshot: *const antfly.metadata_api.AdminSnapshot,
+    record: antfly.ha.replication_record.RecordView,
+) !HAReplicationRecordRoute {
+    if (record.table_id == 0) return error.HAReplicationRecordMissingTableId;
+    if (record.shard_id == 0) return error.HAReplicationRecordMissingShardId;
+    const table = findTableById(snapshot.tables, record.table_id) orelse return error.HAReplicationRecordUnknownTable;
+
+    if (findRangeByGroupId(snapshot.ranges, record.shard_id)) |range| {
+        if (range.table_id == record.table_id) {
+            return .{ .group_id = range.group_id, .table_name = table.name };
+        }
+    }
+
+    for (snapshot.ranges) |range| {
+        if (range.table_id != record.table_id) continue;
+        if (antfly.metadata.table_manager.rangeDocIdentityShardId(range) != record.shard_id) continue;
+        return .{ .group_id = range.group_id, .table_name = table.name };
+    }
+
+    return error.HAReplicationRecordUnknownShard;
 }
 
 fn collectLocalGroupStatuses(
@@ -7293,6 +8569,53 @@ fn localIntentPreferredCampaigner(intent: antfly.raft.PlacementIntent, local_nod
     return local_node_id == min_node_id;
 }
 
+fn drainingLeaderShouldHandoff(
+    placement_intents: []const antfly.raft.PlacementIntent,
+    status: ?raft_engine.core.Status,
+    local_intent: antfly.raft.PlacementIntent,
+    local_node_id: u64,
+) bool {
+    if (local_intent.serving_state != .serving) return false;
+    const raft_status = status orelse return false;
+    const leader_node_id = raft_status.soft.leader_id orelse return false;
+    if (leader_node_id == local_node_id) return false;
+    if (!DataServer.localRaftStatusIsVoter(raft_status, local_node_id)) return false;
+    if (!groupLeaderPlacementIsDraining(placement_intents, local_intent.record.group_id, leader_node_id)) return false;
+    return localNodePreferredServingPeer(placement_intents, local_intent.record.group_id, local_node_id);
+}
+
+fn groupLeaderPlacementIsDraining(
+    placement_intents: []const antfly.raft.PlacementIntent,
+    group_id: u64,
+    leader_node_id: u64,
+) bool {
+    for (placement_intents) |intent| {
+        if (intent.record.group_id == group_id and
+            intent.record.local_node_id == leader_node_id and
+            intent.serving_state == .draining)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn localNodePreferredServingPeer(
+    placement_intents: []const antfly.raft.PlacementIntent,
+    group_id: u64,
+    local_node_id: u64,
+) bool {
+    var min_node_id: ?u64 = null;
+    for (placement_intents) |intent| {
+        if (intent.record.group_id != group_id) continue;
+        if (intent.serving_state != .serving) continue;
+        if (min_node_id == null or intent.record.local_node_id < min_node_id.?) {
+            min_node_id = intent.record.local_node_id;
+        }
+    }
+    return min_node_id != null and min_node_id.? == local_node_id;
+}
+
 fn dataRaftPlacementIntentsFingerprint(intents: []const antfly.raft.PlacementIntent) u64 {
     var hasher = std.hash.Wyhash.init(0x48f9_2026_da7a_4a17);
     hashU64(&hasher, intents.len);
@@ -7305,6 +8628,35 @@ fn dataRaftPlacementIntentsFingerprint(intents: []const antfly.raft.PlacementInt
         hashU64(&hasher, intent.store_id);
         hashU64(&hasher, intent.peer_node_ids.len);
         for (intent.peer_node_ids) |peer_node_id| hashU64(&hasher, peer_node_id);
+    }
+    return hasher.final();
+}
+
+fn dataRaftLocalStatusFingerprint(
+    raft: *antfly.raft.ManagedHttpHostService,
+    intents: []const antfly.raft.PlacementIntent,
+) u64 {
+    var hasher = std.hash.Wyhash.init(0x4d2c_e31a_7f8b_2026);
+    hashU64(&hasher, intents.len);
+    for (intents) |intent| {
+        hashU64(&hasher, intent.record.group_id);
+        const status = raft.host.http_host.host.raftStatus(intent.record.group_id) orelse {
+            hashU64(&hasher, 0);
+            continue;
+        };
+        hashU64(&hasher, 1);
+        hashU64(&hasher, status.id);
+        hashU64(&hasher, @intFromEnum(status.soft.role));
+        if (status.soft.leader_id) |leader_id| {
+            hashU64(&hasher, 1);
+            hashU64(&hasher, leader_id);
+        } else {
+            hashU64(&hasher, 0);
+        }
+        hashU64(&hasher, status.conf_state.voters.len);
+        for (status.conf_state.voters) |node_id| hashU64(&hasher, node_id);
+        hashU64(&hasher, status.conf_state.voters_outgoing.len);
+        for (status.conf_state.voters_outgoing) |node_id| hashU64(&hasher, node_id);
     }
     return hasher.final();
 }
@@ -7698,10 +9050,8 @@ pub fn runFromIterator(
     var secret_store_initialized = false;
     defer if (secret_store_initialized) secret_store.deinit();
 
-    if (cli.secret_store_path) |raw_secret_store_path| {
-        const normalized_secret_store_path = try normalizeResolvedPathAlloc(alloc, raw_secret_store_path);
-        defer alloc.free(normalized_secret_store_path);
-        secret_store = try antfly.common.secrets.FileStore.init(alloc, normalized_secret_store_path);
+    if (cli.secret_store_paths.items.len > 0) {
+        secret_store = try initLayeredSecretStore(alloc, cli.secret_store_paths.items);
         secret_store_initialized = true;
     }
 
@@ -7797,10 +9147,15 @@ pub fn runFromIterator(
             .auth_enabled = effective_auth_enabled,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
+            .ard_base_url = cli.ard_base_url,
+            .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
+            .ard_display_name = cli.ard_display_name orelse "Antfly",
+            .ard_public_catalog_enabled = cli.ard_public_catalog_enabled,
             .user_manager = if (user_manager) |*manager| manager else null,
             .secret_store = if (secret_store_initialized) &secret_store else null,
             .remote_content = if (loaded_config) |*cfg| if (cfg.remote_content) |*remote_content| remote_content else null else null,
             .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
+            .extension_package_store_dir = resolved.extension_package_store_dir,
             .node_config = if (loaded_config) |*cfg| cfg else null,
         },
     }, metadata_api_urls.urls);
@@ -7895,6 +9250,27 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.auth_enabled = parseBoolFlag(arg["--auth=".len..]) orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--ard-publisher-domain")) {
+            cfg.ard_publisher_domain = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ard-base-url")) {
+            cfg.ard_base_url = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ard-display-name")) {
+            cfg.ard_display_name = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ard-public-catalog")) {
+            const value = args.next() orelse return error.InvalidArguments;
+            cfg.ard_public_catalog_enabled = parseBoolFlag(value) orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--ard-public-catalog=")) {
+            cfg.ard_public_catalog_enabled = parseBoolFlag(arg["--ard-public-catalog=".len..]) orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--metadata-api")) {
             try cfg.metadata_apis.append(alloc, args.next() orelse return error.InvalidArguments);
             continue;
@@ -7935,13 +9311,34 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.snapshot_root_dir = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--extension-package-store")) {
+            cfg.extension_package_store_dir = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--secret-store-path")) {
-            cfg.secret_store_path = args.next() orelse return error.InvalidArguments;
+            try cfg.secret_store_paths.append(alloc, args.next() orelse return error.InvalidArguments);
             continue;
         }
         return error.InvalidArguments;
     }
     return cfg;
+}
+
+fn initLayeredSecretStore(
+    alloc: std.mem.Allocator,
+    raw_paths: []const []const u8,
+) !antfly.common.secrets.FileStore {
+    var normalized_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (normalized_paths.items) |path| alloc.free(path);
+        normalized_paths.deinit(alloc);
+    }
+    for (raw_paths) |raw_path| {
+        const normalized_path = try normalizeResolvedPathAlloc(alloc, raw_path);
+        errdefer alloc.free(normalized_path);
+        try normalized_paths.append(alloc, normalized_path);
+    }
+    return try antfly.common.secrets.FileStore.initLayered(alloc, normalized_paths.items);
 }
 
 fn resolveLocalBaseDir(
@@ -7962,6 +9359,8 @@ fn resolvePaths(
     defer alloc.free(local_base);
     const metadata_base = try std.fmt.allocPrint(alloc, "{s}/metadata", .{local_base});
     defer alloc.free(metadata_base);
+    const extension_package_store_dir = try resolveExtensionPackageStoreDir(alloc, cli.extension_package_store_dir, local_base);
+    errdefer alloc.free(extension_package_store_dir);
 
     if (cli.replica_root_dir != null and cli.replica_catalog_path != null) {
         const base = try std.fmt.allocPrint(alloc, "{s}/data", .{local_base});
@@ -7989,6 +9388,7 @@ fn resolvePaths(
             .replica_catalog_path = replica_catalog_path,
             .snapshot_root_dir = snapshot_root_dir,
             .auth_store_root_dir = auth_store_root_dir,
+            .extension_package_store_dir = extension_package_store_dir,
         };
     }
 
@@ -8029,6 +9429,7 @@ fn resolvePaths(
         .replica_catalog_path = replica_catalog_path,
         .snapshot_root_dir = snapshot_root_dir,
         .auth_store_root_dir = auth_store_root_dir,
+        .extension_package_store_dir = extension_package_store_dir,
     };
 }
 
@@ -8037,6 +9438,39 @@ fn ensureDirAndParent(io: std.Io, replica_root_dir: []const u8, replica_catalog_
     if (std.fs.path.dirname(replica_catalog_path)) |parent| {
         try fs_paths.createDirPathPortable(io, parent);
     }
+}
+
+fn resolveExtensionPackageStoreDir(
+    alloc: std.mem.Allocator,
+    cli_path: ?[]const u8,
+    local_base: []const u8,
+) ![]u8 {
+    const env_var_z = try alloc.dupeZ(u8, antfly.extensions.wasmtime_runtime.package_store_env);
+    defer alloc.free(env_var_z);
+    return try resolveExtensionPackageStoreDirWithEnv(
+        alloc,
+        cli_path,
+        local_base,
+        platform.env.getenvSlice(env_var_z),
+    );
+}
+
+fn resolveExtensionPackageStoreDirWithEnv(
+    alloc: std.mem.Allocator,
+    cli_path: ?[]const u8,
+    local_base: []const u8,
+    env_path: ?[]const u8,
+) ![]u8 {
+    if (cli_path) |path| return try normalizeResolvedPathAlloc(alloc, path);
+    if (env_path) |path| {
+        if (std.mem.trim(u8, path, " \t\r\n").len > 0) {
+            return try normalizeResolvedPathAlloc(alloc, path);
+        }
+    }
+
+    const raw = try std.fmt.allocPrint(alloc, "{s}/extensions", .{local_base});
+    defer alloc.free(raw);
+    return try normalizeResolvedPathAlloc(alloc, raw);
 }
 
 fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -8052,14 +9486,13 @@ fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 
             else => return err,
         };
         if (resolved_z) |resolved| {
+            defer alloc.free(resolved);
             const resolved_prefix = resolved[0..resolved.len];
-            if (probe.len == path.len) return resolved_prefix;
+            if (probe.len == path.len) return try alloc.dupe(u8, resolved_prefix);
 
             const suffix_start: usize = if (probe.len == 1) 1 else probe.len + 1;
             const suffix = path[suffix_start..];
-            const joined = try std.fs.path.join(alloc, &.{ resolved_prefix, suffix });
-            alloc.free(resolved_prefix);
-            return joined;
+            return try std.fs.path.join(alloc, &.{ resolved_prefix, suffix });
         }
 
         const parent = std.fs.path.dirname(probe) orelse return try alloc.dupe(u8, path);
@@ -8160,6 +9593,10 @@ fn printUsage(argv0: []const u8) void {
         \\  --health <true|false>          Enable health/metrics server (default: true)
         \\  --health-port <port>           Dedicated health/metrics bind port (default: 4200)
         \\  --auth <true|false>            Enable auth middleware and local user store
+        \\  --ard-base-url <url>           Absolute public base URL for ARD catalog artifact links
+        \\  --ard-publisher-domain <name>  ARD did:web publisher domain (default: antfly.local)
+        \\  --ard-display-name <name>      ARD catalog host display name (default: Antfly)
+        \\  --ard-public-catalog <bool>    Publish anonymous /.well-known ARD bootstrap when auth is enabled
         \\  --metadata-api <uri>           Metadata orchestration/API URL (repeat for multiple endpoints)
         \\  --node-id <id>                 Register this split data process as metadata node <id>
         \\  --store-id <id>                Register this split data process as metadata store <id>
@@ -8170,7 +9607,8 @@ fn printUsage(argv0: []const u8) void {
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path
         \\  --snapshot-root-dir <path>     Data raft snapshot root directory
-        \\  --secret-store-path <path>     Antfly secrets.json file path
+        \\  --extension-package-store <path> Extension package store directory
+        \\  --secret-store-path <path>     Antfly secrets.json file path; repeat for fallback layers
         \\  -h, --help                     Show this help
         \\
     , .{argv0});
@@ -8182,6 +9620,97 @@ test "data runtime module compiles" {
     _ = DataServerConfig;
     _ = DataServer;
     _ = GroupLeadershipSource;
+}
+
+test "data raft bootstrap campaign retries leaderless voter elections" {
+    var voters = [_]u64{ 1, 2, 3 };
+    var status = raft_engine.core.Status{
+        .id = 1,
+        .group_id = 7001,
+        .soft = .{ .leader_id = null, .role = .follower },
+        .hard = .{},
+        .conf_state = .{ .voters = voters[0..] },
+    };
+
+    try std.testing.expect(DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .pre_candidate;
+    try std.testing.expect(DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .candidate;
+    try std.testing.expect(!DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .leader;
+    status.soft.leader_id = 1;
+    try std.testing.expect(!DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .follower;
+    status.soft.leader_id = 2;
+    try std.testing.expect(!DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.leader_id = null;
+    try std.testing.expect(!DataServer.localRaftStatusShouldBootstrapCampaign(status, 4));
+}
+
+test "data raft draining leader handoff campaigns preferred serving survivor" {
+    var voters = [_]u64{ 101, 102, 103 };
+    const status = raft_engine.core.Status{
+        .id = 102,
+        .group_id = 7002,
+        .soft = .{ .leader_id = 101, .role = .follower },
+        .hard = .{},
+        .conf_state = .{ .voters = voters[0..] },
+    };
+    const intents = [_]antfly.raft.PlacementIntent{
+        .{ .record = .{ .group_id = 7002, .replica_id = 1, .local_node_id = 101 }, .serving_state = .draining },
+        .{ .record = .{ .group_id = 7002, .replica_id = 2, .local_node_id = 102 }, .serving_state = .serving },
+        .{ .record = .{ .group_id = 7002, .replica_id = 3, .local_node_id = 103 }, .serving_state = .serving },
+    };
+
+    try std.testing.expect(drainingLeaderShouldHandoff(&intents, status, intents[1], 102));
+    try std.testing.expect(!drainingLeaderShouldHandoff(&intents, status, intents[2], 103));
+    try std.testing.expect(!drainingLeaderShouldHandoff(&intents, status, intents[0], 101));
+}
+
+test "data runtime live writer source follows raft apply ownership" {
+    const Catalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    var server: DataServer = undefined;
+    server.data_raft_apply = null;
+    server.write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-antfly-live-writer-source", Catalog.iface());
+    defer server.write_source.deinit();
+
+    try std.testing.expectEqual(&server.write_source, server.liveRuntimeWriteSource());
+
+    var apply_sm = RaftTableApplyStateMachine.init(std.testing.allocator, "/tmp/unused-antfly-live-writer-source", Catalog.iface(), null);
+    defer apply_sm.deinit();
+    server.data_raft_apply = &apply_sm;
+
+    try std.testing.expectEqual(&apply_sm.write_source, server.liveRuntimeWriteSource());
 }
 
 test "data server can register a store without enabling data raft" {
@@ -8250,7 +9779,34 @@ test "data runtime cli accepts secret store path" {
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_path.?);
+    try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_paths.items[0]);
+}
+
+test "data runtime cli accepts extension package store path" {
+    const argv = [_][*:0]const u8{ "--extension-package-store", "/opt/antfly/extensions" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("/opt/antfly/extensions", cfg.extension_package_store_dir.?);
+}
+
+test "data runtime cli accepts ARD identity flags" {
+    const argv = [_][*:0]const u8{
+        "--ard-publisher-domain",
+        "tenant.example.com",
+        "--ard-base-url",
+        "https://tenant.example.com",
+        "--ard-display-name",
+        "Tenant Antfly",
+        "--ard-public-catalog=true",
+    };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("https://tenant.example.com", cfg.ard_base_url.?);
+    try std.testing.expectEqualStrings("tenant.example.com", cfg.ard_publisher_domain.?);
+    try std.testing.expectEqualStrings("Tenant Antfly", cfg.ard_display_name.?);
+    try std.testing.expect(cfg.ard_public_catalog_enabled);
 }
 
 test "data runtime resolves metadata api urls from common config" {
@@ -8293,6 +9849,19 @@ test "data runtime resolves paths from common storage base dir" {
     try std.testing.expectEqualStrings("/tmp/antflydb/data/catalog.txt", resolved.replica_catalog_path);
     try std.testing.expectEqualStrings("/tmp/antflydb/data/snapshots", resolved.snapshot_root_dir);
     try std.testing.expectEqualStrings("/tmp/antflydb/metadata/auth", resolved.auth_store_root_dir);
+    try std.testing.expectEqualStrings("/tmp/antflydb/extensions", resolved.extension_package_store_dir);
+}
+
+test "data runtime resolves extension package store env before local default" {
+    const alloc = std.testing.allocator;
+
+    const env_resolved = try resolveExtensionPackageStoreDirWithEnv(alloc, null, "/tmp/antflydb", "/antfly-extension-env");
+    defer alloc.free(env_resolved);
+    try std.testing.expectEqualStrings("/antfly-extension-env", env_resolved);
+
+    const cli_resolved = try resolveExtensionPackageStoreDirWithEnv(alloc, "/antfly-cli-extensions", "/tmp/antflydb", "/antfly-extension-env");
+    defer alloc.free(cli_resolved);
+    try std.testing.expectEqualStrings("/antfly-cli-extensions", cli_resolved);
 }
 
 test "data runtime parses optional split store registration flags" {
@@ -8438,6 +10007,7 @@ test "data runtime local group status status-only open preserves replay debt" {
         var db = try antfly.db.DB.open(alloc, db_path, .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
+            .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
         });
         defer db.close();
 
@@ -8692,10 +10262,12 @@ test "data runtime local group status provider collects and caches group statuse
 
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provider-cache", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
-    const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
+    const db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 77);
     defer alloc.free(db_path);
 
-    var db = try antfly.db.DB.open(alloc, db_path, .{});
+    var db = try antfly.db.DB.open(alloc, db_path, .{
+        .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
+    });
     defer db.close();
 
     const FakeCatalog = struct {
@@ -8803,8 +10375,10 @@ test "data runtime local group status provider collects and caches group statuse
     try std.testing.expectEqual(@as(usize, 1), second.len);
     const hook = server.localChangeHook();
     server.store_status_dirty = false;
+    server.store_status_ticks = 0;
     hook.on_change(hook.ptr, "docs", .data);
-    try std.testing.expect(!server.store_status_dirty);
+    try std.testing.expect(server.store_status_dirty);
+    try std.testing.expectEqual(store_status_report_interval_ticks, server.store_status_ticks);
     try std.testing.expectEqual(@as(usize, 1), server.local_group_status_cache.group_statuses.len);
 
     server.invalidateLocalGroupStatusCache();
@@ -8816,6 +10390,49 @@ test "data runtime local group status provider collects and caches group statuse
     const empty_cached = (try server.cloneCachedLocalGroupStatuses(alloc, 3, 99)) orelse return error.TestUnexpectedResult;
     defer antfly.metadata.table_manager.freeGroupStatuses(alloc, empty_cached);
     try std.testing.expectEqual(@as(usize, 0), empty_cached.len);
+}
+
+test "data runtime raft status changes force immediate store status publication" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-runtime-raft-status-publication", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root_dir);
+
+    var server: DataServer = .{
+        .alloc = std.testing.allocator,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(std.testing.allocator),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+        ),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    server.store_status_dirty = false;
+    server.store_status_ticks = 0;
+    server.observeDataRaftStatusFingerprint(11);
+    try std.testing.expect(server.store_status_dirty);
+    try std.testing.expectEqual(store_status_report_interval_ticks, server.store_status_ticks);
+
+    server.store_status_dirty = false;
+    server.store_status_ticks = 0;
+    server.observeDataRaftStatusFingerprint(11);
+    try std.testing.expect(!server.store_status_dirty);
+    try std.testing.expectEqual(@as(usize, 0), server.store_status_ticks);
+
+    server.observeDataRaftStatusFingerprint(12);
+    try std.testing.expect(server.store_status_dirty);
+    try std.testing.expectEqual(store_status_report_interval_ticks, server.store_status_ticks);
 }
 
 test "data runtime local split fallback preserves source identity namespace" {
@@ -8947,6 +10564,101 @@ test "data runtime local split fallback preserves source identity namespace" {
     try std.testing.expectEqual(source_namespace.range_id, stats.doc_identity.namespace_range_id);
     try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.allocated_ordinals);
     try std.testing.expect(!stats.doc_identity.rebuild_required);
+}
+
+test "data runtime split apply store seeding reuses cached source writer" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-split-seed-cached-writer", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const source_db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 180);
+    defer alloc.free(source_db_path);
+
+    const source_namespace = doc_identity.Namespace{
+        .table_id = 7,
+        .shard_id = 180,
+        .range_id = 9000,
+    };
+
+    {
+        var db = try antfly.db.DB.open(alloc, source_db_path, .{
+            .identity_namespace = source_namespace,
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try db.updateRange(.{ .start = "doc:a", .end = "doc:z" });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:t", .value = "{\"v\":\"right\"}" }},
+        });
+    }
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 180,
+                    .table_id = 7,
+                    .range_id = 9000,
+                    .start_key = "doc:a",
+                    .end_key = "doc:z",
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    var write_cache = antfly.public_api.table_writes.ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            FakeCatalog.iface(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(replica_root_dir, FakeCatalog.iface()),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    server.write_source.write_cache = &write_cache;
+    defer server.deinit();
+
+    var held = (try server.write_source.leaseCachedGroupWriter(alloc, 180, "docs")) orelse return error.TestUnexpectedResult;
+    defer held.deinit(alloc);
+
+    try server.ensureSplitSourceApplyStoreSeeded(source_db_path, 180);
+
+    var source_store = try antfly.data.RaftApplyStore.init(alloc, .{ .root_dir = source_db_path });
+    defer source_store.deinit();
+    const latest = (try source_store.latestBatch(180)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(latest.entry_count > 0);
 }
 
 test "data runtime local merge fallback derives receiver identity namespace from catalog" {
@@ -9131,7 +10843,7 @@ test "data runtime store status reuses stale cache while refreshing local group 
 
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-store-status-refresh", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
-    const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
+    const db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 77);
     defer alloc.free(db_path);
 
     var db = try antfly.db.DB.open(alloc, db_path, .{});
@@ -9680,12 +11392,16 @@ test "data runtime background runtime snapshot warm populates cold status cache 
     const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
     defer alloc.free(db_path);
 
-    var db = try antfly.db.DB.open(alloc, db_path, .{});
-    defer db.close();
-    try db.batch(.{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
-        .sync_level = .write,
-    });
+    {
+        var db = try antfly.db.DB.open(alloc, db_path, .{
+            .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
+        });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .sync_level = .write,
+        });
+    }
 
     const FakeStatus = struct {
         fn iface() antfly.public_api.http_server.StatusSource {
@@ -9798,7 +11514,7 @@ test "data runtime background runtime snapshot warm populates cold status cache 
     try std.testing.expect(server.runtime_status_refresh_last_duration_ns.load(.monotonic) > 0);
 }
 
-test "data runtime provisioned cache warmup populates only the read cache for local tables" {
+test "data runtime provisioned cache warmup populates runtime status without pinning db caches" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -9806,15 +11522,19 @@ test "data runtime provisioned cache warmup populates only the read cache for lo
 
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provisioned-warmup", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
-    const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
+    const db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 77);
     defer alloc.free(db_path);
 
-    var db = try antfly.db.DB.open(alloc, db_path, .{});
-    defer db.close();
-    try db.batch(.{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
-        .sync_level = .write,
-    });
+    {
+        var db = try antfly.db.DB.open(alloc, db_path, .{
+            .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
+        });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .sync_level = .write,
+        });
+    }
 
     const FakeStatus = struct {
         fn iface() antfly.public_api.http_server.StatusSource {
@@ -9916,9 +11636,7 @@ test "data runtime provisioned cache warmup populates only the read cache for lo
     try server.requestProvisionedCacheWarmup();
 
     try std.testing.expectEqual(@as(usize, 0), server.write_source.cachedWriteDbCount());
-    try std.testing.expectEqual(@as(usize, 1), server.provisioned_storage.read_cache.entries.items.len);
-    try std.testing.expectEqual(@as(u64, 77), server.provisioned_storage.read_cache.entries.items[0].group_id);
-    try std.testing.expectEqualStrings("docs", server.provisioned_storage.read_cache.entries.items[0].table_name);
+    try std.testing.expectEqual(@as(usize, 0), server.provisioned_storage.read_cache.entries.items.len);
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_warmup_started.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_warmup_completed.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_warmup_failed.load(.monotonic));
@@ -9926,7 +11644,7 @@ test "data runtime provisioned cache warmup populates only the read cache for lo
     try std.testing.expect(server.provisioned_warmup_last_duration_ns.load(.monotonic) > 0);
     const warmed_read_cache = server.provisioned_storage.read_cache.cacheStats();
     try std.testing.expectEqual(@as(u64, 0), warmed_read_cache.hit_count);
-    try std.testing.expectEqual(@as(u64, 1), warmed_read_cache.miss_count);
+    try std.testing.expectEqual(@as(u64, 0), warmed_read_cache.miss_count);
     const warmed_write_cache = server.provisioned_storage.write_cache.cacheStats();
     try std.testing.expectEqual(@as(u64, 0), warmed_write_cache.hit_count);
     try std.testing.expectEqual(@as(u64, 0), warmed_write_cache.miss_count);
@@ -9935,14 +11653,16 @@ test "data runtime provisioned cache warmup populates only the read cache for lo
     defer snapshot_statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), snapshot_statuses.items.len);
     try std.testing.expectEqual(@as(u64, 77), snapshot_statuses.items[0].group_id);
-    try std.testing.expectEqual(@as(u64, 1), snapshot_statuses.items[0].stats.doc_count);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.synthetic_config, snapshot_statuses.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.stale, snapshot_statuses.items[0].metadata.freshness);
+    try std.testing.expectEqual(@as(u64, 0), snapshot_statuses.items[0].stats.doc_count);
 
     var warmed_lookup = (try server.read_source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index)).?;
     defer warmed_lookup.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, warmed_lookup.json, "\"alpha\"") != null);
     const post_lookup_read_cache = server.provisioned_storage.read_cache.cacheStats();
-    try std.testing.expectEqual(@as(u64, 1), post_lookup_read_cache.hit_count);
-    try std.testing.expectEqual(@as(u64, 1), post_lookup_read_cache.miss_count);
+    try std.testing.expectEqual(@as(u64, 0), post_lookup_read_cache.hit_count);
+    try std.testing.expectEqual(@as(u64, 0), post_lookup_read_cache.miss_count);
 
     _ = try server.write_source.source().batch(alloc, "docs", .{
         .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
@@ -9950,8 +11670,8 @@ test "data runtime provisioned cache warmup populates only the read cache for lo
         .sync_level = .write,
     });
     const post_batch_write_cache = server.provisioned_storage.write_cache.cacheStats();
-    try std.testing.expectEqual(@as(u64, 1), post_batch_write_cache.hit_count);
-    try std.testing.expectEqual(@as(u64, 1), post_batch_write_cache.miss_count);
+    try std.testing.expectEqual(@as(u64, 0), post_batch_write_cache.hit_count);
+    try std.testing.expect(post_batch_write_cache.miss_count >= 1);
 
     const pre_live_lookup_read_cache = server.provisioned_storage.read_cache.cacheStats();
     var live_lookup = (try server.read_source.source().lookup(alloc, "docs", "doc:b", .{}, .read_index)).?;
@@ -11333,6 +13053,7 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
         var db = try antfly.db.DB.open(alloc, db_path, .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
+            .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
         });
         defer db.close();
 
@@ -11502,7 +13223,7 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
 
     server.provisioned_startup_catch_up_dirty.store(false, .monotonic);
     try server.requestRuntimeStatusRefresh();
-    try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.monotonic));
+    server.provisioned_startup_catch_up_dirty.store(true, .monotonic);
 
     try server.requestProvisionedStartupCatchUp();
 
@@ -11528,6 +13249,323 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
         try std.testing.expectEqual(appended_sequence, stats.indexes[0].replay_applied_sequence);
         try std.testing.expectEqual(appended_sequence, stats.indexes[0].replay_target_sequence);
         try std.testing.expect(!stats.indexes[0].replay_catch_up_required);
+    }
+}
+
+test "data runtime startup catch-up clears dirty bit for terminal degraded index load" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-terminal-startup-load", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
+    defer alloc.free(db_path);
+    const indexes_json = "{\"dv_v1\":{\"type\":\"embeddings\",\"field\":\"embedding\",\"dims\":2}}";
+    const identity_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 77, .range_id = 77 };
+
+    {
+        var db = try antfly.db.DB.open(alloc, db_path, .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+            .identity_namespace = identity_namespace,
+        });
+        defer db.close();
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+        });
+    }
+
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = indexes_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 77,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{.{
+                    .store_id = 19,
+                    .node_id = 9,
+                    .role = "data",
+                    .live = true,
+                    .health_class = "healthy",
+                }})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{.{
+                    .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 9 },
+                    .store_id = 19,
+                    .peer_node_ids = &.{9},
+                }})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FalseLeader = struct {
+        fn iface() GroupLeadershipSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .is_local_leader = isLocalLeader,
+                },
+            };
+        }
+
+        fn isLocalLeader(_: *anyopaque, _: u64) bool {
+            return false;
+        }
+    };
+
+    var server: DataServer = .{
+        .alloc = alloc,
+        .store_registration = .{
+            .node_id = 9,
+            .store_id = 19,
+            .role = "data",
+            .failure_domain = "test",
+        },
+        .group_leadership_source = FalseLeader.iface(),
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            FakeCatalog.iface(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            replica_root_dir,
+            FakeCatalog.iface(),
+        ),
+        .status_source = FakeStatus.iface(),
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+    server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    server.runtime_status_dirty.store(false, .release);
+    server.store_status_dirty = false;
+    server.provisioned_startup_catch_up_dirty.store(true, .release);
+
+    index_manager_mod.test_inject_index_open_error = error.FileNotFound;
+    defer index_manager_mod.test_inject_index_open_error = null;
+
+    _ = server.runProvisionedStartupCatchUp();
+
+    try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_started.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_completed.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), server.provisioned_startup_catch_up_failed.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_last_group_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_last_groups_with_debt.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), server.provisioned_startup_catch_up_last_groups_cleared.load(.monotonic));
+    try std.testing.expect(!server.provisioned_startup_catch_up_dirty.load(.acquire));
+    try std.testing.expect(server.runtime_status_dirty.load(.acquire));
+    try std.testing.expect(server.store_status_dirty);
+
+    var statuses = (try server.provisioned_storage.runtime_status_cache.snapshot(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expect(statuses.items[0].stats.repair_degraded);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items[0].stats.indexes.len);
+    try std.testing.expect(statuses.items[0].stats.indexes[0].repair_degraded);
+    try std.testing.expect(statuses.items[0].stats.indexes[0].load_error != null);
+    try std.testing.expectEqualStrings("FileNotFound", statuses.items[0].stats.indexes[0].load_error.?);
+}
+
+test "data runtime startup catch-up clears no-debt busy writer groups" {
+    const alloc = std.testing.allocator;
+
+    const cases = [_]struct {
+        suffix: []const u8,
+        runtime_status_dirty: bool = false,
+        runtime_status_refresh_active: bool = false,
+        expect_dirty: bool,
+    }{
+        .{ .suffix = "quiescent", .expect_dirty = false },
+        .{ .suffix = "runtime-dirty", .runtime_status_dirty = true, .expect_dirty = true },
+        .{ .suffix = "refresh-active", .runtime_status_refresh_active = true, .expect_dirty = true },
+    };
+
+    for (cases) |tc| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-startup-catch-up-busy-no-debt-{s}", .{ tmp.sub_path, tc.suffix });
+        defer alloc.free(replica_root_dir);
+        const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
+        defer alloc.free(db_path);
+
+        const FakeStatus = struct {
+            fn iface() antfly.public_api.http_server.StatusSource {
+                return .{
+                    .ptr = undefined,
+                    .vtable = &.{
+                        .status = status,
+                        .admin_snapshot = adminSnapshot,
+                        .free_admin_snapshot = freeAdminSnapshot,
+                    },
+                };
+            }
+
+            fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                return .{ .metadata_group_id = 1, .metrics = .{} };
+            }
+
+            fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                return .{
+                    .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                    .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                        .table_id = 7,
+                        .name = "docs",
+                        .placement_role = "data",
+                        .indexes_json = "{\"indexes\":[]}",
+                    }})[0..]),
+                    .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                        .group_id = 77,
+                        .table_id = 7,
+                        .start_key = "",
+                        .end_key = null,
+                    }})[0..]),
+                    .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{.{
+                        .store_id = 19,
+                        .node_id = 9,
+                        .role = "data",
+                        .live = true,
+                        .health_class = "healthy",
+                    }})[0..]),
+                    .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{.{
+                        .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 9 },
+                        .store_id = 19,
+                        .peer_node_ids = &.{9},
+                    }})[0..]),
+                    .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                    .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+                };
+            }
+
+            fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+        };
+
+        const FakeCatalog = struct {
+            fn iface() antfly.public_api.table_catalog.CatalogSource {
+                return .{
+                    .ptr = undefined,
+                    .vtable = &.{
+                        .admin_snapshot = adminSnapshot,
+                        .free_admin_snapshot = freeAdminSnapshot,
+                    },
+                };
+            }
+
+            fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                return try FakeStatus.adminSnapshot(undefined);
+            }
+
+            fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+        };
+
+        var write_cache = antfly.public_api.ProvisionedTableWriteCache.init(alloc);
+        defer write_cache.deinit();
+
+        var server: DataServer = .{
+            .alloc = alloc,
+            .store_registration = .{
+                .node_id = 9,
+                .store_id = 19,
+                .role = "data",
+                .failure_domain = "test",
+            },
+            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+            .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+                replica_root_dir,
+                FakeCatalog.iface(),
+                antfly.raft.read_gate.noopReadableLeaseRequester(),
+            ),
+            .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+                replica_root_dir,
+                FakeCatalog.iface(),
+            ),
+            .status_source = FakeStatus.iface(),
+            .api_server_cfg = undefined,
+            .query_async_limit = .limited(8),
+            .listener_cfg = undefined,
+        };
+        defer server.deinit();
+        server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+        server.write_source.write_cache = &write_cache;
+
+        try write_cache.beginBulkIngestLocked("docs");
+        {
+            lockAtomic(server.write_source.localDbMutex());
+            defer server.write_source.localDbMutex().unlock();
+
+            var cached = try write_cache.getOrOpenLocked(db_path, FakeCatalog.iface(), 77, 0, "docs");
+            defer cached.deinit(alloc);
+            const stats = try cached.db.stats(alloc);
+            defer antfly.db.types.freeDBStats(alloc, stats);
+            try server.provisioned_storage.runtime_status_cache.upsertGroupStatus("docs", .{
+                .group_id = 77,
+                .stats = stats,
+            });
+        }
+
+        server.runtime_status_dirty.store(tc.runtime_status_dirty, .release);
+        server.runtime_status_refresh_active.store(tc.runtime_status_refresh_active, .release);
+        server.provisioned_startup_catch_up_dirty.store(true, .monotonic);
+        _ = server.runProvisionedStartupCatchUp();
+
+        try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_started.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_completed.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_last_group_count.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 0), server.provisioned_startup_catch_up_last_groups_with_debt.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_last_busy_groups.load(.monotonic));
+        try std.testing.expectEqual(tc.expect_dirty, server.provisioned_startup_catch_up_dirty.load(.monotonic));
     }
 }
 
@@ -11950,7 +13988,7 @@ test "data runtime data changes mark provisioned startup catch-up dirty" {
     try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.acquire));
 }
 
-test "data runtime structural changes preserve writer-published runtime status" {
+test "data runtime structural changes preserve writer-published runtime status and schedule catch-up" {
     const alloc = std.testing.allocator;
     var server: DataServer = .{
         .alloc = alloc,
@@ -11974,7 +14012,7 @@ test "data runtime structural changes preserve writer-published runtime status" 
     server.markRuntimeStatusDirty("docs", .structural);
 
     try std.testing.expect(server.runtime_status_dirty.load(.acquire));
-    try std.testing.expect(!server.provisioned_startup_catch_up_dirty.load(.acquire));
+    try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.acquire));
     var statuses = (try server.provisioned_storage.runtime_status_cache.snapshot(alloc, "docs")).?;
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
@@ -12092,7 +14130,7 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
     defer alloc.free(replica_root_dir);
 
     const remote_metadata = try alloc.create(RemoteMetadataSource);
-    const metadata_api_urls = [_][]const u8{"http://127.0.0.1:1"};
+    const metadata_api_urls = [_][]const u8{"http://metadata.test"};
     remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls);
 
     var server: DataServer = .{
@@ -12121,7 +14159,9 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
     };
     defer server.deinit();
 
+    server.store_registration_confirmed = true;
     server.store_status_dirty = false;
+    server.last_store_status_report_at_ms = 1;
     server.runtime_status_dirty.store(false, .release);
     server.provisioned_startup_catch_up_dirty.store(false, .release);
     server.provisioned_root_refresh_dirty.store(true, .release);
@@ -12134,6 +14174,137 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
     try std.testing.expect(server.provisioned_root_refresh_dirty.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_root_refresh_started.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), server.last_provision_head_check_at_ms);
+}
+
+test "data runtime runRound backs off retryable provision metadata failures" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provision-metadata-backoff", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+
+    const remote_metadata = try alloc.create(RemoteMetadataSource);
+    const metadata_api_urls = [_][]const u8{"http://metadata.test"};
+    remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls);
+    remote_metadata.test_faults.fetch_head_error = error.NotLeader;
+
+    var server: DataServer = .{
+        .alloc = alloc,
+        .remote_metadata = remote_metadata,
+        .store_registration = .{
+            .node_id = 9,
+            .store_id = 19,
+            .role = "data",
+            .failure_domain = "test",
+        },
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+        ),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    server.store_registration_confirmed = true;
+    server.store_status_dirty = false;
+    server.last_store_status_report_at_ms = 1;
+    server.runtime_status_dirty.store(false, .release);
+    server.provisioned_startup_catch_up_dirty.store(false, .release);
+    server.provisioned_root_refresh_dirty.store(false, .release);
+    server.provision_ticks = 3;
+
+    try server.runRound();
+
+    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+    try std.testing.expect(server.nextMetadataBootstrapRetryAtMsForTest() != 0);
+    try std.testing.expect(server.provisioned_root_refresh_dirty.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), server.provision_ticks);
+    try std.testing.expect(server.last_provision_head_check_at_ms != 0);
+
+    const next_retry_at_ms = server.nextMetadataBootstrapRetryAtMsForTest();
+    const last_head_check_at_ms = server.last_provision_head_check_at_ms;
+    server.provision_ticks = 3;
+
+    try server.runRound();
+
+    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+    try std.testing.expectEqual(next_retry_at_ms, server.nextMetadataBootstrapRetryAtMsForTest());
+    try std.testing.expectEqual(last_head_check_at_ms, server.last_provision_head_check_at_ms);
+    try std.testing.expectEqual(@as(usize, 3), server.provision_ticks);
+}
+
+test "data runtime provisioned root refresh worker backs off retryable metadata failures" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provision-worker-backoff", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+
+    const remote_metadata = try alloc.create(RemoteMetadataSource);
+    const metadata_api_urls = [_][]const u8{"http://metadata.test"};
+    remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls);
+    remote_metadata.test_faults.fetch_head_error = error.NotLeader;
+
+    var server: DataServer = .{
+        .alloc = alloc,
+        .remote_metadata = remote_metadata,
+        .store_registration = .{
+            .node_id = 9,
+            .store_id = 19,
+            .role = "data",
+            .failure_domain = "test",
+        },
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+        ),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    server.provisioned_root_refresh_dirty.store(true, .release);
+
+    server.runProvisionedRootRefresh();
+
+    try std.testing.expectEqual(@as(u64, 1), server.provisioned_root_refresh_failed.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+    try std.testing.expect(server.nextMetadataBootstrapRetryAtMsForTest() != 0);
+    try std.testing.expect(server.provisioned_root_refresh_dirty.load(.acquire));
+
+    const next_retry_at_ms = server.nextMetadataBootstrapRetryAtMsForTest();
+    server.store_registration_confirmed = true;
+    server.store_status_dirty = false;
+    server.runtime_status_dirty.store(false, .release);
+    server.provisioned_startup_catch_up_dirty.store(false, .release);
+    server.provision_ticks = 3;
+
+    try server.runRound();
+
+    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+    try std.testing.expectEqual(next_retry_at_ms, server.nextMetadataBootstrapRetryAtMsForTest());
+    try std.testing.expectEqual(@as(usize, 3), server.provision_ticks);
 }
 
 test "data runtime provisioned root refresh spawn failure preserves retry bookkeeping" {
@@ -12929,7 +15100,7 @@ test "data runtime remote admin snapshot clone preserves replication status surf
 
 test "data runtime metrics use prometheus labels for resource and cache dimensions" {
     var resource_manager = resource_manager_mod.ResourceManager.init(.{});
-    var writer_buf: [65536]u8 = undefined;
+    var writer_buf: [262144]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&writer_buf);
 
     try writeResourceMetrics(&writer, &resource_manager);
@@ -13242,7 +15413,7 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
             FakeCatalog.iface(),
         ),
         .status_source = FakeStatus.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -13256,6 +15427,10 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     const items = try std.testing.allocator.alloc(runtime_status.LocalTableRuntimeStatus, 1);
     items[0] = .{
         .group_id = 77,
+        .metadata = .{
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+        },
         .stats = .{
             .doc_count = 3,
             .index_count = 2,
@@ -13276,10 +15451,13 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
                     .lsm_open_stores = 3,
                     .lsm_open_completed = 2,
                     .lsm_open_total_ns = 1000,
+                    .lsm_open_recovered_temp_cleanup_ns = 333,
                     .lsm_open_manifest_ns = 111,
                     .lsm_open_wal_replay_ns = 222,
                     .lsm_open_loaded_runs = 5,
                     .lsm_open_mutable_entries_after_replay = 7,
+                    .lsm_open_recovered_temp_files_deleted = 4,
+                    .lsm_open_recovered_temp_bytes_deleted = 2048,
                     .wal_replay_records = 8,
                     .wal_replay_entries = 9,
                     .wal_replay_bytes = 10,
@@ -13306,6 +15484,7 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     };
 
     const snapshots = try std.testing.allocator.alloc(runtime_status.TableRuntimeSnapshot, 1);
+    defer std.testing.allocator.free(snapshots);
     snapshots[0] = .{
         .table_name = try std.testing.allocator.dupe(u8, "docs"),
         .statuses = .{ .items = items },
@@ -13342,16 +15521,27 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     server.provisioned_root_refresh_last_duration_ns.store(66, .monotonic);
 
     var health = HealthSource{ .data_server = &server };
-    var writer_buf: [65536]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&writer_buf);
-    try health.metricsWriter().writeMetrics(&writer);
-    const output = writer.buffered();
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+    try health.metricsWriter().writeMetrics(&writer.writer);
+    const output = writer.writer.buffered();
 
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_runtime_status_tables 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_runtime_status_groups 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_runtime_status_indexes 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_api_requests_total 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_api_first_request_elapsed_ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_hits_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_coalesced_waiters_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_uncached_computations_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_producer_compute_ns_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_inflight_rejections_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_waiter_timeouts_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_inflight 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_inflight_limit 16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_live_bytes 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_cache_budget_limit_bytes 67108864") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_cache_budget_rejected_reservations_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_runtime_status_refresh_started_total 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_runtime_status_refresh_completed_total 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_runtime_status_refresh_failed_total 1") != null);
@@ -13453,16 +15643,2161 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_stores 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_completed 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_total_ns 1000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_recovered_temp_cleanup_ns 333") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_manifest_ns 111") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_wal_replay_ns 222") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_loaded_runs 5") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_mutable_entries_after_replay 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_recovered_temp_files_deleted 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_recovered_temp_bytes_deleted 2048") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_records 8") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_entries 9") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_bytes 10") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_ns 222") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_truncated_tail_bytes 66") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_phase{phase=\"opening_db\"} 1") != null);
+}
+
+test "data server wires configured HA executors into API server" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-primary-log-{d}", .{nonce});
+    defer alloc.free(primary_log_raw);
+    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    defer alloc.free(primary_log);
+    const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-primary-slots-{d}", .{nonce});
+    defer alloc.free(primary_slots_raw);
+    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    defer alloc.free(primary_slots);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+
+    var primary = try antfly.ha.primary.Primary.open(alloc, primary_log.ptr, primary_slots.ptr, .{
+        .cluster_id = 100,
+        .shard_id = 10,
+        .table_id = 20,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+    _ = try primary.append(.{ .payload = "one" });
+    _ = try primary.append(.{ .payload = "two" });
+
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = ".",
+        .ha = .{
+            .admin_context = .{
+                .primary = &primary,
+                .primary_node_id = "primary-a",
+            },
+            .admin_bearer_token = "runtime-secret-token",
+            .primary_retention_policy = .{ .max_lag_lsn = 1 },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+    server.initApiServer();
+
+    try std.testing.expect(server.ha_admin_server != null);
+    try std.testing.expect(server.ha_internal_server != null);
+    try std.testing.expect(server.haOwnerJobCanRun(.compaction_publish));
+
+    var admin_unauthorized = try server.http_server.?.handle(.{
+        .method = .GET,
+        .uri = antfly.admin.routes.ha_primary_status,
+    });
+    defer admin_unauthorized.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), admin_unauthorized.status);
+
+    var admin_resp = try server.http_server.?.handle(.{
+        .method = .GET,
+        .uri = antfly.admin.routes.ha_primary_status,
+        .authorization = "Bearer runtime-secret-token",
+    });
+    defer admin_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), admin_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, admin_resp.body, "\"current_lsn\"") != null);
+
+    var internal_resp = try server.http_server.?.handle(.{
+        .method = .GET,
+        .uri = antfly.internal.routes.ha_replication_identify,
+    });
+    defer internal_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), internal_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, internal_resp.body, "\"record_format_version\"") != null);
+
+    var health = HealthSource{ .data_server = &server };
+    var writer_buf: [262144]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&writer_buf);
+    try health.metricsWriter().writeMetrics(&writer);
+    const metrics = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_runtime_configured 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_slot_count 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_retention_retained_age_ns 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_retention_active_slots 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_retention_reseed_recommended 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_slot_received_lsn{slot=\"standby-a\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_slot_status_code{slot=\"standby-a\"} 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_mirror_failures_total 0\n") != null);
+}
+
+test "data server mirrors managed primary writes into HA replication log" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 77,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-primary-mirror-root-{d}", .{nonce});
+    defer alloc.free(replica_root_raw);
+    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    defer alloc.free(replica_root);
+    const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-primary-mirror-log-{d}", .{nonce});
+    defer alloc.free(primary_log_raw);
+    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    defer alloc.free(primary_log);
+    const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-primary-mirror-slots-{d}", .{nonce});
+    defer alloc.free(primary_slots_raw);
+    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    defer alloc.free(primary_slots);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+
+    var primary = try antfly.ha.primary.Primary.open(alloc, primary_log.ptr, primary_slots.ptr, .{
+        .cluster_id = 100,
+        .shard_id = 77,
+        .table_id = 7,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = replica_root,
+        .ha = .{
+            .admin_context = .{
+                .primary = &primary,
+                .primary_node_id = "primary-a",
+            },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+    server.initApiServer();
+
+    const source_mirror = server.write_source.ha_async_mirror orelse return error.TestExpectedEqual;
+    try std.testing.expect(source_mirror.primary == &primary);
+    const cache_mirror = server.provisioned_storage.write_cache.ha_async_mirror orelse return error.TestExpectedEqual;
+    try std.testing.expect(cache_mirror.primary == &primary);
+
+    _ = try server.write_source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .timestamp_ns = 123,
+        .sync_level = .write,
+    });
+
+    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+    try std.testing.expectEqual(primary.lastLsn(), server.ha_primary_mirror_last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), server.ha_primary_mirror_failure_count.load(.acquire));
+
+    var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
+    defer entry.deinit(alloc);
+    try std.testing.expectEqual(@as(@TypeOf(entry.record.kind), .batch_mutation), entry.record.kind);
+    try std.testing.expectEqual(@as(u64, 100), entry.record.cluster_id);
+    try std.testing.expectEqual(@as(u64, 77), entry.record.shard_id);
+    try std.testing.expectEqual(@as(u64, 7), entry.record.table_id);
+
+    var decoded = try antfly.ha.effects.decodeBatchMutationRequest(alloc, entry.record);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), decoded.value.request.writes.len);
+    try std.testing.expectEqualStrings("doc:a", decoded.value.request.writes[0].key);
+    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", decoded.value.request.writes[0].value);
+    try std.testing.expectEqual(@as(u64, 123), decoded.value.request.timestamp_ns);
+}
+
+test "data server fail-closed sync policy rejects primary writes before local commit" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 77,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-sync-reject-root-{d}", .{nonce});
+    defer alloc.free(replica_root_raw);
+    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    defer alloc.free(replica_root);
+    const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-sync-reject-log-{d}", .{nonce});
+    defer alloc.free(primary_log_raw);
+    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    defer alloc.free(primary_log);
+    const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-sync-reject-slots-{d}", .{nonce});
+    defer alloc.free(primary_slots_raw);
+    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    defer alloc.free(primary_slots);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+
+    var primary = try antfly.ha.primary.Primary.open(alloc, primary_log.ptr, primary_slots.ptr, .{
+        .cluster_id = 100,
+        .shard_id = 77,
+        .table_id = 7,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+    const standby_names = [_][]const u8{"standby-a"};
+
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = replica_root,
+        .ha = .{
+            .admin_context = .{
+                .primary = &primary,
+                .primary_node_id = "primary-a",
+            },
+            .primary_sync_policy = .{
+                .mode = .remote_write,
+                .standby_names = &standby_names,
+                .failure_policy = .fail_closed,
+            },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+    server.initApiServer();
+
+    try std.testing.expectError(error.SyncPolicyUnsatisfied, server.write_source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:rejected", .value = "{\"title\":\"rejected\"}" }},
+        .timestamp_ns = 123,
+        .sync_level = .write,
+    }));
+
+    try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 1), server.ha_primary_mirror_last_gate_lsn.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(antfly.ha.commit_gate.Action.reject), server.ha_primary_mirror_last_gate_action.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), server.ha_primary_mirror_sync_reject_count.load(.acquire));
+}
+
+test "data server block sync policy waits for standby acknowledgement before commit returns" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 77,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-sync-block-root-{d}", .{nonce});
+    defer alloc.free(replica_root_raw);
+    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    defer alloc.free(replica_root);
+    const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-sync-block-log-{d}", .{nonce});
+    defer alloc.free(primary_log_raw);
+    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    defer alloc.free(primary_log);
+    const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-sync-block-slots-{d}", .{nonce});
+    defer alloc.free(primary_slots_raw);
+    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    defer alloc.free(primary_slots);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+
+    var primary = try antfly.ha.primary.Primary.open(alloc, primary_log.ptr, primary_slots.ptr, .{
+        .cluster_id = 100,
+        .shard_id = 77,
+        .table_id = 7,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+    const standby_names = [_][]const u8{"standby-a"};
+
+    const Poll = struct {
+        calls: u64 = 0,
+
+        fn update(ctx: *anyopaque, primary_arg: *antfly.ha.primary.Primary, target_lsn: u64, policy: antfly.ha.primary.SyncPolicy, round: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 0), round);
+            try std.testing.expectEqual(antfly.ha.primary.DurabilityMode.remote_write, policy.mode);
+            try primary_arg.standbyStatusUpdate("standby-a", primary_arg.identity.timeline_id, target_lsn, 0);
+        }
+    };
+    var poll = Poll{};
+
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = replica_root,
+        .ha = .{
+            .admin_context = .{
+                .primary = &primary,
+                .primary_node_id = "primary-a",
+            },
+            .primary_sync_policy = .{
+                .mode = .remote_write,
+                .standby_names = &standby_names,
+                .failure_policy = .block,
+            },
+            .primary_sync_wait = .{
+                .max_rounds = 4,
+                .sleep_ns = 0,
+                .poll_ctx = &poll,
+                .poll_fn = Poll.update,
+            },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+    server.initApiServer();
+
+    _ = try server.write_source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:block", .value = "{\"title\":\"block\"}" }},
+        .timestamp_ns = 123,
+        .sync_level = .write,
+    });
+
+    try std.testing.expectEqual(@as(u64, 2), poll.calls);
+    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 2), server.ha_primary_mirror_last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 2), server.ha_primary_mirror_last_gate_lsn.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(antfly.ha.commit_gate.Action.acknowledge), server.ha_primary_mirror_last_gate_action.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 2), server.ha_primary_mirror_sync_wait_count.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), server.ha_primary_mirror_sync_reject_count.load(.acquire));
+
+    var found = (try server.read_source.source().lookup(alloc, "docs", "doc:block", .{}, .read_index)) orelse return error.TestExpectedEqual;
+    defer found.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"title\":\"block\"}", found.json);
+}
+
+test "data server propagates standby HA write gate into provisioned write sources" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-standby-log-{d}", .{nonce});
+    defer alloc.free(standby_log_raw);
+    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    defer alloc.free(standby_log);
+    const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-standby-progress-{d}", .{nonce});
+    defer alloc.free(standby_progress_raw);
+    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    defer alloc.free(standby_progress);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+
+    var standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, .{
+        .cluster_id = 100,
+        .shard_id = 10,
+        .table_id = 20,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer standby.close();
+
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = ".",
+        .ha = .{
+            .admin_context = .{
+                .standby = &standby,
+                .standby_node_id = "standby-a",
+            },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+    server.initApiServer();
+
+    const source_gate = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
+    switch (source_gate) {
+        .shared => |gate| {
+            try std.testing.expect(gate.state == &server.ha_public_gate_state);
+            try std.testing.expect(gate.generation == null);
+        },
+        .standby, .fenced_primary, .primary => return error.TestExpectedEqual,
+    }
+
+    const cache_gate = server.provisioned_storage.write_cache.ha_write_gate orelse return error.TestExpectedEqual;
+    switch (cache_gate) {
+        .shared => |gate| {
+            try std.testing.expect(gate.state == &server.ha_public_gate_state);
+            try std.testing.expect(gate.generation == null);
+        },
+        .standby, .fenced_primary, .primary => return error.TestExpectedEqual,
+    }
+
+    const read_gate = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
+    switch (read_gate) {
+        .shared => |state| try std.testing.expect(state == &server.ha_public_gate_state),
+        .standby => return error.TestExpectedEqual,
+    }
+    try std.testing.expectError(
+        error.HAReadRequiresPrimary,
+        server.read_source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index),
+    );
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        server.write_source.source().batchGroupLocal(alloc, 10, "docs", .{
+            .writes = &.{.{ .key = "doc:local", .value = "{\"title\":\"local-write\"}" }},
+            .timestamp_ns = 1,
+            .sync_level = .write,
+        }),
+    );
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        server.write_source.source().createTable(alloc, "docs", .{}),
+    );
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        server.write_source.source().beginBulkIngest(alloc, "docs"),
+    );
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        server.write_source.source().reprocessDocumentArtifactGroupLocal(alloc, 10, "docs", "doc:local", "embedding"),
+    );
+    try std.testing.expect(!server.haOwnerJobCanRun(.compaction_publish));
+    try server.runLsmMaintenanceForegroundRound();
+    try server.requestLsmMaintenanceBackground();
+    try std.testing.expect(server.lsm_maintenance_thread == null);
+}
+
+test "storage.ha data server rejects writes and owner jobs after primary promotion fence" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-fenced-primary-log-{d}", .{nonce});
+    defer alloc.free(primary_log_raw);
+    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    defer alloc.free(primary_log);
+    const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-fenced-primary-slots-{d}", .{nonce});
+    defer alloc.free(primary_slots_raw);
+    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    defer alloc.free(primary_slots);
+    const fence_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-fenced-primary-fence-{d}", .{nonce});
+    defer alloc.free(fence_raw);
+    const fence_path = try alloc.dupeZ(u8, fence_raw);
+    defer alloc.free(fence_path);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), fence_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), fence_path) catch {};
+
+    const identity = antfly.ha.primary.Identity{
+        .cluster_id = 100,
+        .shard_id = 10,
+        .table_id = 20,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try antfly.ha.primary.Primary.open(alloc, primary_log.ptr, primary_slots.ptr, identity, .{});
+    defer primary.close();
+    _ = try primary.append(.{ .payload = "before-fence" });
+
+    var fence_store = try antfly.ha.fencing.Store.open(alloc, fence_path.ptr, .{});
+    defer fence_store.close();
+
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = ".",
+        .ha = .{
+            .admin_context = .{
+                .primary = &primary,
+                .primary_node_id = "primary-a",
+                .fence_store = &fence_store,
+            },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+    server.initApiServer();
+
+    const source_gate = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
+    switch (source_gate) {
+        .shared => |gate| {
+            try std.testing.expect(gate.state == &server.ha_public_gate_state);
+            try std.testing.expect(gate.generation == null);
+        },
+        .primary, .fenced_primary, .standby => return error.TestExpectedEqual,
+    }
+    try source_gate.check();
+
+    var fence_response = try server.http_server.?.handle(.{
+        .method = .POST,
+        .uri = antfly.admin.routes.ha_fence,
+        .content_type = "application/json",
+        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"force\":false,\"reason\":\"data-server-test\"}",
+    });
+    defer fence_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), fence_response.status);
+    try std.testing.expectError(error.HAFencedPrimary, source_gate.check());
+    try std.testing.expectError(
+        error.HAReadRequiresPrimary,
+        server.read_source.source().lookup(alloc, "docs", "doc:local", .{}, .stale),
+    );
+    try std.testing.expectError(
+        error.HAReadRequiresPrimary,
+        server.read_source.source().lookup(alloc, "docs", "doc:local", .{}, .read_index),
+    );
+
+    try std.testing.expectError(error.HAFencedPrimary, server.write_source.source().batchGroupLocal(alloc, 10, "docs", .{
+        .writes = &.{.{ .key = "doc:local", .value = "{\"title\":\"local-write\"}" }},
+        .timestamp_ns = 1,
+        .sync_level = .write,
+    }));
+    try std.testing.expect(!server.haOwnerJobCanRun(.compaction_publish));
+}
+
+test "data server applies routed HA replication records through standby write gate" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 77,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-routed-apply-root-{d}", .{nonce});
+    defer alloc.free(replica_root_raw);
+    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    defer alloc.free(replica_root);
+    const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-routed-apply-log-{d}", .{nonce});
+    defer alloc.free(standby_log_raw);
+    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    defer alloc.free(standby_log);
+    const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-routed-apply-progress-{d}", .{nonce});
+    defer alloc.free(standby_progress_raw);
+    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    defer alloc.free(standby_progress);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+
+    var standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, .{
+        .cluster_id = 100,
+        .shard_id = 77,
+        .table_id = 7,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer standby.close();
+
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = replica_root,
+        .ha = .{
+            .admin_context = .{
+                .standby = &standby,
+                .standby_node_id = "standby-a",
+            },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+    server.initApiServer();
+
+    const payload = try antfly.ha.effects.encodeBatchMutationRequestAlloc(alloc, .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    defer alloc.free(payload);
+
+    try server.applyHAReplicationRecord(.{
+        .kind = .batch_mutation,
+        .payload_codec = .json,
+        .cluster_id = 100,
+        .shard_id = 77,
+        .table_id = 7,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 1,
+        .previous_lsn = 0,
+        .payload = payload,
+    });
+
+    var lookup = (try server.read_source.source().lookupGroupLocal(
+        alloc,
+        77,
+        "docs",
+        "doc:a",
+        .{},
+        .stale,
+    )) orelse return error.TestExpectedEqual;
+    defer lookup.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, lookup.json, "\"title\":\"alpha\"") != null);
+}
+
+test "data server pulls and applies HA standby replication through internal HTTP client" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 77,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-root-{d}", .{nonce});
+    defer alloc.free(replica_root_raw);
+    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    defer alloc.free(replica_root);
+    const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-primary-log-{d}", .{nonce});
+    defer alloc.free(primary_log_raw);
+    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    defer alloc.free(primary_log);
+    const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-primary-slots-{d}", .{nonce});
+    defer alloc.free(primary_slots_raw);
+    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    defer alloc.free(primary_slots);
+    const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-standby-log-{d}", .{nonce});
+    defer alloc.free(standby_log_raw);
+    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    defer alloc.free(standby_log);
+    const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-standby-progress-{d}", .{nonce});
+    defer alloc.free(standby_progress_raw);
+    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    defer alloc.free(standby_progress);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+
+    const identity: antfly.ha.primary.Identity = .{
+        .cluster_id = 100,
+        .shard_id = 77,
+        .table_id = 7,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try antfly.ha.primary.Primary.open(alloc, primary_log.ptr, primary_slots.ptr, identity, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+    _ = try antfly.ha.effects.appendBatchMutationRequest(alloc, &primary, .{
+        .writes = &.{.{ .key = "doc:http", .value = "{\"title\":\"from-http\"}" }},
+        .sync_level = .write,
+    }, .{});
+
+    var standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var primary_internal = antfly.ha.http_internal.Server.init(alloc, &primary);
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = replica_root,
+        .ha = .{
+            .admin_context = .{
+                .standby = &standby,
+                .standby_node_id = "standby-a",
+            },
+            .standby_replication = .{
+                .upstream_base_uri = "http://primary.internal.test",
+                .slot_name = "standby-a",
+                .options = .{ .max_records = 1 },
+                .catch_up_until_end_of_wal = true,
+                .executor = primary_internal.executor(),
+            },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+
+    try server.runHAStandbyReplicationRound();
+
+    const progress = standby.currentProgress();
+    try std.testing.expectEqual(@as(u64, 1), progress.received_lsn);
+    try std.testing.expectEqual(@as(u64, 1), progress.applied_lsn);
+    try std.testing.expect(server.ha_standby_replication_last_attempt_ns.load(.acquire) > 0);
+    try std.testing.expect(server.ha_standby_replication_last_success_ns.load(.acquire) > 0);
+
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
+
+    var admin_status = try server.http_server.?.handle(.{
+        .method = .GET,
+        .uri = antfly.admin.routes.ha_standby_status,
+    });
+    defer admin_status.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), admin_status.status);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_attempt_ns\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_success_ns\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"replication_failures_total\":0") != null);
+
+    var health = HealthSource{ .data_server = &server };
+    var writer_buf: [262144]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&writer_buf);
+    try health.metricsWriter().writeMetrics(&writer);
+    const metrics = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_runtime_configured 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_received_lsn 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_applied_lsn 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_upstream_configured 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_caught_up_to_received 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_replication_last_attempt_ns ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_replication_last_success_ns ") != null);
+
+    var lookup = (try server.read_source.source().lookupGroupLocal(
+        alloc,
+        77,
+        "docs",
+        "doc:http",
+        .{},
+        .stale,
+    )) orelse return error.TestExpectedEqual;
+    defer lookup.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, lookup.json, "\"title\":\"from-http\"") != null);
+}
+
+test "data server HA replication network wait leaves state mutex available" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+    const BlockingExecutor = struct {
+        upstream: antfly.common.http.RequestExecutor,
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn executor(self: *@This()) antfly.common.http.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(
+            ptr: *anyopaque,
+            alloc_arg: std.mem.Allocator,
+            req: antfly.common.http.HttpRequest,
+        ) anyerror!antfly.common.http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.endsWith(u8, req.uri, antfly.internal.routes.ha_replication_start)) {
+                self.entered.store(true, .release);
+                while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            }
+            return try self.upstream.execute(alloc_arg, req);
+        }
+    };
+    const ReplicationThread = struct {
+        server: *DataServer,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.server.runHAStandbyReplicationRound() catch |err| {
+                self.err = err;
+            };
+        }
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-unlocked-network-root-{d}", .{nonce});
+    defer alloc.free(replica_root_raw);
+    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    defer alloc.free(replica_root);
+    const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-unlocked-network-primary-log-{d}", .{nonce});
+    defer alloc.free(primary_log_raw);
+    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    defer alloc.free(primary_log);
+    const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-unlocked-network-primary-slots-{d}", .{nonce});
+    defer alloc.free(primary_slots_raw);
+    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    defer alloc.free(primary_slots);
+    const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-unlocked-network-log-{d}", .{nonce});
+    defer alloc.free(standby_log_raw);
+    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    defer alloc.free(standby_log);
+    const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-unlocked-network-progress-{d}", .{nonce});
+    defer alloc.free(standby_progress_raw);
+    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    defer alloc.free(standby_progress);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+
+    const identity: antfly.ha.standby.Identity = .{
+        .cluster_id = 100,
+        .shard_id = 77,
+        .table_id = 7,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try antfly.ha.primary.Primary.open(alloc, primary_log.ptr, primary_slots.ptr, identity, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+    var primary_internal = antfly.ha.http_internal.Server.init(alloc, &primary);
+    var standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, identity, .{});
+    defer standby.close();
+    var blocking_executor = BlockingExecutor{ .upstream = primary_internal.executor() };
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = replica_root,
+        .ha = .{
+            .admin_context = .{
+                .standby = &standby,
+                .standby_node_id = "standby-a",
+            },
+            .standby_replication = .{
+                .upstream_base_uri = "http://primary.internal.test",
+                .slot_name = "standby-a",
+                .options = .{ .verify_upstream = false },
+                .executor = blocking_executor.executor(),
+            },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+    server.initApiServer();
+
+    var replication_thread = ReplicationThread{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, ReplicationThread.run, .{&replication_thread});
+    var joined = false;
+    defer if (!joined) {
+        blocking_executor.release.store(true, .release);
+        thread.join();
+    };
+
+    var spins: usize = 0;
+    while (!blocking_executor.entered.load(.acquire) and spins < 1_000_000) : (spins += 1) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(blocking_executor.entered.load(.acquire));
+
+    const mutex_available = server.ha_state_mutex.tryLock();
+    var promotion_err: ?anyerror = null;
+    if (mutex_available) {
+        _ = standby.promote(.{
+            .new_timeline_id = 2,
+            .new_epoch = 2,
+            .fencing_confirmed = true,
+        }) catch |err| {
+            promotion_err = err;
+        };
+        server.ha_state_mutex.unlock();
+    }
+    blocking_executor.release.store(true, .release);
+    thread.join();
+    joined = true;
+
+    try std.testing.expect(mutex_available);
+    try std.testing.expect(promotion_err == null);
+    const replication_err = replication_thread.err orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(error.HAStandbyStateChanged, replication_err);
+}
+
+test "data server promotion rewires live HTTP internal HA executor" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promoted-http-root-{d}", .{nonce});
+    defer alloc.free(replica_root_raw);
+    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    defer alloc.free(replica_root);
+    const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promoted-http-log-{d}", .{nonce});
+    defer alloc.free(standby_log_raw);
+    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    defer alloc.free(standby_log);
+    const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promoted-http-progress-{d}", .{nonce});
+    defer alloc.free(standby_progress_raw);
+    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    defer alloc.free(standby_progress);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+
+    var standby: ?antfly.ha.standby.Standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, .{
+        .cluster_id = 100,
+        .shard_id = 77,
+        .table_id = 7,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer if (standby) |*handle| handle.close();
+    if (standby) |*handle| {
+        _ = try handle.promote(.{
+            .new_timeline_id = 2,
+            .new_epoch = 2,
+            .fencing_confirmed = true,
+        });
+    }
+
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = replica_root,
+        .ha = .{
+            .admin_context = .{
+                .standby = if (standby) |*handle| handle else null,
+                .standby_node_id = "standby-a",
+            },
+            .standby_owner = &standby,
+            .standby_replication = .{
+                .upstream_base_uri = "http://primary.internal.test",
+                .slot_name = "standby-a",
+                .standby_log_path = standby_log,
+                .standby_progress_path = standby_progress,
+            },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+    server.initApiServer();
+
+    const public_read_gate_before = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
+    const public_write_gate_before = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
+    try std.testing.expectError(error.HAReadRequiresPrimary, public_read_gate_before.check(.stale));
+    try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, public_write_gate_before.check());
+
+    var before = try server.http_server.?.handle(.{
+        .method = .GET,
+        .uri = antfly.internal.routes.ha_replication_identify,
+    });
+    defer before.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 404), before.status);
+
+    try server.runHAStandbyReplicationRound();
+    try std.testing.expect(standby == null);
+    try std.testing.expect(server.ha_promoted_primary != null);
+    try std.testing.expect(server.ha_cfg.admin_context.?.standby == null);
+    try std.testing.expect(server.ha_cfg.admin_context.?.promoted_standby_handoff != null);
+    try std.testing.expect(server.ha_admin_server.?.auth.state_mutex == &server.ha_state_mutex);
+    try std.testing.expect(server.ha_internal_server.?.state_mutex == &server.ha_state_mutex);
+    const public_read_gate_after = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
+    const public_write_gate_after = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.meta.eql(public_read_gate_before, public_read_gate_after));
+    try std.testing.expect(std.meta.eql(public_write_gate_before, public_write_gate_after));
+    try public_read_gate_before.check(.stale);
+    try public_write_gate_before.check();
+
+    var write_check = try server.http_server.?.handle(.{
+        .method = .POST,
+        .uri = antfly.admin.routes.ha_write_check,
+        .content_type = "application/json",
+        .body = "{\"role\":\"standby\",\"expected_identity\":{\"cluster_id\":100,\"shard_id\":77,\"table_id\":7,\"timeline_id\":2,\"epoch\":2}}",
+    });
+    defer write_check.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), write_check.status);
+    try std.testing.expect(std.mem.indexOf(u8, write_check.body, "\"role\":\"promoted_standby\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_check.body, "\"action\":\"open_promoted_primary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_check.body, "\"promotion_handoff\"") != null);
+
+    var owner_job_check = try server.http_server.?.handle(.{
+        .method = .POST,
+        .uri = antfly.admin.routes.ha_owner_job_check,
+        .content_type = "application/json",
+        .body = "{\"role\":\"standby\",\"kind\":\"retention_advance\",\"expected_identity\":{\"cluster_id\":100,\"shard_id\":77,\"table_id\":7,\"timeline_id\":2,\"epoch\":2}}",
+    });
+    defer owner_job_check.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), owner_job_check.status);
+    try std.testing.expect(std.mem.indexOf(u8, owner_job_check.body, "\"role\":\"promoted_standby\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, owner_job_check.body, "\"action\":\"open_promoted_primary\"") != null);
+
+    var internal_resp = try server.http_server.?.handle(.{
+        .method = .GET,
+        .uri = antfly.internal.routes.ha_replication_identify,
+    });
+    defer internal_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), internal_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, internal_resp.body, "\"record_format_version\"") != null);
+}
+
+test "data server promotion open failure preserves retryable standby" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promote-retry-root-{d}", .{nonce});
+    defer alloc.free(replica_root_raw);
+    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    defer alloc.free(replica_root);
+    const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promote-retry-log-{d}", .{nonce});
+    defer alloc.free(standby_log_raw);
+    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    defer alloc.free(standby_log);
+    const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promote-retry-progress-{d}", .{nonce});
+    defer alloc.free(standby_progress_raw);
+    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    defer alloc.free(standby_progress);
+    const wrong_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promote-retry-wrong-log-{d}", .{nonce});
+    defer alloc.free(wrong_log_raw);
+    const wrong_log = try alloc.dupeZ(u8, wrong_log_raw);
+    defer alloc.free(wrong_log);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), wrong_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), wrong_log) catch {};
+    defer {
+        const promoted_slots = std.fmt.allocPrint(alloc, "{s}.promoted-primary-slots", .{standby_progress}) catch null;
+        if (promoted_slots) |path| {
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+            alloc.free(path);
+        }
+    }
+
+    var standby: ?antfly.ha.standby.Standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, .{
+        .cluster_id = 100,
+        .shard_id = 77,
+        .table_id = 7,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer if (standby) |*handle| handle.close();
+    if (standby) |*handle| {
+        _ = try handle.promote(.{
+            .new_timeline_id = 2,
+            .new_epoch = 2,
+            .fencing_confirmed = true,
+        });
+    }
+
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = replica_root,
+        .ha = .{
+            .admin_context = .{
+                .standby = if (standby) |*handle| handle else null,
+                .standby_node_id = "standby-a",
+            },
+            .standby_owner = &standby,
+            .standby_replication = .{
+                .upstream_base_uri = "http://primary.internal.test",
+                .slot_name = "standby-a",
+                .standby_log_path = wrong_log,
+                .standby_progress_path = standby_progress,
+            },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+    server.initApiServer();
+
+    const public_read_gate = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
+    const public_write_gate = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
+    try std.testing.expectError(error.HAReadRequiresPrimary, public_read_gate.check(.stale));
+    try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, public_write_gate.check());
+
+    try std.testing.expectError(error.PromotedLogMismatch, server.runHAStandbyReplicationRound());
+    try std.testing.expect(standby != null);
+    try std.testing.expect(server.ha_promoted_primary == null);
+    try std.testing.expect(server.ha_cfg.admin_context.?.standby != null);
+    try std.testing.expect(server.ha_cfg.admin_context.?.primary == null);
+
+    server.ha_cfg.standby_replication.?.standby_log_path = standby_log;
+    try server.runHAStandbyReplicationRound();
+    try std.testing.expect(standby == null);
+    try std.testing.expect(server.ha_promoted_primary != null);
+    try std.testing.expect(server.ha_cfg.admin_context.?.standby == null);
+    try std.testing.expect(server.ha_cfg.admin_context.?.primary != null);
+}
+
+test "data server resumes HA standby replication from durable progress after restart" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 77,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-resume-root-{d}", .{nonce});
+    defer alloc.free(replica_root_raw);
+    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    defer alloc.free(replica_root);
+    const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-resume-primary-log-{d}", .{nonce});
+    defer alloc.free(primary_log_raw);
+    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    defer alloc.free(primary_log);
+    const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-resume-primary-slots-{d}", .{nonce});
+    defer alloc.free(primary_slots_raw);
+    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    defer alloc.free(primary_slots);
+    const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-resume-standby-log-{d}", .{nonce});
+    defer alloc.free(standby_log_raw);
+    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    defer alloc.free(standby_log);
+    const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-resume-standby-progress-{d}", .{nonce});
+    defer alloc.free(standby_progress_raw);
+    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    defer alloc.free(standby_progress);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+
+    const identity: antfly.ha.primary.Identity = .{
+        .cluster_id = 100,
+        .shard_id = 77,
+        .table_id = 7,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try antfly.ha.primary.Primary.open(alloc, primary_log.ptr, primary_slots.ptr, identity, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+    _ = try antfly.ha.effects.appendBatchMutationRequest(alloc, &primary, .{
+        .writes = &.{.{ .key = "doc:first", .value = "{\"title\":\"first\"}" }},
+        .sync_level = .write,
+    }, .{});
+    _ = try antfly.ha.effects.appendBatchMutationRequest(alloc, &primary, .{
+        .writes = &.{.{ .key = "doc:second", .value = "{\"title\":\"second\"}" }},
+        .sync_level = .write,
+    }, .{});
+
+    var primary_internal = antfly.ha.http_internal.Server.init(alloc, &primary);
+
+    {
+        var standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, identity, .{});
+        defer standby.close();
+
+        var server = DataServer.initFromLocalMetadataSources(alloc, .{
+            .replica_root_dir = replica_root,
+            .ha = .{
+                .admin_context = .{
+                    .standby = &standby,
+                    .standby_node_id = "standby-a",
+                },
+                .standby_replication = .{
+                    .upstream_base_uri = "http://primary.internal.test",
+                    .slot_name = "standby-a",
+                    .options = .{ .max_records = 1 },
+                    .catch_up_until_end_of_wal = false,
+                    .executor = primary_internal.executor(),
+                },
+            },
+        }, FakeCatalog.iface(), FakeStatus.iface());
+        defer server.deinit();
+
+        try server.runHAStandbyReplicationRound();
+
+        const progress = standby.currentProgress();
+        try std.testing.expectEqual(@as(u64, 1), progress.received_lsn);
+        try std.testing.expectEqual(@as(u64, 1), progress.applied_lsn);
+        const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
+        try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
+
+        var first_lookup = (try server.read_source.source().lookupGroupLocal(
+            alloc,
+            77,
+            "docs",
+            "doc:first",
+            .{},
+            .stale,
+        )) orelse return error.TestExpectedEqual;
+        defer first_lookup.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, first_lookup.json, "\"title\":\"first\"") != null);
+        const second_lookup = try server.read_source.source().lookupGroupLocal(
+            alloc,
+            77,
+            "docs",
+            "doc:second",
+            .{},
+            .stale,
+        );
+        try std.testing.expect(second_lookup == null);
+    }
+
+    {
+        var standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, identity, .{});
+        defer standby.close();
+        const restored_progress = standby.currentProgress();
+        try std.testing.expectEqual(@as(u64, 1), restored_progress.received_lsn);
+        try std.testing.expectEqual(@as(u64, 1), restored_progress.applied_lsn);
+        try std.testing.expectEqual(@as(u64, 2), standby.nextReceiveLsn());
+
+        var server = DataServer.initFromLocalMetadataSources(alloc, .{
+            .replica_root_dir = replica_root,
+            .ha = .{
+                .admin_context = .{
+                    .standby = &standby,
+                    .standby_node_id = "standby-a",
+                },
+                .standby_replication = .{
+                    .upstream_base_uri = "http://primary.internal.test",
+                    .slot_name = "standby-a",
+                    .options = .{ .max_records = 1 },
+                    .catch_up_until_end_of_wal = true,
+                    .executor = primary_internal.executor(),
+                },
+            },
+        }, FakeCatalog.iface(), FakeStatus.iface());
+        defer server.deinit();
+
+        try server.runHAStandbyReplicationRound();
+
+        const progress = standby.currentProgress();
+        try std.testing.expectEqual(@as(u64, 2), progress.received_lsn);
+        try std.testing.expectEqual(@as(u64, 2), progress.applied_lsn);
+        const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(@as(u64, 2), slot.received_lsn);
+        try std.testing.expectEqual(@as(u64, 2), slot.applied_lsn);
+        try std.testing.expectEqual(@as(u64, 0), server.ha_standby_replication_failure_count.load(.acquire));
+        try std.testing.expect(server.ha_standby_replication_last_success_ns.load(.acquire) > 0);
+
+        var first_lookup = (try server.read_source.source().lookupGroupLocal(
+            alloc,
+            77,
+            "docs",
+            "doc:first",
+            .{},
+            .stale,
+        )) orelse return error.TestExpectedEqual;
+        defer first_lookup.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, first_lookup.json, "\"title\":\"first\"") != null);
+
+        var second_lookup = (try server.read_source.source().lookupGroupLocal(
+            alloc,
+            77,
+            "docs",
+            "doc:second",
+            .{},
+            .stale,
+        )) orelse return error.TestExpectedEqual;
+        defer second_lookup.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, second_lookup.json, "\"title\":\"second\"") != null);
+    }
+}
+
+test "data runtime records HA standby replication round failures" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FailingExecutor = struct {
+        fn executor(self: *@This()) antfly.common.http.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+            return error.ConnectionRefused;
+        }
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-failed-root-{d}", .{nonce});
+    defer alloc.free(replica_root_raw);
+    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    defer alloc.free(replica_root);
+    const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-failed-standby-log-{d}", .{nonce});
+    defer alloc.free(standby_log_raw);
+    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    defer alloc.free(standby_log);
+    const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-failed-standby-progress-{d}", .{nonce});
+    defer alloc.free(standby_progress_raw);
+    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    defer alloc.free(standby_progress);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+
+    var standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, .{
+        .cluster_id = 100,
+        .shard_id = 77,
+        .table_id = 7,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer standby.close();
+
+    var failing_executor = FailingExecutor{};
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = replica_root,
+        .ha = .{
+            .admin_context = .{
+                .standby = &standby,
+                .standby_node_id = "standby-a",
+            },
+            .standby_replication = .{
+                .upstream_base_uri = "http://primary.internal.test",
+                .slot_name = "standby-a",
+                .executor = failing_executor.executor(),
+            },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+
+    try server.runRound();
+    try std.testing.expectEqual(@as(u64, 1), server.ha_standby_replication_failure_count.load(.acquire));
+    try std.testing.expect(server.ha_standby_replication_last_attempt_ns.load(.acquire) > 0);
+    try std.testing.expectEqual(@as(u64, 0), server.ha_standby_replication_last_success_ns.load(.acquire));
+
+    var admin_status = try server.http_server.?.handle(.{
+        .method = .GET,
+        .uri = antfly.admin.routes.ha_standby_status,
+    });
+    defer admin_status.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), admin_status.status);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_error\":\"ConnectionRefused\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_attempt_ns\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"replication_failures_total\":1") != null);
+
+    var health = HealthSource{ .data_server = &server };
+    var writer_buf: [262144]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&writer_buf);
+    try health.metricsWriter().writeMetrics(&writer);
+    const metrics = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_runtime_configured 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_replication_failures_total 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_replication_last_attempt_ns ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_replication_last_success_ns 0\n") != null);
+}
+
+test "data runtime records HA standby apply failures without stopping run round" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-apply-failed-root-{d}", .{nonce});
+    defer alloc.free(replica_root_raw);
+    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    defer alloc.free(replica_root);
+    const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-apply-failed-primary-log-{d}", .{nonce});
+    defer alloc.free(primary_log_raw);
+    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    defer alloc.free(primary_log);
+    const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-apply-failed-primary-slots-{d}", .{nonce});
+    defer alloc.free(primary_slots_raw);
+    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    defer alloc.free(primary_slots);
+    const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-apply-failed-standby-log-{d}", .{nonce});
+    defer alloc.free(standby_log_raw);
+    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    defer alloc.free(standby_log);
+    const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-apply-failed-standby-progress-{d}", .{nonce});
+    defer alloc.free(standby_progress_raw);
+    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    defer alloc.free(standby_progress);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+
+    const identity: antfly.ha.primary.Identity = .{
+        .cluster_id = 100,
+        .shard_id = 77,
+        .table_id = 0,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try antfly.ha.primary.Primary.open(alloc, primary_log.ptr, primary_slots.ptr, identity, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+    _ = try antfly.ha.effects.appendBatchMutationRequest(alloc, &primary, .{
+        .writes = &.{.{ .key = "doc:missing-table", .value = "{\"title\":\"missing-table\"}" }},
+        .sync_level = .write,
+    }, .{});
+
+    var standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var primary_internal = antfly.ha.http_internal.Server.init(alloc, &primary);
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = replica_root,
+        .ha = .{
+            .admin_context = .{
+                .standby = &standby,
+                .standby_node_id = "standby-a",
+            },
+            .standby_replication = .{
+                .upstream_base_uri = "http://primary.internal.test",
+                .slot_name = "standby-a",
+                .options = .{ .max_records = 1 },
+                .executor = primary_internal.executor(),
+            },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+
+    try server.runRound();
+    try std.testing.expectEqual(@as(u64, 1), server.ha_standby_replication_failure_count.load(.acquire));
+    try std.testing.expect(server.ha_standby_replication_last_attempt_ns.load(.acquire) > 0);
+    try std.testing.expectEqual(@as(u64, 0), server.ha_standby_replication_last_success_ns.load(.acquire));
+
+    const progress = standby.currentProgress();
+    try std.testing.expectEqual(@as(u64, 1), progress.received_lsn);
+    try std.testing.expectEqual(@as(u64, 0), progress.applied_lsn);
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 0), slot.applied_lsn);
+
+    var admin_status = try server.http_server.?.handle(.{
+        .method = .GET,
+        .uri = antfly.admin.routes.ha_standby_status,
+    });
+    defer admin_status.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), admin_status.status);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_error\":\"HAReplicationRecordMissingTableId\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"replication_failures_total\":1") != null);
 }
 
 test "data runtime lsm maintenance scheduler defers under resource pressure" {

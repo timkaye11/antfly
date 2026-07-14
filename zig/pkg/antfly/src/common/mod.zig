@@ -20,6 +20,9 @@ pub const secrets = @import("secrets.zig");
 pub const health_server = @import("health_server.zig");
 pub const group_ids = @import("group_ids.zig");
 pub const data_format = @import("data_format.zig");
+pub const fs_paths = @import("fs_paths.zig");
+pub const byte_copy = @import("byte_copy.zig");
+pub const cache_budget = @import("cache_budget.zig");
 
 test {
     _ = provider_registry;
@@ -30,4 +33,11 @@ test {
     _ = health_server;
     _ = group_ids;
     _ = data_format;
+    _ = fs_paths;
+    _ = byte_copy;
+    _ = cache_budget;
+}
+
+test "cache budget atomically enforces its hard limit" {
+    try cache_budget.testHardLimit();
 }

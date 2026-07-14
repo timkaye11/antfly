@@ -70,10 +70,10 @@ Do not make XLA a prerequisite for CUDA. The native CUDA path should be useful
 when the only NVIDIA component visible in the container is the driver mounted by
 the node.
 
-Do not rely on cuBLAS for the first production path. That forces runtime
-libraries into the image and does not solve GGUF packed-weight formats. Dense
-F16/F32 matmul without cuBLAS is still needed for correctness and smaller
-models, but unquantized large models are not the initial performance target.
+Do not require cuBLAS for the first production path. Optional cuBLASLt dispatch
+is allowed for dense F16/BF16 matmul when the libraries are present, but the
+driver-only kernels still need to preserve correctness and coverage for
+dependency-light deployments and GGUF packed-weight formats.
 
 ## Existing Codebase Fit
 
@@ -162,21 +162,19 @@ Compatibility floor:
 | L4 | `sm_89` | Preferred GKE cost/performance target |
 | H100 | `sm_90` | High-end validation target |
 
-The first portable artifacts should be PTX for `compute_75`. The NVIDIA driver
-can JIT that PTX on later devices. This keeps one checked-in artifact path for
-T4, L4, A100, and H100.
-
-Later, add optional cubins/fatbins. The current implementation rejects
-`-Dcuda-artifacts=fatbin` until those artifacts exist so builds cannot silently
-fall back to PTX while reporting a fatbin mode.
+Checked-in CUDA artifacts are generated with the pinned CUDA `13.2` toolkit.
+The portable artifact is PTX ISA `9.2` for `compute_75` / `.target sm_75`, so
+the NVIDIA driver can JIT it on later devices. The default artifact is a fatbin
+with cubins for the current validation targets and a `compute_75` PTX fallback:
 
 - `sm_75` baseline cubin for T4 startup latency.
 - `sm_80` cubin for A100.
 - `sm_89` cubin for L4.
 - `sm_90` cubin for H100.
+- `sm_100`, `sm_110`, and `sm_120` cubins for Blackwell-generation targets.
 
-Keep the `compute_75` PTX path even after adding cubins. Architecture-specific
-PTX or cubins must never be the only artifact.
+Keep the `compute_75` PTX path even when fatbins are used by default.
+Architecture-specific cubins must never be the only checked-in artifact.
 
 ## Kernel Artifact Policy
 
@@ -190,23 +188,178 @@ Use this layout:
 | `pkg/inference/src/ops/cuda/driver.zig` | Driver API dynamic loader |
 | `pkg/inference/src/ops/cuda/context.zig` | Device/context/stream lifecycle |
 | `pkg/inference/src/ops/cuda/buffer.zig` | Device memory and host copies |
-| `pkg/inference/src/ops/cuda/kernels.zig` | Embedded PTX module loading and JIT diagnostics |
+| `pkg/inference/src/ops/cuda/kernels.zig` | Embedded PTX/fatbin module loading and diagnostics |
 | `pkg/inference/src/ops/cuda/quant.zig` | GGUF format descriptors for CUDA |
 | `pkg/inference/src/ops/cuda/cuda_compute.zig` | `ComputeBackend` implementation |
 | `pkg/inference/src/ops/cuda/kernels/*.cu` | Developer kernel sources |
 | `pkg/inference/src/ops/cuda/artifacts/*.ptx` | Checked-in portable PTX |
-| `pkg/inference/src/ops/cuda/artifacts/*.fatbin` | Optional checked-in fatbins |
+| `pkg/inference/src/ops/cuda/artifacts/*.fatbin` | Checked-in multi-arch fatbins |
 
 Build flags:
 
 - `-Dcuda=true`: compile CUDA backend Zig code and embed checked-in artifacts.
 - `-Dcuda=false`: default until the backend is mature.
 - `-Dcuda-artifacts=portable`: embed the checked-in portable PTX only.
-- `-Dcuda-artifacts=fatbin`: reserved for future multi-arch artifacts; rejected
-  today.
+- `-Dcuda-artifacts=fatbin`: embed the checked-in multi-arch fatbin. This is
+  the default.
+- `-Dcuda-libs=auto`: use optional CUDA library acceleration when available.
+- `-Dcuda-libs=required`: require CUDA libraries such as cuBLASLt to load.
+- `-Dcuda-libs=off`: do not load optional CUDA libraries.
 
-Add a developer-only regeneration step for CUDA artifacts. CUDA-enabled CI may
-verify checked-in artifact freshness, but normal CI should not need CUDA.
+Use `scripts/regen-cuda-artifacts.sh --check` to verify CUDA artifacts and
+`scripts/regen-cuda-artifacts.sh --write` to update them. The script requires
+CUDA `13.2`, verifies portable PTX ISA `9.2` and `.target sm_75`, verifies
+fatbin cubins for the supported SM targets when `cuobjdump` is available, and
+checks that required CUDA symbols are present before updating checked-in
+artifacts. CUDA-enabled CI may verify checked-in artifact freshness, but normal
+CI should not need CUDA.
+
+## GLiNER2 CUDA Q4 Span Kernels
+
+CUDA GLiNER2 span-head weights use resident `Q4_K` kernels by default when the
+checked-in CUDA module exposes the required GLiNER span primitives. This avoids
+upload-time dequantization for `span_rep.span_rep_layer.*.weight` tensors and
+keeps the span head on packed weights.
+
+Runtime overrides:
+
+- `TERMITE_CUDA_DISABLE_GLINER_SPAN_Q4_KERNELS=1`: use the fp32-upload span
+  path instead of the resident GLiNER span `Q4_K` kernels.
+- `TERMITE_CUDA_ENABLE_GLINER_SPAN_Q4_KERNELS=0`: legacy opt-out alias for the
+  same behavior.
+- `TERMITE_CUDA_DEQUANTIZE_QUANT_WEIGHTS=1`: force upload-time dequantization
+  for quantized weights.
+
+## Gemma4 And TurboQuant KV Status
+
+Gemma4 CUDA defaults remain `f32` KV for production correctness. The optional
+TurboQuant cache formats (`polar4`, `turbo3`) are available through
+`--cache-dtype`, and CUDA now has an opt-in fully paged device path: compressed
+keys are scored directly on device, values are stored as int8-per-head rows, and
+attention resolves logical tokens through the CUDA block table instead of a
+contiguous span assumption.
+
+Current CUDA behavior:
+
+- Default Gemma4 CUDA runs through the existing f32 device KV read/write and GQA
+  attention path.
+- `--cache-dtype polar4` stores device K rows in packed 4-bit Polar4 format and
+  scores Q against compressed K directly.
+- `--cache-dtype turbo3` stores device K rows as packed 3-bit keys plus the
+  deterministic residual sketch and scores Q against both pieces directly.
+- Both TurboQuant dtypes store CUDA V rows with the same int8-per-head value
+  codec used by host KV storage, then dequantize V inside the decode attention
+  kernel.
+- `ANTFLY_CUDA_DISABLE_TURBOQUANT_COMPRESSED_V=1` keeps compressed K but forces
+  f32 V storage for A/B testing.
+- Unsupported shapes, missing CUDA symbols, stale artifacts, or
+  `ANTFLY_CUDA_DISABLE_TURBOQUANT_KV=1` fall back to the existing non-compressed
+  path.
+
+Status checked on 2026-06-21 on an NVIDIA L4 (`sm_89`) with CUDA Toolkit 13.2
+and driver R580:
+
+- `zig build -Dcuda=true`, `regen-cuda-artifacts.sh --check --all`,
+  `antfly-inference cuda-info --smoke`, and `zig build test -Dcuda=true` pass.
+- `polar4` is a production-candidate opt-in compressed-K/compressed-V path. It
+  stays fully resident on CUDA with zero host attention fallback in the E2B and
+  12B Q4 checks below.
+- `turbo3` is functional and resident, but remains experimental. It is slower
+  than `polar4` on the current L4 decode workloads and can change output quality
+  more aggressively.
+- `polar4` is not the CUDA default yet. Deterministic 12B Q4 f32/polar4 output
+  matched in the 32-token raw check, but E2B f32/polar4 output diverged. Promote
+  only after an explicit quality/parity acceptance gate, not just the runtime
+  gate.
+
+Measured L4 results from `/tmp/antfly-cuda-turboquant-prod`:
+
+| Workload | Cache | Tokens | Load | Warm TTFT | Cold TTFT | Decode tok/s | CUDA KV status |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| E2B Korean summary | f32 | 128 | 8.56s | 0.30s | 8.86s | 17.11 | 4480/4480 device KV successes |
+| E2B Korean summary | polar4 | 128 | 8.43s | 0.30s | 8.73s | 16.70 | 1920 compressed-V writes, 4480 reads |
+| 12B Q4 Korean summary | f32 | 40 | 17.01s | 2.01s | 19.02s | 8.67 | 1968/1968 device KV successes |
+| 12B Q4 Korean summary | polar4 | 30 | 17.10s | 1.98s | 19.08s | 8.66 | 1488 compressed-V writes, 1488 reads |
+| 12B Q4 raw repeat 1 | polar4 | 32 | 17.09s | 0.63s | 17.71s | 9.16 | zero fallback |
+| 12B Q4 raw repeat 2 | polar4 | 32 | 17.02s | 0.63s | 17.65s | 9.06 | zero fallback |
+| 12B Q4 raw repeat 3 | polar4 | 32 | 16.82s | 0.63s | 17.45s | 9.04 | zero fallback |
+
+The current performance win is memory residency and lower metadata overhead, not
+higher tok/s. The block-table upload cache reduced E2B 16-token `polar4`
+block-table uploads to 30, and the longer 128-token E2B `polar4` stress run used
+135 uploads while completing 4480 device-KV reads with zero fallback.
+
+User-facing E2B CUDA smoke from the repository root:
+
+```sh
+zig/pkg/inference/zig-out/bin/antfly-inference generate \
+  .models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf \
+  "Give a one sentence summary of Korean history." \
+  --backend cuda \
+  --max-tokens 128 \
+  --print-timing \
+  --print-token-count
+```
+
+If running from `zig/pkg/inference/zig-out/bin`, pass an absolute model path.
+The model loader treats the first argument as a model path relative to the
+current working directory, so `./antfly-inference generate .models/...` from the
+binary directory will fail with `NoTokenizerFound`.
+
+```sh
+./antfly-inference generate \
+  /home/timkaye/tim/antfly/.models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf \
+  "Give a one sentence summary of Korean history." \
+  --backend cuda \
+  --max-tokens 128 \
+  --print-timing \
+  --print-token-count
+```
+
+Optional `polar4` E2B smoke:
+
+```sh
+zig/pkg/inference/zig-out/bin/antfly-inference generate \
+  .models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf \
+  "Give a one sentence summary of Korean history." \
+  --backend cuda \
+  --cache-dtype polar4 \
+  --max-tokens 128 \
+  --print-timing \
+  --print-token-count
+```
+
+Validation ladder for compressed KV:
+
+```sh
+zig build -Dcuda=true
+
+zig/pkg/inference/scripts/regen-cuda-artifacts.sh --check --all
+
+zig/pkg/inference/zig-out/bin/antfly-inference cuda-info --smoke
+
+zig/pkg/inference/scripts/validate_cuda_turboquant_gemma4.sh --quick
+
+zig/pkg/inference/zig-out/bin/antfly-inference generate \
+  /path/to/gemma4-12b-target \
+  "Write one sentence about ants." \
+  --backend cuda \
+  --cache-dtype polar4 \
+  --max-tokens 16 \
+  --temperature 0 \
+  --print-token-ids \
+  --print-timing
+
+zig/pkg/inference/zig-out/bin/antfly-inference generate \
+  /path/to/gemma4-12b-target \
+  "Write one sentence about ants." \
+  --backend cuda \
+  --cache-dtype turbo3 \
+  --max-tokens 16 \
+  --temperature 0 \
+  --print-token-ids \
+  --print-timing
+```
 
 ## Inference Surface
 
@@ -236,6 +389,31 @@ Route every CUDA quantized linear through `graph/quant_matmul.zig`:
 - Do not add public per-format APIs such as `cudaQ4KMatmul`; keep one internal
   descriptor-driven dispatch.
 
+The current CUDA backend also exposes the common dense/model primitives needed
+by ClipClap, GLiNER2, and DeBERTa reranker sessions:
+
+- dense f32 linear/bias, dense f16/bf16 weight paths, activation,
+  normalization, embedding, concat, convolution, and attention helpers
+- optional cuBLASLt f16/bf16 matmul dispatch for eligible dense weights
+- GGUF `Q8_0`, `Q4_0`, and `Q4_K` linear kernels
+- GLiNER-oriented DeBERTa attention/head helper kernels
+
+Required common kernels are loaded eagerly when the CUDA module is loaded. If a
+stale artifact bundle is missing the selected model family's required symbols,
+session creation must fail with `CudaKernelUnavailable` instead of silently
+falling back to an incomplete GPU path.
+
+CUDA session creation now uses explicit capability profiles:
+
+| Profile | Model families | Required capability group |
+|---|---|---|
+| `clipclap` | CLIP, CLAP, ClipCLAP embedding paths | dense linears, bias/activation fusions, embedding lookup, layer/RMS norm, concat, conv2d, SDPA |
+| `deberta_reranker` | DeBERTa cross-encoder rerankers | `clipclap` primitives plus take-rows, DeBERTa attention, split-last-dim |
+| `gliner2` | GLiNER2 recognition | `deberta_reranker` primitives plus GLiNER word embeddings and label GRU combine |
+
+`antfly inference cuda-info --smoke` prints the loaded artifact's profile
+capability booleans before running kernel smokes. Production validation should
+require the relevant profile to be `true` before running real model fixtures.
 ## Quantization Priorities
 
 The minimum useful GGUF set is:
@@ -266,9 +444,9 @@ Every CUDA-supported format needs:
 The important constraint is not "CUDA cannot run unquantized GGUF"; it can.
 The issue is where performance and memory come from:
 
-- Dense F16/F32 GGUF weights need dense GEMM. Without cuBLAS, our first dense
-  kernels will be correctness-grade, not competitive with vendor libraries or
-  XLA.
+- Dense F16/BF16/F32 GGUF weights need dense GEMM. Optional cuBLASLt dispatch
+  handles eligible F16/BF16 cases, while driver-only dense kernels remain a
+  correctness fallback and are not expected to beat vendor libraries.
 - Large unquantized models require much more VRAM than Q4/Q5/Q6 GGUF files, so
   the useful GKE target set is narrower unless we add robust CPU/GPU layer
   offload.
@@ -495,6 +673,7 @@ Add counters early:
 
 - device name and compute capability
 - selected artifact kind: PTX or cubin/fatbin
+- loaded capability profiles: `clipclap`, `gliner2`
 - planned quant operator
 - actual CUDA operator
 - fallback reason
@@ -505,6 +684,16 @@ Add counters early:
 
 Expose these in existing smoke/generate timing output so acceptance tests can
 prove GPU execution instead of just proving successful text generation.
+
+Fallback defaults are intentionally strict:
+
+- Planned quant matmul fallback is rejected unless
+  `ANTFLY_CUDA_ALLOW_PLANNED_FALLBACK=1` is set.
+- RoPE/GQA host fallback remains debug-only behind
+  `ANTFLY_CUDA_ALLOW_HOST_ATTENTION_FALLBACK=1`.
+- Any production smoke that enables either flag must report fallback counters
+  and should not be used as a release gate unless the fallback is the behavior
+  being tested.
 
 ## Acceptance Criteria
 

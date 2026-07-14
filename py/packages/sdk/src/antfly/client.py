@@ -16,6 +16,7 @@ from antfly.client_generated.models import (
     BatchRequest,
     BatchRequestInserts,
     Error,
+    QueryResponses,
 )
 from antfly.client_generated.types import UNSET
 
@@ -213,6 +214,140 @@ class AntflyClient:
         """
         self._request("DELETE", f"/db/v1/tables/{quote(name, safe='')}")
 
+    def query(
+        self,
+        table: str,
+        *,
+        query: dict[str, Any] | None = None,
+        full_text_search: dict[str, Any] | None = None,
+        semantic_search: str | None = None,
+        embedding_template: str | None = None,
+        indexes: list[str] | None = None,
+        filter_prefix: str | None = None,
+        filter_query: dict[str, Any] | None = None,
+        exclusion_query: dict[str, Any] | None = None,
+        aggregations: dict[str, Any] | None = None,
+        facets: dict[str, Any] | None = None,
+        embeddings: dict[str, Any] | None = None,
+        search_effort: float | None = None,
+        fields: list[str] | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        timeout_ms: int | None = None,
+        order_by: list[dict[str, Any]] | None = None,
+        search_after: list[Any] | None = None,
+        search_before: list[Any] | None = None,
+        distance_under: float | None = None,
+        distance_over: float | None = None,
+        merge_config: dict[str, Any] | None = None,
+        count: bool | None = None,
+        profile: bool | None = None,
+        reranker: dict[str, Any] | None = None,
+        analyses: dict[str, Any] | None = None,
+        graph_searches: dict[str, Any] | None = None,
+        expand_strategy: str | None = None,
+        document_renderer: str | None = None,
+        pruner: dict[str, Any] | None = None,
+        join: dict[str, Any] | None = None,
+        foreign_sources: dict[str, Any] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> QueryResponses:
+        """
+        Query a table.
+
+        Args:
+            table: Table name
+            query: Canonical public query AST
+            full_text_search: Full-text query object
+            semantic_search: Natural-language vector search query
+            embedding_template: Optional multimodal embedding template
+            indexes: Vector index names for semantic search
+            filter_prefix: Key prefix filter
+            filter_query: Structured or full-text filter query
+            exclusion_query: Structured or full-text exclusion query
+            aggregations: Aggregation requests keyed by aggregation name
+            facets: Backwards-compatible alias for ``aggregations``
+            embeddings: Pre-computed embeddings keyed by index name
+            search_effort: Vector recall/latency tradeoff
+            fields: Source fields to include
+            limit: Maximum number of hits
+            offset: Offset for shallow pagination
+            timeout_ms: Query deadline in milliseconds
+            order_by: Exact sort fields. Returned hit ``_sort`` values can be
+                passed back through ``search_after`` or ``search_before``.
+            search_after: Forward cursor tuple copied from the previous page's
+                last hit ``_sort`` value.
+            search_before: Backward cursor tuple copied from the current page's
+                first hit ``_sort`` value.
+            distance_under: Maximum semantic distance
+            distance_over: Minimum semantic distance
+            merge_config: Hybrid merge configuration
+            count: Return only total count when true
+            profile: Include execution profile when true
+            reranker: Reranker configuration
+            analyses: Analysis configuration
+            graph_searches: Graph query configuration
+            expand_strategy: Graph result expansion strategy
+            document_renderer: Handlebars document renderer
+            pruner: Result pruning configuration
+            join: Join configuration
+            foreign_sources: Query-time foreign source configuration
+            extra: Additional query request fields for forward compatibility
+
+        Returns:
+            Generated ``QueryResponses`` model.
+
+        Raises:
+            AntflyException: If the query fails or both ``aggregations`` and
+                ``facets`` are supplied.
+        """
+        if aggregations is not None and facets is not None:
+            raise AntflyException("query accepts either aggregations or facets, not both")
+
+        body: dict[str, Any] = {}
+        if extra is not None:
+            body.update(extra)
+
+        query_fields = {
+            "query": query,
+            "full_text_search": full_text_search,
+            "semantic_search": semantic_search,
+            "embedding_template": embedding_template,
+            "indexes": indexes,
+            "filter_prefix": filter_prefix,
+            "filter_query": filter_query,
+            "exclusion_query": exclusion_query,
+            "aggregations": aggregations if aggregations is not None else facets,
+            "embeddings": embeddings,
+            "search_effort": search_effort,
+            "fields": fields,
+            "limit": limit,
+            "offset": offset,
+            "timeout_ms": timeout_ms,
+            "order_by": order_by,
+            "search_after": search_after,
+            "search_before": search_before,
+            "distance_under": distance_under,
+            "distance_over": distance_over,
+            "merge_config": merge_config,
+            "count": count,
+            "profile": profile,
+            "reranker": reranker,
+            "analyses": analyses,
+            "graph_searches": graph_searches,
+            "expand_strategy": expand_strategy,
+            "document_renderer": document_renderer,
+            "pruner": pruner,
+            "join": join,
+            "foreign_sources": foreign_sources,
+        }
+        for key, value in query_fields.items():
+            if value is not None:
+                body[key] = value
+
+        response = self._request("POST", f"/db/v1/tables/{quote(table, safe='')}/query", json=body)
+        return QueryResponses.from_dict(response)
+
     def get(self, table: str, key: str) -> dict[str, Any]:
         """
         Get a single record by key.
@@ -239,6 +374,252 @@ class AntflyClient:
             raise AntflyException(f"Failed to get key '{key}' from table '{table}'")
 
         return response.to_dict()
+
+    def list_artifact_enrichments(self, table: str) -> dict[str, Any]:
+        """
+        List table-level generated artifact enrichments.
+
+        Args:
+            table: Table name
+
+        Returns:
+            Artifact enrichment list response
+
+        Raises:
+            AntflyException: If listing artifact enrichments fails
+        """
+        return self._request("GET", f"/db/v1/tables/{quote(table, safe='')}/artifacts")
+
+    def put_artifact_enrichment(
+        self,
+        table: str,
+        artifact: str,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Register or replace a table-level generated artifact enrichment.
+
+        Args:
+            table: Table name
+            artifact: Artifact enrichment name
+            config: Enrichment configuration
+
+        Returns:
+            API response body
+
+        Raises:
+            AntflyException: If storing the artifact enrichment fails
+        """
+        return self._request(
+            "PUT",
+            f"/db/v1/tables/{quote(table, safe='')}/artifacts/{quote(artifact, safe='')}/enrichment",
+            json=config,
+        )
+
+    def delete_artifact_enrichment(self, table: str, artifact: str) -> dict[str, Any]:
+        """
+        Delete a table-level generated artifact enrichment.
+
+        Args:
+            table: Table name
+            artifact: Artifact enrichment name
+
+        Returns:
+            API response body
+
+        Raises:
+            AntflyException: If deleting the artifact enrichment fails
+        """
+        return self._request(
+            "DELETE",
+            f"/db/v1/tables/{quote(table, safe='')}/artifacts/{quote(artifact, safe='')}/enrichment",
+        )
+
+    def list_document_artifacts(
+        self,
+        table: str,
+        key: str,
+        detail: str = "summary",
+    ) -> dict[str, Any]:
+        """
+        List generated artifact manifests attached to a document.
+
+        Args:
+            table: Table name
+            key: Document key
+            detail: Response detail level, ``summary`` or ``raw``
+
+        Returns:
+            Document artifact manifest list
+
+        Raises:
+            AntflyException: If listing document artifacts fails
+        """
+        return self._request(
+            "GET",
+            f"/db/v1/tables/{quote(table, safe='')}/documents/{quote(key, safe='')}/artifacts",
+            params={"detail": detail},
+        )
+
+    def get_document_artifact(
+        self,
+        table: str,
+        key: str,
+        artifact: str,
+        detail: str = "raw",
+    ) -> dict[str, Any]:
+        """
+        Get a generated artifact manifest attached to a document.
+
+        Args:
+            table: Table name
+            key: Document key
+            artifact: Artifact name
+            detail: Response detail level, ``summary`` or ``raw``
+
+        Returns:
+            Document artifact manifest
+
+        Raises:
+            AntflyException: If getting the document artifact fails
+        """
+        return self._request(
+            "GET",
+            f"/db/v1/tables/{quote(table, safe='')}/documents/{quote(key, safe='')}/artifacts/{quote(artifact, safe='')}",
+            params={"detail": detail},
+        )
+
+    def reprocess_document_artifact(self, table: str, key: str, artifact: str) -> dict[str, Any]:
+        """
+        Reprocess one generated artifact for one document.
+
+        Args:
+            table: Table name
+            key: Document key
+            artifact: Artifact name
+
+        Returns:
+            Reprocess response
+
+        Raises:
+            AntflyException: If reprocessing fails
+        """
+        return self._request(
+            "POST",
+            f"/db/v1/tables/{quote(table, safe='')}/documents/{quote(key, safe='')}/artifacts/{quote(artifact, safe='')}/reprocess",
+        )
+
+    def reprocess_artifact_range(
+        self,
+        table: str,
+        artifact: str,
+        request: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Run one bounded table-wide reprocess pass for an artifact.
+
+        Args:
+            table: Table name
+            artifact: Artifact name
+            request: Optional reprocess request body
+
+        Returns:
+            Reprocess response
+
+        Raises:
+            AntflyException: If reprocessing fails
+        """
+        return self._request(
+            "POST",
+            f"/db/v1/tables/{quote(table, safe='')}/artifacts/{quote(artifact, safe='')}/reprocess",
+            json=request or {},
+        )
+
+    def start_artifact_reprocess_job(
+        self,
+        table: str,
+        artifact: str,
+        request: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Start a durable table-wide artifact reprocess job.
+
+        Args:
+            table: Table name
+            artifact: Artifact name
+            request: Optional job start request body
+
+        Returns:
+            Reprocess job state
+
+        Raises:
+            AntflyException: If starting the job fails
+        """
+        return self._request(
+            "POST",
+            f"/db/v1/tables/{quote(table, safe='')}/artifacts/{quote(artifact, safe='')}/reprocess-jobs",
+            json=request or {},
+        )
+
+    def get_artifact_reprocess_job(self, table: str, artifact: str, job_id: str) -> dict[str, Any]:
+        """
+        Get a durable artifact reprocess job.
+
+        Args:
+            table: Table name
+            artifact: Artifact name
+            job_id: Job identifier
+
+        Returns:
+            Reprocess job state
+
+        Raises:
+            AntflyException: If loading the job fails
+        """
+        return self._request(
+            "GET",
+            f"/db/v1/tables/{quote(table, safe='')}/artifacts/{quote(artifact, safe='')}/reprocess-jobs/{quote(job_id, safe='')}",
+        )
+
+    def advance_artifact_reprocess_job(self, table: str, artifact: str, job_id: str) -> dict[str, Any]:
+        """
+        Advance a durable artifact reprocess job.
+
+        Args:
+            table: Table name
+            artifact: Artifact name
+            job_id: Job identifier
+
+        Returns:
+            Reprocess job state
+
+        Raises:
+            AntflyException: If advancing the job fails
+        """
+        return self._request(
+            "POST",
+            f"/db/v1/tables/{quote(table, safe='')}/artifacts/{quote(artifact, safe='')}/reprocess-jobs/{quote(job_id, safe='')}/advance",
+        )
+
+    def cancel_artifact_reprocess_job(self, table: str, artifact: str, job_id: str) -> dict[str, Any]:
+        """
+        Cancel a durable artifact reprocess job.
+
+        Args:
+            table: Table name
+            artifact: Artifact name
+            job_id: Job identifier
+
+        Returns:
+            Reprocess job state
+
+        Raises:
+            AntflyException: If canceling the job fails
+        """
+        return self._request(
+            "POST",
+            f"/db/v1/tables/{quote(table, safe='')}/artifacts/{quote(artifact, safe='')}/reprocess-jobs/{quote(job_id, safe='')}/cancel",
+        )
 
     def batch(
         self,

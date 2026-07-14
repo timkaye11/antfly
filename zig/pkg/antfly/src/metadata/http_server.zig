@@ -25,6 +25,7 @@ const metadata_transition_state = @import("transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const backups_api = @import("../api/backups.zig");
+const http_route_helpers = @import("../api/http_route_helpers.zig");
 const indexes_api = @import("../api/indexes.zig");
 const tables_api = @import("../api/tables.zig");
 const foreign_mod = @import("../foreign/mod.zig");
@@ -106,6 +107,8 @@ pub const AdminSource = struct {
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         drop_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void = null,
+        put_artifact_enrichment: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) anyerror!void = null,
+        delete_artifact_enrichment: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8) anyerror!void = null,
         upsert_node: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.NodeRecord) anyerror!void = null,
         request_node_shutdown: ?*const fn (ptr: *anyopaque, node_id: u64) anyerror!void = null,
         cancel_node_shutdown: ?*const fn (ptr: *anyopaque, node_id: u64) anyerror!void = null,
@@ -124,7 +127,6 @@ pub const AdminSource = struct {
         disable_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!extension_domain.InstalledExtension = null,
         configure_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.ConfigureExtensionRequest) anyerror!extension_domain.InstalledExtension = null,
         restore_extensions: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, installed: []const extension_domain.InstalledExtension, members: []const extension_domain.ExtensionMember, dependencies: []const extension_domain.ExtensionDependency) anyerror!void = null,
-        forward_metadata_request: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!?http_common.HttpResponse = null,
         record_json_response_allocation: ?*const fn (ptr: *anyopaque, bytes: usize) void = null,
     };
 
@@ -177,6 +179,16 @@ pub const AdminSource = struct {
     pub fn dropIndex(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
         const fn_ptr = self.vtable.drop_index orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, index_name);
+    }
+
+    pub fn putArtifactEnrichment(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) !void {
+        const fn_ptr = self.vtable.put_artifact_enrichment orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, enrichment_name, enrichment_json);
+    }
+
+    pub fn deleteArtifactEnrichment(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8) !void {
+        const fn_ptr = self.vtable.delete_artifact_enrichment orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, enrichment_name);
     }
 
     pub fn upsertNode(self: AdminSource, alloc: std.mem.Allocator, record: metadata_table_manager.NodeRecord) !void {
@@ -275,11 +287,6 @@ pub const AdminSource = struct {
         return try fn_ptr(self.ptr, alloc, installed, members, dependencies);
     }
 
-    pub fn forwardMetadataRequest(self: AdminSource, alloc: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
-        const fn_ptr = self.vtable.forward_metadata_request orelse return null;
-        return try fn_ptr(self.ptr, alloc, req);
-    }
-
     pub fn recordJsonResponseAllocation(self: AdminSource, bytes: usize) void {
         const fn_ptr = self.vtable.record_json_response_allocation orelse return;
         fn_ptr(self.ptr, bytes);
@@ -299,6 +306,8 @@ pub const AdminSource = struct {
                 .update_schema = metadataServiceUpdateSchema,
                 .create_index = metadataServiceCreateIndex,
                 .drop_index = metadataServiceDropIndex,
+                .put_artifact_enrichment = metadataServicePutArtifactEnrichment,
+                .delete_artifact_enrichment = metadataServiceDeleteArtifactEnrichment,
                 .upsert_node = metadataServiceUpsertNode,
                 .request_node_shutdown = metadataServiceRequestNodeShutdown,
                 .cancel_node_shutdown = metadataServiceCancelNodeShutdown,
@@ -336,6 +345,8 @@ pub const AdminSource = struct {
                 .update_schema = metadataHttpServiceUpdateSchema,
                 .create_index = metadataHttpServiceCreateIndex,
                 .drop_index = metadataHttpServiceDropIndex,
+                .put_artifact_enrichment = metadataHttpServicePutArtifactEnrichment,
+                .delete_artifact_enrichment = metadataHttpServiceDeleteArtifactEnrichment,
                 .upsert_node = metadataHttpServiceUpsertNode,
                 .request_node_shutdown = metadataHttpServiceRequestNodeShutdown,
                 .cancel_node_shutdown = metadataHttpServiceCancelNodeShutdown,
@@ -354,7 +365,6 @@ pub const AdminSource = struct {
                 .disable_extension = metadataHttpServiceDisableExtension,
                 .configure_extension = metadataHttpServiceConfigureExtension,
                 .restore_extensions = metadataHttpServiceRestoreExtensions,
-                .forward_metadata_request = metadataHttpServiceForwardMetadataRequest,
                 .record_json_response_allocation = metadataHttpServiceRecordJsonResponseAllocation,
             },
         };
@@ -457,6 +467,37 @@ pub const AdminSource = struct {
 
         const indexes_json = (try indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
         defer alloc.free(indexes_json);
+        var updated = table.*;
+        updated.indexes_json = indexes_json;
+        try svc.upsertTable(updated);
+        try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServicePutArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        var snapshot = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&snapshot);
+        const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsEnrichment(&snapshot, table_name, enrichment_name)) return error.ExtensionOwnedObject;
+
+        var updated = table.*;
+        updated.indexes_json = try indexes_api.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, enrichment_name, enrichment_json);
+        defer alloc.free(updated.indexes_json);
+        try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
+        try svc.upsertTable(updated);
+        try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServiceDeleteArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        var snapshot = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&snapshot);
+        const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsEnrichment(&snapshot, table_name, enrichment_name)) return error.ExtensionOwnedObject;
+
+        const indexes_json = (try indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table.indexes_json, enrichment_name)) orelse return error.EnrichmentNotFound;
+        defer alloc.free(indexes_json);
+        try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
         try svc.upsertTable(updated);
@@ -650,15 +691,6 @@ pub const AdminSource = struct {
         svc.freeAdminSnapshot(snapshot);
     }
 
-    fn metadataHttpServiceForwardMetadataRequest(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        req: http_common.HttpRequest,
-    ) !?http_common.HttpResponse {
-        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        return try svc.forwardMetadataLeaderRequest(alloc, req);
-    }
-
     fn metadataHttpServiceCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
@@ -731,6 +763,37 @@ pub const AdminSource = struct {
 
         const indexes_json = (try indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
         defer alloc.free(indexes_json);
+        var updated = table.*;
+        updated.indexes_json = indexes_json;
+        try svc.upsertTable(updated);
+        try flushMetadataHttpServiceMutation(svc);
+    }
+
+    fn metadataHttpServicePutArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        var snapshot = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&snapshot);
+        const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsEnrichment(&snapshot, table_name, enrichment_name)) return error.ExtensionOwnedObject;
+
+        var updated = table.*;
+        updated.indexes_json = try indexes_api.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, enrichment_name, enrichment_json);
+        defer alloc.free(updated.indexes_json);
+        try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
+        try svc.upsertTable(updated);
+        try flushMetadataHttpServiceMutation(svc);
+    }
+
+    fn metadataHttpServiceDeleteArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        var snapshot = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&snapshot);
+        const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsEnrichment(&snapshot, table_name, enrichment_name)) return error.ExtensionOwnedObject;
+
+        const indexes_json = (try indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table.indexes_json, enrichment_name)) orelse return error.EnrichmentNotFound;
+        defer alloc.free(indexes_json);
+        try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
         try svc.upsertTable(updated);
@@ -933,7 +996,6 @@ pub const MetadataHttpServer = struct {
 
     pub fn handle(self: *MetadataHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
         _ = self.cfg;
-        if (try self.forwardMutationToLeader(req)) |resp| return resp;
         switch (req.method) {
             .GET => {
                 if (routes.Routes.matchInternalNodeShutdown(req.uri)) |node_id| {
@@ -1238,6 +1300,26 @@ pub const MetadataHttpServer = struct {
                     };
                     return try textResponse(self.alloc, 202, "accepted");
                 }
+                if (routes.Routes.matchInternalTableEnrichment(req.uri)) |table_enrichment| {
+                    const table_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, table_enrichment.table_name) catch |err| switch (err) {
+                        error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid table name"),
+                        else => return err,
+                    };
+                    defer self.alloc.free(table_name);
+                    const enrichment_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, table_enrichment.enrichment_name) catch |err| switch (err) {
+                        error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid artifact enrichment name"),
+                        else => return err,
+                    };
+                    defer self.alloc.free(enrichment_name);
+                    self.source.putArtifactEnrichment(self.alloc, table_name, enrichment_name, req.body) catch |err| switch (err) {
+                        error.TableNotFound => return try textResponse(self.alloc, 404, "table not found"),
+                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
+                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                        error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return try textResponse(self.alloc, 400, "unsupported artifact enrichment configuration"),
+                        else => return err,
+                    };
+                    return try textResponse(self.alloc, 202, "accepted");
+                }
             },
             .DELETE => {
                 if (routes.Routes.matchInternalNodeShutdown(req.uri)) |node_id| {
@@ -1273,18 +1355,29 @@ pub const MetadataHttpServer = struct {
                     };
                     return try textResponse(self.alloc, 204, "");
                 }
+                if (routes.Routes.matchInternalTableEnrichment(req.uri)) |table_enrichment| {
+                    const table_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, table_enrichment.table_name) catch |err| switch (err) {
+                        error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid table name"),
+                        else => return err,
+                    };
+                    defer self.alloc.free(table_name);
+                    const enrichment_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, table_enrichment.enrichment_name) catch |err| switch (err) {
+                        error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid artifact enrichment name"),
+                        else => return err,
+                    };
+                    defer self.alloc.free(enrichment_name);
+                    self.source.deleteArtifactEnrichment(self.alloc, table_name, enrichment_name) catch |err| switch (err) {
+                        error.TableNotFound, error.EnrichmentNotFound => return try textResponse(self.alloc, 404, "artifact enrichment not found"),
+                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
+                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                        error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return try textResponse(self.alloc, 400, "unsupported artifact enrichment configuration"),
+                        else => return err,
+                    };
+                    return try textResponse(self.alloc, 204, "");
+                }
             },
         }
         return try textResponse(self.alloc, 404, "not found");
-    }
-
-    fn forwardMutationToLeader(self: *MetadataHttpServer, req: http_common.HttpRequest) !?http_common.HttpResponse {
-        if (req.source_node_id != null) return null;
-        switch (req.method) {
-            .POST, .PUT, .DELETE => {},
-            .GET => return null,
-        }
-        return try self.source.forwardMetadataRequest(self.alloc, req);
     }
 
     fn preserveExistingStoreDrainIntent(self: *MetadataHttpServer, record: *metadata_table_manager.StoreRecord) !void {
@@ -1470,6 +1563,10 @@ pub const MetadataHttpServer = struct {
             defer self.source.freeAdminSnapshot(&snapshot);
             if (finalizeWouldDeleteActiveNodeOrStore(&snapshot, node_id)) return error.ActiveNodeFinalizeRejected;
             try self.source.finalizeNodeShutdown(node_id);
+            self.source.triggerReallocate() catch |err| switch (err) {
+                error.UnsupportedOperation => {},
+                else => return err,
+            };
             return;
         }
         return error.UnsupportedOperation;
@@ -1477,7 +1574,10 @@ pub const MetadataHttpServer = struct {
 
     fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.handle(req);
+        return self.handle(req) catch |err| switch (err) {
+            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => try notLeaderResponse(self.alloc),
+            else => return err,
+        };
     }
 };
 
@@ -2353,6 +2453,15 @@ fn extensionOwnsIndex(snapshot: *const metadata_api.AdminSnapshot, table_name: [
     return false;
 }
 
+fn extensionOwnsEnrichment(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8, enrichment_name: []const u8) bool {
+    for (snapshot.extension_members) |member| {
+        if (member.object_kind != .enrichment) continue;
+        const member_table = extensionMemberTableName(member) orelse continue;
+        if (std.mem.eql(u8, member_table, table_name) and std.mem.eql(u8, member.object_name, enrichment_name)) return true;
+    }
+    return false;
+}
+
 fn extensionOwnsTableSchema(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) bool {
     for (snapshot.extension_members) |member| {
         if (member.object_kind != .table_schema) continue;
@@ -2574,6 +2683,8 @@ fn extensionLifecycleErrorResponse(alloc: std.mem.Allocator, err: anyerror) !htt
         error.InvalidCreateIndexRequest,
         error.InvalidTableIndexMetadata,
         error.InvalidExtensionEnrichment,
+        error.InvalidEnrichmentConfig,
+        error.ConflictingEnrichmentConfig,
         error.UnrequestedCapabilityGrant,
         error.InvalidJsonObject,
         error.EmptyName,
@@ -2589,6 +2700,44 @@ fn textResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_c
         .status = status,
         .content_type = try alloc.dupe(u8, "text/plain"),
         .body = try alloc.dupe(u8, body),
+    };
+}
+
+fn notLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+    const headers = try alloc.alloc(http_common.Header, 2);
+    var initialized_headers: usize = 0;
+    errdefer {
+        for (headers[0..initialized_headers]) |*header| header.deinit(alloc);
+        alloc.free(headers);
+    }
+
+    var retry_after_name: ?[]u8 = try alloc.dupe(u8, "Retry-After");
+    errdefer if (retry_after_name) |value| alloc.free(value);
+    var retry_after_value: ?[]u8 = try alloc.dupe(u8, "1");
+    errdefer if (retry_after_value) |value| alloc.free(value);
+    headers[0] = .{ .name = retry_after_name.?, .value = retry_after_value.? };
+    retry_after_name = null;
+    retry_after_value = null;
+    initialized_headers += 1;
+
+    var not_leader_name: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_header);
+    errdefer if (not_leader_name) |value| alloc.free(value);
+    var not_leader_value: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_value);
+    errdefer if (not_leader_value) |value| alloc.free(value);
+    headers[1] = .{ .name = not_leader_name.?, .value = not_leader_value.? };
+    not_leader_name = null;
+    not_leader_value = null;
+    initialized_headers += 1;
+
+    const content_type = try alloc.dupe(u8, "text/plain");
+    errdefer alloc.free(content_type);
+    const body = try alloc.dupe(u8, "metadata leader unavailable");
+    errdefer alloc.free(body);
+    return .{
+        .status = 503,
+        .content_type = content_type,
+        .headers = headers,
+        .body = body,
     };
 }
 
@@ -3138,6 +3287,7 @@ test "metadata http server appends explicit shutdown commands even when snapshot
 test "metadata http server finalizes node shutdown through explicit command" {
     const FakeSource = struct {
         finalize_count: usize = 0,
+        reallocate_count: usize = 0,
         nodes: [1]metadata_table_manager.NodeRecord = .{
             .{ .node_id = 9, .role = "data", .lifecycle = metadata_table_manager.node_lifecycle_active },
         },
@@ -3150,6 +3300,7 @@ test "metadata http server finalizes node shutdown through explicit command" {
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .finalize_node_shutdown = finalizeNodeShutdown,
+                    .trigger_reallocate = triggerReallocate,
                 },
             };
         }
@@ -3181,6 +3332,11 @@ test "metadata http server finalizes node shutdown through explicit command" {
             try std.testing.expectEqual(@as(u64, 9), node_id);
             self.finalize_count += 1;
         }
+
+        fn triggerReallocate(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reallocate_count += 1;
+        }
     };
 
     var source = FakeSource{};
@@ -3190,12 +3346,14 @@ test "metadata http server finalizes node shutdown through explicit command" {
     defer active_finalize_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 409), active_finalize_resp.status);
     try std.testing.expectEqual(@as(usize, 0), source.finalize_count);
+    try std.testing.expectEqual(@as(usize, 0), source.reallocate_count);
 
     source.nodes[0].lifecycle = metadata_table_manager.node_lifecycle_draining;
     var finalize_resp = try server.handle(.{ .method = .DELETE, .uri = "/internal/v1/nodes/9" });
     defer finalize_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), finalize_resp.status);
     try std.testing.expectEqual(@as(usize, 1), source.finalize_count);
+    try std.testing.expectEqual(@as(usize, 1), source.reallocate_count);
 }
 
 test "metadata http server rejects finalizing active store-only node" {

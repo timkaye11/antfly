@@ -3,8 +3,13 @@ SHELL := /bin/bash
 ZIG ?= zig
 ZIG_BUILD_FLAGS ?=
 UV ?= uv
+GIT ?= git
 SCRIPTS_PY := $(UV) run --project ../scripts --locked python
 INFERENCE_BIN ?= ./zig-out/bin/antfly
+OPENAPI_CODEGEN_SOURCES = build.zig build.zig.zon $(wildcard lib/openapi/src/*.zig)
+OPENAPI_CODEGEN_CACHE_KEY = $(strip $(shell $(GIT) hash-object $(OPENAPI_CODEGEN_SOURCES) 2>/dev/null | $(GIT) hash-object --stdin 2>/dev/null))
+OPENAPI_CODEGEN_CACHE_DIR ?= .zig-cache/openapi-generate-$(OPENAPI_CODEGEN_CACHE_KEY)
+OPENAPI_ZIG_BUILD = $(if $(OPENAPI_CODEGEN_CACHE_KEY),$(ZIG) build --cache-dir $(OPENAPI_CODEGEN_CACHE_DIR),$(error failed to compute OPENAPI_CODEGEN_CACHE_KEY; ensure git is available))
 
 # ====================================================================================
 # Build
@@ -52,19 +57,19 @@ inference-e2e-models: ## Prefetch the curated inference E2E model set with `antf
 # TLA+ Verification Commands
 # ====================================================================================
 
-.PHONY: generate generated-check openapi-generate openapi-check snowball-generate snowball-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-lsm tla-trace-raft tla-trace-txn
+.PHONY: generate generated-check openapi-generate openapi-check snowball-generate snowball-check cabi-header-generate cabi-header-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-lsm tla-trace-raft tla-trace-txn
 
-generate: openapi-generate snowball-generate ## Regenerate checked-in generated sources.
+generate: openapi-generate snowball-generate cabi-header-generate ## Regenerate checked-in generated sources.
 
-generated-check: openapi-check snowball-check ## Check all checked-in generated sources are current.
+generated-check: openapi-check snowball-check cabi-header-check ## Check all checked-in generated sources are current.
 
 openapi-generate:
 	$(SCRIPTS_PY) ../scripts/join_public_openapi.py openapi.yaml
-	$(ZIG) build regen-openapi
+	$(OPENAPI_ZIG_BUILD) regen-openapi
 
 openapi-check:
 	$(SCRIPTS_PY) ../scripts/join_public_openapi.py --compare openapi.yaml
-	$(ZIG) build regen-openapi
+	$(OPENAPI_ZIG_BUILD) regen-openapi
 	test -z "$$(git status --porcelain -- ../openapi.yaml pkg/antfly/src/openapi/generated pkg/inference/src/api/generated)"
 
 snowball-generate:
@@ -72,6 +77,12 @@ snowball-generate:
 
 snowball-check:
 	$(ZIG) build check-snowball
+
+cabi-header-generate:
+	$(SCRIPTS_PY) ../scripts/packaging/sync_cabi_header.py
+
+cabi-header-check:
+	$(SCRIPTS_PY) ../scripts/packaging/sync_cabi_header.py --check
 
 license-headers: ## Add license headers to first-party source files.
 	$(SCRIPTS_PY) ../scripts/license_headers.py

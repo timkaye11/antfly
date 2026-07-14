@@ -143,6 +143,12 @@ pub fn prepareLinearNoBiasSlot(
     return prepareLinearNoBiasSlotWithFallback(cb, allocator, slot, weight, in_dim, out_dim, true);
 }
 
+pub const PrepareLinearNoBiasSlotOptions = struct {
+    retain_dense_fallback: bool = true,
+    disable_mapped_quant_weight: bool = false,
+    dense_fallback_max_bytes: ?usize = null,
+};
+
 pub fn prepareLinearNoBiasDenseSlot(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
@@ -152,27 +158,9 @@ pub fn prepareLinearNoBiasDenseSlot(
     out_dim: usize,
     retain_dense_fallback: bool,
 ) !bool {
-    const started_at = monotonicNowNs();
-    timing_stats.linear_calls += 1;
-    const bias_dense = try zeroBiasTensorGeneric(cb, allocator, out_dim);
-    defer cb.free(bias_dense);
-
-    const prepared = try cb.decoderRuntimePrepareLinear(&.{
-        .slot = slot,
-        .weight = weight,
-        .bias = bias_dense,
-        .in_dim = in_dim,
-        .out_dim = out_dim,
+    return prepareLinearNoBiasSlotWithOptions(cb, allocator, slot, weight, in_dim, out_dim, .{
         .retain_dense_fallback = retain_dense_fallback,
     });
-    const finished_at = monotonicNowNs();
-    timing_stats.linear_dense_calls += 1;
-    if (finished_at > started_at) {
-        const elapsed = finished_at - started_at;
-        timing_stats.linear_nanos += elapsed;
-        timing_stats.linear_dense_nanos += elapsed;
-    }
-    return prepared;
 }
 
 pub fn prepareLinearNoBiasSlotWithFallback(
@@ -183,6 +171,20 @@ pub fn prepareLinearNoBiasSlotWithFallback(
     in_dim: usize,
     out_dim: usize,
     retain_dense_fallback: bool,
+) !bool {
+    return prepareLinearNoBiasSlotWithOptions(cb, allocator, slot, weight, in_dim, out_dim, .{
+        .retain_dense_fallback = retain_dense_fallback,
+    });
+}
+
+pub fn prepareLinearNoBiasSlotWithOptions(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    slot: usize,
+    weight: ops.CT,
+    in_dim: usize,
+    out_dim: usize,
+    options: PrepareLinearNoBiasSlotOptions,
 ) !bool {
     const started_at = monotonicNowNs();
     timing_stats.linear_calls += 1;
@@ -196,7 +198,9 @@ pub fn prepareLinearNoBiasSlotWithFallback(
             .bias = bias_dense,
             .in_dim = in_dim,
             .out_dim = out_dim,
-            .retain_dense_fallback = retain_dense_fallback,
+            .retain_dense_fallback = options.retain_dense_fallback,
+            .disable_mapped_quant_weight = options.disable_mapped_quant_weight,
+            .dense_fallback_max_bytes = options.dense_fallback_max_bytes,
         });
         const finished_at = monotonicNowNs();
         timing_stats.linear_quantized_calls += 1;
@@ -214,7 +218,9 @@ pub fn prepareLinearNoBiasSlotWithFallback(
         .bias = bias_dense,
         .in_dim = in_dim,
         .out_dim = out_dim,
-        .retain_dense_fallback = retain_dense_fallback,
+        .retain_dense_fallback = options.retain_dense_fallback,
+        .disable_mapped_quant_weight = options.disable_mapped_quant_weight,
+        .dense_fallback_max_bytes = options.dense_fallback_max_bytes,
     });
     const finished_at = monotonicNowNs();
     timing_stats.linear_dense_calls += 1;
@@ -240,13 +246,28 @@ pub fn embedToken(
     if (finished_at > started_at) timing_stats.embed_lookup_nanos += finished_at - started_at;
     defer cb.free(embed_w);
     started_at = monotonicNowNs();
-    const embedded = try cb.embeddingLookup(embed_w, input_ids[0..], 1, gpt_config.hidden_size);
+    const scaled = try gpt_arch.lookupScaledTokenEmbeddings(cb, allocator, gpt_config, embed_w, input_ids[0..], 1, gpt_config.hidden_size);
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.embed_gather_nanos += finished_at - started_at;
+    return scaled;
+}
+
+pub fn embedTokenTensor(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    token_tensor: ops.CT,
+) !?ops.CT {
+    timing_stats.embed_calls += 1;
+    var started_at = monotonicNowNs();
+    const embed_w = try gpt_arch.getEmbeddingWeight(cb, gpt_config);
+    var finished_at = monotonicNowNs();
+    if (finished_at > started_at) timing_stats.embed_lookup_nanos += finished_at - started_at;
+    defer cb.free(embed_w);
     started_at = monotonicNowNs();
-    const scaled = try gpt_arch.maybeScaleTokenEmbeddings(cb, allocator, gpt_config, embedded, 1, gpt_config.hidden_size);
+    const scaled = (try gpt_arch.lookupScaledTokenEmbeddingsTensor(cb, allocator, gpt_config, embed_w, token_tensor, 1, gpt_config.hidden_size)) orelse return null;
     finished_at = monotonicNowNs();
-    if (finished_at > started_at) timing_stats.embed_scale_nanos += finished_at - started_at;
+    if (finished_at > started_at) timing_stats.embed_gather_nanos += finished_at - started_at;
     return scaled;
 }
 
@@ -263,12 +284,8 @@ pub fn embedTokens(
     if (finished_at > started_at) timing_stats.embed_lookup_nanos += finished_at - started_at;
     defer cb.free(embed_w);
     started_at = monotonicNowNs();
-    const embedded = try cb.embeddingLookup(embed_w, input_ids, input_ids.len, gpt_config.hidden_size);
+    const scaled = try gpt_arch.lookupScaledTokenEmbeddings(cb, allocator, gpt_config, embed_w, input_ids, input_ids.len, gpt_config.hidden_size);
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.embed_gather_nanos += finished_at - started_at;
-    started_at = monotonicNowNs();
-    const scaled = try gpt_arch.maybeScaleTokenEmbeddings(cb, allocator, gpt_config, embedded, input_ids.len, gpt_config.hidden_size);
-    finished_at = monotonicNowNs();
-    if (finished_at > started_at) timing_stats.embed_scale_nanos += finished_at - started_at;
     return scaled;
 }

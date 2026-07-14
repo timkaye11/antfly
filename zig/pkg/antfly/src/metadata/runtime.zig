@@ -26,6 +26,10 @@ const platform_time = @import("../platform/time.zig");
 const setup_io_thread_stack_size = 1 * 1024 * 1024;
 const metadata_raft_retained_entries = 1024;
 const metadata_raft_compaction_min_interval_entries = 512;
+const metadata_raft_election_max_ticks = 60;
+const metadata_bootstrap_campaign_retry_min_interval_ns: u64 = 500 * std.time.ns_per_ms;
+const trusted_principal_secret_key = "antfly.trusted_principal.secret";
+const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
 
 fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
     return .{
@@ -68,8 +72,14 @@ const CliConfig = struct {
     replica_catalog_path: ?[]const u8 = null,
     snapshot_root_dir: ?[]const u8 = null,
     extension_package_store_dir: ?[]const u8 = null,
-    secret_store_path: ?[]const u8 = null,
+    secret_store_paths: std.ArrayListUnmanaged([]const u8) = .empty,
+    auth_enabled: ?bool = null,
     help: bool = false,
+
+    fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
+        self.secret_store_paths.deinit(alloc);
+        self.* = undefined;
+    }
 };
 
 const Factory = struct {
@@ -133,12 +143,14 @@ const ResolvedPaths = struct {
     replica_root_dir: []u8,
     replica_catalog_path: []u8,
     snapshot_root_dir: []u8,
+    auth_store_root_dir: []u8,
     extension_package_store_dir: []u8,
 
     fn deinit(self: ResolvedPaths, alloc: std.mem.Allocator) void {
         alloc.free(self.replica_root_dir);
         alloc.free(self.replica_catalog_path);
         alloc.free(self.snapshot_root_dir);
+        alloc.free(self.auth_store_root_dir);
         alloc.free(self.extension_package_store_dir);
     }
 };
@@ -300,7 +312,6 @@ pub const ServerConfig = struct {
     local_node_id: u64 = 1,
     metadata_group_id: u64 = group_ids.main_metadata_group_id,
     metadata_cluster_peers: []const MetadataClusterPeer = &.{},
-    metadata_orchestration_urls: []const antfly.metadata_service.MetadataOrchestrationUrl = &.{},
     replica_root_dir: []const u8,
     replica_catalog_path: []const u8,
     snapshot_root_dir: []const u8,
@@ -313,6 +324,7 @@ pub const ServerConfig = struct {
     reconciler_config: antfly.metadata.reconciler.Reconciler.Config = .{},
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     secret_store: ?*antfly.common.secrets.FileStore = null,
+    api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
 };
 
 const MetadataRaftStorageDiagnostics = struct {
@@ -411,7 +423,6 @@ pub const Server = struct {
         const service_cfg = antfly.metadata_service.MetadataServiceConfig{
             .observe_local_replica_root = cfg.observe_local_replica_root,
             .backend_runtime = cfg.backend_runtime,
-            .metadata_orchestration_urls = cfg.metadata_orchestration_urls,
             .secret_store = cfg.secret_store,
         };
         result.server = try antfly.metadata_server.MetadataServer.init(alloc, .{
@@ -426,10 +437,7 @@ pub const Server = struct {
                         .replica_state_backend = cfg.replica_state_backend,
                         .trace_logger = if (build_options.with_tla) tracing.stderrRaftTraceLogger() else null,
                     },
-                    .listener = .{
-                        .bind_host = result.bind_host,
-                        .bind_port = cfg.bind_port,
-                    },
+                    .listener = antfly.raft.httpListenerConfig(result.bind_host, cfg.bind_port),
                     .transport = .{
                         .snapshot = .{
                             .root_dir = result.snapshot_root_dir,
@@ -441,8 +449,11 @@ pub const Server = struct {
             .admin_listener = .{
                 .bind_host = result.admin_bind_host,
                 .bind_port = cfg.admin_bind_port,
+                .serve_in_connection_threads = true,
+                .max_connection_threads = 32,
             },
             .service = service_cfg,
+            .api_server_cfg = cfg.api_server_cfg,
             .reconciler_config = cfg.reconciler_config,
         }, .{
             .http = .{
@@ -576,6 +587,13 @@ pub const Server = struct {
         try self.server.runCdcRound();
     }
 
+    pub fn campaignMetadataGroupIfBootstrapLeaderless(self: *Server, metadata_group_id: u64, local_node_id: u64) !bool {
+        const raft_status = self.server.svc.raft.host.http_host.host.raftStatus(metadata_group_id);
+        if (!metadataRaftStatusShouldBootstrapCampaign(raft_status, local_node_id)) return false;
+        try self.server.campaignMetadataGroup();
+        return true;
+    }
+
     pub fn status(self: *Server) !antfly.metadata_api.MetadataStatus {
         return try self.server.status();
     }
@@ -650,6 +668,39 @@ fn indexOfClusterPeer(cluster_peers: []const MetadataClusterPeer, node_id: u64) 
     return null;
 }
 
+fn metadataClusterPreferredCampaigner(cluster_peers: []const MetadataClusterPeer, local_node_id: u64) bool {
+    if (cluster_peers.len == 0) return true;
+    var min_node_id = cluster_peers[0].node_id;
+    for (cluster_peers[1..]) |peer| {
+        if (peer.node_id < min_node_id) min_node_id = peer.node_id;
+    }
+    return local_node_id == min_node_id;
+}
+
+fn metadataRaftStatusIsVoter(status: raft_engine.core.Status, local_node_id: u64) bool {
+    for (status.conf_state.voters) |node_id| {
+        if (node_id == local_node_id) return true;
+    }
+    return false;
+}
+
+fn metadataRaftStatusShouldBootstrapCampaign(status: ?raft_engine.core.Status, local_node_id: u64) bool {
+    const raft_status = status orelse return false;
+    if (raft_status.soft.leader_id != null) return false;
+    switch (raft_status.soft.role) {
+        .follower, .pre_candidate, .candidate => {},
+        .leader => return false,
+    }
+    return metadataRaftStatusIsVoter(raft_status, local_node_id);
+}
+
+fn metadataBootstrapCampaignRetryIntervalNs(tick_ms: u64) u64 {
+    return @max(
+        metadata_bootstrap_campaign_retry_min_interval_ns,
+        tick_ms * std.time.ns_per_ms * metadata_raft_election_max_ticks * 2,
+    );
+}
+
 fn allocMetadataPeerNodeIds(
     alloc: std.mem.Allocator,
     local_node_id: u64,
@@ -680,7 +731,8 @@ pub fn runFromIterator(
     args: *std.process.Args.Iterator,
 ) !void {
     const alloc = init.gpa;
-    const cli = try parseCli(args);
+    var cli = try parseCli(alloc, args);
+    defer cli.deinit(alloc);
     if (cli.help) {
         printUsage(argv0);
         return;
@@ -690,10 +742,8 @@ pub fn runFromIterator(
     var secret_store_initialized = false;
     defer if (secret_store_initialized) secret_store.deinit();
 
-    if (cli.secret_store_path) |raw_secret_store_path| {
-        const normalized_secret_store_path = try normalizeResolvedPathAlloc(alloc, raw_secret_store_path);
-        defer alloc.free(normalized_secret_store_path);
-        secret_store = try antfly.common.secrets.FileStore.init(alloc, normalized_secret_store_path);
+    if (cli.secret_store_paths.items.len > 0) {
+        secret_store = try initLayeredSecretStore(alloc, cli.secret_store_paths.items);
         secret_store_initialized = true;
     }
 
@@ -713,12 +763,20 @@ pub fn runFromIterator(
 
     const resolved = try resolvePaths(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer resolved.deinit(alloc);
+    const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);
+    const trusted_principal_secret = try resolveTrustedPrincipalSecret(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+    );
+    defer if (trusted_principal_secret) |value| alloc.free(value);
+    const effective_auth_enabled = auth_enabled or trusted_principal_secret != null;
 
     var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
     defer setup_io.deinit();
     try ensureDirPath(setup_io.io(), resolved.replica_root_dir);
     try ensureParent(setup_io.io(), resolved.replica_catalog_path);
     try ensureDirPath(setup_io.io(), resolved.snapshot_root_dir);
+    try fs_paths.createDirPathPortable(setup_io.io(), resolved.auth_store_root_dir);
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,
@@ -727,12 +785,40 @@ pub fn runFromIterator(
     );
     defer active_audio_runtime.deinit();
 
+    var auth_backend: ?antfly.lsm_backend.BackendHandle = null;
+    var auth_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    var auth_user_store: ?antfly.usermgr.StorageUserStore = null;
+    var auth_casbin_store: ?antfly.usermgr.StorageCasbinAdapter = null;
+    var user_manager: ?antfly.usermgr.UserManager = null;
+    if (auth_enabled) {
+        auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, resolved.auth_store_root_dir, .{});
+        errdefer if (auth_backend) |*backend| backend.close();
+        auth_runtime = try auth_backend.?.backend.runtimeNamespaceStore(alloc);
+        errdefer if (auth_runtime) |*runtime| runtime.deinit();
+        auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
+        auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
+        user_manager = try antfly.usermgr.UserManager.init(
+            alloc,
+            auth_user_store.?.iface(),
+            try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
+        );
+        errdefer if (user_manager) |*manager| manager.deinit();
+        try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?);
+    }
+    defer if (user_manager) |*manager| manager.deinit();
+    defer if (auth_runtime) |*runtime| runtime.deinit();
+    defer if (auth_backend) |*backend| backend.close();
+
+    const trusted_principal_issuer = try resolveTrustedPrincipalIssuer(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+    );
+    defer if (trusted_principal_issuer) |value| alloc.free(value);
+
     const local_node_id = cli.local_node_id orelse 1;
     const metadata_group_id = group_ids.main_metadata_group_id;
     const cluster_peers = try resolveMetadataClusterPeers(alloc, cli.cluster_json, if (loaded_config) |*cfg| cfg else null);
     defer freeMetadataClusterPeers(alloc, cluster_peers);
-    const orchestration_urls = try resolveMetadataOrchestrationUrls(alloc, if (loaded_config) |*cfg| cfg else null);
-    defer freeMetadataOrchestrationUrls(alloc, orchestration_urls);
     if (cli.join) return error.UnsupportedMetadataJoin;
     const listener = resolveRaftListener(cli, if (loaded_config) |*cfg| cfg else null);
     const admin_listener = resolveAdminListener(cli, if (loaded_config) |*cfg| cfg else null, local_node_id, listener.bind_host);
@@ -741,7 +827,6 @@ pub fn runFromIterator(
         .local_node_id = local_node_id,
         .metadata_group_id = metadata_group_id,
         .metadata_cluster_peers = cluster_peers,
-        .metadata_orchestration_urls = orchestration_urls,
         .replica_root_dir = resolved.replica_root_dir,
         .replica_catalog_path = resolved.replica_catalog_path,
         .snapshot_root_dir = resolved.snapshot_root_dir,
@@ -751,6 +836,17 @@ pub fn runFromIterator(
         .admin_bind_port = admin_listener.bind_port,
         .reconciler_config = shardAllocationReconcilerConfig(if (loaded_config) |*cfg| cfg else null),
         .secret_store = if (secret_store_initialized) &secret_store else null,
+        .api_server_cfg = .{
+            .auth_enabled = effective_auth_enabled,
+            .trusted_principal_secret = trusted_principal_secret,
+            .trusted_principal_issuer = trusted_principal_issuer,
+            .user_manager = if (user_manager) |*manager| manager else null,
+            .secret_store = if (secret_store_initialized) &secret_store else null,
+            .remote_content = if (loaded_config) |*cfg| if (cfg.remote_content) |*remote_content| remote_content else null else null,
+            .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
+            .extension_package_store_dir = resolved.extension_package_store_dir,
+            .node_config = if (loaded_config) |*cfg| cfg else null,
+        },
     });
     defer server.deinit();
     try server.start();
@@ -788,11 +884,25 @@ pub fn runFromIterator(
         .sec = @intCast(tick_ms / std.time.ms_per_s),
         .nsec = @intCast((tick_ms % std.time.ms_per_s) * std.time.ns_per_ms),
     };
+    const preferred_bootstrap_campaigner = metadataClusterPreferredCampaigner(cluster_peers, local_node_id);
+    const bootstrap_campaign_retry_interval_ns = metadataBootstrapCampaignRetryIntervalNs(tick_ms);
+    var last_bootstrap_campaign_retry_ns = platform_time.monotonicNs();
     while (true) {
+        if (preferred_bootstrap_campaigner) {
+            const now_ns = platform_time.monotonicNs();
+            if (last_bootstrap_campaign_retry_ns == 0 or
+                now_ns -| last_bootstrap_campaign_retry_ns >= bootstrap_campaign_retry_interval_ns)
+            {
+                if (try server.campaignMetadataGroupIfBootstrapLeaderless(metadata_group_id, local_node_id)) {
+                    std.log.warn("metadata bootstrap campaign retry node_id={}", .{local_node_id});
+                    last_bootstrap_campaign_retry_ns = now_ns;
+                }
+            }
+        }
         const run_round_start_ns = platform_time.monotonicNs();
         try server.runRound();
         const run_round_elapsed_ns = platform_time.monotonicNs() -| run_round_start_ns;
-        if (run_round_elapsed_ns > std.time.ns_per_s) {
+        if (run_round_elapsed_ns > antfly.metadata_service.metadata_run_round_slow_threshold_ns) {
             std.log.warn("metadata runRound slow elapsed_ms={d}", .{@divTrunc(run_round_elapsed_ns, std.time.ns_per_ms)});
         }
         const cdc_round_start_ns = platform_time.monotonicNs();
@@ -810,8 +920,9 @@ pub fn runFromIterator(
     }
 }
 
-fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
+fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConfig {
     var cfg = CliConfig{};
+    errdefer cfg.deinit(alloc);
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             cfg.help = true;
@@ -887,12 +998,37 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             continue;
         }
         if (std.mem.eql(u8, arg, "--secret-store-path")) {
-            cfg.secret_store_path = args.next() orelse return error.InvalidArguments;
+            try cfg.secret_store_paths.append(alloc, args.next() orelse return error.InvalidArguments);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--auth")) {
+            cfg.auth_enabled = parseBoolFlag(args.next() orelse return error.InvalidArguments) orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--auth=")) {
+            cfg.auth_enabled = parseBoolFlag(arg["--auth=".len..]) orelse return error.InvalidArguments;
             continue;
         }
         return error.InvalidArguments;
     }
     return cfg;
+}
+
+fn initLayeredSecretStore(
+    alloc: std.mem.Allocator,
+    raw_paths: []const []const u8,
+) !antfly.common.secrets.FileStore {
+    var normalized_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (normalized_paths.items) |path| alloc.free(path);
+        normalized_paths.deinit(alloc);
+    }
+    for (raw_paths) |raw_path| {
+        const normalized_path = try normalizeResolvedPathAlloc(alloc, raw_path);
+        errdefer alloc.free(normalized_path);
+        try normalized_paths.append(alloc, normalized_path);
+    }
+    return try antfly.common.secrets.FileStore.initLayered(alloc, normalized_paths.items);
 }
 
 fn resolveLocalBaseDir(
@@ -907,13 +1043,13 @@ fn resolveLocalBaseDir(
 fn resolvePaths(alloc: std.mem.Allocator, cli: CliConfig, cfg: ?*const antfly.common.config.Config) !ResolvedPaths {
     const local_base = try resolveLocalBaseDir(alloc, cli, cfg);
     defer alloc.free(local_base);
-    const base = try std.fmt.allocPrint(alloc, "{s}/metadata", .{local_base});
-    defer alloc.free(base);
+    const metadata_base = try std.fmt.allocPrint(alloc, "{s}/metadata", .{local_base});
+    defer alloc.free(metadata_base);
 
     const replica_root_dir = if (cli.replica_root_dir) |path|
         try normalizeResolvedPathAlloc(alloc, path)
     else blk: {
-        const raw = try std.fmt.allocPrint(alloc, "{s}/replicas", .{base});
+        const raw = try std.fmt.allocPrint(alloc, "{s}/replicas", .{metadata_base});
         defer alloc.free(raw);
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
@@ -921,7 +1057,7 @@ fn resolvePaths(alloc: std.mem.Allocator, cli: CliConfig, cfg: ?*const antfly.co
     const replica_catalog_path = if (cli.replica_catalog_path) |path|
         try normalizeResolvedPathAlloc(alloc, path)
     else blk: {
-        const raw = try std.fmt.allocPrint(alloc, "{s}/catalog.txt", .{base});
+        const raw = try std.fmt.allocPrint(alloc, "{s}/catalog.txt", .{metadata_base});
         defer alloc.free(raw);
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
@@ -929,26 +1065,60 @@ fn resolvePaths(alloc: std.mem.Allocator, cli: CliConfig, cfg: ?*const antfly.co
     const snapshot_root_dir = if (cli.snapshot_root_dir) |path|
         try normalizeResolvedPathAlloc(alloc, path)
     else blk: {
-        const raw = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{base});
+        const raw = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{metadata_base});
         defer alloc.free(raw);
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
     errdefer alloc.free(snapshot_root_dir);
-    const extension_package_store_dir = if (cli.extension_package_store_dir) |path|
-        try normalizeResolvedPathAlloc(alloc, path)
-    else blk: {
-        const raw = try std.fmt.allocPrint(alloc, "{s}/extensions", .{local_base});
+    const auth_store_root_dir = blk: {
+        const raw = try std.fmt.allocPrint(alloc, "{s}/auth", .{metadata_base});
         defer alloc.free(raw);
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
+    errdefer alloc.free(auth_store_root_dir);
+    const extension_package_store_dir = try resolveExtensionPackageStoreDir(alloc, cli.extension_package_store_dir, local_base);
     errdefer alloc.free(extension_package_store_dir);
 
     return .{
         .replica_root_dir = replica_root_dir,
         .replica_catalog_path = replica_catalog_path,
         .snapshot_root_dir = snapshot_root_dir,
+        .auth_store_root_dir = auth_store_root_dir,
         .extension_package_store_dir = extension_package_store_dir,
     };
+}
+
+fn resolveExtensionPackageStoreDir(
+    alloc: std.mem.Allocator,
+    cli_path: ?[]const u8,
+    local_base: []const u8,
+) ![]u8 {
+    const env_var_z = try alloc.dupeZ(u8, antfly.extensions.wasmtime_runtime.package_store_env);
+    defer alloc.free(env_var_z);
+    return try resolveExtensionPackageStoreDirWithEnv(
+        alloc,
+        cli_path,
+        local_base,
+        platform.env.getenvSlice(env_var_z),
+    );
+}
+
+fn resolveExtensionPackageStoreDirWithEnv(
+    alloc: std.mem.Allocator,
+    cli_path: ?[]const u8,
+    local_base: []const u8,
+    env_path: ?[]const u8,
+) ![]u8 {
+    if (cli_path) |path| return try normalizeResolvedPathAlloc(alloc, path);
+    if (env_path) |path| {
+        if (std.mem.trim(u8, path, " \t\r\n").len > 0) {
+            return try normalizeResolvedPathAlloc(alloc, path);
+        }
+    }
+
+    const raw = try std.fmt.allocPrint(alloc, "{s}/extensions", .{local_base});
+    defer alloc.free(raw);
+    return try normalizeResolvedPathAlloc(alloc, raw);
 }
 
 fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -1084,36 +1254,6 @@ pub fn metadataClusterPeerUrl(
     return null;
 }
 
-fn resolveMetadataOrchestrationUrls(
-    alloc: std.mem.Allocator,
-    cfg: ?*const antfly.common.config.Config,
-) ![]antfly.metadata_service.MetadataOrchestrationUrl {
-    const loaded = cfg orelse return &.{};
-    if (loaded.metadata.orchestration_urls.len == 0) return &.{};
-    var out = try alloc.alloc(antfly.metadata_service.MetadataOrchestrationUrl, loaded.metadata.orchestration_urls.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |entry| alloc.free(entry.url);
-        alloc.free(out);
-    }
-    for (loaded.metadata.orchestration_urls, 0..) |entry, index| {
-        out[index] = .{
-            .node_id = entry.node_id,
-            .url = try alloc.dupe(u8, entry.url),
-        };
-        initialized += 1;
-    }
-    return out;
-}
-
-fn freeMetadataOrchestrationUrls(
-    alloc: std.mem.Allocator,
-    urls: []antfly.metadata_service.MetadataOrchestrationUrl,
-) void {
-    for (urls) |entry| alloc.free(entry.url);
-    if (urls.len > 0) alloc.free(urls);
-}
-
 pub fn metadataOrchestrationPeerUrl(
     cfg: *const antfly.common.config.Config,
     node_id: u64,
@@ -1205,7 +1345,8 @@ fn printUsage(argv0: []const u8) void {
         \\  --snapshot-root-dir <path>     Snapshot root directory
         \\  --extension-package-store <path>
         \\                                 Extension package store directory
-        \\  --secret-store-path <path>     Antfly secrets.json file path
+        \\  --secret-store-path <path>     Antfly secrets.json file path; repeat for fallback layers
+        \\  --auth <true|false>            Enable public API auth on metadata (default: config)
         \\  -h, --help                     Show this help
         \\
     , .{argv0});
@@ -1215,6 +1356,65 @@ fn parseBoolFlag(raw: []const u8) ?bool {
     if (std.mem.eql(u8, raw, "true")) return true;
     if (std.mem.eql(u8, raw, "false")) return false;
     return null;
+}
+
+fn resolveAuthEnabled(cli: CliConfig, cfg: ?*const antfly.common.config.Config) bool {
+    if (cli.auth_enabled) |value| return value;
+    if (cfg) |loaded| return loaded.auth_enabled;
+    return false;
+}
+
+fn resolveTrustedPrincipalSecret(
+    alloc: std.mem.Allocator,
+    secret_store: ?*antfly.common.secrets.FileStore,
+) !?[]u8 {
+    return try resolveMetadataRuntimeSecretValue(alloc, secret_store, trusted_principal_secret_key);
+}
+
+fn resolveTrustedPrincipalIssuer(
+    alloc: std.mem.Allocator,
+    secret_store: ?*antfly.common.secrets.FileStore,
+) !?[]u8 {
+    return try resolveMetadataRuntimeSecretValue(alloc, secret_store, trusted_principal_issuer_key);
+}
+
+fn resolveMetadataRuntimeSecretValue(
+    alloc: std.mem.Allocator,
+    secret_store: ?*antfly.common.secrets.FileStore,
+    key: []const u8,
+) !?[]u8 {
+    if (secret_store) |store| {
+        if (try store.getOwned(alloc, key)) |value| {
+            if (std.mem.trim(u8, value, " \t\r\n").len > 0) return value;
+            alloc.free(value);
+            return null;
+        }
+        return null;
+    }
+
+    const env_var = try antfly.common.secrets.envVarForKey(alloc, key);
+    defer alloc.free(env_var);
+    const env_var_z = try alloc.dupeZ(u8, env_var);
+    defer alloc.free(env_var_z);
+    if (platform.env.getenvSlice(env_var_z)) |value| {
+        const raw = try alloc.dupe(u8, value);
+        if (std.mem.trim(u8, raw, " \t\r\n").len > 0) return raw;
+        alloc.free(raw);
+    }
+    return null;
+}
+
+fn canonicalizeMetadataRuntimeValue(alloc: std.mem.Allocator, value: []u8) !?[]u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) {
+        alloc.free(value);
+        return null;
+    }
+    if (trimmed.len == value.len) return value;
+    errdefer alloc.free(value);
+    const canonical = try alloc.dupe(u8, trimmed);
+    alloc.free(value);
+    return canonical;
 }
 
 test "metadata runtime module compiles" {
@@ -1230,9 +1430,60 @@ test "metadata runtime cli accepts secret and extension package store paths" {
         "/opt/antfly/extensions",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-    const cfg = try parseCli(&iter);
-    try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_path.?);
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_paths.items[0]);
     try std.testing.expectEqualStrings("/opt/antfly/extensions", cfg.extension_package_store_dir.?);
+}
+
+test "metadata runtime cli accepts layered secret store paths" {
+    var argv = [_][*:0]const u8{
+        "--secret-store-path",
+        "/run/antfly/user-secrets/secrets.json",
+        "--secret-store-path",
+        "/run/antfly/system-secrets/secrets.json",
+    };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), cfg.secret_store_paths.items.len);
+    try std.testing.expectEqualStrings("/run/antfly/user-secrets/secrets.json", cfg.secret_store_paths.items[0]);
+    try std.testing.expectEqualStrings("/run/antfly/system-secrets/secrets.json", cfg.secret_store_paths.items[1]);
+}
+
+test "metadata runtime cli accepts auth flag" {
+    var argv = [_][*:0]const u8{
+        "--auth=true",
+    };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqual(true, cfg.auth_enabled.?);
+}
+
+test "metadata runtime preserves trusted principal auth material bytes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-trusted-principal-secrets.json", .{tmp.sub_path});
+    defer alloc.free(store_path);
+
+    var secret_store = try antfly.common.secrets.FileStore.init(alloc, store_path);
+    defer secret_store.deinit();
+
+    var stored_secret = try secret_store.put(alloc, trusted_principal_secret_key, " shared-secret \n");
+    defer stored_secret.deinit(alloc);
+    var stored_issuer = try secret_store.put(alloc, trusted_principal_issuer_key, "\ttrusted-upstream ");
+    defer stored_issuer.deinit(alloc);
+
+    const secret = try resolveTrustedPrincipalSecret(alloc, &secret_store);
+    defer if (secret) |value| alloc.free(value);
+    const issuer = try resolveTrustedPrincipalIssuer(alloc, &secret_store);
+    defer if (issuer) |value| alloc.free(value);
+
+    try std.testing.expectEqualStrings(" shared-secret \n", secret.?);
+    try std.testing.expectEqualStrings("\ttrusted-upstream ", issuer.?);
 }
 
 fn expectMetricPresent(output: []const u8, name: []const u8) !void {
@@ -1332,6 +1583,87 @@ test "metadata runtime enables bounded raft storage compaction for multi-node gr
     try std.testing.expectEqual(@as(u64, metadata_raft_retained_entries), wal_cfg.compaction_retained_entries);
     try std.testing.expectEqual(@as(u64, metadata_raft_compaction_min_interval_entries), wal_cfg.compaction_min_interval_entries);
     try std.testing.expect(!wal_cfg.compaction_single_node_only);
+}
+
+test "metadata runtime chooses one preferred bootstrap campaigner" {
+    const peers = [_]MetadataClusterPeer{
+        .{ .node_id = 3, .raft_url = "http://127.0.0.1:3003" },
+        .{ .node_id = 1, .raft_url = "http://127.0.0.1:3001" },
+        .{ .node_id = 2, .raft_url = "http://127.0.0.1:3002" },
+    };
+
+    try std.testing.expect(metadataClusterPreferredCampaigner(&.{}, 7));
+    try std.testing.expect(metadataClusterPreferredCampaigner(&peers, 1));
+    try std.testing.expect(!metadataClusterPreferredCampaigner(&peers, 2));
+    try std.testing.expect(!metadataClusterPreferredCampaigner(&peers, 3));
+}
+
+test "metadata runtime retries bootstrap campaign only for leaderless voters" {
+    var voters = [_]u64{ 1, 2, 3 };
+    var status = raft_engine.core.Status{
+        .id = 1,
+        .group_id = group_ids.main_metadata_group_id,
+        .soft = .{ .leader_id = null, .role = .follower },
+        .hard = .{},
+        .conf_state = .{ .voters = voters[0..] },
+    };
+
+    try std.testing.expect(metadataRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .pre_candidate;
+    try std.testing.expect(metadataRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .candidate;
+    try std.testing.expect(metadataRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .leader;
+    status.soft.leader_id = 1;
+    try std.testing.expect(!metadataRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .follower;
+    status.soft.leader_id = 2;
+    try std.testing.expect(!metadataRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.leader_id = null;
+    try std.testing.expect(!metadataRaftStatusShouldBootstrapCampaign(status, 4));
+}
+
+test "metadata runtime scales bootstrap campaign retry interval with tick" {
+    try std.testing.expectEqual(
+        @as(u64, 600 * std.time.ns_per_ms),
+        metadataBootstrapCampaignRetryIntervalNs(5),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 12 * std.time.ns_per_s),
+        metadataBootstrapCampaignRetryIntervalNs(100),
+    );
+}
+
+test "metadata runtime serves raft and admin listener requests on threaded io connections" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-admin-threaded-listener/replicas", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-admin-threaded-listener/catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_catalog_path);
+    const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-admin-threaded-listener/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(snapshot_root);
+
+    var server = try Server.init(std.testing.allocator, .{
+        .replica_root_dir = replica_root,
+        .replica_catalog_path = replica_catalog_path,
+        .snapshot_root_dir = snapshot_root,
+    });
+    defer server.deinit();
+
+    const admin_listener = server.server.owned_admin_listener orelse return error.MissingMetadataAdminListener;
+    const raft_listener = server.server.svc.raft.host.http_host.listener;
+    try std.testing.expect(raft_listener.cfg.serve_in_connection_threads);
+    try std.testing.expectEqual(antfly.raft.default_http_listener_max_connection_threads, raft_listener.cfg.max_connection_threads);
+    try std.testing.expect(admin_listener.cfg.serve_in_connection_threads);
+    try std.testing.expectEqual(@as(u32, 32), admin_listener.cfg.max_connection_threads);
+    try std.testing.expect(server.metadataHttpService().apiIoImpl() != null);
 }
 
 test "metadata runtime metrics expose memory ownership buckets" {
@@ -1548,6 +1880,7 @@ test "metadata runtime resolves paths from common storage base dir" {
     try std.testing.expectEqualStrings("/tmp/antflydb/metadata/replicas", resolved.replica_root_dir);
     try std.testing.expectEqualStrings("/tmp/antflydb/metadata/catalog.txt", resolved.replica_catalog_path);
     try std.testing.expectEqualStrings("/tmp/antflydb/metadata/snapshots", resolved.snapshot_root_dir);
+    try std.testing.expectEqualStrings("/tmp/antflydb/metadata/auth", resolved.auth_store_root_dir);
     try std.testing.expectEqualStrings("/tmp/antflydb/extensions", resolved.extension_package_store_dir);
 }
 
@@ -1559,6 +1892,18 @@ test "metadata runtime resolves explicit extension package store path" {
     }, null);
     defer resolved.deinit(alloc);
     try std.testing.expectEqualStrings("/opt/antfly/extension-store", resolved.extension_package_store_dir);
+}
+
+test "metadata runtime resolves extension package store env before local default" {
+    const alloc = std.testing.allocator;
+
+    const env_resolved = try resolveExtensionPackageStoreDirWithEnv(alloc, null, "/tmp/antflydb", "/antfly-extension-env");
+    defer alloc.free(env_resolved);
+    try std.testing.expectEqualStrings("/antfly-extension-env", env_resolved);
+
+    const cli_resolved = try resolveExtensionPackageStoreDirWithEnv(alloc, "/antfly-cli-extensions", "/tmp/antflydb", "/antfly-extension-env");
+    defer alloc.free(cli_resolved);
+    try std.testing.expectEqualStrings("/antfly-cli-extensions", cli_resolved);
 }
 
 test "metadata runtime derives reconciler config from common shard allocation settings" {

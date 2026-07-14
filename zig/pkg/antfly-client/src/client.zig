@@ -55,6 +55,12 @@ pub const AntflyClient = struct {
         self.inner.deinit();
     }
 
+    pub fn setBaseUrl(self: *AntflyClient, base_url: []const u8) !void {
+        const url = try normalizeBaseUrl(self.allocator, base_url);
+        self.allocator.free(self.inner.base_url);
+        self.inner.base_url = url;
+    }
+
     // --- Auth ---
 
     pub fn setBearer(self: *AntflyClient, token: []const u8) !void {
@@ -176,6 +182,105 @@ pub const AntflyClient = struct {
         return resp;
     }
 
+    // --- Artifact operations ---
+
+    pub fn listDocumentArtifactManifests(
+        self: *AntflyClient,
+        table_name: []const u8,
+        key: []const u8,
+        params: openapi.client.ListDocumentArtifactManifestsParams,
+    ) !openapi.ApiResponse(openapi.types.DocumentArtifactManifestList) {
+        return try self.inner.listDocumentArtifactManifests(table_name, key, params);
+    }
+
+    pub fn getDocumentArtifactManifest(
+        self: *AntflyClient,
+        table_name: []const u8,
+        key: []const u8,
+        artifact_name: []const u8,
+        params: openapi.client.GetDocumentArtifactManifestParams,
+    ) !openapi.ApiResponse(openapi.types.DocumentArtifactManifest) {
+        return try self.inner.getDocumentArtifactManifest(table_name, key, artifact_name, params);
+    }
+
+    pub fn listArtifactEnrichments(
+        self: *AntflyClient,
+        table_name: []const u8,
+    ) !openapi.ApiResponse(openapi.types.TableArtifactEnrichmentList) {
+        return try self.inner.listArtifactEnrichments(table_name);
+    }
+
+    pub fn putArtifactEnrichment(
+        self: *AntflyClient,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        body: openapi.types.EnrichmentConfig,
+    ) !openapi.ApiResponse(std.json.Value) {
+        return try self.inner.putArtifactEnrichment(table_name, artifact_name, body);
+    }
+
+    pub fn deleteArtifactEnrichment(
+        self: *AntflyClient,
+        table_name: []const u8,
+        artifact_name: []const u8,
+    ) !openapi.ApiResponse(std.json.Value) {
+        return try self.inner.deleteArtifactEnrichment(table_name, artifact_name);
+    }
+
+    pub fn reprocessDocumentArtifact(
+        self: *AntflyClient,
+        table_name: []const u8,
+        key: []const u8,
+        artifact_name: []const u8,
+    ) !openapi.ApiResponse(openapi.types.DocumentArtifactReprocessResponse) {
+        return try self.inner.reprocessDocumentArtifact(table_name, key, artifact_name);
+    }
+
+    pub fn reprocessDocumentArtifactRange(
+        self: *AntflyClient,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        body: openapi.types.DocumentArtifactTableReprocessRequest,
+    ) !openapi.ApiResponse(openapi.types.DocumentArtifactTableReprocessResponse) {
+        return try self.inner.reprocessDocumentArtifactRange(table_name, artifact_name, body);
+    }
+
+    pub fn startDocumentArtifactReprocessJob(
+        self: *AntflyClient,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        body: openapi.types.DocumentArtifactReprocessJobStartRequest,
+    ) !openapi.ApiResponse(openapi.types.DocumentArtifactReprocessJob) {
+        return try self.inner.startDocumentArtifactReprocessJob(table_name, artifact_name, body);
+    }
+
+    pub fn getDocumentArtifactReprocessJob(
+        self: *AntflyClient,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        job_id: []const u8,
+    ) !openapi.ApiResponse(openapi.types.DocumentArtifactReprocessJob) {
+        return try self.inner.getDocumentArtifactReprocessJob(table_name, artifact_name, job_id);
+    }
+
+    pub fn advanceDocumentArtifactReprocessJob(
+        self: *AntflyClient,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        job_id: []const u8,
+    ) !openapi.ApiResponse(openapi.types.DocumentArtifactReprocessJob) {
+        return try self.inner.advanceDocumentArtifactReprocessJob(table_name, artifact_name, job_id);
+    }
+
+    pub fn cancelDocumentArtifactReprocessJob(
+        self: *AntflyClient,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        job_id: []const u8,
+    ) !openapi.ApiResponse(openapi.types.DocumentArtifactReprocessJob) {
+        return try self.inner.cancelDocumentArtifactReprocessJob(table_name, artifact_name, job_id);
+    }
+
     // --- Batch operations ---
 
     pub fn batch(self: *AntflyClient, table_name: []const u8, body: openapi.types.BatchRequest) !openapi.ApiResponse(openapi.types.BatchResponse) {
@@ -249,10 +354,11 @@ pub const AntflyClient = struct {
             .headers = if (auth_headers) |*h| h[0..] else null,
             .timeout_ms = retrieval_agent_timeout_ms,
         });
+        defer resp.deinit();
         return .{
             .status_code = resp.status.code,
             .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null,
-            .content_type = resp.contentType(),
+            .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null,
             .allocator = self.allocator,
         };
     }
@@ -280,10 +386,8 @@ pub const AntflyClient = struct {
     // --- Helpers ---
 
     fn apiErrorFromResponse(self: *AntflyClient, resp: anytype) error{ ApiError, OutOfMemory } {
-        const msg = if (resp.err_body) |b|
-            (self.allocator.dupe(u8, b) catch "unknown error")
-        else
-            (self.allocator.dupe(u8, "unknown error") catch "unknown error");
+        _ = self;
+        const msg = resp.err_body orelse "unknown error";
         std.debug.print("API error {d}: {s}\n", .{ resp.status_code, msg });
         return error.ApiError;
     }

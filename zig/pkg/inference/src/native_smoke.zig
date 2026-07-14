@@ -19,12 +19,14 @@ const backends = @import("backends/backends.zig");
 const session_factory = @import("architectures/session_factory.zig");
 const manifest_mod = @import("models/manifest.zig");
 const tensor_store_mod = @import("models/tensor_store.zig");
+const gpt_mod = @import("models/gpt.zig");
 const generation = @import("pipelines/generation.zig");
 const model_manager_mod = @import("server/model_manager.zig");
 const runtime = @import("runtime/root.zig");
 const native_backend_choice = @import("native_backend_choice.zig");
 const graph_mod = @import("graph/root.zig");
 const c_file = @import("util/c_file.zig");
+const io_compat = @import("io/compat.zig");
 const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
     pub const pjrt = struct {
         pub const Client = struct {
@@ -56,6 +58,7 @@ const Options = struct {
     kv_budget_mb: usize = 0,
     scratch_budget_mb: usize = 0,
     cache_dtype: ?[]const u8 = null,
+    draft_model: ?[]const u8 = null,
 };
 
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -69,6 +72,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var gguf_report = try session_factory.inspectGgufModel(allocator, opts.model_dir);
     defer if (gguf_report) |*report| report.deinit();
     try printGgufSummary(&manifest, gguf_report);
+    if (opts.draft_model) |draft_model| {
+        try printMtpPairValidation(allocator, opts.model_dir, gguf_report, draft_model);
+    }
 
     if (opts.inspect_only) return;
 
@@ -339,6 +345,10 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingCacheDtype;
             opts.cache_dtype = args[i];
+        } else if (std.mem.eql(u8, arg, "--draft-model")) {
+            i += 1;
+            if (i >= args.len) return error.MissingDraftModel;
+            opts.draft_model = args[i];
         } else {
             printUsage();
             return error.InvalidArguments;
@@ -346,6 +356,153 @@ fn parseArgs(args: []const []const u8) !Options {
     }
 
     return opts;
+}
+
+const MtpPairVerdict = enum {
+    compatible,
+    target_not_gpt,
+    assistant_not_gpt,
+    assistant_not_mtp,
+    unsupported_target_no_shared_kv,
+    compatible_unshared_nextn_target,
+    hidden_size_mismatch,
+    tokenizer_mismatch,
+};
+
+fn mtpPairVerdictName(verdict: MtpPairVerdict) []const u8 {
+    return switch (verdict) {
+        .compatible => "compatible",
+        .target_not_gpt => "target_not_gpt",
+        .assistant_not_gpt => "assistant_not_gpt",
+        .assistant_not_mtp => "assistant_not_mtp",
+        .unsupported_target_no_shared_kv => "unsupported_target_no_shared_kv",
+        .compatible_unshared_nextn_target => "compatible_unshared_nextn_target",
+        .hidden_size_mismatch => "hidden_size_mismatch",
+        .tokenizer_mismatch => "tokenizer_mismatch",
+    };
+}
+
+fn printMtpPairValidation(
+    allocator: std.mem.Allocator,
+    target_model_dir: []const u8,
+    target_report: ?session_factory.GgufInspectionReport,
+    draft_model_dir: []const u8,
+) !void {
+    var draft_manifest = try manifest_mod.loadFromDir(allocator, draft_model_dir);
+    defer draft_manifest.deinit();
+    var draft_report = try session_factory.inspectGgufModel(allocator, draft_model_dir);
+    defer if (draft_report) |*report| report.deinit();
+
+    print("mtp_pair target={s} draft={s}\n", .{ target_model_dir, draft_model_dir });
+    try printGgufSummary(&draft_manifest, draft_report);
+
+    const target_cfg = if (target_report) |report| report.gpt_config else null;
+    const draft_cfg = if (draft_report) |report| report.gpt_config else try loadGptConfigFromManifestConfig(allocator, &draft_manifest);
+    const target_tokenizer = try tokenizerFingerprint(allocator, target_model_dir);
+    defer if (target_tokenizer) |fp| allocator.free(fp);
+    const draft_tokenizer = try tokenizerFingerprint(allocator, draft_model_dir);
+    defer if (draft_tokenizer) |fp| allocator.free(fp);
+    const tokenizer_match = tokenizersCompatible(target_tokenizer, draft_tokenizer);
+    const masked_embeddings = try modelHasTensor(allocator, draft_model_dir, "masked_embedding.centroids.weight") and
+        try modelHasTensor(allocator, draft_model_dir, "masked_embedding.token_ordering");
+
+    if (target_cfg) |cfg| {
+        print(
+            "mtp_pair_target: hidden={d} layers={d} kv_shared_layers={d} sliding_pattern={d} tokenizer={s}\n",
+            .{
+                cfg.hidden_size,
+                cfg.num_hidden_layers,
+                cfg.num_kv_shared_layers,
+                cfg.sliding_window_pattern,
+                target_tokenizer orelse "none",
+            },
+        );
+    } else {
+        print("mtp_pair_target: gpt_config=none tokenizer={s}\n", .{target_tokenizer orelse "none"});
+    }
+    if (draft_cfg) |cfg| {
+        print(
+            "mtp_pair_draft: hidden={d} layers={d} kv_shared_layers={d} mtp_assistant={} mtp_backbone={d} mtp_centroids={d} mtp_top_k={d} masked_embeddings={} tokenizer={s}\n",
+            .{
+                cfg.hidden_size,
+                cfg.num_hidden_layers,
+                cfg.num_kv_shared_layers,
+                cfg.gemma4_mtp_assistant,
+                cfg.mtp_backbone_hidden_size,
+                cfg.mtp_num_centroids,
+                cfg.mtp_centroid_intermediate_top_k,
+                masked_embeddings,
+                draft_tokenizer orelse "none",
+            },
+        );
+    } else {
+        print("mtp_pair_draft: gpt_config=none masked_embeddings={} tokenizer={s}\n", .{ masked_embeddings, draft_tokenizer orelse "none" });
+    }
+
+    const verdict = mtpPairVerdict(target_cfg, draft_cfg, tokenizer_match);
+    print("mtp_pair_verdict: {s}\n", .{mtpPairVerdictName(verdict)});
+}
+
+fn loadGptConfigFromManifestConfig(
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+) !?gpt_mod.Config {
+    const config_path = manifest.config_path orelse return null;
+    const config_bytes = c_file.readFile(allocator, config_path) catch return null;
+    defer allocator.free(config_bytes);
+    const cfg = gpt_mod.parseConfig(allocator, config_bytes) catch return null;
+    if (cfg.family == .other) return null;
+    return cfg;
+}
+
+fn mtpPairVerdict(target_cfg: ?gpt_mod.Config, draft_cfg: ?gpt_mod.Config, tokenizer_match: bool) MtpPairVerdict {
+    const target = target_cfg orelse return .target_not_gpt;
+    const draft = draft_cfg orelse return .assistant_not_gpt;
+    if (!draft.gemma4_mtp_assistant) return .assistant_not_mtp;
+    if (draft.mtp_backbone_hidden_size != target.hidden_size) return .hidden_size_mismatch;
+    if (target.num_kv_shared_layers == 0) {
+        if (draft.mtp_num_centroids == 0) return .compatible_unshared_nextn_target;
+        return .unsupported_target_no_shared_kv;
+    }
+    if (!tokenizer_match) return .tokenizer_mismatch;
+    return .compatible;
+}
+
+fn tokenizersCompatible(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return true;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn tokenizerFingerprint(allocator: std.mem.Allocator, model_dir: []const u8) !?[]const u8 {
+    const names = [_][]const u8{
+        "tokenizer.json",
+        "tokenizer.model",
+        "spiece.model",
+    };
+    for (names) |name| {
+        const path = try std.fs.path.join(allocator, &.{ model_dir, name });
+        defer allocator.free(path);
+        const stat = io_compat.cwd().statFile(io_compat.io(), path, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            error.NotDir => continue,
+            else => return err,
+        };
+        return try std.fmt.allocPrint(allocator, "{s}:{d}:{d}", .{ name, stat.size, stat.mtime });
+    }
+    return null;
+}
+
+fn modelHasTensor(allocator: std.mem.Allocator, model_dir: []const u8, name: []const u8) !bool {
+    var manifest = try manifest_mod.loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+    var store = try tensor_store_mod.openFromManifest(allocator, manifest);
+    defer store.deinit();
+    var tensor_ref = store.describeTensor(allocator, name) catch |err| switch (err) {
+        error.TensorNotFound => return false,
+        else => return err,
+    };
+    defer tensor_ref.deinit(allocator);
+    return true;
 }
 
 fn parseBackendChoice(value: []const u8) ?BackendChoice {
@@ -378,7 +535,7 @@ fn preflightModelLoadBudget(
     opts: Options,
 ) !void {
     const reservation_tier = predictedWeightTier(allocator, manifest, opts.backend) orelse return;
-    const weight_bytes = estimateModelArtifactBytes(allocator, manifest) catch 0;
+    const weight_bytes = estimatePreflightWeightBytes(allocator, manifest, opts) catch 0;
     if (weight_bytes == 0) return;
 
     var limits = runtime.tier.memory.defaultLimitsForBackend(switch (reservation_tier) {
@@ -436,7 +593,7 @@ fn predictedBackendType(choice: BackendChoice, tier: runtime.tier.memory.Residen
     return switch (choice) {
         .metal => .metal,
         .cuda => .cuda,
-        .auto => if (build_options.enable_metal) .metal else .native,
+        .auto => .metal,
         .onnx, .native, .xla, .webgpu => .native,
     };
 }
@@ -458,6 +615,25 @@ fn estimateModelArtifactBytes(
     return 0;
 }
 
+fn estimatePreflightWeightBytes(
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    opts: Options,
+) !usize {
+    const artifact_bytes = try estimateModelArtifactBytes(allocator, manifest);
+    if (opts.backend != .cuda or manifest.safetensors_path == null or manifest.config_path == null) return artifact_bytes;
+
+    const config_bytes = try c_file.readFile(allocator, manifest.config_path.?);
+    defer allocator.free(config_bytes);
+    const cfg = gpt_mod.parseConfig(allocator, config_bytes) catch return artifact_bytes;
+    if (cfg.family != .gemma) return artifact_bytes;
+
+    const embed_elements = std.math.mul(usize, @intCast(cfg.vocab_size), @intCast(cfg.hidden_size)) catch return artifact_bytes;
+    const embed_bytes = std.math.mul(usize, embed_elements, @sizeOf(f32)) catch return artifact_bytes;
+    const overhead_bytes: usize = 512 * 1024 * 1024;
+    return @min(artifact_bytes, embed_bytes + overhead_bytes);
+}
+
 fn metalEagerDenseMaxBytes() u64 {
     const mb = platform.env.getenvUsize("TERMITE_METAL_EAGER_DENSE_MAX_MB") orelse return 1024 * 1024 * 1024;
     return mb * 1024 * 1024;
@@ -465,7 +641,10 @@ fn metalEagerDenseMaxBytes() u64 {
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
     if (choice == .onnx) {
-        session_manager.preferred_backends = if (build_options.enable_native) &.{backends.BackendType.native} else &.{};
+        session_manager.preferred_backends = if (build_options.enable_native)
+            &.{backends.BackendType.native}
+        else
+            &.{};
         return;
     }
     native_backend_choice.configureSessionPreference(session_manager, choice);
@@ -505,19 +684,55 @@ fn printGgufSummary(
 
     if (gguf_report.gpt_config) |cfg| {
         print(
-            "  gpt family={s} layers={d} heads={d} kv_heads={d} hidden={d} sliding_window={d} moe={} experts={d} experts_per_tok={d}\n",
+            "  gpt family={s} layers={d} heads={d} kv_heads={d} global_kv_heads={d} hidden={d} head_dim={d} global_head_dim={d} sliding_window={d} sliding_pattern={d} kv_shared_layers={d} ple_hidden={d} rope_theta={d:.6} rope_local_theta={d:.6} rope_partial_factor={d:.6} rope_dim_override={d} final_logit_softcap={d:.6} weight_tying={} norm_offset={d:.6} mtp_assistant={} mtp_backbone={d} mtp_centroids={d} mtp_top_k={d} moe={} experts={d} experts_per_tok={d}\n",
             .{
                 @tagName(cfg.family),
                 cfg.num_hidden_layers,
                 cfg.num_attention_heads,
                 cfg.effectiveKVHeads(),
+                cfg.num_global_key_value_heads,
                 cfg.hidden_size,
+                cfg.attention_head_dim,
+                cfg.global_head_dim,
                 cfg.sliding_window,
+                cfg.sliding_window_pattern,
+                cfg.num_kv_shared_layers,
+                cfg.ple_hidden_size,
+                cfg.rope_theta,
+                cfg.rope_local_theta,
+                cfg.rope_partial_factor,
+                cfg.rope_dim_override,
+                cfg.final_logit_softcapping,
+                cfg.weight_tying,
+                cfg.norm_weight_offset,
+                cfg.gemma4_mtp_assistant,
+                cfg.mtp_backbone_hidden_size,
+                cfg.mtp_num_centroids,
+                cfg.mtp_centroid_intermediate_top_k,
                 cfg.usesMoe(),
                 cfg.num_local_experts,
                 cfg.num_experts_per_tok,
             },
         );
+        const sample_layers = [_]usize{ 0, 4, 5, 23, 24, 41 };
+        for (sample_layers) |layer| {
+            if (layer >= cfg.num_hidden_layers) continue;
+            print(
+                "  gpt_layer layer={d} sliding={} shared_tail={} donor={?} kv_heads={d} head_dim={d} rope_dim={d} rope_active_dim={d} rope_freq_dim={d} omits_v={}\n",
+                .{
+                    layer,
+                    cfg.layerUsesSlidingAttention(layer),
+                    cfg.layerSharesKv(layer),
+                    cfg.kvDonorLayerIndex(layer),
+                    cfg.effectiveKVHeadsForLayer(layer),
+                    cfg.effectiveHeadDimForLayer(layer),
+                    cfg.layerRopeDim(layer),
+                    cfg.layerRopeActiveDim(layer),
+                    cfg.layerRopeFrequencyDim(layer),
+                    cfg.layerOmitsVProj(layer),
+                },
+            );
+        }
     }
 
     if (gguf_report.all_tensor_types.len == 0) {
@@ -582,8 +797,9 @@ fn printGgufSummary(
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference smoke <model-dir> <prompt> [--backend auto|onnx|native|metal|xla] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--prefill-chunk-size N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--inspect-only] [--no-chat-template]
+        \\usage: antfly inference smoke <model-dir> <prompt> [--backend auto|onnx|native|metal|xla] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--prefill-chunk-size N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--draft-model path] [--inspect-only] [--no-chat-template]
         \\  Loads a native GGUF/SafeTensors model, prints GGUF tensor coverage, and runs one native generation pass.
+        \\  With --draft-model, prints Gemma4 MTP target/assistant compatibility metadata.
         \\
     , .{});
 }

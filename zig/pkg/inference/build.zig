@@ -179,9 +179,13 @@ pub fn build(b: *std.Build) void {
         }
     }
     const enable_cuda = if (enable_wasm or !link_libc) false else (b.option(bool, "cuda", "Enable CUDA backend through the NVIDIA Driver API") orelse false);
-    const cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: portable PTX; fatbin is not implemented yet") orelse "portable";
-    if (!std.mem.eql(u8, cuda_artifacts, "portable")) {
-        @panic("invalid -Dcuda-artifacts (expected portable; fatbin is not implemented yet)");
+    const cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: fatbin SASS+PTX, portable PTX, or sm89 cubin") orelse "fatbin";
+    if (!std.mem.eql(u8, cuda_artifacts, "portable") and !std.mem.eql(u8, cuda_artifacts, "fatbin") and !std.mem.eql(u8, cuda_artifacts, "sm89")) {
+        @panic("invalid -Dcuda-artifacts (expected portable, fatbin, or sm89)");
+    }
+    const cuda_libraries = b.option([]const u8, "cuda-libs", "CUDA library acceleration policy: auto, off, or required") orelse "auto";
+    if (!std.mem.eql(u8, cuda_libraries, "auto") and !std.mem.eql(u8, cuda_libraries, "off") and !std.mem.eql(u8, cuda_libraries, "required")) {
+        @panic("invalid -Dcuda-libs (expected auto, off, or required)");
     }
     const enable_pjrt = if (enable_wasm or !link_libc) false else (b.option(bool, "pjrt", "Enable PJRT backend (TPU/CPU via dlopen)") orelse false);
     const blas_root_opt = b.option([]const u8, "blas-root", "Path to system BLAS root with include/ and lib/ for non-macOS native acceleration");
@@ -216,6 +220,7 @@ pub fn build(b: *std.Build) void {
             .enable_metal = enable_metal,
             .enable_cuda = enable_cuda,
             .cuda_artifacts = cuda_artifacts,
+            .cuda_libraries = cuda_libraries,
             .enable_pjrt = enable_pjrt,
             .enable_native = enable_native,
             .enable_system_blas = enable_system_blas,
@@ -272,7 +277,7 @@ pub fn build(b: *std.Build) void {
     metal_gemma4_prefill_frame_test.step.dependOn(b.getInstallStep());
     const metal_gemma4_prefill_frame_test_step = b.step(
         "test-metal-gemma4-prefill-frame",
-        "Run the local Metal Gemma4 prefill-frame token-anchor regression test",
+        "Run the local Metal Gemma4 prefill-frame no-fallback/stage-sync smoke test",
     );
     metal_gemma4_prefill_frame_test_step.dependOn(&metal_gemma4_prefill_frame_test.step);
 
@@ -304,10 +309,32 @@ pub fn build(b: *std.Build) void {
     });
     metal_gemma4_cli_tool_calling_test.step.dependOn(b.getInstallStep());
     const metal_gemma4_cli_tool_calling_test_step = b.step(
-        "test-metal-gemma4-cli-tool-calling",
-        "Run the local Metal Gemma4 CLI tool-calling smoke test",
+        "diagnose-metal-gemma4-cli-tool-calling",
+        "Diagnose the optional Metal Gemma4 CLI tool-calling surface; server coverage lives in test-metal-gemma4-tool-calling",
     );
     metal_gemma4_cli_tool_calling_test_step.dependOn(&metal_gemma4_cli_tool_calling_test.step);
+
+    const metal_gemma4_e2b_bench = b.addSystemCommand(&.{
+        "bash",
+        "scripts/bench_metal_gemma4_e2b.sh",
+    });
+    metal_gemma4_e2b_bench.step.dependOn(b.getInstallStep());
+    const metal_gemma4_e2b_bench_step = b.step(
+        "bench-metal-gemma4-e2b",
+        "Run the canonical local Metal Gemma4 E2B Q8_0 throughput benchmark",
+    );
+    metal_gemma4_e2b_bench_step.dependOn(&metal_gemma4_e2b_bench.step);
+
+    const metal_gemma4_e4b_bench = b.addSystemCommand(&.{
+        "bash",
+        "scripts/bench_metal_gemma4_e4b.sh",
+    });
+    metal_gemma4_e4b_bench.step.dependOn(b.getInstallStep());
+    const metal_gemma4_e4b_bench_step = b.step(
+        "bench-metal-gemma4-e4b",
+        "Run the canonical local Metal Gemma4 E4B Q4_K/Q6_K throughput benchmark",
+    );
+    metal_gemma4_e4b_bench_step.dependOn(&metal_gemma4_e4b_bench.step);
 
     const metal_prefill_bucket_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-metal-prefill-buckets-bench",
@@ -327,6 +354,27 @@ pub fn build(b: *std.Build) void {
         "Run Metal Gemma4 pp10/pp128/pp512 prefill plus tg16 decode bucket benchmarks",
     );
     metal_prefill_bucket_bench_step.dependOn(&run_metal_prefill_bucket_bench.step);
+
+    const metal_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-metal-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/metal_q4_0_linear.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    metal_bench_exe.root_module.addImport("build_options", build_options_mod);
+    metal_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    configureNativeTool(b, metal_bench_exe, target, enable_system_blas, blas_root, enable_metal);
+    const run_metal_bench = b.addRunArtifact(metal_bench_exe);
+    if (b.args) |args| {
+        run_metal_bench.addArgs(args);
+    }
+    const metal_bench_step = b.step(
+        "inference-metal-bench",
+        "Run the focused Metal kernel benchmark; pass --mode and shape filters after --",
+    );
+    metal_bench_step.dependOn(&run_metal_bench.step);
 
     const run_finetune = b.addRunArtifact(exe);
     run_finetune.step.dependOn(b.getInstallStep());
@@ -566,14 +614,22 @@ pub fn build(b: *std.Build) void {
     const clipclap_e2e_bench_step = b.step("bench-clipclap-e2e", "Run real-bundle CLIP/CLAP embedding E2E benchmarks");
     clipclap_e2e_bench_step.dependOn(&run_clipclap_e2e_bench.step);
 
+<<<<<<< HEAD
     const fused_chunker_e2e_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-fused-chunker-e2e-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench/fused_chunker_e2e.zig"),
+=======
+    const reranker_e2e_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-reranker-e2e-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/reranker_e2e.zig"),
+>>>>>>> main
             .target = target,
             .optimize = .ReleaseFast,
         }),
     });
+<<<<<<< HEAD
     fused_chunker_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
     fused_chunker_e2e_bench_exe.root_module.addImport("ml", ml_mod);
     fused_chunker_e2e_bench_exe.root_module.addImport("pjrt", pjrt_mod);
@@ -592,6 +648,26 @@ pub fn build(b: *std.Build) void {
     }
     const fused_chunker_e2e_bench_step = b.step("bench-fused-chunker-e2e", "Run fused chunker /chunk serving-path E2E benchmarks against a packaged model dir");
     fused_chunker_e2e_bench_step.dependOn(&run_fused_chunker_e2e_bench.step);
+=======
+    reranker_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
+    reranker_e2e_bench_exe.root_module.addImport("ml", ml_mod);
+    reranker_e2e_bench_exe.root_module.addImport("pjrt", pjrt_mod);
+    reranker_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    reranker_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    reranker_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
+    reranker_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
+    reranker_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
+    reranker_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
+    reranker_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    configureNativeTool(b, reranker_e2e_bench_exe, target, enable_system_blas, blas_root, enable_metal);
+    configureOnnxRuntime(b, reranker_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
+    const run_reranker_e2e_bench = b.addRunArtifact(reranker_e2e_bench_exe);
+    if (b.args) |args| {
+        run_reranker_e2e_bench.addArgs(args);
+    }
+    const reranker_e2e_bench_step = b.step("bench-reranker-e2e", "Run real-bundle text reranker E2E benchmarks");
+    reranker_e2e_bench_step.dependOn(&run_reranker_e2e_bench.step);
+>>>>>>> main
 
     const audio_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-audio-bench",
@@ -614,10 +690,10 @@ pub fn build(b: *std.Build) void {
     // Tests
     const runtime_test_filter = b.option(bool, "runtime-test-filter", "Build unit tests with a simple runtime-filtering test runner") orelse false;
     const main_test_filters = if (runtime_test_filter) &.{} else selectTestFilters(b, &.{});
-    const runtime_filter_test_runner: ?std.Build.Step.Compile.TestRunner = if (runtime_test_filter) .{
+    const runtime_filter_test_runner: std.Build.Step.Compile.TestRunner = .{
         .path = b.path("src/test_runner_filter.zig"),
         .mode = .simple,
-    } else null;
+    };
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/inference.zig"),
@@ -1306,6 +1382,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
             .single_threaded = true,
         });
+        wasm_ml_mod.addImport("antfly_platform", wasm_platform_mod);
         const wasm_onnx_graph_mod = b.createModule(.{
             .root_source_file = b.path(b.fmt("{s}/lib/onnx/src/root.zig", .{shared_lib_root})),
             .target = wasm_target,

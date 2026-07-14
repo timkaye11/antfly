@@ -693,6 +693,8 @@ pub fn fuseNamedSets(
     }
     defer for (ranked_results) |result| alloc.free(result.hits);
 
+    if (req.merge_config) |config| try validateFusionWeights(config.weights, ranked_results);
+
     const merge_config = if (req.merge_config) |config|
         fusion_mod.FusionConfig{
             .strategy = config.strategy,
@@ -721,16 +723,25 @@ pub fn fuseNamedSets(
         else
             null;
         const output_doc_id = if (representative) |entry| entry.representative_doc_id else hit.doc_id;
-        const stored_data = if (req.include_stored)
-            try executor.load_projected_document(executor.ctx, alloc, req, output_doc_id)
-        else
-            null;
-        hits[i] = .{
-            .id = try alloc.dupe(u8, output_doc_id),
-            .doc_ordinal = if (representative) |entry| entry.ordinal else if (ordinal_by_id.get(hit.doc_id)) |ordinal| ordinal else null,
-            .score = @floatCast(hit.score),
-            .stored_data = stored_data,
+        const materialized = blk: {
+            const owned_id = try alloc.dupe(u8, output_doc_id);
+            errdefer alloc.free(owned_id);
+            const owned_index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
+            errdefer types.freeIndexScores(alloc, owned_index_scores);
+            const stored_data = if (req.include_stored)
+                try executor.load_projected_document(executor.ctx, alloc, req, output_doc_id)
+            else
+                null;
+            errdefer if (stored_data) |value| alloc.free(value);
+            break :blk types.SearchHit{
+                .id = owned_id,
+                .doc_ordinal = if (representative) |entry| entry.ordinal else if (ordinal_by_id.get(hit.doc_id)) |ordinal| ordinal else null,
+                .score = @floatCast(hit.score),
+                .index_scores = owned_index_scores,
+                .stored_data = stored_data,
+            };
         };
+        hits[i] = materialized;
         initialized += 1;
     }
 
@@ -1195,6 +1206,22 @@ fn fusionWeightName(name: []const u8) []const u8 {
     if (std.mem.startsWith(u8, name, "$full_text_results.")) return name["$full_text_results.".len..];
     if (std.mem.startsWith(u8, name, "$aknn_results.")) return name["$aknn_results.".len..];
     return name;
+}
+
+fn validateFusionWeights(weights: []const fusion_mod.NamedWeight, results: []const fusion_mod.RankedResult) !void {
+    for (weights, 0..) |weight, i| {
+        for (weights[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, weight.name)) return error.InvalidQueryRequest;
+        }
+        var found = false;
+        for (results) |result| {
+            if (std.mem.eql(u8, result.index_name, weight.name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return error.InvalidQueryRequest;
+    }
 }
 
 fn fusionUsesDistanceScore(req: types.SearchRequest, name: []const u8) bool {
@@ -2436,15 +2463,28 @@ fn jsonValuesContainGeoBBox(values: []const std.json.Value, geo_query: std.json.
         .float => |value| value,
         else => return error.InvalidArgument,
     };
+    if (!std.math.isFinite(min_lat) or !std.math.isFinite(min_lon) or
+        !std.math.isFinite(max_lat) or !std.math.isFinite(max_lon) or
+        min_lat < -90.0 or min_lat > 90.0 or max_lat < -90.0 or max_lat > 90.0 or
+        min_lon < -180.0 or min_lon > 180.0 or max_lon < -180.0 or max_lon > 180.0 or
+        min_lat > max_lat)
+    {
+        return error.InvalidArgument;
+    }
     for (values) |value| {
         const point = jsonGeoPointFromValue(value) catch continue;
         if (point.lat >= min_lat and point.lat <= max_lat and
-            point.lon >= min_lon and point.lon <= max_lon)
+            geoLongitudeInRange(point.lon, min_lon, max_lon))
         {
             return true;
         }
     }
     return false;
+}
+
+fn geoLongitudeInRange(lon: f64, min_lon: f64, max_lon: f64) bool {
+    if (min_lon <= max_lon) return lon >= min_lon and lon <= max_lon;
+    return lon >= min_lon or lon <= max_lon;
 }
 
 fn jsonValuesContainGeoShape(alloc: Allocator, values: []const std.json.Value, geo_query: std.json.Value) !bool {
@@ -2867,6 +2907,11 @@ test "jsonDocMatchesPatternFilter supports stored structured filters" {
     , .{});
     defer parsed_geo_bbox.deinit();
 
+    var parsed_wrapped_geo_bbox = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"geo_bbox":{"field":"location","min_lat":-1.0,"min_lon":179.5,"max_lat":1.0,"max_lon":-179.5}}
+    , .{});
+    defer parsed_wrapped_geo_bbox.deinit();
+
     var parsed_geo_shape = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"geo_shape":{"field":"location","polygon":[{"lon":-122.50,"lat":37.70},{"lon":-122.40,"lat":37.70},{"lon":-122.40,"lat":37.80},{"lon":-122.50,"lat":37.80}]}}
     , .{});
@@ -2912,6 +2957,11 @@ test "jsonDocMatchesPatternFilter supports stored structured filters" {
     , .{});
     defer parsed_geo_doc.deinit();
 
+    var parsed_wrapped_geo_doc = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"location":{"lon":179.8,"lat":0.0}}
+    , .{});
+    defer parsed_wrapped_geo_doc.deinit();
+
     try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_bool.value));
     try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_term_range.value));
     try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_standard_range.value));
@@ -2921,6 +2971,7 @@ test "jsonDocMatchesPatternFilter supports stored structured filters" {
     try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_ip_range.value));
     try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_geo_distance.value));
     try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_geo_bbox.value));
+    try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:wrapped", parsed_wrapped_geo_doc.value, parsed_wrapped_geo_bbox.value));
     try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_geo_shape.value));
     try std.testing.expect(!(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_geo_shape_contains.value)));
     try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_doc_ids.value));
@@ -3296,6 +3347,43 @@ test "fuseNamedSets preserves source hit ordinals" {
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 12), result.hits[1].doc_ordinal);
 }
 
+test "fuseNamedSets rejects unknown merge weights" {
+    const alloc = std.testing.allocator;
+
+    const id_a = try alloc.dupe(u8, "doc:a");
+    defer alloc.free(id_a);
+    const id_b = try alloc.dupe(u8, "doc:b");
+    defer alloc.free(id_b);
+    const left_hits = [_]types.SearchHit{.{ .id = id_a, .score = 1.0 }};
+    const right_hits = [_]types.SearchHit{.{ .id = id_b, .score = 0.5 }};
+    const named_sets = [_]NamedResultSet{
+        .{ .name = "$full_text_results", .hits = &left_hits, .total_hits = left_hits.len },
+        .{ .name = "dense_idx", .hits = &right_hits, .total_hits = right_hits.len },
+    };
+
+    const Harness = struct {
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror!?[]u8 {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    try std.testing.expectError(error.InvalidQueryRequest, fuseNamedSets(alloc, .{
+        .limit = 2,
+        .include_stored = false,
+        .merge_config = .{
+            .weights = &.{.{ .name = "missing_idx", .weight = 2.0 }},
+        },
+    }, &named_sets, .{
+        .ctx = null,
+        .load_projected_document = Harness.loadProjectedDocument,
+    }));
+}
+
 test "fuseNamedSets deduplicates aliases by ordinal when complete" {
     const alloc = std.testing.allocator;
 
@@ -3405,6 +3493,62 @@ test "fuseNamedSets drops conflicting source hit ordinals" {
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
     try std.testing.expect(result.hits[0].doc_ordinal == null);
+}
+
+test "fuseNamedSets preserves fused per-index scores" {
+    const alloc = std.testing.allocator;
+
+    const dense_id = try alloc.dupe(u8, "doc:a");
+    defer alloc.free(dense_id);
+    const sparse_id = try alloc.dupe(u8, "doc:a");
+    defer alloc.free(sparse_id);
+    const dense_hits = [_]types.SearchHit{.{
+        .id = dense_id,
+        .doc_ordinal = 11,
+        .score = 1.0,
+    }};
+    const sparse_hits = [_]types.SearchHit{.{
+        .id = sparse_id,
+        .doc_ordinal = 11,
+        .score = 0.9,
+    }};
+    const named_sets = [_]NamedResultSet{
+        .{
+            .name = "dense",
+            .hits = &dense_hits,
+            .total_hits = dense_hits.len,
+        },
+        .{
+            .name = "sparse",
+            .hits = &sparse_hits,
+            .total_hits = sparse_hits.len,
+        },
+    };
+
+    const Harness = struct {
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror!?[]u8 {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var result = try fuseNamedSets(alloc, .{
+        .limit = 1,
+        .include_stored = false,
+    }, &named_sets, .{
+        .ctx = null,
+        .load_projected_document = Harness.loadProjectedDocument,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqual(@as(usize, 2), result.hits[0].index_scores.len);
+    try std.testing.expectEqualStrings("dense", result.hits[0].index_scores[0].index_name);
+    try std.testing.expectEqualStrings("sparse", result.hits[0].index_scores[1].index_name);
 }
 
 test "executeGraphQueries projects base hits to resolved doc-set for unbounded selectors" {

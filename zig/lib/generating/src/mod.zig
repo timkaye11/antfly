@@ -99,6 +99,11 @@ pub const Provider = enum {
     }
 };
 
+/// Antfly safety cap for generation requests that omit an explicit limit.
+/// This is intentionally not provider parity: OpenAI leaves the response cap
+/// optional, and Ollama's native num_predict default is unbounded.
+pub const default_max_tokens: i64 = 256;
+
 pub const OpenAIConfig = struct {
     model: []const u8,
     url: []const u8 = "https://api.openai.com/v1",
@@ -125,6 +130,12 @@ pub const GeneratorConfig = struct {
     credentials_path: ?[]const u8 = null,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
+    max_tokens: i64 = default_max_tokens,
+    temperature: ?f32 = null,
+    top_p: ?f32 = null,
+    top_k: ?i64 = null,
+    frequency_penalty: ?f32 = null,
+    presence_penalty: ?f32 = null,
 
     pub fn clone(self: GeneratorConfig, alloc: std.mem.Allocator) !GeneratorConfig {
         return .{
@@ -137,6 +148,12 @@ pub const GeneratorConfig = struct {
             .credentials_path = if (self.credentials_path) |value| try alloc.dupe(u8, value) else null,
             .tools_json = if (self.tools_json) |value| try alloc.dupe(u8, value) else null,
             .tool_choice_json = if (self.tool_choice_json) |value| try alloc.dupe(u8, value) else null,
+            .max_tokens = self.max_tokens,
+            .temperature = self.temperature,
+            .top_p = self.top_p,
+            .top_k = self.top_k,
+            .frequency_penalty = self.frequency_penalty,
+            .presence_penalty = self.presence_penalty,
         };
     }
 
@@ -181,6 +198,12 @@ pub const GeneratorConfig = struct {
         try self.provider.validate();
         if (self.model.len == 0 and self.provider != .mock) return error.InvalidGeneratorConfig;
         if (self.url.len == 0 and self.provider != .mock and self.provider != .antfly and self.provider != .vertex and self.provider != .gemini) return error.InvalidGeneratorConfig;
+        if (self.max_tokens <= 0) return error.InvalidGeneratorConfig;
+        if (self.temperature) |value| if (value < 0 or value > 2) return error.InvalidGeneratorConfig;
+        if (self.top_p) |value| if (value < 0 or value > 1) return error.InvalidGeneratorConfig;
+        if (self.top_k) |value| if (value <= 0) return error.InvalidGeneratorConfig;
+        if (self.frequency_penalty) |value| if (value < -2 or value > 2) return error.InvalidGeneratorConfig;
+        if (self.presence_penalty) |value| if (value < -2 or value > 2) return error.InvalidGeneratorConfig;
     }
 
     pub fn getModel(self: GeneratorConfig) []const u8 {
@@ -281,6 +304,12 @@ pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorC
         .project_id = if (generated.project_id) |project_id| try alloc.dupe(u8, project_id) else null,
         .location = if (generated.location) |location| try alloc.dupe(u8, location) else null,
         .credentials_path = if (generated.credentials_path) |credentials_path| try alloc.dupe(u8, credentials_path) else null,
+        .max_tokens = generated.max_tokens orelse default_max_tokens,
+        .temperature = generated.temperature,
+        .top_p = generated.top_p,
+        .top_k = generated.top_k,
+        .frequency_penalty = generated.frequency_penalty,
+        .presence_penalty = generated.presence_penalty,
     };
     errdefer cfg.deinit(alloc);
     try cfg.validate();
@@ -303,6 +332,12 @@ pub fn openApiFromConfig(cfg: GeneratorConfig) openapi.GeneratorConfig {
         .project_id = cfg.project_id,
         .location = cfg.location,
         .credentials_path = cfg.credentials_path,
+        .max_tokens = cfg.max_tokens,
+        .temperature = cfg.temperature,
+        .top_p = cfg.top_p,
+        .top_k = cfg.top_k,
+        .frequency_penalty = cfg.frequency_penalty,
+        .presence_penalty = cfg.presence_penalty,
     };
 }
 
@@ -573,12 +608,54 @@ test "generator config round trips through generating openapi types" {
     defer cfg.deinit(alloc);
     try std.testing.expectEqual(.antfly, cfg.provider);
     try std.testing.expectEqualStrings("http://localhost:8082", cfg.url);
+    try std.testing.expectEqual(default_max_tokens, cfg.max_tokens);
+
+    const encoded = try stringifyConfigAlloc(alloc, cfg);
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"max_tokens\":256") != null);
+    var reparsed = try parseConfigFromSlice(alloc, encoded);
+    defer reparsed.deinit(alloc);
+    try std.testing.expectEqual(.antfly, reparsed.provider);
+    try std.testing.expectEqual(default_max_tokens, reparsed.max_tokens);
+}
+
+test "generator config preserves explicit max_tokens" {
+    const alloc = std.testing.allocator;
+    const raw =
+        \\{"provider":"openai","model":"gpt-4.1","url":"https://api.openai.com/v1","max_tokens":128}
+    ;
+    var cfg = try parseConfigFromSlice(alloc, raw);
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 128), cfg.max_tokens);
+
+    const invalid =
+        \\{"provider":"openai","model":"gpt-4.1","url":"https://api.openai.com/v1","max_tokens":0}
+    ;
+    try std.testing.expectError(error.InvalidGeneratorConfig, parseConfigFromSlice(alloc, invalid));
+}
+
+test "generator config preserves sampling controls" {
+    const alloc = std.testing.allocator;
+    const raw =
+        \\{"provider":"openai","model":"gpt-4.1","url":"https://api.openai.com/v1","max_tokens":128,"temperature":0.25,"top_p":0.9,"top_k":40,"frequency_penalty":0.1,"presence_penalty":0.2}
+    ;
+    var cfg = try parseConfigFromSlice(alloc, raw);
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqual(@as(?f32, 0.25), cfg.temperature);
+    try std.testing.expectEqual(@as(?f32, 0.9), cfg.top_p);
+    try std.testing.expectEqual(@as(?i64, 40), cfg.top_k);
+    try std.testing.expectEqual(@as(?f32, 0.1), cfg.frequency_penalty);
+    try std.testing.expectEqual(@as(?f32, 0.2), cfg.presence_penalty);
 
     const encoded = try stringifyConfigAlloc(alloc, cfg);
     defer alloc.free(encoded);
     var reparsed = try parseConfigFromSlice(alloc, encoded);
     defer reparsed.deinit(alloc);
-    try std.testing.expectEqual(.antfly, reparsed.provider);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), reparsed.temperature orelse return error.TestUnexpectedResult, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), reparsed.top_p orelse return error.TestUnexpectedResult, 0.0001);
+    try std.testing.expectEqual(@as(?i64, 40), reparsed.top_k);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), reparsed.frequency_penalty orelse return error.TestUnexpectedResult, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), reparsed.presence_penalty orelse return error.TestUnexpectedResult, 0.0001);
 }
 
 test "chain link round trips through generating openapi types" {

@@ -120,6 +120,8 @@ pub const ExtensionObjectKind = enum {
     enrichment,
     resolver,
     mcp_tool,
+    skill,
+    agent,
     query_function,
     api_endpoint,
     a2a_agent,
@@ -144,6 +146,8 @@ pub fn objectKindV1(kind: ExtensionObjectKind) bool {
         .enrichment,
         .resolver,
         .mcp_tool,
+        .skill,
+        .agent,
         => true,
         else => false,
     };
@@ -287,7 +291,7 @@ pub const PackageStoreEntry = struct {
     manifest: PackageManifest,
     manifest_path: []u8,
     package_root_path: []u8,
-    layout: PackageStoreLayout = .loose,
+    layout: PackageStoreLayout,
 
     pub fn deinitOwned(self: *@This(), alloc: std.mem.Allocator) void {
         self.manifest.deinitOwned(alloc);
@@ -316,7 +320,9 @@ pub fn scanPackageStoreAlloc(alloc: std.mem.Allocator, io: std.Io, root_path: []
     while (try walker.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.eql(u8, std.fs.path.basename(entry.path), package_manifest_filename)) continue;
-        try out.append(alloc, try loadPackageStoreEntryAlloc(alloc, io, root_path, entry.path));
+        if (try loadPackageStoreEntryAlloc(alloc, io, root_path, entry.path)) |package_entry| {
+            try out.append(alloc, package_entry);
+        }
     }
 
     return try out.toOwnedSlice(alloc);
@@ -1077,7 +1083,9 @@ fn loadPackageStoreEntryAlloc(
     io: std.Io,
     root_path: []const u8,
     relative_manifest_path: []const u8,
-) !PackageStoreEntry {
+) !?PackageStoreEntry {
+    if (!packageStorePathSupported(relative_manifest_path)) return null;
+
     const manifest_path = try joinStorePathAlloc(alloc, root_path, relative_manifest_path);
     errdefer alloc.free(manifest_path);
     const package_root_path = try packageRootPathAlloc(alloc, manifest_path);
@@ -1089,7 +1097,12 @@ fn loadPackageStoreEntryAlloc(
     defer parsed.deinit();
     const manifest = try clonePackageManifest(alloc, parsed.value);
     errdefer freePackageManifest(alloc, manifest);
-    const layout = packageStoreLayout(relative_manifest_path, manifest);
+    const layout = packageStoreLayout(relative_manifest_path, manifest) orelse {
+        freePackageManifest(alloc, manifest);
+        alloc.free(package_root_path);
+        alloc.free(manifest_path);
+        return null;
+    };
 
     return .{
         .manifest = manifest,
@@ -1099,23 +1112,36 @@ fn loadPackageStoreEntryAlloc(
     };
 }
 
+fn packageStorePathSupported(relative_manifest_path: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, relative_manifest_path, '/');
+    const first = parts.next() orelse return false;
+    const second = parts.next() orelse return false;
+    const third = parts.next();
+    if (third == null) return first.len != 0 and std.mem.eql(u8, second, package_manifest_filename);
+    return parts.next() == null and
+        std.mem.eql(u8, first, "sha256") and
+        second.len != 0 and
+        std.mem.eql(u8, third.?, package_manifest_filename);
+}
+
 pub const PackageStoreLayout = enum {
     canonical,
     content_addressed,
-    loose,
 };
 
-fn packageStoreLayout(relative_manifest_path: []const u8, manifest: PackageManifest) PackageStoreLayout {
+fn packageStoreLayout(relative_manifest_path: []const u8, manifest: PackageManifest) ?PackageStoreLayout {
     var parts = std.mem.splitScalar(u8, relative_manifest_path, '/');
-    const first = parts.next() orelse return .loose;
-    const second = parts.next() orelse return .loose;
-    const third = parts.next() orelse return .loose;
-    if (parts.next() != null) return .loose;
-    if (!std.mem.eql(u8, third, package_manifest_filename)) return .loose;
+    const first = parts.next() orelse return null;
+    const second = parts.next() orelse return null;
+    const third = parts.next();
 
-    if (std.mem.eql(u8, first, manifest.name) and std.mem.eql(u8, second, manifest.version)) {
+    if (third == null and std.mem.eql(u8, first, manifest.name) and std.mem.eql(u8, second, package_manifest_filename)) {
         return .canonical;
     }
+
+    if (parts.next() != null) return null;
+    if (third == null or !std.mem.eql(u8, third.?, package_manifest_filename)) return null;
+
     if (std.mem.eql(u8, first, "sha256")) {
         if (std.mem.startsWith(u8, manifest.digest, "sha256:") and
             std.mem.eql(u8, manifest.digest["sha256:".len..], second))
@@ -1123,7 +1149,7 @@ fn packageStoreLayout(relative_manifest_path: []const u8, manifest: PackageManif
             return .content_addressed;
         }
     }
-    return .loose;
+    return null;
 }
 
 fn joinStorePathAlloc(alloc: std.mem.Allocator, root_path: []const u8, relative_path: []const u8) ![]u8 {
@@ -1699,7 +1725,7 @@ test "extension package names are path-safe and versions sort deterministically"
     try std.testing.expect(!packageVersionLess("1.10.0", "1.2.0"));
 }
 
-test "extension package manifest validates data shape and mcp objects" {
+test "extension package manifest validates data shape, mcp, and skill objects" {
     const json =
         \\{
         \\  "manifest_api_version": "extensions/v1",
@@ -1748,6 +1774,17 @@ test "extension package manifest validates data shape and mcp objects" {
         \\        "name": "recall",
         \\        "shape": "recall_request",
         \\        "config_json": "{\"handler\":\"antfly_api_template\"}"
+        \\      },
+        \\      {
+        \\        "kind": "skill",
+        \\        "name": "memory",
+        \\        "config_json": "{\"displayName\":\"Memoryaf\",\"description\":\"Use Memoryaf for long-term memory.\",\"profile\":\"copilot\",\"capabilities\":[\"memory-search\"],\"body\":\"# Memoryaf\\n\\nUse this skill when long-term memory is installed and visible.\"}"
+        \\      },
+        \\      {
+        \\        "kind": "agent",
+        \\        "name": "research",
+        \\        "shape": "recall_request",
+        \\        "config_json": "{\"displayName\":\"Memoryaf Research\",\"description\":\"Research visible long-term memories.\",\"profile\":\"copilot\",\"protocols\":[\"agents-api\",\"stream\"],\"capabilities\":[\"memory-search\"],\"handler\":\"wasm:memoryaf/research\"}"
         \\      }
         \\    ],
         \\    "runtimes": [
@@ -1765,7 +1802,7 @@ test "extension package manifest validates data shape and mcp objects" {
 
     try std.testing.expectEqualStrings("memoryaf", parsed.value.name);
     try std.testing.expect(parsed.value.install.supportsScope(.table));
-    try std.testing.expectEqual(@as(usize, 2), parsed.value.install.objects.len);
+    try std.testing.expectEqual(@as(usize, 4), parsed.value.install.objects.len);
     try std.testing.expect(objectKindV1(parsed.value.install.objects[1].kind));
 
     var plan = try planManifestOnlyInstallAlloc(
@@ -1783,7 +1820,7 @@ test "extension package manifest validates data shape and mcp objects" {
     defer plan.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("memoryaf", plan.installed.name);
     try std.testing.expectEqualStrings("sha256:abc", plan.installed.package_digest);
-    try std.testing.expectEqual(@as(usize, 5), plan.members.len);
+    try std.testing.expectEqual(@as(usize, 7), plan.members.len);
     try std.testing.expectEqual(.data_shape, plan.members[0].object_kind);
     try std.testing.expectEqual(DataShapeKind.document, plan.members[0].shape_kind.?);
     try std.testing.expectEqualStrings("{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}}}}}}", plan.members[0].owner_metadata_json);
@@ -1799,6 +1836,16 @@ test "extension package manifest validates data shape and mcp objects" {
     try std.testing.expectEqualStrings("recall_request", plan.members[4].shape_name);
     try std.testing.expectEqualStrings("1", plan.members[4].shape_version);
     try std.testing.expectEqualStrings("memories", plan.members[4].table_name);
+    try std.testing.expectEqual(.skill, plan.members[5].object_kind);
+    try std.testing.expectEqualStrings("memory", plan.members[5].object_name);
+    try std.testing.expectEqualStrings("memories", plan.members[5].table_name);
+    try std.testing.expect(std.mem.indexOf(u8, plan.members[5].owner_metadata_json, "\"displayName\":\"Memoryaf\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan.members[5].owner_metadata_json, "\"profile\":\"copilot\"") != null);
+    try std.testing.expectEqual(.agent, plan.members[6].object_kind);
+    try std.testing.expectEqualStrings("research", plan.members[6].object_name);
+    try std.testing.expectEqualStrings("recall_request", plan.members[6].shape_name);
+    try std.testing.expectEqualStrings("memories", plan.members[6].table_name);
+    try std.testing.expect(std.mem.indexOf(u8, plan.members[6].owner_metadata_json, "\"protocols\":[\"agents-api\",\"stream\"]") != null);
 }
 
 test "extension catalog resolves unversioned installs to deterministic latest package" {
@@ -1830,15 +1877,15 @@ test "extension catalog resolves unversioned installs to deterministic latest pa
     try std.testing.expectEqualStrings("sha256:v110", installed.package_digest);
 }
 
-test "extension package store scans local and content-addressed manifests" {
+test "extension package store scans only canonical and content-addressed manifests" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/extensions", .{tmp.sub_path});
     defer std.testing.allocator.free(root_path);
-    try tmp.dir.createDirPath(std.testing.io, "extensions/memoryaf/1.0.0");
+    try tmp.dir.createDirPath(std.testing.io, "extensions/memoryaf");
     try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "extensions/memoryaf/1.0.0/extension.json",
+        .sub_path = "extensions/memoryaf/extension.json",
         .data =
         \\{
         \\  "manifest_api_version": "extensions/v1",
@@ -1874,52 +1921,32 @@ test "extension package store scans local and content-addressed manifests" {
         \\}
         ,
     });
-    try tmp.dir.createDirPath(std.testing.io, "extensions/dev/loose");
+    try tmp.dir.createDirPath(std.testing.io, "extensions/dev/unsupported");
     try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "extensions/dev/loose/extension.json",
-        .data =
-        \\{
-        \\  "manifest_api_version": "extensions/v1",
-        \\  "name": "looseaf",
-        \\  "version": "0.1.0",
-        \\  "kind": "extension",
-        \\  "digest": "sha256:loose",
-        \\  "install": {
-        \\    "scopes_supported": ["cluster"],
-        \\    "objects": [
-        \\      {"kind": "mcp_tool", "name": "loose_tool"}
-        \\    ]
-        \\  }
-        \\}
-        ,
+        .sub_path = "extensions/dev/unsupported/extension.json",
+        .data = "not a manifest",
     });
 
     const entries = try scanPackageStoreAlloc(std.testing.allocator, std.testing.io, root_path);
     defer freePackageStoreEntries(std.testing.allocator, entries);
 
-    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
     var saw_memoryaf = false;
     var saw_content_addressed = false;
-    var saw_loose = false;
     for (entries) |entry| {
         if (std.mem.eql(u8, entry.manifest.name, "memoryaf")) {
             saw_memoryaf = true;
             try std.testing.expectEqual(PackageStoreLayout.canonical, entry.layout);
-            try std.testing.expect(std.mem.endsWith(u8, entry.package_root_path, "extensions/memoryaf/1.0.0"));
+            try std.testing.expect(std.mem.endsWith(u8, entry.package_root_path, "extensions/memoryaf"));
         }
         if (std.mem.eql(u8, entry.manifest.name, "antfly_text_extras")) {
             saw_content_addressed = true;
             try std.testing.expectEqual(PackageStoreLayout.content_addressed, entry.layout);
             try std.testing.expectEqualStrings("sha256:abc123", entry.manifest.digest);
         }
-        if (std.mem.eql(u8, entry.manifest.name, "looseaf")) {
-            saw_loose = true;
-            try std.testing.expectEqual(PackageStoreLayout.loose, entry.layout);
-        }
     }
     try std.testing.expect(saw_memoryaf);
     try std.testing.expect(saw_content_addressed);
-    try std.testing.expect(saw_loose);
 }
 
 test "extension package store treats missing root as empty" {

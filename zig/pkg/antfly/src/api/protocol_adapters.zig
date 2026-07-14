@@ -22,16 +22,22 @@ const mcp = @import("antfly_mcp");
 const a2a = @import("antfly_a2a");
 
 const trusted_principal_header = "X-Antfly-Trusted-Principal";
+const max_mcp_sample_documents_limit: i64 = 100;
 
 const McpToolKind = enum {
     create_table,
     drop_table,
     list_tables,
+    describe_table,
     create_index,
     drop_index,
     list_indexes,
+    describe_indexes,
     get_document,
+    sample_documents,
     query,
+    describe_query_request,
+    describe_mcp_capabilities,
     backup,
     restore,
     batch,
@@ -47,6 +53,7 @@ const McpToolSpec = struct {
 const McpToolFieldType = enum {
     string,
     integer,
+    boolean,
     array,
     object,
 };
@@ -58,7 +65,24 @@ const McpToolFieldSpec = struct {
     description: ?[]const u8 = null,
     default_json: ?[]const u8 = null,
     items_json: ?[]const u8 = null,
+    schema_json: ?[]const u8 = null,
 };
+
+const full_text_search_schema_json =
+    \\{"oneOf":[{"type":"string"},{"type":"object","additionalProperties":true}],"description":"Full-text query string shorthand, or the generic full_text_search query object accepted by the REST API"}
+;
+
+const query_request_schema_json =
+    \\{"type":"object","additionalProperties":true,"description":"Raw Antfly QueryRequest body for POST /tables/{tableName}/query. Use this to access the full OpenAPI query contract. Mutually exclusive with query shorthand arguments.","properties":{"query":{"type":"object","additionalProperties":true},"full_text_search":{"type":"object","additionalProperties":true},"filter_query":{"type":"object","additionalProperties":true},"exclusion_query":{"type":"object","additionalProperties":true},"semantic_search":{"type":"string"},"embedding_template":{"type":"string"},"indexes":{"type":"array","items":{"type":"string"}},"embeddings":{"type":"object","additionalProperties":true},"fields":{"type":"array","items":{"type":"string"}},"limit":{"type":"integer"},"offset":{"type":"integer"},"timeout_ms":{"type":"integer","minimum":0},"order_by":{"type":"array"},"search_after":{"type":"array","items":{}},"search_before":{"type":"array","items":{}},"filter_prefix":{"type":"string"},"distance_under":{"type":"number"},"distance_over":{"type":"number"},"search_effort":{"type":"number"},"merge_config":{"type":"object","additionalProperties":true},"count":{"type":"boolean"},"profile":{"type":"boolean"},"reranker":{"type":"object","additionalProperties":true},"aggregations":{"type":"object","additionalProperties":true},"graph_searches":{"type":"object","additionalProperties":true},"expand_strategy":{"type":"string"},"document_renderer":{"type":"string"},"pruner":{"type":"object","additionalProperties":true},"join":{"type":"object","additionalProperties":true},"foreign_sources":{"type":"object","additionalProperties":true}}}
+;
+
+const query_request_description_json =
+    \\{"openapi_schema":"specs/openapi/antfly/metadata.yaml#/components/schemas/QueryRequest","query_ast_schema":"specs/openapi/antfly/query.yaml#/components/schemas/Query","mcp_usage":{"tool":"query","path_table_argument":"tableName","raw_body_argument":"queryRequest","rules":["queryRequest is forwarded unchanged as the POST /tables/{tableName}/query body.","queryRequest is mutually exclusive with shorthand query arguments such as fullTextSearch, semanticSearch, fields, limit, orderBy, indexes, and filterPrefix.","queryRequest.table is rejected because tableName selects the table-scoped route.","Use describe_query_request for this compact schema instead of relying on tools/list to inline the full recursive OpenAPI schema.","Structured filter_query.geo_bbox accepts field, min_lat, min_lon, max_lat, and max_lon; min_lon greater than max_lon represents an antimeridian-wrapped box."]},"top_level_fields":["query","full_text_search","semantic_search","embedding_template","indexes","filter_prefix","filter_query","exclusion_query","aggregations","embeddings","search_effort","fields","limit","offset","timeout_ms","order_by","search_after","search_before","distance_under","distance_over","merge_config","count","profile","reranker","analyses","graph_searches","expand_strategy","document_renderer","pruner","join","foreign_sources"],"examples":{"fielded_full_text":{"full_text_search":{"match":"hello","field":"body"},"fields":["title","body"],"limit":5,"timeout_ms":5000},"hybrid":{"full_text_search":{"match":"raft","field":"body"},"semantic_search":"raft snapshot architecture","indexes":["body_embedding"],"merge_config":{"strategy":"rrf"},"fields":["title","body"],"limit":20,"profile":true},"filtered":{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"filter":[{"term":{"path":"/tenant","value":"acme"}}]}},"fields":["title","url"],"limit":10},"geo_bbox_filter":{"filter_query":{"geo_bbox":{"field":"location","min_lat":-1,"min_lon":179.5,"max_lat":1,"max_lon":-179.5}},"limit":10}}}
+;
+
+const mcp_capabilities_description_json =
+    \\{"protocol":"mcp","protocol_version":"2025-06-18","transport":"streamable_http","endpoint":"/mcp/v1","sessions":{"initialize_returns_session_id":true,"delete_closes_session":true,"last_event_id_cursor_supported":true,"historical_replay":false},"query_builder":"Use the A2A query-builder skill for agentic natural-language query planning. MCP stays focused on deterministic database tools and raw QueryRequest execution.","tools":{"deterministic":["list_tables","describe_table","list_indexes","describe_indexes","get_document","sample_documents","query","describe_query_request"],"write":["create_table","drop_table","create_index","drop_index","batch","backup","restore"],"schema_helpers":["describe_query_request","describe_mcp_capabilities"]},"query":{"raw_query_request":true,"raw_query_request_argument":"queryRequest","shorthand_arguments":["fullTextSearch","fullTextSearchField","semanticSearch","fields","limit","orderBy","indexes","filterPrefix"],"raw_mode_exclusive":true}}
+;
 
 const mcp_tool_specs = [_]McpToolSpec{
     .{
@@ -79,6 +103,12 @@ const mcp_tool_specs = [_]McpToolSpec{
         .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
     },
     .{ .kind = .list_tables, .name = "list_tables", .description = "List Antfly tables" },
+    .{
+        .kind = .describe_table,
+        .name = "describe_table",
+        .description = "Describe an Antfly table, including schema, indexes, ranges, and storage status when available",
+        .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
+    },
     .{
         .kind = .create_index,
         .name = "create_index",
@@ -109,6 +139,12 @@ const mcp_tool_specs = [_]McpToolSpec{
         .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
     },
     .{
+        .kind = .describe_indexes,
+        .name = "describe_indexes",
+        .description = "Describe indexes for an Antfly table",
+        .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
+    },
+    .{
         .kind = .get_document,
         .name = "get_document",
         .description = "Get an Antfly document by key",
@@ -119,12 +155,28 @@ const mcp_tool_specs = [_]McpToolSpec{
         },
     },
     .{
+        .kind = .sample_documents,
+        .name = "sample_documents",
+        .description = "Return a bounded NDJSON sample from a table using the table lookup/scan route",
+        .fields = &.{
+            .{ .name = "tableName", .schema_type = .string, .required = true },
+            .{ .name = "limit", .schema_type = .integer, .default_json = "5" },
+            .{ .name = "from", .schema_type = .string },
+            .{ .name = "to", .schema_type = .string },
+            .{ .name = "inclusiveFrom", .schema_type = .boolean, .description = "Set to true to include the from key." },
+            .{ .name = "fields", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
+        },
+    },
+    .{
         .kind = .query,
         .name = "query",
         .description = "Run an Antfly table query",
         .fields = &.{
             .{ .name = "tableName", .schema_type = .string, .required = true },
-            .{ .name = "fullTextSearch", .schema_type = .string },
+            .{ .name = "queryRequest", .schema_type = .object, .schema_json = query_request_schema_json },
+            .{ .name = "fullTextSearch", .schema_type = .object, .schema_json = full_text_search_schema_json },
+            .{ .name = "full_text_search", .schema_type = .object, .description = "Generic REST-shaped full_text_search query object" },
+            .{ .name = "fullTextSearchField", .schema_type = .string, .description = "Field to search when fullTextSearch is a string shorthand, for example content" },
             .{ .name = "semanticSearch", .schema_type = .string },
             .{ .name = "fields", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
             .{ .name = "limit", .schema_type = .integer, .default_json = "10" },
@@ -132,6 +184,16 @@ const mcp_tool_specs = [_]McpToolSpec{
             .{ .name = "indexes", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
             .{ .name = "filterPrefix", .schema_type = .string },
         },
+    },
+    .{
+        .kind = .describe_query_request,
+        .name = "describe_query_request",
+        .description = "Return compact guidance for the raw Antfly QueryRequest accepted by query.queryRequest",
+    },
+    .{
+        .kind = .describe_mcp_capabilities,
+        .name = "describe_mcp_capabilities",
+        .description = "Describe Antfly MCP capabilities, deterministic tools, and A2A query-builder handoff guidance",
     },
     .{
         .kind = .backup,
@@ -170,12 +232,14 @@ const ExtensionMcpTool = struct {
     description: []u8,
     input_schema_json: []u8,
     handler: []u8,
+    required_capabilities: []extension_domain.Capability = &.{},
     runtime_binding: ?ExtensionRuntimeBinding = null,
 
     fn deinit(self: ExtensionMcpTool, alloc: std.mem.Allocator) void {
         alloc.free(self.description);
         alloc.free(self.input_schema_json);
         alloc.free(self.handler);
+        freeExtensionCapabilities(alloc, self.required_capabilities);
         if (self.runtime_binding) |binding| binding.deinit(alloc);
     }
 };
@@ -183,6 +247,7 @@ const ExtensionMcpTool = struct {
 const ExtensionRuntimeBinding = struct {
     package_name: []u8,
     package_version: []u8,
+    package_digest: []u8,
     runtime_name: []u8,
     artifact: []u8,
     entrypoint: []u8,
@@ -190,6 +255,7 @@ const ExtensionRuntimeBinding = struct {
     fn deinit(self: ExtensionRuntimeBinding, alloc: std.mem.Allocator) void {
         alloc.free(self.package_name);
         alloc.free(self.package_version);
+        alloc.free(self.package_digest);
         alloc.free(self.runtime_name);
         alloc.free(self.artifact);
         alloc.free(self.entrypoint);
@@ -199,6 +265,7 @@ const ExtensionRuntimeBinding = struct {
         return .{
             .package_name = self.package_name,
             .package_version = self.package_version,
+            .package_digest = self.package_digest,
             .runtime_name = self.runtime_name,
             .artifact = self.artifact,
             .entrypoint = self.entrypoint,
@@ -232,11 +299,16 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
                 .create_table => try ctx.createTable(alloc, args),
                 .drop_table => try ctx.tableRoute(alloc, args, .DELETE, "tableName", null, ""),
                 .list_tables => try ctx.simpleRoute(alloc, .GET, routes.Routes.tables, ""),
+                .describe_table => try ctx.tableRoute(alloc, args, .GET, "tableName", null, ""),
                 .create_index => try ctx.createIndex(alloc, args),
                 .drop_index => try ctx.indexRoute(alloc, args, .DELETE, ""),
                 .list_indexes => try ctx.listIndexes(alloc, args),
+                .describe_indexes => try ctx.listIndexes(alloc, args),
                 .get_document => try ctx.getDocument(alloc, args),
+                .sample_documents => try ctx.sampleDocuments(alloc, args),
                 .query => try ctx.query(alloc, args),
+                .describe_query_request => try ctx.describeQueryRequest(alloc),
+                .describe_mcp_capabilities => try ctx.describeMcpCapabilities(alloc),
                 .backup => try ctx.backupRestore(alloc, args, "backup"),
                 .restore => try ctx.backupRestore(alloc, args, "restore"),
                 .batch => try ctx.batch(alloc, args),
@@ -313,6 +385,21 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             return try ctx.simpleRoute(alloc, .GET, try uri.toOwnedSlice(alloc), "");
         }
 
+        fn sampleDocuments(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
+            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const limit = jsonIntArg(args, "limit") orelse 5;
+            if (limit <= 0) return mcpError(alloc, "limit must be greater than 0");
+            if (limit > max_mcp_sample_documents_limit) return mcpError(alloc, "limit exceeds maximum sample size");
+            var body = std.json.ObjectMap.empty;
+            try body.put(alloc, "limit", .{ .integer = limit });
+            if (jsonStringArg(args, "from")) |from| if (from.len != 0) try body.put(alloc, "from", .{ .string = from });
+            if (jsonStringArg(args, "to")) |to| if (to.len != 0) try body.put(alloc, "to", .{ .string = to });
+            if (jsonBoolArg(args, "inclusiveFrom")) |inclusive| try body.put(alloc, "inclusive_from", .{ .bool = inclusive });
+            if (jsonValueArg(args, "fields")) |fields| try body.put(alloc, "fields", fields);
+            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}{s}", .{ routes.Routes.tables, table_name, routes.Routes.documents_suffix });
+            return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
+        }
+
         fn indexRoute(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, method: http_common.Method, body: []const u8) !mcp.CallToolResult {
             const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
             const index_name = jsonStringArg(args, "indexName") orelse return mcpError(alloc, "missing indexName");
@@ -322,14 +409,17 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
 
         fn query(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
-            var body = std.json.ObjectMap.empty;
-            if (jsonStringArg(args, "fullTextSearch")) |full_text| {
-                if (full_text.len != 0) {
-                    var full_text_obj = std.json.ObjectMap.empty;
-                    try full_text_obj.put(alloc, "query", .{ .string = full_text });
-                    try body.put(alloc, "full_text_search", .{ .object = full_text_obj });
-                }
+            if (jsonValueArg(args, "queryRequest")) |query_request| {
+                if (query_request != .object) return mcpError(alloc, "queryRequest must be an object");
+                if (hasNonRawQueryArg(args)) return mcpError(alloc, "queryRequest cannot be combined with shorthand query arguments");
+                if (query_request.object.get("table") != null) return mcpError(alloc, "queryRequest.table is not allowed; use tableName");
+
+                const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/query", .{ routes.Routes.tables, table_name });
+                return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, query_request));
             }
+
+            var body = std.json.ObjectMap.empty;
+            putFullTextSearchArg(alloc, &body, args) catch return mcpError(alloc, "invalid fullTextSearch");
             if (jsonStringArg(args, "semanticSearch")) |semantic| if (semantic.len != 0) try body.put(alloc, "semantic_search", .{ .string = semantic });
             if (jsonValueArg(args, "fields")) |fields| try body.put(alloc, "fields", fields);
             if (jsonValueArg(args, "orderBy")) |order_by| try body.put(alloc, "order_by", order_by);
@@ -338,6 +428,22 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             try body.put(alloc, "limit", .{ .integer = jsonIntArg(args, "limit") orelse 10 });
             const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/query", .{ routes.Routes.tables, table_name });
             return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
+        }
+
+        fn describeQueryRequest(_: *@This(), alloc: std.mem.Allocator) !mcp.CallToolResult {
+            const structured = try std.json.parseFromSliceLeaky(std.json.Value, alloc, query_request_description_json, .{});
+            return .{
+                .text = try alloc.dupe(u8, "Antfly QueryRequest schema summary for query.queryRequest"),
+                .structured = structured,
+            };
+        }
+
+        fn describeMcpCapabilities(_: *@This(), alloc: std.mem.Allocator) !mcp.CallToolResult {
+            const structured = try std.json.parseFromSliceLeaky(std.json.Value, alloc, mcp_capabilities_description_json, .{});
+            return .{
+                .text = try alloc.dupe(u8, "Antfly MCP capabilities"),
+                .structured = structured,
+            };
         }
 
         fn backupRestore(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, operation: []const u8) !mcp.CallToolResult {
@@ -388,6 +494,8 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
     };
     const ExtensionToolContext = struct {
         server: Server,
+        authorization: ?[]const u8,
+        trusted_principal: ?[]const u8,
         installed: *const extension_domain.InstalledExtension,
         tool: *const ExtensionMcpTool,
 
@@ -397,7 +505,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
 
         fn call(ptr: *anyopaque, alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const ctx: *@This() = @ptrCast(@alignCast(ptr));
-            return try callExtensionMcpTool(alloc, ctx.server, ctx.installed, ctx.tool.*, args);
+            return try callExtensionMcpTool(alloc, ctx.server, ctx.authorization, ctx.trusted_principal, ctx.installed, ctx.tool.*, args);
         }
     };
 
@@ -440,7 +548,13 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
     defer if (extension_contexts.len > 0) server_ptr.alloc.free(extension_contexts);
     for (extension_contexts, 0..) |*ctx, i| {
         const installed = findInstalledExtensionForRuntimeTool(snapshot_opt.?.installed_extensions, extension_tools.items[i].member.extension_name) orelse return try textResponse(server_ptr.alloc, 404, "extension not found");
-        ctx.* = .{ .server = server_ptr, .installed = installed, .tool = &extension_tools.items[i] };
+        ctx.* = .{
+            .server = server_ptr,
+            .authorization = req.authorization,
+            .trusted_principal = req.header(trusted_principal_header),
+            .installed = installed,
+            .tool = &extension_tools.items[i],
+        };
     }
 
     var input_schemas: [mcp_tool_specs.len][]u8 = undefined;
@@ -470,6 +584,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         }
     }
     for (extension_tools.items, extension_contexts) |tool, *ctx| {
+        if (!extensionMcpToolVisibleForIdentity(ctx.installed, &tool, authenticated_identity)) continue;
         try protocol_server.addTool(server_ptr.alloc, .{
             .name = tool.member.object_name,
             .description = tool.description,
@@ -501,11 +616,52 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
 fn mcpToolVisibleForIdentity(kind: McpToolKind, authenticated_identity: anytype) bool {
     const identity = authenticated_identity orelse return true;
     return switch (kind) {
+        .describe_query_request, .describe_mcp_capabilities => true,
         .list_tables => identityHasPermission(identity.permissions, .table, "*", .read),
-        .query, .get_document, .list_indexes => identityHasAnyPermission(identity.permissions, .table, .read),
+        .query, .describe_table, .describe_indexes, .get_document, .sample_documents, .list_indexes => identityHasAnyPermission(identity.permissions, .table, .read),
         .batch => identityHasAnyPermission(identity.permissions, .table, .write),
         .create_table, .drop_table, .create_index, .drop_index, .backup, .restore => identityHasAnyPermission(identity.permissions, .table, .admin),
     };
+}
+
+fn extensionMcpToolVisibleForIdentity(installed: *const extension_domain.InstalledExtension, tool: *const ExtensionMcpTool, authenticated_identity: anytype) bool {
+    const identity = authenticated_identity orelse return true;
+    if (tool.required_capabilities.len == 0) {
+        return extensionScopeVisibleForIdentity(installed.*, tool.member.*, identity.permissions);
+    }
+
+    var checked_table_permission = false;
+    for (tool.required_capabilities) |capability| {
+        const permission_type = permissionTypeForExtensionCapability(capability.name) orelse continue;
+        checked_table_permission = true;
+        const table = tableResourceForExtensionCapability(installed.*, tool.member.*, capability);
+        if (!identityHasPermission(identity.permissions, .table, table, permission_type)) return false;
+    }
+    return checked_table_permission or extensionScopeVisibleForIdentity(installed.*, tool.member.*, identity.permissions);
+}
+
+fn extensionScopeVisibleForIdentity(installed: extension_domain.InstalledExtension, member: extension_domain.ExtensionMember, permissions: []const usermgr.Permission) bool {
+    if (member.scope.kind == .table) {
+        return identityHasPermission(permissions, .table, member.scope.table_name, .read);
+    }
+    if (installed.scope.kind == .table) {
+        return identityHasPermission(permissions, .table, installed.scope.table_name, .read);
+    }
+    return identityHasPermission(permissions, .@"*", "*", .admin);
+}
+
+fn permissionTypeForExtensionCapability(name: []const u8) ?usermgr.PermissionType {
+    if (std.mem.eql(u8, name, "db:read") or std.mem.eql(u8, name, "read:table")) return .read;
+    if (std.mem.eql(u8, name, "db:write") or std.mem.eql(u8, name, "write:table")) return .write;
+    if (std.mem.eql(u8, name, "db:admin") or std.mem.eql(u8, name, "admin:table")) return .admin;
+    return null;
+}
+
+fn tableResourceForExtensionCapability(installed: extension_domain.InstalledExtension, member: extension_domain.ExtensionMember, capability: extension_domain.Capability) []const u8 {
+    if (capability.scope.len != 0 and !std.mem.eql(u8, capability.scope, installed.package_name)) return capability.scope;
+    if (member.scope.kind == .table) return member.scope.table_name;
+    if (installed.scope.kind == .table) return installed.scope.table_name;
+    return "*";
 }
 
 fn identityHasAnyPermission(permissions: []const usermgr.Permission, resource_type: usermgr.ResourceType, permission_type: usermgr.PermissionType) bool {
@@ -548,6 +704,8 @@ fn extensionMcpToolFromMemberAlloc(alloc: std.mem.Allocator, member: *const exte
     errdefer if (input_schema_json) |value| alloc.free(value);
     var handler: ?[]u8 = null;
     errdefer if (handler) |value| alloc.free(value);
+    var required_capabilities: []extension_domain.Capability = &.{};
+    errdefer freeExtensionCapabilities(alloc, required_capabilities);
 
     if (parsed) |config| {
         if (config.value == .object) {
@@ -564,6 +722,9 @@ fn extensionMcpToolFromMemberAlloc(alloc: std.mem.Allocator, member: *const exte
             }
             if (jsonStringObjectField(config.value.object, "handler")) |value| {
                 handler = try alloc.dupe(u8, value);
+            }
+            if (config.value.object.get("required_capabilities")) |value| {
+                required_capabilities = try parseExtensionCapabilitiesAlloc(alloc, value);
             }
         }
     }
@@ -583,20 +744,70 @@ fn extensionMcpToolFromMemberAlloc(alloc: std.mem.Allocator, member: *const exte
         .description = description.?,
         .input_schema_json = input_schema_json.?,
         .handler = handler.?,
+        .required_capabilities = required_capabilities,
         .runtime_binding = try extensionRuntimeBindingAlloc(alloc, member, handler.?, snapshot),
     };
+}
+
+fn parseExtensionCapabilitiesAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]extension_domain.Capability {
+    if (value != .array) return try alloc.alloc(extension_domain.Capability, 0);
+    var out = std.ArrayListUnmanaged(extension_domain.Capability).empty;
+    errdefer {
+        freeExtensionCapabilityValues(alloc, out.items);
+        out.deinit(alloc);
+    }
+    for (value.array.items) |item| {
+        switch (item) {
+            .string => |name| {
+                const owned_name = try alloc.dupe(u8, name);
+                errdefer alloc.free(owned_name);
+                try out.append(alloc, .{
+                    .name = owned_name,
+                    .scope = "",
+                });
+            },
+            .object => |object| {
+                const name = jsonStringObjectField(object, "name") orelse continue;
+                const scope = jsonStringObjectField(object, "scope") orelse "";
+                const owned_name = try alloc.dupe(u8, name);
+                errdefer alloc.free(owned_name);
+                const owned_scope = if (scope.len == 0) "" else try alloc.dupe(u8, scope);
+                errdefer if (owned_scope.len > 0) alloc.free(owned_scope);
+                try out.append(alloc, .{
+                    .name = owned_name,
+                    .scope = owned_scope,
+                });
+            },
+            else => {},
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn freeExtensionCapabilityValues(alloc: std.mem.Allocator, capabilities: []const extension_domain.Capability) void {
+    for (capabilities) |capability| {
+        alloc.free(capability.name);
+        if (capability.scope.len > 0) alloc.free(capability.scope);
+    }
+}
+
+fn freeExtensionCapabilities(alloc: std.mem.Allocator, capabilities: []const extension_domain.Capability) void {
+    freeExtensionCapabilityValues(alloc, capabilities);
+    if (capabilities.len > 0) alloc.free(@constCast(capabilities));
 }
 
 fn extensionRuntimeBindingAlloc(alloc: std.mem.Allocator, member: *const extension_domain.ExtensionMember, handler: []const u8, snapshot: anytype) !?ExtensionRuntimeBinding {
     const parsed = parseWasmHandler(handler) orelse return null;
     const installed = findInstalledExtension(snapshot.installed_extensions, member.extension_name) orelse return null;
-    const package = findExtensionPackage(snapshot.extension_packages, installed.package_name, installed.package_version) orelse return null;
+    const package = findExtensionPackage(snapshot.extension_packages, installed.package_name, installed.package_version, installed.package_digest) orelse return null;
     const runtime = findWasmRuntime(package.install.runtimes, parsed.runtime_name) orelse return null;
 
     var package_name: ?[]u8 = null;
     errdefer if (package_name) |value| alloc.free(value);
     var package_version: ?[]u8 = null;
     errdefer if (package_version) |value| alloc.free(value);
+    var package_digest: ?[]u8 = null;
+    errdefer if (package_digest) |value| alloc.free(value);
     var runtime_name: ?[]u8 = null;
     errdefer if (runtime_name) |value| alloc.free(value);
     var artifact: ?[]u8 = null;
@@ -606,6 +817,7 @@ fn extensionRuntimeBindingAlloc(alloc: std.mem.Allocator, member: *const extensi
 
     package_name = try alloc.dupe(u8, installed.package_name);
     package_version = try alloc.dupe(u8, installed.package_version);
+    package_digest = try alloc.dupe(u8, installed.package_digest);
     runtime_name = try alloc.dupe(u8, parsed.runtime_name);
     artifact = try alloc.dupe(u8, runtime.artifact);
     entrypoint = try runtimeEntrypointAlloc(alloc, runtime.config_json);
@@ -613,6 +825,7 @@ fn extensionRuntimeBindingAlloc(alloc: std.mem.Allocator, member: *const extensi
     return .{
         .package_name = package_name.?,
         .package_version = package_version.?,
+        .package_digest = package_digest.?,
         .runtime_name = runtime_name.?,
         .artifact = artifact.?,
         .entrypoint = entrypoint.?,
@@ -646,11 +859,111 @@ fn findInstalledExtension(installed_extensions: []const extension_domain.Install
     return null;
 }
 
-fn findExtensionPackage(packages: []const extension_domain.PackageManifest, name: []const u8, version: []const u8) ?extension_domain.PackageManifest {
+fn findExtensionPackage(packages: []const extension_domain.PackageManifest, name: []const u8, version: []const u8, digest: []const u8) ?extension_domain.PackageManifest {
     for (packages) |package| {
-        if (std.mem.eql(u8, package.name, name) and std.mem.eql(u8, package.version, version)) return package;
+        if (std.mem.eql(u8, package.name, name) and
+            std.mem.eql(u8, package.version, version) and
+            std.mem.eql(u8, package.digest, digest))
+        {
+            return package;
+        }
     }
     return null;
+}
+
+pub fn testExtensionRuntimeBindingRequiresInstalledPackageDigestMatch() !void {
+    if (!@import("builtin").is_test) @compileError("test-only helper");
+    const alloc = std.testing.allocator;
+    const runtimes = [_]extension_domain.RuntimeDecl{.{
+        .name = "memoryaf_wasm",
+        .mode = .wasm,
+        .artifact = "target/wasm32-wasip2/release/memoryaf_extension.wasm",
+    }};
+    const packages = [_]extension_domain.PackageManifest{.{
+        .name = "memoryaf",
+        .version = "0.0.1",
+        .digest = "sha256:projected",
+        .install = .{
+            .scopes_supported = &.{.cluster},
+            .runtimes = &runtimes,
+        },
+    }};
+    const installed = [_]extension_domain.InstalledExtension{.{
+        .name = "memories",
+        .package_name = "memoryaf",
+        .package_version = "0.0.1",
+        .package_digest = "sha256:installed",
+        .scope = .{ .kind = .cluster },
+        .status = .ready,
+    }};
+    const snapshot = .{
+        .extension_packages = packages[0..],
+        .installed_extensions = installed[0..],
+    };
+    const member = extension_domain.ExtensionMember{
+        .extension_name = "memories",
+        .scope = .{ .kind = .cluster },
+        .object_kind = .mcp_tool,
+        .object_name = "store_memory",
+    };
+
+    try std.testing.expectEqual(@as(?ExtensionRuntimeBinding, null), try extensionRuntimeBindingAlloc(alloc, &member, "wasm:memoryaf_wasm/store_memory", snapshot));
+}
+
+test "extension runtime binding requires installed package digest to match projected package" {
+    try testExtensionRuntimeBindingRequiresInstalledPackageDigestMatch();
+}
+
+pub fn testExtensionRuntimeBindingCarriesMatchedInstalledPackageDigest() !void {
+    if (!@import("builtin").is_test) @compileError("test-only helper");
+    const alloc = std.testing.allocator;
+    const runtimes = [_]extension_domain.RuntimeDecl{.{
+        .name = "memoryaf_wasm",
+        .mode = .wasm,
+        .artifact = "target/wasm32-wasip2/release/memoryaf_extension.wasm",
+        .config_json = "{\"entrypoint\":\"run-tool\"}",
+    }};
+    const packages = [_]extension_domain.PackageManifest{.{
+        .name = "memoryaf",
+        .version = "0.0.1",
+        .digest = "sha256:projected",
+        .install = .{
+            .scopes_supported = &.{.cluster},
+            .runtimes = &runtimes,
+        },
+    }};
+    const installed = [_]extension_domain.InstalledExtension{.{
+        .name = "memories",
+        .package_name = "memoryaf",
+        .package_version = "0.0.1",
+        .package_digest = "sha256:projected",
+        .scope = .{ .kind = .cluster },
+        .status = .ready,
+    }};
+    const snapshot = .{
+        .extension_packages = packages[0..],
+        .installed_extensions = installed[0..],
+    };
+    const member = extension_domain.ExtensionMember{
+        .extension_name = "memories",
+        .scope = .{ .kind = .cluster },
+        .object_kind = .mcp_tool,
+        .object_name = "store_memory",
+    };
+
+    const binding = (try extensionRuntimeBindingAlloc(alloc, &member, "wasm:memoryaf_wasm/store_memory", snapshot)).?;
+    defer binding.deinit(alloc);
+
+    try std.testing.expectEqualStrings("memoryaf", binding.package_name);
+    try std.testing.expectEqualStrings("0.0.1", binding.package_version);
+    try std.testing.expectEqualStrings("sha256:projected", binding.package_digest);
+    try std.testing.expectEqualStrings("memoryaf_wasm", binding.runtime_name);
+    try std.testing.expectEqualStrings("target/wasm32-wasip2/release/memoryaf_extension.wasm", binding.artifact);
+    try std.testing.expectEqualStrings("run-tool", binding.entrypoint);
+}
+
+test "extension runtime binding carries matched installed package digest" {
+    try testExtensionRuntimeBindingCarriesMatchedInstalledPackageDigest();
 }
 
 fn findWasmRuntime(runtimes: []const extension_domain.RuntimeDecl, name: []const u8) ?extension_domain.RuntimeDecl {
@@ -667,7 +980,7 @@ fn findInstalledExtensionForRuntimeTool(installed_extensions: []const extension_
     return null;
 }
 
-fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, installed: *const extension_domain.InstalledExtension, tool: ExtensionMcpTool, args: std.json.Value) !mcp.CallToolResult {
+fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authorization: ?[]const u8, trusted_principal: ?[]const u8, installed: *const extension_domain.InstalledExtension, tool: ExtensionMcpTool, args: std.json.Value) !mcp.CallToolResult {
     if (parseWasmHandler(tool.handler)) |handler| {
         const tool_name = handler.tool_name;
         if (!std.mem.eql(u8, tool_name, tool.member.object_name)) {
@@ -678,9 +991,12 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, installed: *c
         defer alloc.free(request_json);
         var host_context = ExtensionHostContext(@TypeOf(server)){
             .server = server,
+            .authorization = authorization,
+            .trusted_principal = trusted_principal,
             .installed = installed,
         };
         if (wasmtime_runtime.invokeExtensionWithOptions(alloc, binding.runtime(), tool_name, request_json, .{
+            .package_store_root = server.cfg.extension_package_store_dir,
             .host_imports = .{
                 .ptr = &host_context,
                 .db_query = ExtensionHostContext(@TypeOf(server)).dbQuery,
@@ -695,8 +1011,14 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, installed: *c
             error.WasmtimePackageStoreUnavailable,
             error.WasmtimeArtifactNotFound,
             error.WasmtimeSymbolMissing,
-            => return try mcpError(alloc, "extension wasm runtime is unavailable"),
-            else => return try mcpError(alloc, "extension wasm runtime invocation failed"),
+            => {
+                std.log.warn("extension wasm runtime unavailable package={s} version={s} runtime={s} artifact={s} err={}", .{ binding.package_name, binding.package_version, binding.runtime_name, binding.artifact, err });
+                return try mcpError(alloc, "extension wasm runtime is unavailable");
+            },
+            else => {
+                std.log.warn("extension wasm runtime invocation failed package={s} version={s} runtime={s} artifact={s} err={}", .{ binding.package_name, binding.package_version, binding.runtime_name, binding.artifact, err });
+                return try mcpError(alloc, "extension wasm runtime invocation failed");
+            },
         }
     }
 
@@ -708,6 +1030,8 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, installed: *c
 fn ExtensionHostContext(comptime Server: type) type {
     return struct {
         server: Server,
+        authorization: ?[]const u8,
+        trusted_principal: ?[]const u8,
         installed: *const extension_domain.InstalledExtension,
 
         fn dbQuery(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, query_json: []const u8) anyerror![]u8 {
@@ -771,9 +1095,15 @@ fn ExtensionHostContext(comptime Server: type) type {
         fn dispatchJson(ctx: *@This(), alloc: std.mem.Allocator, method: http_common.Method, table_name: []const u8, route: []const u8, body: []const u8) ![]u8 {
             const uri = try std.fmt.allocPrint(alloc, "/tables/{s}/{s}", .{ table_name, route });
             defer alloc.free(uri);
+            const headers: []const http_common.RequestHeader = if (ctx.trusted_principal) |principal|
+                &[_]http_common.RequestHeader{.{ .name = trusted_principal_header, .value = principal }}
+            else
+                &.{};
             var resp = try ctx.server.handle(.{
                 .method = method,
                 .uri = uri,
+                .headers = headers,
+                .authorization = ctx.authorization,
                 .content_type = "application/json",
                 .body = body,
             });
@@ -881,7 +1211,12 @@ fn buildMcpInputSchema(alloc: std.mem.Allocator, spec: McpToolSpec) ![]u8 {
     for (spec.fields, 0..) |field, i| {
         if (i != 0) try out.append(alloc, ',');
         try appendJsonString(alloc, &out, field.name);
-        try out.appendSlice(alloc, ":{\"type\":");
+        try out.append(alloc, ':');
+        if (field.schema_json) |schema_json| {
+            try out.appendSlice(alloc, schema_json);
+            continue;
+        }
+        try out.appendSlice(alloc, "{\"type\":");
         try appendJsonString(alloc, &out, @tagName(field.schema_type));
         if (field.items_json) |items_json| {
             try out.appendSlice(alloc, ",\"items\":");
@@ -901,10 +1236,10 @@ fn buildMcpInputSchema(alloc: std.mem.Allocator, spec: McpToolSpec) ![]u8 {
     return try out.toOwnedSlice(alloc);
 }
 
-pub fn handleA2aRequest(server_ptr: anytype, req: http_common.HttpRequest) !http_common.HttpResponse {
+pub fn handleA2aRequest(server_ptr: anytype, req: http_common.HttpRequest, query_embedding_security_scope: anytype) !http_common.HttpResponse {
     var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
     defer arena_impl.deinit();
-    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), req.authorization);
+    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), req.authorization, query_embedding_security_scope);
     if (isJsonRpcMethod(arena_impl.allocator(), req.body, "message/stream")) {
         var sink = A2aSseSink{};
         defer sink.out.deinit(server_ptr.alloc);
@@ -921,7 +1256,7 @@ pub fn isA2aStreamingRequest(alloc: std.mem.Allocator, req: http_common.HttpRequ
     return req.method == .POST and isJsonRpcMethod(alloc, req.body, "message/stream");
 }
 
-pub fn handleA2aStreamingRequest(server_ptr: anytype, req: http_common.HttpRequest, writer: http_common.StreamWriter) !bool {
+pub fn handleA2aStreamingRequest(server_ptr: anytype, req: http_common.HttpRequest, writer: http_common.StreamWriter, query_embedding_security_scope: anytype) !bool {
     var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
     defer arena_impl.deinit();
     if (!isJsonRpcMethod(arena_impl.allocator(), req.body, "message/stream")) return false;
@@ -931,7 +1266,7 @@ pub fn handleA2aStreamingRequest(server_ptr: anytype, req: http_common.HttpReque
         .content_type = "text/event-stream",
     });
 
-    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), req.authorization);
+    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), req.authorization, query_embedding_security_scope);
     var sink = A2aLiveSseSink{ .writer = writer };
     try dispatcher.handleJsonRpcStream(server_ptr.alloc, req.body, sink.iface());
     try writer.writeAll("event: done\ndata: {}\n\n");
@@ -966,22 +1301,28 @@ const A2aLiveSseSink = struct {
     }
 };
 
-pub fn handleA2aCard(server_ptr: anytype) !http_common.HttpResponse {
+pub fn handleA2aCard(server_ptr: anytype, query_embedding_security_scope: anytype) !http_common.HttpResponse {
     var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
     defer arena_impl.deinit();
-    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), null);
+    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), null, query_embedding_security_scope);
     const card = try dispatcher.agentCard(arena_impl.allocator());
     const body = try stringifyJsonValue(server_ptr.alloc, card);
     defer server_ptr.alloc.free(body);
     return try jsonBodyResponseWithStatus(server_ptr.alloc, 200, body);
 }
 
-fn buildA2aDispatcher(server_ptr: anytype, dispatcher_alloc: std.mem.Allocator, authorization: ?[]const u8) !a2a.Dispatcher {
+fn buildA2aDispatcher(
+    server_ptr: anytype,
+    dispatcher_alloc: std.mem.Allocator,
+    authorization: ?[]const u8,
+    query_embedding_security_scope: anytype,
+) !a2a.Dispatcher {
     const Server = @TypeOf(server_ptr);
     const HandlerKind = enum { query_builder, retrieval };
     const HandlerContext = struct {
         server: Server,
         authorization: ?[]const u8,
+        query_embedding_security_scope: @TypeOf(query_embedding_security_scope),
         kind: HandlerKind,
 
         fn iface(ctx: *@This()) a2a.AgentHandler {
@@ -1070,7 +1411,14 @@ fn buildA2aDispatcher(server_ptr: anytype, dispatcher_alloc: std.mem.Allocator, 
                 }
             }
             const body_json = try stringifyJsonValue(alloc, .{ .object = body });
-            try ctx.server.executeA2aRetrieval(alloc, body_json, request_ctx.task_id, request_ctx.context_id, queue);
+            try ctx.server.executeA2aRetrieval(
+                alloc,
+                body_json,
+                request_ctx.task_id,
+                request_ctx.context_id,
+                queue,
+                ctx.query_embedding_security_scope,
+            );
         }
     };
 
@@ -1081,8 +1429,18 @@ fn buildA2aDispatcher(server_ptr: anytype, dispatcher_alloc: std.mem.Allocator, 
         .task_store = server_ptr.a2a_tasks.iface(),
     };
     const contexts = try dispatcher_alloc.alloc(HandlerContext, 2);
-    contexts[0] = .{ .server = server_ptr, .authorization = authorization, .kind = .query_builder };
-    contexts[1] = .{ .server = server_ptr, .authorization = authorization, .kind = .retrieval };
+    contexts[0] = .{
+        .server = server_ptr,
+        .authorization = authorization,
+        .query_embedding_security_scope = query_embedding_security_scope,
+        .kind = .query_builder,
+    };
+    contexts[1] = .{
+        .server = server_ptr,
+        .authorization = authorization,
+        .query_embedding_security_scope = query_embedding_security_scope,
+        .kind = .retrieval,
+    };
     try dispatcher.addHandler(dispatcher_alloc, contexts[0].iface());
     try dispatcher.addHandler(dispatcher_alloc, contexts[1].iface());
     return dispatcher;
@@ -1204,9 +1562,67 @@ fn jsonIntObjectField(object: anytype, key: []const u8) ?i64 {
     };
 }
 
+fn jsonBoolArg(value: std.json.Value, key: []const u8) ?bool {
+    if (value != .object) return null;
+    const raw = value.object.get(key) orelse return null;
+    return switch (raw) {
+        .bool => |flag| flag,
+        else => null,
+    };
+}
+
 fn jsonValueArg(value: std.json.Value, key: []const u8) ?std.json.Value {
     if (value != .object) return null;
     return value.object.get(key);
+}
+
+fn hasNonRawQueryArg(args: std.json.Value) bool {
+    if (args != .object) return false;
+    var it = args.object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.eql(u8, key, "tableName") or std.mem.eql(u8, key, "queryRequest")) continue;
+        return true;
+    }
+    return false;
+}
+
+fn putFullTextSearch(
+    alloc: std.mem.Allocator,
+    body: *std.json.ObjectMap,
+    match: []const u8,
+    field: ?[]const u8,
+) !void {
+    var full_text_obj = std.json.ObjectMap.empty;
+    if (field) |field_name| {
+        if (field_name.len != 0) {
+            try full_text_obj.put(alloc, "match", .{ .string = match });
+            try full_text_obj.put(alloc, "field", .{ .string = field_name });
+            try body.put(alloc, "full_text_search", .{ .object = full_text_obj });
+            return;
+        }
+    }
+    try full_text_obj.put(alloc, "query", .{ .string = match });
+    try body.put(alloc, "full_text_search", .{ .object = full_text_obj });
+}
+
+fn putFullTextSearchArg(
+    alloc: std.mem.Allocator,
+    body: *std.json.ObjectMap,
+    args: std.json.Value,
+) !void {
+    if (jsonValueArg(args, "full_text_search")) |full_text| {
+        if (full_text != .null) try body.put(alloc, "full_text_search", full_text);
+        return;
+    }
+    if (jsonValueArg(args, "fullTextSearch")) |full_text| {
+        switch (full_text) {
+            .string => |text| if (text.len != 0) try putFullTextSearch(alloc, body, text, jsonStringArg(args, "fullTextSearchField")),
+            .object => try body.put(alloc, "full_text_search", full_text),
+            .null => {},
+            else => return error.InvalidParams,
+        }
+    }
 }
 
 fn stringifyJsonValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {

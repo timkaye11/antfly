@@ -19,6 +19,9 @@ on:
 permissions:
   contents: read
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   package:
     name: Build CLI package artifacts
@@ -62,6 +65,9 @@ jobs:
         with:
           node-version: 24.x
           registry-url: https://registry.npmjs.org/
+
+      - name: Test Antfly C ABI packaging
+        run: python scripts/packaging/test_cabi_packaging.py
 
       - name: Build wheels and populate npm packages
         run: |

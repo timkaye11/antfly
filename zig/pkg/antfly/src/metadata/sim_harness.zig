@@ -48,6 +48,7 @@ const transition_runtime = @import("../raft/transition_runtime.zig");
 const transition_state = @import("transition_state.zig");
 const raft_engine = @import("raft_engine");
 const data_mod = @import("../data/mod.zig");
+const http_common = @import("../raft/transport/http_common.zig");
 const std_http_executor = @import("../raft/transport/std_http_executor.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const docstore_mod = @import("../storage/docstore.zig");
@@ -433,6 +434,7 @@ test "metadata sim split runtime preserves source identity namespace" {
     _ = try split.catchUpDestination(701, 702);
 
     var dest = try db_mod.DB.open(alloc, destination_root_dir, .{
+        .open_mode = .query_readonly,
         .identity_namespace = source_namespace,
         .start_index_workers = false,
     });
@@ -488,10 +490,22 @@ fn ensureGroupTextIndexProgressPredicate(cluster: *MetadataHttpClusterSimulation
     defer cluster.alloc.free(path);
     const identity_namespace = try projectedIdentityNamespaceForGroup(cluster, ctx.group_id);
 
+    var read_db = db_mod.DB.open(cluster.alloc, path, .{
+        .open_mode = .query_readonly,
+        .identity_namespace = identity_namespace,
+    }) catch |err| switch (err) {
+        error.PathAlreadyExists, error.FileNotFound => return false,
+        else => return err,
+    };
+    defer read_db.close();
+
+    if (read_db.core.index_manager.textIndex(ctx.index_name) != null) return true;
+
     var db = db_mod.DB.open(cluster.alloc, path, .{
         .identity_namespace = identity_namespace,
     }) catch |err| switch (err) {
         error.PathAlreadyExists, error.FileNotFound => return false,
+        error.LsmRootWriterAlreadyOpen => return true,
         else => return err,
     };
     defer db.close();
@@ -715,7 +729,7 @@ fn expectCountProfile(
     var count_profile_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, count_profile_query.body, .{});
     defer count_profile_responses.deinit();
     const count_profile_result = count_profile_responses.value.responses.?[0];
-    try std.testing.expectEqual(expected_total_hits, count_profile_result.hits.?.total.?);
+    try std.testing.expectEqual(expected_total_hits, count_profile_result.hits.?.total.?.value);
     try std.testing.expectEqual(@as(usize, 0), count_profile_result.hits.?.hits.?.len);
     try std.testing.expect(count_profile_result.profile != null);
     try std.testing.expectEqual(expected_shards, count_profile_result.profile.?.object.get("shards").?.object.get("total").?.integer);
@@ -2413,7 +2427,7 @@ pub const MetadataHttpNodeSimulation = struct {
         const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
         defer alloc.free(db_path);
 
-        var db = db_mod.DB.open(alloc, db_path, .{}) catch |err| switch (err) {
+        var db = db_mod.DB.open(alloc, db_path, .{ .open_mode = .status_only }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -3658,6 +3672,14 @@ fn hashPlacementIntent(hasher: *std.hash.Wyhash, intent: raft_reconciler.Placeme
     hashPlacementU64(hasher, @intFromEnum(intent.record.bootstrap_mode));
     hashPlacementU64(hasher, intent.record.metadata_version);
     hashPlacementU64(hasher, intent.store_id);
+    hashPlacementU64(hasher, @intFromEnum(intent.serving_state));
+    hashPlacementU64(hasher, intent.relocation_generation);
+    hashPlacementU64(hasher, intent.relocation_source_node_id);
+    hashPlacementU64(hasher, intent.relocation_source_store_id);
+    hashPlacementU64(hasher, intent.relocation_doc_count_watermark);
+    hashPlacementU64(hasher, intent.relocation_disk_bytes_watermark);
+    hashPlacementU64(hasher, intent.relocation_target_sequence);
+    hashPlacementU64(hasher, intent.relocation_applied_sequence);
     hashPlacementU64(hasher, intent.peer_node_ids.len);
     for (intent.peer_node_ids) |node_id| hashPlacementU64(hasher, node_id);
 
@@ -3711,6 +3733,14 @@ fn placementIntentEquals(
         if (!std.mem.eql(u8, backup.snapshot_path, other.snapshot_path)) return false;
     }
     if (left.store_id != right.store_id) return false;
+    if (left.serving_state != right.serving_state) return false;
+    if (left.relocation_generation != right.relocation_generation) return false;
+    if (left.relocation_source_node_id != right.relocation_source_node_id) return false;
+    if (left.relocation_source_store_id != right.relocation_source_store_id) return false;
+    if (left.relocation_doc_count_watermark != right.relocation_doc_count_watermark) return false;
+    if (left.relocation_disk_bytes_watermark != right.relocation_disk_bytes_watermark) return false;
+    if (left.relocation_target_sequence != right.relocation_target_sequence) return false;
+    if (left.relocation_applied_sequence != right.relocation_applied_sequence) return false;
     return std.mem.eql(u64, left.peer_node_ids, right.peer_node_ids);
 }
 
@@ -5439,7 +5469,7 @@ test "metadata http cluster simulation serves public lifecycle from a non-host n
     var query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, query.body, .{});
     defer query_responses.deinit();
     const query_result = query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 2), query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 2), query_result.hits.?.total.?.value);
     try std.testing.expectEqual(@as(usize, 0), query_result.hits.?.hits.?.len);
     try std.testing.expect(query_result.profile != null);
     try std.testing.expectEqual(@as(i64, 1), query_result.profile.?.object.get("shards").?.object.get("total").?.integer);
@@ -5520,11 +5550,15 @@ test "metadata http cluster simulation seeds default admin for auth-enabled publ
 
     var auth_managers: [3]SimAuthManager = undefined;
     var auth_count: usize = 0;
-    errdefer for (auth_managers[0..auth_count]) |*auth| auth.deinit();
+    var auth_init_complete = false;
+    errdefer if (!auth_init_complete) {
+        for (auth_managers[0..auth_count]) |*auth| auth.deinit();
+    };
     for (&auth_managers) |*auth| {
         auth.* = try SimAuthManager.init(sim_alloc);
         auth_count += 1;
     }
+    auth_init_complete = true;
     defer for (auth_managers[0..auth_count]) |*auth| auth.deinit();
 
     const roots = [_][]const u8{ root_a, root_b, root_c };

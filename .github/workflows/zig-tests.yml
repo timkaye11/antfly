@@ -135,13 +135,16 @@ jobs:
             echo "trace_validate=true" >> "$GITHUB_OUTPUT"
           fi
 
-  unit:
+  zig-base:
+    name: zig-base
     needs: changes
-    if: (github.event_name != 'schedule' && needs.changes.outputs.zig_tests == 'true') || needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
+    if: (github.event_name == 'pull_request' || github.event.schedule == '0 3 * * 0') && (needs.changes.outputs.zig_tests == 'true' || needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true')
     runs-on: arc-antfly-heavy
-    timeout-minutes: 45
+    # Keep the outer job timeout above the in-step hard watchdog so true hangs
+    # produce the watchdog stack dump instead of an opaque GitHub cancellation.
+    timeout-minutes: 120
     env:
-      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/zig-local
+      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
       - uses: actions/checkout@v6
@@ -163,7 +166,7 @@ jobs:
 
       - name: Restore ARC Zig cache dirs
         run: |
-          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/zig-local"
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           global_cache="/mnt/cache/antfly/zig/zig-global"
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
@@ -172,14 +175,12 @@ jobs:
       - name: Verify Zig version
         run: zig version
 
-      - name: Check Snowball generated sources
-        run: make zig-snowball-check
-
-      - name: Check OpenAPI generated sources
-        run: make zig-openapi-check
+      - name: Check generated sources
+        run: make zig-generated-check
 
       - name: Run hermetic Antfly unit tests
         if: needs.changes.outputs.zig_tests == 'true'
+<<<<<<< HEAD
         run: make zig-unit-test
 
       - name: Run inference finetune unit tests
@@ -212,12 +213,157 @@ jobs:
 
       - name: Restore ARC Zig cache dirs
         if: needs.changes.outputs.trace_validate == 'true'
+=======
+        env:
+          ANTFLY_TEST_CLEANUP_TRACE: "1"
+>>>>>>> main
         run: |
-          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/zig-local"
-          global_cache="/mnt/cache/antfly/zig/zig-global"
-          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
-          mkdir -p "$local_cache" "$global_cache"
+          set -euo pipefail
+
+          collect_descendants() {
+            local roots="$*"
+            local all=" ${roots} "
+            local changed=1
+            while [ "$changed" -eq 1 ]; do
+              changed=0
+              while read -r pid ppid; do
+                if [[ " $all " == *" $ppid "* && " $all " != *" $pid "* ]]; then
+                  all="${all}${pid} "
+                  changed=1
+                fi
+              done < <(ps -eo pid=,ppid=)
+            done
+            echo "$all"
+          }
+
+          dump_stacks() {
+            local root_pid="$1"
+            echo "::group::antfly unit watchdog ptrace settings"
+            if [ -r /proc/sys/kernel/yama/ptrace_scope ]; then
+              cat /proc/sys/kernel/yama/ptrace_scope || true
+            fi
+            sysctl kernel.yama.ptrace_scope 2>/dev/null || true
+            echo "::endgroup::"
+
+            echo "::group::antfly unit watchdog process tree"
+            ps -eo pid,ppid,stat,etime,cmd | grep -E "PID|zig build|zig-local|/test|make zig-unit-test|make -C ./zig unit-test" || true
+            echo "::endgroup::"
+
+            local pids
+            pids="$(collect_descendants "$root_pid")"
+            for pid in $pids; do
+              if ! kill -0 "$pid" 2>/dev/null; then
+                continue
+              fi
+              local cmdline
+              cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+              case "$cmdline" in
+                *"/test "*|*"/test"*|*"zig build"*|*" make "*)
+                  echo "::group::proc snapshot pid=$pid cmd=$cmdline"
+                  if [ -r "/proc/$pid/status" ]; then
+                    grep -E "^(Name|State|Pid|PPid|Threads|VmRSS|VmHWM|voluntary_ctxt_switches|nonvoluntary_ctxt_switches):" "/proc/$pid/status" || true
+                  fi
+                  if [ -r "/proc/$pid/wchan" ]; then
+                    printf "wchan="
+                    cat "/proc/$pid/wchan" || true
+                    printf "\n"
+                  fi
+                  if [ -r "/proc/$pid/stack" ]; then
+                    cat "/proc/$pid/stack" || true
+                  fi
+                  echo "::endgroup::"
+
+                  echo "::group::gdb thread dump pid=$pid cmd=$cmdline"
+                  timeout 45s gdb -batch -p "$pid" \
+                    -ex "set pagination off" \
+                    -ex "thread apply all bt" \
+                    -ex "detach" || \
+                    timeout 45s sudo gdb -batch -p "$pid" \
+                      -ex "set pagination off" \
+                      -ex "thread apply all bt" \
+                      -ex "detach" || true
+                  echo "::endgroup::"
+                  ;;
+              esac
+            done
+          }
+
+          terminate_tree() {
+            local root_pid="$1"
+            local pids
+            pids="$(collect_descendants "$root_pid")"
+            for pid in $pids; do
+              if [ "$pid" != "$$" ]; then
+                kill -TERM "$pid" 2>/dev/null || true
+              fi
+            done
+            sleep 5
+            for pid in $pids; do
+              if [ "$pid" != "$$" ]; then
+                kill -KILL "$pid" 2>/dev/null || true
+              fi
+            done
+          }
+
+          if [ -r /proc/sys/kernel/yama/ptrace_scope ]; then
+            echo "::group::configure ptrace for unit watchdog"
+            echo "ptrace_scope before: $(cat /proc/sys/kernel/yama/ptrace_scope || true)"
+            sudo sysctl -w kernel.yama.ptrace_scope=0 || true
+            echo "ptrace_scope after: $(cat /proc/sys/kernel/yama/ptrace_scope || true)"
+            echo "::endgroup::"
+          fi
+
+          unit_log="${RUNNER_TEMP:-/tmp}/antfly-zig-unit.log"
+          : > "$unit_log"
+
+          (
+            set +e
+            make zig-unit-test 2>&1 | tee -a "$unit_log"
+            exit "${PIPESTATUS[0]}"
+          ) &
+          unit_pid="$!"
+          (
+            idle_limit_secs="${ANTFLY_UNIT_WATCHDOG_IDLE_SECS:-900}"
+            hard_limit_secs="${ANTFLY_UNIT_WATCHDOG_HARD_SECS:-3600}"
+            start_epoch="$(date +%s)"
+            last_progress_epoch="$start_epoch"
+            last_mtime=0
+            while kill -0 "$unit_pid" 2>/dev/null; do
+              sleep 15
+              now_epoch="$(date +%s)"
+              if [ -e "$unit_log" ]; then
+                current_mtime="$(stat -c %Y "$unit_log" 2>/dev/null || echo 0)"
+                if [ "$current_mtime" -gt "$last_mtime" ]; then
+                  last_mtime="$current_mtime"
+                  last_progress_epoch="$now_epoch"
+                fi
+              fi
+
+              elapsed_secs=$((now_epoch - start_epoch))
+              idle_secs=$((now_epoch - last_progress_epoch))
+              if [ "$hard_limit_secs" -gt 0 ] && [ "$elapsed_secs" -ge "$hard_limit_secs" ]; then
+                echo "::error::zig-unit-test hard watchdog fired after ${elapsed_secs}s; dumping stacks before terminating live test processes"
+                tail -n 200 "$unit_log" || true
+                dump_stacks "$unit_pid"
+                terminate_tree "$unit_pid"
+                exit 0
+              fi
+              if [ "$idle_limit_secs" -gt 0 ] && [ "$idle_secs" -ge "$idle_limit_secs" ]; then
+                echo "::error::zig-unit-test idle watchdog fired after ${idle_secs}s without unit log progress; dumping stacks before terminating live test processes"
+                tail -n 200 "$unit_log" || true
+                dump_stacks "$unit_pid"
+                terminate_tree "$unit_pid"
+                exit 0
+              fi
+            done
+          ) &
+          watchdog_pid="$!"
+
+          status=0
+          wait "$unit_pid" || status="$?"
+          kill "$watchdog_pid" 2>/dev/null || true
+          wait "$watchdog_pid" 2>/dev/null || true
+          exit "$status"
 
       - name: Set up Java for TLA+
         if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
@@ -226,55 +372,26 @@ jobs:
           distribution: "temurin"
           java-version: "21"
 
-      - name: Run TLC on all specs
-        if: needs.changes.outputs.model_check == 'true'
-        working-directory: zig
-        run: make tla-check
-
-      - name: Download TLA+ tools
-        if: needs.changes.outputs.trace_validate == 'true'
-        working-directory: zig
-        run: make tla-tools
-
-      - name: Run raft tests and extract traces
-        if: needs.changes.outputs.trace_validate == 'true'
-        working-directory: zig
+      - name: Run TLA verification
+        if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
         env:
-          ANTFLY_TRACE_FILE: /tmp/raft-trace.ndjson
-        run: |
-          zig build -Dwith_tla=true raft-test
-          test -s /tmp/raft-trace.ndjson
-          echo "Raft trace lines: $(wc -l < /tmp/raft-trace.ndjson)"
+          ANTFLY_TLA_MODEL_CHECK: ${{ needs.changes.outputs.model_check }}
+          ANTFLY_TLA_TRACE_VALIDATE: ${{ needs.changes.outputs.trace_validate }}
+        run: scripts/ci/zig-tla-verify.sh
 
-      - name: Validate raft traces
-        if: needs.changes.outputs.trace_validate == 'true'
-        working-directory: zig
-        run: make tla-trace-raft TRACE_FILES=/tmp/raft-trace.ndjson
-
-      - name: Run transaction tests and extract traces
-        if: needs.changes.outputs.trace_validate == 'true'
-        working-directory: zig
-        env:
-          ANTFLY_TRACE_FILE: /tmp/txn-trace.ndjson
-        run: |
-          zig build -Dwith_tla=true lib-db-txn-test
-          test -s /tmp/txn-trace.ndjson
-          echo "Transaction trace lines: $(wc -l < /tmp/txn-trace.ndjson)"
-
-      - name: Validate transaction traces
-        if: needs.changes.outputs.trace_validate == 'true'
-        working-directory: zig
-        run: make tla-trace-txn TRACE_FILES=/tmp/txn-trace.ndjson
-
-  full-default:
+  zig-full:
+    name: zig-full
+    needs: changes
     if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
     runs-on: arc-antfly-heavy
-    timeout-minutes: 60
+    timeout-minutes: 120
     env:
-      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/zig-local
+      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: true
 
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
@@ -290,7 +407,7 @@ jobs:
 
       - name: Restore ARC Zig cache dirs
         run: |
-          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/zig-local"
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           global_cache="/mnt/cache/antfly/zig/zig-global"
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
@@ -299,11 +416,14 @@ jobs:
       - name: Verify Zig version
         run: zig version
 
+      - name: Check generated sources
+        run: make zig-generated-check
+
       # The in-process cluster simulations size their thread pools from the
       # visible CPU count, which on ARC reflects the node rather than the pod
       # quota. The resulting burst can starve the runner agent long enough for
       # GitHub to declare the runner lost (~10 min of missed heartbeats), which
-      # is how most full-default failures present. Bound the test steps to a
+      # is how most full-suite failures present. Bound the test steps to a
       # fixed CPU set so pools and zig build parallelism stay within budget.
       - name: Compute CPU bound for heavy test steps
         id: cpus
@@ -314,6 +434,18 @@ jobs:
 
       - name: Run full Zig unit tests
         run: taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test
+
+      - name: Set up Java for TLA+
+        uses: actions/setup-java@v5
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Run TLA verification
+        env:
+          ANTFLY_TLA_MODEL_CHECK: "true"
+          ANTFLY_TLA_TRACE_VALIDATE: "true"
+        run: scripts/ci/zig-tla-verify.sh
 
       - name: Run Zig simulation tests
         working-directory: zig
@@ -355,12 +487,13 @@ jobs:
         run: taskset -c ${{ steps.cpus.outputs.list }} zig build chaos-test
 
   e2e-base:
+    name: e2e-base
     needs: changes
     if: github.event_name != 'schedule' && needs.changes.outputs.e2e == 'true'
     runs-on: arc-antfly-heavy
     timeout-minutes: 45
     env:
-      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/zig-local
+      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
@@ -381,7 +514,7 @@ jobs:
 
       - name: Restore ARC cache dirs
         run: |
-          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/zig-local"
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           global_cache="/mnt/cache/antfly/zig/zig-global"
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
@@ -403,12 +536,13 @@ jobs:
         run: scripts/ci/zig-e2e-base-linux.sh
 
   e2e-full:
+    name: e2e-full
     needs: changes
     if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
-      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/zig-local
+      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
@@ -428,7 +562,7 @@ jobs:
 
       - name: Restore ARC cache dirs
         run: |
-          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/zig-local"
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           global_cache="/mnt/cache/antfly/zig/zig-global"
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
@@ -447,7 +581,7 @@ jobs:
           targets: wasm32-wasip2
 
       - name: Build MemoryAF extension package
-        run: cargo build --manifest-path extensions/memoryaf/0.0.1/Cargo.toml --release --target wasm32-wasip2
+        run: cargo build --manifest-path extensions/memoryaf/Cargo.toml --release --target wasm32-wasip2
 
       - name: Build E2E binaries
         run: scripts/ci/zig-build-e2e-binaries.sh
@@ -474,6 +608,7 @@ jobs:
           echo "LD_LIBRARY_PATH=$root/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Run Antfly full E2E
+        id: antfly_full_e2e
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
@@ -481,12 +616,13 @@ jobs:
           ANTFLY_FS_PATH_DEBUG: "1"
         run: |
           chmod +x ./zig-out/bin/antfly
-          uv run --project e2e/antfly pytest -q -x e2e/antfly
+          uv run --project e2e/antfly pytest -q e2e/antfly
 
       - name: Run Antfly inference full E2E
+        if: ${{ success() || steps.antfly_full_e2e.outcome == 'failure' }}
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_INFERENCE_DOWNLOAD: "1"
           ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: openai-community/gpt2
-        run: uv run --project e2e/inference pytest -q -x e2e/inference
+        run: uv run --project e2e/inference pytest -q e2e/inference

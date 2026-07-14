@@ -8,11 +8,19 @@ on:
     branches: ["main"]
     paths:
       - 'go/pkg/operator/**'
+      - 'go/pkg/sdk/admin/**'
+      - 'go/pkg/sdk/go.mod'
+      - 'go/pkg/sdk/go.sum'
+      - 'specs/openapi/antfly/admin.yaml'
       - '.github/workflows/antfly-operator-go.yml'
   pull_request:
     branches: ["main"]
     paths:
       - 'go/pkg/operator/**'
+      - 'go/pkg/sdk/admin/**'
+      - 'go/pkg/sdk/go.mod'
+      - 'go/pkg/sdk/go.sum'
+      - 'specs/openapi/antfly/admin.yaml'
       - '.github/workflows/antfly-operator-go.yml'
   workflow_dispatch:
 
@@ -21,6 +29,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   GO_VERSION: "1.26.4"
 
 jobs:

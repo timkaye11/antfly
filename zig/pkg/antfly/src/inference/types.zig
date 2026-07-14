@@ -33,6 +33,12 @@ pub const ChatWireFlavor = enum {
 pub const ChatRequestOptions = struct {
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
+    max_tokens: ?i64 = null,
+    temperature: ?f32 = null,
+    top_p: ?f32 = null,
+    top_k: ?i64 = null,
+    frequency_penalty: ?f32 = null,
+    presence_penalty: ?f32 = null,
 };
 
 pub fn chatRequestJsonAlloc(
@@ -69,8 +75,28 @@ pub fn chatRequestJsonWithOptionsAlloc(
         try out.appendSlice(alloc, ",\"tool_choice\":");
         try out.appendSlice(alloc, tool_choice_json);
     }
+    if (options.max_tokens) |max_tokens| {
+        try appendJsonI64Field(alloc, &out, "max_tokens", max_tokens);
+    }
+    if (options.temperature) |temperature| try appendJsonFloatField(alloc, &out, "temperature", temperature);
+    if (options.top_p) |top_p| try appendJsonFloatField(alloc, &out, "top_p", top_p);
+    if (options.top_k) |top_k| try appendJsonI64Field(alloc, &out, "top_k", top_k);
+    if (options.frequency_penalty) |frequency_penalty| try appendJsonFloatField(alloc, &out, "frequency_penalty", frequency_penalty);
+    if (options.presence_penalty) |presence_penalty| try appendJsonFloatField(alloc, &out, "presence_penalty", presence_penalty);
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn appendJsonI64Field(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, value: i64) !void {
+    const fragment = try std.fmt.allocPrint(alloc, ",\"{s}\":{d}", .{ name, value });
+    defer alloc.free(fragment);
+    try out.appendSlice(alloc, fragment);
+}
+
+fn appendJsonFloatField(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, value: f32) !void {
+    const fragment = try std.fmt.allocPrint(alloc, ",\"{s}\":{f}", .{ name, std.json.fmt(value, .{}) });
+    defer alloc.free(fragment);
+    try out.appendSlice(alloc, fragment);
 }
 
 fn appendChatMessageJson(
@@ -425,6 +451,33 @@ test "openai compatible chat serialization converts image media urls" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"media\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image_url\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"url\":\"https://example.test/image.png\"") != null);
+}
+
+test "chat serialization includes max_tokens when configured" {
+    const alloc = std.testing.allocator;
+    const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "hello" } }};
+    const body = try chatRequestJsonWithOptionsAlloc(alloc, "gemma4", &messages, .openai_compatible, .{ .max_tokens = 256 });
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":256") != null);
+}
+
+test "chat serialization includes sampling controls when configured" {
+    const alloc = std.testing.allocator;
+    const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "hello" } }};
+    const body = try chatRequestJsonWithOptionsAlloc(alloc, "gemma4", &messages, .openai_compatible, .{
+        .max_tokens = 256,
+        .temperature = 0.25,
+        .top_p = 0.9,
+        .top_k = 40,
+        .frequency_penalty = 0.1,
+        .presence_penalty = 0.2,
+    });
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":0.25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"top_p\":0.9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"top_k\":40") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"frequency_penalty\":0.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"presence_penalty\":0.2") != null);
 }
 
 test "forced tool call synthesis normalizes plain JSON content" {

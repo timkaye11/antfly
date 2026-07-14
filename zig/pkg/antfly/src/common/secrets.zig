@@ -16,6 +16,7 @@ const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const fs_paths = @import("fs_paths.zig");
+const platform_time = @import("../platform/time.zig");
 
 const c_env = if (builtin.link_libc and builtin.os.tag != .windows) struct {
     extern "c" var environ: [*:null]?[*:0]u8;
@@ -228,15 +229,18 @@ const FileMetadata = struct {
 pub const FileStore = struct {
     alloc: std.mem.Allocator,
     path: []u8,
+    fallbacks: []FileStore = &.{},
     mutex: std.atomic.Mutex = .unlocked,
     entries: std.StringArrayHashMapUnmanaged(StoredSecret) = .{},
     observed_metadata: ?FileMetadata = null,
     generation_value: u64 = 0,
+    generation_snapshot: std.atomic.Value(u64) = .init(0),
     last_reload_failed: bool = false,
     reload_success_count: u64 = 0,
     reload_failure_count: u64 = 0,
     last_success_ns: u64 = 0,
     last_failure_ns: u64 = 0,
+    next_throttled_refresh_ns: std.atomic.Value(u64) = .init(0),
 
     pub fn init(alloc: std.mem.Allocator, path: []const u8) !FileStore {
         var store = FileStore{
@@ -248,7 +252,32 @@ pub const FileStore = struct {
         return store;
     }
 
+    pub fn initLayered(alloc: std.mem.Allocator, paths: []const []const u8) !FileStore {
+        if (paths.len == 0) return error.InvalidArguments;
+
+        var store = try FileStore.init(alloc, paths[0]);
+        errdefer store.deinit();
+
+        if (paths.len > 1) {
+            store.fallbacks = try alloc.alloc(FileStore, paths.len - 1);
+            var initialized: usize = 0;
+            errdefer {
+                for (store.fallbacks[0..initialized]) |*fallback| fallback.deinit();
+                alloc.free(store.fallbacks);
+                store.fallbacks = &.{};
+            }
+            for (paths[1..]) |path| {
+                store.fallbacks[initialized] = try FileStore.init(alloc, path);
+                initialized += 1;
+            }
+        }
+
+        return store;
+    }
+
     pub fn deinit(self: *FileStore) void {
+        for (self.fallbacks) |*fallback| fallback.deinit();
+        if (self.fallbacks.len > 0) self.alloc.free(self.fallbacks);
         deinitEntries(self.alloc, &self.entries);
         self.entries.deinit(self.alloc);
         self.alloc.free(self.path);
@@ -258,25 +287,71 @@ pub const FileStore = struct {
     pub fn generation(self: *FileStore) u64 {
         self.lock();
         defer self.unlock();
-        return self.generation_value;
+        return self.generationLocked();
+    }
+
+    pub fn generationFast(self: *FileStore) u64 {
+        if (self.fallbacks.len == 0) return self.generation_snapshot.load(.acquire);
+        return self.generation();
     }
 
     pub fn reloadFailed(self: *FileStore) bool {
         self.lock();
         defer self.unlock();
-        return self.last_reload_failed;
+        if (self.last_reload_failed) return true;
+        for (self.fallbacks) |*fallback| {
+            if (fallback.reloadFailed()) return true;
+        }
+        return false;
     }
 
     pub fn healthSnapshot(self: *FileStore) ReloadHealth {
         self.lock();
         defer self.unlock();
-        return self.healthSnapshotLocked();
+        var health = self.healthSnapshotLocked();
+        for (self.fallbacks, 1..) |*fallback, index| {
+            const fallback_health = fallback.healthSnapshot();
+            health.generation +%= fallback_health.generation *% @as(u64, @intCast(index + 1));
+            health.entry_count += fallback_health.entry_count;
+            health.last_reload_failed = health.last_reload_failed or fallback_health.last_reload_failed;
+            health.stale_snapshot = health.stale_snapshot or fallback_health.stale_snapshot;
+            health.reload_successes += fallback_health.reload_successes;
+            health.reload_failures += fallback_health.reload_failures;
+            health.last_success_ns = @max(health.last_success_ns, fallback_health.last_success_ns);
+            health.last_failure_ns = @max(health.last_failure_ns, fallback_health.last_failure_ns);
+        }
+        return health;
     }
 
     pub fn refreshIfChanged(self: *FileStore) !bool {
         self.lock();
         defer self.unlock();
-        return try self.refreshIfChangedLocked();
+        var changed = try self.refreshIfChangedLocked();
+        for (self.fallbacks) |*fallback| {
+            changed = (try fallback.refreshIfChanged()) or changed;
+        }
+        return changed;
+    }
+
+    /// Refresh at most once per interval. The atomic fast path avoids taking
+    /// the store lock or issuing a stat syscall on every cache lookup.
+    pub fn refreshIfChangedThrottled(self: *FileStore, interval_ns: u64) !bool {
+        if (interval_ns == 0) return try self.refreshIfChanged();
+        const now_ns = platform_time.monotonicNs();
+        if (now_ns < self.next_throttled_refresh_ns.load(.acquire)) return false;
+
+        self.lock();
+        defer self.unlock();
+        const locked_now_ns = platform_time.monotonicNs();
+        if (locked_now_ns < self.next_throttled_refresh_ns.load(.acquire)) return false;
+        self.next_throttled_refresh_ns.store(locked_now_ns +| interval_ns, .release);
+        errdefer self.next_throttled_refresh_ns.store(0, .release);
+
+        var changed = try self.refreshIfChangedLocked();
+        for (self.fallbacks) |*fallback| {
+            changed = (try fallback.refreshIfChangedThrottled(interval_ns)) or changed;
+        }
+        return changed;
     }
 
     pub fn list(self: *FileStore, alloc: std.mem.Allocator) ![]ListedSecret {
@@ -294,10 +369,12 @@ pub const FileStore = struct {
             try out.append(alloc, try describeStored(alloc, entry.key_ptr.*, entry.value_ptr.*));
         }
 
+        for (self.fallbacks) |*fallback| try fallback.appendFileEntriesForList(alloc, &out);
+
         const env_only = try listEnvironmentSecrets(alloc);
         defer freeListedSecrets(alloc, env_only);
         for (env_only) |item| {
-            if (self.entries.contains(item.key)) continue;
+            if (listedSecretsContain(out.items, item.key)) continue;
             try out.append(alloc, .{
                 .key = try alloc.dupe(u8, item.key),
                 .status = item.status,
@@ -371,6 +448,9 @@ pub const FileStore = struct {
         _ = try self.refreshIfChangedLocked();
 
         if (self.entries.get(key)) |stored| return try alloc.dupe(u8, stored.value);
+        for (self.fallbacks) |*fallback| {
+            if (try fallback.getOwnedFromFilesNoEnv(alloc, key)) |value| return value;
+        }
         const env_var = try envVarForKey(alloc, key);
         defer alloc.free(env_var);
         return envValueOwned(alloc, env_var);
@@ -387,6 +467,15 @@ pub const FileStore = struct {
                 .generation = self.generation_value,
                 .source = .file_store,
             };
+        }
+        for (self.fallbacks) |*fallback| {
+            if (try fallback.getOwnedWithGenerationFromFilesNoEnv(alloc, key)) |value| {
+                return .{
+                    .value = value.value,
+                    .generation = self.generationLocked(),
+                    .source = value.source,
+                };
+            }
         }
         const env_var = try envVarForKey(alloc, key);
         defer alloc.free(env_var);
@@ -415,6 +504,49 @@ pub const FileStore = struct {
     fn describeOneLocked(self: *FileStore, alloc: std.mem.Allocator, key: []const u8) !ListedSecret {
         const stored = self.entries.get(key) orelse return error.SecretNotFound;
         return try describeStored(alloc, key, stored);
+    }
+
+    fn appendFileEntriesForList(self: *FileStore, alloc: std.mem.Allocator, out: *std.ArrayList(ListedSecret)) !void {
+        self.lock();
+        defer self.unlock();
+        _ = try self.refreshIfChangedLocked();
+
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            if (listedSecretsContain(out.items, entry.key_ptr.*)) continue;
+            try out.append(alloc, try describeStored(alloc, entry.key_ptr.*, entry.value_ptr.*));
+        }
+        for (self.fallbacks) |*fallback| try fallback.appendFileEntriesForList(alloc, out);
+    }
+
+    fn getOwnedFromFilesNoEnv(self: *FileStore, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
+        self.lock();
+        defer self.unlock();
+        _ = try self.refreshIfChangedLocked();
+
+        if (self.entries.get(key)) |stored| return try alloc.dupe(u8, stored.value);
+        for (self.fallbacks) |*fallback| {
+            if (try fallback.getOwnedFromFilesNoEnv(alloc, key)) |value| return value;
+        }
+        return null;
+    }
+
+    fn getOwnedWithGenerationFromFilesNoEnv(self: *FileStore, alloc: std.mem.Allocator, key: []const u8) !?ResolvedSecret {
+        self.lock();
+        defer self.unlock();
+        _ = try self.refreshIfChangedLocked();
+
+        if (self.entries.get(key)) |stored| {
+            return .{
+                .value = try alloc.dupe(u8, stored.value),
+                .generation = self.generationLocked(),
+                .source = .file_store,
+            };
+        }
+        for (self.fallbacks) |*fallback| {
+            if (try fallback.getOwnedWithGenerationFromFilesNoEnv(alloc, key)) |value| return value;
+        }
+        return null;
     }
 
     fn load(self: *FileStore) !void {
@@ -489,6 +621,7 @@ pub const FileStore = struct {
         self.replaceEntriesLocked(&next);
         self.observed_metadata = metadata;
         self.generation_value +%= 1;
+        self.generation_snapshot.store(self.generation_value, .release);
         self.markReloadHealthyLocked(true);
         return true;
     }
@@ -524,6 +657,7 @@ pub const FileStore = struct {
         self.replaceEntriesLocked(next);
         self.observed_metadata = try statFileMetadata(self.path);
         self.generation_value +%= 1;
+        self.generation_snapshot.store(self.generation_value, .release);
         self.markReloadHealthyLocked(true);
     }
 
@@ -532,6 +666,14 @@ pub const FileStore = struct {
         self.entries.deinit(self.alloc);
         self.entries = next.*;
         next.* = .{};
+    }
+
+    fn generationLocked(self: *FileStore) u64 {
+        var out = self.generation_value;
+        for (self.fallbacks, 1..) |*fallback, index| {
+            out +%= fallback.generation() *% @as(u64, @intCast(index + 1));
+        }
+        return out;
     }
 
     fn lock(self: *FileStore) void {
@@ -632,6 +774,13 @@ fn deinitEntries(alloc: std.mem.Allocator, entries: *std.StringArrayHashMapUnman
         alloc.free(entry.key_ptr.*);
         entry.value_ptr.deinit(alloc);
     }
+}
+
+fn listedSecretsContain(items: []const ListedSecret, key: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item.key, key)) return true;
+    }
+    return false;
 }
 
 pub fn freeListedSecrets(alloc: std.mem.Allocator, items: []ListedSecret) void {
@@ -934,6 +1083,7 @@ test "file secret store reloads valid external replacements including deletions"
     var store = try FileStore.init(alloc, path);
     defer store.deinit();
     const initial_generation = store.generation();
+    try std.testing.expectEqual(initial_generation, store.generationFast());
 
     const first = try store.getOwned(alloc, "openai.api_key");
     defer if (first) |value| alloc.free(value);
@@ -951,6 +1101,31 @@ test "file secret store reloads valid external replacements including deletions"
     const deleted = try store.getOwned(alloc, "deleted.dynamic_secret");
     defer if (deleted) |value| alloc.free(value);
     try std.testing.expectEqual(@as(?[]u8, null), deleted);
+}
+
+test "file secret store throttles cache-key freshness checks" {
+    const alloc = std.testing.allocator;
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/test-secrets-throttle-{d}.json", .{nowNs()});
+    defer alloc.free(path);
+    defer deleteFile(path) catch {};
+
+    try writeFileAtomically(path,
+        \\{"secrets":[{"key":"openai.api_key","value":"first","created_at_ns":1,"updated_at_ns":1}]}
+    );
+    var store = try FileStore.init(alloc, path);
+    defer store.deinit();
+    const initial_generation = store.generation();
+    try std.testing.expect(!(try store.refreshIfChangedThrottled(std.time.ns_per_hour)));
+
+    try writeFileAtomically(path,
+        \\{"secrets":[{"key":"openai.api_key","value":"second-longer","created_at_ns":1,"updated_at_ns":2}]}
+    );
+    try std.testing.expect(!(try store.refreshIfChangedThrottled(std.time.ns_per_hour)));
+    try std.testing.expectEqual(initial_generation, store.generation());
+
+    try std.testing.expect(try store.refreshIfChanged());
+    try std.testing.expectEqual(initial_generation + 1, store.generation());
+    try std.testing.expectEqual(initial_generation + 1, store.generationFast());
 }
 
 test "file secret store keeps last known good snapshot for malformed and missing files" {
@@ -1022,6 +1197,86 @@ test "file secret store write refreshes first and preserves external keys" {
     const anthropic = try store.getOwned(alloc, "anthropic.api_key");
     defer if (anthropic) |value| alloc.free(value);
     try std.testing.expectEqualStrings("anthropic", anthropic.?);
+}
+
+test "layered file secret store resolves primary before fallback and writes primary" {
+    const alloc = std.testing.allocator;
+    const primary_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-secrets-layer-primary-{d}.json", .{nowNs()});
+    defer alloc.free(primary_path);
+    defer deleteFile(primary_path) catch {};
+    const fallback_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-secrets-layer-fallback-{d}.json", .{nowNs()});
+    defer alloc.free(fallback_path);
+    defer deleteFile(fallback_path) catch {};
+
+    try writeFileAtomically(primary_path,
+        \\{"secrets":[{"key":"openai.api_key","value":"primary-openai","created_at_ns":1,"updated_at_ns":1},{"key":"shared.key","value":"primary-shared","created_at_ns":1,"updated_at_ns":1}]}
+    );
+    try writeFileAtomically(fallback_path,
+        \\{"secrets":[{"key":"antfly.runtime.test.token","value":"fallback-token","created_at_ns":1,"updated_at_ns":1},{"key":"shared.key","value":"fallback-shared","created_at_ns":1,"updated_at_ns":1}]}
+    );
+
+    var store = try FileStore.initLayered(alloc, &.{ primary_path, fallback_path });
+    defer store.deinit();
+
+    const primary = try store.getOwned(alloc, "openai.api_key");
+    defer if (primary) |value| alloc.free(value);
+    try std.testing.expectEqualStrings("primary-openai", primary.?);
+
+    const fallback = try store.getOwned(alloc, "antfly.runtime.test.token");
+    defer if (fallback) |value| alloc.free(value);
+    try std.testing.expectEqualStrings("fallback-token", fallback.?);
+
+    const shared = try store.getOwned(alloc, "shared.key");
+    defer if (shared) |value| alloc.free(value);
+    try std.testing.expectEqualStrings("primary-shared", shared.?);
+
+    var written = try store.put(alloc, "anthropic.api_key", "primary-write");
+    defer written.deinit(alloc);
+
+    var reloaded_primary = try FileStore.init(alloc, primary_path);
+    defer reloaded_primary.deinit();
+    const primary_write = try reloaded_primary.getOwned(alloc, "anthropic.api_key");
+    defer if (primary_write) |value| alloc.free(value);
+    try std.testing.expectEqualStrings("primary-write", primary_write.?);
+
+    var reloaded_fallback = try FileStore.init(alloc, fallback_path);
+    defer reloaded_fallback.deinit();
+    const fallback_write = try reloaded_fallback.getOwned(alloc, "anthropic.api_key");
+    defer if (fallback_write) |value| alloc.free(value);
+    try std.testing.expectEqual(@as(?[]u8, null), fallback_write);
+}
+
+test "layered file secret store generation changes when fallback changes" {
+    const alloc = std.testing.allocator;
+    const primary_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-secrets-layer-generation-primary-{d}.json", .{nowNs()});
+    defer alloc.free(primary_path);
+    defer deleteFile(primary_path) catch {};
+    const fallback_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-secrets-layer-generation-fallback-{d}.json", .{nowNs()});
+    defer alloc.free(fallback_path);
+    defer deleteFile(fallback_path) catch {};
+
+    try writeFileAtomically(primary_path,
+        \\{"secrets":[]}
+    );
+    try writeFileAtomically(fallback_path,
+        \\{"secrets":[{"key":"antfly.runtime.test.token","value":"first","created_at_ns":1,"updated_at_ns":1}]}
+    );
+
+    var store = try FileStore.initLayered(alloc, &.{ primary_path, fallback_path });
+    defer store.deinit();
+
+    var first = try resolveReferenceWithGenerationOwned(alloc, &store, "${secret:antfly.runtime.test.token}");
+    defer first.deinit(alloc);
+    try std.testing.expectEqualStrings("first", first.value);
+
+    try writeFileAtomically(fallback_path,
+        \\{"secrets":[{"key":"antfly.runtime.test.token","value":"second","created_at_ns":1,"updated_at_ns":2}]}
+    );
+
+    var second = try resolveReferenceWithGenerationOwned(alloc, &store, "${secret:antfly.runtime.test.token}");
+    defer second.deinit(alloc);
+    try std.testing.expectEqualStrings("second", second.value);
+    try std.testing.expect(second.generation > first.generation);
 }
 
 test "parse secret reference extracts key name" {

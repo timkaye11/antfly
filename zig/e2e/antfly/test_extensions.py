@@ -59,7 +59,7 @@ class _ExtensionProcess:
         self.tempdir = tempfile.TemporaryDirectory(prefix=f"antfly-zig-extensions-{mode}-")
         self.root = Path(self.tempdir.name)
         self.package_store = MEMORYAF_PACKAGE_STORE
-        if not (self.package_store / "memoryaf" / MEMORYAF_VERSION / "extension.json").exists():
+        if not (self.package_store / "memoryaf" / "extension.json").exists():
             raise RuntimeError(f"memoryaf extension package not found under {self.package_store}")
 
         self.public_port = find_free_port()
@@ -298,6 +298,7 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
     object_kinds = {(obj["object_kind"], obj["object_name"]) for obj in objects}
     assert ("data_shape", "memory_record") in object_kinds
     assert ("generated_artifact", "memory_embedding") in object_kinds
+    assert ("skill", "memory") in object_kinds
     assert ("mcp_tool", "store_memory") in object_kinds
     assert ("mcp_tool", "search_memories") in object_kinds
     assert ("mcp_tool", "list_memories") in object_kinds

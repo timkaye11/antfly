@@ -46,6 +46,7 @@ pub const LoadedVisionReader = struct {
     loaded_model: ?*model_manager_mod.LoadedModel = null,
     hf_tok: ?*hf_tokenizer.HfTokenizer = null,
     owns_sessions: bool = false,
+    florence_final_logits_bias_zero: ?bool = null,
 
     pub fn loadFromDir(
         allocator: std.mem.Allocator,
@@ -142,6 +143,11 @@ pub const LoadedVisionReader = struct {
         return reader_pipeline.read(image_data);
     }
 
+    pub fn readRawBatch(self: *LoadedVisionReader, image_datas: []const []const u8, options: reader_types.ReadOptions) ![]reading_pipeline_mod.ReadResult {
+        var reader_pipeline = self.pipeline(options);
+        return reader_pipeline.readBatch(image_datas);
+    }
+
     pub fn readDecodedRaw(self: *LoadedVisionReader, img: image.Image, options: reader_types.ReadOptions) !reading_pipeline_mod.ReadResult {
         var reader_pipeline = self.pipeline(options);
         return reader_pipeline.readDecoded(img);
@@ -171,6 +177,7 @@ pub const LoadedVisionReader = struct {
                 .pix2struct_do_normalize = self.preproc.pix2struct_do_normalize,
                 .prompt = options.prompt,
             },
+            &self.florence_final_logits_bias_zero,
         );
     }
 
@@ -192,7 +199,7 @@ pub fn isSupportedModelDir(allocator: std.mem.Allocator, model_path: []const u8)
     defer man.deinit();
 
     return man.native_arch_hint == .florence and
-        (man.safetensors_path != null or man.safetensors_index_path != null);
+        (man.gguf_path != null or man.safetensors_path != null or man.safetensors_index_path != null);
 }
 
 pub fn loadPreprocessorConfig(allocator: std.mem.Allocator, model_dir: []const u8) PreprocessorConfig {
@@ -289,4 +296,22 @@ fn jsonValueGetFloatArray3(val: std.json.Value) ?[3]f32 {
         };
     }
     return result;
+}
+
+test "vision reader supports gguf-backed native Florence directories" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data = "{\"model_type\":\"florence2\",\"text_config\":{\"d_model\":768},\"vision_config\":{\"image_size\":768}}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "florence-2-base.Q4_K.gguf", .data = "GGUFstub" });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+
+    try std.testing.expect(isSupportedModelDir(allocator, model_dir));
 }

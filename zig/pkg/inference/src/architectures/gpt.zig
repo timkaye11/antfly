@@ -127,6 +127,25 @@ fn monotonicNowNs() u64 {
     }
 }
 
+fn cudaPrefillProfileEnabled() bool {
+    return !is_freestanding and platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_PREFILL_PROFILE");
+}
+
+fn cudaPrefillStopLayer() ?usize {
+    if (is_freestanding) return null;
+    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_PREFILL_STOP_LAYER");
+}
+
+fn cudaPrefillProfileIntervalLayers() usize {
+    if (is_freestanding) return 1;
+    return @max(@as(usize, 1), platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_PREFILL_PROFILE_INTERVAL_LAYERS") orelse 1);
+}
+
+fn gemmaCudaPrefetchLookaheadLayers() usize {
+    if (is_freestanding) return 4;
+    return @max(@as(usize, 1), platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_PREFETCH_LOOKAHEAD_LAYERS") orelse 4);
+}
+
 pub const Config = gpt_config.Config;
 pub const ModelFamily = gpt_config.ModelFamily;
 pub const NormType = gpt_config.NormType;
@@ -149,6 +168,35 @@ const FinalAndPreNormHiddenTensorResult = struct {
     pre_norm_hidden: CT,
     total_rows: usize,
 };
+
+pub const ActivationTraceSink = struct {
+    ptr: *anyopaque,
+    captureFn: *const fn (*anyopaque, *const ComputeBackend, std.mem.Allocator, []const u8, ?usize, CT, usize) anyerror!void,
+
+    pub fn capture(
+        self: *ActivationTraceSink,
+        cb: *const ComputeBackend,
+        allocator: std.mem.Allocator,
+        label: []const u8,
+        layer: ?usize,
+        tensor: CT,
+        row_dim: usize,
+    ) !void {
+        try self.captureFn(self.ptr, cb, allocator, label, layer, tensor, row_dim);
+    }
+};
+
+fn maybeCaptureActivationTrace(
+    trace_sink: ?*ActivationTraceSink,
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    label: []const u8,
+    layer: ?usize,
+    tensor: CT,
+    row_dim: usize,
+) !void {
+    if (trace_sink) |sink| try sink.capture(cb, allocator, label, layer, tensor, row_dim);
+}
 
 const ReservedHiddenCarrier = struct {
     front: CT,
@@ -246,9 +294,137 @@ pub const Layer0DecoderOverrides = struct {
     mlp_down_slots: [decoder_override_layer_capacity]?usize = [_]?usize{null} ** decoder_override_layer_capacity,
 };
 
+fn cudaPreparedDecoderSlotsEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PREPARED_DECODER_SLOTS", true);
+}
+
+fn cudaDecoderSlotOverrideLevel() usize {
+    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_DECODER_SLOT_OVERRIDE_LEVEL") orelse 4;
+}
+
+fn cudaGemmaPreparedLayers(configured_layers: usize) usize {
+    const configured = platform.env.getenvUsize("TERMITE_MLX_RAW_METAL_WHOLE_TOKEN_GATED_LAYERS") orelse configured_layers;
+    return @min(configured_layers, configured);
+}
+
+fn cudaGemmaNormSlot(layer: usize, comptime kind: enum { attn_pre, attn_post, ffn_pre, ffn_post }) usize {
+    return switch (kind) {
+        .attn_pre => layer * 4,
+        .attn_post => layer * 4 + 1,
+        .ffn_pre => layer * 4 + 2,
+        .ffn_post => layer * 4 + 3,
+    };
+}
+
+fn cudaGemmaLinearSlot(layer: usize, comptime kind: enum { attn_q, attn_k, attn_v, attn_out_proj, mlp_gate, mlp_up, mlp_down }) usize {
+    return switch (kind) {
+        .attn_q => layer * 7,
+        .attn_k => layer * 7 + 1,
+        .attn_v => layer * 7 + 2,
+        .attn_out_proj => layer * 7 + 3,
+        .mlp_gate => layer * 7 + 4,
+        .mlp_up => layer * 7 + 5,
+        .mlp_down => layer * 7 + 6,
+    };
+}
+
+fn layer0DecoderOverridesEmpty(overrides: Layer0DecoderOverrides) bool {
+    if (overrides.attn_norm != null or overrides.fused_qkv != null or
+        overrides.q != null or overrides.k != null or overrides.v != null)
+    {
+        return false;
+    }
+    for (0..decoder_override_layer_capacity) |layer| {
+        if (overrides.attn_norm_slots[layer] != null or
+            overrides.attn_q_slots[layer] != null or
+            overrides.attn_k_slots[layer] != null or
+            overrides.attn_v_slots[layer] != null or
+            overrides.fused_qkv_linear_slots[layer] != null or
+            overrides.attn_out_proj_linear_slots[layer] != null or
+            overrides.attn_sub_norm_slots[layer] != null or
+            overrides.ffn_norm_slots[layer] != null or
+            overrides.mlp_fc1_slots[layer] != null or
+            overrides.mlp_fc2_slots[layer] != null or
+            overrides.mlp_gate_slots[layer] != null or
+            overrides.mlp_up_slots[layer] != null or
+            overrides.mlp_sub_norm_slots[layer] != null or
+            overrides.mlp_down_slots[layer] != null)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn buildCudaGemmaDecoderOverrides(config: Config, configured_layer_count: usize) Layer0DecoderOverrides {
+    const prepared_layer_count = cudaGemmaPreparedLayers(@min(configured_layer_count, @as(usize, @intCast(config.num_hidden_layers))));
+    const override_level = cudaDecoderSlotOverrideLevel();
+    var overrides = Layer0DecoderOverrides{};
+    for (0..prepared_layer_count) |layer| {
+        if (override_level >= 1) {
+            overrides.attn_norm_slots[layer] = cudaGemmaNormSlot(layer, .attn_pre);
+        }
+        if (override_level >= 2) {
+            overrides.attn_q_slots[layer] = cudaGemmaLinearSlot(layer, .attn_q);
+            overrides.attn_k_slots[layer] = cudaGemmaLinearSlot(layer, .attn_k);
+            overrides.attn_v_slots[layer] = cudaGemmaLinearSlot(layer, .attn_v);
+            overrides.attn_out_proj_linear_slots[layer] = cudaGemmaLinearSlot(layer, .attn_out_proj);
+        }
+        if (override_level >= 3) {
+            overrides.attn_sub_norm_slots[layer] = cudaGemmaNormSlot(layer, .attn_post);
+            overrides.ffn_norm_slots[layer] = cudaGemmaNormSlot(layer, .ffn_pre);
+            overrides.mlp_sub_norm_slots[layer] = cudaGemmaNormSlot(layer, .ffn_post);
+        }
+        if (override_level >= 4) {
+            overrides.mlp_gate_slots[layer] = cudaGemmaLinearSlot(layer, .mlp_gate);
+            overrides.mlp_up_slots[layer] = cudaGemmaLinearSlot(layer, .mlp_up);
+            overrides.mlp_down_slots[layer] = cudaGemmaLinearSlot(layer, .mlp_down);
+        }
+    }
+    return overrides;
+}
+
+fn maybePrepareCudaGemmaDecoderOverrides(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    overrides: Layer0DecoderOverrides,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    trace_sink: ?*ActivationTraceSink,
+) !Layer0DecoderOverrides {
+    if (cb.kind() != .cuda or config.family != .gemma or config.usesMoe()) return overrides;
+    if (!cudaPreparedDecoderSlotsEnabled() or trace_sink != null) return overrides;
+    if (!layer0DecoderOverridesEmpty(overrides)) return overrides;
+
+    const configured_layer_count: usize = @intCast(config.num_hidden_layers);
+    const current_kv_tokens = if (decode_context) |ctx| ctx.kv_sequence_len else seq_len;
+    const prepare = try cb.decoderRuntimePrepareOrReuseFamily(
+        allocator,
+        config,
+        current_kv_tokens,
+        configured_layer_count,
+    );
+    if (!prepare.prepared) return overrides;
+    return buildCudaGemmaDecoderOverrides(config, configured_layer_count);
+}
+
 pub const GreedyDeviceTokenResult = struct {
     token_id: usize,
     token_tensor: ?CT = null,
+};
+
+pub const GreedyLastTokenWithHiddenResult = struct {
+    token_id: usize,
+    token_tensor: ?CT = null,
+    hidden: CT,
+    rows: usize,
+
+    pub fn deinit(self: *@This(), cb: *const ComputeBackend) void {
+        if (self.token_tensor) |token| cb.free(token);
+        cb.free(self.hidden);
+        self.* = undefined;
+    }
 };
 
 fn deepSeekV4DecodeContextWithInputIds(
@@ -270,6 +446,39 @@ fn deepSeekV4DecodeContextWithInputIds(
     storage.input_ids = input_ids[0..@min(total, input_ids.len)];
     return storage;
 }
+
+pub const Gemma4LayerSpecCache = struct {
+    layers: []backend_contracts.DecoderRuntimeLayerSpec = &.{},
+    configured_layer_count: usize = 0,
+    num_hidden_layers: usize = 0,
+    include_output_scale: bool = false,
+    config_fingerprint: u64 = 0,
+    valid: bool = false,
+
+    pub fn reset(self: *Gemma4LayerSpecCache) void {
+        self.valid = false;
+    }
+
+    pub fn deinit(self: *Gemma4LayerSpecCache, allocator: std.mem.Allocator) void {
+        if (self.layers.len > 0) allocator.free(self.layers);
+        self.* = .{};
+    }
+
+    pub fn matches(
+        self: *const Gemma4LayerSpecCache,
+        configured_layer_count: usize,
+        num_hidden_layers: usize,
+        include_output_scale: bool,
+        config_fingerprint: u64,
+    ) bool {
+        return self.valid and
+            self.configured_layer_count == configured_layer_count and
+            self.num_hidden_layers == num_hidden_layers and
+            self.include_output_scale == include_output_scale and
+            self.config_fingerprint == config_fingerprint and
+            self.layers.len >= num_hidden_layers;
+    }
+};
 
 pub const DecodeContext = struct {
     pub const AttentionMode = enum {
@@ -316,6 +525,7 @@ pub const DecodeContext = struct {
     deepseek_v4_compressed_cache: ?*DeepSeekV4CompressedCache = null,
     moe_runtime: ?*runtime.moe.runtime.MoeRuntime = null,
     qwen35_linear_cache: ?*Qwen35LinearCache = null,
+    gemma4_layer_spec_cache: ?*Gemma4LayerSpecCache = null,
     input_ids: ?[]const i64 = null,
 
     pub fn usesPagedKv(self: DecodeContext) bool {
@@ -329,6 +539,24 @@ pub const DecodeContext = struct {
         return batch[0].per_item_query_len != null;
     }
 };
+
+test "Gemma4LayerSpecCache matches only exact spec shape" {
+    var layers: [35]backend_contracts.DecoderRuntimeLayerSpec = undefined;
+    var cache = Gemma4LayerSpecCache{
+        .layers = layers[0..],
+        .configured_layer_count = 35,
+        .num_hidden_layers = 35,
+        .include_output_scale = true,
+        .config_fingerprint = 1234,
+        .valid = true,
+    };
+    try std.testing.expect(cache.matches(35, 35, true, 1234));
+    try std.testing.expect(!cache.matches(35, 34, true, 1234));
+    try std.testing.expect(!cache.matches(35, 35, false, 1234));
+    try std.testing.expect(!cache.matches(35, 35, true, 5678));
+    cache.reset();
+    try std.testing.expect(!cache.matches(35, 35, true, 1234));
+}
 
 /// GPT decoder forward pass. Returns logits: [batch * seq_len * vocab_size] as f32.
 pub fn forward(
@@ -369,6 +597,233 @@ pub fn forward(
     return forwardFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, effective_decode_context, ple_vectors);
 }
 
+/// Run embeddings and transformer layers for KV/cache side effects without
+/// projecting logits or materializing anything on the host.
+pub fn forwardHiddenOnly(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+) !void {
+    const hidden_size = config.hidden_size;
+    const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+    const total = batch * query_seq_len;
+
+    const embed_w = try getEmbeddingWeight(cb, config);
+    defer cb.free(embed_w);
+    const hidden = try lookupScaledTokenEmbeddings(cb, allocator, config, embed_w, input_ids, total, hidden_size);
+
+    const ple_vectors = try computePleVectors(cb, allocator, config, input_ids, hidden, total);
+    defer if (ple_vectors) |pv| cb.free(pv);
+
+    var deepseek_v4_decode_context_storage: DecodeContext = undefined;
+    const effective_decode_context = deepSeekV4DecodeContextWithInputIds(
+        config,
+        input_ids,
+        total,
+        seq_len,
+        query_seq_len,
+        decode_context,
+        &deepseek_v4_decode_context_storage,
+    );
+    const hidden_result = try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, effective_decode_context, ple_vectors);
+    cb.free(hidden_result.hidden);
+}
+
+pub fn forwardHiddenTensorWithCudaReplay(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    replay_label: []const u8,
+) !CT {
+    const hidden_size = config.hidden_size;
+    const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+    const total = batch * query_seq_len;
+
+    const embed_w = try getEmbeddingWeight(cb, config);
+    defer cb.free(embed_w);
+    const hidden = try lookupScaledTokenEmbeddings(cb, allocator, config, embed_w, input_ids, total, hidden_size);
+
+    const ple_vectors = try computePleVectors(cb, allocator, config, input_ids, hidden, total);
+    defer if (ple_vectors) |pv| cb.free(pv);
+
+    var deepseek_v4_decode_context_storage: DecodeContext = undefined;
+    const effective_decode_context = deepSeekV4DecodeContextWithInputIds(
+        config,
+        input_ids,
+        total,
+        seq_len,
+        query_seq_len,
+        decode_context,
+        &deepseek_v4_decode_context_storage,
+    );
+    const hidden_result = try forwardFinalHiddenTensorFromEmbeddingsWithReplayLabel(
+        cb,
+        allocator,
+        config,
+        hidden,
+        batch,
+        seq_len,
+        effective_decode_context,
+        ple_vectors,
+        replay_label,
+    );
+    return hidden_result.hidden;
+}
+
+/// Last-row logits through the decoder-runtime forward (CUDA graph replay
+/// capable). Same result shape as the interpreter's last-row logits, but the
+/// layer stack runs through the fused decoder-runtime path — this is what
+/// lets sampled (non-greedy) decoding reuse the fast machinery the greedy
+/// loop gets from forwardGreedyLastToken.
+pub fn forwardLastLogitsWithCudaReplay(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    replay_label: []const u8,
+) ![]f32 {
+    const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+    const total_rows = batch * query_seq_len;
+    const hidden = try forwardHiddenTensorWithCudaReplay(
+        cb,
+        allocator,
+        config,
+        input_ids,
+        batch,
+        seq_len,
+        decode_context,
+        replay_label,
+    );
+    defer cb.free(hidden);
+
+    const last_hidden = if (total_rows == 1)
+        hidden
+    else
+        try cb.sliceRows2D(allocator, hidden, total_rows - 1, 1, config.hidden_size);
+    defer if (last_hidden != hidden) cb.free(last_hidden);
+
+    const lm_w = try getLmHeadWeight(cb, config);
+    defer cb.free(lm_w);
+
+    const logits = try cb.linearNoBias(last_hidden, lm_w, 1, config.hidden_size, config.vocab_size);
+    defer cb.free(logits);
+    try maybeDebugTensor(cb, allocator, "lm_head", logits);
+
+    const result = try cb.toFloat32(logits, allocator);
+    applyFinalLogitSoftcap(config, result);
+    maybeDebugTopLogits(result, config.vocab_size);
+    return result;
+}
+
+pub fn forwardHiddenOnlyWithCudaReplay(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    replay_label: []const u8,
+) !void {
+    const hidden = try forwardHiddenTensorWithCudaReplay(
+        cb,
+        allocator,
+        config,
+        input_ids,
+        batch,
+        seq_len,
+        decode_context,
+        replay_label,
+    );
+    cb.free(hidden);
+}
+
+pub fn forwardHiddenTensorFromTokenTensorWithCudaReplay(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_token: CT,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    replay_label: []const u8,
+) !?CT {
+    const hidden_size = config.hidden_size;
+    const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+    const total = batch * query_seq_len;
+    if (batch != 1 or query_seq_len != 1 or total != 1) return null;
+
+    const embed_w = try getEmbeddingWeight(cb, config);
+    defer cb.free(embed_w);
+    const hidden = (try lookupScaledTokenEmbeddingsTensor(cb, allocator, config, embed_w, input_token, total, hidden_size)) orelse return null;
+
+    const ple_vectors = try computePleVectorsFromTokenTensor(cb, allocator, config, input_token, hidden, total);
+    defer if (ple_vectors) |pv| cb.free(pv);
+
+    const hidden_result = try forwardFinalHiddenTensorFromEmbeddingsWithReplayLabel(
+        cb,
+        allocator,
+        config,
+        hidden,
+        batch,
+        seq_len,
+        decode_context,
+        ple_vectors,
+        replay_label,
+    );
+    return hidden_result.hidden;
+}
+
+pub fn forwardHiddenOnlyFromTokenTensorWithCudaReplayDiscard(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_token: CT,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    replay_label: []const u8,
+) !bool {
+    const hidden_size = config.hidden_size;
+    const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+    const total = batch * query_seq_len;
+    if (batch != 1 or query_seq_len != 1 or total != 1) return false;
+
+    const embed_w = try getEmbeddingWeight(cb, config);
+    defer cb.free(embed_w);
+    const hidden = (try lookupScaledTokenEmbeddingsTensor(cb, allocator, config, embed_w, input_token, total, hidden_size)) orelse return false;
+    var owns_hidden = true;
+    errdefer if (owns_hidden) cb.free(hidden);
+
+    const ple_vectors = try computePleVectorsFromTokenTensor(cb, allocator, config, input_token, hidden, total);
+    defer if (ple_vectors) |pv| cb.free(pv);
+
+    owns_hidden = false;
+    try forwardFinalHiddenTensorFromEmbeddingsWithReplayLabelDiscard(
+        cb,
+        allocator,
+        config,
+        hidden,
+        batch,
+        seq_len,
+        decode_context,
+        ple_vectors,
+        replay_label,
+    );
+    return true;
+}
+
 pub fn forwardGreedyLastToken(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -384,8 +839,7 @@ pub fn forwardGreedyLastToken(
 
     const embed_w = try getEmbeddingWeight(cb, config);
     defer cb.free(embed_w);
-    const embedded = try cb.embeddingLookup(embed_w, input_ids, total, hidden_size);
-    const hidden = try maybeScaleTokenEmbeddings(cb, allocator, config, embedded, total, hidden_size);
+    const hidden = try lookupScaledTokenEmbeddings(cb, allocator, config, embed_w, input_ids, total, hidden_size);
 
     const ple_vectors = try computePleVectors(cb, allocator, config, input_ids, hidden, total);
     defer if (ple_vectors) |pv| cb.free(pv);
@@ -403,6 +857,48 @@ pub fn forwardGreedyLastToken(
     return forwardGreedyLastTokenFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, effective_decode_context, ple_vectors);
 }
 
+pub fn forwardGreedyLastTokenWithFinalHidden(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+) !GreedyLastTokenWithHiddenResult {
+    const hidden_size = config.hidden_size;
+    const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+    const total = batch * query_seq_len;
+
+    const embed_w = try getEmbeddingWeight(cb, config);
+    defer cb.free(embed_w);
+    const hidden = try lookupScaledTokenEmbeddings(cb, allocator, config, embed_w, input_ids, total, hidden_size);
+
+    const ple_vectors = try computePleVectors(cb, allocator, config, input_ids, hidden, total);
+    defer if (ple_vectors) |pv| cb.free(pv);
+
+    var deepseek_v4_decode_context_storage: DecodeContext = undefined;
+    const effective_decode_context = deepSeekV4DecodeContextWithInputIds(
+        config,
+        input_ids,
+        total,
+        seq_len,
+        query_seq_len,
+        decode_context,
+        &deepseek_v4_decode_context_storage,
+    );
+    const hidden_result = try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, effective_decode_context, ple_vectors);
+    errdefer cb.free(hidden_result.hidden);
+    const token_result = try greedyLastTokenTensorFromFinalHiddenRetain(cb, allocator, config, hidden_result);
+    errdefer if (token_result.token_tensor) |token| cb.free(token);
+    return .{
+        .token_id = token_result.token_id,
+        .token_tensor = token_result.token_tensor,
+        .hidden = hidden_result.hidden,
+        .rows = hidden_result.total_rows,
+    };
+}
+
 pub fn forwardGreedyLastTokenFromTokenTensor(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -412,7 +908,6 @@ pub fn forwardGreedyLastTokenFromTokenTensor(
     seq_len: usize,
     decode_context: ?*const DecodeContext,
 ) !?GreedyDeviceTokenResult {
-    if (config.hasPle()) return null;
     const hidden_size = config.hidden_size;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
     const total = batch * query_seq_len;
@@ -420,10 +915,36 @@ pub fn forwardGreedyLastTokenFromTokenTensor(
 
     const embed_w = try getEmbeddingWeight(cb, config);
     defer cb.free(embed_w);
-    const embedded = (try cb.embeddingLookupTensor(embed_w, input_token, total, hidden_size)) orelse return null;
-    const hidden = try maybeScaleTokenEmbeddings(cb, allocator, config, embedded, total, hidden_size);
+    const hidden = (try lookupScaledTokenEmbeddingsTensor(cb, allocator, config, embed_w, input_token, total, hidden_size)) orelse return null;
 
-    return try forwardGreedyLastTokenTensorFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, decode_context, null);
+    const ple_vectors = try computePleVectorsFromTokenTensor(cb, allocator, config, input_token, hidden, total);
+    defer if (ple_vectors) |pv| cb.free(pv);
+
+    return try forwardGreedyLastTokenTensorFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, decode_context, ple_vectors);
+}
+
+pub fn forwardGreedyLastTokenTensorOnlyFromTokenTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_token: CT,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+) !?CT {
+    const hidden_size = config.hidden_size;
+    const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+    const total = batch * query_seq_len;
+    if (batch != 1 or query_seq_len != 1 or total != 1) return null;
+
+    const embed_w = try getEmbeddingWeight(cb, config);
+    defer cb.free(embed_w);
+    const hidden = (try lookupScaledTokenEmbeddingsTensor(cb, allocator, config, embed_w, input_token, total, hidden_size)) orelse return null;
+
+    const ple_vectors = try computePleVectorsFromTokenTensor(cb, allocator, config, input_token, hidden, total);
+    defer if (ple_vectors) |pv| cb.free(pv);
+
+    return try forwardGreedyLastTokenTensorOnlyFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, decode_context, ple_vectors);
 }
 
 pub fn forwardFromEmbeddings(
@@ -590,10 +1111,7 @@ pub fn forwardLastLogitsFromPositionedEmbeddingsWithLayer0Overrides(
     const hidden = hidden_result.hidden;
     defer cb.free(hidden);
 
-    const lm_w = if (config.weight_tying)
-        try getEmbeddingWeight(cb, config)
-    else
-        cb.getWeight("lm_head.weight") catch try getEmbeddingWeight(cb, config);
+    const lm_w = try getLmHeadWeight(cb, config);
     defer cb.free(lm_w);
 
     const logits = try cb.linearNoBias(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size);
@@ -635,10 +1153,7 @@ pub fn forwardLastLogitsFromEmbeddingsWithLayer0Overrides(
     const hidden = hidden_result.hidden;
     defer cb.free(hidden);
 
-    const lm_w = if (config.weight_tying)
-        try getEmbeddingWeight(cb, config)
-    else
-        cb.getWeight("lm_head.weight") catch try getEmbeddingWeight(cb, config);
+    const lm_w = try getLmHeadWeight(cb, config);
     defer cb.free(lm_w);
 
     const logits = try cb.linearNoBias(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size);
@@ -685,10 +1200,7 @@ pub fn forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(
         try cb.sliceRows2D(allocator, hidden, hidden_result.total_rows - 1, 1, config.hidden_size);
     defer if (last_hidden != hidden) cb.free(last_hidden);
 
-    const lm_w = if (config.weight_tying)
-        try getEmbeddingWeight(cb, config)
-    else
-        cb.getWeight("lm_head.weight") catch try getEmbeddingWeight(cb, config);
+    const lm_w = try getLmHeadWeight(cb, config);
     defer cb.free(lm_w);
 
     const logits = try cb.linearNoBias(last_hidden, lm_w, 1, config.hidden_size, config.vocab_size);
@@ -763,6 +1275,14 @@ pub fn applyFinalLogitSoftcapInPlace(config: Config, logits: []f32) void {
     applyFinalLogitSoftcap(config, logits);
 }
 
+pub fn canUseFastGreedyArgmaxForConfig(config: Config) bool {
+    if (config.final_logit_softcapping <= 0.0) return true;
+    // Gemma's final softcap is monotonic for normal logits, so the greedy argmax
+    // can stay on device. Keep non-Gemma configs conservative because extreme
+    // saturation can collapse distinct logits into ties.
+    return config.family == .gemma;
+}
+
 fn forwardGreedyLastTokenTensorFromEmbeddings(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -773,8 +1293,305 @@ fn forwardGreedyLastTokenTensorFromEmbeddings(
     decode_context: ?*const DecodeContext,
     ple_vectors: ?CT,
 ) !GreedyDeviceTokenResult {
-    const hidden_result = try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, hidden_input, batch, seq_len, decode_context, ple_vectors);
+    var capture_final_hidden = false;
+    var final_hidden_input = hidden_input;
+    var final_ple_vectors = ple_vectors;
+    var prepared_final_hidden_input = false;
+    var prepared_ple_vectors = false;
+    var original_hidden_input: CT = undefined;
+    var owns_original_hidden_input = false;
+    if (cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) {
+        if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput("gpt.final_hidden_decode", hidden_input)) |prepared| {
+            final_hidden_input = prepared;
+            prepared_final_hidden_input = true;
+            original_hidden_input = hidden_input;
+            owns_original_hidden_input = true;
+            var replay_inputs_ready = true;
+            if (ple_vectors) |ple| {
+                if (try cb.debugCudaGraphPrepareFinalHiddenReplayAuxInput(ple)) |prepared_ple| {
+                    final_ple_vectors = prepared_ple;
+                    prepared_ple_vectors = true;
+                } else {
+                    replay_inputs_ready = false;
+                }
+            }
+            if (!replay_inputs_ready) {
+                cb.free(final_hidden_input);
+                prepared_final_hidden_input = false;
+                final_hidden_input = original_hidden_input;
+                owns_original_hidden_input = false;
+            }
+        }
+        errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
+        errdefer if (prepared_ple_vectors) cb.free(final_ple_vectors.?);
+        errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
+
+        if (prepared_final_hidden_input) {
+            const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+            const position_offset = positionOffset(seq_len, query_seq_len, decode_context);
+            const kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
+            const total_sequence_len = if (decode_context) |dc| dc.total_sequence_len else seq_len;
+            const kv_position_offset = if (decode_context) |dc| dc.kv_position_offset else 0;
+            _ = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
+            const capture_greedy_token = cudaCaptureGreedyTokenProbeEnabled(cb, batch, seq_len, decode_context);
+            if (try cb.debugCudaGraphReplayFinalHidden(final_hidden_input)) |replayed| {
+                cb.free(final_hidden_input);
+                prepared_final_hidden_input = false;
+                if (prepared_ple_vectors) {
+                    cb.free(final_ple_vectors.?);
+                    prepared_ple_vectors = false;
+                    final_ple_vectors = ple_vectors;
+                }
+                if (owns_original_hidden_input) {
+                    cb.free(original_hidden_input);
+                    owns_original_hidden_input = false;
+                }
+                if (capture_greedy_token) {
+                    return greedyResultFromTokenTensor(cb, allocator, replayed);
+                }
+                return forwardGreedyLastTokenTensorFromFinalHidden(cb, allocator, config, .{
+                    .hidden = replayed,
+                    .total_rows = batch * query_seq_len,
+                });
+            }
+            capture_final_hidden = try cb.debugCudaGraphCaptureBegin("gpt.final_hidden_decode");
+            if (capture_final_hidden) try cb.debugCudaTraceTensor("gpt.capture_input", final_hidden_input);
+            if (capture_final_hidden) {
+                try cb.debugCudaGraphRegisterFinalHiddenReplayInput(final_hidden_input);
+                if (final_ple_vectors) |ple| try cb.debugCudaGraphRegisterFinalHiddenReplayAuxInput(ple);
+            }
+        }
+    }
+    errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
+
+    prepared_final_hidden_input = false;
+    const hidden_result = hidden_result_blk: {
+        break :hidden_result_blk forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, final_hidden_input, batch, seq_len, decode_context, final_ple_vectors) catch |err| {
+            if (capture_final_hidden) {
+                cb.debugCudaGraphCaptureEnd(false) catch {};
+                capture_final_hidden = false;
+            }
+            if (prepared_ple_vectors) {
+                cb.free(final_ple_vectors.?);
+                prepared_ple_vectors = false;
+                final_ple_vectors = ple_vectors;
+            }
+            if (owns_original_hidden_input) {
+                const fallback_input = original_hidden_input;
+                owns_original_hidden_input = false;
+                break :hidden_result_blk try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, fallback_input, batch, seq_len, decode_context, ple_vectors);
+            }
+            return err;
+        };
+    };
+    if (prepared_ple_vectors) {
+        cb.free(final_ple_vectors.?);
+        prepared_ple_vectors = false;
+        final_ple_vectors = ple_vectors;
+    }
+    if (owns_original_hidden_input) {
+        cb.free(original_hidden_input);
+        owns_original_hidden_input = false;
+    }
+    errdefer cb.free(hidden_result.hidden);
+    if (capture_final_hidden) {
+        if (cudaCaptureGreedyTokenProbeEnabled(cb, batch, seq_len, decode_context)) {
+            if (try tryGreedyLastTokenTensorFastPathFromFinalHidden(cb, config, hidden_result)) |token| {
+                errdefer cb.free(token);
+                try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(final_hidden_input, token);
+                try cb.debugCudaGraphCaptureEnd(true);
+                capture_final_hidden = false;
+                cb.free(hidden_result.hidden);
+                return greedyResultFromTokenTensor(cb, allocator, token);
+            }
+            try cb.debugCudaGraphCaptureEnd(false);
+            capture_final_hidden = false;
+            if (cudaDecodeGraphReplayRequired()) return error.CudaGraphReplayRequired;
+            return forwardGreedyLastTokenTensorFromFinalHidden(cb, allocator, config, hidden_result);
+        }
+        try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(final_hidden_input, hidden_result.hidden);
+        try cb.debugCudaGraphCaptureEnd(true);
+        capture_final_hidden = false;
+    }
     return forwardGreedyLastTokenTensorFromFinalHidden(cb, allocator, config, hidden_result);
+}
+
+fn forwardGreedyLastTokenTensorOnlyFromEmbeddings(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+) !?CT {
+    var capture_final_hidden = false;
+    var final_hidden_input = hidden_input;
+    var final_ple_vectors = ple_vectors;
+    var prepared_final_hidden_input = false;
+    var prepared_ple_vectors = false;
+    var original_hidden_input: CT = undefined;
+    var owns_original_hidden_input = false;
+    if (cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) {
+        if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput("gpt.final_hidden_decode", hidden_input)) |prepared| {
+            final_hidden_input = prepared;
+            prepared_final_hidden_input = true;
+            original_hidden_input = hidden_input;
+            owns_original_hidden_input = true;
+            var replay_inputs_ready = true;
+            if (ple_vectors) |ple| {
+                if (try cb.debugCudaGraphPrepareFinalHiddenReplayAuxInput(ple)) |prepared_ple| {
+                    final_ple_vectors = prepared_ple;
+                    prepared_ple_vectors = true;
+                } else {
+                    replay_inputs_ready = false;
+                }
+            }
+            if (!replay_inputs_ready) {
+                cb.free(final_hidden_input);
+                prepared_final_hidden_input = false;
+                final_hidden_input = original_hidden_input;
+                owns_original_hidden_input = false;
+            }
+        }
+        errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
+        errdefer if (prepared_ple_vectors) cb.free(final_ple_vectors.?);
+        errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
+
+        if (prepared_final_hidden_input) {
+            const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+            const position_offset = positionOffset(seq_len, query_seq_len, decode_context);
+            const kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
+            const total_sequence_len = if (decode_context) |dc| dc.total_sequence_len else seq_len;
+            const kv_position_offset = if (decode_context) |dc| dc.kv_position_offset else 0;
+            _ = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
+            const capture_greedy_token = cudaCaptureGreedyTokenProbeEnabled(cb, batch, seq_len, decode_context);
+            if (try cb.debugCudaGraphReplayFinalHidden(final_hidden_input)) |replayed| {
+                cb.free(final_hidden_input);
+                prepared_final_hidden_input = false;
+                if (prepared_ple_vectors) {
+                    cb.free(final_ple_vectors.?);
+                    prepared_ple_vectors = false;
+                    final_ple_vectors = ple_vectors;
+                }
+                if (owns_original_hidden_input) {
+                    cb.free(original_hidden_input);
+                    owns_original_hidden_input = false;
+                }
+                if (capture_greedy_token) return replayed;
+                defer cb.free(replayed);
+                return try greedyLastTokenTensorOnlyFromFinalHiddenRetain(cb, config, .{
+                    .hidden = replayed,
+                    .total_rows = batch * query_seq_len,
+                });
+            }
+            capture_final_hidden = try cb.debugCudaGraphCaptureBegin("gpt.final_hidden_decode");
+            if (capture_final_hidden) try cb.debugCudaTraceTensor("gpt.capture_input", final_hidden_input);
+            if (capture_final_hidden) {
+                try cb.debugCudaGraphRegisterFinalHiddenReplayInput(final_hidden_input);
+                if (final_ple_vectors) |ple| try cb.debugCudaGraphRegisterFinalHiddenReplayAuxInput(ple);
+            }
+        }
+    }
+    errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
+
+    prepared_final_hidden_input = false;
+    const hidden_result = hidden_result_blk: {
+        break :hidden_result_blk forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, final_hidden_input, batch, seq_len, decode_context, final_ple_vectors) catch |err| {
+            if (capture_final_hidden) {
+                cb.debugCudaGraphCaptureEnd(false) catch {};
+                capture_final_hidden = false;
+            }
+            if (prepared_ple_vectors) {
+                cb.free(final_ple_vectors.?);
+                prepared_ple_vectors = false;
+                final_ple_vectors = ple_vectors;
+            }
+            if (owns_original_hidden_input) {
+                const fallback_input = original_hidden_input;
+                owns_original_hidden_input = false;
+                break :hidden_result_blk try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, fallback_input, batch, seq_len, decode_context, ple_vectors);
+            }
+            return err;
+        };
+    };
+    if (prepared_ple_vectors) {
+        cb.free(final_ple_vectors.?);
+        prepared_ple_vectors = false;
+        final_ple_vectors = ple_vectors;
+    }
+    if (owns_original_hidden_input) {
+        cb.free(original_hidden_input);
+        owns_original_hidden_input = false;
+    }
+    errdefer cb.free(hidden_result.hidden);
+    if (capture_final_hidden) {
+        if (cudaCaptureGreedyTokenProbeEnabled(cb, batch, seq_len, decode_context)) {
+            if (try tryGreedyLastTokenTensorFastPathFromFinalHidden(cb, config, hidden_result)) |token| {
+                errdefer cb.free(token);
+                try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(final_hidden_input, token);
+                try cb.debugCudaGraphCaptureEnd(true);
+                capture_final_hidden = false;
+                cb.free(hidden_result.hidden);
+                return token;
+            }
+            try cb.debugCudaGraphCaptureEnd(false);
+            capture_final_hidden = false;
+            if (cudaDecodeGraphReplayRequired()) return error.CudaGraphReplayRequired;
+            return forwardGreedyLastTokenTensorOnlyFromFinalHidden(cb, config, hidden_result);
+        }
+        try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(final_hidden_input, hidden_result.hidden);
+        try cb.debugCudaGraphCaptureEnd(true);
+        capture_final_hidden = false;
+    }
+    return forwardGreedyLastTokenTensorOnlyFromFinalHidden(cb, config, hidden_result);
+}
+
+const CudaDecodeGraphReplayMode = enum {
+    off,
+    auto,
+    required,
+};
+
+fn cudaDecodeGraphReplayMode() CudaDecodeGraphReplayMode {
+    const raw = platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY") orelse return .off;
+    if (std.mem.eql(u8, raw, "off") or std.mem.eql(u8, raw, "0") or std.mem.eql(u8, raw, "false") or std.mem.eql(u8, raw, "no")) return .off;
+    if (std.mem.eql(u8, raw, "required") or std.mem.eql(u8, raw, "require") or std.mem.eql(u8, raw, "force")) return .required;
+    if (std.mem.eql(u8, raw, "auto") or std.mem.eql(u8, raw, "on") or std.mem.eql(u8, raw, "1") or std.mem.eql(u8, raw, "true") or std.mem.eql(u8, raw, "yes")) return .auto;
+    return .off;
+}
+
+fn cudaDecodeGraphReplayRequested() bool {
+    return cudaDecodeGraphReplayMode() != .off;
+}
+
+fn cudaDecodeGraphReplayRequired() bool {
+    return cudaDecodeGraphReplayMode() == .required;
+}
+
+fn cudaCaptureFinalHiddenProbeEnabled(
+    cb: *const ComputeBackend,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+) bool {
+    if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_FINAL_HIDDEN", false) and
+        !cudaDecodeGraphReplayRequested()) return false;
+    if (cb.kind() != .cuda) return false;
+    if (batch != 1) return false;
+    return actualQuerySeqLen(seq_len, decode_context) == 1;
+}
+
+fn cudaCaptureGreedyTokenProbeEnabled(
+    cb: *const ComputeBackend,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+) bool {
+    if (!cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) return false;
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_GREEDY_TOKEN", false) or
+        cudaDecodeGraphReplayRequested();
 }
 
 fn forwardGreedyLastTokenTensorFromEmbeddingsWithLayer0Overrides(
@@ -849,42 +1666,145 @@ fn forwardGreedyLastTokenTensorFromFinalHidden(
 ) !GreedyDeviceTokenResult {
     const hidden = hidden_result.hidden;
     defer cb.free(hidden);
+    return greedyLastTokenTensorFromFinalHiddenRetain(cb, allocator, config, hidden_result);
+}
 
-    const lm_w = if (config.weight_tying)
-        try getEmbeddingWeight(cb, config)
-    else
-        cb.getWeight("lm_head.weight") catch try getEmbeddingWeight(cb, config);
+fn forwardGreedyLastTokenTensorOnlyFromFinalHidden(
+    cb: *const ComputeBackend,
+    config: Config,
+    hidden_result: HiddenTensorResult,
+) !?CT {
+    const hidden = hidden_result.hidden;
+    defer cb.free(hidden);
+    return greedyLastTokenTensorOnlyFromFinalHiddenRetain(cb, config, hidden_result);
+}
+
+fn greedyLastTokenTensorFromFinalHiddenRetain(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_result: HiddenTensorResult,
+) !GreedyDeviceTokenResult {
+    const hidden = hidden_result.hidden;
+    if (try tryGreedyLastTokenTensorFastPathFromFinalHidden(cb, config, hidden_result)) |token| {
+        return greedyResultFromTokenTensor(cb, allocator, token);
+    }
+
+    const lm_w = try getLmHeadWeight(cb, config);
     defer cb.free(lm_w);
-
-    if (try cb.linearNoBiasArgmaxLastRowTensor(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size)) |token_tensor| {
-        errdefer cb.free(token_tensor);
-        const ids = try cb.toFloat32(token_tensor, allocator);
-        defer allocator.free(ids);
-        if (ids.len != 1 or ids[0] < 0) return error.InvalidTensorShape;
-        return .{
-            .token_id = @intFromFloat(ids[0]),
-            .token_tensor = token_tensor,
-        };
-    }
-
-    if (try cb.linearNoBiasArgmaxLastRow(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size)) |token_id| {
-        return .{ .token_id = @intCast(token_id) };
-    }
 
     const logits = try cb.linearNoBias(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size);
     defer cb.free(logits);
     try maybeDebugTensor(cb, allocator, "lm_head", logits);
 
-    // Final logit softcapping is tanh-based and monotonic, so argmax is preserved.
-    if (try cb.argmaxLastRow(logits, hidden_result.total_rows, config.vocab_size)) |token_id| {
-        return .{ .token_id = @intCast(token_id) };
+    if (canUseFastGreedyArgmaxForConfig(config)) {
+        const suppress_token_ids = config.suppressTokenIds();
+        if (suppress_token_ids.len > 0) {
+            if (try cb.argmaxLastRowSuppressTensor(logits, hidden_result.total_rows, config.vocab_size, suppress_token_ids)) |token_tensor| {
+                return greedyResultFromTokenTensor(cb, allocator, token_tensor);
+            }
+        } else if (try cb.argmaxLastRow(logits, hidden_result.total_rows, config.vocab_size)) |token_id| {
+            return .{ .token_id = @intCast(token_id) };
+        }
     }
 
     const result = try cb.toFloat32(logits, allocator);
     defer allocator.free(result);
     applyFinalLogitSoftcap(config, result);
+    const last = result[(hidden_result.total_rows - 1) * config.vocab_size ..][0..config.vocab_size];
+    for (config.suppressTokenIds()) |token_id| {
+        if (token_id < 0) continue;
+        const idx: usize = @intCast(token_id);
+        if (idx < last.len) last[idx] = -std.math.inf(f32);
+    }
+    return .{ .token_id = activations.argmax(last) };
+}
+
+fn greedyLastTokenTensorOnlyFromFinalHiddenRetain(
+    cb: *const ComputeBackend,
+    config: Config,
+    hidden_result: HiddenTensorResult,
+) !?CT {
+    const hidden = hidden_result.hidden;
+    if (try tryGreedyLastTokenTensorFastPathFromFinalHidden(cb, config, hidden_result)) |token| {
+        return token;
+    }
+
+    if (!canUseFastGreedyArgmaxForConfig(config)) return null;
+    const lm_w = try getLmHeadWeight(cb, config);
+    defer cb.free(lm_w);
+
+    const logits = try cb.linearNoBias(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size);
+    defer cb.free(logits);
+
+    const suppress_token_ids = config.suppressTokenIds();
+    return try cb.argmaxLastRowSuppressTensor(logits, hidden_result.total_rows, config.vocab_size, suppress_token_ids);
+}
+
+fn tryGreedyLastTokenTensorFastPathFromFinalHidden(
+    cb: *const ComputeBackend,
+    config: Config,
+    hidden_result: HiddenTensorResult,
+) !?CT {
+    if (!canUseFastGreedyArgmaxForConfig(config)) return null;
+
+    const hidden = hidden_result.hidden;
+    const lm_w = try getLmHeadWeight(cb, config);
+    defer cb.free(lm_w);
+
+    const suppress_token_ids = config.suppressTokenIds();
+    if (suppress_token_ids.len == 0) {
+        if (try cb.linearNoBiasArgmaxLastRowTensor(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size)) |token| {
+            return token;
+        }
+    } else {
+        if (try cb.linearNoBiasArgmaxLastRowSuppressTensor(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size, suppress_token_ids)) |token| {
+            return token;
+        }
+    }
+
+    return null;
+}
+
+pub fn resolveGreedyDeviceTokenTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    token: CT,
+) !usize {
+    if (try cb.exportTensorData(token, allocator)) |exported| {
+        defer switch (exported.payload) {
+            .bytes => |bytes| allocator.free(bytes),
+            .quantized_f32 => |storage| {
+                allocator.free(storage.raw_bytes);
+                allocator.free(storage.shape);
+            },
+        };
+        switch (exported.payload) {
+            .bytes => |bytes| {
+                if (exported.dtype == .i32 and bytes.len == @sizeOf(i32)) {
+                    const token_id = std.mem.readInt(i32, bytes[0..@sizeOf(i32)], .little);
+                    if (token_id < 0) return error.InvalidTensorShape;
+                    return @intCast(token_id);
+                }
+            },
+            .quantized_f32 => {},
+        }
+    }
+    const ids = try cb.toFloat32(token, allocator);
+    defer allocator.free(ids);
+    if (ids.len != 1 or ids[0] < 0) return error.InvalidTensorShape;
+    return @intFromFloat(ids[0]);
+}
+
+fn greedyResultFromTokenTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    token: CT,
+) !GreedyDeviceTokenResult {
+    errdefer cb.free(token);
     return .{
-        .token_id = activations.argmax(result[(hidden_result.total_rows - 1) * config.vocab_size ..][0..config.vocab_size]),
+        .token_id = try resolveGreedyDeviceTokenTensor(cb, allocator, token),
+        .token_tensor = token,
     };
 }
 
@@ -903,10 +1823,7 @@ fn forwardLogitsTensorFromEmbeddings(
     errdefer cb.free(hidden);
 
     // 5. LM head: project to vocab
-    const lm_w = if (config.weight_tying)
-        try getEmbeddingWeight(cb, config)
-    else
-        cb.getWeight("lm_head.weight") catch try getEmbeddingWeight(cb, config);
+    const lm_w = try getLmHeadWeight(cb, config);
     defer cb.free(lm_w);
     const logits = try cb.linearNoBias(hidden, lm_w, hidden_result.total_rows, config.hidden_size, config.vocab_size);
     cb.free(hidden);
@@ -940,6 +1857,236 @@ fn forwardFinalHiddenTensorFromEmbeddings(
     );
 }
 
+fn forwardFinalHiddenTensorFromEmbeddingsWithReplayLabel(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+    replay_label: []const u8,
+) !HiddenTensorResult {
+    if (!cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) {
+        return forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, hidden_input, batch, seq_len, decode_context, ple_vectors);
+    }
+
+    var capture_final_hidden = false;
+    var final_hidden_input = hidden_input;
+    var final_ple_vectors = ple_vectors;
+    var prepared_final_hidden_input = false;
+    var prepared_ple_vectors = false;
+    var original_hidden_input: CT = undefined;
+    var owns_original_hidden_input = false;
+    if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput(replay_label, hidden_input)) |prepared| {
+        final_hidden_input = prepared;
+        prepared_final_hidden_input = true;
+        original_hidden_input = hidden_input;
+        owns_original_hidden_input = true;
+        var replay_inputs_ready = true;
+        if (ple_vectors) |ple| {
+            if (try cb.debugCudaGraphPrepareFinalHiddenReplayAuxInput(ple)) |prepared_ple| {
+                final_ple_vectors = prepared_ple;
+                prepared_ple_vectors = true;
+            } else {
+                replay_inputs_ready = false;
+            }
+        }
+        if (!replay_inputs_ready) {
+            cb.free(final_hidden_input);
+            prepared_final_hidden_input = false;
+            final_hidden_input = original_hidden_input;
+            owns_original_hidden_input = false;
+        }
+    }
+    errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
+    errdefer if (prepared_ple_vectors) cb.free(final_ple_vectors.?);
+    errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
+
+    if (prepared_final_hidden_input) {
+        const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+        const position_offset = positionOffset(seq_len, query_seq_len, decode_context);
+        const kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
+        const total_sequence_len = if (decode_context) |dc| dc.total_sequence_len else seq_len;
+        const kv_position_offset = if (decode_context) |dc| dc.kv_position_offset else 0;
+        _ = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
+        if (try cb.debugCudaGraphReplayFinalHidden(final_hidden_input)) |replayed| {
+            cb.free(final_hidden_input);
+            prepared_final_hidden_input = false;
+            if (prepared_ple_vectors) {
+                cb.free(final_ple_vectors.?);
+                prepared_ple_vectors = false;
+                final_ple_vectors = ple_vectors;
+            }
+            cb.free(original_hidden_input);
+            owns_original_hidden_input = false;
+            return .{
+                .hidden = replayed,
+                .total_rows = batch * query_seq_len,
+            };
+        }
+        capture_final_hidden = try cb.debugCudaGraphCaptureBegin(replay_label);
+        if (capture_final_hidden) try cb.debugCudaTraceTensor("gpt.raw_capture_input", final_hidden_input);
+        if (capture_final_hidden) {
+            try cb.debugCudaGraphRegisterFinalHiddenReplayInput(final_hidden_input);
+            if (final_ple_vectors) |ple| try cb.debugCudaGraphRegisterFinalHiddenReplayAuxInput(ple);
+        }
+    }
+    errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
+
+    prepared_final_hidden_input = false;
+    const hidden_result = hidden_result_blk: {
+        break :hidden_result_blk forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, final_hidden_input, batch, seq_len, decode_context, final_ple_vectors) catch |err| {
+            if (capture_final_hidden) {
+                cb.debugCudaGraphCaptureEnd(false) catch {};
+                capture_final_hidden = false;
+            }
+            if (prepared_ple_vectors) {
+                cb.free(final_ple_vectors.?);
+                prepared_ple_vectors = false;
+                final_ple_vectors = ple_vectors;
+            }
+            if (owns_original_hidden_input) {
+                const fallback_input = original_hidden_input;
+                owns_original_hidden_input = false;
+                break :hidden_result_blk try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, fallback_input, batch, seq_len, decode_context, ple_vectors);
+            }
+            return err;
+        };
+    };
+    if (prepared_ple_vectors) {
+        cb.free(final_ple_vectors.?);
+        prepared_ple_vectors = false;
+        final_ple_vectors = ple_vectors;
+    }
+    if (owns_original_hidden_input) {
+        cb.free(original_hidden_input);
+        owns_original_hidden_input = false;
+    }
+    errdefer cb.free(hidden_result.hidden);
+    if (capture_final_hidden) {
+        try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(final_hidden_input, hidden_result.hidden);
+        try cb.debugCudaGraphCaptureEnd(true);
+        capture_final_hidden = false;
+    }
+    return hidden_result;
+}
+
+fn forwardFinalHiddenTensorFromEmbeddingsWithReplayLabelDiscard(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+    replay_label: []const u8,
+) !void {
+    if (!cudaCaptureFinalHiddenProbeEnabled(cb, batch, seq_len, decode_context)) {
+        const hidden_result = try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, hidden_input, batch, seq_len, decode_context, ple_vectors);
+        cb.free(hidden_result.hidden);
+        return;
+    }
+
+    var capture_final_hidden = false;
+    var final_hidden_input = hidden_input;
+    var final_ple_vectors = ple_vectors;
+    var prepared_final_hidden_input = false;
+    var prepared_ple_vectors = false;
+    var original_hidden_input: CT = undefined;
+    var owns_original_hidden_input = false;
+    if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput(replay_label, hidden_input)) |prepared| {
+        final_hidden_input = prepared;
+        prepared_final_hidden_input = true;
+        original_hidden_input = hidden_input;
+        owns_original_hidden_input = true;
+        var replay_inputs_ready = true;
+        if (ple_vectors) |ple| {
+            if (try cb.debugCudaGraphPrepareFinalHiddenReplayAuxInput(ple)) |prepared_ple| {
+                final_ple_vectors = prepared_ple;
+                prepared_ple_vectors = true;
+            } else {
+                replay_inputs_ready = false;
+            }
+        }
+        if (!replay_inputs_ready) {
+            cb.free(final_hidden_input);
+            prepared_final_hidden_input = false;
+            final_hidden_input = original_hidden_input;
+            owns_original_hidden_input = false;
+        }
+    }
+    errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
+    errdefer if (prepared_ple_vectors) cb.free(final_ple_vectors.?);
+    errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
+
+    if (prepared_final_hidden_input) {
+        const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+        const position_offset = positionOffset(seq_len, query_seq_len, decode_context);
+        const kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
+        const total_sequence_len = if (decode_context) |dc| dc.total_sequence_len else seq_len;
+        const kv_position_offset = if (decode_context) |dc| dc.kv_position_offset else 0;
+        _ = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
+        if (try cb.debugCudaGraphReplayFinalHiddenDiscard(final_hidden_input)) {
+            cb.free(final_hidden_input);
+            prepared_final_hidden_input = false;
+            if (prepared_ple_vectors) {
+                cb.free(final_ple_vectors.?);
+                prepared_ple_vectors = false;
+                final_ple_vectors = ple_vectors;
+            }
+            cb.free(original_hidden_input);
+            owns_original_hidden_input = false;
+            return;
+        }
+        capture_final_hidden = try cb.debugCudaGraphCaptureBegin(replay_label);
+        if (capture_final_hidden) try cb.debugCudaTraceTensor("gpt.raw_capture_input", final_hidden_input);
+        if (capture_final_hidden) {
+            try cb.debugCudaGraphRegisterFinalHiddenReplayInput(final_hidden_input);
+            if (final_ple_vectors) |ple| try cb.debugCudaGraphRegisterFinalHiddenReplayAuxInput(ple);
+        }
+    }
+    errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
+
+    prepared_final_hidden_input = false;
+    const hidden_result = hidden_result_blk: {
+        break :hidden_result_blk forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, final_hidden_input, batch, seq_len, decode_context, final_ple_vectors) catch |err| {
+            if (capture_final_hidden) {
+                cb.debugCudaGraphCaptureEnd(false) catch {};
+                capture_final_hidden = false;
+            }
+            if (prepared_ple_vectors) {
+                cb.free(final_ple_vectors.?);
+                prepared_ple_vectors = false;
+                final_ple_vectors = ple_vectors;
+            }
+            if (owns_original_hidden_input) {
+                const fallback_input = original_hidden_input;
+                owns_original_hidden_input = false;
+                break :hidden_result_blk try forwardFinalHiddenTensorFromEmbeddings(cb, allocator, config, fallback_input, batch, seq_len, decode_context, ple_vectors);
+            }
+            return err;
+        };
+    };
+    if (prepared_ple_vectors) {
+        cb.free(final_ple_vectors.?);
+        prepared_ple_vectors = false;
+        final_ple_vectors = ple_vectors;
+    }
+    if (owns_original_hidden_input) {
+        cb.free(original_hidden_input);
+        owns_original_hidden_input = false;
+    }
+    defer cb.free(hidden_result.hidden);
+    if (capture_final_hidden) {
+        try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(final_hidden_input, hidden_result.hidden);
+        try cb.debugCudaGraphCaptureEnd(true);
+        capture_final_hidden = false;
+    }
+}
+
 pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -950,6 +2097,306 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
     seq_len: usize,
     decode_context: ?*const DecodeContext,
     ple_vectors: ?CT,
+) !HiddenTensorResult {
+    return forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesAndTrace(
+        cb,
+        allocator,
+        config,
+        hidden_input,
+        overrides,
+        batch,
+        seq_len,
+        decode_context,
+        ple_vectors,
+        null,
+    );
+}
+
+pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    overrides: Layer0DecoderOverrides,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+    label: []const u8,
+) !HiddenTensorResult {
+    if (!cudaMtpFinalHiddenReplayEnabled(cb, config, batch, seq_len, decode_context, label)) {
+        return forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
+            cb,
+            allocator,
+            config,
+            hidden_input,
+            overrides,
+            batch,
+            seq_len,
+            decode_context,
+            ple_vectors,
+        );
+    }
+
+    const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+    const position_offset = positionOffset(seq_len, query_seq_len, decode_context);
+    const kv_seq_len = if (decode_context) |dc| dc.kv_sequence_len else seq_len;
+    const total_sequence_len = if (decode_context) |dc| dc.total_sequence_len else seq_len;
+    const kv_position_offset = if (decode_context) |dc| dc.kv_position_offset else 0;
+    var replay_label_buf: [192]u8 = undefined;
+    const replay_label = cudaMtpReplayContextLabel(
+        label,
+        batch,
+        seq_len,
+        query_seq_len,
+        position_offset,
+        kv_seq_len,
+        total_sequence_len,
+        kv_position_offset,
+        &replay_label_buf,
+    );
+
+    var capture_final_hidden = false;
+    var final_hidden_input = hidden_input;
+    var final_ple_vectors = ple_vectors;
+    var prepared_final_hidden_input = false;
+    var prepared_ple_vectors = false;
+    var original_hidden_input: CT = undefined;
+    var owns_original_hidden_input = false;
+    const prepared = (try cb.debugCudaGraphPrepareFinalHiddenReplayInput(replay_label, hidden_input)) orelse
+        return forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
+            cb,
+            allocator,
+            config,
+            hidden_input,
+            overrides,
+            batch,
+            seq_len,
+            decode_context,
+            ple_vectors,
+        );
+    final_hidden_input = prepared;
+    prepared_final_hidden_input = true;
+    original_hidden_input = hidden_input;
+    owns_original_hidden_input = true;
+    if (ple_vectors) |ple| {
+        if (try cb.debugCudaGraphPrepareFinalHiddenReplayAuxInput(ple)) |prepared_ple| {
+            final_ple_vectors = prepared_ple;
+            prepared_ple_vectors = true;
+        } else {
+            cb.free(final_hidden_input);
+            prepared_final_hidden_input = false;
+            owns_original_hidden_input = false;
+            return forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
+                cb,
+                allocator,
+                config,
+                original_hidden_input,
+                overrides,
+                batch,
+                seq_len,
+                decode_context,
+                ple_vectors,
+            );
+        }
+    }
+    errdefer if (prepared_final_hidden_input) cb.free(final_hidden_input);
+    errdefer if (prepared_ple_vectors) cb.free(final_ple_vectors.?);
+    errdefer if (owns_original_hidden_input) cb.free(original_hidden_input);
+
+    _ = try cb.debugCudaGraphPrepareDecodeScalars(position_offset, position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
+    if (try cb.debugCudaGraphReplayFinalHidden(final_hidden_input)) |replayed| {
+        if (prepared_final_hidden_input) {
+            cb.free(final_hidden_input);
+            prepared_final_hidden_input = false;
+        }
+        if (prepared_ple_vectors) {
+            cb.free(final_ple_vectors.?);
+            prepared_ple_vectors = false;
+            final_ple_vectors = ple_vectors;
+        }
+        if (owns_original_hidden_input) {
+            cb.free(original_hidden_input);
+            owns_original_hidden_input = false;
+        }
+        return .{
+            .hidden = replayed,
+            .total_rows = batch * query_seq_len,
+        };
+    }
+
+    capture_final_hidden = try cb.debugCudaGraphCaptureBegin(replay_label);
+    if (capture_final_hidden) try cb.debugCudaTraceTensor("gpt.mtp_capture_input", final_hidden_input);
+    if (capture_final_hidden) {
+        try cb.debugCudaGraphRegisterFinalHiddenReplayInput(final_hidden_input);
+        if (final_ple_vectors) |ple| try cb.debugCudaGraphRegisterFinalHiddenReplayAuxInput(ple);
+    }
+    errdefer if (capture_final_hidden) cb.debugCudaGraphCaptureEnd(false) catch {};
+
+    prepared_final_hidden_input = false;
+    const hidden_result = forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesAndTrace(
+        cb,
+        allocator,
+        config,
+        final_hidden_input,
+        overrides,
+        batch,
+        seq_len,
+        decode_context,
+        final_ple_vectors,
+        null,
+    ) catch |err| {
+        if (capture_final_hidden) {
+            cb.debugCudaGraphCaptureEnd(false) catch {};
+            capture_final_hidden = false;
+        }
+        if (prepared_ple_vectors) {
+            cb.free(final_ple_vectors.?);
+            prepared_ple_vectors = false;
+            final_ple_vectors = ple_vectors;
+        }
+        if (owns_original_hidden_input) {
+            const fallback_input = original_hidden_input;
+            owns_original_hidden_input = false;
+            return forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesAndTrace(
+                cb,
+                allocator,
+                config,
+                fallback_input,
+                overrides,
+                batch,
+                seq_len,
+                decode_context,
+                ple_vectors,
+                null,
+            );
+        }
+        return err;
+    };
+    if (prepared_ple_vectors) {
+        cb.free(final_ple_vectors.?);
+        prepared_ple_vectors = false;
+        final_ple_vectors = ple_vectors;
+    }
+    if (owns_original_hidden_input) {
+        cb.free(original_hidden_input);
+        owns_original_hidden_input = false;
+    }
+    errdefer cb.free(hidden_result.hidden);
+    if (capture_final_hidden) {
+        try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(final_hidden_input, hidden_result.hidden);
+        try cb.debugCudaGraphCaptureEnd(true);
+        capture_final_hidden = false;
+    }
+    return hidden_result;
+}
+
+fn cudaMtpReplayContextKeyEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_REPLAY_CONTEXT_KEY", true);
+}
+
+fn cudaMtpReplayContextLabel(
+    base_label: []const u8,
+    batch: usize,
+    seq_len: usize,
+    query_seq_len: usize,
+    position_offset: usize,
+    kv_seq_len: usize,
+    total_sequence_len: usize,
+    kv_position_offset: usize,
+    buf: []u8,
+) []const u8 {
+    if (!cudaMtpReplayContextKeyEnabled()) return base_label;
+    return std.fmt.bufPrint(
+        buf,
+        "{s}|b={d}|seq={d}|q={d}|pos={d}|kv={d}|tot={d}|kvo={d}",
+        .{
+            base_label,
+            batch,
+            seq_len,
+            query_seq_len,
+            position_offset,
+            kv_seq_len,
+            total_sequence_len,
+            kv_position_offset,
+        },
+    ) catch base_label;
+}
+
+fn cudaMtpFinalHiddenReplayEnabled(
+    cb: *const ComputeBackend,
+    config: Config,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    label: []const u8,
+) bool {
+    const assistant_replay = std.mem.indexOf(u8, label, "mtp_assistant") != null;
+    if (assistant_replay) {
+        if (!platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_ASSISTANT_REPLAY", false)) return false;
+    } else {
+        const raw = platform.env.getenv("ANTFLY_GEMMA4_MTP_TARGET_REPLAY") orelse "auto";
+        if (std.mem.eql(u8, raw, "off") or std.mem.eql(u8, raw, "0") or std.mem.eql(u8, raw, "false")) return false;
+    }
+    if (cb.kind() != .cuda) return false;
+    if (config.family != .gemma or config.usesMoe()) return false;
+    if (batch != 1) return false;
+    if (decode_context == null) return false;
+    const temp_slot_period = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD") orelse 0;
+    if (temp_slot_period == 0) return false;
+    const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
+    return cudaMtpReplayRowAllowed(query_seq_len);
+}
+
+fn cudaMtpReplayRowAllowed(rows: usize) bool {
+    if (rows == 0) return false;
+    const raw = platform.env.getenv("ANTFLY_GEMMA4_MTP_REPLAY_VERIFY_ROWS") orelse "1,2,3,4,5";
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t\r\n");
+        if (part.len == 0) continue;
+        const parsed = std.fmt.parseInt(usize, part, 10) catch continue;
+        if (parsed == rows) return true;
+    }
+    return false;
+}
+
+pub fn forwardFinalHiddenTensorFromEmbeddingsWithTrace(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+    trace_sink: ?*ActivationTraceSink,
+) !HiddenTensorResult {
+    return forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesAndTrace(
+        cb,
+        allocator,
+        config,
+        hidden_input,
+        .{},
+        batch,
+        seq_len,
+        decode_context,
+        ple_vectors,
+        trace_sink,
+    );
+}
+
+fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesAndTrace(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    overrides: Layer0DecoderOverrides,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+    trace_sink: ?*ActivationTraceSink,
 ) !HiddenTensorResult {
     const hidden_size = config.hidden_size;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
@@ -976,8 +2423,9 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
         hidden = with_pos;
     }
 
+    try cb.debugCudaTraceTensor("gpt.positioned_input", hidden);
     owns_hidden = false;
-    return forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0Overrides(
+    return forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0OverridesAndTrace(
         cb,
         allocator,
         config,
@@ -987,6 +2435,7 @@ pub fn forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
         seq_len,
         decode_context,
         ple_vectors,
+        trace_sink,
     );
 }
 
@@ -1039,6 +2488,7 @@ pub fn forwardFinalAndPreNormHiddenTensorFromEmbeddingsWithLayer0Overrides(
         decode_context,
         ple_vectors,
         &pre_norm_hidden,
+        null,
     );
     errdefer cb.free(final_result.hidden);
     errdefer cb.free(pre_norm_hidden);
@@ -1084,6 +2534,32 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0Overrides(
     decode_context: ?*const DecodeContext,
     ple_vectors: ?CT,
 ) !HiddenTensorResult {
+    return forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0OverridesAndTrace(
+        cb,
+        allocator,
+        config,
+        hidden_input,
+        overrides,
+        batch,
+        seq_len,
+        decode_context,
+        ple_vectors,
+        null,
+    );
+}
+
+fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0OverridesAndTrace(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    overrides: Layer0DecoderOverrides,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+    trace_sink: ?*ActivationTraceSink,
+) !HiddenTensorResult {
     return forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
         cb,
         allocator,
@@ -1095,6 +2571,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0Overrides(
         decode_context,
         ple_vectors,
         null,
+        trace_sink,
     );
 }
 
@@ -1109,12 +2586,14 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     decode_context: ?*const DecodeContext,
     ple_vectors: ?CT,
     pre_norm_out: ?*CT,
+    trace_sink: ?*ActivationTraceSink,
 ) !HiddenTensorResult {
     const hidden_size = config.hidden_size;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
     const total = batch * query_seq_len;
     var hidden = hidden_input;
     var owns_hidden = true;
+    errdefer if (owns_hidden) cb.free(hidden);
 
     if (config.family == .deepseek_v4 and config.deepseek_v4_hc_mult > 0) {
         return forwardDeepSeekV4FinalHiddenWithStreams(
@@ -1129,12 +2608,20 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
         );
     }
 
-    var layer0_attn_norm_pending = overrides.attn_norm;
-    var layer0_fused_qkv_pending = overrides.fused_qkv;
-    var layer0_q_pending = overrides.q;
-    var layer0_k_pending = overrides.k;
-    var layer0_v_pending = overrides.v;
-    errdefer if (owns_hidden) cb.free(hidden);
+    const effective_overrides = try maybePrepareCudaGemmaDecoderOverrides(
+        cb,
+        allocator,
+        config,
+        overrides,
+        seq_len,
+        decode_context,
+        trace_sink,
+    );
+    var layer0_attn_norm_pending = effective_overrides.attn_norm;
+    var layer0_fused_qkv_pending = effective_overrides.fused_qkv;
+    var layer0_q_pending = effective_overrides.q;
+    var layer0_k_pending = effective_overrides.k;
+    var layer0_v_pending = effective_overrides.v;
     errdefer if (layer0_attn_norm_pending) |override| cb.free(override);
     errdefer if (layer0_fused_qkv_pending) |override| cb.free(override);
     errdefer if (layer0_q_pending) |override| cb.free(override);
@@ -1148,10 +2635,18 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
         hidden = carrier.active();
         owns_hidden = false;
     }
+    try cb.debugCudaTraceTensor("gpt.decoder_input", hidden);
+    if (!isDecodeStep(decode_context)) {
+        try maybeGemma4PromptSnapshotTensor(cb, allocator, config, "input", hidden, hidden_size);
+    }
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "input", null, hidden, hidden_size);
 
     // 3. Decoder blocks
     const eval_stride = decoderLayerEvalStride(config, decode_context);
+    prefetchGemmaCudaLayerWindow(cb, config, 0);
     for (0..config.num_hidden_layers) |layer| {
+        prefetchGemmaCudaLayerWindow(cb, config, layer + 1);
+        const layer_started_at = monotonicNowNs();
         if (prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill) {
             debugPrint("prefill-trace: gpt decoderBlock layer={d} start\n", .{layer});
         }
@@ -1169,12 +2664,13 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
             layer,
             decode_context,
             ple_vectors,
-            overrides,
+            effective_overrides,
             layer0_attn_norm_pending,
             layer0_fused_qkv_pending,
             layer0_q_pending,
             layer0_k_pending,
             layer0_v_pending,
+            trace_sink,
         );
         if (layer == 0) layer0_attn_norm_pending = null;
         if (layer == 0) layer0_fused_qkv_pending = null;
@@ -1207,8 +2703,22 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
         }
         try maybeDebugLayerTensorLastRow(cb, allocator, layer, "out", hidden, hidden_size);
         try maybeDebugLayerTensor(cb, allocator, layer, "out", hidden);
+        if (!isDecodeStep(decode_context)) {
+            try maybeGemma4PromptSnapshotLayer(cb, allocator, config, layer, "out", hidden, hidden_size);
+        }
+        try maybeCaptureActivationTrace(trace_sink, cb, allocator, "out", layer, hidden, hidden_size);
         if (prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill) {
             debugPrint("prefill-trace: gpt decoderBlock layer={d} done\n", .{layer});
+        }
+        if (cudaPrefillProfileEnabled() and cb.kind() == .cuda and ((layer + 1) % cudaPrefillProfileIntervalLayers() == 0 or layer + 1 == config.num_hidden_layers)) {
+            debugPrint("cuda_prefill_layer: layer={d} elapsed_ms={d}\n", .{ layer, (monotonicNowNs() - layer_started_at) / std.time.ns_per_ms });
+            cb.debugProfileCheckpoint("decoder_layer", layer);
+        }
+        if (cudaPrefillStopLayer()) |stop_layer| {
+            if (cb.kind() == .cuda and stop_layer > 0 and layer + 1 >= stop_layer) {
+                if (cudaPrefillProfileEnabled()) cb.debugProfileCheckpoint("stop_layer", layer);
+                return error.CudaPrefillStopLayerReached;
+            }
         }
     }
 
@@ -1220,6 +2730,11 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
         out.* = try cloneTensorMaterialized(cb, allocator, hidden);
         captured_pre_norm = true;
     }
+    if (!isDecodeStep(decode_context)) {
+        try maybeGemma4PromptSnapshotTensor(cb, allocator, config, "pre_final_norm", hidden, hidden_size);
+    }
+    try cb.debugCudaTraceTensor("gpt.pre_final_norm", hidden);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "pre_final_norm", null, hidden, hidden_size);
 
     // 4. Final layer norm
     if (!is_freestanding and prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill) {
@@ -1239,6 +2754,11 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     }
     try maybeDebugTensorLastRow(cb, allocator, "final_norm", hidden, hidden_size);
     try maybeDebugTensor(cb, allocator, "final_norm_full", hidden);
+    if (!isDecodeStep(decode_context)) {
+        try maybeGemma4PromptSnapshotTensor(cb, allocator, config, "final_norm", hidden, hidden_size);
+    }
+    try cb.debugCudaTraceTensor("gpt.final_hidden", hidden);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "final_norm", null, hidden, hidden_size);
 
     return .{
         .hidden = hidden,
@@ -1366,7 +2886,10 @@ pub fn hiddenForwardFromEmbeddingsResidentWithOverrides(
 
     // 3. Decoder blocks
     const eval_stride = decoderLayerEvalStride(config, decode_context);
+    prefetchGemmaCudaLayerWindow(cb, config, 0);
     for (0..config.num_hidden_layers) |layer| {
+        prefetchGemmaCudaLayerWindow(cb, config, layer + 1);
+        const layer_started_at = monotonicNowNs();
         const num_kv_heads = config.effectiveKVHeadsForLayer(layer);
         const head_dim = config.effectiveHeadDimForLayer(layer);
         const new_hidden = try decoderBlock(
@@ -1387,6 +2910,7 @@ pub fn hiddenForwardFromEmbeddingsResidentWithOverrides(
             null,
             null,
             null,
+            null,
         );
         if (new_hidden != hidden) cb.free(hidden);
         hidden = new_hidden;
@@ -1397,6 +2921,16 @@ pub fn hiddenForwardFromEmbeddingsResidentWithOverrides(
         }
         if (shouldEvalDecoderLayer(eval_stride, layer, config.num_hidden_layers)) {
             try cb.evalTensor(hidden);
+        }
+        if (cudaPrefillProfileEnabled() and cb.kind() == .cuda and ((layer + 1) % cudaPrefillProfileIntervalLayers() == 0 or layer + 1 == config.num_hidden_layers)) {
+            debugPrint("cuda_prefill_layer: layer={d} elapsed_ms={d}\n", .{ layer, (monotonicNowNs() - layer_started_at) / std.time.ns_per_ms });
+            cb.debugProfileCheckpoint("decoder_layer", layer);
+        }
+        if (cudaPrefillStopLayer()) |stop_layer| {
+            if (cb.kind() == .cuda and stop_layer > 0 and layer + 1 >= stop_layer) {
+                if (cudaPrefillProfileEnabled()) cb.debugProfileCheckpoint("stop_layer", layer);
+                return error.CudaPrefillStopLayerReached;
+            }
         }
     }
 
@@ -3041,6 +4575,140 @@ fn deepSeekV4AttentionKindUnsupported(config: Config, layer: usize) !void {
     }
 }
 
+fn finishGemmaDenseNoPleFfnTail(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    sa_out: CT,
+    total: usize,
+    hidden_size: usize,
+    layer: usize,
+    ffn_norm_slot: ?usize,
+    mlp_gate_slot: ?usize,
+    mlp_up_slot: ?usize,
+    mlp_down_slot: ?usize,
+    mlp_sub_norm_slot: ?usize,
+    ple_vectors: ?CT,
+    decode_context: ?*const DecodeContext,
+    trace_sink: ?*ActivationTraceSink,
+) !?CT {
+    if (config.family != .gemma or config.usesMoe()) return null;
+    if (config.hasPle() and ple_vectors == null) return null;
+    if (trace_sink != null) return null;
+
+    var name_buf: [256]u8 = undefined;
+    defer cb.free(sa_out);
+    try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-residual", sa_out, hidden_size);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "attn_residual", layer, sa_out, hidden_size);
+
+    const ffn_normed = if (ffn_norm_slot) |slot| blk: {
+        const raw_norm = try cb.decoderRuntimeApplyRmsNorm(&.{
+            .slot = slot,
+            .input = sa_out,
+            .hidden_size = hidden_size,
+            .eps = config.norm_eps,
+        });
+        break :blk raw_norm orelse try applyGemmaFfnPreNorm(cb, allocator, config, sa_out, layer, &name_buf);
+    } else try applyGemmaFfnPreNorm(cb, allocator, config, sa_out, layer, &name_buf);
+    defer cb.free(ffn_normed);
+    try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-norm", ffn_normed, hidden_size);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_norm", layer, ffn_normed, hidden_size);
+
+    const ffn_started_at = monotonicNowNs();
+    if (!disableDecoderRuntimeActivationDebug() and mlp_gate_slot != null and mlp_up_slot != null and mlp_down_slot != null and mlp_sub_norm_slot != null) {
+        const ffn_output_scale = if (config.hasPle() or branchGemma4LayerOutputScaleDebug())
+            null
+        else
+            try getLayerOutputScaleWeight(cb, config, layer);
+        defer if (ffn_output_scale) |scale| cb.free(scale);
+        if (try cb.runGatedFfnResidual(&.{
+            .gate_linear_slot = mlp_gate_slot.?,
+            .up_linear_slot = mlp_up_slot.?,
+            .down_linear_slot = mlp_down_slot.?,
+            .input = ffn_normed,
+            .residual = sa_out,
+            .post_down_rms_norm_slot = mlp_sub_norm_slot,
+            .output_scale = ffn_output_scale,
+            .hidden_size = hidden_size,
+            .intermediate_size = config.intermediateSize(layer),
+            .eps = config.norm_eps,
+            .activation = decoderRuntimeActivationKind(config.activation),
+        })) |ffn_residual| {
+            debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - ffn_started_at);
+            try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-residual", ffn_residual, hidden_size);
+            try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_residual", layer, ffn_residual, hidden_size);
+
+            var layer_result = ffn_residual;
+            var layer_result_output_scaled = ffn_output_scale != null;
+            if (config.hasPle()) {
+                const ple = ple_vectors.?;
+                const output_scale = try getLayerOutputScaleWeight(cb, config, layer);
+                defer if (output_scale) |scale| cb.free(scale);
+                const ple_result = try applyPle(cb, allocator, config, layer_result, ple, total, layer, output_scale, &name_buf);
+                layer_result_output_scaled = output_scale != null;
+                cb.free(layer_result);
+                layer_result = ple_result;
+            }
+
+            const scaled = if (branchGemma4LayerOutputScaleDebug() or layer_result_output_scaled)
+                layer_result
+            else
+                try applyLayerOutputScale(cb, allocator, config, layer_result, total, hidden_size, layer);
+            try maybeDumpGatedLayerStageStats(cb, allocator, layer, "output-scale", scaled, hidden_size);
+            try maybeCaptureActivationTrace(trace_sink, cb, allocator, "output_scale", layer, scaled, hidden_size);
+            try dumpLayerLastRowStats(cb, allocator, layer, scaled, hidden_size);
+            return scaled;
+        }
+    }
+
+    const ffn_out_raw = try feedForward(cb, allocator, config, ffn_normed, total, layer, &name_buf, decode_context);
+    defer cb.free(ffn_out_raw);
+    try maybeDebugLayerTensorLastRow(cb, allocator, layer, "ffn_raw", ffn_out_raw, hidden_size);
+    try maybeDebugLayerTensor(cb, allocator, layer, "ffn_raw", ffn_out_raw);
+    try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-raw", ffn_out_raw, hidden_size);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_raw", layer, ffn_out_raw, hidden_size);
+    debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - ffn_started_at);
+
+    const ffn_residual = residual_blk: {
+        if (allowGemmaRmsNormAddResidualFusion(trace_sink) and (config.hasPle() or !branchGemma4LayerOutputScaleDebug())) {
+            if (try applyGemmaFfnPostNormResidual(cb, allocator, config, ffn_out_raw, sa_out, layer, &name_buf)) |fused| {
+                break :residual_blk fused;
+            }
+        }
+        const ffn_out = try applyGemmaFfnPostNorm(cb, allocator, config, ffn_out_raw, layer, &name_buf);
+        defer if (ffn_out != ffn_out_raw) cb.free(ffn_out);
+        try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-post", ffn_out, hidden_size);
+        try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_post", layer, ffn_out, hidden_size);
+        if (config.hasPle() or !branchGemma4LayerOutputScaleDebug()) {
+            break :residual_blk try cb.add(ffn_out, sa_out);
+        }
+        break :residual_blk try addLayerOutputScaledBranch(cb, allocator, config, ffn_out, sa_out, total, hidden_size, layer);
+    };
+    try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-residual", ffn_residual, hidden_size);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_residual", layer, ffn_residual, hidden_size);
+
+    var layer_result = ffn_residual;
+    var layer_result_output_scaled = false;
+    if (config.hasPle()) {
+        const ple = ple_vectors.?;
+        const output_scale = try getLayerOutputScaleWeight(cb, config, layer);
+        defer if (output_scale) |scale| cb.free(scale);
+        const ple_result = try applyPle(cb, allocator, config, layer_result, ple, total, layer, output_scale, &name_buf);
+        layer_result_output_scaled = output_scale != null;
+        cb.free(layer_result);
+        layer_result = ple_result;
+    }
+
+    const scaled = if (branchGemma4LayerOutputScaleDebug() or layer_result_output_scaled)
+        layer_result
+    else
+        try applyLayerOutputScale(cb, allocator, config, layer_result, total, hidden_size, layer);
+    try maybeDumpGatedLayerStageStats(cb, allocator, layer, "output-scale", scaled, hidden_size);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "output_scale", layer, scaled, hidden_size);
+    try dumpLayerLastRowStats(cb, allocator, layer, scaled, hidden_size);
+    return scaled;
+}
+
 fn decoderBlock(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -3059,6 +4727,7 @@ fn decoderBlock(
     layer0_q_override: ?CT,
     layer0_k_override: ?CT,
     layer0_v_override: ?CT,
+    trace_sink: ?*ActivationTraceSink,
 ) !CT {
     const attn_started_at = monotonicNowNs();
     const hidden_size = config.hidden_size;
@@ -3124,6 +4793,7 @@ fn decoderBlock(
     try maybeDebugLayerTensorLastRow(cb, allocator, layer, "attn_norm", normed, hidden_size);
     try maybeDebugLayerTensor(cb, allocator, layer, "attn_norm", normed);
     try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-norm", normed, hidden_size);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "attn_norm", layer, normed, hidden_size);
     if (prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill and layer == 0) {
         debugPrint("prefill-trace: gpt layer0 attn norm done\n", .{});
     }
@@ -3168,6 +4838,18 @@ fn decoderBlock(
 
     const shares_kv = config.layerSharesKv(layer) and !disableSharedKvDebug();
     const kv_layer_index = if (shares_kv) config.kvDonorLayerIndex(layer).? else layer;
+    if (config.gemma4_mtp_assistant and traceGemma4MtpDonorDebug()) {
+        const mode_name = if (decode_context) |ctx| @tagName(ctx.attention_mode) else "none";
+        const total_sequence_len = if (decode_context) |ctx| ctx.total_sequence_len else seq_len;
+        const query_sequence_len = if (decode_context) |ctx| ctx.query_sequence_len else query_seq_len;
+        const kv_sequence_len = if (decode_context) |ctx| ctx.kv_sequence_len else seq_len;
+        const has_kv_cache = if (decode_context) |ctx| ctx.kv_cache != null else false;
+        const has_kv_storage = if (decode_context) |ctx| ctx.kv_storage != null else false;
+        std.debug.print(
+            "gemma4_mtp_donor: layer={d} sliding={} shares_kv={} donor={d} mode={s} total={d} query={d} kv={d} has_kv_cache={} has_kv_storage={}\n",
+            .{ layer, config.layerUsesSlidingAttention(layer), shares_kv, kv_layer_index, mode_name, total_sequence_len, query_sequence_len, kv_sequence_len, has_kv_cache, has_kv_storage },
+        );
+    }
 
     // Shared KV layers read K/V from their donor layer's cache — create placeholder zeros.
     const kv_dim: usize = @as(usize, num_kv_heads) * head_dim;
@@ -3176,11 +4858,35 @@ fn decoderBlock(
         config.family != .qwen3 and config.family != .qwen3_5 and
         attn_q_slot != null and attn_k_slot != null and attn_v_slot != null and
         attn_out_proj_linear_slot != null and mlp_gate_slot != null and
-        mlp_up_slot != null and mlp_down_slot != null)
+        mlp_up_slot != null and mlp_down_slot != null and
+        (!config.hasPle() or cb.kind() != .cuda or platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_GATED_BLOCK")))
     {
         if (prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill and layer == 0) {
             debugPrint("prefill-trace: gpt layer0 gated block attempt input path\n", .{});
         }
+        var block_ple_input: ?CT = null;
+        defer if (block_ple_input) |ple_ct| cb.free(ple_ct);
+        var block_output_scale: ?CT = null;
+        defer if (block_output_scale) |scale| cb.free(scale);
+        if (config.family == .gemma and config.hasPle()) {
+            if (ple_vectors) |ple| {
+                const ple_dim: usize = config.ple_hidden_size;
+                const ple_offset = layer * ple_dim;
+                block_ple_input = try cb.sliceLastDim(ple, ple_offset, ple_offset + ple_dim);
+                block_output_scale = try getLayerOutputScaleWeight(cb, config, layer);
+            }
+        }
+        const block_rope_active_dim = if (config.family == .gemma and config.position_encoding == .rope)
+            config.layerRopeActiveDim(layer)
+        else
+            0;
+        const block_rope_theta = if (block_rope_active_dim != 0) theta_blk: {
+            const base_theta = config.layerRopeTheta(layer);
+            const freq_dim: f32 = @floatFromInt(config.layerRopeFrequencyDim(layer));
+            const active_dim: f32 = @floatFromInt(block_rope_active_dim);
+            if (active_dim < freq_dim) break :theta_blk std.math.pow(f32, base_theta, active_dim / freq_dim);
+            break :theta_blk base_theta;
+        } else 10000.0;
         const block_started_at = monotonicNowNs();
         debug_timing_stats.gated_block_attempts += 1;
         debug_timing_stats.gated_block_input_attempts += 1;
@@ -3201,17 +4907,27 @@ fn decoderBlock(
             .q_linear_slot = attn_q_slot.?,
             .k_linear_slot = attn_k_slot.?,
             .v_linear_slot = attn_v_slot.?,
+            .rope_active_dim = block_rope_active_dim,
+            .rope_theta = block_rope_theta,
+            .rope_freq_scale = config.rope_freq_scale,
+            .rope_consecutive_pairs = config.rope_layout == .consecutive_pairs,
+            .global_head_dim = config.global_head_dim,
             .attention_linear_slot = attn_out_proj_linear_slot.?,
+            .attention_post_linear_rms_norm_slot = if (config.family == .gemma) attn_sub_norm_slot else null,
             .hidden_size = hidden_size,
             .eps = config.norm_eps,
             .ffn_layer_norm_slot = if (config.norm_type == .layer_norm) ffn_norm_slot.? else null,
             .ffn_rms_norm_slot = if (config.norm_type == .rms_norm) ffn_norm_slot.? else null,
             .ffn_post_gate_rms_norm_slot = if (config.family == .bitnet) mlp_sub_norm_slot else null,
+            .ffn_post_down_rms_norm_slot = if (config.family == .gemma) mlp_sub_norm_slot else null,
             .gate_ffn_linear_slot = mlp_gate_slot.?,
             .up_ffn_linear_slot = mlp_up_slot.?,
             .down_ffn_linear_slot = mlp_down_slot.?,
             .intermediate_size = config.intermediateSize(layer),
             .activation = decoderRuntimeActivationKind(config.activation),
+            .ple = block_ple_input,
+            .ple_hidden_size = if (block_ple_input != null) config.ple_hidden_size else 0,
+            .output_scale = block_output_scale,
             .graph_plan_tail_vocab_size = config.vocab_size,
         })) |block_out| {
             debug_timing_stats.gated_block_successes += 1;
@@ -3318,6 +5034,36 @@ fn decoderBlock(
         break :blk .{ .q = layer0_q_override.?, .k = layer0_k_override.?, .v = layer0_v_override.? };
     } else blk: {
         const q_projection_dim: usize = if (config.family == .qwen3_5 and config.qwen35_attn_output_gate) q_dim * 2 else q_dim;
+        if (config.family == .gemma and !shares_kv and !config.layerOmitsVProj(layer) and
+            q_projection_dim == q_dim and attn_q_slot != null and attn_k_slot != null and attn_v_slot != null)
+        {
+            if (try cb.decoderRuntimeApplyLinearQkv(&.{
+                .q_slot = attn_q_slot.?,
+                .k_slot = attn_k_slot.?,
+                .v_slot = attn_v_slot.?,
+                .input = normed,
+                .in_dim = hidden_size,
+                .q_out_dim = q_dim,
+                .kv_out_dim = kv_dim,
+            })) |qkv| {
+                break :blk .{ .q = qkv.first, .k = qkv.second, .v = qkv.third };
+            }
+        }
+        if (cb.kind() == .cuda and config.family == .gemma and !shares_kv and !config.layerOmitsVProj(layer) and q_projection_dim == q_dim) {
+            const q_name = std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.q_proj.weight", .{layer}) catch return error.NameTooLong;
+            const q_w = try getModelWeight(cb, config, q_name);
+            defer cb.free(q_w);
+            var k_name_buf: [256]u8 = undefined;
+            const k_name = std.fmt.bufPrint(&k_name_buf, "model.layers.{d}.self_attn.k_proj.weight", .{layer}) catch return error.NameTooLong;
+            const k_w = try getModelWeight(cb, config, k_name);
+            defer cb.free(k_w);
+            var v_name_buf: [256]u8 = undefined;
+            const v_name = std.fmt.bufPrint(&v_name_buf, "model.layers.{d}.self_attn.v_proj.weight", .{layer}) catch return error.NameTooLong;
+            const v_w = try getModelWeight(cb, config, v_name);
+            defer cb.free(v_w);
+            const qkv = try cb.linearNoBiasQkv(normed, q_w, k_w, v_w, total, hidden_size, q_dim, kv_dim);
+            break :blk .{ .q = qkv.first, .k = qkv.second, .v = qkv.third };
+        }
         const q_projected = if (attn_q_slot != null)
             (try cb.decoderRuntimeApplyLinear(&.{
                 .slot = attn_q_slot.?,
@@ -3362,6 +5108,19 @@ fn decoderBlock(
                 .out_dim = num_kv_heads * head_dim,
             })) orelse try attnProjectPair(cb, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", &name_buf);
             break :blk_kv .{ kv.first, false, kv.second };
+        } else if (config.family == .gemma and !config.layerOmitsVProj(layer)) blk_kv: {
+            if (attn_k_slot != null and attn_v_slot != null) {
+                const kv = (try cb.decoderRuntimeApplyLinearPair(&.{
+                    .slot_a = attn_k_slot.?,
+                    .slot_b = attn_v_slot.?,
+                    .input = normed,
+                    .in_dim = hidden_size,
+                    .out_dim = num_kv_heads * head_dim,
+                })) orelse try attnProjectPair(cb, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", &name_buf);
+                break :blk_kv .{ kv.first, false, kv.second };
+            }
+            const kv = try attnProjectPair(cb, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", &name_buf);
+            break :blk_kv .{ kv.first, false, kv.second };
         } else if (config.family == .bitnet) blk_kv: {
             const kv = try attnProjectPair(cb, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", &name_buf);
             break :blk_kv .{ kv.first, false, kv.second };
@@ -3395,6 +5154,15 @@ fn decoderBlock(
     const V_normed = blk: {
         if (config.global_head_dim == 0 or shares_kv) break :blk V; // Not Gemma 4 or shared KV
         const v_dim: usize = head_dim;
+        if (try cb.reshape2d(V, total * num_kv_heads, v_dim)) |reshaped| {
+            defer cb.free(reshaped);
+            if (try cb.rmsNormBare(reshaped, v_dim, config.norm_eps)) |normed_flat| {
+                defer cb.free(normed_flat);
+                const result = try reshape2dOwned(cb, allocator, normed_flat, total, kv_dim);
+                if (!v_omitted) cb.free(V); // V = K when omitted, don't double-free
+                break :blk result;
+            }
+        }
         // Create ones weight for bare RMS norm.
         const ones = try allocator.alloc(f32, v_dim);
         defer allocator.free(ones);
@@ -3408,7 +5176,7 @@ fn decoderBlock(
             defer cb.free(reshaped);
             const normed_flat = try cb.rmsNorm(reshaped, ones_ct, v_dim, config.norm_eps);
             defer cb.free(normed_flat);
-            const result = (try cb.reshape2d(normed_flat, total, kv_dim)) orelse return error.ReshapeFailed;
+            const result = try reshape2dOwned(cb, allocator, normed_flat, total, kv_dim);
             if (!v_omitted) cb.free(V); // V = K when omitted, don't double-free
             break :blk result;
         }
@@ -3425,15 +5193,48 @@ fn decoderBlock(
     try maybeDebugLayerTensor(cb, allocator, layer, "q", Q);
     try maybeDebugLayerTensor(cb, allocator, layer, "k", K);
     try maybeDebugLayerTensor(cb, allocator, layer, "v", V_normed);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "q_raw", layer, Q, num_heads * head_dim);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "k_raw", layer, K, num_kv_heads * head_dim);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "v_norm", layer, V_normed, num_kv_heads * head_dim);
 
-    const Q_attn = if (try maybeApplyQKHeadNorm(cb, allocator, config, Q, total, num_heads * head_dim, layer, "q", head_dim, &name_buf)) |normed_q|
+    var qk_already_roped = false;
+    var fused_q_rope: ?CT = null;
+    var fused_k_rope: ?CT = null;
+    if (!shares_kv and config.family == .gemma and config.position_encoding == .rope and batch == 1) fused_blk: {
+        const rope_dim = config.layerRopeActiveDim(layer);
+        const rope_theta = blk: {
+            const base_theta = config.layerRopeTheta(layer);
+            const freq_dim: f32 = @floatFromInt(config.layerRopeFrequencyDim(layer));
+            const active_dim: f32 = @floatFromInt(rope_dim);
+            if (active_dim < freq_dim) break :blk std.math.pow(f32, base_theta, active_dim / freq_dim);
+            break :blk base_theta;
+        };
+        const offset = positionOffset(seq_len, total, decode_context);
+        const consecutive_pairs = config.rope_layout == .consecutive_pairs;
+        const q_scale = if (config.global_head_dim != 0) @sqrt(@as(f32, @floatFromInt(head_dim))) else 1.0;
+        fused_q_rope = try maybeApplyQKHeadNormRope(cb, allocator, config, Q, total, num_heads * head_dim, layer, "q", head_dim, rope_dim, rope_theta, config.rope_freq_scale, offset, total, consecutive_pairs, q_scale, &name_buf);
+        if (fused_q_rope == null) break :fused_blk;
+        fused_k_rope = try maybeApplyQKHeadNormRope(cb, allocator, config, K, total, num_kv_heads * head_dim, layer, "k", head_dim, rope_dim, rope_theta, config.rope_freq_scale, offset, total, consecutive_pairs, 1.0, &name_buf);
+        if (fused_k_rope == null) {
+            if (fused_q_rope) |tensor| cb.free(tensor);
+            fused_q_rope = null;
+            break :fused_blk;
+        }
+        qk_already_roped = true;
+    }
+
+    const Q_attn = if (fused_q_rope) |roped_q|
+        roped_q
+    else if (try maybeApplyQKHeadNorm(cb, allocator, config, Q, total, num_heads * head_dim, layer, "q", head_dim, &name_buf)) |normed_q|
         normed_q
     else
         Q;
     defer if (Q_attn != Q) cb.free(Q_attn);
 
     // Shared KV layers skip K head norm (K is read from the donor layer's cache).
-    const K_attn = if (!shares_kv)
+    const K_attn = if (fused_k_rope) |roped_k|
+        roped_k
+    else if (!shares_kv)
         if (try maybeApplyQKHeadNorm(cb, allocator, config, K, total, num_kv_heads * head_dim, layer, "k", head_dim, &name_buf)) |normed_k|
             normed_k
         else
@@ -3446,8 +5247,9 @@ fn decoderBlock(
     // but the backend always computes attention as QK^T / sqrt(head_dim).
     // Pre-scale Q by sqrt(head_dim) to cancel the backend's division.
     const Q_for_attn = blk: {
-        if (config.global_head_dim == 0) break :blk Q_attn; // Not Gemma 4
+        if (!shouldScaleGemma4QBeforeAttention(config, qk_already_roped)) break :blk Q_attn;
         const scale = @sqrt(@as(f32, @floatFromInt(head_dim)));
+        if (try cb.multiplyScalar(Q_attn, scale)) |scaled| break :blk scaled;
         if (cb.vtable.reshape2d != null) {
             // GPU path: scalar broadcast multiply avoids GPU→CPU sync.
             const scale_shape = [_]i32{1};
@@ -3466,6 +5268,9 @@ fn decoderBlock(
     try maybeDumpGatedLayerStageStats(cb, allocator, layer, "q", Q_for_attn, num_heads * head_dim);
     try maybeDumpGatedLayerStageStats(cb, allocator, layer, "k", K_attn, num_kv_heads * head_dim);
     try maybeDumpGatedLayerStageStats(cb, allocator, layer, "v", V_normed, num_kv_heads * head_dim);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "q_attn", layer, Q_for_attn, num_heads * head_dim);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "k_attn", layer, K_attn, num_kv_heads * head_dim);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "v_attn", layer, V_normed, num_kv_heads * head_dim);
     debug_timing_stats.attention_qkv_nanos += @intCast(monotonicNowNs() - attn_qkv_started_at);
 
     if (!disableDecoderRuntimeActivationDebug() and attn_out_proj_linear_slot != null and ffn_norm_slot != null) {
@@ -3557,7 +5362,83 @@ fn decoderBlock(
     }
 
     const attn_res = blk: {
-        if (attn_out_proj_linear_slot != null and config.family != .qwen3_5) {
+        if (attn_out_proj_linear_slot != null and config.family == .gemma and
+            attn_sub_norm_slot != null and !config.usesMoe() and
+            (!config.hasPle() or ple_vectors != null) and allowGemmaRmsNormAddResidualFusion(trace_sink))
+        {
+            const fused_attn_started_at = monotonicNowNs();
+            const fused_sa_out = if (qk_already_roped)
+                try applyPreparedAttentionResidual(
+                    cb,
+                    config,
+                    Q_for_attn,
+                    K_attn,
+                    V_normed,
+                    hidden,
+                    batch,
+                    seq_len,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    hidden_size,
+                    layer,
+                    kv_layer_index,
+                    shares_kv,
+                    attn_out_proj_linear_slot.?,
+                    null,
+                    attn_sub_norm_slot,
+                    decode_context,
+                )
+            else
+                try applyAttentionResidual(
+                    cb,
+                    config,
+                    Q_for_attn,
+                    K_attn,
+                    V_normed,
+                    hidden,
+                    batch,
+                    seq_len,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    hidden_size,
+                    layer,
+                    kv_layer_index,
+                    shares_kv,
+                    attn_out_proj_linear_slot.?,
+                    null,
+                    attn_sub_norm_slot,
+                    decode_context,
+                );
+            if (fused_sa_out) |sa_out| {
+                const fused_attn_elapsed = monotonicNowNs() - fused_attn_started_at;
+                debug_timing_stats.attention_nanos += @intCast(monotonicNowNs() - attn_started_at);
+                debug_timing_stats.attention_core_nanos += @intCast(fused_attn_elapsed);
+                if (try finishGemmaDenseNoPleFfnTail(
+                    cb,
+                    allocator,
+                    config,
+                    sa_out,
+                    total,
+                    hidden_size,
+                    layer,
+                    ffn_norm_slot,
+                    mlp_gate_slot,
+                    mlp_up_slot,
+                    mlp_down_slot,
+                    mlp_sub_norm_slot,
+                    ple_vectors,
+                    decode_context,
+                    trace_sink,
+                )) |layer_out| {
+                    return layer_out;
+                }
+                cb.free(sa_out);
+            }
+        }
+
+        if (!qk_already_roped and attn_out_proj_linear_slot != null and config.family != .qwen3_5 and config.family != .gemma) {
             const fused_attn_started_at = monotonicNowNs();
             if (try applyAttentionResidual(
                 cb,
@@ -3588,7 +5469,10 @@ fn decoderBlock(
 
         // Attention (with optional RoPE)
         const attn_core_started_at = monotonicNowNs();
-        const attn_out = try applyAttention(cb, config, Q_for_attn, K_attn, V_normed, batch, seq_len, num_heads, num_kv_heads, head_dim, layer, kv_layer_index, shares_kv, decode_context);
+        const attn_out = if (qk_already_roped)
+            try applyPreparedAttention(cb, config, Q_for_attn, K_attn, V_normed, batch, seq_len, num_heads, num_kv_heads, head_dim, layer, kv_layer_index, shares_kv, decode_context)
+        else
+            try applyAttention(cb, config, Q_for_attn, K_attn, V_normed, batch, seq_len, num_heads, num_kv_heads, head_dim, layer, kv_layer_index, shares_kv, decode_context);
         defer cb.free(attn_out);
         debug_timing_stats.attention_core_nanos += @intCast(monotonicNowNs() - attn_core_started_at);
         const gated_attn_out = if (q_gate) |gate| blk_gate: {
@@ -3600,6 +5484,7 @@ fn decoderBlock(
         try maybeDebugLayerTensorLastRow(cb, allocator, layer, "attn_out", gated_attn_out, num_heads * head_dim);
         try maybeDebugLayerTensor(cb, allocator, layer, "attn_out", gated_attn_out);
         try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-out", gated_attn_out, num_heads * head_dim);
+        try maybeCaptureActivationTrace(trace_sink, cb, allocator, "attn_out", layer, gated_attn_out, num_heads * head_dim);
 
         const attn_proj_input = if (config.family == .bitnet)
             if (attn_sub_norm_slot != null)
@@ -3631,15 +5516,25 @@ fn decoderBlock(
         try maybeDebugLayerTensorLastRow(cb, allocator, layer, "attn_proj", proj, hidden_size);
         try maybeDebugLayerTensor(cb, allocator, layer, "attn_proj", proj);
         try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-proj", proj, hidden_size);
+        try maybeCaptureActivationTrace(trace_sink, cb, allocator, "attn_proj", layer, proj, hidden_size);
         debug_timing_stats.attention_nanos += @intCast(monotonicNowNs() - attn_started_at);
 
         if (config.family == .gemma) {
-            const attn_post = try applyGemmaPostAttentionNorm(cb, allocator, config, proj, layer, &name_buf);
-            defer if (attn_post != proj) cb.free(attn_post);
-            try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-post", attn_post, hidden_size);
+            const sa_out = blk_sa_out: {
+                if (allowGemmaRmsNormAddResidualFusion(trace_sink)) {
+                    if (try applyGemmaPostAttentionNormResidual(cb, allocator, config, proj, hidden, layer, &name_buf)) |fused| {
+                        break :blk_sa_out fused;
+                    }
+                }
 
-            const sa_out = try cb.add(attn_post, hidden);
+                const attn_post = try applyGemmaPostAttentionNorm(cb, allocator, config, proj, layer, &name_buf);
+                defer if (attn_post != proj) cb.free(attn_post);
+                try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-post", attn_post, hidden_size);
+                try maybeCaptureActivationTrace(trace_sink, cb, allocator, "attn_post", layer, attn_post, hidden_size);
+                break :blk_sa_out try cb.add(attn_post, hidden);
+            };
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-residual", sa_out, hidden_size);
+            try maybeCaptureActivationTrace(trace_sink, cb, allocator, "attn_residual", layer, sa_out, hidden_size);
 
             if (config.usesMoe() and config.hasSharedExpert()) {
                 // Gemma 4 three-sublayer block: attention → shared expert FFN → MoE routed experts.
@@ -3681,17 +5576,26 @@ fn decoderBlock(
                 const combined_normed = try applyGemmaFfnPostNorm(cb, allocator, config, combined, layer, &name_buf);
                 defer if (combined_normed != combined) cb.free(combined_normed);
                 debug_timing_stats.norm_nanos += @intCast(monotonicNowNs() - norm_started_at);
-                var layer_result = try cb.add(combined_normed, sa_out);
+
+                var layer_result_output_scaled = false;
+                const use_branch_output_scale = config.family == .gemma and branchGemma4LayerOutputScaleDebug();
+                var layer_result = if (config.hasPle() or !use_branch_output_scale)
+                    try cb.add(combined_normed, sa_out)
+                else
+                    try addLayerOutputScaledBranch(cb, allocator, config, combined_normed, sa_out, total, hidden_size, layer);
                 cb.free(sa_out);
 
                 if (config.hasPle()) {
                     if (ple_vectors) |ple| {
-                        const ple_result = try applyPle(cb, allocator, config, layer_result, ple, total, layer, &name_buf);
+                        const output_scale = try getLayerOutputScaleWeight(cb, config, layer);
+                        defer if (output_scale) |scale| cb.free(scale);
+                        const ple_result = try applyPle(cb, allocator, config, layer_result, ple, total, layer, output_scale, &name_buf);
+                        layer_result_output_scaled = output_scale != null;
                         cb.free(layer_result);
                         layer_result = ple_result;
                     }
                 }
-                const scaled = try applyLayerOutputScale(cb, allocator, config, layer_result, total, hidden_size, layer);
+                const scaled = if (layer_result_output_scaled or (!config.hasPle() and use_branch_output_scale)) layer_result else try applyLayerOutputScale(cb, allocator, config, layer_result, total, hidden_size, layer);
                 try dumpLayerLastRowStats(cb, allocator, layer, scaled, hidden_size);
                 return scaled;
             }
@@ -3699,34 +5603,89 @@ fn decoderBlock(
             const ffn_normed = try applyGemmaFfnPreNorm(cb, allocator, config, sa_out, layer, &name_buf);
             defer cb.free(ffn_normed);
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-norm", ffn_normed, hidden_size);
+            try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_norm", layer, ffn_normed, hidden_size);
 
-            const ffn_started_at = monotonicNowNs();
-            const ffn_out_raw = try feedForward(cb, allocator, config, ffn_normed, total, layer, &name_buf, decode_context);
-            defer cb.free(ffn_out_raw);
-            try maybeDebugLayerTensorLastRow(cb, allocator, layer, "ffn_raw", ffn_out_raw, hidden_size);
-            try maybeDebugLayerTensor(cb, allocator, layer, "ffn_raw", ffn_out_raw);
-            try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-raw", ffn_out_raw, hidden_size);
-            debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - ffn_started_at);
+            var layer_result_output_scaled = false;
+            const ffn_residual = residual_blk: {
+                const ffn_started_at = monotonicNowNs();
+                if (allowGemmaRmsNormAddResidualFusion(trace_sink) and
+                    !disableDecoderRuntimeActivationDebug() and
+                    (config.hasPle() or !branchGemma4LayerOutputScaleDebug()) and
+                    mlp_gate_slot != null and mlp_up_slot != null and mlp_down_slot != null)
+                {
+                    if (try cb.runGatedFfnResidual(&.{
+                        .gate_linear_slot = mlp_gate_slot.?,
+                        .up_linear_slot = mlp_up_slot.?,
+                        .down_linear_slot = mlp_down_slot.?,
+                        .input = ffn_normed,
+                        .residual = sa_out,
+                        .post_down_rms_norm_slot = mlp_sub_norm_slot,
+                        .hidden_size = hidden_size,
+                        .intermediate_size = config.intermediateSize(layer),
+                        .eps = config.norm_eps,
+                        .activation = decoderRuntimeActivationKind(config.activation),
+                    })) |fused| {
+                        debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - ffn_started_at);
+                        break :residual_blk fused;
+                    }
+                }
 
-            const ffn_out = try applyGemmaFfnPostNorm(cb, allocator, config, ffn_out_raw, layer, &name_buf);
-            defer if (ffn_out != ffn_out_raw) cb.free(ffn_out);
-            try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-post", ffn_out, hidden_size);
+                const ffn_out_raw = try feedForward(cb, allocator, config, ffn_normed, total, layer, &name_buf, decode_context);
+                defer cb.free(ffn_out_raw);
+                try maybeDebugLayerTensorLastRow(cb, allocator, layer, "ffn_raw", ffn_out_raw, hidden_size);
+                try maybeDebugLayerTensor(cb, allocator, layer, "ffn_raw", ffn_out_raw);
+                try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-raw", ffn_out_raw, hidden_size);
+                try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_raw", layer, ffn_out_raw, hidden_size);
+                debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - ffn_started_at);
 
-            const ffn_residual = try cb.add(ffn_out, sa_out);
+                if (ple_vectors == null) {
+                    if (allowGemmaRmsNormAddResidualFusion(trace_sink) and (config.hasPle() or !branchGemma4LayerOutputScaleDebug())) {
+                        if (try applyGemmaFfnPostNormResidual(cb, allocator, config, ffn_out_raw, sa_out, layer, &name_buf)) |fused| {
+                            break :residual_blk fused;
+                        }
+                    }
+                    const ffn_out = try applyGemmaFfnPostNorm(cb, allocator, config, ffn_out_raw, layer, &name_buf);
+                    defer if (ffn_out != ffn_out_raw) cb.free(ffn_out);
+                    try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-post", ffn_out, hidden_size);
+                    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_post", layer, ffn_out, hidden_size);
+                    if (config.hasPle() or !branchGemma4LayerOutputScaleDebug()) {
+                        break :residual_blk try cb.add(ffn_out, sa_out);
+                    }
+                    break :residual_blk try addLayerOutputScaledBranch(cb, allocator, config, ffn_out, sa_out, total, hidden_size, layer);
+                }
+
+                if (allowGemmaRmsNormAddResidualFusion(trace_sink)) {
+                    if (try applyGemmaFfnPostNormResidual(cb, allocator, config, ffn_out_raw, sa_out, layer, &name_buf)) |fused| {
+                        break :residual_blk fused;
+                    }
+                }
+
+                const ffn_out = try applyGemmaFfnPostNorm(cb, allocator, config, ffn_out_raw, layer, &name_buf);
+                defer if (ffn_out != ffn_out_raw) cb.free(ffn_out);
+                try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-post", ffn_out, hidden_size);
+                try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_post", layer, ffn_out, hidden_size);
+                break :residual_blk try cb.add(ffn_out, sa_out);
+            };
             cb.free(sa_out);
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-residual", ffn_residual, hidden_size);
+            try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_residual", layer, ffn_residual, hidden_size);
 
             var layer_result = ffn_residual;
             if (config.hasPle()) {
                 if (ple_vectors) |ple| {
-                    const ple_result = try applyPle(cb, allocator, config, ffn_residual, ple, total, layer, &name_buf);
+                    const output_scale = try getLayerOutputScaleWeight(cb, config, layer);
+                    defer if (output_scale) |scale| cb.free(scale);
+                    const ple_result = try applyPle(cb, allocator, config, ffn_residual, ple, total, layer, output_scale, &name_buf);
+                    layer_result_output_scaled = output_scale != null;
                     cb.free(ffn_residual);
                     layer_result = ple_result;
                 }
             }
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ple", layer_result, hidden_size);
-            const scaled = try applyLayerOutputScale(cb, allocator, config, layer_result, total, hidden_size, layer);
+            try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ple", layer, layer_result, hidden_size);
+            const scaled = if (layer_result_output_scaled or (!config.hasPle() and branchGemma4LayerOutputScaleDebug())) layer_result else try applyLayerOutputScale(cb, allocator, config, layer_result, total, hidden_size, layer);
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "output-scale", scaled, hidden_size);
+            try maybeCaptureActivationTrace(trace_sink, cb, allocator, "output_scale", layer, scaled, hidden_size);
             try dumpLayerLastRowStats(cb, allocator, layer, scaled, hidden_size);
             return scaled;
         }
@@ -3815,7 +5774,7 @@ fn decoderBlock(
         else => false,
     }) blk: {
         const inter_size = config.intermediateSize(layer);
-        if (!disableDecoderRuntimeActivationDebug()) {
+        if (!disableDecoderRuntimeActivationDebug() and (config.family != .gemma or mlp_sub_norm_slot != null)) {
             if (try cb.runGatedFfnResidual(&.{
                 .gate_linear_slot = mlp_gate_slot.?,
                 .up_linear_slot = mlp_up_slot.?,
@@ -3872,6 +5831,7 @@ fn decoderBlock(
     defer if (free_ffn_out) cb.free(ffn_out);
     try maybeDebugLayerTensorLastRow(cb, allocator, layer, "ffn_out", ffn_out, hidden_size);
     try maybeDebugLayerTensor(cb, allocator, layer, "ffn_out", ffn_out);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_out", layer, ffn_out, hidden_size);
     debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - ffn_started_at);
 
     // Residual
@@ -3882,6 +5842,7 @@ fn decoderBlock(
     cb.free(attn_res);
 
     try dumpLayerLastRowStats(cb, allocator, layer, result, hidden_size);
+    try maybeCaptureActivationTrace(trace_sink, cb, allocator, "result", layer, result, hidden_size);
     return result;
 }
 
@@ -3911,6 +5872,7 @@ pub fn debugDecoderBlockNoOverrides(
         decode_context,
         ple_vectors,
         .{},
+        null,
         null,
         null,
         null,
@@ -4026,7 +5988,7 @@ pub fn maybeApplyQKHeadNorm(
         defer cb.free(reshaped);
         const normed_flat = try cb.rmsNorm(reshaped, adjusted_weight, head_dim, config.norm_eps);
         defer cb.free(normed_flat);
-        return (try cb.reshape2d(normed_flat, total_rows, total_dim)) orelse return error.ReshapeFailed;
+        return try reshape2dOwned(cb, allocator, normed_flat, total_rows, total_dim);
     }
 
     // CPU fallback (native — rmsNorm handles chunked dim natively).
@@ -4043,6 +6005,57 @@ pub fn maybeApplyQKHeadNorm(
     return try cb.fromFloat32Shape(output, &shape);
 }
 
+pub fn maybeApplyQKHeadNormRope(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    tensor: CT,
+    total_rows: usize,
+    total_dim: u32,
+    layer: usize,
+    proj: []const u8,
+    head_dim: u32,
+    rope_dim: usize,
+    rope_theta: f32,
+    freq_scale: f32,
+    position_offset: usize,
+    seq_len: usize,
+    consecutive_pairs: bool,
+    scale: f32,
+    buf: *[256]u8,
+) !?CT {
+    switch (config.family) {
+        .gemma, .qwen3, .qwen3_5 => {},
+        else => return null,
+    }
+    if (config.position_encoding != .rope) return null;
+
+    const name = std.fmt.bufPrint(buf, "model.layers.{d}.self_attn.{s}_norm.weight", .{ layer, proj }) catch return error.NameTooLong;
+    const base_weight = getModelWeight(cb, config, name) catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => return null,
+        else => return err,
+    };
+    defer cb.free(base_weight);
+    const adjusted_weight = try maybeAdjustNormWeight(cb, allocator, config, base_weight, head_dim);
+    defer if (adjusted_weight != base_weight) cb.free(adjusted_weight);
+
+    return try cb.rmsNormHeadsRope(
+        tensor,
+        adjusted_weight,
+        total_rows,
+        total_dim,
+        head_dim,
+        rope_dim,
+        config.norm_eps,
+        rope_theta,
+        freq_scale,
+        position_offset,
+        seq_len,
+        consecutive_pairs,
+        scale,
+    );
+}
+
 pub fn maybeScaleTokenEmbeddings(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -4054,8 +6067,13 @@ pub fn maybeScaleTokenEmbeddings(
     const scale = config.tokenEmbeddingScale();
     if (std.math.approxEqAbs(f32, scale, 1.0, 1e-6)) return embeddings;
 
-    if (cb.kind() == .graph or cb.kind() == .metal) {
-        // Graph tracing and Metal decode should avoid materializing device
+    if (try cb.multiplyScalar(embeddings, scale)) |scaled| {
+        cb.free(embeddings);
+        return scaled;
+    }
+
+    if (cb.kind() == .graph or cb.kind() == .metal or cb.kind() == .cuda) {
+        // Graph tracing and device backends should avoid materializing device
         // embeddings just to apply a scalar.
         const scale_data: [1]f32 = .{scale};
         const scale_tensor = try cb.fromFloat32(&scale_data);
@@ -4078,6 +6096,36 @@ pub fn maybeScaleTokenEmbeddings(
     return result;
 }
 
+pub fn lookupScaledTokenEmbeddings(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    embed_w: CT,
+    input_ids: []const i64,
+    total: usize,
+    hidden_size: usize,
+) !CT {
+    const scale = config.tokenEmbeddingScale();
+    if (try cb.embeddingLookupScaled(embed_w, input_ids, total, hidden_size, scale)) |scaled| return scaled;
+    const embedded = try cb.embeddingLookup(embed_w, input_ids, total, hidden_size);
+    return try maybeScaleTokenEmbeddings(cb, allocator, config, embedded, total, hidden_size);
+}
+
+pub fn lookupScaledTokenEmbeddingsTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    embed_w: CT,
+    input_token: CT,
+    total: usize,
+    hidden_size: usize,
+) !?CT {
+    const scale = config.tokenEmbeddingScale();
+    if (try cb.embeddingLookupTensorScaled(embed_w, input_token, total, hidden_size, scale)) |scaled| return scaled;
+    const embedded = (try cb.embeddingLookupTensor(embed_w, input_token, total, hidden_size)) orelse return null;
+    return try maybeScaleTokenEmbeddings(cb, allocator, config, embedded, total, hidden_size);
+}
+
 pub fn maybeAdjustNormWeight(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -4086,6 +6134,8 @@ pub fn maybeAdjustNormWeight(
     dim: usize,
 ) !CT {
     if (std.math.approxEqAbs(f32, config.norm_weight_offset, 0.0, 1e-6)) return weight;
+
+    if (try cb.addScalar(weight, config.norm_weight_offset)) |adjusted| return adjusted;
 
     if (cb.kind() == .graph) {
         // Graph tracing: use GPU add to avoid toFloat32 which registers spurious outputs.
@@ -4108,11 +6158,22 @@ pub fn maybeAdjustNormWeight(
 }
 
 fn applyFinalLogitSoftcap(config: Config, logits: []f32) void {
+    if (config.family == .gemma and config.weight_tying and scaleGemma4TiedLogitsDebug()) {
+        const scale = 1.0 / config.tokenEmbeddingScale();
+        for (logits) |*value| value.* *= scale;
+    }
     if (config.final_logit_softcapping <= 0.0) return;
     const softcap = config.final_logit_softcapping;
     for (logits) |*value| {
         value.* = std.math.tanh(value.* / softcap) * softcap;
     }
+}
+
+fn shouldScaleGemma4QBeforeAttention(config: Config, qk_already_roped: bool) bool {
+    if (config.global_head_dim == 0) return false;
+    if (qk_already_roped) return false;
+    if (config.position_encoding == .rope) return false;
+    return true;
 }
 
 fn getenvBool(comptime name: [*:0]const u8) bool {
@@ -4156,6 +6217,10 @@ fn disableSharedKvDebug() bool {
     return getenvBool("TERMITE_DISABLE_SHARED_KV");
 }
 
+fn traceGemma4MtpDonorDebug() bool {
+    return getenvBool("ANTFLY_GEMMA4_MTP_TRACE_DONOR");
+}
+
 fn disablePleDebug() bool {
     return getenvBool("TERMITE_DISABLE_PLE");
 }
@@ -4178,7 +6243,8 @@ fn forceLayerCloneDebug() bool {
 }
 
 fn disablePreparedDecoderSlotsDebug() bool {
-    return getenvBool("TERMITE_METAL_DISABLE_PREPARED_DECODER_SLOTS");
+    return getenvBool("TERMITE_METAL_DISABLE_PREPARED_DECODER_SLOTS") or
+        getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_PREPARED_DECODER_SLOTS");
 }
 
 fn allowDenseBlockFastPath(decode_context: ?*const DecodeContext) bool {
@@ -4218,6 +6284,55 @@ fn debugTopLogitRowsEnabled() bool {
 
 fn debugTensorStatsEnabled() bool {
     return getenvBool("TERMITE_DEBUG_GPT_STATS");
+}
+
+fn gemma4PromptSnapshotEnabled() bool {
+    return getenvBool("ANTFLY_INFERENCE_GEMMA4_PROMPT_SNAPSHOT");
+}
+
+fn shouldSnapshotGemma4PromptLayer(config: Config, layer: usize) bool {
+    if (!gemma4PromptSnapshotEnabled()) return false;
+    if (getenvUsize("ANTFLY_INFERENCE_GEMMA4_PROMPT_SNAPSHOT_LAYER")) |target| return layer == target;
+    if (getenvUsize("ANTFLY_INFERENCE_GEMMA4_PROMPT_SNAPSHOT_INTERVAL_LAYERS")) |interval| {
+        if (interval > 0 and (layer + 1) % interval == 0) return true;
+    }
+
+    return layer == 0 or
+        layer == 1 or
+        layer == 5 or
+        layer == 6 or
+        layer == 11 or
+        layer == 12 or
+        layer == 23 or
+        layer == 35 or
+        layer + 1 == config.num_hidden_layers;
+}
+
+fn disableGemma4LayerOutputScaleDebug() bool {
+    return getenvBool("ANTFLY_INFERENCE_GEMMA4_DISABLE_LAYER_OUTPUT_SCALE") or
+        getenvBool("TERMITE_GEMMA4_DISABLE_LAYER_OUTPUT_SCALE");
+}
+
+fn branchGemma4LayerOutputScaleDebug() bool {
+    return getenvBool("ANTFLY_INFERENCE_GEMMA4_BRANCH_LAYER_OUTPUT_SCALE");
+}
+
+fn disableGemmaRmsNormAddResidualFusionDebug() bool {
+    return getenvBool("ANTFLY_INFERENCE_GEMMA4_DISABLE_RMSNORM_ADD_FUSION") or
+        getenvBool("TERMITE_GEMMA4_DISABLE_RMSNORM_ADD_FUSION");
+}
+
+fn allowGemmaRmsNormAddResidualFusion(trace_sink: ?*ActivationTraceSink) bool {
+    if (disableGemmaRmsNormAddResidualFusionDebug()) return false;
+    if (trace_sink != null) return false;
+    if (debugTensorStatsEnabled()) return false;
+    if (debugTensorSampleIndex() != null) return false;
+    if (dumpGatedLayerTarget() != null) return false;
+    return true;
+}
+
+fn scaleGemma4TiedLogitsDebug() bool {
+    return getenvBool("ANTFLY_INFERENCE_GEMMA4_SCALE_TIED_LOGITS");
 }
 
 fn debugDenseFfnCompareEnabled() bool {
@@ -4405,6 +6520,90 @@ fn maybeDebugTensorLastRow(
     debugPrint("\n", .{});
 }
 
+fn maybeGemma4PromptSnapshotTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    label: []const u8,
+    tensor: CT,
+    row_dim: usize,
+) !void {
+    if (is_freestanding) return;
+    if (config.family != .gemma or !gemma4PromptSnapshotEnabled()) return;
+
+    const values = try cb.toFloat32(tensor, allocator);
+    defer allocator.free(values);
+    if (row_dim == 0 or values.len < row_dim) return;
+    const row_count = values.len / row_dim;
+    if (row_count == 0) return;
+    const row = values[(row_count - 1) * row_dim ..][0..row_dim];
+
+    var min_value: f32 = row[0];
+    var max_value: f32 = row[0];
+    var max_abs: f32 = 0;
+    var max_abs_idx: usize = 0;
+    var sum: f64 = 0;
+    var l2: f64 = 0;
+    var nan_count: usize = 0;
+    var inf_count: usize = 0;
+    for (row, 0..) |value, idx| {
+        if (std.math.isNan(value)) {
+            nan_count += 1;
+            continue;
+        }
+        if (!std.math.isFinite(value)) {
+            inf_count += 1;
+            continue;
+        }
+        min_value = @min(min_value, value);
+        max_value = @max(max_value, value);
+        const abs_value = @abs(value);
+        if (abs_value > max_abs) {
+            max_abs = abs_value;
+            max_abs_idx = idx;
+        }
+        sum += value;
+        l2 += @as(f64, value) * @as(f64, value);
+    }
+
+    const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(row));
+    debugPrint(
+        "gemma4_prompt_snapshot: {s} rows={d} row_dim={d} hash=0x{x} min={d:.6} max={d:.6} mean={d:.6} l2={d:.6} max_abs={d:.6}@{d} nan={d} inf={d} first",
+        .{
+            label,
+            row_count,
+            row_dim,
+            hash,
+            min_value,
+            max_value,
+            sum / @as(f64, @floatFromInt(row.len)),
+            l2,
+            max_abs,
+            max_abs_idx,
+            nan_count,
+            inf_count,
+        },
+    );
+    const limit = @min(row.len, 8);
+    for (row[0..limit]) |value| debugPrint(" {d:.6}", .{value});
+    debugPrint("\n", .{});
+}
+
+fn maybeGemma4PromptSnapshotLayer(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    layer: usize,
+    suffix: []const u8,
+    tensor: CT,
+    row_dim: usize,
+) !void {
+    if (config.family != .gemma or !shouldSnapshotGemma4PromptLayer(config, layer)) return;
+    var label_buf: [64]u8 = undefined;
+    const label = std.fmt.bufPrint(&label_buf, "layer{d}_{s}", .{ layer, suffix }) catch return;
+    try maybeGemma4PromptSnapshotTensor(cb, allocator, config, label, tensor, row_dim);
+}
+
 fn maybeDebugTensorLastRowDiff(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -4446,6 +6645,15 @@ fn maybeDebugTensorLastRowDiff(
     debugPrint("{s} rhs:", .{label});
     for (rhs_row[0..limit]) |value| debugPrint(" {d:.6}", .{value});
     debugPrint("\n", .{});
+}
+
+pub fn reshape2dOwned(cb: *const ComputeBackend, allocator: std.mem.Allocator, tensor: CT, rows: usize, cols: usize) !CT {
+    const shape = [_]i32{ @intCast(rows), @intCast(cols) };
+    if (try cb.cloneTensorShape(tensor, &shape)) |cloned| return cloned;
+
+    const reshaped = (try cb.reshape2d(tensor, rows, cols)) orelse return error.ReshapeFailed;
+    defer cb.free(reshaped);
+    return try cloneTensorMaterialized(cb, allocator, reshaped);
 }
 
 fn cloneTensorMaterialized(cb: *const ComputeBackend, allocator: std.mem.Allocator, tensor: CT) !CT {
@@ -4910,6 +7118,51 @@ pub fn applyAttention(
     return applyAttentionWithSink(cb, config, Q, K, V, null, batch, seq_len, num_heads, num_kv_heads, head_dim, layer, kv_layer_index, skip_kv_write, decode_context);
 }
 
+pub fn applyPreparedAttention(
+    cb: *const ComputeBackend,
+    config: Config,
+    Q: CT,
+    K: CT,
+    V: CT,
+    batch: usize,
+    seq_len: usize,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    layer: usize,
+    kv_layer_index: usize,
+    skip_kv_write: bool,
+    decode_context: ?*const DecodeContext,
+) !CT {
+    var attention = attentionContext(seq_len, decode_context);
+    attention.layer_index = kv_layer_index;
+    attention.skip_kv_write = skip_kv_write;
+    attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
+    if (disableSlidingAttentionDebug()) attention.sliding_window = 0;
+    if (attention.mode == .dense_causal and attention.sliding_window == 0 and attention.attn_or_mask == null) {
+        const gqa_started_at = monotonicNowNs();
+        const result = try cb.gqaCausalAttention(Q, K, V, null, batch, attention.query_sequence_len, num_heads, num_kv_heads, head_dim);
+        debug_timing_stats.attention_gqa_nanos += @intCast(monotonicNowNs() - gqa_started_at);
+        return result;
+    }
+    if (try cb.runAttention(&.{
+        .q = Q,
+        .k = K,
+        .v = V,
+        .attention = attention,
+        .attention_sink = .{},
+        .num_heads = num_heads,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+    })) |result| {
+        return result;
+    }
+    const gqa_started_at = monotonicNowNs();
+    const result = try cb.gqaPagedAttention(Q, K, V, null, attention, batch, num_heads, num_kv_heads, head_dim);
+    debug_timing_stats.attention_gqa_nanos += @intCast(monotonicNowNs() - gqa_started_at);
+    return result;
+}
+
 fn applyAttentionWithSink(
     cb: *const ComputeBackend,
     config: Config,
@@ -4981,7 +7234,20 @@ fn applyAttentionWithSink(
 
         const position_offset = positionOffset(seq_len, attention.query_sequence_len, decode_context);
         const rope_started_at = monotonicNowNs();
-        const Q_rope = try cb.rope(Q, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs);
+        const Q_rope = if (config.global_head_dim != 0) blk: {
+            const scale = @sqrt(@as(f32, @floatFromInt(head_dim)));
+            if (try cb.ropeScaled(Q, scale, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs)) |scaled_rope| break :blk scaled_rope;
+            const scaled = if (try cb.multiplyScalar(Q, scale)) |scaled_q|
+                scaled_q
+            else scaled_blk: {
+                const scale_shape = [_]i32{1};
+                const scale_ct = try cb.fromFloat32Shape(&[_]f32{scale}, &scale_shape);
+                defer cb.free(scale_ct);
+                break :scaled_blk try cb.multiply(Q, scale_ct);
+            };
+            defer cb.free(scaled);
+            break :blk try cb.rope(scaled, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs);
+        } else try cb.rope(Q, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs);
         defer cb.free(Q_rope);
         const K_rope = try cb.rope(K, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs);
         defer cb.free(K_rope);
@@ -5225,7 +7491,20 @@ pub fn applyAttentionResidual(
         };
         const position_offset = positionOffset(seq_len, attention.query_sequence_len, decode_context);
         const rope_started_at = monotonicNowNs();
-        const Q_rope = try cb.rope(Q, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs);
+        const Q_rope = if (config.global_head_dim != 0) blk: {
+            const scale = @sqrt(@as(f32, @floatFromInt(head_dim)));
+            if (try cb.ropeScaled(Q, scale, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs)) |scaled_rope| break :blk scaled_rope;
+            const scaled = if (try cb.multiplyScalar(Q, scale)) |scaled_q|
+                scaled_q
+            else scaled_blk: {
+                const scale_shape = [_]i32{1};
+                const scale_ct = try cb.fromFloat32Shape(&[_]f32{scale}, &scale_shape);
+                defer cb.free(scale_ct);
+                break :scaled_blk try cb.multiply(Q, scale_ct);
+            };
+            defer cb.free(scaled);
+            break :blk try cb.rope(scaled, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs);
+        } else try cb.rope(Q, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs);
         defer cb.free(Q_rope);
         const K_rope = try cb.rope(K, attention.query_sequence_len, head_dim, rope_dim, rope_theta, config.rope_freq_scale, position_offset, rope_consecutive_pairs);
         defer cb.free(K_rope);
@@ -5247,6 +7526,56 @@ pub fn applyAttentionResidual(
             .hidden_size = hidden_size,
             .eps = config.norm_eps,
         });
+    }
+
+    return cb.runAttentionResidual(&.{
+        .q = Q,
+        .k = K,
+        .v = V,
+        .residual = residual,
+        .attention = attention,
+        .num_heads = num_heads,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+        .linear_slot = out_proj_linear_slot,
+        .pre_linear_rms_norm_slot = pre_linear_rms_norm_slot,
+        .post_linear_rms_norm_slot = post_linear_rms_norm_slot,
+        .hidden_size = hidden_size,
+        .eps = config.norm_eps,
+    });
+}
+
+pub fn applyPreparedAttentionResidual(
+    cb: *const ComputeBackend,
+    config: Config,
+    Q: CT,
+    K: CT,
+    V: CT,
+    residual: CT,
+    batch: usize,
+    seq_len: usize,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    hidden_size: usize,
+    layer: usize,
+    kv_layer_index: usize,
+    skip_kv_write: bool,
+    out_proj_linear_slot: usize,
+    pre_linear_rms_norm_slot: ?usize,
+    post_linear_rms_norm_slot: ?usize,
+    decode_context: ?*const DecodeContext,
+) !?CT {
+    var attention = attentionContext(seq_len, decode_context);
+    attention.layer_index = kv_layer_index;
+    attention.skip_kv_write = skip_kv_write;
+    attention.sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
+    if (disableSlidingAttentionDebug()) {
+        attention.sliding_window = 0;
+    }
+    if (batch != 1 or attention.mode != .paged_decode or attention.query_sequence_len != 1 or attention.attn_or_mask != null) return null;
+    if (decode_context) |dc| {
+        if (dc.isMixedBatch()) return null;
     }
 
     return cb.runAttentionResidual(&.{
@@ -5370,7 +7699,7 @@ fn actualQuerySeqLen(seq_len: usize, decode_context: ?*const DecodeContext) usiz
     return dc.query_sequence_len;
 }
 
-fn positionOffset(seq_len: usize, query_seq_len: usize, decode_context: ?*const DecodeContext) usize {
+pub fn positionOffset(seq_len: usize, query_seq_len: usize, decode_context: ?*const DecodeContext) usize {
     const dc = decode_context orelse return 0;
     _ = seq_len;
     return dc.total_sequence_len - query_seq_len;
@@ -5397,15 +7726,24 @@ fn denseFeedForward(
     defer cb.free(gate_w);
     const gate_proj = try cb.linearNoBias(input, gate_w, total, hidden_size, inter_size);
     defer cb.free(gate_proj);
-    const gate_act = try applyActivation(cb, config, gate_proj);
-    defer cb.free(gate_act);
 
     const up_w = try getFFNWeight(cb, config, layer, "up", name_buf);
     defer cb.free(up_w);
     const up_proj = try cb.linearNoBias(input, up_w, total, hidden_size, inter_size);
     defer cb.free(up_proj);
 
-    const gated = try cb.multiply(gate_act, up_proj);
+    const gated = if (try cb.activationMultiply(gate_proj, up_proj, decoderRuntimeActivationKind(config.activation))) |fused|
+        fused
+    else if (config.activation == .silu) blk: {
+        if (try cb.siluMultiply(gate_proj, up_proj)) |fused| break :blk fused;
+        const gate_act = try applyActivation(cb, config, gate_proj);
+        defer cb.free(gate_act);
+        break :blk try cb.multiply(gate_act, up_proj);
+    } else blk: {
+        const gate_act = try applyActivation(cb, config, gate_proj);
+        defer cb.free(gate_act);
+        break :blk try cb.multiply(gate_act, up_proj);
+    };
     defer cb.free(gated);
 
     const down_w = try getFFNWeight(cb, config, layer, "down", name_buf);
@@ -5470,13 +7808,22 @@ fn feedForward(
             const gate_up = try cb.linearNoBiasPair(input, gate_w, up_w, total, hidden_size, inter_size);
             const gate_proj = gate_up.first;
             defer cb.free(gate_proj);
-            const gate_act = try applyActivation(cb, config, gate_proj);
-            defer cb.free(gate_act);
 
             const up_proj = gate_up.second;
             defer cb.free(up_proj);
 
-            const gated = try cb.multiply(gate_act, up_proj);
+            const gated = if (try cb.activationMultiply(gate_proj, up_proj, decoderRuntimeActivationKind(config.activation))) |fused|
+                fused
+            else if (config.activation == .silu) blk: {
+                if (try cb.siluMultiply(gate_proj, up_proj)) |fused| break :blk fused;
+                const gate_act = try applyActivation(cb, config, gate_proj);
+                defer cb.free(gate_act);
+                break :blk try cb.multiply(gate_act, up_proj);
+            } else blk: {
+                const gate_act = try applyActivation(cb, config, gate_proj);
+                defer cb.free(gate_act);
+                break :blk try cb.multiply(gate_act, up_proj);
+            };
             defer cb.free(gated);
 
             const down_w = try getFFNWeight(cb, config, layer, "down", name_buf);
@@ -6620,7 +8967,7 @@ fn applyNormAt(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: 
     }
 }
 
-fn applyFinalNorm(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, hidden: CT) !CT {
+pub fn applyFinalNorm(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, hidden: CT) !CT {
     const dim = config.hidden_size;
     switch (config.family) {
         .deepseek_v4 => {
@@ -6717,6 +9064,20 @@ fn applyGemmaPostAttentionNorm(
     })) orelse hidden;
 }
 
+fn applyGemmaPostAttentionNormResidual(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    residual: CT,
+    layer: usize,
+    buf: *[256]u8,
+) !?CT {
+    return try applyOptionalAdjustedRmsNormAddResidualByNames(cb, allocator, config, hidden, residual, config.hidden_size, &.{
+        std.fmt.bufPrint(buf, "model.layers.{d}.post_attention_layernorm.weight", .{layer}) catch return error.NameTooLong,
+    });
+}
+
 fn applyGemmaFfnPreNorm(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -6742,6 +9103,20 @@ fn applyGemmaFfnPostNorm(
     return (try applyOptionalAdjustedRmsNormByNames(cb, allocator, config, hidden, config.hidden_size, &.{
         std.fmt.bufPrint(buf, "model.layers.{d}.post_feedforward_layernorm.weight", .{layer}) catch return error.NameTooLong,
     })) orelse hidden;
+}
+
+fn applyGemmaFfnPostNormResidual(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    residual: CT,
+    layer: usize,
+    buf: *[256]u8,
+) !?CT {
+    return try applyOptionalAdjustedRmsNormAddResidualByNames(cb, allocator, config, hidden, residual, config.hidden_size, &.{
+        std.fmt.bufPrint(buf, "model.layers.{d}.post_feedforward_layernorm.weight", .{layer}) catch return error.NameTooLong,
+    });
 }
 
 /// Gemma 4: post-norm for the shared expert FFN sublayer (post_ffw_norm_1).
@@ -6804,6 +9179,28 @@ fn applyOptionalAdjustedRmsNormByNames(
         const w = try maybeAdjustNormWeight(cb, allocator, config, base_w, dim);
         defer if (w != base_w) cb.free(w);
         return try cb.rmsNorm(hidden, w, dim, config.norm_eps);
+    }
+    return null;
+}
+
+fn applyOptionalAdjustedRmsNormAddResidualByNames(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    residual: CT,
+    dim: usize,
+    names: []const []const u8,
+) !?CT {
+    for (names) |name| {
+        const base_w = getModelWeight(cb, config, name) catch |err| switch (err) {
+            error.MissingWeight, error.WeightNotFound => continue,
+            else => return err,
+        };
+        defer cb.free(base_w);
+        const w = try maybeAdjustNormWeight(cb, allocator, config, base_w, dim);
+        defer if (w != base_w) cb.free(w);
+        return try cb.rmsNormAddTensor(hidden, w, residual, dim, config.norm_eps);
     }
     return null;
 }
@@ -7076,7 +9473,7 @@ pub fn getModelWeight(cb: *const ComputeBackend, config: Config, name: []const u
         var buf: [256]u8 = undefined;
         const prefixed = try maybePrefixedModelName(config, name, &buf);
         return cb.getWeight(prefixed) catch |err| switch (err) {
-            error.MissingWeight => getModelWeightUnprefixedFallback(cb, name),
+            error.MissingWeight, error.WeightNotFound => getModelWeightUnprefixedFallback(cb, name),
             else => err,
         };
     }
@@ -7157,6 +9554,53 @@ fn prefetchMoeExperts(cb: *const ComputeBackend, layer: usize, expert_indices: [
     }
 }
 
+fn prefetchGemmaCudaLayerWeights(cb: *const ComputeBackend, config: Config, layer: usize, hint: u32) void {
+    if (cb.kind() != .cuda or config.family != .gemma or layer >= config.num_hidden_layers) return;
+    var buf: [256]u8 = undefined;
+    prefetchFormattedModelWeight(cb, config, &buf, hint, "model.layers.{d}.input_layernorm.weight", .{layer});
+    prefetchFormattedModelWeight(cb, config, &buf, hint, "model.layers.{d}.post_attention_layernorm.weight", .{layer});
+    prefetchFormattedModelWeight(cb, config, &buf, hint, "model.layers.{d}.pre_feedforward_layernorm.weight", .{layer});
+    prefetchFormattedModelWeight(cb, config, &buf, hint / 2 + 1, "model.layers.{d}.post_feedforward_layernorm.weight", .{layer});
+    prefetchFormattedModelWeight(cb, config, &buf, hint + 4, "model.layers.{d}.self_attn.q_proj.weight", .{layer});
+    prefetchFormattedModelWeight(cb, config, &buf, hint + 4, "model.layers.{d}.self_attn.k_proj.weight", .{layer});
+    if (!config.layerOmitsVProj(layer)) {
+        prefetchFormattedModelWeight(cb, config, &buf, hint + 4, "model.layers.{d}.self_attn.v_proj.weight", .{layer});
+    }
+    prefetchFormattedModelWeight(cb, config, &buf, hint + 2, "model.layers.{d}.self_attn.o_proj.weight", .{layer});
+    prefetchFormattedModelWeight(cb, config, &buf, hint + 3, "model.layers.{d}.mlp.gate_proj.weight", .{layer});
+    prefetchFormattedModelWeight(cb, config, &buf, hint + 3, "model.layers.{d}.mlp.up_proj.weight", .{layer});
+    prefetchFormattedModelWeight(cb, config, &buf, hint + 1, "model.layers.{d}.mlp.down_proj.weight", .{layer});
+}
+
+fn prefetchGemmaCudaLayerWindow(cb: *const ComputeBackend, config: Config, first_layer: usize) void {
+    if (cb.kind() != .cuda or config.family != .gemma or first_layer >= config.num_hidden_layers) return;
+    const lookahead = gemmaCudaPrefetchLookaheadLayers();
+    for (0..lookahead) |offset| {
+        const layer = first_layer + offset;
+        if (layer >= config.num_hidden_layers) break;
+        const offset_usize: usize = offset;
+        const priority_drop: usize = @min(offset_usize, @as(usize, 7)) * @as(usize, 12);
+        const base_hint: u32 = @intCast(@max(@as(usize, 16), @as(usize, 112) - priority_drop));
+        prefetchGemmaCudaLayerWeights(cb, config, layer, base_hint);
+    }
+}
+
+fn prefetchFormattedModelWeight(cb: *const ComputeBackend, config: Config, buf: *[256]u8, hint: u32, comptime fmt: []const u8, args: anytype) void {
+    const name = std.fmt.bufPrint(buf, fmt, args) catch return;
+    if (config.weight_prefix.len != 0 and std.mem.startsWith(u8, name, "model.")) {
+        var prefixed_buf: [256]u8 = undefined;
+        const prefixed = maybePrefixedModelName(config, name, &prefixed_buf) catch return;
+        cb.prefetchWeightHint(prefixed, hint);
+        return;
+    }
+    cb.prefetchWeightHint(name, hint);
+}
+
+fn prefetchFormattedWeight(cb: *const ComputeBackend, buf: *[256]u8, hint: u32, comptime fmt: []const u8, args: anytype) void {
+    const name = std.fmt.bufPrint(buf, fmt, args) catch return;
+    cb.prefetchWeightHint(name, hint);
+}
+
 fn prefetchMoeExpertWeight(cb: *const ComputeBackend, layer: usize, expert_index: u32, proj: []const u8, hint: u32, buf: *[256]u8) void {
     const name = std.fmt.bufPrint(buf, "model.layers.{d}.block_sparse_moe.experts.{d}.{s}.weight", .{ layer, expert_index, proj }) catch return;
     cb.prefetchWeightHint(name, hint);
@@ -7189,6 +9633,23 @@ fn getFFNBias(cb: *const ComputeBackend, config: Config, layer: usize, proj: []c
     }
 }
 
+pub fn getLayerOutputScaleWeight(
+    cb: *const ComputeBackend,
+    config: Config,
+    layer: usize,
+) !?CT {
+    var name_buf: [256]u8 = undefined;
+    const scale_name = std.fmt.bufPrint(&name_buf, "model.layers.{d}.per_layer_input.layer_output_scale.weight", .{layer}) catch return error.NameTooLong;
+    return getModelWeight(cb, config, scale_name) catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => blk: {
+            var fallback_buf: [256]u8 = undefined;
+            const fallback = std.fmt.bufPrint(&fallback_buf, "model.layers.{d}.layer_scalar", .{layer}) catch return error.NameTooLong;
+            break :blk try getModelWeight(cb, config, fallback);
+        },
+        else => return err,
+    };
+}
+
 /// Apply per-layer output scale (HF: self.layer_scalar / skip_scale).
 /// Multiplies hidden by a scalar loaded from layer_output_scale.weight.
 /// Returns the input unchanged if the weight is ~1.0.
@@ -7201,16 +9662,9 @@ pub fn applyLayerOutputScale(
     hidden_size: usize,
     layer: usize,
 ) !CT {
-    var name_buf: [256]u8 = undefined;
-    const scale_name = std.fmt.bufPrint(&name_buf, "model.layers.{d}.per_layer_input.layer_output_scale.weight", .{layer}) catch return hidden;
-    const scale_w = getModelWeight(cb, config, scale_name) catch |err| switch (err) {
-        error.MissingWeight => blk: {
-            var fallback_buf: [256]u8 = undefined;
-            const fallback = std.fmt.bufPrint(&fallback_buf, "model.layers.{d}.layer_scalar", .{layer}) catch return error.NameTooLong;
-            break :blk try getModelWeight(cb, config, fallback);
-        },
-        else => return err,
-    };
+    if (config.family == .gemma and disableGemma4LayerOutputScaleDebug()) return hidden;
+
+    const scale_w = (try getLayerOutputScaleWeight(cb, config, layer)) orelse return hidden;
 
     if (cb.kind() == .graph) {
         // Graph tracing: always emit the multiply. Avoid toFloat32 which
@@ -7251,6 +9705,49 @@ pub fn applyLayerOutputScale(
     return result;
 }
 
+pub fn addLayerOutputScaledBranch(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    branch: CT,
+    residual: CT,
+    total: usize,
+    hidden_size: usize,
+    layer: usize,
+) !CT {
+    if (config.family == .gemma and disableGemma4LayerOutputScaleDebug()) return cb.add(branch, residual);
+
+    const scale_w = (try getLayerOutputScaleWeight(cb, config, layer)) orelse return cb.add(branch, residual);
+    defer cb.free(scale_w);
+
+    if (try cb.addMultiplyScalarTensor(branch, residual, scale_w)) |scaled| return scaled;
+
+    if (cb.vtable.reshape2d != null or cb.kind() == .graph) {
+        const branch_scaled = try cb.multiply(branch, scale_w);
+        defer cb.free(branch_scaled);
+        return try cb.add(branch_scaled, residual);
+    }
+
+    const scale_data = try cb.toFloat32(scale_w, allocator);
+    defer allocator.free(scale_data);
+    const scale_val = scale_data[0];
+    if (std.math.approxEqAbs(f32, scale_val, 1.0, 1e-6)) return cb.add(branch, residual);
+
+    const branch_data = try cb.toFloat32(branch, allocator);
+    defer allocator.free(branch_data);
+    const residual_data = try cb.toFloat32(residual, allocator);
+    defer allocator.free(residual_data);
+    if (branch_data.len != residual_data.len) return error.InvalidTensorShape;
+    const output = try allocator.alloc(f32, branch_data.len);
+    defer allocator.free(output);
+    for (branch_data, residual_data, output) |branch_value, residual_value, *out| {
+        out.* = branch_value * scale_val + residual_value;
+    }
+
+    const shape = [_]i32{ @intCast(total), @intCast(hidden_size) };
+    return try cb.fromFloat32Shape(output, &shape);
+}
+
 // --- Per-Layer Embeddings (PLE) ---
 
 /// Pre-compute combined PLE vectors for all layers at once.
@@ -7283,6 +9780,103 @@ pub fn computePleVectors(
     defer cb.free(token_w);
     const token_embd_raw = try cb.embeddingLookup(token_w, input_ids, total, ple_total_dim);
     defer cb.free(token_embd_raw);
+
+    return try computePleVectorsFromTokenPath(cb, allocator, config, token_embd_raw, hidden, total, ple_dim, num_layers, ple_total_dim);
+}
+
+pub fn computePleVectorsFromTokenTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_token: CT,
+    hidden: CT,
+    total: usize,
+) !?CT {
+    if (!config.hasPle() or disablePleDebug()) return null;
+    const ple_dim: usize = config.ple_hidden_size;
+    const num_layers: usize = config.num_hidden_layers;
+    const ple_total_dim: usize = ple_dim * num_layers;
+
+    const token_w = getModelWeight(cb, config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
+        error.MissingWeight => try getModelWeight(cb, config, "model.embed_tokens_per_layer.weight"),
+        else => return err,
+    };
+    defer cb.free(token_w);
+
+    if (try computePleVectorsFromTokenEmbeddingTensorPath(cb, allocator, config, token_w, input_token, hidden, total, ple_dim, num_layers, ple_total_dim)) |fused| {
+        return fused;
+    }
+
+    const token_embd_raw = (try cb.embeddingLookupTensor(token_w, input_token, total, ple_total_dim)) orelse return null;
+    defer cb.free(token_embd_raw);
+
+    return try computePleVectorsFromTokenPath(cb, allocator, config, token_embd_raw, hidden, total, ple_dim, num_layers, ple_total_dim);
+}
+
+fn computePleVectorsFromTokenEmbeddingTensorPath(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    token_w: CT,
+    input_token: CT,
+    hidden: CT,
+    total: usize,
+    ple_dim: usize,
+    num_layers: usize,
+    ple_total_dim: usize,
+) !?CT {
+    if (cb.kind() != .cuda) return null;
+    const proj_w = getModelWeight(cb, config, "model.per_layer_input.per_layer_model_proj.weight") catch |err| switch (err) {
+        error.MissingWeight => try getModelWeight(cb, config, "model.per_layer_model_projection.weight"),
+        else => return err,
+    };
+    defer cb.free(proj_w);
+    const model_proj_raw = try cb.linearNoBias(hidden, proj_w, total, config.hidden_size, ple_total_dim);
+
+    const proj_norm_base_w = getModelWeight(cb, config, "model.per_layer_input.per_layer_proj_norm.weight") catch |err| switch (err) {
+        error.MissingWeight => try getModelWeight(cb, config, "model.per_layer_projection_norm.weight"),
+        else => return err,
+    };
+    defer cb.free(proj_norm_base_w);
+    const proj_norm_w = try maybeAdjustNormWeight(cb, allocator, config, proj_norm_base_w, ple_dim);
+    defer if (proj_norm_w != proj_norm_base_w) cb.free(proj_norm_w);
+
+    const embed_scale_val = @sqrt(@as(f32, @floatFromInt(ple_dim)));
+    const combine_scale_val: f32 = 1.0 / @sqrt(2.0);
+    if (try cb.rmsNormAddWeightedEmbeddingTensor(model_proj_raw, proj_norm_w, token_w, input_token, total, num_layers, ple_dim, config.norm_eps, embed_scale_val * combine_scale_val, combine_scale_val)) |fused| {
+        cb.free(model_proj_raw);
+        return fused;
+    }
+
+    if (try cb.reshape2d(model_proj_raw, total * num_layers, ple_dim)) |reshaped| {
+        defer cb.free(model_proj_raw);
+        defer cb.free(reshaped);
+
+        const normed_flat = try cb.rmsNorm(reshaped, proj_norm_w, ple_dim, config.norm_eps);
+        defer cb.free(normed_flat);
+
+        const normed_proj = (try cb.reshape2d(normed_flat, total, ple_total_dim)) orelse
+            return error.ReshapeFailed;
+        defer cb.free(normed_proj);
+
+        return try cb.addWeightedEmbeddingTensor(token_w, input_token, normed_proj, total, ple_total_dim, embed_scale_val * combine_scale_val, combine_scale_val);
+    }
+
+    cb.free(model_proj_raw);
+    return null;
+}
+
+fn computePleVectorsFromTokenPath(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    token_embd_raw: CT,
+    hidden: CT,
+    total: usize,
+    ple_dim: usize,
+    num_layers: usize,
+    ple_total_dim: usize,
+) !CT {
 
     // Context-aware path: project hidden → all-layer PLE space,
     // then scale by 1/sqrt(hidden_size).
@@ -7320,22 +9914,27 @@ pub fn computePleVectors(
         // HF: (RMSNorm(proj) + embed * sqrt(ple_dim)) * (1/sqrt(2))
         // RMSNorm is scale-invariant so 1/sqrt(hidden) pre-norm factor washes out.
         const embed_scale_val = @sqrt(@as(f32, @floatFromInt(ple_dim)));
+        const combine_scale_val: f32 = 1.0 / @sqrt(2.0);
+        if (try cb.addWeightedScalars(token_embd_raw, normed_proj, embed_scale_val * combine_scale_val, combine_scale_val)) |fused| {
+            return fused;
+        }
+
         const scale_shape = [_]i32{1};
-        const embed_scale_ct = try cb.fromFloat32Shape(&[_]f32{embed_scale_val}, &scale_shape);
-        defer cb.free(embed_scale_ct);
-
-        const token_scaled = try cb.multiply(token_embd_raw, embed_scale_ct);
-        defer cb.free(token_scaled);
-
-        const combined = try cb.add(token_scaled, normed_proj);
+        const combined = blk: {
+            const embed_scale_ct = try cb.fromFloat32Shape(&[_]f32{embed_scale_val}, &scale_shape);
+            defer cb.free(embed_scale_ct);
+            if (try cb.addMultiplyScalarTensor(token_embd_raw, normed_proj, embed_scale_ct)) |fused| break :blk fused;
+            const token_scaled = try cb.multiply(token_embd_raw, embed_scale_ct);
+            defer cb.free(token_scaled);
+            break :blk try cb.add(token_scaled, normed_proj);
+        };
         defer cb.free(combined);
 
-        const combine_scale_val: f32 = 1.0 / @sqrt(2.0);
+        if (try cb.multiplyScalar(combined, combine_scale_val)) |scaled| return scaled;
+
         const combine_ct = try cb.fromFloat32Shape(&[_]f32{combine_scale_val}, &scale_shape);
         defer cb.free(combine_ct);
-
-        const result = try cb.multiply(combined, combine_ct);
-        return result;
+        return try cb.multiply(combined, combine_ct);
     }
 
     // CPU fallback (native path): rmsNorm handles chunked dim natively.
@@ -7376,17 +9975,14 @@ pub fn applyPle(
     ple_vectors: CT,
     total: usize,
     layer: usize,
+    output_scale: ?CT,
     buf: *[256]u8,
 ) !CT {
     const ple_dim: usize = config.ple_hidden_size;
     const hidden_size: usize = config.hidden_size;
     const ple_offset = layer * ple_dim;
 
-    // 1. Slice this layer's PLE vectors on GPU: [total, ple_total_dim] → [total, ple_dim].
-    const ple_ct = try cb.sliceLastDim(ple_vectors, ple_offset, ple_offset + ple_dim);
-    defer cb.free(ple_ct);
-
-    // 2. Gate: project hidden → ple_dim and apply the model's configured activation.
+    // 1. Gate: project hidden → ple_dim and apply the model's configured activation.
     const gate_name = std.fmt.bufPrint(buf, "model.layers.{d}.per_layer_input.inp_gate.weight", .{layer}) catch return error.NameTooLong;
     const gate_w = getModelWeight(cb, config, gate_name) catch |err| switch (err) {
         error.MissingWeight => blk: {
@@ -7397,16 +9993,24 @@ pub fn applyPle(
         else => return err,
     };
     defer cb.free(gate_w);
-    const gate_proj = try cb.linearNoBias(hidden, gate_w, total, hidden_size, ple_dim);
-    defer cb.free(gate_proj);
-    const gate = try applyActivation(cb, config, gate_proj);
-    defer cb.free(gate);
 
-    // 3. Element-wise multiply gate with PLE conditioning vector.
-    const gated = try cb.multiply(gate, ple_ct);
+    // 2. Element-wise multiply gate with this layer's PLE conditioning vector.
+    const activation_kind = decoderRuntimeActivationKind(config.activation);
+    const gated = if (try cb.linearNoBiasActivationSliceLastDim(hidden, gate_w, ple_vectors, total, hidden_size, ple_dim, ple_offset, activation_kind)) |fused| fused else blk: {
+        const gate_proj = try cb.linearNoBias(hidden, gate_w, total, hidden_size, ple_dim);
+        defer cb.free(gate_proj);
+        const ple_ct = try cb.sliceLastDim(ple_vectors, ple_offset, ple_offset + ple_dim);
+        defer cb.free(ple_ct);
+        if (try cb.activationMultiply(gate_proj, ple_ct, activation_kind)) |fused| {
+            break :blk fused;
+        }
+        const gate = try applyActivation(cb, config, gate_proj);
+        defer cb.free(gate);
+        break :blk try cb.multiply(gate, ple_ct);
+    };
     defer cb.free(gated);
 
-    // 4. Project back to hidden_size.
+    // 3. Load projection and post-norm weights.
     var proj_buf: [256]u8 = undefined;
     const proj_name = std.fmt.bufPrint(&proj_buf, "model.layers.{d}.per_layer_input.proj.weight", .{layer}) catch return error.NameTooLong;
     const proj_w = getModelWeight(cb, config, proj_name) catch |err| switch (err) {
@@ -7418,10 +10022,7 @@ pub fn applyPle(
         else => return err,
     };
     defer cb.free(proj_w);
-    const projected = try cb.linearNoBias(gated, proj_w, total, ple_dim, hidden_size);
-    defer cb.free(projected);
 
-    // 5. Post-PLE RMSNorm on hidden_size.
     var norm_name_buf: [256]u8 = undefined;
     const norm_name = std.fmt.bufPrint(&norm_name_buf, "model.layers.{d}.per_layer_input.post_norm.weight", .{layer}) catch return error.NameTooLong;
     const post_norm_base_w = getModelWeight(cb, config, norm_name) catch |err| switch (err) {
@@ -7435,10 +10036,33 @@ pub fn applyPle(
     defer cb.free(post_norm_base_w);
     const post_norm_w = try maybeAdjustNormWeight(cb, allocator, config, post_norm_base_w, hidden_size);
     defer if (post_norm_w != post_norm_base_w) cb.free(post_norm_w);
+
+    // 4. Project back to hidden_size and apply post-PLE RMSNorm.
+    const projected = try cb.linearNoBias(gated, proj_w, total, ple_dim, hidden_size);
+    defer cb.free(projected);
+
+    if (output_scale) |scale| {
+        if (try cb.rmsNormAddOutputScaleTensor(projected, post_norm_w, hidden, scale, hidden_size, config.norm_eps)) |fused| {
+            return fused;
+        }
+        if (try cb.rmsNormAddTensor(projected, post_norm_w, hidden, hidden_size, config.norm_eps)) |residual| {
+            defer cb.free(residual);
+            return try cb.multiply(residual, scale);
+        }
+    } else if (try cb.rmsNormAddTensor(projected, post_norm_w, hidden, hidden_size, config.norm_eps)) |fused| {
+        return fused;
+    }
+
     const normed = try cb.rmsNorm(projected, post_norm_w, hidden_size, config.norm_eps);
     defer cb.free(normed);
 
-    // 6. Residual add.
+    // 5. Residual add, then optional whole-layer output scale.
+    if (output_scale) |scale| {
+        const residual = try cb.add(hidden, normed);
+        defer cb.free(residual);
+        return try cb.multiply(residual, scale);
+    }
+
     const result = try cb.add(hidden, normed);
     return result;
 }
@@ -7497,6 +10121,43 @@ fn applyReluSquared(cb: *const ComputeBackend, input: CT) !CT {
 
 // --- Embedding weight helper ---
 
+test "gemma4 q attention scale is not duplicated for rope attention" {
+    const llama_cfg: Config = .{ .family = .llama };
+    try std.testing.expect(!shouldScaleGemma4QBeforeAttention(llama_cfg, false));
+
+    const gemma4_rope_cfg: Config = .{
+        .family = .gemma,
+        .position_encoding = .rope,
+        .global_head_dim = 512,
+    };
+    try std.testing.expect(!shouldScaleGemma4QBeforeAttention(gemma4_rope_cfg, false));
+
+    var gemma4_absolute_cfg = gemma4_rope_cfg;
+    gemma4_absolute_cfg.position_encoding = .absolute;
+    try std.testing.expect(shouldScaleGemma4QBeforeAttention(gemma4_absolute_cfg, false));
+    try std.testing.expect(!shouldScaleGemma4QBeforeAttention(gemma4_absolute_cfg, true));
+}
+
+test "final logit softcap greedy argmax fast path policy is Gemma-only" {
+    const uncapped: Config = .{};
+    try std.testing.expect(canUseFastGreedyArgmaxForConfig(uncapped));
+
+    const capped: Config = .{ .final_logit_softcapping = 30.0 };
+    try std.testing.expect(!canUseFastGreedyArgmaxForConfig(capped));
+    const gemma_capped: Config = .{
+        .family = .gemma,
+        .final_logit_softcapping = 30.0,
+    };
+    try std.testing.expect(canUseFastGreedyArgmaxForConfig(gemma_capped));
+
+    var logits = [_]f32{ 1.0e20, 2.0e20 };
+    try std.testing.expectEqual(@as(usize, 1), activations.argmax(&logits));
+    applyFinalLogitSoftcap(capped, &logits);
+    try std.testing.expectEqual(@as(f32, 30.0), logits[0]);
+    try std.testing.expectEqual(@as(f32, 30.0), logits[1]);
+    try std.testing.expectEqual(@as(usize, 0), activations.argmax(&logits));
+}
+
 test "selectTopExperts picks correct top-k from 8 experts" {
     const allocator = std.testing.allocator;
     const logits = [_]f32{ 1.0, 3.0, 0.5, 2.0, 4.0, 0.1, 0.2, 1.5 };
@@ -7533,4 +10194,11 @@ pub fn getEmbeddingWeight(cb: *const ComputeBackend, config: Config) !CT {
         .llama, .mistral, .qwen2, .qwen3, .qwen3_5, .gemma, .bitnet, .phi => getModelWeight(cb, config, "model.embed_tokens.weight"),
         else => getModelWeight(cb, config, "model.embed_tokens.weight") catch try cb.getWeight("wte.weight"),
     };
+}
+
+pub fn getLmHeadWeight(cb: *const ComputeBackend, config: Config) !CT {
+    if (config.weight_tying) {
+        return try getEmbeddingWeight(cb, config);
+    }
+    return cb.getWeight("lm_head.weight") catch try getEmbeddingWeight(cb, config);
 }

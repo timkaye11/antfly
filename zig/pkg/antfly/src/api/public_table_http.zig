@@ -19,6 +19,8 @@ const backups_api = @import("backups.zig");
 const batch_api = @import("batch.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const common_secrets = @import("../common/secrets.zig");
+const http_route_helpers = @import("http_route_helpers.zig");
+const query_contract = @import("query_contract.zig");
 
 pub const DocumentArtifactManifestDetail = enum {
     summary,
@@ -29,13 +31,14 @@ pub const DocumentArtifactManifestOptions = struct {
     detail: DocumentArtifactManifestDetail = .raw,
 };
 
-pub fn parseDocumentArtifactManifestOptions(query: []const u8) !DocumentArtifactManifestOptions {
+pub fn parseDocumentArtifactManifestOptions(alloc: std.mem.Allocator, query: []const u8) !DocumentArtifactManifestOptions {
     var opts = DocumentArtifactManifestOptions{};
     if (query.len == 0) return opts;
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |part| {
         if (!std.mem.startsWith(u8, part, "detail=")) continue;
-        const value = part["detail=".len..];
+        const value = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, part["detail=".len..]);
+        defer alloc.free(value);
         if (std.mem.eql(u8, value, "summary")) {
             opts.detail = .summary;
         } else if (std.mem.eql(u8, value, "raw")) {
@@ -58,7 +61,11 @@ pub const TableApi = struct {
         MethodNotAllowed,
         Backpressured,
         Unavailable,
+        WriteUnavailable,
         DocIdentityUnavailable,
+        HAReadOnlyStandby,
+        HAPromotedStandbyRequiresPrimaryOpen,
+        HAFencedPrimary,
         InternalFailure,
     };
 
@@ -66,12 +73,25 @@ pub const TableApi = struct {
         InvalidQueryRequest,
         NotFound,
         DocIdentityUnavailable,
+        ReadRequiresPrimary,
+        ReadUnavailable,
+        ModelNotFound,
+        UnsupportedExactSort,
+        QueryCandidateBudgetExceeded,
+        QueryEmbeddingInputTooLarge,
+        QueryEmbeddingOverloaded,
+        EmbedRateLimited,
+        EmbedTransientFailure,
+        EmbedUpstreamFailure,
         InternalFailure,
     };
 
     pub const ExecuteQueryViewError = error{
         NotFound,
         DocIdentityUnavailable,
+        ReadRequiresPrimary,
+        ReadUnavailable,
+        ModelNotFound,
         InternalFailure,
     };
 
@@ -84,6 +104,7 @@ pub const TableApi = struct {
     };
 
     pub const ExecuteRestoreError = error{
+        NotLeader,
         TableAlreadyExists,
         MethodNotAllowed,
         UnsupportedBackupMigrationState,
@@ -103,16 +124,40 @@ pub const TableApi = struct {
     };
 
     pub const ExecuteCreateIndexError = error{
+        NotLeader,
         NotFound,
         MethodNotAllowed,
         InvalidIndexRequest,
         ProbeUnavailable,
+        ModelNotFound,
         InternalFailure,
     };
 
     pub const ExecuteDeleteIndexError = error{
+        NotLeader,
         NotFound,
         MethodNotAllowed,
+        InternalFailure,
+    };
+
+    pub const ExecutePutArtifactEnrichmentError = error{
+        NotLeader,
+        NotFound,
+        MethodNotAllowed,
+        InvalidEnrichmentRequest,
+        InternalFailure,
+    };
+
+    pub const ExecuteDeleteArtifactEnrichmentError = error{
+        NotLeader,
+        NotFound,
+        MethodNotAllowed,
+        InvalidEnrichmentRequest,
+        InternalFailure,
+    };
+
+    pub const ExecuteListArtifactEnrichmentsError = error{
+        NotFound,
         InternalFailure,
     };
 
@@ -120,6 +165,8 @@ pub const TableApi = struct {
         NotFound,
         MethodNotAllowed,
         DocIdentityUnavailable,
+        ReadRequiresPrimary,
+        ReadUnavailable,
         InternalFailure,
     };
 
@@ -127,6 +174,8 @@ pub const TableApi = struct {
         NotFound,
         MethodNotAllowed,
         DocIdentityUnavailable,
+        ReadRequiresPrimary,
+        ReadUnavailable,
         InternalFailure,
     };
 
@@ -176,6 +225,8 @@ pub const TableApi = struct {
             alloc: std.mem.Allocator,
             table_name: []const u8,
             backup_id: []const u8,
+            format: backups_api.BackupFormat,
+            location_uri: []const u8,
             location: *backups_api.BackupLocation,
         ) ExecuteBackupError!void,
         execute_table_restore: *const fn (
@@ -210,6 +261,24 @@ pub const TableApi = struct {
             table_name: []const u8,
             index_name: []const u8,
         ) ExecuteDeleteIndexError!void,
+        execute_put_artifact_enrichment: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            artifact_name: []const u8,
+            body: []const u8,
+        ) ExecutePutArtifactEnrichmentError!void = null,
+        execute_delete_artifact_enrichment: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            artifact_name: []const u8,
+        ) ExecuteDeleteArtifactEnrichmentError!void = null,
+        execute_list_artifact_enrichments: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+        ) ExecuteListArtifactEnrichmentsError![]u8 = null,
         execute_document_artifact_manifest: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -272,9 +341,11 @@ pub const TableApi = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         backup_id: []const u8,
+        format: backups_api.BackupFormat,
+        location_uri: []const u8,
         location: *backups_api.BackupLocation,
     ) ExecuteBackupError!void {
-        return try self.vtable.execute_table_backup(self.ptr, alloc, table_name, backup_id, location);
+        return try self.vtable.execute_table_backup(self.ptr, alloc, table_name, backup_id, format, location_uri, location);
     }
 
     pub fn executeTableRestore(
@@ -322,6 +393,36 @@ pub const TableApi = struct {
         index_name: []const u8,
     ) ExecuteDeleteIndexError!void {
         return try self.vtable.execute_table_delete_index(self.ptr, alloc, table_name, index_name);
+    }
+
+    pub fn executePutArtifactEnrichment(
+        self: TableApi,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        body: []const u8,
+    ) ExecutePutArtifactEnrichmentError!void {
+        const fn_ptr = self.vtable.execute_put_artifact_enrichment orelse return error.MethodNotAllowed;
+        return try fn_ptr(self.ptr, alloc, table_name, artifact_name, body);
+    }
+
+    pub fn executeDeleteArtifactEnrichment(
+        self: TableApi,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        artifact_name: []const u8,
+    ) ExecuteDeleteArtifactEnrichmentError!void {
+        const fn_ptr = self.vtable.execute_delete_artifact_enrichment orelse return error.MethodNotAllowed;
+        return try fn_ptr(self.ptr, alloc, table_name, artifact_name);
+    }
+
+    pub fn executeListArtifactEnrichments(
+        self: TableApi,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) ExecuteListArtifactEnrichmentsError![]u8 {
+        const fn_ptr = self.vtable.execute_list_artifact_enrichments orelse return error.NotFound;
+        return try fn_ptr(self.ptr, alloc, table_name);
     }
 
     pub fn executeDocumentArtifactManifest(
@@ -384,6 +485,49 @@ pub const OwnedResponse = struct {
     }
 };
 
+fn unsupportedExactSortBody(alloc: std.mem.Allocator) ![]u8 {
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{};
+    const public_rejection = query_contract.publicExactSortRejection(diagnostic.reason, diagnostic.detail);
+    return try std.json.Stringify.valueAlloc(alloc, struct {
+        @"error": []const u8 = "unsupported_exact_sort",
+        message: []const u8 = "exact sort is unsupported for this query",
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+        status: u16 = 422,
+    }{
+        .reason = public_rejection.reason,
+        .sort_rejection_reason = public_rejection.reason,
+        .sort_rejection_detail = public_rejection.detail,
+        .sort_rejection_field = diagnostic.field,
+    }, .{});
+}
+
+fn queryCandidateBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{
+        .reason = "candidate_budget_exceeded",
+        .detail = "candidate_budget_exceeded",
+    };
+    const public_rejection = query_contract.publicExactSortRejection(diagnostic.reason, diagnostic.detail);
+    return try std.json.Stringify.valueAlloc(alloc, struct {
+        @"error": []const u8 = "query_candidate_budget_exceeded",
+        message: []const u8 = "query candidate budget exceeded",
+        reason: []const u8,
+        budget_rejection_reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+        status: u16 = 422,
+    }{
+        .reason = public_rejection.reason,
+        .budget_rejection_reason = diagnostic.detail,
+        .sort_rejection_reason = public_rejection.reason,
+        .sort_rejection_detail = public_rejection.detail,
+        .sort_rejection_field = diagnostic.field,
+    }, .{});
+}
+
 pub fn handleTableBatch(
     alloc: std.mem.Allocator,
     table_name: []const u8,
@@ -405,7 +549,11 @@ pub fn handleTableBatch(
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.Backpressured => return .{ .status = 429, .body = try alloc.dupe(u8, "table backpressured") },
         error.Unavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "maintenance routes unavailable on query-only runtime") },
+        error.WriteUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "write unavailable") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
+        error.HAReadOnlyStandby => return .{ .status = 409, .body = try alloc.dupe(u8, "standby is read-only") },
+        error.HAPromotedStandbyRequiresPrimaryOpen => return .{ .status = 409, .body = try alloc.dupe(u8, "promoted standby requires primary open") },
+        error.HAFencedPrimary => return .{ .status = 409, .body = try alloc.dupe(u8, "fenced primary rejects writes") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "batch failed") },
     };
 
@@ -427,9 +575,20 @@ pub fn handleTableQueryRequest(
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid query request") };
     }
 
+    db_mod.resetLastSortRejectionDiagnostic();
+    query_contract.validatePublicQuerySortTupleContract(alloc, body) catch |err| switch (err) {
+        error.InvalidQueryRequest => {
+            std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });
+            return .{ .status = 422, .body = try unsupportedExactSortBody(alloc) };
+        },
+    };
     const response_body = api.executeTableQueryRequest(alloc, table_name, body, row_filter_json) catch |err| {
         switch (err) {
             error.InvalidQueryRequest => {
+                if (db_mod.peekLastSortRejectionDiagnostic() != null) {
+                    std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });
+                    return .{ .status = 422, .body = try unsupportedExactSortBody(alloc) };
+                }
                 std.log.err("public table query invalid table={s} err={}", .{ table_name, err });
                 return .{ .status = 400, .body = try alloc.dupe(u8, "invalid query request") };
             },
@@ -440,6 +599,43 @@ pub fn handleTableQueryRequest(
             error.DocIdentityUnavailable => {
                 std.log.warn("public table query doc identity unavailable table={s} err={}", .{ table_name, err });
                 return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") };
+            },
+            error.ReadRequiresPrimary => {
+                std.log.warn("public table query requires primary table={s} err={}", .{ table_name, err });
+                return .{ .status = 503, .body = try alloc.dupe(u8, "read requires primary") };
+            },
+            error.ReadUnavailable => {
+                std.log.warn("public table query standby unavailable table={s} err={}", .{ table_name, err });
+                return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") };
+            },
+            error.ModelNotFound => {
+                std.log.warn("public table query model not found table={s} err={}", .{ table_name, err });
+                return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}") };
+            },
+            error.QueryCandidateBudgetExceeded => {
+                std.log.warn("public table query candidate budget exceeded table={s} err={}", .{ table_name, err });
+                return .{ .status = 422, .body = try queryCandidateBudgetExceededBody(alloc) };
+            },
+            error.QueryEmbeddingInputTooLarge => {
+                return .{ .status = 413, .body = try alloc.dupe(u8, "query embedding input too large") };
+            },
+            error.QueryEmbeddingOverloaded => {
+                return .{ .status = 429, .body = try alloc.dupe(u8, "query embedding overloaded") };
+            },
+            error.EmbedRateLimited => {
+                return .{ .status = 429, .body = try alloc.dupe(u8, "query embedding rate limited") };
+            },
+            error.EmbedTransientFailure => {
+                std.log.warn("public table query embedding temporarily unavailable table={s}", .{table_name});
+                return .{ .status = 503, .body = try alloc.dupe(u8, "query embedding temporarily unavailable") };
+            },
+            error.EmbedUpstreamFailure => {
+                std.log.warn("public table query embedding upstream failure table={s}", .{table_name});
+                return .{ .status = 502, .body = try alloc.dupe(u8, "query embedding provider failed") };
+            },
+            error.UnsupportedExactSort => {
+                std.log.warn("public table query unsupported exact sort table={s} err={}", .{ table_name, err });
+                return .{ .status = 422, .body = try unsupportedExactSortBody(alloc) };
             },
             error.InternalFailure => {
                 std.log.err("public table query failed table={s} err={}", .{ table_name, err });
@@ -488,6 +684,9 @@ pub fn handleTableQueryView(
     const response_body = api.executeTableQueryView(alloc, table_name, view) catch |err| switch (err) {
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
+        error.ReadRequiresPrimary => return .{ .status = 503, .body = try alloc.dupe(u8, "read requires primary") },
+        error.ReadUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") },
+        error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "query failed") },
     };
     return .{
@@ -508,14 +707,9 @@ pub fn handleTableBackup(
     };
     defer parsed_req.deinit();
 
-    if (parsed_req.value.format) |format| {
-        if (!std.mem.eql(u8, format, "native")) {
-            return .{
-                .status = 400,
-                .body = try alloc.dupe(u8, "portable table backups are not supported; omit format or use native"),
-            };
-        }
-    }
+    const backup_format = parseBackupFormat(parsed_req.value.format) catch {
+        return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported backup format") };
+    };
 
     var location = backups_api.openBackupLocationWithSecrets(alloc, parsed_req.value.location, secret_store) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
@@ -525,7 +719,7 @@ pub fn handleTableBackup(
     };
     defer location.deinit(alloc);
 
-    api.executeTableBackup(alloc, table_name, parsed_req.value.backup_id, &location) catch |err| switch (err) {
+    api.executeTableBackup(alloc, table_name, parsed_req.value.backup_id, backup_format, parsed_req.value.location, &location) catch |err| switch (err) {
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.UnsupportedBackupMigrationState => return .{ .status = 400, .body = try alloc.dupe(u8, "backup does not support active schema migration") },
@@ -537,6 +731,13 @@ pub fn handleTableBackup(
         .status = 201,
         .body = try backups_api.encodeBackupSuccess(alloc),
     };
+}
+
+fn parseBackupFormat(value: ?[]const u8) !backups_api.BackupFormat {
+    const format = value orelse return .native;
+    if (std.mem.eql(u8, format, "native")) return .native;
+    if (std.mem.eql(u8, format, "portable")) return .portable;
+    return error.UnsupportedBackupFormat;
 }
 
 pub fn handleTableRestore(
@@ -560,6 +761,7 @@ pub fn handleTableRestore(
     defer location.deinit(alloc);
 
     api.executeTableRestore(alloc, table_name, parsed_req.value.backup_id, parsed_req.value.location, &location) catch |err| switch (err) {
+        error.NotLeader => return err,
         error.TableAlreadyExists => return .{ .status = 400, .body = try alloc.dupe(u8, "restore target already exists") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.UnsupportedBackupMigrationState => return .{ .status = 400, .body = try alloc.dupe(u8, "restore does not support active schema migration") },
@@ -607,10 +809,12 @@ pub fn handleTableCreateIndex(
     api: TableApi,
 ) !OwnedResponse {
     api.executeTableCreateIndex(alloc, table_name, index_name, body) catch |err| switch (err) {
+        error.NotLeader => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InvalidIndexRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported index configuration") },
         error.ProbeUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "index validation probe unavailable") },
+        error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index create failed") },
     };
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };
@@ -623,11 +827,57 @@ pub fn handleTableDeleteIndex(
     api: TableApi,
 ) !OwnedResponse {
     api.executeTableDeleteIndex(alloc, table_name, index_name) catch |err| switch (err) {
+        error.NotLeader => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index delete failed") },
     };
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };
+}
+
+pub fn handlePutArtifactEnrichment(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    artifact_name: []const u8,
+    body: []const u8,
+    api: TableApi,
+) !OwnedResponse {
+    api.executePutArtifactEnrichment(alloc, table_name, artifact_name, body) catch |err| switch (err) {
+        error.NotLeader => return err,
+        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
+        error.InvalidEnrichmentRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported artifact enrichment configuration") },
+        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact enrichment update failed") },
+    };
+    return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };
+}
+
+pub fn handleDeleteArtifactEnrichment(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    artifact_name: []const u8,
+    api: TableApi,
+) !OwnedResponse {
+    api.executeDeleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
+        error.NotLeader => return err,
+        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
+        error.InvalidEnrichmentRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported artifact enrichment configuration") },
+        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact enrichment delete failed") },
+    };
+    return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };
+}
+
+pub fn handleListArtifactEnrichments(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    api: TableApi,
+) !OwnedResponse {
+    const response_body = api.executeListArtifactEnrichments(alloc, table_name) catch |err| switch (err) {
+        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact enrichment list failed") },
+    };
+    return .{ .status = 200, .body = response_body };
 }
 
 pub fn handleDocumentArtifactManifest(
@@ -642,6 +892,8 @@ pub fn handleDocumentArtifactManifest(
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
+        error.ReadRequiresPrimary => return .{ .status = 503, .body = try alloc.dupe(u8, "read requires primary") },
+        error.ReadUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact manifest lookup failed") },
     };
     defer manifest.deinit(alloc);
@@ -748,6 +1000,8 @@ pub fn handleDocumentArtifactManifests(
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
+        error.ReadRequiresPrimary => return .{ .status = 503, .body = try alloc.dupe(u8, "read requires primary") },
+        error.ReadUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact manifest list failed") },
     };
     defer list.deinit(alloc);
@@ -1022,6 +1276,8 @@ fn unsupportedBackup(
     _: std.mem.Allocator,
     _: []const u8,
     _: []const u8,
+    _: backups_api.BackupFormat,
+    _: []const u8,
     _: *backups_api.BackupLocation,
 ) TableApi.ExecuteBackupError!void {
     return error.InternalFailure;
@@ -1199,6 +1455,44 @@ test "public table batch handler maps unavailable errors" {
     try std.testing.expectEqualStrings("maintenance routes unavailable on query-only runtime", resp.body);
 }
 
+test "public table batch handler maps write unavailable errors" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = executeTableBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBatch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) TableApi.ExecuteBatchError!void {
+            return error.WriteUnavailable;
+        }
+    };
+
+    var resp = try handleTableBatch(std.testing.allocator, "docs",
+        \\{"inserts":{"doc-a":{"title":"alpha"}}}
+    , Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqualStrings("write unavailable", resp.body);
+}
+
 test "public table batch handler maps doc identity unavailable errors" {
     const Backend = struct {
         fn iface() TableApi {
@@ -1235,6 +1529,60 @@ test "public table batch handler maps doc identity unavailable errors" {
 
     try std.testing.expectEqual(@as(u16, 503), resp.status);
     try std.testing.expectEqualStrings("doc identity unavailable", resp.body);
+}
+
+test "public table batch handler maps HA write gate errors" {
+    const Backend = struct {
+        err: TableApi.ExecuteBatchError,
+
+        fn iface(self: *@This()) TableApi {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_table_batch = executeTableBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBatch(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) TableApi.ExecuteBatchError!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.err;
+        }
+    };
+
+    const Case = struct {
+        err: TableApi.ExecuteBatchError,
+        body: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .err = error.HAReadOnlyStandby, .body = "standby is read-only" },
+        .{ .err = error.HAPromotedStandbyRequiresPrimaryOpen, .body = "promoted standby requires primary open" },
+        .{ .err = error.HAFencedPrimary, .body = "fenced primary rejects writes" },
+    };
+
+    for (cases) |tc| {
+        var backend = Backend{ .err = tc.err };
+        var resp = try handleTableBatch(std.testing.allocator, "docs",
+            \\{"inserts":{"doc-a":{"title":"alpha"}}}
+        , backend.iface());
+        defer resp.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(@as(u16, 409), resp.status);
+        try std.testing.expectEqualStrings(tc.body, resp.body);
+    }
 }
 
 test "public table query handler maps doc identity unavailable errors" {
@@ -1274,6 +1622,112 @@ test "public table query handler maps doc identity unavailable errors" {
 
     try std.testing.expectEqual(@as(u16, 503), resp.status);
     try std.testing.expectEqualStrings("doc identity unavailable", resp.body);
+}
+
+test "public table query handler preserves embedding failure status" {
+    const Backend = struct {
+        err: TableApi.ExecuteQueryError,
+
+        fn iface(self: *@This()) TableApi {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.err;
+        }
+    };
+    const Case = struct {
+        err: TableApi.ExecuteQueryError,
+        status: u16,
+        body: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .err = error.QueryEmbeddingInputTooLarge, .status = 413, .body = "query embedding input too large" },
+        .{ .err = error.QueryEmbeddingOverloaded, .status = 429, .body = "query embedding overloaded" },
+        .{ .err = error.EmbedRateLimited, .status = 429, .body = "query embedding rate limited" },
+        .{ .err = error.EmbedTransientFailure, .status = 503, .body = "query embedding temporarily unavailable" },
+        .{ .err = error.EmbedUpstreamFailure, .status = 502, .body = "query embedding provider failed" },
+    };
+
+    for (cases) |tc| {
+        var backend = Backend{ .err = tc.err };
+        var resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+            \\{"query":{"match_all":{}}}
+        , null, backend.iface());
+        defer resp.deinit(std.testing.allocator);
+        try std.testing.expectEqual(tc.status, resp.status);
+        try std.testing.expectEqualStrings(tc.body, resp.body);
+    }
+}
+
+test "public table query handler maps HA read gate errors" {
+    const Backend = struct {
+        err: TableApi.ExecuteQueryError,
+
+        fn iface(self: *@This()) TableApi {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.err;
+        }
+    };
+
+    var primary_backend = Backend{ .err = error.ReadRequiresPrimary };
+    var primary_resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"query":{"match_all":{}}}
+    , null, primary_backend.iface());
+    defer primary_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), primary_resp.status);
+    try std.testing.expectEqualStrings("read requires primary", primary_resp.body);
+
+    var lag_backend = Backend{ .err = error.ReadUnavailable };
+    var lag_resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"query":{"match_all":{}}}
+    , null, lag_backend.iface());
+    defer lag_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), lag_resp.status);
+    try std.testing.expectEqualStrings("standby read unavailable", lag_resp.body);
 }
 
 test "public table query handler returns json response" {
@@ -1433,6 +1887,356 @@ test "public table query handler maps backend errors" {
     try std.testing.expectEqualStrings("invalid query request", resp.body);
 }
 
+test "public table query handler maps invalid exact sort diagnostics" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            db_mod.testing.recordSortRejectionDiagnostic(
+                "_score",
+                "invalid_sort_tuple",
+                "non_numeric_score",
+            );
+            return error.InvalidQueryRequest;
+        }
+    };
+
+    var resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"full_text_search":{"match":"raft","field":"body"},"order_by":[{"field":"_score","desc":true}]}
+    , null, Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, std.testing.allocator, resp.body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("exact sort is unsupported for this query", parsed.value.message);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.reason);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("_score", parsed.value.sort_rejection_field);
+}
+
+test "public table query handler rejects unknown sort tuple properties before dispatch" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            return error.InternalFailure;
+        }
+    };
+
+    var resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"query":{"match_all":{}},"order_by":[{"field":"created_at","descc":true}]}
+    , null, Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, std.testing.allocator, resp.body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.reason);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("created_at", parsed.value.sort_rejection_field);
+}
+
+test "public table query handler maps candidate budget exhaustion" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            db_mod.testing.recordSortRejectionDiagnostic(
+                "full_text_index_v0",
+                "candidate_budget_exceeded",
+                "text_field_sort_candidate_window",
+            );
+            return error.QueryCandidateBudgetExceeded;
+        }
+    };
+
+    var resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"query":{"match_all":{}},"order_by":[{"field":"created_at"}]}
+    , null, Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        reason: []const u8,
+        budget_rejection_reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, std.testing.allocator, resp.body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("query_candidate_budget_exceeded", parsed.value.@"error");
+    try std.testing.expectEqualStrings("query candidate budget exceeded", parsed.value.message);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.reason);
+    try std.testing.expectEqualStrings("text_field_sort_candidate_window", parsed.value.budget_rejection_reason);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("full_text_index_v0", parsed.value.sort_rejection_field);
+}
+
+test "public table query handler maps unsupported exact sort" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            return error.UnsupportedExactSort;
+        }
+    };
+
+    var resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"query":{"match_all":{}},"order_by":[{"field":"created_at"}]}
+    , null, Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, std.testing.allocator, resp.body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("exact sort is unsupported for this query", parsed.value.message);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.reason);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("", parsed.value.sort_rejection_field);
+}
+
+test "public table query handler exposes stable count-only sort rejection reason" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            db_mod.testing.recordSortRejectionDiagnostic(
+                "*",
+                "unsupported_exact_sort",
+                "count_only_ordered_page",
+            );
+            return error.UnsupportedExactSort;
+        }
+    };
+
+    var resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"query":{"match_all":{}},"count":true,"order_by":[{"field":"created_at"}]}
+    , null, Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, std.testing.allocator, resp.body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.reason);
+    try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("*", parsed.value.sort_rejection_field);
+}
+
+test "public table query handler surfaces exact sort rejection diagnostics" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            db_mod.testing.recordSortRejectionDiagnostic(
+                "created_at",
+                "missing_doc_values_coverage",
+                "missing_doc_values_section",
+            );
+            return error.UnsupportedExactSort;
+        }
+    };
+
+    var resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"query":{"match_all":{}},"order_by":[{"field":"created_at"}]}
+    , null, Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, std.testing.allocator, resp.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("exact sort is unsupported for this query", parsed.value.message);
+    try std.testing.expectEqualStrings("field_not_sort_ready", parsed.value.reason);
+    try std.testing.expectEqualStrings("field_not_sort_ready", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("field_not_sort_ready", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("created_at", parsed.value.sort_rejection_field);
+}
+
 test "public table query view handler maps doc identity unavailable errors" {
     const Backend = struct {
         fn iface() TableApi {
@@ -1467,6 +2271,42 @@ test "public table query view handler maps doc identity unavailable errors" {
 
     try std.testing.expectEqual(@as(u16, 503), resp.status);
     try std.testing.expectEqualStrings("doc identity unavailable", resp.body);
+}
+
+test "public table query view handler maps HA read gate errors" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = executeTableQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryView(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: TableApi.TableQueryView,
+        ) TableApi.ExecuteQueryViewError![]u8 {
+            return error.ReadRequiresPrimary;
+        }
+    };
+
+    var resp = try handleTableQueryView(std.testing.allocator, "docs", .latest, Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqualStrings("read requires primary", resp.body);
 }
 
 test "public table query view handler returns json response" {
@@ -1531,6 +2371,8 @@ test "public table backup handler maps unsupported multi-range error" {
             _: std.mem.Allocator,
             _: []const u8,
             _: []const u8,
+            _: backups_api.BackupFormat,
+            _: []const u8,
             _: *backups_api.BackupLocation,
         ) TableApi.ExecuteBackupError!void {
             return error.UnsupportedMultiRangeTable;
@@ -1550,16 +2392,18 @@ test "public table backup handler maps unsupported multi-range error" {
     try std.testing.expectEqualStrings("backup does not support multi-range tables", resp.body);
 }
 
-test "public table backup handler rejects portable format" {
+test "public table backup handler accepts portable format" {
     const Backend = struct {
-        fn iface() TableApi {
+        seen_portable: bool = false,
+
+        fn iface(self: *@This()) TableApi {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .execute_table_batch = unsupportedBatch,
                     .execute_table_query_request = unsupportedQueryRequest,
                     .execute_table_query_view = unsupportedQueryView,
-                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_backup = executeTableBackup,
                     .execute_table_restore = unsupportedRestore,
                     .execute_table_list_indexes = unsupportedListIndexes,
                     .execute_table_get_index = unsupportedGetIndex,
@@ -1568,19 +2412,33 @@ test "public table backup handler rejects portable format" {
                 },
             };
         }
+
+        fn executeTableBackup(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            format: backups_api.BackupFormat,
+            _: []const u8,
+            _: *backups_api.BackupLocation,
+        ) TableApi.ExecuteBackupError!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.seen_portable = format == .portable;
+        }
     };
 
+    var backend = Backend{};
     var resp = try handleTableBackup(
         std.testing.allocator,
         "docs",
         "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\",\"format\":\"portable\"}",
-        Backend.iface(),
+        backend.iface(),
         null,
     );
     defer resp.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(u16, 400), resp.status);
-    try std.testing.expectEqualStrings("portable table backups are not supported; omit format or use native", resp.body);
+    try std.testing.expectEqual(@as(u16, 201), resp.status);
+    try std.testing.expect(backend.seen_portable);
 }
 
 test "public table restore handler maps target already exists" {
@@ -1625,6 +2483,71 @@ test "public table restore handler maps target already exists" {
 
     try std.testing.expectEqual(@as(u16, 400), resp.status);
     try std.testing.expectEqualStrings("restore target already exists", resp.body);
+}
+
+test "public document artifact manifest handlers map HA read gate errors" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                    .execute_document_artifact_manifest = executeDocumentArtifactManifest,
+                    .execute_document_artifact_manifests = executeDocumentArtifactManifests,
+                },
+            };
+        }
+
+        fn executeDocumentArtifactManifest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+        ) TableApi.ExecuteDocumentArtifactManifestError!db_mod.types.DocumentArtifactManifest {
+            return error.ReadUnavailable;
+        }
+
+        fn executeDocumentArtifactManifests(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+        ) TableApi.ExecuteDocumentArtifactManifestsError!db_mod.types.DocumentArtifactManifestList {
+            return error.ReadRequiresPrimary;
+        }
+    };
+
+    var manifest_resp = try handleDocumentArtifactManifest(
+        std.testing.allocator,
+        "docs",
+        "doc:a",
+        "document_units_v1",
+        .{},
+        Backend.iface(),
+    );
+    defer manifest_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), manifest_resp.status);
+    try std.testing.expectEqualStrings("standby read unavailable", manifest_resp.body);
+
+    var list_resp = try handleDocumentArtifactManifests(
+        std.testing.allocator,
+        "docs",
+        "doc:a",
+        .{},
+        Backend.iface(),
+    );
+    defer list_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), list_resp.status);
+    try std.testing.expectEqualStrings("read requires primary", list_resp.body);
 }
 
 test "public document artifact manifest handler returns summary and raw state" {

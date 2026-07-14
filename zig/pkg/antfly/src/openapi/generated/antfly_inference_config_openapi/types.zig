@@ -3,212 +3,12 @@
 
 const std = @import("std");
 const antfly_chunking_api_openapi = @import("antfly_chunking_api_openapi");
-const antfly_scraping_openapi = @import("antfly_scraping_openapi");
-const antfly_s3_openapi = @import("antfly_s3_openapi");
-const antfly_logging_openapi = @import("antfly_logging_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
+const antfly_logging_openapi = @import("antfly_logging_openapi");
+const antfly_s3_openapi = @import("antfly_s3_openapi");
+const antfly_scraping_openapi = @import("antfly_scraping_openapi");
 
-pub const Error = struct {
-    /// Error message
-    @"error": []const u8,
-};
-
-/// Text content for embedding
-pub const TextContentPart = struct {
-    type: []const u8,
-    /// Text content to embed
-    text: []const u8,
-};
-
-/// Image URL or data URI
-pub const ImageURL = struct {
-    /// URL or data URI (data:image/png;base64,...)
-    url: []const u8,
-};
-
-/// Binary or URL media content for providers that support non-image media parts.
-pub const MediaContentPart = struct {
-    type: []const u8,
-    /// Base64-encoded binary data. Use either data or url.
-    data: ?[]const u8 = null,
-    /// URL or data URI media reference. Use either url or data.
-    url: ?[]const u8 = null,
-    /// MIME type such as image/png, audio/wav, or application/pdf. Required with data and optional with url when the URL can resolve content type.
-    mime_type: ?[]const u8 = null,
-};
-
-/// A sparse vector with parallel index/value arrays, sorted by index ascending
-pub const SparseVector = struct {
-    /// Token IDs from the model vocabulary (sorted ascending)
-    indices: []const i32,
-    /// Corresponding weights for each index (always positive)
-    values: []const f32,
-};
-
-pub const Chunk = antfly_chunking_api_openapi.Chunk;
-
-/// Options for Voice Activity Detection (VAD) based audio segmentation. Antfly inference-specific.
-pub const VADOptions = struct {
-    /// Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300.
-    min_silence_duration_ms: ?i64 = null,
-    /// Minimum speech duration (ms) for a segment to be kept. Shorter segments are discarded. Default: 250.
-    min_speech_duration_ms: ?i64 = null,
-    /// Padding (ms) added before and after detected speech. Default: 30.
-    speech_pad_ms: ?i64 = null,
-    /// Maximum segment duration (ms). Segments longer than this are split. Useful for Whisper-compatible chunking. Default: 30000.
-    max_segment_duration_ms: ?i64 = null,
-};
-
-pub const RerankRequest = struct {
-    /// Name of reranking model from models_dir/rerankers/
-    model: []const u8,
-    /// Search query for relevance scoring
-    query: []const u8,
-    /// Pre-rendered document texts to rerank. The client is responsible for extracting and rendering document fields/templates before calling this endpoint.
-    prompts: []const []const u8,
-};
-
-pub const RerankResponse = struct {
-    /// Name of model used for reranking
-    model: []const u8,
-    /// Relevance scores (one per prompt, same order as input)
-    scores: []const f32,
-};
-
-pub const RecognizeEntity = struct {
-    /// The entity text
-    text: []const u8,
-    /// Entity type (PER, ORG, LOC, MISC)
-    label: []const u8,
-    /// Character offset where entity begins
-    start: i64,
-    /// Character offset where entity ends (exclusive)
-    end: i64,
-    /// Confidence score (0.0 to 1.0)
-    score: f32,
-};
-
-/// Configuration for entity resolution. When present in a RecognizeRequest, the response entities and relations are deduplicated via entity resolution (e.g., "Elon Musk" and "Musk" are merged into a single entity).
-pub const ResolverConfig = struct {
-    /// Jaro-Winkler similarity threshold for merging entities (0.0-1.0)
-    similarity_threshold: ?f32 = null,
-    /// Whether entity types must match for merging
-    type_must_match: ?bool = null,
-    /// Minimum confidence score for entities to be included
-    min_entity_confidence: ?f32 = null,
-    /// Minimum confidence score for relations to be included
-    min_relation_confidence: ?f32 = null,
-    /// Whether to deduplicate relations after entity resolution
-    deduplicate_relations: ?bool = null,
-    /// Whether to track mention provenance for resolved entities
-    track_provenance: ?bool = null,
-};
-
-pub const RewriteRequest = struct {
-    /// Name of Seq2Seq rewriter model from models_dir/rewriters/
-    model: []const u8,
-    /// Input texts to rewrite/transform
-    inputs: []const []const u8,
-};
-
-pub const RewriteResponse = struct {
-    /// Name of model used for rewriting
-    model: []const u8,
-    /// Rewritten texts (array of arrays, one per input, multiple per beam)
-    texts: []const []const []const u8,
-};
-
-pub const ClassifyRequest = struct {
-    /// Name of classifier model from models_dir/classifiers/
-    model: []const u8,
-    /// Texts to classify
-    texts: []const []const u8,
-    /// Candidate labels for zero-shot classification. The model will predict which label(s) best describe each text.
-    labels: []const []const u8,
-    /// Custom hypothesis template for NLI-based classification. Use "{}" as placeholder for the label. Default: "This example is {}."
-    hypothesis_template: ?[]const u8 = null,
-    /// If true, allows multiple labels per text (independent scoring). If false (default), scores are normalized across labels.
-    multi_label: ?bool = null,
-};
-
-pub const ClassifyResult = struct {
-    /// The predicted class/category
-    label: []const u8,
-    /// Confidence score (0.0 to 1.0)
-    score: f32,
-};
-
-pub const ExtractRequest = struct {
-    /// Name of recognizer model with 'extraction' capability
-    model: []const u8,
-    /// Texts to extract structured data from
-    texts: []const []const u8,
-    /// Extraction schema mapping structure names to field definitions. Each field is defined as "field_name::type" where type is "str" or "list". Optional choice fields: "field_name::[opt1|opt2]::str". If no type is specified, defaults to "str".
-    schema: std.json.ArrayHashMap([]const []const u8),
-    /// Score threshold for span extraction (0.0-1.0)
-    threshold: ?f32 = null,
-    /// If true, don't allow nested/overlapping entities
-    flat_ner: ?bool = null,
-    /// If true, include confidence scores in output
-    include_confidence: ?bool = null,
-    /// If true, include character offset spans in output
-    include_spans: ?bool = null,
-};
-
-pub const ExtractFieldValue = struct {
-    /// The extracted text value
-    value: []const u8,
-    /// Confidence score (only present when include_confidence=true)
-    score: ?f32 = null,
-    /// Character offset where value begins (only present when include_spans=true)
-    start: ?i64 = null,
-    /// Character offset where value ends (only present when include_spans=true)
-    end: ?i64 = null,
-};
-
-pub const ExtractResponse = struct {
-    /// Name of model used for extraction
-    model: []const u8,
-    /// Array of extraction results (one per input text). Each result maps structure names to arrays of extracted instances. Each instance maps field names to ExtractFieldValue (for ::str fields) or arrays of ExtractFieldValue (for ::list fields).
-    results: []const std.json.ArrayHashMap([]const std.json.Value),
-};
-
-pub const TextRegion = struct {
-    /// Recognized text within the region
-    text: []const u8,
-    /// Bounding box [x1, y1, x2, y2] in pixel coordinates
-    bbox: []const f64,
-    /// Recognition confidence score (0-1)
-    confidence: ?f64 = null,
-    /// Semantic label from layout analysis (e.g., text, title, table)
-    label: ?[]const u8 = null,
-};
-
-pub const TranscribeRequest = struct {
-    /// Name of transcriber model from models_dir/transcribers/
-    model: ?[]const u8 = null,
-    /// Base64-encoded audio data (WAV, MP3, FLAC, etc.)
-    audio: []const u8,
-    /// Force specific language for transcription (optional, model-dependent)
-    language: ?[]const u8 = null,
-};
-
-pub const TranscribeResponse = struct {
-    /// Name of model used for transcription
-    model: []const u8,
-    /// Transcribed text from the audio
-    text: []const u8,
-    /// Detected or forced language
-    language: ?[]const u8 = null,
-};
-
-/// Information about a model including its capabilities
-pub const ModelInfo = struct {
-    /// List of capabilities this model supports (omitted when empty)
-    capabilities: ?[]const []const u8 = null,
-    /// List of input modalities this model accepts, such as `text`, `image`, or `audio`
-    inputs: ?[]const []const u8 = null,
-};
+pub const AudioChunkConfig = antfly_chunking_api_openapi.InferenceAudioChunkConfig;
 
 /// Runtime backends compiled into this inference server.
 pub const BackendRuntimes = struct {
@@ -226,103 +26,58 @@ pub const BackendRuntimes = struct {
     wasm: ?bool = null,
 };
 
-/// Definition of a function that can be called by the model
-pub const FunctionDefinition = struct {
-    /// The name of the function to call
-    name: []const u8,
-    /// A description of what the function does
-    description: ?[]const u8 = null,
-    /// JSON Schema object describing the function parameters
-    parameters: ?std.json.Value = null,
-    /// Whether to enforce strict parameter validation
-    strict: ?bool = null,
+pub const ChatMessage = struct {
+    role: Role,
+    content: ?ChatMessageContent = null,
+    /// Tool calls made by the assistant (only for role=assistant)
+    tool_calls: ?[]const antfly_generating_openapi.ToolCall = null,
+    /// ID of the tool call this message is responding to (only for role=tool)
+    tool_call_id: ?[]const u8 = null,
 };
 
-/// Controls how the model uses tools. Options: - "auto": Model decides whether to call a tool (default) - "none": Model will not call any tools - "required": Model must call at least one tool - object: Force a specific function to be called
-pub const ToolChoice = std.json.Value;
+/// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
+pub const ChatMessageContent = std.json.Value;
 
-/// The role of a message sender in a conversation
-pub const Role = enum {
-    system,
-    user,
-    assistant,
-    tool,
+pub const Chunk = antfly_chunking_api_openapi.Chunk;
 
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .system => "system",
-            .user => "user",
-            .assistant => "assistant",
-            .tool => "tool",
-        };
-        try jw.write(s);
-    }
+pub const ChunkConfig = antfly_chunking_api_openapi.InferenceChunkConfig;
 
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "system", .system },
-            .{ "user", .user },
-            .{ "assistant", .assistant },
-            .{ "tool", .tool },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
+pub const ChunkRequest = antfly_chunking_api_openapi.InferenceChunkRequest;
+
+pub const ChunkResponse = struct {
+    /// Array of text chunks
+    chunks: []const Chunk,
+    /// Chunking model actually used (may differ from requested if fallback occurred)
+    model: []const u8,
+    /// Whether result was served from cache
+    cache_hit: bool,
 };
 
-/// Reason why generation stopped
-pub const FinishReason = enum {
-    stop,
-    length,
-    tool_calls,
-    content_filter,
-    function_call,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .stop => "stop",
-            .length => "length",
-            .tool_calls => "tool_calls",
-            .content_filter => "content_filter",
-            .function_call => "function_call",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "stop", .stop },
-            .{ "length", .length },
-            .{ "tool_calls", .tool_calls },
-            .{ "content_filter", .content_filter },
-            .{ "function_call", .function_call },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
+pub const ClassifyRequest = struct {
+    /// Name of classifier model from models_dir/classifiers/
+    model: []const u8,
+    /// Texts to classify
+    texts: []const []const u8,
+    /// Candidate labels for zero-shot classification. The model will predict which label(s) best describe each text.
+    labels: []const []const u8,
+    /// Custom hypothesis template for NLI-based classification. Use "{}" as placeholder for the label. Default: "This example is {}."
+    hypothesis_template: ?[]const u8 = null,
+    /// If true, allows multiple labels per text (independent scoring). If false (default), scores are normalized across labels.
+    multi_label: ?bool = null,
 };
 
-pub const GenerateUsage = struct {
-    /// Number of tokens in the prompt
-    prompt_tokens: i64,
-    /// Number of tokens in the completion
-    completion_tokens: i64,
-    /// Total tokens used (prompt + completion)
-    total_tokens: i64,
+pub const ClassifyResponse = struct {
+    /// Name of model used for classification
+    model: []const u8,
+    /// Array of classification results (one per input text). Each result is an array of ClassifyResult sorted by score descending.
+    classifications: []const []const ClassifyResult,
 };
 
-/// Incremental function call data for streaming
-pub const ToolCallFunctionDelta = struct {
-    /// Function name (only in first delta)
-    name: ?[]const u8 = null,
-    /// Incremental arguments JSON string
-    arguments: ?[]const u8 = null,
+pub const ClassifyResult = struct {
+    /// The predicted class/category
+    label: []const u8,
+    /// Confidence score (0.0 to 1.0)
+    score: f32,
 };
 
 pub const Config = struct {
@@ -338,12 +93,15 @@ pub const Config = struct {
     content_security: ?antfly_scraping_openapi.ContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?antfly_s3_openapi.Credentials = null,
+    query_embedding_cache: ?QueryEmbeddingCacheConfig = null,
     /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading). Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading where all models are loaded at startup and never unloaded.
     keep_alive: ?[]const u8 = null,
     /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
     max_loaded_models: ?i64 = null,
     /// Number of concurrent inference pipelines per model. Each pipeline loads a copy of the model, so higher values use more memory but allow more concurrent requests. Note: pool_size multiplies per-model memory independently of max_loaded_models.
     pool_size: ?i64 = null,
+    /// Native generator prompt KV cache settings.
+    prompt_cache: ?PromptCacheConfig = null,
     /// Backend priority order for model loading with optional device specifiers. Format: `backend` or `backend:device` where device defaults to `auto`. Antfly inference tries entries in order and uses the first available backend+device combination that supports the model. **Backends** (depend on build flags): - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend **Devices**: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only **Examples**: - `["native", "onnx", "xla"]` - Try backends with auto device detection - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
     backend_priority: ?[]const []const u8 = null,
     /// Maximum number of concurrent inference requests allowed. Additional requests will be queued up to max_queue_size. Set to 0 for unlimited (default).
@@ -352,154 +110,15 @@ pub const Config = struct {
     max_queue_size: ?i64 = null,
     /// Maximum time to wait for a request to complete, including queue wait time. Use Go duration format: "30s", "1m", "0" (no timeout, default). Requests exceeding this timeout receive 504 Gateway Timeout.
     request_timeout: ?[]const u8 = null,
-    /// List of model names to preload at startup (Ollama-compatible). These models are loaded immediately when Antfly inference starts, avoiding first-request latency. Model names should match those in models_dir/embedders/ (e.g., "BAAI/bge-small-en-v1.5"). Only effective when keep_alive is non-zero (lazy loading mode).
-    preload: ?[]const []const u8 = null,
+    /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind.
+    preload: ?[]const ModelRef = null,
     /// Maximum memory (in MB) to use for loaded models. When this limit is approached, least recently used models are unloaded. Set to 0 for unlimited (default). This is an advisory limit - actual memory usage depends on model sizes and may temporarily exceed this value. Works alongside max_loaded_models for fine-grained control.
     max_memory_mb: ?i64 = null,
-    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map use the default strategy based on keep_alive: - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle) - If keep_alive="0": eager loading (load at startup, never unload) When a model has strategy "eager" in this map: - It is loaded at startup (as part of preload) - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
+    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map use the default strategy based on keep_alive: - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle) - If keep_alive="0": eager loading (load at startup, never unload) When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
     model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
     /// Whether the dashboard should show model download commands. Defaults to true for standalone/swarm mode. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
     allow_downloads: ?bool = null,
     log: ?antfly_logging_openapi.Config = null,
-};
-
-/// Image content for embedding (OpenAI-compatible format)
-pub const ImageURLContentPart = struct {
-    type: []const u8,
-    image_url: ImageURL,
-};
-
-pub const ReadRequest = struct {
-    /// Name of reader model from models_dir/readers/
-    model: []const u8,
-    /// Images to read text from. Supports: - Data URIs: `data:image/png;base64,...` - URLs (if content_security allows)
-    images: []const ImageURL,
-    /// Optional task prompt for document understanding models. - TrOCR: Not used (pure OCR) - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning
-    prompt: ?[]const u8 = null,
-    /// Maximum tokens to generate
-    max_tokens: ?i64 = null,
-};
-
-pub const EmbedResponse = struct {
-    /// Model used for embedding
-    model: []const u8,
-    /// Array of dense embedding vectors (one per input, populated for dense models)
-    embeddings: ?[]const []const f32 = null,
-    /// Array of sparse embedding vectors (one per input, populated for sparse models)
-    sparse_embeddings: ?[]const SparseVector = null,
-};
-
-pub const ChunkResponse = struct {
-    /// Array of text chunks
-    chunks: []const Chunk,
-    /// Chunking model actually used (may differ from requested if fallback occurred)
-    model: []const u8,
-    /// Whether result was served from cache
-    cache_hit: bool,
-};
-
-/// Audio chunking configuration for Antfly inference, including VAD options.
-pub const AudioChunkConfig = struct {
-    /// Window duration in milliseconds for fixed-window audio chunking (default: 30000).
-    window_duration_ms: ?i64 = null,
-    /// Overlap duration in milliseconds between audio chunks (default: 0).
-    overlap_duration_ms: ?i64 = null,
-    vad: ?VADOptions = null,
-};
-
-pub const Relation = struct {
-    /// The subject/head entity in the relationship
-    head: RecognizeEntity,
-    /// The object/tail entity in the relationship
-    tail: RecognizeEntity,
-    /// The relationship type
-    label: []const u8,
-    /// Confidence score for the relation (0.0 to 1.0)
-    score: f32,
-};
-
-pub const RecognizeRequest = struct {
-    /// Name of recognizer model from models_dir/recognizers/
-    model: []const u8,
-    /// Texts to extract entities from
-    texts: []const []const u8,
-    /// Custom entity labels to extract (GLiNER models only). When using a GLiNER model, you can specify any entity types to extract, enabling zero-shot NER without model retraining. If not provided, the model's default labels are used.
-    labels: ?[]const []const u8 = null,
-    /// Relation types to extract (for models with 'relations' capability). Only used when the model supports relation extraction (GLiNER multitask, REBEL). If not provided, the model extracts all relations it can detect.
-    relation_labels: ?[]const []const u8 = null,
-    resolver: ?ResolverConfig = null,
-};
-
-pub const ClassifyResponse = struct {
-    /// Name of model used for classification
-    model: []const u8,
-    /// Array of classification results (one per input text). Each result is an array of ClassifyResult sorted by score descending.
-    classifications: []const []const ClassifyResult,
-};
-
-pub const ReadResult = struct {
-    /// Extracted text from the image
-    text: []const u8,
-    /// Structured fields extracted by document understanding models (Donut, Florence-2). Fields are flattened with dot notation for nested structures. Only present for models that output structured data.
-    fields: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Individual text regions with bounding boxes and recognized text. Populated by multi-stage OCR models (Surya, PaddleOCR).
-    regions: ?[]const TextRegion = null,
-};
-
-pub const ModelsResponse = struct {
-    /// OpenAI-compatible response object type.
-    object: []const u8,
-    /// OpenAI-compatible flat model list for generation/embedding models.
-    data: []const std.json.Value,
-    /// Whether clients should show model download commands.
-    allow_downloads: bool,
-    backends: BackendRuntimes,
-    /// Available chunking models (always includes "fixed")
-    chunkers: std.json.ArrayHashMap(ModelInfo),
-    /// Available reranking models
-    rerankers: std.json.ArrayHashMap(ModelInfo),
-    /// Available zero-shot classification models
-    classifiers: std.json.ArrayHashMap(ModelInfo),
-    /// Available embedding models from models_dir/embedders/
-    embedders: std.json.ArrayHashMap(ModelInfo),
-    /// Available extractor models (NER models with 'extraction' capability)
-    extractors: std.json.ArrayHashMap(ModelInfo),
-    /// Available generator/LLM models from models_dir/generators/
-    generators: std.json.ArrayHashMap(ModelInfo),
-    /// Available recognizer models from models_dir/recognizers/
-    recognizers: std.json.ArrayHashMap(ModelInfo),
-    /// Available Seq2Seq rewriter models from models_dir/rewriters/
-    rewriters: std.json.ArrayHashMap(ModelInfo),
-    /// Available reader/OCR models from models_dir/readers/
-    readers: std.json.ArrayHashMap(ModelInfo),
-    /// Available transcriber/speech-to-text models from models_dir/transcribers/
-    transcribers: std.json.ArrayHashMap(ModelInfo),
-};
-
-/// A tool (function) that the model can call
-pub const Tool = struct {
-    /// The type of tool (currently only "function" is supported)
-    type: []const u8,
-    function: FunctionDefinition,
-};
-
-pub const GenerateMessage = struct {
-    role: Role,
-    /// The generated message content (null when tool_calls is present)
-    content: ?[]const u8 = null,
-    /// Tool calls made by the model (only present when finish_reason is tool_calls)
-    tool_calls: ?[]const antfly_generating_openapi.ToolCall = null,
-};
-
-/// Incremental tool call data for streaming
-pub const ToolCallDelta = struct {
-    /// Index of the tool call in the array
-    index: ?i64 = null,
-    /// Unique identifier (only in first delta for this index)
-    id: ?[]const u8 = null,
-    /// The type of tool call (only in first delta)
-    type: ?[]const u8 = null,
-    function: ?ToolCallFunctionDelta = null,
 };
 
 /// A content part for multimodal input (text, image URL, or inline media)
@@ -509,12 +128,12 @@ pub const ContentPart = union(enum) {
     text_content_part: *TextContentPart,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
         const value = try allocator.create(T);
-        value.* = parsed.value;
+        value.* = parsed;
         return value;
     }
 
@@ -559,6 +178,7 @@ pub const ContentPart = union(enum) {
     }
 };
 
+<<<<<<< HEAD
 /// Configuration for chunking requests to Antfly inference. Combines shared text options with inference-specific audio/VAD options.
 pub const ChunkConfig = struct {
     /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
@@ -615,6 +235,8 @@ pub const GenerateDelta = struct {
     tool_calls: ?[]const ToolCallDelta = null,
 };
 
+=======
+>>>>>>> main
 pub const EmbedRequest = struct {
     /// Name of the embedder model from models_dir/embedders/
     model: []const u8,
@@ -628,45 +250,169 @@ pub const EmbedRequest = struct {
     min_weight: ?f32 = null,
 };
 
-/// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
-pub const ChatMessageContent = std.json.Value;
-
-pub const ChunkRequest = struct {
-    /// Input content to chunk. Supports two formats: - Text string: `"This is a long document..."` (backward compatible) - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}` - ContentPart: `{"type": "text", "text": "..."}`
-    input: ?std.json.Value = null,
-    /// DEPRECATED: Use 'input' instead. Text to chunk.
-    text: ?[]const u8 = null,
-    config: ?ChunkConfig = null,
-};
-
-/// OpenAI-compatible chat completion response
-pub const GenerateResponse = struct {
-    /// A unique identifier for the chat completion
-    id: []const u8,
-    /// The object type, always "chat.completion"
-    object: []const u8,
-    /// Unix timestamp (seconds) when the completion was created
-    created: i64,
-    /// Model used for generation
+pub const EmbedResponse = struct {
+    /// Model used for embedding
     model: []const u8,
-    /// List of completion choices (currently always 1)
-    choices: []const GenerateChoice,
-    usage: GenerateUsage,
+    /// Array of dense embedding vectors (one per input, populated for dense models)
+    embeddings: ?[]const []const f32 = null,
+    /// Array of sparse embedding vectors (one per input, populated for sparse models)
+    sparse_embeddings: ?[]const SparseVector = null,
 };
 
-pub const GenerateChunkChoice = struct {
+pub const Error = struct {
+    /// Error message
+    @"error": []const u8,
+};
+
+pub const ExtractFieldValue = struct {
+    /// The extracted text value
+    value: []const u8,
+    /// Confidence score (only present when include_confidence=true)
+    score: ?f32 = null,
+    /// Character offset where value begins (only present when include_spans=true)
+    start: ?i64 = null,
+    /// Character offset where value ends (only present when include_spans=true)
+    end: ?i64 = null,
+};
+
+pub const ExtractRequest = struct {
+    /// Name of recognizer model with 'extraction' capability
+    model: []const u8,
+    /// Texts to extract structured data from
+    texts: []const []const u8,
+    /// Extraction schema mapping structure names to field definitions. Each field is defined as "field_name::type" where type is "str" or "list". Optional choice fields: "field_name::[opt1|opt2]::str". If no type is specified, defaults to "str".
+    schema: std.json.ArrayHashMap([]const []const u8),
+    /// Score threshold for span extraction (0.0-1.0)
+    threshold: ?f32 = null,
+    /// If true, don't allow nested/overlapping entities
+    flat_ner: ?bool = null,
+    /// If true, include confidence scores in output
+    include_confidence: ?bool = null,
+    /// If true, include character offset spans in output
+    include_spans: ?bool = null,
+};
+
+pub const ExtractResponse = struct {
+    /// Name of model used for extraction
+    model: []const u8,
+    /// Array of extraction results (one per input text). Each result maps structure names to arrays of extracted instances. Each instance maps field names to ExtractFieldValue (for ::str fields) or arrays of ExtractFieldValue (for ::list fields).
+    results: []const std.json.ArrayHashMap([]const std.json.Value),
+};
+
+/// Reason why generation stopped
+pub const FinishReason = enum {
+    stop,
+    length,
+    tool_calls,
+    content_filter,
+    function_call,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .stop => "stop",
+            .length => "length",
+            .tool_calls => "tool_calls",
+            .content_filter => "content_filter",
+            .function_call => "function_call",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "stop", .stop },
+            .{ "length", .length },
+            .{ "tool_calls", .tool_calls },
+            .{ "content_filter", .content_filter },
+            .{ "function_call", .function_call },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Definition of a function that can be called by the model
+pub const FunctionDefinition = struct {
+    /// The name of the function to call
+    name: []const u8,
+    /// A description of what the function does
+    description: ?[]const u8 = null,
+    /// JSON Schema object describing the function parameters
+    parameters: ?std.json.Value = null,
+    /// Whether to enforce strict parameter validation
+    strict: ?bool = null,
+};
+
+pub const GenerateBatchError = struct {
+    code: []const u8,
+    message: []const u8,
+    retryable: ?bool = null,
+};
+
+/// Batch execution mode. Only synchronous batches are implemented.
+pub const GenerateBatchMode = enum {
+    sync,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .sync => "sync",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "sync", .sync },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const GenerateBatchRequest = struct {
+    mode: ?GenerateBatchMode = null,
+    requests: []const GenerateBatchRequestItem,
+};
+
+pub const GenerateBatchRequestItem = struct {
+    /// Caller-supplied identifier echoed in the result item.
+    custom_id: []const u8,
+    body: GenerateRequest,
+};
+
+pub const GenerateBatchResponse = struct {
+    object: []const u8,
+    data: []const GenerateBatchResultItem,
+    summary: GenerateBatchSummary,
+};
+
+pub const GenerateBatchResultItem = struct {
+    custom_id: []const u8,
+    /// Zero-based request index from the submitted batch.
     index: i64,
-    delta: GenerateDelta,
-    finish_reason: ?FinishReason = null,
+    response: ?GenerateResponse = null,
+    @"error": ?GenerateBatchError = null,
 };
 
-pub const ChatMessage = struct {
-    role: Role,
-    content: ?ChatMessageContent = null,
-    /// Tool calls made by the assistant (only for role=assistant)
-    tool_calls: ?[]const antfly_generating_openapi.ToolCall = null,
-    /// ID of the tool call this message is responding to (only for role=tool)
-    tool_call_id: ?[]const u8 = null,
+pub const GenerateBatchSummary = struct {
+    total: i64,
+    succeeded: i64,
+    failed: i64,
+};
+
+pub const GenerateChoice = struct {
+    /// Index of this choice in the list
+    index: i64,
+    message: GenerateMessage,
+    finish_reason: FinishReason,
+    /// Log probability information (not supported, always null)
+    logprobs: ?std.json.Value = null,
 };
 
 /// Streaming generation chunk (SSE event data)
@@ -676,6 +422,29 @@ pub const GenerateChunk = struct {
     created: i64,
     model: []const u8,
     choices: []const GenerateChunkChoice,
+};
+
+pub const GenerateChunkChoice = struct {
+    index: i64,
+    delta: GenerateDelta,
+    finish_reason: ?FinishReason = null,
+};
+
+/// Delta content for streaming
+pub const GenerateDelta = struct {
+    role: ?Role = null,
+    /// Token content delta
+    content: ?[]const u8 = null,
+    /// Tool call deltas for streaming tool calls
+    tool_calls: ?[]const ToolCallDelta = null,
+};
+
+pub const GenerateMessage = struct {
+    role: Role,
+    /// The generated message content (null when tool_calls is present)
+    content: ?[]const u8 = null,
+    /// Tool calls made by the model (only present when finish_reason is tool_calls)
+    tool_calls: ?[]const antfly_generating_openapi.ToolCall = null,
 };
 
 pub const GenerateRequest = struct {
@@ -695,6 +464,513 @@ pub const GenerateRequest = struct {
     stream: ?bool = null,
     /// List of tools (functions) the model can call. Only supported by models with tool_call_format configured.
     tools: ?[]const Tool = null,
+    /// inference-native prompt prefix cache namespace key. Requests with the same key can reuse matching prompt-prefix KV on the same node. Required to enable prompt caching; requests without a key are never cached.
+    prompt_cache_key: ?[]const u8 = null,
+    /// inference-native prompt prefix cache control. False bypasses prompt cache for this request.
+    prompt_cache: ?bool = null,
     /// Controls how the model uses tools
     tool_choice: ?ToolChoice = null,
 };
+
+/// OpenAI-compatible chat completion response
+pub const GenerateResponse = struct {
+    /// A unique identifier for the chat completion
+    id: []const u8,
+    /// The object type, always "chat.completion"
+    object: []const u8,
+    /// Unix timestamp (seconds) when the completion was created
+    created: i64,
+    /// Model used for generation
+    model: []const u8,
+    /// List of completion choices (currently always 1)
+    choices: []const GenerateChoice,
+    usage: GenerateUsage,
+};
+
+pub const GenerateUsage = struct {
+    /// Number of tokens in the prompt
+    prompt_tokens: i64,
+    /// Number of tokens in the completion
+    completion_tokens: i64,
+    /// Total tokens used (prompt + completion)
+    total_tokens: i64,
+    /// Prompt tokens served from inference-native prefix KV cache
+    cached_prompt_tokens: ?i64 = null,
+};
+
+/// Image URL or data URI
+pub const ImageURL = struct {
+    /// URL or data URI (data:image/png;base64,...)
+    url: []const u8,
+};
+
+/// Image content for embedding (OpenAI-compatible format)
+pub const ImageURLContentPart = struct {
+    type: []const u8,
+    image_url: ImageURL,
+};
+
+/// Binary or URL media content for providers that support non-image media parts.
+pub const MediaContentPart = struct {
+    type: []const u8,
+    /// Base64-encoded binary data. Use either data or url.
+    data: ?[]const u8 = null,
+    /// URL or data URI media reference. Use either url or data.
+    url: ?[]const u8 = null,
+    /// MIME type such as image/png, audio/wav, or application/pdf. Required with data and optional with url when the URL can resolve content type.
+    mime_type: ?[]const u8 = null,
+};
+
+/// Optional backend preference for model loading or request execution. `auto` keeps the node default behavior. `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds.
+pub const ModelBackend = enum {
+    auto,
+    native,
+    onnx,
+    metal,
+    cuda,
+    xla,
+    webgpu,
+    wasm,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .native => "native",
+            .onnx => "onnx",
+            .metal => "metal",
+            .cuda => "cuda",
+            .xla => "xla",
+            .webgpu => "webgpu",
+            .wasm => "wasm",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "native", .native },
+            .{ "onnx", .onnx },
+            .{ "metal", .metal },
+            .{ "cuda", .cuda },
+            .{ "xla", .xla },
+            .{ "webgpu", .webgpu },
+            .{ "wasm", .wasm },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Optional artifact format preference for loading a model.
+pub const ModelFormat = enum {
+    gguf,
+    onnx,
+    safetensors,
+    hybrid,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .gguf => "gguf",
+            .onnx => "onnx",
+            .safetensors => "safetensors",
+            .hybrid => "hybrid",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "gguf", .gguf },
+            .{ "onnx", .onnx },
+            .{ "safetensors", .safetensors },
+            .{ "hybrid", .hybrid },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Information about a model including its capabilities
+pub const ModelInfo = struct {
+    /// List of capabilities this model supports (omitted when empty)
+    capabilities: ?[]const []const u8 = null,
+    /// List of input modalities this model accepts, such as `text`, `image`, or `audio`
+    inputs: ?[]const []const u8 = null,
+};
+
+/// Model registry kind.
+pub const ModelKind = enum {
+    generator,
+    embedder,
+    reranker,
+    chunker,
+    classifier,
+    recognizer,
+    rewriter,
+    reader,
+    transcriber,
+    extractor,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .generator => "generator",
+            .embedder => "embedder",
+            .reranker => "reranker",
+            .chunker => "chunker",
+            .classifier => "classifier",
+            .recognizer => "recognizer",
+            .rewriter => "rewriter",
+            .reader => "reader",
+            .transcriber => "transcriber",
+            .extractor => "extractor",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "generator", .generator },
+            .{ "embedder", .embedder },
+            .{ "reranker", .reranker },
+            .{ "chunker", .chunker },
+            .{ "classifier", .classifier },
+            .{ "recognizer", .recognizer },
+            .{ "rewriter", .rewriter },
+            .{ "reader", .reader },
+            .{ "transcriber", .transcriber },
+            .{ "extractor", .extractor },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Optional quantization preference for loading a model.
+pub const ModelQuantization = enum {
+    q4_k,
+    q8,
+    fp16,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .q4_k => "q4_k",
+            .q8 => "q8",
+            .fp16 => "fp16",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "q4_k", .q4_k },
+            .{ "q8", .q8 },
+            .{ "fp16", .fp16 },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Model reference used by startup preload and model-loading configuration.
+pub const ModelRef = struct {
+    kind: ModelKind,
+    /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
+    name: []const u8,
+    backend: ?ModelBackend = null,
+    format: ?ModelFormat = null,
+    quantization: ?ModelQuantization = null,
+};
+
+pub const ModelsResponse = struct {
+    /// OpenAI-compatible response object type.
+    object: []const u8,
+    /// OpenAI-compatible flat model list for generation/embedding models.
+    data: []const std.json.Value,
+    /// Whether clients should show model download commands.
+    allow_downloads: bool,
+    backends: BackendRuntimes,
+    /// Available chunking models (always includes "fixed")
+    chunkers: std.json.ArrayHashMap(ModelInfo),
+    /// Available reranking models
+    rerankers: std.json.ArrayHashMap(ModelInfo),
+    /// Available zero-shot classification models
+    classifiers: std.json.ArrayHashMap(ModelInfo),
+    /// Available embedding models from models_dir/embedders/
+    embedders: std.json.ArrayHashMap(ModelInfo),
+    /// Available extractor models (NER models with 'extraction' capability)
+    extractors: std.json.ArrayHashMap(ModelInfo),
+    /// Available generator/LLM models from models_dir/generators/
+    generators: std.json.ArrayHashMap(ModelInfo),
+    /// Available recognizer models from models_dir/recognizers/
+    recognizers: std.json.ArrayHashMap(ModelInfo),
+    /// Available Seq2Seq rewriter models from models_dir/rewriters/
+    rewriters: std.json.ArrayHashMap(ModelInfo),
+    /// Available reader/OCR models from models_dir/readers/
+    readers: std.json.ArrayHashMap(ModelInfo),
+    /// Available transcriber/speech-to-text models from models_dir/transcribers/
+    transcribers: std.json.ArrayHashMap(ModelInfo),
+};
+
+/// Native generator prompt KV cache configuration.
+pub const PromptCacheConfig = struct {
+    /// Enable inference-native prompt KV cache reuse for generator requests.
+    enabled: ?bool = null,
+    /// Prompt KV cache implementation. `block_hash` (default) uses hash-addressed full KV blocks under prompt_cache_key with O(1) block lookup and is the scalable production mode. `simple` keeps the linear-scan retained-prefix cache and is only suitable for small caches or debugging.
+    mode: ?[]const u8 = null,
+    /// Node-wide target for live prompt-cache entries. The runtime divides it across participating model caches and evicts using estimated metadata and logical host/device KV bytes. Backend allocators may retain reusable capacity, so this is not a hard cap on process or accelerator memory.
+    max_bytes_mb: ?i64 = null,
+    /// Minimum prompt length eligible for prompt KV caching.
+    min_tokens: ?i64 = null,
+    /// Idle time-to-live for prompt KV cache entries. Refreshed on every cache hit, so only entries left unused for this duration expire.
+    ttl_ms: ?i64 = null,
+};
+
+/// Process-local cache for dense query embeddings. Cache lookup and singleflight happen before provider pacing and local inference queueing. Entries are isolated by the server-derived security domain and effective embedding operation. Templated and multimodal queries bypass retention and singleflight but share the max_inflight provider admission bound.
+pub const QueryEmbeddingCacheConfig = struct {
+    /// Enable query embedding result caching and concurrent miss coalescing. Provider admission control remains active when false.
+    enabled: ?bool = null,
+    /// Maximum retained cache memory in MiB. Set to 0 for singleflight without result retention.
+    max_bytes_mb: ?i64 = null,
+    /// Idle expiration in milliseconds. Cache hits refresh the expiry time.
+    ttl_ms: ?i64 = null,
+    /// Maximum query embedding provider computations in flight, including uncached templated and multimodal requests. Existing-key waiters continue to coalesce when this limit is reached. The conservative default bounds transient memory before provider responses are decoded; raise it only after measuring provider and node capacity.
+    max_inflight: ?i64 = null,
+};
+
+pub const ReadRequest = struct {
+    /// Name of reader model from models_dir/readers/
+    model: []const u8,
+    /// Images to read text from. Supports: - Data URIs: `data:image/png;base64,...` - URLs (if content_security allows)
+    images: []const ImageURL,
+    /// Optional task prompt for document understanding models. - TrOCR: Not used (pure OCR) - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning
+    prompt: ?[]const u8 = null,
+    /// Maximum tokens to generate
+    max_tokens: ?i64 = null,
+};
+
+pub const ReadResponse = struct {
+    /// Name of model used for reading
+    model: []const u8,
+    /// Array of read results (one per input image)
+    results: []const ReadResult,
+};
+
+pub const ReadResult = struct {
+    /// Extracted text from the image
+    text: []const u8,
+    /// Structured fields extracted by document understanding models (Donut, Florence-2). Fields are flattened with dot notation for nested structures. Only present for models that output structured data.
+    fields: ?std.json.ArrayHashMap([]const u8) = null,
+    /// Individual text regions with bounding boxes and recognized text. Populated by multi-stage OCR models (Surya, PaddleOCR).
+    regions: ?[]const TextRegion = null,
+};
+
+pub const RecognizeEntity = struct {
+    /// The entity text
+    text: []const u8,
+    /// Entity type (PER, ORG, LOC, MISC)
+    label: []const u8,
+    /// Character offset where entity begins
+    start: i64,
+    /// Character offset where entity ends (exclusive)
+    end: i64,
+    /// Confidence score (0.0 to 1.0)
+    score: f32,
+};
+
+pub const RecognizeRequest = struct {
+    /// Name of recognizer model from models_dir/recognizers/
+    model: []const u8,
+    /// Texts to extract entities from
+    texts: []const []const u8,
+    /// Custom entity labels to extract (GLiNER models only). When using a GLiNER model, you can specify any entity types to extract, enabling zero-shot NER without model retraining. If not provided, the model's default labels are used.
+    labels: ?[]const []const u8 = null,
+    /// Relation types to extract (for models with 'relations' capability). Only used when the model supports relation extraction (GLiNER multitask, REBEL). If not provided, the model extracts all relations it can detect.
+    relation_labels: ?[]const []const u8 = null,
+    resolver: ?ResolverConfig = null,
+};
+
+pub const RecognizeResponse = struct {
+    /// Name of model used for NER
+    model: []const u8,
+    /// Array of entity arrays (one per input text)
+    entities: []const []const RecognizeEntity,
+    /// Array of relation arrays (one per input text). Only present when using a model with 'relations' capability (GLiNER multitask, REBEL).
+    relations: ?[]const []const Relation = null,
+};
+
+pub const Relation = struct {
+    /// The subject/head entity in the relationship
+    head: RecognizeEntity,
+    /// The object/tail entity in the relationship
+    tail: RecognizeEntity,
+    /// The relationship type
+    label: []const u8,
+    /// Confidence score for the relation (0.0 to 1.0)
+    score: f32,
+};
+
+pub const RerankRequest = struct {
+    /// Name of reranking model from models_dir/rerankers/
+    model: []const u8,
+    /// Search query for relevance scoring
+    query: []const u8,
+    /// Pre-rendered document texts to rerank. The client is responsible for extracting and rendering document fields/templates before calling this endpoint.
+    prompts: []const []const u8,
+};
+
+pub const RerankResponse = struct {
+    /// Name of model used for reranking
+    model: []const u8,
+    /// Relevance scores (one per prompt, same order as input)
+    scores: []const f32,
+};
+
+/// Configuration for entity resolution. When present in a RecognizeRequest, the response entities and relations are deduplicated via entity resolution (e.g., "Elon Musk" and "Musk" are merged into a single entity).
+pub const ResolverConfig = struct {
+    /// Jaro-Winkler similarity threshold for merging entities (0.0-1.0)
+    similarity_threshold: ?f32 = null,
+    /// Whether entity types must match for merging
+    type_must_match: ?bool = null,
+    /// Minimum confidence score for entities to be included
+    min_entity_confidence: ?f32 = null,
+    /// Minimum confidence score for relations to be included
+    min_relation_confidence: ?f32 = null,
+    /// Whether to deduplicate relations after entity resolution
+    deduplicate_relations: ?bool = null,
+    /// Whether to track mention provenance for resolved entities
+    track_provenance: ?bool = null,
+};
+
+pub const RewriteRequest = struct {
+    /// Name of Seq2Seq rewriter model from models_dir/rewriters/
+    model: []const u8,
+    /// Input texts to rewrite/transform
+    inputs: []const []const u8,
+};
+
+pub const RewriteResponse = struct {
+    /// Name of model used for rewriting
+    model: []const u8,
+    /// Rewritten texts (array of arrays, one per input, multiple per beam)
+    texts: []const []const []const u8,
+};
+
+/// The role of a message sender in a conversation
+pub const Role = enum {
+    system,
+    user,
+    assistant,
+    tool,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .system => "system",
+            .user => "user",
+            .assistant => "assistant",
+            .tool => "tool",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "system", .system },
+            .{ "user", .user },
+            .{ "assistant", .assistant },
+            .{ "tool", .tool },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// A sparse vector with parallel index/value arrays, sorted by index ascending
+pub const SparseVector = struct {
+    /// Token IDs from the model vocabulary (sorted ascending)
+    indices: []const i32,
+    /// Corresponding weights for each index (always positive)
+    values: []const f32,
+};
+
+/// Text content for embedding
+pub const TextContentPart = struct {
+    type: []const u8,
+    /// Text content to embed
+    text: []const u8,
+};
+
+pub const TextRegion = struct {
+    /// Recognized text within the region
+    text: []const u8,
+    /// Bounding box [x1, y1, x2, y2] in pixel coordinates
+    bbox: []const f64,
+    /// Recognition confidence score (0-1)
+    confidence: ?f64 = null,
+    /// Semantic label from layout analysis (e.g., text, title, table)
+    label: ?[]const u8 = null,
+};
+
+/// A tool (function) that the model can call
+pub const Tool = struct {
+    /// The type of tool (currently only "function" is supported)
+    type: []const u8,
+    function: FunctionDefinition,
+};
+
+/// Incremental tool call data for streaming
+pub const ToolCallDelta = struct {
+    /// Index of the tool call in the array
+    index: ?i64 = null,
+    /// Unique identifier (only in first delta for this index)
+    id: ?[]const u8 = null,
+    /// The type of tool call (only in first delta)
+    type: ?[]const u8 = null,
+    function: ?ToolCallFunctionDelta = null,
+};
+
+/// Incremental function call data for streaming
+pub const ToolCallFunctionDelta = struct {
+    /// Function name (only in first delta)
+    name: ?[]const u8 = null,
+    /// Incremental arguments JSON string
+    arguments: ?[]const u8 = null,
+};
+
+/// Controls how the model uses tools. Options: - "auto": Model decides whether to call a tool (default) - "none": Model will not call any tools - "required": Model must call at least one tool - object: Force a specific function to be called
+pub const ToolChoice = std.json.Value;
+
+pub const TranscribeRequest = struct {
+    /// Name of transcriber model from models_dir/transcribers/
+    model: ?[]const u8 = null,
+    /// Base64-encoded audio data (WAV, MP3, FLAC, etc.)
+    audio: []const u8,
+    /// Force specific language for transcription (optional, model-dependent)
+    language: ?[]const u8 = null,
+};
+
+pub const TranscribeResponse = struct {
+    /// Name of model used for transcription
+    model: []const u8,
+    /// Transcribed text from the audio
+    text: []const u8,
+    /// Detected or forced language
+    language: ?[]const u8 = null,
+};
+
+pub const VADOptions = antfly_chunking_api_openapi.VADOptions;

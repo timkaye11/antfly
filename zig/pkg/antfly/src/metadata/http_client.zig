@@ -23,6 +23,32 @@ const raft_routes = @import("../raft/transport/routes.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const routes = @import("http_routes.zig");
 
+const max_transport_retries: usize = 1;
+const max_metadata_not_leader_retries: usize = 2;
+const default_request_timeout_ms: u32 = 5_000;
+
+fn isUriUnreserved(ch: u8) bool {
+    return (ch >= 'A' and ch <= 'Z') or
+        (ch >= 'a' and ch <= 'z') or
+        (ch >= '0' and ch <= '9') or
+        ch == '-' or ch == '.' or ch == '_' or ch == '~';
+}
+
+fn percentEncodePathComponent(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    for (value) |ch| {
+        if (isUriUnreserved(ch)) {
+            try out.append(alloc, ch);
+        } else {
+            var buf: [3]u8 = undefined;
+            const encoded = try std.fmt.bufPrint(&buf, "%{X:0>2}", .{ch});
+            try out.appendSlice(alloc, encoded);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
 pub const ActiveTransitionsResponse = struct {
     split: []metadata_transition_state.SplitTransitionRecord,
     merge: []metadata_transition_state.MergeTransitionRecord,
@@ -309,6 +335,47 @@ pub const MetadataHttpClient = struct {
         try self.requestNoBody(base_uri, .DELETE, path, error.IndexNotFound, null);
     }
 
+    pub fn putArtifactEnrichment(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        enrichment_name: []const u8,
+        enrichment_json: []const u8,
+    ) !void {
+        const escaped_table_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(escaped_table_name);
+        const escaped_enrichment_name = try percentEncodePathComponent(self.alloc, enrichment_name);
+        defer self.alloc.free(escaped_enrichment_name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}", .{
+            routes.Routes.internal_tables_prefix,
+            escaped_table_name,
+            routes.Routes.internal_table_enrichments_infix,
+            escaped_enrichment_name,
+        });
+        defer self.alloc.free(path);
+        try self.requestWithBody(base_uri, .PUT, path, enrichment_json, error.InvalidExtensionEnrichment, error.TableNotFound, null);
+    }
+
+    pub fn deleteArtifactEnrichment(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        enrichment_name: []const u8,
+    ) !void {
+        const escaped_table_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(escaped_table_name);
+        const escaped_enrichment_name = try percentEncodePathComponent(self.alloc, enrichment_name);
+        defer self.alloc.free(escaped_enrichment_name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{s}", .{
+            routes.Routes.internal_tables_prefix,
+            escaped_table_name,
+            routes.Routes.internal_table_enrichments_infix,
+            escaped_enrichment_name,
+        });
+        defer self.alloc.free(path);
+        try self.requestNoBody(base_uri, .DELETE, path, error.EnrichmentNotFound, error.InvalidExtensionEnrichment);
+    }
+
     pub fn requestTableSplit(
         self: *MetadataHttpClient,
         base_uri: []const u8,
@@ -346,6 +413,7 @@ pub const MetadataHttpClient = struct {
         var resp = try self.executeWithRetry(.{
             .method = .GET,
             .uri = uri,
+            .timeout_ms = default_request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
@@ -359,6 +427,7 @@ pub const MetadataHttpClient = struct {
         var resp = try self.executeWithRetry(.{
             .method = .GET,
             .uri = uri,
+            .timeout_ms = default_request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
@@ -387,6 +456,7 @@ pub const MetadataHttpClient = struct {
             .uri = uri,
             .body = body,
             .content_type = "application/json",
+            .timeout_ms = default_request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
         try mapStatus(resp.status, bad_request_err, not_found_err, conflict_err);
@@ -411,6 +481,7 @@ pub const MetadataHttpClient = struct {
             .uri = uri,
             .body = body,
             .content_type = "application/json",
+            .timeout_ms = default_request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
         try mapStatus(resp.status, bad_request_err, not_found_err, conflict_err);
@@ -431,28 +502,50 @@ pub const MetadataHttpClient = struct {
         var resp = try self.executeWithRetry(.{
             .method = method,
             .uri = uri,
+            .timeout_ms = default_request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
         try mapStatus(resp.status, bad_request_err, not_found_err, null);
     }
 
     fn executeWithRetry(self: *MetadataHttpClient, req: http_common.HttpRequest) !http_common.HttpResponse {
-        var attempt: usize = 0;
+        var transport_attempt: usize = 0;
+        var not_leader_attempt: usize = 0;
         while (true) {
-            return self.executor.execute(self.alloc, req) catch |err| switch (err) {
+            var resp = self.executor.execute(self.alloc, req) catch |err| switch (err) {
                 error.HttpConnectionClosing,
                 error.ConnectionResetByPeer,
                 error.ConnectionRefused,
                 error.BrokenPipe,
                 error.EndOfStream,
+                error.Timeout,
                 => {
-                    if (attempt >= 1) return err;
-                    attempt += 1;
+                    if (transport_attempt >= max_transport_retries) return err;
+                    transport_attempt += 1;
                     continue;
                 },
                 else => return err,
             };
+            if (!isMetadataNotLeaderResponse(resp)) return resp;
+            if (not_leader_attempt >= max_metadata_not_leader_retries) {
+                resp.deinit(self.alloc);
+                return error.NotLeader;
+            }
+            not_leader_attempt += 1;
+            resp.deinit(self.alloc);
         }
+    }
+
+    fn isMetadataNotLeaderResponse(resp: http_common.HttpResponse) bool {
+        if (resp.status != 503) return false;
+        for (resp.headers) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, http_common.metadata_not_leader_header) and
+                std.ascii.eqlIgnoreCase(std.mem.trim(u8, header.value, " \t\r\n"), http_common.metadata_not_leader_value))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     fn mapStatus(status: u16, bad_request_err: ?anyerror, not_found_err: ?anyerror, conflict_err: ?anyerror) !void {
@@ -502,6 +595,7 @@ test "metadata http client retries transient connection close on fetch status" {
         fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(http_common.Method.GET, req.method);
+            try std.testing.expectEqual(@as(?u32, default_request_timeout_ms), req.timeout_ms);
             self.attempts += 1;
             if (self.attempts == 1) return error.HttpConnectionClosing;
             return .{
@@ -519,6 +613,100 @@ test "metadata http client retries transient connection close on fetch status" {
     const status = try client.fetchStatus("http://127.0.0.1:9000");
     try std.testing.expectEqual(@as(u64, 77), status.metadata_group_id);
     try std.testing.expectEqual(@as(usize, 2), flaky.attempts);
+}
+
+test "metadata http client retries bounded timeout on fetch status" {
+    const TimeoutExecutor = struct {
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.GET, req.method);
+            try std.testing.expectEqual(@as(?u32, default_request_timeout_ms), req.timeout_ms);
+            self.attempts += 1;
+            if (self.attempts == 1) return error.Timeout;
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8,
+                    \\{"metadata_group_id":88,"metrics":{"rounds":0,"repairs":0,"rebalances":0,"splits":0,"merges":0},"projected_tables":0,"projected_ranges":0,"projected_placement_intents":0,"projected_split_transitions":0,"projected_merge_transitions":0,"projected_split_observations":0,"projected_merge_observations":0,"projected_schema_progress":0,"projected_restore_progress":0,"projected_snapshot_bootstrap_intents":0,"projected_backup_restore_bootstrap_intents":0,"projected_shuffle_join_leases":0,"projected_replication_source_statuses":0}
+                ),
+            };
+        }
+    };
+
+    var timeout_executor = TimeoutExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, timeout_executor.executor());
+    const status = try client.fetchStatus("http://127.0.0.1:9000");
+    try std.testing.expectEqual(@as(u64, 88), status.metadata_group_id);
+    try std.testing.expectEqual(@as(usize, 2), timeout_executor.attempts);
+}
+
+test "metadata http client retries explicit metadata not leader response" {
+    const NotLeaderExecutor = struct {
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn notLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+            const headers = try alloc.alloc(http_common.Header, 1);
+            var initialized_headers: usize = 0;
+            errdefer {
+                for (headers[0..initialized_headers]) |*header| header.deinit(alloc);
+                alloc.free(headers);
+            }
+            var header_name: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_header);
+            errdefer if (header_name) |value| alloc.free(value);
+            var header_value: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_value);
+            errdefer if (header_value) |value| alloc.free(value);
+            headers[0] = .{
+                .name = header_name.?,
+                .value = header_value.?,
+            };
+            header_name = null;
+            header_value = null;
+            initialized_headers += 1;
+            const body = try alloc.dupe(u8, "metadata leader unavailable");
+            errdefer alloc.free(body);
+            return .{
+                .status = 503,
+                .headers = headers,
+                .body = body,
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.GET, req.method);
+            self.attempts += 1;
+            if (self.attempts <= 2) return try notLeaderResponse(alloc);
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8,
+                    \\{"metadata_group_id":88,"metrics":{"rounds":0,"repairs":0,"rebalances":0,"splits":0,"merges":0},"projected_tables":0,"projected_ranges":0,"projected_placement_intents":0,"projected_split_transitions":0,"projected_merge_transitions":0,"projected_split_observations":0,"projected_merge_observations":0,"projected_schema_progress":0,"projected_restore_progress":0,"projected_snapshot_bootstrap_intents":0,"projected_backup_restore_bootstrap_intents":0,"projected_shuffle_join_leases":0,"projected_replication_source_statuses":0}
+                ),
+            };
+        }
+    };
+
+    var executor = NotLeaderExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    const status = try client.fetchStatus("http://127.0.0.1:9000");
+    try std.testing.expectEqual(@as(u64, 88), status.metadata_group_id);
+    try std.testing.expectEqual(@as(usize, 3), executor.attempts);
 }
 
 test "metadata http client preserves split merge doc identity conflicts" {
@@ -565,6 +753,44 @@ test "metadata http client preserves split merge doc identity conflicts" {
     try std.testing.expectEqual(@as(usize, 1), executor.merge_calls);
 }
 
+test "metadata http client percent-encodes artifact enrichment path components" {
+    const EncodingExecutor = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            switch (self.calls) {
+                1 => {
+                    try std.testing.expectEqual(http_common.Method.PUT, req.method);
+                    try std.testing.expectEqualStrings("http://127.0.0.1:9000/internal/v1/tables/docs%20table/enrichments/document%20chunks%2Fv2", req.uri);
+                    try std.testing.expectEqualStrings("{\"kind\":\"chunk\"}", req.body);
+                    return .{ .status = 202 };
+                },
+                2 => {
+                    try std.testing.expectEqual(http_common.Method.DELETE, req.method);
+                    try std.testing.expectEqualStrings("http://127.0.0.1:9000/internal/v1/tables/docs%20table/enrichments/document%20chunks%2Fv2", req.uri);
+                    return .{ .status = 204 };
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    };
+
+    var executor = EncodingExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    try client.putArtifactEnrichment("http://127.0.0.1:9000", "docs table", "document chunks/v2", "{\"kind\":\"chunk\"}");
+    try client.deleteArtifactEnrichment("http://127.0.0.1:9000", "docs table", "document chunks/v2");
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+}
+
 test "metadata http client round-trips server endpoints" {
     const metadata_http_server = @import("http_server.zig");
     const std_http_executor = @import("../raft/transport/std_http_executor.zig");
@@ -579,6 +805,8 @@ test "metadata http client round-trips server endpoints" {
         update_schema_count: usize = 0,
         create_index_count: usize = 0,
         drop_index_count: usize = 0,
+        put_artifact_enrichment_count: usize = 0,
+        delete_artifact_enrichment_count: usize = 0,
         upsert_node_count: usize = 0,
         upsert_store_count: usize = 0,
         report_store_status_count: usize = 0,
@@ -658,6 +886,8 @@ test "metadata http client round-trips server endpoints" {
                     .update_schema = updateSchema,
                     .create_index = createIndex,
                     .drop_index = dropIndex,
+                    .put_artifact_enrichment = putArtifactEnrichment,
+                    .delete_artifact_enrichment = deleteArtifactEnrichment,
                     .upsert_node = upsertNode,
                     .upsert_store = upsertStore,
                     .report_store_status = reportStoreStatus,
@@ -744,6 +974,21 @@ test "metadata http client round-trips server endpoints" {
             self.drop_index_count += 1;
         }
 
+        fn putArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("document chunks/v2", enrichment_name);
+            try std.testing.expectEqualStrings("{\"kind\":\"chunk\"}", enrichment_json);
+            self.put_artifact_enrichment_count += 1;
+        }
+
+        fn deleteArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("document chunks/v2", enrichment_name);
+            self.delete_artifact_enrichment_count += 1;
+        }
+
         fn upsertNode(ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.NodeRecord) !void {
             defer metadata_table_manager.freeNode(alloc, record);
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -827,6 +1072,8 @@ test "metadata http client round-trips server endpoints" {
     try client.updateSchema(base_uri, "docs", "{\"kind\":\"demo\"}");
     try client.createIndex(base_uri, "docs", "embed_idx", "{\"type\":\"managed_embeddings\"}");
     try client.dropIndex(base_uri, "docs", "embed_idx");
+    try client.putArtifactEnrichment(base_uri, "docs", "document chunks/v2", "{\"kind\":\"chunk\"}");
+    try client.deleteArtifactEnrichment(base_uri, "docs", "document chunks/v2");
     try client.dropTable(base_uri, "docs");
     try client.upsertNode(base_uri, "{\"store_id\":7,\"node_id\":7}");
     try client.reportNodeStatus(base_uri, "{\"store_id\":7,\"health_class\":\"healthy\"}");
@@ -837,6 +1084,8 @@ test "metadata http client round-trips server endpoints" {
     try std.testing.expectEqual(@as(usize, 1), source.update_schema_count);
     try std.testing.expectEqual(@as(usize, 1), source.create_index_count);
     try std.testing.expectEqual(@as(usize, 1), source.drop_index_count);
+    try std.testing.expectEqual(@as(usize, 1), source.put_artifact_enrichment_count);
+    try std.testing.expectEqual(@as(usize, 1), source.delete_artifact_enrichment_count);
     try std.testing.expectEqual(@as(usize, 1), source.upsert_node_count);
     try std.testing.expectEqual(@as(usize, 1), source.upsert_store_count);
     try std.testing.expectEqual(@as(usize, 1), source.report_store_status_count);

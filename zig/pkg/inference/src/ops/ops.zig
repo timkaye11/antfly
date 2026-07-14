@@ -151,6 +151,10 @@ pub const ExportTensorData = struct {
     },
 };
 
+pub const PendingI32ScalarDownload = struct {
+    handle: usize,
+};
+
 pub const SampleLastRowRequest = struct {
     tensor: CT,
     rows: usize,
@@ -163,6 +167,88 @@ pub const SampleLastRowRequest = struct {
     frequency_penalty: f32 = 0.0,
     presence_penalty: f32 = 0.0,
     token_history: []const i64 = &.{},
+};
+
+pub const Gemma4MtpMaskedArgmaxRequest = struct {
+    logits: CT,
+    centroid_logits: CT,
+    token_ordering: CT,
+    vocab_size: usize,
+    num_centroids: usize,
+    top_k: usize,
+    use_inverse_ordering: bool = false,
+};
+
+pub const Gemma4MtpMaskedSelectRequest = struct {
+    assistant_hidden: CT,
+    logits: CT,
+    centroid_weight: CT,
+    token_ordering: CT,
+    hidden_size: usize,
+    vocab_size: usize,
+    num_centroids: usize,
+    top_k: usize,
+    use_inverse_ordering: bool = false,
+};
+
+pub const Gemma4MtpMaskedSelectFromHiddenRequest = struct {
+    assistant_hidden: CT,
+    lm_head_weight: CT,
+    centroid_weight: CT,
+    token_ordering: CT,
+    hidden_size: usize,
+    vocab_size: usize,
+    num_centroids: usize,
+    top_k: usize,
+    use_inverse_ordering: bool = false,
+};
+
+pub const Gemma4MtpConcatOrder = enum(u32) {
+    embedding_activation = 0,
+    activation_embedding = 1,
+};
+
+pub const Gemma4MtpPreprojectRequest = struct {
+    target_embedding: CT,
+    activation: CT,
+    weight: CT,
+    backbone_hidden: usize,
+    draft_hidden: usize,
+    concat_order: Gemma4MtpConcatOrder = .embedding_activation,
+};
+
+pub const Gemma4MtpVerifyCommitResult = struct {
+    target_choices: []u32 = &.{},
+    target_choices_owned: bool = false,
+    compact_device_result: bool = false,
+    correction_token: ?u32 = null,
+    bonus_token: ?u32 = null,
+    matched_drafts: usize,
+    accepted: usize,
+    correction_added: bool,
+    had_bonus: bool,
+    bonus_skipped: bool,
+    hit_eos: bool,
+    commit_forward_required: bool,
+    accepted_hidden_row: ?usize,
+
+    pub fn deinit(self: *Gemma4MtpVerifyCommitResult, allocator: std.mem.Allocator) void {
+        if (self.target_choices_owned and self.target_choices.len != 0) allocator.free(self.target_choices);
+        self.* = undefined;
+    }
+};
+
+pub const Gemma4MtpVerifyCommitRequest = struct {
+    input: CT,
+    weight: CT,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    suppress_token_ids: []const i32,
+    draft_tokens: []const i64,
+    eos_token_ids: []const i32,
+    accept_bonus: bool,
+    allocator: std.mem.Allocator,
 };
 
 pub const TakeRowsRequest = struct {
@@ -185,6 +271,16 @@ pub const GlinerLabelGruCombinedRequest = struct {
     label_embeddings: CT,
     num_labels: usize,
     hidden_size: usize,
+};
+
+pub const GlinerGatherConcatReluRequest = struct {
+    start: CT,
+    end: CT,
+    start_rows: []const u32,
+    end_rows: []const u32,
+    source_rows: usize,
+    rows: usize,
+    dim: usize,
 };
 
 pub const DenseMlp2Request = struct {
@@ -273,6 +369,7 @@ pub const DecoderRuntimeApplyRmsNormLinearArgmaxRequest = backend_contracts.Deco
 pub const DecoderRuntimeApplyRmsNormLinearRequest = backend_contracts.DecoderRuntimeApplyRmsNormLinearRequest;
 pub const DecoderRuntimeApplyLayerNormLinearSampleRequest = backend_contracts.DecoderRuntimeApplyLayerNormLinearSampleRequest;
 pub const DecoderRuntimeApplyRmsNormLinearSampleRequest = backend_contracts.DecoderRuntimeApplyRmsNormLinearSampleRequest;
+pub const DecoderRuntimeSampleResidentLogitsRequest = backend_contracts.DecoderRuntimeSampleResidentLogitsRequest;
 pub const DecoderRuntimePrepareLinearRequest = backend_contracts.DecoderRuntimePrepareLinearRequest;
 pub const DecoderRuntimeEnsureLinearSlotRequest = backend_contracts.DecoderRuntimeEnsureLinearSlotRequest;
 pub const DecoderRuntimeApplyLinearRequest = backend_contracts.DecoderRuntimeApplyLinearRequest;
@@ -356,6 +453,10 @@ pub const NativeQuantTimingStats = struct {
     metal_tensor_to_host_device_calls: u64 = 0,
     metal_runtime_buffer_count: u64 = 0,
     metal_runtime_total_bytes: u64 = 0,
+    metal_runtime_private_bytes: u64 = 0,
+    metal_runtime_shared_bytes: u64 = 0,
+    metal_runtime_managed_bytes: u64 = 0,
+    metal_runtime_embedding_logical_bytes: u64 = 0,
     metal_runtime_embedding_bytes: u64 = 0,
     metal_runtime_norm_bytes: u64 = 0,
     metal_runtime_dense_linear_bytes: u64 = 0,
@@ -412,6 +513,7 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_deberta_attention_legacy_calls: u64 = 0,
     metal_runtime_deberta_attention_gemm_calls: u64 = 0,
     metal_runtime_deberta_attention_gemm_fallbacks: u64 = 0,
+    metal_runtime_paged_attention_1x_calls: u64 = 0,
     metal_runtime_compute_encoder_count: u64 = 0,
     metal_runtime_blit_encoder_count: u64 = 0,
     metal_runtime_last_frame_compute_encoder_count: u64 = 0,
@@ -464,6 +566,32 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_q8_0_pair_activation_rms_scale_mmv_f16_output: u64 = 0,
     metal_runtime_q8_0_linear_mmv_f16_input: u64 = 0,
     metal_runtime_q8_0_linear_family_dispatch_counts: [12][4]u64 = [_][4]u64{[_]u64{0} ** 4} ** 12,
+    metal_runtime_q4_0_linear_reduce: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_f16_input: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_f16_output: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_f16_input_f16_output: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_sumsq: u64 = 0,
+    metal_runtime_q4_0_pair: u64 = 0,
+    metal_runtime_q4_0_pair_reduce: u64 = 0,
+    metal_runtime_q4_0_pair_activation_reduce: u64 = 0,
+    metal_runtime_q4_0_pair_activation_reduce_f16_output: u64 = 0,
+    metal_runtime_q4_0_pair_activation_rms_scale_reduce_f16_output: u64 = 0,
+    metal_runtime_q4_0_activation_rhs_reduce: u64 = 0,
+    metal_runtime_q4_0_activation_rhs_reduce_f16_output: u64 = 0,
+    metal_runtime_q4_0_ple_activation_rhs_reduce_f16_output: u64 = 0,
+    metal_runtime_q4_0_ple_linear_reduce_f16_input: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_encode_nanos: u64 = 0,
+    metal_runtime_q4_0_pair_reduce_encode_nanos: u64 = 0,
+    metal_runtime_q4_0_pair_activation_reduce_encode_nanos: u64 = 0,
+    metal_runtime_q4_0_activation_rhs_reduce_encode_nanos: u64 = 0,
+    metal_runtime_q4_k_linear_reduce: u64 = 0,
+    metal_runtime_q4_k_pair_reduce: u64 = 0,
+    metal_runtime_q4_k_pair_activation_reduce: u64 = 0,
+    metal_runtime_q4_k_pair_activation_reduce_f16_output: u64 = 0,
+    metal_runtime_q4_k_activation_rhs_reduce: u64 = 0,
+    metal_runtime_q6_k_linear_reduce: u64 = 0,
+    metal_runtime_q6_k_linear_reduce_f16_input: u64 = 0,
+    metal_runtime_rms_norm_add_sumsq: u64 = 0,
     metal_provider_quantized_slots: u64 = 0,
     metal_provider_quantized_raw_bytes: u64 = 0,
     metal_provider_quantized_raw_owned_bytes: u64 = 0,
@@ -529,11 +657,11 @@ pub const NativeQuantTimingStats = struct {
     compressed_block_command_wait_nanos: u128 = 0,
     compressed_block_gpu_nanos: u128 = 0,
     active_decode_attention_f32_kernels: u64 = 0,
-    active_decode_q8_0_linear_kernels: u64 = 0,
-    active_decode_q8_0_attention_linear_kernels: u64 = 0,
-    active_decode_q8_0_ffn_down_linear_kernels: u64 = 0,
-    active_decode_q8_0_ple_linear_kernels: u64 = 0,
-    active_decode_q8_0_pair_activation_kernels: u64 = 0,
+    active_decode_quant_linear_kernels: u64 = 0,
+    active_decode_quant_attention_linear_kernels: u64 = 0,
+    active_decode_quant_ffn_down_linear_kernels: u64 = 0,
+    active_decode_quant_ple_linear_kernels: u64 = 0,
+    active_decode_quant_gate_up_pair_kernels: u64 = 0,
     active_decode_rms_norm_kernels: u64 = 0,
     active_decode_rms_norm_add_kernels: u64 = 0,
     active_decode_layer_norm_kernels: u64 = 0,
@@ -786,6 +914,66 @@ pub const ComputeBackend = struct {
         return op(self.ptr, tensor, target);
     }
 
+    pub fn debugCudaGraphCaptureBegin(self: *const ComputeBackend, label: []const u8) !bool {
+        const op = self.vtable.debugCudaGraphCaptureBegin orelse return false;
+        return op(self.ptr, label);
+    }
+
+    pub fn debugCudaGraphPrepareDecodeScalars(self: *const ComputeBackend, position_offset: usize, query_position_offset: usize, kv_seq_len: usize, total_sequence_len: usize, kv_position_offset: usize) !bool {
+        const op = self.vtable.debugCudaGraphPrepareDecodeScalars orelse return false;
+        return op(self.ptr, position_offset, query_position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
+    }
+
+    pub fn debugCudaTraceTensor(self: *const ComputeBackend, label: []const u8, tensor: CT) !void {
+        const op = self.vtable.debugCudaTraceTensor orelse return;
+        return op(self.ptr, label, tensor);
+    }
+
+    pub fn debugCudaGraphRegisterFinalHiddenReplayBoundary(self: *const ComputeBackend, input: CT, output: CT) !void {
+        const op = self.vtable.debugCudaGraphRegisterFinalHiddenReplayBoundary orelse return;
+        return op(self.ptr, input, output);
+    }
+
+    pub fn debugCudaGraphRegisterFinalHiddenReplayInput(self: *const ComputeBackend, input: CT) !void {
+        const op = self.vtable.debugCudaGraphRegisterFinalHiddenReplayInput orelse return;
+        return op(self.ptr, input);
+    }
+
+    pub fn debugCudaGraphRegisterFinalHiddenReplayAuxInput(self: *const ComputeBackend, input: CT) !void {
+        const op = self.vtable.debugCudaGraphRegisterFinalHiddenReplayAuxInput orelse return;
+        return op(self.ptr, input);
+    }
+
+    pub fn debugCudaGraphPrepareFinalHiddenReplayInput(self: *const ComputeBackend, label: []const u8, input: CT) !?CT {
+        const op = self.vtable.debugCudaGraphPrepareFinalHiddenReplayInput orelse return null;
+        return op(self.ptr, label, input);
+    }
+
+    pub fn debugCudaGraphPrepareFinalHiddenReplayAuxInput(self: *const ComputeBackend, input: CT) !?CT {
+        const op = self.vtable.debugCudaGraphPrepareFinalHiddenReplayAuxInput orelse return null;
+        return op(self.ptr, input);
+    }
+
+    pub fn debugCudaGraphReplayFinalHidden(self: *const ComputeBackend, input: CT) !?CT {
+        const op = self.vtable.debugCudaGraphReplayFinalHidden orelse return null;
+        return op(self.ptr, input);
+    }
+
+    pub fn debugCudaGraphReplayFinalHiddenDiscard(self: *const ComputeBackend, input: CT) !bool {
+        const op = self.vtable.debugCudaGraphReplayFinalHiddenDiscard orelse return false;
+        return op(self.ptr, input);
+    }
+
+    pub fn debugCudaGraphCaptureEnd(self: *const ComputeBackend, replay: bool) !void {
+        const op = self.vtable.debugCudaGraphCaptureEnd orelse return;
+        return op(self.ptr, replay);
+    }
+
+    pub fn debugCudaDeviceWarmup(self: *const ComputeBackend, bytes: usize, iterations: usize) !bool {
+        const op = self.vtable.debugCudaDeviceWarmup orelse return false;
+        return op(self.ptr, bytes, iterations);
+    }
+
     pub const VTable = struct {
         backendKind: *const fn (ctx: *anyopaque) BackendKind,
         deinitBackend: *const fn (ctx: *anyopaque) void,
@@ -815,21 +1003,53 @@ pub const ComputeBackend = struct {
 
         convertDType: ?*const fn (ctx: *anyopaque, tensor: CT, target: GraphDType) anyerror!?CT = null,
 
+        debugCudaGraphCaptureBegin: ?*const fn (ctx: *anyopaque, label: []const u8) anyerror!bool = null,
+        debugCudaGraphPrepareDecodeScalars: ?*const fn (ctx: *anyopaque, position_offset: usize, query_position_offset: usize, kv_seq_len: usize, total_sequence_len: usize, kv_position_offset: usize) anyerror!bool = null,
+        debugCudaTraceTensor: ?*const fn (ctx: *anyopaque, label: []const u8, tensor: CT) anyerror!void = null,
+        debugCudaGraphRegisterFinalHiddenReplayBoundary: ?*const fn (ctx: *anyopaque, input: CT, output: CT) anyerror!void = null,
+        debugCudaGraphRegisterFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!void = null,
+        debugCudaGraphRegisterFinalHiddenReplayAuxInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!void = null,
+        debugCudaGraphPrepareFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, label: []const u8, input: CT) anyerror!?CT = null,
+        debugCudaGraphPrepareFinalHiddenReplayAuxInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
+        debugCudaGraphReplayFinalHidden: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
+        debugCudaGraphReplayFinalHiddenDiscard: ?*const fn (ctx: *anyopaque, input: CT) anyerror!bool = null,
+        debugCudaGraphCaptureEnd: ?*const fn (ctx: *anyopaque, replay: bool) anyerror!void = null,
+        debugCudaDeviceWarmup: ?*const fn (ctx: *anyopaque, bytes: usize, iterations: usize) anyerror!bool = null,
+
         /// Look up a named weight tensor. Returned tensor is borrowed (do NOT free).
         getWeight: *const fn (ctx: *anyopaque, name: []const u8) anyerror!CT,
         prefetchWeightHint: *const fn (ctx: *anyopaque, name: []const u8, hint: u32) void,
         drainPrefetchBudget: *const fn (ctx: *anyopaque, max_items: usize) void,
+        debugProfileCheckpoint: ?*const fn (ctx: *anyopaque, label: []const u8, layer: usize) void = null,
 
         /// Embedding table lookup: weight[ids[i]] for each i. Returns [total, dim].
         embeddingLookup: *const fn (ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize) anyerror!CT,
+
+        /// Embedding table lookup with an output scale fused into the backend gather.
+        /// Backends may return null to use embeddingLookup plus a scalar multiply.
+        embeddingLookupScaled: ?*const fn (ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize, scale: f32) anyerror!?CT = null,
 
         /// Embedding table lookup where the ids already live in a backend tensor.
         /// Backends may return null to use the host-id embedding path.
         embeddingLookupTensor: ?*const fn (ctx: *anyopaque, weight: CT, ids: CT, total: usize, dim: usize) anyerror!?CT = null,
 
+<<<<<<< HEAD
         /// Add deterministic uniform NEFTune noise to an embedding tensor.
         /// Backends may return null to use the host-generated noise fallback.
         addNeftuneNoise: ?*const fn (ctx: *anyopaque, input: CT, seed: u64, scale: f32) anyerror!?CT = null,
+=======
+        /// Tensor-id embedding table lookup with an output scale fused into the
+        /// backend gather. Backends may return null to use the generic fallback.
+        embeddingLookupTensorScaled: ?*const fn (ctx: *anyopaque, weight: CT, ids: CT, total: usize, dim: usize, scale: f32) anyerror!?CT = null,
+
+        /// Tensor-id embedding lookup fused with `embedding * lhs_scale + rhs * rhs_scale`.
+        /// Backends may return null to use embeddingLookupTensor plus weighted add.
+        addWeightedEmbeddingTensor: ?*const fn (ctx: *anyopaque, weight: CT, ids: CT, rhs: CT, total: usize, dim: usize, lhs_scale: f32, rhs_scale: f32) anyerror!?CT = null,
+
+        /// PLE vector construction fused as `embedding(ids) * lhs_scale + rms_norm(input) * rhs_scale`.
+        /// `input` is [total, num_groups * group_dim], and `norm_weight` is [group_dim].
+        rmsNormAddWeightedEmbeddingTensor: ?*const fn (ctx: *anyopaque, input: CT, norm_weight: CT, embedding_weight: CT, ids: CT, total: usize, num_groups: usize, group_dim: usize, eps: f32, lhs_scale: f32, rhs_scale: f32) anyerror!?CT = null,
+>>>>>>> main
 
         /// DeBERTa-v3 embedding block: word lookup + row LayerNorm + attention-mask multiply.
         /// Backends may return null to use the generic embedding/layernorm/multiply path.
@@ -847,6 +1067,10 @@ pub const ComputeBackend = struct {
         /// returns `gru(label_embeddings, pos0) + label_embeddings` as
         /// [num_labels, hidden_size].
         glinerLabelGruCombined: ?*const fn (ctx: *anyopaque, request: *const GlinerLabelGruCombinedRequest) anyerror!?CT = null,
+
+        /// GLiNER span-head gather of start/end projected word rows, concat on
+        /// the last dimension, and ReLU. Backends may fuse the full strip.
+        glinerGatherConcatRelu: ?*const fn (ctx: *anyopaque, request: *const GlinerGatherConcatReluRequest) anyerror!?CT = null,
 
         /// Y = X @ W^T + bias. X:[rows, in_dim], W:[out_dim, in_dim], bias:[out_dim] → Y:[rows, out_dim]
         linear: *const fn (ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT,
@@ -881,6 +1105,57 @@ pub const ComputeBackend = struct {
         /// bias, and residual add; callers fall back to linear + add.
         linearAdd: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, bias: CT, residual: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!?CT = null,
 
+        /// Y = X * scale. Backends may keep scalar multiplies on device;
+        /// callers fall back to creating a broadcast scalar tensor.
+        multiplyScalar: ?*const fn (ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT = null,
+
+        /// Y = X + value. Backends may keep scalar adds on device; callers
+        /// fall back to host materialization or a broadcast scalar tensor.
+        addScalar: ?*const fn (ctx: *anyopaque, input: CT, value: f32) anyerror!?CT = null,
+
+        /// Y = silu(gate) * up. Backends may fuse the common gated-FFN
+        /// activation/multiply pair; callers fall back to silu + multiply.
+        siluMultiply: ?*const fn (ctx: *anyopaque, gate: CT, up: CT) anyerror!?CT = null,
+
+        /// Y = activation(gate) * up for decoder-runtime activation kinds.
+        /// Backends may fuse the common gated-FFN activation/multiply pair.
+        activationMultiply: ?*const fn (ctx: *anyopaque, gate: CT, up: CT, activation: DecoderRuntimeActivationKind) anyerror!?CT = null,
+
+        /// Y = activation(gate) * sliceLastDim(source, start, stop).
+        /// Backends may fuse Gemma4 per-layer input conditioning without
+        /// materializing the sliced PLE vector.
+        activationMultiplySliceLastDim: ?*const fn (ctx: *anyopaque, gate: CT, source: CT, start: usize, stop: usize, activation: DecoderRuntimeActivationKind) anyerror!?CT = null,
+
+        /// Y = activation(input @ weight^T) * sliceLastDim(source, start, start + out_dim).
+        /// Backends may fuse Gemma4 QAT PLE gate projection with its activation/slice multiply.
+        linearNoBiasActivationSliceLastDim: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, source: CT, rows: usize, in_dim: usize, out_dim: usize, start: usize, activation: DecoderRuntimeActivationKind) anyerror!?CT = null,
+
+        /// Y = (A + B) * scalar[0]. Backends may fuse residual add and a
+        /// device-resident scalar multiply used by per-layer output scales.
+        addMultiplyScalarTensor: ?*const fn (ctx: *anyopaque, a: CT, b: CT, scalar: CT) anyerror!?CT = null,
+
+        /// Y = A * scale_a + B * scale_b. Backends may fuse small PLE/residual
+        /// combines without materializing scalar tensors or launching a
+        /// follow-up scale kernel.
+        addWeightedScalars: ?*const fn (ctx: *anyopaque, a: CT, b: CT, scale_a: f32, scale_b: f32) anyerror!?CT = null,
+
+        /// Y = rms_norm(input, weight, dim, eps) * scalar[0] + residual.
+        /// Backends may fuse Gemma-style post-norm residual epilogues.
+        rmsNormAddMultiplyScalarTensor: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, residual: CT, scalar: CT, dim: usize, eps: f32) anyerror!?CT = null,
+
+        /// Y = rms_norm(input, weight, dim, eps) + residual.
+        /// Backends may fuse Gemma-style post-norm residual epilogues when no
+        /// layer-output scale is present.
+        rmsNormAddTensor: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, residual: CT, dim: usize, eps: f32) anyerror!?CT = null,
+
+        /// Y = (rms_norm(input, weight, dim, eps) + residual) * scalar[0].
+        /// Backends may fuse Gemma4 PLE/post-FFN residual output-scale epilogues.
+        rmsNormAddOutputScaleTensor: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, residual: CT, scalar: CT, dim: usize, eps: f32) anyerror!?CT = null,
+
+        /// Y = rope(rms_norm_heads(input, weight, eps), ...), optionally scaled.
+        /// Backends may fuse Gemma/Qwen Q/K head norm immediately followed by RoPE.
+        rmsNormHeadsRope: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, total_dim: usize, head_dim: usize, rope_dim: usize, eps: f32, theta: f32, freq_scale: f32, position_offset: usize, seq_len: usize, consecutive_pairs: bool, scale: f32) anyerror!?CT = null,
+
         /// Y = layer_norm(A + B). Backends may fuse residual add and layer norm;
         /// callers fall back to add + layerNorm.
         addLayerNorm: ?*const fn (ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT = null,
@@ -912,16 +1187,32 @@ pub const ComputeBackend = struct {
         /// two independent `linearNoBias` calls.
         linearNoBiasPair: ?*const fn (ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!LinearNoBiasPairResult = null,
 
+        /// Compute asymmetric no-bias Q/K/V projections with one shared input.
+        /// This is used by GQA decoders where Q has a wider output than K/V.
+        /// Backends return null when unsupported and the wrapper falls back to
+        /// Q plus K/V pair projections.
+        linearNoBiasQkv: ?*const fn (ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_weight: CT, rows: usize, in_dim: usize, q_out_dim: usize, kv_out_dim: usize) anyerror!?LinearNoBiasTripleResult = null,
+
         /// Compute two biased linears that share the same input shape.
         /// Backends can apply bias inside their native quantized path;
         /// otherwise the wrapper falls back to no-bias pair + add or two
         /// independent `linear` calls.
         linearPair: ?*const fn (ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: CT, bias_b: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!LinearPairResult = null,
 
+<<<<<<< HEAD
         /// Y = activation(gate) * value. Backends may fuse activation and
         /// multiply to keep gated FFNs resident; callers fall back to the
         /// explicit activation + multiply sequence.
         activationMultiply: ?*const fn (ctx: *anyopaque, gate: CT, value: CT, activation: DecoderRuntimeActivationKind, rows: usize, dim: usize) anyerror!?CT = null,
+=======
+        /// Compute two biased ReLU linears that share the same input shape.
+        /// Backends may fuse projection, bias, and activation.
+        linearPairRelu: ?*const fn (ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: CT, bias_b: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!?LinearPairResult = null,
+
+        /// Compute two biased linears with separate inputs but equal shapes.
+        /// This is useful after paired activations split the dataflow.
+        linearPairInputs: ?*const fn (ctx: *anyopaque, input_a: CT, input_b: CT, weight_a: CT, bias_a: CT, weight_b: CT, bias_b: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!?LinearPairResult = null,
+>>>>>>> main
 
         /// Compute three biased linears that share the same input shape.
         /// This is the Q/K/V fast path for encoders with separate projection
@@ -967,6 +1258,14 @@ pub const ComputeBackend = struct {
         /// view; otherwise the wrapper falls back to copying through host f32.
         reshape2D: ?*const fn (ctx: *anyopaque, input: CT, old_rows: usize, old_cols: usize, new_rows: usize, new_cols: usize) anyerror!CT = null,
 
+        /// Allocate an uninitialized f32 tensor with the given shape. Backends
+        /// that cannot provide stable device storage leave this null.
+        allocUninitF32Shape: ?*const fn (ctx: *anyopaque, shape: []const i32) anyerror!?CT = null,
+
+        /// Copy row_count contiguous rows from src into dst. Shapes are logical
+        /// [*, cols] f32 row-major tensors. Returns false when unsupported.
+        copyRows2D: ?*const fn (ctx: *anyopaque, dst: CT, dst_start_row: usize, src: CT, src_start_row: usize, row_count: usize, cols: usize) anyerror!bool = null,
+
         /// Concatenate two rank-2 tensors along rows:
         /// a:[rows_a, cols], b:[rows_b, cols] -> [rows_a + rows_b, cols]
         concatRows2D: ?*const fn (ctx: *anyopaque, a: CT, b: CT, rows_a: usize, rows_b: usize, cols: usize) anyerror!CT = null,
@@ -974,6 +1273,15 @@ pub const ComputeBackend = struct {
         /// Slice contiguous rows from a rank-2 tensor:
         /// input:[rows, cols] -> [row_count, cols]
         sliceRows2D: ?*const fn (ctx: *anyopaque, input: CT, start_row: usize, row_count: usize, cols: usize) anyerror!CT = null,
+
+        /// Florence-2 vision tail for spatial_avg_pool + temporal_avg_pool:
+        /// apply final 2D/temporal embeddings on device and emit
+        /// [batch * (height * width + 1), dim].
+        florenceVisionTailSources: ?*const fn (ctx: *anyopaque, tokens: CT, row_embed: CT, col_embed: CT, temporal_embed: ?CT, batch: usize, height: usize, width: usize, dim: usize) anyerror!?CT = null,
+
+        /// Florence-2 image projection with backend-owned cached projection
+        /// weight layout when the stored GGUF tensor is quantized.
+        florenceProjectImageFeatures: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, vision_dim: usize, projection_dim: usize) anyerror!?CT = null,
 
         /// ggml_mul_mat_id-style routed matrix multiply. `input` is already
         /// grouped row-wise, `weight` is the full packed expert tensor or an
@@ -1032,6 +1340,11 @@ pub const ComputeBackend = struct {
         /// RMS normalization: x * rsqrt(mean(x^2) + eps) * weight. No bias, no mean subtraction.
         rmsNorm: *const fn (ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT,
 
+        /// RMS normalization without learned weights:
+        /// x * rsqrt(mean(x^2) + eps). Backends may implement this to avoid
+        /// constructing an all-ones weight tensor on hot paths.
+        rmsNormBare: ?*const fn (ctx: *anyopaque, input: CT, dim: usize, eps: f32) anyerror!?CT = null,
+
         /// Optional destructive RMS norm that may reuse the input tensor's
         /// storage when it is uniquely owned. Callers must only use this when
         /// the input is at last use.
@@ -1070,6 +1383,12 @@ pub const ComputeBackend = struct {
 
         /// Element-wise addition. Result is a new tensor; inputs are NOT freed.
         add: *const fn (ctx: *anyopaque, a: CT, b: CT) anyerror!CT,
+
+        /// In-place row-wise bias add for an owned `[rows, out_dim]` tensor and
+        /// `[out_dim]` bias. Backends return null when unsupported; callers
+        /// retain ownership of `input` on null/error and own the returned tensor
+        /// on success.
+        addBiasRowsConsume: ?*const fn (ctx: *anyopaque, input: CT, bias: CT, rows: usize, out_dim: usize) anyerror!?CT = null,
 
         /// Optional destructive addition that may reuse the left-hand tensor's
         /// storage when it is uniquely owned and already matches the output
@@ -1243,6 +1562,10 @@ pub const ComputeBackend = struct {
         /// Rotates pairs of dimensions using sin/cos of position-dependent angles.
         rope: *const fn (ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) anyerror!CT,
 
+        /// Apply scalar multiply and RoPE in one backend op. Used by Gemma
+        /// variants that pre-scale Q before attention.
+        ropeScaled: ?*const fn (ctx: *anyopaque, input: CT, scale: f32, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) anyerror!?CT = null,
+
         /// Apply rotary position embeddings with per-item query lengths and
         /// position offsets for mixed prefill+decode batches.
         ropePerItem: *const fn (ctx: *anyopaque, input: CT, batch: usize, max_seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, query_lengths: []const usize, position_offsets: []const usize, consecutive_pairs: bool) anyerror!CT,
@@ -1277,10 +1600,22 @@ pub const ComputeBackend = struct {
         /// tensor in its native logical dtype without widening through f32.
         exportTensorData: ?*const fn (ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror!?ExportTensorData = null,
 
+        /// Enqueue a backend-side i32 scalar download without blocking the
+        /// caller. The returned handle must be finished or canceled before the
+        /// backend is destroyed. Backends return null when unsupported.
+        beginI32ScalarDownload: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!?PendingI32ScalarDownload = null,
+        finishI32ScalarDownload: ?*const fn (ctx: *anyopaque, pending: PendingI32ScalarDownload) anyerror!i32 = null,
+        cancelI32ScalarDownload: ?*const fn (ctx: *anyopaque, pending: PendingI32ScalarDownload) void = null,
+
         /// Clone a tensor into a new backend handle with the requested logical
         /// shape without requiring host materialization. Backends may alias
         /// immutable device storage when lifetime/refcounting makes that safe.
         cloneTensorShape: ?*const fn (ctx: *anyopaque, tensor: CT, shape: []const i32) anyerror!?CT = null,
+
+        /// Copy a tensor from another backend instance into this backend
+        /// without host materialization when the two backends are compatible.
+        /// Backends return null when unsupported.
+        copyTensorFromBackend: ?*const fn (ctx: *anyopaque, src_ctx: *anyopaque, src_kind: BackendKind, src_tensor: CT) anyerror!?CT = null,
 
         /// Return the logical tensor dtype when the backend can report it.
         tensorDType: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!tensor_mod.DType = null,
@@ -1296,6 +1631,19 @@ pub const ComputeBackend = struct {
         /// Backends may return null when they do not provide a specialized path.
         argmaxLastRow: ?*const fn (ctx: *anyopaque, tensor: CT, rows: usize, dim: usize) anyerror!?u32 = null,
 
+        /// Return argmax token ids for a contiguous row range of a [rows, dim]
+        /// tensor. Backends may return null to use repeated argmaxLastRow calls.
+        argmaxRows: ?*const fn (ctx: *anyopaque, tensor: CT, row_start: usize, row_count: usize, dim: usize, allocator: std.mem.Allocator) anyerror!?[]u32 = null,
+
+        /// Return argmax token ids for a contiguous row range while masking a
+        /// small list of suppressed token ids.
+        argmaxRowsSuppress: ?*const fn (ctx: *anyopaque, tensor: CT, row_start: usize, row_count: usize, dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) anyerror!?[]u32 = null,
+
+        /// Return the argmax token id as a backend tensor while masking a small
+        /// list of suppressed token ids. Used by pure-greedy decode paths that
+        /// must avoid full-logit host transfers.
+        argmaxLastRowSuppressTensor: ?*const fn (ctx: *anyopaque, tensor: CT, rows: usize, dim: usize, suppress_token_ids: []const i32) anyerror!?CT = null,
+
         /// Sample a token id from the last row of a [rows, dim] tensor.
         /// Backends may return null to fall back to host materialization.
         sampleLastRow: ?*const fn (ctx: *anyopaque, request: *const SampleLastRowRequest) anyerror!?u32 = null,
@@ -1309,6 +1657,42 @@ pub const ComputeBackend = struct {
         /// the token id as a backend tensor. Used by decode paths that want to
         /// feed the next token back into the backend without a host upload.
         linearNoBiasArgmaxLastRowTensor: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!?CT = null,
+
+        /// Compute argmax(input @ weight^T) for the last input row while
+        /// masking a small list of suppressed token ids, returning the token id
+        /// as a backend tensor.
+        linearNoBiasArgmaxLastRowSuppressTensor: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, suppress_token_ids: []const i32) anyerror!?CT = null,
+
+        /// Compute argmax(input @ weight^T) for every row in a contiguous
+        /// input tensor while masking a small list of suppressed token ids.
+        /// Returns host token ids because speculative verification needs to
+        /// compare them against draft tokens on the CPU control path.
+        linearNoBiasArgmaxRowsSuppress: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) anyerror!?[]u32 = null,
+
+        /// Gemma4 MTP masked embedding selection. Backends may keep centroid
+        /// top-k and restricted-token argmax on device; callers fall back to
+        /// the portable host implementation when unsupported.
+        gemma4MtpMaskedArgmax: ?*const fn (ctx: *anyopaque, request: *const Gemma4MtpMaskedArgmaxRequest) anyerror!?u32 = null,
+
+        /// Gemma4 MTP masked embedding selection fused with the assistant
+        /// hidden-to-centroid projection. Backends return null when unsupported
+        /// so callers can use centroid linear + masked argmax.
+        gemma4MtpMaskedSelect: ?*const fn (ctx: *anyopaque, request: *const Gemma4MtpMaskedSelectRequest) anyerror!?u32 = null,
+
+        /// Gemma4 MTP masked embedding selection fused all the way from
+        /// assistant hidden state to the restricted LM-head argmax. Backends
+        /// return null when unsupported so callers can compute full logits.
+        gemma4MtpMaskedSelectFromHidden: ?*const fn (ctx: *anyopaque, request: *const Gemma4MtpMaskedSelectFromHiddenRequest) anyerror!?u32 = null,
+
+        /// Gemma4 MTP preprojection helper. Backends may fuse the target
+        /// embedding/activation concat with pre_projection.weight; callers
+        /// fall back to concat + linear when unsupported.
+        gemma4MtpPreproject: ?*const fn (ctx: *anyopaque, request: *const Gemma4MtpPreprojectRequest) anyerror!?CT = null,
+
+        /// Gemma4 pure-greedy MTP verification helper. Backends may combine
+        /// hidden-to-LM-head argmax with draft comparison and commit metadata;
+        /// callers fall back to the portable verifier when unsupported.
+        gemma4MtpVerifyCommit: ?*const fn (ctx: *anyopaque, request: *const Gemma4MtpVerifyCommitRequest) anyerror!?Gemma4MtpVerifyCommitResult = null,
 
         /// Prepare a backend-owned whole-token greedy decode runtime for a
         /// decoder-only model. Backends return false when unsupported so the
@@ -1464,6 +1848,11 @@ pub const ComputeBackend = struct {
         /// token from the resulting last-row logits using a penalty-free
         /// sampling config.
         decoderRuntimeApplyRmsNormLinearSample: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyRmsNormLinearSampleRequest) anyerror!?usize = null,
+
+        /// Sample a token from the full logits left resident in the backend's
+        /// sample-logits buffer by the most recent decode frame's fused
+        /// lm-head tail.
+        decoderRuntimeSampleResidentLogits: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeSampleResidentLogitsRequest) anyerror!?usize = null,
 
         /// Upload dense linear parameters into a backend-owned whole-token
         /// runtime slot. Weight shape is [out_dim, in_dim], bias shape is
@@ -1684,8 +2073,20 @@ pub const ComputeBackend = struct {
         self.vtable.drainPrefetchBudget(self.ptr, max_items);
     }
 
+    pub fn debugProfileCheckpoint(self: *const ComputeBackend, label: []const u8, layer: usize) void {
+        const op = self.vtable.debugProfileCheckpoint orelse return;
+        op(self.ptr, label, layer);
+    }
+
     pub fn embeddingLookup(self: *const ComputeBackend, weight: CT, ids: []const i64, total: usize, dim: usize) !CT {
         return self.vtable.embeddingLookup(self.ptr, weight, ids, total, dim);
+    }
+
+    pub fn embeddingLookupScaled(self: *const ComputeBackend, weight: CT, ids: []const i64, total: usize, dim: usize, scale: f32) !?CT {
+        if (self.vtable.embeddingLookupScaled) |op| {
+            return op(self.ptr, weight, ids, total, dim, scale);
+        }
+        return null;
     }
 
     pub fn embeddingLookupTensor(self: *const ComputeBackend, weight: CT, ids: CT, total: usize, dim: usize) !?CT {
@@ -1695,9 +2096,29 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+<<<<<<< HEAD
     pub fn addNeftuneNoise(self: *const ComputeBackend, input: CT, seed: u64, scale: f32) !?CT {
         if (self.vtable.addNeftuneNoise) |op| {
             return op(self.ptr, input, seed, scale);
+=======
+    pub fn embeddingLookupTensorScaled(self: *const ComputeBackend, weight: CT, ids: CT, total: usize, dim: usize, scale: f32) !?CT {
+        if (self.vtable.embeddingLookupTensorScaled) |op| {
+            return op(self.ptr, weight, ids, total, dim, scale);
+        }
+        return null;
+    }
+
+    pub fn addWeightedEmbeddingTensor(self: *const ComputeBackend, weight: CT, ids: CT, rhs: CT, total: usize, dim: usize, lhs_scale: f32, rhs_scale: f32) !?CT {
+        if (self.vtable.addWeightedEmbeddingTensor) |op| {
+            return op(self.ptr, weight, ids, rhs, total, dim, lhs_scale, rhs_scale);
+        }
+        return null;
+    }
+
+    pub fn rmsNormAddWeightedEmbeddingTensor(self: *const ComputeBackend, input: CT, norm_weight: CT, embedding_weight: CT, ids: CT, total: usize, num_groups: usize, group_dim: usize, eps: f32, lhs_scale: f32, rhs_scale: f32) !?CT {
+        if (self.vtable.rmsNormAddWeightedEmbeddingTensor) |op| {
+            return op(self.ptr, input, norm_weight, embedding_weight, ids, total, num_groups, group_dim, eps, lhs_scale, rhs_scale);
+>>>>>>> main
         }
         return null;
     }
@@ -1864,6 +2285,30 @@ pub const ComputeBackend = struct {
         };
     }
 
+    pub fn linearNoBiasQkv(
+        self: *const ComputeBackend,
+        input: CT,
+        q_weight: CT,
+        k_weight: CT,
+        v_weight: CT,
+        rows: usize,
+        in_dim: usize,
+        q_out_dim: usize,
+        kv_out_dim: usize,
+    ) !LinearNoBiasTripleResult {
+        if (self.vtable.linearNoBiasQkv) |linear_no_bias_qkv| {
+            if (try linear_no_bias_qkv(self.ptr, input, q_weight, k_weight, v_weight, rows, in_dim, q_out_dim, kv_out_dim)) |result| {
+                return result;
+            }
+        }
+        const q = try self.linearNoBias(input, q_weight, rows, in_dim, q_out_dim);
+        errdefer self.free(q);
+        const kv = try self.linearNoBiasPair(input, k_weight, v_weight, rows, in_dim, kv_out_dim);
+        errdefer self.free(kv.first);
+        errdefer self.free(kv.second);
+        return .{ .first = q, .second = kv.first, .third = kv.second };
+    }
+
     pub fn linearPair(
         self: *const ComputeBackend,
         input: CT,
@@ -1905,6 +2350,7 @@ pub const ComputeBackend = struct {
         return .{ .first = first, .second = second };
     }
 
+<<<<<<< HEAD
     pub fn activationMultiply(
         self: *const ComputeBackend,
         gate: CT,
@@ -1917,6 +2363,66 @@ pub const ComputeBackend = struct {
             return activation_multiply(self.ptr, gate, value, activation, rows, dim);
         }
         return null;
+=======
+    pub fn linearPairRelu(
+        self: *const ComputeBackend,
+        input: CT,
+        weight_a: CT,
+        bias_a: CT,
+        weight_b: CT,
+        bias_b: CT,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) !LinearPairResult {
+        if (self.vtable.linearPairRelu) |linear_pair_relu| {
+            if (try linear_pair_relu(self.ptr, input, weight_a, bias_a, weight_b, bias_b, rows, in_dim, out_dim)) |fused| {
+                return fused;
+            }
+        }
+
+        const pair = try self.linearPair(input, weight_a, bias_a, weight_b, bias_b, rows, in_dim, out_dim);
+        var first_live = true;
+        var second_live = true;
+        errdefer if (first_live) self.free(pair.first);
+        errdefer if (second_live) self.free(pair.second);
+
+        const first = try self.relu(pair.first);
+        self.free(pair.first);
+        first_live = false;
+        var first_relu_live = true;
+        errdefer if (first_relu_live) self.free(first);
+
+        const second = try self.relu(pair.second);
+        self.free(pair.second);
+        second_live = false;
+        first_relu_live = false;
+        return .{ .first = first, .second = second };
+    }
+
+    pub fn linearPairInputs(
+        self: *const ComputeBackend,
+        input_a: CT,
+        input_b: CT,
+        weight_a: CT,
+        bias_a: CT,
+        weight_b: CT,
+        bias_b: CT,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) !LinearPairResult {
+        if (self.vtable.linearPairInputs) |linear_pair_inputs| {
+            if (try linear_pair_inputs(self.ptr, input_a, input_b, weight_a, bias_a, weight_b, bias_b, rows, in_dim, out_dim)) |fused| {
+                return fused;
+            }
+        }
+
+        const first = try self.linear(input_a, weight_a, bias_a, rows, in_dim, out_dim);
+        errdefer self.free(first);
+        const second = try self.linear(input_b, weight_b, bias_b, rows, in_dim, out_dim);
+        return .{ .first = first, .second = second };
+>>>>>>> main
     }
 
     pub fn linearTriple(
@@ -2003,6 +2509,30 @@ pub const ComputeBackend = struct {
         return self.fromFloat32Shape(data, &shape);
     }
 
+    pub fn allocUninitF32Shape(self: *const ComputeBackend, shape: []const i32) !?CT {
+        if (self.vtable.allocUninitF32Shape) |alloc_uninit| {
+            return alloc_uninit(self.ptr, shape);
+        }
+        return null;
+    }
+
+    pub fn copyRows2D(
+        self: *const ComputeBackend,
+        allocator: std.mem.Allocator,
+        dst: CT,
+        dst_start_row: usize,
+        src: CT,
+        src_start_row: usize,
+        row_count: usize,
+        cols: usize,
+    ) !bool {
+        _ = allocator;
+        if (self.vtable.copyRows2D) |copy_rows_2d| {
+            return copy_rows_2d(self.ptr, dst, dst_start_row, src, src_start_row, row_count, cols);
+        }
+        return false;
+    }
+
     pub fn concatRows2D(
         self: *const ComputeBackend,
         allocator: std.mem.Allocator,
@@ -2047,6 +2577,37 @@ pub const ComputeBackend = struct {
         const out = data[start_row * cols ..][0 .. row_count * cols];
         const shape = [_]i32{ @intCast(row_count), @intCast(cols) };
         return self.fromFloat32Shape(out, &shape);
+    }
+
+    pub fn florenceVisionTailSources(
+        self: *const ComputeBackend,
+        tokens: CT,
+        row_embed: CT,
+        col_embed: CT,
+        temporal_embed: ?CT,
+        batch: usize,
+        height: usize,
+        width: usize,
+        dim: usize,
+    ) !?CT {
+        if (self.vtable.florenceVisionTailSources) |vision_tail| {
+            return vision_tail(self.ptr, tokens, row_embed, col_embed, temporal_embed, batch, height, width, dim);
+        }
+        return null;
+    }
+
+    pub fn florenceProjectImageFeatures(
+        self: *const ComputeBackend,
+        input: CT,
+        weight: CT,
+        rows: usize,
+        vision_dim: usize,
+        projection_dim: usize,
+    ) !?CT {
+        if (self.vtable.florenceProjectImageFeatures) |project| {
+            return project(self.ptr, input, weight, rows, vision_dim, projection_dim);
+        }
+        return null;
     }
 
     pub fn mulMatId(
@@ -2170,6 +2731,11 @@ pub const ComputeBackend = struct {
         return self.vtable.rmsNorm(self.ptr, input, weight, dim, eps);
     }
 
+    pub fn rmsNormBare(self: *const ComputeBackend, input: CT, dim: usize, eps: f32) !?CT {
+        if (self.vtable.rmsNormBare) |f| return f(self.ptr, input, dim, eps);
+        return null;
+    }
+
     pub fn rmsNormConsumeInput(self: *const ComputeBackend, input: CT, weight: CT, dim: usize, eps: f32) !?CT {
         if (self.vtable.rmsNormConsumeInput) |f| return f(self.ptr, input, weight, dim, eps);
         return null;
@@ -2224,6 +2790,11 @@ pub const ComputeBackend = struct {
 
     pub fn denseMlp2(self: *const ComputeBackend, request: *const DenseMlp2Request) !?CT {
         if (self.vtable.denseMlp2) |f| return f(self.ptr, request);
+        return null;
+    }
+
+    pub fn glinerGatherConcatRelu(self: *const ComputeBackend, request: *const GlinerGatherConcatReluRequest) !?CT {
+        if (self.vtable.glinerGatherConcatRelu) |f| return f(self.ptr, request);
         return null;
     }
 
@@ -2283,6 +2854,11 @@ pub const ComputeBackend = struct {
 
     pub fn add(self: *const ComputeBackend, a: CT, b: CT) !CT {
         return self.vtable.add(self.ptr, a, b);
+    }
+
+    pub fn addBiasRowsConsume(self: *const ComputeBackend, input: CT, bias: CT, rows: usize, out_dim: usize) !?CT {
+        if (self.vtable.addBiasRowsConsume) |f| return f(self.ptr, input, bias, rows, out_dim);
+        return null;
     }
 
     pub fn addConsumeLeft(self: *const ComputeBackend, a: CT, b: CT) !?CT {
@@ -2488,8 +3064,73 @@ pub const ComputeBackend = struct {
         return self.vtable.multiply(self.ptr, a, b);
     }
 
+    pub fn multiplyScalar(self: *const ComputeBackend, input: CT, scale: f32) !?CT {
+        const op = self.vtable.multiplyScalar orelse return null;
+        return op(self.ptr, input, scale);
+    }
+
+    pub fn addScalar(self: *const ComputeBackend, input: CT, value: f32) !?CT {
+        const op = self.vtable.addScalar orelse return null;
+        return op(self.ptr, input, value);
+    }
+
+    pub fn siluMultiply(self: *const ComputeBackend, gate: CT, up: CT) !?CT {
+        const op = self.vtable.siluMultiply orelse return null;
+        return op(self.ptr, gate, up);
+    }
+
+    pub fn activationMultiply(self: *const ComputeBackend, gate: CT, up: CT, activation: DecoderRuntimeActivationKind) !?CT {
+        const op = self.vtable.activationMultiply orelse return null;
+        return op(self.ptr, gate, up, activation);
+    }
+
+    pub fn activationMultiplySliceLastDim(self: *const ComputeBackend, gate: CT, source: CT, start: usize, stop: usize, activation: DecoderRuntimeActivationKind) !?CT {
+        const op = self.vtable.activationMultiplySliceLastDim orelse return null;
+        return op(self.ptr, gate, source, start, stop, activation);
+    }
+
+    pub fn linearNoBiasActivationSliceLastDim(self: *const ComputeBackend, input: CT, weight: CT, source: CT, rows: usize, in_dim: usize, out_dim: usize, start: usize, activation: DecoderRuntimeActivationKind) !?CT {
+        const op = self.vtable.linearNoBiasActivationSliceLastDim orelse return null;
+        return op(self.ptr, input, weight, source, rows, in_dim, out_dim, start, activation);
+    }
+
+    pub fn addMultiplyScalarTensor(self: *const ComputeBackend, a: CT, b: CT, scalar: CT) !?CT {
+        const op = self.vtable.addMultiplyScalarTensor orelse return null;
+        return op(self.ptr, a, b, scalar);
+    }
+
+    pub fn addWeightedScalars(self: *const ComputeBackend, a: CT, b: CT, scale_a: f32, scale_b: f32) !?CT {
+        const op = self.vtable.addWeightedScalars orelse return null;
+        return op(self.ptr, a, b, scale_a, scale_b);
+    }
+
+    pub fn rmsNormAddMultiplyScalarTensor(self: *const ComputeBackend, input: CT, weight: CT, residual: CT, scalar: CT, dim: usize, eps: f32) !?CT {
+        const op = self.vtable.rmsNormAddMultiplyScalarTensor orelse return null;
+        return op(self.ptr, input, weight, residual, scalar, dim, eps);
+    }
+
+    pub fn rmsNormAddTensor(self: *const ComputeBackend, input: CT, weight: CT, residual: CT, dim: usize, eps: f32) !?CT {
+        const op = self.vtable.rmsNormAddTensor orelse return null;
+        return op(self.ptr, input, weight, residual, dim, eps);
+    }
+
+    pub fn rmsNormAddOutputScaleTensor(self: *const ComputeBackend, input: CT, weight: CT, residual: CT, scalar: CT, dim: usize, eps: f32) !?CT {
+        const op = self.vtable.rmsNormAddOutputScaleTensor orelse return null;
+        return op(self.ptr, input, weight, residual, scalar, dim, eps);
+    }
+
+    pub fn rmsNormHeadsRope(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, total_dim: usize, head_dim: usize, rope_dim: usize, eps: f32, theta: f32, freq_scale: f32, position_offset: usize, seq_len: usize, consecutive_pairs: bool, scale: f32) !?CT {
+        const op = self.vtable.rmsNormHeadsRope orelse return null;
+        return op(self.ptr, input, weight, rows, total_dim, head_dim, rope_dim, eps, theta, freq_scale, position_offset, seq_len, consecutive_pairs, scale);
+    }
+
     pub fn rope(self: *const ComputeBackend, input: CT, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) !CT {
         return self.vtable.rope(self.ptr, input, seq_len, head_dim, rope_dim, theta, freq_scale, position_offset, consecutive_pairs);
+    }
+
+    pub fn ropeScaled(self: *const ComputeBackend, input: CT, scale: f32, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) !?CT {
+        const op = self.vtable.ropeScaled orelse return null;
+        return op(self.ptr, input, scale, seq_len, head_dim, rope_dim, theta, freq_scale, position_offset, consecutive_pairs);
     }
 
     pub fn ropePerItem(
@@ -2542,9 +3183,36 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    pub fn beginI32ScalarDownload(self: *const ComputeBackend, tensor: CT) !?PendingI32ScalarDownload {
+        if (self.vtable.beginI32ScalarDownload) |begin_i32_scalar_download| {
+            return begin_i32_scalar_download(self.ptr, tensor);
+        }
+        return null;
+    }
+
+    pub fn finishI32ScalarDownload(self: *const ComputeBackend, pending: PendingI32ScalarDownload) !i32 {
+        if (self.vtable.finishI32ScalarDownload) |finish_i32_scalar_download| {
+            return finish_i32_scalar_download(self.ptr, pending);
+        }
+        return error.UnsupportedBackendOp;
+    }
+
+    pub fn cancelI32ScalarDownload(self: *const ComputeBackend, pending: PendingI32ScalarDownload) void {
+        if (self.vtable.cancelI32ScalarDownload) |cancel_i32_scalar_download| {
+            cancel_i32_scalar_download(self.ptr, pending);
+        }
+    }
+
     pub fn cloneTensorShape(self: *const ComputeBackend, tensor: CT, shape: []const i32) !?CT {
         if (self.vtable.cloneTensorShape) |clone_tensor_shape| {
             return clone_tensor_shape(self.ptr, tensor, shape);
+        }
+        return null;
+    }
+
+    pub fn copyTensorFromBackend(self: *const ComputeBackend, src_backend: *const ComputeBackend, src_tensor: CT) !?CT {
+        if (self.vtable.copyTensorFromBackend) |copy_tensor_from_backend| {
+            return copy_tensor_from_backend(self.ptr, src_backend.ptr, src_backend.kind(), src_tensor);
         }
         return null;
     }
@@ -2597,6 +3265,27 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    pub fn argmaxRows(self: *const ComputeBackend, tensor: CT, row_start: usize, row_count: usize, dim: usize, allocator: std.mem.Allocator) !?[]u32 {
+        if (self.vtable.argmaxRows) |argmax_rows| {
+            return argmax_rows(self.ptr, tensor, row_start, row_count, dim, allocator);
+        }
+        return null;
+    }
+
+    pub fn argmaxRowsSuppress(self: *const ComputeBackend, tensor: CT, row_start: usize, row_count: usize, dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) !?[]u32 {
+        if (self.vtable.argmaxRowsSuppress) |argmax_rows_suppress| {
+            return argmax_rows_suppress(self.ptr, tensor, row_start, row_count, dim, suppress_token_ids, allocator);
+        }
+        return null;
+    }
+
+    pub fn argmaxLastRowSuppressTensor(self: *const ComputeBackend, tensor: CT, rows: usize, dim: usize, suppress_token_ids: []const i32) !?CT {
+        if (self.vtable.argmaxLastRowSuppressTensor) |argmax_last_row_suppress_tensor| {
+            return argmax_last_row_suppress_tensor(self.ptr, tensor, rows, dim, suppress_token_ids);
+        }
+        return null;
+    }
+
     pub fn sampleLastRow(self: *const ComputeBackend, request: *const SampleLastRowRequest) !?u32 {
         if (self.vtable.sampleLastRow) |sample_last_row| {
             return sample_last_row(self.ptr, request);
@@ -2614,6 +3303,55 @@ pub const ComputeBackend = struct {
     pub fn linearNoBiasArgmaxLastRowTensor(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) !?CT {
         if (self.vtable.linearNoBiasArgmaxLastRowTensor) |op| {
             return op(self.ptr, input, weight, rows, in_dim, out_dim);
+        }
+        return null;
+    }
+
+    pub fn linearNoBiasArgmaxLastRowSuppressTensor(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, suppress_token_ids: []const i32) !?CT {
+        if (self.vtable.linearNoBiasArgmaxLastRowSuppressTensor) |op| {
+            return op(self.ptr, input, weight, rows, in_dim, out_dim, suppress_token_ids);
+        }
+        return null;
+    }
+
+    pub fn linearNoBiasArgmaxRowsSuppress(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) !?[]u32 {
+        if (self.vtable.linearNoBiasArgmaxRowsSuppress) |op| {
+            return op(self.ptr, input, weight, rows, in_dim, out_dim, suppress_token_ids, allocator);
+        }
+        return null;
+    }
+
+    pub fn gemma4MtpMaskedArgmax(self: *const ComputeBackend, request: *const Gemma4MtpMaskedArgmaxRequest) !?u32 {
+        if (self.vtable.gemma4MtpMaskedArgmax) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn gemma4MtpMaskedSelect(self: *const ComputeBackend, request: *const Gemma4MtpMaskedSelectRequest) !?u32 {
+        if (self.vtable.gemma4MtpMaskedSelect) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn gemma4MtpMaskedSelectFromHidden(self: *const ComputeBackend, request: *const Gemma4MtpMaskedSelectFromHiddenRequest) !?u32 {
+        if (self.vtable.gemma4MtpMaskedSelectFromHidden) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn gemma4MtpPreproject(self: *const ComputeBackend, request: *const Gemma4MtpPreprojectRequest) !?CT {
+        if (self.vtable.gemma4MtpPreproject) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn gemma4MtpVerifyCommit(self: *const ComputeBackend, request: *const Gemma4MtpVerifyCommitRequest) !?Gemma4MtpVerifyCommitResult {
+        if (self.vtable.gemma4MtpVerifyCommit) |op| {
+            return op(self.ptr, request);
         }
         return null;
     }
@@ -2869,6 +3607,13 @@ pub const ComputeBackend = struct {
 
     pub fn decoderRuntimeApplyRmsNormLinearSample(self: *const ComputeBackend, request: *const DecoderRuntimeApplyRmsNormLinearSampleRequest) !?usize {
         if (self.vtable.decoderRuntimeApplyRmsNormLinearSample) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeSampleResidentLogits(self: *const ComputeBackend, request: *const DecoderRuntimeSampleResidentLogitsRequest) !?usize {
+        if (self.vtable.decoderRuntimeSampleResidentLogits) |op| {
             return op(self.ptr, request);
         }
         return null;

@@ -54,6 +54,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, subcommand, "swarm")) return try cmd.swarm.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "inference")) return try cmd.inference.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "serverless")) return try cmd.serverless.runFromIterator(runtimeInit(init), argv0, &args);
+    if (std.mem.eql(u8, subcommand, "lite")) return try cmd.lite.runFromIterator(runtimeInit(init), argv0, &args);
+    if (std.mem.eql(u8, subcommand, "ha")) return try cmd.ha.runFromIterator(runtimeInit(init), argv0, &args);
 
     if (std.mem.eql(u8, subcommand, "cloud")) {
         const code = try runAntflyCloud(init.gpa, init.io, &args);
@@ -62,13 +64,16 @@ pub fn main(init: std.process.Init) !void {
 
     // CLI client subcommands — these talk to a remote Antfly server via HTTP
     const cli_commands = [_][]const u8{
-        "table",  "index",   "query",    "lookup",
-        "load",   "insert",  "delete",   "agents",
-        "backup", "restore", "internal",
+        "table",  "index",  "artifact", "query",
+        "lookup", "load",   "insert",   "delete",
+        "agents", "backup", "restore",  "internal",
     };
     for (cli_commands) |cli_cmd| {
         if (std.mem.eql(u8, subcommand, cli_cmd)) {
-            return runCliCommand(init.gpa, cli_cmd, &args);
+            return runCliCommand(init.gpa, cli_cmd, &args) catch |err| switch (err) {
+                error.ApiError => std.process.exit(1),
+                else => return err,
+            };
         }
     }
 
@@ -146,6 +151,7 @@ fn runCliCommand(allocator: std.mem.Allocator, subcommand: []const u8, args: *st
     // Dispatch to the specific command
     if (std.mem.eql(u8, subcommand, "table")) return cmd.cli.table.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "index")) return cmd.cli.index.run(allocator, io, &client, args);
+    if (std.mem.eql(u8, subcommand, "artifact")) return cmd.cli.artifact.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "query")) return cmd.cli.query.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "lookup")) return cmd.cli.query.lookup(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "load")) return cmd.cli.data.load(allocator, io, &client, args);
@@ -168,10 +174,13 @@ fn printUsage(argv0: []const u8) void {
         \\  swarm
         \\  inference
         \\  serverless
+        \\  lite           Embedded Antfly Lite databases (*.aflite)
+        \\  ha             Local hot-standby HA administration
         \\
         \\client subcommands:
         \\  table          Manage tables (create, drop, list, get)
         \\  index          Manage indexes (create, drop, list, get)
+        \\  artifact       Manage generated artifact enrichments and reprocessing
         \\  query          Query data from a table
         \\  lookup         Look up a document by key
         \\  load           Bulk load data from NDJSON file
@@ -179,7 +188,7 @@ fn printUsage(argv0: []const u8) void {
         \\  delete         Delete a single document
         \\  agents         Run AI agents (retrieval, query-builder)
         \\  backup         Backup tables
-        \\  restore        Restore tables from backup
+        \\  restore        Restore tables from backup, including Lite *.aflite input
         \\  auth           Manage data-plane users, roles, permissions, row filters, and API keys
         \\  internal       Internal cluster management
         \\  cloud          Delegate to the separate Antfly Cloud CLI

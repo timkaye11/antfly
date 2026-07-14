@@ -25,6 +25,7 @@ import type {
   DocumentArtifactReprocessResponse,
   DocumentArtifactTableReprocessRequest,
   DocumentArtifactTableReprocessResponse,
+  EnrichmentConfig,
   IndexConfig,
   LinearMergeRequest,
   LinearMergeResult,
@@ -42,6 +43,7 @@ import type {
   RetrievalAgentResult,
   RetrievalAgentStreamCallbacks,
   ScanKeysRequest,
+  TableArtifactEnrichmentList,
   TableSchema,
   User,
   WriteOptions,
@@ -942,6 +944,64 @@ export class AntflyClient {
 
     artifacts: {
       /**
+       * List table-level generated artifact enrichment definitions.
+       */
+      listEnrichments: async (
+        tableName: string
+      ): Promise<TableArtifactEnrichmentList | undefined> => {
+        const { data, error } = await this.client.GET("/db/v1/tables/{tableName}/artifacts", {
+          params: {
+            path: { tableName },
+          },
+        });
+        if (error) {
+          throw new Error(`Failed to list artifact enrichments: ${apiErrorMessage(error)}`);
+        }
+        return data;
+      },
+
+      /**
+       * Register or replace a table-level generated artifact enrichment.
+       */
+      putEnrichment: async (
+        tableName: string,
+        artifactName: string,
+        config: EnrichmentConfig
+      ): Promise<unknown> => {
+        const { data, error } = await this.client.PUT(
+          "/db/v1/tables/{tableName}/artifacts/{artifactName}/enrichment",
+          {
+            params: {
+              path: { tableName, artifactName },
+            },
+            body: config,
+          }
+        );
+        if (error) {
+          throw new Error(`Failed to put artifact enrichment: ${apiErrorMessage(error)}`);
+        }
+        return data;
+      },
+
+      /**
+       * Delete a table-level generated artifact enrichment.
+       */
+      deleteEnrichment: async (tableName: string, artifactName: string): Promise<unknown> => {
+        const { data, error } = await this.client.DELETE(
+          "/db/v1/tables/{tableName}/artifacts/{artifactName}/enrichment",
+          {
+            params: {
+              path: { tableName, artifactName },
+            },
+          }
+        );
+        if (error) {
+          throw new Error(`Failed to delete artifact enrichment: ${apiErrorMessage(error)}`);
+        }
+        return data;
+      },
+
+      /**
        * List derived artifact manifests attached to a document.
        */
       list: async (
@@ -1124,11 +1184,11 @@ export class AntflyClient {
     scan: (
       tableName: string,
       request?: ScanKeysRequest
-    ): AsyncGenerator<{ _key: string; [key: string]: unknown }> => {
+    ): AsyncGenerator<{ _id: string; [key: string]: unknown }> => {
       const config = this.config;
       const authHeader = this.getAuthHeader();
 
-      async function* scanGenerator(): AsyncGenerator<{ _key: string; [key: string]: unknown }> {
+      async function* scanGenerator(): AsyncGenerator<{ _id: string; [key: string]: unknown }> {
         const headers: Record<string, string> = {
           "Content-Type": "application/json",
           Accept: "application/x-ndjson",
@@ -1143,7 +1203,7 @@ export class AntflyClient {
         Object.assign(headers, config.headers);
 
         const response = await fetch(
-          `${normalizeBaseUrl(config.baseUrl)}/db/v1/tables/${tableName}/lookup`,
+          `${normalizeBaseUrl(config.baseUrl)}/db/v1/tables/${tableName}/documents`,
           {
             method: "POST",
             headers,
@@ -1198,8 +1258,8 @@ export class AntflyClient {
     scanAll: async (
       tableName: string,
       request?: ScanKeysRequest
-    ): Promise<Array<{ _key: string; [key: string]: unknown }>> => {
-      const results: Array<{ _key: string; [key: string]: unknown }> = [];
+    ): Promise<Array<{ _id: string; [key: string]: unknown }>> => {
+      const results: Array<{ _id: string; [key: string]: unknown }> = [];
       for await (const doc of this.tables.scan(tableName, request)) {
         results.push(doc);
       }

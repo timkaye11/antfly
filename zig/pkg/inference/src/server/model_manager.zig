@@ -411,15 +411,58 @@ fn loadHuggingFaceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []c
 
     const view = gguf_metadata.View.init(&parsed);
     const model_name = view.getString("tokenizer.ggml.model") orelse return error.NoTokenizerFound;
-    if (!std.mem.eql(u8, model_name, "gpt2")) return error.NoTokenizerFound;
 
-    const tokens = try getRequiredMetadataArray(&parsed, "tokenizer.ggml.tokens", .string);
-    const merges = try getRequiredMetadataArray(&parsed, "tokenizer.ggml.merges", .string);
+    const flavor: GgufBpeTokenizerFlavor = if (std.mem.eql(u8, model_name, "gpt2"))
+        .byte_level
+    else if (std.mem.eql(u8, model_name, "gemma4"))
+        .gemma4
+    else
+        return error.NoTokenizerFound;
+
+    const tokenizer_bytes = try bpeTokenizerJsonFromGguf(allocator, &parsed, flavor);
+    defer allocator.free(tokenizer_bytes);
+
+    const tok = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tokenizer_bytes);
+    tok.applySpecialTokenIds(
+        metadataTokenId(&parsed, "tokenizer.ggml.bos_token_id"),
+        metadataTokenId(&parsed, "tokenizer.ggml.eos_token_id"),
+        metadataTokenId(&parsed, "tokenizer.ggml.padding_token_id"),
+        metadataTokenId(&parsed, "tokenizer.ggml.unknown_token_id"),
+    );
+    return tok;
+}
+
+const GgufBpeTokenizerFlavor = enum {
+    byte_level,
+    gemma4,
+};
+
+fn bpeTokenizerJsonFromGguf(
+    allocator: std.mem.Allocator,
+    parsed: *const gguf_format.File,
+    flavor: GgufBpeTokenizerFlavor,
+) ![]u8 {
+    const tokens = try getRequiredMetadataArray(parsed, "tokenizer.ggml.tokens", .string);
+    const merges = try getRequiredMetadataArray(parsed, "tokenizer.ggml.merges", .string);
+    const token_types = if (findMetadataEntry(parsed, "tokenizer.ggml.token_type") != null)
+        try getRequiredMetadataArray(parsed, "tokenizer.ggml.token_type", null)
+    else
+        null;
 
     var tokenizer_json = std.ArrayListUnmanaged(u8).empty;
     defer tokenizer_json.deinit(allocator);
 
-    try tokenizer_json.appendSlice(allocator, "{\"model\":{\"type\":\"BPE\",\"byte_fallback\":false,\"vocab\":{");
+    switch (flavor) {
+        .byte_level => {
+            try tokenizer_json.appendSlice(allocator, "{\"model\":{\"type\":\"BPE\",\"byte_fallback\":false,\"vocab\":{");
+        },
+        .gemma4 => {
+            try tokenizer_json.appendSlice(
+                allocator,
+                "{\"normalizer\":{\"type\":\"Replace\",\"pattern\":{\"String\":\" \"},\"content\":\"▁\"},\"pre_tokenizer\":{\"type\":\"Split\",\"pattern\":{\"String\":\" \"},\"behavior\":\"MergedWithPrevious\",\"invert\":false},\"model\":{\"type\":\"BPE\",\"fuse_unk\":true,\"byte_fallback\":true,\"vocab\":{",
+            );
+        },
+    }
     for (tokens.values, 0..) |token_value, idx| {
         const token = switch (token_value) {
             .string => |value| value,
@@ -441,39 +484,56 @@ fn loadHuggingFaceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []c
         if (idx > 0) try tokenizer_json.append(allocator, ',');
         try appendJsonString(&tokenizer_json, allocator, merge);
     }
-    try tokenizer_json.appendSlice(allocator, "]},\"pre_tokenizer\":{\"type\":\"ByteLevel\"},\"added_tokens\":[");
+    switch (flavor) {
+        .byte_level => try tokenizer_json.appendSlice(allocator, "]},\"pre_tokenizer\":{\"type\":\"ByteLevel\"},\"added_tokens\":["),
+        .gemma4 => try tokenizer_json.appendSlice(allocator, "]},\"added_tokens\":["),
+    }
 
-    var first_added = true;
-    try appendSpecialGgufToken(&tokenizer_json, allocator, &first_added, &parsed, "tokenizer.ggml.bos_token_id", tokens);
-    try appendSpecialGgufToken(&tokenizer_json, allocator, &first_added, &parsed, "tokenizer.ggml.eos_token_id", tokens);
-    try appendSpecialGgufToken(&tokenizer_json, allocator, &first_added, &parsed, "tokenizer.ggml.padding_token_id", tokens);
-    try appendSpecialGgufToken(&tokenizer_json, allocator, &first_added, &parsed, "tokenizer.ggml.unknown_token_id", tokens);
+    try appendSpecialTokensFromMetadata(&tokenizer_json, allocator, parsed, tokens, token_types);
     try tokenizer_json.appendSlice(allocator, "]}");
 
-    const tokenizer_bytes = try tokenizer_json.toOwnedSlice(allocator);
-    defer allocator.free(tokenizer_bytes);
-
-    const tok = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tokenizer_bytes);
-    tok.applySpecialTokenIds(
-        metadataTokenId(&parsed, "tokenizer.ggml.bos_token_id"),
-        metadataTokenId(&parsed, "tokenizer.ggml.eos_token_id"),
-        metadataTokenId(&parsed, "tokenizer.ggml.padding_token_id"),
-        metadataTokenId(&parsed, "tokenizer.ggml.unknown_token_id"),
-    );
-    return tok;
+    return tokenizer_json.toOwnedSlice(allocator);
 }
 
-fn appendSpecialGgufToken(
+fn appendSpecialTokensFromMetadata(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
-    first: *bool,
     parsed: *const gguf_format.File,
-    id_key: []const u8,
     tokens: gguf_format.MetadataArray,
+    token_types: ?gguf_format.MetadataArray,
 ) !void {
-    const token_id = metadataTokenId(parsed, id_key) orelse return;
-    const token = metadataTokenStringById(tokens, token_id) orelse return;
-    try appendAddedToken(buf, allocator, first, token, token_id);
+    var first_added = true;
+    var seen = std.AutoHashMapUnmanaged(i64, void){};
+    defer seen.deinit(allocator);
+
+    const special_id_keys = [_][]const u8{
+        "tokenizer.ggml.bos_token_id",
+        "tokenizer.ggml.eos_token_id",
+        "tokenizer.ggml.padding_token_id",
+        "tokenizer.ggml.unknown_token_id",
+    };
+    for (special_id_keys) |key| {
+        const token_id = metadataTokenId(parsed, key) orelse continue;
+        const token = metadataTokenStringById(tokens, token_id) orelse continue;
+        if (seen.contains(token_id)) continue;
+        try seen.put(allocator, token_id, {});
+        try appendAddedToken(buf, allocator, &first_added, token, token_id);
+    }
+
+    if (token_types) |types| {
+        for (tokens.values, 0..) |token_value, idx| {
+            const token = switch (token_value) {
+                .string => |value| value,
+                else => return error.InvalidTokenizerMetadata,
+            };
+            const token_type = try metadataI64At(types, idx);
+            if (token_type == 1 or token_type == 6) continue;
+            const token_id: i64 = @intCast(idx);
+            if (seen.contains(token_id)) continue;
+            try seen.put(allocator, token_id, {});
+            try appendAddedToken(buf, allocator, &first_added, token, token_id);
+        }
+    }
 }
 
 fn metadataTokenId(parsed: *const gguf_format.File, key: []const u8) ?i32 {
@@ -490,6 +550,24 @@ fn metadataTokenStringById(tokens: gguf_format.MetadataArray, token_id: i32) ?[]
         .string => |value| value,
         else => null,
     };
+}
+
+fn metadataI64At(arr: gguf_format.MetadataArray, index: usize) !i64 {
+    if (index >= arr.values.len) return error.InvalidTokenizerMetadata;
+    return switch (arr.values[index]) {
+        .i32 => |value| value,
+        .i64 => |value| value,
+        .u32 => |value| value,
+        .u64 => |value| std.math.cast(i64, value) orelse return error.InvalidTokenizerMetadata,
+        else => return error.InvalidTokenizerMetadata,
+    };
+}
+
+fn findMetadataEntry(parsed: *const gguf_format.File, key: []const u8) ?*const gguf_format.MetadataEntry {
+    for (parsed.metadata) |*entry| {
+        if (std.mem.eql(u8, entry.key, key)) return entry;
+    }
+    return null;
 }
 
 pub fn loadSentencePieceTokenizerFromDirOrGguf(
@@ -621,6 +699,7 @@ pub fn isManifestPotentiallyLoadableInCurrentBuild(man: manifest_mod.ModelManife
     if (man.hasIncompleteGlinerBundle()) return false;
     if (man.hasIncompleteColqwenBundle()) return false;
     if (man.hasIncompleteClipclapGgufBundle()) return false;
+    if (man.hasIncompleteFlorence2GgufBundle()) return false;
     if (man.onnx_path != null or
         man.visual_model_path != null or
         man.audio_model_path != null or
@@ -647,7 +726,11 @@ pub const LoadedModel = struct {
     chat_tmpl: ?*ChatTemplate = null,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = null,
     shared_prefetch: ?*runtime.tier.shared.SharedPrefetchState = null,
+    prompt_prefix_cache: runtime.kv.prompt_cache.PromptPrefixCache,
     native_generate_coordinator: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = null,
+    native_generation_graph_cache: graph_mod.cache.GraphCache,
+    // ponytail: per-model native generation lock; replace with Metal-safe batching if throughput matters.
+    native_generate_lock: std.atomic.Mutex = .unlocked,
     // Multimodal sessions (CLIP/CLAP/CLIPCLAP)
     embedding_session_lock: std.atomic.Mutex = .unlocked,
     reranking_session_lock: std.atomic.Mutex = .unlocked,
@@ -679,6 +762,23 @@ pub const LoadedModel = struct {
         if (self.hf_tok) |ht| return ht.tokenizer();
         if (self.sp_tok) |sp| return sp.tokenizer();
         unreachable;
+    }
+
+    pub fn attachIo(self: *LoadedModel, io: std.Io) void {
+        session_factory.attachIo(self.session, io);
+        if (self.vision_session) |session| session_factory.attachIo(session, io);
+        if (self.audio_session) |session| session_factory.attachIo(session, io);
+        if (self.text_projection) |session| session_factory.attachIo(session, io);
+        if (self.visual_projection) |session| session_factory.attachIo(session, io);
+        if (self.audio_projection) |session| session_factory.attachIo(session, io);
+    }
+
+    pub fn lockNativeGeneration(self: *LoadedModel) void {
+        spinLock(&self.native_generate_lock);
+    }
+
+    pub fn unlockNativeGeneration(self: *LoadedModel) void {
+        self.native_generate_lock.unlock();
     }
 
     pub fn wholeModelExecutor(self: *LoadedModel, allocator: std.mem.Allocator, kv_dtype: ?runtime.kv.pool.KvDType) !?graph_mod.model_runtime.ModelExecutor {
@@ -975,6 +1075,8 @@ pub const LoadedModel = struct {
     }
 
     pub fn deinit(self: *LoadedModel) void {
+        self.native_generation_graph_cache.deinit();
+        self.prompt_prefix_cache.deinit();
         self.session.close();
         if (self.vision_session) |vs| vs.close();
         if (self.audio_session) |as_| as_.close();
@@ -1130,6 +1232,47 @@ pub const ModelManager = struct {
         self.loaded_aliases.deinit(self.allocator);
     }
 
+    pub fn attachIo(self: *ModelManager, io: std.Io) void {
+        self.session_manager.io = io;
+        var it = self.loaded.iterator();
+        while (it.next()) |entry| entry.value_ptr.*.attachIo(io);
+    }
+
+    /// Counts loaded models participating in the prompt-cache accounting target.
+    /// Used to split that target evenly across active model caches.
+    /// `include` is always counted even if its cache has not activated yet.
+    fn activePromptCacheCount(self: *ModelManager, include: *LoadedModel) usize {
+        var count: usize = 0;
+        var it = self.loaded.iterator();
+        while (it.next()) |entry| {
+            const model = entry.value_ptr.*;
+            if (model == include) continue;
+            if (model.prompt_prefix_cache.isActive()) count += 1;
+        }
+        return count + 1;
+    }
+
+    /// Apply one node-wide prompt-cache target to the cache being activated and
+    /// every cache that is already active. configure() synchronously evicts
+    /// entries against their estimated logical cache bytes.
+    pub fn rebalancePromptCaches(
+        self: *ModelManager,
+        include: *LoadedModel,
+        node_config: runtime.kv.prompt_cache.Config,
+    ) void {
+        var per_cache = node_config;
+        per_cache.max_bytes /= self.activePromptCacheCount(include);
+        include.prompt_prefix_cache.configure(per_cache);
+
+        var it = self.loaded.iterator();
+        while (it.next()) |entry| {
+            const model = entry.value_ptr.*;
+            if (model != include and model.prompt_prefix_cache.isActive()) {
+                model.prompt_prefix_cache.configure(per_cache);
+            }
+        }
+    }
+
     /// Load a model from a directory path. Returns a cached model if already loaded.
     pub fn loadFromDir(self: *ModelManager, model_dir: []const u8) !*LoadedModel {
         if (self.loaded.get(model_dir)) |model| return model;
@@ -1168,6 +1311,7 @@ pub const ModelManager = struct {
         if (man.hasIncompleteGlinerBundle()) return error.IncompleteGlinerBundle;
         if (man.hasIncompleteColqwenBundle()) return error.IncompleteColqwenBundle;
         if (man.hasIncompleteClipclapGgufBundle()) return error.IncompleteClipclapGgufBundle;
+        if (man.hasIncompleteFlorence2GgufBundle()) return error.IncompleteFlorence2Bundle;
 
         // Load tokenizer
         var hf_tok: ?*hf_tokenizer.HfTokenizer = null;
@@ -1263,7 +1407,9 @@ pub const ModelManager = struct {
             .chat_tmpl = chat_tmpl,
             .shared_moe_cache = shared_moe_cache,
             .shared_prefetch = shared_prefetch,
+            .prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(self.allocator),
             .native_generate_coordinator = native_generate_coordinator,
+            .native_generation_graph_cache = graph_mod.cache.GraphCache.init(self.allocator),
             .vision_session = null,
             .audio_session = null,
             .text_projection = null,
@@ -1967,6 +2113,43 @@ test "load huggingface tokenizer from gguf gpt2 metadata" {
     try std.testing.expectEqual(@as(i32, 1), encoded.attention_mask[1]);
 }
 
+test "load huggingface tokenizer from gguf gemma4 bpe metadata" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const gguf_bytes = try buildTestGgufWithGemma4Tokenizer(allocator);
+    defer allocator.free(gguf_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "gemma4-q4_0.gguf", .data = gguf_bytes });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+    const gguf_path = try std.fs.path.join(allocator, &.{ model_dir, "gemma4-q4_0.gguf" });
+    defer allocator.free(gguf_path);
+
+    var tok = try loadHuggingFaceTokenizerFromDirOrGguf(allocator, model_dir, gguf_path);
+    defer tok.deinitSelf();
+
+    var encoded = try tok.tokenizer().encodeForGenerationConfigured(allocator, "hello world", 8, true);
+    defer encoded.deinit();
+
+    try std.testing.expectEqual(@as(i32, 2), encoded.ids[0]);
+    try std.testing.expectEqual(@as(i32, 4), encoded.ids[1]);
+    try std.testing.expectEqual(@as(i32, 5), encoded.ids[2]);
+    try std.testing.expectEqual(@as(i32, 1), encoded.attention_mask[0]);
+    try std.testing.expectEqual(@as(i32, 1), encoded.attention_mask[1]);
+    try std.testing.expectEqual(@as(i32, 1), encoded.attention_mask[2]);
+
+    const special_ids = try tok.tokenizer().encode(allocator, "<|turn>hello");
+    defer allocator.free(special_ids);
+    try std.testing.expectEqualSlices(i32, &.{ 6, 4 }, special_ids);
+
+    const decoded = try tok.tokenizer().decode(allocator, &.{ 4, 5 });
+    defer allocator.free(decoded);
+    try std.testing.expectEqualStrings("hello world", decoded);
+}
+
 fn buildTestGgufWithGpt2Tokenizer(allocator: std.mem.Allocator) ![]u8 {
     var data = std.ArrayListUnmanaged(u8).empty;
     defer data.deinit(allocator);
@@ -1986,6 +2169,37 @@ fn buildTestGgufWithGpt2Tokenizer(allocator: std.mem.Allocator) ![]u8 {
     try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.merges", &.{});
     try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.bos_token_id", 0);
     try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.eos_token_id", 2);
+    try appendTestMetadataBool(allocator, &data, "tokenizer.ggml.add_bos_token", true);
+
+    return data.toOwnedSlice(allocator);
+}
+
+fn buildTestGgufWithGemma4Tokenizer(allocator: std.mem.Allocator) ![]u8 {
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    try data.appendSlice(allocator, gguf_format.magic);
+    try appendTestLe(u32, allocator, &data, 3);
+    try appendTestLe(u64, allocator, &data, 0);
+    try appendTestLe(u64, allocator, &data, 10);
+
+    try appendTestMetadataString(allocator, &data, "general.architecture", "gemma4");
+    try appendTestMetadataString(allocator, &data, "tokenizer.ggml.model", "gemma4");
+    try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.tokens", &.{
+        "<pad>",
+        "<eos>",
+        "<bos>",
+        "<unk>",
+        "hello",
+        "▁world",
+        "<|turn>",
+    });
+    try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.merges", &.{});
+    try appendTestMetadataI32Array(allocator, &data, "tokenizer.ggml.token_type", &.{ 3, 3, 3, 2, 1, 1, 3 });
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.bos_token_id", 2);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.eos_token_id", 1);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.padding_token_id", 0);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.unknown_token_id", 3);
     try appendTestMetadataBool(allocator, &data, "tokenizer.ggml.add_bos_token", true);
 
     return data.toOwnedSlice(allocator);
@@ -2025,4 +2239,12 @@ fn appendTestMetadataStringArray(allocator: std.mem.Allocator, data: *std.ArrayL
     try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.string));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestString(allocator, data, value);
+}
+
+fn appendTestMetadataI32Array(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const i32) !void {
+    try appendTestString(allocator, data, key);
+    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.array));
+    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.i32));
+    try appendTestLe(u64, allocator, data, values.len);
+    for (values) |value| try appendTestLe(i32, allocator, data, value);
 }

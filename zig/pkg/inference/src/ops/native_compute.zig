@@ -4704,13 +4704,26 @@ fn prefetchPriority(entry: *LazyWeightEntry) u64 {
     return entry.prefetch_score;
 }
 
-fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory.RunBudget, entry: *LazyWeightEntry) !void {
+pub fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory.RunBudget, entry: *LazyWeightEntry) !void {
+    const trace = platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_LAZY_TRACE");
+    const trace_start = platform.time.monotonicNs();
+    if (trace) {
+        std.log.info("native_lazy_trace: ensure_start name={s} active_tier={s} loaded={} ref_mb={d}", .{
+            entry.tensor_ref.name,
+            @tagName(entry.active_tier),
+            entry.loaded != null,
+            entry.tensor_ref.byte_len / (1024 * 1024),
+        });
+    }
     if (entry.expert_coord) |coord| {
         if (data.residency) |*residency| {
             try residency.noteTouch(coord, data.moe_num_experts);
         }
     }
-    if (entry.loaded != null) return;
+    if (entry.loaded != null) {
+        if (trace) std.log.info("native_lazy_trace: ensure_hit name={s}", .{entry.tensor_ref.name});
+        return;
+    }
     const tensor_store = data.tensor_store orelse return error.MissingWeight;
     var direct_quant_storage: ?QuantizedStorage = null;
     errdefer if (direct_quant_storage) |*storage| storage.deinit();
@@ -4777,6 +4790,13 @@ fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory.Run
             entry.loaded.?.quantized = false;
         }
         entry.loaded_bytes = entry.loaded.?.tensor.data.len;
+    }
+    if (trace) {
+        std.log.info("native_lazy_trace: loaded name={s} loaded_mb={d} total_ms={d}", .{
+            entry.tensor_ref.name,
+            entry.loaded_bytes / (1024 * 1024),
+            (platform.time.monotonicNs() - trace_start) / 1_000_000,
+        });
     }
     entry.active_tier = .host;
     if (data.tier_cache) |*tier_cache| {
@@ -6097,7 +6117,8 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
             seq_len,
         });
     }
-    const bias_shared_len = num_heads * effective_seq_len * effective_seq_len;
+    const bias_seq_len = effective_seq_len * effective_seq_len;
+    const bias_shared_len = num_heads * bias_seq_len;
     const bias_batched_len = effective_batch * bias_shared_len;
     const bh = effective_batch * num_heads;
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
@@ -6113,7 +6134,7 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
     // broadcasts; safer to keep that case on the legacy path.
     const flash_eligible = effective_seq_len >= 32 and
         mask.len >= effective_batch * effective_seq_len and
-        (bias == null or bias.?.len == bias_shared_len or bias.?.len == bias_batched_len);
+        (bias == null or bias.?.len == bias_seq_len or bias.?.len == bias_shared_len or bias.?.len == bias_batched_len);
     if (flash_eligible) {
         const flash_output = try linalg.flashAttentionHost(
             self.allocator,
@@ -6171,13 +6192,19 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
 
         // Add position bias if provided: bias[h, qi, ki]
         if (bias) |b_data| {
-            const head_offset = if (b_data.len == bias_batched_len)
+            const head_offset: ?usize = if (b_data.len == bias_batched_len)
                 bh_idx * effective_seq_len * effective_seq_len
+            else if (b_data.len == bias_shared_len)
+                h * effective_seq_len * effective_seq_len
+            else if (b_data.len == bias_seq_len)
+                0
             else
-                h * effective_seq_len * effective_seq_len;
-            for (0..effective_seq_len) |qi| {
-                for (0..effective_seq_len) |ki| {
-                    scores[qi * effective_seq_len + ki] += b_data[head_offset + qi * effective_seq_len + ki];
+                null;
+            if (head_offset) |off| {
+                for (0..effective_seq_len) |qi| {
+                    for (0..effective_seq_len) |ki| {
+                        scores[qi * effective_seq_len + ki] += b_data[off + qi * effective_seq_len + ki];
+                    }
                 }
             }
         }
@@ -46564,6 +46591,51 @@ test "dot_general handles batched rhs free-before-contract layout" {
 
     for (out, expected) |actual, want| {
         try std.testing.expectApproxEqAbs(want, actual, 1e-5);
+    }
+}
+
+test "dot_general handles clip vision attention score shape" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+
+    const batch = 1;
+    const heads = 12;
+    const seq = 50;
+    const dim = 64;
+
+    const lhs_data = try allocator.alloc(f32, batch * heads * seq * dim);
+    defer allocator.free(lhs_data);
+    @memset(lhs_data, 1.0);
+    const rhs_data = try allocator.alloc(f32, batch * heads * dim * seq);
+    defer allocator.free(rhs_data);
+    @memset(rhs_data, 1.0);
+
+    const lhs_ct = try compute.makeBuf(lhs_data, false);
+    defer freeTensor(&compute, lhs_ct);
+    const lhs_shaped = try compute.withLogicalShape(lhs_ct, &.{ batch, heads, seq, dim });
+
+    const rhs_ct = try compute.makeBuf(rhs_data, false);
+    defer freeTensor(&compute, rhs_ct);
+    const rhs_shaped = try compute.withLogicalShape(rhs_ct, &.{ batch, heads, dim, seq });
+
+    const out_ct = try primDotGeneralOp(
+        &compute,
+        lhs_shaped,
+        rhs_shaped,
+        &.{ -1, heads, seq, dim },
+        &.{ -1, heads, dim, seq },
+        &.{3},
+        &.{2},
+        &.{ 0, 1 },
+        &.{ 0, 1 },
+    );
+    defer freeTensor(&compute, out_ct);
+
+    try std.testing.expectEqualSlices(i64, &.{ batch, heads, seq, seq }, tensorStoredShape(out_ct).?);
+    try std.testing.expectEqual(@as(usize, batch * heads * seq * seq), getData(out_ct).len);
+    for (getData(out_ct)) |value| {
+        try std.testing.expectApproxEqAbs(@as(f32, dim), value, 1e-5);
     }
 }
 

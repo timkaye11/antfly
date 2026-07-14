@@ -231,38 +231,12 @@ components:
     # Chunking Types - reference existing schemas
     Chunk:
       $ref: "../shared/chunking.yaml#/components/schemas/Chunk"
-
     VADOptions:
-      type: object
-      description: "Options for Voice Activity Detection (VAD) based audio segmentation. Antfly inference-specific."
-      properties:
-        min_silence_duration_ms:
-          type: integer
-          description: "Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300."
-        min_speech_duration_ms:
-          type: integer
-          description: "Minimum speech duration (ms) for a segment to be kept. Shorter segments are discarded. Default: 250."
-        speech_pad_ms:
-          type: integer
-          description: "Padding (ms) added before and after detected speech. Default: 30."
-        max_segment_duration_ms:
-          type: integer
-          description: "Maximum segment duration (ms). Segments longer than this are split. Useful for Whisper-compatible chunking. Default: 30000."
-
+      $ref: "../shared/chunking.yaml#/components/schemas/VADOptions"
     AudioChunkConfig:
-      type: object
-      description: "Audio chunking configuration for Antfly inference, including VAD options."
-      properties:
-        window_duration_ms:
-          type: integer
-          description: "Window duration in milliseconds for fixed-window audio chunking (default: 30000)."
-        overlap_duration_ms:
-          type: integer
-          description: "Overlap duration in milliseconds between audio chunks (default: 0)."
-        vad:
-          $ref: "#/components/schemas/VADOptions"
-
+      $ref: "../shared/chunking.yaml#/components/schemas/InferenceAudioChunkConfig"
     ChunkConfig:
+<<<<<<< HEAD
       type: object
       description: |
         Configuration for chunking requests to Antfly inference.
@@ -303,27 +277,11 @@ components:
         audio:
           $ref: "#/components/schemas/AudioChunkConfig"
 
+=======
+      $ref: "../shared/chunking.yaml#/components/schemas/InferenceChunkConfig"
+>>>>>>> main
     ChunkRequest:
-      type: object
-      properties:
-        input:
-          description: |
-            Input content to chunk. Supports two formats:
-            - Text string: `"This is a long document..."` (backward compatible)
-            - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}`
-            - ContentPart: `{"type": "text", "text": "..."}`
-          oneOf:
-            - type: string
-              description: "Text to chunk (backward compatible)"
-            - $ref: "#/components/schemas/ContentPart"
-              description: "Content part (text or media)"
-        text:
-          type: string
-          deprecated: true
-          description: "DEPRECATED: Use 'input' instead. Text to chunk."
-          example: "This is a long document that needs to be split into smaller chunks..."
-        config:
-          $ref: "#/components/schemas/ChunkConfig"
+      $ref: "../shared/chunking.yaml#/components/schemas/InferenceChunkRequest"
 
     ChunkResponse:
       type: object
@@ -787,6 +745,8 @@ components:
           example: "microsoft/trocr-base-printed"
         images:
           type: array
+          minItems: 1
+          maxItems: 64
           items:
             $ref: "#/components/schemas/ImageURL"
           description: |
@@ -1208,6 +1168,17 @@ components:
           description: |
             List of tools (functions) the model can call.
             Only supported by models with tool_call_format configured.
+        prompt_cache_key:
+          type: string
+          maxLength: 256
+          description: |
+            inference-native prompt prefix cache namespace key. Requests with the same key can
+            reuse matching prompt-prefix KV on the same node. Required to enable prompt caching;
+            requests without a key are never cached.
+        prompt_cache:
+          type: boolean
+          description: |
+            inference-native prompt prefix cache control. False bypasses prompt cache for this request.
         tool_choice:
           $ref: "#/components/schemas/ToolChoice"
           description: Controls how the model uses tools
@@ -1245,6 +1216,98 @@ components:
           description: List of completion choices (currently always 1)
         usage:
           $ref: "#/components/schemas/GenerateUsage"
+
+    GenerateBatchMode:
+      type: string
+      enum: ["sync"]
+      description: Batch execution mode. Only synchronous batches are implemented.
+
+    GenerateBatchRequest:
+      type: object
+      required:
+        - requests
+      properties:
+        mode:
+          $ref: "#/components/schemas/GenerateBatchMode"
+        requests:
+          type: array
+          minItems: 1
+          maxItems: 128
+          items:
+            $ref: "#/components/schemas/GenerateBatchRequestItem"
+
+    GenerateBatchRequestItem:
+      type: object
+      required:
+        - custom_id
+        - body
+      properties:
+        custom_id:
+          type: string
+          description: Caller-supplied identifier echoed in the result item.
+        body:
+          $ref: "#/components/schemas/GenerateRequest"
+
+    GenerateBatchError:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        retryable:
+          type: boolean
+          default: false
+
+    GenerateBatchResultItem:
+      type: object
+      required:
+        - custom_id
+        - index
+      properties:
+        custom_id:
+          type: string
+        index:
+          type: integer
+          description: Zero-based request index from the submitted batch.
+        response:
+          $ref: "#/components/schemas/GenerateResponse"
+        error:
+          $ref: "#/components/schemas/GenerateBatchError"
+
+    GenerateBatchSummary:
+      type: object
+      required:
+        - total
+        - succeeded
+        - failed
+      properties:
+        total:
+          type: integer
+        succeeded:
+          type: integer
+        failed:
+          type: integer
+
+    GenerateBatchResponse:
+      type: object
+      required:
+        - object
+        - data
+        - summary
+      properties:
+        object:
+          type: string
+          enum: ["generate.batch"]
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/GenerateBatchResultItem"
+        summary:
+          $ref: "#/components/schemas/GenerateBatchSummary"
 
     GenerateChoice:
       type: object
@@ -1298,6 +1361,9 @@ components:
         total_tokens:
           type: integer
           description: Total tokens used (prompt + completion)
+        cached_prompt_tokens:
+          type: integer
+          description: Prompt tokens served from inference-native prefix KV cache
 
     GenerateChunk:
       type: object
@@ -1380,6 +1446,117 @@ components:
           type: string
           description: Incremental arguments JSON string
 
+    ModelKind:
+      type: string
+      description: Model registry kind.
+      enum: [generator, embedder, reranker, chunker, classifier, recognizer, rewriter, reader, transcriber, extractor]
+
+    ModelBackend:
+      type: string
+      description: |
+        Optional backend preference for model loading or request execution.
+        `auto` keeps the node default behavior.
+        `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via
+        `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`,
+        `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
+        `webgpu` selects the Wasm/WebGPU backend in Wasm builds.
+      enum: [auto, native, onnx, metal, cuda, xla, webgpu, wasm]
+
+    ModelFormat:
+      type: string
+      description: Optional artifact format preference for loading a model.
+      enum: [gguf, onnx, safetensors, hybrid]
+
+    ModelQuantization:
+      type: string
+      description: Optional quantization preference for loading a model.
+      enum: [q4_k, q8, fp16]
+
+    ModelRef:
+      type: object
+      description: Model reference used by startup preload and model-loading configuration.
+      required: [kind, name]
+      properties:
+        kind:
+          $ref: "#/components/schemas/ModelKind"
+        name:
+          type: string
+          description: Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
+          example: antflydb/gemma-e2b
+        backend:
+          $ref: "#/components/schemas/ModelBackend"
+        format:
+          $ref: "#/components/schemas/ModelFormat"
+        quantization:
+          $ref: "#/components/schemas/ModelQuantization"
+
+    PromptCacheConfig:
+      type: object
+      description: Native generator prompt KV cache configuration.
+      properties:
+        enabled:
+          type: boolean
+          description: Enable inference-native prompt KV cache reuse for generator requests.
+          default: false
+        mode:
+          type: string
+          description: |
+            Prompt KV cache implementation. `block_hash` (default) uses hash-addressed
+            full KV blocks under prompt_cache_key with O(1) block lookup and is the
+            scalable production mode. `simple` keeps the linear-scan retained-prefix
+            cache and is only suitable for small caches or debugging.
+          enum: [simple, block_hash]
+          default: block_hash
+        max_bytes_mb:
+          type: integer
+          description: |
+            Node-wide target for live prompt-cache entries. The runtime divides it
+            across participating model caches and evicts using estimated metadata
+            and logical host/device KV bytes. Backend allocators may retain reusable
+            capacity, so this is not a hard cap on process or accelerator memory.
+          default: 512
+        min_tokens:
+          type: integer
+          description: Minimum prompt length eligible for prompt KV caching.
+          default: 64
+        ttl_ms:
+          type: integer
+          description: |
+            Idle time-to-live for prompt KV cache entries. Refreshed on every cache
+            hit, so only entries left unused for this duration expire.
+          default: 300000
+    QueryEmbeddingCacheConfig:
+      type: object
+      description: |
+        Process-local cache for dense query embeddings. Cache lookup and
+        singleflight happen before provider pacing and local inference queueing.
+        Entries are isolated by the server-derived security domain and effective
+        embedding operation. Templated and multimodal queries bypass retention
+        and singleflight but share the max_inflight provider admission bound.
+      properties:
+        enabled:
+          type: boolean
+          default: true
+          description: Enable query embedding result caching and concurrent miss coalescing. Provider admission control remains active when false.
+        max_bytes_mb:
+          type: integer
+          minimum: 0
+          maximum: 1048576
+          default: 64
+          description: Maximum retained cache memory in MiB. Set to 0 for singleflight without result retention.
+        ttl_ms:
+          type: integer
+          minimum: 0
+          maximum: 86400000
+          default: 300000
+          description: Idle expiration in milliseconds. Cache hits refresh the expiry time.
+        max_inflight:
+          type: integer
+          minimum: 1
+          maximum: 65536
+          default: 16
+          description: Maximum query embedding provider computations in flight, including uncached templated and multimodal requests. Existing-key waiters continue to coalesce when this limit is reached. The conservative default bounds transient memory before provider responses are decoded; raise it only after measuring provider and node capacity.
+
     Config:
       type: object
       required:
@@ -1419,6 +1596,8 @@ components:
         s3_credentials:
           $ref: "../shared/s3.yaml#/components/schemas/Credentials"
           description: "S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail."
+        query_embedding_cache:
+          $ref: "#/components/schemas/QueryEmbeddingCacheConfig"
         keep_alive:
           type: string
           description: |
@@ -1446,6 +1625,9 @@ components:
             independently of max_loaded_models.
           default: 1
           example: 1
+        prompt_cache:
+          $ref: "#/components/schemas/PromptCacheConfig"
+          description: Native generator prompt KV cache settings.
         backend_priority:
           type: array
           items:
@@ -1501,14 +1683,19 @@ components:
           example: "30s"
         preload:
           type: array
-          items:
-            type: string
           description: |
-            List of model names to preload at startup (Ollama-compatible).
-            These models are loaded immediately when Antfly inference starts, avoiding first-request latency.
-            Model names should match those in models_dir/embedders/ (e.g., "BAAI/bge-small-en-v1.5").
-            Only effective when keep_alive is non-zero (lazy loading mode).
-          example: ["BAAI/bge-small-en-v1.5", "openai/clip-vit-base-patch32"]
+            Models to preload and warm at startup. Generators run a tiny generation
+            request so native/Metal weights, KV setup, and kernels use the same
+            budgeted path as request-time generation. Other model kinds use the
+            best available warm path for that kind.
+          items:
+            $ref: "#/components/schemas/ModelRef"
+          example:
+            - kind: generator
+              name: antflydb/gemma-e2b
+              backend: metal
+              format: gguf
+              quantization: q4_k
         max_memory_mb:
           type: integer
           description: |
@@ -1531,7 +1718,7 @@ components:
             - If keep_alive="0": eager loading (load at startup, never unload)
 
             When a model has strategy "eager" in this map:
-            - It is loaded at startup (as part of preload)
+            - It is loaded at startup through the same startup warmup path
             - It is never unloaded, even when keep_alive>0 (pinned in memory)
 
             This allows mixing eager and lazy models in the same pool.
@@ -1785,6 +1972,50 @@ paths:
                 $ref: "#/components/schemas/Error"
         "503":
           description: Generation service unavailable (no models configured)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /generate/batch:
+    post:
+      summary: Generate text for a synchronous batch of requests
+      description: |
+        Runs multiple non-streaming generation requests as one synchronous batch.
+        Compatible native requests for the same model are executed through the
+        native batched KV decoder; unsupported per-item options are returned as
+        per-item errors without failing sibling requests.
+
+        This endpoint implements the synchronous form only. Future async durable
+        batching will use the same request item shape with `mode: async`.
+      operationId: generateBatchContent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenerateBatchRequest"
+      responses:
+        "200":
+          description: Batch generation results in request order
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenerateBatchResponse"
+        "400":
+          description: Invalid batch envelope
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Generation service unavailable
           content:
             application/json:
               schema:

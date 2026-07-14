@@ -47,6 +47,7 @@ const Worker = struct {
     catch_up_open: bool = false,
     replay_cursor: ?replay_source_mod.MatchingCursor = null,
     replay_cursor_open_sequence: u64 = 0,
+    last_replay_tail_records: u64 = 0,
 };
 
 fn forcePersistAppliedSequence(worker: *const Worker) bool {
@@ -427,6 +428,8 @@ fn workerMain(worker: *Worker) void {
         const from_sequence = worker.applied_sequence;
         const persisted_sequence = worker.persisted_sequence;
         const target_sequence = worker.target_sequence;
+        const replay_tail_records = target_sequence -| from_sequence;
+        if (replay_tail_records > 0) worker.last_replay_tail_records = replay_tail_records;
         runtime.mutex.unlock();
         if (target_sequence <= from_sequence) {
             if (from_sequence > persisted_sequence) {
@@ -509,7 +512,7 @@ fn workerMain(worker: *Worker) void {
             closeWorkerReplayCursor(runtime, worker);
         }
 
-        const target_advance_allowed = if (stats.last_sequence == 0 and target_sequence > from_sequence)
+        const target_advance_allowed = if (stats.shouldTryTargetAdvance(from_sequence, target_sequence))
             canAdvanceToTarget(runtime, worker, from_sequence, target_sequence) catch |err| {
                 close_success = false;
                 runtime.recordError(err);
@@ -517,13 +520,13 @@ fn workerMain(worker: *Worker) void {
             }
         else
             false;
-        const caught_up_sequence = if (stats.last_sequence > from_sequence)
-            stats.last_sequence
+        const caught_up_sequence = if (stats.appliedSequenceAdvance(from_sequence)) |sequence|
+            sequence
         else if (target_advance_allowed)
             target_sequence
         else
             from_sequence;
-        if (caught_up_sequence == from_sequence and stats.last_sequence == 0 and target_sequence > from_sequence) {
+        if (caught_up_sequence == from_sequence and stats.shouldTryTargetAdvance(from_sequence, target_sequence)) {
             closeWorkerCatchUpState(runtime, worker, false) catch |err| {
                 close_success = false;
                 runtime.recordError(err);
@@ -665,13 +668,14 @@ fn closeWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, success: b
     closeWorkerReplayCursor(runtime, worker);
     if (!worker.catch_up_open) return;
     worker.catch_up_open = false;
+    worker.last_replay_tail_records = 0;
     if (runtime.finish_catch_up_fn) |finish_catch_up| try finish_catch_up(runtime.ctx, worker.kind, success);
 }
 
 fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
     return switch (err) {
         error.NotFound => catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).not_found_is_recoverable,
-        error.ReplayDocumentNotVisible, error.WriterLocked => true,
+        error.ReplayDocumentNotVisible, error.ArtifactRepairRequired, error.WriterLocked => true,
         else => false,
     };
 }
@@ -680,6 +684,7 @@ fn isRecoverableCatchUpError(worker: *const Worker, err: anyerror) bool {
     return switch (err) {
         error.WriterLocked,
         error.ReplayDocumentNotVisible,
+        error.ArtifactRepairRequired,
         => true,
         error.NotFound => catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).not_found_is_recoverable,
         else => false,
@@ -688,10 +693,11 @@ fn isRecoverableCatchUpError(worker: *const Worker, err: anyerror) bool {
 
 fn waitForCatchUpSessionReuse(runtime: *DerivedRuntime, worker: *Worker, from_sequence: u64) bool {
     const policy = catch_up_policy.forIndex(worker.kind, runtime.backlog.resource_manager);
-    if (!worker.catch_up_open or policy.session_idle_ns == 0) return false;
+    const idle_wait_ns = catch_up_policy.sessionIdleMaxWaitNs(policy, worker.last_replay_tail_records);
+    if (!worker.catch_up_open or idle_wait_ns == 0) return false;
     var waited_ns: u64 = 0;
     const delay_ns = @max(@as(u64, std.time.ns_per_ms), policy.coalesce_delay_ns);
-    while (waited_ns < policy.session_idle_ns) {
+    while (waited_ns < idle_wait_ns) {
         lock(runtime);
         const shutdown = runtime.shutdown or worker.stop or runtime.last_error_name != null;
         const target = worker.target_sequence;
@@ -699,20 +705,20 @@ fn waitForCatchUpSessionReuse(runtime: *DerivedRuntime, worker: *Worker, from_se
         runtime.mutex.unlock();
         if (shutdown) return false;
         if (target > from_sequence or force_sequence > from_sequence) return true;
-        sleepNs(delay_ns);
-        waited_ns +|= delay_ns;
+        const sleep_ns = @min(delay_ns, idle_wait_ns - waited_ns);
+        sleepNs(sleep_ns);
+        waited_ns +|= sleep_ns;
     }
     return false;
 }
 
 fn waitForReplayWindow(runtime: *DerivedRuntime, worker: *Worker, from_sequence: u64) void {
     const policy = catch_up_policy.forIndex(worker.kind, runtime.backlog.resource_manager);
-    const min_records = policy.coalesce_min_records;
     const delay_ns = policy.coalesce_delay_ns;
-    if (min_records == 0 or delay_ns == 0) return;
+    if (delay_ns == 0) return;
 
     var waited_ns: u64 = 0;
-    while (waited_ns < policy.coalesce_max_wait_ns) {
+    while (true) {
         lock(runtime);
         const shutdown = runtime.shutdown or worker.stop or runtime.last_error_name != null;
         const target = worker.target_sequence;
@@ -720,10 +726,12 @@ fn waitForReplayWindow(runtime: *DerivedRuntime, worker: *Worker, from_sequence:
         const force_sequence = runtime.force_catch_up_sequence;
         runtime.mutex.unlock();
 
-        if (shutdown or pending_records == 0 or pending_records >= min_records or force_sequence > from_sequence) return;
+        const max_wait_ns = catch_up_policy.replayWindowMaxWaitNs(policy, pending_records);
+        if (shutdown or pending_records == 0 or max_wait_ns == 0 or force_sequence > from_sequence or waited_ns >= max_wait_ns) return;
 
-        sleepNs(delay_ns);
-        waited_ns +|= delay_ns;
+        const sleep_ns = @min(delay_ns, max_wait_ns - waited_ns);
+        sleepNs(sleep_ns);
+        waited_ns +|= sleep_ns;
     }
 }
 
@@ -777,10 +785,12 @@ const TestRuntimeCapture = struct {
     finish_calls: std.atomic.Value(u64) = .init(0),
     publish_failures: std.atomic.Value(u64) = .init(0),
     apply_not_found_failures: std.atomic.Value(u64) = .init(0),
+    target_advance_calls: std.atomic.Value(u64) = .init(0),
     persist_calls: std.atomic.Value(u64) = .init(0),
     persisted_sequence: std.atomic.Value(u64) = .init(0),
     last_applied_batch_sequence: std.atomic.Value(u64) = .init(0),
     defer_next_persist: std.atomic.Value(bool) = .init(false),
+    skip_next_apply: std.atomic.Value(bool) = .init(false),
     fail_next_dense_apply_not_found: std.atomic.Value(bool) = .init(false),
     fail_next_publish: std.atomic.Value(bool) = .init(false),
 };
@@ -793,6 +803,7 @@ fn testRuntimeApply(ctx: *anyopaque, batch: derived_types.DerivedBatch, index_re
         _ = capture.apply_not_found_failures.fetchAdd(1, .monotonic);
         return error.NotFound;
     }
+    if (capture.skip_next_apply.swap(false, .monotonic)) return false;
     return true;
 }
 
@@ -827,6 +838,14 @@ fn testRuntimeFinishCatchUp(ctx: *anyopaque, index_ref: index_manager_mod.Manage
     }
 }
 
+fn testRuntimeCanAdvanceToTarget(ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) !bool {
+    _ = index_ref;
+    try std.testing.expect(target_sequence > from_sequence);
+    const capture: *TestRuntimeCapture = @ptrCast(@alignCast(ctx));
+    _ = capture.target_advance_calls.fetchAdd(1, .monotonic);
+    return true;
+}
+
 fn appendTestChangeJournalRecord(log: *change_journal_mod.Journal, alloc: Allocator, record: change_journal_mod.Record) !void {
     const payload = try change_journal_mod.encodeRecord(alloc, record);
     defer alloc.free(payload);
@@ -843,6 +862,33 @@ fn testInMemoryJournalOpenOptions() change_journal_mod.OpenOptions {
             .obsolete_retention_ns = 0,
         },
     };
+}
+
+test "async dense replay wait policy scales with pending tail" {
+    const policy = catch_up_policy.Policy{
+        .coalesce_min_records = 256,
+        .coalesce_delay_ns = 50 * std.time.ns_per_ms,
+        .coalesce_max_wait_ns = 2_000 * std.time.ns_per_ms,
+    };
+
+    try std.testing.expectEqual(@as(u64, 0), catch_up_policy.replayWindowMaxWaitNs(policy, 0));
+    try std.testing.expectEqual(@as(u64, 7_812_500), catch_up_policy.replayWindowMaxWaitNs(policy, 1));
+    try std.testing.expectEqual(@as(u64, 54_687_500), catch_up_policy.replayWindowMaxWaitNs(policy, 7));
+    try std.testing.expectEqual(@as(u64, 1_000 * std.time.ns_per_ms), catch_up_policy.replayWindowMaxWaitNs(policy, 128));
+    try std.testing.expectEqual(@as(u64, 0), catch_up_policy.replayWindowMaxWaitNs(policy, 256));
+}
+
+test "async dense session idle policy scales with recent replay tail" {
+    const policy = catch_up_policy.Policy{
+        .coalesce_min_records = 256,
+        .session_idle_ns = 5 * std.time.ns_per_s,
+    };
+
+    try std.testing.expectEqual(@as(u64, 0), catch_up_policy.sessionIdleMaxWaitNs(policy, 0));
+    try std.testing.expectEqual(@as(u64, 19_531_250), catch_up_policy.sessionIdleMaxWaitNs(policy, 1));
+    try std.testing.expectEqual(@as(u64, 136_718_750), catch_up_policy.sessionIdleMaxWaitNs(policy, 7));
+    try std.testing.expectEqual(@as(u64, 2_500 * std.time.ns_per_ms), catch_up_policy.sessionIdleMaxWaitNs(policy, 128));
+    try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_s), catch_up_policy.sessionIdleMaxWaitNs(policy, 256));
 }
 
 test "async non-tail replay cursor refreshes before watermark advance" {
@@ -952,6 +998,154 @@ test "async non-tail replay cursor refreshes before watermark advance" {
     try std.testing.expectEqual(@as(u64, 1), capture.apply_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), capture.last_applied_batch_sequence.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 2), runtime.appliedSequence("dense_idx").?);
+}
+
+test "async dense zero-applied replay window advances only through target coverage guard" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/async-dense-zero-applied-target-advance-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    defer alloc.free(journal_path_z);
+
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
+    defer journal.close();
+
+    try appendTestChangeJournalRecord(&journal, alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:text-only"},
+        .target_hints = &.{.dense_vector},
+    });
+
+    var capture = TestRuntimeCapture{ .alloc = alloc };
+    capture.skip_next_apply.store(true, .monotonic);
+    var runtime = DerivedRuntime.init(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        &capture,
+        testRuntimeApply,
+        testRuntimePersist,
+        testRuntimeTruncate,
+        testRuntimeBeginCatchUp,
+        testRuntimeFinishCatchUp,
+        testRuntimeCanAdvanceToTarget,
+        null,
+    );
+    defer runtime.deinit();
+
+    try runtime.addWorker("dense_idx", .{ .name = "dense_idx", .kind = .dense_vector }, 0);
+    runtime.notifySequence(1);
+    try runtime.waitForAll(1);
+    try runtime.failIfUnhealthy();
+
+    try std.testing.expectEqual(@as(u64, 1), capture.apply_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), capture.target_advance_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), capture.persisted_sequence.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), runtime.appliedSequence("dense_idx").?);
+}
+
+const DenseTargetAdvanceSessionCapture = struct {
+    active_sessions: std.atomic.Value(u64) = .init(0),
+    begin_calls: std.atomic.Value(u64) = .init(0),
+    finish_calls: std.atomic.Value(u64) = .init(0),
+    apply_calls: std.atomic.Value(u64) = .init(0),
+    target_advance_calls: std.atomic.Value(u64) = .init(0),
+    persist_calls: std.atomic.Value(u64) = .init(0),
+    persisted_sequence: std.atomic.Value(u64) = .init(0),
+};
+
+fn testDenseTargetAdvanceSessionApply(ctx: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !bool {
+    _ = batch;
+    try std.testing.expectEqual(types.IndexKind.dense_vector, index_ref.kind);
+    const capture: *DenseTargetAdvanceSessionCapture = @ptrCast(@alignCast(ctx));
+    _ = capture.apply_calls.fetchAdd(1, .monotonic);
+    return false;
+}
+
+fn testDenseTargetAdvanceSessionPersist(ctx: *anyopaque, index_name: []const u8, sequence: u64, force: bool) !bool {
+    _ = index_name;
+    _ = force;
+    const capture: *DenseTargetAdvanceSessionCapture = @ptrCast(@alignCast(ctx));
+    _ = capture.persist_calls.fetchAdd(1, .monotonic);
+    capture.persisted_sequence.store(sequence, .monotonic);
+    return true;
+}
+
+fn testDenseTargetAdvanceSessionBegin(ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) !void {
+    try std.testing.expectEqual(types.IndexKind.dense_vector, index_ref.kind);
+    const capture: *DenseTargetAdvanceSessionCapture = @ptrCast(@alignCast(ctx));
+    _ = capture.begin_calls.fetchAdd(1, .monotonic);
+    _ = capture.active_sessions.fetchAdd(1, .monotonic);
+}
+
+fn testDenseTargetAdvanceSessionFinish(ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, success: bool) !void {
+    try std.testing.expectEqual(types.IndexKind.dense_vector, index_ref.kind);
+    try std.testing.expect(success);
+    const capture: *DenseTargetAdvanceSessionCapture = @ptrCast(@alignCast(ctx));
+    _ = capture.finish_calls.fetchAdd(1, .monotonic);
+    const active = capture.active_sessions.fetchSub(1, .monotonic);
+    try std.testing.expect(active > 0);
+}
+
+fn testDenseTargetAdvanceWhileSessionOpen(ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) !bool {
+    try std.testing.expectEqual(types.IndexKind.dense_vector, index_ref.kind);
+    try std.testing.expect(target_sequence > from_sequence);
+    const capture: *DenseTargetAdvanceSessionCapture = @ptrCast(@alignCast(ctx));
+    _ = capture.target_advance_calls.fetchAdd(1, .monotonic);
+    try std.testing.expect(capture.active_sessions.load(.monotonic) > 0);
+    return true;
+}
+
+test "async dense workers advance zero-applied target while catch-up sessions are open" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/async-dense-worker-target-advance-open-session-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    defer alloc.free(journal_path_z);
+
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
+    defer journal.close();
+
+    try appendTestChangeJournalRecord(&journal, alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:text-only"},
+        .target_hints = &.{.dense_vector},
+    });
+
+    var capture = DenseTargetAdvanceSessionCapture{};
+    var runtime = DerivedRuntime.init(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        &capture,
+        testDenseTargetAdvanceSessionApply,
+        testDenseTargetAdvanceSessionPersist,
+        testRuntimeTruncate,
+        testDenseTargetAdvanceSessionBegin,
+        testDenseTargetAdvanceSessionFinish,
+        testDenseTargetAdvanceWhileSessionOpen,
+        null,
+    );
+    defer runtime.deinit();
+
+    try runtime.addWorker("dense_a", .{ .name = "dense_a", .kind = .dense_vector }, 0);
+    try runtime.addWorker("dense_b", .{ .name = "dense_b", .kind = .dense_vector }, 0);
+    runtime.notifySequence(1);
+    try runtime.waitForAll(1);
+    try runtime.failIfUnhealthy();
+
+    try std.testing.expectEqual(@as(u64, 1), runtime.appliedSequence("dense_a").?);
+    try std.testing.expectEqual(@as(u64, 1), runtime.appliedSequence("dense_b").?);
+    try std.testing.expectEqual(@as(u64, 2), capture.apply_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), capture.target_advance_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), capture.begin_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), capture.finish_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), capture.active_sessions.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), capture.persisted_sequence.load(.monotonic));
 }
 
 test "async dense publish NotFound retries without failing runtime" {

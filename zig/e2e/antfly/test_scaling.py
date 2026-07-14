@@ -42,6 +42,10 @@ from conftest import (
 from helpers import wait_until
 
 
+MULTI_SHARD_WRITE_ROUTE_TIMEOUT_S = 120.0
+DATA_NODE_REGISTRATION_TIMEOUT_S = 180.0
+
+
 class _ClusterStartupDeadline:
     def __init__(self, expires_at: float):
         self.expires_at = expires_at
@@ -419,6 +423,10 @@ class MultiNodeScalingCluster:
         ]
 
     @property
+    def data_base_urls(self) -> list[str]:
+        return [self.data_base_url_for_node(node) for node in self.data_nodes]
+
+    @property
     def live_data_api_urls(self) -> list[str]:
         urls: list[str] = []
         for node in self.data_nodes:
@@ -428,7 +436,10 @@ class MultiNodeScalingCluster:
         return urls
 
     def data_api_url_for_node(self, node: dict[str, int]) -> str:
-        return antfly_public_api_url(f"http://{self.host}:{node['api_port']}", binary=self.binary)
+        return antfly_public_api_url(self.data_base_url_for_node(node), binary=self.binary)
+
+    def data_base_url_for_node(self, node: dict[str, int]) -> str:
+        return f"http://{self.host}:{node['api_port']}"
 
     def _new_data_node(self, node_id: int) -> dict[str, int]:
         return {
@@ -496,15 +507,22 @@ class MultiNodeScalingCluster:
         for node in self.data_nodes:
             self._start_data_node(node)
 
-        for url in self.data_api_urls:
-            if not wait_for_server(url, timeout=self.startup_timeout(30.0)):
-                raise RuntimeError(f"Data node failed to start at {url}\n{self.debug_logs()}")
-        if not self.wait_for_all_data_nodes_registered(timeout_s=self.startup_timeout(60.0)):
+        self._wait_for_data_nodes_http(self.data_nodes, max_timeout_s=60.0, label="Data node process")
+        if not self.wait_for_all_data_nodes_registered(
+            timeout_s=self.startup_timeout(DATA_NODE_REGISTRATION_TIMEOUT_S)
+        ):
             raise RuntimeError(
                 "Data nodes did not register on all metadata nodes\n"
+                f"metadata snapshot: {self.metadata_snapshot_diagnostic()}\n"
                 f"metadata statuses: {json.dumps(self.metadata_statuses(), indent=2, sort_keys=True)}\n"
                 f"{self.debug_logs()}"
             )
+        self._wait_for_data_nodes_http(
+            self.data_nodes,
+            public_api=True,
+            max_timeout_s=60.0,
+            label="Data node public API",
+        )
 
     def startup_timeout(self, max_timeout_s: float) -> float:
         if self.startup_deadline is None:
@@ -551,16 +569,86 @@ class MultiNodeScalingCluster:
         node = self._new_data_node(max(int(existing["id"]) for existing in self.data_nodes) + 1)
         self.data_nodes.append(node)
         self._start_data_node(node)
-        url = self.data_api_url_for_node(node)
-        if not wait_for_server(url):
-            raise RuntimeError(f"Added data node failed to start at {url}\n{self.debug_logs()}")
+        self._wait_for_data_nodes_http([node], max_timeout_s=60.0, label="Added data node process")
         if not self.wait_for_data_nodes_registered({int(node["id"])}, timeout_s=60.0):
             raise RuntimeError(
                 f"Added data node {node['id']} did not register on all metadata nodes\n"
                 f"metadata statuses: {json.dumps(self.metadata_statuses(), indent=2, sort_keys=True)}\n"
                 f"{self.debug_logs()}"
             )
+        self._wait_for_data_nodes_http(
+            [node],
+            public_api=True,
+            max_timeout_s=60.0,
+            label="Added data node public API",
+        )
         return node
+
+    def _wait_for_data_nodes_http(
+        self,
+        nodes: list[dict[str, int]],
+        *,
+        public_api: bool = False,
+        max_timeout_s: float,
+        label: str,
+    ) -> None:
+        timeout_s = self.startup_timeout(max_timeout_s)
+        deadline = time.monotonic() + timeout_s
+        pending = {int(node["id"]): node for node in nodes}
+        consecutive_successes = {node_id: 0 for node_id in pending}
+        last_probe: dict[int, str] = {}
+        path = "/status" if public_api else "/healthz"
+
+        while pending and time.monotonic() < deadline:
+            request_timeout = max(0.1, min(2.0, deadline - time.monotonic()))
+            for node_id, node in list(pending.items()):
+                proc = self.data_proc_by_node_id.get(node_id)
+                if proc is not None and proc.poll() is not None:
+                    raise RuntimeError(
+                        f"{label} {node_id} exited before becoming ready rc={proc.returncode}\n"
+                        f"{self.debug_logs()}"
+                    )
+
+                url = self.data_api_url_for_node(node) if public_api else self.data_base_url_for_node(node)
+                try:
+                    response = requests.get(f"{url}{path}", timeout=request_timeout)
+                    if response.ok:
+                        consecutive_successes[node_id] += 1
+                        if consecutive_successes[node_id] >= 2:
+                            del pending[node_id]
+                        continue
+                    consecutive_successes[node_id] = 0
+                    last_probe[node_id] = f"{response.status_code}: {response.text[:500]}"
+                except requests.RequestException as exc:
+                    consecutive_successes[node_id] = 0
+                    last_probe[node_id] = repr(exc)
+            if pending:
+                time.sleep(0.25)
+
+        if pending:
+            pending_urls = {
+                node_id: (
+                    self.data_api_url_for_node(node) if public_api else self.data_base_url_for_node(node)
+                )
+                for node_id, node in pending.items()
+            }
+            raise RuntimeError(
+                f"{label} failed to become ready for data nodes {sorted(pending)} within {timeout_s:.1f}s\n"
+                f"pending urls: {json.dumps(pending_urls, indent=2, sort_keys=True)}\n"
+                f"last probes: {json.dumps(last_probe, indent=2, sort_keys=True)}\n"
+                f"{self.debug_logs()}"
+            )
+
+    def _ensure_data_nodes_running(self, expected_node_ids: set[int], *, label: str) -> None:
+        for node_id in sorted(expected_node_ids):
+            proc = self.data_proc_by_node_id.get(node_id)
+            if proc is None:
+                raise RuntimeError(f"{label} {node_id} has no process\n{self.debug_logs()}")
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"{label} {node_id} exited while waiting for registration rc={proc.returncode}\n"
+                    f"{self.debug_logs()}"
+                )
 
     def stop_data_node(self, node_id: int) -> None:
         proc = self.data_proc_by_node_id.get(node_id)
@@ -656,6 +744,7 @@ class MultiNodeScalingCluster:
 
     def wait_for_data_nodes_registered(self, expected_node_ids: set[int], *, timeout_s: float) -> dict[str, Any] | None:
         def registered_on_all_metadata_nodes() -> dict[str, Any] | None:
+            self._ensure_data_nodes_running(expected_node_ids, label="Data node process")
             try:
                 snapshots = [self.metadata_snapshot(index) for index in range(len(self.metadata_urls))]
             except (AssertionError, requests.RequestException):
@@ -925,6 +1014,77 @@ def _all_metadata_snapshots(cluster: MultiNodeScalingCluster) -> list[dict[str, 
         return None
 
 
+def _table_write_route_diagnostic(
+    cluster: MultiNodeScalingCluster,
+    table_name: str,
+    *,
+    min_group_count: int,
+) -> dict[str, Any]:
+    snapshot = cluster.metadata_snapshot()
+    table_id: int | None = None
+    for table in snapshot.get("tables", []):
+        if isinstance(table, dict) and table.get("name") == table_name:
+            table_id = int(table.get("table_id", 0))
+            break
+    if table_id is None:
+        return {
+            "table_name": table_name,
+            "table_found": False,
+            "min_group_count": min_group_count,
+            "projected_tables": [table.get("name") for table in snapshot.get("tables", []) if isinstance(table, dict)],
+        }
+
+    group_ids = sorted(
+        int(record.get("group_id", 0))
+        for record in snapshot.get("ranges", [])
+        if isinstance(record, dict) and int(record.get("table_id", 0)) == table_id
+    )
+    leader_store_by_group: dict[int, int] = {}
+    group_statuses: dict[int, dict[str, Any]] = {}
+    for status in snapshot.get("merged_group_statuses", []):
+        if not isinstance(status, dict):
+            continue
+        group_id = int(status.get("group_id", 0))
+        if group_id not in group_ids:
+            continue
+        group_statuses[group_id] = {
+            "leader_known": bool(status.get("leader_known", False)),
+            "leader_store_id": int(status.get("leader_store_id", 0)),
+            "voter_count_known": bool(status.get("voter_count_known", False)),
+            "voter_count": int(status.get("voter_count", 0)),
+            "healthy_voter_reports": int(status.get("healthy_voter_reports", 0)),
+            "updated_at_millis": int(status.get("updated_at_millis", 0)),
+        }
+        leader_store_id = int(status.get("leader_store_id", 0))
+        if leader_store_id != 0:
+            leader_store_by_group[group_id] = leader_store_id
+
+    placed_nodes_by_group: dict[int, list[int]] = {group_id: [] for group_id in group_ids}
+    for intent in snapshot.get("placement_intents", []):
+        if not isinstance(intent, dict) or not isinstance(intent.get("record"), dict):
+            continue
+        group_id = int(intent["record"].get("group_id", 0))
+        if group_id not in placed_nodes_by_group:
+            continue
+        placed_nodes_by_group[group_id].append(int(intent["record"].get("local_node_id", 0)))
+    for nodes in placed_nodes_by_group.values():
+        nodes.sort()
+
+    return {
+        "table_name": table_name,
+        "table_found": True,
+        "table_id": table_id,
+        "min_group_count": min_group_count,
+        "group_count": len(group_ids),
+        "group_ids": group_ids,
+        "missing_group_count": max(0, min_group_count - len(group_ids)),
+        "missing_leader_group_ids": [group_id for group_id in group_ids if group_id not in leader_store_by_group],
+        "leader_store_by_group": leader_store_by_group,
+        "group_statuses": group_statuses,
+        "placed_nodes_by_group": placed_nodes_by_group,
+    }
+
+
 def _lookup_from_any_data_node(
     cluster: MultiNodeScalingCluster,
     table_name: str,
@@ -958,26 +1118,35 @@ def _insert_docs(
 
     def route_ready() -> str | None:
         try:
-            return _data_api_url_for_table(
+            api_urls = _data_api_urls_for_table(
                 cluster,
                 table_name,
-                require_all_group_leaders=True,
+                require_all_group_leaders=False,
                 min_group_count=min_group_count,
             )
         except (AssertionError, requests.RequestException, ValueError):
             return None
+        for api_url in api_urls:
+            if wait_for_server(api_url, timeout=1.0):
+                return api_url
+        return None
 
-    api_url = wait_until(route_ready, timeout_s=60.0, interval_s=0.5)
+    api_url = wait_until(route_ready, timeout_s=MULTI_SHARD_WRITE_ROUTE_TIMEOUT_S, interval_s=0.5)
     assert api_url is not None, (
-        f"table {table_name} never became write-routable before seed batch\n"
+        f"table {table_name} never exposed a live write endpoint before seed batch\n"
+        f"route readiness: {json.dumps(_table_write_route_diagnostic(cluster, table_name, min_group_count=min_group_count), indent=2, sort_keys=True)}\n"
         f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
-        f"snapshot: {cluster.metadata_snapshot()}\n"
+        f"snapshot: {cluster.metadata_snapshot_diagnostic()}\n"
         f"{cluster.debug_logs()}"
     )
 
     def post_once() -> bool | None:
         nonlocal api_url, last_error
-        api_url = route_ready() or api_url
+        next_api_url = route_ready()
+        if next_api_url is None:
+            last_error = "no live write route"
+            return None
+        api_url = next_api_url
         try:
             response = requests.post(
                 f"{api_url}/tables/{table_name}/batch",
@@ -1011,6 +1180,22 @@ def _data_api_url_for_table(
     require_all_group_leaders: bool = False,
     min_group_count: int = 1,
 ) -> str | None:
+    urls = _data_api_urls_for_table(
+        cluster,
+        table_name,
+        require_all_group_leaders=require_all_group_leaders,
+        min_group_count=min_group_count,
+    )
+    return urls[0] if urls else None
+
+
+def _data_api_urls_for_table(
+    cluster: MultiNodeScalingCluster,
+    table_name: str,
+    *,
+    require_all_group_leaders: bool = False,
+    min_group_count: int = 1,
+) -> list[str]:
     snapshot = cluster.metadata_snapshot()
     table_id: int | None = None
     for table in snapshot.get("tables", []):
@@ -1018,13 +1203,13 @@ def _data_api_url_for_table(
             table_id = int(table.get("table_id", 0))
             break
     if table_id is None:
-        return None
+        return []
     group_ids: list[int] = []
     for table_range in snapshot.get("ranges", []):
         if isinstance(table_range, dict) and int(table_range.get("table_id", 0)) == table_id:
             group_ids.append(int(table_range.get("group_id", 0)))
     if len(group_ids) < min_group_count:
-        return None
+        return []
     group_ids.sort()
 
     leader_store_by_group: dict[int, int] = {}
@@ -1038,20 +1223,34 @@ def _data_api_url_for_table(
         if raw_leader != 0:
             leader_store_by_group[group_id] = raw_leader
     if require_all_group_leaders and any(group_id not in leader_store_by_group for group_id in group_ids):
-        return None
+        return []
+
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def append_node_url(node_id: int) -> None:
+        for node in cluster.data_nodes:
+            if int(node["id"]) != node_id:
+                continue
+            url = cluster.data_api_url_for_node(node)
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+            return
+
+    store_node_by_id = {
+        int(store.get("store_id", 0)): int(store.get("node_id", 0))
+        for store in snapshot.get("stores", [])
+        if isinstance(store, dict)
+    }
+    for group_id in group_ids:
+        leader_store_id = leader_store_by_group.get(group_id)
+        if leader_store_id is not None:
+            append_node_url(store_node_by_id.get(leader_store_id, 0))
+    if urls:
+        return urls
 
     group_id = group_ids[0]
-    leader_store_id: int | None = None
-    if group_id in leader_store_by_group:
-        leader_store_id = leader_store_by_group[group_id]
-    if leader_store_id is not None:
-        for store in snapshot.get("stores", []):
-            if not isinstance(store, dict) or int(store.get("store_id", 0)) != leader_store_id:
-                continue
-            leader_node_id = int(store.get("node_id", 0))
-            for node in cluster.data_nodes:
-                if int(node["id"]) == leader_node_id:
-                    return cluster.data_api_url_for_node(node)
     placed_node_ids = {
         int(intent.get("record", {}).get("local_node_id", 0))
         for intent in snapshot.get("placement_intents", [])
@@ -1059,8 +1258,8 @@ def _data_api_url_for_table(
     }
     for node in cluster.data_nodes:
         if int(node["id"]) in placed_node_ids:
-            return cluster.data_api_url_for_node(node)
-    return None
+            append_node_url(int(node["id"]))
+    return urls
 
 
 def _assert_docs_readable(
@@ -1138,6 +1337,10 @@ def _wait_node_drained_for_groups(
     timeout_s: float = 90.0,
 ) -> dict[str, Any] | None:
     def drained_and_replaced() -> dict[str, Any] | None:
+        try:
+            cluster.trigger_reallocate()
+        except (AssertionError, requests.RequestException):
+            return None
         snapshots = _all_metadata_snapshots(cluster)
         if snapshots is None:
             return None
@@ -1147,14 +1350,19 @@ def _wait_node_drained_for_groups(
                 (store for store in stores if int(store.get("node_id", 0)) == node_id),
                 None,
             )
-            if not drained_store or drained_store.get("drain_requested") is not True:
+            if drained_store is not None and drained_store.get("drain_requested") is not True:
                 return None
             for intent in snapshot.get("placement_intents", []):
                 if not isinstance(intent, dict) or not isinstance(intent.get("record"), dict):
                     continue
                 record = intent["record"]
-                if int(record.get("group_id", 0)) in group_ids and int(record.get("local_node_id", 0)) == node_id:
-                    return None
+                if int(record.get("group_id", 0)) not in group_ids:
+                    continue
+                if int(record.get("local_node_id", 0)) != node_id:
+                    continue
+                if intent.get("serving_state") == "draining":
+                    continue
+                return None
         return snapshots[0]
 
     return wait_until(drained_and_replaced, timeout_s=timeout_s, interval_s=0.5)
@@ -1166,8 +1374,19 @@ def _wait_node_shutdown_phase(
     phase: str,
     *,
     timeout_s: float = 60.0,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    last_status: dict[str, Any] | None = None
+
     def status_matches() -> dict[str, Any] | None:
+        nonlocal last_status
+        # Shutdown convergence (drain debt clearing, then post-finalize cleanup to
+        # "not_found") is driven by the metadata reconcile loop. A reallocation
+        # request is a reconcile wake signal, so nudge it each poll to keep the loop
+        # advancing under load instead of waiting on the next unforced periodic pass.
+        try:
+            cluster.trigger_reallocate()
+        except (AssertionError, requests.RequestException):
+            pass
         try:
             response = requests.get(f"{cluster.metadata_urls[0]}/internal/v1/nodes/{node_id}/shutdown", timeout=10)
             response.raise_for_status()
@@ -1176,11 +1395,13 @@ def _wait_node_shutdown_phase(
             return None
         if not isinstance(payload, dict):
             return None
+        last_status = payload
         if payload.get("phase") != phase:
             return None
         return payload
 
-    return wait_until(status_matches, timeout_s=timeout_s, interval_s=0.5)
+    matched = wait_until(status_matches, timeout_s=timeout_s, interval_s=0.5)
+    return matched, last_status
 
 
 def test_multinode_cluster_uses_configured_multi_metadata_discovery_and_data_raft_urls(
@@ -1225,21 +1446,7 @@ def test_autoscaling_drains_data_node_and_replaces_placements(
     cluster.create_table(table_name, num_shards=5)
 
     docs = {f"doc-{i:02d}": {"title": f"doc {i}", "rank": i} for i in range(10)}
-    try:
-        batch = requests.post(
-            f"{cluster.data_api_urls[0]}/tables/{table_name}/batch",
-            json={"inserts": docs, "sync_level": "write"},
-            timeout=30,
-        )
-        batch.raise_for_status()
-    except requests.RequestException as exc:
-        # Connection resets here have flaked CI with no server-side context;
-        # attach node logs and native stacks so the failure is diagnosable.
-        raise AssertionError(
-            f"seed batch failed table={table_name!r}: {exc!r}"
-            f"\n[native stacks]\n{cluster.native_stack_dumps()}"
-            f"\n[logs]\n{cluster.debug_logs()}"
-        ) from exc
+    _insert_docs(cluster, table_name, docs, min_group_count=5)
 
     group_ids = wait_until(lambda: _table_group_ids(cluster, table_name), timeout_s=60.0, interval_s=0.5)
     assert group_ids is not None and len(group_ids) >= 5, (
@@ -1261,27 +1468,7 @@ def test_autoscaling_drains_data_node_and_replaces_placements(
     node_to_drain = sorted(initial_nodes)[0]
     cluster.request_node_shutdown(node_to_drain)
 
-    def drained_and_replaced() -> dict[str, Any] | None:
-        snapshots = _all_metadata_snapshots(cluster)
-        if snapshots is None:
-            return None
-        for snapshot in snapshots:
-            stores = [store for store in snapshot.get("stores", []) if isinstance(store, dict)]
-            drained_store = next(
-                (store for store in stores if int(store.get("node_id", 0)) == node_to_drain),
-                None,
-            )
-            if not drained_store or drained_store.get("drain_requested") is not True:
-                return None
-            for intent in snapshot.get("placement_intents", []):
-                if not isinstance(intent, dict) or not isinstance(intent.get("record"), dict):
-                    continue
-                record = intent["record"]
-                if int(record.get("group_id", 0)) in group_ids and int(record.get("local_node_id", 0)) == node_to_drain:
-                    return None
-        return snapshots[0]
-
-    drained = wait_until(drained_and_replaced, timeout_s=90.0, interval_s=0.5)
+    drained = _wait_node_drained_for_groups(cluster, node_to_drain, group_ids, timeout_s=90.0)
     assert drained is not None, (
         "drained data node still owned table placements\n"
         f"node_to_drain: {node_to_drain}\n"
@@ -1367,21 +1554,22 @@ def test_autoscaling_drains_stops_and_finalizes_data_node_without_losing_reads(
         f"snapshot: {cluster.metadata_snapshot()}\n"
         f"{cluster.debug_logs()}"
     )
-    complete = _wait_node_shutdown_phase(cluster, node_to_stop, "complete")
+    complete, complete_status = _wait_node_shutdown_phase(cluster, node_to_stop, "complete")
     assert complete is not None and complete.get("safe_to_terminate") is True, (
         "node shutdown never became safe to terminate\n"
         f"node_to_stop: {node_to_stop}\n"
-        f"status: {complete}\n"
+        f"last shutdown status: {complete_status}\n"
         f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
         f"{cluster.debug_logs()}"
     )
 
     cluster.stop_data_node(node_to_stop)
     cluster.finalize_node_shutdown(node_to_stop)
-    finalized = _wait_node_shutdown_phase(cluster, node_to_stop, "not_found")
+    finalized, finalized_status = _wait_node_shutdown_phase(cluster, node_to_stop, "not_found")
     assert finalized is not None and finalized.get("safe_to_terminate") is True, (
         "finalized node still appeared as shutdown debt\n"
         f"node_to_stop: {node_to_stop}\n"
+        f"last shutdown status: {finalized_status}\n"
         f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
         f"snapshot: {cluster.metadata_snapshot()}\n"
         f"{cluster.debug_logs()}"

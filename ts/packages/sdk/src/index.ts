@@ -222,9 +222,11 @@ export type {
   QueryBuilderRequest,
   QueryBuilderResult,
   QueryHit,
+  QueryHitsTotal,
   QueryOptions,
   QueryProfile,
   QueryRequest,
+  SortProfile,
   // Core types
   QueryResponses,
   QueryResult,
@@ -263,8 +265,18 @@ export type {
   WebSearchResultItem,
   WriteOptions,
 } from "./types.js";
-export { embedderProviders, generatorProviders } from "./types.js";
+export {
+  embedderProviders,
+  formatQueryHitsTotal,
+  generatorProviders,
+  queryHitsTotalIsExact,
+  queryHitsTotalValue,
+  queryResultHitsTotal,
+  queryResultTotalHits,
+} from "./types.js";
 
 // Default export for convenience
 import { Client } from "./sdk.js";
 export default Client;
+
+export * from "./models.js";

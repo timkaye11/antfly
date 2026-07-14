@@ -55,6 +55,7 @@ pub const PendingWorkStats = struct {
     resolution: types.ReplayStageStats = .{},
     promotion: types.ReplayStageStats = .{},
     text_merge: types.TextMergeStats = .{},
+    repair_metadata_rebuild_pending: bool = false,
 };
 
 pub const MaintenanceDriver = struct {
@@ -605,6 +606,10 @@ pub const DBCore = struct {
         return try self.index_manager.removeEnrichment(self.store, kind, name);
     }
 
+    pub fn upsertEnrichment(self: *DBCore, cfg: types.EnrichmentConfig) !index_manager_mod.IndexManager.EnrichmentUpsertResult {
+        return try self.index_manager.upsertEnrichment(self.store, cfg);
+    }
+
     pub fn planGeneratedEnrichments(
         self: *DBCore,
         alloc: Allocator,
@@ -693,12 +698,36 @@ pub const DBCore = struct {
     }
 
     pub fn loadAppliedSequence(self: *DBCore, alloc: Allocator, index_name: []const u8) !u64 {
-        return try apply_state.loadAppliedSequenceWithCheckpoint(
+        if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |dense_checkpoint| {
+            if (dense_checkpoint.config_hash != 0) return dense_checkpoint.applied_sequence;
+        }
+        return apply_state.loadAppliedSequenceWithCheckpoint(
             alloc,
             self.store,
             self.applied_sequence_checkpoint_path,
             index_name,
-        );
+        ) catch |err| switch (err) {
+            error.InvalidDerivedApplyState => 0,
+            else => return err,
+        };
+    }
+
+    pub fn loadProjectionCheckpoint(self: *DBCore, alloc: Allocator, index_name: []const u8) !apply_state.ProjectionCheckpoint {
+        if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |dense_checkpoint| {
+            if (dense_checkpoint.config_hash != 0) return dense_checkpoint;
+        }
+        return apply_state.loadProjectionCheckpointWithSidecar(
+            alloc,
+            self.store,
+            self.applied_sequence_checkpoint_path,
+            index_name,
+        ) catch |err| switch (err) {
+            error.InvalidDerivedApplyState => .{
+                .status = .repair_required,
+                .config_hash = if (self.index_manager.get(index_name)) |cfg| types.indexConfigHash(cfg.*) else 0,
+            },
+            else => return err,
+        };
     }
 
     pub fn indexRequiresEnrichmentReplay(self: *DBCore, index_name: []const u8) !bool {
@@ -706,12 +735,60 @@ pub const DBCore = struct {
     }
 
     pub fn saveAppliedSequence(self: *DBCore, index_name: []const u8, sequence: u64) !void {
-        try apply_state.saveAppliedSequenceWithCheckpoint(
+        const cfg = self.index_manager.get(index_name);
+        const config_hash = if (cfg) |value|
+            types.indexConfigHash(value.*)
+        else
+            0;
+        if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |checkpoint| {
+            try self.index_manager.saveDenseProjectionCheckpointMetadata(index_name, .{
+                .applied_sequence = sequence,
+                .status = checkpoint.status,
+                .generation = checkpoint.generation,
+                .config_hash = if (config_hash != 0) config_hash else checkpoint.config_hash,
+            });
+            try self.index_manager.checkpointLsmWalForManagedIndex(.{
+                .name = index_name,
+                .kind = .dense_vector,
+            });
+        } else if (cfg) |value| {
+            try self.index_manager.checkpointLsmWalForManagedIndex(.{
+                .name = index_name,
+                .kind = value.kind,
+            });
+        }
+        try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
+            self.alloc,
+            self.store,
+            self.applied_sequence_checkpoint_path,
+            .{
+                .index_name = index_name,
+                .sequence = sequence,
+                .config_hash = config_hash,
+            },
+        );
+    }
+
+    pub fn saveProjectionCheckpoint(self: *DBCore, index_name: []const u8, checkpoint: apply_state.ProjectionCheckpoint) !void {
+        var checkpoint_with_identity = checkpoint;
+        if (checkpoint_with_identity.config_hash == 0) {
+            if (self.index_manager.get(index_name)) |cfg| {
+                checkpoint_with_identity.config_hash = types.indexConfigHash(cfg.*);
+            }
+        }
+        if (self.index_manager.denseProjectionCheckpointMetadata(index_name) != null) {
+            try self.index_manager.saveDenseProjectionCheckpointMetadata(index_name, checkpoint_with_identity);
+            try self.index_manager.checkpointLsmWalForManagedIndex(.{
+                .name = index_name,
+                .kind = .dense_vector,
+            });
+        }
+        try apply_state.saveProjectionCheckpointWithSidecar(
             self.alloc,
             self.store,
             self.applied_sequence_checkpoint_path,
             index_name,
-            sequence,
+            checkpoint_with_identity,
         );
     }
 
@@ -840,6 +917,17 @@ pub const DBCore = struct {
 
     pub fn scanStoreRange(self: *DBCore, alloc: Allocator, lower: []const u8, upper: []const u8) ![]docstore_mod.OwnedKVPair {
         return try self.store.scanRange(alloc, lower, upper);
+    }
+
+    pub fn scanStoreRangeWithContext(
+        self: *DBCore,
+        lower: []const u8,
+        upper: []const u8,
+        options: docstore_mod.DocStore.ScanOptions,
+        ctx: ?*anyopaque,
+        callback: docstore_mod.DocStore.ScanWithContextCallback,
+    ) !void {
+        return try self.store.scanWithContext(lower, upper, options, ctx, callback);
     }
 
     pub fn findMedianStoreKey(
@@ -1240,18 +1328,40 @@ fn buildTransactionRecoveryIdentityExtraBatch(
         }
         identity_writes.deinit(alloc);
     }
-    try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
+    var identity_visibility_deletes = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (identity_visibility_deletes.items) |key| alloc.free(key);
+        identity_visibility_deletes.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
         alloc,
         identity_ctx.store,
         identity_ctx.identity_namespace,
         identity_ctx.store.lastReplaySequence(0),
         &identity_writes,
+        &identity_visibility_deletes,
         identity_upserts.items,
         identity_deletes.items,
     );
-    if (identity_writes.items.len == 0) return .{};
+    if (identity_writes.items.len == 0 and identity_visibility_deletes.items.len == 0) return .{};
+    const owned_writes = try identity_writes.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_writes) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        if (owned_writes.len > 0) alloc.free(owned_writes);
+    }
+    const owned_deletes = try identity_visibility_deletes.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_deletes) |key| {
+            alloc.free(key);
+        }
+        if (owned_deletes.len > 0) alloc.free(owned_deletes);
+    }
     return .{
-        .writes = try identity_writes.toOwnedSlice(alloc),
+        .writes = owned_writes,
+        .deletes = owned_deletes,
     };
 }
 
@@ -1261,6 +1371,9 @@ fn cleanupTransactionRecoveryIdentityExtraBatch(ctx: ?*anyopaque, batch: transac
     for (batch.writes) |item| {
         alloc.free(@constCast(item.key));
         alloc.free(@constCast(item.value));
+    }
+    for (batch.deletes) |key| {
+        alloc.free(@constCast(key));
     }
     if (batch.writes.len > 0) alloc.free(@constCast(batch.writes));
     if (batch.deletes.len > 0) alloc.free(@constCast(batch.deletes));
@@ -1324,6 +1437,7 @@ pub fn changeJournalOpenOptionsForPrimaryKind(
     primary_lsm_storage: ?lsm_backend_mod.Storage,
     backend_override: ?change_journal_mod.StorageBackend,
     storage_override: ?lsm_backend_mod.Storage,
+    read_only: bool,
 ) change_journal_mod.OpenOptions {
     const backend: change_journal_mod.StorageBackend = backend_override orelse switch (primary_backend_kind) {
         .mem, .lsm_memory => .lsm_memory,
@@ -1333,6 +1447,7 @@ pub fn changeJournalOpenOptionsForPrimaryKind(
         .map_size = map_size,
         .no_sync = no_sync,
         .backend = backend,
+        .read_only = read_only,
         .storage = storage_override orelse if (backend == .lsm and primary_backend_kind == .lsm) primary_lsm_storage else null,
     };
 }
@@ -1340,6 +1455,7 @@ pub fn changeJournalOpenOptionsForPrimaryKind(
 pub fn openCoreResourcesFromPrimaryStore(
     alloc: Allocator,
     path: []const u8,
+    index_base_path: []const u8,
     map_size: usize,
     no_sync: bool,
     primary_backend_kind: PrimaryBackendKind,
@@ -1351,6 +1467,8 @@ pub fn openCoreResourcesFromPrimaryStore(
     configured_identity_namespace: ?doc_identity.Namespace,
     persist_identity_namespace_if_missing: bool,
     identity_namespace_mismatch_policy: doc_identity.NamespaceMismatchPolicy,
+    external_derived_checkpoints: bool,
+    read_only: bool,
 ) !OpenedCoreResources {
     var owned_path: ?[]u8 = null;
     var owned_applied_sequence_checkpoint_path: ?[]u8 = null;
@@ -1394,10 +1512,10 @@ pub fn openCoreResourcesFromPrimaryStore(
     owned_log_mutex = log_mutex;
     const path_copy = try alloc.dupe(u8, path);
     owned_path = path_copy;
-    const applied_sequence_checkpoint_path = switch (primary_backend_kind) {
+    const applied_sequence_checkpoint_path = if (external_derived_checkpoints) switch (primary_backend_kind) {
         .lmdb, .lsm => try apply_state.checkpointPathAlloc(alloc, path),
         .mem, .lsm_memory => null,
-    };
+    } else null;
     owned_applied_sequence_checkpoint_path = applied_sequence_checkpoint_path;
 
     const change_journal_path = try std.fmt.allocPrint(alloc, "{s}/change_journal", .{path});
@@ -1413,6 +1531,7 @@ pub fn openCoreResourcesFromPrimaryStore(
             primary_lsm_storage,
             change_journal_backend,
             change_journal_storage,
+            read_only,
         ),
     );
     errdefer {
@@ -1431,7 +1550,7 @@ pub fn openCoreResourcesFromPrimaryStore(
 
     index_manager.* = try index_manager_mod.IndexManager.initWithOptions(
         alloc,
-        path,
+        index_base_path,
         index_backends,
     );
     index_manager.setAppliedSequenceCheckpointPath(applied_sequence_checkpoint_path);

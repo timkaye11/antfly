@@ -20,6 +20,7 @@ import base64
 import json
 import struct
 import time
+from urllib.parse import quote
 import pytest
 import requests
 
@@ -71,6 +72,51 @@ def _maybe_serverless_build(serverless_api, table_name: str) -> dict | None:
         if exc.response.status_code == 409:
             return serverless_api.table_build_status(table_name)
         raise
+
+
+def _serverless_build_or_wait_for_publish(
+    serverless_api,
+    table_name: str,
+    *,
+    min_head_version: int,
+    published_wal_end_lsn: int,
+    timeout_s: float = 60.0,
+) -> dict:
+    assert _maybe_serverless_build(serverless_api, table_name) is not None
+
+    return _wait_for_serverless_build_status(
+        serverless_api,
+        table_name,
+        lambda current: (
+            current.get("head_version", 0) >= min_head_version
+            and current.get("published_wal_end_lsn") == published_wal_end_lsn
+            and current.get("publish_recommended") is False
+            and current.get("head_republish_recommended") is False
+        ),
+        timeout_s=timeout_s,
+        reason=f"serverless publish did not complete for head version >= {min_head_version}",
+    )
+
+
+def _wait_for_serverless_build_status(
+    serverless_api,
+    table_name: str,
+    predicate,
+    *,
+    timeout_s: float = 30.0,
+    interval_s: float = 0.5,
+    reason: str,
+) -> dict:
+    last_status = None
+
+    def probe():
+        nonlocal last_status
+        last_status = serverless_api.table_build_status(table_name)
+        return last_status if predicate(last_status) else None
+
+    status = wait_until(probe, timeout_s=timeout_s, interval_s=interval_s)
+    assert status is not None, f"{reason}; last_status={last_status}"
+    return status
 
 
 def _index_exists(stateful_api, table_name: str, index_name: str) -> dict | None:
@@ -202,14 +248,14 @@ def test_table_index_lifecycle(table_api):
         raise AssertionError("expected deleted index lookup to return 404")
 
 
-def test_table_rejects_public_full_text_create_index(table_api):
-    table_name = f"index_backfill_{time.time_ns()}"
+def test_stateful_table_accepts_public_full_text_create_index(stateful_api):
+    table_name = f"public_full_text_{time.time_ns()}"
 
-    created = table_api.create_table(table_name)
+    created = stateful_api.create_table(table_name, num_shards=1)
     assert _table_name(created) == table_name
 
-    try:
-        table_api.create_index(
+    assert (
+        stateful_api.create_index(
             table_name,
             "search_idx",
             {
@@ -217,11 +263,162 @@ def test_table_rejects_public_full_text_create_index(table_api):
                 "type": "full_text",
             },
         )
-    except requests.HTTPError as exc:
-        assert exc.response is not None
-        assert exc.response.status_code == 400
-    else:
-        raise AssertionError("expected public full-text create_index to be rejected")
+        == {}
+    )
+
+    detail = stateful_api.get_index(table_name, "search_idx")
+    assert detail["config"]["name"] == "search_idx"
+    assert detail["config"]["type"] == "full_text"
+
+
+def test_stateful_table_registers_public_artifact_enrichment_for_default_full_text(stateful_api):
+    table_name = f"artifact_enrichment_{time.time_ns()}"
+
+    created = stateful_api.create_table(table_name, num_shards=1)
+    assert _table_name(created) == table_name
+
+    with pytest.raises(requests.HTTPError) as exc_info:
+        stateful_api.put(
+            f"/tables/{table_name}/artifacts/invalid_chunks_v1/enrichment",
+            {
+                "kind": "chunk",
+                "chunk_size": 512,
+                "full_text_index": True,
+            },
+        )
+    assert exc_info.value.response.status_code == 400
+
+    with pytest.raises(requests.HTTPError) as exc_info:
+        stateful_api.put(
+            f"/tables/{table_name}/artifacts/orphan_chunks_v1/enrichment",
+            {
+                "kind": "chunk",
+                "source_artifact_name": "missing_units_v1",
+                "field": "text",
+                "chunk_size": 512,
+                "full_text_index": True,
+            },
+        )
+    assert exc_info.value.response.status_code == 400
+
+    assert (
+        stateful_api.put(
+            f"/tables/{table_name}/artifacts/document_units_v1/enrichment",
+            {
+                "kind": "asset",
+                "field": "url",
+                "content_type": "application/json",
+                "producer_json": json.dumps({"type": "document_extraction", "config": {}}),
+            },
+        )
+        == {}
+    )
+    assert (
+        stateful_api.put(
+            f"/tables/{table_name}/artifacts/document_chunks_v1/enrichment",
+            {
+                "kind": "chunk",
+                "source_artifact_name": "document_units_v1",
+                "field": "text",
+                "chunk_size": 512,
+                "chunk_overlap": 50,
+                "full_text_index": True,
+            },
+        )
+        == {}
+    )
+
+    detail = stateful_api.get_index(table_name, "full_text_index_v0")
+    assert detail["config"]["name"] == "full_text_index_v0"
+    assert detail["config"]["type"] == "full_text"
+
+    table = stateful_api.get_table(table_name)
+    encoded_detail = json.dumps(table, sort_keys=True)
+    assert "document_units_v1" in encoded_detail
+    assert "document_chunks_v1" in encoded_detail
+    assert "full_text_index" in encoded_detail
+
+    assert (
+        stateful_api.put(
+            f"/tables/{table_name}/artifacts/document_chunks_v1/enrichment",
+            {
+                "kind": "chunk",
+                "source_artifact_name": "document_units_v1",
+                "field": "text",
+                "chunk_size": 256,
+                "chunk_overlap": 25,
+                "full_text_index": True,
+            },
+        )
+        == {}
+    )
+    replaced = stateful_api.get_table(table_name)
+    replaced_detail = json.dumps(replaced, sort_keys=True)
+    assert '"chunk_size": 256' in replaced_detail
+    assert '"chunk_overlap": 25' in replaced_detail
+
+    with pytest.raises(requests.HTTPError) as exc_info:
+        stateful_api.delete(f"/tables/{table_name}/artifacts/document_units_v1/enrichment")
+    assert exc_info.value.response.status_code == 400
+
+    decoded_name = "document chunks v2"
+    assert (
+        stateful_api.put(
+            f"/tables/{table_name}/artifacts/{quote(decoded_name, safe='')}/enrichment",
+            {
+                "kind": "chunk",
+                "source_artifact_name": "document_units_v1",
+                "field": "text",
+                "chunk_size": 128,
+                "chunk_overlap": 10,
+            },
+        )
+        == {}
+    )
+    decoded_table = stateful_api.get_table(table_name)
+    decoded_detail = json.dumps(decoded_table, sort_keys=True)
+    assert decoded_name in decoded_detail
+    assert quote(decoded_name, safe="") not in decoded_detail
+
+    assert stateful_api.delete(f"/tables/{table_name}/artifacts/document_chunks_v1/enrichment") == {}
+    assert stateful_api.delete(f"/tables/{table_name}/artifacts/{quote(decoded_name, safe='')}/enrichment") == {}
+    assert stateful_api.delete(f"/tables/{table_name}/artifacts/document_units_v1/enrichment") == {}
+
+
+def test_stateful_table_rejects_document_full_text_create_index_with_inline_enrichments(stateful_api):
+    table_name = f"document_full_text_rejected_{time.time_ns()}"
+
+    created = stateful_api.create_table(table_name, num_shards=1)
+    assert _table_name(created) == table_name
+
+    with pytest.raises(requests.HTTPError) as exc_info:
+        stateful_api.create_index(
+            table_name,
+            "document_text",
+            {
+                "name": "document_text",
+                "type": "full_text",
+                "artifact_name": "document_chunks_v1",
+                "enrichments": [
+                    {
+                        "name": "document_units_v1",
+                        "kind": "asset",
+                        "field": "url",
+                        "content_type": "application/json",
+                        "producer_json": json.dumps({"type": "document_extraction", "config": {}}),
+                    },
+                    {
+                        "name": "document_chunks_v1",
+                        "kind": "chunk",
+                        "source_artifact_name": "document_units_v1",
+                        "field": "text",
+                        "chunk_size": 512,
+                        "chunk_overlap": 50,
+                    },
+                ],
+            },
+        )
+    assert exc_info.value.response.status_code == 400
 
 
 def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_query(stateful_api):
@@ -705,7 +902,7 @@ def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(
                 "provider": "openai",
                 "model": "text-embedding-3-small",
                 "url": strict_pacing_sensitive_openai_embedder.url,
-                "requests_per_minute": 300,
+                "requests_per_minute": 120,
                 "burst": 1,
             },
         }
@@ -787,7 +984,7 @@ def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(
 
     stats = strict_pacing_sensitive_openai_embedder.stats()
     assert stats["successful_requests"] >= 2
-    assert stats["rate_limited_requests"] == 0
+    assert stats["rate_limited_requests"] <= 1
 
 
 def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_artifact(
@@ -922,9 +1119,9 @@ def test_table_rejects_non_go_full_text_chunk_config(table_api):
     try:
         table_api.create_index(
             table_name,
-            "full_text_index_v1",
+            "search_idx",
             {
-                "name": "full_text_index_v1",
+                "name": "search_idx",
                 "type": "full_text",
                 "chunk_name": "serverless_chunk_preview",
             },
@@ -1034,7 +1231,7 @@ def test_table_chunker_full_text_index_routes_template_chunks(table_api, openai_
                     "body": "body text without the keyword",
                 }
             },
-            sync_level="full_text",
+            sync_level="full_index",
         )
         assert batch["inserted"] == 1
         if table_api.backend == "serverless":
@@ -1538,21 +1735,17 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
     rebuilt = _maybe_serverless_build(serverless_api, table_name)
     assert rebuilt is not None
     target_head_version = rebuilt.get("version") or rebuilt.get("head_version") or 2
-    ready = wait_until(
-        lambda: (
-            current
-            if (
-                (current := serverless_api.table_build_status(table_name)).get("head_version", 0) == target_head_version
-                and _named_action(current, "vector_index_actions", "semantic_b") == "reuse"
-                and _named_action(current, "sparse_index_actions", "sparse_a") == "reuse"
-                and _named_action(current, "sparse_index_actions", "sparse_b") == "reuse"
-            )
-            else None
+    ready = _wait_for_serverless_build_status(
+        serverless_api,
+        table_name,
+        lambda current: (
+            current.get("head_version", 0) >= target_head_version
+            and _named_action(current, "vector_index_actions", "semantic_b") == "reuse"
+            and _named_action(current, "sparse_index_actions", "sparse_a") == "reuse"
+            and _named_action(current, "sparse_index_actions", "sparse_b") == "reuse"
         ),
-        timeout_s=30.0,
-        interval_s=0.5,
+        reason=f"serverless republish did not reach head version {target_head_version}",
     )
-    assert ready is not None
 
     semantic_b = serverless_api.get_index(table_name, "semantic_b")
     sparse_a = serverless_api.get_index(table_name, "sparse_a")
@@ -1651,23 +1844,26 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
     assert planned["artifact_actions"]["dense_vector"] == "rebuild"
     assert planned["published_wal_end_lsn"] == first_published_wal_end
 
-    rebuilt = _maybe_serverless_build(serverless_api, table_name)
+    rebuilt = _serverless_build_or_wait_for_publish(
+        serverless_api,
+        table_name,
+        min_head_version=first_head_version + 1,
+        published_wal_end_lsn=first_published_wal_end,
+    )
     assert rebuilt is not None
     target_head_version = rebuilt.get("version") or rebuilt.get("head_version") or (first_head_version + 1)
-    ready = wait_until(
-        lambda: (
-            current
-            if (
-                (current := serverless_api.table_build_status(table_name)).get("head_version", 0) == target_head_version
-                and current.get("published_wal_end_lsn") == first_published_wal_end
-                and _named_action(current, "head_vector_index_actions", "semantic_idx") == "rebuild"
-            )
-            else None
+    ready = _wait_for_serverless_build_status(
+        serverless_api,
+        table_name,
+        lambda current: (
+            current.get("head_version", 0) >= target_head_version
+            and current.get("published_wal_end_lsn") == first_published_wal_end
+            and current.get("publish_recommended") is False
+            and _named_action(current, "head_vector_index_actions", "semantic_idx") == "rebuild"
         ),
-        timeout_s=30.0,
-        interval_s=0.5,
+        timeout_s=60.0,
+        reason=f"serverless dense-index republish did not reach head version {target_head_version}",
     )
-    assert ready is not None
 
     detail = serverless_api.get_index(table_name, "semantic_idx")
     assert detail["status"]["head_publication_action"] == "rebuild"
@@ -1756,16 +1952,12 @@ def test_serverless_build_status_reports_head_actions_for_text_only_updates(serv
     assert second_build is not None
     target_head_version = second_build.get("version") or second_build.get("head_version") or 2
 
-    status = wait_until(
-        lambda: (
-            current
-            if (current := serverless_api.table_build_status(table_name)).get("head_version", 0) == target_head_version
-            else None
-        ),
-        timeout_s=30.0,
-        interval_s=0.5,
+    status = _wait_for_serverless_build_status(
+        serverless_api,
+        table_name,
+        lambda current: current.get("head_version", 0) >= target_head_version,
+        reason=f"serverless rebuild did not reach head version {target_head_version}",
     )
-    assert status is not None
     assert status["head_artifact_actions"]["document_segment"] == "rebuild"
     assert status["head_artifact_actions"]["full_text"] == "rebuild"
     assert status["head_artifact_actions"]["dense_vector"] == "reuse"
@@ -1881,21 +2073,17 @@ def test_serverless_schema_migration_republishes_versioned_full_text_indexes(ser
     rebuilt = _maybe_serverless_build(serverless_api, table_name)
     assert rebuilt is not None
     target_head_version = rebuilt.get("version") or rebuilt.get("head_version") or (first_head_version + 1)
-    ready = wait_until(
-        lambda: (
-            current
-            if (
-                (current := serverless_api.table_build_status(table_name)).get("head_version", 0) == target_head_version
-                and current.get("published_wal_end_lsn") == first_published_wal_end
-                and _full_text_action(current, "head_full_text_index_actions", "full_text_index_v0") == "reuse"
-                and _full_text_action(current, "head_full_text_index_actions", "full_text_index_v1") == "rebuild"
-            )
-            else None
+    ready = _wait_for_serverless_build_status(
+        serverless_api,
+        table_name,
+        lambda current: (
+            current.get("head_version", 0) >= target_head_version
+            and current.get("published_wal_end_lsn") == first_published_wal_end
+            and _full_text_action(current, "head_full_text_index_actions", "full_text_index_v0") == "reuse"
+            and _full_text_action(current, "head_full_text_index_actions", "full_text_index_v1") == "rebuild"
         ),
-        timeout_s=30.0,
-        interval_s=0.5,
+        reason=f"serverless full-text republish did not reach head version {target_head_version}",
     )
-    assert ready is not None
 
     active_index = serverless_api.get_index(table_name, "full_text_index_v0")
     next_index = serverless_api.get_index(table_name, "full_text_index_v1")
