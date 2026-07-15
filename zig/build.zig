@@ -1111,9 +1111,9 @@ pub fn build(b: *std.Build) void {
     else
         false;
     const termite_enable_cuda = b.option(bool, "cuda", "Enable CUDA inference support through the NVIDIA Driver API") orelse false;
-    const termite_cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: portable PTX; fatbin is not implemented yet") orelse "portable";
-    if (!std.mem.eql(u8, termite_cuda_artifacts, "portable")) {
-        @panic("invalid -Dcuda-artifacts (expected portable; fatbin is not implemented yet)");
+    const termite_cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: fatbin SASS+PTX, portable PTX, or sm89 cubin") orelse "fatbin";
+    if (!std.mem.eql(u8, termite_cuda_artifacts, "portable") and !std.mem.eql(u8, termite_cuda_artifacts, "fatbin") and !std.mem.eql(u8, termite_cuda_artifacts, "sm89")) {
+        @panic("invalid -Dcuda-artifacts (expected portable, fatbin, or sm89)");
     }
     const termite_blas_root_opt = b.option([]const u8, "blas-root", "Path to system BLAS root with include/ and lib/ for non-macOS native acceleration");
     const termite_system_blas_available = link_libc and (target.result.os.tag == .macos or termite_blas_root_opt != null);
@@ -1438,6 +1438,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     scraping_mod.addImport("objectstore", objectstore_mod);
+    scraping_mod.addImport("httpx", httpx_mod);
     const reranking_mod = b.createModule(.{
         .root_source_file = b.path("lib/reranking/src/mod.zig"),
         .target = target,
@@ -2491,6 +2492,13 @@ pub fn build(b: *std.Build) void {
     const lib_embeddings_test_step = b.step("lib-embeddings-test", "Run standalone lib/embeddings tests");
     lib_embeddings_test_step.dependOn(&run_lib_embeddings_tests.step);
 
+    const lib_scraping_tests = b.addTest(.{
+        .root_module = scraping_mod,
+    });
+    const run_lib_scraping_tests = b.addRunArtifact(lib_scraping_tests);
+    const lib_scraping_test_step = b.step("lib-scraping-test", "Run standalone lib/scraping tests");
+    lib_scraping_test_step.dependOn(&run_lib_scraping_tests.step);
+
     const lib_vectorindex_tests = b.addTest(.{
         .root_module = vectorindex_mod,
     });
@@ -2816,7 +2824,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_common_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{ "provider registry", "std http listener" },
+        .filters = &.{ "provider registry", "std http listener", "health server" },
     });
     const run_lib_common_tests = b.addRunArtifact(lib_common_tests);
     const lib_common_test_step = b.step("lib-common-test", "Run common/provider registry tests");
@@ -2955,6 +2963,8 @@ pub fn build(b: *std.Build) void {
         "provisioned table write cache retires stale db when index metadata changes",
         "embeddings index status ignores inactive stale catch-up progress once dense coverage is visible",
         "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery",
+        "managed embedder sends antfly media parts when local provider is configured",
+        "managed embedder normalizes local admission overload across embedding modes",
         "partial coverage embeddings readiness counts skipped source units",
         "partial coverage embeddings readiness does not mask pending enrichment",
         "create table raw parser merges default full text with quickstart embedding index",
@@ -5041,6 +5051,12 @@ pub fn build(b: *std.Build) void {
         .root_module = standalone_runtime_test_mod,
         .filters = &.{
             "standalone runtime module compiles",
+            "standalone runtime local generator accepts media url data uris",
+            "standalone runtime local dense embed preserves borrowed binary media",
+            "standalone runtime local generator preflights mixed resident media exactly",
+            "standalone runtime local generator refuses decode allocation beyond preflight",
+            "standalone inference middleware reuses public API authentication",
+            "standalone CORS middleware enforces dynamic configuration",
             "standalone runtime local replica reconcile permit stays blocked while startup debt is unresolved",
             "standalone runtime registers internal group routes explicitly",
             "standalone runtime registers mcp routes before antfarm catch-all",
@@ -5058,7 +5074,9 @@ pub fn build(b: *std.Build) void {
             "antfly config uses cli override before common config",
             "standalone public api caps keep alive request reuse",
             "standalone public api body limit matches common http listener",
+            "standalone public ready endpoint fails closed before API initialization",
             "standalone public HTTP server is restart-safe and uses public API request body limit",
+            "standalone rejects configured server TLS instead of serving plaintext",
             "standalone Lite transaction sessions survive file reopen",
             "durable session mutations publish only after persistence succeeds",
             "durable session limits bound count and encoded record size",
@@ -5066,7 +5084,9 @@ pub fn build(b: *std.Build) void {
             "common config parses bounded transaction session policy",
             "standalone public listener lease is exclusive and immediately reusable",
             "parse cli accepts inference budget overrides",
+            "standalone kernel JIT mode precedence is CLI then environment then config",
             "inference config falls back to common config",
+            "standalone prompt cache detaches resource observer before owner teardown",
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
             "standalone Lite enforces one shard and one replica",
@@ -7269,6 +7289,22 @@ pub fn build(b: *std.Build) void {
         inference_cli_mod.addImport("build_options", inference_build_options_mod);
         inference_cli_mod.addImport("antfly_platform", platform_mod);
         inference_cli_mod.addImport("structlog", structlog_mod);
+
+        // Tests declared by an imported module are compiled but are not
+        // enumerated by the wrapper module's test runner. Exercise the
+        // inference CLI module directly so its config and argument parser
+        // tests remain part of the top-level unit-test graph.
+        const inference_cli_tests = b.addTest(.{
+            .root_module = inference_cli_mod,
+            .test_runner = .{
+                .path = b.path("pkg/antfly/src/test_runner.zig"),
+                .mode = .simple,
+            },
+        });
+        const run_inference_cli_tests = b.addRunArtifact(inference_cli_tests);
+        const inference_cli_test_step = b.step("inference-cli-test", "Run standalone inference CLI tests");
+        inference_cli_test_step.dependOn(&run_inference_cli_tests.step);
+        unit_test_step.dependOn(&run_inference_cli_tests.step);
 
         const mod = b.createModule(.{
             .root_source_file = b.path("pkg/antfly/src/inference_main.zig"),

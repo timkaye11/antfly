@@ -49,6 +49,7 @@ const florence_arch = @import("florence.zig");
 const deberta_arch = @import("deberta.zig");
 const gliner_head = @import("gliner_head.zig");
 const gliner_head_graph = @import("gliner_head_graph.zig");
+const kernel_jit = @import("../graph/kernel_jit.zig");
 const graph_runtime = @import("../graph/runtime.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const ops = @import("../ops/ops.zig");
@@ -125,7 +126,19 @@ const metal_runtime = if (build_options.enable_metal) @import("../backends/metal
     fn metalDeviceAvailable() bool {
         return false;
     }
+
+    fn validateMetalJitLoadContext(
+        config: kernel_jit.Config,
+        load_context: kernel_jit.LoadContext,
+    ) !void {
+        if (!load_context.allowsQualification() and
+            (config.mode.failClosed() or config.qualified_profile_path != null or config.profile_capture_only))
+        {
+            return error.KernelJitRequiredDynamicLoad;
+        }
+    }
 };
+const MetalJitRouteScope = if (build_options.enable_metal) metal_runtime.MetalJitRouteScope else void;
 
 const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {};
 
@@ -944,26 +957,109 @@ pub fn getPjrtClientPtr(session: Session) ?*anyopaque {
 }
 
 pub fn createMetalSession(allocator: std.mem.Allocator, model_path: []const u8) !Session {
-    return createMetalSessionWithTaskOverride(allocator, model_path, null);
+    return createMetalSessionWithKernelJit(allocator, model_path, .{});
 }
 
 pub fn createMetalSessionWithTaskOverride(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride) !Session {
-    return createGpuHostedSessionWithTaskOverride(allocator, model_path, override, .metal);
+    return createMetalSessionWithTaskOverrideAndKernelJit(allocator, model_path, override, .{});
+}
+
+pub fn createMetalSessionWithKernelJit(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    config: kernel_jit.Config,
+) !Session {
+    return createMetalSessionWithKernelJitAndLoadContext(allocator, model_path, config, .dynamic);
+}
+
+pub fn createMetalSessionWithKernelJitAndLoadContext(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    config: kernel_jit.Config,
+    load_context: kernel_jit.LoadContext,
+) !Session {
+    return createMetalSessionWithTaskOverrideAndKernelJitAndLoadContext(allocator, model_path, null, config, load_context);
+}
+
+pub fn createMetalSessionWithTaskOverrideAndKernelJit(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    override: ?TaskOverride,
+    config: kernel_jit.Config,
+) !Session {
+    return createMetalSessionWithTaskOverrideAndKernelJitAndLoadContext(allocator, model_path, override, config, .dynamic);
+}
+
+pub fn createMetalSessionWithTaskOverrideAndKernelJitAndLoadContext(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    override: ?TaskOverride,
+    config: kernel_jit.Config,
+    load_context: kernel_jit.LoadContext,
+) !Session {
+    return createGpuHostedSessionWithTaskOverride(allocator, model_path, override, .metal, config, load_context);
 }
 
 pub fn createCudaSession(allocator: std.mem.Allocator, model_path: []const u8) !Session {
-    return createCudaSessionWithTaskOverride(allocator, model_path, null);
+    return createCudaSessionWithKernelJit(allocator, model_path, .{});
 }
 
 pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride) !Session {
+    return createCudaSessionWithTaskOverrideAndKernelJit(allocator, model_path, override, .{});
+}
+
+pub fn createCudaSessionWithKernelJit(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    config: kernel_jit.Config,
+) !Session {
+    return createCudaSessionWithKernelJitAndLoadContext(allocator, model_path, config, .dynamic);
+}
+
+pub fn createCudaSessionWithKernelJitAndLoadContext(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    config: kernel_jit.Config,
+    load_context: kernel_jit.LoadContext,
+) !Session {
+    return createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
+        allocator,
+        model_path,
+        null,
+        config,
+        load_context,
+    );
+}
+
+pub fn createCudaSessionWithTaskOverrideAndKernelJit(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    override: ?TaskOverride,
+    config: kernel_jit.Config,
+) !Session {
+    return createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
+        allocator,
+        model_path,
+        override,
+        config,
+        .dynamic,
+    );
+}
+
+pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    override: ?TaskOverride,
+    config: kernel_jit.Config,
+    load_context: kernel_jit.LoadContext,
+) !Session {
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+    try config.validate();
+    if (config.mode.failClosed() and !load_context.allowsQualification()) {
+        return error.KernelJitRequiredDynamicLoad;
+    }
 
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
-    if (debug_cuda_session) std.log.info("cuda-session: init cuda compute start path={s}", .{model_path});
-    var cuda_compute = try cuda_compute_mod.CudaCompute.init(allocator);
-    errdefer cuda_compute.deinit();
-    if (debug_cuda_session) std.log.info("cuda-session: init cuda compute done path={s}", .{model_path});
-
     if (debug_cuda_session) std.log.info("cuda-session: create native session start path={s}", .{model_path});
     var native_session = try createNativeSessionWithTaskOverride(allocator, model_path, override);
     defer native_session.close();
@@ -971,6 +1067,21 @@ pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
     const native_impl: *ArchSession = @ptrCast(@alignCast(native_session.ptr));
     if (native_impl.backend_type != .native) return error.InvalidBackend;
     const cuda_profile = cudaProfileForArch(native_impl.arch_config) orelse return error.UnsupportedCudaArchitecture;
+    const jit_scope = cuda_compute_mod.kernelJitRouteScopeForLoadedWeights(
+        cuda_profile,
+        &native_impl.backend_data.native.resident_weights,
+    );
+
+    if (debug_cuda_session) std.log.info("cuda-session: init cuda compute start path={s}", .{model_path});
+    var cuda_compute = try cuda_compute_mod.CudaCompute.initWithKernelJitForScopeAndLoadContext(
+        allocator,
+        config,
+        cuda_profile,
+        jit_scope,
+        load_context,
+    );
+    errdefer cuda_compute.deinit();
+    if (debug_cuda_session) std.log.info("cuda-session: init cuda compute done path={s}", .{model_path});
 
     if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
     try cuda_compute.requireProfile(cuda_profile);
@@ -992,6 +1103,7 @@ pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
         .arch_config = native_impl.arch_config,
         .task = native_impl.task,
         .backend_type = .cuda,
+        .kernel_jit_config = config,
         .backend_data = .{ .cuda = .{ .compute = cuda_compute } },
     };
     if (debug_cuda_session) std.log.info("cuda-session: return session path={s}", .{model_path});
@@ -1029,6 +1141,46 @@ test "cuda support gate admits only supported encoder architectures" {
         try std.testing.expectEqual(CudaCapabilityProfile.gemma4, cudaProfileForArch(.{ .gpt = .{ .family = .gemma } }).?);
     }
 }
+
+test "CUDA runtime JIT required dynamic session rejects before model access" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    try std.testing.expectError(
+        error.KernelJitRequiredDynamicLoad,
+        createCudaSessionWithKernelJitAndLoadContext(
+            std.testing.allocator,
+            "/private/tmp/antfly-runtime-jit-intentionally-missing-model",
+            .{ .mode = .required },
+            .dynamic,
+        ),
+    );
+}
+
+test "Metal JIT load policy is backend independent" {
+    try metal_runtime.validateMetalJitLoadContext(.{ .mode = .on }, .dynamic);
+    try std.testing.expectError(
+        error.KernelJitRequiredDynamicLoad,
+        metal_runtime.validateMetalJitLoadContext(.{ .mode = .required }, .dynamic),
+    );
+    try std.testing.expectError(
+        error.KernelJitRequiredDynamicLoad,
+        metal_runtime.validateMetalJitLoadContext(.{
+            .mode = .on,
+            .qualified_profile_path = "/tmp/qualified-profile.json",
+        }, .dynamic),
+    );
+    try std.testing.expectError(
+        error.KernelJitRequiredDynamicLoad,
+        metal_runtime.validateMetalJitLoadContext(.{
+            .mode = .shadow,
+            .profile_capture_only = true,
+        }, .dynamic),
+    );
+    try metal_runtime.validateMetalJitLoadContext(.{
+        .mode = .on,
+        .qualified_profile_path = "/tmp/qualified-profile.json",
+    }, .startup_preload);
+}
+
 fn eagerLoadResidentsFromStore(
     allocator: std.mem.Allocator,
     resident_weights: anytype,
@@ -1136,7 +1288,11 @@ fn createGpuHostedSessionWithTaskOverride(
     model_path: []const u8,
     override: ?TaskOverride,
     backend_type: BackendType,
+    kernel_jit_config: kernel_jit.Config,
+    kernel_jit_load_context: kernel_jit.LoadContext,
 ) !Session {
+    try kernel_jit_config.validate();
+    try metal_runtime.validateMetalJitLoadContext(kernel_jit_config, kernel_jit_load_context);
     try ensureGpuHostedSessionAvailable(backend_type);
     const direct_quant_enabled = directQuantEnabled();
     const quant_mode = gpuHostedQuantExecutionMode(direct_quant_enabled);
@@ -1148,6 +1304,9 @@ fn createGpuHostedSessionWithTaskOverride(
     const model_weight_bytes = estimateNativeWeightBytes(allocator, mf) catch 0;
 
     var arch_config = try detectArchitecture(allocator, model_path, mf);
+    var metal_jit_scope: MetalJitRouteScope = if (build_options.enable_metal)
+        metal_runtime.MetalJitRouteScope.none()
+    else {};
     if (mf.gguf_path) |_| {
         var report_opt = try inspectGgufModel(allocator, model_path);
         defer if (report_opt) |*report| report.deinit();
@@ -1158,16 +1317,19 @@ fn createGpuHostedSessionWithTaskOverride(
 
     var lazy_weights = std.StringHashMapUnmanaged(gpu_hosted_store_mod.LazyWeightEntry){};
     var tensor_store: ?tensor_store_mod.TensorStore = null;
+    var backend_resources_transferred = false;
     errdefer {
-        var it = lazy_weights.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.quantized_storage) |*storage| storage.deinit();
-            if (entry.value_ptr.host_loaded) |*host_loaded| host_loaded.deinit();
-            entry.value_ptr.tensor_ref.deinit(allocator);
-            allocator.free(entry.key_ptr.*);
+        if (!backend_resources_transferred) {
+            var it = lazy_weights.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.quantized_storage) |*storage| storage.deinit();
+                if (entry.value_ptr.host_loaded) |*host_loaded| host_loaded.deinit();
+                entry.value_ptr.tensor_ref.deinit(allocator);
+                allocator.free(entry.key_ptr.*);
+            }
+            lazy_weights.deinit(allocator);
+            if (tensor_store) |store| store.deinit();
         }
-        lazy_weights.deinit(allocator);
-        if (tensor_store) |store| store.deinit();
     }
 
     var eager_dense = false;
@@ -1286,9 +1448,25 @@ fn createGpuHostedSessionWithTaskOverride(
         break :blk runtime.tier.cache.SharedCache.init(budget);
     } else null;
     errdefer {
-        if (residency) |value| {
-            var v = value;
-            v.deinit();
+        if (!backend_resources_transferred) {
+            if (residency) |value| {
+                var v = value;
+                v.deinit();
+            }
+        }
+    }
+    if (comptime build_options.enable_metal) {
+        // CUDA/native sessions do not own a Metal provider, so avoid a GGUF
+        // catalog scan that cannot affect their dispatch.
+        if (backend_type == .metal) {
+            includeMetalJitLinearWeightFormats(
+                &metal_jit_scope,
+                &lazy_weights,
+                tensor_store,
+                direct_quant_enabled,
+                arch_config,
+                metalJitUsesExactProfileScope(kernel_jit_config),
+            );
         }
     }
 
@@ -1298,6 +1476,11 @@ fn createGpuHostedSessionWithTaskOverride(
         .arch_config = arch_config,
         .task = sessionTaskForModelType(mf.model_type, override),
         .backend_type = backend_type,
+        .kernel_jit_config = kernel_jit_config,
+        // Startup authority is a constructor-local capability. Never retain
+        // it in a session that may be published and reused post-startup.
+        .kernel_jit_load_context = .dynamic,
+        .metal_jit_scope = metal_jit_scope,
         .budget_floor = budget_floor,
         .shared_cache_budget_floor = shared_cache_floor,
         .backend_data = makeGpuHostedBackendData(backend_type, .{
@@ -1315,8 +1498,25 @@ fn createGpuHostedSessionWithTaskOverride(
             .jina_lora_adapter = gpu_jina_lora_adapter,
         }),
     };
+    backend_resources_transferred = true;
     gpu_jina_lora_adapter = null;
     errdefer archClose(impl);
+    // Build and qualify the model-scoped provider before publishing the
+    // session. Required mode therefore fails model loading, and subsequent
+    // compute wrappers reuse the already-initialized shared provider.
+    if (comptime build_options.enable_metal) {
+        if (backend_type == .metal and kernel_jit_config.mode.compiles()) {
+            var prepared = try MetalCompute.initWithKernelJitScopeAndLoadContext(
+                allocator,
+                gpuBackendData(impl),
+                null,
+                kernel_jit_config,
+                metal_jit_scope,
+                kernel_jit_load_context,
+            );
+            prepared.deinit();
+        }
+    }
     try initGpuHostedPrefetch(impl);
     return .{ .ptr = impl, .vtable = &arch_vtable };
 }
@@ -2754,6 +2954,397 @@ fn shouldKeepGpuHostedLazyWeightDense(backend_type: BackendType, arch_config: Ar
     return false;
 }
 
+fn isMetalJitTiedEmbeddingWeightKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "embed_tokens.weight") or
+        std.mem.endsWith(u8, key, ".embed_tokens.weight") or
+        std.mem.eql(u8, key, "wte.weight") or
+        std.mem.endsWith(u8, key, ".wte.weight");
+}
+
+fn isMetalJitLinearWeightKey(key: []const u8, projection_mask: u8, tied_lm_head: bool) bool {
+    if (projection_mask != 0) return true;
+    if (!std.mem.endsWith(u8, key, ".weight")) return false;
+    // A tied GPT head reaches the token table through ordinary linearNoBias,
+    // even though the same storage is also used by embedding lookup.
+    if (tied_lm_head and isMetalJitTiedEmbeddingWeightKey(key)) return true;
+    // These two-dimensional tensors are lookup tables, not matmul routes.
+    const non_linear_tables = [_][]const u8{
+        "embed_tokens",
+        "embedding",
+        "embeddings",
+        "position_embeddings",
+        "token_type_embeddings",
+        "word_embeddings",
+        "rope_freqs",
+        "wpe.weight",
+        "wte.weight",
+    };
+    for (non_linear_tables) |needle| {
+        if (std.mem.indexOf(u8, key, needle) != null) return false;
+    }
+    return true;
+}
+
+fn metalJitUsesExactProfileScope(config: kernel_jit.Config) bool {
+    return config.profile_capture_only or config.qualified_profile_path != null;
+}
+
+fn metalJitTensorTypeInExactProfileScope(tensor_type: gguf_mod.tensor_types.KnownTensorType) bool {
+    // Keep this boundary aligned with the workload tuner's first exact slice.
+    // Other formats remain part of the general JIT scope, but cannot affect a
+    // Q4_0/Q4_K capture or the later activation of that captured contract.
+    return tensor_type == .Q4_0 or tensor_type == .Q4_K;
+}
+
+/// Derive Metal JIT slots from quantized matrices that the loaded WeightStore
+/// can actually feed to linear dispatch. Global GGUF type presence is too
+/// broad: embedding tables and dequant-only tensors must not become required
+/// matmul routes.
+fn includeMetalJitTensorShape(
+    scope: *MetalJitRouteScope,
+    tensor_type: gguf_mod.tensor_types.KnownTensorType,
+    dimensions: []const u64,
+    fused_gate_up: bool,
+    exact_profile_scope: bool,
+) void {
+    if (comptime !build_options.enable_metal) return;
+    if (exact_profile_scope and !metalJitTensorTypeInExactProfileScope(tensor_type)) return;
+    const format = metal_runtime.MetalJitRouteScope.quantFormatForTensorType(tensor_type) orelse return;
+    if (dimensions.len < 2) {
+        scope.invalidate(.invalid_shape, format, 0, 0);
+        return;
+    }
+    // GGUF stores matrices as [in_dim, out_dim]; the JIT scope uses logical
+    // [out_dim, in_dim] so its qualification fixtures match linear dispatch.
+    const in_dim = std.math.cast(usize, dimensions[0]) orelse {
+        scope.invalidate(.dimension_overflow, format, 0, 0);
+        return;
+    };
+    var out_dim = std.math.cast(usize, dimensions[1]) orelse {
+        scope.invalidate(.dimension_overflow, format, 0, in_dim);
+        return;
+    };
+    // Packed GGUF gate+up sources register two logical lazy projections; each
+    // runtime dispatch sees one half of the combined output dimension.
+    if (fused_gate_up) {
+        if (out_dim == 0 or out_dim % 2 != 0) {
+            scope.invalidate(.invalid_shape, format, out_dim, in_dim);
+            return;
+        }
+        out_dim /= 2;
+    }
+    _ = scope.includeQuantShape(format, out_dim, in_dim);
+}
+
+/// Composite stores expose their primary GGUF through `ggufFile`, so a linear
+/// weight from a secondary GGUF may not be present in that catalog. Recover
+/// the logical shape from the store's existing zero-copy quantized view.
+fn includeMetalJitStorageShape(
+    scope: *MetalJitRouteScope,
+    storage: *const weight_source_mod.QuantizedStorage,
+    fused_gate_up: bool,
+    exact_profile_scope: bool,
+) void {
+    if (comptime !build_options.enable_metal) return;
+    const tensor_type = switch (storage.tensor_type) {
+        .known => |known| known,
+        .bitnet_tl2 => return,
+        .unknown => {
+            scope.invalidate(.scope_discovery, .unknown, 0, 0);
+            return;
+        },
+    };
+    if (exact_profile_scope and !metalJitTensorTypeInExactProfileScope(tensor_type)) return;
+    const format = metal_runtime.MetalJitRouteScope.quantFormatForTensorType(tensor_type) orelse return;
+    if (storage.shape.len != 2 or storage.shape[0] <= 0 or storage.shape[1] <= 0) {
+        scope.invalidate(.invalid_shape, format, 0, 0);
+        return;
+    }
+    var out_dim = std.math.cast(usize, storage.shape[0]) orelse {
+        scope.invalidate(.dimension_overflow, format, 0, 0);
+        return;
+    };
+    const in_dim = std.math.cast(usize, storage.shape[1]) orelse {
+        scope.invalidate(.dimension_overflow, format, out_dim, 0);
+        return;
+    };
+    if (fused_gate_up) {
+        if (out_dim % 2 != 0) {
+            scope.invalidate(.invalid_shape, format, out_dim, in_dim);
+            return;
+        }
+        out_dim /= 2;
+    }
+    _ = scope.includeQuantShape(format, out_dim, in_dim);
+}
+
+fn includeMetalJitLinearWeightFormats(
+    scope: *MetalJitRouteScope,
+    lazy_weights: *const std.StringHashMapUnmanaged(gpu_hosted_store_mod.LazyWeightEntry),
+    tensor_store: ?tensor_store_mod.TensorStore,
+    direct_quant_enabled: bool,
+    arch_config: ArchConfig,
+    exact_profile_scope: bool,
+) void {
+    if (comptime !build_options.enable_metal) return;
+    if (!direct_quant_enabled) return;
+    const store = tensor_store orelse return;
+    const file = store.ggufFile() orelse return;
+    const catalog = gguf_mod.tensor_catalog.Catalog.init(file);
+    const tied_lm_head = switch (arch_config) {
+        .gpt => |config| blk: {
+            if (config.weight_tying) break :blk true;
+            var has_separate_head = false;
+            var names = lazy_weights.keyIterator();
+            while (names.next()) |key| {
+                if (isMetalJitOutputHeadKey(key.*)) {
+                    has_separate_head = true;
+                    break;
+                }
+            }
+            break :blk !has_separate_head;
+        },
+        else => false,
+    };
+    var iterator = lazy_weights.iterator();
+    while (iterator.next()) |entry| {
+        const lazy = entry.value_ptr;
+        if (!lazy.tensor_ref.quantized or lazy.prefer_dense or
+            !isMetalJitLinearWeightKey(entry.key_ptr.*, lazy.projection_mask, tied_lm_head)) continue;
+        const source_name = lazy.tensor_ref.source_name orelse lazy.tensor_ref.name;
+        const tensor = catalog.find(source_name) orelse {
+            var storage = (store.loadQuantizedStorageRef(&lazy.tensor_ref) catch |err| {
+                std.log.warn(
+                    "Metal runtime JIT scope discovery failed key={s} source={s}: {s}",
+                    .{ entry.key_ptr.*, source_name, @errorName(err) },
+                );
+                scope.invalidate(.scope_discovery, .unknown, 0, 0);
+                continue;
+            }) orelse {
+                std.log.warn(
+                    "Metal runtime JIT scope discovery found no quantized storage key={s} source={s}",
+                    .{ entry.key_ptr.*, source_name },
+                );
+                scope.invalidate(.scope_discovery, .unknown, 0, 0);
+                continue;
+            };
+            defer storage.deinit();
+            includeMetalJitStorageShape(scope, &storage, lazy.tensor_ref.fused_gate_up, exact_profile_scope);
+            continue;
+        };
+        switch (tensor.tensor_type) {
+            .known => |known| {
+                if (exact_profile_scope and !metalJitTensorTypeInExactProfileScope(known)) continue;
+                const format = metal_runtime.MetalJitRouteScope.quantFormatForTensorType(known) orelse continue;
+                if (tensor.dimensions.len != 2 and lazy.projection_mask == 0) {
+                    scope.invalidate(.invalid_shape, format, 0, 0);
+                    continue;
+                }
+                includeMetalJitTensorShape(scope, known, tensor.dimensions, lazy.tensor_ref.fused_gate_up, exact_profile_scope);
+            },
+            // BitNet TL2 has a bundled Metal route but no generated runtime-JIT
+            // artifact in this catalog, so it is outside the JIT scope.
+            .bitnet_tl2 => {},
+            .unknown => scope.invalidate(.scope_discovery, .unknown, 0, 0),
+        }
+    }
+}
+
+fn isMetalJitOutputHeadKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "output.weight") or
+        std.mem.eql(u8, key, "lm_head.weight") or
+        std.mem.endsWith(u8, key, ".lm_head.weight");
+}
+
+test "Metal JIT scope records GGUF linear dimensions in logical order" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    var scope = metal_runtime.MetalJitRouteScope.none();
+    includeMetalJitTensorShape(&scope, .Q2_K, &.{ 512, 256 }, false, false);
+    const shapes = scope.observedShapes(.q2_k);
+    try std.testing.expectEqual(@as(usize, 1), shapes.len);
+    try std.testing.expectEqual([2]usize{ 256, 512 }, shapes[0]);
+    try std.testing.expectEqual(@as(usize, 1), metal_runtime.metalJitProductionRouteCount(scope));
+
+    var fused_scope = metal_runtime.MetalJitRouteScope.none();
+    includeMetalJitTensorShape(&fused_scope, .Q2_K, &.{ 512, 512, 8 }, true, false);
+    try std.testing.expectEqual([2]usize{ 256, 512 }, fused_scope.observedShapes(.q2_k)[0]);
+    includeMetalJitTensorShape(&fused_scope, .Q2_K, &.{ 512, 511, 8 }, true, false);
+    try std.testing.expect(!fused_scope.conformance_complete);
+
+    // LM-head projections can execute with multiple rows, so they must remain
+    // in scope. A synthetic fixture that exceeds the bounded preload footprint
+    // stays on the bundled route instead of being silently treated as covered.
+    try std.testing.expect(isMetalJitLinearWeightKey("lm_head.weight", 0, false));
+    try std.testing.expect(isMetalJitOutputHeadKey("lm_head.weight"));
+    try std.testing.expect(isMetalJitOutputHeadKey("model.language_model.lm_head.weight"));
+    try std.testing.expect(isMetalJitOutputHeadKey("output.weight"));
+    try std.testing.expect(!isMetalJitOutputHeadKey("model.embed_tokens.weight"));
+    try std.testing.expect(!isMetalJitLinearWeightKey("model.embed_tokens.weight", 0, false));
+    try std.testing.expect(isMetalJitLinearWeightKey("model.embed_tokens.weight", 0, true));
+    var large_head_scope = metal_runtime.MetalJitRouteScope.none();
+    // A supported body matrix remains eligible even when the same format's
+    // tied vocabulary projection cannot fit the bounded live fixture. The
+    // exact shape gate keeps only the body on the generated pipeline.
+    includeMetalJitTensorShape(&large_head_scope, .Q8_K, &.{ 4096, 4096 }, false, false);
+    includeMetalJitTensorShape(&large_head_scope, .Q8_K, &.{ 4096, 262144 }, false, false);
+    try std.testing.expect(!large_head_scope.conformance_complete);
+    try std.testing.expectEqual(metal_runtime.MetalJitScopeInvalidReason.fixture_resource_limit, large_head_scope.invalid_reason);
+    try std.testing.expectEqual(@as(usize, 1), large_head_scope.observedShapes(.q8_k).len);
+    try std.testing.expectEqual(@as(usize, 1), metal_runtime.metalJitProductionRouteCount(large_head_scope));
+}
+
+test "Metal exact profile scope ignores unrelated oversized formats and keeps Q4 fail closed" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+
+    try std.testing.expect(metalJitUsesExactProfileScope(.{ .mode = .shadow, .profile_capture_only = true }));
+    try std.testing.expect(metalJitUsesExactProfileScope(.{ .mode = .required, .qualified_profile_path = "profile.json" }));
+    try std.testing.expect(!metalJitUsesExactProfileScope(.{ .mode = .required }));
+
+    var profile_scope = metal_runtime.MetalJitRouteScope.none();
+    includeMetalJitTensorShape(&profile_scope, .Q4_0, &.{ 10240, 2560 }, false, true);
+    includeMetalJitTensorShape(&profile_scope, .Q6_K, &.{ 10752, 262144 }, false, true);
+    try std.testing.expect(profile_scope.conformance_complete);
+    try std.testing.expectEqualSlices([2]usize, &.{.{ 2560, 10240 }}, profile_scope.observedShapes(.q4_0));
+    try std.testing.expectEqual(@as(usize, 0), profile_scope.observedShapes(.q6_k).len);
+
+    var relevant_oversized_scope = metal_runtime.MetalJitRouteScope.none();
+    includeMetalJitTensorShape(&relevant_oversized_scope, .Q4_0, &.{ 10752, 262144 }, false, true);
+    try std.testing.expect(!relevant_oversized_scope.conformance_complete);
+    try std.testing.expectEqual(
+        metal_runtime.MetalJitScopeInvalidReason.fixture_resource_limit,
+        relevant_oversized_scope.invalid_reason,
+    );
+}
+
+test "Metal JIT scope discovers quantized weights in a secondary GGUF store" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const SecondaryGgufStore = struct {
+        allocator: std.mem.Allocator,
+        encoder_file: gguf_mod.format.File,
+        load_calls: usize = 0,
+
+        const vtable = tensor_store_mod.TensorStore.VTable{
+            .kind = @ptrCast(&kindImpl),
+            .weightSource = @ptrCast(&weightSourceImpl),
+            .describeTensor = @ptrCast(&describeTensorImpl),
+            .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
+            .loadTensorRef = @ptrCast(&loadTensorRefImpl),
+            .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
+            .ggufFile = @ptrCast(&ggufFileImpl),
+            .deinit = @ptrCast(&deinitSelf),
+        };
+
+        fn tensorStore(self: *@This()) tensor_store_mod.TensorStore {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        fn kindImpl(_: *@This()) tensor_store_mod.StoreKind {
+            return .gguf;
+        }
+
+        fn weightSourceImpl(_: *@This()) !?weight_source_mod.WeightSource {
+            return null;
+        }
+
+        fn describeTensorImpl(_: *@This(), _: std.mem.Allocator, _: []const u8) !tensor_store_mod.LazyTensorRef {
+            return error.UnsupportedOperation;
+        }
+
+        fn describeTensorRangeImpl(_: *@This(), _: std.mem.Allocator, _: []const u8) !?tensor_store_mod.TensorRangeRef {
+            return null;
+        }
+
+        fn loadTensorRefImpl(_: *@This(), _: *const tensor_store_mod.LazyTensorRef) !weight_source_mod.LoadedWeight {
+            return error.UnsupportedOperation;
+        }
+
+        fn loadQuantizedStorageRefImpl(
+            self: *@This(),
+            tensor_ref: *const tensor_store_mod.LazyTensorRef,
+        ) !?weight_source_mod.QuantizedStorage {
+            const source_name = tensor_ref.source_name orelse tensor_ref.name;
+            if (!std.mem.eql(u8, source_name, "span_rep.secondary.weight")) return error.TensorNotFound;
+            self.load_calls += 1;
+            const shape = try self.allocator.dupe(i64, &.{ 3072, 768 });
+            errdefer self.allocator.free(shape);
+            const owned_source_name = try self.allocator.dupe(u8, source_name);
+            errdefer self.allocator.free(owned_source_name);
+            return .{
+                .tensor_type = .{ .known = .Q4_K },
+                .raw_bytes = &.{},
+                .shape = shape,
+                .source_name = owned_source_name,
+                .raw_owned = false,
+                .allocator = self.allocator,
+            };
+        }
+
+        fn ggufFileImpl(self: *@This()) ?*const gguf_mod.format.File {
+            return &self.encoder_file;
+        }
+
+        fn deinitSelf(_: *@This()) void {}
+    };
+
+    var metadata: [0]gguf_mod.format.MetadataEntry = .{};
+    var tensors: [0]gguf_mod.format.TensorInfo = .{};
+    var secondary = SecondaryGgufStore{
+        .allocator = allocator,
+        .encoder_file = .{
+            .header = .{ .version = 3, .tensor_count = 0, .metadata_count = 0 },
+            .metadata = metadata[0..],
+            .tensors = tensors[0..],
+            .alignment = gguf_mod.format.default_alignment,
+            .data_region_offset = 0,
+        },
+    };
+
+    var lazy_weights = std.StringHashMapUnmanaged(gpu_hosted_store_mod.LazyWeightEntry){};
+    defer {
+        var iterator = lazy_weights.iterator();
+        while (iterator.next()) |entry| {
+            entry.value_ptr.tensor_ref.deinit(allocator);
+            allocator.free(entry.key_ptr.*);
+        }
+        lazy_weights.deinit(allocator);
+    }
+    const key = try allocator.dupe(u8, "span_rep.secondary.weight");
+    var key_owned = true;
+    defer if (key_owned) allocator.free(key);
+    const ref_name = try allocator.dupe(u8, key);
+    var ref_name_owned = true;
+    defer if (ref_name_owned) allocator.free(ref_name);
+    const ref_source_name = try allocator.dupe(u8, key);
+    var ref_source_name_owned = true;
+    defer if (ref_source_name_owned) allocator.free(ref_source_name);
+    const tensor_ref = tensor_store_mod.LazyTensorRef{
+        .name = ref_name,
+        .source_name = ref_source_name,
+        .quantized = true,
+    };
+    try lazy_weights.put(allocator, key, .{ .tensor_ref = tensor_ref });
+    key_owned = false;
+    ref_name_owned = false;
+    ref_source_name_owned = false;
+
+    var scope = metal_runtime.MetalJitRouteScope.none();
+    includeMetalJitLinearWeightFormats(
+        &scope,
+        &lazy_weights,
+        secondary.tensorStore(),
+        true,
+        .{ .gliner = .{} },
+        false,
+    );
+
+    try std.testing.expect(scope.conformance_complete);
+    try std.testing.expectEqual(@as(usize, 1), secondary.load_calls);
+    try std.testing.expectEqual([2]usize{ 3072, 768 }, scope.observedShapes(.q4_k)[0]);
+    try std.testing.expectEqual(@as(usize, 1), metal_runtime.metalJitProductionRouteCount(scope));
+}
+
 fn isGptEmbeddingTableKey(key: []const u8) bool {
     return std.mem.eql(u8, key, "model.embed_tokens.weight") or
         std.mem.eql(u8, key, "model.per_layer_input.per_layer_token_embd.weight");
@@ -2921,6 +3512,12 @@ fn openGpuHostedStream(backend_type: BackendType) !GpuHostedStream {
 fn ensureMetalHostedSessionAvailable() !void {
     if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
     if (!metal_runtime.metalDeviceAvailable()) return error.MetalDeviceUnavailable;
+}
+
+test "gpu-hosted Metal availability gate agrees with linked runtime probe" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (metal_runtime.termite_metal_device_available() == 0) return error.SkipZigTest;
+    try ensureMetalHostedSessionAvailable();
 }
 
 fn openMetalHostedStream() !GpuHostedStream {
@@ -3140,10 +3737,26 @@ fn makeMetalHostedComputeBackend(
 ) !ops.ComputeBackend {
     if (!build_options.enable_metal) return error.MetalNotEnabled;
     const compute = try allocator.create(MetalCompute);
+    errdefer allocator.destroy(compute);
     compute.* = if (self.io) |io_handle|
-        try MetalCompute.initWithIo(allocator, gpuBackendData(self), run_budget, io_handle)
+        try MetalCompute.initWithIoAndKernelJitScopeAndLoadContext(
+            allocator,
+            gpuBackendData(self),
+            run_budget,
+            io_handle,
+            self.kernel_jit_config,
+            self.metal_jit_scope,
+            self.kernel_jit_load_context,
+        )
     else
-        try MetalCompute.init(allocator, gpuBackendData(self), run_budget);
+        try MetalCompute.initWithKernelJitScopeAndLoadContext(
+            allocator,
+            gpuBackendData(self),
+            run_budget,
+            self.kernel_jit_config,
+            self.metal_jit_scope,
+            self.kernel_jit_load_context,
+        );
     return compute.computeBackend();
 }
 
@@ -4061,6 +4674,11 @@ const ArchSession = struct {
     arch_config: ArchConfig,
     task: SessionTask = .generic,
     backend_type: BackendType,
+    kernel_jit_config: kernel_jit.Config = .{},
+    kernel_jit_load_context: kernel_jit.LoadContext = .dynamic,
+    metal_jit_scope: MetalJitRouteScope = if (build_options.enable_metal)
+        metal_runtime.MetalJitRouteScope.none()
+    else {},
     budget_floor: runtime.tier.memory.Limits = .{},
     shared_cache_budget_floor: runtime.tier.cache.Budget = .{},
     backend_data: BackendData,
@@ -4100,6 +4718,48 @@ pub fn attachGraphRuntimeStrategy(session: Session, strategy: graph_runtime.Stra
     if (session.vtable != &arch_vtable) return;
     const arch_session: *ArchSession = @ptrCast(@alignCast(session.ptr));
     arch_session.graph_runtime_strategy = strategy;
+}
+
+pub const MetalWorkloadProfileExport = if (build_options.enable_metal) metal_runtime.WorkloadProfileExport else void;
+
+/// Starts an explicit pre-serving/benchmark census on an architecture session.
+/// Unsupported or non-Metal sessions return false; there is no backend-pointer
+/// downcast outside this factory.
+pub fn beginMetalWorkloadProfile(session: Session, regime: ops.WorkloadRegime) !bool {
+    if (comptime !build_options.enable_metal) return false;
+    if (session.vtable != &arch_vtable) return false;
+    const arch_session: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (arch_session.backend_type != .metal) return false;
+    const provider = gpuBackendData(arch_session).shared_metal_native_provider orelse
+        return error.MetalWorkloadProfileUnavailable;
+    try provider.workloadProfileBegin(@enumFromInt(@intFromEnum(regime)));
+    return true;
+}
+
+/// Stops capture at a command-buffer boundary, optionally calibrates every
+/// eligible first-slice signature, and returns an owned backend-neutral export.
+pub fn endMetalWorkloadProfile(
+    session: Session,
+    allocator: std.mem.Allocator,
+    calibrate_first_slice: bool,
+) !?MetalWorkloadProfileExport {
+    if (comptime !build_options.enable_metal) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const arch_session: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (arch_session.backend_type != .metal) return null;
+    const provider = gpuBackendData(arch_session).shared_metal_native_provider orelse
+        return error.MetalWorkloadProfileUnavailable;
+    try provider.workloadProfileEnd();
+    var snapshot = try provider.workloadProfileSnapshot();
+    var tuning: metal_runtime.MetalWorkloadTuningSummary = .{};
+    if (calibrate_first_slice and snapshot.eligibleForSelection()) {
+        if (!metal_runtime.metalJitHasPersistentQualificationCache(provider)) {
+            return error.MetalJitQualificationCacheUnavailable;
+        }
+        try metal_runtime.calibrateFirstMetalTuningSlice(allocator, provider.raw_decode_runtime, &snapshot);
+        tuning = try metal_runtime.tuneFirstMetalWorkloadSlice(provider, &snapshot);
+    }
+    return try metal_runtime.workloadProfileExportWithTuningAlloc(allocator, snapshot, tuning, &provider.jit_scope);
 }
 
 test "attachIo reaches native compute backend" {
@@ -4245,6 +4905,29 @@ pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {
     return switch (self.backend_type) {
         .cuda => self.backend_data.cuda.compute.snapshotStats(),
         else => null,
+    };
+}
+
+pub const MetalExactJitDispatchStats = struct {
+    q4_0_hits: u64 = 0,
+    q4_k_hits: u64 = 0,
+
+    pub fn add(self: *MetalExactJitDispatchStats, other: MetalExactJitDispatchStats) void {
+        self.q4_0_hits +|= other.q4_0_hits;
+        self.q4_k_hits +|= other.q4_k_hits;
+    }
+};
+
+pub fn getMetalExactJitDispatchStats(session: Session) ?MetalExactJitDispatchStats {
+    if (comptime !build_options.enable_metal) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .metal) return null;
+    const provider = gpuBackendData(self).shared_metal_native_provider orelse return null;
+    const stats = metal_runtime.exactJitDispatchStatsSnapshot(provider.raw_decode_runtime) catch return null;
+    return .{
+        .q4_0_hits = stats.q4_0_hits,
+        .q4_k_hits = stats.q4_k_hits,
     };
 }
 

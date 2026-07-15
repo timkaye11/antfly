@@ -23,6 +23,7 @@
 const std = @import("std");
 const runtime = @import("../runtime/root.zig");
 const backend_contracts = @import("../graph/backend_contracts.zig");
+const quant_matmul = @import("../graph/quant_matmul.zig");
 const operator_plan = @import("../graph/operator_plan.zig");
 const tensor_mod = @import("../backends/tensor.zig");
 const gguf_tensor_types = @import("../gguf/tensor_types.zig");
@@ -514,6 +515,9 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_deberta_attention_gemm_calls: u64 = 0,
     metal_runtime_deberta_attention_gemm_fallbacks: u64 = 0,
     metal_runtime_paged_attention_1x_calls: u64 = 0,
+    metal_runtime_generated_attention_decode_1x_calls: u64 = 0,
+    metal_runtime_generated_attention_flash_prefill_calls: u64 = 0,
+    metal_runtime_generated_rms_norm_calls: u64 = 0,
     metal_runtime_compute_encoder_count: u64 = 0,
     metal_runtime_blit_encoder_count: u64 = 0,
     metal_runtime_last_frame_compute_encoder_count: u64 = 0,
@@ -567,6 +571,10 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_q8_0_linear_mmv_f16_input: u64 = 0,
     metal_runtime_q8_0_linear_family_dispatch_counts: [12][4]u64 = [_][4]u64{[_]u64{0} ** 4} ** 12,
     metal_runtime_q4_0_linear_reduce: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_rows_1: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_rows_2_8: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_rows_9_64: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_rows_65_plus: u64 = 0,
     metal_runtime_q4_0_linear_reduce_f16_input: u64 = 0,
     metal_runtime_q4_0_linear_reduce_f16_output: u64 = 0,
     metal_runtime_q4_0_linear_reduce_f16_input_f16_output: u64 = 0,
@@ -585,12 +593,27 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_q4_0_pair_activation_reduce_encode_nanos: u64 = 0,
     metal_runtime_q4_0_activation_rhs_reduce_encode_nanos: u64 = 0,
     metal_runtime_q4_k_linear_reduce: u64 = 0,
+    metal_runtime_q4_k_linear_reduce_rows_1: u64 = 0,
+    metal_runtime_q4_k_linear_reduce_rows_2_8: u64 = 0,
+    metal_runtime_q4_k_linear_reduce_rows_9_64: u64 = 0,
+    metal_runtime_q4_k_linear_reduce_rows_65_plus: u64 = 0,
     metal_runtime_q4_k_pair_reduce: u64 = 0,
     metal_runtime_q4_k_pair_activation_reduce: u64 = 0,
     metal_runtime_q4_k_pair_activation_reduce_f16_output: u64 = 0,
     metal_runtime_q4_k_activation_rhs_reduce: u64 = 0,
     metal_runtime_q6_k_linear_reduce: u64 = 0,
+    metal_runtime_q6_k_linear_reduce_rows_1: u64 = 0,
+    metal_runtime_q6_k_linear_reduce_rows_2_8: u64 = 0,
+    metal_runtime_q6_k_linear_reduce_rows_9_64: u64 = 0,
+    metal_runtime_q6_k_linear_reduce_rows_65_plus: u64 = 0,
     metal_runtime_q6_k_linear_reduce_f16_input: u64 = 0,
+    /// Generated small-batch quant kernel dispatch counters indexed by
+    /// [quant_matmul.GeneratedQuantFormatIndex][quant_matmul.GeneratedQuantEpilogueIndex].
+    metal_runtime_antfly_generated_dispatch_counts: quant_matmul.GeneratedQuantDispatchCounts = quant_matmul.generated_quant_dispatch_counts_zero,
+    /// Exact workload-qualified runtime JIT dispatches. These counters prove
+    /// that a profile-installed pipeline was selected, not merely compiled.
+    metal_runtime_jit_exact_q4_0_hits: u64 = 0,
+    metal_runtime_jit_exact_q4_k_hits: u64 = 0,
     metal_runtime_rms_norm_add_sumsq: u64 = 0,
     metal_provider_quantized_slots: u64 = 0,
     metal_provider_quantized_raw_bytes: u64 = 0,
@@ -864,6 +887,18 @@ pub const GraphPlanSlot = struct {
     bytes: usize,
 };
 
+/// Explicit workload phase used by backend profilers. It is intentionally not
+/// inferred from row count: decode, prefill, and speculative verification can
+/// share the same matrix geometry.
+pub const WorkloadRegime = enum(u8) {
+    unknown = 0,
+    encoder = 1,
+    prefill = 2,
+    decode = 3,
+    speculative_draft = 4,
+    speculative_verify = 5,
+};
+
 /// Abstract compute backend for tensor operations.
 pub const ComputeBackend = struct {
     ptr: *anyopaque,
@@ -892,6 +927,11 @@ pub const ComputeBackend = struct {
     pub fn getIo(self: *const ComputeBackend) ?std.Io {
         const accessor = self.vtable.getIo orelse return null;
         return accessor(self.ptr);
+    }
+
+    pub fn workloadProfileSetRegime(self: *const ComputeBackend, regime: WorkloadRegime) !void {
+        const op = self.vtable.workloadProfileSetRegime orelse return;
+        return op(self.ptr, regime);
     }
 
     pub fn reserveGraphPlanSlots(self: *const ComputeBackend, slots: []const GraphPlanSlot) !bool {
@@ -944,9 +984,9 @@ pub const ComputeBackend = struct {
         return op(self.ptr, input);
     }
 
-    pub fn debugCudaGraphPrepareFinalHiddenReplayInput(self: *const ComputeBackend, label: []const u8, input: CT) !?CT {
+    pub fn debugCudaGraphPrepareFinalHiddenReplayInput(self: *const ComputeBackend, label: []const u8, input: CT, kv_seq_len: usize) !?CT {
         const op = self.vtable.debugCudaGraphPrepareFinalHiddenReplayInput orelse return null;
-        return op(self.ptr, label, input);
+        return op(self.ptr, label, input, kv_seq_len);
     }
 
     pub fn debugCudaGraphPrepareFinalHiddenReplayAuxInput(self: *const ComputeBackend, input: CT) !?CT {
@@ -992,6 +1032,10 @@ pub const ComputeBackend = struct {
         /// also be null for backends that have no notion of an Io.
         getIo: ?*const fn (ctx: *anyopaque) ?std.Io = null,
 
+        /// Changes only the tag applied to subsequent physical dispatches.
+        /// Capture ownership and snapshot export remain provider/session APIs.
+        workloadProfileSetRegime: ?*const fn (ctx: *anyopaque, regime: WorkloadRegime) anyerror!void = null,
+
         /// Reserve backend-owned graph-plan scratch/storage slots before a
         /// partition executes. Metal maps these to persistent MTLBuffer slots.
         reserveGraphPlanSlots: ?*const fn (ctx: *anyopaque, slots: []const GraphPlanSlot) anyerror!bool = null,
@@ -1009,7 +1053,7 @@ pub const ComputeBackend = struct {
         debugCudaGraphRegisterFinalHiddenReplayBoundary: ?*const fn (ctx: *anyopaque, input: CT, output: CT) anyerror!void = null,
         debugCudaGraphRegisterFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!void = null,
         debugCudaGraphRegisterFinalHiddenReplayAuxInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!void = null,
-        debugCudaGraphPrepareFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, label: []const u8, input: CT) anyerror!?CT = null,
+        debugCudaGraphPrepareFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, label: []const u8, input: CT, kv_seq_len: usize) anyerror!?CT = null,
         debugCudaGraphPrepareFinalHiddenReplayAuxInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
         debugCudaGraphReplayFinalHidden: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
         debugCudaGraphReplayFinalHiddenDiscard: ?*const fn (ctx: *anyopaque, input: CT) anyerror!bool = null,
@@ -1620,6 +1664,10 @@ pub const ComputeBackend = struct {
         /// Return argmax token ids for a contiguous row range while masking a
         /// small list of suppressed token ids.
         argmaxRowsSuppress: ?*const fn (ctx: *anyopaque, tensor: CT, row_start: usize, row_count: usize, dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) anyerror!?[]u32 = null,
+
+        /// Consume an active decoder-runtime frame with a batched masked
+        /// argmax. Backends return null when there is no compatible frame.
+        decoderRuntimeArgmaxRowsSuppress: ?*const fn (ctx: *anyopaque, tensor: CT, row_start: usize, row_count: usize, dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) anyerror!?[]u32 = null,
 
         /// Return the argmax token id as a backend tensor while masking a small
         /// list of suppressed token ids. Used by pure-greedy decode paths that
@@ -3234,6 +3282,13 @@ pub const ComputeBackend = struct {
 
     pub fn argmaxRowsSuppress(self: *const ComputeBackend, tensor: CT, row_start: usize, row_count: usize, dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) !?[]u32 {
         if (self.vtable.argmaxRowsSuppress) |argmax_rows_suppress| {
+            return argmax_rows_suppress(self.ptr, tensor, row_start, row_count, dim, suppress_token_ids, allocator);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeArgmaxRowsSuppress(self: *const ComputeBackend, tensor: CT, row_start: usize, row_count: usize, dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) !?[]u32 {
+        if (self.vtable.decoderRuntimeArgmaxRowsSuppress) |argmax_rows_suppress| {
             return argmax_rows_suppress(self.ptr, tensor, row_start, row_count, dim, suppress_token_ids, allocator);
         }
         return null;

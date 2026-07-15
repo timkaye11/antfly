@@ -322,6 +322,16 @@ pub const Config = struct {
         return false;
     }
 
+    /// Retention window for a layer-packed KV pool. Mixed global/sliding
+    /// attention keeps full history unless the lower-memory override is forced.
+    pub fn kvPoolSlidingWindowSize(self: Config, force_sliding_trim: bool) ?u32 {
+        if (self.position_encoding == .absolute) return null;
+        if (self.sliding_window > 0 and self.hasGlobalAttentionLayers() and !force_sliding_trim) return null;
+        if (self.sliding_window > 0) return self.sliding_window;
+        if (self.max_position_embeddings > 0) return self.max_position_embeddings;
+        return null;
+    }
+
     pub fn layerRopeTheta(self: Config, layer_index: usize) f32 {
         if (self.family == .deepseek_v4 and
             self.deepseekV4AttentionKind(layer_index) != .sliding_attention and

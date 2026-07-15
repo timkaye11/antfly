@@ -132,7 +132,7 @@ pub fn addCommand(ctx: Context, spec: CommandSpec) void {
         }),
     });
     addImports(ctx, exe.root_module, spec.imports);
-    configureNative(ctx, exe, spec.native_link);
+    configureNative(ctx, exe, spec.native_link, spec.imports);
     if (spec.link_libc) exe.root_module.link_libc = true;
 
     const run = b.addRunArtifact(exe);
@@ -151,7 +151,7 @@ pub fn addTest(ctx: Context, spec: TestSpec) *std.Build.Step {
         }),
     });
     addImports(ctx, test_exe.root_module, spec.imports);
-    configureNative(ctx, test_exe, spec.native_link);
+    configureNative(ctx, test_exe, spec.native_link, spec.imports);
 
     const run = b.addRunArtifact(test_exe);
     const step = b.step(spec.step_name, spec.description);
@@ -165,10 +165,10 @@ fn addImports(ctx: Context, module: *std.Build.Module, imports: []const Import) 
     }
 }
 
-fn configureNative(ctx: Context, artifact: *std.Build.Step.Compile, native_link: NativeLink) void {
+fn configureNative(ctx: Context, artifact: *std.Build.Step.Compile, native_link: NativeLink, imports: []const Import) void {
     switch (native_link) {
         .none => {},
-        .default => configureNativeTool(ctx, artifact, ctx.enable_metal),
+        .default => configureNativeTool(ctx, artifact, ctx.enable_metal and std.mem.indexOfScalar(Import, imports, .inference_internal) == null),
         .no_accel => configureNativeTool(ctx, artifact, false),
     }
 }

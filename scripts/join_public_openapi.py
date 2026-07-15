@@ -156,6 +156,50 @@ def inference_schema_name(name: str) -> str:
     return f"Inference{name}"
 
 
+def add_unified_inference_auth_responses(path_item: dict) -> dict:
+    """Document auth failures added by the unified Antfly middleware.
+
+    The standalone inference contract intentionally has no built-in auth, so
+    this response belongs only in the joined public API.
+    """
+    joined = walk_refs(path_item, inference_schema_name)
+    for operation in joined.values():
+        if not isinstance(operation, dict):
+            continue
+        responses = operation.get("responses")
+        if not isinstance(responses, dict):
+            continue
+        responses.setdefault(
+            "401",
+            {
+                "description": "Authentication is enabled and valid credentials were not supplied",
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/InferenceError"},
+                    },
+                },
+            },
+        )
+        auth_not_ready = (
+            "The unified Antfly server also returns this status when authentication "
+            "is enabled but its backend is not ready."
+        )
+        unavailable = responses.get("503")
+        if isinstance(unavailable, dict):
+            description = unavailable.get("description", "Inference service unavailable").rstrip(".")
+            unavailable["description"] = f"{description}. {auth_not_ready}"
+        else:
+            responses["503"] = {
+                "description": auth_not_ready,
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/InferenceError"},
+                    },
+                },
+            }
+    return joined
+
+
 PUBLIC_INFERENCE_SCHEMA_ROOTS = {
     "Config",
     "ContentPart",
@@ -243,7 +287,7 @@ def join_specs() -> dict:
     for path, item in antfly.get("paths", {}).items():
         paths[antfly_public_path(path)] = copy.deepcopy(item)
     for path, item in inference.get("paths", {}).items():
-        paths[inference_public_path(path)] = walk_refs(item, inference_schema_name)
+        paths[inference_public_path(path)] = add_unified_inference_auth_responses(item)
     for path, item in extensions.get("paths", {}).items():
         paths[extension_public_path(path)] = copy.deepcopy(item)
 

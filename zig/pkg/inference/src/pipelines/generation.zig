@@ -48,6 +48,15 @@ const hf_tokenizer = tokenizer_mod.hf;
 const graph_mod = @import("../graph/root.zig");
 const pjrt_executor_mod = if (build_options.enable_pjrt) @import("../graph/pjrt_executor.zig") else struct {};
 
+fn setWorkloadProfileRegime(cb: *const ComputeBackend, regime: ops.WorkloadRegime) !void {
+    cb.workloadProfileSetRegime(regime) catch |err| {
+        // Profiling metadata must never turn an otherwise usable backend into
+        // an inference failure when its optional profiler runtime is absent.
+        if (err == error.WorkloadProfileUnavailable) return;
+        return err;
+    };
+}
+
 pub var gemma4_mtp_debug_override: bool = false;
 
 pub const Message = struct {
@@ -184,6 +193,23 @@ pub const GenerationConfig = struct {
     /// EOS token. Defaults to production stop-on-EOS behavior.
     ignore_eos: bool = false,
 };
+
+pub fn kvPoolConfig(
+    backend: runtime.kv.pool.BackendKind,
+    dtype: runtime.kv.pool.KvDType,
+    config: gpt_mod.Config,
+    force_sliding_trim: bool,
+) runtime.kv.pool.KvPoolConfig {
+    return .{
+        .backend = backend,
+        .dtype = dtype,
+        .page_size_tokens = 16,
+        .num_layers_packed = @intCast(config.num_hidden_layers),
+        .num_kv_heads = config.maxKvHeads(),
+        .head_dim = config.maxHeadDim(),
+        .sliding_window_size = config.kvPoolSlidingWindowSize(force_sliding_trim),
+    };
+}
 
 /// Parsed chat template for rendering messages via Jinja2.
 pub const ChatTemplate = struct {
@@ -338,6 +364,8 @@ pub const MtpProfileStats = struct {
     materialization_hidden_only_fallbacks: usize = 0,
     correction_materializations: usize = 0,
     bonus_materializations: usize = 0,
+    deferred_materializations: usize = 0,
+    pending_flushes: usize = 0,
     bonus_skips: usize = 0,
     fallback_calls: usize = 0,
     draft_embedding_cache_hits: usize = 0,
@@ -420,6 +448,10 @@ pub const SpeculativeDecodeStats = struct {
 /// Streaming token callback. Called with each decoded text delta.
 /// Return `true` to continue generation, `false` to stop early.
 pub const TokenCallback = *const fn (ctx: *anyopaque, token_text: []const u8) bool;
+
+fn emitCompletedStreamingText(ctx: *anyopaque, on_token: TokenCallback, text: []const u8) bool {
+    return on_token(ctx, text);
+}
 
 pub const KvView = struct {
     sequence_id: runtime.kv.manager.SequenceId,
@@ -554,6 +586,10 @@ fn firstTokenTopKTraceCount() usize {
 
 fn enableGemma4MtpDebug() bool {
     return gemma4_mtp_debug_override or getenvBool("ANTFLY_GEMMA4_MTP_DEBUG") or getenvBool("TERMITE_DEBUG_GEMMA4_MTP");
+}
+
+fn enableGemma4MtpVerifyTrace() bool {
+    return getenvBool("ANTFLY_GEMMA4_MTP_VERIFY_TRACE");
 }
 
 const Gemma4MtpPositionMode = enum {
@@ -932,6 +968,10 @@ fn shouldAcceptSpeculativeBonus(enabled: bool, draft_count: usize, remaining_gen
     return enabled and draft_count < remaining_generation_tokens;
 }
 
+fn shouldEnterSpeculativeDecodeLoop(callback_allows_generation: bool, first_is_eos: bool, grammar_complete: bool) bool {
+    return callback_allows_generation and !first_is_eos and !grammar_complete;
+}
+
 fn gemma4MtpDedicatedRuntimeEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_DEDICATED_RUNTIME", true);
 }
@@ -944,6 +984,26 @@ fn gemma4MtpMaterializeReplayEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_MATERIALIZE_REPLAY", false);
 }
 
+/// Fold the correction/bonus materialize forward into the next verify: the
+/// committed token stays pending (KV unwritten) and the next round's verify
+/// prepends it as row 0, whose suffix write materializes the KV.
+fn gemma4MtpDeferMaterializeEnabled(kind: ops.BackendKind) bool {
+    _ = kind;
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE", false);
+}
+
+/// Reuse the target verify row as the next draft activation after a folded
+/// correction/bonus instead of the assistant chain projection.
+fn gemma4MtpDeferMaterializeTargetActivationEnabled(kind: ops.BackendKind) bool {
+    _ = kind;
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_DEFER_MATERIALIZE_TARGET_ACTIVATION", false);
+}
+
+fn gemma4MtpDeferredTargetActivationRow(cached_first: bool, logit_base_row: usize, accepted: usize) ?usize {
+    if (cached_first) return if (accepted >= 2) accepted - 2 else null;
+    return if (accepted != 0) logit_base_row + accepted - 1 else null;
+}
+
 fn gemma4MtpDraftEmbeddingCacheSize() usize {
     return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_DRAFT_EMBED_CACHE") orelse 256;
 }
@@ -952,8 +1012,13 @@ fn gemma4MtpResidentDraftBackendAllowed(kind: ops.BackendKind) bool {
     return kind == .cuda or kind == .metal;
 }
 
-fn gemma4MtpMetalAutoEnabled() bool {
-    return platform.env.getenvBool("ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO");
+pub fn gemma4MtpMetalAutoEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO", false);
+}
+
+fn gemma4MtpMetalPrefillHiddenCaptureEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_ENABLE_METAL_PREFILL_HIDDEN_CAPTURE", false) and
+        !platform.env.getenvBool("ANTFLY_GEMMA4_MTP_DISABLE_METAL_PREFILL_HIDDEN_CAPTURE");
 }
 
 fn gemma4MetalDirectGreedyDefault() bool {
@@ -1107,6 +1172,22 @@ fn isPureGreedyConfig(config: GenerationConfig) bool {
     return config.temperature <= 0 and !hasSamplingPenalties(config);
 }
 
+fn requiresCudaDecodeGraphBeforeEagerFallback(
+    backend_kind: ops.BackendKind,
+    graph_replay_required: bool,
+    pure_greedy: bool,
+    query_seq_len: usize,
+    has_external_graph_runtime: bool,
+    has_grammar: bool,
+) bool {
+    return graph_replay_required and
+        backend_kind == .cuda and
+        pure_greedy and
+        query_seq_len == 1 and
+        !has_external_graph_runtime and
+        !has_grammar;
+}
+
 fn hasSamplingPenalties(config: GenerationConfig) bool {
     return config.repetition_penalty != 1.0 or
         config.frequency_penalty != 0 or
@@ -1130,6 +1211,22 @@ fn shouldUseCudaPrefillGreedyToken(
         backend_kind == .cuda and
         isPureGreedyConfig(config) and
         config.grammar == null;
+}
+
+fn directPrefillExecutionMutex(
+    prepared_multimodal: bool,
+    use_cuda_prefill_greedy_token: bool,
+    use_metal_prefill_greedy_token: bool,
+    execution_lock: ?*std.atomic.Mutex,
+) ?*std.atomic.Mutex {
+    return if (prepared_multimodal or use_cuda_prefill_greedy_token or use_metal_prefill_greedy_token) execution_lock else null;
+}
+
+fn batchKvMutationMutex(
+    execution_lock: ?*std.atomic.Mutex,
+    kv_lock: ?*std.atomic.Mutex,
+) ?*std.atomic.Mutex {
+    return if (kv_lock != null) execution_lock else null;
 }
 
 fn coalescedPrefillChunkSizeForFirstToken(
@@ -1419,10 +1516,9 @@ pub const NativeDecodeState = struct {
         }
         self.syncPagedKvBlockTable() catch {};
         if (self.kv_compacted) {
-            const current_kv_tokens = if (self.kv_view) |view|
-                @min(view.token_count + 1, self.total_tokens)
-            else
-                @min(@as(usize, 1), self.total_tokens);
+            const manager = self.kv_manager orelse return;
+            const sequence_id = self.sequence_id orelse return;
+            const current_kv_tokens = @min(manager.tokenCount(sequence_id) orelse 0, self.total_tokens);
             self.setPagedKvView(current_kv_tokens, self.total_tokens - current_kv_tokens);
             return;
         }
@@ -1622,7 +1718,9 @@ pub const NativeDecodeState = struct {
     /// sequence with a smaller one containing fitted K/V values that preserve
     /// attention output. Call after prefill, before the decode loop.
     pub fn compactKvCache(self: *NativeDecodeState, config: runtime.kv.compaction.CompactionConfig) !usize {
+        try config.validate();
         if (self.deepseek_v4_compressed_cache != null) return error.DeepSeekV4CompressedKvCompactionNotSupported;
+        if (self.kv_storage != null) return error.KvStorageCompactionNotSupported;
         const lock = self.lockPagedKv();
         defer if (lock) |mutex| mutex.unlock();
         const manager = self.kv_manager orelse return 0;
@@ -1653,13 +1751,20 @@ pub const NativeDecodeState = struct {
             );
         }
 
+        // Complete every fallible step before releasing the old sequence so
+        // a failed compaction leaves the original state intact.
+        const new_state = try manager.sequenceMut(new_seq_id);
+        new_state.compacted = true;
+        var new_block_ids = std.ArrayListUnmanaged(runtime.kv.block.KvBlockId).empty;
+        errdefer new_block_ids.deinit(self.allocator);
+        _ = try manager.logicalBlocksWithReservations(new_seq_id, &new_block_ids);
+
         // Swap: release old sequence, adopt new one.
         try manager.releaseSequence(seq_id);
         self.sequence_id = new_seq_id;
-
-        // Mark compacted so sliding window trimming is skipped.
-        const new_state = try manager.sequenceMut(new_seq_id);
-        new_state.compacted = true;
+        self.kv_block_ids.deinit(self.allocator);
+        self.kv_block_ids = new_block_ids;
+        new_block_ids = .empty;
         self.kv_compacted = true;
         self.setPagedKvView(compacted.retained_count, self.total_tokens - compacted.retained_count);
         // total_tokens stays the same for position encoding continuity.
@@ -1821,6 +1926,19 @@ const BorrowedDecodeStateRuntime = struct {
     }
 };
 
+fn retryDirectPrefillAfterMemoryBudgetExceeded(
+    decode_runtime: *BorrowedDecodeStateRuntime,
+    reserved_tokens: usize,
+    attempted_chunk_size: usize,
+    current_chunk_size: *usize,
+    err: anyerror,
+) !bool {
+    if (err != error.MemoryBudgetExceeded or attempted_chunk_size <= 1) return false;
+    try decode_runtime.rollbackReservedPrefill(reserved_tokens);
+    current_chunk_size.* = @max(attempted_chunk_size / 2, 1);
+    return true;
+}
+
 pub fn buildOwnedBatchDecodeContext(
     allocator: std.mem.Allocator,
     states: []const *NativeDecodeState,
@@ -1867,7 +1985,7 @@ pub fn buildOwnedBatchDecodeContext(
                 .kv_storage = ctx.kv_cache.?.kv_storage,
             },
             .kv_manager = ctx.kv_manager.?,
-            .kv_storage = ctx.kv_storage,
+            .kv_storage = ctx.kv_storage orelse ctx.kv_cache.?.kv_storage,
         };
     }
 
@@ -1951,7 +2069,7 @@ pub fn buildOwnedMixedBatchDecodeContext(
                 .kv_storage = ctx.kv_cache.?.kv_storage,
             },
             .kv_manager = ctx.kv_manager.?,
-            .kv_storage = ctx.kv_storage,
+            .kv_storage = ctx.kv_storage orelse ctx.kv_cache.?.kv_storage,
             .per_item_query_len = item.query_sequence_len,
             .per_item_total_len = item.total_sequence_len,
             .per_item_kv_len = item.kv_sequence_len,
@@ -2053,7 +2171,9 @@ pub const GenerationPipeline = struct {
 
         // Multimodal streaming not supported yet — fall back
         if (messagesHaveImages(messages)) {
-            return self.generate(messages, config);
+            const result = try self.generate(messages, config);
+            _ = emitCompletedStreamingText(on_token_ctx, on_token, result.text);
+            return result;
         }
 
         const prompt = if (self.prompt_override) |override|
@@ -2111,6 +2231,9 @@ pub const NativeGenerationPipeline = struct {
     decode_state: ?*NativeDecodeState = null,
     scheduler: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = null,
     scheduler_lease: ?*runtime.scheduler.native_generate.Lease = null,
+    /// Serializes the shared model backend for one claimed scheduler step.
+    /// Request-local tokenization and sampling remain outside this lock.
+    execution_lock: ?*std.atomic.Mutex = null,
     /// Optional smaller draft model for speculative decoding. When set
     /// together with `GenerationConfig.draft_model`, the generate loop
     /// proposes K tokens with the draft and verifies them against the
@@ -2170,7 +2293,7 @@ pub const NativeGenerationPipeline = struct {
         seq_len: usize,
         logits: ?[]f32 = null,
         failure: ?anyerror = null,
-        ready: bool = false,
+        ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     };
 
     const PendingPrefillBatchWork = struct {
@@ -2182,7 +2305,7 @@ pub const NativeGenerationPipeline = struct {
         wants_last_logits: bool,
         logits: ?[]f32 = null,
         failure: ?anyerror = null,
-        ready: bool = false,
+        ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     };
 
     pub fn generate(self: *NativeGenerationPipeline, messages: []const Message, config: GenerationConfig) !GenerationResult {
@@ -2447,7 +2570,9 @@ pub const NativeGenerationPipeline = struct {
         );
 
         const runtime_prepare_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        debugGenerationStage("prepare compiled generation runtime begin prompt_token_count={d}", .{prompt_token_count});
         const runtime_prepared = try self.prepareCompiledGenerationRuntime(prompt_token_count);
+        debugGenerationStage("prepare compiled generation runtime end prepared={}", .{runtime_prepared});
         const prefill_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         if (runtime_prepared) {
             debugGenerationStage("prepared compiled generation runtime prompt_token_count={d}", .{prompt_token_count});
@@ -2480,6 +2605,7 @@ pub const NativeGenerationPipeline = struct {
         }
 
         // Prefill
+        try setWorkloadProfileRegime(&self.cb, .prefill);
         const allow_prefill_greedy_token = !use_speculative or (use_speculative and draft_is_gemma4_mtp);
         const capture_mtp_prefill_hidden = use_speculative and draft_is_gemma4_mtp and gemma4MtpTargetHiddenSource() == .final;
         const prefill_output = if (prepared_multimodal_prompt) |*prepared|
@@ -2656,6 +2782,7 @@ pub const NativeGenerationPipeline = struct {
             // standalone decoders: they are seeded from target activations and
             // target KV during each draft round.
             if (!use_gemma4_mtp) {
+                try setWorkloadProfileRegime(&draft_pipeline.cb, .prefill);
                 const draft_ctx = draft_runtime.makeDecodeContext(seq_len, seq_len);
                 const draft_prefill_logits = try draft_pipeline.forwardAllLogits(token_ids[0..seq_len], 1, seq_len, &draft_ctx);
                 allocator.free(draft_prefill_logits);
@@ -2767,6 +2894,7 @@ pub const NativeGenerationPipeline = struct {
             }
 
             // Use prefill last logits for the first token
+            try setWorkloadProfileRegime(&self.cb, .decode);
             const first_outcome = mtp_first_outcome orelse try self.sampleNextToken(
                 prefill_last_logits.?,
                 config,
@@ -2784,6 +2912,7 @@ pub const NativeGenerationPipeline = struct {
                 _ = try draft_runtime.appendGeneratedToken();
             }
             try penalty_state.noteToken(allocator, @intCast(first_token));
+            var callback_allows_generation = true;
             if (stream_enabled) {
                 const keep_streaming = try self.emitDecodedDelta(
                     token_ids[prompt_token_count..seq_len],
@@ -2792,6 +2921,7 @@ pub const NativeGenerationPipeline = struct {
                     on_token_ctx.?,
                 );
                 if (!keep_streaming) {
+                    callback_allows_generation = false;
                     finish_reason = "stop";
                 }
             }
@@ -2801,12 +2931,17 @@ pub const NativeGenerationPipeline = struct {
                 finish_reason = "stop";
             }
 
-            if (use_gemma4_mtp and !first_is_eos and !first_outcome.grammar_complete) {
+            const enter_speculative_loop = shouldEnterSpeculativeDecodeLoop(
+                callback_allows_generation,
+                first_is_eos,
+                first_outcome.grammar_complete,
+            );
+            if (use_gemma4_mtp and enter_speculative_loop) {
                 mtp_activation.cached_target_choice = try self.materializeAcceptedTokenKvForMtp(token_ids, seq_len, decode_state, mtp_hidden_source);
             }
 
             // Speculative decode loop
-            if (!first_is_eos and !first_outcome.grammar_complete) {
+            if (enter_speculative_loop) {
                 var mtp_zero_match_rounds: usize = 0;
                 const mtp_zero_match_fallback_rounds: usize = if (use_gemma4_mtp)
                     platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_ZERO_MATCH_FALLBACK_ROUNDS") orelse default_mtp_zero_match_fallback_rounds
@@ -2850,6 +2985,8 @@ pub const NativeGenerationPipeline = struct {
                     else
                         @min(@as(usize, @intCast(config.speculative_k)), remaining);
 
+                    const round_trace = enableGemma4MtpVerifyTrace();
+                    const round_started_at = mtpProfileTimestamp(round_trace, self.io);
                     const result = if (use_gemma4_mtp)
                         try self.speculativeDecodeGemma4Mtp(
                             &draft_pipeline,
@@ -2882,6 +3019,17 @@ pub const NativeGenerationPipeline = struct {
                             if (gbnf_grammar != null) &(gbnf_grammar.?) else null,
                         );
 
+                    if (round_trace) {
+                        std.debug.print(
+                            "mtp-round-trace: round_us={d} drafted={d} accepted={d} bonus={}\n",
+                            .{
+                                @divTrunc(mtpProfileElapsedNs(true, self.io, round_started_at), std.time.ns_per_us),
+                                result.drafted,
+                                result.accepted,
+                                result.had_bonus,
+                            },
+                        );
+                    }
                     speculative_stats.rounds += 1;
                     speculative_stats.drafted_tokens += result.drafted;
                     speculative_stats.matched_draft_tokens += result.matched_drafts;
@@ -2974,10 +3122,19 @@ pub const NativeGenerationPipeline = struct {
                                 mtp_auto_min_accepted_per_round_milli,
                             },
                         );
+                        try self.flushPendingGemma4MtpMaterialize(
+                            token_ids,
+                            seq_len,
+                            decode_state,
+                            &mtp_activation,
+                            mtp_hidden_source,
+                            &speculative_stats.mtp_profile,
+                        );
                         var fallback_prefill_logits: ?[]f32 = null;
                         defer if (fallback_prefill_logits) |logits| allocator.free(logits);
                         var fallback_greedy_token: ?usize = null;
                         const fallback_started_at = mtpProfileTimestamp(speculative_stats.mtp_profile.enabled, self.io);
+                        try setWorkloadProfileRegime(&self.cb, .decode);
                         const fallback = try self.standardDecode(
                             token_ids,
                             &seq_len,
@@ -3007,10 +3164,19 @@ pub const NativeGenerationPipeline = struct {
                     if (use_gemma4_mtp and speculation_policy == .auto and mtp_effective_zero_match_fallback_rounds > 0 and mtp_zero_match_rounds >= mtp_effective_zero_match_fallback_rounds and tokens_generated < max_tokens) {
                         speculative_stats.adaptive_fallbacks += 1;
                         speculative_stats.speculation_policy_decision = .disabled_zero_match;
+                        try self.flushPendingGemma4MtpMaterialize(
+                            token_ids,
+                            seq_len,
+                            decode_state,
+                            &mtp_activation,
+                            mtp_hidden_source,
+                            &speculative_stats.mtp_profile,
+                        );
                         var fallback_prefill_logits: ?[]f32 = null;
                         defer if (fallback_prefill_logits) |logits| allocator.free(logits);
                         var fallback_greedy_token: ?usize = null;
                         const fallback_started_at = mtpProfileTimestamp(speculative_stats.mtp_profile.enabled, self.io);
+                        try setWorkloadProfileRegime(&self.cb, .decode);
                         const fallback = try self.standardDecode(
                             token_ids,
                             &seq_len,
@@ -3044,6 +3210,7 @@ pub const NativeGenerationPipeline = struct {
 
         // Standard autoregressive loop (skipped when speculative decoding was used above)
         if (!use_speculative and !used_prefill_first_token) {
+            try setWorkloadProfileRegime(&self.cb, .decode);
             debugGenerationStage(
                 "entering standard decode max_tokens={d} prompt_token_count={d}",
                 .{ max_tokens, prompt_token_count },
@@ -3154,6 +3321,25 @@ pub const NativeGenerationPipeline = struct {
         last_hidden_rows: usize = 0,
     };
 
+    /// Prepared decoder tails expose the input to final RMSNorm. Gemma4 MTP's
+    /// `.final` activation contract is the post-norm row used by verification.
+    fn capturePreparedTailPostNormHidden(
+        cb: *const ComputeBackend,
+        capture: bool,
+        pre_norm_hidden: ops.CT,
+        final_norm_slot: usize,
+        hidden_size: usize,
+        eps: f32,
+    ) !?ops.CT {
+        if (!capture) return null;
+        return cb.decoderRuntimeApplyRmsNorm(&.{
+            .slot = final_norm_slot,
+            .input = pre_norm_hidden,
+            .hidden_size = hidden_size,
+            .eps = eps,
+        });
+    }
+
     fn tryCudaPreparedTailPrefillGreedy(
         self: *NativeGenerationPipeline,
         input_ids: []const i64,
@@ -3194,20 +3380,78 @@ pub const NativeGenerationPipeline = struct {
             greedy.token_tensor = null;
         }
 
-        const last_hidden = if (capture_last_hidden) blk: {
-            owns_hidden = false;
-            break :blk tail.final_hidden;
-        } else blk: {
+        const last_hidden = try capturePreparedTailPostNormHidden(
+            &self.cb,
+            capture_last_hidden,
+            tail.final_hidden,
+            tail.final_norm_slot,
+            self.gpt_config.hidden_size,
+            self.gpt_config.norm_eps,
+        );
+        if (capture_last_hidden and last_hidden == null) {
             self.cb.free(tail.final_hidden);
             owns_hidden = false;
-            break :blk null;
-        };
+            return null;
+        }
+        self.cb.free(tail.final_hidden);
+        owns_hidden = false;
         debugGenerationStage(
             "executePrefill prepared_tail_greedy token={d} capture_hidden={}",
             .{ greedy.token_id, capture_last_hidden },
         );
         return .{
             .greedy_token = greedy.token_id,
+            .last_hidden = last_hidden,
+            .last_hidden_rows = if (last_hidden != null) 1 else 0,
+        };
+    }
+
+    /// Metal analog of the CUDA prepared-tail prefill: the planned prefill
+    /// frame plus a prepared-slot greedy tail, capturing the last POST-final-
+    /// norm hidden row for Gemma4 MTP seeding. Without this the MTP seed path
+    /// re-runs the whole prompt through the generic per-op forward (a second
+    /// prompt-length forward that scales with prompt size). Returns null on
+    /// any miss so the caller falls back to the plain logits prefill.
+    fn tryMetalPreparedTailPrefillGreedy(
+        self: *NativeGenerationPipeline,
+        input_ids: []const i64,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        capture_last_hidden: bool,
+    ) !?PrefillOutput {
+        if (self.cb.kind() != .metal) return null;
+        if (!gemma4MtpMetalPrefillHiddenCaptureEnabled()) return null;
+        if (decode_context.attention_mode != .paged_prefill or decode_context.query_sequence_len != input_ids.len) return null;
+
+        const tail = (try decoder_gated_runtime.forwardPrefillLastPreparedTail(
+            &self.cb,
+            self.allocator,
+            self.gpt_config,
+            self.gpt_config.num_hidden_layers,
+            input_ids,
+            seq_len,
+            decode_context,
+            true,
+        )) orelse return null;
+        defer self.cb.free(tail.final_hidden);
+
+        const greedy_token = tail.greedy_token_id orelse return null;
+
+        const last_hidden = try capturePreparedTailPostNormHidden(
+            &self.cb,
+            capture_last_hidden,
+            tail.final_hidden,
+            tail.final_norm_slot,
+            self.gpt_config.hidden_size,
+            self.gpt_config.norm_eps,
+        );
+        if (capture_last_hidden and last_hidden == null) return null;
+        debugGenerationStage(
+            "executePrefill metal_prepared_tail_greedy token={d} capture_hidden={}",
+            .{ greedy_token, capture_last_hidden },
+        );
+        return .{
+            .greedy_token = @intCast(greedy_token),
             .last_hidden = last_hidden,
             .last_hidden_rows = if (last_hidden != null) 1 else 0,
         };
@@ -3232,13 +3476,27 @@ pub const NativeGenerationPipeline = struct {
         var prefill_last_hidden: ?ops.CT = null;
         var prefill_last_hidden_rows: usize = 0;
         errdefer if (prefill_last_hidden) |hidden| self.cb.free(hidden);
-        const use_cuda_prefill_greedy_token = shouldUseCudaPrefillGreedyToken(
-            self.cb.kind(),
-            config,
-            allow_resident_greedy_token,
-            self.gpt_config.suppressTokenIds().len > 0,
-            enableCudaPrefillGreedyToken(),
-        );
+        const has_scheduler_peers = if (self.scheduler) |scheduler| scheduler.shouldCoordinateCurrentRequests() else false;
+        // A sole CUDA request keeps the device-greedy fast path. If a peer
+        // arrives after this check, execution_lock still serializes the
+        // direct forward against scheduler-driven work.
+        const use_cuda_prefill_greedy_token = (self.execution_lock == null or !has_scheduler_peers) and
+            shouldUseCudaPrefillGreedyToken(
+                self.cb.kind(),
+                config,
+                allow_resident_greedy_token,
+                self.gpt_config.suppressTokenIds().len > 0,
+                enableCudaPrefillGreedyToken(),
+            );
+        // Metal: only when the caller wants the MTP prefill-hidden capture —
+        // plain Metal decode keeps the logits prefill path untouched.
+        const use_metal_prefill_greedy_token = self.cb.kind() == .metal and
+            gemma4MtpMetalPrefillHiddenCaptureEnabled() and
+            capture_last_hidden and
+            allow_resident_greedy_token and
+            isPureGreedyConfig(config) and
+            config.grammar == null;
+        const use_prefill_greedy_token = use_cuda_prefill_greedy_token or use_metal_prefill_greedy_token;
         debugGenerationStage(
             "executePrefill enter seq_len={d} prefilled={d} query_len={d} paged={} scheduler={} compiled_whole_model={} prefill_greedy={}",
             .{
@@ -3248,7 +3506,7 @@ pub const NativeGenerationPipeline = struct {
                 decode_state.isPaged(),
                 self.scheduler != null,
                 self.compiled_partition_backend != null and self.compiled_attachment_target == .whole_model and self.graph_cache != null,
-                use_cuda_prefill_greedy_token,
+                use_prefill_greedy_token,
             },
         );
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
@@ -3268,14 +3526,18 @@ pub const NativeGenerationPipeline = struct {
             debugGenerationStage("executePrefill whole-model fast path seq_len={d}", .{seq_len});
             const decode_context = try decode_runtime.preparePrefill(seq_len, seq_len);
             if (allow_resident_greedy_token) {
-                if (try self.forwardGreedyCompiledModelToken(
+                const greedy_token = self.forwardGreedyCompiledModelToken(
                     prompt_ids,
                     1,
                     seq_len,
                     &decode_context,
                     config,
                     false,
-                )) |token| {
+                ) catch |err| {
+                    debugGenerationStage("executePrefill whole-model greedy failed: {s}", .{@errorName(err)});
+                    return err;
+                };
+                if (greedy_token) |token| {
                     if (self.scheduler) |scheduler| {
                         if (self.scheduler_lease) |lease| {
                             scheduler.notePrefillProgress(lease, seq_len, seq_len);
@@ -3285,7 +3547,10 @@ pub const NativeGenerationPipeline = struct {
                     return .{ .greedy_token = token };
                 }
             }
-            prefill_last_logits = try self.forwardLastLogits(prompt_ids, 1, seq_len, &decode_context);
+            prefill_last_logits = self.forwardLastLogits(prompt_ids, 1, seq_len, &decode_context) catch |err| {
+                debugGenerationStage("executePrefill whole-model logits failed: {s}", .{@errorName(err)});
+                return err;
+            };
             if (self.scheduler) |scheduler| {
                 if (self.scheduler_lease) |lease| {
                     scheduler.notePrefillProgress(lease, seq_len, seq_len);
@@ -3326,6 +3591,10 @@ pub const NativeGenerationPipeline = struct {
             }
             var processed: usize = 0;
             while (processed < query_len) {
+                var direct_prefill_turn_acquired = false;
+                defer if (direct_prefill_turn_acquired) {
+                    self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);
+                };
                 const scheduler_chunk = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else current_chunk_size;
                 const iteration_chunk = schedulerChunkForPrefillIteration(scheduler_chunk, current_chunk_size, first_token_coalesced);
                 const chunk_size = @max(@min(current_chunk_size, iteration_chunk), 1);
@@ -3339,7 +3608,7 @@ pub const NativeGenerationPipeline = struct {
                 if (self.scheduler) |scheduler| {
                     if (self.scheduler_lease) |lease| {
                         if (self.io) |io| {
-                            if (!(total_chunk_end == seq_len and use_cuda_prefill_greedy_token)) {
+                            if (!(total_chunk_end == seq_len and use_prefill_greedy_token)) {
                                 prefill_last_logits = self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, chunk, total_chunk_end, chunk.len, total_chunk_end == seq_len) catch |err| {
                                     if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
                                         current_chunk_size = @max(chunk_size / 2, 1);
@@ -3357,22 +3626,40 @@ pub const NativeGenerationPipeline = struct {
 
                 if (self.scheduler) |scheduler| {
                     if (self.scheduler_lease) |lease| {
-                        if (self.io) |io| scheduler.awaitTurn(lease, .prefill, io);
+                        if (self.io) |io| {
+                            try scheduler.awaitTurn(lease, .prefill, io);
+                            direct_prefill_turn_acquired = true;
+                        }
                     }
                 }
+                const direct_execution_mutex = directPrefillExecutionMutex(
+                    false,
+                    use_cuda_prefill_greedy_token,
+                    use_metal_prefill_greedy_token,
+                    self.execution_lock,
+                );
+                if (direct_execution_mutex) |mutex| {
+                    platform.sync.lockYielding(mutex);
+                }
+                defer if (direct_execution_mutex) |mutex| mutex.unlock();
                 try decode_runtime.appendPrefillChunk(chunk.len);
                 const decode_context = decode_runtime.makeDecodeContext(total_chunk_end, chunk.len);
-                if (total_chunk_end == seq_len and use_cuda_prefill_greedy_token) {
+                const metal_prepared: ?PrefillOutput = if (total_chunk_end == seq_len and use_metal_prefill_greedy_token)
+                    try self.tryMetalPreparedTailPrefillGreedy(chunk, total_chunk_end, &decode_context, capture_last_hidden)
+                else
+                    null;
+                if (metal_prepared) |prepared| {
+                    prefill_greedy_token = prepared.greedy_token;
+                    prefill_last_hidden = prepared.last_hidden;
+                    prefill_last_hidden_rows = prepared.last_hidden_rows;
+                } else if (total_chunk_end == seq_len and use_cuda_prefill_greedy_token) {
                     if (try self.tryCudaPreparedTailPrefillGreedy(chunk, total_chunk_end, &decode_context, capture_last_hidden)) |prepared| {
                         prefill_greedy_token = prepared.greedy_token;
                         prefill_last_hidden = prepared.last_hidden;
                         prefill_last_hidden_rows = prepared.last_hidden_rows;
                     } else if (capture_last_hidden) {
                         var greedy_hidden = gpt_arch.forwardGreedyLastTokenWithFinalHidden(&self.cb, allocator, self.gpt_config, chunk, 1, total_chunk_end, &decode_context) catch |err| {
-                            if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
-                                current_chunk_size = @max(chunk_size / 2, 1);
-                                continue;
-                            }
+                            if (try retryDirectPrefillAfterMemoryBudgetExceeded(&decode_runtime, chunk.len, chunk_size, &current_chunk_size, err)) continue;
                             return err;
                         };
                         prefill_greedy_token = greedy_hidden.token_id;
@@ -3384,10 +3671,7 @@ pub const NativeGenerationPipeline = struct {
                         prefill_last_hidden_rows = greedy_hidden.rows;
                     } else {
                         prefill_greedy_token = gpt_arch.forwardGreedyLastToken(&self.cb, allocator, self.gpt_config, chunk, 1, total_chunk_end, &decode_context) catch |err| {
-                            if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
-                                current_chunk_size = @max(chunk_size / 2, 1);
-                                continue;
-                            }
+                            if (try retryDirectPrefillAfterMemoryBudgetExceeded(&decode_runtime, chunk.len, chunk_size, &current_chunk_size, err)) continue;
                             return err;
                         };
                     }
@@ -3397,10 +3681,7 @@ pub const NativeGenerationPipeline = struct {
                     );
                 } else {
                     const logits = self.forwardAllLogits(chunk, 1, total_chunk_end, &decode_context) catch |err| {
-                        if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
-                            current_chunk_size = @max(chunk_size / 2, 1);
-                            continue;
-                        }
+                        if (try retryDirectPrefillAfterMemoryBudgetExceeded(&decode_runtime, chunk.len, chunk_size, &current_chunk_size, err)) continue;
                         return err;
                     };
                     defer allocator.free(logits);
@@ -3470,6 +3751,10 @@ pub const NativeGenerationPipeline = struct {
         decode_state: *NativeDecodeState,
     ) !?[]f32 {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
+        var direct_prefill_turn_acquired = false;
+        defer if (direct_prefill_turn_acquired) {
+            self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);
+        };
         if (self.gpt_config.isQwen35() and decode_state.isPaged()) {
             try decode_state.ensureQwen35LinearCache(self.gpt_config);
             decode_state.resetQwen35LinearCache();
@@ -3484,13 +3769,10 @@ pub const NativeGenerationPipeline = struct {
             if (self.scheduler_lease) |lease| {
                 if (self.io == null) {
                     _ = try decode_runtime.preparePrefill(seq_len, seq_len);
-                    scheduler.notePrefillProgress(lease, seq_len, seq_len);
-                    scheduler.finishTurn(lease, .prefill);
                 } else {
-                    scheduler.awaitTurn(lease, .prefill, self.io.?);
+                    try scheduler.awaitTurn(lease, .prefill, self.io.?);
+                    direct_prefill_turn_acquired = true;
                     _ = try decode_runtime.preparePrefill(seq_len, seq_len);
-                    scheduler.notePrefillProgress(lease, seq_len, seq_len);
-                    scheduler.finishTurn(lease, .prefill);
                 }
             } else {
                 _ = try decode_runtime.preparePrefill(seq_len, seq_len);
@@ -3501,6 +3783,11 @@ pub const NativeGenerationPipeline = struct {
 
         const input_embeddings = prepared.input_embeddings orelse return error.InvalidPreparedPrompt;
         prepared.input_embeddings = null;
+        // Match text prefill/decode lock order: scheduler turn, then model.
+        // Both stay held until the backend forward and result copy complete.
+        const direct_execution_mutex = directPrefillExecutionMutex(true, false, false, self.execution_lock);
+        if (direct_execution_mutex) |mutex| platform.sync.lockYielding(mutex);
+        defer if (direct_execution_mutex) |mutex| mutex.unlock();
         const ple_token_ids = prepared.ple_token_ids orelse prepared.token_ids;
         const ple_vectors = try gpt_arch.computePleVectors(&self.cb, self.allocator, self.gpt_config, ple_token_ids, input_embeddings, seq_len);
         defer if (ple_vectors) |vectors| self.cb.free(vectors);
@@ -3517,6 +3804,9 @@ pub const NativeGenerationPipeline = struct {
             ple_vectors,
         );
         defer self.allocator.free(logits);
+        if (self.scheduler) |scheduler| {
+            if (self.scheduler_lease) |lease| scheduler.notePrefillProgress(lease, seq_len, seq_len);
+        }
         return try self.allocator.dupe(f32, logits[(seq_len - 1) * self.gpt_config.vocab_size ..][0..self.gpt_config.vocab_size]);
     }
 
@@ -3726,35 +4016,41 @@ pub const NativeGenerationPipeline = struct {
         var tokens_generated: usize = 0;
         var finish_reason: []const u8 = "length";
         var device_token_tensor: ?ops.CT = null;
-        defer if (device_token_tensor) |tensor| self.cb.free(tensor);
+        defer if (device_token_tensor) |tensor| self.freeDeviceTokenTensor(tensor);
         debugGenerationStage(
             "standardDecode enter seq_len={d} max_tokens={d} prefill_cached={}",
             .{ seq_len.*, max_tokens, prefill_last_logits.* != null },
         );
-        if (try self.standardDecodeCudaPendingTokenReadback(
-            token_ids,
-            seq_len,
-            decode_state,
-            config,
-            prefill_last_logits,
-            prefill_greedy_token,
-            penalty_state,
-            token_table,
-            json_grammar,
-            gbnf_grammar,
-            max_tokens,
-            prompt_token_count,
-            on_token_fn,
-            on_token_ctx,
-            emitted_text,
-        )) |pending_result| {
-            return pending_result;
+        if (self.execution_lock == null) {
+            if (try self.standardDecodeCudaPendingTokenReadback(
+                token_ids,
+                seq_len,
+                decode_state,
+                config,
+                prefill_last_logits,
+                prefill_greedy_token,
+                penalty_state,
+                token_table,
+                json_grammar,
+                gbnf_grammar,
+                max_tokens,
+                prompt_token_count,
+                on_token_fn,
+                on_token_ctx,
+                emitted_text,
+            )) |pending_result| {
+                return pending_result;
+            }
         }
 
         while (tokens_generated < max_tokens) {
             var used_decode_microbatch = false;
+            var direct_decode_turn_acquired = false;
+            defer if (direct_decode_turn_acquired) {
+                self.scheduler.?.finishTurn(self.scheduler_lease.?, .decode);
+            };
             var next_device_token_tensor: ?ops.CT = null;
-            errdefer if (next_device_token_tensor) |tensor| self.cb.free(tensor);
+            errdefer if (next_device_token_tensor) |tensor| self.freeDeviceTokenTensor(tensor);
             debugGenerationStage(
                 "standardDecode iter={d} seq_len={d} device_token_handoff={}",
                 .{ tokens_generated, seq_len.*, device_token_tensor != null },
@@ -3785,21 +4081,62 @@ pub const NativeGenerationPipeline = struct {
                 }
 
                 const has_cached_prefill_logits = tokens_generated == 0 and prefill_last_logits.* != null;
-                if (!has_cached_prefill_logits) {
-                    if (try self.forwardGreedyDeviceDecodeToken(
-                        token_ids,
-                        seq_len.*,
-                        tokens_generated,
-                        decode_state,
-                        config,
-                        token_table,
-                        json_grammar,
-                        gbnf_grammar,
-                        device_token_tensor,
-                    )) |token| {
+                // Once a second request is admitted inside the validated C2
+                // envelope, keep both requests on the scheduler path. A
+                // compatibility-only check here races with the later
+                // enqueue/turn acquisition: one request can commit to a
+                // direct step while its peer observes the old decode position
+                // and waits for work that will never be enqueued. The
+                // scheduler still admits only full-geometry-compatible work,
+                // and incompatible peers do not pay a coalescing delay.
+                const route_decode_through_scheduler = self.execution_lock != null and self.scheduler_lease != null and
+                    (if (self.scheduler) |scheduler| scheduler.shouldCoordinateCurrentRequests() else false);
+                const allow_direct_device_decode = !route_decode_through_scheduler;
+                if (!has_cached_prefill_logits and allow_direct_device_decode) {
+                    const direct_token = direct_token_blk: {
+                        // Above the batching rollout cap the scheduler emits
+                        // singleton work, but direct device decode must still
+                        // claim its fair turn before taking the shared model.
+                        if (self.execution_lock != null) {
+                            if (self.scheduler) |scheduler| {
+                                if (self.scheduler_lease) |lease| {
+                                    if (self.io) |io| {
+                                        try scheduler.awaitTurn(lease, .decode, io);
+                                        direct_decode_turn_acquired = true;
+                                    }
+                                }
+                            }
+                        }
+                        if (self.execution_lock) |mutex| {
+                            platform.sync.lockYielding(mutex);
+                        }
+                        defer if (self.execution_lock) |mutex| mutex.unlock();
+                        break :direct_token_blk try self.forwardGreedyDeviceDecodeToken(
+                            token_ids,
+                            seq_len.*,
+                            tokens_generated,
+                            decode_state,
+                            config,
+                            token_table,
+                            json_grammar,
+                            gbnf_grammar,
+                            device_token_tensor,
+                        );
+                    };
+                    if (direct_token) |token| {
                         next_device_token_tensor = token.token_tensor;
                         break :blk .{ .token = token.token, .grammar_complete = false };
                     }
+                    const fallback_query_seq_len = if (decode_runtime.kvView() != null and
+                        (tokens_generated > 0 or prefill_last_logits.* == null)) 1 else seq_len.*;
+                    if (requiresCudaDecodeGraphBeforeEagerFallback(
+                        self.cb.kind(),
+                        gpt_arch.cudaDecodeGraphReplayRequired(),
+                        isPureGreedyConfig(config),
+                        fallback_query_seq_len,
+                        self.graph_cache != null or self.compiled_partition_backend != null,
+                        token_table != null or json_grammar.* != null or gbnf_grammar != null,
+                    )) return error.CudaGraphReplayRequired;
                 }
 
                 var owns_last_logits = false;
@@ -3822,7 +4159,8 @@ pub const NativeGenerationPipeline = struct {
                                     owns_last_logits = true;
                                     break :logits_blk try self.runScheduledDecodeBatch(scheduler, lease, io, decode_state, token_ids[seq_len.* - 1], seq_len.*);
                                 }
-                                scheduler.awaitTurn(lease, .decode, io);
+                                try scheduler.awaitTurn(lease, .decode, io);
+                                direct_decode_turn_acquired = true;
                             }
                         }
                     }
@@ -3878,7 +4216,7 @@ pub const NativeGenerationPipeline = struct {
             // Check EOS
             if (self.shouldStopOnEos(config, next_token)) {
                 if (next_device_token_tensor) |tensor| {
-                    self.cb.free(tensor);
+                    self.freeDeviceTokenTensor(tensor);
                     next_device_token_tensor = null;
                 }
                 finish_reason = "stop";
@@ -3889,14 +4227,19 @@ pub const NativeGenerationPipeline = struct {
                 next_device_token_tensor = try self.makeDeviceTokenTensor(next_token);
                 if (next_device_token_tensor != null) decoder_runtime_debug_stats.device_token_handoff_seeds += 1;
             }
-            if (device_token_tensor) |tensor| self.cb.free(tensor);
+            if (device_token_tensor) |tensor| self.freeDeviceTokenTensor(tensor);
             device_token_tensor = next_device_token_tensor;
             next_device_token_tensor = null;
 
             token_ids[seq_len.*] = @intCast(next_token);
             seq_len.* += 1;
             tokens_generated += 1;
-            _ = try decode_runtime.appendGeneratedToken();
+            {
+                const kv_mutation_mutex = batchKvMutationMutex(self.execution_lock, decode_state.kv_lock);
+                if (kv_mutation_mutex) |mutex| platform.sync.lockYielding(mutex);
+                defer if (kv_mutation_mutex) |mutex| mutex.unlock();
+                _ = try decode_runtime.appendGeneratedToken();
+            }
             try penalty_state.noteToken(allocator, @intCast(next_token));
             debugGenerationStage(
                 "standardDecode iter={d} appended token new_seq_len={d}",
@@ -4384,7 +4727,9 @@ pub const NativeGenerationPipeline = struct {
         if (input_token_tensor) |token_tensor| {
             if (enableCudaGreedyDeviceTokenHandoff()) {
                 decoder_runtime_debug_stats.device_token_handoff_attempts += 1;
-                if (enableCudaGatedTokenTensorDecode()) {
+                if (enableCudaGatedTokenTensorDecode() and
+                    (backend_kind != .cuda or !gpt_arch.cudaDecodeGraphReplayRequired()))
+                {
                     if (try decoder_gated_runtime.forwardGreedyTokenFromTokenTensor(
                         &self.cb,
                         self.allocator,
@@ -4476,7 +4821,7 @@ pub const NativeGenerationPipeline = struct {
         self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
         const decode_context = decode_runtime.makeDecodeContext(seq_len, 1);
         decoder_runtime_debug_stats.device_token_handoff_attempts += 1;
-        if (enableCudaGatedTokenTensorDecode()) {
+        if (enableCudaGatedTokenTensorDecode() and !gpt_arch.cudaDecodeGraphReplayRequired()) {
             if (try decoder_gated_runtime.forwardGreedyTokenTensorOnlyFromTokenTensor(
                 &self.cb,
                 self.allocator,
@@ -4529,9 +4874,21 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn makeDeviceTokenTensor(self: *NativeGenerationPipeline, token_id: usize) !?ops.CT {
+        if (self.execution_lock) |mutex| {
+            platform.sync.lockYielding(mutex);
+        }
+        defer if (self.execution_lock) |mutex| mutex.unlock();
         const data = [_]i32{@intCast(token_id)};
         const shape = [_]i32{1};
         return try self.cb.fromInt32Shape(&data, &shape);
+    }
+
+    fn freeDeviceTokenTensor(self: *NativeGenerationPipeline, tensor: ops.CT) void {
+        if (self.execution_lock) |mutex| {
+            platform.sync.lockYielding(mutex);
+        }
+        defer if (self.execution_lock) |mutex| mutex.unlock();
+        self.cb.free(tensor);
     }
 
     fn forwardLastLogits(
@@ -4616,6 +4973,8 @@ pub const NativeGenerationPipeline = struct {
         const cache = self.graph_cache orelse return false;
         try self.rejectUnsupportedDeepSeekV4GraphMode();
         if (self.compiled_partition_backend == null or self.compiled_attachment_target != .whole_model) return false;
+        // ponytail: Metal prefill prepares lazily; eager prepare is only a warmup and can be skipped.
+        if (self.compiled_partition_backend == .metal) return false;
         return graph_mod.execution.prepareCompiledModelRuntime(self, cache, kv_tokens_hint);
     }
 
@@ -4696,10 +5055,13 @@ pub const NativeGenerationPipeline = struct {
         pre_norm_hidden: ?ops.CT,
         rows: usize,
         greedy_token_id: ?u32 = null,
+        prepared_tail_choices: ?[]u32 = null,
+        choices_allocator: ?std.mem.Allocator = null,
 
         fn deinit(self: *ForwardHiddenDevice) void {
             self.cb.free(self.hidden);
             if (self.pre_norm_hidden) |pre_norm| self.cb.free(pre_norm);
+            if (self.prepared_tail_choices) |choices| self.choices_allocator.?.free(choices);
             self.* = undefined;
         }
     };
@@ -4715,6 +5077,11 @@ pub const NativeGenerationPipeline = struct {
         host: ?[]f32 = null,
         device: ?ops.CT = null,
         cached_target_choice: ?u32 = null,
+        /// Defer-materialize fold: a committed token (already counted by
+        /// seq_len and present in token_ids) whose target forward/KV write is
+        /// deferred to the next verify round. Invariant at every round
+        /// boundary: decode_state.total_tokens + pendingCount() == seq_len.
+        pending_unmaterialized: bool = false,
         draft_embedding_cache: std.ArrayListUnmanaged(DraftEmbeddingCacheEntry) = .empty,
 
         fn deinit(self: *Gemma4MtpActivationState) void {
@@ -4743,6 +5110,28 @@ pub const NativeGenerationPipeline = struct {
 
         fn residentReady(self: *const Gemma4MtpActivationState) bool {
             return self.device != null;
+        }
+
+        fn pendingCount(self: *const Gemma4MtpActivationState) usize {
+            return @intFromBool(self.pending_unmaterialized);
+        }
+
+        /// Every committed token except the pending one must have KV written.
+        /// This is a production invariant: a mismatch shifts the verify suffix
+        /// write onto the wrong KV rows, so fail closed in ReleaseFast too.
+        fn validateKvTokensInSync(self: *const Gemma4MtpActivationState, decode_state: *const NativeDecodeState, seq_len: usize) !void {
+            const accounted_tokens = std.math.add(usize, decode_state.total_tokens, self.pendingCount()) catch
+                return error.InvalidSpeculativeState;
+            if (accounted_tokens != seq_len) return error.InvalidSpeculativeState;
+        }
+
+        fn notePendingUnmaterialized(self: *Gemma4MtpActivationState) !void {
+            if (self.pending_unmaterialized) return error.InvalidSpeculativeState;
+            self.pending_unmaterialized = true;
+        }
+
+        fn notePendingKvWritten(self: *Gemma4MtpActivationState) void {
+            self.pending_unmaterialized = false;
         }
 
         fn cachedDraftEmbedding(self: *const Gemma4MtpActivationState, token_id: i64) ?ops.CT {
@@ -5017,6 +5406,29 @@ pub const NativeGenerationPipeline = struct {
             hidden_source,
             replay_label,
             gemma4MtpUnsafeTargetReplayEnabled(),
+            null,
+        );
+    }
+
+    fn forwardMtpTargetHiddenDevicePreparedArgmax(
+        self: *NativeGenerationPipeline,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        hidden_source: Gemma4MtpTargetHiddenSource,
+        replay_label: []const u8,
+        suppress_token_ids: []const i32,
+    ) !ForwardHiddenDevice {
+        return self.forwardMtpTargetHiddenDeviceReplayMode(
+            input_ids,
+            batch,
+            seq_len,
+            decode_context,
+            hidden_source,
+            replay_label,
+            gemma4MtpUnsafeTargetReplayEnabled(),
+            suppress_token_ids,
         );
     }
 
@@ -5036,6 +5448,7 @@ pub const NativeGenerationPipeline = struct {
             hidden_source,
             "",
             false,
+            null,
         );
     }
 
@@ -5048,6 +5461,7 @@ pub const NativeGenerationPipeline = struct {
         hidden_source: Gemma4MtpTargetHiddenSource,
         replay_label: []const u8,
         allow_replay: bool,
+        prepared_tail_suppress_token_ids: ?[]const i32,
     ) !ForwardHiddenDevice {
         if (hidden_source != .final) {
             return self.forwardHiddenDevice(input_ids, batch, seq_len, decode_context);
@@ -5061,20 +5475,57 @@ pub const NativeGenerationPipeline = struct {
         if (input_ids.len != total) return error.InvalidTensorShape;
 
         if (self.cb.kind() == .metal) {
-            if (try decoder_gated_runtime.forwardFinalHiddenRows(
-                &self.cb,
-                allocator,
-                self.gpt_config,
-                self.gpt_config.num_hidden_layers,
-                input_ids,
-                seq_len,
-                decode_context,
-            )) |direct| {
+            const verify_trace = enableGemma4MtpVerifyTrace();
+            const trace_stats_before = if (verify_trace) decoder_gated_runtime.getTimingStats() else undefined;
+            const trace_started_at = mtpProfileTimestamp(verify_trace, self.io);
+            const direct_result = if (prepared_tail_suppress_token_ids) |suppress_token_ids|
+                try decoder_gated_runtime.forwardFinalHiddenRowsPreparedArgmax(
+                    &self.cb,
+                    allocator,
+                    self.gpt_config,
+                    self.gpt_config.num_hidden_layers,
+                    input_ids,
+                    seq_len,
+                    decode_context,
+                    suppress_token_ids,
+                )
+            else
+                try decoder_gated_runtime.forwardFinalHiddenRows(
+                    &self.cb,
+                    allocator,
+                    self.gpt_config,
+                    self.gpt_config.num_hidden_layers,
+                    input_ids,
+                    seq_len,
+                    decode_context,
+                );
+            if (direct_result) |direct| {
+                if (verify_trace) {
+                    const wall_ns = mtpProfileElapsedNs(true, self.io, trace_started_at);
+                    const after = decoder_gated_runtime.getTimingStats();
+                    std.debug.print(
+                        "mtp-verify-trace: rows={d} wall_us={d} embed_us={d} ple_us={d} frame_begin_us={d} layer_spec_us={d} plan_us={d} execute_us={d} block_us={d} finish_us={d}\n",
+                        .{
+                            direct.rows,
+                            @divTrunc(wall_ns, std.time.ns_per_us),
+                            @as(u64, @intCast(@divTrunc(after.prefill_embed_nanos - trace_stats_before.prefill_embed_nanos, std.time.ns_per_us))),
+                            @as(u64, @intCast(@divTrunc(after.prefill_ple_prepare_nanos - trace_stats_before.prefill_ple_prepare_nanos, std.time.ns_per_us))),
+                            @as(u64, @intCast(@divTrunc(after.prefill_frame_begin_nanos - trace_stats_before.prefill_frame_begin_nanos, std.time.ns_per_us))),
+                            @as(u64, @intCast(@divTrunc(after.prefill_frame_layer_spec_nanos - trace_stats_before.prefill_frame_layer_spec_nanos, std.time.ns_per_us))),
+                            @as(u64, @intCast(@divTrunc(after.prefill_frame_plan_nanos - trace_stats_before.prefill_frame_plan_nanos, std.time.ns_per_us))),
+                            @as(u64, @intCast(@divTrunc(after.prefill_frame_execute_nanos - trace_stats_before.prefill_frame_execute_nanos, std.time.ns_per_us))),
+                            @as(u64, @intCast(@divTrunc(after.prefill_block_nanos - trace_stats_before.prefill_block_nanos, std.time.ns_per_us))),
+                            @as(u64, @intCast(@divTrunc(after.prefill_frame_finish_nanos - trace_stats_before.prefill_frame_finish_nanos, std.time.ns_per_us))),
+                        },
+                    );
+                }
                 return .{
                     .cb = &self.cb,
                     .hidden = direct.final_hidden,
                     .pre_norm_hidden = null,
                     .rows = direct.rows,
+                    .prepared_tail_choices = direct.prepared_tail_choices,
+                    .choices_allocator = direct.choices_allocator,
                 };
             }
         }
@@ -5521,6 +5972,9 @@ pub const NativeGenerationPipeline = struct {
         const actual_k = @min(k, 16);
         var draft_count: usize = 0;
 
+        try setWorkloadProfileRegime(&self.cb, .speculative_draft);
+        try setWorkloadProfileRegime(&draft_pipeline.cb, .speculative_draft);
+
         for (0..actual_k) |di| {
             _ = di;
             // Run draft model forward on the last token
@@ -5556,6 +6010,8 @@ pub const NativeGenerationPipeline = struct {
             .hit_eos = false,
             .hit_grammar_stop = false,
         };
+
+        try setWorkloadProfileRegime(&self.cb, .speculative_verify);
 
         // --- Verify phase: run target model on all draft positions at once ---
         // We need logits for positions seq_len-1 .. seq_len+draft_count-1
@@ -5658,6 +6114,10 @@ pub const NativeGenerationPipeline = struct {
         var round_penalties = try penalty_state.clone(allocator);
         defer round_penalties.deinit(allocator);
 
+        const defer_materialize = gemma4MtpDeferMaterializeEnabled(self.cb.kind());
+        const entry_pending = mtp_activation.pendingCount();
+        try mtp_activation.validateKvTokensInSync(decode_state, seq_len.*);
+
         var draft_tokens: [16]i64 = undefined;
         var draft_logits: [16]?[]f32 = [_]?[]f32{null} ** 16;
         defer for (draft_logits) |maybe_logits| {
@@ -5668,6 +6128,8 @@ pub const NativeGenerationPipeline = struct {
         var draft_logit_sources: [16]gemma4_mtp.DraftLogitSource = undefined;
         const actual_k = @min(k, 16);
         var draft_count: usize = 0;
+        try setWorkloadProfileRegime(&self.cb, .speculative_draft);
+        try setWorkloadProfileRegime(&draft_pipeline.cb, .speculative_draft);
         const position_mode = gemma4MtpPositionMode();
         const hidden_source = gemma4MtpTargetHiddenSource();
         const concat_order = gemma4_mtp.concatOrderFromEnv();
@@ -5678,6 +6140,9 @@ pub const NativeGenerationPipeline = struct {
             mtp_activation.cached_target_choice
         else
             null;
+        // A pending round must take the full non-cached verify shape: its row 0
+        // is the pending token, which the cached fast path would never forward.
+        if (entry_pending != 0 and cached_first_target_choice != null) return error.InvalidSpeculativeState;
         const use_resident_draft =
             mtp_activation.residentReady() and
             gemma4_mtp.deviceResidentDraftAllowed(mtp_top_k) and
@@ -5686,9 +6151,25 @@ pub const NativeGenerationPipeline = struct {
         if (!use_resident_draft and mtp_activation.host == null) return error.MissingGemma4MtpActivation;
 
         var host_chain_activation: ?[]f32 = null;
-        defer if (host_chain_activation) |activation| allocator.free(activation);
+        defer if (!defer_materialize) {
+            if (host_chain_activation) |activation| allocator.free(activation);
+        };
         var device_chain_activation: ?ops.CT = null;
-        defer if (device_chain_activation) |activation| draft_pipeline.cb.free(activation);
+        defer if (!defer_materialize) {
+            if (device_chain_activation) |activation| draft_pipeline.cb.free(activation);
+        };
+        // Defer-materialize keeps every draft step's projected activation (the
+        // chain vars above become borrows of these slots) so a correction or
+        // bonus round can adopt the committed position's chain activation
+        // instead of running the materialize forward.
+        var draft_step_device_activations: [16]?ops.CT = [_]?ops.CT{null} ** 16;
+        defer for (&draft_step_device_activations) |*slot| {
+            if (slot.*) |tensor| draft_pipeline.cb.free(tensor);
+        };
+        var draft_step_host_activations: [16]?[]f32 = [_]?[]f32{null} ** 16;
+        defer for (&draft_step_host_activations) |*slot| {
+            if (slot.*) |activation| allocator.free(activation);
+        };
         const DraftStep = struct {
             token: usize,
             logits: ?[]f32,
@@ -5724,7 +6205,11 @@ pub const NativeGenerationPipeline = struct {
                     .profile_sync = mtp_profile.sync_enabled,
                 });
                 if (mtp_profile.sync_enabled) draft_pipeline.cb.evalTensor(draft_result.projected_activation) catch {};
-                if (device_chain_activation) |old| draft_pipeline.cb.free(old);
+                if (defer_materialize) {
+                    draft_step_device_activations[draft_count] = draft_result.projected_activation;
+                } else if (device_chain_activation) |old| {
+                    draft_pipeline.cb.free(old);
+                }
                 device_chain_activation = draft_result.projected_activation;
                 break :blk .{
                     .token = draft_result.token,
@@ -5747,7 +6232,11 @@ pub const NativeGenerationPipeline = struct {
                     .profile_enabled = mtp_profile.enabled,
                     .profile_sync = mtp_profile.sync_enabled,
                 });
-                if (host_chain_activation) |old| allocator.free(old);
+                if (defer_materialize) {
+                    draft_step_host_activations[draft_count] = draft_result.projected_activation;
+                } else if (host_chain_activation) |old| {
+                    allocator.free(old);
+                }
                 host_chain_activation = draft_result.projected_activation;
                 break :blk .{
                     .token = draft_result.token,
@@ -5818,9 +6307,17 @@ pub const NativeGenerationPipeline = struct {
             .hit_grammar_stop = false,
         };
 
+        try setWorkloadProfileRegime(&self.cb, .speculative_verify);
+
         const verify_len = draft_count + 1;
         const verify_seq = seq_len.* + draft_count;
-        _ = try decode_runtime.appendGeneratedTokens(draft_count);
+        // Reserve KV slots for the drafted tokens plus the pending
+        // unmaterialized token: the verify's suffix write covers its query
+        // rows, so row 0 writes the pending token's KV. The KV layer cannot
+        // detect a miscounted append (the suffix write would silently shift),
+        // hence the release-mode check.
+        _ = try decode_runtime.appendGeneratedTokens(draft_count + entry_pending);
+        if (decode_state.total_tokens != verify_seq) return error.InvalidSpeculativeState;
         mtp_activation.cached_target_choice = null;
         const target_forward_len = if (cached_first_target_choice != null) draft_count else verify_len;
         const target_query_len: usize = if (decode_runtime.kvView() != null) target_forward_len else verify_seq;
@@ -5855,23 +6352,43 @@ pub const NativeGenerationPipeline = struct {
             var used_fused_verify = false;
             {
                 const verify_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
-                var target_hidden = self.forwardMtpTargetHiddenDevice(
-                    token_ids[verify_start..verify_seq],
-                    1,
-                    verify_seq,
-                    &target_ctx,
-                    hidden_source,
-                    "gpt.mtp_verify_final_hidden",
-                ) catch |err| {
-                    decode_runtime.truncateGeneratedTokens(draft_count) catch {};
+                const target_lm_rows = if (cached_first_target_choice != null) draft_count else verify_len;
+                const logit_base_row = target_query_len - target_lm_rows;
+                const suppress_token_ids = self.gpt_config.suppressTokenIds();
+                const target_hidden_result = if (logit_base_row == 0)
+                    self.forwardMtpTargetHiddenDevicePreparedArgmax(
+                        token_ids[verify_start..verify_seq],
+                        1,
+                        verify_seq,
+                        &target_ctx,
+                        hidden_source,
+                        "gpt.mtp_verify_final_hidden",
+                        suppress_token_ids,
+                    )
+                else
+                    self.forwardMtpTargetHiddenDevice(
+                        token_ids[verify_start..verify_seq],
+                        1,
+                        verify_seq,
+                        &target_ctx,
+                        hidden_source,
+                        "gpt.mtp_verify_final_hidden",
+                    );
+                var target_hidden = target_hidden_result catch |err| {
+                    decode_runtime.truncateGeneratedTokens(draft_count + mtp_activation.pendingCount()) catch {};
                     return err;
                 };
                 defer target_hidden.deinit();
+                var prepared_tail_choices = target_hidden.prepared_tail_choices;
+                target_hidden.prepared_tail_choices = null;
+                target_hidden.choices_allocator = null;
+                defer if (prepared_tail_choices) |choices| allocator.free(choices);
+                mtp_activation.notePendingKvWritten();
 
                 const hidden_size: usize = @intCast(self.gpt_config.hidden_size);
                 const vocab_size_usize: usize = @intCast(self.gpt_config.vocab_size);
-                const target_lm_rows = if (cached_first_target_choice != null) draft_count else verify_len;
-                const logit_base_row = target_query_len - target_lm_rows;
+                const verify_trace = enableGemma4MtpVerifyTrace();
+                const tail_trace_started_at = mtpProfileTimestamp(verify_trace, self.io);
                 var lm_input = target_hidden.hidden;
                 var lm_input_owned = false;
                 defer if (lm_input_owned) self.cb.free(lm_input);
@@ -5879,27 +6396,55 @@ pub const NativeGenerationPipeline = struct {
                     lm_input = try self.cb.sliceRows2D(self.allocator, target_hidden.hidden, logit_base_row, target_lm_rows, hidden_size);
                     lm_input_owned = true;
                 }
+                const trace_slice_us = if (verify_trace) @divTrunc(mtpProfileElapsedNs(true, self.io, tail_trace_started_at), std.time.ns_per_us) else 0;
 
                 const lm_w = try self.graphWeight("lm_head.weight");
                 defer self.cb.free(lm_w);
-                const suppress_token_ids = self.gpt_config.suppressTokenIds();
-                if (cached_first_target_choice) |cached_choice| {
-                    const target_tail_choices = (try self.cb.linearNoBiasArgmaxRowsSuppress(
+                const trace_lmw_us = if (verify_trace) @divTrunc(mtpProfileElapsedNs(true, self.io, tail_trace_started_at), std.time.ns_per_us) else 0;
+                // Prefer the prepared final-lm-head slot (same quantized weight
+                // the planned decode frames use for their tail) over the dense
+                // lm_head fallback inside the generic linearNoBias path.
+                if (prepared_tail_choices == null and self.cb.kind() == .metal) {
+                    prepared_tail_choices = try decoder_gated_runtime.forwardPreparedLmHeadArgmaxRows(
+                        &self.cb,
+                        self.gpt_config,
+                        self.gpt_config.num_hidden_layers,
                         lm_input,
-                        lm_w,
                         target_lm_rows,
-                        hidden_size,
-                        vocab_size_usize,
                         suppress_token_ids,
                         allocator,
-                    )) orelse {
-                        std.log.err(
-                            "gemma4_mtp_target_tail_argmax_unsupported: backend={s} rows={d} hidden={d} vocab={d} suppress={d} weight_tying={}",
-                            .{ @tagName(self.cb.kind()), target_lm_rows, hidden_size, vocab_size_usize, suppress_token_ids.len, self.gpt_config.weight_tying },
-                        );
-                        return error.UnsupportedBackend;
+                    );
+                }
+                if (cached_first_target_choice) |cached_choice| {
+                    const target_tail_choices = blk: {
+                        if (prepared_tail_choices) |choices| {
+                            prepared_tail_choices = null;
+                            break :blk choices;
+                        }
+                        break :blk (try self.cb.linearNoBiasArgmaxRowsSuppress(
+                            lm_input,
+                            lm_w,
+                            target_lm_rows,
+                            hidden_size,
+                            vocab_size_usize,
+                            suppress_token_ids,
+                            allocator,
+                        )) orelse {
+                            std.log.err(
+                                "gemma4_mtp_target_tail_argmax_unsupported: backend={s} rows={d} hidden={d} vocab={d} suppress={d} weight_tying={}",
+                                .{ @tagName(self.cb.kind()), target_lm_rows, hidden_size, vocab_size_usize, suppress_token_ids.len, self.gpt_config.weight_tying },
+                            );
+                            return error.UnsupportedBackend;
+                        };
                     };
                     defer allocator.free(target_tail_choices);
+                    if (verify_trace) {
+                        const argmax_done_us = @divTrunc(mtpProfileElapsedNs(true, self.io, tail_trace_started_at), std.time.ns_per_us);
+                        std.debug.print(
+                            "mtp-verify-tail-trace: rows={d} slice_us={d} lmw_us={d} argmax_done_us={d}\n",
+                            .{ target_lm_rows, trace_slice_us, trace_lmw_us, argmax_done_us },
+                        );
+                    }
                     if (target_tail_choices.len < target_lm_rows) return error.InvalidTensorShape;
                     var combined_choices_buf: [17]u32 = undefined;
                     if (verify_len > combined_choices_buf.len) return error.InvalidSpeculativeK;
@@ -5956,7 +6501,12 @@ pub const NativeGenerationPipeline = struct {
                         }
                     }
                     used_fused_verify = true;
-                } else if (gemma4MtpDedicatedRuntimeEnabled()) {
+                } else if (prepared_tail_choices == null and gemma4MtpDedicatedRuntimeEnabled()) {
+                    // The dedicated-runtime verify commit recomputes lm_head
+                    // logits internally through the dense fallback weight;
+                    // when the prepared-slot argmax already produced the
+                    // choices, the plain accept path below consumes them at a
+                    // fraction of the cost.
                     var eos_token_ids_buf: [1 + gpt_mod.max_extra_eos_token_ids]i32 = [_]i32{-1} ** (1 + gpt_mod.max_extra_eos_token_ids);
                     var eos_token_ids_len: usize = 0;
                     if (!config.ignore_eos and self.gpt_config.eos_token_id >= 0) {
@@ -6044,15 +6594,22 @@ pub const NativeGenerationPipeline = struct {
                     }
                 }
                 if (!used_fused_verify) {
-                    if (try self.cb.linearNoBiasArgmaxRowsSuppress(
-                        lm_input,
-                        lm_w,
-                        verify_len,
-                        hidden_size,
-                        vocab_size_usize,
-                        suppress_token_ids,
-                        allocator,
-                    )) |target_choices| {
+                    const maybe_target_choices: ?[]u32 = blk: {
+                        if (prepared_tail_choices) |choices| {
+                            prepared_tail_choices = null;
+                            break :blk choices;
+                        }
+                        break :blk try self.cb.linearNoBiasArgmaxRowsSuppress(
+                            lm_input,
+                            lm_w,
+                            verify_len,
+                            hidden_size,
+                            vocab_size_usize,
+                            suppress_token_ids,
+                            allocator,
+                        );
+                    };
+                    if (maybe_target_choices) |target_choices| {
                         defer allocator.free(target_choices);
                         verify_result = try self.acceptVerifiedDraftTokenChoicesGreedy(
                             token_ids,
@@ -6104,6 +6661,34 @@ pub const NativeGenerationPipeline = struct {
                         used_fused_verify = true;
                     }
                 }
+                if (used_fused_verify and
+                    defer_materialize and
+                    gemma4MtpDeferMaterializeTargetActivationEnabled(self.cb.kind()) and
+                    (verify_result.correction_added or verify_result.had_bonus) and
+                    !verify_result.hit_eos and
+                    !verify_result.hit_grammar_stop)
+                {
+                    // Option C: the verify already produced the target hidden
+                    // that scored the pending token, so reuse it directly.
+                    const row = gemma4MtpDeferredTargetActivationRow(
+                        cached_first_target_choice != null,
+                        logit_base_row,
+                        verify_result.accepted,
+                    ) orelse return error.InvalidTensorShape;
+                    if (row >= target_hidden.rows) return error.InvalidTensorShape;
+                    const activation_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
+                    if (use_resident_draft) {
+                        next_device_activation = (try self.copyMtpTargetHiddenRowFromHiddenToBackend(&target_hidden, row, hidden_source, &draft_pipeline.cb)) orelse return error.UnsupportedBackend;
+                        if (mtp_profile.sync_enabled) draft_pipeline.cb.evalTensor(next_device_activation.?) catch {};
+                    } else {
+                        next_host_activation = try self.dupeMtpTargetHiddenRowFromHiddenDevice(&target_hidden, row, hidden_source);
+                    }
+                    if (mtp_profile.enabled) {
+                        mtp_profile.activation_copies += 1;
+                        mtp_profile.accepted_hidden_reuse_rows += 1;
+                        mtp_profile.activation_copy_ns +|= mtpProfileElapsedNs(true, self.io, activation_started_at);
+                    }
+                }
             }
 
             if (!used_fused_verify) {
@@ -6114,10 +6699,11 @@ pub const NativeGenerationPipeline = struct {
                     verify_seq,
                     &target_ctx,
                 ) catch |err| {
-                    decode_runtime.truncateGeneratedTokens(draft_count) catch {};
+                    decode_runtime.truncateGeneratedTokens(draft_count + mtp_activation.pendingCount()) catch {};
                     return err;
                 };
                 defer target_result.deinit();
+                mtp_activation.notePendingKvWritten();
 
                 verify_result = try self.acceptVerifiedDraftTokensGreedyDevice(
                     token_ids,
@@ -6169,10 +6755,11 @@ pub const NativeGenerationPipeline = struct {
                 verify_seq,
                 &target_ctx,
             ) catch |err| {
-                decode_runtime.truncateGeneratedTokens(draft_count) catch {};
+                decode_runtime.truncateGeneratedTokens(draft_count + mtp_activation.pendingCount()) catch {};
                 return err;
             };
             defer target_result.deinit();
+            mtp_activation.notePendingKvWritten();
 
             const parity_trace: ?MtpParityTrace = if (mtp_top_k > 0)
                 .{
@@ -6243,55 +6830,82 @@ pub const NativeGenerationPipeline = struct {
         }
 
         if (verify_result.correction_added or verify_result.had_bonus) {
-            const accepted_seq_len = seq_len.* + accepted;
-            const materialization_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
-            const hidden_only_materialize = gemma4MtpHiddenOnlyMaterializeEnabled();
-            const have_predictor_activation = next_device_activation != null or next_host_activation != null;
-            if (have_predictor_activation) {
-                next_cached_target_choice = try self.materializeAcceptedTokenKvForMtp(token_ids, accepted_seq_len, decode_state, hidden_source);
-            } else {
-                if (use_resident_draft) {
-                    const materialized = try self.materializeAcceptedTokenKvAndCopyHiddenToBackend(
-                        token_ids,
-                        accepted_seq_len,
-                        decode_state,
-                        hidden_source,
-                        &draft_pipeline.cb,
-                    );
-                    const materialized_hidden = materialized.activation orelse return error.UnsupportedBackend;
-                    if (mtp_profile.sync_enabled) draft_pipeline.cb.evalTensor(materialized_hidden) catch {};
-                    if (next_device_activation) |old| draft_pipeline.cb.free(old);
-                    next_device_activation = materialized_hidden;
-                    next_cached_target_choice = materialized.next_target_choice;
-                    if (next_host_activation) |old| {
-                        allocator.free(old);
-                        next_host_activation = null;
+            if (defer_materialize) {
+                // Fold: leave the committed token un-forwarded. The next
+                // round's verify prepends it as row 0 (the non-cached verify
+                // shape) and the suffix write materializes its KV. Draft
+                // quality only (the verify still decides every token): the
+                // next round drafts without the committed token's donor KV
+                // row. The target verify activation above is preferred; this
+                // retained assistant-chain activation is its fallback.
+                if (next_device_activation == null and next_host_activation == null) {
+                    const step_index = if (verify_result.correction_added) matched_drafts else draft_count - 1;
+                    if (use_resident_draft) {
+                        const retained = draft_step_device_activations[step_index] orelse return error.MissingGemma4MtpActivation;
+                        draft_step_device_activations[step_index] = null;
+                        next_device_activation = retained;
+                    } else {
+                        const retained = draft_step_host_activations[step_index] orelse return error.MissingGemma4MtpActivation;
+                        draft_step_host_activations[step_index] = null;
+                        next_host_activation = retained;
                     }
+                }
+                next_cached_target_choice = null;
+                try mtp_activation.notePendingUnmaterialized();
+                if (mtp_profile.enabled) {
+                    mtp_profile.deferred_materializations += 1;
+                }
+            } else {
+                const accepted_seq_len = seq_len.* + accepted;
+                const materialization_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
+                const hidden_only_materialize = gemma4MtpHiddenOnlyMaterializeEnabled();
+                const have_predictor_activation = next_device_activation != null or next_host_activation != null;
+                if (have_predictor_activation) {
+                    next_cached_target_choice = try self.materializeAcceptedTokenKvForMtp(token_ids, accepted_seq_len, decode_state, hidden_source);
                 } else {
-                    const materialized = try self.materializeAcceptedTokenKvAndReturnHidden(
-                        token_ids,
-                        accepted_seq_len,
-                        decode_state,
-                        hidden_source,
-                    );
-                    if (next_host_activation) |old| allocator.free(old);
-                    next_host_activation = materialized.activation;
-                    next_cached_target_choice = materialized.next_target_choice;
+                    if (use_resident_draft) {
+                        const materialized = try self.materializeAcceptedTokenKvAndCopyHiddenToBackend(
+                            token_ids,
+                            accepted_seq_len,
+                            decode_state,
+                            hidden_source,
+                            &draft_pipeline.cb,
+                        );
+                        const materialized_hidden = materialized.activation orelse return error.UnsupportedBackend;
+                        if (mtp_profile.sync_enabled) draft_pipeline.cb.evalTensor(materialized_hidden) catch {};
+                        if (next_device_activation) |old| draft_pipeline.cb.free(old);
+                        next_device_activation = materialized_hidden;
+                        next_cached_target_choice = materialized.next_target_choice;
+                        if (next_host_activation) |old| {
+                            allocator.free(old);
+                            next_host_activation = null;
+                        }
+                    } else {
+                        const materialized = try self.materializeAcceptedTokenKvAndReturnHidden(
+                            token_ids,
+                            accepted_seq_len,
+                            decode_state,
+                            hidden_source,
+                        );
+                        if (next_host_activation) |old| allocator.free(old);
+                        next_host_activation = materialized.activation;
+                        next_cached_target_choice = materialized.next_target_choice;
+                    }
                 }
-            }
-            if (mtp_profile.enabled) {
-                mtp_profile.materializations += 1;
-                if (verify_result.correction_added) {
-                    mtp_profile.correction_materializations += 1;
-                } else if (verify_result.had_bonus) {
-                    mtp_profile.bonus_materializations += 1;
+                if (mtp_profile.enabled) {
+                    mtp_profile.materializations += 1;
+                    if (verify_result.correction_added) {
+                        mtp_profile.correction_materializations += 1;
+                    } else if (verify_result.had_bonus) {
+                        mtp_profile.bonus_materializations += 1;
+                    }
+                    if (hidden_only_materialize) {
+                        mtp_profile.materialization_hidden_only_hits += 1;
+                    } else {
+                        mtp_profile.materialization_hidden_only_fallbacks += 1;
+                    }
+                    mtp_profile.materialization_ns +|= mtpProfileElapsedNs(true, self.io, materialization_started_at);
                 }
-                if (hidden_only_materialize) {
-                    mtp_profile.materialization_hidden_only_hits += 1;
-                } else {
-                    mtp_profile.materialization_hidden_only_fallbacks += 1;
-                }
-                mtp_profile.materialization_ns +|= mtpProfileElapsedNs(true, self.io, materialization_started_at);
             }
         }
 
@@ -6304,6 +6918,7 @@ pub const NativeGenerationPipeline = struct {
         }
         mtp_activation.cached_target_choice = next_cached_target_choice;
         seq_len.* += accepted;
+        try mtp_activation.validateKvTokensInSync(decode_state, seq_len.*);
         try penalty_state.noteTokens(allocator, token_ids[round_start..seq_len.*]);
 
         return .{
@@ -7001,6 +7616,32 @@ pub const NativeGenerationPipeline = struct {
         return try self.greedyTargetChoiceFromFinalHiddenDevice(result.hidden);
     }
 
+    /// Flush a pending unmaterialized token (defer-materialize fold) before
+    /// entering any decode path that assumes decode_state.total_tokens ==
+    /// seq_len — e.g. the mid-generation standardDecode fallbacks. Restores
+    /// exactly the fold-off state: the token's KV written via a one-row
+    /// materialize forward.
+    fn flushPendingGemma4MtpMaterialize(
+        self: *NativeGenerationPipeline,
+        token_ids: []const i64,
+        seq_len: usize,
+        decode_state: *NativeDecodeState,
+        mtp_activation: *Gemma4MtpActivationState,
+        hidden_source: Gemma4MtpTargetHiddenSource,
+        mtp_profile: *MtpProfileStats,
+    ) !void {
+        if (mtp_activation.pendingCount() == 0) return;
+        try mtp_activation.validateKvTokensInSync(decode_state, seq_len);
+        const flush_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
+        mtp_activation.cached_target_choice = try self.materializeAcceptedTokenKvForMtp(token_ids, seq_len, decode_state, hidden_source);
+        mtp_activation.notePendingKvWritten();
+        try mtp_activation.validateKvTokensInSync(decode_state, seq_len);
+        if (mtp_profile.enabled) {
+            mtp_profile.pending_flushes += 1;
+            mtp_profile.materialization_ns +|= mtpProfileElapsedNs(true, self.io, flush_started_at);
+        }
+    }
+
     const MtpMaterializedHostActivation = struct {
         activation: []f32,
         next_target_choice: ?u32 = null,
@@ -7170,9 +7811,22 @@ pub const NativeGenerationPipeline = struct {
             .token_id = token_id,
             .seq_len = seq_len,
         };
+        defer if (work.logits) |logits| work.allocator.free(logits);
         const pending_options = pendingWorkOptionsFromState(decode_state, 1);
         try scheduler.enqueueDecodeWork(lease.*, @ptrCast(&work), seq_len, decode_ctx.kv_sequence_len, decode_ctx.kv_position_offset, pending_options);
-        defer if (!work.ready) scheduler.cancelDecodeWork(@ptrCast(&work));
+        defer if (!work.ready.load(.acquire)) scheduler.cancelDecodeWork(@ptrCast(&work));
+
+        const coalesce_delay_us = if (self.execution_lock != null)
+            scheduler.decodeCoalesceDelayUs(lease.*)
+        else
+            0;
+        var coalesce_wait_error: ?anyerror = null;
+        if (coalesce_delay_us > 0) {
+            scheduler.noteDecodeCoalesceWait(coalesce_delay_us);
+            io.sleep(std.Io.Duration.fromMicroseconds(coalesce_delay_us), .awake) catch |err| {
+                coalesce_wait_error = err;
+            };
+        }
 
         var driver = DecodeStepDriver{
             .pipeline = self,
@@ -7180,7 +7834,7 @@ pub const NativeGenerationPipeline = struct {
             .work = &work,
             .decode_state = decode_state,
         };
-        try runStepLoop(self.allocator, scheduler, lease, @ptrCast(&work), .decode, io, &driver);
+        try runStepLoop(self.allocator, scheduler, lease, @ptrCast(&work), .decode, io, coalesce_wait_error, &driver);
 
         if (work.failure) |err| return err;
         const logits = work.logits orelse return error.InvalidBatchDecodeState;
@@ -7209,9 +7863,15 @@ pub const NativeGenerationPipeline = struct {
             .query_seq_len = query_seq_len,
             .wants_last_logits = wants_last_logits,
         };
-        const pending_options = pendingWorkOptionsFromState(decode_state, query_seq_len);
+        defer if (work.logits) |logits| work.allocator.free(logits);
+        var pending_options = pendingWorkOptionsFromState(decode_state, query_seq_len);
+        if (self.execution_lock != null) {
+            // CUDA row-batched prefill is not response-equivalent yet. Keep
+            // prefill as a singleton; decode remains continuously batchable.
+            pending_options.exclusive_step = true;
+        }
         try scheduler.enqueuePrefillWork(lease.*, @ptrCast(&work), seq_len, query_seq_len, decode_ctx.kv_sequence_len, decode_ctx.kv_position_offset, pending_options);
-        defer if (!work.ready) scheduler.cancelPrefillWork(@ptrCast(&work));
+        defer if (!work.ready.load(.acquire)) scheduler.cancelPrefillWork(@ptrCast(&work));
 
         var driver = PrefillStepDriver{
             .pipeline = self,
@@ -7219,7 +7879,7 @@ pub const NativeGenerationPipeline = struct {
             .work = &work,
             .decode_state = decode_state,
         };
-        try runStepLoop(self.allocator, scheduler, lease, @ptrCast(&work), .prefill, io, &driver);
+        try runStepLoop(self.allocator, scheduler, lease, @ptrCast(&work), .prefill, io, null, &driver);
 
         if (work.failure) |err| return err;
         const logits = work.logits;
@@ -7312,7 +7972,7 @@ pub const NativeGenerationPipeline = struct {
         for (claimed, 0..) |item, idx| {
             if (item.phase != .prefill) continue;
             const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
-            reserved[idx] = try reserveScheduledPrefillState(work.decode_state, work.seq_len);
+            reserved[idx] = try reserveAndRefreshScheduledPrefill(&items[idx], work.seq_len);
             reserved_count = idx + 1;
         }
 
@@ -7332,29 +7992,83 @@ pub const NativeGenerationPipeline = struct {
     }
 
     /// Drive a claimed step end-to-end. Always calls `scheduler.completeStep`
-    /// before returning so pending entries never leak. Per-item failures are
-    /// surfaced via `work.failure`/`work.ready`; the function itself does not
-    /// return errors to the caller.
+    /// before publishing `work.ready`, so a waiter can never observe ready
+    /// work that the scheduler still owns. Per-item failures are surfaced via
+    /// `work.failure`/`work.ready`; the function itself does not return errors
+    /// to the caller.
+    fn completeClaimedStepBeforePublish(
+        scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
+        lease: *runtime.scheduler.native_generate.Lease,
+        claimed: []const runtime.scheduler.native_generate.StepItem,
+        publisher: anytype,
+    ) void {
+        scheduler.completeStep(lease, claimed);
+        publisher.publish(claimed);
+    }
+
+    const FailedStepPublisher = struct {
+        err: anyerror,
+
+        fn publish(self: @This(), claimed: []const runtime.scheduler.native_generate.StepItem) void {
+            markStepFailed(claimed, self.err);
+        }
+    };
+
+    const SuccessfulStepPublisher = struct {
+        vocab_size: usize,
+        logits: ?[]const f32,
+        max_query_seq_len: usize,
+
+        fn publish(self: @This(), claimed: []const runtime.scheduler.native_generate.StepItem) void {
+            dispatchStepLogits(self.vocab_size, claimed, self.logits, self.max_query_seq_len);
+        }
+    };
+
     fn executeClaimedStep(
         self: *NativeGenerationPipeline,
         scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
         lease: *runtime.scheduler.native_generate.Lease,
         claimed: []const runtime.scheduler.native_generate.StepItem,
     ) void {
+        if (self.execution_lock) |mutex| {
+            platform.sync.lockYielding(mutex);
+        }
+        defer if (self.execution_lock) |mutex| mutex.unlock();
+
+        self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
+
         const result = self.forwardScheduledStep(claimed) catch |err| {
-            markStepFailed(claimed, err);
-            scheduler.completeStep(lease, claimed);
+            completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = err });
             return;
         };
         defer if (result.logits) |logits| self.allocator.free(logits);
 
-        dispatchStepLogits(self.gpt_config.vocab_size, claimed, result.logits, result.max_query_seq_len);
-        scheduler.completeStep(lease, claimed);
+        completeClaimedStepBeforePublish(scheduler, lease, claimed, SuccessfulStepPublisher{
+            .vocab_size = self.gpt_config.vocab_size,
+            .logits = result.logits,
+            .max_query_seq_len = result.max_query_seq_len,
+        });
     }
 
     fn reserveScheduledPrefillState(decode_state: *NativeDecodeState, target_total_seq_len: usize) !usize {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         return decode_runtime.reservePrefillTo(target_total_seq_len);
+    }
+
+    fn reserveAndRefreshScheduledPrefill(item: *MixedBatchDecodeItem, target_total_seq_len: usize) !usize {
+        const reserved = try reserveScheduledPrefillState(item.state, target_total_seq_len);
+        // The scheduler item captures KV geometry before this chunk is
+        // reserved. Refresh it from the now-current state so paged KV writes
+        // append the chunk instead of reusing the prior chunk's suffix range.
+        refreshReservedPrefillGeometry(item);
+        return reserved;
+    }
+
+    fn refreshReservedPrefillGeometry(item: *MixedBatchDecodeItem) void {
+        var decode_runtime = BorrowedDecodeStateRuntime.init(item.state);
+        const decode_ctx = decode_runtime.makeDecodeContext(item.total_sequence_len, item.query_sequence_len);
+        item.kv_sequence_len = decode_ctx.kv_sequence_len;
+        item.kv_position_offset = decode_ctx.kv_position_offset;
     }
 
     fn rollbackScheduledPrefillState(decode_state: *NativeDecodeState, reserved: usize) !void {
@@ -7412,12 +8126,12 @@ pub const NativeGenerationPipeline = struct {
                 .decode => {
                     const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
                     work.failure = err;
-                    work.ready = true;
+                    work.ready.store(true, .release);
                 },
                 .prefill => {
                     const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
                     work.failure = err;
-                    work.ready = true;
+                    work.ready.store(true, .release);
                 },
                 .waiting => {},
             }
@@ -7440,12 +8154,12 @@ pub const NativeGenerationPipeline = struct {
                     .decode => {
                         const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
                         work.failure = error.InvalidBatchDecodeState;
-                        work.ready = true;
+                        work.ready.store(true, .release);
                     },
                     .prefill => {
                         const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
                         if (work.wants_last_logits) work.failure = error.InvalidBatchDecodeState;
-                        work.ready = true;
+                        work.ready.store(true, .release);
                     },
                     .waiting => {},
                 }
@@ -7464,7 +8178,7 @@ pub const NativeGenerationPipeline = struct {
                     } else |dupe_err| {
                         work.failure = dupe_err;
                     }
-                    work.ready = true;
+                    work.ready.store(true, .release);
                 },
                 .prefill => {
                     const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
@@ -7475,7 +8189,7 @@ pub const NativeGenerationPipeline = struct {
                             work.failure = dupe_err;
                         }
                     }
-                    work.ready = true;
+                    work.ready.store(true, .release);
                 },
                 .waiting => {},
             }
@@ -7500,6 +8214,7 @@ fn runStepLoop(
     leader_work_ptr: *anyopaque,
     leader_phase: runtime.scheduler.native_generate.Phase,
     io: std.Io,
+    initial_wait_error: ?anyerror,
     driver: anytype,
 ) !void {
     const DriverInfo = @typeInfo(@TypeOf(driver));
@@ -7507,16 +8222,30 @@ fn runStepLoop(
 
     var step = std.ArrayListUnmanaged(runtime.scheduler.native_generate.StepItem).empty;
     defer step.deinit(allocator);
+    var wait_error = initial_wait_error;
 
     while (!driver.isReady()) {
+        if (wait_error) |err| {
+            // Cancellation cannot drop a stack-backed work pointer while a
+            // peer may own it. Remove idle work immediately; otherwise wait
+            // for the claimed step to publish ready before returning.
+            if (scheduler.cancelPendingWorkIfIdle(leader_work_ptr, leader_phase)) return err;
+            // ponytail: bounded polling while an in-flight forward drains;
+            // replace with a scheduler event if canceled-waiter volume grows.
+            platform.time.yieldBriefly();
+            continue;
+        }
         if (@hasDecl(DriverChild, "preStep")) driver.preStep();
         const budget = driver.stepBudget();
         if (try scheduler.claimStep(allocator, lease, leader_work_ptr, leader_phase, budget, &step)) {
             driver.execute(scheduler, lease, step.items);
         } else {
-            io.sleep(std.Io.Duration.fromMilliseconds(0), .awake) catch break;
+            io.sleep(std.Io.Duration.fromMilliseconds(0), .awake) catch |err| {
+                wait_error = err;
+            };
         }
     }
+    if (wait_error) |err| return err;
 }
 
 const DecodeStepDriver = struct {
@@ -7526,7 +8255,7 @@ const DecodeStepDriver = struct {
     decode_state: *NativeDecodeState,
 
     fn isReady(self: *const DecodeStepDriver) bool {
-        return self.work.ready;
+        return self.work.ready.load(.acquire);
     }
 
     fn stepBudget(self: *const DecodeStepDriver) runtime.scheduler.native_generate.StepBudget {
@@ -7534,6 +8263,7 @@ const DecodeStepDriver = struct {
     }
 
     fn preStep(self: *DecodeStepDriver) void {
+        if (self.pipeline.execution_lock != null) return;
         self.pipeline.cb.drainPrefetchBudget(NativeGenerationPipeline.prefetch_drain_budget_per_step);
     }
 
@@ -7554,7 +8284,7 @@ const PrefillStepDriver = struct {
     decode_state: *NativeDecodeState,
 
     fn isReady(self: *const PrefillStepDriver) bool {
-        return self.work.ready;
+        return self.work.ready.load(.acquire);
     }
 
     fn stepBudget(self: *const PrefillStepDriver) runtime.scheduler.native_generate.StepBudget {
@@ -7785,6 +8515,33 @@ fn appendQwenVisualPlaceholderTokens(
     if (config.eoi_token_index >= 0) try out.append(allocator, config.eoi_token_index);
 }
 
+test "completed streaming fallback emits full text exactly once when callback stops" {
+    const CallbackContext = struct {
+        expected: []const u8,
+        calls: usize = 0,
+        matched: bool = false,
+
+        fn onToken(raw_ctx: *anyopaque, text: []const u8) bool {
+            const ctx: *@This() = @ptrCast(@alignCast(raw_ctx));
+            ctx.calls += 1;
+            ctx.matched = std.mem.eql(u8, ctx.expected, text);
+            return false;
+        }
+    };
+
+    var ctx = CallbackContext{ .expected = "complete multimodal response" };
+    try std.testing.expect(!emitCompletedStreamingText(&ctx, CallbackContext.onToken, ctx.expected));
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+    try std.testing.expect(ctx.matched);
+}
+
+test "first token callback cancellation prevents speculative entry" {
+    try std.testing.expect(shouldEnterSpeculativeDecodeLoop(true, false, false));
+    try std.testing.expect(!shouldEnterSpeculativeDecodeLoop(false, false, false));
+    try std.testing.expect(!shouldEnterSpeculativeDecodeLoop(true, true, false));
+    try std.testing.expect(!shouldEnterSpeculativeDecodeLoop(true, false, true));
+}
+
 test "shouldAddBosToken skips duplicate literal bos prefix" {
     try std.testing.expect(!shouldAddBosToken("<bos><start_of_turn>user\nHello", true, "<bos>"));
 }
@@ -7848,13 +8605,98 @@ test "markStepFailed marks every claimed work failed and ready" {
 
     NativeGenerationPipeline.markStepFailed(&items, error.OutOfMemory);
 
-    try std.testing.expect(dec_a.ready);
+    try std.testing.expect(dec_a.ready.load(.acquire));
     try std.testing.expectEqual(@as(?anyerror, error.OutOfMemory), dec_a.failure);
     try std.testing.expect(dec_a.logits == null);
 
-    try std.testing.expect(pre_a.ready);
+    try std.testing.expect(pre_a.ready.load(.acquire));
     try std.testing.expectEqual(@as(?anyerror, error.OutOfMemory), pre_a.failure);
     try std.testing.expect(pre_a.logits == null);
+}
+
+test "completeClaimedStepBeforePublish removes scheduler work before ready publication" {
+    const allocator = std.testing.allocator;
+    var coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+
+    var lease = try coordinator.acquire(.{
+        .requested_units = 1,
+        .prompt_bytes = 64,
+        .max_tokens = 8,
+    });
+    defer coordinator.release(lease);
+    var peer_lease = try coordinator.acquire(.{
+        .requested_units = 1,
+        .prompt_bytes = 64,
+        .max_tokens = 8,
+    });
+    defer coordinator.release(peer_lease);
+
+    var dummy_state = NativeDecodeState.initContiguous(allocator);
+    defer dummy_state.deinit();
+    var work = NativeGenerationPipeline.PendingDecodeBatchWork{
+        .allocator = allocator,
+        .decode_state = &dummy_state,
+        .token_id = 7,
+        .seq_len = 4,
+    };
+
+    coordinator.beginDecode(&lease, 4);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work), 5, 5, 0, .{});
+    var peer_work: u8 = 0;
+    coordinator.beginDecode(&peer_lease, 4);
+    try coordinator.enqueueDecodeWork(peer_lease, @ptrCast(&peer_work), 5, 5, 0, .{});
+
+    var claimed = std.ArrayListUnmanaged(runtime.scheduler.native_generate.StepItem).empty;
+    defer claimed.deinit(allocator);
+    try std.testing.expect(try coordinator.claimStep(
+        allocator,
+        &lease,
+        @ptrCast(&work),
+        .decode,
+        .{ .max_items = 1, .max_query_tokens = 1 },
+        &claimed,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), claimed.items.len);
+
+    var pending_was_removed = false;
+    var ownership_was_released = false;
+    var ready_was_clear = false;
+    const ProbePublisher = struct {
+        scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
+        work: *NativeGenerationPipeline.PendingDecodeBatchWork,
+        peer_lease: *runtime.scheduler.native_generate.Lease,
+        pending_was_removed: *bool,
+        ownership_was_released: *bool,
+        ready_was_clear: *bool,
+
+        fn publish(self: @This(), _: []const runtime.scheduler.native_generate.StepItem) void {
+            self.pending_was_removed.* = self.scheduler.pendingKvBlocksEstimate(@ptrCast(self.work), .decode) == null;
+            self.ownership_was_released.* = self.scheduler.tryAcquireTurn(self.peer_lease, .decode);
+            if (self.ownership_was_released.*) self.scheduler.finishTurn(self.peer_lease, .decode);
+            self.ready_was_clear.* = !self.work.ready.load(.acquire);
+            self.work.ready.store(true, .release);
+        }
+    };
+
+    NativeGenerationPipeline.completeClaimedStepBeforePublish(
+        &coordinator,
+        &lease,
+        claimed.items,
+        ProbePublisher{
+            .scheduler = &coordinator,
+            .work = &work,
+            .peer_lease = &peer_lease,
+            .pending_was_removed = &pending_was_removed,
+            .ownership_was_released = &ownership_was_released,
+            .ready_was_clear = &ready_was_clear,
+        },
+    );
+
+    try std.testing.expect(pending_was_removed);
+    try std.testing.expect(ownership_was_released);
+    try std.testing.expect(ready_was_clear);
+    try std.testing.expect(work.ready.load(.acquire));
 }
 
 test "dispatchStepLogits dupes per-item rows and respects wants_last_logits" {
@@ -7909,11 +8751,11 @@ test "dispatchStepLogits dupes per-item rows and respects wants_last_logits" {
 
     NativeGenerationPipeline.dispatchStepLogits(vocab_size, &items, &logits, max_query);
 
-    try std.testing.expect(dec_w.ready);
+    try std.testing.expect(dec_w.ready.load(.acquire));
     try std.testing.expectEqualSlices(f32, &.{ 10, 11 }, dec_w.logits.?);
-    try std.testing.expect(pre_with_logits.ready);
+    try std.testing.expect(pre_with_logits.ready.load(.acquire));
     try std.testing.expectEqualSlices(f32, &.{ 22, 23 }, pre_with_logits.logits.?);
-    try std.testing.expect(pre_no_logits.ready);
+    try std.testing.expect(pre_no_logits.ready.load(.acquire));
     try std.testing.expect(pre_no_logits.logits == null);
 }
 
@@ -7959,16 +8801,16 @@ test "dispatchStepLogits records dupe failure per-work without aborting peers" {
 
     NativeGenerationPipeline.dispatchStepLogits(vocab_size, &items, &logits, 1);
 
-    try std.testing.expect(dec_a.ready);
+    try std.testing.expect(dec_a.ready.load(.acquire));
     try std.testing.expect(dec_a.failure == null);
     try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, dec_a.logits.?);
 
-    try std.testing.expect(dec_b.ready);
+    try std.testing.expect(dec_b.ready.load(.acquire));
     try std.testing.expect(dec_b.failure != null);
     try std.testing.expect(dec_b.logits == null);
 
     // The failing dupe must not stop dec_c's dispatch.
-    try std.testing.expect(dec_c.ready);
+    try std.testing.expect(dec_c.ready.load(.acquire));
     try std.testing.expect(dec_c.failure == null);
     try std.testing.expectEqualSlices(f32, &.{ 5, 6 }, dec_c.logits.?);
 }
@@ -8057,7 +8899,7 @@ test "runStepLoop drives stub driver to completion and reports per-iteration bud
     var io_impl = std.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
 
-    try runStepLoop(allocator, &coordinator, &lease, @ptrCast(&work_byte), .decode, io_impl.io(), &driver);
+    try runStepLoop(allocator, &coordinator, &lease, @ptrCast(&work_byte), .decode, io_impl.io(), null, &driver);
 
     try std.testing.expect(driver.ready);
     try std.testing.expectEqual(@as(usize, 1), driver.execute_calls);
@@ -8065,6 +8907,62 @@ test "runStepLoop drives stub driver to completion and reports per-iteration bud
     try std.testing.expectEqual(@as(usize, 1), driver.prestep_calls);
     try std.testing.expectEqual(@as(usize, 1), driver.budget_calls);
     try std.testing.expectEqual(@as(usize, 0), coordinator.pending_decode.items.len);
+}
+
+test "runStepLoop cancellation removes idle stack work without executing it" {
+    const allocator = std.testing.allocator;
+    var coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+
+    var lease = try coordinator.acquire(.{
+        .requested_units = 1,
+        .prompt_bytes = 64,
+        .max_tokens = 8,
+    });
+    defer coordinator.release(lease);
+
+    var work_byte: u8 = 1;
+    coordinator.beginDecode(&lease, 4);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work_byte), 5, 5, 0, .{});
+
+    const StubDriver = struct {
+        fn isReady(_: *const @This()) bool {
+            return false;
+        }
+
+        fn stepBudget(_: *@This()) runtime.scheduler.native_generate.StepBudget {
+            unreachable;
+        }
+
+        fn execute(
+            _: *@This(),
+            _: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
+            _: *runtime.scheduler.native_generate.Lease,
+            _: []const runtime.scheduler.native_generate.StepItem,
+        ) void {
+            unreachable;
+        }
+    };
+
+    var driver = StubDriver{};
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+
+    try std.testing.expectError(
+        error.Canceled,
+        runStepLoop(
+            allocator,
+            &coordinator,
+            &lease,
+            @ptrCast(&work_byte),
+            .decode,
+            io_impl.io(),
+            error.Canceled,
+            &driver,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), coordinator.pending_decode.items.len);
+    try std.testing.expectEqual(@as(?runtime.scheduler.native_generate.RequestId, null), coordinator.in_turn);
 }
 
 test "runStepLoop yields when no step is currently claimable" {
@@ -8111,7 +9009,7 @@ test "runStepLoop yields when no step is currently claimable" {
     var io_impl = std.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
 
-    try runStepLoop(allocator, &coordinator, &lease, @ptrCast(&ghost_work), .decode, io_impl.io(), &driver);
+    try runStepLoop(allocator, &coordinator, &lease, @ptrCast(&ghost_work), .decode, io_impl.io(), null, &driver);
 
     // The loop should have spun until isReady() returned true after ~3 calls
     // (the count begins at 1 inside isReady; ready_after=2 means: cycles 1,2
@@ -8175,7 +9073,7 @@ test "runStepLoop drains a multi-item step from a stub driver" {
     var io_impl = std.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
 
-    try runStepLoop(allocator, &coordinator, &lease_a, @ptrCast(&work_a), .decode, io_impl.io(), &driver);
+    try runStepLoop(allocator, &coordinator, &lease_a, @ptrCast(&work_a), .decode, io_impl.io(), null, &driver);
 
     try std.testing.expect(driver.ready);
     // Both pending decodes should have been packed into the single step.
@@ -8331,6 +9229,77 @@ test "rollbackPrefillReservations skips decode-phase entries within bounds" {
     NativeGenerationPipeline.rollbackPrefillReservations(&items, &reserved, 1);
 }
 
+test "scheduled prefill refreshes KV geometry after chunk reservation" {
+    const allocator = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f16,
+        .page_size_tokens = 16,
+        .num_kv_heads = 1,
+        .head_dim = 8,
+    });
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    defer state.deinit();
+
+    var first_chunk = MixedBatchDecodeItem{
+        .state = &state,
+        .total_sequence_len = 128,
+        .query_sequence_len = 128,
+        .kv_sequence_len = 0,
+        .kv_position_offset = 99,
+        .attention_mode = .paged_prefill,
+    };
+    const first_reserved = try NativeGenerationPipeline.reserveAndRefreshScheduledPrefill(&first_chunk, 128);
+    try std.testing.expectEqual(@as(usize, 128), first_reserved);
+    try std.testing.expectEqual(@as(usize, 128), state.total_tokens);
+    try std.testing.expectEqual(@as(usize, 128), first_chunk.kv_sequence_len);
+    try std.testing.expectEqual(@as(usize, 0), first_chunk.kv_position_offset);
+
+    var second_chunk = MixedBatchDecodeItem{
+        .state = &state,
+        .total_sequence_len = 256,
+        .query_sequence_len = 128,
+        // This is the geometry captured while the first chunk was current.
+        .kv_sequence_len = 128,
+        .kv_position_offset = 99,
+        .attention_mode = .paged_prefill,
+    };
+
+    const second_reserved = try NativeGenerationPipeline.reserveAndRefreshScheduledPrefill(&second_chunk, 256);
+
+    try std.testing.expectEqual(@as(usize, 128), second_reserved);
+    try std.testing.expectEqual(@as(usize, 256), state.total_tokens);
+    try std.testing.expectEqual(@as(usize, 256), second_chunk.kv_sequence_len);
+    try std.testing.expectEqual(@as(usize, 0), second_chunk.kv_position_offset);
+    try std.testing.expectEqual(@as(usize, 128), second_chunk.kv_sequence_len - second_chunk.query_sequence_len);
+
+    var work = NativeGenerationPipeline.PendingPrefillBatchWork{
+        .allocator = allocator,
+        .decode_state = &state,
+        .token_ids = &.{},
+        .seq_len = 256,
+        .query_seq_len = 128,
+        .wants_last_logits = false,
+    };
+    const claimed = [_]runtime.scheduler.native_generate.StepItem{
+        .{ .work_ptr = @ptrCast(&work), .phase = .prefill, .query_sequence_len = 128, .total_sequence_len = 256, .kv_sequence_len = 128, .kv_position_offset = 0 },
+    };
+    const reserved = [_]usize{second_reserved};
+
+    NativeGenerationPipeline.rollbackPrefillReservations(&claimed, &reserved, 1);
+
+    try std.testing.expectEqual(@as(usize, 128), state.total_tokens);
+    const rolled_back = state.kvView().?;
+    try std.testing.expectEqual(@as(usize, 128), rolled_back.token_count);
+    try std.testing.expectEqual(@as(usize, 8), rolled_back.logical_block_count);
+    try std.testing.expectEqual(@as(usize, 8), rolled_back.logical_blocks.?.len);
+    try std.testing.expectEqual(@as(u16, 16), rolled_back.tail_tokens);
+    try std.testing.expectEqual(@as(usize, 0), rolled_back.position_offset);
+}
+
 test "native decode state paged kv grows in pages" {
     const allocator = std.testing.allocator;
     var manager = runtime.kv.manager.KvManager.init(allocator);
@@ -8384,6 +9353,70 @@ test "native decode state batched append refreshes paged block table" {
     try std.testing.expectEqual(@as(usize, 1), view.logical_block_count);
     try std.testing.expectEqual(@as(usize, 1), view.logical_blocks.?.len);
     try std.testing.expectEqual(@as(usize, 4), view.token_count);
+}
+
+test "native decode state compacted batched append advances the full accepted count" {
+    const allocator = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f16,
+        .page_size_tokens = 4,
+        .num_kv_heads = 1,
+        .head_dim = 8,
+    });
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    defer state.deinit();
+
+    // Model a six-token prompt compacted to two retained KV entries without
+    // invoking the numerical compactor; this test targets view accounting.
+    try state.notePrefill(2);
+    state.total_tokens = 6;
+    state.kv_compacted = true;
+    (try manager.sequenceMut(state.sequence_id.?)).compacted = true;
+    state.setPagedKvView(2, 4);
+
+    try state.appendGeneratedTokens(3);
+    const view = state.kvView().?;
+    try std.testing.expectEqual(@as(usize, 5), view.token_count);
+    try std.testing.expectEqual(@as(usize, 4), view.position_offset);
+    try std.testing.expectEqual(@as(usize, 9), state.total_tokens);
+}
+
+test "native decode state compaction publishes the replacement block table" {
+    const allocator = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 4,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    });
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    defer state.deinit();
+
+    try state.notePrefill(6);
+    const old_sequence_id = state.sequence_id.?;
+    const old_blocks = state.kvView().?.logical_blocks.?;
+    var old_block_ids: [2]runtime.kv.block.KvBlockId = undefined;
+    @memcpy(&old_block_ids, old_blocks);
+
+    const layer_kv = [_]f32{ 1, 0, 0, 1, 1, 1, 2, 1, 1, 2, 2, 2 };
+    try manager.writeFullLayerKv(old_sequence_id, 0, 6, &layer_kv, &layer_kv);
+
+    try std.testing.expectEqual(@as(usize, 6), try state.compactKvCache(.{ .target_ratio = 1.0 }));
+    const view = state.kvView().?;
+    try std.testing.expect(state.sequence_id.? != old_sequence_id);
+    try std.testing.expectEqual(@as(usize, 6), view.token_count);
+    try std.testing.expectEqual(@as(usize, 0), view.position_offset);
+    try std.testing.expectEqual(@as(usize, 2), view.logical_blocks.?.len);
+    try std.testing.expect(!std.mem.eql(runtime.kv.block.KvBlockId, &old_block_ids, view.logical_blocks.?));
 }
 
 test "native decode state sliding-window view stays block-aligned" {
@@ -8446,6 +9479,39 @@ test "native decode state chunked prefill appends incrementally" {
     try state.appendPrefillChunk(2);
     try std.testing.expectEqual(@as(usize, 5), state.total_tokens);
     try std.testing.expectEqual(@as(usize, 5), manager.tokenCount(state.sequence_id.?).?);
+}
+
+test "direct paged prefill OOM retry rolls back its exact reservation" {
+    const allocator = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f16,
+        .page_size_tokens = 4,
+        .num_kv_heads = 1,
+        .head_dim = 8,
+    });
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    defer state.deinit();
+    var decode_runtime = BorrowedDecodeStateRuntime.init(&state);
+
+    try decode_runtime.appendPrefillChunk(3);
+    try decode_runtime.appendPrefillChunk(6);
+    var current_chunk_size: usize = 8;
+
+    try std.testing.expect(try retryDirectPrefillAfterMemoryBudgetExceeded(
+        &decode_runtime,
+        6,
+        8,
+        &current_chunk_size,
+        error.MemoryBudgetExceeded,
+    ));
+    try std.testing.expectEqual(@as(usize, 4), current_chunk_size);
+    try std.testing.expectEqual(@as(usize, 3), state.total_tokens);
+    try std.testing.expectEqual(@as(usize, 3), manager.tokenCount(state.sequence_id.?).?);
+    try std.testing.expectEqual(@as(usize, 1), state.kvView().?.logical_block_count);
 }
 
 test "native decode state maps to gpt decode context" {
@@ -8616,6 +9682,34 @@ test "native decode state rejects KV compaction for DeepSeek V4 compressed cache
     );
 }
 
+test "native decode state rejects KV compaction when device storage is attached" {
+    const allocator = std.testing.allocator;
+    const pool_config = runtime.kv.pool.KvPoolConfig{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 4,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 8,
+    };
+
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+    const pool_id = try manager.addPool(pool_config);
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, pool_config);
+    defer storage.deinit();
+
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    state.kv_storage = &storage;
+    defer state.deinit();
+    try state.notePrefill(4);
+
+    try std.testing.expectError(
+        error.KvStorageCompactionNotSupported,
+        state.compactKvCache(.{ .target_ratio = 0.5 }),
+    );
+}
+
 test "native generation pipeline rejects graph modes for DeepSeek V4 compressed cache" {
     const allocator = std.testing.allocator;
     const compressed_config = gpt_mod.Config{
@@ -8680,6 +9774,16 @@ test "cuda prefill first token path is narrowly gated" {
     try std.testing.expect(!shouldUsePrefillFirstTokenPath(.cuda, 1, false, false));
 }
 
+test "required cuda decode graph blocks only eligible eager fallbacks" {
+    try std.testing.expect(requiresCudaDecodeGraphBeforeEagerFallback(.cuda, true, true, 1, false, false));
+    try std.testing.expect(!requiresCudaDecodeGraphBeforeEagerFallback(.cuda, false, true, 1, false, false));
+    try std.testing.expect(!requiresCudaDecodeGraphBeforeEagerFallback(.metal, true, true, 1, false, false));
+    try std.testing.expect(!requiresCudaDecodeGraphBeforeEagerFallback(.cuda, true, false, 1, false, false));
+    try std.testing.expect(!requiresCudaDecodeGraphBeforeEagerFallback(.cuda, true, true, 2, false, false));
+    try std.testing.expect(!requiresCudaDecodeGraphBeforeEagerFallback(.cuda, true, true, 1, true, false));
+    try std.testing.expect(!requiresCudaDecodeGraphBeforeEagerFallback(.cuda, true, true, 1, false, true));
+}
+
 test "cuda prefill greedy token path is pure greedy only" {
     const greedy: GenerationConfig = .{ .max_tokens = 32, .temperature = 0 };
     try std.testing.expect(shouldUseCudaPrefillGreedyToken(.cuda, greedy, true, false, true));
@@ -8699,6 +9803,23 @@ test "cuda prefill greedy token path is pure greedy only" {
     var grammar = greedy;
     grammar.grammar = "json";
     try std.testing.expect(!shouldUseCudaPrefillGreedyToken(.cuda, grammar, true, false, true));
+}
+
+test "direct prepared prefill serializes multimodal CUDA and Metal execution" {
+    var mutex: std.atomic.Mutex = .unlocked;
+    try std.testing.expect(directPrefillExecutionMutex(true, false, false, &mutex) == &mutex);
+    try std.testing.expect(directPrefillExecutionMutex(false, true, false, &mutex) == &mutex);
+    try std.testing.expect(directPrefillExecutionMutex(false, false, true, &mutex) == &mutex);
+    try std.testing.expect(directPrefillExecutionMutex(false, false, false, &mutex) == null);
+    try std.testing.expect(directPrefillExecutionMutex(true, true, true, null) == null);
+}
+
+test "shared batch KV mutations use the model execution lock" {
+    var execution_mutex: std.atomic.Mutex = .unlocked;
+    var kv_mutex: std.atomic.Mutex = .unlocked;
+    try std.testing.expect(batchKvMutationMutex(&execution_mutex, &kv_mutex) == &execution_mutex);
+    try std.testing.expect(batchKvMutationMutex(&execution_mutex, null) == null);
+    try std.testing.expect(batchKvMutationMutex(null, &kv_mutex) == null);
 }
 
 test "cuda prefill first token coalesces only short eligible prompts" {
@@ -8962,6 +10083,86 @@ test "gemma4 mtp target hidden source parser defaults safely" {
     try std.testing.expectEqual(Gemma4MtpTargetHiddenSource.final, parseGemma4MtpTargetHiddenSource("unknown"));
 }
 
+test "workload regime tagging tolerates an unavailable optional profiler" {
+    const Probe = struct {
+        calls: usize = 0,
+        failure: anyerror,
+
+        fn set(ctx: *anyopaque, _: ops.WorkloadRegime) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return self.failure;
+        }
+    };
+
+    var vtable: ops.ComputeBackend.VTable = undefined;
+    vtable.workloadProfileSetRegime = Probe.set;
+
+    var unavailable = Probe{ .failure = error.WorkloadProfileUnavailable };
+    const unavailable_cb = ComputeBackend{ .ptr = &unavailable, .vtable = &vtable };
+    try setWorkloadProfileRegime(&unavailable_cb, .decode);
+    try std.testing.expectEqual(@as(usize, 1), unavailable.calls);
+
+    var broken = Probe{ .failure = error.BackendBroken };
+    const broken_cb = ComputeBackend{ .ptr = &broken, .vtable = &vtable };
+    try std.testing.expectError(error.BackendBroken, setWorkloadProfileRegime(&broken_cb, .decode));
+}
+
+test "prepared tail MTP capture applies the final RMS norm contract" {
+    const Probe = struct {
+        called: bool = false,
+        input: ?ops.CT = null,
+        slot: usize = 0,
+        hidden_size: usize = 0,
+        eps: f32 = 0.0,
+        output: ops.CT,
+
+        fn applyRmsNorm(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyRmsNormRequest) anyerror!?ops.CT {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.called = true;
+            self.input = request.input;
+            self.slot = request.slot;
+            self.hidden_size = request.hidden_size;
+            self.eps = request.eps;
+            return self.output;
+        }
+    };
+
+    var pre_norm_storage: u8 = 0;
+    var post_norm_storage: u8 = 0;
+    const pre_norm: ops.CT = @ptrCast(&pre_norm_storage);
+    const post_norm: ops.CT = @ptrCast(&post_norm_storage);
+    var probe = Probe{ .output = post_norm };
+    var vtable: ops.ComputeBackend.VTable = undefined;
+    vtable.decoderRuntimeApplyRmsNorm = Probe.applyRmsNorm;
+    const cb = ComputeBackend{ .ptr = @ptrCast(&probe), .vtable = &vtable };
+
+    try std.testing.expect((try NativeGenerationPipeline.capturePreparedTailPostNormHidden(
+        &cb,
+        false,
+        pre_norm,
+        7,
+        1536,
+        1e-6,
+    )) == null);
+    try std.testing.expect(!probe.called);
+
+    const captured = (try NativeGenerationPipeline.capturePreparedTailPostNormHidden(
+        &cb,
+        true,
+        pre_norm,
+        7,
+        1536,
+        1e-6,
+    )) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(post_norm, captured);
+    try std.testing.expect(probe.called);
+    try std.testing.expectEqual(pre_norm, probe.input.?);
+    try std.testing.expectEqual(@as(usize, 7), probe.slot);
+    try std.testing.expectEqual(@as(usize, 1536), probe.hidden_size);
+    try std.testing.expectEqual(@as(f32, 1e-6), probe.eps);
+}
+
 test "speculation calibration parser is explicit" {
     try std.testing.expectEqual(SpeculationCalibration.none, parseSpeculationCalibration("none").?);
     try std.testing.expectEqual(SpeculationCalibration.none, parseSpeculationCalibration("off").?);
@@ -8972,7 +10173,7 @@ test "speculation calibration parser is explicit" {
     try std.testing.expect(parseSpeculationCalibration("true") == null);
 }
 
-test "Gemma4 MTP bonus default is conservative on Metal" {
+test "Gemma4 MTP bonus default remains conservative on Metal" {
     try std.testing.expectEqual(false, gemma4MtpAcceptBonusDefault(.metal));
     try std.testing.expectEqual(true, gemma4MtpAcceptBonusDefault(.cuda));
     try std.testing.expectEqual(true, gemma4MtpAcceptBonusDefault(.native));
@@ -8982,10 +10183,137 @@ test "Gemma4 MTP active materialization is default" {
     try std.testing.expectEqual(true, gemma4MtpActiveMaterializeEnabled());
 }
 
+test "Gemma4 MTP deferred materialization defaults off" {
+    try std.testing.expectEqual(false, gemma4MtpDeferMaterializeEnabled(.metal));
+    try std.testing.expectEqual(false, gemma4MtpDeferMaterializeTargetActivationEnabled(.metal));
+    try std.testing.expectEqual(false, gemma4MtpDeferMaterializeEnabled(.cuda));
+    try std.testing.expectEqual(false, gemma4MtpDeferMaterializeTargetActivationEnabled(.cuda));
+}
+
+test "Gemma4 MTP Metal auto defaults off" {
+    try std.testing.expectEqual(false, gemma4MtpMetalAutoEnabled());
+    try std.testing.expectEqual(false, gemma4MtpMetalPrefillHiddenCaptureEnabled());
+    try std.testing.expectEqual(@as(usize, 2), gemma4MtpAutoMaxK());
+    try std.testing.expectEqual(@as(usize, 16), gemma4MtpAutoCostProbeRounds());
+    try std.testing.expectEqual(@as(usize, 2000), gemma4MtpAutoMinAcceptedPerRoundMilli());
+}
+
+test "gemma4 mtp pending token bookkeeping holds kv invariant across round shapes" {
+    const allocator = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 4,
+        .num_layers_packed = 1,
+        .num_kv_heads = 2,
+        .head_dim = 8,
+    });
+    var decode = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    defer decode.deinit();
+
+    var mtp_activation = NativeGenerationPipeline.Gemma4MtpActivationState{
+        .allocator = allocator,
+        .draft_cb = undefined, // no device tensors touched in this test
+    };
+    defer mtp_activation.deinit();
+
+    // Prefill + materialized first token: nothing pending, total == seq_len.
+    try decode.notePrefill(8);
+    var seq_len: usize = 8;
+    try std.testing.expectEqual(@as(usize, 0), mtp_activation.pendingCount());
+    try std.testing.expectEqual(seq_len, decode.total_tokens + mtp_activation.pendingCount());
+    try mtp_activation.validateKvTokensInSync(&decode, seq_len);
+    try std.testing.expectError(
+        error.InvalidSpeculativeState,
+        mtp_activation.validateKvTokensInSync(&decode, seq_len + 1),
+    );
+
+    // Round A: k=2, mismatch at draft index 1 -> correction committed, fold
+    // leaves it pending instead of materializing.
+    {
+        const draft_count: usize = 2;
+        const matched_drafts: usize = 1;
+        try decode.appendGeneratedTokens(draft_count + mtp_activation.pendingCount());
+        mtp_activation.notePendingKvWritten(); // verify forward succeeded
+        try decode.truncateTokens(draft_count - matched_drafts);
+        try mtp_activation.notePendingUnmaterialized();
+        try std.testing.expectError(error.InvalidSpeculativeState, mtp_activation.notePendingUnmaterialized());
+        seq_len += matched_drafts + 1;
+        try std.testing.expectEqual(@as(usize, 1), mtp_activation.pendingCount());
+        try std.testing.expectEqual(seq_len, decode.total_tokens + mtp_activation.pendingCount());
+        try mtp_activation.validateKvTokensInSync(&decode, seq_len);
+    }
+
+    // Round B: enters pending; k=2 pure accept. The verify appends k+1 slots
+    // (row 0 writes the pending token's KV) and rolls back only the tail.
+    {
+        const draft_count: usize = 2;
+        const entry_pending = mtp_activation.pendingCount();
+        try std.testing.expectEqual(@as(usize, 1), entry_pending);
+        try decode.appendGeneratedTokens(draft_count + entry_pending);
+        try std.testing.expectEqual(seq_len + draft_count, decode.total_tokens);
+        mtp_activation.notePendingKvWritten();
+        const matched_drafts: usize = 2;
+        try decode.truncateTokens(draft_count - matched_drafts);
+        seq_len += matched_drafts;
+        try std.testing.expectEqual(@as(usize, 0), mtp_activation.pendingCount());
+        try std.testing.expectEqual(seq_len, decode.total_tokens + mtp_activation.pendingCount());
+    }
+
+    // Round C: k=2 all matched + bonus -> bonus token pending.
+    {
+        const draft_count: usize = 2;
+        try decode.appendGeneratedTokens(draft_count + mtp_activation.pendingCount());
+        mtp_activation.notePendingKvWritten();
+        try mtp_activation.notePendingUnmaterialized();
+        seq_len += draft_count + 1;
+        try std.testing.expectEqual(seq_len, decode.total_tokens + mtp_activation.pendingCount());
+        try mtp_activation.validateKvTokensInSync(&decode, seq_len);
+    }
+
+    // Round D: verify forward fails while pending -> roll back the entire
+    // reservation (drafts + pending slot); the pending token stays pending.
+    {
+        const draft_count: usize = 2;
+        const entry_pending = mtp_activation.pendingCount();
+        try std.testing.expectEqual(@as(usize, 1), entry_pending);
+        try decode.appendGeneratedTokens(draft_count + entry_pending);
+        try decode.truncateTokens(draft_count + mtp_activation.pendingCount());
+        try std.testing.expectEqual(@as(usize, 1), mtp_activation.pendingCount());
+        try std.testing.expectEqual(seq_len, decode.total_tokens + mtp_activation.pendingCount());
+    }
+
+    // Fallback flush: one-token materialize restores total == seq_len before
+    // standardDecode runs.
+    try decode.appendGeneratedTokens(1);
+    mtp_activation.notePendingKvWritten();
+    try std.testing.expectEqual(@as(usize, 0), mtp_activation.pendingCount());
+    try std.testing.expectEqual(seq_len, decode.total_tokens + mtp_activation.pendingCount());
+
+    // Final round ends with a correction (pending) and generation stops:
+    // deinit with a pending token is a clean exit.
+    try decode.appendGeneratedTokens(1 + mtp_activation.pendingCount());
+    mtp_activation.notePendingKvWritten();
+    try decode.truncateTokens(1);
+    try mtp_activation.notePendingUnmaterialized();
+    seq_len += 1;
+    try std.testing.expectEqual(seq_len, decode.total_tokens + mtp_activation.pendingCount());
+    try mtp_activation.validateKvTokensInSync(&decode, seq_len);
+}
+
 test "Gemma4 MTP cached first choice requires multi draft" {
     try std.testing.expectEqual(false, gemma4MtpCachedFirstChoiceAllowed(0));
     try std.testing.expectEqual(false, gemma4MtpCachedFirstChoiceAllowed(1));
     try std.testing.expectEqual(true, gemma4MtpCachedFirstChoiceAllowed(2));
+}
+
+test "Gemma4 MTP deferred target activation maps cached verify rows" {
+    try std.testing.expectEqual(@as(?usize, null), gemma4MtpDeferredTargetActivationRow(true, 0, 1));
+    try std.testing.expectEqual(@as(?usize, 0), gemma4MtpDeferredTargetActivationRow(true, 0, 2));
+    try std.testing.expectEqual(@as(?usize, 2), gemma4MtpDeferredTargetActivationRow(true, 0, 4));
+    try std.testing.expectEqual(@as(?usize, 3), gemma4MtpDeferredTargetActivationRow(false, 1, 3));
 }
 
 test "Gemma4 Metal direct greedy is default" {

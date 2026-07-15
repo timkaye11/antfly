@@ -432,6 +432,7 @@ components:
           type: string
         coordinates:
           type: array
+          items: {}
       required:
         - type
         - coordinates

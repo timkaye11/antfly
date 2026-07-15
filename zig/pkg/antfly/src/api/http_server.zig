@@ -11984,6 +11984,7 @@ fn resourceTypeFromOpenApi(value: usermgr_openapi.ResourceType) usermgr.Resource
     return switch (value) {
         .table => .table,
         .user => .user,
+        .inference => .inference,
         .@"*" => .@"*",
     };
 }
@@ -12000,6 +12001,7 @@ fn resourceTypeToOpenApi(value: usermgr.ResourceType) usermgr_openapi.ResourceTy
     return switch (value) {
         .table => .table,
         .user => .user,
+        .inference => .inference,
         .@"*" => .@"*",
     };
 }

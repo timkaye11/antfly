@@ -292,6 +292,11 @@ fn getenvBool(comptime name: [*:0]const u8) bool {
         std.ascii.eqlIgnoreCase(slice, "on");
 }
 
+fn gemma4MtpVerifyTailFrameEnabled() bool {
+    return getenvBool("TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME") and
+        !getenvBool("TERMITE_METAL_DISABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME");
+}
+
 fn gatedFamilyCompareRequested() bool {
     return getenvBool("TERMITE_METAL_COMPARE_GATED_FAMILY") or gemmaPrefillCompareRequested();
 }
@@ -976,6 +981,10 @@ fn kHeadNormSlot(configured_layer_count: usize, layer: usize) usize {
     return gemma4_runtime.kHeadNormSlot(configured_layer_count, layer);
 }
 
+fn layerHasOwnKvWeights(gpt_config: gpt_mod.Config, layer: usize) bool {
+    return !gpt_config.layerSharesKv(layer);
+}
+
 fn layerRopeThetaForActiveDim(gpt_config: gpt_mod.Config, layer: usize) f32 {
     const rope_dim: usize = gpt_config.layerRopeActiveDim(layer);
     const base_theta = gpt_config.layerRopeTheta(layer);
@@ -1501,9 +1510,12 @@ pub const GreedyTokenAndFinalHidden = struct {
 pub const FinalHiddenRows = struct {
     final_hidden: ops.CT,
     rows: usize,
+    prepared_tail_choices: ?[]u32 = null,
+    choices_allocator: ?std.mem.Allocator = null,
 
     pub fn deinit(self: *FinalHiddenRows, cb: *const ops.ComputeBackend) void {
         cb.free(self.final_hidden);
+        if (self.prepared_tail_choices) |choices| self.choices_allocator.?.free(choices);
         self.* = undefined;
     }
 };
@@ -6056,7 +6068,7 @@ pub fn forwardPrefillLastPreparedTail(
     };
 }
 
-pub fn forwardFinalHiddenRows(
+fn forwardFinalHiddenRowsInternal(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
     gpt_config: gpt_mod.Config,
@@ -6064,6 +6076,7 @@ pub fn forwardFinalHiddenRows(
     input_ids: []const i64,
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
+    prepared_tail_suppress_token_ids: ?[]const i32,
 ) !?FinalHiddenRows {
     if (!supportsConfig(gpt_config)) return null;
     if (input_ids.len == 0 or decode_context.query_sequence_len != input_ids.len) return null;
@@ -6142,10 +6155,162 @@ pub fn forwardFinalHiddenRows(
         return null;
     };
     if (final_hidden != hidden_result.hidden) cb.free(hidden_result.hidden);
+    errdefer cb.free(final_hidden);
+    var prepared_tail_choices: ?[]u32 = null;
+    errdefer if (prepared_tail_choices) |choices| allocator.free(choices);
+    if (prepared_tail_suppress_token_ids) |suppress_token_ids| {
+        if (gemma4MtpVerifyTailFrameEnabled()) {
+            prepared_tail_choices = try forwardPreparedLmHeadArgmaxRows(
+                cb,
+                gpt_config,
+                configured_layer_count,
+                final_hidden,
+                hidden_result.total_rows,
+                suppress_token_ids,
+                allocator,
+            );
+            // The on-encoder argmax submits and waits the whole frame so the
+            // shared token buffer can be read. Keep the local frame state in
+            // sync and avoid submitting a second, empty frame on return.
+            if (!cb.decoderRuntimeHasActiveFrame()) decoder_frame_active = false;
+        }
+    }
     return .{
         .final_hidden = final_hidden,
         .rows = hidden_result.total_rows,
+        .prepared_tail_choices = prepared_tail_choices,
+        .choices_allocator = if (prepared_tail_choices != null) allocator else null,
     };
+}
+
+pub fn forwardFinalHiddenRows(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    input_ids: []const i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+) !?FinalHiddenRows {
+    return forwardFinalHiddenRowsInternal(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        input_ids,
+        seq_len,
+        decode_context,
+        null,
+    );
+}
+
+pub fn forwardFinalHiddenRowsPreparedArgmax(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    input_ids: []const i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+    suppress_token_ids: []const i32,
+) !?FinalHiddenRows {
+    return forwardFinalHiddenRowsInternal(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        input_ids,
+        seq_len,
+        decode_context,
+        suppress_token_ids,
+    );
+}
+
+/// Multi-row lm_head argmax over the prepared final-lm-head slot. The MTP
+/// verify path lands here with 2-3 rows of final (normed) hidden state; the
+/// prepared slot serves the same quantized weight the planned decode frames
+/// use for their tail, unlike the dense lm_head fallback in the generic
+/// linearNoBias path.
+pub fn forwardPreparedLmHeadArgmaxRows(
+    cb: *const ops.ComputeBackend,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    final_hidden: ops.CT,
+    rows: usize,
+    suppress_token_ids: []const i32,
+    allocator: std.mem.Allocator,
+) !?[]u32 {
+    if (!supportsConfig(gpt_config)) return null;
+    if (rows == 0 or rows > 16) return null;
+    const hidden_size: usize = @intCast(gpt_config.hidden_size);
+    const vocab_size: usize = @intCast(gpt_config.vocab_size);
+    const lm_head_slot = finalLmHeadSlot(configured_layer_count);
+    const trace = getenvBool("ANTFLY_GEMMA4_MTP_VERIFY_TRACE");
+    const trace_started_at = if (trace) monotonicNowNs() else 0;
+    const choices = try allocator.alloc(u32, rows);
+    errdefer allocator.free(choices);
+    // Preferred at rows 2-8: ONE multi-row apply — the q6_k head rides the
+    // r2-reduce kernel (pairs of rows share a single pass over the ~550MB
+    // weight stream) instead of re-reading the head once per row. Falls back
+    // to the per-row loop below on any unsupported condition.
+    if (rows >= 2) multi_row: {
+        const logits = (try cb.decoderRuntimeApplyLinear(&.{
+            .slot = lm_head_slot,
+            .input = final_hidden,
+            .in_dim = hidden_size,
+            .out_dim = vocab_size,
+        })) orelse break :multi_row;
+        defer cb.free(logits);
+        const row_choices = (try cb.decoderRuntimeArgmaxRowsSuppress(logits, 0, rows, vocab_size, suppress_token_ids, allocator)) orelse
+            (try cb.argmaxRowsSuppress(logits, 0, rows, vocab_size, suppress_token_ids, allocator)) orelse break :multi_row;
+        defer allocator.free(row_choices);
+        if (row_choices.len < rows) break :multi_row;
+        @memcpy(choices, row_choices[0..rows]);
+        if (trace) {
+            std.debug.print(
+                "prepared-lmhead-argmax-trace: rows={d} suppress={d} total_us={d} multi_row=1\n",
+                .{ rows, suppress_token_ids.len, (monotonicNowNs() - trace_started_at) / std.time.ns_per_us },
+            );
+        }
+        return choices;
+    }
+    // Per-row fallback: the planned decode frames' tail route (bandwidth-bound
+    // mmv, but re-reads the head once per row).
+    for (0..rows) |row| {
+        const row_input = try cb.sliceRows2D(allocator, final_hidden, row, 1, hidden_size);
+        defer cb.free(row_input);
+        const row_logits = (try cb.decoderRuntimeApplyLinear(&.{
+            .slot = lm_head_slot,
+            .input = row_input,
+            .in_dim = hidden_size,
+            .out_dim = vocab_size,
+        })) orelse {
+            allocator.free(choices);
+            return null;
+        };
+        defer cb.free(row_logits);
+        const row_choices = (try cb.argmaxRowsSuppress(row_logits, 0, 1, vocab_size, suppress_token_ids, allocator)) orelse {
+            allocator.free(choices);
+            return null;
+        };
+        defer allocator.free(row_choices);
+        if (row_choices.len == 0) {
+            allocator.free(choices);
+            return null;
+        }
+        choices[row] = row_choices[0];
+    }
+    if (trace) {
+        std.debug.print(
+            "prepared-lmhead-argmax-trace: rows={d} suppress={d} total_us={d}\n",
+            .{
+                rows,
+                suppress_token_ids.len,
+                (monotonicNowNs() - trace_started_at) / std.time.ns_per_us,
+            },
+        );
+    }
+    return choices;
 }
 
 pub fn forwardPrefillLastLogits(
@@ -6405,6 +6570,10 @@ pub fn forwardSampledToken(
     return token;
 }
 
+test "Gemma4 MTP verify-tail frame defaults off" {
+    try std.testing.expect(!gemma4MtpVerifyTailFrameEnabled());
+}
+
 test "raw whole-token gated supports multimodal decode-only gemma config" {
     const base: gpt_mod.Config = .{
         .family = .gemma,
@@ -6468,4 +6637,24 @@ test "direct gemma runtime allows gemma4-style global head configs without share
     shared_kv.num_kv_shared_layers = 2;
     try std.testing.expect(supportsDirectGemmaRuntime(shared_kv, shared_kv.num_hidden_layers, &decode_context));
     try std.testing.expect(supportsDirectGemmaRuntime(shared_kv, shared_kv.num_hidden_layers, &prefill_context));
+}
+
+test "gemma4 shared kv layers do not own decode runtime kv weights" {
+    const config: gpt_mod.Config = .{
+        .family = .gemma,
+        .num_hidden_layers = 6,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .hidden_size = 1536,
+        .attention_head_dim = 256,
+        .intermediate_size = 6144,
+        .sliding_window = 512,
+        .sliding_window_pattern = 5,
+        .num_kv_shared_layers = 2,
+        .vocab_size = 1024,
+    };
+
+    try std.testing.expect(layerHasOwnKvWeights(config, 3));
+    try std.testing.expect(!layerHasOwnKvWeights(config, 4));
+    try std.testing.expect(!layerHasOwnKvWeights(config, 5));
 }

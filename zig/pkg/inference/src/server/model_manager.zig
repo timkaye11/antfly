@@ -50,6 +50,7 @@ const generation = @import("../pipelines/generation.zig");
 const ChatTemplate = generation.ChatTemplate;
 const session_factory = @import("../architectures/session_factory.zig");
 const graph_mod = @import("../graph/root.zig");
+const kernel_jit_profile_output = @import("../kernel_jit_profile_output.zig");
 const runtime = @import("../runtime/root.zig");
 
 fn shouldPreferNativeSession(man: manifest_mod.ModelManifest) bool {
@@ -588,6 +589,21 @@ pub fn loadSentencePieceTokenizerFromDirOrGguf(
     return sp;
 }
 
+fn adoptAndConfigureSentencePieceTokenizer(
+    owned: *?*sentencepiece.Processor,
+    sp: *sentencepiece.Processor,
+    man: manifest_mod.ModelManifest,
+    model_dir: []const u8,
+    allocator: std.mem.Allocator,
+) !void {
+    std.debug.assert(owned.* == null);
+    owned.* = sp;
+    if (shouldEnableGemmaSentencePieceCompat(man, model_dir, allocator)) {
+        sp.setPreserveInlineSpecialsAfterLiteralBos(true);
+    }
+    try loadSentencePieceAddedTokens(model_dir, allocator, sp);
+}
+
 fn loadSentencePieceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []const u8) !sentencepiece.Processor {
     var region = try c_file.MmapRegion.init(allocator, gguf_path);
     defer region.deinit();
@@ -713,12 +729,109 @@ pub fn isManifestPotentiallyLoadableInCurrentBuild(man: manifest_mod.ModelManife
     return false;
 }
 
+const DeclaredOptionalSessionKind = enum {
+    vision,
+    audio,
+    text_projection,
+    visual_projection,
+    audio_projection,
+};
+
+const DeclaredOptionalSession = struct {
+    kind: DeclaredOptionalSessionKind,
+    path: ?[]const u8,
+};
+
+const declared_optional_session_count = @typeInfo(DeclaredOptionalSessionKind).@"enum".fields.len;
+
+fn declaredOptionalSessions(manifest: *const manifest_mod.ModelManifest) [declared_optional_session_count]DeclaredOptionalSession {
+    return .{
+        .{ .kind = .vision, .path = manifest.visual_model_path },
+        .{ .kind = .audio, .path = manifest.audio_model_path },
+        .{ .kind = .text_projection, .path = manifest.text_projection_path },
+        .{ .kind = .visual_projection, .path = manifest.visual_projection_path },
+        .{ .kind = .audio_projection, .path = manifest.audio_projection_path },
+    };
+}
+
+fn declaredOptionalSessionsComplete(
+    manifest: *const manifest_mod.ModelManifest,
+    loaded: [declared_optional_session_count]bool,
+) bool {
+    for (declaredOptionalSessions(manifest), loaded) |declared, is_loaded| {
+        if (declared.path != null and !is_loaded) return false;
+    }
+    return true;
+}
+
+fn bindOptionalSessionProfile(
+    session_manager: *backends.SessionManager,
+    kind: DeclaredOptionalSessionKind,
+    profile_bundle: ?graph_mod.kernel_jit.QualifiedProfileBundle,
+) !void {
+    if (profile_bundle) |bundle| {
+        const component_path = switch (kind) {
+            .vision => bundle.vision,
+            .audio => bundle.audio,
+            .text_projection => bundle.text_projection,
+            .visual_projection => bundle.visual_projection,
+            .audio_projection => bundle.audio_projection,
+        };
+        if (component_path) |path| {
+            session_manager.kernel_jit.qualified_profile_path = path;
+        } else {
+            if (session_manager.kernel_jit.mode.failClosed()) {
+                return error.MissingKernelJitProfileBundleComponent;
+            }
+            std.log.warn(
+                "kernel JIT profile bundle has no {s} member; using bundled kernels",
+                .{@tagName(kind)},
+            );
+            session_manager.kernel_jit.qualified_profile_path = null;
+            session_manager.kernel_jit.mode = .off;
+        }
+    } else if (session_manager.kernel_jit.qualified_profile_path != null) {
+        if (session_manager.kernel_jit.mode.failClosed()) {
+            return error.KernelJitQualifiedProfileOptionalSessionUnsupported;
+        }
+        // One exact profile is bound to one model fingerprint. Never apply
+        // the primary model's profile to an optional submodel.
+        session_manager.kernel_jit.qualified_profile_path = null;
+        session_manager.kernel_jit.mode = .off;
+    }
+}
+
+fn ownSelectedFirstBackendPreference(
+    allocator: std.mem.Allocator,
+    preferred: []const backends.BackendType,
+    selected: backends.BackendType,
+) ![]backends.BackendType {
+    var count: usize = 1;
+    for (preferred) |backend| {
+        if (backend != selected) count += 1;
+    }
+    const result = try allocator.alloc(backends.BackendType, count);
+    result[0] = selected;
+    var index: usize = 1;
+    for (preferred) |backend| {
+        if (backend == selected) continue;
+        result[index] = backend;
+        index += 1;
+    }
+    return result;
+}
+
 pub const LoadedModel = struct {
     manifest: manifest_mod.ModelManifest,
     hf_tok: ?*hf_tokenizer.HfTokenizer,
     sp_tok: ?*sentencepiece.Processor,
     session: backends.Session,
     session_manager: *backends.SessionManager,
+    /// Backend order captured when the primary session was loaded, with the
+    /// selected backend first. Optional vision/audio/projection sessions use
+    /// this owned order while inheriting the manager's current JIT load
+    /// context, so an explicit startup preload backend cannot silently drift.
+    optional_session_preferred_backends: []backends.BackendType,
     model_dir: []const u8,
     allocator: std.mem.Allocator,
     chat_tmpl: ?*ChatTemplate = null,
@@ -727,7 +840,7 @@ pub const LoadedModel = struct {
     prompt_prefix_cache: runtime.kv.prompt_cache.PromptPrefixCache,
     native_generate_coordinator: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = null,
     native_generation_graph_cache: graph_mod.cache.GraphCache,
-    // ponytail: per-model native generation lock; replace with Metal-safe batching if throughput matters.
+    // ponytail: model-wide safety lock; replace with per-request backend state only when continuous batching is proven safe.
     native_generate_lock: std.atomic.Mutex = .unlocked,
     // Multimodal sessions (CLIP/CLAP/CLIPCLAP)
     embedding_session_lock: std.atomic.Mutex = .unlocked,
@@ -737,6 +850,7 @@ pub const LoadedModel = struct {
     text_projection: ?backends.Session = null,
     visual_projection: ?backends.Session = null,
     audio_projection: ?backends.Session = null,
+    kernel_jit_profile_bundle: ?kernel_jit_profile_output.LoadedProfileBundle = null,
     resident_projection_stats: embedding_mod.AtomicResidentProjectionStats = .{},
     cleanup_head: ?*cleanup_model_mod.CleanupHead = null,
     cleanup_head_loaded: bool = false,
@@ -756,12 +870,38 @@ pub const LoadedModel = struct {
         if (self.audio_projection) |session| session_factory.attachIo(session, io);
     }
 
-    pub fn lockNativeGeneration(self: *LoadedModel) void {
-        spinLock(&self.native_generate_lock);
+    /// Snapshot all model-component exact-JIT counters while optional-session
+    /// publication is stable. Metrics must not read those lazy pointers
+    /// directly while an embedding request can materialize them.
+    pub fn metalExactJitDispatchStats(self: *LoadedModel) session_factory.MetalExactJitDispatchStats {
+        spinLock(&self.embedding_session_lock);
+        defer self.embedding_session_lock.unlock();
+        var total = session_factory.MetalExactJitDispatchStats{};
+        const sessions = [_]?backends.Session{
+            self.session,
+            self.vision_session,
+            self.audio_session,
+            self.text_projection,
+            self.visual_projection,
+            self.audio_projection,
+        };
+        for (sessions) |maybe_session| {
+            const session = maybe_session orelse continue;
+            if (session_factory.getMetalExactJitDispatchStats(session)) |stats| total.add(stats);
+        }
+        return total;
+    }
+
+    pub fn lockNativeGeneration(self: *LoadedModel, io: std.Io) void {
+        platform.sync.lockYieldingIo(&self.native_generate_lock, io);
     }
 
     pub fn unlockNativeGeneration(self: *LoadedModel) void {
         self.native_generate_lock.unlock();
+    }
+
+    pub fn nativeGenerationMutex(self: *LoadedModel) *std.atomic.Mutex {
+        return &self.native_generate_lock;
     }
 
     pub fn wholeModelExecutor(self: *LoadedModel, allocator: std.mem.Allocator, kv_dtype: ?runtime.kv.pool.KvDType) !?graph_mod.model_runtime.ModelExecutor {
@@ -785,17 +925,70 @@ pub const LoadedModel = struct {
         );
     }
 
-    fn ensureOptionalSession(self: *LoadedModel, slot: *?backends.Session, path: ?[]const u8) !void {
+    fn ensureOptionalSession(
+        self: *LoadedModel,
+        kind: DeclaredOptionalSessionKind,
+        slot: *?backends.Session,
+        path: ?[]const u8,
+    ) !void {
         if (slot.* != null) return;
         const session_path = path orelse return;
         const shared_ctx = backends.imported_onnx_session.sharedBackendContext(self.session);
-        slot.* = try self.session_manager.loadModelWithImportedOnnxContext(session_path, shared_ctx);
+        var session_manager = self.session_manager.*.withPreferredBackends(
+            self.allocator,
+            self.optional_session_preferred_backends,
+        );
+        const profile_bundle = if (self.kernel_jit_profile_bundle) |*bundle| blk: {
+            const mapped = bundle.kernelJitBundleForMode(session_manager.kernel_jit.mode);
+            session_manager.kernel_jit.qualified_profile_path = mapped.primary;
+            break :blk mapped;
+        } else null;
+        try bindOptionalSessionProfile(&session_manager, kind, profile_bundle);
+        slot.* = try session_manager.loadModelWithImportedOnnxContext(session_path, shared_ctx);
+    }
+
+    /// Load every optional model/projection declared by the manifest without
+    /// running media inference. Startup preload calls this while the node owns
+    /// the exclusive JIT qualification phase, preventing a first media request
+    /// from triggering dynamic compiler work after publication.
+    pub fn materializeDeclaredOptionalSessions(self: *LoadedModel) !void {
+        spinLock(&self.embedding_session_lock);
+        defer self.embedding_session_lock.unlock();
+
+        for (declaredOptionalSessions(&self.manifest)) |declared| {
+            switch (declared.kind) {
+                .vision => try self.ensureOptionalSession(.vision, &self.vision_session, declared.path),
+                .audio => try self.ensureOptionalSession(.audio, &self.audio_session, declared.path),
+                .text_projection => try self.ensureOptionalSession(.text_projection, &self.text_projection, declared.path),
+                .visual_projection => try self.ensureOptionalSession(.visual_projection, &self.visual_projection, declared.path),
+                .audio_projection => try self.ensureOptionalSession(.audio_projection, &self.audio_projection, declared.path),
+            }
+        }
+        if (!self.declaredOptionalSessionsMaterializedUnlocked()) {
+            return error.OptionalSessionMaterializationIncomplete;
+        }
+    }
+
+    pub fn declaredOptionalSessionsMaterialized(self: *LoadedModel) bool {
+        spinLock(&self.embedding_session_lock);
+        defer self.embedding_session_lock.unlock();
+        return self.declaredOptionalSessionsMaterializedUnlocked();
+    }
+
+    fn declaredOptionalSessionsMaterializedUnlocked(self: *const LoadedModel) bool {
+        return declaredOptionalSessionsComplete(&self.manifest, .{
+            self.vision_session != null,
+            self.audio_session != null,
+            self.text_projection != null,
+            self.visual_projection != null,
+            self.audio_projection != null,
+        });
     }
 
     pub fn ensureVisionSession(self: *LoadedModel) !void {
         spinLock(&self.embedding_session_lock);
         defer self.embedding_session_lock.unlock();
-        try self.ensureOptionalSession(&self.vision_session, self.manifest.visual_model_path);
+        try self.ensureOptionalSession(.vision, &self.vision_session, self.manifest.visual_model_path);
     }
 
     pub fn ensureEmbeddingAssets(self: *LoadedModel, include_text: bool, include_image: bool, include_audio: bool) !void {
@@ -803,15 +996,15 @@ pub const LoadedModel = struct {
         defer self.embedding_session_lock.unlock();
 
         if (include_text) {
-            try self.ensureOptionalSession(&self.text_projection, self.manifest.text_projection_path);
+            try self.ensureOptionalSession(.text_projection, &self.text_projection, self.manifest.text_projection_path);
         }
         if (include_image) {
-            try self.ensureOptionalSession(&self.vision_session, self.manifest.visual_model_path);
-            try self.ensureOptionalSession(&self.visual_projection, self.manifest.visual_projection_path);
+            try self.ensureOptionalSession(.vision, &self.vision_session, self.manifest.visual_model_path);
+            try self.ensureOptionalSession(.visual_projection, &self.visual_projection, self.manifest.visual_projection_path);
         }
         if (include_audio) {
-            try self.ensureOptionalSession(&self.audio_session, self.manifest.audio_model_path);
-            try self.ensureOptionalSession(&self.audio_projection, self.manifest.audio_projection_path);
+            try self.ensureOptionalSession(.audio, &self.audio_session, self.manifest.audio_model_path);
+            try self.ensureOptionalSession(.audio_projection, &self.audio_projection, self.manifest.audio_projection_path);
         }
     }
 
@@ -974,11 +1167,13 @@ pub const LoadedModel = struct {
         if (self.text_projection) |tp| tp.close();
         if (self.visual_projection) |vp| vp.close();
         if (self.audio_projection) |ap| ap.close();
+        if (self.kernel_jit_profile_bundle) |*bundle| bundle.deinit();
         if (self.hf_tok) |ht| ht.deinitSelf();
         if (self.sp_tok) |sp| {
             sp.deinit();
             self.allocator.destroy(sp);
         }
+        self.allocator.free(self.optional_session_preferred_backends);
         if (self.chat_tmpl) |ct| {
             var ct_mut = @constCast(ct);
             ct_mut.deinit();
@@ -1017,21 +1212,70 @@ fn usesClipImagePreprocessProfile(manifest: *const manifest_mod.ModelManifest) b
 }
 
 pub const ModelManager = struct {
+    const LoadedModelMap = std.StringHashMapUnmanaged(*LoadedModel);
+
+    pub const LoadedModelsGuard = struct {
+        manager: *ModelManager,
+
+        pub fn models(self: *const @This()) *const LoadedModelMap {
+            return &self.manager.loaded;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.manager.state_mutex.unlock();
+            self.* = undefined;
+        }
+    };
+
     allocator: std.mem.Allocator,
     session_manager: backends.SessionManager,
-    loaded: std.StringHashMapUnmanaged(*LoadedModel),
-    loaded_aliases: std.StringHashMapUnmanaged(*LoadedModel),
+    loaded: LoadedModelMap,
+    loaded_aliases: LoadedModelMap,
+    /// Serializes every loaded-map read, mutation, and iteration, plus prompt
+    /// cache ownership. Cold loading happens outside this lock so operational
+    /// endpoints can still inspect the registry while a model starts.
+    state_mutex: std.atomic.Mutex = .unlocked,
+    /// Suppresses duplicate cold loads while keeping the state lock brief.
+    // ponytail: serialize cold loads until measured startup contention justifies
+    // a per-model singleflight table and its extra ownership states.
+    load_mutex: std.atomic.Mutex = .unlocked,
+    prompt_cache_owner: ?*LoadedModel = null,
 
     pub fn init(allocator: std.mem.Allocator, session_manager: backends.SessionManager) ModelManager {
         return .{
             .allocator = allocator,
             .session_manager = session_manager,
-            .loaded = std.StringHashMapUnmanaged(*LoadedModel){},
-            .loaded_aliases = std.StringHashMapUnmanaged(*LoadedModel){},
+            .loaded = LoadedModelMap{},
+            .loaded_aliases = LoadedModelMap{},
         };
     }
 
+    fn lockMutex(mutex: *std.atomic.Mutex, io: ?std.Io) void {
+        if (io) |active_io| {
+            platform.sync.lockYieldingIo(mutex, active_io);
+        } else {
+            platform.sync.lockYielding(mutex);
+        }
+    }
+
+    fn lockState(self: *ModelManager, io: ?std.Io) void {
+        lockMutex(&self.state_mutex, io);
+    }
+
+    fn lockLoad(self: *ModelManager, io: ?std.Io) void {
+        lockMutex(&self.load_mutex, io);
+    }
+
+    pub fn lockLoadedModels(self: *ModelManager, io: std.Io) LoadedModelsGuard {
+        self.lockState(io);
+        return .{ .manager = self };
+    }
+
     pub fn deinit(self: *ModelManager) void {
+        self.lockLoad(null);
+        defer self.load_mutex.unlock();
+        self.lockState(null);
+        defer self.state_mutex.unlock();
         var it = self.loaded.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit();
@@ -1044,54 +1288,50 @@ pub const ModelManager = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.loaded_aliases.deinit(self.allocator);
+        self.prompt_cache_owner = null;
     }
 
     pub fn attachIo(self: *ModelManager, io: std.Io) void {
+        self.lockLoad(io);
+        defer self.load_mutex.unlock();
+        self.lockState(io);
+        defer self.state_mutex.unlock();
         self.session_manager.io = io;
         var it = self.loaded.iterator();
         while (it.next()) |entry| entry.value_ptr.*.attachIo(io);
     }
 
-    /// Counts loaded models participating in the prompt-cache accounting target.
-    /// Used to split that target evenly across active model caches.
-    /// `include` is always counted even if its cache has not activated yet.
-    fn activePromptCacheCount(self: *ModelManager, include: *LoadedModel) usize {
-        var count: usize = 0;
-        var it = self.loaded.iterator();
-        while (it.next()) |entry| {
-            const model = entry.value_ptr.*;
-            if (model == include) continue;
-            if (model.prompt_prefix_cache.isActive()) count += 1;
+    /// Claim the node-wide prompt cache for one process-stable loaded model.
+    /// Different models fail closed instead of mutating an active model's KV
+    /// manager from outside that model's generation lock.
+    pub fn tryActivatePromptCache(
+        self: *ModelManager,
+        io: std.Io,
+        model: *LoadedModel,
+        node_config: runtime.kv.prompt_cache.Config,
+    ) bool {
+        self.lockState(io);
+        defer self.state_mutex.unlock();
+        if (!node_config.enabled) return false;
+        if (self.prompt_cache_owner) |owner| {
+            if (owner != model) return false;
+        } else {
+            self.prompt_cache_owner = model;
         }
-        return count + 1;
+        model.prompt_prefix_cache.configure(node_config);
+        return true;
     }
 
-    /// Apply one node-wide prompt-cache target to the cache being activated and
-    /// every cache that is already active. configure() synchronously evicts
-    /// entries against their estimated logical cache bytes.
-    pub fn rebalancePromptCaches(
-        self: *ModelManager,
-        include: *LoadedModel,
-        node_config: runtime.kv.prompt_cache.Config,
-    ) void {
-        var per_cache = node_config;
-        per_cache.max_bytes /= self.activePromptCacheCount(include);
-        include.prompt_prefix_cache.configure(per_cache);
-
-        var it = self.loaded.iterator();
-        while (it.next()) |entry| {
-            const model = entry.value_ptr.*;
-            if (model != include and model.prompt_prefix_cache.isActive()) {
-                model.prompt_prefix_cache.configure(per_cache);
-            }
-        }
+    pub fn detachPromptCacheResourceUsageObserver(self: *ModelManager) void {
+        self.lockState(null);
+        defer self.state_mutex.unlock();
+        var it = self.loaded.valueIterator();
+        while (it.next()) |model| model.*.prompt_prefix_cache.detachResourceUsageObserver();
     }
 
     /// Load a model from a directory path. Returns a cached model if already loaded.
     pub fn loadFromDir(self: *ModelManager, model_dir: []const u8) !*LoadedModel {
-        if (self.loaded.get(model_dir)) |model| return model;
-        if (self.loaded_aliases.get(model_dir)) |model| return model;
-        return self.loadFromDirWithPreferredBackends(model_dir, self.session_manager.preferred_backends, true);
+        return self.loadFromDirImpl(model_dir, self.session_manager.preferred_backends, true, true);
     }
 
     pub fn loadFromDirWithPreferredBackends(
@@ -1100,6 +1340,47 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
     ) !*LoadedModel {
+        return self.loadFromDirImpl(model_dir, preferred_backends, cache_default_alias, false);
+    }
+
+    fn loadFromDirImpl(
+        self: *ModelManager,
+        model_dir: []const u8,
+        preferred_backends: []const backends.BackendType,
+        cache_default_alias: bool,
+        use_default_alias: bool,
+    ) !*LoadedModel {
+        if (try self.findLoadedModel(model_dir, preferred_backends, use_default_alias)) |model| return model;
+
+        self.lockLoad(null);
+        defer self.load_mutex.unlock();
+
+        // A different caller may have completed the same load while this one
+        // waited for duplicate-load suppression.
+        if (try self.findLoadedModel(model_dir, preferred_backends, use_default_alias)) |model| return model;
+
+        var session_manager = self.session_manager.withPreferredBackends(self.allocator, preferred_backends);
+        const model = try self.loadFromDirUncached(model_dir, &session_manager);
+        errdefer destroyLoadedModel(self, model);
+
+        const published = try self.publishLoadedModel(model_dir, model, cache_default_alias);
+        if (published != model) destroyLoadedModel(self, model);
+        return published;
+    }
+
+    fn findLoadedModel(
+        self: *ModelManager,
+        model_dir: []const u8,
+        preferred_backends: []const backends.BackendType,
+        use_default_alias: bool,
+    ) !?*LoadedModel {
+        self.lockState(null);
+        defer self.state_mutex.unlock();
+
+        if (use_default_alias) {
+            if (self.loaded.get(model_dir)) |model| return model;
+            if (self.loaded_aliases.get(model_dir)) |model| return model;
+        }
         for (preferred_backends) |backend| {
             if (!backend.supportsDirectSessionLoad()) continue;
             const variant_key = try backendVariantCacheKey(self.allocator, model_dir, backend);
@@ -1107,18 +1388,14 @@ pub const ModelManager = struct {
             if (self.loaded.get(variant_key)) |model| return model;
             if (self.loaded_aliases.get(variant_key)) |model| return model;
         }
-
-        var session_manager = sessionManagerForPreferredBackends(self.allocator, preferred_backends, &self.session_manager);
-        return self.loadFromDirUncached(model_dir, &session_manager, cache_default_alias);
+        return null;
     }
 
     fn loadFromDirUncached(
         self: *ModelManager,
         model_dir: []const u8,
         sm: *backends.SessionManager,
-        cache_default_alias: bool,
     ) !*LoadedModel {
-
         // Load manifest
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
         errdefer man.deinit();
@@ -1126,6 +1403,25 @@ pub const ModelManager = struct {
         if (man.hasIncompleteColqwenBundle()) return error.IncompleteColqwenBundle;
         if (man.hasIncompleteClipclapGgufBundle()) return error.IncompleteClipclapGgufBundle;
         if (man.hasIncompleteFlorence2GgufBundle()) return error.IncompleteFlorence2Bundle;
+
+        var qualified_profile_bundle: ?kernel_jit_profile_output.LoadedProfileBundle =
+            if (sm.kernel_jit.qualified_profile_path) |path|
+                try kernel_jit_profile_output.loadQualifiedProfileBundleIfPresent(
+                    self.allocator,
+                    sm.io orelse std.Options.debug_io,
+                    path,
+                )
+            else
+                null;
+        errdefer if (qualified_profile_bundle) |*bundle| bundle.deinit();
+        if (qualified_profile_bundle) |*bundle| {
+            sm.kernel_jit.qualified_profile_path = bundle.kernelJitBundle().primary;
+            if (!sm.kernel_jit.mode.failClosed() and !bundle.hasQualifiedKernels(.primary)) {
+                std.log.warn("kernel JIT profile bundle primary has no qualified winner; using bundled kernels", .{});
+                sm.kernel_jit.qualified_profile_path = null;
+                sm.kernel_jit.mode = .off;
+            }
+        }
 
         // Load tokenizer
         var hf_tok: ?*hf_tokenizer.HfTokenizer = null;
@@ -1149,16 +1445,19 @@ pub const ModelManager = struct {
             },
             .sentencepiece => {
                 const sp = try loadSentencePieceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
-                if (shouldEnableGemmaSentencePieceCompat(man, model_dir, self.allocator)) {
-                    sp.setPreserveInlineSpecialsAfterLiteralBos(true);
-                }
-                try loadSentencePieceAddedTokens(model_dir, self.allocator, sp);
-                sp_tok = sp;
+                try adoptAndConfigureSentencePieceTokenizer(&sp_tok, sp, man, model_dir, self.allocator);
             },
         }
 
         // Load session.
         const session = try loadSessionForPreferredBackends(self.allocator, sm.preferred_backends, model_dir, man, sm);
+        errdefer session.close();
+        const optional_session_preferred_backends = try ownSelectedFirstBackendPreference(
+            self.allocator,
+            sm.preferred_backends,
+            session.backend(),
+        );
+        errdefer self.allocator.free(optional_session_preferred_backends);
 
         // Load chat template if available (for generator models)
         const chat_tmpl: ?*ChatTemplate = if (man.chat_template) |ct_source| blk2: {
@@ -1177,6 +1476,11 @@ pub const ModelManager = struct {
             };
             break :blk2 ct;
         } else null;
+        errdefer if (chat_tmpl) |ct| {
+            var ct_mut = @constCast(ct);
+            ct_mut.deinit();
+            self.allocator.destroy(ct_mut);
+        };
 
         // Create loaded model
         const shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = blk: {
@@ -1196,6 +1500,10 @@ pub const ModelManager = struct {
         const shared_prefetch: ?*runtime.tier.shared.SharedPrefetchState = if (session_factory.getGptConfig(session)) |_| blk: {
             const state = try self.allocator.create(runtime.tier.shared.SharedPrefetchState);
             state.* = runtime.tier.shared.SharedPrefetchState.init(self.allocator);
+            errdefer {
+                state.deinit();
+                self.allocator.destroy(state);
+            }
             try session_factory.attachSharedPrefetchState(session, state);
             break :blk state;
         } else null;
@@ -1209,14 +1517,18 @@ pub const ModelManager = struct {
             break :blk coordinator;
         } else null;
         errdefer if (native_generate_coordinator) |coordinator| self.allocator.destroy(coordinator);
+        const owned_model_dir = try self.allocator.dupe(u8, model_dir);
+        errdefer self.allocator.free(owned_model_dir);
         const model = try self.allocator.create(LoadedModel);
+        errdefer self.allocator.destroy(model);
         model.* = .{
             .manifest = man,
             .hf_tok = hf_tok,
             .sp_tok = sp_tok,
             .session = session,
             .session_manager = &self.session_manager,
-            .model_dir = try self.allocator.dupe(u8, model_dir),
+            .optional_session_preferred_backends = optional_session_preferred_backends,
+            .model_dir = owned_model_dir,
             .allocator = self.allocator,
             .chat_tmpl = chat_tmpl,
             .shared_moe_cache = shared_moe_cache,
@@ -1229,6 +1541,7 @@ pub const ModelManager = struct {
             .text_projection = null,
             .visual_projection = null,
             .audio_projection = null,
+            .kernel_jit_profile_bundle = null,
         };
 
         if (build_options.enable_metal and shouldUseMetalWholeModelExecutor(session)) {
@@ -1241,15 +1554,52 @@ pub const ModelManager = struct {
             }
         }
 
-        // Cache by actual loaded session backend.
-        const variant_key = try backendVariantCacheKey(self.allocator, model_dir, model.session.backend());
-        try self.loaded.put(self.allocator, variant_key, model);
-        if (cache_default_alias and self.loaded.get(model_dir) == null and self.loaded_aliases.get(model_dir) == null) {
-            const alias_key = try self.allocator.dupe(u8, model_dir);
-            try self.loaded_aliases.put(self.allocator, alias_key, model);
-        }
+        model.kernel_jit_profile_bundle = qualified_profile_bundle;
+        qualified_profile_bundle = null;
 
         return model;
+    }
+
+    fn publishLoadedModel(
+        self: *ModelManager,
+        model_dir: []const u8,
+        model: *LoadedModel,
+        cache_default_alias: bool,
+    ) !*LoadedModel {
+        const variant_key = try backendVariantCacheKey(self.allocator, model_dir, model.session.backend());
+        var variant_key_owned = true;
+        defer if (variant_key_owned) self.allocator.free(variant_key);
+
+        const maybe_alias_key = if (cache_default_alias) try self.allocator.dupe(u8, model_dir) else null;
+        var alias_key_owned = maybe_alias_key != null;
+        defer if (alias_key_owned) self.allocator.free(maybe_alias_key.?);
+
+        self.lockState(null);
+        defer self.state_mutex.unlock();
+
+        var inserted_variant = false;
+        const published = self.loaded.get(variant_key) orelse blk: {
+            try self.loaded.put(self.allocator, variant_key, model);
+            variant_key_owned = false;
+            inserted_variant = true;
+            break :blk model;
+        };
+        errdefer if (inserted_variant) {
+            if (self.loaded.fetchRemove(variant_key)) |removed| self.allocator.free(removed.key);
+        };
+
+        if (maybe_alias_key) |alias_key| {
+            if (self.loaded.get(model_dir) == null and self.loaded_aliases.get(model_dir) == null) {
+                try self.loaded_aliases.put(self.allocator, alias_key, published);
+                alias_key_owned = false;
+            }
+        }
+        return published;
+    }
+
+    fn destroyLoadedModel(self: *ModelManager, model: *LoadedModel) void {
+        model.deinit();
+        self.allocator.destroy(model);
     }
 };
 
@@ -1298,19 +1648,6 @@ fn effectiveLoadBackends(
     return scratch[0..idx];
 }
 
-fn sessionManagerForPreferredBackends(
-    allocator: std.mem.Allocator,
-    preferred_backends: []const backends.BackendType,
-    source: *const backends.SessionManager,
-) backends.SessionManager {
-    return .{
-        .allocator = allocator,
-        .preferred_backends = preferred_backends,
-        .graph_runtime_strategy = source.graph_runtime_strategy,
-        .io = source.io,
-    };
-}
-
 fn loadSessionForPreferredBackends(
     allocator: std.mem.Allocator,
     preferred_backends: []const backends.BackendType,
@@ -1322,12 +1659,19 @@ fn loadSessionForPreferredBackends(
     const effective_backends = effectiveLoadBackends(&effective_scratch, preferred_backends, man);
     for (effective_backends) |backend| {
         if (!backend.supportsDirectSessionLoad()) continue;
+        if (source_session_manager.kernel_jit.mode.failClosed() and
+            !backend.supportsKernelJitSession()) continue;
         const candidate_path = preferredModelPathForBackend(model_dir, man, backend) orelse continue;
+        if (source_session_manager.kernel_jit.mode.failClosed() and
+            std.mem.endsWith(u8, candidate_path, ".onnx")) continue;
         var single_backend = [_]backends.BackendType{backend};
-        var backend_session_manager = sessionManagerForPreferredBackends(allocator, single_backend[0..], source_session_manager);
+        var backend_session_manager = source_session_manager.*.withPreferredBackends(allocator, single_backend[0..]);
         if (backend_session_manager.loadModel(candidate_path)) |session| {
             return session;
-        } else |_| {}
+        } else |err| {
+            if (source_session_manager.kernel_jit.qualified_profile_path != null and backend == .metal) return err;
+            if (graph_mod.kernel_jit.isRequiredFailure(source_session_manager.kernel_jit.mode, err)) return err;
+        }
     }
 
     std.log.err("loadModel({s}) failed: no backend accepted model", .{model_dir});
@@ -1339,6 +1683,12 @@ fn loadSessionForPreferredBackends(
         man.visual_projection_path,
         man.audio_projection_path,
     });
+    if (source_session_manager.kernel_jit.qualified_profile_path != null) {
+        return error.KernelJitProfileRequiresMetalBackend;
+    }
+    if (source_session_manager.kernel_jit.mode.failClosed()) {
+        return error.KernelJitRequiredBackendUnavailable;
+    }
     return error.NoModelFileFound;
 }
 
@@ -1356,14 +1706,77 @@ test "shouldPreferNativeSession prefers native GLiNER weights" {
     try std.testing.expect(shouldPreferNativeSession(man));
 }
 
-test "model manager backend clones preserve explicit graph runtime" {
-    var source = backends.SessionManager.init(std.testing.allocator);
-    source.graph_runtime_strategy = .partitioned;
-    const preferred = [_]backends.BackendType{.onnx};
+test "optional sessions retain the selected backend before fallbacks" {
+    const preferred = [_]backends.BackendType{ .metal, .native };
+    const owned = try ownSelectedFirstBackendPreference(
+        std.testing.allocator,
+        &preferred,
+        .native,
+    );
+    defer std.testing.allocator.free(owned);
+    try std.testing.expectEqualSlices(backends.BackendType, &.{ .native, .metal }, owned);
 
-    const cloned = sessionManagerForPreferredBackends(std.testing.allocator, preferred[0..], &source);
-    try std.testing.expectEqual(source.graph_runtime_strategy, cloned.graph_runtime_strategy);
-    try std.testing.expectEqualSlices(backends.BackendType, preferred[0..], cloned.preferred_backends);
+    const added = try ownSelectedFirstBackendPreference(
+        std.testing.allocator,
+        &preferred,
+        .cuda,
+    );
+    defer std.testing.allocator.free(added);
+    try std.testing.expectEqualSlices(backends.BackendType, &.{ .cuda, .metal, .native }, added);
+}
+
+test "required preload completeness includes every declared optional session" {
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .visual_model_path = "vision.gguf",
+        .audio_model_path = "audio.gguf",
+        .text_projection_path = "text-projection.onnx",
+        .visual_projection_path = "visual-projection.onnx",
+        .audio_projection_path = "audio-projection.onnx",
+    };
+    const declared = declaredOptionalSessions(&manifest);
+    try std.testing.expectEqual(@as(usize, 5), declared.len);
+    try std.testing.expect(!declaredOptionalSessionsComplete(
+        &manifest,
+        .{ true, true, true, true, false },
+    ));
+    try std.testing.expect(declaredOptionalSessionsComplete(
+        &manifest,
+        .{ true, true, true, true, true },
+    ));
+
+    const text_only = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    try std.testing.expect(declaredOptionalSessionsComplete(
+        &text_only,
+        .{ false, false, false, false, false },
+    ));
+}
+
+test "optional sessions bind only their component-qualified profile" {
+    var manager = backends.SessionManager.init(std.testing.allocator);
+    manager.kernel_jit = .{ .mode = .on, .qualified_profile_path = "primary.json" };
+    const bundle: graph_mod.kernel_jit.QualifiedProfileBundle = .{
+        .primary = "primary.json",
+        .vision = "vision.json",
+        .audio = "audio.json",
+    };
+
+    try bindOptionalSessionProfile(&manager, .audio, bundle);
+    try std.testing.expectEqualStrings("audio.json", manager.kernel_jit.qualified_profile_path.?);
+    try bindOptionalSessionProfile(&manager, .text_projection, bundle);
+    try std.testing.expect(manager.kernel_jit.qualified_profile_path == null);
+    try std.testing.expectEqual(graph_mod.kernel_jit.Mode.off, manager.kernel_jit.mode);
+
+    manager.kernel_jit = .{ .mode = .required, .qualified_profile_path = "primary.json" };
+    try std.testing.expectError(
+        error.MissingKernelJitProfileBundleComponent,
+        bindOptionalSessionProfile(&manager, .text_projection, bundle),
+    );
+
+    manager.kernel_jit = .{ .mode = .on, .qualified_profile_path = "primary.json" };
+    try bindOptionalSessionProfile(&manager, .vision, null);
+    try std.testing.expect(manager.kernel_jit.qualified_profile_path == null);
+    try std.testing.expectEqual(graph_mod.kernel_jit.Mode.off, manager.kernel_jit.mode);
 }
 
 test "preferredModelPathForBackend keeps metal/native on model directory when native assets exist" {
@@ -1703,6 +2116,47 @@ test "shouldEnableGemmaSentencePieceCompat applies to gguf-only gemma dirs" {
 
     try std.testing.expect(shouldEnableGemmaSentencePieceCompat(man, dir_path, allocator));
     try std.testing.expect(!shouldPreferSentencePieceOverride(man, dir_path, allocator));
+}
+
+test "sentencepiece tokenizer is owned before added-token failure" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "added_tokens.json",
+        .data = "]",
+    });
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(dir_path);
+    const man = manifest_mod.ModelManifest{ .allocator = allocator };
+
+    const Harness = struct {
+        fn run(a: std.mem.Allocator, model_dir: []const u8, manifest: manifest_mod.ModelManifest) !void {
+            var owned: ?*sentencepiece.Processor = null;
+            errdefer if (owned) |sp| {
+                sp.deinit();
+                a.destroy(sp);
+            };
+
+            const sp = try a.create(sentencepiece.Processor);
+            errdefer if (owned == null) a.destroy(sp);
+            sp.* = try sentencepiece.Processor.initFromPieces(a, &.{
+                .{ .text = "<unk>", .score = 0, .piece_type = 2 },
+                .{ .text = "token", .score = -1, .piece_type = 1 },
+            }, .{});
+
+            try adoptAndConfigureSentencePieceTokenizer(&owned, sp, manifest, model_dir, a);
+
+            // Keep an unexpected success leak-free so expectError reports only
+            // the missing post-load failure.
+            sp.deinit();
+            a.destroy(sp);
+            owned = null;
+        }
+    };
+
+    try std.testing.expectError(error.SyntaxError, Harness.run(allocator, dir_path, man));
 }
 
 test "loadSentencePieceAddedTokens overlays gemma special tokens from tokenizer json" {

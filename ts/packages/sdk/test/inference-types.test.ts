@@ -17,6 +17,7 @@ describe("Type exports", () => {
     const config: InferenceConfig = {
       baseUrl: "http://localhost:8080/api",
       headers: { "X-Custom-Header": "value" },
+      maxBinaryResponseBytes: 64 << 20,
     };
     expect(config.baseUrl).toBe("http://localhost:8080/api");
   });
