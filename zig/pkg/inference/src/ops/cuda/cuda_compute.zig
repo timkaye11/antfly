@@ -75,6 +75,7 @@ pub const CudaTensorCoreQuantBuffer = struct {
 
 pub const CapabilityProfile = enum {
     clipclap,
+    bert_encoder,
     deberta_reranker,
     gliner2,
     florence2,
@@ -86,6 +87,7 @@ pub const KernelJitRouteScope = kernels_mod.JitRouteScope;
 fn jitModelProfile(profile: CapabilityProfile) kernels_mod.JitModelProfile {
     return switch (profile) {
         .clipclap => .clipclap,
+        .bert_encoder => .bert_encoder,
         .deberta_reranker => .deberta_reranker,
         .gliner2 => .gliner2,
         .florence2 => .florence2,
@@ -1050,6 +1052,13 @@ pub const CudaCompute = struct {
     pinned_bulk_download_buffer: buffer_mod.HostBuffer = .{},
     async_i32_scalar_download: AsyncI32ScalarDownload = .{},
     temp_ids_masks: scratch_mod.DeviceScratch = .{},
+    // A BERT forward shares one attention mask across every transformer
+    // block. Keep that mask in a dedicated scratch allocation so padded
+    // device-resident encodes make one H2D upload per request rather than one
+    // per layer. The content hash prevents stale masks across requests.
+    attention_mask_scratch: scratch_mod.DeviceScratch = .{},
+    attention_mask_cache_hash: u64 = 0,
+    attention_mask_cache_len: usize = 0,
     bf16_activation_scratch: scratch_mod.DeviceScratch = .{},
     cublaslt_workspace_scratch: scratch_mod.DeviceScratch = .{},
     cublaslt: ?cublaslt_mod.CublasLt = null,
@@ -1235,6 +1244,7 @@ pub const CudaCompute = struct {
         }
         self.deferred_device_frees.deinit(self.allocator);
         self.temp_ids_masks.deinit(&self.ctx);
+        self.attention_mask_scratch.deinit(&self.ctx);
         self.bf16_activation_scratch.deinit(&self.ctx);
         self.cublaslt_workspace_scratch.deinit(&self.ctx);
         if (self.cublaslt) |*blas| {
@@ -1256,6 +1266,9 @@ pub const CudaCompute = struct {
     pub fn supportsProfile(self: *const CudaCompute, profile: CapabilityProfile) bool {
         return switch (profile) {
             .clipclap => self.kernels.hasClipClapPrimitives(),
+            // BERT/XLM-R uses the same dense encoder primitives as CLIP text,
+            // plus the Q4_0 biased-linear adapter in this compute backend.
+            .bert_encoder => self.kernels.hasClipClapPrimitives(),
             .deberta_reranker => self.kernels.hasDebertaRerankerPrimitives(),
             .gliner2 => self.kernels.hasGliner2Primitives(),
             .florence2 => self.kernels.hasFlorence2Primitives(),
@@ -2378,7 +2391,17 @@ fn cudaHybridQ4Bf16WeightsEnabled() bool {
 }
 
 fn cudaShouldAttachBf16MirrorToQ4Weight(name: []const u8, storage: weight_source_mod.QuantizedStorage) bool {
-    if (!cudaHybridQ4Bf16WeightsEnabled()) return false;
+    // Encoder prefill has M=batch*sequence rows, so dequantizing the static
+    // Q4_0 projection once on upload and dispatching the existing BF16
+    // cuBLASLt path is materially faster than repeatedly running the scalar
+    // SIMT Q4 kernel. Keep decoder behavior opt-in, but enable this safe
+    // device-resident BERT/XLM-R profile by default.
+    const bert_encoder_weight = std.mem.startsWith(u8, name, "encoder.layer.");
+    if (!cudaHybridQ4Bf16WeightsEnabled() and
+        !(bert_encoder_weight and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_BERT_Q4_0_BF16_PREFILL", true)))
+    {
+        return false;
+    }
     if (cudaDequantizeQ4_0MatrixWeightsToBf16OnUpload()) return false;
     if (!isKnownQuantStorage(storage, .Q4_0)) return false;
     if (cudaShouldDequantizeWeightOnUpload(name, storage)) return false;
@@ -7423,6 +7446,18 @@ fn uploadTempI64(self: *CudaCompute, data: []const i64) !buffer_mod.DeviceBuffer
     return device;
 }
 
+fn uploadCachedAttentionMaskI64(self: *CudaCompute, data: []const i64) !buffer_mod.DeviceBuffer {
+    const hash = std.hash.Wyhash.hash(0x62_67_65_6d_33_6d_61, std.mem.sliceAsBytes(data));
+    const bytes = try checkedMul(data.len, @sizeOf(i64));
+    const device = try self.attention_mask_scratch.acquire(&self.ctx, bytes);
+    if (self.attention_mask_cache_len != data.len or self.attention_mask_cache_hash != hash) {
+        try copyFromHostTracked(self, device, std.mem.sliceAsBytes(data));
+        self.attention_mask_cache_len = data.len;
+        self.attention_mask_cache_hash = hash;
+    }
+    return device;
+}
+
 fn allOnesI64(data: []const i64) bool {
     for (data) |value| {
         if (value != 1) return false;
@@ -8079,6 +8114,20 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
     if (bias_tensor.elem_count != out_dim) {
         if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=linear bias_elems={d} out_dim={d}", .{ bias_tensor.elem_count, out_dim });
         return error.InvalidShape;
+    }
+
+    // Encoder GGUFs commonly use Q4_0 weights together with learned biases.
+    // Reuse the proven generated/no-bias Q4_0 dispatch and apply the bias in
+    // place instead of rejecting the model at every projection. This keeps
+    // the entire encoder on CUDA now; specialized bias epilogues can replace
+    // this two-launch fallback through the same route later.
+    if (isKnownQuant(weight_tensor, .Q4_0)) {
+        const result = try linearNoBias(ctx, input, weight, rows, in_dim, out_dim);
+        errdefer freeTensor(ctx, result);
+        const result_tensor = tensorFromCt(result);
+        try self.kernels.launchAddBiasRowsF32(&self.ctx, result_tensor.buffer, bias_tensor.buffer, rows, out_dim);
+        self.dispatch_stats.note(self.allocator, .linear, .q4_0, .q4_simt, .bias, .none, rows, in_dim, out_dim, 0);
+        return result;
     }
 
     const out_count = try checkedMul(rows, out_dim);
@@ -10351,6 +10400,33 @@ fn linearTriple(ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: 
     try ensureCount(bias_b_tensor, out_dim);
     try ensureCount(bias_c_tensor, out_dim);
 
+    // BGE-M3/XLM-R uses three biased Q4_0 projections for every encoder
+    // attention block. At prefill sizes their Q4_0 BF16 mirrors are faster
+    // with cuBLASLt, but the generic triple fallback stages the same F32
+    // activation three times. Reuse the generator-aware QKV route so that
+    // input staging happens once, then apply each learned bias in place.
+    //
+    // This is deliberately limited to the existing BF16-mirror contract:
+    // decode and raw Q4_0 kernels retain their established dispatch and
+    // numerical behavior. `linearNoBiasQkv` returns null when its fusion is
+    // disabled or ineligible, preserving the three-linear fallback below.
+    if (rows > 1 and
+        weightBf16MirrorForRows(weight_a_tensor, rows) != null and
+        weightBf16MirrorForRows(weight_b_tensor, rows) != null and
+        weightBf16MirrorForRows(weight_c_tensor, rows) != null)
+    {
+        if (try linearNoBiasQkv(ctx, input, weight_a, weight_b, weight_c, rows, in_dim, out_dim, out_dim)) |qkv| {
+            errdefer freeTensor(ctx, qkv.first);
+            errdefer freeTensor(ctx, qkv.second);
+            errdefer freeTensor(ctx, qkv.third);
+            try self.kernels.launchAddBiasRowsF32(&self.ctx, tensorFromCt(qkv.first).buffer, bias_a_tensor.buffer, rows, out_dim);
+            try self.kernels.launchAddBiasRowsF32(&self.ctx, tensorFromCt(qkv.second).buffer, bias_b_tensor.buffer, rows, out_dim);
+            try self.kernels.launchAddBiasRowsF32(&self.ctx, tensorFromCt(qkv.third).buffer, bias_c_tensor.buffer, rows, out_dim);
+            self.dispatch_stats.note(self.allocator, .linear_triple, .bf16, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
+            return .{ .first = qkv.first, .second = qkv.second, .third = qkv.third };
+        }
+    }
+
     if (isKnownQuant(weight_a_tensor, .Q4_K) and isKnownQuant(weight_b_tensor, .Q4_K) and isKnownQuant(weight_c_tensor, .Q4_K)) {
         const out_count = try checkedMul(rows, out_dim);
         const shape_a = try allocShape2(self.allocator, rows, out_dim);
@@ -12018,7 +12094,7 @@ fn sdpaLaunch(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: ?[]const i64,
         if (mask_values.len < token_count) return error.InvalidShape;
     }
 
-    const mask_device = if (mask) |mask_values| try uploadTempI64(self, mask_values) else buffer_mod.DeviceBuffer{};
+    const mask_device = if (mask) |mask_values| try uploadCachedAttentionMaskI64(self, mask_values) else buffer_mod.DeviceBuffer{};
     const bias_tensor: ?*CudaTensor = if (attn_bias_ct) |bct| tensorFromCt(bct) else null;
     const bias_buffer = if (bias_tensor) |bt| bt.buffer else buffer_mod.DeviceBuffer{};
     const bias_mode: u32 = if (bias_tensor) |bt| blk: {
@@ -12031,6 +12107,8 @@ fn sdpaLaunch(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: ?[]const i64,
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
+    var prefill_profile_scope = beginPrefillProfile(self, .attention, token_count);
+    defer if (prefill_profile_scope) |*scope| scope.end();
     try self.kernels.launchAttentionF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, bias_buffer, batch, seq_len, num_heads, head_dim, false, has_mask, bias_mode, true);
     self.stats.launch_attention += 1;
     return createTensor(self, device, shape, count);

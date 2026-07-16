@@ -614,7 +614,11 @@ fn loadSentencePieceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: [
 
     const view = gguf_metadata.View.init(&parsed);
     const model_name = view.getString("tokenizer.ggml.model") orelse return error.NoTokenizerFound;
-    if (!(std.mem.eql(u8, model_name, "llama") or std.mem.startsWith(u8, model_name, "gemma"))) {
+    if (!(std.mem.eql(u8, model_name, "llama") or
+        std.mem.eql(u8, model_name, "bert") or
+        std.mem.eql(u8, model_name, "t5") or
+        std.mem.startsWith(u8, model_name, "gemma")))
+    {
         return error.NoTokenizerFound;
     }
 
@@ -1010,6 +1014,13 @@ pub const LoadedModel = struct {
 
     pub fn embeddingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) EmbeddingPipeline {
         const tok = self.getTokenizer();
+        const resident_text_encoder = self.session.backend() == .cuda and blk: {
+            const arch = session_factory.getGenericEncoderArchConfig(self.session) catch break :blk false;
+            break :blk switch (arch) {
+                .bert => true,
+                .deberta => false,
+            };
+        };
         var pipeline = EmbeddingPipeline.init(allocator, self.session, tok, .{
             .max_length = self.manifest.max_position_embeddings,
             .normalize = self.manifest.normalize,
@@ -1020,8 +1031,13 @@ pub const LoadedModel = struct {
                 .last => .last,
             },
             .text_prefix = self.manifest.embedding_text_prefix,
-            .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest),
+            // BERT/XLM-R GGUFs declare their maximum context (BGE-M3: 8192)
+            // while accepting dynamic sequence lengths. Padding every request
+            // to that context would turn a 256-token encoder benchmark into an
+            // unrelated 8192-token workload.
+            .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest) or resident_text_encoder,
             .resident_qwen3_embedding = isJinaStyleEmbeddingManifest(&self.manifest),
+            .resident_text_encoder = resident_text_encoder,
         });
         if (usesClipImagePreprocessProfile(&self.manifest)) {
             pipeline.config.image_preprocess_profile = .clip;

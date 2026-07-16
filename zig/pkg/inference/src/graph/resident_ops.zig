@@ -33,6 +33,20 @@ pub fn l2NormalizeLastDim(
     const dim = input_shape[last_axis];
     if (dim <= 0) return error.UnsupportedShape;
 
+    // CUDA has a fused bare-RMS kernel but intentionally does not expose the
+    // generic reduction primitives used below.  RMS(x) / sqrt(dim) is L2(x),
+    // so use that two-kernel resident path when it is available.  Scale epsilon
+    // by the dimension to preserve the L2 expression's near-zero behavior.
+    const dim_usize: usize = @intCast(dim);
+    if (try backend.rmsNormBare(input, dim_usize, std.math.floatMin(f32) / @as(f32, @floatFromInt(dim)))) |rms| {
+        errdefer backend.free(rms);
+        if (try backend.multiplyScalar(rms, 1.0 / @sqrt(@as(f32, @floatFromInt(dim))))) |normalized| {
+            backend.free(rms);
+            return normalized;
+        }
+        backend.free(rms);
+    }
+
     var reduced_shape_buf: [8]i64 = undefined;
     var broadcast_axes_buf: [8]u8 = undefined;
     var const_shape_buf: [8]i32 = undefined;

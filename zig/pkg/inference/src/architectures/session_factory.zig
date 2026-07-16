@@ -23,6 +23,7 @@ const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const compat = @import("../io/compat.zig");
 const Session = @import("../backends/session.zig").Session;
+const ResidentOutputs = @import("../backends/session.zig").ResidentOutputs;
 const Tensor = @import("../backends/tensor.zig").Tensor;
 const TensorInfo = @import("../backends/tensor.zig").TensorInfo;
 const BackendType = @import("../backends/backends.zig").BackendType;
@@ -69,6 +70,7 @@ const cuda_compute_mod = if (build_options.enable_cuda) @import("../ops/cuda/cud
 pub const CudaRuntimeStats = if (build_options.enable_cuda) cuda_compute_mod.RuntimeStats else void;
 const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.CapabilityProfile else enum {
     clipclap,
+    bert_encoder,
     deberta_reranker,
     gliner2,
     florence2,
@@ -1117,6 +1119,7 @@ fn cudaSupportsArch(arch_config: ArchConfig) bool {
 fn cudaProfileForArch(arch_config: ArchConfig) ?CudaCapabilityProfile {
     return switch (arch_config) {
         .clip, .clap => .clipclap,
+        .bert => .bert_encoder,
         .deberta => .deberta_reranker,
         .gliner => .gliner2,
         .florence => .florence2,
@@ -1133,8 +1136,10 @@ test "cuda support gate admits only supported encoder architectures" {
     try std.testing.expect(cudaSupportsArch(.{ .deberta = .{} }));
     try std.testing.expect(cudaSupportsArch(.{ .gliner = .{} }));
     try std.testing.expect(cudaSupportsArch(.{ .florence = .{} }));
+    try std.testing.expect(cudaSupportsArch(.{ .bert = .{} }));
     if (comptime build_options.enable_cuda) {
         try std.testing.expectEqual(CudaCapabilityProfile.clipclap, cudaProfileForArch(.{ .clip = .{} }).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.bert_encoder, cudaProfileForArch(.{ .bert = .{} }).?);
         try std.testing.expectEqual(CudaCapabilityProfile.deberta_reranker, cudaProfileForArch(.{ .deberta = .{} }).?);
         try std.testing.expectEqual(CudaCapabilityProfile.gliner2, cudaProfileForArch(.{ .gliner = .{} }).?);
         try std.testing.expectEqual(CudaCapabilityProfile.florence2, cudaProfileForArch(.{ .florence = .{} }).?);
@@ -2355,8 +2360,63 @@ fn normalizeWeightKey(store_kind: tensor_store_mod.StoreKind, arch_config: ArchC
     if (store_kind != .gguf) return key;
     return switch (arch_config) {
         .gpt => |cfg| normalizeGgufGptWeightKey(cfg, key, buf) orelse key,
+        .bert => normalizeGgufBertWeightKey(key, buf) orelse key,
         else => key,
     };
+}
+
+/// llama.cpp BERT GGUFs use compact encoder tensor names while the shared
+/// BERT architecture intentionally consumes HuggingFace-style names. Keep
+/// this translation at the GGUF boundary so native exports and SafeTensors
+/// continue to use their existing ABI.
+fn normalizeGgufBertWeightKey(key: []const u8, buf: *[256]u8) ?[]const u8 {
+    if (std.mem.eql(u8, key, "token_embd.weight")) return "embeddings.word_embeddings.weight";
+    if (std.mem.eql(u8, key, "position_embd.weight")) return "embeddings.position_embeddings.weight";
+    if (std.mem.eql(u8, key, "token_type_embd.weight") or std.mem.eql(u8, key, "token_types.weight")) {
+        return "embeddings.token_type_embeddings.weight";
+    }
+    if (std.mem.eql(u8, key, "token_embd_norm.weight") or std.mem.eql(u8, key, "embd_norm.weight")) {
+        return "embeddings.LayerNorm.weight";
+    }
+    if (std.mem.eql(u8, key, "token_embd_norm.bias") or std.mem.eql(u8, key, "embd_norm.bias")) {
+        return "embeddings.LayerNorm.bias";
+    }
+    if (!std.mem.startsWith(u8, key, "blk.")) return null;
+
+    var parts = std.mem.splitScalar(u8, key, '.');
+    _ = parts.next() orelse return null;
+    const layer_text = parts.next() orelse return null;
+    const suffix_start = 4 + layer_text.len + 1;
+    if (suffix_start >= key.len) return null;
+    const layer = std.fmt.parseInt(usize, layer_text, 10) catch return null;
+    const suffix = key[suffix_start..];
+
+    const mapped_suffix = if (std.mem.eql(u8, suffix, "attn_q.weight")) "attention.self.query.weight" else if (std.mem.eql(u8, suffix, "attn_q.bias")) "attention.self.query.bias" else if (std.mem.eql(u8, suffix, "attn_k.weight")) "attention.self.key.weight" else if (std.mem.eql(u8, suffix, "attn_k.bias")) "attention.self.key.bias" else if (std.mem.eql(u8, suffix, "attn_v.weight")) "attention.self.value.weight" else if (std.mem.eql(u8, suffix, "attn_v.bias")) "attention.self.value.bias" else if (std.mem.eql(u8, suffix, "attn_output.weight") or std.mem.eql(u8, suffix, "attn_out.weight")) "attention.output.dense.weight" else if (std.mem.eql(u8, suffix, "attn_output.bias") or std.mem.eql(u8, suffix, "attn_out.bias")) "attention.output.dense.bias" else if (std.mem.eql(u8, suffix, "attn_norm.weight") or std.mem.eql(u8, suffix, "attn_output_norm.weight")) "attention.output.LayerNorm.weight" else if (std.mem.eql(u8, suffix, "attn_norm.bias") or std.mem.eql(u8, suffix, "attn_output_norm.bias")) "attention.output.LayerNorm.bias" else if (std.mem.eql(u8, suffix, "ffn_up.weight")) "intermediate.dense.weight" else if (std.mem.eql(u8, suffix, "ffn_up.bias")) "intermediate.dense.bias" else if (std.mem.eql(u8, suffix, "ffn_down.weight")) "output.dense.weight" else if (std.mem.eql(u8, suffix, "ffn_down.bias")) "output.dense.bias" else if (std.mem.eql(u8, suffix, "ffn_norm.weight") or std.mem.eql(u8, suffix, "layer_output_norm.weight")) "output.LayerNorm.weight" else if (std.mem.eql(u8, suffix, "ffn_norm.bias") or std.mem.eql(u8, suffix, "layer_output_norm.bias")) "output.LayerNorm.bias" else return null;
+    return std.fmt.bufPrint(buf, "encoder.layer.{d}.{s}", .{ layer, mapped_suffix }) catch null;
+}
+
+test "llama BERT GGUF tensor names map to the resident encoder ABI" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "embeddings.word_embeddings.weight",
+        normalizeGgufBertWeightKey("token_embd.weight", &buf).?,
+    );
+    try std.testing.expectEqualStrings(
+        "encoder.layer.23.attention.self.query.weight",
+        normalizeGgufBertWeightKey("blk.23.attn_q.weight", &buf).?,
+    );
+    try std.testing.expectEqualStrings(
+        "encoder.layer.0.output.LayerNorm.bias",
+        normalizeGgufBertWeightKey("blk.0.ffn_norm.bias", &buf).?,
+    );
+    try std.testing.expectEqualStrings(
+        "encoder.layer.0.attention.output.LayerNorm.weight",
+        normalizeGgufBertWeightKey("blk.0.attn_output_norm.weight", &buf).?,
+    );
+    try std.testing.expectEqualStrings(
+        "encoder.layer.0.output.LayerNorm.bias",
+        normalizeGgufBertWeightKey("blk.0.layer_output_norm.bias", &buf).?,
+    );
 }
 
 fn refineGemma4AttentionKEqualVFromGgufTensors(config: *gpt_mod.Config, file: *const gguf_mod.format.File) void {
@@ -4800,11 +4860,56 @@ fn gpuBackendData(self: *ArchSession) *GpuHostedData {
 
 const arch_vtable = Session.VTable{
     .run = &archRun,
+    .runResident = &archRunResident,
     .inputInfo = &archInputInfo,
     .outputInfo = &archOutputInfo,
     .backend = &archBackend,
     .close = &archClose,
 };
+
+fn deinitResidentComputeBackend(owner: *anyopaque, allocator: std.mem.Allocator) void {
+    const cb: *ops.ComputeBackend = @ptrCast(@alignCast(owner));
+    cb.deinit();
+    allocator.destroy(cb);
+}
+
+/// Execute an encoder without materialising host Tensor outputs. This is kept
+/// deliberately narrow: classifiers still use `archRun`, while embedding
+/// callers receive last-hidden-state on the backend and pool it there.
+fn archRunResident(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) !?ResidentOutputs {
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    const cfg = switch (self.arch_config) {
+        .bert => |value| value,
+        else => return null,
+    };
+    if (self.task == .classifier or self.task == .recognizer) return null;
+    if (inputs.len < 2) return error.MissingInputs;
+    const input_ids_tensor = inputs[0];
+    if (input_ids_tensor.shape.len != 2) return error.InvalidInputShape;
+    const batch: usize = @intCast(input_ids_tensor.shape[0]);
+    const seq_len: usize = @intCast(input_ids_tensor.shape[1]);
+    const input_ids = input_ids_tensor.asInt64();
+    const attention_mask = inputs[1].asInt64();
+    const token_type_ids: ?[]const i64 = if (inputs.len > 2) inputs[2].asInt64() else null;
+
+    const cb = try allocator.create(ops.ComputeBackend);
+    errdefer allocator.destroy(cb);
+    cb.* = try makeComputeBackend(self, allocator, null);
+    errdefer cb.deinit();
+
+    const hidden = try bert_arch.forwardCt(cb, allocator, cfg, input_ids, attention_mask, token_type_ids, batch, seq_len);
+    errdefer cb.free(hidden);
+    const outputs = try allocator.alloc(ops.CT, 1);
+    errdefer allocator.free(outputs);
+    outputs[0] = hidden;
+    return .{
+        .outputs = outputs,
+        .backend = cb,
+        .allocator = allocator,
+        .backend_owner = cb,
+        .deinit_backend_owner = &deinitResidentComputeBackend,
+    };
+}
 
 /// Create a ComputeBackend from an ArchSession. Used internally and by generation pipeline.
 fn makeComputeBackend(

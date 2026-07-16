@@ -37,6 +37,25 @@ pub fn forward(
     batch: usize,
     seq_len: usize,
 ) ![]f32 {
+    const hidden = try forwardCt(cb, allocator, config, input_ids, attention_mask, token_type_ids, batch, seq_len);
+    defer cb.free(hidden);
+    return cb.toFloat32(hidden, allocator);
+}
+
+/// Run the full BERT encoder while keeping the complete hidden-state chain on
+/// the compute backend. Embedding pipelines that can consume `CT` values must
+/// use this entry point so CUDA never downloads [batch, sequence, hidden]
+/// activations merely to pool them on the host.
+pub fn forwardCt(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    attention_mask: []const i64,
+    token_type_ids: ?[]const i64,
+    batch: usize,
+    seq_len: usize,
+) !CT {
     const H = config.hidden_size;
     const total = batch * seq_len;
 
@@ -50,10 +69,7 @@ pub fn forward(
         hidden = new_hidden;
     }
 
-    // 3. Read out to f32
-    const result = try cb.toFloat32(hidden, allocator);
-    cb.free(hidden);
-    return result;
+    return hidden;
 }
 
 pub fn forwardUntilLayer(
@@ -144,10 +160,10 @@ fn embeddings(
     // Position embeddings
     const pos_emb = try cb.getWeight("embeddings.position_embeddings.weight");
     defer cb.free(pos_emb);
-    // Build position IDs: [0, 1, ..., seq_len-1] repeated for each batch item
-    const pos_ids = try allocator.alloc(i64, total);
+    // Build position IDs. RoBERTa/XLM-R reserves the padding position and
+    // starts non-padding positions at pad_token_id + 1.
+    const pos_ids = try buildPositionIds(allocator, config, input_ids, total, seq_len);
     defer allocator.free(pos_ids);
-    for (0..total) |i| pos_ids[i] = @intCast(i % seq_len);
     const pos_lookup = try cb.embeddingLookup(pos_emb, pos_ids, total, H);
     defer cb.free(pos_lookup);
 
@@ -180,10 +196,42 @@ fn embeddings(
     defer cb.free(ln_w);
     const ln_b = try cb.getWeight("embeddings.LayerNorm.bias");
     defer cb.free(ln_b);
-    const normed = try cb.layerNorm(result, ln_w, ln_b, H, 1e-12);
+    const normed = try cb.layerNorm(result, ln_w, ln_b, H, config.layer_norm_eps);
     cb.free(result);
 
     return normed;
+}
+
+fn buildPositionIds(
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    total: usize,
+    seq_len: usize,
+) ![]i64 {
+    if (seq_len == 0 or input_ids.len < total or total % seq_len != 0) return error.InvalidShape;
+    const pos_ids = try allocator.alloc(i64, total);
+    const batch = total / seq_len;
+    switch (config.position_id_mode) {
+        .absolute => {
+            for (0..total) |i| pos_ids[i] = @intCast(i % seq_len);
+        },
+        .roberta_padding => {
+            for (0..batch) |b| {
+                var next = config.pad_token_id + 1;
+                for (0..seq_len) |s| {
+                    const index = b * seq_len + s;
+                    if (input_ids[index] == config.pad_token_id) {
+                        pos_ids[index] = config.pad_token_id;
+                    } else {
+                        pos_ids[index] = next;
+                        next += 1;
+                    }
+                }
+            }
+        },
+    }
+    return pos_ids;
 }
 
 fn encoderLayer(
@@ -215,29 +263,29 @@ fn encoderLayer(
     defer cb.free(q_w);
     const q_b = try getLayerWeight(cb, allocator, layer, "attention.self.query.bias", &name_buf);
     defer cb.free(q_b);
-    const Q = try linearReplicatedToMaybeSharded(cb, hidden, q_w, q_b, total, hidden_dim, hidden_dim);
-    defer {
-        cb.free(Q);
-    }
-
     const k_w = try getLayerWeight(cb, allocator, layer, "attention.self.key.weight", &name_buf);
     defer cb.free(k_w);
     const k_b = try getLayerWeight(cb, allocator, layer, "attention.self.key.bias", &name_buf);
     defer cb.free(k_b);
-    const K = try linearReplicatedToMaybeSharded(cb, hidden, k_w, k_b, total, hidden_dim, hidden_dim);
-    defer {
-        cb.free(K);
-    }
-
     const v_w = try getLayerWeight(cb, allocator, layer, "attention.self.value.weight", &name_buf);
     defer cb.free(v_w);
     const v_b = try getLayerWeight(cb, allocator, layer, "attention.self.value.bias", &name_buf);
     defer cb.free(v_b);
-    const V = try linearReplicatedToMaybeSharded(cb, hidden, v_w, v_b, total, hidden_dim, hidden_dim);
-    defer {
-        cb.free(V);
-    }
-    const attn_out = try cb.scaledDotProductAttention(Q, K, V, attention_mask, null, batch, seq_len, local_num_heads, head_dim);
+
+    // The backend may emit a model-specialized QKV+bias kernel. Other
+    // backends retain the exact three-linear fallback behind this stable API.
+    const qkv = try cb.linearTriple(hidden, q_w, q_b, k_w, k_b, v_w, v_b, total, hidden_dim, hidden_dim);
+    const Q = qkv.first;
+    const K = qkv.second;
+    const V = qkv.third;
+    defer cb.free(Q);
+    defer cb.free(K);
+    defer cb.free(V);
+    const attn_out = if (allAttentionMaskOnes(attention_mask, total))
+        (try cb.scaledDotProductAttentionFull(Q, K, V, null, batch, seq_len, local_num_heads, head_dim)) orelse
+            try cb.scaledDotProductAttention(Q, K, V, attention_mask, null, batch, seq_len, local_num_heads, head_dim)
+    else
+        try cb.scaledDotProductAttention(Q, K, V, attention_mask, null, batch, seq_len, local_num_heads, head_dim);
     defer {
         cb.free(attn_out);
     }
@@ -260,7 +308,7 @@ fn encoderLayer(
     defer cb.free(attn_ln_w);
     const attn_ln_b = try getLayerWeight(cb, allocator, layer, "attention.output.LayerNorm.bias", &name_buf);
     defer cb.free(attn_ln_b);
-    const attn_normed = try cb.layerNorm(attn_res, attn_ln_w, attn_ln_b, hidden_dim, 1e-12);
+    const attn_normed = try cb.layerNorm(attn_res, attn_ln_w, attn_ln_b, hidden_dim, config.layer_norm_eps);
 
     const ffn_i_w = try getLayerWeight(cb, allocator, layer, "intermediate.dense.weight", &name_buf);
     defer cb.free(ffn_i_w);
@@ -294,8 +342,22 @@ fn encoderLayer(
     defer cb.free(ffn_ln_w);
     const ffn_ln_b = try getLayerWeight(cb, allocator, layer, "output.LayerNorm.bias", &name_buf);
     defer cb.free(ffn_ln_b);
-    const layer_out = try cb.layerNorm(ffn_res, ffn_ln_w, ffn_ln_b, hidden_dim, 1e-12);
+    const layer_out = try cb.layerNorm(ffn_res, ffn_ln_w, ffn_ln_b, hidden_dim, config.layer_norm_eps);
     return layer_out;
+}
+
+fn allAttentionMaskOnes(mask: []const i64, total: usize) bool {
+    if (mask.len < total) return false;
+    for (mask[0..total]) |value| if (value == 0) return false;
+    return true;
+}
+
+test "RoBERTa position ids preserve padding indices" {
+    const config = Config{ .position_id_mode = .roberta_padding, .pad_token_id = 1 };
+    const input_ids = [_]i64{ 0, 42, 1, 9, 1, 1, 5, 6 };
+    const positions = try buildPositionIds(std.testing.allocator, config, &input_ids, input_ids.len, 4);
+    defer std.testing.allocator.free(positions);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3, 1, 4, 1, 1, 2, 3 }, positions);
 }
 
 /// Build a layer weight name like "encoder.layer.N.suffix" and look it up.

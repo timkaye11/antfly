@@ -82,6 +82,10 @@ pub const EmbeddingConfig = struct {
     /// Enable the direct resident Qwen3/Jina embedding encoder. This is set
     /// from Jina/Qwen3 embedding manifests, not merely from the backbone family.
     resident_qwen3_embedding: bool = false,
+    /// Keep a supported encoder, pooling, and normalization on the backend.
+    /// CUDA BERT/XLM-R embedders use this instead of downloading full hidden
+    /// states before CLS pooling.
+    resident_text_encoder: bool = false,
     /// For CLIP/SigLIP multimodal models: image size for vision encoder.
     image_size: u32 = 224,
     /// Model-selected image preprocessing contract.
@@ -353,10 +357,64 @@ pub const EmbeddingPipeline = struct {
 
         var input_set = try textInputTensorSet(alloc, input_info, input_ids_tensor, attention_mask_tensor, &shape);
         defer input_set.deinit();
-        const inputs = input_set.slice();
+        return self.embedPreparedTextInputs(
+            text_session,
+            input_set.slice(),
+            all_mask,
+            ids_i64,
+            batch,
+            effective_len,
+        );
+    }
 
+    /// Embed already-tokenized inputs. This is the benchmark-facing contract
+    /// for measuring the encoder/pooling path without tokenizer work, and it
+    /// keeps the normal production resident path exactly unchanged.
+    pub fn embedTokenized(
+        self: *EmbeddingPipeline,
+        input_ids: []const i64,
+        attention_mask: []const i64,
+        batch: usize,
+        seq_len: usize,
+    ) ![][]f32 {
+        if (batch == 0 or seq_len == 0) return error.InvalidInputShape;
+        const total = std.math.mul(usize, batch, seq_len) catch return error.InvalidInputShape;
+        if (input_ids.len != total or attention_mask.len != total) return error.InvalidInputShape;
+
+        const alloc = self.allocator;
+        const text_session = self.textEncodingSession();
+        const shape = [_]i64{ @intCast(batch), @intCast(seq_len) };
+        var input_ids_tensor = try Tensor.initInt64(alloc, "input_ids", &shape, input_ids);
+        defer input_ids_tensor.deinit();
+        var attention_mask_tensor = try Tensor.initInt64(alloc, "attention_mask", &shape, attention_mask);
+        defer attention_mask_tensor.deinit();
+        var input_set = try textInputTensorSet(alloc, text_session.inputInfo(), input_ids_tensor, attention_mask_tensor, &shape);
+        defer input_set.deinit();
+
+        const mask_i32 = try alloc.alloc(i32, total);
+        defer alloc.free(mask_i32);
+        for (attention_mask, 0..) |value, index| {
+            mask_i32[index] = std.math.cast(i32, value) orelse return error.InvalidInputShape;
+        }
+        return self.embedPreparedTextInputs(text_session, input_set.slice(), mask_i32, input_ids, batch, seq_len);
+    }
+
+    fn embedPreparedTextInputs(
+        self: *EmbeddingPipeline,
+        text_session: backends.Session,
+        inputs: []const Tensor,
+        all_mask: []const i32,
+        ids_i64: []const i64,
+        batch: usize,
+        effective_len: usize,
+    ) ![][]f32 {
+        const alloc = self.allocator;
         if (self.text_projection) |proj| {
             if (try self.tryEmbedTextResidentProjection(inputs, all_mask, batch, effective_len, proj)) |resident_embeddings| {
+                return resident_embeddings;
+            }
+        } else if (self.config.resident_text_encoder) {
+            if (try self.tryEmbedTextResidentEncoder(inputs, all_mask, batch, effective_len)) |resident_embeddings| {
                 return resident_embeddings;
             }
         } else if (try self.tryEmbedTextResidentQwen3(all_mask, ids_i64, batch, effective_len)) |resident_embeddings| {
@@ -1335,6 +1393,43 @@ pub const EmbeddingPipeline = struct {
         return embeddings;
     }
 
+    fn tryEmbedTextResidentEncoder(
+        self: *EmbeddingPipeline,
+        inputs: []const Tensor,
+        mask: []const i32,
+        batch: usize,
+        seq_len: usize,
+    ) !?[][]f32 {
+        const encoder_start = embedTimingStart(self.print_timing);
+        var encoder_outputs = (try self.session.runResident(inputs, self.allocator)) orelse
+            return self.residentProjectionFallback(.text, "text.encoder.resident", batch, "unsupported");
+        logEmbedTiming("text.encoder.resident", batch, encoder_start);
+        defer encoder_outputs.deinit();
+        if (encoder_outputs.outputs.len == 0) return error.NoOutputTensors;
+
+        var pooled = self.residentPoolTextOutput(&encoder_outputs, mask, batch, seq_len) catch |err| switch (err) {
+            error.UnsupportedResidentTextPooling,
+            error.UnsupportedPrimitiveOp,
+            error.UnsupportedOperation,
+            error.UnsupportedShape,
+            => return self.residentProjectionFallback(.text, "text.pool.resident", batch, @errorName(err)),
+            else => return err,
+        };
+        defer pooled.deinit();
+
+        const pooled_storage = try self.allocator.alloc(ops_mod.CT, 1);
+        defer self.allocator.free(pooled_storage);
+        pooled_storage[0] = pooled.value;
+        var pooled_outputs = session_mod.ResidentOutputs{
+            .outputs = pooled_storage,
+            .backend = pooled.backend,
+            .allocator = self.allocator,
+        };
+        const embeddings = try self.resident2DToEmbeddings(&pooled_outputs, batch);
+        self.recordResidentProjection(.text, .success, "text.encoder.resident", batch, null);
+        return embeddings;
+    }
+
     fn tryEmbedResidentProjection(
         self: *EmbeddingPipeline,
         encoder: backends.Session,
@@ -1406,7 +1501,8 @@ pub const EmbeddingPipeline = struct {
                 shape[0] == @as(i64, @intCast(expected_batch)) and
                 shape[2] == @as(i64, @intCast(expected_dim)))
             {
-                return try residentClsPool(outputs.backend, output, expected_batch, expected_dim);
+                if (shape[1] <= 0) return error.ShapeMismatch;
+                return try residentClsPool(outputs.allocator, outputs.backend, output, expected_batch, @intCast(shape[1]), expected_dim);
             }
         }
         return error.UnsupportedResidentProjectionInput;
@@ -1435,7 +1531,7 @@ pub const EmbeddingPipeline = struct {
                 defer backend.free(reshaped);
                 return switch (self.config.pooling) {
                     .mean => try residentMaskedMeanPool(outputs.allocator, backend, reshaped, mask, batch, seq_len, hidden),
-                    .cls => try residentClsPool(backend, reshaped, batch, hidden),
+                    .cls => try residentClsPool(outputs.allocator, backend, reshaped, batch, seq_len, hidden),
                     .last => try residentLastTokenPool(outputs.allocator, backend, reshaped, mask, batch, seq_len, hidden),
                     .max => error.UnsupportedResidentTextPooling,
                 };
@@ -1449,7 +1545,7 @@ pub const EmbeddingPipeline = struct {
 
         return switch (self.config.pooling) {
             .mean => try residentMaskedMeanPool(outputs.allocator, backend, output, mask, batch, seq_len, @intCast(shape[2])),
-            .cls => try residentClsPool(backend, output, batch, @intCast(shape[2])),
+            .cls => try residentClsPool(outputs.allocator, backend, output, batch, seq_len, @intCast(shape[2])),
             .last => try residentLastTokenPool(outputs.allocator, backend, output, mask, batch, seq_len, @intCast(shape[2])),
             .max => error.UnsupportedResidentTextPooling,
         };
@@ -1497,19 +1593,23 @@ pub const EmbeddingPipeline = struct {
     }
 
     fn residentClsPool(
+        allocator: std.mem.Allocator,
         backend: *const ops_mod.ComputeBackend,
         output: ops_mod.CT,
         batch: usize,
+        seq_len: usize,
         hidden: usize,
     ) !ResidentPooled {
-        const input_shape = [_]i64{ @intCast(batch), -1, @intCast(hidden) };
-        const starts = [_]i64{ 0, 0, 0 };
-        const limits = [_]i64{ @intCast(batch), 1, @intCast(hidden) };
-        const strides = [_]i64{ 1, 1, 1 };
-        const pooled_shape = [_]i64{ @intCast(batch), @intCast(hidden) };
-        const sliced = try backend.primSlice(output, &starts, &limits, &strides, &input_shape);
-        defer backend.free(sliced);
-        const pooled = try backend.primReshape(sliced, &pooled_shape);
+        // CUDA intentionally has no generic primSlice implementation.  Flatten
+        // [B,S,H] and use the resident take-rows primitive for positions b*S,
+        // which keeps CLS pooling on device for BERT/XLM-R encoders.
+        const flat_shape = [_]i64{ @intCast(batch * seq_len), @intCast(hidden) };
+        const flat = try backend.primReshape(output, &flat_shape);
+        defer backend.free(flat);
+        const row_ids = try allocator.alloc(u32, batch);
+        defer allocator.free(row_ids);
+        for (row_ids, 0..) |*row_id, b| row_id.* = @intCast(b * seq_len);
+        const pooled = (try backend.takeRows(flat, row_ids, batch, hidden)) orelse return error.UnsupportedResidentTextPooling;
         return .{ .value = pooled, .backend = backend, .owns_value = true };
     }
 

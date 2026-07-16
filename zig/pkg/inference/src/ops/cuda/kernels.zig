@@ -47,6 +47,16 @@ fn generatedGqaDecodeEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE", false);
 }
 
+// Kept switchable so the shape-specialized encoder prefill path can be
+// validated directly against the generic implementation on a given GPU.
+fn bertPrefillAttentionEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_BERT_PREFILL_ATTENTION", true);
+}
+
+fn bertPrefillAttentionQueryTilingEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_BERT_PREFILL_ATTENTION_Q8", true);
+}
+
 pub fn generatedGqaScorePreworkEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK", false);
 }
@@ -316,6 +326,7 @@ pub const JitProductionRoutes = struct {
 
 pub const JitModelProfile = enum {
     clipclap,
+    bert_encoder,
     deberta_reranker,
     gliner2,
     florence2,
@@ -341,7 +352,7 @@ pub const JitRouteScope = struct {
         return switch (profile) {
             // Current production CUDA JIT evidence is exclusively Gemma4
             // E2B/E4B Q4_0. Encoder models keep the bundled runtime.
-            .clipclap, .deberta_reranker, .gliner2, .florence2 => .{},
+            .clipclap, .bert_encoder, .deberta_reranker, .gliner2, .florence2 => .{},
             .gemma4 => .{ .production = .{
                 .mmv = true,
                 .mm = true,
@@ -945,6 +956,12 @@ pub const KernelModule = struct {
     conv2d_f32: driver_mod.CUfunction = null,
     attention_f32: driver_mod.CUfunction = null,
     attention_f32_block: driver_mod.CUfunction = null,
+    // Generated-shape BERT prefill attention: full, head-major [B,H,256,64].
+    // It replaces the legacy block-wide reduction performed once per key.
+    attention_f32_bert_prefill_s256_hd64: driver_mod.CUfunction = null,
+    // Eight independent query rows per block for the occupancy-sensitive
+    // encoder prefill path.
+    attention_f32_bert_prefill_s256_hd64_q8: driver_mod.CUfunction = null,
     cross_attention_f32: driver_mod.CUfunction = null,
     cross_attention_q1_f32: driver_mod.CUfunction = null,
     token_to_nchw_f32: driver_mod.CUfunction = null,
@@ -1914,6 +1931,8 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32, module, "termite_attention_f32"));
         var attention_f32_block: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32_block, module, "termite_attention_f32_block"));
+        const attention_f32_bert_prefill_s256_hd64 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64");
+        const attention_f32_bert_prefill_s256_hd64_q8 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64_q8");
         const cross_attention_f32 = loadOptionalFunction(ctx, module, "termite_cross_attention_f32");
         const cross_attention_q1_f32 = loadOptionalFunction(ctx, module, "termite_cross_attention_q1_f32");
         const token_to_nchw_f32 = loadOptionalFunction(ctx, module, "termite_token_to_nchw_f32");
@@ -2265,6 +2284,8 @@ pub const KernelModule = struct {
             .conv2d_f32 = conv2d_f32,
             .attention_f32 = attention_f32,
             .attention_f32_block = attention_f32_block,
+            .attention_f32_bert_prefill_s256_hd64 = attention_f32_bert_prefill_s256_hd64,
+            .attention_f32_bert_prefill_s256_hd64_q8 = attention_f32_bert_prefill_s256_hd64_q8,
             .cross_attention_f32 = cross_attention_f32,
             .cross_attention_q1_f32 = cross_attention_q1_f32,
             .token_to_nchw_f32 = token_to_nchw_f32,
@@ -2555,6 +2576,8 @@ pub const KernelModule = struct {
             self.conv2d_f32 = null;
             self.attention_f32 = null;
             self.attention_f32_block = null;
+            self.attention_f32_bert_prefill_s256_hd64 = null;
+            self.attention_f32_bert_prefill_s256_hd64_q8 = null;
             self.cross_attention_f32 = null;
             self.cross_attention_q1_f32 = null;
             self.token_to_nchw_f32 = null;
@@ -6106,7 +6129,18 @@ pub const KernelModule = struct {
             @ptrCast(&bias_mode_u32),
             @ptrCast(&head_major_u32),
         };
-        if (seq_len <= 512 and head_dim <= 128) {
+        if (bertPrefillAttentionEnabled() and bertPrefillAttentionQueryTilingEnabled() and !causal and !has_mask and bias_mode == 0 and head_major and
+            seq_len == 256 and head_dim == 64 and
+            self.attention_f32_bert_prefill_s256_hd64_q8 != null)
+        {
+            const query_tiles = seq_len / 8;
+            try launchBlocks(self.attention_f32_bert_prefill_s256_hd64_q8, ctx, try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles), 256, &params);
+        } else if (bertPrefillAttentionEnabled() and !causal and !has_mask and bias_mode == 0 and head_major and
+            seq_len == 256 and head_dim == 64 and
+            self.attention_f32_bert_prefill_s256_hd64 != null)
+        {
+            try launchBlocks(self.attention_f32_bert_prefill_s256_hd64, ctx, try checkedTensorElements(try checkedTensorElements(batch, seq_len), num_heads), 256, &params);
+        } else if (seq_len <= 512 and head_dim <= 128) {
             try launchBlocks(self.attention_f32_block, ctx, try checkedTensorElements(try checkedTensorElements(batch, seq_len), num_heads), 128, &params);
         } else {
             try launch1d(self.attention_f32, ctx, count, &params);
@@ -14566,6 +14600,7 @@ test "CUDA runtime JIT mappings cover complete artifact function bundles" {
 test "CUDA runtime JIT profile scope covers only Gemma4 production routes" {
     inline for (.{
         JitModelProfile.clipclap,
+        JitModelProfile.bert_encoder,
         JitModelProfile.deberta_reranker,
         JitModelProfile.gliner2,
         JitModelProfile.florence2,

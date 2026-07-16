@@ -2196,6 +2196,251 @@ extern "C" __global__ void termite_attention_f32_block(
     }
 }
 
+// Shape-specialized BERT encoder prefill attention for the BGE-M3/XLM-R hot
+// path: full attention over head-major [batch, heads, 256, 64] tensors.
+//
+// The generic block kernel above synchronizes a 128-thread block seven times
+// for *every* key. At sequence 256 that serializes thousands of barriers per
+// layer. This schedule gives eight warps independent key streams, reduces each
+// 64-wide QK dot with warp shuffles, then synchronizes only at the softmax
+// phase boundaries. It is deliberately narrow and selected only when all
+// semantics match exactly (non-causal, unmasked, unbiased, head-major S=256
+// and D=64); other attention routes retain the generic implementation.
+extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64(
+    float* dst,
+    const float* q,
+    const float* k,
+    const float* v,
+    const long long* mask,
+    const float* bias,
+    unsigned int batch,
+    unsigned int seq_len,
+    unsigned int num_heads,
+    unsigned int head_dim,
+    unsigned int causal,
+    unsigned int has_mask,
+    unsigned int bias_mode,
+    unsigned int head_major
+) {
+    (void)mask;
+    (void)bias;
+    (void)causal;
+    (void)has_mask;
+    (void)bias_mode;
+    (void)head_major;
+
+    const unsigned int row_id = blockIdx.x;
+    const unsigned int total_rows = batch * seq_len * num_heads;
+    if (row_id >= total_rows || seq_len != 256u || head_dim != 64u) return;
+
+    const unsigned int head = row_id % num_heads;
+    const unsigned int row = row_id / num_heads;
+    const unsigned int qi = row % seq_len;
+    const unsigned int b = row / seq_len;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int base = ((b * num_heads + head) * seq_len) * 64u;
+    const unsigned int q_base = base + qi * 64u;
+    const float q0 = q[q_base + lane];
+    const float q1 = q[q_base + lane + 32u];
+
+    __shared__ float scores[256];
+    __shared__ float reductions[8];
+    __shared__ float scratch[128];
+    __shared__ float shared_max;
+    __shared__ float shared_denom;
+
+    float local_max = -3.402823466e+38f;
+    for (unsigned int ki = warp; ki < 256u; ki += 8u) {
+        const unsigned int k_base = base + ki * 64u;
+        // Match the generic block kernel's separate products followed by a
+        // round-to-nearest tree add.  A fused multiply-add here is fast but
+        // causes enough encoder-layer drift to be visible in final embeddings.
+        const float dot_lo = q0 * k[k_base + lane];
+        const float dot_hi = q1 * k[k_base + lane + 32u];
+        float dot = __fadd_rn(dot_lo, dot_hi);
+        #pragma unroll
+        for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+            dot = __fadd_rn(dot, __shfl_down_sync(0xffffffffu, dot, offset));
+        }
+        if (lane == 0u) {
+            const float score = dot * 0.125f;
+            scores[ki] = score;
+            local_max = fmaxf(local_max, score);
+        }
+    }
+
+    if (lane == 0u) reductions[warp] = local_max;
+    __syncthreads();
+    if (warp == 0u) {
+        float value = lane < 8u ? reductions[lane] : -3.402823466e+38f;
+        #pragma unroll
+        for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+            value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, offset));
+        }
+        if (lane == 0u) shared_max = value;
+    }
+    __syncthreads();
+
+    // Preserve the generic S=256 denominator order: 128 lanes each sum two
+    // scores, then the same 128-way reduction tree.  This costs six phase
+    // barriers per row, versus seven barriers for every one of 256 keys.
+    if (tid < 128u) {
+        float denom_part = 0.0f;
+        #pragma unroll
+        for (unsigned int ki = tid; ki < 256u; ki += 128u) {
+            const float e = expf(scores[ki] - shared_max);
+            scores[ki] = e;
+            denom_part = __fadd_rn(denom_part, e);
+        }
+        scratch[tid] = denom_part;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (unsigned int stride = 64u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) scratch[tid] = __fadd_rn(scratch[tid], scratch[tid + stride]);
+        __syncthreads();
+    }
+    if (tid == 0u) shared_denom = scratch[0];
+    __syncthreads();
+
+    if (tid < 64u) {
+        float acc = 0.0f;
+        #pragma unroll 4
+        for (unsigned int ki = 0u; ki < 256u; ++ki) {
+            acc += scores[ki] * v[base + ki * 64u + tid];
+        }
+        dst[q_base + tid] = acc / shared_denom;
+    }
+}
+
+// Eight-query tile of the same S=256, D=64 BERT attention.  Each warp owns a
+// query row, which removes the cross-warp hand-offs in the single-query
+// schedule and gives BERT's medium-batch prefill enough independent work to
+// fill the GPU.  The reduction tree deliberately mirrors the single-query
+// generic kernel so encoder embeddings remain bit-stable.
+extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64_q8(
+    float* dst,
+    const float* q,
+    const float* k,
+    const float* v,
+    const long long* mask,
+    const float* bias,
+    unsigned int batch,
+    unsigned int seq_len,
+    unsigned int num_heads,
+    unsigned int head_dim,
+    unsigned int causal,
+    unsigned int has_mask,
+    unsigned int bias_mode,
+    unsigned int head_major
+) {
+    (void)mask;
+    (void)bias;
+    (void)causal;
+    (void)has_mask;
+    (void)bias_mode;
+    (void)head_major;
+
+    const unsigned int tile_id = blockIdx.x;
+    const unsigned int tiles_per_head = 32u;
+    const unsigned int total_tiles = batch * num_heads * tiles_per_head;
+    if (tile_id >= total_tiles || seq_len != 256u || head_dim != 64u) return;
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int tile = tile_id % tiles_per_head;
+    const unsigned int tmp = tile_id / tiles_per_head;
+    const unsigned int head = tmp % num_heads;
+    const unsigned int b = tmp / num_heads;
+    const unsigned int qi = tile * 8u + warp;
+    const unsigned int base = ((b * num_heads + head) * 256u) * 64u;
+    const unsigned int q_base = base + qi * 64u;
+    const float q0 = q[q_base + lane];
+    const float q1 = q[q_base + lane + 32u];
+
+    __shared__ float scores[8][256];
+    // One [32, 64] tile is reused for K and V.  At B8 the eight query warps
+    // otherwise repeatedly fetch the same 256-byte rows from global memory.
+    __shared__ float kv_tile[32][64];
+    float max_score = -3.402823466e+38f;
+    for (unsigned int key_start = 0u; key_start < 256u; key_start += 32u) {
+        for (unsigned int element = tid; element < 32u * 64u; element += blockDim.x) {
+            kv_tile[element / 64u][element % 64u] = k[base + key_start * 64u + element];
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int key = 0u; key < 32u; ++key) {
+            const float dot_lo = q0 * kv_tile[key][lane];
+            const float dot_hi = q1 * kv_tile[key][lane + 32u];
+            float dot = __fadd_rn(dot_lo, dot_hi);
+            #pragma unroll
+            for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+                dot = __fadd_rn(dot, __shfl_down_sync(0xffffffffu, dot, offset));
+            }
+            if (lane == 0u) {
+                const float score = dot * 0.125f;
+                scores[warp][key_start + key] = score;
+                max_score = fmaxf(max_score, score);
+            }
+        }
+        __syncthreads();
+    }
+    max_score = __shfl_sync(0xffffffffu, max_score, 0);
+    __syncwarp();
+
+    // Reconstruct the generic 128-lane denominator reduction exactly.  Each
+    // lane owns four of its partial sums, then the warp performs the remaining
+    // 32-way tail of that same reduction tree.
+    const unsigned int score_base = lane;
+    const float e0 = expf(scores[warp][score_base] - max_score);
+    const float e1 = expf(scores[warp][score_base + 32u] - max_score);
+    const float e2 = expf(scores[warp][score_base + 64u] - max_score);
+    const float e3 = expf(scores[warp][score_base + 96u] - max_score);
+    const float e4 = expf(scores[warp][score_base + 128u] - max_score);
+    const float e5 = expf(scores[warp][score_base + 160u] - max_score);
+    const float e6 = expf(scores[warp][score_base + 192u] - max_score);
+    const float e7 = expf(scores[warp][score_base + 224u] - max_score);
+    scores[warp][score_base] = e0;
+    scores[warp][score_base + 32u] = e1;
+    scores[warp][score_base + 64u] = e2;
+    scores[warp][score_base + 96u] = e3;
+    scores[warp][score_base + 128u] = e4;
+    scores[warp][score_base + 160u] = e5;
+    scores[warp][score_base + 192u] = e6;
+    scores[warp][score_base + 224u] = e7;
+    float denom = __fadd_rn(
+        __fadd_rn(__fadd_rn(e0, e4), __fadd_rn(e2, e6)),
+        __fadd_rn(__fadd_rn(e1, e5), __fadd_rn(e3, e7))
+    );
+    #pragma unroll
+    for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+        denom = __fadd_rn(denom, __shfl_down_sync(0xffffffffu, denom, offset));
+    }
+    denom = __shfl_sync(0xffffffffu, denom, 0);
+    __syncwarp();
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (unsigned int key_start = 0u; key_start < 256u; key_start += 32u) {
+        for (unsigned int element = tid; element < 32u * 64u; element += blockDim.x) {
+            kv_tile[element / 64u][element % 64u] = v[base + key_start * 64u + element];
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int key = 0u; key < 32u; ++key) {
+            const float weight = scores[warp][key_start + key];
+            acc0 += weight * kv_tile[key][lane];
+            acc1 += weight * kv_tile[key][lane + 32u];
+        }
+        __syncthreads();
+    }
+    dst[q_base + lane] = acc0 / denom;
+    dst[q_base + lane + 32u] = acc1 / denom;
+}
+
 extern "C" __global__ void termite_cross_attention_f32(
     float* dst,
     const float* q,

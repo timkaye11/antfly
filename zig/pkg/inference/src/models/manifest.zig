@@ -780,6 +780,8 @@ fn applyGgufTokenizerMetadata(
 
     const view = gguf_metadata.View.init(&parsed);
 
+    applyGgufEncoderMetadata(manifest, allocator, view) catch {};
+
     const gguf_model_name = view.getString("tokenizer.ggml.model");
     if (gguf_model_name) |model_name| {
         if (c_file.fileExistsInDir(allocator, model_dir_path, "tokenizer.model")) {
@@ -832,7 +834,11 @@ fn shouldUseBuiltInGemma4GgufChatTemplate(model_name: []const u8, chat_template:
 }
 
 fn supportsGgufSentencePieceFallback(model_name: []const u8) bool {
-    return std.mem.eql(u8, model_name, "llama") or std.mem.startsWith(u8, model_name, "gemma");
+    // llama.cpp's BERT writer uses this tokenizer label for XLM-R/BGE-M3.
+    return std.mem.eql(u8, model_name, "llama") or
+        std.mem.eql(u8, model_name, "bert") or
+        std.mem.eql(u8, model_name, "t5") or
+        std.mem.startsWith(u8, model_name, "gemma");
 }
 
 fn supportsGgufHuggingFaceFallback(model_name: []const u8) bool {
@@ -887,6 +893,50 @@ fn applyGgufSpecialTokenString(
     };
     if (target.*.len > 0) allocator.free(target.*);
     target.* = allocator.dupe(u8, token) catch return;
+}
+
+/// Apply the encoder contract carried by a standalone BERT GGUF. This makes
+/// the model usable without a neighbouring HuggingFace config.json, including
+/// llama.cpp BGE-M3 exports whose architecture is the generic `bert` tag.
+fn applyGgufEncoderMetadata(
+    manifest: *ModelManifest,
+    allocator: std.mem.Allocator,
+    view: gguf_metadata.View,
+) !void {
+    const arch = view.getString("general.architecture") orelse return;
+    if (!std.mem.eql(u8, arch, "bert")) return;
+
+    const config = bert.parseGgufMetadata(view) orelse return;
+    manifest.model_type = .embedder;
+    manifest.hidden_size = config.hidden_size;
+    manifest.intermediate_size = config.intermediate_size;
+    manifest.max_position_embeddings = config.max_position_embeddings;
+    manifest.num_hidden_layers = config.num_hidden_layers;
+    manifest.num_attention_heads = config.num_attention_heads;
+    manifest.bert_model_type = config.model_type;
+    manifest.normalize = true;
+    manifest.pooling = ggufBertPooling(view.getU64("bert.pooling_type") orelse 1);
+
+    if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
+    manifest.config_model_arch = try allocator.dupe(u8, if (config.model_type == .roberta) "xlm-roberta" else "bert");
+}
+
+/// llama.cpp's BERT GGUF enum: mean=1, cls=2, max=3, last=4. Unknown and
+/// omitted values preserve the portable sentence-transformer mean default.
+fn ggufBertPooling(value: u64) PoolingStrategy {
+    return switch (value) {
+        2 => .cls,
+        3 => .max,
+        4 => .last,
+        else => .mean,
+    };
+}
+
+test "llama BERT pooling metadata maps to the embedding pipeline contract" {
+    try std.testing.expectEqual(PoolingStrategy.mean, ggufBertPooling(1));
+    try std.testing.expectEqual(PoolingStrategy.cls, ggufBertPooling(2));
+    try std.testing.expectEqual(PoolingStrategy.max, ggufBertPooling(3));
+    try std.testing.expectEqual(PoolingStrategy.last, ggufBertPooling(4));
 }
 
 fn findMetadataEntry(parsed: *const gguf_format.File, key: []const u8) ?*const gguf_format.MetadataEntry {
