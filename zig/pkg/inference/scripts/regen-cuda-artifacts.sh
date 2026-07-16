@@ -162,6 +162,8 @@ required_symbols=(
   termite_linear_bf16_weight_f32_tiled
   termite_embedding_lookup_bf16_weight_f32
   termite_attention_f32_block
+  termite_attention_f32_bert_prefill_s256_hd64_q16
+  termite_attention_f32_bert_prefill_s256_hd64_mma
   termite_cross_attention_f32
   termite_cross_attention_q1_f32
   termite_token_to_nchw_f32

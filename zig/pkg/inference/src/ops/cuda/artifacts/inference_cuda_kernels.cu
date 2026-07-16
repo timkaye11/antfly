@@ -2441,6 +2441,316 @@ extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64_q8(
     dst[q_base + lane + 32u] = acc1 / denom;
 }
 
+// Sixteen-query version of the exact q8 schedule above. It preserves every
+// per-row arithmetic and reduction order, but doubles query rows per launch
+// block to reduce grid traffic and improve occupancy on encoder prefill.
+extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64_q16(
+    float* dst,
+    const float* q,
+    const float* k,
+    const float* v,
+    const long long* mask,
+    const float* bias,
+    unsigned int batch,
+    unsigned int seq_len,
+    unsigned int num_heads,
+    unsigned int head_dim,
+    unsigned int causal,
+    unsigned int has_mask,
+    unsigned int bias_mode,
+    unsigned int head_major
+) {
+    (void)mask;
+    (void)bias;
+    (void)causal;
+    (void)has_mask;
+    (void)bias_mode;
+    (void)head_major;
+
+    const unsigned long long tile_id = blockIdx.x;
+    const unsigned int tiles_per_head = 16u;
+    const unsigned long long total_tiles = static_cast<unsigned long long>(batch) * num_heads * tiles_per_head;
+    if (tile_id >= total_tiles || seq_len != 256u || head_dim != 64u || blockDim.x != 512u) return;
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int tile = static_cast<unsigned int>(tile_id % tiles_per_head);
+    const unsigned long long tmp = tile_id / tiles_per_head;
+    const unsigned int head = static_cast<unsigned int>(tmp % num_heads);
+    const unsigned int b = static_cast<unsigned int>(tmp / num_heads);
+    const unsigned int qi = tile * 16u + warp;
+    const size_t base = (static_cast<size_t>(b) * num_heads + head) * 256u * 64u;
+    const size_t q_base = base + qi * 64u;
+    const float q0 = q[q_base + lane];
+    const float q1 = q[q_base + lane + 32u];
+
+    __shared__ float scores[16][256];
+    __shared__ float kv_tile[32][64];
+    float max_score = -3.402823466e+38f;
+    for (unsigned int key_start = 0u; key_start < 256u; key_start += 32u) {
+        for (unsigned int element = tid; element < 32u * 64u; element += blockDim.x) {
+            kv_tile[element / 64u][element % 64u] = k[base + key_start * 64u + element];
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int key = 0u; key < 32u; ++key) {
+            const float dot_lo = q0 * kv_tile[key][lane];
+            const float dot_hi = q1 * kv_tile[key][lane + 32u];
+            float dot = __fadd_rn(dot_lo, dot_hi);
+            #pragma unroll
+            for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+                dot = __fadd_rn(dot, __shfl_down_sync(0xffffffffu, dot, offset));
+            }
+            if (lane == 0u) {
+                const float score = dot * 0.125f;
+                scores[warp][key_start + key] = score;
+                max_score = fmaxf(max_score, score);
+            }
+        }
+        __syncthreads();
+    }
+    max_score = __shfl_sync(0xffffffffu, max_score, 0);
+    __syncwarp();
+
+    const unsigned int score_base = lane;
+    const float e0 = expf(scores[warp][score_base] - max_score);
+    const float e1 = expf(scores[warp][score_base + 32u] - max_score);
+    const float e2 = expf(scores[warp][score_base + 64u] - max_score);
+    const float e3 = expf(scores[warp][score_base + 96u] - max_score);
+    const float e4 = expf(scores[warp][score_base + 128u] - max_score);
+    const float e5 = expf(scores[warp][score_base + 160u] - max_score);
+    const float e6 = expf(scores[warp][score_base + 192u] - max_score);
+    const float e7 = expf(scores[warp][score_base + 224u] - max_score);
+    scores[warp][score_base] = e0;
+    scores[warp][score_base + 32u] = e1;
+    scores[warp][score_base + 64u] = e2;
+    scores[warp][score_base + 96u] = e3;
+    scores[warp][score_base + 128u] = e4;
+    scores[warp][score_base + 160u] = e5;
+    scores[warp][score_base + 192u] = e6;
+    scores[warp][score_base + 224u] = e7;
+    float denom = __fadd_rn(
+        __fadd_rn(__fadd_rn(e0, e4), __fadd_rn(e2, e6)),
+        __fadd_rn(__fadd_rn(e1, e5), __fadd_rn(e3, e7))
+    );
+    #pragma unroll
+    for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+        denom = __fadd_rn(denom, __shfl_down_sync(0xffffffffu, denom, offset));
+    }
+    denom = __shfl_sync(0xffffffffu, denom, 0);
+    __syncwarp();
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (unsigned int key_start = 0u; key_start < 256u; key_start += 32u) {
+        for (unsigned int element = tid; element < 32u * 64u; element += blockDim.x) {
+            kv_tile[element / 64u][element % 64u] = v[base + key_start * 64u + element];
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int key = 0u; key < 32u; ++key) {
+            const float weight = scores[warp][key_start + key];
+            acc0 += weight * kv_tile[key][lane];
+            acc1 += weight * kv_tile[key][lane + 32u];
+        }
+        __syncthreads();
+    }
+    dst[q_base + lane] = acc0 / denom;
+    dst[q_base + lane + 32u] = acc1 / denom;
+}
+
+// Opt-in WMMA candidate for full BERT/XLM-R prefill attention. A block owns
+// 16 query rows for one [batch, head] pair and streams all 256 keys in four
+// 64-key tiles. QK stays FP32 to preserve encoder embedding quality. The
+// dominant P*V term uses f16 tensor cores and then adds the two FP32 residual
+// terms, so value/probability narrowing does not change the result. Online
+// softmax and output stay f32. This is separate from the exact q8 path above.
+extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64_mma(
+    float* dst,
+    const float* q,
+    const float* k,
+    const float* v,
+    const long long* mask,
+    const float* bias,
+    unsigned int batch,
+    unsigned int seq_len,
+    unsigned int num_heads,
+    unsigned int head_dim,
+    unsigned int causal,
+    unsigned int has_mask,
+    unsigned int bias_mode,
+    unsigned int head_major
+) {
+    (void)mask;
+    (void)bias;
+    (void)causal;
+    (void)has_mask;
+    (void)bias_mode;
+    (void)head_major;
+
+    constexpr unsigned int tile_m = 16u;
+    constexpr unsigned int tile_n = 64u;
+    constexpr unsigned int dim = 64u;
+    constexpr unsigned int kv_pitch = 72u;
+    constexpr unsigned int score_pitch = 72u;
+    constexpr float attention_scale = 0.125f;
+    const unsigned long long tile_id = blockIdx.x;
+    const unsigned int tiles_per_head = 16u;
+    const unsigned long long total_tiles = static_cast<unsigned long long>(batch) * num_heads * tiles_per_head;
+    if (tile_id >= total_tiles || seq_len != 256u || head_dim != dim || blockDim.x != 256u) return;
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int tile = static_cast<unsigned int>(tile_id % tiles_per_head);
+    const unsigned long long tmp = tile_id / tiles_per_head;
+    const unsigned int head = static_cast<unsigned int>(tmp % num_heads);
+    const unsigned int b = static_cast<unsigned int>(tmp / num_heads);
+    const unsigned int query_start = tile * tile_m;
+    const size_t base = (static_cast<size_t>(b) * num_heads + head) * 256u * dim;
+
+    extern __shared__ __align__(32) unsigned char mma_smem[];
+    half* kv_tile = reinterpret_cast<half*>(mma_smem) + tile_m * dim;
+    float* scores = reinterpret_cast<float*>(kv_tile + tile_n * kv_pitch);
+    float* probabilities = scores + tile_m * score_pitch;
+    half* probabilities_hi = reinterpret_cast<half*>(probabilities + tile_m * score_pitch);
+    float* value_tile = reinterpret_cast<float*>(probabilities_hi + tile_m * score_pitch);
+    float* output = value_tile + tile_n * kv_pitch;
+    __shared__ float alpha[tile_m];
+
+    for (unsigned int index = tid; index < tile_m * dim; index += blockDim.x) {
+        output[index] = 0.0f;
+    }
+    __syncthreads();
+
+    float max0 = -3.402823466e+38f;
+    float max1 = -3.402823466e+38f;
+    float denom0 = 0.0f;
+    float denom1 = 0.0f;
+
+    for (unsigned int key_start = 0u; key_start < 256u; key_start += tile_n) {
+        // One warp owns two query rows. Its lanes evaluate two score columns
+        // apiece, matching the FP32 dot-product contract of the exact path.
+        #pragma unroll
+        for (unsigned int sub = 0u; sub < 2u; ++sub) {
+            const unsigned int row = warp * 2u + sub;
+            const unsigned int ja = lane;
+            const unsigned int jb = lane + 32u;
+            float score_a = 0.0f;
+            float score_b = 0.0f;
+            #pragma unroll
+            for (unsigned int d = 0u; d < dim; ++d) {
+                const float query = q[base + (query_start + row) * dim + d];
+                score_a += query * k[base + (key_start + ja) * dim + d];
+                score_b += query * k[base + (key_start + jb) * dim + d];
+            }
+            scores[row * score_pitch + ja] = score_a;
+            scores[row * score_pitch + jb] = score_b;
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (unsigned int sub = 0u; sub < 2u; ++sub) {
+            const unsigned int row = warp * 2u + sub;
+            const unsigned int ja = lane;
+            const unsigned int jb = lane + 32u;
+            const float score_a = scores[row * score_pitch + ja] * attention_scale;
+            const float score_b = scores[row * score_pitch + jb] * attention_scale;
+            float tile_max = fmaxf(score_a, score_b);
+            #pragma unroll
+            for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+                tile_max = fmaxf(tile_max, __shfl_down_sync(0xffffffffu, tile_max, offset));
+            }
+            tile_max = __shfl_sync(0xffffffffu, tile_max, 0u);
+
+            float* running_max = sub == 0u ? &max0 : &max1;
+            float* running_denom = sub == 0u ? &denom0 : &denom1;
+            const float new_max = fmaxf(*running_max, tile_max);
+            const float scale_old = *running_max > -3.402823466e+38f ? expf(*running_max - new_max) : 0.0f;
+            const float p_a = expf(score_a - new_max);
+            const float p_b = expf(score_b - new_max);
+            float sum = p_a + p_b;
+            #pragma unroll
+            for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+                sum += __shfl_down_sync(0xffffffffu, sum, offset);
+            }
+            sum = __shfl_sync(0xffffffffu, sum, 0u);
+            *running_max = new_max;
+            *running_denom = *running_denom * scale_old + sum;
+            probabilities[row * score_pitch + ja] = p_a;
+            probabilities[row * score_pitch + jb] = p_b;
+            probabilities_hi[row * score_pitch + ja] = __float2half(p_a);
+            probabilities_hi[row * score_pitch + jb] = __float2half(p_b);
+            if (lane == 0u) alpha[row] = scale_old;
+        }
+        __syncthreads();
+
+        for (unsigned int index = tid; index < tile_m * dim; index += blockDim.x) {
+            const unsigned int row = index / dim;
+            output[index] *= alpha[row];
+        }
+        for (unsigned int index = tid; index < tile_n * dim; index += blockDim.x) {
+            const unsigned int row = index / dim;
+            const unsigned int col = index % dim;
+            const float value = v[base + (key_start + row) * dim + col];
+            kv_tile[row * kv_pitch + col] = __float2half(value);
+            value_tile[row * kv_pitch + col] = value;
+        }
+        __syncthreads();
+
+        if (warp < 4u) {
+            const unsigned int column_chunk = warp;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> output_acc;
+            wmma::load_matrix_sync(output_acc, output + column_chunk * 16u, dim, wmma::mem_row_major);
+            #pragma unroll
+            for (unsigned int kb = 0u; kb < 4u; ++kb) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
+                wmma::load_matrix_sync(p_frag, probabilities_hi + kb * 16u, score_pitch);
+                wmma::load_matrix_sync(v_frag, kv_tile + (kb * 16u) * kv_pitch + column_chunk * 16u, kv_pitch);
+                wmma::mma_sync(output_acc, p_frag, v_frag, output_acc);
+            }
+            wmma::store_matrix_sync(output + column_chunk * 16u, output_acc, dim, wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        // Reconstruct P*V exactly with respect to the full-precision softmax
+        // probability and value: p*v = ph*vh + (p-ph)*v + ph*(v-vh).
+        // Tensor cores compute the first, dominant term; each thread owns two
+        // output columns for the two rows assigned to its warp.
+        const unsigned int row0 = warp * 2u;
+        const unsigned int row1 = row0 + 1u;
+        for (unsigned int col = lane; col < dim; col += 32u) {
+            float correction0 = 0.0f;
+            float correction1 = 0.0f;
+            #pragma unroll
+            for (unsigned int key = 0u; key < tile_n; ++key) {
+                const float p0 = probabilities[row0 * score_pitch + key];
+                const float p1 = probabilities[row1 * score_pitch + key];
+                const float ph0 = __half2float(probabilities_hi[row0 * score_pitch + key]);
+                const float ph1 = __half2float(probabilities_hi[row1 * score_pitch + key]);
+                const float value = value_tile[key * kv_pitch + col];
+                const float value_hi = __half2float(kv_tile[key * kv_pitch + col]);
+                correction0 += (p0 - ph0) * value + ph0 * (value - value_hi);
+                correction1 += (p1 - ph1) * value + ph1 * (value - value_hi);
+            }
+            output[row0 * dim + col] += correction0;
+            output[row1 * dim + col] += correction1;
+        }
+        __syncthreads();
+    }
+
+    const unsigned int row0 = warp * 2u;
+    const unsigned int row1 = row0 + 1u;
+    const float inv_denom0 = denom0 > 0.0f ? 1.0f / denom0 : 0.0f;
+    const float inv_denom1 = denom1 > 0.0f ? 1.0f / denom1 : 0.0f;
+    for (unsigned int col = lane; col < dim; col += 32u) {
+        dst[base + (query_start + row0) * dim + col] = output[row0 * dim + col] * inv_denom0;
+        dst[base + (query_start + row1) * dim + col] = output[row1 * dim + col] * inv_denom1;
+    }
+}
+
 extern "C" __global__ void termite_cross_attention_f32(
     float* dst,
     const float* q,

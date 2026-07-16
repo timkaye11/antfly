@@ -57,6 +57,70 @@ fn bertPrefillAttentionQueryTilingEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_BERT_PREFILL_ATTENTION_Q8", true);
 }
 
+const BertPrefillAttentionMode = enum {
+    generic,
+    exact,
+    exact_q8,
+    tensor_core,
+};
+
+const bert_prefill_attention_mma_seq_len: usize = 256;
+const bert_prefill_attention_mma_head_dim: usize = 64;
+const bert_prefill_attention_mma_query_tile: usize = 16;
+const bert_prefill_attention_mma_threads: usize = 256;
+// f16 V-hi plus f32 S/P/V/O. QK is exact FP32; the P*V residual correction
+// fits below CUDA's 48 KiB default dynamic-shared-memory limit.
+const bert_prefill_attention_mma_shared_bytes: usize = 45312;
+
+fn parseBertPrefillAttentionMode(value: []const u8) ?BertPrefillAttentionMode {
+    if (std.ascii.eqlIgnoreCase(value, "generic")) return .generic;
+    if (std.ascii.eqlIgnoreCase(value, "exact")) return .exact;
+    if (std.ascii.eqlIgnoreCase(value, "exact-q8") or std.ascii.eqlIgnoreCase(value, "exact_q8")) return .exact_q8;
+    if (std.ascii.eqlIgnoreCase(value, "tensor-core") or
+        std.ascii.eqlIgnoreCase(value, "tensor_core") or
+        std.ascii.eqlIgnoreCase(value, "mma")) return .tensor_core;
+    return null;
+}
+
+// `exact` is the production default. Tensor-core is a deliberate opt-in: it
+// changes the FP32 Q/K/V arithmetic contract, so it must be qualified for a
+// model and retrieval-quality target before deployment. The legacy boolean is
+// retained for existing experiment scripts; MODE is the canonical interface.
+fn bertPrefillAttentionMode() BertPrefillAttentionMode {
+    if (!bertPrefillAttentionEnabled()) return .generic;
+    if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_BERT_PREFILL_ATTENTION_MODE")) |value| {
+        return parseBertPrefillAttentionMode(value) orelse .exact;
+    }
+    if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_BERT_PREFILL_ATTENTION_MMA", false)) return .tensor_core;
+    return .exact;
+}
+
+fn bertPrefillAttentionMmaComputeEligible(compute_major: i32, compute_minor: i32) bool {
+    // The checked-in portable CUDA artifact targets sm_75. Do not select a
+    // WMMA symbol on an older device and rely on module-load/JIT failure.
+    return compute_major > 7 or (compute_major == 7 and compute_minor >= 5);
+}
+
+fn bertPrefillAttentionMmaShapeEligible(
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    causal: bool,
+    has_mask: bool,
+    bias_mode: u32,
+    head_major: bool,
+) bool {
+    return batch > 0 and
+        num_heads > 0 and
+        !causal and
+        !has_mask and
+        bias_mode == 0 and
+        head_major and
+        seq_len == bert_prefill_attention_mma_seq_len and
+        head_dim == bert_prefill_attention_mma_head_dim;
+}
+
 pub fn generatedGqaScorePreworkEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK", false);
 }
@@ -962,6 +1026,10 @@ pub const KernelModule = struct {
     // Eight independent query rows per block for the occupancy-sensitive
     // encoder prefill path.
     attention_f32_bert_prefill_s256_hd64_q8: driver_mod.CUfunction = null,
+    // Exact sixteen-query tile. It preserves q8 arithmetic while reducing
+    // prefill grid traffic for the BERT 256x64 contract.
+    attention_f32_bert_prefill_s256_hd64_q16: driver_mod.CUfunction = null,
+    attention_f32_bert_prefill_s256_hd64_mma: driver_mod.CUfunction = null,
     cross_attention_f32: driver_mod.CUfunction = null,
     cross_attention_q1_f32: driver_mod.CUfunction = null,
     token_to_nchw_f32: driver_mod.CUfunction = null,
@@ -1933,6 +2001,8 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32_block, module, "termite_attention_f32_block"));
         const attention_f32_bert_prefill_s256_hd64 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64");
         const attention_f32_bert_prefill_s256_hd64_q8 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64_q8");
+        const attention_f32_bert_prefill_s256_hd64_q16 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64_q16");
+        const attention_f32_bert_prefill_s256_hd64_mma = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64_mma");
         const cross_attention_f32 = loadOptionalFunction(ctx, module, "termite_cross_attention_f32");
         const cross_attention_q1_f32 = loadOptionalFunction(ctx, module, "termite_cross_attention_q1_f32");
         const token_to_nchw_f32 = loadOptionalFunction(ctx, module, "termite_token_to_nchw_f32");
@@ -2286,6 +2356,8 @@ pub const KernelModule = struct {
             .attention_f32_block = attention_f32_block,
             .attention_f32_bert_prefill_s256_hd64 = attention_f32_bert_prefill_s256_hd64,
             .attention_f32_bert_prefill_s256_hd64_q8 = attention_f32_bert_prefill_s256_hd64_q8,
+            .attention_f32_bert_prefill_s256_hd64_q16 = attention_f32_bert_prefill_s256_hd64_q16,
+            .attention_f32_bert_prefill_s256_hd64_mma = attention_f32_bert_prefill_s256_hd64_mma,
             .cross_attention_f32 = cross_attention_f32,
             .cross_attention_q1_f32 = cross_attention_q1_f32,
             .token_to_nchw_f32 = token_to_nchw_f32,
@@ -2578,6 +2650,8 @@ pub const KernelModule = struct {
             self.attention_f32_block = null;
             self.attention_f32_bert_prefill_s256_hd64 = null;
             self.attention_f32_bert_prefill_s256_hd64_q8 = null;
+            self.attention_f32_bert_prefill_s256_hd64_q16 = null;
+            self.attention_f32_bert_prefill_s256_hd64_mma = null;
             self.cross_attention_f32 = null;
             self.cross_attention_q1_f32 = null;
             self.token_to_nchw_f32 = null;
@@ -6129,13 +6203,40 @@ pub const KernelModule = struct {
             @ptrCast(&bias_mode_u32),
             @ptrCast(&head_major_u32),
         };
-        if (bertPrefillAttentionEnabled() and bertPrefillAttentionQueryTilingEnabled() and !causal and !has_mask and bias_mode == 0 and head_major and
+        const attention_mode = bertPrefillAttentionMode();
+        if (attention_mode == .tensor_core and
+            bertPrefillAttentionMmaComputeEligible(ctx.info.compute_major, ctx.info.compute_minor) and
+            bertPrefillAttentionMmaShapeEligible(batch, seq_len, num_heads, head_dim, causal, has_mask, bias_mode, head_major) and
+            self.attention_f32_bert_prefill_s256_hd64_mma != null)
+        {
+            const query_tiles = seq_len / bert_prefill_attention_mma_query_tile;
+            try launchBlocksShared(
+                self.attention_f32_bert_prefill_s256_hd64_mma,
+                ctx,
+                try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles),
+                bert_prefill_attention_mma_threads,
+                bert_prefill_attention_mma_shared_bytes,
+                &params,
+            );
+        } else if (attention_mode == .exact and !causal and !has_mask and bias_mode == 0 and head_major and
+            seq_len == bert_prefill_attention_mma_seq_len and head_dim == bert_prefill_attention_mma_head_dim and
+            self.attention_f32_bert_prefill_s256_hd64_q16 != null)
+        {
+            const query_tiles = seq_len / 16;
+            try launchBlocks(
+                self.attention_f32_bert_prefill_s256_hd64_q16,
+                ctx,
+                try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles),
+                512,
+                &params,
+            );
+        } else if (attention_mode != .generic and bertPrefillAttentionQueryTilingEnabled() and !causal and !has_mask and bias_mode == 0 and head_major and
             seq_len == 256 and head_dim == 64 and
             self.attention_f32_bert_prefill_s256_hd64_q8 != null)
         {
             const query_tiles = seq_len / 8;
             try launchBlocks(self.attention_f32_bert_prefill_s256_hd64_q8, ctx, try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles), 256, &params);
-        } else if (bertPrefillAttentionEnabled() and !causal and !has_mask and bias_mode == 0 and head_major and
+        } else if (attention_mode != .generic and !causal and !has_mask and bias_mode == 0 and head_major and
             seq_len == 256 and head_dim == 64 and
             self.attention_f32_bert_prefill_s256_hd64 != null)
         {
@@ -17634,6 +17735,31 @@ test "generated CUDA GQA decode shape supports bounded ratios" {
     try std.testing.expect(!generatedGqaDecodeShapeEligible(1, 1, 256, 18, 4));
     try std.testing.expect(!generatedGqaDecodeShapeEligible(1, 1, 256, 17, 1));
     try std.testing.expect(!generatedGqaDecodeShapeEligible(1, 1, 512, 40, 5));
+}
+
+test "BERT tensor-core prefill mode is explicit and shape-bounded" {
+    try std.testing.expectEqual(BertPrefillAttentionMode.generic, parseBertPrefillAttentionMode("generic").?);
+    try std.testing.expectEqual(BertPrefillAttentionMode.exact, parseBertPrefillAttentionMode("exact").?);
+    try std.testing.expectEqual(BertPrefillAttentionMode.exact_q8, parseBertPrefillAttentionMode("exact-q8").?);
+    try std.testing.expectEqual(BertPrefillAttentionMode.tensor_core, parseBertPrefillAttentionMode("tensor-core").?);
+    try std.testing.expectEqual(BertPrefillAttentionMode.tensor_core, parseBertPrefillAttentionMode("MMA").?);
+    try std.testing.expect(parseBertPrefillAttentionMode("fast") == null);
+
+    try std.testing.expect(bertPrefillAttentionMmaComputeEligible(7, 5));
+    try std.testing.expect(bertPrefillAttentionMmaComputeEligible(8, 0));
+    try std.testing.expect(!bertPrefillAttentionMmaComputeEligible(7, 0));
+    try std.testing.expect(!bertPrefillAttentionMmaComputeEligible(6, 1));
+
+    try std.testing.expect(bertPrefillAttentionMmaShapeEligible(1, 256, 12, 64, false, false, 0, true));
+    try std.testing.expect(bertPrefillAttentionMmaShapeEligible(32, 256, 12, 64, false, false, 0, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(0, 256, 12, 64, false, false, 0, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(1, 512, 12, 64, false, false, 0, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(1, 256, 12, 128, false, false, 0, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(1, 256, 12, 64, true, false, 0, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(1, 256, 12, 64, false, true, 0, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(1, 256, 12, 64, false, false, 1, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(1, 256, 12, 64, false, false, 0, false));
+    try std.testing.expectEqual(@as(usize, 45312), bert_prefill_attention_mma_shared_bytes);
 }
 
 test "generated CUDA paged score prework has a strict production boundary" {

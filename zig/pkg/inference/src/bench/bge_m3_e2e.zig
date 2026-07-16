@@ -31,6 +31,7 @@ const session_factory = inference.architectures.session_factory;
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 const BackendChoice = enum { native, cuda };
+const AttentionKernel = enum { generic, exact, exact_q8, tensor_core };
 
 const Options = struct {
     model_dir: []const u8 = "",
@@ -39,7 +40,10 @@ const Options = struct {
     seq_len: usize = 256,
     warmup_iters: usize = 2,
     measure_iters: usize = 10,
+    attention_kernel: AttentionKernel = .exact,
     validate_specialized_attention: bool = false,
+    min_attention_cosine: ?f64 = null,
+    max_attention_abs: ?f32 = null,
     kernel_jit: kernel_jit.Config = .{},
 };
 
@@ -84,6 +88,7 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArguments;
     }
     if (opts.backend == .cuda and !build_options.enable_cuda) return error.CudaNotEnabled;
+    if (opts.validate_specialized_attention and opts.attention_kernel == .generic) return error.InvalidAttentionValidationKernel;
 
     var session_manager = backends.SessionManager.initWithIo(allocator, init.io);
     session_manager.preferred_backends = switch (opts.backend) {
@@ -110,6 +115,7 @@ pub fn main(init: std.process.Init) !void {
     if (opts.backend == .cuda and !pipeline.config.resident_text_encoder) {
         return error.ResidentTextEncoderUnavailable;
     }
+    if (opts.backend == .cuda) try setAttentionKernel(opts.attention_kernel);
 
     const token_count = std.math.mul(usize, opts.batch, opts.seq_len) catch return error.InvalidInputShape;
     const input_ids = try allocator.alloc(i64, token_count);
@@ -132,11 +138,33 @@ pub fn main(init: std.process.Init) !void {
         try setAttentionKernelEnabled(false);
         const generic = try pipeline.embedTokenized(input_ids, attention_mask, opts.batch, opts.seq_len);
         defer freeEmbeddings(allocator, generic);
-        try setAttentionKernelEnabled(true);
+        try setAttentionKernel(opts.attention_kernel);
         const specialized = try pipeline.embedTokenized(input_ids, attention_mask, opts.batch, opts.seq_len);
         defer freeEmbeddings(allocator, specialized);
         break :blk compareEmbeddings(generic, specialized);
     } else null;
+
+    if (opts.min_attention_cosine != null or opts.max_attention_abs != null) {
+        const validation = attention_validation orelse return error.AttentionValidationRequired;
+        if (opts.min_attention_cosine) |minimum| {
+            if (validation.cosine < minimum) {
+                std.debug.print(
+                    "bge_m3_e2e attention_quality_gate=failed metric=cosine actual={d:.8} minimum={d:.8}\n",
+                    .{ validation.cosine, minimum },
+                );
+                return error.AttentionCosineBelowThreshold;
+            }
+        }
+        if (opts.max_attention_abs) |maximum| {
+            if (validation.max_abs > maximum) {
+                std.debug.print(
+                    "bge_m3_e2e attention_quality_gate=failed metric=max_abs actual={d:.7} maximum={d:.7}\n",
+                    .{ validation.max_abs, maximum },
+                );
+                return error.AttentionMaxAbsAboveThreshold;
+            }
+        }
+    }
 
     const before_cuda = session_factory.getCudaRuntimeStats(model.session);
     const before_resident = model.resident_projection_stats.snapshot();
@@ -197,10 +225,17 @@ pub fn main(init: std.process.Init) !void {
 
     const total_ns: u64 = total(samples);
     const embeddings_per_second = if (total_ns == 0) 0.0 else @as(f64, @floatFromInt(opts.batch * opts.measure_iters)) / (@as(f64, @floatFromInt(total_ns)) / 1.0e9);
+    var resident_text_buf: [48]u8 = undefined;
+    const resident_text = try std.fmt.bufPrint(
+        &resident_text_buf,
+        "{}/{}",
+        .{ resident.text_success - before_resident.text_success, resident.text_fallback - before_resident.text_fallback },
+    );
     std.debug.print(
-        "bge_m3_e2e backend={s} batch={} seq_len={} iters={} avg_ms={d:.3} p50_ms={d:.3} p95_ms={d:.3} min_ms={d:.3} max_ms={d:.3} embeddings_s={d:.2} resident_text={}/{} h2d_bytes={} d2h_bytes={} to_float32_calls={} to_float32_bytes={} bf16_cublaslt_linear_calls={} bf16_cublaslt_qkv_calls={} bf16_activation_staging_calls={} bf16_activation_mirror_hits={} generated_q4_0_mm_hits={} linear_launches={} attention_launches={} prefill_profile_events={} prefill_bf16_linear_us={} prefill_bf16_qkv_us={} prefill_attention_us={} prefill_staging_us={} prefill_norm_us={} checksum={d:.6} attention_max_abs={d:.7} attention_cosine={d:.8}\n",
+        "bge_m3_e2e backend={s} attention_kernel={s} batch={} seq_len={} iters={} avg_ms={d:.3} p50_ms={d:.3} p95_ms={d:.3} min_ms={d:.3} max_ms={d:.3} embeddings_s={d:.2} resident_text={s} h2d_bytes={} d2h_bytes={} to_float32_calls={} to_float32_bytes={} bf16_cublaslt_linear_calls={} bf16_cublaslt_qkv_calls={} bf16_activation_staging_calls={} bf16_activation_mirror_hits={} generated_q4_0_mm_hits={} linear_launches={} attention_launches={} prefill_profile_events={} prefill_bf16_linear_us={} prefill_bf16_qkv_us={} prefill_attention_us={} prefill_staging_us={} prefill_norm_us={} checksum={d:.6} attention_max_abs={d:.7} attention_cosine={d:.8}\n",
         .{
             @tagName(opts.backend),
+            attentionKernelName(opts.attention_kernel),
             opts.batch,
             opts.seq_len,
             opts.measure_iters,
@@ -210,8 +245,7 @@ pub fn main(init: std.process.Init) !void {
             nsToMs(timing.min_ns),
             nsToMs(timing.max_ns),
             embeddings_per_second,
-            resident.text_success - before_resident.text_success,
-            resident.text_fallback - before_resident.text_fallback,
+            resident_text,
             cuda.h2d_bytes,
             cuda.d2h_bytes,
             cuda.to_float32_calls,
@@ -254,8 +288,14 @@ fn parseArgs(init: std.process.Init) !Options {
             opts.warmup_iters = try std.fmt.parseInt(usize, args.next() orelse return error.MissingWarmupIters, 10);
         } else if (std.mem.eql(u8, arg, "--measure-iters")) {
             opts.measure_iters = try std.fmt.parseInt(usize, args.next() orelse return error.MissingMeasureIters, 10);
+        } else if (std.mem.eql(u8, arg, "--attention-kernel")) {
+            opts.attention_kernel = parseAttentionKernel(args.next() orelse return error.MissingAttentionKernel) orelse return error.InvalidAttentionKernel;
         } else if (std.mem.eql(u8, arg, "--validate-specialized-attention")) {
             opts.validate_specialized_attention = true;
+        } else if (std.mem.eql(u8, arg, "--min-attention-cosine")) {
+            opts.min_attention_cosine = try std.fmt.parseFloat(f64, args.next() orelse return error.MissingAttentionCosine);
+        } else if (std.mem.eql(u8, arg, "--max-attention-abs")) {
+            opts.max_attention_abs = try std.fmt.parseFloat(f32, args.next() orelse return error.MissingAttentionMaxAbs);
         } else if (std.mem.eql(u8, arg, "--kernel-jit-mode")) {
             opts.kernel_jit.mode = std.meta.stringToEnum(kernel_jit.Mode, args.next() orelse return error.MissingKernelJitMode) orelse return error.InvalidKernelJitMode;
         } else if (std.mem.eql(u8, arg, "--kernel-jit-cache-dir")) {
@@ -271,7 +311,50 @@ fn parseArgs(init: std.process.Init) !Options {
         }
     }
     try opts.kernel_jit.validate();
+    if (opts.min_attention_cosine) |minimum| {
+        if (minimum < -1 or minimum > 1) return error.InvalidAttentionCosine;
+    }
+    if (opts.max_attention_abs) |maximum| {
+        if (maximum < 0) return error.InvalidAttentionMaxAbs;
+    }
     return opts;
+}
+
+fn parseAttentionKernel(value: []const u8) ?AttentionKernel {
+    if (std.ascii.eqlIgnoreCase(value, "generic")) return .generic;
+    if (std.ascii.eqlIgnoreCase(value, "exact")) return .exact;
+    if (std.ascii.eqlIgnoreCase(value, "exact-q8") or std.ascii.eqlIgnoreCase(value, "exact_q8")) return .exact_q8;
+    if (std.ascii.eqlIgnoreCase(value, "tensor-core") or
+        std.ascii.eqlIgnoreCase(value, "tensor_core") or
+        std.ascii.eqlIgnoreCase(value, "mma")) return .tensor_core;
+    return null;
+}
+
+fn attentionKernelName(kernel: AttentionKernel) []const u8 {
+    return switch (kernel) {
+        .generic => "generic",
+        .exact => "exact",
+        .exact_q8 => "exact-q8",
+        .tensor_core => "tensor-core",
+    };
+}
+
+fn attentionKernelEnvValue(kernel: AttentionKernel) [*:0]const u8 {
+    return switch (kernel) {
+        .generic => "generic",
+        .exact => "exact",
+        .exact_q8 => "exact-q8",
+        .tensor_core => "tensor-core",
+    };
+}
+
+fn setAttentionKernel(kernel: AttentionKernel) !void {
+    if (setenv("ANTFLY_INFERENCE_CUDA_BERT_PREFILL_ATTENTION", "1", 1) != 0) {
+        return error.EnvironmentMutationFailed;
+    }
+    if (setenv("ANTFLY_INFERENCE_CUDA_BERT_PREFILL_ATTENTION_MODE", attentionKernelEnvValue(kernel), 1) != 0) {
+        return error.EnvironmentMutationFailed;
+    }
 }
 
 fn setAttentionKernelEnabled(enabled: bool) !void {
@@ -351,7 +434,7 @@ fn nsToMs(ns: u64) f64 {
 
 fn printUsage() void {
     std.debug.print(
-        "usage: zig build bench-bge-m3-e2e -- --model-dir <bge-m3-q4_0.gguf|dir> [--backend cuda|native] [--batch N] [--seq-len 256] [--warmup-iters N] [--measure-iters N] [--kernel-jit-mode off|shadow|on|required]\n",
+        "usage: zig build bench-bge-m3-e2e -- --model-dir <bge-m3-q4_0.gguf|dir> [--backend cuda|native] [--batch N] [--seq-len 256] [--warmup-iters N] [--measure-iters N] [--attention-kernel generic|exact|exact-q8|tensor-core] [--validate-specialized-attention] [--min-attention-cosine N] [--max-attention-abs N] [--kernel-jit-mode off|shadow|on|required]\n",
         .{},
     );
 }
