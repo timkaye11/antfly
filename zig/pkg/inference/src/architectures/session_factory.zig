@@ -1638,7 +1638,9 @@ fn detectArchitectureFromGguf(allocator: std.mem.Allocator, gguf_path: []const u
         return .{ .gpt = refined };
     }
     if (bert.parseGgufMetadata(meta)) |cfg| {
-        return .{ .bert = cfg };
+        var refined = cfg;
+        refineBertConfigFromGgufTensorInfo(&refined, file);
+        return .{ .bert = refined };
     }
     if (t5_mod.parseGgufMetadata(meta)) |cfg| {
         return .{ .t5 = cfg };
@@ -1795,6 +1797,16 @@ pub fn refineGptConfigFromGgufTensorInfo(config: *gpt_mod.Config, file: *const g
 
 fn refineGptConfigFromGgufFile(config: *gpt_mod.Config, file: *const gguf_mod.format.File) void {
     refineGptConfigFromGgufTensorInfo(config, file);
+}
+
+/// BERT-family GGUF conversions (e.g. bge-m3) may omit `bert.vocab_size`;
+/// the embedding tensor's row count is authoritative.
+fn refineBertConfigFromGgufTensorInfo(config: *bert.Config, file: *const gguf_mod.format.File) void {
+    if (findGgufTensor(file, "token_embd.weight")) |tensor| {
+        if (tensor.dimensions.len >= 2) {
+            config.vocab_size = @intCast(tensor.dimensions[tensor.dimensions.len - 1]);
+        }
+    }
 }
 
 fn findGgufTensor(file: *const gguf_mod.format.File, name: []const u8) ?*const gguf_mod.format.TensorInfo {
