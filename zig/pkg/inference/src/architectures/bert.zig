@@ -81,6 +81,24 @@ fn bertEmbeddingLayerNormSlot(layer_count: usize) usize {
     return layer_count * bert_layer_norm_specs.len;
 }
 
+fn metalBertWeightMirrorMaxBytes() usize {
+    const mb = platform.env.getenvUsize("TERMITE_METAL_BERT_WEIGHT_MIRROR_MAX_MB") orelse 768;
+    return std.math.mul(usize, mb, 1024 * 1024) catch std.math.maxInt(usize);
+}
+
+fn bertDenseMirrorBytes(config: Config, bytes_per_element: usize) ?usize {
+    const layers: usize = config.num_hidden_layers;
+    const hidden: usize = config.hidden_size;
+    const intermediate: usize = config.intermediate_size;
+    const hidden_squared = std.math.mul(usize, hidden, hidden) catch return null;
+    const hidden_intermediate = std.math.mul(usize, hidden, intermediate) catch return null;
+    const hidden_projections = std.math.mul(usize, hidden_squared, 4) catch return null;
+    const ffn_projections = std.math.mul(usize, hidden_intermediate, 2) catch return null;
+    const elements_per_layer = std.math.add(usize, hidden_projections, ffn_projections) catch return null;
+    const total_elements = std.math.mul(usize, elements_per_layer, layers) catch return null;
+    return std.math.mul(usize, total_elements, bytes_per_element) catch null;
+}
+
 fn preplanMetalEncoder(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config) !bool {
     if (cb.kind() != .metal or !metalEncoderFrameEnabled() or cb.decoderRuntimeHasActiveFrame()) return false;
 
@@ -89,6 +107,24 @@ fn preplanMetalEncoder(cb: *const ComputeBackend, allocator: std.mem.Allocator, 
     const intermediate: usize = @intCast(config.intermediate_size);
     const heads: usize = @intCast(config.num_attention_heads);
     if (layer_count == 0 or hidden == 0 or intermediate == 0 or heads == 0 or hidden % heads != 0) return false;
+    const weight_mirrors_requested = !platform.env.getenvBool("TERMITE_METAL_DISABLE_BERT_WEIGHT_MIRRORS") and
+        !platform.env.getenvBool("TERMITE_METAL_DISABLE_BERT_Q8_STAGING");
+    const prefer_q8_mirrors = weight_mirrors_requested and platform.env.getenvBool("TERMITE_METAL_BERT_USE_Q8_MIRRORS");
+    const prefer_bf16_requested = weight_mirrors_requested and !prefer_q8_mirrors and
+        platform.env.getenvBool("TERMITE_METAL_BERT_USE_BF16_MIRRORS");
+    const prefer_f32_requested = weight_mirrors_requested and !prefer_q8_mirrors and !prefer_bf16_requested and
+        platform.env.getenvBool("TERMITE_METAL_BERT_USE_F32_MIRRORS");
+    const mirror_bytes = bertDenseMirrorBytes(config, if (prefer_f32_requested) @sizeOf(f32) else @sizeOf(u16)) orelse
+        std.math.maxInt(usize);
+    // ponytail: keep one explicit aggregate ceiling until the runtime exposes
+    // the Metal device's working-set budget to architecture preplanning.
+    const weight_mirrors_enabled = weight_mirrors_requested and mirror_bytes <= metalBertWeightMirrorMaxBytes();
+    const prefer_bf16_mirrors = weight_mirrors_enabled and !prefer_q8_mirrors and
+        prefer_bf16_requested;
+    const prefer_f32_mps_mirrors = weight_mirrors_enabled and !prefer_q8_mirrors and !prefer_bf16_mirrors and
+        prefer_f32_requested;
+    const prefer_f16_mps_mirrors = weight_mirrors_enabled and !prefer_q8_mirrors and !prefer_bf16_mirrors and
+        !prefer_f32_mps_mirrors;
 
     for (0..layer_count) |layer| {
         for (bert_linear_specs) |spec| {
@@ -104,7 +140,17 @@ fn preplanMetalEncoder(cb: *const ComputeBackend, allocator: std.mem.Allocator, 
                 .bias = bias,
                 .in_dim = if (spec.input_intermediate) intermediate else hidden,
                 .out_dim = if (spec.output_intermediate) intermediate else hidden,
-                .retain_dense_fallback = true,
+                .retain_dense_fallback = weight_mirrors_enabled,
+                // Prefill-shaped encoder GEMMs reuse an F16 mirror so Metal can
+                // use its mixed F32/F16 matrix path, matching CUDA's hybrid-
+                // residency strategy. The packed quantized weight remains the
+                // source of truth; direct, Q8, BF16, and F32 mirrors stay
+                // available for A/B runs.
+                .dense_fallback_max_bytes = if (weight_mirrors_enabled) 32 * 1024 * 1024 else null,
+                .allow_direct_quant_fallback = weight_mirrors_enabled,
+                .prefer_bf16_fallback = prefer_bf16_mirrors,
+                .prefer_f16_mps_fallback = prefer_f16_mps_mirrors,
+                .prefer_f32_mps_fallback = prefer_f32_mps_mirrors,
             }))) return false;
         }
 
@@ -153,6 +199,49 @@ pub fn forward(
     return cb.toFloat32(hidden, allocator);
 }
 
+fn validateBertForwardInputs(
+    config: Config,
+    input_ids: []const i64,
+    attention_mask: []const i64,
+    token_type_ids: ?[]const i64,
+    batch: usize,
+    seq_len: usize,
+) !usize {
+    const hidden: usize = config.hidden_size;
+    const intermediate: usize = config.intermediate_size;
+    const heads: usize = config.num_attention_heads;
+    const max_positions: usize = config.max_position_embeddings;
+    if (batch == 0 or seq_len == 0 or hidden == 0 or intermediate == 0 or heads == 0 or
+        hidden % heads != 0 or max_positions == 0 or seq_len > max_positions)
+    {
+        return error.InvalidShape;
+    }
+    if (batch > std.math.maxInt(i32) or seq_len > std.math.maxInt(i32) or
+        hidden > std.math.maxInt(i32) or intermediate > std.math.maxInt(i32))
+    {
+        return error.InvalidShape;
+    }
+    const total = std.math.mul(usize, batch, seq_len) catch return error.InvalidShape;
+    if (total > std.math.maxInt(i32)) return error.InvalidShape;
+    _ = std.math.mul(usize, total, hidden) catch return error.InvalidShape;
+    _ = std.math.mul(usize, total, intermediate) catch return error.InvalidShape;
+    if (input_ids.len != total or attention_mask.len != total) return error.InvalidShape;
+
+    for (input_ids) |token_id| {
+        if (token_id < 0 or token_id >= config.vocab_size) return error.InvalidTokenId;
+    }
+    for (attention_mask) |value| {
+        if (value != 0 and value != 1) return error.InvalidAttentionMask;
+    }
+    if (token_type_ids) |values| {
+        if (values.len != total or config.type_vocab_size == 0) return error.InvalidShape;
+        for (values) |token_type_id| {
+            if (token_type_id < 0 or token_type_id >= config.type_vocab_size) return error.InvalidTokenTypeId;
+        }
+    }
+    return total;
+}
+
 /// Run the encoder while keeping intermediate tensors on the backend.
 pub fn forwardCt(
     cb: *const ComputeBackend,
@@ -165,7 +254,7 @@ pub fn forwardCt(
     seq_len: usize,
 ) !CT {
     const H = config.hidden_size;
-    const total = batch * seq_len;
+    const total = try validateBertForwardInputs(config, input_ids, attention_mask, token_type_ids, batch, seq_len);
     // ponytail: prepare on first use; move this to session warmup if cold-request latency matters.
     const resident_slots = try preplanMetalEncoder(cb, allocator, config);
 
@@ -292,10 +381,8 @@ fn embeddings(
     // Position embeddings
     const pos_emb = try cb.getWeight("embeddings.position_embeddings.weight");
     defer cb.free(pos_emb);
-    // Build position IDs: [0, 1, ..., seq_len-1] repeated for each batch item
-    const pos_ids = try allocator.alloc(i64, total);
+    const pos_ids = try buildPositionIds(allocator, config, input_ids, total, seq_len);
     defer allocator.free(pos_ids);
-    for (0..total) |i| pos_ids[i] = @intCast(i % seq_len);
     const pos_lookup = try cb.embeddingLookup(pos_emb, pos_ids, total, H);
     defer cb.free(pos_lookup);
 
@@ -342,6 +429,41 @@ fn embeddings(
     return normed;
 }
 
+fn buildPositionIds(
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    total: usize,
+    seq_len: usize,
+) ![]i64 {
+    if (seq_len == 0 or seq_len > config.max_position_embeddings or input_ids.len < total or total % seq_len != 0) {
+        return error.InvalidShape;
+    }
+    const pos_ids = try allocator.alloc(i64, total);
+    errdefer allocator.free(pos_ids);
+    switch (config.position_id_mode) {
+        .absolute => {
+            for (0..total) |i| pos_ids[i] = @intCast(i % seq_len);
+        },
+        .roberta_padding => {
+            if (config.pad_token_id < 0) return error.InvalidTokenId;
+            for (0..total / seq_len) |batch_index| {
+                var next = std.math.add(i64, config.pad_token_id, 1) catch return error.InvalidShape;
+                for (0..seq_len) |sequence_index| {
+                    const index = batch_index * seq_len + sequence_index;
+                    if (input_ids[index] == config.pad_token_id) {
+                        pos_ids[index] = config.pad_token_id;
+                    } else {
+                        pos_ids[index] = next;
+                        next = std.math.add(i64, next, 1) catch return error.InvalidShape;
+                    }
+                }
+            }
+        },
+    }
+    return pos_ids;
+}
+
 fn encoderLayer(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -368,57 +490,32 @@ fn encoderLayer(
     }
     const local_num_heads = if (use_tp) num_heads / tp_world_size else num_heads;
 
-    const Q = try layerLinearWithSlot(
-        cb,
-        allocator,
-        layer,
-        hidden,
-        "attention.self.query.weight",
-        "attention.self.query.bias",
-        total,
-        hidden_dim,
-        hidden_dim,
-        if (resident_slots) bertLinearSlot(layer, .q) else null,
-        &name_buf,
-    );
-    defer {
-        cb.free(Q);
-    }
-
-    const K = try layerLinearWithSlot(
-        cb,
-        allocator,
-        layer,
-        hidden,
-        "attention.self.key.weight",
-        "attention.self.key.bias",
-        total,
-        hidden_dim,
-        hidden_dim,
-        if (resident_slots) bertLinearSlot(layer, .k) else null,
-        &name_buf,
-    );
-    defer {
-        cb.free(K);
-    }
-
-    const V = try layerLinearWithSlot(
-        cb,
-        allocator,
-        layer,
-        hidden,
-        "attention.self.value.weight",
-        "attention.self.value.bias",
-        total,
-        hidden_dim,
-        hidden_dim,
-        if (resident_slots) bertLinearSlot(layer, .v) else null,
-        &name_buf,
-    );
-    defer {
-        cb.free(V);
-    }
-    const attn_out = try cb.scaledDotProductAttention(Q, K, V, attention_mask, null, batch, seq_len, local_num_heads, head_dim);
+    const qkv: ops.LinearTripleResult = if (resident_slots and !platform.env.getenvBool("TERMITE_METAL_DISABLE_BERT_QKV")) blk: {
+        if (try cb.decoderRuntimeApplyLinearQkv(&.{
+            .q_slot = bertLinearSlot(layer, .q),
+            .k_slot = bertLinearSlot(layer, .k),
+            .v_slot = bertLinearSlot(layer, .v),
+            .input = hidden,
+            .in_dim = hidden_dim,
+            .q_out_dim = hidden_dim,
+            .kv_out_dim = hidden_dim,
+        })) |projected| {
+            break :blk .{
+                .first = projected.first,
+                .second = projected.second,
+                .third = projected.third,
+            };
+        }
+        break :blk try layerLinearTriple(cb, allocator, layer, hidden, total, hidden_dim, &name_buf);
+    } else try layerLinearTriple(cb, allocator, layer, hidden, total, hidden_dim, &name_buf);
+    defer cb.free(qkv.first);
+    defer cb.free(qkv.second);
+    defer cb.free(qkv.third);
+    const attn_out = if (allAttentionMaskOnes(attention_mask, total))
+        (try cb.scaledDotProductAttentionFull(qkv.first, qkv.second, qkv.third, null, batch, seq_len, local_num_heads, head_dim)) orelse
+            try cb.scaledDotProductAttention(qkv.first, qkv.second, qkv.third, attention_mask, null, batch, seq_len, local_num_heads, head_dim)
+    else
+        try cb.scaledDotProductAttention(qkv.first, qkv.second, qkv.third, attention_mask, null, batch, seq_len, local_num_heads, head_dim);
     defer {
         cb.free(attn_out);
     }
@@ -551,6 +648,36 @@ fn getLayerWeight(cb: *const ComputeBackend, _: std.mem.Allocator, layer: usize,
     return cb.getWeight(name);
 }
 
+fn layerLinearTriple(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    layer: usize,
+    input: CT,
+    rows: usize,
+    hidden_dim: usize,
+    name_buf: *[256]u8,
+) !ops.LinearTripleResult {
+    const q_w = try getLayerWeight(cb, allocator, layer, "attention.self.query.weight", name_buf);
+    defer cb.free(q_w);
+    const q_b = try getLayerWeight(cb, allocator, layer, "attention.self.query.bias", name_buf);
+    defer cb.free(q_b);
+    const k_w = try getLayerWeight(cb, allocator, layer, "attention.self.key.weight", name_buf);
+    defer cb.free(k_w);
+    const k_b = try getLayerWeight(cb, allocator, layer, "attention.self.key.bias", name_buf);
+    defer cb.free(k_b);
+    const v_w = try getLayerWeight(cb, allocator, layer, "attention.self.value.weight", name_buf);
+    defer cb.free(v_w);
+    const v_b = try getLayerWeight(cb, allocator, layer, "attention.self.value.bias", name_buf);
+    defer cb.free(v_b);
+    return cb.linearTriple(input, q_w, q_b, k_w, k_b, v_w, v_b, rows, hidden_dim, hidden_dim);
+}
+
+fn allAttentionMaskOnes(mask: []const i64, total: usize) bool {
+    if (mask.len < total) return false;
+    for (mask[0..total]) |value| if (value == 0) return false;
+    return true;
+}
+
 fn tensorParallelWorldSize(cb: *const ComputeBackend) usize {
     _ = cb;
     return 1;
@@ -615,4 +742,41 @@ test "BERT resident slot layout is stable and non-overlapping" {
     try std.testing.expectEqual(@as(usize, 143), bertLinearSlot(23, .output));
     try std.testing.expectEqual(@as(usize, 47), bertLayerNormSlot(23, .output));
     try std.testing.expectEqual(@as(usize, 48), bertEmbeddingLayerNormSlot(24));
+}
+
+test "RoBERTa position ids preserve padding indices" {
+    const config = Config{ .position_id_mode = .roberta_padding, .pad_token_id = 1 };
+    const input_ids = [_]i64{ 0, 42, 1, 9, 1, 1, 5, 6 };
+    const positions = try buildPositionIds(std.testing.allocator, config, &input_ids, input_ids.len, 4);
+    defer std.testing.allocator.free(positions);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3, 1, 4, 1, 1, 2, 3 }, positions);
+}
+
+test "BERT forward input validation rejects unsafe public inputs" {
+    const config = Config{
+        .vocab_size = 16,
+        .hidden_size = 8,
+        .intermediate_size = 16,
+        .num_attention_heads = 2,
+        .max_position_embeddings = 4,
+    };
+    const ids = [_]i64{ 1, 2, 3, 4 };
+    const mask = [_]i64{ 1, 1, 1, 0 };
+    try std.testing.expectEqual(@as(usize, 4), try validateBertForwardInputs(config, &ids, &mask, null, 1, 4));
+
+    const invalid_mask = [_]i64{ 1, 1, -1, 0 };
+    try std.testing.expectError(
+        error.InvalidAttentionMask,
+        validateBertForwardInputs(config, &ids, &invalid_mask, null, 1, 4),
+    );
+    try std.testing.expectError(error.InvalidShape, validateBertForwardInputs(config, &ids, &mask, null, 1, 5));
+}
+
+test "BGE-M3 F16 mirror estimate stays within the production default" {
+    const config = Config{
+        .hidden_size = 1024,
+        .intermediate_size = 4096,
+        .num_hidden_layers = 24,
+    };
+    try std.testing.expectEqual(@as(usize, 576 * 1024 * 1024), bertDenseMirrorBytes(config, @sizeOf(u16)).?);
 }

@@ -324,6 +324,32 @@ pub fn renderKernel(
     return out.toOwnedSlice(allocator);
 }
 
+/// Renders a single-dispatch Q/K/V projection for one homogeneous quant
+/// format and output shape. The z grid selects Q, K, or V, so the exact tuned
+/// schedule is reused without a second kernel family or packed weight layout.
+pub fn renderQkvKernel(
+    allocator: std.mem.Allocator,
+    kernel_id: []const u8,
+    decoder: FormatDecoder,
+    schedule: KernelSchedule,
+) ![]u8 {
+    const block_values = decoder.format.valuesPerBlock() orelse return error.MissingBlockValues;
+    const block_bytes = decoder.format.bytesPerBlock() orelse return error.MissingBlockBytes;
+    if (decoder.format != .q4_k and decoder.format != .q6_k) return error.QkvRequiresSupportedFormat;
+    try schedule.validate(block_values);
+    try validateEpilogueSchedule(schedule, .none);
+    try validateTiledSchedule(decoder.format, schedule, .none);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    var emitted_names = EmittedNames{};
+    for (decoder.helpers) |helper| try emitHelper(allocator, &out, &emitted_names, helper);
+    try out.appendSlice(allocator, decoder.lane_decode_msl);
+    try out.append(allocator, '\n');
+    try renderQkvBody(allocator, &out, kernel_id, decoder, schedule, block_values, block_bytes);
+    return out.toOwnedSlice(allocator);
+}
+
 // ---- Microkernels (non-matmul fused ops) ---------------------------------
 
 /// Renders the full standalone MSL for a fused microkernel. Microkernels are
@@ -868,11 +894,7 @@ fn renderBody(
     block_values: usize,
     block_bytes: usize,
 ) !void {
-    const threads = schedule.threads_per_threadgroup;
-    const mask = block_values - 1;
-    const shift = log2Usize(block_values);
     const has_bias = epilogue == .bias or epilogue == .bias_gelu;
-    const two_col = schedule.cols_per_threadgroup == 2;
 
     // Signature. Buffer layout: input=0, weight=1, [bias=2], output, rows,
     // in_dim, out_dim; bias shifts output and the scalars up by one slot.
@@ -884,8 +906,45 @@ fn renderBody(
         "";
     try appendFmt(allocator, out, "kernel void {s}(device const float *input [[buffer(0)]], device const uchar *{s} [[buffer(1)]], {s}device float *output [[buffer({d})]], constant int &rows [[buffer({d})]], constant int &in_dim [[buffer({d})]], constant int &out_dim [[buffer({d})]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]{s}) {{\n", .{ kernel_id, decoder.weight_param, bias_param, out_idx, out_idx + 1, out_idx + 2, out_idx + 3, simd_params });
 
+    try renderMatmulComputation(allocator, out, decoder, schedule, epilogue, block_values, block_bytes);
+    try out.appendSlice(allocator, "}\n");
+}
+
+fn renderQkvBody(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    kernel_id: []const u8,
+    decoder: FormatDecoder,
+    schedule: KernelSchedule,
+    block_values: usize,
+    block_bytes: usize,
+) !void {
+    const simd_params = if (schedule.reduction == .hybrid_simd or schedule.reduction == .simdgroup_tiled or schedule.reduction == .simdgroup_matrix)
+        ", ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]"
+    else
+        "";
+    try appendFmt(allocator, out, "kernel void {s}(device const float *input [[buffer(0)]], device const uchar *weight_q [[buffer(1)]], device const uchar *weight_k [[buffer(2)]], device const uchar *weight_v [[buffer(3)]], device float *output_q [[buffer(4)]], device float *output_k [[buffer(5)]], device float *output_v [[buffer(6)]], constant int &rows [[buffer(7)]], constant int &in_dim [[buffer(8)]], constant int &out_dim [[buffer(9)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]{s}) {{\n", .{ kernel_id, simd_params });
+    try appendFmt(allocator, out, "    if (group_pos.z >= 3u) return; device const uchar *{s} = group_pos.z == 0u ? weight_q : (group_pos.z == 1u ? weight_k : weight_v); device float *output = group_pos.z == 0u ? output_q : (group_pos.z == 1u ? output_k : output_v);\n", .{decoder.weight_param});
+    try renderMatmulComputation(allocator, out, decoder, schedule, .none, block_values, block_bytes);
+    try out.appendSlice(allocator, "}\n");
+}
+
+fn renderMatmulComputation(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    decoder: FormatDecoder,
+    schedule: KernelSchedule,
+    epilogue: Epilogue,
+    block_values: usize,
+    block_bytes: usize,
+) !void {
+    const threads = schedule.threads_per_threadgroup;
+    const mask = block_values - 1;
+    const shift = log2Usize(block_values);
+    const two_col = schedule.cols_per_threadgroup == 2;
+
     if (schedule.reduction == .simdgroup_matrix) {
-        try renderSimdgroupMatrixBody(allocator, out, decoder);
+        try renderSimdgroupMatrixBody(allocator, out, decoder, schedule);
     } else if (schedule.reduction == .simdgroup_tiled) {
         switch (decoder.format) {
             .q4_0 => try renderPackedQ4_0TiledBody(allocator, out, decoder, schedule),
@@ -898,40 +957,50 @@ fn renderBody(
     } else {
         try renderSingleColBody(allocator, out, decoder, schedule, epilogue, threads, mask, shift, block_values, block_bytes);
     }
-    try out.appendSlice(allocator, "}\n");
 }
 
 fn renderSimdgroupMatrixBody(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     decoder: FormatDecoder,
+    schedule: KernelSchedule,
 ) !void {
-    try out.appendSlice(allocator,
-        \\    const uint tid = thread_pos.x; const uint first_o = group_pos.x * 64u;
-        \\    if (rows != 40 || in_dim <= 0 || (uint(in_dim) & 255u) != 0u || out_dim <= 0 || first_o >= uint(out_dim)) return;
-        \\    threadgroup uchar shared[10240]; threadgroup half *weight_tile = (threadgroup half *)shared; threadgroup half *input_tile = weight_tile + 2048;
-        \\    simdgroup_half8x8 mw[8]; simdgroup_half8x8 mx; simdgroup_float8x8 acc[8];
-        \\    for (uint i = 0u; i < 8u; ++i) acc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
-        \\    const uint block_count = uint(in_dim) >> 8; const uint sg_row = uint(simdgroup_id) * 8u;
-        \\    for (uint k0 = 0u; k0 < uint(in_dim); k0 += 32u) {
-        \\        for (uint index = tid; index < 2048u; index += 160u) { uint k = index >> 6; uint col = index & 63u; uint global_col = first_o + col; uint global_k = k0 + k; half value = half(0.0f); if (global_col < uint(out_dim)) { device const uchar *block =
+    const tile_rows: usize = schedule.rows_per_threadgroup;
+    const threads: usize = schedule.threads_per_threadgroup;
+    const input_elements = tile_rows * 32;
+    const result_elements = tile_rows * 64;
+    const shared_bytes = @max((2048 + input_elements) * @sizeOf(f16), result_elements * @sizeOf(f32));
+    try appendFmt(
+        allocator,
+        out,
+        "    const uint tid = thread_pos.x; const uint first_o = group_pos.x * 64u; const uint first_r = group_pos.y * {d}u;\n" ++
+            "    if (rows < 2 || in_dim <= 0 || (uint(in_dim) & 255u) != 0u || out_dim <= 0 || first_r >= uint(rows) || first_o >= uint(out_dim)) return;\n" ++
+            "    threadgroup uchar shared[{d}]; threadgroup half *weight_tile = (threadgroup half *)shared; threadgroup half *input_tile = weight_tile + 2048;\n" ++
+            "    simdgroup_half8x8 mw[8]; simdgroup_half8x8 mx; simdgroup_float8x8 acc[8];\n" ++
+            "    for (uint i = 0u; i < 8u; ++i) acc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n" ++
+            "    const uint block_count = uint(in_dim) >> 8; const uint sg_row = uint(simdgroup_id) * 8u;\n" ++
+            "    for (uint k0 = 0u; k0 < uint(in_dim); k0 += 32u) {{\n" ++
+            "        for (uint index = tid; index < 2048u; index += {d}u) {{ uint k = index >> 6; uint col = index & 63u; uint global_col = first_o + col; uint global_k = k0 + k; half value = half(0.0f); if (global_col < uint(out_dim)) {{ device const uchar *block = ",
+        .{ tile_rows, shared_bytes, threads },
     );
     try out.appendSlice(allocator, decoder.weight_param);
     try out.appendSlice(allocator, " + (global_col * block_count + (global_k >> 8)) * ");
     try appendFmt(allocator, out, "{d}u", .{decoder.format.bytesPerBlock().?});
     try out.appendSlice(allocator, "; value = half(");
     try out.appendSlice(allocator, decoder.lane_decode_fn);
-    try out.appendSlice(allocator,
-        \\(block, int(global_k & 255u))); } weight_tile[k * 64u + col] = value; }
-        \\        for (uint index = tid; index < 1280u; index += 160u) { uint row = index >> 5; uint k = index & 31u; input_tile[row * 32u + k] = half(input[row * uint(in_dim) + k0 + k]); }
-        \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-        \\        for (uint k = 0u; k < 32u; k += 8u) { for (uint i = 0u; i < 8u; ++i) simdgroup_load(mw[i], weight_tile + k * 64u + i * 8u, 64u); simdgroup_load(mx, input_tile + sg_row * 32u + k, 32u); for (uint i = 0u; i < 8u; ++i) simdgroup_multiply_accumulate(acc[i], mx, mw[i], acc[i]); }
-        \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-        \\    }
-        \\    threadgroup float *result_tile = (threadgroup float *)shared; for (uint i = 0u; i < 8u; ++i) simdgroup_store(acc[i], result_tile + sg_row * 64u + i * 8u, 64u);
-        \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-        \\    for (uint index = tid; index < 2560u; index += 160u) { uint row = index >> 6; uint col = index & 63u; if (first_o + col < uint(out_dim)) output[row * uint(out_dim) + first_o + col] = result_tile[index]; }
-        \\
+    try appendFmt(
+        allocator,
+        out,
+        "(block, int(global_k & 255u))); }} weight_tile[k * 64u + col] = value; }}\n" ++
+            "        for (uint index = tid; index < {d}u; index += {d}u) {{ uint row = index >> 5; uint k = index & 31u; uint global_row = first_r + row; input_tile[row * 32u + k] = global_row < uint(rows) ? half(input[global_row * uint(in_dim) + k0 + k]) : half(0.0f); }}\n" ++
+            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n" ++
+            "        for (uint k = 0u; k < 32u; k += 8u) {{ for (uint i = 0u; i < 8u; ++i) simdgroup_load(mw[i], weight_tile + k * 64u + i * 8u, 64u); simdgroup_load(mx, input_tile + sg_row * 32u + k, 32u); for (uint i = 0u; i < 8u; ++i) simdgroup_multiply_accumulate(acc[i], mx, mw[i], acc[i]); }}\n" ++
+            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n" ++
+            "    }}\n" ++
+            "    threadgroup float *result_tile = (threadgroup float *)shared; for (uint i = 0u; i < 8u; ++i) simdgroup_store(acc[i], result_tile + sg_row * 64u + i * 8u, 64u);\n" ++
+            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n" ++
+            "    for (uint index = tid; index < {d}u; index += {d}u) {{ uint row = index >> 6; uint col = index & 63u; uint global_row = first_r + row; if (global_row < uint(rows) && first_o + col < uint(out_dim)) output[global_row * uint(out_dim) + first_o + col] = result_tile[index]; }}\n",
+        .{ input_elements, threads, result_elements, threads },
     );
 }
 
@@ -1025,7 +1094,7 @@ fn renderQ4KTiledBody(
     const cols_per_simdgroup = schedule.cols_per_threadgroup / @as(u8, @intCast(simdgroups));
 
     try appendFmt(allocator, out, "    const uint NSG = {d}u; const uint NC = {d}u; const uint NR = {d}u; const uint first_o = (group_pos.x * NSG + uint(simdgroup_id)) * NC; const uint first_r = group_pos.y * NR;\n", .{ simdgroups, cols_per_simdgroup, schedule.rows_per_threadgroup });
-    try appendFmt(allocator, out, "    if (rows < 2 || rows > 64 || in_dim <= 0 || (uint(in_dim) & 255u) != 0u || out_dim <= 0 || first_r >= uint(rows) || first_o >= uint(out_dim)) return; const uint block_count = uint(in_dim) >> 8; const uint sub = uint(lane_id) >> 2; const uint j0 = (uint(lane_id) & 3u) << 3; const uint chunk = sub >> 1; const bool high = (sub & 1u) != 0u; float acc[{d}][{d}]; for (uint c = 0u; c < NC; ++c) for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] = 0.0f;\n", .{ cols_per_simdgroup, schedule.rows_per_threadgroup });
+    try appendFmt(allocator, out, "    if (rows < 2 || in_dim <= 0 || (uint(in_dim) & 255u) != 0u || out_dim <= 0 || first_r >= uint(rows) || first_o >= uint(out_dim)) return; const uint block_count = uint(in_dim) >> 8; const uint sub = uint(lane_id) >> 2; const uint j0 = (uint(lane_id) & 3u) << 3; const uint chunk = sub >> 1; const bool high = (sub & 1u) != 0u; float acc[{d}][{d}]; for (uint c = 0u; c < NC; ++c) for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] = 0.0f;\n", .{ cols_per_simdgroup, schedule.rows_per_threadgroup });
     try appendFmt(allocator, out, "    for (uint b = 0u; b < block_count; ++b) {{ uint input_off = first_r * uint(in_dim) + b * 256u + sub * 32u + j0; float x[{d}][8]; for (uint rr = 0u; rr < NR; ++rr) for (uint i = 0u; i < 8u; ++i) x[rr][i] = first_r + rr < uint(rows) ? input[input_off + rr * uint(in_dim) + i] : 0.0f;\n", .{schedule.rows_per_threadgroup});
     try appendFmt(allocator, out, "        for (uint c = 0u; c < NC; ++c) {{ uint col = first_o + c; if (col >= uint(out_dim)) continue; device const uchar *block = {s} + (col * block_count + b) * 144u; float raw_scale = 0.0f; float raw_min = 0.0f; antfly_qk_unpack_scale_min_6bit(block + 4u, int(sub), raw_scale, raw_min); float dsc = antfly_qk_half_le_to_float(block) * raw_scale; float dmn = antfly_qk_half_le_to_float(block + 2u) * raw_min; device const uchar *qs = block + 16u + chunk * 32u + j0; for (uint i = 0u; i < 8u; ++i) {{ uchar packed = qs[i]; float w = dsc * float(high ? packed >> 4 : packed & 0x0fu) - dmn; for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] += x[rr][i] * w; }} }} }}\n", .{decoder.weight_param});
     const write = try writeExpr(allocator, "total", "col", epilogue);
@@ -1046,7 +1115,7 @@ fn renderQ6KTiledBody(
     const cols_per_simdgroup = schedule.cols_per_threadgroup / @as(u8, @intCast(simdgroups));
 
     try appendFmt(allocator, out, "    const uint NSG = {d}u; const uint NC = {d}u; const uint NR = {d}u; const uint first_o = (group_pos.x * NSG + uint(simdgroup_id)) * NC; const uint first_r = group_pos.y * NR;\n", .{ simdgroups, cols_per_simdgroup, schedule.rows_per_threadgroup });
-    try appendFmt(allocator, out, "    if (rows < 2 || rows > 64 || in_dim <= 0 || (uint(in_dim) & 255u) != 0u || out_dim <= 0 || first_r >= uint(rows) || first_o >= uint(out_dim)) return; const uint block_count = uint(in_dim) >> 8; const uint sub = uint(lane_id) >> 1; const uint j0 = (uint(lane_id) & 1u) << 3; const uint half_idx = sub >> 3; const uint group = (sub & 7u) >> 1; const uint l0 = ((sub & 1u) << 4) + j0; const uint ql_off = half_idx * 64u + (group & 1u) * 32u; const uint qh_off = half_idx * 32u; const uint qh_shift = group * 2u; const uint nibble_shift = (group >> 1) * 4u; float acc[{d}][{d}]; for (uint c = 0u; c < NC; ++c) for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] = 0.0f;\n", .{ cols_per_simdgroup, schedule.rows_per_threadgroup });
+    try appendFmt(allocator, out, "    if (rows < 2 || in_dim <= 0 || (uint(in_dim) & 255u) != 0u || out_dim <= 0 || first_r >= uint(rows) || first_o >= uint(out_dim)) return; const uint block_count = uint(in_dim) >> 8; const uint sub = uint(lane_id) >> 1; const uint j0 = (uint(lane_id) & 1u) << 3; const uint half_idx = sub >> 3; const uint group = (sub & 7u) >> 1; const uint l0 = ((sub & 1u) << 4) + j0; const uint ql_off = half_idx * 64u + (group & 1u) * 32u; const uint qh_off = half_idx * 32u; const uint qh_shift = group * 2u; const uint nibble_shift = (group >> 1) * 4u; float acc[{d}][{d}]; for (uint c = 0u; c < NC; ++c) for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] = 0.0f;\n", .{ cols_per_simdgroup, schedule.rows_per_threadgroup });
     try appendFmt(allocator, out, "    for (uint b = 0u; b < block_count; ++b) {{ uint input_off = first_r * uint(in_dim) + b * 256u + sub * 16u + j0; float x[{d}][8]; for (uint rr = 0u; rr < NR; ++rr) for (uint i = 0u; i < 8u; ++i) x[rr][i] = first_r + rr < uint(rows) ? input[input_off + rr * uint(in_dim) + i] : 0.0f;\n", .{schedule.rows_per_threadgroup});
     try appendFmt(allocator, out, "        for (uint c = 0u; c < NC; ++c) {{ uint col = first_o + c; if (col >= uint(out_dim)) continue; device const uchar *block = {s} + (col * block_count + b) * 210u; device const uchar *ql = block; device const uchar *qh = block + 128u; int scale_u = int(block[192u + sub]); int scale = scale_u >= 128 ? scale_u - 256 : scale_u; float dscale = antfly_qk_half_le_to_float(block + 208u) * float(scale); for (uint i = 0u; i < 8u; ++i) {{ uint l = l0 + i; int low4 = int((ql[ql_off + l] >> nibble_shift) & 0x0fu); int high2 = int((qh[qh_off + l] >> qh_shift) & 0x03u); float w = dscale * float((low4 | (high2 << 4)) - 32); for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] += x[rr][i] * w; }} }} }}\n", .{decoder.weight_param});
     const write = try writeExpr(allocator, "total", "col", epilogue);
@@ -1184,7 +1253,7 @@ test "metal renderer emits a shape-general two-row Q4_K register tile" {
     defer allocator.free(source);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint NSG = 4u; const uint NC = 4u; const uint NR = 2u"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "rows < 2 || rows > 64"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "rows < 2 || in_dim <= 0"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float x[2][8]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "antfly_qk_unpack_scale_min_6bit"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "acc[c][rr] += x[rr][i] * w"));
@@ -1213,7 +1282,7 @@ test "metal renderer emits a shape-general two-row Q6_K register tile" {
     defer allocator.free(source);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint NSG = 4u; const uint NC = 4u; const uint NR = 2u"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "rows < 2 || rows > 64"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "rows < 2 || in_dim <= 0"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint sub = uint(lane_id) >> 1"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "block[192u + sub]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "high2 << 4"));
@@ -1238,20 +1307,39 @@ test "metal renderer emits a shape-general two-row Q6_K register tile" {
 
 test "metal renderer emits a Q4_K and Q6_K simdgroup matrix tile" {
     const allocator = std.testing.allocator;
-    const schedule = KernelSchedule{
-        .threads_per_threadgroup = 160,
-        .cols_per_threadgroup = 64,
-        .rows_per_threadgroup = 40,
-        .reduction = .simdgroup_matrix,
-    };
     inline for (.{ decoder_q4_k, decoder_q6_k }) |decoder| {
-        const source = try renderKernel(allocator, "antfly_quant_matrix", decoder, schedule, .none);
-        defer allocator.free(source);
-        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "threadgroup uchar shared[10240]"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "simdgroup_multiply_accumulate"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "group_pos.x * 64u"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, decoder.lane_decode_fn));
+        inline for (.{
+            .{ KernelSchedule{ .threads_per_threadgroup = 160, .cols_per_threadgroup = 64, .rows_per_threadgroup = 40, .reduction = .simdgroup_matrix }, "threadgroup uchar shared[10240]", "group_pos.y * 40u" },
+            .{ KernelSchedule{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 64, .rows_per_threadgroup = 64, .reduction = .simdgroup_matrix }, "threadgroup uchar shared[16384]", "group_pos.y * 64u" },
+        }) |case| {
+            const source = try renderKernel(allocator, "antfly_quant_matrix", decoder, case[0], .none);
+            defer allocator.free(source);
+            try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, case[1]));
+            try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "simdgroup_multiply_accumulate"));
+            try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "group_pos.x * 64u"));
+            try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, case[2]));
+            try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "global_row < uint(rows)"));
+            try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, decoder.lane_decode_fn));
+        }
     }
+}
+
+test "metal renderer emits one exact QKV matrix dispatch" {
+    const source = try renderQkvKernel(std.testing.allocator, "antfly_q4_k_qkv", decoder_q4_k, .{
+        .threads_per_threadgroup = 256,
+        .cols_per_threadgroup = 64,
+        .rows_per_threadgroup = 64,
+        .reduction = .simdgroup_matrix,
+    });
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "weight_q [[buffer(1)]]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "weight_v [[buffer(3)]]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "output_q [[buffer(4)]]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "output_v [[buffer(6)]]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "group_pos.z == 0u ? weight_q"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "threadgroup uchar shared[16384]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "simdgroup_multiply_accumulate"));
 }
 
 test "metal renderer validate rejects invalid schedules" {

@@ -27,6 +27,8 @@ pub const ResidentOutputs = struct {
     outputs: []ops.CT,
     backend: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
+    backend_owner: ?*anyopaque = null,
+    deinit_backend_owner: ?*const fn (owner: *anyopaque, allocator: std.mem.Allocator) void = null,
 
     pub fn deinit(self: *ResidentOutputs) void {
         for (self.outputs, 0..) |output, idx| {
@@ -41,6 +43,11 @@ pub const ResidentOutputs = struct {
         }
         self.allocator.free(self.outputs);
         self.outputs = &.{};
+        if (self.backend_owner) |owner| {
+            if (self.deinit_backend_owner) |deinit_owner| deinit_owner(owner, self.allocator);
+        }
+        self.backend_owner = null;
+        self.deinit_backend_owner = null;
     }
 };
 

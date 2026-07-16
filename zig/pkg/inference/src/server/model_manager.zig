@@ -667,7 +667,10 @@ fn loadSentencePieceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: [
 
     const view = gguf_metadata.View.init(&parsed);
     const model_name = view.getString("tokenizer.ggml.model") orelse return error.NoTokenizerFound;
-    if (!(std.mem.eql(u8, model_name, "llama") or std.mem.startsWith(u8, model_name, "gemma"))) {
+    if (!(std.mem.eql(u8, model_name, "llama") or
+        std.mem.eql(u8, model_name, "t5") or
+        std.mem.startsWith(u8, model_name, "gemma")))
+    {
         return error.NoTokenizerFound;
     }
 
@@ -895,7 +898,9 @@ pub const LoadedModel = struct {
     native_generation_graph_cache: graph_mod.cache.GraphCache,
     // ponytail: model-wide safety lock; replace with per-request backend state only when continuous batching is proven safe.
     native_generate_lock: std.atomic.Mutex = .unlocked,
-    // Multimodal sessions (CLIP/CLAP/CLIPCLAP)
+    // Optional-session publication and shared embedding backend state.
+    // ponytail: keep one model-level execution lane until per-request resident
+    // frames and backend caches are independently owned and proven concurrent.
     embedding_session_lock: std.atomic.Mutex = .unlocked,
     reranking_session_lock: std.atomic.Mutex = .unlocked,
     vision_session: ?backends.Session = null,
@@ -1064,6 +1069,11 @@ pub const LoadedModel = struct {
     pub fn embeddingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) EmbeddingPipeline {
         const tok = self.getTokenizer();
         const generic_encoder: ?session_factory.GenericEncoderArchConfig = session_factory.getGenericEncoderArchConfig(self.session) catch null;
+        const resident_text_encoder = (self.session.backend() == .metal or self.session.backend() == .cuda) and
+            if (generic_encoder) |arch| switch (arch) {
+                .bert => true,
+                .deberta => false,
+            } else false;
         var pipeline = EmbeddingPipeline.init(allocator, self.session, tok, .{
             .max_length = self.manifest.max_position_embeddings,
             .normalize = self.manifest.normalize,
@@ -1076,6 +1086,7 @@ pub const LoadedModel = struct {
             .text_prefix = self.manifest.embedding_text_prefix,
             .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest) or generic_encoder != null,
             .resident_qwen3_embedding = isJinaStyleEmbeddingManifest(&self.manifest),
+            .resident_text_encoder = resident_text_encoder,
         });
         if (usesClipImagePreprocessProfile(&self.manifest)) {
             pipeline.config.image_preprocess_profile = .clip;
@@ -1095,6 +1106,7 @@ pub const LoadedModel = struct {
         pipeline.visual_projection = self.visual_projection;
         pipeline.audio_projection = self.audio_projection;
         pipeline.resident_projection_stats = &self.resident_projection_stats;
+        pipeline.execution_lock = &self.embedding_session_lock;
         return pipeline;
     }
 

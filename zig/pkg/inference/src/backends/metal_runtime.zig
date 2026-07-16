@@ -57,7 +57,7 @@ const metal_jit_fixture_safety_margin_bytes = 16 * 1024 * 1024;
 const metal_jit_measure_target_macs: u64 = 128 * 1024 * 1024;
 const metal_jit_measure_target_ns: u64 = 20 * std.time.ns_per_ms;
 const metal_jit_max_measure_iters: u32 = 1024;
-const metal_jit_qualification_policy_identity = "metal-v17:correctness=route-wide-generic+exact-signature-full-bundled-differential+columns8-cpu,cold+repeat-before-timing,pattern-bank29,matrix-fp16-abs-q4k0.002-q6k0.003;benchmark=after-correctness,exact-rows+shape,calibrated-target-ns20000000+macs-fallback134217728,iters2-1024-even,warmup2-every-repeat,shared-input-weight+separate-outputs,selection-interleaved-abba5+independent-confirmation-interleaved-abba5,gpu-timestamps-required,post-output-check;winner=both-phases-median+worst-repeat>=1.02,ranked-confirmation-fallback,candidates<=8;q4_0-exact-2d-rows2-shape-general-tile2or4or8-small-output-nr2;q4_k+q6_k-exact-2d-rows2-64-nr2or4or8-matrix40x64x32;qualified-coverage=all-eligible-calibrated-denominator+floor2pct+target90pct+attempts<=5-per-regime;fixture-max268435456,margin16777216;scope-max-shapes16";
+const metal_jit_qualification_policy_identity = "metal-v19:correctness=route-wide-generic+exact-signature-full-bundled-differential+columns8-cpu,cold+repeat-before-timing,pattern-bank29,matrix-fp16-abs-q4k0.002-q6k0.003;benchmark=after-correctness,exact-rows+shape,calibrated-target-ns20000000+macs-fallback134217728,iters2-1024-even,warmup2-every-repeat,shared-input-weight+separate-outputs,selection-interleaved-abba5+independent-confirmation-interleaved-abba5,gpu-timestamps-required,post-output-check;winner=both-phases-median+worst-repeat>=1.02,ranked-confirmation-fallback,candidates<=8;q4_0-exact-2d-rows2-shape-general-tile2or4or8-small-output-nr2;q4_k+q6_k-exact-2d-rows2-plus-nr2or4or8-matrix40or64x64x32-row-tiled+homogeneous-qkv-companion;qualified-coverage=all-eligible-calibrated-denominator+floor2pct+target90pct+attempts<=5-per-regime;fixture-max268435456,margin16777216;scope-max-shapes16";
 
 pub const QuantizedStorage = weight_source_mod.QuantizedStorage;
 const c_file = @import("../util/c_file.zig");
@@ -1024,11 +1024,32 @@ fn runtimeDenseFallbackAllowedForQuantizedStorage(storage: *const QuantizedStora
 }
 
 fn runtimeDenseFallbackAllowedForRequest(request: anytype, storage: *const QuantizedStorage) bool {
-    if (!runtimeDenseFallbackAllowedForQuantizedStorage(storage)) return false;
-    if (comptime @hasField(@TypeOf(request), "dense_fallback_max_bytes")) {
-        if (request.dense_fallback_max_bytes != null) return true;
+    if (comptime @hasField(@TypeOf(request), "allow_direct_quant_fallback")) {
+        if (request.allow_direct_quant_fallback) return true;
     }
-    return true;
+    return runtimeDenseFallbackAllowedForQuantizedStorage(storage);
+}
+
+fn f32ToBf16BitsRoundNearestEven(value: f32) u16 {
+    const bits: u32 = @bitCast(value);
+    const lsb = (bits >> 16) & 1;
+    const rounded = bits +% (0x7fff + lsb);
+    return @intCast(rounded >> 16);
+}
+
+fn f32ToF16Bits(value: f32) u16 {
+    return @bitCast(@as(f16, @floatCast(value)));
+}
+
+test "Metal BF16 mirror conversion rounds ties to even" {
+    try std.testing.expectEqual(@as(u16, 0x3f80), f32ToBf16BitsRoundNearestEven(1.0));
+    try std.testing.expectEqual(@as(u16, 0x3f80), f32ToBf16BitsRoundNearestEven(@bitCast(@as(u32, 0x3f808000))));
+    try std.testing.expectEqual(@as(u16, 0x3f82), f32ToBf16BitsRoundNearestEven(@bitCast(@as(u32, 0x3f818000))));
+}
+
+test "Metal F16 mirror conversion uses IEEE half precision" {
+    try std.testing.expectEqual(@as(u16, 0x3c00), f32ToF16Bits(1.0));
+    try std.testing.expectEqual(@as(u16, 0xc000), f32ToF16Bits(-2.0));
 }
 
 fn traceGlinerStages() bool {
@@ -6582,11 +6603,24 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         request.disable_mapped_quant_weight
     else
         false;
+    const prefer_bf16_fallback = if (@hasField(@TypeOf(request), "prefer_bf16_fallback"))
+        request.prefer_bf16_fallback
+    else
+        false;
+    const prefer_f16_mps_fallback = if (@hasField(@TypeOf(request), "prefer_f16_mps_fallback"))
+        request.prefer_f16_mps_fallback
+    else
+        false;
+    const prefer_f32_mps_fallback = if (@hasField(@TypeOf(request), "prefer_f32_mps_fallback"))
+        request.prefer_f32_mps_fallback
+    else
+        false;
     if (self.raw_linear_slots_prepared[request.slot] and
         self.raw_linear_slot_in_dims[request.slot] == request.in_dim and
         self.raw_linear_slot_out_dims[request.slot] == request.out_dim and
         ((request.quantized_storage != null and
-            (self.raw_linear_slot_kinds[request.slot] == .quantized or self.raw_linear_slot_kinds[request.slot] == .dense)) or
+            (self.raw_linear_slot_kinds[request.slot] == .dense or
+                (!prefer_bf16_fallback and !prefer_f16_mps_fallback and !prefer_f32_mps_fallback and self.raw_linear_slot_kinds[request.slot] == .quantized))) or
             (request.quantized_storage == null and
                 (self.raw_linear_slot_kinds[request.slot] == .dense or
                     (retain_dense_fallback and self.raw_linear_slot_kinds[request.slot] == .quantized)))))
@@ -6632,6 +6666,86 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
             runtimeDenseFallbackAllowedForRequest(request, storage) and
             dense_bytes <= dense_fallback_max_bytes)
         {
+            if (prefer_f16_mps_fallback) {
+                const dense_weight = try std.heap.c_allocator.alloc(f32, dense_values);
+                defer std.heap.c_allocator.free(dense_weight);
+                if (quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, dense_weight)) {
+                    const f16_weight = try std.heap.c_allocator.alloc(u16, dense_values);
+                    defer std.heap.c_allocator.free(f16_weight);
+                    for (dense_weight, f16_weight) |value, *bits| {
+                        bits.* = f32ToF16Bits(value);
+                    }
+                    const f16_bytes = std.mem.sliceAsBytes(f16_weight);
+                    const f16_rc = termite_metal_decode_runtime_prepare_linear_f16(
+                        runtime,
+                        request.slot,
+                        f16_bytes.ptr,
+                        f16_bytes.len,
+                        bias_base,
+                        request.in_dim,
+                        request.out_dim,
+                    );
+                    if (f16_rc == 0) {
+                        stats.decoder_runtime_prepare_linear_calls += 1;
+                        self.raw_linear_slot_kinds[request.slot] = .dense;
+                        self.raw_linear_slots_prepared[request.slot] = true;
+                        self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
+                        self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
+                        return true;
+                    }
+                } else |_| {}
+            }
+            if (prefer_f32_mps_fallback) {
+                const dense_weight = try std.heap.c_allocator.alloc(f32, dense_values);
+                defer std.heap.c_allocator.free(dense_weight);
+                if (quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, dense_weight)) {
+                    const dense_rc = termite_metal_decode_runtime_prepare_linear(
+                        runtime,
+                        request.slot,
+                        dense_weight.ptr,
+                        bias_base,
+                        request.in_dim,
+                        request.out_dim,
+                    );
+                    if (dense_rc == 0 and termite_metal_decode_runtime_prefer_linear_mps(runtime, request.slot) == 0) {
+                        stats.decoder_runtime_prepare_linear_calls += 1;
+                        self.raw_linear_slot_kinds[request.slot] = .dense;
+                        self.raw_linear_slots_prepared[request.slot] = true;
+                        self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
+                        self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
+                        return true;
+                    }
+                } else |_| {}
+            }
+            if (prefer_bf16_fallback) {
+                const dense_weight = try std.heap.c_allocator.alloc(f32, dense_values);
+                defer std.heap.c_allocator.free(dense_weight);
+                if (quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, dense_weight)) {
+                    const bf16_weight = try std.heap.c_allocator.alloc(u16, dense_values);
+                    defer std.heap.c_allocator.free(bf16_weight);
+                    for (dense_weight, bf16_weight) |value, *bits| {
+                        bits.* = f32ToBf16BitsRoundNearestEven(value);
+                    }
+                    const bf16_bytes = std.mem.sliceAsBytes(bf16_weight);
+                    const bf16_rc = termite_metal_decode_runtime_prepare_linear_bf16(
+                        runtime,
+                        request.slot,
+                        bf16_bytes.ptr,
+                        bf16_bytes.len,
+                        bias_base,
+                        request.in_dim,
+                        request.out_dim,
+                    );
+                    if (bf16_rc == 0) {
+                        stats.decoder_runtime_prepare_linear_calls += 1;
+                        self.raw_linear_slot_kinds[request.slot] = .dense;
+                        self.raw_linear_slots_prepared[request.slot] = true;
+                        self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
+                        self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
+                        return true;
+                    }
+                } else |_| {}
+            }
             if (try makeRuntimeQ8StorageFromQuantized(storage, dense_values)) |q8_storage| {
                 errdefer {
                     q8_storage.deinit();
@@ -6957,6 +7071,9 @@ test "direct quant runtime storage skips retained dense fallback by default" {
     try std.testing.expect(!runtimeDenseFallbackAllowedForRequest(.{
         .dense_fallback_max_bytes = @as(?usize, 128 * 1024 * 1024),
     }, &q40_storage));
+    try std.testing.expect(runtimeDenseFallbackAllowedForRequest(.{
+        .allow_direct_quant_fallback = true,
+    }, &q40_storage));
 
     var q4_raw: [144]u8 = undefined;
     @memset(q4_raw[0..], 0);
@@ -6971,6 +7088,9 @@ test "direct quant runtime storage skips retained dense fallback by default" {
     try std.testing.expect(!runtimeDenseFallbackAllowedForRequest(.{}, &q4_storage));
     try std.testing.expect(!runtimeDenseFallbackAllowedForRequest(.{
         .dense_fallback_max_bytes = @as(?usize, 128 * 1024 * 1024),
+    }, &q4_storage));
+    try std.testing.expect(runtimeDenseFallbackAllowedForRequest(.{
+        .allow_direct_quant_fallback = true,
     }, &q4_storage));
 
     var q8_raw: [34]u8 = undefined;
@@ -7281,6 +7401,7 @@ pub const MetalWorkloadTuningSummary = struct {
     selected_count: u8 = 0,
     qualified_count: u8 = 0,
     active_count: u8 = 0,
+    qkv_active_count: u8 = 0,
     failed_count: u8 = 0,
     activation_failed_count: u8 = 0,
     coverage_complete: bool = false,
@@ -7378,7 +7499,7 @@ fn workloadProfileEntryInFirstMetalSlice(entry: RawWorkloadProfileEntry) bool {
     const rows_supported = if (entry.format == q4_0_format)
         entry.rows >= 2 and entry.rows <= 8
     else
-        entry.rows >= 2 and entry.rows <= 64;
+        entry.rows >= 2;
     return entry.occupied != 0 and
         entry.implementation == @intFromEnum(WorkloadImplementation.bundled) and
         entry.regime != @intFromEnum(WorkloadRegime.unknown) and
@@ -7985,8 +8106,11 @@ pub const RawRuntimeMemoryStats = extern struct {
     dense_linear_weight_bytes: u64 = 0,
     dense_linear_f32_weight_bytes: u64 = 0,
     dense_linear_bf16_weight_bytes: u64 = 0,
+    dense_linear_f16_weight_bytes: u64 = 0,
     dense_linear_f32_slots: u64 = 0,
     dense_linear_bf16_slots: u64 = 0,
+    dense_linear_f16_slots: u64 = 0,
+    dense_qkv_packed_bytes: u64 = 0,
     quant_linear_bytes: u64 = 0,
     scratch_bytes: u64 = 0,
     scratch_pool_bytes: u64 = 0,
@@ -8807,6 +8931,17 @@ pub extern fn termite_metal_generated_pipeline_install_exact(
     cols_per_threadgroup: c_uint,
     rows_per_threadgroup: c_uint,
 ) c_int;
+pub extern fn termite_metal_generated_pipeline_install_exact_qkv(
+    provider: ?*RawMetalProvider,
+    runtime: ?*RawMetalDecodeRuntime,
+    generated: ?*const RawMetalGeneratedPipeline,
+    slot: c_uint,
+    regime: u8,
+    dispatch: u8,
+    rows: c_uint,
+    out_dim: usize,
+    in_dim: usize,
+) c_int;
 pub extern fn termite_metal_jit_exact_pipeline_lookup_probe(
     slot: c_uint,
     installed_regime: u8,
@@ -9384,9 +9519,9 @@ fn metalJitQualificationTolerance(format: quant_matmul.Format) f64 {
 }
 
 fn metalJitObservedQualificationTolerance(format: quant_matmul.Format, rows_per_threadgroup: usize) f64 {
-    // The 40-row exact schedule is the FP16-input simdgroup-MMA path.
+    // Matrix exact schedules use the FP16-input simdgroup-MMA path.
     // Keep scalar candidates on the existing strict tolerance.
-    if (rows_per_threadgroup == 40) return switch (format) {
+    if (rows_per_threadgroup == 40 or rows_per_threadgroup == 64) return switch (format) {
         .q4_k => 0.002,
         .q6_k => 0.003,
         else => metalJitQualificationTolerance(format),
@@ -9956,7 +10091,30 @@ fn createMetalScheduleCandidatePipeline(
     schedule: quant_kernel_compiler.KernelSchedule,
     device: MetalDeviceInfo,
 ) !*RawMetalGeneratedPipeline {
-    const kernel_name = try allocator.dupeZ(u8, artifact.kernel_id);
+    return createNamedMetalScheduleCandidatePipeline(allocator, artifact, artifact.kernel_id, source, schedule, device);
+}
+
+fn createMetalQkvScheduleCandidatePipeline(
+    allocator: std.mem.Allocator,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    source: []const u8,
+    schedule: quant_kernel_compiler.KernelSchedule,
+    device: MetalDeviceInfo,
+) !*RawMetalGeneratedPipeline {
+    const kernel_name = try std.fmt.allocPrint(allocator, "{s}_qkv", .{artifact.kernel_id});
+    defer allocator.free(kernel_name);
+    return createNamedMetalScheduleCandidatePipeline(allocator, artifact, kernel_name, source, schedule, device);
+}
+
+fn createNamedMetalScheduleCandidatePipeline(
+    allocator: std.mem.Allocator,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    kernel_name_raw: []const u8,
+    source: []const u8,
+    schedule: quant_kernel_compiler.KernelSchedule,
+    device: MetalDeviceInfo,
+) !*RawMetalGeneratedPipeline {
+    const kernel_name = try allocator.dupeZ(u8, kernel_name_raw);
     defer allocator.free(kernel_name);
     var error_buffer: [4096]u8 = @splat(0);
     const generated = termite_metal_generated_pipeline_create(
@@ -9978,6 +10136,40 @@ fn createMetalScheduleCandidatePipeline(
     }
     try validateMetalJitCandidateSchedule(schedule, device, pipeline_info);
     return generated;
+}
+
+fn activateMetalExactQkvCompanion(
+    owner: anytype,
+    allocator: std.mem.Allocator,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    signature: RawWorkloadProfileEntry,
+    schedule: quant_kernel_compiler.KernelSchedule,
+    device: MetalDeviceInfo,
+) !bool {
+    if (getenvFlagEnabled("TERMITE_METAL_DISABLE_GENERATED_QKV")) return false;
+    const op = artifact.matmulOp() orelse return false;
+    if (op.epilogue != .none or (op.format != .q4_k and op.format != .q6_k)) return false;
+    if (!owner.canOwnExactJitPipeline()) return error.TooManyExactJitPipelines;
+    const emitted = try quant_kernel_compiler.emitMetalQkvScheduleCandidateSource(allocator, artifact, schedule);
+    defer emitted.deinit(allocator);
+    const generated = try createMetalQkvScheduleCandidatePipeline(allocator, artifact, emitted.data, schedule, device);
+    var retained = false;
+    defer if (!retained) termite_metal_generated_pipeline_destroy(generated);
+    const route = metalJitRouteForArtifact(artifact) orelse return error.MissingMetalJitRoute;
+    if (termite_metal_generated_pipeline_install_exact_qkv(
+        owner.raw_provider,
+        owner.raw_decode_runtime,
+        generated,
+        @intFromEnum(route.slot),
+        signature.regime,
+        signature.dispatch,
+        @intCast(signature.rows),
+        @intCast(signature.out_dim),
+        @intCast(signature.in_dim),
+    ) != 0) return error.MetalJitQkvActivationFailed;
+    owner.ownExactJitPipeline(generated);
+    retained = true;
+    return true;
 }
 
 fn metalJitCachedExactQualification(
@@ -10450,6 +10642,22 @@ pub fn tuneFirstMetalWorkloadSlice(
                 owner.ownExactJitPipeline(winner.generated);
                 retained = true;
                 summary.active_count += 1;
+                if (activateMetalExactQkvCompanion(
+                    owner,
+                    session.allocator,
+                    artifact,
+                    signature,
+                    winner.schedule,
+                    device,
+                ) catch |err| blk: {
+                    std.log.warn(
+                        "Metal exact QKV companion activation skipped regime={s} format={d} rows={d} out_dim={d} in_dim={d} reason={s}",
+                        .{ @tagName(regime), signature.format, signature.rows, signature.out_dim, signature.in_dim, @errorName(err) },
+                    );
+                    break :blk false;
+                }) {
+                    summary.qkv_active_count += 1;
+                }
             }
         }
         const regime_complete = coverage.complete();
@@ -10666,6 +10874,20 @@ fn activateMetalQualifiedProfileKernel(
     ) != 0) return error.MetalJitActivationFailed;
     owner.ownExactJitPipeline(generated);
     retained = true;
+    _ = activateMetalExactQkvCompanion(
+        owner,
+        context.allocator,
+        artifact,
+        signature,
+        schedule,
+        context.device,
+    ) catch |err| blk: {
+        std.log.warn(
+            "Metal cached exact QKV companion activation skipped format={d} rows={d} out_dim={d} in_dim={d} reason={s}",
+            .{ signature.format, signature.rows, signature.out_dim, signature.in_dim, @errorName(err) },
+        );
+        break :blk false;
+    };
     return true;
 }
 
@@ -11915,8 +12137,9 @@ test "metal exact timing calibration targets twenty milliseconds within bounds" 
     try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "gpu-timestamps-required"));
     try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "interleaved-abba5"));
     try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "small-output-nr2"));
-    try std.testing.expect(std.mem.startsWith(u8, metal_jit_qualification_policy_identity, "metal-v17:"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "q4_k+q6_k-exact-2d-rows2-64"));
+    try std.testing.expect(std.mem.startsWith(u8, metal_jit_qualification_policy_identity, "metal-v19:"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "q4_k+q6_k-exact-2d-rows2-plus"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "matrix40or64x64x32-row-tiled+homogeneous-qkv-companion"));
     try std.testing.expect(std.mem.containsAtLeast(u8, metal_jit_qualification_policy_identity, 1, "qualified-coverage=all-eligible-calibrated-denominator+floor2pct+target90pct+attempts<=5-per-regime"));
 }
 
@@ -11935,6 +12158,11 @@ test "Metal first tuning slice matches bundled Q4 dispatches and rejects oversiz
         .occupied = 1,
     };
     try std.testing.expect(workloadProfileEntryInFirstMetalSlice(entry));
+    var large_q4_k = entry;
+    large_q4_k.rows = 256;
+    large_q4_k.out_dim = 4096;
+    large_q4_k.in_dim = 1024;
+    try std.testing.expect(workloadProfileEntryInFirstMetalSlice(large_q4_k));
     var wrong_q4_k_dispatch = entry;
     wrong_q4_k_dispatch.dispatch = workloadProfileDispatchId("small_batch").?;
     try std.testing.expect(!workloadProfileEntryInFirstMetalSlice(wrong_q4_k_dispatch));
@@ -12447,7 +12675,7 @@ test "metal exact Q4_K and Q6_K matrix candidates match the bundled baseline" {
     try std.testing.expectEqual(@as(c_int, 0), termite_metal_device_info_get(&device));
 
     for ([_]quant_matmul.Format{ .q4_k, .q6_k }) |format| {
-        const rows: usize = 40;
+        const rows: usize = 65;
         const in_dim: usize = 512;
         const out_dim: usize = 257;
         const signature = RawWorkloadProfileEntry{
@@ -12537,7 +12765,7 @@ test "metal exact Q4_K provider fallback activates installed route" {
     var provider = try metal_native_provider.MetalNativeProvider.create();
     defer provider.deinitOwned();
 
-    const rows: usize = 2;
+    const rows: usize = 65;
     const in_dim: usize = 512;
     const out_dim: usize = 257;
     const signature = RawWorkloadProfileEntry{
@@ -12576,7 +12804,8 @@ test "metal exact Q4_K provider fallback activates installed route" {
         &schedules,
     );
     try std.testing.expect(candidate_count > 0);
-    const schedule = schedules[0];
+    const schedule = schedules[candidate_count - 1];
+    try std.testing.expectEqual(quant_kernel_compiler.ReductionKind.simdgroup_matrix, schedule.reduction);
     const emitted = try quant_kernel_compiler.emitMetalScheduleCandidateSource(
         std.testing.allocator,
         artifact,
@@ -12661,10 +12890,180 @@ test "metal exact Q4_K provider fallback activates installed route" {
     }
     const stats = try exactJitDispatchStatsSnapshot(provider.raw_decode_runtime);
     try std.testing.expectEqual(@as(u64, 1), stats.q4_k_hits);
-    const tolerance = metalJitQualificationTolerance(.q4_k);
+    const tolerance = metalJitObservedQualificationTolerance(.q4_k, schedule.rows_per_threadgroup);
     for (baseline, actual) |expected, observed| {
         try std.testing.expect(std.math.isFinite(observed));
         try std.testing.expect(@abs(@as(f64, observed) - expected) <= tolerance);
+    }
+}
+
+test "metal exact Q4_K QKV companion matches three qualified projections" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const rows: usize = 65;
+    const in_dim: usize = 512;
+    const out_dim: usize = 257;
+    const signature = RawWorkloadProfileEntry{
+        .hash = 3,
+        .call_count = 3,
+        .logical_bytes = 1,
+        .macs = 3 * rows * in_dim * out_dim,
+        .estimated_gpu_nanos = 600_000,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .format = workloadProfileQuantFormatId("q4_k").?,
+        .dispatch = workloadProfileDispatchId("scalar").?,
+        .input_encoding = workloadProfileEncodingId("f32").?,
+        .output_encoding = workloadProfileEncodingId("f32").?,
+        .epilogue = 0,
+        .implementation = @intFromEnum(WorkloadImplementation.bundled),
+        .regime = @intFromEnum(WorkloadRegime.encoder),
+        .fusion = 0,
+        .layout = 0,
+        .calibrated = 1,
+        .occupied = 1,
+    };
+    const artifact = metalJitArtifactForExactSignature(signature) orelse return error.MissingMetalJitArtifact;
+    var schedules: [kernel_jit.maximum_candidates]quant_kernel_compiler.KernelSchedule = undefined;
+    const candidate_count = quant_kernel_compiler.metalScheduleCandidatesForExactShape(.q4_k, .none, rows, in_dim, out_dim, &schedules);
+    try std.testing.expectEqual(@as(usize, 8), candidate_count);
+    const schedule = schedules[candidate_count - 1];
+    try std.testing.expectEqual(@as(u8, 64), schedule.rows_per_threadgroup);
+    var device: MetalDeviceInfo = .{};
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_device_info_get(&device));
+
+    const emitted = try quant_kernel_compiler.emitMetalScheduleCandidateSource(std.testing.allocator, artifact, schedule);
+    defer emitted.deinit(std.testing.allocator);
+    const generated = try createMetalScheduleCandidatePipeline(std.testing.allocator, artifact, emitted.data, schedule, device);
+    defer termite_metal_generated_pipeline_destroy(generated);
+    const qkv_emitted = try quant_kernel_compiler.emitMetalQkvScheduleCandidateSource(std.testing.allocator, artifact, schedule);
+    defer qkv_emitted.deinit(std.testing.allocator);
+    const qkv_generated = try createMetalQkvScheduleCandidatePipeline(std.testing.allocator, artifact, qkv_emitted.data, schedule, device);
+    defer termite_metal_generated_pipeline_destroy(qkv_generated);
+    const route = metalJitRouteForArtifact(artifact) orelse return error.MissingMetalJitRoute;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_generated_pipeline_install_exact(
+        provider.raw_provider,
+        runtime,
+        generated,
+        @intFromEnum(route.slot),
+        signature.regime,
+        signature.dispatch,
+        rows,
+        out_dim,
+        in_dim,
+        schedule.threads_per_threadgroup,
+        schedule.cols_per_threadgroup,
+        schedule.rows_per_threadgroup,
+    ));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_generated_pipeline_install_exact_qkv(
+        provider.raw_provider,
+        runtime,
+        qkv_generated,
+        @intFromEnum(route.slot),
+        signature.regime,
+        signature.dispatch,
+        rows,
+        out_dim,
+        in_dim,
+    ));
+    try provider.workloadProfileSetRegime(.encoder);
+
+    const weights = .{
+        try metalJitPatternWeight(std.testing.allocator, .q4_k, in_dim, out_dim, 9101),
+        try metalJitPatternWeight(std.testing.allocator, .q4_k, in_dim, out_dim, 9102),
+        try metalJitPatternWeight(std.testing.allocator, .q4_k, in_dim, out_dim, 9103),
+    };
+    defer {
+        inline for (weights) |weight| std.testing.allocator.free(weight);
+    }
+    const shape = [_]i64{ out_dim, in_dim };
+    var storages = [_]QuantizedStorage{
+        .{ .tensor_type = .{ .known = .Q4_K }, .raw_bytes = weights[0], .shape = &shape, .raw_owned = false, .allocator = std.testing.allocator },
+        .{ .tensor_type = .{ .known = .Q4_K }, .raw_bytes = weights[1], .shape = &shape, .raw_owned = false, .allocator = std.testing.allocator },
+        .{ .tensor_type = .{ .known = .Q4_K }, .raw_bytes = weights[2], .shape = &shape, .raw_owned = false, .allocator = std.testing.allocator },
+    };
+    const zero_bias_data = try std.testing.allocator.alloc(f32, out_dim);
+    defer std.testing.allocator.free(zero_bias_data);
+    @memset(zero_bias_data, 0);
+    var biases = .{
+        try MetalTensor.ownedCloneFrom(zero_bias_data, &[_]i32{@intCast(out_dim)}),
+        try MetalTensor.ownedCloneFrom(zero_bias_data, &[_]i32{@intCast(out_dim)}),
+        try MetalTensor.ownedCloneFrom(zero_bias_data, &[_]i32{@intCast(out_dim)}),
+    };
+    defer {
+        inline for (&biases) |*bias| bias.deinit();
+    }
+    var dummy_weight_value = [_]f32{0.0};
+    const dummy_weight = MetalTensor.borrowed(dummy_weight_value[0..].ptr, 1, &[_]i32{0});
+    var prep_stats: ops.NativeQuantTimingStats = .{};
+    inline for (0..3) |index| {
+        try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+            .weight = dummy_weight,
+            .bias = biases[index],
+            .quantized_storage = @as(?*const QuantizedStorage, &storages[index]),
+            .slot = 30 + index,
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .retain_dense_fallback = false,
+        }, &prep_stats));
+    }
+
+    const input_data = try std.testing.allocator.alloc(f32, rows * in_dim);
+    defer std.testing.allocator.free(input_data);
+    fillMetalJitFixture(input_data, 7, 31, 15, 64.0, 9111);
+    var input = try testDeviceTensorFromSlice(runtime, input_data, &[_]i32{ rows, in_dim });
+    defer input.deinit();
+    const expected = .{
+        try std.testing.allocator.alloc(f32, rows * out_dim),
+        try std.testing.allocator.alloc(f32, rows * out_dim),
+        try std.testing.allocator.alloc(f32, rows * out_dim),
+    };
+    defer {
+        inline for (expected) |values| std.testing.allocator.free(values);
+    }
+    var scope = MetalJitRouteScope.none();
+    try std.testing.expect(scope.includeQuantShape(.q4_k, out_dim, in_dim));
+    metal_jit_process_gpu_mutex.lockUncancelable(std.testing.io);
+    defer metal_jit_process_gpu_mutex.unlock(std.testing.io);
+    inline for (0..3) |index| {
+        _ = try runMetalJitQuantFixture(
+            .{ .allocator = std.testing.allocator, .artifact = artifact, .scope = &scope, .provider = provider.raw_provider, .runtime = runtime, .generated = generated },
+            .q4_k,
+            .candidate,
+            input_data,
+            weights[index],
+            expected[index],
+            rows,
+            in_dim,
+            out_dim,
+            schedule.threads_per_threadgroup,
+            schedule.cols_per_threadgroup,
+            schedule.rows_per_threadgroup,
+            0,
+            1,
+        );
+    }
+    try resetExactJitDispatchStats(runtime);
+    var actual = (try tryApplyQuantizedRuntimeLinearQkv(&provider, 30, 31, 32, input, rows, in_dim, out_dim, out_dim)) orelse return error.UnexpectedNull;
+    defer actual.first.deinit();
+    defer actual.second.deinit();
+    defer actual.third.deinit();
+    const stats = try exactJitDispatchStatsSnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 3), stats.q4_k_hits);
+    const outputs = .{ &actual.first, &actual.second, &actual.third };
+    const tolerance = metalJitObservedQualificationTolerance(.q4_k, schedule.rows_per_threadgroup);
+    inline for (0..3) |index| {
+        const observed = try tensorHostSlice(outputs[index]);
+        for (expected[index], observed) |wanted, got| {
+            try std.testing.expect(std.math.isFinite(got));
+            try std.testing.expect(@abs(@as(f64, got) - wanted) <= tolerance);
+        }
     }
 }
 
@@ -14244,6 +14643,19 @@ pub extern fn termite_metal_decode_runtime_prepare_linear(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
     weight: [*c]const f32,
+    bias: [*c]const f32,
+    in_dim: usize,
+    out_dim: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_prefer_linear_mps(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_prepare_linear_f16(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    weight: [*c]const u8,
+    weight_bytes: usize,
     bias: [*c]const f32,
     in_dim: usize,
     out_dim: usize,
@@ -19080,16 +19492,23 @@ pub fn tryApplyDenseRuntimeLinear(
 ) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (slot >= decoder_runtime_linear_slot_capacity or rows == 0 or in_dim == 0 or out_dim == 0) return null;
+    if (rows > std.math.maxInt(i32) or in_dim > std.math.maxInt(i32) or out_dim > std.math.maxInt(i32)) return null;
+    const output_elements = std.math.mul(usize, rows, out_dim) catch return null;
+    const output_bytes = std.math.mul(usize, output_elements, @sizeOf(f32)) catch return null;
     const frame_active = hasActiveFrame(self.raw_decode_runtime);
     const trace_dense = getenvFlagEnabled("TERMITE_METAL_TRACE_DENSE_LINEAR");
     if (self.raw_linear_slot_kinds[slot] != .dense) {
         if (trace_dense) std.debug.print("dense-linear-null: slot={d} kind={s} rows={d} in={d} out={d}\n", .{ slot, @tagName(self.raw_linear_slot_kinds[slot]), rows, in_dim, out_dim });
         return null;
     }
+    if (self.raw_linear_slot_in_dims[slot] != in_dim or self.raw_linear_slot_out_dims[slot] != out_dim) return null;
+    if (input.ndim() != 2 or input.dim(0) <= 0 or input.dim(1) <= 0 or
+        @as(usize, @intCast(input.dim(0))) != rows or @as(usize, @intCast(input.dim(1))) != in_dim) return null;
 
     if (rows == 1 and input.isDevice()) {
         const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
-        var output_device = try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &shape);
+        var output_device = try MetalTensor.deviceAllocate(runtime, output_bytes, .private, &shape);
         errdefer output_device.deinit();
         const device_rc = termite_metal_decode_runtime_apply_linear_device(
             runtime,
@@ -19109,7 +19528,7 @@ pub fn tryApplyDenseRuntimeLinear(
     }
     if (rows != 1 and input.isDevice()) {
         const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
-        var output_device = try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &shape);
+        var output_device = try MetalTensor.deviceAllocate(runtime, output_bytes, .private, &shape);
         errdefer output_device.deinit();
         const device_rc = termite_metal_decode_runtime_apply_linear_multi_row_device(
             runtime,
@@ -19128,7 +19547,7 @@ pub fn tryApplyDenseRuntimeLinear(
 
     if (frame_active) return null;
 
-    const output = try std.heap.c_allocator.alloc(f32, rows * out_dim);
+    const output = try std.heap.c_allocator.alloc(f32, output_elements);
     errdefer std.heap.c_allocator.free(output);
 
     var input_mut = input;
@@ -19205,6 +19624,11 @@ pub fn tryApplyDenseRuntimeFfnLayerNorm(
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!input.isDevice() or !residual.isDevice()) return null;
+    if (rows == 0 or hidden_size == 0 or intermediate_size == 0 or
+        rows > std.math.maxInt(i32) or hidden_size > std.math.maxInt(i32) or intermediate_size > std.math.maxInt(i32)) return null;
+    const output_elements = std.math.mul(usize, rows, hidden_size) catch return null;
+    const output_bytes = std.math.mul(usize, output_elements, @sizeOf(f32)) catch return null;
+    _ = std.math.mul(usize, rows, intermediate_size) catch return null;
     if (first_slot >= decoder_runtime_linear_slot_capacity or
         second_slot >= decoder_runtime_linear_slot_capacity or
         layer_norm_slot >= decoder_runtime_layer_norm_slot_capacity) return null;
@@ -19213,12 +19637,12 @@ pub fn tryApplyDenseRuntimeFfnLayerNorm(
     if (self.raw_linear_slot_in_dims[first_slot] != hidden_size or self.raw_linear_slot_out_dims[first_slot] != intermediate_size) return null;
     if (self.raw_linear_slot_in_dims[second_slot] != intermediate_size or self.raw_linear_slot_out_dims[second_slot] != hidden_size) return null;
     if (self.raw_layer_norm_slot_hidden_sizes[layer_norm_slot] != hidden_size) return null;
-    if (input.ndim() != 2 or residual.ndim() != 2) return null;
+    if (input.ndim() != 2 or residual.ndim() != 2 or input.dim(0) <= 0 or input.dim(1) <= 0 or residual.dim(0) <= 0 or residual.dim(1) <= 0) return null;
     if (@as(usize, @intCast(input.dim(0))) != rows or @as(usize, @intCast(input.dim(1))) != hidden_size) return null;
     if (@as(usize, @intCast(residual.dim(0))) != rows or @as(usize, @intCast(residual.dim(1))) != hidden_size) return null;
 
     const shape = [_]i32{ @intCast(rows), @intCast(hidden_size) };
-    var output_device = try MetalTensor.deviceAllocate(runtime, rows * hidden_size * @sizeOf(f32), .private, &shape);
+    var output_device = try MetalTensor.deviceAllocate(runtime, output_bytes, .private, &shape);
     errdefer output_device.deinit();
     const rc = termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
         runtime,
@@ -19255,17 +19679,22 @@ pub fn tryApplyDenseRuntimeLinearLayerNorm(
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!input.isDevice() or !residual.isDevice()) return null;
+    if (rows == 0 or in_dim == 0 or hidden_size == 0 or
+        rows > std.math.maxInt(i32) or in_dim > std.math.maxInt(i32) or hidden_size > std.math.maxInt(i32)) return null;
+    const output_elements = std.math.mul(usize, rows, hidden_size) catch return null;
+    const output_bytes = std.math.mul(usize, output_elements, @sizeOf(f32)) catch return null;
+    _ = std.math.mul(usize, rows, in_dim) catch return null;
     if (linear_slot >= decoder_runtime_linear_slot_capacity or layer_norm_slot >= decoder_runtime_layer_norm_slot_capacity) return null;
     if (self.raw_linear_slot_kinds[linear_slot] != .dense) return null;
     if (!self.raw_layer_norm_slots_prepared[layer_norm_slot]) return null;
     if (self.raw_linear_slot_in_dims[linear_slot] != in_dim or self.raw_linear_slot_out_dims[linear_slot] != hidden_size) return null;
     if (self.raw_layer_norm_slot_hidden_sizes[layer_norm_slot] != hidden_size) return null;
-    if (input.ndim() != 2 or residual.ndim() != 2) return null;
+    if (input.ndim() != 2 or residual.ndim() != 2 or input.dim(0) <= 0 or input.dim(1) <= 0 or residual.dim(0) <= 0 or residual.dim(1) <= 0) return null;
     if (@as(usize, @intCast(input.dim(0))) != rows or @as(usize, @intCast(input.dim(1))) != in_dim) return null;
     if (@as(usize, @intCast(residual.dim(0))) != rows or @as(usize, @intCast(residual.dim(1))) != hidden_size) return null;
 
     const shape = [_]i32{ @intCast(rows), @intCast(hidden_size) };
-    var output_device = try MetalTensor.deviceAllocate(runtime, rows * hidden_size * @sizeOf(f32), .private, &shape);
+    var output_device = try MetalTensor.deviceAllocate(runtime, output_bytes, .private, &shape);
     errdefer output_device.deinit();
     const rc = termite_metal_decode_runtime_apply_dense_linear_layer_norm_device(
         runtime,
@@ -19527,17 +19956,29 @@ pub fn tryApplyDenseRuntimeLinearQkv(
 ) !?RuntimeLinearTripleResult {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (q_slot >= decoder_runtime_linear_slot_capacity or k_slot >= decoder_runtime_linear_slot_capacity or v_slot >= decoder_runtime_linear_slot_capacity) return null;
+    if (rows == 0 or in_dim == 0 or q_out_dim == 0 or kv_out_dim == 0 or
+        rows > std.math.maxInt(i32) or in_dim > std.math.maxInt(i32) or
+        q_out_dim > std.math.maxInt(i32) or kv_out_dim > std.math.maxInt(i32)) return null;
+    const q_elements = std.math.mul(usize, rows, q_out_dim) catch return null;
+    const kv_elements = std.math.mul(usize, rows, kv_out_dim) catch return null;
+    const q_bytes = std.math.mul(usize, q_elements, @sizeOf(f32)) catch return null;
+    const kv_bytes = std.math.mul(usize, kv_elements, @sizeOf(f32)) catch return null;
     const frame_active = hasActiveFrame(self.raw_decode_runtime);
     if (self.raw_linear_slot_kinds[q_slot] != .dense or self.raw_linear_slot_kinds[k_slot] != .dense or self.raw_linear_slot_kinds[v_slot] != .dense) return null;
+    if (self.raw_linear_slot_in_dims[q_slot] != in_dim or self.raw_linear_slot_in_dims[k_slot] != in_dim or self.raw_linear_slot_in_dims[v_slot] != in_dim or
+        self.raw_linear_slot_out_dims[q_slot] != q_out_dim or self.raw_linear_slot_out_dims[k_slot] != kv_out_dim or self.raw_linear_slot_out_dims[v_slot] != kv_out_dim) return null;
+    if (input.ndim() != 2 or input.dim(0) <= 0 or input.dim(1) <= 0 or
+        @as(usize, @intCast(input.dim(0))) != rows or @as(usize, @intCast(input.dim(1))) != in_dim) return null;
 
     if (rows == 1 and input.isDevice()) {
         const q_shape = [_]i32{ @intCast(rows), @intCast(q_out_dim) };
         const kv_shape = [_]i32{ @intCast(rows), @intCast(kv_out_dim) };
-        var q_device = try MetalTensor.deviceAllocate(runtime, rows * q_out_dim * @sizeOf(f32), .private, &q_shape);
+        var q_device = try MetalTensor.deviceAllocate(runtime, q_bytes, .private, &q_shape);
         errdefer q_device.deinit();
-        var k_device = try MetalTensor.deviceAllocate(runtime, rows * kv_out_dim * @sizeOf(f32), .private, &kv_shape);
+        var k_device = try MetalTensor.deviceAllocate(runtime, kv_bytes, .private, &kv_shape);
         errdefer k_device.deinit();
-        var v_device = try MetalTensor.deviceAllocate(runtime, rows * kv_out_dim * @sizeOf(f32), .private, &kv_shape);
+        var v_device = try MetalTensor.deviceAllocate(runtime, kv_bytes, .private, &kv_shape);
         errdefer v_device.deinit();
         const device_rc = termite_metal_decode_runtime_apply_linear_qkv_slots_device(
             runtime,
@@ -19591,11 +20032,11 @@ pub fn tryApplyDenseRuntimeLinearQkv(
             if (scratch_rc == 0) {
                 const q_shape = [_]i32{ @intCast(rows), @intCast(q_out_dim) };
                 const kv_shape = [_]i32{ @intCast(rows), @intCast(kv_out_dim) };
-                var q = MetalTensor.deviceBorrowed(@ptrCast(runtime), q_handle orelse return null, 0, rows * q_out_dim * @sizeOf(f32), &q_shape);
+                var q = MetalTensor.deviceBorrowed(@ptrCast(runtime), q_handle orelse return null, 0, q_bytes, &q_shape);
                 errdefer q.deinit();
-                var k = MetalTensor.deviceBorrowed(@ptrCast(runtime), k_handle orelse return null, 0, rows * kv_out_dim * @sizeOf(f32), &kv_shape);
+                var k = MetalTensor.deviceBorrowed(@ptrCast(runtime), k_handle orelse return null, 0, kv_bytes, &kv_shape);
                 errdefer k.deinit();
-                var v = MetalTensor.deviceBorrowed(@ptrCast(runtime), v_handle orelse return null, 0, rows * kv_out_dim * @sizeOf(f32), &kv_shape);
+                var v = MetalTensor.deviceBorrowed(@ptrCast(runtime), v_handle orelse return null, 0, kv_bytes, &kv_shape);
                 errdefer v.deinit();
                 return .{
                     .first = q,
@@ -19628,11 +20069,11 @@ pub fn tryApplyDenseRuntimeLinearQkv(
 
     var input_mut = input;
     const input_base = try tensorHostConstPtr(&input_mut);
-    const q_out = try std.heap.c_allocator.alloc(f32, rows * q_out_dim);
+    const q_out = try std.heap.c_allocator.alloc(f32, q_elements);
     errdefer std.heap.c_allocator.free(q_out);
-    const k_out = try std.heap.c_allocator.alloc(f32, rows * kv_out_dim);
+    const k_out = try std.heap.c_allocator.alloc(f32, kv_elements);
     errdefer std.heap.c_allocator.free(k_out);
-    const v_out = try std.heap.c_allocator.alloc(f32, rows * kv_out_dim);
+    const v_out = try std.heap.c_allocator.alloc(f32, kv_elements);
     errdefer std.heap.c_allocator.free(v_out);
 
     const rc = termite_metal_decode_runtime_apply_linear_qkv_slots(
@@ -33637,6 +34078,319 @@ test "metal native decoder runtime can prepare bf16 linear without copying model
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), actual[0], 1e-3);
     try std.testing.expectApproxEqAbs(@as(f32, -2.0), actual[1], 1e-3);
     try std.testing.expectApproxEqAbs(@as(f32, 1.25), actual[2], 1e-3);
+}
+
+test "metal native decoder runtime f16 linear matches host reference" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+
+    const hidden_size: usize = 32;
+    const out_dim: usize = 3;
+    var dense_weight = [_]f32{0.0} ** (hidden_size * out_dim);
+    dense_weight[0] = 1.0;
+    dense_weight[hidden_size + 1] = 1.0;
+    for (0..4) |index| dense_weight[2 * hidden_size + index] = 0.5;
+    const q4_bytes = try quant_codec.quantizeQ4_0FromF32(std.testing.allocator, &dense_weight);
+    defer std.testing.allocator.free(q4_bytes);
+    const shape = [_]i64{ @intCast(out_dim), @intCast(hidden_size) };
+    const storage = QuantizedStorage{
+        .tensor_type = .{ .known = .Q4_0 },
+        .raw_bytes = q4_bytes,
+        .shape = &shape,
+        .raw_owned = false,
+        .allocator = std.testing.allocator,
+    };
+    const bias = [_]f32{ 0.0, 0.0, 0.0 };
+    var linear_bias = try MetalTensor.ownedCloneFrom(&bias, &[_]i32{@intCast(out_dim)});
+    defer linear_bias.deinit();
+    var dummy_weight_value = [_]f32{0.0};
+    const dummy_weight = MetalTensor.borrowed(dummy_weight_value[0..].ptr, 1, &[_]i32{0});
+    var prep_stats: ops.NativeQuantTimingStats = .{};
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .slot = 0,
+        .weight = dummy_weight,
+        .bias = linear_bias,
+        .quantized_storage = @as(?*const QuantizedStorage, &storage),
+        .in_dim = hidden_size,
+        .out_dim = out_dim,
+        .retain_dense_fallback = true,
+        .dense_fallback_max_bytes = @as(?usize, 1024),
+        .allow_direct_quant_fallback = true,
+        .prefer_f16_mps_fallback = true,
+    }, &prep_stats));
+
+    var input = [_]f32{0.0} ** hidden_size;
+    input[0] = 1.0;
+    input[1] = -2.0;
+    input[2] = 0.5;
+    input[3] = 3.0;
+    var output: [out_dim]f32 = undefined;
+    try std.testing.expect(try tryRawLinearHost(
+        &provider,
+        0,
+        &input,
+        hidden_size,
+        out_dim,
+        &output,
+    ));
+    var dequantized: [hidden_size * out_dim]f32 = undefined;
+    try quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, &dequantized);
+    for (0..out_dim) |row| {
+        var expected: f32 = 0.0;
+        for (0..hidden_size) |column| expected += input[column] * dequantized[row * hidden_size + column];
+        try std.testing.expectApproxEqAbs(expected, output[row], 1e-3);
+    }
+}
+
+test "metal native decoder runtime f16 BERT fused paths match decomposed device ops" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+    if (getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED")) return error.SkipZigTest;
+    if ((getenvUsize("TERMITE_METAL_DENSE_QKV_PACK_CACHE_MAX_MB") orelse 256) == 0) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const rows: usize = 4;
+    const hidden: usize = 64;
+    const intermediate: usize = 128;
+
+    const Compare = struct {
+        fn close(label: []const u8, expected: []const f32, actual: []const f32) !void {
+            try std.testing.expectEqual(expected.len, actual.len);
+            for (expected, actual, 0..) |want, got, index| {
+                if (!std.math.isFinite(got) or !std.math.approxEqAbs(f32, want, got, 3e-3)) {
+                    std.debug.print("{s} mismatch index={} expected={d} actual={d}\n", .{ label, index, want, got });
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+
+        fn prepareLinear(
+            p: anytype,
+            slot: usize,
+            storage: *const QuantizedStorage,
+            bias: MetalTensor,
+            in_dim: usize,
+            out_dim: usize,
+            stats: *ops.NativeQuantTimingStats,
+        ) !void {
+            var dummy_value = [_]f32{0};
+            const dummy = MetalTensor.borrowed(&dummy_value, 1, &[_]i32{0});
+            try std.testing.expect(try decoderRuntimePrepareLinear(p, .{
+                .slot = slot,
+                .weight = dummy,
+                .bias = bias,
+                .quantized_storage = @as(?*const QuantizedStorage, storage),
+                .in_dim = in_dim,
+                .out_dim = out_dim,
+                .retain_dense_fallback = true,
+                .dense_fallback_max_bytes = @as(?usize, 1024 * 1024),
+                .allow_direct_quant_fallback = true,
+                .prefer_f16_mps_fallback = true,
+            }, stats));
+        }
+    };
+
+    const identity_values = try allocator.alloc(f32, hidden * hidden);
+    defer allocator.free(identity_values);
+    @memset(identity_values, 0);
+    for (0..hidden) |index| identity_values[index * hidden + index] = 1;
+    const identity_q4 = try quant_codec.quantizeQ4_0FromF32(allocator, identity_values);
+    defer allocator.free(identity_q4);
+    const identity_shape = [_]i64{ hidden, hidden };
+    const identity_storage = QuantizedStorage{
+        .tensor_type = .{ .known = .Q4_0 },
+        .raw_bytes = identity_q4,
+        .shape = &identity_shape,
+        .raw_owned = false,
+        .allocator = allocator,
+    };
+
+    const up_values = try allocator.alloc(f32, intermediate * hidden);
+    defer allocator.free(up_values);
+    @memset(up_values, 0);
+    for (0..hidden) |index| {
+        up_values[index * hidden + index] = 1;
+        up_values[(hidden + index) * hidden + index] = -0.5;
+    }
+    const up_q4 = try quant_codec.quantizeQ4_0FromF32(allocator, up_values);
+    defer allocator.free(up_q4);
+    const up_shape = [_]i64{ intermediate, hidden };
+    const up_storage = QuantizedStorage{
+        .tensor_type = .{ .known = .Q4_0 },
+        .raw_bytes = up_q4,
+        .shape = &up_shape,
+        .raw_owned = false,
+        .allocator = allocator,
+    };
+
+    const down_values = try allocator.alloc(f32, hidden * intermediate);
+    defer allocator.free(down_values);
+    @memset(down_values, 0);
+    for (0..hidden) |index| {
+        down_values[index * intermediate + index] = 1;
+        down_values[index * intermediate + hidden + index] = 0.25;
+    }
+    const down_q4 = try quant_codec.quantizeQ4_0FromF32(allocator, down_values);
+    defer allocator.free(down_q4);
+    const down_shape = [_]i64{ hidden, intermediate };
+    const down_storage = QuantizedStorage{
+        .tensor_type = .{ .known = .Q4_0 },
+        .raw_bytes = down_q4,
+        .shape = &down_shape,
+        .raw_owned = false,
+        .allocator = allocator,
+    };
+
+    const hidden_bias_values = try allocator.alloc(f32, hidden);
+    defer allocator.free(hidden_bias_values);
+    @memset(hidden_bias_values, 0);
+    var hidden_bias = try MetalTensor.ownedCloneFrom(hidden_bias_values, &[_]i32{@intCast(hidden)});
+    defer hidden_bias.deinit();
+    const intermediate_bias_values = try allocator.alloc(f32, intermediate);
+    defer allocator.free(intermediate_bias_values);
+    @memset(intermediate_bias_values, 0);
+    var intermediate_bias = try MetalTensor.ownedCloneFrom(intermediate_bias_values, &[_]i32{@intCast(intermediate)});
+    defer intermediate_bias.deinit();
+
+    var prep_stats: ops.NativeQuantTimingStats = .{};
+    for (0..4) |slot| {
+        try Compare.prepareLinear(&provider, slot, &identity_storage, hidden_bias, hidden, hidden, &prep_stats);
+    }
+    try Compare.prepareLinear(&provider, 4, &up_storage, intermediate_bias, hidden, intermediate, &prep_stats);
+    try Compare.prepareLinear(&provider, 5, &down_storage, hidden_bias, intermediate, hidden, &prep_stats);
+
+    const norm_weight_values = try allocator.alloc(f32, hidden);
+    defer allocator.free(norm_weight_values);
+    const norm_bias_values = try allocator.alloc(f32, hidden);
+    defer allocator.free(norm_bias_values);
+    for (norm_weight_values, norm_bias_values, 0..) |*weight, *bias, index| {
+        weight.* = 0.75 + @as(f32, @floatFromInt(index % 7)) * 0.03125;
+        bias.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 5)) - 2)) * 0.01;
+    }
+    var norm_weight = try MetalTensor.ownedCloneFrom(norm_weight_values, &[_]i32{@intCast(hidden)});
+    defer norm_weight.deinit();
+    var norm_bias = try MetalTensor.ownedCloneFrom(norm_bias_values, &[_]i32{@intCast(hidden)});
+    defer norm_bias.deinit();
+    for (0..2) |slot| {
+        try std.testing.expect(try decoderRuntimePrepareLayerNorm(&provider, .{
+            .slot = slot,
+            .weight = norm_weight,
+            .bias = norm_bias,
+            .hidden_size = hidden,
+        }));
+    }
+
+    const input_values = try allocator.alloc(f32, rows * hidden);
+    defer allocator.free(input_values);
+    const residual_values = try allocator.alloc(f32, rows * hidden);
+    defer allocator.free(residual_values);
+    for (input_values, residual_values, 0..) |*input_value, *residual_value, index| {
+        input_value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 23)) - 11)) * 0.0625;
+        residual_value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 13)) - 6)) * 0.03125;
+    }
+    const input_shape = [_]i32{ @intCast(rows), @intCast(hidden) };
+    var input = try testDeviceTensorFromSlice(runtime, input_values, &input_shape);
+    defer input.deinit();
+    var residual = try testDeviceTensorFromSlice(runtime, residual_values, &input_shape);
+    defer residual.deinit();
+
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    var packed_qkv = (try tryApplyDenseRuntimeLinearQkv(&provider, 0, 1, 2, input, rows, hidden, hidden, hidden)) orelse
+        return error.UnexpectedNull;
+    defer packed_qkv.first.deinit();
+    defer packed_qkv.second.deinit();
+    defer packed_qkv.third.deinit();
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    const packed_stats = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 1), packed_stats.dense_qkv_packed_calls);
+    try std.testing.expectEqual(@as(u64, 0), packed_stats.dense_qkv_packed_fallbacks);
+    try std.testing.expectEqual(
+        @as(u64, 3 * hidden * hidden * @sizeOf(u16) + 3 * hidden * @sizeOf(f32)),
+        packed_stats.dense_qkv_packed_bytes,
+    );
+
+    var q_reference = (try tryApplyDenseRuntimeLinear(&provider, 0, input, rows, hidden, hidden)) orelse return error.UnexpectedNull;
+    defer q_reference.deinit();
+    var k_reference = (try tryApplyDenseRuntimeLinear(&provider, 1, input, rows, hidden, hidden)) orelse return error.UnexpectedNull;
+    defer k_reference.deinit();
+    var v_reference = (try tryApplyDenseRuntimeLinear(&provider, 2, input, rows, hidden, hidden)) orelse return error.UnexpectedNull;
+    defer v_reference.deinit();
+    try Compare.close("packed-q", try tensorHostSlice(&q_reference), try tensorHostSlice(&packed_qkv.first));
+    try Compare.close("packed-k", try tensorHostSlice(&k_reference), try tensorHostSlice(&packed_qkv.second));
+    try Compare.close("packed-v", try tensorHostSlice(&v_reference), try tensorHostSlice(&packed_qkv.third));
+
+    var activation_stats: ops.NativeQuantTimingStats = .{};
+    var fused_attention = (try tryApplyDenseRuntimeLinearLayerNorm(&provider, 3, 0, input, residual, rows, hidden, hidden, 1e-5)) orelse
+        return error.UnexpectedNull;
+    defer fused_attention.deinit();
+    var attention_projected = (try tryApplyDenseRuntimeLinear(&provider, 3, input, rows, hidden, hidden)) orelse return error.UnexpectedNull;
+    defer attention_projected.deinit();
+    var attention_added = (try decoderRuntimeApplyAdd(&provider, .{
+        .lhs = attention_projected,
+        .rhs = residual,
+        .dim = hidden,
+    }, &activation_stats)) orelse return error.UnexpectedNull;
+    defer attention_added.deinit();
+    var attention_reference = (try decoderRuntimeApplyLayerNorm(&provider, .{
+        .input = attention_added,
+        .slot = 0,
+        .hidden_size = hidden,
+        .eps = 1e-5,
+    }, &activation_stats)) orelse return error.UnexpectedNull;
+    defer attention_reference.deinit();
+    try Compare.close("attention-linear-layer-norm", try tensorHostSlice(&attention_reference), try tensorHostSlice(&fused_attention));
+
+    var fused_ffn = (try tryApplyDenseRuntimeFfnLayerNorm(
+        &provider,
+        4,
+        5,
+        1,
+        input,
+        residual,
+        rows,
+        hidden,
+        intermediate,
+        1e-5,
+        .gelu,
+    )) orelse return error.UnexpectedNull;
+    defer fused_ffn.deinit();
+    var first = (try tryApplyDenseRuntimeLinear(&provider, 4, input, rows, hidden, intermediate)) orelse return error.UnexpectedNull;
+    defer first.deinit();
+    var activated = (try decoderRuntimeApplyActivation(&provider, .{
+        .kind = @as(ops.DecoderRuntimeActivationKind, .gelu),
+        .input = first,
+        .dim = intermediate,
+    }, &activation_stats)) orelse return error.UnexpectedNull;
+    defer activated.deinit();
+    var second = (try tryApplyDenseRuntimeLinear(&provider, 5, activated, rows, intermediate, hidden)) orelse return error.UnexpectedNull;
+    defer second.deinit();
+    var ffn_added = (try decoderRuntimeApplyAdd(&provider, .{
+        .lhs = second,
+        .rhs = residual,
+        .dim = hidden,
+    }, &activation_stats)) orelse return error.UnexpectedNull;
+    defer ffn_added.deinit();
+    var ffn_reference = (try decoderRuntimeApplyLayerNorm(&provider, .{
+        .input = ffn_added,
+        .slot = 1,
+        .hidden_size = hidden,
+        .eps = 1e-5,
+    }, &activation_stats)) orelse return error.UnexpectedNull;
+    defer ffn_reference.deinit();
+    try Compare.close("ffn-layer-norm", try tensorHostSlice(&ffn_reference), try tensorHostSlice(&fused_ffn));
 }
 
 test "metal native decoder runtime bf16 multi-row linear matches identity projection" {

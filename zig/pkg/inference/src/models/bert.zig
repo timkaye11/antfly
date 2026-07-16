@@ -27,6 +27,11 @@ pub const ModelType = enum {
     distilbert,
 };
 
+pub const PositionIdMode = enum {
+    absolute,
+    roberta_padding,
+};
+
 /// BERT model configuration loaded from config.json.
 pub const Config = struct {
     model_type: ModelType = .bert,
@@ -44,6 +49,8 @@ pub const Config = struct {
     hidden_act: []const u8 = "gelu",
     layer_norm_eps: f32 = 1e-12,
     num_labels: u32 = 1,
+    pad_token_id: i64 = 0,
+    position_id_mode: PositionIdMode = .absolute,
 
     /// Returns the effective weight prefix for this config.
     pub fn effectivePrefix(self: Config) []const u8 {
@@ -70,6 +77,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
         };
         if (std.mem.eql(u8, s, "roberta") or std.mem.eql(u8, s, "xlm-roberta")) {
             config.model_type = .roberta;
+            config.position_id_mode = .roberta_padding;
         } else if (std.mem.eql(u8, s, "distilbert")) {
             config.model_type = .distilbert;
         }
@@ -84,6 +92,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     if (obj.get("type_vocab_size")) |v| config.type_vocab_size = jsonU32(v) orelse config.type_vocab_size;
     if (obj.get("layer_norm_eps")) |v| config.layer_norm_eps = jsonF32(v) orelse config.layer_norm_eps;
     if (obj.get("num_labels")) |v| config.num_labels = jsonU32(v) orelse config.num_labels;
+    if (obj.get("pad_token_id")) |v| config.pad_token_id = jsonI64(v) orelse config.pad_token_id;
     if (config.num_labels == 1) {
         if (inferNumLabels(obj)) |n| config.num_labels = n;
     }
@@ -104,11 +113,15 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
 
     var config = Config{ .weight_prefix = "" };
     if (view.getString("bert.family")) |family| {
-        if (std.mem.eql(u8, family, "roberta")) {
+        if (std.mem.eql(u8, family, "roberta") or std.mem.eql(u8, family, "xlm-roberta")) {
             config.model_type = .roberta;
+            config.position_id_mode = .roberta_padding;
         } else if (std.mem.eql(u8, family, "distilbert")) {
             config.model_type = .distilbert;
         }
+    } else if (isXlmRobertaGgufMetadata(view)) {
+        config.model_type = .roberta;
+        config.position_id_mode = .roberta_padding;
     }
 
     config.vocab_size = metaU32(view, "bert.vocab_size") orelse config.vocab_size;
@@ -118,7 +131,12 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
     config.intermediate_size = metaU32(view, "bert.feed_forward_length") orelse config.intermediate_size;
     config.max_position_embeddings = metaU32(view, "bert.context_length") orelse config.max_position_embeddings;
     config.type_vocab_size = metaU32(view, "bert.token_type_count") orelse config.type_vocab_size;
-    config.layer_norm_eps = view.getF32("bert.attention.layer_norm_epsilon") orelse config.layer_norm_eps;
+    config.pad_token_id = metaI64(view, "bert.pad_token_id") orelse
+        metaI64(view, "tokenizer.ggml.padding_token_id") orelse
+        config.pad_token_id;
+    config.layer_norm_eps = view.getF32("bert.layer_norm_epsilon") orelse
+        view.getF32("bert.attention.layer_norm_epsilon") orelse
+        config.layer_norm_eps;
     config.num_labels = metaU32(view, "bert.label_count") orelse config.num_labels;
     if (view.getString("bert.hidden_act")) |value| {
         config.hidden_act = if (std.mem.eql(u8, value, "relu")) "relu" else "gelu";
@@ -126,13 +144,31 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
     return config;
 }
 
+pub fn isXlmRobertaGgufMetadata(view: gguf_metadata.View) bool {
+    const tokenizer_model = view.getString("tokenizer.ggml.model") orelse return false;
+    return (std.mem.eql(u8, tokenizer_model, "bert") or std.mem.eql(u8, tokenizer_model, "t5")) and
+        (view.getBool("tokenizer.ggml.add_space_prefix") orelse false) and
+        (metaI64(view, "tokenizer.ggml.padding_token_id") orelse -1) == 1;
+}
+
 fn metaU32(view: gguf_metadata.View, key: []const u8) ?u32 {
     return std.math.cast(u32, view.getU64(key) orelse return null);
 }
 
+fn metaI64(view: gguf_metadata.View, key: []const u8) ?i64 {
+    return view.getI64(key) orelse std.math.cast(i64, view.getU64(key) orelse return null);
+}
+
 fn jsonU32(val: std.json.Value) ?u32 {
     return switch (val) {
-        .integer => |i| @intCast(i),
+        .integer => |i| std.math.cast(u32, i),
+        else => null,
+    };
+}
+
+fn jsonI64(val: std.json.Value) ?i64 {
+    return switch (val) {
+        .integer => |i| i,
         else => null,
     };
 }
@@ -420,6 +456,7 @@ test "parse roberta config" {
     try std.testing.expectEqual(ModelType.roberta, config.model_type);
     try std.testing.expectEqual(@as(u32, 384), config.hidden_size);
     try std.testing.expectEqual(@as(u32, 6), config.num_hidden_layers);
+    try std.testing.expectEqual(PositionIdMode.roberta_padding, config.position_id_mode);
 }
 
 test "weight mapping for bert" {
@@ -508,6 +545,30 @@ test "parse bert gguf metadata" {
     try std.testing.expectEqual(@as(u32, 384), config.hidden_size);
     try std.testing.expectEqual(@as(u32, 3), config.num_labels);
     try std.testing.expectApproxEqAbs(@as(f32, 1e-5), config.layer_norm_eps, 1e-10);
+}
+
+test "BGE-M3 GGUF metadata selects XLM-R padding positions" {
+    const allocator = std.testing.allocator;
+    const format = @import("../gguf/format.zig");
+    const writer = @import("../gguf/writer.zig");
+
+    const metadata = [_]format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "bert" } },
+        .{ .key = "tokenizer.ggml.model", .value = .{ .string = "t5" } },
+        .{ .key = "tokenizer.ggml.add_space_prefix", .value = .{ .bool_ = true } },
+        .{ .key = "tokenizer.ggml.padding_token_id", .value = .{ .i32 = 1 } },
+        .{ .key = "bert.attention.layer_norm_epsilon", .value = .{ .f32 = 0.00001 } },
+    };
+    var layout = try writer.buildLayout(allocator, &metadata, &.{});
+    defer layout.deinit(allocator);
+    var parsed = try format.parse(allocator, layout.header_bytes);
+    defer parsed.deinit(allocator);
+
+    const config = parseGgufMetadata(gguf_metadata.View.init(&parsed)).?;
+    try std.testing.expectEqual(ModelType.roberta, config.model_type);
+    try std.testing.expectEqual(PositionIdMode.roberta_padding, config.position_id_mode);
+    try std.testing.expectEqual(@as(i64, 1), config.pad_token_id);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.00001), config.layer_norm_eps, 1e-8);
 }
 
 test "normalize canonical BERT GGUF weight keys" {

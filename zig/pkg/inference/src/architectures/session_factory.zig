@@ -23,6 +23,7 @@ const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const compat = @import("../io/compat.zig");
 const Session = @import("../backends/session.zig").Session;
+const ResidentOutputs = @import("../backends/session.zig").ResidentOutputs;
 const Tensor = @import("../backends/tensor.zig").Tensor;
 const TensorInfo = @import("../backends/tensor.zig").TensorInfo;
 const BackendType = @import("../backends/backends.zig").BackendType;
@@ -4804,11 +4805,124 @@ fn gpuBackendData(self: *ArchSession) *GpuHostedData {
 
 const arch_vtable = Session.VTable{
     .run = &archRun,
+    .runResident = &archRunResident,
     .inputInfo = &archInputInfo,
     .outputInfo = &archOutputInfo,
     .backend = &archBackend,
     .close = &archClose,
 };
+
+fn deinitResidentComputeBackend(owner: *anyopaque, allocator: std.mem.Allocator) void {
+    const cb: *ops.ComputeBackend = @ptrCast(@alignCast(owner));
+    cb.deinit();
+    allocator.destroy(cb);
+}
+
+const BertRunInputs = struct {
+    input_ids: []const i64,
+    attention_mask: []const i64,
+    token_type_ids: ?[]const i64,
+    batch: usize,
+    seq_len: usize,
+};
+
+fn validateI64Matrix(tensor: Tensor, expected_shape: ?[2]usize) !struct {
+    values: []const i64,
+    shape: [2]usize,
+} {
+    if (tensor.dtype != .i64) return error.InvalidInputType;
+    if (tensor.shape.len != 2 or tensor.shape[0] <= 0 or tensor.shape[1] <= 0) return error.InvalidInputShape;
+    const shape = [2]usize{
+        std.math.cast(usize, tensor.shape[0]) orelse return error.InvalidInputShape,
+        std.math.cast(usize, tensor.shape[1]) orelse return error.InvalidInputShape,
+    };
+    if (expected_shape) |expected| {
+        if (!std.mem.eql(usize, &shape, &expected)) return error.InvalidInputShape;
+    }
+    const element_count = std.math.mul(usize, shape[0], shape[1]) catch return error.InvalidInputShape;
+    const expected_bytes = std.math.mul(usize, element_count, @sizeOf(i64)) catch return error.InvalidInputShape;
+    if (tensor.data.len != expected_bytes or !tensor.isAlignedFor(i64)) return error.InvalidInputShape;
+    return .{ .values = tensor.asInt64(), .shape = shape };
+}
+
+fn parseBertRunInputs(inputs: []const Tensor) !BertRunInputs {
+    if (inputs.len < 2) return error.MissingInputs;
+    const ids = try validateI64Matrix(inputs[0], null);
+    const mask = try validateI64Matrix(inputs[1], ids.shape);
+    const token_type_ids = if (inputs.len > 2)
+        (try validateI64Matrix(inputs[2], ids.shape)).values
+    else
+        null;
+    return .{
+        .input_ids = ids.values,
+        .attention_mask = mask.values,
+        .token_type_ids = token_type_ids,
+        .batch = ids.shape[0],
+        .seq_len = ids.shape[1],
+    };
+}
+
+test "BERT session inputs require matching aligned i64 matrices" {
+    const allocator = std.testing.allocator;
+    const shape = [_]i64{ 1, 2 };
+    var ids = try Tensor.initInt64(allocator, "input_ids", &shape, &.{ 7, 8 });
+    defer ids.deinit();
+    var mask = try Tensor.initInt64(allocator, "attention_mask", &shape, &.{ 1, 1 });
+    defer mask.deinit();
+    const parsed = try parseBertRunInputs(&.{ ids, mask });
+    try std.testing.expectEqual(@as(usize, 1), parsed.batch);
+    try std.testing.expectEqual(@as(usize, 2), parsed.seq_len);
+
+    var wrong_type = try Tensor.initFloat32(allocator, "attention_mask", &shape, &.{ 1, 1 });
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.InvalidInputType, parseBertRunInputs(&.{ ids, wrong_type }));
+
+    const wrong_shape = [_]i64{ 2, 1 };
+    var mismatched = try Tensor.initInt64(allocator, "attention_mask", &wrong_shape, &.{ 1, 1 });
+    defer mismatched.deinit();
+    try std.testing.expectError(error.InvalidInputShape, parseBertRunInputs(&.{ ids, mismatched }));
+}
+
+test "BERT architecture regression declarations compile" {
+    std.testing.refAllDecls(bert_arch);
+}
+
+fn archRunResident(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) !?ResidentOutputs {
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    const cfg = switch (self.arch_config) {
+        .bert => |value| value,
+        else => return null,
+    };
+    if (self.task == .classifier or self.task == .recognizer) return null;
+    const bert_inputs = try parseBertRunInputs(inputs);
+
+    const cb = try allocator.create(ops.ComputeBackend);
+    errdefer allocator.destroy(cb);
+    cb.* = try makeComputeBackend(self, allocator, null);
+    errdefer cb.deinit();
+
+    const hidden = try bert_arch.forwardCt(
+        cb,
+        allocator,
+        cfg,
+        bert_inputs.input_ids,
+        bert_inputs.attention_mask,
+        bert_inputs.token_type_ids,
+        bert_inputs.batch,
+        bert_inputs.seq_len,
+    );
+    errdefer cb.free(hidden);
+    const outputs = try allocator.alloc(ops.CT, 1);
+    errdefer allocator.free(outputs);
+    outputs[0] = hidden;
+    return .{
+        .outputs = outputs,
+        .backend = cb,
+        .allocator = allocator,
+        .backend_owner = cb,
+        .deinit_backend_owner = &deinitResidentComputeBackend,
+    };
+}
 
 /// Create a ComputeBackend from an ArchSession. Used internally and by generation pipeline.
 fn makeComputeBackend(
@@ -5180,15 +5294,19 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
     // Dispatch based on architecture
     switch (self.arch_config) {
         .bert => |cfg| {
-            if (inputs.len < 2) return error.MissingInputs;
-            const input_ids_tensor = inputs[0];
-            if (input_ids_tensor.shape.len != 2) return error.InvalidInputShape;
-            const batch: usize = @intCast(input_ids_tensor.shape[0]);
-            const seq_len: usize = @intCast(input_ids_tensor.shape[1]);
-            const input_ids = input_ids_tensor.asInt64();
-            const attention_mask = inputs[1].asInt64();
-            const token_type_ids: ?[]const i64 = if (inputs.len > 2) inputs[2].asInt64() else null;
-            const hidden = try bert_arch.forward(&cb, allocator, cfg, input_ids, attention_mask, token_type_ids, batch, seq_len);
+            const bert_inputs = try parseBertRunInputs(inputs);
+            const batch = bert_inputs.batch;
+            const seq_len = bert_inputs.seq_len;
+            const hidden = try bert_arch.forward(
+                &cb,
+                allocator,
+                cfg,
+                bert_inputs.input_ids,
+                bert_inputs.attention_mask,
+                bert_inputs.token_type_ids,
+                batch,
+                seq_len,
+            );
             defer allocator.free(hidden);
 
             if (self.task == .classifier) {

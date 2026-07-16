@@ -553,8 +553,8 @@ pub const ReductionKind = enum(u8) {
     /// cross-simdgroup reduction; `cols_per_threadgroup` is the sum of the
     /// columns produced by all simdgroups in the threadgroup.
     simdgroup_tiled,
-    /// Four simdgroups cooperatively stage a 64x32x32 half tile and accumulate
-    /// it with Metal simdgroup matrix operations.
+    /// Five or eight simdgroups cooperatively stage a 40x32x64 or 64x32x64
+    /// half tile and accumulate it with Metal simdgroup matrix operations.
     simdgroup_matrix,
 };
 
@@ -632,10 +632,9 @@ pub const KernelSchedule = struct {
             },
             .simdgroup_matrix => {
                 if (block_values != 256) return error.MatrixReductionRequiresKBlock;
-                if (self.threads_per_threadgroup != 160 or
-                    self.cols_per_threadgroup != 64 or
-                    self.rows_per_threadgroup != 40)
-                {
+                const tile_40 = self.threads_per_threadgroup == 160 and self.rows_per_threadgroup == 40;
+                const tile_64 = self.threads_per_threadgroup == 256 and self.rows_per_threadgroup == 64;
+                if (self.cols_per_threadgroup != 64 or (!tile_40 and !tile_64)) {
                     return error.InvalidMatrixTile;
                 }
             },
@@ -794,7 +793,8 @@ pub fn metalScheduleCandidates(
 
 /// Shape-aware schedule catalog used by exact-signature Metal tuning. Every
 /// valid two-row Q4_0 projection gets a bounded packed register-tile grid;
-/// every other shape keeps the generic catalog unchanged.
+/// Q4_K/Q6_K encoder projections get bounded register and row-tiled matrix
+/// candidates; every other shape keeps the generic catalog unchanged.
 pub fn metalScheduleCandidatesForExactShape(
     format: quant_matmul.Format,
     epilogue: Epilogue,
@@ -805,7 +805,7 @@ pub fn metalScheduleCandidatesForExactShape(
 ) usize {
     if ((format == .q4_k or format == .q6_k) and
         (epilogue == .none or epilogue == .bias or epilogue == .bias_gelu) and
-        rows >= 9 and rows <= 64 and
+        rows >= 9 and
         in_dim != 0 and in_dim % 256 == 0 and out_dim != 0)
     {
         const row_tiles = if (rows <= 32) [_]u8{ 2, 4 } else [_]u8{ 4, 8 };
@@ -824,15 +824,24 @@ pub fn metalScheduleCandidatesForExactShape(
                 }
             }
         }
-        if (epilogue == .none and rows == 40) {
-            // Keep the proven scalar winner at index 4 and spend the final
-            // bounded candidate slot on the matrix kernel.
+        if (epilogue == .none and rows >= 40) {
             out[count - 1] = .{
                 .threads_per_threadgroup = 160,
                 .cols_per_threadgroup = 64,
                 .rows_per_threadgroup = 40,
                 .reduction = .simdgroup_matrix,
             };
+            if (rows >= 64) {
+                // Compare both matrix tiles without growing the bounded
+                // candidate set or displacing the strongest register shapes.
+                out[count - 3] = out[count - 1];
+                out[count - 1] = .{
+                    .threads_per_threadgroup = 256,
+                    .cols_per_threadgroup = 64,
+                    .rows_per_threadgroup = 64,
+                    .reduction = .simdgroup_matrix,
+                };
+            }
         }
         return count;
     }
@@ -7873,18 +7882,43 @@ pub fn emitMetalScheduleCandidateSource(
     artifact: GeneratedArtifact,
     schedule: KernelSchedule,
 ) !RuntimeArtifactSource {
+    return emitMetalScheduleCandidateSourceKind(allocator, artifact, schedule, false);
+}
+
+/// Emits the homogeneous Q/K/V companion for an already-qualified exact
+/// schedule. This is deliberately not a second tuning surface: it uses the
+/// same decoder, shape, and launch tile as the qualified single projection.
+pub fn emitMetalQkvScheduleCandidateSource(
+    allocator: std.mem.Allocator,
+    artifact: GeneratedArtifact,
+    schedule: KernelSchedule,
+) !RuntimeArtifactSource {
+    return emitMetalScheduleCandidateSourceKind(allocator, artifact, schedule, true);
+}
+
+fn emitMetalScheduleCandidateSourceKind(
+    allocator: std.mem.Allocator,
+    artifact: GeneratedArtifact,
+    schedule: KernelSchedule,
+    qkv: bool,
+) !RuntimeArtifactSource {
     if (artifact.backend != .metal) return error.UnsupportedMetalScheduleCandidate;
     const op = artifact.matmulOp() orelse return error.UnsupportedMetalScheduleCandidate;
     if (op.row_bucket != .rows_2_8) return error.UnsupportedMetalScheduleCandidate;
+    if (qkv and (op.epilogue != .none or (op.format != .q4_k and op.format != .q6_k))) {
+        return error.UnsupportedMetalQkvScheduleCandidate;
+    }
     const decoder = metal_renderer.decoderFor(op.format) orelse
         return error.MissingMetalFormatDecoder;
-    const kernel = try metal_renderer.renderKernel(
-        allocator,
-        artifact.kernel_id,
-        decoder,
-        schedule,
-        op.epilogue,
-    );
+    const kernel_id = if (qkv)
+        try std.fmt.allocPrint(allocator, "{s}_qkv", .{artifact.kernel_id})
+    else
+        try allocator.dupe(u8, artifact.kernel_id);
+    defer allocator.free(kernel_id);
+    const kernel = if (qkv)
+        try metal_renderer.renderQkvKernel(allocator, kernel_id, decoder, schedule)
+    else
+        try metal_renderer.renderKernel(allocator, kernel_id, decoder, schedule, op.epilogue);
     defer allocator.free(kernel);
 
     var source: std.ArrayListUnmanaged(u8) = .empty;
@@ -7893,9 +7927,10 @@ pub fn emitMetalScheduleCandidateSource(
     try source.appendSlice(allocator, "\n\n// Runtime Metal schedule candidate.\n");
     const metadata = try std.fmt.allocPrint(
         allocator,
-        "// kernel_id={s}\n// production_baseline=metal_handwritten_quant_matmul\n// production_enabled=false\n// schedule=threads:{d},rows:{d},cols:{d},reduction:{s}\n\n#include <metal_stdlib>\nusing namespace metal;\n\n",
+        "// kernel_id={s}\n// production_baseline=metal_handwritten_quant_matmul\n// production_enabled=false\n// fusion={s}\n// schedule=threads:{d},rows:{d},cols:{d},reduction:{s}\n\n#include <metal_stdlib>\nusing namespace metal;\n\n",
         .{
-            artifact.kernel_id,
+            kernel_id,
+            if (qkv) "qkv" else "none",
             schedule.threads_per_threadgroup,
             schedule.rows_per_threadgroup,
             schedule.cols_per_threadgroup,
@@ -12523,7 +12558,7 @@ test "quant kernel compiler exact two-row Q4_0 catalog includes the bounded smal
     }
 }
 
-test "quant kernel compiler exact Q4_K and Q6_K encoder catalogs tile rows through 64" {
+test "quant kernel compiler exact Q4_K and Q6_K encoder catalogs tile large rows" {
     var schedules: [metal_schedule_candidate_capacity]KernelSchedule = undefined;
     for ([_]struct {
         format: quant_matmul.Format,
@@ -12546,7 +12581,11 @@ test "quant kernel compiler exact Q4_K and Q6_K encoder catalogs tile rows throu
         const wide_count = metalScheduleCandidatesForExactShape(route.format, route.epilogue, 48, 1024, 1024, &schedules);
         try std.testing.expectEqual(@as(usize, 8), wide_count);
         for (schedules[0..wide_count]) |schedule| {
-            try std.testing.expect(schedule.rows_per_threadgroup == 4 or schedule.rows_per_threadgroup == 8);
+            if (route.epilogue == .none and schedule.reduction == .simdgroup_matrix) {
+                try std.testing.expectEqual(@as(u8, 40), schedule.rows_per_threadgroup);
+            } else {
+                try std.testing.expect(schedule.rows_per_threadgroup == 4 or schedule.rows_per_threadgroup == 8);
+            }
             try schedule.validate(256);
         }
 
@@ -12556,6 +12595,21 @@ test "quant kernel compiler exact Q4_K and Q6_K encoder catalogs tile rows throu
             try std.testing.expectEqual(ReductionKind.simdgroup_matrix, schedules[7].reduction);
             try std.testing.expectEqual(@as(u16, 160), schedules[7].threads_per_threadgroup);
             try std.testing.expectEqual(@as(u8, 40), schedules[7].rows_per_threadgroup);
+        }
+
+        const large_count = metalScheduleCandidatesForExactShape(route.format, route.epilogue, 256, 1024, 4096, &schedules);
+        try std.testing.expectEqual(@as(usize, 8), large_count);
+        if (route.epilogue == .none) {
+            try std.testing.expectEqual(ReductionKind.simdgroup_matrix, schedules[5].reduction);
+            try std.testing.expectEqual(@as(u16, 160), schedules[5].threads_per_threadgroup);
+            try std.testing.expectEqual(@as(u8, 40), schedules[5].rows_per_threadgroup);
+            try std.testing.expectEqual(ReductionKind.simdgroup_matrix, schedules[7].reduction);
+            try std.testing.expectEqual(@as(u16, 256), schedules[7].threads_per_threadgroup);
+            try std.testing.expectEqual(@as(u8, 64), schedules[7].rows_per_threadgroup);
+        } else {
+            for (schedules[0..large_count]) |schedule| {
+                try std.testing.expect(schedule.rows_per_threadgroup == 4 or schedule.rows_per_threadgroup == 8);
+            }
         }
     }
 

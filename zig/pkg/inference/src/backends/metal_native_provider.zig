@@ -39,7 +39,8 @@ const RawQuantizedRuntimeLinearKind = metal_runtime.RawQuantizedRuntimeLinearKin
 const RawQuantizedRuntimeLinearStorageMode = metal_runtime.RawQuantizedRuntimeLinearStorageMode;
 const GatheredSpanKey = metal_runtime.GatheredSpanKey;
 const GatheredSpanEntry = metal_runtime.GatheredSpanEntry;
-pub const exact_jit_pipeline_owner_capacity: usize = 32;
+// One primary pipeline plus an optional homogeneous QKV companion per winner.
+pub const exact_jit_pipeline_owner_capacity: usize = 2 * metal_runtime.workload_tuning_maximum_winners;
 comptime {
     if (exact_jit_pipeline_owner_capacity < metal_runtime.workload_tuning_maximum_winners) {
         @compileError("Metal exact JIT owner capacity must cover every per-regime workload winner");

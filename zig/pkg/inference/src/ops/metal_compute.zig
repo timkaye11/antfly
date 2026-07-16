@@ -6758,6 +6758,84 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.attention_mask_device_cache.?.retainedCopy();
     }
 
+    fn tryScaledDotProductAttentionResident(
+        self: *MetalCompute,
+        q_ct: CT,
+        k_ct: CT,
+        v_ct: CT,
+        mask: ?[]const i64,
+        attn_bias_ct: ?CT,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) anyerror!?CT {
+        if (batch == 0 or seq_len == 0 or num_heads == 0 or head_dim == 0) return null;
+        const q_buf = toBuf(q_ct);
+        const k_buf = toBuf(k_ct);
+        const v_buf = toBuf(v_ct);
+        if (q_buf.quantized_storage != null or k_buf.quantized_storage != null or v_buf.quantized_storage != null) return null;
+        const batch_heads = std.math.mul(usize, batch, num_heads) catch return null;
+        const batch_head_tokens = std.math.mul(usize, batch_heads, seq_len) catch return null;
+        const total = std.math.mul(usize, batch_head_tokens, head_dim) catch return null;
+        if (total == 0) return null;
+
+        var q_mt = try self.ownedDeviceMetalTensorFromCt(q_ct);
+        defer q_mt.deinit();
+        var k_mt = try self.ownedDeviceMetalTensorFromCt(k_ct);
+        defer k_mt.deinit();
+        var v_mt = try self.ownedDeviceMetalTensorFromCt(v_ct);
+        defer v_mt.deinit();
+        if (!q_mt.isDevice() or !k_mt.isDevice() or !v_mt.isDevice()) return null;
+        if (q_mt.elemCount() != total or k_mt.elemCount() != total or v_mt.elemCount() != total) return null;
+
+        var bias_mt: ?MetalTensor = null;
+        defer if (bias_mt) |*tensor| tensor.deinit();
+        var bias_mode: u32 = 0;
+        if (attn_bias_ct) |bias_ct| {
+            const bias_buf = toBuf(bias_ct);
+            if (bias_buf.quantized_storage != null) return null;
+            const seq_squared = std.math.mul(usize, seq_len, seq_len) catch return null;
+            const shared_bias_len = std.math.mul(usize, num_heads, seq_squared) catch return null;
+            const batched_bias_len = std.math.mul(usize, batch, shared_bias_len) catch return null;
+            const broadcast_head_bias_len = std.math.mul(usize, batch, seq_squared) catch return null;
+            const bias_elem_count = bufElemCount(bias_buf);
+            if (bias_elem_count == shared_bias_len) {
+                bias_mode = 1;
+            } else if (bias_elem_count == batched_bias_len) {
+                bias_mode = 2;
+            } else if (bias_elem_count == broadcast_head_bias_len) {
+                bias_mode = 3;
+            } else {
+                return null;
+            }
+            bias_mt = try self.ownedDeviceMetalTensorFromCt(bias_ct);
+            if (!bias_mt.?.isDevice()) return null;
+        }
+
+        var mask_mt: ?MetalTensor = null;
+        defer if (mask_mt) |*tensor| tensor.deinit();
+        if (mask) |values| {
+            const mask_len = std.math.mul(usize, batch, seq_len) catch return null;
+            if (values.len < mask_len) return null;
+            mask_mt = try self.attentionMaskDeviceTensor(values, batch, seq_len);
+        }
+
+        const tensor = (try metal_runtime.decoderRuntimeSdpaF32Device(self.provider_impl, .{
+            .q = q_mt,
+            .k = k_mt,
+            .v = v_mt,
+            .bias = bias_mt,
+            .mask = mask_mt,
+            .batch = batch,
+            .seq_len = seq_len,
+            .num_heads = num_heads,
+            .head_dim = head_dim,
+            .bias_mode = bias_mode,
+        })) orelse return null;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
     fn scaledDotProductAttentionOp(
         ctx: *anyopaque,
         q_ct: CT,
@@ -6771,69 +6849,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         head_dim: usize,
     ) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (batch != 0 and seq_len != 0 and num_heads != 0 and head_dim != 0) resident_path: {
-            const q_buf = toBuf(q_ct);
-            const k_buf = toBuf(k_ct);
-            const v_buf = toBuf(v_ct);
-            if (q_buf.quantized_storage != null or k_buf.quantized_storage != null or v_buf.quantized_storage != null) break :resident_path;
-            const total = batch * num_heads * seq_len * head_dim;
-            if (total == 0) break :resident_path;
-
-            var q_mt = try self.ownedDeviceMetalTensorFromCt(q_ct);
-            defer q_mt.deinit();
-            var k_mt = try self.ownedDeviceMetalTensorFromCt(k_ct);
-            defer k_mt.deinit();
-            var v_mt = try self.ownedDeviceMetalTensorFromCt(v_ct);
-            defer v_mt.deinit();
-            if (!q_mt.isDevice() or !k_mt.isDevice() or !v_mt.isDevice()) break :resident_path;
-            if (q_mt.elemCount() != total or k_mt.elemCount() != total or v_mt.elemCount() != total) break :resident_path;
-
-            var bias_mt: ?MetalTensor = null;
-            defer if (bias_mt) |*tensor| tensor.deinit();
-            var bias_mode: u32 = 0;
-            if (attn_bias_ct) |bias_ct| {
-                const bias_buf = toBuf(bias_ct);
-                if (bias_buf.quantized_storage != null) break :resident_path;
-                const shared_bias_len = num_heads * seq_len * seq_len;
-                const batched_bias_len = batch * shared_bias_len;
-                const broadcast_head_bias_len = batch * seq_len * seq_len;
-                const bias_elem_count = bufElemCount(bias_buf);
-                if (bias_elem_count == shared_bias_len) {
-                    bias_mode = 1;
-                } else if (bias_elem_count == batched_bias_len) {
-                    bias_mode = 2;
-                } else if (bias_elem_count == broadcast_head_bias_len) {
-                    bias_mode = 3;
-                } else {
-                    break :resident_path;
-                }
-                bias_mt = try self.ownedDeviceMetalTensorFromCt(bias_ct);
-                if (!bias_mt.?.isDevice()) break :resident_path;
-            }
-
-            var mask_mt: ?MetalTensor = null;
-            defer if (mask_mt) |*tensor| tensor.deinit();
-            if (mask.len > 0) {
-                if (mask.len < batch * seq_len) break :resident_path;
-                mask_mt = try self.attentionMaskDeviceTensor(mask, batch, seq_len);
-            }
-
-            if (try metal_runtime.decoderRuntimeSdpaF32Device(self.provider_impl, .{
-                .q = q_mt,
-                .k = k_mt,
-                .v = v_mt,
-                .bias = bias_mt,
-                .mask = mask_mt,
-                .batch = batch,
-                .seq_len = seq_len,
-                .num_heads = num_heads,
-                .head_dim = head_dim,
-                .bias_mode = bias_mode,
-            })) |tensor| {
-                return self.ctFromOwnedMetalTensor(tensor);
-            }
-        }
+        if (try self.tryScaledDotProductAttentionResident(q_ct, k_ct, v_ct, if (mask.len == 0) null else mask, attn_bias_ct, batch, seq_len, num_heads, head_dim)) |output| return output;
         return self.hostFallbackSdpa(q_ct, k_ct, v_ct, mask, attn_bias_ct, batch, seq_len, num_heads, head_dim);
+    }
+
+    fn scaledDotProductAttentionFullOp(
+        ctx: *anyopaque,
+        q_ct: CT,
+        k_ct: CT,
+        v_ct: CT,
+        attn_bias_ct: ?CT,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.tryScaledDotProductAttentionResident(q_ct, k_ct, v_ct, null, attn_bias_ct, batch, seq_len, num_heads, head_dim);
     }
 
     fn disentangledRelativeAttentionOp(
@@ -7625,6 +7657,41 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (request.row_ids.len != request.rows or request.rows == 0 or request.dim == 0) return null;
         const input_buf = toBuf(request.input);
+        if (input_buf.quantized_storage == null) {
+            const shape = input_buf.logical_shape orelse return null;
+            if (shape.len != 2 or shape[0] <= 0 or shape[1] != @as(i64, @intCast(request.dim))) return null;
+            const source_rows: usize = @intCast(shape[0]);
+            for (request.row_ids) |row_id| {
+                if (row_id >= source_rows) return error.IndexOutOfBounds;
+            }
+            const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+            var input_tensor = try self.ownedDeviceMetalTensorFromCt(request.input);
+            defer input_tensor.deinit();
+            const index_values = try self.allocator.alloc(f32, request.rows);
+            defer self.allocator.free(index_values);
+            for (request.row_ids, 0..) |row_id, index| index_values[index] = @floatFromInt(row_id);
+            const index_shape = [_]i32{@intCast(request.rows)};
+            var index_tensor = try MetalTensor.deviceAllocate(
+                @ptrCast(runtime),
+                request.rows * @sizeOf(f32),
+                .shared,
+                &index_shape,
+            );
+            defer index_tensor.deinit();
+            const host_indices = MetalTensor.borrowed(index_values.ptr, index_values.len, &index_shape);
+            try host_indices.copyInto(&index_tensor);
+            const output_shape = [_]i32{ @intCast(request.rows), @intCast(request.dim) };
+            if (try metal_runtime.decoderRuntimeGatherAxis0F32_2DDevice(
+                self.provider_impl,
+                input_tensor,
+                index_tensor,
+                source_rows,
+                request.dim,
+                request.rows,
+                &output_shape,
+            )) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+            return null;
+        }
         const storage = input_buf.quantized_storage orelse return null;
         if (storage.packed_expert != null or storage.shape.len != 2) return null;
         const source_rows: usize = @intCast(storage.shape[0]);
@@ -18753,8 +18820,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_dense_linear_weight_bytes = runtime_stats.dense_linear_weight_bytes;
         stats.metal_runtime_dense_linear_f32_weight_bytes = runtime_stats.dense_linear_f32_weight_bytes;
         stats.metal_runtime_dense_linear_bf16_weight_bytes = runtime_stats.dense_linear_bf16_weight_bytes;
+        stats.metal_runtime_dense_linear_f16_weight_bytes = runtime_stats.dense_linear_f16_weight_bytes;
         stats.metal_runtime_dense_linear_f32_slots = runtime_stats.dense_linear_f32_slots;
         stats.metal_runtime_dense_linear_bf16_slots = runtime_stats.dense_linear_bf16_slots;
+        stats.metal_runtime_dense_linear_f16_slots = runtime_stats.dense_linear_f16_slots;
+        stats.metal_runtime_dense_qkv_packed_bytes = runtime_stats.dense_qkv_packed_bytes;
         stats.metal_runtime_quant_linear_bytes = runtime_stats.quant_linear_bytes;
         stats.metal_runtime_scratch_bytes = runtime_stats.scratch_bytes;
         stats.metal_runtime_scratch_pool_bytes = runtime_stats.scratch_pool_bytes;
@@ -18770,6 +18840,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_graph_plan_count = runtime_stats.graph_plan_count;
         stats.metal_runtime_graph_plan_allocations = runtime_stats.graph_plan_allocations;
         stats.metal_runtime_graph_plan_reuses = runtime_stats.graph_plan_reuses;
+        stats.metal_runtime_mps_dense_linear_standalone_calls = runtime_stats.mps_dense_linear_standalone_calls;
+        stats.metal_runtime_mps_dense_linear_active_frame_calls = runtime_stats.mps_dense_linear_active_frame_calls;
+        stats.metal_runtime_mps_dense_linear_standalone_wait_nanos = runtime_stats.mps_dense_linear_standalone_wait_nanos;
+        stats.metal_runtime_mps_dense_linear_standalone_gpu_nanos = runtime_stats.mps_dense_linear_standalone_gpu_nanos;
+        stats.metal_runtime_last_frame_mps_dense_linear_count = runtime_stats.last_frame_mps_dense_linear_count;
+        stats.metal_runtime_dense_qkv_packed_calls = runtime_stats.dense_qkv_packed_calls;
+        stats.metal_runtime_dense_qkv_packed_fallbacks = runtime_stats.dense_qkv_packed_fallbacks;
+        stats.metal_runtime_dense_pair_packed_calls = runtime_stats.dense_pair_packed_calls;
+        stats.metal_runtime_dense_pair_packed_fallbacks = runtime_stats.dense_pair_packed_fallbacks;
+        stats.metal_runtime_deberta_ffn_fused_calls = runtime_stats.deberta_ffn_fused_calls;
+        stats.metal_runtime_deberta_ffn_fused_mps_matmuls = runtime_stats.deberta_ffn_fused_mps_matmuls;
+        stats.metal_runtime_deberta_ffn_fused_fallbacks = runtime_stats.deberta_ffn_fused_fallbacks;
+        stats.metal_runtime_deberta_attention_flash_calls = runtime_stats.deberta_attention_flash_calls;
+        stats.metal_runtime_deberta_attention_legacy_calls = runtime_stats.deberta_attention_legacy_calls;
+        stats.metal_runtime_deberta_attention_gemm_calls = runtime_stats.deberta_attention_gemm_calls;
+        stats.metal_runtime_deberta_attention_gemm_fallbacks = runtime_stats.deberta_attention_gemm_fallbacks;
         stats.metal_runtime_paged_attention_1x_calls = runtime_stats.paged_attention_1x_calls;
         stats.metal_runtime_generated_attention_decode_1x_calls = runtime_stats.generated_attention_decode_1x_calls;
         stats.metal_runtime_generated_attention_flash_prefill_calls = runtime_stats.generated_attention_flash_prefill_calls;
@@ -19190,6 +19276,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .retain_dense_fallback = request.retain_dense_fallback,
             .disable_mapped_quant_weight = request.disable_mapped_quant_weight,
             .dense_fallback_max_bytes = request.dense_fallback_max_bytes,
+            .allow_direct_quant_fallback = request.allow_direct_quant_fallback,
+            .prefer_bf16_fallback = request.prefer_bf16_fallback,
+            .prefer_f16_mps_fallback = request.prefer_f16_mps_fallback,
+            .prefer_f32_mps_fallback = request.prefer_f32_mps_fallback,
             .dense_bf16_bytes = dense_bf16_bytes,
             .dense_bf16_no_copy_safe = dense_bf16_no_copy_safe,
         }, &self.timing_stats);
@@ -20201,6 +20291,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.concatPrimOp = concatPrimOp;
         vt.softmaxOp = softmaxOp;
         vt.scaledDotProductAttention = scaledDotProductAttentionOp;
+        vt.scaledDotProductAttentionFull = scaledDotProductAttentionFullOp;
         vt.disentangledRelativeAttention = disentangledRelativeAttentionOp;
         vt.causalSelfAttention = causalSelfAttentionOp;
         vt.crossAttention = crossAttentionOp;
