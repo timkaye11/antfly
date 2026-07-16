@@ -411,14 +411,17 @@ fn loadHuggingFaceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []c
     const view = gguf_metadata.View.init(&parsed);
     const model_name = view.getString("tokenizer.ggml.model") orelse return error.NoTokenizerFound;
 
-    const flavor: GgufBpeTokenizerFlavor = if (std.mem.eql(u8, model_name, "gpt2"))
-        .byte_level
-    else if (std.mem.eql(u8, model_name, "gemma4"))
-        .gemma4
-    else
-        return error.NoTokenizerFound;
-
-    const tokenizer_bytes = try bpeTokenizerJsonFromGguf(allocator, &parsed, flavor);
+    const tokenizer_bytes = if (std.mem.eql(u8, model_name, "t5"))
+        try unigramTokenizerJsonFromGguf(allocator, &parsed)
+    else blk: {
+        const flavor: GgufBpeTokenizerFlavor = if (std.mem.eql(u8, model_name, "gpt2"))
+            .byte_level
+        else if (std.mem.eql(u8, model_name, "gemma4"))
+            .gemma4
+        else
+            return error.NoTokenizerFound;
+        break :blk try bpeTokenizerJsonFromGguf(allocator, &parsed, flavor);
+    };
     defer allocator.free(tokenizer_bytes);
 
     const tok = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tokenizer_bytes);
@@ -435,6 +438,56 @@ const GgufBpeTokenizerFlavor = enum {
     byte_level,
     gemma4,
 };
+
+fn unigramTokenizerJsonFromGguf(
+    allocator: std.mem.Allocator,
+    parsed: *const gguf_format.File,
+) ![]u8 {
+    const tokens = try getRequiredMetadataArray(parsed, "tokenizer.ggml.tokens", .string);
+    const scores = try getRequiredMetadataArray(parsed, "tokenizer.ggml.scores", null);
+    const token_types = try getRequiredMetadataArray(parsed, "tokenizer.ggml.token_type", null);
+    if (tokens.values.len != scores.values.len or tokens.values.len != token_types.values.len) {
+        return error.InvalidTokenizerMetadata;
+    }
+    const unknown_id = metadataTokenId(parsed, "tokenizer.ggml.unknown_token_id") orelse
+        return error.InvalidTokenizerMetadata;
+    const add_space_prefix = gguf_metadata.View.init(parsed).getBool("tokenizer.ggml.add_space_prefix") orelse true;
+
+    var tokenizer_json = std.ArrayListUnmanaged(u8).empty;
+    defer tokenizer_json.deinit(allocator);
+    try tokenizer_json.appendSlice(allocator, "{\"model\":{\"type\":\"Unigram\",\"unk_id\":");
+    var unknown_id_buf: [32]u8 = undefined;
+    try tokenizer_json.appendSlice(allocator, try std.fmt.bufPrint(&unknown_id_buf, "{d}", .{unknown_id}));
+    try tokenizer_json.appendSlice(allocator, ",\"vocab\":[");
+    for (tokens.values, scores.values, 0..) |token_value, score_value, index| {
+        const token = switch (token_value) {
+            .string => |value| value,
+            else => return error.InvalidTokenizerMetadata,
+        };
+        const score = switch (score_value) {
+            .f32 => |value| value,
+            .f64 => |value| @as(f32, @floatCast(value)),
+            else => return error.InvalidTokenizerMetadata,
+        };
+        if (index > 0) try tokenizer_json.append(allocator, ',');
+        try tokenizer_json.append(allocator, '[');
+        try appendJsonString(&tokenizer_json, allocator, token);
+        var score_buf: [64]u8 = undefined;
+        try tokenizer_json.appendSlice(allocator, try std.fmt.bufPrint(&score_buf, ",{d}]", .{score}));
+    }
+    try tokenizer_json.appendSlice(
+        allocator,
+        if (add_space_prefix)
+            "]},\"pre_tokenizer\":{\"type\":\"Metaspace\",\"replacement\":\"\\u2581\",\"prepend_scheme\":\"always\",\"split\":true},\"added_tokens\":["
+        else
+            "]},\"pre_tokenizer\":{\"type\":\"Metaspace\",\"replacement\":\"\\u2581\",\"prepend_scheme\":\"never\",\"split\":true},\"added_tokens\":[",
+    );
+    // ponytail: precompiled SentencePiece normalization is intentionally left
+    // to a future shared normalizer; ordinary normalized UTF-8 needs no copy.
+    try appendSpecialTokensFromMetadata(&tokenizer_json, allocator, parsed, tokens, token_types);
+    try tokenizer_json.appendSlice(allocator, "]}");
+    return tokenizer_json.toOwnedSlice(allocator);
+}
 
 fn bpeTokenizerJsonFromGguf(
     allocator: std.mem.Allocator,
@@ -1010,6 +1063,7 @@ pub const LoadedModel = struct {
 
     pub fn embeddingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) EmbeddingPipeline {
         const tok = self.getTokenizer();
+        const generic_encoder: ?session_factory.GenericEncoderArchConfig = session_factory.getGenericEncoderArchConfig(self.session) catch null;
         var pipeline = EmbeddingPipeline.init(allocator, self.session, tok, .{
             .max_length = self.manifest.max_position_embeddings,
             .normalize = self.manifest.normalize,
@@ -1020,7 +1074,7 @@ pub const LoadedModel = struct {
                 .last => .last,
             },
             .text_prefix = self.manifest.embedding_text_prefix,
-            .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest),
+            .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest) or generic_encoder != null,
             .resident_qwen3_embedding = isJinaStyleEmbeddingManifest(&self.manifest),
         });
         if (usesClipImagePreprocessProfile(&self.manifest)) {
@@ -2418,6 +2472,30 @@ test "load huggingface tokenizer from gguf gemma4 bpe metadata" {
     try std.testing.expectEqualStrings("hello world", decoded);
 }
 
+test "load huggingface tokenizer from gguf t5 unigram metadata" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const gguf_bytes = try buildTestGgufWithT5Tokenizer(allocator);
+    defer allocator.free(gguf_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bge-m3-q4_k_m.gguf", .data = gguf_bytes });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+    const gguf_path = try std.fs.path.join(allocator, &.{ model_dir, "bge-m3-q4_k_m.gguf" });
+    defer allocator.free(gguf_path);
+
+    var tok = try loadHuggingFaceTokenizerFromDirOrGguf(allocator, model_dir, gguf_path);
+    defer tok.deinitSelf();
+
+    var encoded = try tok.tokenizer().encodeForModel(allocator, "hello world", 8);
+    defer encoded.deinit();
+    try std.testing.expectEqualSlices(i32, &.{ 0, 4, 5, 2, 1, 1, 1, 1 }, encoded.ids);
+    try std.testing.expectEqualSlices(i32, &.{ 1, 1, 1, 1, 0, 0, 0, 0 }, encoded.attention_mask);
+}
+
 fn buildTestGgufWithGpt2Tokenizer(allocator: std.mem.Allocator) ![]u8 {
     var data = std.ArrayListUnmanaged(u8).empty;
     defer data.deinit(allocator);
@@ -2473,6 +2551,32 @@ fn buildTestGgufWithGemma4Tokenizer(allocator: std.mem.Allocator) ![]u8 {
     return data.toOwnedSlice(allocator);
 }
 
+fn buildTestGgufWithT5Tokenizer(allocator: std.mem.Allocator) ![]u8 {
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    try data.appendSlice(allocator, gguf_format.magic);
+    try appendTestLe(u32, allocator, &data, 3);
+    try appendTestLe(u64, allocator, &data, 0);
+    try appendTestLe(u64, allocator, &data, 11);
+
+    try appendTestMetadataString(allocator, &data, "general.architecture", "bert");
+    try appendTestMetadataString(allocator, &data, "tokenizer.ggml.model", "t5");
+    try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.tokens", &.{
+        "<s>", "<pad>", "</s>", "<unk>", "\u{2581}hello", "\u{2581}world",
+    });
+    try appendTestMetadataF32Array(allocator, &data, "tokenizer.ggml.scores", &.{ 0, 0, 0, 0, -1, -1 });
+    try appendTestMetadataI32Array(allocator, &data, "tokenizer.ggml.token_type", &.{ 3, 3, 3, 2, 1, 1 });
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.bos_token_id", 0);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.eos_token_id", 2);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.padding_token_id", 1);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.unknown_token_id", 3);
+    try appendTestMetadataBool(allocator, &data, "tokenizer.ggml.add_bos_token", true);
+    try appendTestMetadataBool(allocator, &data, "tokenizer.ggml.add_eos_token", true);
+
+    return data.toOwnedSlice(allocator);
+}
+
 fn appendTestLe(comptime T: type, allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), value: T) !void {
     const bytes = std.mem.asBytes(&std.mem.nativeToLittle(T, value));
     try data.appendSlice(allocator, bytes);
@@ -2515,4 +2619,12 @@ fn appendTestMetadataI32Array(allocator: std.mem.Allocator, data: *std.ArrayList
     try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.i32));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestLe(i32, allocator, data, value);
+}
+
+fn appendTestMetadataF32Array(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const f32) !void {
+    try appendTestString(allocator, data, key);
+    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.array));
+    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.f32));
+    try appendTestLe(u64, allocator, data, values.len);
+    for (values) |value| try appendTestLe(u32, allocator, data, @bitCast(value));
 }

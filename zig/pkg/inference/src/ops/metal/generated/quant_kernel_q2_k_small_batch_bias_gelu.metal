@@ -25,7 +25,7 @@
 using namespace metal;
 
 inline float antfly_qk_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
-inline float antfly_qk_gelu(float x) { float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x); return 0.5f * x * (1.0f + fast::tanh(inner)); }
+inline float antfly_qk_gelu(float x) { if (!isfinite(x)) return 0.0f; float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x); if (inner > 10.0f) return x; if (inner < -10.0f) return 0.0f; float y = 0.5f * x * (1.0f + tanh(inner)); return isfinite(y) ? y : 0.0f; }
 inline float antfly_q2_k_dequant_lane_v2(device const uchar *block, int lane) {
     uint sub = uint(lane) >> 4; uint i = uint(lane) & 15u; uchar scale_byte = block[sub]; float dsc = antfly_qk_half_le_to_float(block + 16) * float(scale_byte & 0x0fu); float dmn = antfly_qk_half_le_to_float(block + 18) * float(scale_byte >> 4);
     uint chunk = sub >> 3; uint group = (sub & 7u) >> 1; uint l_base = (sub & 1u) << 4; uint q_base = chunk << 5; uint shift = group << 1; uint q = (uint(block[20u + q_base + l_base + i]) >> shift) & 0x03u;

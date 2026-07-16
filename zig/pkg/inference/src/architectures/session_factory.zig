@@ -1116,7 +1116,7 @@ fn cudaSupportsArch(arch_config: ArchConfig) bool {
 
 fn cudaProfileForArch(arch_config: ArchConfig) ?CudaCapabilityProfile {
     return switch (arch_config) {
-        .clip, .clap => .clipclap,
+        .bert, .clip, .clap => .clipclap,
         .deberta => .deberta_reranker,
         .gliner => .gliner2,
         .florence => .florence2,
@@ -1130,11 +1130,13 @@ test "cuda support gate admits only supported encoder architectures" {
     try std.testing.expect(!cudaSupportsArch(.{ .gpt = .{ .family = .qwen2 } }));
     try std.testing.expect(cudaSupportsArch(.{ .clip = .{} }));
     try std.testing.expect(cudaSupportsArch(.{ .clap = .{} }));
+    try std.testing.expect(cudaSupportsArch(.{ .bert = .{} }));
     try std.testing.expect(cudaSupportsArch(.{ .deberta = .{} }));
     try std.testing.expect(cudaSupportsArch(.{ .gliner = .{} }));
     try std.testing.expect(cudaSupportsArch(.{ .florence = .{} }));
     if (comptime build_options.enable_cuda) {
         try std.testing.expectEqual(CudaCapabilityProfile.clipclap, cudaProfileForArch(.{ .clip = .{} }).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.clipclap, cudaProfileForArch(.{ .bert = .{} }).?);
         try std.testing.expectEqual(CudaCapabilityProfile.deberta_reranker, cudaProfileForArch(.{ .deberta = .{} }).?);
         try std.testing.expectEqual(CudaCapabilityProfile.gliner2, cudaProfileForArch(.{ .gliner = .{} }).?);
         try std.testing.expectEqual(CudaCapabilityProfile.florence2, cudaProfileForArch(.{ .florence = .{} }).?);
@@ -2355,6 +2357,7 @@ fn normalizeWeightKey(store_kind: tensor_store_mod.StoreKind, arch_config: ArchC
     if (store_kind != .gguf) return key;
     return switch (arch_config) {
         .gpt => |cfg| normalizeGgufGptWeightKey(cfg, key, buf) orelse key,
+        .bert => bert.normalizeGgufWeightKey(key, buf) orelse key,
         else => key,
     };
 }
@@ -2992,8 +2995,8 @@ fn metalJitUsesExactProfileScope(config: kernel_jit.Config) bool {
 fn metalJitTensorTypeInExactProfileScope(tensor_type: gguf_mod.tensor_types.KnownTensorType) bool {
     // Keep this boundary aligned with the workload tuner's first exact slice.
     // Other formats remain part of the general JIT scope, but cannot affect a
-    // Q4_0/Q4_K capture or the later activation of that captured contract.
-    return tensor_type == .Q4_0 or tensor_type == .Q4_K;
+    // Q4_0/Q4_K/Q6_K capture or the later activation of that contract.
+    return tensor_type == .Q4_0 or tensor_type == .Q4_K or tensor_type == .Q6_K;
 }
 
 /// Derive Metal JIT slots from quantized matrices that the loaded WeightStore
@@ -3193,7 +3196,7 @@ test "Metal JIT scope records GGUF linear dimensions in logical order" {
     try std.testing.expectEqual(@as(usize, 1), metal_runtime.metalJitProductionRouteCount(large_head_scope));
 }
 
-test "Metal exact profile scope ignores unrelated oversized formats and keeps Q4 fail closed" {
+test "Metal exact profile scope ignores unrelated oversized formats and keeps tuned formats fail closed" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
 
     try std.testing.expect(metalJitUsesExactProfileScope(.{ .mode = .shadow, .profile_capture_only = true }));
@@ -3202,10 +3205,11 @@ test "Metal exact profile scope ignores unrelated oversized formats and keeps Q4
 
     var profile_scope = metal_runtime.MetalJitRouteScope.none();
     includeMetalJitTensorShape(&profile_scope, .Q4_0, &.{ 10240, 2560 }, false, true);
-    includeMetalJitTensorShape(&profile_scope, .Q6_K, &.{ 10752, 262144 }, false, true);
+    includeMetalJitTensorShape(&profile_scope, .Q6_K, &.{ 4096, 1024 }, false, true);
+    includeMetalJitTensorShape(&profile_scope, .Q5_K, &.{ 10752, 262144 }, false, true);
     try std.testing.expect(profile_scope.conformance_complete);
     try std.testing.expectEqualSlices([2]usize, &.{.{ 2560, 10240 }}, profile_scope.observedShapes(.q4_0));
-    try std.testing.expectEqual(@as(usize, 0), profile_scope.observedShapes(.q6_k).len);
+    try std.testing.expectEqualSlices([2]usize, &.{.{ 1024, 4096 }}, profile_scope.observedShapes(.q6_k));
 
     var relevant_oversized_scope = metal_runtime.MetalJitRouteScope.none();
     includeMetalJitTensorShape(&relevant_oversized_scope, .Q4_0, &.{ 10752, 262144 }, false, true);

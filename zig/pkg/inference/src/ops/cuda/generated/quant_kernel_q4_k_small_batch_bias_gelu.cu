@@ -37,8 +37,12 @@ static __device__ __forceinline__ float antfly_half_le_to_float(const uint8_t *p
 }
 
 static __device__ __forceinline__ float antfly_gelu(float x) {
+    if (!isfinite(x)) return 0.0f;
     const float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
-    return 0.5f * x * (1.0f + tanhf(inner));
+    if (inner > 10.0f) return x;
+    if (inner < -10.0f) return 0.0f;
+    const float y = 0.5f * x * (1.0f + tanhf(inner));
+    return isfinite(y) ? y : 0.0f;
 }
 
 static __device__ __forceinline__ void antfly_q4_k_unpack_scale_min(

@@ -23,14 +23,14 @@ const builtin = @import("builtin");
 const workload_profile_policy = @import("../workload_profile_policy.zig");
 
 pub const schema = "antfly.kernel_jit.v1";
-pub const codegen_abi_version: u32 = 2;
-pub const qualification_policy_version: u32 = 3;
+pub const codegen_abi_version: u32 = 3;
+pub const qualification_policy_version: u32 = 4;
 /// Bump the policy version and update this identity whenever correctness
 /// tolerances, fixtures, warmup/measurement procedure, or eligibility gates
 /// change. It is part of every artifact key, so stale approvals cannot cross
 /// a qualification-policy change.
 pub const qualification_policy_identity =
-    "correctness-first/v3;min-speedup=1.02;warmups=2;paired-repeats=5;worst-repeat-gate=true;workload-coverage=qualified-weight-80,min-share-2,max-attempts-5";
+    "correctness-first/v4;matrix-fp16-abs=q4k0.002,q6k0.003;min-speedup=1.02;warmups=2;paired-repeats=5;worst-repeat-gate=true;workload-coverage=qualified-weight-80,min-share-2,max-attempts-5";
 pub const minimum_speedup: f64 = 1.02;
 pub const maximum_candidates: usize = 8;
 pub const warmup_repeats: usize = 2;
@@ -2427,8 +2427,8 @@ test "kernel JIT package replays weighted backfill coverage and full profile str
         testWeightedPackageEntry(20, 501),
         testWeightedPackageEntry(9, 502),
         testWeightedPackageEntry(8, 503),
-        testWeightedPackageEntry(7, 504),
-        testWeightedPackageEntry(6, 505),
+        testWeightedPackageEntry(8, 504),
+        testWeightedPackageEntry(1, 505),
     };
     var key_hex: [keys.len][cache_key_hex_bytes]u8 = undefined;
     for (keys, &key_hex) |key, *hex| hex.* = artifactKeyHex(key);

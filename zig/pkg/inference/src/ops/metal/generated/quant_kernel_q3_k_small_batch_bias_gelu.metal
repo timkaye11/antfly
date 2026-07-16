@@ -33,7 +33,7 @@ inline int antfly_q3_k_raw_scale(device const uchar *scale_data, uint sub) {
     else { low = uint((scale_data[4u + i] >> 4) & 0x0fu); high = uint((scale_data[8u + i] >> 6) & 0x03u); }
     return int(low | (high << 4)) - 32;
 }
-inline float antfly_qk_gelu(float x) { float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x); return 0.5f * x * (1.0f + fast::tanh(inner)); }
+inline float antfly_qk_gelu(float x) { if (!isfinite(x)) return 0.0f; float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x); if (inner > 10.0f) return x; if (inner < -10.0f) return 0.0f; float y = 0.5f * x * (1.0f + tanh(inner)); return isfinite(y) ? y : 0.0f; }
 inline float antfly_q3_k_dequant_lane_v2(device const uchar *block, int lane) {
     uint sub = uint(lane) >> 4; uint i = uint(lane) & 15u; uint chunk = sub >> 3; uint group = (sub & 7u) >> 1; uint l = ((sub & 1u) << 4) + i; uint q_base = chunk << 5; uint shift = group << 1; uint hm_bit = (chunk << 2) + group;
     int low2 = int((uint(block[32u + q_base + l]) >> shift) & 0x03u); int high1 = int((uint(block[l]) >> hm_bit) & 0x01u); int q = low2 + high1 * 4 - 4;

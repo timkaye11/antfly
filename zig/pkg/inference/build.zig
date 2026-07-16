@@ -1065,7 +1065,8 @@ pub fn build(b: *std.Build) void {
     clipclap_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     clipclap_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     clipclap_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    configureNativeTool(b, clipclap_e2e_bench_exe, target, enable_system_blas, blas_root, enable_metal);
+    // inference_internal already owns the Metal source and frameworks.
+    configureNativeTool(b, clipclap_e2e_bench_exe, target, enable_system_blas, blas_root, false);
     configureOnnxRuntime(b, clipclap_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_clipclap_e2e_bench = b.addRunArtifact(clipclap_e2e_bench_exe);
     if (b.args) |args| {

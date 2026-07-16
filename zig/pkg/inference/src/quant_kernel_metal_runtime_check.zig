@@ -3152,6 +3152,10 @@ fn runCheckImpl(
     for (bias, 0..) |*value, i| {
         value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 1)) / 8.0;
     }
+    // Exercise the same saturation path used by the resident BERT FFN. The
+    // unfused Metal GELU maps non-finite inputs to zero, so fused candidates
+    // must not turn a negative infinity into NaN via `x * (1 + tanh(x))`.
+    if (check.epilogue == .bias_gelu and bias.len > 0) bias[0] = -std.math.inf(f32);
 
     const expected = try allocator.alloc(f32, check.rows * check.out_dim);
     defer allocator.free(expected);

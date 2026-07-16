@@ -42,6 +42,7 @@ pub const Config = struct {
     max_position_embeddings: u32 = 512,
     type_vocab_size: u32 = 2,
     hidden_act: []const u8 = "gelu",
+    layer_norm_eps: f32 = 1e-12,
     num_labels: u32 = 1,
 
     /// Returns the effective weight prefix for this config.
@@ -81,6 +82,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     if (obj.get("intermediate_size")) |v| config.intermediate_size = jsonU32(v) orelse config.intermediate_size;
     if (obj.get("max_position_embeddings")) |v| config.max_position_embeddings = jsonU32(v) orelse config.max_position_embeddings;
     if (obj.get("type_vocab_size")) |v| config.type_vocab_size = jsonU32(v) orelse config.type_vocab_size;
+    if (obj.get("layer_norm_eps")) |v| config.layer_norm_eps = jsonF32(v) orelse config.layer_norm_eps;
     if (obj.get("num_labels")) |v| config.num_labels = jsonU32(v) orelse config.num_labels;
     if (config.num_labels == 1) {
         if (inferNumLabels(obj)) |n| config.num_labels = n;
@@ -116,6 +118,7 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
     config.intermediate_size = metaU32(view, "bert.feed_forward_length") orelse config.intermediate_size;
     config.max_position_embeddings = metaU32(view, "bert.context_length") orelse config.max_position_embeddings;
     config.type_vocab_size = metaU32(view, "bert.token_type_count") orelse config.type_vocab_size;
+    config.layer_norm_eps = view.getF32("bert.attention.layer_norm_epsilon") orelse config.layer_norm_eps;
     config.num_labels = metaU32(view, "bert.label_count") orelse config.num_labels;
     if (view.getString("bert.hidden_act")) |value| {
         config.hidden_act = if (std.mem.eql(u8, value, "relu")) "relu" else "gelu";
@@ -132,6 +135,68 @@ fn jsonU32(val: std.json.Value) ?u32 {
         .integer => |i| @intCast(i),
         else => null,
     };
+}
+
+fn jsonF32(val: std.json.Value) ?f32 {
+    return switch (val) {
+        .float => |value| @floatCast(value),
+        .integer => |value| @floatFromInt(value),
+        else => null,
+    };
+}
+
+/// Map llama.cpp's canonical BERT GGUF tensor names to the names consumed by
+/// the shared BERT architecture.
+pub fn normalizeGgufWeightKey(key: []const u8, buf: *[256]u8) ?[]const u8 {
+    if (std.mem.eql(u8, key, "token_embd.weight")) return "embeddings.word_embeddings.weight";
+    if (std.mem.eql(u8, key, "position_embd.weight")) return "embeddings.position_embeddings.weight";
+    if (std.mem.eql(u8, key, "token_types.weight")) return "embeddings.token_type_embeddings.weight";
+    if (std.mem.eql(u8, key, "token_embd_norm.weight")) return "embeddings.LayerNorm.weight";
+    if (std.mem.eql(u8, key, "token_embd_norm.bias")) return "embeddings.LayerNorm.bias";
+    if (!std.mem.startsWith(u8, key, "blk.")) return null;
+
+    var parts = std.mem.splitScalar(u8, key, '.');
+    _ = parts.next() orelse return null;
+    const layer_text = parts.next() orelse return null;
+    const layer = std.fmt.parseInt(usize, layer_text, 10) catch return null;
+    const suffix_start = "blk.".len + layer_text.len + 1;
+    if (suffix_start >= key.len) return null;
+    const suffix = key[suffix_start..];
+    const mapped = if (std.mem.eql(u8, suffix, "attn_q.weight"))
+        "attention.self.query.weight"
+    else if (std.mem.eql(u8, suffix, "attn_q.bias"))
+        "attention.self.query.bias"
+    else if (std.mem.eql(u8, suffix, "attn_k.weight"))
+        "attention.self.key.weight"
+    else if (std.mem.eql(u8, suffix, "attn_k.bias"))
+        "attention.self.key.bias"
+    else if (std.mem.eql(u8, suffix, "attn_v.weight"))
+        "attention.self.value.weight"
+    else if (std.mem.eql(u8, suffix, "attn_v.bias"))
+        "attention.self.value.bias"
+    else if (std.mem.eql(u8, suffix, "attn_output.weight"))
+        "attention.output.dense.weight"
+    else if (std.mem.eql(u8, suffix, "attn_output.bias"))
+        "attention.output.dense.bias"
+    else if (std.mem.eql(u8, suffix, "attn_output_norm.weight"))
+        "attention.output.LayerNorm.weight"
+    else if (std.mem.eql(u8, suffix, "attn_output_norm.bias"))
+        "attention.output.LayerNorm.bias"
+    else if (std.mem.eql(u8, suffix, "ffn_up.weight"))
+        "intermediate.dense.weight"
+    else if (std.mem.eql(u8, suffix, "ffn_up.bias"))
+        "intermediate.dense.bias"
+    else if (std.mem.eql(u8, suffix, "ffn_down.weight"))
+        "output.dense.weight"
+    else if (std.mem.eql(u8, suffix, "ffn_down.bias"))
+        "output.dense.bias"
+    else if (std.mem.eql(u8, suffix, "layer_output_norm.weight"))
+        "output.LayerNorm.weight"
+    else if (std.mem.eql(u8, suffix, "layer_output_norm.bias"))
+        "output.LayerNorm.bias"
+    else
+        return null;
+    return std.fmt.bufPrint(buf, "encoder.layer.{d}.{s}", .{ layer, mapped }) catch null;
 }
 
 fn inferNumLabels(obj: std.json.ObjectMap) ?u32 {
@@ -337,12 +402,13 @@ pub fn freeWeightMapping(allocator: std.mem.Allocator, mapping: []WeightMapping)
 test "parse config" {
     const allocator = std.testing.allocator;
     const json_str =
-        \\{"model_type": "bert", "vocab_size": 30522, "hidden_size": 768, "num_hidden_layers": 12, "num_attention_heads": 12, "intermediate_size": 3072}
+        \\{"model_type": "bert", "vocab_size": 30522, "hidden_size": 768, "num_hidden_layers": 12, "num_attention_heads": 12, "intermediate_size": 3072, "layer_norm_eps": 0.00001}
     ;
     const config = try parseConfig(allocator, json_str);
     try std.testing.expectEqual(ModelType.bert, config.model_type);
     try std.testing.expectEqual(@as(u32, 768), config.hidden_size);
     try std.testing.expectEqual(@as(u32, 12), config.num_hidden_layers);
+    try std.testing.expectApproxEqAbs(@as(f32, 1e-5), config.layer_norm_eps, 1e-10);
 }
 
 test "parse roberta config" {
@@ -427,6 +493,7 @@ test "parse bert gguf metadata" {
         .{ .key = "bert.feed_forward_length", .value = .{ .u32 = 1536 } },
         .{ .key = "bert.context_length", .value = .{ .u32 = 512 } },
         .{ .key = "bert.token_type_count", .value = .{ .u32 = 2 } },
+        .{ .key = "bert.attention.layer_norm_epsilon", .value = .{ .f32 = 1e-5 } },
         .{ .key = "bert.label_count", .value = .{ .u32 = 3 } },
         .{ .key = "bert.hidden_act", .value = .{ .string = "gelu" } },
     };
@@ -440,4 +507,22 @@ test "parse bert gguf metadata" {
     try std.testing.expectEqualStrings("", config.effectivePrefix());
     try std.testing.expectEqual(@as(u32, 384), config.hidden_size);
     try std.testing.expectEqual(@as(u32, 3), config.num_labels);
+    try std.testing.expectApproxEqAbs(@as(f32, 1e-5), config.layer_norm_eps, 1e-10);
+}
+
+test "normalize canonical BERT GGUF weight keys" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "embeddings.word_embeddings.weight",
+        normalizeGgufWeightKey("token_embd.weight", &buf).?,
+    );
+    try std.testing.expectEqualStrings(
+        "encoder.layer.23.attention.self.query.weight",
+        normalizeGgufWeightKey("blk.23.attn_q.weight", &buf).?,
+    );
+    try std.testing.expectEqualStrings(
+        "encoder.layer.7.output.LayerNorm.bias",
+        normalizeGgufWeightKey("blk.7.layer_output_norm.bias", &buf).?,
+    );
+    try std.testing.expect(normalizeGgufWeightKey("blk.0.unknown.weight", &buf) == null);
 }

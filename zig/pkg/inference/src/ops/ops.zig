@@ -374,6 +374,8 @@ pub const DecoderRuntimeSampleResidentLogitsRequest = backend_contracts.DecoderR
 pub const DecoderRuntimePrepareLinearRequest = backend_contracts.DecoderRuntimePrepareLinearRequest;
 pub const DecoderRuntimeEnsureLinearSlotRequest = backend_contracts.DecoderRuntimeEnsureLinearSlotRequest;
 pub const DecoderRuntimeApplyLinearRequest = backend_contracts.DecoderRuntimeApplyLinearRequest;
+pub const DecoderRuntimeApplyLinearLayerNormRequest = backend_contracts.DecoderRuntimeApplyLinearLayerNormRequest;
+pub const DecoderRuntimeApplyFfnLayerNormRequest = backend_contracts.DecoderRuntimeApplyFfnLayerNormRequest;
 pub const DecoderRuntimeApplyLinearArgmaxRequest = backend_contracts.DecoderRuntimeApplyLinearArgmaxRequest;
 pub const DecoderRuntimeApplyLinearPairRequest = backend_contracts.DecoderRuntimeApplyLinearPairRequest;
 pub const DecoderRuntimeApplyLinearQkvRequest = backend_contracts.DecoderRuntimeApplyLinearQkvRequest;
@@ -1896,6 +1898,12 @@ pub const ComputeBackend = struct {
         /// Apply a previously prepared dense linear slot to a [1, in_dim]
         /// input and return a [1, out_dim] tensor.
         decoderRuntimeApplyLinear: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearRequest) anyerror!?CT = null,
+
+        /// Apply a prepared linear slot, residual add, and prepared layer norm.
+        decoderRuntimeApplyLinearLayerNorm: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearLayerNormRequest) anyerror!?CT = null,
+
+        /// Apply a prepared two-linear FFN, residual add, and prepared layer norm.
+        decoderRuntimeApplyFfnLayerNorm: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyFfnLayerNormRequest) anyerror!?CT = null,
 
         /// Apply a previously prepared dense linear slot to a [1, in_dim]
         /// input and return the argmax token id without materializing full
@@ -3650,6 +3658,20 @@ pub const ComputeBackend = struct {
 
     pub fn decoderRuntimeApplyLinear(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearRequest) !?CT {
         if (self.vtable.decoderRuntimeApplyLinear) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeApplyLinearLayerNorm(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearLayerNormRequest) !?CT {
+        if (self.vtable.decoderRuntimeApplyLinearLayerNorm) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeApplyFfnLayerNorm(self: *const ComputeBackend, request: *const DecoderRuntimeApplyFfnLayerNormRequest) !?CT {
+        if (self.vtable.decoderRuntimeApplyFfnLayerNorm) |op| {
             return op(self.ptr, request);
         }
         return null;

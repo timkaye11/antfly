@@ -18,12 +18,123 @@
 // The compute backend handles all hardware-specific execution.
 
 const std = @import("std");
+const platform = @import("antfly_platform");
 const ops = @import("../ops/ops.zig");
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
 const bert_config = @import("../models/bert.zig");
 
 pub const Config = bert_config.Config;
+
+const BertLinearSlotKind = enum(usize) {
+    q,
+    k,
+    v,
+    attention_output,
+    intermediate,
+    output,
+};
+
+const BertLayerNormSlotKind = enum(usize) {
+    attention_output,
+    output,
+};
+
+const bert_linear_specs = [_]struct {
+    kind: BertLinearSlotKind,
+    weight: []const u8,
+    bias: []const u8,
+    input_intermediate: bool = false,
+    output_intermediate: bool = false,
+}{
+    .{ .kind = .q, .weight = "attention.self.query.weight", .bias = "attention.self.query.bias" },
+    .{ .kind = .k, .weight = "attention.self.key.weight", .bias = "attention.self.key.bias" },
+    .{ .kind = .v, .weight = "attention.self.value.weight", .bias = "attention.self.value.bias" },
+    .{ .kind = .attention_output, .weight = "attention.output.dense.weight", .bias = "attention.output.dense.bias" },
+    .{ .kind = .intermediate, .weight = "intermediate.dense.weight", .bias = "intermediate.dense.bias", .output_intermediate = true },
+    .{ .kind = .output, .weight = "output.dense.weight", .bias = "output.dense.bias", .input_intermediate = true },
+};
+
+const bert_layer_norm_specs = [_]struct {
+    kind: BertLayerNormSlotKind,
+    weight: []const u8,
+    bias: []const u8,
+}{
+    .{ .kind = .attention_output, .weight = "attention.output.LayerNorm.weight", .bias = "attention.output.LayerNorm.bias" },
+    .{ .kind = .output, .weight = "output.LayerNorm.weight", .bias = "output.LayerNorm.bias" },
+};
+
+fn metalEncoderFrameEnabled() bool {
+    if (@import("builtin").target.cpu.arch.isWasm()) return false;
+    return !platform.env.getenvBool("TERMITE_METAL_DISABLE_BERT_ENCODER_FRAME");
+}
+
+fn bertLinearSlot(layer: usize, kind: BertLinearSlotKind) usize {
+    return layer * bert_linear_specs.len + @intFromEnum(kind);
+}
+
+fn bertLayerNormSlot(layer: usize, kind: BertLayerNormSlotKind) usize {
+    return layer * bert_layer_norm_specs.len + @intFromEnum(kind);
+}
+
+fn bertEmbeddingLayerNormSlot(layer_count: usize) usize {
+    return layer_count * bert_layer_norm_specs.len;
+}
+
+fn preplanMetalEncoder(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config) !bool {
+    if (cb.kind() != .metal or !metalEncoderFrameEnabled() or cb.decoderRuntimeHasActiveFrame()) return false;
+
+    const layer_count: usize = @intCast(config.num_hidden_layers);
+    const hidden: usize = @intCast(config.hidden_size);
+    const intermediate: usize = @intCast(config.intermediate_size);
+    const heads: usize = @intCast(config.num_attention_heads);
+    if (layer_count == 0 or hidden == 0 or intermediate == 0 or heads == 0 or hidden % heads != 0) return false;
+
+    for (0..layer_count) |layer| {
+        for (bert_linear_specs) |spec| {
+            var weight_name: [256]u8 = undefined;
+            var bias_name: [256]u8 = undefined;
+            const weight = try getLayerWeight(cb, allocator, layer, spec.weight, &weight_name);
+            defer cb.free(weight);
+            const bias = try getLayerWeight(cb, allocator, layer, spec.bias, &bias_name);
+            defer cb.free(bias);
+            if (!(try cb.decoderRuntimePrepareLinear(&.{
+                .slot = bertLinearSlot(layer, spec.kind),
+                .weight = weight,
+                .bias = bias,
+                .in_dim = if (spec.input_intermediate) intermediate else hidden,
+                .out_dim = if (spec.output_intermediate) intermediate else hidden,
+                .retain_dense_fallback = true,
+            }))) return false;
+        }
+
+        for (bert_layer_norm_specs) |spec| {
+            var weight_name: [256]u8 = undefined;
+            var bias_name: [256]u8 = undefined;
+            const weight = try getLayerWeight(cb, allocator, layer, spec.weight, &weight_name);
+            defer cb.free(weight);
+            const bias = try getLayerWeight(cb, allocator, layer, spec.bias, &bias_name);
+            defer cb.free(bias);
+            if (!(try cb.decoderRuntimePrepareLayerNorm(&.{
+                .slot = bertLayerNormSlot(layer, spec.kind),
+                .weight = weight,
+                .bias = bias,
+                .hidden_size = hidden,
+            }))) return false;
+        }
+    }
+
+    const embedding_norm_weight = try cb.getWeight("embeddings.LayerNorm.weight");
+    defer cb.free(embedding_norm_weight);
+    const embedding_norm_bias = try cb.getWeight("embeddings.LayerNorm.bias");
+    defer cb.free(embedding_norm_bias);
+    return cb.decoderRuntimePrepareLayerNorm(&.{
+        .slot = bertEmbeddingLayerNormSlot(layer_count),
+        .weight = embedding_norm_weight,
+        .bias = embedding_norm_bias,
+        .hidden_size = hidden,
+    });
+}
 
 /// Run the full BERT encoder forward pass.
 /// Returns an owned f32 slice: [batch * seq_len * hidden_size].
@@ -37,23 +148,59 @@ pub fn forward(
     batch: usize,
     seq_len: usize,
 ) ![]f32 {
+    const hidden = try forwardCt(cb, allocator, config, input_ids, attention_mask, token_type_ids, batch, seq_len);
+    defer cb.free(hidden);
+    return cb.toFloat32(hidden, allocator);
+}
+
+/// Run the encoder while keeping intermediate tensors on the backend.
+pub fn forwardCt(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    attention_mask: []const i64,
+    token_type_ids: ?[]const i64,
+    batch: usize,
+    seq_len: usize,
+) !CT {
     const H = config.hidden_size;
     const total = batch * seq_len;
+    // ponytail: prepare on first use; move this to session warmup if cold-request latency matters.
+    const resident_slots = try preplanMetalEncoder(cb, allocator, config);
+
+    var encoder_frame_active = false;
+    if (resident_slots and !cb.decoderRuntimeHasActiveFrame()) {
+        encoder_frame_active = try cb.decoderRuntimeBeginFrame();
+    }
+    errdefer if (encoder_frame_active) cb.decoderRuntimeCancelFrame() catch {};
 
     // 1. Embeddings: word + position + token_type + LayerNorm
-    var hidden = try embeddings(cb, allocator, config, input_ids, token_type_ids, total, seq_len, H);
+    var hidden = try embeddings(
+        cb,
+        allocator,
+        config,
+        input_ids,
+        token_type_ids,
+        total,
+        seq_len,
+        H,
+        if (resident_slots) bertEmbeddingLayerNormSlot(@intCast(config.num_hidden_layers)) else null,
+    );
+    errdefer cb.free(hidden);
 
     // 2. Encoder layers
     for (0..config.num_hidden_layers) |layer| {
-        const new_hidden = try encoderLayer(cb, allocator, config, hidden, attention_mask, batch, seq_len, layer);
+        const new_hidden = try encoderLayer(cb, allocator, config, hidden, attention_mask, batch, seq_len, layer, resident_slots);
         cb.free(hidden);
         hidden = new_hidden;
     }
 
-    // 3. Read out to f32
-    const result = try cb.toFloat32(hidden, allocator);
-    cb.free(hidden);
-    return result;
+    if (encoder_frame_active) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        encoder_frame_active = false;
+    }
+    return hidden;
 }
 
 pub fn forwardUntilLayer(
@@ -71,9 +218,9 @@ pub fn forwardUntilLayer(
     const total = batch * seq_len;
     const clamped_stop = @min(stop_layer_exclusive, config.num_hidden_layers);
 
-    var hidden = try embeddings(cb, allocator, config, input_ids, token_type_ids, total, seq_len, H);
+    var hidden = try embeddings(cb, allocator, config, input_ids, token_type_ids, total, seq_len, H, null);
     for (0..clamped_stop) |layer| {
-        const new_hidden = try encoderLayer(cb, allocator, config, hidden, attention_mask, batch, seq_len, layer);
+        const new_hidden = try encoderLayer(cb, allocator, config, hidden, attention_mask, batch, seq_len, layer, false);
         cb.free(hidden);
         hidden = new_hidden;
     }
@@ -116,7 +263,7 @@ pub fn forwardFromHiddenRange(
     const clamped_start = @min(start_layer, config.num_hidden_layers);
     const clamped_end = @max(clamped_start, @min(end_layer_exclusive, config.num_hidden_layers));
     for (clamped_start..clamped_end) |layer| {
-        const new_hidden = try encoderLayer(cb, allocator, config, hidden, attention_mask, batch, seq_len, layer);
+        const new_hidden = try encoderLayer(cb, allocator, config, hidden, attention_mask, batch, seq_len, layer, false);
         cb.free(hidden);
         hidden = new_hidden;
     }
@@ -135,6 +282,7 @@ fn embeddings(
     total: usize,
     seq_len: usize,
     H: u32,
+    layer_norm_slot: ?usize,
 ) !CT {
     // Word embeddings
     const word_emb = try cb.getWeight("embeddings.word_embeddings.weight");
@@ -180,7 +328,15 @@ fn embeddings(
     defer cb.free(ln_w);
     const ln_b = try cb.getWeight("embeddings.LayerNorm.bias");
     defer cb.free(ln_b);
-    const normed = try cb.layerNorm(result, ln_w, ln_b, H, 1e-12);
+    const normed = if (layer_norm_slot) |slot|
+        (try cb.decoderRuntimeApplyLayerNorm(&.{
+            .slot = slot,
+            .input = result,
+            .hidden_size = H,
+            .eps = config.layer_norm_eps,
+        })) orelse try cb.layerNorm(result, ln_w, ln_b, H, config.layer_norm_eps)
+    else
+        try cb.layerNorm(result, ln_w, ln_b, H, config.layer_norm_eps);
     cb.free(result);
 
     return normed;
@@ -195,6 +351,7 @@ fn encoderLayer(
     batch: usize,
     seq_len: usize,
     layer: usize,
+    resident_slots: bool,
 ) !CT {
     const hidden_dim: usize = @intCast(config.hidden_size);
     const num_heads: usize = @intCast(config.num_attention_heads);
@@ -211,29 +368,53 @@ fn encoderLayer(
     }
     const local_num_heads = if (use_tp) num_heads / tp_world_size else num_heads;
 
-    const q_w = try getLayerWeight(cb, allocator, layer, "attention.self.query.weight", &name_buf);
-    defer cb.free(q_w);
-    const q_b = try getLayerWeight(cb, allocator, layer, "attention.self.query.bias", &name_buf);
-    defer cb.free(q_b);
-    const Q = try linearReplicatedToMaybeSharded(cb, hidden, q_w, q_b, total, hidden_dim, hidden_dim);
+    const Q = try layerLinearWithSlot(
+        cb,
+        allocator,
+        layer,
+        hidden,
+        "attention.self.query.weight",
+        "attention.self.query.bias",
+        total,
+        hidden_dim,
+        hidden_dim,
+        if (resident_slots) bertLinearSlot(layer, .q) else null,
+        &name_buf,
+    );
     defer {
         cb.free(Q);
     }
 
-    const k_w = try getLayerWeight(cb, allocator, layer, "attention.self.key.weight", &name_buf);
-    defer cb.free(k_w);
-    const k_b = try getLayerWeight(cb, allocator, layer, "attention.self.key.bias", &name_buf);
-    defer cb.free(k_b);
-    const K = try linearReplicatedToMaybeSharded(cb, hidden, k_w, k_b, total, hidden_dim, hidden_dim);
+    const K = try layerLinearWithSlot(
+        cb,
+        allocator,
+        layer,
+        hidden,
+        "attention.self.key.weight",
+        "attention.self.key.bias",
+        total,
+        hidden_dim,
+        hidden_dim,
+        if (resident_slots) bertLinearSlot(layer, .k) else null,
+        &name_buf,
+    );
     defer {
         cb.free(K);
     }
 
-    const v_w = try getLayerWeight(cb, allocator, layer, "attention.self.value.weight", &name_buf);
-    defer cb.free(v_w);
-    const v_b = try getLayerWeight(cb, allocator, layer, "attention.self.value.bias", &name_buf);
-    defer cb.free(v_b);
-    const V = try linearReplicatedToMaybeSharded(cb, hidden, v_w, v_b, total, hidden_dim, hidden_dim);
+    const V = try layerLinearWithSlot(
+        cb,
+        allocator,
+        layer,
+        hidden,
+        "attention.self.value.weight",
+        "attention.self.value.bias",
+        total,
+        hidden_dim,
+        hidden_dim,
+        if (resident_slots) bertLinearSlot(layer, .v) else null,
+        &name_buf,
+    );
     defer {
         cb.free(V);
     }
@@ -242,59 +423,125 @@ fn encoderLayer(
         cb.free(attn_out);
     }
 
-    const attn_proj_w = try getLayerWeight(cb, allocator, layer, "attention.output.dense.weight", &name_buf);
-    defer cb.free(attn_proj_w);
-    const attn_proj_b = try getLayerWeight(cb, allocator, layer, "attention.output.dense.bias", &name_buf);
-    defer cb.free(attn_proj_b);
-    const attn_proj = try linearMaybeShardedToReplicated(cb, attn_out, attn_proj_w, attn_proj_b, total, hidden_dim, hidden_dim);
-    defer {
-        cb.free(attn_proj);
+    const attn_normed = blk: {
+        if (resident_slots) {
+            if (try cb.decoderRuntimeApplyLinearLayerNorm(&.{
+                .linear_slot = bertLinearSlot(layer, .attention_output),
+                .layer_norm_slot = bertLayerNormSlot(layer, .attention_output),
+                .input = attn_out,
+                .residual = hidden,
+                .in_dim = hidden_dim,
+                .hidden_size = hidden_dim,
+                .eps = config.layer_norm_eps,
+            })) |output| break :blk output;
+        }
+
+        const attn_proj = try layerLinearWithSlot(
+            cb,
+            allocator,
+            layer,
+            attn_out,
+            "attention.output.dense.weight",
+            "attention.output.dense.bias",
+            total,
+            hidden_dim,
+            hidden_dim,
+            if (resident_slots) bertLinearSlot(layer, .attention_output) else null,
+            &name_buf,
+        );
+        defer cb.free(attn_proj);
+        const attn_res = try cb.add(attn_proj, hidden);
+        defer cb.free(attn_res);
+        break :blk try layerNormForLayerWithSlot(
+            cb,
+            allocator,
+            layer,
+            attn_res,
+            "attention.output.LayerNorm.weight",
+            "attention.output.LayerNorm.bias",
+            hidden_dim,
+            config.layer_norm_eps,
+            if (resident_slots) bertLayerNormSlot(layer, .attention_output) else null,
+            &name_buf,
+        );
+    };
+    defer cb.free(attn_normed);
+
+    if (resident_slots) {
+        if (try cb.decoderRuntimeApplyFfnLayerNorm(&.{
+            .first_linear_slot = bertLinearSlot(layer, .intermediate),
+            .second_linear_slot = bertLinearSlot(layer, .output),
+            .layer_norm_slot = bertLayerNormSlot(layer, .output),
+            .input = attn_normed,
+            .residual = attn_normed,
+            .hidden_size = hidden_dim,
+            .intermediate_size = intermediate_dim,
+            .eps = config.layer_norm_eps,
+            .activation = .gelu,
+        })) |layer_out| {
+            return layer_out;
+        }
     }
 
-    const attn_res = try cb.add(attn_proj, hidden);
-    defer {
-        cb.free(attn_res);
-    }
+    const ffn_res = blk: {
+        if (resident_slots) {
+            if (try cb.runDenseFfnResidual(&.{
+                .first_linear_slot = bertLinearSlot(layer, .intermediate),
+                .second_linear_slot = bertLinearSlot(layer, .output),
+                .input = attn_normed,
+                .residual = attn_normed,
+                .hidden_size = hidden_dim,
+                .intermediate_size = intermediate_dim,
+                .activation = .gelu,
+            })) |output| break :blk output;
+        }
 
-    const attn_ln_w = try getLayerWeight(cb, allocator, layer, "attention.output.LayerNorm.weight", &name_buf);
-    defer cb.free(attn_ln_w);
-    const attn_ln_b = try getLayerWeight(cb, allocator, layer, "attention.output.LayerNorm.bias", &name_buf);
-    defer cb.free(attn_ln_b);
-    const attn_normed = try cb.layerNorm(attn_res, attn_ln_w, attn_ln_b, hidden_dim, 1e-12);
+        const ffn_inter = try layerLinearWithSlot(
+            cb,
+            allocator,
+            layer,
+            attn_normed,
+            "intermediate.dense.weight",
+            "intermediate.dense.bias",
+            total,
+            hidden_dim,
+            intermediate_dim,
+            if (resident_slots) bertLinearSlot(layer, .intermediate) else null,
+            &name_buf,
+        );
+        defer cb.free(ffn_inter);
+        const ffn_gelu = try cb.gelu(ffn_inter);
+        defer cb.free(ffn_gelu);
+        const ffn_out = try layerLinearWithSlot(
+            cb,
+            allocator,
+            layer,
+            ffn_gelu,
+            "output.dense.weight",
+            "output.dense.bias",
+            total,
+            intermediate_dim,
+            hidden_dim,
+            if (resident_slots) bertLinearSlot(layer, .output) else null,
+            &name_buf,
+        );
+        defer cb.free(ffn_out);
+        break :blk try cb.add(ffn_out, attn_normed);
+    };
+    defer cb.free(ffn_res);
 
-    const ffn_i_w = try getLayerWeight(cb, allocator, layer, "intermediate.dense.weight", &name_buf);
-    defer cb.free(ffn_i_w);
-    const ffn_i_b = try getLayerWeight(cb, allocator, layer, "intermediate.dense.bias", &name_buf);
-    defer cb.free(ffn_i_b);
-    const ffn_inter = try linearReplicatedToMaybeSharded(cb, attn_normed, ffn_i_w, ffn_i_b, total, hidden_dim, intermediate_dim);
-    defer {
-        cb.free(ffn_inter);
-    }
-
-    const ffn_gelu = try cb.gelu(ffn_inter);
-    defer {
-        cb.free(ffn_gelu);
-    }
-
-    const ffn_o_w = try getLayerWeight(cb, allocator, layer, "output.dense.weight", &name_buf);
-    defer cb.free(ffn_o_w);
-    const ffn_o_b = try getLayerWeight(cb, allocator, layer, "output.dense.bias", &name_buf);
-    defer cb.free(ffn_o_b);
-    const ffn_out = try linearMaybeShardedToReplicated(cb, ffn_gelu, ffn_o_w, ffn_o_b, total, intermediate_dim, hidden_dim);
-    defer {
-        cb.free(ffn_out);
-    }
-    const ffn_res = try cb.add(ffn_out, attn_normed);
-    cb.free(attn_normed);
-    defer {
-        cb.free(ffn_res);
-    }
-
-    const ffn_ln_w = try getLayerWeight(cb, allocator, layer, "output.LayerNorm.weight", &name_buf);
-    defer cb.free(ffn_ln_w);
-    const ffn_ln_b = try getLayerWeight(cb, allocator, layer, "output.LayerNorm.bias", &name_buf);
-    defer cb.free(ffn_ln_b);
-    const layer_out = try cb.layerNorm(ffn_res, ffn_ln_w, ffn_ln_b, hidden_dim, 1e-12);
+    const layer_out = try layerNormForLayerWithSlot(
+        cb,
+        allocator,
+        layer,
+        ffn_res,
+        "output.LayerNorm.weight",
+        "output.LayerNorm.bias",
+        hidden_dim,
+        config.layer_norm_eps,
+        if (resident_slots) bertLayerNormSlot(layer, .output) else null,
+        &name_buf,
+    );
     return layer_out;
 }
 
@@ -309,26 +556,63 @@ fn tensorParallelWorldSize(cb: *const ComputeBackend) usize {
     return 1;
 }
 
-fn linearReplicatedToMaybeSharded(
+fn layerLinearWithSlot(
     cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    layer: usize,
     input: CT,
-    weight: CT,
-    bias: CT,
+    weight_suffix: []const u8,
+    bias_suffix: []const u8,
     rows: usize,
     input_dim: usize,
     output_dim: usize,
+    slot: ?usize,
+    name_buf: *[256]u8,
 ) !CT {
+    if (slot) |prepared_slot| {
+        if (try cb.decoderRuntimeApplyLinear(&.{
+            .slot = prepared_slot,
+            .input = input,
+            .in_dim = input_dim,
+            .out_dim = output_dim,
+        })) |output| return output;
+    }
+    const weight = try getLayerWeight(cb, allocator, layer, weight_suffix, name_buf);
+    defer cb.free(weight);
+    const bias = try getLayerWeight(cb, allocator, layer, bias_suffix, name_buf);
+    defer cb.free(bias);
     return cb.linear(input, weight, bias, rows, input_dim, output_dim);
 }
 
-fn linearMaybeShardedToReplicated(
+fn layerNormForLayerWithSlot(
     cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    layer: usize,
     input: CT,
-    weight: CT,
-    bias: CT,
-    rows: usize,
-    input_dim: usize,
-    output_dim: usize,
+    weight_suffix: []const u8,
+    bias_suffix: []const u8,
+    hidden_size: usize,
+    eps: f32,
+    slot: ?usize,
+    name_buf: *[256]u8,
 ) !CT {
-    return cb.linear(input, weight, bias, rows, input_dim, output_dim);
+    if (slot) |prepared_slot| {
+        if (try cb.decoderRuntimeApplyLayerNorm(&.{
+            .slot = prepared_slot,
+            .input = input,
+            .hidden_size = hidden_size,
+            .eps = eps,
+        })) |output| return output;
+    }
+    const weight = try getLayerWeight(cb, allocator, layer, weight_suffix, name_buf);
+    defer cb.free(weight);
+    const bias = try getLayerWeight(cb, allocator, layer, bias_suffix, name_buf);
+    defer cb.free(bias);
+    return cb.layerNorm(input, weight, bias, hidden_size, eps);
+}
+
+test "BERT resident slot layout is stable and non-overlapping" {
+    try std.testing.expectEqual(@as(usize, 143), bertLinearSlot(23, .output));
+    try std.testing.expectEqual(@as(usize, 47), bertLayerNormSlot(23, .output));
+    try std.testing.expectEqual(@as(usize, 48), bertEmbeddingLayerNormSlot(24));
 }

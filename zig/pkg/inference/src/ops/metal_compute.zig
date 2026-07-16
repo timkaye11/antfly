@@ -60,6 +60,14 @@ fn shouldUploadFloat32ShapeToMetal(data_len: usize, shape: []const i32) bool {
     return concreteShapeElementCount(shape) == data_len;
 }
 
+fn embeddingTableRows(shape: []const i64, dim: usize) !usize {
+    if (shape.len != 1 and shape.len != 2) return error.InvalidTensorShape;
+    const rows = if (shape.len == 1) 1 else std.math.cast(usize, shape[0]) orelse return error.InvalidTensorShape;
+    const cols = std.math.cast(usize, shape[shape.len - 1]) orelse return error.InvalidTensorShape;
+    if (rows == 0 or cols != dim) return error.InvalidTensorShape;
+    return rows;
+}
+
 fn metalPagedAttentionKvFormatSupported(format: u32) bool {
     // Keep this aligned with `termite_paged_attention_key_scalar` in
     // metal_kernels.m: polar4, turbo3, raw_f32, f16, and int8_per_head.
@@ -75,6 +83,10 @@ test "metal_compute: upload boundary accepts only concrete matching shapes" {
         try std.testing.expectEqual(metal_tensor_mod.StorageMode.shared, uploadStorageMode(64 * 1024));
         try std.testing.expectEqual(metal_tensor_mod.StorageMode.private, uploadStorageMode(64 * 1024 + 1));
     }
+}
+
+test "metal_compute accepts a singleton rank-one embedding table" {
+    try std.testing.expectEqual(@as(usize, 1), try embeddingTableRows(&.{1024}, 1024));
 }
 
 test "metal_compute paged slot attention accepts kernel supported kv formats" {
@@ -521,6 +533,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     dense_weight_cache: std.StringHashMapUnmanaged(CachedDenseWeight) = .empty,
     layer_output_scale_device_cache: std.AutoHashMapUnmanaged(usize, MetalTensor) = .empty,
     unit_rms_weight_device_cache: std.AutoHashMapUnmanaged(usize, MetalTensor) = .empty,
+    attention_mask_device_cache: ?MetalTensor = null,
+    attention_mask_values_cache: []i64 = &.{},
+    attention_mask_batch: usize = 0,
+    attention_mask_seq_len: usize = 0,
     zero_bias_cache: std.AutoHashMapUnmanaged(usize, []f32) = .empty,
     dynamic_linear_slots: std.AutoHashMapUnmanaged(DynamicLinearSlotKey, usize) = .empty,
     dynamic_layer_norm_slots: std.AutoHashMapUnmanaged(DynamicLayerNormSlotKey, usize) = .empty,
@@ -2777,6 +2793,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.clearActivePrefillFramePlan();
         self.clearPendingPrefillKvDeviceSeeds();
         self.resetBackendKvCache();
+        if (self.attention_mask_device_cache) |*tensor| tensor.deinit();
+        if (self.attention_mask_values_cache.len != 0) self.allocator.free(self.attention_mask_values_cache);
         var v4_it = self.deepseek_v4_device_cache.iterator();
         while (v4_it.next()) |entry| entry.value_ptr.deinit();
         self.deepseek_v4_device_cache.deinit(self.allocator);
@@ -6697,6 +6715,49 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.hostFallbackSoftmax(input, last_dim_size, false);
     }
 
+    fn attentionMaskDeviceTensor(
+        self: *MetalCompute,
+        mask: []const i64,
+        batch: usize,
+        seq_len: usize,
+    ) !MetalTensor {
+        const count = batch * seq_len;
+        const values = mask[0..count];
+        if (self.attention_mask_device_cache) |*cached| {
+            if (self.attention_mask_batch == batch and
+                self.attention_mask_seq_len == seq_len and
+                std.mem.eql(i64, self.attention_mask_values_cache, values))
+            {
+                return cached.retainedCopy();
+            }
+        }
+
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+        const mask_values = try self.allocator.alloc(f32, count);
+        defer self.allocator.free(mask_values);
+        for (mask_values, 0..) |*value, i| value.* = if (values[i] != 0) 1.0 else 0.0;
+        const mask_shape = [_]i32{ @intCast(batch), @intCast(seq_len) };
+        var replacement = try MetalTensor.deviceAllocate(
+            @ptrCast(runtime),
+            count * @sizeOf(f32),
+            uploadStorageMode(count * @sizeOf(f32)),
+            &mask_shape,
+        );
+        errdefer replacement.deinit();
+        const host_mask = MetalTensor.borrowed(mask_values.ptr, mask_values.len, &mask_shape);
+        try host_mask.copyInto(&replacement);
+        const cached_values = try self.allocator.dupe(i64, values);
+        errdefer self.allocator.free(cached_values);
+
+        if (self.attention_mask_device_cache) |*cached| cached.deinit();
+        if (self.attention_mask_values_cache.len != 0) self.allocator.free(self.attention_mask_values_cache);
+        self.attention_mask_device_cache = replacement;
+        self.attention_mask_values_cache = cached_values;
+        self.attention_mask_batch = batch;
+        self.attention_mask_seq_len = seq_len;
+        return self.attention_mask_device_cache.?.retainedCopy();
+    }
+
     fn scaledDotProductAttentionOp(
         ctx: *anyopaque,
         q_ct: CT,
@@ -6754,16 +6815,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             defer if (mask_mt) |*tensor| tensor.deinit();
             if (mask.len > 0) {
                 if (mask.len < batch * seq_len) break :resident_path;
-                const mask_values = try self.allocator.alloc(f32, batch * seq_len);
-                defer self.allocator.free(mask_values);
-                for (mask_values, 0..) |*value, i| value.* = if (mask[i] != 0) 1.0 else 0.0;
-                const runtime = self.provider_impl.raw_decode_runtime orelse break :resident_path;
-                const mask_shape = [_]i32{ @intCast(batch), @intCast(seq_len) };
-                var device_mask = try MetalTensor.deviceAllocate(@ptrCast(runtime), mask_values.len * @sizeOf(f32), uploadStorageMode(mask_values.len * @sizeOf(f32)), &mask_shape);
-                errdefer device_mask.deinit();
-                const host_mask = MetalTensor.borrowed(mask_values.ptr, mask_values.len, &mask_shape);
-                try host_mask.copyInto(&device_mask);
-                mask_mt = device_mask;
+                mask_mt = try self.attentionMaskDeviceTensor(mask, batch, seq_len);
             }
 
             if (try metal_runtime.decoderRuntimeSdpaF32Device(self.provider_impl, .{
@@ -6831,16 +6883,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             defer if (mask_mt) |*tensor| tensor.deinit();
             if (mask.len > 0) {
                 if (mask.len < batch * seq_len) break :resident_path;
-                const mask_values = try self.allocator.alloc(f32, batch * seq_len);
-                defer self.allocator.free(mask_values);
-                for (mask_values, 0..) |*value, i| value.* = if (mask[i] != 0) 1.0 else 0.0;
-                const runtime = self.provider_impl.raw_decode_runtime orelse break :resident_path;
-                const mask_shape = [_]i32{ @intCast(batch), @intCast(seq_len) };
-                var device_mask = try MetalTensor.deviceAllocate(@ptrCast(runtime), mask_values.len * @sizeOf(f32), uploadStorageMode(mask_values.len * @sizeOf(f32)), &mask_shape);
-                errdefer device_mask.deinit();
-                const host_mask = MetalTensor.borrowed(mask_values.ptr, mask_values.len, &mask_shape);
-                try host_mask.copyInto(&device_mask);
-                mask_mt = device_mask;
+                mask_mt = try self.attentionMaskDeviceTensor(mask, batch, seq_len);
             }
 
             if (try metal_runtime.decoderRuntimeDisentangledRelativeAttentionF32Device(self.provider_impl, .{
@@ -7491,10 +7534,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             storage.shape
         else
             weight_buf.logical_shape orelse return error.InvalidTensorShape;
-        if (shape.len != 2) return error.InvalidTensorShape;
-        const rows: usize = @intCast(shape[0]);
-        const cols: usize = @intCast(shape[1]);
-        if (cols != dim) return error.InvalidTensorShape;
+        const rows = try embeddingTableRows(shape, dim);
 
         if (quantized_storage == null and weight_buf.native_dense_bytes == null and !disableRuntimeEmbeddingLookup()) {
             var weight_mt = try self.ownedMetalTensorFromCt(weight);
@@ -14162,6 +14202,29 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return self.ctFromOwnedMetalTensor(tensor);
         }
 
+        if (request.activation == .gelu) {
+            const rows: usize = @intCast(input.dim(0));
+            if (try metal_runtime.tryApplyQuantizedRuntimeLinearBiasGelu(
+                self.provider_impl,
+                request.first_linear_slot,
+                input,
+                rows,
+                request.hidden_size,
+                request.intermediate_size,
+            )) |tensor| {
+                const activated = try self.ctFromOwnedMetalTensor(tensor);
+                defer freeOp(ctx, activated);
+                const projected = (try decoderRuntimeApplyLinearOp(ctx, &.{
+                    .slot = request.second_linear_slot,
+                    .input = activated,
+                    .in_dim = request.intermediate_size,
+                    .out_dim = request.hidden_size,
+                })) orelse return null;
+                defer freeOp(ctx, projected);
+                return addOp(ctx, projected, request.residual);
+            }
+        }
+
         const first = (try decoderRuntimeApplyLinearOp(ctx, &.{
             .slot = request.first_linear_slot,
             .input = request.input,
@@ -19147,6 +19210,76 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.ctFromOwnedMetalTensor(tensor);
     }
 
+    fn decoderRuntimeApplyLinearLayerNormOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearLayerNormRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var input = try self.ownedDeviceMetalTensorFromCt(request.input);
+        defer input.deinit();
+        var residual = try self.ownedDeviceMetalTensorFromCt(request.residual);
+        defer residual.deinit();
+        if (input.ndim() != 2 or residual.ndim() != 2) return null;
+        const rows: usize = @intCast(input.dim(0));
+
+        const tensor = (try metal_runtime.tryApplyQuantizedRuntimeLinearLayerNorm(
+            self.provider_impl,
+            request.linear_slot,
+            request.layer_norm_slot,
+            input,
+            residual,
+            rows,
+            request.in_dim,
+            request.hidden_size,
+            request.eps,
+        )) orelse (try metal_runtime.tryApplyDenseRuntimeLinearLayerNorm(
+            self.provider_impl,
+            request.linear_slot,
+            request.layer_norm_slot,
+            input,
+            residual,
+            rows,
+            request.in_dim,
+            request.hidden_size,
+            request.eps,
+        )) orelse return null;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn decoderRuntimeApplyFfnLayerNormOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyFfnLayerNormRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var input = try self.ownedDeviceMetalTensorFromCt(request.input);
+        defer input.deinit();
+        var residual = try self.ownedDeviceMetalTensorFromCt(request.residual);
+        defer residual.deinit();
+        if (input.ndim() != 2 or residual.ndim() != 2) return null;
+        const rows: usize = @intCast(input.dim(0));
+
+        const tensor = (try metal_runtime.tryApplyQuantizedRuntimeFfnLayerNorm(
+            self.provider_impl,
+            request.first_linear_slot,
+            request.second_linear_slot,
+            request.layer_norm_slot,
+            input,
+            residual,
+            rows,
+            request.hidden_size,
+            request.intermediate_size,
+            request.eps,
+            request.activation,
+        )) orelse (try metal_runtime.tryApplyDenseRuntimeFfnLayerNorm(
+            self.provider_impl,
+            request.first_linear_slot,
+            request.second_linear_slot,
+            request.layer_norm_slot,
+            input,
+            residual,
+            rows,
+            request.hidden_size,
+            request.intermediate_size,
+            request.eps,
+            request.activation,
+        )) orelse return null;
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
     fn decoderRuntimeApplyLinearArgmaxOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearArgmaxRequest) anyerror!?usize {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedMetalTensorFromCt(request.input);
@@ -20166,6 +20299,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.decoderRuntimePrepareLinear = decoderRuntimePrepareLinearOp;
         vt.decoderRuntimeEnsureLinearSlot = decoderRuntimeEnsureLinearSlotOp;
         vt.decoderRuntimeApplyLinear = decoderRuntimeApplyLinearOp;
+        vt.decoderRuntimeApplyLinearLayerNorm = decoderRuntimeApplyLinearLayerNormOp;
+        vt.decoderRuntimeApplyFfnLayerNorm = decoderRuntimeApplyFfnLayerNormOp;
         vt.decoderRuntimeApplyLayerNormLinearArgmax = decoderRuntimeApplyLayerNormLinearArgmaxOp;
         vt.decoderRuntimeApplyLayerNormLinear = decoderRuntimeApplyLayerNormLinearOp;
         vt.decoderRuntimeApplyLayerNormLinearSample = decoderRuntimeApplyLayerNormLinearSampleOp;

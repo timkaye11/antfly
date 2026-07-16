@@ -780,6 +780,23 @@ fn applyGgufTokenizerMetadata(
 
     const view = gguf_metadata.View.init(&parsed);
 
+    if (bert.parseGgufMetadata(view)) |config| {
+        manifest.hidden_size = config.hidden_size;
+        manifest.intermediate_size = config.intermediate_size;
+        manifest.max_position_embeddings = config.max_position_embeddings;
+        manifest.num_hidden_layers = config.num_hidden_layers;
+        manifest.num_attention_heads = config.num_attention_heads;
+        manifest.bert_model_type = config.model_type;
+    }
+    if (view.getU64("bert.pooling_type")) |pooling_type| {
+        manifest.pooling = switch (pooling_type) {
+            1 => .mean,
+            2 => .cls,
+            3 => .last,
+            else => manifest.pooling,
+        };
+    }
+
     const gguf_model_name = view.getString("tokenizer.ggml.model");
     if (gguf_model_name) |model_name| {
         if (c_file.fileExistsInDir(allocator, model_dir_path, "tokenizer.model")) {
@@ -836,7 +853,9 @@ fn supportsGgufSentencePieceFallback(model_name: []const u8) bool {
 }
 
 fn supportsGgufHuggingFaceFallback(model_name: []const u8) bool {
-    return std.mem.eql(u8, model_name, "gpt2") or std.mem.eql(u8, model_name, "gemma4");
+    return std.mem.eql(u8, model_name, "gpt2") or
+        std.mem.eql(u8, model_name, "gemma4") or
+        std.mem.eql(u8, model_name, "t5");
 }
 
 fn hasGgufSentencePieceMetadata(parsed: *const gguf_format.File) bool {
@@ -857,12 +876,19 @@ fn hasGgufSentencePieceMetadata(parsed: *const gguf_format.File) bool {
 
 fn hasGgufHuggingFaceMetadata(parsed: *const gguf_format.File) bool {
     const tokens = findMetadataEntry(parsed, "tokenizer.ggml.tokens") orelse return false;
-    const merges = findMetadataEntry(parsed, "tokenizer.ggml.merges") orelse return false;
-
-    return tokens.value == .array and
-        merges.value == .array and
-        tokens.value.array.element_type == .string and
-        merges.value.array.element_type == .string;
+    if (tokens.value != .array or tokens.value.array.element_type != .string) return false;
+    if (findMetadataEntry(parsed, "tokenizer.ggml.merges")) |merges| {
+        if (merges.value == .array and merges.value.array.element_type == .string) return true;
+    }
+    const scores = findMetadataEntry(parsed, "tokenizer.ggml.scores") orelse return false;
+    const token_types = findMetadataEntry(parsed, "tokenizer.ggml.token_type") orelse return false;
+    return scores.value == .array and
+        token_types.value == .array and
+        (scores.value.array.element_type == .f32 or scores.value.array.element_type == .f64) and
+        (token_types.value.array.element_type == .i32 or
+            token_types.value.array.element_type == .i64 or
+            token_types.value.array.element_type == .u32 or
+            token_types.value.array.element_type == .u64);
 }
 
 fn applyGgufSpecialTokenString(
@@ -3123,6 +3149,31 @@ test "manifest prefers huggingface tokenizer from gemma4 gguf bpe metadata" {
     try std.testing.expectEqualStrings("<eos>", manifest.eos_token);
 }
 
+test "manifest applies BERT and T5 tokenizer metadata from GGUF" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const gguf_bytes = try buildTestGgufWithBertT5Tokenizer(allocator);
+    defer allocator.free(gguf_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bge-m3-q4_k_m.gguf", .data = gguf_bytes });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(TokenizerType.huggingface, manifest.tokenizer_type.?);
+    try std.testing.expectEqual(PoolingStrategy.cls, manifest.pooling);
+    try std.testing.expectEqual(@as(u32, 1024), manifest.hidden_size);
+    try std.testing.expectEqual(@as(u32, 4096), manifest.intermediate_size);
+    try std.testing.expectEqual(@as(u32, 8192), manifest.max_position_embeddings);
+    try std.testing.expectEqual(@as(u32, 24), manifest.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 16), manifest.num_attention_heads);
+}
+
 fn buildTestGgufWithGpt2Tokenizer(allocator: std.mem.Allocator) ![]u8 {
     var data = std.ArrayListUnmanaged(u8).empty;
     defer data.deinit(allocator);
@@ -3180,6 +3231,35 @@ fn buildTestGgufWithGemma4Tokenizer(allocator: std.mem.Allocator) ![]u8 {
     return data.toOwnedSlice(allocator);
 }
 
+fn buildTestGgufWithBertT5Tokenizer(allocator: std.mem.Allocator) ![]u8 {
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    try data.appendSlice(allocator, gguf_format.magic);
+    try appendTestLe(u32, allocator, &data, 3);
+    try appendTestLe(u64, allocator, &data, 0);
+    try appendTestLe(u64, allocator, &data, 16);
+
+    try appendTestMetadataString(allocator, &data, "general.architecture", "bert");
+    try appendTestMetadataU32(allocator, &data, "bert.block_count", 24);
+    try appendTestMetadataU32(allocator, &data, "bert.context_length", 8192);
+    try appendTestMetadataU32(allocator, &data, "bert.embedding_length", 1024);
+    try appendTestMetadataU32(allocator, &data, "bert.feed_forward_length", 4096);
+    try appendTestMetadataU32(allocator, &data, "bert.attention.head_count", 16);
+    try appendTestMetadataF32(allocator, &data, "bert.attention.layer_norm_epsilon", 1e-5);
+    try appendTestMetadataU32(allocator, &data, "bert.pooling_type", 2);
+    try appendTestMetadataString(allocator, &data, "tokenizer.ggml.model", "t5");
+    try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.tokens", &.{ "<s>", "<pad>", "</s>", "<unk>", "\u{2581}hello" });
+    try appendTestMetadataF32Array(allocator, &data, "tokenizer.ggml.scores", &.{ 0, 0, 0, 0, -1 });
+    try appendTestMetadataI32Array(allocator, &data, "tokenizer.ggml.token_type", &.{ 3, 3, 3, 2, 1 });
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.bos_token_id", 0);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.eos_token_id", 2);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.padding_token_id", 1);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.unknown_token_id", 3);
+
+    return data.toOwnedSlice(allocator);
+}
+
 fn appendTestLe(comptime T: type, allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), value: T) !void {
     const bytes = std.mem.asBytes(&std.mem.nativeToLittle(T, value));
     try data.appendSlice(allocator, bytes);
@@ -3206,6 +3286,12 @@ fn appendTestMetadataBool(allocator: std.mem.Allocator, data: *std.ArrayListUnma
     try appendTestString(allocator, data, key);
     try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.bool_));
     try appendTestLe(u8, allocator, data, @intFromBool(value));
+}
+
+fn appendTestMetadataF32(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: f32) !void {
+    try appendTestString(allocator, data, key);
+    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.f32));
+    try appendTestLe(u32, allocator, data, @bitCast(value));
 }
 
 fn appendTestMetadataStringArray(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const []const u8) !void {

@@ -26,7 +26,7 @@ pub const maximum_profile_entries: usize = 256;
 pub const tuning_regime_count: usize = 5;
 pub const maximum_attempts_per_regime: usize = 5;
 pub const maximum_tuning_signatures: u8 = maximum_attempts_per_regime * tuning_regime_count;
-pub const selection_target_percent: u64 = 80;
+pub const selection_target_percent: u64 = 90;
 pub const selection_minimum_percent: u64 = 2;
 
 pub const ProfileEntry = struct {
@@ -123,6 +123,7 @@ fn knownRegime(name: []const u8) bool {
 fn formatRank(name: []const u8) ?u8 {
     if (std.mem.eql(u8, name, "q4_0")) return 6;
     if (std.mem.eql(u8, name, "q4_k")) return 8;
+    if (std.mem.eql(u8, name, "q6_k")) return 12;
     return null;
 }
 
@@ -136,11 +137,15 @@ fn eligible(entry: ProfileEntry) bool {
     const format = formatRank(entry.quant_format) orelse return false;
     const dispatch = dispatchRank(entry.dispatch) orelse return false;
     const matches_dispatch = (format == 6 and (dispatch == 0 or dispatch == 2)) or
-        (format == 8 and dispatch == 0);
+        ((format == 8 or format == 12) and dispatch == 0);
+    const rows_supported = if (format == 6)
+        entry.rows >= 2 and entry.rows <= 8
+    else
+        entry.rows >= 2 and entry.rows <= 64;
     return knownRegime(entry.regime) and
         matches_dispatch and
         std.mem.eql(u8, entry.implementation, "bundled") and
-        entry.rows >= 2 and entry.rows <= 8 and
+        rows_supported and
         std.mem.eql(u8, entry.input_encoding, "f32") and
         std.mem.eql(u8, entry.output_encoding, "f32") and
         std.mem.eql(u8, entry.epilogue, "none") and
@@ -258,7 +263,7 @@ pub fn validateStructure(
             kernel.quant_format.len == 0 or
             kernel.dispatch.len == 0 or
             kernel.implementation.len == 0 or
-            kernel.rows < 2 or kernel.rows > 8 or
+            kernel.rows < 2 or kernel.rows > 64 or
             kernel.in_dim == 0 or
             kernel.out_dim == 0 or
             kernel.input_encoding.len == 0 or
@@ -268,7 +273,9 @@ pub fn validateStructure(
             kernel.layout.len == 0 or
             kernel.candidate_index >= maximum_candidates or
             kernel.threads_per_threadgroup == 0 or
-            (kernel.rows_per_threadgroup != 1 and kernel.rows_per_threadgroup != 2) or
+            (kernel.rows_per_threadgroup != 1 and kernel.rows_per_threadgroup != 2 and
+                kernel.rows_per_threadgroup != 4 and kernel.rows_per_threadgroup != 8 and
+                kernel.rows_per_threadgroup != 40) or
             kernel.cols_per_threadgroup == 0 or
             kernel.reduction.len == 0 or
             !std.math.isFinite(kernel.measured_speedup) or
@@ -319,7 +326,7 @@ fn qualifiedIndexForEntry(report: ProfileReport, entry: ProfileEntry) !?usize {
 
 /// Replays the complete deterministic attempt policy. Qualified signatures are
 /// treated as successful attempts; every other member of the ranked prefix is
-/// a rejection. The replay stops immediately at 80% qualified weight or after
+/// a rejection. The replay stops immediately at 90% qualified weight or after
 /// five attempts, so out-of-prefix and post-target winners are rejected.
 pub fn validateWeightedCoverage(report: ProfileReport) !void {
     if (!std.mem.eql(u8, report.schema, schema_name)) return error.InvalidProfileSchema;
@@ -478,12 +485,12 @@ fn testQualified(entry: ProfileEntry, artifact_key: []const u8) QualifiedKernel 
 
 test "weighted coverage accepts a fifth-attempt backfill after rank four rejects" {
     const entries = [_]ProfileEntry{
-        testEntry(50, 500),
-        testEntry(20, 501),
-        testEntry(9, 502),
-        testEntry(8, 503),
-        testEntry(7, 504),
-        testEntry(6, 505),
+        testEntry(55, 500),
+        testEntry(25, 501),
+        testEntry(8, 502),
+        testEntry(5, 503),
+        testEntry(4, 504),
+        testEntry(3, 505),
     };
     const qualified = [_]QualifiedKernel{
         testQualified(entries[0], "01"),
@@ -579,7 +586,7 @@ test "weighted coverage requires every eligible regime to reach its target" {
     try std.testing.expectError(error.InvalidProfileTuningCoverage, validateWeightedCoverage(report));
 }
 
-test "weighted coverage rounds the eighty percent target upward" {
+test "weighted coverage rounds the ninety percent target upward" {
     const entries = [_]ProfileEntry{
         testEntry(80, 500),
         testEntry(21, 501),

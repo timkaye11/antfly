@@ -409,6 +409,28 @@ pub const DecoderRuntimeApplyLinearRequest = struct {
     out_dim: usize,
 };
 
+pub const DecoderRuntimeApplyLinearLayerNormRequest = struct {
+    linear_slot: usize,
+    layer_norm_slot: usize,
+    input: CT,
+    residual: CT,
+    in_dim: usize,
+    hidden_size: usize,
+    eps: f32,
+};
+
+pub const DecoderRuntimeApplyFfnLayerNormRequest = struct {
+    first_linear_slot: usize,
+    second_linear_slot: usize,
+    layer_norm_slot: usize,
+    input: CT,
+    residual: CT,
+    hidden_size: usize,
+    intermediate_size: usize,
+    eps: f32,
+    activation: DecoderRuntimeActivationKind,
+};
+
 pub const DecoderRuntimeApplyLinearArgmaxRequest = struct {
     slot: usize,
     input: CT,

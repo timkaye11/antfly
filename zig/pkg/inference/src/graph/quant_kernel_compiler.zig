@@ -553,6 +553,9 @@ pub const ReductionKind = enum(u8) {
     /// cross-simdgroup reduction; `cols_per_threadgroup` is the sum of the
     /// columns produced by all simdgroups in the threadgroup.
     simdgroup_tiled,
+    /// Four simdgroups cooperatively stage a 64x32x32 half tile and accumulate
+    /// it with Metal simdgroup matrix operations.
+    simdgroup_matrix,
 };
 
 /// The launch/loop schedule of one generated Metal small-batch quant kernel.
@@ -613,14 +616,27 @@ pub const KernelSchedule = struct {
                 if (self.threads_per_threadgroup < 64) return error.MultiSimdgroupNeeds64Threads;
             },
             .simdgroup_tiled => {
-                if (block_values != 32) return error.TiledReductionRequires32ValueBlocks;
-                if (self.rows_per_threadgroup != 2) return error.TiledReductionRequiresTwoRows;
+                if (block_values != 32 and block_values != 256) return error.TiledReductionRequiresQuantBlock;
+                if (self.rows_per_threadgroup != 2 and
+                    (block_values != 256 or (self.rows_per_threadgroup != 4 and self.rows_per_threadgroup != 8)))
+                {
+                    return error.TiledReductionRequiresSupportedRows;
+                }
                 if (self.threads_per_threadgroup > 256) return error.TiledReductionTooManyThreads;
                 const simdgroups: u8 = @intCast(self.threads_per_threadgroup / 32);
                 if (self.cols_per_threadgroup % simdgroups != 0) return error.InvalidColCount;
                 const cols_per_simdgroup = self.cols_per_threadgroup / simdgroups;
                 if (cols_per_simdgroup != 2 and cols_per_simdgroup != 4 and cols_per_simdgroup != 8) {
                     return error.InvalidColCount;
+                }
+            },
+            .simdgroup_matrix => {
+                if (block_values != 256) return error.MatrixReductionRequiresKBlock;
+                if (self.threads_per_threadgroup != 160 or
+                    self.cols_per_threadgroup != 64 or
+                    self.rows_per_threadgroup != 40)
+                {
+                    return error.InvalidMatrixTile;
                 }
             },
         }
@@ -684,16 +700,17 @@ pub const metal_production_schedules = [_]MetalRouteSchedule{
     .{ .format = .q3_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
     .{ .format = .q3_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
     .{ .format = .q3_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .schedule = .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum } },
-    // 256-value blocks reduced with a threadgroup tree.
-    .{ .format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
-    .{ .format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
-    .{ .format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .schedule = .{ .threads_per_threadgroup = 64, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree } },
+    // Q4_K shares weights across two rows and activations across sixteen columns.
+    .{ .format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 16, .rows_per_threadgroup = 2, .reduction = .simdgroup_tiled } },
+    .{ .format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 16, .rows_per_threadgroup = 2, .reduction = .simdgroup_tiled } },
+    .{ .format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 16, .rows_per_threadgroup = 2, .reduction = .simdgroup_tiled } },
     .{ .format = .q5_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
     .{ .format = .q5_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
     .{ .format = .q5_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
-    .{ .format = .q6_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
-    .{ .format = .q6_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
-    .{ .format = .q6_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .hybrid_simd } },
+    // Q6_K uses the same two-row by sixteen-column register tile as Q4_K.
+    .{ .format = .q6_k, .row_bucket = .rows_2_8, .epilogue = .none, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 16, .rows_per_threadgroup = 2, .reduction = .simdgroup_tiled } },
+    .{ .format = .q6_k, .row_bucket = .rows_2_8, .epilogue = .bias, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 16, .rows_per_threadgroup = 2, .reduction = .simdgroup_tiled } },
+    .{ .format = .q6_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu, .schedule = .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 16, .rows_per_threadgroup = 2, .reduction = .simdgroup_tiled } },
 };
 
 /// Look up a route's schedule in `metal_production_schedules`. Returns null for
@@ -727,6 +744,23 @@ pub fn metalScheduleCandidates(
     }
     const block_values = format.valuesPerBlock() orelse return 0;
     var count: usize = 0;
+    if ((format == .q4_k or format == .q6_k) and
+        (epilogue == .none or epilogue == .bias or epilogue == .bias_gelu))
+    {
+        for ([_]u16{ 32, 64, 128, 256 }) |threads| {
+            const simdgroups: u8 = @intCast(threads / 32);
+            for ([_]u8{ 2, 4 }) |cols_per_simdgroup| {
+                out[count] = .{
+                    .threads_per_threadgroup = threads,
+                    .cols_per_threadgroup = simdgroups * cols_per_simdgroup,
+                    .rows_per_threadgroup = 2,
+                    .reduction = .simdgroup_tiled,
+                };
+                count += 1;
+            }
+        }
+        return count;
+    }
     for ([_]u16{ 32, 64, 128, 256 }) |threads| {
         if (threads > block_values) continue;
         if (threads == 32) {
@@ -769,6 +803,40 @@ pub fn metalScheduleCandidatesForExactShape(
     out_dim: u64,
     out: *[metal_schedule_candidate_capacity]KernelSchedule,
 ) usize {
+    if ((format == .q4_k or format == .q6_k) and
+        (epilogue == .none or epilogue == .bias or epilogue == .bias_gelu) and
+        rows >= 9 and rows <= 64 and
+        in_dim != 0 and in_dim % 256 == 0 and out_dim != 0)
+    {
+        const row_tiles = if (rows <= 32) [_]u8{ 2, 4 } else [_]u8{ 4, 8 };
+        var count: usize = 0;
+        for ([_]u16{ 64, 128 }) |threads| {
+            const simdgroups: u8 = @intCast(threads / 32);
+            for ([_]u8{ 2, 4 }) |cols_per_simdgroup| {
+                for (row_tiles) |rows_per_threadgroup| {
+                    out[count] = .{
+                        .threads_per_threadgroup = threads,
+                        .cols_per_threadgroup = simdgroups * cols_per_simdgroup,
+                        .rows_per_threadgroup = rows_per_threadgroup,
+                        .reduction = .simdgroup_tiled,
+                    };
+                    count += 1;
+                }
+            }
+        }
+        if (epilogue == .none and rows == 40) {
+            // Keep the proven scalar winner at index 4 and spend the final
+            // bounded candidate slot on the matrix kernel.
+            out[count - 1] = .{
+                .threads_per_threadgroup = 160,
+                .cols_per_threadgroup = 64,
+                .rows_per_threadgroup = 40,
+                .reduction = .simdgroup_matrix,
+            };
+        }
+        return count;
+    }
+
     if (format != .q4_0 or
         epilogue != .none or
         rows != 2 or
@@ -4760,6 +4828,7 @@ pub fn renderMetalLaunchShapeRegion(allocator: std.mem.Allocator) ![]u8 {
         \\    termite_metal_generated_quant_epilogue epilogue;
         \\    NSUInteger threads_per_threadgroup;
         \\    NSUInteger cols_per_threadgroup;
+        \\    NSUInteger rows_per_threadgroup;
         \\} termite_metal_generated_quant_launch_entry;
         \\
         \\static const termite_metal_generated_quant_launch_entry termite_metal_generated_quant_launch_table[] = {
@@ -4768,11 +4837,12 @@ pub fn renderMetalLaunchShapeRegion(allocator: std.mem.Allocator) ![]u8 {
     for (metal_production_schedules) |entry| {
         const format_c = metalRuntimeQuantFormatConstant(entry.format) orelse return error.MissingMetalFormatConstant;
         const epilogue_c = metalRuntimeGeneratedEpilogueConstant(entry.epilogue) orelse return error.MissingMetalEpilogueConstant;
-        try appendFmt(allocator, &out, "    {{ {s}, {s}, {d}u, {d}u }},\n", .{
+        try appendFmt(allocator, &out, "    {{ {s}, {s}, {d}u, {d}u, {d}u }},\n", .{
             format_c,
             epilogue_c,
             entry.schedule.threads_per_threadgroup,
             entry.schedule.cols_per_threadgroup,
+            entry.schedule.rows_per_threadgroup,
         });
     }
     try out.appendSlice(allocator,
@@ -4784,13 +4854,15 @@ pub fn renderMetalLaunchShapeRegion(allocator: std.mem.Allocator) ![]u8 {
         \\    size_t rows,
         \\    termite_metal_generated_quant_launch_shape *shape
         \\) {
-        \\    if (shape == NULL || rows < 2u || rows > 8u) return false;
+        \\    const bool extended_rows = format == TERMITE_METAL_QUANT_FORMAT_Q4_K || format == TERMITE_METAL_QUANT_FORMAT_Q6_K;
+        \\    if (shape == NULL || rows < 2u || rows > (extended_rows ? 64u : 8u)) return false;
         \\    const size_t entry_count = sizeof(termite_metal_generated_quant_launch_table) / sizeof(termite_metal_generated_quant_launch_table[0]);
         \\    for (size_t i = 0; i < entry_count; ++i) {
         \\        const termite_metal_generated_quant_launch_entry *entry = &termite_metal_generated_quant_launch_table[i];
         \\        if (entry->format == format && entry->epilogue == epilogue) {
         \\            shape->threads_per_threadgroup = entry->threads_per_threadgroup;
         \\            shape->cols_per_threadgroup = entry->cols_per_threadgroup;
+        \\            shape->rows_per_threadgroup = entry->rows_per_threadgroup;
         \\            return true;
         \\        }
         \\    }
@@ -5057,8 +5129,8 @@ const first_general_metal_q4_source = renderMetalSmallBatchSource(
         .plan_id = "metal/q4_k/rows_2_8/none/small_batch",
         .kernel_id = "antfly_q4_k_small_batch_msl_v1",
         .production_enabled = true,
-        .promotion_comment = "// Promoted after the schedule sweep re-tuned this route to 128-thread" ++ "\n" ++
-            "// hybrid-simd and the decode-runtime speedup gate cleared vs handwritten.",
+        .promotion_comment = "// Promoted after the two-row by sixteen-column register tile cleared" ++ "\n" ++
+            "// BGE-M3 model correctness and speed checks; runtime remains opt-in.",
     },
     .q4_k,
     .none,
@@ -5286,8 +5358,8 @@ const first_general_metal_q6_source = renderMetalSmallBatchSource(
         .plan_id = "metal/q6_k/rows_2_8/none/small_batch",
         .kernel_id = "antfly_q6_k_small_batch_msl_v1",
         .production_enabled = true,
-        .promotion_comment = "// Promoted after sequential Metal runtime evidence cleared correctness," ++ "\n" ++
-            "// route, provider-route, and speedup gates.",
+        .promotion_comment = "// Promoted after the two-row by sixteen-column register tile cleared" ++ "\n" ++
+            "// BGE-M3 model correctness and speed checks; runtime remains opt-in.",
     },
     .q6_k,
     .none,
@@ -8369,8 +8441,19 @@ fn blockBytesForFormat(comptime format: quant_matmul.Format) usize {
 }
 
 fn gelu(x: f32) f32 {
+    if (!std.math.isFinite(x)) return 0.0;
     const inner = 0.7978845608028654 * (x + 0.044715 * x * x * x);
-    return 0.5 * x * (1.0 + std.math.tanh(inner));
+    if (inner > 10.0) return x;
+    if (inner < -10.0) return 0.0;
+    const y = 0.5 * x * (1.0 + std.math.tanh(inner));
+    return if (std.math.isFinite(y)) y else 0.0;
+}
+
+test "quant kernel GELU saturates non-finite inputs" {
+    try std.testing.expectEqual(@as(f32, 0.0), gelu(-std.math.inf(f32)));
+    try std.testing.expectEqual(@as(f32, 0.0), gelu(std.math.nan(f32)));
+    try std.testing.expectEqual(@as(f32, 1024.0), gelu(1024.0));
+    try std.testing.expectEqual(@as(f32, 0.0), gelu(-1024.0));
 }
 
 fn contains(comptime T: type, haystack: []const T, needle: T) bool {
@@ -10656,10 +10739,9 @@ test "quant kernel compiler registry helper is the dispatch-facing route source"
     try std.testing.expectEqualStrings("metal_handwritten_quant_matmul", metal_q6_bias.production_kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q6_bias_kernel_id, metal_q6_bias.kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q6_bias_source_path, metal_q6_bias.candidate_source_path);
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_source, 1, "threadgroup float partial[32];"));
-    // q6_k/bias re-tuned to 256 threads (8 simdgroups): `lane_id >= 8u`.
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_source, 1, "if (simdgroup_id == 0u && lane_id >= 8u) partial[lane_id] = 0.0f;"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_source, 1, "simdgroup_index_in_threadgroup"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_source, 1, "const uint NSG = 4u; const uint NC = 4u; const uint NR = 2u;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_source, 1, "float acc[4][2]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_source, 1, "simd_sum(acc[c][rr])"));
 
     const metal_q6_bias_gelu = registryLoweringFor(.metal, .q6_k, .rows_2_8, .bias_gelu, .small_batch);
     try std.testing.expectEqual(LoweringRoute.handwritten_production, metal_q6_bias_gelu.production_route);
@@ -10668,9 +10750,9 @@ test "quant kernel compiler registry helper is the dispatch-facing route source"
     try std.testing.expectEqualStrings("metal_handwritten_quant_matmul", metal_q6_bias_gelu.production_kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q6_bias_gelu_kernel_id, metal_q6_bias_gelu.kernel_id);
     try std.testing.expectEqualStrings(first_general_metal_q6_bias_gelu_source_path, metal_q6_bias_gelu.candidate_source_path);
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_gelu_source, 1, "threadgroup float partial[32];"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_gelu_source, 1, "if (simdgroup_id == 0u && lane_id >= 4u) partial[lane_id] = 0.0f;"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_gelu_source, 1, "simdgroup_index_in_threadgroup"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_gelu_source, 1, "const uint NSG = 4u; const uint NC = 4u; const uint NR = 2u;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_gelu_source, 1, "float acc[4][2]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, first_general_metal_q6_bias_gelu_source, 1, "antfly_qk_gelu(total + bias[col])"));
 
     const miss = registryLoweringFor(.cuda, .unknown, .rows_2_8, .bias_gelu, .small_batch);
     try std.testing.expectEqual(LoweringRoute.unsupported, miss.production_route);
@@ -10751,9 +10833,9 @@ test "quant kernel compiler first Metal lazy target stays blocked by timing drif
     defer emitted.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings(emitted.data, contents);
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "for (int lane = int(tid); lane < 256; lane += 64)"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "threadgroup float partial[64];"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "partial[tid] += partial[tid + stride];"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "const uint NSG = 4u; const uint NC = 4u; const uint NR = 2u;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "float acc[4][2]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "antfly_qk_gelu(total + bias[col])"));
 }
 
 test "quant kernel compiler compiles promoted Metal source from descriptor route" {
@@ -11639,11 +11721,12 @@ test "quant kernel compiler production Metal source includes only runtime-wired 
         try std.testing.expect(std.mem.containsAtLeast(u8, launch_region_body, 1, format_constant));
         try std.testing.expect(std.mem.containsAtLeast(u8, launch_region_body, 1, epilogue_constant));
     }
-    // The table encodes the two-column routes as `32u, 2u` entries and scans by
-    // (format, epilogue).
-    try std.testing.expect(std.mem.containsAtLeast(u8, launch_region_body, 1, ", 32u, 2u },"));
+    // The table encodes threads, columns, and rows per threadgroup, then scans
+    // by (format, epilogue).
+    try std.testing.expect(std.mem.containsAtLeast(u8, launch_region_body, 1, ", 32u, 2u, 1u },"));
     try std.testing.expect(std.mem.containsAtLeast(u8, launch_region_body, 1, "entry->format == format && entry->epilogue == epilogue"));
     try std.testing.expect(std.mem.containsAtLeast(u8, launch_region_body, 1, "shape->cols_per_threadgroup = entry->cols_per_threadgroup;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, launch_region_body, 1, "shape->rows_per_threadgroup = entry->rows_per_threadgroup;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 2, "termite_metal_generated_quant_launch_shape_for(descriptor->format, TERMITE_METAL_GENERATED_QUANT_EPILOGUE_NONE, descriptor->rows, &launch_shape)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 2, "launch_shape.threads_per_threadgroup"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 2, "launch_shape.cols_per_threadgroup"));
@@ -11749,7 +11832,7 @@ test "quant kernel compiler generated Metal wrapper gates follow artifact metada
     try std.testing.expect(provider_checked > 0);
 }
 
-test "quant kernel compiler embedded Metal source keeps generated q5 q6 bias reduction" {
+test "quant kernel compiler embedded Metal source keeps generated q5 reduction and q6 tile" {
     const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(contents);
 
@@ -11758,20 +11841,31 @@ test "quant kernel compiler embedded Metal source keeps generated q5 q6 bias red
     const optimized_reduction_head = "threadgroup float partial[32]; acc = simd_sum(acc); if (lane_id == 0u) partial[simdgroup_id] = acc; if (simdgroup_id == 0u && lane_id >= ";
     const optimized_reduction_tail = "u) partial[lane_id] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]);";
     const old_reduction = "threadgroup float partial[32]; if (simdgroup_id == 0u) partial[lane_id] = 0.0f; acc = simd_sum(acc); threadgroup_barrier(mem_flags::mem_threadgroup); if (lane_id == 0u) partial[simdgroup_id] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); float total = simd_sum(partial[lane_id]);";
-    const kernels = [_][]const u8{
+    const q5_kernels = [_][]const u8{
         "antfly_q5_k_small_batch_bias_msl_v1",
         "antfly_q5_k_small_batch_bias_gelu_msl_v1",
-        "antfly_q6_k_small_batch_bias_msl_v1",
-        "antfly_q6_k_small_batch_bias_gelu_msl_v1",
     };
 
-    for (kernels) |kernel| {
+    for (q5_kernels) |kernel| {
         const start = std.mem.indexOf(u8, contents, kernel) orelse return error.MissingEmbeddedQ5Q6BiasKernel;
         const end = std.mem.indexOfPos(u8, contents, start, "\"}\\n\"") orelse return error.MissingEmbeddedQ5Q6BiasKernelEnd;
         const body = contents[start..end];
         try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, optimized_reduction_head));
         try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, optimized_reduction_tail));
         try std.testing.expect(!std.mem.containsAtLeast(u8, body, 1, old_reduction));
+    }
+
+    const q6_kernels = [_][]const u8{
+        "antfly_q6_k_small_batch_bias_msl_v1",
+        "antfly_q6_k_small_batch_bias_gelu_msl_v1",
+    };
+    for (q6_kernels) |kernel| {
+        const start = std.mem.indexOf(u8, contents, kernel) orelse return error.MissingEmbeddedQ5Q6BiasKernel;
+        const end = std.mem.indexOfPos(u8, contents, start, "\"}\\n\"") orelse return error.MissingEmbeddedQ5Q6BiasKernelEnd;
+        const body = contents[start..end];
+        try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "const uint NSG = 4u; const uint NC = 4u; const uint NR = 2u;"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "float acc[4][2]"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "simd_sum(acc[c][rr])"));
     }
 }
 
@@ -12273,15 +12367,15 @@ test "quant kernel compiler metal_production_schedules reproduces the launch-sha
         .{ .format = .q3_k, .epilogue = .none, .threads = 32, .cols = 1 },
         .{ .format = .q3_k, .epilogue = .bias, .threads = 32, .cols = 1 },
         .{ .format = .q3_k, .epilogue = .bias_gelu, .threads = 32, .cols = 1 },
-        .{ .format = .q4_k, .epilogue = .none, .threads = 128, .cols = 1 },
-        .{ .format = .q4_k, .epilogue = .bias, .threads = 256, .cols = 1 },
-        .{ .format = .q4_k, .epilogue = .bias_gelu, .threads = 64, .cols = 1 },
+        .{ .format = .q4_k, .epilogue = .none, .threads = 128, .cols = 16 },
+        .{ .format = .q4_k, .epilogue = .bias, .threads = 128, .cols = 16 },
+        .{ .format = .q4_k, .epilogue = .bias_gelu, .threads = 128, .cols = 16 },
         .{ .format = .q5_k, .epilogue = .none, .threads = 256, .cols = 1 },
         .{ .format = .q5_k, .epilogue = .bias, .threads = 128, .cols = 1 },
         .{ .format = .q5_k, .epilogue = .bias_gelu, .threads = 128, .cols = 1 },
-        .{ .format = .q6_k, .epilogue = .none, .threads = 256, .cols = 1 },
-        .{ .format = .q6_k, .epilogue = .bias, .threads = 256, .cols = 1 },
-        .{ .format = .q6_k, .epilogue = .bias_gelu, .threads = 128, .cols = 1 },
+        .{ .format = .q6_k, .epilogue = .none, .threads = 128, .cols = 16 },
+        .{ .format = .q6_k, .epilogue = .bias, .threads = 128, .cols = 16 },
+        .{ .format = .q6_k, .epilogue = .bias_gelu, .threads = 128, .cols = 16 },
     };
     try std.testing.expectEqual(expected.len, metal_production_schedules.len);
     for (expected) |want| {
@@ -12320,22 +12414,38 @@ test "quant kernel compiler Metal schedule candidates are deterministic unique a
     }
 
     const expected_q4_k = [_]KernelSchedule{
-        .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum },
-        .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 2, .reduction = .simd_sum },
-        .{ .threads_per_threadgroup = 64, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree },
-        .{ .threads_per_threadgroup = 64, .cols_per_threadgroup = 1, .reduction = .hybrid_simd },
-        .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree },
-        .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .hybrid_simd },
-        .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree },
-        .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .hybrid_simd },
+        .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 2, .rows_per_threadgroup = 2, .reduction = .simdgroup_tiled },
+        .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 4, .rows_per_threadgroup = 2, .reduction = .simdgroup_tiled },
+        .{ .threads_per_threadgroup = 64, .cols_per_threadgroup = 4, .rows_per_threadgroup = 2, .reduction = .simdgroup_tiled },
+        .{ .threads_per_threadgroup = 64, .cols_per_threadgroup = 8, .rows_per_threadgroup = 2, .reduction = .simdgroup_tiled },
+        .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 8, .rows_per_threadgroup = 2, .reduction = .simdgroup_tiled },
+        .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 16, .rows_per_threadgroup = 2, .reduction = .simdgroup_tiled },
+        .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 16, .rows_per_threadgroup = 2, .reduction = .simdgroup_tiled },
+        .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 32, .rows_per_threadgroup = 2, .reduction = .simdgroup_tiled },
     };
     const q4_k_count = metalScheduleCandidates(.q4_k, .none, &first);
     try std.testing.expectEqual(expected_q4_k.len, q4_k_count);
     try std.testing.expectEqualDeep(expected_q4_k[0..], first[0..q4_k_count]);
 
+    const q4_k_bias_count = metalScheduleCandidates(.q4_k, .bias, &first);
+    try std.testing.expectEqual(expected_q4_k.len, q4_k_bias_count);
+    try std.testing.expectEqualDeep(expected_q4_k[0..], first[0..q4_k_bias_count]);
+
+    const q4_k_bias_gelu_count = metalScheduleCandidates(.q4_k, .bias_gelu, &first);
+    try std.testing.expectEqual(expected_q4_k.len, q4_k_bias_gelu_count);
+    try std.testing.expectEqualDeep(expected_q4_k[0..], first[0..q4_k_bias_gelu_count]);
+
+    const q6_k_count = metalScheduleCandidates(.q6_k, .none, &first);
+    try std.testing.expectEqual(expected_q4_k.len, q6_k_count);
+    try std.testing.expectEqualDeep(expected_q4_k[0..], first[0..q6_k_count]);
+
     const q4_0_count = metalScheduleCandidates(.q4_0, .none, &first);
     try std.testing.expectEqual(@as(usize, 2), q4_0_count);
-    try std.testing.expectEqualDeep(expected_q4_k[0..2], first[0..q4_0_count]);
+    const expected_q4_0 = [_]KernelSchedule{
+        .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 1, .reduction = .simd_sum },
+        .{ .threads_per_threadgroup = 32, .cols_per_threadgroup = 2, .reduction = .simd_sum },
+    };
+    try std.testing.expectEqualDeep(expected_q4_0[0..], first[0..q4_0_count]);
 }
 
 test "quant kernel compiler exact two-row Q4_0 catalog includes the bounded small-output tile" {
@@ -12413,6 +12523,47 @@ test "quant kernel compiler exact two-row Q4_0 catalog includes the bounded smal
     }
 }
 
+test "quant kernel compiler exact Q4_K and Q6_K encoder catalogs tile rows through 64" {
+    var schedules: [metal_schedule_candidate_capacity]KernelSchedule = undefined;
+    for ([_]struct {
+        format: quant_matmul.Format,
+        epilogue: Epilogue,
+    }{
+        .{ .format = .q4_k, .epilogue = .none },
+        .{ .format = .q4_k, .epilogue = .bias },
+        .{ .format = .q4_k, .epilogue = .bias_gelu },
+        .{ .format = .q6_k, .epilogue = .none },
+        .{ .format = .q6_k, .epilogue = .bias },
+        .{ .format = .q6_k, .epilogue = .bias_gelu },
+    }) |route| {
+        const mid_count = metalScheduleCandidatesForExactShape(route.format, route.epilogue, 16, 1024, 1024, &schedules);
+        try std.testing.expectEqual(@as(usize, 8), mid_count);
+        for (schedules[0..mid_count]) |schedule| {
+            try std.testing.expect(schedule.rows_per_threadgroup == 2 or schedule.rows_per_threadgroup == 4);
+            try schedule.validate(256);
+        }
+
+        const wide_count = metalScheduleCandidatesForExactShape(route.format, route.epilogue, 48, 1024, 1024, &schedules);
+        try std.testing.expectEqual(@as(usize, 8), wide_count);
+        for (schedules[0..wide_count]) |schedule| {
+            try std.testing.expect(schedule.rows_per_threadgroup == 4 or schedule.rows_per_threadgroup == 8);
+            try schedule.validate(256);
+        }
+
+        const bge_count = metalScheduleCandidatesForExactShape(route.format, route.epilogue, 40, 1024, 1024, &schedules);
+        try std.testing.expectEqual(@as(usize, 8), bge_count);
+        if (route.epilogue == .none) {
+            try std.testing.expectEqual(ReductionKind.simdgroup_matrix, schedules[7].reduction);
+            try std.testing.expectEqual(@as(u16, 160), schedules[7].threads_per_threadgroup);
+            try std.testing.expectEqual(@as(u8, 40), schedules[7].rows_per_threadgroup);
+        }
+    }
+
+    const small_count = metalScheduleCandidatesForExactShape(.q4_k, .none, 8, 1024, 1024, &schedules);
+    try std.testing.expectEqual(@as(usize, 8), small_count);
+    for (schedules[0..small_count]) |schedule| try std.testing.expectEqual(@as(u8, 2), schedule.rows_per_threadgroup);
+}
+
 test "quant kernel compiler renders distinct self-contained Metal schedule candidates" {
     const artifact = comptime blk: {
         for (first_generated_artifacts) |candidate| {
@@ -12458,7 +12609,11 @@ test "quant kernel compiler rendered bodies carry their schedule cols marker" {
                 try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "simd_sum"));
                 try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "simdgroup_id"));
             },
-            .simdgroup_tiled => unreachable,
+            .simdgroup_tiled => {
+                try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "const uint NSG"));
+                try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "simd_sum"));
+            },
+            .simdgroup_matrix => try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "simdgroup_multiply_accumulate")),
         }
     }
 }
