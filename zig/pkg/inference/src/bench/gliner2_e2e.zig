@@ -200,6 +200,34 @@ pub fn main(init: std.process.Init) !void {
             for (rows.items) |row| printCsv(opts, row);
         },
     }
+
+    var debug_backend = try session_factory.getComputeBackend(model.session, allocator);
+    defer debug_backend.deinit();
+    const provider_stats = debug_backend.debugTimingSnapshot().provider;
+    std.debug.print(
+        "provider_stats: mps_linears={} dense_f16_mb={} dense_f16_slots={} qkv_pack_mb={} runtime_mb={} quant_qkv={} quant_linear={} qkv_packed={}/{} ffn_fused={}/{}/{} attention_flash={} attention_legacy={} attention_gemm={}/{} compute_encoders={} last_frame_compute_encoders={} last_frame_attention={}\n",
+        .{
+            provider_stats.metal_runtime_last_frame_mps_dense_linear_count,
+            provider_stats.metal_runtime_dense_linear_f16_weight_bytes / (1024 * 1024),
+            provider_stats.metal_runtime_dense_linear_f16_slots,
+            provider_stats.metal_runtime_dense_qkv_packed_bytes / (1024 * 1024),
+            provider_stats.metal_runtime_total_bytes / (1024 * 1024),
+            provider_stats.metal_runtime_last_frame_compute_quant_qkv_count,
+            provider_stats.metal_runtime_last_frame_compute_quant_linear_count,
+            provider_stats.metal_runtime_dense_qkv_packed_calls,
+            provider_stats.metal_runtime_dense_qkv_packed_fallbacks,
+            provider_stats.metal_runtime_deberta_ffn_fused_calls,
+            provider_stats.metal_runtime_deberta_ffn_fused_mps_matmuls,
+            provider_stats.metal_runtime_deberta_ffn_fused_fallbacks,
+            provider_stats.metal_runtime_deberta_attention_flash_calls,
+            provider_stats.metal_runtime_deberta_attention_legacy_calls,
+            provider_stats.metal_runtime_deberta_attention_gemm_calls,
+            provider_stats.metal_runtime_deberta_attention_gemm_fallbacks,
+            provider_stats.metal_runtime_compute_encoder_count,
+            provider_stats.metal_runtime_last_frame_compute_encoder_count,
+            provider_stats.metal_runtime_last_frame_compute_attention_count,
+        },
+    );
 }
 
 fn runBenchmarkTask(

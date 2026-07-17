@@ -3214,6 +3214,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const slot = self.nextFreeDynamicLinearSlot() orelse return null;
         const weight_buf = toBuf(weight);
         const retain_dense_fallback = weight_buf.quantized_storage != null or weight_buf.runtime_quantized_storage != null;
+        // Eager-path quantized weights (e.g. the GLiNER head span MLPs, which
+        // run at rows = batch*num_spans in the thousands) want the same dense
+        // f16 MPS mirror the preplanned encoder slots get; without it they run
+        // the handwritten large-row quant reduce. Per-weight 32 MB cap keeps
+        // pathological weights (embeddings/vocab) on the quantized path.
+        const dense_mirror = retain_dense_fallback and
+            !getenvBool("TERMITE_METAL_DISABLE_DYNAMIC_SLOT_MIRRORS");
         if (!(try decoderRuntimePrepareLinearOp(self, &.{
             .slot = slot,
             .weight = weight,
@@ -3221,6 +3228,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .in_dim = in_dim,
             .out_dim = out_dim,
             .retain_dense_fallback = retain_dense_fallback,
+            .dense_fallback_max_bytes = if (dense_mirror) 32 * 1024 * 1024 else null,
+            .allow_direct_quant_fallback = dense_mirror,
+            .prefer_f16_mps_fallback = dense_mirror,
         }))) return null;
         try self.dynamic_linear_slots.put(self.allocator, key, slot);
         return slot;
@@ -7653,6 +7663,73 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return denseBuf(self.allocator, out, true, &out_shape);
     }
 
+    // First-subtoken word gather for the GLiNER head: resolves each (batch,
+    // word) to the absolute hidden row of its first token on the host, then
+    // reuses the axis-0 gather the takeRows op dispatches. Words with no
+    // tokens (the CPU path zero-fills them) fall back to the host
+    // implementation rather than growing a dedicated zero-fill kernel.
+    fn glinerWordEmbeddingsOp(ctx: *anyopaque, request: *const ops.GlinerWordEmbeddingsRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (getenvBool("TERMITE_METAL_DISABLE_GLINER_HEAD_DEVICE")) return null;
+        if (request.batch == 0 or request.seq_len == 0 or request.hidden_size == 0 or request.num_words == 0) return null;
+        const token_count = request.batch * request.seq_len;
+        if (request.words_mask.len < token_count) return null;
+
+        const input_buf = toBuf(request.hidden);
+        if (input_buf.quantized_storage != null) return null;
+        const shape = input_buf.logical_shape orelse return null;
+        if (shape.len != 2 or shape[0] != @as(i64, @intCast(token_count)) or
+            shape[1] != @as(i64, @intCast(request.hidden_size))) return null;
+
+        const out_rows = request.batch * request.num_words;
+        const row_ids = try self.allocator.alloc(u32, out_rows);
+        defer self.allocator.free(row_ids);
+        const sentinel = std.math.maxInt(u32);
+        @memset(row_ids, sentinel);
+        for (0..request.batch) |b| {
+            for (0..request.seq_len) |t| {
+                const word_id = request.words_mask[b * request.seq_len + t];
+                if (word_id <= 0) continue;
+                const w: usize = @intCast(word_id - 1);
+                if (w >= request.num_words) continue;
+                const slot_index = b * request.num_words + w;
+                if (row_ids[slot_index] != sentinel) continue;
+                row_ids[slot_index] = @intCast(b * request.seq_len + t);
+            }
+        }
+        for (row_ids) |row_id| {
+            if (row_id == sentinel) return null;
+        }
+
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        var input_tensor = try self.ownedDeviceMetalTensorFromCt(request.hidden);
+        defer input_tensor.deinit();
+        const index_values = try self.allocator.alloc(f32, out_rows);
+        defer self.allocator.free(index_values);
+        for (row_ids, 0..) |row_id, index| index_values[index] = @floatFromInt(row_id);
+        const index_shape = [_]i32{@intCast(out_rows)};
+        var index_tensor = try MetalTensor.deviceAllocate(
+            @ptrCast(runtime),
+            out_rows * @sizeOf(f32),
+            .shared,
+            &index_shape,
+        );
+        defer index_tensor.deinit();
+        const host_indices = MetalTensor.borrowed(index_values.ptr, index_values.len, &index_shape);
+        try host_indices.copyInto(&index_tensor);
+        const output_shape = [_]i32{ @intCast(out_rows), @intCast(request.hidden_size) };
+        if (try metal_runtime.decoderRuntimeGatherAxis0F32_2DDevice(
+            self.provider_impl,
+            input_tensor,
+            index_tensor,
+            token_count,
+            request.hidden_size,
+            out_rows,
+            &output_shape,
+        )) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+        return null;
+    }
+
     fn takeRowsOp(ctx: *anyopaque, request: *const ops.TakeRowsRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (request.row_ids.len != request.rows or request.rows == 0 or request.dim == 0) return null;
@@ -8120,6 +8197,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (b_buf.metal_tensor) |*b_metal| {
                     if (a_metal.isDevice() and b_metal.isDevice()) {
                         if (try metal_runtime.deviceConcatRow(self.provider_impl, a_metal.*, b_metal.*, dim_a, dim_b)) |tensor| {
+                            return self.ctFromOwnedMetalTensor(tensor);
+                        }
+                    }
+                }
+            }
+        } else {
+            // Multi-row column concat stays on device: the host fallback below
+            // materializes both inputs (draining any active frame) and hands
+            // downstream consumers host tensors — for the GLiNER span head that
+            // used to pull the whole span MLP off the GPU.
+            const a_buf = toBuf(a);
+            const b_buf = toBuf(b);
+            if (a_buf.metal_tensor) |*a_metal| {
+                if (b_buf.metal_tensor) |*b_metal| {
+                    if (a_metal.isDevice() and b_metal.isDevice()) {
+                        if (try metal_runtime.deviceConcatColumns2DF32(self.provider_impl, a_metal.*, b_metal.*, total, dim_a, dim_b)) |tensor| {
                             return self.ctFromOwnedMetalTensor(tensor);
                         }
                     }
@@ -20321,6 +20414,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.sliceRows2D = sliceRows2DOp;
         vt.embeddingLookup = embeddingLookupOp;
         vt.takeRows = takeRowsOp;
+        vt.glinerWordEmbeddings = glinerWordEmbeddingsOp;
         vt.gelu = geluOp;
         vt.geluNew = geluNewOp;
         vt.relu = reluOp;

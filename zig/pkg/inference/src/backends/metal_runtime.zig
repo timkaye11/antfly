@@ -13636,6 +13636,46 @@ pub fn hasActiveFrame(runtime: ?*RawMetalDecodeRuntime) bool {
     return termite_metal_decode_runtime_has_active_frame(runtime) != 0;
 }
 
+/// Column-concat two device [total, dim_a] / [total, dim_b] f32 tensors into
+/// [total, dim_a + dim_b] on device. Frame-aware (joins an active frame).
+pub fn deviceConcatColumns2DF32(
+    self: anytype,
+    a: MetalTensor,
+    b: MetalTensor,
+    total: usize,
+    dim_a: usize,
+    dim_b: usize,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!a.isDevice() or !b.isDevice()) return null;
+    if (total == 0 or dim_a == 0 or dim_b == 0) return null;
+    const out_dim = std.math.add(usize, dim_a, dim_b) catch return null;
+    const total_elems = std.math.mul(usize, total, out_dim) catch return null;
+    if (total_elems > std.math.maxInt(u32)) return null;
+    if (a.elemCount() != total * dim_a or b.elemCount() != total * dim_b) return null;
+    const shape = [_]i32{ @intCast(total), @intCast(out_dim) };
+    var output = try MetalTensor.deviceAllocate(runtime, total_elems * @sizeOf(f32), .private, &shape);
+    errdefer output.deinit();
+    const rc = termite_metal_decode_runtime_concat_cols_f32_device(
+        runtime,
+        a.deviceHandle(),
+        a.deviceByteOffset(),
+        b.deviceHandle(),
+        b.deviceByteOffset(),
+        total,
+        dim_a,
+        dim_b,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc != 0) {
+        output.deinit();
+        return null;
+    }
+    return output;
+}
+
 pub fn deviceConcatRow(
     self: anytype,
     a: MetalTensor,
@@ -15804,6 +15844,18 @@ pub extern fn termite_metal_decode_runtime_transpose_f32_device(
     perm: [*c]const u32,
     rank: usize,
     total: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_concat_cols_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    a_handle: ?*anyopaque,
+    a_offset: usize,
+    b_handle: ?*anyopaque,
+    b_offset: usize,
+    total: usize,
+    dim_a: usize,
+    dim_b: usize,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;

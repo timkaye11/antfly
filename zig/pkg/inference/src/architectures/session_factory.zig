@@ -5879,13 +5879,25 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
 
             // Eager head path -- keeps the encoder/head boundary on the
             // backend (CT) so we skip the toFloat32 + fromFloat32Shape
-            // round-trip the legacy []f32-typed APIs do.
+            // round-trip the legacy []f32-typed APIs do. On Metal the head's
+            // gather/MLP/logits ops each pay a command-buffer commit+wait
+            // when no frame is open, so span the head with one frame; ops
+            // that read host memory (label GRU) drain it and reopen.
+            var head_frame_active = false;
+            if (cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame()) {
+                head_frame_active = cb.decoderRuntimeBeginFrame() catch false;
+            }
+            errdefer if (head_frame_active) cb.decoderRuntimeCancelFrame() catch {};
             const head_result = try gliner_head.forwardCtWithLabelMarkers(&cb, allocator, hidden, input_ids, words_mask, span_idx, batch, seq_len, cfg.hidden_size, .{
                 .classification = cfg.classification_token_id,
                 .entity = cfg.entity_token_id,
                 .relation = cfg.relation_token_id,
             });
             defer cb.free(head_result.logits);
+            if (head_frame_active) {
+                try cb.decoderRuntimeSubmitAndWaitFrame();
+                head_frame_active = false;
+            }
 
             const logits_f32 = if (head_result.num_labels == 0)
                 try allocator.alloc(f32, 0)

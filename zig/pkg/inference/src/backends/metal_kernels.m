@@ -722,6 +722,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> deberta_relative_score_gemm_f32_pipeline;
     id<MTLComputePipelineState> deberta_relative_score_softmax_pv_f32_pipeline;
     id<MTLComputePipelineState> transpose_f32_pipeline;
+    id<MTLComputePipelineState> concat_cols_f32_pipeline;
     id<MTLComputePipelineState> dot_general_2d_f32_pipeline;
     id<MTLComputePipelineState> dot_general_batched_f32_pipeline;
     id<MTLComputePipelineState> conv1d_f32_pipeline;
@@ -4078,6 +4079,13 @@ typedef struct termite_metal_transpose_f32_params {
     uint32_t perm[8];
 } termite_metal_transpose_f32_params;
 
+typedef struct termite_metal_concat_cols_f32_params {
+    uint32_t total;
+    uint32_t dim_a;
+    uint32_t dim_b;
+    uint32_t reserved0;
+} termite_metal_concat_cols_f32_params;
+
 typedef struct termite_metal_dot_general_2d_f32_params {
     uint32_t m;
     uint32_t n;
@@ -4189,6 +4197,7 @@ static NSString *termite_metal_shader_source(void) {
            "struct termite_metal_disentangled_relative_attention_f32_params { uint batch; uint seq_len; uint num_heads; uint head_dim; uint has_mask; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_deberta_relative_score_gemm_f32_params { uint batch; uint seq_len; uint rel_len; uint num_heads; uint head_dim; uint mode; uint reserved0; uint reserved1; };\n"
            "struct termite_metal_transpose_f32_params { uint rank; uint total; uint reserved0; uint reserved1; uint dims[8]; uint in_strides[8]; uint out_strides[8]; uint perm[8]; };\n"
+           "struct termite_metal_concat_cols_f32_params { uint total; uint dim_a; uint dim_b; uint reserved0; };\n"
            "struct termite_metal_dot_general_2d_f32_params { uint m; uint n; uint k; uint rhs_contract_axis; };\n"
            "struct termite_metal_dot_general_batched_f32_params { uint batch_count; uint m; uint n; uint k; uint rhs_contract_axis; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_conv1d_f32_params { uint batch; uint in_channels; uint out_channels; uint time_steps; uint kernel_size; uint stride; uint padding; uint out_time; uint has_bias; uint reserved0; uint reserved1; uint reserved2; };\n"
@@ -6778,6 +6787,11 @@ static NSString *termite_metal_shader_source(void) {
            "    uint rem = gid; uint flat_in = 0u;\n"
            "    for (uint axis = 0u; axis < p.rank; ++axis) { uint stride = p.out_strides[axis]; uint coord = stride == 0u ? 0u : rem / stride; if (stride != 0u) rem -= coord * stride; uint in_axis = p.perm[axis]; if (in_axis >= p.rank) return; flat_in += coord * p.in_strides[in_axis]; }\n"
            "    output[gid] = input[flat_in];\n"
+           "}\n"
+           "kernel void termite_concat_cols_f32(device const float *a [[buffer(0)]], device const float *b [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_concat_cols_f32_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    uint out_dim = p.dim_a + p.dim_b; uint total_elems = p.total * out_dim; if (gid >= total_elems || out_dim == 0u) return;\n"
+           "    uint row = gid / out_dim; uint col = gid - row * out_dim;\n"
+           "    output[gid] = col < p.dim_a ? a[row * p.dim_a + col] : b[row * p.dim_b + (col - p.dim_a)];\n"
            "}\n"
            "kernel void termite_dot_general_2d_f32(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_dot_general_2d_f32_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.m * p.n; if (gid >= total || p.k == 0u) return; uint row = gid / p.n; uint col = gid - row * p.n; float acc = 0.0f;\n"
@@ -16574,6 +16588,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->deberta_relative_score_gemm_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_deberta_relative_score_gemm_f32");
         runtime->deberta_relative_score_softmax_pv_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_deberta_relative_score_softmax_pv_f32");
         runtime->transpose_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_transpose_f32");
+        runtime->concat_cols_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_concat_cols_f32");
         runtime->dot_general_2d_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_dot_general_2d_f32");
         runtime->dot_general_batched_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_dot_general_batched_f32");
         runtime->conv1d_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_conv1d_f32");
@@ -30709,36 +30724,30 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
         {
             return -16;
         }
-        const BOOL gemm_attention_requested = getenv("TERMITE_METAL_DISABLE_DEBERTA_GEMM_ATTENTION") == NULL &&
-            ((batch == 1 && seq_len >= 384) || (batch >= 2 && batch <= 8 && seq_len >= 256));
-        const BOOL flash4_attention_requested = getenv("TERMITE_METAL_DISABLE_DEBERTA_FLASH_ATTENTION") == NULL &&
-            ((batch == 1 && seq_len >= 384) || (batch >= 2 && batch <= 8 && seq_len >= 256)) &&
+        // TERMITE_METAL_DEBERTA_ATTENTION_FORCE=tg|flash4|gemm|naive bypasses the
+        // shape heuristics for variant A/B experiments; hard kernel limits
+        // (flash4/tg seq<=512, head_dim<=256; gemm scratch reservation) still
+        // apply and fall through in the usual order.
+        const char *deberta_attention_force = getenv("TERMITE_METAL_DEBERTA_ATTENTION_FORCE");
+        const BOOL force_tg = deberta_attention_force != NULL && strcmp(deberta_attention_force, "tg") == 0;
+        const BOOL force_flash4 = deberta_attention_force != NULL && strcmp(deberta_attention_force, "flash4") == 0;
+        const BOOL force_gemm = deberta_attention_force != NULL && strcmp(deberta_attention_force, "gemm") == 0;
+        const BOOL force_naive = deberta_attention_force != NULL && strcmp(deberta_attention_force, "naive") == 0;
+        // Measured M4 defaults (2026-07-16 interleaved ABBA variant runs at
+        // seq 430, batches 2-16, plus a seq {128,215} x batch {1..16} sweep):
+        // tg wins for seq<384 at every batch and for batch==1 at any seq<=512;
+        // flash4 wins for batch>=2 at seq>=384 (13-18% over gemm and tg at
+        // batch 8-16, where tg falls off a threadgroup-occupancy cliff). The
+        // GEMM-score path never won a clean interleaved cell inside flash4's
+        // seq<=512 envelope, so it now serves the seq>512 range only (its own
+        // block bounds seq<=1024; scratch-reservation failure falls to tg).
+        const BOOL gemm_attention_requested = !force_tg && !force_flash4 && !force_naive &&
+            (force_gemm || (getenv("TERMITE_METAL_DISABLE_DEBERTA_GEMM_ATTENTION") == NULL &&
+                seq_len > 512));
+        const BOOL flash4_attention_requested = !force_tg && !force_gemm && !force_naive &&
+            (force_flash4 || (getenv("TERMITE_METAL_DISABLE_DEBERTA_FLASH_ATTENTION") == NULL &&
+                (batch >= 2 && seq_len >= 384))) &&
             seq_len <= 512 && head_dim <= 256;
-        if (flash4_attention_requested &&
-            runtime->disentangled_relative_attention_f32_flash4_pipeline != nil)
-        {
-            BOOL flash_encoder_owned = YES;
-            id<MTLComputeCommandEncoder> flash_encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &flash_encoder_owned);
-            if (flash_encoder == nil) return -16;
-            [flash_encoder setComputePipelineState:runtime->disentangled_relative_attention_f32_flash4_pipeline];
-            [flash_encoder setBuffer:q_buffer offset:q_offset atIndex:0];
-            [flash_encoder setBuffer:k_buffer offset:k_offset atIndex:1];
-            [flash_encoder setBuffer:v_buffer offset:v_offset atIndex:2];
-            [flash_encoder setBuffer:q_r_buffer offset:q_r_offset atIndex:3];
-            [flash_encoder setBuffer:k_r_buffer offset:k_r_offset atIndex:4];
-            [flash_encoder setBuffer:mask_buffer offset:mask_offset atIndex:5];
-            [flash_encoder setBuffer:output_buffer offset:output_offset atIndex:6];
-            [flash_encoder setBytes:&params length:sizeof(params) atIndex:7];
-            const NSUInteger flash_width = 64u;
-            const NSUInteger flash_query_block = 4u;
-            const NSUInteger scratch_floats = flash_query_block * seq_len + flash_query_block + flash_query_block * flash_width;
-            [flash_encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16(scratch_floats * sizeof(float)) atIndex:0];
-            [flash_encoder dispatchThreadgroups:MTLSizeMake((seq_len + flash_query_block - 1u) / flash_query_block, num_heads, batch)
-                       threadsPerThreadgroup:MTLSizeMake(flash_width, 1, 1)];
-            runtime->deberta_attention_flash_calls += 1;
-            termite_metal_end_scoped_compute_encoder(flash_encoder, flash_encoder_owned);
-            return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -17);
-        }
         if (gemm_attention_requested &&
             runtime->deberta_relative_score_gemm_f32_pipeline != nil &&
             runtime->deberta_relative_score_softmax_pv_f32_pipeline != nil &&
@@ -30811,7 +30820,33 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
             }
             runtime->deberta_attention_gemm_fallbacks += 1;
         }
-        if (getenv("TERMITE_METAL_DISABLE_DEBERTA_TG_ATTENTION") == NULL &&
+        if (flash4_attention_requested &&
+            runtime->disentangled_relative_attention_f32_flash4_pipeline != nil)
+        {
+            BOOL flash_encoder_owned = YES;
+            id<MTLComputeCommandEncoder> flash_encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &flash_encoder_owned);
+            if (flash_encoder == nil) return -16;
+            [flash_encoder setComputePipelineState:runtime->disentangled_relative_attention_f32_flash4_pipeline];
+            [flash_encoder setBuffer:q_buffer offset:q_offset atIndex:0];
+            [flash_encoder setBuffer:k_buffer offset:k_offset atIndex:1];
+            [flash_encoder setBuffer:v_buffer offset:v_offset atIndex:2];
+            [flash_encoder setBuffer:q_r_buffer offset:q_r_offset atIndex:3];
+            [flash_encoder setBuffer:k_r_buffer offset:k_r_offset atIndex:4];
+            [flash_encoder setBuffer:mask_buffer offset:mask_offset atIndex:5];
+            [flash_encoder setBuffer:output_buffer offset:output_offset atIndex:6];
+            [flash_encoder setBytes:&params length:sizeof(params) atIndex:7];
+            const NSUInteger flash_width = 64u;
+            const NSUInteger flash_query_block = 4u;
+            const NSUInteger scratch_floats = flash_query_block * seq_len + flash_query_block + flash_query_block * flash_width;
+            [flash_encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16(scratch_floats * sizeof(float)) atIndex:0];
+            [flash_encoder dispatchThreadgroups:MTLSizeMake((seq_len + flash_query_block - 1u) / flash_query_block, num_heads, batch)
+                       threadsPerThreadgroup:MTLSizeMake(flash_width, 1, 1)];
+            runtime->deberta_attention_flash_calls += 1;
+            termite_metal_end_scoped_compute_encoder(flash_encoder, flash_encoder_owned);
+            return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -17);
+        }
+        if (!force_naive &&
+            getenv("TERMITE_METAL_DISABLE_DEBERTA_TG_ATTENTION") == NULL &&
             runtime->disentangled_relative_attention_f32_tg_pipeline != nil &&
             seq_len <= 512 &&
             head_dim <= 256)
@@ -30898,6 +30933,61 @@ int termite_metal_decode_runtime_transpose_f32_device(
            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->transpose_f32_pipeline, total), 1, 1)];
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -8);
+    }
+}
+
+int termite_metal_decode_runtime_concat_cols_f32_device(
+    termite_metal_decode_runtime *runtime,
+    void *a_handle,
+    size_t a_offset,
+    void *b_handle,
+    size_t b_offset,
+    size_t total,
+    size_t dim_a,
+    size_t dim_b,
+    void *output_handle,
+    size_t output_offset
+) {
+    if (runtime == NULL || a_handle == NULL || b_handle == NULL || output_handle == NULL) return -1;
+    if (runtime->concat_cols_f32_pipeline == nil) return -2;
+    const size_t out_dim = dim_a + dim_b;
+    if (total == 0 || dim_a == 0 || dim_b == 0) return -3;
+    const size_t total_elems = total * out_dim;
+    if (total_elems > UINT32_MAX || total > UINT32_MAX || dim_a > UINT32_MAX || dim_b > UINT32_MAX) return -3;
+    @autoreleasepool {
+        id<MTLBuffer> a_buffer = (__bridge id<MTLBuffer>)a_handle;
+        id<MTLBuffer> b_buffer = (__bridge id<MTLBuffer>)b_handle;
+        id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
+        if (a_offset + total * dim_a * sizeof(float) > a_buffer.length) return -4;
+        if (b_offset + total * dim_b * sizeof(float) > b_buffer.length) return -5;
+        if (output_offset + total_elems * sizeof(float) > output_buffer.length) return -6;
+        termite_metal_concat_cols_f32_params params = {
+            .total = (uint32_t)total,
+            .dim_a = (uint32_t)dim_a,
+            .dim_b = (uint32_t)dim_b,
+            .reserved0 = 0,
+        };
+        bool frame_owned = true;
+        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (command_buffer == nil) return -7;
+        if (!frame_owned) {
+            if (termite_metal_decode_runtime_retain_frame_resource(runtime, a_buffer) != 0 ||
+                termite_metal_decode_runtime_retain_frame_resource(runtime, b_buffer) != 0 ||
+                termite_metal_decode_runtime_retain_frame_resource(runtime, output_buffer) != 0) {
+                return -7;
+            }
+        }
+        id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
+        if (encoder == nil) return -8;
+        [encoder setComputePipelineState:runtime->concat_cols_f32_pipeline];
+        [encoder setBuffer:a_buffer offset:a_offset atIndex:0];
+        [encoder setBuffer:b_buffer offset:b_offset atIndex:1];
+        [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
+        [encoder setBytes:&params length:sizeof(params) atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(total_elems, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->concat_cols_f32_pipeline, total_elems), 1, 1)];
+        [encoder endEncoding];
+        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
     }
 }
 
