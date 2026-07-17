@@ -305,6 +305,10 @@ candidate is still dev-only.
 
 ## GLiNER2 CUDA Q4 Span Kernels
 
+The complete FP16 encoder, generated tensor-core attention, Fastino comparison,
+correctness evidence, production dispatch policy, and remaining work are
+documented in [`docs/GLINER2_CUDA.md`](docs/GLINER2_CUDA.md).
+
 CUDA GLiNER2 span-head weights use resident `Q4_K` kernels by default when the
 checked-in CUDA module exposes the required GLiNER span primitives. This avoids
 upload-time dequantization for `span_rep.span_rep_layer.*.weight` tensors and
