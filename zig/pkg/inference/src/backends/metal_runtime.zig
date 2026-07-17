@@ -14697,6 +14697,14 @@ pub extern fn termite_metal_decode_runtime_clear_linear_slot(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_clear_layer_norm_slot(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_clear_rms_norm_slot(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_prepare_linear_bias(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
@@ -18516,6 +18524,28 @@ pub fn clearRawLinearSlot(self: anytype, slot: usize) void {
     setRuntimeQuantMappedDisabled(self, slot, false);
     setRuntimeQuantPrepareMode(self, slot, .none);
     self.raw_linear_slots_prepared[slot] = false;
+}
+
+pub fn clearRawLayerNormSlot(self: anytype, slot: usize) void {
+    if (self.raw_decode_runtime) |runtime| {
+        _ = termite_metal_decode_runtime_clear_layer_norm_slot(runtime, slot);
+    }
+    if (self.raw_layer_norm_slot_weights[slot]) |*weight| weight.deinit();
+    self.raw_layer_norm_slot_weights[slot] = null;
+    if (self.raw_layer_norm_slot_biases[slot]) |*bias| bias.deinit();
+    self.raw_layer_norm_slot_biases[slot] = null;
+    self.raw_layer_norm_slot_hidden_sizes[slot] = 0;
+    self.raw_layer_norm_slots_prepared[slot] = false;
+}
+
+pub fn clearRawRmsNormSlot(self: anytype, slot: usize) void {
+    if (self.raw_decode_runtime) |runtime| {
+        _ = termite_metal_decode_runtime_clear_rms_norm_slot(runtime, slot);
+    }
+    if (self.raw_rms_norm_slot_weights[slot]) |*weight| weight.deinit();
+    self.raw_rms_norm_slot_weights[slot] = null;
+    self.raw_rms_norm_slot_hidden_sizes[slot] = 0;
+    self.raw_rms_norm_slots_prepared[slot] = false;
 }
 
 pub fn makeQuantizedWeightDeviceArray(storage: *const QuantizedStorage) !c.backend_array {

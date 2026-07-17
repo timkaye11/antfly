@@ -226,38 +226,44 @@ pub fn main(init: std.process.Init) !void {
             for (rows.items) |row| printText(opts, row);
         },
         .csv => {
-            printCsvHeader();
-            for (rows.items) |row| printCsv(opts, row);
+            var stdout_buffer: [4096]u8 = undefined;
+            var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+            const stdout = &stdout_writer.interface;
+            try printCsvHeader(stdout);
+            for (rows.items) |row| try printCsv(stdout, opts, row);
+            try stdout.flush();
         },
     }
 
-    var debug_backend = try session_factory.getComputeBackend(model.session, allocator);
-    defer debug_backend.deinit();
-    const provider_stats = debug_backend.debugTimingSnapshot().provider;
-    std.debug.print(
-        "provider_stats: mps_linears={} dense_f16_mb={} dense_f16_slots={} qkv_pack_mb={} runtime_mb={} quant_qkv={} quant_linear={} qkv_packed={}/{} ffn_fused={}/{}/{} attention_flash={} attention_legacy={} attention_gemm={}/{} compute_encoders={} last_frame_compute_encoders={} last_frame_attention={}\n",
-        .{
-            provider_stats.metal_runtime_last_frame_mps_dense_linear_count,
-            provider_stats.metal_runtime_dense_linear_f16_weight_bytes / (1024 * 1024),
-            provider_stats.metal_runtime_dense_linear_f16_slots,
-            provider_stats.metal_runtime_dense_qkv_packed_bytes / (1024 * 1024),
-            provider_stats.metal_runtime_total_bytes / (1024 * 1024),
-            provider_stats.metal_runtime_last_frame_compute_quant_qkv_count,
-            provider_stats.metal_runtime_last_frame_compute_quant_linear_count,
-            provider_stats.metal_runtime_dense_qkv_packed_calls,
-            provider_stats.metal_runtime_dense_qkv_packed_fallbacks,
-            provider_stats.metal_runtime_deberta_ffn_fused_calls,
-            provider_stats.metal_runtime_deberta_ffn_fused_mps_matmuls,
-            provider_stats.metal_runtime_deberta_ffn_fused_fallbacks,
-            provider_stats.metal_runtime_deberta_attention_flash_calls,
-            provider_stats.metal_runtime_deberta_attention_legacy_calls,
-            provider_stats.metal_runtime_deberta_attention_gemm_calls,
-            provider_stats.metal_runtime_deberta_attention_gemm_fallbacks,
-            provider_stats.metal_runtime_compute_encoder_count,
-            provider_stats.metal_runtime_last_frame_compute_encoder_count,
-            provider_stats.metal_runtime_last_frame_compute_attention_count,
-        },
-    );
+    if (opts.format == .text and model.session.backend() != .onnx) {
+        var debug_backend = try session_factory.getComputeBackend(model.session, allocator);
+        defer debug_backend.deinit();
+        const provider_stats = debug_backend.debugTimingSnapshot().provider;
+        std.debug.print(
+            "provider_stats: mps_linears={} dense_f16_mb={} dense_f16_slots={} qkv_pack_mb={} runtime_mb={} quant_qkv={} quant_linear={} qkv_packed={}/{} ffn_fused={}/{}/{} attention_flash={} attention_legacy={} attention_gemm={}/{} compute_encoders={} last_frame_compute_encoders={} last_frame_attention={}\n",
+            .{
+                provider_stats.metal_runtime_last_frame_mps_dense_linear_count,
+                provider_stats.metal_runtime_dense_linear_f16_weight_bytes / (1024 * 1024),
+                provider_stats.metal_runtime_dense_linear_f16_slots,
+                provider_stats.metal_runtime_dense_qkv_packed_bytes / (1024 * 1024),
+                provider_stats.metal_runtime_total_bytes / (1024 * 1024),
+                provider_stats.metal_runtime_last_frame_compute_quant_qkv_count,
+                provider_stats.metal_runtime_last_frame_compute_quant_linear_count,
+                provider_stats.metal_runtime_dense_qkv_packed_calls,
+                provider_stats.metal_runtime_dense_qkv_packed_fallbacks,
+                provider_stats.metal_runtime_deberta_ffn_fused_calls,
+                provider_stats.metal_runtime_deberta_ffn_fused_mps_matmuls,
+                provider_stats.metal_runtime_deberta_ffn_fused_fallbacks,
+                provider_stats.metal_runtime_deberta_attention_flash_calls,
+                provider_stats.metal_runtime_deberta_attention_legacy_calls,
+                provider_stats.metal_runtime_deberta_attention_gemm_calls,
+                provider_stats.metal_runtime_deberta_attention_gemm_fallbacks,
+                provider_stats.metal_runtime_compute_encoder_count,
+                provider_stats.metal_runtime_last_frame_compute_encoder_count,
+                provider_stats.metal_runtime_last_frame_compute_attention_count,
+            },
+        );
+    }
 }
 
 fn runBenchmarkTask(
@@ -671,12 +677,12 @@ fn printText(opts: Options, result: Result) void {
     );
 }
 
-fn printCsvHeader() void {
-    std.debug.print("task,mode,model_dir,backend,batch_size,avg_ms,p50_ms,p95_ms,min_ms,max_ms,entity_count,relation_count,score_sum,relation_score_sum,native_quant_stats_enabled,q4q5,q4q5_pair,q4q5_triple,q4q5_panel,dequant,dequant_pair,dequant_triple,q8_0,q8_0_pair,q8_0_triple,metal_jit_exact_q4_0,metal_jit_exact_q4_k\n", .{});
+fn printCsvHeader(writer: *std.Io.Writer) !void {
+    try writer.writeAll("task,mode,model_dir,backend,batch_size,avg_ms,p50_ms,p95_ms,min_ms,max_ms,entity_count,relation_count,score_sum,relation_score_sum,native_quant_stats_enabled,q4q5,q4q5_pair,q4q5_triple,q4q5_panel,dequant,dequant_pair,dequant_triple,q8_0,q8_0_pair,q8_0_triple,metal_jit_exact_q4_0,metal_jit_exact_q4_k\n");
 }
 
-fn printCsv(opts: Options, result: Result) void {
-    std.debug.print(
+fn printCsv(writer: *std.Io.Writer, opts: Options, result: Result) !void {
+    try writer.print(
         "{s},{s},{s},{s},{},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{},{},{d:.6},{d:.6},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
         .{
             @tagName(result.task),
@@ -712,7 +718,7 @@ fn printCsv(opts: Options, result: Result) void {
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: zig build bench-gliner2-e2e -- --model-dir <dir> [--task entities|relations|both] [--text TEXT] [--text-repeat N] [--batch-size N] [--label NAME]... [--relation-label NAME]... [--backend auto|native|metal|onnx|cuda] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--graph-runtime partitioned] [--warmup-iters N] [--measure-iters N] [--format text|csv] [--dump-entities]
+        \\usage: zig build bench-gliner2-e2e -- --model-dir <dir> [--task entities|relations|both] [--text TEXT] [--text-repeat N] [--batch-size N] [--ragged] [--label NAME]... [--relation-label NAME]... [--backend auto|native|metal|onnx|cuda] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--graph-runtime partitioned] [--warmup-iters N] [--measure-iters N] [--format text|csv] [--dump-entities]
         \\  Profile capture selects shadow mode unless a conflicting mode is explicit.
         \\
     , .{});

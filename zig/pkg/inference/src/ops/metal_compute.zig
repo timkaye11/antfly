@@ -100,7 +100,11 @@ test "metal_compute paged slot attention accepts kernel supported kv formats" {
 // its host fallback; without this the GLiNER span head can quietly fall off
 // the GPU (the exact regression the device concat/word-gather work fixed)
 // with no operator-visible signal.
-var host_fallback_warned = [_]std.atomic.Value(bool){ std.atomic.Value(bool).init(false), std.atomic.Value(bool).init(false) };
+var host_fallback_warned = [_]std.atomic.Value(bool){
+    std.atomic.Value(bool).init(false),
+    std.atomic.Value(bool).init(false),
+    std.atomic.Value(bool).init(false),
+};
 
 fn warnHostFallbackOnce(comptime index: usize, comptime what: []const u8) void {
     if (host_fallback_warned[index].swap(true, .monotonic)) return;
@@ -2834,7 +2838,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             metal_runtime.clearRawLinearSlot(self.provider_impl, slot.*);
         }
         self.dynamic_linear_slots.deinit(self.allocator);
+        var dynamic_layer_norm_slot_it = self.dynamic_layer_norm_slots.valueIterator();
+        while (dynamic_layer_norm_slot_it.next()) |slot| {
+            metal_runtime.clearRawLayerNormSlot(self.provider_impl, slot.*);
+        }
         self.dynamic_layer_norm_slots.deinit(self.allocator);
+        var dynamic_rms_norm_slot_it = self.dynamic_rms_norm_slots.valueIterator();
+        while (dynamic_rms_norm_slot_it.next()) |slot| {
+            metal_runtime.clearRawRmsNormSlot(self.provider_impl, slot.*);
+        }
         self.dynamic_rms_norm_slots.deinit(self.allocator);
         if (self.owned_native_provider) {
             self.provider_impl.deinitOwned();
@@ -7875,7 +7887,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const gamma_buf = toBuf(gamma);
         const beta_buf = toBuf(beta);
         if (input_buf.quantized_storage != null or gamma_buf.quantized_storage != null or beta_buf.quantized_storage != null) return error.UnsupportedTensorType;
-        if (!disableRuntimeElementwise()) {
+        const device_fast_path_enabled = !disableRuntimeElementwise();
+        if (device_fast_path_enabled) {
             if (input_buf.metal_tensor) |*input_metal| {
                 if (input_metal.isDevice() and input_metal.ndim() == 2 and @as(usize, @intCast(input_metal.dim(1))) == dim and
                     bufElemCount(gamma_buf) == dim and bufElemCount(beta_buf) == dim)
@@ -7892,6 +7905,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     }
                 }
             }
+        }
+        if (device_fast_path_enabled and isDeviceResidentCt(input)) {
+            warnHostFallbackOnce(2, "layer norm");
         }
         const input_data = try hostSliceForBuf(input_buf);
         const gamma_data = try hostSliceForBuf(gamma_buf);
@@ -8222,6 +8238,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         dim_b: usize,
     ) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const a_device = isDeviceResidentCt(a);
+        const b_device = isDeviceResidentCt(b);
+        const gliner_span_concat = self.eager_quant_mirrors_preferred and dim_a == dim_b;
+        const warn_on_fallback = gliner_span_concat or (a_device and b_device);
         if (total == 1) {
             const a_buf = toBuf(a);
             const b_buf = toBuf(b);
@@ -8248,10 +8268,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         if (try metal_runtime.decoderRuntimeConcatLastDimF32_2DDevice(self.provider_impl, a_metal.*, b_metal.*, total, dim_a, dim_b, &out_shape)) |tensor| {
                             return self.ctFromOwnedMetalTensor(tensor);
                         }
-                        warnHostFallbackOnce(0, "multi-row concat");
                     }
                 }
             }
+        }
+        if (total > 1 and warn_on_fallback and !host_fallback_warned[0].swap(true, .monotonic)) {
+            std.log.warn(
+                "metal multi-row concat fell back to the host path; rows={} dims={}+{} a_device={} b_device={} (first occurrence, logged once)",
+                .{ total, dim_a, dim_b, a_device, b_device },
+            );
         }
         const a_data = try hostSliceForBuf(toBuf(a));
         const b_data = try hostSliceForBuf(toBuf(b));
@@ -20671,6 +20696,44 @@ test "metal_compute: native provider is shared across backend lifetimes" {
     var second = try MetalCompute.init(allocator, &metal_ws, null);
     defer second.deinit();
     try std.testing.expectEqual(first_provider, second.provider_impl);
+}
+
+test "metal_compute: dynamic norm slots survive repeated backend lifetimes" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer {
+        deinitSharedNativeProvider(&metal_ws);
+        metal_ws.lazy_weights.deinit(allocator);
+    }
+
+    const gamma_data = [_]f32{ 1, 1, 1, 1, 1, 1, 1 };
+    const beta_data = [_]f32{ 0, 0, 0, 0, 0, 0, 0 };
+
+    // Four LayerNorm slots per request exhaust the old 256-slot pool on the
+    // 65th backend lifetime when teardown fails to release provider slots.
+    for (0..65) |_| {
+        var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+        defer metal_compute.deinit();
+        var cb = metal_compute.computeBackend();
+
+        for (0..4) |index| {
+            const hidden_size = 4 + index;
+            const shape = [_]i32{@intCast(hidden_size)};
+            const gamma = try cb.fromFloat32Shape(gamma_data[0..hidden_size], &shape);
+            defer cb.free(gamma);
+            const beta = try cb.fromFloat32Shape(beta_data[0..hidden_size], &shape);
+            defer cb.free(beta);
+            try std.testing.expect((try metal_compute.ensureDynamicLayerNormSlot(gamma, beta, hidden_size)) != null);
+        }
+
+        const rms_shape = [_]i32{4};
+        const rms_weight = try cb.fromFloat32Shape(gamma_data[0..4], &rms_shape);
+        defer cb.free(rms_weight);
+        try std.testing.expect((try metal_compute.ensureDynamicRmsNormSlot(rms_weight, 4)) != null);
+    }
 }
 
 test "metal_compute: paged decode attention matches native on f32 cache" {

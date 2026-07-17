@@ -1,12 +1,11 @@
 # GLiNER2 on the Metal backend
 
-Status (2026-07-16): Metal is the fastest GLiNER2 backend at batch >= 8 on
-Apple silicon, beating both the native CPU backend (+33-43%) and the Fastino
-PyTorch-MPS reference implementation (+10-42%) at 215-430-token documents.
-Batch-1 short-text is at parity with native; batch-1 long-text trails native by
-~13% (attention-bound, see Remaining Work). All numbers in this document are
-local, unattested MacBook Air M4 (8-core GPU, 16 GB) measurements; the raw
-logs live in the untracked `.benchmark-results/gliner2-metal-opt/`.
+Status (2026-07-16): at batch 8-16 on Apple silicon, Metal beats the native
+CPU backend by 33-43%. Against Fastino PyTorch-MPS it is effectively tied on
+215-token documents and 10-42% faster on 430-token documents. Batch-1
+short-text is at parity with native; batch-1 long-text trails native by ~13%
+(attention-bound, see Remaining Work). All numbers below are local, unattested
+MacBook Air M4 (8-core GPU, 16 GB) measurements.
 
 ## Execution architecture
 
@@ -52,8 +51,8 @@ interleaved ABBA measurements at seq {128, 215, 430} x batch {1..16}:
 
 - `glinerWordEmbeddings` (`ops/metal_compute.zig`): host-computes the
   first-subtoken row index per (batch, word), then reuses the axis-0 gather
-  device kernel. Words with no tokens fall back to the host path (which
-  zero-fills). This unlocks the fully device head path in
+  device kernel. Words with no tokens gather an out-of-range row that the
+  kernel zero-fills. This unlocks the fully device head path in
   `gliner_head.zig` (label takeRows, span ops, logits).
 - **Multi-row device column-concat**: previously `concatOp` handled only
   `total == 1` on device; any multi-row concat drained the active frame,
@@ -78,7 +77,7 @@ All default-on fast paths have kill switches; force knobs exist for A/B runs.
 
 | Flag | Effect |
 |---|---|
-| `TERMITE_METAL_DISABLE_DEBERTA_WEIGHT_MIRRORS` | Encoder slots stay quantized (memory-constrained mode; slower) |
+| `TERMITE_METAL_DISABLE_DEBERTA_WEIGHT_MIRRORS` | GLiNER encoder slots stay quantized (memory-constrained mode; slower) |
 | `TERMITE_METAL_DEBERTA_USE_{Q8,BF16,F32}_MIRRORS` | Mirror dtype A/B knobs (default f16 MPS) |
 | `TERMITE_METAL_DEBERTA_WEIGHT_MIRROR_MAX_MB` | Mirror budget ceiling (default 768) |
 | `TERMITE_METAL_DISABLE_DEBERTA_SLOT_OPS` | Umbrella: encoder falls back to explicit-weight per-op path |
@@ -90,9 +89,9 @@ All default-on fast paths have kill switches; force knobs exist for A/B runs.
 | `TERMITE_GLINER_PROFILE=1` | Pipeline phase timing (prepare/pack/session_run/decode) |
 | `TERMITE_METAL_TRACE_FRAME=all` | Per-frame encoder counts + GPU-busy ms |
 
-`bench-gliner2-e2e` prints a `provider_stats:` line (mps_linears, dense-f16
-mirror MB/slots, qkv_packed, deberta_ffn_fused, attention variant counters,
-compute-encoder counts) that proves which paths fired.
+In text mode, `bench-gliner2-e2e` prints a `provider_stats:` line (mps_linears,
+dense-f16 mirror MB/slots, qkv_packed, deberta_ffn_fused, attention variant
+counters, compute-encoder counts) that proves which paths fired.
 
 ## Measured results (2026-07-16, warm p50, interleaved lanes)
 
@@ -149,12 +148,12 @@ before interleaved runs reversed it.
   duplicated the pre-existing (never-wired) `concat_lastdim_f32_2d` device op;
   `concatOp` now routes through the existing binding and the duplicate stack
   was deleted.
-- **Blast radius (major)**: dynamic-slot f16 mirrors no longer default for
-  every model's eager quantized linears; a `preferEagerQuantMirrors` backend
-  hint scopes them to GLiNER (set in the `.gliner` session branch).
-- **Slot stranding (major)**: per-request backends now release their dynamic
-  linear slots on deinit (`clearRawLinearSlot`), so the shared provider's
-  512-slot pool cannot exhaust nor strand mirrors across requests.
+- **Blast radius (major)**: encoder and dynamic-slot f16 mirrors are explicit
+  GLiNER opt-ins; generic DeBERTa sessions keep their existing quantized
+  execution, numerics, and memory use.
+- **Slot stranding (major)**: per-request backends release their dynamic
+  linear, LayerNorm, and RMSNorm slots on deinit, so the shared provider pools
+  cannot exhaust across requests.
 - **Lifetimes (major/minor)**: fixed a latent double-free in
   `decoderRuntimeApplyLinearQkvOp`'s error path (overlapping errdefers);
   `attn_normed` in the DeBERTa FFN section is now owned by a single `defer`;
@@ -183,11 +182,11 @@ DeBERTa users would land on GEMM-or-naive there).
    parallelization over key chunks, a `query_block=8` flash variant for large
    batch, simdgroup-tiled GEMM-score upgrade. These would also stretch the
    batch >= 8 lead.
-2. **Backend auto-routing**: `auto` still maps GLiNER2 to native. The measured
-   crossover is batch >= 8 (Metal wins) vs batch 1 (tie/loss), but backend
-   selection happens at model load, not per request — shape-based routing
-   needs either dual-resident sessions or a load-time workload hint. Decide
-   with the table above.
+2. **Backend auto-routing**: `auto` still maps GLiNER2 to native. Metal clearly
+   wins for long documents at batch 8-16 but only ties Fastino on short
+   documents, while batch 1 is a tie/loss. Backend selection happens at model
+   load, not per request, so the current table does not justify a single
+   batch-only crossover rule.
 3. Rel Q_r/K_r projections (12 layers x 2 GEMMs on the shared q/k slots) are
    recomputed every forward; cacheable per seq-len if profiling ever shows it.
 4. Generated/JIT quant kernels intentionally play no role in the GLiNER2 Metal

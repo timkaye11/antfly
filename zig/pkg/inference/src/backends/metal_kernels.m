@@ -8911,6 +8911,27 @@ int termite_metal_decode_runtime_clear_linear_slot(termite_metal_decode_runtime 
     return 0;
 }
 
+int termite_metal_decode_runtime_clear_layer_norm_slot(termite_metal_decode_runtime *runtime, size_t slot) {
+    if (runtime == NULL) return -1;
+    if (slot >= TERMITE_METAL_LAYER_NORM_SLOT_CAPACITY) return -2;
+
+    runtime->layer_norm_weight_buffers[slot] = nil;
+    runtime->layer_norm_bias_buffers[slot] = nil;
+    runtime->layer_norm_hidden_sizes[slot] = 0;
+    runtime->layer_norm_slot_prepared[slot] = 0;
+    return 0;
+}
+
+int termite_metal_decode_runtime_clear_rms_norm_slot(termite_metal_decode_runtime *runtime, size_t slot) {
+    if (runtime == NULL) return -1;
+    if (slot >= TERMITE_METAL_RMS_NORM_SLOT_CAPACITY) return -2;
+
+    runtime->rms_norm_weight_buffers[slot] = nil;
+    runtime->rms_norm_hidden_sizes[slot] = 0;
+    runtime->rms_norm_slot_prepared[slot] = 0;
+    return 0;
+}
+
 static int termite_metal_decode_runtime_check_quant_linear_descriptor(
     termite_metal_decode_runtime *runtime,
     size_t slot,

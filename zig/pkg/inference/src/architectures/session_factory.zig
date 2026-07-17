@@ -5436,7 +5436,7 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             const attention_mask = inputs[1].asInt64();
 
             if (self.task == .classifier) {
-                const hidden_ct = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
+                const hidden_ct = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, false);
                 defer cb.free(hidden_ct);
 
                 const logits = try runDebertaSequenceClassifierCt(&cb, allocator, cfg, hidden_ct, batch, seq_len);
@@ -5879,7 +5879,7 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             // measured win there. Scoped to GLiNER so other models' eager
             // quantized linears keep their existing numerics and memory.
             cb.preferEagerQuantMirrors(true);
-            const hidden = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
+            const hidden = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, true);
             defer cb.free(hidden);
 
             // Eager head path -- keeps the encoder/head boundary on the

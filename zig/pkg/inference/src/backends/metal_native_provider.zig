@@ -170,16 +170,8 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         }
         metal_runtime.resetGatheredSpans(self);
         for (0..decoder_runtime_linear_slot_capacity) |slot| metal_runtime.clearRawLinearSlot(self, slot);
-        for (0..decoder_runtime_layer_norm_slot_capacity) |slot| {
-            if (self.raw_layer_norm_slot_weights[slot]) |*t| t.deinit();
-            self.raw_layer_norm_slot_weights[slot] = null;
-            if (self.raw_layer_norm_slot_biases[slot]) |*t| t.deinit();
-            self.raw_layer_norm_slot_biases[slot] = null;
-        }
-        for (0..decoder_runtime_rms_norm_slot_capacity) |slot| {
-            if (self.raw_rms_norm_slot_weights[slot]) |*t| t.deinit();
-            self.raw_rms_norm_slot_weights[slot] = null;
-        }
+        for (0..decoder_runtime_layer_norm_slot_capacity) |slot| metal_runtime.clearRawLayerNormSlot(self, slot);
+        for (0..decoder_runtime_rms_norm_slot_capacity) |slot| metal_runtime.clearRawRmsNormSlot(self, slot);
         metal_runtime.termite_metal_provider_destroy(self.raw_provider);
         metal_runtime.termite_metal_decode_runtime_destroy(self.raw_decode_runtime);
         self.raw_provider = null;
