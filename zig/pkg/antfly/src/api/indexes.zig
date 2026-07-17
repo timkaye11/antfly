@@ -1165,9 +1165,42 @@ fn appendMinimalIndexRuntimeStatus(
     try out.append(alloc, '}');
 }
 
+/// Collapse the durable repair state machine into the small vocabulary that is
+/// useful to an application or an operator scanning ordinary index status.
+/// Detailed phases, identities, retry deadlines, and sequence counters remain
+/// available through internal diagnostics.
+fn publicIndexRepairState(item: anytype) ?[]const u8 {
+    const T = @TypeOf(item);
+    if (@hasField(T, "repair_state")) return item.repair_state;
+    if (!@hasField(T, "index_repair_id")) return null;
+    // Corrupt durable repair state intentionally has no trustworthy repair ID,
+    // but it is still a terminal, operator-actionable condition.
+    if (std.mem.eql(u8, item.index_repair_automation, "paused")) return "paused";
+    if (std.mem.eql(u8, item.index_repair_phase, "terminal")) return "failed";
+    if (item.index_repair_id == null) return null;
+    if (!std.mem.eql(u8, item.index_repair_wait_reason, "none")) return "waiting";
+    return "rebuilding";
+}
+
+fn repairStateRank(state: []const u8) u8 {
+    // Aggregate toward the least-progressing shard so a partially stalled
+    // distributed index is not presented as uniformly rebuilding.
+    if (std.mem.eql(u8, state, "failed")) return 5;
+    if (std.mem.eql(u8, state, "paused")) return 4;
+    if (std.mem.eql(u8, state, "waiting")) return 3;
+    if (std.mem.eql(u8, state, "rebuilding")) return 1;
+    return 0;
+}
+
+test "index repair aggregation exposes a waiting shard over rebuilding shards" {
+    try std.testing.expect(repairStateRank("waiting") > repairStateRank("rebuilding"));
+    try std.testing.expect(repairStateRank("failed") > repairStateRank("waiting"));
+}
+
 const AggregatedIndexStatus = struct {
     kind: ?db_mod.types.IndexKind = null,
     load_error: ?[]const u8 = null,
+    repair_state: ?[]const u8 = null,
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
     enrichment_failed: bool = false,
@@ -1312,6 +1345,11 @@ fn aggregateIndexStatusIndexed(
         found = true;
         if (aggregate.kind == null) aggregate.kind = item.kind;
         if (item.load_error != null and aggregate.load_error == null) aggregate.load_error = item.load_error;
+        if (publicIndexRepairState(item)) |state| {
+            if (aggregate.repair_state == null or repairStateRank(state) > repairStateRank(aggregate.repair_state.?)) {
+                aggregate.repair_state = state;
+            }
+        }
         const runtime_present = runtime_status.statusHasRuntimeFacts(runtime);
         if (!runtime_present) continue;
         runtime_count += 1;
@@ -1748,6 +1786,7 @@ test "derived coverage aggregation rejects mixed config observations" {
     var indexes_a = [_]db_mod.types.DBIndexStats{.{
         .name = "visual",
         .kind = .dense_vector,
+        .load_error = "IncompleteBulkPublish",
         .coverage_produced_count = 1,
         .coverage_config_hash = 41,
     }};
@@ -1796,6 +1835,65 @@ test "derived coverage aggregation rejects mixed config observations" {
     );
     try std.testing.expect(std.mem.indexOf(u8, missing_status.items, "\"observation_incomplete_reasons\":[\"runtime_unavailable\",\"missing_group\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, missing_status.items, "\"pending\":null") != null);
+}
+
+test "index status exposes compact repair state without internal diagnostics" {
+    const item = db_mod.types.DBIndexStats{
+        .name = "visual",
+        .kind = .dense_vector,
+        .index_repair_id = 1,
+        .index_repair_phase = "building",
+        .index_repair_automation = "enabled",
+        .index_repair_wait_reason = "none",
+        .index_repair_attempts = 7,
+        .index_repair_applied_sequence = 41,
+        .index_repair_target_sequence = 99,
+    };
+    try std.testing.expectEqualStrings("rebuilding", publicIndexRepairState(item).?);
+
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .embeddings,
+        item,
+        0,
+        .external,
+        false,
+        0,
+        0,
+        null,
+        .{},
+        null,
+        null,
+        null,
+        .{},
+        null,
+        true,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"repair\":{\"state\":\"rebuilding\",\"action_required\":false}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"rebuilding\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"backfill_state\":\"running\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "load failed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "index_repair_id") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "index_repair_phase") == null);
+
+    var paused = item;
+    paused.index_repair_automation = "paused";
+    try std.testing.expectEqualStrings("paused", publicIndexRepairState(paused).?);
+
+    var failed = item;
+    failed.index_repair_phase = "terminal";
+    try std.testing.expectEqualStrings("failed", publicIndexRepairState(failed).?);
+
+    var corrupt = failed;
+    corrupt.index_repair_id = null;
+    try std.testing.expectEqualStrings("failed", publicIndexRepairState(corrupt).?);
+
+    var waiting = item;
+    waiting.index_repair_wait_reason = "backoff";
+    try std.testing.expectEqualStrings("waiting", publicIndexRepairState(waiting).?);
 }
 
 test "derived coverage aggregation rejects stale index incarnations" {
@@ -2206,9 +2304,26 @@ fn appendSingleIndexRuntimeStatus(
         null;
     var backfill_active = if (embeddings_view) |view| view.backfill_active else item.backfill_active;
     var backfill_progress = if (embeddings_view) |view| view.backfill_progress else item.backfill_progress;
-    var replay_applied_sequence = if (embeddings_view) |view| view.replay_applied_sequence else item.replay_applied_sequence;
-    var replay_target_sequence = if (embeddings_view) |view| view.replay_target_sequence else item.replay_target_sequence;
-    var replay_catch_up_required = if (embeddings_view) |view| view.replay_catch_up_required else item.replay_catch_up_required;
+    // Replay watermarks describe the managed index worker's real ledger.
+    // Coverage and enrichment are separate stages with separate sequence
+    // domains; they may keep readiness/backfill active, but must not rewrite a
+    // converged index watermark into synthetic replay debt. Older snapshots
+    // that contain no index replay facts can still derive a compatibility
+    // view from enrichment status.
+    const index_replay_present = item.replay_applied_sequence != 0 or
+        item.replay_target_sequence != 0 or item.replay_catch_up_required;
+    var replay_applied_sequence = if (index_replay_present or embeddings_view == null)
+        item.replay_applied_sequence
+    else
+        embeddings_view.?.replay_applied_sequence;
+    var replay_target_sequence = if (index_replay_present or embeddings_view == null)
+        item.replay_target_sequence
+    else
+        embeddings_view.?.replay_target_sequence;
+    var replay_catch_up_required = if (index_replay_present or embeddings_view == null)
+        item.replay_catch_up_required
+    else
+        embeddings_view.?.replay_catch_up_required;
     const dense_catch_up = async_indexing.dense_catch_up;
     var catch_up_active = item.catch_up_active;
     var catch_up_phase = item.catch_up_phase;
@@ -2228,7 +2343,7 @@ fn appendSingleIndexRuntimeStatus(
             }
         }
     }
-    if (catch_up_active or catch_up_target_sequence > catch_up_applied_sequence) {
+    if (!index_replay_present and (catch_up_active or catch_up_target_sequence > catch_up_applied_sequence)) {
         replay_catch_up_required = true;
         backfill_active = true;
         replay_target_sequence = @max(replay_target_sequence, catch_up_target_sequence);
@@ -2248,15 +2363,20 @@ fn appendSingleIndexRuntimeStatus(
     }
     if (catch_up_active and catch_up_phase == .idle and replay_catch_up_required) catch_up_phase = .replay;
 
-    // An index whose persisted artifacts failed to load is broken, not
-    // rebuilding/warming: report the load error and suppress activity flags
-    // so clients classify it as needing a drop+recreate.
-    const load_error: ?[]const u8 = if (@hasField(@TypeOf(item), "load_error")) item.load_error else null;
+    const repair_state = publicIndexRepairState(item);
+    // A load failure with no durable automatic repair remains a terminal
+    // operator-visible error. Once a repair intent exists, the compact repair
+    // state is authoritative; exposing the quarantined root's raw load error
+    // at the same time would incorrectly tell clients to drop/recreate.
+    const raw_load_error: ?[]const u8 = if (@hasField(@TypeOf(item), "load_error")) item.load_error else null;
+    const load_error: ?[]const u8 = if (repair_state == null) raw_load_error else null;
     if (load_error != null) {
         backfill_active = false;
         catch_up_active = false;
         replay_catch_up_required = false;
         catch_up_phase = .idle;
+    } else if (repair_state) |state| {
+        backfill_active = std.mem.eql(u8, state, "rebuilding") or std.mem.eql(u8, state, "waiting");
     }
 
     try out.append(alloc, '{');
@@ -2292,8 +2412,12 @@ fn appendSingleIndexRuntimeStatus(
     defer alloc.free(progress);
     try out.appendSlice(alloc, progress);
     try out.appendSlice(alloc, ",\"backfill_state\":");
-    if (load_error != null) {
+    if (load_error != null or (repair_state != null and
+        (std.mem.eql(u8, repair_state.?, "paused") or std.mem.eql(u8, repair_state.?, "failed"))))
+    {
         try appendJsonString(alloc, out, "failed");
+    } else if (repair_state != null and std.mem.eql(u8, repair_state.?, "waiting")) {
+        try appendJsonString(alloc, out, "retrying");
     } else {
         try appendJsonString(alloc, out, backfillState(index_type, backfill_active, item.enrichment_failed, replay_applied_sequence, replay_target_sequence, enrichment));
     }
@@ -2302,6 +2426,13 @@ fn appendSingleIndexRuntimeStatus(
         defer alloc.free(msg);
         try out.appendSlice(alloc, ",\"error\":");
         try appendJsonString(alloc, out, msg);
+    }
+    if (repair_state) |state| {
+        try out.appendSlice(alloc, ",\"repair\":{\"state\":");
+        try appendJsonString(alloc, out, state);
+        try out.appendSlice(alloc, ",\"action_required\":");
+        try out.appendSlice(alloc, if (std.mem.eql(u8, state, "paused") or std.mem.eql(u8, state, "failed")) "true" else "false");
+        try out.append(alloc, '}');
     }
     try out.appendSlice(alloc, ",\"doc_count\":");
     try appendIntValue(alloc, out, item.doc_count);
@@ -4290,8 +4421,8 @@ test "single embeddings index encoder keeps backfill active while enrichment rep
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":0.600") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":3") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":5") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"retrying\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"retrying\":true") != null);
 }
@@ -4347,11 +4478,80 @@ test "single embeddings index encoder keeps retrying coverage gaps catch-up cohe
     const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "semantic_idx", &local_status)).?;
     defer std.testing.allocator.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":0.333") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":33") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":0.000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":34") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":34") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"retrying\"") != null);
+}
+
+test "managed embeddings coverage debt does not fabricate replay debt" {
+    const config_json = "{\"type\":\"embeddings\",\"field\":\"semantic_content\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"_coverage_incarnation\":42}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const config_hash = try expectedCoverageConfigHash(std.testing.allocator, "semantic_idx", parsed_config.value);
+
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .doc_count = 6,
+        .node_count = 1,
+        .root_node = 1,
+        .coverage_produced_count = 6,
+        .coverage_skipped_count = 3,
+        .coverage_generation = 42,
+        .coverage_config_hash = config_hash,
+        .coverage_identity_ready = true,
+        .replay_applied_sequence = 12,
+        .replay_target_sequence = 12,
+        .replay_catch_up_required = false,
+        .catch_up_active = false,
+        .catch_up_phase = .idle,
+        .catch_up_applied_sequence = 10,
+        .catch_up_target_sequence = 12,
+    }};
+    var items = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{
+            .source_doc_count = 9,
+            .doc_count = 9,
+            .index_count = 1,
+            .indexes = indexes[0..],
+            .enrichment = .{
+                .enabled = true,
+                .target_sequence = 10,
+                .applied_sequence = 10,
+                .processed_requests = 9,
+                .skipped_source_count = 3,
+            },
+        },
+    }};
+    var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = items[0..] };
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"semantic_idx\":" ++ config_json ++ "}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "semantic_idx", &local_status)).?;
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"policy\":\"strict\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"pending\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"complete\":false") != null);
 }
 
 test "external embeddings index readiness does not require table doc coverage" {

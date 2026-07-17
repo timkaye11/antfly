@@ -194,14 +194,6 @@ pub const Config = struct {
             min_tokens: usize = 64,
             ttl_ms: u64 = 300_000,
         };
-
-        pub const QueryEmbeddingCacheConfig = struct {
-            enabled: bool = true,
-            max_bytes_mb: usize = 64,
-            ttl_ms: u64 = 300_000,
-            max_inflight: usize = 16,
-        };
-
         pub const WarmModelConfig = struct {
             kind: []u8,
             name: []u8,
@@ -231,7 +223,6 @@ pub const Config = struct {
         max_concurrent_requests: ?usize = null,
         kernel_jit: KernelJitConfig = .{},
         prompt_cache: PromptCacheConfig = .{},
-        query_embedding_cache: QueryEmbeddingCacheConfig = .{},
 
         fn deinit(self: *InferenceConfig, alloc: std.mem.Allocator) void {
             if (self.api_url) |value| alloc.free(value);
@@ -616,10 +607,6 @@ pub const Config = struct {
             synthesizing.Registry.init(alloc);
         errdefer text_to_speech.deinit();
 
-        const query_embedding_cache = if (validated.value.inference) |inference|
-            try queryEmbeddingCacheFromOpenApi(inference.query_embedding_cache)
-        else
-            Config.InferenceConfig.QueryEmbeddingCacheConfig{};
         const prompt_cache = if (validated.value.inference) |inference|
             try promptCacheFromOpenApi(inference.prompt_cache)
         else
@@ -668,7 +655,6 @@ pub const Config = struct {
                     null,
                 .kernel_jit = kernel_jit,
                 .prompt_cache = prompt_cache,
-                .query_embedding_cache = query_embedding_cache,
             } else .{},
             .remote_content = if (raw_root.get("remote_content")) |remote_content|
                 try parseRemoteContentConfig(alloc, remote_content)
@@ -1864,22 +1850,6 @@ fn optionalStringArrayField(alloc: std.mem.Allocator, object: std.json.ObjectMap
     return out;
 }
 
-fn queryEmbeddingCacheFromOpenApi(
-    value: ?inference_config_openapi.QueryEmbeddingCacheConfig,
-) !Config.InferenceConfig.QueryEmbeddingCacheConfig {
-    const config = value orelse return .{};
-    const max_bytes_mb = std.math.cast(usize, config.max_bytes_mb orelse 64) orelse return error.InvalidConfig;
-    const ttl_ms = std.math.cast(u64, config.ttl_ms orelse 300_000) orelse return error.InvalidConfig;
-    const max_inflight = std.math.cast(usize, config.max_inflight orelse 16) orelse return error.InvalidConfig;
-    if (max_bytes_mb > 1_048_576 or ttl_ms > 86_400_000 or max_inflight == 0 or max_inflight > 65_536) return error.InvalidConfig;
-    return .{
-        .enabled = config.enabled orelse true,
-        .max_bytes_mb = max_bytes_mb,
-        .ttl_ms = ttl_ms,
-        .max_inflight = max_inflight,
-    };
-}
-
 fn kernelJitFromOpenApi(
     alloc: std.mem.Allocator,
     value: ?inference_config_openapi.KernelJitConfig,
@@ -1932,7 +1902,6 @@ fn promptCacheFromOpenApi(
         .ttl_ms = ttl_ms,
     };
 }
-
 fn parseInferencePreloadModels(
     alloc: std.mem.Allocator,
     raw_inference: ?std.json.Value,
@@ -2189,12 +2158,6 @@ test "common config extracts antfly settings" {
         \\      "min_tokens": 48,
         \\      "ttl_ms": 120000
         \\    },
-        \\    "query_embedding_cache": {
-        \\      "enabled": false,
-        \\      "max_bytes_mb": 128,
-        \\      "ttl_ms": 45000,
-        \\      "max_inflight": 77
-        \\    },
         \\    "preload": [
         \\      { "kind": "generator", "name": "antflydb/gemma-e2b", "backend": "metal", "format": "gguf", "quantization": "q4_k" }
         \\    ],
@@ -2230,10 +2193,6 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqual(@as(usize, 256), cfg.inference.prompt_cache.max_bytes_mb);
     try std.testing.expectEqual(@as(usize, 48), cfg.inference.prompt_cache.min_tokens);
     try std.testing.expectEqual(@as(u64, 120_000), cfg.inference.prompt_cache.ttl_ms);
-    try std.testing.expect(!cfg.inference.query_embedding_cache.enabled);
-    try std.testing.expectEqual(@as(usize, 128), cfg.inference.query_embedding_cache.max_bytes_mb);
-    try std.testing.expectEqual(@as(u64, 45_000), cfg.inference.query_embedding_cache.ttl_ms);
-    try std.testing.expectEqual(@as(usize, 77), cfg.inference.query_embedding_cache.max_inflight);
     try std.testing.expectEqual(@as(usize, 1), cfg.inference.preload.len);
     try std.testing.expectEqualStrings("generator", cfg.inference.preload[0].kind);
     try std.testing.expectEqualStrings("antflydb/gemma-e2b", cfg.inference.preload[0].name);
@@ -2272,34 +2231,6 @@ test "common config parses inference preload" {
     try std.testing.expectEqualStrings("BAAI/bge-reranker", cfg.inference.preload[1].name);
     try std.testing.expectEqualStrings("native", cfg.inference.preload[1].backend.?);
     try std.testing.expectEqualStrings("onnx", cfg.inference.preload[1].format.?);
-}
-
-test "common config rejects out of range query embedding cache policy" {
-    const alloc = std.testing.allocator;
-    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
-        \\{
-        \\  "inference": {
-        \\    "api_url": "http://127.0.0.1:8090",
-        \\    "query_embedding_cache": { "max_bytes_mb": -1 }
-        \\  }
-        \\}
-    ));
-    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
-        \\{
-        \\  "inference": {
-        \\    "api_url": "http://127.0.0.1:8090",
-        \\    "query_embedding_cache": { "ttl_ms": 86400001 }
-        \\  }
-        \\}
-    ));
-    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
-        \\{
-        \\  "inference": {
-        \\    "api_url": "http://127.0.0.1:8090",
-        \\    "query_embedding_cache": { "max_inflight": 0 }
-        \\  }
-        \\}
-    ));
 }
 
 test "common config rejects invalid prompt cache policy" {
@@ -2365,7 +2296,6 @@ test "common config rejects invalid kernel JIT policy" {
         \\}
     ));
 }
-
 test "common config defaults shard scalar fields" {
     const alloc = std.testing.allocator;
     const raw =
@@ -3019,7 +2949,6 @@ test "common config parses minimal config with runtime defaults" {
     try std.testing.expectEqual(@as(usize, 512), cfg.inference.prompt_cache.max_bytes_mb);
     try std.testing.expectEqual(@as(usize, 64), cfg.inference.prompt_cache.min_tokens);
     try std.testing.expectEqual(@as(u64, 300_000), cfg.inference.prompt_cache.ttl_ms);
-    try std.testing.expectEqual(@as(usize, 16), cfg.inference.query_embedding_cache.max_inflight);
 }
 
 test "common config can disable health server" {

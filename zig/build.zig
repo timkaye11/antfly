@@ -1720,6 +1720,13 @@ pub fn build(b: *std.Build) void {
     });
     antfly_imports.configure(b, data_runtime_test_mod, true, true);
 
+    const filesystem_capacity_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/filesystem_capacity_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, filesystem_capacity_test_mod, true, true);
+
     const data_storage_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/data_storage_test_root.zig"),
         .target = target,
@@ -2411,6 +2418,11 @@ pub fn build(b: *std.Build) void {
             "repair job store does not expire future live running heartbeat",
             "table repair job store persists monotonic next id across stale durable writes",
             "table repair job cleanup pages durable expired jobs",
+            "forced index repair job dispatches force only once",
+            "named index repair cancellation remains nonterminal until durable controls finish",
+            "named index repair cancellation restarts its durable traversal after job store recovery",
+            "durable cancellation retries transient failures with backoff",
+            "durable cancellation scan rotates past a backed off head window",
             "api http client maps remote repair cancel unavailable",
             "api http client encodes table name for repair cancel callback",
             "public api routes compile",
@@ -2937,7 +2949,7 @@ pub fn build(b: *std.Build) void {
         "managed embedder deadlines bound provider pacing and transport",
         "managed embedder rejects malformed provider vectors",
         "api http retryable embedding failures provide retry guidance",
-        "api http server applies node query embedding cache policy",
+        "api http server obtains query embedding policy from resource manager",
         "semantic query planning reuses equivalent embeddings",
         "batch parser preserves oversized value errors",
         "batch parser accepts raw payload value under public request cap",
@@ -3315,7 +3327,10 @@ pub fn build(b: *std.Build) void {
 
     const lib_db_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &.{"storage.db.db.test."}),
+        .filters = selectTestFilters(b, &.{
+            "storage.db.db.test.",
+            "io threaded applied callback observes published watermark outside runtime lock",
+        }),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3353,6 +3368,14 @@ pub fn build(b: *std.Build) void {
     serverless_manifest_test_step.dependOn(&run_serverless_manifest_tests.step);
 
     const lib_data_runtime_default_filters = [_][]const u8{
+        "index repair scan periodically rediscovers debt after a lost wake",
+        "index repair lost-wakeup fallback stays bounded at large group counts",
+        "index repair lost-wakeup audit meets rotation target within supported envelope",
+        "index repair fallback advances past a non-local prefix without skipping local debt",
+        "index repair queue retains debt while leadership is temporarily unknown",
+        "index repair queue removes only authoritative non-local ownership",
+        "store capacity reporting preserves the last good observation on probe failure",
+        "data server repair owner cancels and drains through backend runtime",
         "data runtime health metrics include replay debt and provisioned warmup counters",
         "data runtime status refresh publishes synthetic missing status for absent local group db",
         "data runtime status refresh budget preserves fresh cached group status for visible generation",
@@ -3362,6 +3385,10 @@ pub fn build(b: *std.Build) void {
         "data runtime runRound backs off retryable provision metadata failures",
         "data runtime provisioned root refresh worker backs off retryable metadata failures",
         "data runtime data changes mark provisioned startup catch-up dirty",
+        "data runtime repair debt hook targets the affected group queue",
+        "data runtime repair failures preserve durable backoff and increase retry delay",
+        "index repair fallback backoff never blocks an exact durable wake",
+        "data runtime repair queue links and removes debt in constant time",
         "data runtime startup catch-up parks scheduler when only quarantined debt remains",
         "data runtime raft status changes force immediate store status publication",
         "data raft draining leader handoff campaigns preferred serving survivor",
@@ -4019,7 +4046,7 @@ pub fn build(b: *std.Build) void {
             "api http server serves api key and row filter routes",
             "api http server returns json user auth errors",
             "document artifact routes declare read and admin permissions",
-            "api http server marks table repair job failed when background submit is closing",
+            "api http server durably retries table repair job when background submit is closing",
             "api http server serves mcp and a2a protocol surfaces",
             "api http server serves ARD catalogs with public bootstrap and authenticated tenant entries",
             "api http server requires auth for ARD tenant catalog when auth is enabled",
@@ -4452,7 +4479,7 @@ pub fn build(b: *std.Build) void {
             "write cache local mutation preempts stale startup writer",
             "hosted runtime status prefers live writer over stale hosted snapshot",
             "runtime status collection leaves active stale write lease live",
-            "primary lookup adopts seeded write cache across visible generation bump",
+            "resident DB lease adopts seeded write cache across visible generation bump",
             "provisioned write cache close detaches promotion leadership callback before stats",
             "provisioned table write source coalesces same-group waiters",
             "provisioned table write source preserves same-key delete then write across coalesced waiters",
@@ -4465,7 +4492,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table restore lifecycle blocks request admission without blocking foreground structural mutation",
             "provisioned table restore lifecycle reserves forwarded owner and caller sources",
             "provisioned startup catch-up enters through forwarded write owner",
-            "provisioned runtime status inspection waits for structural transition",
+            "provisioned runtime status inspection remains available during structural transition",
             "provisioned read admission enters through forwarded write owner",
             "provisioned table write source drop table waits for active read cache lease",
             "provisioned table write source drop table closes schema-bearing cached writer once",
@@ -4481,6 +4508,9 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up finishes restore repair before terminal index load degradation",
             "table runtime snapshot cache clones stored status",
+            "table runtime snapshot cache rejects a late stale live observation",
+            "table runtime snapshot cache replacement preserves a newer live observation",
+            "provisioned managed replay tails converge and publish without later traffic",
             "provisioned runtime status overlays live writer replay target without republishing stats",
             "provisioned runtime status live replay overlay preserves cold dense visibility refresh",
             "provisioned runtime status live replay overlay clears ambiguous replay-only backfill",
@@ -4506,6 +4536,7 @@ pub fn build(b: *std.Build) void {
             "parseRemoteSearchResult preserves fused index scores",
             "table read distributed sorted merge uses catalog runtime schema and rejects incomplete shard windows",
             "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
+            "provisioned local query reuses resident generation without readonly open",
             "catalog backed router skips non-serving relocation placements",
         },
         .test_runner = .{
@@ -4519,8 +4550,9 @@ pub fn build(b: *std.Build) void {
             "public table batch handler maps doc identity unavailable errors",
             "public table batch handler maps write unavailable errors",
             "public table batch handler maps HA write gate errors",
+            "public table batch handler returns concise dense repair backpressure",
             "public table query handler maps doc identity unavailable errors",
-            "public table query handler preserves embedding failure status",
+            "public table query handler preserves retryable failure status",
             "public table query handler maps HA read gate errors",
             "public table query handler maps unsupported exact sort",
             "public table query handler exposes stable count-only sort rejection reason",
@@ -4579,6 +4611,8 @@ pub fn build(b: *std.Build) void {
             "identical index mutation retries preserve coverage incarnation",
             "derived coverage evaluation is policy exact and observation gated",
             "derived coverage aggregation rejects mixed config observations",
+            "index status exposes compact repair state without internal diagnostics",
+            "index repair aggregation exposes a waiting shard over rebuilding shards",
             "derived coverage aggregation rejects stale index incarnations",
             "derived coverage reasons expose counter mismatch",
             "derived coverage rejects unknown freshness for aggregate and shard views",
@@ -4588,6 +4622,8 @@ pub fn build(b: *std.Build) void {
             "partial coverage embeddings readiness does not mask pending enrichment",
             "derived coverage reasons deduplicate overlapping freshness signals",
             "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery",
+            "single embeddings index encoder keeps retrying coverage gaps catch-up coherent",
+            "managed embeddings coverage debt does not fabricate replay debt",
             "external embeddings index readiness does not require table doc coverage",
             "api http server create index waits for exact target config projection",
         },
@@ -4619,9 +4655,11 @@ pub fn build(b: *std.Build) void {
             "provisioned table write request queues structural reconcile ahead of later writes",
             "queued structural reconcile reserves write admission before its worker starts",
             "provisioned structural reconcile blocks table write admission",
+            "provisioned schema reconcile keeps reads and status available",
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up preserves restore repair debt while index load is terminal",
             "managed startup catch-up allocation failure preserves bounded retry",
+            "provisioned named index repair keeps group queued for aggregate debt audit",
             "dirty table tracking stays bounded to writer cache ownership",
             "writer cache eviction retires dirty ownership after the last cache owner",
             "forwarded write sources use the local writer owner dirty lifecycle",
@@ -4629,6 +4667,7 @@ pub fn build(b: *std.Build) void {
             "HA ownership transition serializes with active writer cache mutation",
             "startup cache clear retires dirty identity without a serving owner",
             "dirty auto bulk writer publishes runtime status without closing the cached writer",
+            "median key lookup reuses startup writer instead of reopening its root",
             "write cache retirement is allocation-free after entry installation",
             "provisioned read cache retirement is allocation-free after entry installation",
         },
@@ -4861,13 +4900,23 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "resource manager observes over-budget external usage",
+            "resource manager evaluates projected admission with configured action",
+            "resource manager bounds soft write throttling without waiting for compaction publication",
+            "resource manager records index repair activation pause separately from cleanup",
+            "catchUpIndex refuses to open an apply window after its deadline",
             "cache reports shared byte usage to resource manager",
+            "lsm backend resource manager throttles projected immutable state",
+            "lsm backend resource manager rejects before wal apply",
             "derived backlog tracker accounts and releases payload bytes",
+            "derived backlog tracker fails closed when sequence accounting allocation fails",
             "hbc shared cache namespaces entries",
             "hbc shared cache evicts across namespaces under one resource budget",
             "hbc cache reports byte usage to resource manager",
             "hbc cache shrinks to resource budget under pressure",
+            "resource-managed mapped residency evicts cold segments and preserves hot mappings",
             "provisioned group storage derives all resource budgets",
+            "resource manager capacity source is immutable after composition",
+            "capacity reservation revalidation fails closed when available space falls",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4875,8 +4924,112 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_resource_budget_tests = b.addRunArtifact(resource_budget_tests);
+    const filesystem_capacity_tests = b.addTest(.{
+        .root_module = filesystem_capacity_test_mod,
+        .filters = &.{"filesystem capacity probe reports the test volume"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_filesystem_capacity_tests = b.addRunArtifact(filesystem_capacity_tests);
+    // Keep the filesystem probe in the default resource-budget lane instead of
+    // adding another concurrently runnable unit-test process. The default unit
+    // graph is intentionally broad, and an extra process here can turn short
+    // listener/storage timing tests into load-dependent failures.
+    run_resource_budget_tests.step.dependOn(&run_filesystem_capacity_tests.step);
     const resource_budget_test_step = b.step("resource-budget-test", "Run storage resource-manager accounting tests");
     resource_budget_test_step.dependOn(&run_resource_budget_tests.step);
+
+    const dense_index_lifecycle_regression_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "index repair state root-generation reset atomically rebinds replacement debt",
+            "index repair state persists intent and provisional replay pin atomically",
+            "db managed operator repair persists intent without running reconstruction inline",
+            "db root generation rollover preserves activated repair debt fail closed",
+            "db repair capacity converts materialized shadow bytes into consumed reservation",
+            "db automatic dense repair bootstraps missing coverage metadata",
+            "db dense artifact rebuild bootstraps missing counter metadata",
+            "db dense artifact rebuild force-resets corrupt external dense structure",
+            "db asynchronous dense replay lag is not classified as repair debt",
+            "db dense artifact rebuild rejects clean checkpoint for stale config identity",
+            "db forced repair attaches to automatic generation intent idempotently",
+            "db forced repair preserves missing-counter fail-closed classification",
+            "db forced dense repair stays fail closed until background health proof",
+            "db forced dense repair keeps structurally invalid generation fail closed",
+            "db quarantined dense bootstrap tracks concurrent insert update and delete",
+            "db dense artifact coverage resets and removes surplus vectors",
+            "db dense shadow activation rejects surplus candidate coverage",
+            "db document artifact child range batch atomically tracks dense artifact counters",
+            "db ttl delete callback atomically removes dense artifacts and updates repair counters",
+            "db replay skips a missing dense artifact after its source document was deleted",
+            "db dense artifact surplus uses quarantined generation replacement",
+            "db dense artifact planner does not let stale status override authoritative counter",
+            "db dense artifact counter bootstrap combines snapshot with concurrent write delta",
+            "db dense artifact counter bootstrap restarts from a fresh snapshot",
+            "db dense artifact counter bootstrap fences stale concurrent attempt",
+            "db malformed quarantined dense config does not block healthy artifact counters",
+            "db dense repair working set scales batch to resource budget",
+            "db dense counter bootstrap admission respects soft background budget",
+            "managed startup catch-up advances counterless incomplete dense repair",
+            "provisioned leader admission rejects uncommitted writes under dense repair pressure",
+            "api maintenance resumes recovered durable named index cancellation without client advance",
+            "bulk publication revalidates admission before every publish window",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_dense_index_lifecycle_regression_tests = b.addRunArtifact(dense_index_lifecycle_regression_tests);
+    const dense_index_repair_job_tests = b.addTest(.{
+        .root_module = api_artifact_reprocess_jobs_test_mod,
+        .filters = &.{
+            "forced index repair job dispatches force only once",
+            "named index repair cancellation remains nonterminal until durable controls finish",
+            "named index repair cancellation restarts its durable traversal after job store recovery",
+            "durable cancellation scan rotates past a backed off head window",
+            "table repair job recovery quarantines corrupt primary without blocking service",
+            "active repair job recovery quarantines malformed secondary entries",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_dense_index_repair_job_tests = b.addRunArtifact(dense_index_repair_job_tests);
+    const dense_index_repair_status_tests = b.addTest(.{
+        .root_module = api_derived_coverage_test_mod,
+        .filters = &.{"index status exposes compact repair state without internal diagnostics"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_dense_index_repair_status_tests = b.addRunArtifact(dense_index_repair_status_tests);
+    const dense_index_repair_runtime_tests = b.addTest(.{
+        .root_module = data_runtime_test_mod,
+        .filters = &.{
+            "data runtime repair debt hook targets the affected group queue",
+            "data runtime repair failures preserve durable backoff and increase retry delay",
+            "index repair fallback backoff never blocks an exact durable wake",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_dense_index_repair_runtime_tests = b.addRunArtifact(dense_index_repair_runtime_tests);
+    const dense_index_lifecycle_regression_step = b.step(
+        "dense-index-lifecycle-regression-test",
+        "Run focused durable dense-index repair and admission regressions",
+    );
+    dense_index_lifecycle_regression_step.dependOn(&run_dense_index_lifecycle_regression_tests.step);
+    dense_index_lifecycle_regression_step.dependOn(&run_dense_index_repair_job_tests.step);
+    dense_index_lifecycle_regression_step.dependOn(&run_dense_index_repair_status_tests.step);
+    dense_index_lifecycle_regression_step.dependOn(&run_dense_index_repair_runtime_tests.step);
+    unit_test_step.dependOn(&run_dense_index_lifecycle_regression_tests.step);
 
     const sim_test_step = b.step("sim-test", "Run mocked-time Antfly simulation suites");
     sim_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
@@ -5654,10 +5807,33 @@ pub fn build(b: *std.Build) void {
     const derived_log_test_step = b.step("derived-log-test", "Run storage/db/derived/derived_log unit tests");
     derived_log_test_step.dependOn(&run_derived_log_unit_tests.step);
 
+    // `root-test`, `lib-storage-test`, and `lib-metadata-test` are useful
+    // focused aliases, but all compile the same root module. Use one
+    // union-filtered artifact in the default aggregate so an overlapping test
+    // is executed only once.
+    const unit_root_default_filters = lib_unit_default_filters ++ lib_storage_default_filters ++ [_][]const u8{"metadata."};
+    const unit_root_filters = selectTestFilters(b, &unit_root_default_filters);
+    const unit_root_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = unit_root_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_unit_root_tests = b.addRunArtifact(unit_root_tests);
+    addRuntimeTestFilters(run_unit_root_tests, unit_root_filters);
+    for (root_test_skip_filters) |filter| {
+        run_unit_root_tests.addArgs(&.{ "--skip-test-filter", filter });
+    }
+
     // Default Antfly unit coverage is hermetic: no network fetchers, no
     // benchmarks, and no soak/conformance suites that require external corpora.
-    // Focused aliases stay available as separate steps; broader module suites
-    // are wired here once.
+    // The root storage suite already discovers LMDB, docstore, shard, WAL,
+    // persistent, index-manager, DB, and derived-log tests. Do not also wire
+    // their focused aliases into this aggregate: Zig discovers imported tests
+    // transitively, so doing both ran the same test in as many as three test
+    // binaries. The focused aliases remain available for direct invocation.
     dependOnAll(unit_test_step, &.{
         &run_lib_json_tests.step,
         &run_lib_onnx_tests.step,
@@ -5665,21 +5841,8 @@ pub fn build(b: *std.Build) void {
         &run_httpx_tests.step,
         &run_api_json_helpers_tests.step,
         &run_antfly_client_pkg_tests.step,
-        &run_lib_unit_tests.step,
-        &run_lib_metadata_tests.step,
-        &run_lib_storage_tests.step,
-        &run_lsm_backend_tests.step,
-        &run_resource_budget_tests.step,
-        &run_lmdb_unit_tests.step,
-        &run_storage_lmdb_unit_tests.step,
-        &run_docstore_unit_tests.step,
-        &run_shard_unit_tests.step,
-        &run_wal_unit_tests.step,
-        &run_persistent_unit_tests.step,
-        &run_index_manager_unit_tests.step,
-        &run_db_unit_tests.step,
+        &run_unit_root_tests.step,
         &run_sparse_unit_tests.step,
-        &run_derived_log_unit_tests.step,
     });
 
     const lmdb_bench_engine_options_c = makeLmdbBuildOptions(b, .c, false, false);
@@ -6349,6 +6512,81 @@ pub fn build(b: *std.Build) void {
     });
     const install_search_benchmark_query = b.addInstallArtifact(search_benchmark_query, .{});
 
+    const search_benchmark_common_test_mod = b.createModule(.{
+        .root_source_file = b.path("bench/full_text/search_benchmark_common.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    search_benchmark_common_test_mod.addImport("antfly-zig", lib_mod);
+    const search_benchmark_common_tests = b.addTest(.{
+        .root_module = search_benchmark_common_test_mod,
+    });
+    const run_search_benchmark_common_tests = b.addRunArtifact(search_benchmark_common_tests);
+    const search_bench_test_step = b.step("search-bench-test", "Run search benchmark grammar and protocol tests");
+    search_bench_test_step.dependOn(&run_search_benchmark_common_tests.step);
+
+    const search_performance_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "search bool conjunction query",
+            "search bool should-only query",
+            "streaming boolean scorer matches all-hit reference on randomized corpus",
+            "search pure bool should uses WAND top-k",
+            "search term phrase uses exact positional BM25 top-k",
+            "streaming phrase scorer matches randomized positional reference",
+            "phrase filter exact adjacency",
+            "phrase filter with slop",
+            "PostingsIterator positional seek decodes only selected records",
+            "PostingsIterator deferred positional seek decodes only accepted candidates",
+            "PostingsIterator streams deferred grouped positions without scratch arrays",
+            "production reader rejects branch-only v24-v37 formats",
+            "v12 positions are bit-packed smaller than raw u32",
+            "v12 reads back positions with wide packed deltas",
+            "current one posting block retains one global impact bound",
+            "v29 impact frequency escape remains a conservative upper bound",
+            "v29 adaptive impact IDs use runs and round-trip",
+            "v29 one-payload-block postings omit sparse impact range IDs",
+            "v30 contiguous grouped positions retain direct document round-trip",
+            "v31 inline single-document postings retain frequency positions and direct iteration",
+            "v32 posting-count metadata derives chunk ordinal and document count",
+            "v33 constant-frequency blocks omit packed frequency payload",
+            "v34 five-bit impact frequencies are conservative upper bounds",
+            "v35 full posting blocks use portable vertical BP128 for docs and frequencies",
+            "portable vertical BP128 round-trips every bit width",
+            "portable vertical BP128 fuses document delta prefix sums",
+            "PostingsIterator advanceTo uses sparse skip data for long postings",
+            "current reader reopens origin-main v23 postings and block-max layout",
+            "index-only stored fields preserve ordinals key ranges and merges",
+            "v25 field norms match Tantivy quantization",
+            "BM25 term scorer retains query-invariant arithmetic",
+            "BM25 bound table matches packed impact and norm domains",
+            "snapshot BM25 bound table cache is reused and bounded",
+            "v25 norm table uses one byte per document and reads legacy packed norms",
+            "v22 term dictionary block values compact one-hit terms and delta postings offsets",
+            "v23 term dictionary stores front-coded blocks indexed by block ceiling",
+            "WAND pivot bound remains conservative across later high-impact blocks",
+            "single-term block scan preserves a later higher-impact chunk",
+            "single-term equality pruning retains earliest cutoff ties",
+            "pure conjunction block pruning retains earliest cutoff ties",
+            "pure conjunction metadata scan preserves later competitive block",
+            "multi-segment filter execution",
+            "multi-segment search merges per-segment top-k globally",
+            "fragmented snapshot retains segment bound pruning",
+            "bool fallback applies native doc number constraints",
+            "db text kernel search matches projected search without stored bodies",
+            "split preserves postings when text segments omit source bodies",
+            "background text stats use postings when segment source is omitted",
+            "text score query exposes score top k sort profile",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_search_performance_tests = b.addRunArtifact(search_performance_tests);
+    const search_performance_test_step = b.step("search-performance-test", "Run focused full-text scorer regression tests");
+    search_performance_test_step.dependOn(&run_search_performance_tests.step);
+
     const search_benchmark_codec_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/search_benchmark_codec_bench.zig"),
         .target = target,
@@ -6367,6 +6605,37 @@ pub fn build(b: *std.Build) void {
     }
     const search_bench_codec_step = b.step("search-bench-codec-bench", "Benchmark StreamVByte codec used by search postings");
     search_bench_codec_step.dependOn(&run_search_benchmark_codec_bench.step);
+
+    const search_benchmark_bitpack_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/full_text/search_benchmark_bitpack_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    search_benchmark_bitpack_bench_mod.addImport("antfly-zig", lib_mod);
+    const search_benchmark_bitpack_bench = b.addExecutable(.{
+        .name = "search_benchmark_bitpack_bench",
+        .root_module = search_benchmark_bitpack_bench_mod,
+    });
+    const install_search_benchmark_bitpack_bench = b.addInstallArtifact(search_benchmark_bitpack_bench, .{});
+    const run_search_benchmark_bitpack_bench = b.addRunArtifact(search_benchmark_bitpack_bench);
+    if (b.args) |args| run_search_benchmark_bitpack_bench.addArgs(args);
+    const search_bench_bitpack_step = b.step("search-bench-bitpack-bench", "Benchmark portable Zig vector BP128 against horizontal bit packing");
+    search_bench_bitpack_step.dependOn(&run_search_benchmark_bitpack_bench.step);
+
+    const search_impact_layout_analyze_mod = b.createModule(.{
+        .root_source_file = b.path("bench/full_text/search_impact_layout_analyze.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    search_impact_layout_analyze_mod.addImport("antfly-zig", lib_mod);
+    const search_impact_layout_analyze = b.addExecutable(.{
+        .name = "search_impact_layout_analyze",
+        .root_module = search_impact_layout_analyze_mod,
+    });
+    const run_search_impact_layout_analyze = b.addRunArtifact(search_impact_layout_analyze);
+    if (b.args) |args| run_search_impact_layout_analyze.addArgs(args);
+    const search_impact_layout_analyze_step = b.step("search-impact-layout-analyze", "Project exact adaptive impact-column density for segment files");
+    search_impact_layout_analyze_step.dependOn(&run_search_impact_layout_analyze.step);
 
     const wand_skip_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/wand_skip_bench.zig"),
@@ -6389,6 +6658,7 @@ pub fn build(b: *std.Build) void {
     search_bench_build_step.dependOn(&install_search_benchmark_index.step);
     search_bench_build_step.dependOn(&install_search_benchmark_query.step);
     search_bench_build_step.dependOn(&install_search_benchmark_codec_bench.step);
+    search_bench_build_step.dependOn(&install_search_benchmark_bitpack_bench.step);
 
     const storage_fixture_promote_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/storage_fixture_promote.zig"),

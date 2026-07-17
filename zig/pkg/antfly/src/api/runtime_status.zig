@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const db_mod = @import("../storage/db/mod.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 
@@ -59,6 +59,10 @@ pub const RuntimeStatusMetadata = struct {
 
 pub const LocalTableRuntimeStatus = struct {
     group_id: u64 = 0,
+    // Internal ordering for concurrent observations of one live DB. This is
+    // deliberately separate from metadata.status_generation, which identifies
+    // externally published store snapshots.
+    cache_observation_generation: u64 = 0,
     metadata: RuntimeStatusMetadata = .{},
     disk_bytes: u64 = 0,
     created_at_millis: u64 = 0,
@@ -73,6 +77,7 @@ pub const LocalTableRuntimeStatus = struct {
     pub fn clone(self: *const @This(), alloc: std.mem.Allocator) !@This() {
         return .{
             .group_id = self.group_id,
+            .cache_observation_generation = self.cache_observation_generation,
             .metadata = self.metadata,
             .disk_bytes = self.disk_bytes,
             .created_at_millis = self.created_at_millis,
@@ -155,6 +160,7 @@ pub const TableRuntimeSummary = struct {
 pub const TableRuntimeSnapshotCache = struct {
     alloc: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
+    next_observation_generation: std.atomic.Value(u64) = .init(1),
     entries: std.ArrayListUnmanaged(TableRuntimeSnapshot) = .empty,
 
     pub fn init(alloc: std.mem.Allocator) @This() {
@@ -193,6 +199,7 @@ pub const TableRuntimeSnapshotCache = struct {
         for (new_entries.items) |*entry| {
             for (entry.statuses.items) |*status| {
                 status.withMetadataDefaults(.background_refresh, now_ns);
+                self.preserveNewerObservedStatusLocked(entry.table_name, status) catch {};
                 self.preserveCachedStatusForSyntheticPlaceholderLocked(entry.table_name, status, now_ns) catch {};
             }
         }
@@ -226,6 +233,7 @@ pub const TableRuntimeSnapshotCache = struct {
         for (new_entries.items) |*entry| {
             for (entry.statuses.items) |*status| {
                 status.withMetadataDefaults(.background_refresh, now_ns);
+                self.preserveNewerObservedStatusLocked(entry.table_name, status) catch {};
                 self.preserveCachedStatusForSyntheticPlaceholderLocked(entry.table_name, status, now_ns) catch {};
             }
         }
@@ -301,6 +309,51 @@ pub const TableRuntimeSnapshotCache = struct {
         try self.upsertGroupStatusInEntries(&self.entries, table_name, status);
     }
 
+    pub fn beginStatusObservation(self: *@This()) u64 {
+        return self.next_observation_generation.fetchAdd(1, .monotonic);
+    }
+
+    pub fn upsertObservedGroupStatus(
+        self: *@This(),
+        table_name: []const u8,
+        status: LocalTableRuntimeStatus,
+        observation_generation: u64,
+    ) !bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.newerObservationAlreadyPublishedLocked(table_name, status.group_id, observation_generation)) return false;
+        var owned = status;
+        owned.cache_observation_generation = observation_generation;
+        owned.withMetadataDefaults(.live_writer_publish, platform_time.monotonicNs());
+        try self.upsertGroupStatusInEntries(&self.entries, table_name, owned);
+        return true;
+    }
+
+    pub fn upsertObservedGroupStatusPreservingMetadata(
+        self: *@This(),
+        table_name: []const u8,
+        status: LocalTableRuntimeStatus,
+        observation_generation: u64,
+    ) !bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.newerObservationAlreadyPublishedLocked(table_name, status.group_id, observation_generation)) return false;
+        var owned = status;
+        owned.cache_observation_generation = observation_generation;
+        try self.upsertGroupStatusInEntries(&self.entries, table_name, owned);
+        return true;
+    }
+
+    fn newerObservationAlreadyPublishedLocked(
+        self: *@This(),
+        table_name: []const u8,
+        group_id: u64,
+        observation_generation: u64,
+    ) bool {
+        const existing = self.findGroupStatusLocked(table_name, group_id) orelse return false;
+        return existing.cache_observation_generation > observation_generation;
+    }
+
     fn upsertGroupStatusLocked(self: *@This(), table_name: []const u8, status: LocalTableRuntimeStatus) !void {
         try self.upsertGroupStatusInEntries(&self.entries, table_name, status);
     }
@@ -358,6 +411,27 @@ pub const TableRuntimeSnapshotCache = struct {
         errdefer merged.deinit(self.alloc);
         status.deinit(self.alloc);
         status.* = merged;
+    }
+
+    fn preserveNewerObservedStatusLocked(
+        self: *@This(),
+        table_name: []const u8,
+        status: *LocalTableRuntimeStatus,
+    ) !void {
+        // A background refresh first snapshots this cache, performs metadata
+        // work without the cache mutex, then replaces the cache wholesale. A
+        // worker can publish a newer live DB observation during that gap. Only
+        // compare non-zero generations: zero denotes an independent remote or
+        // synthetic observation, which must remain free to replace retired
+        // local-writer state.
+        if (status.cache_observation_generation == 0) return;
+        const previous = self.findGroupStatusLocked(table_name, status.group_id) orelse return;
+        if (previous.cache_observation_generation <= status.cache_observation_generation) return;
+
+        var cloned = try previous.clone(self.alloc);
+        errdefer cloned.deinit(self.alloc);
+        status.deinit(self.alloc);
+        status.* = cloned;
     }
 
     fn findGroupStatusLocked(
@@ -824,6 +898,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         for (indexes[0..initialized]) |item| {
             alloc.free(item.name);
             if (item.load_error) |value| alloc.free(value);
+            if (item.index_repair_last_error) |value| alloc.free(value);
             if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
             if (item.algebraic_last_error_reason) |value| alloc.free(value);
             if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
@@ -875,6 +950,11 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         else
             null;
         errdefer if (load_error) |value| alloc.free(value);
+        const index_repair_last_error = if (item.index_repair_last_error) |value|
+            try alloc.dupe(u8, value)
+        else
+            null;
+        errdefer if (index_repair_last_error) |value| alloc.free(value);
         const algebraic_last_error_doc_key = if (item.algebraic_last_error_doc_key) |value|
             try alloc.dupe(u8, value)
         else
@@ -985,6 +1065,19 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .repair_summary_ready = item.repair_summary_ready,
             .repair_issue_count_estimated = item.repair_issue_count_estimated,
             .repair_scan_issue_count = item.repair_scan_issue_count,
+            .index_repair_id = item.index_repair_id,
+            .index_repair_trigger = item.index_repair_trigger,
+            .index_repair_phase = item.index_repair_phase,
+            .index_repair_automation = item.index_repair_automation,
+            .index_repair_attempts = item.index_repair_attempts,
+            .index_repair_started_at_ms = item.index_repair_started_at_ms,
+            .index_repair_updated_at_ms = item.index_repair_updated_at_ms,
+            .index_repair_build_floor_sequence = item.index_repair_build_floor_sequence,
+            .index_repair_applied_sequence = item.index_repair_applied_sequence,
+            .index_repair_target_sequence = item.index_repair_target_sequence,
+            .index_repair_next_retry_at_ms = item.index_repair_next_retry_at_ms,
+            .index_repair_last_error = index_repair_last_error,
+            .index_repair_wait_reason = item.index_repair_wait_reason,
             .projection_checkpoint_status = item.projection_checkpoint_status,
             .projection_checkpoint_applied_sequence = item.projection_checkpoint_applied_sequence,
             .projection_checkpoint_generation = item.projection_checkpoint_generation,
@@ -1764,6 +1857,65 @@ test "table runtime snapshot cache allows dense visibility decrease with newer a
     try std.testing.expectEqual(@as(u64, 24_999), docs.items[0].stats.indexes[0].doc_count);
     try std.testing.expectEqual(@as(u64, 101), docs.items[0].stats.indexes[0].replay_applied_sequence);
     try std.testing.expectEqual(@as(u64, 101), docs.items[0].stats.indexes[0].replay_target_sequence);
+}
+
+test "table runtime snapshot cache rejects a late stale live observation" {
+    var cache = TableRuntimeSnapshotCache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    const stale_observation = cache.beginStatusObservation();
+    const current_observation = cache.beginStatusObservation();
+
+    const current = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .stats = .{ .doc_count = 12 },
+    };
+    try std.testing.expect(try cache.upsertObservedGroupStatus("docs", current, current_observation));
+
+    const stale = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .stats = .{ .doc_count = 10 },
+    };
+    try std.testing.expect(!try cache.upsertObservedGroupStatus("docs", stale, stale_observation));
+
+    var docs = (try cache.snapshot(std.testing.allocator, "docs")).?;
+    defer docs.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 12), docs.items[0].stats.doc_count);
+    try std.testing.expectEqual(current_observation, docs.items[0].cache_observation_generation);
+}
+
+test "table runtime snapshot cache replacement preserves a newer live observation" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    const stale_observation = cache.beginStatusObservation();
+    const stale = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .stats = .{ .doc_count = 10 },
+    };
+    try std.testing.expect(try cache.upsertObservedGroupStatus("docs", stale, stale_observation));
+
+    // Model a refresh that cloned generation 1, then released the cache lock.
+    const replacement = try alloc.alloc(TableRuntimeSnapshot, 1);
+    replacement[0] = .{
+        .table_name = try alloc.dupe(u8, "docs"),
+        .statuses = .{ .items = try alloc.alloc(LocalTableRuntimeStatus, 1) },
+    };
+    replacement[0].statuses.items[0] = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+
+    const current_observation = cache.beginStatusObservation();
+    const current = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .stats = .{ .doc_count = 12 },
+    };
+    try std.testing.expect(try cache.upsertObservedGroupStatus("docs", current, current_observation));
+
+    cache.replaceOwned(replacement);
+    var docs = (try cache.snapshot(alloc, "docs")).?;
+    defer docs.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 12), docs.items[0].stats.doc_count);
+    try std.testing.expectEqual(current_observation, docs.items[0].cache_observation_generation);
 }
 
 test "cached replay sequence alone is not a runtime fact" {

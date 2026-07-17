@@ -92,7 +92,6 @@ pub const Config = struct {
     content_security: ?antfly_scraping_openapi.ContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?antfly_s3_openapi.Credentials = null,
-    query_embedding_cache: ?QueryEmbeddingCacheConfig = null,
     /// Legacy compatibility field. The current Zig inference runtime does not unload idle models from this setting; configuring it has no effect.
     keep_alive: ?[]const u8 = null,
     /// Legacy compatibility field. The current Zig inference runtime does not evict loaded models from this setting; configuring it has no effect.
@@ -722,18 +721,6 @@ pub const PromptCacheConfig = struct {
     min_tokens: ?i64 = null,
     /// Idle time-to-live for prompt KV cache entries. Refreshed on every cache hit, so only entries left unused for this duration expire.
     ttl_ms: ?i64 = null,
-};
-
-/// Process-local cache for dense query embeddings. Cache lookup and singleflight happen before provider pacing and local inference queueing. Entries are isolated by the server-derived security domain and effective embedding operation. Templated and multimodal queries bypass retention and singleflight but share the max_inflight provider admission bound.
-pub const QueryEmbeddingCacheConfig = struct {
-    /// Enable query embedding result caching and concurrent miss coalescing. Provider admission control remains active when false.
-    enabled: ?bool = null,
-    /// Maximum retained cache memory in MiB. Set to 0 for singleflight without result retention.
-    max_bytes_mb: ?i64 = null,
-    /// Idle expiration in milliseconds. Cache hits refresh the expiry time.
-    ttl_ms: ?i64 = null,
-    /// Maximum query embedding provider computations in flight, including uncached templated and multimodal requests. Existing-key waiters continue to coalesce when this limit is reached. The conservative default bounds transient memory before provider responses are decoded; raise it only after measuring provider and node capacity.
-    max_inflight: ?i64 = null,
 };
 
 pub const ReadRequest = struct {

@@ -62,7 +62,7 @@ const asset_producer_mod = @import("../storage/db/enrichment/asset_producer.zig"
 const distributed_txn = @import("distributed_txn.zig");
 const build_options = @import("build_options");
 const tracing = @import("../tracing/mod.zig");
-const platform_time = @import("../platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 const Io = std.Io;
 
 var txn_id_nonce: std.atomic.Value(u64) = .init(0);
@@ -313,6 +313,7 @@ fn mergeArtifactRepairResult(dst: *db_mod.types.ArtifactRepairResult, src: db_mo
     dst.in_progress += src.in_progress;
     dst.indexes_rebuilt += src.indexes_rebuilt;
     dst.indexes_degraded += src.indexes_degraded;
+    dst.controls_applied += src.controls_applied;
     dst.debt_remaining = dst.debt_remaining or src.debt_remaining;
 }
 
@@ -359,8 +360,11 @@ fn artifactRepairRunRequestForShard(
         .limit = limit,
         .cursor = cursor,
         .force = req.force,
+        .control = req.control,
+        .repair_id = req.repair_id,
         .repair_job_id = req.repair_job_id,
         .repair_attempt_id = req.repair_attempt_id,
+        .repair_job_created_at_ms = req.repair_job_created_at_ms,
         .repair_cancel_base_uri = req.repair_cancel_base_uri,
     };
 }
@@ -373,8 +377,11 @@ test "artifact repair shard run request preserves repair target" {
         .limit = 10,
         .cursor = "idx_b",
         .force = true,
+        .control = .pause_automatic,
+        .repair_id = 99,
         .repair_job_id = 42,
         .repair_attempt_id = 7,
+        .repair_job_created_at_ms = 1234,
         .repair_cancel_base_uri = "http://node-a",
     }, 2, "idx_c");
 
@@ -384,8 +391,11 @@ test "artifact repair shard run request preserves repair target" {
     try std.testing.expectEqual(@as(u32, 2), shard_req.limit);
     try std.testing.expectEqualStrings("idx_c", shard_req.cursor.?);
     try std.testing.expect(shard_req.force);
+    try std.testing.expectEqual(db_mod.types.IndexRepairControl.pause_automatic, shard_req.control.?);
+    try std.testing.expectEqual(@as(u128, 99), shard_req.repair_id.?);
     try std.testing.expectEqual(@as(u64, 42), shard_req.repair_job_id.?);
     try std.testing.expectEqual(@as(u64, 7), shard_req.repair_attempt_id.?);
+    try std.testing.expectEqual(@as(u64, 1234), shard_req.repair_job_created_at_ms.?);
     try std.testing.expectEqualStrings("http://node-a", shard_req.repair_cancel_base_uri.?);
 }
 
@@ -1643,6 +1653,20 @@ pub const ProvisionedTableWriteCache = struct {
             return self.leaseEntryLocked(entry);
         }
         return null;
+    }
+
+    fn groupDenseRepairWriteBackpressuredLocked(
+        self: *const ProvisionedTableWriteCache,
+        group_id: u64,
+        table_name: []const u8,
+    ) bool {
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id) continue;
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (!self.entryHAWriteGateCurrent(entry)) continue;
+            return entry.db.denseRepairWriteBackpressured();
+        }
+        return false;
     }
 
     fn publishCachedLeaseGeneration(
@@ -4315,16 +4339,39 @@ pub const ProvisionedTableWriteSource = struct {
         quarantined: bool = false,
         quarantine_retry_scheduled: bool = false,
         retry_at_ms: u64 = 0,
+        index_repair_pending: bool = false,
+        index_repair_attempted: bool = false,
+        index_repair_repaired: bool = false,
+        index_repair_disk_wait: bool = false,
+        index_repair_retry_at_ms: u64 = 0,
     };
 
     pub const LocalChangeKind = enum {
         data,
+        index_repair,
         structural,
     };
 
     pub const LocalChangeHook = struct {
         ptr: *anyopaque,
         on_change: *const fn (ptr: *anyopaque, table_name: []const u8, kind: LocalChangeKind) void,
+    };
+
+    pub const LocalIndexRepairDebtAction = enum {
+        enqueue,
+        remove,
+        cancel,
+        clear_cancel,
+    };
+
+    pub const LocalIndexRepairDebtHook = struct {
+        ptr: *anyopaque,
+        on_change: *const fn (
+            ptr: *anyopaque,
+            table_name: []const u8,
+            group_id: u64,
+            action: LocalIndexRepairDebtAction,
+        ) void,
     };
 
     const StructuralReconcileRequest = struct {
@@ -4376,6 +4423,7 @@ pub const ProvisionedTableWriteSource = struct {
     structural_reconcile_tables: std.ArrayListUnmanaged(StructuralReconcileRequest) = .empty,
     runtime_status_cache: ?*runtime_status.TableRuntimeSnapshotCache = null,
     local_change_hook: ?LocalChangeHook = null,
+    local_index_repair_debt_hook: ?LocalIndexRepairDebtHook = null,
     raft_batcher: ?RaftBatcher = null,
     local_write_owner: ?*ProvisionedTableWriteSource = null,
     seed_create_table_writers: bool = true,
@@ -4406,6 +4454,11 @@ pub const ProvisionedTableWriteSource = struct {
         table_request_active: usize = 0,
         read_request_active: usize = 0,
         operation_active: bool = false,
+        // A schema/index backfill mutates only its unpublished target index.
+        // Reads routed to the retained read-schema generation may therefore
+        // share the resident DB while that operation is active. Ordinary
+        // writes, restores, and generation changes remain read-exclusive.
+        operation_allows_reads: bool = false,
         structural_active: bool = false,
         structural_reconcile_active: bool = false,
         structural_reconcile_queued: usize = 0,
@@ -4874,6 +4927,51 @@ pub const ProvisionedTableWriteSource = struct {
         return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else table_reads.backend_current_root_generation;
     }
 
+    /// Activation fence for long-running owner-side repair work. This is
+    /// intentionally narrower than exposing the generation source itself.
+    pub fn visibleRootGenerationForRepair(self: *const ProvisionedTableWriteSource, group_id: u64) u64 {
+        if (self.local_write_owner) |owner| return owner.visibleRootGenerationForRepair(group_id);
+        return self.visibleRootGeneration(group_id);
+    }
+
+    /// Leader-side admission for writes that have not yet entered Raft. Once a
+    /// batch is committed it must apply on every replica, so replicated apply
+    /// deliberately bypasses this gate. The resource check keeps the ordinary
+    /// proposal path allocation-free and avoids touching the writer cache until
+    /// the node is actually under hard replay/backlog pressure.
+    pub fn preflightDenseRepairWriteAdmission(
+        self: *ProvisionedTableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+    ) !void {
+        if (self.local_write_owner) |owner| return owner.preflightDenseRepairWriteAdmission(group_id, table_name);
+
+        const write_manager = if (self.write_cache) |cache| cache.resource_manager else null;
+        const startup_manager = if (self.startup_write_cache) |cache| cache.resource_manager else null;
+        const write_cache_hard = if (write_manager) |manager| manager.denseRepairReplayPressureIsHard() else false;
+        const startup_cache_hard = if (startup_manager) |manager|
+            if (write_manager != null and manager == write_manager.?)
+                write_cache_hard
+            else
+                manager.denseRepairReplayPressureIsHard()
+        else
+            false;
+        if (!write_cache_hard and !startup_cache_hard) return;
+
+        lockAtomic(&self.local_db_mutex);
+        defer self.local_db_mutex.unlock();
+        if (write_cache_hard) {
+            if (self.write_cache.?.groupDenseRepairWriteBackpressuredLocked(group_id, table_name)) {
+                return error.DenseRepairBackpressure;
+            }
+        }
+        if (startup_cache_hard) {
+            if (self.startup_write_cache.?.groupDenseRepairWriteBackpressuredLocked(group_id, table_name)) {
+                return error.DenseRepairBackpressure;
+            }
+        }
+    }
+
     fn droppedTableDeleteOwnerId(self: *ProvisionedTableWriteSource, runtime: *db_mod.background_runtime.BackendRuntime) u64 {
         if (self.dropped_table_delete_owner_id == 0) {
             self.dropped_table_delete_owner_id = runtime.allocOwnerId();
@@ -4950,6 +5048,15 @@ pub const ProvisionedTableWriteSource = struct {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (entry.group_id == null) continue;
             if (entry.operation_active) return true;
+        }
+        return false;
+    }
+
+    fn hasAnyReadBlockingGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
+        for (self.active_table_activities.items) |entry| {
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.group_id == null) continue;
+            if (entry.operation_active and !entry.operation_allows_reads) return true;
         }
         return false;
     }
@@ -5089,7 +5196,7 @@ pub const ProvisionedTableWriteSource = struct {
                     continue;
                 }
             }
-            if (self.hasAnyActiveGroupOperationLocked(table_name)) {
+            if (self.hasAnyReadBlockingGroupOperationLocked(table_name)) {
                 self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                 continue;
             }
@@ -5104,7 +5211,13 @@ pub const ProvisionedTableWriteSource = struct {
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
-                if (entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) {
+                // Status is served from an immutable published snapshot while
+                // structural work is active. It is observational and must not
+                // make schema metadata projection or a long index backfill an
+                // availability fence. Restore preparation is different: it
+                // may replace the complete root and has no stable snapshot
+                // contract until the lifecycle reservation completes.
+                if (entry.restore_preparations > 0) {
                     self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
                     continue;
                 }
@@ -5149,6 +5262,7 @@ pub const ProvisionedTableWriteSource = struct {
             }
             const entry = self.activityEntryLocked(table_name, group_id);
             entry.operation_active = true;
+            entry.operation_allows_reads = false;
             return;
         }
     }
@@ -5164,6 +5278,21 @@ pub const ProvisionedTableWriteSource = struct {
         }
         const entry = self.activityEntryLocked(table_name, group_id);
         entry.operation_active = true;
+        entry.operation_allows_reads = false;
+        return true;
+    }
+
+    fn tryBeginReadCompatibleGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
+        if (self.findTableActivityLocked(table_name, null)) |index| {
+            const entry = self.active_table_activities.items[index];
+            if (entry.structural_active or entry.restore_preparations > 0) return false;
+        }
+        if (self.findTableActivityLocked(table_name, group_id)) |index| {
+            if (self.active_table_activities.items[index].operation_active) return false;
+        }
+        const entry = self.activityEntryLocked(table_name, group_id);
+        entry.operation_active = true;
+        entry.operation_allows_reads = true;
         return true;
     }
 
@@ -5172,6 +5301,7 @@ pub const ProvisionedTableWriteSource = struct {
         const index = self.findTableActivityLocked(table_name, group_id) orelse unreachable;
         std.debug.assert(self.active_table_activities.items[index].operation_active);
         self.active_table_activities.items[index].operation_active = false;
+        self.active_table_activities.items[index].operation_allows_reads = false;
         self.pruneTableActivityLocked(table_name, group_id);
         self.table_activity_ready.broadcast(io);
     }
@@ -5367,6 +5497,13 @@ pub const ProvisionedTableWriteSource = struct {
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         return self.tryBeginGroupOperationLocked(table_name, group_id);
+    }
+
+    fn tryBeginReadCompatibleGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        return self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id);
     }
 
     fn endGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
@@ -6132,6 +6269,14 @@ pub const ProvisionedTableWriteSource = struct {
         // resolution workers started by this open drain the same backlog
         // asynchronously instead.
         if (mode != .default_async) try cached.db.drainResolverBackfill();
+        // DB.open starts and resumes derived workers before the cache can
+        // attach its provisioned visibility hook. A short persisted replay
+        // tail can therefore finish during open and miss the post-watermark
+        // callback entirely. Seed the status cache once after hook attachment;
+        // later watermark advances continue to publish through the hook.
+        if (mode == .default or mode == .default_async) {
+            _ = self.publishManagedRuntimeStatusBestEffort(table_name, group_id, cached.db);
+        }
         return cached;
     }
 
@@ -6184,6 +6329,10 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn setLocalChangeHook(self: *ProvisionedTableWriteSource, hook: ?LocalChangeHook) void {
         self.local_change_hook = hook;
+    }
+
+    pub fn setLocalIndexRepairDebtHook(self: *ProvisionedTableWriteSource, hook: ?LocalIndexRepairDebtHook) void {
+        self.local_index_repair_debt_hook = hook;
     }
 
     fn invalidateReadCache(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
@@ -6295,6 +6444,7 @@ pub const ProvisionedTableWriteSource = struct {
         db: *db_mod.DB,
     ) bool {
         const snapshot_cache = self.runtime_status_cache orelse return false;
+        const observation_generation = snapshot_cache.beginStatusObservation();
         var status = (snapshot_cache.snapshotGroupStatus(snapshot_cache.alloc, table_name, group_id) catch |err| {
             std.log.warn("managed runtime status cached snapshot lookup failed table={s} group_id={} err={s}", .{
                 table_name,
@@ -6306,7 +6456,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer status.deinit(snapshot_cache.alloc);
 
         db.overlayRuntimeStatusBestEffort(snapshot_cache.alloc, &status.stats);
-        snapshot_cache.upsertGroupStatus(table_name, status) catch |err| {
+        _ = snapshot_cache.upsertObservedGroupStatus(table_name, status, observation_generation) catch |err| {
             std.log.warn("managed runtime status overlay publish failed table={s} group_id={} err={s}", .{
                 table_name,
                 group_id,
@@ -6326,6 +6476,14 @@ pub const ProvisionedTableWriteSource = struct {
     ) void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         switch (change) {
+            .index_repair_pending => {
+                self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue);
+                return;
+            },
+            .index_repair_cleared => {
+                self.notifyLocalIndexRepairDebt(table_name, group_id, .remove);
+                return;
+            },
             .status => {
                 if (db) |managed_db| {
                     if (self.publishManagedRuntimeStatusBestEffort(table_name, group_id, managed_db)) {
@@ -6740,13 +6898,44 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
 
+        // Startup catch-up and Raft apply intentionally use separate caches,
+        // but there may only be one writer for an LSM root. Prefer the writer
+        // that already owns the root; opening through the other cache would
+        // turn a healthy split into LsmRootWriterAlreadyOpen and eventually
+        // surface to metadata as GroupLeaderUnavailable.
+        var existing: ?ProvisionedTableWriteCache.CachedDb = null;
+        lockAtomic(&self.local_db_mutex);
+        if (self.write_cache) |cache| {
+            existing = cache.snapshotLeaseLocked(group_id, lsm_root_generation, table_name);
+        }
+        if (existing == null) {
+            if (self.startup_write_cache) |cache| {
+                existing = cache.snapshotLeaseLocked(group_id, lsm_root_generation, table_name);
+            }
+        }
+        self.local_db_mutex.unlock();
+        if (existing) |leased| {
+            var cached = leased;
+            defer cached.deinit(alloc);
+            if (cached.entry) |entry| {
+                lockAtomic(&self.local_db_mutex);
+                defer self.local_db_mutex.unlock();
+                try self.finishEntryAutoBulkIngestForForegroundVisibility(cached.cache.?, entry);
+            }
+            return cached.db.findMedianKey(alloc) catch |err| switch (err) {
+                error.NotFound => null,
+                else => err,
+            };
+        }
+
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, lsm_root_generation, table_name, .default_async, null, null, null);
             defer cached.deinit(alloc);
             if (cached.entry) |entry| {
+                lockAtomic(&self.local_db_mutex);
+                defer self.local_db_mutex.unlock();
                 try self.finishEntryAutoBulkIngestForForegroundVisibility(cache, entry);
             }
-            try drainManagedDbBeforeClose(cached.db);
             const median = cached.db.findMedianKey(alloc) catch |err| switch (err) {
                 error.NotFound => return null,
                 else => return err,
@@ -6796,12 +6985,14 @@ pub const ProvisionedTableWriteSource = struct {
         }
         const backoff_epoch = self.startup_catch_up_backoff_epoch.load(.acquire);
         const now_ms = startupCatchUpMonotonicMs();
-        if (self.startupCatchUpRetryAt(group_id, now_ms)) |retry_at_ms| {
-            return .{
-                .had_debt = true,
-                .quarantined = true,
-                .retry_at_ms = retry_at_ms,
-            };
+        if (!metadata.advance_index_repairs) {
+            if (self.startupCatchUpRetryAt(group_id, now_ms)) |retry_at_ms| {
+                return .{
+                    .had_debt = true,
+                    .quarantined = true,
+                    .retry_at_ms = retry_at_ms,
+                };
+            }
         }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -6825,6 +7016,7 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
         self.local_db_mutex.unlock();
+        var group_operation_active = true;
         var preserve_startup_cache = false;
         errdefer {
             var failed_result = StartupCatchUpResult{ .had_debt = true };
@@ -6838,7 +7030,7 @@ pub const ProvisionedTableWriteSource = struct {
                     @errorName(err),
                 });
             };
-            self.endGroupOperation(table_name, group_id);
+            if (group_operation_active) self.endGroupOperation(table_name, group_id);
         }
         self.startup_catch_up_active.store(true, .monotonic);
         defer self.startup_catch_up_active.store(false, .monotonic);
@@ -6968,7 +7160,23 @@ pub const ProvisionedTableWriteSource = struct {
             db,
             configured_indexes,
         );
-        var result = try catchUpManagedDb(self, alloc, group_id, table_name, db);
+        if (metadata.advance_index_repairs and cached_db != null) {
+            // The cache lease keeps the DB/root alive across retirement, while
+            // the activation callback fences leadership and root generation.
+            // Releasing this broad lifecycle guard prevents a multi-minute
+            // corpus scan from head-of-line blocking unrelated group work.
+            self.endGroupOperation(table_name, group_id);
+            group_operation_active = false;
+        }
+        var result = try catchUpManagedDb(
+            self,
+            alloc,
+            group_id,
+            table_name,
+            db,
+            metadata.advance_index_repairs,
+            metadata.index_repair_options,
+        );
         try publishRuntimeStatusSnapshotWithStartupPhase(self, alloc, table_name, group_id, .idle, db);
         self.updateStartupCatchUpBackoff(group_id, startupCatchUpMonotonicMs(), backoff_epoch, &result);
         preserve_startup_cache = result.had_debt and !result.cleared_debt and
@@ -7510,9 +7718,28 @@ pub const ProvisionedTableWriteSource = struct {
             if (entry.structural_active or entry.table_request_active > 0 or entry.read_request_active > 0) return true;
         }
         if (self.findTableActivityLocked(table_name, group_id)) |index| {
-            if (self.active_table_activities.items[index].operation_active) return true;
+            const entry = self.active_table_activities.items[index];
+            if (entry.operation_active and !entry.operation_allows_reads) return true;
         }
         return false;
+    }
+
+    fn structuralStatusSnapshotOnlyBestEffort(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const index = self.findTableActivityLocked(table_name, null) orelse return false;
+        const entry = self.active_table_activities.items[index];
+        return entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0;
+    }
+
+    fn readCompatibleGroupOperationActiveBestEffort(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const index = self.findTableActivityLocked(table_name, group_id) orelse return false;
+        const entry = self.active_table_activities.items[index];
+        return entry.operation_active and entry.operation_allows_reads;
     }
 
     fn activeOperationGroupsForTable(
@@ -7721,7 +7948,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
         markRecoveredRuntimeStatuses(&recovered);
         for (recovered.items) |item| try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, item);
-        self.overlayManagedWriterReplayTargetsBestEffort(table_name, &recovered);
+        self.overlayManagedWriterReplayTargetsBestEffort(alloc, table_name, &recovered);
         return recovered;
     }
 
@@ -7749,8 +7976,14 @@ pub const ProvisionedTableWriteSource = struct {
         // after primary-write dirtiness has been cleared. Refresh stale/aged
         // snapshots from an already-open writer. Tables without one continue
         // to use the published snapshot, so polling never opens a DB.
-        try self.refreshRuntimeStatusesFromWriteCache(alloc, table_name, &cached);
-        self.overlayManagedWriterReplayTargetsBestEffort(table_name, &cached);
+        // Reconciliation can spend minutes building an unpublished index on
+        // the resident writer. Status is observational and already has an
+        // immutable published snapshot; do not contend on live DB stats merely
+        // to refresh optional counters during that interval.
+        if (!self.structuralStatusSnapshotOnlyBestEffort(table_name)) {
+            try self.refreshRuntimeStatusesFromWriteCache(alloc, table_name, &cached);
+            self.overlayManagedWriterReplayTargetsBestEffort(alloc, table_name, &cached);
+        }
         return cached;
     }
 
@@ -7802,28 +8035,36 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn overlayManagedWriterReplayTargetsBestEffort(
         self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
         table_name: []const u8,
         statuses: *runtime_status.LocalTableRuntimeStatuses,
     ) void {
-        if (!self.local_db_mutex.tryLock()) return;
-        defer self.local_db_mutex.unlock();
-        self.overlayManagedWriterReplayTargetsFromCacheLocked(table_name, self.write_cache, statuses);
-        self.overlayManagedWriterReplayTargetsFromCacheLocked(table_name, self.startup_write_cache, statuses);
-    }
+        var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
+        defer {
+            for (leases.items) |*lease| {
+                const release_alloc = if (lease.cache) |cache| cache.alloc else std.heap.page_allocator;
+                lease.deinit(release_alloc);
+            }
+            leases.deinit(alloc);
+        }
 
-    fn overlayManagedWriterReplayTargetsFromCacheLocked(
-        self: *ProvisionedTableWriteSource,
-        table_name: []const u8,
-        maybe_cache: ?*ProvisionedTableWriteCache,
-        statuses: *runtime_status.LocalTableRuntimeStatuses,
-    ) void {
-        const cache = maybe_cache orelse return;
-        for (cache.entries.items) |entry| {
+        if (!self.local_db_mutex.tryLock()) return;
+        self.collectAllRuntimeStatusLeasesFromCacheLocked(alloc, self.write_cache, &leases) catch {
+            self.local_db_mutex.unlock();
+            return;
+        };
+        self.collectAllRuntimeStatusLeasesFromCacheLocked(alloc, self.startup_write_cache, &leases) catch {
+            self.local_db_mutex.unlock();
+            return;
+        };
+        self.local_db_mutex.unlock();
+
+        for (leases.items) |lease| {
+            const entry = lease.entry orelse continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.lsm_root_generation != self.visibleRootGeneration(entry.group_id)) continue;
             for (statuses.items) |*status| {
                 if (status.group_id != entry.group_id) continue;
-                overlayRuntimeStatusReplayTargetFromDb(status, &entry.db);
+                overlayRuntimeStatusReplayTargetFromDb(alloc, status, lease.db);
                 break;
             }
         }
@@ -7992,10 +8233,10 @@ pub const ProvisionedTableWriteSource = struct {
         };
     }
 
-    pub fn primaryLookupDbSource(self: *ProvisionedTableWriteSource) table_reads.PrimaryLookupDbSource {
+    pub fn residentDbSource(self: *ProvisionedTableWriteSource) table_reads.ResidentDbSource {
         return .{
             .ptr = self,
-            .lease_group = leasePrimaryLookupDb,
+            .lease_group = leaseResidentDb,
         };
     }
 
@@ -8036,16 +8277,16 @@ pub const ProvisionedTableWriteSource = struct {
         self.endReadRequest(table_name);
     }
 
-    fn leasePrimaryLookupDb(
+    fn leaseResidentDb(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
         group_id: u64,
         lsm_root_generation: u64,
-    ) !?table_reads.PrimaryLookupDbLease {
+    ) !?table_reads.ResidentDbLease {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.local_write_owner) |owner| {
-            return try leasePrimaryLookupDb(owner, alloc, table_name, group_id, lsm_root_generation);
+            return try leaseResidentDb(owner, alloc, table_name, group_id, lsm_root_generation);
         }
         self.beginReadRequest(table_name);
         var read_request_active = true;
@@ -8053,15 +8294,81 @@ pub const ProvisionedTableWriteSource = struct {
 
         lockAtomic(&self.local_db_mutex);
         var cached: ?ProvisionedTableWriteCache.CachedDb = null;
+        var mismatched_generation_resident = false;
         if (self.write_cache) |cache| {
             cached = cache.snapshotLeaseOrAdoptSeededLocked(group_id, lsm_root_generation, table_name);
+            if (cached == null) {
+                for (cache.entries.items) |entry| {
+                    if (entry.group_id == group_id and
+                        std.mem.eql(u8, entry.table_name, table_name) and
+                        entry.lsm_root_generation != lsm_root_generation)
+                    {
+                        mismatched_generation_resident = true;
+                        break;
+                    }
+                }
+            }
         }
         if (cached == null) {
             if (self.startup_write_cache) |cache| {
                 cached = cache.snapshotLeaseOrAdoptSeededLocked(group_id, lsm_root_generation, table_name);
+                if (cached == null) {
+                    for (cache.entries.items) |entry| {
+                        if (entry.group_id == group_id and
+                            std.mem.eql(u8, entry.table_name, table_name) and
+                            entry.lsm_root_generation != lsm_root_generation)
+                        {
+                            mismatched_generation_resident = true;
+                            break;
+                        }
+                    }
+                }
             }
         }
         self.local_db_mutex.unlock();
+
+        // Reconciliation retires the stale-schema writer before opening its
+        // replacement. During that short handoff, let the query path use its
+        // generation-pinned readonly cache instead of racing to create another
+        // writer-cache owner. Once the replacement is resident, subsequent
+        // queries lease it normally while the unpublished target builds.
+        if (cached == null and self.readCompatibleGroupOperationActiveBestEffort(table_name, group_id)) {
+            self.endReadRequest(table_name);
+            read_request_active = false;
+            return null;
+        }
+
+        if (cached == null and mismatched_generation_resident) return error.ReadUnavailable;
+
+        // A normal data runtime owns a write cache even when this group has not
+        // been touched since process start. Make that cache the single cold-open
+        // owner instead of allowing the read path to construct a duplicate
+        // query_readonly DB. Query-only runtimes have no write cache and retain
+        // the explicit readonly fallback.
+        if (cached == null) {
+            const cache = self.write_cache orelse self.startup_write_cache orelse {
+                self.endReadRequest(table_name);
+                read_request_active = false;
+                return null;
+            };
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
+            cached = self.getOrOpenCachedDbModeAtGeneration(
+                alloc,
+                cache,
+                path,
+                group_id,
+                lsm_root_generation,
+                table_name,
+                .default_async,
+                null,
+                null,
+                null,
+            ) catch |err| {
+                if (isTransientWriterOpenConflict(err)) return error.ReadUnavailable;
+                return err;
+            };
+        }
 
         var cached_value = cached orelse {
             self.endReadRequest(table_name);
@@ -8075,7 +8382,7 @@ pub const ProvisionedTableWriteSource = struct {
             return err;
         };
         errdefer alloc.free(owned_table_name);
-        const lease_ctx = alloc.create(PrimaryLookupLeaseContext) catch |err| {
+        const lease_ctx = alloc.create(ResidentLeaseContext) catch |err| {
             cached_value.deinit(alloc);
             self.endReadRequest(table_name);
             read_request_active = false;
@@ -8090,18 +8397,18 @@ pub const ProvisionedTableWriteSource = struct {
         return .{
             .ptr = lease_ctx,
             .db = lease_ctx.cached.db,
-            .release_fn = releasePrimaryLookupDb,
+            .release_fn = releaseResidentDb,
         };
     }
 
-    const PrimaryLookupLeaseContext = struct {
+    const ResidentLeaseContext = struct {
         source: *ProvisionedTableWriteSource,
         table_name: []u8,
         cached: ProvisionedTableWriteCache.CachedDb,
     };
 
-    fn releasePrimaryLookupDb(ptr: *anyopaque, alloc: std.mem.Allocator) void {
-        const lease_ctx: *PrimaryLookupLeaseContext = @ptrCast(@alignCast(ptr));
+    fn releaseResidentDb(ptr: *anyopaque, alloc: std.mem.Allocator) void {
+        const lease_ctx: *ResidentLeaseContext = @ptrCast(@alignCast(ptr));
         lease_ctx.cached.deinit(alloc);
         lease_ctx.source.endReadRequest(lease_ctx.table_name);
         alloc.free(lease_ctx.table_name);
@@ -8199,6 +8506,37 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn notifyLocalChange(self: *ProvisionedTableWriteSource, table_name: []const u8, kind: LocalChangeKind) void {
         if (self.local_change_hook) |hook| hook.on_change(hook.ptr, table_name, kind);
+    }
+
+    fn notifyLocalIndexRepairDebt(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+        action: LocalIndexRepairDebtAction,
+    ) void {
+        if (self.local_index_repair_debt_hook) |hook| hook.on_change(hook.ptr, table_name, group_id, action);
+    }
+
+    fn indexRepairDebtAction(
+        req: db_mod.types.ArtifactRepairRunRequest,
+        result: db_mod.types.ArtifactRepairResult,
+    ) ?LocalIndexRepairDebtAction {
+        if (req.target != .index or result.scanned == 0) return null;
+        if (req.control) |control| {
+            if (result.controls_applied == 0) return null;
+            return switch (control) {
+                // A named pause says nothing about other repair intents in the
+                // same group. Keep the group queued for one aggregate owner
+                // audit; that pass removes it cheaply when only paused debt
+                // remains, or advances another runnable index immediately.
+                .pause_automatic => .enqueue,
+                .resume_automatic, .cancel_current_attempt => .enqueue,
+            };
+        }
+        // Index repair requests are named-index operations. Even when that
+        // index completes, another intent may remain in the group, so only the
+        // aggregate owner-side pass is allowed to remove the group queue key.
+        return .enqueue;
     }
 
     fn changeKindForHARecord(record: db_mod.HAReplicationRecordView) LocalChangeKind {
@@ -8635,7 +8973,11 @@ pub const ProvisionedTableWriteSource = struct {
         lockAtomic(&self.local_db_mutex);
         self.invalidateWriteCache(table_name);
         self.invalidateReadCache(table_name);
-        self.invalidateRuntimeStatusCache(table_name);
+        // Keep the last published read-generation snapshot available while
+        // the replacement index builds. The migration state comes from the
+        // catalog; clearing this snapshot would force status requests to open
+        // the live writer and recreate the maintenance outage this background
+        // path is intended to avoid.
         self.local_db_mutex.unlock();
         self.drainWriteCachePendingCloses();
         var attempts: usize = 0;
@@ -8691,7 +9033,10 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         metadata: StartupCatchUpMetadata,
     ) !bool {
-        if (!self.tryBeginGroupOperation(table_name, group_id)) return true;
+        // The target generation is unpublished until catch-up and sync finish.
+        // Queries are routed to the retained read generation, so do not turn a
+        // corpus-sized backfill into a table-wide read outage.
+        if (!self.tryBeginReadCompatibleGroupOperation(table_name, group_id)) return true;
         defer self.endGroupOperation(table_name, group_id);
 
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -11358,6 +11703,17 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.repairArtifactIssuesGroupLocalControlled(alloc, group_id, table_name, req, options);
         if (options.cancelled()) return error.Canceled;
+        var effective_options = options;
+        if (req.target == .index and req.control == null) {
+            // Persist the generation intent while the group lifecycle guard is
+            // held, then let the DataServer's BackendRuntime maintenance owner
+            // perform the admitted long-running work. This request remains a
+            // bounded metadata operation and cannot stall foreground writes.
+            effective_options.defer_durable_index_repair_execution = true;
+        }
+        const notify_cancellation = req.target == .index and req.control == .pause_automatic;
+        if (notify_cancellation) self.notifyLocalIndexRepairDebt(table_name, group_id, .cancel);
+        errdefer if (notify_cancellation) self.notifyLocalIndexRepairDebt(table_name, group_id, .clear_cancel);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
@@ -11369,7 +11725,7 @@ pub const ProvisionedTableWriteSource = struct {
         var result = if (self.write_cache) |cache| blk: {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
             defer cached.deinit(alloc);
-            break :blk try cached.db.repairArtifactIssuesWithRequestOptions(alloc, req, options);
+            break :blk try cached.db.repairArtifactIssuesWithRequestOptions(alloc, req, effective_options);
         } else blk: {
             const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
             defer if (indexes_json) |value| alloc.free(value);
@@ -11393,7 +11749,7 @@ pub const ProvisionedTableWriteSource = struct {
                 try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            const group_result = try db.repairArtifactIssuesWithRequestOptions(alloc, req, options);
+            const group_result = try db.repairArtifactIssuesWithRequestOptions(alloc, req, effective_options);
             if (group_result.scanned > 0) self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
             break :blk group_result;
         };
@@ -11403,8 +11759,12 @@ pub const ProvisionedTableWriteSource = struct {
             self.invalidateReadCache(table_name);
             self.markWriteCacheDirty(table_name);
             self.local_db_mutex.unlock();
-            self.notifyLocalChange(table_name, .data);
+            self.notifyLocalChange(table_name, if (req.target == .index) .index_repair else .data);
+            if (indexRepairDebtAction(req, result)) |action| {
+                self.notifyLocalIndexRepairDebt(table_name, group_id, action);
+            }
         }
+        if (notify_cancellation) self.notifyLocalIndexRepairDebt(table_name, group_id, .clear_cancel);
         return result;
     }
 };
@@ -14543,6 +14903,11 @@ pub const StartupCatchUpMetadata = struct {
     schema_json: ?[]const u8 = null,
     identity_namespace: ?doc_identity.Namespace = null,
     target_index_name: ?[]const u8 = null,
+    /// Internal owner-side executor mode. Normal startup inspection only
+    /// discovers durable repair debt; the bounded repair worker sets this to
+    /// advance at most one admitted intent.
+    advance_index_repairs: bool = false,
+    index_repair_options: db_mod.types.ArtifactRepairRunOptions = .{},
 };
 
 fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
@@ -15141,6 +15506,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
     mode: RuntimeStatusSnapshotMode,
     db: *db_mod.DB,
 ) !void {
+    const observation_generation = snapshot_cache.beginStatusObservation();
     const async_stats = db.snapshotAsyncIndexingStats();
     if (mode == .best_effort and phase != .idle) {
         if (try snapshot_cache.snapshotGroupStatus(alloc, table_name, group_id)) |cached_status| {
@@ -15150,7 +15516,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
             applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
             markStartupRuntimeStatus(&status, startup);
             status.metadata.lsm_root_generation = lsm_root_generation;
-            try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, status);
+            _ = try snapshot_cache.upsertObservedGroupStatusPreservingMetadata(table_name, status, observation_generation);
         } else {
             var status = runtime_status.LocalTableRuntimeStatus{
                 .group_id = group_id,
@@ -15161,7 +15527,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
             applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
             markStartupRuntimeStatus(&status, startup);
             status.metadata.lsm_root_generation = lsm_root_generation;
-            try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, status);
+            _ = try snapshot_cache.upsertObservedGroupStatusPreservingMetadata(table_name, status, observation_generation);
         }
         return;
     }
@@ -15241,11 +15607,11 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
         !statusHasRuntimeFactsIgnoringMetadataSource(status))
     {
         markClearedStartupRuntimeStatus(&status);
-        try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, status);
+        _ = try snapshot_cache.upsertObservedGroupStatusPreservingMetadata(table_name, status, observation_generation);
     } else {
         markRuntimeStatusFromDb(&status, phase);
         status.metadata.lsm_root_generation = lsm_root_generation;
-        try snapshot_cache.upsertGroupStatus(table_name, status);
+        _ = try snapshot_cache.upsertObservedGroupStatus(table_name, status, observation_generation);
     }
 }
 
@@ -15352,8 +15718,11 @@ fn overlayDenseHbcCacheStatsFromDb(stats: *db_mod.types.DBStats, db: *db_mod.DB)
     }
 }
 
-fn overlayRuntimeStatusReplayTargetFromDb(status: *runtime_status.LocalTableRuntimeStatus, db: *db_mod.DB) void {
-    const target_sequence = db.core.nextDerivedSequence();
+fn overlayRuntimeStatusReplayTargetFromDb(
+    alloc: std.mem.Allocator,
+    status: *runtime_status.LocalTableRuntimeStatus,
+    db: *db_mod.DB,
+) void {
     const async_stats = db.snapshotAsyncIndexingStats();
     status.stats.async_indexing = async_stats;
     for (status.stats.indexes) |*item| {
@@ -15362,15 +15731,18 @@ fn overlayRuntimeStatusReplayTargetFromDb(status: *runtime_status.LocalTableRunt
         const preserve_non_replay_backfill = runtimeStatusHasNonReplayBackfillSignal(item.*);
         if (db.executor.appliedSequence(item.name)) |live_applied| {
             item.replay_applied_sequence = @max(item.replay_applied_sequence, live_applied);
-            item.replay_target_sequence = @max(item.replay_target_sequence, live_applied);
         }
-        if (target_sequence > item.replay_target_sequence) {
-            item.replay_target_sequence = target_sequence;
-            item.catch_up_target_sequence = target_sequence;
-        }
-        if (item.catch_up_target_sequence < item.replay_target_sequence) {
-            item.catch_up_target_sequence = item.replay_target_sequence;
-        }
+        // The primary replay head is shared by every managed index. Derive the
+        // target from this index's matching replay lane so unrelated commits
+        // cannot manufacture replay debt in public provisioned status.
+        item.replay_target_sequence = db.managedIndexReplayTargetSequence(
+            alloc,
+            item.name,
+            item.kind,
+            item.replay_applied_sequence,
+        ) catch @max(item.replay_target_sequence, item.replay_applied_sequence);
+        item.replay_target_sequence = @max(item.replay_target_sequence, item.replay_applied_sequence);
+        item.catch_up_target_sequence = item.replay_target_sequence;
         item.catch_up_applied_sequence = item.replay_applied_sequence;
         item.catch_up_active = item.kind == .dense_vector and async_stats.dense_catch_up.active;
         item.catch_up_phase = if (item.kind == .dense_vector) async_stats.dense_catch_up.phase else .idle;
@@ -15877,6 +16249,8 @@ fn catchUpManagedDb(
     group_id: u64,
     table_name: []const u8,
     db: *db_mod.DB,
+    advance_index_repairs: bool,
+    index_repair_options: db_mod.types.ArtifactRepairRunOptions,
 ) !ProvisionedTableWriteSource.StartupCatchUpResult {
     const max_startup_catch_up_replay_passes: usize = 16;
 
@@ -15927,10 +16301,15 @@ fn catchUpManagedDb(
         return err;
     };
     const initial_index_load_failure = try managedDbHasIndexLoadFailure(alloc, db);
-    const initial_repair_debt = had_debt or restore_repair_needed or needs_dense_artifact_rebuild or initial_index_load_failure;
+    const initial_index_repair_intents = db.hasPendingIndexRepairIntents(alloc) catch |err| switch (err) {
+        error.DurableIndexRepairStateUnavailable => false,
+        else => return err,
+    };
+    const initial_repair_debt = had_debt or restore_repair_needed or needs_dense_artifact_rebuild or initial_index_load_failure or initial_index_repair_intents;
 
     var repaired_restore_runtime = false;
     var repaired_dense_artifacts: usize = 0;
+    var repaired_indexes: usize = 0;
     var made_progress = false;
     defer if (made_progress) {
         // Only retire shared handles after this isolated owner changed durable
@@ -16020,6 +16399,45 @@ fn catchUpManagedDb(
         return .{};
     }
 
+    if (initial_index_load_failure) {
+        const discovery = db.discoverRecoverableStartupIndexFailures(alloc, 1) catch |err| switch (err) {
+            error.DurableIndexRepairStateUnavailable => db_mod.DB.StartupIndexRepairDiscovery{},
+            else => return err,
+        };
+        made_progress = made_progress or discovery.discovered != 0;
+    }
+    var repair_summary = db.indexRepairIntentSummary(alloc) catch |err| switch (err) {
+        error.DurableIndexRepairStateUnavailable => db_mod.DB.IndexRepairIntentSummary{},
+        else => return err,
+    };
+    if (repair_summary.runnable != 0) {
+        progress_ctx.phase = .artifact_rebuild;
+        try publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db);
+        if (!advance_index_repairs) {
+            return .{
+                .had_debt = true,
+                .made_progress = made_progress,
+                .index_repair_pending = true,
+            };
+        }
+        const repair = try db.repairRecoverableStartupIndexFailures(alloc, 1, index_repair_options);
+        repaired_indexes = repair.repaired;
+        made_progress = made_progress or repair.repaired != 0 or repair.discovered != 0;
+        repair_summary = try db.indexRepairIntentSummary(alloc);
+        if (repair_summary.runnable != 0) {
+            return .{
+                .had_debt = true,
+                .made_progress = made_progress,
+                .busy = repair.busy != 0,
+                .index_repair_pending = true,
+                .index_repair_attempted = repair.attempted != 0,
+                .index_repair_repaired = repair.repaired != 0,
+                .index_repair_disk_wait = repair.disk_waits != 0,
+                .index_repair_retry_at_ms = repair.next_retry_at_ms,
+            };
+        }
+    }
+
     if (repaired_restore_runtime) db.clearDenseHbcCaches();
 
     const after = db.listDerivedReplayDebt(alloc) catch |err| {
@@ -16060,6 +16478,24 @@ fn catchUpManagedDb(
             .made_progress = made_progress,
         };
     }
+    repair_summary = db.indexRepairIntentSummary(alloc) catch |err| switch (err) {
+        error.DurableIndexRepairStateUnavailable => db_mod.DB.IndexRepairIntentSummary{},
+        else => return err,
+    };
+    if (repair_summary.paused != 0) {
+        return .{
+            .had_debt = true,
+            .made_progress = made_progress,
+        };
+    }
+    if (repair_summary.terminal != 0) {
+        try publishRuntimeStatusSnapshotWithStartupPhaseMode(source, alloc, table_name, group_id, .idle, .consistent, db);
+        return .{
+            .had_debt = true,
+            .terminal_degraded = true,
+            .made_progress = made_progress,
+        };
+    }
     if (try managedDbHasIndexLoadFailure(alloc, db)) {
         try publishRuntimeStatusSnapshotWithStartupPhaseMode(source, alloc, table_name, group_id, .idle, .consistent, db);
         return .{
@@ -16070,8 +16506,10 @@ fn catchUpManagedDb(
     }
     return .{
         .had_debt = initial_repair_debt,
-        .cleared_debt = had_debt or repaired_restore_runtime or repaired_dense_artifacts > 0,
+        .cleared_debt = had_debt or repaired_restore_runtime or repaired_dense_artifacts > 0 or repaired_indexes > 0,
         .made_progress = made_progress or initial_repair_debt,
+        .index_repair_attempted = advance_index_repairs and repaired_indexes != 0,
+        .index_repair_repaired = repaired_indexes != 0,
     };
 }
 
@@ -21918,6 +22356,339 @@ test "provisioned table write cache eventually runs managed dense enrichment for
     try std.testing.expect(FakeEmbeddingProvider.request_count.load(.monotonic) > 0);
 }
 
+test "provisioned managed replay tails converge and publish without later traffic" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-managed-replay-tail", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    const FakeEmbeddingProvider = struct {
+        var request_count: std.atomic.Value(u32) = .init(0);
+        var embedded_count: std.atomic.Value(u32) = .init(0);
+
+        fn executor() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, arena: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/v1/embeddings"));
+            _ = request_count.fetchAdd(1, .monotonic);
+
+            var parsed_req = try parseJsonBodyIgnoreUnknown(TestEmbeddingRequest, arena, req.body);
+            defer parsed_req.deinit();
+
+            const input_count: usize = switch (parsed_req.value.input) {
+                .string => 1,
+                .array => |inputs| inputs.items.len,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expect(input_count > 0);
+            _ = embedded_count.fetchAdd(@intCast(input_count), .monotonic);
+
+            var body = std.ArrayListUnmanaged(u8).empty;
+            defer body.deinit(arena);
+            try body.appendSlice(arena, "{\"object\":\"list\",\"data\":[");
+            for (0..input_count) |i| {
+                if (i > 0) try body.append(arena, ',');
+                var item_buf: [128]u8 = undefined;
+                const item = try std.fmt.bufPrint(
+                    &item_buf,
+                    "{{\"object\":\"embedding\",\"index\":{d},\"embedding\":[1,0,0]}}",
+                    .{i},
+                );
+                try body.appendSlice(arena, item);
+            }
+            try body.appendSlice(arena, "],\"model\":\"test-embed\",\"usage\":{\"prompt_tokens\":1,\"total_tokens\":1}}");
+
+            return .{
+                .status = 200,
+                .content_type = try arena.dupe(u8, "application/json"),
+                .body = try body.toOwnedSlice(arena),
+            };
+        }
+    };
+
+    const Catalog = struct {
+        var indexes_json_buf: []const u8 = "";
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = indexes_json_buf,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Wait = struct {
+        const Progress = struct {
+            applied_sequence: u64,
+            target_sequence: u64,
+            catch_up_target_sequence: u64,
+        };
+
+        fn forPublishedConvergence(
+            snapshot_cache: *runtime_status.TableRuntimeSnapshotCache,
+            expected_docs: u64,
+        ) !Progress {
+            for (0..500) |_| {
+                if (try snapshot_cache.snapshot(std.testing.allocator, "docs")) |statuses_value| {
+                    var statuses = statuses_value;
+                    defer statuses.deinit(std.testing.allocator);
+                    if (statuses.items.len == 1 and statuses.items[0].stats.indexes.len == 1) {
+                        const item = statuses.items[0].stats.indexes[0];
+                        const enrichment = statuses.items[0].stats.enrichment;
+                        if (item.doc_count == expected_docs and
+                            item.replay_applied_sequence >= item.replay_target_sequence and
+                            enrichment.applied_sequence >= enrichment.target_sequence and
+                            !enrichment.retrying and
+                            !enrichment.worker_failed and
+                            !item.replay_catch_up_required and
+                            !item.catch_up_active and
+                            item.catch_up_phase == .idle and
+                            !item.backfill_active)
+                        {
+                            return .{
+                                .applied_sequence = item.replay_applied_sequence,
+                                .target_sequence = item.replay_target_sequence,
+                                .catch_up_target_sequence = item.catch_up_target_sequence,
+                            };
+                        }
+                    }
+                }
+                sleepNs(20 * std.time.ns_per_ms);
+            }
+            return error.TestExpectedConvergence;
+        }
+    };
+
+    var listener = std_http_listener.StdHttpListener.init(alloc, .{}, FakeEmbeddingProvider.executor());
+    defer listener.deinit();
+    try listener.start();
+    const base_uri = try listener.baseUri(alloc);
+    defer alloc.free(base_uri);
+
+    Catalog.indexes_json_buf = try std.fmt.allocPrint(alloc,
+        \\{{"semantic_idx":{{"type":"embeddings","field":"semantic_content","dimension":3,"embedder":{{"provider":"openai","model":"test-embed","url":"{s}"}}}}}}
+    , .{base_uri});
+    defer alloc.free(Catalog.indexes_json_buf);
+    FakeEmbeddingProvider.request_count.store(0, .monotonic);
+    FakeEmbeddingProvider.embedded_count.store(0, .monotonic);
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    var snapshot_cache_live = true;
+    defer if (snapshot_cache_live) snapshot_cache.deinit();
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    var write_cache_live = true;
+    defer if (write_cache_live) write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(path, Catalog.iface());
+    source.write_cache = &write_cache;
+    source.runtime_status_cache = &snapshot_cache;
+
+    for (1..7) |i| {
+        var key_buf: [32]u8 = undefined;
+        var value_buf: [160]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc-{d}", .{i});
+        const value = try std.fmt.bufPrint(
+            &value_buf,
+            "{{\"content\":\"payload {d}\",\"semantic_content\":\"unique semantic payload {d}\"}}",
+            .{ i, i },
+        );
+        _ = try source.source().batch(alloc, "docs", .{
+            .writes = &.{.{ .key = key, .value = value }},
+            .sync_level = .write,
+        });
+    }
+    for (1..4) |i| {
+        var key_buf: [32]u8 = undefined;
+        var value_buf: [96]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "plain-{d}", .{i});
+        const value = try std.fmt.bufPrint(&value_buf, "{{\"content\":\"plain trailing document {d}\"}}", .{i});
+        _ = try source.source().batch(alloc, "docs", .{
+            .writes = &.{.{ .key = key, .value = value }},
+            .sync_level = .write,
+        });
+    }
+
+    const initial = try Wait.forPublishedConvergence(&snapshot_cache, 6);
+    try std.testing.expect(initial.applied_sequence > 0);
+
+    _ = try source.source().batch(alloc, "docs", .{
+        .deletes = &.{"doc-1"},
+        .sync_level = .write,
+    });
+    _ = try Wait.forPublishedConvergence(&snapshot_cache, 5);
+
+    // Repeated mixed bursts exercise notify/drain/park transitions. Every
+    // iteration ends in a no-op-for-this-index write, and there is no probe or
+    // explicit catch-up request after the final burst.
+    for (0..100) |i| {
+        var semantic_key_buf: [32]u8 = undefined;
+        var semantic_value_buf: [160]u8 = undefined;
+        var plain_key_buf: [32]u8 = undefined;
+        var plain_value_buf: [96]u8 = undefined;
+        const semantic_key = try std.fmt.bufPrint(&semantic_key_buf, "mixed-semantic-{d}", .{i});
+        const semantic_value = try std.fmt.bufPrint(
+            &semantic_value_buf,
+            "{{\"content\":\"mixed {d}\",\"semantic_content\":\"mixed semantic payload {d}\"}}",
+            .{ i, i },
+        );
+        const plain_key = try std.fmt.bufPrint(&plain_key_buf, "mixed-plain-{d}", .{i});
+        const plain_value = try std.fmt.bufPrint(&plain_value_buf, "{{\"content\":\"mixed plain {d}\"}}", .{i});
+
+        _ = try source.source().batch(alloc, "docs", .{
+            .writes = &.{.{ .key = semantic_key, .value = semantic_value }},
+            .sync_level = .write,
+        });
+        _ = try source.source().batch(alloc, "docs", .{
+            .writes = &.{.{ .key = plain_key, .value = plain_value }},
+            .sync_level = .write,
+        });
+    }
+
+    const final_status = try Wait.forPublishedConvergence(&snapshot_cache, 105);
+    try std.testing.expectEqual(final_status.target_sequence, final_status.catch_up_target_sequence);
+    try std.testing.expectEqual(
+        final_status.applied_sequence,
+        write_cache.entries.items[0].db.executor.appliedSequence("semantic_idx").?,
+    );
+    try std.testing.expect(FakeEmbeddingProvider.request_count.load(.monotonic) > 0);
+    try std.testing.expect(FakeEmbeddingProvider.embedded_count.load(.monotonic) >= 106);
+
+    const query_vec = [_]f32{ 1, 0, 0 };
+    {
+        var result = try write_cache.entries.items[0].db.search(alloc, .{
+            .index_name = "semantic_idx",
+            .dense = .{ .vector = query_vec[0..], .k = 128 },
+            .limit = 128,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 105), result.total_hits);
+        for (result.hits) |hit| try std.testing.expect(!std.mem.eql(u8, hit.id, "doc-1"));
+    }
+
+    write_cache.entries.items[0].db.setQueryVisibilityHook(null);
+    write_cache.deinit();
+    write_cache_live = false;
+    snapshot_cache.deinit();
+    snapshot_cache_live = false;
+
+    const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+    defer alloc.free(group_path);
+
+    // Leave one real dense replay record beyond the persisted applied
+    // watermark while all workers are stopped. This models a process exiting
+    // after the commit became durable but before derived replay completed.
+    var restart_tail_sequence: u64 = 0;
+    {
+        var seeded = try db_mod.DB.open(alloc, group_path, .{
+            .open_mode = .writer_no_replay,
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+            .prefer_existing_identity_namespace = true,
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .ttl_cleanup = .{ .enabled = false },
+            .transaction_recovery = .{ .enabled = false },
+            .text_merge = .{ .enabled = false },
+        });
+        defer seeded.close();
+
+        const stored_key = try db_mod.internal_keys.documentKeyAlloc(alloc, "restart-tail");
+        defer alloc.free(stored_key);
+        try seeded.core.store.putBatch(&.{.{
+            .key = stored_key,
+            .value = "{\"content\":\"restart payload\",\"semantic_content\":\"restart semantic payload\"}",
+        }}, &.{});
+
+        var dense_embeddings = try alloc.alloc(db_mod.derived_types.DerivedDenseEmbeddingWrite, 1);
+        var derived_batch = db_mod.derived_types.DerivedBatch{
+            .dense_embeddings = dense_embeddings,
+        };
+        defer db_mod.derived_types.deinitDerivedBatch(alloc, &derived_batch);
+        dense_embeddings[0] = .{
+            .index_name = try alloc.dupe(u8, "semantic_idx"),
+            .doc_key = try alloc.dupe(u8, "restart-tail"),
+            .artifact_key = null,
+            .vector = try alloc.dupe(f32, &[_]f32{ 1, 0, 0 }),
+        };
+
+        restart_tail_sequence = seeded.core.store.reserveNextReplaySequence(1);
+        var replay_record = try change_journal_mod.recordFromDerivedBatch(alloc, derived_batch, restart_tail_sequence);
+        defer change_journal_mod.deinitRecord(alloc, &replay_record);
+        const encoded = try change_journal_mod.encodeRecord(alloc, replay_record);
+        defer alloc.free(encoded);
+        try db_mod.replay_stream.appendOpaque(alloc, seeded.core.store, restart_tail_sequence, encoded);
+
+        const debt = try seeded.stats(alloc);
+        defer db_mod.types.freeDBStats(alloc, debt);
+        try std.testing.expectEqual(@as(usize, 1), debt.indexes.len);
+        try std.testing.expect(debt.indexes[0].replay_applied_sequence < debt.indexes[0].replay_target_sequence);
+        try std.testing.expectEqual(restart_tail_sequence, debt.indexes[0].replay_target_sequence);
+    }
+
+    // Restart the provisioned owner without issuing another batch or manually
+    // publishing status. It must replay the persisted tail once, publish the
+    // post-watermark state, and then remain parked.
+    var restarted_snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer restarted_snapshot_cache.deinit();
+    var restarted_write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer restarted_write_cache.deinit();
+    var restarted_source = ProvisionedTableWriteSource.init(path, Catalog.iface());
+    restarted_source.write_cache = &restarted_write_cache;
+    restarted_source.runtime_status_cache = &restarted_snapshot_cache;
+
+    var reopened = try restarted_source.getOrOpenCachedDbMode(
+        alloc,
+        &restarted_write_cache,
+        group_path,
+        7001,
+        "docs",
+        .default,
+        null,
+        null,
+    );
+    defer reopened.deinit(alloc);
+    const restarted = try Wait.forPublishedConvergence(&restarted_snapshot_cache, 106);
+    try std.testing.expect(restarted.applied_sequence >= restart_tail_sequence);
+    try std.testing.expectEqual(restarted.target_sequence, restarted.catch_up_target_sequence);
+    sleepNs(100 * std.time.ns_per_ms);
+    const stable = try Wait.forPublishedConvergence(&restarted_snapshot_cache, 106);
+    try std.testing.expectEqual(restarted.applied_sequence, stable.applied_sequence);
+    reopened.db.setQueryVisibilityHook(null);
+}
+
 test "provisioned write cache invalidation closes failed managed enrichment db without aborting" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-managed-dense-write-cache-failed-close";
@@ -22686,12 +23457,12 @@ test "provisioned table write cache retires stale db when index metadata changes
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), write_cache.table_metadata.items.len);
     try std.testing.expect(first.db.core.index_manager.textIndex("first_idx") != null);
+    const initial_cache_stats = write_cache.cacheStats();
 
     Catalog.indexes_json_buf = "{\"second_idx\":{\"type\":\"full_text\",\"field\":\"body\"}}";
 
     try std.testing.expectError(error.LsmRootWriterAlreadyOpen, write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs"));
 
-    const first_entry = first.entry.?;
     first.deinit(alloc);
     first_released = true;
     write_cache.drainPendingClosesForGroupTable(7001, "docs");
@@ -22701,7 +23472,9 @@ test "provisioned table write cache retires stale db when index metadata changes
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), write_cache.table_metadata.items.len);
-    try std.testing.expect(second.entry.? != first_entry);
+    const refreshed_cache_stats = write_cache.cacheStats();
+    try std.testing.expectEqual(initial_cache_stats.hit_count, refreshed_cache_stats.hit_count);
+    try std.testing.expectEqual(initial_cache_stats.miss_count + 1, refreshed_cache_stats.miss_count);
     try std.testing.expect(second.db.core.index_manager.textIndex("second_idx") != null);
     try std.testing.expect(second.db.core.index_manager.textIndex("first_idx") == null);
 }
@@ -24382,7 +25155,7 @@ test "provisioned table write source group operation blocks read admission" {
     thread.join();
 }
 
-test "provisioned runtime status inspection waits for structural transition" {
+test "provisioned schema reconcile keeps reads and status available" {
     const NoCatalog = struct {
         fn iface() table_catalog.CatalogSource {
             return .{
@@ -24401,39 +25174,47 @@ test "provisioned runtime status inspection waits for structural transition" {
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
-    const StatusWorker = struct {
-        source: *ProvisionedTableWriteSource,
-        started: std.atomic.Value(bool) = .init(false),
-        completed: std.atomic.Value(bool) = .init(false),
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-reconcile-readable", NoCatalog.iface());
+    source.beginStructuralReconcileActivity("docs");
+    defer source.endStructuralReconcileActivity("docs");
 
-        fn run(self: *@This()) void {
-            self.started.store(true, .release);
-            const statuses = self.source.source().localRuntimeStatuses(std.testing.allocator, "docs") catch unreachable;
-            std.debug.assert(statuses == null);
-            self.completed.store(true, .release);
+    try std.testing.expect(source.tryBeginReadCompatibleGroupOperation("docs", 7001));
+    defer source.endGroupOperation("docs", 7001);
+    try std.testing.expect(!source.hasReadBlockingActivityBestEffort("docs", 7001));
+
+    var activity = source.readPreparation().beginRead("docs", .general).?;
+    activity.deinit();
+
+    try std.testing.expect((try source.residentDbSource().leaseGroup(std.testing.allocator, "docs", 7001, 1)) == null);
+
+    source.beginStatusRequest("docs");
+    source.endReadRequest("docs");
+}
+
+test "provisioned runtime status inspection remains available during structural transition" {
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
         }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
     var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-status-transition", NoCatalog.iface());
     source.beginStructuralTableActivity("docs");
-    var structural_active = true;
-    errdefer if (structural_active) source.endStructuralTableActivity("docs");
-
-    var worker = StatusWorker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, StatusWorker.run, .{&worker});
-
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer io_impl.deinit();
-    while (!worker.started.load(.acquire)) {
-        io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
-    }
-    io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
-    try std.testing.expect(!worker.completed.load(.acquire));
-
+    const statuses = try source.source().localRuntimeStatuses(std.testing.allocator, "docs");
+    try std.testing.expect(statuses == null);
     source.endStructuralTableActivity("docs");
-    structural_active = false;
-    thread.join();
-    try std.testing.expect(worker.completed.load(.acquire));
 }
 
 test "provisioned read admission enters through forwarded write owner" {
@@ -25190,6 +25971,35 @@ test "provisioned table write source restore repair completion retires cached ve
     try std.testing.expectEqual(stats_before.miss_count + 1, stats_after.miss_count);
 }
 
+test "provisioned named index repair keeps group queued for aggregate debt audit" {
+    const base = db_mod.types.ArtifactRepairRunRequest{
+        .target = .index,
+        .index_name = "dense_idx",
+        .control = .resume_automatic,
+    };
+    try std.testing.expectEqual(
+        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.enqueue,
+        ProvisionedTableWriteSource.indexRepairDebtAction(base, .{ .scanned = 1, .controls_applied = 1 }).?,
+    );
+    var pause = base;
+    pause.control = .pause_automatic;
+    try std.testing.expectEqual(
+        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.enqueue,
+        ProvisionedTableWriteSource.indexRepairDebtAction(pause, .{ .scanned = 1, .controls_applied = 1 }).?,
+    );
+    try std.testing.expect(ProvisionedTableWriteSource.indexRepairDebtAction(base, .{ .scanned = 1 }) == null);
+    var automatic = base;
+    automatic.control = null;
+    try std.testing.expectEqual(
+        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.enqueue,
+        ProvisionedTableWriteSource.indexRepairDebtAction(automatic, .{ .scanned = 1, .debt_remaining = true }).?,
+    );
+    try std.testing.expectEqual(
+        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.enqueue,
+        ProvisionedTableWriteSource.indexRepairDebtAction(automatic, .{ .scanned = 1 }).?,
+    );
+}
+
 test "provisioned table write source path invalidation clears shared vector read cache" {
     const alloc = std.testing.allocator;
 
@@ -25903,6 +26713,22 @@ test "provisioned runtime status overlays live writer replay target without repu
     try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_applied_sequence);
     try std.testing.expect(!statuses.items[0].stats.indexes[0].replay_catch_up_required);
     try std.testing.expect(!statuses.items[0].stats.indexes[0].backfill_active);
+
+    const unrelated_sequence = cached.db.core.store.nextReplaySequence(1);
+    const unrelated_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = unrelated_sequence,
+        .target_hints = &.{.full_text},
+    });
+    defer alloc.free(unrelated_payload);
+    try cached.db.core.store.appendReplayOpaque(alloc, unrelated_sequence, unrelated_payload);
+    try std.testing.expectEqual(@as(u64, 3), cached.db.core.nextDerivedSequence());
+
+    // A global replay entry for another managed-index kind must not recreate
+    // dense replay debt in the public provisioned status overlay.
+    overlayRuntimeStatusReplayTargetFromDb(alloc, &statuses.items[0], cached.db);
+    try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_target_sequence);
+    try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_applied_sequence);
+    try std.testing.expect(!statuses.items[0].stats.indexes[0].replay_catch_up_required);
 }
 
 test "provisioned runtime status live replay overlay preserves cold dense visibility refresh" {
@@ -28727,7 +29553,7 @@ test "managed startup catch-up repeats replay while dense debt progresses" {
     });
     defer startup_db.close();
 
-    const result = try catchUpManagedDb(&source, alloc, 7001, "docs", &startup_db);
+    const result = try catchUpManagedDb(&source, alloc, 7001, "docs", &startup_db, false, .{});
     try std.testing.expect(!result.busy);
     try std.testing.expect(result.had_debt);
     try std.testing.expect(result.cleared_debt);
@@ -30221,6 +31047,98 @@ test "managed startup catch-up repairs external dense doc gaps from stored artif
     try std.testing.expectEqual(@as(?u64, 3), dense_doc_count);
 }
 
+test "managed startup catch-up advances counterless incomplete dense repair" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-counterless-incomplete-dense", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+    const identity_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
+
+    {
+        var db = try db_mod.DB.open(alloc, path, .{
+            .identity_namespace = identity_namespace,
+            .prefer_existing_identity_namespace = true,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try doc_identity.writeNamespaceToStore(db.core.store, identity_namespace);
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" }},
+            .sync_level = .full_index,
+        });
+        const counter_key = try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:dense_artifact_target_count:{s}", .{"dense_idx"});
+        defer alloc.free(counter_key);
+        try db.core.store.delete(counter_key);
+    }
+
+    const dense_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{path});
+    defer alloc.free(dense_path);
+    const dense_path_z = try alloc.dupeZ(u8, dense_path);
+    defer alloc.free(dense_path_z);
+    {
+        var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
+            .dims = 3,
+            .storage_backend = .lsm,
+        }, .{});
+        try hbc.beginBulkIngestSession();
+        hbc.close();
+    }
+
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var managed_db = try db_mod.DB.open(alloc, path, .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer managed_db.close();
+    try std.testing.expectEqualStrings("IncompleteBulkPublish", managed_db.core.index_manager.loadFailure("dense_idx").?);
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, NoCatalog.iface());
+    const result = try catchUpManagedDb(&source, alloc, 7001, "docs", &managed_db, true, .{});
+    try std.testing.expect(!result.busy);
+    try std.testing.expect(!result.terminal_degraded);
+    try std.testing.expect(result.had_debt);
+    try std.testing.expect(result.cleared_debt);
+    try std.testing.expect(result.index_repair_attempted);
+    try std.testing.expect(result.index_repair_repaired);
+
+    var search = try managed_db.search(alloc, .{
+        .index_name = "dense_idx",
+        .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 1 } },
+        .limit = 1,
+    });
+    defer search.deinit();
+    try std.testing.expectEqual(@as(u32, 1), search.total_hits);
+    try std.testing.expectEqualStrings("doc:a", search.hits[0].id);
+}
+
 test "managed startup catch-up defers while shared bulk ingest state is active" {
     const alloc = std.testing.allocator;
 
@@ -31691,16 +32609,14 @@ test "runtime status collection leaves active stale write lease live" {
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
 }
 
-test "primary lookup adopts seeded write cache across visible generation bump" {
+test "resident DB lease adopts seeded write cache across visible generation bump" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/primary-lookup-write-cache-generation", .{tmp.sub_path});
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/resident-db-write-cache-generation", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
-    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
-    defer alloc.free(path);
 
     const Catalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -31745,21 +32661,22 @@ test "primary lookup adopts seeded write cache across visible generation bump" {
     source.write_cache = &write_cache;
     _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
 
-    var seeded = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, generation, "docs");
+    const resident = source.residentDbSource();
+    var seeded = (try resident.leaseGroup(alloc, "docs", 7001, generation)).?;
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try seeded.db.batch(.{
         .writes = &.{.{ .key = "doc:gold", .value = "{\"title\":\"gold doc\"}" }},
         .sync_level = .write,
     });
-    seeded.deinit(alloc);
+    seeded.release(alloc);
 
-    const primary_lookup = source.primaryLookupDbSource();
     generation = 2;
-    try std.testing.expect((try primary_lookup.leaseGroup(alloc, "docs", 7001, generation)) == null);
+    try std.testing.expectError(error.ReadUnavailable, resident.leaseGroup(alloc, "docs", 7001, generation));
 
     write_cache.entries.items[0].allow_generation_adoption = true;
     const misses_before = write_cache.miss_count.load(.monotonic);
 
-    var lease = (try primary_lookup.leaseGroup(alloc, "docs", 7001, generation)).?;
+    var lease = (try resident.leaseGroup(alloc, "docs", 7001, generation)).?;
     defer lease.release(alloc);
 
     try std.testing.expectEqual(@as(u64, 2), write_cache.entries.items[0].lsm_root_generation);
@@ -32023,4 +32940,172 @@ test "write cache retires adoptable seed when transfer allocators differ" {
     try std.testing.expectEqual(@as(usize, 1), retired);
     try std.testing.expectEqual(@as(usize, 0), source_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), apply_cache.entries.items.len);
+}
+
+test "provisioned leader admission rejects uncommitted writes under dense repair pressure" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/dense-repair-leader-admission", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = .{
+        .soft_limit_bytes = 1,
+        .hard_limit_bytes = 1,
+    };
+    var resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    write_cache.resource_manager = &resources;
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+
+    var cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 1, "docs");
+    cached.deinit(alloc);
+    const entry = write_cache.entries.items[0];
+
+    // Normal pressure-free writes avoid the cache scan and remain admitted even
+    // while a repair owns a replay pin.
+    entry.db.index_repair_replay_pinned.store(true, .release);
+    try source.preflightDenseRepairWriteAdmission(7001, "docs");
+
+    var tracked: u64 = 0;
+    resources.observeUsage(.derived_backlog, &tracked, 2);
+    defer resources.observeUsage(.derived_backlog, &tracked, 0);
+    try std.testing.expectError(
+        error.DenseRepairBackpressure,
+        source.preflightDenseRepairWriteAdmission(7001, "docs"),
+    );
+
+    // Pressure on one group must not reject unrelated groups, and clearing the
+    // durable repair pin immediately reopens admission for this group.
+    try source.preflightDenseRepairWriteAdmission(7002, "docs");
+    entry.db.index_repair_replay_pinned.store(false, .release);
+    try source.preflightDenseRepairWriteAdmission(7001, "docs");
+}
+
+test "median key lookup reuses startup writer instead of reopening its root" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/median-startup-owner", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var foreground_cache = ProvisionedTableWriteCache.init(alloc);
+    defer foreground_cache.deinit();
+    var startup_cache = ProvisionedTableWriteCache.init(alloc);
+    defer startup_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
+    source.bindWriteCaches(&foreground_cache, &startup_cache);
+
+    var startup_writer = try source.getOrOpenCachedDbModeAtGeneration(
+        alloc,
+        &startup_cache,
+        path,
+        7001,
+        0,
+        "docs",
+        .default_async,
+        null,
+        null,
+        null,
+    );
+    defer startup_writer.deinit(alloc);
+    try startup_writer.db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"a\"}" },
+            .{ .key = "doc:m", .value = "{\"title\":\"m\"}" },
+            .{ .key = "doc:z", .value = "{\"title\":\"z\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const median = (try source.findMedianKeyForTableGroup(alloc, 7001, 0, "docs")) orelse
+        return error.TestUnexpectedResult;
+    defer alloc.free(median);
+    try std.testing.expectEqualStrings("doc:m", median);
+    try std.testing.expectEqual(@as(usize, 0), foreground_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), startup_cache.entries.items.len);
 }

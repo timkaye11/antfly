@@ -19,7 +19,7 @@ const template_mod = @import("template.zig");
 const pdf_mod = @import("antfly_pdf");
 const scraping = @import("antfly_scraping");
 const common_secrets = @import("common/secrets.zig");
-const platform_time = @import("platform/time.zig");
+const platform_time = @import("antfly_platform").time;
 
 const Allocator = std.mem.Allocator;
 
