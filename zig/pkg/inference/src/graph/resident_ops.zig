@@ -39,13 +39,15 @@ pub fn l2NormalizeLastDim(
     // normal-sized: dividing floatMin by a typical embedding dimension makes
     // it subnormal and risks a zero-row 0 * rsqrt(0) NaN on GPU hardware.
     const dim_usize: usize = @intCast(dim);
-    if (backend.kind() == .cuda and try backend.rmsNormBare(input, dim_usize, std.math.floatMin(f32))) |rms| {
-        errdefer backend.free(rms);
-        if (try backend.multiplyScalar(rms, 1.0 / @sqrt(@as(f32, @floatFromInt(dim))))) |normalized| {
+    if (backend.kind() == .cuda) {
+        if (try backend.rmsNormBare(input, dim_usize, std.math.floatMin(f32))) |rms| {
+            errdefer backend.free(rms);
+            if (try backend.multiplyScalar(rms, 1.0 / @sqrt(@as(f32, @floatFromInt(dim))))) |normalized| {
+                backend.free(rms);
+                return normalized;
+            }
             backend.free(rms);
-            return normalized;
         }
-        backend.free(rms);
     }
 
     var reduced_shape_buf: [8]i64 = undefined;

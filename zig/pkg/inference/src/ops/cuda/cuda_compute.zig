@@ -259,7 +259,7 @@ pub fn kernelJitRouteScopeForLoadedWeights(
             entry.key_ptr.*,
             out_dim,
             in_dim,
-            !cudaShouldAttachBf16MirrorToQ4Weight(entry.key_ptr.*, storage),
+            !cudaQ4WeightBf16MirrorPolicyEnabled(entry.key_ptr.*, storage),
         );
     }
     return builder.finish();
@@ -1186,11 +1186,19 @@ pub const CudaCompute = struct {
         // Warm up only when a BF16 matmul path is actually enabled: the
         // ~100ms cuBLASLt library load should not tax every backend init
         // (parity harnesses construct dozens of CudaCompute instances).
+        // The default-on Q4->BF16 prefill mirror only attaches to
+        // encoder.layer.* weights, so its warmup is scoped to the encoder
+        // profiles that carry them; profile-less capability probes stay cold.
+        const encoder_bf16_prefill_default = if (profile) |value| switch (value) {
+            .bert_encoder, .deberta_reranker, .gliner2 => cudaBertQ4Bf16PrefillEnabled(),
+            else => false,
+        } else false;
         if (cublaslt != null and cudaCublasLtWarmupEnabled() and
             (cudaDequantizeQ4_0MatrixWeightsToBf16OnUpload() or
                 cudaHybridQ4Bf16WeightsEnabled() or
                 cudaRmsNormBf16MirrorEnabled() or
-                cudaPleModelProjectionBf16OnUpload()))
+                cudaPleModelProjectionBf16OnUpload() or
+                encoder_bf16_prefill_default))
         {
             warmupCublasLtBf16(&cublaslt.?, &ctx);
         }
@@ -1295,6 +1303,19 @@ pub const CudaCompute = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
+    /// Bind a request-scoped RunBudget for the lifetime of the returned
+    /// backend handle. CudaCompute is shared session state, so the budget
+    /// pointer must not outlive the request: the handle's deinitBackend
+    /// unbinds it. Requests on one session are serialized, matching every
+    /// other unsynchronized per-request field on this struct.
+    pub fn computeBackendWithScopedRunBudget(
+        self: *CudaCompute,
+        run_budget: *run_memory.RunBudget,
+    ) ops.ComputeBackend {
+        self.configureRunBudget(run_budget);
+        return .{ .ptr = self, .vtable = &scoped_run_budget_vtable };
+    }
+
     pub fn hasGemma4DecoderPrimitives(self: *const CudaCompute) bool {
         return self.kernels.hasGemma4DecoderPrimitives();
     }
@@ -1345,12 +1366,15 @@ pub const CudaCompute = struct {
     pub fn configureRunBudget(self: *CudaCompute, run_budget: ?*run_memory.RunBudget) void {
         self.run_budget = run_budget;
         const default_lazy_budget: usize = 10 * 1024 * 1024 * 1024;
+        // Passing null unbinds a request-scoped budget: restore the
+        // unbudgeted field defaults (0 disables lazy eviction) rather than
+        // leaving a stale cap on the shared compute.
         self.lazy_device_budget_bytes = if (run_budget) |budget| blk: {
             const backend_limit = budget.limits.backend_limit_bytes;
             if (backend_limit == 0) break :blk default_lazy_budget;
             const reserved = budget.backend_kv_bytes + budget.backend_scratch_bytes;
             break :blk if (backend_limit > reserved) backend_limit - reserved else 0;
-        } else default_lazy_budget;
+        } else 0;
     }
 
     fn noteDeviceBytes(self: *CudaCompute, bytes: usize) void {
@@ -1428,7 +1452,7 @@ pub const CudaCompute = struct {
             errdefer if (tc_quant) |*packed_quant| releaseDeviceBuffer(self, &packed_quant.buffer);
             var bf16_mirror = buffer_mod.DeviceBuffer{};
             errdefer bf16_mirror.free(&self.ctx);
-            if (cudaShouldAttachBf16MirrorToQ4Weight(owned_key, storage)) {
+            if (cudaShouldAttachBf16MirrorToQ4Weight(self, owned_key, storage)) {
                 bf16_mirror = try allocDeviceBuffer(self, elem_count * @sizeOf(u16));
                 // Dequantize on device from the raw Q4_0 bytes already
                 // uploaded above — bit-identical to the host path and skips
@@ -2487,7 +2511,16 @@ fn cudaHybridQ4Bf16WeightsEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL", false);
 }
 
-fn cudaShouldAttachBf16MirrorToQ4Weight(name: []const u8, storage: weight_source_mod.QuantizedStorage) bool {
+fn cudaBertQ4Bf16PrefillEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_BERT_Q4_0_BF16_PREFILL", true);
+}
+
+// Name/env half of the mirror decision, usable before a CUDA context exists
+// (kernel-JIT route scoping). The attach decision itself must go through
+// cudaShouldAttachBf16MirrorToQ4Weight, which also requires the BF16 fast
+// path to exist on the device; a scope built without that knowledge only
+// costs generated prefill routes, never correctness.
+fn cudaQ4WeightBf16MirrorPolicyEnabled(name: []const u8, storage: weight_source_mod.QuantizedStorage) bool {
     // Encoder prefill has M=batch*sequence rows, so dequantizing the static
     // Q4_0 projection once on upload and dispatching the existing BF16
     // cuBLASLt path is materially faster than repeatedly running the scalar
@@ -2495,7 +2528,7 @@ fn cudaShouldAttachBf16MirrorToQ4Weight(name: []const u8, storage: weight_source
     // device-resident BERT/XLM-R profile by default.
     const bert_encoder_weight = std.mem.startsWith(u8, name, "encoder.layer.");
     if (!cudaHybridQ4Bf16WeightsEnabled() and
-        !(bert_encoder_weight and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_BERT_Q4_0_BF16_PREFILL", true)))
+        !(bert_encoder_weight and cudaBertQ4Bf16PrefillEnabled()))
     {
         return false;
     }
@@ -2508,6 +2541,20 @@ fn cudaShouldAttachBf16MirrorToQ4Weight(name: []const u8, storage: weight_source
     if (std.mem.indexOf(u8, name, "token_embd") != null) return false;
     if (std.mem.indexOf(u8, name, "embed_tokens") != null) return false;
     return true;
+}
+
+fn cudaShouldAttachBf16MirrorToQ4Weight(
+    self: *const CudaCompute,
+    name: []const u8,
+    storage: weight_source_mod.QuantizedStorage,
+) bool {
+    // A mirror is only worth its ~2 bytes/param when the cuBLASLt tensor-core
+    // path can consume it (cublaslt != null implies compute capability >= 8,
+    // the env gate on, and the library loaded). Without it the mirror would
+    // route prefill to the scalar BF16 fallback — slower than the retained
+    // Q4 kernels — while still inflating VRAM at load admission.
+    if (self.cublaslt == null) return false;
+    return cudaQ4WeightBf16MirrorPolicyEnabled(name, storage);
 }
 
 fn isPleModelProjectionWeightName(name: []const u8) bool {
@@ -2840,6 +2887,12 @@ fn deinitBackend(ctx: *anyopaque) void {
         self.deinit();
         self.allocator.destroy(self);
     }
+}
+
+fn deinitBackendClearRunBudget(ctx: *anyopaque) void {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    self.configureRunBudget(null);
+    deinitBackend(ctx);
 }
 
 fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor) void {
@@ -16227,6 +16280,14 @@ const vtable = ops.ComputeBackend.VTable{
     .evalTensor = &evalTensorOp,
     .debugCudaDeviceWarmup = &debugCudaDeviceWarmup,
     .zeroTensor = &zeroTensorOp,
+};
+
+// Identical to `vtable` except deinit also unbinds the request-scoped
+// RunBudget; see computeBackendWithScopedRunBudget.
+const scoped_run_budget_vtable = blk: {
+    var copied = vtable;
+    copied.deinitBackend = &deinitBackendClearRunBudget;
+    break :blk copied;
 };
 
 test "cuda compute vtable is type checked" {

@@ -4987,10 +4987,16 @@ fn makeComputeBackend(
                 NativeCompute.init(allocator, &self.backend_data.pjrt.native, run_budget);
             break :blk compute.computeBackend();
         },
-        .cuda => if (comptime build_options.enable_cuda)
-            self.backend_data.cuda.compute.computeBackend()
-        else
-            return error.CudaNotEnabled,
+        .cuda => if (comptime build_options.enable_cuda) blk: {
+            // CudaCompute is shared session state: bind the request-local
+            // budget through the scoped handle so the handle's deinit
+            // unbinds it instead of the shared compute retaining a pointer
+            // into a completed request.
+            if (run_budget) |budget| {
+                break :blk self.backend_data.cuda.compute.computeBackendWithScopedRunBudget(budget);
+            }
+            break :blk self.backend_data.cuda.compute.computeBackend();
+        } else return error.CudaNotEnabled,
         .onnx => return error.OnnxNotSupportedHere,
         .wasm => return error.WasmNotSupportedHere,
     };
