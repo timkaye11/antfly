@@ -57,7 +57,13 @@ const MatmulHeuristicResult = extern struct {
     reserved: [4]c_int,
 };
 
+const TensorCorePlanKind = enum(u8) {
+    dense,
+    strided_batched,
+};
+
 const TensorCorePlanKey = struct {
+    kind: TensorCorePlanKind,
     input_type: c_int,
     batch_count: u32,
     rows: u32,
@@ -69,7 +75,26 @@ const TensorCorePlanKey = struct {
 const TensorCorePlan = struct {
     algo: MatmulAlgo,
     workspace_size: usize,
+    op_desc: MatmulDesc,
+    a_desc: MatrixLayout,
+    b_desc: MatrixLayout,
+    c_desc: MatrixLayout,
+    d_desc: MatrixLayout,
 };
+
+const TensorCorePlanLease = struct {
+    plan: TensorCorePlan,
+    owns_descriptors: bool,
+
+    fn deinit(self: *TensorCorePlanLease, cublas: *CublasLt) void {
+        if (self.owns_descriptors) cublas.destroyTensorCorePlan(self.plan);
+        self.* = undefined;
+    }
+};
+
+// Shape diversity is small for a loaded model, but untrusted request shapes
+// must not be able to grow this process-lifetime cache without bound.
+const maximum_tensor_core_plans = 256;
 
 pub const CublasLt = struct {
     allocator: ?std.mem.Allocator = null,
@@ -77,6 +102,7 @@ pub const CublasLt = struct {
     handle: Handle,
     fns: Table,
     tensor_core_plans: std.AutoHashMapUnmanaged(TensorCorePlanKey, TensorCorePlan) = .empty,
+    tensor_core_plans_mutex: std.atomic.Mutex = .unlocked,
 
     const Table = struct {
         cublasLtCreate: *const fn (*Handle) callconv(.c) Status,
@@ -156,6 +182,8 @@ pub const CublasLt = struct {
 
     pub fn deinit(self: *CublasLt) void {
         if (self.allocator) |allocator| {
+            var plans = self.tensor_core_plans.valueIterator();
+            while (plans.next()) |plan| self.destroyTensorCorePlan(plan.*);
             self.tensor_core_plans.deinit(allocator);
         }
         if (self.handle != null) {
@@ -211,33 +239,13 @@ pub const CublasLt = struct {
     ) Error!void {
         if (rows == 0 or in_dim == 0 or out_dim == 0) return;
         if (rows > std.math.maxInt(u32) or in_dim > std.math.maxInt(u32) or out_dim > std.math.maxInt(u32)) return error.CublasLtUnsupported;
-        try checkRawBytes(input, rows * in_dim * @sizeOf(u16));
-        try checkRawBytes(weight, out_dim * in_dim * @sizeOf(u16));
-        try checkRawBytes(dst, rows * out_dim * @sizeOf(f32));
+        try checkRawBytes(input, try checkedMatrixBytes(rows, in_dim, @sizeOf(u16)));
+        try checkRawBytes(weight, try checkedMatrixBytes(out_dim, in_dim, @sizeOf(u16)));
+        try checkRawBytes(dst, try checkedMatrixBytes(rows, out_dim, @sizeOf(f32)));
 
-        var op_desc: MatmulDesc = null;
-        try self.check(self.fns.cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-        defer _ = self.fns.cublasLtMatmulDescDestroy(op_desc);
-
-        var transa = CUBLAS_OP_T;
-        var transb = CUBLAS_OP_N;
-        try self.check(self.fns.cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, @sizeOf(c_int)));
-        try self.check(self.fns.cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, @sizeOf(c_int)));
-
-        var a_desc: MatrixLayout = null;
-        var b_desc: MatrixLayout = null;
-        var c_desc: MatrixLayout = null;
-        var d_desc: MatrixLayout = null;
-        try self.check(self.fns.cublasLtMatrixLayoutCreate(&a_desc, input_type, in_dim, out_dim, @intCast(in_dim)));
-        defer _ = self.fns.cublasLtMatrixLayoutDestroy(a_desc);
-        try self.check(self.fns.cublasLtMatrixLayoutCreate(&b_desc, input_type, in_dim, rows, @intCast(in_dim)));
-        defer _ = self.fns.cublasLtMatrixLayoutDestroy(b_desc);
-        try self.check(self.fns.cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_32F, out_dim, rows, @intCast(out_dim)));
-        defer _ = self.fns.cublasLtMatrixLayoutDestroy(c_desc);
-        try self.check(self.fns.cublasLtMatrixLayoutCreate(&d_desc, CUDA_R_32F, out_dim, rows, @intCast(out_dim)));
-        defer _ = self.fns.cublasLtMatrixLayoutDestroy(d_desc);
-
-        const plan = try self.tensorCorePlanFor(input_type, 1, rows, in_dim, out_dim, workspace.len, op_desc, a_desc, b_desc, c_desc, d_desc);
+        var plan_lease = try self.tensorCorePlanFor(.dense, input_type, 1, rows, in_dim, out_dim, workspace.len);
+        defer plan_lease.deinit(self);
+        const plan = plan_lease.plan;
         try checkRawBytes(workspace, plan.workspace_size);
 
         var alpha: f32 = 1.0;
@@ -249,17 +257,17 @@ pub const CublasLt = struct {
         ctx.makeCurrent() catch return error.CublasLtError;
         try self.check(self.fns.cublasLtMatmul(
             self.handle,
-            op_desc,
+            plan.op_desc,
             &alpha,
             @ptrFromInt(weight.ptr),
-            a_desc,
+            plan.a_desc,
             @ptrFromInt(input.ptr),
-            b_desc,
+            plan.b_desc,
             &beta,
             @ptrFromInt(dst.ptr),
-            c_desc,
+            plan.c_desc,
             @ptrFromInt(dst.ptr),
-            d_desc,
+            plan.d_desc,
             &plan.algo,
             workspace_ptr,
             plan.workspace_size,
@@ -269,20 +277,18 @@ pub const CublasLt = struct {
 
     fn tensorCorePlanFor(
         self: *CublasLt,
+        kind: TensorCorePlanKind,
         input_type: c_int,
         batch_count: usize,
         rows: usize,
         in_dim: usize,
         out_dim: usize,
         workspace_bytes: usize,
-        op_desc: MatmulDesc,
-        a_desc: MatrixLayout,
-        b_desc: MatrixLayout,
-        c_desc: MatrixLayout,
-        d_desc: MatrixLayout,
-    ) Error!TensorCorePlan {
+    ) Error!TensorCorePlanLease {
         if (batch_count == 0 or batch_count > std.math.maxInt(u32)) return error.CublasLtUnsupported;
+        if (rows == 0 or rows > std.math.maxInt(u32) or in_dim == 0 or in_dim > std.math.maxInt(u32) or out_dim == 0 or out_dim > std.math.maxInt(u32)) return error.CublasLtUnsupported;
         const key = TensorCorePlanKey{
+            .kind = kind,
             .input_type = input_type,
             .batch_count = @intCast(batch_count),
             .rows = @intCast(rows),
@@ -290,27 +296,105 @@ pub const CublasLt = struct {
             .out_dim = @intCast(out_dim),
             .workspace_bytes = workspace_bytes,
         };
-        if (self.tensor_core_plans.get(key)) |plan| return plan;
+        spinLock(&self.tensor_core_plans_mutex);
+        const cached_plan = self.tensor_core_plans.get(key);
+        self.tensor_core_plans_mutex.unlock();
+        if (cached_plan) |plan| return .{ .plan = plan, .owns_descriptors = false };
+
+        const candidate = try self.createTensorCorePlan(key);
+        if (self.allocator) |allocator| {
+            spinLock(&self.tensor_core_plans_mutex);
+            // Another request may have populated the same plan while this
+            // request was running the heuristic. Prefer that canonical entry.
+            if (self.tensor_core_plans.get(key)) |existing| {
+                self.tensor_core_plans_mutex.unlock();
+                self.destroyTensorCorePlan(candidate);
+                return .{ .plan = existing, .owns_descriptors = false };
+            }
+            if (self.tensor_core_plans.count() < maximum_tensor_core_plans) {
+                self.tensor_core_plans.put(allocator, key, candidate) catch {
+                    self.tensor_core_plans_mutex.unlock();
+                    return .{ .plan = candidate, .owns_descriptors = true };
+                };
+                self.tensor_core_plans_mutex.unlock();
+                return .{ .plan = candidate, .owns_descriptors = false };
+            }
+            self.tensor_core_plans_mutex.unlock();
+        }
+        return .{ .plan = candidate, .owns_descriptors = true };
+    }
+
+    fn createTensorCorePlan(self: *CublasLt, key: TensorCorePlanKey) Error!TensorCorePlan {
+        var plan = TensorCorePlan{
+            .algo = undefined,
+            .workspace_size = 0,
+            .op_desc = null,
+            .a_desc = null,
+            .b_desc = null,
+            .c_desc = null,
+            .d_desc = null,
+        };
+        errdefer self.destroyTensorCorePlan(plan);
+
+        try self.check(self.fns.cublasLtMatmulDescCreate(&plan.op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+        var transa: c_int = undefined;
+        var transb: c_int = undefined;
+        switch (key.kind) {
+            .dense => {
+                transa = CUBLAS_OP_T;
+                transb = CUBLAS_OP_N;
+                try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.a_desc, key.input_type, key.in_dim, key.out_dim, key.in_dim));
+                try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.b_desc, key.input_type, key.in_dim, key.rows, key.in_dim));
+            },
+            .strided_batched => {
+                if (key.batch_count > std.math.maxInt(i32)) return error.CublasLtUnsupported;
+                transa = CUBLAS_OP_N;
+                transb = CUBLAS_OP_T;
+                try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.a_desc, key.input_type, key.out_dim, key.in_dim, key.in_dim));
+                try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.b_desc, key.input_type, key.rows, key.in_dim, key.in_dim));
+            },
+        }
+        try self.check(self.fns.cublasLtMatmulDescSetAttribute(plan.op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, @sizeOf(c_int)));
+        try self.check(self.fns.cublasLtMatmulDescSetAttribute(plan.op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, @sizeOf(c_int)));
+        try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.c_desc, CUDA_R_32F, key.out_dim, key.rows, key.out_dim));
+        try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.d_desc, CUDA_R_32F, key.out_dim, key.rows, key.out_dim));
+
+        if (key.kind == .strided_batched) {
+            var row_order = CUBLASLT_ORDER_ROW;
+            try self.check(self.fns.cublasLtMatrixLayoutSetAttribute(plan.a_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, @sizeOf(c_int)));
+            try self.check(self.fns.cublasLtMatrixLayoutSetAttribute(plan.b_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, @sizeOf(c_int)));
+            const batch_i32: i32 = @intCast(key.batch_count);
+            const weight_stride = try checkedI64Product(key.out_dim, key.in_dim);
+            const input_stride = try checkedI64Product(key.rows, key.in_dim);
+            const output_stride = try checkedI64Product(key.rows, key.out_dim);
+            try self.configureStridedBatch(plan.a_desc, batch_i32, weight_stride);
+            try self.configureStridedBatch(plan.b_desc, batch_i32, input_stride);
+            try self.configureStridedBatch(plan.c_desc, batch_i32, output_stride);
+            try self.configureStridedBatch(plan.d_desc, batch_i32, output_stride);
+        }
 
         var pref: MatmulPreference = null;
         try self.check(self.fns.cublasLtMatmulPreferenceCreate(&pref));
         defer _ = self.fns.cublasLtMatmulPreferenceDestroy(pref);
-        var max_workspace = workspace_bytes;
+        var max_workspace = key.workspace_bytes;
         try self.check(self.fns.cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_workspace, @sizeOf(usize)));
 
         var heuristic: [1]MatmulHeuristicResult = undefined;
         var returned: c_int = 0;
-        try self.check(self.fns.cublasLtMatmulAlgoGetHeuristic(self.handle, op_desc, a_desc, b_desc, c_desc, d_desc, pref, 1, &heuristic, &returned));
+        try self.check(self.fns.cublasLtMatmulAlgoGetHeuristic(self.handle, plan.op_desc, plan.a_desc, plan.b_desc, plan.c_desc, plan.d_desc, pref, 1, &heuristic, &returned));
         if (returned <= 0 or heuristic[0].state != CUBLAS_STATUS_SUCCESS) return error.CublasLtUnsupported;
 
-        const plan = TensorCorePlan{
-            .algo = heuristic[0].algo,
-            .workspace_size = heuristic[0].workspace_size,
-        };
-        if (self.allocator) |allocator| {
-            self.tensor_core_plans.put(allocator, key, plan) catch {};
-        }
+        plan.algo = heuristic[0].algo;
+        plan.workspace_size = heuristic[0].workspace_size;
         return plan;
+    }
+
+    fn destroyTensorCorePlan(self: *CublasLt, plan: TensorCorePlan) void {
+        if (plan.a_desc != null) _ = self.fns.cublasLtMatrixLayoutDestroy(plan.a_desc);
+        if (plan.b_desc != null) _ = self.fns.cublasLtMatrixLayoutDestroy(plan.b_desc);
+        if (plan.c_desc != null) _ = self.fns.cublasLtMatrixLayoutDestroy(plan.c_desc);
+        if (plan.d_desc != null) _ = self.fns.cublasLtMatrixLayoutDestroy(plan.d_desc);
+        if (plan.op_desc != null) _ = self.fns.cublasLtMatmulDescDestroy(plan.op_desc);
     }
 
     /// Tensor-core strided-batched row-major GEMM. The logical operation is
@@ -340,37 +424,9 @@ pub const CublasLt = struct {
         try checkRawBytes(weight_f16, std.math.mul(usize, weight_count, @sizeOf(u16)) catch return error.CublasLtUnsupported);
         try checkRawBytes(dst, std.math.mul(usize, output_count, @sizeOf(f32)) catch return error.CublasLtUnsupported);
 
-        var op_desc: MatmulDesc = null;
-        try self.check(self.fns.cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-        defer _ = self.fns.cublasLtMatmulDescDestroy(op_desc);
-        var transa = CUBLAS_OP_N;
-        var transb = CUBLAS_OP_T;
-        try self.check(self.fns.cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, @sizeOf(c_int)));
-        try self.check(self.fns.cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, @sizeOf(c_int)));
-
-        var a_desc: MatrixLayout = null;
-        var b_desc: MatrixLayout = null;
-        var c_desc: MatrixLayout = null;
-        var d_desc: MatrixLayout = null;
-        try self.check(self.fns.cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_16F, out_dim, in_dim, @intCast(in_dim)));
-        defer _ = self.fns.cublasLtMatrixLayoutDestroy(a_desc);
-        try self.check(self.fns.cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_16F, rows, in_dim, @intCast(in_dim)));
-        defer _ = self.fns.cublasLtMatrixLayoutDestroy(b_desc);
-        try self.check(self.fns.cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_32F, out_dim, rows, @intCast(out_dim)));
-        defer _ = self.fns.cublasLtMatrixLayoutDestroy(c_desc);
-        try self.check(self.fns.cublasLtMatrixLayoutCreate(&d_desc, CUDA_R_32F, out_dim, rows, @intCast(out_dim)));
-        defer _ = self.fns.cublasLtMatrixLayoutDestroy(d_desc);
-        var row_order = CUBLASLT_ORDER_ROW;
-        try self.check(self.fns.cublasLtMatrixLayoutSetAttribute(a_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, @sizeOf(c_int)));
-        try self.check(self.fns.cublasLtMatrixLayoutSetAttribute(b_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, @sizeOf(c_int)));
-
-        const batch_i32: i32 = @intCast(batch_count);
-        try self.configureStridedBatch(a_desc, batch_i32, @intCast(weight_stride));
-        try self.configureStridedBatch(b_desc, batch_i32, @intCast(input_stride));
-        try self.configureStridedBatch(c_desc, batch_i32, @intCast(output_stride));
-        try self.configureStridedBatch(d_desc, batch_i32, @intCast(output_stride));
-
-        const plan = try self.tensorCorePlanFor(CUDA_R_16F, batch_count, rows, in_dim, out_dim, workspace.len, op_desc, a_desc, b_desc, c_desc, d_desc);
+        var plan_lease = try self.tensorCorePlanFor(.strided_batched, CUDA_R_16F, batch_count, rows, in_dim, out_dim, workspace.len);
+        defer plan_lease.deinit(self);
+        const plan = plan_lease.plan;
         try checkRawBytes(workspace, plan.workspace_size);
         var alpha: f32 = 1.0;
         var beta: f32 = 0.0;
@@ -378,17 +434,17 @@ pub const CublasLt = struct {
         ctx.makeCurrent() catch return error.CublasLtError;
         try self.check(self.fns.cublasLtMatmul(
             self.handle,
-            op_desc,
+            plan.op_desc,
             &alpha,
             @ptrFromInt(weight_f16.ptr),
-            a_desc,
+            plan.a_desc,
             @ptrFromInt(input_f16.ptr),
-            b_desc,
+            plan.b_desc,
             &beta,
             @ptrFromInt(dst.ptr),
-            c_desc,
+            plan.c_desc,
             @ptrFromInt(dst.ptr),
-            d_desc,
+            plan.d_desc,
             &plan.algo,
             workspace_ptr,
             plan.workspace_size,
@@ -413,9 +469,9 @@ pub const CublasLt = struct {
     ) Error!void {
         if (rows == 0 or in_dim == 0 or out_dim == 0) return;
         if (rows > std.math.maxInt(u32) or in_dim > std.math.maxInt(u32) or out_dim > std.math.maxInt(u32)) return error.CublasLtUnsupported;
-        try checkRawBytes(input_f32, rows * in_dim * @sizeOf(f32));
-        try checkRawBytes(weight_f32, out_dim * in_dim * @sizeOf(f32));
-        try checkRawBytes(dst, rows * out_dim * @sizeOf(f32));
+        try checkRawBytes(input_f32, try checkedMatrixBytes(rows, in_dim, @sizeOf(f32)));
+        try checkRawBytes(weight_f32, try checkedMatrixBytes(out_dim, in_dim, @sizeOf(f32)));
+        try checkRawBytes(dst, try checkedMatrixBytes(rows, out_dim, @sizeOf(f32)));
 
         var op_desc: MatmulDesc = null;
         try self.check(self.fns.cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
@@ -491,4 +547,38 @@ fn lookup(lib: *std.DynLib, comptime T: type, name: [:0]const u8) Error!T {
 
 fn checkRawBytes(buffer: buffer_mod.DeviceBuffer, bytes: usize) Error!void {
     if (bytes > buffer.len) return error.CublasLtUnsupported;
+}
+
+fn checkedMatrixBytes(rows: usize, cols: usize, element_bytes: usize) Error!usize {
+    const elements = std.math.mul(usize, rows, cols) catch return error.CublasLtUnsupported;
+    return std.math.mul(usize, elements, element_bytes) catch return error.CublasLtUnsupported;
+}
+
+fn checkedI64Product(a: u32, b: u32) Error!i64 {
+    const product = std.math.mul(u64, a, b) catch return error.CublasLtUnsupported;
+    if (product > std.math.maxInt(i64)) return error.CublasLtUnsupported;
+    return @intCast(product);
+}
+
+fn spinLock(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+test "tensor core plan keys distinguish incompatible layouts" {
+    const common = TensorCorePlanKey{
+        .kind = .dense,
+        .input_type = CUDA_R_16F,
+        .batch_count = 1,
+        .rows = 256,
+        .in_dim = 768,
+        .out_dim = 768,
+        .workspace_bytes = 4 * 1024 * 1024,
+    };
+    var batched = common;
+    batched.kind = .strided_batched;
+    try std.testing.expect(!std.meta.eql(common, batched));
+}
+
+test "matrix byte checks reject overflow" {
+    try std.testing.expectError(error.CublasLtUnsupported, checkedMatrixBytes(std.math.maxInt(usize), 2, 2));
 }

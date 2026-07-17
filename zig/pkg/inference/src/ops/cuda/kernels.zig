@@ -957,6 +957,7 @@ pub const KernelModule = struct {
     linear_f32: driver_mod.CUfunction = null,
     linear_f32_tiled: driver_mod.CUfunction = null,
     linear_bf16_weight_f32_tiled: driver_mod.CUfunction = null,
+    linear_f16_weight_f32_tiled: driver_mod.CUfunction = null,
     argmax_last_row_f32: driver_mod.CUfunction = null,
     argmax_rows_f32: driver_mod.CUfunction = null,
     argmax_rows_suppress_f32: driver_mod.CUfunction = null,
@@ -1911,6 +1912,7 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_f32, module, "termite_linear_f32"));
         const linear_f32_tiled = loadOptionalFunction(ctx, module, "termite_linear_f32_tiled");
         const linear_bf16_weight_f32_tiled = loadOptionalFunction(ctx, module, "termite_linear_bf16_weight_f32_tiled");
+        const linear_f16_weight_f32_tiled = loadOptionalFunction(ctx, module, "termite_linear_f16_weight_f32_tiled");
         var argmax_last_row_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&argmax_last_row_f32, module, "termite_argmax_last_row_f32"));
         const argmax_rows_f32 = loadOptionalFunction(ctx, module, "termite_argmax_rows_f32");
@@ -2318,6 +2320,7 @@ pub const KernelModule = struct {
             .linear_f32 = linear_f32,
             .linear_f32_tiled = linear_f32_tiled,
             .linear_bf16_weight_f32_tiled = linear_bf16_weight_f32_tiled,
+            .linear_f16_weight_f32_tiled = linear_f16_weight_f32_tiled,
             .argmax_last_row_f32 = argmax_last_row_f32,
             .argmax_rows_f32 = argmax_rows_f32,
             .argmax_rows_suppress_f32 = argmax_rows_suppress_f32,
@@ -2624,6 +2627,7 @@ pub const KernelModule = struct {
             self.linear_f32 = null;
             self.linear_f32_tiled = null;
             self.linear_bf16_weight_f32_tiled = null;
+            self.linear_f16_weight_f32_tiled = null;
             self.argmax_last_row_f32 = null;
             self.argmax_rows_f32 = null;
             self.argmax_rows_suppress_f32 = null;
@@ -3275,6 +3279,44 @@ pub const KernelModule = struct {
     ) driver_mod.Error!void {
         const function = self.linear_bf16_weight_f32_tiled orelse return error.CudaKernelUnavailable;
         const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight, try checkedTensorElements(try checkedTensorElements(out_dim, in_dim), @sizeOf(u16)));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launchBlocks(function, ctx, out_count, f32_tiled_threads, &params);
+    }
+
+    pub fn launchLinearF16WeightF32Tiled(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_f16_weight_f32_tiled orelse return error.CudaKernelUnavailable;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        // The compatibility kernel indexes its launch domain with u32. Fail
+        // closed before launch instead of allowing rows*out_dim to wrap in
+        // device code for an otherwise representable host-side allocation.
+        _ = try toU32(out_count);
         try checkBytes(dst, out_count);
         try checkBytes(input, try checkedTensorElements(rows, in_dim));
         try checkRawBytes(weight, try checkedTensorElements(try checkedTensorElements(out_dim, in_dim), @sizeOf(u16)));
@@ -16362,6 +16404,19 @@ fn smokeBf16WeightPrimitives(allocator: std.mem.Allocator, ctx: *context_mod.Cud
 
     const out = try allocator.alloc(f32, rows * out_dim);
     defer allocator.free(out);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_linear, 0.0001);
+
+    const weight_f16_data = [_]u16{
+        @bitCast(@as(f16, 1.0)), @bitCast(@as(f16, 0.0)), @bitCast(@as(f16, -1.0)),
+        @bitCast(@as(f16, 0.5)), @bitCast(@as(f16, 2.0)), @bitCast(@as(f16, 1.0)),
+    };
+    var weight_f16 = try buffer_mod.DeviceBuffer.alloc(ctx, weight_f16_data.len * @sizeOf(u16));
+    defer weight_f16.free(ctx);
+    try weight_f16.copyFromHost(ctx, std.mem.sliceAsBytes(&weight_f16_data));
+    try module.launchLinearF16WeightF32Tiled(ctx, output, input, weight_f16, rows, in_dim, out_dim);
+    try ctx.synchronize();
     try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
     try expectApproxSlice(out, &expected_linear, 0.0001);

@@ -350,35 +350,32 @@ pub const GlinerPipeline = struct {
         // their schema, word tokenization, and span tables made CPU work scale
         // linearly even though CUDA executes one real batch.
         var prepared = try alloc.alloc(PreparedGlinerInput, texts.len);
-        const row_to_prepared = try alloc.alloc(usize, texts.len);
-        defer alloc.free(row_to_prepared);
         var prepared_len: usize = 0;
         errdefer {
             for (prepared[0..prepared_len]) |*row| row.deinit(alloc);
             alloc.free(prepared);
         }
+        const row_to_prepared = try alloc.alloc(usize, texts.len);
+        defer alloc.free(row_to_prepared);
+        var prepared_by_text = std.StringHashMapUnmanaged(usize).empty;
+        defer prepared_by_text.deinit(alloc);
 
         var max_seq_len: usize = 0;
         var max_num_words: usize = 0;
         const prepare_start_ns = glinerProfileStart(profile_enabled);
         for (texts, 0..) |text, i| {
-            var existing: ?usize = null;
-            for (texts[0..i], 0..) |candidate, previous_i| {
-                if (std.mem.eql(u8, text, candidate)) {
-                    existing = row_to_prepared[previous_i];
-                    break;
-                }
-            }
-            if (existing) |prepared_i| {
+            if (prepared_by_text.get(text)) |prepared_i| {
                 row_to_prepared[i] = prepared_i;
                 continue;
             }
 
-            prepared[prepared_len] = try self.prepareGlinerInputWithSchema(text, schema);
-            row_to_prepared[i] = prepared_len;
+            const prepared_i = prepared_len;
+            prepared[prepared_i] = try self.prepareGlinerInputWithSchema(text, schema);
             prepared_len += 1;
-            max_seq_len = @max(max_seq_len, prepared[prepared_len - 1].input_ids.len);
-            max_num_words = @max(max_num_words, prepared[prepared_len - 1].actual_num_words);
+            try prepared_by_text.put(alloc, text, prepared_i);
+            row_to_prepared[i] = prepared_i;
+            max_seq_len = @max(max_seq_len, prepared[prepared_i].input_ids.len);
+            max_num_words = @max(max_num_words, prepared[prepared_i].actual_num_words);
         }
         const prepare_ms = glinerProfileElapsedMs(prepare_start_ns);
 
@@ -422,15 +419,17 @@ pub const GlinerPipeline = struct {
         }
 
         const batch = texts.len;
-        const batch_num_spans = max_num_words * max_width;
+        const batch_num_spans = try checkedSizeMul(max_num_words, max_width);
+        const batch_rows = try checkedSizeMul(batch, max_seq_len);
+        const span_values = try checkedSizeMul(try checkedSizeMul(batch, batch_num_spans), 2);
         const pack_start_ns = glinerProfileStart(profile_enabled);
-        const input_ids_buf = try alloc.alloc(i64, batch * max_seq_len);
+        const input_ids_buf = try alloc.alloc(i64, batch_rows);
         defer alloc.free(input_ids_buf);
-        const attention_mask_buf = try alloc.alloc(i64, batch * max_seq_len);
+        const attention_mask_buf = try alloc.alloc(i64, batch_rows);
         defer alloc.free(attention_mask_buf);
-        const words_mask_buf = try alloc.alloc(i64, batch * max_seq_len);
+        const words_mask_buf = try alloc.alloc(i64, batch_rows);
         defer alloc.free(words_mask_buf);
-        const span_idx_buf = try alloc.alloc(i64, batch * batch_num_spans * 2);
+        const span_idx_buf = try alloc.alloc(i64, span_values);
         defer alloc.free(span_idx_buf);
         @memset(input_ids_buf, 0);
         @memset(attention_mask_buf, 0);
@@ -455,7 +454,7 @@ pub const GlinerPipeline = struct {
             }
         }
 
-        const shape_2d = [_]i64{ @intCast(batch), @intCast(max_seq_len) };
+        const shape_2d = [_]i64{ try sizeToI64(batch), try sizeToI64(max_seq_len) };
         var input_ids_tensor = try Tensor.initInt64(alloc, "input_ids", &shape_2d, input_ids_buf);
         defer input_ids_tensor.deinit();
         var attention_mask_tensor = try Tensor.initInt64(alloc, "attention_mask", &shape_2d, attention_mask_buf);
@@ -463,7 +462,7 @@ pub const GlinerPipeline = struct {
         var words_mask_tensor = try Tensor.initInt64(alloc, "words_mask", &shape_2d, words_mask_buf);
         defer words_mask_tensor.deinit();
 
-        const span_shape = [_]i64{ @intCast(batch), @intCast(batch_num_spans), 2 };
+        const span_shape = [_]i64{ try sizeToI64(batch), try sizeToI64(batch_num_spans), 2 };
         var span_idx_tensor = try Tensor.initInt64(alloc, "span_idx", &span_shape, span_idx_buf);
         defer span_idx_tensor.deinit();
         const pack_ms = glinerProfileElapsedMs(pack_start_ns);
@@ -489,33 +488,30 @@ pub const GlinerPipeline = struct {
         var num_labels_dim: usize = labels.len;
         var output_num_words: usize = max_num_words;
         var output_max_width: usize = max_width;
-        var row_stride: usize = batch_num_spans * num_labels_dim;
+        var row_stride: usize = try checkedSizeMul(batch_num_spans, num_labels_dim);
         if (output_shape.len >= 4) {
-            output_num_words = @intCast(output_shape[1]);
-            output_max_width = @intCast(output_shape[2]);
-            num_labels_dim = @intCast(output_shape[3]);
-            row_stride = output_num_words * output_max_width * num_labels_dim;
+            output_num_words = try nonNegativeDim(output_shape[1]);
+            output_max_width = try nonNegativeDim(output_shape[2]);
+            num_labels_dim = try nonNegativeDim(output_shape[3]);
+            row_stride = try checkedSizeMul(try checkedSizeMul(output_num_words, output_max_width), num_labels_dim);
         } else if (output_shape.len == 3) {
-            row_stride = @as(usize, @intCast(output_shape[1])) * @as(usize, @intCast(output_shape[2]));
-            num_labels_dim = @intCast(output_shape[2]);
+            const output_spans = try nonNegativeDim(output_shape[1]);
+            num_labels_dim = try nonNegativeDim(output_shape[2]);
+            row_stride = try checkedSizeMul(output_spans, num_labels_dim);
         }
         if (num_labels_dim > labels.len) num_labels_dim = labels.len;
 
         const decode_start_ns = glinerProfileStart(profile_enabled);
+        const first_result_by_prepared = try alloc.alloc(?usize, prepared_len);
+        defer alloc.free(first_result_by_prepared);
+        @memset(first_result_by_prepared, null);
         for (row_to_prepared, 0..) |prepared_i, i| {
             const row = prepared[prepared_i];
-            var duplicate_of: ?usize = null;
-            for (row_to_prepared[0..i], 0..) |previous_prepared_i, previous_i| {
-                if (previous_prepared_i == prepared_i) {
-                    duplicate_of = previous_i;
-                    break;
-                }
-            }
-            results[i] = if (duplicate_of) |previous_i|
+            results[i] = if (first_result_by_prepared[prepared_i]) |previous_i|
                 try cloneEntities(alloc, results[previous_i])
             else blk: {
-                const row_start = @min(i * row_stride, logits.len);
-                const row_end = @min(row_start + row_stride, logits.len);
+                const row_start = @min(try checkedSizeMul(i, row_stride), logits.len);
+                const row_end = @min(try checkedSizeAdd(row_start, row_stride), logits.len);
                 break :blk try self.decodeEntitiesFromLogits(
                     row,
                     labels,
@@ -528,6 +524,7 @@ pub const GlinerPipeline = struct {
                     .word_major_logits,
                 );
             };
+            if (first_result_by_prepared[prepared_i] == null) first_result_by_prepared[prepared_i] = i;
             initialized_results += 1;
         }
         const decode_ms = glinerProfileElapsedMs(decode_start_ns);
@@ -1593,6 +1590,24 @@ const AsciiCaselessStringContext = struct {
         return std.ascii.eqlIgnoreCase(a, b);
     }
 };
+
+fn checkedSizeMul(a: usize, b: usize) !usize {
+    return std.math.mul(usize, a, b) catch error.InvalidShape;
+}
+
+fn checkedSizeAdd(a: usize, b: usize) !usize {
+    return std.math.add(usize, a, b) catch error.InvalidShape;
+}
+
+fn sizeToI64(value: usize) !i64 {
+    if (value > std.math.maxInt(i64)) return error.InvalidShape;
+    return @intCast(value);
+}
+
+fn nonNegativeDim(value: i64) !usize {
+    if (value < 0) return error.InvalidShape;
+    return @intCast(value);
+}
 
 fn cloneEntities(alloc: std.mem.Allocator, entities: []const Entity) ![]Entity {
     const cloned = try alloc.alloc(Entity, entities.len);

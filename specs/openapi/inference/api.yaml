@@ -1533,16 +1533,21 @@ components:
           example: dslim/bert-base-NER
         texts:
           type: array
+          minItems: 1
+          maxItems: 128
           items:
             type: string
-          description: Texts to extract entities from
+            maxLength: 65536
+          description: Texts to extract entities from (4 MiB combined request limit)
           example:
             - John Smith works at Google.
             - Apple Inc. is in Cupertino.
         labels:
           type: array
+          maxItems: 256
           items:
             type: string
+            maxLength: 512
           description: |
             Custom entity labels to extract (GLiNER models only).
             When using a GLiNER model, you can specify any entity types to extract,
@@ -1555,8 +1560,10 @@ components:
             - date
         relation_labels:
           type: array
+          maxItems: 256
           items:
             type: string
+            maxLength: 512
           description: |
             Relation types to extract (for models with 'relations' capability).
             Only used when the model supports relation extraction (GLiNER multitask, REBEL).

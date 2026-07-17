@@ -162,6 +162,7 @@ required_symbols=(
   termite_add_bias_relu_rows_f32
   termite_add_weighted_scalars_f32
   termite_linear_bf16_weight_f32_tiled
+  termite_linear_f16_weight_f32_tiled
   termite_embedding_lookup_bf16_weight_f32
   termite_embedding_lookup_f16_weight_f32
   termite_embedding_lookup_i32_f16_weight_f32

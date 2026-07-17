@@ -317,7 +317,12 @@ fn writeFileAtomic(
     if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) {
         return error.InvalidKernelJitProfileOut;
     }
-    var dir = try compat.cwd().openDir(io, parent_path, .{});
+    // On Linux the default non-iterable directory handle may be opened with
+    // O_PATH. Such a handle is sufficient for relative filesystem operations
+    // but fsync(2) rejects it with EBADF. Atomic profile publication requires
+    // an fsync-capable directory descriptor, so request an iterable handle just
+    // as the executable artifact cache does.
+    var dir = try compat.cwd().openDir(io, parent_path, .{ .iterate = true });
     defer dir.close(io);
     const tmp_name = try std.fmt.allocPrint(
         allocator,

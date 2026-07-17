@@ -1609,7 +1609,20 @@ pub const EmbeddingPipeline = struct {
         const row_ids = try allocator.alloc(u32, batch);
         defer allocator.free(row_ids);
         for (row_ids, 0..) |*row_id, b| row_id.* = @intCast(b * seq_len);
-        const pooled = (try backend.takeRows(flat, row_ids, batch, hidden)) orelse return error.UnsupportedResidentTextPooling;
+        if (try backend.takeRows(flat, row_ids, batch, hidden)) |pooled| {
+            return .{ .value = pooled, .backend = backend, .owns_value = true };
+        }
+
+        // Backends with a generic slice primitive (notably native) can retain
+        // the resident path without implementing the optimized take-rows op.
+        const input_shape = [_]i64{ @intCast(batch), @intCast(seq_len), @intCast(hidden) };
+        const pooled_shape = [_]i64{ @intCast(batch), @intCast(hidden) };
+        const cls = backend.primSlice(output, &.{ 0, 0, 0 }, &.{ @intCast(batch), 1, @intCast(hidden) }, &.{ 1, 1, 1 }, &input_shape) catch |err| switch (err) {
+            error.UnsupportedPrimitiveOp => return error.UnsupportedResidentTextPooling,
+            else => return err,
+        };
+        defer backend.free(cls);
+        const pooled = try backend.primReshape(cls, &pooled_shape);
         return .{ .value = pooled, .backend = backend, .owns_value = true };
     }
 

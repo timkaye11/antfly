@@ -63,6 +63,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         try schema_labels.append(allocator, entry.key_ptr.*);
     }
 
+    model.lockRecognizerSession(io);
+    defer model.unlockRecognizerSession();
     if (model.isGlinerModel()) {
         var gliner = model.glinerPipeline(allocator);
         if (opts.relation_labels.items.len > 0) {

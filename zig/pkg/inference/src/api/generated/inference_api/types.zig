@@ -1117,7 +1117,7 @@ pub const RecognizeObject = struct {
 pub const RecognizeRequest = struct {
     /// Name of recognizer model from models_dir/recognizers/
     model: []const u8,
-    /// Texts to extract entities from
+    /// Texts to extract entities from (4 MiB combined request limit)
     texts: []const []const u8,
     /// Custom entity labels to extract (GLiNER models only). When using a GLiNER model, you can specify any entity types to extract, enabling zero-shot NER without model retraining. If not provided, the model's default labels are used.
     labels: ?[]const []const u8 = null,

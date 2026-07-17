@@ -658,6 +658,8 @@ pub const RuntimeStats = struct {
     deberta_stream_f16_staging_calls: usize = 0,
     deberta_materialized_f16_attention_calls: usize = 0,
     deberta_materialized_f16_attention_fallbacks: usize = 0,
+    deberta_materialized_workspace_rejections: usize = 0,
+    deberta_materialized_workspace_peak_bytes: usize = 0,
     deberta_generated_tc_attention_calls: usize = 0,
     deberta_generated_tc_m32_attention_calls: usize = 0,
     deberta_generated_tc_m16_attention_calls: usize = 0,
@@ -780,6 +782,7 @@ pub const RuntimeStats = struct {
     f16_cublaslt_qkv_calls: usize = 0,
     f16_cublaslt_activation_staging_calls: usize = 0,
     f16_cublaslt_fallbacks: usize = 0,
+    f16_scalar_linear_calls: usize = 0,
     rms_norm_bf16_mirror_hits: usize = 0,
     pinned_bulk_downloads: usize = 0,
     qkv_fallback_unsupported: usize = 0,
@@ -1082,11 +1085,10 @@ pub const CudaCompute = struct {
     deberta_v_f16_scratch: scratch_mod.DeviceScratch = .{},
     deberta_qr_f16_scratch: scratch_mod.DeviceScratch = .{},
     deberta_kr_f16_scratch: scratch_mod.DeviceScratch = .{},
-    deberta_content_scores_scratch: scratch_mod.DeviceScratch = .{},
-    deberta_c2p_scores_scratch: scratch_mod.DeviceScratch = .{},
-    deberta_p2c_scores_scratch: scratch_mod.DeviceScratch = .{},
-    deberta_probabilities_f16_scratch: scratch_mod.DeviceScratch = .{},
-    deberta_output_packed_scratch: scratch_mod.DeviceScratch = .{},
+    // Materialized attention uses one preflighted arena. A single allocation
+    // avoids ten independent grow/synchronize cycles and makes the complete
+    // retained workspace visible to admission before any CUDA allocation.
+    deberta_materialized_scratch: scratch_mod.DeviceScratch = .{},
     cublaslt_workspace_scratch: scratch_mod.DeviceScratch = .{},
     cublaslt: ?cublaslt_mod.CublasLt = null,
     stats: RuntimeStats = .{},
@@ -1279,11 +1281,7 @@ pub const CudaCompute = struct {
         self.deberta_v_f16_scratch.deinit(&self.ctx);
         self.deberta_qr_f16_scratch.deinit(&self.ctx);
         self.deberta_kr_f16_scratch.deinit(&self.ctx);
-        self.deberta_content_scores_scratch.deinit(&self.ctx);
-        self.deberta_c2p_scores_scratch.deinit(&self.ctx);
-        self.deberta_p2c_scores_scratch.deinit(&self.ctx);
-        self.deberta_probabilities_f16_scratch.deinit(&self.ctx);
-        self.deberta_output_packed_scratch.deinit(&self.ctx);
+        self.deberta_materialized_scratch.deinit(&self.ctx);
         self.cublaslt_workspace_scratch.deinit(&self.ctx);
         if (self.cublaslt) |*blas| {
             blas.deinit();
@@ -2294,6 +2292,7 @@ fn cudaCublasLtEnabled() bool {
 fn canUseF16TensorCoreWeights(self: *const CudaCompute) bool {
     return cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and
         self.cublaslt != null and self.kernels.f32_to_f16 != null and
+        self.kernels.linear_f16_weight_f32_tiled != null and
         self.kernels.embedding_lookup_f16_weight_f32 != null and
         self.kernels.embedding_lookup_i32_f16_weight_f32 != null;
 }
@@ -4466,6 +4465,109 @@ fn stageDebertaAttentionF16(
     return staged;
 }
 
+const deberta_materialized_workspace_alignment: usize = 256;
+const default_deberta_materialized_workspace_limit_bytes: usize = 512 * 1024 * 1024;
+
+const DebertaMaterializedWorkspaceLayout = struct {
+    q_f16: usize,
+    k_f16: usize,
+    v_f16: usize,
+    q_r_f16: usize,
+    k_r_f16: usize,
+    content_scores: usize,
+    c2p_scores: usize,
+    p2c_scores: usize,
+    probabilities_f16: usize,
+    output_packed: usize,
+    total_bytes: usize,
+};
+
+fn alignDebertaWorkspaceOffset(value: usize) !usize {
+    const padded = try checkedAdd(value, deberta_materialized_workspace_alignment - 1);
+    return padded & ~(deberta_materialized_workspace_alignment - 1);
+}
+
+fn appendDebertaWorkspaceRegion(cursor: *usize, bytes: usize) !usize {
+    const offset = try alignDebertaWorkspaceOffset(cursor.*);
+    cursor.* = try checkedAdd(offset, bytes);
+    return offset;
+}
+
+fn debertaMaterializedWorkspaceLayout(
+    f16_count_bytes: usize,
+    f16_rel_bytes: usize,
+    score_bytes: usize,
+    rel_score_bytes: usize,
+    probability_bytes: usize,
+    output_bytes: usize,
+) !DebertaMaterializedWorkspaceLayout {
+    var cursor: usize = 0;
+    const q_f16 = try appendDebertaWorkspaceRegion(&cursor, f16_count_bytes);
+    const k_f16 = try appendDebertaWorkspaceRegion(&cursor, f16_count_bytes);
+    const v_f16 = try appendDebertaWorkspaceRegion(&cursor, f16_count_bytes);
+    const q_r_f16 = try appendDebertaWorkspaceRegion(&cursor, f16_rel_bytes);
+    const k_r_f16 = try appendDebertaWorkspaceRegion(&cursor, f16_rel_bytes);
+    const content_scores = try appendDebertaWorkspaceRegion(&cursor, score_bytes);
+    const c2p_scores = try appendDebertaWorkspaceRegion(&cursor, rel_score_bytes);
+    const p2c_scores = try appendDebertaWorkspaceRegion(&cursor, rel_score_bytes);
+    const probabilities_f16 = try appendDebertaWorkspaceRegion(&cursor, probability_bytes);
+    const output_packed = try appendDebertaWorkspaceRegion(&cursor, output_bytes);
+    return .{
+        .q_f16 = q_f16,
+        .k_f16 = k_f16,
+        .v_f16 = v_f16,
+        .q_r_f16 = q_r_f16,
+        .k_r_f16 = k_r_f16,
+        .content_scores = content_scores,
+        .c2p_scores = c2p_scores,
+        .p2c_scores = p2c_scores,
+        .probabilities_f16 = probabilities_f16,
+        .output_packed = output_packed,
+        .total_bytes = try alignDebertaWorkspaceOffset(cursor),
+    };
+}
+
+fn debertaMaterializedWorkspaceLayoutForShape(batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !DebertaMaterializedWorkspaceLayout {
+    if (batch == 0 or seq_len == 0 or num_heads == 0 or head_dim == 0) return error.InvalidShape;
+    const hidden = try checkedMul(num_heads, head_dim);
+    const count = try checkedMul(try checkedMul(batch, seq_len), hidden);
+    const rel_len = try checkedSub(try checkedMul(2, seq_len), 1);
+    const packed_rel_count = try checkedMul(batch, try checkedMul(rel_len, hidden));
+    const score_count = try checkedMul(try checkedMul(batch, num_heads), try checkedMul(seq_len, seq_len));
+    const rel_score_count = try checkedMul(try checkedMul(batch, num_heads), try checkedMul(seq_len, rel_len));
+    return debertaMaterializedWorkspaceLayout(
+        try checkedMul(count, @sizeOf(u16)),
+        try checkedMul(packed_rel_count, @sizeOf(u16)),
+        try checkedMul(score_count, @sizeOf(f32)),
+        try checkedMul(rel_score_count, @sizeOf(f32)),
+        try checkedMul(score_count, @sizeOf(u16)),
+        try checkedMul(count, @sizeOf(f32)),
+    );
+}
+
+fn debertaWorkspaceRegion(arena: buffer_mod.DeviceBuffer, offset: usize, bytes: usize) buffer_mod.DeviceBuffer {
+    std.debug.assert(offset <= arena.len and bytes <= arena.len - offset);
+    return .{ .ptr = arena.ptr + @as(u64, @intCast(offset)), .len = bytes };
+}
+
+fn cudaDebertaMaterializedWorkspaceLimitBytes(self: *const CudaCompute) usize {
+    const configured = if (platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_DEBERTA_MATERIALIZED_WORKSPACE_MB")) |mb|
+        std.math.mul(usize, mb, 1024 * 1024) catch 0
+    else
+        default_deberta_materialized_workspace_limit_bytes;
+    const budget = self.run_budget orelse return configured;
+    const scratch_limit = budget.limits.scratch_limit_bytes;
+    if (scratch_limit == 0) return configured;
+    const remaining = scratch_limit -| budget.scratchTotalBytes();
+    return @min(configured, remaining);
+}
+
+fn debertaMaterializedAutoTarget(compute_major: i32, compute_minor: i32) bool {
+    // Current production evidence is exact to NVIDIA L4 / SM89. Keep other
+    // architectures available through explicit diagnostic mode only.
+    return compute_major == 8 and compute_minor == 9;
+}
+
 /// Materialized DeBERTa attention follows the same schedule as the fast CPU
 /// encoder path: QK^T, QKr^T, and KQr^T are tensor-core GEMMs; a generated
 /// kernel gathers relative-position diagonals and applies softmax; P*V is the
@@ -4504,16 +4606,33 @@ fn tryDebertaMaterializedAttentionF16(
     const rel_score_bytes = checkedMul(rel_score_count, @sizeOf(f32)) catch return false;
     const probability_bytes = checkedMul(score_count, @sizeOf(u16)) catch return false;
     const output_bytes = checkedMul(count, @sizeOf(f32)) catch return false;
-    const q_f16 = self.deberta_q_f16_scratch.acquire(&self.ctx, f16_count_bytes) catch return false;
-    const k_f16 = self.deberta_k_f16_scratch.acquire(&self.ctx, f16_count_bytes) catch return false;
-    const v_f16 = self.deberta_v_f16_scratch.acquire(&self.ctx, f16_count_bytes) catch return false;
-    const q_r_f16 = self.deberta_qr_f16_scratch.acquire(&self.ctx, f16_rel_bytes) catch return false;
-    const k_r_f16 = self.deberta_kr_f16_scratch.acquire(&self.ctx, f16_rel_bytes) catch return false;
-    const content_scores = self.deberta_content_scores_scratch.acquire(&self.ctx, score_bytes) catch return false;
-    const c2p_scores = self.deberta_c2p_scores_scratch.acquire(&self.ctx, rel_score_bytes) catch return false;
-    const p2c_scores = self.deberta_p2c_scores_scratch.acquire(&self.ctx, rel_score_bytes) catch return false;
-    const probabilities_f16 = self.deberta_probabilities_f16_scratch.acquire(&self.ctx, probability_bytes) catch return false;
-    const output_packed = self.deberta_output_packed_scratch.acquire(&self.ctx, output_bytes) catch return false;
+    const layout = debertaMaterializedWorkspaceLayout(
+        f16_count_bytes,
+        f16_rel_bytes,
+        score_bytes,
+        rel_score_bytes,
+        probability_bytes,
+        output_bytes,
+    ) catch return false;
+    if (layout.total_bytes > cudaDebertaMaterializedWorkspaceLimitBytes(self)) {
+        self.stats.deberta_materialized_workspace_rejections += 1;
+        return false;
+    }
+    const arena = self.deberta_materialized_scratch.acquire(&self.ctx, layout.total_bytes) catch return false;
+    self.stats.deberta_materialized_workspace_peak_bytes = @max(
+        self.stats.deberta_materialized_workspace_peak_bytes,
+        layout.total_bytes,
+    );
+    const q_f16 = debertaWorkspaceRegion(arena, layout.q_f16, f16_count_bytes);
+    const k_f16 = debertaWorkspaceRegion(arena, layout.k_f16, f16_count_bytes);
+    const v_f16 = debertaWorkspaceRegion(arena, layout.v_f16, f16_count_bytes);
+    const q_r_f16 = debertaWorkspaceRegion(arena, layout.q_r_f16, f16_rel_bytes);
+    const k_r_f16 = debertaWorkspaceRegion(arena, layout.k_r_f16, f16_rel_bytes);
+    const content_scores = debertaWorkspaceRegion(arena, layout.content_scores, score_bytes);
+    const c2p_scores = debertaWorkspaceRegion(arena, layout.c2p_scores, rel_score_bytes);
+    const p2c_scores = debertaWorkspaceRegion(arena, layout.p2c_scores, rel_score_bytes);
+    const probabilities_f16 = debertaWorkspaceRegion(arena, layout.probabilities_f16, probability_bytes);
+    const output_packed = debertaWorkspaceRegion(arena, layout.output_packed, output_bytes);
 
     if (!try self.kernels.launchDebertaPackHeadsF16(&self.ctx, q_f16, k_f16, v_f16, q_r_f16, k_r_f16, q.buffer, k.buffer, v.buffer, q_r.buffer, k_r.buffer, batch, seq_len, num_heads, head_dim)) return false;
     const blas = &(self.cublaslt orelse return false);
@@ -7657,12 +7776,25 @@ const CudaDebertaAttentionMode = enum {
     generated_tc,
 };
 
+fn parseCudaDebertaAttentionMode(value: []const u8) ?CudaDebertaAttentionMode {
+    if (std.ascii.eqlIgnoreCase(value, "auto")) return .auto;
+    if (std.ascii.eqlIgnoreCase(value, "f32") or std.ascii.eqlIgnoreCase(value, "fused") or std.ascii.eqlIgnoreCase(value, "fused-f32")) return .fused_f32;
+    if (std.ascii.eqlIgnoreCase(value, "streaming") or std.ascii.eqlIgnoreCase(value, "streaming-f16")) return .streaming_f16;
+    if (std.ascii.eqlIgnoreCase(value, "materialized") or std.ascii.eqlIgnoreCase(value, "materialized-f16") or std.ascii.eqlIgnoreCase(value, "tensor-core")) return .materialized_f16;
+    if (std.ascii.eqlIgnoreCase(value, "generated") or std.ascii.eqlIgnoreCase(value, "generated-tc") or std.ascii.eqlIgnoreCase(value, "tc")) return .generated_tc;
+    return null;
+}
+
+const CudaDebertaInvalidModeWarning = struct {
+    var emitted = std.atomic.Value(bool).init(false);
+};
+
 fn cudaDebertaAttentionMode() CudaDebertaAttentionMode {
     if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_DEBERTA_ATTENTION_MODE")) |value| {
-        if (std.ascii.eqlIgnoreCase(value, "f32") or std.ascii.eqlIgnoreCase(value, "fused") or std.ascii.eqlIgnoreCase(value, "fused-f32")) return .fused_f32;
-        if (std.ascii.eqlIgnoreCase(value, "streaming") or std.ascii.eqlIgnoreCase(value, "streaming-f16") or std.ascii.eqlIgnoreCase(value, "generated")) return .streaming_f16;
-        if (std.ascii.eqlIgnoreCase(value, "materialized") or std.ascii.eqlIgnoreCase(value, "materialized-f16") or std.ascii.eqlIgnoreCase(value, "tensor-core")) return .materialized_f16;
-        if (std.ascii.eqlIgnoreCase(value, "generated-tc") or std.ascii.eqlIgnoreCase(value, "tc")) return .generated_tc;
+        if (parseCudaDebertaAttentionMode(value)) |mode| return mode;
+        if (!CudaDebertaInvalidModeWarning.emitted.swap(true, .monotonic)) {
+            std.log.warn("ignoring invalid ANTFLY_INFERENCE_CUDA_DEBERTA_ATTENTION_MODE='{s}'; using auto", .{value});
+        }
     }
     return .auto;
 }
@@ -7677,10 +7809,23 @@ fn cudaDebertaGeneratedTcAutoEnabled() bool {
 
 const CudaDebertaGeneratedTcVariant = enum { auto, m32, m16 };
 
+fn parseCudaDebertaGeneratedTcVariant(value: []const u8) ?CudaDebertaGeneratedTcVariant {
+    if (std.ascii.eqlIgnoreCase(value, "auto")) return .auto;
+    if (std.ascii.eqlIgnoreCase(value, "m16") or std.ascii.eqlIgnoreCase(value, "m16n32")) return .m16;
+    if (std.ascii.eqlIgnoreCase(value, "m32") or std.ascii.eqlIgnoreCase(value, "m32n16")) return .m32;
+    return null;
+}
+
+const CudaDebertaInvalidVariantWarning = struct {
+    var emitted = std.atomic.Value(bool).init(false);
+};
+
 fn cudaDebertaGeneratedTcVariant() CudaDebertaGeneratedTcVariant {
     if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_DEBERTA_GENERATED_TC_VARIANT")) |value| {
-        if (std.ascii.eqlIgnoreCase(value, "m16") or std.ascii.eqlIgnoreCase(value, "m16n32")) return .m16;
-        if (std.ascii.eqlIgnoreCase(value, "m32") or std.ascii.eqlIgnoreCase(value, "m32n16")) return .m32;
+        if (parseCudaDebertaGeneratedTcVariant(value)) |variant| return variant;
+        if (!CudaDebertaInvalidVariantWarning.emitted.swap(true, .monotonic)) {
+            std.log.warn("ignoring invalid ANTFLY_INFERENCE_CUDA_DEBERTA_GENERATED_TC_VARIANT='{s}'; using auto", .{value});
+        }
     }
     return .auto;
 }
@@ -9037,7 +9182,9 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .f16, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
         } else {
             self.stats.f16_cublaslt_fallbacks += 1;
-            return error.CudaFp16TensorCoreUnavailable;
+            try self.kernels.launchLinearF16WeightF32Tiled(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+            self.stats.f16_scalar_linear_calls += 1;
+            self.dispatch_stats.note(self.allocator, .linear_no_bias, .f16, .dense_cuda, .none, .none, rows, in_dim, out_dim, 0);
         }
     } else if (rows == 1 and weight_tensor.quant_type == null and weight_tensor.dtype == .f32 and
         weight_tensor.bf16_mirror.ptr != 0 and
@@ -10692,7 +10839,10 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
             kv_out_dim,
         )) {
             self.stats.f16_cublaslt_fallbacks += 1;
-            return null;
+            try self.kernels.launchLinearF16WeightF32Tiled(&self.ctx, q_device, input_tensor.buffer, q_weight_tensor.buffer, rows, in_dim, q_out_dim);
+            try self.kernels.launchLinearF16WeightF32Tiled(&self.ctx, k_device, input_tensor.buffer, k_weight_tensor.buffer, rows, in_dim, kv_out_dim);
+            try self.kernels.launchLinearF16WeightF32Tiled(&self.ctx, v_device, input_tensor.buffer, v_weight_tensor.buffer, rows, in_dim, kv_out_dim);
+            self.stats.f16_scalar_linear_calls += 3;
         }
         self.stats.qkv_fused_f32 += 1;
         self.stats.launch_linear_qkv += 1;
@@ -10989,7 +11139,9 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
             out_dim,
         )) {
             self.stats.f16_cublaslt_fallbacks += 1;
-            return error.CudaFp16TensorCoreUnavailable;
+            try self.kernels.launchLinearF16WeightF32Tiled(&self.ctx, device_a, input_tensor.buffer, weight_a_tensor.buffer, rows, in_dim, out_dim);
+            try self.kernels.launchLinearF16WeightF32Tiled(&self.ctx, device_b, input_tensor.buffer, weight_b_tensor.buffer, rows, in_dim, out_dim);
+            self.stats.f16_scalar_linear_calls += 2;
         }
     } else if (use_bf16) {
         if (try tryCublasLtBf16LinearPair(
@@ -13720,10 +13872,12 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
         self.stats.deberta_generated_tc_attention_fallbacks += 1;
     }
     // Qualification on SM89/L4 shows the cuBLASLt materialized schedule is
-    // the best current B4+ production route, while the fused scalar schedule
-    // remains preferable for latency-oriented small batches. Keep the shape
-    // gate explicit so B1 does not inherit B8's score-buffer overhead.
+    // the best current B4+ production route. Do not generalize that evidence
+    // to other tensor-core generations; explicit mode remains available for
+    // collecting qualification data there. Workspace admission inside the
+    // route falls through to bounded fused attention before allocating.
     const auto_materialized_f16 = attention_mode == .auto and
+        debertaMaterializedAutoTarget(self.ctx.info.compute_major, self.ctx.info.compute_minor) and
         batch >= 4 and seq_len >= 128 and seq_len <= 256 and head_dim == 64;
     if (attention_mode == .materialized_f16 or auto_materialized_f16) {
         if (try tryDebertaMaterializedAttentionF16(self, device, q_tensor, k_tensor, v_tensor, q_r_tensor, k_r_tensor, mask_device, batch, seq_len, num_heads, head_dim)) {
@@ -16095,6 +16249,48 @@ test "cuda shape helpers reject incompatible shapes" {
     try std.testing.expect(try checkedMul(2, 3) == 6);
     try std.testing.expect(sameShape(&.{ 2, 3 }, &.{ 2, 3 }));
     try std.testing.expect(!sameShape(&.{ 2, 3 }, &.{ 3, 2 }));
+}
+
+test "deberta materialized workspace is aligned bounded and scales linearly with batch" {
+    const b8 = try debertaMaterializedWorkspaceLayoutForShape(8, 256, 12, 64);
+    const b32 = try debertaMaterializedWorkspaceLayoutForShape(32, 256, 12, 64);
+    inline for (.{
+        b8.q_f16,
+        b8.k_f16,
+        b8.v_f16,
+        b8.q_r_f16,
+        b8.k_r_f16,
+        b8.content_scores,
+        b8.c2p_scores,
+        b8.p2c_scores,
+        b8.probabilities_f16,
+        b8.output_packed,
+        b8.total_bytes,
+    }) |offset| try std.testing.expectEqual(@as(usize, 0), offset % deberta_materialized_workspace_alignment);
+    try std.testing.expect(b8.total_bytes < default_deberta_materialized_workspace_limit_bytes);
+    try std.testing.expect(b32.total_bytes > default_deberta_materialized_workspace_limit_bytes);
+    try std.testing.expect(b32.total_bytes >= b8.total_bytes * 4);
+}
+
+test "deberta materialized auto promotion is exact to qualified sm89" {
+    try std.testing.expect(debertaMaterializedAutoTarget(8, 9));
+    try std.testing.expect(!debertaMaterializedAutoTarget(8, 0));
+    try std.testing.expect(!debertaMaterializedAutoTarget(9, 0));
+}
+
+test "deberta attention mode aliases select the advertised routes" {
+    try std.testing.expectEqual(CudaDebertaAttentionMode.auto, parseCudaDebertaAttentionMode("auto").?);
+    try std.testing.expectEqual(CudaDebertaAttentionMode.generated_tc, parseCudaDebertaAttentionMode("generated").?);
+    try std.testing.expectEqual(CudaDebertaAttentionMode.generated_tc, parseCudaDebertaAttentionMode("generated-tc").?);
+    try std.testing.expectEqual(CudaDebertaAttentionMode.streaming_f16, parseCudaDebertaAttentionMode("streaming-f16").?);
+    try std.testing.expectEqual(@as(?CudaDebertaAttentionMode, null), parseCudaDebertaAttentionMode("typo"));
+}
+
+test "deberta generated attention variants parse strictly" {
+    try std.testing.expectEqual(CudaDebertaGeneratedTcVariant.auto, parseCudaDebertaGeneratedTcVariant("auto").?);
+    try std.testing.expectEqual(CudaDebertaGeneratedTcVariant.m32, parseCudaDebertaGeneratedTcVariant("m32n16").?);
+    try std.testing.expectEqual(CudaDebertaGeneratedTcVariant.m16, parseCudaDebertaGeneratedTcVariant("m16").?);
+    try std.testing.expectEqual(@as(?CudaDebertaGeneratedTcVariant, null), parseCudaDebertaGeneratedTcVariant("m64"));
 }
 
 test "cuda lazy demand cancels pending host prefetch item" {

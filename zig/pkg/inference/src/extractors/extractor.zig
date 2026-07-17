@@ -116,7 +116,9 @@ const RecognizerExtractor = struct {
 
         var gliner = model.glinerPipeline(ctx.allocator);
         var extraction_config = config;
-        extraction_config.cleanup_model = try model.getCleanupHead();
+        extraction_config.cleanup_model = try model.getCleanupHead(ctx.io);
+        model.lockRecognizerSession(ctx.io);
+        defer model.unlockRecognizerSession();
         return extraction_mod.extractBatch(ctx.allocator, &gliner, texts, schemas, extraction_config);
     }
 

@@ -16,7 +16,6 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$repo_root"
 
 default_models_root="${ANTFLY_INFERENCE_MODELS_DIR:-${HOME:+$HOME/.antfly/inference/models}}"
 model_dir="${ANTFLY_GLINER2_MODEL_DIR:-${default_models_root:+$default_models_root/antflydb/gliner2-base-v1}}"
@@ -25,6 +24,7 @@ command_timeout="${ANTFLY_GLINER2_COMMAND_TIMEOUT:-1200}"
 warmup_iters="${ANTFLY_GLINER2_WARMUP_ITERS:-1}"
 measure_iters="${ANTFLY_GLINER2_MEASURE_ITERS:-1}"
 verify_generated_tc="${ANTFLY_GLINER2_VERIFY_GENERATED_TC:-0}"
+verify_materialized_auto="${ANTFLY_GLINER2_VERIFY_MATERIALIZED_AUTO:-auto}"
 cuda_artifacts="${ANTFLY_CUDA_ARTIFACTS:-fatbin}"
 cuda_libraries="${ANTFLY_CUDA_LIBS:-auto}"
 optimize="${ANTFLY_CUDA_VERIFY_OPTIMIZE:-ReleaseFast}"
@@ -47,6 +47,12 @@ if [[ -z "$model_dir" ]]; then
   echo "set ANTFLY_GLINER2_MODEL_DIR, or set ANTFLY_INFERENCE_MODELS_DIR/HOME for the default model location" >&2
   exit 1
 fi
+if [[ ! -d "$model_dir" ]]; then
+  echo "missing GLiNER model directory at $model_dir" >&2
+  exit 1
+fi
+model_dir="$(cd "$model_dir" && pwd -P)"
+cd "$repo_root"
 if [[ ! -f "$model_dir/gliner_config.json" ]]; then
   echo "missing GLiNER config at $model_dir/gliner_config.json" >&2
   exit 1
@@ -62,7 +68,7 @@ fi
 
 zig_bin="$(resolve_zig)"
 
-python3 - "$zig_bin" "$model_dir" "$score_tolerance" "$command_timeout" "$warmup_iters" "$measure_iters" "$verify_generated_tc" "$cuda_artifacts" "$cuda_libraries" "$optimize" "$zig_global_cache_dir" <<'PY'
+python3 - "$zig_bin" "$model_dir" "$score_tolerance" "$command_timeout" "$warmup_iters" "$measure_iters" "$verify_generated_tc" "$verify_materialized_auto" "$cuda_artifacts" "$cuda_libraries" "$optimize" "$zig_global_cache_dir" <<'PY'
 import csv
 import io
 import math
@@ -71,10 +77,53 @@ import re
 import subprocess
 import sys
 
-zig_bin, model_dir, tolerance_raw, timeout_raw, warmup_iters, measure_iters, verify_generated_tc_raw, cuda_artifacts, cuda_libraries, optimize, zig_global_cache_dir = sys.argv[1:12]
+zig_bin, model_dir, tolerance_raw, timeout_raw, warmup_iters, measure_iters, verify_generated_tc_raw, verify_materialized_auto_raw, cuda_artifacts, cuda_libraries, optimize, zig_global_cache_dir = sys.argv[1:13]
 tolerance = float(tolerance_raw)
 timeout = float(timeout_raw)
-verify_generated_tc = verify_generated_tc_raw.lower() in ("1", "true", "yes", "on")
+
+def parse_switch(raw, name, allow_auto=False):
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    if allow_auto and value == "auto":
+        return None
+    raise SystemExit(f"{name} must be one of 0/1, false/true" + (", or auto" if allow_auto else ""))
+
+def default_cuda_device_is_sm89():
+    try:
+        output = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=index,compute_cap", "--format=csv,noheader,nounits"],
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=min(timeout, 15.0),
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+    capabilities = {}
+    for line in output.splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) == 2:
+            capabilities[fields[0]] = fields[1]
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    # CUDA device zero maps to the first numeric entry when an explicit
+    # visibility mask is present; otherwise it maps to physical index zero.
+    physical_index = visible.split(",", 1)[0].strip() if visible else "0"
+    return capabilities.get(physical_index) == "8.9"
+
+verify_generated_tc = parse_switch(
+    verify_generated_tc_raw,
+    "ANTFLY_GLINER2_VERIFY_GENERATED_TC",
+)
+materialized_setting = parse_switch(
+    verify_materialized_auto_raw,
+    "ANTFLY_GLINER2_VERIFY_MATERIALIZED_AUTO",
+    allow_auto=True,
+)
+verify_materialized_auto = default_cuda_device_is_sm89() if materialized_setting is None else materialized_setting
+if materialized_setting is None and not verify_materialized_auto:
+    print("case=distinct_b8_s256 materialized_auto=skipped reason=default_cuda_device_not_detected_as_sm89", flush=True)
 
 cases = [
     {
@@ -106,7 +155,7 @@ def checked_output(cmd, env=None):
         print_subprocess_output(exc)
         raise
 
-def run_case(backend, case, attention_mode=None):
+def run_case(backend, case, attention_mode=None, batch_size=1, expected_encoder_seq_len=None, dump_entities=True):
     cmd = [
         zig_bin,
         "build",
@@ -124,18 +173,25 @@ def run_case(backend, case, attention_mode=None):
         backend,
         "--task",
         "entities",
-        "--text",
-        case["text"],
         "--batch-size",
-        "1",
+        str(batch_size),
         "--warmup-iters",
         warmup_iters,
         "--measure-iters",
         measure_iters,
         "--format",
         "csv",
-        "--dump-entities",
     ]
+    if "text_batch_file" in case:
+        cmd.extend(["--text-batch-file", case["text_batch_file"]])
+    elif "text_file" in case:
+        cmd.extend(["--text-file", case["text_file"]])
+    else:
+        cmd.extend(["--text", case["text"]])
+    if expected_encoder_seq_len is not None:
+        cmd.extend(["--expect-encoder-seq-len", str(expected_encoder_seq_len)])
+    if dump_entities:
+        cmd.append("--dump-entities")
     for label in case["labels"]:
         cmd.extend(["--label", label])
 
@@ -143,6 +199,8 @@ def run_case(backend, case, attention_mode=None):
     if attention_mode is not None:
         env = dict(os.environ)
         env["ANTFLY_INFERENCE_CUDA_DEBERTA_ATTENTION_MODE"] = attention_mode
+        if attention_mode == "generated-tc":
+            env["ANTFLY_INFERENCE_CUDA_DEBERTA_GENERATED_TC_VARIANT"] = "m32"
     raw = checked_output(cmd, env)
     csv_lines = []
     entities = []
@@ -176,12 +234,32 @@ def run_case(backend, case, attention_mode=None):
         raise AssertionError(f"{case['name']} {backend}: invalid row {warm}")
     generated_calls = int(warm.get("cuda_deberta_generated_tc_attention_calls", "0") or 0)
     generated_m32_calls = int(warm.get("cuda_deberta_generated_tc_m32_attention_calls", "0") or 0)
+    generated_fallbacks = int(warm.get("cuda_deberta_generated_tc_attention_fallbacks", "0") or 0)
+    materialized_calls = int(warm.get("cuda_deberta_materialized_f16_attention_calls", "0") or 0)
+    materialized_fallbacks = int(warm.get("cuda_deberta_materialized_f16_attention_fallbacks", "0") or 0)
+    materialized_workspace_rejections = int(warm.get("cuda_deberta_materialized_workspace_rejections", "0") or 0)
+    f16_cublaslt_fallbacks = int(warm.get("cuda_f16_cublaslt_fallbacks", "0") or 0)
+    f16_scalar_linear_calls = int(warm.get("cuda_f16_scalar_linear_calls", "0") or 0)
     if attention_mode == "generated-tc" and generated_calls <= 0:
         raise AssertionError(f"{case['name']} generated-tc: fused tensor-core route was not used: {warm}")
     if attention_mode == "generated-tc" and generated_m32_calls != generated_calls:
         raise AssertionError(f"{case['name']} generated-tc: requested M32 schedule silently fell back: {warm}")
+    if attention_mode == "generated-tc" and generated_fallbacks != 0:
+        raise AssertionError(f"{case['name']} generated-tc: route recorded {generated_fallbacks} fallback(s): {warm}")
+    if backend == "cuda" and (f16_cublaslt_fallbacks != 0 or f16_scalar_linear_calls != 0):
+        raise AssertionError(f"{case['name']} cuda: qualified shape used FP16 scalar fallback: {warm}")
     entities.sort(key=lambda entity: (entity["start"], entity["end"], entity["label"], entity["text"]))
-    return {"entity_count": entity_count, "score_sum": score_sum, "generated_calls": generated_calls, "generated_m32_calls": generated_m32_calls, "entities": entities}
+    return {
+        "entity_count": entity_count,
+        "score_sum": score_sum,
+        "generated_calls": generated_calls,
+        "generated_m32_calls": generated_m32_calls,
+        "generated_fallbacks": generated_fallbacks,
+        "materialized_calls": materialized_calls,
+        "materialized_fallbacks": materialized_fallbacks,
+        "materialized_workspace_rejections": materialized_workspace_rejections,
+        "entities": entities,
+    }
 
 def verify_entities(case_name, reference, candidate, route):
     reference_keys = [(e["label"], e["start"], e["end"], e["text"]) for e in reference["entities"]]
@@ -220,6 +298,42 @@ for case in cases:
         verify_entities(case["name"], native, generated, "generated-tc")
         if generated_diff > tolerance:
             raise SystemExit(f"{case['name']}: native/generated-tc score diff {generated_diff:.8f} exceeds tolerance {tolerance:.8f}")
+
+qualification_case = {
+    "name": "distinct_b8_s256",
+    "text_batch_file": "scripts/fixtures/gliner2_256_distinct_b8.txt",
+    "labels": ["person", "organization", "location", "date", "money"],
+}
+if verify_materialized_auto:
+    production = run_case(
+        "cuda",
+        qualification_case,
+        batch_size=8,
+        expected_encoder_seq_len=256,
+        dump_entities=False,
+    )
+    if production["materialized_calls"] <= 0:
+        raise SystemExit(f"distinct B8 S256: production auto did not use materialized attention: {production}")
+    if production["materialized_fallbacks"] != 0 or production["materialized_workspace_rejections"] != 0:
+        raise SystemExit(f"distinct B8 S256: production materialized attention fell back or rejected workspace: {production}")
+    print(
+        f"case=distinct_b8_s256 materialized_calls={production['materialized_calls']} materialized_fallbacks={production['materialized_fallbacks']} workspace_rejections={production['materialized_workspace_rejections']}",
+        flush=True,
+    )
+
+if verify_generated_tc:
+    generated_b8 = run_case(
+        "cuda",
+        qualification_case,
+        "generated-tc",
+        batch_size=8,
+        expected_encoder_seq_len=256,
+        dump_entities=False,
+    )
+    print(
+        f"case=distinct_b8_s256 generated_tc_calls={generated_b8['generated_calls']} generated_tc_m32_calls={generated_b8['generated_m32_calls']} generated_tc_fallbacks={generated_b8['generated_fallbacks']}",
+        flush=True,
+    )
 
 print("gliner2 E2E native/cuda parity completed", flush=True)
 PY

@@ -849,6 +849,11 @@ pub const LoadedModel = struct {
     // Multimodal sessions (CLIP/CLAP/CLIPCLAP)
     embedding_session_lock: std.atomic.Mutex = .unlocked,
     reranking_session_lock: std.atomic.Mutex = .unlocked,
+    // Recognizer pipelines reuse the primary backend session. CUDA and Metal
+    // sessions own mutable streams, scratch arenas, plan caches, and counters,
+    // so one LoadedModel must not execute overlapping recognition requests.
+    recognizer_session_lock: std.atomic.Mutex = .unlocked,
+    cleanup_head_lock: std.atomic.Mutex = .unlocked,
     vision_session: ?backends.Session = null,
     audio_session: ?backends.Session = null,
     text_projection: ?backends.Session = null,
@@ -906,6 +911,14 @@ pub const LoadedModel = struct {
 
     pub fn nativeGenerationMutex(self: *LoadedModel) *std.atomic.Mutex {
         return &self.native_generate_lock;
+    }
+
+    pub fn lockRecognizerSession(self: *LoadedModel, io: std.Io) void {
+        platform.sync.lockYieldingIo(&self.recognizer_session_lock, io);
+    }
+
+    pub fn unlockRecognizerSession(self: *LoadedModel) void {
+        self.recognizer_session_lock.unlock();
     }
 
     pub fn wholeModelExecutor(self: *LoadedModel, allocator: std.mem.Allocator, kv_dtype: ?runtime.kv.pool.KvDType) !?graph_mod.model_runtime.ModelExecutor {
@@ -1160,7 +1173,9 @@ pub const LoadedModel = struct {
         };
     }
 
-    pub fn getCleanupHead(self: *LoadedModel) !?*const cleanup_model_mod.CleanupHead {
+    pub fn getCleanupHead(self: *LoadedModel, io: std.Io) !?*const cleanup_model_mod.CleanupHead {
+        platform.sync.lockYieldingIo(&self.cleanup_head_lock, io);
+        defer self.cleanup_head_lock.unlock();
         if (self.cleanup_head_loaded) return self.cleanup_head;
 
         const loaded = (try cleanup_model_mod.loadHeadIfPresent(self.allocator, self.model_dir)) orelse {

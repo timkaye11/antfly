@@ -214,6 +214,39 @@ extern "C" __global__ void termite_linear_bf16_weight_f32_tiled(
     if (tid == 0u) dst[global] = partial[0];
 }
 
+// Compatibility route for native FP16 encoder weights when cuBLASLt cannot
+// produce or execute an algorithm for a newly introduced dense shape. This is
+// intentionally simple and universally shaped: qualified tensor-core plans
+// remain the fast path, while an unsupported heuristic degrades to correct
+// device-resident execution instead of failing the request.
+extern "C" __global__ void termite_linear_f16_weight_f32_tiled(
+    float* dst,
+    const float* input,
+    const unsigned short* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    unsigned int global = blockIdx.x;
+    unsigned int total = rows * out_dim;
+    if (global >= total) return;
+    unsigned int row = global / out_dim;
+    unsigned int col = global - row * out_dim;
+    unsigned int tid = threadIdx.x;
+    __shared__ float partial[256];
+    float acc = 0.0f;
+    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
+        acc += input[row * in_dim + i] * __half2float(__ushort_as_half(weight[col * in_dim + i]));
+    }
+    partial[tid] = acc;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0u) dst[global] = partial[0];
+}
+
 extern "C" __global__ void termite_argmax_last_row_f32(
     unsigned int* dst,
     const float* input,

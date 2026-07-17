@@ -613,6 +613,17 @@ pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 const max_generate_batch_items: usize = 128;
 const max_read_batch_images: usize = 64;
+const max_recognize_texts: usize = 128;
+const max_recognize_text_bytes: usize = 64 * 1024;
+const max_recognize_total_text_bytes: usize = 4 * 1024 * 1024;
+const max_recognize_labels: usize = 256;
+const max_recognize_label_bytes: usize = 512;
+const max_recognize_total_label_bytes: usize = 128 * 1024;
+const max_recognize_relation_candidates: usize = 1024;
+const max_recognize_score_cells: usize = 32 * 1024 * 1024;
+const recognize_admission_texts_per_unit: usize = 8;
+const recognize_admission_bytes_per_unit: usize = 512 * 1024;
+const recognize_admission_score_cells_per_unit: usize = 4 * 1024 * 1024;
 const default_read_queue_max_tokens: usize = 256;
 const max_read_tokens: usize = 1024;
 const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
@@ -631,6 +642,80 @@ const default_request_content_security = scraping.ContentSecurityConfig{
     .block_private_ips = true,
     .max_download_size_bytes = 100 * 1024 * 1024,
 };
+
+const RecognizeAdmission = struct {
+    units: usize,
+    total_text_bytes: usize,
+    estimated_score_cells: usize,
+};
+
+fn checkedRecognizeAdd(a: usize, b: usize) !usize {
+    return std.math.add(usize, a, b) catch error.RecognizeRequestTooLarge;
+}
+
+fn checkedRecognizeMul(a: usize, b: usize) !usize {
+    return std.math.mul(usize, a, b) catch error.RecognizeRequestTooLarge;
+}
+
+fn recognizeStringsBytes(values: []const []const u8, per_item_limit: usize, total_limit: usize) !usize {
+    var total: usize = 0;
+    for (values) |value| {
+        if (value.len > per_item_limit) return error.RecognizeRequestTooLarge;
+        total = try checkedRecognizeAdd(total, value.len);
+        if (total > total_limit) return error.RecognizeRequestTooLarge;
+    }
+    return total;
+}
+
+fn recognizeRequestAdmission(body: api.RecognizeRequest, default_entity_label_count: ?usize) !RecognizeAdmission {
+    if (body.texts.len == 0) return error.RecognizeTextsRequired;
+    if (body.texts.len > max_recognize_texts) return error.RecognizeRequestTooLarge;
+    const total_text_bytes = try recognizeStringsBytes(
+        body.texts,
+        max_recognize_text_bytes,
+        max_recognize_total_text_bytes,
+    );
+
+    const labels = body.labels orelse &.{};
+    const relation_labels = body.relation_labels orelse &.{};
+    if (labels.len > max_recognize_labels or relation_labels.len > max_recognize_labels) {
+        return error.RecognizeRequestTooLarge;
+    }
+    const label_bytes = try recognizeStringsBytes(labels, max_recognize_label_bytes, max_recognize_total_label_bytes);
+    const relation_label_bytes = try recognizeStringsBytes(relation_labels, max_recognize_label_bytes, max_recognize_total_label_bytes);
+    if (try checkedRecognizeAdd(label_bytes, relation_label_bytes) > max_recognize_total_label_bytes) {
+        return error.RecognizeRequestTooLarge;
+    }
+
+    const entity_label_count = if (labels.len > 0)
+        labels.len
+    else
+        @max(default_entity_label_count orelse 1, 1);
+    if (entity_label_count > max_recognize_labels) return error.RecognizeRequestTooLarge;
+    const relation_candidate_count = if (relation_labels.len > 0)
+        try checkedRecognizeMul(entity_label_count, relation_labels.len)
+    else
+        0;
+    if (relation_candidate_count > max_recognize_relation_candidates) return error.RecognizeRequestTooLarge;
+    const total_schema_labels = try checkedRecognizeAdd(entity_label_count, relation_candidate_count);
+    // Admission is intentionally conservative before the model is loaded:
+    // GLiNER's public maximum is S512 and its default maximum span width is 12.
+    const estimated_score_cells = try checkedRecognizeMul(
+        try checkedRecognizeMul(try checkedRecognizeMul(body.texts.len, 512), 12),
+        total_schema_labels,
+    );
+    if (estimated_score_cells > max_recognize_score_cells) return error.RecognizeRequestTooLarge;
+
+    var units: usize = 1;
+    units = try checkedRecognizeAdd(units, (body.texts.len - 1) / recognize_admission_texts_per_unit);
+    units = try checkedRecognizeAdd(units, total_text_bytes / recognize_admission_bytes_per_unit);
+    units = try checkedRecognizeAdd(units, estimated_score_cells / recognize_admission_score_cells_per_unit);
+    return .{
+        .units = units,
+        .total_text_bytes = total_text_bytes,
+        .estimated_score_cells = estimated_score_cells,
+    };
+}
 
 const GenerateBackendSelection = struct {
     native_choice: native_backend_choice.Choice = .auto,
@@ -2704,7 +2789,7 @@ pub const Node = struct {
             try ctx.setHeader("Retry-After", "1");
             return try ctx.status(503).json(.{
                 .@"error" = "SERVICE_UNAVAILABLE",
-                .message = "server at capacity for decoded image workload, try again later",
+                .message = "server at capacity for expanded request workload, try again later",
                 .retryable = true,
             });
         };
@@ -5872,8 +5957,20 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
-        if (try self.acquireSlot(ctx)) |resp| return resp;
-        defer self.releaseSlot();
+        const admission = recognizeRequestAdmission(body, null) catch |err| switch (err) {
+            error.RecognizeTextsRequired => return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "texts must contain at least one input",
+            }),
+            error.RecognizeRequestTooLarge => return ctx.status(413).json(.{
+                .@"error" = "REQUEST_TOO_LARGE",
+                .message = "recognition request exceeds text, label, span, or batch limits",
+            }),
+            else => return err,
+        };
+        if (try self.acquireSlotUnits(ctx, admission.units)) |resp| return resp;
+        var reserved_units = admission.units;
+        defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("recognize");
         defer self.metrics.decActive();
 
@@ -5891,6 +5988,26 @@ pub const Node = struct {
 
         // Use GLiNER pipeline for GLiNER models, standard NER for BIO models
         if (model.isGlinerModel()) {
+            // Labels omitted (or supplied as an empty list) resolve to the
+            // model defaults. Recompute admission now that model metadata is
+            // available so relation-candidate and score-surface caps cannot
+            // be underestimated before model loading.
+            const pipeline = model.glinerPipeline(ctx.allocator);
+            const exact_admission = recognizeRequestAdmission(body, pipeline.config.default_labels.len) catch |err| switch (err) {
+                error.RecognizeTextsRequired => return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "texts must contain at least one input",
+                }),
+                error.RecognizeRequestTooLarge => return ctx.status(413).json(.{
+                    .@"error" = "REQUEST_TOO_LARGE",
+                    .message = "recognition request exceeds text, label, span, or batch limits",
+                }),
+                else => return err,
+            };
+            if (exact_admission.units > reserved_units) {
+                if (try self.growSlotUnits(ctx, reserved_units, exact_admission.units)) |resp| return resp;
+                reserved_units = exact_admission.units;
+            }
             return self.recognizeGliner(ctx, model, body);
         }
 
@@ -5901,8 +6018,12 @@ pub const Node = struct {
         }
 
         var pipeline = model.nerPipeline(ctx.allocator);
-        const all_entities = pipeline.recognizeBatch(body.texts) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
+        const all_entities = blk: {
+            model.lockRecognizerSession(ctx.io);
+            defer model.unlockRecognizerSession();
+            break :blk pipeline.recognizeBatch(body.texts) catch |err|
+                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
+        };
         defer {
             for (all_entities) |entities| {
                 for (entities) |e| ctx.allocator.free(e.text);
@@ -5911,7 +6032,7 @@ pub const Node = struct {
             ctx.allocator.free(all_entities);
         }
 
-        const cleaned_entities = try applyLearnedCleanupIfPresent(ctx.allocator, try model.getCleanupHead(), body.texts, all_entities);
+        const cleaned_entities = try applyLearnedCleanupIfPresent(ctx.allocator, try model.getCleanupHead(ctx.io), body.texts, all_entities);
         defer if (cleaned_entities) |entities| freeEntityBatches(ctx.allocator, entities);
         const entities_for_response = cleaned_entities orelse all_entities;
 
@@ -6047,8 +6168,12 @@ pub const Node = struct {
             }
 
             const relation_labels = body.relation_labels.?;
-            const extracted = pipeline.extractRelationsBatch(body.texts, labels, relation_labels) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
+            const extracted = blk: {
+                model.lockRecognizerSession(ctx.io);
+                defer model.unlockRecognizerSession();
+                break :blk pipeline.extractRelationsBatch(body.texts, labels, relation_labels) catch |err|
+                    return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
+            };
             defer {
                 for (extracted.entities) |entities| {
                     for (entities) |e| ctx.allocator.free(e.text);
@@ -6072,8 +6197,12 @@ pub const Node = struct {
             return self.buildRecognizeResponse(ctx, body.model, extracted.entities, extracted.relations, body.texts);
         }
 
-        const all_entities = pipeline.recognizeBatch(body.texts, labels) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
+        const all_entities = blk: {
+            model.lockRecognizerSession(ctx.io);
+            defer model.unlockRecognizerSession();
+            break :blk pipeline.recognizeBatch(body.texts, labels) catch |err|
+                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
+        };
         defer {
             for (all_entities) |entities| {
                 for (entities) |e| ctx.allocator.free(e.text);
@@ -6082,7 +6211,7 @@ pub const Node = struct {
             ctx.allocator.free(all_entities);
         }
 
-        const cleaned_entities = try applyLearnedCleanupIfPresent(ctx.allocator, try model.getCleanupHead(), body.texts, all_entities);
+        const cleaned_entities = try applyLearnedCleanupIfPresent(ctx.allocator, try model.getCleanupHead(ctx.io), body.texts, all_entities);
         defer if (cleaned_entities) |entities| freeEntityBatches(ctx.allocator, entities);
         const entities_for_response = cleaned_entities orelse all_entities;
 
@@ -6210,12 +6339,16 @@ pub const Node = struct {
             }
 
             var pipeline = model.glinerPipeline(ctx.allocator);
-            const all_results = pipeline.classifyBatch(body.texts, body.labels, .{
-                .threshold = 0.0,
-                .multi_label = body.multi_label orelse false,
-            }) catch |err| switch (err) {
-                error.MissingSpecialTokenIds => return ctx.status(500).json(.{ .@"error" = "MODEL_CONFIG_INVALID", .message = internalErrorMessage("MODEL_CONFIG_INVALID", err) }),
-                else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
+            const all_results = blk: {
+                model.lockRecognizerSession(ctx.io);
+                defer model.unlockRecognizerSession();
+                break :blk pipeline.classifyBatch(body.texts, body.labels, .{
+                    .threshold = 0.0,
+                    .multi_label = body.multi_label orelse false,
+                }) catch |err| switch (err) {
+                    error.MissingSpecialTokenIds => return ctx.status(500).json(.{ .@"error" = "MODEL_CONFIG_INVALID", .message = internalErrorMessage("MODEL_CONFIG_INVALID", err) }),
+                    else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
+                };
             };
             defer {
                 for (all_results) |r| ctx.allocator.free(r);
@@ -14284,4 +14417,67 @@ fn appendBase64Json(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocat
 fn graphModeEnabled() bool {
     if (comptime @import("builtin").os.tag == .freestanding) return false;
     return platform.env.getenvBool("TERMITE_GRAPH_MODE");
+}
+
+test "recognition admission bounds cardinality and scales queue units" {
+    const labels = [_][]const u8{ "person", "organization", "location", "date", "money" };
+    const b1 = try recognizeRequestAdmission(.{
+        .model = "gliner2",
+        .texts = &.{"Acme hired Alice in Seattle."},
+        .labels = &labels,
+    }, null);
+    try std.testing.expectEqual(@as(usize, 1), b1.units);
+    try std.testing.expect(b1.estimated_score_cells > 0);
+
+    const texts9: [9][]const u8 = @splat("Acme hired Alice in Seattle.");
+    const b9 = try recognizeRequestAdmission(.{
+        .model = "gliner2",
+        .texts = &texts9,
+        .labels = &labels,
+    }, null);
+    try std.testing.expect(b9.units >= 2);
+
+    try std.testing.expectError(error.RecognizeTextsRequired, recognizeRequestAdmission(.{
+        .model = "gliner2",
+        .texts = &.{},
+        .labels = &labels,
+    }, null));
+    const too_many_texts: [max_recognize_texts + 1][]const u8 = @splat("x");
+    try std.testing.expectError(error.RecognizeRequestTooLarge, recognizeRequestAdmission(.{
+        .model = "gliner2",
+        .texts = &too_many_texts,
+        .labels = &labels,
+    }, null));
+}
+
+test "recognition admission rejects pathological score surfaces" {
+    const texts: [max_recognize_texts][]const u8 = @splat("x");
+    const labels: [max_recognize_labels][]const u8 = @splat("entity");
+    try std.testing.expectError(error.RecognizeRequestTooLarge, recognizeRequestAdmission(.{
+        .model = "gliner2",
+        .texts = &texts,
+        .labels = &labels,
+    }, null));
+
+    const entity_labels = [_][]const u8{ "person", "organization" };
+    const relation_labels: [max_recognize_labels][]const u8 = @splat("works_for");
+    const relation_admission = try recognizeRequestAdmission(.{
+        .model = "gliner2",
+        .texts = &.{"Alice works for Acme."},
+        .labels = &entity_labels,
+        .relation_labels = &relation_labels,
+    }, null);
+    try std.testing.expect(relation_admission.estimated_score_cells > 0);
+
+    const relation_labels5: [5][]const u8 = @splat("works_for");
+    const defaults_body = api.RecognizeRequest{
+        .model = "gliner2",
+        .texts = &.{"Alice works for Acme."},
+        .relation_labels = &relation_labels5,
+    };
+    _ = try recognizeRequestAdmission(defaults_body, null);
+    try std.testing.expectError(
+        error.RecognizeRequestTooLarge,
+        recognizeRequestAdmission(defaults_body, max_recognize_labels),
+    );
 }

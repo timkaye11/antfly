@@ -2,8 +2,9 @@
 
 This document records the GLiNER2 CUDA encoder work qualified on 2026-07-17.
 It covers the measurement contract, current dispatch policy, correctness
-evidence, and remaining performance work. The implementation baseline is
-commit `1f609755d` (`cuda: close GLiNER2 batch encoder gap`).
+evidence, and remaining performance work. The measurements use performance
+baseline commit `1f609755d` (`cuda: close GLiNER2 batch encoder gap`);
+subsequent hardening does not change the benchmark contract.
 
 ## Current Status
 
@@ -16,14 +17,14 @@ default because it is faster still.
 | Area | Status | Production behavior |
 | --- | --- | --- |
 | FP16 encoder and span-head weights | Qualified | Selected embeddings, encoder matrices, and span projection matrices remain FP16 and device resident |
-| FP16 dense GEMM | Qualified | cuBLASLt tensor-core GEMM with F32 accumulation/output |
+| FP16 dense GEMM | Qualified | Bounded, synchronized cuBLASLt plan/descriptor cache with F32 accumulation/output and a compiled CUDA correctness fallback |
 | FP16 bias + ReLU epilogue | Qualified | One in-place compiled CUDA kernel; no second activation allocation/pass |
 | B1 DeBERTa attention | Qualified | Fused F32 attention |
 | B4+ S128..256 DeBERTa attention | Qualified on L4/SM89 | Materialized FP16 tensor-core schedule selected automatically |
 | Generated M32N16 attention | Qualified explicit route | Faster than Fastino at B8, but not the default because materialized attention is faster |
 | Generated M16N32 attention | Diagnostic | Available for schedule comparison; slower than M32N16 at B8 |
 | Q4_K span head | Qualified | Existing resident packed-weight route remains available |
-| Request preprocessing | Qualified for repeated rows | Schema and word-token work are reused within one request; duplicate rows are prepared and decoded once |
+| Request preprocessing | Qualified for repeated and heterogeneous rows | Schema work is shared, duplicate rows are prepared/decoded once, and distinct rows retain independent ownership |
 | Runtime NVRTC specialization for GLiNER2 | Not implemented | Current GLiNER2 winners are shipped AOT CUDA artifacts |
 
 The generated M32/M16 attention schedules are shape-specialized tensor-core
@@ -55,8 +56,11 @@ label prefix, not just the natural-language text.
 The repeated-row B8 result is a real supported workload and both implementations
 receive the same inputs. It also exercises Antfly's request-local duplicate
 reuse. It must not be presented as a distinct-text B8 result; a separate
-distinct-text corpus is still needed before generalizing the throughput claim
-to heterogeneous service batches.
+distinct-text release fixture is checked in as
+`scripts/fixtures/gliner2_256_distinct_b8.txt`. That fixture is used for route,
+memory, and fallback qualification, while the performance comparison table
+below remains explicitly repeated-row because Fastino has not yet been rerun
+on the same heterogeneous corpus.
 
 The Fastino harness fails closed unless all of the following are true:
 
@@ -128,6 +132,15 @@ GEMM, accumulate and write F32, and then apply the graph epilogue. QKV and pair
 routes share staged activations. `linearRelu` and `linearPairRelu` use
 `termite_add_bias_relu_rows_f32`, which applies bias and ReLU in place.
 
+cuBLASLt algorithm entries and their immutable operation/matrix descriptors
+are cached by layout kind, dtype, complete shape, batch count, and workspace
+limit. Cache access is synchronized, dense and strided-batched layouts cannot
+collide, and the process-lifetime cache is capped at 256 entries. If cuBLASLt
+cannot plan or execute an otherwise supported FP16 shape, the request stays
+device resident and falls back to `termite_linear_f16_weight_f32_tiled` instead
+of failing. The fallback is correctness-oriented and has its own route counter;
+qualified performance runs require it to remain zero.
+
 ### Attention policy
 
 The production `auto` policy is deliberately narrow:
@@ -141,6 +154,13 @@ The materialized route packs Q/K/V and relative projections by head, launches
 three score GEMMs, applies the DeBERTa relative-position gathers and softmax,
 launches P*V, and unpacks the output. It uses more workspace and launches than
 the generated route, but remains faster on the measured L4 B8 shape.
+
+All materialized intermediates occupy one aligned arena rather than ten
+persistent scratch allocations. Admission happens before allocation, defaults
+to a 512 MiB ceiling, and also respects the configured runtime scratch budget.
+`ANTFLY_INFERENCE_CUDA_DEBERTA_MATERIALIZED_WORKSPACE_MB` may narrow the
+ceiling. A rejected shape falls through to bounded fused attention and records
+an explicit workspace-rejection counter.
 
 The generated M32N16 route performs FP16 staging, all three DeBERTa score terms,
 online softmax, and P*V inside one CTA-local tensor-core schedule. It avoids the
@@ -161,6 +181,10 @@ ANTFLY_INFERENCE_CUDA_DEBERTA_ATTENTION_MODE=fused-f32
 ANTFLY_INFERENCE_CUDA_DEBERTA_ATTENTION_MODE=streaming-f16
 ANTFLY_INFERENCE_CUDA_DEBERTA_ATTENTION_MODE=materialized-f16
 ```
+
+`generated` is accepted as an alias for `generated-tc`; `streaming-f16` remains
+the unambiguous streaming route. Invalid mode or variant values emit one
+warning and use `auto` instead of silently selecting an unrelated route.
 
 `ANTFLY_CUDA_DEBERTA_GENERATED_TC_AUTO=1` makes generated attention precede the
 normal auto policy for eligible shapes. It defaults to false; production auto
@@ -183,13 +207,29 @@ The GLiNER pipeline now performs the following request-local reuse:
 There is intentionally no persistent raw-text cache. Memory ownership and cache
 lifetime remain bounded to one request.
 
+The server applies recognition admission before model loading or GPU work: at
+most 128 texts (64 KiB each, 4 MiB combined), 256 entity labels, 256 relation
+labels (512 bytes each, 128 KiB combined label bytes), 1,024 relation
+candidates, and 32 million score cells. Queue weight scales with batch size,
+text bytes, and score surface. When request labels are omitted, admission is
+recomputed from the loaded model's default-label count and the queue reservation
+is grown atomically before inference. A loaded recognizer session is
+single-owner for the full inference call, preventing concurrent mutation of
+backend scratch and pipeline state.
+
 ## Correctness and Route Evidence
 
-`scripts/verify_gliner2_cuda.sh` now checks native, production CUDA, and optional
+`scripts/verify_gliner2_cuda.sh` checks native, production CUDA, and optional
 generated attention at the entity level. It requires identical label, byte
 span, and text identity, bounds every entity-score difference, and verifies
-that generated attention executed the M32 schedule rather than silently falling
-back.
+that generated attention executed the M32 schedule rather than silently
+falling back. On an auto-detected SM89 device, it also runs the heterogeneous
+B8/S256 fixture, validates all eight row lengths independently, requires
+production materialized attention, and fails on generated fallback,
+materialized fallback/workspace rejection, or FP16 scalar fallback. Set
+`ANTFLY_GLINER2_VERIFY_MATERIALIZED_AUTO=1` to require that gate explicitly on
+qualification hardware. Relative model paths are canonicalized before the
+script changes working directory.
 
 The qualification runs passed for full FP16 and Q4_K bundles:
 
@@ -202,6 +242,7 @@ The benchmark CSV also records:
 
 - FP16 cuBLASLt linear and QKV calls;
 - FP16 activation staging and fallback counts;
+- compiled FP16 scalar fallback calls;
 - fused, streaming, materialized, and generated attention calls/fallbacks;
 - generated M32 and M16 calls separately;
 - CUDA H2D and D2H bytes.
@@ -210,6 +251,18 @@ On the qualified B8 FP16 production run, all 120 measured layer-attention calls
 used materialized FP16 attention. The generated run recorded 120 M32 calls,
 zero M16 calls, and zero generated fallbacks. Dense execution recorded 660 FP16
 linear calls and 120 QKV calls over the ten samples with zero cuBLASLt fallback.
+
+The hardened one-sample heterogeneous release gate recorded 93.304 ms for
+production materialized attention and 93.445 ms for generated M32 on the FP16
+bundle. Both recorded 66 FP16 linear calls, 12 QKV calls, and zero FP16
+fallbacks; production used 12 materialized layers with a 166,502,400-byte peak
+arena, while generated used 12 M32 layers. These samples validate dispatch and
+memory behavior, not a stable Fastino performance comparison.
+
+A forced 1 MiB materialized-workspace ceiling rejected all 12 materialized
+layers before allocation, executed all 12 through fused attention, and
+completed the distinct B8 request with zero FP16 linear fallbacks. This is a
+fault-path qualification result, not a throughput target.
 
 ## Reproduction
 
@@ -278,8 +331,9 @@ Priority order:
 1. Close B1 latency versus Fastino. Profile launch and span-head costs after
    the current fused-F32 attention route; avoid promoting a B8 schedule that
    regresses B1.
-2. Add a canonical distinct-text B8 corpus and report repeated-row and
-   heterogeneous-batch throughput separately.
+2. Run the canonical distinct-text B8 corpus through Fastino and collect enough
+   samples to report heterogeneous-batch throughput separately from repeated
+   rows.
 3. Qualify B2/B4 and sequence buckets below 128 and above 256, then replace the
    current narrow auto gate only where evidence supports it.
 4. Validate the attention and FP16 residency policy on SM80, SM90, and a

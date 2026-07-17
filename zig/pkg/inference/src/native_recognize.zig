@@ -55,17 +55,21 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     const model = try model_manager.loadFromDir(opts.model_dir);
     const texts = [_][]const u8{opts.text};
-    const entities = if (model.isGlinerModel()) blk: {
-        var pipeline = model.glinerPipeline(allocator);
-        const labels: ?[]const []const u8 = if (opts.labels.items.len > 0) opts.labels.items else null;
-        break :blk try pipeline.recognizeBatch(&texts, labels);
-    } else blk: {
-        var pipeline = model.nerPipeline(allocator);
-        break :blk try pipeline.recognizeBatch(&texts);
+    const entities = blk: {
+        model.lockRecognizerSession(io);
+        defer model.unlockRecognizerSession();
+        break :blk if (model.isGlinerModel()) gliner: {
+            var pipeline = model.glinerPipeline(allocator);
+            const labels: ?[]const []const u8 = if (opts.labels.items.len > 0) opts.labels.items else null;
+            break :gliner try pipeline.recognizeBatch(&texts, labels);
+        } else ner: {
+            var pipeline = model.nerPipeline(allocator);
+            break :ner try pipeline.recognizeBatch(&texts);
+        };
     };
     defer freeEntities(allocator, entities);
 
-    const cleaned_entities = try applyLearnedCleanupIfPresent(allocator, try model.getCleanupHead(), &texts, entities);
+    const cleaned_entities = try applyLearnedCleanupIfPresent(allocator, try model.getCleanupHead(io), &texts, entities);
     defer if (cleaned_entities) |cleaned| freeEntities(allocator, cleaned);
 
     try writeRecognizeJson(allocator, opts.model_dir, cleaned_entities orelse entities);

@@ -58,6 +58,7 @@ const Options = struct {
     model_dir: []const u8 = "",
     text: []const u8 = "John Smith works for Apple Inc. and lives in San Francisco. Apple Inc. is located in Cupertino.",
     text_file: ?[]const u8 = null,
+    text_batch_file: ?[]const u8 = null,
     text_explicit: bool = false,
     text_repeat: usize = 1,
     print_encoder_seq_len: bool = false,
@@ -70,6 +71,7 @@ const Options = struct {
     warmup_iters: usize = 1,
     measure_iters: usize = 5,
     batch_size: usize = 1,
+    batch_size_explicit: bool = false,
     format: OutputFormat = .text,
     task: BenchTask = .entities,
     dump_entities: bool = false,
@@ -106,6 +108,7 @@ const CudaCounters = struct {
     f16_cublaslt_qkv_calls: usize = 0,
     f16_activation_staging_calls: usize = 0,
     f16_cublaslt_fallbacks: usize = 0,
+    f16_scalar_linear_calls: usize = 0,
     deberta_fused_attention_calls: usize = 0,
     deberta_fused_attention_fallbacks: usize = 0,
     deberta_stream_f16_attention_calls: usize = 0,
@@ -113,6 +116,8 @@ const CudaCounters = struct {
     deberta_stream_f16_staging_calls: usize = 0,
     deberta_materialized_f16_attention_calls: usize = 0,
     deberta_materialized_f16_attention_fallbacks: usize = 0,
+    deberta_materialized_workspace_rejections: usize = 0,
+    deberta_materialized_workspace_peak_bytes: usize = 0,
     deberta_generated_tc_attention_calls: usize = 0,
     deberta_generated_tc_m32_attention_calls: usize = 0,
     deberta_generated_tc_m16_attention_calls: usize = 0,
@@ -126,6 +131,7 @@ const CudaCounters = struct {
             .f16_cublaslt_qkv_calls = self.f16_cublaslt_qkv_calls + other.f16_cublaslt_qkv_calls,
             .f16_activation_staging_calls = self.f16_activation_staging_calls + other.f16_activation_staging_calls,
             .f16_cublaslt_fallbacks = self.f16_cublaslt_fallbacks + other.f16_cublaslt_fallbacks,
+            .f16_scalar_linear_calls = self.f16_scalar_linear_calls + other.f16_scalar_linear_calls,
             .deberta_fused_attention_calls = self.deberta_fused_attention_calls + other.deberta_fused_attention_calls,
             .deberta_fused_attention_fallbacks = self.deberta_fused_attention_fallbacks + other.deberta_fused_attention_fallbacks,
             .deberta_stream_f16_attention_calls = self.deberta_stream_f16_attention_calls + other.deberta_stream_f16_attention_calls,
@@ -133,6 +139,8 @@ const CudaCounters = struct {
             .deberta_stream_f16_staging_calls = self.deberta_stream_f16_staging_calls + other.deberta_stream_f16_staging_calls,
             .deberta_materialized_f16_attention_calls = self.deberta_materialized_f16_attention_calls + other.deberta_materialized_f16_attention_calls,
             .deberta_materialized_f16_attention_fallbacks = self.deberta_materialized_f16_attention_fallbacks + other.deberta_materialized_f16_attention_fallbacks,
+            .deberta_materialized_workspace_rejections = self.deberta_materialized_workspace_rejections + other.deberta_materialized_workspace_rejections,
+            .deberta_materialized_workspace_peak_bytes = @max(self.deberta_materialized_workspace_peak_bytes, other.deberta_materialized_workspace_peak_bytes),
             .deberta_generated_tc_attention_calls = self.deberta_generated_tc_attention_calls + other.deberta_generated_tc_attention_calls,
             .deberta_generated_tc_m32_attention_calls = self.deberta_generated_tc_m32_attention_calls + other.deberta_generated_tc_m32_attention_calls,
             .deberta_generated_tc_m16_attention_calls = self.deberta_generated_tc_m16_attention_calls + other.deberta_generated_tc_m16_attention_calls,
@@ -199,31 +207,58 @@ pub fn main(init: std.process.Init) !void {
     const load_elapsed_ns = nowNs() - load_start;
     if (!model.isGlinerModel()) return error.NotGlinerModel;
 
-    if (opts.batch_size == 0) return error.InvalidBatchSize;
     const fixture_text_owned = if (opts.text_file) |path|
         try std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1024 * 1024))
     else
         null;
     defer if (fixture_text_owned) |bytes| allocator.free(bytes);
+    const fixture_batch_owned = if (opts.text_batch_file) |path|
+        try std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(8 * 1024 * 1024))
+    else
+        null;
+    defer if (fixture_batch_owned) |bytes| allocator.free(bytes);
+
+    var fixture_batch = std.ArrayListUnmanaged([]const u8).empty;
+    defer fixture_batch.deinit(allocator);
+    if (fixture_batch_owned) |bytes| {
+        if (opts.text_repeat != 1) return error.TextRepeatUnsupportedForBatchFile;
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        while (lines.next()) |line| {
+            const text = std.mem.trim(u8, line, " \t\r");
+            if (text.len > 0) try fixture_batch.append(allocator, text);
+        }
+        if (fixture_batch.items.len == 0) return error.EmptyTextFixture;
+        if (opts.batch_size_explicit and opts.batch_size != fixture_batch.items.len) return error.BatchSizeDoesNotMatchTextBatch;
+        opts.batch_size = fixture_batch.items.len;
+    }
+    if (opts.batch_size == 0) return error.InvalidBatchSize;
+
     const source_text = if (fixture_text_owned) |bytes| std.mem.trim(u8, bytes, " \t\r\n") else opts.text;
-    if (source_text.len == 0) return error.EmptyTextFixture;
-    const bench_text = try repeatedText(allocator, source_text, opts.text_repeat);
-    defer allocator.free(bench_text);
+    var bench_text_owned: ?[]const u8 = null;
+    defer if (bench_text_owned) |bytes| allocator.free(bytes);
     const texts = try allocator.alloc([]const u8, opts.batch_size);
     defer allocator.free(texts);
-    @memset(texts, bench_text);
+    if (fixture_batch.items.len > 0) {
+        @memcpy(texts, fixture_batch.items);
+    } else {
+        if (source_text.len == 0) return error.EmptyTextFixture;
+        bench_text_owned = try repeatedText(allocator, source_text, opts.text_repeat);
+        @memset(texts, bench_text_owned.?);
+    }
     const labels: ?[]const []const u8 = if (opts.labels.items.len > 0) opts.labels.items else null;
     const relation_labels: ?[]const []const u8 = if (opts.relation_labels.items.len > 0) opts.relation_labels.items else null;
 
     var pipeline = model.glinerPipeline(allocator);
     if (opts.print_encoder_seq_len or opts.expected_encoder_seq_len != null) {
         const entity_labels = labels orelse return error.ExpectedEncoderSeqLenRequiresLabels;
-        const actual = try pipeline.entityEncoderTokenCount(bench_text, entity_labels);
-        if (opts.expected_encoder_seq_len) |expected| {
-            std.debug.print("gliner2_e2e: encoder_seq_len={} expected={}\n", .{ actual, expected });
-            if (actual != expected) return error.UnexpectedEncoderSeqLen;
-        } else {
-            std.debug.print("gliner2_e2e: encoder_seq_len={}\n", .{actual});
+        for (texts, 0..) |text, row_index| {
+            const actual = try pipeline.entityEncoderTokenCount(text, entity_labels);
+            if (opts.expected_encoder_seq_len) |expected| {
+                std.debug.print("gliner2_e2e: row={} encoder_seq_len={} expected={}\n", .{ row_index, actual, expected });
+                if (actual != expected) return error.UnexpectedEncoderSeqLen;
+            } else {
+                std.debug.print("gliner2_e2e: row={} encoder_seq_len={}\n", .{ row_index, actual });
+            }
         }
     }
 
@@ -510,6 +545,7 @@ fn cudaCountersFromStats(before: anytype, after: anytype) CudaCounters {
         .f16_cublaslt_qkv_calls = after_stats.f16_cublaslt_qkv_calls - before_stats.f16_cublaslt_qkv_calls,
         .f16_activation_staging_calls = after_stats.f16_cublaslt_activation_staging_calls - before_stats.f16_cublaslt_activation_staging_calls,
         .f16_cublaslt_fallbacks = after_stats.f16_cublaslt_fallbacks - before_stats.f16_cublaslt_fallbacks,
+        .f16_scalar_linear_calls = after_stats.f16_scalar_linear_calls - before_stats.f16_scalar_linear_calls,
         .deberta_fused_attention_calls = after_stats.deberta_fused_attention_calls - before_stats.deberta_fused_attention_calls,
         .deberta_fused_attention_fallbacks = after_stats.deberta_fused_attention_fallbacks - before_stats.deberta_fused_attention_fallbacks,
         .deberta_stream_f16_attention_calls = after_stats.deberta_stream_f16_attention_calls - before_stats.deberta_stream_f16_attention_calls,
@@ -517,6 +553,8 @@ fn cudaCountersFromStats(before: anytype, after: anytype) CudaCounters {
         .deberta_stream_f16_staging_calls = after_stats.deberta_stream_f16_staging_calls - before_stats.deberta_stream_f16_staging_calls,
         .deberta_materialized_f16_attention_calls = after_stats.deberta_materialized_f16_attention_calls - before_stats.deberta_materialized_f16_attention_calls,
         .deberta_materialized_f16_attention_fallbacks = after_stats.deberta_materialized_f16_attention_fallbacks - before_stats.deberta_materialized_f16_attention_fallbacks,
+        .deberta_materialized_workspace_rejections = after_stats.deberta_materialized_workspace_rejections - before_stats.deberta_materialized_workspace_rejections,
+        .deberta_materialized_workspace_peak_bytes = after_stats.deberta_materialized_workspace_peak_bytes,
         .deberta_generated_tc_attention_calls = after_stats.deberta_generated_tc_attention_calls - before_stats.deberta_generated_tc_attention_calls,
         .deberta_generated_tc_m32_attention_calls = after_stats.deberta_generated_tc_m32_attention_calls - before_stats.deberta_generated_tc_m32_attention_calls,
         .deberta_generated_tc_m16_attention_calls = after_stats.deberta_generated_tc_m16_attention_calls - before_stats.deberta_generated_tc_m16_attention_calls,
@@ -543,12 +581,15 @@ fn parseArgs(allocator: std.mem.Allocator, init: std.process.Init) !Options {
         if (std.mem.eql(u8, arg, "--model-dir")) {
             opts.model_dir = args.next() orelse return error.MissingModelDir;
         } else if (std.mem.eql(u8, arg, "--text")) {
-            if (opts.text_file != null) return error.DuplicateTextSource;
+            if (opts.text_file != null or opts.text_batch_file != null) return error.DuplicateTextSource;
             opts.text = args.next() orelse return error.MissingText;
             opts.text_explicit = true;
         } else if (std.mem.eql(u8, arg, "--text-file")) {
-            if (opts.text_explicit or opts.text_file != null) return error.DuplicateTextSource;
+            if (opts.text_explicit or opts.text_file != null or opts.text_batch_file != null) return error.DuplicateTextSource;
             opts.text_file = args.next() orelse return error.MissingTextFile;
+        } else if (std.mem.eql(u8, arg, "--text-batch-file")) {
+            if (opts.text_explicit or opts.text_file != null or opts.text_batch_file != null) return error.DuplicateTextSource;
+            opts.text_batch_file = args.next() orelse return error.MissingTextBatchFile;
         } else if (std.mem.eql(u8, arg, "--text-repeat")) {
             opts.text_repeat = try std.fmt.parseInt(usize, args.next() orelse return error.MissingTextRepeat, 10);
             if (opts.text_repeat == 0) return error.InvalidTextRepeat;
@@ -591,6 +632,7 @@ fn parseArgs(allocator: std.mem.Allocator, init: std.process.Init) !Options {
             opts.measure_iters = try std.fmt.parseInt(usize, args.next() orelse return error.MissingMeasureIters, 10);
         } else if (std.mem.eql(u8, arg, "--batch-size")) {
             opts.batch_size = try std.fmt.parseInt(usize, args.next() orelse return error.MissingBatchSize, 10);
+            opts.batch_size_explicit = true;
         } else if (std.mem.eql(u8, arg, "--format")) {
             opts.format = parseFormat(args.next() orelse return error.MissingFormat) orelse return error.InvalidFormat;
         } else if (std.mem.eql(u8, arg, "--dump-entities")) {
@@ -643,7 +685,7 @@ fn parseFormat(value: []const u8) ?OutputFormat {
 
 fn printText(opts: Options, result: Result) void {
     std.debug.print(
-        "{s}/{s}: model_dir={s} backend={s} batch_size={} avg_ms={d:.3} p50_ms={d:.3} p95_ms={d:.3} min_ms={d:.3} max_ms={d:.3} entity_count={} relation_count={} score_sum={d:.6} relation_score_sum={d:.6} native_quant_stats={s} q4q5={} q4q5_pair={} q4q5_triple={} q4q5_panel={} dequant={} dequant_pair={} dequant_triple={} q8_0={} q8_0_pair={} q8_0_triple={} cuda_h2d_bytes={} cuda_d2h_bytes={} cuda_f16_cublaslt_linear_calls={} cuda_f16_cublaslt_qkv_calls={} cuda_f16_activation_staging_calls={} cuda_f16_cublaslt_fallbacks={}",
+        "{s}/{s}: model_dir={s} backend={s} batch_size={} avg_ms={d:.3} p50_ms={d:.3} p95_ms={d:.3} min_ms={d:.3} max_ms={d:.3} entity_count={} relation_count={} score_sum={d:.6} relation_score_sum={d:.6} native_quant_stats={s} q4q5={} q4q5_pair={} q4q5_triple={} q4q5_panel={} dequant={} dequant_pair={} dequant_triple={} q8_0={} q8_0_pair={} q8_0_triple={} cuda_h2d_bytes={} cuda_d2h_bytes={} cuda_f16_cublaslt_linear_calls={} cuda_f16_cublaslt_qkv_calls={} cuda_f16_activation_staging_calls={} cuda_f16_cublaslt_fallbacks={} cuda_f16_scalar_linear_calls={}",
         .{
             @tagName(result.task),
             result.mode,
@@ -676,10 +718,11 @@ fn printText(opts: Options, result: Result) void {
             result.cuda.f16_cublaslt_qkv_calls,
             result.cuda.f16_activation_staging_calls,
             result.cuda.f16_cublaslt_fallbacks,
+            result.cuda.f16_scalar_linear_calls,
         },
     );
     std.debug.print(
-        " cuda_deberta_fused_attention_calls={} cuda_deberta_fused_attention_fallbacks={} cuda_deberta_stream_f16_attention_calls={} cuda_deberta_stream_f16_attention_fallbacks={} cuda_deberta_stream_f16_staging_calls={} cuda_deberta_materialized_f16_attention_calls={} cuda_deberta_materialized_f16_attention_fallbacks={} cuda_deberta_generated_tc_attention_calls={} cuda_deberta_generated_tc_m32_attention_calls={} cuda_deberta_generated_tc_m16_attention_calls={} cuda_deberta_generated_tc_attention_fallbacks={}\n",
+        " cuda_deberta_fused_attention_calls={} cuda_deberta_fused_attention_fallbacks={} cuda_deberta_stream_f16_attention_calls={} cuda_deberta_stream_f16_attention_fallbacks={} cuda_deberta_stream_f16_staging_calls={} cuda_deberta_materialized_f16_attention_calls={} cuda_deberta_materialized_f16_attention_fallbacks={} cuda_deberta_materialized_workspace_rejections={} cuda_deberta_materialized_workspace_peak_bytes={} cuda_deberta_generated_tc_attention_calls={} cuda_deberta_generated_tc_m32_attention_calls={} cuda_deberta_generated_tc_m16_attention_calls={} cuda_deberta_generated_tc_attention_fallbacks={}\n",
         .{
             result.cuda.deberta_fused_attention_calls,
             result.cuda.deberta_fused_attention_fallbacks,
@@ -688,6 +731,8 @@ fn printText(opts: Options, result: Result) void {
             result.cuda.deberta_stream_f16_staging_calls,
             result.cuda.deberta_materialized_f16_attention_calls,
             result.cuda.deberta_materialized_f16_attention_fallbacks,
+            result.cuda.deberta_materialized_workspace_rejections,
+            result.cuda.deberta_materialized_workspace_peak_bytes,
             result.cuda.deberta_generated_tc_attention_calls,
             result.cuda.deberta_generated_tc_m32_attention_calls,
             result.cuda.deberta_generated_tc_m16_attention_calls,
@@ -743,7 +788,7 @@ fn printText(opts: Options, result: Result) void {
 }
 
 fn printCsvHeader() void {
-    std.debug.print("task,mode,model_dir,backend,batch_size,avg_ms,p50_ms,p95_ms,min_ms,max_ms,entity_count,relation_count,score_sum,relation_score_sum,native_quant_stats_enabled,q4q5,q4q5_pair,q4q5_triple,q4q5_panel,dequant,dequant_pair,dequant_triple,q8_0,q8_0_pair,q8_0_triple,metal_jit_exact_q4_0,metal_jit_exact_q4_k,cuda_h2d_bytes,cuda_d2h_bytes,cuda_f16_cublaslt_linear_calls,cuda_f16_cublaslt_qkv_calls,cuda_f16_activation_staging_calls,cuda_f16_cublaslt_fallbacks,cuda_deberta_fused_attention_calls,cuda_deberta_fused_attention_fallbacks,cuda_deberta_stream_f16_attention_calls,cuda_deberta_stream_f16_attention_fallbacks,cuda_deberta_stream_f16_staging_calls,cuda_deberta_materialized_f16_attention_calls,cuda_deberta_materialized_f16_attention_fallbacks,cuda_deberta_generated_tc_attention_calls,cuda_deberta_generated_tc_m32_attention_calls,cuda_deberta_generated_tc_m16_attention_calls,cuda_deberta_generated_tc_attention_fallbacks\n", .{});
+    std.debug.print("task,mode,model_dir,backend,batch_size,avg_ms,p50_ms,p95_ms,min_ms,max_ms,entity_count,relation_count,score_sum,relation_score_sum,native_quant_stats_enabled,q4q5,q4q5_pair,q4q5_triple,q4q5_panel,dequant,dequant_pair,dequant_triple,q8_0,q8_0_pair,q8_0_triple,metal_jit_exact_q4_0,metal_jit_exact_q4_k,cuda_h2d_bytes,cuda_d2h_bytes,cuda_f16_cublaslt_linear_calls,cuda_f16_cublaslt_qkv_calls,cuda_f16_activation_staging_calls,cuda_f16_cublaslt_fallbacks,cuda_f16_scalar_linear_calls,cuda_deberta_fused_attention_calls,cuda_deberta_fused_attention_fallbacks,cuda_deberta_stream_f16_attention_calls,cuda_deberta_stream_f16_attention_fallbacks,cuda_deberta_stream_f16_staging_calls,cuda_deberta_materialized_f16_attention_calls,cuda_deberta_materialized_f16_attention_fallbacks,cuda_deberta_materialized_workspace_rejections,cuda_deberta_materialized_workspace_peak_bytes,cuda_deberta_generated_tc_attention_calls,cuda_deberta_generated_tc_m32_attention_calls,cuda_deberta_generated_tc_m16_attention_calls,cuda_deberta_generated_tc_attention_fallbacks\n", .{});
 }
 
 fn printCsv(opts: Options, result: Result) void {
@@ -785,7 +830,7 @@ fn printCsv(opts: Options, result: Result) void {
         },
     );
     std.debug.print(
-        ",{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+        ",{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
         .{
             result.cuda.h2d_bytes,
             result.cuda.d2h_bytes,
@@ -793,6 +838,7 @@ fn printCsv(opts: Options, result: Result) void {
             result.cuda.f16_cublaslt_qkv_calls,
             result.cuda.f16_activation_staging_calls,
             result.cuda.f16_cublaslt_fallbacks,
+            result.cuda.f16_scalar_linear_calls,
             result.cuda.deberta_fused_attention_calls,
             result.cuda.deberta_fused_attention_fallbacks,
             result.cuda.deberta_stream_f16_attention_calls,
@@ -800,6 +846,8 @@ fn printCsv(opts: Options, result: Result) void {
             result.cuda.deberta_stream_f16_staging_calls,
             result.cuda.deberta_materialized_f16_attention_calls,
             result.cuda.deberta_materialized_f16_attention_fallbacks,
+            result.cuda.deberta_materialized_workspace_rejections,
+            result.cuda.deberta_materialized_workspace_peak_bytes,
             result.cuda.deberta_generated_tc_attention_calls,
             result.cuda.deberta_generated_tc_m32_attention_calls,
             result.cuda.deberta_generated_tc_m16_attention_calls,
@@ -810,7 +858,8 @@ fn printCsv(opts: Options, result: Result) void {
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: zig build bench-gliner2-e2e -- --model-dir <dir> [--task entities|relations|both] [--text TEXT | --text-file PATH] [--text-repeat N] [--print-encoder-seq-len] [--expect-encoder-seq-len N] [--batch-size N] [--label NAME]... [--relation-label NAME]... [--backend auto|native|metal|onnx|cuda] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--graph-runtime partitioned] [--warmup-iters N] [--measure-iters N] [--format text|csv] [--dump-entities]
+        \\usage: zig build bench-gliner2-e2e -- --model-dir <dir> [--task entities|relations|both] [--text TEXT | --text-file PATH | --text-batch-file PATH] [--text-repeat N] [--print-encoder-seq-len] [--expect-encoder-seq-len N] [--batch-size N] [--label NAME]... [--relation-label NAME]... [--backend auto|native|metal|onnx|cuda] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--graph-runtime partitioned] [--warmup-iters N] [--measure-iters N] [--format text|csv] [--dump-entities]
+        \\  --text-batch-file reads one non-empty input per line and derives batch size unless --batch-size is supplied and matches.
         \\  Profile capture selects shadow mode unless a conflicting mode is explicit.
         \\
     , .{});
