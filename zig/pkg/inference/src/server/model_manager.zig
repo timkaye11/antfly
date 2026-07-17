@@ -424,7 +424,17 @@ fn loadHuggingFaceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []c
     };
     defer allocator.free(tokenizer_bytes);
 
-    const tok = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tokenizer_bytes);
+    const tok = try hf_tokenizer.HfTokenizer.loadFromBytesAllowDuplicateFields(allocator, tokenizer_bytes);
+    errdefer tok.deinitSelf();
+    const tokens = try getRequiredMetadataArray(&parsed, "tokenizer.ggml.tokens", .string);
+    for (tokens.values, 0..) |token_value, index| {
+        const token = switch (token_value) {
+            .string => |value| value,
+            else => return error.InvalidTokenizerMetadata,
+        };
+        const id = std.math.cast(i32, index) orelse return error.InvalidTokenizerMetadata;
+        try tok.addTokenIdAliasForDecode(token, id);
+    }
     tok.applySpecialTokenIds(
         metadataTokenId(&parsed, "tokenizer.ggml.bos_token_id"),
         metadataTokenId(&parsed, "tokenizer.ggml.eos_token_id"),
@@ -2471,7 +2481,7 @@ test "load huggingface tokenizer from gguf gemma4 bpe metadata" {
     defer encoded.deinit();
 
     try std.testing.expectEqual(@as(i32, 2), encoded.ids[0]);
-    try std.testing.expectEqual(@as(i32, 4), encoded.ids[1]);
+    try std.testing.expectEqual(@as(i32, 7), encoded.ids[1]);
     try std.testing.expectEqual(@as(i32, 5), encoded.ids[2]);
     try std.testing.expectEqual(@as(i32, 1), encoded.attention_mask[0]);
     try std.testing.expectEqual(@as(i32, 1), encoded.attention_mask[1]);
@@ -2479,11 +2489,12 @@ test "load huggingface tokenizer from gguf gemma4 bpe metadata" {
 
     const special_ids = try tok.tokenizer().encode(allocator, "<|turn>hello");
     defer allocator.free(special_ids);
-    try std.testing.expectEqualSlices(i32, &.{ 6, 4 }, special_ids);
+    try std.testing.expectEqualSlices(i32, &.{ 6, 7 }, special_ids);
 
-    const decoded = try tok.tokenizer().decode(allocator, &.{ 4, 5 });
+    const decoded = try tok.tokenizer().decode(allocator, &.{ 4, 7 });
     defer allocator.free(decoded);
-    try std.testing.expectEqualStrings("hello world", decoded);
+    try std.testing.expectEqualStrings("hellohello", decoded);
+    try std.testing.expectEqual(@as(usize, 8), tok.tokenizer().vocabSize());
 }
 
 test "load huggingface tokenizer from gguf t5 unigram metadata" {
@@ -2553,9 +2564,10 @@ fn buildTestGgufWithGemma4Tokenizer(allocator: std.mem.Allocator) ![]u8 {
         "hello",
         "▁world",
         "<|turn>",
+        "hello",
     });
     try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.merges", &.{});
-    try appendTestMetadataI32Array(allocator, &data, "tokenizer.ggml.token_type", &.{ 3, 3, 3, 2, 1, 1, 3 });
+    try appendTestMetadataI32Array(allocator, &data, "tokenizer.ggml.token_type", &.{ 3, 3, 3, 2, 1, 1, 3, 1 });
     try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.bos_token_id", 2);
     try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.eos_token_id", 1);
     try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.padding_token_id", 0);

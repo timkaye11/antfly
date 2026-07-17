@@ -533,15 +533,19 @@ fn traceBackendStage(cb: *const ops.ComputeBackend, allocator: std.mem.Allocator
 
 fn getMtpWeight(cb: *const ops.ComputeBackend, name: []const u8) !ops.CT {
     return cb.getWeight(name) catch |err| {
-        if (err != error.WeightNotFound) return err;
+        if (!isMissingWeight(err)) return err;
         var buf: [128]u8 = undefined;
         const prefixed = std.fmt.bufPrint(&buf, "mtp.{s}", .{name}) catch return error.NameTooLong;
         return cb.getWeight(prefixed) catch |prefixed_err| {
-            if (prefixed_err != error.WeightNotFound) return prefixed_err;
+            if (!isMissingWeight(prefixed_err)) return prefixed_err;
             const nextn_prefixed = std.fmt.bufPrint(&buf, "nextn.{s}", .{name}) catch return error.NameTooLong;
             return cb.getWeight(nextn_prefixed);
         };
     };
+}
+
+fn isMissingWeight(err: anyerror) bool {
+    return err == error.MissingWeight or err == error.WeightNotFound;
 }
 
 /// Run one Gemma 4 MTP assistant draft step.
@@ -972,6 +976,12 @@ test "gemma4 mtp stage stats summarize finite values" {
     try std.testing.expectEqual(@as(f32, 4.0), stats.max_abs);
     try std.testing.expectEqual(@as(f32, -3.0), stats.min);
     try std.testing.expectEqual(@as(f32, 4.0), stats.max);
+}
+
+test "gemma4 mtp retries weight aliases for backend missing errors" {
+    try std.testing.expect(isMissingWeight(error.MissingWeight));
+    try std.testing.expect(isMissingWeight(error.WeightNotFound));
+    try std.testing.expect(!isMissingWeight(error.OutOfMemory));
 }
 
 test "gemma4 mtp parses concat and kv donor modes" {

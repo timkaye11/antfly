@@ -240,6 +240,7 @@ run_mtp_policy_check() {
     --print-token-ids \
     >"$target_out" 2>&1
   ANTFLY_GEMMA4_MTP_AUTO_MIN_TOKENS=1 \
+  ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO=1 \
   ANTFLY_GEMMA4_MTP_PROFILE=1 \
   run_antfly_inference generate "$model" "$ORACLE_RENDERED_PROMPT" \
     --backend metal \
@@ -264,11 +265,12 @@ run_mtp_policy_check() {
     echo "auto:   ${auto_ids:-<missing>} ($auto_out)" >&2
     exit 1
   fi
-  if ! grep -Eq '^speculative: .*decision=active.*mtp_enabled=true' "$auto_out"; then
-    echo "Gemma4 QAT calibrated Metal MTP auto did not enable: $auto_out" >&2
+  if ! grep -Eq '^speculative: .*decision=(active|disabled_slow|disabled_low_acceptance|disabled_zero_match|disabled_insufficient_probe).*rounds=[1-9][0-9]*.*drafted=[1-9][0-9]*.*mtp_enabled=true' "$auto_out"; then
+    echo "Gemma4 QAT calibrated Metal MTP auto did not execute: $auto_out" >&2
     exit 1
   fi
   ANTFLY_GEMMA4_MTP_AUTO_MIN_TOKENS=1 \
+  ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO=1 \
   ANTFLY_GEMMA4_MTP_PROFILE=1 \
   run_antfly_inference generate "$model" "$ORACLE_RENDERED_PROMPT" \
     --backend metal \

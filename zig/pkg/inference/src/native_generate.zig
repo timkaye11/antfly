@@ -4827,6 +4827,18 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
             metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_f16_input,
         },
     );
+    print("metal_generated_quant_dispatch:", .{});
+    for (quant_matmul.generated_quant_counter_names) |counter| {
+        print(" {s}={d}", .{
+            counter.name,
+            quant_matmul.generatedQuantDispatchCount(
+                &metal_snapshot.provider.metal_runtime_antfly_generated_dispatch_counts,
+                counter.format,
+                counter.epilogue,
+            ),
+        });
+    }
+    print("\n", .{});
     print(
         "metal_q4_0_ple_dispatch: activation_rhs_reduce_out_f16={d} linear_reduce_in_f16={d}\n",
         .{
