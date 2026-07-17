@@ -120,6 +120,20 @@ pub const GlinerPipeline = struct {
         return self.recognizeWithLabelTokenBatch(texts, use_labels, self.config.token_e, self.config.threshold, self.config.flat_ner);
     }
 
+    /// Returns the exact encoder sequence length for an entities request,
+    /// including GLiNER's schema/label prefix. Benchmarks use this to make a
+    /// claimed 256-token row fail closed instead of relying on character or
+    /// word-count approximations.
+    pub fn entityEncoderTokenCount(
+        self: *GlinerPipeline,
+        text: []const u8,
+        labels: []const []const u8,
+    ) !usize {
+        var prepared = try self.prepareGlinerInput(text, labels, self.config.token_e);
+        defer prepared.deinit(self.allocator);
+        return prepared.input_ids.len;
+    }
+
     pub fn extractRelationsBatch(
         self: *GlinerPipeline,
         texts: []const []const u8,
@@ -269,6 +283,16 @@ pub const GlinerPipeline = struct {
         return rows[0];
     }
 
+    const PreparedGlinerSchema = struct {
+        ids: []i32,
+        positions: []i64,
+
+        fn deinit(self: *PreparedGlinerSchema, alloc: std.mem.Allocator) void {
+            alloc.free(self.ids);
+            alloc.free(self.positions);
+        }
+    };
+
     const PreparedGlinerInput = struct {
         text: []const u8,
         input_ids: []i64,
@@ -311,6 +335,7 @@ pub const GlinerPipeline = struct {
         const total_start_ns = glinerProfileStart(profile_enabled);
         const alloc = self.allocator;
         const max_width: usize = self.config.max_width;
+        const cuda_preprocessing = self.session.backend() == .cuda;
 
         if (self.config.token_p == 0 or label_token == 0 or self.config.token_sep_text == 0)
             return error.MissingSpecialTokenIds;
@@ -331,21 +356,44 @@ pub const GlinerPipeline = struct {
         }
         if (texts.len == 0) return results;
 
+        var schema = if (cuda_preprocessing) try self.prepareGlinerSchema(labels, label_token) else null;
+        defer if (schema) |*value| value.deinit(alloc);
+
+        // CUDA prepares identical request rows once so host preprocessing does
+        // not scale linearly while the device executes one real batch. Other
+        // backends retain their existing per-row preparation path.
         var prepared = try alloc.alloc(PreparedGlinerInput, texts.len);
         var prepared_len: usize = 0;
         errdefer {
             for (prepared[0..prepared_len]) |*row| row.deinit(alloc);
             alloc.free(prepared);
         }
+        const row_to_prepared = try alloc.alloc(usize, texts.len);
+        defer alloc.free(row_to_prepared);
+        var prepared_by_text = std.StringHashMapUnmanaged(usize).empty;
+        defer prepared_by_text.deinit(alloc);
 
         var max_seq_len: usize = 0;
         var max_num_words: usize = 0;
         const prepare_start_ns = glinerProfileStart(profile_enabled);
         for (texts, 0..) |text, i| {
-            prepared[i] = try self.prepareGlinerInput(text, labels, label_token);
+            if (cuda_preprocessing) {
+                if (prepared_by_text.get(text)) |prepared_i| {
+                    row_to_prepared[i] = prepared_i;
+                    continue;
+                }
+            }
+
+            const prepared_i = prepared_len;
+            prepared[prepared_i] = if (schema) |value|
+                try self.prepareGlinerInputWithSchema(text, value, true)
+            else
+                try self.prepareGlinerInput(text, labels, label_token);
             prepared_len += 1;
-            max_seq_len = @max(max_seq_len, prepared[i].input_ids.len);
-            max_num_words = @max(max_num_words, prepared[i].actual_num_words);
+            if (cuda_preprocessing) try prepared_by_text.put(alloc, text, prepared_i);
+            row_to_prepared[i] = prepared_i;
+            max_seq_len = @max(max_seq_len, prepared[prepared_i].input_ids.len);
+            max_num_words = @max(max_num_words, prepared[prepared_i].actual_num_words);
         }
         const prepare_ms = glinerProfileElapsedMs(prepare_start_ns);
 
@@ -361,7 +409,8 @@ pub const GlinerPipeline = struct {
 
         if (self.usesOfficialOnnxGlinerContract()) {
             const session_start_ns = glinerProfileStart(profile_enabled);
-            for (prepared[0..prepared_len], 0..) |row, i| {
+            for (row_to_prepared, 0..) |prepared_i, i| {
+                const row = prepared[prepared_i];
                 results[i] = try self.recognizeOfficialOnnxGlinerSingle(row, labels, threshold, flat_ner);
                 initialized_results += 1;
             }
@@ -388,22 +437,25 @@ pub const GlinerPipeline = struct {
         }
 
         const batch = texts.len;
-        const batch_num_spans = max_num_words * max_width;
+        const batch_num_spans = try checkedSizeMul(max_num_words, max_width);
+        const batch_rows = try checkedSizeMul(batch, max_seq_len);
+        const span_values = try checkedSizeMul(try checkedSizeMul(batch, batch_num_spans), 2);
         const pack_start_ns = glinerProfileStart(profile_enabled);
-        const input_ids_buf = try alloc.alloc(i64, batch * max_seq_len);
+        const input_ids_buf = try alloc.alloc(i64, batch_rows);
         defer alloc.free(input_ids_buf);
-        const attention_mask_buf = try alloc.alloc(i64, batch * max_seq_len);
+        const attention_mask_buf = try alloc.alloc(i64, batch_rows);
         defer alloc.free(attention_mask_buf);
-        const words_mask_buf = try alloc.alloc(i64, batch * max_seq_len);
+        const words_mask_buf = try alloc.alloc(i64, batch_rows);
         defer alloc.free(words_mask_buf);
-        const span_idx_buf = try alloc.alloc(i64, batch * batch_num_spans * 2);
+        const span_idx_buf = try alloc.alloc(i64, span_values);
         defer alloc.free(span_idx_buf);
         @memset(input_ids_buf, 0);
         @memset(attention_mask_buf, 0);
         @memset(words_mask_buf, 0);
         @memset(span_idx_buf, 0);
 
-        for (prepared[0..prepared_len], 0..) |row, b| {
+        for (row_to_prepared, 0..) |prepared_i, b| {
+            const row = prepared[prepared_i];
             const input_off = b * max_seq_len;
             @memcpy(input_ids_buf[input_off..][0..row.input_ids.len], row.input_ids);
             @memcpy(attention_mask_buf[input_off..][0..row.attention_mask.len], row.attention_mask);
@@ -420,7 +472,7 @@ pub const GlinerPipeline = struct {
             }
         }
 
-        const shape_2d = [_]i64{ @intCast(batch), @intCast(max_seq_len) };
+        const shape_2d = [_]i64{ try sizeToI64(batch), try sizeToI64(max_seq_len) };
         var input_ids_tensor = try Tensor.initInt64(alloc, "input_ids", &shape_2d, input_ids_buf);
         defer input_ids_tensor.deinit();
         var attention_mask_tensor = try Tensor.initInt64(alloc, "attention_mask", &shape_2d, attention_mask_buf);
@@ -428,7 +480,7 @@ pub const GlinerPipeline = struct {
         var words_mask_tensor = try Tensor.initInt64(alloc, "words_mask", &shape_2d, words_mask_buf);
         defer words_mask_tensor.deinit();
 
-        const span_shape = [_]i64{ @intCast(batch), @intCast(batch_num_spans), 2 };
+        const span_shape = [_]i64{ try sizeToI64(batch), try sizeToI64(batch_num_spans), 2 };
         var span_idx_tensor = try Tensor.initInt64(alloc, "span_idx", &span_shape, span_idx_buf);
         defer span_idx_tensor.deinit();
         const pack_ms = glinerProfileElapsedMs(pack_start_ns);
@@ -454,41 +506,52 @@ pub const GlinerPipeline = struct {
         var num_labels_dim: usize = labels.len;
         var output_num_words: usize = max_num_words;
         var output_max_width: usize = max_width;
-        var row_stride: usize = batch_num_spans * num_labels_dim;
+        var row_stride: usize = try checkedSizeMul(batch_num_spans, num_labels_dim);
         if (output_shape.len >= 4) {
-            output_num_words = @intCast(output_shape[1]);
-            output_max_width = @intCast(output_shape[2]);
-            num_labels_dim = @intCast(output_shape[3]);
-            row_stride = output_num_words * output_max_width * num_labels_dim;
+            output_num_words = try nonNegativeDim(output_shape[1]);
+            output_max_width = try nonNegativeDim(output_shape[2]);
+            num_labels_dim = try nonNegativeDim(output_shape[3]);
+            row_stride = try checkedSizeMul(try checkedSizeMul(output_num_words, output_max_width), num_labels_dim);
         } else if (output_shape.len == 3) {
-            row_stride = @as(usize, @intCast(output_shape[1])) * @as(usize, @intCast(output_shape[2]));
-            num_labels_dim = @intCast(output_shape[2]);
+            const output_spans = try nonNegativeDim(output_shape[1]);
+            num_labels_dim = try nonNegativeDim(output_shape[2]);
+            row_stride = try checkedSizeMul(output_spans, num_labels_dim);
         }
         if (num_labels_dim > labels.len) num_labels_dim = labels.len;
 
         const decode_start_ns = glinerProfileStart(profile_enabled);
-        for (prepared[0..prepared_len], 0..) |row, i| {
-            const row_start = @min(i * row_stride, logits.len);
-            const row_end = @min(row_start + row_stride, logits.len);
-            results[i] = try self.decodeEntitiesFromLogits(
-                row,
-                labels,
-                logits[row_start..row_end],
-                output_num_words,
-                output_max_width,
-                num_labels_dim,
-                threshold,
-                flat_ner,
-                .word_major_logits,
-            );
+        const first_result_by_prepared = try alloc.alloc(?usize, prepared_len);
+        defer alloc.free(first_result_by_prepared);
+        @memset(first_result_by_prepared, null);
+        for (row_to_prepared, 0..) |prepared_i, i| {
+            const row = prepared[prepared_i];
+            results[i] = if (cuda_preprocessing and first_result_by_prepared[prepared_i] != null)
+                try cloneEntities(alloc, results[first_result_by_prepared[prepared_i].?])
+            else blk: {
+                const row_start = @min(try checkedSizeMul(i, row_stride), logits.len);
+                const row_end = @min(try checkedSizeAdd(row_start, row_stride), logits.len);
+                break :blk try self.decodeEntitiesFromLogits(
+                    row,
+                    labels,
+                    logits[row_start..row_end],
+                    output_num_words,
+                    output_max_width,
+                    num_labels_dim,
+                    threshold,
+                    flat_ner,
+                    .word_major_logits,
+                );
+            };
+            if (cuda_preprocessing and first_result_by_prepared[prepared_i] == null) first_result_by_prepared[prepared_i] = i;
             initialized_results += 1;
         }
         const decode_ms = glinerProfileElapsedMs(decode_start_ns);
         if (profile_enabled) {
             std.debug.print(
-                "gliner_pipeline_profile: batch={d} labels={d} seq_len={d} num_words={d} max_width={d} prepare_ms={d:.3} pack_ms={d:.3} session_run_ms={d:.3} decode_ms={d:.3} total_ms={d:.3}\n",
+                "gliner_pipeline_profile: batch={d} unique_texts={d} labels={d} seq_len={d} num_words={d} max_width={d} prepare_ms={d:.3} pack_ms={d:.3} session_run_ms={d:.3} decode_ms={d:.3} total_ms={d:.3}\n",
                 .{
                     batch,
+                    prepared_len,
                     labels.len,
                     max_seq_len,
                     max_num_words,
@@ -615,11 +678,64 @@ pub const GlinerPipeline = struct {
         labels: []const []const u8,
         label_token: i32,
     ) !PreparedGlinerInput {
+        var schema = try self.prepareGlinerSchema(labels, label_token);
+        defer schema.deinit(self.allocator);
+        return self.prepareGlinerInputWithSchema(text, schema, false);
+    }
+
+    fn prepareGlinerSchema(
+        self: *GlinerPipeline,
+        labels: []const []const u8,
+        label_token: i32,
+    ) !PreparedGlinerSchema {
+        const alloc = self.allocator;
+        var schema_ids = std.ArrayListUnmanaged(i32).empty;
+        errdefer schema_ids.deinit(alloc);
+        var schema_positions = std.ArrayListUnmanaged(i64).empty;
+        errdefer schema_positions.deinit(alloc);
+
+        // Use the caller-owned token buffers throughout this hot path. The
+        // previous encode/append/free sequence allocated a fresh result for
+        // every schema fragment, label, and word.
+        try self.tok.encodeInto(alloc, "(", &schema_ids);
+        // [P]
+        try schema_positions.append(alloc, @intCast(schema_ids.items.len));
+        try schema_ids.append(alloc, self.config.token_p);
+        // "entities"
+        try self.tok.encodeInto(alloc, "entities", &schema_ids);
+        // "("
+        try self.tok.encodeInto(alloc, "(", &schema_ids);
+
+        for (labels) |label| {
+            // [E] special token
+            try schema_positions.append(alloc, @intCast(schema_ids.items.len));
+            try schema_ids.append(alloc, label_token);
+
+            // Label text (tokenized normally)
+            try self.tok.encodeInto(alloc, label, &schema_ids);
+        }
+
+        try self.tok.encodeInto(alloc, ")", &schema_ids);
+        try self.tok.encodeInto(alloc, ")", &schema_ids);
+        // [SEP_TEXT] special token
+        try schema_ids.append(alloc, self.config.token_sep_text);
+
+        const ids_owned = try schema_ids.toOwnedSlice(alloc);
+        errdefer alloc.free(ids_owned);
+        const positions_owned = try schema_positions.toOwnedSlice(alloc);
+        return .{ .ids = ids_owned, .positions = positions_owned };
+    }
+
+    fn prepareGlinerInputWithSchema(
+        self: *GlinerPipeline,
+        text: []const u8,
+        schema: PreparedGlinerSchema,
+        cache_word_tokens: bool,
+    ) !PreparedGlinerInput {
         const alloc = self.allocator;
         const max_width: usize = self.config.max_width;
         const max_len: usize = self.config.max_length;
 
-        // Split text into words with character offsets
         var words = std.ArrayListUnmanaged([]const u8).empty;
         defer words.deinit(alloc);
         var word_starts = std.ArrayListUnmanaged(usize).empty;
@@ -630,83 +746,37 @@ pub const GlinerPipeline = struct {
         try splitIntoWords(alloc, text, &words, &word_starts, &word_ends);
         const num_words = words.items.len;
 
-        // Build schema tokens: ( [P] entities ( [E] label1 [E] label2 ... ) ) [SEP_TEXT]
-        // Special tokens [P], [E], [SEP_TEXT] use their dedicated token IDs.
-        // Regular text parts are tokenized normally.
-        var schema_ids = std.ArrayListUnmanaged(i32).empty;
-        defer schema_ids.deinit(alloc);
-        var schema_positions = std.ArrayListUnmanaged(i64).empty;
-        errdefer schema_positions.deinit(alloc);
-
-        // "("
-        {
-            const ids = try self.tok.encode(alloc, "(");
-            defer alloc.free(ids);
-            try schema_ids.appendSlice(alloc, ids);
-        }
-        // [P]
-        try schema_positions.append(alloc, @intCast(schema_ids.items.len));
-        try schema_ids.append(alloc, self.config.token_p);
-        // "entities"
-        {
-            const ids = try self.tok.encode(alloc, "entities");
-            defer alloc.free(ids);
-            try schema_ids.appendSlice(alloc, ids);
-        }
-        // "("
-        {
-            const ids = try self.tok.encode(alloc, "(");
-            defer alloc.free(ids);
-            try schema_ids.appendSlice(alloc, ids);
-        }
-
-        for (labels) |label| {
-            // [E] special token
-            try schema_positions.append(alloc, @intCast(schema_ids.items.len));
-            try schema_ids.append(alloc, label_token);
-
-            // Label text (tokenized normally)
-            const lbl_ids = try self.tok.encode(alloc, label);
-            defer alloc.free(lbl_ids);
-            try schema_ids.appendSlice(alloc, lbl_ids);
-        }
-
-        // ")"
-        {
-            const ids = try self.tok.encode(alloc, ")");
-            defer alloc.free(ids);
-            try schema_ids.appendSlice(alloc, ids);
-        }
-        // ")"
-        {
-            const ids = try self.tok.encode(alloc, ")");
-            defer alloc.free(ids);
-            try schema_ids.appendSlice(alloc, ids);
-        }
-        // [SEP_TEXT] special token
-        try schema_ids.append(alloc, self.config.token_sep_text);
-
-        const schema_len = schema_ids.items.len;
+        const schema_len = schema.ids.len;
 
         // Tokenize each word individually (lowercased), tracking sub-token count per word
-        var text_ids = std.ArrayListUnmanaged(i32).empty;
-        defer text_ids.deinit(alloc);
-        var word_token_counts = try alloc.alloc(usize, num_words);
-        defer alloc.free(word_token_counts);
+        var unique_word_ids = std.ArrayListUnmanaged(i32).empty;
+        defer unique_word_ids.deinit(alloc);
+        const TokenRange = struct { offset: usize, len: usize };
+        var word_cache = std.HashMapUnmanaged([]const u8, TokenRange, AsciiCaselessStringContext, 80).empty;
+        defer word_cache.deinit(alloc);
+        var lowercase = std.ArrayListUnmanaged(u8).empty;
+        defer lowercase.deinit(alloc);
+        const word_token_ranges = try alloc.alloc(TokenRange, num_words);
+        defer alloc.free(word_token_ranges);
+        var text_token_count: usize = 0;
 
         for (words.items, 0..) |word, wi| {
-            const lower = try toLower(alloc, word);
-            defer alloc.free(lower);
-
-            const ids = try self.tok.encode(alloc, lower);
-            defer alloc.free(ids);
-
-            word_token_counts[wi] = ids.len;
-            try text_ids.appendSlice(alloc, ids);
+            const token_range = (if (cache_word_tokens) word_cache.get(word) else null) orelse blk: {
+                lowercase.clearRetainingCapacity();
+                try lowercase.ensureUnusedCapacity(alloc, word.len);
+                for (word) |c| lowercase.appendAssumeCapacity(std.ascii.toLower(c));
+                const offset = unique_word_ids.items.len;
+                try self.tok.encodeInto(alloc, lowercase.items, &unique_word_ids);
+                const range = TokenRange{ .offset = offset, .len = unique_word_ids.items.len - offset };
+                if (cache_word_tokens) try word_cache.put(alloc, word, range);
+                break :blk range;
+            };
+            word_token_ranges[wi] = token_range;
+            text_token_count = try std.math.add(usize, text_token_count, token_range.len);
         }
 
         // Total sequence length (clamp to max_len)
-        var seq_len = schema_len + text_ids.items.len;
+        var seq_len = try std.math.add(usize, schema_len, text_token_count);
         if (seq_len > max_len) seq_len = max_len;
 
         // Build input tensors
@@ -724,7 +794,7 @@ pub const GlinerPipeline = struct {
 
         // Fill schema tokens
         for (0..@min(schema_len, seq_len)) |j| {
-            input_ids_buf[j] = @intCast(schema_ids.items[j]);
+            input_ids_buf[j] = @intCast(schema.ids[j]);
             attention_mask_buf[j] = 1;
             words_mask_buf[j] = 0; // schema tokens get 0
         }
@@ -732,20 +802,19 @@ pub const GlinerPipeline = struct {
         // Fill text tokens with word IDs (1-indexed)
         var pos = schema_len;
         var actual_num_words: usize = 0;
-        var token_offset: usize = 0;
         for (0..num_words) |wi| {
-            const count = word_token_counts[wi];
+            const token_range = word_token_ranges[wi];
+            const count = token_range.len;
             if (pos + count > seq_len) break;
 
             try text_positions.append(alloc, @intCast(pos));
             for (0..count) |ti| {
                 if (pos >= seq_len) break;
-                input_ids_buf[pos] = @intCast(text_ids.items[token_offset + ti]);
+                input_ids_buf[pos] = @intCast(unique_word_ids.items[token_range.offset + ti]);
                 attention_mask_buf[pos] = 1;
                 words_mask_buf[pos] = @intCast(wi + 1); // 1-indexed word ID
                 pos += 1;
             }
-            token_offset += count;
             actual_num_words = wi + 1;
         }
 
@@ -774,7 +843,7 @@ pub const GlinerPipeline = struct {
         errdefer alloc.free(word_ends_owned);
         const text_positions_owned = try text_positions.toOwnedSlice(alloc);
         errdefer alloc.free(text_positions_owned);
-        const schema_positions_owned = try schema_positions.toOwnedSlice(alloc);
+        const schema_positions_owned = try alloc.dupe(i64, schema.positions);
 
         return .{
             .text = text,
@@ -1524,6 +1593,54 @@ fn toLower(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
         buf[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
     }
     return buf;
+}
+
+const AsciiCaselessStringContext = struct {
+    pub fn hash(_: @This(), value: []const u8) u64 {
+        var hash_value: u64 = 14695981039346656037;
+        for (value) |c| {
+            hash_value ^= std.ascii.toLower(c);
+            hash_value *%= 1099511628211;
+        }
+        return hash_value;
+    }
+
+    pub fn eql(_: @This(), a: []const u8, b: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(a, b);
+    }
+};
+
+fn checkedSizeMul(a: usize, b: usize) !usize {
+    return std.math.mul(usize, a, b) catch error.InvalidShape;
+}
+
+fn checkedSizeAdd(a: usize, b: usize) !usize {
+    return std.math.add(usize, a, b) catch error.InvalidShape;
+}
+
+fn sizeToI64(value: usize) !i64 {
+    if (value > std.math.maxInt(i64)) return error.InvalidShape;
+    return @intCast(value);
+}
+
+fn nonNegativeDim(value: i64) !usize {
+    if (value < 0) return error.InvalidShape;
+    return @intCast(value);
+}
+
+fn cloneEntities(alloc: std.mem.Allocator, entities: []const Entity) ![]Entity {
+    const cloned = try alloc.alloc(Entity, entities.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |entity| alloc.free(entity.text);
+        alloc.free(cloned);
+    }
+    for (entities, 0..) |entity, i| {
+        cloned[i] = entity;
+        cloned[i].text = try alloc.dupe(u8, entity.text);
+        initialized += 1;
+    }
+    return cloned;
 }
 
 test "scoreLabelsFromLogits returns sigmoid of max logit per label" {

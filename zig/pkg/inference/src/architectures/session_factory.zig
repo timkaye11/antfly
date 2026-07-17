@@ -70,6 +70,7 @@ const cuda_compute_mod = if (build_options.enable_cuda) @import("../ops/cuda/cud
 pub const CudaRuntimeStats = if (build_options.enable_cuda) cuda_compute_mod.RuntimeStats else void;
 const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.CapabilityProfile else enum {
     clipclap,
+    bert_encoder,
     deberta_reranker,
     gliner2,
     florence2,
@@ -1117,7 +1118,8 @@ fn cudaSupportsArch(arch_config: ArchConfig) bool {
 
 fn cudaProfileForArch(arch_config: ArchConfig) ?CudaCapabilityProfile {
     return switch (arch_config) {
-        .bert, .clip, .clap => .clipclap,
+        .clip, .clap => .clipclap,
+        .bert => .bert_encoder,
         .deberta => .deberta_reranker,
         .gliner => .gliner2,
         .florence => .florence2,
@@ -1137,7 +1139,7 @@ test "cuda support gate admits only supported encoder architectures" {
     try std.testing.expect(cudaSupportsArch(.{ .florence = .{} }));
     if (comptime build_options.enable_cuda) {
         try std.testing.expectEqual(CudaCapabilityProfile.clipclap, cudaProfileForArch(.{ .clip = .{} }).?);
-        try std.testing.expectEqual(CudaCapabilityProfile.clipclap, cudaProfileForArch(.{ .bert = .{} }).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.bert_encoder, cudaProfileForArch(.{ .bert = .{} }).?);
         try std.testing.expectEqual(CudaCapabilityProfile.deberta_reranker, cudaProfileForArch(.{ .deberta = .{} }).?);
         try std.testing.expectEqual(CudaCapabilityProfile.gliner2, cudaProfileForArch(.{ .gliner = .{} }).?);
         try std.testing.expectEqual(CudaCapabilityProfile.florence2, cudaProfileForArch(.{ .florence = .{} }).?);

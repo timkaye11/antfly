@@ -47,6 +47,80 @@ fn generatedGqaDecodeEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE", false);
 }
 
+// Kept switchable so the shape-specialized encoder prefill path can be
+// validated directly against the generic implementation on a given GPU.
+fn bertPrefillAttentionEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_BERT_PREFILL_ATTENTION", true);
+}
+
+fn bertPrefillAttentionQueryTilingEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_BERT_PREFILL_ATTENTION_Q8", true);
+}
+
+const BertPrefillAttentionMode = enum {
+    generic,
+    exact,
+    exact_q8,
+    tensor_core,
+};
+
+const bert_prefill_attention_mma_seq_len: usize = 256;
+const bert_prefill_attention_mma_head_dim: usize = 64;
+const bert_prefill_attention_mma_query_tile: usize = 16;
+const bert_prefill_attention_mma_threads: usize = 256;
+// f16 V-hi plus f32 S/P/V/O. QK is exact FP32; the P*V residual correction
+// fits below CUDA's 48 KiB default dynamic-shared-memory limit.
+const bert_prefill_attention_mma_shared_bytes: usize = 45312;
+
+fn parseBertPrefillAttentionMode(value: []const u8) ?BertPrefillAttentionMode {
+    if (std.ascii.eqlIgnoreCase(value, "generic")) return .generic;
+    if (std.ascii.eqlIgnoreCase(value, "exact")) return .exact;
+    if (std.ascii.eqlIgnoreCase(value, "exact-q8") or std.ascii.eqlIgnoreCase(value, "exact_q8")) return .exact_q8;
+    if (std.ascii.eqlIgnoreCase(value, "tensor-core") or
+        std.ascii.eqlIgnoreCase(value, "tensor_core") or
+        std.ascii.eqlIgnoreCase(value, "mma")) return .tensor_core;
+    return null;
+}
+
+// `exact` is the production default. Tensor-core is a deliberate opt-in: it
+// changes the FP32 Q/K/V arithmetic contract, so it must be qualified for a
+// model and retrieval-quality target before deployment. The legacy boolean is
+// retained for existing experiment scripts; MODE is the canonical interface.
+fn bertPrefillAttentionMode() BertPrefillAttentionMode {
+    if (!bertPrefillAttentionEnabled()) return .generic;
+    if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_BERT_PREFILL_ATTENTION_MODE")) |value| {
+        return parseBertPrefillAttentionMode(value) orelse .exact;
+    }
+    if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_BERT_PREFILL_ATTENTION_MMA", false)) return .tensor_core;
+    return .exact;
+}
+
+fn bertPrefillAttentionMmaComputeEligible(compute_major: i32, compute_minor: i32) bool {
+    // The checked-in portable CUDA artifact targets sm_75. Do not select a
+    // WMMA symbol on an older device and rely on module-load/JIT failure.
+    return compute_major > 7 or (compute_major == 7 and compute_minor >= 5);
+}
+
+fn bertPrefillAttentionMmaShapeEligible(
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    causal: bool,
+    has_mask: bool,
+    bias_mode: u32,
+    head_major: bool,
+) bool {
+    return batch > 0 and
+        num_heads > 0 and
+        !causal and
+        !has_mask and
+        bias_mode == 0 and
+        head_major and
+        seq_len == bert_prefill_attention_mma_seq_len and
+        head_dim == bert_prefill_attention_mma_head_dim;
+}
+
 pub fn generatedGqaScorePreworkEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK", false);
 }
@@ -316,6 +390,7 @@ pub const JitProductionRoutes = struct {
 
 pub const JitModelProfile = enum {
     clipclap,
+    bert_encoder,
     deberta_reranker,
     gliner2,
     florence2,
@@ -341,7 +416,7 @@ pub const JitRouteScope = struct {
         return switch (profile) {
             // Current production CUDA JIT evidence is exclusively Gemma4
             // E2B/E4B Q4_0. Encoder models keep the bundled runtime.
-            .clipclap, .deberta_reranker, .gliner2, .florence2 => .{},
+            .clipclap, .bert_encoder, .deberta_reranker, .gliner2, .florence2 => .{},
             .gemma4 => .{ .production = .{
                 .mmv = true,
                 .mm = true,
@@ -872,6 +947,7 @@ pub const KernelModule = struct {
     copy_f32: driver_mod.CUfunction = null,
     copy_u8: driver_mod.CUfunction = null,
     f32_to_bf16: driver_mod.CUfunction = null,
+    f32_to_f16: driver_mod.CUfunction = null,
     dequant_q4_0_bf16: driver_mod.CUfunction = null,
     scale_f32: driver_mod.CUfunction = null,
     add_scalar_f32: driver_mod.CUfunction = null,
@@ -881,6 +957,7 @@ pub const KernelModule = struct {
     linear_f32: driver_mod.CUfunction = null,
     linear_f32_tiled: driver_mod.CUfunction = null,
     linear_bf16_weight_f32_tiled: driver_mod.CUfunction = null,
+    linear_f16_weight_f32_tiled: driver_mod.CUfunction = null,
     argmax_last_row_f32: driver_mod.CUfunction = null,
     argmax_rows_f32: driver_mod.CUfunction = null,
     argmax_rows_suppress_f32: driver_mod.CUfunction = null,
@@ -914,6 +991,7 @@ pub const KernelModule = struct {
     gemma4_mtp_verify_commit_u32: driver_mod.CUfunction = null,
     linear_bias_f32: driver_mod.CUfunction = null,
     add_bias_rows_f32: driver_mod.CUfunction = null,
+    add_bias_relu_rows_f32: driver_mod.CUfunction = null,
     linear_bias_f32_tile4_r2: driver_mod.CUfunction = null,
     linear_bias_relu_f32_tile4_r2: driver_mod.CUfunction = null,
     linear_bias_gelu_f32_tile4_r2: driver_mod.CUfunction = null,
@@ -935,7 +1013,9 @@ pub const KernelModule = struct {
     activation_multiply_slice_last_dim_f32: driver_mod.CUfunction = null,
     embedding_lookup_f32: driver_mod.CUfunction = null,
     embedding_lookup_bf16_weight_f32: driver_mod.CUfunction = null,
+    embedding_lookup_f16_weight_f32: driver_mod.CUfunction = null,
     embedding_lookup_i32_f32: driver_mod.CUfunction = null,
+    embedding_lookup_i32_f16_weight_f32: driver_mod.CUfunction = null,
     take_rows_f32: driver_mod.CUfunction = null,
     gliner_gather_concat_relu_f32: driver_mod.CUfunction = null,
     gliner_word_embeddings_f32: driver_mod.CUfunction = null,
@@ -945,6 +1025,16 @@ pub const KernelModule = struct {
     conv2d_f32: driver_mod.CUfunction = null,
     attention_f32: driver_mod.CUfunction = null,
     attention_f32_block: driver_mod.CUfunction = null,
+    // Generated-shape BERT prefill attention: full, head-major [B,H,256,64].
+    // It replaces the legacy block-wide reduction performed once per key.
+    attention_f32_bert_prefill_s256_hd64: driver_mod.CUfunction = null,
+    // Eight independent query rows per block for the occupancy-sensitive
+    // encoder prefill path.
+    attention_f32_bert_prefill_s256_hd64_q8: driver_mod.CUfunction = null,
+    // Exact sixteen-query tile. It preserves q8 arithmetic while reducing
+    // prefill grid traffic for the BERT 256x64 contract.
+    attention_f32_bert_prefill_s256_hd64_q16: driver_mod.CUfunction = null,
+    attention_f32_bert_prefill_s256_hd64_mma: driver_mod.CUfunction = null,
     cross_attention_f32: driver_mod.CUfunction = null,
     cross_attention_q1_f32: driver_mod.CUfunction = null,
     token_to_nchw_f32: driver_mod.CUfunction = null,
@@ -1003,6 +1093,17 @@ pub const KernelModule = struct {
     gqa_attention_decode_turboquant_f32: driver_mod.CUfunction = null,
     kv_write_suffix_turboquant_f32: driver_mod.CUfunction = null,
     deberta_attention_f32: driver_mod.CUfunction = null,
+    deberta_attention_fused_f32: driver_mod.CUfunction = null,
+    deberta_attention_stream_f16: driver_mod.CUfunction = null,
+    /// Generated tensor-core DeBERTa prefill schedule. It consumes graph
+    /// layout F32 directly and owns a 16-query x 32-key tile per CTA.
+    deberta_attention_tc_f16_m16n32: driver_mod.CUfunction = null,
+    /// Preferred generated tensor-core DeBERTa prefill schedule. Its 32-query
+    /// x 16-key CTA reduces K/V rereads while remaining under 48 KiB shared.
+    deberta_attention_tc_f16_m32n16: driver_mod.CUfunction = null,
+    deberta_pack_heads_f16: driver_mod.CUfunction = null,
+    deberta_scores_softmax_f32: driver_mod.CUfunction = null,
+    deberta_unpack_heads_f32: driver_mod.CUfunction = null,
     split_last_dim3_f32: driver_mod.CUfunction = null,
     linear_q8_0_f32: driver_mod.CUfunction = null,
 
@@ -1795,6 +1896,7 @@ pub const KernelModule = struct {
         const copy_f32 = loadOptionalFunction(ctx, module, "termite_copy_f32");
         const copy_u8 = loadOptionalFunction(ctx, module, "termite_copy_u8");
         const f32_to_bf16 = loadOptionalFunction(ctx, module, "termite_f32_to_bf16");
+        const f32_to_f16 = loadOptionalFunction(ctx, module, "termite_f32_to_f16");
         const dequant_q4_0_bf16 = loadOptionalFunction(ctx, module, "termite_dequant_q4_0_bf16");
         var scale_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&scale_f32, module, "termite_scale_f32"));
@@ -1810,6 +1912,7 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_f32, module, "termite_linear_f32"));
         const linear_f32_tiled = loadOptionalFunction(ctx, module, "termite_linear_f32_tiled");
         const linear_bf16_weight_f32_tiled = loadOptionalFunction(ctx, module, "termite_linear_bf16_weight_f32_tiled");
+        const linear_f16_weight_f32_tiled = loadOptionalFunction(ctx, module, "termite_linear_f16_weight_f32_tiled");
         var argmax_last_row_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&argmax_last_row_f32, module, "termite_argmax_last_row_f32"));
         const argmax_rows_f32 = loadOptionalFunction(ctx, module, "termite_argmax_rows_f32");
@@ -1858,6 +1961,8 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_bias_f32, module, "termite_linear_bias_f32"));
         var add_bias_rows_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&add_bias_rows_f32, module, "termite_add_bias_rows_f32"));
+        var add_bias_relu_rows_f32: driver_mod.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&add_bias_relu_rows_f32, module, "termite_add_bias_relu_rows_f32"));
         var linear_bias_f32_tile4_r2: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_bias_f32_tile4_r2, module, "termite_linear_bias_f32_tile4_r2"));
         var linear_bias_relu_f32_tile4_r2: driver_mod.CUfunction = null;
@@ -1895,8 +2000,10 @@ pub const KernelModule = struct {
         var embedding_lookup_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_f32, module, "termite_embedding_lookup_f32"));
         const embedding_lookup_bf16_weight_f32 = loadOptionalFunction(ctx, module, "termite_embedding_lookup_bf16_weight_f32");
+        const embedding_lookup_f16_weight_f32 = loadOptionalFunction(ctx, module, "termite_embedding_lookup_f16_weight_f32");
         var embedding_lookup_i32_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_i32_f32, module, "termite_embedding_lookup_i32_f32"));
+        const embedding_lookup_i32_f16_weight_f32 = loadOptionalFunction(ctx, module, "termite_embedding_lookup_i32_f16_weight_f32");
         var take_rows_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&take_rows_f32, module, "termite_take_rows_f32"));
         const gliner_gather_concat_relu_f32 = loadOptionalFunction(ctx, module, "termite_gliner_gather_concat_relu_f32");
@@ -1914,6 +2021,10 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32, module, "termite_attention_f32"));
         var attention_f32_block: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32_block, module, "termite_attention_f32_block"));
+        const attention_f32_bert_prefill_s256_hd64 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64");
+        const attention_f32_bert_prefill_s256_hd64_q8 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64_q8");
+        const attention_f32_bert_prefill_s256_hd64_q16 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64_q16");
+        const attention_f32_bert_prefill_s256_hd64_mma = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64_mma");
         const cross_attention_f32 = loadOptionalFunction(ctx, module, "termite_cross_attention_f32");
         const cross_attention_q1_f32 = loadOptionalFunction(ctx, module, "termite_cross_attention_q1_f32");
         const token_to_nchw_f32 = loadOptionalFunction(ctx, module, "termite_token_to_nchw_f32");
@@ -1997,6 +2108,13 @@ pub const KernelModule = struct {
         const kv_write_suffix_turboquant_f32 = loadOptionalFunction(ctx, module, "termite_kv_write_suffix_turboquant_f32");
         var deberta_attention_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&deberta_attention_f32, module, "termite_deberta_attention_f32"));
+        const deberta_attention_fused_f32 = loadOptionalFunction(ctx, module, "termite_deberta_attention_fused_f32");
+        const deberta_attention_stream_f16 = loadOptionalFunction(ctx, module, "termite_deberta_attention_stream_f16");
+        const deberta_attention_tc_f16_m16n32 = loadOptionalFunction(ctx, module, "termite_deberta_attention_tc_f16_m16n32");
+        const deberta_attention_tc_f16_m32n16 = loadOptionalFunction(ctx, module, "termite_deberta_attention_tc_f16_m32n16");
+        const deberta_pack_heads_f16 = loadOptionalFunction(ctx, module, "termite_deberta_pack_heads_f16");
+        const deberta_scores_softmax_f32 = loadOptionalFunction(ctx, module, "termite_deberta_scores_softmax_f32");
+        const deberta_unpack_heads_f32 = loadOptionalFunction(ctx, module, "termite_deberta_unpack_heads_f32");
         var split_last_dim3_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&split_last_dim3_f32, module, "termite_split_last_dim3_f32"));
         var linear_q8_0_f32: driver_mod.CUfunction = null;
@@ -2192,6 +2310,7 @@ pub const KernelModule = struct {
             .copy_f32 = copy_f32,
             .copy_u8 = copy_u8,
             .f32_to_bf16 = f32_to_bf16,
+            .f32_to_f16 = f32_to_f16,
             .dequant_q4_0_bf16 = dequant_q4_0_bf16,
             .scale_f32 = scale_f32,
             .add_scalar_f32 = add_scalar_f32,
@@ -2201,6 +2320,7 @@ pub const KernelModule = struct {
             .linear_f32 = linear_f32,
             .linear_f32_tiled = linear_f32_tiled,
             .linear_bf16_weight_f32_tiled = linear_bf16_weight_f32_tiled,
+            .linear_f16_weight_f32_tiled = linear_f16_weight_f32_tiled,
             .argmax_last_row_f32 = argmax_last_row_f32,
             .argmax_rows_f32 = argmax_rows_f32,
             .argmax_rows_suppress_f32 = argmax_rows_suppress_f32,
@@ -2234,6 +2354,7 @@ pub const KernelModule = struct {
             .gemma4_mtp_verify_commit_u32 = gemma4_mtp_verify_commit_u32,
             .linear_bias_f32 = linear_bias_f32,
             .add_bias_rows_f32 = add_bias_rows_f32,
+            .add_bias_relu_rows_f32 = add_bias_relu_rows_f32,
             .linear_bias_f32_tile4_r2 = linear_bias_f32_tile4_r2,
             .linear_bias_relu_f32_tile4_r2 = linear_bias_relu_f32_tile4_r2,
             .linear_bias_gelu_f32_tile4_r2 = linear_bias_gelu_f32_tile4_r2,
@@ -2255,7 +2376,9 @@ pub const KernelModule = struct {
             .activation_multiply_slice_last_dim_f32 = activation_multiply_slice_last_dim_f32,
             .embedding_lookup_f32 = embedding_lookup_f32,
             .embedding_lookup_bf16_weight_f32 = embedding_lookup_bf16_weight_f32,
+            .embedding_lookup_f16_weight_f32 = embedding_lookup_f16_weight_f32,
             .embedding_lookup_i32_f32 = embedding_lookup_i32_f32,
+            .embedding_lookup_i32_f16_weight_f32 = embedding_lookup_i32_f16_weight_f32,
             .take_rows_f32 = take_rows_f32,
             .gliner_gather_concat_relu_f32 = gliner_gather_concat_relu_f32,
             .gliner_word_embeddings_f32 = gliner_word_embeddings_f32,
@@ -2265,6 +2388,10 @@ pub const KernelModule = struct {
             .conv2d_f32 = conv2d_f32,
             .attention_f32 = attention_f32,
             .attention_f32_block = attention_f32_block,
+            .attention_f32_bert_prefill_s256_hd64 = attention_f32_bert_prefill_s256_hd64,
+            .attention_f32_bert_prefill_s256_hd64_q8 = attention_f32_bert_prefill_s256_hd64_q8,
+            .attention_f32_bert_prefill_s256_hd64_q16 = attention_f32_bert_prefill_s256_hd64_q16,
+            .attention_f32_bert_prefill_s256_hd64_mma = attention_f32_bert_prefill_s256_hd64_mma,
             .cross_attention_f32 = cross_attention_f32,
             .cross_attention_q1_f32 = cross_attention_q1_f32,
             .token_to_nchw_f32 = token_to_nchw_f32,
@@ -2318,6 +2445,13 @@ pub const KernelModule = struct {
             .gqa_attention_decode_turboquant_f32 = gqa_attention_decode_turboquant_f32,
             .kv_write_suffix_turboquant_f32 = kv_write_suffix_turboquant_f32,
             .deberta_attention_f32 = deberta_attention_f32,
+            .deberta_attention_fused_f32 = deberta_attention_fused_f32,
+            .deberta_attention_stream_f16 = deberta_attention_stream_f16,
+            .deberta_attention_tc_f16_m16n32 = deberta_attention_tc_f16_m16n32,
+            .deberta_attention_tc_f16_m32n16 = deberta_attention_tc_f16_m32n16,
+            .deberta_pack_heads_f16 = deberta_pack_heads_f16,
+            .deberta_scores_softmax_f32 = deberta_scores_softmax_f32,
+            .deberta_unpack_heads_f32 = deberta_unpack_heads_f32,
             .split_last_dim3_f32 = split_last_dim3_f32,
             .linear_q8_0_f32 = linear_q8_0_f32,
             .linear_q8_0_f32_tile4 = linear_q8_0_f32_tile4,
@@ -2483,6 +2617,7 @@ pub const KernelModule = struct {
             self.module = null;
             self.fill_f32 = null;
             self.f32_to_bf16 = null;
+            self.f32_to_f16 = null;
             self.dequant_q4_0_bf16 = null;
             self.scale_f32 = null;
             self.add_scalar_f32 = null;
@@ -2492,6 +2627,7 @@ pub const KernelModule = struct {
             self.linear_f32 = null;
             self.linear_f32_tiled = null;
             self.linear_bf16_weight_f32_tiled = null;
+            self.linear_f16_weight_f32_tiled = null;
             self.argmax_last_row_f32 = null;
             self.argmax_rows_f32 = null;
             self.argmax_rows_suppress_f32 = null;
@@ -2525,6 +2661,7 @@ pub const KernelModule = struct {
             self.gemma4_mtp_verify_commit_u32 = null;
             self.linear_bias_f32 = null;
             self.add_bias_rows_f32 = null;
+            self.add_bias_relu_rows_f32 = null;
             self.linear_bias_f32_tile4_r2 = null;
             self.linear_bias_relu_f32_tile4_r2 = null;
             self.linear_bias_gelu_f32_tile4_r2 = null;
@@ -2545,7 +2682,9 @@ pub const KernelModule = struct {
             self.activation_multiply_slice_last_dim_f32 = null;
             self.embedding_lookup_f32 = null;
             self.embedding_lookup_bf16_weight_f32 = null;
+            self.embedding_lookup_f16_weight_f32 = null;
             self.embedding_lookup_i32_f32 = null;
+            self.embedding_lookup_i32_f16_weight_f32 = null;
             self.take_rows_f32 = null;
             self.gliner_gather_concat_relu_f32 = null;
             self.gliner_word_embeddings_f32 = null;
@@ -2555,6 +2694,10 @@ pub const KernelModule = struct {
             self.conv2d_f32 = null;
             self.attention_f32 = null;
             self.attention_f32_block = null;
+            self.attention_f32_bert_prefill_s256_hd64 = null;
+            self.attention_f32_bert_prefill_s256_hd64_q8 = null;
+            self.attention_f32_bert_prefill_s256_hd64_q16 = null;
+            self.attention_f32_bert_prefill_s256_hd64_mma = null;
             self.cross_attention_f32 = null;
             self.cross_attention_q1_f32 = null;
             self.token_to_nchw_f32 = null;
@@ -2608,6 +2751,13 @@ pub const KernelModule = struct {
             self.gqa_attention_decode_turboquant_f32 = null;
             self.kv_write_suffix_turboquant_f32 = null;
             self.deberta_attention_f32 = null;
+            self.deberta_attention_fused_f32 = null;
+            self.deberta_attention_stream_f16 = null;
+            self.deberta_attention_tc_f16_m16n32 = null;
+            self.deberta_attention_tc_f16_m32n16 = null;
+            self.deberta_pack_heads_f16 = null;
+            self.deberta_scores_softmax_f32 = null;
+            self.deberta_unpack_heads_f32 = null;
             self.split_last_dim3_f32 = null;
             self.linear_q8_0_f32 = null;
             self.linear_q8_0_f32_tile4 = null;
@@ -3094,6 +3244,29 @@ pub const KernelModule = struct {
         try launch1d(function, ctx, count, &params);
     }
 
+    pub fn launchF32ToF16(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        count: usize,
+    ) driver_mod.Error!void {
+        const function = self.f32_to_f16 orelse return error.CudaKernelUnavailable;
+        try checkRawBytes(dst, try checkedTensorElements(count, @sizeOf(u16)));
+        try checkBytes(input, count);
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var count_u32 = try toU32(count);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&count_u32),
+        };
+        try launch1d(function, ctx, count, &params);
+    }
+
     pub fn launchLinearBf16WeightF32Tiled(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -3106,6 +3279,44 @@ pub const KernelModule = struct {
     ) driver_mod.Error!void {
         const function = self.linear_bf16_weight_f32_tiled orelse return error.CudaKernelUnavailable;
         const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight, try checkedTensorElements(try checkedTensorElements(out_dim, in_dim), @sizeOf(u16)));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launchBlocks(function, ctx, out_count, f32_tiled_threads, &params);
+    }
+
+    pub fn launchLinearF16WeightF32Tiled(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_f16_weight_f32_tiled orelse return error.CudaKernelUnavailable;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        // The compatibility kernel indexes its launch domain with u32. Fail
+        // closed before launch instead of allowing rows*out_dim to wrap in
+        // device code for an otherwise representable host-side allocation.
+        _ = try toU32(out_count);
         try checkBytes(dst, out_count);
         try checkBytes(input, try checkedTensorElements(rows, in_dim));
         try checkRawBytes(weight, try checkedTensorElements(try checkedTensorElements(out_dim, in_dim), @sizeOf(u16)));
@@ -4661,6 +4872,32 @@ pub const KernelModule = struct {
         try launch1d(self.add_bias_rows_f32, ctx, out_count, &params);
     }
 
+    pub fn launchAddBiasReluRowsF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        bias: buffer_mod.DeviceBuffer,
+        rows: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(bias, out_dim);
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var bias_ptr = bias.ptr;
+        var rows_u32 = try toU32(rows);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&bias_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launch1d(self.add_bias_relu_rows_f32, ctx, out_count, &params);
+    }
+
     pub fn launchLinearBiasTile4Rows2F32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -5329,6 +5566,40 @@ pub const KernelModule = struct {
         try launch1d(function, ctx, count, &params);
     }
 
+    pub fn launchEmbeddingLookupF16WeightF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        ids: buffer_mod.DeviceBuffer,
+        total: usize,
+        dim: usize,
+        scale: f32,
+    ) driver_mod.Error!void {
+        const function = self.embedding_lookup_f16_weight_f32 orelse return error.CudaKernelUnavailable;
+        const count = try checkedTensorElements(total, dim);
+        try checkBytes(dst, count);
+        try checkRawBytes(weight, dim * @sizeOf(u16));
+        try checkRawBytes(ids, total * @sizeOf(i64));
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var weight_ptr = weight.ptr;
+        var ids_ptr = ids.ptr;
+        var total_u32 = try toU32(total);
+        var dim_u32 = try toU32(dim);
+        var scale_value = scale;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&ids_ptr),
+            @ptrCast(&total_u32),
+            @ptrCast(&dim_u32),
+            @ptrCast(&scale_value),
+        };
+        try launch1d(function, ctx, count, &params);
+    }
+
     pub fn launchEmbeddingLookupI32F32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -5360,6 +5631,40 @@ pub const KernelModule = struct {
             @ptrCast(&scale_value),
         };
         try launch1d(self.embedding_lookup_i32_f32, ctx, count, &params);
+    }
+
+    pub fn launchEmbeddingLookupI32F16WeightF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        ids: buffer_mod.DeviceBuffer,
+        total: usize,
+        dim: usize,
+        scale: f32,
+    ) driver_mod.Error!void {
+        const function = self.embedding_lookup_i32_f16_weight_f32 orelse return error.CudaKernelUnavailable;
+        const count = try checkedTensorElements(total, dim);
+        try checkBytes(dst, count);
+        try checkRawBytes(weight, dim * @sizeOf(u16));
+        try checkRawBytes(ids, total * @sizeOf(i32));
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var weight_ptr = weight.ptr;
+        var ids_ptr = ids.ptr;
+        var total_u32 = try toU32(total);
+        var dim_u32 = try toU32(dim);
+        var scale_value = scale;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&ids_ptr),
+            @ptrCast(&total_u32),
+            @ptrCast(&dim_u32),
+            @ptrCast(&scale_value),
+        };
+        try launch1d(function, ctx, count, &params);
     }
 
     pub fn launchTakeRowsF32(
@@ -6106,7 +6411,45 @@ pub const KernelModule = struct {
             @ptrCast(&bias_mode_u32),
             @ptrCast(&head_major_u32),
         };
-        if (seq_len <= 512 and head_dim <= 128) {
+        const attention_mode = bertPrefillAttentionMode();
+        if (attention_mode == .tensor_core and
+            bertPrefillAttentionMmaComputeEligible(ctx.info.compute_major, ctx.info.compute_minor) and
+            bertPrefillAttentionMmaShapeEligible(batch, seq_len, num_heads, head_dim, causal, has_mask, bias_mode, head_major) and
+            self.attention_f32_bert_prefill_s256_hd64_mma != null)
+        {
+            const query_tiles = seq_len / bert_prefill_attention_mma_query_tile;
+            try launchBlocksShared(
+                self.attention_f32_bert_prefill_s256_hd64_mma,
+                ctx,
+                try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles),
+                bert_prefill_attention_mma_threads,
+                bert_prefill_attention_mma_shared_bytes,
+                &params,
+            );
+        } else if (attention_mode == .exact and !causal and !has_mask and bias_mode == 0 and head_major and
+            seq_len == bert_prefill_attention_mma_seq_len and head_dim == bert_prefill_attention_mma_head_dim and
+            self.attention_f32_bert_prefill_s256_hd64_q16 != null)
+        {
+            const query_tiles = seq_len / 16;
+            try launchBlocks(
+                self.attention_f32_bert_prefill_s256_hd64_q16,
+                ctx,
+                try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles),
+                512,
+                &params,
+            );
+        } else if (attention_mode != .generic and bertPrefillAttentionQueryTilingEnabled() and !causal and !has_mask and bias_mode == 0 and head_major and
+            seq_len == 256 and head_dim == 64 and
+            self.attention_f32_bert_prefill_s256_hd64_q8 != null)
+        {
+            const query_tiles = seq_len / 8;
+            try launchBlocks(self.attention_f32_bert_prefill_s256_hd64_q8, ctx, try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles), 256, &params);
+        } else if (attention_mode != .generic and !causal and !has_mask and bias_mode == 0 and head_major and
+            seq_len == 256 and head_dim == 64 and
+            self.attention_f32_bert_prefill_s256_hd64 != null)
+        {
+            try launchBlocks(self.attention_f32_bert_prefill_s256_hd64, ctx, try checkedTensorElements(try checkedTensorElements(batch, seq_len), num_heads), 256, &params);
+        } else if (seq_len <= 512 and head_dim <= 128) {
             try launchBlocks(self.attention_f32_block, ctx, try checkedTensorElements(try checkedTensorElements(batch, seq_len), num_heads), 128, &params);
         } else {
             try launch1d(self.attention_f32, ctx, count, &params);
@@ -8362,6 +8705,375 @@ pub const KernelModule = struct {
             @ptrCast(&head_dim_u32),
         };
         try launch1d(self.deberta_attention_f32, ctx, count, &params);
+    }
+
+    /// Fused one-block-per-(batch, head, query) DeBERTa attention.  The
+    /// kernel owns a fixed 512-token shared-memory score tile; callers use
+    /// the general elementwise implementation outside that envelope.
+    pub fn launchDebertaAttentionFusedF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        q_r: buffer_mod.DeviceBuffer,
+        k_r: buffer_mod.DeviceBuffer,
+        mask: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) driver_mod.Error!bool {
+        const function = self.deberta_attention_fused_f32 orelse return false;
+        if (seq_len == 0 or seq_len > 512 or batch == 0 or num_heads == 0 or head_dim == 0) return false;
+        const hidden = try checkedTensorElements(num_heads, head_dim);
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), hidden);
+        const rel_count = try checkedTensorElements(2 * seq_len - 1, hidden);
+        try checkBytes(dst, count);
+        try checkBytes(q, count);
+        try checkBytes(k, count);
+        try checkBytes(v, count);
+        try checkBytes(q_r, rel_count);
+        try checkBytes(k_r, rel_count);
+        try checkRawBytes(mask, try checkedTensorElements(batch, seq_len) * @sizeOf(i64));
+
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var q_r_ptr = q_r.ptr;
+        var k_r_ptr = k_r.ptr;
+        var mask_ptr = mask.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_len_u32 = try toU32(seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&q_ptr),
+            @ptrCast(&k_ptr),
+            @ptrCast(&v_ptr),
+            @ptrCast(&q_r_ptr),
+            @ptrCast(&k_r_ptr),
+            @ptrCast(&mask_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&seq_len_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&head_dim_u32),
+        };
+        const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), seq_len);
+        try launchBlocks(function, ctx, blocks, 256, &params);
+        return true;
+    }
+
+    /// Generated-style Flash/streaming DeBERTa encoder attention. The
+    /// specialized FP16-storage route is intentionally narrow: DeBERTa-base's
+    /// 64-wide heads and encoder prefill up to 256 tokens. Callers retain F32
+    /// output and use the fused-F32 route outside this envelope.
+    pub fn launchDebertaAttentionStreamF16(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        q_r: buffer_mod.DeviceBuffer,
+        k_r: buffer_mod.DeviceBuffer,
+        mask: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) driver_mod.Error!bool {
+        const function = self.deberta_attention_stream_f16 orelse return false;
+        if (seq_len == 0 or seq_len > 256 or batch == 0 or num_heads == 0 or head_dim != 64) return false;
+        const hidden = try checkedTensorElements(num_heads, head_dim);
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), hidden);
+        const rel_count = try checkedTensorElements(2 * seq_len - 1, hidden);
+        try checkBytes(dst, count);
+        try checkRawBytes(q, count * @sizeOf(u16));
+        try checkRawBytes(k, count * @sizeOf(u16));
+        try checkRawBytes(v, count * @sizeOf(u16));
+        try checkRawBytes(q_r, rel_count * @sizeOf(u16));
+        try checkRawBytes(k_r, rel_count * @sizeOf(u16));
+        try checkRawBytes(mask, try checkedTensorElements(batch, seq_len) * @sizeOf(i64));
+
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var q_r_ptr = q_r.ptr;
+        var k_r_ptr = k_r.ptr;
+        var mask_ptr = mask.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_len_u32 = try toU32(seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&q_ptr),
+            @ptrCast(&k_ptr),
+            @ptrCast(&v_ptr),
+            @ptrCast(&q_r_ptr),
+            @ptrCast(&k_r_ptr),
+            @ptrCast(&mask_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&seq_len_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&head_dim_u32),
+        };
+        const query_groups = (seq_len + 7) / 8;
+        const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_groups);
+        try launchBlocks(function, ctx, blocks, 256, &params);
+        return true;
+    }
+
+    /// Fully fused generated tensor-core DeBERTa prefill attention. Unlike
+    /// the legacy streaming route it accepts the graph's F32 tensors directly:
+    /// conversion, relative-position gathers, online softmax, and P*V all
+    /// happen inside one CTA-local schedule. This deliberately has no scratch
+    /// buffer parameters, which makes accidental reintroduction of the four
+    /// materialized cuBLASLt attention launches impossible at this ABI.
+    pub fn launchDebertaAttentionTcF16M16N32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        q_r: buffer_mod.DeviceBuffer,
+        k_r: buffer_mod.DeviceBuffer,
+        mask: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) driver_mod.Error!bool {
+        const function = self.deberta_attention_tc_f16_m16n32 orelse return false;
+        if (ctx.info.compute_major < 8 or seq_len == 0 or seq_len > 256 or batch == 0 or num_heads == 0 or head_dim != 64) return false;
+        const hidden = try checkedTensorElements(num_heads, head_dim);
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), hidden);
+        const rel_count = try checkedTensorElements(2 * seq_len - 1, hidden);
+        try checkBytes(dst, count);
+        try checkBytes(q, count);
+        try checkBytes(k, count);
+        try checkBytes(v, count);
+        try checkBytes(q_r, rel_count);
+        try checkBytes(k_r, rel_count);
+        try checkRawBytes(mask, try checkedTensorElements(batch, seq_len) * @sizeOf(i64));
+
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var q_r_ptr = q_r.ptr;
+        var k_r_ptr = k_r.ptr;
+        var mask_ptr = mask.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_len_u32 = try toU32(seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&q_ptr),
+            @ptrCast(&k_ptr),
+            @ptrCast(&v_ptr),
+            @ptrCast(&q_r_ptr),
+            @ptrCast(&k_r_ptr),
+            @ptrCast(&mask_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&seq_len_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&head_dim_u32),
+        };
+        const query_tiles = (seq_len + 15) / 16;
+        const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles);
+        try launchBlocks(function, ctx, blocks, 256, &params);
+        return true;
+    }
+
+    pub fn launchDebertaAttentionTcF16M32N16(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        q_r: buffer_mod.DeviceBuffer,
+        k_r: buffer_mod.DeviceBuffer,
+        mask: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) driver_mod.Error!bool {
+        const function = self.deberta_attention_tc_f16_m32n16 orelse return false;
+        if (ctx.info.compute_major < 8 or seq_len == 0 or seq_len > 256 or batch == 0 or num_heads == 0 or head_dim != 64) return false;
+        const hidden = try checkedTensorElements(num_heads, head_dim);
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), hidden);
+        const rel_count = try checkedTensorElements(2 * seq_len - 1, hidden);
+        try checkBytes(dst, count);
+        try checkBytes(q, count);
+        try checkBytes(k, count);
+        try checkBytes(v, count);
+        try checkBytes(q_r, rel_count);
+        try checkBytes(k_r, rel_count);
+        try checkRawBytes(mask, try checkedTensorElements(batch, seq_len) * @sizeOf(i64));
+
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var q_r_ptr = q_r.ptr;
+        var k_r_ptr = k_r.ptr;
+        var mask_ptr = mask.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_len_u32 = try toU32(seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&q_ptr),
+            @ptrCast(&k_ptr),
+            @ptrCast(&v_ptr),
+            @ptrCast(&q_r_ptr),
+            @ptrCast(&k_r_ptr),
+            @ptrCast(&mask_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&seq_len_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&head_dim_u32),
+        };
+        const query_tiles = (seq_len + 31) / 32;
+        const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles);
+        try launchBlocks(function, ctx, blocks, 256, &params);
+        return true;
+    }
+
+    pub fn launchDebertaPackHeadsF16(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        q_out: buffer_mod.DeviceBuffer,
+        k_out: buffer_mod.DeviceBuffer,
+        v_out: buffer_mod.DeviceBuffer,
+        q_r_out: buffer_mod.DeviceBuffer,
+        k_r_out: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        q_r: buffer_mod.DeviceBuffer,
+        k_r: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) driver_mod.Error!bool {
+        const function = self.deberta_pack_heads_f16 orelse return false;
+        if (seq_len == 0 or batch == 0 or num_heads == 0 or head_dim == 0) return false;
+        const hidden = try checkedTensorElements(num_heads, head_dim);
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), hidden);
+        const rel_len = 2 * seq_len - 1;
+        const rel_count = try checkedTensorElements(rel_len, hidden);
+        const packed_rel_count = try checkedTensorElements(batch, rel_count);
+        try checkRawBytes(q_out, count * @sizeOf(u16));
+        try checkRawBytes(k_out, count * @sizeOf(u16));
+        try checkRawBytes(v_out, count * @sizeOf(u16));
+        try checkRawBytes(q_r_out, packed_rel_count * @sizeOf(u16));
+        try checkRawBytes(k_r_out, packed_rel_count * @sizeOf(u16));
+        try checkBytes(q, count);
+        try checkBytes(k, count);
+        try checkBytes(v, count);
+        try checkBytes(q_r, rel_count);
+        try checkBytes(k_r, rel_count);
+
+        var q_out_ptr = q_out.ptr;
+        var k_out_ptr = k_out.ptr;
+        var v_out_ptr = v_out.ptr;
+        var q_r_out_ptr = q_r_out.ptr;
+        var k_r_out_ptr = k_r_out.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var q_r_ptr = q_r.ptr;
+        var k_r_ptr = k_r.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_len_u32 = try toU32(seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&q_out_ptr), @ptrCast(&k_out_ptr),   @ptrCast(&v_out_ptr),     @ptrCast(&q_r_out_ptr),  @ptrCast(&k_r_out_ptr),
+            @ptrCast(&q_ptr),     @ptrCast(&k_ptr),       @ptrCast(&v_ptr),         @ptrCast(&q_r_ptr),      @ptrCast(&k_r_ptr),
+            @ptrCast(&batch_u32), @ptrCast(&seq_len_u32), @ptrCast(&num_heads_u32), @ptrCast(&head_dim_u32),
+        };
+        try launch1d(function, ctx, @max(count, packed_rel_count), &params);
+        return true;
+    }
+
+    pub fn launchDebertaScoresSoftmaxF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        content_scores: buffer_mod.DeviceBuffer,
+        c2p_scores: buffer_mod.DeviceBuffer,
+        p2c_scores: buffer_mod.DeviceBuffer,
+        mask: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) driver_mod.Error!bool {
+        const function = self.deberta_scores_softmax_f32 orelse return false;
+        if (seq_len == 0 or batch == 0 or num_heads == 0 or head_dim == 0) return false;
+        const matrices = try checkedTensorElements(batch, num_heads);
+        const score_count = try checkedTensorElements(matrices, try checkedTensorElements(seq_len, seq_len));
+        const rel_len = 2 * seq_len - 1;
+        const rel_score_count = try checkedTensorElements(matrices, try checkedTensorElements(seq_len, rel_len));
+        try checkRawBytes(content_scores, score_count * @sizeOf(f32));
+        try checkRawBytes(c2p_scores, rel_score_count * @sizeOf(f32));
+        try checkRawBytes(p2c_scores, rel_score_count * @sizeOf(f32));
+        try checkRawBytes(mask, try checkedTensorElements(batch, seq_len) * @sizeOf(i64));
+        var content_ptr = content_scores.ptr;
+        var c2p_ptr = c2p_scores.ptr;
+        var p2c_ptr = p2c_scores.ptr;
+        var mask_ptr = mask.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_len_u32 = try toU32(seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&content_ptr), @ptrCast(&c2p_ptr),     @ptrCast(&p2c_ptr),       @ptrCast(&mask_ptr),
+            @ptrCast(&batch_u32),   @ptrCast(&seq_len_u32), @ptrCast(&num_heads_u32), @ptrCast(&head_dim_u32),
+        };
+        try launchBlocks(function, ctx, try checkedTensorElements(matrices, seq_len), 256, &params);
+        return true;
+    }
+
+    pub fn launchDebertaUnpackHeadsF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        packed_input: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) driver_mod.Error!bool {
+        const function = self.deberta_unpack_heads_f32 orelse return false;
+        if (seq_len == 0 or batch == 0 or num_heads == 0 or head_dim == 0) return false;
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), try checkedTensorElements(num_heads, head_dim));
+        try checkBytes(dst, count);
+        try checkBytes(packed_input, count);
+        var dst_ptr = dst.ptr;
+        var packed_ptr = packed_input.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_len_u32 = try toU32(seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr), @ptrCast(&packed_ptr), @ptrCast(&batch_u32), @ptrCast(&seq_len_u32), @ptrCast(&num_heads_u32), @ptrCast(&head_dim_u32),
+        };
+        try launch1d(function, ctx, count, &params);
+        return true;
     }
 
     pub fn launchSplitLastDim3F32(
@@ -14566,6 +15278,7 @@ test "CUDA runtime JIT mappings cover complete artifact function bundles" {
 test "CUDA runtime JIT profile scope covers only Gemma4 production routes" {
     inline for (.{
         JitModelProfile.clipclap,
+        JitModelProfile.bert_encoder,
         JitModelProfile.deberta_reranker,
         JitModelProfile.gliner2,
         JitModelProfile.florence2,
@@ -15691,6 +16404,19 @@ fn smokeBf16WeightPrimitives(allocator: std.mem.Allocator, ctx: *context_mod.Cud
 
     const out = try allocator.alloc(f32, rows * out_dim);
     defer allocator.free(out);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_linear, 0.0001);
+
+    const weight_f16_data = [_]u16{
+        @bitCast(@as(f16, 1.0)), @bitCast(@as(f16, 0.0)), @bitCast(@as(f16, -1.0)),
+        @bitCast(@as(f16, 0.5)), @bitCast(@as(f16, 2.0)), @bitCast(@as(f16, 1.0)),
+    };
+    var weight_f16 = try buffer_mod.DeviceBuffer.alloc(ctx, weight_f16_data.len * @sizeOf(u16));
+    defer weight_f16.free(ctx);
+    try weight_f16.copyFromHost(ctx, std.mem.sliceAsBytes(&weight_f16_data));
+    try module.launchLinearF16WeightF32Tiled(ctx, output, input, weight_f16, rows, in_dim, out_dim);
+    try ctx.synchronize();
     try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
     try expectApproxSlice(out, &expected_linear, 0.0001);
@@ -17599,6 +18325,31 @@ test "generated CUDA GQA decode shape supports bounded ratios" {
     try std.testing.expect(!generatedGqaDecodeShapeEligible(1, 1, 256, 18, 4));
     try std.testing.expect(!generatedGqaDecodeShapeEligible(1, 1, 256, 17, 1));
     try std.testing.expect(!generatedGqaDecodeShapeEligible(1, 1, 512, 40, 5));
+}
+
+test "BERT tensor-core prefill mode is explicit and shape-bounded" {
+    try std.testing.expectEqual(BertPrefillAttentionMode.generic, parseBertPrefillAttentionMode("generic").?);
+    try std.testing.expectEqual(BertPrefillAttentionMode.exact, parseBertPrefillAttentionMode("exact").?);
+    try std.testing.expectEqual(BertPrefillAttentionMode.exact_q8, parseBertPrefillAttentionMode("exact-q8").?);
+    try std.testing.expectEqual(BertPrefillAttentionMode.tensor_core, parseBertPrefillAttentionMode("tensor-core").?);
+    try std.testing.expectEqual(BertPrefillAttentionMode.tensor_core, parseBertPrefillAttentionMode("MMA").?);
+    try std.testing.expect(parseBertPrefillAttentionMode("fast") == null);
+
+    try std.testing.expect(bertPrefillAttentionMmaComputeEligible(7, 5));
+    try std.testing.expect(bertPrefillAttentionMmaComputeEligible(8, 0));
+    try std.testing.expect(!bertPrefillAttentionMmaComputeEligible(7, 0));
+    try std.testing.expect(!bertPrefillAttentionMmaComputeEligible(6, 1));
+
+    try std.testing.expect(bertPrefillAttentionMmaShapeEligible(1, 256, 12, 64, false, false, 0, true));
+    try std.testing.expect(bertPrefillAttentionMmaShapeEligible(32, 256, 12, 64, false, false, 0, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(0, 256, 12, 64, false, false, 0, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(1, 512, 12, 64, false, false, 0, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(1, 256, 12, 128, false, false, 0, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(1, 256, 12, 64, true, false, 0, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(1, 256, 12, 64, false, true, 0, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(1, 256, 12, 64, false, false, 1, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(1, 256, 12, 64, false, false, 0, false));
+    try std.testing.expectEqual(@as(usize, 45312), bert_prefill_attention_mma_shared_bytes);
 }
 
 test "generated CUDA paged score prework has a strict production boundary" {
