@@ -1961,8 +1961,9 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_bias_f32, module, "termite_linear_bias_f32"));
         var add_bias_rows_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&add_bias_rows_f32, module, "termite_add_bias_rows_f32"));
-        var add_bias_relu_rows_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&add_bias_relu_rows_f32, module, "termite_add_bias_relu_rows_f32"));
+        // Optional: absent from CUDA artifact bundles that predate the FP16
+        // GLiNER2 epilogue; callers decline the fused route instead.
+        const add_bias_relu_rows_f32 = loadOptionalFunction(ctx, module, "termite_add_bias_relu_rows_f32");
         var linear_bias_f32_tile4_r2: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_bias_f32_tile4_r2, module, "termite_linear_bias_f32_tile4_r2"));
         var linear_bias_relu_f32_tile4_r2: driver_mod.CUfunction = null;
@@ -4885,6 +4886,7 @@ pub const KernelModule = struct {
         try checkBytes(bias, out_dim);
         if (out_count == 0) return;
 
+        const function = self.add_bias_relu_rows_f32 orelse return error.CudaKernelUnavailable;
         var dst_ptr = dst.ptr;
         var bias_ptr = bias.ptr;
         var rows_u32 = try toU32(rows);
@@ -4895,7 +4897,7 @@ pub const KernelModule = struct {
             @ptrCast(&rows_u32),
             @ptrCast(&out_dim_u32),
         };
-        try launch1d(self.add_bias_relu_rows_f32, ctx, out_count, &params);
+        try launch1d(function, ctx, out_count, &params);
     }
 
     pub fn launchLinearBiasTile4Rows2F32(

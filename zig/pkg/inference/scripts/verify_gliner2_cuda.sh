@@ -94,23 +94,40 @@ def parse_switch(raw, name, allow_auto=False):
 def default_cuda_device_is_sm89():
     try:
         output = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=index,compute_cap", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "--query-gpu=index,uuid,compute_cap", "--format=csv,noheader,nounits"],
             stderr=subprocess.STDOUT,
             text=True,
             timeout=min(timeout, 15.0),
         )
     except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return False
-    capabilities = {}
+    by_index = {}
+    by_uuid = {}
     for line in output.splitlines():
         fields = [field.strip() for field in line.split(",")]
-        if len(fields) == 2:
-            capabilities[fields[0]] = fields[1]
+        if len(fields) == 3:
+            by_index[fields[0]] = fields[2]
+            by_uuid[fields[1]] = fields[2]
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-    # CUDA device zero maps to the first numeric entry when an explicit
-    # visibility mask is present; otherwise it maps to physical index zero.
-    physical_index = visible.split(",", 1)[0].strip() if visible else "0"
-    return capabilities.get(physical_index) == "8.9"
+    if not visible:
+        return by_index.get("0") == "8.9"
+    # CUDA device zero maps to the first entry of an explicit visibility
+    # mask. Container schedulers commonly pass GPU-<uuid> entries instead of
+    # numeric indices, so resolve both forms.
+    entry = visible.split(",", 1)[0].strip()
+    if entry in by_index:
+        return by_index[entry] == "8.9"
+    if entry in by_uuid:
+        return by_uuid[entry] == "8.9"
+    # MIG ids can never resolve to SM89 today (L4 has no MIG), and negative
+    # or malformed masks expose no device zero. Say so instead of skipping
+    # silently: a quietly-disabled gate on qualification hardware is how a
+    # materialized-route regression ships green.
+    print(
+        f"case=distinct_b8_s256 materialized_auto_detect=unresolved cuda_visible_devices_entry={entry}",
+        flush=True,
+    )
+    return False
 
 verify_generated_tc = parse_switch(
     verify_generated_tc_raw,
@@ -238,8 +255,11 @@ def run_case(backend, case, attention_mode=None, batch_size=1, expected_encoder_
     materialized_calls = int(warm.get("cuda_deberta_materialized_f16_attention_calls", "0") or 0)
     materialized_fallbacks = int(warm.get("cuda_deberta_materialized_f16_attention_fallbacks", "0") or 0)
     materialized_workspace_rejections = int(warm.get("cuda_deberta_materialized_workspace_rejections", "0") or 0)
-    f16_cublaslt_fallbacks = int(warm.get("cuda_f16_cublaslt_fallbacks", "0") or 0)
-    f16_scalar_linear_calls = int(warm.get("cuda_f16_scalar_linear_calls", "0") or 0)
+    # Sum across every recorded row (first_run + warm samples): the cuBLASLt
+    # heuristic is exercised freshly on the first run, so a first-touch
+    # failure must fail the gate even when warm samples recover.
+    f16_cublaslt_fallbacks = sum(int(row.get("cuda_f16_cublaslt_fallbacks", "0") or 0) for row in rows)
+    f16_scalar_linear_calls = sum(int(row.get("cuda_f16_scalar_linear_calls", "0") or 0) for row in rows)
     if attention_mode == "generated-tc" and generated_calls <= 0:
         raise AssertionError(f"{case['name']} generated-tc: fused tensor-core route was not used: {warm}")
     if attention_mode == "generated-tc" and generated_m32_calls != generated_calls:
@@ -247,7 +267,10 @@ def run_case(backend, case, attention_mode=None, batch_size=1, expected_encoder_
     if attention_mode == "generated-tc" and generated_fallbacks != 0:
         raise AssertionError(f"{case['name']} generated-tc: route recorded {generated_fallbacks} fallback(s): {warm}")
     if backend == "cuda" and (f16_cublaslt_fallbacks != 0 or f16_scalar_linear_calls != 0):
-        raise AssertionError(f"{case['name']} cuda: qualified shape used FP16 scalar fallback: {warm}")
+        raise AssertionError(
+            f"{case['name']} cuda: qualified shape used FP16 scalar fallback across first/warm rows: "
+            f"cublaslt_fallbacks={f16_cublaslt_fallbacks} scalar_linear_calls={f16_scalar_linear_calls}"
+        )
     entities.sort(key=lambda entity: (entity["start"], entity["end"], entity["label"], entity["text"]))
     return {
         "entity_count": entity_count,

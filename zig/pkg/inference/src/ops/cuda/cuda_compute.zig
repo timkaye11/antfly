@@ -754,6 +754,7 @@ pub const RuntimeStats = struct {
     qkv_fused_q4: usize = 0,
     qkv_fused_q4_q4_f32: usize = 0,
     qkv_fused_f32: usize = 0,
+    qkv_fused_f16: usize = 0,
     linear_pair_fused_q8: usize = 0,
     linear_pair_fused_q4_0: usize = 0,
     linear_pair_fused_q4_0_activation: usize = 0,
@@ -1074,10 +1075,9 @@ pub const CudaCompute = struct {
     // A BERT forward shares one attention mask across every transformer
     // block. Keep that mask in a dedicated scratch allocation so padded
     // device-resident encodes make one H2D upload per request rather than one
-    // per layer. The content hash prevents stale masks across requests.
+    // per layer. The retained host copy prevents stale masks across requests.
     attention_mask_scratch: scratch_mod.DeviceScratch = .{},
-    attention_mask_cache_hash: u64 = 0,
-    attention_mask_cache_len: usize = 0,
+    attention_mask_cache_host: std.ArrayListUnmanaged(i64) = .empty,
     bf16_activation_scratch: scratch_mod.DeviceScratch = .{},
     f16_activation_scratch: scratch_mod.DeviceScratch = .{},
     deberta_q_f16_scratch: scratch_mod.DeviceScratch = .{},
@@ -1282,6 +1282,7 @@ pub const CudaCompute = struct {
         self.deferred_device_frees.deinit(self.allocator);
         self.temp_ids_masks.deinit(&self.ctx);
         self.attention_mask_scratch.deinit(&self.ctx);
+        self.attention_mask_cache_host.deinit(self.allocator);
         self.bf16_activation_scratch.deinit(&self.ctx);
         self.f16_activation_scratch.deinit(&self.ctx);
         self.deberta_q_f16_scratch.deinit(&self.ctx);
@@ -4687,16 +4688,19 @@ fn tryDebertaMaterializedAttentionF16(
     const probabilities_f16 = debertaWorkspaceRegion(arena, layout.probabilities_f16, probability_bytes);
     const output_packed = debertaWorkspaceRegion(arena, layout.output_packed, output_bytes);
 
-    if (!try self.kernels.launchDebertaPackHeadsF16(&self.ctx, q_f16, k_f16, v_f16, q_r_f16, k_r_f16, q.buffer, k.buffer, v.buffer, q_r.buffer, k_r.buffer, batch, seq_len, num_heads, head_dim)) return false;
+    // Launch faults return false rather than propagating so the caller's
+    // documented fallback chain runs and its fallback counter ticks; dst is
+    // only written by the final unpack, so a partial pipeline leaves no state.
+    if (!(self.kernels.launchDebertaPackHeadsF16(&self.ctx, q_f16, k_f16, v_f16, q_r_f16, k_r_f16, q.buffer, k.buffer, v.buffer, q_r.buffer, k_r.buffer, batch, seq_len, num_heads, head_dim) catch return false)) return false;
     const blas = &(self.cublaslt orelse return false);
     const workspace = cublasLtWorkspace(self);
     blas.matmulF16StridedBatchedF32Out(&self.ctx, content_scores, q_f16, k_f16, workspace, matrices, seq_len, head_dim, seq_len) catch return false;
     blas.matmulF16StridedBatchedF32Out(&self.ctx, c2p_scores, q_f16, k_r_f16, workspace, matrices, seq_len, head_dim, rel_len) catch return false;
     blas.matmulF16StridedBatchedF32Out(&self.ctx, p2c_scores, k_f16, q_r_f16, workspace, matrices, seq_len, head_dim, rel_len) catch return false;
-    if (!try self.kernels.launchDebertaScoresSoftmaxF32(&self.ctx, content_scores, c2p_scores, p2c_scores, mask, batch, seq_len, num_heads, head_dim)) return false;
+    if (!(self.kernels.launchDebertaScoresSoftmaxF32(&self.ctx, content_scores, c2p_scores, p2c_scores, mask, batch, seq_len, num_heads, head_dim) catch return false)) return false;
     self.kernels.launchF32ToF16(&self.ctx, probabilities_f16, content_scores, score_count) catch return false;
     blas.matmulF16StridedBatchedF32Out(&self.ctx, output_packed, probabilities_f16, v_f16, workspace, matrices, seq_len, seq_len, head_dim) catch return false;
-    if (!try self.kernels.launchDebertaUnpackHeadsF32(&self.ctx, dst, output_packed, batch, seq_len, num_heads, head_dim)) return false;
+    if (!(self.kernels.launchDebertaUnpackHeadsF32(&self.ctx, dst, output_packed, batch, seq_len, num_heads, head_dim) catch return false)) return false;
     self.stats.deberta_materialized_f16_attention_calls += 1;
     return true;
 }
@@ -7990,13 +7994,17 @@ fn uploadTempI64(self: *CudaCompute, data: []const i64) !buffer_mod.DeviceBuffer
 }
 
 fn uploadCachedAttentionMaskI64(self: *CudaCompute, data: []const i64) !buffer_mod.DeviceBuffer {
-    const hash = std.hash.Wyhash.hash(0x62_67_65_6d_33_6d_61, std.mem.sliceAsBytes(data));
     const bytes = try checkedMul(data.len, @sizeOf(i64));
     const device = try self.attention_mask_scratch.acquire(&self.ctx, bytes);
-    if (self.attention_mask_cache_len != data.len or self.attention_mask_cache_hash != hash) {
+    // Compare against the retained host copy byte-for-byte: a 64-bit hash
+    // alone would silently reuse a stale device mask on collision, and the
+    // host compare is negligible next to the H2D upload it saves.
+    if (!std.mem.eql(i64, self.attention_mask_cache_host.items, data)) {
+        // Invalidate first so a failed upload cannot leave the cache
+        // claiming the device buffer holds this mask.
+        self.attention_mask_cache_host.clearRetainingCapacity();
         try copyFromHostTracked(self, device, std.mem.sliceAsBytes(data));
-        self.attention_mask_cache_len = data.len;
-        self.attention_mask_cache_hash = hash;
+        try self.attention_mask_cache_host.appendSlice(self.allocator, data);
     }
     return device;
 }
@@ -8791,6 +8799,9 @@ fn linearRelu(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_
     try ensureF32(input_tensor);
     try ensureF32(bias_tensor);
     if (isF16Weight(weight_tensor)) {
+        // Older CUDA artifacts predate the fused bias+ReLU epilogue kernel;
+        // decline so the generic path composes it from unfused ops.
+        if (self.kernels.add_bias_relu_rows_f32 == null) return null;
         try ensureCount(input_tensor, try checkedMul(rows, in_dim));
         try ensureCount(weight_tensor, try checkedMul(out_dim, in_dim));
         try ensureCount(bias_tensor, out_dim);
@@ -10897,7 +10908,7 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
             try self.kernels.launchLinearF16WeightF32Tiled(&self.ctx, v_device, input_tensor.buffer, v_weight_tensor.buffer, rows, in_dim, kv_out_dim);
             self.stats.f16_scalar_linear_calls += 3;
         }
-        self.stats.qkv_fused_f32 += 1;
+        self.stats.qkv_fused_f16 += 1;
         self.stats.launch_linear_qkv += 1;
     } else if (use_bf16) {
         if (try tryCublasLtBf16Qkv(
@@ -11787,6 +11798,9 @@ fn linearPairRelu(ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b
     try ensureCount(bias_b_tensor, out_dim);
 
     if (isF16Weight(weight_a_tensor) and isF16Weight(weight_b_tensor)) {
+        // Older CUDA artifacts predate the fused bias+ReLU epilogue kernel;
+        // decline so the generic path composes it from unfused ops.
+        if (self.kernels.add_bias_relu_rows_f32 == null) return null;
         const projected = try linearNoBiasPair(ctx, input, weight_a, weight_b, rows, in_dim, out_dim);
         errdefer freeTensor(ctx, projected.first);
         errdefer freeTensor(ctx, projected.second);
@@ -13994,8 +14008,10 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
             self.stats.launch_attention += 1;
             return createTensor(self, device, shape, count);
         }
+        // Count only attempted-but-failed fused launches: disabled or
+        // ineligible shapes reaching the base kernel are not fallbacks.
+        self.stats.deberta_fused_attention_fallbacks += 1;
     }
-    self.stats.deberta_fused_attention_fallbacks += 1;
     try self.kernels.launchDebertaAttentionF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, q_r_tensor.buffer, k_r_tensor.buffer, mask_device, batch, seq_len, num_heads, head_dim);
     self.stats.launch_attention += 1;
     return createTensor(self, device, shape, count);

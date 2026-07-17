@@ -1883,7 +1883,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     },
                 );
                 print(
-                    "cuda_qkv_counts: fused_q8={d} fused_q4_0={d} fused_q4_0_tile4={d} fused_q4_0_tile8={d} fused_q4={d} fused_q4_q4_f32={d} fused_f32={d} fallback_unsupported={d} kernel_unavailable={d}\n",
+                    "cuda_qkv_counts: fused_q8={d} fused_q4_0={d} fused_q4_0_tile4={d} fused_q4_0_tile8={d} fused_q4={d} fused_q4_q4_f32={d} fused_f32={d} fused_f16={d} fallback_unsupported={d} kernel_unavailable={d}\n",
                     .{
                         cuda_stats.qkv_fused_q8,
                         cuda_stats.qkv_fused_q4_0,
@@ -1892,6 +1892,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         cuda_stats.qkv_fused_q4,
                         cuda_stats.qkv_fused_q4_q4_f32,
                         cuda_stats.qkv_fused_f32,
+                        cuda_stats.qkv_fused_f16,
                         cuda_stats.qkv_fallback_unsupported,
                         cuda_stats.qkv_kernel_unavailable,
                     },
@@ -3746,6 +3747,7 @@ fn writeJsonTiming(
                 \\"qkv_fused_q4":{d},
                 \\"qkv_fused_q4_q4_f32":{d},
                 \\"qkv_fused_f32":{d},
+                \\"qkv_fused_f16":{d},
                 \\"qkv_fallback_unsupported":{d},
                 \\"qkv_kernel_unavailable":{d},
                 \\"linear_pair_fused_q8":{d},
@@ -3779,6 +3781,7 @@ fn writeJsonTiming(
                     cuda_stats.qkv_fused_q4,
                     cuda_stats.qkv_fused_q4_q4_f32,
                     cuda_stats.qkv_fused_f32,
+                    cuda_stats.qkv_fused_f16,
                     cuda_stats.qkv_fallback_unsupported,
                     cuda_stats.qkv_kernel_unavailable,
                     cuda_stats.linear_pair_fused_q8,
