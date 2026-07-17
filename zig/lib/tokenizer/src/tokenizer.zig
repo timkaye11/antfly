@@ -63,6 +63,10 @@ pub const Tokenizer = struct {
         /// hot ingest paths reuse a single ArrayList across many encode
         /// calls instead of allocating and freeing per call.
         encodeInto: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32)) anyerror!void,
+        /// Optional fast path for caller-normalized, whitespace-free pieces.
+        /// Implementations must produce the same IDs as `encodeInto` would
+        /// after applying their configured ASCII lowercase normalization.
+        encodePreNormalizedInto: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32)) anyerror!void = null,
         /// Encode text with model wrapping such as [CLS]/[SEP], optionally including offsets.
         encodeForModel: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize) anyerror!EncodeResult,
         /// Encode text for causal generation, optionally with BOS-aware start-of-sequence semantics.
@@ -85,6 +89,16 @@ pub const Tokenizer = struct {
     /// not cleared on entry, so callers can either pre-clear (`clearRetainingCapacity`)
     /// to encode a fresh sequence or skip clearing to concatenate sequences.
     pub fn encodeInto(self: Tokenizer, allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32)) !void {
+        return self.vtable.encodeInto(self.ptr, allocator, text, out);
+    }
+
+    /// Append a caller-normalized, whitespace-free piece without repeating
+    /// tokenizer normalization allocations when the implementation supports
+    /// it. Generic tokenizers safely fall back to the regular route.
+    pub fn encodePreNormalizedInto(self: Tokenizer, allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32)) !void {
+        if (self.vtable.encodePreNormalizedInto) |encode_normalized| {
+            return encode_normalized(self.ptr, allocator, text, out);
+        }
         return self.vtable.encodeInto(self.ptr, allocator, text, out);
     }
 

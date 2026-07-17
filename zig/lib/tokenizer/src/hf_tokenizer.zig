@@ -207,6 +207,7 @@ pub const HfTokenizer = struct {
     const vtable = Tokenizer.VTable{
         .encode = @ptrCast(&encode),
         .encodeInto = @ptrCast(&encodeInto),
+        .encodePreNormalizedInto = @ptrCast(&encodePreNormalizedInto),
         .encodeForModel = @ptrCast(&encodeForModel),
         .encodeGeneration = @ptrCast(&encodeGeneration),
         .decode = @ptrCast(&decode),
@@ -815,6 +816,18 @@ pub const HfTokenizer = struct {
         }
 
         return self.encodeWithAddedTokens(allocator, normalized, ids);
+    }
+
+    fn encodePreNormalizedInto(
+        self: *HfTokenizer,
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        ids: *std.ArrayListUnmanaged(i32),
+    ) !void {
+        // GLiNER supplies ASCII-lowercased, whitespace-free word pieces.
+        // Bypassing the normalizer here removes one allocation per unique
+        // word while preserving the exact added-token/model dispatch.
+        return self.encodeWithAddedTokens(allocator, text, ids);
     }
 
     fn encodeWithAddedTokens(
@@ -2883,6 +2896,11 @@ test "sequence normalizer applies lowercase before byte-level bpe" {
     try std.testing.expectEqualSlices(i32, &.{2}, black);
 
     const tok = hf.tokenizer();
+    var normalized_ids = std.ArrayListUnmanaged(i32).empty;
+    defer normalized_ids.deinit(allocator);
+    try tok.encodePreNormalizedInto(allocator, "white", &normalized_ids);
+    try std.testing.expectEqualSlices(i32, white, normalized_ids.items);
+
     var encoded = try tok.encodeForModel(allocator, "WHITE", 4);
     defer encoded.deinit();
     try std.testing.expectEqualSlices(i32, &.{ 10, 1, 11, 11 }, encoded.ids);

@@ -64,6 +64,10 @@ const CudaDelta = struct {
     bf16_cublaslt_qkv_calls: usize = 0,
     bf16_activation_staging_calls: usize = 0,
     bf16_activation_mirror_hits: usize = 0,
+    f16_cublaslt_linear_calls: usize = 0,
+    f16_cublaslt_qkv_calls: usize = 0,
+    f16_activation_staging_calls: usize = 0,
+    f16_cublaslt_fallbacks: usize = 0,
     generated_mm_hits: usize = 0,
     linear_launches: usize = 0,
     attention_launches: usize = 0,
@@ -193,6 +197,10 @@ pub fn main(init: std.process.Init) !void {
             .bf16_cublaslt_qkv_calls = after.bf16_cublaslt_qkv_calls - before.bf16_cublaslt_qkv_calls,
             .bf16_activation_staging_calls = after.bf16_cublaslt_activation_staging_calls - before.bf16_cublaslt_activation_staging_calls,
             .bf16_activation_mirror_hits = after.bf16_cublaslt_activation_mirror_hits - before.bf16_cublaslt_activation_mirror_hits,
+            .f16_cublaslt_linear_calls = after.f16_cublaslt_linear_calls - before.f16_cublaslt_linear_calls,
+            .f16_cublaslt_qkv_calls = after.f16_cublaslt_qkv_calls - before.f16_cublaslt_qkv_calls,
+            .f16_activation_staging_calls = after.f16_cublaslt_activation_staging_calls - before.f16_cublaslt_activation_staging_calls,
+            .f16_cublaslt_fallbacks = after.f16_cublaslt_fallbacks - before.f16_cublaslt_fallbacks,
             .generated_mm_hits = after.q4_0_generated_mm_hits - before.q4_0_generated_mm_hits,
             .linear_launches = after.launch_linear - before.launch_linear,
             .attention_launches = after.launch_attention - before.launch_attention,
@@ -212,6 +220,10 @@ pub fn main(init: std.process.Init) !void {
         .bf16_cublaslt_qkv_calls = @as(usize, 0),
         .bf16_activation_staging_calls = @as(usize, 0),
         .bf16_activation_mirror_hits = @as(usize, 0),
+        .f16_cublaslt_linear_calls = @as(usize, 0),
+        .f16_cublaslt_qkv_calls = @as(usize, 0),
+        .f16_activation_staging_calls = @as(usize, 0),
+        .f16_cublaslt_fallbacks = @as(usize, 0),
         .generated_mm_hits = @as(usize, 0),
         .linear_launches = @as(usize, 0),
         .attention_launches = @as(usize, 0),
@@ -266,6 +278,15 @@ pub fn main(init: std.process.Init) !void {
             checksum,
             if (attention_validation) |validation| validation.max_abs else @as(f32, -1),
             if (attention_validation) |validation| validation.cosine else @as(f64, -1),
+        },
+    );
+    std.debug.print(
+        "bge_m3_e2e f16_cublaslt_linear_calls={} f16_cublaslt_qkv_calls={} f16_activation_staging_calls={} f16_cublaslt_fallbacks={}\n",
+        .{
+            cuda.f16_cublaslt_linear_calls,
+            cuda.f16_cublaslt_qkv_calls,
+            cuda.f16_activation_staging_calls,
+            cuda.f16_cublaslt_fallbacks,
         },
     );
 }

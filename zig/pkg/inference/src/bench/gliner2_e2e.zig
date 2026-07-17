@@ -57,7 +57,11 @@ const BenchTask = enum {
 const Options = struct {
     model_dir: []const u8 = "",
     text: []const u8 = "John Smith works for Apple Inc. and lives in San Francisco. Apple Inc. is located in Cupertino.",
+    text_file: ?[]const u8 = null,
+    text_explicit: bool = false,
     text_repeat: usize = 1,
+    print_encoder_seq_len: bool = false,
+    expected_encoder_seq_len: ?usize = null,
     backend: BackendChoice = .native,
     kernel_jit: kernel_jit.Config = .{},
     kernel_jit_mode_explicit: bool = false,
@@ -91,6 +95,52 @@ const QuantCounters = struct {
     q8_0_triple: u64 = 0,
 };
 
+/// Per-request CUDA evidence for dense FP16 encoder dispatch. The benchmark
+/// reports the aggregate over the measured samples, allowing the CSV result
+/// to prove that timing came from the intended tensor-core route instead of
+/// the F32 compatibility fallback.
+const CudaCounters = struct {
+    h2d_bytes: usize = 0,
+    d2h_bytes: usize = 0,
+    f16_cublaslt_linear_calls: usize = 0,
+    f16_cublaslt_qkv_calls: usize = 0,
+    f16_activation_staging_calls: usize = 0,
+    f16_cublaslt_fallbacks: usize = 0,
+    deberta_fused_attention_calls: usize = 0,
+    deberta_fused_attention_fallbacks: usize = 0,
+    deberta_stream_f16_attention_calls: usize = 0,
+    deberta_stream_f16_attention_fallbacks: usize = 0,
+    deberta_stream_f16_staging_calls: usize = 0,
+    deberta_materialized_f16_attention_calls: usize = 0,
+    deberta_materialized_f16_attention_fallbacks: usize = 0,
+    deberta_generated_tc_attention_calls: usize = 0,
+    deberta_generated_tc_m32_attention_calls: usize = 0,
+    deberta_generated_tc_m16_attention_calls: usize = 0,
+    deberta_generated_tc_attention_fallbacks: usize = 0,
+
+    fn add(self: CudaCounters, other: CudaCounters) CudaCounters {
+        return .{
+            .h2d_bytes = self.h2d_bytes + other.h2d_bytes,
+            .d2h_bytes = self.d2h_bytes + other.d2h_bytes,
+            .f16_cublaslt_linear_calls = self.f16_cublaslt_linear_calls + other.f16_cublaslt_linear_calls,
+            .f16_cublaslt_qkv_calls = self.f16_cublaslt_qkv_calls + other.f16_cublaslt_qkv_calls,
+            .f16_activation_staging_calls = self.f16_activation_staging_calls + other.f16_activation_staging_calls,
+            .f16_cublaslt_fallbacks = self.f16_cublaslt_fallbacks + other.f16_cublaslt_fallbacks,
+            .deberta_fused_attention_calls = self.deberta_fused_attention_calls + other.deberta_fused_attention_calls,
+            .deberta_fused_attention_fallbacks = self.deberta_fused_attention_fallbacks + other.deberta_fused_attention_fallbacks,
+            .deberta_stream_f16_attention_calls = self.deberta_stream_f16_attention_calls + other.deberta_stream_f16_attention_calls,
+            .deberta_stream_f16_attention_fallbacks = self.deberta_stream_f16_attention_fallbacks + other.deberta_stream_f16_attention_fallbacks,
+            .deberta_stream_f16_staging_calls = self.deberta_stream_f16_staging_calls + other.deberta_stream_f16_staging_calls,
+            .deberta_materialized_f16_attention_calls = self.deberta_materialized_f16_attention_calls + other.deberta_materialized_f16_attention_calls,
+            .deberta_materialized_f16_attention_fallbacks = self.deberta_materialized_f16_attention_fallbacks + other.deberta_materialized_f16_attention_fallbacks,
+            .deberta_generated_tc_attention_calls = self.deberta_generated_tc_attention_calls + other.deberta_generated_tc_attention_calls,
+            .deberta_generated_tc_m32_attention_calls = self.deberta_generated_tc_m32_attention_calls + other.deberta_generated_tc_m32_attention_calls,
+            .deberta_generated_tc_m16_attention_calls = self.deberta_generated_tc_m16_attention_calls + other.deberta_generated_tc_m16_attention_calls,
+            .deberta_generated_tc_attention_fallbacks = self.deberta_generated_tc_attention_fallbacks + other.deberta_generated_tc_attention_fallbacks,
+        };
+    }
+};
+
 const Sample = struct {
     elapsed_ns: u64,
     entity_count: usize,
@@ -98,6 +148,7 @@ const Sample = struct {
     score_sum: f64,
     relation_score_sum: f64 = 0.0,
     quant: QuantCounters = .{},
+    cuda: CudaCounters = .{},
     metal_generated_quant: MetalGeneratedQuantStats = .{},
     native_quant_stats_enabled: bool = false,
 };
@@ -115,6 +166,7 @@ const Result = struct {
     score_sum: f64,
     relation_score_sum: f64,
     quant: QuantCounters,
+    cuda: CudaCounters,
     metal_generated_quant: MetalGeneratedQuantStats,
     native_quant_stats_enabled: bool,
 };
@@ -148,7 +200,14 @@ pub fn main(init: std.process.Init) !void {
     if (!model.isGlinerModel()) return error.NotGlinerModel;
 
     if (opts.batch_size == 0) return error.InvalidBatchSize;
-    const bench_text = try repeatedText(allocator, opts.text, opts.text_repeat);
+    const fixture_text_owned = if (opts.text_file) |path|
+        try std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1024 * 1024))
+    else
+        null;
+    defer if (fixture_text_owned) |bytes| allocator.free(bytes);
+    const source_text = if (fixture_text_owned) |bytes| std.mem.trim(u8, bytes, " \t\r\n") else opts.text;
+    if (source_text.len == 0) return error.EmptyTextFixture;
+    const bench_text = try repeatedText(allocator, source_text, opts.text_repeat);
     defer allocator.free(bench_text);
     const texts = try allocator.alloc([]const u8, opts.batch_size);
     defer allocator.free(texts);
@@ -157,6 +216,16 @@ pub fn main(init: std.process.Init) !void {
     const relation_labels: ?[]const []const u8 = if (opts.relation_labels.items.len > 0) opts.relation_labels.items else null;
 
     var pipeline = model.glinerPipeline(allocator);
+    if (opts.print_encoder_seq_len or opts.expected_encoder_seq_len != null) {
+        const entity_labels = labels orelse return error.ExpectedEncoderSeqLenRequiresLabels;
+        const actual = try pipeline.entityEncoderTokenCount(bench_text, entity_labels);
+        if (opts.expected_encoder_seq_len) |expected| {
+            std.debug.print("gliner2_e2e: encoder_seq_len={} expected={}\n", .{ actual, expected });
+            if (actual != expected) return error.UnexpectedEncoderSeqLen;
+        } else {
+            std.debug.print("gliner2_e2e: encoder_seq_len={}\n", .{actual});
+        }
+    }
 
     var rows = std.ArrayListUnmanaged(Result).empty;
     defer rows.deinit(allocator);
@@ -230,6 +299,7 @@ fn runBenchmarkTask(
         .score_sum = first.score_sum,
         .relation_score_sum = first.relation_score_sum,
         .quant = first.quant,
+        .cuda = first.cuda,
         .metal_generated_quant = first.metal_generated_quant,
         .native_quant_stats_enabled = first.native_quant_stats_enabled,
     };
@@ -263,6 +333,7 @@ fn runTask(
 ) !Sample {
     native_compute.resetNativeQuantDispatchStats();
     const before_metal_generated = metal_generated_quant_stats.snapshotForSession(allocator, session);
+    const before_cuda = session_factory.getCudaRuntimeStats(session);
     const start = nowNs();
 
     switch (task) {
@@ -284,6 +355,7 @@ fn runTask(
                 .entity_count = entity_count,
                 .score_sum = score_sum,
                 .quant = quantCountersFromStats(native_compute.nativeQuantDispatchStats()),
+                .cuda = cudaCountersFromStats(before_cuda, session_factory.getCudaRuntimeStats(session)),
                 .metal_generated_quant = MetalGeneratedQuantStats.diff(before_metal_generated, after_metal_generated),
                 .native_quant_stats_enabled = native_compute.nativeQuantDispatchStatsEnabled(),
             };
@@ -318,6 +390,7 @@ fn runTask(
                 .score_sum = score_sum,
                 .relation_score_sum = relation_score_sum,
                 .quant = quantCountersFromStats(native_compute.nativeQuantDispatchStats()),
+                .cuda = cudaCountersFromStats(before_cuda, session_factory.getCudaRuntimeStats(session)),
                 .metal_generated_quant = MetalGeneratedQuantStats.diff(before_metal_generated, after_metal_generated),
                 .native_quant_stats_enabled = native_compute.nativeQuantDispatchStatsEnabled(),
             };
@@ -340,16 +413,16 @@ fn resultFromSamples(allocator: std.mem.Allocator, task: BenchTask, mode: []cons
     for (samples) |sample| total_ns += sample.elapsed_ns;
     var metal_generated_quant = MetalGeneratedQuantStats{};
     for (samples) |sample| metal_generated_quant = metal_generated_quant.add(sample.metal_generated_quant);
+    var cuda = CudaCounters{};
+    for (samples) |sample| cuda = cuda.add(sample.cuda);
     const avg_ns: u64 = @intCast(total_ns / samples.len);
-    const p50_idx = samples.len / 2;
-    const p95_idx = @min(samples.len - 1, (samples.len * 95 + 99) / 100 - 1);
     const last = samples[samples.len - 1];
     return .{
         .task = task,
         .mode = mode,
         .avg_ms = nsToMs(avg_ns),
-        .p50_ms = nsToMs(sorted[p50_idx].elapsed_ns),
-        .p95_ms = nsToMs(sorted[p95_idx].elapsed_ns),
+        .p50_ms = percentileMs(sorted, 0.50),
+        .p95_ms = percentileMs(sorted, 0.95),
         .min_ms = nsToMs(sorted[0].elapsed_ns),
         .max_ms = nsToMs(sorted[sorted.len - 1].elapsed_ns),
         .entity_count = last.entity_count,
@@ -357,6 +430,7 @@ fn resultFromSamples(allocator: std.mem.Allocator, task: BenchTask, mode: []cons
         .score_sum = last.score_sum,
         .relation_score_sum = last.relation_score_sum,
         .quant = last.quant,
+        .cuda = cuda,
         .metal_generated_quant = metal_generated_quant,
         .native_quant_stats_enabled = last.native_quant_stats_enabled,
     };
@@ -426,6 +500,30 @@ fn quantCountersFromStats(stats: native_compute.NativeQuantDispatchStats) QuantC
     };
 }
 
+fn cudaCountersFromStats(before: anytype, after: anytype) CudaCounters {
+    const before_stats = before orelse return .{};
+    const after_stats = after orelse return .{};
+    return .{
+        .h2d_bytes = after_stats.h2d_bytes - before_stats.h2d_bytes,
+        .d2h_bytes = after_stats.d2h_bytes - before_stats.d2h_bytes,
+        .f16_cublaslt_linear_calls = after_stats.f16_cublaslt_linear_calls - before_stats.f16_cublaslt_linear_calls,
+        .f16_cublaslt_qkv_calls = after_stats.f16_cublaslt_qkv_calls - before_stats.f16_cublaslt_qkv_calls,
+        .f16_activation_staging_calls = after_stats.f16_cublaslt_activation_staging_calls - before_stats.f16_cublaslt_activation_staging_calls,
+        .f16_cublaslt_fallbacks = after_stats.f16_cublaslt_fallbacks - before_stats.f16_cublaslt_fallbacks,
+        .deberta_fused_attention_calls = after_stats.deberta_fused_attention_calls - before_stats.deberta_fused_attention_calls,
+        .deberta_fused_attention_fallbacks = after_stats.deberta_fused_attention_fallbacks - before_stats.deberta_fused_attention_fallbacks,
+        .deberta_stream_f16_attention_calls = after_stats.deberta_stream_f16_attention_calls - before_stats.deberta_stream_f16_attention_calls,
+        .deberta_stream_f16_attention_fallbacks = after_stats.deberta_stream_f16_attention_fallbacks - before_stats.deberta_stream_f16_attention_fallbacks,
+        .deberta_stream_f16_staging_calls = after_stats.deberta_stream_f16_staging_calls - before_stats.deberta_stream_f16_staging_calls,
+        .deberta_materialized_f16_attention_calls = after_stats.deberta_materialized_f16_attention_calls - before_stats.deberta_materialized_f16_attention_calls,
+        .deberta_materialized_f16_attention_fallbacks = after_stats.deberta_materialized_f16_attention_fallbacks - before_stats.deberta_materialized_f16_attention_fallbacks,
+        .deberta_generated_tc_attention_calls = after_stats.deberta_generated_tc_attention_calls - before_stats.deberta_generated_tc_attention_calls,
+        .deberta_generated_tc_m32_attention_calls = after_stats.deberta_generated_tc_m32_attention_calls - before_stats.deberta_generated_tc_m32_attention_calls,
+        .deberta_generated_tc_m16_attention_calls = after_stats.deberta_generated_tc_m16_attention_calls - before_stats.deberta_generated_tc_m16_attention_calls,
+        .deberta_generated_tc_attention_fallbacks = after_stats.deberta_generated_tc_attention_fallbacks - before_stats.deberta_generated_tc_attention_fallbacks,
+    };
+}
+
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
     session_manager.preferred_backends = switch (choice) {
         .auto => &.{backends.BackendType.native},
@@ -445,10 +543,21 @@ fn parseArgs(allocator: std.mem.Allocator, init: std.process.Init) !Options {
         if (std.mem.eql(u8, arg, "--model-dir")) {
             opts.model_dir = args.next() orelse return error.MissingModelDir;
         } else if (std.mem.eql(u8, arg, "--text")) {
+            if (opts.text_file != null) return error.DuplicateTextSource;
             opts.text = args.next() orelse return error.MissingText;
+            opts.text_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--text-file")) {
+            if (opts.text_explicit or opts.text_file != null) return error.DuplicateTextSource;
+            opts.text_file = args.next() orelse return error.MissingTextFile;
         } else if (std.mem.eql(u8, arg, "--text-repeat")) {
             opts.text_repeat = try std.fmt.parseInt(usize, args.next() orelse return error.MissingTextRepeat, 10);
             if (opts.text_repeat == 0) return error.InvalidTextRepeat;
+        } else if (std.mem.eql(u8, arg, "--print-encoder-seq-len")) {
+            opts.print_encoder_seq_len = true;
+        } else if (std.mem.eql(u8, arg, "--expect-encoder-seq-len")) {
+            if (opts.expected_encoder_seq_len != null) return error.DuplicateExpectedEncoderSeqLen;
+            opts.expected_encoder_seq_len = try std.fmt.parseInt(usize, args.next() orelse return error.MissingExpectedEncoderSeqLen, 10);
+            if (opts.expected_encoder_seq_len.? == 0) return error.InvalidExpectedEncoderSeqLen;
         } else if (std.mem.eql(u8, arg, "--task")) {
             opts.task = parseTask(args.next() orelse return error.MissingTask) orelse return error.InvalidTask;
         } else if (std.mem.eql(u8, arg, "--label")) {
@@ -534,7 +643,7 @@ fn parseFormat(value: []const u8) ?OutputFormat {
 
 fn printText(opts: Options, result: Result) void {
     std.debug.print(
-        "{s}/{s}: model_dir={s} backend={s} batch_size={} avg_ms={d:.3} p50_ms={d:.3} p95_ms={d:.3} min_ms={d:.3} max_ms={d:.3} entity_count={} relation_count={} score_sum={d:.6} relation_score_sum={d:.6} native_quant_stats={s} q4q5={} q4q5_pair={} q4q5_triple={} q4q5_panel={} dequant={} dequant_pair={} dequant_triple={} q8_0={} q8_0_pair={} q8_0_triple={}\n",
+        "{s}/{s}: model_dir={s} backend={s} batch_size={} avg_ms={d:.3} p50_ms={d:.3} p95_ms={d:.3} min_ms={d:.3} max_ms={d:.3} entity_count={} relation_count={} score_sum={d:.6} relation_score_sum={d:.6} native_quant_stats={s} q4q5={} q4q5_pair={} q4q5_triple={} q4q5_panel={} dequant={} dequant_pair={} dequant_triple={} q8_0={} q8_0_pair={} q8_0_triple={} cuda_h2d_bytes={} cuda_d2h_bytes={} cuda_f16_cublaslt_linear_calls={} cuda_f16_cublaslt_qkv_calls={} cuda_f16_activation_staging_calls={} cuda_f16_cublaslt_fallbacks={}",
         .{
             @tagName(result.task),
             result.mode,
@@ -561,6 +670,28 @@ fn printText(opts: Options, result: Result) void {
             result.quant.q8_0,
             result.quant.q8_0_pair,
             result.quant.q8_0_triple,
+            result.cuda.h2d_bytes,
+            result.cuda.d2h_bytes,
+            result.cuda.f16_cublaslt_linear_calls,
+            result.cuda.f16_cublaslt_qkv_calls,
+            result.cuda.f16_activation_staging_calls,
+            result.cuda.f16_cublaslt_fallbacks,
+        },
+    );
+    std.debug.print(
+        " cuda_deberta_fused_attention_calls={} cuda_deberta_fused_attention_fallbacks={} cuda_deberta_stream_f16_attention_calls={} cuda_deberta_stream_f16_attention_fallbacks={} cuda_deberta_stream_f16_staging_calls={} cuda_deberta_materialized_f16_attention_calls={} cuda_deberta_materialized_f16_attention_fallbacks={} cuda_deberta_generated_tc_attention_calls={} cuda_deberta_generated_tc_m32_attention_calls={} cuda_deberta_generated_tc_m16_attention_calls={} cuda_deberta_generated_tc_attention_fallbacks={}\n",
+        .{
+            result.cuda.deberta_fused_attention_calls,
+            result.cuda.deberta_fused_attention_fallbacks,
+            result.cuda.deberta_stream_f16_attention_calls,
+            result.cuda.deberta_stream_f16_attention_fallbacks,
+            result.cuda.deberta_stream_f16_staging_calls,
+            result.cuda.deberta_materialized_f16_attention_calls,
+            result.cuda.deberta_materialized_f16_attention_fallbacks,
+            result.cuda.deberta_generated_tc_attention_calls,
+            result.cuda.deberta_generated_tc_m32_attention_calls,
+            result.cuda.deberta_generated_tc_m16_attention_calls,
+            result.cuda.deberta_generated_tc_attention_fallbacks,
         },
     );
     const metal_generated_top = result.metal_generated_quant.topFamily();
@@ -612,12 +743,12 @@ fn printText(opts: Options, result: Result) void {
 }
 
 fn printCsvHeader() void {
-    std.debug.print("task,mode,model_dir,backend,batch_size,avg_ms,p50_ms,p95_ms,min_ms,max_ms,entity_count,relation_count,score_sum,relation_score_sum,native_quant_stats_enabled,q4q5,q4q5_pair,q4q5_triple,q4q5_panel,dequant,dequant_pair,dequant_triple,q8_0,q8_0_pair,q8_0_triple,metal_jit_exact_q4_0,metal_jit_exact_q4_k\n", .{});
+    std.debug.print("task,mode,model_dir,backend,batch_size,avg_ms,p50_ms,p95_ms,min_ms,max_ms,entity_count,relation_count,score_sum,relation_score_sum,native_quant_stats_enabled,q4q5,q4q5_pair,q4q5_triple,q4q5_panel,dequant,dequant_pair,dequant_triple,q8_0,q8_0_pair,q8_0_triple,metal_jit_exact_q4_0,metal_jit_exact_q4_k,cuda_h2d_bytes,cuda_d2h_bytes,cuda_f16_cublaslt_linear_calls,cuda_f16_cublaslt_qkv_calls,cuda_f16_activation_staging_calls,cuda_f16_cublaslt_fallbacks,cuda_deberta_fused_attention_calls,cuda_deberta_fused_attention_fallbacks,cuda_deberta_stream_f16_attention_calls,cuda_deberta_stream_f16_attention_fallbacks,cuda_deberta_stream_f16_staging_calls,cuda_deberta_materialized_f16_attention_calls,cuda_deberta_materialized_f16_attention_fallbacks,cuda_deberta_generated_tc_attention_calls,cuda_deberta_generated_tc_m32_attention_calls,cuda_deberta_generated_tc_m16_attention_calls,cuda_deberta_generated_tc_attention_fallbacks\n", .{});
 }
 
 fn printCsv(opts: Options, result: Result) void {
     std.debug.print(
-        "{s},{s},{s},{s},{},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{},{},{d:.6},{d:.6},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+        "{s},{s},{s},{s},{},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{},{},{d:.6},{d:.6}",
         .{
             @tagName(result.task),
             result.mode,
@@ -633,6 +764,11 @@ fn printCsv(opts: Options, result: Result) void {
             result.relation_count,
             result.score_sum,
             result.relation_score_sum,
+        },
+    );
+    std.debug.print(
+        ",{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        .{
             result.native_quant_stats_enabled,
             result.quant.q4q5,
             result.quant.q4q5_pair,
@@ -648,11 +784,33 @@ fn printCsv(opts: Options, result: Result) void {
             result.metal_generated_quant.jit_exact_q4_k,
         },
     );
+    std.debug.print(
+        ",{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+        .{
+            result.cuda.h2d_bytes,
+            result.cuda.d2h_bytes,
+            result.cuda.f16_cublaslt_linear_calls,
+            result.cuda.f16_cublaslt_qkv_calls,
+            result.cuda.f16_activation_staging_calls,
+            result.cuda.f16_cublaslt_fallbacks,
+            result.cuda.deberta_fused_attention_calls,
+            result.cuda.deberta_fused_attention_fallbacks,
+            result.cuda.deberta_stream_f16_attention_calls,
+            result.cuda.deberta_stream_f16_attention_fallbacks,
+            result.cuda.deberta_stream_f16_staging_calls,
+            result.cuda.deberta_materialized_f16_attention_calls,
+            result.cuda.deberta_materialized_f16_attention_fallbacks,
+            result.cuda.deberta_generated_tc_attention_calls,
+            result.cuda.deberta_generated_tc_m32_attention_calls,
+            result.cuda.deberta_generated_tc_m16_attention_calls,
+            result.cuda.deberta_generated_tc_attention_fallbacks,
+        },
+    );
 }
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: zig build bench-gliner2-e2e -- --model-dir <dir> [--task entities|relations|both] [--text TEXT] [--text-repeat N] [--batch-size N] [--label NAME]... [--relation-label NAME]... [--backend auto|native|metal|onnx|cuda] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--graph-runtime partitioned] [--warmup-iters N] [--measure-iters N] [--format text|csv] [--dump-entities]
+        \\usage: zig build bench-gliner2-e2e -- --model-dir <dir> [--task entities|relations|both] [--text TEXT | --text-file PATH] [--text-repeat N] [--print-encoder-seq-len] [--expect-encoder-seq-len N] [--batch-size N] [--label NAME]... [--relation-label NAME]... [--backend auto|native|metal|onnx|cuda] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--graph-runtime partitioned] [--warmup-iters N] [--measure-iters N] [--format text|csv] [--dump-entities]
         \\  Profile capture selects shadow mode unless a conflicting mode is explicit.
         \\
     , .{});
@@ -678,6 +836,21 @@ fn repeatedText(allocator: std.mem.Allocator, text: []const u8, repeat: usize) !
 
 fn nsToMs(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1.0e6;
+}
+
+/// Linear interpolation keeps p50/p95 stable for small benchmark sample
+/// counts and deliberately matches the Fastino reference harness.
+fn percentileMs(sorted: []const Sample, ratio: f64) f64 {
+    std.debug.assert(sorted.len > 0);
+    std.debug.assert(ratio >= 0.0 and ratio <= 1.0);
+    const position = @as(f64, @floatFromInt(sorted.len - 1)) * ratio;
+    const lower: usize = @intFromFloat(@floor(position));
+    const upper: usize = @intFromFloat(@ceil(position));
+    if (lower == upper) return nsToMs(sorted[lower].elapsed_ns);
+    const fraction = position - @as(f64, @floatFromInt(lower));
+    const lower_ns = @as(f64, @floatFromInt(sorted[lower].elapsed_ns));
+    const upper_ns = @as(f64, @floatFromInt(sorted[upper].elapsed_ns));
+    return (lower_ns * (1.0 - fraction) + upper_ns * fraction) / 1.0e6;
 }
 
 fn nowNs() u64 {

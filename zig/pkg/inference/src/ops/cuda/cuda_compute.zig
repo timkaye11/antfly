@@ -286,6 +286,7 @@ const CudaDispatchQuant = enum {
     q4_k,
     q6_k,
     f32,
+    f16,
     bf16,
 };
 
@@ -650,6 +651,17 @@ pub const RuntimeStats = struct {
     launch_embedding: usize = 0,
     launch_linear: usize = 0,
     launch_linear_qkv: usize = 0,
+    deberta_fused_attention_calls: usize = 0,
+    deberta_fused_attention_fallbacks: usize = 0,
+    deberta_stream_f16_attention_calls: usize = 0,
+    deberta_stream_f16_attention_fallbacks: usize = 0,
+    deberta_stream_f16_staging_calls: usize = 0,
+    deberta_materialized_f16_attention_calls: usize = 0,
+    deberta_materialized_f16_attention_fallbacks: usize = 0,
+    deberta_generated_tc_attention_calls: usize = 0,
+    deberta_generated_tc_m32_attention_calls: usize = 0,
+    deberta_generated_tc_m16_attention_calls: usize = 0,
+    deberta_generated_tc_attention_fallbacks: usize = 0,
     launch_norm: usize = 0,
     launch_norm_layer: usize = 0,
     launch_norm_add_layer: usize = 0,
@@ -764,6 +776,10 @@ pub const RuntimeStats = struct {
     bf16_cublaslt_fallbacks: usize = 0,
     bf16_scalar_linear_calls: usize = 0,
     bf16_scalar_qkv_calls: usize = 0,
+    f16_cublaslt_linear_calls: usize = 0,
+    f16_cublaslt_qkv_calls: usize = 0,
+    f16_cublaslt_activation_staging_calls: usize = 0,
+    f16_cublaslt_fallbacks: usize = 0,
     rms_norm_bf16_mirror_hits: usize = 0,
     pinned_bulk_downloads: usize = 0,
     qkv_fallback_unsupported: usize = 0,
@@ -1060,6 +1076,17 @@ pub const CudaCompute = struct {
     attention_mask_cache_hash: u64 = 0,
     attention_mask_cache_len: usize = 0,
     bf16_activation_scratch: scratch_mod.DeviceScratch = .{},
+    f16_activation_scratch: scratch_mod.DeviceScratch = .{},
+    deberta_q_f16_scratch: scratch_mod.DeviceScratch = .{},
+    deberta_k_f16_scratch: scratch_mod.DeviceScratch = .{},
+    deberta_v_f16_scratch: scratch_mod.DeviceScratch = .{},
+    deberta_qr_f16_scratch: scratch_mod.DeviceScratch = .{},
+    deberta_kr_f16_scratch: scratch_mod.DeviceScratch = .{},
+    deberta_content_scores_scratch: scratch_mod.DeviceScratch = .{},
+    deberta_c2p_scores_scratch: scratch_mod.DeviceScratch = .{},
+    deberta_p2c_scores_scratch: scratch_mod.DeviceScratch = .{},
+    deberta_probabilities_f16_scratch: scratch_mod.DeviceScratch = .{},
+    deberta_output_packed_scratch: scratch_mod.DeviceScratch = .{},
     cublaslt_workspace_scratch: scratch_mod.DeviceScratch = .{},
     cublaslt: ?cublaslt_mod.CublasLt = null,
     stats: RuntimeStats = .{},
@@ -1246,6 +1273,17 @@ pub const CudaCompute = struct {
         self.temp_ids_masks.deinit(&self.ctx);
         self.attention_mask_scratch.deinit(&self.ctx);
         self.bf16_activation_scratch.deinit(&self.ctx);
+        self.f16_activation_scratch.deinit(&self.ctx);
+        self.deberta_q_f16_scratch.deinit(&self.ctx);
+        self.deberta_k_f16_scratch.deinit(&self.ctx);
+        self.deberta_v_f16_scratch.deinit(&self.ctx);
+        self.deberta_qr_f16_scratch.deinit(&self.ctx);
+        self.deberta_kr_f16_scratch.deinit(&self.ctx);
+        self.deberta_content_scores_scratch.deinit(&self.ctx);
+        self.deberta_c2p_scores_scratch.deinit(&self.ctx);
+        self.deberta_p2c_scores_scratch.deinit(&self.ctx);
+        self.deberta_probabilities_f16_scratch.deinit(&self.ctx);
+        self.deberta_output_packed_scratch.deinit(&self.ctx);
         self.cublaslt_workspace_scratch.deinit(&self.ctx);
         if (self.cublaslt) |*blas| {
             blas.deinit();
@@ -1437,6 +1475,16 @@ pub const CudaCompute = struct {
         if (loaded.tensor.dtype == .bf16 and loaded.tensor.shape.len >= 2) {
             return self.insertBf16WeightFromTensor(owned_key, &loaded.tensor);
         }
+        // Keep matrix-shaped FP16 GGUF tensors in their native representation
+        // only when the complete tensor-core route is available. Rank-one
+        // parameters intentionally continue through F32: norms, biases, and
+        // scalar graph operators retain their existing numerical behavior.
+        if (loaded.tensor.dtype == .f16 and loaded.tensor.shape.len >= 2 and
+            cudaShouldKeepF16WeightOnDevice(owned_key) and
+            canUseF16TensorCoreWeights(self))
+        {
+            return self.insertF16WeightFromTensor(owned_key, &loaded.tensor);
+        }
         if (loaded.tensor.dtype == .f32 and cudaShouldConvertF32WeightToBf16OnUpload(owned_key, &loaded.tensor)) {
             return self.insertBf16WeightFromF32Tensor(owned_key, &loaded.tensor);
         }
@@ -1515,6 +1563,30 @@ pub const CudaCompute = struct {
         try self.resident_weights.put(self.allocator, owned_key, .{
             .buffer = device,
             .dtype = .bf16,
+            .shape = shape,
+            .elem_count = elem_count,
+            .quant_type = null,
+            .owns_buffer = false,
+            .owns_shape = false,
+            .owned_by_tensor = false,
+        });
+    }
+
+    pub fn insertF16WeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+        if (tensor.dtype != .f16) return error.UnsupportedTensorType;
+        const elem_count = tensor.elementCount();
+        if (tensor.data.len != elem_count * @sizeOf(u16)) return error.InvalidShape;
+        const shape = try self.allocator.dupe(i64, tensor.shape);
+        errdefer self.allocator.free(shape);
+        var device = try allocDeviceBuffer(self, tensor.data.len);
+        errdefer device.free(&self.ctx);
+        try copyFromHostTracked(self, device, tensor.data);
+        try synchronizeAndDrainDeferredDeviceFrees(self);
+        self.stats.resident_weight_bytes += tensor.data.len;
+        errdefer self.allocator.free(owned_key);
+        try self.resident_weights.put(self.allocator, owned_key, .{
+            .buffer = device,
+            .dtype = .f16,
             .shape = shape,
             .elem_count = elem_count,
             .quant_type = null,
@@ -2213,6 +2285,32 @@ fn cudaPleModelProjectionBf16OnUpload() bool {
 
 fn cudaCublasLtEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CUBLASLT", true);
+}
+
+/// FP16 dense residency is an all-or-nothing route. If either the runtime
+/// library or the generated staging primitive is unavailable, retain the old
+/// F32 upload path so a CUDA build with a partial/older artifact bundle stays
+/// functional rather than accepting weights it cannot execute.
+fn canUseF16TensorCoreWeights(self: *const CudaCompute) bool {
+    return cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and
+        self.cublaslt != null and self.kernels.f32_to_f16 != null and
+        self.kernels.embedding_lookup_f16_weight_f32 != null and
+        self.kernels.embedding_lookup_i32_f16_weight_f32 != null;
+}
+
+/// Only retain FP16 tensors for operations with a fully device-resident FP16
+/// implementation. GLiNER's DeBERTa token embedding, per-layer dense
+/// projections, and span projection MLPs are consumed by FP16 tensor-core
+/// GEMM routes. The relative position table and the CountLSTM/transformer head
+/// still have F32-only consumers, so those exceptional tensors remain F32.
+/// Keep this operation-capability policy explicit rather than shape-dependent:
+/// silently promoting every two-dimensional head tensor can make an otherwise
+/// supported model fail much later in an unrelated elementwise operation.
+fn cudaShouldKeepF16WeightOnDevice(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "embeddings.word_embeddings.weight")) return true;
+    if (std.mem.startsWith(u8, name, "encoder.layer.") and std.mem.endsWith(u8, name, ".weight")) return true;
+    return std.mem.startsWith(u8, name, "span_rep.span_rep_layer.") and
+        std.mem.endsWith(u8, name, ".weight");
 }
 
 fn cudaDeviceMirrorDequantEnabled() bool {
@@ -4329,6 +4427,108 @@ fn stageBf16ActivationForCublasLt(
     return scratch;
 }
 
+fn stageF16ActivationForCublasLt(
+    self: *CudaCompute,
+    input: *const CudaTensor,
+    rows: usize,
+    in_dim: usize,
+) !?buffer_mod.DeviceBuffer {
+    if (!canUseF16TensorCoreWeights(self)) return null;
+    if (input.dtype != .f32) return null;
+    const count = try checkedMul(rows, in_dim);
+    if (input.elem_count != count) return null;
+    const bytes = try checkedMul(count, @sizeOf(u16));
+    const scratch = self.f16_activation_scratch.acquire(&self.ctx, bytes) catch return null;
+    var staging_profile_scope = beginPrefillProfile(self, .staging, rows);
+    defer if (staging_profile_scope) |*scope| scope.end();
+    self.kernels.launchF32ToF16(&self.ctx, scratch, input.buffer, count) catch return null;
+    self.stats.f16_cublaslt_activation_staging_calls += 1;
+    return scratch;
+}
+
+// DeBERTa's attention consumes five tensors at once (Q/K/V and two relative
+// projections), so it cannot reuse the one-buffer GEMM staging scratch. Keep
+// a small set of model-session-owned buffers and convert each F32 graph tensor
+// once per layer. The streaming attention kernel accumulates into F32 and
+// writes F32 output, preserving the residual/norm contract around it.
+fn stageDebertaAttentionF16(
+    self: *CudaCompute,
+    scratch: *scratch_mod.DeviceScratch,
+    input: *const CudaTensor,
+    count: usize,
+) !?buffer_mod.DeviceBuffer {
+    if (input.dtype != .f32 or input.quant_type != null or input.elem_count != count) return null;
+    if (self.ctx.info.compute_major < 8 or self.kernels.deberta_attention_stream_f16 == null) return null;
+    const bytes = try checkedMul(count, @sizeOf(u16));
+    const staged = scratch.acquire(&self.ctx, bytes) catch return null;
+    self.kernels.launchF32ToF16(&self.ctx, staged, input.buffer, count) catch return null;
+    self.stats.deberta_stream_f16_staging_calls += 1;
+    return staged;
+}
+
+/// Materialized DeBERTa attention follows the same schedule as the fast CPU
+/// encoder path: QK^T, QKr^T, and KQr^T are tensor-core GEMMs; a generated
+/// kernel gathers relative-position diagonals and applies softmax; P*V is the
+/// fourth GEMM. The auto dispatcher promotes it only for its qualified B4+
+/// S128..256 envelope; explicit mode remains available for diagnostics.
+fn tryDebertaMaterializedAttentionF16(
+    self: *CudaCompute,
+    dst: buffer_mod.DeviceBuffer,
+    q: *const CudaTensor,
+    k: *const CudaTensor,
+    v: *const CudaTensor,
+    q_r: *const CudaTensor,
+    k_r: *const CudaTensor,
+    mask: buffer_mod.DeviceBuffer,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) !bool {
+    if (self.ctx.info.compute_major < 8 or self.cublaslt == null) return false;
+    if (seq_len == 0 or seq_len > 256 or head_dim != 64 or q.dtype != .f32 or k.dtype != .f32 or v.dtype != .f32 or q_r.dtype != .f32 or k_r.dtype != .f32) return false;
+    if (self.kernels.deberta_pack_heads_f16 == null or self.kernels.deberta_scores_softmax_f32 == null or self.kernels.deberta_unpack_heads_f32 == null) return false;
+    const matrices = checkedMul(batch, num_heads) catch return false;
+    const hidden = checkedMul(num_heads, head_dim) catch return false;
+    const count = checkedMul(checkedMul(batch, seq_len) catch return false, hidden) catch return false;
+    const rel_len = checkedSub(checkedMul(2, seq_len) catch return false, 1) catch return false;
+    const rel_count = checkedMul(rel_len, hidden) catch return false;
+    const packed_rel_count = checkedMul(batch, rel_count) catch return false;
+    const score_count = checkedMul(matrices, checkedMul(seq_len, seq_len) catch return false) catch return false;
+    const rel_score_count = checkedMul(matrices, checkedMul(seq_len, rel_len) catch return false) catch return false;
+    if (q.elem_count != count or k.elem_count != count or v.elem_count != count or q_r.elem_count != rel_count or k_r.elem_count != rel_count) return false;
+
+    const f16_count_bytes = checkedMul(count, @sizeOf(u16)) catch return false;
+    const f16_rel_bytes = checkedMul(packed_rel_count, @sizeOf(u16)) catch return false;
+    const score_bytes = checkedMul(score_count, @sizeOf(f32)) catch return false;
+    const rel_score_bytes = checkedMul(rel_score_count, @sizeOf(f32)) catch return false;
+    const probability_bytes = checkedMul(score_count, @sizeOf(u16)) catch return false;
+    const output_bytes = checkedMul(count, @sizeOf(f32)) catch return false;
+    const q_f16 = self.deberta_q_f16_scratch.acquire(&self.ctx, f16_count_bytes) catch return false;
+    const k_f16 = self.deberta_k_f16_scratch.acquire(&self.ctx, f16_count_bytes) catch return false;
+    const v_f16 = self.deberta_v_f16_scratch.acquire(&self.ctx, f16_count_bytes) catch return false;
+    const q_r_f16 = self.deberta_qr_f16_scratch.acquire(&self.ctx, f16_rel_bytes) catch return false;
+    const k_r_f16 = self.deberta_kr_f16_scratch.acquire(&self.ctx, f16_rel_bytes) catch return false;
+    const content_scores = self.deberta_content_scores_scratch.acquire(&self.ctx, score_bytes) catch return false;
+    const c2p_scores = self.deberta_c2p_scores_scratch.acquire(&self.ctx, rel_score_bytes) catch return false;
+    const p2c_scores = self.deberta_p2c_scores_scratch.acquire(&self.ctx, rel_score_bytes) catch return false;
+    const probabilities_f16 = self.deberta_probabilities_f16_scratch.acquire(&self.ctx, probability_bytes) catch return false;
+    const output_packed = self.deberta_output_packed_scratch.acquire(&self.ctx, output_bytes) catch return false;
+
+    if (!try self.kernels.launchDebertaPackHeadsF16(&self.ctx, q_f16, k_f16, v_f16, q_r_f16, k_r_f16, q.buffer, k.buffer, v.buffer, q_r.buffer, k_r.buffer, batch, seq_len, num_heads, head_dim)) return false;
+    const blas = &(self.cublaslt orelse return false);
+    const workspace = cublasLtWorkspace(self);
+    blas.matmulF16StridedBatchedF32Out(&self.ctx, content_scores, q_f16, k_f16, workspace, matrices, seq_len, head_dim, seq_len) catch return false;
+    blas.matmulF16StridedBatchedF32Out(&self.ctx, c2p_scores, q_f16, k_r_f16, workspace, matrices, seq_len, head_dim, rel_len) catch return false;
+    blas.matmulF16StridedBatchedF32Out(&self.ctx, p2c_scores, k_f16, q_r_f16, workspace, matrices, seq_len, head_dim, rel_len) catch return false;
+    if (!try self.kernels.launchDebertaScoresSoftmaxF32(&self.ctx, content_scores, c2p_scores, p2c_scores, mask, batch, seq_len, num_heads, head_dim)) return false;
+    self.kernels.launchF32ToF16(&self.ctx, probabilities_f16, content_scores, score_count) catch return false;
+    blas.matmulF16StridedBatchedF32Out(&self.ctx, output_packed, probabilities_f16, v_f16, workspace, matrices, seq_len, seq_len, head_dim) catch return false;
+    if (!try self.kernels.launchDebertaUnpackHeadsF32(&self.ctx, dst, output_packed, batch, seq_len, num_heads, head_dim)) return false;
+    self.stats.deberta_materialized_f16_attention_calls += 1;
+    return true;
+}
+
 // Q8_1 activation mirror: a norm kernel pre-quantized its output row, so a
 // Q4/Q6 DP4A matmul can consume it directly instead of launching a separate
 // quantize kernel. Blocks are position-independent per 32 contiguous values,
@@ -4367,6 +4567,23 @@ fn tryCublasLtBf16Linear(
     return true;
 }
 
+fn tryCublasLtF16Linear(
+    self: *CudaCompute,
+    dst: buffer_mod.DeviceBuffer,
+    input: *const CudaTensor,
+    weight: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    const input_f16 = try stageF16ActivationForCublasLt(self, input, rows, in_dim) orelse return false;
+    const blas = &(self.cublaslt orelse return false);
+    const workspace = cublasLtWorkspace(self);
+    blas.matmulF16WeightF32Out(&self.ctx, dst, input_f16, weight, workspace, rows, in_dim, out_dim) catch return false;
+    self.stats.f16_cublaslt_linear_calls += 1;
+    return true;
+}
+
 fn tryCublasLtBf16LinearPair(
     self: *CudaCompute,
     dst_a: buffer_mod.DeviceBuffer,
@@ -4384,6 +4601,26 @@ fn tryCublasLtBf16LinearPair(
     blas.matmulBf16WeightF32Out(&self.ctx, dst_a, input_bf16, weight_a, workspace, rows, in_dim, out_dim) catch return false;
     blas.matmulBf16WeightF32Out(&self.ctx, dst_b, input_bf16, weight_b, workspace, rows, in_dim, out_dim) catch return false;
     self.stats.bf16_cublaslt_linear_calls += 2;
+    return true;
+}
+
+fn tryCublasLtF16LinearPair(
+    self: *CudaCompute,
+    dst_a: buffer_mod.DeviceBuffer,
+    dst_b: buffer_mod.DeviceBuffer,
+    input: *const CudaTensor,
+    weight_a: buffer_mod.DeviceBuffer,
+    weight_b: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    const input_f16 = try stageF16ActivationForCublasLt(self, input, rows, in_dim) orelse return false;
+    const blas = &(self.cublaslt orelse return false);
+    const workspace = cublasLtWorkspace(self);
+    blas.matmulF16WeightF32Out(&self.ctx, dst_a, input_f16, weight_a, workspace, rows, in_dim, out_dim) catch return false;
+    blas.matmulF16WeightF32Out(&self.ctx, dst_b, input_f16, weight_b, workspace, rows, in_dim, out_dim) catch return false;
+    self.stats.f16_cublaslt_linear_calls += 2;
     return true;
 }
 
@@ -4425,6 +4662,30 @@ fn tryCublasLtBf16Qkv(
     blas.matmulBf16WeightF32Out(&self.ctx, dst_k, input_bf16, weight_k, workspace, rows, in_dim, kv_out_dim) catch return false;
     blas.matmulBf16WeightF32Out(&self.ctx, dst_v, input_bf16, weight_v, workspace, rows, in_dim, kv_out_dim) catch return false;
     self.stats.bf16_cublaslt_qkv_calls += 1;
+    return true;
+}
+
+fn tryCublasLtF16Qkv(
+    self: *CudaCompute,
+    dst_q: buffer_mod.DeviceBuffer,
+    dst_k: buffer_mod.DeviceBuffer,
+    dst_v: buffer_mod.DeviceBuffer,
+    input: *const CudaTensor,
+    weight_q: buffer_mod.DeviceBuffer,
+    weight_k: buffer_mod.DeviceBuffer,
+    weight_v: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    q_out_dim: usize,
+    kv_out_dim: usize,
+) !bool {
+    const input_f16 = try stageF16ActivationForCublasLt(self, input, rows, in_dim) orelse return false;
+    const blas = &(self.cublaslt orelse return false);
+    const workspace = cublasLtWorkspace(self);
+    blas.matmulF16WeightF32Out(&self.ctx, dst_q, input_f16, weight_q, workspace, rows, in_dim, q_out_dim) catch return false;
+    blas.matmulF16WeightF32Out(&self.ctx, dst_k, input_f16, weight_k, workspace, rows, in_dim, kv_out_dim) catch return false;
+    blas.matmulF16WeightF32Out(&self.ctx, dst_v, input_f16, weight_v, workspace, rows, in_dim, kv_out_dim) catch return false;
+    self.stats.f16_cublaslt_qkv_calls += 1;
     return true;
 }
 
@@ -6562,6 +6823,23 @@ fn downloadTensorToFloat32(
             for (ints, out) |value, *dst| dst.* = @floatFromInt(value);
             return cuda_tensor.elem_count * @sizeOf(i32);
         },
+        .f16 => {
+            const halves = try allocator.alloc(u16, cuda_tensor.elem_count);
+            defer allocator.free(halves);
+            try copyToHostTrackedAndSync(self, cuda_tensor.buffer, std.mem.sliceAsBytes(halves));
+            for (halves, out) |bits, *dst| {
+                const value: f16 = @bitCast(bits);
+                dst.* = @floatCast(value);
+            }
+            return cuda_tensor.elem_count * @sizeOf(u16);
+        },
+        .bf16 => {
+            const halves = try allocator.alloc(u16, cuda_tensor.elem_count);
+            defer allocator.free(halves);
+            try copyToHostTrackedAndSync(self, cuda_tensor.buffer, std.mem.sliceAsBytes(halves));
+            for (halves, out) |bits, *dst| dst.* = @bitCast(@as(u32, bits) << 16);
+            return cuda_tensor.elem_count * @sizeOf(u16);
+        },
         else => return error.UnsupportedTensorType,
     }
 }
@@ -7240,7 +7518,16 @@ fn dupeShape(allocator: std.mem.Allocator, shape: []const i64) ![]i64 {
 }
 
 fn ensureF32(tensor: *const CudaTensor) !void {
-    if (tensor.dtype != .f32 or tensor.quant_type != null) return error.UnsupportedTensorType;
+    if (tensor.dtype != .f32 or tensor.quant_type != null) {
+        if (cudaTensorTypeDebugEnabled()) {
+            std.log.err("cuda_tensor_type: expected=f32 actual={s} quantized={} shape={any}", .{
+                @tagName(tensor.dtype),
+                tensor.quant_type != null,
+                tensor.shape,
+            });
+        }
+        return error.UnsupportedTensorType;
+    }
 }
 
 fn florenceTailWeightDTypeCode(tensor: *const CudaTensor) !u32 {
@@ -7263,8 +7550,22 @@ fn ensureF32Bf16OrQuantized(tensor: *const CudaTensor) !void {
     if (tensor.dtype != .f32 and tensor.dtype != .bf16) return error.UnsupportedTensorType;
 }
 
+fn ensureF32F16Bf16OrQuantized(tensor: *const CudaTensor) !void {
+    if (tensor.quant_type != null) return;
+    if (tensor.dtype != .f32 and tensor.dtype != .f16 and tensor.dtype != .bf16) return error.UnsupportedTensorType;
+}
+
+fn ensureF32F16OrQuantized(tensor: *const CudaTensor) !void {
+    if (tensor.quant_type != null) return;
+    if (tensor.dtype != .f32 and tensor.dtype != .f16) return error.UnsupportedTensorType;
+}
+
 fn isBf16Weight(tensor: *const CudaTensor) bool {
     return tensor.dtype == .bf16 and tensor.quant_type == null;
+}
+
+fn isF16Weight(tensor: *const CudaTensor) bool {
+    return tensor.dtype == .f16 and tensor.quant_type == null;
 }
 
 fn isKnownQuant(tensor: *const CudaTensor, known: gguf_tensor_types.KnownTensorType) bool {
@@ -7344,6 +7645,46 @@ fn cudaDisableFusedQkv() bool {
     return platform.env.getenvBoolDefault("ANTFLY_CUDA_DISABLE_FUSED_QKV", false);
 }
 
+fn cudaDebertaFusedAttentionEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_CUDA_DEBERTA_FUSED_ATTENTION", true);
+}
+
+const CudaDebertaAttentionMode = enum {
+    auto,
+    fused_f32,
+    streaming_f16,
+    materialized_f16,
+    generated_tc,
+};
+
+fn cudaDebertaAttentionMode() CudaDebertaAttentionMode {
+    if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_DEBERTA_ATTENTION_MODE")) |value| {
+        if (std.ascii.eqlIgnoreCase(value, "f32") or std.ascii.eqlIgnoreCase(value, "fused") or std.ascii.eqlIgnoreCase(value, "fused-f32")) return .fused_f32;
+        if (std.ascii.eqlIgnoreCase(value, "streaming") or std.ascii.eqlIgnoreCase(value, "streaming-f16") or std.ascii.eqlIgnoreCase(value, "generated")) return .streaming_f16;
+        if (std.ascii.eqlIgnoreCase(value, "materialized") or std.ascii.eqlIgnoreCase(value, "materialized-f16") or std.ascii.eqlIgnoreCase(value, "tensor-core")) return .materialized_f16;
+        if (std.ascii.eqlIgnoreCase(value, "generated-tc") or std.ascii.eqlIgnoreCase(value, "tc")) return .generated_tc;
+    }
+    return .auto;
+}
+
+/// The generated tensor-core encoder route stays opt-in until its external
+/// Fastino evidence is checked in. This avoids silently trading model quality
+/// for a locally faster schedule while keeping the production auto policy
+/// explicit and testable.
+fn cudaDebertaGeneratedTcAutoEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_CUDA_DEBERTA_GENERATED_TC_AUTO", false);
+}
+
+const CudaDebertaGeneratedTcVariant = enum { auto, m32, m16 };
+
+fn cudaDebertaGeneratedTcVariant() CudaDebertaGeneratedTcVariant {
+    if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_DEBERTA_GENERATED_TC_VARIANT")) |value| {
+        if (std.ascii.eqlIgnoreCase(value, "m16") or std.ascii.eqlIgnoreCase(value, "m16n32")) return .m16;
+        if (std.ascii.eqlIgnoreCase(value, "m32") or std.ascii.eqlIgnoreCase(value, "m32n16")) return .m32;
+    }
+    return .auto;
+}
+
 fn recordQuantKernelCompilerPlan(
     self: *CudaCompute,
     plan: quant_matmul.Plan,
@@ -7418,6 +7759,10 @@ fn sameShape(a: []const i64, b: []const i64) bool {
 
 fn cudaLazyProfileEnabled() bool {
     return platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_LAZY_PROFILE");
+}
+
+fn cudaTensorTypeDebugEnabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DEBUG_TENSOR_TYPES");
 }
 
 fn monotonicNowNs() u64 {
@@ -7497,7 +7842,7 @@ fn uploadTempU8(self: *CudaCompute, data: []const u8) !buffer_mod.DeviceBuffer {
 fn embeddingLookupScaledCommon(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize, scale: f32) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const weight_tensor = tensorFromCt(weight);
-    try ensureF32Bf16OrQuantized(weight_tensor);
+    try ensureF32F16Bf16OrQuantized(weight_tensor);
     if (ids.len != total) {
         if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=embedding ids_len={d} total={d}", .{ ids.len, total });
         return error.InvalidShape;
@@ -7531,6 +7876,8 @@ fn embeddingLookupScaledCommon(ctx: *anyopaque, weight: CT, ids: []const i64, to
         }
     } else if (isBf16Weight(weight_tensor)) {
         try self.kernels.launchEmbeddingLookupBf16WeightF32(&self.ctx, device, weight_tensor.buffer, ids_device, total, dim, scale);
+    } else if (isF16Weight(weight_tensor)) {
+        try self.kernels.launchEmbeddingLookupF16WeightF32(&self.ctx, device, weight_tensor.buffer, ids_device, total, dim, scale);
     } else {
         try self.kernels.launchEmbeddingLookupF32(&self.ctx, device, weight_tensor.buffer, ids_device, total, dim, scale);
     }
@@ -7551,7 +7898,7 @@ fn embeddingLookupTensorScaledCommon(ctx: *anyopaque, weight: CT, ids: CT, total
     const weight_tensor = tensorFromCt(weight);
     const ids_tensor = tensorFromCt(ids);
     if (isBf16Weight(weight_tensor)) return null;
-    try ensureF32OrQuantized(weight_tensor);
+    try ensureF32F16OrQuantized(weight_tensor);
     if (ids_tensor.dtype != .i32 or ids_tensor.quant_type != null) return null;
     if (ids_tensor.elem_count != total) {
         if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=embedding_tensor ids_elems={d} total={d}", .{ ids_tensor.elem_count, total });
@@ -7578,6 +7925,8 @@ fn embeddingLookupTensorScaledCommon(ctx: *anyopaque, weight: CT, ids: CT, total
             },
             else => return error.UnsupportedTensorType,
         }
+    } else if (isF16Weight(weight_tensor)) {
+        try self.kernels.launchEmbeddingLookupI32F16WeightF32(&self.ctx, device, weight_tensor.buffer, ids_tensor.buffer, total, dim, scale);
     } else {
         try self.kernels.launchEmbeddingLookupI32F32(&self.ctx, device, weight_tensor.buffer, ids_tensor.buffer, total, dim, scale);
     }
@@ -8099,7 +8448,7 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
     const weight_tensor = tensorFromCt(weight);
     const bias_tensor = tensorFromCt(bias);
     try ensureF32(input_tensor);
-    try ensureF32OrQuantized(weight_tensor);
+    try ensureF32F16OrQuantized(weight_tensor);
     try ensureF32(bias_tensor);
     const input_expected = try checkedMul(rows, in_dim);
     if (input_tensor.elem_count != input_expected) {
@@ -8127,6 +8476,14 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
         const result_tensor = tensorFromCt(result);
         try self.kernels.launchAddBiasRowsF32(&self.ctx, result_tensor.buffer, bias_tensor.buffer, rows, out_dim);
         self.dispatch_stats.note(self.allocator, .linear, .q4_0, .q4_simt, .bias, .none, rows, in_dim, out_dim, 0);
+        return result;
+    }
+    if (isF16Weight(weight_tensor)) {
+        const result = try linearNoBias(ctx, input, weight, rows, in_dim, out_dim);
+        errdefer freeTensor(ctx, result);
+        const result_tensor = tensorFromCt(result);
+        try self.kernels.launchAddBiasRowsF32(&self.ctx, result_tensor.buffer, bias_tensor.buffer, rows, out_dim);
+        self.dispatch_stats.note(self.allocator, .linear, .f16, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
         return result;
     }
 
@@ -8235,6 +8592,18 @@ fn linearRelu(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_
     const bias_tensor = tensorFromCt(bias);
     try ensureF32(input_tensor);
     try ensureF32(bias_tensor);
+    if (isF16Weight(weight_tensor)) {
+        try ensureCount(input_tensor, try checkedMul(rows, in_dim));
+        try ensureCount(weight_tensor, try checkedMul(out_dim, in_dim));
+        try ensureCount(bias_tensor, out_dim);
+
+        const projected = try linearNoBias(ctx, input, weight, rows, in_dim, out_dim);
+        errdefer freeTensor(ctx, projected);
+        const projected_tensor = tensorFromCt(projected);
+        try self.kernels.launchAddBiasReluRowsF32(&self.ctx, projected_tensor.buffer, bias_tensor.buffer, rows, out_dim);
+        self.dispatch_stats.note(self.allocator, .linear_relu, .f16, .dense_lt, .bias_relu, .none, rows, in_dim, out_dim, 0);
+        return projected;
+    }
     const use_q4 = isKnownQuant(weight_tensor, .Q4_K);
     const use_dense = weight_tensor.quant_type == null and rows >= 2 and in_dim >= 256 and out_dim >= 4;
     if (!use_q4 and !use_dense) return null;
@@ -8284,6 +8653,7 @@ fn linearGelu(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_
     const bias_tensor = tensorFromCt(bias);
     const q8_variant = if (isKnownQuant(weight_tensor, .Q8_0)) mxbaiQ8Variant(rows, in_dim, out_dim) else null;
     const q4_variant = if (isKnownQuant(weight_tensor, .Q4_K)) mxbaiQ4Variant(rows, in_dim, out_dim) else null;
+    if (isF16Weight(weight_tensor)) return null;
     const use_dense = weight_tensor.quant_type == null and rows >= 2 and in_dim >= 256 and out_dim >= 4;
     if (q8_variant == null and q4_variant == null and !use_dense) return null;
     try ensureF32(input_tensor);
@@ -8331,6 +8701,7 @@ fn linearAdd(ctx: *anyopaque, input: CT, weight: CT, bias: CT, residual: CT, row
     try ensureF32(residual_tensor);
     const q8_variant = if (isKnownQuant(weight_tensor, .Q8_0)) mxbaiQ8Variant(rows, in_dim, out_dim) else null;
     const q4_variant = if (isKnownQuant(weight_tensor, .Q4_K)) mxbaiQ4Variant(rows, in_dim, out_dim) else null;
+    if (isF16Weight(weight_tensor)) return null;
     const use_dense = weight_tensor.quant_type == null and rows >= 2 and in_dim >= 256 and out_dim >= 4;
     if (q8_variant == null and q4_variant == null and !use_dense) return null;
     if (use_dense) try ensureF32(weight_tensor);
@@ -8633,7 +9004,7 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
     const input_tensor = tensorFromCt(input);
     const weight_tensor = tensorFromCt(weight);
     try ensureF32(input_tensor);
-    try ensureF32Bf16OrQuantized(weight_tensor);
+    try ensureF32F16Bf16OrQuantized(weight_tensor);
     const input_expected = try checkedMul(rows, in_dim);
     if (input_tensor.elem_count != input_expected) {
         if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=linear_no_bias input_elems={d} rows={d} in_dim={d}", .{ input_tensor.elem_count, rows, in_dim });
@@ -8660,6 +9031,13 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
             try self.kernels.launchLinearBf16WeightF32Tiled(&self.ctx, device, input_tensor.buffer, mirror_buffer, rows, in_dim, out_dim);
             self.stats.bf16_scalar_linear_calls += 1;
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .bf16, .dense_cuda, .none, .none, rows, in_dim, out_dim, 0);
+        }
+    } else if (isF16Weight(weight_tensor)) {
+        if (try tryCublasLtF16Linear(self, device, input_tensor, weight_tensor.buffer, rows, in_dim, out_dim)) {
+            self.dispatch_stats.note(self.allocator, .linear_no_bias, .f16, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
+        } else {
+            self.stats.f16_cublaslt_fallbacks += 1;
+            return error.CudaFp16TensorCoreUnavailable;
         }
     } else if (rows == 1 and weight_tensor.quant_type == null and weight_tensor.dtype == .f32 and
         weight_tensor.bf16_mirror.ptr != 0 and
@@ -10091,8 +10469,9 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
     const use_f32 = q_weight_tensor.dtype == .f32 and q_weight_tensor.quant_type == null and
         k_weight_tensor.dtype == .f32 and k_weight_tensor.quant_type == null and
         v_weight_tensor.dtype == .f32 and v_weight_tensor.quant_type == null;
+    const use_f16 = isF16Weight(q_weight_tensor) and isF16Weight(k_weight_tensor) and isF16Weight(v_weight_tensor);
     const use_bf16 = use_hybrid_bf16 or (isBf16Weight(q_weight_tensor) and isBf16Weight(k_weight_tensor) and isBf16Weight(v_weight_tensor));
-    if (!use_q8 and !use_q4_0 and !use_q4 and !use_q4_q4_f32 and !use_f32 and !use_bf16) {
+    if (!use_q8 and !use_q4_0 and !use_q4 and !use_q4_q4_f32 and !use_f32 and !use_f16 and !use_bf16) {
         self.stats.qkv_fallback_unsupported += 1;
         return null;
     }
@@ -10297,6 +10676,26 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
         };
         self.stats.qkv_fused_q4_q4_f32 += 1;
         self.stats.launch_linear_qkv += 1;
+    } else if (use_f16) {
+        if (!try tryCublasLtF16Qkv(
+            self,
+            q_device,
+            k_device,
+            v_device,
+            input_tensor,
+            q_weight_tensor.buffer,
+            k_weight_tensor.buffer,
+            v_weight_tensor.buffer,
+            rows,
+            in_dim,
+            q_out_dim,
+            kv_out_dim,
+        )) {
+            self.stats.f16_cublaslt_fallbacks += 1;
+            return null;
+        }
+        self.stats.qkv_fused_f32 += 1;
+        self.stats.launch_linear_qkv += 1;
     } else if (use_bf16) {
         if (try tryCublasLtBf16Qkv(
             self,
@@ -10400,21 +10799,22 @@ fn linearTriple(ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: 
     try ensureCount(bias_b_tensor, out_dim);
     try ensureCount(bias_c_tensor, out_dim);
 
-    // BGE-M3/XLM-R uses three biased Q4_0 projections for every encoder
-    // attention block. At prefill sizes their Q4_0 BF16 mirrors are faster
+    // BGE-M3/XLM-R uses three biased projections for every encoder attention
+    // block. At prefill sizes BF16 mirrors and native FP16 weights are faster
     // with cuBLASLt, but the generic triple fallback stages the same F32
-    // activation three times. Reuse the generator-aware QKV route so that
-    // input staging happens once, then apply each learned bias in place.
+    // activation three times. Reuse the QKV route so input staging happens
+    // once, then apply each learned bias in place.
     //
-    // This is deliberately limited to the existing BF16-mirror contract:
-    // decode and raw Q4_0 kernels retain their established dispatch and
+    // Decode and raw Q4_0 kernels retain their established dispatch and
     // numerical behavior. `linearNoBiasQkv` returns null when its fusion is
     // disabled or ineligible, preserving the three-linear fallback below.
-    if (rows > 1 and
+    const use_bf16_triple = rows > 1 and
         weightBf16MirrorForRows(weight_a_tensor, rows) != null and
         weightBf16MirrorForRows(weight_b_tensor, rows) != null and
-        weightBf16MirrorForRows(weight_c_tensor, rows) != null)
-    {
+        weightBf16MirrorForRows(weight_c_tensor, rows) != null;
+    const use_f16_triple = isF16Weight(weight_a_tensor) and
+        isF16Weight(weight_b_tensor) and isF16Weight(weight_c_tensor);
+    if (use_bf16_triple or use_f16_triple) {
         if (try linearNoBiasQkv(ctx, input, weight_a, weight_b, weight_c, rows, in_dim, out_dim, out_dim)) |qkv| {
             errdefer freeTensor(ctx, qkv.first);
             errdefer freeTensor(ctx, qkv.second);
@@ -10422,7 +10822,7 @@ fn linearTriple(ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: 
             try self.kernels.launchAddBiasRowsF32(&self.ctx, tensorFromCt(qkv.first).buffer, bias_a_tensor.buffer, rows, out_dim);
             try self.kernels.launchAddBiasRowsF32(&self.ctx, tensorFromCt(qkv.second).buffer, bias_b_tensor.buffer, rows, out_dim);
             try self.kernels.launchAddBiasRowsF32(&self.ctx, tensorFromCt(qkv.third).buffer, bias_c_tensor.buffer, rows, out_dim);
-            self.dispatch_stats.note(self.allocator, .linear_triple, .bf16, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
+            self.dispatch_stats.note(self.allocator, .linear_triple, if (use_f16_triple) .f16 else .bf16, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
             return .{ .first = qkv.first, .second = qkv.second, .third = qkv.third };
         }
     }
@@ -10546,8 +10946,9 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
     const use_q8 = !use_hybrid_bf16 and isKnownQuant(weight_a_tensor, .Q8_0) and isKnownQuant(weight_b_tensor, .Q8_0);
     const use_q4_0 = !use_hybrid_bf16 and isKnownQuant(weight_a_tensor, .Q4_0) and isKnownQuant(weight_b_tensor, .Q4_0);
     const use_q4 = !use_hybrid_bf16 and isKnownQuant(weight_a_tensor, .Q4_K) and isKnownQuant(weight_b_tensor, .Q4_K);
+    const use_f16 = isF16Weight(weight_a_tensor) and isF16Weight(weight_b_tensor);
     const use_bf16 = use_hybrid_bf16 or (isBf16Weight(weight_a_tensor) and isBf16Weight(weight_b_tensor));
-    if (!use_q8 and !use_q4_0 and !use_q4 and !use_bf16) {
+    if (!use_q8 and !use_q4_0 and !use_q4 and !use_f16 and !use_bf16) {
         self.stats.linear_pair_fallbacks += 1;
         const first = try linearNoBias(ctx, input, weight_a, rows, in_dim, out_dim);
         errdefer freeTensor(ctx, first);
@@ -10575,7 +10976,22 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
     var prefill_profile_scope = beginPrefillProfile(self, if (use_bf16) .bf16_pair else null, rows);
     defer if (prefill_profile_scope) |*scope| scope.end();
 
-    if (use_bf16) {
+    if (use_f16) {
+        if (!try tryCublasLtF16LinearPair(
+            self,
+            device_a,
+            device_b,
+            input_tensor,
+            weight_a_tensor.buffer,
+            weight_b_tensor.buffer,
+            rows,
+            in_dim,
+            out_dim,
+        )) {
+            self.stats.f16_cublaslt_fallbacks += 1;
+            return error.CudaFp16TensorCoreUnavailable;
+        }
+    } else if (use_bf16) {
         if (try tryCublasLtBf16LinearPair(
             self,
             device_a,
@@ -11126,6 +11542,16 @@ fn linearPair(ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: CT
     try ensureCount(bias_a_tensor, out_dim);
     try ensureCount(bias_b_tensor, out_dim);
 
+    if (isF16Weight(weight_a_tensor) and isF16Weight(weight_b_tensor)) {
+        const pair = try linearNoBiasPair(ctx, input, weight_a, weight_b, rows, in_dim, out_dim);
+        errdefer freeTensor(ctx, pair.first);
+        errdefer freeTensor(ctx, pair.second);
+        try self.kernels.launchAddBiasRowsF32(&self.ctx, tensorFromCt(pair.first).buffer, bias_a_tensor.buffer, rows, out_dim);
+        try self.kernels.launchAddBiasRowsF32(&self.ctx, tensorFromCt(pair.second).buffer, bias_b_tensor.buffer, rows, out_dim);
+        self.dispatch_stats.note(self.allocator, .linear_pair, .f16, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
+        return .{ .first = pair.first, .second = pair.second };
+    }
+
     if (try linearPairSpanQ4(self, input_tensor, null, weight_a_tensor, bias_a_tensor, weight_b_tensor, bias_b_tensor, rows, in_dim, out_dim, .shared)) |span_pair| {
         return span_pair;
     }
@@ -11155,6 +11581,16 @@ fn linearPairRelu(ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b
     try ensureCount(bias_a_tensor, out_dim);
     try ensureCount(bias_b_tensor, out_dim);
 
+    if (isF16Weight(weight_a_tensor) and isF16Weight(weight_b_tensor)) {
+        const projected = try linearNoBiasPair(ctx, input, weight_a, weight_b, rows, in_dim, out_dim);
+        errdefer freeTensor(ctx, projected.first);
+        errdefer freeTensor(ctx, projected.second);
+        try self.kernels.launchAddBiasReluRowsF32(&self.ctx, tensorFromCt(projected.first).buffer, bias_a_tensor.buffer, rows, out_dim);
+        try self.kernels.launchAddBiasReluRowsF32(&self.ctx, tensorFromCt(projected.second).buffer, bias_b_tensor.buffer, rows, out_dim);
+        self.dispatch_stats.note(self.allocator, .linear_pair_relu, .f16, .dense_lt, .bias_relu, .none, rows, in_dim, out_dim, 0);
+        return .{ .first = projected.first, .second = projected.second };
+    }
+
     return try linearPairSpanQ4(self, input_tensor, null, weight_a_tensor, bias_a_tensor, weight_b_tensor, bias_b_tensor, rows, in_dim, out_dim, .shared_relu);
 }
 
@@ -11177,6 +11613,14 @@ fn linearPairInputs(ctx: *anyopaque, input_a: CT, input_b: CT, weight_a: CT, bia
     try ensureCount(weight_b_tensor, try checkedMul(out_dim, in_dim));
     try ensureCount(bias_a_tensor, out_dim);
     try ensureCount(bias_b_tensor, out_dim);
+
+    if (isF16Weight(weight_a_tensor) and isF16Weight(weight_b_tensor)) {
+        const first = try linear(ctx, input_a, weight_a, bias_a, rows, in_dim, out_dim);
+        errdefer freeTensor(ctx, first);
+        const second = try linear(ctx, input_b, weight_b, bias_b, rows, in_dim, out_dim);
+        self.dispatch_stats.note(self.allocator, .linear_pair_inputs, .f16, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
+        return .{ .first = first, .second = second };
+    }
 
     return try linearPairSpanQ4(self, input_a_tensor, input_b_tensor, weight_a_tensor, bias_a_tensor, weight_b_tensor, bias_b_tensor, rows, in_dim, out_dim, .separate);
 }
@@ -13218,7 +13662,135 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
+    const attention_mode = cudaDebertaAttentionMode();
+    if ((attention_mode == .generated_tc or (attention_mode == .auto and cudaDebertaGeneratedTcAutoEnabled())) and seq_len <= 256 and head_dim == 64) {
+        const requested_variant = cudaDebertaGeneratedTcVariant();
+        const launched_m32 = if (requested_variant != .m16)
+            self.kernels.launchDebertaAttentionTcF16M32N16(
+                &self.ctx,
+                device,
+                q_tensor.buffer,
+                k_tensor.buffer,
+                v_tensor.buffer,
+                q_r_tensor.buffer,
+                k_r_tensor.buffer,
+                mask_device,
+                batch,
+                seq_len,
+                num_heads,
+                head_dim,
+            ) catch |err| switch (err) {
+                error.CudaKernelUnavailable => false,
+                else => return err,
+            }
+        else
+            false;
+        // Keep the smaller schedule as a binary-compatibility fallback for
+        // deployments whose CUDA artifact predates the preferred M32 kernel.
+        var launched_m16 = false;
+        if (!launched_m32 and requested_variant != .m32) {
+            launched_m16 = self.kernels.launchDebertaAttentionTcF16M16N32(
+                &self.ctx,
+                device,
+                q_tensor.buffer,
+                k_tensor.buffer,
+                v_tensor.buffer,
+                q_r_tensor.buffer,
+                k_r_tensor.buffer,
+                mask_device,
+                batch,
+                seq_len,
+                num_heads,
+                head_dim,
+            ) catch |err| switch (err) {
+                error.CudaKernelUnavailable => false,
+                else => return err,
+            };
+        }
+        if (launched_m32 or launched_m16) {
+            self.stats.deberta_generated_tc_attention_calls += 1;
+            if (launched_m32) {
+                self.stats.deberta_generated_tc_m32_attention_calls += 1;
+            } else {
+                self.stats.deberta_generated_tc_m16_attention_calls += 1;
+            }
+            self.stats.launch_attention += 1;
+            return createTensor(self, device, shape, count);
+        }
+        self.stats.deberta_generated_tc_attention_fallbacks += 1;
+    }
+    // Qualification on SM89/L4 shows the cuBLASLt materialized schedule is
+    // the best current B4+ production route, while the fused scalar schedule
+    // remains preferable for latency-oriented small batches. Keep the shape
+    // gate explicit so B1 does not inherit B8's score-buffer overhead.
+    const auto_materialized_f16 = attention_mode == .auto and
+        batch >= 4 and seq_len >= 128 and seq_len <= 256 and head_dim == 64;
+    if (attention_mode == .materialized_f16 or auto_materialized_f16) {
+        if (try tryDebertaMaterializedAttentionF16(self, device, q_tensor, k_tensor, v_tensor, q_r_tensor, k_r_tensor, mask_device, batch, seq_len, num_heads, head_dim)) {
+            self.stats.launch_attention += 1;
+            return createTensor(self, device, shape, count);
+        }
+        self.stats.deberta_materialized_f16_attention_fallbacks += 1;
+    }
+    if (attention_mode == .streaming_f16 and seq_len <= 256 and head_dim == 64) {
+        const q_f16 = try stageDebertaAttentionF16(self, &self.deberta_q_f16_scratch, q_tensor, count);
+        const k_f16 = try stageDebertaAttentionF16(self, &self.deberta_k_f16_scratch, k_tensor, count);
+        const v_f16 = try stageDebertaAttentionF16(self, &self.deberta_v_f16_scratch, v_tensor, count);
+        const qr_f16 = try stageDebertaAttentionF16(self, &self.deberta_qr_f16_scratch, q_r_tensor, rel_count);
+        const kr_f16 = try stageDebertaAttentionF16(self, &self.deberta_kr_f16_scratch, k_r_tensor, rel_count);
+        if (q_f16 != null and k_f16 != null and v_f16 != null and qr_f16 != null and kr_f16 != null) {
+            const launched = self.kernels.launchDebertaAttentionStreamF16(
+                &self.ctx,
+                device,
+                q_f16.?,
+                k_f16.?,
+                v_f16.?,
+                qr_f16.?,
+                kr_f16.?,
+                mask_device,
+                batch,
+                seq_len,
+                num_heads,
+                head_dim,
+            ) catch |err| switch (err) {
+                error.CudaKernelUnavailable => false,
+                else => return err,
+            };
+            if (launched) {
+                self.stats.deberta_stream_f16_attention_calls += 1;
+                self.stats.launch_attention += 1;
+                return createTensor(self, device, shape, count);
+            }
+        }
+        self.stats.deberta_stream_f16_attention_fallbacks += 1;
+    }
+    if (cudaDebertaFusedAttentionEnabled() and seq_len <= 512) {
+        const launched = self.kernels.launchDebertaAttentionFusedF32(
+            &self.ctx,
+            device,
+            q_tensor.buffer,
+            k_tensor.buffer,
+            v_tensor.buffer,
+            q_r_tensor.buffer,
+            k_r_tensor.buffer,
+            mask_device,
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+        ) catch |err| switch (err) {
+            error.CudaKernelUnavailable => false,
+            else => return err,
+        };
+        if (launched) {
+            self.stats.deberta_fused_attention_calls += 1;
+            self.stats.launch_attention += 1;
+            return createTensor(self, device, shape, count);
+        }
+    }
+    self.stats.deberta_fused_attention_fallbacks += 1;
     try self.kernels.launchDebertaAttentionF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, q_r_tensor.buffer, k_r_tensor.buffer, mask_device, batch, seq_len, num_heads, head_dim);
+    self.stats.launch_attention += 1;
     return createTensor(self, device, shape, count);
 }
 fn windowedSelfAttention(

@@ -24,6 +24,7 @@ score_tolerance="${ANTFLY_GLINER2_SCORE_TOLERANCE:-0.01}"
 command_timeout="${ANTFLY_GLINER2_COMMAND_TIMEOUT:-1200}"
 warmup_iters="${ANTFLY_GLINER2_WARMUP_ITERS:-1}"
 measure_iters="${ANTFLY_GLINER2_MEASURE_ITERS:-1}"
+verify_generated_tc="${ANTFLY_GLINER2_VERIFY_GENERATED_TC:-0}"
 cuda_artifacts="${ANTFLY_CUDA_ARTIFACTS:-fatbin}"
 cuda_libraries="${ANTFLY_CUDA_LIBS:-auto}"
 optimize="${ANTFLY_CUDA_VERIFY_OPTIMIZE:-ReleaseFast}"
@@ -50,27 +51,30 @@ if [[ ! -f "$model_dir/gliner_config.json" ]]; then
   echo "missing GLiNER config at $model_dir/gliner_config.json" >&2
   exit 1
 fi
-if [[ ! -f "$model_dir/gliner2-encoder.Q4_K.gguf" ]]; then
-  echo "missing GLiNER encoder weights at $model_dir/gliner2-encoder.Q4_K.gguf" >&2
+if [[ ! -f "$model_dir/gliner2-encoder.Q4_K.gguf" && ! -f "$model_dir/gliner2-encoder.gguf" ]]; then
+  echo "missing GLiNER encoder weights under $model_dir" >&2
   exit 1
 fi
-if [[ ! -f "$model_dir/gliner2-head.Q4_K.gguf" ]]; then
-  echo "missing GLiNER head weights at $model_dir/gliner2-head.Q4_K.gguf" >&2
+if [[ ! -f "$model_dir/gliner2-head.Q4_K.gguf" && ! -f "$model_dir/gliner2-head.gguf" && ! -f "$model_dir/gliner_head.gguf" ]]; then
+  echo "missing GLiNER head weights under $model_dir" >&2
   exit 1
 fi
 
 zig_bin="$(resolve_zig)"
 
-python3 - "$zig_bin" "$model_dir" "$score_tolerance" "$command_timeout" "$warmup_iters" "$measure_iters" "$cuda_artifacts" "$cuda_libraries" "$optimize" "$zig_global_cache_dir" <<'PY'
+python3 - "$zig_bin" "$model_dir" "$score_tolerance" "$command_timeout" "$warmup_iters" "$measure_iters" "$verify_generated_tc" "$cuda_artifacts" "$cuda_libraries" "$optimize" "$zig_global_cache_dir" <<'PY'
 import csv
 import io
 import math
+import os
+import re
 import subprocess
 import sys
 
-zig_bin, model_dir, tolerance_raw, timeout_raw, warmup_iters, measure_iters, cuda_artifacts, cuda_libraries, optimize, zig_global_cache_dir = sys.argv[1:11]
+zig_bin, model_dir, tolerance_raw, timeout_raw, warmup_iters, measure_iters, verify_generated_tc_raw, cuda_artifacts, cuda_libraries, optimize, zig_global_cache_dir = sys.argv[1:12]
 tolerance = float(tolerance_raw)
 timeout = float(timeout_raw)
+verify_generated_tc = verify_generated_tc_raw.lower() in ("1", "true", "yes", "on")
 
 cases = [
     {
@@ -95,14 +99,14 @@ def print_subprocess_output(exc):
     if not output.endswith("\n"):
         sys.stderr.write("\n")
 
-def checked_output(cmd):
+def checked_output(cmd, env=None):
     try:
-        return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=timeout, env=env)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         print_subprocess_output(exc)
         raise
 
-def run_case(backend, case):
+def run_case(backend, case, attention_mode=None):
     cmd = [
         zig_bin,
         "build",
@@ -130,14 +134,32 @@ def run_case(backend, case):
         measure_iters,
         "--format",
         "csv",
+        "--dump-entities",
     ]
     for label in case["labels"]:
         cmd.extend(["--label", label])
 
-    raw = checked_output(cmd)
+    env = None
+    if attention_mode is not None:
+        env = dict(os.environ)
+        env["ANTFLY_INFERENCE_CUDA_DEBERTA_ATTENTION_MODE"] = attention_mode
+    raw = checked_output(cmd, env)
     csv_lines = []
+    entities = []
+    entity_pattern = re.compile(
+        r'^entities\[(\d+)\]\[(\d+)\]: label=(.*?) span=(\d+)\.\.(\d+) score=([-+0-9.eE]+) text="(.*)"$'
+    )
     keep = False
     for line in raw.splitlines():
+        match = entity_pattern.match(line)
+        if match and int(match.group(1)) == 0:
+            entities.append({
+                "label": match.group(3),
+                "start": int(match.group(4)),
+                "end": int(match.group(5)),
+                "score": float(match.group(6)),
+                "text": match.group(7),
+            })
         if line.startswith("task,mode,"):
             csv_lines = [line]
             keep = True
@@ -152,7 +174,26 @@ def run_case(backend, case):
     score_sum = float(warm["score_sum"])
     if entity_count < 0 or not math.isfinite(score_sum):
         raise AssertionError(f"{case['name']} {backend}: invalid row {warm}")
-    return {"entity_count": entity_count, "score_sum": score_sum}
+    generated_calls = int(warm.get("cuda_deberta_generated_tc_attention_calls", "0") or 0)
+    generated_m32_calls = int(warm.get("cuda_deberta_generated_tc_m32_attention_calls", "0") or 0)
+    if attention_mode == "generated-tc" and generated_calls <= 0:
+        raise AssertionError(f"{case['name']} generated-tc: fused tensor-core route was not used: {warm}")
+    if attention_mode == "generated-tc" and generated_m32_calls != generated_calls:
+        raise AssertionError(f"{case['name']} generated-tc: requested M32 schedule silently fell back: {warm}")
+    entities.sort(key=lambda entity: (entity["start"], entity["end"], entity["label"], entity["text"]))
+    return {"entity_count": entity_count, "score_sum": score_sum, "generated_calls": generated_calls, "generated_m32_calls": generated_m32_calls, "entities": entities}
+
+def verify_entities(case_name, reference, candidate, route):
+    reference_keys = [(e["label"], e["start"], e["end"], e["text"]) for e in reference["entities"]]
+    candidate_keys = [(e["label"], e["start"], e["end"], e["text"]) for e in candidate["entities"]]
+    if reference_keys != candidate_keys:
+        raise SystemExit(f"{case_name}: native/{route} entity identities differ: {reference_keys} vs {candidate_keys}")
+    for expected, actual in zip(reference["entities"], candidate["entities"]):
+        score_diff = abs(expected["score"] - actual["score"])
+        if score_diff > tolerance:
+            raise SystemExit(
+                f"{case_name}: native/{route} score diff {score_diff:.8f} exceeds tolerance {tolerance:.8f} for {expected}"
+            )
 
 for case in cases:
     native = run_case("native", case)
@@ -164,8 +205,21 @@ for case in cases:
     )
     if native["entity_count"] != cuda["entity_count"]:
         raise SystemExit(f"{case['name']}: native/cuda entity counts differ: {native} vs {cuda}")
+    verify_entities(case["name"], native, cuda, "cuda")
     if score_diff > tolerance:
         raise SystemExit(f"{case['name']}: native/cuda score diff {score_diff:.8f} exceeds tolerance {tolerance:.8f}")
+    if verify_generated_tc:
+        generated = run_case("cuda", case, "generated-tc")
+        generated_diff = abs(native["score_sum"] - generated["score_sum"])
+        print(
+            f"case={case['name']} generated_tc_entities={generated['entity_count']} generated_tc_score_diff={generated_diff:.8f} generated_tc_calls={generated['generated_calls']}",
+            flush=True,
+        )
+        if native["entity_count"] != generated["entity_count"]:
+            raise SystemExit(f"{case['name']}: native/generated-tc entity counts differ: {native} vs {generated}")
+        verify_entities(case["name"], native, generated, "generated-tc")
+        if generated_diff > tolerance:
+            raise SystemExit(f"{case['name']}: native/generated-tc score diff {generated_diff:.8f} exceeds tolerance {tolerance:.8f}")
 
 print("gliner2 E2E native/cuda parity completed", flush=True)
 PY
