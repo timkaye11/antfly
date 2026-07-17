@@ -908,6 +908,10 @@ fn encoderLayer(
         break :blk normed;
     };
 
+    // attn_normed feeds every FFN branch as input/residual; one deferred
+    // free covers success and error paths alike (mirrors bert.zig).
+    defer cb.free(attn_normed);
+
     // FFN
     timer = profileStart(profile);
     var ffn_i_w_buf: [256]u8 = undefined;
@@ -942,7 +946,6 @@ fn encoderLayer(
                 .eps = eps,
                 .activation = .gelu,
             })) |layer_out| {
-                cb.free(attn_normed);
                 if (profile) |p| p.ffn_output_ns += profileElapsed(timer);
                 return layer_out;
             }
@@ -957,7 +960,6 @@ fn encoderLayer(
             })) |ffn_res| {
                 defer cb.free(ffn_res);
                 const layer_out = try cb.layerNorm(ffn_res, ffn_ln_w, ffn_ln_b, H, eps);
-                cb.free(attn_normed);
                 if (profile) |p| p.ffn_output_ns += profileElapsed(timer);
                 return layer_out;
             }
@@ -977,7 +979,6 @@ fn encoderLayer(
             .eps = eps,
             .activation = .gelu,
         })) |fused| {
-            cb.free(attn_normed);
             if (profile) |p| p.ffn_output_ns += profileElapsed(timer);
             return fused;
         }
@@ -1019,16 +1020,13 @@ fn encoderLayer(
 
     timer = profileStart(profile);
     const out = if (ffn_out_has_residual) blk: {
-        cb.free(attn_normed);
         defer cb.free(ffn_out);
         break :blk try cb.layerNorm(ffn_out, ffn_ln_w, ffn_ln_b, H, eps);
     } else if (try cb.addLayerNorm(ffn_out, attn_normed, ffn_ln_w, ffn_ln_b, H, eps)) |fused| blk: {
-        cb.free(attn_normed);
         cb.free(ffn_out);
         break :blk fused;
     } else blk: {
         const ffn_res = try cb.add(ffn_out, attn_normed);
-        cb.free(attn_normed);
         cb.free(ffn_out);
         defer cb.free(ffn_res);
         break :blk try cb.layerNorm(ffn_res, ffn_ln_w, ffn_ln_b, H, eps);

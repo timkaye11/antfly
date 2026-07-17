@@ -85,6 +85,19 @@ pub const GlinerPipeline = struct {
     session: backends.Session,
     tok: Tokenizer,
     config: GlinerConfig,
+    /// Optional caller-owned guard for backend state shared by pipelines made
+    /// from the same loaded model (Metal frames and resident linear slots are
+    /// per-session state). Tokenization and postprocessing stay parallel;
+    /// only device/session execution is serialized.
+    execution_lock: ?*std.atomic.Mutex = null,
+
+    fn lockedSessionRun(self: *GlinerPipeline, inputs: []const Tensor, alloc: std.mem.Allocator) ![]Tensor {
+        if (self.execution_lock) |lock| {
+            platform.sync.lockYielding(lock);
+        }
+        defer if (self.execution_lock) |lock| lock.unlock();
+        return self.session.run(inputs, alloc);
+    }
 
     pub fn usesDistributedGpuHosted(self: *const GlinerPipeline) bool {
         return self.config.distributed.enabled and
@@ -421,7 +434,7 @@ pub const GlinerPipeline = struct {
         const pack_ms = glinerProfileElapsedMs(pack_start_ns);
 
         const session_start_ns = glinerProfileStart(profile_enabled);
-        const outputs = try self.session.run(&.{
+        const outputs = try self.lockedSessionRun(&.{
             input_ids_tensor,
             attention_mask_tensor,
             words_mask_tensor,
@@ -559,7 +572,7 @@ pub const GlinerPipeline = struct {
         var span_idx_tensor = try Tensor.initInt64(alloc, "span_idx", &span_shape, row.span_idx);
         defer span_idx_tensor.deinit();
 
-        const outputs = try self.session.run(&.{
+        const outputs = try self.lockedSessionRun(&.{
             input_ids_tensor,
             attention_mask_tensor,
             text_positions_tensor,
@@ -1129,7 +1142,7 @@ pub const GlinerPipeline = struct {
         var span_idx_tensor = try Tensor.initInt64(alloc, "span_idx", &span_shape, span_idx_buf);
         defer span_idx_tensor.deinit();
 
-        const outputs = try self.session.run(&.{
+        const outputs = try self.lockedSessionRun(&.{
             input_ids_tensor,
             attention_mask_tensor,
             words_mask_tensor,

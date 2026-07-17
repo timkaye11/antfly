@@ -1105,6 +1105,10 @@ pub const ComputeBackend = struct {
         /// takes the first encoder hidden row by a host words_mask into
         /// [batch * num_words, hidden_size].
         glinerWordEmbeddings: ?*const fn (ctx: *anyopaque, request: *const GlinerWordEmbeddingsRequest) anyerror!?CT = null,
+        // Optional backend hint: prefer dense mirrors for eager-path quantized
+        // linears (set by architectures whose eager weights are hot GEMMs, e.g.
+        // the GLiNER span head). No-op on backends without the concept.
+        preferEagerQuantMirrors: ?*const fn (ctx: *anyopaque, enabled: bool) void = null,
 
         /// GLiNER-specific CountLSTM GRU step plus skip connection:
         /// returns `gru(label_embeddings, pos0) + label_embeddings` as
@@ -2175,6 +2179,10 @@ pub const ComputeBackend = struct {
             });
         }
         return null;
+    }
+
+    pub fn preferEagerQuantMirrors(self: *const ComputeBackend, enabled: bool) void {
+        if (self.vtable.preferEagerQuantMirrors) |op| op(self.ptr, enabled);
     }
 
     pub fn glinerWordEmbeddings(self: *const ComputeBackend, hidden: CT, words_mask: []const i64, batch: usize, seq_len: usize, hidden_size: usize, num_words: usize) !?CT {

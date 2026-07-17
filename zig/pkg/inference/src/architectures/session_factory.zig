@@ -5874,6 +5874,11 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
                 return result;
             }
 
+            // The span head's quantized MLP weights run through the eager
+            // linear path at thousands of rows; dense f16 MPS mirrors are a
+            // measured win there. Scoped to GLiNER so other models' eager
+            // quantized linears keep their existing numerics and memory.
+            cb.preferEagerQuantMirrors(true);
             const hidden = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
             defer cb.free(hidden);
 

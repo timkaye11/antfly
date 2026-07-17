@@ -722,7 +722,6 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> deberta_relative_score_gemm_f32_pipeline;
     id<MTLComputePipelineState> deberta_relative_score_softmax_pv_f32_pipeline;
     id<MTLComputePipelineState> transpose_f32_pipeline;
-    id<MTLComputePipelineState> concat_cols_f32_pipeline;
     id<MTLComputePipelineState> dot_general_2d_f32_pipeline;
     id<MTLComputePipelineState> dot_general_batched_f32_pipeline;
     id<MTLComputePipelineState> conv1d_f32_pipeline;
@@ -4079,13 +4078,6 @@ typedef struct termite_metal_transpose_f32_params {
     uint32_t perm[8];
 } termite_metal_transpose_f32_params;
 
-typedef struct termite_metal_concat_cols_f32_params {
-    uint32_t total;
-    uint32_t dim_a;
-    uint32_t dim_b;
-    uint32_t reserved0;
-} termite_metal_concat_cols_f32_params;
-
 typedef struct termite_metal_dot_general_2d_f32_params {
     uint32_t m;
     uint32_t n;
@@ -4197,7 +4189,6 @@ static NSString *termite_metal_shader_source(void) {
            "struct termite_metal_disentangled_relative_attention_f32_params { uint batch; uint seq_len; uint num_heads; uint head_dim; uint has_mask; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_deberta_relative_score_gemm_f32_params { uint batch; uint seq_len; uint rel_len; uint num_heads; uint head_dim; uint mode; uint reserved0; uint reserved1; };\n"
            "struct termite_metal_transpose_f32_params { uint rank; uint total; uint reserved0; uint reserved1; uint dims[8]; uint in_strides[8]; uint out_strides[8]; uint perm[8]; };\n"
-           "struct termite_metal_concat_cols_f32_params { uint total; uint dim_a; uint dim_b; uint reserved0; };\n"
            "struct termite_metal_dot_general_2d_f32_params { uint m; uint n; uint k; uint rhs_contract_axis; };\n"
            "struct termite_metal_dot_general_batched_f32_params { uint batch_count; uint m; uint n; uint k; uint rhs_contract_axis; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_conv1d_f32_params { uint batch; uint in_channels; uint out_channels; uint time_steps; uint kernel_size; uint stride; uint padding; uint out_time; uint has_bias; uint reserved0; uint reserved1; uint reserved2; };\n"
@@ -6787,11 +6778,6 @@ static NSString *termite_metal_shader_source(void) {
            "    uint rem = gid; uint flat_in = 0u;\n"
            "    for (uint axis = 0u; axis < p.rank; ++axis) { uint stride = p.out_strides[axis]; uint coord = stride == 0u ? 0u : rem / stride; if (stride != 0u) rem -= coord * stride; uint in_axis = p.perm[axis]; if (in_axis >= p.rank) return; flat_in += coord * p.in_strides[in_axis]; }\n"
            "    output[gid] = input[flat_in];\n"
-           "}\n"
-           "kernel void termite_concat_cols_f32(device const float *a [[buffer(0)]], device const float *b [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_concat_cols_f32_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
-           "    uint out_dim = p.dim_a + p.dim_b; uint total_elems = p.total * out_dim; if (gid >= total_elems || out_dim == 0u) return;\n"
-           "    uint row = gid / out_dim; uint col = gid - row * out_dim;\n"
-           "    output[gid] = col < p.dim_a ? a[row * p.dim_a + col] : b[row * p.dim_b + (col - p.dim_a)];\n"
            "}\n"
            "kernel void termite_dot_general_2d_f32(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_dot_general_2d_f32_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.m * p.n; if (gid >= total || p.k == 0u) return; uint row = gid / p.n; uint col = gid - row * p.n; float acc = 0.0f;\n"
@@ -16588,7 +16574,6 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->deberta_relative_score_gemm_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_deberta_relative_score_gemm_f32");
         runtime->deberta_relative_score_softmax_pv_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_deberta_relative_score_softmax_pv_f32");
         runtime->transpose_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_transpose_f32");
-        runtime->concat_cols_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_concat_cols_f32");
         runtime->dot_general_2d_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_dot_general_2d_f32");
         runtime->dot_general_batched_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_dot_general_batched_f32");
         runtime->conv1d_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_conv1d_f32");
@@ -30756,7 +30741,8 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
         {
             const size_t rel_score_count = batch * num_heads * seq_len * rel_len;
             const size_t cc_score_count = batch * num_heads * seq_len * seq_len;
-            if (rel_score_count <= SIZE_MAX / sizeof(float) && cc_score_count <= SIZE_MAX / sizeof(float)) {
+            if (rel_score_count <= SIZE_MAX / sizeof(float) && cc_score_count <= SIZE_MAX / sizeof(float) &&
+                cc_score_count <= UINT32_MAX && rel_score_count <= UINT32_MAX) {
                 const size_t cc_score_bytes = cc_score_count * sizeof(float);
                 const size_t rel_score_bytes = rel_score_count * sizeof(float);
                 const size_t gemm_slots[3] = {
@@ -30933,61 +30919,6 @@ int termite_metal_decode_runtime_transpose_f32_device(
            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->transpose_f32_pipeline, total), 1, 1)];
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -8);
-    }
-}
-
-int termite_metal_decode_runtime_concat_cols_f32_device(
-    termite_metal_decode_runtime *runtime,
-    void *a_handle,
-    size_t a_offset,
-    void *b_handle,
-    size_t b_offset,
-    size_t total,
-    size_t dim_a,
-    size_t dim_b,
-    void *output_handle,
-    size_t output_offset
-) {
-    if (runtime == NULL || a_handle == NULL || b_handle == NULL || output_handle == NULL) return -1;
-    if (runtime->concat_cols_f32_pipeline == nil) return -2;
-    const size_t out_dim = dim_a + dim_b;
-    if (total == 0 || dim_a == 0 || dim_b == 0) return -3;
-    const size_t total_elems = total * out_dim;
-    if (total_elems > UINT32_MAX || total > UINT32_MAX || dim_a > UINT32_MAX || dim_b > UINT32_MAX) return -3;
-    @autoreleasepool {
-        id<MTLBuffer> a_buffer = (__bridge id<MTLBuffer>)a_handle;
-        id<MTLBuffer> b_buffer = (__bridge id<MTLBuffer>)b_handle;
-        id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
-        if (a_offset + total * dim_a * sizeof(float) > a_buffer.length) return -4;
-        if (b_offset + total * dim_b * sizeof(float) > b_buffer.length) return -5;
-        if (output_offset + total_elems * sizeof(float) > output_buffer.length) return -6;
-        termite_metal_concat_cols_f32_params params = {
-            .total = (uint32_t)total,
-            .dim_a = (uint32_t)dim_a,
-            .dim_b = (uint32_t)dim_b,
-            .reserved0 = 0,
-        };
-        bool frame_owned = true;
-        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
-        if (command_buffer == nil) return -7;
-        if (!frame_owned) {
-            if (termite_metal_decode_runtime_retain_frame_resource(runtime, a_buffer) != 0 ||
-                termite_metal_decode_runtime_retain_frame_resource(runtime, b_buffer) != 0 ||
-                termite_metal_decode_runtime_retain_frame_resource(runtime, output_buffer) != 0) {
-                return -7;
-            }
-        }
-        id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (encoder == nil) return -8;
-        [encoder setComputePipelineState:runtime->concat_cols_f32_pipeline];
-        [encoder setBuffer:a_buffer offset:a_offset atIndex:0];
-        [encoder setBuffer:b_buffer offset:b_offset atIndex:1];
-        [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
-        [encoder setBytes:&params length:sizeof(params) atIndex:3];
-        [encoder dispatchThreads:MTLSizeMake(total_elems, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->concat_cols_f32_pipeline, total_elems), 1, 1)];
-        [encoder endEncoding];
-        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
     }
 }
 

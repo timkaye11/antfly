@@ -903,6 +903,7 @@ pub const LoadedModel = struct {
     // frames and backend caches are independently owned and proven concurrent.
     embedding_session_lock: std.atomic.Mutex = .unlocked,
     reranking_session_lock: std.atomic.Mutex = .unlocked,
+    recognize_session_lock: std.atomic.Mutex = .unlocked,
     vision_session: ?backends.Session = null,
     audio_session: ?backends.Session = null,
     text_projection: ?backends.Session = null,
@@ -1190,6 +1191,7 @@ pub const LoadedModel = struct {
             .allocator = allocator,
             .session = self.session,
             .tok = tok,
+            .execution_lock = &self.recognize_session_lock,
             .config = .{
                 .max_width = self.manifest.gliner_max_width,
                 .max_length = self.manifest.max_position_embeddings,

@@ -96,6 +96,17 @@ test "metal_compute paged slot attention accepts kernel supported kv formats" {
     try std.testing.expect(!metalPagedAttentionKvFormatSupported(5));
 }
 
+// Warn exactly once per process when a device fast path silently re-engages
+// its host fallback; without this the GLiNER span head can quietly fall off
+// the GPU (the exact regression the device concat/word-gather work fixed)
+// with no operator-visible signal.
+var host_fallback_warned = [_]std.atomic.Value(bool){ std.atomic.Value(bool).init(false), std.atomic.Value(bool).init(false) };
+
+fn warnHostFallbackOnce(comptime index: usize, comptime what: []const u8) void {
+    if (host_fallback_warned[index].swap(true, .monotonic)) return;
+    std.log.warn("metal {s} fell back to the host path; device fast path inactive (first occurrence, logged once)", .{what});
+}
+
 fn getenvBool(comptime name: [*:0]const u8) bool {
     if (comptime @import("builtin").os.tag == .freestanding) return false;
     // Per-name cache: several callers sit in the decode inner loop and a raw
@@ -539,6 +550,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     attention_mask_seq_len: usize = 0,
     zero_bias_cache: std.AutoHashMapUnmanaged(usize, []f32) = .empty,
     dynamic_linear_slots: std.AutoHashMapUnmanaged(DynamicLinearSlotKey, usize) = .empty,
+    eager_quant_mirrors_preferred: bool = false,
     dynamic_layer_norm_slots: std.AutoHashMapUnmanaged(DynamicLayerNormSlotKey, usize) = .empty,
     dynamic_rms_norm_slots: std.AutoHashMapUnmanaged(DynamicRmsNormSlotKey, usize) = .empty,
     next_dynamic_linear_slot: usize = metal_runtime.decoder_runtime_linear_slot_capacity,
@@ -2813,6 +2825,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var zero_it = self.zero_bias_cache.iterator();
         while (zero_it.next()) |entry| self.allocator.free(entry.value_ptr.*);
         self.zero_bias_cache.deinit(self.allocator);
+        // Dynamic slots are keyed per backend instance while the slot pool
+        // lives on the shared provider: release ours so per-request backends
+        // cannot strand prepared weights (and their dense mirrors) until the
+        // pool exhausts.
+        var dynamic_slot_it = self.dynamic_linear_slots.valueIterator();
+        while (dynamic_slot_it.next()) |slot| {
+            metal_runtime.clearRawLinearSlot(self.provider_impl, slot.*);
+        }
         self.dynamic_linear_slots.deinit(self.allocator);
         self.dynamic_layer_norm_slots.deinit(self.allocator);
         self.dynamic_rms_norm_slots.deinit(self.allocator);
@@ -3219,7 +3239,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // f16 MPS mirror the preplanned encoder slots get; without it they run
         // the handwritten large-row quant reduce. Per-weight 32 MB cap keeps
         // pathological weights (embeddings/vocab) on the quantized path.
-        const dense_mirror = retain_dense_fallback and
+        const dense_mirror = retain_dense_fallback and self.eager_quant_mirrors_preferred and
             !getenvBool("TERMITE_METAL_DISABLE_DYNAMIC_SLOT_MIRRORS");
         if (!(try decoderRuntimePrepareLinearOp(self, &.{
             .slot = slot,
@@ -7666,8 +7686,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     // First-subtoken word gather for the GLiNER head: resolves each (batch,
     // word) to the absolute hidden row of its first token on the host, then
     // reuses the axis-0 gather the takeRows op dispatches. Words with no
-    // tokens (the CPU path zero-fills them) fall back to the host
-    // implementation rather than growing a dedicated zero-fill kernel.
+    // tokens (ragged batches; the CPU path zero-fills them) gather an
+    // out-of-range row, which the kernel zero-fills.
+    fn preferEagerQuantMirrorsOp(ctx: *anyopaque, enabled: bool) void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        self.eager_quant_mirrors_preferred = enabled;
+    }
+
     fn glinerWordEmbeddingsOp(ctx: *anyopaque, request: *const ops.GlinerWordEmbeddingsRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (getenvBool("TERMITE_METAL_DISABLE_GLINER_HEAD_DEVICE")) return null;
@@ -7697,16 +7722,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 row_ids[slot_index] = @intCast(b * request.seq_len + t);
             }
         }
-        for (row_ids) |row_id| {
-            if (row_id == sentinel) return null;
-        }
-
-        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        const runtime = self.provider_impl.raw_decode_runtime orelse {
+            warnHostFallbackOnce(1, "gliner word gather");
+            return null;
+        };
         var input_tensor = try self.ownedDeviceMetalTensorFromCt(request.hidden);
         defer input_tensor.deinit();
         const index_values = try self.allocator.alloc(f32, out_rows);
         defer self.allocator.free(index_values);
-        for (row_ids, 0..) |row_id, index| index_values[index] = @floatFromInt(row_id);
+        for (row_ids, 0..) |row_id, index| {
+            // Missing words (ragged batches) map to an out-of-range row; the
+            // gather kernel zero-fills those, matching the CPU path.
+            index_values[index] = if (row_id == sentinel)
+                @floatFromInt(token_count)
+            else
+                @floatFromInt(row_id);
+        }
         const index_shape = [_]i32{@intCast(out_rows)};
         var index_tensor = try MetalTensor.deviceAllocate(
             @ptrCast(runtime),
@@ -7727,6 +7758,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             out_rows,
             &output_shape,
         )) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+        warnHostFallbackOnce(1, "gliner word gather");
         return null;
     }
 
@@ -8212,9 +8244,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (a_buf.metal_tensor) |*a_metal| {
                 if (b_buf.metal_tensor) |*b_metal| {
                     if (a_metal.isDevice() and b_metal.isDevice()) {
-                        if (try metal_runtime.deviceConcatColumns2DF32(self.provider_impl, a_metal.*, b_metal.*, total, dim_a, dim_b)) |tensor| {
+                        const out_shape = [_]i32{ @intCast(total), @intCast(dim_a + dim_b) };
+                        if (try metal_runtime.decoderRuntimeConcatLastDimF32_2DDevice(self.provider_impl, a_metal.*, b_metal.*, total, dim_a, dim_b, &out_shape)) |tensor| {
                             return self.ctFromOwnedMetalTensor(tensor);
                         }
+                        warnHostFallbackOnce(0, "multi-row concat");
                     }
                 }
             }
@@ -20251,10 +20285,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             freeOp(ctx, first);
             return null;
         };
-        errdefer {
-            freeOp(ctx, first);
-            freeOp(ctx, second);
-        }
+        // `first` is already covered by the errdefer above; freeing it here
+        // too would double-free on an error from the V projection.
+        errdefer freeOp(ctx, second);
         const third = (try decoderRuntimeApplyLinearOp(ctx, &.{
             .slot = request.v_slot,
             .input = request.input,
@@ -20415,6 +20448,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.embeddingLookup = embeddingLookupOp;
         vt.takeRows = takeRowsOp;
         vt.glinerWordEmbeddings = glinerWordEmbeddingsOp;
+        vt.preferEagerQuantMirrors = preferEagerQuantMirrorsOp;
         vt.gelu = geluOp;
         vt.geluNew = geluNewOp;
         vt.relu = reluOp;
@@ -23634,5 +23668,121 @@ test "metal_compute: causal self attention is owned by metal backend" {
     };
     for (expected, out_data) |expected_value, actual_value| {
         try std.testing.expectApproxEqAbs(expected_value, actual_value, 1e-4);
+    }
+}
+
+test "metal_compute: multi-row concat stays on device and matches host reference" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+    const runtime = metal_compute.provider_impl.raw_decode_runtime orelse return error.SkipZigTest;
+
+    const rows: usize = 5;
+    const dim_a: usize = 3;
+    const dim_b: usize = 4;
+    var a_data: [rows * dim_a]f32 = undefined;
+    var b_data: [rows * dim_b]f32 = undefined;
+    for (&a_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 7) % 29)) - 14)) / 13.0;
+    for (&b_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 11) % 31)) - 15)) / 11.0;
+
+    const a_shape = [_]i32{ @intCast(rows), @intCast(dim_a) };
+    var a_dev = try MetalTensor.deviceAllocate(@ptrCast(runtime), a_data.len * @sizeOf(f32), .shared, &a_shape);
+    errdefer a_dev.deinit();
+    try MetalTensor.borrowed(&a_data, a_data.len, &a_shape).copyInto(&a_dev);
+    const a_ct = try metal_compute.ctFromOwnedMetalTensor(a_dev);
+    defer metal_cb.free(a_ct);
+
+    const b_shape = [_]i32{ @intCast(rows), @intCast(dim_b) };
+    var b_dev = try MetalTensor.deviceAllocate(@ptrCast(runtime), b_data.len * @sizeOf(f32), .shared, &b_shape);
+    errdefer b_dev.deinit();
+    try MetalTensor.borrowed(&b_data, b_data.len, &b_shape).copyInto(&b_dev);
+    const b_ct = try metal_compute.ctFromOwnedMetalTensor(b_dev);
+    defer metal_cb.free(b_ct);
+
+    const out_ct = try metal_cb.concat(a_ct, b_ct, rows, dim_a, dim_b);
+    defer metal_cb.free(out_ct);
+    // The multi-row device path must engage: the result stays device-resident
+    // rather than falling back to the host memcpy loop.
+    const out_buf = MetalCompute.toBuf(out_ct);
+    try std.testing.expect(out_buf.metal_tensor != null and out_buf.metal_tensor.?.isDevice());
+
+    const out_f32 = try metal_cb.toFloat32(out_ct, allocator);
+    defer allocator.free(out_f32);
+    try std.testing.expectEqual(rows * (dim_a + dim_b), out_f32.len);
+    for (0..rows) |row| {
+        for (0..dim_a) |col| {
+            try std.testing.expectApproxEqAbs(a_data[row * dim_a + col], out_f32[row * (dim_a + dim_b) + col], 1e-6);
+        }
+        for (0..dim_b) |col| {
+            try std.testing.expectApproxEqAbs(b_data[row * dim_b + col], out_f32[row * (dim_a + dim_b) + dim_a + col], 1e-6);
+        }
+    }
+}
+
+test "metal_compute: gliner word embeddings gather matches CPU semantics on ragged batches" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+    const runtime = metal_compute.provider_impl.raw_decode_runtime orelse return error.SkipZigTest;
+
+    const batch: usize = 2;
+    const seq_len: usize = 6;
+    const hidden_size: usize = 4;
+    // Item 0 has words 1..3; item 1 has only words 1..2 (ragged) so word 3 of
+    // item 1 must be zero-filled, matching extractWordEmbeddings.
+    const words_mask = [_]i64{
+        1, 1, 2, 3, 3, 0,
+        1, 2, 2, 0, 0, 0,
+    };
+    const num_words: usize = 3;
+
+    var hidden_data: [batch * seq_len * hidden_size]f32 = undefined;
+    for (&hidden_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 13) % 37)) - 18)) / 17.0;
+
+    const hidden_shape = [_]i32{ @intCast(batch * seq_len), @intCast(hidden_size) };
+    var hidden_dev = try MetalTensor.deviceAllocate(@ptrCast(runtime), hidden_data.len * @sizeOf(f32), .shared, &hidden_shape);
+    errdefer hidden_dev.deinit();
+    try MetalTensor.borrowed(&hidden_data, hidden_data.len, &hidden_shape).copyInto(&hidden_dev);
+    const hidden_ct = try metal_compute.ctFromOwnedMetalTensor(hidden_dev);
+    defer metal_cb.free(hidden_ct);
+
+    const word_ct = (try metal_cb.glinerWordEmbeddings(hidden_ct, &words_mask, batch, seq_len, hidden_size, num_words)) orelse
+        return error.DeviceWordGatherFellBack;
+    defer metal_cb.free(word_ct);
+
+    const actual = try metal_cb.toFloat32(word_ct, allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqual(batch * num_words * hidden_size, actual.len);
+
+    // CPU reference: first token of each word wins; missing words stay zero.
+    var expected = [_]f32{0.0} ** (batch * num_words * hidden_size);
+    var seen = [_]bool{false} ** (batch * num_words);
+    for (0..batch) |b| {
+        for (0..seq_len) |t| {
+            const word_id = words_mask[b * seq_len + t];
+            if (word_id <= 0) continue;
+            const w: usize = @intCast(word_id - 1);
+            if (w >= num_words) continue;
+            if (seen[b * num_words + w]) continue;
+            seen[b * num_words + w] = true;
+            const src = (b * seq_len + t) * hidden_size;
+            const dst = (b * num_words + w) * hidden_size;
+            @memcpy(expected[dst..][0..hidden_size], hidden_data[src..][0..hidden_size]);
+        }
+    }
+    for (expected, actual) |expected_value, actual_value| {
+        try std.testing.expectApproxEqAbs(expected_value, actual_value, 1e-6);
     }
 }

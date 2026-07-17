@@ -69,6 +69,7 @@ const Options = struct {
     format: OutputFormat = .text,
     task: BenchTask = .entities,
     dump_entities: bool = false,
+    ragged: bool = false,
     labels: std.ArrayListUnmanaged([]const u8) = .empty,
     relation_labels: std.ArrayListUnmanaged([]const u8) = .empty,
 
@@ -153,6 +154,35 @@ pub fn main(init: std.process.Init) !void {
     const texts = try allocator.alloc([]const u8, opts.batch_size);
     defer allocator.free(texts);
     @memset(texts, bench_text);
+    var ragged_texts = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (ragged_texts.items) |item| allocator.free(item);
+        ragged_texts.deinit(allocator);
+    }
+    if (opts.ragged and opts.batch_size > 1) {
+        // Real batches are ragged: give item i the first (i+1)/B fraction of
+        // the words so per-item word counts differ (exercises the zero-filled
+        // word slots in the batched head path).
+        for (texts, 0..) |*slot, index| {
+            var word_count: usize = 0;
+            var word_it = std.mem.tokenizeScalar(u8, bench_text, ' ');
+            while (word_it.next()) |_| word_count += 1;
+            const keep = @max(1, word_count * (index + 1) / opts.batch_size);
+            var end: usize = bench_text.len;
+            var seen: usize = 0;
+            var it = std.mem.tokenizeScalar(u8, bench_text, ' ');
+            while (it.next()) |word| {
+                seen += 1;
+                if (seen == keep) {
+                    end = @intFromPtr(word.ptr) - @intFromPtr(bench_text.ptr) + word.len;
+                    break;
+                }
+            }
+            const copy = try allocator.dupe(u8, bench_text[0..end]);
+            try ragged_texts.append(allocator, copy);
+            slot.* = copy;
+        }
+    }
     const labels: ?[]const []const u8 = if (opts.labels.items.len > 0) opts.labels.items else null;
     const relation_labels: ?[]const []const u8 = if (opts.relation_labels.items.len > 0) opts.relation_labels.items else null;
 
@@ -514,6 +544,8 @@ fn parseArgs(allocator: std.mem.Allocator, init: std.process.Init) !Options {
             opts.format = parseFormat(args.next() orelse return error.MissingFormat) orelse return error.InvalidFormat;
         } else if (std.mem.eql(u8, arg, "--dump-entities")) {
             opts.dump_entities = true;
+        } else if (std.mem.eql(u8, arg, "--ragged")) {
+            opts.ragged = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             std.process.exit(0);
