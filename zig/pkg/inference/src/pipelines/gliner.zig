@@ -323,6 +323,63 @@ pub const GlinerPipeline = struct {
         label_major_scores,
     };
 
+    const BatchOutputLayout = struct {
+        num_words: usize,
+        max_width: usize,
+        num_labels: usize,
+        row_stride: usize,
+    };
+
+    fn validateBatchOutputLayout(
+        output_shape: []const i64,
+        logits_len: usize,
+        batch: usize,
+        expected_num_words: usize,
+        expected_max_width: usize,
+        requested_labels: usize,
+    ) !BatchOutputLayout {
+        if (output_shape.len != 3 and output_shape.len != 4) return error.UnexpectedOutputShape;
+        const output_batch = nonNegativeDim(output_shape[0]) catch return error.UnexpectedOutputShape;
+        if (output_batch != batch) return error.UnexpectedOutputShape;
+
+        var num_words = expected_num_words;
+        var max_width = expected_max_width;
+        const output_labels: usize = if (output_shape.len == 4) labels: {
+            num_words = nonNegativeDim(output_shape[1]) catch return error.UnexpectedOutputShape;
+            max_width = nonNegativeDim(output_shape[2]) catch return error.UnexpectedOutputShape;
+            break :labels nonNegativeDim(output_shape[3]) catch return error.UnexpectedOutputShape;
+        } else labels: {
+            const output_spans = nonNegativeDim(output_shape[1]) catch return error.UnexpectedOutputShape;
+            const expected_spans = std.math.mul(usize, expected_num_words, expected_max_width) catch
+                return error.UnexpectedOutputShape;
+            if (output_spans != expected_spans) return error.UnexpectedOutputShape;
+            break :labels nonNegativeDim(output_shape[2]) catch return error.UnexpectedOutputShape;
+        };
+        if (num_words == 0 or
+            max_width == 0 or
+            num_words != expected_num_words or
+            max_width != expected_max_width or
+            output_labels != requested_labels)
+        {
+            return error.UnexpectedOutputShape;
+        }
+
+        const row_stride = std.math.mul(
+            usize,
+            std.math.mul(usize, num_words, max_width) catch return error.UnexpectedOutputShape,
+            output_labels,
+        ) catch return error.UnexpectedOutputShape;
+        const expected_logits = std.math.mul(usize, batch, row_stride) catch return error.UnexpectedOutputShape;
+        if (logits_len != expected_logits) return error.UnexpectedOutputShape;
+
+        return .{
+            .num_words = num_words,
+            .max_width = max_width,
+            .num_labels = requested_labels,
+            .row_stride = row_stride,
+        };
+    }
+
     fn recognizeWithLabelTokenBatch(
         self: *GlinerPipeline,
         texts: []const []const u8,
@@ -505,21 +562,14 @@ pub const GlinerPipeline = struct {
         const logits = output.asFloat32();
         const output_shape = output.shape;
 
-        var num_labels_dim: usize = labels.len;
-        var output_num_words: usize = max_num_words;
-        var output_max_width: usize = max_width;
-        var row_stride: usize = try checkedSizeMul(batch_num_spans, num_labels_dim);
-        if (output_shape.len >= 4) {
-            output_num_words = try nonNegativeDim(output_shape[1]);
-            output_max_width = try nonNegativeDim(output_shape[2]);
-            num_labels_dim = try nonNegativeDim(output_shape[3]);
-            row_stride = try checkedSizeMul(try checkedSizeMul(output_num_words, output_max_width), num_labels_dim);
-        } else if (output_shape.len == 3) {
-            const output_spans = try nonNegativeDim(output_shape[1]);
-            num_labels_dim = try nonNegativeDim(output_shape[2]);
-            row_stride = try checkedSizeMul(output_spans, num_labels_dim);
-        }
-        if (num_labels_dim > labels.len) num_labels_dim = labels.len;
+        const output_layout = try validateBatchOutputLayout(
+            output_shape,
+            logits.len,
+            batch,
+            max_num_words,
+            max_width,
+            labels.len,
+        );
 
         const decode_start_ns = glinerProfileStart(profile_enabled);
         const first_result_by_prepared = try alloc.alloc(?usize, prepared_len);
@@ -530,15 +580,15 @@ pub const GlinerPipeline = struct {
             results[i] = if (first_result_by_prepared[prepared_i] != null)
                 try cloneEntities(alloc, results[first_result_by_prepared[prepared_i].?])
             else blk: {
-                const row_start = @min(try checkedSizeMul(i, row_stride), logits.len);
-                const row_end = @min(try checkedSizeAdd(row_start, row_stride), logits.len);
+                const row_start = try checkedSizeMul(i, output_layout.row_stride);
+                const row_end = try checkedSizeAdd(row_start, output_layout.row_stride);
                 break :blk try self.decodeEntitiesFromLogits(
                     row,
                     labels,
                     logits[row_start..row_end],
-                    output_num_words,
-                    output_max_width,
-                    num_labels_dim,
+                    output_layout.num_words,
+                    output_layout.max_width,
+                    output_layout.num_labels,
                     threshold,
                     flat_ner,
                     .word_major_logits,
@@ -656,10 +706,21 @@ pub const GlinerPipeline = struct {
         if (output_shape.len != 4 and output_shape.len != 3) return error.UnexpectedOutputShape;
 
         const dim_offset: usize = if (output_shape.len == 4) 1 else 0;
-        var num_labels_dim: usize = @intCast(output_shape[dim_offset]);
-        if (num_labels_dim > labels.len) num_labels_dim = labels.len;
-        const output_num_words: usize = @intCast(output_shape[dim_offset + 1]);
-        const output_max_width: usize = @intCast(output_shape[dim_offset + 2]);
+        if (output_shape.len == 4 and (nonNegativeDim(output_shape[0]) catch return error.UnexpectedOutputShape) != 1) {
+            return error.UnexpectedOutputShape;
+        }
+        const output_labels = nonNegativeDim(output_shape[dim_offset]) catch return error.UnexpectedOutputShape;
+        const output_num_words = nonNegativeDim(output_shape[dim_offset + 1]) catch return error.UnexpectedOutputShape;
+        const output_max_width = nonNegativeDim(output_shape[dim_offset + 2]) catch return error.UnexpectedOutputShape;
+        if (output_labels < labels.len or output_num_words == 0 or output_max_width == 0) {
+            return error.UnexpectedOutputShape;
+        }
+        const expected_scores = std.math.mul(
+            usize,
+            std.math.mul(usize, output_labels, output_num_words) catch return error.UnexpectedOutputShape,
+            output_max_width,
+        ) catch return error.UnexpectedOutputShape;
+        if (scores.len != expected_scores) return error.UnexpectedOutputShape;
 
         return self.decodeEntitiesFromLogits(
             row,
@@ -667,7 +728,7 @@ pub const GlinerPipeline = struct {
             scores,
             output_num_words,
             output_max_width,
-            num_labels_dim,
+            labels.len,
             threshold,
             flat_ner,
             .label_major_scores,
@@ -1083,7 +1144,11 @@ pub const GlinerPipeline = struct {
 
         try splitIntoWords(alloc, text, &words, &word_starts, &word_ends);
         const num_words = words.items.len;
-        if (num_words == 0) return try alloc.alloc(f32, 0);
+        if (num_words == 0) {
+            const scores = try alloc.alloc(f32, labels.len);
+            @memset(scores, 0);
+            return scores;
+        }
 
         var schema_ids = std.ArrayListUnmanaged(i32).empty;
         defer schema_ids.deinit(alloc);
@@ -1230,15 +1295,15 @@ pub const GlinerPipeline = struct {
         const logits = output.asFloat32();
         const output_shape = output.shape;
 
-        var num_labels_dim: usize = labels.len;
-        if (output_shape.len >= 4) {
-            num_labels_dim = @intCast(output_shape[3]);
-        } else if (output_shape.len == 3) {
-            num_labels_dim = @intCast(output_shape[2]);
-        }
-        if (num_labels_dim > labels.len) num_labels_dim = labels.len;
-
-        return scoreLabelsFromLogits(alloc, logits, num_labels_dim);
+        const output_layout = try validateBatchOutputLayout(
+            output_shape,
+            logits.len,
+            1,
+            actual_num_words,
+            max_width,
+            labels.len,
+        );
+        return scoreLabelsFromLogits(alloc, logits, output_layout.num_labels);
     }
 
     pub fn supportsClassification(self: *const GlinerPipeline) bool {
@@ -1658,6 +1723,55 @@ test "scoreLabelsFromLogits returns sigmoid of max logit per label" {
 
     try std.testing.expectApproxEqAbs(sigmoid(0.7), scores[0], 1e-6);
     try std.testing.expectApproxEqAbs(sigmoid(1.2), scores[1], 1e-6);
+}
+
+test "gliner batch output validation rejects incomplete backend results" {
+    const layout = try GlinerPipeline.validateBatchOutputLayout(&.{ 2, 3, 4, 3 }, 72, 2, 3, 4, 3);
+    try std.testing.expectEqual(@as(usize, 3), layout.num_words);
+    try std.testing.expectEqual(@as(usize, 4), layout.max_width);
+    try std.testing.expectEqual(@as(usize, 3), layout.num_labels);
+    try std.testing.expectEqual(@as(usize, 36), layout.row_stride);
+
+    try std.testing.expectError(
+        error.UnexpectedOutputShape,
+        GlinerPipeline.validateBatchOutputLayout(&.{ 1, 3, 4, 3 }, 36, 2, 3, 4, 3),
+    );
+    try std.testing.expectError(
+        error.UnexpectedOutputShape,
+        GlinerPipeline.validateBatchOutputLayout(&.{ 2, 3, 4, 3 }, 71, 2, 3, 4, 3),
+    );
+    try std.testing.expectError(
+        error.UnexpectedOutputShape,
+        GlinerPipeline.validateBatchOutputLayout(&.{ 2, 3, 4, 2 }, 48, 2, 3, 4, 3),
+    );
+    try std.testing.expectError(
+        error.UnexpectedOutputShape,
+        GlinerPipeline.validateBatchOutputLayout(&.{ 2, 3, 4, 4 }, 96, 2, 3, 4, 3),
+    );
+    try std.testing.expectError(
+        error.UnexpectedOutputShape,
+        GlinerPipeline.validateBatchOutputLayout(&.{ 2, 2, 4, 3 }, 48, 2, 3, 4, 3),
+    );
+    try std.testing.expectError(
+        error.UnexpectedOutputShape,
+        GlinerPipeline.validateBatchOutputLayout(&.{ 2, 3, 2, 3 }, 36, 2, 3, 4, 3),
+    );
+    try std.testing.expectError(
+        error.UnexpectedOutputShape,
+        GlinerPipeline.validateBatchOutputLayout(&.{ 2, 11, 5 }, 110, 2, 3, 4, 3),
+    );
+}
+
+test "gliner whitespace classification returns one zero score per label" {
+    var pipeline = GlinerPipeline{
+        .allocator = std.testing.allocator,
+        .session = undefined,
+        .tok = undefined,
+        .config = .{ .token_p = 1, .token_e = 2, .token_sep_text = 3 },
+    };
+    const scores = try pipeline.scoreLabels(" \t\n", &.{ "person", "organization" });
+    defer std.testing.allocator.free(scores);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0 }, scores);
 }
 
 test "gliner splitIntoWords separates punctuation like Python processor" {

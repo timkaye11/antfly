@@ -63,6 +63,25 @@ pub const QuantizedStorage = weight_source_mod.QuantizedStorage;
 const c_file = @import("../util/c_file.zig");
 pub const MetalTensor = metal_tensor.MetalTensor;
 
+/// Preserve the optional-fallback contract while releasing a newly allocated
+/// device output when the Metal runtime rejects an operation. `errdefer` alone
+/// is insufficient because `return null` is a successful optional return.
+fn finishDeviceOutput(output: *MetalTensor, rc: c_int) ?MetalTensor {
+    if (rc != 0) {
+        output.deinit();
+        return null;
+    }
+    return output.*;
+}
+
+fn finishHostOutput(output: []f32, shape: []const i32, rc: c_int) ?MetalTensor {
+    if (rc != 0) {
+        std.heap.c_allocator.free(output);
+        return null;
+    }
+    return MetalTensor.owned(output, shape);
+}
+
 const c = struct {
     pub const backend_array = extern struct {
         ctx: ?*anyopaque = null,
@@ -1998,9 +2017,8 @@ pub fn decoderRuntimeEmbedAbsolutePosition(self: anytype, request: anytype, stat
         request.hidden_size,
         output.ptr,
     );
-    if (rc != 0) return null;
     const shape = [_]i32{ 1, @intCast(request.hidden_size) };
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn decoderRuntimeEmbeddingLookup(self: anytype, request: anytype) !?MetalTensor {
@@ -2080,8 +2098,7 @@ pub fn decoderRuntimeEmbeddingLookup(self: anytype, request: anytype) !?MetalTen
         request.dim,
         output.ptr,
     );
-    if (rc != 0) return null;
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn decoderRuntimeDebertaEmbeddingsF32Device(self: anytype, request: anytype) !?MetalTensor {
@@ -2137,7 +2154,10 @@ pub fn decoderRuntimeDebertaEmbeddingsF32Device(self: anytype, request: anytype)
             output.deviceByteOffset(),
         )
     else blk: {
-        if (request.weight.isDevice() or request.gamma.isDevice() or request.beta.isDevice()) return null;
+        if (request.weight.isDevice() or request.gamma.isDevice() or request.beta.isDevice()) {
+            output.deinit();
+            return null;
+        }
         var weight = request.weight;
         var gamma = request.gamma;
         var beta = request.beta;
@@ -2157,7 +2177,10 @@ pub fn decoderRuntimeDebertaEmbeddingsF32Device(self: anytype, request: anytype)
         );
     };
     const encode_ns = if (trace) monotonicNowNs() - encode_start_ns else 0;
-    if (rc != 0) return null;
+    if (rc != 0) {
+        output.deinit();
+        return null;
+    }
     if (trace) {
         std.debug.print(
             "metal_gliner_stage: deberta_embeddings_runtime total_ms={d:.3} pack_ms={d:.3} alloc_ms={d:.3} encode_ms={d:.3} device_inputs={} total={d} dim={d}\n",
@@ -2242,8 +2265,7 @@ pub fn decoderRuntimeQuantEmbeddingLookupDeviceToken(
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (lookup_rc != 0) return null;
-    return output;
+    return finishDeviceOutput(&output, lookup_rc);
 }
 
 pub fn decoderRuntimeQuantEmbeddingLookup(
@@ -2326,8 +2348,7 @@ pub fn decoderRuntimeQuantEmbeddingLookup(
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (lookup_rc != 0) return null;
-    return output;
+    return finishDeviceOutput(&output, lookup_rc);
 }
 
 fn quantizedEmbeddingRows(storage: *const QuantizedStorage, dim: usize) ?usize {
@@ -2422,7 +2443,10 @@ pub fn decoderRuntimeNativeBf16EmbeddingLookup(
             rows,
             dim,
         );
-        if (prep_rc != 0) return null;
+        if (prep_rc != 0) {
+            output.deinit();
+            return null;
+        }
     }
 
     const lookup_rc = termite_metal_decode_runtime_embedding_lookup_bf16_prepared_device(
@@ -2433,8 +2457,7 @@ pub fn decoderRuntimeNativeBf16EmbeddingLookup(
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (lookup_rc != 0) return null;
-    return output;
+    return finishDeviceOutput(&output, lookup_rc);
 }
 
 pub fn decoderRuntimeApplyRope(self: anytype, request: anytype) !?MetalTensor {
@@ -2489,8 +2512,7 @@ pub fn decoderRuntimeApplyRope(self: anytype, request: anytype) !?MetalTensor {
         if (request.consecutive_pairs) 1 else 0,
         output.ptr,
     );
-    if (rc != 0) return null;
-    return MetalTensor.owned(output, request.input.shape());
+    return finishHostOutput(output, request.input.shape(), rc);
 }
 
 pub fn decoderRuntimeApplyHeadRmsNormRope(self: anytype, request: anytype) !?MetalTensor {
@@ -2521,8 +2543,7 @@ pub fn decoderRuntimeApplyHeadRmsNormRope(self: anytype, request: anytype) !?Met
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output;
+    return finishDeviceOutput(&output, rc);
 }
 
 pub fn decoderRuntimeApplyHeadRmsNormRopeBatched(self: anytype, request: anytype, heads_per_row: usize, position_period: usize) !?MetalTensor {
@@ -2555,8 +2576,7 @@ pub fn decoderRuntimeApplyHeadRmsNormRopeBatched(self: anytype, request: anytype
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output;
+    return finishDeviceOutput(&output, rc);
 }
 
 pub fn decoderRuntimeApplyHeadRmsNormRopeInto(self: anytype, request: anytype, output: MetalTensor) !bool {
@@ -2756,8 +2776,7 @@ pub fn decoderRuntimeApplyAttentionF32(self: anytype, request: anytype) !?MetalT
         total_sequence_len,
         output.ptr,
     );
-    if (rc != 0) return null;
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn decoderRuntimeApplyAttentionF32DeviceBatched(self: anytype, request: anytype) !?MetalTensor {
@@ -2854,15 +2873,6 @@ pub fn decoderRuntimeApplyPagedKvAttentionSlotOnRuntime(runtime: *RawMetalDecode
         if (!plannedContractAllowsPagedAttention(request.planned_layer_contract)) return null;
     }
 
-    const attention_shape = [_]i32{ @intCast(q_rows), @intCast(attention_input_size) };
-    var output = try MetalTensor.deviceAllocate(
-        @ptrCast(runtime),
-        q_rows * attention_input_size * @sizeOf(f32),
-        .private,
-        &attention_shape,
-    );
-    errdefer output.deinit();
-
     const Request = @TypeOf(request);
     const page_size: usize = if (@hasField(Request, "page_size")) request.page_size else @min(request.kv_tokens, 256);
     if (page_size == 0) return null;
@@ -2892,6 +2902,15 @@ pub fn decoderRuntimeApplyPagedKvAttentionSlotOnRuntime(runtime: *RawMetalDecode
     const sinks: ?[]const f32 = if (@hasField(Request, "sinks")) request.sinks else null;
     const sinks_ptr: ?[*]const f32 = if (sinks) |slice| slice.ptr else null;
     const sink_count: usize = if (sinks) |slice| slice.len else 0;
+
+    const attention_shape = [_]i32{ @intCast(q_rows), @intCast(attention_input_size) };
+    var output = try MetalTensor.deviceAllocate(
+        @ptrCast(runtime),
+        q_rows * attention_input_size * @sizeOf(f32),
+        .private,
+        &attention_shape,
+    );
+    errdefer output.deinit();
 
     const rc = termite_metal_decode_runtime_attention_paged_slot_device(
         runtime,
@@ -2938,6 +2957,7 @@ pub fn decoderRuntimeApplyPagedKvAttentionSlotOnRuntime(runtime: *RawMetalDecode
                 request.kv_position_offset,
             },
         );
+        output.deinit();
         return null;
     }
 
@@ -3108,15 +3128,6 @@ pub fn decoderRuntimeApplyQuantizedKvAttention(self: anytype, request: anytype) 
         request.kv_position_offset,
     ) != 0) return null;
 
-    const attention_shape = [_]i32{ @intCast(q_rows), @intCast(attention_input_size) };
-    var output = try MetalTensor.deviceAllocate(
-        @ptrCast(runtime),
-        q_rows * attention_input_size * @sizeOf(f32),
-        .private,
-        &attention_shape,
-    );
-    errdefer output.deinit();
-
     const Request = @TypeOf(request);
     const page_size: usize = if (@hasField(Request, "page_size")) request.page_size else @min(request.kv_tokens, 256);
     if (page_size == 0) return null;
@@ -3139,7 +3150,16 @@ pub fn decoderRuntimeApplyQuantizedKvAttention(self: anytype, request: anytype) 
     const sinks_ptr: ?[*]const f32 = if (sinks) |slice| slice.ptr else null;
     const sink_count: usize = if (sinks) |slice| slice.len else 0;
 
-    if (termite_metal_decode_runtime_attention_paged_slot_device(
+    const attention_shape = [_]i32{ @intCast(q_rows), @intCast(attention_input_size) };
+    var output = try MetalTensor.deviceAllocate(
+        @ptrCast(runtime),
+        q_rows * attention_input_size * @sizeOf(f32),
+        .private,
+        &attention_shape,
+    );
+    errdefer output.deinit();
+
+    const rc = termite_metal_decode_runtime_attention_paged_slot_device(
         runtime,
         0,
         runtime_format,
@@ -3163,9 +3183,8 @@ pub fn decoderRuntimeApplyQuantizedKvAttention(self: anytype, request: anytype) 
         sink_count,
         output.deviceHandle(),
         output.deviceByteOffset(),
-    ) != 0) return null;
-
-    return output;
+    );
+    return finishDeviceOutput(&output, rc);
 }
 
 pub fn sampleLogitsDevice(self: anytype, request: anytype) !?usize {
@@ -3483,8 +3502,7 @@ pub fn decoderRuntimeApplyLayerNorm(self: anytype, request: anytype, stats: anyt
         request.eps,
         output.ptr,
     );
-    if (rc != 0) return null;
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn decoderRuntimeApplyAddLayerNorm(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
@@ -3591,8 +3609,7 @@ pub fn decoderRuntimeApplyRmsNorm(self: anytype, request: anytype, stats: anytyp
         request.eps,
         output.ptr,
     );
-    if (rc != 0) return null;
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn decoderRuntimeApplyRmsNormWeightDevice(
@@ -3624,8 +3641,7 @@ pub fn decoderRuntimeApplyRmsNormWeightDevice(
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output;
+    return finishDeviceOutput(&output, rc);
 }
 
 pub fn decoderRuntimeApplyRmsNormWeightDeviceInto(
@@ -3800,9 +3816,8 @@ pub fn decoderRuntimeApplyLayerNormLinear(self: anytype, request: anytype) !?Met
         request.out_dim,
         output.ptr,
     );
-    if (rc != 0) return null;
     const shape = [_]i32{ 1, @intCast(request.out_dim) };
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn decoderRuntimeApplyLayerNormLinearSample(self: anytype, request: anytype) !?usize {
@@ -4227,6 +4242,7 @@ pub fn decoderRuntimeApplyPleResidualDevice(self: anytype, request: anytype) !?M
         );
         if (rc == 0) return output;
         if (tracePleResidualRuntimeEnabled()) std.debug.print("metal_graph_fusion_trace: ple_residual runtime_direct_q8 rc={d}\n", .{rc});
+        output.deinit();
     }
     if ((ple_gate_kind == .q4_0 and ple_proj_kind == .q4_0) or
         (ple_gate_kind == .q4_k and ple_proj_kind == .q4_k))
@@ -4260,6 +4276,7 @@ pub fn decoderRuntimeApplyPleResidualDevice(self: anytype, request: anytype) !?M
         );
         if (rc == 0) return output;
         if (tracePleResidualRuntimeEnabled()) std.debug.print("metal_graph_fusion_trace: ple_residual runtime_direct_quantized kind={s} rc={d}\n", .{ @tagName(ple_gate_kind), rc });
+        output.deinit();
     }
 
     if (!runtimeLinearSlotSupportsDeviceApply(self, request.gate_linear_slot, request.hidden_size, request.ple_hidden_size) or
@@ -4396,8 +4413,7 @@ pub fn decoderRuntimeApplyAttentionOutputResidualDevice(self: anytype, request: 
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output;
+    return finishDeviceOutput(&output, rc);
 }
 
 pub fn decoderRuntimeReadTokenId(self: anytype) !?usize {
@@ -4684,9 +4700,8 @@ pub fn decoderRuntimeApplyActivation(self: anytype, request: anytype, stats: any
         request.dim,
         output.ptr,
     );
-    if (rc != 0) return null;
     const shape = [_]i32{ 1, @intCast(request.dim) };
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn decoderRuntimeApplyPrimitiveUnary(self: anytype, input: MetalTensor, activation_kind: u32) !?MetalTensor {
@@ -4707,8 +4722,7 @@ pub fn decoderRuntimeApplyPrimitiveUnary(self: anytype, input: MetalTensor, acti
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeApplySoftmaxDevice(self: anytype, input: MetalTensor, rows: usize, dim: usize, log_softmax: bool) !?MetalTensor {
@@ -4730,8 +4744,7 @@ pub fn decoderRuntimeApplySoftmaxDevice(self: anytype, input: MetalTensor, rows:
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeReduceLastDimDevice(self: anytype, input: MetalTensor, rows: usize, dim: usize, kind: u32, output_shape: []const i32) !?MetalTensor {
@@ -4753,8 +4766,7 @@ pub fn decoderRuntimeReduceLastDimDevice(self: anytype, input: MetalTensor, rows
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeMultiplyReduceLastDimDevice(self: anytype, lhs: MetalTensor, rhs: MetalTensor, rows: usize, dim: usize, output_shape: []const i32) !?MetalTensor {
@@ -4777,8 +4789,7 @@ pub fn decoderRuntimeMultiplyReduceLastDimDevice(self: anytype, lhs: MetalTensor
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeReduceAxisF32Device(
@@ -4817,8 +4828,7 @@ pub fn decoderRuntimeReduceAxisF32Device(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeBroadcastLastDimDevice(self: anytype, input: MetalTensor, rows: usize, in_dim: usize, out_dim: usize, output_shape: []const i32) !?MetalTensor {
@@ -4841,8 +4851,7 @@ pub fn decoderRuntimeBroadcastLastDimDevice(self: anytype, input: MetalTensor, r
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeBroadcastF32Device(
@@ -4875,8 +4884,7 @@ pub fn decoderRuntimeBroadcastF32Device(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeGatherAxis0F32_2DDevice(
@@ -4951,8 +4959,7 @@ pub fn decoderRuntimeGlinerWordEmbeddingsF32Device(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeConcatLastDimF32_2DDevice(
@@ -5026,8 +5033,7 @@ pub fn decoderRuntimeGlinerGruCombineF32Device(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeArgmaxAxisF32Device(
@@ -5056,8 +5062,7 @@ pub fn decoderRuntimeArgmaxAxisF32Device(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeConvertDTypeF32Device(self: anytype, input: MetalTensor, kind: u32) !?MetalTensor {
@@ -5076,8 +5081,7 @@ pub fn decoderRuntimeConvertDTypeF32Device(self: anytype, input: MetalTensor, ki
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeSdpaF32Device(self: anytype, request: anytype) !?MetalTensor {
@@ -5144,8 +5148,7 @@ pub fn decoderRuntimeSdpaF32Device(self: anytype, request: anytype) !?MetalTenso
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeFlorenceWindowPackF32Device(
@@ -5186,8 +5189,7 @@ pub fn decoderRuntimeFlorenceWindowPackF32Device(
         dim,
         window_size,
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeFlorenceWindowUnpackF32Device(
@@ -5228,8 +5230,7 @@ pub fn decoderRuntimeFlorenceWindowUnpackF32Device(
         dim,
         window_size,
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeFlorenceChannelAttentionF32Device(
@@ -5260,8 +5261,7 @@ pub fn decoderRuntimeFlorenceChannelAttentionF32Device(
         dim,
         groups,
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeDisentangledRelativeAttentionF32Device(self: anytype, request: anytype) !?MetalTensor {
@@ -5306,8 +5306,7 @@ pub fn decoderRuntimeDisentangledRelativeAttentionF32Device(self: anytype, reque
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeTransposeF32Device(
@@ -5385,8 +5384,7 @@ pub fn decoderRuntimeTransposeF32Device(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeDotGeneral2DF32Device(
@@ -5420,8 +5418,7 @@ pub fn decoderRuntimeDotGeneral2DF32Device(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeDotGeneralBatchedF32Device(
@@ -5462,8 +5459,7 @@ pub fn decoderRuntimeDotGeneralBatchedF32Device(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeConv1dF32Device(self: anytype, request: anytype) !?MetalTensor {
@@ -5504,8 +5500,7 @@ pub fn decoderRuntimeConv1dF32Device(self: anytype, request: anytype) !?MetalTen
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeConv2dF32Device(self: anytype, request: anytype) !?MetalTensor {
@@ -5555,8 +5550,7 @@ pub fn decoderRuntimeConv2dF32Device(self: anytype, request: anytype) !?MetalTen
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeApplyAdd(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
@@ -5586,13 +5580,13 @@ pub fn decoderRuntimeApplyAdd(self: anytype, request: anytype, stats: anytype) !
     if (rows == 0 or @as(usize, @intCast(request.rhs.dim(0))) != rows) return null;
     if (@as(usize, @intCast(request.lhs.dim(1))) != request.dim or @as(usize, @intCast(request.rhs.dim(1))) != request.dim) return null;
     if (rows != 1) {
-        const out = try std.heap.c_allocator.alloc(f32, request.lhs.elemCount());
-        errdefer std.heap.c_allocator.free(out);
         var lhs = request.lhs;
         var rhs = request.rhs;
         const lhs_slice = try tensorHostSlice(&lhs);
         const rhs_slice = try tensorHostSlice(&rhs);
         if (lhs_slice.len == 0 or rhs_slice.len == 0) return null;
+        const out = try std.heap.c_allocator.alloc(f32, request.lhs.elemCount());
+        errdefer std.heap.c_allocator.free(out);
         for (out, 0..) |*o, i| {
             o.* = lhs_slice[i % lhs_slice.len] + rhs_slice[i % rhs_slice.len];
         }
@@ -5631,9 +5625,8 @@ pub fn decoderRuntimeApplyAdd(self: anytype, request: anytype, stats: anytype) !
         request.dim,
         output.ptr,
     );
-    if (rc != 0) return null;
     const shape = [_]i32{ 1, @intCast(request.dim) };
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn decoderRuntimeApplyAddScale(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
@@ -5793,13 +5786,13 @@ pub fn decoderRuntimeApplyMultiply(
     if (rows == 0 or @as(usize, @intCast(rhs.dim(0))) != rows) return null;
     if (@as(usize, @intCast(lhs.dim(1))) != dim or @as(usize, @intCast(rhs.dim(1))) != dim) return null;
     if (rows != 1) {
-        const out = try std.heap.c_allocator.alloc(f32, lhs.elemCount());
-        errdefer std.heap.c_allocator.free(out);
         var lhs_host = lhs;
         var rhs_host = rhs;
         const lhs_slice = try tensorHostSlice(&lhs_host);
         const rhs_slice = try tensorHostSlice(&rhs_host);
         if (lhs_slice.len == 0 or rhs_slice.len == 0) return null;
+        const out = try std.heap.c_allocator.alloc(f32, lhs.elemCount());
+        errdefer std.heap.c_allocator.free(out);
         for (out, 0..) |*o, i| {
             o.* = lhs_slice[i % lhs_slice.len] * rhs_slice[i % rhs_slice.len];
         }
@@ -5836,9 +5829,8 @@ pub fn decoderRuntimeApplyMultiply(
         dim,
         output.ptr,
     );
-    if (rc != 0) return null;
     const shape = [_]i32{ 1, @intCast(dim) };
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn decoderRuntimeApplyMultiplyInto(
@@ -5886,8 +5878,7 @@ pub fn decoderRuntimeApplyMultiplyRhsRepeat(self: anytype, lhs: MetalTensor, rhs
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 fn decoderRuntimeApplyFlatBinaryDevice(
@@ -5921,8 +5912,7 @@ fn decoderRuntimeApplyFlatBinaryDevice(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeApplySubtract(self: anytype, lhs: MetalTensor, rhs: MetalTensor) !?MetalTensor {
@@ -5953,8 +5943,7 @@ pub fn decoderRuntimeApplyDivideRhsRepeat(self: anytype, lhs: MetalTensor, rhs: 
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeApplyLessThan(self: anytype, lhs: MetalTensor, rhs: MetalTensor) !?MetalTensor {
@@ -6087,8 +6076,7 @@ pub fn decoderRuntimeApplyWhereSelect(self: anytype, cond: MetalTensor, on_true:
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeApplyScale(
@@ -6112,8 +6100,7 @@ pub fn decoderRuntimeApplyScale(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn decoderRuntimeApplyLinearActivationLinearResidual(self: anytype, request: anytype) !?MetalTensor {
@@ -6152,10 +6139,8 @@ pub fn decoderRuntimeApplyLinearActivationLinearResidual(self: anytype, request:
         @intFromEnum(request.activation),
         output.ptr,
     );
-    if (rc != 0) return null;
-
     const shape = [_]i32{ 1, @intCast(request.hidden_size) };
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn tryRawProviderQuantizedLinearHost(
@@ -6450,6 +6435,7 @@ pub fn decoderRuntimeApplyLinear(self: anytype, request: anytype) !?MetalTensor 
     errdefer std.heap.c_allocator.free(output);
     var input = request.input;
     if (!(try tryRawLinearHost(self, request.slot, try tensorHostConstPtr(&input), request.in_dim, request.out_dim, output.ptr))) {
+        std.heap.c_allocator.free(output);
         return null;
     }
 
@@ -6593,9 +6579,8 @@ pub fn decoderRuntimeApplyRmsNormLinear(self: anytype, request: anytype) !?Metal
         request.out_dim,
         output.ptr,
     );
-    if (rc != 0) return null;
     const shape = [_]i32{ 1, @intCast(request.out_dim) };
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anytype) !bool {
@@ -18386,8 +18371,7 @@ pub fn decoderRuntimeCopyQuantLinearSlotToF32(
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output;
+    return finishDeviceOutput(&output, rc);
 }
 
 pub fn decoderRuntimeCopyF32ToQuantLinearSlot(
@@ -18494,28 +18478,31 @@ pub fn decoderRuntimeGetRowsQuantLinearSlot(
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output;
+    return finishDeviceOutput(&output, rc);
 }
 
-pub fn clearRawLinearSlot(self: anytype, slot: usize) void {
+pub fn releaseRawLinearSlot(self: anytype, slot: usize) void {
     if (self.raw_decode_runtime) |runtime| {
         _ = termite_metal_decode_runtime_clear_linear_slot(runtime, slot);
     }
     if (self.raw_linear_slot_dense_weights[slot]) |*weight_tensor| {
         weight_tensor.deinit();
     }
-    self.raw_linear_slot_dense_weights[slot] = null;
     if (self.raw_linear_slot_dense_biases[slot]) |*bias_tensor| {
         bias_tensor.deinit();
     }
-    self.raw_linear_slot_dense_biases[slot] = null;
     if (self.raw_linear_slot_kinds[slot] == .quantized) {
         if (self.raw_linear_slot_quantized_storage[slot]) |storage| {
             storage.deinit();
             std.heap.c_allocator.destroy(storage);
         }
     }
+}
+
+pub fn clearRawLinearSlot(self: anytype, slot: usize) void {
+    releaseRawLinearSlot(self, slot);
+    self.raw_linear_slot_dense_weights[slot] = null;
+    self.raw_linear_slot_dense_biases[slot] = null;
     self.raw_linear_slot_quantized_storage[slot] = null;
     self.raw_linear_slot_kinds[slot] = .none;
     self.raw_linear_slot_in_dims[slot] = 0;
@@ -18526,23 +18513,31 @@ pub fn clearRawLinearSlot(self: anytype, slot: usize) void {
     self.raw_linear_slots_prepared[slot] = false;
 }
 
-pub fn clearRawLayerNormSlot(self: anytype, slot: usize) void {
+pub fn releaseRawLayerNormSlot(self: anytype, slot: usize) void {
     if (self.raw_decode_runtime) |runtime| {
         _ = termite_metal_decode_runtime_clear_layer_norm_slot(runtime, slot);
     }
     if (self.raw_layer_norm_slot_weights[slot]) |*weight| weight.deinit();
-    self.raw_layer_norm_slot_weights[slot] = null;
     if (self.raw_layer_norm_slot_biases[slot]) |*bias| bias.deinit();
+}
+
+pub fn clearRawLayerNormSlot(self: anytype, slot: usize) void {
+    releaseRawLayerNormSlot(self, slot);
+    self.raw_layer_norm_slot_weights[slot] = null;
     self.raw_layer_norm_slot_biases[slot] = null;
     self.raw_layer_norm_slot_hidden_sizes[slot] = 0;
     self.raw_layer_norm_slots_prepared[slot] = false;
 }
 
-pub fn clearRawRmsNormSlot(self: anytype, slot: usize) void {
+pub fn releaseRawRmsNormSlot(self: anytype, slot: usize) void {
     if (self.raw_decode_runtime) |runtime| {
         _ = termite_metal_decode_runtime_clear_rms_norm_slot(runtime, slot);
     }
     if (self.raw_rms_norm_slot_weights[slot]) |*weight| weight.deinit();
+}
+
+pub fn clearRawRmsNormSlot(self: anytype, slot: usize) void {
+    releaseRawRmsNormSlot(self, slot);
     self.raw_rms_norm_slot_weights[slot] = null;
     self.raw_rms_norm_slot_hidden_sizes[slot] = 0;
     self.raw_rms_norm_slots_prepared[slot] = false;
@@ -18711,9 +18706,6 @@ fn tryApplyGeneratedQuantizedRuntimeLinearEpilogue(
     if (!input.isDevice() or rows < 2 or rows > generated_runtime_fused_linear_max_rows) return null;
     if (self.raw_linear_slot_dense_biases[slot] == null) return null;
 
-    const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
-    var output = try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &shape);
-    errdefer output.deinit();
     const apply: @TypeOf(&termite_metal_decode_runtime_apply_quantized_linear_q4_k_bias_slot_device) = switch (kind) {
         .q4_k => switch (epilogue) {
             .bias => &termite_metal_decode_runtime_apply_quantized_linear_q4_k_bias_slot_device,
@@ -18725,6 +18717,9 @@ fn tryApplyGeneratedQuantizedRuntimeLinearEpilogue(
         },
         else => return null,
     };
+    const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
+    var output = try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &shape);
+    errdefer output.deinit();
     const rc = apply(
         runtime,
         slot,
@@ -18911,7 +18906,10 @@ pub fn tryApplyQuantizedRuntimeLinear(
         .tq2_0,
         => unreachable,
     };
-    if (rc != 0) return null;
+    if (rc != 0) {
+        std.heap.c_allocator.free(output);
+        return null;
+    }
     if (!applyRuntimeLinearBiasHost(self, slot, output, rows, out_dim)) {
         std.heap.c_allocator.free(output);
         return null;
@@ -18957,7 +18955,10 @@ pub fn tryApplyQuantizedRuntimeLinearScratch(
     const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
     var output = MetalTensor.deviceBorrowed(@ptrCast(runtime), handle, 0, rows * out_dim * @sizeOf(f32), &shape);
     errdefer output.deinit();
-    if (!applyRuntimeLinearBiasDevice(self, slot, &output, rows, out_dim)) return null;
+    if (!applyRuntimeLinearBiasDevice(self, slot, &output, rows, out_dim)) {
+        output.deinit();
+        return null;
+    }
     return output;
 }
 
@@ -19512,7 +19513,11 @@ pub fn tryApplyQuantizedRuntimeLinearPair(
         first_out.ptr,
         second_out.ptr,
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        std.heap.c_allocator.free(second_out);
+        std.heap.c_allocator.free(first_out);
+        return null;
+    }
     if (!applyRuntimeLinearBiasHost(self, slot_a, first_out, rows, out_dim) or
         !applyRuntimeLinearBiasHost(self, slot_b, second_out, rows, out_dim))
     {
@@ -19605,10 +19610,8 @@ pub fn tryApplyDenseRuntimeLinear(
         out_dim,
         output.ptr,
     );
-    if (rc != 0) return null;
-
     const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn tryApplyDenseRuntimeMlp2(
@@ -19649,8 +19652,7 @@ pub fn tryApplyDenseRuntimeMlp2(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn tryApplyDenseRuntimeFfnLayerNorm(
@@ -19706,8 +19708,7 @@ pub fn tryApplyDenseRuntimeFfnLayerNorm(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn tryApplyDenseRuntimeLinearLayerNorm(
@@ -19756,8 +19757,7 @@ pub fn tryApplyDenseRuntimeLinearLayerNorm(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn tryApplyQuantizedRuntimeLinearLayerNorm(
@@ -19811,8 +19811,7 @@ pub fn tryApplyQuantizedRuntimeLinearLayerNorm(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn tryApplyQuantizedRuntimeFfnLayerNorm(
@@ -19882,8 +19881,7 @@ pub fn tryApplyQuantizedRuntimeFfnLayerNorm(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return output_device;
+    return finishDeviceOutput(&output_device, rc);
 }
 
 pub fn tryApplyDenseRuntimeLinearPair(
@@ -19920,7 +19918,11 @@ pub fn tryApplyDenseRuntimeLinearPair(
                 const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
                 var first = MetalTensor.deviceBorrowed(@ptrCast(runtime), first_handle orelse return null, 0, rows * out_dim * @sizeOf(f32), &shape);
                 errdefer first.deinit();
-                var second = MetalTensor.deviceBorrowed(@ptrCast(runtime), second_handle orelse return null, 0, rows * out_dim * @sizeOf(f32), &shape);
+                const second_handle_value = second_handle orelse {
+                    first.deinit();
+                    return null;
+                };
+                var second = MetalTensor.deviceBorrowed(@ptrCast(runtime), second_handle_value, 0, rows * out_dim * @sizeOf(f32), &shape);
                 errdefer second.deinit();
                 return .{
                     .first = first,
@@ -19979,7 +19981,11 @@ pub fn tryApplyDenseRuntimeLinearPair(
         first_out.ptr,
         second_out.ptr,
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        std.heap.c_allocator.free(second_out);
+        std.heap.c_allocator.free(first_out);
+        return null;
+    }
 
     const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
     return .{
@@ -20079,9 +20085,18 @@ pub fn tryApplyDenseRuntimeLinearQkv(
                 const kv_shape = [_]i32{ @intCast(rows), @intCast(kv_out_dim) };
                 var q = MetalTensor.deviceBorrowed(@ptrCast(runtime), q_handle orelse return null, 0, q_bytes, &q_shape);
                 errdefer q.deinit();
-                var k = MetalTensor.deviceBorrowed(@ptrCast(runtime), k_handle orelse return null, 0, kv_bytes, &kv_shape);
+                const k_handle_value = k_handle orelse {
+                    q.deinit();
+                    return null;
+                };
+                var k = MetalTensor.deviceBorrowed(@ptrCast(runtime), k_handle_value, 0, kv_bytes, &kv_shape);
                 errdefer k.deinit();
-                var v = MetalTensor.deviceBorrowed(@ptrCast(runtime), v_handle orelse return null, 0, kv_bytes, &kv_shape);
+                const v_handle_value = v_handle orelse {
+                    k.deinit();
+                    q.deinit();
+                    return null;
+                };
+                var v = MetalTensor.deviceBorrowed(@ptrCast(runtime), v_handle_value, 0, kv_bytes, &kv_shape);
                 errdefer v.deinit();
                 return .{
                     .first = q,
@@ -20135,7 +20150,12 @@ pub fn tryApplyDenseRuntimeLinearQkv(
         k_out.ptr,
         v_out.ptr,
     );
-    if (rc != 0) return null;
+    if (rc != 0) {
+        std.heap.c_allocator.free(v_out);
+        std.heap.c_allocator.free(k_out);
+        std.heap.c_allocator.free(q_out);
+        return null;
+    }
 
     const q_shape = [_]i32{ @intCast(rows), @intCast(q_out_dim) };
     const kv_shape = [_]i32{ @intCast(rows), @intCast(kv_out_dim) };
@@ -20210,6 +20230,7 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
     }
 
     if (input.isDevice() and direct_case != null) {
+        const device_case = direct_case.?;
         const q_shape = [_]i32{ @intCast(rows), @intCast(q_out_dim) };
         const kv_shape = [_]i32{ @intCast(rows), @intCast(kv_out_dim) };
         var q_device = try MetalTensor.deviceAllocate(runtime, rows * q_out_dim * @sizeOf(f32), .private, &q_shape);
@@ -20218,7 +20239,7 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
         errdefer k_device.deinit();
         var v_device = try MetalTensor.deviceAllocate(runtime, rows * kv_out_dim * @sizeOf(f32), .private, &kv_shape);
         errdefer v_device.deinit();
-        const device_rc = switch (direct_case orelse return null) {
+        const device_rc = switch (device_case) {
             .q4_0 => termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_device(
                 runtime,
                 @intFromEnum(MetalQuantFormat.q4_0),
@@ -20357,7 +20378,8 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
         };
     }
 
-    if (direct_case == .q8_0) return null;
+    const host_case = direct_case orelse return null;
+    if (host_case == .q8_0) return null;
     if (frame_active) return null;
 
     var input_mut = input;
@@ -20370,7 +20392,7 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
     const v_out = try std.heap.c_allocator.alloc(f32, rows * kv_out_dim);
     errdefer std.heap.c_allocator.free(v_out);
 
-    const rc = switch (direct_case orelse return null) {
+    const rc = switch (host_case) {
         .q4_0 => termite_metal_decode_runtime_apply_quantized_q_kv_pair_linear_qkv_slots(
             runtime,
             @intFromEnum(MetalQuantFormat.q4_0),
@@ -20421,7 +20443,12 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
         ),
         .q8_0 => unreachable,
     };
-    if (rc != 0) return null;
+    if (rc != 0) {
+        std.heap.c_allocator.free(v_out);
+        std.heap.c_allocator.free(k_out);
+        std.heap.c_allocator.free(q_out);
+        return null;
+    }
     if (!applyRuntimeLinearBiasHost(self, q_slot, q_out, rows, q_out_dim) or
         !applyRuntimeLinearBiasHost(self, k_slot, k_out, rows, kv_out_dim) or
         !applyRuntimeLinearBiasHost(self, v_slot, v_out, rows, kv_out_dim))
@@ -20491,13 +20518,28 @@ pub fn tryApplyQuantizedRuntimeLinearQkvScratch(
     const kv_shape = [_]i32{ @intCast(rows), @intCast(kv_out_dim) };
     var q = MetalTensor.deviceBorrowed(@ptrCast(runtime), q_handle orelse return null, 0, rows * q_out_dim * @sizeOf(f32), &q_shape);
     errdefer q.deinit();
-    var k = MetalTensor.deviceBorrowed(@ptrCast(runtime), k_handle orelse return null, 0, rows * kv_out_dim * @sizeOf(f32), &kv_shape);
+    const k_handle_value = k_handle orelse {
+        q.deinit();
+        return null;
+    };
+    var k = MetalTensor.deviceBorrowed(@ptrCast(runtime), k_handle_value, 0, rows * kv_out_dim * @sizeOf(f32), &kv_shape);
     errdefer k.deinit();
-    var v = MetalTensor.deviceBorrowed(@ptrCast(runtime), v_handle orelse return null, 0, rows * kv_out_dim * @sizeOf(f32), &kv_shape);
+    const v_handle_value = v_handle orelse {
+        k.deinit();
+        q.deinit();
+        return null;
+    };
+    var v = MetalTensor.deviceBorrowed(@ptrCast(runtime), v_handle_value, 0, rows * kv_out_dim * @sizeOf(f32), &kv_shape);
     errdefer v.deinit();
     if (!applyRuntimeLinearBiasDevice(self, q_slot, &q, rows, q_out_dim) or
         !applyRuntimeLinearBiasDevice(self, k_slot, &k, rows, kv_out_dim) or
-        !applyRuntimeLinearBiasDevice(self, v_slot, &v, rows, kv_out_dim)) return null;
+        !applyRuntimeLinearBiasDevice(self, v_slot, &v, rows, kv_out_dim))
+    {
+        v.deinit();
+        k.deinit();
+        q.deinit();
+        return null;
+    }
     return .{
         .first = q,
         .second = k,
@@ -21208,9 +21250,8 @@ pub fn tryDeviceQuantizedGatedFfnResidual(
     );
     if (rc != 0) {
         stats.quantized_gated_ffn_runtime_failures += 1;
-        return null;
     }
-    return output;
+    return finishDeviceOutput(&output, rc);
 }
 
 pub fn shouldAttemptDirectQuantizedGatedFfn(
@@ -21581,6 +21622,7 @@ fn runQuantizedGatedFfnResidualMetalTensor(
         .post_down_rms_norm_slot = request.ffn_post_down_rms_norm_slot,
         .output = output.ptr,
     }, stats, logged_unsupported_type))) {
+        std.heap.c_allocator.free(output);
         return null;
     }
     stats.quantized_gated_ffn_direct_successes += 1;
@@ -21871,6 +21913,7 @@ fn runAttentionF32GatedDecoderBlockQuantizedDevice(
             );
         }
         stats.f32_kv_quant_direct_block_failures += 1;
+        device_output.deinit();
         return null;
     }
     stats.f32_kv_quant_direct_block_successes += 1;
@@ -21929,7 +21972,10 @@ fn runAttentionPagedGatedDecoderBlockQuantizedDevice(
         block_token_offsets,
         device_output,
         stats,
-    )) return null;
+    )) {
+        device_output.deinit();
+        return null;
+    }
     return device_output;
 }
 
@@ -22377,6 +22423,10 @@ fn runCompressedAttentionGatedDecoderBlockQuantizedDevice(
         if (trace) std.debug.print("metal-quant-block-skip layer={d} reason=device q={} k={} v={} residual={}\n", .{ request.layer_index, q_mt.isDevice(), k_suffix_mt.isDevice(), v_suffix_mt.isDevice(), request.residual.isDevice() });
         return null;
     }
+    if (direct_block_format.attention != .q8_0 or
+        direct_block_format.ffn_gate_up != .q8_0 or
+        direct_block_format.ffn_down != .q8_0 or
+        (direct_block_format.ple != .unsupported and direct_block_format.ple != .q8_0)) return null;
 
     const base_key_row_bytes = switch (request.format) {
         .polar4 => (@as(usize, request.num_kv_heads) * request.head_dim + 1) / 2,
@@ -22455,10 +22505,6 @@ fn runCompressedAttentionGatedDecoderBlockQuantizedDevice(
             },
         );
     }
-    if (direct_block_format.attention != .q8_0 or
-        direct_block_format.ffn_gate_up != .q8_0 or
-        direct_block_format.ffn_down != .q8_0 or
-        (direct_block_format.ple != .unsupported and direct_block_format.ple != .q8_0)) return null;
     const rc = termite_metal_decode_runtime_apply_attention_gated_block_q8_0_device_kv_device(
         runtime,
         switch (request.format) {
@@ -22523,6 +22569,7 @@ fn runCompressedAttentionGatedDecoderBlockQuantizedDevice(
         if (stats.compressed_block_gated_direct_first_failure_code == 0) {
             stats.compressed_block_gated_direct_first_failure_code = timing.failure_code;
         }
+        device_output.deinit();
         return null;
     }
     stats.compressed_block_gated_direct_successes += 1;
@@ -22900,8 +22947,7 @@ pub fn sliceLastDim2DDevice(self: anytype, tensor: MetalTensor, start: usize, st
         out.deviceHandle(),
         out.deviceByteOffset(),
     );
-    if (rc != 0) return null;
-    return out;
+    return finishDeviceOutput(&out, rc);
 }
 
 fn cloneOrRetainTensor(tensor: MetalTensor) !MetalTensor {
@@ -23003,8 +23049,7 @@ fn ensureGatheredSpanEntryDevice(
 pub fn resetGatheredSpans(self: anytype) void {
     var it = self.gathered_spans.iterator();
     while (it.next()) |entry| entry.value_ptr.deinit();
-    self.gathered_spans.deinit(std.heap.c_allocator);
-    self.gathered_spans = .empty;
+    self.gathered_spans.clearAndFree(std.heap.c_allocator);
 }
 
 pub fn hasGatheredSpanCache(self: anytype, source_ptr_id: usize, sequence_id: runtime_root.kv.manager.SequenceId, layer_index: usize) bool {
@@ -24126,6 +24171,8 @@ pub fn runCompressedAttentionResidual(self: anytype, request: anytype, stats: an
         attention_output.ptr,
     ) != 0) {
         stats.compressed_attention_residual_attention_span_failures += 1;
+        std.heap.c_allocator.free(attention_output);
+        attention_output_owned = false;
         return null;
     }
     debugRuntimeSliceFinite("attention-output-host", request.layer_index, attention_output[0..attention_input_size]);
@@ -24273,7 +24320,7 @@ pub fn runCompressedAttentionDenseDecoderBlockDirect(self: anytype, request: any
         if (request.query_sequence_len != input_rows or request.kv_tokens < request.query_sequence_len) return null;
         const prefix_tokens = request.kv_tokens - request.query_sequence_len;
         var combined: ?MetalTensor = null;
-        errdefer if (combined) |*tensor| tensor.deinit();
+        defer if (combined) |*tensor| tensor.deinit();
         for (0..input_rows) |row| {
             var row_residual = try sliceRows(self, request.residual, row, 1);
             defer row_residual.deinit();
@@ -24384,7 +24431,9 @@ pub fn runCompressedAttentionDenseDecoderBlockDirect(self: anytype, request: any
                 combined = row_output;
             }
         }
-        return combined;
+        const result = combined;
+        combined = null;
+        return result;
     }
 
     var q_tensor = maybe_q orelse blk: {
@@ -24584,9 +24633,8 @@ pub fn runCompressedAttentionDenseDecoderBlockDirect(self: anytype, request: any
         output.ptr,
     );
     stats.compressed_block_apply_nanos += @intCast(monotonicNowNs() - apply_started_at);
-    if (rc != 0) return null;
     const shape = [_]i32{ 1, @intCast(request.hidden_size) };
-    return MetalTensor.owned(output, &shape);
+    return finishHostOutput(output, &shape, rc);
 }
 
 pub fn runCompressedAttentionGatedDecoderBlockDirect(
@@ -24611,6 +24659,10 @@ pub fn runCompressedAttentionGatedDecoderBlockDirect(
     {
         return null;
     }
+    const projected_q_slot = if (selected_qkv.source == .projected_q_only_slot)
+        request.q_linear_slot orelse return null
+    else
+        0;
 
     const base_key_row_bytes = switch (request.format) {
         .polar4 => (@as(usize, request.num_kv_heads) * request.head_dim + 1) / 2,
@@ -24692,7 +24744,7 @@ pub fn runCompressedAttentionGatedDecoderBlockDirect(
                 },
                 q_handle,
                 q_offset,
-                request.q_linear_slot orelse return null,
+                projected_q_slot,
                 k_handle,
                 k_offset,
                 v_handle,
@@ -24817,7 +24869,7 @@ pub fn runCompressedAttentionGatedDecoderBlockDirect(
                 .turbo3 => 1,
             },
             q_ptr,
-            request.q_linear_slot orelse return null,
+            projected_q_slot,
             k_ptr,
             v_ptr,
             request.kv_tokens,
@@ -24907,6 +24959,7 @@ pub fn runCompressedAttentionGatedDecoderBlockDirect(
         if (stats.compressed_block_gated_direct_first_failure_code == 0) {
             stats.compressed_block_gated_direct_first_failure_code = timing.failure_code;
         }
+        std.heap.c_allocator.free(output);
         return null;
     }
     stats.compressed_block_gated_direct_successes += 1;

@@ -24189,7 +24189,6 @@ test "api index status refreshes synthetic configured index status from write so
         },
     }};
     try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefresh(live_statuses[0..]));
-
 }
 
 test "api index status asks write source when read runtime status is absent" {

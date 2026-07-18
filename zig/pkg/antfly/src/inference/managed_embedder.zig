@@ -930,6 +930,13 @@ pub fn testEmbeddingProviderDeadlines() !void {
     defer managed.deinit();
     try std.testing.expectEqual(expired_deadline, managed.entries[0].deadline_ns.?);
     try std.testing.expectError(error.Timeout, embeddingHttpClientConfig(&managed.entries[0]));
+    const render_config = queryTemplateRenderConfig(&managed.entries[0]);
+    if (comptime @hasField(template_remote.RenderConfig, "io")) {
+        try std.testing.expect(render_config.io == null);
+    }
+    if (comptime @hasField(template_remote.RenderConfig, "deadline_ns")) {
+        try std.testing.expectEqual(expired_deadline, render_config.deadline_ns.?);
+    }
     try std.testing.expectError(
         error.Timeout,
         renderQueryTemplateWithEntry(std.testing.allocator, "{{this}}", "query", &managed.entries[0]),
@@ -1683,6 +1690,13 @@ fn renderQueryTemplateWithEntry(
         return try renderQueryTemplate(alloc, embedding_template, text);
     }
 
+    const config = queryTemplateRenderConfig(entry);
+    const query_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(text, .{})});
+    defer alloc.free(query_json);
+    return try template_remote.renderJsonToTextWithConfig(alloc, embedding_template, query_json, config);
+}
+
+fn queryTemplateRenderConfig(entry: *const ManagedEmbeddingEntry) template_remote.RenderConfig {
     var config: template_remote.RenderConfig = .{};
     if (comptime @hasField(template_remote.RenderConfig, "remote_content")) {
         config.remote_content = entry.remote_content;
@@ -1691,7 +1705,11 @@ fn renderQueryTemplateWithEntry(
         config.secret_store = entry.secret_store;
     }
     if (comptime @hasField(template_remote.RenderConfig, "io")) {
-        config.io = embeddingIo(entry);
+        // Preserve the distinction between caller-owned request I/O and no
+        // request context. The renderer creates and owns its fallback I/O;
+        // substituting the process-global single-threaded executor here can
+        // make remote helpers fail under the server's concurrent workload.
+        config.io = entry.io;
     }
     if (comptime @hasField(template_remote.RenderConfig, "deadline_ns")) {
         config.deadline_ns = entry.deadline_ns;
@@ -1699,9 +1717,7 @@ fn renderQueryTemplateWithEntry(
     if (comptime @hasField(template_remote.RenderConfig, "max_media_parts")) {
         if (isAntflyProvider(entry.provider)) config.max_media_parts = 1;
     }
-    const query_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(text, .{})});
-    defer alloc.free(query_json);
-    return try template_remote.renderJsonToTextWithConfig(alloc, embedding_template, query_json, config);
+    return config;
 }
 
 fn validateRenderedTemplate(alloc: std.mem.Allocator, rendered: []const u8) !void {

@@ -881,7 +881,11 @@ def test_stateful_managed_embeddings_status_reports_partial_retrying_backfill_af
     assert partial["backfill_state"] == "retrying"
     assert partial["backfill_active"] is True
     assert partial["backfill_progress"] < 1.0
-    assert partial["replay_applied_sequence"] < partial["replay_target_sequence"]
+
+    # Journal replay may already be caught up while enrichment retries leave
+    # the snapshot backfill partial. The backfill and enrichment fields above
+    # are the authoritative signals for this state.
+    assert partial["replay_applied_sequence"] <= partial["replay_target_sequence"]
 
     enrichment = partial["enrichment_runtime"]
     assert enrichment["error_count"] >= 1

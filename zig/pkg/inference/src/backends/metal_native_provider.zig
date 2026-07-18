@@ -159,36 +159,23 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         self.jit_exact_pipeline_owner_count += 1;
     }
 
+    /// Releases every owned resource. The provider is consumed and must not be
+    /// used or deinitialized again.
     pub fn deinitOwned(self: *MetalNativeProvider) void {
         // Release the synchronous JIT session before provider, cache, or
         // pipeline dependencies are released.
         metal_runtime.destroyMetalJitSession(self.jit_session);
-        self.jit_session = null;
         metal_runtime.flushActiveFrame(self.raw_decode_runtime) catch {};
         if (metal_runtime.hasActiveFrame(self.raw_decode_runtime)) {
             metal_runtime.waitFrame(self.raw_decode_runtime) catch {};
         }
         metal_runtime.resetGatheredSpans(self);
-        for (0..decoder_runtime_linear_slot_capacity) |slot| metal_runtime.clearRawLinearSlot(self, slot);
-        for (0..decoder_runtime_layer_norm_slot_capacity) |slot| metal_runtime.clearRawLayerNormSlot(self, slot);
-        for (0..decoder_runtime_rms_norm_slot_capacity) |slot| metal_runtime.clearRawRmsNormSlot(self, slot);
+        for (0..decoder_runtime_linear_slot_capacity) |slot| metal_runtime.releaseRawLinearSlot(self, slot);
+        for (0..decoder_runtime_layer_norm_slot_capacity) |slot| metal_runtime.releaseRawLayerNormSlot(self, slot);
+        for (0..decoder_runtime_rms_norm_slot_capacity) |slot| metal_runtime.releaseRawRmsNormSlot(self, slot);
         metal_runtime.termite_metal_provider_destroy(self.raw_provider);
         metal_runtime.termite_metal_decode_runtime_destroy(self.raw_decode_runtime);
-        self.raw_provider = null;
-        self.raw_decode_runtime = null;
-        for (&self.jit_pipeline_owners) |*generated| {
-            metal_runtime.termite_metal_generated_pipeline_destroy(generated.*);
-            generated.* = null;
-        }
-        for (&self.jit_exact_pipeline_owners) |*generated| {
-            metal_runtime.termite_metal_generated_pipeline_destroy(generated.*);
-            generated.* = null;
-        }
-        self.jit_exact_pipeline_owner_count = 0;
-        self.jit_artifact_keys = metal_runtime.empty_metal_jit_artifact_keys;
-        self.jit_route_states = metal_runtime.empty_metal_jit_route_states;
-        self.jit_qualified_routes = metal_runtime.empty_metal_jit_qualified_routes;
-        self.jit_mode = .off;
-        self.jit_scope = metal_runtime.MetalJitRouteScope.none();
+        for (&self.jit_pipeline_owners) |*generated| metal_runtime.termite_metal_generated_pipeline_destroy(generated.*);
+        for (&self.jit_exact_pipeline_owners) |*generated| metal_runtime.termite_metal_generated_pipeline_destroy(generated.*);
     }
 } else void;

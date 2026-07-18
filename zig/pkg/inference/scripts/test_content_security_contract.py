@@ -34,7 +34,6 @@ class ContentSecurityContractTest(unittest.TestCase):
             text = " ".join((ROOT / relative).read_text().split())
             self.assertIn("Remote URL byte potential is reserved before fetch", text)
 
-        self.assertIn("currently parsed but not applied by the scraper", shared)
         self.assertIn("Images are rejected rather than resized", shared)
         self.assertIn("generate/chat, dense embed, multimodal rerank", shared)
         self.assertIn("Batch generation rejects multimodal content before fetch", shared)
