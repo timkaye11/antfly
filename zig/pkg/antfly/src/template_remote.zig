@@ -364,6 +364,8 @@ fn remoteTextHelperImpl(ctx: hbs.HelperContext) anyerror!hbs.Value {
     return .{ .string = text_copy };
 }
 
+/// Deprecated compatibility helper. Prefer document_extraction for durable PDF
+/// ingestion or remoteMedia for template-time multimodal inference input.
 fn remotePdfHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
     try beginRemoteHelper(ctx);
     return remotePdfHelperImpl(ctx) catch |err| {

@@ -1091,6 +1091,7 @@ pub fn build(b: *std.Build) void {
     const with_tla = b.option(bool, "with_tla", "Enable TLA+ trace instrumentation (ndjson event logging)") orelse false;
     const link_libc = b.option(bool, "link-libc", "Link Antfly runtime modules against libc") orelse true;
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer for the Antfly runtime") orelse false;
+    const include_ha_tests_in_aggregates = b.option(bool, "ha-tests", "Include hot-standby HA suites in aggregate test steps") orelse true;
     const edition = b.option(BuildEdition, "edition", "Build edition: full or inference") orelse .full;
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
@@ -2633,6 +2634,18 @@ pub fn build(b: *std.Build) void {
     const bench_pdf_step = b.step("bench-pdf", "Run lib/pdf benchmarks");
     bench_pdf_step.dependOn(&run_lib_pdf_bench.step);
 
+    const lib_pdf_safety_tests = b.addTest(.{
+        .root_module = pdf_mod,
+        .filters = &.{
+            "native backend renders simple pdf first page png",
+            "stream decoders enforce the decoded byte budget before growth",
+            "xref parser rejects a cyclic Prev chain",
+        },
+    });
+    const run_lib_pdf_safety_tests = b.addRunArtifact(lib_pdf_safety_tests);
+    const lib_pdf_safety_test_step = b.step("lib-pdf-safety-test", "Run focused PDF OCR rendering and parser safety tests");
+    lib_pdf_safety_test_step.dependOn(&run_lib_pdf_safety_tests.step);
+
     const lib_image_conformance_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/src/mod.zig"),
         .target = target,
@@ -4116,6 +4129,9 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "object probe cache identity covers every bucket and credential source",
             "connection cache remains valid across every allocation failure",
+            "build response exposes embedded inference as a local connection",
+            "inference connection operations are allowlisted",
+            "inference connection URLs require an HTTP origin",
             "build response reports mock connected and types filter",
             "build response reports configured external io connections",
             "build response reports configured web search connections",
@@ -5045,7 +5061,9 @@ pub fn build(b: *std.Build) void {
     var chaos_progress_tail: ?*std.Build.Step = null;
     chaos_progress_tail = chainLabeledRun(b, lib_metadata_vopr_chaos_tests, "lib-metadata-vopr-chaos-test", chaos_progress_tail);
     chaos_progress_tail = chainLabeledRun(b, lib_lsm_backend_chaos_tests, "lib-lsm-backend-chaos-test", chaos_progress_tail);
-    chaos_progress_tail = chainLabeledRun(b, lib_ha_chaos_tests, "ha-chaos-test", chaos_progress_tail);
+    if (include_ha_tests_in_aggregates) {
+        chaos_progress_tail = chainLabeledRun(b, lib_ha_chaos_tests, "ha-chaos-test", chaos_progress_tail);
+    }
     chaos_test_step.dependOn(chaos_progress_tail.?);
 
     const chaos_soak_test_step = b.step("chaos-soak-test", "Run broad legacy metadata and raft chaos simulation soaks");
@@ -5306,7 +5324,9 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(delegated_inference_steps.inference_test);
     unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);
     unit_test_step.dependOn(lib_standalone_runtime_test_step);
-    unit_test_step.dependOn(ha_test_step);
+    if (include_ha_tests_in_aggregates) {
+        unit_test_step.dependOn(ha_test_step);
+    }
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_transport_tests.step);
 
@@ -6486,7 +6506,9 @@ pub fn build(b: *std.Build) void {
     run_compat.addArg("compat/cases");
     const compat_step = b.step("compat", "Run the shared compatibility corpus");
     compat_step.dependOn(&run_compat.step);
-    compat_step.dependOn(&run_lib_ha_compat_tests.step);
+    if (include_ha_tests_in_aggregates) {
+        compat_step.dependOn(&run_lib_ha_compat_tests.step);
+    }
 
     const search_benchmark_index_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/search_benchmark_index.zig"),

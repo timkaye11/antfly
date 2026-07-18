@@ -36,6 +36,7 @@ const default_max_shards_per_table: u32 = 20;
 const default_config_shards_per_table: u32 = 3;
 const default_standalone_shards_per_table: u32 = 1;
 pub const default_health_port: u16 = 4200;
+pub const local_inference_connection_id = "local-inference";
 
 pub const DeploymentMode = enum {
     embedded,
@@ -1407,6 +1408,7 @@ fn parseConnectionsConfig(alloc: std.mem.Allocator, maybe_value: ?std.json.Value
 
     var it = value.object.iterator();
     while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, local_inference_connection_id)) return error.InvalidConfig;
         const id = try alloc.dupe(u8, entry.key_ptr.*);
         errdefer alloc.free(id);
         var connection = try parseConnectionConfig(alloc, entry.value_ptr.*);
@@ -2510,6 +2512,18 @@ test "common config parses public connections map" {
     try std.testing.expectEqual(Config.ExternalIoProtocol.http, external_io.external_io.?.protocol);
     try std.testing.expectEqualStrings("https://docs.example.com", external_io.external_io.?.hosts[0]);
     try std.testing.expectEqualStrings("Bearer abc", external_io.external_io.?.headers.get("Authorization").?);
+
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
+        \\{
+        \\  "connections": {
+        \\    "local-inference": {
+        \\      "kind": "inference",
+        \\      "capabilities": ["models.generate"],
+        \\      "inference": { "provider": "antfly", "url": "https://platform.antfly.io" }
+        \\    }
+        \\  }
+        \\}
+    ));
 
     const web_search = cfg.connections.get("agent-web").?;
     try std.testing.expectEqual(Config.ConnectionKind.web_search, web_search.kind);
