@@ -317,7 +317,10 @@ fn writeFileAtomic(
     if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) {
         return error.InvalidKernelJitProfileOut;
     }
-    var dir = try compat.cwd().openDir(io, parent_path, .{});
+    // .iterate forces a real O_RDONLY directory fd; the Zig 0.16 Threaded io
+    // otherwise opens O_PATH on Linux, and fsync on an O_PATH fd aborts with
+    // EBADF inside syncDirectory.
+    var dir = try compat.cwd().openDir(io, parent_path, .{ .iterate = true });
     defer dir.close(io);
     const tmp_name = try std.fmt.allocPrint(
         allocator,
