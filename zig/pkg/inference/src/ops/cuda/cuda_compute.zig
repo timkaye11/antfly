@@ -259,7 +259,7 @@ pub fn kernelJitRouteScopeForLoadedWeights(
             entry.key_ptr.*,
             out_dim,
             in_dim,
-            !cudaQ4WeightBf16MirrorPolicyEnabled(entry.key_ptr.*, storage),
+            !cudaQ4WeightBf16MirrorPolicyEnabled(entry.key_ptr.*, storage, true),
         );
     }
     return builder.finish();
@@ -574,6 +574,8 @@ pub const RuntimeStats = struct {
     d2h_bytes: usize = 0,
     d2d_bytes: usize = 0,
     resident_weight_bytes: usize = 0,
+    bf16_mirror_weight_count: usize = 0,
+    bf16_mirror_weight_bytes: usize = 0,
     device_allocated_bytes: usize = 0,
     device_alloc_calls: usize = 0,
     device_free_calls: usize = 0,
@@ -1187,10 +1189,13 @@ pub const CudaCompute = struct {
         // ~100ms cuBLASLt library load should not tax every backend init
         // (parity harnesses construct dozens of CudaCompute instances).
         // The default-on Q4->BF16 prefill mirror only attaches to
-        // encoder.layer.* weights, so its warmup is scoped to the encoder
-        // profiles that carry them; profile-less capability probes stay cold.
+        // encoder.layer.* weights on the qualified target, so its warmup is
+        // scoped to the encoder profiles that carry them; profile-less
+        // capability probes stay cold.
         const encoder_bf16_prefill_default = if (profile) |value| switch (value) {
-            .bert_encoder, .deberta_reranker, .gliner2 => cudaBertQ4Bf16PrefillEnabled(),
+            .bert_encoder, .deberta_reranker, .gliner2 => cudaBertQ4Bf16PrefillEnabled(
+                cudaQualifiedPerfTarget(ctx.info.compute_major, ctx.info.compute_minor),
+            ),
             else => false,
         } else false;
         if (cublaslt != null and cudaCublasLtWarmupEnabled() and
@@ -1475,6 +1480,8 @@ pub const CudaCompute = struct {
                     try copyFromHostTracked(self, bf16_mirror, std.mem.sliceAsBytes(bf16_data));
                 }
                 self.stats.resident_weight_bytes += elem_count * @sizeOf(u16);
+                self.stats.bf16_mirror_weight_count += 1;
+                self.stats.bf16_mirror_weight_bytes += elem_count * @sizeOf(u16);
             }
             try synchronizeAndDrainDeferredDeviceFrees(self);
             self.stats.resident_weight_bytes += storage.raw_bytes.len;
@@ -2512,24 +2519,34 @@ fn cudaHybridQ4Bf16WeightsEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL", false);
 }
 
-fn cudaBertQ4Bf16PrefillEnabled() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_BERT_Q4_0_BF16_PREFILL", true);
+// Qualified-performance target: production parity and performance evidence
+// for the default-on BF16 prefill mirrors and fused DeBERTa attention is
+// exact to NVIDIA L4 / SM89 (see GLINER2_CUDA.md). Other architectures keep
+// the conservative route by default and opt in through the env switches.
+fn cudaQualifiedPerfTarget(compute_major: i32, compute_minor: i32) bool {
+    return compute_major == 8 and compute_minor == 9;
+}
+
+fn cudaBertQ4Bf16PrefillEnabled(default_on: bool) bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_BERT_Q4_0_BF16_PREFILL", default_on);
 }
 
 // Name/env half of the mirror decision, usable before a CUDA context exists
-// (kernel-JIT route scoping). The attach decision itself must go through
-// cudaShouldAttachBf16MirrorToQ4Weight, which also requires the BF16 fast
-// path to exist on the device; a scope built without that knowledge only
-// costs generated prefill routes, never correctness.
-fn cudaQ4WeightBf16MirrorPolicyEnabled(name: []const u8, storage: weight_source_mod.QuantizedStorage) bool {
+// (kernel-JIT route scoping passes bert_default_on=true: an optimistic scope
+// only costs generated prefill routes, never correctness). The attach
+// decision itself must go through cudaShouldAttachBf16MirrorToQ4Weight,
+// which also requires the BF16 fast path to exist on the device and applies
+// the qualified-target default.
+fn cudaQ4WeightBf16MirrorPolicyEnabled(name: []const u8, storage: weight_source_mod.QuantizedStorage, bert_default_on: bool) bool {
     // Encoder prefill has M=batch*sequence rows, so dequantizing the static
     // Q4_0 projection once on upload and dispatching the existing BF16
     // cuBLASLt path is materially faster than repeatedly running the scalar
-    // SIMT Q4 kernel. Keep decoder behavior opt-in, but enable this safe
-    // device-resident BERT/XLM-R profile by default.
+    // SIMT Q4 kernel. Keep decoder behavior opt-in, and enable the
+    // device-resident BERT/XLM-R profile by default only on the qualified
+    // target.
     const bert_encoder_weight = std.mem.startsWith(u8, name, "encoder.layer.");
     if (!cudaHybridQ4Bf16WeightsEnabled() and
-        !(bert_encoder_weight and cudaBertQ4Bf16PrefillEnabled()))
+        !(bert_encoder_weight and cudaBertQ4Bf16PrefillEnabled(bert_default_on)))
     {
         return false;
     }
@@ -2555,7 +2572,11 @@ fn cudaShouldAttachBf16MirrorToQ4Weight(
     // route prefill to the scalar BF16 fallback — slower than the retained
     // Q4 kernels — while still inflating VRAM at load admission.
     if (self.cublaslt == null) return false;
-    return cudaQ4WeightBf16MirrorPolicyEnabled(name, storage);
+    return cudaQ4WeightBf16MirrorPolicyEnabled(
+        name,
+        storage,
+        cudaQualifiedPerfTarget(self.ctx.info.compute_major, self.ctx.info.compute_minor),
+    );
 }
 
 fn isPleModelProjectionWeightName(name: []const u8) bool {
@@ -4619,7 +4640,7 @@ fn cudaDebertaMaterializedWorkspaceLimitBytes(self: *const CudaCompute) usize {
 fn debertaMaterializedAutoTarget(compute_major: i32, compute_minor: i32) bool {
     // Current production evidence is exact to NVIDIA L4 / SM89. Keep other
     // architectures available through explicit diagnostic mode only.
-    return compute_major == 8 and compute_minor == 9;
+    return cudaQualifiedPerfTarget(compute_major, compute_minor);
 }
 
 /// Materialized DeBERTa attention follows the same schedule as the fast CPU
@@ -7821,8 +7842,14 @@ fn cudaDisableFusedQkv() bool {
     return platform.env.getenvBoolDefault("ANTFLY_CUDA_DISABLE_FUSED_QKV", false);
 }
 
-fn cudaDebertaFusedAttentionEnabled() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_CUDA_DEBERTA_FUSED_ATTENTION", true);
+// Default-on only where the fused kernel's parity gate has run (L4/SM89);
+// other architectures keep the reference elementwise kernel unless the env
+// switch forces the fused route.
+fn cudaDebertaFusedAttentionEnabled(self: *const CudaCompute) bool {
+    return platform.env.getenvBoolDefault(
+        "ANTFLY_CUDA_DEBERTA_FUSED_ATTENTION",
+        cudaQualifiedPerfTarget(self.ctx.info.compute_major, self.ctx.info.compute_minor),
+    );
 }
 
 const CudaDebertaAttentionMode = enum {
@@ -13985,7 +14012,7 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
         }
         self.stats.deberta_stream_f16_attention_fallbacks += 1;
     }
-    if (cudaDebertaFusedAttentionEnabled() and seq_len <= 512) {
+    if (cudaDebertaFusedAttentionEnabled(self) and seq_len <= 512) {
         const launched = self.kernels.launchDebertaAttentionFusedF32(
             &self.ctx,
             device,

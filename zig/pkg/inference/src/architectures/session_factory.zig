@@ -1098,6 +1098,16 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
         resident_count += 1;
     }
     if (debug_cuda_session) std.log.info("cuda-session: uploaded resident weights count={d}", .{resident_count});
+    const upload_stats = cuda_compute.snapshotStats();
+    if (upload_stats.bf16_mirror_weight_count > 0) {
+        // The default-on prefill mirrors trade device memory for cuBLASLt
+        // prefill speed; say so at load time so an OOM investigation can see
+        // the cost and the switch without reading source.
+        std.log.info(
+            "cuda: attached {d} BF16 prefill weight mirrors (+{d} MiB device memory); ANTFLY_INFERENCE_CUDA_BERT_Q4_0_BF16_PREFILL=0 disables",
+            .{ upload_stats.bf16_mirror_weight_count, upload_stats.bf16_mirror_weight_bytes / (1024 * 1024) },
+        );
+    }
 
     const impl = try allocator.create(ArchSession);
     impl.* = .{

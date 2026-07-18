@@ -49,6 +49,7 @@ if [[ -z "$model_dir" ]]; then
 fi
 if [[ ! -d "$model_dir" ]]; then
   echo "missing GLiNER model directory at $model_dir" >&2
+  echo "note: a relative ANTFLY_GLINER2_MODEL_DIR resolves against the current working directory ($PWD)" >&2
   exit 1
 fi
 model_dir="$(cd "$model_dir" && pwd -P)"

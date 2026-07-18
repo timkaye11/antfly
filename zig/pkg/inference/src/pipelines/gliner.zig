@@ -359,9 +359,13 @@ pub const GlinerPipeline = struct {
         var schema = if (cuda_preprocessing) try self.prepareGlinerSchema(labels, label_token) else null;
         defer if (schema) |*value| value.deinit(alloc);
 
-        // CUDA prepares identical request rows once so host preprocessing does
-        // not scale linearly while the device executes one real batch. Other
-        // backends retain their existing per-row preparation path.
+        // Identical request rows are prepared and entity-decoded once on
+        // every backend: the packed batch (and therefore the model forward)
+        // is unchanged, so duplicate rows produce identical logits and their
+        // results clone from the first occurrence. This also keeps
+        // cross-backend benchmark comparisons on repeated-text batches
+        // measuring the same work. Only the schema-reuse preparation path
+        // below remains CUDA-specific.
         var prepared = try alloc.alloc(PreparedGlinerInput, texts.len);
         var prepared_len: usize = 0;
         errdefer {
@@ -377,11 +381,9 @@ pub const GlinerPipeline = struct {
         var max_num_words: usize = 0;
         const prepare_start_ns = glinerProfileStart(profile_enabled);
         for (texts, 0..) |text, i| {
-            if (cuda_preprocessing) {
-                if (prepared_by_text.get(text)) |prepared_i| {
-                    row_to_prepared[i] = prepared_i;
-                    continue;
-                }
+            if (prepared_by_text.get(text)) |prepared_i| {
+                row_to_prepared[i] = prepared_i;
+                continue;
             }
 
             const prepared_i = prepared_len;
@@ -390,7 +392,7 @@ pub const GlinerPipeline = struct {
             else
                 try self.prepareGlinerInput(text, labels, label_token);
             prepared_len += 1;
-            if (cuda_preprocessing) try prepared_by_text.put(alloc, text, prepared_i);
+            try prepared_by_text.put(alloc, text, prepared_i);
             row_to_prepared[i] = prepared_i;
             max_seq_len = @max(max_seq_len, prepared[prepared_i].input_ids.len);
             max_num_words = @max(max_num_words, prepared[prepared_i].actual_num_words);
@@ -525,7 +527,7 @@ pub const GlinerPipeline = struct {
         @memset(first_result_by_prepared, null);
         for (row_to_prepared, 0..) |prepared_i, i| {
             const row = prepared[prepared_i];
-            results[i] = if (cuda_preprocessing and first_result_by_prepared[prepared_i] != null)
+            results[i] = if (first_result_by_prepared[prepared_i] != null)
                 try cloneEntities(alloc, results[first_result_by_prepared[prepared_i].?])
             else blk: {
                 const row_start = @min(try checkedSizeMul(i, row_stride), logits.len);
@@ -542,7 +544,7 @@ pub const GlinerPipeline = struct {
                     .word_major_logits,
                 );
             };
-            if (cuda_preprocessing and first_result_by_prepared[prepared_i] == null) first_result_by_prepared[prepared_i] = i;
+            if (first_result_by_prepared[prepared_i] == null) first_result_by_prepared[prepared_i] = i;
             initialized_results += 1;
         }
         const decode_ms = glinerProfileElapsedMs(decode_start_ns);

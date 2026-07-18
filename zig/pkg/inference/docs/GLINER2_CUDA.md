@@ -150,6 +150,17 @@ The production `auto` policy is deliberately narrow:
   tensor-core attention.
 - Other shapes: the established compatible fallback chain.
 
+Route defaults follow the qualified-performance target. Parity and
+performance evidence is exact to L4/SM89, so the fused F32 attention kernel
+and the Q4_0-to-BF16 prefill weight mirrors are default-on only when the
+device reports compute capability 8.9 (mirrors additionally require a loaded
+cuBLASLt). Other architectures keep the reference elementwise kernel and the
+retained Q4 route. `ANTFLY_CUDA_DEBERTA_FUSED_ATTENTION=1` and
+`ANTFLY_INFERENCE_CUDA_BERT_Q4_0_BF16_PREFILL=1` force the fast routes on
+unqualified hardware; `=0` disables them on the target. Attached mirrors
+cost about two bytes per parameter of device memory; the session logs their
+count and total size at load time.
+
 The materialized route packs Q/K/V and relative projections by head, launches
 three score GEMMs, applies the DeBERTa relative-position gathers and softmax,
 launches P*V, and unpacks the output. It uses more workspace and launches than
