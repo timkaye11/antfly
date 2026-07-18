@@ -74,7 +74,7 @@ components:
               provider: openai
               model: whisper-1
         cors:
-          $ref: "../../../go/pkg/antfly/lib/middleware/openapi.yaml#/components/schemas/CORSConfig"
+          $ref: "../shared/middleware.yaml#/components/schemas/CORSConfig"
         replication_factor:
           type: integer
           description: "How many replicas of each shard should be maintained."

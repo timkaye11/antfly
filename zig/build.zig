@@ -1010,7 +1010,7 @@ fn addOpenApiRegenStep(
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/audio.yaml"), "antfly_audio_openapi", antfly_generated_root ++ "/antfly_audio_openapi", "types", &.{
             .{ "../shared/s3.yaml", "antfly_s3_openapi" },
         }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/middleware/openapi.yaml"), "antfly_middleware_openapi", antfly_generated_root ++ "/antfly_middleware_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/middleware.yaml"), "antfly_middleware_openapi", antfly_generated_root ++ "/antfly_middleware_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/scraping.yaml"), "antfly_scraping_openapi", antfly_generated_root ++ "/antfly_scraping_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/s3.yaml"), "antfly_s3_openapi", antfly_generated_root ++ "/antfly_s3_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/inference/config.yaml"), "antfly_inference_config_openapi", antfly_generated_root ++ "/antfly_inference_config_openapi", "types", &.{
@@ -1030,7 +1030,7 @@ fn addOpenApiRegenStep(
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/config.yaml"), "antfly_common_openapi", antfly_generated_root ++ "/antfly_common_openapi", "types", &.{
             .{ "../shared/logging.yaml", "antfly_logging_openapi" },
             .{ "audio.yaml", "antfly_audio_openapi" },
-            .{ "../../../go/pkg/antfly/lib/middleware/openapi.yaml", "antfly_middleware_openapi" },
+            .{ "../shared/middleware.yaml", "antfly_middleware_openapi" },
             .{ "embeddings.yaml", "antfly_embeddings_openapi" },
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
             .{ "reranking.yaml", "antfly_reranking_openapi" },
