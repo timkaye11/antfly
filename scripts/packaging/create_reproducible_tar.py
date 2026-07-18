@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Create a byte-reproducible tar.gz archive from a directory tree."""
+"""Create a byte-reproducible tar.gz archive from a directory tree.
+
+Used by scripts/packaging/build_zig_release_archive.sh to package release
+artifacts. Rebuilding the same tree on any machine yields a bit-identical
+archive (fixed mtime, zeroed owners, normalized modes, sorted entries, no
+gzip timestamp), so release checksums stay stable across build
+environments and can be independently verified. Symlinks and special
+files are rejected rather than silently normalized.
+"""
 
 from __future__ import annotations
 
