@@ -309,6 +309,14 @@ fn yieldToInteractiveEmbeds(runtime: *EnrichmentRuntime) void {
     }
 }
 
+fn yieldToInteractiveGeneration(runtime: *EnrichmentRuntime) void {
+    if (comptime builtin.os.tag == .freestanding) return;
+    while (enrichment_types.interactive_generate_inflight.load(.monotonic) > 0) {
+        if (runtimeShuttingDown(runtime)) return;
+        sleepRetryBackoff(query_yield_poll_ns);
+    }
+}
+
 fn runtimeShuttingDown(runtime: *EnrichmentRuntime) bool {
     if (comptime builtin.os.tag == .freestanding) return false;
     const io_impl = runtime.io_impl orelse return runtime.shutdown;
@@ -2109,6 +2117,8 @@ fn flushAssetProducerBatch(
 ) !void {
     if (items.items.len == 0) return;
     defer clearAssetProducerBatchItems(runtime.alloc, items);
+
+    yieldToInteractiveGeneration(runtime);
 
     const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
     const requests = try runtime.alloc.alloc(asset_producer_mod.Request, items.items.len);

@@ -3406,6 +3406,19 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
+    fn metalPreparedTailOwnsWholePrefill(
+        input_len: usize,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+    ) bool {
+        return decode_context.attention_mode == .paged_prefill and
+            decode_context.total_sequence_len == seq_len and
+            decode_context.query_sequence_len == input_len and
+            decode_context.kv_sequence_len == input_len and
+            decode_context.kv_position_offset == 0 and
+            input_len == seq_len;
+    }
+
     /// Metal analog of the CUDA prepared-tail prefill: the planned prefill
     /// frame plus a prepared-slot greedy tail, capturing the last POST-final-
     /// norm hidden row for Gemma4 MTP seeding. Without this the MTP seed path
@@ -3421,7 +3434,15 @@ pub const NativeGenerationPipeline = struct {
     ) !?PrefillOutput {
         if (self.cb.kind() != .metal) return null;
         if (!gemma4MtpMetalPrefillHiddenCaptureEnabled()) return null;
-        if (decode_context.attention_mode != .paged_prefill or decode_context.query_sequence_len != input_ids.len) return null;
+        if (!metalPreparedTailOwnsWholePrefill(input_ids.len, seq_len, decode_context)) return null;
+
+        const prepared = self.cb.decoderRuntimePrepareOrReuseFamily(
+            self.allocator,
+            self.gpt_config,
+            seq_len,
+            self.gpt_config.num_hidden_layers,
+        ) catch return null;
+        if (!prepared.prepared) return null;
 
         const tail = (try decoder_gated_runtime.forwardPrefillLastPreparedTail(
             &self.cb,
@@ -3435,8 +3456,6 @@ pub const NativeGenerationPipeline = struct {
         )) orelse return null;
         defer self.cb.free(tail.final_hidden);
 
-        const greedy_token = tail.greedy_token_id orelse return null;
-
         const last_hidden = try capturePreparedTailPostNormHidden(
             &self.cb,
             capture_last_hidden,
@@ -3445,13 +3464,50 @@ pub const NativeGenerationPipeline = struct {
             self.gpt_config.hidden_size,
             self.gpt_config.norm_eps,
         );
+        errdefer if (last_hidden) |hidden| self.cb.free(hidden);
         if (capture_last_hidden and last_hidden == null) return null;
+
+        if (tail.greedy_token_id) |greedy_token| {
+            debugGenerationStage(
+                "executePrefill metal_prepared_tail_greedy token={d} capture_hidden={}",
+                .{ greedy_token, capture_last_hidden },
+            );
+            return .{
+                .greedy_token = @intCast(greedy_token),
+                .last_hidden = last_hidden,
+                .last_hidden_rows = if (last_hidden != null) 1 else 0,
+            };
+        }
+
+        const logits = if (try decoder_tail_runtime.forwardPreparedLogitsTensorFromFinalHidden(
+            &self.cb,
+            self.gpt_config,
+            tail.final_hidden,
+            .rms,
+            tail.final_norm_slot,
+            tail.final_lm_head_slot,
+        )) |prepared_logits|
+            prepared_logits
+        else
+            (try decoder_tail_runtime.forwardLogitsTensorFromFinalHidden(
+                &self.cb,
+                self.gpt_config,
+                tail.final_hidden,
+                .rms,
+                tail.final_norm_slot,
+            )) orelse {
+                if (last_hidden) |hidden| self.cb.free(hidden);
+                return null;
+            };
+        defer self.cb.free(logits);
+        const last_logits = try self.cb.toFloat32(logits, self.allocator);
+        gpt_arch.applyFinalLogitSoftcapInPlace(self.gpt_config, last_logits);
         debugGenerationStage(
-            "executePrefill metal_prepared_tail_greedy token={d} capture_hidden={}",
-            .{ greedy_token, capture_last_hidden },
+            "executePrefill metal_prepared_tail_logits capture_hidden={}",
+            .{capture_last_hidden},
         );
         return .{
-            .greedy_token = @intCast(greedy_token),
+            .last_logits = last_logits,
             .last_hidden = last_hidden,
             .last_hidden_rows = if (last_hidden != null) 1 else 0,
         };
@@ -3644,11 +3700,12 @@ pub const NativeGenerationPipeline = struct {
                 defer if (direct_execution_mutex) |mutex| mutex.unlock();
                 try decode_runtime.appendPrefillChunk(chunk.len);
                 const decode_context = decode_runtime.makeDecodeContext(total_chunk_end, chunk.len);
-                const metal_prepared: ?PrefillOutput = if (total_chunk_end == seq_len and use_metal_prefill_greedy_token)
+                const metal_prepared: ?PrefillOutput = if (processed == 0 and total_chunk_end == seq_len and use_metal_prefill_greedy_token)
                     try self.tryMetalPreparedTailPrefillGreedy(chunk, total_chunk_end, &decode_context, capture_last_hidden)
                 else
                     null;
                 if (metal_prepared) |prepared| {
+                    prefill_last_logits = prepared.last_logits;
                     prefill_greedy_token = prepared.greedy_token;
                     prefill_last_hidden = prepared.last_hidden;
                     prefill_last_hidden_rows = prepared.last_hidden_rows;
@@ -3678,6 +3735,45 @@ pub const NativeGenerationPipeline = struct {
                     debugGenerationStage(
                         "executePrefill captured greedy token={d}",
                         .{prefill_greedy_token.?},
+                    );
+                } else if (total_chunk_end == seq_len and capture_last_hidden) {
+                    var target_hidden = self.forwardHiddenDevice(chunk, 1, total_chunk_end, &decode_context) catch |err| {
+                        if (try retryDirectPrefillAfterMemoryBudgetExceeded(&decode_runtime, chunk.len, chunk_size, &current_chunk_size, err)) continue;
+                        return err;
+                    };
+                    var keep_target_hidden = false;
+                    defer {
+                        if (!keep_target_hidden) self.cb.free(target_hidden.hidden);
+                        if (target_hidden.pre_norm_hidden) |pre_norm| self.cb.free(pre_norm);
+                        if (target_hidden.prepared_tail_choices) |choices| target_hidden.choices_allocator.?.free(choices);
+                    }
+                    const last_hidden = try self.cb.sliceRows2D(
+                        allocator,
+                        target_hidden.hidden,
+                        target_hidden.rows - 1,
+                        1,
+                        self.gpt_config.hidden_size,
+                    );
+                    defer self.cb.free(last_hidden);
+                    const lm_w = try gpt_arch.getLmHeadWeight(&self.cb, self.gpt_config);
+                    defer self.cb.free(lm_w);
+                    const last_logits_device = try self.cb.linearNoBias(
+                        last_hidden,
+                        lm_w,
+                        1,
+                        self.gpt_config.hidden_size,
+                        self.gpt_config.vocab_size,
+                    );
+                    defer self.cb.free(last_logits_device);
+                    const last_logits = try self.cb.toFloat32(last_logits_device, allocator);
+                    gpt_arch.applyFinalLogitSoftcapInPlace(self.gpt_config, last_logits);
+                    prefill_last_logits = last_logits;
+                    prefill_last_hidden = target_hidden.hidden;
+                    prefill_last_hidden_rows = target_hidden.rows;
+                    keep_target_hidden = true;
+                    debugGenerationStage(
+                        "executePrefill captured final logits and MTP hidden vocab_size={d}",
+                        .{self.gpt_config.vocab_size},
                     );
                 } else {
                     const logits = self.forwardAllLogits(chunk, 1, total_chunk_end, &decode_context) catch |err| {
@@ -9812,6 +9908,23 @@ test "direct prepared prefill serializes multimodal CUDA and Metal execution" {
     try std.testing.expect(directPrefillExecutionMutex(false, false, true, &mutex) == &mutex);
     try std.testing.expect(directPrefillExecutionMutex(false, false, false, &mutex) == null);
     try std.testing.expect(directPrefillExecutionMutex(true, true, true, null) == null);
+}
+
+test "metal prepared tail rejects chunked and cached-prefix prefill" {
+    var ctx = gpt_arch.DecodeContext{
+        .attention_mode = .paged_prefill,
+        .total_sequence_len = 64,
+        .query_sequence_len = 64,
+        .kv_sequence_len = 64,
+    };
+    try std.testing.expect(NativeGenerationPipeline.metalPreparedTailOwnsWholePrefill(64, 64, &ctx));
+
+    ctx.query_sequence_len = 32;
+    try std.testing.expect(!NativeGenerationPipeline.metalPreparedTailOwnsWholePrefill(32, 64, &ctx));
+
+    ctx.query_sequence_len = 64;
+    ctx.kv_position_offset = 1;
+    try std.testing.expect(!NativeGenerationPipeline.metalPreparedTailOwnsWholePrefill(64, 64, &ctx));
 }
 
 test "shared batch KV mutations use the model execution lock" {

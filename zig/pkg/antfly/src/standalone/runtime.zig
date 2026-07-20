@@ -2282,6 +2282,7 @@ fn serveUnifiedInner(
 
     if (corsEnabled(active_cors_config)) try server.use(corsMiddleware());
     try server.use(inferenceAuthMiddleware());
+    try server.use(interactiveGenerateMiddleware());
 
     // Register inference AI routes under /ai/v1 and Traditional ML routes under /ml/v1.
     if (antfly_node) |node| {
@@ -2425,6 +2426,20 @@ fn inferenceAuthMiddleware() httpx.Middleware {
                 if (!antfly.public_api.http_server.permissionsAllow(identity.permissions, .inference, "*", .read)) {
                     return inferenceForbiddenResponse(ctx);
                 }
+                return next.call(ctx);
+            }
+        }.handler,
+    };
+}
+
+fn interactiveGenerateMiddleware() httpx.Middleware {
+    return .{
+        .name = "interactive_generate",
+        .handler = struct {
+            fn handler(ctx: *httpx.Context, next: *httpx.Next) anyerror!httpx.Response {
+                if (!isInteractiveGeneratePath(ctx.request.uri.path)) return next.call(ctx);
+                _ = antfly.db.enrichment_types.interactive_generate_inflight.fetchAdd(1, .monotonic);
+                defer _ = antfly.db.enrichment_types.interactive_generate_inflight.fetchSub(1, .monotonic);
                 return next.call(ctx);
             }
         }.handler,
@@ -2653,6 +2668,17 @@ fn isHttpToken(value: []const u8) bool {
 fn isInferenceApiPath(path: []const u8) bool {
     return hasPathComponentPrefix(path, inference.server.ai_api_prefix) or
         hasPathComponentPrefix(path, inference.server.public_api_prefix);
+}
+
+fn isInteractiveGeneratePath(path: []const u8) bool {
+    for ([_][]const u8{ inference.server.ai_api_prefix, inference.server.public_api_prefix }) |prefix| {
+        if (!std.mem.startsWith(u8, path, prefix)) continue;
+        const suffix = path[prefix.len..];
+        if (std.mem.eql(u8, suffix, "/generate") or
+            std.mem.eql(u8, suffix, "/generate/batch") or
+            std.mem.eql(u8, suffix, "/chat/completions")) return true;
+    }
+    return false;
 }
 
 fn hasPathComponentPrefix(path: []const u8, prefix: []const u8) bool {
@@ -4199,6 +4225,11 @@ const RecordingServer = struct {
 test "standalone runtime module compiles" {
     _ = run;
     _ = runFromIterator;
+    try std.testing.expect(isInteractiveGeneratePath("/ai/v1/generate"));
+    try std.testing.expect(isInteractiveGeneratePath("/ai/v1/chat/completions"));
+    try std.testing.expect(isInteractiveGeneratePath("/ml/v1/generate/batch"));
+    try std.testing.expect(!isInteractiveGeneratePath("/ai/v1/embed"));
+    try std.testing.expect(!isInteractiveGeneratePath("/ai/v10/generate"));
 }
 
 test "standalone Lite enforces one shard and one replica" {

@@ -34258,20 +34258,22 @@ fn flushFinishedDenseAppliedSequenceLocked(ctx: *AsyncContext, index_name: []con
     // backends. Hold a shared apply lease so concurrent persistence remains
     // parallel while catalog replacement's exclusive lease cannot retire a
     // backend underneath this durability boundary.
-    ctx.apply_mutex.lockShared();
-    defer ctx.apply_mutex.unlockShared();
-    const raw_update = [_]apply_state.AppliedSequenceUpdate{.{
-        .index_name = pending.owned_name,
-        .sequence = pending.sequence,
-    }};
-    const enriched_updates = try appliedSequenceUpdatesWithConfigHashes(ctx.alloc, ctx.index_manager, &raw_update);
-    defer ctx.alloc.free(enriched_updates);
-    try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-    try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-    try apply_state.saveAppliedSequencesWithCheckpoint(ctx.alloc, ctx.store, ctx.applied_sequence_checkpoint_path, enriched_updates);
-    try finalizeCoveredDenseProjectionCheckpoint(ctx, pending.owned_name, pending.sequence);
-    try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
-    const save_ns = elapsedSince(save_start_ns);
+    const save_ns = blk: {
+        ctx.apply_mutex.lockShared();
+        defer ctx.apply_mutex.unlockShared();
+        const raw_update = [_]apply_state.AppliedSequenceUpdate{.{
+            .index_name = pending.owned_name,
+            .sequence = pending.sequence,
+        }};
+        const enriched_updates = try appliedSequenceUpdatesWithConfigHashes(ctx.alloc, ctx.index_manager, &raw_update);
+        defer ctx.alloc.free(enriched_updates);
+        try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+        try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+        try apply_state.saveAppliedSequencesWithCheckpoint(ctx.alloc, ctx.store, ctx.applied_sequence_checkpoint_path, enriched_updates);
+        try finalizeCoveredDenseProjectionCheckpoint(ctx, pending.owned_name, pending.sequence);
+        try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
+        break :blk elapsedSince(save_start_ns);
+    };
 
     ctx.applied_sequence_coalescer.last_flush_ns = monotonicTimeNs();
     const flush_ns = elapsedSince(flush_start_ns);
@@ -34308,19 +34310,21 @@ fn flushPendingAppliedSequencesLocked(ctx: *AsyncContext, force: bool) !bool {
     // Keep the complete metadata/checkpoint/status transaction on one stable
     // index generation. Shared holders may proceed concurrently; index
     // replacement and teardown require the exclusive lease.
-    ctx.apply_mutex.lockShared();
-    defer ctx.apply_mutex.unlockShared();
-    try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-    try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-    try apply_state.saveAppliedSequencesWithCheckpoint(
-        ctx.alloc,
-        ctx.store,
-        ctx.applied_sequence_checkpoint_path,
-        enriched_updates,
-    );
-    for (enriched_updates) |update| try finalizeCoveredDenseProjectionCheckpoint(ctx, update.index_name, update.sequence);
-    try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
-    const save_ns = elapsedSince(save_start_ns);
+    const save_ns = blk: {
+        ctx.apply_mutex.lockShared();
+        defer ctx.apply_mutex.unlockShared();
+        try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+        try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+        try apply_state.saveAppliedSequencesWithCheckpoint(
+            ctx.alloc,
+            ctx.store,
+            ctx.applied_sequence_checkpoint_path,
+            enriched_updates,
+        );
+        for (enriched_updates) |update| try finalizeCoveredDenseProjectionCheckpoint(ctx, update.index_name, update.sequence);
+        try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
+        break :blk elapsedSince(save_start_ns);
+    };
     ctx.applied_sequence_coalescer.clearPending(ctx.alloc);
     ctx.applied_sequence_coalescer.last_flush_ns = monotonicTimeNs();
     const flush_ns = elapsedSince(flush_start_ns);
