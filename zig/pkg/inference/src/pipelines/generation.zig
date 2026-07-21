@@ -960,8 +960,11 @@ fn gemma4MtpAcceptBonusEnabled(kind: ops.BackendKind) bool {
     return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_ACCEPT_BONUS", gemma4MtpAcceptBonusDefault(kind));
 }
 
-fn gemma4MtpCachedFirstChoiceAllowed(actual_k: usize) bool {
-    return actual_k > 1;
+fn gemma4MtpCachedFirstChoiceAllowed(actual_k: usize, canonical_materialize_available: bool) bool {
+    // A cached choice is only safe when an accepted single draft can advance
+    // through the canonical one-row target frame. Otherwise a short final
+    // round can fall back to the older verifier and drift from target-only.
+    return actual_k > 0 and canonical_materialize_available;
 }
 
 fn shouldAcceptSpeculativeBonus(enabled: bool, draft_count: usize, remaining_generation_tokens: usize) bool {
@@ -1222,6 +1225,54 @@ fn directPrefillExecutionMutex(
     return if (prepared_multimodal or use_cuda_prefill_greedy_token or use_metal_prefill_greedy_token) execution_lock else null;
 }
 
+fn prefillFinalChunkNeedsDirectExecution(
+    total_chunk_end: usize,
+    seq_len: usize,
+    use_prefill_greedy_token: bool,
+    capture_last_hidden: bool,
+) bool {
+    return total_chunk_end == seq_len and (use_prefill_greedy_token or capture_last_hidden);
+}
+
+fn singletonScheduledGemmaPrefillFrameEnabled() bool {
+    return !platform.env.getenvBool("TERMITE_METAL_DISABLE_SINGLETON_SCHEDULED_PREFILL_FRAME");
+}
+
+fn shouldUseSingletonScheduledGemmaPrefillFrame(
+    kind: ops.BackendKind,
+    config: *const gpt_mod.Config,
+    item_count: usize,
+    phase: runtime.scheduler.native_generate.Phase,
+    query_sequence_len: usize,
+    wants_logits: bool,
+) bool {
+    return kind == .metal and
+        config.family == .gemma and
+        !config.usesMoe() and
+        config.hasPle() and
+        item_count == 1 and
+        phase == .prefill and
+        query_sequence_len > 1 and
+        !wants_logits;
+}
+
+/// A scheduled prefill chunk may be followed by a generic final-hidden/logits
+/// forward or by another request. Keep the direct runtime's gathered KV span
+/// strictly inside this attempt; paged KV storage remains the handoff boundary.
+fn runWithDecoderRuntimeResetBoundary(
+    cb: *const ComputeBackend,
+    context: *anyopaque,
+    run: *const fn (context: *anyopaque) anyerror!bool,
+) !bool {
+    try cb.decoderRuntimeResetState();
+    const result = run(context) catch |err| {
+        cb.decoderRuntimeResetState() catch {};
+        return err;
+    };
+    try cb.decoderRuntimeResetState();
+    return result;
+}
+
 fn batchKvMutationMutex(
     execution_lock: ?*std.atomic.Mutex,
     kv_lock: ?*std.atomic.Mutex,
@@ -1315,6 +1366,8 @@ pub const NativeDecodeState = struct {
     gemma4_layer_spec_cache: gpt_arch.Gemma4LayerSpecCache = .{},
     deepseek_v4_compressed_cache: ?gpt_arch.DeepSeekV4CompressedCache = null,
     force_full_recompute: bool = false,
+    kv_max_inflight_tokens: usize = 0,
+    allow_swa_ring: bool = false,
 
     pub fn initContiguous(allocator: std.mem.Allocator) NativeDecodeState {
         return .{
@@ -1354,8 +1407,24 @@ pub const NativeDecodeState = struct {
 
     pub fn configureForGptConfig(self: *NativeDecodeState, config: gpt_mod.Config) void {
         self.force_full_recompute = false;
+        if (self.total_tokens == 0) self.kv_max_inflight_tokens = 0;
+        self.allow_swa_ring = config.family == .gemma and
+            config.hasPle() and
+            config.sliding_window > 0 and
+            config.hasGlobalAttentionLayers();
         if (config.family != .gemma) self.gemma4_layer_spec_cache.reset();
         if (!requiresDeepSeekV4CompressedCache(config)) self.clearDeepSeekV4CompressedCache();
+    }
+
+    fn configureKvMaxInflightTokens(self: *NativeDecodeState, token_count: usize, request_allows_ring: bool) void {
+        if (token_count == 0 or self.total_tokens != 0) {
+            self.allow_swa_ring = false;
+            return;
+        }
+        // Ring page ids are absolute from sequence position zero. A pool that
+        // front-trims its logical block table would make them view-relative.
+        self.allow_swa_ring = self.allow_swa_ring and request_allows_ring and self.kvSlidingWindowTokens() == null;
+        self.kv_max_inflight_tokens = if (self.allow_swa_ring) token_count else 0;
     }
 
     pub fn requiresFullRecompute(self: *const NativeDecodeState) bool {
@@ -1819,6 +1888,8 @@ pub const NativeDecodeState = struct {
                     .logical_block_count = view.logical_block_count,
                     .tail_tokens = view.tail_tokens,
                     .position_offset = view.position_offset,
+                    .max_inflight_tokens = self.kv_max_inflight_tokens,
+                    .allow_swa_ring = self.allow_swa_ring,
                     .logical_blocks = view.logical_blocks,
                     .kv_storage = view.kv_storage,
                 }
@@ -1981,6 +2052,8 @@ pub fn buildOwnedBatchDecodeContext(
                 .logical_block_count = ctx.kv_cache.?.logical_block_count,
                 .tail_tokens = ctx.kv_cache.?.tail_tokens,
                 .position_offset = ctx.kv_cache.?.position_offset,
+                .max_inflight_tokens = ctx.kv_cache.?.max_inflight_tokens,
+                .allow_swa_ring = ctx.kv_cache.?.allow_swa_ring,
                 .logical_blocks = ctx.kv_cache.?.logical_blocks,
                 .kv_storage = ctx.kv_cache.?.kv_storage,
             },
@@ -2065,6 +2138,8 @@ pub fn buildOwnedMixedBatchDecodeContext(
                 .logical_block_count = ctx.kv_cache.?.logical_block_count,
                 .tail_tokens = ctx.kv_cache.?.tail_tokens,
                 .position_offset = ctx.kv_cache.?.position_offset,
+                .max_inflight_tokens = ctx.kv_cache.?.max_inflight_tokens,
+                .allow_swa_ring = ctx.kv_cache.?.allow_swa_ring,
                 .logical_blocks = ctx.kv_cache.?.logical_blocks,
                 .kv_storage = ctx.kv_cache.?.kv_storage,
             },
@@ -3645,6 +3720,14 @@ pub const NativeGenerationPipeline = struct {
                 );
                 current_chunk_size = coalesced_chunk_size;
             }
+            const max_speculative_rows = @min(@as(usize, @intCast(config.speculative_k)), 16) + 1;
+            decode_state.configureKvMaxInflightTokens(
+                @max(current_chunk_size, max_speculative_rows),
+                self.cb.kind() == .metal and
+                    prefilled_tokens == 0 and
+                    !config.prompt_cache_enabled and
+                    config.cache_compaction_ratio == null,
+            );
             var processed: usize = 0;
             while (processed < query_len) {
                 var direct_prefill_turn_acquired = false;
@@ -3664,7 +3747,12 @@ pub const NativeGenerationPipeline = struct {
                 if (self.scheduler) |scheduler| {
                     if (self.scheduler_lease) |lease| {
                         if (self.io) |io| {
-                            if (!(total_chunk_end == seq_len and use_prefill_greedy_token)) {
+                            if (!prefillFinalChunkNeedsDirectExecution(
+                                total_chunk_end,
+                                seq_len,
+                                use_prefill_greedy_token,
+                                capture_last_hidden,
+                            )) {
                                 prefill_last_logits = self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, chunk, total_chunk_end, chunk.len, total_chunk_end == seq_len) catch |err| {
                                     if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
                                         current_chunk_size = @max(chunk_size / 2, 1);
@@ -6232,7 +6320,10 @@ pub const NativeGenerationPipeline = struct {
         const kv_donor_mode = gemma4_mtp.kvDonorModeFromEnv();
         const mtp_top_k = gemma4MtpTopKDiagnosticCount();
         const use_greedy_device_verifier = self.shouldUseGemma4MtpGreedyDeviceVerifier(config, token_table, json_grammar, gbnf_grammar, mtp_top_k);
-        const cached_first_target_choice = if (use_greedy_device_verifier and decode_runtime.kvView() != null and gemma4MtpCachedFirstChoiceAllowed(actual_k))
+        const canonical_materialize_available = gemma4MtpActiveMaterializeEnabled() and
+            hidden_source == .final and
+            self.cb.kind() == .metal;
+        const cached_first_target_choice = if (use_greedy_device_verifier and decode_runtime.kvView() != null and gemma4MtpCachedFirstChoiceAllowed(actual_k, canonical_materialize_available))
             mtp_activation.cached_target_choice
         else
             null;
@@ -6446,7 +6537,83 @@ pub const NativeGenerationPipeline = struct {
         }
         if (use_greedy_device_verifier and !used_cached_first_reject) {
             var used_fused_verify = false;
-            {
+            // A cached k=1 match has already been target-verified for its
+            // first choice. Advance that accepted token through the same
+            // one-row frame as ordinary greedy decode so its next choice and
+            // hidden state cannot drift from target-only generation.
+            if (cached_first_target_choice) |cached_choice| {
+                if (draft_count == 1 and target_query_len == 1) {
+                    const verify_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
+                    const canonical_result = self.materializeAcceptedTokenKvActiveHiddenForMtp(
+                        token_ids,
+                        verify_seq,
+                        &target_ctx,
+                        hidden_source,
+                    ) catch |err| {
+                        decode_runtime.truncateGeneratedTokens(draft_count + mtp_activation.pendingCount()) catch {};
+                        return err;
+                    };
+                    if (canonical_result == null) {
+                        decode_runtime.truncateGeneratedTokens(draft_count + mtp_activation.pendingCount()) catch {};
+                        return error.UnsupportedBackend;
+                    }
+                    if (canonical_result) |owned| {
+                        var canonical_hidden = owned;
+                        defer canonical_hidden.deinit();
+                        mtp_activation.notePendingKvWritten();
+
+                        const next_choice = canonical_hidden.greedy_token_id orelse
+                            try self.greedyTargetChoiceFromFinalHiddenDevice(canonical_hidden.hidden) orelse
+                            return error.UnsupportedBackend;
+                        const combined_choices = [2]u32{ cached_choice, next_choice };
+                        if (verify_len != combined_choices.len) return error.InvalidSpeculativeState;
+                        verify_result = try self.acceptVerifiedDraftTokenChoicesGreedy(
+                            token_ids,
+                            seq_len.*,
+                            draft_tokens[0..draft_count],
+                            &combined_choices,
+                            &round_penalties,
+                            accept_bonus,
+                            config,
+                        );
+                        if (mtp_profile.sync_enabled) self.cb.evalTensor(canonical_hidden.hidden) catch {};
+                        if (mtp_profile.enabled) {
+                            mtp_profile.target_verify_calls += 1;
+                            mtp_profile.target_verify_rows += 1;
+                            mtp_profile.target_verify_argmax_calls += 1;
+                            mtp_profile.target_verify_argmax_rows += 1;
+                            mtp_profile.target_verify_argmax_syncs += 1;
+                            mtp_profile.target_choice_downloads += 1;
+                            mtp_profile.target_verify_ns +|= mtpProfileElapsedNs(true, self.io, verify_started_at);
+                        }
+                        if (!verify_result.correction_added and !verify_result.had_bonus and verify_result.accepted == 1) {
+                            next_cached_target_choice = next_choice;
+                        }
+
+                        if (verify_result.accepted > 0 and
+                            !verify_result.hit_eos and
+                            !verify_result.hit_grammar_stop and
+                            !verify_result.correction_added and
+                            !verify_result.had_bonus)
+                        {
+                            const activation_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
+                            if (use_resident_draft) {
+                                next_device_activation = (try self.copyMtpTargetHiddenRowFromHiddenToBackend(&canonical_hidden, 0, hidden_source, &draft_pipeline.cb)) orelse return error.UnsupportedBackend;
+                                if (mtp_profile.sync_enabled) draft_pipeline.cb.evalTensor(next_device_activation.?) catch {};
+                            } else {
+                                next_host_activation = try self.dupeMtpTargetHiddenRowFromHiddenDevice(&canonical_hidden, 0, hidden_source);
+                            }
+                            if (mtp_profile.enabled) {
+                                mtp_profile.activation_copies += 1;
+                                mtp_profile.accepted_hidden_reuse_rows += 1;
+                                mtp_profile.activation_copy_ns +|= mtpProfileElapsedNs(true, self.io, activation_started_at);
+                            }
+                        }
+                        used_fused_verify = true;
+                    }
+                }
+            }
+            if (!used_fused_verify) {
                 const verify_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
                 const target_lm_rows = if (cached_first_target_choice != null) draft_count else verify_len;
                 const logit_base_row = target_query_len - target_lm_rows;
@@ -8005,6 +8172,63 @@ pub const NativeGenerationPipeline = struct {
         return false;
     }
 
+    fn tryRunSingletonScheduledGemmaPrefillFrame(
+        self: *NativeGenerationPipeline,
+        claimed: []const runtime.scheduler.native_generate.StepItem,
+        decode_context: *const gpt_arch.DecodeContext,
+    ) !bool {
+        if (!singletonScheduledGemmaPrefillFrameEnabled()) return false;
+        if (claimed.len != 1 or claimed[0].phase != .prefill) return false;
+        const item = claimed[0];
+        const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
+        if (!shouldUseSingletonScheduledGemmaPrefillFrame(
+            self.cb.kind(),
+            &self.gpt_config,
+            claimed.len,
+            item.phase,
+            item.query_sequence_len,
+            work.wants_last_logits,
+        )) return false;
+
+        const Attempt = struct {
+            pipeline: *NativeGenerationPipeline,
+            work: *PendingPrefillBatchWork,
+            decode_context: *const gpt_arch.DecodeContext,
+
+            fn run(context: *anyopaque) !bool {
+                const attempt: *@This() = @ptrCast(@alignCast(context));
+                const pipeline = attempt.pipeline;
+                const prepared = try pipeline.cb.decoderRuntimePrepareOrReuseFamily(
+                    pipeline.allocator,
+                    pipeline.gpt_config,
+                    attempt.decode_context.kv_sequence_len,
+                    pipeline.gpt_config.num_hidden_layers,
+                );
+                if (!prepared.prepared) return false;
+
+                const tail = (try decoder_gated_runtime.forwardPrefillLastPreparedTail(
+                    &pipeline.cb,
+                    pipeline.allocator,
+                    pipeline.gpt_config,
+                    pipeline.gpt_config.num_hidden_layers,
+                    attempt.work.token_ids,
+                    attempt.work.seq_len,
+                    attempt.decode_context,
+                    false,
+                )) orelse return false;
+                pipeline.cb.free(tail.final_hidden);
+                return true;
+            }
+        };
+
+        var attempt = Attempt{
+            .pipeline = self,
+            .work = work,
+            .decode_context = decode_context,
+        };
+        return runWithDecoderRuntimeResetBoundary(&self.cb, @ptrCast(&attempt), Attempt.run);
+    }
+
     /// Run a step's forward pass: allocate scratch, populate per-item context,
     /// reserve prefill state, build the mixed-batch decode context, and invoke
     /// the model. On any error before the forward pass returns successfully,
@@ -8076,6 +8300,9 @@ pub const NativeGenerationPipeline = struct {
         defer owned_ctx.deinit();
 
         if (!scheduledStepNeedsLogits(claimed)) {
+            if (try self.tryRunSingletonScheduledGemmaPrefillFrame(claimed, &owned_ctx.context)) {
+                return .{ .logits = null, .max_query_seq_len = max_query_seq_len };
+            }
             try gpt_arch.forwardHiddenOnly(&self.cb, self.allocator, self.gpt_config, input_ids, claimed.len, max_query_seq_len, &owned_ctx.context);
             return .{ .logits = null, .max_query_seq_len = max_query_seq_len };
         }
@@ -9553,6 +9780,28 @@ test "native decode state sliding-window view stays block-aligned" {
     }
 }
 
+test "native decode state disables SWA ring when the KV pool trims history" {
+    const allocator = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f16,
+        .page_size_tokens = 4,
+        .num_kv_heads = 1,
+        .head_dim = 8,
+        .sliding_window_size = 8,
+    });
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    defer state.deinit();
+
+    state.allow_swa_ring = true;
+    state.configureKvMaxInflightTokens(4, true);
+    try std.testing.expect(!state.allow_swa_ring);
+    try std.testing.expectEqual(@as(usize, 0), state.kv_max_inflight_tokens);
+}
+
 test "native decode state chunked prefill appends incrementally" {
     const allocator = std.testing.allocator;
     var manager = runtime.kv.manager.KvManager.init(allocator);
@@ -9910,6 +10159,83 @@ test "direct prepared prefill serializes multimodal CUDA and Metal execution" {
     try std.testing.expect(directPrefillExecutionMutex(true, true, true, null) == null);
 }
 
+test "scheduled prefill sends the final hidden capture through direct execution" {
+    try std.testing.expect(!prefillFinalChunkNeedsDirectExecution(32, 64, true, true));
+    try std.testing.expect(!prefillFinalChunkNeedsDirectExecution(64, 64, false, false));
+    try std.testing.expect(prefillFinalChunkNeedsDirectExecution(64, 64, true, false));
+    try std.testing.expect(prefillFinalChunkNeedsDirectExecution(64, 64, false, true));
+}
+
+test "scheduled Gemma prefill frame only owns singleton non-logit chunks" {
+    var config = gpt_mod.Config{
+        .family = .gemma,
+        .ple_hidden_size = 256,
+    };
+    try std.testing.expect(shouldUseSingletonScheduledGemmaPrefillFrame(.metal, &config, 1, .prefill, 128, false));
+    try std.testing.expect(!shouldUseSingletonScheduledGemmaPrefillFrame(.metal, &config, 2, .prefill, 128, false));
+    try std.testing.expect(!shouldUseSingletonScheduledGemmaPrefillFrame(.metal, &config, 1, .prefill, 128, true));
+    try std.testing.expect(!shouldUseSingletonScheduledGemmaPrefillFrame(.metal, &config, 1, .prefill, 1, false));
+    try std.testing.expect(!shouldUseSingletonScheduledGemmaPrefillFrame(.metal, &config, 1, .decode, 128, false));
+    try std.testing.expect(!shouldUseSingletonScheduledGemmaPrefillFrame(.cuda, &config, 1, .prefill, 128, false));
+
+    config.ple_hidden_size = 0;
+    try std.testing.expect(!shouldUseSingletonScheduledGemmaPrefillFrame(.metal, &config, 1, .prefill, 128, false));
+    config.ple_hidden_size = 256;
+    config.num_local_experts = 2;
+    config.num_experts_per_tok = 1;
+    try std.testing.expect(!shouldUseSingletonScheduledGemmaPrefillFrame(.metal, &config, 1, .prefill, 128, false));
+}
+
+test "scheduled prefill frame resets decoder runtime after hit miss and error" {
+    const Probe = struct {
+        reset_calls: usize = 0,
+
+        fn reset(context: *anyopaque) anyerror!void {
+            const probe: *@This() = @ptrCast(@alignCast(context));
+            probe.reset_calls += 1;
+        }
+    };
+    const Attempt = struct {
+        const Outcome = enum { hit, miss, fail };
+
+        outcome: Outcome,
+        run_calls: usize = 0,
+
+        fn run(context: *anyopaque) anyerror!bool {
+            const attempt: *@This() = @ptrCast(@alignCast(context));
+            attempt.run_calls += 1;
+            return switch (attempt.outcome) {
+                .hit => true,
+                .miss => false,
+                .fail => error.ScheduledPrefillProbeFailure,
+            };
+        }
+    };
+
+    var probe = Probe{};
+    var vtable: ops.ComputeBackend.VTable = undefined;
+    vtable.decoderRuntimeResetState = Probe.reset;
+    const cb = ComputeBackend{ .ptr = @ptrCast(&probe), .vtable = &vtable };
+
+    var hit = Attempt{ .outcome = .hit };
+    try std.testing.expect(try runWithDecoderRuntimeResetBoundary(&cb, @ptrCast(&hit), Attempt.run));
+    try std.testing.expectEqual(@as(usize, 1), hit.run_calls);
+    try std.testing.expectEqual(@as(usize, 2), probe.reset_calls);
+
+    var miss = Attempt{ .outcome = .miss };
+    try std.testing.expect(!try runWithDecoderRuntimeResetBoundary(&cb, @ptrCast(&miss), Attempt.run));
+    try std.testing.expectEqual(@as(usize, 1), miss.run_calls);
+    try std.testing.expectEqual(@as(usize, 4), probe.reset_calls);
+
+    var failed = Attempt{ .outcome = .fail };
+    try std.testing.expectError(
+        error.ScheduledPrefillProbeFailure,
+        runWithDecoderRuntimeResetBoundary(&cb, @ptrCast(&failed), Attempt.run),
+    );
+    try std.testing.expectEqual(@as(usize, 1), failed.run_calls);
+    try std.testing.expectEqual(@as(usize, 6), probe.reset_calls);
+}
+
 test "metal prepared tail rejects chunked and cached-prefix prefill" {
     var ctx = gpt_arch.DecodeContext{
         .attention_mode = .paged_prefill,
@@ -10044,6 +10370,10 @@ test "owned batch decode context captures per-item kv bindings" {
     second.kv_storage = &storage;
     defer second.deinit();
 
+    first.allow_swa_ring = true;
+    first.configureKvMaxInflightTokens(128, true);
+    second.allow_swa_ring = true;
+    second.configureKvMaxInflightTokens(512, true);
     try first.notePrefill(6);
     try second.notePrefill(6);
 
@@ -10055,6 +10385,10 @@ test "owned batch decode context captures per-item kv bindings" {
     try std.testing.expect(owned.context.kv_batch != null);
     try std.testing.expectEqual(first.sequence_id.?, owned.kv_batch.?[0].kv_cache.sequence_id);
     try std.testing.expectEqual(second.sequence_id.?, owned.kv_batch.?[1].kv_cache.sequence_id);
+    try std.testing.expectEqual(@as(usize, 128), owned.kv_batch.?[0].kv_cache.max_inflight_tokens);
+    try std.testing.expectEqual(@as(usize, 512), owned.kv_batch.?[1].kv_cache.max_inflight_tokens);
+    try std.testing.expect(owned.kv_batch.?[0].kv_cache.allow_swa_ring);
+    try std.testing.expect(owned.kv_batch.?[1].kv_cache.allow_swa_ring);
     try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.context.kv_storage);
     try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.kv_batch.?[0].kv_storage);
     try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.kv_batch.?[0].kv_cache.kv_storage);
@@ -10416,10 +10750,11 @@ test "gemma4 mtp pending token bookkeeping holds kv invariant across round shape
     try mtp_activation.validateKvTokensInSync(&decode, seq_len);
 }
 
-test "Gemma4 MTP cached first choice requires multi draft" {
-    try std.testing.expectEqual(false, gemma4MtpCachedFirstChoiceAllowed(0));
-    try std.testing.expectEqual(false, gemma4MtpCachedFirstChoiceAllowed(1));
-    try std.testing.expectEqual(true, gemma4MtpCachedFirstChoiceAllowed(2));
+test "Gemma4 MTP cached first choice covers single draft" {
+    try std.testing.expectEqual(false, gemma4MtpCachedFirstChoiceAllowed(0, true));
+    try std.testing.expectEqual(false, gemma4MtpCachedFirstChoiceAllowed(1, false));
+    try std.testing.expectEqual(true, gemma4MtpCachedFirstChoiceAllowed(1, true));
+    try std.testing.expectEqual(true, gemma4MtpCachedFirstChoiceAllowed(2, true));
 }
 
 test "Gemma4 MTP deferred target activation maps cached verify rows" {

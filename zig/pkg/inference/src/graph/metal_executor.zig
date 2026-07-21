@@ -850,9 +850,18 @@ const DecoderRuntimeSpanState = struct {
     kv_position_offset: usize,
 };
 
+fn executorUsesLazyDeviceKvReserve(config: gpt_mod.Config) bool {
+    if (config.family != .gemma or !config.hasPle()) return false;
+    const mixed_width = config.hasGlobalAttentionLayers() and
+        (config.maxKvHeads() != config.effectiveKVHeads() or
+            config.maxHeadDim() != config.headDim());
+    return mixed_width or config.num_kv_shared_layers > 0;
+}
+
 const ExecutorKvMetadataLayer = struct {
     allocator: std.mem.Allocator,
     pool_id: runtime.kv.block.KvPoolId,
+    lazy_device_reserve: bool,
     sequence_id: ?runtime.kv.manager.SequenceId = null,
     total_token_count: usize = 0,
     position_offset: usize = 0,
@@ -861,8 +870,8 @@ const ExecutorKvMetadataLayer = struct {
     compacted: bool = false,
     logical_blocks: std.ArrayListUnmanaged(runtime.kv.block.KvBlockId) = .empty,
 
-    fn init(allocator: std.mem.Allocator, pool_id: runtime.kv.block.KvPoolId) ExecutorKvMetadataLayer {
-        return .{ .allocator = allocator, .pool_id = pool_id };
+    fn init(allocator: std.mem.Allocator, pool_id: runtime.kv.block.KvPoolId, lazy_device_reserve: bool) ExecutorKvMetadataLayer {
+        return .{ .allocator = allocator, .pool_id = pool_id, .lazy_device_reserve = lazy_device_reserve };
     }
 
     fn deinit(self: *ExecutorKvMetadataLayer, storage: *runtime.kv.storage_runtime.KvStorageRuntime) void {
@@ -923,7 +932,7 @@ const ExecutorKvMetadataLayer = struct {
     }
 
     fn reserveDeviceCapacity(self: *ExecutorKvMetadataLayer, storage: *runtime.kv.storage_runtime.KvStorageRuntime) !void {
-        if (disableDeviceKvReserveRequested()) return;
+        if (self.lazy_device_reserve or disableDeviceKvReserveRequested()) return;
         const sequence_id = self.sequence_id orelse return;
         const pool = storage.getPool(self.pool_id) orelse return error.InvalidPoolId;
         const retained_tokens = self.tokenCount(storage);
@@ -936,6 +945,9 @@ const ExecutorKvMetadataLayer = struct {
                 self.position_offset,
                 pool.config.num_kv_heads,
                 pool.config.head_dim,
+                0,
+                0,
+                false,
             ) catch |err| switch (err) {
                 error.DeviceWriteUnsupported,
                 error.DeviceWriteFormatUnsupported,
@@ -1170,14 +1182,7 @@ const RuntimeContext = struct {
             .metal => false,
             else => false,
         };
-        const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-            null
-        else if (gpt_config.sliding_window > 0)
-            gpt_config.sliding_window
-        else if (gpt_config.max_position_embeddings > 0)
-            gpt_config.max_position_embeddings
-        else
-            null;
+        const sliding_window_size = executorKvSlidingWindowSize(gpt_config);
 
         var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
             .backend = .metal,
@@ -1208,7 +1213,7 @@ const RuntimeContext = struct {
             .pool_id = pool_id,
             .moe_runtime = runtime.moe.runtime.MoeRuntime.init(allocator, shared_moe_cache),
             .shared_moe_cache = shared_moe_cache,
-            .kv_metadata = ExecutorKvMetadataLayer.init(allocator, pool_id),
+            .kv_metadata = ExecutorKvMetadataLayer.init(allocator, pool_id, executorUsesLazyDeviceKvReserve(gpt_config)),
             .mirrored_token_count = 0,
             .mirrored_kv_view = null,
             .mirrored_kv_compacted = false,
@@ -1419,7 +1424,7 @@ const RuntimeContext = struct {
         };
         defer compacted.deinit();
 
-        var replacement = ExecutorKvMetadataLayer.init(self.allocator, self.pool_id);
+        var replacement = ExecutorKvMetadataLayer.init(self.allocator, self.pool_id, self.kv_metadata.lazy_device_reserve);
         replacement.sequence_id = try self.kv_storage.attachSequence(self.pool_id);
         errdefer replacement.releaseOwnedSequence(&self.kv_storage) catch {};
         replacement.total_token_count = self.kv_metadata.total_token_count;
@@ -1845,6 +1850,10 @@ const RuntimeContext = struct {
         return token;
     }
 };
+
+fn executorKvSlidingWindowSize(config: gpt_mod.Config) ?u32 {
+    return config.kvPoolSlidingWindowSize(false);
+}
 
 const runtime_vtable = model_runtime.ModelRuntime.VTable{
     .capabilities = runtimeCapabilities,
@@ -2351,4 +2360,49 @@ fn forwardLastLogits(
     const vocab_size: usize = @intCast(runtime_ctx.gpt_config.vocab_size);
     const last_pos_offset = (query_seq_len - 1) * vocab_size;
     return allocator.dupe(f32, logits[last_pos_offset..][0..vocab_size]);
+}
+
+test "metal executor preserves mixed Gemma global KV history" {
+    var config = gpt_mod.Config{
+        .family = .gemma,
+        .num_hidden_layers = 6,
+        .position_encoding = .rope,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+    };
+
+    try std.testing.expectEqual(@as(?u32, null), executorKvSlidingWindowSize(config));
+
+    config.num_hidden_layers = 5;
+    try std.testing.expectEqual(@as(?u32, 512), executorKvSlidingWindowSize(config));
+}
+
+test "metal executor limits lazy device KV reserve to mixed-geometry Gemma" {
+    var config = gpt_mod.Config{
+        .family = .gemma,
+        .num_hidden_layers = 6,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .position_encoding = .rope,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+        .ple_hidden_size = 256,
+    };
+
+    try std.testing.expect(!executorUsesLazyDeviceKvReserve(config));
+
+    config.global_head_dim = 512;
+    try std.testing.expect(executorUsesLazyDeviceKvReserve(config));
+
+    config.ple_hidden_size = 0;
+    try std.testing.expect(!executorUsesLazyDeviceKvReserve(config));
+
+    config.ple_hidden_size = 256;
+    config.global_head_dim = 0;
+    config.num_kv_shared_layers = 1;
+    try std.testing.expect(executorUsesLazyDeviceKvReserve(config));
+
+    config.family = .llama;
+    try std.testing.expect(!executorUsesLazyDeviceKvReserve(config));
 }

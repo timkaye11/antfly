@@ -11558,8 +11558,8 @@ test "quant kernel compiler production Metal source includes only runtime-wired 
     const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(contents);
 
-    // Branch-added GPU fast paths must stay positive opt-ins until their
-    // model-level release evidence is current.
+    // Branch-added GPU fast paths stay positive opt-ins until their runtime
+    // gates are model-scoped and their model-level release evidence is current.
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "TERMITE_METAL_ENABLE_PREFILL_SG_ATTENTION"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "TERMITE_METAL_ENABLE_Q6_K_R2_REDUCE"));

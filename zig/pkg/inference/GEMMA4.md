@@ -60,10 +60,23 @@ current model-level token-parity and runtime evidence is checked in:
   prepared-tail prefill/hidden-state handoff; its `DISABLE_` variable overrides
   it.
 
-The hand-written Metal flash-prefill path likewise requires
-`TERMITE_METAL_ENABLE_PREFILL_SG_ATTENTION=1`; its new direct K/V load requires
-the additional `TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD=1`. Both retain
-their corresponding `DISABLE_` rollback variables.
+The hand-written Metal chunked flash-prefill path is enabled with
+`TERMITE_METAL_ENABLE_PREFILL_SG_ATTENTION=1`; its contiguous direct K/V load
+requires `TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD=1`. Both passed the E4B
+long-prompt token gate, but remain opt-in because the Metal runtime switch is
+process-wide rather than scoped to the loaded model. Their matching `DISABLE_`
+variables remain rollback overrides.
+
+Singleton intermediate Gemma 4 prefill chunks use the planned Metal frame by
+default. `TERMITE_METAL_DISABLE_SINGLETON_SCHEDULED_PREFILL_FRAME=1` restores
+the scheduled mixed-context path for diagnosis. Final logits and MTP hidden
+capture never use the planned intermediate-chunk frame.
+
+`TERMITE_METAL_ENABLE_SPLIT_SWA_KV_RING=1` stores Gemma 4 sliding-attention
+layers in a fixed Metal ring while global-attention layers retain full KV
+history. The ring is disabled for prompt-cache requests, cache compaction, and
+non-paged attention; `TERMITE_METAL_DISABLE_SPLIT_SWA_KV_RING=1` is the master
+rollback while the long-context rollout gate remains experimental.
 
 The drafter must use the same tokenizer vocabulary and special token ids as the
 target. Speculative decoding is currently native text-only generation; it is not

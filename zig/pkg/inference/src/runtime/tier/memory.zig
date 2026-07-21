@@ -471,21 +471,19 @@ pub fn estimateGptGeneration(
     prefill_chunk_size: usize,
 ) Estimate {
     const total_tokens = prompt_tokens + max_tokens;
-    const retained_tokens = blk: {
-        if (config.position_encoding != .absolute and config.sliding_window > 0) {
-            break :blk @min(total_tokens, @as(usize, @intCast(config.sliding_window)));
-        }
-        if (config.position_encoding != .absolute and config.max_position_embeddings > 0) {
-            break :blk @min(total_tokens, @as(usize, @intCast(config.max_position_embeddings)));
-        }
-        break :blk total_tokens;
-    };
+    const retained_tokens = if (config.kvPoolSlidingWindowSize(false)) |window|
+        @min(total_tokens, @as(usize, @intCast(window)))
+    else
+        total_tokens;
     const page_aligned_tokens = std.mem.alignForward(usize, @max(retained_tokens, 1), 16);
-    const kv_pair_bytes = kv_dtype.bytesForTokenPair(
-        @intCast(config.maxKvHeads()),
-        @intCast(config.maxHeadDim()),
-    );
-    const kv_bytes = page_aligned_tokens * @as(usize, @intCast(config.num_hidden_layers)) * kv_pair_bytes;
+    var kv_bytes: usize = 0;
+    for (0..@as(usize, @intCast(config.num_hidden_layers))) |layer| {
+        if (config.layerSharesKv(layer)) continue;
+        kv_bytes += page_aligned_tokens * kv_dtype.bytesForTokenPair(
+            config.effectiveKVHeadsForLayer(layer),
+            config.effectiveHeadDimForLayer(layer),
+        );
+    }
 
     const scratch_rows = @max(prefill_chunk_size, 1);
     const hidden = @as(usize, @intCast(config.hidden_size));
@@ -595,6 +593,29 @@ test "gpt generation estimate accounts for sliding window and page alignment" {
     // int4: bytesForTokenRow(8, 128) = ceil(1024/32)*18 = 32*18 = 576
     const est_int4 = estimateGptGeneration(.metal, .int4, cfg, 100, 10, 64);
     try std.testing.expectEqual(@as(usize, 112 * 32 * 576 * 2), est_int4.kv_bytes);
+}
+
+test "gpt generation estimate keeps mixed Gemma global history" {
+    const cfg = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2560,
+        .num_hidden_layers = 42,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .vocab_size = 262144,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+        .num_kv_shared_layers = 18,
+        .position_encoding = .rope,
+    };
+
+    const estimate = estimateGptGeneration(.metal, .f16, cfg, 2000, 100, 512);
+    try std.testing.expectEqual(@as(usize, 2100), estimate.retained_tokens);
+    // 24 donor layers: 20 local (2x256) and four global (2x512), at 2112
+    // page-aligned tokens. The 18 shared tail layers do not own KV storage.
+    try std.testing.expectEqual(@as(usize, 121_110_528), estimate.kv_bytes);
 }
 
 test "derive gpu limits keeps combined cap sane" {

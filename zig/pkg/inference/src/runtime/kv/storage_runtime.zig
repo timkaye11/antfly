@@ -21,6 +21,24 @@ const storage_mod = @import("storage.zig");
 
 pub const SequenceId = manager_mod.SequenceId;
 
+pub fn swaRingPageCount(
+    page_size_tokens: u16,
+    sliding_window: usize,
+    max_inflight_tokens: usize,
+    allow_swa_ring: bool,
+) !usize {
+    if (!allow_swa_ring or sliding_window == 0 or max_inflight_tokens == 0 or page_size_tokens == 0) return 0;
+    const live_span = (std.math.add(usize, sliding_window, max_inflight_tokens) catch return error.KvCapacityTooSmall) - 1;
+    // The oldest and newest live tokens can occupy partial pages. Include the
+    // worst-case alignment slack so those pages never alias in the ring.
+    const padded_span = std.math.add(usize, live_span, @as(usize, page_size_tokens) - 1) catch return error.KvCapacityTooSmall;
+    return std.math.divCeil(usize, padded_span, page_size_tokens) catch return error.KvCapacityTooSmall;
+}
+
+pub fn physicalPageForLogical(logical_page: usize, ring_page_count: usize) usize {
+    return if (ring_page_count > 0) logical_page % ring_page_count else logical_page;
+}
+
 pub const SequenceState = struct {
     id: SequenceId,
     active: bool = true,
@@ -54,6 +72,9 @@ pub const KvSuffixWrite = struct {
     position_offset: usize,
     num_kv_heads: u32,
     head_dim: u32,
+    sliding_window: usize = 0,
+    max_inflight_tokens: usize = 0,
+    allow_swa_ring: bool = false,
     logical_blocks: ?[]const block.KvBlockId = null,
     page_size_tokens: u16 = 0,
 };
@@ -75,6 +96,9 @@ pub const DeviceKvLayerReserve = struct {
     position_offset: usize,
     num_kv_heads: u32,
     head_dim: u32,
+    sliding_window: usize = 0,
+    max_inflight_tokens: usize = 0,
+    allow_swa_ring: bool = false,
     logical_blocks: ?[]const block.KvBlockId = null,
     page_size_tokens: u16 = 0,
 };
@@ -98,6 +122,8 @@ pub const DevicePagedKvLayer = struct {
     base_key_row_bytes: usize,
     v_row_stride: usize,
     page_size_tokens: u16 = 0,
+    /// Non-zero when logical pages wrap through a fixed physical SWA ring.
+    ring_page_count: usize = 0,
     position_offset: usize,
 };
 
@@ -269,6 +295,7 @@ pub const KvStorageRuntime = struct {
         const reserved_capacity = (sequence_state.block_table.blocks.items.len + sequence_state.reserved_tail_blocks.items.len) * page_size;
         if (write.total_token_count > reserved_capacity) return error.KvCapacityTooSmall;
         var enriched = write;
+        enriched.allow_swa_ring = enriched.allow_swa_ring and sequence_state.block_table.shared_prefix_blocks == 0;
         enriched.logical_blocks = try self.logicalBlocksWithReservations(write.sequence_id);
         enriched.page_size_tokens = page_size;
         try hook.writeLayerKvSuffix(enriched, k, v);
@@ -282,10 +309,14 @@ pub const KvStorageRuntime = struct {
         position_offset: usize,
         num_kv_heads: u32,
         head_dim: u32,
+        sliding_window: usize,
+        max_inflight_tokens: usize,
+        allow_swa_ring: bool,
     ) !void {
         const hook = self.device_write_hook orelse return error.DeviceWriteUnsupported;
         if (token_capacity == 0) return;
         try self.reserveTokenCapacity(sequence_id, token_capacity);
+        const sequence_state = try self.sequenceMut(sequence_id);
         try hook.reserveLayerKvDevice(.{
             .sequence_id = sequence_id,
             .layer_index = layer_index,
@@ -293,6 +324,9 @@ pub const KvStorageRuntime = struct {
             .position_offset = position_offset,
             .num_kv_heads = num_kv_heads,
             .head_dim = head_dim,
+            .sliding_window = sliding_window,
+            .max_inflight_tokens = max_inflight_tokens,
+            .allow_swa_ring = allow_swa_ring and sequence_state.block_table.shared_prefix_blocks == 0,
             .logical_blocks = try self.logicalBlocksWithReservations(sequence_id),
             .page_size_tokens = self.storage.config.page_size_tokens,
         });
@@ -861,6 +895,7 @@ const TestDeviceWriteHookContext = struct {
     last_total_token_count: usize = 0,
     last_logical_block_count: usize = 0,
     last_page_size_tokens: u16 = 0,
+    last_allow_swa_ring: bool = false,
 };
 
 fn testDeviceWriteLayerKvSuffix(ctx: *anyopaque, write: KvSuffixWrite, _: DeviceKvRef, _: DeviceKvRef) anyerror!void {
@@ -869,6 +904,7 @@ fn testDeviceWriteLayerKvSuffix(ctx: *anyopaque, write: KvSuffixWrite, _: Device
     typed.last_total_token_count = write.total_token_count;
     typed.last_logical_block_count = if (write.logical_blocks) |blocks| blocks.len else 0;
     typed.last_page_size_tokens = write.page_size_tokens;
+    typed.last_allow_swa_ring = write.allow_swa_ring;
 }
 
 fn testDeviceWriteHookDeinit(_: *anyopaque, _: std.mem.Allocator) void {}
@@ -912,6 +948,7 @@ test "storage runtime device writes count reserved blocks as capacity" {
             .position_offset = 0,
             .num_kv_heads = 1,
             .head_dim = 1,
+            .allow_swa_ring = true,
         },
         .{ .handle = @ptrCast(&k_value), .byte_offset = 0, .byte_len = ref_len },
         .{ .handle = @ptrCast(&v_value), .byte_offset = 0, .byte_len = ref_len },
@@ -921,4 +958,64 @@ test "storage runtime device writes count reserved blocks as capacity" {
     try std.testing.expectEqual(@as(usize, 10), hook_context.last_total_token_count);
     try std.testing.expectEqual(@as(usize, 3), hook_context.last_logical_block_count);
     try std.testing.expectEqual(@as(u16, 4), hook_context.last_page_size_tokens);
+    try std.testing.expect(hook_context.last_allow_swa_ring);
+}
+
+test "SWA ring geometry includes the largest in-flight suffix" {
+    try std.testing.expectEqual(@as(usize, 0), try swaRingPageCount(128, 512, 128, false));
+    try std.testing.expectEqual(@as(usize, 0), try swaRingPageCount(128, 0, 128, true));
+    try std.testing.expectEqual(@as(usize, 6), try swaRingPageCount(128, 512, 128, true));
+    try std.testing.expectEqual(@as(usize, 9), try swaRingPageCount(128, 512, 512, true));
+    try std.testing.expectEqual(@as(usize, 41), try swaRingPageCount(16, 512, 128, true));
+
+    try std.testing.expectEqual(@as(usize, 0), physicalPageForLogical(0, 5));
+    try std.testing.expectEqual(@as(usize, 4), physicalPageForLogical(4, 5));
+    try std.testing.expectEqual(@as(usize, 0), physicalPageForLogical(5, 5));
+    try std.testing.expectEqual(@as(usize, 1), physicalPageForLogical(6, 5));
+    try std.testing.expectEqual(@as(usize, 6), physicalPageForLogical(6, 0));
+}
+
+test "storage runtime disables SWA ring for retained prompt prefixes" {
+    const allocator = std.testing.allocator;
+    var runtime = try KvStorageRuntime.init(allocator, .{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 4,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 1,
+    });
+    defer runtime.deinit();
+
+    var hook_context = TestDeviceWriteHookContext{};
+    runtime.setDeviceWriteHook(.{
+        .ctx = &hook_context,
+        .vtable = &test_device_write_hook_vtable,
+    });
+
+    const sequence_id = try runtime.attachSequence(runtime.poolId());
+    try runtime.appendTokens(sequence_id, 1);
+    (try runtime.sequenceMut(sequence_id)).block_table.markSharedPrefix(1);
+
+    var k_value: f32 = 1.0;
+    var v_value: f32 = 2.0;
+    try runtime.writeLayerKvSuffixDevice(
+        .{
+            .sequence_id = sequence_id,
+            .layer_index = 0,
+            .total_token_count = 1,
+            .suffix_token_count = 1,
+            .position_offset = 0,
+            .num_kv_heads = 1,
+            .head_dim = 1,
+            .sliding_window = 512,
+            .max_inflight_tokens = 128,
+            .allow_swa_ring = true,
+        },
+        .{ .handle = @ptrCast(&k_value), .byte_offset = 0, .byte_len = @sizeOf(f32) },
+        .{ .handle = @ptrCast(&v_value), .byte_offset = 0, .byte_len = @sizeOf(f32) },
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), hook_context.calls);
+    try std.testing.expect(!hook_context.last_allow_swa_ring);
 }

@@ -914,7 +914,7 @@ pub const NativeGenerateCoordinator = struct {
         const prompt_token_estimate = @max(prompt_bytes / 4, 1);
 
         var target = self.base_prefill_chunk_size;
-        if (state.decode_requests == 0 and state.prefill_requests <= 1 and state.waiting_requests == 0) {
+        if (self.entries.items.len == 1 and state.decode_requests == 0) {
             // Sole request on an idle scheduler: no fairness pressure, so run
             // the prompt in as few passes as possible. Chunked prefill costs
             // several full per-layer passes and starves large-GEMM
@@ -1161,6 +1161,30 @@ test "native generate coordinator caps chunk by prompt size" {
 
     coordinator.notePrefillProgress(&lease, 0, 24);
     try std.testing.expectEqual(@as(usize, 32), lease.prefill_chunk_size);
+}
+
+test "native generate coordinator shrinks a sole long request after a peer arrives" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+
+    var sole = try coordinator.acquire(.{
+        .requested_units = 18,
+        .prompt_bytes = 15_434,
+        .max_tokens = 16,
+    });
+    defer coordinator.release(sole);
+    try std.testing.expectEqual(@as(usize, 128), sole.prefill_chunk_size);
+
+    const peer = try coordinator.acquire(.{
+        .requested_units = 1,
+        .prompt_bytes = 64,
+        .max_tokens = 16,
+    });
+    defer coordinator.release(peer);
+
+    coordinator.notePrefillProgress(&sole, 0, 2048);
+    try std.testing.expectEqual(@as(usize, 32), sole.prefill_chunk_size);
 }
 
 test "native generate coordinator round-robins turns and prioritizes decode" {

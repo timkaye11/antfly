@@ -13676,9 +13676,8 @@ static bool termite_metal_block_table_contiguous(const uint32_t *block_table, si
     return true;
 }
 
-// The prefill-sg direct-device K/V load is an explicit opt-in until current
-// model-level correctness and runtime evidence is checked in. The legacy
-// disable switch remains an overriding rollback for A/B runs.
+// The direct-device K/V load remains opt-in because this runtime gate is
+// process-wide rather than model-scoped. The disable switch overrides it.
 static bool termite_metal_prefill_sg_direct_load_disabled(void) {
     return !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD")) ||
         termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_PREFILL_SG_DIRECT_LOAD"));
@@ -13734,11 +13733,12 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
         default:
             return failure_code;
     }
-
+    const size_t full_needed_blocks = 1u + (kv_tokens - 1u) / page_size;
+    if (full_needed_blocks > block_count) return failure_code;
     // iSWA scan clamp: for sliding-window layers, whole leading pages that
     // lie outside every query's window contribute exactly zero (the kernels
-    // mask per position) — skip them so scan cost tracks the window, not the
-    // full sequence. The ragged first page is still masked in-kernel.
+    // mask per position). Clamp before validating physical pages so validation
+    // cost also tracks the window rather than the full logical history.
     if (sliding_window > 0 && sliding_window < kv_tokens && !termite_metal_swa_scan_clamp_disabled()) {
         const size_t window_start = query_position_offset + 1 > sliding_window
             ? query_position_offset + 1 - sliding_window
@@ -13755,6 +13755,25 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
             }
         }
     }
+    const size_t needed_blocks = 1u + (kv_tokens - 1u) / page_size;
+    if (needed_blocks > block_count) return failure_code;
+    size_t referenced_tokens = 0;
+    for (size_t block = 0; block < needed_blocks; ++block) {
+        const size_t block_start = (size_t)block_table[block];
+        if (block_start > SIZE_MAX - page_size) return failure_code;
+        const size_t block_end = block_start + page_size;
+        if (block_end > referenced_tokens) referenced_tokens = block_end;
+    }
+    if (referenced_tokens == 0 || referenced_tokens > SIZE_MAX / key_row_bytes) return failure_code;
+    const size_t referenced_key_bytes = referenced_tokens * key_row_bytes;
+    const size_t v_row_stride = runtime->attention_span_slot_v_row_stride[slot];
+    if (v_row_stride == 0 || v_row_stride > SIZE_MAX / v_element_bytes) return failure_code;
+    const size_t v_row_bytes = v_row_stride * v_element_bytes;
+    if (referenced_tokens > SIZE_MAX / v_row_bytes) return failure_code;
+    const size_t referenced_v_bytes = referenced_tokens * v_row_bytes;
+    if (referenced_key_bytes > runtime->attention_span_encoded_key_buffers[slot].length ||
+        referenced_v_bytes > runtime->attention_span_v_buffers[slot].length) return failure_code;
+
     uint32_t contiguous_base_token = 0;
     const bool contiguous_blocks = termite_metal_block_table_contiguous(block_table, block_count, page_size, &contiguous_base_token) &&
         !termite_metal_prefill_sg_direct_load_disabled();
@@ -16551,8 +16570,9 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         if (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_ATTENTION_1X_GENERATED"))) {
             runtime->attention_1x_generated_pipeline = termite_metal_make_pipeline(device, precise_library, @"antfly_paged_attention_1x_generated_msl_v1");
         }
-        // Hand-written flash-prefill remains an explicit opt-in pending current
-        // model-level release evidence; the disable switch overrides the opt-in.
+        // Model-token evidence currently covers Gemma4, while this gate is
+        // process-wide. Keep the hand-written chunked flash path opt-in until
+        // the runtime can scope it per loaded model.
         runtime->attention_paged_prefill_sg_pipeline =
             termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_PREFILL_SG_ATTENTION")) &&
                 !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_PREFILL_SG_ATTENTION"))
@@ -37617,7 +37637,7 @@ static int termite_metal_decode_runtime_encode_attention_paged_update_from_f32_k
             [blit endEncoding];
         }
 
-        runtime->attention_span_slot_tokens[slot] = capacity_tokens;
+        runtime->attention_span_slot_tokens[slot] = total_tokens;
         runtime->attention_span_slot_key_row_bytes[slot] = key_row_bytes;
         runtime->attention_span_slot_v_row_stride[slot] = v_row_stride;
         runtime->attention_span_slot_position_offset[slot] = kv_position_offset;
@@ -37626,7 +37646,7 @@ static int termite_metal_decode_runtime_encode_attention_paged_update_from_f32_k
             runtime->attention_span_v_buffer = runtime->attention_span_v_buffers[slot];
             runtime->attention_span_encoded_key_capacity = runtime->attention_span_encoded_key_capacities[slot];
             runtime->attention_span_v_capacity = runtime->attention_span_v_capacities[slot];
-            runtime->attention_span_tokens = capacity_tokens;
+            runtime->attention_span_tokens = total_tokens;
             runtime->attention_span_key_row_bytes = key_row_bytes;
             runtime->attention_span_v_row_stride = v_row_stride;
             runtime->attention_span_position_offset = kv_position_offset;
@@ -37801,7 +37821,7 @@ static int termite_metal_encode_paged_quantized_kv_seed_on_encoder(
            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->paged_f32_v_seed_pipeline, v_total), 1, 1)];
     }
 
-    runtime->attention_span_slot_tokens[slot] = capacity_tokens;
+    runtime->attention_span_slot_tokens[slot] = total_tokens;
     runtime->attention_span_slot_key_row_bytes[slot] = key_row_bytes;
     runtime->attention_span_slot_v_row_stride[slot] = v_row_stride;
     runtime->attention_span_slot_position_offset[slot] = kv_position_offset;
@@ -37810,7 +37830,7 @@ static int termite_metal_encode_paged_quantized_kv_seed_on_encoder(
         runtime->attention_span_v_buffer = runtime->attention_span_v_buffers[slot];
         runtime->attention_span_encoded_key_capacity = runtime->attention_span_encoded_key_capacities[slot];
         runtime->attention_span_v_capacity = runtime->attention_span_v_capacities[slot];
-        runtime->attention_span_tokens = capacity_tokens;
+        runtime->attention_span_tokens = total_tokens;
         runtime->attention_span_key_row_bytes = key_row_bytes;
         runtime->attention_span_v_row_stride = v_row_stride;
         runtime->attention_span_position_offset = kv_position_offset;
@@ -37912,7 +37932,7 @@ static int termite_metal_encode_paged_f32_kv_seed_on_encoder(
     [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
        threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->paged_f32_kv_seed_pipeline, total), 1, 1)];
 
-    runtime->attention_span_slot_tokens[slot] = capacity_tokens;
+    runtime->attention_span_slot_tokens[slot] = total_tokens;
     runtime->attention_span_slot_key_row_bytes[slot] = key_row_bytes;
     runtime->attention_span_slot_v_row_stride[slot] = v_row_stride;
     runtime->attention_span_slot_position_offset[slot] = kv_position_offset;
@@ -37921,7 +37941,7 @@ static int termite_metal_encode_paged_f32_kv_seed_on_encoder(
         runtime->attention_span_v_buffer = runtime->attention_span_v_buffers[slot];
         runtime->attention_span_encoded_key_capacity = runtime->attention_span_encoded_key_capacities[slot];
         runtime->attention_span_v_capacity = runtime->attention_span_v_capacities[slot];
-        runtime->attention_span_tokens = capacity_tokens;
+        runtime->attention_span_tokens = total_tokens;
         runtime->attention_span_key_row_bytes = key_row_bytes;
         runtime->attention_span_v_row_stride = v_row_stride;
         runtime->attention_span_position_offset = kv_position_offset;
@@ -38716,11 +38736,12 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
         default:
             return -13;
     }
-
+    const size_t full_needed_blocks = 1u + (kv_tokens - 1u) / page_size;
+    if (full_needed_blocks > block_count) return -9;
     // iSWA scan clamp: for sliding-window layers, whole leading pages that
     // lie outside every query's window contribute exactly zero (the kernels
-    // mask per position) — skip them so scan cost tracks the window, not the
-    // full sequence. The ragged first page is still masked in-kernel.
+    // mask per position). Clamp before validating physical pages so validation
+    // cost also tracks the window rather than the full logical history.
     if (sliding_window > 0 && sliding_window < kv_tokens && !termite_metal_swa_scan_clamp_disabled()) {
         const size_t window_start = query_position_offset + 1 > sliding_window
             ? query_position_offset + 1 - sliding_window
@@ -38737,6 +38758,25 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
             }
         }
     }
+    const size_t needed_blocks = 1u + (kv_tokens - 1u) / page_size;
+    if (needed_blocks > block_count) return -9;
+    size_t referenced_tokens = 0;
+    for (size_t block = 0; block < needed_blocks; ++block) {
+        const size_t block_start = (size_t)block_table[block];
+        if (block_start > SIZE_MAX - page_size) return -9;
+        const size_t block_end = block_start + page_size;
+        if (block_end > referenced_tokens) referenced_tokens = block_end;
+    }
+    if (referenced_tokens == 0 || referenced_tokens > SIZE_MAX / key_row_bytes) return -9;
+    const size_t referenced_key_bytes = referenced_tokens * key_row_bytes;
+    const size_t v_row_stride = runtime->attention_span_slot_v_row_stride[slot];
+    if (v_row_stride == 0 || v_row_stride > SIZE_MAX / v_element_bytes) return -9;
+    const size_t v_row_bytes = v_row_stride * v_element_bytes;
+    if (referenced_tokens > SIZE_MAX / v_row_bytes) return -9;
+    const size_t referenced_v_bytes = referenced_tokens * v_row_bytes;
+    if (referenced_key_bytes > runtime->attention_span_encoded_key_buffers[slot].length ||
+        referenced_v_bytes > runtime->attention_span_v_buffers[slot].length) return -9;
+
     uint32_t contiguous_base_token = 0;
     const bool contiguous_blocks = termite_metal_block_table_contiguous(block_table, block_count, page_size, &contiguous_base_token) &&
         !termite_metal_prefill_sg_direct_load_disabled();

@@ -493,6 +493,8 @@ pub const DecodeContext = struct {
         logical_block_count: usize,
         tail_tokens: u16,
         position_offset: usize = 0,
+        max_inflight_tokens: usize = 0,
+        allow_swa_ring: bool = false,
         logical_blocks: ?[]const runtime.kv.block.KvBlockId = null,
         kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
     };
@@ -7786,6 +7788,8 @@ fn attentionContext(seq_len: usize, decode_context: ?*const DecodeContext) ops.A
                 .logical_block_count = kv.logical_block_count,
                 .tail_tokens = kv.tail_tokens,
                 .position_offset = kv.position_offset,
+                .max_inflight_tokens = kv.max_inflight_tokens,
+                .allow_swa_ring = kv.allow_swa_ring,
                 .logical_blocks = kv.logical_blocks,
                 .kv_storage = kv.kv_storage,
             }
