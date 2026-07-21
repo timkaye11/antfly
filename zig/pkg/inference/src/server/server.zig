@@ -185,7 +185,7 @@ fn parseGenerateSpeculationOptions(
             return error.InvalidSpeculationCalibration;
         }
         break :blk generation.parseSpeculationCalibration(raw).?;
-    } else if (draft_requested and policy == .auto) .probe else .none;
+    } else .none;
     return .{
         .k = @intCast(k),
         .policy = policy,
@@ -239,7 +239,11 @@ fn validateQualifiedProfileDraft(
     }
 }
 
-fn generateQueueUnitsForSpeculation(base_units: usize, draft_requested: bool, policy: generation.SpeculationPolicy) usize {
+fn generateQueueUnitsForSpeculation(
+    base_units: usize,
+    draft_requested: bool,
+    policy: generation.SpeculationPolicy,
+) usize {
     if (!draft_requested or !shouldResolveDraftModel(policy)) return base_units;
     return std.math.add(usize, base_units, base_units) catch std.math.maxInt(usize);
 }
@@ -2817,8 +2821,7 @@ pub const Node = struct {
         return estimateGenerateQueueUnitsFromShape(text_bytes, media_count, max_tokens);
     }
 
-    fn estimateGenerateRequestQueueUnits(self: *Node, body: api.GenerateRequest, max_tokens: i32) usize {
-        _ = self;
+    fn estimateGenerateRequestQueueUnits(body: api.GenerateRequest, max_tokens: i32) usize {
         var text_bytes: usize = 0;
         var media_count: usize = 0;
         for (body.messages) |msg| {
@@ -2849,10 +2852,21 @@ pub const Node = struct {
         }
 
         const base_units = estimateGenerateQueueUnitsFromShape(text_bytes, media_count, max_tokens);
-        return generateQueueUnitsForSpeculation(base_units, body.draft_model != null, .auto);
+        const speculation = parseGenerateSpeculationOptions(
+            body.draft_model != null,
+            body.speculative_k,
+            body.speculation_policy,
+            body.speculation_calibration,
+        ) catch return base_units;
+        return generateQueueUnitsForSpeculation(
+            base_units,
+            body.draft_model != null,
+            speculation.policy,
+        );
     }
 
     fn estimateGenerateBatchQueueUnitsPreflight(self: *Node, requests: []const api.GenerateBatchRequestItem, pending: []const bool) usize {
+        _ = self;
         var total: usize = 1;
         for (requests, pending) |item, is_pending| {
             if (!is_pending) continue;
@@ -2863,7 +2877,7 @@ pub const Node = struct {
             total = std.math.add(
                 usize,
                 total,
-                self.estimateGenerateRequestQueueUnits(item.body, max_tokens),
+                estimateGenerateRequestQueueUnits(item.body, max_tokens),
             ) catch std.math.maxInt(usize);
         }
         return total;
@@ -3488,11 +3502,12 @@ pub const Node = struct {
         });
 
         // Admit before resolving or decoding request media. The raw request
-        // shape is deliberately conservative (draft requests are charged as
-        // active speculation) so a rejected request cannot consume remote
-        // fetch or decoded-media memory first.
+        // shape deliberately charges every active draft request conservatively:
+        // calibration=none disables uncalibrated Gemma4 MTP, but other draft
+        // model families can still speculate. A rejected request must not
+        // consume remote fetch or decoded-media memory first.
         const media_admission = requestMediaAdmission(self, generateRequestMediaShape(body));
-        const queue_units = @max(self.estimateGenerateRequestQueueUnits(body, numeric.max_tokens), media_admission.units);
+        const queue_units = @max(estimateGenerateRequestQueueUnits(body, numeric.max_tokens), media_admission.units);
         if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
         var reserved_units = queue_units;
         defer self.releaseSlotUnits(reserved_units);
@@ -8798,7 +8813,9 @@ test "generate speculation options validate the HTTP trust boundary" {
     const defaults = try parseGenerateSpeculationOptions(true, null, null, null);
     try std.testing.expectEqual(@as(u32, 4), defaults.k);
     try std.testing.expectEqual(generation.SpeculationPolicy.auto, defaults.policy);
-    try std.testing.expectEqual(generation.SpeculationCalibration.probe, defaults.calibration);
+    try std.testing.expectEqual(generation.SpeculationCalibration.none, defaults.calibration);
+    const probing = try parseGenerateSpeculationOptions(true, null, null, "probe");
+    try std.testing.expectEqual(generation.SpeculationCalibration.probe, probing.calibration);
     const forced = try parseGenerateSpeculationOptions(true, null, "force", null);
     try std.testing.expectEqual(generation.SpeculationCalibration.none, forced.calibration);
     try std.testing.expect(!shouldResolveDraftModel(.off));
@@ -8814,6 +8831,22 @@ test "generate speculation options validate the HTTP trust boundary" {
     try std.testing.expectError(error.InvalidSpeculationPolicy, parseGenerateSpeculationOptions(true, 4, "sometimes", null));
     try std.testing.expectError(error.InvalidSpeculationCalibration, parseGenerateSpeculationOptions(true, 4, null, "calibrate"));
     try std.testing.expectError(error.InvalidSpeculationCalibration, parseGenerateSpeculationOptions(true, 4, null, "unknown"));
+}
+
+test "generate queue units conservatively charge active draft requests" {
+    const request_json =
+        \\{"model":"m","draft_model":"draft","messages":[{"role":"user","content":"hello"}]}
+    ;
+    var parsed = try std.json.parseFromSlice(api.GenerateRequest, std.testing.allocator, request_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 6), Node.estimateGenerateRequestQueueUnits(parsed.value, 256));
+    var probing = parsed.value;
+    probing.speculation_calibration = "probe";
+    try std.testing.expectEqual(@as(usize, 6), Node.estimateGenerateRequestQueueUnits(probing, 256));
+    var off = parsed.value;
+    off.speculation_policy = "off";
+    try std.testing.expectEqual(@as(usize, 3), Node.estimateGenerateRequestQueueUnits(off, 256));
 }
 
 test "generate numeric options validate narrowing at the HTTP trust boundary" {

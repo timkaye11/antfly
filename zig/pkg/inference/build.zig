@@ -779,6 +779,20 @@ pub fn build(b: *std.Build) void {
     );
     metal_gemma4_prefill_block_parity_test_step.dependOn(&metal_gemma4_prefill_block_parity_test.step);
 
+    const metal_gemma4_mtp_long_context_test = b.addSystemCommand(&.{
+        "bash",
+        "scripts/test_metal_gemma4_mtp_long_context.sh",
+    });
+    metal_gemma4_mtp_long_context_test.step.dependOn(b.getInstallStep());
+    const metal_gemma4_mtp_long_context_test_step = b.step(
+        "test-metal-gemma4-mtp-long-context",
+        "Run the 2,003-token Metal Gemma4 target/MTP exact-token regression gate",
+    );
+    metal_gemma4_mtp_long_context_test_step.dependOn(&metal_gemma4_mtp_long_context_test.step);
+    if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        quant_kernel_metal_model_local_check_step.dependOn(&metal_gemma4_mtp_long_context_test.step);
+    }
+
     const metal_gemma4_tool_calling_test = b.addSystemCommand(&.{
         "bash",
         "scripts/test_metal_gemma4_tool_calling.sh",
@@ -852,7 +866,9 @@ pub fn build(b: *std.Build) void {
     });
     metal_bench_exe.root_module.addImport("build_options", build_options_mod);
     metal_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    configureNativeTool(b, metal_bench_exe, target, enable_system_blas, blas_root, enable_metal);
+    // inference_internal already owns the native backend links. Configuring
+    // Metal again here compiles metal_kernels.m twice into this executable.
+    metal_bench_exe.root_module.link_libc = true;
     const run_metal_bench = b.addRunArtifact(metal_bench_exe);
     if (b.args) |args| {
         run_metal_bench.addArgs(args);
@@ -862,6 +878,23 @@ pub fn build(b: *std.Build) void {
         "Run the focused Metal kernel benchmark; pass --mode and shape filters after --",
     );
     metal_bench_step.dependOn(&run_metal_bench.step);
+
+    const q4_mm_aligned_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mm_aligned_route_check.addArgs(&.{ "--mode", "linear", "--rows", "32", "--in", "2560", "--out", "4096", "--warmup", "1", "--iters", "1", "--expect-q4-route", "aligned" });
+    const q4_mm_aligned_tail_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mm_aligned_tail_route_check.addArgs(&.{ "--mode", "linear", "--rows", "31", "--in", "2560", "--out", "512", "--warmup", "1", "--iters", "1", "--expect-q4-route", "aligned-tail" });
+    q4_mm_aligned_tail_route_check.step.dependOn(&q4_mm_aligned_route_check.step);
+    const q4_mm_unrolled_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mm_unrolled_route_check.addArgs(&.{ "--mode", "linear", "--rows", "32", "--in", "2048", "--out", "2560", "--warmup", "1", "--iters", "1", "--expect-q4-route", "unrolled" });
+    q4_mm_unrolled_route_check.step.dependOn(&q4_mm_aligned_tail_route_check.step);
+    const q4_mm_route_check_step = b.step(
+        "test-metal-q4-0-mm-routes",
+        "Run on-device assertions for the promoted aligned, aligned-tail, and unrolled Q4_0 MM routes",
+    );
+    q4_mm_route_check_step.dependOn(&q4_mm_unrolled_route_check.step);
+    if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        quant_kernel_metal_local_check_step.dependOn(&q4_mm_unrolled_route_check.step);
+    }
 
     const run_finetune = b.addRunArtifact(exe);
     run_finetune.step.dependOn(b.getInstallStep());

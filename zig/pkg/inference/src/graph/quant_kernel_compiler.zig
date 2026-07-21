@@ -3048,20 +3048,21 @@ fn cudaAttentionSchedule(head_dim: u16, split_variant: cuda_renderer.AttentionSp
 // Second `op_kind = .attention` route: the simdgroup-MMA flash prefill kernel
 // (`termite_paged_attention_kv_prefill_sg`), brought under the compiler as a
 // `--sweep`-tunable route. The checked-in schedule below is the baseline
-// (`key_chunk=32, skip_rescale=false`), which renders byte-for-byte the
-// hand-written kernel (modulo the self-contained params/helper renames) so the
-// generated route is bit-identical model tokens. The sweep enumerates the
+// (`key_chunk=32, skip_rescale=false`), which preserves the hand-written
+// kernel's MMA and online-softmax order while replacing the large K/V gather
+// scratch with page-local loads. The sweep enumerates the
 // `key_chunk ∈ {32,64}` × `skip_rescale ∈ {false,true}` variants in memory; only
-// the baseline is checked in / runtime-embedded / model-gated. Dev-only candidate
-// (opt-in kill switch TERMITE_METAL_ENABLE_FLASH_PREFILL_GENERATED) until it
-// clears the prefill model-token acceptance gate.
+// the baseline is checked in / runtime-embedded / model-gated. Production
+// defaults to it only for the attested Gemma4 E4B geometry; other compatible
+// geometries remain opt-in and retain the handwritten fallback.
 pub const first_prefill_flash_metal_kernel_id = "antfly_paged_attention_prefill_flash_generated_msl_v1";
 pub const first_prefill_flash_metal_source_path = "src/ops/metal/generated/attention_prefill_flash.metal";
 pub const first_prefill_flash_metal_air_path = "/tmp/antfly_paged_attention_prefill_flash_generated_msl_v1.air";
 pub const first_prefill_flash_metal_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/attention_prefill_flash.metal -o /tmp/antfly_paged_attention_prefill_flash_generated_msl_v1.air";
 /// Baseline flash-prefill schedule: 128 threads / 4 simdgroups (structural),
-/// `key_chunk=32` + `skip_rescale=false` (byte-identical to the hand-written
-/// dispatch: grid ((q_len+7)/8, heads), threadgroup memory 80*hd + 2016 bytes).
+/// `key_chunk=32` + `skip_rescale=false` (same arithmetic order as the
+/// hand-written dispatch); grid ((q_len+7)/8, heads), threadgroup memory
+/// 24*hd + 2016 bytes.
 pub const first_prefill_flash_metal_schedule = KernelSchedule{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree, .key_chunk = 32, .skip_rescale = false };
 
 // Gemma4 global attention: the same paged flash semantics with a fixed
@@ -3071,7 +3072,7 @@ pub const first_prefill_flash_hd512_metal_kernel_id = "antfly_paged_attention_pr
 pub const first_prefill_flash_hd512_metal_source_path = "src/ops/metal/generated/attention_prefill_flash_hd512.metal";
 pub const first_prefill_flash_hd512_metal_air_path = "/tmp/antfly_paged_attention_prefill_flash_hd512_generated_msl_v1.air";
 pub const first_prefill_flash_hd512_metal_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/attention_prefill_flash_hd512.metal -o /tmp/antfly_paged_attention_prefill_flash_hd512_generated_msl_v1.air";
-pub const first_prefill_flash_hd512_metal_schedule = KernelSchedule{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree, .key_chunk = 32, .skip_rescale = false };
+pub const first_prefill_flash_hd512_metal_schedule = KernelSchedule{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree, .key_chunk = 64, .skip_rescale = false };
 
 pub const first_general_metal_q4_0_kernel_id = "antfly_q4_0_small_batch_msl_v1";
 pub const first_general_metal_q4_0_source_path = "src/ops/metal/generated/quant_kernel_q4_0_small_batch.metal";
@@ -4065,12 +4066,14 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .backend = .metal,
         .op = .{ .attention = .{
             .kind = .prefill_flash,
+            .head_dim = 256,
             .schedule = first_prefill_flash_metal_schedule,
         } },
         .kernel_id = first_prefill_flash_metal_kernel_id,
         .source_path = first_prefill_flash_metal_source_path,
         .check_command = first_prefill_flash_metal_check_command,
-        .production_enabled = false,
+        .production_enabled = true,
+        .runtime_default_enabled = true,
     },
     .{
         .backend = .metal,
@@ -5074,12 +5077,12 @@ const first_prefill_flash_metal_source = renderMetalAttentionSource(
         .plan_id = "metal/attention/prefill_flash",
         .kernel_id = first_prefill_flash_metal_kernel_id,
         .production_baseline = "termite_paged_attention_kv_prefill_sg",
-        .production_enabled = false,
-        .promotion_comment = "// Descriptor-driven simdgroup-MMA flash prefill attention (--sweep-tunable route)." ++ "\n" ++
-            "// This is the key_chunk=32/skip_rescale=false baseline: byte-for-byte the" ++ "\n" ++
-            "// hand-written termite_paged_attention_kv_prefill_sg (modulo the self-contained" ++ "\n" ++
-            "// params/helper renames). Production prefill stays on the hand-written kernel" ++ "\n" ++
-            "// until this candidate clears its bit-identical model-token acceptance gate.",
+        .production_enabled = true,
+        .promotion_comment = "// Descriptor-driven low-memory simdgroup-MMA flash prefill attention." ++ "\n" ++
+            "// The key_chunk=32/skip_rescale=false baseline preserves the hand-written" ++ "\n" ++
+            "// arithmetic order while using page-local K/V loads and direct output stores." ++ "\n" ++
+            "// Production defaults to this route only for Gemma4 E4B local attention;" ++ "\n" ++
+            "// capability checks and the handwritten fallback remain authoritative.",
     },
     .prefill_flash,
     first_prefill_flash_metal_schedule,
@@ -11270,12 +11273,14 @@ test "quant kernel compiler attention artifacts carry typed render plans" {
         try std.testing.expectEqual(OpKind.attention, artifact.opKind());
         const op = artifact.attentionOp() orelse return error.MissingAttentionArtifactOp;
         try std.testing.expect(op.schedule.threads_per_threadgroup > 0);
-        const promoted_hd512 = artifact.backend == .metal and
-            std.mem.eql(u8, artifact.kernel_id, first_prefill_flash_hd512_metal_kernel_id);
-        // The Gemma4 HD512 flash route cleared its capability and model-token
-        // gates. Every other generated attention artifact remains dev-only.
-        try std.testing.expectEqual(promoted_hd512, artifact.production_enabled);
-        try std.testing.expectEqual(promoted_hd512, artifact.runtime_default_enabled);
+        const promoted_gemma4_flash = artifact.backend == .metal and
+            (std.mem.eql(u8, artifact.kernel_id, first_prefill_flash_metal_kernel_id) or
+                std.mem.eql(u8, artifact.kernel_id, first_prefill_flash_hd512_metal_kernel_id));
+        // The Gemma4 local and global flash routes cleared their capability and
+        // model-token gates. Every other generated attention artifact remains
+        // dev-only.
+        try std.testing.expectEqual(promoted_gemma4_flash, artifact.production_enabled);
+        try std.testing.expectEqual(promoted_gemma4_flash, artifact.runtime_default_enabled);
         const source = generatedSourceForArtifact(artifact) orelse return error.MissingGeneratedSource;
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, artifact.kernel_id));
         const kernel_decl = switch (artifact.backend) {
@@ -11426,15 +11431,112 @@ test "quant kernel compiler pins the paged-attention params layout drift guard" 
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, flash_threads));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, flash_key_chunk));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, rms_threads));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "termite_metal_threadgroup_memory_16(TERMITE_METAL_GENERATED_FLASH_MEMORY_BYTES(head_dim))"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "termite_metal_threadgroup_memory_16(prefill_sg_memory_bytes)"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, host_source, "TERMITE_METAL_HANDWRITTEN_FLASH_MEMORY_BYTES(head_dim)"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "? TERMITE_METAL_GENERATED_FLASH_MEMORY_BYTES(head_dim)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "BOOL missing_requested_generated_pipeline"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "runtime->generated_attention_decode_1x_calls += 1"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "runtime->generated_attention_flash_prefill_calls += 1"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "runtime->generated_attention_flash_prefill_hd512_calls += 1"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_GENERATED_FLASH_HD512_MEMORY_BYTES 12224u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_GENERATED_FLASH_HD512_MEMORY_BYTES 13888u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_DISABLE_PREFILL_FLASH_HD512"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "runtime->generated_rms_norm_calls += 1"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "return termite_metal_encode_rms_norm_generated("));
+}
+
+test "metal runtime source narrowly gates the small-row split GQA route" {
+    const host_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(host_source);
+
+    // Stage 1 maps query rows x KV heads x context splits and shares each KV
+    // tile across the four query heads in the group.
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kernel void termite_paged_attention_kv_decode_gqa_split_stage("));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kernel void termite_paged_attention_kv_decode_gqa_split_reduce("));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "const uint qi = tg.x; const uint kv_h = tg.y; const uint split = tg.z;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "const uint query_pos = p.query_position_offset + qi;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "for (uint kc = split * 32u; kc < p.kv_tokens; kc += split_count * 32u)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "sS[j] = sS[j] * corr + row_sum"));
+
+    // Split is the innermost SoA dimension. The reducer performs the stable
+    // M/S/O merge with SIMD reductions over all active splits.
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "partial_o[(qh * (hd / 4u) + d4) * 32u + split]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "float merged_m = simd_max(M)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "float denom = simd_sum(S * weight)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "float4 merged = simd_sum(value * weight)"));
+
+    // Both live encoders share one opt-in gate, preserve 1x fallback, use a
+    // fixed persistent private scratch allocation, and track stage write then
+    // reducer read/output write so the buffer barrier cannot disappear.
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_ENABLE_DECODE_GQA_SPLIT"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_DISABLE_DECODE_GQA_SPLIT"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_ENABLE_DECODE_GQA_FLASH"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, host_source, "termite_metal_decode_gqa_split_eligible("));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "dispatchThreadgroups:MTLSizeMake(q_len, num_kv_heads, split_count)"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "const bool use_decode_1x = !use_decode_gqa_split"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "decode_gqa_split_scratch_buffer, 0, split_scratch_bytes, TERMITE_METAL_PLANNED_RANGE_READ"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "use_decode_gqa_split ? 0u : output_offset,\n            use_decode_gqa_split ? split_scratch_bytes"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "if (needs_explicit_split_barrier) [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "runtime->decode_gqa_split_calls += 1"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_DECODE_GQA_SPLIT_SCRATCH_MAX_BYTES 1052672u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "options:MTLResourceStorageModePrivate"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "scratch_runtime->submitted_frame_cb != nil"));
+
+    // Gemma4 E4B's measured route is exact 8Q/2KV f16 KV, q_len 1-2,
+    // HD256 SWA-512 or HD512 global attention.
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "num_heads != 8u || num_kv_heads != 2u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "q_len > 2u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "output_offset % (4u * sizeof(float)) != 0u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "head_dim == 256u && sliding_window == 512u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "head_dim == 512u && sliding_window == 0u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kv_tokens < 512u"));
+
+    // A ragged final KV tile must gather each physical V row and explicitly
+    // zero masked lanes. Loading an entire private-buffer tile lets NaN page
+    // padding contaminate the MMA even when its probability is zero.
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "if (kc + kk8 * 8u + 8u <= p.kv_tokens)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "sv[vi] = vphys != 0xffffffffu ? v_half[vphys * p.v_row_stride + kv_head_base + d8 + vc] : half(0.0f)"));
+}
+
+test "metal runtime source gates aligned and unrolled Q4 MM to measured shapes" {
+    const host_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(host_source);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kernel void termite_q4_0_linear_mm_sg_aligned("));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kernel void termite_q4_0_linear_mm_sg_aligned_tail("));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_ENABLE_Q4_0_MM_SG_ALIGNED"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_DISABLE_Q4_0_MM_SG_ALIGNED"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "termite_dequantize_q4_0_4x4_half(x, il0, temp_a);"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "*(threadgroup half2x4 *)(sb + 64 * ib + 8 * ly) = (half2x4)(*((device const float2x4 *)y));"));
+
+    // Measured E4B FFN and projection matrices default to aligned full/tail
+    // routes. Only the measured 2048<->2560 full-tile projection may use the
+    // unrolled route; explicit enable keeps the wider aligned experiment.
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "q4_0_mm_sg_aligned_e4b_ffn"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "descriptor->in_dim == 2560u && descriptor->out_dim == 10240u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "descriptor->in_dim == 10240u && descriptor->out_dim == 2560u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "q4_0_mm_sg_aligned_e4b_projection"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "descriptor->in_dim == 2560u && descriptor->out_dim == 4096u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "descriptor->in_dim == 4096u && descriptor->out_dim == 2560u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "q4_0_mm_sg_aligned_e4b_tail_projection"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "descriptor->out_dim == 256u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "descriptor->out_dim == 512u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "descriptor->out_dim == 1024u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "descriptor->out_dim == 2048u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "descriptor->rows % 32u == 0u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "q4_0_mm_sg_unrolled_measured_projection"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "descriptor->in_dim == 2048u && descriptor->out_dim == 2560u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "descriptor->in_dim == 2560u && descriptor->out_dim == 2048u"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, host_source, 1, "descriptor->out_dim >= 1024u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "runtime->q4_0_mm_sg_aligned_dispatches += 1"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "runtime->q4_0_mm_sg_aligned_tail_dispatches += 1"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "runtime->q4_0_mm_sg_unrolled_dispatches += 1"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "descriptor->out_dim % 64u == 0u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "descriptor->in_dim % 32u == 0u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "descriptor->input_offset % 16u == 0u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "descriptor->rows % 32u != 0u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "runtime->q4_0_mm_sg_aligned_tail_pipeline"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "const short nr1 = short(min(uint(NR1), p.rows - uint(r1)))"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "const short lr1 = short(min(int(tiitg) / int(NL1), int(nr1) - 1))"));
 }
 
 test "quant kernel compiler emits single-sourced backend source for every generated artifact" {

@@ -276,6 +276,76 @@ extern fn termite_metal_decode_runtime_ready(runtime: ?*RawMetalDecodeRuntime) c
 extern fn termite_metal_decode_runtime_begin_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
 extern fn termite_metal_decode_runtime_submit_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
 extern fn termite_metal_decode_runtime_wait_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
+extern fn termite_metal_decode_runtime_reset_attention_span_slot(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+) c_int;
+extern fn termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    format: u32,
+    token_capacity: usize,
+    key_row_bytes: usize,
+    v_row_stride: usize,
+) c_int;
+extern fn termite_metal_decode_runtime_attention_span_slot_info(
+    runtime: ?*const RawMetalDecodeRuntime,
+    slot: usize,
+    encoded_key_handle_out: ?*?*anyopaque,
+    encoded_key_capacity_out: ?*usize,
+    v_handle_out: ?*?*anyopaque,
+    v_capacity_out: ?*usize,
+    tokens_out: ?*usize,
+    key_row_bytes_out: ?*usize,
+    v_row_stride_out: ?*usize,
+    position_offset_out: ?*usize,
+) c_int;
+extern fn termite_metal_decode_runtime_update_attention_paged_from_f32_key_device_slot(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    format: u32,
+    k_handle: ?*anyopaque,
+    k_offset: usize,
+    v_handle: ?*anyopaque,
+    v_offset: usize,
+    total_tokens: usize,
+    suffix_tokens: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    key_row_bytes: usize,
+    base_key_row_bytes: usize,
+    v_row_stride: usize,
+    kv_position_offset: usize,
+    block_table: [*c]const u32,
+    block_count: usize,
+    page_size: usize,
+) c_int;
+extern fn termite_metal_decode_runtime_attention_paged_slot_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    format: u32,
+    q_handle: ?*anyopaque,
+    q_offset: usize,
+    block_table: [*c]const u32,
+    block_count: usize,
+    page_size: usize,
+    q_len: usize,
+    kv_tokens: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    key_row_bytes: usize,
+    base_key_row_bytes: usize,
+    query_position_offset: usize,
+    kv_position_offset: usize,
+    sliding_window: usize,
+    softcap: f32,
+    sinks: ?[*]const f32,
+    sink_count: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+extern fn termite_metal_decode_runtime_decode_gqa_split_calls(runtime: ?*const RawMetalDecodeRuntime) u64;
 extern fn termite_metal_decode_runtime_prepare_quantized_linear_slot(
     runtime: ?*RawMetalDecodeRuntime,
     format: u32,
@@ -1159,9 +1229,9 @@ fn runAttentionCheck(allocator: std.mem.Allocator, check: AttentionCheckCase) !C
 // ---- Flash-prefill (multi-query) attention conformance -------------------
 // The flash-prefill route dispatches a different grid / thread count / shmem
 // layout than decode-1x, so it has its own oracle + runner + shape set. Every
-// case is the simplest case: f16 KV, single contiguous block, no sinks, softcap
-// 0 — exercising a multi-query prefill tile against the causal + sliding-window
-// masks. Isolated float parity is a loose compile/dispatch sanity check (the
+// case uses f16 KV, no sinks, and softcap 0, with dense, permuted, and offset
+// physical pages exercising multi-query prefill against the causal +
+// sliding-window masks. Isolated float parity is a loose compile/dispatch sanity check (the
 // flash online-softmax + f16 Q/P rounding diverge from a plain-f32 reference);
 // the real gate is bit-identical model tokens with the generated route enabled.
 
@@ -1177,24 +1247,41 @@ const FlashPrefillShape = struct {
     sliding_window: usize,
     page_size: usize = 0,
     permuted_pages: bool = false,
+    physical_page_bias: usize = 0,
 };
 
-/// Representative prefill tiles: causal prompts (q_len == kv, qpo 0), a GQA/MHA
-/// spread of head_dims (64/128/256, all valid at the checked-in key_chunk=32),
-/// plus extend-with-sliding cases (qpo>0, kv includes the ragged tail so both the
-/// direct-load and gather paths fire). head_dim=256 stays under the 32 KB
-/// threadgroup limit at key_chunk=32 (80*256+2016 = 22496 bytes).
+/// Representative Gemma4 local-attention tiles for the exact head_dim=256
+/// specialization, including sliding, permuted, and ragged-final-page cases.
 const flash_prefill_shapes = [_]FlashPrefillShape{
-    .{ .q_len = 8, .kv_tokens = 8, .num_heads = 2, .num_kv_heads = 1, .head_dim = 64, .query_position_offset = 0, .sliding_window = 0 },
-    .{ .q_len = 16, .kv_tokens = 16, .num_heads = 4, .num_kv_heads = 2, .head_dim = 128, .query_position_offset = 0, .sliding_window = 0 },
-    .{ .q_len = 8, .kv_tokens = 32, .num_heads = 4, .num_kv_heads = 1, .head_dim = 64, .query_position_offset = 24, .sliding_window = 8 },
-    .{ .q_len = 32, .kv_tokens = 32, .num_heads = 8, .num_kv_heads = 8, .head_dim = 128, .query_position_offset = 0, .sliding_window = 0 },
     .{ .q_len = 12, .kv_tokens = 48, .num_heads = 4, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 36, .sliding_window = 16 },
+    .{ .q_len = 8, .kv_tokens = 64, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 0, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 },
+    .{ .q_len = 13, .kv_tokens = 50, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 37, .sliding_window = 0, .page_size = 16, .permuted_pages = true },
+    .{ .q_len = 256, .kv_tokens = 512, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 256, .sliding_window = 512, .page_size = 16, .permuted_pages = true },
 };
 
 const flash_prefill_hd512_shapes = [_]FlashPrefillShape{
+    // Production Gemma4 E4B global-attention geometry (8Q/2KV, 4:1 GQA).
+    .{ .q_len = 8, .kv_tokens = 64, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 0, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 },
+    .{ .q_len = 8, .kv_tokens = 64, .num_heads = 16, .num_kv_heads = 1, .head_dim = 512, .query_position_offset = 0, .sliding_window = 0, .page_size = 16, .permuted_pages = true },
     .{ .q_len = 8, .kv_tokens = 32, .num_heads = 16, .num_kv_heads = 1, .head_dim = 512, .query_position_offset = 24, .sliding_window = 0, .page_size = 16, .permuted_pages = true },
     .{ .q_len = 12, .kv_tokens = 48, .num_heads = 16, .num_kv_heads = 1, .head_dim = 512, .query_position_offset = 36, .sliding_window = 0, .page_size = 16, .permuted_pages = true },
+    .{ .q_len = 13, .kv_tokens = 50, .num_heads = 16, .num_kv_heads = 1, .head_dim = 512, .query_position_offset = 37, .sliding_window = 0, .page_size = 16, .permuted_pages = true },
+    .{ .q_len = 256, .kv_tokens = 512, .num_heads = 16, .num_kv_heads = 1, .head_dim = 512, .query_position_offset = 0, .sliding_window = 0, .page_size = 16, .permuted_pages = true },
+};
+
+const SplitGqaCheckCase = struct {
+    name: []const u8,
+    shape: FlashPrefillShape,
+};
+
+// Production Gemma4 E4B decode geometries. 513 tokens leaves one valid row in
+// the final 8-row V tile; reversed pages plus a leading physical-page gap make
+// every masked lane observable when the unused private storage is NaN-poisoned.
+const split_gqa_checks = [_]SplitGqaCheckCase{
+    .{ .name = "decode_gqa_split_q1_hd256_swa512", .shape = .{ .q_len = 1, .kv_tokens = 513, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 512, .sliding_window = 512, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
+    .{ .name = "decode_gqa_split_q2_hd256_swa512", .shape = .{ .q_len = 2, .kv_tokens = 513, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 511, .sliding_window = 512, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
+    .{ .name = "decode_gqa_split_q1_hd512_global", .shape = .{ .q_len = 1, .kv_tokens = 513, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 512, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
+    .{ .name = "decode_gqa_split_q2_hd512_global", .shape = .{ .q_len = 2, .kv_tokens = 513, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 511, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
 };
 
 const FlashPrefillCheckCase = struct {
@@ -1256,9 +1343,9 @@ fn flashPrefillRuntimeCheck(comptime artifact: quant_kernel_compiler.GeneratedAr
         .key_chunk = @intCast(op.schedule.key_chunk),
         .threads_per_threadgroup = @intCast(op.schedule.threads_per_threadgroup),
         .threadgroup_memory_bytes = if (op.head_dim == 512)
-            12_224
+            13_888
         else
-            @intCast((8 + op.schedule.key_chunk) * shape.head_dim * 2 + 52 * op.schedule.key_chunk + 352),
+            @intCast(24 * shape.head_dim + 52 * op.schedule.key_chunk + 352),
         // Loose sanity bound: the flash online softmax rounds Q and the P weights
         // through f16 and accumulates in a different order than the f32 reference,
         // so the divergence on O(0.3) outputs runs a few 1e-2. 5e-2 keeps a wide
@@ -1369,18 +1456,22 @@ fn runFlashPrefillCheck(allocator: std.mem.Allocator, check: FlashPrefillCheckCa
     }
 
     const page_size = if (shape.page_size == 0) kv else shape.page_size;
-    if (page_size == 0 or kv % page_size != 0) return error.InvalidArgument;
-    const page_count = kv / page_size;
+    if (page_size == 0) return error.InvalidArgument;
+    const page_count = (kv + page_size - 1) / page_size;
     const block_table = try allocator.alloc(u32, page_count);
     defer allocator.free(block_table);
     for (block_table, 0..) |*offset, logical_page| {
-        const physical_page = if (shape.permuted_pages) page_count - 1 - logical_page else logical_page;
+        const page_within_span = if (shape.permuted_pages) page_count - 1 - logical_page else logical_page;
+        const physical_page = shape.physical_page_bias + page_within_span;
         offset.* = @intCast(physical_page * page_size);
     }
-    const key = try allocator.alloc(u16, logical_key.len);
+    const physical_tokens = (shape.physical_page_bias + page_count) * page_size;
+    const key = try allocator.alloc(u16, physical_tokens * nkv * hd);
     defer allocator.free(key);
-    const v = try allocator.alloc(u16, logical_v.len);
+    @memset(key, 0x7e00); // Poison unwritten page padding: masked lanes must never leak NaNs.
+    const v = try allocator.alloc(u16, physical_tokens * nkv * hd);
     defer allocator.free(v);
+    @memset(v, 0x7e00);
     const row_values = nkv * hd;
     for (0..kv) |logical_token| {
         const logical_page = logical_token / page_size;
@@ -1451,6 +1542,240 @@ fn runFlashPrefillCheck(allocator: std.mem.Allocator, check: FlashPrefillCheckCa
         }
     }
     return .{ .max_error = max_error, .measure_iters = check.measure_iters, .elapsed_nanos = elapsed_nanos };
+}
+
+const SplitGqaCheckResult = struct {
+    max_error: f32,
+    route_calls: u64,
+};
+
+fn runSplitGqaCheck(
+    allocator: std.mem.Allocator,
+    runtime: *RawMetalDecodeRuntime,
+    check: SplitGqaCheckCase,
+) !SplitGqaCheckResult {
+    const shape = check.shape;
+    const q_len = shape.q_len;
+    const kv = shape.kv_tokens;
+    const nh = shape.num_heads;
+    const nkv = shape.num_kv_heads;
+    const hd = shape.head_dim;
+    const q_width = nh * hd;
+    const kv_width = nkv * hd;
+    const page_size = shape.page_size;
+    const f16_kv_format: u32 = 3;
+    const slot: usize = 0;
+    const key_row_bytes = kv_width * @sizeOf(u16);
+
+    const q = try allocator.alloc(f32, q_len * q_width);
+    defer allocator.free(q);
+    for (q, 0..) |*value, i| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 5) % 17)) - 8)) / 32.0;
+    }
+
+    const logical_key = try allocator.alloc(u16, kv * kv_width);
+    defer allocator.free(logical_key);
+    const key_source = try allocator.alloc(f32, logical_key.len);
+    defer allocator.free(key_source);
+    for (logical_key, key_source, 0..) |*bits, *source, i| {
+        bits.* = f32ToHalfBits(@as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + 1) % 23)) - 11)) / 40.0);
+        source.* = halfBitsToF32(bits.*);
+    }
+    const logical_v = try allocator.alloc(u16, kv * kv_width);
+    defer allocator.free(logical_v);
+    const v_source = try allocator.alloc(f32, logical_v.len);
+    defer allocator.free(v_source);
+    for (logical_v, v_source, 0..) |*bits, *source, i| {
+        bits.* = f32ToHalfBits(@as(f32, @floatFromInt(@as(i32, @intCast((i * 3 + 5) % 19)) - 9)) / 24.0);
+        source.* = halfBitsToF32(bits.*);
+    }
+
+    const page_count = (kv + page_size - 1) / page_size;
+    const block_table = try allocator.alloc(u32, page_count);
+    defer allocator.free(block_table);
+    var physical_tokens: usize = 0;
+    for (block_table, 0..) |*offset, logical_page| {
+        const page_within_span = if (shape.permuted_pages) page_count - 1 - logical_page else logical_page;
+        const physical_page = shape.physical_page_bias + page_within_span;
+        const physical_offset = physical_page * page_size;
+        offset.* = @intCast(physical_offset);
+        physical_tokens = @max(physical_tokens, physical_offset + page_size);
+    }
+
+    const expected = try allocator.alloc(f32, q.len);
+    defer allocator.free(expected);
+    try referenceFlashPrefill(allocator, q, logical_key, logical_v, shape, expected);
+    const actual = try allocator.alloc(f32, q.len);
+    defer allocator.free(actual);
+
+    const q_buffer = termite_metal_buffer_alloc(runtime, q.len * @sizeOf(f32), metal_storage_private) orelse return error.MetalRuntimeUnavailable;
+    defer termite_metal_buffer_release(q_buffer);
+    const key_source_buffer = termite_metal_buffer_alloc(runtime, key_source.len * @sizeOf(f32), metal_storage_private) orelse return error.MetalRuntimeUnavailable;
+    defer termite_metal_buffer_release(key_source_buffer);
+    const v_source_buffer = termite_metal_buffer_alloc(runtime, v_source.len * @sizeOf(f32), metal_storage_private) orelse return error.MetalRuntimeUnavailable;
+    defer termite_metal_buffer_release(v_source_buffer);
+    const output_buffer = termite_metal_buffer_alloc(runtime, actual.len * @sizeOf(f32), metal_storage_private) orelse return error.MetalRuntimeUnavailable;
+    defer termite_metal_buffer_release(output_buffer);
+    if (termite_metal_buffer_upload(runtime, q_buffer, 0, q.ptr, q.len * @sizeOf(f32)) != 0 or
+        termite_metal_buffer_upload(runtime, key_source_buffer, 0, key_source.ptr, key_source.len * @sizeOf(f32)) != 0 or
+        termite_metal_buffer_upload(runtime, v_source_buffer, 0, v_source.ptr, v_source.len * @sizeOf(f32)) != 0)
+    {
+        return error.GeneratedMetalKernelFailed;
+    }
+
+    if (termite_metal_decode_runtime_reset_attention_span_slot(runtime, slot) != 0 or
+        termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
+            runtime,
+            slot,
+            f16_kv_format,
+            physical_tokens,
+            key_row_bytes,
+            kv_width,
+        ) != 0)
+    {
+        return error.GeneratedMetalKernelFailed;
+    }
+
+    var encoded_key_handle: ?*anyopaque = null;
+    var encoded_key_capacity: usize = 0;
+    var v_handle: ?*anyopaque = null;
+    var v_capacity: usize = 0;
+    if (termite_metal_decode_runtime_attention_span_slot_info(
+        runtime,
+        slot,
+        &encoded_key_handle,
+        &encoded_key_capacity,
+        &v_handle,
+        &v_capacity,
+        null,
+        null,
+        null,
+        null,
+    ) != 0 or encoded_key_handle == null or v_handle == null) {
+        return error.GeneratedMetalKernelFailed;
+    }
+
+    const poison = try allocator.alloc(u16, physical_tokens * kv_width);
+    defer allocator.free(poison);
+    @memset(poison, 0x7e00);
+    const poison_bytes = poison.len * @sizeOf(u16);
+    if (encoded_key_capacity < poison_bytes or v_capacity < poison_bytes or
+        termite_metal_buffer_upload(runtime, encoded_key_handle, 0, poison.ptr, poison_bytes) != 0 or
+        termite_metal_buffer_upload(runtime, v_handle, 0, poison.ptr, poison_bytes) != 0)
+    {
+        return error.GeneratedMetalKernelFailed;
+    }
+
+    const seed_rc = termite_metal_decode_runtime_update_attention_paged_from_f32_key_device_slot(
+        runtime,
+        slot,
+        f16_kv_format,
+        key_source_buffer,
+        0,
+        v_source_buffer,
+        0,
+        kv,
+        kv,
+        nkv,
+        hd,
+        key_row_bytes,
+        key_row_bytes,
+        kv_width,
+        0,
+        block_table.ptr,
+        block_table.len,
+        page_size,
+    );
+    if (seed_rc != 0) {
+        std.debug.print("split GQA seed failed {s} rc={d}\n", .{ check.name, seed_rc });
+        return error.GeneratedMetalKernelFailed;
+    }
+
+    const calls_before = termite_metal_decode_runtime_decode_gqa_split_calls(runtime);
+    const attention_rc = termite_metal_decode_runtime_attention_paged_slot_device(
+        runtime,
+        slot,
+        f16_kv_format,
+        q_buffer,
+        0,
+        block_table.ptr,
+        block_table.len,
+        page_size,
+        q_len,
+        kv,
+        nh,
+        nkv,
+        hd,
+        key_row_bytes,
+        key_row_bytes,
+        shape.query_position_offset,
+        0,
+        shape.sliding_window,
+        0.0,
+        null,
+        0,
+        output_buffer,
+        0,
+    );
+    if (attention_rc != 0) {
+        std.debug.print("split GQA attention failed {s} rc={d}\n", .{ check.name, attention_rc });
+        return error.GeneratedMetalKernelFailed;
+    }
+    const calls_after = termite_metal_decode_runtime_decode_gqa_split_calls(runtime);
+    if (calls_after != calls_before + 1) {
+        std.debug.print("split GQA route missed {s}: before={d} after={d}\n", .{ check.name, calls_before, calls_after });
+        return error.GeneratedMetalKernelMismatch;
+    }
+    if (termite_metal_buffer_download(runtime, output_buffer, 0, actual.ptr, actual.len * @sizeOf(f32)) != 0) {
+        return error.GeneratedMetalKernelFailed;
+    }
+
+    var max_error: f32 = 0.0;
+    for (actual, expected, 0..) |got, want, index| {
+        if (!std.math.isFinite(got)) {
+            std.debug.print("split GQA {s} nonfinite at {d}: got={d} want={d}\n", .{ check.name, index, got, want });
+            return error.GeneratedMetalKernelMismatch;
+        }
+        const diff = @abs(got - want);
+        max_error = @max(max_error, diff);
+        if (diff > 5e-2) {
+            std.debug.print("split GQA {s} mismatch at {d}: got={d} want={d} diff={d}\n", .{ check.name, index, got, want, diff });
+            return error.GeneratedMetalKernelMismatch;
+        }
+    }
+    return .{ .max_error = max_error, .route_calls = calls_after - calls_before };
+}
+
+fn runSplitGqaChecks(allocator: std.mem.Allocator) !void {
+    const enable_env = "TERMITE_METAL_ENABLE_DECODE_GQA_SPLIT";
+    const disable_env = "TERMITE_METAL_DISABLE_DECODE_GQA_SPLIT";
+    const old_enable = if (std.c.getenv(enable_env)) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+    defer if (old_enable) |value| allocator.free(value);
+    const old_disable = if (std.c.getenv(disable_env)) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+    defer if (old_disable) |value| allocator.free(value);
+    if (setenv(enable_env, "1", 1) != 0 or unsetenv(disable_env) != 0) return error.MetalRuntimeUnavailable;
+    defer if (old_enable) |value| {
+        _ = setenv(enable_env, value.ptr, 1);
+    } else {
+        _ = unsetenv(enable_env);
+    };
+    defer if (old_disable) |value| {
+        _ = setenv(disable_env, value.ptr, 1);
+    } else {
+        _ = unsetenv(disable_env);
+    };
+
+    const runtime = termite_metal_decode_runtime_create() orelse return error.MetalRuntimeUnavailable;
+    defer termite_metal_decode_runtime_destroy(runtime);
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return error.MetalRuntimeUnavailable;
+
+    for (split_gqa_checks) |check| {
+        const result = try runSplitGqaCheck(allocator, runtime, check);
+        std.debug.print(
+            "quant-kernel-metal-runtime-check {s} ok max_abs_error={d:.7} route_calls={d} op_kind=attention_decode_gqa_split\n",
+            .{ check.name, result.max_error, result.route_calls },
+        );
+    }
 }
 
 fn metalRuntimeCheckCount() comptime_int {
@@ -1661,16 +1986,47 @@ test "quant kernel metal runtime flash prefill checks cover the generated flash 
         try std.testing.expect(check.shape.num_kv_heads > 0);
         try std.testing.expectEqual(@as(usize, 0), check.shape.num_heads % check.shape.num_kv_heads);
         try std.testing.expect(check.shape.head_dim % 32 == 0);
-        try std.testing.expectEqual(@as(u32, 32), check.key_chunk); // checked-in baseline
         if (check.shape.head_dim == 512) {
+            try std.testing.expectEqual(@as(u32, quant_kernel_compiler.first_prefill_flash_hd512_metal_schedule.key_chunk), check.key_chunk);
             try std.testing.expectEqual(@as(u32, 256), check.threads_per_threadgroup);
-            try std.testing.expectEqual(@as(u32, 12_224), check.threadgroup_memory_bytes);
+            try std.testing.expectEqual(@as(u32, 13_888), check.threadgroup_memory_bytes);
             try std.testing.expectEqual(@as(usize, 16), check.shape.page_size);
             try std.testing.expect(check.shape.permuted_pages);
         } else {
+            try std.testing.expectEqual(@as(u32, quant_kernel_compiler.first_prefill_flash_metal_schedule.key_chunk), check.key_chunk);
             try std.testing.expectEqual(@as(u32, 128), check.threads_per_threadgroup);
         }
     }
+}
+
+test "quant kernel Metal split GQA checks cover production shapes and poisoned ragged pages" {
+    try std.testing.expectEqual(@as(usize, 4), split_gqa_checks.len);
+    var q1_count: usize = 0;
+    var q2_count: usize = 0;
+    var hd256_count: usize = 0;
+    var hd512_count: usize = 0;
+    for (split_gqa_checks) |check| {
+        const shape = check.shape;
+        try std.testing.expectEqual(@as(usize, 513), shape.kv_tokens);
+        try std.testing.expectEqual(@as(usize, 8), shape.num_heads);
+        try std.testing.expectEqual(@as(usize, 2), shape.num_kv_heads);
+        try std.testing.expectEqual(@as(usize, 16), shape.page_size);
+        try std.testing.expect(shape.permuted_pages);
+        try std.testing.expectEqual(@as(usize, 1), shape.physical_page_bias);
+        if (shape.q_len == 1) q1_count += 1 else if (shape.q_len == 2) q2_count += 1 else return error.TestUnexpectedResult;
+        if (shape.head_dim == 256) {
+            hd256_count += 1;
+            try std.testing.expectEqual(@as(usize, 512), shape.sliding_window);
+        } else if (shape.head_dim == 512) {
+            hd512_count += 1;
+            try std.testing.expectEqual(@as(usize, 0), shape.sliding_window);
+        } else return error.TestUnexpectedResult;
+        try std.testing.expectEqual(shape.kv_tokens - shape.q_len, shape.query_position_offset);
+    }
+    try std.testing.expectEqual(@as(usize, 2), q1_count);
+    try std.testing.expectEqual(@as(usize, 2), q2_count);
+    try std.testing.expectEqual(@as(usize, 2), hd256_count);
+    try std.testing.expectEqual(@as(usize, 2), hd512_count);
 }
 
 test "quant kernel metal runtime GQA attention CPU oracle matches an independent reference" {
@@ -2101,6 +2457,10 @@ pub fn main(init: std.process.Init) !void {
                 .{ flash_check.name, result.max_error, result.measure_iters, avg_us },
             );
         }
+        // Real production-route split-GQA checks. The harness opts the route in
+        // before runtime creation, poisons private page padding, and requires its
+        // route counter to advance so a numerically-correct fallback cannot pass.
+        try runSplitGqaChecks(allocator);
     }
 
     if (cfg.evidence_out_path) |path| {
@@ -2920,15 +3280,15 @@ fn reductionName(reduction: quant_kernel_compiler.ReductionKind) []const u8 {
 
 const max_attention_sweep_variants = 4;
 
-/// Prefill tiles used to benchmark the flash sweep. head_dim is kept at 128/64 so
-/// EVERY variant fits the 32 KB threadgroup limit — key_chunk=64 needs
-/// `144*hd+3680` bytes (36 KB at hd=256, so it is excluded from the model but
-/// valid here). Larger kv_tokens exercise the chunk-count lever (key_chunk=64
-/// halves the flash chunks + their barriers/gathers).
+/// Prefill tiles used to benchmark the flash sweep. The page-local K/V lowering
+/// keeps every variant under the 32 KB threadgroup limit, including Gemma4's
+/// head_dim=256 shape. Larger kv_tokens exercise the chunk-count lever
+/// (key_chunk=64 halves the flash chunks and their barriers).
 const flash_sweep_shapes = [_]FlashPrefillShape{
     .{ .q_len = 128, .kv_tokens = 256, .num_heads = 8, .num_kv_heads = 2, .head_dim = 128, .query_position_offset = 128, .sliding_window = 0 },
     .{ .q_len = 256, .kv_tokens = 256, .num_heads = 8, .num_kv_heads = 2, .head_dim = 128, .query_position_offset = 0, .sliding_window = 0 },
     .{ .q_len = 128, .kv_tokens = 512, .num_heads = 4, .num_kv_heads = 1, .head_dim = 64, .query_position_offset = 384, .sliding_window = 0 },
+    .{ .q_len = 256, .kv_tokens = 512, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 256, .sliding_window = 512 },
 };
 
 const flash_sweep_tolerance: f32 = 5e-2;
@@ -2997,7 +3357,7 @@ fn timeFlashSourceMinNs(
             .kernel_name = kernel_id,
             .key_chunk = key_chunk,
             .threads_per_threadgroup = 128,
-            .threadgroup_memory_bytes = @intCast((8 + key_chunk) * shape.head_dim * 2 + 52 * key_chunk + 352),
+            .threadgroup_memory_bytes = @intCast(24 * shape.head_dim + 52 * key_chunk + 352),
             .tolerance = flash_sweep_tolerance,
             .shape = shape,
             .measure_iters = measure_iters,

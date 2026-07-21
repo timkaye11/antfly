@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Exact-token gate for chunked Gemma4 QAT prefill: plain target and forced
-# Metal MTP must use the same chunk width and produce identical tokens.
+# Exact-token gate for chunked Gemma4 QAT prefill: frame target, live
+# whole-model target, and forced Metal MTP must produce identical tokens.
 
 set -euo pipefail
 
@@ -27,8 +27,8 @@ MODEL="${ANTFLY_INFERENCE_GEMMA4_QAT_MODEL:-$DEFAULT_MODELS_DIR/google/gemma-4-E
 DRAFT="${ANTFLY_INFERENCE_GEMMA4_MTP_POLICY_DRAFT_MODEL:-${MODEL%-gguf}-unquantized-assistant}"
 TOKENS="${ANTFLY_GEMMA4_MTP_LONG_CONTEXT_TOKENS:-64}"
 PREFILL_CHUNK_SIZE="${ANTFLY_GEMMA4_MTP_LONG_CONTEXT_PREFILL_CHUNK_SIZE:-auto}"
-AUTO_PREFILL_CHUNK_SIZE="${ANTFLY_GEMMA4_MTP_LONG_CONTEXT_AUTO_PREFILL_CHUNK_SIZE:-128}"
-SPECULATIVE_K="${ANTFLY_GEMMA4_MTP_LONG_CONTEXT_SPECULATIVE_K:-1}"
+AUTO_PREFILL_CHUNK_SIZE="${ANTFLY_GEMMA4_MTP_LONG_CONTEXT_AUTO_PREFILL_CHUNK_SIZE:-512}"
+SPECULATIVE_K="${ANTFLY_GEMMA4_MTP_LONG_CONTEXT_SPECULATIVE_K:-4}"
 EXPECTED_TOKEN_PREFIX="${ANTFLY_GEMMA4_MTP_LONG_CONTEXT_EXPECTED_TOKEN_PREFIX-818 2430 563 10980 623 3350 659 1041 102007 236746 7681 10091 126584 107 236777 735 2802 531 496 1694 529 5734 236787 107 236770 236761 2165 236773 3192 7681 10091 236929 568 2094 5072 531 577 506 1463 529 506 10091 506 2430 563 3182 573 769 107 236778 236761 2165 236773 3192 7681 10091 236929 568 12656 5705 769 108 818 2430}"
 # 36 repeats yields a query-bearing 2,003-token prompt with the E4B tokenizer.
 # The gate also accepts larger repeats to exercise multi-chunk prefill.
@@ -42,6 +42,10 @@ fi
 hd512_flash_gate_active=1
 if [[ "${TERMITE_METAL_DISABLE_PREFILL_FLASH_HD512:-0}" != "0" ]]; then
   hd512_flash_gate_active=0
+fi
+local_flash_gate_active=1
+if [[ "${TERMITE_METAL_DISABLE_FLASH_PREFILL_GENERATED:-0}" != "0" ]]; then
+  local_flash_gate_active=0
 fi
 trace_kv="${TERMITE_METAL_TRACE_KV_GATHER:-0}"
 if (( ring_gate_active )); then
@@ -93,6 +97,7 @@ fi
 
 mkdir -p "$OUT_DIR"
 target_out="$OUT_DIR/target.txt"
+whole_model_out="$OUT_DIR/whole-model-target.txt"
 mtp_out="$OUT_DIR/mtp-k${SPECULATIVE_K}.txt"
 
 common_args=(
@@ -117,6 +122,14 @@ TERMITE_METAL_TRACE_KV_GATHER="$trace_kv" \
 run_antfly_inference generate "$MODEL" "$PROMPT" \
   "${common_args[@]}" >"$target_out" 2>&1
 
+(
+  unset TERMITE_METAL_DISABLE_LIVE_WHOLE_MODEL_EXECUTOR
+  TERMITE_GEN_STAGE_DEBUG=1 \
+  TERMITE_METAL_TRACE_KV_GATHER="$trace_kv" \
+  run_antfly_inference generate "$MODEL" "$PROMPT" \
+    "${common_args[@]}"
+) >"$whole_model_out" 2>&1
+
 TERMITE_GEN_STAGE_DEBUG=1 \
 TERMITE_METAL_DISABLE_LIVE_WHOLE_MODEL_EXECUTOR=1 \
 TERMITE_METAL_TRACE_KV_GATHER="$trace_kv" \
@@ -128,8 +141,9 @@ run_antfly_inference generate "$MODEL" "$PROMPT" \
 
 fail() {
   echo "FAIL: $*" >&2
-  echo "target: $target_out" >&2
-  echo "MTP:    $mtp_out" >&2
+  echo "target:      $target_out" >&2
+  echo "whole-model: $whole_model_out" >&2
+  echo "MTP:         $mtp_out" >&2
   exit 1
 }
 
@@ -146,8 +160,10 @@ chunk_size_from_output() {
 }
 
 target_ids="$(token_ids_from_output "$target_out")"
+whole_model_ids="$(token_ids_from_output "$whole_model_out")"
 mtp_ids="$(token_ids_from_output "$mtp_out")"
 [[ -n "$target_ids" ]] || fail "target run did not print token IDs"
+[[ -n "$whole_model_ids" ]] || fail "whole-model target run did not print token IDs"
 [[ -n "$mtp_ids" ]] || fail "MTP run did not print token IDs"
 if [[ -n "$EXPECTED_TOKEN_PREFIX" ]]; then
   expected_count=$((TOKENS < 64 ? TOKENS : 64))
@@ -158,7 +174,18 @@ if [[ -n "$EXPECTED_TOKEN_PREFIX" ]]; then
   [[ "${target_oracle_ids[*]:0:expected_count}" == "${expected_oracle_ids[*]:0:expected_count}" ]] \
     || fail "target's first $expected_count token IDs changed"
 fi
+[[ "$target_ids" == "$whole_model_ids" ]] || fail "live whole-model target changed greedy token IDs"
 [[ "$target_ids" == "$mtp_ids" ]] || fail "forced MTP changed greedy token IDs"
+
+grep -q '^generate-setup: live whole-model executor handled request$' "$whole_model_out" \
+  || fail "live whole-model executor did not handle the target run"
+if grep -q '^generate-setup: live whole-model executor skipped$' "$whole_model_out"; then
+  fail "live whole-model executor silently fell back"
+fi
+grep -Eq '^metal_executor_ms: .*prefill_calls=[1-9][0-9]* ' "$whole_model_out" \
+  || fail "live whole-model executor did not report prefill work"
+grep -Eq '^metal_executor_ms2: .*ensure_prepared_calls=[1-9][0-9]* ' "$whole_model_out" \
+  || fail "live whole-model executor did not prepare its decoder runtime"
 
 if (( ring_gate_active )); then
   if grep -Eq 'kv-gather-fallback|^kv-read:|RingKvRequiresPagedAttention|KvRingAttentionUnavailable' "$target_out" "$mtp_out"; then
@@ -177,11 +204,21 @@ if (( hd512_flash_gate_active )); then
       || fail "512-d global attention did not use the default flash-prefill route in $flash_out"
   done
 fi
+if (( local_flash_gate_active )); then
+  for flash_out in "$target_out" "$mtp_out"; do
+    grep -Eq '^metal_attention_dispatch: .*generated_flash_prefill=[1-9][0-9]*' "$flash_out" \
+      || fail "256-d local attention did not use the default flash-prefill route in $flash_out"
+  done
+fi
+for frame_out in "$target_out" "$mtp_out"; do
+  grep -Eq '^metal_frame_fallbacks: .*prefill_execute=[1-9][0-9]*/[1-9][0-9]*' "$frame_out" \
+    || fail "Gemma4 final-hidden prefill frame did not execute in $frame_out"
+done
 
 target_prompt_tokens="$(prompt_tokens_from_output "$target_out")"
 mtp_prompt_tokens="$(prompt_tokens_from_output "$mtp_out")"
 [[ -n "$target_prompt_tokens" && "$target_prompt_tokens" == "$mtp_prompt_tokens" ]] \
-  || fail "target and MTP prompt token counts differ"
+  || fail "frame target and MTP prompt token counts differ"
 target_chunk="$(chunk_size_from_output "$target_out")"
 mtp_chunk="$(chunk_size_from_output "$mtp_out")"
 if (( auto_prefill )); then
@@ -197,6 +234,8 @@ fi
 
 grep -Eq "^finish_reason=length tokens=$TOKENS$" "$target_out" \
   || fail "target did not generate exactly $TOKENS tokens"
+grep -Eq "^finish_reason=length tokens=$TOKENS$" "$whole_model_out" \
+  || fail "whole-model target did not generate exactly $TOKENS tokens"
 grep -Eq "^finish_reason=length tokens=$TOKENS$" "$mtp_out" \
   || fail "MTP did not generate exactly $TOKENS tokens"
 grep -Eq '^speculative: .*rounds=[1-9][0-9]* .*drafted=[1-9][0-9]* .*matched=[1-9][0-9]* .*mtp_enabled=true' "$mtp_out" \
@@ -216,8 +255,12 @@ fi
 
 echo "metal Gemma4 MTP long-context token gate passed"
 echo "prompt_tokens=$target_prompt_tokens prefill_chunk_size=$target_chunk requested_prefill=$PREFILL_CHUNK_SIZE output_tokens=$TOKENS"
+echo "whole_model_executor=handled"
 if [[ "$PRINT_TIMING" != "0" ]]; then
   echo "target $(grep '^generate_timing_ms:' "$target_out" | tail -n 1)"
+  echo "whole_model_target $(grep '^timing_ms:' "$whole_model_out" | tail -n 1)"
+  echo "whole_model_executor $(grep '^metal_executor_ms:' "$whole_model_out" | tail -n 1)"
+  echo "whole_model_executor $(grep '^metal_executor_ms2:' "$whole_model_out" | tail -n 1)"
   echo "mtp_k${SPECULATIVE_K} $(grep '^generate_timing_ms:' "$mtp_out" | tail -n 1)"
 fi
 echo "output: $OUT_DIR"

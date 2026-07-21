@@ -505,9 +505,9 @@ fn metalJitMaximumDynamicThreadgroupMemory(artifact: quant_kernel_compiler.Gener
     return switch (op.kind) {
         .decode_1x => align16((4096 * 2 + 256) * @sizeOf(f32)),
         .prefill_flash => if (op.head_dim == 512)
-            12_224
+            13_888
         else
-            align16((8 + @as(usize, op.schedule.key_chunk)) * 256 * 2 + 52 * @as(usize, op.schedule.key_chunk) + 352),
+            align16(24 * 256 + 52 * @as(usize, op.schedule.key_chunk) + 352),
     };
 }
 
@@ -8206,6 +8206,9 @@ pub const RawRuntimeMemoryStats = extern struct {
     q4_0_linear_reduce_f16_output: u64 = 0,
     q4_0_linear_reduce_f16_input_f16_output: u64 = 0,
     q4_0_linear_reduce_sumsq: u64 = 0,
+    q4_0_mm_sg_aligned_dispatches: u64 = 0,
+    q4_0_mm_sg_aligned_tail_dispatches: u64 = 0,
+    q4_0_mm_sg_unrolled_dispatches: u64 = 0,
     q4_0_pair: u64 = 0,
     q4_0_pair_reduce: u64 = 0,
     q4_0_pair_activation_reduce: u64 = 0,
@@ -12346,7 +12349,7 @@ test "metal runtime JIT schedule validation enforces reflected device limits" {
     pipeline.max_total_threads_per_threadgroup = 1024;
     device.max_threadgroup_memory_length = 32 * 1024;
     try std.testing.expectError(error.MetalJitThreadgroupMemoryLimitExceeded, validateMetalJitSchedule(decode, device, pipeline));
-    device.max_threadgroup_memory_length = 12_224;
+    device.max_threadgroup_memory_length = 13_888;
     try validateMetalJitSchedule(flash_hd512, device, pipeline);
 
     const tiled = quant_kernel_compiler.KernelSchedule{
@@ -13389,6 +13392,7 @@ pub extern fn termite_metal_decode_runtime_end_planned_compute_scope(runtime: ?*
 pub extern fn termite_metal_decode_runtime_push_planned_compute_barrier_suppression(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_pop_planned_compute_barrier_suppression(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_frame_cb_count(runtime: ?*RawMetalDecodeRuntime) u64;
+pub extern fn termite_metal_decode_runtime_decode_gqa_split_calls(runtime: ?*const RawMetalDecodeRuntime) u64;
 pub extern fn termite_metal_decode_runtime_last_frame_gpu_nanos(runtime: ?*RawMetalDecodeRuntime) u64;
 pub extern fn termite_metal_decode_runtime_workload_profile_begin(
     runtime: ?*RawMetalDecodeRuntime,
@@ -34701,6 +34705,89 @@ test "metal native decoder runtime activation scratch pool and hidden state" {
     for (handles[0..capacity]) |h| {
         if (h) |ptr| releaseScratch(runtime, ptr);
     }
+}
+
+test "metal donated KV on-frame attention executes on caller frame" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const kv_runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(kv_runtime);
+    defer _ = termite_metal_decode_runtime_reset_state(kv_runtime);
+    const frame_runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(frame_runtime);
+    defer _ = termite_metal_decode_runtime_reset_state(frame_runtime);
+    if (termite_metal_decode_runtime_ready(kv_runtime) == 0 or
+        termite_metal_decode_runtime_ready(frame_runtime) == 0)
+    {
+        return error.SkipZigTest;
+    }
+
+    var q = try testDeviceTensorFromSlice(frame_runtime, &[_]f32{1.0}, &[_]i32{ 1, 1 });
+    defer q.deinit();
+    var k = try testDeviceTensorFromSlice(kv_runtime, &[_]f32{2.0}, &[_]i32{ 1, 1 });
+    defer k.deinit();
+    var v = try testDeviceTensorFromSlice(kv_runtime, &[_]f32{7.0}, &[_]i32{ 1, 1 });
+    defer v.deinit();
+    var output = try MetalTensor.deviceAllocate(frame_runtime, @sizeOf(f32), .private, &[_]i32{ 1, 1 });
+    defer output.deinit();
+
+    const block_table = [_]u32{0};
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_reset_attention_span_slot(kv_runtime, 0));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_update_attention_paged_from_f32_key_device_slot(
+        kv_runtime,
+        0,
+        2,
+        k.deviceHandle(),
+        k.deviceByteOffset(),
+        v.deviceHandle(),
+        v.deviceByteOffset(),
+        1,
+        1,
+        1,
+        1,
+        @sizeOf(f32),
+        @sizeOf(f32),
+        1,
+        0,
+        &block_table,
+        block_table.len,
+        16,
+    ));
+
+    try beginFrame(frame_runtime);
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_attention_paged_slot_device_on_frame(
+        kv_runtime,
+        frame_runtime,
+        0,
+        2,
+        q.deviceHandle(),
+        q.deviceByteOffset(),
+        &block_table,
+        block_table.len,
+        16,
+        1,
+        1,
+        1,
+        1,
+        1,
+        @sizeOf(f32),
+        @sizeOf(f32),
+        0,
+        0,
+        0,
+        0.0,
+        null,
+        0,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    ));
+    try submitFrame(frame_runtime);
+    try waitFrame(frame_runtime);
+
+    const actual = try tensorHostSlice(&output);
+    try std.testing.expectEqual(@as(usize, 1), actual.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.0), actual[0], 1e-6);
 }
 
 test "metal donated KV on-frame attention fails closed on unsafe runtime state" {

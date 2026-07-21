@@ -16,12 +16,12 @@
 // plan_id=metal/attention/prefill_flash
 // kernel_id=antfly_paged_attention_prefill_flash_generated_msl_v1
 // production_baseline=termite_paged_attention_kv_prefill_sg
-// production_enabled=false
-// Descriptor-driven simdgroup-MMA flash prefill attention (--sweep-tunable route).
-// This is the key_chunk=32/skip_rescale=false baseline: byte-for-byte the
-// hand-written termite_paged_attention_kv_prefill_sg (modulo the self-contained
-// params/helper renames). Production prefill stays on the hand-written kernel
-// until this candidate clears its bit-identical model-token acceptance gate.
+// production_enabled=true
+// Descriptor-driven low-memory simdgroup-MMA flash prefill attention.
+// The key_chunk=32/skip_rescale=false baseline preserves the hand-written
+// arithmetic order while using page-local K/V loads and direct output stores.
+// Production defaults to this route only for Gemma4 E4B local attention;
+// capability checks and the handwritten fallback remain authoritative.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -29,38 +29,34 @@ using namespace metal;
 struct antfly_paged_attention_1x_params { uint q_len; uint kv_tokens; uint num_heads; uint num_kv_heads; uint head_dim; uint key_row_bytes; uint base_key_row_bytes; uint query_position_offset; uint kv_position_offset; uint sliding_window; uint v_row_stride; uint page_size; uint block_count; uint contiguous_base_token; uint contiguous_blocks; uint format; uint v_element_bytes; uint has_sinks; float softcap; };
 inline uint antfly_paged_attention_1x_page_token(device const uint *block_table, constant antfly_paged_attention_1x_params &p, uint logical_token) { if (p.contiguous_blocks != 0u) return p.contiguous_base_token + logical_token; uint logical_block = logical_token / p.page_size; uint token_in_block = logical_token - logical_block * p.page_size; if (logical_block >= p.block_count) return 0xffffffffu; return block_table[logical_block] + token_in_block; }
 kernel void antfly_paged_attention_prefill_flash_generated_msl_v1(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant antfly_paged_attention_1x_params &p [[buffer(6)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
-    const uint hd = p.head_dim; const uint q0 = tg.x * 8u; const uint h = tg.y;
-    if (q0 >= p.q_len || h >= p.num_heads || p.format != 3u || p.page_size == 0u || p.num_kv_heads == 0u || hd % 32u != 0u || hd > 256u) return;
-    const float scale = rsqrt(float(hd)); const uint heads_per_group = p.num_heads / p.num_kv_heads; const uint kv_head_base = (h / heads_per_group) * hd;
-    const uint q_stride = p.num_heads * hd; const uint k_row_halfs = p.key_row_bytes / 2u;
+    const uint q0 = tg.x * 8u; const uint h = tg.y;
+    if (q0 >= p.q_len || h >= p.num_heads || p.format != 3u || p.page_size == 0u || (p.page_size & 7u) != 0u || p.num_kv_heads == 0u || p.num_heads % p.num_kv_heads != 0u || p.head_dim != 256u) return;
+    const float scale = rsqrt(256.0f); const uint heads_per_group = p.num_heads / p.num_kv_heads; const uint kv_head_base = (h / heads_per_group) * 256u;
+    const uint q_stride = p.num_heads * 256u; const uint k_row_halfs = p.key_row_bytes / 2u;
     threadgroup half *sq = (threadgroup half *)shmem;
-    threadgroup half *skv = sq + 8u * hd;
-    threadgroup char *fb = shmem + (8u + 32u) * hd * 2u;
+    threadgroup char *fb = shmem + 8u * 256u * 2u;
     threadgroup float *ss = (threadgroup float *)fb;
     threadgroup half *sp = (threadgroup half *)(fb + 1024u);
     threadgroup uint *sphys = (threadgroup uint *)(fb + 1536u);
     threadgroup float *sM = (threadgroup float *)(fb + 1664u);
     threadgroup float *sS = (threadgroup float *)(fb + 1696u);
     threadgroup float *sdiag = (threadgroup float *)(fb + 1760u);
+    threadgroup float *so = (threadgroup float *)(fb + 2016u);
     const device half *v_half = reinterpret_cast<const device half *>(v_bytes);
     const device half *k_half = reinterpret_cast<const device half *>(encoded_key);
-    for (uint i = uint(tid); i < 8u * hd; i += 128u) { uint j = i / hd; uint d = i - j * hd; uint qi = q0 + j; sq[i] = qi < p.q_len ? half(q[qi * q_stride + h * hd + d] * scale) : half(0.0f); }
+    for (uint i = uint(tid); i < 8u * 256u; i += 128u) { uint j = i / 256u; uint d = i - j * 256u; uint qi = q0 + j; sq[i] = qi < p.q_len ? half(q[qi * q_stride + h * 256u + d] * scale) : half(0.0f); }
     if (tid < 8u) { sM[tid] = -3.402823466e+38f; sS[tid] = 0.0f; }
     if (tid < 64u) sdiag[tid] = 0.0f;
-    const uint dslice = uint(sgitg) * (hd / 4u);
+    const uint dslice = uint(sgitg) * 64u;
     simdgroup_float8x8 mo[8];
     for (uint i = 0u; i < 8u; ++i) mo[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
-    const uint d_tiles = hd / 32u;
     for (uint kc = 0u; kc < p.kv_tokens; kc += 32u) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint q_last = min(q0 + 7u, p.q_len - 1u); uint tile_first_q = p.query_position_offset + q0; uint tile_last_q = p.query_position_offset + q_last; uint key_first = p.kv_position_offset + kc; uint key_last = p.kv_position_offset + min(kc + 31u, p.kv_tokens - 1u); bool wholly_future = key_first > tile_last_q; bool wholly_expired = p.sliding_window != 0u && tile_first_q >= key_last && tile_first_q - key_last >= p.sliding_window; if (wholly_future) break; if (wholly_expired) continue;
         if (tid < 32u) { uint ki = kc + uint(tid); sphys[tid] = ki < p.kv_tokens ? antfly_paged_attention_1x_page_token(block_table, p, ki) : 0xffffffffu; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        const bool fast = (p.contiguous_blocks != 0u) && (kc + 32u <= p.kv_tokens);
-        if (!fast) { for (uint i = uint(tid); i < 32u * hd; i += 128u) { uint kk = i / hd; uint d = i - kk * hd; uint phys = sphys[kk]; skv[i] = phys != 0xffffffffu ? k_half[phys * k_row_halfs + kv_head_base + d] : half(0.0f); } }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         simdgroup_float8x8 ms = make_filled_simdgroup_matrix<float, 8>(0.0f);
-        if (fast) { const device half *kbase = k_half + (p.contiguous_base_token + kc + uint(sgitg) * 8u) * k_row_halfs + kv_head_base; for (uint d = 0u; d < hd; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, sq + d, hd); simdgroup_load(mk, kbase + d, k_row_halfs, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } }
-        else { for (uint d = 0u; d < hd; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, sq + d, hd); simdgroup_load(mk, skv + uint(sgitg) * 8u * hd + d, hd, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } }
+        uint phys = sphys[uint(sgitg) * 8u]; const device half *kbase = k_half + (phys != 0xffffffffu ? phys : 0u) * k_row_halfs + kv_head_base; for (uint d = 0u; d < 256u; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, sq + d, 256u); simdgroup_load(mk, kbase + d, k_row_halfs, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); }
         simdgroup_store(ms, ss + uint(sgitg) * 8u, 32u, 0, false);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint jj = 0u; jj < 2u; ++jj) {
@@ -77,19 +73,14 @@ kernel void antfly_paged_attention_prefill_flash_generated_msl_v1(device const f
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag, 8u);
-        for (uint i = 0u; i < d_tiles; ++i) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, mcorr, mo[i]); mo[i] = scaled; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (!fast) { for (uint i = uint(tid); i < 32u * hd; i += 128u) { uint kk = i / hd; uint d = i - kk * hd; uint phys = sphys[kk]; skv[i] = phys != 0xffffffffu ? v_half[phys * p.v_row_stride + kv_head_base + d] : half(0.0f); } }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (fast) { for (uint dt = 0u; dt < d_tiles; ++dt) { uint d8 = dslice + dt * 8u; simdgroup_float8x8 acc = mo[dt]; for (uint kk8 = 0u; kk8 < 4u; ++kk8) { simdgroup_half8x8 mp; simdgroup_half8x8 mv; simdgroup_load(mp, sp + kk8 * 8u, 32u); simdgroup_load(mv, v_half + (p.contiguous_base_token + kc + kk8 * 8u) * p.v_row_stride + kv_head_base + d8, p.v_row_stride); simdgroup_multiply_accumulate(acc, mp, mv, acc); } mo[dt] = acc; } }
-        else { for (uint dt = 0u; dt < d_tiles; ++dt) { uint d8 = dslice + dt * 8u; simdgroup_float8x8 acc = mo[dt]; for (uint kk8 = 0u; kk8 < 4u; ++kk8) { simdgroup_half8x8 mp; simdgroup_half8x8 mv; simdgroup_load(mp, sp + kk8 * 8u, 32u); simdgroup_load(mv, skv + kk8 * 8u * hd + d8, hd); simdgroup_multiply_accumulate(acc, mp, mv, acc); } mo[dt] = acc; } }
+        for (uint i = 0u; i < 8u; ++i) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, mcorr, mo[i]); mo[i] = scaled; }
+        for (uint kk8 = 0u; kk8 < 4u; ++kk8) { uint phys = sphys[kk8 * 8u]; simdgroup_half8x8 mp; simdgroup_load(mp, sp + kk8 * 8u, 32u); for (uint dt = 0u; dt < 8u; ++dt) { uint d8 = dslice + dt * 8u; simdgroup_half8x8 mv; if (kc + kk8 * 8u + 8u <= p.kv_tokens) { const device half *vbase = v_half + phys * p.v_row_stride + kv_head_base + d8; simdgroup_load(mv, vbase, p.v_row_stride); } else { threadgroup half *sv = (threadgroup half *)ss + uint(sgitg) * 64u; for (uint vi = uint(lane); vi < 64u; vi += 32u) { uint vr = vi / 8u; uint vc = vi - vr * 8u; uint vphys = sphys[kk8 * 8u + vr]; sv[vi] = vphys != 0xffffffffu ? v_half[vphys * p.v_row_stride + kv_head_base + d8 + vc] : half(0.0f); } simdgroup_barrier(mem_flags::mem_threadgroup); simdgroup_load(mv, sv, 8u); } simdgroup_multiply_accumulate(mo[dt], mp, mv, mo[dt]); } }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid < 8u) { float denom = sS[tid]; sdiag[uint(tid) * 8u + uint(tid)] = denom > 0.0f ? 1.0f / denom : 0.0f; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     simdgroup_float8x8 minv; simdgroup_load(minv, sdiag, 8u);
-    threadgroup float *so = (threadgroup float *)skv;
-    for (uint dt = 0u; dt < d_tiles; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, minv, mo[dt]); simdgroup_store(scaled, so + uint(sgitg) * (8u * (hd / 4u)) + dt * 8u, hd / 4u, 0, false); }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = uint(tid); i < 8u * hd; i += 128u) { uint j = i / hd; uint d = i - j * hd; uint qi = q0 + j; if (qi >= p.q_len) continue; uint sg_of_d = d / (hd / 4u); uint d_in = d - sg_of_d * (hd / 4u); output[qi * q_stride + h * hd + d] = so[sg_of_d * (8u * (hd / 4u)) + j * (hd / 4u) + d_in]; }
+    for (uint dt = 0u; dt < 8u; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, minv, mo[dt]); mo[dt] = scaled; }
+    if (q0 + 8u <= p.q_len) { for (uint dt = 0u; dt < 8u; ++dt) simdgroup_store(mo[dt], output + q0 * q_stride + h * 256u + dslice + dt * 8u, q_stride); return; }
+    const uint valid_rows = p.q_len - q0; for (uint owner = 0u; owner < 4u; ++owner) { threadgroup_barrier(mem_flags::mem_threadgroup); if (uint(sgitg) == owner) for (uint dt = 0u; dt < 8u; ++dt) simdgroup_store(mo[dt], so + dt * 8u, 64u); threadgroup_barrier(mem_flags::mem_threadgroup); for (uint i = uint(tid); i < valid_rows * 64u; i += 128u) { uint j = i / 64u; uint d = i - j * 64u; output[(q0 + j) * q_stride + h * 256u + owner * 64u + d] = so[i]; } }
 }

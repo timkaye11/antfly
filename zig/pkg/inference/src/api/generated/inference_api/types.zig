@@ -667,7 +667,7 @@ pub const GenerateRequest = struct {
     speculative_k: ?i64 = null,
     /// inference-native speculative decoding policy: `auto`, `force`, or `off`. Defaults to `auto` when a draft model is requested.
     speculation_policy: ?[]const u8 = null,
-    /// inference-native speculative decoding calibration state: `none`, `probe`, or `positive`. Defaults to `probe` for `auto` draft requests so they are measured instead of silently disabled, and to `none` for `force` or `off`.
+    /// inference-native speculative decoding calibration state: `none`, `probe`, or `positive`. Defaults to `none`; `auto` MTP requests require an explicit `probe` or `positive` calibration.
     speculation_calibration: ?[]const u8 = null,
     /// inference-native KV cache quantization format. Lower precision reduces memory usage but may affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
     cache_dtype: ?[]const u8 = null,

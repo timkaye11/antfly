@@ -124,10 +124,9 @@ pub fn nativeGenerationMediaTokenAllowance(messages: []const Message, config: gp
     return image_count *| (@as(usize, config.mm_tokens_per_image) + 1);
 }
 
-/// Bound idle prefill chunks for the Gemma4 target geometry whose Metal Q4
-/// kernels are fastest at 128 rows. Keep the general scheduler ceiling intact
-/// for other models and backends. Explicit request limits are applied
-/// separately so diagnostics and tuned deployments can override this choice.
+/// Bound idle prefill chunks for the measured Gemma4 E4B Metal target geometry.
+/// Keep the general scheduler ceiling intact for every other model and backend.
+/// Explicit request limits are applied separately.
 pub fn nativeGenerationPrefillChunkCeiling(
     backend: runtime.kv.pool.BackendKind,
     config: gpt_mod.Config,
@@ -137,10 +136,14 @@ pub fn nativeGenerationPrefillChunkCeiling(
     if (backend == .metal and
         config.family == .gemma and
         config.hasPle() and
+        config.num_attention_heads == 8 and
+        config.effectiveKVHeads() == 2 and
+        config.headDim() == 256 and
         config.global_head_dim == 512 and
+        config.sliding_window == 512 and
         !config.gemma4_mtp_assistant)
     {
-        return @min(ceiling, 128);
+        return @min(ceiling, 512);
     }
     return ceiling;
 }
@@ -602,6 +605,10 @@ fn enableCudaGreedyDeviceTokenHandoff() bool {
 
 fn enableCudaGatedTokenTensorDecode() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GATED_TOKEN_TENSOR_DECODE", false);
+}
+
+fn metalFinalHiddenFrameOwnsResidentPrefix(retained_prefix_tokens: usize) bool {
+    return retained_prefix_tokens == 0;
 }
 
 fn cudaReplayLastLogitsEnabled() bool {
@@ -3926,7 +3933,13 @@ pub const NativeGenerationPipeline = struct {
                 } else if (total_chunk_end == seq_len and
                     (capture_last_hidden or use_metal_target_last_logits))
                 {
-                    var target_hidden = self.forwardHiddenDevice(chunk, 1, total_chunk_end, &decode_context) catch |err| {
+                    var target_hidden = self.forwardFinalHiddenDevice(
+                        chunk,
+                        1,
+                        total_chunk_end,
+                        prefilled_tokens,
+                        &decode_context,
+                    ) catch |err| {
                         if (try retryDirectPrefillAfterMemoryBudgetExceeded(&decode_runtime, chunk.len, chunk_size, &current_chunk_size, err)) continue;
                         return err;
                     };
@@ -5681,6 +5694,98 @@ pub const NativeGenerationPipeline = struct {
             .pre_norm_hidden = hidden_result.pre_norm_hidden,
             .rows = hidden_result.total_rows,
         };
+    }
+
+    fn tryMetalGemmaFinalHiddenFrame(
+        self: *NativeGenerationPipeline,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        retained_prefix_tokens: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+    ) !?ForwardHiddenDevice {
+        if (self.compiled_partition_backend != null or
+            self.cb.kind() != .metal or
+            self.gpt_config.family != .gemma or
+            self.gpt_config.usesMoe() or
+            !self.gpt_config.hasPle() or
+            batch != 1 or
+            input_ids.len == 0 or
+            // Prompt-cache hits attach retained host blocks to a fresh
+            // sequence. Until those rows have been materialized into the new
+            // Metal slot, the direct frame may only own uncached prefixes.
+            !metalFinalHiddenFrameOwnsResidentPrefix(retained_prefix_tokens) or
+            decode_context.attention_mode != .paged_prefill or
+            decode_context.query_sequence_len != input_ids.len)
+        {
+            return null;
+        }
+
+        const Attempt = struct {
+            pipeline: *NativeGenerationPipeline,
+            input_ids: []const i64,
+            seq_len: usize,
+            decode_context: *const gpt_arch.DecodeContext,
+            result: ?ForwardHiddenDevice = null,
+
+            fn run(context: *anyopaque) !bool {
+                const attempt: *@This() = @ptrCast(@alignCast(context));
+                const pipeline = attempt.pipeline;
+                const prepared = try pipeline.cb.decoderRuntimePrepareOrReuseFamily(
+                    pipeline.allocator,
+                    pipeline.gpt_config,
+                    attempt.decode_context.kv_sequence_len,
+                    pipeline.gpt_config.num_hidden_layers,
+                );
+                if (!prepared.prepared) return false;
+
+                const direct = (try decoder_gated_runtime.forwardFinalHiddenRows(
+                    &pipeline.cb,
+                    pipeline.allocator,
+                    pipeline.gpt_config,
+                    pipeline.gpt_config.num_hidden_layers,
+                    attempt.input_ids,
+                    attempt.seq_len,
+                    attempt.decode_context,
+                )) orelse return false;
+                attempt.result = .{
+                    .cb = &pipeline.cb,
+                    .hidden = direct.final_hidden,
+                    .pre_norm_hidden = null,
+                    .rows = direct.rows,
+                    .prepared_tail_choices = direct.prepared_tail_choices,
+                    .choices_allocator = direct.choices_allocator,
+                };
+                return true;
+            }
+        };
+
+        var attempt = Attempt{
+            .pipeline = self,
+            .input_ids = input_ids,
+            .seq_len = seq_len,
+            .decode_context = decode_context,
+        };
+        errdefer if (attempt.result) |result_value| {
+            var result = result_value;
+            result.deinit();
+        };
+        if (!try runWithDecoderRuntimeResetBoundary(&self.cb, @ptrCast(&attempt), Attempt.run)) return null;
+        const result = attempt.result orelse return null;
+        attempt.result = null;
+        return result;
+    }
+
+    fn forwardFinalHiddenDevice(
+        self: *NativeGenerationPipeline,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        retained_prefix_tokens: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+    ) !ForwardHiddenDevice {
+        return (try self.tryMetalGemmaFinalHiddenFrame(input_ids, batch, seq_len, retained_prefix_tokens, decode_context)) orelse
+            self.forwardHiddenDevice(input_ids, batch, seq_len, decode_context);
     }
 
     fn forwardMtpTargetHiddenDevice(
@@ -9073,11 +9178,15 @@ test "native generation prompt limit reserves output media and draft context" {
 test "native generation prefill ceiling only specializes Gemma4 Metal target" {
     const gemma4_target = gpt_mod.Config{
         .family = .gemma,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
         .global_head_dim = 512,
+        .sliding_window = 512,
         .ple_hidden_size = 2560,
     };
     try std.testing.expectEqual(
-        @as(usize, 128),
+        @as(usize, 512),
         nativeGenerationPrefillChunkCeiling(.metal, gemma4_target, 2048),
     );
     try std.testing.expectEqual(
@@ -9092,6 +9201,18 @@ test "native generation prefill ceiling only specializes Gemma4 Metal target" {
         @as(usize, 2048),
         nativeGenerationPrefillChunkCeiling(.metal, .{ .family = .gemma }, 2048),
     );
+    inline for (.{
+        gpt_mod.Config{ .family = .gemma, .num_attention_heads = 7, .num_key_value_heads = 2, .attention_head_dim = 256, .global_head_dim = 512, .sliding_window = 512, .ple_hidden_size = 2560 },
+        gpt_mod.Config{ .family = .gemma, .num_attention_heads = 8, .num_key_value_heads = 1, .attention_head_dim = 256, .global_head_dim = 512, .sliding_window = 512, .ple_hidden_size = 2560 },
+        gpt_mod.Config{ .family = .gemma, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 128, .global_head_dim = 512, .sliding_window = 512, .ple_hidden_size = 2560 },
+        gpt_mod.Config{ .family = .gemma, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 256, .global_head_dim = 256, .sliding_window = 512, .ple_hidden_size = 2560 },
+        gpt_mod.Config{ .family = .gemma, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 256, .global_head_dim = 512, .sliding_window = 1024, .ple_hidden_size = 2560 },
+    }) |other_geometry| {
+        try std.testing.expectEqual(
+            @as(usize, 2048),
+            nativeGenerationPrefillChunkCeiling(.metal, other_geometry, 2048),
+        );
+    }
     var assistant = gemma4_target;
     assistant.gemma4_mtp_assistant = true;
     try std.testing.expectEqual(
@@ -10486,6 +10607,11 @@ test "scheduled prefill frame resets decoder runtime after hit miss and error" {
     );
     try std.testing.expectEqual(@as(usize, 1), failed.run_calls);
     try std.testing.expectEqual(@as(usize, 6), probe.reset_calls);
+}
+
+test "metal final-hidden frame rejects retained prompt-cache prefixes" {
+    try std.testing.expect(metalFinalHiddenFrameOwnsResidentPrefix(0));
+    try std.testing.expect(!metalFinalHiddenFrameOwnsResidentPrefix(512));
 }
 
 test "metal prepared tail rejects chunked and cached-prefix prefill" {
