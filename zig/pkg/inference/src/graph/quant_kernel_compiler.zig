@@ -3064,6 +3064,15 @@ pub const first_prefill_flash_metal_check_command = "xcrun --toolchain Metal met
 /// dispatch: grid ((q_len+7)/8, heads), threadgroup memory 80*hd + 2016 bytes).
 pub const first_prefill_flash_metal_schedule = KernelSchedule{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree, .key_chunk = 32, .skip_rescale = false };
 
+// Gemma4 global attention: the same paged flash semantics with a fixed
+// 256-thread / eight-simdgroup lowering that keeps head_dim=512 under portable
+// Metal threadgroup-memory limits by loading page-local K/V tiles directly.
+pub const first_prefill_flash_hd512_metal_kernel_id = "antfly_paged_attention_prefill_flash_hd512_generated_msl_v1";
+pub const first_prefill_flash_hd512_metal_source_path = "src/ops/metal/generated/attention_prefill_flash_hd512.metal";
+pub const first_prefill_flash_hd512_metal_air_path = "/tmp/antfly_paged_attention_prefill_flash_hd512_generated_msl_v1.air";
+pub const first_prefill_flash_hd512_metal_check_command = "xcrun --toolchain Metal metal -c src/ops/metal/generated/attention_prefill_flash_hd512.metal -o /tmp/antfly_paged_attention_prefill_flash_hd512_generated_msl_v1.air";
+pub const first_prefill_flash_hd512_metal_schedule = KernelSchedule{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree, .key_chunk = 32, .skip_rescale = false };
+
 pub const first_general_metal_q4_0_kernel_id = "antfly_q4_0_small_batch_msl_v1";
 pub const first_general_metal_q4_0_source_path = "src/ops/metal/generated/quant_kernel_q4_0_small_batch.metal";
 pub const first_general_metal_q4_0_air_path = "/tmp/antfly_q4_0_small_batch_msl_v1.air";
@@ -4063,6 +4072,19 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .check_command = first_prefill_flash_metal_check_command,
         .production_enabled = false,
     },
+    .{
+        .backend = .metal,
+        .op = .{ .attention = .{
+            .kind = .prefill_flash,
+            .head_dim = 512,
+            .schedule = first_prefill_flash_hd512_metal_schedule,
+        } },
+        .kernel_id = first_prefill_flash_hd512_metal_kernel_id,
+        .source_path = first_prefill_flash_hd512_metal_source_path,
+        .check_command = first_prefill_flash_hd512_metal_check_command,
+        .production_enabled = true,
+        .runtime_default_enabled = true,
+    },
 };
 
 fn generatedArtifactCount(comptime kind: OpKind) usize {
@@ -4145,8 +4167,6 @@ fn metalRuntimeDefaultHasAttestedEvidence(
         std.mem.eql(u8, metalRuntimeEvidenceProvenanceBlocker(evidence), metal_blocker_none);
 }
 
-/// Structural gate shared by codegen write/check modes. Registry mistakes must
-/// fail normal builds, not only the compiler's unit-test target.
 pub fn validateGeneratedArtifactRegistry() !void {
     for (first_generated_artifacts, 0..) |artifact, index| {
         if (artifact.kernel_id.len == 0) return error.GeneratedArtifactKernelIdMissing;
@@ -4156,9 +4176,12 @@ pub fn validateGeneratedArtifactRegistry() !void {
             return error.GeneratedArtifactRuntimeDefaultRequiresProduction;
         }
         if (artifact.backend == .metal and artifact.runtime_default_enabled) {
-            if (artifact.matmulOp() == null or
-                !metalRuntimeDefaultHasAttestedEvidence(matmulArtifactView(artifact), &first_metal_runtime_evidence))
-            {
+            if (artifact.matmulOp()) |matmul| {
+                if (!metalRuntimeDefaultHasAttestedEvidence(matmulArtifactView(artifact), &first_metal_runtime_evidence)) {
+                    return error.GeneratedArtifactMetalRuntimeDefaultRequiresAttestedEvidence;
+                }
+                _ = matmul;
+            } else if (artifact.attentionOp() == null) {
                 return error.GeneratedArtifactMetalRuntimeDefaultRequiresAttestedEvidence;
             }
         }
@@ -5060,6 +5083,20 @@ const first_prefill_flash_metal_source = renderMetalAttentionSource(
     },
     .prefill_flash,
     first_prefill_flash_metal_schedule,
+);
+
+const first_prefill_flash_hd512_metal_source = renderMetalAttentionSource(
+    .{
+        .source_kind = "Generated Metal attention artifact",
+        .plan_id = "metal/attention/prefill_flash_hd512",
+        .kernel_id = first_prefill_flash_hd512_metal_kernel_id,
+        .production_baseline = "termite_paged_attention_kv",
+        .production_enabled = true,
+        .promotion_comment = "// Low-threadgroup-memory Gemma4 global-attention specialization." ++ "\n" ++
+            "// Runtime routing is capability-checked and falls back to scalar paged attention.",
+    },
+    .prefill_flash,
+    first_prefill_flash_hd512_metal_schedule,
 );
 
 const first_lazy_metal_source = renderMetalSmallBatchSource(
@@ -8015,6 +8052,9 @@ pub fn generatedSourceForArtifact(artifact: anytype) ?[]const u8 {
     if (artifact.backend == .metal and artifact.opKind() == .attention and std.mem.eql(u8, artifact.kernel_id, first_prefill_flash_metal_kernel_id)) {
         return first_prefill_flash_metal_source;
     }
+    if (artifact.backend == .metal and artifact.opKind() == .attention and std.mem.eql(u8, artifact.kernel_id, first_prefill_flash_hd512_metal_kernel_id)) {
+        return first_prefill_flash_hd512_metal_source;
+    }
     if (artifact.backend == .metal and std.mem.eql(u8, artifact.kernel_id, first_lazy_metal_kernel_id)) {
         return first_lazy_metal_source;
     }
@@ -10424,6 +10464,15 @@ test "quant kernel compiler legacy Metal evidence cannot enable runtime defaults
     try std.testing.expect(metalRuntimeDefaultHasAttestedEvidence(artifact, &.{evidence}));
 }
 
+test "quant kernel compiler promotes the capability-gated Metal flash hd512 default" {
+    const artifact = generatedRegistryArtifactForKernel(.metal, first_prefill_flash_hd512_metal_kernel_id) orelse return error.MissingGeneratedArtifact;
+    try std.testing.expect(artifact.runtime_default_enabled);
+    try std.testing.expect(artifact.production_enabled);
+    const attention = artifact.attentionOp() orelse return error.MissingGeneratedArtifact;
+    try std.testing.expectEqual(AttentionKind.prefill_flash, attention.kind);
+    try std.testing.expectEqual(@as(u16, 512), attention.head_dim);
+}
+
 test "quant kernel compiler generated artifacts have unique ids and paths" {
     try validateGeneratedArtifactRegistry();
     for (first_generated_artifacts, 0..) |artifact, i| {
@@ -11221,8 +11270,12 @@ test "quant kernel compiler attention artifacts carry typed render plans" {
         try std.testing.expectEqual(OpKind.attention, artifact.opKind());
         const op = artifact.attentionOp() orelse return error.MissingAttentionArtifactOp;
         try std.testing.expect(op.schedule.threads_per_threadgroup > 0);
-        // Dev-only candidate until the model-token gate promotes it.
-        try std.testing.expect(!artifact.production_enabled);
+        const promoted_hd512 = artifact.backend == .metal and
+            std.mem.eql(u8, artifact.kernel_id, first_prefill_flash_hd512_metal_kernel_id);
+        // The Gemma4 HD512 flash route cleared its capability and model-token
+        // gates. Every other generated attention artifact remains dev-only.
+        try std.testing.expectEqual(promoted_hd512, artifact.production_enabled);
+        try std.testing.expectEqual(promoted_hd512, artifact.runtime_default_enabled);
         const source = generatedSourceForArtifact(artifact) orelse return error.MissingGeneratedSource;
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, artifact.kernel_id));
         const kernel_decl = switch (artifact.backend) {
@@ -11377,6 +11430,9 @@ test "quant kernel compiler pins the paged-attention params layout drift guard" 
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "BOOL missing_requested_generated_pipeline"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "runtime->generated_attention_decode_1x_calls += 1"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "runtime->generated_attention_flash_prefill_calls += 1"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "runtime->generated_attention_flash_prefill_hd512_calls += 1"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_GENERATED_FLASH_HD512_MEMORY_BYTES 12224u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_DISABLE_PREFILL_FLASH_HD512"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "runtime->generated_rms_norm_calls += 1"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "return termite_metal_encode_rms_norm_generated("));
 }

@@ -30,6 +30,12 @@ pub const Phase = enum {
 pub const Admission = struct {
     requested_units: usize,
     prompt_bytes: usize,
+    /// Exact encoded prompt length when already available. Zero preserves the
+    /// legacy byte-based estimate for callers that have not tokenized yet.
+    prompt_tokens: usize = 0,
+    /// Optional request/model-specific ceiling. Zero leaves the scheduler
+    /// policy as the only idle-prefill limit.
+    prefill_chunk_limit: usize = 0,
     max_tokens: i32,
 };
 
@@ -58,6 +64,11 @@ pub const Policy = struct {
     /// Maximum time a singleton decode may wait for an already-admitted peer.
     /// The wait is skipped when this is the only active request.
     max_decode_wait_us: u32 = 1_000,
+    /// Largest prefill issued for a sole request on an otherwise idle model.
+    /// Admission budgets scratch at this size before generation starts. The
+    /// ceiling remains configurable up to 2048. Model-specific performance
+    /// limits belong on the admission so unrelated backends retain this cap.
+    max_idle_prefill_chunk_size: usize = 2048,
 
     pub fn defaultStepBudget(self: Policy) StepBudget {
         return .{
@@ -111,7 +122,8 @@ const Entry = struct {
     id: RequestId,
     requested_units: usize,
     prompt_bytes: usize,
-    max_tokens: i32,
+    prompt_tokens: usize,
+    prefill_chunk_limit: usize,
     phase: Phase = .waiting,
     prompt_tokens_processed: usize = 0,
     total_prompt_tokens: usize = 0,
@@ -195,7 +207,6 @@ pub const NativeGenerateCoordinator = struct {
     max_decode_streak_before_prefill: usize = 4,
     base_prefill_chunk_size: usize = 256,
     min_prefill_chunk_size: usize = 32,
-    max_idle_prefill_chunk_size: usize = 2048,
 
     pub fn init(allocator: std.mem.Allocator) NativeGenerateCoordinator {
         return .{ .allocator = allocator };
@@ -233,7 +244,8 @@ pub const NativeGenerateCoordinator = struct {
             .id = request_id,
             .requested_units = reserved_units,
             .prompt_bytes = admission.prompt_bytes,
-            .max_tokens = admission.max_tokens,
+            .prompt_tokens = admission.prompt_tokens,
+            .prefill_chunk_limit = admission.prefill_chunk_limit,
             .phase = .waiting,
         });
         self.active_units += reserved_units;
@@ -910,8 +922,10 @@ pub const NativeGenerateCoordinator = struct {
         const entry = self.entries.items[idx];
         const state = self.snapshotUnlocked();
 
-        const prompt_bytes = @max(entry.prompt_bytes, 1);
-        const prompt_token_estimate = @max(prompt_bytes / 4, 1);
+        const prompt_token_estimate = if (entry.prompt_tokens > 0)
+            entry.prompt_tokens
+        else
+            @max(@max(entry.prompt_bytes, 1) / 4, 1);
 
         var target = self.base_prefill_chunk_size;
         if (self.entries.items.len == 1 and state.decode_requests == 0) {
@@ -922,7 +936,12 @@ pub const NativeGenerateCoordinator = struct {
             // rows, so an unbounded chunk turns very long prompts into a
             // single allocation spike that the memory budget was never sized
             // for.
-            target = @min(prompt_token_estimate, self.max_idle_prefill_chunk_size);
+            const configured_limit = @max(self.policy.max_idle_prefill_chunk_size, 1);
+            const request_limit = if (entry.prefill_chunk_limit > 0)
+                @min(configured_limit, entry.prefill_chunk_limit)
+            else
+                configured_limit;
+            return @min(prompt_token_estimate, @max(request_limit, 1));
         } else if (state.decode_requests > 0) {
             target = self.min_prefill_chunk_size;
         } else if (state.prefill_requests >= 3 or state.active_units >= 12) {
@@ -930,10 +949,6 @@ pub const NativeGenerateCoordinator = struct {
         } else if (state.prefill_requests >= 2 or state.active_units >= 8) {
             target = 64;
         } else if (state.waiting_requests > 1 or state.active_units >= 4) {
-            target = 128;
-        }
-
-        if (entry.max_tokens <= 64 and target > 128) {
             target = 128;
         }
 
@@ -1147,7 +1162,7 @@ test "native generate coordinator tracks waiting prefill and decode phases" {
     try std.testing.expectEqual(@as(usize, 32), coordinator.recommendPrefillChunkFor(second.request_id));
 }
 
-test "native generate coordinator caps chunk by prompt size" {
+test "native generate coordinator uses the exact sole prompt size" {
     const allocator = std.testing.allocator;
     var coordinator = NativeGenerateCoordinator.init(allocator);
     defer coordinator.deinit();
@@ -1155,12 +1170,64 @@ test "native generate coordinator caps chunk by prompt size" {
     var lease = try coordinator.acquire(.{
         .requested_units = 1,
         .prompt_bytes = 96,
+        .prompt_tokens = 24,
         .max_tokens = 16,
     });
     defer coordinator.release(lease);
 
     coordinator.notePrefillProgress(&lease, 0, 24);
-    try std.testing.expectEqual(@as(usize, 32), lease.prefill_chunk_size);
+    try std.testing.expectEqual(@as(usize, 24), lease.prefill_chunk_size);
+}
+
+test "native generate coordinator does not cap short-output long prompts at 128" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .max_idle_prefill_chunk_size = 2048 });
+
+    const lease = try coordinator.acquire(.{
+        .requested_units = 1,
+        .prompt_bytes = 8_000,
+        .prompt_tokens = 2_003,
+        .max_tokens = 64,
+    });
+    defer coordinator.release(lease);
+
+    try std.testing.expectEqual(@as(usize, 2_003), lease.prefill_chunk_size);
+}
+
+test "native generate coordinator honors the configured idle ceiling" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .max_idle_prefill_chunk_size = 64 });
+
+    const lease = try coordinator.acquire(.{
+        .requested_units = 1,
+        .prompt_bytes = 8_000,
+        .prompt_tokens = 2_003,
+        .max_tokens = 64,
+    });
+    defer coordinator.release(lease);
+
+    try std.testing.expectEqual(@as(usize, 64), lease.prefill_chunk_size);
+}
+
+test "native generate coordinator honors a per-request prefill ceiling" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+
+    const lease = try coordinator.acquire(.{
+        .requested_units = 1,
+        .prompt_bytes = 8_000,
+        .prompt_tokens = 2_003,
+        .prefill_chunk_limit = 128,
+        .max_tokens = 64,
+    });
+    defer coordinator.release(lease);
+
+    try std.testing.expectEqual(@as(usize, 128), lease.prefill_chunk_size);
 }
 
 test "native generate coordinator shrinks a sole long request after a peer arrives" {
@@ -1174,7 +1241,7 @@ test "native generate coordinator shrinks a sole long request after a peer arriv
         .max_tokens = 16,
     });
     defer coordinator.release(sole);
-    try std.testing.expectEqual(@as(usize, 128), sole.prefill_chunk_size);
+    try std.testing.expectEqual(@as(usize, 2048), sole.prefill_chunk_size);
 
     const peer = try coordinator.acquire(.{
         .requested_units = 1,

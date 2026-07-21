@@ -506,6 +506,7 @@ pub const GenerationBatchingConfig = struct {
     max_step_items: usize = 2,
     max_step_query_tokens: usize = 512,
     max_decode_wait_us: u32 = 1_000,
+    max_idle_prefill_chunk_size: usize = 2048,
 
     pub fn enabledForBackend(self: @This(), backend: backends_mod.BackendType) bool {
         if (backend != .cuda) return false;
@@ -538,6 +539,7 @@ pub const GenerationBatchingConfig = struct {
             .max_step_items = @min(@max(self.max_step_items, 1), validated_max_items),
             .max_step_query_tokens = @max(self.max_step_query_tokens, 1),
             .max_decode_wait_us = if (self.mode == .on) self.max_decode_wait_us else 0,
+            .max_idle_prefill_chunk_size = @min(@max(self.max_idle_prefill_chunk_size, 32), 2048),
             // Wider active sets currently lose response equivalence even when
             // individual steps are capped to two rows. Preserve the proven
             // direct path until the multi-wave row scheduler is validated.
@@ -1614,7 +1616,9 @@ pub const Node = struct {
     fn countPromptTokens(
         allocator: std.mem.Allocator,
         model: *model_manager_mod.LoadedModel,
+        gpt_config: gpt_model_mod.Config,
         messages: []const generation.Message,
+        max_tokens: i32,
     ) !usize {
         const prompt = if (model.chat_tmpl) |ct|
             try ct.apply(allocator, messages, true)
@@ -1622,11 +1626,19 @@ pub const Node = struct {
             try generation.formatMessages(allocator, messages);
         defer allocator.free(prompt);
 
-        var encoded = try generation.encodePromptForGeneration(
+        const media_allowance = generation.nativeGenerationMediaTokenAllowance(messages, gpt_config);
+        const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
+            gpt_config,
+            null,
+            @intCast(@max(max_tokens, 1)),
+            0,
+            media_allowance,
+        );
+        var encoded = try generation.encodeNativeGenerationPrompt(
             model.getTokenizer(),
             allocator,
             prompt,
-            2048,
+            prompt_token_limit,
             model.manifest.add_bos_token,
             model.manifest.bos_token,
         );
@@ -1635,7 +1647,7 @@ pub const Node = struct {
         var prompt_tokens: usize = 0;
         while (prompt_tokens < encoded.attention_mask.len and encoded.attention_mask[prompt_tokens] != 0) : (prompt_tokens += 1) {}
         if (prompt_tokens == 0) return error.EmptyPrompt;
-        return prompt_tokens;
+        return std.math.add(usize, prompt_tokens, media_allowance) catch error.PromptTooLong;
     }
 
     fn generateMessagesDirectMaxTokens(
@@ -1720,15 +1732,25 @@ pub const Node = struct {
             runtime.tier.memory.defaultLimitsForBackend(budget_backend_class),
         ));
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
-        const prompt_tokens = try countPromptTokens(allocator, model, messages);
-        run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
-            backend_kind,
-            kv_dtype,
-            gpt_config,
+        const prompt_tokens = try countPromptTokens(allocator, model, gpt_config, messages, max_tokens);
+        const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
+            .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config },
+        };
+        const direct_prefill_ceiling = @min(
+            prompt_tokens,
+            generation.nativeGenerationPrefillChunkCeiling(
+                backend_kind,
+                gpt_config,
+                self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
+            ),
+        );
+        const admitted_prefill_chunk = runtime.tier.memory.reserveGptGenerationAtLargestChunk(
+            &run_budget,
+            &budget_components,
             prompt_tokens,
             @intCast(@max(max_tokens, 1)),
-            256,
-        )) catch |err| {
+            direct_prefill_ceiling,
+        ) catch |err| {
             if (err == error.MemoryBudgetExceeded) {
                 var buf: [512]u8 = undefined;
                 std.log.warn("{s}", .{
@@ -1792,7 +1814,7 @@ pub const Node = struct {
         if (timing != null) {
             std.log.info("direct generator starting generation model={s} backend={s}", .{ model_name, @tagName(model.session.backend()) });
         }
-        var result = pipeline.generate(messages, .{ .max_tokens = max_tokens, .prefill_chunk_size = 256 }) catch |err| {
+        var result = pipeline.generate(messages, .{ .max_tokens = max_tokens, .prefill_chunk_size = admitted_prefill_chunk }) catch |err| {
             std.log.err("direct generator generation failed model={s} backend={s}: {s}", .{
                 model_name,
                 @tagName(model.session.backend()),
@@ -2894,7 +2916,10 @@ pub const Node = struct {
         self: *Node,
         allocator: std.mem.Allocator,
         model: *model_manager_mod.LoadedModel,
+        gpt_config: gpt_model_mod.Config,
         messages: []const generation.Message,
+        max_tokens: i32,
+        speculative_bonus_tokens: usize,
     ) !usize {
         _ = self;
         const prompt = if (model.chat_tmpl) |ct|
@@ -2902,18 +2927,26 @@ pub const Node = struct {
         else
             try generation.formatMessages(allocator, messages);
         defer allocator.free(prompt);
-        var encoded = try generation.encodePromptForGeneration(
+        const media_allowance = generation.nativeGenerationMediaTokenAllowance(messages, gpt_config);
+        const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
+            gpt_config,
+            null,
+            @intCast(@max(max_tokens, 1)),
+            speculative_bonus_tokens,
+            media_allowance,
+        );
+        var encoded = try generation.encodeNativeGenerationPrompt(
             model.getTokenizer(),
             allocator,
             prompt,
-            2048,
+            prompt_token_limit,
             model.manifest.add_bos_token,
             model.manifest.bos_token,
         );
         defer encoded.deinit();
         var count: usize = 0;
         while (count < encoded.attention_mask.len and encoded.attention_mask[count] != 0) : (count += 1) {}
-        return count;
+        return std.math.add(usize, count, media_allowance) catch error.PromptTooLong;
     }
 
     fn memoryBudgetExceededMessage(
@@ -3659,7 +3692,7 @@ pub const Node = struct {
             .speculation_requested = requested_draft_model_name != null,
             .speculation_policy = speculation.policy,
             .speculation_calibration = speculation.calibration,
-            .prefill_chunk_size = 256,
+            .prefill_chunk_size = 0,
             .cache_dtype = body.cache_dtype,
             .cache_compaction_ratio = body.cache_compaction_ratio,
             .prompt_cache_enabled = self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and prompt_cache_key != null and !want_stream,
@@ -3979,8 +4012,29 @@ pub const Node = struct {
         }
         defer if (continuous_generation_lock_held) model.unlockNativeGeneration();
         const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
-        const prompt_tokens = self.estimateNativePromptTokens(ctx.allocator, model, messages.items) catch |err|
+        const prompt_tokens = self.estimateNativePromptTokens(
+            ctx.allocator,
+            model,
+            gpt_config,
+            messages.items,
+            configured_max_tokens,
+            if (config.speculation_requested and config.speculation_policy != .off and config.speculative_k > 0) 1 else 0,
+        ) catch |err| {
+            if (err == error.PromptTooLong) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "prompt exceeds the model context window after reserving output tokens",
+                });
+            }
             return ctx.status(500).json(.{ .@"error" = "TOKENIZE_FAILED", .message = internalErrorMessage("TOKENIZE_FAILED", err) });
+        };
+        const backend_kind = generationBackendKind(model.session.backend()) orelse
+            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unsupported backend in native generation path" });
+        const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
+            backend_kind,
+            gpt_config,
+            self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
+        );
         var native_generate_lease: ?runtime.scheduler.native_generate.Lease = null;
         defer if (native_generate_lease) |lease| {
             if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
@@ -3989,13 +4043,12 @@ pub const Node = struct {
             native_generate_lease = try self.acquireNativeGenerateLease(coordinator, .{
                 .requested_units = reserved_units,
                 .prompt_bytes = prompt_bytes,
+                .prompt_tokens = prompt_tokens,
+                .prefill_chunk_limit = if (config.prefill_chunk_size == 0) idle_prefill_ceiling else 0,
                 .max_tokens = configured_max_tokens,
             });
-            config.prefill_chunk_size = native_generate_lease.?.prefill_chunk_size;
         }
 
-        const backend_kind = generationBackendKind(model.session.backend()) orelse
-            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unsupported backend in native generation path" });
         const kv_dtype = if (config.cache_dtype) |name|
             runtime.kv.pool.parseKvDType(name) orelse
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid cache_dtype value" })
@@ -4010,23 +4063,6 @@ pub const Node = struct {
             runtime.tier.memory.defaultLimitsForBackend(budget_backend_class),
         ));
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
-        const admission_prefill_chunk = if (config.prefill_chunk_size > 0) config.prefill_chunk_size else 256;
-        run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
-            backend_kind,
-            kv_dtype,
-            gpt_config,
-            prompt_tokens,
-            @intCast(@max(config.max_tokens, 1)),
-            admission_prefill_chunk,
-        )) catch |err| {
-            if (err == error.MemoryBudgetExceeded) {
-                return ctx.status(507).json(.{
-                    .@"error" = "MEMORY_BUDGET_EXCEEDED",
-                    .message = memoryBudgetExceededMessage(ctx.allocator, model.session, &run_budget),
-                });
-            }
-            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
-        };
 
         const tok = model.getTokenizer();
         var draft_cb: ?ops.ComputeBackend = null;
@@ -4123,7 +4159,6 @@ pub const Node = struct {
         };
 
         if (loaded_draft_model) |draft_model| {
-            const draft_cfg = draft_gpt_config.?;
             const draft_kind = draft_backend_kind.?;
             const draft_budget_class: runtime.tier.memory.BackendClass = switch (draft_kind) {
                 .native => .cpu,
@@ -4138,23 +4173,71 @@ pub const Node = struct {
                 runtime.kv.pool.parseKvDType(name).?
             else
                 session_factory.recommendedKvDTypeForSession(draft_model.session, draft_kind);
-            run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
-                draft_kind,
-                draft_kv_dtype.?,
-                draft_cfg,
-                prompt_tokens,
-                @intCast(@max(config.max_tokens, 1)),
-                admission_prefill_chunk,
-            )) catch |err| {
-                if (err == error.MemoryBudgetExceeded) {
-                    return ctx.status(507).json(.{
-                        .@"error" = "MEMORY_BUDGET_EXCEEDED",
-                        .message = memoryBudgetExceededMessage(ctx.allocator, draft_model.session, &run_budget),
-                    });
-                }
-                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
-            };
         }
+
+        if (loaded_draft_model != null and config.speculation_policy != .off) {
+            const shared_prompt_limit = generation.nativeGenerationPromptTokenLimit(
+                gpt_config,
+                draft_gpt_config,
+                @intCast(@max(config.max_tokens, 1)),
+                if (config.speculative_k > 0) 1 else 0,
+                0,
+            ) catch return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "requested output leaves no prompt capacity in the target or draft model context window",
+            });
+            if (prompt_tokens > shared_prompt_limit) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "prompt exceeds the target or draft model context window",
+                });
+            }
+        }
+
+        var budget_components: [2]runtime.tier.memory.GptGenerationBudgetComponent = undefined;
+        budget_components[0] = .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config };
+        var budget_component_count: usize = 1;
+        if (loaded_draft_model != null) {
+            budget_components[1] = .{
+                .backend = draft_backend_kind.?,
+                .kv_dtype = draft_kv_dtype.?,
+                .config = draft_gpt_config.?,
+            };
+            budget_component_count = 2;
+        }
+        const scheduler_prefill_ceiling = if (native_generate_lease) |lease|
+            lease.prefill_chunk_size
+        else
+            @min(
+                prompt_tokens,
+                if (config.prefill_chunk_size == 0)
+                    idle_prefill_ceiling
+                else
+                    self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
+            );
+        const admission_prefill_ceiling = if (config.prefill_chunk_size > 0)
+            @min(config.prefill_chunk_size, scheduler_prefill_ceiling)
+        else
+            scheduler_prefill_ceiling;
+        const speculative_budget_bonus: usize = if (loaded_draft_model != null and
+            config.speculation_policy != .off and
+            config.speculative_k > 0) 1 else 0;
+        const budget_max_tokens = @as(usize, @intCast(@max(config.max_tokens, 1))) + speculative_budget_bonus;
+        config.prefill_chunk_size = runtime.tier.memory.reserveGptGenerationAtLargestChunk(
+            &run_budget,
+            budget_components[0..budget_component_count],
+            prompt_tokens,
+            budget_max_tokens,
+            admission_prefill_ceiling,
+        ) catch |err| {
+            if (err == error.MemoryBudgetExceeded) {
+                return ctx.status(507).json(.{
+                    .@"error" = "MEMORY_BUDGET_EXCEEDED",
+                    .message = memoryBudgetExceededMessage(ctx.allocator, model.session, &run_budget),
+                });
+            }
+            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
+        };
 
         const first_locked_model = if (loaded_draft_model) |draft_model|
             if (@intFromPtr(draft_model) < @intFromPtr(model)) draft_model else model
@@ -4363,8 +4446,15 @@ pub const Node = struct {
             return self.streamGenerate(ctx, body.model, &pipeline, messages.items, config, if (tool_parser) |*parser| parser else null);
         }
 
-        var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
+        var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err| {
+            if (err == error.PromptTooLong) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "prompt exceeds the target or draft model context window",
+                });
+            }
             return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err) });
+        };
         defer result.deinit();
         if (debug_metal_timing) {
             if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
@@ -4719,7 +4809,7 @@ pub const Node = struct {
             .speculation_requested = false,
             .speculation_policy = speculation.policy,
             .speculation_calibration = speculation.calibration,
-            .prefill_chunk_size = 256,
+            .prefill_chunk_size = 0,
             .cache_dtype = body.cache_dtype,
             .cache_compaction_ratio = body.cache_compaction_ratio,
         };
@@ -4991,6 +5081,11 @@ pub const Node = struct {
                         continue;
                     },
                 };
+                const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
+                    backend_kind,
+                    gpt_config,
+                    self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
+                );
 
                 var configs = try ctx.allocator.alloc(generation.GenerationConfig, group_indices.items.len);
                 defer ctx.allocator.free(configs);
@@ -5014,8 +5109,22 @@ pub const Node = struct {
                         pending[idx] = false;
                         continue;
                     };
-                    prompt_tokens[pos] = self.estimateNativePromptTokens(ctx.allocator, model, owned_messages[idx].messages) catch |err| {
-                        results[idx].@"error" = .{ .code = "TOKENIZE_FAILED", .message = internalErrorMessage("TOKENIZE_FAILED", err), .retryable = false };
+                    prompt_tokens[pos] = self.estimateNativePromptTokens(
+                        ctx.allocator,
+                        model,
+                        gpt_config,
+                        owned_messages[idx].messages,
+                        configs[pos].max_tokens,
+                        if (configs[pos].speculation_requested and configs[pos].speculation_policy != .off and configs[pos].speculative_k > 0) 1 else 0,
+                    ) catch |err| {
+                        results[idx].@"error" = if (err == error.PromptTooLong)
+                            .{
+                                .code = "INVALID_REQUEST",
+                                .message = "prompt exceeds the model context window after reserving output tokens",
+                                .retryable = false,
+                            }
+                        else
+                            .{ .code = "TOKENIZE_FAILED", .message = internalErrorMessage("TOKENIZE_FAILED", err), .retryable = false };
                         pending[idx] = false;
                         continue;
                     };
@@ -5042,22 +5151,87 @@ pub const Node = struct {
                     model.session,
                     runtime.tier.memory.defaultLimitsForBackend(budget_backend_class),
                 ));
-                var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
+                var leases = try ctx.allocator.alloc(runtime.scheduler.native_generate.Lease, group_indices.items.len);
+                for (leases) |*lease| lease.* = .{ .request_id = 0, .reserved_units = 0, .prompt_bytes = 0, .max_tokens = 0, .prefill_chunk_size = 0, .active_requests_snapshot = 0 };
+                defer {
+                    if (model.native_generate_coordinator) |coordinator| {
+                        for (leases) |*lease| {
+                            if (lease.request_id != 0) {
+                                coordinator.release(lease.*);
+                                lease.request_id = 0;
+                            }
+                        }
+                    }
+                    ctx.allocator.free(leases);
+                }
+                var admitted_count: usize = 0;
                 for (group_indices.items, 0..) |idx, pos| {
                     if (!pending[idx]) continue;
-                    const admission_prefill_chunk = if (configs[pos].prefill_chunk_size > 0) configs[pos].prefill_chunk_size else 256;
-                    run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
-                        backend_kind,
-                        kv_dtype,
-                        gpt_config,
+                    if (model.native_generate_coordinator) |coordinator| {
+                        const queue_item_units = self.estimateGenerateQueueUnits(owned_messages[idx].messages, configs[pos].max_tokens);
+                        leases[pos] = self.acquireNativeGenerateLease(coordinator, .{
+                            .requested_units = queue_item_units,
+                            .prompt_bytes = prompt_bytes[pos],
+                            .prompt_tokens = prompt_tokens[pos],
+                            .prefill_chunk_limit = if (configs[pos].prefill_chunk_size == 0) idle_prefill_ceiling else 0,
+                            .max_tokens = configs[pos].max_tokens,
+                        }) catch |err| {
+                            results[idx].@"error" = .{ .code = "QUEUE_FULL", .message = internalErrorMessage("QUEUE_FULL", err), .retryable = true };
+                            pending[idx] = false;
+                            continue;
+                        };
+                    }
+                    admitted_count += 1;
+                }
+                if (model.native_generate_coordinator) |coordinator| {
+                    for (group_indices.items, 0..) |idx, pos| {
+                        if (!pending[idx]) continue;
+                        leases[pos].prefill_chunk_size = coordinator.recommendPrefillChunkFor(leases[pos].request_id);
+                    }
+                }
+
+                var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
+                const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
+                    .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config },
+                };
+                for (group_indices.items, 0..) |idx, pos| {
+                    if (!pending[idx]) continue;
+                    const scheduler_ceiling = if (model.native_generate_coordinator != null)
+                        leases[pos].prefill_chunk_size
+                    else
+                        @min(
+                            prompt_tokens[pos],
+                            if (configs[pos].prefill_chunk_size == 0)
+                                idle_prefill_ceiling
+                            else
+                                self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
+                        );
+                    const admission_prefill_ceiling = if (configs[pos].prefill_chunk_size > 0)
+                        @min(configs[pos].prefill_chunk_size, scheduler_ceiling)
+                    else
+                        scheduler_ceiling;
+                    const speculative_budget_bonus: usize = if (configs[pos].speculation_requested and
+                        configs[pos].speculation_policy != .off and
+                        configs[pos].speculative_k > 0) 1 else 0;
+                    const budget_max_tokens = @as(usize, @intCast(@max(configs[pos].max_tokens, 1))) + speculative_budget_bonus;
+                    configs[pos].prefill_chunk_size = runtime.tier.memory.reserveGptGenerationAtLargestChunk(
+                        &run_budget,
+                        &budget_components,
                         prompt_tokens[pos],
-                        @intCast(@max(configs[pos].max_tokens, 1)),
-                        admission_prefill_chunk,
-                    )) catch |err| {
+                        budget_max_tokens,
+                        admission_prefill_ceiling,
+                    ) catch |err| {
                         results[idx].@"error" = .{ .code = "MEMORY_BUDGET_EXCEEDED", .message = internalErrorMessage("MEMORY_BUDGET_EXCEEDED", err), .retryable = true };
                         pending[idx] = false;
+                        admitted_count -= 1;
+                        if (model.native_generate_coordinator) |coordinator| {
+                            coordinator.release(leases[pos]);
+                            leases[pos].request_id = 0;
+                        }
+                        continue;
                     };
                 }
+                if (admitted_count == 0) continue;
 
                 var cb = session_factory.getComputeBackendWithBudget(model.session, ctx.allocator, &run_budget) catch |err| {
                     for (group_indices.items) |idx| {
@@ -5111,19 +5285,6 @@ pub const Node = struct {
                     for (decode_states) |*state| state.deinit();
                     ctx.allocator.free(decode_states);
                 }
-                var leases = try ctx.allocator.alloc(runtime.scheduler.native_generate.Lease, group_indices.items.len);
-                for (leases) |*lease| lease.* = .{ .request_id = 0, .reserved_units = 0, .prompt_bytes = 0, .max_tokens = 0, .prefill_chunk_size = 0, .active_requests_snapshot = 0 };
-                defer {
-                    if (model.native_generate_coordinator) |coordinator| {
-                        for (leases) |*lease| {
-                            if (lease.request_id != 0) {
-                                coordinator.release(lease.*);
-                                lease.request_id = 0;
-                            }
-                        }
-                    }
-                    ctx.allocator.free(leases);
-                }
                 var task_results = try ctx.allocator.alloc(BatchGenerateTaskResult, group_indices.items.len);
                 for (task_results) |*task_result| task_result.* = .{};
                 defer ctx.allocator.free(task_results);
@@ -5136,23 +5297,9 @@ pub const Node = struct {
                 for (group_indices.items, 0..) |idx, pos| {
                     if (!pending[idx]) continue;
                     const task_alloc = task_arenas[pos].allocator();
-                    const queue_item_units = self.estimateGenerateQueueUnits(owned_messages[idx].messages, configs[pos].max_tokens);
                     decode_states[pos] = generation.NativeDecodeState.initPaged(task_alloc, &kv_manager, pool_id, model.shared_moe_cache);
                     decode_states[pos].kv_lock = &kv_mutex;
                     decode_states[pos].kv_storage = &kv_storage;
-                    leases[pos] = if (model.native_generate_coordinator) |coordinator| blk: {
-                        const lease = self.acquireNativeGenerateLease(coordinator, .{
-                            .requested_units = queue_item_units,
-                            .prompt_bytes = prompt_bytes[pos],
-                            .max_tokens = configs[pos].max_tokens,
-                        }) catch |err| {
-                            results[idx].@"error" = .{ .code = "QUEUE_FULL", .message = internalErrorMessage("QUEUE_FULL", err), .retryable = true };
-                            pending[idx] = false;
-                            continue;
-                        };
-                        configs[pos].prefill_chunk_size = lease.prefill_chunk_size;
-                        break :blk lease;
-                    } else .{ .request_id = 0, .reserved_units = 0, .prompt_bytes = 0, .max_tokens = 0, .prefill_chunk_size = 256, .active_requests_snapshot = 0 };
                     tasks[pos] = .{
                         .allocator = task_alloc,
                         .pipeline = .{
@@ -10550,12 +10697,21 @@ test "generation batching keeps the experimental CUDA envelope default-off" {
     try std.testing.expectEqual(@as(usize, 2), policy.max_step_items);
     try std.testing.expectEqual(@as(?usize, 2), policy.max_active_requests_for_batching);
     try std.testing.expectEqual(@as(u32, 0), policy.max_decode_wait_us);
+    try std.testing.expectEqual(@as(usize, 2048), policy.max_idle_prefill_chunk_size);
 
     const enabled_policy = (GenerationBatchingConfig{ .mode = .on }).schedulerPolicy();
     try std.testing.expectEqual(@as(u32, 1_000), enabled_policy.max_decode_wait_us);
 
     const clamped = (GenerationBatchingConfig{ .max_step_items = 128 }).schedulerPolicy();
     try std.testing.expectEqual(@as(usize, 2), clamped.max_step_items);
+    try std.testing.expectEqual(
+        @as(usize, 32),
+        (GenerationBatchingConfig{ .max_idle_prefill_chunk_size = 1 }).schedulerPolicy().max_idle_prefill_chunk_size,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2048),
+        (GenerationBatchingConfig{ .max_idle_prefill_chunk_size = 4096 }).schedulerPolicy().max_idle_prefill_chunk_size,
+    );
 }
 
 test "native generation applies scheduler policy before the first lease" {

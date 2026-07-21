@@ -504,7 +504,10 @@ fn metalJitMaximumDynamicThreadgroupMemory(artifact: quant_kernel_compiler.Gener
     const op = artifact.attentionOp() orelse return 0;
     return switch (op.kind) {
         .decode_1x => align16((4096 * 2 + 256) * @sizeOf(f32)),
-        .prefill_flash => align16(80 * 256 + 2016),
+        .prefill_flash => if (op.head_dim == 512)
+            12_224
+        else
+            align16((8 + @as(usize, op.schedule.key_chunk)) * 256 * 2 + 52 * @as(usize, op.schedule.key_chunk) + 352),
     };
 }
 
@@ -8140,6 +8143,7 @@ pub const RawRuntimeMemoryStats = extern struct {
     paged_attention_1x_calls: u64 = 0,
     generated_attention_decode_1x_calls: u64 = 0,
     generated_attention_flash_prefill_calls: u64 = 0,
+    generated_attention_flash_prefill_hd512_calls: u64 = 0,
     generated_rms_norm_calls: u64 = 0,
     compute_encoder_count: u64 = 0,
     blit_encoder_count: u64 = 0,
@@ -8245,6 +8249,9 @@ test "metal generated attention and RMS opt-ins are fail-closed and execution-co
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "missing_requested_generated_pipeline || missing_quant_reduce_pipeline"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "runtime->generated_attention_decode_1x_calls += 1"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "runtime->generated_attention_flash_prefill_calls += 1"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "runtime->generated_attention_flash_prefill_hd512_calls += 1"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "runtime->attention_flash_hd512_generated_pipeline = termite_metal_make_pipeline"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_PREFILL_FLASH_HD512"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "runtime->generated_rms_norm_calls += 1"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "return termite_metal_encode_rms_norm_generated("));
 }
@@ -12315,6 +12322,13 @@ test "metal runtime JIT schedule validation enforces reflected device limits" {
         }
         @compileError("missing generated Metal decode attention artifact");
     };
+    const flash_hd512 = comptime blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+            if (artifact.backend == .metal and artifact.opKind() == .attention and
+                artifact.attentionOp().?.head_dim == 512) break :blk artifact;
+        }
+        @compileError("missing generated Metal hd512 flash attention artifact");
+    };
     var device = MetalDeviceInfo{
         .max_threads_per_threadgroup_width = 1024,
         .max_threadgroup_memory_length = 64 * 1024,
@@ -12332,6 +12346,8 @@ test "metal runtime JIT schedule validation enforces reflected device limits" {
     pipeline.max_total_threads_per_threadgroup = 1024;
     device.max_threadgroup_memory_length = 32 * 1024;
     try std.testing.expectError(error.MetalJitThreadgroupMemoryLimitExceeded, validateMetalJitSchedule(decode, device, pipeline));
+    device.max_threadgroup_memory_length = 12_224;
+    try validateMetalJitSchedule(flash_hd512, device, pipeline);
 
     const tiled = quant_kernel_compiler.KernelSchedule{
         .threads_per_threadgroup = 64,

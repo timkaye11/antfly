@@ -510,8 +510,13 @@ fn validateAttentionSchedule(kind: AttentionKind, schedule: KernelSchedule) !voi
         // values. head_dim (a runtime value, must be a multiple of 32) is guarded
         // inside the kernel body.
         .prefill_flash => {
-            if (schedule.threads_per_threadgroup != 128) return error.AttentionFlashThreadsMustBe128;
             if (schedule.cols_per_threadgroup != 1) return error.AttentionColsMustBeOne;
+            if (schedule.threads_per_threadgroup == 256) {
+                if (schedule.key_chunk != 32) return error.AttentionFlashHd512KeyChunkMustBe32;
+                if (schedule.skip_rescale) return error.AttentionFlashHd512SkipRescaleUnsupported;
+                return;
+            }
+            if (schedule.threads_per_threadgroup != 128) return error.AttentionFlashThreadsMustBe128Or256;
             const kc = schedule.key_chunk;
             if (kc == 0 or kc % 32 != 0) return error.AttentionFlashKeyChunkNotSimdgroupMultiple;
             if (kc > 128) return error.AttentionFlashKeyChunkTooWide;
@@ -529,7 +534,10 @@ fn renderAttentionBody(
     try validateAttentionSchedule(kind, schedule);
     switch (kind) {
         .decode_1x => try renderPagedAttention1xBody(allocator, out, kernel_id, schedule),
-        .prefill_flash => try renderPrefillFlashBody(allocator, out, kernel_id, schedule),
+        .prefill_flash => if (schedule.threads_per_threadgroup == 256)
+            try renderPrefillFlashHd512Body(allocator, out, kernel_id)
+        else
+            try renderPrefillFlashBody(allocator, out, kernel_id, schedule),
     }
 }
 
@@ -743,6 +751,53 @@ fn renderPrefillFlashBody(
     try out.appendSlice(allocator, "    threadgroup_barrier(mem_flags::mem_threadgroup);\n");
     try out.appendSlice(allocator, "    for (uint i = uint(tid); i < 8u * hd; i += 128u) { uint j = i / hd; uint d = i - j * hd; uint qi = q0 + j; if (qi >= p.q_len) continue; uint sg_of_d = d / (hd / 4u); uint d_in = d - sg_of_d * (hd / 4u); output[qi * q_stride + h * hd + d] = so[sg_of_d * (8u * (hd / 4u)) + j * (hd / 4u) + d_in]; }\n");
     try out.appendSlice(allocator, "}\n");
+}
+
+/// Gemma4 global-attention specialization: 8 queries, head_dim=512, KC=32,
+/// 256 threads. Four simdgroups produce Q*K^T; all eight own 64 output columns.
+/// K/V are read as page-local 8-token tiles, so shared memory is only Q (8 KiB),
+/// softmax state, and one reusable 8x64 partial-tail store (12,224 bytes total).
+fn renderPrefillFlashHd512Body(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    kernel_id: []const u8,
+) !void {
+    try appendFmt(allocator, out, "kernel void {s}(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant antfly_paged_attention_1x_params &p [[buffer(6)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {{\n", .{kernel_id});
+    try out.appendSlice(allocator, "    const uint hd = p.head_dim; const uint q0 = tg.x * 8u; const uint h = tg.y;\n" ++
+        "    if (q0 >= p.q_len || h >= p.num_heads || p.format != 3u || p.page_size == 0u || (p.page_size & 7u) != 0u || p.num_kv_heads == 0u || p.num_heads % p.num_kv_heads != 0u || hd != 512u) return;\n" ++
+        "    const float scale = rsqrt(512.0f); const uint heads_per_group = p.num_heads / p.num_kv_heads; const uint kv_head_base = (h / heads_per_group) * hd;\n" ++
+        "    const uint q_stride = p.num_heads * hd; const uint k_row_halfs = p.key_row_bytes / 2u;\n" ++
+        "    threadgroup half *sq = (threadgroup half *)shmem;\n" ++
+        "    threadgroup char *fb = shmem + 8u * 512u * 2u;\n" ++
+        "    threadgroup float *ss = (threadgroup float *)fb;\n" ++
+        "    threadgroup half *sp = (threadgroup half *)(fb + 1024u);\n" ++
+        "    threadgroup uint *sphys = (threadgroup uint *)(fb + 1536u);\n" ++
+        "    threadgroup float *sM = (threadgroup float *)(fb + 1664u);\n" ++
+        "    threadgroup float *sS = (threadgroup float *)(fb + 1696u);\n" ++
+        "    threadgroup float *sdiag = (threadgroup float *)(fb + 1728u);\n" ++
+        "    threadgroup float *so = (threadgroup float *)(fb + 1984u);\n" ++
+        "    const device half *k_half = reinterpret_cast<const device half *>(encoded_key); const device half *v_half = reinterpret_cast<const device half *>(v_bytes);\n" ++
+        "    for (uint i = uint(tid); i < 8u * 512u; i += 256u) { uint j = i / 512u; uint d = i - j * 512u; uint qi = q0 + j; sq[i] = qi < p.q_len ? half(q[qi * q_stride + h * 512u + d] * scale) : half(0.0f); }\n" ++
+        "    if (tid < 8u) { sM[tid] = -3.402823466e+38f; sS[tid] = 0.0f; } if (tid < 64u) sdiag[tid] = 0.0f;\n" ++
+        "    const uint dslice = uint(sgitg) * 64u; simdgroup_float8x8 mo[8]; for (uint i = 0u; i < 8u; ++i) mo[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n");
+
+    try out.appendSlice(allocator, "    for (uint kc = 0u; kc < p.kv_tokens; kc += 32u) {\n" ++
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n" ++
+        "        if (tid < 32u) { uint ki = kc + uint(tid); sphys[tid] = ki < p.kv_tokens ? antfly_paged_attention_1x_page_token(block_table, p, ki) : 0xffffffffu; }\n" ++
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n" ++
+        "        if (sgitg < 4u) { uint ktile = uint(sgitg); uint phys = sphys[ktile * 8u]; const device half *kbase = k_half + (phys != 0xffffffffu ? phys : 0u) * k_row_halfs + kv_head_base; simdgroup_float8x8 ms = make_filled_simdgroup_matrix<float, 8>(0.0f); for (uint d = 0u; d < 512u; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, sq + d, 512u); simdgroup_load(mk, kbase + d, k_row_halfs, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } simdgroup_store(ms, ss + ktile * 8u, 32u, 0, false); }\n" ++
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n" ++
+        "        if (sgitg < 4u) { for (uint jj = 0u; jj < 2u; ++jj) { uint j = uint(sgitg) + jj * 4u; uint qi = q0 + j; uint query_pos = p.query_position_offset + qi; uint kk = uint(lane); uint ki = kc + kk; bool allowed = ki < p.kv_tokens && qi < p.q_len && sphys[kk] != 0xffffffffu; if (allowed) { uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; } float sc = allowed ? ss[j * 32u + kk] : -3.402823466e+38f; if (!isfinite(sc)) sc = -3.402823466e+38f; float row_max = simd_max(sc); float m_old = sM[j]; float m_new = max(m_old, row_max); float e = 0.0f; float corr = 1.0f; if (m_new > -3.0e+38f) { corr = m_old > -3.0e+38f ? exp(m_old - m_new) : 0.0f; e = sc > -3.0e+38f ? exp(sc - m_new) : 0.0f; } sp[j * 32u + kk] = half(e); float row_sum = simd_sum(e); if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[j * 8u + j] = corr; } } }\n" ++
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n" ++
+        "        simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag, 8u); for (uint i = 0u; i < 8u; ++i) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, mcorr, mo[i]); mo[i] = scaled; }\n" ++
+        "        for (uint dt = 0u; dt < 8u; ++dt) { uint d8 = dslice + dt * 8u; simdgroup_float8x8 acc = mo[dt]; for (uint kk8 = 0u; kk8 < 4u; ++kk8) { uint phys = sphys[kk8 * 8u]; const device half *vbase = v_half + (phys != 0xffffffffu ? phys : 0u) * p.v_row_stride + kv_head_base + d8; simdgroup_half8x8 mp; simdgroup_half8x8 mv; simdgroup_load(mp, sp + kk8 * 8u, 32u); simdgroup_load(mv, vbase, p.v_row_stride); simdgroup_multiply_accumulate(acc, mp, mv, acc); } mo[dt] = acc; }\n" ++
+        "    }\n");
+
+    try out.appendSlice(allocator, "    threadgroup_barrier(mem_flags::mem_threadgroup); if (tid < 8u) { float denom = sS[tid]; sdiag[uint(tid) * 8u + uint(tid)] = denom > 0.0f ? 1.0f / denom : 0.0f; } threadgroup_barrier(mem_flags::mem_threadgroup);\n" ++
+        "    simdgroup_float8x8 minv; simdgroup_load(minv, sdiag, 8u); for (uint dt = 0u; dt < 8u; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, minv, mo[dt]); mo[dt] = scaled; }\n" ++
+        "    if (q0 + 8u <= p.q_len) { for (uint dt = 0u; dt < 8u; ++dt) simdgroup_store(mo[dt], output + q0 * q_stride + h * 512u + dslice + dt * 8u, q_stride); return; }\n" ++
+        "    const uint valid_rows = p.q_len - q0; for (uint owner = 0u; owner < 8u; ++owner) { threadgroup_barrier(mem_flags::mem_threadgroup); if (uint(sgitg) == owner) for (uint dt = 0u; dt < 8u; ++dt) simdgroup_store(mo[dt], so + dt * 8u, 64u); threadgroup_barrier(mem_flags::mem_threadgroup); for (uint i = uint(tid); i < valid_rows * 64u; i += 256u) { uint j = i / 64u; uint d = i - j * 64u; output[(q0 + j) * q_stride + h * 512u + owner * 64u + d] = so[i]; } }\n" ++
+        "}\n");
 }
 
 /// One generated Metal kernel to emit into the shared runtime region: its
@@ -1539,12 +1594,33 @@ test "metal renderer restructures the flash Q·Kᵀ and score passes for key_chu
 }
 
 test "metal renderer rejects invalid flash-prefill schedules" {
-    // Flash is structurally 128 threads / 4 simdgroups.
-    try std.testing.expectError(error.AttentionFlashThreadsMustBe128, validateAttentionSchedule(.prefill_flash, .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree, .key_chunk = 32 }));
+    // Flash uses either the 128-thread general route or the exact 256-thread
+    // head_dim=512 specialization.
+    try std.testing.expectError(error.AttentionFlashThreadsMustBe128Or256, validateAttentionSchedule(.prefill_flash, .{ .threads_per_threadgroup = 64, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree, .key_chunk = 32 }));
     // key_chunk must be a positive multiple of the 32-lane simdgroup width.
     try std.testing.expectError(error.AttentionFlashKeyChunkNotSimdgroupMultiple, validateAttentionSchedule(.prefill_flash, .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree, .key_chunk = 48 }));
     // key_chunk must fit the single-pass sphys write (<= 128 threads).
     try std.testing.expectError(error.AttentionFlashKeyChunkTooWide, validateAttentionSchedule(.prefill_flash, .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree, .key_chunk = 160 }));
     // One threadgroup owns one 8-query tile.
     try std.testing.expectError(error.AttentionColsMustBeOne, validateAttentionSchedule(.prefill_flash, .{ .threads_per_threadgroup = 128, .cols_per_threadgroup = 2, .reduction = .threadgroup_tree, .key_chunk = 32 }));
+}
+
+test "metal renderer emits the low-memory head-dim-512 flash prefill specialization" {
+    const source = try renderPrefillFlashKernel(std.testing.allocator, "antfly_flash_hd512", .{
+        .threads_per_threadgroup = 256,
+        .cols_per_threadgroup = 1,
+        .reduction = .threadgroup_tree,
+        .key_chunk = 32,
+    });
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "hd != 512u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "(p.page_size & 7u) != 0u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "if (sgitg < 4u)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint dslice = uint(sgitg) * 64u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "threadgroup float *so = (threadgroup float *)(fb + 1984u)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const device half *vbase = v_half + (phys != 0xffffffffu ? phys : 0u)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "simdgroup_store(mo[dt], output + q0 * q_stride"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "threadgroup half *skv"));
+    try std.testing.expectError(error.AttentionFlashHd512KeyChunkMustBe32, renderPrefillFlashKernel(std.testing.allocator, "bad", .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree, .key_chunk = 64 }));
 }

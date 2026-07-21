@@ -114,6 +114,8 @@ pub const MetalKvStorage = struct {
     slot_physical_base_tokens: [metal_runtime.attention_span_slot_capacity]usize = [_]usize{0} ** metal_runtime.attention_span_slot_capacity,
     slot_ring_page_count: [metal_runtime.attention_span_slot_capacity]usize = [_]usize{0} ** metal_runtime.attention_span_slot_capacity,
     slot_ring_policy_initialized: [metal_runtime.attention_span_slot_capacity]bool = [_]bool{false} ** metal_runtime.attention_span_slot_capacity,
+    slot_buffer_capacity_tokens: [metal_runtime.attention_span_slot_capacity]usize = [_]usize{0} ** metal_runtime.attention_span_slot_capacity,
+    cyclic_page_table_cache: storage_runtime.CyclicPageTableCache = .{},
 
     /// Allocate a MetalKvStorage keyed to `runtime`. The storage does not own
     /// the runtime — callers are responsible for its lifetime. `dtype` must
@@ -161,6 +163,7 @@ pub const MetalKvStorage = struct {
         self.slot_physical_base_tokens[slot] = 0;
         self.slot_ring_page_count[slot] = 0;
         self.slot_ring_policy_initialized[slot] = false;
+        self.slot_buffer_capacity_tokens[slot] = 0;
         try self.slot_map.put(self.allocator, key, slot);
         return slot;
     }
@@ -201,6 +204,69 @@ pub const MetalKvStorage = struct {
         return self.slot_ring_page_count[slot];
     }
 
+    fn pageTokenOffsets(
+        self: *MetalKvStorage,
+        logical_blocks: []const u32,
+        needed_blocks: usize,
+        page_size_tokens: usize,
+        ring_page_count: usize,
+    ) !storage_runtime.PageTokenOffsets {
+        if (ring_page_count > 0) {
+            return self.cyclic_page_table_cache.get(
+                self.allocator,
+                page_size_tokens,
+                ring_page_count,
+                needed_blocks,
+                !envFlagEnabled("TERMITE_METAL_DISABLE_CYCLIC_PAGE_TABLE_CACHE"),
+            );
+        }
+        if (logical_blocks.len < needed_blocks) return error.KvCapacityTooSmall;
+        const offsets = try self.allocator.alloc(u32, needed_blocks);
+        errdefer self.allocator.free(offsets);
+        for (offsets, logical_blocks[0..needed_blocks]) |*offset, block_id| {
+            const token_offset = std.math.mul(usize, @as(usize, block_id), page_size_tokens) catch return error.KvCapacityTooSmall;
+            if (token_offset > std.math.maxInt(u32)) return error.KvCapacityTooSmall;
+            offset.* = @intCast(token_offset);
+        }
+        return .{ .owned = offsets };
+    }
+
+    fn reserveSlotCapacity(
+        self: *MetalKvStorage,
+        slot: usize,
+        required_tokens: usize,
+        page_size_tokens: usize,
+        ring_page_count: usize,
+        key_row_bytes: usize,
+        v_row_stride: usize,
+    ) !void {
+        const current = self.slot_buffer_capacity_tokens[slot];
+        if (required_tokens <= current) return;
+        const target = if (ring_page_count > 0 or envFlagEnabled("TERMITE_METAL_DISABLE_GEOMETRIC_KV_GROWTH"))
+            required_tokens
+        else
+            try storage_runtime.geometricKvTokenCapacity(current, required_tokens, page_size_tokens);
+        const rc = metal_runtime.termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
+            self.runtime,
+            slot,
+            @intFromEnum(self.format),
+            target,
+            key_row_bytes,
+            v_row_stride,
+        );
+        if (rc != 0) return error.DeviceWriteFallback;
+        self.slot_buffer_capacity_tokens[slot] = target;
+    }
+
+    fn requiredTokenCapacity(block_offsets: []const u32, page_size_tokens: usize) !usize {
+        var required: usize = 0;
+        for (block_offsets) |offset| {
+            const end = std.math.add(usize, @as(usize, offset), page_size_tokens) catch return error.KvCapacityTooSmall;
+            required = @max(required, end);
+        }
+        return required;
+    }
+
     /// Release every slot bound to `sequence_id` back to the free pool and
     /// reset their slot metadata so the next tenant re-encodes from scratch.
     /// Safe to call for a sequence that holds no slots.
@@ -213,13 +279,16 @@ pub const MetalKvStorage = struct {
             to_release.append(self.allocator, entry.key_ptr.*) catch {
                 // On allocation failure, reset the slot in place — we won't
                 // be able to reuse it, but we also won't double-bind it.
-                _ = metal_runtime.termite_metal_decode_runtime_reset_attention_span_slot(self.runtime, entry.value_ptr.*);
+                const slot = entry.value_ptr.*;
+                _ = metal_runtime.termite_metal_decode_runtime_reset_attention_span_slot(self.runtime, slot);
+                self.slot_buffer_capacity_tokens[slot] = 0;
                 continue;
             };
         }
         for (to_release.items) |key| {
             if (self.slot_map.fetchRemove(key)) |removed| {
                 _ = metal_runtime.termite_metal_decode_runtime_reset_attention_span_slot(self.runtime, removed.value);
+                self.slot_buffer_capacity_tokens[removed.value] = 0;
                 self.free_slots.append(self.allocator, removed.value) catch {
                     // If we can't record the reuse slot, the slot leaks for
                     // this session — it still gets cleared on reset_state.
@@ -323,17 +392,26 @@ pub const MetalKvStorage = struct {
             if (logical_blocks.len == 0 or write.page_size_tokens == 0) break :paged -9999;
             const needed_blocks = std.math.divCeil(usize, write.total_token_count, write.page_size_tokens) catch break :paged -9999;
             if (logical_blocks.len < needed_blocks) break :paged -9999;
-            const block_offsets = self.allocator.alloc(u32, needed_blocks) catch break :paged -9999;
-            defer self.allocator.free(block_offsets);
-            for (block_offsets, logical_blocks[0..needed_blocks], 0..) |*offset, block_id, logical_page| {
-                const physical_page = if (ring_page_count > 0)
-                    storage_runtime.physicalPageForLogical(logical_page, ring_page_count)
-                else
-                    @as(usize, block_id);
-                const token_offset = std.math.mul(usize, physical_page, write.page_size_tokens) catch break :paged -9999;
-                if (token_offset > std.math.maxInt(u32)) break :paged -9999;
-                offset.* = @intCast(token_offset);
-            }
+            const block_offsets_result = self.pageTokenOffsets(
+                logical_blocks,
+                needed_blocks,
+                write.page_size_tokens,
+                ring_page_count,
+            ) catch break :paged -9999;
+            defer block_offsets_result.deinit(self.allocator);
+            const block_offsets = block_offsets_result.values();
+            const required_tokens = if (ring_page_count > 0)
+                std.math.mul(usize, ring_page_count, write.page_size_tokens) catch break :paged -9999
+            else
+                requiredTokenCapacity(block_offsets, write.page_size_tokens) catch break :paged -9999;
+            self.reserveSlotCapacity(
+                slot,
+                required_tokens,
+                write.page_size_tokens,
+                ring_page_count,
+                key_row_bytes,
+                v_row_stride,
+            ) catch break :paged -9999;
             self.slot_physical_base_tokens[slot] = if (ring_page_count > 0) 0 else block_offsets[0];
             self.slot_logical_contiguous[slot] = ring_page_count == 0;
             if (ring_page_count == 0) {
@@ -366,8 +444,17 @@ pub const MetalKvStorage = struct {
                 write.page_size_tokens,
             );
         } else blk: {
+            if (ring_page_count > 0) break :blk -9999;
             self.slot_logical_contiguous[slot] = true;
             self.slot_physical_base_tokens[slot] = 0;
+            self.reserveSlotCapacity(
+                slot,
+                write.total_token_count,
+                write.page_size_tokens,
+                ring_page_count,
+                key_row_bytes,
+                v_row_stride,
+            ) catch break :blk -9999;
             break :blk metal_runtime.termite_metal_decode_runtime_update_attention_span_from_f32_key_device_slot(
                 self.runtime,
                 slot,
@@ -408,6 +495,11 @@ pub const MetalKvStorage = struct {
             reserve.allow_swa_ring,
         );
         const ring_page_count = try self.configureSlotRingPolicy(slot, requested_ring_pages);
+        if (traceKvGather()) std.debug.print(
+            "kv-reserve: seq={d} layer={d} capacity={d} slot={d} ring_pages={d}\n",
+            .{ reserve.sequence_id, reserve.layer_index, reserve.token_capacity, slot, ring_page_count },
+        );
+        if (ring_page_count > 0 and reserve.logical_blocks == null) return error.DeviceWriteFallback;
 
         const token_capacity = if (ring_page_count > 0)
             std.math.mul(usize, ring_page_count, reserve.page_size_tokens) catch return error.KvCapacityTooSmall
@@ -416,13 +508,34 @@ pub const MetalKvStorage = struct {
             const needed_blocks = std.math.divCeil(usize, reserve.token_capacity, reserve.page_size_tokens) catch break :blk reserve.token_capacity;
             if (logical_blocks.len < needed_blocks) break :blk reserve.token_capacity;
             var capacity_tokens: usize = 0;
-            self.slot_physical_base_tokens[slot] = @as(usize, logical_blocks[0]) * reserve.page_size_tokens;
+            self.slot_physical_base_tokens[slot] = std.math.mul(
+                usize,
+                @as(usize, logical_blocks[0]),
+                reserve.page_size_tokens,
+            ) catch return error.KvCapacityTooSmall;
             self.slot_logical_contiguous[slot] = true;
             for (logical_blocks[0..needed_blocks], 0..) |block_id, block_idx| {
-                const block_start = @as(usize, block_id) * reserve.page_size_tokens;
-                const expected = self.slot_physical_base_tokens[slot] + block_idx * @as(usize, reserve.page_size_tokens);
+                const block_start = std.math.mul(
+                    usize,
+                    @as(usize, block_id),
+                    reserve.page_size_tokens,
+                ) catch return error.KvCapacityTooSmall;
+                const expected_delta = std.math.mul(
+                    usize,
+                    block_idx,
+                    @as(usize, reserve.page_size_tokens),
+                ) catch return error.KvCapacityTooSmall;
+                const expected = std.math.add(
+                    usize,
+                    self.slot_physical_base_tokens[slot],
+                    expected_delta,
+                ) catch return error.KvCapacityTooSmall;
                 if (block_start != expected) self.slot_logical_contiguous[slot] = false;
-                const block_end = block_start + reserve.page_size_tokens;
+                const block_end = std.math.add(
+                    usize,
+                    block_start,
+                    reserve.page_size_tokens,
+                ) catch return error.KvCapacityTooSmall;
                 if (block_end > capacity_tokens) capacity_tokens = block_end;
             }
             break :blk capacity_tokens;
@@ -436,21 +549,21 @@ pub const MetalKvStorage = struct {
             self.slot_physical_base_tokens[slot] = 0;
         }
 
-        const rc = metal_runtime.termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
-            self.runtime,
+        try self.reserveSlotCapacity(
             slot,
-            @intFromEnum(self.format),
             token_capacity,
+            reserve.page_size_tokens,
+            ring_page_count,
             layout.key_row_bytes,
             layout.v_row_stride,
         );
-        if (rc != 0) return error.DeviceWriteFallback;
     }
 
     fn hookDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
         const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
         self.slot_map.deinit(allocator);
         self.free_slots.deinit(allocator);
+        self.cyclic_page_table_cache.deinit(allocator);
         allocator.destroy(self);
     }
 

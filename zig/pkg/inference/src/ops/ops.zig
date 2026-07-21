@@ -522,6 +522,7 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_paged_attention_1x_calls: u64 = 0,
     metal_runtime_generated_attention_decode_1x_calls: u64 = 0,
     metal_runtime_generated_attention_flash_prefill_calls: u64 = 0,
+    metal_runtime_generated_attention_flash_prefill_hd512_calls: u64 = 0,
     metal_runtime_generated_rms_norm_calls: u64 = 0,
     metal_runtime_compute_encoder_count: u64 = 0,
     metal_runtime_blit_encoder_count: u64 = 0,

@@ -35,6 +35,8 @@
 #define TERMITE_METAL_SCRATCH_POOL_CAPACITY 16
 #define TERMITE_METAL_GENERATED_DECODE_THREADS 256u
 #define TERMITE_METAL_GENERATED_FLASH_THREADS 128u
+#define TERMITE_METAL_GENERATED_FLASH_HD512_THREADS 256u
+#define TERMITE_METAL_GENERATED_FLASH_HD512_MEMORY_BYTES 12224u
 #define TERMITE_METAL_GENERATED_RMS_THREADS 256u
 #define TERMITE_METAL_GENERATED_FLASH_KEY_CHUNK 32u
 #define TERMITE_METAL_GENERATED_FLASH_MEMORY_BYTES(head_dim) \
@@ -693,6 +695,9 @@ typedef struct termite_metal_decode_runtime {
     // dispatch (identical buffers / grid / 128 threads / 80*hd+2016 threadgroup
     // memory) — a pure kernel-body A/B of the generated flash route.
     id<MTLComputePipelineState> attention_flash_generated_pipeline;
+    // Low-memory generated flash-prefill route for Gemma4's 512-d global heads.
+    // Capability-gated at dispatch and independently kill-switchable.
+    id<MTLComputePipelineState> attention_flash_hd512_generated_pipeline;
     id<MTLComputePipelineState> compressed_attention_store_local_pipeline;
     id<MTLComputePipelineState> compressed_attention_store_component_pipeline;
     id<MTLComputePipelineState> compressed_attention_update_component_pipeline;
@@ -1174,6 +1179,7 @@ typedef struct termite_metal_decode_runtime {
     uint64_t paged_attention_1x_calls;
     uint64_t generated_attention_decode_1x_calls;
     uint64_t generated_attention_flash_prefill_calls;
+    uint64_t generated_attention_flash_prefill_hd512_calls;
     uint64_t generated_rms_norm_calls;
     uint64_t q8_0_linear_dispatch_scalar;
     uint64_t q8_0_linear_dispatch_mmv;
@@ -1725,6 +1731,7 @@ typedef struct termite_metal_decode_runtime_memory_stats {
     uint64_t paged_attention_1x_calls;
     uint64_t generated_attention_decode_1x_calls;
     uint64_t generated_attention_flash_prefill_calls;
+    uint64_t generated_attention_flash_prefill_hd512_calls;
     uint64_t generated_rms_norm_calls;
     uint64_t compute_encoder_count;
     uint64_t blit_encoder_count;
@@ -3793,9 +3800,8 @@ int termite_metal_run_generated_attention_check(
 // Same buffer order (q, encoded_key, v_bytes, block_table, sinks, output, params)
 // and f16-KV / format==3 / single-contiguous-block simplest case as
 // termite_metal_run_generated_attention_check, but dispatches the flash grid
-// ((q_len+7)/8, num_heads) with 128 threads and the flash threadgroup-memory
-// layout `(8+key_chunk)*head_dim*2 + 52*key_chunk + 352` bytes (the size the host
-// dispatch must track per key_chunk). Returns the output for host comparison
+// ((q_len+7)/8, num_heads) with the artifact's thread count and threadgroup
+// memory. Returns the output for host comparison
 // against the multi-query prefill CPU oracle and the elapsed nanos for the sweep
 // A/B. Isolated float parity is a compile/dispatch sanity check; the real gate is
 // bit-identical model tokens, so the runner covers only the simplest case.
@@ -3825,6 +3831,8 @@ int termite_metal_run_generated_flash_prefill_check(
     uint32_t contiguous_base_token,
     uint32_t contiguous_blocks,
     uint32_t key_chunk,
+    uint32_t threads_per_threadgroup,
+    uint32_t threadgroup_memory_bytes,
     uint32_t warmup_iters,
     uint32_t measure_iters,
     uint64_t *elapsed_nanos
@@ -3836,8 +3844,9 @@ int termite_metal_run_generated_flash_prefill_check(
     const size_t kv_expected = (size_t)kv_tokens * (size_t)num_kv_heads * (size_t)head_dim;
     if (q_count != q_expected || output_count != q_expected) return -4;
     if (encoded_key_count != kv_expected || v_bytes_count != kv_expected) return -5;
-    if (head_dim % 32u != 0u || head_dim > 256u) return -16;
+    if (head_dim % 32u != 0u || head_dim > 512u) return -16;
     if (key_chunk == 0u || key_chunk % 32u != 0u) return -17;
+    if (threads_per_threadgroup == 0u || threads_per_threadgroup % 32u != 0u || threadgroup_memory_bytes == 0u) return -18;
     if (measure_iters == 0) return -15;
 
     @autoreleasepool {
@@ -3860,7 +3869,8 @@ int termite_metal_run_generated_flash_prefill_check(
             fprintf(stderr, "generated Metal flash-prefill pipeline compile failed for %s: %s\n", kernel_name, error.localizedDescription.UTF8String ?: "unknown");
             return -10;
         }
-        if (pipeline.maxTotalThreadsPerThreadgroup < 128u) return -11;
+        if (pipeline.maxTotalThreadsPerThreadgroup < threads_per_threadgroup || pipeline.threadExecutionWidth != 32u) return -11;
+        if (device.maxThreadgroupMemoryLength < threadgroup_memory_bytes) return -18;
 
         id<MTLCommandQueue> queue = [device newCommandQueue];
         if (queue == nil) return -12;
@@ -3896,10 +3906,7 @@ int termite_metal_run_generated_flash_prefill_check(
             .has_sinks = 0u,
             .softcap = 0.0f,
         };
-        // Flash shmem layout: sq(8*hd) + skv(key_chunk*hd) halves, then the float
-        // block (52*key_chunk + 352 bytes). Matches the host dispatch formula.
-        const NSUInteger flash_bytes = (NSUInteger)((8u + key_chunk) * head_dim * 2u + 52u * key_chunk + 352u);
-        const NSUInteger threadgroup_memory = termite_metal_threadgroup_memory_16(flash_bytes);
+        const NSUInteger threadgroup_memory = termite_metal_threadgroup_memory_16(threadgroup_memory_bytes);
 
         uint64_t start_nanos = 0;
         const uint32_t total_iters = warmup_iters + measure_iters;
@@ -3918,7 +3925,7 @@ int termite_metal_run_generated_flash_prefill_check(
             [encoder setBytes:&params length:sizeof(params) atIndex:6];
             [encoder setThreadgroupMemoryLength:threadgroup_memory atIndex:0];
             [encoder dispatchThreadgroups:MTLSizeMake(((NSUInteger)q_len + 7u) / 8u, (NSUInteger)num_heads, 1)
-                    threadsPerThreadgroup:MTLSizeMake(128u, 1, 1)];
+                    threadsPerThreadgroup:MTLSizeMake(threads_per_threadgroup, 1, 1)];
             [encoder endEncoding];
             [command_buffer commit];
             [command_buffer waitUntilCompleted];
@@ -4804,6 +4811,40 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint dt = 0u; dt < d_tiles; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, minv, mo[dt]); simdgroup_store(scaled, so + uint(sgitg) * (8u * (hd / 4u)) + dt * 8u, hd / 4u, 0, false); }\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    for (uint i = uint(tid); i < 8u * hd; i += 128u) { uint j = i / hd; uint d = i - j * hd; uint qi = q0 + j; if (qi >= p.q_len) continue; uint sg_of_d = d / (hd / 4u); uint d_in = d - sg_of_d * (hd / 4u); output[qi * q_stride + h * hd + d] = so[sg_of_d * (8u * (hd / 4u)) + j * (hd / 4u) + d_in]; }\n"
+           "}\n"
+           "kernel void antfly_paged_attention_prefill_flash_hd512_generated_msl_v1(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant antfly_paged_attention_1x_params &p [[buffer(6)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
+           "    const uint hd = p.head_dim; const uint q0 = tg.x * 8u; const uint h = tg.y;\n"
+           "    if (q0 >= p.q_len || h >= p.num_heads || p.format != 3u || p.page_size == 0u || (p.page_size & 7u) != 0u || p.num_kv_heads == 0u || p.num_heads % p.num_kv_heads != 0u || hd != 512u) return;\n"
+           "    const float scale = rsqrt(512.0f); const uint heads_per_group = p.num_heads / p.num_kv_heads; const uint kv_head_base = (h / heads_per_group) * hd;\n"
+           "    const uint q_stride = p.num_heads * hd; const uint k_row_halfs = p.key_row_bytes / 2u;\n"
+           "    threadgroup half *sq = (threadgroup half *)shmem;\n"
+           "    threadgroup char *fb = shmem + 8u * 512u * 2u;\n"
+           "    threadgroup float *ss = (threadgroup float *)fb;\n"
+           "    threadgroup half *sp = (threadgroup half *)(fb + 1024u);\n"
+           "    threadgroup uint *sphys = (threadgroup uint *)(fb + 1536u);\n"
+           "    threadgroup float *sM = (threadgroup float *)(fb + 1664u);\n"
+           "    threadgroup float *sS = (threadgroup float *)(fb + 1696u);\n"
+           "    threadgroup float *sdiag = (threadgroup float *)(fb + 1728u);\n"
+           "    threadgroup float *so = (threadgroup float *)(fb + 1984u);\n"
+           "    const device half *k_half = reinterpret_cast<const device half *>(encoded_key); const device half *v_half = reinterpret_cast<const device half *>(v_bytes);\n"
+           "    for (uint i = uint(tid); i < 8u * 512u; i += 256u) { uint j = i / 512u; uint d = i - j * 512u; uint qi = q0 + j; sq[i] = qi < p.q_len ? half(q[qi * q_stride + h * 512u + d] * scale) : half(0.0f); }\n"
+           "    if (tid < 8u) { sM[tid] = -3.402823466e+38f; sS[tid] = 0.0f; } if (tid < 64u) sdiag[tid] = 0.0f;\n"
+           "    const uint dslice = uint(sgitg) * 64u; simdgroup_float8x8 mo[8]; for (uint i = 0u; i < 8u; ++i) mo[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+           "    for (uint kc = 0u; kc < p.kv_tokens; kc += 32u) {\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        if (tid < 32u) { uint ki = kc + uint(tid); sphys[tid] = ki < p.kv_tokens ? antfly_paged_attention_1x_page_token(block_table, p, ki) : 0xffffffffu; }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        if (sgitg < 4u) { uint ktile = uint(sgitg); uint phys = sphys[ktile * 8u]; const device half *kbase = k_half + (phys != 0xffffffffu ? phys : 0u) * k_row_halfs + kv_head_base; simdgroup_float8x8 ms = make_filled_simdgroup_matrix<float, 8>(0.0f); for (uint d = 0u; d < 512u; d += 8u) { simdgroup_half8x8 mq; simdgroup_half8x8 mk; simdgroup_load(mq, sq + d, 512u); simdgroup_load(mk, kbase + d, k_row_halfs, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } simdgroup_store(ms, ss + ktile * 8u, 32u, 0, false); }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        if (sgitg < 4u) { for (uint jj = 0u; jj < 2u; ++jj) { uint j = uint(sgitg) + jj * 4u; uint qi = q0 + j; uint query_pos = p.query_position_offset + qi; uint kk = uint(lane); uint ki = kc + kk; bool allowed = ki < p.kv_tokens && qi < p.q_len && sphys[kk] != 0xffffffffu; if (allowed) { uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; } float sc = allowed ? ss[j * 32u + kk] : -3.402823466e+38f; if (!isfinite(sc)) sc = -3.402823466e+38f; float row_max = simd_max(sc); float m_old = sM[j]; float m_new = max(m_old, row_max); float e = 0.0f; float corr = 1.0f; if (m_new > -3.0e+38f) { corr = m_old > -3.0e+38f ? exp(m_old - m_new) : 0.0f; e = sc > -3.0e+38f ? exp(sc - m_new) : 0.0f; } sp[j * 32u + kk] = half(e); float row_sum = simd_sum(e); if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[j * 8u + j] = corr; } } }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag, 8u); for (uint i = 0u; i < 8u; ++i) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, mcorr, mo[i]); mo[i] = scaled; }\n"
+           "        for (uint dt = 0u; dt < 8u; ++dt) { uint d8 = dslice + dt * 8u; simdgroup_float8x8 acc = mo[dt]; for (uint kk8 = 0u; kk8 < 4u; ++kk8) { uint phys = sphys[kk8 * 8u]; const device half *vbase = v_half + (phys != 0xffffffffu ? phys : 0u) * p.v_row_stride + kv_head_base + d8; simdgroup_half8x8 mp; simdgroup_half8x8 mv; simdgroup_load(mp, sp + kk8 * 8u, 32u); simdgroup_load(mv, vbase, p.v_row_stride); simdgroup_multiply_accumulate(acc, mp, mv, acc); } mo[dt] = acc; }\n"
+           "    }\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup); if (tid < 8u) { float denom = sS[tid]; sdiag[uint(tid) * 8u + uint(tid)] = denom > 0.0f ? 1.0f / denom : 0.0f; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    simdgroup_float8x8 minv; simdgroup_load(minv, sdiag, 8u); for (uint dt = 0u; dt < 8u; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, minv, mo[dt]); mo[dt] = scaled; }\n"
+           "    if (q0 + 8u <= p.q_len) { for (uint dt = 0u; dt < 8u; ++dt) simdgroup_store(mo[dt], output + q0 * q_stride + h * 512u + dslice + dt * 8u, q_stride); return; }\n"
+           "    const uint valid_rows = p.q_len - q0; for (uint owner = 0u; owner < 8u; ++owner) { threadgroup_barrier(mem_flags::mem_threadgroup); if (uint(sgitg) == owner) for (uint dt = 0u; dt < 8u; ++dt) simdgroup_store(mo[dt], so + dt * 8u, 64u); threadgroup_barrier(mem_flags::mem_threadgroup); for (uint i = uint(tid); i < valid_rows * 64u; i += 256u) { uint j = i / 64u; uint d = i - j * 64u; output[(q0 + j) * q_stride + h * 512u + owner * 64u + d] = so[i]; } }\n"
            "}\n"
            // quant-kernel-codegen:end generated quant kernels
            "inline void termite_q4_0_linear_r_ext_impl(device const float *input, device const uchar *weight, device float *output, constant termite_metal_linear_params &p, ushort lane, ushort sgitg, uint3 tg, uint RPTG) {\n"
@@ -13828,6 +13869,17 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
     id<MTLComputePipelineState> prefill_sg_pipeline = runtime->attention_flash_generated_pipeline != nil
         ? runtime->attention_flash_generated_pipeline
         : runtime->attention_paged_prefill_sg_pipeline;
+    id<MTLComputePipelineState> prefill_hd512_pipeline = runtime->attention_flash_hd512_generated_pipeline;
+    const bool use_prefill_hd512 = format == 3u &&
+        sinks == NULL &&
+        softcap == 0.0f &&
+        q_len >= 8u &&
+        head_dim == 512u &&
+        page_size % 8u == 0u &&
+        prefill_hd512_pipeline != nil &&
+        prefill_hd512_pipeline.maxTotalThreadsPerThreadgroup >= TERMITE_METAL_GENERATED_FLASH_HD512_THREADS &&
+        prefill_hd512_pipeline.threadExecutionWidth == 32u &&
+        runtime->device.maxThreadgroupMemoryLength >= TERMITE_METAL_GENERATED_FLASH_HD512_MEMORY_BYTES;
     const bool use_prefill_sg = format == 3u &&
         sinks == NULL &&
         softcap == 0.0f &&
@@ -13835,7 +13887,7 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
         head_dim % 32u == 0u &&
         head_dim <= 256u &&
         prefill_sg_pipeline != nil;
-    const bool use_decode_1x = !use_prefill_sg &&
+    const bool use_decode_1x = !use_prefill_hd512 && !use_prefill_sg &&
         format == 3u &&
         sinks == NULL &&
         softcap == 0.0f &&
@@ -13850,7 +13902,7 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
     // route the prefill path through it instead of the hand-written kernel. The
     // baseline schedule is byte-identical, so this is a pure kernel-body A/B (same
     // buffer bindings, grid and threadgroup memory below).
-    [encoder setComputePipelineState:use_prefill_sg ? prefill_sg_pipeline : (use_decode_1x ? decode_1x_pipeline : runtime->attention_paged_pipeline)];
+    [encoder setComputePipelineState:use_prefill_hd512 ? prefill_hd512_pipeline : (use_prefill_sg ? prefill_sg_pipeline : (use_decode_1x ? decode_1x_pipeline : runtime->attention_paged_pipeline))];
     [encoder setBuffer:q_buffer offset:q_offset atIndex:0];
     [encoder setBuffer:runtime->attention_span_encoded_key_buffers[slot] offset:0 atIndex:1];
     [encoder setBuffer:runtime->attention_span_v_buffers[slot] offset:0 atIndex:2];
@@ -13872,7 +13924,11 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
     }
     [encoder setBuffer:output_buffer offset:output_offset atIndex:5];
     [encoder setBytes:&params length:sizeof(params) atIndex:6];
-    if (use_prefill_sg) {
+    if (use_prefill_hd512) {
+        runtime->generated_attention_flash_prefill_hd512_calls += 1;
+        [encoder setThreadgroupMemoryLength:TERMITE_METAL_GENERATED_FLASH_HD512_MEMORY_BYTES atIndex:0];
+        [encoder dispatchThreadgroups:MTLSizeMake((q_len + 7u) / 8u, num_heads, 1) threadsPerThreadgroup:MTLSizeMake(TERMITE_METAL_GENERATED_FLASH_HD512_THREADS, 1, 1)];
+    } else if (use_prefill_sg) {
         if (runtime->attention_flash_generated_pipeline != nil) runtime->generated_attention_flash_prefill_calls += 1;
         [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16(TERMITE_METAL_GENERATED_FLASH_MEMORY_BYTES(head_dim)) atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake((q_len + 7u) / 8u, num_heads, 1) threadsPerThreadgroup:MTLSizeMake(TERMITE_METAL_GENERATED_FLASH_THREADS, 1, 1)];
@@ -16586,6 +16642,10 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         if (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_FLASH_PREFILL_GENERATED"))) {
             runtime->attention_flash_generated_pipeline = termite_metal_make_pipeline(device, precise_library, @"antfly_paged_attention_prefill_flash_generated_msl_v1");
         }
+        if (!termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_PREFILL_FLASH_HD512")))
+        {
+            runtime->attention_flash_hd512_generated_pipeline = termite_metal_make_pipeline(device, precise_library, @"antfly_paged_attention_prefill_flash_hd512_generated_msl_v1");
+        }
         runtime->compressed_attention_store_local_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_compressed_attention_store_local");
         runtime->compressed_attention_store_component_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_compressed_attention_store_component");
         runtime->compressed_attention_update_component_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_compressed_attention_update_component");
@@ -17136,6 +17196,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->attention_paged_1x_pipeline = nil;
     runtime->attention_1x_generated_pipeline = nil;
     runtime->attention_flash_generated_pipeline = nil;
+    runtime->attention_flash_hd512_generated_pipeline = nil;
     runtime->paged_f32_kv_seed_pipeline = nil;
     runtime->paged_f16_kv_seed_pipeline = nil;
     runtime->paged_f32_v_seed_pipeline = nil;
@@ -38841,6 +38902,17 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
     id<MTLComputePipelineState> prefill_sg_pipeline = runtime->attention_flash_generated_pipeline != nil
         ? runtime->attention_flash_generated_pipeline
         : runtime->attention_paged_prefill_sg_pipeline;
+    id<MTLComputePipelineState> prefill_hd512_pipeline = runtime->attention_flash_hd512_generated_pipeline;
+    const bool use_prefill_hd512 = format == 3u &&
+        sinks == NULL &&
+        softcap == 0.0f &&
+        q_len >= 8u &&
+        head_dim == 512u &&
+        page_size % 8u == 0u &&
+        prefill_hd512_pipeline != nil &&
+        prefill_hd512_pipeline.maxTotalThreadsPerThreadgroup >= TERMITE_METAL_GENERATED_FLASH_HD512_THREADS &&
+        prefill_hd512_pipeline.threadExecutionWidth == 32u &&
+        runtime->device.maxThreadgroupMemoryLength >= TERMITE_METAL_GENERATED_FLASH_HD512_MEMORY_BYTES;
     const bool use_prefill_sg = format == 3u &&
         sinks == NULL &&
         softcap == 0.0f &&
@@ -38848,7 +38920,7 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
         head_dim % 32u == 0u &&
         head_dim <= 256u &&
         prefill_sg_pipeline != nil;
-    const bool use_decode_1x = !use_prefill_sg &&
+    const bool use_decode_1x = !use_prefill_hd512 && !use_prefill_sg &&
         format == 3u &&
         sinks == NULL &&
         softcap == 0.0f &&
@@ -38863,7 +38935,7 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
     // route the prefill path through it instead of the hand-written kernel. The
     // baseline schedule is byte-identical, so this is a pure kernel-body A/B (same
     // buffer bindings, grid and threadgroup memory below).
-    [encoder setComputePipelineState:use_prefill_sg ? prefill_sg_pipeline : (use_decode_1x ? decode_1x_pipeline : runtime->attention_paged_pipeline)];
+    [encoder setComputePipelineState:use_prefill_hd512 ? prefill_hd512_pipeline : (use_prefill_sg ? prefill_sg_pipeline : (use_decode_1x ? decode_1x_pipeline : runtime->attention_paged_pipeline))];
     [encoder setBuffer:q_buffer offset:q_offset atIndex:0];
     [encoder setBuffer:runtime->attention_span_encoded_key_buffers[slot] offset:0 atIndex:1];
     [encoder setBuffer:runtime->attention_span_v_buffers[slot] offset:0 atIndex:2];
@@ -38871,7 +38943,11 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
     [encoder setBuffer:sinks_buffer offset:0 atIndex:4];
     [encoder setBuffer:output_buffer offset:output_offset atIndex:5];
     [encoder setBuffer:params_buffer offset:0 atIndex:6];
-    if (use_prefill_sg) {
+    if (use_prefill_hd512) {
+        runtime->generated_attention_flash_prefill_hd512_calls += 1;
+        [encoder setThreadgroupMemoryLength:TERMITE_METAL_GENERATED_FLASH_HD512_MEMORY_BYTES atIndex:0];
+        [encoder dispatchThreadgroups:MTLSizeMake((q_len + 7u) / 8u, num_heads, 1) threadsPerThreadgroup:MTLSizeMake(TERMITE_METAL_GENERATED_FLASH_HD512_THREADS, 1, 1)];
+    } else if (use_prefill_sg) {
         if (runtime->attention_flash_generated_pipeline != nil) runtime->generated_attention_flash_prefill_calls += 1;
         [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16(TERMITE_METAL_GENERATED_FLASH_MEMORY_BYTES(head_dim)) atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake((q_len + 7u) / 8u, num_heads, 1) threadsPerThreadgroup:MTLSizeMake(TERMITE_METAL_GENERATED_FLASH_THREADS, 1, 1)];
@@ -43216,6 +43292,7 @@ int termite_metal_decode_runtime_memory_snapshot(
     snapshot->paged_attention_1x_calls = runtime->paged_attention_1x_calls;
     snapshot->generated_attention_decode_1x_calls = runtime->generated_attention_decode_1x_calls;
     snapshot->generated_attention_flash_prefill_calls = runtime->generated_attention_flash_prefill_calls;
+    snapshot->generated_attention_flash_prefill_hd512_calls = runtime->generated_attention_flash_prefill_hd512_calls;
     snapshot->generated_rms_norm_calls = runtime->generated_rms_norm_calls;
     snapshot->compute_encoder_count = runtime->compute_encoder_count;
     snapshot->blit_encoder_count = runtime->blit_encoder_count;

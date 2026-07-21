@@ -585,7 +585,8 @@ test "run config parses shared scraping fields and ignores api_url" {
         \\    "mode": "on",
         \\    "max_step_items": 8,
         \\    "max_step_query_tokens": 256,
-        \\    "max_decode_wait_us": 750
+        \\    "max_decode_wait_us": 750,
+        \\    "max_idle_prefill_chunk_size": 1024
         \\  },
         \\  "kernel_jit": { "mode": "shadow", "cache_dir": "/tmp/jit", "qualified_profile_path": "/tmp/jit-profile.json", "max_cache_bytes_mb": 256, "preload_budget_ms": 120000 },
         \\  "prompt_cache": { "enabled": true, "mode": "block_hash", "max_bytes_mb": 64, "min_tokens": 32, "ttl_ms": 1000 }
@@ -610,6 +611,7 @@ test "run config parses shared scraping fields and ignores api_url" {
     try std.testing.expectEqual(@as(usize, 8), parsed.value.generation_batching.?.max_step_items);
     try std.testing.expectEqual(@as(usize, 256), parsed.value.generation_batching.?.max_step_query_tokens);
     try std.testing.expectEqual(@as(u32, 750), parsed.value.generation_batching.?.max_decode_wait_us);
+    try std.testing.expectEqual(@as(usize, 1024), parsed.value.generation_batching.?.max_idle_prefill_chunk_size);
     try std.testing.expectEqual(inference.graph.kernel_jit.Mode.shadow, parsed.value.kernel_jit.?.mode);
     try std.testing.expectEqualStrings("/tmp/jit", parsed.value.kernel_jit.?.cache_dir.?);
     try std.testing.expectEqualStrings("/tmp/jit-profile.json", parsed.value.kernel_jit.?.qualified_profile_path.?);

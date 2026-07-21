@@ -695,6 +695,8 @@ extern fn termite_metal_run_generated_flash_prefill_check(
     contiguous_base_token: u32,
     contiguous_blocks: u32,
     key_chunk: u32,
+    threads_per_threadgroup: u32,
+    threadgroup_memory_bytes: u32,
     warmup_iters: u32,
     measure_iters: u32,
     elapsed_nanos: *u64,
@@ -1173,6 +1175,8 @@ const FlashPrefillShape = struct {
     query_position_offset: usize,
     /// 0 = full causal; W>0 masks KV tokens older than W (iSWA).
     sliding_window: usize,
+    page_size: usize = 0,
+    permuted_pages: bool = false,
 };
 
 /// Representative prefill tiles: causal prompts (q_len == kv, qpo 0), a GQA/MHA
@@ -1188,11 +1192,18 @@ const flash_prefill_shapes = [_]FlashPrefillShape{
     .{ .q_len = 12, .kv_tokens = 48, .num_heads = 4, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 36, .sliding_window = 16 },
 };
 
+const flash_prefill_hd512_shapes = [_]FlashPrefillShape{
+    .{ .q_len = 8, .kv_tokens = 32, .num_heads = 16, .num_kv_heads = 1, .head_dim = 512, .query_position_offset = 24, .sliding_window = 0, .page_size = 16, .permuted_pages = true },
+    .{ .q_len = 12, .kv_tokens = 48, .num_heads = 16, .num_kv_heads = 1, .head_dim = 512, .query_position_offset = 36, .sliding_window = 0, .page_size = 16, .permuted_pages = true },
+};
+
 const FlashPrefillCheckCase = struct {
     name: []const u8,
     source: []const u8,
     kernel_name: []const u8,
     key_chunk: u32,
+    threads_per_threadgroup: u32,
+    threadgroup_memory_bytes: u32,
     tolerance: f32,
     shape: FlashPrefillShape,
     warmup_iters: u32 = default_warmup_iters,
@@ -1210,7 +1221,8 @@ fn isFlashPrefillArtifact(comptime artifact: quant_kernel_compiler.GeneratedArti
 fn flashPrefillRuntimeCheckCount() comptime_int {
     var count: comptime_int = 0;
     for (quant_kernel_compiler.first_generated_attention_artifacts) |artifact| {
-        if (isFlashPrefillArtifact(artifact)) count += flash_prefill_shapes.len;
+        if (!isFlashPrefillArtifact(artifact)) continue;
+        count += if (artifact.attentionOp().?.head_dim == 512) flash_prefill_hd512_shapes.len else flash_prefill_shapes.len;
     }
     return count;
 }
@@ -1220,9 +1232,16 @@ fn buildFlashPrefillRuntimeChecks() [flash_prefill_check_count]FlashPrefillCheck
     var index: usize = 0;
     inline for (quant_kernel_compiler.first_generated_attention_artifacts) |artifact| {
         if (!isFlashPrefillArtifact(artifact)) continue;
-        inline for (flash_prefill_shapes) |shape| {
-            checks[index] = flashPrefillRuntimeCheck(artifact, shape);
-            index += 1;
+        if (artifact.attentionOp().?.head_dim == 512) {
+            inline for (flash_prefill_hd512_shapes) |shape| {
+                checks[index] = flashPrefillRuntimeCheck(artifact, shape);
+                index += 1;
+            }
+        } else {
+            inline for (flash_prefill_shapes) |shape| {
+                checks[index] = flashPrefillRuntimeCheck(artifact, shape);
+                index += 1;
+            }
         }
     }
     return checks;
@@ -1235,6 +1254,11 @@ fn flashPrefillRuntimeCheck(comptime artifact: quant_kernel_compiler.GeneratedAr
         .source = quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse @compileError("missing generated flash prefill source"),
         .kernel_name = artifact.kernel_id,
         .key_chunk = @intCast(op.schedule.key_chunk),
+        .threads_per_threadgroup = @intCast(op.schedule.threads_per_threadgroup),
+        .threadgroup_memory_bytes = if (op.head_dim == 512)
+            12_224
+        else
+            @intCast((8 + op.schedule.key_chunk) * shape.head_dim * 2 + 52 * op.schedule.key_chunk + 352),
         // Loose sanity bound: the flash online softmax rounds Q and the P weights
         // through f16 and accumulates in a different order than the f32 reference,
         // so the divergence on O(0.3) outputs runs a few 1e-2. 5e-2 keeps a wide
@@ -1333,22 +1357,41 @@ fn runFlashPrefillCheck(allocator: std.mem.Allocator, check: FlashPrefillCheckCa
     for (q, 0..) |*value, i| {
         value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 5) % 17)) - 8)) / 32.0;
     }
-    const key = try allocator.alloc(u16, kv * nkv * hd);
-    defer allocator.free(key);
-    for (key, 0..) |*value, i| {
+    const logical_key = try allocator.alloc(u16, kv * nkv * hd);
+    defer allocator.free(logical_key);
+    for (logical_key, 0..) |*value, i| {
         value.* = f32ToHalfBits(@as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + 1) % 23)) - 11)) / 40.0);
     }
-    const v = try allocator.alloc(u16, kv * nkv * hd);
-    defer allocator.free(v);
-    for (v, 0..) |*value, i| {
+    const logical_v = try allocator.alloc(u16, kv * nkv * hd);
+    defer allocator.free(logical_v);
+    for (logical_v, 0..) |*value, i| {
         value.* = f32ToHalfBits(@as(f32, @floatFromInt(@as(i32, @intCast((i * 3 + 5) % 19)) - 9)) / 24.0);
     }
 
-    var block_table = [_]u32{0};
+    const page_size = if (shape.page_size == 0) kv else shape.page_size;
+    if (page_size == 0 or kv % page_size != 0) return error.InvalidArgument;
+    const page_count = kv / page_size;
+    const block_table = try allocator.alloc(u32, page_count);
+    defer allocator.free(block_table);
+    for (block_table, 0..) |*offset, logical_page| {
+        const physical_page = if (shape.permuted_pages) page_count - 1 - logical_page else logical_page;
+        offset.* = @intCast(physical_page * page_size);
+    }
+    const key = try allocator.alloc(u16, logical_key.len);
+    defer allocator.free(key);
+    const v = try allocator.alloc(u16, logical_v.len);
+    defer allocator.free(v);
+    const row_values = nkv * hd;
+    for (0..kv) |logical_token| {
+        const logical_page = logical_token / page_size;
+        const physical_token = @as(usize, block_table[logical_page]) + logical_token % page_size;
+        @memcpy(key[physical_token * row_values ..][0..row_values], logical_key[logical_token * row_values ..][0..row_values]);
+        @memcpy(v[physical_token * row_values ..][0..row_values], logical_v[logical_token * row_values ..][0..row_values]);
+    }
 
     const expected = try allocator.alloc(f32, q_len * nh * hd);
     defer allocator.free(expected);
-    try referenceFlashPrefill(allocator, q, key, v, shape, expected);
+    try referenceFlashPrefill(allocator, q, logical_key, logical_v, shape, expected);
 
     const actual = try allocator.alloc(f32, q_len * nh * hd);
     defer allocator.free(actual);
@@ -1367,7 +1410,7 @@ fn runFlashPrefillCheck(allocator: std.mem.Allocator, check: FlashPrefillCheckCa
         key.len,
         v.ptr,
         v.len,
-        &block_table,
+        block_table.ptr,
         block_table.len,
         actual.ptr,
         actual.len,
@@ -1379,10 +1422,12 @@ fn runFlashPrefillCheck(allocator: std.mem.Allocator, check: FlashPrefillCheckCa
         @intCast(shape.query_position_offset),
         0, // kv_position_offset
         @intCast(shape.sliding_window),
-        @intCast(kv), // page_size (single block spans all kv tokens)
+        @intCast(page_size),
         0, // contiguous_base_token
-        1, // contiguous_blocks
+        @intFromBool(!shape.permuted_pages),
         check.key_chunk,
+        check.threads_per_threadgroup,
+        check.threadgroup_memory_bytes,
         check.warmup_iters,
         check.measure_iters,
         &elapsed_nanos,
@@ -1609,14 +1654,7 @@ test "quant kernel metal runtime attention checks cover generated decode attenti
 
 test "quant kernel metal runtime flash prefill checks cover the generated flash artifact" {
     try std.testing.expect(flash_prefill_checks.len > 0);
-    const flash_artifacts = comptime blk: {
-        var count: usize = 0;
-        for (quant_kernel_compiler.first_generated_attention_artifacts) |artifact| {
-            if (isFlashPrefillArtifact(artifact)) count += 1;
-        }
-        break :blk count;
-    };
-    try std.testing.expectEqual(flash_artifacts * flash_prefill_shapes.len, flash_prefill_checks.len);
+    try std.testing.expectEqual(@as(usize, flashPrefillRuntimeCheckCount()), flash_prefill_checks.len);
     for (flash_prefill_checks) |check| {
         // Every case is a valid multi-query GQA prefill tile that never masks all
         // KV (the first query at qpo must see at least token 0).
@@ -1624,6 +1662,14 @@ test "quant kernel metal runtime flash prefill checks cover the generated flash 
         try std.testing.expectEqual(@as(usize, 0), check.shape.num_heads % check.shape.num_kv_heads);
         try std.testing.expect(check.shape.head_dim % 32 == 0);
         try std.testing.expectEqual(@as(u32, 32), check.key_chunk); // checked-in baseline
+        if (check.shape.head_dim == 512) {
+            try std.testing.expectEqual(@as(u32, 256), check.threads_per_threadgroup);
+            try std.testing.expectEqual(@as(u32, 12_224), check.threadgroup_memory_bytes);
+            try std.testing.expectEqual(@as(usize, 16), check.shape.page_size);
+            try std.testing.expect(check.shape.permuted_pages);
+        } else {
+            try std.testing.expectEqual(@as(u32, 128), check.threads_per_threadgroup);
+        }
     }
 }
 
@@ -2857,6 +2903,7 @@ fn reductionName(reduction: quant_kernel_compiler.ReductionKind) []const u8 {
         .threadgroup_tree => "threadgroup_tree",
         .hybrid_simd => "hybrid_simd",
         .simdgroup_tiled => "simdgroup_tiled",
+        .simdgroup_matrix => "simdgroup_matrix",
     };
 }
 
@@ -2949,6 +2996,8 @@ fn timeFlashSourceMinNs(
             .source = source,
             .kernel_name = kernel_id,
             .key_chunk = key_chunk,
+            .threads_per_threadgroup = 128,
+            .threadgroup_memory_bytes = @intCast((8 + key_chunk) * shape.head_dim * 2 + 52 * key_chunk + 352),
             .tolerance = flash_sweep_tolerance,
             .shape = shape,
             .measure_iters = measure_iters,

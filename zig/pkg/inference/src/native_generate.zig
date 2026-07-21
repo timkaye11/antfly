@@ -594,18 +594,29 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     else
         try generation.formatMessages(allocator, &messages);
     defer allocator.free(rendered_prompt);
-    var prompt_encoded = try generation.encodePromptForGeneration(
+    const prompt_media_allowance = generation.nativeGenerationMediaTokenAllowance(&messages, gpt_config);
+    const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
+        gpt_config,
+        if (draft_model != null and opts.speculation_policy != .off) draft_gpt_config else null,
+        @intCast(@max(opts.max_tokens, 1)),
+        if (draft_model != null and opts.speculation_policy != .off and opts.speculative_k > 0) 1 else 0,
+        prompt_media_allowance,
+    );
+    var prompt_encoded = try generation.encodeNativeGenerationPrompt(
         tokenizer,
         allocator,
         rendered_prompt,
-        2048,
+        prompt_token_limit,
         !opts.no_bos and model.manifest.add_bos_token,
         model.manifest.bos_token,
     );
     const encoded_prompt_at = std.Io.Timestamp.now(io, .awake);
     defer prompt_encoded.deinit();
-    const prompt_tokens = countPromptTokens(prompt_encoded.attention_mask) +
-        opts.image_count * (@as(usize, gpt_config.mm_tokens_per_image) + 1);
+    const prompt_tokens = std.math.add(
+        usize,
+        countPromptTokens(prompt_encoded.attention_mask),
+        prompt_media_allowance,
+    ) catch return error.PromptTooLong;
 
     if (artifact_backend != null and effective_draft_model == null and !route_onnx_whole_model_graph and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
         if (try tryRunArtifactForPromptShape(
@@ -705,6 +716,19 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         graph_mod.executor_stats.printBypass("inference.generate", "native_generation_direct_decoder_runtime");
     }
 
+    const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
+        .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+        .pjrt => return error.UnexpectedPjrtBackend,
+        .onnx => return error.UnexpectedOnnxBackend,
+        .wasm => return error.UnexpectedWasmBackend,
+    };
+    const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
+        backend_kind,
+        gpt_config,
+        (runtime.scheduler.native_generate.Policy{}).max_idle_prefill_chunk_size,
+    );
     const decoder_runtime_scheduler_override = false;
     var native_generate_lease: ?runtime.scheduler.native_generate.Lease = null;
     defer if (native_generate_lease) |lease| {
@@ -715,6 +739,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             native_generate_lease = try coordinator.acquire(.{
                 .requested_units = 1,
                 .prompt_bytes = rendered_prompt.len,
+                .prompt_tokens = prompt_tokens,
+                .prefill_chunk_limit = if (opts.prefill_chunk_size == 0) idle_prefill_ceiling else 0,
                 .max_tokens = opts.max_tokens,
             });
         }
@@ -724,14 +750,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var kv_manager = runtime.kv.manager.KvManager.init(allocator);
     defer kv_manager.deinit();
 
-    const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
-        .native => .native,
-        .metal => .metal,
-        .cuda => .cuda,
-        .pjrt => return error.UnexpectedPjrtBackend,
-        .onnx => return error.UnexpectedOnnxBackend,
-        .wasm => return error.UnexpectedWasmBackend,
-    };
     const draft_backend_kind: ?runtime.kv.pool.BackendKind = if (draft_model) |loaded|
         generationKvBackendKind(loaded.session.backend()) orelse return error.SpeculativeDecodingRequiresNativeBackend
     else
@@ -773,20 +791,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         budget_limits.backend_limit_bytes / (1024 * 1024),
         budget_limits.combined_limit_bytes / (1024 * 1024),
     });
-    const admission_prefill_chunk = if (opts.prefill_chunk_size > 0) opts.prefill_chunk_size else 256;
-    run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
-        backend_kind,
-        kv_dtype,
-        gpt_config,
-        prompt_tokens,
-        @intCast(@max(opts.max_tokens, 1)),
-        admission_prefill_chunk,
-    )) catch |err| {
-        if (err == error.MemoryBudgetExceeded) {
-            printBudgetExceeded(model.session, &run_budget);
-        }
-        return err;
-    };
     const draft_kv_dtype = if (draft_model) |loaded| blk: {
         const requested_draft_kv_dtype = if (opts.cache_dtype) |name|
             runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDtype
@@ -803,23 +807,49 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         else
             requested_draft_kv_dtype;
     } else null;
-    if (draft_model != null) {
-        if (draft_gpt_config) |draft_cfg| {
-            run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
-                draft_backend_kind.?,
-                draft_kv_dtype.?,
-                draft_cfg,
-                prompt_tokens,
-                @intCast(@max(opts.max_tokens, 1)),
-                admission_prefill_chunk,
-            )) catch |err| {
-                if (err == error.MemoryBudgetExceeded) {
-                    printBudgetExceeded(draft_model.?.session, &run_budget);
-                }
-                return err;
+    var budget_components: [2]runtime.tier.memory.GptGenerationBudgetComponent = undefined;
+    budget_components[0] = .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config };
+    var budget_component_count: usize = 1;
+    if (draft_gpt_config) |draft_cfg| {
+        if (draft_backend_kind != null and draft_kv_dtype != null) {
+            budget_components[1] = .{
+                .backend = draft_backend_kind.?,
+                .kv_dtype = draft_kv_dtype.?,
+                .config = draft_cfg,
             };
+            budget_component_count = 2;
         }
     }
+    const scheduler_prefill_ceiling = if (native_generate_lease) |lease|
+        lease.prefill_chunk_size
+    else
+        @min(
+            prompt_tokens,
+            if (opts.prefill_chunk_size == 0)
+                idle_prefill_ceiling
+            else
+                (runtime.scheduler.native_generate.Policy{}).max_idle_prefill_chunk_size,
+        );
+    const admission_prefill_ceiling = if (opts.prefill_chunk_size > 0)
+        @min(opts.prefill_chunk_size, scheduler_prefill_ceiling)
+    else
+        scheduler_prefill_ceiling;
+    const speculative_budget_bonus: usize = if (draft_model != null and
+        opts.speculation_policy != .off and
+        opts.speculative_k > 0) 1 else 0;
+    const budget_max_tokens = @as(usize, @intCast(@max(opts.max_tokens, 1))) + speculative_budget_bonus;
+    config.prefill_chunk_size = runtime.tier.memory.reserveGptGenerationAtLargestChunk(
+        &run_budget,
+        budget_components[0..budget_component_count],
+        prompt_tokens,
+        budget_max_tokens,
+        admission_prefill_ceiling,
+    ) catch |err| {
+        if (err == error.MemoryBudgetExceeded) {
+            printBudgetExceeded(model.session, &run_budget);
+        }
+        return err;
+    };
     debugGenerateSetup("compute backend begin", .{});
     var cb = session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget) catch |err| {
         debugGenerateSetup("compute backend failed err={s}", .{@errorName(err)});
@@ -4780,11 +4810,12 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
         },
     );
     print(
-        "metal_attention_dispatch: paged_1x={d} generated_decode_1x={d} generated_flash_prefill={d} generated_rms_norm={d}\n",
+        "metal_attention_dispatch: paged_1x={d} generated_decode_1x={d} generated_flash_prefill={d} generated_flash_prefill_hd512={d} generated_rms_norm={d}\n",
         .{
             metal_snapshot.provider.metal_runtime_paged_attention_1x_calls,
             metal_snapshot.provider.metal_runtime_generated_attention_decode_1x_calls,
             metal_snapshot.provider.metal_runtime_generated_attention_flash_prefill_calls,
+            metal_snapshot.provider.metal_runtime_generated_attention_flash_prefill_hd512_calls,
             metal_snapshot.provider.metal_runtime_generated_rms_norm_calls,
         },
     );

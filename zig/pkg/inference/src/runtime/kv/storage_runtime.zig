@@ -39,6 +39,100 @@ pub fn physicalPageForLogical(logical_page: usize, ring_page_count: usize) usize
     return if (ring_page_count > 0) logical_page % ring_page_count else logical_page;
 }
 
+/// A page-table result can borrow a reusable cyclic cache or own a one-shot
+/// table for arbitrary physical block ids. Callers must always call `deinit`.
+pub const PageTokenOffsets = union(enum) {
+    borrowed: []const u32,
+    owned: []u32,
+
+    pub fn values(self: PageTokenOffsets) []const u32 {
+        return switch (self) {
+            .borrowed => |offsets| offsets,
+            .owned => |offsets| offsets,
+        };
+    }
+
+    pub fn deinit(self: PageTokenOffsets, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .borrowed => {},
+            .owned => |offsets| allocator.free(offsets),
+        }
+    }
+};
+
+/// Reuses the monotonically-growing logical-to-ring offset prefix for SWA.
+/// The owning backend is single-threaded; returned borrowed slices remain
+/// valid until its next cache request.
+pub const CyclicPageTableCache = struct {
+    offsets: std.ArrayListUnmanaged(u32) = .empty,
+    page_size_tokens: usize = 0,
+    ring_page_count: usize = 0,
+
+    pub fn deinit(self: *CyclicPageTableCache, allocator: std.mem.Allocator) void {
+        self.offsets.deinit(allocator);
+        self.* = .{};
+    }
+
+    pub fn get(
+        self: *CyclicPageTableCache,
+        allocator: std.mem.Allocator,
+        page_size_tokens: usize,
+        ring_page_count: usize,
+        needed_blocks: usize,
+        cache_enabled: bool,
+    ) !PageTokenOffsets {
+        if (page_size_tokens == 0 or ring_page_count == 0 or needed_blocks == 0) return error.KvCapacityTooSmall;
+        const largest_offset = std.math.mul(usize, ring_page_count - 1, page_size_tokens) catch return error.KvCapacityTooSmall;
+        if (largest_offset > std.math.maxInt(u32)) return error.KvCapacityTooSmall;
+
+        if (!cache_enabled) {
+            const owned = try allocator.alloc(u32, needed_blocks);
+            fillCyclicPageTokenOffsets(owned, page_size_tokens, ring_page_count, 0);
+            return .{ .owned = owned };
+        }
+
+        const same_geometry = self.page_size_tokens == page_size_tokens and self.ring_page_count == ring_page_count;
+        if (!same_geometry) {
+            var replacement: std.ArrayListUnmanaged(u32) = .empty;
+            errdefer replacement.deinit(allocator);
+            try replacement.resize(allocator, needed_blocks);
+            fillCyclicPageTokenOffsets(replacement.items, page_size_tokens, ring_page_count, 0);
+            var old = self.offsets;
+            self.offsets = replacement;
+            self.page_size_tokens = page_size_tokens;
+            self.ring_page_count = ring_page_count;
+            old.deinit(allocator);
+        } else if (needed_blocks > self.offsets.items.len) {
+            const first_to_fill = self.offsets.items.len;
+            try self.offsets.resize(allocator, needed_blocks);
+            fillCyclicPageTokenOffsets(self.offsets.items, page_size_tokens, ring_page_count, first_to_fill);
+        }
+        return .{ .borrowed = self.offsets.items[0..needed_blocks] };
+    }
+};
+
+fn fillCyclicPageTokenOffsets(offsets: []u32, page_size_tokens: usize, ring_page_count: usize, start: usize) void {
+    for (offsets[start..], start..) |*offset, logical_page| {
+        offset.* = @intCast(physicalPageForLogical(logical_page, ring_page_count) * page_size_tokens);
+    }
+}
+
+/// Grow global/full-history KV buffers by 1.5x after the exact first
+/// allocation. Later growth is page-aligned so all callers reserve the same
+/// physical capacity.
+pub fn geometricKvTokenCapacity(current: usize, required: usize, page_size_tokens: usize) !usize {
+    if (required == 0 or required <= current) return @max(current, required);
+    if (current == 0) return required;
+    const half = current / 2 + current % 2;
+    const grown = std.math.add(usize, current, half) catch return error.KvCapacityTooSmall;
+    var target = @max(required, grown);
+    if (page_size_tokens > 1) {
+        const pages = std.math.divCeil(usize, target, page_size_tokens) catch return error.KvCapacityTooSmall;
+        target = std.math.mul(usize, pages, page_size_tokens) catch return error.KvCapacityTooSmall;
+    }
+    return target;
+}
+
 pub const SequenceState = struct {
     id: SequenceId,
     active: bool = true,
@@ -973,6 +1067,44 @@ test "SWA ring geometry includes the largest in-flight suffix" {
     try std.testing.expectEqual(@as(usize, 0), physicalPageForLogical(5, 5));
     try std.testing.expectEqual(@as(usize, 1), physicalPageForLogical(6, 5));
     try std.testing.expectEqual(@as(usize, 6), physicalPageForLogical(6, 0));
+}
+
+test "cyclic page table cache reuses and extends ring offsets" {
+    const allocator = std.testing.allocator;
+    var cache: CyclicPageTableCache = .{};
+    defer cache.deinit(allocator);
+
+    const first = try cache.get(allocator, 16, 3, 4, true);
+    defer first.deinit(allocator);
+    try std.testing.expect(first == .borrowed);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 16, 32, 0 }, first.values());
+
+    const extended = try cache.get(allocator, 16, 3, 7, true);
+    defer extended.deinit(allocator);
+    try std.testing.expect(extended == .borrowed);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 16, 32, 0, 16, 32, 0 }, extended.values());
+
+    const shorter = try cache.get(allocator, 16, 3, 2, true);
+    defer shorter.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 7), cache.offsets.items.len);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 16 }, shorter.values());
+
+    const changed = try cache.get(allocator, 8, 2, 5, true);
+    defer changed.deinit(allocator);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 8, 0, 8, 0 }, changed.values());
+
+    const uncached = try cache.get(allocator, 16, 3, 2, false);
+    defer uncached.deinit(allocator);
+    try std.testing.expect(uncached == .owned);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 16 }, uncached.values());
+}
+
+test "global KV capacity grows geometrically and page aligns" {
+    try std.testing.expectEqual(@as(usize, 100), try geometricKvTokenCapacity(0, 100, 16));
+    try std.testing.expectEqual(@as(usize, 160), try geometricKvTokenCapacity(100, 101, 16));
+    try std.testing.expectEqual(@as(usize, 160), try geometricKvTokenCapacity(160, 150, 16));
+    try std.testing.expectEqual(@as(usize, 240), try geometricKvTokenCapacity(160, 200, 16));
+    try std.testing.expectError(error.KvCapacityTooSmall, geometricKvTokenCapacity(std.math.maxInt(usize) - 1, std.math.maxInt(usize), 16));
 }
 
 test "storage runtime disables SWA ring for retained prompt prefixes" {

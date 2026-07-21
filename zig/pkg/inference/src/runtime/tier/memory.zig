@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const planner = @import("planner.zig");
 const kv_pool = @import("../kv/pool.zig");
+const storage_runtime = @import("../kv/storage_runtime.zig");
 const gpt_mod = @import("../../models/gpt.zig");
 
 const macos = if (builtin.os.tag == .macos) struct {
@@ -462,6 +463,32 @@ fn clampBytes(value: usize, min_value: usize, max_value: usize) usize {
     return @min(@max(value, min_value), max_value);
 }
 
+fn saturatingAdd(a: usize, b: usize) usize {
+    return std.math.add(usize, a, b) catch std.math.maxInt(usize);
+}
+
+fn saturatingMul(a: usize, b: usize) usize {
+    return std.math.mul(usize, a, b) catch std.math.maxInt(usize);
+}
+
+fn pageAlignTokens(tokens: usize) usize {
+    const nonzero = @max(tokens, 1);
+    const remainder = nonzero % 16;
+    if (remainder == 0) return nonzero;
+    return std.math.add(usize, nonzero, 16 - remainder) catch std.math.maxInt(usize);
+}
+
+fn geometricTokenCapacity(tokens: usize) usize {
+    const aligned = pageAlignTokens(tokens);
+    return pageAlignTokens(saturatingAdd(aligned, aligned / 2 + aligned % 2));
+}
+
+fn generationMaxInflightTokens(prefill_chunk_size: usize) usize {
+    // Generation accepts speculative_k through 16 and writes the proposal
+    // rows plus the verification row into the same live KV span.
+    return @max(@max(prefill_chunk_size, 1), 17);
+}
+
 pub fn estimateGptGeneration(
     backend: kv_pool.BackendKind,
     kv_dtype: kv_pool.KvDType,
@@ -470,30 +497,46 @@ pub fn estimateGptGeneration(
     max_tokens: usize,
     prefill_chunk_size: usize,
 ) Estimate {
-    const total_tokens = prompt_tokens + max_tokens;
+    const total_tokens = saturatingAdd(prompt_tokens, max_tokens);
     const retained_tokens = if (config.kvPoolSlidingWindowSize(false)) |window|
         @min(total_tokens, @as(usize, @intCast(window)))
     else
         total_tokens;
-    const page_aligned_tokens = std.mem.alignForward(usize, @max(retained_tokens, 1), 16);
+    const page_aligned_tokens = pageAlignTokens(retained_tokens);
+    const full_history_tokens = pageAlignTokens(total_tokens);
+    const metal_capacity_tokens = geometricTokenCapacity(full_history_tokens);
+    const split_gemma_kv = backend == .metal and
+        config.usesGemmaSlidingAttention() and
+        config.hasGlobalAttentionLayers();
     var kv_bytes: usize = 0;
     for (0..@as(usize, @intCast(config.num_hidden_layers))) |layer| {
         if (config.layerSharesKv(layer)) continue;
-        kv_bytes += page_aligned_tokens * kv_dtype.bytesForTokenPair(
+        var layer_capacity_tokens = if (backend == .metal) metal_capacity_tokens else page_aligned_tokens;
+        if (split_gemma_kv and config.layerUsesSlidingAttention(layer)) {
+            const ring_pages = storage_runtime.swaRingPageCount(
+                16,
+                config.sliding_window,
+                generationMaxInflightTokens(prefill_chunk_size),
+                true,
+            ) catch 0;
+            layer_capacity_tokens = @max(layer_capacity_tokens, saturatingMul(ring_pages, 16));
+        }
+        kv_bytes = saturatingAdd(kv_bytes, saturatingMul(layer_capacity_tokens, kv_dtype.bytesForTokenPair(
             config.effectiveKVHeadsForLayer(layer),
             config.effectiveHeadDimForLayer(layer),
-        );
+        )));
     }
 
-    const scratch_rows = @max(prefill_chunk_size, 1);
+    const scratch_rows = @min(@max(prompt_tokens, 1), @max(prefill_chunk_size, 1));
     const hidden = @as(usize, @intCast(config.hidden_size));
     const heads = @as(usize, @intCast(config.num_attention_heads));
-    const head_dim = @as(usize, @intCast(config.headDim()));
+    const head_dim = @as(usize, @intCast(config.maxHeadDim()));
     const vocab = @as(usize, @intCast(config.vocab_size));
-    const hidden_scratch = scratch_rows * hidden * @as(usize, 8) * @sizeOf(f32);
-    const attn_scratch = scratch_rows * @max(heads * head_dim, hidden) * @as(usize, 4) * @sizeOf(f32);
-    const logits_scratch = vocab * @sizeOf(f32);
-    const scratch_bytes = hidden_scratch + attn_scratch + logits_scratch;
+    const hidden_scratch = saturatingMul(saturatingMul(saturatingMul(scratch_rows, hidden), 8), @sizeOf(f32));
+    const attn_width = @max(saturatingMul(heads, head_dim), hidden);
+    const attn_scratch = saturatingMul(saturatingMul(saturatingMul(scratch_rows, attn_width), 4), @sizeOf(f32));
+    const logits_scratch = saturatingMul(vocab, @sizeOf(f32));
+    const scratch_bytes = saturatingAdd(saturatingAdd(hidden_scratch, attn_scratch), logits_scratch);
 
     return .{
         .prompt_tokens = prompt_tokens,
@@ -509,6 +552,56 @@ pub fn estimateGptGeneration(
             .metal, .cuda => .backend,
         },
     };
+}
+
+pub const GptGenerationBudgetComponent = struct {
+    backend: kv_pool.BackendKind,
+    kv_dtype: kv_pool.KvDType,
+    config: gpt_mod.Config,
+};
+
+/// Reserves target and optional draft generation memory at the largest chunk
+/// that fits. Failed attempts are isolated, so only the selected geometry is
+/// committed to the caller's budget.
+pub fn reserveGptGenerationAtLargestChunk(
+    budget: *RunBudget,
+    components: []const GptGenerationBudgetComponent,
+    prompt_tokens: usize,
+    max_tokens: usize,
+    chunk_ceiling: usize,
+) !usize {
+    var chunk = @max(chunk_ceiling, 1);
+    while (true) {
+        var trial = budget.*;
+        var failed = false;
+        for (components) |component| {
+            trial.reserveEstimate(estimateGptGeneration(
+                component.backend,
+                component.kv_dtype,
+                component.config,
+                prompt_tokens,
+                max_tokens,
+                chunk,
+            )) catch |err| {
+                if (err != error.MemoryBudgetExceeded) return err;
+                failed = true;
+                break;
+            };
+        }
+        if (!failed) {
+            budget.* = trial;
+            return chunk;
+        }
+        if (chunk <= 32) {
+            const denial_count = trial.denials;
+            const last_denial = trial.last_denial;
+            budget.denials = denial_count;
+            budget.last_denial = last_denial;
+            return error.MemoryBudgetExceeded;
+        }
+        const power_of_two_ceiling = std.math.ceilPowerOfTwo(usize, chunk) catch chunk;
+        chunk = @max(power_of_two_ceiling / 2, 32);
+    }
 }
 
 test "run budget enforces kv and scratch separately from host total" {
@@ -582,17 +675,30 @@ test "gpt generation estimate accounts for sliding window and page alignment" {
 
     const estimate = estimateGptGeneration(.metal, .f16, cfg, 100, 10, 64);
     try std.testing.expectEqual(@as(usize, 110), estimate.retained_tokens);
-    try std.testing.expectEqual(@as(usize, 112), estimate.kv_bytes / (32 * 8 * 128 * 2 * 2));
+    try std.testing.expectEqual(@as(usize, 176), estimate.kv_bytes / (32 * 8 * 128 * 2 * 2));
     try std.testing.expectEqual(ResidencyTier.backend, estimate.kv_tier);
     try std.testing.expect(estimate.scratch_bytes > 0);
 
     // int8: bytesForTokenRow(8, 128) = 1024 + 8*4 = 1056
     const est_int8 = estimateGptGeneration(.metal, .int8, cfg, 100, 10, 64);
-    try std.testing.expectEqual(@as(usize, 112 * 32 * 1056 * 2), est_int8.kv_bytes);
+    try std.testing.expectEqual(@as(usize, 176 * 32 * 1056 * 2), est_int8.kv_bytes);
 
     // int4: bytesForTokenRow(8, 128) = ceil(1024/32)*18 = 32*18 = 576
     const est_int4 = estimateGptGeneration(.metal, .int4, cfg, 100, 10, 64);
-    try std.testing.expectEqual(@as(usize, 112 * 32 * 576 * 2), est_int4.kv_bytes);
+    try std.testing.expectEqual(@as(usize, 176 * 32 * 576 * 2), est_int4.kv_bytes);
+}
+
+test "generation token alignment saturates instead of wrapping below the request" {
+    try std.testing.expectEqual(@as(usize, 16), pageAlignTokens(1));
+    try std.testing.expectEqual(@as(usize, 32), pageAlignTokens(17));
+    try std.testing.expectEqual(std.math.maxInt(usize), pageAlignTokens(std.math.maxInt(usize)));
+    try std.testing.expectEqual(std.math.maxInt(usize), geometricTokenCapacity(std.math.maxInt(usize)));
+}
+
+test "generation ring estimate covers the maximum speculative verification span" {
+    try std.testing.expectEqual(@as(usize, 17), generationMaxInflightTokens(1));
+    try std.testing.expectEqual(@as(usize, 17), generationMaxInflightTokens(16));
+    try std.testing.expectEqual(@as(usize, 128), generationMaxInflightTokens(128));
 }
 
 test "gpt generation estimate keeps mixed Gemma global history" {
@@ -613,9 +719,84 @@ test "gpt generation estimate keeps mixed Gemma global history" {
 
     const estimate = estimateGptGeneration(.metal, .f16, cfg, 2000, 100, 512);
     try std.testing.expectEqual(@as(usize, 2100), estimate.retained_tokens);
-    // 24 donor layers: 20 local (2x256) and four global (2x512), at 2112
-    // page-aligned tokens. The 18 shared tail layers do not own KV storage.
-    try std.testing.expectEqual(@as(usize, 121_110_528), estimate.kv_bytes);
+    // All 24 donor layers budget the 3168-token Metal growth capacity. The
+    // 18 shared tail layers do not own KV storage.
+    try std.testing.expectEqual(@as(usize, 181_665_792), estimate.kv_bytes);
+    try std.testing.expectEqual(@as(usize, 76_546_048), estimate.scratch_bytes);
+}
+
+test "gpt generation estimate covers a sliding ring larger than global growth" {
+    const cfg = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2560,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .vocab_size = 1,
+        .sliding_window = 512,
+        .sliding_window_pattern = 2,
+        .position_encoding = .rope,
+    };
+
+    const estimate = estimateGptGeneration(.metal, .f16, cfg, 16, 1, 16);
+    // Local ring: 34 pages = 544 tokens. Global growth: 32 -> 48 tokens.
+    try std.testing.expectEqual(@as(usize, 1_310_720), estimate.kv_bytes);
+}
+
+test "generation budget downshifts target and draft together" {
+    const cfg = gpt_mod.Config{
+        .hidden_size = 8,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 1,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 8,
+        .vocab_size = 1,
+        .position_encoding = .rope,
+    };
+    const components = [_]GptGenerationBudgetComponent{
+        .{ .backend = .metal, .kv_dtype = .f16, .config = cfg },
+        .{ .backend = .metal, .kv_dtype = .f16, .config = cfg },
+    };
+    var budget = RunBudget.init(.{ .scratch_limit_bytes = 50_000 });
+
+    const selected = try reserveGptGenerationAtLargestChunk(
+        &budget,
+        &components,
+        200,
+        1,
+        200,
+    );
+    try std.testing.expectEqual(@as(usize, 64), selected);
+    try std.testing.expectEqual(
+        2 * estimateGptGeneration(.metal, .f16, cfg, 200, 1, 64).scratch_bytes,
+        budget.scratchTotalBytes(),
+    );
+}
+
+test "generation budget rolls back all components when the minimum chunk fails" {
+    const cfg = gpt_mod.Config{
+        .hidden_size = 8,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 1,
+        .attention_head_dim = 8,
+        .vocab_size = 1,
+    };
+    const components = [_]GptGenerationBudgetComponent{
+        .{ .backend = .native, .kv_dtype = .f16, .config = cfg },
+        .{ .backend = .native, .kv_dtype = .f16, .config = cfg },
+    };
+    const one_component_scratch = estimateGptGeneration(.native, .f16, cfg, 200, 1, 32).scratch_bytes;
+    var budget = RunBudget.init(.{ .scratch_limit_bytes = one_component_scratch + 1 });
+
+    try std.testing.expectError(
+        error.MemoryBudgetExceeded,
+        reserveGptGenerationAtLargestChunk(&budget, &components, 200, 1, 2048),
+    );
+    try std.testing.expectEqual(@as(usize, 0), budget.kvTotalBytes());
+    try std.testing.expectEqual(@as(usize, 0), budget.scratchTotalBytes());
+    try std.testing.expect(budget.hasLastDenial());
 }
 
 test "derive gpu limits keeps combined cap sane" {

@@ -105,6 +105,46 @@ pub fn messagesHaveAudio(messages: []const Message) bool {
     return false;
 }
 
+/// Extra positions introduced when model-declared image placeholders expand.
+/// Audio expansion is measured after projection because its token count varies
+/// with the clip and projector metadata.
+pub fn nativeGenerationMediaTokenAllowance(messages: []const Message, config: gpt_mod.Config) usize {
+    if (config.mm_tokens_per_image == 0) return 0;
+    var image_count: usize = 0;
+    for (messages) |message| {
+        if (message.content_parts) |parts| {
+            for (parts) |part| switch (part) {
+                .image => image_count +|= 1,
+                else => {},
+            };
+        } else if (message.image_bytes) |images| {
+            image_count +|= images.len;
+        }
+    }
+    return image_count *| (@as(usize, config.mm_tokens_per_image) + 1);
+}
+
+/// Bound idle prefill chunks for the Gemma4 target geometry whose Metal Q4
+/// kernels are fastest at 128 rows. Keep the general scheduler ceiling intact
+/// for other models and backends. Explicit request limits are applied
+/// separately so diagnostics and tuned deployments can override this choice.
+pub fn nativeGenerationPrefillChunkCeiling(
+    backend: runtime.kv.pool.BackendKind,
+    config: gpt_mod.Config,
+    configured_ceiling: usize,
+) usize {
+    const ceiling = @max(configured_ceiling, 1);
+    if (backend == .metal and
+        config.family == .gemma and
+        config.hasPle() and
+        config.global_head_dim == 512 and
+        !config.gemma4_mtp_assistant)
+    {
+        return @min(ceiling, 128);
+    }
+    return ceiling;
+}
+
 pub fn userFacingErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.AudioInputTooLong => "audio input is too long for the Gemma4 direct audio projector; trim the clip or raise clip.audio.max_tokens in the projector metadata",
@@ -1230,8 +1270,22 @@ fn prefillFinalChunkNeedsDirectExecution(
     seq_len: usize,
     use_prefill_greedy_token: bool,
     capture_last_hidden: bool,
+    use_metal_target_last_logits: bool,
 ) bool {
-    return total_chunk_end == seq_len and (use_prefill_greedy_token or capture_last_hidden);
+    return total_chunk_end == seq_len and
+        (use_prefill_greedy_token or capture_last_hidden or use_metal_target_last_logits);
+}
+
+fn shouldUseMetalGemmaTargetLastLogits(
+    kind: ops.BackendKind,
+    config: *const gpt_mod.Config,
+    capture_last_hidden: bool,
+) bool {
+    return !capture_last_hidden and
+        kind == .metal and
+        config.family == .gemma and
+        config.hasPle() and
+        !config.gemma4_mtp_assistant;
 }
 
 fn singletonScheduledGemmaPrefillFrameEnabled() bool {
@@ -2429,28 +2483,13 @@ pub const NativeGenerationPipeline = struct {
         const formatted_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         defer allocator.free(prompt);
 
-        // Tokenize
-        var encoded = try encodePromptForGeneration(self.tokenizer, allocator, prompt, 2048, self.add_bos_token, self.bos_token);
-        const encoded_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
-        defer encoded.deinit();
-
-        var actual_prompt_tokens: usize = 0;
-        while (actual_prompt_tokens < encoded.attention_mask.len and encoded.attention_mask[actual_prompt_tokens] != 0) : (actual_prompt_tokens += 1) {}
-        if (actual_prompt_tokens == 0) return error.EmptyPrompt;
-        debugGenerationStage(
-            "encoded prompt chars={d} actual_prompt_tokens={d}",
-            .{ prompt.len, actual_prompt_tokens },
-        );
-
         const has_images = messagesHaveImages(messages);
         const has_audio = messagesHaveAudio(messages);
         const requested_max_tokens: usize = @intCast(@max(config.max_tokens, 1));
 
-        // --- Speculative decoding path ---
-        // Use the draft model to propose K tokens, then verify them against
-        // the target. When grammar constraints are active, draft proposals
-        // remain unconstrained but target-side verification still applies the
-        // grammar at each accepted position.
+        // Decide whether the loaded draft participates before deriving the
+        // shared context limit. An unavailable/disabled draft must not shorten
+        // a target-only request.
         const draft_is_gemma4_mtp = if (self.draft_gpt_config) |cfg| cfg.gemma4_mtp_assistant else false;
         const draft_is_nextn_gemma4_mtp = if (self.draft_gpt_config) |cfg|
             cfg.gemma4_mtp_assistant and cfg.mtp_num_centroids == 0 and cfg.mtp_backbone_hidden_size == self.gpt_config.hidden_size
@@ -2493,6 +2532,41 @@ pub const NativeGenerationPipeline = struct {
         if ((has_images or has_audio) and use_speculative) return error.MultimodalSpeculativeDecodingNotSupported;
         if (use_speculative and self.speculativeUsesDeepSeekV4CompressedCache()) return error.DeepSeekV4CompressedSpeculativeDecodingNotSupported;
 
+        const relevant_draft_config = if (use_speculative) self.draft_gpt_config else null;
+        const speculative_bonus_tokens: usize = if (use_speculative and config.speculative_k > 0) 1 else 0;
+        const expanded_prompt_token_limit = try nativeGenerationPromptTokenLimit(
+            self.gpt_config,
+            relevant_draft_config,
+            requested_max_tokens,
+            speculative_bonus_tokens,
+            0,
+        );
+        const text_prompt_token_limit = try nativeGenerationPromptTokenLimit(
+            self.gpt_config,
+            relevant_draft_config,
+            requested_max_tokens,
+            speculative_bonus_tokens,
+            nativeGenerationMediaTokenAllowance(messages, self.gpt_config),
+        );
+        var encoded = try encodeNativeGenerationPrompt(
+            self.tokenizer,
+            allocator,
+            prompt,
+            text_prompt_token_limit,
+            self.add_bos_token,
+            self.bos_token,
+        );
+        const encoded_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        defer encoded.deinit();
+
+        var actual_prompt_tokens: usize = 0;
+        while (actual_prompt_tokens < encoded.attention_mask.len and encoded.attention_mask[actual_prompt_tokens] != 0) : (actual_prompt_tokens += 1) {}
+        if (actual_prompt_tokens == 0) return error.EmptyPrompt;
+        debugGenerationStage(
+            "encoded prompt chars={d} actual_prompt_tokens={d}",
+            .{ prompt.len, actual_prompt_tokens },
+        );
+
         var prepared_multimodal_prompt: ?gemma3_mm.PreparedPrompt = null;
         defer if (prepared_multimodal_prompt) |*prepared| prepared.deinit(&self.cb);
 
@@ -2512,7 +2586,14 @@ pub const NativeGenerationPipeline = struct {
                     const model_dir = self.model_dir orelse return error.MissingModelDirForMultimodal;
                     const expanded_prompt = try gemma3_mm.expandPromptText(allocator, prompt, self.gpt_config, images.len);
                     defer allocator.free(expanded_prompt);
-                    var expanded_encoded = try encodePromptForGeneration(self.tokenizer, allocator, expanded_prompt, 4096, self.add_bos_token, self.bos_token);
+                    var expanded_encoded = try encodeNativeGenerationPrompt(
+                        self.tokenizer,
+                        allocator,
+                        expanded_prompt,
+                        expanded_prompt_token_limit,
+                        self.add_bos_token,
+                        self.bos_token,
+                    );
                     defer expanded_encoded.deinit();
                     var expanded_prompt_tokens: usize = 0;
                     while (expanded_prompt_tokens < expanded_encoded.attention_mask.len and expanded_encoded.attention_mask[expanded_prompt_tokens] != 0) : (expanded_prompt_tokens += 1) {}
@@ -2546,8 +2627,14 @@ pub const NativeGenerationPipeline = struct {
                         if (projected_audio) |*projected| projected.tokens_per_audio else &.{},
                     );
                     defer allocator.free(expanded_prompt);
-                    const max_expanded_tokens = @max(@as(usize, 4096), expanded_prompt.len);
-                    var expanded_encoded = try encodePromptForGeneration(self.tokenizer, allocator, expanded_prompt, max_expanded_tokens, self.add_bos_token, self.bos_token);
+                    var expanded_encoded = try encodeNativeGenerationPrompt(
+                        self.tokenizer,
+                        allocator,
+                        expanded_prompt,
+                        expanded_prompt_token_limit,
+                        self.add_bos_token,
+                        self.bos_token,
+                    );
                     defer expanded_encoded.deinit();
                     var expanded_prompt_tokens: usize = 0;
                     while (expanded_prompt_tokens < expanded_encoded.attention_mask.len and expanded_encoded.attention_mask[expanded_prompt_tokens] != 0) : (expanded_prompt_tokens += 1) {}
@@ -2570,13 +2657,12 @@ pub const NativeGenerationPipeline = struct {
                 if (self.gpt_config.family == .qwen3_5) {
                     debugGenerationStage("qwen3.5 multimodal load preprocessor", .{});
                     const prep_cfg = try qwen2vl_mm.loadPreprocessorConfig(allocator, model_dir);
-                    const max_expanded_tokens = @max(@as(usize, 4096), prompt.len + images.len * 3);
-                    debugGenerationStage("qwen3.5 multimodal encode prompt max_tokens={d}", .{max_expanded_tokens});
+                    debugGenerationStage("qwen3.5 multimodal encode prompt max_tokens={d}", .{expanded_prompt_token_limit});
                     var qwen_encoded = try encodeQwenPromptWithImagePlaceholders(
                         self.tokenizer,
                         allocator,
                         prompt,
-                        max_expanded_tokens,
+                        expanded_prompt_token_limit,
                         self.add_bos_token,
                         self.bos_token,
                         self.gpt_config,
@@ -2606,7 +2692,14 @@ pub const NativeGenerationPipeline = struct {
                 } else {
                     const expanded_prompt = try gemma3_mm.expandPromptText(allocator, prompt, self.gpt_config, images.len);
                     defer allocator.free(expanded_prompt);
-                    var expanded_encoded = try encodePromptForGeneration(self.tokenizer, allocator, expanded_prompt, 4096, self.add_bos_token, self.bos_token);
+                    var expanded_encoded = try encodeNativeGenerationPrompt(
+                        self.tokenizer,
+                        allocator,
+                        expanded_prompt,
+                        expanded_prompt_token_limit,
+                        self.add_bos_token,
+                        self.bos_token,
+                    );
                     defer expanded_encoded.deinit();
                     var expanded_prompt_tokens: usize = 0;
                     while (expanded_prompt_tokens < expanded_encoded.attention_mask.len and expanded_encoded.attention_mask[expanded_prompt_tokens] != 0) : (expanded_prompt_tokens += 1) {}
@@ -3619,8 +3712,8 @@ pub const NativeGenerationPipeline = struct {
                 self.gpt_config.suppressTokenIds().len > 0,
                 enableCudaPrefillGreedyToken(),
             );
-        // Metal: only when the caller wants the MTP prefill-hidden capture —
-        // plain Metal decode keeps the logits prefill path untouched.
+        // Keep the prepared greedy route MTP-only. Target-only Metal takes the
+        // final-row logits path below without touching prepared-tail state.
         const use_metal_prefill_greedy_token = self.cb.kind() == .metal and
             gemma4MtpMetalPrefillHiddenCaptureEnabled() and
             capture_last_hidden and
@@ -3628,6 +3721,11 @@ pub const NativeGenerationPipeline = struct {
             isPureGreedyConfig(config) and
             config.grammar == null;
         const use_prefill_greedy_token = use_cuda_prefill_greedy_token or use_metal_prefill_greedy_token;
+        const use_metal_target_last_logits = shouldUseMetalGemmaTargetLastLogits(
+            self.cb.kind(),
+            &self.gpt_config,
+            capture_last_hidden,
+        );
         debugGenerationStage(
             "executePrefill enter seq_len={d} prefilled={d} query_len={d} paged={} scheduler={} compiled_whole_model={} prefill_greedy={}",
             .{
@@ -3752,6 +3850,7 @@ pub const NativeGenerationPipeline = struct {
                                 seq_len,
                                 use_prefill_greedy_token,
                                 capture_last_hidden,
+                                use_metal_target_last_logits,
                             )) {
                                 prefill_last_logits = self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, chunk, total_chunk_end, chunk.len, total_chunk_end == seq_len) catch |err| {
                                     if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
@@ -3824,7 +3923,9 @@ pub const NativeGenerationPipeline = struct {
                         "executePrefill captured greedy token={d}",
                         .{prefill_greedy_token.?},
                     );
-                } else if (total_chunk_end == seq_len and capture_last_hidden) {
+                } else if (total_chunk_end == seq_len and
+                    (capture_last_hidden or use_metal_target_last_logits))
+                {
                     var target_hidden = self.forwardHiddenDevice(chunk, 1, total_chunk_end, &decode_context) catch |err| {
                         if (try retryDirectPrefillAfterMemoryBudgetExceeded(&decode_runtime, chunk.len, chunk_size, &current_chunk_size, err)) continue;
                         return err;
@@ -3856,13 +3957,22 @@ pub const NativeGenerationPipeline = struct {
                     const last_logits = try self.cb.toFloat32(last_logits_device, allocator);
                     gpt_arch.applyFinalLogitSoftcapInPlace(self.gpt_config, last_logits);
                     prefill_last_logits = last_logits;
-                    prefill_last_hidden = target_hidden.hidden;
-                    prefill_last_hidden_rows = target_hidden.rows;
-                    keep_target_hidden = true;
-                    debugGenerationStage(
-                        "executePrefill captured final logits and MTP hidden vocab_size={d}",
-                        .{self.gpt_config.vocab_size},
-                    );
+                    if (capture_last_hidden) {
+                        prefill_last_hidden = target_hidden.hidden;
+                        prefill_last_hidden_rows = target_hidden.rows;
+                        keep_target_hidden = true;
+                    }
+                    if (capture_last_hidden) {
+                        debugGenerationStage(
+                            "executePrefill captured final logits and MTP hidden vocab_size={d}",
+                            .{self.gpt_config.vocab_size},
+                        );
+                    } else {
+                        debugGenerationStage(
+                            "executePrefill captured target final-row logits vocab_size={d}",
+                            .{self.gpt_config.vocab_size},
+                        );
+                    }
                 } else {
                     const logits = self.forwardAllLogits(chunk, 1, total_chunk_end, &decode_context) catch |err| {
                         if (try retryDirectPrefillAfterMemoryBudgetExceeded(&decode_runtime, chunk.len, chunk_size, &current_chunk_size, err)) continue;
@@ -8748,6 +8858,61 @@ pub fn encodePromptForGeneration(
     );
 }
 
+/// Maximum text tokens that can be admitted without exceeding either model's
+/// context after generation and known multimodal expansion.
+pub fn nativeGenerationPromptTokenLimit(
+    target_config: gpt_mod.Config,
+    draft_config: ?gpt_mod.Config,
+    requested_output_tokens: usize,
+    speculative_bonus_tokens: usize,
+    media_token_allowance: usize,
+) !usize {
+    var context_tokens: usize = @intCast(target_config.max_position_embeddings);
+    if (draft_config) |draft| {
+        context_tokens = @min(context_tokens, @as(usize, @intCast(draft.max_position_embeddings)));
+    }
+    const output_tokens = std.math.add(
+        usize,
+        @max(requested_output_tokens, 1),
+        speculative_bonus_tokens,
+    ) catch return error.PromptTooLong;
+    const reserved_tokens = std.math.add(
+        usize,
+        output_tokens,
+        media_token_allowance,
+    ) catch return error.PromptTooLong;
+    if (context_tokens <= reserved_tokens) return error.PromptTooLong;
+    return context_tokens - reserved_tokens;
+}
+
+/// Encode one native-generation prompt without silently dropping tokens at the
+/// model boundary. The extra slot distinguishes an exact fit from overflow.
+pub fn encodeNativeGenerationPrompt(
+    tokenizer: tokenizer_mod.Tokenizer,
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    prompt_token_limit: usize,
+    add_bos_token: bool,
+    bos_token: []const u8,
+) !tokenizer_mod.EncodeResult {
+    if (prompt_token_limit == 0) return error.PromptTooLong;
+    const detection_limit = std.math.add(usize, prompt_token_limit, 1) catch prompt_token_limit;
+    var encoded = try encodePromptForGeneration(
+        tokenizer,
+        allocator,
+        prompt,
+        detection_limit,
+        add_bos_token,
+        bos_token,
+    );
+    errdefer encoded.deinit();
+
+    var token_count: usize = 0;
+    while (token_count < encoded.attention_mask.len and encoded.attention_mask[token_count] != 0) : (token_count += 1) {}
+    if (token_count > prompt_token_limit) return error.PromptTooLong;
+    return encoded;
+}
+
 fn shouldAddBosToken(prompt: []const u8, add_bos_token: bool, bos_token: []const u8) bool {
     if (!add_bos_token) return false;
     if (bos_token.len == 0) return true;
@@ -8815,7 +8980,7 @@ fn appendQwenPromptTextTokens(
     if (text.len == 0 and !add_bos_token) return;
     if (out.items.len >= max_length) return error.PromptTooLong;
     const remaining = max_length - out.items.len;
-    var encoded = try encodePromptForGeneration(tokenizer, allocator, text, remaining, add_bos_token, bos_token);
+    var encoded = try encodeNativeGenerationPrompt(tokenizer, allocator, text, remaining, add_bos_token, bos_token);
     defer encoded.deinit();
     var token_count: usize = 0;
     while (token_count < encoded.attention_mask.len and encoded.attention_mask[token_count] != 0) : (token_count += 1) {}
@@ -8869,6 +9034,72 @@ test "shouldAddBosToken skips duplicate literal bos prefix" {
     try std.testing.expect(!shouldAddBosToken("<bos><start_of_turn>user\nHello", true, "<bos>"));
 }
 
+test "native generation prompt limit reserves output media and draft context" {
+    const target = gpt_mod.Config{ .max_position_embeddings = 8192 };
+    const draft = gpt_mod.Config{ .max_position_embeddings = 4096 };
+    try std.testing.expectEqual(
+        @as(usize, 3775),
+        try nativeGenerationPromptTokenLimit(target, draft, 64, 1, 256),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 8128),
+        try nativeGenerationPromptTokenLimit(target, null, 64, 0, 0),
+    );
+    try std.testing.expectError(
+        error.PromptTooLong,
+        nativeGenerationPromptTokenLimit(.{ .max_position_embeddings = 64 }, null, 64, 0, 0),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try nativeGenerationPromptTokenLimit(.{ .max_position_embeddings = 65 }, null, 64, 0, 0),
+    );
+    try std.testing.expectError(
+        error.PromptTooLong,
+        nativeGenerationPromptTokenLimit(.{ .max_position_embeddings = 65 }, null, 64, 1, 0),
+    );
+    try std.testing.expectError(
+        error.PromptTooLong,
+        nativeGenerationPromptTokenLimit(target, null, std.math.maxInt(usize), 1, 0),
+    );
+
+    const images = [_][]const u8{ "a", "b" };
+    const messages = [_]Message{.{ .role = "user", .content = "describe", .image_bytes = &images }};
+    try std.testing.expectEqual(
+        @as(usize, 514),
+        nativeGenerationMediaTokenAllowance(&messages, .{ .mm_tokens_per_image = 256 }),
+    );
+}
+
+test "native generation prefill ceiling only specializes Gemma4 Metal target" {
+    const gemma4_target = gpt_mod.Config{
+        .family = .gemma,
+        .global_head_dim = 512,
+        .ple_hidden_size = 2560,
+    };
+    try std.testing.expectEqual(
+        @as(usize, 128),
+        nativeGenerationPrefillChunkCeiling(.metal, gemma4_target, 2048),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 64),
+        nativeGenerationPrefillChunkCeiling(.metal, gemma4_target, 64),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2048),
+        nativeGenerationPrefillChunkCeiling(.cuda, gemma4_target, 2048),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2048),
+        nativeGenerationPrefillChunkCeiling(.metal, .{ .family = .gemma }, 2048),
+    );
+    var assistant = gemma4_target;
+    assistant.gemma4_mtp_assistant = true;
+    try std.testing.expectEqual(
+        @as(usize, 2048),
+        nativeGenerationPrefillChunkCeiling(.metal, assistant, 2048),
+    );
+}
+
 test "encodePromptForGeneration does not duplicate literal bos prefix" {
     const allocator = std.testing.allocator;
     const tokenizer_json =
@@ -8893,6 +9124,11 @@ test "encodePromptForGeneration does not duplicate literal bos prefix" {
     try std.testing.expectEqual(@as(i32, 2), encoded.ids[0]);
     try std.testing.expectEqual(@as(i32, 3), encoded.ids[1]);
     try std.testing.expectEqual(@as(i32, 0), encoded.attention_mask[2]);
+
+    try std.testing.expectError(
+        error.PromptTooLong,
+        encodeNativeGenerationPrompt(tok.tokenizer(), allocator, "<bos>Hello", 1, true, "<bos>"),
+    );
 }
 
 test "shouldAddBosToken keeps bos when prompt lacks literal prefix" {
@@ -10159,11 +10395,27 @@ test "direct prepared prefill serializes multimodal CUDA and Metal execution" {
     try std.testing.expect(directPrefillExecutionMutex(true, true, true, null) == null);
 }
 
-test "scheduled prefill sends the final hidden capture through direct execution" {
-    try std.testing.expect(!prefillFinalChunkNeedsDirectExecution(32, 64, true, true));
-    try std.testing.expect(!prefillFinalChunkNeedsDirectExecution(64, 64, false, false));
-    try std.testing.expect(prefillFinalChunkNeedsDirectExecution(64, 64, true, false));
-    try std.testing.expect(prefillFinalChunkNeedsDirectExecution(64, 64, false, true));
+test "Metal Gemma target final-row logits path is narrowly gated" {
+    var config = gpt_mod.Config{ .family = .gemma, .ple_hidden_size = 256 };
+    try std.testing.expect(shouldUseMetalGemmaTargetLastLogits(.metal, &config, false));
+    try std.testing.expect(!shouldUseMetalGemmaTargetLastLogits(.cuda, &config, false));
+    try std.testing.expect(!shouldUseMetalGemmaTargetLastLogits(.metal, &config, true));
+    config.gemma4_mtp_assistant = true;
+    try std.testing.expect(!shouldUseMetalGemmaTargetLastLogits(.metal, &config, false));
+    config.gemma4_mtp_assistant = false;
+    config.ple_hidden_size = 0;
+    try std.testing.expect(!shouldUseMetalGemmaTargetLastLogits(.metal, &config, false));
+    config.ple_hidden_size = 256;
+    config.family = .llama;
+    try std.testing.expect(!shouldUseMetalGemmaTargetLastLogits(.metal, &config, false));
+}
+
+test "scheduled prefill sends final direct-only work through direct execution" {
+    try std.testing.expect(!prefillFinalChunkNeedsDirectExecution(32, 64, true, true, true));
+    try std.testing.expect(!prefillFinalChunkNeedsDirectExecution(64, 64, false, false, false));
+    try std.testing.expect(prefillFinalChunkNeedsDirectExecution(64, 64, true, false, false));
+    try std.testing.expect(prefillFinalChunkNeedsDirectExecution(64, 64, false, true, false));
+    try std.testing.expect(prefillFinalChunkNeedsDirectExecution(64, 64, false, false, true));
 }
 
 test "scheduled Gemma prefill frame only owns singleton non-logit chunks" {
