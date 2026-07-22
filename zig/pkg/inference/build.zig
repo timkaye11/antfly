@@ -793,6 +793,16 @@ pub fn build(b: *std.Build) void {
         quant_kernel_metal_model_local_check_step.dependOn(&metal_gemma4_mtp_long_context_test.step);
     }
 
+    const metal_gemma4_long_output_benchmark_contract_test = b.addSystemCommand(&.{
+        "python3",
+        "scripts/test_benchmark_metal_gemma4_long_output.py",
+    });
+    const metal_gemma4_long_output_benchmark_contract_test_step = b.step(
+        "test-metal-gemma4-long-output-benchmark",
+        "Test the paired Gemma4 2K-prompt/300-output benchmark contract",
+    );
+    metal_gemma4_long_output_benchmark_contract_test_step.dependOn(&metal_gemma4_long_output_benchmark_contract_test.step);
+
     const metal_gemma4_tool_calling_test = b.addSystemCommand(&.{
         "bash",
         "scripts/test_metal_gemma4_tool_calling.sh",

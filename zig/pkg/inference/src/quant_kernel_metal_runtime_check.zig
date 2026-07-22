@@ -1284,6 +1284,30 @@ const split_gqa_checks = [_]SplitGqaCheckCase{
     .{ .name = "decode_gqa_split_q2_hd512_global", .shape = .{ .q_len = 2, .kv_tokens = 513, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 511, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
 };
 
+// The production local-attention fallback at the first ragged SWA boundary.
+// A leading physical-page gap stays NaN-poisoned so masked V reads cannot hide.
+const paged_local_ragged_check = SplitGqaCheckCase{
+    .name = "paged_local_q1_kv513_hd256_swa512",
+    .shape = .{ .q_len = 1, .kv_tokens = 513, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 512, .sliding_window = 512, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 },
+};
+
+const SplitGqaSelectionCheck = struct {
+    check: SplitGqaCheckCase,
+    expect_route: bool,
+};
+
+// Production defaults keep split GQA off at every measured boundary. The
+// explicit-opt-in checks above still cover both validated kernel shapes.
+const split_gqa_production_selection_checks = [_]SplitGqaSelectionCheck{
+    .{ .check = .{ .name = "decode_gqa_default_global_kv511", .shape = .{ .q_len = 1, .kv_tokens = 511, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 510, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = false },
+    .{ .check = .{ .name = "decode_gqa_default_global_kv512", .shape = .{ .q_len = 1, .kv_tokens = 512, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 511, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = false },
+    .{ .check = .{ .name = "decode_gqa_default_global_kv513", .shape = .{ .q_len = 2, .kv_tokens = 513, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 511, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = false },
+    .{ .check = .{ .name = "decode_gqa_default_global_kv4095", .shape = .{ .q_len = 1, .kv_tokens = 4095, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 4094, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = false },
+    .{ .check = .{ .name = "decode_gqa_default_global_kv4096", .shape = .{ .q_len = 1, .kv_tokens = 4096, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 4095, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = false },
+    .{ .check = .{ .name = "decode_gqa_default_global_kv4097", .shape = .{ .q_len = 1, .kv_tokens = 4097, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 4096, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = false },
+    .{ .check = .{ .name = "decode_gqa_default_local_stays_paged", .shape = .{ .q_len = 1, .kv_tokens = 512, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 511, .sliding_window = 512, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = false },
+};
+
 const FlashPrefillCheckCase = struct {
     name: []const u8,
     source: []const u8,
@@ -1553,6 +1577,7 @@ fn runSplitGqaCheck(
     allocator: std.mem.Allocator,
     runtime: *RawMetalDecodeRuntime,
     check: SplitGqaCheckCase,
+    expect_route: bool,
 ) !SplitGqaCheckResult {
     const shape = check.shape;
     const q_len = shape.q_len;
@@ -1722,8 +1747,9 @@ fn runSplitGqaCheck(
         return error.GeneratedMetalKernelFailed;
     }
     const calls_after = termite_metal_decode_runtime_decode_gqa_split_calls(runtime);
-    if (calls_after != calls_before + 1) {
-        std.debug.print("split GQA route missed {s}: before={d} after={d}\n", .{ check.name, calls_before, calls_after });
+    const expected_calls: u64 = @intFromBool(expect_route);
+    if (calls_after != calls_before + expected_calls) {
+        std.debug.print("split GQA route mismatch {s}: expected={d} before={d} after={d}\n", .{ check.name, expected_calls, calls_before, calls_after });
         return error.GeneratedMetalKernelMismatch;
     }
     if (termite_metal_buffer_download(runtime, output_buffer, 0, actual.ptr, actual.len * @sizeOf(f32)) != 0) {
@@ -1770,12 +1796,40 @@ fn runSplitGqaChecks(allocator: std.mem.Allocator) !void {
     if (termite_metal_decode_runtime_ready(runtime) == 0) return error.MetalRuntimeUnavailable;
 
     for (split_gqa_checks) |check| {
-        const result = try runSplitGqaCheck(allocator, runtime, check);
+        const result = try runSplitGqaCheck(allocator, runtime, check, true);
         std.debug.print(
             "quant-kernel-metal-runtime-check {s} ok max_abs_error={d:.7} route_calls={d} op_kind=attention_decode_gqa_split\n",
             .{ check.name, result.max_error, result.route_calls },
         );
     }
+
+    if (unsetenv(enable_env) != 0) return error.MetalRuntimeUnavailable;
+    const production_runtime = termite_metal_decode_runtime_create() orelse return error.MetalRuntimeUnavailable;
+    defer termite_metal_decode_runtime_destroy(production_runtime);
+    if (termite_metal_decode_runtime_ready(production_runtime) == 0) return error.MetalRuntimeUnavailable;
+    for (split_gqa_production_selection_checks) |selection| {
+        const result = try runSplitGqaCheck(allocator, production_runtime, selection.check, selection.expect_route);
+        std.debug.print(
+            "quant-kernel-metal-runtime-check {s} ok max_abs_error={d:.7} route_calls={d} expected_route={} op_kind=attention_decode_gqa_split_policy\n",
+            .{ selection.check.name, result.max_error, result.route_calls, selection.expect_route },
+        );
+    }
+
+    if (setenv(enable_env, "1", 1) != 0 or setenv(disable_env, "1", 1) != 0) return error.MetalRuntimeUnavailable;
+    const disabled_runtime = termite_metal_decode_runtime_create() orelse return error.MetalRuntimeUnavailable;
+    defer termite_metal_decode_runtime_destroy(disabled_runtime);
+    if (termite_metal_decode_runtime_ready(disabled_runtime) == 0) return error.MetalRuntimeUnavailable;
+    const disabled_check = split_gqa_checks[2];
+    const disabled_result = try runSplitGqaCheck(allocator, disabled_runtime, disabled_check, false);
+    std.debug.print(
+        "quant-kernel-metal-runtime-check decode_gqa_split_disable_rollback ok max_abs_error={d:.7} route_calls={d} expected_route=false op_kind=attention_decode_gqa_split_policy\n",
+        .{ disabled_result.max_error, disabled_result.route_calls },
+    );
+    const paged_result = try runSplitGqaCheck(allocator, disabled_runtime, paged_local_ragged_check, false);
+    std.debug.print(
+        "quant-kernel-metal-runtime-check {s} ok max_abs_error={d:.7} route_calls={d} expected_route=false op_kind=attention_paged_1x\n",
+        .{ paged_local_ragged_check.name, paged_result.max_error, paged_result.route_calls },
+    );
 }
 
 fn metalRuntimeCheckCount() comptime_int {
@@ -1999,7 +2053,7 @@ test "quant kernel metal runtime flash prefill checks cover the generated flash 
     }
 }
 
-test "quant kernel Metal split GQA checks cover production shapes and poisoned ragged pages" {
+test "quant kernel metal runtime split GQA checks cover production shapes and poisoned ragged pages" {
     try std.testing.expectEqual(@as(usize, 4), split_gqa_checks.len);
     var q1_count: usize = 0;
     var q2_count: usize = 0;
@@ -2027,6 +2081,25 @@ test "quant kernel Metal split GQA checks cover production shapes and poisoned r
     try std.testing.expectEqual(@as(usize, 2), q2_count);
     try std.testing.expectEqual(@as(usize, 2), hd256_count);
     try std.testing.expectEqual(@as(usize, 2), hd512_count);
+}
+
+test "quant kernel metal runtime split GQA production policy defaults off across exact KV boundaries" {
+    try std.testing.expectEqual(@as(usize, 7), split_gqa_production_selection_checks.len);
+    const expected_kv = [_]usize{ 511, 512, 513, 4095, 4096, 4097 };
+    for (expected_kv) |kv_tokens| {
+        var found = false;
+        for (split_gqa_production_selection_checks) |selection| {
+            if (selection.check.shape.head_dim == 512 and selection.check.shape.kv_tokens == kv_tokens) {
+                found = true;
+                try std.testing.expect(!selection.expect_route);
+            }
+        }
+        try std.testing.expect(found);
+    }
+    const local = split_gqa_production_selection_checks[split_gqa_production_selection_checks.len - 1];
+    try std.testing.expectEqual(@as(usize, 256), local.check.shape.head_dim);
+    try std.testing.expectEqual(@as(usize, 512), local.check.shape.sliding_window);
+    try std.testing.expect(!local.expect_route);
 }
 
 test "quant kernel metal runtime GQA attention CPU oracle matches an independent reference" {
@@ -2457,9 +2530,9 @@ pub fn main(init: std.process.Init) !void {
                 .{ flash_check.name, result.max_error, result.measure_iters, avg_us },
             );
         }
-        // Real production-route split-GQA checks. The harness opts the route in
-        // before runtime creation, poisons private page padding, and requires its
-        // route counter to advance so a numerically-correct fallback cannot pass.
+        // Real production-route split-GQA checks. The harness covers explicit
+        // all-layer, production global-only, and disabled rollback policies,
+        // poisons private page padding, and proves selection with route counters.
         try runSplitGqaChecks(allocator);
     }
 

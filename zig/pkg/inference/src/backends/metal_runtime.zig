@@ -1473,6 +1473,7 @@ pub fn decoderRuntimePreparedSlotsMatchFamily(self: anytype, gpt_config: anytype
                 const layer_head_dim = gpt_config.effectiveHeadDimForLayer(layer);
                 const layer_kv_heads = gpt_config.effectiveKVHeadsForLayer(layer);
                 const attention_input_size = gpt_config.num_attention_heads * layer_head_dim;
+                const shares_kv = gpt_config.family == .gemma and gpt_config.layerSharesKv(layer);
                 if (!decoderRuntimeRmsNormSlotPrepared(self, decoder_gated_runtime.normSlot(layer, .attn_pre), gpt_config.hidden_size)) {
                     if (trace) std.debug.print("prepare-trace: slot-miss family={s} layer={d} kind=attn_pre_norm slot={d} hidden={d}\n", .{ @tagName(gpt_config.family), layer, decoder_gated_runtime.normSlot(layer, .attn_pre), gpt_config.hidden_size });
                     return false;
@@ -1500,11 +1501,11 @@ pub fn decoderRuntimePreparedSlotsMatchFamily(self: anytype, gpt_config: anytype
                     if (trace) std.debug.print("prepare-trace: slot-miss family={s} layer={d} kind=attn_q slot={d} in={d} out={d}\n", .{ @tagName(gpt_config.family), layer, decoder_gated_runtime.linearSlot(layer, .attn_q), gpt_config.hidden_size, attention_input_size });
                     return false;
                 }
-                if (!decoderRuntimeLinearSlotPrepared(self, decoder_gated_runtime.linearSlot(layer, .attn_k), gpt_config.hidden_size, layer_kv_heads * layer_head_dim)) {
+                if (!shares_kv and !decoderRuntimeLinearSlotPrepared(self, decoder_gated_runtime.linearSlot(layer, .attn_k), gpt_config.hidden_size, layer_kv_heads * layer_head_dim)) {
                     if (trace) std.debug.print("prepare-trace: slot-miss family={s} layer={d} kind=attn_k slot={d} in={d} out={d}\n", .{ @tagName(gpt_config.family), layer, decoder_gated_runtime.linearSlot(layer, .attn_k), gpt_config.hidden_size, layer_kv_heads * layer_head_dim });
                     return false;
                 }
-                if (!decoderRuntimeLinearSlotPrepared(self, decoder_gated_runtime.linearSlot(layer, .attn_v), gpt_config.hidden_size, layer_kv_heads * layer_head_dim)) {
+                if (!shares_kv and !decoderRuntimeLinearSlotPrepared(self, decoder_gated_runtime.linearSlot(layer, .attn_v), gpt_config.hidden_size, layer_kv_heads * layer_head_dim)) {
                     if (trace) std.debug.print("prepare-trace: slot-miss family={s} layer={d} kind=attn_v slot={d} in={d} out={d}\n", .{ @tagName(gpt_config.family), layer, decoder_gated_runtime.linearSlot(layer, .attn_v), gpt_config.hidden_size, layer_kv_heads * layer_head_dim });
                     return false;
                 }
@@ -1550,6 +1551,78 @@ pub fn decoderRuntimePreparedSlotsMatchFamily(self: anytype, gpt_config: anytype
         },
         else => return false,
     }
+}
+
+test "Gemma shared-KV prepared family matching omits only shared K/V slots" {
+    const gpt_mod = @import("../models/gpt.zig");
+    const PreparedSlots = struct {
+        raw_absolute_embeddings_prepared: bool = false,
+        raw_layer_norm_slots_prepared: [decoder_runtime_layer_norm_slot_capacity]bool = [_]bool{false} ** decoder_runtime_layer_norm_slot_capacity,
+        raw_layer_norm_slot_hidden_sizes: [decoder_runtime_layer_norm_slot_capacity]usize = [_]usize{0} ** decoder_runtime_layer_norm_slot_capacity,
+        raw_rms_norm_slots_prepared: [decoder_runtime_rms_norm_slot_capacity]bool = [_]bool{false} ** decoder_runtime_rms_norm_slot_capacity,
+        raw_rms_norm_slot_hidden_sizes: [decoder_runtime_rms_norm_slot_capacity]usize = [_]usize{0} ** decoder_runtime_rms_norm_slot_capacity,
+        raw_linear_slots_prepared: [decoder_runtime_linear_slot_capacity]bool = [_]bool{false} ** decoder_runtime_linear_slot_capacity,
+        raw_linear_slot_in_dims: [decoder_runtime_linear_slot_capacity]usize = [_]usize{0} ** decoder_runtime_linear_slot_capacity,
+        raw_linear_slot_out_dims: [decoder_runtime_linear_slot_capacity]usize = [_]usize{0} ** decoder_runtime_linear_slot_capacity,
+    };
+    const Mark = struct {
+        fn rms(slots: *PreparedSlots, slot: usize, hidden_size: usize) void {
+            slots.raw_rms_norm_slots_prepared[slot] = true;
+            slots.raw_rms_norm_slot_hidden_sizes[slot] = hidden_size;
+        }
+
+        fn linear(slots: *PreparedSlots, slot: usize, in_dim: usize, out_dim: usize) void {
+            slots.raw_linear_slots_prepared[slot] = true;
+            slots.raw_linear_slot_in_dims[slot] = in_dim;
+            slots.raw_linear_slot_out_dims[slot] = out_dim;
+        }
+    };
+
+    const config = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 16,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 8,
+        .intermediate_size = 32,
+        .shared_layer_intermediate_size = 24,
+        .vocab_size = 64,
+        .num_kv_shared_layers = 1,
+        .norm_type = .rms_norm,
+    };
+    var slots = PreparedSlots{};
+    for (0..config.num_hidden_layers) |layer| {
+        Mark.rms(&slots, decoder_gated_runtime.normSlot(layer, .attn_pre), config.hidden_size);
+        Mark.rms(&slots, decoder_gated_runtime.normSlot(layer, .attn_post), config.hidden_size);
+        Mark.rms(&slots, decoder_gated_runtime.normSlot(layer, .ffn_pre), config.hidden_size);
+        Mark.rms(&slots, decoder_gated_runtime.normSlot(layer, .ffn_post), config.hidden_size);
+
+        const head_dim = config.effectiveHeadDimForLayer(layer);
+        const attention_input_size = config.num_attention_heads * head_dim;
+        const kv_dim = config.effectiveKVHeadsForLayer(layer) * head_dim;
+        Mark.linear(&slots, decoder_gated_runtime.linearSlot(layer, .attn_q), config.hidden_size, attention_input_size);
+        if (!config.layerSharesKv(layer)) {
+            Mark.linear(&slots, decoder_gated_runtime.linearSlot(layer, .attn_k), config.hidden_size, kv_dim);
+            Mark.linear(&slots, decoder_gated_runtime.linearSlot(layer, .attn_v), config.hidden_size, kv_dim);
+        }
+        Mark.linear(&slots, decoder_gated_runtime.linearSlot(layer, .attn_out_proj), attention_input_size, config.hidden_size);
+        Mark.linear(&slots, decoder_gated_runtime.linearSlot(layer, .mlp_gate), config.hidden_size, config.intermediateSize(layer));
+        Mark.linear(&slots, decoder_gated_runtime.linearSlot(layer, .mlp_up), config.hidden_size, config.intermediateSize(layer));
+        Mark.linear(&slots, decoder_gated_runtime.linearSlot(layer, .mlp_down), config.intermediateSize(layer), config.hidden_size);
+    }
+    Mark.rms(&slots, decoder_gated_runtime.finalNormSlot(config.num_hidden_layers), config.hidden_size);
+    Mark.linear(&slots, decoder_gated_runtime.finalLmHeadSlot(config.num_hidden_layers), config.hidden_size, config.vocab_size);
+
+    try std.testing.expect(decoderRuntimePreparedSlotsMatchFamily(&slots, config));
+
+    var no_shared_kv = config;
+    no_shared_kv.num_kv_shared_layers = 0;
+    try std.testing.expect(!decoderRuntimePreparedSlotsMatchFamily(&slots, no_shared_kv));
+
+    const shared_q_slot = decoder_gated_runtime.linearSlot(1, .attn_q);
+    slots.raw_linear_slots_prepared[shared_q_slot] = false;
+    try std.testing.expect(!decoderRuntimePreparedSlotsMatchFamily(&slots, config));
 }
 
 pub fn supportsDecoderRuntimeConfig(gpt_config: anytype) bool {
@@ -8141,6 +8214,7 @@ pub const RawRuntimeMemoryStats = extern struct {
     deberta_attention_gemm_calls: u64 = 0,
     deberta_attention_gemm_fallbacks: u64 = 0,
     paged_attention_1x_calls: u64 = 0,
+    decode_gqa_split_calls: u64 = 0,
     generated_attention_decode_1x_calls: u64 = 0,
     generated_attention_flash_prefill_calls: u64 = 0,
     generated_attention_flash_prefill_hd512_calls: u64 = 0,

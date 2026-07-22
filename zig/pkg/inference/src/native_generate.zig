@@ -3029,6 +3029,28 @@ fn metalStatsCompactJson(
         allocator,
         &out,
         \\,
+        \\"attention_dispatch":{{
+        \\"paged_1x":{d},
+        \\"decode_gqa_split":{d},
+        \\"generated_decode_1x":{d},
+        \\"generated_flash_prefill":{d},
+        \\"generated_flash_prefill_hd512":{d},
+        \\"generated_rms_norm":{d}
+        \\}}
+    ,
+        .{
+            provider.metal_runtime_paged_attention_1x_calls,
+            provider.metal_runtime_decode_gqa_split_calls,
+            provider.metal_runtime_generated_attention_decode_1x_calls,
+            provider.metal_runtime_generated_attention_flash_prefill_calls,
+            provider.metal_runtime_generated_attention_flash_prefill_hd512_calls,
+            provider.metal_runtime_generated_rms_norm_calls,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
         \\"q8_0_dispatch":{{
         \\"scalar":{d},
         \\"mmv":{d},
@@ -4810,9 +4832,10 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
         },
     );
     print(
-        "metal_attention_dispatch: paged_1x={d} generated_decode_1x={d} generated_flash_prefill={d} generated_flash_prefill_hd512={d} generated_rms_norm={d}\n",
+        "metal_attention_dispatch: paged_1x={d} decode_gqa_split={d} generated_decode_1x={d} generated_flash_prefill={d} generated_flash_prefill_hd512={d} generated_rms_norm={d}\n",
         .{
             metal_snapshot.provider.metal_runtime_paged_attention_1x_calls,
+            metal_snapshot.provider.metal_runtime_decode_gqa_split_calls,
             metal_snapshot.provider.metal_runtime_generated_attention_decode_1x_calls,
             metal_snapshot.provider.metal_runtime_generated_attention_flash_prefill_calls,
             metal_snapshot.provider.metal_runtime_generated_attention_flash_prefill_hd512_calls,
@@ -5032,6 +5055,20 @@ fn liveWholeModelExecutorRequested(opts: *const Options) bool {
     };
 }
 
+fn liveWholeModelSupportsSplitSwaRing(gpt_config: gpt_mod.Config) bool {
+    return gpt_config.supportsSplitSwaGlobalKvRing();
+}
+
+fn liveWholeModelAllowsSplitSwaRing(gpt_config: gpt_mod.Config, config: generation.GenerationConfig) bool {
+    return liveWholeModelSupportsSplitSwaRing(gpt_config) and
+        !config.prompt_cache_enabled and
+        config.cache_compaction_ratio == null;
+}
+
+fn liveWholeModelShouldStopOnEos(gpt_config: gpt_mod.Config, ignore_eos: bool, token_id: i32) bool {
+    return !ignore_eos and token_id >= 0 and gpt_config.isEosToken(@intCast(token_id));
+}
+
 fn runLiveWholeModelExecutorReuseProbe(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -5056,6 +5093,7 @@ fn runLiveWholeModelExecutorReuseProbe(
     var processed: usize = 0;
     var output_accum: ?graph_mod.model_runtime.ModelOutput = null;
     errdefer if (output_accum) |*owned| owned.deinit(allocator);
+    const allow_swa_ring = liveWholeModelSupportsSplitSwaRing(gpt_config);
     while (processed < prompt_ids.len) {
         const chunk_end = @min(prompt_ids.len, processed + @max(prefill_chunk_size, 1));
         if (output_accum) |*owned| owned.deinit(allocator);
@@ -5064,6 +5102,8 @@ fn runLiveWholeModelExecutorReuseProbe(
             .seq_len = chunk_end,
             .query_seq_len = chunk_end - processed,
             .attention_mode = .paged_prefill,
+            .max_inflight_tokens = if (allow_swa_ring) @max(prefill_chunk_size, 1) else 0,
+            .allow_swa_ring = allow_swa_ring,
             .force_host_logits = forcePrefillHostLogits(),
             .prefer_greedy_token = prefillGreedyTokenEnabled() and chunk_end == prompt_ids.len,
         });
@@ -5200,6 +5240,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
     const prefer_prefill_greedy_token = prefillGreedyTokenEnabled() and use_greedy_decode;
     var prefill_chunk_size = if (config.prefill_chunk_size > 0) config.prefill_chunk_size else prompt_ids.len;
     prefill_chunk_size = @max(@min(prefill_chunk_size, prompt_ids.len), 1);
+    const allow_swa_ring = liveWholeModelAllowsSplitSwaRing(gpt_config, config);
     const graph_stats_before_generate = graph_mod.executor_stats.snapshot();
     const prefill_started_at = std.Io.Timestamp.now(io, .awake);
     var output = blk: {
@@ -5215,6 +5256,8 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 .seq_len = chunk_end,
                 .query_seq_len = chunk_end - processed,
                 .attention_mode = .paged_prefill,
+                .max_inflight_tokens = if (allow_swa_ring) prefill_chunk_size else 0,
+                .allow_swa_ring = allow_swa_ring,
                 .force_host_logits = forcePrefillHostLogits(),
                 .prefer_greedy_token = prefer_prefill_greedy_token and chunk_end == prompt_ids.len,
             }) catch |err| {
@@ -5273,15 +5316,15 @@ fn tryRunLiveWholeModelExecutorGenerate(
             ));
         };
         const next_token_i64: i64 = next_token_i32;
+        if (liveWholeModelShouldStopOnEos(gpt_config, config.ignore_eos, next_token_i32)) {
+            finish_reason = "stop";
+            break;
+        }
         try generated_token_ids.append(allocator, next_token_i32);
         try all_token_ids.append(allocator, next_token_i64);
         generated += 1;
         if (generated == 1) first_token_at = std.Io.Timestamp.now(io, .awake);
 
-        if (gpt_config.eos_token_id >= 0 and next_token_i32 == gpt_config.eos_token_id) {
-            finish_reason = "stop";
-            break;
-        }
         if (generated >= max_tokens) break;
         if (use_greedy_decode or use_sample_decode) continue;
 
@@ -6960,6 +7003,7 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     snapshot.provider.metal_runtime_last_frame_planned_command_operator_counts[1] = 2;
     snapshot.provider.metal_runtime_last_frame_planned_command_quant_dispatch_counts[2] = 3;
     snapshot.provider.metal_runtime_q8_0_linear_rows_2_8 = 4;
+    snapshot.provider.metal_runtime_decode_gqa_split_calls = 31;
     snapshot.provider.metal_runtime_jit_exact_q4_0_hits = 25;
     snapshot.provider.metal_runtime_jit_exact_q4_k_hits = 26;
     const generated_counts = &snapshot.provider.metal_runtime_antfly_generated_dispatch_counts;
@@ -6999,6 +7043,7 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     try std.testing.expectEqual(@as(i64, 2), root.get("runtime_command_operators").?.object.get("mul_mv").?.integer);
     try std.testing.expectEqual(@as(i64, 3), root.get("runtime_command_operators").?.object.get("dispatch_small_batch").?.integer);
     try std.testing.expectEqual(@as(i64, 4), root.get("q8_0_dispatch").?.object.get("rows_2_8").?.integer);
+    try std.testing.expectEqual(@as(i64, 31), root.get("attention_dispatch").?.object.get("decode_gqa_split").?.integer);
     try std.testing.expectEqual(@as(i64, 5), root.get("generated_quant_dispatch").?.object.get("q8_0_small_batch").?.integer);
     try std.testing.expectEqual(@as(i64, 24), root.get("generated_quant_dispatch").?.object.get("q6_k_small_batch_bias").?.integer);
     try std.testing.expectEqual(@as(i64, 6), root.get("generated_quant_dispatch").?.object.get("q6_k_small_batch_bias_gelu").?.integer);
@@ -7671,4 +7716,36 @@ test "explicit compiled whole model does not route through live executor" {
         .compiled_target = .whole_model,
     };
     try std.testing.expect(!liveWholeModelExecutorRequested(&opts));
+}
+
+test "live whole-model split KV policy preserves cache and compaction guards" {
+    const gpt_config = gpt_mod.Config{
+        .family = .gemma,
+        .num_hidden_layers = 6,
+        .position_encoding = .rope,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+        .ple_hidden_size = 256,
+    };
+    try std.testing.expect(liveWholeModelAllowsSplitSwaRing(gpt_config, .{}));
+    try std.testing.expect(!liveWholeModelAllowsSplitSwaRing(gpt_config, .{
+        .prompt_cache_enabled = true,
+    }));
+    try std.testing.expect(!liveWholeModelAllowsSplitSwaRing(gpt_config, .{
+        .cache_compaction_ratio = 0.5,
+    }));
+}
+
+test "live whole-model generation excludes all EOS tokens unless ignored" {
+    var gpt_config = gpt_mod.Config{
+        .eos_token_id = 7,
+        .extra_eos_token_ids_len = 1,
+    };
+    gpt_config.extra_eos_token_ids[0] = 9;
+
+    try std.testing.expect(liveWholeModelShouldStopOnEos(gpt_config, false, 7));
+    try std.testing.expect(liveWholeModelShouldStopOnEos(gpt_config, false, 9));
+    try std.testing.expect(!liveWholeModelShouldStopOnEos(gpt_config, false, 4));
+    try std.testing.expect(!liveWholeModelShouldStopOnEos(gpt_config, true, 7));
+    try std.testing.expect(!liveWholeModelShouldStopOnEos(gpt_config, false, -1));
 }

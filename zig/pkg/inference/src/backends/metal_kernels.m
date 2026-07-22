@@ -42,6 +42,7 @@
 #define TERMITE_METAL_DECODE_GQA_SPLIT_REDUCE_THREADS 256u
 #define TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_MEMORY_BYTES 12224u
 #define TERMITE_METAL_DECODE_GQA_SPLIT_SCRATCH_MAX_BYTES 1052672u
+#define TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV_TOKENS 512u
 #define TERMITE_METAL_GENERATED_RMS_THREADS 256u
 #define TERMITE_METAL_GENERATED_FLASH_KEY_CHUNK 32u
 #define TERMITE_METAL_GENERATED_FLASH_MEMORY_BYTES(head_dim) \
@@ -1745,6 +1746,7 @@ typedef struct termite_metal_decode_runtime_memory_stats {
     uint64_t deberta_attention_gemm_calls;
     uint64_t deberta_attention_gemm_fallbacks;
     uint64_t paged_attention_1x_calls;
+    uint64_t decode_gqa_split_calls;
     uint64_t generated_attention_decode_1x_calls;
     uint64_t generated_attention_flash_prefill_calls;
     uint64_t generated_attention_flash_prefill_hd512_calls;
@@ -2164,6 +2166,14 @@ static bool termite_metal_env_flag_enabled(const char *value) {
         strcasecmp(value, "false") != 0 &&
         strcasecmp(value, "no") != 0 &&
         strcasecmp(value, "off") != 0;
+}
+
+static bool termite_metal_env_bool_enabled(const char *value) {
+    return value != NULL &&
+        (strcmp(value, "1") == 0 ||
+         strcasecmp(value, "true") == 0 ||
+         strcasecmp(value, "yes") == 0 ||
+         strcasecmp(value, "on") == 0);
 }
 
 static bool termite_metal_q4_0_linear_rms_add_f16_project_enabled(void) {
@@ -4778,7 +4788,7 @@ static NSString *termite_metal_shader_source(void) {
            "    threadgroup_barrier(mem_flags::mem_threadgroup); float local_best = -3.402823466e+38f; for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) { float score = scores[ki]; local_best = score > local_best ? score : local_best; } partials[tid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) { if (uint(tid) < stride) { float rhs = partials[tid + stride]; partials[tid] = rhs > partials[tid] ? rhs : partials[tid]; } threadgroup_barrier(mem_flags::mem_threadgroup); } float best = partials[0];\n"
            "    float local_sum = 0.0f; for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) { float score = scores[ki]; float e = (best > -3.0e+38f && score > -3.0e+38f) ? exp(score - best) : 0.0f; e = isfinite(e) ? e : 0.0f; scores[ki] = e; local_sum += e; } partials[tid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) { if (uint(tid) < stride) partials[tid] += partials[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } const float inv_sum = partials[0] > 0.0f ? 1.0f / partials[0] : 0.0f;\n"
            "    for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) scores[ki] *= inv_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    for (uint d = uint(tid); d < p.head_dim; d += NT) { const device half *v_col = v_half + kv_head_base + d; float value = 0.0f; for (uint ki = 0u; ki < p.kv_tokens; ++ki) { value += scores[ki] * float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride]); } output[out_base + d] = value; }\n"
+           "    for (uint d = uint(tid); d < p.head_dim; d += NT) { const device half *v_col = v_half + kv_head_base + d; float value = 0.0f; for (uint ki = 0u; ki < p.kv_tokens; ++ki) { float weight = scores[ki]; if (weight != 0.0f) value += weight * float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride]); } output[out_base + d] = value; }\n"
            "}\n"
            "kernel void antfly_paged_attention_prefill_flash_generated_msl_v1(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant antfly_paged_attention_1x_params &p [[buffer(6)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
            "    const uint q0 = tg.x * 8u; const uint h = tg.y;\n"
@@ -7222,7 +7232,7 @@ static NSString *termite_metal_shader_source(void) {
            "    threadgroup_barrier(mem_flags::mem_threadgroup); float local_best = -3.402823466e+38f; for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) { float score = scores[ki]; local_best = score > local_best ? score : local_best; } partials[tid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) { if (uint(tid) < stride) { float rhs = partials[tid + stride]; partials[tid] = rhs > partials[tid] ? rhs : partials[tid]; } threadgroup_barrier(mem_flags::mem_threadgroup); } float best = partials[0];\n"
            "    float local_sum = 0.0f; for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) { float e = exp(scores[ki] - best); e = isfinite(e) ? e : 0.0f; scores[ki] = e; local_sum += e; } partials[tid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) { if (uint(tid) < stride) partials[tid] += partials[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } const float inv_sum = partials[0] > 0.0f ? 1.0f / partials[0] : 0.0f;\n"
            "    for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) scores[ki] *= inv_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    for (uint d = uint(tid); d < p.head_dim; d += NT) { const device half *v_col = v_half + kv_head_base + d; float value = 0.0f; for (uint ki = 0u; ki < p.kv_tokens; ++ki) { value += scores[ki] * float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride]); } output[out_base + d] = value; }\n"
+           "    for (uint d = uint(tid); d < p.head_dim; d += NT) { const device half *v_col = v_half + kv_head_base + d; float value = 0.0f; for (uint ki = 0u; ki < p.kv_tokens; ++ki) { float weight = scores[ki]; if (weight != 0.0f) value += weight * float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride]); } output[out_base + d] = value; }\n"
            "}\n"
            "// Flash-style prefill attention: 8-query tile per TG, 4 simdgroups,\n"
            "// simdgroup MMA for Q.K^T and P.V with online softmax. f16 KV only\n"
@@ -7735,6 +7745,14 @@ static bool termite_metal_paged_attention_1x_enabled(void) {
 static bool termite_metal_decode_gqa_split_enabled(void) {
     return termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_DECODE_GQA_SPLIT")) &&
         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_DECODE_GQA_SPLIT"));
+}
+
+static bool termite_metal_decode_gqa_split_shape_enabled(size_t head_dim, size_t sliding_window) {
+    if (!termite_metal_decode_gqa_split_enabled()) return false;
+    // Keep both validated shapes opt-in until an end-to-end context crossover
+    // beats paged 1x. At 2K, the stage/reduce fan-out regresses decode.
+    return (head_dim == 256u && sliding_window == 512u) ||
+        (head_dim == 512u && sliding_window == 0u);
 }
 
 static void termite_metal_decode_runtime_reset_planned_compute_ranges(termite_metal_decode_runtime *runtime) {
@@ -13999,10 +14017,9 @@ static bool termite_metal_decode_gqa_split_eligible(
         scratch_runtime->attention_decode_gqa_split_scratch_buffer == nil) return false;
     if (format != 3u || sinks != NULL || softcap != 0.0f || q_len == 0u || q_len > 2u ||
         output_offset % (4u * sizeof(float)) != 0u ||
-        kv_tokens < 512u || num_heads != 8u || num_kv_heads != 2u ||
+        kv_tokens < TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV_TOKENS || num_heads != 8u || num_kv_heads != 2u ||
         page_size == 0u || page_size % 8u != 0u) return false;
-    if (!((head_dim == 256u && sliding_window == 512u) ||
-          (head_dim == 512u && sliding_window == 0u))) return false;
+    if (!termite_metal_decode_gqa_split_shape_enabled(head_dim, sliding_window)) return false;
     size_t expected_key_row_bytes = 0;
     size_t expected_v_row_stride = 0;
     size_t scratch_bytes = 0;
@@ -43184,7 +43201,7 @@ int termite_metal_decode_runtime_begin_frame(termite_metal_decode_runtime *runti
     if (runtime->queue == nil) return -2;
     if (runtime->active_frame_cb != nil) return -3;
     if (runtime->submitted_frame_cb != nil &&
-        termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME"))) return -4;
+        termite_metal_env_bool_enabled(getenv("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME"))) return -4;
     if (runtime->submitted_frame_cb == nil) {
         termite_metal_decode_runtime_finish_frame_scratch_releases(runtime);
     }
@@ -43768,6 +43785,7 @@ int termite_metal_decode_runtime_memory_snapshot(
     snapshot->deberta_attention_gemm_calls = runtime->deberta_attention_gemm_calls;
     snapshot->deberta_attention_gemm_fallbacks = runtime->deberta_attention_gemm_fallbacks;
     snapshot->paged_attention_1x_calls = runtime->paged_attention_1x_calls;
+    snapshot->decode_gqa_split_calls = runtime->decode_gqa_split_calls;
     snapshot->generated_attention_decode_1x_calls = runtime->generated_attention_decode_1x_calls;
     snapshot->generated_attention_flash_prefill_calls = runtime->generated_attention_flash_prefill_calls;
     snapshot->generated_attention_flash_prefill_hd512_calls = runtime->generated_attention_flash_prefill_hd512_calls;

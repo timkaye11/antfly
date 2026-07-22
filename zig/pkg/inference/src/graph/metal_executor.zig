@@ -14,6 +14,7 @@
 
 const build_options = @import("build_options");
 const std = @import("std");
+const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
 const decoder_bitnet_runtime = @import("../backends/decoder_bitnet_runtime.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
@@ -858,6 +859,34 @@ fn executorUsesLazyDeviceKvReserve(config: gpt_mod.Config) bool {
     return mixed_width or config.num_kv_shared_layers > 0;
 }
 
+fn executorContractKvCacheView(kv_view: generation.KvView) contracts.KvCacheView {
+    return .{
+        .sequence_id = kv_view.sequence_id,
+        .pool_id = kv_view.pool_id,
+        .logical_block_count = kv_view.logical_block_count,
+        .tail_tokens = kv_view.tail_tokens,
+        .position_offset = kv_view.position_offset,
+        .max_inflight_tokens = kv_view.max_inflight_tokens,
+        .allow_swa_ring = kv_view.allow_swa_ring,
+        .logical_blocks = kv_view.logical_blocks,
+        .kv_storage = kv_view.kv_storage,
+    };
+}
+
+fn executorDecodeKvCacheView(kv_view: generation.KvView) gpt_arch.DecodeContext.KvCacheView {
+    return .{
+        .sequence_id = kv_view.sequence_id,
+        .pool_id = kv_view.pool_id,
+        .logical_block_count = kv_view.logical_block_count,
+        .tail_tokens = kv_view.tail_tokens,
+        .position_offset = kv_view.position_offset,
+        .max_inflight_tokens = kv_view.max_inflight_tokens,
+        .allow_swa_ring = kv_view.allow_swa_ring,
+        .logical_blocks = kv_view.logical_blocks,
+        .kv_storage = kv_view.kv_storage,
+    };
+}
+
 const ExecutorKvMetadataLayer = struct {
     allocator: std.mem.Allocator,
     pool_id: runtime.kv.block.KvPoolId,
@@ -868,6 +897,8 @@ const ExecutorKvMetadataLayer = struct {
     tail_tokens: u16 = 0,
     kv_view: ?generation.KvView = null,
     compacted: bool = false,
+    max_inflight_tokens: usize = 0,
+    allow_swa_ring: bool = false,
     logical_blocks: std.ArrayListUnmanaged(runtime.kv.block.KvBlockId) = .empty,
 
     fn init(allocator: std.mem.Allocator, pool_id: runtime.kv.block.KvPoolId, lazy_device_reserve: bool) ExecutorKvMetadataLayer {
@@ -887,7 +918,22 @@ const ExecutorKvMetadataLayer = struct {
         self.tail_tokens = 0;
         self.kv_view = null;
         self.compacted = false;
+        self.max_inflight_tokens = 0;
+        self.allow_swa_ring = false;
         self.logical_blocks.clearRetainingCapacity();
+    }
+
+    fn configureKvPolicy(self: *ExecutorKvMetadataLayer, max_inflight_tokens: usize, allow_swa_ring: bool) !void {
+        const enabled = allow_swa_ring and max_inflight_tokens > 0;
+        const normalized_max = if (enabled) max_inflight_tokens else 0;
+        if (self.sequence_id != null or self.total_token_count != 0) {
+            if (self.max_inflight_tokens != normalized_max or self.allow_swa_ring != enabled) {
+                return error.InvalidPagedKvState;
+            }
+            return;
+        }
+        self.max_inflight_tokens = normalized_max;
+        self.allow_swa_ring = enabled;
     }
 
     fn tokenCount(self: *const ExecutorKvMetadataLayer, storage: *const runtime.kv.storage_runtime.KvStorageRuntime) usize {
@@ -914,6 +960,8 @@ const ExecutorKvMetadataLayer = struct {
             .tail_tokens = self.tail_tokens,
             .token_count = retained_tokens,
             .position_offset = self.position_offset,
+            .max_inflight_tokens = self.max_inflight_tokens,
+            .allow_swa_ring = self.allow_swa_ring,
             .logical_blocks = self.logical_blocks.items,
             .kv_storage = storage,
         };
@@ -932,7 +980,10 @@ const ExecutorKvMetadataLayer = struct {
     }
 
     fn reserveDeviceCapacity(self: *ExecutorKvMetadataLayer, storage: *runtime.kv.storage_runtime.KvStorageRuntime) !void {
-        if (self.lazy_device_reserve or disableDeviceKvReserveRequested()) return;
+        // The generic eager reserve does not know whether a layer is local or
+        // global. Let the first layer write establish that slot's ring geometry
+        // when split SWA/global caching is enabled.
+        if (self.lazy_device_reserve or self.allow_swa_ring or disableDeviceKvReserveRequested()) return;
         const sequence_id = self.sequence_id orelse return;
         const pool = storage.getPool(self.pool_id) orelse return error.InvalidPoolId;
         const retained_tokens = self.tokenCount(storage);
@@ -972,6 +1023,8 @@ const ExecutorKvMetadataLayer = struct {
         self.position_offset = 0;
         self.tail_tokens = 0;
         self.compacted = false;
+        self.max_inflight_tokens = 0;
+        self.allow_swa_ring = false;
         self.logical_blocks.clearRetainingCapacity();
         self.kv_view = null;
     }
@@ -1504,15 +1557,14 @@ const RuntimeContext = struct {
     }
 
     fn kvCacheView(_: *const RuntimeContext, kv_view: generation.KvView) contracts.KvCacheView {
-        return .{
-            .sequence_id = kv_view.sequence_id,
-            .pool_id = kv_view.pool_id,
-            .logical_block_count = kv_view.logical_block_count,
-            .tail_tokens = kv_view.tail_tokens,
-            .position_offset = kv_view.position_offset,
-            .logical_blocks = kv_view.logical_blocks,
-            .kv_storage = kv_view.kv_storage,
-        };
+        return executorContractKvCacheView(kv_view);
+    }
+
+    fn configureKvPolicy(self: *RuntimeContext, max_inflight_tokens: usize, allow_swa_ring: bool) !void {
+        try self.kv_metadata.configureKvPolicy(
+            max_inflight_tokens,
+            allow_swa_ring and self.gpt_config.supportsSplitSwaGlobalKvRing(),
+        );
     }
 
     fn validateDecodePosition(self: *const RuntimeContext, position: usize) !void {
@@ -1578,15 +1630,7 @@ const RuntimeContext = struct {
                 .kv_storage = &self.kv_storage,
                 .moe_runtime = &self.moe_runtime,
                 .kv_cache = if (kv_view) |view|
-                    .{
-                        .sequence_id = view.sequence_id,
-                        .pool_id = view.pool_id,
-                        .logical_block_count = view.logical_block_count,
-                        .tail_tokens = view.tail_tokens,
-                        .position_offset = view.position_offset,
-                        .logical_blocks = view.logical_blocks,
-                        .kv_storage = view.kv_storage,
-                    }
+                    executorDecodeKvCacheView(view)
                 else
                     null,
             };
@@ -1880,8 +1924,15 @@ fn envFlag(name: [:0]const u8) bool {
     return slice.len > 0 and !std.mem.eql(u8, slice, "0");
 }
 
+fn pipelinedDecodeFrameEnabledForFlags(enable_requested: bool, disable_requested: bool) bool {
+    return enable_requested and !disable_requested;
+}
+
 fn pipelinedDecodeFrameEnabled() bool {
-    return !envFlag("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME");
+    return pipelinedDecodeFrameEnabledForFlags(
+        platform.env.getenvBool("TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME"),
+        platform.env.getenvBool("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME"),
+    );
 }
 
 fn decoderRuntimePrefillAfterPrepareRequested() bool {
@@ -2077,6 +2128,7 @@ fn runtimePrefill(
     if (request.input_ids.len == 0 or request.query_seq_len == 0) return error.EmptyPrompt;
     if (request.input_ids.len != request.query_seq_len) return error.UnsupportedShape;
     if (request.query_seq_len > request.seq_len) return error.UnsupportedShape;
+    try runtime_ctx.configureKvPolicy(request.max_inflight_tokens, request.allow_swa_ring);
 
     timing_stats.prefill_calls += 1;
     const prepare_started_at = monotonicNowNs();
@@ -2405,4 +2457,74 @@ test "metal executor limits lazy device KV reserve to mixed-geometry Gemma" {
 
     config.family = .llama;
     try std.testing.expect(!executorUsesLazyDeviceKvReserve(config));
+}
+
+test "metal executor preserves split KV policy through its views and reset" {
+    const allocator = std.testing.allocator;
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = .metal,
+        .dtype = .f16,
+        .page_size_tokens = 16,
+        .num_layers_packed = 2,
+        .num_kv_heads = 2,
+        .head_dim = 256,
+    });
+    defer storage.deinit();
+
+    var metadata = ExecutorKvMetadataLayer.init(allocator, storage.poolId(), true);
+    defer metadata.deinit(&storage);
+    try metadata.configureKvPolicy(128, true);
+    _ = try metadata.notePrefill(&storage, 32);
+    try metadata.configureKvPolicy(128, true);
+    try std.testing.expectError(error.InvalidPagedKvState, metadata.configureKvPolicy(64, true));
+
+    const view = metadata.kv_view.?;
+    try std.testing.expectEqual(@as(usize, 128), view.max_inflight_tokens);
+    try std.testing.expect(view.allow_swa_ring);
+
+    const contract_view = executorContractKvCacheView(view);
+    try std.testing.expectEqual(@as(usize, 128), contract_view.max_inflight_tokens);
+    try std.testing.expect(contract_view.allow_swa_ring);
+    const decode_view = executorDecodeKvCacheView(view);
+    try std.testing.expectEqual(@as(usize, 128), decode_view.max_inflight_tokens);
+    try std.testing.expect(decode_view.allow_swa_ring);
+
+    try metadata.reset(&storage);
+    try std.testing.expectEqual(@as(usize, 0), metadata.max_inflight_tokens);
+    try std.testing.expect(!metadata.allow_swa_ring);
+    try std.testing.expect(metadata.kv_view == null);
+}
+
+test "metal executor only enables split KV policy for mixed local and global Gemma" {
+    var config = gpt_mod.Config{
+        .family = .gemma,
+        .num_hidden_layers = 6,
+        .position_encoding = .rope,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+        .ple_hidden_size = 256,
+    };
+    try std.testing.expect(config.supportsSplitSwaGlobalKvRing());
+
+    config.ple_hidden_size = 0;
+    try std.testing.expect(!config.supportsSplitSwaGlobalKvRing());
+    config.ple_hidden_size = 256;
+
+    config.sliding_window = 0;
+    try std.testing.expect(!config.supportsSplitSwaGlobalKvRing());
+    config.sliding_window = 512;
+
+    config.sliding_window_pattern = 7;
+    try std.testing.expect(!config.supportsSplitSwaGlobalKvRing());
+    config.sliding_window_pattern = 6;
+
+    config.family = .llama;
+    try std.testing.expect(!config.supportsSplitSwaGlobalKvRing());
+}
+
+test "metal executor keeps speculative decode frames opt in" {
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, false));
+    try std.testing.expect(pipelinedDecodeFrameEnabledForFlags(true, false));
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, true));
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(true, true));
 }

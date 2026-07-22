@@ -322,6 +322,13 @@ pub const Config = struct {
         return false;
     }
 
+    pub fn supportsSplitSwaGlobalKvRing(self: Config) bool {
+        return self.family == .gemma and
+            self.hasPle() and
+            self.sliding_window > 0 and
+            self.hasGlobalAttentionLayers();
+    }
+
     /// Retention window for a layer-packed KV pool. Mixed global/sliding
     /// attention keeps full history unless the lower-memory override is forced.
     pub fn kvPoolSlidingWindowSize(self: Config, force_sliding_trim: bool) ?u32 {

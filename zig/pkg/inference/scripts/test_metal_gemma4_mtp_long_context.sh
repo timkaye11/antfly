@@ -26,6 +26,7 @@ DEFAULT_MODELS_DIR="${ANTFLY_INFERENCE_GEMMA4_MODELS_DIR:-$HOME/.antfly/inferenc
 MODEL="${ANTFLY_INFERENCE_GEMMA4_QAT_MODEL:-$DEFAULT_MODELS_DIR/google/gemma-4-E4B-it-qat-q4_0-gguf}"
 DRAFT="${ANTFLY_INFERENCE_GEMMA4_MTP_POLICY_DRAFT_MODEL:-${MODEL%-gguf}-unquantized-assistant}"
 TOKENS="${ANTFLY_GEMMA4_MTP_LONG_CONTEXT_TOKENS:-64}"
+EXPECTED_FINISH_REASON="${ANTFLY_GEMMA4_MTP_LONG_CONTEXT_EXPECT_FINISH_REASON:-length}"
 PREFILL_CHUNK_SIZE="${ANTFLY_GEMMA4_MTP_LONG_CONTEXT_PREFILL_CHUNK_SIZE:-auto}"
 AUTO_PREFILL_CHUNK_SIZE="${ANTFLY_GEMMA4_MTP_LONG_CONTEXT_AUTO_PREFILL_CHUNK_SIZE:-512}"
 SPECULATIVE_K="${ANTFLY_GEMMA4_MTP_LONG_CONTEXT_SPECULATIVE_K:-4}"
@@ -35,9 +36,9 @@ EXPECTED_TOKEN_PREFIX="${ANTFLY_GEMMA4_MTP_LONG_CONTEXT_EXPECTED_TOKEN_PREFIX-81
 PROMPT_REPEAT="${ANTFLY_GEMMA4_MTP_LONG_CONTEXT_PROMPT_REPEAT:-36}"
 PRINT_TIMING="${ANTFLY_GEMMA4_MTP_LONG_CONTEXT_TIMING:-0}"
 OUT_DIR="${OUT_DIR:-/tmp/antfly-gemma4-mtp-long-context-$(date -u +%Y%m%d-%H%M%S)}"
-ring_gate_active=0
-if [[ "${TERMITE_METAL_ENABLE_SPLIT_SWA_KV_RING:-0}" != "0" && "${TERMITE_METAL_DISABLE_SPLIT_SWA_KV_RING:-0}" == "0" ]]; then
-  ring_gate_active=1
+ring_gate_active=1
+if [[ "${TERMITE_METAL_DISABLE_SPLIT_SWA_KV_RING:-0}" != "0" ]]; then
+  ring_gate_active=0
 fi
 hd512_flash_gate_active=1
 if [[ "${TERMITE_METAL_DISABLE_PREFILL_FLASH_HD512:-0}" != "0" ]]; then
@@ -73,6 +74,10 @@ else
 fi
 if (( SPECULATIVE_K > 16 )); then
   echo "speculative k must not exceed 16" >&2
+  exit 2
+fi
+if [[ "$EXPECTED_FINISH_REASON" != "length" && "$EXPECTED_FINISH_REASON" != "stop" ]]; then
+  echo "expected finish reason must be length or stop" >&2
   exit 2
 fi
 
@@ -232,12 +237,24 @@ else
     || fail "target and MTP did not use requested prefill chunk size $PREFILL_CHUNK_SIZE"
 fi
 
-grep -Eq "^finish_reason=length tokens=$TOKENS$" "$target_out" \
-  || fail "target did not generate exactly $TOKENS tokens"
-grep -Eq "^finish_reason=length tokens=$TOKENS$" "$whole_model_out" \
-  || fail "whole-model target did not generate exactly $TOKENS tokens"
-grep -Eq "^finish_reason=length tokens=$TOKENS$" "$mtp_out" \
-  || fail "MTP did not generate exactly $TOKENS tokens"
+if [[ "$EXPECTED_FINISH_REASON" == "length" ]]; then
+  grep -Eq "^finish_reason=length tokens=$TOKENS$" "$target_out" \
+    || fail "target did not generate exactly $TOKENS tokens"
+  grep -Eq "^finish_reason=length tokens=$TOKENS$" "$whole_model_out" \
+    || fail "whole-model target did not generate exactly $TOKENS tokens"
+  grep -Eq "^finish_reason=length tokens=$TOKENS$" "$mtp_out" \
+    || fail "MTP did not generate exactly $TOKENS tokens"
+  generated_tokens="$TOKENS"
+else
+  target_generated="$(sed -n 's/^finish_reason=stop tokens=\([0-9][0-9]*\)$/\1/p' "$target_out" | tail -n 1)"
+  whole_model_generated="$(sed -n 's/^finish_reason=stop tokens=\([0-9][0-9]*\)$/\1/p' "$whole_model_out" | tail -n 1)"
+  mtp_generated="$(sed -n 's/^finish_reason=stop tokens=\([0-9][0-9]*\)$/\1/p' "$mtp_out" | tail -n 1)"
+  [[ -n "$target_generated" && "$target_generated" == "$whole_model_generated" && "$target_generated" == "$mtp_generated" ]] \
+    || fail "target, whole-model, and MTP stop token counts differ"
+  (( target_generated > 0 && target_generated < TOKENS )) \
+    || fail "expected a natural stop before the $TOKENS-token budget"
+  generated_tokens="$target_generated"
+fi
 grep -Eq '^speculative: .*rounds=[1-9][0-9]* .*drafted=[1-9][0-9]* .*matched=[1-9][0-9]* .*mtp_enabled=true' "$mtp_out" \
   || fail "forced MTP did not execute accepted speculative work"
 if (( target_chunk == target_prompt_tokens )); then
@@ -254,7 +271,7 @@ else
 fi
 
 echo "metal Gemma4 MTP long-context token gate passed"
-echo "prompt_tokens=$target_prompt_tokens prefill_chunk_size=$target_chunk requested_prefill=$PREFILL_CHUNK_SIZE output_tokens=$TOKENS"
+echo "prompt_tokens=$target_prompt_tokens prefill_chunk_size=$target_chunk requested_prefill=$PREFILL_CHUNK_SIZE output_tokens=$generated_tokens finish_reason=$EXPECTED_FINISH_REASON"
 echo "whole_model_executor=handled"
 if [[ "$PRINT_TIMING" != "0" ]]; then
   echo "target $(grep '^generate_timing_ms:' "$target_out" | tail -n 1)"

@@ -503,6 +503,8 @@ pub const KvView = struct {
     tail_tokens: u16,
     token_count: usize,
     position_offset: usize,
+    max_inflight_tokens: usize = 0,
+    allow_swa_ring: bool = false,
     logical_blocks: ?[]const runtime.kv.block.KvBlockId = null,
     kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
 };
@@ -1075,8 +1077,15 @@ fn gemma4MetalDirectGreedyDefault() bool {
     return true;
 }
 
+fn pipelinedMetalDecodeEnabledForFlags(enable_requested: bool, disable_requested: bool) bool {
+    return enable_requested and !disable_requested;
+}
+
 fn pipelinedMetalDecodeEnabled() bool {
-    return !platform.env.getenvBool("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME");
+    return pipelinedMetalDecodeEnabledForFlags(
+        platform.env.getenvBool("TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME"),
+        platform.env.getenvBool("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME"),
+    );
 }
 
 fn gemma4MetalDirectGreedyEnabled() bool {
@@ -1469,10 +1478,7 @@ pub const NativeDecodeState = struct {
     pub fn configureForGptConfig(self: *NativeDecodeState, config: gpt_mod.Config) void {
         self.force_full_recompute = false;
         if (self.total_tokens == 0) self.kv_max_inflight_tokens = 0;
-        self.allow_swa_ring = config.family == .gemma and
-            config.hasPle() and
-            config.sliding_window > 0 and
-            config.hasGlobalAttentionLayers();
+        self.allow_swa_ring = config.supportsSplitSwaGlobalKvRing();
         if (config.family != .gemma) self.gemma4_layer_spec_cache.reset();
         if (!requiresDeepSeekV4CompressedCache(config)) self.clearDeepSeekV4CompressedCache();
     }
@@ -1480,12 +1486,21 @@ pub const NativeDecodeState = struct {
     fn configureKvMaxInflightTokens(self: *NativeDecodeState, token_count: usize, request_allows_ring: bool) void {
         if (token_count == 0 or self.total_tokens != 0) {
             self.allow_swa_ring = false;
+            self.kv_max_inflight_tokens = 0;
+            if (self.kv_view) |*view| {
+                view.max_inflight_tokens = 0;
+                view.allow_swa_ring = false;
+            }
             return;
         }
         // Ring page ids are absolute from sequence position zero. A pool that
         // front-trims its logical block table would make them view-relative.
         self.allow_swa_ring = self.allow_swa_ring and request_allows_ring and self.kvSlidingWindowTokens() == null;
         self.kv_max_inflight_tokens = if (self.allow_swa_ring) token_count else 0;
+        if (self.kv_view) |*view| {
+            view.max_inflight_tokens = self.kv_max_inflight_tokens;
+            view.allow_swa_ring = self.allow_swa_ring;
+        }
     }
 
     pub fn requiresFullRecompute(self: *const NativeDecodeState) bool {
@@ -1613,6 +1628,8 @@ pub const NativeDecodeState = struct {
             .tail_tokens = tail_tokens,
             .token_count = token_count,
             .position_offset = position_offset,
+            .max_inflight_tokens = self.kv_max_inflight_tokens,
+            .allow_swa_ring = self.allow_swa_ring,
             .logical_blocks = self.kv_block_ids.items,
             .kv_storage = self.kv_storage,
         };
@@ -1949,8 +1966,8 @@ pub const NativeDecodeState = struct {
                     .logical_block_count = view.logical_block_count,
                     .tail_tokens = view.tail_tokens,
                     .position_offset = view.position_offset,
-                    .max_inflight_tokens = self.kv_max_inflight_tokens,
-                    .allow_swa_ring = self.allow_swa_ring,
+                    .max_inflight_tokens = view.max_inflight_tokens,
+                    .allow_swa_ring = view.allow_swa_ring,
                     .logical_blocks = view.logical_blocks,
                     .kv_storage = view.kv_storage,
                 }
@@ -3079,29 +3096,31 @@ pub const NativeGenerationPipeline = struct {
                 if (gbnf_grammar != null) &(gbnf_grammar.?) else null,
             );
             const first_token = first_outcome.token;
-            token_ids[seq_len] = @intCast(first_token);
-            seq_len += 1;
-            tokens_generated += 1;
-            if (!use_gemma4_mtp) {
-                _ = try decode_runtime.appendGeneratedToken();
-                _ = try draft_runtime.appendGeneratedToken();
-            }
-            try penalty_state.noteToken(allocator, @intCast(first_token));
+            const first_is_eos = self.shouldStopOnEos(config, first_token);
             var callback_allows_generation = true;
-            if (stream_enabled) {
-                const keep_streaming = try self.emitDecodedDelta(
-                    token_ids[prompt_token_count..seq_len],
-                    &emitted_text,
-                    on_token_fn.?,
-                    on_token_ctx.?,
-                );
-                if (!keep_streaming) {
-                    callback_allows_generation = false;
-                    finish_reason = "stop";
+            if (!first_is_eos) {
+                token_ids[seq_len] = @intCast(first_token);
+                seq_len += 1;
+                tokens_generated += 1;
+                if (!use_gemma4_mtp) {
+                    _ = try decode_runtime.appendGeneratedToken();
+                    _ = try draft_runtime.appendGeneratedToken();
+                }
+                try penalty_state.noteToken(allocator, @intCast(first_token));
+                if (stream_enabled) {
+                    const keep_streaming = try self.emitDecodedDelta(
+                        token_ids[prompt_token_count..seq_len],
+                        &emitted_text,
+                        on_token_fn.?,
+                        on_token_ctx.?,
+                    );
+                    if (!keep_streaming) {
+                        callback_allows_generation = false;
+                        finish_reason = "stop";
+                    }
                 }
             }
 
-            const first_is_eos = self.shouldStopOnEos(config, first_token);
             if (first_is_eos or first_outcome.grammar_complete) {
                 finish_reason = "stop";
             }
@@ -3759,6 +3778,13 @@ pub const NativeGenerationPipeline = struct {
 
         if (self.compiled_partition_backend != null and self.compiled_attachment_target == .whole_model and self.graph_cache != null) {
             if (prefilled_tokens != 0) return error.UnsupportedShape;
+            const max_speculative_rows = @min(@as(usize, @intCast(config.speculative_k)), 16) + 1;
+            decode_state.configureKvMaxInflightTokens(
+                @max(seq_len, max_speculative_rows),
+                self.cb.kind() == .metal and
+                    !config.prompt_cache_enabled and
+                    config.cache_compaction_ratio == null,
+            );
             debugGenerationStage("executePrefill whole-model fast path seq_len={d}", .{seq_len});
             const decode_context = try decode_runtime.preparePrefill(seq_len, seq_len);
             if (allow_resident_greedy_token) {
@@ -7472,13 +7498,14 @@ pub const NativeGenerationPipeline = struct {
         if (target_choice == first_draft) return null;
         if (seq_len >= token_ids.len) return error.InvalidTensorShape;
 
-        token_ids[seq_len] = @intCast(cached_choice);
+        const hit_eos = self.shouldStopOnEos(config, target_choice);
+        if (!hit_eos) token_ids[seq_len] = @intCast(cached_choice);
         return .{
             .matched_drafts = 0,
-            .accepted = 1,
-            .hit_eos = self.shouldStopOnEos(config, target_choice),
+            .accepted = @intFromBool(!hit_eos),
+            .hit_eos = hit_eos,
             .hit_grammar_stop = false,
-            .correction_added = true,
+            .correction_added = !hit_eos,
             .had_bonus = false,
             .bonus_skipped = false,
             .mtp_quality = classifyGemma4MtpMismatchWithoutTargetLogits(first_draft_raw, target_choice),
@@ -7598,42 +7625,42 @@ pub const NativeGenerationPipeline = struct {
             });
 
             if (target_choice == @as(usize, @intCast(draft_tokens[i]))) {
-                matched_drafts += 1;
-                accepted += 1;
-                try round_penalties.noteToken(self.allocator, draft_tokens[i]);
-
-                if (self.shouldStopOnEos(config, @intCast(draft_tokens[i]))) {
+                if (self.shouldStopOnEos(config, target_choice)) {
                     hit_eos = true;
                     break;
                 }
+                matched_drafts += 1;
+                accepted += 1;
+                try round_penalties.noteToken(self.allocator, draft_tokens[i]);
             } else {
                 mtp_quality.merge(classifyGemma4MtpMismatchWithoutTargetLogits(draft_tokens[i], target_choice));
-                token_ids[seq_len + matched_drafts] = @intCast(target_choice);
-                accepted = matched_drafts + 1;
-                correction_added = true;
-
                 if (self.shouldStopOnEos(config, target_choice)) {
                     hit_eos = true;
+                } else {
+                    token_ids[seq_len + matched_drafts] = @intCast(target_choice);
+                    accepted = matched_drafts + 1;
+                    correction_added = true;
                 }
                 break;
             }
         }
 
         const can_bonus = matched_drafts == draft_tokens.len and !hit_eos;
-        const had_bonus = can_bonus and accept_bonus;
+        var had_bonus = false;
         const bonus_skipped = can_bonus and !accept_bonus;
-        if (had_bonus) {
+        if (can_bonus and accept_bonus) {
             const bonus_token = @as(usize, @intCast(target_choices[draft_tokens.len]));
             debugGemma4Mtp("bonus_device index={d} target={d}", .{
                 draft_tokens.len,
                 bonus_token,
             });
 
-            token_ids[seq_len + accepted] = @intCast(bonus_token);
-            accepted += 1;
-
             if (self.shouldStopOnEos(config, bonus_token)) {
                 hit_eos = true;
+            } else {
+                token_ids[seq_len + accepted] = @intCast(bonus_token);
+                accepted += 1;
+                had_bonus = true;
             }
         }
 
@@ -7683,8 +7710,25 @@ pub const NativeGenerationPipeline = struct {
             if (runtime_result.accepted == 0 or row != runtime_result.accepted - 1) return error.InvalidSpeculativeState;
         }
 
+        var matched_drafts = runtime_result.matched_drafts;
+        var accepted = runtime_result.accepted;
+        var correction_added = runtime_result.correction_added;
+        var had_bonus = runtime_result.had_bonus;
+        if (runtime_result.hit_eos) {
+            if (accepted == 0) return error.InvalidSpeculativeState;
+            accepted -= 1;
+            if (correction_added) {
+                correction_added = false;
+            } else if (had_bonus) {
+                had_bonus = false;
+            } else {
+                if (matched_drafts == 0) return error.InvalidSpeculativeState;
+                matched_drafts -= 1;
+            }
+        }
+
         var mtp_quality = MtpQualityStats{};
-        for (0..runtime_result.matched_drafts) |i| {
+        for (0..matched_drafts) |i| {
             if (draft_tokens[i] < 0) return error.InvalidModelOutput;
             if (has_target_choices and runtime_result.target_choices[i] != @as(u32, @intCast(draft_tokens[i]))) return error.InvalidSpeculativeState;
             try round_penalties.noteToken(self.allocator, draft_tokens[i]);
@@ -7697,14 +7741,14 @@ pub const NativeGenerationPipeline = struct {
                 @as(usize, @intCast(runtime_result.target_choices[runtime_result.matched_drafts]))
             else
                 @as(usize, @intCast(runtime_result.correction_token orelse return error.InvalidSpeculativeState));
-            token_ids[seq_len + runtime_result.matched_drafts] = @intCast(target_choice);
+            if (correction_added) token_ids[seq_len + matched_drafts] = @intCast(target_choice);
             mtp_quality.merge(classifyGemma4MtpMismatchWithoutTargetLogits(
                 draft_tokens[runtime_result.matched_drafts],
                 target_choice,
             ));
         }
 
-        if (runtime_result.had_bonus) {
+        if (had_bonus) {
             if (runtime_result.matched_drafts != draft_tokens.len) return error.InvalidSpeculativeState;
             const bonus_token = if (has_target_choices)
                 @as(usize, @intCast(runtime_result.target_choices[draft_tokens.len]))
@@ -7714,12 +7758,12 @@ pub const NativeGenerationPipeline = struct {
         }
 
         return .{
-            .matched_drafts = runtime_result.matched_drafts,
-            .accepted = runtime_result.accepted,
+            .matched_drafts = matched_drafts,
+            .accepted = accepted,
             .hit_eos = runtime_result.hit_eos,
             .hit_grammar_stop = false,
-            .correction_added = runtime_result.correction_added,
-            .had_bonus = runtime_result.had_bonus,
+            .correction_added = correction_added,
+            .had_bonus = had_bonus,
             .bonus_skipped = runtime_result.bonus_skipped,
             .mtp_quality = mtp_quality,
         };
@@ -7825,26 +7869,25 @@ pub const NativeGenerationPipeline = struct {
             }
 
             if (target_choice == @as(usize, @intCast(draft_tokens[i]))) {
-                matched_drafts += 1;
-                accepted += 1;
-                try round_penalties.noteToken(self.allocator, draft_tokens[i]);
-
-                if (self.shouldStopOnEos(config, @intCast(draft_tokens[i]))) {
+                if (self.shouldStopOnEos(config, target_choice)) {
                     hit_eos = true;
                     break;
                 }
+                matched_drafts += 1;
+                accepted += 1;
+                try round_penalties.noteToken(self.allocator, draft_tokens[i]);
                 if (outcome.grammar_complete) {
                     hit_grammar_stop = true;
                     break;
                 }
             } else {
                 mtp_quality.merge(classifyGemma4MtpMismatch(mtp_parity_trace, i, pos_logits, draft_tokens[i], target_choice));
-                token_ids[seq_len + matched_drafts] = @intCast(target_choice);
-                accepted = matched_drafts + 1;
-                correction_added = true;
-
                 if (self.shouldStopOnEos(config, target_choice)) {
                     hit_eos = true;
+                } else {
+                    token_ids[seq_len + matched_drafts] = @intCast(target_choice);
+                    accepted = matched_drafts + 1;
+                    correction_added = true;
                 }
                 if (outcome.grammar_complete) {
                     hit_grammar_stop = true;
@@ -7854,9 +7897,9 @@ pub const NativeGenerationPipeline = struct {
         }
 
         const can_bonus = matched_drafts == draft_tokens.len and !hit_eos and !hit_grammar_stop;
-        const had_bonus = can_bonus and accept_bonus;
+        var had_bonus = false;
         const bonus_skipped = can_bonus and !accept_bonus;
-        if (had_bonus) {
+        if (can_bonus and accept_bonus) {
             const bonus_offset = logit_base_offset + draft_tokens.len * vocab_size;
             const bonus_logits = target_logits[bonus_offset..][0..vocab_size];
             const outcome = try self.sampleNextToken(
@@ -7874,11 +7917,12 @@ pub const NativeGenerationPipeline = struct {
                 bonus_token,
             });
 
-            token_ids[seq_len + accepted] = @intCast(bonus_token);
-            accepted += 1;
-
             if (self.shouldStopOnEos(config, bonus_token)) {
                 hit_eos = true;
+            } else {
+                token_ids[seq_len + accepted] = @intCast(bonus_token);
+                accepted += 1;
+                had_bonus = true;
             }
             if (outcome.grammar_complete) {
                 hit_grammar_stop = true;
@@ -10159,6 +10203,33 @@ test "native decode state disables SWA ring when the KV pool trims history" {
     try std.testing.expectEqual(@as(usize, 0), state.kv_max_inflight_tokens);
 }
 
+test "native decode state clears an existing KV view ring policy" {
+    const allocator = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f16,
+        .page_size_tokens = 4,
+        .num_kv_heads = 1,
+        .head_dim = 8,
+    });
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    defer state.deinit();
+
+    state.allow_swa_ring = true;
+    state.configureKvMaxInflightTokens(4, true);
+    try state.notePrefill(4);
+    try std.testing.expect(state.kvView().?.allow_swa_ring);
+
+    state.configureKvMaxInflightTokens(4, true);
+    try std.testing.expect(!state.allow_swa_ring);
+    try std.testing.expectEqual(@as(usize, 0), state.kv_max_inflight_tokens);
+    try std.testing.expect(!state.kvView().?.allow_swa_ring);
+    try std.testing.expectEqual(@as(usize, 0), state.kvView().?.max_inflight_tokens);
+}
+
 test "native decode state chunked prefill appends incrementally" {
     const allocator = std.testing.allocator;
     var manager = runtime.kv.manager.KvManager.init(allocator);
@@ -10754,6 +10825,10 @@ test "owned batch decode context captures per-item kv bindings" {
     second.configureKvMaxInflightTokens(512, true);
     try first.notePrefill(6);
     try second.notePrefill(6);
+    try std.testing.expectEqual(@as(usize, 128), first.kvView().?.max_inflight_tokens);
+    try std.testing.expectEqual(@as(usize, 512), second.kvView().?.max_inflight_tokens);
+    try std.testing.expect(first.kvView().?.allow_swa_ring);
+    try std.testing.expect(second.kvView().?.allow_swa_ring);
 
     var owned = try buildOwnedBatchDecodeContext(allocator, &.{ &first, &second }, 6, 1);
     defer owned.deinit();
@@ -11146,6 +11221,13 @@ test "Gemma4 Metal direct greedy is default" {
     try std.testing.expectEqual(true, gemma4MetalDirectGreedyDefault());
 }
 
+test "Gemma4 speculative Metal decode frames are opt in" {
+    try std.testing.expect(!pipelinedMetalDecodeEnabledForFlags(false, false));
+    try std.testing.expect(pipelinedMetalDecodeEnabledForFlags(true, false));
+    try std.testing.expect(!pipelinedMetalDecodeEnabledForFlags(false, true));
+    try std.testing.expect(!pipelinedMetalDecodeEnabledForFlags(true, true));
+}
+
 test "gemma4 mtp adaptive k starts with probe and ramps on accepted windows" {
     var policy = MtpAdaptiveKPolicy.initFromValues(8, 750, 4, true, 1);
 
@@ -11399,6 +11481,52 @@ test "speculative verification can skip target bonus token" {
     try std.testing.expectEqual(@as(i64, 0), token_ids[2]);
 }
 
+test "speculative greedy verification excludes EOS from accepted tokens" {
+    const allocator = std.testing.allocator;
+    var pipeline = NativeGenerationPipeline{
+        .allocator = allocator,
+        .cb = undefined,
+        .gpt_config = .{ .vocab_size = 8, .eos_token_id = 7 },
+        .tokenizer = undefined,
+    };
+
+    var correction_tokens = [_]i64{ 2, 0, 0 };
+    var correction_penalties = SamplingPenaltyState{};
+    defer correction_penalties.deinit(allocator);
+    const correction = try pipeline.acceptVerifiedDraftTokenChoicesGreedy(
+        correction_tokens[0..],
+        1,
+        &.{4},
+        &.{ 7, 6 },
+        &correction_penalties,
+        true,
+        .{},
+    );
+    try std.testing.expectEqual(@as(usize, 0), correction.accepted);
+    try std.testing.expectEqual(@as(usize, 0), correction.matched_drafts);
+    try std.testing.expect(!correction.correction_added);
+    try std.testing.expect(correction.hit_eos);
+    try std.testing.expectEqual(@as(i64, 0), correction_tokens[1]);
+
+    var bonus_tokens = [_]i64{ 2, 4, 0 };
+    var bonus_penalties = SamplingPenaltyState{};
+    defer bonus_penalties.deinit(allocator);
+    const bonus = try pipeline.acceptVerifiedDraftTokenChoicesGreedy(
+        bonus_tokens[0..],
+        1,
+        &.{4},
+        &.{ 4, 7 },
+        &bonus_penalties,
+        true,
+        .{},
+    );
+    try std.testing.expectEqual(@as(usize, 1), bonus.accepted);
+    try std.testing.expectEqual(@as(usize, 1), bonus.matched_drafts);
+    try std.testing.expect(!bonus.had_bonus);
+    try std.testing.expect(bonus.hit_eos);
+    try std.testing.expectEqual(@as(i64, 0), bonus_tokens[2]);
+}
+
 test "gemma4 mtp cached first choice rejects mismatched draft" {
     const allocator = std.testing.allocator;
     var pipeline = NativeGenerationPipeline{
@@ -11429,11 +11557,11 @@ test "gemma4 mtp cached first choice rejects mismatched draft" {
     )) orelse return error.TestExpectedNonNull;
 
     try std.testing.expectEqual(@as(usize, 0), rejected.matched_drafts);
-    try std.testing.expectEqual(@as(usize, 1), rejected.accepted);
-    try std.testing.expectEqual(true, rejected.correction_added);
+    try std.testing.expectEqual(@as(usize, 0), rejected.accepted);
+    try std.testing.expectEqual(false, rejected.correction_added);
     try std.testing.expectEqual(false, rejected.had_bonus);
     try std.testing.expectEqual(true, rejected.hit_eos);
-    try std.testing.expectEqual(@as(i64, 7), rejected_tokens[1]);
+    try std.testing.expectEqual(@as(i64, 0), rejected_tokens[1]);
     try std.testing.expectEqual(@as(usize, 1), rejected.mtp_quality.mismatches);
 
     var ignored_tokens = [_]i64{ 2, 0, 0 };
@@ -11445,6 +11573,9 @@ test "gemma4 mtp cached first choice rejects mismatched draft" {
         .{ .ignore_eos = true },
     )) orelse return error.TestExpectedNonNull;
     try std.testing.expectEqual(false, ignored.hit_eos);
+    try std.testing.expectEqual(@as(usize, 1), ignored.accepted);
+    try std.testing.expectEqual(true, ignored.correction_added);
+    try std.testing.expectEqual(@as(i64, 7), ignored_tokens[1]);
 }
 
 test "gemma4 mtp verify-commit adapter handles correction metadata" {
@@ -11485,6 +11616,98 @@ test "gemma4 mtp verify-commit adapter handles correction metadata" {
     try std.testing.expectEqual(true, result.correction_added);
     try std.testing.expectEqual(false, result.had_bonus);
     try std.testing.expectEqual(@as(i64, 7), token_ids[2]);
+}
+
+test "gemma4 mtp verify-commit adapter excludes EOS metadata" {
+    const allocator = std.testing.allocator;
+    var pipeline = NativeGenerationPipeline{
+        .allocator = allocator,
+        .cb = undefined,
+        .gpt_config = .{ .vocab_size = 16, .eos_token_id = 7 },
+        .tokenizer = undefined,
+    };
+
+    var correction_tokens = [_]i64{ 2, 4, 0, 0 };
+    var correction_penalties = SamplingPenaltyState{};
+    defer correction_penalties.deinit(allocator);
+    var correction_choices = [_]u32{ 4, 7, 9 };
+    var correction_runtime = ops.Gemma4MtpVerifyCommitResult{
+        .target_choices = correction_choices[0..],
+        .matched_drafts = 1,
+        .accepted = 2,
+        .correction_added = true,
+        .had_bonus = false,
+        .bonus_skipped = false,
+        .hit_eos = true,
+        .commit_forward_required = true,
+        .accepted_hidden_row = null,
+    };
+    const correction = try pipeline.acceptGemma4MtpVerifyCommitResultGreedy(
+        correction_tokens[0..],
+        1,
+        &.{ 4, 5 },
+        &correction_runtime,
+        &correction_penalties,
+    );
+    try std.testing.expectEqual(@as(usize, 1), correction.accepted);
+    try std.testing.expectEqual(@as(usize, 1), correction.matched_drafts);
+    try std.testing.expect(!correction.correction_added);
+    try std.testing.expect(correction.hit_eos);
+    try std.testing.expectEqual(@as(i64, 0), correction_tokens[2]);
+
+    var matched_tokens = [_]i64{ 2, 4, 7, 0 };
+    var matched_penalties = SamplingPenaltyState{};
+    defer matched_penalties.deinit(allocator);
+    var matched_choices = [_]u32{ 4, 7, 9 };
+    var matched_runtime = ops.Gemma4MtpVerifyCommitResult{
+        .target_choices = matched_choices[0..],
+        .matched_drafts = 2,
+        .accepted = 2,
+        .correction_added = false,
+        .had_bonus = false,
+        .bonus_skipped = false,
+        .hit_eos = true,
+        .commit_forward_required = false,
+        .accepted_hidden_row = 1,
+    };
+    const matched = try pipeline.acceptGemma4MtpVerifyCommitResultGreedy(
+        matched_tokens[0..],
+        1,
+        &.{ 4, 7 },
+        &matched_runtime,
+        &matched_penalties,
+    );
+    try std.testing.expectEqual(@as(usize, 1), matched.accepted);
+    try std.testing.expectEqual(@as(usize, 1), matched.matched_drafts);
+    try std.testing.expect(matched.hit_eos);
+
+    var bonus_tokens = [_]i64{ 2, 4, 5, 0 };
+    var bonus_penalties = SamplingPenaltyState{};
+    defer bonus_penalties.deinit(allocator);
+    var bonus_choices = [_]u32{ 4, 5, 7 };
+    var bonus_runtime = ops.Gemma4MtpVerifyCommitResult{
+        .target_choices = bonus_choices[0..],
+        .matched_drafts = 2,
+        .accepted = 3,
+        .correction_added = false,
+        .had_bonus = true,
+        .bonus_skipped = false,
+        .hit_eos = true,
+        .commit_forward_required = true,
+        .accepted_hidden_row = null,
+    };
+    const bonus = try pipeline.acceptGemma4MtpVerifyCommitResultGreedy(
+        bonus_tokens[0..],
+        1,
+        &.{ 4, 5 },
+        &bonus_runtime,
+        &bonus_penalties,
+    );
+    try std.testing.expectEqual(@as(usize, 2), bonus.accepted);
+    try std.testing.expectEqual(@as(usize, 2), bonus.matched_drafts);
+    try std.testing.expect(!bonus.had_bonus);
+    try std.testing.expect(bonus.hit_eos);
+    try std.testing.expectEqual(@as(i64, 0), bonus_tokens[3]);
 }
 
 test "gemma4 mtp verify-commit adapter handles compact device metadata" {

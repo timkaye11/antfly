@@ -19064,6 +19064,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_deberta_attention_gemm_calls = runtime_stats.deberta_attention_gemm_calls;
         stats.metal_runtime_deberta_attention_gemm_fallbacks = runtime_stats.deberta_attention_gemm_fallbacks;
         stats.metal_runtime_paged_attention_1x_calls = runtime_stats.paged_attention_1x_calls;
+        stats.metal_runtime_decode_gqa_split_calls = runtime_stats.decode_gqa_split_calls;
         stats.metal_runtime_generated_attention_decode_1x_calls = runtime_stats.generated_attention_decode_1x_calls;
         stats.metal_runtime_generated_attention_flash_prefill_calls = runtime_stats.generated_attention_flash_prefill_calls;
         stats.metal_runtime_generated_attention_flash_prefill_hd512_calls = runtime_stats.generated_attention_flash_prefill_hd512_calls;

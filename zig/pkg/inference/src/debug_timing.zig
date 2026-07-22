@@ -265,10 +265,11 @@ pub fn printBackendTimingDetails(
         },
     );
     std.debug.print(
-        "{s}_attention_dispatch: paged_1x={d} generated_decode_1x={d} generated_flash_prefill={d} generated_flash_prefill_hd512={d} generated_rms_norm={d}\n",
+        "{s}_attention_dispatch: paged_1x={d} decode_gqa_split={d} generated_decode_1x={d} generated_flash_prefill={d} generated_flash_prefill_hd512={d} generated_rms_norm={d}\n",
         .{
             prefix,
             provider_stats.metal_runtime_paged_attention_1x_calls,
+            provider_stats.metal_runtime_decode_gqa_split_calls,
             provider_stats.metal_runtime_generated_attention_decode_1x_calls,
             provider_stats.metal_runtime_generated_attention_flash_prefill_calls,
             provider_stats.metal_runtime_generated_attention_flash_prefill_hd512_calls,

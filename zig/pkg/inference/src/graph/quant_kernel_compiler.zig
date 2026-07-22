@@ -11464,11 +11464,12 @@ test "metal runtime source narrowly gates the small-row split GQA route" {
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "float denom = simd_sum(S * weight)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "float4 merged = simd_sum(value * weight)"));
 
-    // Both live encoders share one opt-in gate, preserve 1x fallback, use a
+    // Both live encoders share one policy helper, preserve 1x fallback, use a
     // fixed persistent private scratch allocation, and track stage write then
     // reducer read/output write so the buffer barrier cannot disappear.
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_ENABLE_DECODE_GQA_SPLIT"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_DISABLE_DECODE_GQA_SPLIT"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "(head_dim == 512u && sliding_window == 0u)"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_ENABLE_DECODE_GQA_FLASH"));
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, host_source, "termite_metal_decode_gqa_split_eligible("));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "dispatchThreadgroups:MTLSizeMake(q_len, num_kv_heads, split_count)"));
@@ -11488,7 +11489,8 @@ test "metal runtime source narrowly gates the small-row split GQA route" {
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "output_offset % (4u * sizeof(float)) != 0u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "head_dim == 256u && sliding_window == 512u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "head_dim == 512u && sliding_window == 0u"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kv_tokens < 512u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV_TOKENS 512u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kv_tokens < TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV_TOKENS"));
 
     // A ragged final KV tile must gather each physical V row and explicitly
     // zero masked lanes. Loading an entire private-buffer tile lets NaN page
