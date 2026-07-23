@@ -4149,6 +4149,8 @@ fn makeBertConfig(mf: manifest_mod.ModelManifest) bert.Config {
         .intermediate_size = mf.intermediate_size,
         .max_position_embeddings = mf.max_position_embeddings,
         .num_labels = mf.num_labels,
+        .pad_token_id = mf.bert_pad_token_id,
+        .position_id_mode = if (mf.bert_model_type == .roberta) .roberta_padding else .absolute,
     };
 }
 
@@ -4163,12 +4165,15 @@ test "makeBertConfig carries num_labels from manifest" {
         .intermediate_size = 1536,
         .max_position_embeddings = 256,
         .num_labels = 3,
+        .bert_pad_token_id = 1,
     };
     defer mf.deinit();
 
     const cfg = makeBertConfig(mf);
     try std.testing.expectEqual(@as(bert.ModelType, .roberta), cfg.model_type);
     try std.testing.expectEqual(@as(u32, 3), cfg.num_labels);
+    try std.testing.expectEqual(@as(i64, 1), cfg.pad_token_id);
+    try std.testing.expectEqual(@as(bert.PositionIdMode, .roberta_padding), cfg.position_id_mode);
 }
 
 test "sessionTaskForModelType maps classifier and recognizer tasks" {

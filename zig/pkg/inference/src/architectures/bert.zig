@@ -210,7 +210,7 @@ fn validateBertForwardInputs(
     const hidden: usize = config.hidden_size;
     const intermediate: usize = config.intermediate_size;
     const heads: usize = config.num_attention_heads;
-    const max_positions: usize = config.max_position_embeddings;
+    const max_positions: usize = config.maxSequenceLength();
     if (batch == 0 or seq_len == 0 or hidden == 0 or intermediate == 0 or heads == 0 or
         hidden % heads != 0 or max_positions == 0 or seq_len > max_positions)
     {
@@ -436,7 +436,7 @@ fn buildPositionIds(
     total: usize,
     seq_len: usize,
 ) ![]i64 {
-    if (seq_len == 0 or seq_len > config.max_position_embeddings or input_ids.len < total or total % seq_len != 0) {
+    if (seq_len == 0 or seq_len > config.maxSequenceLength() or input_ids.len < total or total % seq_len != 0) {
         return error.InvalidShape;
     }
     const pos_ids = try allocator.alloc(i64, total);
@@ -752,6 +752,26 @@ test "RoBERTa position ids preserve padding indices" {
     try std.testing.expectEqualSlices(i64, &.{ 2, 3, 1, 4, 1, 1, 2, 3 }, positions);
 }
 
+test "RoBERTa position ids stay within the embedding table" {
+    const config = Config{
+        .position_id_mode = .roberta_padding,
+        .pad_token_id = 1,
+        .max_position_embeddings = 4,
+    };
+    try std.testing.expectEqual(@as(u32, 2), config.maxSequenceLength());
+
+    const valid_ids = [_]i64{ 10, 11 };
+    const positions = try buildPositionIds(std.testing.allocator, config, &valid_ids, valid_ids.len, valid_ids.len);
+    defer std.testing.allocator.free(positions);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, positions);
+
+    const too_many_ids = [_]i64{ 10, 11, 12 };
+    try std.testing.expectError(
+        error.InvalidShape,
+        buildPositionIds(std.testing.allocator, config, &too_many_ids, too_many_ids.len, too_many_ids.len),
+    );
+}
+
 test "BERT forward input validation rejects unsafe public inputs" {
     const config = Config{
         .vocab_size = 16,
@@ -770,6 +790,17 @@ test "BERT forward input validation rejects unsafe public inputs" {
         validateBertForwardInputs(config, &ids, &invalid_mask, null, 1, 4),
     );
     try std.testing.expectError(error.InvalidShape, validateBertForwardInputs(config, &ids, &mask, null, 1, 5));
+
+    const roberta_config = Config{
+        .vocab_size = 16,
+        .hidden_size = 8,
+        .intermediate_size = 16,
+        .num_attention_heads = 2,
+        .max_position_embeddings = 4,
+        .position_id_mode = .roberta_padding,
+        .pad_token_id = 1,
+    };
+    try std.testing.expectError(error.InvalidShape, validateBertForwardInputs(roberta_config, &ids, &mask, null, 1, 4));
 }
 
 test "BGE-M3 F16 mirror estimate stays within the production default" {

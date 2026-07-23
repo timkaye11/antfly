@@ -178,6 +178,16 @@ class L4ReleaseGateTest(unittest.TestCase):
         publish = release[release.index("  publish-release-assets:"):release.index("  package-cli-artifacts:")]
         self.assertNotIn("cuda-gemma4-release-gate", publish)
 
+    def test_workflow_requires_dedicated_runner_labels(self) -> None:
+        workflow = (pathlib.Path(__file__).resolve().parents[4] / ".github/workflows/cuda-gemma4-l4.yml").read_text(encoding="utf-8")
+        configure = workflow[workflow.index("  configure:"):workflow.index("  l4-evidence:")]
+        evidence = workflow[workflow.index("  l4-evidence:"):]
+        self.assertIn("ANTFLY_CUDA_L4_RUNNER_LABELS_JSON must be configured for release gates", configure)
+        self.assertIn("a dedicated L4 runner label", configure)
+        self.assertIn("enabled=false", configure)
+        self.assertIn("if: ${{ needs.configure.outputs.enabled == 'true' }}", evidence)
+        self.assertNotIn("|| '[\"self-hosted\"]'", evidence)
+
     def test_workflow_uses_accepted_release_and_batching_regression_floors(self) -> None:
         workflow = (pathlib.Path(__file__).resolve().parents[4] / ".github/workflows/cuda-gemma4-l4.yml").read_text(encoding="utf-8")
         self.assertIn("--enforce-performance --min-comparable-ratio 0.70 --verify-artifacts", workflow)
