@@ -66,11 +66,61 @@ const remote_fetch_security = scraping.ContentSecurityConfig{
 };
 
 fn remoteByteBudget(remote_content: ?*const scraping.RemoteContentConfig) u64 {
-    const configured = if (remote_content) |cfg|
-        if (cfg.security) |security| security.max_download_size_bytes else null
+    var snapshot = if (remote_content) |cfg| cfg.acquire() else null;
+    defer if (snapshot) |*held| held.deinit();
+
+    const configured = if (snapshot) |held|
+        if (held.config.security) |security| security.max_download_size_bytes else null
     else
         null;
     return @min(default_remote_fetch_max_download_size_bytes, configured orelse default_remote_fetch_max_download_size_bytes);
+}
+
+test "template remote byte budget reads the reloadable config snapshot" {
+    const Harness = struct {
+        config: scraping.RemoteContentConfig,
+        releases: usize = 0,
+
+        fn acquire(context: *anyopaque) ?scraping.RemoteContentConfig.Snapshot {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return .{
+                .config = &self.config,
+                .context = context,
+                .release_fn = release,
+            };
+        }
+
+        fn release(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.releases += 1;
+        }
+
+        fn health(_: *anyopaque) scraping.RemoteContentConfig.RuntimeHealth {
+            return .{
+                .generation = 1,
+                .hash = [_]u8{0} ** 32,
+                .last_reload_failed = false,
+                .stale_snapshot = false,
+                .reload_successes = 0,
+                .reload_failures = 0,
+            };
+        }
+    };
+
+    var harness = Harness{
+        .config = .{ .security = .{ .max_download_size_bytes = 4096 } },
+    };
+    var facade = scraping.RemoteContentConfig{
+        .security = .{ .max_download_size_bytes = 8192 },
+        .runtime = .{
+            .context = &harness,
+            .acquire_fn = Harness.acquire,
+            .health_fn = Harness.health,
+        },
+    };
+
+    try std.testing.expectEqual(@as(u64, 4096), remoteByteBudget(&facade));
+    try std.testing.expectEqual(@as(usize, 1), harness.releases);
 }
 
 pub fn renderJsonToText(
@@ -450,7 +500,10 @@ fn downloadRemoteContentOutcomeAlloc(
     credential_name: ?[]const u8,
 ) !scraping.DownloadOutcome {
     if (render_ctx.remote_bytes_remaining == 0) return error.StreamTooLong;
-    var resolved = try resolveRemoteContentFetchOptions(render_ctx.alloc, render_ctx.remote_content, render_ctx.secret_store, url, credential_name);
+    var snapshot = if (render_ctx.remote_content) |remote_content| remote_content.acquire() else null;
+    defer if (snapshot) |*held| held.deinit();
+    const remote_content = if (snapshot) |*held| held.config else null;
+    var resolved = try resolveRemoteContentFetchOptions(render_ctx.alloc, remote_content, render_ctx.secret_store, url, credential_name);
     defer resolved.deinit(render_ctx.alloc);
     const fetch_budget = @min(
         resolved.security.max_download_size_bytes orelse default_remote_fetch_max_download_size_bytes,
@@ -623,9 +676,38 @@ pub fn downloadRemoteContentOutcomeAllocWithConfig(
     url: []const u8,
     credential_name: ?[]const u8,
 ) !scraping.DownloadOutcome {
-    var resolved = try resolveRemoteContentFetchOptions(alloc, remote_content, secret_store, url, credential_name);
+    return try downloadRemoteContentOutcomeAllocWithExecutor(
+        alloc,
+        remote_content,
+        secret_store,
+        url,
+        credential_name,
+        scraping.downloadContentOutcomeAllocWithHeaders,
+    );
+}
+
+const RemoteContentDownloadExecutor = *const fn (
+    Allocator,
+    []const u8,
+    ?*const scraping.ContentSecurityConfig,
+    ?*const scraping.S3CredentialsConfig,
+    ?[]const scraping.HTTPHeader,
+) anyerror!scraping.DownloadOutcome;
+
+fn downloadRemoteContentOutcomeAllocWithExecutor(
+    alloc: Allocator,
+    remote_content: ?*const scraping.RemoteContentConfig,
+    secret_store: ?*common_secrets.FileStore,
+    url: []const u8,
+    credential_name: ?[]const u8,
+    executor: RemoteContentDownloadExecutor,
+) !scraping.DownloadOutcome {
+    var snapshot = if (remote_content) |configured| configured.acquire() else null;
+    defer if (snapshot) |*held| held.deinit();
+    const effective_remote_content = if (snapshot) |*held| held.config else null;
+    var resolved = try resolveRemoteContentFetchOptions(alloc, effective_remote_content, secret_store, url, credential_name);
     defer resolved.deinit(alloc);
-    return try scraping.downloadContentOutcomeAllocWithHeaders(
+    return try executor(
         alloc,
         url,
         &resolved.security,
@@ -909,9 +991,18 @@ fn resolveSelectedS3Credential(
         .use_ssl = credential.use_ssl,
     };
     errdefer resolved.deinit(alloc);
-    if (credential.access_key_id) |value| resolved.access_key_id = try common_secrets.resolveReferenceOwned(alloc, secret_store, value);
-    if (credential.secret_access_key) |value| resolved.secret_access_key = try common_secrets.resolveReferenceOwned(alloc, secret_store, value);
-    if (credential.session_token) |value| resolved.session_token = try common_secrets.resolveReferenceOwned(alloc, secret_store, value);
+    resolved.access_key_id = if (credential.access_key_id) |value|
+        try common_secrets.resolveReferenceOwned(alloc, secret_store, value)
+    else
+        common_secrets.envValueOwned(alloc, "AWS_ACCESS_KEY_ID");
+    resolved.secret_access_key = if (credential.secret_access_key) |value|
+        try common_secrets.resolveReferenceOwned(alloc, secret_store, value)
+    else
+        common_secrets.envValueOwned(alloc, "AWS_SECRET_ACCESS_KEY");
+    resolved.session_token = if (credential.session_token) |value|
+        try common_secrets.resolveReferenceOwned(alloc, secret_store, value)
+    else
+        common_secrets.envValueOwned(alloc, "AWS_SESSION_TOKEN");
     return resolved;
 }
 
@@ -1317,6 +1408,175 @@ test "HTTP error bodies consume the aggregate render byte budget" {
     } };
     try std.testing.expectError(error.StreamTooLong, chargeDownloadOutcome(&render_ctx, oversized_error, 4));
     try std.testing.expectEqual(@as(u64, 0), render_ctx.remote_bytes_remaining);
+}
+
+test "template remote S3 credentials observe same-length secret rotation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/secrets.json", .{tmp.sub_path});
+    defer alloc.free(store_path);
+
+    var store = try common_secrets.FileStore.init(alloc, store_path);
+    defer store.deinit();
+    var first_access = try store.put(alloc, "s3.access", "ACCESS-ONE");
+    defer first_access.deinit(alloc);
+    var first_secret = try store.put(alloc, "s3.secret", "SECRET-ONE");
+    defer first_secret.deinit(alloc);
+
+    var cfg = scraping.RemoteContentConfig{};
+    defer cfg.deinit(alloc);
+    cfg.default_s3 = try alloc.dupe(u8, "primary");
+    try cfg.s3.put(alloc, try alloc.dupe(u8, "primary"), .{
+        .access_key_id = try alloc.dupe(u8, "${secret:s3.access}"),
+        .secret_access_key = try alloc.dupe(u8, "${secret:s3.secret}"),
+    });
+
+    var first = try resolveRemoteContentFetchOptions(alloc, &cfg, &store, "s3://bucket/document.pdf", null);
+    defer first.deinit(alloc);
+    try std.testing.expectEqualStrings("ACCESS-ONE", first.s3_credentials.?.access_key_id.?);
+    try std.testing.expectEqualStrings("SECRET-ONE", first.s3_credentials.?.secret_access_key.?);
+
+    var rotated_access = try store.put(alloc, "s3.access", "ACCESS-TWO");
+    defer rotated_access.deinit(alloc);
+    var rotated_secret = try store.put(alloc, "s3.secret", "SECRET-TWO");
+    defer rotated_secret.deinit(alloc);
+
+    var rotated = try resolveRemoteContentFetchOptions(alloc, &cfg, &store, "s3://bucket/document.pdf", null);
+    defer rotated.deinit(alloc);
+    try std.testing.expectEqualStrings("ACCESS-TWO", rotated.s3_credentials.?.access_key_id.?);
+    try std.testing.expectEqualStrings("SECRET-TWO", rotated.s3_credentials.?.secret_access_key.?);
+}
+
+test "template remote S3 credential resolution survives every allocation failure" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var credential = scraping.S3CredentialConfig{};
+            defer credential.deinit(alloc);
+            credential.access_key_id = try alloc.dupe(u8, "access-key");
+            credential.secret_access_key = try alloc.dupe(u8, "secret-key");
+            credential.session_token = try alloc.dupe(u8, "session-token");
+            const endpoint = try alloc.dupe(u8, "s3.example.test");
+            var resolved = try resolveSelectedS3Credential(alloc, null, .{
+                .credential = &credential,
+                .endpoint = endpoint,
+            });
+            defer resolved.deinit(alloc);
+            try std.testing.expectEqualStrings("s3.example.test", resolved.endpoint.?);
+            try std.testing.expectEqualStrings("access-key", resolved.access_key_id.?);
+            try std.testing.expectEqualStrings("secret-key", resolved.secret_access_key.?);
+            try std.testing.expectEqualStrings("session-token", resolved.session_token.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "template remote S3 credentials fall back to standard AWS environment" {
+    if (!@import("builtin").link_libc) return error.SkipZigTest;
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const alloc = std.testing.allocator;
+    const old_access = common_secrets.envValueOwned(alloc, "AWS_ACCESS_KEY_ID");
+    defer if (old_access) |value| alloc.free(value);
+    const old_secret = common_secrets.envValueOwned(alloc, "AWS_SECRET_ACCESS_KEY");
+    defer if (old_secret) |value| alloc.free(value);
+    const old_access_z = if (old_access) |value| try alloc.dupeZ(u8, value) else null;
+    defer if (old_access_z) |value| alloc.free(value);
+    const old_secret_z = if (old_secret) |value| try alloc.dupeZ(u8, value) else null;
+    defer if (old_secret_z) |value| alloc.free(value);
+    defer {
+        if (old_access_z) |value| {
+            _ = c.setenv("AWS_ACCESS_KEY_ID", value.ptr, 1);
+        } else {
+            _ = c.unsetenv("AWS_ACCESS_KEY_ID");
+        }
+        if (old_secret_z) |value| {
+            _ = c.setenv("AWS_SECRET_ACCESS_KEY", value.ptr, 1);
+        } else {
+            _ = c.unsetenv("AWS_SECRET_ACCESS_KEY");
+        }
+    }
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv("AWS_ACCESS_KEY_ID", "ENV-ACCESS", 1));
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv("AWS_SECRET_ACCESS_KEY", "ENV-SECRET", 1));
+
+    var cfg = scraping.RemoteContentConfig{};
+    defer cfg.deinit(alloc);
+    cfg.default_s3 = try alloc.dupe(u8, "primary");
+    try cfg.s3.put(alloc, try alloc.dupe(u8, "primary"), .{});
+
+    var resolved = try resolveRemoteContentFetchOptions(alloc, &cfg, null, "s3://bucket/document.pdf", null);
+    defer resolved.deinit(alloc);
+    try std.testing.expectEqualStrings("ENV-ACCESS", resolved.s3_credentials.?.access_key_id.?);
+    try std.testing.expectEqualStrings("ENV-SECRET", resolved.s3_credentials.?.secret_access_key.?);
+}
+
+test "template remote S3 fetch passes rotated credentials to downloader" {
+    const alloc = std.testing.allocator;
+    const FakeDownloader = struct {
+        var request_count: usize = 0;
+
+        fn execute(
+            a: Allocator,
+            _: []const u8,
+            _: ?*const scraping.ContentSecurityConfig,
+            credentials: ?*const scraping.S3CredentialsConfig,
+            _: ?[]const scraping.HTTPHeader,
+        ) !scraping.DownloadOutcome {
+            const expected_access, const expected_secret = switch (request_count) {
+                0 => .{ "ACCESS-ONE", "SECRET-ONE" },
+                1 => .{ "ACCESS-TWO", "SECRET-TWO" },
+                else => return error.TestUnexpectedResult,
+            };
+            request_count += 1;
+            const resolved = credentials orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings(expected_access, resolved.access_key_id.?);
+            try std.testing.expectEqualStrings(expected_secret, resolved.secret_access_key.?);
+            return .{ .ok = .{
+                .content_type = try a.dupe(u8, "text/plain"),
+                .data = try a.dupe(u8, "rotated-object"),
+            } };
+        }
+    };
+    FakeDownloader.request_count = 0;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/secrets.json", .{tmp.sub_path});
+    defer alloc.free(store_path);
+    var store = try common_secrets.FileStore.init(alloc, store_path);
+    defer store.deinit();
+    var first_access = try store.put(alloc, "s3.access", "ACCESS-ONE");
+    defer first_access.deinit(alloc);
+    var first_secret = try store.put(alloc, "s3.secret", "SECRET-ONE");
+    defer first_secret.deinit(alloc);
+
+    var cfg = scraping.RemoteContentConfig{};
+    defer cfg.deinit(alloc);
+    cfg.default_s3 = try alloc.dupe(u8, "primary");
+    try cfg.s3.put(alloc, try alloc.dupe(u8, "primary"), .{
+        .endpoint = try alloc.dupe(u8, "s3.example.invalid"),
+        .use_ssl = false,
+        .access_key_id = try alloc.dupe(u8, "${secret:s3.access}"),
+        .secret_access_key = try alloc.dupe(u8, "${secret:s3.secret}"),
+    });
+
+    var first = try downloadRemoteContentOutcomeAllocWithExecutor(alloc, &cfg, &store, "s3://bucket/document.txt", null, FakeDownloader.execute);
+    defer if (first == .ok) first.ok.deinit(alloc);
+    try std.testing.expect(first == .ok);
+    try std.testing.expectEqualStrings("rotated-object", first.ok.data);
+
+    var rotated_access = try store.put(alloc, "s3.access", "ACCESS-TWO");
+    defer rotated_access.deinit(alloc);
+    var rotated_secret = try store.put(alloc, "s3.secret", "SECRET-TWO");
+    defer rotated_secret.deinit(alloc);
+
+    var second = try downloadRemoteContentOutcomeAllocWithExecutor(alloc, &cfg, &store, "s3://bucket/document.txt", null, FakeDownloader.execute);
+    defer if (second == .ok) second.ok.deinit(alloc);
+    try std.testing.expect(second == .ok);
+    try std.testing.expectEqualStrings("rotated-object", second.ok.data);
+    try std.testing.expectEqual(@as(usize, 2), FakeDownloader.request_count);
 }
 
 test "template remote applies remote content security to http urls" {

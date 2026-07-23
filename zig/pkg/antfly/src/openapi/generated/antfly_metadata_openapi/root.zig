@@ -134,6 +134,7 @@ pub const RetrievalAgentUsage = types.RetrievalAgentUsage;
 pub const RetrievalQueryRequest = types.RetrievalQueryRequest;
 pub const RetrievalStepConfig = types.RetrievalStepConfig;
 pub const RetrievalStrategy = types.RetrievalStrategy;
+pub const RuntimeConfigStatus = types.RuntimeConfigStatus;
 pub const SSEError = types.SSEError;
 pub const SSEEvent = types.SSEEvent;
 pub const SSEStepCompleted = types.SSEStepCompleted;
