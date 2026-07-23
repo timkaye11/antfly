@@ -19324,6 +19324,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         });
     }
 
+    fn decoderRuntimeLayerNormSlotPreparedOp(ctx: *anyopaque, slot: usize, hidden_size: usize) bool {
+        const self: *const MetalCompute = @ptrCast(@alignCast(ctx));
+        return metal_runtime.decoderRuntimeLayerNormSlotPrepared(self.provider_impl, slot, hidden_size);
+    }
+
     fn decoderRuntimeEnsureLayerNormSlotOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeEnsureLayerNormSlotRequest) anyerror!?usize {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         return self.ensureDynamicLayerNormSlot(request.weight, request.bias, request.hidden_size);
@@ -19435,6 +19440,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .dense_bf16_bytes = dense_bf16_bytes,
             .dense_bf16_no_copy_safe = dense_bf16_no_copy_safe,
         }, &self.timing_stats);
+    }
+
+    fn decoderRuntimeLinearSlotPreparedOp(ctx: *anyopaque, slot: usize, in_dim: usize, out_dim: usize) bool {
+        const self: *const MetalCompute = @ptrCast(@alignCast(ctx));
+        return metal_runtime.decoderRuntimeLinearSlotPrepared(self.provider_impl, slot, in_dim, out_dim);
     }
 
     fn decoderRuntimeApplyLinearOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearRequest) anyerror!?CT {
@@ -20535,12 +20545,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.decoderRuntimePrepareAbsoluteEmbeddings = decoderRuntimePrepareAbsoluteEmbeddingsOp;
         vt.decoderRuntimeEmbedAbsolutePosition = decoderRuntimeEmbedAbsolutePositionOp;
         vt.decoderRuntimePrepareLayerNorm = decoderRuntimePrepareLayerNormOp;
+        vt.decoderRuntimeLayerNormSlotPrepared = decoderRuntimeLayerNormSlotPreparedOp;
         vt.decoderRuntimeEnsureLayerNormSlot = decoderRuntimeEnsureLayerNormSlotOp;
         vt.decoderRuntimeApplyLayerNorm = decoderRuntimeApplyLayerNormOp;
         vt.decoderRuntimePrepareRmsNorm = decoderRuntimePrepareRmsNormOp;
         vt.decoderRuntimeEnsureRmsNormSlot = decoderRuntimeEnsureRmsNormSlotOp;
         vt.decoderRuntimeApplyRmsNorm = decoderRuntimeApplyRmsNormOp;
         vt.decoderRuntimePrepareLinear = decoderRuntimePrepareLinearOp;
+        vt.decoderRuntimeLinearSlotPrepared = decoderRuntimeLinearSlotPreparedOp;
         vt.decoderRuntimeEnsureLinearSlot = decoderRuntimeEnsureLinearSlotOp;
         vt.decoderRuntimeApplyLinear = decoderRuntimeApplyLinearOp;
         vt.decoderRuntimeApplyLinearLayerNorm = decoderRuntimeApplyLinearLayerNormOp;

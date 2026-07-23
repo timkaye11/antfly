@@ -23,6 +23,7 @@ const ops = @import("../ops/ops.zig");
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
 const bert_config = @import("../models/bert.zig");
+const native_compute_mod = @import("../ops/native_compute.zig");
 
 pub const Config = bert_config.Config;
 
@@ -99,6 +100,32 @@ fn bertDenseMirrorBytes(config: Config, bytes_per_element: usize) ?usize {
     return std.math.mul(usize, total_elements, bytes_per_element) catch null;
 }
 
+fn metalEncoderSlotsPrepared(cb: *const ComputeBackend, config: Config) bool {
+    const layer_count: usize = @intCast(config.num_hidden_layers);
+    const hidden: usize = @intCast(config.hidden_size);
+    const intermediate: usize = @intCast(config.intermediate_size);
+
+    for (0..layer_count) |layer| {
+        for (bert_linear_specs) |spec| {
+            if (!cb.decoderRuntimeLinearSlotPrepared(
+                bertLinearSlot(layer, spec.kind),
+                if (spec.input_intermediate) intermediate else hidden,
+                if (spec.output_intermediate) intermediate else hidden,
+            )) return false;
+        }
+        for (bert_layer_norm_specs) |spec| {
+            if (!cb.decoderRuntimeLayerNormSlotPrepared(
+                bertLayerNormSlot(layer, spec.kind),
+                hidden,
+            )) return false;
+        }
+    }
+    return cb.decoderRuntimeLayerNormSlotPrepared(
+        bertEmbeddingLayerNormSlot(layer_count),
+        hidden,
+    );
+}
+
 fn preplanMetalEncoder(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config) !bool {
     if (cb.kind() != .metal or !metalEncoderFrameEnabled() or cb.decoderRuntimeHasActiveFrame()) return false;
 
@@ -107,6 +134,12 @@ fn preplanMetalEncoder(cb: *const ComputeBackend, allocator: std.mem.Allocator, 
     const intermediate: usize = @intCast(config.intermediate_size);
     const heads: usize = @intCast(config.num_attention_heads);
     if (layer_count == 0 or hidden == 0 or intermediate == 0 or heads == 0 or hidden % heads != 0) return false;
+    // Query backend-owned slot metadata before touching the weight store.
+    // The check is allocation-free and remains valid across explicit slot
+    // invalidation because it verifies every slot and dimension required by
+    // this encoder.
+    if (metalEncoderSlotsPrepared(cb, config)) return true;
+
     const weight_mirrors_requested = !platform.env.getenvBool("TERMITE_METAL_DISABLE_BERT_WEIGHT_MIRRORS") and
         !platform.env.getenvBool("TERMITE_METAL_DISABLE_BERT_Q8_STAGING");
     const prefer_q8_mirrors = weight_mirrors_requested and platform.env.getenvBool("TERMITE_METAL_BERT_USE_Q8_MIRRORS");
@@ -255,7 +288,8 @@ pub fn forwardCt(
 ) !CT {
     const H = config.hidden_size;
     const total = try validateBertForwardInputs(config, input_ids, attention_mask, token_type_ids, batch, seq_len);
-    // ponytail: prepare on first use; move this to session warmup if cold-request latency matters.
+    // Preparation is lazy on the first request; subsequent requests validate
+    // backend-owned slot metadata without loading or wrapping model weights.
     const resident_slots = try preplanMetalEncoder(cb, allocator, config);
 
     var encoder_frame_active = false;
@@ -742,6 +776,59 @@ test "BERT resident slot layout is stable and non-overlapping" {
     try std.testing.expectEqual(@as(usize, 143), bertLinearSlot(23, .output));
     try std.testing.expectEqual(@as(usize, 47), bertLayerNormSlot(23, .output));
     try std.testing.expectEqual(@as(usize, 48), bertEmbeddingLayerNormSlot(24));
+}
+
+const MetalEncoderPreparedProbe = struct {
+    linear_calls: usize = 0,
+    layer_norm_calls: usize = 0,
+    missing_linear_slot: ?usize = null,
+    missing_layer_norm_slot: ?usize = null,
+
+    fn linearPrepared(ctx: *anyopaque, slot: usize, in_dim: usize, out_dim: usize) bool {
+        const self: *MetalEncoderPreparedProbe = @ptrCast(@alignCast(ctx));
+        self.linear_calls += 1;
+        if (self.missing_linear_slot == slot) return false;
+        const kind: BertLinearSlotKind = @enumFromInt(slot % bert_linear_specs.len);
+        const spec = bert_linear_specs[@intFromEnum(kind)];
+        const expected_in_dim: usize = if (spec.input_intermediate) 8 else 4;
+        const expected_out_dim: usize = if (spec.output_intermediate) 8 else 4;
+        return in_dim == expected_in_dim and out_dim == expected_out_dim;
+    }
+
+    fn layerNormPrepared(ctx: *anyopaque, slot: usize, hidden_size: usize) bool {
+        const self: *MetalEncoderPreparedProbe = @ptrCast(@alignCast(ctx));
+        self.layer_norm_calls += 1;
+        return self.missing_layer_norm_slot != slot and hidden_size == 4;
+    }
+
+    const vtable = blk: {
+        var vt = native_compute_mod.vtable_impl;
+        vt.decoderRuntimeLinearSlotPrepared = linearPrepared;
+        vt.decoderRuntimeLayerNormSlotPrepared = layerNormPrepared;
+        break :blk vt;
+    };
+};
+
+test "BERT Metal resident slot probe is allocation-free and detects invalidation" {
+    const config = Config{
+        .hidden_size = 4,
+        .intermediate_size = 8,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+    };
+    var probe = MetalEncoderPreparedProbe{};
+    const cb = ComputeBackend{ .ptr = &probe, .vtable = &MetalEncoderPreparedProbe.vtable };
+
+    try std.testing.expect(metalEncoderSlotsPrepared(&cb, config));
+    try std.testing.expectEqual(@as(usize, 12), probe.linear_calls);
+    try std.testing.expectEqual(@as(usize, 5), probe.layer_norm_calls);
+
+    probe.linear_calls = 0;
+    probe.layer_norm_calls = 0;
+    probe.missing_linear_slot = bertLinearSlot(1, .k);
+    try std.testing.expect(!metalEncoderSlotsPrepared(&cb, config));
+    try std.testing.expectEqual(bertLinearSlot(1, .k) + 1, probe.linear_calls);
+    try std.testing.expectEqual(@as(usize, 2), probe.layer_norm_calls);
 }
 
 test "RoBERTa position ids preserve padding indices" {
