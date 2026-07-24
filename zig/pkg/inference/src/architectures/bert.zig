@@ -444,23 +444,44 @@ fn embeddings(
         } else |_| {}
     }
 
-    // LayerNorm
-    const ln_w = try cb.getWeight("embeddings.LayerNorm.weight");
-    defer cb.free(ln_w);
-    const ln_b = try cb.getWeight("embeddings.LayerNorm.bias");
-    defer cb.free(ln_b);
-    const normed = if (layer_norm_slot) |slot|
-        (try cb.decoderRuntimeApplyLayerNorm(&.{
-            .slot = slot,
-            .input = result,
-            .hidden_size = H,
-            .eps = config.layer_norm_eps,
-        })) orelse try cb.layerNorm(result, ln_w, ln_b, H, config.layer_norm_eps)
-    else
-        try cb.layerNorm(result, ln_w, ln_b, H, config.layer_norm_eps);
+    // Keep fallback weights completely off the resident Metal hot path:
+    // cached getWeight calls still allocate short-lived tensor wrappers.
+    const normed = embeddingLayerNormWithSlot(
+        cb,
+        result,
+        H,
+        config.layer_norm_eps,
+        layer_norm_slot,
+    ) catch |err| {
+        cb.free(result);
+        return err;
+    };
     cb.free(result);
 
     return normed;
+}
+
+fn embeddingLayerNormWithSlot(
+    cb: *const ComputeBackend,
+    input: CT,
+    hidden_size: usize,
+    eps: f32,
+    slot: ?usize,
+) !CT {
+    if (slot) |prepared_slot| {
+        if (try cb.decoderRuntimeApplyLayerNorm(&.{
+            .slot = prepared_slot,
+            .input = input,
+            .hidden_size = hidden_size,
+            .eps = eps,
+        })) |output| return output;
+    }
+
+    const weight = try cb.getWeight("embeddings.LayerNorm.weight");
+    defer cb.free(weight);
+    const bias = try cb.getWeight("embeddings.LayerNorm.bias");
+    defer cb.free(bias);
+    return cb.layerNorm(input, weight, bias, hidden_size, eps);
 }
 
 fn buildPositionIds(
@@ -809,6 +830,37 @@ const MetalEncoderPreparedProbe = struct {
     };
 };
 
+const EmbeddingLayerNormResidentProbe = struct {
+    input_marker: u8 = 0,
+    output_marker: u8 = 0,
+    apply_calls: usize = 0,
+    weight_calls: usize = 0,
+
+    fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
+        const self: *EmbeddingLayerNormResidentProbe = @ptrCast(@alignCast(ctx));
+        _ = name;
+        self.weight_calls += 1;
+        return error.UnexpectedWeightLookup;
+    }
+
+    fn applyLayerNorm(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLayerNormRequest) anyerror!?CT {
+        const self: *EmbeddingLayerNormResidentProbe = @ptrCast(@alignCast(ctx));
+        self.apply_calls += 1;
+        try std.testing.expectEqual(@as(usize, 7), request.slot);
+        try std.testing.expectEqual(@as(usize, 4), request.hidden_size);
+        try std.testing.expectApproxEqAbs(@as(f32, 1e-5), request.eps, 1e-9);
+        try std.testing.expectEqual(@intFromPtr(&self.input_marker), @intFromPtr(request.input));
+        return @ptrCast(&self.output_marker);
+    }
+
+    const vtable = blk: {
+        var vt = native_compute_mod.vtable_impl;
+        vt.getWeight = getWeight;
+        vt.decoderRuntimeApplyLayerNorm = applyLayerNorm;
+        break :blk vt;
+    };
+};
+
 test "BERT Metal resident slot probe is allocation-free and detects invalidation" {
     const config = Config{
         .hidden_size = 4,
@@ -829,6 +881,18 @@ test "BERT Metal resident slot probe is allocation-free and detects invalidation
     try std.testing.expect(!metalEncoderSlotsPrepared(&cb, config));
     try std.testing.expectEqual(bertLinearSlot(1, .k) + 1, probe.linear_calls);
     try std.testing.expectEqual(@as(usize, 2), probe.layer_norm_calls);
+}
+
+test "BERT resident embedding LayerNorm does not materialize fallback weights" {
+    var probe = EmbeddingLayerNormResidentProbe{};
+    const cb = ComputeBackend{ .ptr = &probe, .vtable = &EmbeddingLayerNormResidentProbe.vtable };
+    const input: CT = @ptrCast(&probe.input_marker);
+
+    const output = try embeddingLayerNormWithSlot(&cb, input, 4, 1e-5, 7);
+
+    try std.testing.expectEqual(@intFromPtr(&probe.output_marker), @intFromPtr(output));
+    try std.testing.expectEqual(@as(usize, 1), probe.apply_calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.weight_calls);
 }
 
 test "RoBERTa position ids preserve padding indices" {
