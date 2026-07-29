@@ -1086,7 +1086,7 @@ pub const LoadedModel = struct {
                 .deberta => false,
             } else false;
         var pipeline = EmbeddingPipeline.init(allocator, self.session, tok, .{
-            .max_length = self.manifest.max_position_embeddings,
+            .max_length = self.manifest.maxTextSequenceLength(),
             .normalize = self.manifest.normalize,
             .pooling = switch (self.manifest.pooling) {
                 .mean => .mean,
@@ -1124,7 +1124,7 @@ pub const LoadedModel = struct {
     pub fn rerankingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) RerankingPipeline {
         const tok = self.getTokenizer();
         return RerankingPipeline.init(allocator, self.session, tok, .{
-            .max_length = self.manifest.max_position_embeddings,
+            .max_length = self.manifest.maxTextSequenceLength(),
             .mode = if (self.manifest.hasCapability("late_interaction") or
                 self.manifest.hasCapability("colbert") or
                 self.manifest.hasCapability("colqwen") or
@@ -1149,6 +1149,7 @@ pub const LoadedModel = struct {
     pub fn classificationPipeline(self: *LoadedModel, allocator: std.mem.Allocator, config: ClassificationConfig) ClassificationPipeline {
         const tok = self.getTokenizer();
         var effective = config;
+        effective.max_length = @min(effective.max_length, self.manifest.maxTextSequenceLength());
         effective.distributed = runtime.distributed.configFromEnv();
         return ClassificationPipeline.init(allocator, self.session, tok, effective);
     }
@@ -1158,7 +1159,7 @@ pub const LoadedModel = struct {
         // Cast id2label from ?[][]const u8 to ?[]const []const u8
         const id2label: ?[]const []const u8 = if (self.manifest.id2label) |labels| labels else null;
         return NerPipeline.init(allocator, self.session, tok, .{
-            .max_length = self.manifest.max_position_embeddings,
+            .max_length = self.manifest.maxTextSequenceLength(),
             .id2label = id2label,
             .distributed = runtime.distributed.configFromEnv(),
         });

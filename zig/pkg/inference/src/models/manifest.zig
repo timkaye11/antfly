@@ -158,6 +158,7 @@ pub const ModelManifest = struct {
     num_hidden_layers: u32 = 12,
     num_attention_heads: u32 = 12,
     bert_model_type: bert.ModelType = .bert,
+    bert_pad_token_id: i64 = 0,
     config_model_arch: []const u8 = "",
 
     // Pipeline config
@@ -202,6 +203,19 @@ pub const ModelManifest = struct {
     pad_token: []const u8 = "",
     add_bos_token: bool = false,
     add_eos_token: bool = false,
+
+    pub fn maxTextSequenceLength(self: *const ModelManifest) usize {
+        const position_id_mode: bert.PositionIdMode = if (self.bert_model_type == .roberta)
+            .roberta_padding
+        else
+            .absolute;
+        const config = bert.Config{
+            .max_position_embeddings = self.max_position_embeddings,
+            .pad_token_id = self.bert_pad_token_id,
+            .position_id_mode = position_id_mode,
+        };
+        return config.maxSequenceLength();
+    }
 
     pub fn deinit(self: *ModelManifest) void {
         if (self.onnx_path) |p| self.allocator.free(p);
@@ -787,6 +801,7 @@ fn applyGgufTokenizerMetadata(
         manifest.num_hidden_layers = config.num_hidden_layers;
         manifest.num_attention_heads = config.num_attention_heads;
         manifest.bert_model_type = config.model_type;
+        manifest.bert_pad_token_id = config.pad_token_id;
     }
     if (view.getU64("bert.pooling_type")) |pooling_type| {
         manifest.pooling = switch (pooling_type) {
@@ -1041,6 +1056,9 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
     }
     if (obj.get("max_position_embeddings")) |v| {
         if (jsonU32(v)) |val| manifest.max_position_embeddings = val;
+    }
+    if (obj.get("pad_token_id")) |v| {
+        if (v == .integer) manifest.bert_pad_token_id = v.integer;
     }
     if (obj.get("num_hidden_layers")) |v| {
         if (jsonU32(v)) |val| manifest.num_hidden_layers = val;
@@ -2046,6 +2064,21 @@ test "manifest from config.json" {
     try std.testing.expectEqual(@as(u32, 6), manifest.num_hidden_layers);
     try std.testing.expectEqual(bert.ModelType.bert, manifest.bert_model_type);
     try std.testing.expectEqualStrings("bert", manifest.config_model_arch);
+}
+
+test "RoBERTa manifest reserves padding position indices" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    const config_json =
+        \\{"model_type": "roberta", "max_position_embeddings": 514, "pad_token_id": 1}
+    ;
+    try parseConfigJson(&manifest, allocator, config_json);
+
+    try std.testing.expectEqual(bert.ModelType.roberta, manifest.bert_model_type);
+    try std.testing.expectEqual(@as(i64, 1), manifest.bert_pad_token_id);
+    try std.testing.expectEqual(@as(usize, 512), manifest.maxTextSequenceLength());
 }
 
 test "manifest treats jina embeddings v5 as qwen3 embedder with last pooling" {
