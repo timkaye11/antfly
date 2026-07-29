@@ -20724,7 +20724,7 @@ pub fn deinitPackedExpertViews(data: *WeightStore, allocator: std.mem.Allocator)
 }
 
 fn metalComputeLockIo(io: ?std.Io) std.Io {
-    return io orelse if (builtin.is_test) std.testing.io else unreachable;
+    return io orelse if (builtin.is_test) std.testing.io else std.Options.debug_io;
 }
 
 pub fn deinitSharedNativeProvider(data: *WeightStore) void {

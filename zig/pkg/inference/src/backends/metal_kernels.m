@@ -40,7 +40,8 @@
 #define TERMITE_METAL_DECODE_GQA_SPLIT_COUNT 32u
 #define TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_THREADS 256u
 #define TERMITE_METAL_DECODE_GQA_SPLIT_REDUCE_THREADS 256u
-#define TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_MEMORY_BYTES 12224u
+#define TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_MEMORY_BYTES(head_dim) \
+    (48u * (uint32_t)(head_dim) + 1984u)
 #define TERMITE_METAL_DECODE_GQA_SPLIT_SCRATCH_MAX_BYTES 1052672u
 #define TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV_TOKENS 512u
 #define TERMITE_METAL_GENERATED_RMS_THREADS 256u
@@ -7365,7 +7366,9 @@ static NSString *termite_metal_shader_source(void) {
            "        for (uint dt = 0u; dt < d_tiles; ++dt) { uint d8 = uint(sgitg) * dslice + dt * 8u; simdgroup_float8x8 acc = mo[dt]; for (uint kk8 = 0u; kk8 < 4u; ++kk8) { simdgroup_half8x8 mp; simdgroup_half8x8 mv; simdgroup_load(mp, sp + kk8 * 8u, 32u); if (kc + kk8 * 8u + 8u <= p.kv_tokens) { uint phys = sphys[kk8 * 8u]; const device half *vbase = v_half + phys * p.v_row_stride + kv_head_base + d8; simdgroup_load(mv, vbase, p.v_row_stride); } else { threadgroup half *sv = (threadgroup half *)ss + uint(sgitg) * 64u; for (uint vi = uint(lane); vi < 64u; vi += 32u) { uint vr = vi / 8u; uint vc = vi - vr * 8u; uint vphys = sphys[kk8 * 8u + vr]; sv[vi] = vphys != 0xffffffffu ? v_half[vphys * p.v_row_stride + kv_head_base + d8 + vc] : half(0.0f); } simdgroup_barrier(mem_flags::mem_threadgroup); simdgroup_load(mv, sv, 8u); } simdgroup_multiply_accumulate(acc, mp, mv, acc); } mo[dt] = acc; }\n"
            "    }\n"
            "    device float *partial_stats = reinterpret_cast<device float *>(partial_o + p.q_len * p.num_heads * (hd / 4u) * 32u); if (tid < heads_per_group) { uint h = kv_h * heads_per_group + uint(tid); uint qh = qi * p.num_heads + h; partial_stats[qh * 64u + split] = sS[tid]; partial_stats[qh * 64u + 32u + split] = sM[tid]; }\n"
-           "    for (uint owner = 0u; owner < 8u; ++owner) { threadgroup_barrier(mem_flags::mem_threadgroup); if (uint(sgitg) == owner) for (uint dt = 0u; dt < d_tiles; ++dt) simdgroup_store(mo[dt], so + dt * 8u, dslice); threadgroup_barrier(mem_flags::mem_threadgroup); for (uint i = uint(tid); i < heads_per_group * (dslice / 4u); i += 256u) { uint j = i / (dslice / 4u); uint dv = i - j * (dslice / 4u); uint h = kv_h * heads_per_group + j; uint qh = qi * p.num_heads + h; uint d4 = owner * (dslice / 4u) + dv; uint so_base = j * dslice + dv * 4u; partial_o[(qh * (hd / 4u) + d4) * 32u + split] = float4(so[so_base], so[so_base + 1u], so[so_base + 2u], so[so_base + 3u]); } }\n"
+           "    threadgroup float *so_sg = so + uint(sgitg) * 8u * dslice; for (uint dt = 0u; dt < d_tiles; ++dt) simdgroup_store(mo[dt], so_sg + dt * 8u, dslice);\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    const uint hd4 = hd / 4u; const uint dslice4 = dslice / 4u; for (uint i = uint(tid); i < heads_per_group * hd4; i += 256u) { uint j = i / hd4; uint d4 = i - j * hd4; uint owner = d4 / dslice4; uint dv = d4 - owner * dslice4; uint h = kv_h * heads_per_group + j; uint qh = qi * p.num_heads + h; uint so_base = owner * 8u * dslice + j * dslice + dv * 4u; partial_o[(qh * hd4 + d4) * 32u + split] = float4(so[so_base], so[so_base + 1u], so[so_base + 2u], so[so_base + 3u]); }\n"
            "}\n"
            "// Stage 2 merges split-local (O,S,M) with the global stable softmax.\n"
            "// Split is innermost so every SIMD lane reads one coalesced float4.\n"
@@ -7783,14 +7786,14 @@ static bool termite_metal_paged_attention_1x_enabled(void) {
 }
 
 static bool termite_metal_decode_gqa_split_enabled(void) {
-    return termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_DECODE_GQA_SPLIT")) &&
+    const char *enabled = getenv("TERMITE_METAL_ENABLE_DECODE_GQA_SPLIT");
+    return (enabled == NULL || termite_metal_env_flag_enabled(enabled)) &&
         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_DECODE_GQA_SPLIT"));
 }
 
 static bool termite_metal_decode_gqa_split_shape_enabled(size_t head_dim, size_t sliding_window) {
     if (!termite_metal_decode_gqa_split_enabled()) return false;
-    // Keep both validated shapes opt-in until an end-to-end context crossover
-    // beats paged 1x. At 2K, the stage/reduce fan-out regresses decode.
+    // Both Gemma4 shapes beat paged 1x at the production 2K decode gate.
     return (head_dim == 256u && sliding_window == 512u) ||
         (head_dim == 512u && sliding_window == 0u);
 }
@@ -14074,7 +14077,7 @@ static bool termite_metal_decode_gqa_split_eligible(
     if (stage.maxTotalThreadsPerThreadgroup < TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_THREADS ||
         reduce.maxTotalThreadsPerThreadgroup < TERMITE_METAL_DECODE_GQA_SPLIT_REDUCE_THREADS ||
         stage.threadExecutionWidth != 32u || reduce.threadExecutionWidth != 32u ||
-        runtime->device.maxThreadgroupMemoryLength < TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_MEMORY_BYTES) return false;
+        runtime->device.maxThreadgroupMemoryLength < TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_MEMORY_BYTES(head_dim)) return false;
     if (scratch_bytes_out != NULL) *scratch_bytes_out = scratch_bytes;
     return true;
 }
@@ -14318,7 +14321,7 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
         const size_t split_count = kv_tokens < TERMITE_METAL_DECODE_GQA_SPLIT_COUNT * 32u
             ? 1u + (kv_tokens - 1u) / 32u
             : TERMITE_METAL_DECODE_GQA_SPLIT_COUNT;
-        [encoder setThreadgroupMemoryLength:TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_MEMORY_BYTES atIndex:0];
+        [encoder setThreadgroupMemoryLength:TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_MEMORY_BYTES(head_dim) atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake(q_len, num_kv_heads, split_count) threadsPerThreadgroup:MTLSizeMake(TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_THREADS, 1, 1)];
         const bool needs_explicit_split_barrier = runtime->active_planned_compute_encoder != encoder ||
             !termite_metal_planned_compute_barriers_enabled(runtime);
@@ -39463,7 +39466,7 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
         const size_t split_count = kv_tokens < TERMITE_METAL_DECODE_GQA_SPLIT_COUNT * 32u
             ? 1u + (kv_tokens - 1u) / 32u
             : TERMITE_METAL_DECODE_GQA_SPLIT_COUNT;
-        [encoder setThreadgroupMemoryLength:TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_MEMORY_BYTES atIndex:0];
+        [encoder setThreadgroupMemoryLength:TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_MEMORY_BYTES(head_dim) atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake(q_len, num_kv_heads, split_count) threadsPerThreadgroup:MTLSizeMake(TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_THREADS, 1, 1)];
         const bool needs_explicit_split_barrier = frame_runtime->active_planned_compute_encoder != encoder ||
             !termite_metal_planned_compute_barriers_enabled(frame_runtime);

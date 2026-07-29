@@ -215,6 +215,7 @@ done
 
 python3 - "$OUT_DIR" "$RUNS" "$OUTPUT_TOKENS" "$MAX_TOTAL_RATIO" "$MIN_DECODE_RATIO" "$MAX_CV" <<'PY'
 import json
+import os
 import re
 import statistics
 import sys
@@ -226,6 +227,12 @@ requested_tokens = int(sys.argv[3])
 max_total_ratio = float(sys.argv[4])
 min_decode_ratio = float(sys.argv[5])
 max_cv = float(sys.argv[6])
+
+def env_flag(name):
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+split_enable = os.environ.get("TERMITE_METAL_ENABLE_DECODE_GQA_SPLIT")
+expect_split_gqa = (split_enable is None or env_flag("TERMITE_METAL_ENABLE_DECODE_GQA_SPLIT")) and not env_flag("TERMITE_METAL_DISABLE_DECODE_GQA_SPLIT")
 
 def metric(text, pattern, label, path):
     match = re.search(pattern, text, re.MULTILINE)
@@ -327,14 +334,16 @@ for index in range(1, runs + 1):
     paged_calls = int(dispatch.group(1))
     split_calls = int(dispatch.group(2))
     # Compiled prefill produces the first output token. The production decoder
-    # then executes one 42-layer paged frame for each remaining token; it must
+    # then executes one 42-layer attention frame for each remaining token; it must
     # not retain or speculatively execute an additional next-token frame.
     decode_frames = requested_tokens - 1
     expected_attention = decode_frames * 42
-    if paged_calls != expected_attention or split_calls != 0:
+    expected_paged = 0 if expect_split_gqa else expected_attention
+    expected_split = expected_attention if expect_split_gqa else 0
+    if paged_calls != expected_paged or split_calls != expected_split:
         raise SystemExit(
             f"decode attention routes paged/split={paged_calls}/{split_calls}, "
-            f"expected production paged/split={expected_attention}/0: {antfly_log_path}"
+            f"expected production paged/split={expected_paged}/{expected_split}: {antfly_log_path}"
         )
 
     runtime_memory = re.search(
@@ -360,7 +369,19 @@ for index in range(1, runs + 1):
         antfly_log,
         re.MULTILINE,
     )
-    if not q4_rows or int(q4_rows.group(1)) < decode_frames * 210:
+    q4_exact = re.search(
+        r"^metal_jit_exact_dispatch:\s+q4_0=(\d+)",
+        antfly_log,
+        re.MULTILINE,
+    )
+    q4_pair_activation = re.search(
+        r"^metal_q4_0_dispatch:.*\bpair_act_reduce=(\d+)",
+        antfly_log,
+        re.MULTILINE,
+    )
+    exact_q4_calls = int(q4_exact.group(1)) if q4_exact else 0
+    fused_q4_pairs = int(q4_pair_activation.group(1)) if q4_pair_activation else 0
+    if not q4_rows or int(q4_rows.group(1)) + exact_q4_calls + 2 * fused_q4_pairs < decode_frames * 210:
         raise SystemExit(f"missing expected Q4_0 row-one decode route: {antfly_log_path}")
     if not q6_rows or int(q6_rows.group(1)) < requested_tokens:
         raise SystemExit(f"missing expected Q6_K row-one LM-head route: {antfly_log_path}")
@@ -382,6 +403,8 @@ for index in range(1, runs + 1):
         "decode_gqa_split_calls": split_calls,
         "frame_retained_mb": int(runtime_memory.group(1)),
         "q4_0_linear_reduce_rows_1": int(q4_rows.group(1)) if q4_rows else None,
+        "q4_0_exact_dispatches": exact_q4_calls,
+        "q4_0_pair_activation_dispatches": fused_q4_pairs,
         "q6_k_linear_reduce_rows_1": int(q6_rows.group(1)) if q6_rows else None,
         "q4_0_linear_reduce_encode_us": int(q4_encode.group(1)) if q4_encode else None,
     })

@@ -44,11 +44,14 @@ def main() -> None:
             antfly,
             """#!/usr/bin/env python3
 import json
+import os
 from pathlib import Path
 import sys
 
 args = sys.argv[1:]
 tokens = int(args[args.index("--max-tokens") + 1])
+split_enable = os.environ.get("TERMITE_METAL_ENABLE_DECODE_GQA_SPLIT")
+split_gqa = split_enable in (None, "1") and os.environ.get("TERMITE_METAL_DISABLE_DECODE_GQA_SPLIT") != "1"
 timing_path = Path(args[args.index("--json-timing") + 1])
 timing_path.write_text(json.dumps({
     "tokens": tokens,
@@ -63,7 +66,7 @@ print("generate-setup: live whole-model executor skipped")
 print("gen_debug: executePrefill whole-model fast path seq_len=2003")
 print("prompt_token_ids:", " ".join(str(i) for i in range(2003)))
 print("token_ids:", " ".join(str(i) for i in range(tokens)))
-print(f"metal_attention_dispatch: paged_1x={(tokens - 1) * 42} decode_gqa_split=0")
+print(f"metal_attention_dispatch: paged_1x={0 if split_gqa else (tokens - 1) * 42} decode_gqa_split={(tokens - 1) * 42 if split_gqa else 0}")
 print("metal_runtime_memory: frame_retained_mb=0")
 print(f"metal_q4_0_dispatch: linear_reduce_rows={(tokens - 1) * 210}/0/0/0")
 print(f"metal_q4_q6_k_dispatch: q6_linear_reduce_rows={tokens}/0/0/0")
@@ -100,6 +103,8 @@ print("common_perf_print: total time = 9500.00 ms")
             "COOLDOWN_SECONDS": "0",
             "MAX_CV": "0.01",
         })
+        env.pop("TERMITE_METAL_ENABLE_DECODE_GQA_SPLIT", None)
+        env.pop("TERMITE_METAL_DISABLE_DECODE_GQA_SPLIT", None)
         completed = subprocess.run(
             ["bash", str(BENCHMARK)],
             env=env,
@@ -113,8 +118,8 @@ print("common_perf_print: total time = 9500.00 ms")
         assert summary["output_tokens"] == 300
         assert summary["total_ratio"] <= 1.10
         assert summary["decode_ratio"] >= 0.90
-        assert summary["rows"][0]["paged_1x_calls"] == 12_558
-        assert summary["rows"][0]["decode_gqa_split_calls"] == 0
+        assert summary["rows"][0]["paged_1x_calls"] == 0
+        assert summary["rows"][0]["decode_gqa_split_calls"] == 12_558
         assert summary["rows"][0]["frame_retained_mb"] == 0
         assert summary["rows"][0]["q4_0_linear_reduce_rows_1"] == 62_790
         assert summary["rows"][0]["q6_k_linear_reduce_rows_1"] == 300
@@ -126,6 +131,14 @@ print("common_perf_print: total time = 9500.00 ms")
         assert summary["metadata"]["llama_cache_type_v"] == "f16"
         assert summary["metadata"]["warmup_output_tokens"] == 4
         assert summary["metadata"]["pipelined_decode_frame_enable"] is None
+
+        rollback_out = tmp / "paged-results"
+        env["OUT_DIR"] = str(rollback_out)
+        env["TERMITE_METAL_DISABLE_DECODE_GQA_SPLIT"] = "1"
+        subprocess.run(["bash", str(BENCHMARK)], env=env, check=True, text=True, capture_output=True)
+        rollback_summary = json.loads((rollback_out / "summary.json").read_text())
+        assert rollback_summary["rows"][0]["paged_1x_calls"] == 12_558
+        assert rollback_summary["rows"][0]["decode_gqa_split_calls"] == 0
 
 
 if __name__ == "__main__":

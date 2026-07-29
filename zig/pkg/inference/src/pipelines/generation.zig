@@ -624,6 +624,14 @@ fn finalResponseTokenSlice(
     return token_ids[0..0];
 }
 
+fn generationResultTokenSlice(
+    raw_token_ids: []const i64,
+    public_token_ids: []const i64,
+    return_raw_token_ids: bool,
+) []const i64 {
+    return if (return_raw_token_ids) raw_token_ids else public_token_ids;
+}
+
 fn resolveTokenId(
     tokenizer: tokenizer_mod.Tokenizer,
     allocator: std.mem.Allocator,
@@ -2622,6 +2630,9 @@ pub const NativeGenerationPipeline = struct {
     bos_token: []const u8 = "",
     chat_template: ?*const ChatTemplate = null,
     prompt_override: ?[]const u8 = null,
+    /// Local diagnostics may request the complete generated sequence. Serving
+    /// callers must keep the default so private Gemma4 channel tokens stay hidden.
+    return_raw_token_ids: bool = false,
     print_timing: bool = false,
     model_dir: ?[]const u8 = null,
     artifact_dir: ?[]const u8 = null,
@@ -3720,9 +3731,9 @@ pub const NativeGenerationPipeline = struct {
             );
         }
 
-        // Decode only the generated tokens. Channel-aware models project both the
-        // public text and public token IDs from the same slice so callers cannot
-        // reconstruct a withheld reasoning channel from GenerationResult.token_ids.
+        // Decode only the generated tokens. By default channel-aware models
+        // project public text and token IDs from the same slice. The explicit
+        // local diagnostic opt-in may retain raw IDs while text stays public.
         const gen_start = prompt_token_count;
         const final_channel_end_token_id = streaming_text.final_channel_end_token_id;
         const turn_end_token_id = streaming_text.turn_end_token_id;
@@ -3734,12 +3745,25 @@ pub const NativeGenerationPipeline = struct {
             streaming_text.channel_start_token_id,
             turn_end_token_id,
         );
-        const projected_gen_ids = try allocator.alloc(i32, projected_gen_token_ids.len);
-        errdefer allocator.free(projected_gen_ids);
-        for (projected_gen_token_ids, 0..) |token_id, idx| projected_gen_ids[idx] = @intCast(token_id);
+        const raw_gen_token_ids = token_ids[gen_start..seq_len];
+        const result_gen_token_ids = generationResultTokenSlice(
+            raw_gen_token_ids,
+            projected_gen_token_ids,
+            self.return_raw_token_ids,
+        );
+        const result_gen_ids = try allocator.alloc(i32, result_gen_token_ids.len);
+        errdefer allocator.free(result_gen_ids);
+        for (result_gen_token_ids, 0..) |token_id, idx| result_gen_ids[idx] = @intCast(token_id);
+
+        const text_gen_ids = if (self.return_raw_token_ids) blk: {
+            const ids = try allocator.alloc(i32, projected_gen_token_ids.len);
+            for (projected_gen_token_ids, 0..) |token_id, idx| ids[idx] = @intCast(token_id);
+            break :blk ids;
+        } else result_gen_ids;
+        defer if (self.return_raw_token_ids) allocator.free(text_gen_ids);
 
         const text_decode_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
-        const text = try self.tokenizer.decode(allocator, projected_gen_ids);
+        const text = try self.tokenizer.decode(allocator, text_gen_ids);
         const finished_generate_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         const timing_ms: ?GenerationTimingMs = if (self.io != null) .{
             .prompt_format = timestampDurationMillis(started_at, formatted_prompt_at),
@@ -3796,7 +3820,7 @@ pub const NativeGenerationPipeline = struct {
         }
         return .{
             .text = text,
-            .token_ids = projected_gen_ids,
+            .token_ids = result_gen_ids,
             .prompt_tokens = prompt_token_count,
             .tokens_used = tokens_generated,
             .finish_reason = finish_reason,
@@ -9691,6 +9715,14 @@ test "final channel projection requires exact header and stops before trailing c
         &.{ 7, 8 },
         finalResponseTokenSlice(&.{ 7, 8 }, false, null, &.{}, null, null),
     );
+}
+
+test "raw token diagnostics retain private generated ids" {
+    const raw = [_]i64{ 7, 8 };
+    const public = finalResponseTokenSlice(&raw, true, 101, &.{ 102, 103, 104, 101 }, 102, 106);
+    try std.testing.expectEqual(@as(usize, 0), public.len);
+    try std.testing.expectEqualSlices(i64, &raw, generationResultTokenSlice(&raw, public, true));
+    try std.testing.expectEqualSlices(i64, public, generationResultTokenSlice(&raw, public, false));
 }
 
 test "streaming final channel projection ignores intermediate boundaries and streams final text" {

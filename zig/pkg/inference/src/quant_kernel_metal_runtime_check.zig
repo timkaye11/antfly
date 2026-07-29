@@ -1296,16 +1296,16 @@ const SplitGqaSelectionCheck = struct {
     expect_route: bool,
 };
 
-// Production defaults keep split GQA off at every measured boundary. The
-// explicit-opt-in checks above still cover both validated kernel shapes.
+// Production defaults use split GQA at and above the validated 512-token
+// crossover; the explicit disable flag remains the rollback path.
 const split_gqa_production_selection_checks = [_]SplitGqaSelectionCheck{
     .{ .check = .{ .name = "decode_gqa_default_global_kv511", .shape = .{ .q_len = 1, .kv_tokens = 511, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 510, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = false },
-    .{ .check = .{ .name = "decode_gqa_default_global_kv512", .shape = .{ .q_len = 1, .kv_tokens = 512, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 511, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = false },
-    .{ .check = .{ .name = "decode_gqa_default_global_kv513", .shape = .{ .q_len = 2, .kv_tokens = 513, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 511, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = false },
-    .{ .check = .{ .name = "decode_gqa_default_global_kv4095", .shape = .{ .q_len = 1, .kv_tokens = 4095, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 4094, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = false },
-    .{ .check = .{ .name = "decode_gqa_default_global_kv4096", .shape = .{ .q_len = 1, .kv_tokens = 4096, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 4095, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = false },
-    .{ .check = .{ .name = "decode_gqa_default_global_kv4097", .shape = .{ .q_len = 1, .kv_tokens = 4097, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 4096, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = false },
-    .{ .check = .{ .name = "decode_gqa_default_local_stays_paged", .shape = .{ .q_len = 1, .kv_tokens = 512, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 511, .sliding_window = 512, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = false },
+    .{ .check = .{ .name = "decode_gqa_default_global_kv512", .shape = .{ .q_len = 1, .kv_tokens = 512, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 511, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = true },
+    .{ .check = .{ .name = "decode_gqa_default_global_kv513", .shape = .{ .q_len = 2, .kv_tokens = 513, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 511, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = true },
+    .{ .check = .{ .name = "decode_gqa_default_global_kv4095", .shape = .{ .q_len = 1, .kv_tokens = 4095, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 4094, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = true },
+    .{ .check = .{ .name = "decode_gqa_default_global_kv4096", .shape = .{ .q_len = 1, .kv_tokens = 4096, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 4095, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = true },
+    .{ .check = .{ .name = "decode_gqa_default_global_kv4097", .shape = .{ .q_len = 1, .kv_tokens = 4097, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 4096, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = true },
+    .{ .check = .{ .name = "decode_gqa_default_local_split", .shape = .{ .q_len = 1, .kv_tokens = 512, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 511, .sliding_window = 512, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = true },
 };
 
 const FlashPrefillCheckCase = struct {
@@ -2083,7 +2083,7 @@ test "quant kernel metal runtime split GQA checks cover production shapes and po
     try std.testing.expectEqual(@as(usize, 2), hd512_count);
 }
 
-test "quant kernel metal runtime split GQA production policy defaults off across exact KV boundaries" {
+test "quant kernel metal runtime split GQA production policy starts at 512 tokens" {
     try std.testing.expectEqual(@as(usize, 7), split_gqa_production_selection_checks.len);
     const expected_kv = [_]usize{ 511, 512, 513, 4095, 4096, 4097 };
     for (expected_kv) |kv_tokens| {
@@ -2091,7 +2091,7 @@ test "quant kernel metal runtime split GQA production policy defaults off across
         for (split_gqa_production_selection_checks) |selection| {
             if (selection.check.shape.head_dim == 512 and selection.check.shape.kv_tokens == kv_tokens) {
                 found = true;
-                try std.testing.expect(!selection.expect_route);
+                try std.testing.expectEqual(kv_tokens >= 512, selection.expect_route);
             }
         }
         try std.testing.expect(found);
@@ -2099,7 +2099,7 @@ test "quant kernel metal runtime split GQA production policy defaults off across
     const local = split_gqa_production_selection_checks[split_gqa_production_selection_checks.len - 1];
     try std.testing.expectEqual(@as(usize, 256), local.check.shape.head_dim);
     try std.testing.expectEqual(@as(usize, 512), local.check.shape.sliding_window);
-    try std.testing.expect(!local.expect_route);
+    try std.testing.expect(local.expect_route);
 }
 
 test "quant kernel metal runtime GQA attention CPU oracle matches an independent reference" {
