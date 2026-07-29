@@ -768,12 +768,16 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (opts.print_timing and kv_dtype != requested_kv_dtype) {
         print("cache_dtype_effective: requested={s} effective={s}\n", .{ @tagName(requested_kv_dtype), @tagName(kv_dtype) });
     }
-    const budget_backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
-        .native => .cpu,
-        else => .gpu,
-    };
+    const budget_backend_class: runtime.tier.memory.BackendClass =
+        if (backend_kind != .native or (draft_backend_kind != null and draft_backend_kind.? != .native))
+            .gpu
+        else
+            .cpu;
     var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
     budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
+    if (draft_model) |loaded| {
+        budget_limits = session_factory.widenBudgetLimitsForSession(loaded.session, budget_limits);
+    }
     budget_limits = applyBudgetOverrides(budget_limits, opts);
     if (draft_model) |loaded| {
         const draft_budget_backend_class: runtime.tier.memory.BackendClass = switch (draft_backend_kind.?) {
@@ -5773,7 +5777,7 @@ fn runOnnxWholeModelGraphGenerate(
         budget_limits.backend_limit_bytes / (1024 * 1024),
         budget_limits.combined_limit_bytes / (1024 * 1024),
     });
-    run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
+    run_budget.reserveEstimate(try runtime.tier.memory.estimateGptGeneration(
         backend_kind,
         kv_dtype,
         gpt_config,
@@ -6897,9 +6901,10 @@ fn estimateModelArtifactBytes(
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
 ) !usize {
-    if (manifest.gguf_path) |path| return @intCast(try c_file.fileSize(allocator, path));
-    if (manifest.safetensors_path) |path| return @intCast(try c_file.fileSize(allocator, path));
-    return 0;
+    return std.math.cast(
+        usize,
+        try session_factory.estimateNativeWeightBytes(allocator, manifest.*),
+    ) orelse error.ResourceLimitExceeded;
 }
 
 fn estimatePreflightWeightBytes(

@@ -224,6 +224,8 @@ pub const Config = struct {
         max_concurrent_requests: ?usize = null,
         kernel_jit: KernelJitConfig = .{},
         prompt_cache: PromptCacheConfig = .{},
+        keep_alive: ?[]u8 = null,
+        max_loaded_models: ?i64 = null,
 
         fn deinit(self: *InferenceConfig, alloc: std.mem.Allocator) void {
             if (self.api_url) |value| alloc.free(value);
@@ -235,6 +237,7 @@ pub const Config = struct {
             for (self.preload) |*model| model.deinit(alloc);
             if (self.preload.len > 0) alloc.free(self.preload);
             self.kernel_jit.deinit(alloc);
+            if (self.keep_alive) |value| alloc.free(value);
             self.* = undefined;
         }
     };
@@ -656,6 +659,8 @@ pub const Config = struct {
                     null,
                 .kernel_jit = kernel_jit,
                 .prompt_cache = prompt_cache,
+                .keep_alive = if (inference.keep_alive) |value| try alloc.dupe(u8, value) else null,
+                .max_loaded_models = inference.max_loaded_models,
             } else .{},
             .remote_content = if (raw_root.get("remote_content")) |remote_content|
                 try parseRemoteContentConfig(alloc, remote_content)
@@ -2160,6 +2165,8 @@ test "common config extracts antfly settings" {
         \\      "min_tokens": 48,
         \\      "ttl_ms": 120000
         \\    },
+        \\    "keep_alive": "1m30s",
+        \\    "max_loaded_models": 4,
         \\    "preload": [
         \\      { "kind": "generator", "name": "antflydb/gemma-e2b", "backend": "metal", "format": "gguf", "quantization": "q4_k" }
         \\    ],
@@ -2195,6 +2202,8 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqual(@as(usize, 256), cfg.inference.prompt_cache.max_bytes_mb);
     try std.testing.expectEqual(@as(usize, 48), cfg.inference.prompt_cache.min_tokens);
     try std.testing.expectEqual(@as(u64, 120_000), cfg.inference.prompt_cache.ttl_ms);
+    try std.testing.expectEqualStrings("1m30s", cfg.inference.keep_alive.?);
+    try std.testing.expectEqual(@as(?i64, 4), cfg.inference.max_loaded_models);
     try std.testing.expectEqual(@as(usize, 1), cfg.inference.preload.len);
     try std.testing.expectEqualStrings("generator", cfg.inference.preload[0].kind);
     try std.testing.expectEqualStrings("antflydb/gemma-e2b", cfg.inference.preload[0].name);

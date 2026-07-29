@@ -64,6 +64,7 @@ pub const SpawnedServer = struct {
 const EmbeddedServerConfig = struct {
     api_url: []const u8,
     models_dir: ?[]const u8 = null,
+    allow_unknown_models: bool = false,
     ml_dir: ?[]const u8 = null,
     content_security: ?common_config.Config.ContentSecurityConfig = null,
     s3_credentials: ?common_config.Config.S3CredentialsConfig = null,
@@ -236,6 +237,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var kernel_jit_max_cache_bytes_mb_override: ?usize = null;
     var kernel_jit_preload_budget_ms_override: ?u64 = null;
     var allow_insecure_public_bind = false;
+    var allow_unknown_models = false;
     var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
     defer preload_models.deinit(alloc);
 
@@ -278,6 +280,8 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
             );
         } else if (std.mem.eql(u8, arg, "--allow-insecure-public-bind")) {
             allow_insecure_public_bind = true;
+        } else if (std.mem.eql(u8, arg, "--allow-unknown-models")) {
+            allow_unknown_models = true;
         } else {
             return error.InvalidArguments;
         }
@@ -307,9 +311,13 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         .preload = preload_models.items,
         .kernel_jit = kernel_jit,
         .allow_insecure_public_bind = allow_insecure_public_bind,
+        .allow_unknown_models = allow_unknown_models,
     });
     defer node.deinit();
 
+    // Bind the caller-owned runtime before warmup so model loading, tokenizer
+    // work, and backend sessions all compose with the same executor.
+    node.attachIo(io);
     try node.warmConfiguredGenerators(alloc);
     std.debug.print("listening on {s}:{d}\n", .{ host, port });
     try node.serve(alloc, io, host, port);
@@ -330,6 +338,7 @@ pub fn spawnServerProcess(
         .generation_budget_overrides = config.generation_budget_overrides,
         .preload = config.preload,
         .allow_insecure_public_bind = config.allow_insecure_public_bind,
+        .allow_unknown_models = config.allow_unknown_models,
     };
     if (config.content_security) |sec| node_cfg.content_security = sec;
     if (config.s3_credentials) |creds| node_cfg.s3_credentials = creds;
@@ -355,6 +364,7 @@ pub fn spawnServerProcess(
 fn serveThread(node: *inference.server.Node, alloc: std.mem.Allocator, host: []const u8, port: u16) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
+    node.attachIo(io_impl.io());
     node.warmConfiguredGenerators(alloc) catch |err| {
         std.debug.print("inference warmup error: {}\n", .{err});
         return;
@@ -647,6 +657,7 @@ fn printUsage() void {
         \\  --kernel-jit-max-cache-mb <n> Persistent JIT cache limit; 0 disables persistence
         \\  --kernel-jit-preload-budget-ms <n> Per-session best-effort startup JIT budget
         \\  --preload-model <kind:name|kind:backend:name>  Preload and warm a configured model before serving
+        \\  --allow-unknown-models  Permit artifacts whose compatibility cannot be proven; known incompatible models remain blocked
         \\
         \\Pull options:
         \\  --token <token>  HuggingFace API token (or set HF_TOKEN env var)

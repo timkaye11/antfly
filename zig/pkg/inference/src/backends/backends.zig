@@ -18,6 +18,7 @@ const manifest_mod = @import("../models/manifest.zig");
 const c_file = @import("../util/c_file.zig");
 const kernel_jit_mod = @import("../graph/kernel_jit.zig");
 const graph_runtime_mod = @import("../graph/runtime.zig");
+const backend_runtime_mod = @import("backend_runtime.zig");
 
 pub const Session = @import("session.zig").Session;
 pub const Tensor = @import("tensor.zig").Tensor;
@@ -33,6 +34,7 @@ pub const onnx = if (build_options.enable_onnx) @import("onnx.zig") else struct 
 pub const ortgenai = if (build_options.enable_onnx) @import("ortgenai.zig") else struct {};
 pub const imported_onnx_session = @import("imported_onnx_session.zig");
 pub const metal_kv_storage = if (build_options.enable_metal) @import("metal_kv_storage.zig") else struct {};
+pub const OnnxExecutionProvider = backend_runtime_mod.OnnxExecutionProvider;
 
 const session_factory = @import("../architectures/session_factory.zig");
 
@@ -89,6 +91,33 @@ pub const BackendType = enum {
     }
 };
 
+/// A backend plus the concrete execution provider that determines its resource
+/// domain. In particular, external ONNX Runtime sessions are not inherently
+/// CPU: an automatically selected CUDA provider must be admitted as GPU work.
+pub const BackendRuntime = struct {
+    backend: BackendType,
+    onnx_execution_provider: OnnxExecutionProvider = .cpu,
+
+    pub fn usesGpuHostedSession(self: BackendRuntime) bool {
+        return switch (self.backend) {
+            .metal, .cuda => true,
+            .onnx => self.onnx_execution_provider == .cuda,
+            else => false,
+        };
+    }
+};
+
+test "backend runtime classifies external ONNX CUDA as GPU hosted" {
+    try std.testing.expect(!(BackendRuntime{
+        .backend = .onnx,
+        .onnx_execution_provider = .cpu,
+    }).usesGpuHostedSession());
+    try std.testing.expect((BackendRuntime{
+        .backend = .onnx,
+        .onnx_execution_provider = .cuda,
+    }).usesGpuHostedSession());
+}
+
 const backend_order_capacity = std.meta.fields(BackendType).len;
 
 /// SessionManager selects the best available backend and creates sessions.
@@ -98,6 +127,13 @@ pub const SessionManager = struct {
     graph_runtime_strategy: ?graph_runtime_mod.Strategy = null,
     kernel_jit: kernel_jit_mod.Config = .{},
     kernel_jit_load_context: kernel_jit_mod.LoadContext = .dynamic,
+    /// Provider preference for the external ONNX Runtime backend. Automatic is
+    /// resolved before admission; candidate SessionManagers then carry only
+    /// the resolved CPU/CUDA value through construction.
+    onnx_execution_provider: OnnxExecutionProvider = .automatic,
+    /// Per-session CUDA allocation ceiling. ModelManager sets this to the
+    /// model-residency plus pre-admitted workspace reservation.
+    onnx_cuda_memory_limit_bytes: usize = std.math.maxInt(usize),
     /// Optional Io runtime threaded into compute backends so parallel GEMM
     /// dispatch goes through the caller's thread pool (linalg.sgemm*Io).
     /// Null means backends use the process-wide futex pool inside lib/linalg.
@@ -148,6 +184,12 @@ pub const SessionManager = struct {
             if (manifest) |m| m else null,
         );
 
+        // Every backend below logs its failure and moves on, so without this the caller
+        // only ever sees a blanket NoBackendAvailable. The actionable cause -- a GGUF
+        // whose tensors could not be resolved fails with MissingRequiredWeights -- was
+        // reaching the log but never the API response.
+        var first_err: ?anyerror = null;
+
         for (effective_backends) |backend| {
             if (!backend.available()) continue;
             if (!backend.supportsDirectSessionLoad()) {
@@ -157,6 +199,14 @@ pub const SessionManager = struct {
                 );
                 continue;
             }
+            const backend_runtime = self.resolveBackendRuntime(backend) catch |err| {
+                std.log.err(
+                    "backend {s} runtime resolution failed: {s}",
+                    .{ @tagName(backend), @errorName(err) },
+                );
+                first_err = first_err orelse err;
+                continue;
+            };
             const effective_model_path = switch (backend) {
                 .onnx, .wasm => if (manifest) |m| m.onnx_path orelse model_path else model_path,
                 else => model_path,
@@ -171,14 +221,19 @@ pub const SessionManager = struct {
             const session = switch (backend) {
                 .onnx => if (comptime build_options.enable_onnx) blk: {
                     if (!isOnnxFilePath(effective_model_path)) continue;
-                    break :blk onnx.createSession(self.allocator, effective_model_path) catch |err| {
+                    break :blk onnx.createSessionWithOptions(self.allocator, effective_model_path, .{
+                        .execution_provider = backend_runtime.onnx_execution_provider,
+                        .cuda_memory_limit_bytes = self.onnx_cuda_memory_limit_bytes,
+                    }) catch |err| {
                         std.log.err("onnx runtime session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
+                        first_err = first_err orelse err;
                         continue;
                     };
                 } else continue,
                 .metal => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .metal, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx metal session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
+                        first_err = first_err orelse err;
                         continue;
                     }
                 else if (build_options.enable_metal)
@@ -191,6 +246,7 @@ pub const SessionManager = struct {
                         std.log.err("Metal session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         if (self.kernel_jit.qualified_profile_path != null or self.kernel_jit.profile_capture_only) return err;
                         if (kernel_jit_mod.isRequiredFailure(self.kernel_jit.mode, err)) return err;
+                        first_err = first_err orelse err;
                         continue;
                     }
                 else
@@ -198,6 +254,7 @@ pub const SessionManager = struct {
                 .cuda => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .cuda, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx CUDA session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
+                        first_err = first_err orelse err;
                         continue;
                     }
                 else if (build_options.enable_cuda)
@@ -209,6 +266,7 @@ pub const SessionManager = struct {
                     ) catch |err| {
                         std.log.err("CUDA session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         if (kernel_jit_mod.isRequiredFailure(self.kernel_jit.mode, err)) return err;
+                        first_err = first_err orelse err;
                         continue;
                     }
                 else
@@ -216,16 +274,19 @@ pub const SessionManager = struct {
                 .native => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx native session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
+                        first_err = first_err orelse err;
                         continue;
                     }
                 else
                     session_factory.createNativeSession(self.allocator, model_path) catch |err| {
                         std.log.err("native session create failed for {s}: {s}", .{ model_path, @errorName(err) });
+                        first_err = first_err orelse err;
                         continue;
                     },
                 .wasm => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
                     self.createImportedOnnxSession(effective_model_path, .wasm, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx wasm session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
+                        first_err = first_err orelse err;
                         continue;
                     }
                 else
@@ -256,7 +317,8 @@ pub const SessionManager = struct {
         }
         if (self.kernel_jit.qualified_profile_path != null or self.kernel_jit.profile_capture_only) return error.KernelJitProfileRequiresMetalBackend;
         if (self.kernel_jit.mode.failClosed()) return error.KernelJitRequiredBackendUnavailable;
-        return error.NoBackendAvailable;
+        // NoBackendAvailable only when no backend produced a real error.
+        return first_err orelse error.NoBackendAvailable;
     }
 
     fn createImportedOnnxSession(
@@ -296,6 +358,22 @@ pub const SessionManager = struct {
                 backend.supportsDirectSessionLoad()) return backend;
         }
         return null;
+    }
+
+    pub fn resolveBackendRuntime(
+        self: *const SessionManager,
+        backend: BackendType,
+    ) !BackendRuntime {
+        return .{
+            .backend = backend,
+            .onnx_execution_provider = if (backend == .onnx)
+                if (comptime build_options.enable_onnx)
+                    try onnx.resolveExecutionProvider(self.onnx_execution_provider)
+                else
+                    return error.BackendUnavailable
+            else
+                .cpu,
+        };
     }
 };
 
@@ -448,14 +526,16 @@ fn shouldPreferBlasBeforeGpu(allocator: std.mem.Allocator, manifest: ?manifest_m
     if (build_options.enable_wasm) return false;
     const man = manifest orelse return false;
     if (man.model_type == .generator) return false;
-    const gguf_path = man.gguf_path orelse return false;
+    if (!man.usesGgufWeights()) return false;
+    const gguf_path = man.gguf_path.?;
     const total_bytes = c_file.fileSize(allocator, gguf_path) catch return true;
     return shouldPreferBlasBeforeGpuForBytes(total_bytes, gpuEagerDenseMaxBytes());
 }
 
 fn shouldPreferNativeTextEncoder(man: manifest_mod.ModelManifest) bool {
     if (man.model_type != .embedder) return false;
-    if (man.safetensors_path == null and man.safetensors_index_path == null) return false;
+    const artifact = man.nativeWeightArtifactKind() orelse return false;
+    if (artifact != .safetensors and artifact != .sharded_safetensors) return false;
     return man.onnx_path != null and
         man.visual_model_path == null and
         man.audio_model_path == null and

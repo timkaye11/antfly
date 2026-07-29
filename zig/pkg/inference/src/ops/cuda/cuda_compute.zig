@@ -26,6 +26,7 @@ const tensor_store_mod = @import("../../models/tensor_store.zig");
 const c_file = @import("../../util/c_file.zig");
 const native_compute_mod = @import("../native_compute.zig");
 const run_memory = @import("../../runtime/tier/memory.zig");
+const load_plan = @import("load_plan.zig");
 const gguf_tensor_types = @import("../../gguf/tensor_types.zig");
 const quant_codec = @import("../../gguf/quant_codec.zig");
 const backend_contracts = @import("../../graph/backend_contracts.zig");
@@ -2302,11 +2303,11 @@ const CudaKvDeviceStorage = struct {
 };
 
 fn cudaDequantizeQuantWeightsOnUpload() bool {
-    return platform.env.getenvBoolDefault("TERMITE_CUDA_DEQUANTIZE_QUANT_WEIGHTS", false);
+    return load_plan.dequantizeAllWeights();
 }
 
 fn cudaDequantizeQ4_0MatrixWeightsToBf16OnUpload() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DEQUANTIZE_Q4_0_MATRIX_WEIGHTS_BF16", false);
+    return load_plan.dequantizeQ4_0ToBf16();
 }
 
 fn cudaPleModelProjectionBf16OnUpload() bool {
@@ -2516,7 +2517,7 @@ fn cudaShouldDequantizeQ4_0MatrixWeightToBf16OnUpload(name: []const u8, storage:
 // kernels AND attach a dequantized BF16 copy consumed by cuBLASLt when
 // rows > 1 (prefill). Costs ~2 bytes/param extra device memory.
 fn cudaHybridQ4Bf16WeightsEnabled() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL", false);
+    return load_plan.retainQ4_0Bf16Mirror();
 }
 
 // Qualified-performance target: production parity and performance evidence
@@ -2749,10 +2750,7 @@ fn mxbaiQ4TiledVariant(rows: usize, in_dim: usize, out_dim: usize) ?kernels_mod.
 }
 
 fn cudaTensorCoreQuantRequested() bool {
-    return switch (cudaQMatmulVariantChoice()) {
-        .auto, .tc_hmma => true,
-        .legacy, .fast_r2c4, .fast_r2c8, .fast_r4c4 => false,
-    };
+    return load_plan.tensorCorePackedWeightsRequested();
 }
 
 fn cudaTensorCoreQuantAvailable(self: *const CudaCompute) bool {

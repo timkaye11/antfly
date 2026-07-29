@@ -24,11 +24,10 @@ class InferencePromptCacheConfig:
             scalable production mode. `simple` keeps the linear-scan retained-prefix
             cache and is only suitable for small caches or debugging.
              Default: InferencePromptCacheConfigMode.BLOCK_HASH.
-        max_bytes_mb (int | Unset): Node-wide target for live entries in the single process-stable model cache.
-            The first model to activate prompt caching owns it for the process lifetime;
-            requests to other models bypass prompt caching. The owner evicts using
-            estimated metadata and logical host/device KV bytes. Backend allocators may
-            retain reusable capacity, so this is not a hard process or accelerator cap.
+        max_bytes_mb (int | Unset): Node-wide target for live prompt-cache entries. The runtime divides it
+            across participating model caches and evicts using estimated metadata
+            and logical host/device KV bytes. Backend allocators may retain reusable
+            capacity, so this is not a hard cap on process or accelerator memory.
              Default: 512.
         min_tokens (int | Unset): Minimum prompt length eligible for prompt KV caching. Default: 64.
         ttl_ms (int | Unset): Idle time-to-live for prompt KV cache entries. Refreshed on every cache

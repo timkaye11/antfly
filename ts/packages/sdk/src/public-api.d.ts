@@ -424,8 +424,12 @@ export interface paths {
          *     - Table metadata (schema, indexes, shard configuration)
          *     - All shard data (compressed with zstd)
          *
-         *     The backup creates a cluster-level manifest that tracks all included tables
-         *     and their individual backup locations.
+         *     A non-empty backup publishes a cluster-level manifest only after every
+         *     requested table backup is durable. The manifest is the final commit
+         *     point and records complete expected/completed table counts. A `partial`
+         *     or `failed` attempt returns per-table diagnostics but does not publish a
+         *     restorable aggregate manifest. A cluster with no selected tables returns
+         *     `400` without writing a backup artifact.
          *
          *     Backup IDs are immutable. Reusing an ID that already has a published
          *     cluster manifest returns `409` and leaves the existing backup unchanged.
@@ -4424,14 +4428,16 @@ export interface components {
              */
             fields?: string[];
             /**
-             * @description Antfly query to filter documents. Only documents matching this query
-             *     are included in results. Uses the sear library for efficient per-document
-             *     matching without requiring a full index.
+             * @description Structured subset of the Antfly query AST used to filter a primary-key
+             *     scan. Only documents matching this query are included in results.
+             *     Because scans do not open a text index, text-index-only variants such
+             *     as phrase and multi-match queries are rejected with a validation error
+             *     instead of being evaluated with slower stored-document semantics.
              *
              *     Examples:
-             *     - Status filtering: `{"query": "status:published"}`
-             *     - Date ranges: `{"query": "created_at:>2023-01-01"}`
-             *     - Field matching: `{"query": "category:technology"}`
+             *     - Status filtering: `{"term":{"path":"/status","value":"published"}}`
+             *     - Date ranges: `{"range":{"/created_at":{"gte":"2023-01-01"}}}`
+             *     - Field existence: `{"exists":{"path":"/category"}}`
              */
             filter_query?: components["schemas"]["RawQuery"];
             /**
@@ -5838,12 +5844,12 @@ export interface components {
              *
              *     Boolean clauses are normalized before planning:
              *     - `bool.must` is scoring query input.
-             *     - `bool.filter` is a non-scoring structured filter.
-             *     - `bool.must_not` is a structured exclusion filter.
+             *     - `bool.filter` is non-scoring query input.
+             *     - `bool.must_not` is non-scoring exclusion query input.
              *
-             *     The same AST accepts direct structured filters using `field` or JSON-pointer
-             *     `path`, scalar `term` values, multi-value `terms`, and `exists`.
-             *     Query-string objects remain supported as a full-text escape hatch.
+             *     Filter branches accept the same query variants as `filter_query` and
+             *     `exclusion_query`. Structured clauses use the native document-value
+             *     path; text clauses are resolved through the text index before scoring.
              * @example {
              *       "bool": {
              *         "must": [
@@ -8933,11 +8939,8 @@ export interface components {
              * @description Projection generation associated with the durable checkpoint.
              */
             projection_checkpoint_generation?: number;
-            /**
-             * Format: uint64
-             * @description Projection configuration identity associated with the durable checkpoint.
-             */
-            projection_checkpoint_config_hash?: number;
+            /** @description Projection configuration identity associated with the durable checkpoint. */
+            projection_checkpoint_config_fingerprint?: string;
             /**
              * Format: uint64
              * @description Number of derived-log sequences after the durable checkpoint that still need replay.
@@ -9037,6 +9040,80 @@ export interface components {
             /** @description Whether coverage is complete under best_effort but includes terminal failures. */
             degraded: boolean;
         };
+        /** @description Runtime state for the durable embeddings enrichment worker. */
+        EnrichmentRuntimeStatus: {
+            enabled: boolean;
+            /** Format: uint64 */
+            target_sequence: number;
+            /** Format: uint64 */
+            applied_sequence: number;
+            /** Format: uint64 */
+            pending_sequence_count: number;
+            projection_checkpoint_status: string;
+            /** Format: uint64 */
+            projection_checkpoint_applied_sequence: number;
+            /** Format: uint64 */
+            projection_checkpoint_generation: number;
+            projection_checkpoint_config_fingerprint: string;
+            /** @description Whether every shard contributing to this status reports the same checkpoint generation and configuration identity. */
+            projection_checkpoint_identity_consistent: boolean;
+            /** Format: uint64 */
+            checkpoint_replay_tail_sequence_count: number;
+            /** Format: uint64 */
+            processed_requests: number;
+            /** Format: uint64 */
+            error_count: number;
+            /** Format: uint64 */
+            retryable_error_count: number;
+            /** Format: uint64 */
+            fatal_error_count: number;
+            retrying: boolean;
+            worker_failed: boolean;
+            /** @description Whether the background enrichment worker is currently running. */
+            worker_started: boolean;
+            /** @description Whether work is pending with no running worker, retry, or terminal failure explaining the backlog. */
+            stalled: boolean;
+            /** Format: uint64 */
+            skip_by_hash_count: number;
+            /** Format: uint64 */
+            skipped_source_count: number;
+            /** Format: uint64 */
+            codec_decode_failures: number;
+            /** Format: uint64 */
+            embed_batches_started: number;
+            /** Format: uint64 */
+            embed_batches_completed: number;
+            /** Format: uint64 */
+            embed_items_started: number;
+            /** Format: uint64 */
+            embed_items_completed: number;
+            /** Format: uint64 */
+            active_embed_batch_items: number;
+            /** Format: uint64 */
+            active_embed_batch_bytes: number;
+            /** Format: uint64 */
+            active_embed_batch_max_bytes: number;
+            /** Format: uint64 */
+            active_embed_batch_started_ms: number;
+            /** Format: uint64 */
+            last_embed_batch_items: number;
+            /** Format: uint64 */
+            last_embed_batch_bytes: number;
+            /** Format: uint64 */
+            last_embed_batch_max_bytes: number;
+            /**
+             * Format: uint64
+             * @description Wall-clock completion time in Unix milliseconds for the most recently completed embedding batch.
+             */
+            last_embed_batch_completed_ms: number;
+            /**
+             * Format: uint64
+             * @description Elapsed duration in nanoseconds for the most recently completed embedding batch.
+             */
+            last_embed_batch_ns: number;
+            /** Format: uint64 */
+            total_embed_ns: number;
+        };
         /** @description Statistics for an embeddings index (dense or sparse) */
         EmbeddingsIndexStats: {
             /**
@@ -9129,13 +9206,7 @@ export interface components {
             catch_up_applied_sequence?: number;
             /** Format: uint64 */
             catch_up_target_sequence?: number;
-            /** @description Embedding enrichment worker runtime diagnostics. */
-            enrichment_runtime?: {
-                /** Format: uint64 */
-                pending_sequence_count?: number;
-            } & {
-                [key: string]: unknown;
-            };
+            enrichment_runtime?: components["schemas"]["EnrichmentRuntimeStatus"];
             hbc_cache?: {
                 [key: string]: unknown;
             };
@@ -9157,11 +9228,8 @@ export interface components {
              * @description Projection generation associated with the durable checkpoint.
              */
             projection_checkpoint_generation?: number;
-            /**
-             * Format: uint64
-             * @description Projection configuration identity associated with the durable checkpoint.
-             */
-            projection_checkpoint_config_hash?: number;
+            /** @description Projection configuration identity associated with the durable checkpoint. */
+            projection_checkpoint_config_fingerprint?: string;
             /**
              * Format: uint64
              * @description Number of derived-log sequences after the durable checkpoint that still need replay.
@@ -9292,11 +9360,8 @@ export interface components {
              * @description Projection generation associated with the durable checkpoint.
              */
             projection_checkpoint_generation?: number;
-            /**
-             * Format: uint64
-             * @description Projection configuration identity associated with the durable checkpoint.
-             */
-            projection_checkpoint_config_hash?: number;
+            /** @description Projection configuration identity associated with the durable checkpoint. */
+            projection_checkpoint_config_fingerprint?: string;
             /**
              * Format: uint64
              * @description Number of derived-log sequences after the durable checkpoint that still need replay.
@@ -9470,11 +9535,8 @@ export interface components {
              * @description Projection generation associated with the durable checkpoint.
              */
             projection_checkpoint_generation?: number;
-            /**
-             * Format: uint64
-             * @description Projection configuration identity associated with the durable checkpoint.
-             */
-            projection_checkpoint_config_hash?: number;
+            /** @description Projection configuration identity associated with the durable checkpoint. */
+            projection_checkpoint_config_fingerprint?: string;
             /**
              * Format: uint64
              * @description Number of derived-log sequences after the durable checkpoint that still need replay.
@@ -10399,18 +10461,11 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
-        /** @description The fuzziness of the query. Can be an integer or "auto". */
-        Fuzziness: number | "auto";
         MatchQuery: {
             match: string;
             field?: string;
             analyzer?: string;
             boost?: components["schemas"]["Boost"];
-            /** Format: int32 */
-            prefix_length?: number;
-            fuzziness?: components["schemas"]["Fuzziness"];
-            /** @enum {string} */
-            operator?: "or" | "and";
         };
         MultiMatchBody: {
             query: string;
@@ -10422,6 +10477,8 @@ export interface components {
         MultiMatchQuery: {
             multi_match: components["schemas"]["MultiMatchBody"];
         };
+        /** @description The fuzziness of the query. Can be an integer or "auto". */
+        Fuzziness: number | "auto";
         MatchPhraseQuery: {
             match_phrase: string;
             field?: string;
@@ -11939,11 +11996,10 @@ export interface components {
              */
             mode?: "simple" | "block_hash";
             /**
-             * @description Node-wide target for live entries in the single process-stable model cache.
-             *     The first model to activate prompt caching owns it for the process lifetime;
-             *     requests to other models bypass prompt caching. The owner evicts using
-             *     estimated metadata and logical host/device KV bytes. Backend allocators may
-             *     retain reusable capacity, so this is not a hard process or accelerator cap.
+             * @description Node-wide target for live prompt-cache entries. The runtime divides it
+             *     across participating model caches and evicts using estimated metadata
+             *     and logical host/device KV bytes. Backend allocators may retain reusable
+             *     capacity, so this is not a hard cap on process or accelerator memory.
              * @default 512
              */
             max_bytes_mb?: number;
@@ -11993,15 +12049,22 @@ export interface components {
             /** @description S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail. */
             s3_credentials?: components["schemas"]["InferenceCredentials"];
             /**
-             * @deprecated
-             * @description Legacy compatibility field. The current Zig inference runtime does not
-             *     unload idle models from this setting; configuring it has no effect.
+             * @description How long to keep models loaded in memory after last use (Ollama-compatible).
+             *     Models are automatically unloaded after this duration of inactivity.
+             *     Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
+             *     Defaults to "5m". Set to "0" to disable idle-time eviction; models can
+             *     still be evicted under resource pressure or to enforce max_loaded_models.
+             * @default 5m
+             * @example 5m
              */
             keep_alive?: string;
             /**
-             * @deprecated
-             * @description Legacy compatibility field. The current Zig inference runtime does not
-             *     evict loaded models from this setting; configuring it has no effect.
+             * @description Maximum total models loaded across all registry types (embedders, rerankers,
+             *     generators, chunkers, etc.). When the limit is reached, the least-recently-used
+             *     idle model from any registry is evicted to make room. Set to 0 for unlimited.
+             *     Defaults to 10.
+             * @default 10
+             * @example 3
              */
             max_loaded_models?: number;
             /**
@@ -12071,9 +12134,19 @@ export interface components {
              */
             max_memory_mb?: number;
             /**
-             * @deprecated
-             * @description Legacy compatibility field. The current Zig runtime ignores per-model
-             *     loading strategies; use `preload` for startup warming.
+             * @description Per-model loading strategy overrides. Maps model names to their loading strategy.
+             *     Models not in this map load on demand. keep_alive controls their idle
+             *     eviction; setting it to "0" disables idle eviction but does not preload or pin them.
+             *
+             *     When a model has strategy "eager" in this map:
+             *     - It is loaded at startup through the same startup warmup path
+             *     - It is never unloaded, even when keep_alive>0 (pinned in memory)
+             *
+             *     This allows mixing eager and lazy models in the same pool.
+             * @example {
+             *       "BAAI/bge-small-en-v1.5": "eager",
+             *       "mirth/chonky-mmbert-small-multilingual-1": "lazy"
+             *     }
              */
             model_strategies?: {
                 [key: string]: "eager" | "lazy" | "bounded";
@@ -13411,6 +13484,7 @@ export interface operations {
              * @description Backup attempt completed. Inspect the response `status`: `completed`
              *     is fully successful, while `partial` or `failed` reports per-table
              *     failures even though the request itself was processed successfully.
+             *     Only `completed` publishes a restorable cluster manifest.
              */
             200: {
                 headers: {

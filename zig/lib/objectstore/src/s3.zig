@@ -150,7 +150,7 @@ pub const TransportResponse = struct {
     }
 };
 
-const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []const HeaderPair, ?[]const u8, ?[]const u8) anyerror!TransportResponse;
+const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []const HeaderPair, ?[]const u8, ?[]const u8, ?usize) anyerror!TransportResponse;
 
 pub const HttpContext = struct {
     io: std.Io,
@@ -209,9 +209,10 @@ const HttpxTransport = struct {
         headers: []const HeaderPair,
         body: ?[]const u8,
         content_type: ?[]const u8,
+        max_response_size: ?usize,
     ) !TransportResponse {
         const self: *HttpxTransport = @ptrCast(@alignCast(ctx.?));
-        return httpxRequest(&self.client, alloc, method, url, headers, body, content_type, null);
+        return httpxRequest(&self.client, alloc, method, url, headers, body, content_type, null, max_response_size);
     }
 };
 
@@ -254,6 +255,7 @@ const ContextHttpxTransport = struct {
         headers: []const HeaderPair,
         body: ?[]const u8,
         content_type: ?[]const u8,
+        max_response_size: ?usize,
     ) !TransportResponse {
         const self: *ContextHttpxTransport = @ptrCast(@alignCast(ctx.?));
         var result = try httpxRequest(
@@ -265,6 +267,7 @@ const ContextHttpxTransport = struct {
             body,
             content_type,
             try self.remainingTimeoutMs(),
+            max_response_size,
         );
         errdefer result.deinit(alloc);
         _ = try self.remainingTimeoutMs();
@@ -281,6 +284,7 @@ fn httpxRequest(
     body: ?[]const u8,
     content_type: ?[]const u8,
     timeout_ms: ?u64,
+    max_response_size: ?usize,
 ) !TransportResponse {
     var request_headers = std.ArrayListUnmanaged(HeaderPair).empty;
     defer request_headers.deinit(alloc);
@@ -293,6 +297,7 @@ fn httpxRequest(
         .headers = request_headers.items,
         .body = body,
         .timeout_ms = timeout_ms,
+        .max_response_size = max_response_size,
     });
     defer response.deinit();
 
@@ -630,6 +635,17 @@ pub const Client = struct {
         key: []const u8,
         opts: types.GetOptions,
     ) !types.GetResult {
+        var meta = if (opts.skip_metadata_probe) blk: {
+            const owned_bucket = try alloc.dupe(u8, bucket);
+            errdefer alloc.free(owned_bucket);
+            const owned_key = try alloc.dupe(u8, key);
+            break :blk types.ObjectMetadata{
+                .bucket = owned_bucket,
+                .key = owned_key,
+                .content_length = 0,
+            };
+        } else try self.statObject(alloc, bucket, key);
+        errdefer meta.deinit(alloc);
         const query = try buildObjectQueryAlloc(alloc, opts.version_id, opts.part_number);
         defer freeQueryPairs(alloc, query);
         var target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, query);
@@ -649,7 +665,14 @@ pub const Client = struct {
             }
         }
 
-        var response = try self.perform(.GET, target, headers.items, null, null);
+        var response = try self.performWithResponseLimit(
+            .GET,
+            target,
+            headers.items,
+            null,
+            null,
+            opts.max_response_bytes,
+        );
         errdefer response.deinit(alloc);
         switch (response.status) {
             200, 206 => {},
@@ -659,25 +682,22 @@ pub const Client = struct {
             else => return unexpectedStatusError(response.status),
         }
 
-        const owned_bucket = try alloc.dupe(u8, bucket);
-        errdefer alloc.free(owned_bucket);
-        const owned_key = try alloc.dupe(u8, key);
-        errdefer alloc.free(owned_key);
-        const etag = if (response.etag) |value| try alloc.dupe(u8, stripQuotes(value)) else null;
-        errdefer if (etag) |value| alloc.free(value);
-        const version_id = if (response.version_id) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (version_id) |value| alloc.free(value);
-        const content_type = if (response.content_type) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (content_type) |value| alloc.free(value);
-        const meta = types.ObjectMetadata{
-            .bucket = owned_bucket,
-            .key = owned_key,
-            .etag = etag,
-            .version_id = version_id,
-            .content_length = @intCast(response.body.len),
-            .content_type = content_type,
-            .last_modified_unix_ms = null,
-        };
+        meta.content_length = @intCast(response.body.len);
+        if (response.etag) |value| {
+            const next = try alloc.dupe(u8, stripQuotes(value));
+            if (meta.etag) |current| alloc.free(current);
+            meta.etag = next;
+        }
+        if (response.content_type) |value| {
+            const next = try alloc.dupe(u8, value);
+            if (meta.content_type) |current| alloc.free(current);
+            meta.content_type = next;
+        }
+        if (response.version_id) |value| {
+            const next = try alloc.dupe(u8, value);
+            if (meta.version_id) |current| alloc.free(current);
+            meta.version_id = next;
+        }
 
         const out_body = response.body;
         response.body = &.{};
@@ -778,6 +798,18 @@ pub const Client = struct {
         body: ?[]const u8,
         content_type: ?[]const u8,
     ) !TransportResponse {
+        return try self.performWithResponseLimit(method, target, headers, body, content_type, null);
+    }
+
+    fn performWithResponseLimit(
+        self: *Client,
+        method: HttpMethod,
+        target: RequestTarget,
+        headers: []const HeaderPair,
+        body: ?[]const u8,
+        content_type: ?[]const u8,
+        max_response_size: ?usize,
+    ) !TransportResponse {
         var dynamic_credentials = if (self.cfg.credential_provider) |provider| try provider.get(self.alloc) else null;
         defer if (dynamic_credentials) |*credentials| credentials.deinit(self.alloc);
         var signing_config = self.cfg;
@@ -810,7 +842,16 @@ pub const Client = struct {
         );
         defer freeHeaderPairs(self.alloc, signed);
 
-        return try self.request_fn(self.request_ctx, self.alloc, method, target.url, signed, body, content_type);
+        return try self.request_fn(
+            self.request_ctx,
+            self.alloc,
+            method,
+            target.url,
+            signed,
+            body,
+            content_type,
+            max_response_size,
+        );
     }
 
     const vtable: client_mod.Client.VTable = .{
@@ -1932,7 +1973,7 @@ test "s3 file upload completes a multipart lifecycle with bounded parts" {
     const State = struct {
         calls: usize = 0,
 
-        fn request(ctx: ?*anyopaque, request_alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, body: ?[]const u8, _: ?[]const u8) !TransportResponse {
+        fn request(ctx: ?*anyopaque, request_alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, body: ?[]const u8, _: ?[]const u8, _: ?usize) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             defer self.calls += 1;
             return switch (self.calls) {
@@ -1991,6 +2032,7 @@ test "s3 client signs and issues object operations through request fn" {
         version_id: ?[]const u8 = null,
         expect_body: ?[]const u8 = null,
         expect_range: ?[]const u8 = null,
+        expect_max_response_size: ?usize = null,
     };
 
     const Fake = struct {
@@ -2005,6 +2047,7 @@ test "s3 client signs and issues object operations through request fn" {
             headers: []const HeaderPair,
             body: ?[]const u8,
             _: ?[]const u8,
+            max_response_size: ?usize,
         ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             defer self.index += 1;
@@ -2014,6 +2057,7 @@ test "s3 client signs and issues object operations through request fn" {
             try expectHeader(headers, "Authorization");
             try expectHeader(headers, "x-amz-date");
             try expectHeader(headers, "x-amz-content-sha256");
+            try std.testing.expectEqual(step.expect_max_response_size, max_response_size);
             if (step.expect_body) |expected| {
                 try std.testing.expectEqualStrings(expected, body orelse "");
             }
@@ -2052,7 +2096,9 @@ test "s3 client signs and issues object operations through request fn" {
         .{ .method = .HEAD, .url_contains = "/bucket", .status = 404 },
         .{ .method = .PUT, .url_contains = "/bucket", .status = 200 },
         .{ .method = .PUT, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-put\"", .expect_body = "hello" },
+        .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5 },
         .{ .method = .GET, .url_contains = "partNumber=7&versionId=v2", .status = 206, .body = "ell", .etag = "\"etag-get\"", .content_type = "text/plain", .content_length = 3, .version_id = "v2", .expect_range = "bytes=1-3" },
+        .{ .method = .GET, .url_contains = "/bucket/docs/a.txt", .status = 206, .body = "hell", .etag = "\"etag-direct\"", .content_type = "text/plain", .content_length = 4, .expect_max_response_size = 4 },
         .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5 },
         .{ .method = .GET, .url_contains = "list-type=2", .status = 200, .body = "<ListBucketResult><Contents><Key>docs/a.txt</Key><ETag>\"etag-head\"</ETag><Size>5</Size></Contents></ListBucketResult>" },
         .{ .method = .DELETE, .url_contains = "/bucket/docs/a.txt", .status = 204 },
@@ -2087,11 +2133,20 @@ test "s3 client signs and issues object operations through request fn" {
         .range = .{ .offset = 1, .length = 3 },
     });
     defer get.deinit(alloc);
-    try std.testing.expectEqual(before_get + 1, fake.index);
+    try std.testing.expectEqual(before_get + 2, fake.index);
     try std.testing.expectEqualStrings("ell", get.body);
     try std.testing.expectEqualStrings("etag-get", get.metadata.etag.?);
     try std.testing.expectEqualStrings("v2", get.metadata.version_id.?);
     try std.testing.expectEqual(@as(u64, 3), get.metadata.content_length);
+
+    var direct = try client.getObject("bucket", "docs/a.txt", .{
+        .range = .{ .offset = 0, .length = 4 },
+        .skip_metadata_probe = true,
+        .max_response_bytes = 4,
+    });
+    defer direct.deinit(alloc);
+    try std.testing.expectEqualStrings("hell", direct.body);
+    try std.testing.expectEqualStrings("etag-direct", direct.metadata.etag.?);
 
     var meta = try client.statObject("bucket", "docs/a.txt");
     defer meta.deinit(alloc);
@@ -2135,6 +2190,7 @@ test "s3 client refreshes dynamic credentials for every signed request" {
             headers: []const HeaderPair,
             _: ?[]const u8,
             _: ?[]const u8,
+            _: ?usize,
         ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             self.requests += 1;
@@ -2185,6 +2241,7 @@ test "s3 bucket existence fails closed on access denied" {
             _: []const HeaderPair,
             _: ?[]const u8,
             _: ?[]const u8,
+            _: ?usize,
         ) !TransportResponse {
             try std.testing.expectEqual(HttpMethod.HEAD, method);
             return .{ .status = 403, .body = try request_alloc.alloc(u8, 0) };

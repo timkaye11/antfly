@@ -28,6 +28,7 @@ const extracting_api = @import("antfly_extracting");
 const scraping = @import("antfly_scraping");
 const jsonschema = @import("antfly_jsonschema");
 const lib_chunker = @import("inference_chunker");
+const hf_tokenizer_mod = @import("inference_hf_tokenizer");
 const backends_mod = @import("../backends/backends.zig");
 const session_factory = @import("../architectures/session_factory.zig");
 const registry_mod = @import("../registry/registry.zig");
@@ -36,7 +37,9 @@ const cache_mod = @import("../cache/cache.zig");
 const model_manager_mod = @import("model_manager.zig");
 const model_caps = @import("../models/capabilities.zig");
 const manifest_mod = @import("../models/manifest.zig");
+const safetensors_mod = @import("../models/safetensors.zig");
 const gpt_model_mod = @import("../models/gpt.zig");
+const model_compatibility = @import("../models/compatibility.zig");
 const chunking_mod = @import("../pipelines/chunking.zig");
 const embedding_mod = @import("../pipelines/embedding.zig");
 const extraction_mod = @import("../pipelines/extraction.zig");
@@ -75,6 +78,10 @@ const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
 };
 pub const metrics_mod = @import("metrics.zig");
 const request_queue_mod = @import("request_queue.zig");
+
+fn spinLock(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+}
 
 fn shouldSkipAutoMtpDraftLoad(config: generation.GenerationConfig, draft_cfg: gpt_model_mod.Config) bool {
     if (config.speculation_policy != .auto) return false;
@@ -404,10 +411,11 @@ test "native prompt cache seeds a second request from cache-owned storage" {
     try std.testing.expectEqual(@as(?usize, 2), storage.tokenCount(hit.sequence_id));
 }
 
-test "model manager prompt cache has one stable owner" {
+test "concurrent first prompt cache activations share the node budget" {
     const allocator = std.testing.allocator;
     var manager = model_manager_mod.ModelManager.init(allocator, backends_mod.SessionManager.init(allocator));
-    defer manager.deinit();
+    defer manager.loaded.deinit(allocator);
+    defer manager.loaded_aliases.deinit(allocator);
 
     var first: model_manager_mod.LoadedModel = undefined;
     first.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
@@ -415,33 +423,26 @@ test "model manager prompt cache has one stable owner" {
     var second: model_manager_mod.LoadedModel = undefined;
     second.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
     defer second.prompt_prefix_cache.deinit();
+    try manager.loaded.put(allocator, "first", &first);
+    try manager.loaded.put(allocator, "second", &second);
 
-    const config = runtime.kv.prompt_cache.Config{
+    const node_config = runtime.kv.prompt_cache.Config{
         .enabled = true,
-        .mode = .simple,
-        .min_tokens = 2,
-        .max_bytes = 1 << 20,
+        .max_bytes = 1024,
     };
+    // Reproduce the production interleaving: both handlers rebalance before
+    // either has reached ensurePool().
+    manager.rebalancePromptCaches(&first, node_config);
+    manager.rebalancePromptCaches(&second, node_config);
 
-    try std.testing.expect(manager.tryActivatePromptCache(std.testing.io, &first, config));
-    try std.testing.expect(manager.tryActivatePromptCache(std.testing.io, &first, config));
-    try std.testing.expect(!manager.tryActivatePromptCache(std.testing.io, &second, config));
-    try std.testing.expectEqual(config.max_bytes, first.prompt_prefix_cache.config.max_bytes);
-    try std.testing.expect(!second.prompt_prefix_cache.config.enabled);
-}
+    try std.testing.expectEqual(@as(usize, 512), first.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expectEqual(@as(usize, 512), second.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expect(first.prompt_prefix_cache.isParticipating());
+    try std.testing.expect(second.prompt_prefix_cache.isParticipating());
 
-test "model manager registry guard remains available during a cold load" {
-    var manager = model_manager_mod.ModelManager.init(std.testing.allocator, backends_mod.SessionManager.init(std.testing.allocator));
-    defer manager.deinit();
-
-    try std.testing.expect(manager.load_mutex.tryLock());
-    defer manager.load_mutex.unlock();
-    var guard = manager.lockLoadedModels(std.testing.io);
-    try std.testing.expect(!manager.state_mutex.tryLock());
-    guard.deinit();
-
-    try std.testing.expect(manager.state_mutex.tryLock());
-    manager.state_mutex.unlock();
+    manager.cancelPromptCacheActivation(&second, node_config);
+    try std.testing.expectEqual(@as(usize, 1024), first.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expect(!second.prompt_prefix_cache.isParticipating());
 }
 
 pub const NodeConfig = struct {
@@ -459,7 +460,12 @@ pub const NodeConfig = struct {
     kernel_jit: graph_mod.kernel_jit.Config = .{},
     prompt_cache: PromptCacheConfig = .{},
     prompt_cache_resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver = null,
+    tokenizer_cache: hf_tokenizer_mod.HfTokenizer.BpeCacheConfig = .{},
+    tokenizer_parallel_bpe: hf_tokenizer_mod.HfTokenizer.ParallelBpeConfig = .{},
     allow_insecure_public_bind: bool = false,
+    /// Permit artifacts whose compatibility cannot be proven by this build.
+    /// Known incompatible or unsafe artifacts remain blocked.
+    allow_unknown_models: bool = false,
 };
 
 fn isLoopbackBindHost(host: []const u8) bool {
@@ -966,28 +972,113 @@ fn estimateTextsTokens(texts: []const []const u8) usize {
     return total;
 }
 
-fn countTokenizerTokens(allocator: std.mem.Allocator, tokenizer: anytype, text: []const u8) !usize {
-    const ids = try tokenizer.encode(allocator, text);
-    defer allocator.free(ids);
-    return ids.len;
+// std.Io owns the actual worker pool, so this bounds queued tokenizer
+// consumers without creating or oversubscribing OS threads. Sixteen gives the
+// encoder enough pull-scheduled chunks for heterogeneous server CPUs while its
+// 256 KiB threshold keeps normal request prompts on the serial path.
+const tokenizer_parallel_max_tasks = 16;
+
+fn countTokenizerTokens(
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    tokenizer: anytype,
+    text: []const u8,
+) !usize {
+    var ids: std.ArrayListUnmanaged(i32) = .empty;
+    defer ids.deinit(allocator);
+    if (io) |runtime_io| {
+        try tokenizer.encodeIntoParallel(
+            runtime_io,
+            allocator,
+            text,
+            &ids,
+            tokenizer_parallel_max_tasks,
+        );
+    } else {
+        try tokenizer.encodeInto(allocator, text, &ids);
+    }
+    return ids.items.len;
 }
 
-fn countTokenizerTexts(allocator: std.mem.Allocator, tokenizer: anytype, texts: []const []const u8) !usize {
+fn countTokenizerTexts(
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    tokenizer: anytype,
+    texts: []const []const u8,
+) !usize {
     var total: usize = 0;
-    for (texts) |text| total += try countTokenizerTokens(allocator, tokenizer, text);
+    for (texts) |text| total += try countTokenizerTokens(allocator, io, tokenizer, text);
     return total;
 }
 
 fn countParsedDenseEmbedTextTokens(
     allocator: std.mem.Allocator,
+    io: ?std.Io,
     tokenizer: anytype,
     inputs: *const ParsedDenseEmbedInputs,
 ) usize {
     var total: usize = 0;
     for (inputs.texts.items) |item| {
-        total += countTokenizerTokens(allocator, tokenizer, item.text) catch estimateTextTokens(item.text);
+        total += countTokenizerTokens(allocator, io, tokenizer, item.text) catch estimateTextTokens(item.text);
     }
     return total;
+}
+
+test "token counting uses the attached std.Io tokenizer path" {
+    const ProbeTokenizer = struct {
+        serial_calls: *usize,
+        parallel_calls: *usize,
+
+        pub fn encodeInto(
+            self: @This(),
+            allocator: std.mem.Allocator,
+            _: []const u8,
+            ids: *std.ArrayListUnmanaged(i32),
+        ) !void {
+            self.serial_calls.* += 1;
+            try ids.append(allocator, 1);
+        }
+
+        pub fn encodeIntoParallel(
+            self: @This(),
+            _: std.Io,
+            allocator: std.mem.Allocator,
+            _: []const u8,
+            ids: *std.ArrayListUnmanaged(i32),
+            max_tasks: usize,
+        ) !void {
+            try std.testing.expectEqual(tokenizer_parallel_max_tasks, max_tasks);
+            self.parallel_calls.* += 1;
+            try ids.appendSlice(allocator, &.{ 1, 2 });
+        }
+    };
+
+    var serial_calls: usize = 0;
+    var parallel_calls: usize = 0;
+    const tokenizer = ProbeTokenizer{
+        .serial_calls = &serial_calls,
+        .parallel_calls = &parallel_calls,
+    };
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        try countTokenizerTokens(
+            std.testing.allocator,
+            std.testing.io,
+            tokenizer,
+            "parallel",
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try countTokenizerTokens(
+            std.testing.allocator,
+            null,
+            tokenizer,
+            "serial",
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), parallel_calls);
+    try std.testing.expectEqual(@as(usize, 1), serial_calls);
 }
 
 fn estimateParsedDenseEmbedPromptTokens(inputs: *const ParsedDenseEmbedInputs) usize {
@@ -1000,22 +1091,679 @@ fn isOpenAiListTask(task: []const u8) bool {
     return std.mem.eql(u8, task, "generators") or std.mem.eql(u8, task, "embedders");
 }
 
+const CompatibilitySummary = model_manager_mod.CompatibilitySummary;
+const CompatibilitySignature = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+const compatibility_sidecar_hash_limit: u64 = 4 * 1024 * 1024;
+const compatibility_artifact_sample_bytes: usize = 64 * 1024;
+
+const CachedCompatibility = struct {
+    allocator: std.mem.Allocator,
+    refs: std.atomic.Value(usize) = .init(1),
+    signature: CompatibilitySignature,
+    summary: CompatibilitySummary,
+    external_paths: [][]u8,
+    external_paths_valid: bool,
+
+    fn create(
+        allocator: std.mem.Allocator,
+        signature: CompatibilitySignature,
+        summary: CompatibilitySummary,
+        dependencies: *OnnxDependencies,
+    ) !*CachedCompatibility {
+        const self = try allocator.create(CachedCompatibility);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .signature = signature,
+            .summary = summary,
+            .external_paths = try dependencies.paths.toOwnedSlice(allocator),
+            .external_paths_valid = dependencies.valid,
+        };
+        return self;
+    }
+
+    fn retain(self: *CachedCompatibility) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    fn release(self: *CachedCompatibility) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        for (self.external_paths) |path| self.allocator.free(path);
+        self.allocator.free(self.external_paths);
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+};
+
+const OnnxDependencies = struct {
+    paths: std.ArrayListUnmanaged([]u8) = .empty,
+    valid: bool = true,
+
+    fn deinit(self: *OnnxDependencies, allocator: std.mem.Allocator) void {
+        for (self.paths.items) |path| allocator.free(path);
+        self.paths.deinit(allocator);
+        self.* = .{};
+    }
+
+    fn append(self: *OnnxDependencies, allocator: std.mem.Allocator, path: []const u8) !void {
+        for (self.paths.items) |existing| {
+            if (std.mem.eql(u8, existing, path)) return;
+        }
+        const owned_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned_path);
+        try self.paths.append(allocator, owned_path);
+    }
+};
+
+fn updateCompatibilitySignatureSlice(
+    signature: *std.crypto.hash.sha2.Sha256,
+    value: []const u8,
+) void {
+    const len: u64 = @intCast(value.len);
+    signature.update(std.mem.asBytes(&len));
+    signature.update(value);
+}
+
+fn addArtifactIdentityToSignature(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    signature: *std.crypto.hash.sha2.Sha256,
+    path: ?[]const u8,
+    hash_small_contents: bool,
+) !void {
+    const artifact_path = path orelse return;
+    updateCompatibilitySignatureSlice(signature, artifact_path);
+    const stat = std.Io.Dir.cwd().statFile(io, artifact_path, .{}) catch {
+        signature.update("missing");
+        return;
+    };
+    signature.update(std.mem.asBytes(&stat.inode));
+    signature.update(std.mem.asBytes(&stat.size));
+    const mtime_ns = stat.mtime.toNanoseconds();
+    const ctime_ns = stat.ctime.toNanoseconds();
+    // std.Io.Timestamp uses i96, whose ABI representation can contain
+    // indeterminate padding. Hash a fully represented integer instead.
+    const canonical_mtime_ns: i128 = mtime_ns;
+    const canonical_ctime_ns: i128 = ctime_ns;
+    signature.update(std.mem.asBytes(&canonical_mtime_ns));
+    signature.update(std.mem.asBytes(&canonical_ctime_ns));
+    if (hash_small_contents and stat.size <= compatibility_sidecar_hash_limit) {
+        const bytes = c_file.readFileMax(
+            allocator,
+            artifact_path,
+            compatibility_sidecar_hash_limit,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            signature.update("content-unreadable");
+            return;
+        };
+        defer allocator.free(bytes);
+        updateCompatibilitySignatureSlice(signature, bytes);
+    } else if (stat.size > 0) {
+        // Stat identity alone misses atomic/in-place deployments that preserve
+        // inode, length, and timestamp. Hash bounded samples so cache hits stay
+        // O(1) in artifact size while still tracking large graph/weight swaps.
+        const sample_len: usize = @intCast(@min(
+            stat.size,
+            compatibility_artifact_sample_bytes,
+        ));
+        const offsets = [_]u64{
+            0,
+            if (stat.size > sample_len) (stat.size - sample_len) / 2 else 0,
+            if (stat.size > sample_len) stat.size - sample_len else 0,
+        };
+        for (offsets, 0..) |offset, index| {
+            if (index > 0 and offset == offsets[index - 1]) continue;
+            const bytes = c_file.readRegion(allocator, artifact_path, offset, sample_len) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                signature.update("sample-unreadable");
+                return;
+            };
+            defer allocator.free(bytes);
+            signature.update(std.mem.asBytes(&offset));
+            updateCompatibilitySignatureSlice(signature, bytes);
+        }
+    }
+
+    const final_stat = std.Io.Dir.cwd().statFile(io, artifact_path, .{}) catch {
+        signature.update("changed-during-read");
+        return;
+    };
+    const final_mtime_ns = final_stat.mtime.toNanoseconds();
+    const final_ctime_ns = final_stat.ctime.toNanoseconds();
+    if (final_stat.inode != stat.inode or
+        final_stat.size != stat.size or
+        final_mtime_ns != mtime_ns or
+        final_ctime_ns != ctime_ns)
+        signature.update("changed-during-read");
+}
+
+fn addOnnxArtifactToSignature(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    signature: *std.crypto.hash.sha2.Sha256,
+    maybe_path: ?[]const u8,
+) !void {
+    const path = maybe_path orelse return;
+    try addArtifactIdentityToSignature(allocator, io, signature, path, false);
+}
+
+fn collectOnnxDependenciesForPath(
+    allocator: std.mem.Allocator,
+    dependencies: *OnnxDependencies,
+    maybe_path: ?[]const u8,
+) !void {
+    const path = maybe_path orelse return;
+    if (!std.mem.endsWith(u8, path, ".onnx")) return;
+    var artifacts = backends_mod.imported_onnx_session.inspectArtifactSet(
+        allocator,
+        path,
+    ) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        dependencies.valid = false;
+        return;
+    };
+    defer artifacts.deinit();
+    for (artifacts.external_paths) |external_path| {
+        try dependencies.append(allocator, external_path);
+    }
+}
+
+fn collectCompatibilityOnnxDependencies(
+    allocator: std.mem.Allocator,
+    man: *const manifest_mod.ModelManifest,
+) !OnnxDependencies {
+    var dependencies = OnnxDependencies{};
+    errdefer dependencies.deinit(allocator);
+    const paths = [_]?[]const u8{
+        man.onnx_path,
+        man.visual_model_path,
+        man.audio_model_path,
+        man.text_projection_path,
+        man.visual_projection_path,
+        man.audio_projection_path,
+    };
+    for (paths) |path| try collectOnnxDependenciesForPath(allocator, &dependencies, path);
+    return dependencies;
+}
+
+fn addModelSidecarToSignature(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    signature: *std.crypto.hash.sha2.Sha256,
+    model_path: []const u8,
+    sidecar_name: []const u8,
+) !void {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const separator = if (std.mem.endsWith(u8, model_path, "/")) "" else "/";
+    const path = std.fmt.bufPrint(
+        &path_buffer,
+        "{s}{s}{s}",
+        .{ model_path, separator, sidecar_name },
+    ) catch {
+        // Keep overlong paths distinct and deterministically uncacheable from a
+        // shorter valid sidecar path.
+        signature.update(model_path);
+        signature.update(sidecar_name);
+        signature.update("sidecar-path-too-long");
+        return;
+    };
+    try addArtifactIdentityToSignature(allocator, io, signature, path, true);
+}
+
+fn addShardedArtifactStatsToSignature(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    signature: *std.crypto.hash.sha2.Sha256,
+    index_path: ?[]const u8,
+) !void {
+    const path = index_path orelse return;
+    const bytes = try c_file.readFile(allocator, path);
+    defer allocator.free(bytes);
+    var index = try safetensors_mod.ShardedIndex.load(allocator, bytes);
+    defer index.deinit();
+    const model_dir = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(allocator);
+    var it = index.weight_map.iterator();
+    while (it.next()) |entry| {
+        const shard = entry.value_ptr.*;
+        if (seen.contains(shard)) continue;
+        try seen.put(allocator, shard, {});
+        const shard_path = try std.fs.path.join(allocator, &.{ model_dir, shard });
+        defer allocator.free(shard_path);
+        try addArtifactIdentityToSignature(
+            allocator,
+            io,
+            signature,
+            shard_path,
+            false,
+        );
+    }
+}
+
+fn addCompatibilityManifestFacts(
+    signature: *std.crypto.hash.sha2.Sha256,
+    man: *const manifest_mod.ModelManifest,
+) void {
+    const model_type: u8 = @intFromEnum(man.model_type);
+    const native_arch_hint: u8 = @intFromEnum(man.native_arch_hint);
+    signature.update(&.{ model_type, native_arch_hint });
+    updateCompatibilitySignatureSlice(signature, man.config_model_arch);
+    updateCompatibilitySignatureSlice(signature, man.gliner_model_type);
+    updateCompatibilitySignatureSlice(signature, man.inference_bundle_family);
+    signature.update(&.{
+        @intFromBool(man.hasIncompleteGlinerBundle()),
+        @intFromBool(man.hasIncompleteColqwenBundle()),
+        @intFromBool(man.hasIncompleteClipclapGgufBundle()),
+        @intFromBool(man.hasIncompleteFlorence2GgufBundle()),
+        @intFromBool(man.isClipclapGgufBundle()),
+    });
+}
+
+fn computeCompatibilitySignatureWithDependencies(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model_path: []const u8,
+    man: *const manifest_mod.ModelManifest,
+    external_paths: []const []const u8,
+    external_paths_valid: bool,
+) !CompatibilitySignature {
+    var signature = std.crypto.hash.sha2.Sha256.init(.{});
+    addCompatibilityManifestFacts(&signature, man);
+
+    // Hash every small metadata input parsed by loadListingFromDir. Content
+    // hashing avoids stale policy decisions when deployment tools preserve
+    // size and timestamps during an in-place replacement.
+    for (manifest_mod.listing_compatibility_sidecars) |sidecar_name| {
+        try addModelSidecarToSignature(
+            allocator,
+            io,
+            &signature,
+            model_path,
+            sidecar_name,
+        );
+    }
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.model_manifest_path, true);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.config_path, true);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.gguf_path, false);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.gguf_projector_path, false);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.safetensors_path, false);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.safetensors_index_path, true);
+    addShardedArtifactStatsToSignature(
+        allocator,
+        io,
+        &signature,
+        man.safetensors_index_path,
+    ) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        signature.update("invalid-sharded-index");
+    };
+    try addOnnxArtifactToSignature(allocator, io, &signature, man.onnx_path);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.gliner_head_gguf_path, false);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.gliner_head_safetensors_path, false);
+    try addOnnxArtifactToSignature(allocator, io, &signature, man.visual_model_path);
+    try addOnnxArtifactToSignature(allocator, io, &signature, man.audio_model_path);
+    try addOnnxArtifactToSignature(allocator, io, &signature, man.text_projection_path);
+    try addOnnxArtifactToSignature(allocator, io, &signature, man.visual_projection_path);
+    try addOnnxArtifactToSignature(allocator, io, &signature, man.audio_projection_path);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.tokenizer_json_path, false);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.tokenizer_config_path, true);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.preprocessor_config_path, true);
+    try addArtifactIdentityToSignature(allocator, io, &signature, man.processor_config_path, true);
+    if (!external_paths_valid) signature.update("invalid-onnx-artifact-set");
+    for (external_paths) |external_path| {
+        try addArtifactIdentityToSignature(
+            allocator,
+            io,
+            &signature,
+            external_path,
+            false,
+        );
+    }
+
+    var digest: CompatibilitySignature = undefined;
+    signature.final(&digest);
+    return digest;
+}
+
+fn computeCompatibilitySignature(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model_path: []const u8,
+    man: *const manifest_mod.ModelManifest,
+) !CompatibilitySignature {
+    var dependencies = try collectCompatibilityOnnxDependencies(allocator, man);
+    defer dependencies.deinit(allocator);
+    return computeCompatibilitySignatureWithDependencies(
+        allocator,
+        io,
+        model_path,
+        man,
+        dependencies.paths.items,
+        dependencies.valid,
+    );
+}
+
+test "compatibility signature tracks implicit GLiNER classification sidecar" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const model_dir = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", tmp.sub_path[0..] },
+    );
+    defer allocator.free(model_dir);
+
+    var missing = std.crypto.hash.sha2.Sha256.init(.{});
+    try addModelSidecarToSignature(
+        allocator,
+        std.testing.io,
+        &missing,
+        model_dir,
+        "special_tokens_map.json",
+    );
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "special_tokens_map.json",
+        .data = "{\"additional_special_tokens\":[\"[P]\",\"[C]\",\"[E]\",\"[R]\",\"[SEP_TEXT]\"]}",
+    });
+    var present = std.crypto.hash.sha2.Sha256.init(.{});
+    try addModelSidecarToSignature(
+        allocator,
+        std.testing.io,
+        &present,
+        model_dir,
+        "special_tokens_map.json",
+    );
+    var missing_digest: CompatibilitySignature = undefined;
+    var present_digest: CompatibilitySignature = undefined;
+    missing.final(&missing_digest);
+    present.final(&present_digest);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        missing_digest[0..],
+        present_digest[0..],
+    ));
+}
+
+test "compatibility signature hashes same-size sidecar replacements" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const model_dir = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", tmp.sub_path[0..] },
+    );
+    defer allocator.free(model_dir);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data = "{\"model_type\":\"bert\"}",
+    });
+    var first = std.crypto.hash.sha2.Sha256.init(.{});
+    try addModelSidecarToSignature(
+        allocator,
+        std.testing.io,
+        &first,
+        model_dir,
+        "config.json",
+    );
+    var first_digest: CompatibilitySignature = undefined;
+    first.final(&first_digest);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data = "{\"model_type\":\"bart\"}",
+    });
+    var second = std.crypto.hash.sha2.Sha256.init(.{});
+    try addModelSidecarToSignature(
+        allocator,
+        std.testing.io,
+        &second,
+        model_dir,
+        "config.json",
+    );
+    var second_digest: CompatibilitySignature = undefined;
+    second.final(&second_digest);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        first_digest[0..],
+        second_digest[0..],
+    ));
+}
+
+test "cached compatibility signature tracks known ONNX external dependencies without reparsing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const model_dir = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", tmp.sub_path[0..] },
+    );
+    defer allocator.free(model_dir);
+    const external_path = try std.fs.path.join(
+        allocator,
+        &.{ model_dir, "weights.bin" },
+    );
+    defer allocator.free(external_path);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "weights.bin",
+        .data = "first-external-generation",
+    });
+
+    var man = manifest_mod.ModelManifest{ .allocator = allocator };
+    defer man.deinit();
+    const first = try computeCompatibilitySignatureWithDependencies(
+        allocator,
+        std.testing.io,
+        model_dir,
+        &man,
+        &.{external_path},
+        true,
+    );
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "weights.bin",
+        .data = "second-external-generat",
+    });
+    const second = try computeCompatibilitySignatureWithDependencies(
+        allocator,
+        std.testing.io,
+        model_dir,
+        &man,
+        &.{external_path},
+        true,
+    );
+    try std.testing.expect(!std.mem.eql(u8, first[0..], second[0..]));
+}
+
+/// Apply the serving policy before model loading. `ModelManager` repeats this check as a
+/// safety backstop so a new endpoint or direct Node helper cannot bypass it.
+fn rejectDisallowedModel(
+    self: *Node,
+    ctx: *httpx.Context,
+    model_path: []const u8,
+) !?httpx.Response {
+    const summary = self.compatibilitySummaryForDir(ctx.allocator, model_path) catch {
+        if (self.config.allow_unknown_models) return null;
+        return try ctx.status(400).json(.{
+            .@"error" = "UNKNOWN_MODEL_COMPATIBILITY",
+            .message = "model compatibility could not be determined; restart with --allow-unknown-models to opt in",
+        });
+    };
+    switch (summary.level) {
+        .compatible => return null,
+        .unknown => {
+            if (self.config.allow_unknown_models) return null;
+            return try ctx.status(400).json(.{
+                .@"error" = "UNKNOWN_MODEL_COMPATIBILITY",
+                .message = summary.message,
+            });
+        },
+        .incompatible => return try ctx.status(400).json(.{
+            .@"error" = "INCOMPATIBLE_MODEL",
+            .message = summary.message,
+        }),
+    }
+}
+
+fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    return switch (err) {
+        error.UnknownModelCompatibility => ctx.status(400).json(.{
+            .@"error" = "UNKNOWN_MODEL_COMPATIBILITY",
+            .message = "model compatibility is unknown; restart with --allow-unknown-models to opt in",
+        }),
+        error.IncompatibleModel => ctx.status(400).json(.{
+            .@"error" = "INCOMPATIBLE_MODEL",
+            .message = "model artifact is incompatible with the available runtime",
+        }),
+        error.ResourceLimitExceeded => ctx.status(400).json(.{
+            .@"error" = "MODEL_RESOURCE_LIMIT",
+            .message = "model resource plan exceeds the configured inference budget",
+        }),
+        error.ResourceTemporarilyUnavailable => ctx.status(503).json(.{
+            .@"error" = "MODEL_RESOURCE_BUSY",
+            .message = "insufficient inference capacity is currently available",
+        }),
+        else => ctx.status(500).json(.{
+            .@"error" = "MODEL_LOAD_FAILED",
+            .message = @errorName(err),
+        }),
+    };
+}
+
+fn inferenceFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    return switch (err) {
+        error.ResourceLimitExceeded => ctx.status(400).json(.{
+            .@"error" = "MODEL_RESOURCE_LIMIT",
+            .message = "request resource plan exceeds the configured inference budget",
+        }),
+        error.ResourceTemporarilyUnavailable => ctx.status(503).json(.{
+            .@"error" = "MODEL_RESOURCE_BUSY",
+            .message = "insufficient inference capacity is currently available",
+        }),
+        else => ctx.status(500).json(.{
+            .@"error" = "INFERENCE_FAILED",
+            .message = @errorName(err),
+        }),
+    };
+}
+
+fn rejectExplicitBackendIncompatibility(
+    ctx: *httpx.Context,
+    model_path: []const u8,
+    choice: native_backend_choice.Choice,
+    allow_unknown: bool,
+) !?httpx.Response {
+    const backend: backends_mod.BackendType = switch (choice) {
+        .auto => return null,
+        .onnx => .onnx,
+        .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+        .xla, .webgpu => return null,
+    };
+    var man = try manifest_mod.loadListingFromDir(ctx.allocator, model_path);
+    defer man.deinit();
+    const summary = try model_manager_mod.compatibilitySummaryForBackend(
+        ctx.allocator,
+        model_path,
+        &man,
+        backend,
+    ) orelse {
+        return try ctx.status(400).json(.{
+            .@"error" = "INCOMPATIBLE_MODEL",
+            .message = "the selected backend has no compatible artifact in this model bundle",
+        });
+    };
+    if (summary.level == .incompatible or
+        (summary.level == .unknown and !allow_unknown))
+    {
+        return try ctx.status(400).json(.{
+            .@"error" = if (summary.level == .unknown)
+                "UNKNOWN_MODEL_COMPATIBILITY"
+            else
+                "INCOMPATIBLE_MODEL",
+            .message = summary.message,
+        });
+    }
+    return null;
+}
+
 fn appendOpenAiModelEntry(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
     model_id: []const u8,
     created: i64,
+    compatibility_level: []const u8,
 ) !void {
     try buf.appendSlice(allocator, "{\"id\":");
     try jsonEncodeString(buf, allocator, model_id);
     const metadata = try std.fmt.allocPrint(
         allocator,
-        ",\"object\":\"model\",\"created\":{d},\"owned_by\":\"antfly\"}}",
+        ",\"object\":\"model\",\"created\":{d},\"owned_by\":\"antfly\",\"compatibility\":",
         .{created},
     );
     defer allocator.free(metadata);
     try buf.appendSlice(allocator, metadata);
+    try jsonEncodeString(buf, allocator, compatibility_level);
+    try buf.append(allocator, '}');
 }
+
+test "OpenAI model entries expose artifact compatibility" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayListUnmanaged(u8).empty;
+    defer buf.deinit(allocator);
+
+    try appendOpenAiModelEntry(
+        &buf,
+        allocator,
+        "owner/model",
+        42,
+        "unknown",
+    );
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"owner/model\",\"object\":\"model\",\"created\":42,\"owned_by\":\"antfly\",\"compatibility\":\"unknown\"}",
+        buf.items,
+    );
+}
+
+fn appendUniqueOpenAiModelEntry(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    seen: *std.StringHashMapUnmanaged(void),
+    count: *usize,
+    model_id: []const u8,
+    created: i64,
+    compatibility_level: []const u8,
+) !void {
+    const entry = try seen.getOrPut(allocator, model_id);
+    if (entry.found_existing) return;
+    if (count.* > 0) try buf.append(allocator, ',');
+    try appendOpenAiModelEntry(
+        buf,
+        allocator,
+        model_id,
+        created,
+        compatibility_level,
+    );
+    count.* += 1;
+}
+
+const DiscoveredModelListing = struct {
+    entry_index: usize,
+    manifest: manifest_mod.ModelManifest,
+    reader_supported: bool,
+    /// `@tagName(manifest.model_type)`, not the path-derived registry kind.
+    kind: []const u8,
+    /// Compatibility derived from the artifact and available runtime paths.
+    compatibility_level: []const u8,
+
+    fn deinit(self: *@This()) void {
+        self.manifest.deinit();
+        self.* = undefined;
+    }
+};
 
 const ModelCounts = struct {
     embedders: usize = 0,
@@ -1047,20 +1795,82 @@ fn incrementModelCount(counts: *ModelCounts, task: []const u8) void {
     if (std.mem.eql(u8, task, "embedders")) counts.embedders += 1 else if (std.mem.eql(u8, task, "rerankers")) counts.rerankers += 1 else if (std.mem.eql(u8, task, "chunkers")) counts.chunkers += 1 else if (std.mem.eql(u8, task, "generators")) counts.generators += 1 else if (std.mem.eql(u8, task, "recognizers")) counts.recognizers += 1 else if (std.mem.eql(u8, task, "classifiers")) counts.classifiers += 1 else if (std.mem.eql(u8, task, "rewriters")) counts.rewriters += 1 else if (std.mem.eql(u8, task, "readers")) counts.readers += 1 else if (std.mem.eql(u8, task, "transcribers")) counts.transcribers += 1 else if (std.mem.eql(u8, task, "extractors")) counts.extractors += 1;
 }
 
-fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Allocator, io: std.Io) !ModelCounts {
+fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) ModelCounts {
     const task_names = [_][]const u8{
         "embedders",  "rerankers",   "chunkers",
         "generators", "recognizers", "classifiers",
         "rewriters",  "readers",     "transcribers",
         "extractors",
     };
-    // Fixed chunking is always available, even when no external models are
-    // installed. Keep readiness and the advertised model counts aligned.
-    var counts = ModelCounts{ .chunkers = 2 };
+    var counts = ModelCounts{};
+
+    const ra = node.registry.allocator;
+    const discovered = node.registry.discover(io) catch &[_]registry_mod.ModelEntry{};
+    defer {
+        for (discovered) |entry| {
+            ra.free(entry.name);
+            ra.free(entry.path);
+        }
+        if (discovered.len > 0) ra.free(discovered);
+    }
+
+    for (discovered) |entry| {
+        if (!model_manager_mod.isModelDirPotentiallyLoadableInCurrentBuild(allocator, entry.path)) continue;
+
+        var maybe_manifest: ?manifest_mod.ModelManifest = manifest_mod.loadFromDir(allocator, entry.path) catch null;
+        defer if (maybe_manifest) |*man| man.deinit();
+
+        const tasks = if (maybe_manifest) |*man| man.tasks else &.{};
+        const capabilities = if (maybe_manifest) |*man| man.capabilities else &.{};
+        const gliner_model_type = if (maybe_manifest) |*man| man.gliner_model_type else "";
+
+        for (task_names) |task| {
+            if (std.mem.eql(u8, task, "chunkers")) continue;
+            if (std.mem.eql(u8, task, "readers") and !readers_mod.isSupportedModelDir(allocator, entry.path)) continue;
+            if (taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities)) {
+                incrementModelCount(&counts, task);
+            }
+        }
+    }
+
+    node.model_manager.lockLoadedModels();
+    defer node.model_manager.unlockLoadedModels();
+    var it = node.model_manager.loaded.iterator();
+    while (it.next()) |entry| {
+        var already_listed = false;
+        for (discovered) |d| {
+            if (std.mem.eql(u8, d.path, entry.value_ptr.*.model_dir)) {
+                already_listed = true;
+                break;
+            }
+        }
+        if (already_listed) continue;
+
+        const model = entry.value_ptr.*;
+        const model_task = @tagName(model.manifest.model_type);
+        for (task_names) |task| {
+            if (std.mem.eql(u8, task, "chunkers")) continue;
+            if (taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) {
+                incrementModelCount(&counts, task);
+            }
+        }
+    }
+
+    return counts;
+}
+
+fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Allocator, io: std.Io) ModelCounts {
+    const task_names = [_][]const u8{
+        "embedders",  "rerankers",   "chunkers",
+        "generators", "recognizers", "classifiers",
+        "rewriters",  "readers",     "transcribers",
+        "extractors",
+    };
+    var counts = ModelCounts{};
 
     var registry = registry_mod.ModelRegistry.init(allocator, models_dir);
     defer registry.deinit();
-    const discovered = try registry.discover(io);
+    const discovered = registry.discover(io) catch &[_]registry_mod.ModelEntry{};
     defer {
         for (discovered) |entry| {
             allocator.free(entry.name);
@@ -1089,23 +1899,6 @@ fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Alloc
     }
 
     return counts;
-}
-
-fn discoveredModelsReadinessResponse(
-    ctx: *httpx.Context,
-    discovered_counts: anyerror!ModelCounts,
-) !httpx.Response {
-    const counts = discovered_counts catch |err| {
-        if (!builtin.is_test) std.log.err("inference readiness model discovery failed: {s}", .{@errorName(err)});
-        return ctx.status(503).json(.{
-            .status = "not_ready",
-            .models = ModelCounts{},
-        });
-    };
-    return ctx.status(200).json(.{
-        .status = "ready",
-        .models = counts,
-    });
 }
 
 fn validateRequestModelIdentifier(raw: []const u8) !void {
@@ -1247,12 +2040,12 @@ pub const Node = struct {
     embed_cache: cache_mod.ResultCache([]const f32),
     metrics: metrics_mod.Metrics,
     request_queue: request_queue_mod.RequestQueue,
-    /// Set before this Node is exposed through any HTTP routing surface.
-    /// Runtime-kernel qualification is deliberately limited to the earlier,
-    /// single-threaded startup phase.
+    compatibility_cache: std.StringHashMapUnmanaged(*CachedCompatibility) = .empty,
+    compatibility_cache_lock: std.atomic.Mutex = .unlocked,
+    /// Runtime JIT qualification is limited to the single-threaded startup phase.
     request_surfaces_published: bool = false,
-    /// Set only after every configured preload, including manifest-declared
-    /// optional sessions, has completed successfully.
+    /// Set after configured preloads, including declared optional sessions,
+    /// have completed successfully.
     startup_preloads_materialized: bool = false,
 
     pub const DirectSparseEmbedding = sparse_embedding_mod.SparseVector;
@@ -1376,9 +2169,54 @@ pub const Node = struct {
             .embed_cache = cache_mod.ResultCache([]const f32).init(allocator, 120_000),
             .metrics = metrics_mod.Metrics.default,
             .request_queue = request_queue_mod.RequestQueue.init(config.max_concurrent_requests),
+            .compatibility_cache = .empty,
         };
+        node.model_manager.configureServingPolicy(.{
+            .allow_unknown = config.allow_unknown_models,
+        });
+        node.model_manager.configureModelCache(
+            config.keep_alive_ms,
+            config.max_loaded_models,
+        );
+        node.model_manager.configureAdmissionLimits(.{
+            .host_limit_bytes = config.generation_budget_overrides.host_limit_bytes,
+            .backend_limit_bytes = config.generation_budget_overrides.backend_limit_bytes,
+            .combined_limit_bytes = config.generation_budget_overrides.combined_limit_bytes,
+            .kv_limit_bytes = config.generation_budget_overrides.kv_limit_bytes,
+            .scratch_limit_bytes = config.generation_budget_overrides.scratch_limit_bytes,
+        });
+        node.model_manager.tokenizer_cache_config = config.tokenizer_cache;
+        node.model_manager.tokenizer_parallel_bpe_config =
+            config.tokenizer_parallel_bpe;
         node.updateQueueMetrics();
         return node;
+    }
+
+    /// Attach process-wide tokenizer-cache admission before loading models.
+    pub fn configureTokenizerCaches(
+        self: *Node,
+        config: hf_tokenizer_mod.HfTokenizer.BpeCacheConfig,
+    ) !void {
+        try self.model_manager.configureTokenizerCaches(config);
+        self.config.tokenizer_cache = config;
+    }
+
+    pub fn configureAdmissionResourceBudget(
+        self: *Node,
+        resource_budget: ?runtime.tier.memory.AdmissionResourceBudget,
+    ) void {
+        self.model_manager.configureAdmissionResourceBudget(resource_budget);
+    }
+
+    /// Configure the std.Io tokenizer scheduler and optional consumer-local
+    /// tables before model load. Table memory is admitted by the cache
+    /// resource budget configured above.
+    pub fn configureTokenizerParallelBpe(
+        self: *Node,
+        config: hf_tokenizer_mod.HfTokenizer.ParallelBpeConfig,
+    ) !void {
+        try self.model_manager.configureTokenizerParallelBpe(config);
+        self.config.tokenizer_parallel_bpe = config;
     }
 
     pub fn deinit(self: *Node) void {
@@ -1386,11 +2224,140 @@ pub const Node = struct {
         self.registry.deinit();
         self.tabular_registry.deinit();
         self.embed_cache.deinit();
+        var compatibility_it = self.compatibility_cache.iterator();
+        while (compatibility_it.next()) |entry| {
+            entry.value_ptr.*.release();
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.compatibility_cache.deinit(self.allocator);
     }
 
-    fn loadRequestModelFromDir(self: *Node, model_path: []const u8) !*model_manager_mod.LoadedModel {
-        if (comptime builtin.is_test) request_work_test_counters.model_load_attempts += 1;
-        return self.model_manager.loadFromDir(model_path);
+    /// Derive artifact compatibility once per immutable artifact signature. Discovery
+    /// calls this repeatedly, so caching prevents GGUF/ONNX metadata inspection from
+    /// becoming request-path work while still invalidating when a sidecar is replaced.
+    fn compatibilitySummaryForDir(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+    ) !CompatibilitySummary {
+        var io_impl: ?std.Io.Threaded = null;
+        defer if (io_impl) |*threaded| threaded.deinit();
+        const io = self.session_manager.io orelse blk: {
+            io_impl = std.Io.Threaded.init(allocator, .{});
+            break :blk io_impl.?.io();
+        };
+
+        // A deployment can replace several sidecars and artifacts without an
+        // atomic directory snapshot. Derive and validate the manifest twice so
+        // the cached assessment is published only when both parsed facts and
+        // artifact identities describe the same stable generation.
+        const max_snapshot_attempts = 3;
+        var attempt: usize = 0;
+        while (attempt < max_snapshot_attempts) : (attempt += 1) {
+            var man = try manifest_mod.loadListingFromDir(allocator, model_path);
+            defer man.deinit();
+
+            spinLock(&self.compatibility_cache_lock);
+            const cached = self.compatibility_cache.get(model_path);
+            if (cached) |entry| entry.retain();
+            self.compatibility_cache_lock.unlock();
+            if (cached) |entry| {
+                const cached_signature = computeCompatibilitySignatureWithDependencies(
+                    allocator,
+                    io,
+                    model_path,
+                    &man,
+                    entry.external_paths,
+                    entry.external_paths_valid,
+                ) catch |err| {
+                    entry.release();
+                    return err;
+                };
+                const cache_hit = std.mem.eql(
+                    u8,
+                    entry.signature[0..],
+                    cached_signature[0..],
+                );
+                const cached_summary = entry.summary;
+                entry.release();
+                if (cache_hit) return cached_summary;
+            }
+
+            var dependencies = try collectCompatibilityOnnxDependencies(allocator, &man);
+            defer dependencies.deinit(allocator);
+            const artifact_signature = try computeCompatibilitySignatureWithDependencies(
+                allocator,
+                io,
+                model_path,
+                &man,
+                dependencies.paths.items,
+                dependencies.valid,
+            );
+
+            const summary = try model_manager_mod.compatibilitySummaryForBackends(
+                allocator,
+                model_path,
+                &man,
+                self.session_manager.preferred_backends,
+            );
+
+            var verification_manifest = try manifest_mod.loadListingFromDir(
+                allocator,
+                model_path,
+            );
+            defer verification_manifest.deinit();
+            var verification_dependencies = try collectCompatibilityOnnxDependencies(
+                allocator,
+                &verification_manifest,
+            );
+            defer verification_dependencies.deinit(allocator);
+            const verification_signature = try computeCompatibilitySignatureWithDependencies(
+                allocator,
+                io,
+                model_path,
+                &verification_manifest,
+                verification_dependencies.paths.items,
+                verification_dependencies.valid,
+            );
+            if (!std.mem.eql(
+                u8,
+                artifact_signature[0..],
+                verification_signature[0..],
+            )) continue;
+
+            const new_cached = try CachedCompatibility.create(
+                self.allocator,
+                artifact_signature,
+                summary,
+                &verification_dependencies,
+            );
+            var replaced: ?*CachedCompatibility = null;
+            spinLock(&self.compatibility_cache_lock);
+            if (self.compatibility_cache.getPtr(model_path)) |cached_ptr| {
+                replaced = cached_ptr.*;
+                cached_ptr.* = new_cached;
+            } else {
+                const owned_path = self.allocator.dupe(u8, model_path) catch |err| {
+                    self.compatibility_cache_lock.unlock();
+                    new_cached.release();
+                    return err;
+                };
+                self.compatibility_cache.put(
+                    self.allocator,
+                    owned_path,
+                    new_cached,
+                ) catch |err| {
+                    self.allocator.free(owned_path);
+                    self.compatibility_cache_lock.unlock();
+                    new_cached.release();
+                    return err;
+                };
+            }
+            self.compatibility_cache_lock.unlock();
+            if (replaced) |old| old.release();
+            return summary;
+        }
+        return error.ModelArtifactsChanging;
     }
 
     pub fn attachIo(self: *Node, io: std.Io) void {
@@ -1433,8 +2400,13 @@ pub const Node = struct {
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
         defer self.allocator.free(model_path);
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        const model = try self.loadRequestModelFromDir(model_path);
+        var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        defer admission_manifest.deinit();
+        if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         try ensureDirectEmbeddingDeadline(deadline_ns);
+        var model_handle = try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
         if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         try model.ensureEmbeddingAssets(true, false, false);
         try ensureDirectEmbeddingDeadline(deadline_ns);
@@ -1463,8 +2435,9 @@ pub const Node = struct {
         defer io_impl.deinit();
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "embedders");
-        defer self.allocator.free(model_path);
-        const model = try self.model_manager.loadFromDir(model_path);
+        var model_handle = try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
         if (!model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
             .allocator = allocator,
@@ -1493,8 +2466,9 @@ pub const Node = struct {
         defer io_impl.deinit();
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "rerankers");
-        defer self.allocator.free(model_path);
-        const model = try self.model_manager.loadFromDir(model_path);
+        var model_handle = try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
         var pipeline = model.rerankingPipeline(allocator);
         return try pipeline.rerank(query, documents);
     }
@@ -1518,7 +2492,7 @@ pub const Node = struct {
             };
         }
 
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null, false);
     }
 
     pub fn generateMessagesDirect(
@@ -1527,7 +2501,7 @@ pub const Node = struct {
         model_name: []const u8,
         messages: []const generation.Message,
     ) ![]u8 {
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null, false);
     }
 
     pub fn beginDirectGenerateAdmission(
@@ -1563,9 +2537,6 @@ pub const Node = struct {
                 self.request_queue.max_concurrent,
                 read_admission_bytes_per_unit,
             ) catch std.math.maxInt(usize);
-            // Gemma direct generation currently decodes with the fixed default
-            // working cap. Do not admit it into a smaller configured queue and
-            // silently exceed that operator-selected capacity.
             if (peak_bytes > capacity_bytes) return error.AudioTooLarge;
         }
         const generation_units = estimateGenerateQueueUnitsFromShape(
@@ -1606,6 +2577,7 @@ pub const Node = struct {
             null,
             false,
             null,
+            false,
         );
     }
 
@@ -1663,6 +2635,7 @@ pub const Node = struct {
         preferred_backends: ?[]const backends_mod.BackendType,
         cache_default_alias: bool,
         timing: ?*DirectGenerateTiming,
+        pin_after_success: bool,
     ) ![]u8 {
         if (messages.len == 0) return error.InvalidGenerationRequest;
         const preflight = try directGeneratePreflightForMessages(messages);
@@ -1676,6 +2649,7 @@ pub const Node = struct {
             preferred_backends,
             cache_default_alias,
             timing,
+            pin_after_success,
         );
     }
 
@@ -1688,6 +2662,7 @@ pub const Node = struct {
         preferred_backends: ?[]const backends_mod.BackendType,
         cache_default_alias: bool,
         timing: ?*DirectGenerateTiming,
+        pin_after_success: bool,
     ) ![]u8 {
         if (messages.len == 0) return error.InvalidGenerationRequest;
         const admitted_node = admission.node orelse return error.InvalidGenerationAdmission;
@@ -1706,13 +2681,12 @@ pub const Node = struct {
         };
         defer self.allocator.free(model_path);
         const resolved_at_ns = embedTimingNowNs();
-        const model = (if (preferred_backends) |backends|
-            self.model_manager.loadFromDirWithPreferredBackends(model_path, backends, cache_default_alias)
+        var model_handle = if (preferred_backends) |backends|
+            try self.model_manager.acquireFromDirWithPreferredBackends(model_path, backends, cache_default_alias)
         else
-            self.model_manager.loadFromDir(model_path)) catch |err| {
-            std.log.err("direct generator load failed model={s} path={s}: {s}", .{ model_name, model_path, @errorName(err) });
-            return err;
-        };
+            try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
         const loaded_at_ns = embedTimingNowNs();
         if (timing != null) {
             std.log.info("direct generator loaded model={s} backend={s}", .{ model_name, @tagName(model.session.backend()) });
@@ -1764,6 +2738,20 @@ pub const Node = struct {
             }
             return err;
         };
+        const resource_estimate = try runtime.tier.memory.estimateGptGeneration(
+            backend_kind,
+            kv_dtype,
+            gpt_config,
+            prompt_tokens,
+            @intCast(@max(max_tokens, 1)),
+            admitted_prefill_chunk,
+        );
+        var admission_lease = try self.model_manager.acquireRunResources(
+            budget_backend_class,
+            budget_limits,
+            resource_estimate,
+        );
+        defer admission_lease.release();
 
         var kv_manager = runtime.kv.manager.KvManager.init(allocator);
         defer kv_manager.deinit();
@@ -1842,7 +2830,9 @@ pub const Node = struct {
                 .total_ms = elapsedMs(started_at_ns, generated_at_ns),
             };
         }
-        return try allocator.dupe(u8, result.text);
+        const text = try allocator.dupe(u8, result.text);
+        if (pin_after_success) model_handle.pin();
+        return text;
     }
 
     pub fn warmConfiguredModels(self: *Node, allocator: std.mem.Allocator) !void {
@@ -1925,10 +2915,12 @@ pub const Node = struct {
         defer io_impl.deinit();
         const model_path = try self.resolveModelPath(io_impl.io(), model.name, warmModelTaskDir(model.kind));
         defer self.allocator.free(model_path);
-        const loaded = if (model.backend) |backend|
-            try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(backend), true)
+        var loaded_handle = if (model.backend) |backend|
+            try self.model_manager.acquireFromDirWithPreferredBackends(model_path, singleBackendPreference(backend), true)
         else
-            try self.model_manager.loadFromDir(model_path);
+            try self.model_manager.acquireFromDir(model_path);
+        defer loaded_handle.release();
+        const loaded = loaded_handle.get();
 
         try loaded.materializeDeclaredOptionalSessions();
         if (self.config.kernel_jit.mode.failClosed() and
@@ -1952,7 +2944,7 @@ pub const Node = struct {
             .content = "ping",
         }};
         var timing = DirectGenerateTiming{};
-        const text = try self.generateMessagesDirectMaxTokens(allocator, model_name, &messages, 1, preferred_backends, true, &timing);
+        const text = try self.generateMessagesDirectMaxTokens(allocator, model_name, &messages, 1, preferred_backends, true, &timing, true);
         defer allocator.free(text);
         const elapsed_ms = elapsedMs(started_at_ns, embedTimingNowNs());
         std.log.info(
@@ -1977,11 +2969,12 @@ pub const Node = struct {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
         const model_path = try self.resolveModelPath(io_impl.io(), model_name, "embedders");
-        defer self.allocator.free(model_path);
-        const model = if (backend) |value|
-            try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(value), true)
+        var model_handle = if (backend) |value|
+            try self.model_manager.acquireFromDirWithPreferredBackends(model_path, singleBackendPreference(value), false)
         else
-            try self.model_manager.loadFromDir(model_path);
+            try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
 
         if (model.manifest.hasCapability("sparse")) {
             var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
@@ -2004,6 +2997,7 @@ pub const Node = struct {
                 allocator.free(embeddings);
             }
         }
+        model_handle.pin();
         std.log.info("warmed inference embedder model={s} elapsed_ms={d}", .{ model_name, elapsedMs(started_at_ns, embedTimingNowNs()) });
     }
 
@@ -2015,14 +3009,16 @@ pub const Node = struct {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
         const model_path = try self.resolveModelPath(io_impl.io(), model_name, "rerankers");
-        defer self.allocator.free(model_path);
-        const model = if (backend) |value|
-            try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(value), true)
+        var model_handle = if (backend) |value|
+            try self.model_manager.acquireFromDirWithPreferredBackends(model_path, singleBackendPreference(value), false)
         else
-            try self.model_manager.loadFromDir(model_path);
+            try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
         var pipeline = model.rerankingPipeline(allocator);
         const scores = try pipeline.rerank("ping", &documents);
         defer allocator.free(scores);
+        model_handle.pin();
         std.log.info("warmed inference reranker model={s} elapsed_ms={d}", .{ model_name, elapsedMs(started_at_ns, embedTimingNowNs()) });
     }
 
@@ -2034,11 +3030,12 @@ pub const Node = struct {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
         const model_path = try self.resolveModelPath(io_impl.io(), model.name, task_dir);
-        defer self.allocator.free(model_path);
-        _ = if (model.backend) |backend|
-            try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(backend), true)
+        var model_handle = if (model.backend) |backend|
+            try self.model_manager.acquireFromDirWithPreferredBackends(model_path, singleBackendPreference(backend), false)
         else
-            try self.model_manager.loadFromDir(model_path);
+            try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        model_handle.pin();
         std.log.info("loaded inference {s} model={s} elapsed_ms={d}", .{ @tagName(model.kind), model.name, elapsedMs(started_at_ns, embedTimingNowNs()) });
     }
 
@@ -2205,7 +3202,9 @@ pub const Node = struct {
             self.updateQueueMetrics();
         }
 
-        const model = try self.loadRequestModelFromDir(model_path);
+        var model_handle = try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
         try ensureDirectEmbeddingDeadline(deadline_ns);
         try model.ensureEmbeddingAssets(parsed.texts.items.len > 0, parsed.images.items.len > 0, parsed.audio.items.len > 0);
         try ensureDirectEmbeddingDeadline(deadline_ns);
@@ -2346,8 +3345,6 @@ pub const Node = struct {
         reserved_units = audio_admission.units;
         self.updateQueueMetrics();
 
-        // The returned mono PCM is parent-owned; no stack-local limiter state
-        // escapes decodeBounded. Decode before loading model weights/sessions.
         var decoded = audio_mod.decodeBounded(
             allocator,
             downloaded.data,
@@ -2359,7 +3356,9 @@ pub const Node = struct {
         };
         defer decoded.deinit();
 
-        const model = try self.loadRequestModelFromDir(model_path);
+        var model_handle = try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
         if (session_factory.getWhisperConfig(model.session) == null) return error.UnsupportedTranscriberProvider;
 
         const transcription = @import("../pipelines/transcription.zig");
@@ -3019,10 +4018,7 @@ pub const Node = struct {
         defer ctx.allocator.free(model_path);
 
         var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
-            return ctx.status(500).json(.{
-                .@"error" = "MODEL_LOAD_FAILED",
-                .message = internalErrorMessage("MODEL_LOAD_FAILED", err),
-            });
+            return modelLoadFailureResponse(ctx, err);
         defer admission_manifest.deinit();
 
         if (admission_manifest.hasCapability("sparse")) {
@@ -3043,11 +4039,11 @@ pub const Node = struct {
                     .message = "dimensions is not supported for sparse embedding models",
                 });
             }
-            const model = self.loadRequestModelFromDir(model_path) catch |err|
-                return ctx.status(500).json(.{
-                    .@"error" = "MODEL_LOAD_FAILED",
-                    .message = internalErrorMessage("MODEL_LOAD_FAILED", err),
-                });
+            if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
+            var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+                return modelLoadFailureResponse(ctx, err);
+            defer model_handle.release();
+            const model = model_handle.get();
             var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
                 .allocator = ctx.allocator,
                 .session = model.session,
@@ -3055,7 +4051,7 @@ pub const Node = struct {
                 .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
             };
             const sparse_vecs = pipeline.embed(sparse_texts) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
+                return inferenceFailureResponse(ctx, err);
             defer {
                 for (sparse_vecs) |*sv| @constCast(sv).deinit(ctx.allocator);
                 ctx.allocator.free(sparse_vecs);
@@ -3063,7 +4059,7 @@ pub const Node = struct {
 
             var arena = std.heap.ArenaAllocator.init(ctx.allocator);
             defer arena.deinit();
-            const prompt_tokens = countTokenizerTexts(ctx.allocator, model.getTokenizer(), sparse_texts) catch estimateTextsTokens(sparse_texts);
+            const prompt_tokens = countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), sparse_texts) catch estimateTextsTokens(sparse_texts);
             const response = try buildEmbedSparseResponse(arena.allocator(), request.model, sparse_vecs, prompt_tokens);
             return ctx.json(response);
         }
@@ -3106,17 +4102,17 @@ pub const Node = struct {
             audio_decode_working_bytes = audio_admission.max_decode_working_bytes;
         }
 
-        const model = self.loadRequestModelFromDir(model_path) catch |err|
-            return ctx.status(500).json(.{
-                .@"error" = "MODEL_LOAD_FAILED",
-                .message = internalErrorMessage("MODEL_LOAD_FAILED", err),
-            });
+        if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
+        var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        defer model_handle.release();
+        const model = model_handle.get();
         model.ensureEmbeddingAssets(
             inputs.texts.items.len > 0,
             inputs.images.items.len > 0,
             inputs.audio.items.len > 0,
         ) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
+            return inferenceFailureResponse(ctx, err);
 
         var pipeline = model.embeddingPipeline(ctx.allocator);
         pipeline.config.max_audio_decode_working_bytes = audio_decode_working_bytes;
@@ -3131,7 +4127,7 @@ pub const Node = struct {
         defer arena.deinit();
         const response_build_start = embedTimingStart();
         const prompt_tokens = if (inputs.texts.items.len > 0)
-            countParsedDenseEmbedTextTokens(ctx.allocator, model.getTokenizer(), &inputs)
+            countParsedDenseEmbedTextTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), &inputs)
         else
             estimateParsedDenseEmbedPromptTokens(&inputs);
 
@@ -3288,17 +4284,19 @@ pub const Node = struct {
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
 
-        const model = self.loadRequestModelFromDir(model_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
+        var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        defer model_handle.release();
+        const model = model_handle.get();
 
         var pipeline = model.rerankingPipeline(ctx.allocator);
         const scores = pipeline.rerank(body.query, body.prompts) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
+            return inferenceFailureResponse(ctx, err);
         defer ctx.allocator.free(scores);
 
         const prompt_tokens =
-            (countTokenizerTokens(ctx.allocator, model.getTokenizer(), body.query) catch estimateTextTokens(body.query)) * body.prompts.len +
-            (countTokenizerTexts(ctx.allocator, model.getTokenizer(), body.prompts) catch estimateTextsTokens(body.prompts));
+            (countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.query) catch estimateTextTokens(body.query)) * body.prompts.len +
+            (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.prompts) catch estimateTextsTokens(body.prompts));
         return writeRerankScoresResponse(ctx, body.model, scores, prompt_tokens);
     }
 
@@ -3324,14 +4322,11 @@ pub const Node = struct {
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
 
-        // Reject an incompatible model from its lightweight manifest before
+        // Reject a text-only model from its lightweight manifest before
         // fetching request media or loading weights and accelerator sessions.
         if (media_shape.image_count > 0) {
             var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
-                return ctx.status(500).json(.{
-                    .@"error" = "MODEL_LOAD_FAILED",
-                    .message = internalErrorMessage("MODEL_LOAD_FAILED", err),
-                });
+                return modelLoadFailureResponse(ctx, err);
             defer admission_manifest.deinit();
             if (!(admission_manifest.hasCapability("colqwen") or admission_manifest.hasCapability("multimodal_late_interaction"))) {
                 return ctx.status(400).json(.{
@@ -3375,8 +4370,10 @@ pub const Node = struct {
             reserved_units = required_units;
         }
 
-        const model = self.loadRequestModelFromDir(model_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
+        var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        defer model_handle.release();
+        const model = model_handle.get();
 
         if (image_count == 0) {
             const flat_texts = try ctx.allocator.alloc([]const u8, parsed_docs.items.len);
@@ -3385,11 +4382,11 @@ pub const Node = struct {
 
             var pipeline = model.rerankingPipeline(ctx.allocator);
             const scores = pipeline.rerank(body.query, flat_texts) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
+                return inferenceFailureResponse(ctx, err);
             defer ctx.allocator.free(scores);
             const prompt_tokens =
-                (countTokenizerTokens(ctx.allocator, model.getTokenizer(), body.query) catch estimateTextTokens(body.query)) * flat_texts.len +
-                (countTokenizerTexts(ctx.allocator, model.getTokenizer(), flat_texts) catch estimateTextsTokens(flat_texts));
+                (countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.query) catch estimateTextTokens(body.query)) * flat_texts.len +
+                (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), flat_texts) catch estimateTextsTokens(flat_texts));
             return writeRerankScoresResponse(ctx, body.model, scores, prompt_tokens);
         }
 
@@ -3401,7 +4398,7 @@ pub const Node = struct {
         }
 
         model.ensureVisionSession() catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
+            return inferenceFailureResponse(ctx, err);
         const vision_session = model.vision_session;
         const gpt_cfg = session_factory.getGptConfig(model.session) orelse
             return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = "multimodal late-interaction reranking currently requires a native qwen/gpt text session" });
@@ -3428,7 +4425,7 @@ pub const Node = struct {
         );
 
         var query_encoded = mm_pipeline.encodeQueryText(body.query) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
+            return inferenceFailureResponse(ctx, err);
         defer query_encoded.deinit();
 
         const scores = try ctx.allocator.alloc(f32, parsed_docs.items.len);
@@ -3438,7 +4435,7 @@ pub const Node = struct {
             if (doc.images.len == 0) {
                 var text_pipeline = model.rerankingPipeline(ctx.allocator);
                 const text_scores = text_pipeline.rerank(body.query, &.{doc.text}) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
+                    return inferenceFailureResponse(ctx, err);
                 defer ctx.allocator.free(text_scores);
                 scores[idx] = text_scores[0];
                 continue;
@@ -3449,9 +4446,9 @@ pub const Node = struct {
                 doc.text,
                 doc.images,
             ) catch |err| switch (err) {
-                error.InvalidImageDataUri, error.UnsupportedContentPartType => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid multimodal document content" }),
-                error.ImageTokenLengthMismatch, error.ImageProjectionSizeMismatch, error.UnexpectedOutputShape => return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = "model image and text projection shapes are incompatible" }),
-                else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
+                error.InvalidImageDataUri, error.UnsupportedContentPartType => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
+                error.ImageTokenLengthMismatch, error.ImageProjectionSizeMismatch, error.UnexpectedOutputShape => return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) }),
+                else => return inferenceFailureResponse(ctx, err),
             };
         }
 
@@ -3459,8 +4456,8 @@ pub const Node = struct {
         defer ctx.allocator.free(doc_texts);
         for (parsed_docs.items, 0..) |doc, idx| doc_texts[idx] = doc.text;
         const prompt_tokens =
-            (countTokenizerTokens(ctx.allocator, model.getTokenizer(), body.query) catch estimateTextTokens(body.query)) * doc_texts.len +
-            (countTokenizerTexts(ctx.allocator, model.getTokenizer(), doc_texts) catch estimateTextsTokens(doc_texts));
+            (countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.query) catch estimateTextTokens(body.query)) * doc_texts.len +
+            (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), doc_texts) catch estimateTextsTokens(doc_texts));
         return writeRerankScoresResponse(ctx, body.model, scores, prompt_tokens);
     }
 
@@ -3501,11 +4498,8 @@ pub const Node = struct {
             .message = generateSamplingErrorMessage(err),
         });
 
-        // Admit before resolving or decoding request media. The raw request
-        // shape deliberately charges every active draft request conservatively:
-        // calibration=none disables uncalibrated Gemma4 MTP, but other draft
-        // model families can still speculate. A rejected request must not
-        // consume remote fetch or decoded-media memory first.
+        // Admission precedes model resolution and media decoding so rejected
+        // requests cannot consume model or download work first.
         const media_admission = requestMediaAdmission(self, generateRequestMediaShape(body));
         const queue_units = @max(estimateGenerateRequestQueueUnits(body, numeric.max_tokens), media_admission.units);
         if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
@@ -3513,7 +4507,6 @@ pub const Node = struct {
         defer self.releaseSlotUnits(reserved_units);
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
 
-        // Resolve model
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
         const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "generators") catch |err|
             return requestModelResolutionError(ctx, err);
@@ -3541,9 +4534,10 @@ pub const Node = struct {
             reserved_units = required_units;
         }
 
-        // Tool prompting may insert or replace a system message, so retain the
-        // parsed message slice as an ArrayList while keeping media ownership in
-        // OwnedGenerateMessages.
+        if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
+
+        // Tool prompting can mutate the message list; media ownership remains
+        // with OwnedGenerateMessages while this list owns message text.
         var messages = std.ArrayListUnmanaged(generation.Message).fromOwnedSlice(owned_messages.messages);
         owned_messages.messages = &.{};
         defer {
@@ -3578,7 +4572,7 @@ pub const Node = struct {
                         .@"error" = "INVALID_MODEL",
                         .message = "model has an unsupported tool_call_format",
                     }),
-                    else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) }),
+                    else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) }),
                 };
                 if (tool_parser == null) {
                     return ctx.status(400).json(.{
@@ -3729,12 +4723,17 @@ pub const Node = struct {
                 .message = "draft_model is not supported with backend=onnx; use native, metal, or cuda",
             });
         };
+        if (try rejectExplicitBackendIncompatibility(
+            ctx,
+            model_path,
+            backend_selection.native_choice,
+            self.config.allow_unknown_models,
+        )) |response|
+            return response;
         const allow_onnx = effective_draft_model_name == null and
             !backend_selection.graph_mode_requested and
             (body.backend == null or backend_selection.native_choice == .onnx);
 
-        var owned_response_format_grammar: ?[]u8 = null;
-        defer if (owned_response_format_grammar) |grammar| ctx.allocator.free(grammar);
         if (body.response_format) |rf| {
             if (std.mem.eql(u8, rf.type, "json_object")) {
                 config.grammar = "json";
@@ -3751,13 +4750,12 @@ pub const Node = struct {
                         .message = "response_format.json_schema.schema is required for type=json_schema",
                     });
                 };
-                owned_response_format_grammar = grammar_mod.buildJsonSchemaGrammar(ctx.allocator, schema) catch {
+                config.grammar = grammar_mod.buildJsonSchemaGrammar(ctx.allocator, schema) catch |err| {
                     return ctx.status(400).json(.{
                         .@"error" = "INVALID_REQUEST",
-                        .message = "response_format JSON schema is invalid",
+                        .message = @errorName(err),
                     });
                 };
-                config.grammar = owned_response_format_grammar;
             } else if (!std.mem.eql(u8, rf.type, "text")) {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
@@ -3774,17 +4772,13 @@ pub const Node = struct {
                 });
             }
             if (!std.mem.eql(u8, grammar, "json")) {
-                var compiled = grammar_mod.GbnfGrammar.parse(ctx.allocator, grammar) catch {
+                var compiled = grammar_mod.GbnfGrammar.parse(ctx.allocator, grammar) catch |err| {
                     return ctx.status(400).json(.{
                         .@"error" = "INVALID_REQUEST",
-                        .message = "grammar is invalid",
+                        .message = @errorName(err),
                     });
                 };
                 compiled.deinit();
-            }
-            if (owned_response_format_grammar) |owned| {
-                ctx.allocator.free(owned);
-                owned_response_format_grammar = null;
             }
             config.grammar = grammar;
         }
@@ -3807,7 +4801,7 @@ pub const Node = struct {
             }
 
             var pipeline = onnx_decoder_only_vlm.Pipeline.load(ctx.allocator, model_path) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
+                return modelLoadFailureResponse(ctx, err);
             defer pipeline.deinit();
             pipeline.prompt_override = if (prompt_override) |prompt| prompt else null;
 
@@ -3823,7 +4817,7 @@ pub const Node = struct {
             }
 
             var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err) });
+                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
             defer result.deinit();
 
             var response_text = result.text;
@@ -3832,9 +4826,9 @@ pub const Node = struct {
             const parsed_tool_calls = if (tool_parser) |*parser| blk: {
                 parser.reset();
                 _ = parser.feed(result.text) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err) });
+                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
                 tool_response_text = parser.finishText(ctx.allocator) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err) });
+                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
                 response_text = tool_response_text.?;
                 if (response_text.len == 0) response_text = result.text;
                 const calls = parser.toolCalls();
@@ -3848,7 +4842,11 @@ pub const Node = struct {
             var formatted_response_text: ?[]u8 = null;
             defer if (formatted_response_text) |text| ctx.allocator.free(text);
             if (parsed_tool_calls == null) {
-                formatted_response_text = try coerceGenerateResponseFormat(ctx.allocator, body.response_format, response_text);
+                formatted_response_text = coerceGenerateResponseFormat(ctx.allocator, body.response_format, response_text) catch |err|
+                    return ctx.status(500).json(.{
+                        .@"error" = "STRUCTURED_OUTPUT_INVALID",
+                        .message = @errorName(err),
+                    });
                 if (formatted_response_text) |text| response_text = text;
             }
 
@@ -3861,12 +4859,6 @@ pub const Node = struct {
                 result.tokens_used,
                 0,
                 parsed_tool_calls,
-                effectiveSpeculationStats(
-                    result.speculative,
-                    config.speculation_requested,
-                    config.speculation_policy,
-                    config.speculation_calibration,
-                ),
             );
         }
 
@@ -3877,7 +4869,7 @@ pub const Node = struct {
             defer if (ort_model_dir) |prepared| ctx.allocator.free(prepared);
             if (ort_model_dir) |prepared_model_dir| {
                 var ort_manifest = manifest_mod.loadFromDir(ctx.allocator, prepared_model_dir) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
+                    return modelLoadFailureResponse(ctx, err);
                 defer ort_manifest.deinit();
 
                 const use_functiongemma_prompt_override = if (tool_parser) |*parser|
@@ -3914,7 +4906,7 @@ pub const Node = struct {
                 }
 
                 var gen_model = ortgenai.GenAiModel.load(ctx.allocator, prepared_model_dir) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
+                    return modelLoadFailureResponse(ctx, err);
                 defer gen_model.deinit();
 
                 var pipeline = generation.GenerationPipeline{
@@ -3936,7 +4928,7 @@ pub const Node = struct {
                 }
 
                 var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err) });
+                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
                 defer result.deinit();
 
                 var response_text = result.text;
@@ -3945,9 +4937,9 @@ pub const Node = struct {
                 const parsed_tool_calls = if (tool_parser) |*parser| blk: {
                     parser.reset();
                     _ = parser.feed(result.text) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err) });
+                        return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
                     tool_response_text = parser.finishText(ctx.allocator) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err) });
+                        return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
                     response_text = tool_response_text.?;
                     if (response_text.len == 0) response_text = result.text;
                     const calls = parser.toolCalls();
@@ -3961,7 +4953,11 @@ pub const Node = struct {
                 var formatted_response_text: ?[]u8 = null;
                 defer if (formatted_response_text) |text| ctx.allocator.free(text);
                 if (parsed_tool_calls == null) {
-                    formatted_response_text = try coerceGenerateResponseFormat(ctx.allocator, body.response_format, response_text);
+                    formatted_response_text = coerceGenerateResponseFormat(ctx.allocator, body.response_format, response_text) catch |err|
+                        return ctx.status(500).json(.{
+                            .@"error" = "STRUCTURED_OUTPUT_INVALID",
+                            .message = @errorName(err),
+                        });
                     if (formatted_response_text) |text| response_text = text;
                 }
 
@@ -3974,29 +4970,47 @@ pub const Node = struct {
                     result.tokens_used,
                     0,
                     parsed_tool_calls,
-                    effectiveSpeculationStats(
-                        result.speculative,
-                        config.speculation_requested,
-                        config.speculation_policy,
-                        config.speculation_calibration,
-                    ),
                 );
             }
         }
 
         // Fall back to native generation (CPU/GPU GPT arch forward pass).
-        const model = if (backend_selection.native_choice != .auto) blk: {
+        var model_handle = if (backend_selection.native_choice != .auto) blk: {
             var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
             configureGenerateBackendPreference(&request_session_manager, backend_selection);
-            break :blk self.model_manager.loadFromDirWithPreferredBackends(model_path, request_session_manager.preferred_backends, false) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
-        } else self.model_manager.loadFromDir(model_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
-        const gpt_config = session_factory.getGptConfig(model.session) orelse
+            break :blk self.model_manager.acquireFromDirWithPreferredBackends(model_path, request_session_manager.preferred_backends, false) catch |err|
+                return modelLoadFailureResponse(ctx, err);
+        } else self.model_manager.acquireFromDir(model_path) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        defer model_handle.release();
+        const model = model_handle.get();
+
+        const gpt_config = session_factory.getGptConfig(model.session) orelse {
+            // The session is not a decoder at all, which in practice means the
+            // architecture was never recognized and the model fell through to the
+            // default encoder path. Name it, so the caller can tell "unsupported model"
+            // apart from "Antfly is broken".
+            var inspection: model_compatibility.Inspection = model_compatibility.inspectAlloc(ctx.allocator, &model.manifest) catch .{
+                .architecture = try ctx.allocator.dupe(u8, "unknown"),
+            };
+            defer inspection.deinit(ctx.allocator);
             return ctx.status(400).json(.{
-                .@"error" = "INVALID_MODEL",
-                .message = "model does not support generation (not a GPT-family model)",
+                .@"error" = "INCOMPATIBLE_MODEL",
+                .message = try std.fmt.allocPrint(
+                    ctx.allocator,
+                    "model architecture \"{s}\" does not provide a generation runtime",
+                    .{inspection.architecture},
+                ),
             });
+        };
+        const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
+            .native => .native,
+            .metal => .metal,
+            .cuda => .cuda,
+            .pjrt => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected PJRT backend in native generation path" }),
+            .onnx => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected ONNX backend in native generation path" }),
+            .wasm => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected WASM backend in server generation path" }),
+        };
         const auto_metal_whole_model = shouldAutoUseMetalWholeModelGenerate(
             model.session.backend(),
             graph_mod.metal_executor.supportsSession(model.session),
@@ -4011,21 +5025,11 @@ pub const Node = struct {
             .whole_model
         else
             backend_selection.compiled_attachment_target;
-        const graph_mode = backend_selection.graph_mode_requested or
-            effective_compiled_partition_backend != null or
-            graphModeEnabled();
-        const continuous_batching = self.config.generation_batching.enabledForRequest(
-            model.session.backend(),
-            graph_mode,
-            config.speculation_requested,
-            owned_messages.decoded_images.len != 0,
-        );
-        var continuous_generation_lock_held = false;
-        if (continuous_batching) {
-            model.lockNativeGeneration(ctx.io);
-            continuous_generation_lock_held = true;
-        }
-        defer if (continuous_generation_lock_held) model.unlockNativeGeneration();
+        const kv_dtype = if (config.cache_dtype) |name|
+            runtime.kv.pool.parseKvDType(name) orelse
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid cache_dtype value" })
+        else
+            session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
         const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
         const prompt_tokens = self.estimateNativePromptTokens(
             ctx.allocator,
@@ -4043,8 +5047,6 @@ pub const Node = struct {
             }
             return ctx.status(500).json(.{ .@"error" = "TOKENIZE_FAILED", .message = internalErrorMessage("TOKENIZE_FAILED", err) });
         };
-        const backend_kind = generationBackendKind(model.session.backend()) orelse
-            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unsupported backend in native generation path" });
         const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
             backend_kind,
             gpt_config,
@@ -4056,7 +5058,7 @@ pub const Node = struct {
         };
         if (model.native_generate_coordinator) |coordinator| {
             native_generate_lease = try self.acquireNativeGenerateLease(coordinator, .{
-                .requested_units = reserved_units,
+                .requested_units = queue_units,
                 .prompt_bytes = prompt_bytes,
                 .prompt_tokens = prompt_tokens,
                 .prefill_chunk_limit = if (config.prefill_chunk_size == 0) idle_prefill_ceiling else 0,
@@ -4064,33 +5066,16 @@ pub const Node = struct {
             });
         }
 
-        const kv_dtype = if (config.cache_dtype) |name|
-            runtime.kv.pool.parseKvDType(name) orelse
-                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid cache_dtype value" })
-        else
-            session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
-        const budget_backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
-            .native => .cpu,
-            .metal, .cuda => .gpu,
-        };
-        const budget_limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(
-            model.session,
-            runtime.tier.memory.defaultLimitsForBackend(budget_backend_class),
-        ));
-        var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
-
         const tok = model.getTokenizer();
         var draft_cb: ?ops.ComputeBackend = null;
-        defer if (draft_cb) |*cb_value| {
-            const reacquire = continuous_batching and !continuous_generation_lock_held;
-            if (reacquire) model.lockNativeGeneration(ctx.io);
-            defer if (reacquire) model.unlockNativeGeneration();
-            cb_value.deinit();
-        };
+        defer if (draft_cb) |*cb_value| cb_value.deinit();
         var draft_gpt_config: ?@import("../models/gpt.zig").Config = null;
-        var loaded_draft_model: ?*model_manager_mod.LoadedModel = null;
+        var draft_model_handle: ?model_manager_mod.ModelHandle = null;
+        defer if (draft_model_handle) |*handle| handle.release();
+        var draft_model_for_generation: ?*model_manager_mod.LoadedModel = null;
         var draft_backend_kind: ?runtime.kv.pool.BackendKind = null;
         var draft_kv_dtype: ?runtime.kv.pool.KvDType = null;
+        var draft_resource_estimate: ?runtime.tier.memory.Estimate = null;
         var pjrt_client: ?pjrt_lib.pjrt.Client = null;
         defer if (pjrt_client) |*client| client.deinit();
         var pjrt_plugin_path: ?[:0]u8 = null;
@@ -4103,94 +5088,106 @@ pub const Node = struct {
                     .message = "xla backend requires TERMITE_XLA_PLUGIN or TERMITE_PJRT_PLUGIN",
                 });
             pjrt_client = pjrt_lib.pjrt.Client.init(plugin_path) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
+                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         }
 
-        if (effective_draft_model_name) |draft_model_name| if (shouldResolveDraftModel(config.speculation_policy)) {
-            const draft_model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, draft_model_name, "generators") catch |err|
-                return requestModelResolutionError(ctx, err);
-            draft_model_path_storage = draft_model_path;
-            if (std.mem.eql(u8, draft_model_path, model_path)) {
-                return ctx.status(400).json(.{
-                    .@"error" = "INVALID_REQUEST",
-                    .message = "draft_model must resolve to a model different from model",
-                });
-            }
-            config.draft_model = draft_model_path;
-            var load_draft_backend = true;
-            if (config.speculation_policy == .auto) {
-                var draft_manifest = manifest_mod.loadFromDir(ctx.allocator, draft_model_path) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
-                defer draft_manifest.deinit();
-                const draft_cfg = session_factory.loadGptConfigFromModelDir(ctx.allocator, draft_model_path, draft_manifest) catch
-                    return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = "draft model generation configuration is invalid or unsupported" });
-                if (shouldSkipAutoMtpDraftLoad(config, draft_cfg)) {
-                    draft_gpt_config = draft_cfg;
-                    load_draft_backend = false;
-                }
-            }
-            if (load_draft_backend) {
-                const draft_model = if (backend_selection.native_choice != .auto) blk: {
-                    var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
-                    configureGenerateBackendPreference(&request_session_manager, backend_selection);
-                    break :blk self.model_manager.loadFromDirWithPreferredBackends(draft_model_path, request_session_manager.preferred_backends, false) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
-                } else self.model_manager.loadFromDir(draft_model_path) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
-                if (draft_model == model) {
+        if (effective_draft_model_name) |draft_model_name| {
+            if (shouldResolveDraftModel(config.speculation_policy)) {
+                const draft_model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, draft_model_name, "generators") catch |err|
+                    return requestModelResolutionError(ctx, err);
+                draft_model_path_storage = draft_model_path;
+                if (std.mem.eql(u8, draft_model_path, model_path)) {
                     return ctx.status(400).json(.{
                         .@"error" = "INVALID_REQUEST",
                         .message = "draft_model must resolve to a model different from model",
                     });
                 }
-                const draft_cfg = session_factory.getGptConfig(draft_model.session) orelse
-                    return ctx.status(400).json(.{
-                        .@"error" = "INVALID_MODEL",
-                        .message = "draft_model does not support generation",
-                    });
-                const draft_tok = draft_model.getTokenizer();
-                const target_special = tok.specialTokens();
-                const draft_special = draft_tok.specialTokens();
-                if (draft_tok.vocabSize() != tok.vocabSize() or
-                    draft_cfg.vocab_size != gpt_config.vocab_size or
-                    draft_special.cls_id != target_special.cls_id or
-                    draft_special.sep_id != target_special.sep_id or
-                    draft_special.pad_id != target_special.pad_id or
-                    draft_special.unk_id != target_special.unk_id)
-                {
-                    return ctx.status(400).json(.{
-                        .@"error" = "INVALID_REQUEST",
-                        .message = "draft_model tokenizer is incompatible with target model",
-                    });
+                config.draft_model = draft_model_path;
+                var load_draft_backend = true;
+                if (config.speculation_policy == .auto) {
+                    var draft_manifest = manifest_mod.loadFromDir(ctx.allocator, draft_model_path) catch |err|
+                        return modelLoadFailureResponse(ctx, err);
+                    defer draft_manifest.deinit();
+                    const draft_cfg = session_factory.loadGptConfigFromModelDir(ctx.allocator, draft_model_path, draft_manifest) catch |err|
+                        return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) });
+                    if (shouldSkipAutoMtpDraftLoad(config, draft_cfg)) {
+                        draft_gpt_config = draft_cfg;
+                        load_draft_backend = false;
+                    }
                 }
-                draft_backend_kind = generationBackendKind(draft_model.session.backend()) orelse
-                    return ctx.status(400).json(.{
-                        .@"error" = "INVALID_MODEL",
-                        .message = "draft_model backend does not support native speculative generation",
-                    });
-                loaded_draft_model = draft_model;
-                draft_gpt_config = draft_cfg;
-            }
-        };
+                if (load_draft_backend) {
+                    draft_model_handle = if (backend_selection.native_choice != .auto) blk: {
+                        var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
+                        configureGenerateBackendPreference(&request_session_manager, backend_selection);
+                        break :blk self.model_manager.acquireFromDirWithPreferredBackends(draft_model_path, request_session_manager.preferred_backends, false) catch |err|
+                            return modelLoadFailureResponse(ctx, err);
+                    } else self.model_manager.acquireFromDir(draft_model_path) catch |err|
+                        return modelLoadFailureResponse(ctx, err);
+                    const draft_model = draft_model_handle.?.get();
+                    const draft_cfg = session_factory.getGptConfig(draft_model.session) orelse
+                        return ctx.status(400).json(.{
+                            .@"error" = "INVALID_MODEL",
+                            .message = "draft_model does not support generation",
+                        });
+                    const draft_tok = draft_model.getTokenizer();
+                    const target_special = tok.specialTokens();
+                    const draft_special = draft_tok.specialTokens();
+                    if (draft_tok.vocabSize() != tok.vocabSize() or
+                        draft_cfg.vocab_size != gpt_config.vocab_size or
+                        draft_special.cls_id != target_special.cls_id or
+                        draft_special.sep_id != target_special.sep_id or
+                        draft_special.pad_id != target_special.pad_id or
+                        draft_special.unk_id != target_special.unk_id)
+                    {
+                        return ctx.status(400).json(.{
+                            .@"error" = "INVALID_REQUEST",
+                            .message = "draft_model tokenizer is incompatible with target model",
+                        });
+                    }
 
-        if (loaded_draft_model) |draft_model| {
-            const draft_kind = draft_backend_kind.?;
-            const draft_budget_class: runtime.tier.memory.BackendClass = switch (draft_kind) {
-                .native => .cpu,
-                .metal, .cuda => .gpu,
-            };
-            const draft_budget_limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(
-                draft_model.session,
-                runtime.tier.memory.defaultLimitsForBackend(draft_budget_class),
-            ));
-            run_budget.limits = runtime.tier.memory.maxCompositeLimits(run_budget.limits, draft_budget_limits);
-            draft_kv_dtype = if (config.cache_dtype) |name|
-                runtime.kv.pool.parseKvDType(name).?
-            else
-                session_factory.recommendedKvDTypeForSession(draft_model.session, draft_kind);
+                    const actual_draft_backend: runtime.kv.pool.BackendKind = switch (draft_model.session.backend()) {
+                        .native => .native,
+                        .metal => .metal,
+                        .cuda => .cuda,
+                        .pjrt, .onnx, .wasm => return ctx.status(400).json(.{
+                            .@"error" = "INVALID_MODEL",
+                            .message = "draft_model does not use a supported generation backend",
+                        }),
+                    };
+                    const actual_draft_kv_dtype = session_factory.recommendedKvDTypeForSession(
+                        draft_model.session,
+                        actual_draft_backend,
+                    );
+                    draft_model_for_generation = draft_model;
+                    draft_backend_kind = actual_draft_backend;
+                    draft_kv_dtype = actual_draft_kv_dtype;
+                    draft_gpt_config = draft_cfg;
+                }
+            }
         }
 
-        if (loaded_draft_model != null and config.speculation_policy != .off) {
+        const budget_backend_class: runtime.tier.memory.BackendClass =
+            if (backend_kind != .native or (draft_backend_kind != null and draft_backend_kind.? != .native))
+                .gpu
+            else
+                .cpu;
+        var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
+        budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
+        if (draft_model_for_generation) |draft_model| {
+            const draft_budget_class: runtime.tier.memory.BackendClass =
+                if (draft_backend_kind.? == .native) .cpu else .gpu;
+            const draft_budget_limits = self.config.generation_budget_overrides.apply(
+                session_factory.widenBudgetLimitsForSession(
+                    draft_model.session,
+                    runtime.tier.memory.defaultLimitsForBackend(draft_budget_class),
+                ),
+            );
+            budget_limits = runtime.tier.memory.maxCompositeLimits(budget_limits, draft_budget_limits);
+        }
+        budget_limits = self.config.generation_budget_overrides.apply(budget_limits);
+        var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
+
+        if (draft_model_for_generation != null and config.speculation_policy != .off) {
             const shared_prompt_limit = generation.nativeGenerationPromptTokenLimit(
                 gpt_config,
                 draft_gpt_config,
@@ -4212,7 +5209,7 @@ pub const Node = struct {
         var budget_components: [2]runtime.tier.memory.GptGenerationBudgetComponent = undefined;
         budget_components[0] = .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config };
         var budget_component_count: usize = 1;
-        if (loaded_draft_model != null) {
+        if (draft_model_for_generation != null) {
             budget_components[1] = .{
                 .backend = draft_backend_kind.?,
                 .kv_dtype = draft_kv_dtype.?,
@@ -4234,7 +5231,7 @@ pub const Node = struct {
             @min(config.prefill_chunk_size, scheduler_prefill_ceiling)
         else
             scheduler_prefill_ceiling;
-        const speculative_budget_bonus: usize = if (loaded_draft_model != null and
+        const speculative_budget_bonus: usize = if (draft_model_for_generation != null and
             config.speculation_policy != .off and
             config.speculative_k > 0) 1 else 0;
         const budget_max_tokens = @as(usize, @intCast(@max(config.max_tokens, 1))) + speculative_budget_bonus;
@@ -4253,23 +5250,93 @@ pub const Node = struct {
             }
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
         };
+        const resource_estimate = try runtime.tier.memory.estimateGptGeneration(
+            backend_kind,
+            kv_dtype,
+            gpt_config,
+            prompt_tokens,
+            budget_max_tokens,
+            config.prefill_chunk_size,
+        );
+        if (draft_model_for_generation != null) {
+            draft_resource_estimate = try runtime.tier.memory.estimateGptGeneration(
+                draft_backend_kind.?,
+                draft_kv_dtype.?,
+                draft_gpt_config.?,
+                prompt_tokens,
+                budget_max_tokens,
+                config.prefill_chunk_size,
+            );
+        }
+        const target_backend_class: runtime.tier.memory.BackendClass =
+            if (backend_kind == .native) .cpu else .gpu;
+        const target_admission_limits = self.config.generation_budget_overrides.apply(
+            session_factory.widenBudgetLimitsForSession(
+                model.session,
+                runtime.tier.memory.defaultLimitsForBackend(target_backend_class),
+            ),
+        );
+        var admission_requests: [2]runtime.tier.memory.AdmissionRequest = undefined;
+        admission_requests[0] = .{
+            .backend_class = target_backend_class,
+            .limits = target_admission_limits,
+            .amounts = .fromEstimate(resource_estimate),
+        };
+        const admission_request_count: usize = if (draft_resource_estimate) |estimate| blk: {
+            const draft_backend_class: runtime.tier.memory.BackendClass =
+                if (draft_backend_kind.? == .native) .cpu else .gpu;
+            admission_requests[1] = .{
+                .backend_class = draft_backend_class,
+                .limits = self.config.generation_budget_overrides.apply(
+                    session_factory.widenBudgetLimitsForSession(
+                        draft_model_for_generation.?.session,
+                        runtime.tier.memory.defaultLimitsForBackend(draft_backend_class),
+                    ),
+                ),
+                .amounts = .fromEstimate(estimate),
+            };
+            break :blk 2;
+        } else 1;
+        var admission_lease = self.model_manager.acquireRunResourceEstimates(
+            admission_requests[0..admission_request_count],
+        ) catch |err| switch (err) {
+            error.ResourceLimitExceeded => return ctx.status(400).json(.{
+                .@"error" = "MODEL_RESOURCE_LIMIT",
+                .message = "request exceeds the configured inference resource budget",
+            }),
+            error.ResourceTemporarilyUnavailable => return ctx.status(503).json(.{
+                .@"error" = "MODEL_RESOURCE_BUSY",
+                .message = "insufficient inference capacity is currently available",
+            }),
+        };
+        defer admission_lease.release();
 
-        const first_locked_model = if (loaded_draft_model) |draft_model|
+        const first_locked_model = if (draft_model_for_generation) |draft_model|
             if (@intFromPtr(draft_model) < @intFromPtr(model)) draft_model else model
         else
             model;
-        const second_locked_model: ?*model_manager_mod.LoadedModel = if (loaded_draft_model) |draft_model|
+        const second_locked_model: ?*model_manager_mod.LoadedModel = if (draft_model_for_generation) |draft_model|
             if (first_locked_model == model) draft_model else model
         else
             null;
-        if (!continuous_batching) {
-            first_locked_model.lockNativeGeneration(ctx.io);
-            if (second_locked_model) |second| second.lockNativeGeneration(ctx.io);
-        }
-        defer if (!continuous_batching) {
+        first_locked_model.lockNativeGeneration(ctx.io);
+        if (second_locked_model) |second| second.lockNativeGeneration(ctx.io);
+        defer {
             if (second_locked_model) |second| second.unlockNativeGeneration();
             first_locked_model.unlockNativeGeneration();
-        };
+        }
+
+        if (draft_model_for_generation) |draft_model| {
+            draft_cb = session_factory.getComputeBackendWithBudget(draft_model.session, ctx.allocator, &run_budget) catch |err| {
+                if (err == error.MemoryBudgetExceeded) {
+                    return ctx.status(400).json(.{
+                        .@"error" = "MODEL_RESOURCE_LIMIT",
+                        .message = memoryBudgetExceededMessage(ctx.allocator, draft_model.session, &run_budget),
+                    });
+                }
+                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+            };
+        }
 
         var kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
         defer kv_manager.deinit();
@@ -4278,63 +5345,51 @@ pub const Node = struct {
 
         var cb = session_factory.getComputeBackendWithBudget(model.session, ctx.allocator, &run_budget) catch |err| {
             if (err == error.MemoryBudgetExceeded) {
-                return ctx.status(507).json(.{
-                    .@"error" = "MEMORY_BUDGET_EXCEEDED",
+                return ctx.status(400).json(.{
+                    .@"error" = "MODEL_RESOURCE_LIMIT",
                     .message = memoryBudgetExceededMessage(ctx.allocator, model.session, &run_budget),
                 });
             }
-            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
+            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         };
-        defer {
-            const reacquire = continuous_batching and !continuous_generation_lock_held;
-            if (reacquire) model.lockNativeGeneration(ctx.io);
-            defer if (reacquire) model.unlockNativeGeneration();
-            cb.deinit();
-        }
-        if (loaded_draft_model) |draft_model| {
-            draft_cb = session_factory.getComputeBackendWithBudget(draft_model.session, ctx.allocator, &run_budget) catch |err| {
-                if (err == error.MemoryBudgetExceeded) {
-                    return ctx.status(507).json(.{
-                        .@"error" = "MEMORY_BUDGET_EXCEEDED",
-                        .message = memoryBudgetExceededMessage(ctx.allocator, draft_model.session, &run_budget),
-                    });
-                }
-                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
-            };
-        }
+        defer cb.deinit();
         const pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
 
         var prompt_cache: ?*runtime.kv.prompt_cache.PromptPrefixCache = null;
         var active_kv_manager: *runtime.kv.manager.KvManager = &kv_manager;
         var active_kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null;
         var pool_id: runtime.kv.block.KvPoolId = undefined;
-        if (promptCacheEligibleForNativeRequest(
-            config.prompt_cache_enabled,
-            continuous_batching,
-            backend_kind,
-            effective_compiled_partition_backend != null,
-            effective_draft_model_name != null,
-            config.cache_compaction_ratio != null,
-        ) and self.model_manager.tryActivatePromptCache(
-            ctx.io,
-            model,
-            self.config.prompt_cache.runtimeConfig(self.config.prompt_cache_resource_usage_observer),
-        )) {
-            const cache_ready = blk: {
-                const ensured = model.prompt_prefix_cache.ensureStorage(pool_config) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
+        if (config.prompt_cache_enabled and (backend_kind == .native or backend_kind == .metal or backend_kind == .cuda) and
+            effective_compiled_partition_backend == null and
+            effective_draft_model_name == null and
+            config.cache_compaction_ratio == null)
+        {
+            const prompt_cache_config = self.config.prompt_cache.runtimeConfig(
+                self.config.prompt_cache_resource_usage_observer,
+            );
+            self.model_manager.rebalancePromptCaches(
+                model,
+                prompt_cache_config,
+            );
+            const cache_ready = if (backend_kind == .metal or backend_kind == .cuda) blk: {
+                const ensured = model.prompt_prefix_cache.ensureStorage(pool_config) catch |err| {
+                    self.model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
+                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                };
                 const storage = if (ensured) |result| result.storage else break :blk false;
-                if (backend_kind != .metal and backend_kind != .cuda) {
-                    active_kv_storage = storage;
-                    break :blk true;
-                }
                 if (storage.device_write_hook == null) {
                     cb.provisionKvDeviceWriteHook(storage) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
+                        return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
                 }
                 if (storage.device_write_hook == null) break :blk false;
                 active_kv_storage = storage;
                 break :blk true;
+            } else blk: {
+                const maybe_cache_pool_id = model.prompt_prefix_cache.ensurePool(pool_config) catch |err| {
+                    self.model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
+                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                };
+                break :blk maybe_cache_pool_id != null;
             };
 
             if (cache_ready) {
@@ -4343,29 +5398,25 @@ pub const Node = struct {
                 prompt_cache = &model.prompt_prefix_cache;
             } else {
                 pool_id = kv_manager.addPool(pool_config) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
+                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
                 config.prompt_cache_enabled = false;
+                self.model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
             }
         } else {
             config.prompt_cache_enabled = false;
             pool_id = kv_manager.addPool(pool_config) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
+                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         }
 
         var kv_storage: ?runtime.kv.storage_runtime.KvStorageRuntime = if (active_kv_storage == null)
             runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, pool_config) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) })
+                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) })
         else
             null;
-        defer if (kv_storage) |*storage| {
-            const reacquire = continuous_batching and !continuous_generation_lock_held;
-            if (reacquire) model.lockNativeGeneration(ctx.io);
-            defer if (reacquire) model.unlockNativeGeneration();
-            storage.deinit();
-        };
+        defer if (kv_storage) |*storage| storage.deinit();
         if (kv_storage) |*storage| {
             cb.provisionKvDeviceWriteHook(storage) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
+                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         }
         var decode_state = generation.NativeDecodeState.initPaged(ctx.allocator, active_kv_manager, pool_id, model.shared_moe_cache);
         if (active_kv_storage) |storage| {
@@ -4373,31 +5424,29 @@ pub const Node = struct {
         } else if (kv_storage) |*storage| {
             decode_state.kv_storage = storage;
         }
-        defer {
-            const reacquire = continuous_batching and !continuous_generation_lock_held;
-            if (reacquire) model.lockNativeGeneration(ctx.io);
-            defer if (reacquire) model.unlockNativeGeneration();
-            decode_state.deinit();
-        }
+        defer decode_state.deinit();
+
         var draft_decode_state: ?generation.NativeDecodeState = null;
-        defer if (draft_decode_state) |*state| {
-            const reacquire = continuous_batching and !continuous_generation_lock_held;
-            if (reacquire) model.lockNativeGeneration(ctx.io);
-            defer if (reacquire) model.unlockNativeGeneration();
-            state.deinit();
-        };
+        defer if (draft_decode_state) |*state| state.deinit();
 
         if (draft_cb != null) {
             if (draft_gpt_config) |draft_cfg| {
-                const draft_kind = draft_backend_kind.?;
                 draft_kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
-                const draft_pool_config = generation.kvPoolConfig(draft_kind, draft_kv_dtype.?, draft_cfg, generationKvSlidingTrimForced());
+                const draft_pool_config = generation.kvPoolConfig(
+                    draft_backend_kind.?,
+                    draft_kv_dtype.?,
+                    draft_cfg,
+                    generationKvSlidingTrimForced(),
+                );
                 const draft_pool_id = draft_kv_manager.?.addPool(draft_pool_config) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
+                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
                 draft_decode_state = generation.NativeDecodeState.initPaged(ctx.allocator, &draft_kv_manager.?, draft_pool_id, null);
             }
         }
 
+        const graph_mode = backend_selection.graph_mode_requested or
+            effective_compiled_partition_backend != null or
+            graphModeEnabled();
         const use_scheduler = !graph_mode;
         const use_model_graph_cache = graph_mode and
             build_options.enable_metal and
@@ -4441,7 +5490,6 @@ pub const Node = struct {
             .decode_state = &decode_state,
             .scheduler = if (use_scheduler) model.native_generate_coordinator else null,
             .scheduler_lease = if (use_scheduler) if (native_generate_lease) |*lease| lease else null else null,
-            .execution_lock = if (continuous_batching and use_scheduler) model.nativeGenerationMutex() else null,
             .draft_cb = if (draft_cb) |cb_value| cb_value else null,
             .draft_gpt_config = draft_gpt_config,
             .draft_decode_state = if (draft_decode_state) |*state| state else null,
@@ -4452,24 +5500,12 @@ pub const Node = struct {
             .pjrt_client = if (pjrt_client) |*client| client else null,
         };
 
-        if (continuous_batching and use_scheduler) {
-            model.unlockNativeGeneration();
-            continuous_generation_lock_held = false;
-        }
-
         if (want_stream) {
             return self.streamGenerate(ctx, body.model, &pipeline, messages.items, config, if (tool_parser) |*parser| parser else null);
         }
 
-        var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err| {
-            if (err == error.PromptTooLong) {
-                return ctx.status(400).json(.{
-                    .@"error" = "INVALID_REQUEST",
-                    .message = "prompt exceeds the target or draft model context window",
-                });
-            }
-            return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err) });
-        };
+        var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
+            return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
         defer result.deinit();
         if (debug_metal_timing) {
             if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
@@ -4483,9 +5519,9 @@ pub const Node = struct {
         const parsed_tool_calls = if (tool_parser) |*parser| blk: {
             parser.reset();
             _ = parser.feed(result.text) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err) });
+                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
             tool_response_text = parser.finishText(ctx.allocator) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err) });
+                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
             response_text = tool_response_text.?;
             if (response_text.len == 0) response_text = result.text;
             const calls = parser.toolCalls();
@@ -4499,7 +5535,11 @@ pub const Node = struct {
         var formatted_response_text: ?[]u8 = null;
         defer if (formatted_response_text) |text| ctx.allocator.free(text);
         if (parsed_tool_calls == null) {
-            formatted_response_text = try coerceGenerateResponseFormat(ctx.allocator, body.response_format, response_text);
+            formatted_response_text = coerceGenerateResponseFormat(ctx.allocator, body.response_format, response_text) catch |err|
+                return ctx.status(500).json(.{
+                    .@"error" = "STRUCTURED_OUTPUT_INVALID",
+                    .message = @errorName(err),
+                });
             if (formatted_response_text) |text| response_text = text;
         }
 
@@ -4891,6 +5931,62 @@ pub const Node = struct {
         @"error": ?api.GenerateBatchError = null,
     };
 
+    fn applyBatchGenerateTaskResult(
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        task_result: BatchGenerateTaskResult,
+        result: *api.GenerateBatchResultItem,
+    ) !void {
+        if (task_result.@"error") |batch_err| {
+            result.@"error" = batch_err;
+        } else if (task_result.text) |text| {
+            result.response = try buildGenerateResponseValue(
+                allocator,
+                model_name,
+                text,
+                task_result.finish_reason,
+                task_result.prompt_tokens,
+                task_result.completion_tokens,
+            );
+        } else {
+            result.@"error" = .{
+                .code = "GENERATION_FAILED",
+                .message = "missing batch generation result",
+                .retryable = true,
+            };
+        }
+    }
+
+    fn batchModelLoadError(err: anyerror) api.GenerateBatchError {
+        return switch (err) {
+            error.UnknownModelCompatibility => .{
+                .code = "UNKNOWN_MODEL_COMPATIBILITY",
+                .message = "model compatibility is unknown",
+                .retryable = false,
+            },
+            error.IncompatibleModel => .{
+                .code = "INCOMPATIBLE_MODEL",
+                .message = "model artifact is incompatible with the selected runtime",
+                .retryable = false,
+            },
+            error.ResourceLimitExceeded => .{
+                .code = "MODEL_RESOURCE_LIMIT",
+                .message = "model resource plan exceeds the configured inference budget",
+                .retryable = false,
+            },
+            error.ResourceTemporarilyUnavailable => .{
+                .code = "MODEL_RESOURCE_BUSY",
+                .message = "insufficient inference capacity is currently available",
+                .retryable = true,
+            },
+            else => .{
+                .code = "MODEL_LOAD_FAILED",
+                .message = @errorName(err),
+                .retryable = true,
+            },
+        };
+    }
+
     const BatchGenerateTask = struct {
         allocator: std.mem.Allocator,
         pipeline: generation.NativeGenerationPipeline,
@@ -4901,7 +5997,18 @@ pub const Node = struct {
 
         fn run(self: *@This()) std.Io.Cancelable!void {
             self.runInner() catch |err| {
-                self.out.@"error" = .{ .code = "GENERATION_FAILED", .message = internalErrorMessage("GENERATION_FAILED", err), .retryable = true };
+                self.out.@"error" = switch (err) {
+                    error.InvalidStructuredOutput => .{
+                        .code = "STRUCTURED_OUTPUT_INVALID",
+                        .message = @errorName(err),
+                        .retryable = true,
+                    },
+                    else => .{
+                        .code = "GENERATION_FAILED",
+                        .message = @errorName(err),
+                        .retryable = true,
+                    },
+                };
             };
         }
 
@@ -4942,13 +6049,64 @@ pub const Node = struct {
         }
 
         fn deinit(self: *@This()) void {
-            // Shared backend and KV resources must be torn down under the same
-            // model lock used by every worker execution step.
             std.debug.assert(self.held);
             self.mutex.unlock();
             self.held = false;
         }
     };
+
+    const BatchExecutionMode = enum {
+        /// NativeCompute is cheap request state over a shared, internally
+        /// synchronized weight store. Give each item its own instance so task
+        /// allocators and RunBudget accounting remain independent.
+        isolated_parallel,
+        /// Metal/CUDA sessions own stateful command/runtime objects. Reusing
+        /// those objects serially avoids racing streams, scratch buffers, and
+        /// graph-capture state while still amortizing backend construction.
+        shared_serial,
+    };
+
+    fn batchExecutionMode(backend: runtime.kv.pool.BackendKind) BatchExecutionMode {
+        return switch (backend) {
+            .native => .isolated_parallel,
+            .metal, .cuda => .shared_serial,
+        };
+    }
+
+    const BatchAdmission = struct {
+        lease: runtime.tier.memory.AdmissionLease,
+        estimate: runtime.tier.memory.Estimate,
+    };
+
+    fn acquireBatchAdmission(
+        self: *Node,
+        backend_class: runtime.tier.memory.BackendClass,
+        limits: runtime.tier.memory.Limits,
+        run_budget: *runtime.tier.memory.RunBudget,
+        estimate: runtime.tier.memory.Estimate,
+    ) !BatchAdmission {
+        try run_budget.reserveEstimate(estimate);
+        errdefer run_budget.releaseEstimate(estimate);
+        return .{
+            .lease = try self.model_manager.acquireRunResources(
+                backend_class,
+                limits,
+                estimate,
+            ),
+            .estimate = estimate,
+        };
+    }
+
+    fn releaseBatchAdmission(
+        run_budget: *runtime.tier.memory.RunBudget,
+        admission: *?BatchAdmission,
+    ) void {
+        if (admission.*) |*owned| {
+            owned.lease.release();
+            run_budget.releaseEstimate(owned.estimate);
+            admission.* = null;
+        }
+    }
 
     pub fn generateBatchContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
         var parsed = (try ctx.parseJson(api.GenerateBatchRequest)) orelse
@@ -5054,28 +6212,50 @@ pub const Node = struct {
                 try group_indices.append(ctx.allocator, idx);
             }
 
-            const model = if (selection.native_choice != .auto) blk: {
+            const compatibility_summary = self.compatibilitySummaryForDir(ctx.allocator, model_path) catch CompatibilitySummary{
+                .level = .unknown,
+                .code = .artifact_unreadable,
+                .message = "model compatibility could not be determined",
+            };
+            const compatibility_blocked = compatibility_summary.level == .incompatible or
+                (compatibility_summary.level == .unknown and !self.config.allow_unknown_models);
+            if (compatibility_blocked) {
+                const code = if (compatibility_summary.level == .incompatible)
+                    "INCOMPATIBLE_MODEL"
+                else
+                    "UNKNOWN_MODEL_COMPATIBILITY";
+                for (group_indices.items) |idx| {
+                    results[idx].@"error" = .{
+                        .code = code,
+                        .message = compatibility_summary.message,
+                        .retryable = false,
+                    };
+                    pending[idx] = false;
+                }
+                continue;
+            }
+
+            var model_handle = if (selection.native_choice != .auto) blk: {
                 var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
                 configureGenerateBackendPreference(&request_session_manager, selection);
-                break :blk self.model_manager.loadFromDirWithPreferredBackends(model_path, request_session_manager.preferred_backends, false) catch |err| {
+                break :blk self.model_manager.acquireFromDirWithPreferredBackends(model_path, request_session_manager.preferred_backends, false) catch |err| {
                     for (group_indices.items) |idx| {
-                        results[idx].@"error" = .{ .code = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err), .retryable = true };
+                        results[idx].@"error" = batchModelLoadError(err);
                         pending[idx] = false;
                     }
                     continue;
                 };
-            } else self.model_manager.loadFromDir(model_path) catch |err| {
+            } else self.model_manager.acquireFromDir(model_path) catch |err| {
                 for (group_indices.items) |idx| {
-                    results[idx].@"error" = .{ .code = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err), .retryable = true };
+                    results[idx].@"error" = batchModelLoadError(err);
                     pending[idx] = false;
                 }
                 continue;
             };
+            const model = model_handle.get();
 
-            model.lockNativeGeneration(ctx.io);
-            var model_lock = BatchModelLockOwner.initAcquired(model.nativeGenerationMutex(), ctx.io);
             {
-                defer model_lock.deinit();
+                defer model_handle.release();
 
                 const gpt_config = session_factory.getGptConfig(model.session) orelse {
                     for (group_indices.items) |idx| {
@@ -5179,10 +6359,9 @@ pub const Node = struct {
                     }
                     ctx.allocator.free(leases);
                 }
-                var admitted_count: usize = 0;
-                for (group_indices.items, 0..) |idx, pos| {
-                    if (!pending[idx]) continue;
-                    if (model.native_generate_coordinator) |coordinator| {
+                if (model.native_generate_coordinator) |coordinator| {
+                    for (group_indices.items, 0..) |idx, pos| {
+                        if (!pending[idx]) continue;
                         const queue_item_units = self.estimateGenerateQueueUnits(owned_messages[idx].messages, configs[pos].max_tokens);
                         leases[pos] = self.acquireNativeGenerateLease(coordinator, .{
                             .requested_units = queue_item_units,
@@ -5191,21 +6370,47 @@ pub const Node = struct {
                             .prefill_chunk_limit = if (configs[pos].prefill_chunk_size == 0) idle_prefill_ceiling else 0,
                             .max_tokens = configs[pos].max_tokens,
                         }) catch |err| {
-                            results[idx].@"error" = .{ .code = "QUEUE_FULL", .message = internalErrorMessage("QUEUE_FULL", err), .retryable = true };
+                            results[idx].@"error" = .{ .code = "QUEUE_FULL", .message = @errorName(err), .retryable = true };
                             pending[idx] = false;
                             continue;
                         };
                     }
-                    admitted_count += 1;
-                }
-                if (model.native_generate_coordinator) |coordinator| {
                     for (group_indices.items, 0..) |idx, pos| {
                         if (!pending[idx]) continue;
                         leases[pos].prefill_chunk_size = coordinator.recommendPrefillChunkFor(leases[pos].request_id);
                     }
                 }
-
-                var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
+                const execution_mode = batchExecutionMode(backend_kind);
+                var shared_run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
+                const task_run_budgets = try ctx.allocator.alloc(
+                    runtime.tier.memory.RunBudget,
+                    group_indices.items.len,
+                );
+                defer ctx.allocator.free(task_run_budgets);
+                for (task_run_budgets) |*budget| {
+                    budget.* = runtime.tier.memory.RunBudget.init(budget_limits);
+                }
+                const resource_estimates = try ctx.allocator.alloc(
+                    ?runtime.tier.memory.Estimate,
+                    group_indices.items.len,
+                );
+                @memset(resource_estimates, null);
+                defer ctx.allocator.free(resource_estimates);
+                // Allocate ownership slots before acquiring capacity. Once a
+                // process-wide lease is granted, publishing it here cannot fail.
+                const admissions = try ctx.allocator.alloc(?BatchAdmission, group_indices.items.len);
+                @memset(admissions, null);
+                defer {
+                    for (admissions, 0..) |*maybe_admission, pos| {
+                        const item_run_budget = if (execution_mode == .isolated_parallel)
+                            &task_run_budgets[pos]
+                        else
+                            &shared_run_budget;
+                        releaseBatchAdmission(item_run_budget, maybe_admission);
+                    }
+                    ctx.allocator.free(admissions);
+                }
+                var runnable_count: usize = 0;
                 const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
                     .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config },
                 };
@@ -5229,34 +6434,114 @@ pub const Node = struct {
                         configs[pos].speculation_policy != .off and
                         configs[pos].speculative_k > 0) 1 else 0;
                     const budget_max_tokens = @as(usize, @intCast(@max(configs[pos].max_tokens, 1))) + speculative_budget_bonus;
+                    var sizing_budget = runtime.tier.memory.RunBudget.init(budget_limits);
                     configs[pos].prefill_chunk_size = runtime.tier.memory.reserveGptGenerationAtLargestChunk(
-                        &run_budget,
+                        &sizing_budget,
                         &budget_components,
                         prompt_tokens[pos],
                         budget_max_tokens,
                         admission_prefill_ceiling,
                     ) catch |err| {
-                        results[idx].@"error" = .{ .code = "MEMORY_BUDGET_EXCEEDED", .message = internalErrorMessage("MEMORY_BUDGET_EXCEEDED", err), .retryable = true };
+                        results[idx].@"error" = .{
+                            .code = "MEMORY_BUDGET_EXCEEDED",
+                            .message = @errorName(err),
+                            .retryable = false,
+                        };
                         pending[idx] = false;
-                        admitted_count -= 1;
                         if (model.native_generate_coordinator) |coordinator| {
                             coordinator.release(leases[pos]);
                             leases[pos].request_id = 0;
                         }
                         continue;
                     };
-                }
-                if (admitted_count == 0) continue;
-
-                var cb = session_factory.getComputeBackendWithBudget(model.session, ctx.allocator, &run_budget) catch |err| {
-                    for (group_indices.items) |idx| {
-                        if (!pending[idx]) continue;
-                        results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err), .retryable = true };
+                    const resource_estimate = runtime.tier.memory.estimateGptGeneration(
+                        backend_kind,
+                        kv_dtype,
+                        gpt_config,
+                        prompt_tokens[pos],
+                        budget_max_tokens,
+                        configs[pos].prefill_chunk_size,
+                    ) catch |err| {
+                        results[idx].@"error" = .{
+                            .code = if (err == error.InvalidModelConfig) "INVALID_MODEL" else "MODEL_RESOURCE_LIMIT",
+                            .message = @errorName(err),
+                            .retryable = false,
+                        };
                         pending[idx] = false;
+                        if (model.native_generate_coordinator) |coordinator| {
+                            coordinator.release(leases[pos]);
+                            leases[pos].request_id = 0;
+                        }
+                        continue;
+                    };
+                    resource_estimates[pos] = resource_estimate;
+                    if (execution_mode == .shared_serial) {
+                        runnable_count += 1;
+                        continue;
                     }
-                    continue;
-                };
-                defer cb.deinit();
+                    admissions[pos] = self.acquireBatchAdmission(
+                        budget_backend_class,
+                        budget_limits,
+                        &task_run_budgets[pos],
+                        resource_estimate,
+                    ) catch |err| {
+                        results[idx].@"error" = .{
+                            .code = if (err == error.ResourceTemporarilyUnavailable) "MODEL_RESOURCE_BUSY" else "MODEL_RESOURCE_LIMIT",
+                            .message = @errorName(err),
+                            .retryable = err == error.ResourceTemporarilyUnavailable,
+                        };
+                        pending[idx] = false;
+                        if (model.native_generate_coordinator) |coordinator| {
+                            coordinator.release(leases[pos]);
+                            leases[pos].request_id = 0;
+                        }
+                        continue;
+                    };
+                    runnable_count += 1;
+                }
+                if (runnable_count == 0) continue;
+
+                var shared_cb: ?ops.ComputeBackend = null;
+                if (execution_mode == .shared_serial) {
+                    var provision_admitted = false;
+                    for (group_indices.items, 0..) |idx, pos| {
+                        if (!pending[idx]) continue;
+                        admissions[pos] = self.acquireBatchAdmission(
+                            budget_backend_class,
+                            budget_limits,
+                            &shared_run_budget,
+                            resource_estimates[pos].?,
+                        ) catch |err| {
+                            results[idx].@"error" = .{
+                                .code = if (err == error.ResourceTemporarilyUnavailable) "MODEL_RESOURCE_BUSY" else "MODEL_RESOURCE_LIMIT",
+                                .message = @errorName(err),
+                                .retryable = err == error.ResourceTemporarilyUnavailable,
+                            };
+                            pending[idx] = false;
+                            if (model.native_generate_coordinator) |coordinator| {
+                                coordinator.release(leases[pos]);
+                                leases[pos].request_id = 0;
+                            }
+                            continue;
+                        };
+                        provision_admitted = true;
+                        break;
+                    }
+                    if (!provision_admitted) continue;
+                    shared_cb = session_factory.getComputeBackendWithBudget(
+                        model.session,
+                        ctx.allocator,
+                        &shared_run_budget,
+                    ) catch |err| {
+                        for (group_indices.items) |idx| {
+                            if (!pending[idx]) continue;
+                            results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
+                            pending[idx] = false;
+                        }
+                        continue;
+                    };
+                }
+                defer if (shared_cb) |*cb| cb.deinit();
 
                 var kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
                 defer kv_manager.deinit();
@@ -5278,14 +6563,16 @@ pub const Node = struct {
                     continue;
                 };
                 defer kv_storage.deinit();
-                cb.provisionKvDeviceWriteHook(&kv_storage) catch |err| {
-                    for (group_indices.items) |idx| {
-                        if (!pending[idx]) continue;
-                        results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err), .retryable = true };
-                        pending[idx] = false;
-                    }
-                    continue;
-                };
+                if (shared_cb) |*cb| {
+                    cb.provisionKvDeviceWriteHook(&kv_storage) catch |err| {
+                        for (group_indices.items) |idx| {
+                            if (!pending[idx]) continue;
+                            results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
+                            pending[idx] = false;
+                        }
+                        continue;
+                    };
+                }
 
                 var kv_mutex: std.atomic.Mutex = .unlocked;
                 var task_arenas = try ctx.allocator.alloc(std.heap.ArenaAllocator, group_indices.items.len);
@@ -5293,6 +6580,14 @@ pub const Node = struct {
                 defer {
                     for (task_arenas) |*arena| arena.deinit();
                     ctx.allocator.free(task_arenas);
+                }
+                const task_cbs = try ctx.allocator.alloc(?ops.ComputeBackend, group_indices.items.len);
+                @memset(task_cbs, null);
+                defer {
+                    for (task_cbs) |*maybe_cb| {
+                        if (maybe_cb.*) |*cb| cb.deinit();
+                    }
+                    ctx.allocator.free(task_cbs);
                 }
                 const decode_states = try ctx.allocator.alloc(generation.NativeDecodeState, group_indices.items.len);
                 for (decode_states) |*state| state.* = generation.NativeDecodeState.initContiguous(ctx.allocator);
@@ -5309,9 +6604,52 @@ pub const Node = struct {
                 var tasks = try ctx.allocator.alloc(BatchGenerateTask, group_indices.items.len);
                 defer ctx.allocator.free(tasks);
 
+                var spawned_any = false;
+                var group = std.Io.Group.init;
                 for (group_indices.items, 0..) |idx, pos| {
                     if (!pending[idx]) continue;
                     const task_alloc = task_arenas[pos].allocator();
+                    if (execution_mode == .shared_serial and admissions[pos] == null) {
+                        const resource_estimate = resource_estimates[pos].?;
+                        admissions[pos] = self.acquireBatchAdmission(
+                            budget_backend_class,
+                            budget_limits,
+                            &shared_run_budget,
+                            resource_estimate,
+                        ) catch |err| {
+                            results[idx].@"error" = .{
+                                .code = if (err == error.ResourceTemporarilyUnavailable) "MODEL_RESOURCE_BUSY" else "MODEL_RESOURCE_LIMIT",
+                                .message = @errorName(err),
+                                .retryable = err == error.ResourceTemporarilyUnavailable,
+                            };
+                            pending[idx] = false;
+                            if (model.native_generate_coordinator) |coordinator| {
+                                coordinator.release(leases[pos]);
+                                leases[pos].request_id = 0;
+                            }
+                            continue;
+                        };
+                    }
+                    if (execution_mode == .isolated_parallel) {
+                        task_cbs[pos] = session_factory.getComputeBackendWithBudget(
+                            model.session,
+                            task_alloc,
+                            &task_run_budgets[pos],
+                        ) catch |err| {
+                            releaseBatchAdmission(&task_run_budgets[pos], &admissions[pos]);
+                            results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
+                            pending[idx] = false;
+                            if (model.native_generate_coordinator) |coordinator| {
+                                coordinator.release(leases[pos]);
+                                leases[pos].request_id = 0;
+                            }
+                            continue;
+                        };
+                    }
+                    const task_cb = if (execution_mode == .isolated_parallel)
+                        task_cbs[pos].?
+                    else
+                        shared_cb.?;
                     decode_states[pos] = generation.NativeDecodeState.initPaged(task_alloc, &kv_manager, pool_id, model.shared_moe_cache);
                     decode_states[pos].kv_lock = &kv_mutex;
                     decode_states[pos].kv_storage = &kv_storage;
@@ -5320,7 +6658,7 @@ pub const Node = struct {
                         .pipeline = .{
                             .allocator = task_alloc,
                             .io = ctx.io,
-                            .cb = cb,
+                            .cb = task_cb,
                             .session = model.session,
                             .gpt_config = gpt_config,
                             .kv_dtype = kv_dtype,
@@ -5343,18 +6681,28 @@ pub const Node = struct {
                         .out = &task_results[pos],
                     };
                     task_ran[pos] = true;
-                }
-
-                // Scheduler turns are claimed before a worker takes the model
-                // mutex. Keeping the setup lock here would invert that order
-                // against an existing request that owns a turn and is waiting
-                // for this mutex. Hand ownership to the workers until all of
-                // them have completed, then take it back for shared teardown.
-                model_lock.releaseForWorkers();
-                var spawned_any = false;
-                var group = std.Io.Group.init;
-                for (task_ran, 0..) |run_task, pos| {
-                    if (!run_task) continue;
+                    if (execution_mode == .shared_serial) {
+                        tasks[pos].run() catch {};
+                        if (model.native_generate_coordinator) |coordinator| {
+                            if (leases[pos].request_id != 0) {
+                                coordinator.release(leases[pos]);
+                                leases[pos].request_id = 0;
+                            }
+                        }
+                        releaseBatchAdmission(&shared_run_budget, &admissions[pos]);
+                        decode_states[pos].deinit();
+                        decode_states[pos] = generation.NativeDecodeState.initContiguous(ctx.allocator);
+                        try applyBatchGenerateTaskResult(
+                            response_alloc,
+                            body.requests[idx].body.model,
+                            task_results[pos],
+                            &results[idx],
+                        );
+                        pending[idx] = false;
+                        task_arenas[pos].deinit();
+                        task_arenas[pos] = std.heap.ArenaAllocator.init(ctx.allocator);
+                        continue;
+                    }
                     group.concurrent(ctx.io, BatchGenerateTask.run, .{&tasks[pos]}) catch {
                         tasks[pos].run() catch {};
                         continue;
@@ -5362,27 +6710,18 @@ pub const Node = struct {
                     spawned_any = true;
                 }
                 if (spawned_any) group.await(ctx.io) catch {};
-                model_lock.reacquireForTeardown();
                 for (group_indices.items, 0..) |idx, pos| {
                     if (!pending[idx]) continue;
                     if (!task_ran[pos]) {
                         pending[idx] = false;
                         continue;
                     }
-                    if (task_results[pos].@"error") |batch_err| {
-                        results[idx].@"error" = batch_err;
-                    } else if (task_results[pos].text) |text| {
-                        results[idx].response = try buildGenerateResponseValue(
-                            response_alloc,
-                            body.requests[idx].body.model,
-                            text,
-                            task_results[pos].finish_reason,
-                            task_results[pos].prompt_tokens,
-                            task_results[pos].completion_tokens,
-                        );
-                    } else {
-                        results[idx].@"error" = .{ .code = "GENERATION_FAILED", .message = "missing batch generation result", .retryable = true };
-                    }
+                    try applyBatchGenerateTaskResult(
+                        response_alloc,
+                        body.requests[idx].body.model,
+                        task_results[pos],
+                        &results[idx],
+                    );
                     pending[idx] = false;
                 }
             }
@@ -6048,8 +7387,10 @@ pub const Node = struct {
             return self.recognizeRebel(ctx, model_path, body);
         }
 
-        const model = self.model_manager.loadFromDir(model_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
+        var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        defer model_handle.release();
+        const model = model_handle.get();
 
         // Use GLiNER pipeline for GLiNER models, standard NER for BIO models
         if (model.isGlinerModel()) {
@@ -6064,7 +7405,7 @@ pub const Node = struct {
 
         var pipeline = model.nerPipeline(ctx.allocator);
         const all_entities = pipeline.recognizeBatch(body.texts) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
+            return inferenceFailureResponse(ctx, err);
         defer {
             for (all_entities) |entities| {
                 for (entities) |e| ctx.allocator.free(e.text);
@@ -6108,31 +7449,33 @@ pub const Node = struct {
         defer hf_tok.deinitSelf();
 
         var config = rebel_mod.loadConfig(ctx.allocator, model_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
+            return modelLoadFailureResponse(ctx, err);
 
         const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
         if (dec_config.max_length > 0) config.max_length = dec_config.max_length;
 
-        const sessions = blk: {
-            var encoder_session = self.session_manager.loadModel(paths.encoder) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
-            errdefer encoder_session.close();
-
-            const decoder_session = self.session_manager.loadModel(paths.decoder) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
-
-            break :blk .{
-                .encoder = encoder_session,
-                .decoder = decoder_session,
-            };
-        };
+        var component_loader = self.model_manager.componentLoaderForPaths(
+            model_path,
+            self.session_manager.preferred_backends,
+            &.{ paths.encoder, paths.decoder },
+        ) catch |err| return modelLoadFailureResponse(ctx, err);
+        var encoder_managed = component_loader.load(paths.encoder) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        defer encoder_managed.deinit();
+        var strict_loader = component_loader.restrictToBackend(encoder_managed.session.backend()) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        var decoder_managed = strict_loader.load(paths.decoder) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        defer decoder_managed.deinit();
+        const encoder_session = encoder_managed.disownSession();
+        const decoder_session = decoder_managed.disownSession();
 
         var pipeline = rebel_mod.RebelPipeline{
             .allocator = ctx.allocator,
             .enc_dec = .{
                 .allocator = ctx.allocator,
-                .encoder = sessions.encoder,
-                .decoder = sessions.decoder,
+                .encoder = encoder_session,
+                .decoder = decoder_session,
                 .config = dec_config,
             },
             .tokenizer = hf_tok.tokenizer(),
@@ -6143,7 +7486,7 @@ pub const Node = struct {
         if (body.relation_labels) |relation_labels| {
             if (relation_labels.len > 0) {
                 const extracted = pipeline.extractRelationsBatch(body.texts, body.labels, relation_labels) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
+                    return inferenceFailureResponse(ctx, err);
                 defer {
                     for (extracted.entities) |entities| {
                         for (entities) |entity| ctx.allocator.free(entity.text);
@@ -6169,7 +7512,7 @@ pub const Node = struct {
         }
 
         const all_entities = pipeline.recognizeBatch(body.texts) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
+            return inferenceFailureResponse(ctx, err);
         defer {
             for (all_entities) |entities| {
                 for (entities) |entity| ctx.allocator.free(entity.text);
@@ -6210,7 +7553,7 @@ pub const Node = struct {
 
             const relation_labels = body.relation_labels.?;
             const extracted = pipeline.extractRelationsBatch(body.texts, labels, relation_labels) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
+                return inferenceFailureResponse(ctx, err);
             defer {
                 for (extracted.entities) |entities| {
                     for (entities) |e| ctx.allocator.free(e.text);
@@ -6235,7 +7578,7 @@ pub const Node = struct {
         }
 
         const all_entities = pipeline.recognizeBatch(body.texts, labels) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
+            return inferenceFailureResponse(ctx, err);
         defer {
             for (all_entities) |entities| {
                 for (entities) |e| ctx.allocator.free(e.text);
@@ -6324,10 +7667,11 @@ pub const Node = struct {
         defer self.metrics.decActive();
 
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
-        if (self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "classifiers")) |model_path| {
-            defer ctx.allocator.free(model_path);
-            const model = self.model_manager.loadFromDir(model_path) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
+        if (self.resolveModelPath(ctx.io, model_name, "classifiers")) |model_path| {
+            var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+                return modelLoadFailureResponse(ctx, err);
+            defer model_handle.release();
+            const model = model_handle.get();
 
             // Detect entailment index from id2label (varies by NLI model)
             const entailment_idx: ?usize = if (model.manifest.id2label) |labels| blk: {
@@ -6348,25 +7692,26 @@ pub const Node = struct {
             var pipeline = model.classificationPipeline(ctx.allocator, config);
 
             const all_results = pipeline.classifyBatch(body.texts, body.labels) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
+                return inferenceFailureResponse(ctx, err);
             defer {
                 for (all_results) |r| ctx.allocator.free(r);
                 ctx.allocator.free(all_results);
             }
 
             const prompt_tokens =
-                (countTokenizerTexts(ctx.allocator, model.getTokenizer(), body.texts) catch estimateTextsTokens(body.texts)) +
-                (countTokenizerTexts(ctx.allocator, model.getTokenizer(), body.labels) catch estimateTextsTokens(body.labels));
+                (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.texts) catch estimateTextsTokens(body.texts)) +
+                (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.labels) catch estimateTextsTokens(body.labels));
             return buildClassificationResponse(ctx, body.model, all_results, prompt_tokens);
         } else |err| switch (requestModelResolutionErrorKind(err)) {
             .missing => {},
             .invalid, .internal => return requestModelResolutionError(ctx, err),
         }
 
-        if (self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "recognizers")) |model_path| {
-            defer ctx.allocator.free(model_path);
-            const model = self.model_manager.loadFromDir(model_path) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
+        if (self.resolveModelPath(ctx.io, model_name, "recognizers")) |model_path| {
+            var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+                return modelLoadFailureResponse(ctx, err);
+            defer model_handle.release();
+            const model = model_handle.get();
             if (!model.isGlinerModel() or !model.supportsClassification()) {
                 return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
             }
@@ -6376,8 +7721,8 @@ pub const Node = struct {
                 .threshold = 0.0,
                 .multi_label = body.multi_label orelse false,
             }) catch |err| switch (err) {
-                error.MissingSpecialTokenIds => return ctx.status(500).json(.{ .@"error" = "MODEL_CONFIG_INVALID", .message = internalErrorMessage("MODEL_CONFIG_INVALID", err) }),
-                else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
+                error.MissingSpecialTokenIds => return ctx.status(500).json(.{ .@"error" = "MODEL_CONFIG_INVALID", .message = @errorName(err) }),
+                else => return inferenceFailureResponse(ctx, err),
             };
             defer {
                 for (all_results) |r| ctx.allocator.free(r);
@@ -6385,8 +7730,8 @@ pub const Node = struct {
             }
 
             const prompt_tokens =
-                (countTokenizerTexts(ctx.allocator, model.getTokenizer(), body.texts) catch estimateTextsTokens(body.texts)) +
-                (countTokenizerTexts(ctx.allocator, model.getTokenizer(), body.labels) catch estimateTextsTokens(body.labels));
+                (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.texts) catch estimateTextsTokens(body.texts)) +
+                (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.labels) catch estimateTextsTokens(body.labels));
             return buildClassificationResponse(ctx, body.model, all_results, prompt_tokens);
         } else |err| switch (requestModelResolutionErrorKind(err)) {
             .missing => {},
@@ -6422,7 +7767,7 @@ pub const Node = struct {
         defer ctx.allocator.free(checkpoint_path);
 
         var head = document_classification.Head.load(ctx.allocator, checkpoint_path, prefix) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
+            return modelLoadFailureResponse(ctx, err);
         defer head.deinit();
 
         const num_tokens: usize = std.math.cast(usize, body.num_tokens) orelse
@@ -6435,7 +7780,7 @@ pub const Node = struct {
 
         const features = document_classification.extractFeatures(ctx.allocator, input) catch |err| switch (err) {
             error.FileNotFound => return ctx.status(404).json(.{ .@"error" = "IMAGE_NOT_FOUND", .message = "image not found" }),
-            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
+            else => return inferenceFailureResponse(ctx, err),
         };
 
         const results = document_classification.classifyWithHead(ctx.allocator, &head, body.labels, input) catch |err| switch (err) {
@@ -6444,7 +7789,7 @@ pub const Node = struct {
                 .message = "label count does not match checkpoint output width",
             }),
             error.FileNotFound => return ctx.status(404).json(.{ .@"error" = "IMAGE_NOT_FOUND", .message = "image not found" }),
-            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
+            else => return inferenceFailureResponse(ctx, err),
         };
         defer ctx.allocator.free(results);
 
@@ -6524,7 +7869,7 @@ pub const Node = struct {
         defer ctx.allocator.free(checkpoint_path);
 
         var head = document_token_classification.Head.load(ctx.allocator, checkpoint_path, prefix) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
+            return modelLoadFailureResponse(ctx, err);
         defer head.deinit();
 
         const tokens = try ctx.allocator.alloc(document_token_classification.TokenBox, body.tokens.len);
@@ -6549,7 +7894,7 @@ pub const Node = struct {
                 .@"error" = "INVALID_REQUEST",
                 .message = "label count does not match checkpoint output width",
             }),
-            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
+            else => return inferenceFailureResponse(ctx, err),
         };
         defer {
             for (predictions) |pred| ctx.allocator.free(pred.scores);
@@ -6667,25 +8012,21 @@ pub const Node = struct {
         defer ctx.allocator.free(paths.encoder);
         defer ctx.allocator.free(paths.decoder);
 
-        // Load encoder and decoder sessions via the session manager.
-        // Sessions are owned by this handler: a close flag guards all exit
-        // paths (both error returns and ctx.status non-error returns), and
-        // the enclosing pipeline is kept as a plain value (no deinit) so
-        // closes never run twice.
-        var encoder_session: backends_mod.Session = undefined;
-        var close_encoder = false;
-        defer if (close_encoder) encoder_session.close();
-        var decoder_session: backends_mod.Session = undefined;
-        var close_decoder = false;
-        defer if (close_decoder) decoder_session.close();
-
-        encoder_session = self.session_manager.loadModel(paths.encoder) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
-        close_encoder = true;
-
-        decoder_session = self.session_manager.loadModel(paths.decoder) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
-        close_decoder = true;
+        var component_loader = self.model_manager.componentLoaderForPaths(
+            model_path,
+            self.session_manager.preferred_backends,
+            &.{ paths.encoder, paths.decoder },
+        ) catch |err| return modelLoadFailureResponse(ctx, err);
+        var encoder_managed = component_loader.load(paths.encoder) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        defer encoder_managed.deinit();
+        var strict_loader = component_loader.restrictToBackend(encoder_managed.session.backend()) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        var decoder_managed = strict_loader.load(paths.decoder) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        defer decoder_managed.deinit();
+        const encoder_session = encoder_managed.session;
+        const decoder_session = decoder_managed.session;
 
         // Parse decoder config
         const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
@@ -6732,13 +8073,13 @@ pub const Node = struct {
         var completion_tokens: usize = 0;
         for (body.inputs, 0..) |input_text, i| {
             var result = pipeline.rewrite(input_text) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) });
+                return inferenceFailureResponse(ctx, err);
             defer result.deinit();
 
             const inner = try ctx.allocator.alloc([]const u8, 1);
             errdefer ctx.allocator.free(inner);
             inner[0] = try ctx.allocator.dupe(u8, result.text);
-            completion_tokens += countTokenizerTokens(ctx.allocator, hf_tok.tokenizer(), result.text) catch estimateTextTokens(result.text);
+            completion_tokens += countTokenizerTokens(ctx.allocator, self.session_manager.io, hf_tok.tokenizer(), result.text) catch estimateTextTokens(result.text);
             data[i] = .{
                 .object = "rewrite",
                 .index = @intCast(i),
@@ -6747,7 +8088,7 @@ pub const Node = struct {
             filled = i + 1;
         }
 
-        const prompt_tokens = countTokenizerTexts(ctx.allocator, hf_tok.tokenizer(), body.inputs) catch estimateTextsTokens(body.inputs);
+        const prompt_tokens = countTokenizerTexts(ctx.allocator, self.session_manager.io, hf_tok.tokenizer(), body.inputs) catch estimateTextsTokens(body.inputs);
         return ctx.json(api.RewriteResponse{
             .object = "list",
             .data = data,
@@ -6881,7 +8222,7 @@ pub const Node = struct {
                 .@"error" = "INVALID_REQUEST",
                 .message = "'max_tokens' exceeds the selected model's context limit",
             }),
-            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
+            else => return inferenceFailureResponse(ctx, err),
         };
         defer {
             for (results) |result| {
@@ -7009,25 +8350,33 @@ pub const Node = struct {
         const hf_tokenizer = @import("inference_hf_tokenizer");
         var encoder_session: backends_mod.Session = undefined;
         var decoder_session: backends_mod.Session = undefined;
-        var close_encoder = false;
-        defer if (close_encoder) encoder_session.close();
-        var close_decoder = false;
-        defer if (close_decoder) decoder_session.close();
+        var encoder_managed: ?model_manager_mod.ManagedSession = null;
+        defer if (encoder_managed) |*managed| managed.deinit();
+        var decoder_managed: ?model_manager_mod.ManagedSession = null;
+        defer if (decoder_managed) |*managed| managed.deinit();
         var tokenizer: tokenizer_mod.Tokenizer = undefined;
         var hf_tok_owned: ?*hf_tokenizer.HfTokenizer = null;
         defer if (hf_tok_owned) |hf_tok| hf_tok.deinitSelf();
+        var loaded_model_handle: ?model_manager_mod.ModelHandle = null;
+        defer if (loaded_model_handle) |*handle| handle.release();
 
         if (enc_dec_mod.findEncoderDecoderPaths(ctx.allocator, model_path)) |paths| {
             defer ctx.allocator.free(paths.encoder);
             defer ctx.allocator.free(paths.decoder);
 
-            encoder_session = self.session_manager.loadModel(paths.encoder) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
-            close_encoder = true;
-
-            decoder_session = self.session_manager.loadModel(paths.decoder) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
-            close_decoder = true;
+            var component_loader = self.model_manager.componentLoaderForPaths(
+                model_path,
+                self.session_manager.preferred_backends,
+                &.{ paths.encoder, paths.decoder },
+            ) catch |err| return modelLoadFailureResponse(ctx, err);
+            encoder_managed = component_loader.load(paths.encoder) catch |err|
+                return modelLoadFailureResponse(ctx, err);
+            encoder_session = encoder_managed.?.session;
+            var strict_loader = component_loader.restrictToBackend(encoder_session.backend()) catch |err|
+                return modelLoadFailureResponse(ctx, err);
+            decoder_managed = strict_loader.load(paths.decoder) catch |err|
+                return modelLoadFailureResponse(ctx, err);
+            decoder_session = decoder_managed.?.session;
 
             const tok_path = std.fmt.allocPrint(ctx.allocator, "{s}/tokenizer.json", .{model_path}) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
@@ -7043,8 +8392,9 @@ pub const Node = struct {
                 tokenizer = hf_tok.tokenizer();
             }
         } else |_| {
-            const model = self.model_manager.loadFromDir(model_path) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) });
+            loaded_model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+                return modelLoadFailureResponse(ctx, err);
+            const model = loaded_model_handle.?.get();
             if (session_factory.getWhisperConfig(model.session) == null) {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_MODEL",
@@ -7097,7 +8447,7 @@ pub const Node = struct {
             .object = "list",
             .data = &data,
             .model = model_str,
-            .usage = tokenUsage(0, countTokenizerTokens(ctx.allocator, tokenizer, result.text) catch estimateTextTokens(result.text)),
+            .usage = tokenUsage(0, countTokenizerTokens(ctx.allocator, self.session_manager.io, tokenizer, result.text) catch estimateTextTokens(result.text)),
         });
     }
 
@@ -7332,6 +8682,8 @@ pub const Node = struct {
         defer body.deinit(a);
         var openai_data = std.ArrayListUnmanaged(u8).empty;
         defer openai_data.deinit(a);
+        var openai_models = std.StringHashMapUnmanaged(void).empty;
+        defer openai_models.deinit(a);
         var openai_data_count: usize = 0;
         const list_created = completionCreatedTimestamp();
 
@@ -7346,24 +8698,67 @@ pub const Node = struct {
             if (discovered.len > 0) ra.free(discovered);
         }
 
+        var discovered_listings = std.ArrayListUnmanaged(DiscoveredModelListing).empty;
+        defer {
+            for (discovered_listings.items) |*listing| listing.deinit();
+            discovered_listings.deinit(a);
+        }
+        try discovered_listings.ensureTotalCapacity(a, discovered.len);
+        for (discovered, 0..) |entry, entry_index| {
+            var manifest = manifest_mod.loadFromDir(a, entry.path) catch continue;
+            if (!model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(manifest)) {
+                manifest.deinit();
+                continue;
+            }
+            const model_kind = @tagName(manifest.model_type);
+            const reader_candidate = taskMatchesModelListing(
+                "readers",
+                model_kind,
+                manifest.gliner_model_type,
+                manifest.tasks,
+                manifest.capabilities,
+            );
+            const compatibility_summary = self.compatibilitySummaryForDir(a, entry.path) catch CompatibilitySummary{
+                .level = .unknown,
+                .code = .artifact_unreadable,
+                .message = "model compatibility could not be determined",
+            };
+            discovered_listings.appendAssumeCapacity(.{
+                .entry_index = entry_index,
+                .manifest = manifest,
+                .reader_supported = reader_candidate and readers_mod.isSupportedModelDir(a, entry.path),
+                .kind = model_kind,
+                .compatibility_level = @tagName(compatibility_summary.level),
+            });
+        }
+
         const task_names = [_][]const u8{
             "embedders",  "rerankers",   "chunkers",
             "generators", "recognizers", "classifiers",
             "rewriters",  "readers",     "transcribers",
             "extractors",
         };
-        // Listing metadata is immutable after publication, and loaded models
-        // remain manager-owned until Node teardown. Snapshot pointers while
-        // holding the registry lock so filesystem canonicalization and
-        // manifest rendering cannot stall inference lookups or publication.
-        var loaded_model_snapshot = std.ArrayListUnmanaged(*model_manager_mod.LoadedModel).empty;
-        defer loaded_model_snapshot.deinit(a);
-        {
-            var loaded_models = self.model_manager.lockLoadedModels(io);
-            defer loaded_models.deinit();
-            var loaded_it = loaded_models.models().valueIterator();
-            while (loaded_it.next()) |model| try loaded_model_snapshot.append(a, model.*);
+        // Keep every snapshotted model alive while filesystem canonicalization
+        // and manifest rendering run without the manager lock.
+        var loaded_model_snapshot = std.ArrayListUnmanaged(model_manager_mod.ModelHandle).empty;
+        defer {
+            for (loaded_model_snapshot.items) |*handle| handle.release();
+            loaded_model_snapshot.deinit(a);
         }
+        self.model_manager.lockLoadedModels();
+        loaded_model_snapshot.ensureTotalCapacity(a, self.model_manager.loaded.count()) catch |err| {
+            self.model_manager.unlockLoadedModels();
+            return err;
+        };
+        var loaded_it = self.model_manager.loaded.valueIterator();
+        while (loaded_it.next()) |model| {
+            model.*.active_handles += 1;
+            loaded_model_snapshot.appendAssumeCapacity(.{
+                .manager = &self.model_manager,
+                .model = model.*,
+            });
+        }
+        self.model_manager.unlockLoadedModels();
 
         const LoadedListing = struct {
             model: *model_manager_mod.LoadedModel,
@@ -7403,7 +8798,8 @@ pub const Node = struct {
         defer if (canonical_models_dir) |path| a.free(path);
 
         if (canonical_models_dir) |models_root| {
-            for (loaded_model_snapshot.items) |model| {
+            for (loaded_model_snapshot.items) |*model_handle| {
+                const model = model_handle.get();
                 if (discoveredContainsModelDir(discovered, model.model_dir)) continue;
 
                 const canonical_model_dir = realPathExistingAlloc(a, io, model.model_dir) catch |err| {
@@ -7454,57 +8850,123 @@ pub const Node = struct {
             }
 
             // Add discovered models matching this task
-            for (discovered) |entry| {
-                if (!model_manager_mod.isModelDirPotentiallyLoadableInCurrentBuild(a, entry.path)) continue;
-                if (std.mem.eql(u8, task, "readers") and !readers_mod.isSupportedModelDir(a, entry.path)) continue;
+            for (discovered_listings.items) |*listing| {
+                const entry = discovered[listing.entry_index];
+                if (std.mem.eql(u8, task, "readers") and !listing.reader_supported) continue;
 
-                var maybe_manifest: ?manifest_mod.ModelManifest = manifest_mod.loadFromDir(a, entry.path) catch null;
-                defer if (maybe_manifest) |*man| man.deinit();
-
-                const tasks = if (maybe_manifest) |*man| man.tasks else &.{};
-                const capabilities = if (maybe_manifest) |*man| man.capabilities else &.{};
-                const gliner_model_type = if (maybe_manifest) |*man| man.gliner_model_type else "";
-                const inputs = if (maybe_manifest) |*man| man.inputs else &.{};
-                const has_visual = if (maybe_manifest) |*man| man.visual_model_path != null or man.visual_projection_path != null else false;
-                const has_audio = if (maybe_manifest) |*man| man.audio_model_path != null or man.audio_projection_path != null else false;
-                if (!taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities)) continue;
+                const tasks = listing.manifest.tasks;
+                const capabilities = listing.manifest.capabilities;
+                const gliner_model_type = listing.manifest.gliner_model_type;
+                const inputs = listing.manifest.inputs;
+                const has_visual = listing.manifest.visual_model_path != null or listing.manifest.visual_projection_path != null;
+                const has_audio = listing.manifest.audio_model_path != null or listing.manifest.audio_projection_path != null;
+                if (!taskMatchesModelListing(task, listing.kind, gliner_model_type, tasks, capabilities)) continue;
 
                 if (model_count > 0) try body.append(a, ',');
                 try jsonEncodeString(&body, a, entry.name);
                 try body.append(a, ':');
-                try appendModelInfo(&body, a, @tagName(entry.kind), gliner_model_type, capabilities, inputs, has_visual, has_audio);
+                // Discovery does not parse chat templates (that is what made this handler
+                // slow), so only models already loaded can report a template failure.
+                const chat_template_failed =
+                    self.model_manager.loadedChatTemplateFailed(entry.path) orelse false;
+                try appendModelInfo(
+                    &body,
+                    a,
+                    listing.kind,
+                    gliner_model_type,
+                    capabilities,
+                    inputs,
+                    has_visual,
+                    has_audio,
+                    chat_template_failed,
+                    listing.compatibility_level,
+                );
                 if (isOpenAiListTask(task)) {
-                    if (openai_data_count > 0) try openai_data.append(a, ',');
-                    try appendOpenAiModelEntry(&openai_data, a, entry.name, list_created);
-                    openai_data_count += 1;
+                    const enabled = listing.compatibility_level.len > 0 and
+                        (!std.mem.eql(u8, listing.compatibility_level, "unknown") or self.config.allow_unknown_models) and
+                        !std.mem.eql(u8, listing.compatibility_level, "incompatible");
+                    if (enabled) {
+                        try appendUniqueOpenAiModelEntry(
+                            &openai_data,
+                            a,
+                            &openai_models,
+                            &openai_data_count,
+                            entry.name,
+                            list_created,
+                            listing.compatibility_level,
+                        );
+                    }
                 }
                 model_count += 1;
             }
 
-            // Add each undiscovered loaded directory once. Internal backend
-            // variant keys are intentionally never part of the response.
-            for (loaded_listings.items) |listing| {
-                const model = listing.model;
-                const model_task = @tagName(model.manifest.model_type);
-                if (!taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) continue;
+            // Add loaded models not yet listed (loaded by path, not discovered by name)
+            {
+                self.model_manager.lockLoadedModels();
+                defer self.model_manager.unlockLoadedModels();
+                var loaded_paths_seen = std.ArrayListUnmanaged([]const u8).empty;
+                defer loaded_paths_seen.deinit(a);
+                var it = self.model_manager.loaded.iterator();
+                while (it.next()) |entry| {
+                    const model = entry.value_ptr.*;
+                    const model_task = @tagName(model.manifest.model_type);
+                    if (!taskMatchesModelListing(task, model_task, model.manifest.gliner_model_type, model.manifest.tasks, model.manifest.capabilities)) continue;
 
-                if (model_count > 0) try body.append(a, ',');
-                try jsonEncodeString(&body, a, listing.identifier);
-                try body.append(a, ':');
-                try appendModelInfo(
-                    &body,
-                    a,
-                    model_task,
-                    model.manifest.gliner_model_type,
-                    model.manifest.capabilities,
-                    model.manifest.inputs,
-                    model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
-                    model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
-                );
-                if (isOpenAiListTask(task)) {
-                    if (openai_data_count > 0) try openai_data.append(a, ',');
-                    try appendOpenAiModelEntry(&openai_data, a, listing.identifier, list_created);
-                    openai_data_count += 1;
+                    // Skip if already listed from discovery
+                    var already_listed = false;
+                    for (discovered) |d| {
+                        if (std.mem.eql(u8, d.path, model.model_dir)) {
+                            already_listed = true;
+                            break;
+                        }
+                    }
+                    if (!already_listed) {
+                        for (loaded_paths_seen.items) |path| {
+                            if (std.mem.eql(u8, path, model.model_dir)) {
+                                already_listed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!already_listed) {
+                        try loaded_paths_seen.append(a, model.model_dir);
+                        if (model_count > 0) try body.append(a, ',');
+                        try jsonEncodeString(&body, a, model.model_dir);
+                        try body.append(a, ':');
+                        const loaded_compatibility = self.compatibilitySummaryForDir(a, model.model_dir) catch CompatibilitySummary{
+                            .level = .unknown,
+                            .code = .artifact_unreadable,
+                            .message = "model compatibility could not be determined",
+                        };
+                        try appendModelInfo(
+                            &body,
+                            a,
+                            model_task,
+                            model.manifest.gliner_model_type,
+                            model.manifest.capabilities,
+                            model.manifest.inputs,
+                            model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
+                            model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
+                            model.chat_template_failed,
+                            @tagName(loaded_compatibility.level),
+                        );
+                        if (isOpenAiListTask(task)) {
+                            const enabled = loaded_compatibility.level == .compatible or
+                                (loaded_compatibility.level == .unknown and self.config.allow_unknown_models);
+                            if (enabled) {
+                                try appendUniqueOpenAiModelEntry(
+                                    &openai_data,
+                                    a,
+                                    &openai_models,
+                                    &openai_data_count,
+                                    model.model_dir,
+                                    list_created,
+                                    @tagName(loaded_compatibility.level),
+                                );
+                            }
+                        }
+                        model_count += 1;
+                    }
                 }
                 model_count += 1;
             }
@@ -7673,9 +9135,9 @@ pub const Node = struct {
         try @constCast(&node.metrics).render(&writer.writer);
 
         // Scheduler metrics (computed on-the-fly from loaded models)
-        var loaded_models = node.model_manager.lockLoadedModels(ctx.io);
-        defer loaded_models.deinit();
-        const aggregate = runtime.scheduler.native_generate.aggregateStats(loaded_models.models());
+        node.model_manager.lockLoadedModels();
+        defer node.model_manager.unlockLoadedModels();
+        const aggregate = runtime.scheduler.native_generate.aggregateStats(node.model_manager.loaded);
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_waiting_requests", "gauge", "Waiting native scheduler requests across loaded models", aggregate.snapshot.waiting_requests);
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_prefill_requests", "gauge", "Prefill-phase native scheduler requests across loaded models", aggregate.snapshot.prefill_requests);
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_decode_requests", "gauge", "Decode-phase native scheduler requests across loaded models", aggregate.snapshot.decode_requests);
@@ -7693,10 +9155,10 @@ pub const Node = struct {
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_5_8_total", "counter", "Unified scheduler steps containing five through eight items", aggregate.stats.step_batch_size_5_8_total);
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_9_16_total", "counter", "Unified scheduler steps containing nine through sixteen items", aggregate.stats.step_batch_size_9_16_total);
         try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_turn_yields_total", "counter", "Total cooperative scheduler yields while waiting for turns", aggregate.stats.turn_yields_total);
-        try appendResidentProjectionMetrics(&writer.writer, aggregateResidentProjectionStats(loaded_models.models()));
+        try appendResidentProjectionMetrics(&writer.writer, aggregateResidentProjectionStats(node.model_manager.loaded));
         try appendGraphExecutorMetrics(&writer.writer, graph_mod.executor_stats.snapshot());
-        try appendMetalExactJitMetrics(&writer.writer, aggregateMetalExactJitStats(loaded_models.models()));
-        try appendPromptCacheMetrics(&writer.writer, loaded_models.models());
+        try appendMetalExactJitMetrics(&writer.writer, aggregateMetalExactJitStats(node.model_manager.loaded));
+        try appendPromptCacheMetrics(&writer.writer, node.model_manager.loaded);
 
         try ctx.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
         return ctx.text(writer.writer.buffered());
@@ -7711,10 +9173,13 @@ pub const Node = struct {
             .status = "not_ready",
             .models = ModelCounts{},
         });
-        return discoveredModelsReadinessResponse(
-            ctx,
-            collectDiscoveredModelCounts(models_dir, ctx.allocator, ctx.io),
-        );
+        const counts = collectDiscoveredModelCounts(models_dir, ctx.allocator, ctx.io);
+        const status_text = if (counts.total() > 0) "ready" else "not_ready";
+        const status_code: u16 = if (counts.total() > 0) 200 else 503;
+        return ctx.status(status_code).json(.{
+            .status = status_text,
+            .models = counts,
+        });
     }
 };
 
@@ -8585,6 +10050,39 @@ test "graph executor metrics render counters" {
     try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_top_fallback_reason{reason=\"tensor_core_repack_required\"} 14\n") != null);
 }
 
+test "OpenAI model listing deduplicates multi-task models" {
+    var output = std.ArrayListUnmanaged(u8).empty;
+    defer output.deinit(std.testing.allocator);
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(std.testing.allocator);
+    var count: usize = 0;
+
+    try appendUniqueOpenAiModelEntry(
+        &output,
+        std.testing.allocator,
+        &seen,
+        &count,
+        "antflydb/clipclap",
+        17,
+        "compatible",
+    );
+    try appendUniqueOpenAiModelEntry(
+        &output,
+        std.testing.allocator,
+        &seen,
+        &count,
+        "antflydb/clipclap",
+        17,
+        "compatible",
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, output.items, "\"id\":\"antflydb/clipclap\""),
+    );
+}
+
 fn taskMatchesModelListing(task: []const u8, model_kind: []const u8, gliner_model_type: []const u8, tasks: []const []const u8, capabilities: []const []const u8) bool {
     if (tasks.len > 0) {
         const singular_task: ?[]const u8 = if (std.mem.eql(u8, task, "embedders"))
@@ -8631,6 +10129,11 @@ fn appendModelInfo(
     inputs: []const []const u8,
     has_visual: bool,
     has_audio: bool,
+    /// Set when the model shipped a chat template we could not parse. Without this the
+    /// degradation to raw prompting is invisible to API clients.
+    chat_template_failed: bool,
+    /// Artifact compatibility derived for the current build.
+    compatibility_level: []const u8,
 ) !void {
     const inferred_classification = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification") and !model_caps.hasCapability(capabilities, "classification");
     const inferred_relations = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "relations") and !model_caps.hasCapability(capabilities, "relations");
@@ -8640,7 +10143,18 @@ fn appendModelInfo(
         model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "audio");
 
     if (capabilities.len == 0 and !inferred_classification and !inferred_relations and !inferred_extraction and !has_known_inputs) {
-        try buf.appendSlice(allocator, "{}");
+        if (!chat_template_failed and compatibility_level.len == 0) {
+            try buf.appendSlice(allocator, "{}");
+            return;
+        }
+        try buf.append(allocator, '{');
+        if (chat_template_failed) try buf.appendSlice(allocator, "\"chat_template\":false");
+        if (compatibility_level.len > 0) {
+            if (chat_template_failed) try buf.append(allocator, ',');
+            try buf.appendSlice(allocator, "\"compatibility\":");
+            try jsonEncodeString(buf, allocator, compatibility_level);
+        }
+        try buf.append(allocator, '}');
         return;
     }
 
@@ -8674,7 +10188,13 @@ fn appendModelInfo(
         try jsonEncodeString(buf, allocator, input);
         input_index += 1;
     }
-    try buf.appendSlice(allocator, "]}");
+    try buf.append(allocator, ']');
+    if (chat_template_failed) try buf.appendSlice(allocator, ",\"chat_template\":false");
+    if (compatibility_level.len > 0) {
+        try buf.appendSlice(allocator, ",\"compatibility\":");
+        try jsonEncodeString(buf, allocator, compatibility_level);
+    }
+    try buf.append(allocator, '}');
 }
 
 /// Wrapper that prepends a path prefix to route registrations.
@@ -9001,10 +10521,10 @@ test "generate draft KV pool uses safe model geometry" {
 }
 
 test "generate rejects an ONNX draft before model loading" {
-    const onnx = try parseGenerateBackendSelection(.onnx, null, null);
+    const onnx = GenerateBackendSelection{ .native_choice = .onnx };
     try std.testing.expectError(error.OnnxDraftUnsupported, validateGenerateDraftBackend(onnx, "draft"));
     try validateGenerateDraftBackend(onnx, null);
-    try validateGenerateDraftBackend(try parseGenerateBackendSelection(.native, null, null), "draft");
+    try validateGenerateDraftBackend(.{ .native_choice = .native }, "draft");
 }
 
 test "generate speculation outcome metrics classify completed requests" {
@@ -9127,135 +10647,19 @@ test "generate batch preflight rejects image content without parsing media" {
     try std.testing.expectEqualStrings("UNSUPPORTED_MULTIMODAL", reason.code);
 }
 
-test "generate batch message parse errors retain normalized content semantics" {
-    const cases = [_]struct {
-        err: anyerror,
-        code: []const u8,
-        message: []const u8,
-        retryable: bool,
-    }{
-        .{ .err = error.RemoteContentTooLarge, .code = "CONTENT_TOO_LARGE", .message = "media content exceeds the configured size limit", .retryable = false },
-        .{ .err = error.RemoteContentNotAllowed, .code = "CONTENT_NOT_ALLOWED", .message = "remote content URL is blocked by content security policy", .retryable = false },
-        .{ .err = error.RemoteContentInvalid, .code = "INVALID_CONTENT_URL", .message = "remote content URL or inline data is invalid", .retryable = false },
-        .{ .err = error.RemoteContentNotConfigured, .code = "CONTENT_FETCH_NOT_CONFIGURED", .message = "remote content storage is not configured", .retryable = false },
-        .{ .err = error.RemoteContentUnavailable, .code = "CONTENT_FETCH_FAILED", .message = "remote content could not be fetched", .retryable = true },
-    };
-    for (cases) |case| {
-        const batch_err = Node.generateBatchMessageParseError(case.err).?;
-        try std.testing.expectEqualStrings(case.code, batch_err.code);
-        try std.testing.expectEqualStrings(case.message, batch_err.message);
-        try std.testing.expectEqual(case.retryable, batch_err.retryable.?);
-    }
-}
-
-test "generate batch message parse errors hide internals and leave OOM fatal" {
-    const invalid = Node.generateBatchMessageParseError(error.InvalidImageUrl).?;
-    try std.testing.expectEqualStrings("INVALID_REQUEST", invalid.code);
-    try std.testing.expectEqualStrings("image_url must contain a URL string", invalid.message);
-    try std.testing.expect(!std.mem.eql(u8, @errorName(error.InvalidImageUrl), invalid.message));
-    try std.testing.expectEqual(false, invalid.retryable.?);
-    try std.testing.expect(Node.generateBatchMessageParseError(error.OutOfMemory) == null);
-}
-
-test "generate admission rejects before parsing remote media" {
-    const alloc = std.testing.allocator;
-    var node = try Node.init(alloc, .{ .max_concurrent_requests = 1 });
-    defer node.deinit();
-    try node.request_queue.acquire();
-    defer node.request_queue.release();
-
-    var request = try httpx.Request.init(alloc, .POST, "/ai/v1/generate");
-    defer request.deinit();
-    try request.setJson(
-        \\{"model":"missing","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,not-valid-base64"}}]}]}
+test "generate batch isolates native execution and serializes stateful GPU backends" {
+    try std.testing.expectEqual(
+        Node.BatchExecutionMode.isolated_parallel,
+        Node.batchExecutionMode(.native),
     );
-    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
-    defer ctx.deinit();
-
-    var response = try node.generateContent(&ctx);
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 503), response.status.code);
-}
-
-test "generate message media budget maps cumulative content to batch 413 semantics" {
-    const alloc = std.testing.allocator;
-    var node: Node = undefined;
-    node.config = .{};
-    const request_json =
-        \\{"model":"m","messages":[{"role":"user","content":[
-        \\{"type":"image_url","image_url":{"url":"data:image/png;base64,YWJj"}},
-        \\{"type":"image_url","image_url":{"url":"data:image/png;base64,ZGVm"}}
-        \\]}]}
-    ;
-    var parsed = try std.json.parseFromSlice(api.GenerateRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-    const first_uri = "data:image/png;base64,YWJj";
-    var budget = RequestMediaBudget.init(first_uri.len + 1);
-
-    var owned = node.parseGenerateMessagesWithBudget(alloc, parsed.value, &budget) catch |err| {
-        try std.testing.expectEqual(error.RemoteContentTooLarge, err);
-        try std.testing.expectEqual(first_uri.len, budget.used_bytes);
-        const batch_err = Node.generateBatchMessageParseError(err).?;
-        try std.testing.expectEqualStrings("CONTENT_TOO_LARGE", batch_err.code);
-        try std.testing.expectEqualStrings("media content exceeds the configured size limit", batch_err.message);
-        try std.testing.expectEqual(false, batch_err.retryable.?);
-        return;
-    };
-    owned.deinit();
-    return error.TestExpectedAggregateMediaLimit;
-}
-
-test "generate message ownership survives every allocation failure and tool prompt mutation" {
-    const backing_allocator = std.testing.allocator;
-    const request_json =
-        \\{"model":"m","messages":[
-        \\{"role":"user","content":[
-        \\{"type":"text","text":"hello"},
-        \\{"type":"image_url","image_url":{"url":"data:image/png;base64,YWJj"}},
-        \\{"type":"image_url","image_url":{"url":"data:image/png;base64,ZGVm"}}
-        \\]},
-        \\{"role":"assistant","content":"world"}
-        \\]}
-    ;
-    var parsed = try std.json.parseFromSlice(api.GenerateRequest, backing_allocator, request_json, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-    var node: Node = undefined;
-    node.config = .{};
-
-    const Runner = struct {
-        fn run(allocator: std.mem.Allocator, target: *Node, body: api.GenerateRequest) !void {
-            var budget = RequestMediaBudget.init(64);
-            var owned = try target.parseGenerateMessagesWithBudget(allocator, body, &budget);
-            defer owned.deinit();
-
-            var messages = std.ArrayListUnmanaged(generation.Message).fromOwnedSlice(owned.messages);
-            owned.messages = &.{};
-            defer {
-                for (messages.items) |message| allocator.free(message.content);
-                messages.deinit(allocator);
-            }
-            try Node.prependSystemPrompt(allocator, &messages, "tools");
-        }
-    };
-
-    var fail_index: usize = 0;
-    while (true) : (fail_index += 1) {
-        var failing = std.testing.FailingAllocator.init(backing_allocator, .{
-            .fail_index = fail_index,
-            .resize_fail_index = 0,
-        });
-        Runner.run(failing.allocator(), &node, parsed.value) catch |err| switch (err) {
-            error.OutOfMemory => {
-                try std.testing.expect(failing.has_induced_failure);
-                try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
-                continue;
-            },
-            else => return err,
-        };
-        try std.testing.expect(!failing.has_induced_failure);
-        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
-        break;
-    }
+    try std.testing.expectEqual(
+        Node.BatchExecutionMode.shared_serial,
+        Node.batchExecutionMode(.metal),
+    );
+    try std.testing.expectEqual(
+        Node.BatchExecutionMode.shared_serial,
+        Node.batchExecutionMode(.cuda),
+    );
 }
 
 test "generate batch queue units sum pending generation work" {
@@ -10432,161 +11836,34 @@ test "node attachIo wires model session manager" {
     try std.testing.expect(node.model_manager.session_manager.io != null);
 }
 
-test "node init propagates runtime kernel JIT config to model loading" {
-    const kernel_jit = graph_mod.kernel_jit.Config{
-        .mode = .shadow,
-        .cache_dir = "/tmp/antfly-jit",
-        .max_cache_bytes_mb = 256,
-        .preload_budget_ms = 120_000,
-    };
-    var node = try Node.init(std.testing.allocator, .{ .kernel_jit = kernel_jit });
-    defer node.deinit();
+test "component session pool adapter retains explicit resource-managed backend policy" {
+    const session_manager = backends_mod.SessionManager.init(std.testing.allocator);
+    var manager = model_manager_mod.ModelManager.init(std.testing.allocator, session_manager);
+    defer manager.deinit();
 
-    try std.testing.expectEqual(kernel_jit.mode, node.session_manager.kernel_jit.mode);
-    try std.testing.expectEqual(kernel_jit.mode, node.model_manager.session_manager.kernel_jit.mode);
-    try std.testing.expectEqualStrings(kernel_jit.cache_dir.?, node.model_manager.session_manager.kernel_jit.cache_dir.?);
-}
-
-test "server rejects workload capture config without a capture sink" {
-    try std.testing.expectError(
-        error.KernelJitProfileCaptureUnsupportedInServer,
-        Node.init(std.testing.allocator, .{
-            .kernel_jit = .{ .mode = .shadow, .profile_capture_only = true },
-        }),
+    var loader = model_manager_mod.ModelManager.ComponentLoader{ .manager = &manager };
+    loader.allowed_backends[0] = .native;
+    loader.allowed_backends[1] = .metal;
+    loader.allowed_backend_count = 2;
+    std.crypto.hash.sha2.Sha256.hash(
+        "/models/component.onnx",
+        &loader.component_path_digests[0],
+        .{},
     );
-}
-
-test "required runtime kernel JIT rejects an empty preload list at warm time" {
-    var node = try Node.init(std.testing.allocator, .{
-        .kernel_jit = .{ .mode = .required },
-    });
-    defer node.deinit();
-    try std.testing.expectError(
-        error.KernelJitRequiredPreloadMissing,
-        node.warmConfiguredModelsBeforeServing(std.testing.allocator),
+    loader.component_path_count = 1;
+    const strict = try loader.restrictToBackend(.metal);
+    try std.testing.expectEqualSlices(
+        backends_mod.BackendType,
+        &.{.metal},
+        strict.preferredBackends(),
     );
-    try std.testing.expect(!node.startup_preloads_materialized);
-}
-
-test "qualified profile requires exactly one startup preload" {
-    if (comptime !build_options.enable_metal) return error.SkipZigTest;
-    var empty = try Node.init(std.testing.allocator, .{
-        .kernel_jit = .{ .mode = .on, .qualified_profile_path = "/tmp/profile.json" },
-    });
-    defer empty.deinit();
+    var pool_loader = try loader.sessionPoolLoader();
+    defer pool_loader.deinit();
+    loader = undefined;
     try std.testing.expectError(
-        error.KernelJitRequiredPreloadMissing,
-        empty.warmConfiguredModelsBeforeServing(std.testing.allocator),
+        error.UnvalidatedModelComponent,
+        pool_loader.load("/models/substituted.onnx"),
     );
-
-    const preload = [_]WarmModel{
-        .{ .name = "model-a" },
-        .{ .name = "model-b" },
-    };
-    var multiple = try Node.init(std.testing.allocator, .{
-        .kernel_jit = .{ .mode = .on, .qualified_profile_path = "/tmp/profile.json" },
-        .preload = &preload,
-    });
-    defer multiple.deinit();
-    try std.testing.expectError(
-        error.KernelJitQualifiedProfileMultiplePreloadsUnsupported,
-        multiple.warmConfiguredModelsBeforeServing(std.testing.allocator),
-    );
-
-    const native_preload = [_]WarmModel{.{ .name = "model-a", .backend = .native }};
-    var native = try Node.init(std.testing.allocator, .{
-        .kernel_jit = .{ .mode = .on, .qualified_profile_path = "/tmp/profile.json" },
-        .preload = &native_preload,
-    });
-    defer native.deinit();
-    try std.testing.expectError(
-        error.KernelJitQualifiedProfileRequiresMetalPreload,
-        native.warmConfiguredModelsBeforeServing(std.testing.allocator),
-    );
-}
-
-test "warm model task directories cover every preload kind" {
-    try std.testing.expectEqualStrings("generators", warmModelTaskDir(.generator));
-    try std.testing.expectEqualStrings("embedders", warmModelTaskDir(.embedder));
-    try std.testing.expectEqualStrings("rerankers", warmModelTaskDir(.reranker));
-    try std.testing.expectEqualStrings("chunkers", warmModelTaskDir(.chunker));
-    try std.testing.expectEqualStrings("classifiers", warmModelTaskDir(.classifier));
-    try std.testing.expectEqualStrings("recognizers", warmModelTaskDir(.recognizer));
-    try std.testing.expectEqualStrings("rewriters", warmModelTaskDir(.rewriter));
-    try std.testing.expectEqualStrings("readers", warmModelTaskDir(.reader));
-    try std.testing.expectEqualStrings("transcribers", warmModelTaskDir(.transcriber));
-    try std.testing.expectEqualStrings("extractors", warmModelTaskDir(.extractor));
-}
-
-test "only enabled runtime JIT modes materialize optional preload sessions" {
-    try std.testing.expect(!kernelJitMaterializesOptionalSessions(.off));
-    try std.testing.expect(kernelJitMaterializesOptionalSessions(.shadow));
-    try std.testing.expect(kernelJitMaterializesOptionalSessions(.on));
-    try std.testing.expect(kernelJitMaterializesOptionalSessions(.required));
-}
-
-test "required runtime kernel JIT cannot publish when startup warming was skipped" {
-    const preload = [_]WarmModel{.{ .name = "configured-model" }};
-    var node = try Node.init(std.testing.allocator, .{
-        .kernel_jit = .{ .mode = .required },
-        .preload = &preload,
-    });
-    defer node.deinit();
-    var server = RecordingServer{ .allocator = std.testing.allocator };
-    defer server.deinit();
-
-    try std.testing.expectError(
-        error.KernelJitRequiredPreloadUnmaterialized,
-        node.registerRoutesOn(public_api_prefix, &server),
-    );
-    try std.testing.expect(!node.request_surfaces_published);
-    try ensureKernelJitRequestSurfacesPublishable(.required, false, true);
-    try ensureKernelJitRequestSurfacesPublishable(.on, false, false);
-    try std.testing.expectError(
-        error.KernelJitRequiredPreloadUnmaterialized,
-        ensureKernelJitRequestSurfacesPublishable(.on, true, false),
-    );
-}
-
-test "failed startup warming never publishes the preload latch" {
-    const preload = [_]WarmModel{.{ .name = "" }};
-    var node = try Node.init(std.testing.allocator, .{
-        .kernel_jit = .{ .mode = .required },
-        .preload = &preload,
-    });
-    defer node.deinit();
-    node.startup_preloads_materialized = true;
-
-    try std.testing.expectError(
-        error.InvalidGenerationRequest,
-        node.warmConfiguredModelsBeforeServing(std.testing.allocator),
-    );
-    try std.testing.expect(!node.startup_preloads_materialized);
-}
-
-test "startup model warming restores safe dynamic JIT load context" {
-    var node = try Node.init(std.testing.allocator, .{});
-    defer node.deinit();
-
-    try std.testing.expectEqual(graph_mod.kernel_jit.LoadContext.dynamic, node.session_manager.kernel_jit_load_context);
-    try std.testing.expectEqual(graph_mod.kernel_jit.LoadContext.dynamic, node.model_manager.session_manager.kernel_jit_load_context);
-    try node.warmConfiguredModelsBeforeServing(std.testing.allocator);
-    try std.testing.expect(node.startup_preloads_materialized);
-    try std.testing.expectEqual(graph_mod.kernel_jit.LoadContext.dynamic, node.session_manager.kernel_jit_load_context);
-    try std.testing.expectEqual(graph_mod.kernel_jit.LoadContext.dynamic, node.model_manager.session_manager.kernel_jit_load_context);
-}
-
-test "startup model warming rejects a published request surface" {
-    var node = try Node.init(std.testing.allocator, .{});
-    defer node.deinit();
-
-    node.request_surfaces_published = true;
-    try std.testing.expectError(
-        error.KernelJitStartupWindowClosed,
-        node.warmConfiguredModelsBeforeServing(std.testing.allocator),
-    );
-    try std.testing.expectEqual(graph_mod.kernel_jit.LoadContext.dynamic, node.session_manager.kernel_jit_load_context);
-    try std.testing.expectEqual(graph_mod.kernel_jit.LoadContext.dynamic, node.model_manager.session_manager.kernel_jit_load_context);
 }
 
 test "registerAiRoutesOn excludes Traditional ML predictor routes" {
@@ -10616,54 +11893,6 @@ test "root operational routes stay outside inference API prefix" {
     try std.testing.expect(server.hasRoute(.get, "/readyz"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/healthz"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/readyz"));
-}
-
-test "readiness is healthy with fixed chunkers and no discovered models" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "models");
-    const models_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
-    defer allocator.free(models_dir);
-
-    const counts = try collectDiscoveredModelCounts(models_dir, allocator, std.testing.io);
-    try std.testing.expectEqual(@as(usize, 2), counts.chunkers);
-    try std.testing.expectEqual(@as(usize, 2), counts.total());
-
-    var request = try httpx.Request.init(allocator, .GET, "/readyz");
-    defer request.deinit();
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
-    defer ctx.deinit();
-    var response = try discoveredModelsReadinessResponse(&ctx, counts);
-    defer response.deinit();
-
-    try std.testing.expectEqual(@as(u16, 200), response.status.code);
-    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"status\":\"ready\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"chunkers\":2") != null);
-}
-
-test "readiness fails closed when model discovery fails" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "models");
-    const models_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
-    defer allocator.free(models_dir);
-
-    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
-    const discovery_result = collectDiscoveredModelCounts(models_dir, failing.allocator(), std.testing.io);
-
-    var request = try httpx.Request.init(allocator, .GET, "/readyz");
-    defer request.deinit();
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
-    defer ctx.deinit();
-    var response = try discoveredModelsReadinessResponse(&ctx, discovery_result);
-    defer response.deinit();
-
-    try std.testing.expect(failing.has_induced_failure);
-    try std.testing.expectEqual(@as(u16, 503), response.status.code);
-    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"status\":\"not_ready\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "OutOfMemory") == null);
 }
 
 test "internal error response hides implementation error names" {
@@ -10806,24 +12035,6 @@ test "taskMatchesModelListing prefers explicit tasks when present" {
     try std.testing.expect(!taskMatchesModelListing("recognizers", "generator", "", &.{"generate"}, &.{"extraction"}));
 }
 
-test "modelSupportsCapability infers gliner2 extraction and classification" {
-    try std.testing.expect(model_caps.modelSupportsCapability("recognizer", "gliner2", &.{"labels"}, "classification"));
-    try std.testing.expect(model_caps.modelSupportsCapability("recognizer", "gliner2", &.{"labels"}, "relations"));
-    try std.testing.expect(model_caps.modelSupportsCapability("recognizer", "gliner2", &.{"labels"}, "extraction"));
-    try std.testing.expect(!model_caps.modelSupportsCapability("recognizer", "", &.{"labels"}, "extraction"));
-}
-
-test "modelKindAcceptsInput infers text and image modalities" {
-    try std.testing.expect(model_caps.modelKindAcceptsInput("recognizer", "gliner2", &.{}, false, false, "text"));
-    try std.testing.expect(!model_caps.modelKindAcceptsInput("recognizer", "gliner2", &.{}, false, false, "image"));
-    try std.testing.expect(model_caps.modelKindAcceptsInput("reader", "", &.{}, false, false, "image"));
-    try std.testing.expect(!model_caps.modelKindAcceptsInput("reader", "", &.{}, false, false, "text"));
-    try std.testing.expect(model_caps.modelKindAcceptsInput("embedder", "", &.{}, true, false, "image"));
-    try std.testing.expect(model_caps.modelKindAcceptsInput("transcriber", "", &.{}, false, false, "audio"));
-    try std.testing.expect(model_caps.modelKindAcceptsInput("recognizer", "", &.{"image"}, false, false, "image"));
-    try std.testing.expect(!model_caps.modelKindAcceptsInput("recognizer", "", &.{"image"}, false, false, "text"));
-}
-
 test "generate backend selection keeps compiled mode explicit" {
     const eager_webgpu = parseGenerateBackendSelection(.webgpu, null, null);
     if (build_options.enable_wasm and build_options.enable_webgpu) {
@@ -10852,9 +12063,16 @@ test "generate backend selection keeps compiled mode explicit" {
     try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, auto_default));
     try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, auto_default));
 
-    const metal_eager = try parseGenerateBackendSelection(.metal, "eager", null);
-    try std.testing.expect(metal_eager.eager_mode_requested);
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, metal_eager));
+    if (build_options.enable_metal) {
+        const metal_eager = try parseGenerateBackendSelection(.metal, "eager", null);
+        try std.testing.expect(metal_eager.eager_mode_requested);
+        try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, metal_eager));
+    } else {
+        try std.testing.expectError(
+            error.BackendUnavailable,
+            parseGenerateBackendSelection(.metal, "eager", null),
+        );
+    }
 
     try std.testing.expectError(error.InvalidGenerateMode, parseGenerateBackendSelection(null, "graph", null));
     try std.testing.expectError(error.InvalidCompiledTarget, parseGenerateBackendSelection(null, "compiled", "full"));
@@ -12096,15 +13314,15 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
             .code = "INVALID_IMAGE",
             .message = "unsupported or corrupt image input",
         },
-        error.UnsupportedAudioFormat => .{
+        error.ResourceLimitExceeded => .{
             .status = 400,
-            .code = "INVALID_AUDIO",
-            .message = "unsupported or corrupt audio input",
+            .code = "MODEL_RESOURCE_LIMIT",
+            .message = "request resource plan exceeds the configured inference budget",
         },
-        error.AudioTooLarge, error.AudioInputTooLong => .{
-            .status = 413,
-            .code = "AUDIO_TOO_LARGE",
-            .message = "audio input exceeds the server processing limit",
+        error.ResourceTemporarilyUnavailable => .{
+            .status = 503,
+            .code = "MODEL_RESOURCE_BUSY",
+            .message = "insufficient inference capacity is currently available",
         },
         else => .{
             .status = 500,
@@ -12177,21 +13395,21 @@ fn embedItemFailure(index: usize, err: anyerror, stage: []const u8) EmbedItemErr
             .retryable = false,
             .status = 400,
         },
-        error.UnsupportedAudioFormat => .{
+        error.ResourceLimitExceeded => .{
             .index = @intCast(index),
-            .code = "INVALID_AUDIO",
-            .message = "unsupported or corrupt audio input",
-            .stage = "audio_decode",
+            .code = "MODEL_RESOURCE_LIMIT",
+            .message = "request resource plan exceeds the configured inference budget",
+            .stage = stage,
             .retryable = false,
             .status = 400,
         },
-        error.AudioTooLarge, error.AudioInputTooLong => .{
+        error.ResourceTemporarilyUnavailable => .{
             .index = @intCast(index),
-            .code = "AUDIO_TOO_LARGE",
-            .message = "audio input exceeds the server processing limit",
-            .stage = "audio_decode",
-            .retryable = false,
-            .status = 413,
+            .code = "MODEL_RESOURCE_BUSY",
+            .message = "insufficient inference capacity is currently available",
+            .stage = stage,
+            .retryable = true,
+            .status = 503,
         },
         else => .{
             .index = @intCast(index),
@@ -13104,6 +14322,14 @@ test "embedding image decode failures are permanent client input errors" {
     const runtime_failure = embedDenseInputFailure(error.OutOfMemory);
     try std.testing.expectEqual(@as(u16, 500), runtime_failure.status);
     try std.testing.expectEqualStrings("INFERENCE_FAILED", runtime_failure.code);
+
+    const limit_failure = embedDenseInputFailure(error.ResourceLimitExceeded);
+    try std.testing.expectEqual(@as(u16, 400), limit_failure.status);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_LIMIT", limit_failure.code);
+
+    const busy_failure = embedDenseInputFailure(error.ResourceTemporarilyUnavailable);
+    try std.testing.expectEqual(@as(u16, 503), busy_failure.status);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", busy_failure.code);
 }
 
 test "Antfly inference embed parser accepts data uri media payloads" {
@@ -14169,20 +15395,17 @@ fn coerceGenerateResponseFormat(
     const rf = response_format orelse return null;
     if (std.mem.eql(u8, rf.type, "json_object")) {
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch
-            return try allocator.dupe(u8, "{}");
+            return error.InvalidStructuredOutput;
         defer parsed.deinit();
         if (parsed.value == .object) return null;
-        return try allocator.dupe(u8, "{}");
+        return error.InvalidStructuredOutput;
     }
     if (!std.mem.eql(u8, rf.type, "json_schema")) return null;
 
     const schema_cfg = rf.json_schema orelse return error.MissingJsonSchema;
-    validateGeneratedJsonSchema(allocator, json_text, schema_cfg) catch {
-        const schema = schema_cfg.schema orelse return error.MissingJsonSchema;
-        const fallback = try minimalJsonForSchema(allocator, schema);
-        errdefer allocator.free(fallback);
-        try validateGeneratedJsonSchema(allocator, fallback, schema_cfg);
-        return fallback;
+    validateGeneratedJsonSchema(allocator, json_text, schema_cfg) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidStructuredOutput;
     };
     return null;
 }
@@ -14198,104 +15421,54 @@ fn validateGeneratedJsonSchema(
     try jsonschema.validateJsonSchemaValue(allocator, schema, parsed.value);
 }
 
-fn minimalJsonForSchema(allocator: std.mem.Allocator, schema: std.json.Value) ![]u8 {
-    var buf = std.ArrayListUnmanaged(u8).empty;
-    errdefer buf.deinit(allocator);
-    try appendMinimalJsonForSchema(&buf, allocator, schema);
-    return try buf.toOwnedSlice(allocator);
-}
+test "structured output validation fails closed instead of fabricating JSON" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidStructuredOutput,
+        coerceGenerateResponseFormat(
+            allocator,
+            .{ .type = "json_object" },
+            "not json",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidStructuredOutput,
+        coerceGenerateResponseFormat(
+            allocator,
+            .{ .type = "json_object" },
+            "[]",
+        ),
+    );
 
-fn appendMinimalJsonForSchema(
-    buf: *std.ArrayListUnmanaged(u8),
-    allocator: std.mem.Allocator,
-    schema: std.json.Value,
-) anyerror!void {
-    if (schema != .object) {
-        try buf.appendSlice(allocator, "null");
-        return;
-    }
-
-    const obj = schema.object;
-    if (obj.get("const")) |value| {
-        const rendered = try std.json.Stringify.valueAlloc(allocator, value, .{});
-        defer allocator.free(rendered);
-        try buf.appendSlice(allocator, rendered);
-        return;
-    }
-    if (obj.get("enum")) |values| {
-        if (values == .array and values.array.items.len > 0) {
-            const rendered = try std.json.Stringify.valueAlloc(allocator, values.array.items[0], .{});
-            defer allocator.free(rendered);
-            try buf.appendSlice(allocator, rendered);
-            return;
-        }
-    }
-
-    const type_name = if (obj.get("type")) |type_value|
-        if (type_value == .string) type_value.string else null
-    else
-        null;
-
-    if (type_name) |name| {
-        if (std.mem.eql(u8, name, "object")) {
-            try appendMinimalObjectForSchema(buf, allocator, obj);
-            return;
-        }
-        if (std.mem.eql(u8, name, "array")) {
-            try buf.appendSlice(allocator, "[]");
-            return;
-        }
-        if (std.mem.eql(u8, name, "string")) {
-            try buf.appendSlice(allocator, "\"\"");
-            return;
-        }
-        if (std.mem.eql(u8, name, "integer") or std.mem.eql(u8, name, "number")) {
-            try buf.append(allocator, '0');
-            return;
-        }
-        if (std.mem.eql(u8, name, "boolean")) {
-            try buf.appendSlice(allocator, "false");
-            return;
-        }
-        if (std.mem.eql(u8, name, "null")) {
-            try buf.appendSlice(allocator, "null");
-            return;
-        }
-    }
-
-    if (obj.get("properties") != null or obj.get("required") != null) {
-        try appendMinimalObjectForSchema(buf, allocator, obj);
-        return;
-    }
-
-    try buf.appendSlice(allocator, "null");
-}
-
-fn appendMinimalObjectForSchema(
-    buf: *std.ArrayListUnmanaged(u8),
-    allocator: std.mem.Allocator,
-    schema_obj: std.json.ObjectMap,
-) anyerror!void {
-    try buf.append(allocator, '{');
-    var first = true;
-    const properties = schema_obj.get("properties");
-    if (schema_obj.get("required")) |required| {
-        if (required == .array) {
-            for (required.array.items) |name_value| {
-                if (name_value != .string) continue;
-                if (!first) try buf.append(allocator, ',');
-                first = false;
-                try jsonEncodeString(buf, allocator, name_value.string);
-                try buf.append(allocator, ':');
-                const property_schema = if (properties != null and properties.? == .object)
-                    properties.?.object.get(name_value.string) orelse .null
-                else
-                    .null;
-                try appendMinimalJsonForSchema(buf, allocator, property_schema);
-            }
-        }
-    }
-    try buf.append(allocator, '}');
+    var parsed_schema = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"type\":\"object\",\"required\":[\"answer\"],\"properties\":{\"answer\":{\"type\":\"string\"}}}",
+        .{},
+    );
+    defer parsed_schema.deinit();
+    try std.testing.expectError(
+        error.InvalidStructuredOutput,
+        coerceGenerateResponseFormat(
+            allocator,
+            .{
+                .type = "json_schema",
+                .json_schema = .{ .schema = parsed_schema.value },
+            },
+            "{}",
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(?[]u8, null),
+        try coerceGenerateResponseFormat(
+            allocator,
+            .{
+                .type = "json_schema",
+                .json_schema = .{ .schema = parsed_schema.value },
+            },
+            "{\"answer\":\"ok\"}",
+        ),
+    );
 }
 
 test "admission rejection includes Retry-After" {

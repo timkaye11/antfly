@@ -281,6 +281,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var max_concurrent_requests_override: ?usize = null;
     var kernel_jit_mode_override: ?inference.graph.kernel_jit.Mode = null;
     var allow_insecure_public_bind = false;
+    var allow_unknown_models = false;
     var models_overridden = false;
     var ml_overridden = false;
     var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
@@ -317,6 +318,8 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--allow-insecure-public-bind")) {
             allow_insecure_public_bind = true;
+        } else if (std.mem.eql(u8, args[i], "--allow-unknown-models")) {
+            allow_unknown_models = true;
         } else {
             return error.InvalidArguments;
         }
@@ -357,6 +360,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         .ml_dir = ml_dir,
         .preload = preload_models.items,
         .allow_insecure_public_bind = allow_insecure_public_bind,
+        .allow_unknown_models = allow_unknown_models,
     };
     if (loaded_cfg) |parsed| {
         const cfg = parsed.value;
@@ -548,6 +552,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  --max-concurrent-requests <n> Bound weighted in-flight request capacity before returning 503
         \\  --kernel-jit-mode <off|shadow|on|required> JIT startup-preloaded Metal/CUDA models
         \\  --preload-model <kind:name|kind:backend:name> Preload and warm a configured model before serving
+        \\  --allow-unknown-models Permit artifacts whose compatibility cannot be proven; known incompatible models remain blocked
         \\
         \\Pull options:
         \\  --token <token>   HuggingFace API token (or set HF_TOKEN env var)

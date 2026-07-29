@@ -45,10 +45,17 @@ class InferenceConfig:
             baseline. HTTP(S), file, and S3 content require explicit allowlists; data URIs remain allowed within the
             configured size budget.
         s3_credentials (InferenceCredentials | Unset):
-        keep_alive (str | Unset): Legacy compatibility field. The current Zig inference runtime does not
-            unload idle models from this setting; configuring it has no effect.
-        max_loaded_models (int | Unset): Legacy compatibility field. The current Zig inference runtime does not
-            evict loaded models from this setting; configuring it has no effect.
+        keep_alive (str | Unset): How long to keep models loaded in memory after last use (Ollama-compatible).
+            Models are automatically unloaded after this duration of inactivity.
+            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
+            Defaults to "5m". Set to "0" to disable idle-time eviction; models can
+            still be evicted under resource pressure or to enforce max_loaded_models.
+             Default: '5m'. Example: 5m.
+        max_loaded_models (int | Unset): Maximum total models loaded across all registry types (embedders, rerankers,
+            generators, chunkers, etc.). When the limit is reached, the least-recently-used
+            idle model from any registry is evicted to make room. Set to 0 for unlimited.
+            Defaults to 10.
+             Default: 10. Example: 3.
         pool_size (int | Unset): Legacy compatibility field. The current Zig inference runtime does not
             create per-model pipeline pools from this setting; configuring it has no effect.
         prompt_cache (InferencePromptCacheConfig | Unset): Native generator prompt KV cache configuration.
@@ -81,9 +88,17 @@ class InferenceConfig:
             'quantization': 'q4_k'}].
         max_memory_mb (int | Unset): Legacy compatibility field. The current Zig runtime uses explicit host,
             backend, combined, KV, and scratch budgets instead and ignores this field.
-        model_strategies (InferenceConfigModelStrategies | Unset): Legacy compatibility field. The current Zig runtime
-            ignores per-model
-            loading strategies; use `preload` for startup warming.
+        model_strategies (InferenceConfigModelStrategies | Unset): Per-model loading strategy overrides. Maps model
+            names to their loading strategy.
+            Models not in this map load on demand. keep_alive controls their idle
+            eviction; setting it to "0" disables idle eviction but does not preload or pin them.
+
+            When a model has strategy "eager" in this map:
+            - It is loaded at startup through the same startup warmup path
+            - It is never unloaded, even when keep_alive>0 (pinned in memory)
+
+            This allows mixing eager and lazy models in the same pool.
+             Example: {'BAAI/bge-small-en-v1.5': 'eager', 'mirth/chonky-mmbert-small-multilingual-1': 'lazy'}.
         allow_downloads (bool | Unset): Legacy compatibility field controlling whether dashboards show model
             download commands. It defaults to true for standalone deployments;
             managed deployments historically set it to false. Download-command
@@ -100,8 +115,8 @@ class InferenceConfig:
     ml_dir: str | Unset = UNSET
     content_security: InferenceContentSecurityConfig | Unset = UNSET
     s3_credentials: InferenceCredentials | Unset = UNSET
-    keep_alive: str | Unset = UNSET
-    max_loaded_models: int | Unset = UNSET
+    keep_alive: str | Unset = "5m"
+    max_loaded_models: int | Unset = 10
     pool_size: int | Unset = UNSET
     prompt_cache: InferencePromptCacheConfig | Unset = UNSET
     backend_priority: list[str] | Unset = UNSET

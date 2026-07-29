@@ -12106,11 +12106,14 @@ test "quant kernel compiler generated Metal headers match production state" {
 test "quant kernel compiler Metal build check covers generated and promoted artifacts" {
     const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "build.zig", std.testing.allocator, .limited(256 * 1024));
     defer std.testing.allocator.free(contents);
+    const test_filter_contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "build/test_filters.zig", std.testing.allocator, .limited(16 * 1024));
+    defer std.testing.allocator.free(test_filter_contents);
 
     const macos_gate = std.mem.indexOf(u8, contents, "if (target.result.os.tag == .macos) {\n        const quant_kernel_metal_artifact_check = b.addRunArtifact(quant_kernel_codegen_exe);") orelse return error.MissingMetalBuildMacosGate;
     const non_macos_fail_closed = std.mem.indexOf(u8, contents, "} else {\n        const quant_kernel_metal_unavailable = b.addFail(metal_unavailable_message);\n        quant_kernel_metal_unavailable_step = &quant_kernel_metal_unavailable.step;\n        quant_kernel_metal_check_step.dependOn(&quant_kernel_metal_unavailable.step);\n    }\n\n    const quant_kernel_metal_runtime_check_step") orelse return error.MissingMetalBuildNonMacosFailClosed;
     try std.testing.expect(macos_gate < non_macos_fail_closed);
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "if (std.mem.startsWith(u8, args[0], \"-\")) return default_filters"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "return build_test_filters.select("));
+    try std.testing.expect(std.mem.containsAtLeast(u8, test_filter_contents, 1, "else if (std.mem.startsWith(u8, arg, \"-\")) {"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "fn targetRunsOnBuildHost(b: *std.Build, target: std.Build.ResolvedTarget) bool"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, ".target = b.graph.host"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "quant_kernel_metal_artifact_check.addArg(\"--check-metal\")"));

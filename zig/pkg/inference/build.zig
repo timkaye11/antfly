@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_test_filters = @import("build/test_filters.zig");
 const runtime_build = @import("build/runtime.zig");
 const finetune_common = @import("build/finetune/common.zig");
 const finetune_tests = @import("build/finetune/tests.zig");
@@ -33,14 +34,11 @@ fn resolveSharedLibRoot(b: *std.Build) []const u8 {
 }
 
 fn selectTestFilters(b: *std.Build, default_filters: []const []const u8) []const []const u8 {
-    const args = b.args orelse return default_filters;
-    if (args.len == 0) return default_filters;
-    if (std.mem.eql(u8, args[0], "--test-filter")) {
-        if (args.len <= 1) return default_filters;
-        return args[1..];
-    }
-    if (std.mem.startsWith(u8, args[0], "-")) return default_filters;
-    return args;
+    return build_test_filters.select(
+        b.allocator,
+        b.args orelse &.{},
+        default_filters,
+    );
 }
 
 fn defaultOnnxRuntimeRoot(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
@@ -1205,7 +1203,8 @@ pub fn build(b: *std.Build) void {
 
     // Tests
     const runtime_test_filter = b.option(bool, "runtime-test-filter", "Build unit tests with a simple runtime-filtering test runner") orelse false;
-    const main_test_filters = if (runtime_test_filter) &.{} else selectTestFilters(b, &.{});
+    const selected_test_filters = selectTestFilters(b, &.{});
+    const main_test_filters = if (runtime_test_filter) &.{} else selected_test_filters;
     const runtime_filter_test_runner: std.Build.Step.Compile.TestRunner = .{
         .path = b.path("src/test_runner_filter.zig"),
         .mode = .simple,
@@ -1276,9 +1275,10 @@ pub fn build(b: *std.Build) void {
     finetune_tests.register(finetune_ctx);
 
     const run_tests = b.addRunArtifact(tests);
-    if (runtime_test_filter) {
-        if (b.args) |args| run_tests.addArgs(args);
+    for (selected_test_filters) |filter| {
+        run_tests.addArgs(&.{ "--test-filter", filter });
     }
+    build_test_filters.addRuntimeControls(run_tests, b.args orelse &.{});
     const run_quant_kernel_compiler_tests = b.addRunArtifact(tests);
     run_quant_kernel_compiler_tests.addArg("--test-filter");
     run_quant_kernel_compiler_tests.addArg("quant kernel compiler");
@@ -1430,8 +1430,21 @@ pub fn build(b: *std.Build) void {
     });
     tok_tests.root_module.addImport("sentencepiece_proto", sentencepiece_proto_mod);
     const run_tok_tests = b.addRunArtifact(tok_tests);
+
+    const hf_tok_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(b.fmt("{s}/lib/tokenizer/src/hf_tokenizer.zig", .{shared_lib_root})),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    hf_tok_tests.root_module.addImport("sentencepiece_proto", sentencepiece_proto_mod);
+    const run_hf_tok_tests = b.addRunArtifact(hf_tok_tests);
+
     const tok_test_step = b.step("test-tokenizer", "Run tokenizer tests");
     tok_test_step.dependOn(&run_tok_tests.step);
+    tok_test_step.dependOn(&run_hf_tok_tests.step);
 
     const audio_tests = b.addTest(.{
         .root_module = b.createModule(.{

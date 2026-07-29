@@ -67,12 +67,12 @@ class RetrievalQueryRequest:
 
                 Boolean clauses are normalized before planning:
                 - `bool.must` is scoring query input.
-                - `bool.filter` is a non-scoring structured filter.
-                - `bool.must_not` is a structured exclusion filter.
+                - `bool.filter` is non-scoring query input.
+                - `bool.must_not` is non-scoring exclusion query input.
 
-                The same AST accepts direct structured filters using `field` or JSON-pointer
-                `path`, scalar `term` values, multi-value `terms`, and `exists`.
-                Query-string objects remain supported as a full-text escape hatch.
+                Filter branches accept the same query variants as `filter_query` and
+                `exclusion_query`. Structured clauses use the native document-value
+                path; text clauses are resolved through the text index before scoring.
                  Example: {'bool': {'must': [{'match': {'field': 'body', 'text': 'computer'}}], 'filter': [{'term': {'path':
                 '/tenant', 'value': 'acme'}}], 'must_not': [{'exists': {'path': '/deleted_at'}}]}}.
             full_text_search (BooleanQuery | BoolFieldQuery | ConjunctionQuery | DateRangeStringQuery | DisjunctionQuery |

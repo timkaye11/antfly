@@ -3304,11 +3304,10 @@ components:
           minimum: 0
           maximum: 17592186044415
           description: |
-            Node-wide target for live entries in the single process-stable model cache.
-            The first model to activate prompt caching owns it for the process lifetime;
-            requests to other models bypass prompt caching. The owner evicts using
-            estimated metadata and logical host/device KV bytes. Backend allocators may
-            retain reusable capacity, so this is not a hard process or accelerator cap.
+            Node-wide target for live prompt-cache entries. The runtime divides it
+            across participating model caches and evicts using estimated metadata
+            and logical host/device KV bytes. Backend allocators may retain reusable
+            capacity, so this is not a hard cap on process or accelerator memory.
           default: 512
         min_tokens:
           type: integer
@@ -3365,15 +3364,22 @@ components:
         keep_alive:
           type: string
           description: |
-            Legacy compatibility field. The current Zig inference runtime does not
-            unload idle models from this setting; configuring it has no effect.
-          deprecated: true
+            How long to keep models loaded in memory after last use (Ollama-compatible).
+            Models are automatically unloaded after this duration of inactivity.
+            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
+            Defaults to "5m". Set to "0" to disable idle-time eviction; models can
+            still be evicted under resource pressure or to enforce max_loaded_models.
+          default: 5m
+          example: 5m
         max_loaded_models:
           type: integer
           description: |
-            Legacy compatibility field. The current Zig inference runtime does not
-            evict loaded models from this setting; configuring it has no effect.
-          deprecated: true
+            Maximum total models loaded across all registry types (embedders, rerankers,
+            generators, chunkers, etc.). When the limit is reached, the least-recently-used
+            idle model from any registry is evicted to make room. Set to 0 for unlimited.
+            Defaults to 10.
+          default: 10
+          example: 3
         pool_size:
           type: integer
           description: |
@@ -3452,9 +3458,18 @@ components:
               - lazy
               - bounded
           description: |
-            Legacy compatibility field. The current Zig runtime ignores per-model
-            loading strategies; use `preload` for startup warming.
-          deprecated: true
+            Per-model loading strategy overrides. Maps model names to their loading strategy.
+            Models not in this map load on demand. keep_alive controls their idle
+            eviction; setting it to "0" disables idle eviction but does not preload or pin them.
+
+            When a model has strategy "eager" in this map:
+            - It is loaded at startup through the same startup warmup path
+            - It is never unloaded, even when keep_alive>0 (pinned in memory)
+
+            This allows mixing eager and lazy models in the same pool.
+          example:
+            BAAI/bge-small-en-v1.5: eager
+            mirth/chonky-mmbert-small-multilingual-1: lazy
         allow_downloads:
           type: boolean
           description: |

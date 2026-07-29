@@ -108,6 +108,8 @@ pub const Stream = struct {
     /// Used for content-length validation instead of data_buf.items.len,
     /// which shrinks when compactDataBuf() discards consumed bytes.
     total_data_received: u64 = 0,
+    /// Per-stream body ceiling. Null inherits the connection-wide ceiling.
+    max_data_size: ?usize = null,
 
     /// Accumulated received DATA bytes not yet acknowledged via WINDOW_UPDATE.
     pending_window_update: u32 = 0,

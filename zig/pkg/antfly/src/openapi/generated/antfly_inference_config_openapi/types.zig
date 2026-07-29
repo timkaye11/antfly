@@ -92,9 +92,9 @@ pub const Config = struct {
     content_security: ?antfly_scraping_openapi.ContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?antfly_s3_openapi.Credentials = null,
-    /// Legacy compatibility field. The current Zig inference runtime does not unload idle models from this setting; configuring it has no effect.
+    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0". Defaults to "5m". Set to "0" to disable idle-time eviction; models can still be evicted under resource pressure or to enforce max_loaded_models.
     keep_alive: ?[]const u8 = null,
-    /// Legacy compatibility field. The current Zig inference runtime does not evict loaded models from this setting; configuring it has no effect.
+    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited. Defaults to 10.
     max_loaded_models: ?i64 = null,
     /// Legacy compatibility field. The current Zig inference runtime does not create per-model pipeline pools from this setting; configuring it has no effect.
     pool_size: ?i64 = null,
@@ -113,7 +113,7 @@ pub const Config = struct {
     preload: ?[]const ModelRef = null,
     /// Legacy compatibility field. The current Zig runtime uses explicit host, backend, combined, KV, and scratch budgets instead and ignores this field.
     max_memory_mb: ?i64 = null,
-    /// Legacy compatibility field. The current Zig runtime ignores per-model loading strategies; use `preload` for startup warming.
+    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map load on demand. keep_alive controls their idle eviction; setting it to "0" disables idle eviction but does not preload or pin them. When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
     model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
     /// Legacy compatibility field controlling whether dashboards show model download commands. It defaults to true for standalone deployments; managed deployments historically set it to false. Download-command availability is a build-time setting in the current Zig runtime, so configuring this field has no effect.
     allow_downloads: ?bool = null,
@@ -715,7 +715,7 @@ pub const PromptCacheConfig = struct {
     enabled: ?bool = null,
     /// Prompt KV cache implementation. `block_hash` (default) uses hash-addressed full KV blocks under prompt_cache_key with O(1) block lookup and is the scalable production mode. `simple` keeps the linear-scan retained-prefix cache and is only suitable for small caches or debugging.
     mode: ?[]const u8 = null,
-    /// Node-wide target for live entries in the single process-stable model cache. The first model to activate prompt caching owns it for the process lifetime; requests to other models bypass prompt caching. The owner evicts using estimated metadata and logical host/device KV bytes. Backend allocators may retain reusable capacity, so this is not a hard process or accelerator cap.
+    /// Node-wide target for live prompt-cache entries. The runtime divides it across participating model caches and evicts using estimated metadata and logical host/device KV bytes. Backend allocators may retain reusable capacity, so this is not a hard cap on process or accelerator memory.
     max_bytes_mb: ?i64 = null,
     /// Minimum prompt length eligible for prompt KV caching.
     min_tokens: ?i64 = null,

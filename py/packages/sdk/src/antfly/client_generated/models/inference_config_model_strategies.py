@@ -15,8 +15,18 @@ T = TypeVar("T", bound="InferenceConfigModelStrategies")
 
 @_attrs_define
 class InferenceConfigModelStrategies:
-    """Legacy compatibility field. The current Zig runtime ignores per-model
-    loading strategies; use `preload` for startup warming.
+    """Per-model loading strategy overrides. Maps model names to their loading strategy.
+    Models not in this map load on demand. keep_alive controls their idle
+    eviction; setting it to "0" disables idle eviction but does not preload or pin them.
+
+    When a model has strategy "eager" in this map:
+    - It is loaded at startup through the same startup warmup path
+    - It is never unloaded, even when keep_alive>0 (pinned in memory)
+
+    This allows mixing eager and lazy models in the same pool.
+
+        Example:
+            {'BAAI/bge-small-en-v1.5': 'eager', 'mirth/chonky-mmbert-small-multilingual-1': 'lazy'}
 
     """
 

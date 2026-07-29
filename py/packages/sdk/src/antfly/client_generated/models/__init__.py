@@ -169,7 +169,6 @@ from .embedding_type_3 import EmbeddingType3
 from .embeddings_index_config import EmbeddingsIndexConfig
 from .embeddings_index_stats import EmbeddingsIndexStats
 from .embeddings_index_stats_async_indexing import EmbeddingsIndexStatsAsyncIndexing
-from .embeddings_index_stats_enrichment_runtime import EmbeddingsIndexStatsEnrichmentRuntime
 from .embeddings_index_stats_hbc_cache import EmbeddingsIndexStatsHbcCache
 from .embeddings_index_stats_hbc_posting import EmbeddingsIndexStatsHbcPosting
 from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
@@ -177,6 +176,7 @@ from .embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
 from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
 from .enrichment_kind import EnrichmentKind
+from .enrichment_runtime_status import EnrichmentRuntimeStatus
 from .error import Error
 from .eval_config import EvalConfig
 from .eval_options import EvalOptions
@@ -471,7 +471,6 @@ from .match_none_query import MatchNoneQuery
 from .match_none_query_match_none import MatchNoneQueryMatchNone
 from .match_phrase_query import MatchPhraseQuery
 from .match_query import MatchQuery
-from .match_query_operator import MatchQueryOperator
 from .media_content_part import MediaContentPart
 from .media_content_part_type import MediaContentPartType
 from .merge_config import MergeConfig
@@ -875,7 +874,6 @@ __all__ = (
     "EmbeddingsIndexConfig",
     "EmbeddingsIndexStats",
     "EmbeddingsIndexStatsAsyncIndexing",
-    "EmbeddingsIndexStatsEnrichmentRuntime",
     "EmbeddingsIndexStatsHbcCache",
     "EmbeddingsIndexStatsHbcPosting",
     "EmbeddingsIndexStatsIndexType",
@@ -885,6 +883,7 @@ __all__ = (
     "EmbeddingType3",
     "EnrichmentConfig",
     "EnrichmentKind",
+    "EnrichmentRuntimeStatus",
     "Error",
     "EvalConfig",
     "EvalOptions",
@@ -1179,7 +1178,6 @@ __all__ = (
     "MatchNoneQueryMatchNone",
     "MatchPhraseQuery",
     "MatchQuery",
-    "MatchQueryOperator",
     "MediaContentPart",
     "MediaContentPartType",
     "MergeConfig",
