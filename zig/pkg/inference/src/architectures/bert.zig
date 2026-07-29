@@ -23,6 +23,7 @@ const ops = @import("../ops/ops.zig");
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
 const bert_config = @import("../models/bert.zig");
+const native_compute_mod = @import("../ops/native_compute.zig");
 
 pub const Config = bert_config.Config;
 
@@ -99,6 +100,32 @@ fn bertDenseMirrorBytes(config: Config, bytes_per_element: usize) ?usize {
     return std.math.mul(usize, total_elements, bytes_per_element) catch null;
 }
 
+fn metalEncoderSlotsPrepared(cb: *const ComputeBackend, config: Config) bool {
+    const layer_count: usize = @intCast(config.num_hidden_layers);
+    const hidden: usize = @intCast(config.hidden_size);
+    const intermediate: usize = @intCast(config.intermediate_size);
+
+    for (0..layer_count) |layer| {
+        for (bert_linear_specs) |spec| {
+            if (!cb.decoderRuntimeLinearSlotPrepared(
+                bertLinearSlot(layer, spec.kind),
+                if (spec.input_intermediate) intermediate else hidden,
+                if (spec.output_intermediate) intermediate else hidden,
+            )) return false;
+        }
+        for (bert_layer_norm_specs) |spec| {
+            if (!cb.decoderRuntimeLayerNormSlotPrepared(
+                bertLayerNormSlot(layer, spec.kind),
+                hidden,
+            )) return false;
+        }
+    }
+    return cb.decoderRuntimeLayerNormSlotPrepared(
+        bertEmbeddingLayerNormSlot(layer_count),
+        hidden,
+    );
+}
+
 fn preplanMetalEncoder(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config) !bool {
     if (cb.kind() != .metal or !metalEncoderFrameEnabled() or cb.decoderRuntimeHasActiveFrame()) return false;
 
@@ -107,6 +134,12 @@ fn preplanMetalEncoder(cb: *const ComputeBackend, allocator: std.mem.Allocator, 
     const intermediate: usize = @intCast(config.intermediate_size);
     const heads: usize = @intCast(config.num_attention_heads);
     if (layer_count == 0 or hidden == 0 or intermediate == 0 or heads == 0 or hidden % heads != 0) return false;
+    // Query backend-owned slot metadata before touching the weight store.
+    // The check is allocation-free and remains valid across explicit slot
+    // invalidation because it verifies every slot and dimension required by
+    // this encoder.
+    if (metalEncoderSlotsPrepared(cb, config)) return true;
+
     const weight_mirrors_requested = !platform.env.getenvBool("TERMITE_METAL_DISABLE_BERT_WEIGHT_MIRRORS") and
         !platform.env.getenvBool("TERMITE_METAL_DISABLE_BERT_Q8_STAGING");
     const prefer_q8_mirrors = weight_mirrors_requested and platform.env.getenvBool("TERMITE_METAL_BERT_USE_Q8_MIRRORS");
@@ -210,7 +243,7 @@ fn validateBertForwardInputs(
     const hidden: usize = config.hidden_size;
     const intermediate: usize = config.intermediate_size;
     const heads: usize = config.num_attention_heads;
-    const max_positions: usize = config.max_position_embeddings;
+    const max_positions: usize = config.maxSequenceLength();
     if (batch == 0 or seq_len == 0 or hidden == 0 or intermediate == 0 or heads == 0 or
         hidden % heads != 0 or max_positions == 0 or seq_len > max_positions)
     {
@@ -255,7 +288,8 @@ pub fn forwardCt(
 ) !CT {
     const H = config.hidden_size;
     const total = try validateBertForwardInputs(config, input_ids, attention_mask, token_type_ids, batch, seq_len);
-    // ponytail: prepare on first use; move this to session warmup if cold-request latency matters.
+    // Preparation is lazy on the first request; subsequent requests validate
+    // backend-owned slot metadata without loading or wrapping model weights.
     const resident_slots = try preplanMetalEncoder(cb, allocator, config);
 
     var encoder_frame_active = false;
@@ -410,23 +444,44 @@ fn embeddings(
         } else |_| {}
     }
 
-    // LayerNorm
-    const ln_w = try cb.getWeight("embeddings.LayerNorm.weight");
-    defer cb.free(ln_w);
-    const ln_b = try cb.getWeight("embeddings.LayerNorm.bias");
-    defer cb.free(ln_b);
-    const normed = if (layer_norm_slot) |slot|
-        (try cb.decoderRuntimeApplyLayerNorm(&.{
-            .slot = slot,
-            .input = result,
-            .hidden_size = H,
-            .eps = config.layer_norm_eps,
-        })) orelse try cb.layerNorm(result, ln_w, ln_b, H, config.layer_norm_eps)
-    else
-        try cb.layerNorm(result, ln_w, ln_b, H, config.layer_norm_eps);
+    // Keep fallback weights completely off the resident Metal hot path:
+    // cached getWeight calls still allocate short-lived tensor wrappers.
+    const normed = embeddingLayerNormWithSlot(
+        cb,
+        result,
+        H,
+        config.layer_norm_eps,
+        layer_norm_slot,
+    ) catch |err| {
+        cb.free(result);
+        return err;
+    };
     cb.free(result);
 
     return normed;
+}
+
+fn embeddingLayerNormWithSlot(
+    cb: *const ComputeBackend,
+    input: CT,
+    hidden_size: usize,
+    eps: f32,
+    slot: ?usize,
+) !CT {
+    if (slot) |prepared_slot| {
+        if (try cb.decoderRuntimeApplyLayerNorm(&.{
+            .slot = prepared_slot,
+            .input = input,
+            .hidden_size = hidden_size,
+            .eps = eps,
+        })) |output| return output;
+    }
+
+    const weight = try cb.getWeight("embeddings.LayerNorm.weight");
+    defer cb.free(weight);
+    const bias = try cb.getWeight("embeddings.LayerNorm.bias");
+    defer cb.free(bias);
+    return cb.layerNorm(input, weight, bias, hidden_size, eps);
 }
 
 fn buildPositionIds(
@@ -436,7 +491,7 @@ fn buildPositionIds(
     total: usize,
     seq_len: usize,
 ) ![]i64 {
-    if (seq_len == 0 or seq_len > config.max_position_embeddings or input_ids.len < total or total % seq_len != 0) {
+    if (seq_len == 0 or seq_len > config.maxSequenceLength() or input_ids.len < total or total % seq_len != 0) {
         return error.InvalidShape;
     }
     const pos_ids = try allocator.alloc(i64, total);
@@ -744,12 +799,128 @@ test "BERT resident slot layout is stable and non-overlapping" {
     try std.testing.expectEqual(@as(usize, 48), bertEmbeddingLayerNormSlot(24));
 }
 
+const MetalEncoderPreparedProbe = struct {
+    linear_calls: usize = 0,
+    layer_norm_calls: usize = 0,
+    missing_linear_slot: ?usize = null,
+    missing_layer_norm_slot: ?usize = null,
+
+    fn linearPrepared(ctx: *anyopaque, slot: usize, in_dim: usize, out_dim: usize) bool {
+        const self: *MetalEncoderPreparedProbe = @ptrCast(@alignCast(ctx));
+        self.linear_calls += 1;
+        if (self.missing_linear_slot == slot) return false;
+        const kind: BertLinearSlotKind = @enumFromInt(slot % bert_linear_specs.len);
+        const spec = bert_linear_specs[@intFromEnum(kind)];
+        const expected_in_dim: usize = if (spec.input_intermediate) 8 else 4;
+        const expected_out_dim: usize = if (spec.output_intermediate) 8 else 4;
+        return in_dim == expected_in_dim and out_dim == expected_out_dim;
+    }
+
+    fn layerNormPrepared(ctx: *anyopaque, slot: usize, hidden_size: usize) bool {
+        const self: *MetalEncoderPreparedProbe = @ptrCast(@alignCast(ctx));
+        self.layer_norm_calls += 1;
+        return self.missing_layer_norm_slot != slot and hidden_size == 4;
+    }
+
+    const vtable = blk: {
+        var vt = native_compute_mod.vtable_impl;
+        vt.decoderRuntimeLinearSlotPrepared = linearPrepared;
+        vt.decoderRuntimeLayerNormSlotPrepared = layerNormPrepared;
+        break :blk vt;
+    };
+};
+
+const EmbeddingLayerNormResidentProbe = struct {
+    input_marker: u8 = 0,
+    output_marker: u8 = 0,
+    apply_calls: usize = 0,
+    weight_calls: usize = 0,
+
+    fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
+        const self: *EmbeddingLayerNormResidentProbe = @ptrCast(@alignCast(ctx));
+        _ = name;
+        self.weight_calls += 1;
+        return error.UnexpectedWeightLookup;
+    }
+
+    fn applyLayerNorm(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLayerNormRequest) anyerror!?CT {
+        const self: *EmbeddingLayerNormResidentProbe = @ptrCast(@alignCast(ctx));
+        self.apply_calls += 1;
+        try std.testing.expectEqual(@as(usize, 7), request.slot);
+        try std.testing.expectEqual(@as(usize, 4), request.hidden_size);
+        try std.testing.expectApproxEqAbs(@as(f32, 1e-5), request.eps, 1e-9);
+        try std.testing.expectEqual(@intFromPtr(&self.input_marker), @intFromPtr(request.input));
+        return @ptrCast(&self.output_marker);
+    }
+
+    const vtable = blk: {
+        var vt = native_compute_mod.vtable_impl;
+        vt.getWeight = getWeight;
+        vt.decoderRuntimeApplyLayerNorm = applyLayerNorm;
+        break :blk vt;
+    };
+};
+
+test "BERT Metal resident slot probe is allocation-free and detects invalidation" {
+    const config = Config{
+        .hidden_size = 4,
+        .intermediate_size = 8,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+    };
+    var probe = MetalEncoderPreparedProbe{};
+    const cb = ComputeBackend{ .ptr = &probe, .vtable = &MetalEncoderPreparedProbe.vtable };
+
+    try std.testing.expect(metalEncoderSlotsPrepared(&cb, config));
+    try std.testing.expectEqual(@as(usize, 12), probe.linear_calls);
+    try std.testing.expectEqual(@as(usize, 5), probe.layer_norm_calls);
+
+    probe.linear_calls = 0;
+    probe.layer_norm_calls = 0;
+    probe.missing_linear_slot = bertLinearSlot(1, .k);
+    try std.testing.expect(!metalEncoderSlotsPrepared(&cb, config));
+    try std.testing.expectEqual(bertLinearSlot(1, .k) + 1, probe.linear_calls);
+    try std.testing.expectEqual(@as(usize, 2), probe.layer_norm_calls);
+}
+
+test "BERT resident embedding LayerNorm does not materialize fallback weights" {
+    var probe = EmbeddingLayerNormResidentProbe{};
+    const cb = ComputeBackend{ .ptr = &probe, .vtable = &EmbeddingLayerNormResidentProbe.vtable };
+    const input: CT = @ptrCast(&probe.input_marker);
+
+    const output = try embeddingLayerNormWithSlot(&cb, input, 4, 1e-5, 7);
+
+    try std.testing.expectEqual(@intFromPtr(&probe.output_marker), @intFromPtr(output));
+    try std.testing.expectEqual(@as(usize, 1), probe.apply_calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.weight_calls);
+}
+
 test "RoBERTa position ids preserve padding indices" {
     const config = Config{ .position_id_mode = .roberta_padding, .pad_token_id = 1 };
     const input_ids = [_]i64{ 0, 42, 1, 9, 1, 1, 5, 6 };
     const positions = try buildPositionIds(std.testing.allocator, config, &input_ids, input_ids.len, 4);
     defer std.testing.allocator.free(positions);
     try std.testing.expectEqualSlices(i64, &.{ 2, 3, 1, 4, 1, 1, 2, 3 }, positions);
+}
+
+test "RoBERTa position ids stay within the embedding table" {
+    const config = Config{
+        .position_id_mode = .roberta_padding,
+        .pad_token_id = 1,
+        .max_position_embeddings = 4,
+    };
+    try std.testing.expectEqual(@as(u32, 2), config.maxSequenceLength());
+
+    const valid_ids = [_]i64{ 10, 11 };
+    const positions = try buildPositionIds(std.testing.allocator, config, &valid_ids, valid_ids.len, valid_ids.len);
+    defer std.testing.allocator.free(positions);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, positions);
+
+    const too_many_ids = [_]i64{ 10, 11, 12 };
+    try std.testing.expectError(
+        error.InvalidShape,
+        buildPositionIds(std.testing.allocator, config, &too_many_ids, too_many_ids.len, too_many_ids.len),
+    );
 }
 
 test "BERT forward input validation rejects unsafe public inputs" {
@@ -770,6 +941,17 @@ test "BERT forward input validation rejects unsafe public inputs" {
         validateBertForwardInputs(config, &ids, &invalid_mask, null, 1, 4),
     );
     try std.testing.expectError(error.InvalidShape, validateBertForwardInputs(config, &ids, &mask, null, 1, 5));
+
+    const roberta_config = Config{
+        .vocab_size = 16,
+        .hidden_size = 8,
+        .intermediate_size = 16,
+        .num_attention_heads = 2,
+        .max_position_embeddings = 4,
+        .position_id_mode = .roberta_padding,
+        .pad_token_id = 1,
+    };
+    try std.testing.expectError(error.InvalidShape, validateBertForwardInputs(roberta_config, &ids, &mask, null, 1, 4));
 }
 
 test "BGE-M3 F16 mirror estimate stays within the production default" {

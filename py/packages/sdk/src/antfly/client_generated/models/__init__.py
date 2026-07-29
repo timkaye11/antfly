@@ -589,6 +589,7 @@ from .role_assignment import RoleAssignment
 from .route_type import RouteType
 from .row_filter_entry import RowFilterEntry
 from .row_filter_entry_filter import RowFilterEntryFilter
+from .runtime_config_status import RuntimeConfigStatus
 from .runtime_decl import RuntimeDecl
 from .runtime_decl_mode import RuntimeDeclMode
 from .scan_keys_request import ScanKeysRequest
@@ -1296,6 +1297,7 @@ __all__ = (
     "RouteType",
     "RowFilterEntry",
     "RowFilterEntryFilter",
+    "RuntimeConfigStatus",
     "RuntimeDecl",
     "RuntimeDeclMode",
     "ScanKeysRequest",

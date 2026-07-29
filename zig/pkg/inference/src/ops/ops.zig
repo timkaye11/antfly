@@ -1838,6 +1838,11 @@ pub const ComputeBackend = struct {
         /// of the prepared runtime.
         decoderRuntimePrepareLayerNorm: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimePrepareLayerNormRequest) anyerror!bool = null,
 
+        /// Report whether a layer-norm slot with the requested shape is
+        /// already resident. This lets architecture warmup paths avoid
+        /// reloading model weights merely to rediscover prepared state.
+        decoderRuntimeLayerNormSlotPrepared: ?*const fn (ctx: *anyopaque, slot: usize, hidden_size: usize) bool = null,
+
         /// Reuse or prepare a backend-owned graph/runtime layer-norm slot
         /// without exposing backend slot allocation policy to graph executors.
         decoderRuntimeEnsureLayerNormSlot: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeEnsureLayerNormSlotRequest) anyerror!?usize = null,
@@ -1898,6 +1903,11 @@ pub const ComputeBackend = struct {
         /// runtime slot. Weight shape is [out_dim, in_dim], bias shape is
         /// [out_dim].
         decoderRuntimePrepareLinear: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimePrepareLinearRequest) anyerror!bool = null,
+
+        /// Report whether a linear slot with the requested shape is already
+        /// resident. Backends that do not expose resident slots leave this
+        /// null and callers perform ordinary preparation.
+        decoderRuntimeLinearSlotPrepared: ?*const fn (ctx: *anyopaque, slot: usize, in_dim: usize, out_dim: usize) bool = null,
 
         /// Reuse or prepare a backend-owned graph/runtime dense linear slot
         /// without exposing backend slot allocation policy to graph executors.
@@ -3570,6 +3580,13 @@ pub const ComputeBackend = struct {
         return false;
     }
 
+    pub fn decoderRuntimeLayerNormSlotPrepared(self: *const ComputeBackend, slot: usize, hidden_size: usize) bool {
+        if (self.vtable.decoderRuntimeLayerNormSlotPrepared) |op| {
+            return op(self.ptr, slot, hidden_size);
+        }
+        return false;
+    }
+
     pub fn decoderRuntimeEnsureLayerNormSlot(self: *const ComputeBackend, request: *const DecoderRuntimeEnsureLayerNormSlotRequest) !?usize {
         if (self.vtable.decoderRuntimeEnsureLayerNormSlot) |op| {
             return op(self.ptr, request);
@@ -3657,6 +3674,13 @@ pub const ComputeBackend = struct {
     pub fn decoderRuntimePrepareLinear(self: *const ComputeBackend, request: *const DecoderRuntimePrepareLinearRequest) !bool {
         if (self.vtable.decoderRuntimePrepareLinear) |op| {
             return op(self.ptr, request);
+        }
+        return false;
+    }
+
+    pub fn decoderRuntimeLinearSlotPrepared(self: *const ComputeBackend, slot: usize, in_dim: usize, out_dim: usize) bool {
+        if (self.vtable.decoderRuntimeLinearSlotPrepared) |op| {
+            return op(self.ptr, slot, in_dim, out_dim);
         }
         return false;
     }

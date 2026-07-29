@@ -58,14 +58,59 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  configure:
+    name: Validate L4 runner configuration
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.runner-labels.outputs.enabled }}
+    env:
+      CUDA_RELEASE_MODE: ${{ inputs.gate || 'nightly' }}
+      RUNNER_LABELS_JSON: ${{ vars.ANTFLY_CUDA_L4_RUNNER_LABELS_JSON }}
+    steps:
+      - name: Validate dedicated L4 runner labels
+        id: runner-labels
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$RUNNER_LABELS_JSON" ]]; then
+            if [[ "$CUDA_RELEASE_MODE" == "release" ]]; then
+              echo "ANTFLY_CUDA_L4_RUNNER_LABELS_JSON must be configured for release gates." >&2
+              exit 1
+            fi
+            echo "No L4 runner labels are configured; skipping nightly CUDA evidence."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          python3 - <<'PY'
+          import json
+          import os
+
+          labels = json.loads(os.environ["RUNNER_LABELS_JSON"])
+          if not isinstance(labels, list) or not labels or not all(
+              isinstance(label, str) and label for label in labels
+          ):
+              raise SystemExit("ANTFLY_CUDA_L4_RUNNER_LABELS_JSON must be a non-empty JSON string array")
+
+          generic = {"self-hosted", "linux", "windows", "macos", "x64", "arm64"}
+          if "self-hosted" not in labels or not any(label not in generic for label in labels):
+              raise SystemExit(
+                  "ANTFLY_CUDA_L4_RUNNER_LABELS_JSON must include self-hosted and a dedicated L4 runner label"
+              )
+          PY
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
   l4-evidence:
     name: Gemma 4 CUDA evidence (L4 / SM89)
+    needs: configure
+    if: ${{ needs.configure.outputs.enabled == 'true' }}
     # Configure ANTFLY_CUDA_L4_RUNNER_LABELS_JSON as a repository variable with
     # the labels assigned to the L4 runner, for example
-    # ["self-hosted","linux","x64","gpu-l4"]. The generic default avoids
-    # guessing an unavailable repository-specific label; the gate verifies the
-    # actual visible device is an NVIDIA L4 with compute capability 8.9.
-    runs-on: ${{ fromJSON(vars.ANTFLY_CUDA_L4_RUNNER_LABELS_JSON || '["self-hosted"]') }}
+    # ["self-hosted","linux","x64","gpu-l4"]. The configure job skips
+    # unconfigured nightly runs and fails closed for release gates. The hosted
+    # fallback is parsed only for a skipped job and can never claim a
+    # self-hosted runner.
+    runs-on: ${{ fromJSON(vars.ANTFLY_CUDA_L4_RUNNER_LABELS_JSON || '["ubuntu-latest"]') }}
     timeout-minutes: 240
     env:
       CUDA_EVIDENCE_DIR: ${{ github.workspace }}/artifacts/cuda-gemma4-l4

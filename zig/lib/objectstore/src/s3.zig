@@ -1430,7 +1430,7 @@ fn formatAmzDateAlloc(alloc: Allocator, unix_seconds: u64) ![]u8 {
         "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z",
         .{
             year_day.year,
-            @intFromEnum(month_day.month) + 1,
+            @intFromEnum(month_day.month),
             month_day.day_index + 1,
             day_seconds.getHoursIntoDay(),
             day_seconds.getMinutesIntoHour(),
@@ -1448,7 +1448,7 @@ fn formatScopeDateAlloc(alloc: Allocator, unix_seconds: u64) ![]u8 {
         "{d:0>4}{d:0>2}{d:0>2}",
         .{
             year_day.year,
-            @intFromEnum(month_day.month) + 1,
+            @intFromEnum(month_day.month),
             month_day.day_index + 1,
         },
     );
@@ -1458,6 +1458,29 @@ fn asciiLowerAlloc(alloc: Allocator, input: []const u8) ![]u8 {
     const out = try alloc.dupe(u8, input);
     _ = std.ascii.lowerString(out, out);
     return out;
+}
+
+test "s3 signing timestamp uses Unix wall clock" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+
+    const before: u64 = @intCast(std.Io.Timestamp.now(io_impl.io(), .real).toSeconds());
+    const actual = try currentUnixSeconds();
+    const after: u64 = @intCast(std.Io.Timestamp.now(io_impl.io(), .real).toSeconds());
+
+    try std.testing.expect(actual >= before);
+    try std.testing.expect(actual <= after);
+}
+
+test "s3 signing dates use calendar month numbers" {
+    const alloc = std.testing.allocator;
+    const amz_date = try formatAmzDateAlloc(alloc, 0);
+    defer alloc.free(amz_date);
+    const scope_date = try formatScopeDateAlloc(alloc, 0);
+    defer alloc.free(scope_date);
+
+    try std.testing.expectEqualStrings("19700101T000000Z", amz_date);
+    try std.testing.expectEqualStrings("19700101", scope_date);
 }
 
 fn encodeUriComponentAlloc(alloc: Allocator, input: []const u8, encode_slash: bool) ![]u8 {

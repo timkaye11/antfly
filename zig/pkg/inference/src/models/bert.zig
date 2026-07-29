@@ -60,6 +60,17 @@ pub const Config = struct {
             .distilbert => "distilbert",
         };
     }
+
+    /// Returns the largest sequence that can be represented by the position
+    /// embedding table. RoBERTa reserves indices through pad_token_id and
+    /// numbers non-padding tokens starting at pad_token_id + 1.
+    pub fn maxSequenceLength(self: Config) u32 {
+        if (self.position_id_mode == .absolute) return self.max_position_embeddings;
+        if (self.pad_token_id < 0) return 0;
+        const first_position = std.math.add(i64, self.pad_token_id, 1) catch return 0;
+        const reserved = std.math.cast(u32, first_position) orelse return 0;
+        return self.max_position_embeddings -| reserved;
+    }
 };
 
 /// Parse a BERT config from JSON bytes.
