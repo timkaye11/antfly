@@ -727,6 +727,21 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
         },
     );
     std.debug.print(
+        "metal_q4_0_pair_activation_policy: mmv_nr4_nsg2={d} mmv_nr8_nsg2={d} mmv_nr4_nsg4={d} mmv_nr8_nsg4={d} mmv_variant_fallbacks={d} mm_m32_n64_aligned={d} mm_m32_n64_tail={d} mm_m32_n32_aligned={d} mm_m32_n32_tail={d} mm_variant_fallbacks={d}\n",
+        .{
+            provider_stats.metal_runtime_q4_0_pair_activation_mmv_nr4_nsg2_dispatches,
+            provider_stats.metal_runtime_q4_0_pair_activation_mmv_nr8_nsg2_dispatches,
+            provider_stats.metal_runtime_q4_0_pair_activation_mmv_nr4_nsg4_dispatches,
+            provider_stats.metal_runtime_q4_0_pair_activation_mmv_nr8_nsg4_dispatches,
+            provider_stats.metal_runtime_q4_0_pair_activation_mmv_variant_fallbacks,
+            provider_stats.metal_runtime_q4_0_pair_activation_mm_m32_n64_aligned_dispatches,
+            provider_stats.metal_runtime_q4_0_pair_activation_mm_m32_n64_tail_dispatches,
+            provider_stats.metal_runtime_q4_0_pair_activation_mm_m32_n32_aligned_dispatches,
+            provider_stats.metal_runtime_q4_0_pair_activation_mm_m32_n32_tail_dispatches,
+            provider_stats.metal_runtime_q4_0_pair_activation_mm_variant_fallbacks,
+        },
+    );
+    std.debug.print(
         "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_linear_reduce_rows={d}/{d}/{d}/{d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_rows={d}/{d}/{d}/{d} q6_linear_reduce_in_f16={d}\n",
         .{
             provider_stats.metal_runtime_q4_k_linear_reduce,

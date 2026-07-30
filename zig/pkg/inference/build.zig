@@ -809,6 +809,23 @@ pub fn build(b: *std.Build) void {
     );
     metal_gemma4_long_output_benchmark_contract_test_step.dependOn(&metal_gemma4_long_output_benchmark_contract_test.step);
 
+    const metal_gemma4_ab_benchmark_contract_test = b.addSystemCommand(&.{
+        "python3",
+        "scripts/test_benchmark_metal_gemma4_ab.py",
+    });
+    const metal_gemma4_ab_benchmark_contract_test_step = b.step(
+        "test-metal-gemma4-ab-benchmark",
+        "Test the fail-closed Gemma4 Metal baseline/candidate benchmark contract",
+    );
+    metal_gemma4_ab_benchmark_contract_test_step.dependOn(&metal_gemma4_ab_benchmark_contract_test.step);
+
+    const metal_gemma4_benchmark_contracts_test_step = b.step(
+        "test-metal-gemma4-benchmark-contracts",
+        "Test the Gemma4 Metal comparator and baseline/candidate benchmark contracts",
+    );
+    metal_gemma4_benchmark_contracts_test_step.dependOn(metal_gemma4_long_output_benchmark_contract_test_step);
+    metal_gemma4_benchmark_contracts_test_step.dependOn(metal_gemma4_ab_benchmark_contract_test_step);
+
     const metal_gemma4_tool_calling_test = b.addSystemCommand(&.{
         "bash",
         "scripts/test_metal_gemma4_tool_calling.sh",
@@ -972,6 +989,66 @@ pub fn build(b: *std.Build) void {
     q4_mmv_route_check_step.dependOn(&q4_mmv_fallback_route_check.step);
     if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
         quant_kernel_metal_local_check_step.dependOn(&q4_mmv_fallback_route_check.step);
+    }
+
+    const q4_pair_mmv_variants = [_]struct { name: []const u8, hash: []const u8 }{
+        .{ .name = "nr4-nsg2", .hash = "1b8993f8509b5da" },
+        .{ .name = "nr8-nsg2", .hash = "1b8993f8509b5da" },
+        .{ .name = "nr4-nsg4", .hash = "1b8993f8509b5da" },
+        .{ .name = "nr8-nsg4", .hash = "1b8993f8509b5da" },
+    };
+    var q4_pair_route_tail: *std.Build.Step = undefined;
+    for (q4_pair_mmv_variants, 0..) |variant, variant_index| {
+        const check = b.addRunArtifact(metal_bench_exe);
+        check.setEnvironmentVariable("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION", "1");
+        check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_FUSION", "0");
+        check.setEnvironmentVariable("TERMITE_METAL_Q4_0_PAIR_ACTIVATION_MMV_VARIANT", variant.name);
+        check.addArg("--skip-unless-apple-m4");
+        check.addArgs(&.{ "--mode", "ffn", "--rows", "1", "--in", "2560", "--out", "10240", "--warmup", "1", "--iters", "1", "--expect-q4-pair-mmv-variant", variant.name, "--expect-output-hash", variant.hash });
+        if (variant_index != 0) check.step.dependOn(q4_pair_route_tail);
+        q4_pair_route_tail = &check.step;
+    }
+    const q4_pair_mmv_auto_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_pair_mmv_auto_route_check.setEnvironmentVariable("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION", "1");
+    q4_pair_mmv_auto_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_FUSION", "0");
+    q4_pair_mmv_auto_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_PAIR_ACTIVATION_MMV_VARIANT", "auto");
+    q4_pair_mmv_auto_route_check.addArg("--skip-unless-apple-m4");
+    q4_pair_mmv_auto_route_check.addArgs(&.{ "--mode", "ffn", "--rows", "1", "--in", "2560", "--out", "10240", "--warmup", "1", "--iters", "1", "--expect-q4-pair-mmv-variant", "nr4-nsg2", "--expect-output-hash", "1b8993f8509b5da" });
+    q4_pair_mmv_auto_route_check.step.dependOn(q4_pair_route_tail);
+
+    const q4_pair_mmv_kill_switch_check = b.addRunArtifact(metal_bench_exe);
+    q4_pair_mmv_kill_switch_check.setEnvironmentVariable("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION", "1");
+    q4_pair_mmv_kill_switch_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_FUSION", "1");
+    q4_pair_mmv_kill_switch_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_PAIR_ACTIVATION_MMV_VARIANT", "nr8-nsg2");
+    q4_pair_mmv_kill_switch_check.addArg("--skip-unless-apple-m4");
+    q4_pair_mmv_kill_switch_check.addArgs(&.{ "--mode", "ffn", "--rows", "1", "--in", "2560", "--out", "10240", "--warmup", "1", "--iters", "1", "--expect-output-hash", "e48cf991af265cc9" });
+    q4_pair_mmv_kill_switch_check.step.dependOn(&q4_pair_mmv_auto_route_check.step);
+
+    const q4_pair_mm_cases = [_]struct { variant: []const u8, rows: []const u8, route: []const u8, hash: []const u8 }{
+        .{ .variant = "m32-n64", .rows = "32", .route = "m32-n64-aligned", .hash = "e1941e94e89fba88" },
+        .{ .variant = "m32-n32", .rows = "32", .route = "m32-n32-aligned", .hash = "e1941e94e89fba88" },
+        .{ .variant = "m32-n64", .rows = "31", .route = "m32-n64-tail", .hash = "74bf31c81f60ad14" },
+        .{ .variant = "m32-n32", .rows = "31", .route = "m32-n32-tail", .hash = "74bf31c81f60ad14" },
+        .{ .variant = "m32-n64", .rows = "2003", .route = "m32-n64-tail", .hash = "34e1a1753b4c4dfe" },
+    };
+    q4_pair_route_tail = &q4_pair_mmv_kill_switch_check.step;
+    for (q4_pair_mm_cases) |case| {
+        const check = b.addRunArtifact(metal_bench_exe);
+        check.setEnvironmentVariable("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_MM", "1");
+        check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_MM", "0");
+        check.setEnvironmentVariable("TERMITE_METAL_Q4_0_PAIR_ACTIVATION_MM_VARIANT", case.variant);
+        check.addArg("--skip-unless-apple-m4");
+        check.addArgs(&.{ "--mode", "ffn", "--rows", case.rows, "--in", "2560", "--out", "10240", "--warmup", "1", "--iters", "1", "--expect-q4-pair-mm-route", case.route, "--expect-output-hash", case.hash });
+        check.step.dependOn(q4_pair_route_tail);
+        q4_pair_route_tail = &check.step;
+    }
+    const q4_pair_route_check_step = b.step(
+        "test-metal-q4-0-pair-activation-routes",
+        "Run exact-output Metal assertions for the M4-qualified Q4_0 pair activation portfolios",
+    );
+    q4_pair_route_check_step.dependOn(q4_pair_route_tail);
+    if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        quant_kernel_metal_local_check_step.dependOn(q4_pair_route_tail);
     }
 
     const run_finetune = b.addRunArtifact(exe);

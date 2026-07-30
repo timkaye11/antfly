@@ -479,6 +479,12 @@ Local ggml inspection on 2026-05-01 confirmed the production shape:
 
 These are local directional anchors, not absolute device claims.
 
+The current Gemma 4 QAT baseline/no-MTP plan, canonical 2K+300 comparator, and
+promotion gates live in
+[GEMMA4_METAL_PERFORMANCE.md](./GEMMA4_METAL_PERFORMANCE.md). Older anchors
+below remain useful implementation history, but they are not the current
+llama.cpp gap unless rerun under that contract.
+
 - Current compiled partitioned graph anchor, Gemma4 Q8_0 short prompt:
   `ANTFLY_INFERENCE_GRAPH_EXECUTOR_STATS=1` with `--backend metal --mode compiled
   --compiled-target partitioned --max-tokens 1 --temperature 0` reports

@@ -853,6 +853,12 @@ pub const ComputeRegion = enum(usize) {
     other = 8,
 };
 
+pub const FrameRegime = enum(u8) {
+    none = 0,
+    prefill = 1,
+    decode = 2,
+};
+
 pub const ComputeSource = enum(usize) {
     quant_linear = 0,
     quant_qkv = 1,
@@ -7447,6 +7453,27 @@ pub const RawWorkloadProfileSnapshot = extern struct {
     }
 };
 
+pub const stage_bucket_count: usize = 6;
+
+pub const RawStageRegimeTiming = extern struct {
+    sampled_frames: u64 = 0,
+    whole_frame_gpu_nanos: u64 = 0,
+    bucket_nanos: [stage_bucket_count]u64 = [_]u64{0} ** stage_bucket_count,
+};
+
+pub const RawStageTimingSnapshot = extern struct {
+    enabled: u64 = 0,
+    supported: u64 = 0,
+    complete: u64 = 0,
+    barrier_sample_count: u64 = 0,
+    allocation_failures: u64 = 0,
+    resolve_failures: u64 = 0,
+    overflow_failures: u64 = 0,
+    dropped_frames: u64 = 0,
+    prefill: RawStageRegimeTiming = .{},
+    decode: RawStageRegimeTiming = .{},
+};
+
 pub const RawMetalJitExactDispatchStats = extern struct {
     q4_0_hits: u64 = 0,
     q4_k_hits: u64 = 0,
@@ -8172,6 +8199,8 @@ test "Metal workload model fingerprint binds the complete route scope" {
 comptime {
     std.debug.assert(@sizeOf(RawWorkloadProfileEntry) == 80);
     std.debug.assert(@sizeOf(RawWorkloadProfileSnapshot) == 20_520);
+    std.debug.assert(@sizeOf(RawStageRegimeTiming) == 64);
+    std.debug.assert(@sizeOf(RawStageTimingSnapshot) == 192);
 }
 
 pub const RawRuntimeMemoryStats = extern struct {
@@ -8238,6 +8267,10 @@ pub const RawRuntimeMemoryStats = extern struct {
     generated_rms_norm_calls: u64 = 0,
     prepared_frame_fast_path_calls: u64 = 0,
     prepared_frame_fallback_calls: u64 = 0,
+    frame_begin_count: u64 = 0,
+    frame_submit_count: u64 = 0,
+    frame_wait_nanos: u64 = 0,
+    frame_gpu_nanos: u64 = 0,
     compute_encoder_count: u64 = 0,
     blit_encoder_count: u64 = 0,
     last_frame_compute_encoder_count: u64 = 0,
@@ -8304,9 +8337,19 @@ pub const RawRuntimeMemoryStats = extern struct {
     q4_0_mmv_nr4_nsg4_dispatches: u64 = 0,
     q4_0_mmv_nr8_nsg4_dispatches: u64 = 0,
     q4_0_mmv_variant_fallbacks: u64 = 0,
+    q4_0_pair_activation_mmv_nr4_nsg2_dispatches: u64 = 0,
+    q4_0_pair_activation_mmv_nr8_nsg2_dispatches: u64 = 0,
+    q4_0_pair_activation_mmv_nr4_nsg4_dispatches: u64 = 0,
+    q4_0_pair_activation_mmv_nr8_nsg4_dispatches: u64 = 0,
+    q4_0_pair_activation_mmv_variant_fallbacks: u64 = 0,
     q4_0_mm_sg_aligned_dispatches: u64 = 0,
     q4_0_mm_sg_aligned_tail_dispatches: u64 = 0,
     q4_0_mm_sg_unrolled_dispatches: u64 = 0,
+    q4_0_pair_activation_mm_m32_n64_aligned_dispatches: u64 = 0,
+    q4_0_pair_activation_mm_m32_n64_tail_dispatches: u64 = 0,
+    q4_0_pair_activation_mm_m32_n32_aligned_dispatches: u64 = 0,
+    q4_0_pair_activation_mm_m32_n32_tail_dispatches: u64 = 0,
+    q4_0_pair_activation_mm_variant_fallbacks: u64 = 0,
     q4_0_pair: u64 = 0,
     q4_0_pair_reduce: u64 = 0,
     q4_0_pair_activation_reduce: u64 = 0,
@@ -8412,6 +8455,21 @@ test "metal prepared frame fast path is qualified, diagnosable, and shares lifec
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->prepared_frame_fallback_calls = runtime->prepared_frame_fallback_calls"));
 }
 
+test "Metal stage timing preserves the prepared frame topology" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    const diagnostics_start = std.mem.indexOf(u8, source, "static bool termite_metal_prepared_frame_diagnostics_enabled(void)").?;
+    const diagnostics_end = std.mem.indexOfPos(u8, source, diagnostics_start, "static uint64_t termite_metal_env_bounded_u64").?;
+    try std.testing.expect(std.mem.indexOf(u8, source[diagnostics_start..diagnostics_end], "TERMITE_METAL_STAGE_TIMING") == null);
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "sampleCountersInBuffer:frame->buffer"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_metal_new_fast_prepared_command_buffer"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "int termite_metal_decode_runtime_stage_timing_snapshot("));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "int termite_metal_decode_runtime_reset_stage_timing("));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->stage_timing_prefill_seen = 0"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->stage_timing_decode_selected = 0"));
+}
+
 test "metal Q4_0 MMV portfolio is M4-qualified, observable, and cloned into host dispatch" {
     const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
@@ -8423,6 +8481,42 @@ test "metal Q4_0 MMV portfolio is M4-qualified, observable, and cloned into host
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime.q4_0_mmv_trace_emitted = source_runtime->q4_0_mmv_trace_emitted"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "source_runtime->q4_0_mmv_nr4_nsg2_dispatches += runtime.q4_0_mmv_nr4_nsg2_dispatches"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->q4_0_mmv_variant_fallbacks = runtime->q4_0_mmv_variant_fallbacks"));
+}
+
+test "metal Q4_0 pair activation portfolios are exact gated and observable" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_FUSION"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_Q4_0_PAIR_ACTIVATION_MMV_VARIANT"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_MM"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_MM"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_Q4_0_PAIR_ACTIVATION_MM_VARIANT"));
+    inline for (.{ "nr4_nsg2", "nr8_nsg2", "nr4_nsg4", "nr8_nsg4" }) |variant| {
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_q4_0_pair_activation_1x_reduce_" ++ variant));
+    }
+    inline for (.{ "m32_n64_aligned", "m32_n64_tail", "m32_n32_aligned", "m32_n32_tail" }) |variant| {
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_q4_0_pair_activation_mm_" ++ variant));
+    }
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "descriptor->in_dim == 2560u && descriptor->out_dim == 10240u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "selection.threadgroup_memory_bytes = 16u * 1024u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "selection.threadgroup_memory_bytes = 8u * 1024u"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->q4_0_pair_activation_mmv_variant_fallbacks = runtime->q4_0_pair_activation_mmv_variant_fallbacks"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->q4_0_pair_activation_mm_variant_fallbacks = runtime->q4_0_pair_activation_mm_variant_fallbacks"));
+}
+
+test "concurrent planned dispatch policy is fail closed and hazards share production classifier" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_concurrent_planned_dispatch_policy_probe(0, 0, 0));
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_concurrent_planned_dispatch_policy_probe(1, 0, 0));
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_concurrent_planned_dispatch_policy_probe(0, 1, 0));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_concurrent_planned_dispatch_policy_probe(1, 1, 1));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_planned_range_hazard_probe(0, 16, 0, 8, 24, 0, 1));
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_planned_range_hazard_probe(0, 16, 0, 8, 24, 1, 1));
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_planned_range_hazard_probe(0, 16, 1, 8, 24, 1, 1));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_planned_range_hazard_probe(0, 16, 1, 16, 24, 1, 1));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_planned_range_hazard_probe(0, 16, 1, 8, 24, 1, 0));
 }
 
 test "Metal exact JIT pipeline lookup includes regime dispatch rows and both matrix dimensions" {
@@ -13558,9 +13652,22 @@ pub extern fn termite_metal_decode_runtime_planned_compute_barrier(runtime: ?*Ra
 pub extern fn termite_metal_decode_runtime_end_planned_compute_scope(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_push_planned_compute_barrier_suppression(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_pop_planned_compute_barrier_suppression(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_set_concurrent_planned_dispatch(runtime: ?*RawMetalDecodeRuntime, requested: c_int) c_int;
+pub extern fn termite_metal_decode_runtime_concurrent_planned_dispatch_enabled(runtime: ?*const RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_concurrent_planned_dispatch_policy_probe(requested: c_int, force_enabled: c_int, force_disabled: c_int) c_int;
+pub extern fn termite_metal_planned_range_hazard_probe(a_begin: usize, a_end: usize, a_write: u32, b_begin: usize, b_end: usize, b_write: u32, same_buffer: u32) c_int;
 pub extern fn termite_metal_decode_runtime_frame_cb_count(runtime: ?*RawMetalDecodeRuntime) u64;
 pub extern fn termite_metal_decode_runtime_decode_gqa_split_calls(runtime: ?*const RawMetalDecodeRuntime) u64;
 pub extern fn termite_metal_decode_runtime_last_frame_gpu_nanos(runtime: ?*RawMetalDecodeRuntime) u64;
+pub extern fn termite_metal_decode_runtime_set_active_frame_regime(
+    runtime: ?*RawMetalDecodeRuntime,
+    regime: u8,
+) c_int;
+pub extern fn termite_metal_decode_runtime_stage_timing_snapshot(
+    runtime: ?*RawMetalDecodeRuntime,
+    snapshot: *RawStageTimingSnapshot,
+) c_int;
+pub extern fn termite_metal_decode_runtime_reset_stage_timing(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_workload_profile_begin(
     runtime: ?*RawMetalDecodeRuntime,
     regime: u8,
@@ -14195,6 +14302,34 @@ pub fn frameCommandBufferCount(runtime: ?*RawMetalDecodeRuntime) u64 {
 
 pub fn lastFrameGpuNanos(runtime: ?*RawMetalDecodeRuntime) u64 {
     return termite_metal_decode_runtime_last_frame_gpu_nanos(runtime);
+}
+
+pub fn setActiveFrameRegime(runtime: ?*RawMetalDecodeRuntime, regime: FrameRegime) FrameError!void {
+    return switch (termite_metal_decode_runtime_set_active_frame_regime(runtime, @intFromEnum(regime))) {
+        0 => {},
+        -1 => FrameError.RuntimeUnavailable,
+        -2 => FrameError.FrameNotActive,
+        else => FrameError.SubmissionFailed,
+    };
+}
+
+pub fn stageTimingSnapshot(runtime: ?*RawMetalDecodeRuntime) RawStageTimingSnapshot {
+    var snapshot: RawStageTimingSnapshot = .{};
+    if (termite_metal_decode_runtime_stage_timing_snapshot(runtime, &snapshot) != 0) return .{};
+    return snapshot;
+}
+
+pub const StageTimingResetError = error{
+    RuntimeUnavailable,
+    FrameActive,
+};
+
+pub fn resetStageTiming(runtime: ?*RawMetalDecodeRuntime) StageTimingResetError!void {
+    return switch (termite_metal_decode_runtime_reset_stage_timing(runtime)) {
+        0 => {},
+        -1 => StageTimingResetError.RuntimeUnavailable,
+        else => StageTimingResetError.FrameActive,
+    };
 }
 
 pub fn workloadProfileBegin(runtime: ?*RawMetalDecodeRuntime, regime: WorkloadRegime) !void {
@@ -35579,6 +35714,45 @@ test "metal native planned compute barrier suppression skips barriers" {
     try std.testing.expectEqual(@as(u64, 1), snapshot.last_frame_compute_encoder_count);
     try std.testing.expectEqual(@as(u64, 1), snapshot.last_frame_planned_compute_scope_count);
     try std.testing.expectEqual(@as(u64, 0), snapshot.last_frame_planned_barrier_count);
+}
+
+test "metal concurrent planned dispatch policy only mutates at frame boundaries" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(runtime);
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_set_concurrent_planned_dispatch(runtime, 0));
+    try beginFrame(runtime);
+    try std.testing.expectEqual(@as(c_int, -2), termite_metal_decode_runtime_set_concurrent_planned_dispatch(runtime, 1));
+    try cancelFrame(runtime);
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_set_concurrent_planned_dispatch(runtime, 0));
+}
+
+test "metal stage timing reset only mutates at frame boundaries" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(runtime);
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+
+    try resetStageTiming(runtime);
+    try beginFrame(runtime);
+    try std.testing.expectError(StageTimingResetError.FrameActive, resetStageTiming(runtime));
+    try beginPlannedComputeScope(runtime, 4, .ffn);
+    try plannedComputeBarrier(runtime);
+    try submitFrame(runtime);
+    try std.testing.expectError(StageTimingResetError.FrameActive, resetStageTiming(runtime));
+    try waitFrame(runtime);
+    try resetStageTiming(runtime);
+
+    const snapshot = stageTimingSnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.barrier_sample_count);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.prefill.sampled_frames);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.decode.sampled_frames);
 }
 
 test "planned compute sequence exports active typed contract" {

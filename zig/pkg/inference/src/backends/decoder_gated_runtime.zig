@@ -1961,6 +1961,9 @@ fn forwardFinalHiddenTensorGemmaDirect(
         cb.decoderRuntimeHasActiveFrame() or try cb.decoderRuntimeBeginFrame()
     else
         false;
+    if (decoder_frame_active and phase == .prefill) {
+        try cb.decoderRuntimeSetActiveFrameRegime(.prefill);
+    }
     const frame_begin_finished_at = monotonicNowNs();
     if (phase == .prefill and frame_begin_finished_at > frame_begin_started_at) {
         timing_stats.prefill_frame_begin_nanos += frame_begin_finished_at - frame_begin_started_at;
@@ -5883,12 +5886,20 @@ pub fn forwardPrefillLastPreparedTail(
 
     var ple_frame_active = false;
     errdefer cancelDecoderRuntimeFrame(cb, &ple_frame_active);
-    if (shouldUseDecoderRuntimeFrame(.prefill, gpt_config, configured_layer_count, decode_context) and !cb.decoderRuntimeHasActiveFrame()) {
-        const frame_begin_started_at = monotonicNowNs();
-        ple_frame_active = try cb.decoderRuntimeBeginFrame();
-        const frame_begin_finished_at = monotonicNowNs();
-        if (frame_begin_finished_at > frame_begin_started_at) {
-            timing_stats.prefill_frame_begin_nanos += frame_begin_finished_at - frame_begin_started_at;
+    if (shouldUseDecoderRuntimeFrame(.prefill, gpt_config, configured_layer_count, decode_context)) {
+        if (!cb.decoderRuntimeHasActiveFrame()) {
+            const frame_begin_started_at = monotonicNowNs();
+            ple_frame_active = try cb.decoderRuntimeBeginFrame();
+            const frame_begin_finished_at = monotonicNowNs();
+            if (frame_begin_finished_at > frame_begin_started_at) {
+                timing_stats.prefill_frame_begin_nanos += frame_begin_finished_at - frame_begin_started_at;
+            }
+        }
+        // Tag the frame before direct PLE work is encoded. Stage timing's
+        // whole-frame denominator begins at frame creation, so delaying the
+        // tag until the transformer blocks would misattribute this prefix.
+        if (cb.decoderRuntimeHasActiveFrame()) {
+            try cb.decoderRuntimeSetActiveFrameRegime(.prefill);
         }
     }
 

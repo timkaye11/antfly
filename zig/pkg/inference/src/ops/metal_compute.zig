@@ -567,6 +567,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     active_prefill_frame_tail_contract: ?ops.PlannedLayerContract = null,
     pending_prefill_kv_device_seeds: std.ArrayListUnmanaged(PendingKvDeviceSeed) = .empty,
     timing_stats: ops.NativeQuantTimingStats = .{},
+    runtime_frame_begin_baseline: u64 = 0,
+    runtime_frame_submit_baseline: u64 = 0,
+    runtime_frame_wait_baseline: u64 = 0,
+    runtime_frame_gpu_baseline: u64 = 0,
     logged_quantized_gated_ffn_unsupported_type: bool = false,
     logged_quantized_gated_ffn_backend_mixed_kind: bool = false,
     logged_quantized_gated_ffn_backend_unsupported_kind: bool = false,
@@ -18819,6 +18823,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return try self.beginDecoderRuntimeFrame(runtime);
     }
 
+    fn decoderRuntimeSetActiveFrameRegimeOp(
+        ctx: *anyopaque,
+        regime: ops.DecoderRuntimeFrameRegime,
+    ) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return;
+        try metal_runtime.setActiveFrameRegime(runtime, @enumFromInt(@intFromEnum(regime)));
+    }
+
     fn decoderRuntimeHasActiveFrameOp(ctx: *anyopaque) bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         return metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime);
@@ -18928,7 +18941,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn resetDebugTimingStatsOp(ctx: *anyopaque) void {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        metal_runtime.resetStageTiming(self.provider_impl.raw_decode_runtime) catch {};
         self.timing_stats = .{};
+        const runtime_stats = metal_runtime.runtimeMemorySnapshot(self.provider_impl.raw_decode_runtime);
+        self.runtime_frame_begin_baseline = runtime_stats.frame_begin_count;
+        self.runtime_frame_submit_baseline = runtime_stats.frame_submit_count;
+        self.runtime_frame_wait_baseline = runtime_stats.frame_wait_nanos;
+        self.runtime_frame_gpu_baseline = runtime_stats.frame_gpu_nanos;
         self.provider_impl.raw_quant_runtime_private_prepare_nanos = 0;
         self.provider_impl.raw_quant_runtime_mapped_prepare_nanos = 0;
         self.provider_impl.raw_quant_runtime_mapped_attempts = 0;
@@ -19019,6 +19038,41 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_tensor_to_host_calls = tensor_stats.to_host_calls;
         stats.metal_tensor_to_host_device_calls = tensor_stats.to_host_device_calls;
         const runtime_stats = metal_runtime.runtimeMemorySnapshot(self.provider_impl.raw_decode_runtime);
+        stats.decoder_runtime_frame_begins = runtime_stats.frame_begin_count -| self.runtime_frame_begin_baseline;
+        stats.decoder_runtime_frame_submits = runtime_stats.frame_submit_count -| self.runtime_frame_submit_baseline;
+        stats.decoder_runtime_frame_wait_nanos = runtime_stats.frame_wait_nanos -| self.runtime_frame_wait_baseline;
+        stats.decoder_runtime_frame_gpu_nanos = runtime_stats.frame_gpu_nanos -| self.runtime_frame_gpu_baseline;
+        const raw_stage_timing = metal_runtime.stageTimingSnapshot(self.provider_impl.raw_decode_runtime);
+        stats.metal_stage_timing = .{
+            .enabled = raw_stage_timing.enabled,
+            .supported = raw_stage_timing.supported,
+            .complete = raw_stage_timing.complete,
+            .barrier_sample_count = raw_stage_timing.barrier_sample_count,
+            .allocation_failures = raw_stage_timing.allocation_failures,
+            .resolve_failures = raw_stage_timing.resolve_failures,
+            .overflow_failures = raw_stage_timing.overflow_failures,
+            .dropped_frames = raw_stage_timing.dropped_frames,
+            .prefill = .{
+                .sampled_frames = raw_stage_timing.prefill.sampled_frames,
+                .whole_frame_gpu_nanos = raw_stage_timing.prefill.whole_frame_gpu_nanos,
+                .attention_nanos = raw_stage_timing.prefill.bucket_nanos[0],
+                .ffn_nanos = raw_stage_timing.prefill.bucket_nanos[1],
+                .ple_nanos = raw_stage_timing.prefill.bucket_nanos[2],
+                .tail_nanos = raw_stage_timing.prefill.bucket_nanos[3],
+                .embedding_nanos = raw_stage_timing.prefill.bucket_nanos[4],
+                .other_nanos = raw_stage_timing.prefill.bucket_nanos[5],
+            },
+            .decode = .{
+                .sampled_frames = raw_stage_timing.decode.sampled_frames,
+                .whole_frame_gpu_nanos = raw_stage_timing.decode.whole_frame_gpu_nanos,
+                .attention_nanos = raw_stage_timing.decode.bucket_nanos[0],
+                .ffn_nanos = raw_stage_timing.decode.bucket_nanos[1],
+                .ple_nanos = raw_stage_timing.decode.bucket_nanos[2],
+                .tail_nanos = raw_stage_timing.decode.bucket_nanos[3],
+                .embedding_nanos = raw_stage_timing.decode.bucket_nanos[4],
+                .other_nanos = raw_stage_timing.decode.bucket_nanos[5],
+            },
+        };
         stats.metal_runtime_buffer_count = runtime_stats.buffer_count;
         stats.metal_runtime_total_bytes = runtime_stats.total_bytes;
         stats.metal_runtime_private_bytes = runtime_stats.private_bytes;
@@ -19148,9 +19202,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_q4_0_mmv_nr4_nsg4_dispatches = runtime_stats.q4_0_mmv_nr4_nsg4_dispatches;
         stats.metal_runtime_q4_0_mmv_nr8_nsg4_dispatches = runtime_stats.q4_0_mmv_nr8_nsg4_dispatches;
         stats.metal_runtime_q4_0_mmv_variant_fallbacks = runtime_stats.q4_0_mmv_variant_fallbacks;
+        stats.metal_runtime_q4_0_pair_activation_mmv_nr4_nsg2_dispatches = runtime_stats.q4_0_pair_activation_mmv_nr4_nsg2_dispatches;
+        stats.metal_runtime_q4_0_pair_activation_mmv_nr8_nsg2_dispatches = runtime_stats.q4_0_pair_activation_mmv_nr8_nsg2_dispatches;
+        stats.metal_runtime_q4_0_pair_activation_mmv_nr4_nsg4_dispatches = runtime_stats.q4_0_pair_activation_mmv_nr4_nsg4_dispatches;
+        stats.metal_runtime_q4_0_pair_activation_mmv_nr8_nsg4_dispatches = runtime_stats.q4_0_pair_activation_mmv_nr8_nsg4_dispatches;
+        stats.metal_runtime_q4_0_pair_activation_mmv_variant_fallbacks = runtime_stats.q4_0_pair_activation_mmv_variant_fallbacks;
         stats.metal_runtime_q4_0_mm_sg_aligned_dispatches = runtime_stats.q4_0_mm_sg_aligned_dispatches;
         stats.metal_runtime_q4_0_mm_sg_aligned_tail_dispatches = runtime_stats.q4_0_mm_sg_aligned_tail_dispatches;
         stats.metal_runtime_q4_0_mm_sg_unrolled_dispatches = runtime_stats.q4_0_mm_sg_unrolled_dispatches;
+        stats.metal_runtime_q4_0_pair_activation_mm_m32_n64_aligned_dispatches = runtime_stats.q4_0_pair_activation_mm_m32_n64_aligned_dispatches;
+        stats.metal_runtime_q4_0_pair_activation_mm_m32_n64_tail_dispatches = runtime_stats.q4_0_pair_activation_mm_m32_n64_tail_dispatches;
+        stats.metal_runtime_q4_0_pair_activation_mm_m32_n32_aligned_dispatches = runtime_stats.q4_0_pair_activation_mm_m32_n32_aligned_dispatches;
+        stats.metal_runtime_q4_0_pair_activation_mm_m32_n32_tail_dispatches = runtime_stats.q4_0_pair_activation_mm_m32_n32_tail_dispatches;
+        stats.metal_runtime_q4_0_pair_activation_mm_variant_fallbacks = runtime_stats.q4_0_pair_activation_mm_variant_fallbacks;
         stats.metal_runtime_q4_0_pair = runtime_stats.q4_0_pair;
         stats.metal_runtime_q4_0_pair_reduce = runtime_stats.q4_0_pair_reduce;
         stats.metal_runtime_q4_0_pair_activation_reduce = runtime_stats.q4_0_pair_activation_reduce;
@@ -20614,6 +20678,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.decoderRuntimePlanPrefillFrame = decoderRuntimePlanPrefillFrameOp;
         vt.decoderRuntimeExecuteGraphCommandPlanFrame = decoderRuntimeExecuteGraphCommandPlanFrameOp;
         vt.decoderRuntimeBeginFrame = decoderRuntimeBeginFrameOp;
+        vt.decoderRuntimeSetActiveFrameRegime = decoderRuntimeSetActiveFrameRegimeOp;
         vt.decoderRuntimeHasActiveFrame = decoderRuntimeHasActiveFrameOp;
         vt.decoderRuntimePushPlannedComputeBarrierSuppression = decoderRuntimePushPlannedComputeBarrierSuppressionOp;
         vt.decoderRuntimePopPlannedComputeBarrierSuppression = decoderRuntimePopPlannedComputeBarrierSuppressionOp;

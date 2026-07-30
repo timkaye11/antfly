@@ -568,6 +568,12 @@ MLX streams/providers for the `.mlx` backend. The repaired smoke
 
 ### Phase 3: Performance Work
 
+Baseline, no-MTP prefill/decode optimization is tracked separately in
+[GEMMA4_METAL_PERFORMANCE.md](./GEMMA4_METAL_PERFORMANCE.md). That roadmap owns
+the pinned llama.cpp comparison, current experiment ledger, promotion gates,
+and ordered Metal kernel/runtime tranches. MTP speedups are additive and must
+not be used to qualify the baseline model path.
+
 - Tune `speculative_k`; start at 4 and compare against 2, 6, and 8.
 - Add a heuristic schedule that increases draft length after full acceptance
   and decreases it after rejection.

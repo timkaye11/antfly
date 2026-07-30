@@ -1244,6 +1244,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     metal_snapshot.provider.metal_runtime_blit_encoder_count,
                 },
             );
+            printMetalStageTiming(metal_snapshot.provider);
             print(
                 "metal_decoder_frame_blits: upload={d} copy={d} slice={d} attention_span={d} ffn_copy={d} embedding={d} other={d}\n",
                 .{
@@ -2977,6 +2978,7 @@ fn metalStatsCompactJson(
 ) ![]u8 {
     const stats = stats_opt orelse return allocator.dupe(u8, "null");
     const provider = stats.provider;
+    const stage = provider.metal_stage_timing;
     const command_operators = provider.metal_runtime_last_frame_planned_command_operator_counts;
     const command_dispatch = provider.metal_runtime_last_frame_planned_command_quant_dispatch_counts;
     const generated_route_json = try graph_mod.quant_kernel_compiler.metalRuntimeRouteSummaryJson(allocator);
@@ -3060,6 +3062,45 @@ fn metalStatsCompactJson(
             provider.metal_runtime_generated_rms_norm_calls,
             provider.metal_runtime_prepared_frame_fast_path_calls,
             provider.metal_runtime_prepared_frame_fallback_calls,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"stage_timing_ns":{{
+        \\"scope":"runtime_frame",
+        \\"enabled":{d},
+        \\"supported":{d},
+        \\"complete":{d},
+        \\"samples":{d},
+        \\"failures":{d},
+        \\"prefill":{{"frames":{d},"gpu":{d},"attention":{d},"ffn":{d},"ple":{d},"tail":{d},"embedding":{d},"other":{d}}},
+        \\"decode":{{"frames":{d},"gpu":{d},"attention":{d},"ffn":{d},"ple":{d},"tail":{d},"embedding":{d},"other":{d}}}
+        \\}}
+    ,
+        .{
+            stage.enabled,
+            stage.supported,
+            stage.complete,
+            stage.barrier_sample_count,
+            stage.failureCount(),
+            stage.prefill.sampled_frames,
+            stage.prefill.whole_frame_gpu_nanos,
+            stage.prefill.attention_nanos,
+            stage.prefill.ffn_nanos,
+            stage.prefill.ple_nanos,
+            stage.prefill.tail_nanos,
+            stage.prefill.embedding_nanos,
+            stage.prefill.other_nanos,
+            stage.decode.sampled_frames,
+            stage.decode.whole_frame_gpu_nanos,
+            stage.decode.attention_nanos,
+            stage.decode.ffn_nanos,
+            stage.decode.ple_nanos,
+            stage.decode.tail_nanos,
+            stage.decode.embedding_nanos,
+            stage.decode.other_nanos,
         },
     );
     try appendFmt(
@@ -3164,6 +3205,36 @@ fn metalStatsCompactJson(
             provider.metal_runtime_q4_0_mm_sg_aligned_dispatches,
             provider.metal_runtime_q4_0_mm_sg_aligned_tail_dispatches,
             provider.metal_runtime_q4_0_mm_sg_unrolled_dispatches,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"q4_0_pair_activation_policy":{{
+        \\"mmv_nr4_nsg2":{d},
+        \\"mmv_nr8_nsg2":{d},
+        \\"mmv_nr4_nsg4":{d},
+        \\"mmv_nr8_nsg4":{d},
+        \\"mmv_variant_fallbacks":{d},
+        \\"mm_m32_n64_aligned":{d},
+        \\"mm_m32_n64_tail":{d},
+        \\"mm_m32_n32_aligned":{d},
+        \\"mm_m32_n32_tail":{d},
+        \\"mm_variant_fallbacks":{d}
+        \\}}
+    ,
+        .{
+            provider.metal_runtime_q4_0_pair_activation_mmv_nr4_nsg2_dispatches,
+            provider.metal_runtime_q4_0_pair_activation_mmv_nr8_nsg2_dispatches,
+            provider.metal_runtime_q4_0_pair_activation_mmv_nr4_nsg4_dispatches,
+            provider.metal_runtime_q4_0_pair_activation_mmv_nr8_nsg4_dispatches,
+            provider.metal_runtime_q4_0_pair_activation_mmv_variant_fallbacks,
+            provider.metal_runtime_q4_0_pair_activation_mm_m32_n64_aligned_dispatches,
+            provider.metal_runtime_q4_0_pair_activation_mm_m32_n64_tail_dispatches,
+            provider.metal_runtime_q4_0_pair_activation_mm_m32_n32_aligned_dispatches,
+            provider.metal_runtime_q4_0_pair_activation_mm_m32_n32_tail_dispatches,
+            provider.metal_runtime_q4_0_pair_activation_mm_variant_fallbacks,
         },
     );
     // Keys and their order come from the shared counter-name table; the emitted
@@ -4947,6 +5018,21 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
             metal_snapshot.provider.metal_runtime_q4_0_mm_sg_unrolled_dispatches,
         },
     );
+    print(
+        "metal_q4_0_pair_activation_policy: mmv_nr4_nsg2={d} mmv_nr8_nsg2={d} mmv_nr4_nsg4={d} mmv_nr8_nsg4={d} mmv_variant_fallbacks={d} mm_m32_n64_aligned={d} mm_m32_n64_tail={d} mm_m32_n32_aligned={d} mm_m32_n32_tail={d} mm_variant_fallbacks={d}\n",
+        .{
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_mmv_nr4_nsg2_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_mmv_nr8_nsg2_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_mmv_nr4_nsg4_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_mmv_nr8_nsg4_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_mmv_variant_fallbacks,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_mm_m32_n64_aligned_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_mm_m32_n64_tail_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_mm_m32_n32_aligned_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_mm_m32_n32_tail_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_pair_activation_mm_variant_fallbacks,
+        },
+    );
     print("metal_generated_quant_dispatch:", .{});
     for (quant_matmul.generated_quant_counter_names) |counter| {
         print(" {s}={d}", .{
@@ -4964,6 +5050,36 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
         .{
             metal_snapshot.provider.metal_runtime_q4_0_ple_activation_rhs_reduce_f16_output,
             metal_snapshot.provider.metal_runtime_q4_0_ple_linear_reduce_f16_input,
+        },
+    );
+}
+
+fn printMetalStageTiming(provider: ops.NativeQuantTimingStats) void {
+    const stage = provider.metal_stage_timing;
+    std.debug.print(
+        "metal_stage_timing_ns: enabled={d} supported={d} complete={d} scope=runtime_frame prefill_frames={d} prefill_gpu={d} prefill_attention={d} prefill_ffn={d} prefill_ple={d} prefill_tail={d} prefill_embedding={d} prefill_other={d} decode_frames={d} decode_gpu={d} decode_attention={d} decode_ffn={d} decode_ple={d} decode_tail={d} decode_embedding={d} decode_other={d} samples={d} failures={d}\n",
+        .{
+            stage.enabled,
+            stage.supported,
+            stage.complete,
+            stage.prefill.sampled_frames,
+            stage.prefill.whole_frame_gpu_nanos,
+            stage.prefill.attention_nanos,
+            stage.prefill.ffn_nanos,
+            stage.prefill.ple_nanos,
+            stage.prefill.tail_nanos,
+            stage.prefill.embedding_nanos,
+            stage.prefill.other_nanos,
+            stage.decode.sampled_frames,
+            stage.decode.whole_frame_gpu_nanos,
+            stage.decode.attention_nanos,
+            stage.decode.ffn_nanos,
+            stage.decode.ple_nanos,
+            stage.decode.tail_nanos,
+            stage.decode.embedding_nanos,
+            stage.decode.other_nanos,
+            stage.barrier_sample_count,
+            stage.failureCount(),
         },
     );
 }
@@ -5520,6 +5636,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
                     metal_snapshot.provider.metal_runtime_blit_encoder_count,
                 },
             );
+            printMetalStageTiming(metal_snapshot.provider);
             print(
                 "metal_decoder_frame_blits: upload={d} copy={d} slice={d} attention_span={d} ffn_copy={d} embedding={d} other={d}\n",
                 .{
@@ -7074,6 +7191,14 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     snapshot.provider.metal_runtime_attention_prefill_direct_kv_calls = 42;
     snapshot.provider.metal_runtime_prepared_frame_fast_path_calls = 29;
     snapshot.provider.metal_runtime_prepared_frame_fallback_calls = 2;
+    snapshot.provider.metal_stage_timing = .{
+        .enabled = 1,
+        .supported = 1,
+        .complete = 1,
+        .barrier_sample_count = 12,
+        .prefill = .{ .sampled_frames = 1, .whole_frame_gpu_nanos = 100, .attention_nanos = 40, .ffn_nanos = 60 },
+        .decode = .{ .sampled_frames = 5, .whole_frame_gpu_nanos = 500, .attention_nanos = 200, .ffn_nanos = 300 },
+    };
     snapshot.provider.metal_runtime_q4_0_mmv_nr4_nsg2_dispatches = 37;
     snapshot.provider.metal_runtime_q4_0_mmv_nr8_nsg2_dispatches = 38;
     snapshot.provider.metal_runtime_q4_0_mmv_nr4_nsg4_dispatches = 39;
@@ -7082,6 +7207,16 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     snapshot.provider.metal_runtime_q4_0_mm_sg_aligned_dispatches = 42;
     snapshot.provider.metal_runtime_q4_0_mm_sg_aligned_tail_dispatches = 43;
     snapshot.provider.metal_runtime_q4_0_mm_sg_unrolled_dispatches = 44;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_mmv_nr4_nsg2_dispatches = 45;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_mmv_nr8_nsg2_dispatches = 46;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_mmv_nr4_nsg4_dispatches = 47;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_mmv_nr8_nsg4_dispatches = 48;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_mmv_variant_fallbacks = 49;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_mm_m32_n64_aligned_dispatches = 50;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_mm_m32_n64_tail_dispatches = 51;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_mm_m32_n32_aligned_dispatches = 52;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_mm_m32_n32_tail_dispatches = 53;
+    snapshot.provider.metal_runtime_q4_0_pair_activation_mm_variant_fallbacks = 54;
     snapshot.provider.metal_runtime_jit_exact_q4_0_hits = 25;
     snapshot.provider.metal_runtime_jit_exact_q4_k_hits = 26;
     const generated_counts = &snapshot.provider.metal_runtime_antfly_generated_dispatch_counts;
@@ -7128,6 +7263,11 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     try std.testing.expectEqual(@as(i64, 0), root.get("attention_dispatch").?.object.get("prefill_paged_kv").?.integer);
     try std.testing.expectEqual(@as(i64, 29), root.get("prepared_frame").?.object.get("fast_path").?.integer);
     try std.testing.expectEqual(@as(i64, 2), root.get("prepared_frame").?.object.get("fallback").?.integer);
+    const stage_timing = root.get("stage_timing_ns").?.object;
+    try std.testing.expectEqualStrings("runtime_frame", stage_timing.get("scope").?.string);
+    try std.testing.expectEqual(@as(i64, 1), stage_timing.get("complete").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), stage_timing.get("prefill").?.object.get("frames").?.integer);
+    try std.testing.expectEqual(@as(i64, 300), stage_timing.get("decode").?.object.get("ffn").?.integer);
     const q4_0_policy = root.get("q4_0_policy").?.object;
     try std.testing.expectEqual(@as(i64, 37), q4_0_policy.get("mmv_nr4_nsg2").?.integer);
     try std.testing.expectEqual(@as(i64, 38), q4_0_policy.get("mmv_nr8_nsg2").?.integer);
@@ -7137,6 +7277,17 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     try std.testing.expectEqual(@as(i64, 42), q4_0_policy.get("mm_sg_aligned").?.integer);
     try std.testing.expectEqual(@as(i64, 43), q4_0_policy.get("mm_sg_aligned_tail").?.integer);
     try std.testing.expectEqual(@as(i64, 44), q4_0_policy.get("mm_sg_unrolled").?.integer);
+    const pair_policy = root.get("q4_0_pair_activation_policy").?.object;
+    try std.testing.expectEqual(@as(i64, 45), pair_policy.get("mmv_nr4_nsg2").?.integer);
+    try std.testing.expectEqual(@as(i64, 46), pair_policy.get("mmv_nr8_nsg2").?.integer);
+    try std.testing.expectEqual(@as(i64, 47), pair_policy.get("mmv_nr4_nsg4").?.integer);
+    try std.testing.expectEqual(@as(i64, 48), pair_policy.get("mmv_nr8_nsg4").?.integer);
+    try std.testing.expectEqual(@as(i64, 49), pair_policy.get("mmv_variant_fallbacks").?.integer);
+    try std.testing.expectEqual(@as(i64, 50), pair_policy.get("mm_m32_n64_aligned").?.integer);
+    try std.testing.expectEqual(@as(i64, 51), pair_policy.get("mm_m32_n64_tail").?.integer);
+    try std.testing.expectEqual(@as(i64, 52), pair_policy.get("mm_m32_n32_aligned").?.integer);
+    try std.testing.expectEqual(@as(i64, 53), pair_policy.get("mm_m32_n32_tail").?.integer);
+    try std.testing.expectEqual(@as(i64, 54), pair_policy.get("mm_variant_fallbacks").?.integer);
     try std.testing.expectEqual(@as(i64, 5), root.get("generated_quant_dispatch").?.object.get("q8_0_small_batch").?.integer);
     try std.testing.expectEqual(@as(i64, 24), root.get("generated_quant_dispatch").?.object.get("q6_k_small_batch_bias").?.integer);
     try std.testing.expectEqual(@as(i64, 6), root.get("generated_quant_dispatch").?.object.get("q6_k_small_batch_bias_gelu").?.integer);

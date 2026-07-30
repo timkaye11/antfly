@@ -406,6 +406,41 @@ pub const KvBatchView = backend_contracts.KvBatchView;
 pub const PagedKvLayerCacheRows = backend_contracts.PagedKvLayerCacheRows;
 pub const DirectFamilyTimingSnapshot = backend_contracts.DirectFamilyTimingSnapshot;
 
+pub const MetalStageRegimeTiming = struct {
+    sampled_frames: u64 = 0,
+    whole_frame_gpu_nanos: u64 = 0,
+    attention_nanos: u64 = 0,
+    ffn_nanos: u64 = 0,
+    ple_nanos: u64 = 0,
+    tail_nanos: u64 = 0,
+    embedding_nanos: u64 = 0,
+    other_nanos: u64 = 0,
+};
+
+pub const MetalStageTimingSnapshot = struct {
+    enabled: u64 = 0,
+    supported: u64 = 0,
+    complete: u64 = 0,
+    barrier_sample_count: u64 = 0,
+    allocation_failures: u64 = 0,
+    resolve_failures: u64 = 0,
+    overflow_failures: u64 = 0,
+    dropped_frames: u64 = 0,
+    prefill: MetalStageRegimeTiming = .{},
+    decode: MetalStageRegimeTiming = .{},
+
+    pub fn failureCount(self: MetalStageTimingSnapshot) u64 {
+        const categorized = self.allocation_failures +| self.resolve_failures +| self.overflow_failures;
+        return @max(categorized, self.dropped_frames);
+    }
+};
+
+pub const DecoderRuntimeFrameRegime = enum(u8) {
+    none = 0,
+    prefill = 1,
+    decode = 2,
+};
+
 pub const NativeQuantTimingStats = struct {
     calls: u64 = 0,
     pair_calls: u64 = 0,
@@ -443,6 +478,7 @@ pub const NativeQuantTimingStats = struct {
     decoder_runtime_frame_submits: u64 = 0,
     decoder_runtime_frame_wait_nanos: u128 = 0,
     decoder_runtime_frame_gpu_nanos: u128 = 0,
+    metal_stage_timing: MetalStageTimingSnapshot = .{},
     metal_tensor_device_owned_buffers_created: u64 = 0,
     metal_tensor_device_owned_buffers_released: u64 = 0,
     metal_tensor_device_owned_live_bytes: u64 = 0,
@@ -595,9 +631,19 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_q4_0_mmv_nr4_nsg4_dispatches: u64 = 0,
     metal_runtime_q4_0_mmv_nr8_nsg4_dispatches: u64 = 0,
     metal_runtime_q4_0_mmv_variant_fallbacks: u64 = 0,
+    metal_runtime_q4_0_pair_activation_mmv_nr4_nsg2_dispatches: u64 = 0,
+    metal_runtime_q4_0_pair_activation_mmv_nr8_nsg2_dispatches: u64 = 0,
+    metal_runtime_q4_0_pair_activation_mmv_nr4_nsg4_dispatches: u64 = 0,
+    metal_runtime_q4_0_pair_activation_mmv_nr8_nsg4_dispatches: u64 = 0,
+    metal_runtime_q4_0_pair_activation_mmv_variant_fallbacks: u64 = 0,
     metal_runtime_q4_0_mm_sg_aligned_dispatches: u64 = 0,
     metal_runtime_q4_0_mm_sg_aligned_tail_dispatches: u64 = 0,
     metal_runtime_q4_0_mm_sg_unrolled_dispatches: u64 = 0,
+    metal_runtime_q4_0_pair_activation_mm_m32_n64_aligned_dispatches: u64 = 0,
+    metal_runtime_q4_0_pair_activation_mm_m32_n64_tail_dispatches: u64 = 0,
+    metal_runtime_q4_0_pair_activation_mm_m32_n32_aligned_dispatches: u64 = 0,
+    metal_runtime_q4_0_pair_activation_mm_m32_n32_tail_dispatches: u64 = 0,
+    metal_runtime_q4_0_pair_activation_mm_variant_fallbacks: u64 = 0,
     metal_runtime_q4_0_pair: u64 = 0,
     metal_runtime_q4_0_pair_reduce: u64 = 0,
     metal_runtime_q4_0_pair_activation_reduce: u64 = 0,
@@ -1787,6 +1833,10 @@ pub const ComputeBackend = struct {
         /// encode subsequent runtime operations into one command submission
         /// until `decoderRuntimeSubmitAndWaitFrame` is called.
         decoderRuntimeBeginFrame: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
+
+        /// Tag the active frame for backend-owned diagnostic attribution.
+        /// This must not alter dispatch or command-buffer topology.
+        decoderRuntimeSetActiveFrameRegime: ?*const fn (ctx: *anyopaque, regime: DecoderRuntimeFrameRegime) anyerror!void = null,
 
         /// Return true when a backend-owned decoder frame is already active.
         decoderRuntimeHasActiveFrame: ?*const fn (ctx: *anyopaque) bool = null,
@@ -3471,6 +3521,12 @@ pub const ComputeBackend = struct {
             return op(self.ptr);
         }
         return false;
+    }
+
+    pub fn decoderRuntimeSetActiveFrameRegime(self: *const ComputeBackend, regime: DecoderRuntimeFrameRegime) !void {
+        if (self.vtable.decoderRuntimeSetActiveFrameRegime) |op| {
+            return op(self.ptr, regime);
+        }
     }
 
     pub fn decoderRuntimeHasActiveFrame(self: *const ComputeBackend) bool {

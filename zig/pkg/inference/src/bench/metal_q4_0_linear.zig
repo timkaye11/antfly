@@ -97,6 +97,21 @@ const Q4MmvVariant = enum {
     }
 };
 
+const Q4PairMmRoute = enum {
+    m32_n64_aligned,
+    m32_n64_tail,
+    m32_n32_aligned,
+    m32_n32_tail,
+
+    fn parse(value: []const u8) !Q4PairMmRoute {
+        if (std.mem.eql(u8, value, "m32-n64-aligned")) return .m32_n64_aligned;
+        if (std.mem.eql(u8, value, "m32-n64-tail")) return .m32_n64_tail;
+        if (std.mem.eql(u8, value, "m32-n32-aligned")) return .m32_n32_aligned;
+        if (std.mem.eql(u8, value, "m32-n32-tail")) return .m32_n32_tail;
+        return error.InvalidArgument;
+    }
+};
+
 const Config = struct {
     mode: Mode = .linear,
     rows: usize = 1,
@@ -111,12 +126,17 @@ const Config = struct {
     expect_q4_mmv_variant: ?Q4MmvVariant = null,
     expect_q4_mmv_auto: bool = false,
     expect_q4_mmv_fallbacks: ?usize = null,
+    expect_q4_pair_mmv_variant: ?Q4MmvVariant = null,
+    expect_q4_pair_mmv_fallbacks: ?usize = null,
+    expect_q4_pair_mm_route: ?Q4PairMmRoute = null,
+    expect_q4_pair_mm_fallbacks: ?usize = null,
     expect_output_hash: ?u64 = null,
+    skip_unless_apple_m4: bool = false,
 };
 
 fn usage() void {
     std.debug.print(
-        \\usage: zig build inference-metal-bench -- [--mode linear|q6-linear|q6-argmax|head-rope|pair|qkv|split-qkv|ffn|ple] [--rows N] [--in N] [--out N] [--kv-out N] [--warmup N] [--iters N] [--ops-per-frame N] [--expect-q4-route aligned|aligned-tail|unrolled] [--expect-q4-mmv-variant nr4-nsg2|nr8-nsg2|nr4-nsg4|nr8-nsg4] [--expect-q4-mmv-auto] [--expect-q4-mmv-fallbacks N] [--expect-output-hash HEX]
+        \\usage: zig build inference-metal-bench -- [--mode linear|q6-linear|q6-argmax|head-rope|pair|qkv|split-qkv|ffn|ple] [--rows N] [--in N] [--out N] [--kv-out N] [--warmup N] [--iters N] [--ops-per-frame N] [--expect-q4-route aligned|aligned-tail|unrolled] [--expect-q4-mmv-variant nr4-nsg2|nr8-nsg2|nr4-nsg4|nr8-nsg4] [--expect-q4-mmv-auto] [--expect-q4-mmv-fallbacks N] [--expect-q4-pair-mmv-variant nr4-nsg2|nr8-nsg2|nr4-nsg4|nr8-nsg4] [--expect-q4-pair-mmv-fallbacks N] [--expect-q4-pair-mm-route m32-n64-aligned|m32-n64-tail|m32-n32-aligned|m32-n32-tail] [--expect-q4-pair-mm-fallbacks N] [--expect-output-hash HEX] [--skip-unless-apple-m4]
         \\
     , .{});
 }
@@ -139,6 +159,10 @@ fn parseArgs(args: []const [:0]const u8) !Config {
         }
         if (std.mem.eql(u8, arg, "--expect-q4-mmv-auto")) {
             cfg.expect_q4_mmv_auto = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--skip-unless-apple-m4")) {
+            cfg.skip_unless_apple_m4 = true;
             continue;
         }
         if (i + 1 >= args.len) return error.InvalidArgument;
@@ -169,6 +193,14 @@ fn parseArgs(args: []const [:0]const u8) !Config {
             cfg.expect_q4_mmv_variant = try Q4MmvVariant.parse(value);
         } else if (std.mem.eql(u8, arg, "--expect-q4-mmv-fallbacks")) {
             cfg.expect_q4_mmv_fallbacks = try std.fmt.parseUnsigned(usize, value, 10);
+        } else if (std.mem.eql(u8, arg, "--expect-q4-pair-mmv-variant")) {
+            cfg.expect_q4_pair_mmv_variant = try Q4MmvVariant.parse(value);
+        } else if (std.mem.eql(u8, arg, "--expect-q4-pair-mmv-fallbacks")) {
+            cfg.expect_q4_pair_mmv_fallbacks = try std.fmt.parseUnsigned(usize, value, 10);
+        } else if (std.mem.eql(u8, arg, "--expect-q4-pair-mm-route")) {
+            cfg.expect_q4_pair_mm_route = try Q4PairMmRoute.parse(value);
+        } else if (std.mem.eql(u8, arg, "--expect-q4-pair-mm-fallbacks")) {
+            cfg.expect_q4_pair_mm_fallbacks = try std.fmt.parseUnsigned(usize, value, 10);
         } else if (std.mem.eql(u8, arg, "--expect-output-hash")) {
             const digits = if (std.mem.startsWith(u8, value, "0x")) value[2..] else value;
             if (digits.len == 0) return error.InvalidArgument;
@@ -187,10 +219,13 @@ fn parseArgs(args: []const [:0]const u8) !Config {
     if (cfg.expect_q4_mmv_variant != null and (cfg.mode != .linear or cfg.rows != 1)) return error.InvalidArgument;
     if (cfg.expect_q4_mmv_auto and (cfg.mode != .linear or cfg.rows != 1 or cfg.expect_q4_mmv_variant != null)) return error.InvalidArgument;
     if (cfg.expect_q4_mmv_fallbacks != null and cfg.expect_q4_mmv_variant == null and !cfg.expect_q4_mmv_auto) return error.InvalidArgument;
+    if ((cfg.expect_q4_pair_mmv_variant != null or cfg.expect_q4_pair_mmv_fallbacks != null or cfg.expect_q4_pair_mm_route != null or cfg.expect_q4_pair_mm_fallbacks != null) and cfg.mode != .ffn) return error.InvalidArgument;
+    if (cfg.expect_q4_pair_mmv_variant != null and cfg.rows != 1) return error.InvalidArgument;
+    if (cfg.expect_q4_pair_mm_route != null and cfg.rows < 9) return error.InvalidArgument;
     return cfg;
 }
 
-fn expectedAutoQ4MmvVariant(cfg: Config) !Q4MmvVariant {
+fn isQualifiedAppleM4() !bool {
     var device: metal_runtime.MetalDeviceInfo = .{};
     if (metal_runtime.termite_metal_device_info_get(&device) != 0) return error.MetalDeviceInfoUnavailable;
     var device_name_buffer: [256]u8 = undefined;
@@ -201,7 +236,11 @@ fn expectedAutoQ4MmvVariant(cfg: Config) !Q4MmvVariant {
         return error.MetalDeviceInfoUnavailable;
     }
     const device_name = device_name_buffer[0..device_name_len];
-    const exact_m4 = device.apple_gpu_family == 9 and std.mem.startsWith(u8, device_name, "Apple M4");
+    return device.apple_gpu_family == 9 and std.mem.startsWith(u8, device_name, "Apple M4");
+}
+
+fn expectedAutoQ4MmvVariant(cfg: Config) !Q4MmvVariant {
+    const exact_m4 = try isQualifiedAppleM4();
     const gemma4_ffn = (cfg.in_dim == 2560 and cfg.out_dim == 10240) or
         (cfg.in_dim == 10240 and cfg.out_dim == 2560);
     if (exact_m4 and gemma4_ffn) return .nr4_nsg2;
@@ -726,6 +765,10 @@ pub fn main(init: std.process.Init) !void {
     };
 
     if (!metal_runtime.metalDeviceAvailable()) return error.MetalDeviceUnavailable;
+    if (cfg.skip_unless_apple_m4 and !try isQualifiedAppleM4()) {
+        std.debug.print("metal_q4_0_bench: skipped (requires qualified Apple M4 device)\n", .{});
+        return;
+    }
     var provider = try metal_native_provider.MetalNativeProvider.create();
     defer provider.deinitOwned();
     const runtime = provider.raw_decode_runtime orelse return error.MetalDeviceUnavailable;
@@ -883,9 +926,19 @@ pub fn main(init: std.process.Init) !void {
     const q4_mmv_nr4_nsg4 = after.q4_0_mmv_nr4_nsg4_dispatches - before.q4_0_mmv_nr4_nsg4_dispatches;
     const q4_mmv_nr8_nsg4 = after.q4_0_mmv_nr8_nsg4_dispatches - before.q4_0_mmv_nr8_nsg4_dispatches;
     const q4_mmv_fallbacks = after.q4_0_mmv_variant_fallbacks - before.q4_0_mmv_variant_fallbacks;
+    const q4_pair_mmv_nr4_nsg2 = after.q4_0_pair_activation_mmv_nr4_nsg2_dispatches - before.q4_0_pair_activation_mmv_nr4_nsg2_dispatches;
+    const q4_pair_mmv_nr8_nsg2 = after.q4_0_pair_activation_mmv_nr8_nsg2_dispatches - before.q4_0_pair_activation_mmv_nr8_nsg2_dispatches;
+    const q4_pair_mmv_nr4_nsg4 = after.q4_0_pair_activation_mmv_nr4_nsg4_dispatches - before.q4_0_pair_activation_mmv_nr4_nsg4_dispatches;
+    const q4_pair_mmv_nr8_nsg4 = after.q4_0_pair_activation_mmv_nr8_nsg4_dispatches - before.q4_0_pair_activation_mmv_nr8_nsg4_dispatches;
+    const q4_pair_mmv_fallbacks = after.q4_0_pair_activation_mmv_variant_fallbacks - before.q4_0_pair_activation_mmv_variant_fallbacks;
     const q4_mm_aligned = after.q4_0_mm_sg_aligned_dispatches - before.q4_0_mm_sg_aligned_dispatches;
     const q4_mm_aligned_tail = after.q4_0_mm_sg_aligned_tail_dispatches - before.q4_0_mm_sg_aligned_tail_dispatches;
     const q4_mm_unrolled = after.q4_0_mm_sg_unrolled_dispatches - before.q4_0_mm_sg_unrolled_dispatches;
+    const q4_pair_mm_m32_n64_aligned = after.q4_0_pair_activation_mm_m32_n64_aligned_dispatches - before.q4_0_pair_activation_mm_m32_n64_aligned_dispatches;
+    const q4_pair_mm_m32_n64_tail = after.q4_0_pair_activation_mm_m32_n64_tail_dispatches - before.q4_0_pair_activation_mm_m32_n64_tail_dispatches;
+    const q4_pair_mm_m32_n32_aligned = after.q4_0_pair_activation_mm_m32_n32_aligned_dispatches - before.q4_0_pair_activation_mm_m32_n32_aligned_dispatches;
+    const q4_pair_mm_m32_n32_tail = after.q4_0_pair_activation_mm_m32_n32_tail_dispatches - before.q4_0_pair_activation_mm_m32_n32_tail_dispatches;
+    const q4_pair_mm_fallbacks = after.q4_0_pair_activation_mm_variant_fallbacks - before.q4_0_pair_activation_mm_variant_fallbacks;
     const q4_pair_reduce = after.q4_0_pair_reduce - before.q4_0_pair_reduce;
     const q4_pair = after.q4_0_pair - before.q4_0_pair;
     const q4_pair_activation = after.q4_0_pair_activation_reduce - before.q4_0_pair_activation_reduce;
@@ -950,6 +1003,28 @@ pub fn main(init: std.process.Init) !void {
             return error.UnexpectedQ4MmvFallbackCount;
         }
     }
+    if (cfg.expect_q4_pair_mmv_variant) |expected_variant| {
+        const expected_ops: u64 = @intCast(total_ops);
+        const observed = switch (expected_variant) {
+            .nr4_nsg2 => q4_pair_mmv_nr4_nsg2,
+            .nr8_nsg2 => q4_pair_mmv_nr8_nsg2,
+            .nr4_nsg4 => q4_pair_mmv_nr4_nsg4,
+            .nr8_nsg4 => q4_pair_mmv_nr8_nsg4,
+        };
+        if (observed != expected_ops or q4_pair_mmv_nr4_nsg2 + q4_pair_mmv_nr8_nsg2 + q4_pair_mmv_nr4_nsg4 + q4_pair_mmv_nr8_nsg4 != expected_ops) return error.ExpectedQ4MmvVariantNotUsed;
+        if (q4_pair_mmv_fallbacks != @as(u64, @intCast(cfg.expect_q4_pair_mmv_fallbacks orelse 0))) return error.UnexpectedQ4MmvFallbackCount;
+    }
+    if (cfg.expect_q4_pair_mm_route) |expected_route| {
+        const expected_ops: u64 = @intCast(total_ops);
+        const observed = switch (expected_route) {
+            .m32_n64_aligned => q4_pair_mm_m32_n64_aligned,
+            .m32_n64_tail => q4_pair_mm_m32_n64_tail,
+            .m32_n32_aligned => q4_pair_mm_m32_n32_aligned,
+            .m32_n32_tail => q4_pair_mm_m32_n32_tail,
+        };
+        if (observed != expected_ops or q4_pair_mm_m32_n64_aligned + q4_pair_mm_m32_n64_tail + q4_pair_mm_m32_n32_aligned + q4_pair_mm_m32_n32_tail != expected_ops) return error.ExpectedQ4MmRouteNotUsed;
+        if (q4_pair_mm_fallbacks != @as(u64, @intCast(cfg.expect_q4_pair_mm_fallbacks orelse 0))) return error.UnexpectedQ4MmFallbackCount;
+    }
 
     std.debug.print(
         "metal_q4_0_linear mode={s} rows={d} in={d} out={d} kv_out={d} warmup={d} iters={d} ops_per_frame={d} median_frame_ms={d:.3} median_op_ms={d:.3} mean_frame_ms={d:.3} mean_op_ms={d:.3} min_frame_ms={d:.3} max_frame_ms={d:.3} total_ops={d}",
@@ -1004,6 +1079,10 @@ pub fn main(init: std.process.Init) !void {
             after.last_frame_blit_encoder_count,
             after.last_frame_planned_command_op_count,
         },
+    );
+    std.debug.print(
+        "metal_q4_0_pair_activation_policy: mmv_nr4_nsg2={d} mmv_nr8_nsg2={d} mmv_nr4_nsg4={d} mmv_nr8_nsg4={d} mmv_variant_fallbacks={d} mm_m32_n64_aligned={d} mm_m32_n64_tail={d} mm_m32_n32_aligned={d} mm_m32_n32_tail={d} mm_variant_fallbacks={d}\n",
+        .{ q4_pair_mmv_nr4_nsg2, q4_pair_mmv_nr8_nsg2, q4_pair_mmv_nr4_nsg4, q4_pair_mmv_nr8_nsg4, q4_pair_mmv_fallbacks, q4_pair_mm_m32_n64_aligned, q4_pair_mm_m32_n64_tail, q4_pair_mm_m32_n32_aligned, q4_pair_mm_m32_n32_tail, q4_pair_mm_fallbacks },
     );
 
     // Keep the timed loop readback-free, then fingerprint one deterministic
