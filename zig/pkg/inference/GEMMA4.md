@@ -67,6 +67,23 @@ long-prompt token gate, but remain opt-in because the Metal runtime switch is
 process-wide rather than scoped to the loaded model. Their matching `DISABLE_`
 variables remain rollback overrides.
 
+The baseline M4 Metal path also has three independently reversible policies:
+
+- Sliding-window attention clamps the generated flash kernel's K/V scan to the
+  live window by default. `TERMITE_METAL_DISABLE_SWA_SCAN_CLAMP=1` restores the
+  full logical-history scan. The choice is captured once when each Metal
+  runtime is created, so concurrent model runtimes cannot race on policy state.
+- Prepared single-token decode frames use retained-reference command buffers
+  on qualified Apple M4 devices. `TERMITE_METAL_DISABLE_FAST_PREPARED_FRAME=1`
+  restores the diagnostic-safe command-buffer path, and
+  `TERMITE_METAL_FORCE_DIAGNOSTIC_COMMAND_BUFFERS=1` forces that path whenever
+  profiling or debugging requires it.
+- Q4_0 row-one matvec dispatch selects a device/shape-qualified threadgroup
+  portfolio. `TERMITE_METAL_Q4_0_MMV_VARIANT=auto|legacy|nr4-nsg2|nr8-nsg2|nr4-nsg4|nr8-nsg4`
+  provides deterministic qualification overrides, while
+  `TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO=1` is the master rollback to the
+  legacy selector.
+
 Singleton intermediate Gemma 4 prefill chunks use the planned Metal frame by
 default. `TERMITE_METAL_DISABLE_SINGLETON_SCHEDULED_PREFILL_FRAME=1` restores
 the scheduled mixed-context path for diagnosis. Final logits and MTP hidden

@@ -124,7 +124,7 @@ pub const helper_q3_k_raw_scale = HelperFragment{
 // generated struct (which the dispatch's `termite_metal_paged_attention_params`
 // bytes are reinterpret-cast into at buffer(6)) can never silently diverge in
 // layout from what the runtime binds.
-pub const paged_attention_params_field_body = "uint q_len; uint kv_tokens; uint num_heads; uint num_kv_heads; uint head_dim; uint key_row_bytes; uint base_key_row_bytes; uint query_position_offset; uint kv_position_offset; uint sliding_window; uint v_row_stride; uint page_size; uint block_count; uint contiguous_base_token; uint contiguous_blocks; uint format; uint v_element_bytes; uint has_sinks; float softcap;";
+pub const paged_attention_params_field_body = "uint q_len; uint kv_tokens; uint num_heads; uint num_kv_heads; uint head_dim; uint key_row_bytes; uint base_key_row_bytes; uint query_position_offset; uint kv_position_offset; uint sliding_window; uint v_row_stride; uint page_size; uint block_count; uint contiguous_base_token; uint contiguous_blocks; uint format; uint v_element_bytes; uint has_sinks; float softcap; uint swa_scan_clamp;";
 
 pub const helper_paged_attention_1x_params = HelperFragment{
     .name = "antfly_paged_attention_1x_params",
@@ -645,9 +645,16 @@ fn renderPrefillFlashBody(
     try out.appendSlice(allocator, "    for (uint i = 0u; i < 8u; ++i) mo[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n");
 
     // ---- per-chunk online-softmax loop ----
-    try appendFmt(allocator, out, "    for (uint kc = 0u; kc < p.kv_tokens; kc += {d}u) {{\n", .{kc});
+    // For SWA, start at the chunk containing the first key that can be live for
+    // the earliest query in this query tile. Align in logical-KV coordinates:
+    // the page helper consumes logical token indices, even when physical pages
+    // are biased or permuted. The boundary chunk remains in the loop so the
+    // existing per-key mask removes its expired prefix exactly as before.
+    try out.appendSlice(allocator, "    const uint q_last = min(q0 + 7u, p.q_len - 1u); const uint tile_first_q = p.query_position_offset + q0; const uint tile_last_q = p.query_position_offset + q_last;\n");
+    try appendFmt(allocator, out, "    uint kc_start = 0u; if (p.swa_scan_clamp != 0u && p.sliding_window != 0u) {{ const uint window_minus_one = p.sliding_window - 1u; const uint earliest_live_key = tile_first_q >= window_minus_one ? tile_first_q - window_minus_one : 0u; if (earliest_live_key > p.kv_position_offset) {{ const uint earliest_logical_key = earliest_live_key - p.kv_position_offset; kc_start = (earliest_logical_key / {d}u) * {d}u; }} }}\n", .{ kc, kc });
+    try appendFmt(allocator, out, "    for (uint kc = kc_start; kc < p.kv_tokens; kc += {d}u) {{\n", .{kc});
     try out.appendSlice(allocator, "        threadgroup_barrier(mem_flags::mem_threadgroup);\n");
-    try appendFmt(allocator, out, "        uint q_last = min(q0 + 7u, p.q_len - 1u); uint tile_first_q = p.query_position_offset + q0; uint tile_last_q = p.query_position_offset + q_last; uint key_first = p.kv_position_offset + kc; uint key_last = p.kv_position_offset + min(kc + {d}u, p.kv_tokens - 1u); bool wholly_future = key_first > tile_last_q; bool wholly_expired = p.sliding_window != 0u && tile_first_q >= key_last && tile_first_q - key_last >= p.sliding_window; if (wholly_future) break; if (wholly_expired) continue;\n", .{kc - 1});
+    try appendFmt(allocator, out, "        uint key_first = p.kv_position_offset + kc; uint key_last = p.kv_position_offset + min(kc + {d}u, p.kv_tokens - 1u); bool wholly_future = key_first > tile_last_q; bool wholly_expired = p.sliding_window != 0u && tile_first_q >= key_last && tile_first_q - key_last >= p.sliding_window; if (wholly_future) break; if (wholly_expired) continue;\n", .{kc - 1});
     try appendFmt(allocator, out, "        if (tid < {d}u) {{ uint ki = kc + uint(tid); sphys[tid] = ki < p.kv_tokens ? antfly_paged_attention_1x_page_token(block_table, p, ki) : 0xffffffffu; }}\n", .{kc});
     if (skip) try out.appendSlice(allocator, "        if (tid == 0u) atomic_store_explicit(schanged, 0u, memory_order_relaxed);\n");
     try out.appendSlice(allocator, "        threadgroup_barrier(mem_flags::mem_threadgroup);\n");
@@ -1463,6 +1470,7 @@ test "metal renderer renders the decode-1x paged attention kernel self-contained
     // dependency on the hand-written termite_* copies), each exactly once.
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "struct antfly_paged_attention_1x_params {"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "inline uint antfly_paged_attention_1x_page_token("));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float softcap; uint swa_scan_clamp;"));
     // Never references the hand-written names (would collide in the shared library
     // and would use-before-declaration in the runtime region).
     try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "termite_metal_paged_attention_params"));
@@ -1532,7 +1540,13 @@ test "metal renderer renders the low-memory flash-prefill baseline self-containe
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "sdiag = (threadgroup float *)(fb + 1760u);"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "so = (threadgroup float *)(fb + 2016u);"));
     // Flash structure: 32-key chunk, simdgroup MMA for Q·Kᵀ and P·V, online softmax.
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "for (uint kc = 0u; kc < p.kv_tokens; kc += 32u) {"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint q_last = min(q0 + 7u, p.q_len - 1u); const uint tile_first_q = p.query_position_offset + q0;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "uint kc_start = 0u; if (p.swa_scan_clamp != 0u && p.sliding_window != 0u) {"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "uint kc_start = 0u; if (p.sliding_window != 0u) {"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint window_minus_one = p.sliding_window - 1u; const uint earliest_live_key = tile_first_q >= window_minus_one ? tile_first_q - window_minus_one : 0u;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint earliest_logical_key = earliest_live_key - p.kv_position_offset; kc_start = (earliest_logical_key / 32u) * 32u;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "for (uint kc = kc_start; kc < p.kv_tokens; kc += 32u) {"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "for (uint kc = 0u; kc < p.kv_tokens; kc += 32u) {"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "if (wholly_future) break; if (wholly_expired) continue;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "simdgroup_multiply_accumulate(ms, mq, mk, ms)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "for (uint kk8 = 0u; kk8 < 4u; ++kk8)"));
@@ -1583,7 +1597,8 @@ test "metal renderer restructures the flash Q·Kᵀ and score passes for key_chu
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "sp = (threadgroup half *)(fb + 2048u);"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "sdiag = (threadgroup float *)(fb + 3424u);"));
     // 64-token chunk; 4 simdgroups tile 2 MMA k-tiles each; 2 keys per lane; P·V 8 inner tiles.
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "for (uint kc = 0u; kc < p.kv_tokens; kc += 64u) {"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "kc_start = (earliest_logical_key / 64u) * 64u;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "for (uint kc = kc_start; kc < p.kv_tokens; kc += 64u) {"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "for (uint kt = 0u; kt < 2u; ++kt) {"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "uint ktile = uint(sgitg) + kt * 4u;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float scs[2];"));

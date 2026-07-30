@@ -3040,7 +3040,13 @@ fn metalStatsCompactJson(
         \\"generated_decode_1x":{d},
         \\"generated_flash_prefill":{d},
         \\"generated_flash_prefill_hd512":{d},
+        \\"prefill_direct_kv":{d},
+        \\"prefill_paged_kv":{d},
         \\"generated_rms_norm":{d}
+        \\}},
+        \\"prepared_frame":{{
+        \\"fast_path":{d},
+        \\"fallback":{d}
         \\}}
     ,
         .{
@@ -3049,7 +3055,11 @@ fn metalStatsCompactJson(
             provider.metal_runtime_generated_attention_decode_1x_calls,
             provider.metal_runtime_generated_attention_flash_prefill_calls,
             provider.metal_runtime_generated_attention_flash_prefill_hd512_calls,
+            provider.metal_runtime_attention_prefill_direct_kv_calls,
+            provider.metal_runtime_attention_prefill_paged_kv_calls,
             provider.metal_runtime_generated_rms_norm_calls,
+            provider.metal_runtime_prepared_frame_fast_path_calls,
+            provider.metal_runtime_prepared_frame_fallback_calls,
         },
     );
     try appendFmt(
@@ -3128,6 +3138,32 @@ fn metalStatsCompactJson(
             provider.metal_runtime_q6_k_linear_reduce_rows_9_64,
             provider.metal_runtime_q6_k_linear_reduce_rows_65_plus,
             provider.metal_runtime_q6_k_linear_reduce_f16_input,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"q4_0_policy":{{
+        \\"mmv_nr4_nsg2":{d},
+        \\"mmv_nr8_nsg2":{d},
+        \\"mmv_nr4_nsg4":{d},
+        \\"mmv_nr8_nsg4":{d},
+        \\"mmv_variant_fallbacks":{d},
+        \\"mm_sg_aligned":{d},
+        \\"mm_sg_aligned_tail":{d},
+        \\"mm_sg_unrolled":{d}
+        \\}}
+    ,
+        .{
+            provider.metal_runtime_q4_0_mmv_nr4_nsg2_dispatches,
+            provider.metal_runtime_q4_0_mmv_nr8_nsg2_dispatches,
+            provider.metal_runtime_q4_0_mmv_nr4_nsg4_dispatches,
+            provider.metal_runtime_q4_0_mmv_nr8_nsg4_dispatches,
+            provider.metal_runtime_q4_0_mmv_variant_fallbacks,
+            provider.metal_runtime_q4_0_mm_sg_aligned_dispatches,
+            provider.metal_runtime_q4_0_mm_sg_aligned_tail_dispatches,
+            provider.metal_runtime_q4_0_mm_sg_unrolled_dispatches,
         },
     );
     // Keys and their order come from the shared counter-name table; the emitted
@@ -4837,14 +4873,23 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
         },
     );
     print(
-        "metal_attention_dispatch: paged_1x={d} decode_gqa_split={d} generated_decode_1x={d} generated_flash_prefill={d} generated_flash_prefill_hd512={d} generated_rms_norm={d}\n",
+        "metal_attention_dispatch: paged_1x={d} decode_gqa_split={d} generated_decode_1x={d} generated_flash_prefill={d} generated_flash_prefill_hd512={d} prefill_direct_kv={d} prefill_paged_kv={d} generated_rms_norm={d}\n",
         .{
             metal_snapshot.provider.metal_runtime_paged_attention_1x_calls,
             metal_snapshot.provider.metal_runtime_decode_gqa_split_calls,
             metal_snapshot.provider.metal_runtime_generated_attention_decode_1x_calls,
             metal_snapshot.provider.metal_runtime_generated_attention_flash_prefill_calls,
             metal_snapshot.provider.metal_runtime_generated_attention_flash_prefill_hd512_calls,
+            metal_snapshot.provider.metal_runtime_attention_prefill_direct_kv_calls,
+            metal_snapshot.provider.metal_runtime_attention_prefill_paged_kv_calls,
             metal_snapshot.provider.metal_runtime_generated_rms_norm_calls,
+        },
+    );
+    print(
+        "metal_prepared_frame: fast_path={d} fallback={d}\n",
+        .{
+            metal_snapshot.provider.metal_runtime_prepared_frame_fast_path_calls,
+            metal_snapshot.provider.metal_runtime_prepared_frame_fallback_calls,
         },
     );
     print(
@@ -4887,6 +4932,19 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
             metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_9_64,
             metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_65_plus,
             metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_f16_input,
+        },
+    );
+    print(
+        "metal_q4_0_policy: mmv_nr4_nsg2={d} mmv_nr8_nsg2={d} mmv_nr4_nsg4={d} mmv_nr8_nsg4={d} mmv_variant_fallbacks={d} mm_sg_aligned={d} mm_sg_aligned_tail={d} mm_sg_unrolled={d}\n",
+        .{
+            metal_snapshot.provider.metal_runtime_q4_0_mmv_nr4_nsg2_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_mmv_nr8_nsg2_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_mmv_nr4_nsg4_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_mmv_nr8_nsg4_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_mmv_variant_fallbacks,
+            metal_snapshot.provider.metal_runtime_q4_0_mm_sg_aligned_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_mm_sg_aligned_tail_dispatches,
+            metal_snapshot.provider.metal_runtime_q4_0_mm_sg_unrolled_dispatches,
         },
     );
     print("metal_generated_quant_dispatch:", .{});
@@ -7011,6 +7069,19 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     snapshot.provider.metal_runtime_last_frame_planned_command_quant_dispatch_counts[2] = 3;
     snapshot.provider.metal_runtime_q8_0_linear_rows_2_8 = 4;
     snapshot.provider.metal_runtime_decode_gqa_split_calls = 31;
+    snapshot.provider.metal_runtime_generated_attention_flash_prefill_calls = 35;
+    snapshot.provider.metal_runtime_generated_attention_flash_prefill_hd512_calls = 7;
+    snapshot.provider.metal_runtime_attention_prefill_direct_kv_calls = 42;
+    snapshot.provider.metal_runtime_prepared_frame_fast_path_calls = 29;
+    snapshot.provider.metal_runtime_prepared_frame_fallback_calls = 2;
+    snapshot.provider.metal_runtime_q4_0_mmv_nr4_nsg2_dispatches = 37;
+    snapshot.provider.metal_runtime_q4_0_mmv_nr8_nsg2_dispatches = 38;
+    snapshot.provider.metal_runtime_q4_0_mmv_nr4_nsg4_dispatches = 39;
+    snapshot.provider.metal_runtime_q4_0_mmv_nr8_nsg4_dispatches = 40;
+    snapshot.provider.metal_runtime_q4_0_mmv_variant_fallbacks = 41;
+    snapshot.provider.metal_runtime_q4_0_mm_sg_aligned_dispatches = 42;
+    snapshot.provider.metal_runtime_q4_0_mm_sg_aligned_tail_dispatches = 43;
+    snapshot.provider.metal_runtime_q4_0_mm_sg_unrolled_dispatches = 44;
     snapshot.provider.metal_runtime_jit_exact_q4_0_hits = 25;
     snapshot.provider.metal_runtime_jit_exact_q4_k_hits = 26;
     const generated_counts = &snapshot.provider.metal_runtime_antfly_generated_dispatch_counts;
@@ -7051,6 +7122,21 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     try std.testing.expectEqual(@as(i64, 3), root.get("runtime_command_operators").?.object.get("dispatch_small_batch").?.integer);
     try std.testing.expectEqual(@as(i64, 4), root.get("q8_0_dispatch").?.object.get("rows_2_8").?.integer);
     try std.testing.expectEqual(@as(i64, 31), root.get("attention_dispatch").?.object.get("decode_gqa_split").?.integer);
+    try std.testing.expectEqual(@as(i64, 35), root.get("attention_dispatch").?.object.get("generated_flash_prefill").?.integer);
+    try std.testing.expectEqual(@as(i64, 7), root.get("attention_dispatch").?.object.get("generated_flash_prefill_hd512").?.integer);
+    try std.testing.expectEqual(@as(i64, 42), root.get("attention_dispatch").?.object.get("prefill_direct_kv").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), root.get("attention_dispatch").?.object.get("prefill_paged_kv").?.integer);
+    try std.testing.expectEqual(@as(i64, 29), root.get("prepared_frame").?.object.get("fast_path").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), root.get("prepared_frame").?.object.get("fallback").?.integer);
+    const q4_0_policy = root.get("q4_0_policy").?.object;
+    try std.testing.expectEqual(@as(i64, 37), q4_0_policy.get("mmv_nr4_nsg2").?.integer);
+    try std.testing.expectEqual(@as(i64, 38), q4_0_policy.get("mmv_nr8_nsg2").?.integer);
+    try std.testing.expectEqual(@as(i64, 39), q4_0_policy.get("mmv_nr4_nsg4").?.integer);
+    try std.testing.expectEqual(@as(i64, 40), q4_0_policy.get("mmv_nr8_nsg4").?.integer);
+    try std.testing.expectEqual(@as(i64, 41), q4_0_policy.get("mmv_variant_fallbacks").?.integer);
+    try std.testing.expectEqual(@as(i64, 42), q4_0_policy.get("mm_sg_aligned").?.integer);
+    try std.testing.expectEqual(@as(i64, 43), q4_0_policy.get("mm_sg_aligned_tail").?.integer);
+    try std.testing.expectEqual(@as(i64, 44), q4_0_policy.get("mm_sg_unrolled").?.integer);
     try std.testing.expectEqual(@as(i64, 5), root.get("generated_quant_dispatch").?.object.get("q8_0_small_batch").?.integer);
     try std.testing.expectEqual(@as(i64, 24), root.get("generated_quant_dispatch").?.object.get("q6_k_small_batch_bias").?.integer);
     try std.testing.expectEqual(@as(i64, 6), root.get("generated_quant_dispatch").?.object.get("q6_k_small_batch_bias_gelu").?.integer);

@@ -896,20 +896,82 @@ pub fn build(b: *std.Build) void {
     metal_bench_step.dependOn(&run_metal_bench.step);
 
     const q4_mm_aligned_route_check = b.addRunArtifact(metal_bench_exe);
-    q4_mm_aligned_route_check.addArgs(&.{ "--mode", "linear", "--rows", "32", "--in", "2560", "--out", "4096", "--warmup", "1", "--iters", "1", "--expect-q4-route", "aligned" });
+    q4_mm_aligned_route_check.addArgs(&.{ "--mode", "linear", "--rows", "32", "--in", "2560", "--out", "4096", "--warmup", "1", "--iters", "1", "--expect-q4-route", "aligned", "--expect-output-hash", "cdaed85c5db03f09" });
     const q4_mm_aligned_tail_route_check = b.addRunArtifact(metal_bench_exe);
-    q4_mm_aligned_tail_route_check.addArgs(&.{ "--mode", "linear", "--rows", "31", "--in", "2560", "--out", "512", "--warmup", "1", "--iters", "1", "--expect-q4-route", "aligned-tail" });
+    q4_mm_aligned_tail_route_check.addArgs(&.{ "--mode", "linear", "--rows", "31", "--in", "2560", "--out", "512", "--warmup", "1", "--iters", "1", "--expect-q4-route", "aligned-tail", "--expect-output-hash", "eb66cbc058bfed68" });
     q4_mm_aligned_tail_route_check.step.dependOn(&q4_mm_aligned_route_check.step);
+    const q4_mm_ragged_tail_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mm_ragged_tail_route_check.addArgs(&.{ "--mode", "linear", "--rows", "2003", "--in", "2560", "--out", "10240", "--warmup", "1", "--iters", "1", "--expect-q4-route", "aligned-tail", "--expect-output-hash", "96347637560a304a" });
+    q4_mm_ragged_tail_route_check.step.dependOn(&q4_mm_aligned_tail_route_check.step);
+    const q4_mm_ragged_tail_down_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mm_ragged_tail_down_route_check.addArgs(&.{ "--mode", "linear", "--rows", "2003", "--in", "10240", "--out", "2560", "--warmup", "1", "--iters", "1", "--expect-q4-route", "aligned-tail", "--expect-output-hash", "56067182fae278a" });
+    q4_mm_ragged_tail_down_route_check.step.dependOn(&q4_mm_ragged_tail_route_check.step);
     const q4_mm_unrolled_route_check = b.addRunArtifact(metal_bench_exe);
-    q4_mm_unrolled_route_check.addArgs(&.{ "--mode", "linear", "--rows", "32", "--in", "2048", "--out", "2560", "--warmup", "1", "--iters", "1", "--expect-q4-route", "unrolled" });
-    q4_mm_unrolled_route_check.step.dependOn(&q4_mm_aligned_tail_route_check.step);
+    q4_mm_unrolled_route_check.addArgs(&.{ "--mode", "linear", "--rows", "32", "--in", "2048", "--out", "2560", "--warmup", "1", "--iters", "1", "--expect-q4-route", "unrolled", "--expect-output-hash", "cb1571d002d961f3" });
+    q4_mm_unrolled_route_check.step.dependOn(&q4_mm_ragged_tail_down_route_check.step);
     const q4_mm_route_check_step = b.step(
         "test-metal-q4-0-mm-routes",
-        "Run on-device assertions for the promoted aligned, aligned-tail, and unrolled Q4_0 MM routes",
+        "Run on-device assertions for aligned, ragged-tail, and unrolled Q4_0 MM routes",
     );
     q4_mm_route_check_step.dependOn(&q4_mm_unrolled_route_check.step);
     if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
         quant_kernel_metal_local_check_step.dependOn(&q4_mm_unrolled_route_check.step);
+    }
+
+    const q4_mmv_nr4_nsg2_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mmv_nr4_nsg2_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_MMV_VARIANT", "nr4-nsg2");
+    q4_mmv_nr4_nsg2_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO", "0");
+    q4_mmv_nr4_nsg2_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_SMALL_REDUCE", "0");
+    q4_mmv_nr4_nsg2_route_check.addArgs(&.{ "--mode", "linear", "--rows", "1", "--in", "256", "--out", "256", "--warmup", "1", "--iters", "1", "--expect-q4-mmv-variant", "nr4-nsg2", "--expect-output-hash", "72bd43f1b2aa7f8e" });
+    const q4_mmv_nr8_nsg2_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mmv_nr8_nsg2_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_MMV_VARIANT", "nr8-nsg2");
+    q4_mmv_nr8_nsg2_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO", "0");
+    q4_mmv_nr8_nsg2_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_SMALL_REDUCE", "0");
+    q4_mmv_nr8_nsg2_route_check.addArgs(&.{ "--mode", "linear", "--rows", "1", "--in", "256", "--out", "256", "--warmup", "1", "--iters", "1", "--expect-q4-mmv-variant", "nr8-nsg2", "--expect-output-hash", "72bd43f1b2aa7f8e" });
+    q4_mmv_nr8_nsg2_route_check.step.dependOn(&q4_mmv_nr4_nsg2_route_check.step);
+    const q4_mmv_nr4_nsg4_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mmv_nr4_nsg4_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_MMV_VARIANT", "nr4-nsg4");
+    q4_mmv_nr4_nsg4_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO", "0");
+    q4_mmv_nr4_nsg4_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_SMALL_REDUCE", "0");
+    q4_mmv_nr4_nsg4_route_check.addArgs(&.{ "--mode", "linear", "--rows", "1", "--in", "256", "--out", "256", "--warmup", "1", "--iters", "1", "--expect-q4-mmv-variant", "nr4-nsg4", "--expect-output-hash", "72bd43f1b2aa7f8e" });
+    q4_mmv_nr4_nsg4_route_check.step.dependOn(&q4_mmv_nr8_nsg2_route_check.step);
+    const q4_mmv_nr8_nsg4_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mmv_nr8_nsg4_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_MMV_VARIANT", "nr8-nsg4");
+    q4_mmv_nr8_nsg4_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO", "0");
+    q4_mmv_nr8_nsg4_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_SMALL_REDUCE", "0");
+    q4_mmv_nr8_nsg4_route_check.addArgs(&.{ "--mode", "linear", "--rows", "1", "--in", "256", "--out", "256", "--warmup", "1", "--iters", "1", "--expect-q4-mmv-variant", "nr8-nsg4", "--expect-output-hash", "72bd43f1b2aa7f8e" });
+    q4_mmv_nr8_nsg4_route_check.step.dependOn(&q4_mmv_nr4_nsg4_route_check.step);
+    const q4_mmv_auto_gate_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mmv_auto_gate_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_MMV_VARIANT", "auto");
+    q4_mmv_auto_gate_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO", "0");
+    q4_mmv_auto_gate_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_SMALL_REDUCE", "0");
+    q4_mmv_auto_gate_route_check.addArgs(&.{ "--mode", "linear", "--rows", "1", "--in", "2560", "--out", "10240", "--warmup", "1", "--iters", "1", "--expect-q4-mmv-auto", "--expect-output-hash", "b4826b6e363a4695" });
+    q4_mmv_auto_gate_route_check.step.dependOn(&q4_mmv_nr8_nsg4_route_check.step);
+    const q4_mmv_auto_down_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mmv_auto_down_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_MMV_VARIANT", "auto");
+    q4_mmv_auto_down_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO", "0");
+    q4_mmv_auto_down_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_SMALL_REDUCE", "0");
+    q4_mmv_auto_down_route_check.addArgs(&.{ "--mode", "linear", "--rows", "1", "--in", "10240", "--out", "2560", "--warmup", "1", "--iters", "1", "--expect-q4-mmv-auto", "--expect-output-hash", "2b8a37cc63efcfec" });
+    q4_mmv_auto_down_route_check.step.dependOn(&q4_mmv_auto_gate_route_check.step);
+    const q4_mmv_kill_switch_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mmv_kill_switch_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_MMV_VARIANT", "nr8-nsg4");
+    q4_mmv_kill_switch_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO", "1");
+    q4_mmv_kill_switch_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_SMALL_REDUCE", "0");
+    q4_mmv_kill_switch_route_check.addArgs(&.{ "--mode", "linear", "--rows", "1", "--in", "256", "--out", "256", "--warmup", "1", "--iters", "1", "--expect-q4-mmv-variant", "nr4-nsg2", "--expect-output-hash", "72bd43f1b2aa7f8e" });
+    q4_mmv_kill_switch_route_check.step.dependOn(&q4_mmv_auto_down_route_check.step);
+    const q4_mmv_fallback_route_check = b.addRunArtifact(metal_bench_exe);
+    q4_mmv_fallback_route_check.setEnvironmentVariable("TERMITE_METAL_Q4_0_MMV_VARIANT", "nr4-nsg4");
+    q4_mmv_fallback_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO", "0");
+    q4_mmv_fallback_route_check.setEnvironmentVariable("TERMITE_METAL_DISABLE_Q4_0_SMALL_REDUCE", "1");
+    q4_mmv_fallback_route_check.addArgs(&.{ "--mode", "linear", "--rows", "1", "--in", "256", "--out", "256", "--warmup", "1", "--iters", "1", "--expect-q4-mmv-variant", "nr8-nsg2", "--expect-q4-mmv-fallbacks", "1", "--expect-output-hash", "72bd43f1b2aa7f8e" });
+    q4_mmv_fallback_route_check.step.dependOn(&q4_mmv_kill_switch_route_check.step);
+    const q4_mmv_route_check_step = b.step(
+        "test-metal-q4-0-mmv-routes",
+        "Run on-device assertions for the Q4_0 row-one MMV portfolio, kill switch, and fallback",
+    );
+    q4_mmv_route_check_step.dependOn(&q4_mmv_fallback_route_check.step);
+    if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
+        quant_kernel_metal_local_check_step.dependOn(&q4_mmv_fallback_route_check.step);
     }
 
     const run_finetune = b.addRunArtifact(exe);

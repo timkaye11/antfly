@@ -8233,7 +8233,11 @@ pub const RawRuntimeMemoryStats = extern struct {
     generated_attention_decode_1x_calls: u64 = 0,
     generated_attention_flash_prefill_calls: u64 = 0,
     generated_attention_flash_prefill_hd512_calls: u64 = 0,
+    attention_prefill_direct_kv_calls: u64 = 0,
+    attention_prefill_paged_kv_calls: u64 = 0,
     generated_rms_norm_calls: u64 = 0,
+    prepared_frame_fast_path_calls: u64 = 0,
+    prepared_frame_fallback_calls: u64 = 0,
     compute_encoder_count: u64 = 0,
     blit_encoder_count: u64 = 0,
     last_frame_compute_encoder_count: u64 = 0,
@@ -8295,6 +8299,11 @@ pub const RawRuntimeMemoryStats = extern struct {
     q4_0_linear_reduce_f16_output: u64 = 0,
     q4_0_linear_reduce_f16_input_f16_output: u64 = 0,
     q4_0_linear_reduce_sumsq: u64 = 0,
+    q4_0_mmv_nr4_nsg2_dispatches: u64 = 0,
+    q4_0_mmv_nr8_nsg2_dispatches: u64 = 0,
+    q4_0_mmv_nr4_nsg4_dispatches: u64 = 0,
+    q4_0_mmv_nr8_nsg4_dispatches: u64 = 0,
+    q4_0_mmv_variant_fallbacks: u64 = 0,
     q4_0_mm_sg_aligned_dispatches: u64 = 0,
     q4_0_mm_sg_aligned_tail_dispatches: u64 = 0,
     q4_0_mm_sg_unrolled_dispatches: u64 = 0,
@@ -8346,6 +8355,74 @@ test "metal generated attention and RMS opt-ins are fail-closed and execution-co
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_PREFILL_FLASH_HD512"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "runtime->generated_rms_norm_calls += 1"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "return termite_metal_encode_rms_norm_generated("));
+}
+
+test "metal prefill direct KV is selected-only, bounded, rollback-safe, and counted" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+    const generated = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/ops/metal/generated/attention_prefill_flash.metal", std.testing.allocator, .limited(1024 * 1024));
+    defer std.testing.allocator.free(generated);
+
+    // The checked-in renderer output and embedded hd256 source both start at
+    // the first 32-token tile that can intersect the live sliding window.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "uint kc_start = 0u; if (p.swa_scan_clamp != 0u && p.sliding_window != 0u)"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "for (uint kc = kc_start; kc < p.kv_tokens; kc += 32u)"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, generated, "uint kc_start = 0u; if (p.swa_scan_clamp != 0u && p.sliding_window != 0u)"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, generated, "for (uint kc = kc_start; kc < p.kv_tokens; kc += 32u)"));
+
+    // Resolve the rollback once per runtime. A process-global lazy cache would
+    // race when independent model runtimes are created concurrently.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "BOOL swa_scan_clamp_enabled;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "runtime->swa_scan_clamp_enabled ="));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "runtime.swa_scan_clamp_enabled = source_runtime->swa_scan_clamp_enabled"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source, "termite_metal_swa_scan_clamp_disabled"));
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "(uint64_t)base + (uint64_t)(kv_tokens - 1u) > UINT32_MAX"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, ".block_count = (uint32_t)needed_blocks"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "const size_t block_table_bytes = needed_blocks * sizeof(uint32_t)"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "const bool use_prefill_direct_kv = (use_prefill_hd512 || use_prefill_sg)"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "params.contiguous_blocks = 1u"));
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, source, "termite_metal_record_prefill_kv_route(runtime, use_prefill_direct_kv)"));
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "apple_gpu_family == 9u && [device.name hasPrefix:@\"Apple M4\"]"));
+    try std.testing.expect(std.mem.indexOf(u8, source, "TERMITE_METAL_DISABLE_PREFILL_SG_DIRECT_LOAD").? <
+        std.mem.indexOf(u8, source, "TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD").?);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, source, "return termite_metal_env_flag_enabled(getenv(\"TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD\"));"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->attention_prefill_direct_kv_calls = runtime->attention_prefill_direct_kv_calls"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->attention_prefill_paged_kv_calls = runtime->attention_prefill_paged_kv_calls"));
+}
+
+test "metal prepared frame fast path is qualified, diagnosable, and shares lifecycle" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_FAST_PREPARED_FRAME"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_FORCE_DIAGNOSTIC_COMMAND_BUFFERS"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "apple_gpu_family == 9u && [device.name hasPrefix:@\"Apple M4\"]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "id<MTLCommandBuffer> command_buffer = [queue commandBuffer]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->workload_profile_active == 0"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->prepared_frame_diagnostics_forced = termite_metal_prepared_frame_diagnostics_enabled()"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "!runtime->prepared_frame_diagnostics_forced"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "return termite_metal_decode_runtime_begin_frame_internal(runtime, false)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "return termite_metal_decode_runtime_begin_frame_internal(runtime, true)"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->prepared_frame_fast_path_calls = runtime->prepared_frame_fast_path_calls"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->prepared_frame_fallback_calls = runtime->prepared_frame_fallback_calls"));
+}
+
+test "metal Q4_0 MMV portfolio is M4-qualified, observable, and cloned into host dispatch" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_Q4_0_MMV_VARIANT"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const BOOL is_m4_gemma4_ffn = runtime->apple_m4_device"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime.apple_m4_device = source_runtime->apple_m4_device"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime.q4_0_mmv_trace_emitted = source_runtime->q4_0_mmv_trace_emitted"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "source_runtime->q4_0_mmv_nr4_nsg2_dispatches += runtime.q4_0_mmv_nr4_nsg2_dispatches"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->q4_0_mmv_variant_fallbacks = runtime->q4_0_mmv_variant_fallbacks"));
 }
 
 test "Metal exact JIT pipeline lookup includes regime dispatch rows and both matrix dimensions" {
@@ -13455,6 +13532,7 @@ pub extern fn termite_metal_decode_runtime_destroy(runtime: ?*RawMetalDecodeRunt
 pub extern fn termite_metal_decode_runtime_ready(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_reserve(runtime: ?*RawMetalDecodeRuntime, scratch_bytes: usize, token_bytes: usize) c_int;
 pub extern fn termite_metal_decode_runtime_begin_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_begin_prepared_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_submit_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_cancel_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_wait_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
@@ -13682,6 +13760,15 @@ pub const FrameError = error{
 
 pub fn beginFrame(runtime: ?*RawMetalDecodeRuntime) FrameError!void {
     return switch (termite_metal_decode_runtime_begin_frame(runtime)) {
+        0 => {},
+        -1, -2 => FrameError.RuntimeUnavailable,
+        -3, -4 => FrameError.FrameAlreadyActive,
+        else => FrameError.SubmissionFailed,
+    };
+}
+
+pub fn beginPreparedFrame(runtime: ?*RawMetalDecodeRuntime) FrameError!void {
+    return switch (termite_metal_decode_runtime_begin_prepared_frame(runtime)) {
         0 => {},
         -1, -2 => FrameError.RuntimeUnavailable,
         -3, -4 => FrameError.FrameAlreadyActive,
@@ -33024,6 +33111,203 @@ test "metal native planned q8_0 attention ffn ple block matches decomposed" {
     }
 }
 
+test "metal native flash prefill direct KV is bounded, counted, and disable-wins" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const enable_env = "TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD";
+    const disable_env = "TERMITE_METAL_DISABLE_PREFILL_SG_DIRECT_LOAD";
+    const generated_enable_env = "TERMITE_METAL_ENABLE_FLASH_PREFILL_GENERATED";
+    const generated_disable_env = "TERMITE_METAL_DISABLE_FLASH_PREFILL_GENERATED";
+    const original_enable = if (std.c.getenv(enable_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    const original_disable = if (std.c.getenv(disable_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    const original_generated_enable = if (std.c.getenv(generated_enable_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    const original_generated_disable = if (std.c.getenv(generated_disable_env)) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    defer {
+        if (original_enable) |value| {
+            _ = setenv(enable_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(enable_env);
+        }
+        if (original_disable) |value| {
+            _ = setenv(disable_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(disable_env);
+        }
+        if (original_generated_enable) |value| {
+            _ = setenv(generated_enable_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(generated_enable_env);
+        }
+        if (original_generated_disable) |value| {
+            _ = setenv(generated_disable_env, value.ptr, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv(generated_disable_env);
+        }
+    }
+    try std.testing.expectEqual(@as(c_int, 0), setenv(enable_env, "1", 1));
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(disable_env));
+    try std.testing.expectEqual(@as(c_int, 0), setenv(generated_enable_env, "1", 1));
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(generated_disable_env));
+
+    const Exercise = struct {
+        fn run(expect_direct: bool, output: []f32) !void {
+            const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+            defer termite_metal_decode_runtime_destroy(runtime);
+            defer _ = termite_metal_decode_runtime_reset_state(runtime);
+            if (termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+
+            const q_len: usize = 8;
+            const kv_tokens: usize = 16;
+            const num_heads: usize = 8;
+            const num_kv_heads: usize = 2;
+            const head_dim: usize = 256;
+            const sliding_window: usize = 512;
+            const kv_dim: usize = num_kv_heads * head_dim;
+            const q_dim: usize = num_heads * head_dim;
+            const page_size: usize = 16;
+            const key_row_bytes: usize = kv_dim * @sizeOf(f16);
+            try std.testing.expectEqual(q_len * q_dim, output.len);
+
+            var q_data: [q_len * q_dim]f32 = undefined;
+            var k_data: [kv_tokens * kv_dim]f32 = undefined;
+            var v_data: [kv_tokens * kv_dim]f32 = undefined;
+            for (&q_data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6)) * 0.03125;
+            for (&k_data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) * 0.03125;
+            for (&v_data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 19)) - 9)) * 0.03125;
+
+            var q = try testDeviceTensorFromSlice(runtime, &q_data, &[_]i32{ @intCast(q_len), @intCast(q_dim) });
+            defer q.deinit();
+            var k = try testDeviceTensorFromSlice(runtime, &k_data, &[_]i32{ @intCast(kv_tokens), @intCast(kv_dim) });
+            defer k.deinit();
+            var v = try testDeviceTensorFromSlice(runtime, &v_data, &[_]i32{ @intCast(kv_tokens), @intCast(kv_dim) });
+            defer v.deinit();
+            var out = try MetalTensor.deviceAllocate(runtime, q_len * q_dim * @sizeOf(f32), .private, &[_]i32{ @intCast(q_len), @intCast(q_dim) });
+            defer out.deinit();
+
+            // Logical token zero starts at physical token 16. Attention is
+            // deliberately given an invalid unused tail entry: only the one
+            // block needed by kv_tokens may be validated or uploaded.
+            const update_blocks = [_]u32{16};
+            const attention_blocks = [_]u32{ 16, std.math.maxInt(u32) };
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_reset_attention_span_slot(runtime, 0));
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_update_attention_paged_from_f32_key_device_slot(
+                runtime,
+                0,
+                3,
+                k.deviceHandle(),
+                k.deviceByteOffset(),
+                v.deviceHandle(),
+                v.deviceByteOffset(),
+                kv_tokens,
+                kv_tokens,
+                num_kv_heads,
+                head_dim,
+                key_row_bytes,
+                key_row_bytes,
+                kv_dim,
+                0,
+                &update_blocks,
+                update_blocks.len,
+                page_size,
+            ));
+
+            const before = runtimeMemorySnapshot(runtime);
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_attention_paged_slot_device(
+                runtime,
+                0,
+                3,
+                q.deviceHandle(),
+                q.deviceByteOffset(),
+                &attention_blocks,
+                attention_blocks.len,
+                page_size,
+                q_len,
+                kv_tokens,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                key_row_bytes,
+                key_row_bytes,
+                kv_tokens - q_len,
+                0,
+                sliding_window,
+                0.0,
+                null,
+                0,
+                out.deviceHandle(),
+                out.deviceByteOffset(),
+            ));
+            const after_prefill = runtimeMemorySnapshot(runtime);
+            try std.testing.expectEqual(before.generated_attention_flash_prefill_calls + 1, after_prefill.generated_attention_flash_prefill_calls);
+            if (expect_direct) {
+                try std.testing.expectEqual(before.attention_prefill_direct_kv_calls + 1, after_prefill.attention_prefill_direct_kv_calls);
+                try std.testing.expectEqual(before.attention_prefill_paged_kv_calls, after_prefill.attention_prefill_paged_kv_calls);
+            } else {
+                try std.testing.expectEqual(before.attention_prefill_direct_kv_calls, after_prefill.attention_prefill_direct_kv_calls);
+                try std.testing.expectEqual(before.attention_prefill_paged_kv_calls + 1, after_prefill.attention_prefill_paged_kv_calls);
+            }
+            var out_mut = out;
+            const prefill_output = try tensorHostSlice(&out_mut);
+            @memcpy(output, prefill_output);
+
+            // A decode-shaped call on the same contiguous table cannot select
+            // or count either prefill K/V route.
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_attention_paged_slot_device(
+                runtime,
+                0,
+                3,
+                q.deviceHandle(),
+                q.deviceByteOffset(),
+                &attention_blocks,
+                attention_blocks.len,
+                page_size,
+                1,
+                kv_tokens,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                key_row_bytes,
+                key_row_bytes,
+                kv_tokens - 1,
+                0,
+                sliding_window,
+                0.0,
+                null,
+                0,
+                out.deviceHandle(),
+                out.deviceByteOffset(),
+            ));
+            const after_decode = runtimeMemorySnapshot(runtime);
+            try std.testing.expectEqual(after_prefill.attention_prefill_direct_kv_calls, after_decode.attention_prefill_direct_kv_calls);
+            try std.testing.expectEqual(after_prefill.attention_prefill_paged_kv_calls, after_decode.attention_prefill_paged_kv_calls);
+        }
+    };
+
+    var direct_output: [8 * 8 * 256]f32 = undefined;
+    var paged_output: [8 * 8 * 256]f32 = undefined;
+    try Exercise.run(true, &direct_output);
+    try std.testing.expectEqual(@as(c_int, 0), setenv(disable_env, "1", 1));
+    try Exercise.run(false, &paged_output);
+    try std.testing.expectEqualSlices(f32, &direct_output, &paged_output);
+}
+
 test "metal native paged attention f16 single row uses 1x kernel across pages" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
@@ -34960,6 +35244,43 @@ test "metal donated KV on-frame attention fails closed on unsafe runtime state" 
     try std.testing.expectEqual(@as(c_int, -5), GuardCall.run(kv_runtime, frame_runtime, q, output, &block_table));
     try submitFrame(frame_runtime);
     try waitFrame(frame_runtime);
+}
+
+test "metal prepared frame uses the shared lifecycle and profiling forces fallback" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(runtime);
+    defer _ = termite_metal_decode_runtime_reset_state(runtime);
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+
+    const before = runtimeMemorySnapshot(runtime);
+    try beginPreparedFrame(runtime);
+    try std.testing.expect(hasActiveFrame(runtime));
+    try cancelFrame(runtime);
+    const after_prepared = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(
+        before.prepared_frame_fast_path_calls + before.prepared_frame_fallback_calls + 1,
+        after_prepared.prepared_frame_fast_path_calls + after_prepared.prepared_frame_fallback_calls,
+    );
+
+    // The generic entrypoint remains on the descriptor path and does not
+    // report itself as an explicit prepared-frame request.
+    try beginFrame(runtime);
+    try cancelFrame(runtime);
+    const after_generic = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(after_prepared.prepared_frame_fast_path_calls, after_generic.prepared_frame_fast_path_calls);
+    try std.testing.expectEqual(after_prepared.prepared_frame_fallback_calls, after_generic.prepared_frame_fallback_calls);
+
+    try workloadProfileBegin(runtime, .decode);
+    defer workloadProfileEnd(runtime) catch {};
+    try beginPreparedFrame(runtime);
+    try cancelFrame(runtime);
+    const after_profiled = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(after_generic.prepared_frame_fast_path_calls, after_profiled.prepared_frame_fast_path_calls);
+    try std.testing.expectEqual(after_generic.prepared_frame_fallback_calls + 1, after_profiled.prepared_frame_fallback_calls);
+    try workloadProfileEnd(runtime);
 }
 
 test "metal native decoder runtime frame API batches device ops into one command buffer" {

@@ -17933,7 +17933,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         var active_frame = false;
         if (active_decode_frame_enabled and !metal_runtime.hasActiveFrame(runtime)) {
-            active_frame = try self.beginDecoderRuntimeFrame(runtime);
+            active_frame = try self.beginPreparedDecoderRuntimeFrame(runtime);
         }
         errdefer self.cancelDecoderRuntimeFrame(runtime, &active_frame);
         if (request.phase != .full and !active_frame) {
@@ -18751,6 +18751,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return true;
     }
 
+    fn beginPreparedDecoderRuntimeFrame(self: *MetalCompute, runtime: ?*metal_runtime.RawMetalDecodeRuntime) !bool {
+        const rt = runtime orelse return false;
+        if (metal_runtime.hasActiveFrame(rt)) return false;
+        self.clearPendingPrefillKvDeviceSeeds();
+        try metal_runtime.beginPreparedFrame(rt);
+        self.timing_stats.decoder_runtime_frame_begins += 1;
+        return true;
+    }
+
     fn submitAndWaitDecoderRuntimeFrame(self: *MetalCompute, runtime: ?*metal_runtime.RawMetalDecodeRuntime, active: *bool) !void {
         if (!active.*) return;
         errdefer self.cancelDecoderRuntimeFrame(runtime, active);
@@ -19068,7 +19077,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_generated_attention_decode_1x_calls = runtime_stats.generated_attention_decode_1x_calls;
         stats.metal_runtime_generated_attention_flash_prefill_calls = runtime_stats.generated_attention_flash_prefill_calls;
         stats.metal_runtime_generated_attention_flash_prefill_hd512_calls = runtime_stats.generated_attention_flash_prefill_hd512_calls;
+        stats.metal_runtime_attention_prefill_direct_kv_calls = runtime_stats.attention_prefill_direct_kv_calls;
+        stats.metal_runtime_attention_prefill_paged_kv_calls = runtime_stats.attention_prefill_paged_kv_calls;
         stats.metal_runtime_generated_rms_norm_calls = runtime_stats.generated_rms_norm_calls;
+        stats.metal_runtime_prepared_frame_fast_path_calls = runtime_stats.prepared_frame_fast_path_calls;
+        stats.metal_runtime_prepared_frame_fallback_calls = runtime_stats.prepared_frame_fallback_calls;
         stats.metal_runtime_compute_encoder_count = runtime_stats.compute_encoder_count;
         stats.metal_runtime_blit_encoder_count = runtime_stats.blit_encoder_count;
         stats.metal_runtime_last_frame_compute_encoder_count = runtime_stats.last_frame_compute_encoder_count;
@@ -19130,6 +19143,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_q4_0_linear_reduce_f16_output = runtime_stats.q4_0_linear_reduce_f16_output;
         stats.metal_runtime_q4_0_linear_reduce_f16_input_f16_output = runtime_stats.q4_0_linear_reduce_f16_input_f16_output;
         stats.metal_runtime_q4_0_linear_reduce_sumsq = runtime_stats.q4_0_linear_reduce_sumsq;
+        stats.metal_runtime_q4_0_mmv_nr4_nsg2_dispatches = runtime_stats.q4_0_mmv_nr4_nsg2_dispatches;
+        stats.metal_runtime_q4_0_mmv_nr8_nsg2_dispatches = runtime_stats.q4_0_mmv_nr8_nsg2_dispatches;
+        stats.metal_runtime_q4_0_mmv_nr4_nsg4_dispatches = runtime_stats.q4_0_mmv_nr4_nsg4_dispatches;
+        stats.metal_runtime_q4_0_mmv_nr8_nsg4_dispatches = runtime_stats.q4_0_mmv_nr8_nsg4_dispatches;
+        stats.metal_runtime_q4_0_mmv_variant_fallbacks = runtime_stats.q4_0_mmv_variant_fallbacks;
+        stats.metal_runtime_q4_0_mm_sg_aligned_dispatches = runtime_stats.q4_0_mm_sg_aligned_dispatches;
+        stats.metal_runtime_q4_0_mm_sg_aligned_tail_dispatches = runtime_stats.q4_0_mm_sg_aligned_tail_dispatches;
+        stats.metal_runtime_q4_0_mm_sg_unrolled_dispatches = runtime_stats.q4_0_mm_sg_unrolled_dispatches;
         stats.metal_runtime_q4_0_pair = runtime_stats.q4_0_pair;
         stats.metal_runtime_q4_0_pair_reduce = runtime_stats.q4_0_pair_reduce;
         stats.metal_runtime_q4_0_pair_activation_reduce = runtime_stats.q4_0_pair_activation_reduce;

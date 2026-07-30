@@ -663,6 +663,26 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
         },
     );
     std.debug.print(
+        "metal_attention_dispatch: paged_1x={d} decode_gqa_split={d} generated_decode_1x={d} generated_flash_prefill={d} generated_flash_prefill_hd512={d} prefill_direct_kv={d} prefill_paged_kv={d} generated_rms_norm={d}\n",
+        .{
+            provider_stats.metal_runtime_paged_attention_1x_calls,
+            provider_stats.metal_runtime_decode_gqa_split_calls,
+            provider_stats.metal_runtime_generated_attention_decode_1x_calls,
+            provider_stats.metal_runtime_generated_attention_flash_prefill_calls,
+            provider_stats.metal_runtime_generated_attention_flash_prefill_hd512_calls,
+            provider_stats.metal_runtime_attention_prefill_direct_kv_calls,
+            provider_stats.metal_runtime_attention_prefill_paged_kv_calls,
+            provider_stats.metal_runtime_generated_rms_norm_calls,
+        },
+    );
+    std.debug.print(
+        "metal_prepared_frame: fast_path={d} fallback={d}\n",
+        .{
+            provider_stats.metal_runtime_prepared_frame_fast_path_calls,
+            provider_stats.metal_runtime_prepared_frame_fallback_calls,
+        },
+    );
+    std.debug.print(
         "metal_q4_0_dispatch: linear_reduce={d} linear_reduce_rows={d}/{d}/{d}/{d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",
         .{
             provider_stats.metal_runtime_q4_0_linear_reduce,
@@ -691,6 +711,19 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
             @divTrunc(provider_stats.metal_runtime_q4_0_pair_reduce_encode_nanos, 1000),
             @divTrunc(provider_stats.metal_runtime_q4_0_pair_activation_reduce_encode_nanos, 1000),
             @divTrunc(provider_stats.metal_runtime_q4_0_activation_rhs_reduce_encode_nanos, 1000),
+        },
+    );
+    std.debug.print(
+        "metal_q4_0_policy: mmv_nr4_nsg2={d} mmv_nr8_nsg2={d} mmv_nr4_nsg4={d} mmv_nr8_nsg4={d} mmv_variant_fallbacks={d} mm_sg_aligned={d} mm_sg_aligned_tail={d} mm_sg_unrolled={d}\n",
+        .{
+            provider_stats.metal_runtime_q4_0_mmv_nr4_nsg2_dispatches,
+            provider_stats.metal_runtime_q4_0_mmv_nr8_nsg2_dispatches,
+            provider_stats.metal_runtime_q4_0_mmv_nr4_nsg4_dispatches,
+            provider_stats.metal_runtime_q4_0_mmv_nr8_nsg4_dispatches,
+            provider_stats.metal_runtime_q4_0_mmv_variant_fallbacks,
+            provider_stats.metal_runtime_q4_0_mm_sg_aligned_dispatches,
+            provider_stats.metal_runtime_q4_0_mm_sg_aligned_tail_dispatches,
+            provider_stats.metal_runtime_q4_0_mm_sg_unrolled_dispatches,
         },
     );
     std.debug.print(

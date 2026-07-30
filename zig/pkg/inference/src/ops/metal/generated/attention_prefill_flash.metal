@@ -26,7 +26,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-struct antfly_paged_attention_1x_params { uint q_len; uint kv_tokens; uint num_heads; uint num_kv_heads; uint head_dim; uint key_row_bytes; uint base_key_row_bytes; uint query_position_offset; uint kv_position_offset; uint sliding_window; uint v_row_stride; uint page_size; uint block_count; uint contiguous_base_token; uint contiguous_blocks; uint format; uint v_element_bytes; uint has_sinks; float softcap; };
+struct antfly_paged_attention_1x_params { uint q_len; uint kv_tokens; uint num_heads; uint num_kv_heads; uint head_dim; uint key_row_bytes; uint base_key_row_bytes; uint query_position_offset; uint kv_position_offset; uint sliding_window; uint v_row_stride; uint page_size; uint block_count; uint contiguous_base_token; uint contiguous_blocks; uint format; uint v_element_bytes; uint has_sinks; float softcap; uint swa_scan_clamp; };
 inline uint antfly_paged_attention_1x_page_token(device const uint *block_table, constant antfly_paged_attention_1x_params &p, uint logical_token) { if (p.contiguous_blocks != 0u) return p.contiguous_base_token + logical_token; uint logical_block = logical_token / p.page_size; uint token_in_block = logical_token - logical_block * p.page_size; if (logical_block >= p.block_count) return 0xffffffffu; return block_table[logical_block] + token_in_block; }
 kernel void antfly_paged_attention_prefill_flash_generated_msl_v1(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant antfly_paged_attention_1x_params &p [[buffer(6)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
     const uint q0 = tg.x * 8u; const uint h = tg.y;
@@ -50,9 +50,11 @@ kernel void antfly_paged_attention_prefill_flash_generated_msl_v1(device const f
     const uint dslice = uint(sgitg) * 64u;
     simdgroup_float8x8 mo[8];
     for (uint i = 0u; i < 8u; ++i) mo[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
-    for (uint kc = 0u; kc < p.kv_tokens; kc += 32u) {
+    const uint q_last = min(q0 + 7u, p.q_len - 1u); const uint tile_first_q = p.query_position_offset + q0; const uint tile_last_q = p.query_position_offset + q_last;
+    uint kc_start = 0u; if (p.swa_scan_clamp != 0u && p.sliding_window != 0u) { const uint window_minus_one = p.sliding_window - 1u; const uint earliest_live_key = tile_first_q >= window_minus_one ? tile_first_q - window_minus_one : 0u; if (earliest_live_key > p.kv_position_offset) { const uint earliest_logical_key = earliest_live_key - p.kv_position_offset; kc_start = (earliest_logical_key / 32u) * 32u; } }
+    for (uint kc = kc_start; kc < p.kv_tokens; kc += 32u) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        uint q_last = min(q0 + 7u, p.q_len - 1u); uint tile_first_q = p.query_position_offset + q0; uint tile_last_q = p.query_position_offset + q_last; uint key_first = p.kv_position_offset + kc; uint key_last = p.kv_position_offset + min(kc + 31u, p.kv_tokens - 1u); bool wholly_future = key_first > tile_last_q; bool wholly_expired = p.sliding_window != 0u && tile_first_q >= key_last && tile_first_q - key_last >= p.sliding_window; if (wholly_future) break; if (wholly_expired) continue;
+        uint key_first = p.kv_position_offset + kc; uint key_last = p.kv_position_offset + min(kc + 31u, p.kv_tokens - 1u); bool wholly_future = key_first > tile_last_q; bool wholly_expired = p.sliding_window != 0u && tile_first_q >= key_last && tile_first_q - key_last >= p.sliding_window; if (wholly_future) break; if (wholly_expired) continue;
         if (tid < 32u) { uint ki = kc + uint(tid); sphys[tid] = ki < p.kv_tokens ? antfly_paged_attention_1x_page_token(block_table, p, ki) : 0xffffffffu; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         simdgroup_float8x8 ms = make_filled_simdgroup_matrix<float, 8>(0.0f);
