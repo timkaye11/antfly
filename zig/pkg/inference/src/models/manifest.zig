@@ -838,6 +838,18 @@ fn applyGgufTokenizerMetadata(
 
     const view = gguf_metadata.View.init(&parsed);
 
+    // A standalone GGUF has no config.json to classify the model. Preserve the
+    // GGUF architecture in the manifest so direct-file and GGUF-only directory
+    // loads take the generator path instead of silently defaulting to embedder.
+    if (view.getString("general.architecture")) |architecture| {
+        if (manifest.config_model_arch.len == 0) {
+            manifest.config_model_arch = try allocator.dupe(u8, architecture);
+        }
+        if (manifest.model_type == .embedder and gpt.isGenerativeModel(architecture)) {
+            manifest.model_type = .generator;
+        }
+    }
+
     if (bert.parseGgufMetadata(view)) |config| {
         manifest.hidden_size = config.hidden_size;
         manifest.intermediate_size = config.intermediate_size;
@@ -3264,9 +3276,31 @@ test "manifest prefers huggingface tokenizer from gemma4 gguf bpe metadata" {
     defer manifest.deinit();
 
     try std.testing.expect(manifest.gguf_path != null);
+    try std.testing.expectEqual(ModelType.generator, manifest.model_type);
+    try std.testing.expectEqualStrings("gemma4", manifest.config_model_arch);
     try std.testing.expectEqual(TokenizerType.huggingface, manifest.tokenizer_type.?);
     try std.testing.expectEqualStrings("<bos>", manifest.bos_token);
     try std.testing.expectEqualStrings("<eos>", manifest.eos_token);
+}
+
+test "direct gemma4 gguf is classified as generator" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const gguf_bytes = try buildTestGgufWithGemma4Tokenizer(allocator);
+    defer allocator.free(gguf_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "gemma4-q4_0.gguf", .data = gguf_bytes });
+
+    const gguf_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "gemma4-q4_0.gguf" });
+    defer allocator.free(gguf_path);
+
+    var manifest = try loadFromDir(allocator, gguf_path);
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(ModelType.generator, manifest.model_type);
+    try std.testing.expectEqualStrings("gemma4", manifest.config_model_arch);
 }
 
 test "manifest applies BERT and T5 tokenizer metadata from GGUF" {

@@ -5629,6 +5629,7 @@ fn decoderBlock(
                 break :blk_sa_out try cb.add(attn_post, hidden);
             };
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-residual", sa_out, hidden_size);
+            try maybeDebugLayerTensorLastRow(cb, allocator, layer, "attn_residual", sa_out, hidden_size);
             try maybeCaptureActivationTrace(trace_sink, cb, allocator, "attn_residual", layer, sa_out, hidden_size);
 
             if (config.usesMoe() and config.hasSharedExpert()) {
@@ -5642,34 +5643,64 @@ fn decoderBlock(
                 var norm_started_at = monotonicNowNs();
                 const shared_normed = try applyGemmaFfnPreNorm(cb, allocator, config, sa_out, layer, &name_buf);
                 defer cb.free(shared_normed);
+                try maybeDebugLayerTensorLastRow(cb, allocator, layer, "shared_norm", shared_normed, hidden_size);
                 debug_timing_stats.norm_nanos += @intCast(monotonicNowNs() - norm_started_at);
+
+                // Route from the parallel MoE branch before running the shared
+                // FFN so compact expert preads can overlap its Metal work.
+                norm_started_at = monotonicNowNs();
+                const moe_normed = try applyGemmaMoeFfnPreNorm(cb, allocator, config, sa_out, layer, &name_buf);
+                defer cb.free(moe_normed);
+                try maybeDebugLayerTensorLastRow(cb, allocator, layer, "moe_norm", moe_normed, hidden_size);
+                debug_timing_stats.norm_nanos += @intCast(monotonicNowNs() - norm_started_at);
+                var pending_compact_moe = try beginCompactMoeBlock(
+                    cb,
+                    allocator,
+                    config,
+                    moe_normed,
+                    sa_out,
+                    total,
+                    layer,
+                    &name_buf,
+                );
+                defer if (pending_compact_moe) |*pending| pending.deinit(cb);
+
                 const shared_ffn_started_at = monotonicNowNs();
                 const shared_out = try denseFeedForward(cb, allocator, config, shared_normed, total, layer, &name_buf);
                 defer cb.free(shared_out);
+                try maybeDebugLayerTensorLastRow(cb, allocator, layer, "shared_raw", shared_out, hidden_size);
                 const shared_ffn_elapsed = monotonicNowNs() - shared_ffn_started_at;
                 debug_timing_stats.ffn_nanos += @intCast(shared_ffn_elapsed);
                 debug_timing_stats.shared_expert_ffn_nanos += @intCast(shared_ffn_elapsed);
                 norm_started_at = monotonicNowNs();
                 const shared_post = try applyGemmaSharedFfnPostNorm(cb, allocator, config, shared_out, layer, &name_buf);
                 defer if (shared_post != shared_out) cb.free(shared_post);
+                try maybeDebugLayerTensorLastRow(cb, allocator, layer, "shared_post", shared_post, hidden_size);
+                debug_timing_stats.norm_nanos += @intCast(monotonicNowNs() - norm_started_at);
 
                 // MoE routed expert path: RMSNorm → MoE → RMSNorm (branches from sa_out too)
-                const moe_normed = try applyGemmaMoeFfnPreNorm(cb, allocator, config, sa_out, layer, &name_buf);
-                defer cb.free(moe_normed);
-                debug_timing_stats.norm_nanos += @intCast(monotonicNowNs() - norm_started_at);
                 const moe_started_at = monotonicNowNs();
-                const moe_out = try moeFeedForwardRoutedOnly(cb, allocator, config, moe_normed, total, layer, &name_buf, decode_context);
+                const moe_out = blk_moe_out: {
+                    if (pending_compact_moe) |*pending| {
+                        if (try pending.finish(cb)) |output| break :blk_moe_out output;
+                    }
+                    break :blk_moe_out try moeFeedForwardRoutedOnly(cb, allocator, config, moe_normed, sa_out, total, layer, &name_buf, decode_context);
+                };
                 defer cb.free(moe_out);
+                try maybeDebugLayerTensorLastRow(cb, allocator, layer, "moe_raw", moe_out, hidden_size);
                 debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - moe_started_at);
                 norm_started_at = monotonicNowNs();
                 const moe_post = try applyGemmaMoeFfnPostNorm(cb, allocator, config, moe_out, layer, &name_buf);
                 defer if (moe_post != moe_out) cb.free(moe_post);
+                try maybeDebugLayerTensorLastRow(cb, allocator, layer, "moe_post", moe_post, hidden_size);
 
                 // Combine: shared + MoE, then overall FFN post-norm, then residual
                 const combined = try cb.add(shared_post, moe_post);
                 defer cb.free(combined);
+                try maybeDebugLayerTensorLastRow(cb, allocator, layer, "ffn_combined", combined, hidden_size);
                 const combined_normed = try applyGemmaFfnPostNorm(cb, allocator, config, combined, layer, &name_buf);
                 defer if (combined_normed != combined) cb.free(combined_normed);
+                try maybeDebugLayerTensorLastRow(cb, allocator, layer, "ffn_post", combined_normed, hidden_size);
                 debug_timing_stats.norm_nanos += @intCast(monotonicNowNs() - norm_started_at);
 
                 var layer_result_output_scaled = false;
@@ -5691,6 +5722,7 @@ fn decoderBlock(
                     }
                 }
                 const scaled = if (layer_result_output_scaled or (!config.hasPle() and use_branch_output_scale)) layer_result else try applyLayerOutputScale(cb, allocator, config, layer_result, total, hidden_size, layer);
+                try maybeDebugLayerTensorLastRow(cb, allocator, layer, "out", scaled, hidden_size);
                 try dumpLayerLastRowStats(cb, allocator, layer, scaled, hidden_size);
                 return scaled;
             }
@@ -6611,6 +6643,30 @@ fn maybeDebugTensorLastRow(
     debugPrint("{s} last_row:", .{label});
     for (row[0..limit]) |value| {
         debugPrint(" {d:.6}", .{value});
+    }
+    debugPrint("\n", .{});
+}
+
+fn maybeDebugMoeRoutesLastRow(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    layer: usize,
+    logits: CT,
+    num_experts: usize,
+    top_k: usize,
+) !void {
+    if (is_freestanding) return;
+    if (!debugLastRowEnabled() or num_experts == 0 or top_k == 0) return;
+    const values = try cb.toFloat32(logits, allocator);
+    defer allocator.free(values);
+    if (values.len < num_experts) return;
+    const row_count = values.len / num_experts;
+    if (row_count == 0) return;
+    const row = values[(row_count - 1) * num_experts ..][0..num_experts];
+    const selection = try selectTopExperts(allocator, row, @min(top_k, 8));
+    debugPrint("layer{d}_routes:", .{layer});
+    for (0..selection.count) |index| {
+        debugPrint(" {d}:{d:.6}", .{ selection.indices[index], selection.weights[index] });
     }
     debugPrint("\n", .{});
 }
@@ -8132,7 +8188,98 @@ fn moeFeedForward(
     name_buf: *[256]u8,
     decode_context: ?*const DecodeContext,
 ) !CT {
-    return moeFeedForwardInner(cb, allocator, config, input, total, layer, name_buf, decode_context, false);
+    return moeFeedForwardInner(cb, allocator, config, input, null, total, layer, name_buf, decode_context, false);
+}
+
+const PendingCompactMoeBlock = struct {
+    request: ops.RunMoeBlockRequest,
+    active: bool = true,
+
+    fn releaseInputs(self: *PendingCompactMoeBlock, cb: *const ComputeBackend) void {
+        cb.free(self.request.router_logits);
+        if (self.request.expert_scale) |scale| cb.free(scale);
+    }
+
+    fn finish(self: *PendingCompactMoeBlock, cb: *const ComputeBackend) !?CT {
+        defer {
+            self.releaseInputs(cb);
+            self.active = false;
+        }
+        return cb.finishMoeBlock(&self.request);
+    }
+
+    fn deinit(self: *PendingCompactMoeBlock, cb: *const ComputeBackend) void {
+        if (!self.active) return;
+        const output = cb.finishMoeBlock(&self.request) catch null;
+        if (output) |tensor| cb.free(tensor);
+        self.releaseInputs(cb);
+        self.active = false;
+    }
+};
+
+/// Compute the deterministic top-8 route and start bounded expert preads.
+/// The returned ticket retains only the router logits and optional scale until
+/// finish; Metal slot publication remains on the calling inference thread.
+fn beginCompactMoeBlock(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input: CT,
+    router_source: CT,
+    total: usize,
+    layer: usize,
+    name_buf: *[256]u8,
+) !?PendingCompactMoeBlock {
+    const hidden_size = config.hidden_size;
+    const inter_size = config.expertIntermediateSize();
+    const num_experts: usize = config.num_local_experts;
+    const top_k: usize = @min(@as(usize, @intCast(config.num_experts_per_tok)), num_experts);
+    const supported = total == 1 and config.family == .gemma and
+        hidden_size == 2816 and inter_size == 704 and
+        num_experts == 128 and top_k == 8 and
+        cb.kind() != .graph and cb.vtable.beginMoeBlock != null and cb.vtable.finishMoeBlock != null and
+        !platform.env.getenvBool("ANTFLY_GEMMA4_DISABLE_COMPACT_MOE");
+    if (!supported) return null;
+
+    const router_weight_fetch_started_at = monotonicNowNs();
+    const router_w = try getMoeRouterWeight(cb, config, layer, name_buf);
+    debug_timing_stats.moe_router_weight_fetch_nanos += @intCast(monotonicNowNs() - router_weight_fetch_started_at);
+    defer cb.free(router_w);
+
+    const router_input = try prepareMoeRouterInput(cb, allocator, config, input, router_source, hidden_size, layer, name_buf);
+    defer if (router_input != input and router_input != router_source) cb.free(router_input);
+    try maybeDebugLayerTensorLastRow(cb, allocator, layer, "router_input", router_input, hidden_size);
+
+    const router_proj_started_at = monotonicNowNs();
+    const router_logits = try cb.linearNoBias(router_input, router_w, total, hidden_size, num_experts);
+    errdefer cb.free(router_logits);
+    try maybeDebugLayerTensorLastRow(cb, allocator, layer, "router_logits", router_logits, num_experts);
+    try maybeDebugMoeRoutesLastRow(cb, allocator, layer, router_logits, num_experts, top_k);
+    debug_timing_stats.moe_router_proj_nanos += @intCast(monotonicNowNs() - router_proj_started_at);
+
+    const expert_scale: ?CT = blk: {
+        const scale_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.block_sparse_moe.expert_output_scale", .{layer}) catch break :blk null;
+        break :blk getModelWeight(cb, config, scale_name) catch null;
+    };
+    errdefer if (expert_scale) |scale| cb.free(scale);
+    var pending = PendingCompactMoeBlock{ .request = .{
+        .input = input,
+        .router_logits = router_logits,
+        .expert_scale = expert_scale,
+        .layer_index = layer,
+        .activation = decoderRuntimeActivationKind(config.activation),
+        .total = total,
+        .hidden_size = hidden_size,
+        .inter_size = inter_size,
+        .num_experts = num_experts,
+        .top_k = top_k,
+    } };
+    if (!(try cb.beginMoeBlock(&pending.request))) {
+        pending.releaseInputs(cb);
+        pending.active = false;
+        return null;
+    }
+    return pending;
 }
 
 /// MoE feed-forward that skips the shared expert addition (used when the caller
@@ -8142,12 +8289,13 @@ fn moeFeedForwardRoutedOnly(
     allocator: std.mem.Allocator,
     config: Config,
     input: CT,
+    router_source: CT,
     total: usize,
     layer: usize,
     name_buf: *[256]u8,
     decode_context: ?*const DecodeContext,
 ) !CT {
-    return moeFeedForwardInner(cb, allocator, config, input, total, layer, name_buf, decode_context, true);
+    return moeFeedForwardInner(cb, allocator, config, input, router_source, total, layer, name_buf, decode_context, true);
 }
 
 fn moeFeedForwardInner(
@@ -8155,6 +8303,7 @@ fn moeFeedForwardInner(
     allocator: std.mem.Allocator,
     config: Config,
     input: CT,
+    router_source: ?CT,
     total: usize,
     layer: usize,
     name_buf: *[256]u8,
@@ -8171,45 +8320,41 @@ fn moeFeedForwardInner(
     debug_timing_stats.moe_router_weight_fetch_nanos += @intCast(monotonicNowNs() - router_weight_fetch_started_at);
     defer cb.free(router_w);
 
-    const router_input = try scaleMoeRouterInput(cb, config, input, hidden_size, layer, name_buf);
-    defer if (router_input != input) cb.free(router_input);
+    const router_input = try prepareMoeRouterInput(cb, allocator, config, input, router_source, hidden_size, layer, name_buf);
+    defer if (router_input != input and (router_source == null or router_input != router_source.?)) cb.free(router_input);
+    try maybeDebugLayerTensorLastRow(cb, allocator, layer, "router_input", router_input, hidden_size);
 
     const router_proj_started_at = monotonicNowNs();
     const router_logits_ct = try cb.linearNoBias(router_input, router_w, total, hidden_size, num_experts);
     defer cb.free(router_logits_ct);
+    try maybeDebugLayerTensorLastRow(cb, allocator, layer, "router_logits", router_logits_ct, num_experts);
+    try maybeDebugMoeRoutesLastRow(cb, allocator, layer, router_logits_ct, num_experts, top_k);
     debug_timing_stats.moe_router_proj_nanos += @intCast(monotonicNowNs() - router_proj_started_at);
 
-    // The fused Metal MoE kernel is SiLU-only. Models with other expert
-    // activations must use the generic path for correctness.
-    if (cb.kind() != .graph and config.activation == .silu) {
-        const w1 = getMoeExpertWeight(cb, config, layer, 0, "w1", name_buf) catch null;
-        const w3 = getMoeExpertWeight(cb, config, layer, 0, "w3", name_buf) catch null;
-        const w2 = getMoeExpertWeight(cb, config, layer, 0, "w2", name_buf) catch null;
-        defer if (w1) |w| cb.free(w);
-        defer if (w3) |w| cb.free(w);
-        defer if (w2) |w| cb.free(w);
-        if (w1 != null and w3 != null and w2 != null) {
-            const expert_scale_ct: ?CT = blk: {
-                const sn = std.fmt.bufPrint(name_buf, "model.layers.{d}.block_sparse_moe.expert_output_scale", .{layer}) catch break :blk null;
-                break :blk getModelWeight(cb, config, sn) catch null;
-            };
-            defer if (expert_scale_ct) |s| cb.free(s);
-            if (try cb.runMoeBlock(&.{
-                .input = input,
-                .router_logits = router_logits_ct,
-                .w1 = w1.?,
-                .w3 = w3.?,
-                .w2 = w2.?,
-                .expert_scale = expert_scale_ct,
-                .total = total,
-                .hidden_size = hidden_size,
-                .inter_size = inter_size,
-                .num_experts = num_experts,
-                .top_k = top_k,
-            })) |routed_output| {
-                if (skip_shared_expert) return routed_output;
-                return maybeAddSharedExpert(cb, allocator, config, input, routed_output, total, layer, name_buf);
-            }
+    const compact_gemma4_moe = config.family == .gemma and
+        hidden_size == 2816 and inter_size == 704 and
+        num_experts == 128 and top_k == 8 and
+        !platform.env.getenvBool("ANTFLY_GEMMA4_DISABLE_COMPACT_MOE");
+    if (compact_gemma4_moe and cb.kind() != .graph and cb.vtable.runMoeBlock != null) {
+        const expert_scale_ct: ?CT = blk: {
+            const sn = std.fmt.bufPrint(name_buf, "model.layers.{d}.block_sparse_moe.expert_output_scale", .{layer}) catch break :blk null;
+            break :blk getModelWeight(cb, config, sn) catch null;
+        };
+        defer if (expert_scale_ct) |s| cb.free(s);
+        if (try cb.runMoeBlock(&.{
+            .input = input,
+            .router_logits = router_logits_ct,
+            .expert_scale = expert_scale_ct,
+            .layer_index = layer,
+            .activation = decoderRuntimeActivationKind(config.activation),
+            .total = total,
+            .hidden_size = hidden_size,
+            .inter_size = inter_size,
+            .num_experts = num_experts,
+            .top_k = top_k,
+        })) |routed_output| {
+            if (skip_shared_expert) return routed_output;
+            return maybeAddSharedExpert(cb, allocator, config, input, routed_output, total, layer, name_buf);
         }
     }
 
@@ -8231,9 +8376,11 @@ fn moeFeedForwardInner(
     defer if (input_data) |downloaded| allocator.free(downloaded);
 
     // Gemma 4: per-expert output scale (ffn_down_exps.scale).
-    // Folded into route weights: effective_weight = route_weight * expert_scale[expert_id].
+    // Keep this separate from the normalized route weight. llama.cpp applies
+    // down projection -> expert scale -> route weight -> ordered reduction;
+    // folding the two scalars changes f32 rounding and breaks token parity.
     // In graph mode, pass the scale tensor to the backend so the interpreter
-    // can apply it during fused_moe_scatter_add execution.
+    // can preserve that operation order during fused_moe_scatter_add.
     if (cb.kind() == .graph) {
         const scale_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.block_sparse_moe.expert_output_scale", .{layer}) catch null;
         if (scale_name) |sn| {
@@ -8273,12 +8420,7 @@ fn moeFeedForwardInner(
                 };
                 for (0..selection.count) |i| {
                     const append_started_at = monotonicNowNs();
-                    var weight = selection.weights[i];
-                    if (expert_output_scale) |eos| {
-                        const eid = selection.indices[i];
-                        if (eid < eos.len) weight *= eos[eid];
-                    }
-                    try moe_runtime.appendRoute(layer, selection.indices[i], @intCast(row), weight);
+                    try moe_runtime.appendRoute(layer, selection.indices[i], @intCast(row), selection.weights[i]);
                     debug_timing_stats.moe_append_route_nanos += @intCast(monotonicNowNs() - append_started_at);
                 }
             }
@@ -8288,15 +8430,23 @@ fn moeFeedForwardInner(
             const prefetch_started_at = monotonicNowNs();
             prefetchMoeExperts(cb, layer, moe_runtime.predictedExperts(layer), moe_runtime.predictedExpertScores(layer), name_buf);
             debug_timing_stats.moe_prefetch_hint_nanos += @intCast(monotonicNowNs() - prefetch_started_at);
-            if (try runMoeWithRuntimeBatches(cb, allocator, config, moe_runtime, input, output, layer, hidden_size, inter_size, name_buf)) |grouped_output| {
+            const grouped_output = if (expert_output_scale == null)
+                try runMoeWithRuntimeBatches(cb, allocator, config, moe_runtime, input, output, layer, hidden_size, inter_size, name_buf)
+            else
+                null;
+            if (grouped_output) |resident_output| {
                 allocator.free(output);
-                if (skip_shared_expert) return grouped_output;
-                return maybeAddSharedExpert(cb, allocator, config, input, grouped_output, total, layer, name_buf);
+                if (skip_shared_expert) return resident_output;
+                return maybeAddSharedExpert(cb, allocator, config, input, resident_output, total, layer, name_buf);
             } else {
                 if (input_data == null) input_data = try downloadMoeInput(cb, allocator, input);
                 for (moe_runtime.activeExperts(layer)) |expert_index| {
                     const batch = moe_runtime.batchView(layer, expert_index);
-                    try runExpertBatch(cb, allocator, config, input_data.?, output, layer, expert_index, batch, hidden_size, inter_size, name_buf);
+                    const scale = if (expert_output_scale) |scales|
+                        if (expert_index < scales.len) scales[expert_index] else 1.0
+                    else
+                        1.0;
+                    try runExpertBatch(cb, allocator, config, input_data.?, output, layer, expert_index, batch, scale, hidden_size, inter_size, name_buf);
                 }
             }
         } else {
@@ -8443,11 +8593,7 @@ fn runMoeWithLocalBatches(
             const expert_index: usize = selection.indices[i];
             const cursor = cursors[expert_index];
             expert_batches[expert_index].rows[cursor] = @intCast(row);
-            var weight = selection.weights[i];
-            if (expert_output_scale) |eos| {
-                if (expert_index < eos.len) weight *= eos[expert_index];
-            }
-            expert_batches[expert_index].route_weights[cursor] = weight;
+            expert_batches[expert_index].route_weights[cursor] = selection.weights[i];
             cursors[expert_index] = cursor + 1;
         }
     }
@@ -8459,73 +8605,75 @@ fn runMoeWithLocalBatches(
         if (first_active_expert == null) first_active_expert = expert_index;
         grouped_count += batch.rows.len;
     }
-    if (first_active_expert) |representative_expert| {
-        const grouped_rows = try allocator.alloc(u32, grouped_count);
-        defer allocator.free(grouped_rows);
-        const grouped_expert_ids = try allocator.alloc(u32, grouped_count);
-        defer allocator.free(grouped_expert_ids);
-        const grouped_route_weights = try allocator.alloc(f32, grouped_count);
-        defer allocator.free(grouped_route_weights);
+    if (expert_output_scale == null) {
+        if (first_active_expert) |representative_expert| {
+            const grouped_rows = try allocator.alloc(u32, grouped_count);
+            defer allocator.free(grouped_rows);
+            const grouped_expert_ids = try allocator.alloc(u32, grouped_count);
+            defer allocator.free(grouped_expert_ids);
+            const grouped_route_weights = try allocator.alloc(f32, grouped_count);
+            defer allocator.free(grouped_route_weights);
 
-        var cursor: usize = 0;
-        for (expert_batches, 0..) |batch, expert_index| {
-            if (batch.rows.len == 0) continue;
-            for (batch.rows, batch.route_weights, 0..) |row_index, route_weight, batch_row| {
-                grouped_rows[cursor + batch_row] = row_index;
-                grouped_expert_ids[cursor + batch_row] = @intCast(expert_index);
-                grouped_route_weights[cursor + batch_row] = route_weight;
+            var cursor: usize = 0;
+            for (expert_batches, 0..) |batch, expert_index| {
+                if (batch.rows.len == 0) continue;
+                for (batch.rows, batch.route_weights, 0..) |row_index, route_weight, batch_row| {
+                    grouped_rows[cursor + batch_row] = row_index;
+                    grouped_expert_ids[cursor + batch_row] = @intCast(expert_index);
+                    grouped_route_weights[cursor + batch_row] = route_weight;
+                }
+                cursor += batch.rows.len;
             }
-            cursor += batch.rows.len;
-        }
-        const grouped_tiles = try buildGroupedExpertTiles(allocator, grouped_expert_ids, 4);
-        defer grouped_tiles.deinit(allocator);
+            const grouped_tiles = try buildGroupedExpertTiles(allocator, grouped_expert_ids, 4);
+            defer grouped_tiles.deinit(allocator);
 
-        if (try runGroupedExpertBatchTensor(
-            cb,
-            allocator,
-            config,
-            input,
-            output.len / hidden_size,
-            layer,
-            representative_expert,
-            .{
-                .rows = grouped_rows,
-                .expert_ids = grouped_expert_ids,
-                .route_weights = grouped_route_weights,
-                .expert_tile_ids = grouped_tiles.expert_tile_ids,
-                .tile_row_starts = grouped_tiles.tile_row_starts,
-                .tile_row_counts = grouped_tiles.tile_row_counts,
-            },
-            hidden_size,
-            inter_size,
-            name_buf,
-        )) |result| {
-            return result;
-        }
-        const input_data = try downloadMoeInput(cb, allocator, input);
-        defer allocator.free(input_data);
-        if (try runGroupedExpertBatch(
-            cb,
-            allocator,
-            config,
-            input_data,
-            output,
-            output.len / hidden_size,
-            layer,
-            representative_expert,
-            .{
-                .rows = grouped_rows,
-                .expert_ids = grouped_expert_ids,
-                .route_weights = grouped_route_weights,
-                .expert_tile_ids = grouped_tiles.expert_tile_ids,
-                .tile_row_starts = grouped_tiles.tile_row_starts,
-                .tile_row_counts = grouped_tiles.tile_row_counts,
-            },
-            hidden_size,
-            inter_size,
-            name_buf,
-        )) {
-            return null;
+            if (try runGroupedExpertBatchTensor(
+                cb,
+                allocator,
+                config,
+                input,
+                output.len / hidden_size,
+                layer,
+                representative_expert,
+                .{
+                    .rows = grouped_rows,
+                    .expert_ids = grouped_expert_ids,
+                    .route_weights = grouped_route_weights,
+                    .expert_tile_ids = grouped_tiles.expert_tile_ids,
+                    .tile_row_starts = grouped_tiles.tile_row_starts,
+                    .tile_row_counts = grouped_tiles.tile_row_counts,
+                },
+                hidden_size,
+                inter_size,
+                name_buf,
+            )) |result| {
+                return result;
+            }
+            const input_data = try downloadMoeInput(cb, allocator, input);
+            defer allocator.free(input_data);
+            if (try runGroupedExpertBatch(
+                cb,
+                allocator,
+                config,
+                input_data,
+                output,
+                output.len / hidden_size,
+                layer,
+                representative_expert,
+                .{
+                    .rows = grouped_rows,
+                    .expert_ids = grouped_expert_ids,
+                    .route_weights = grouped_route_weights,
+                    .expert_tile_ids = grouped_tiles.expert_tile_ids,
+                    .tile_row_starts = grouped_tiles.tile_row_starts,
+                    .tile_row_counts = grouped_tiles.tile_row_counts,
+                },
+                hidden_size,
+                inter_size,
+                name_buf,
+            )) {
+                return null;
+            }
         }
     }
 
@@ -8533,7 +8681,11 @@ fn runMoeWithLocalBatches(
     defer allocator.free(input_data);
     for (expert_batches, 0..) |batch, expert_index| {
         if (batch.rows.len == 0) continue;
-        try runExpertBatch(cb, allocator, config, input_data, output, layer, expert_index, batch, hidden_size, inter_size, name_buf);
+        const scale = if (expert_output_scale) |scales|
+            if (expert_index < scales.len) scales[expert_index] else 1.0
+        else
+            1.0;
+        try runExpertBatch(cb, allocator, config, input_data, output, layer, expert_index, batch, scale, hidden_size, inter_size, name_buf);
     }
     return null;
 }
@@ -8665,9 +8817,10 @@ fn selectTopExperts(allocator: std.mem.Allocator, router_logits: []const f32, to
         weight_sum += best_value;
     }
 
-    if (weight_sum > 0.0) {
+    const clamped_weight_sum = @max(weight_sum, @as(f32, 6.103515625e-5));
+    if (clamped_weight_sum > 0.0) {
         for (selection.weights[0..selection.count]) |*weight| {
-            weight.* /= weight_sum;
+            weight.* /= clamped_weight_sum;
         }
     }
     return selection;
@@ -8696,6 +8849,7 @@ fn runExpertBatch(
     layer: usize,
     expert_index: usize,
     batch: anytype,
+    expert_output_scale: f32,
     hidden_size: usize,
     inter_size: usize,
     name_buf: *[256]u8,
@@ -8743,7 +8897,8 @@ fn runExpertBatch(
         const src = expert_out[batch_row * hidden_size ..][0..hidden_size];
         const dst = output[@as(usize, row_index) * hidden_size ..][0..hidden_size];
         for (dst, src) |*out_value, in_value| {
-            out_value.* += route_weight * in_value;
+            const expert_scaled = in_value * expert_output_scale;
+            out_value.* += expert_scaled * route_weight;
         }
     }
     debug_timing_stats.moe_fallback_nanos += @intCast(monotonicNowNs() - started_at);
@@ -10190,22 +10345,52 @@ fn applyGeluNew(cb: *const ComputeBackend, input: CT) !CT {
     return cb.geluNew(input);
 }
 
-fn scaleMoeRouterInput(
+fn prepareMoeRouterInput(
     cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
     config: Config,
-    input: CT,
+    expert_input: CT,
+    router_source: ?CT,
     hidden_size: usize,
     layer: usize,
     name_buf: *[256]u8,
 ) !CT {
-    const scaled = input;
+    // Gemma 4 routes from the attention residual, not from the separately
+    // learned pre-FFN norm used as the expert input. Its router preconditioner
+    // is bare RMSNorm(x) / sqrt(hidden), followed by the learned input scale.
+    // Keeping those two branches distinct is required for exact top-k choices.
+    const scaled = if (router_source) |source| blk: {
+        const normalized = if (try cb.rmsNormBare(source, hidden_size, config.norm_eps)) |resident|
+            resident
+        else norm: {
+            const unit_values = try allocator.alloc(f32, hidden_size);
+            defer allocator.free(unit_values);
+            @memset(unit_values, 1.0);
+            const shape = [_]i32{@intCast(hidden_size)};
+            const unit_weight = try cb.fromFloat32Shape(unit_values, &shape);
+            defer cb.free(unit_weight);
+            break :norm try cb.rmsNorm(source, unit_weight, hidden_size, config.norm_eps);
+        };
+        errdefer cb.free(normalized);
 
-    _ = hidden_size;
+        const inverse_sqrt_hidden = 1.0 / @sqrt(@as(f32, @floatFromInt(hidden_size)));
+        if (try cb.multiplyScalar(normalized, inverse_sqrt_hidden)) |resident| {
+            cb.free(normalized);
+            break :blk resident;
+        }
+        const scale_tensor = try cb.fromFloat32(&.{inverse_sqrt_hidden});
+        defer cb.free(scale_tensor);
+        const resident = try cb.multiply(normalized, scale_tensor);
+        cb.free(normalized);
+        break :blk resident;
+    } else expert_input;
 
     const scale_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.block_sparse_moe.gate.input_scale", .{layer}) catch return scaled;
     const scale_w = getModelWeight(cb, config, scale_name) catch return scaled;
     defer cb.free(scale_w);
-    return cb.multiply(scaled, scale_w);
+    const result = try cb.multiply(scaled, scale_w);
+    if (scaled != expert_input and (router_source == null or scaled != router_source.?)) cb.free(scaled);
+    return result;
 }
 
 pub fn applyActivation(cb: *const ComputeBackend, config: Config, input: CT) !CT {

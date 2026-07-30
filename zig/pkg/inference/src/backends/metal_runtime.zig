@@ -740,7 +740,10 @@ fn metalJitRejectionMemoClear(key: kernel_jit.ArtifactKey) void {
 
 pub const decoder_runtime_layer_norm_slot_capacity: usize = 256;
 pub const decoder_runtime_rms_norm_slot_capacity: usize = 512;
-pub const decoder_runtime_linear_slot_capacity: usize = 512;
+// Slots [0, 512) retain the long-standing dense/dynamic decoder layout.
+// Gemma4 A4B reserves 1,080 additional descriptors (30 layers * 12 resident
+// experts * gate/up/down) without displacing any existing slot assignment.
+pub const decoder_runtime_linear_slot_capacity: usize = 2048;
 
 pub const RawQuantizedRuntimeLinearKind = enum {
     none,
@@ -6707,7 +6710,13 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         request.prefer_f32_mps_fallback
     else
         false;
-    if (self.raw_linear_slots_prepared[request.slot] and
+    const force_replace = if (@hasField(@TypeOf(request), "force_replace")) request.force_replace else false;
+    const borrow_quantized_storage = if (@hasField(@TypeOf(request), "borrow_quantized_storage"))
+        request.borrow_quantized_storage
+    else
+        false;
+    if (!force_replace and
+        self.raw_linear_slots_prepared[request.slot] and
         self.raw_linear_slot_in_dims[request.slot] == request.in_dim and
         self.raw_linear_slot_out_dims[request.slot] == request.out_dim and
         ((request.quantized_storage != null and
@@ -6875,7 +6884,10 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         }
 
         stats.decoder_runtime_prepare_linear_calls += 1;
-        self.raw_linear_slot_quantized_storage[request.slot] = try dupQuantizedStorage(storage);
+        self.raw_linear_slot_quantized_storage[request.slot] = if (borrow_quantized_storage)
+            try borrowQuantizedStorage(storage)
+        else
+            try dupQuantizedStorage(storage);
         setRuntimeQuantMappedDisabled(self, request.slot, disable_mapped_quant_weight);
         self.raw_linear_slot_kinds[request.slot] = .quantized;
         self.raw_linear_slots_prepared[request.slot] = true;
@@ -15056,6 +15068,22 @@ pub extern fn termite_metal_decode_runtime_prepare_quantized_linear_slot_no_copy
     in_dim: usize,
     out_dim: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_prepare_q4_0_expert_slot_no_copy_region(
+    runtime: ?*RawMetalDecodeRuntime,
+    gate_slot: usize,
+    up_slot: usize,
+    down_slot: usize,
+    mapped_raw: [*c]const u8,
+    mapped_bytes: usize,
+    gate_offset: usize,
+    gate_bytes: usize,
+    up_offset: usize,
+    up_bytes: usize,
+    down_offset: usize,
+    down_bytes: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_prepare_bitnet_tl1_linear_slot(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
@@ -18185,7 +18213,7 @@ fn mappedDenseRawSpan(bytes: []const u8, mapped: []const u8, expected_bytes: usi
     const source_offset = ptr_value - mapped_base;
     if (source_offset > mapped.len or expected_bytes > mapped.len - source_offset) return null;
 
-    const page_size = std.heap.page_size_min;
+    const page_size = std.heap.pageSize();
     const aligned_start = ptr_value - (ptr_value % page_size);
     if (aligned_start < mapped_base) return null;
     const weight_offset = ptr_value - aligned_start;
@@ -18210,7 +18238,7 @@ fn mappedQuantRawSpan(storage: *const QuantizedStorage, raw_bytes: []const u8, o
     if (raw_bytes.len == 0) return null;
     if (raw_bytes.ptr != storage.raw_bytes.ptr or raw_bytes.len != storage.raw_bytes.len) return null;
 
-    const page_size = std.heap.page_size_min;
+    const page_size = std.heap.pageSize();
     const ptr_value = @intFromPtr(raw_bytes.ptr);
     if (ptr_value % page_size == 0 and raw_bytes.len % page_size == 0) {
         return .{
@@ -18943,6 +18971,141 @@ pub fn dupQuantizedStorage(storage: *const QuantizedStorage) !*QuantizedStorage 
         owned.setPreparedBytes(@enumFromInt(idx), bytes, buffer.panel_cols, buffer.row_blocks);
     }
     return owned;
+}
+
+/// Create an owning metadata wrapper around externally owned quantized bytes.
+/// This is only safe while the source storage remains alive; compact streamed
+/// expert callers enforce that lifetime by clearing every prepared slot before
+/// unpinning its lazy weight.
+fn borrowQuantizedStorage(storage: *const QuantizedStorage) !*QuantizedStorage {
+    if (storage.prepared.ownedBytes() != 0 or storage.prepared_group_cache != null) {
+        return error.PreparedQuantizedStorageCannotBeBorrowed;
+    }
+    const owned = try std.heap.c_allocator.create(QuantizedStorage);
+    errdefer std.heap.c_allocator.destroy(owned);
+    const shape = try std.heap.c_allocator.dupe(i64, storage.shape);
+    errdefer std.heap.c_allocator.free(shape);
+    owned.* = .{
+        .tensor_type = storage.tensor_type,
+        .raw_bytes = storage.raw_bytes,
+        .shape = shape,
+        .packed_expert = storage.packed_expert,
+        .raw_owned = false,
+        .raw_mmap_backed = storage.raw_mmap_backed,
+        .allocator = std.heap.c_allocator,
+    };
+    return owned;
+}
+
+/// Publish a page-aligned Gemma 4 Q4_0 expert arena as gate/up/down views.
+/// The Objective-C side constructs exactly one no-copy MTLBuffer and installs
+/// all three offsets only after validating the full descriptor. The borrowed
+/// Zig metadata keeps the arena views alive until all three slots are cleared.
+pub fn decoderRuntimePrepareQ40ExpertArena(
+    self: anytype,
+    slots: [3]usize,
+    storages: [3]*const QuantizedStorage,
+    arena: []const u8,
+    offsets: [3]usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or
+        hidden_size == 0 or intermediate_size == 0 or arena.len == 0)
+    {
+        return false;
+    }
+    if (slots[0] >= decoder_runtime_linear_slot_capacity or
+        slots[1] >= decoder_runtime_linear_slot_capacity or
+        slots[2] >= decoder_runtime_linear_slot_capacity or
+        slots[0] == slots[1] or slots[0] == slots[2] or slots[1] == slots[2])
+    {
+        return false;
+    }
+    for (storages, offsets, 0..) |storage, offset, index| {
+        if (quantizedRuntimeLinearKind(storage) != .q4_0) return false;
+        if (offset > arena.len or storage.raw_bytes.len > arena.len - offset) return false;
+        if (storage.raw_bytes.ptr != arena.ptr + offset) return false;
+        const in_dim = if (index == 2) intermediate_size else hidden_size;
+        const out_dim = if (index == 2) hidden_size else intermediate_size;
+        _ = packedWeightDescriptorForMatrix(storage, in_dim, out_dim, .q4_0) orelse return false;
+    }
+
+    var borrowed: [3]*QuantizedStorage = undefined;
+    var borrowed_count: usize = 0;
+    errdefer for (borrowed[0..borrowed_count]) |storage| {
+        storage.deinit();
+        std.heap.c_allocator.destroy(storage);
+    };
+    for (storages, 0..) |storage, index| {
+        borrowed[index] = try borrowQuantizedStorage(storage);
+        borrowed_count += 1;
+    }
+
+    // Clearing happens before the single atomic C publication. If validation
+    // or MTLBuffer creation fails, the three slots remain visibly absent.
+    for (slots) |slot| clearRawLinearSlot(self, slot);
+    incrementRuntimeQuantMappedAttempts(self);
+    const started_at = monotonicNowNs();
+    const rc = termite_metal_decode_runtime_prepare_q4_0_expert_slot_no_copy_region(
+        runtime,
+        slots[0],
+        slots[1],
+        slots[2],
+        arena.ptr,
+        arena.len,
+        offsets[0],
+        storages[0].raw_bytes.len,
+        offsets[1],
+        storages[1].raw_bytes.len,
+        offsets[2],
+        storages[2].raw_bytes.len,
+        hidden_size,
+        intermediate_size,
+    );
+    addRuntimeQuantMappedPrepareNanos(self, monotonicNowNs() - started_at);
+    if (rc != 0) {
+        incrementRuntimeQuantMappedFailures(self);
+        for (borrowed[0..borrowed_count]) |storage| {
+            storage.deinit();
+            std.heap.c_allocator.destroy(storage);
+        }
+        borrowed_count = 0;
+        return false;
+    }
+
+    for (slots, 0..) |slot, index| {
+        self.raw_linear_slot_quantized_storage[slot] = borrowed[index];
+        self.raw_linear_slot_kinds[slot] = .quantized;
+        self.raw_linear_slot_in_dims[slot] = if (index == 2) intermediate_size else hidden_size;
+        self.raw_linear_slot_out_dims[slot] = if (index == 2) hidden_size else intermediate_size;
+        self.raw_linear_slot_runtime_prepared_kind[slot] = .q4_0;
+        self.raw_linear_slots_prepared[slot] = true;
+        setRuntimeQuantMappedDisabled(self, slot, false);
+        setRuntimeQuantPrepareMode(self, slot, .mapped_shared);
+    }
+    borrowed_count = 0;
+    return true;
+}
+
+test "borrowQuantizedStorage borrows raw bytes and owns only metadata" {
+    var raw: [34]u8 = [_]u8{0x5a} ** 34;
+    const shape = [_]i64{ 1, 32 };
+    const storage = QuantizedStorage{
+        .tensor_type = .{ .known = .Q8_0 },
+        .raw_bytes = &raw,
+        .shape = &shape,
+        .raw_owned = false,
+        .allocator = std.testing.allocator,
+    };
+
+    const borrowed = try borrowQuantizedStorage(&storage);
+    try std.testing.expect(borrowed.raw_bytes.ptr == storage.raw_bytes.ptr);
+    try std.testing.expect(!borrowed.raw_owned);
+    borrowed.deinit();
+    std.heap.c_allocator.destroy(borrowed);
+    try std.testing.expectEqual(@as(u8, 0x5a), raw[0]);
 }
 
 test "dupQuantizedStorage preserves mmap backing metadata" {

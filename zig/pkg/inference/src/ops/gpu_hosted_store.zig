@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const platform = @import("antfly_platform");
 const runtime = @import("../runtime/root.zig");
 const tensor_store_mod = @import("../models/tensor_store.zig");
 const weight_source_mod = @import("../models/weight_source.zig");
@@ -216,6 +217,8 @@ pub const WeightStore = struct {
     access_epoch: u64 = 1,
     packed_expert_views: std.StringHashMapUnmanaged(PackedExpertViewEntry) = .empty,
     packed_expert_view_bytes: usize = 0,
+    parallel_quant_loader: ParallelQuantLoader = .{},
+    parallel_expert_loader: ParallelExpertLoader = .{},
     shared_metal_native_provider: if (supports_native_metal_provider) ?*metal_native_provider_mod.MetalNativeProvider else void =
         if (supports_native_metal_provider) null else {},
     shared_metal_native_provider_lock: if (supports_native_metal_provider) std.Io.Mutex else void =
@@ -266,6 +269,8 @@ pub fn stopPrefetchWorker(data: *WeightStore) void {
 }
 
 pub fn deinitPrefetchQueue(data: *WeightStore) void {
+    data.parallel_quant_loader.deinit();
+    data.parallel_expert_loader.deinit();
     if (!data.prefetch_initialized) return;
     data.prefetch.deinit();
     data.prefetch_initialized = false;
@@ -300,6 +305,7 @@ pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEn
             if (entry.loaded_bytes != 0) {
                 if (data.tier_cache) |*tier_cache| tier_cache.noteResident(.host, entry.loaded_bytes);
             }
+            try noteExpertLoadedAndEvict(data, entry);
             return;
         }
     }
@@ -322,6 +328,471 @@ pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEn
     entry.active_tier = if (entry.loaded_bytes == 0) .disk else .host;
     if (entry.loaded_bytes != 0) {
         if (data.tier_cache) |*tier_cache| tier_cache.noteResident(.host, entry.loaded_bytes);
+    }
+    try noteExpertLoadedAndEvict(data, entry);
+}
+
+const ParallelQuantLoadTask = struct {
+    tensor_store: tensor_store_mod.TensorStore,
+    entry: *LazyWeightEntry,
+    storage: ?QuantizedStorage = null,
+    load_error: ?anyerror = null,
+};
+
+fn parallelQuantLoadMain(task: *ParallelQuantLoadTask) void {
+    task.storage = task.tensor_store.loadQuantizedStorageRef(&task.entry.tensor_ref) catch |err| {
+        task.load_error = err;
+        return;
+    };
+}
+
+const ParallelQuantLoader = struct {
+    const max_worker_count = 8;
+
+    mutex: std.atomic.Mutex = .unlocked,
+    workers: [max_worker_count]?std.Thread = [_]?std.Thread{null} ** max_worker_count,
+    worker_count: usize = 0,
+    tasks: ?[]ParallelQuantLoadTask = null,
+    next_task: usize = 0,
+    completed_tasks: usize = 0,
+    stop_workers: bool = false,
+
+    fn lock(self: *ParallelQuantLoader) void {
+        while (!self.mutex.tryLock()) platform.time.yieldBriefly();
+    }
+
+    fn unlock(self: *ParallelQuantLoader) void {
+        self.mutex.unlock();
+    }
+
+    fn ensureStarted(self: *ParallelQuantLoader, requested_workers: usize) !void {
+        if (self.worker_count != 0) return;
+        const count = @min(@as(usize, max_worker_count), @max(@as(usize, 1), requested_workers));
+        self.stop_workers = false;
+        for (0..count) |index| {
+            self.workers[index] = try std.Thread.spawn(.{}, workerMain, .{self});
+            self.worker_count += 1;
+        }
+    }
+
+    fn workerMain(self: *ParallelQuantLoader) void {
+        while (true) {
+            var task: ?*ParallelQuantLoadTask = null;
+            self.lock();
+            if (self.stop_workers) {
+                self.unlock();
+                return;
+            }
+            if (self.tasks) |tasks| {
+                if (self.next_task < tasks.len) {
+                    task = &tasks[self.next_task];
+                    self.next_task += 1;
+                }
+            }
+            self.unlock();
+
+            if (task) |load_task| {
+                parallelQuantLoadMain(load_task);
+                self.lock();
+                self.completed_tasks += 1;
+                self.unlock();
+            } else {
+                platform.time.yieldBriefly();
+            }
+        }
+    }
+
+    fn begin(self: *ParallelQuantLoader, tasks: []ParallelQuantLoadTask, requested_workers: usize) !void {
+        if (tasks.len == 0) return;
+        if (requested_workers <= 1) {
+            for (tasks) |*task| parallelQuantLoadMain(task);
+            return;
+        }
+        try self.ensureStarted(requested_workers);
+        self.lock();
+        self.tasks = tasks;
+        self.next_task = 0;
+        self.completed_tasks = 0;
+        self.unlock();
+    }
+
+    fn wait(self: *ParallelQuantLoader, task_count: usize) void {
+        if (task_count == 0 or self.tasks == null) return;
+        while (true) {
+            self.lock();
+            const complete = self.completed_tasks == task_count;
+            if (complete) self.tasks = null;
+            self.unlock();
+            if (complete) return;
+            platform.time.yieldBriefly();
+        }
+    }
+
+    fn run(self: *ParallelQuantLoader, tasks: []ParallelQuantLoadTask, requested_workers: usize) !void {
+        try self.begin(tasks, requested_workers);
+        self.wait(tasks.len);
+    }
+
+    fn deinit(self: *ParallelQuantLoader) void {
+        if (self.worker_count == 0) return;
+        self.lock();
+        self.stop_workers = true;
+        self.unlock();
+        for (self.workers[0..self.worker_count]) |worker| if (worker) |handle| handle.join();
+        self.* = .{};
+    }
+};
+
+pub const ResidentExpertLoadRequest = struct {
+    entries: [3]*LazyWeightEntry,
+    destination: []u8,
+};
+
+const ParallelExpertLoadTask = struct {
+    tensor_store: tensor_store_mod.TensorStore,
+    refs: [3]tensor_store_mod.LazyTensorRef,
+    destination: []u8,
+    layout: ?tensor_store_mod.QuantizedExpertLayout = null,
+    load_error: ?anyerror = null,
+};
+
+fn parallelExpertLoadMain(task: *ParallelExpertLoadTask) void {
+    task.layout = task.tensor_store.loadQuantizedExpertInto(
+        std.heap.c_allocator,
+        &task.refs,
+        task.destination,
+    ) catch |err| {
+        task.load_error = err;
+        return;
+    };
+}
+
+const ParallelExpertLoader = struct {
+    const max_worker_count = 8;
+
+    mutex: std.atomic.Mutex = .unlocked,
+    workers: [max_worker_count]?std.Thread = [_]?std.Thread{null} ** max_worker_count,
+    worker_count: usize = 0,
+    tasks: ?[]ParallelExpertLoadTask = null,
+    next_task: usize = 0,
+    completed_tasks: usize = 0,
+    stop_workers: bool = false,
+
+    fn lock(self: *ParallelExpertLoader) void {
+        while (!self.mutex.tryLock()) platform.time.yieldBriefly();
+    }
+
+    fn unlock(self: *ParallelExpertLoader) void {
+        self.mutex.unlock();
+    }
+
+    fn ensureStarted(self: *ParallelExpertLoader, requested_workers: usize) !void {
+        if (self.worker_count != 0) return;
+        const count = @min(@as(usize, max_worker_count), @max(@as(usize, 1), requested_workers));
+        self.stop_workers = false;
+        for (0..count) |index| {
+            self.workers[index] = try std.Thread.spawn(.{}, workerMain, .{self});
+            self.worker_count += 1;
+        }
+    }
+
+    fn workerMain(self: *ParallelExpertLoader) void {
+        while (true) {
+            var task: ?*ParallelExpertLoadTask = null;
+            self.lock();
+            if (self.stop_workers) {
+                self.unlock();
+                return;
+            }
+            if (self.tasks) |tasks| {
+                if (self.next_task < tasks.len) {
+                    task = &tasks[self.next_task];
+                    self.next_task += 1;
+                }
+            }
+            self.unlock();
+
+            if (task) |load_task| {
+                parallelExpertLoadMain(load_task);
+                self.lock();
+                self.completed_tasks += 1;
+                self.unlock();
+            } else {
+                platform.time.yieldBriefly();
+            }
+        }
+    }
+
+    fn begin(self: *ParallelExpertLoader, tasks: []ParallelExpertLoadTask, requested_workers: usize) !void {
+        if (tasks.len == 0) return;
+        try self.ensureStarted(requested_workers);
+        self.lock();
+        if (self.tasks != null) {
+            self.unlock();
+            return error.ExpertLoaderBusy;
+        }
+        self.tasks = tasks;
+        self.next_task = 0;
+        self.completed_tasks = 0;
+        self.unlock();
+    }
+
+    fn wait(self: *ParallelExpertLoader, task_count: usize) void {
+        if (task_count == 0) return;
+        while (true) {
+            self.lock();
+            const complete = self.completed_tasks == task_count;
+            if (complete) self.tasks = null;
+            self.unlock();
+            if (complete) return;
+            platform.time.yieldBriefly();
+        }
+    }
+
+    fn run(self: *ParallelExpertLoader, tasks: []ParallelExpertLoadTask, requested_workers: usize) !void {
+        try self.begin(tasks, requested_workers);
+        self.wait(tasks.len);
+    }
+
+    fn deinit(self: *ParallelExpertLoader) void {
+        if (self.worker_count == 0) return;
+        self.lock();
+        self.stop_workers = true;
+        self.unlock();
+        for (self.workers[0..self.worker_count]) |worker| if (worker) |handle| handle.join();
+        self.* = .{};
+    }
+};
+
+pub const ResidentExpertLoadBatch = struct {
+    data: *WeightStore,
+    tasks: []ParallelExpertLoadTask,
+    active: bool = true,
+
+    pub fn finish(
+        self: *ResidentExpertLoadBatch,
+        outputs: []?tensor_store_mod.QuantizedExpertLayout,
+    ) !void {
+        if (!self.active or outputs.len != self.tasks.len) return error.InvalidTensorShape;
+        self.data.parallel_expert_loader.wait(self.tasks.len);
+        self.active = false;
+        defer {
+            self.data.allocator.free(self.tasks);
+            self.tasks = &.{};
+        }
+        errdefer for (self.tasks) |*task| if (task.layout) |*layout| layout.deinit();
+
+        for (self.tasks, 0..) |*task, index| {
+            if (task.load_error) |err| return err;
+            outputs[index] = task.layout orelse return error.UnsupportedTensorType;
+            task.layout = null;
+        }
+    }
+
+    pub fn deinit(self: *ResidentExpertLoadBatch) void {
+        if (self.tasks.len == 0) return;
+        if (self.active) self.data.parallel_expert_loader.wait(self.tasks.len);
+        for (self.tasks) |*task| if (task.layout) |*layout| layout.deinit();
+        self.data.allocator.free(self.tasks);
+        self.tasks = &.{};
+        self.active = false;
+    }
+};
+
+/// Start whole-expert preads and return immediately. Only the caller-owned
+/// destination arenas and immutable tensor-store references are touched on
+/// loader threads; publishing layouts and preparing Metal slots stay on the
+/// inference thread in `ResidentExpertLoadBatch.finish`.
+pub fn beginResidentExpertLayoutsParallel(
+    data: *WeightStore,
+    requests: []const ResidentExpertLoadRequest,
+    max_workers: usize,
+) !ResidentExpertLoadBatch {
+    const tensor_store = data.tensor_store orelse return error.MissingWeight;
+    const tasks = try data.allocator.alloc(ParallelExpertLoadTask, requests.len);
+    errdefer data.allocator.free(tasks);
+
+    for (requests, 0..) |request, index| {
+        for (request.entries) |entry| touchLazyWeight(data, entry);
+        tasks[index] = .{
+            .tensor_store = tensor_store,
+            .refs = .{
+                request.entries[0].tensor_ref,
+                request.entries[1].tensor_ref,
+                request.entries[2].tensor_ref,
+            },
+            .destination = request.destination,
+        };
+    }
+    try data.parallel_expert_loader.begin(tasks, @max(@as(usize, 1), max_workers));
+    return .{ .data = data, .tasks = tasks };
+}
+
+/// Load whole experts concurrently. Each task performs one fused gate/up
+/// pread and one down pread into a caller-owned, page-aligned Metal-visible
+/// arena. No projection bytes are retained in the generic lazy cache.
+pub fn loadResidentExpertLayoutsParallel(
+    data: *WeightStore,
+    requests: []const ResidentExpertLoadRequest,
+    outputs: []?tensor_store_mod.QuantizedExpertLayout,
+    max_workers: usize,
+) !void {
+    if (requests.len != outputs.len) return error.InvalidTensorShape;
+    @memset(outputs, null);
+    var batch = try beginResidentExpertLayoutsParallel(data, requests, max_workers);
+    defer batch.deinit();
+    try batch.finish(outputs);
+}
+
+/// Load independent quantized tensor ranges concurrently and publish them as
+/// one protected route batch.
+pub fn ensureHostLazyWeightsLoadedParallel(
+    data: *WeightStore,
+    entries: []const *LazyWeightEntry,
+    max_workers: usize,
+) !void {
+    const tensor_store = data.tensor_store orelse return error.MissingWeight;
+    const tasks = try data.allocator.alloc(ParallelQuantLoadTask, entries.len);
+    defer data.allocator.free(tasks);
+
+    var pending_count: usize = 0;
+    data.prefetch.lock();
+    for (entries) |entry| {
+        touchLazyWeight(data, entry);
+        if (entry.host_loaded != null or (entry.quantized_storage != null and !entry.prefer_dense)) continue;
+        entry.pending_prefetch = true;
+        tasks[pending_count] = .{ .tensor_store = tensor_store, .entry = entry };
+        pending_count += 1;
+    }
+    data.prefetch.unlock();
+    const active_tasks = tasks[0..pending_count];
+    errdefer {
+        data.prefetch.lock();
+        defer data.prefetch.unlock();
+        for (active_tasks) |task| task.entry.pending_prefetch = false;
+    }
+
+    try data.parallel_quant_loader.run(active_tasks, @max(@as(usize, 1), max_workers));
+    defer for (active_tasks) |*task| {
+        if (task.storage) |*storage| storage.deinit();
+    };
+
+    data.prefetch.lock();
+    defer data.prefetch.unlock();
+    for (active_tasks) |*task| {
+        if (task.load_error) |err| {
+            for (active_tasks) |cleanup| cleanup.entry.pending_prefetch = false;
+            return err;
+        }
+        const storage = task.storage orelse {
+            for (active_tasks) |cleanup| cleanup.entry.pending_prefetch = false;
+            return error.UnsupportedTensorType;
+        };
+        if (task.entry.host_loaded != null or (task.entry.quantized_storage != null and !task.entry.prefer_dense)) {
+            var redundant = storage;
+            redundant.deinit();
+            task.storage = null;
+            task.entry.pending_prefetch = false;
+            continue;
+        }
+        task.storage = null;
+        task.entry.quantized_storage = storage;
+        task.entry.loaded_bytes = storage.raw_bytes.len + storage.prepared.ownedBytes();
+        task.entry.active_tier = .host;
+        task.entry.pending_prefetch = false;
+        if (task.entry.loaded_bytes != 0) {
+            if (data.tier_cache) |*tier_cache| tier_cache.noteResident(.host, task.entry.loaded_bytes);
+        }
+        if (task.entry.expert_coord) |coord| {
+            if (data.residency) |*residency| {
+                try residency.noteLoad(coord, data.moe_num_experts, task.entry.projection_mask, task.entry.loaded_bytes);
+            }
+        }
+    }
+
+    if (data.residency) |*residency| {
+        for (entries) |entry| {
+            const coord = entry.expert_coord orelse continue;
+            while (residency.isOverCapacity(coord.layer_index)) {
+                const victim = findSimpleExpertVictimAvoiding(data, coord.layer_index, entries) orelse break;
+                unloadSimpleExpert(data, victim);
+            }
+        }
+    }
+}
+
+fn noteExpertLoadedAndEvict(data: *WeightStore, entry: *LazyWeightEntry) !void {
+    const coord = entry.expert_coord orelse return;
+    if (data.residency) |*residency| {
+        try residency.noteLoad(coord, data.moe_num_experts, entry.projection_mask, entry.loaded_bytes);
+        while (residency.isOverCapacity(coord.layer_index)) {
+            const protected = [_]*LazyWeightEntry{entry};
+            const victim = findSimpleExpertVictimAvoiding(data, coord.layer_index, &protected) orelse break;
+            unloadSimpleExpert(data, victim);
+        }
+    }
+}
+
+fn findSimpleExpertVictimAvoiding(
+    data: *WeightStore,
+    layer_index: usize,
+    protected_entries: []const *LazyWeightEntry,
+) ?ExpertCoord {
+    const residency = if (data.residency) |*value| value else return null;
+    var victim: ?ExpertCoord = null;
+    var it = data.lazy_weights.iterator();
+    while (it.next()) |map_entry| {
+        const entry = map_entry.value_ptr;
+        const coord = entry.expert_coord orelse continue;
+        if (coord.layer_index != layer_index or expertIsProtected(coord, protected_entries)) continue;
+        if (entry.quantized_storage == null and entry.host_loaded == null) continue;
+        if (!simpleExpertCanEvict(data, coord)) continue;
+        if (victim == null or residency.isMoreEvictable(coord, victim.?)) victim = coord;
+    }
+    return victim;
+}
+
+fn expertIsProtected(coord: ExpertCoord, protected_entries: []const *LazyWeightEntry) bool {
+    for (protected_entries) |entry| {
+        const protected = entry.expert_coord orelse continue;
+        if (protected.layer_index == coord.layer_index and protected.expert_index == coord.expert_index) return true;
+    }
+    return false;
+}
+
+fn simpleExpertCanEvict(data: *WeightStore, coord: ExpertCoord) bool {
+    var found = false;
+    var it = data.lazy_weights.iterator();
+    while (it.next()) |map_entry| {
+        const entry = map_entry.value_ptr;
+        const entry_coord = entry.expert_coord orelse continue;
+        if (entry_coord.layer_index != coord.layer_index or entry_coord.expert_index != coord.expert_index) continue;
+        if (entry.quantized_storage == null and entry.host_loaded == null) continue;
+        found = true;
+        if (entry.pin_count != 0) return false;
+    }
+    return found;
+}
+
+fn unloadSimpleExpert(data: *WeightStore, coord: ExpertCoord) void {
+    var it = data.lazy_weights.iterator();
+    while (it.next()) |map_entry| {
+        const entry = map_entry.value_ptr;
+        const entry_coord = entry.expert_coord orelse continue;
+        if (entry_coord.layer_index != coord.layer_index or entry_coord.expert_index != coord.expert_index) continue;
+        if (entry.pin_count != 0) continue;
+
+        const released_bytes = entry.loaded_bytes;
+        if (entry.quantized_storage) |*storage| storage.deinit();
+        entry.quantized_storage = null;
+        if (entry.host_loaded) |*loaded| loaded.deinit();
+        entry.host_loaded = null;
+        entry.loaded_bytes = 0;
+        entry.active_tier = .disk;
+        if (released_bytes != 0) {
+            if (data.tier_cache) |*tier_cache| tier_cache.noteRelease(.host, released_bytes);
+            if (data.residency) |*residency| residency.noteUnload(coord, entry.projection_mask, released_bytes);
+        }
     }
 }
 

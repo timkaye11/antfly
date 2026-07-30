@@ -397,6 +397,14 @@ pub const DecoderRuntimePrepareLinearRequest = struct {
     prefer_bf16_fallback: bool = false,
     prefer_f16_mps_fallback: bool = false,
     prefer_f32_mps_fallback: bool = false,
+    /// Replace an existing slot even when its dimensions and encoding match.
+    /// Callers must complete every command that references the old contents
+    /// before setting this flag.
+    force_replace: bool = false,
+    /// Keep quantized bytes borrowed from `weight` instead of cloning them
+    /// into the runtime slot. The caller must clear the slot before releasing
+    /// the weight that owns those bytes.
+    borrow_quantized_storage: bool = false,
 };
 
 pub const DecoderRuntimeEnsureLinearSlotRequest = struct {

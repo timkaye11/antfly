@@ -56,6 +56,7 @@ const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
 
 const print = std.debug.print;
 const BackendChoice = native_backend_choice.Choice;
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 const ExecutionMode = enum {
     eager,
@@ -63,6 +64,10 @@ const ExecutionMode = enum {
 };
 
 const CompiledTarget = graph_mod.compiled_backend.AttachmentTarget;
+
+const MemoryProfile = enum {
+    compact_2gbs,
+};
 
 fn debugGenerateSetup(comptime fmt: []const u8, args: anytype) void {
     if (!platform.env.getenvBool("TERMITE_GEN_STAGE_DEBUG")) return;
@@ -111,6 +116,8 @@ const Options = struct {
     combined_budget_mb: usize = 0,
     kv_budget_mb: usize = 0,
     scratch_budget_mb: usize = 0,
+    memory_profile: ?MemoryProfile = null,
+    expert_cache_slots: usize = 0,
     raw_prompt: bool = false,
     no_bos: bool = false,
     raw_decode_bench: bool = false,
@@ -286,6 +293,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         if (!serverGenerateSupportsOptions(opts)) return error.UnsupportedServerGenerateOption;
         return error.WarmInferenceServerUnavailable;
     }
+    try configureMemoryProfileProcess(opts);
 
     var preflight_draft_gpt_config: ?gpt_mod.Config = null;
     const effective_draft_model = if (opts.speculation_policy == .off) null else if (opts.backend == .metal and opts.speculation_policy == .auto) blk: {
@@ -1211,6 +1219,24 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             printMetalQuantDispatchSummary(
                 metal_snapshot,
                 metalStatsWithRuntimePlanCounters(graph_generate_stats, metal_snapshot.provider),
+            );
+            print(
+                "metal_compact_expert_cache: resident_slots={d}/{d} resident_bytes={d} hits={d} misses={d} load_bytes={d} whole_publications={d} projection_prepares={d} fused_frames={d}/{d} fused_fallbacks={d} device_input_reuses={d} host_transfers={d}\n",
+                .{
+                    metal_snapshot.provider.metal_compact_expert_resident_slots,
+                    metal_snapshot.provider.metal_compact_expert_cache_capacity,
+                    metal_snapshot.provider.metal_compact_expert_resident_bytes,
+                    metal_snapshot.provider.metal_compact_expert_cache_hits,
+                    metal_snapshot.provider.metal_compact_expert_cache_misses,
+                    metal_snapshot.provider.metal_compact_expert_load_bytes,
+                    metal_snapshot.provider.metal_compact_expert_whole_publications,
+                    metal_snapshot.provider.metal_compact_expert_projection_prepares,
+                    metal_snapshot.provider.metal_compact_expert_fused_frame_successes,
+                    metal_snapshot.provider.metal_compact_expert_fused_frame_attempts,
+                    metal_snapshot.provider.metal_compact_expert_fused_frame_fallbacks,
+                    metal_snapshot.provider.metal_compact_expert_device_input_reuses,
+                    metal_snapshot.provider.metal_compact_expert_host_transfers,
+                },
             );
             print(
                 "metal_gated_quantized_block: calls={d} quantized_branch={d} attn_calls={d} attn_nulls={d} attn_prefill_nulls={d} attn_decode_nulls={d} norm_nulls={d} f32_kv_calls={d} f32_kv_ok={d} f32_kv_nulls={d} f32_quant_direct_ok={d} f32_quant_direct_fail={d} compressed_f32_reroutes={d} active_bootstrap_misses={d}\n",
@@ -3373,8 +3399,23 @@ fn metalStatsCompactJson(
         \\"runtime_mapped_attempts":{d},
         \\"runtime_mapped_fallbacks":{d},
         \\"runtime_mapped_failures":{d},
+        \\"compact_expert_cache_capacity":{d},
+        \\"compact_expert_resident_slots":{d},
+        \\"compact_expert_resident_bytes":{d},
+        \\"compact_expert_cache_hits":{d},
+        \\"compact_expert_cache_misses":{d},
+        \\"compact_expert_load_bytes":{d},
         \\"active_frame_bootstrap_misses":{d},
         \\"misses":{d}
+        \\}},
+        \\"compact_expert_execution\":{{
+        \\"whole_publications\":{d},
+        \\"projection_prepares\":{d},
+        \\"fused_frame_attempts\":{d},
+        \\"fused_frame_successes\":{d},
+        \\"fused_frame_fallbacks\":{d},
+        \\"device_input_reuses\":{d},
+        \\"host_transfers\":{d}
         \\}}
         \\}}
     ,
@@ -3390,8 +3431,21 @@ fn metalStatsCompactJson(
             provider.metal_provider_quantized_runtime_mapped_attempts,
             provider.metal_provider_quantized_runtime_mapped_fallbacks,
             provider.metal_provider_quantized_runtime_mapped_failures,
+            provider.metal_compact_expert_cache_capacity,
+            provider.metal_compact_expert_resident_slots,
+            provider.metal_compact_expert_resident_bytes,
+            provider.metal_compact_expert_cache_hits,
+            provider.metal_compact_expert_cache_misses,
+            provider.metal_compact_expert_load_bytes,
             provider.compressed_block_active_frame_bootstrap_misses,
             metalResidencyMisses(provider),
+            provider.metal_compact_expert_whole_publications,
+            provider.metal_compact_expert_projection_prepares,
+            provider.metal_compact_expert_fused_frame_attempts,
+            provider.metal_compact_expert_fused_frame_successes,
+            provider.metal_compact_expert_fused_frame_fallbacks,
+            provider.metal_compact_expert_device_input_reuses,
+            provider.metal_compact_expert_host_transfers,
         },
     );
     return try out.toOwnedSlice(allocator);
@@ -5224,6 +5278,7 @@ fn liveWholeModelDeclineError(err: anyerror) bool {
 
 fn liveWholeModelExecutorRequested(opts: *const Options) bool {
     if (envFlagEnabled("TERMITE_METAL_DISABLE_LIVE_WHOLE_MODEL_EXECUTOR")) return false;
+    if (opts.memory_profile == .compact_2gbs) return false;
     const explicit_whole_model = opts.mode != null and opts.mode.? == .compiled and
         opts.compiled_target != null and opts.compiled_target.? == .whole_model;
     if (explicit_whole_model) return false;
@@ -6454,6 +6509,7 @@ fn serverGenerateSupportsOptions(opts: Options) bool {
         !opts.debug_mtp and
         !opts.debug_gemma4_target and
         !opts.disable_gemma_embedding_scale and
+        opts.memory_profile == null and
         opts.prefill_chunk_size == 0 and
         opts.host_budget_mb == 0 and
         opts.backend_budget_mb == 0 and
@@ -6724,6 +6780,17 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingScratchBudget;
             opts.scratch_budget_mb = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--memory-profile")) {
+            i += 1;
+            if (i >= args.len) return error.MissingMemoryProfile;
+            opts.memory_profile = parseMemoryProfile(args[i]) orelse return error.InvalidMemoryProfile;
+        } else if (std.mem.eql(u8, arg, "--expert-cache-slots")) {
+            i += 1;
+            if (i >= args.len) return error.MissingExpertCacheSlots;
+            opts.expert_cache_slots = try std.fmt.parseInt(usize, args[i], 10);
+            if (opts.expert_cache_slots != 8 and opts.expert_cache_slots != 12 and opts.expert_cache_slots != 16) {
+                return error.InvalidExpertCacheSlots;
+            }
         } else if (std.mem.eql(u8, arg, "--server")) {
             i += 1;
             if (i >= args.len) return error.MissingServerUrl;
@@ -6736,7 +6803,54 @@ fn parseArgs(args: []const []const u8) !Options {
         }
     }
 
+    try applyMemoryProfile(&opts);
     return opts;
+}
+
+fn parseMemoryProfile(value: []const u8) ?MemoryProfile {
+    if (std.mem.eql(u8, value, "2gbs") or std.mem.eql(u8, value, "2gb")) return .compact_2gbs;
+    return null;
+}
+
+fn applyMemoryProfile(opts: *Options) !void {
+    const profile = opts.memory_profile orelse {
+        if (opts.expert_cache_slots != 0) return error.ExpertCacheSlotsRequireMemoryProfile;
+        return;
+    };
+    switch (profile) {
+        .compact_2gbs => {
+            if (opts.backend == .auto) opts.backend = .metal;
+            if (opts.backend != .metal) return error.MemoryProfileRequiresMetal;
+            if (opts.mode == null) opts.mode = .eager;
+            if (opts.mode.? != .eager) return error.MemoryProfileRequiresEager;
+            if (opts.prefill_chunk_size == 0) opts.prefill_chunk_size = 128;
+            if (opts.cache_dtype == null) opts.cache_dtype = "f16";
+            if (opts.host_budget_mb == 0) opts.host_budget_mb = 2048;
+            if (opts.backend_budget_mb == 0) opts.backend_budget_mb = 2048;
+            if (opts.combined_budget_mb == 0) opts.combined_budget_mb = 2048;
+            if (opts.kv_budget_mb == 0) opts.kv_budget_mb = 384;
+            if (opts.scratch_budget_mb == 0) opts.scratch_budget_mb = 384;
+            if (opts.expert_cache_slots == 0) opts.expert_cache_slots = 12;
+        },
+    }
+}
+
+fn configureMemoryProfileProcess(opts: Options) !void {
+    if (opts.memory_profile != .compact_2gbs) return;
+    // The command runs in its own process, so this process-local cache setting
+    // cannot leak into server models or another invocation.
+    const expert_slots_value: [*:0]const u8 = switch (opts.expert_cache_slots) {
+        8 => "8",
+        12 => "12",
+        16 => "16",
+        else => return error.InvalidExpertCacheSlots,
+    };
+    if (setenv("ANTFLY_GEMMA4_COMPACT_EXPERT_SLOTS", expert_slots_value, 1) != 0) {
+        return error.MemoryProfileConfigurationFailed;
+    }
+    if (setenv("ANTFLY_GEMMA4_COMPACT_IO_READERS", "4", 1) != 0) {
+        return error.MemoryProfileConfigurationFailed;
+    }
 }
 
 fn parseBackendChoice(value: []const u8) ?BackendChoice {
@@ -7090,6 +7204,21 @@ fn estimatePreflightWeightBytes(
     opts: Options,
 ) !usize {
     const artifact_bytes = try estimateModelArtifactBytes(allocator, manifest);
+    const metal_requested = opts.backend == .metal or opts.backend == .auto;
+    if (metal_requested and
+        manifest.usesGgufWeights() and
+        std.mem.startsWith(u8, manifest.config_model_arch, "gemma4") and
+        artifact_bytes > metalEagerDenseMaxBytes())
+    {
+        // Compact Gemma4 GGUF sessions mmap the immutable artifact, retain
+        // ordinary quantized weights lazily, and pread routed experts through
+        // a bounded residency cache. Reserving the full on-disk file as a
+        // backend allocation would reject the very execution mode that avoids
+        // that allocation. This estimate covers transient Metal weight slots;
+        // host expert slots are independently bounded and reported by runtime
+        // residency metrics.
+        return 256 * 1024 * 1024;
+    }
     if (opts.backend != .cuda or manifest.safetensors_path == null or manifest.config_path == null) return artifact_bytes;
 
     const config_bytes = try c_file.readFile(allocator, manifest.config_path.?);
@@ -7110,7 +7239,7 @@ fn metalEagerDenseMaxBytes() u64 {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--memory-profile 2gbs] [--expert-cache-slots 8|12|16] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
         \\  --stream prints generated text incrementally as token deltas arrive.
@@ -7123,6 +7252,8 @@ fn printUsage() void {
         \\  compiled-target=whole-model requests a compiled backend only when it can own the full traced graph shape.
         \\  raw-decode-bench runs transformer-body decode without logits/sampling for llama-bench-style baselines.
         \\  ignore-eos keeps generating after EOS for benchmark compatibility with engines that do not stop on the same EOG token set.
+        \\  --memory-profile 2gbs selects Metal eager compact MoE execution, four bounded expert readers, 128-token prefill chunks, FP16 KV, and explicit 2 GiB residency budgets.
+        \\  --expert-cache-slots 8|12|16 selects resident expert slots per layer for the 2gbs profile (default: 12; routing still executes exactly top-8 experts).
         \\  Kernel-JIT options are local-only and bypass ANTFLY_INFERENCE_SERVER_URL; an explicit --server remains an error.
         \\  A qualified profile reloads matching package records from the selected cache before model publication; use mode on or required.
         \\  Profile capture auto-selects shadow unless a conflicting mode is explicit. Target and draft profiles are model-bound and separate.
@@ -7229,6 +7360,12 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     snapshot.provider.metal_provider_quantized_runtime_mapped_fallbacks = 10;
     snapshot.provider.compressed_block_active_frame_bootstrap_misses = 11;
     snapshot.provider.metal_provider_quantized_runtime_mapped_failures = 12;
+    snapshot.provider.metal_compact_expert_cache_capacity = 54;
+    snapshot.provider.metal_compact_expert_resident_slots = 55;
+    snapshot.provider.metal_compact_expert_resident_bytes = 56;
+    snapshot.provider.metal_compact_expert_cache_hits = 57;
+    snapshot.provider.metal_compact_expert_cache_misses = 58;
+    snapshot.provider.metal_compact_expert_load_bytes = 59;
 
     const graph_stats = graph_mod.executor_stats.ExecutionStats{
         .quant_kernel_planned_ops = 12,
@@ -7327,6 +7464,12 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     try std.testing.expectEqual(@as(i64, 10), root.get("residency").?.object.get("runtime_mapped_fallbacks").?.integer);
     try std.testing.expectEqual(@as(i64, 11), root.get("residency").?.object.get("active_frame_bootstrap_misses").?.integer);
     try std.testing.expectEqual(@as(i64, 12), root.get("residency").?.object.get("runtime_mapped_failures").?.integer);
+    try std.testing.expectEqual(@as(i64, 54), root.get("residency").?.object.get("compact_expert_cache_capacity").?.integer);
+    try std.testing.expectEqual(@as(i64, 55), root.get("residency").?.object.get("compact_expert_resident_slots").?.integer);
+    try std.testing.expectEqual(@as(i64, 56), root.get("residency").?.object.get("compact_expert_resident_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 57), root.get("residency").?.object.get("compact_expert_cache_hits").?.integer);
+    try std.testing.expectEqual(@as(i64, 58), root.get("residency").?.object.get("compact_expert_cache_misses").?.integer);
+    try std.testing.expectEqual(@as(i64, 59), root.get("residency").?.object.get("compact_expert_load_bytes").?.integer);
     try std.testing.expectEqual(@as(i64, 33), root.get("residency").?.object.get("misses").?.integer);
 
     const null_json = try metalStatsCompactJson(std.testing.allocator, null, .{});
@@ -7512,6 +7655,62 @@ test "parseArgs accepts artifact dir" {
     try std.testing.expectEqualStrings("/tmp/artifacts", opts.artifact_dir.?);
     try std.testing.expectEqual(@as(i32, 1), opts.max_tokens);
     try std.testing.expect(opts.raw_prompt);
+}
+
+test "parseArgs expands compact 2gbs memory profile" {
+    const opts = try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--memory-profile",
+        "2gbs",
+    });
+    try std.testing.expectEqual(MemoryProfile.compact_2gbs, opts.memory_profile.?);
+    try std.testing.expectEqual(BackendChoice.metal, opts.backend);
+    try std.testing.expectEqual(ExecutionMode.eager, opts.mode.?);
+    try std.testing.expectEqual(@as(usize, 128), opts.prefill_chunk_size);
+    try std.testing.expectEqualStrings("f16", opts.cache_dtype.?);
+    try std.testing.expectEqual(@as(usize, 2048), opts.host_budget_mb);
+    try std.testing.expectEqual(@as(usize, 2048), opts.backend_budget_mb);
+    try std.testing.expectEqual(@as(usize, 2048), opts.combined_budget_mb);
+    try std.testing.expectEqual(@as(usize, 384), opts.kv_budget_mb);
+    try std.testing.expectEqual(@as(usize, 384), opts.scratch_budget_mb);
+    try std.testing.expectEqual(@as(usize, 12), opts.expert_cache_slots);
+    try std.testing.expect(!liveWholeModelExecutorRequested(&opts));
+
+    const slots_16 = try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--memory-profile",
+        "2gbs",
+        "--expert-cache-slots",
+        "16",
+    });
+    try std.testing.expectEqual(@as(usize, 16), slots_16.expert_cache_slots);
+
+    try std.testing.expectError(error.InvalidExpertCacheSlots, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--memory-profile",
+        "2gbs",
+        "--expert-cache-slots",
+        "10",
+    }));
+
+    try std.testing.expectError(error.ExpertCacheSlotsRequireMemoryProfile, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--expert-cache-slots",
+        "8",
+    }));
+
+    try std.testing.expectError(error.MemoryProfileRequiresMetal, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--backend",
+        "native",
+        "--memory-profile",
+        "2gbs",
+    }));
 }
 
 test "parseArgs accepts compiled target" {

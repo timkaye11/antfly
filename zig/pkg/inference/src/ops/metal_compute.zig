@@ -30,7 +30,9 @@ const metal_tensor_mod = if (build_options.enable_metal) @import("../backends/me
     pub const MetalTensor = opaque {};
 };
 const tensor_mod = @import("../backends/tensor.zig");
+const tensor_store_mod = @import("../models/tensor_store.zig");
 const weight_source_mod = @import("../models/weight_source.zig");
+const c_file = @import("../util/c_file.zig");
 const runtime_root = @import("../runtime/root.zig");
 const model_runtime = @import("../graph/model_runtime.zig");
 const backend_contracts = @import("../graph/backend_contracts.zig");
@@ -305,6 +307,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     const metal_native_provider_mod = @import("../backends/metal_native_provider.zig");
     const MetalNativeProvider = metal_native_provider_mod.MetalNativeProvider;
     const ProviderImpl = MetalNativeProvider;
+    const compact_expert_layer_count: usize = 30;
+    // Top-8 routing needs at least eight resident entries. Keep capacity for
+    // the supported 8/12/16 A/B choices while only scanning and allocating the
+    // configured active prefix. Twelve preserves four historical experts per
+    // layer and is the compact profile default.
+    const compact_expert_slot_capacity: usize = 16;
+    const compact_expert_default_active_slots: usize = 12;
+    const compact_expert_projection_count: usize = 3;
+    const compact_expert_linear_slot_start: usize = 512;
+    const compact_expert_linear_slot_count: usize = compact_expert_layer_count * compact_expert_slot_capacity * compact_expert_projection_count;
+    const compact_expert_encoded_bytes: usize = 3_345_408;
+    const compact_expert_arena_alignment: usize = 16 * 1024;
+    const compact_expert_arena_bytes: usize = std.mem.alignForward(usize, compact_expert_encoded_bytes, compact_expert_arena_alignment);
+    const streamed_expert_linear_slot_count: usize = 32;
+    const streamed_expert_linear_slot_start: usize = compact_expert_linear_slot_start - streamed_expert_linear_slot_count;
+    comptime {
+        std.debug.assert(compact_expert_linear_slot_start + compact_expert_linear_slot_count <= metal_runtime.decoder_runtime_linear_slot_capacity);
+    }
     var host_materialize_trace_count: usize = 0;
 
     const Buf = struct {
@@ -409,6 +429,55 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     const DynamicRmsNormSlotKey = struct {
         weight_buf: usize,
         hidden_size: usize,
+    };
+
+    const ResidentExpertSlot = struct {
+        expert_index: u16 = std.math.maxInt(u16),
+        generation: u64 = 0,
+        use_count: u64 = 0,
+        last_access_epoch: u64 = 0,
+        arena: ?c_file.MmapRegion = null,
+        layout: ?tensor_store_mod.QuantizedExpertLayout = null,
+        published: bool = false,
+
+        fn ready(self: *const ResidentExpertSlot) bool {
+            return self.published and self.layout != null and
+                self.expert_index != std.math.maxInt(u16);
+        }
+    };
+
+    const ResidentExpertProjectionSlots = struct {
+        gate: usize,
+        up: usize,
+        down: usize,
+    };
+
+    const CompactMoeRoute = struct {
+        indices: [8]u32 = [_]u32{0} ** 8,
+        weights: [8]f32 = [_]f32{0.0} ** 8,
+        count: usize = 0,
+    };
+
+    const PendingCompactMoeRoute = struct {
+        layer_index: usize,
+        epoch: u64,
+        route: CompactMoeRoute,
+        route_slots: [8]ResidentExpertProjectionSlots = undefined,
+        miss_route_slots: [8]usize = undefined,
+        miss_local_slots: [8]usize = undefined,
+        layouts: [8]?tensor_store_mod.QuantizedExpertLayout = [_]?tensor_store_mod.QuantizedExpertLayout{null} ** 8,
+        load_batch: ?gpu_hosted_store_mod.ResidentExpertLoadBatch = null,
+        miss_count: usize = 0,
+        compact_started_at: u128 = 0,
+        hits_before: u64 = 0,
+        misses_before: u64 = 0,
+
+        fn deinit(self: *PendingCompactMoeRoute) void {
+            if (self.load_batch) |*batch| batch.deinit();
+            self.load_batch = null;
+            for (&self.layouts) |*layout| if (layout.*) |*value| value.deinit();
+            self.layouts = [_]?tensor_store_mod.QuantizedExpertLayout{null} ** 8;
+        }
     };
 
     pub const ReservedHiddenStatePair = struct {
@@ -558,7 +627,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     eager_quant_mirrors_preferred: bool = false,
     dynamic_layer_norm_slots: std.AutoHashMapUnmanaged(DynamicLayerNormSlotKey, usize) = .empty,
     dynamic_rms_norm_slots: std.AutoHashMapUnmanaged(DynamicRmsNormSlotKey, usize) = .empty,
-    next_dynamic_linear_slot: usize = metal_runtime.decoder_runtime_linear_slot_capacity,
+    next_dynamic_linear_slot: usize = streamed_expert_linear_slot_start,
+    streamed_expert_linear_slot_cursor: usize = 0,
+    resident_expert_slots: [compact_expert_layer_count * compact_expert_slot_capacity]ResidentExpertSlot =
+        [_]ResidentExpertSlot{.{}} ** (compact_expert_layer_count * compact_expert_slot_capacity),
+    resident_expert_active_slots: usize = compact_expert_default_active_slots,
+    resident_expert_epoch: u64 = 1,
+    resident_expert_hits: u64 = 0,
+    resident_expert_misses: u64 = 0,
+    resident_expert_load_bytes: u64 = 0,
+    resident_expert_publication_generation: u64 = 0,
+    resident_expert_whole_publications: u64 = 0,
+    resident_expert_projection_prepares: u64 = 0,
+    resident_expert_fused_frame_attempts: u64 = 0,
+    resident_expert_fused_frame_successes: u64 = 0,
+    resident_expert_fused_frame_fallbacks: u64 = 0,
+    resident_expert_device_input_reuses: u64 = 0,
+    resident_expert_host_transfers: u64 = 0,
+    pending_compact_moe_route: ?PendingCompactMoeRoute = null,
     next_dynamic_layer_norm_slot: usize = metal_runtime.decoder_runtime_layer_norm_slot_capacity,
     next_dynamic_rms_norm_slot: usize = metal_runtime.decoder_runtime_rms_norm_slot_capacity,
     active_prefill_frame_plan: ?metal_command_planner.GatedFrameCommandLowerer = null,
@@ -646,6 +732,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .data = data,
                 .provider_impl = provider_impl,
                 .owned_native_provider = true,
+                .resident_expert_active_slots = configuredResidentExpertSlots(),
                 .io = io,
             };
         }
@@ -666,6 +753,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .data = data,
             .provider_impl = provider_impl,
             .owned_native_provider = false,
+            .resident_expert_active_slots = configuredResidentExpertSlots(),
             .io = io,
         };
     }
@@ -2814,6 +2902,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.clearActivePrefillFramePlan();
         self.clearPendingPrefillKvDeviceSeeds();
         self.resetBackendKvCache();
+        if (self.pending_compact_moe_route) |*pending| pending.deinit();
+        self.pending_compact_moe_route = null;
+        self.deinitResidentExpertSlots();
         self.cyclic_page_table_cache.deinit(self.allocator);
         if (self.attention_mask_device_cache) |*tensor| tensor.deinit();
         if (self.attention_mask_values_cache.len != 0) self.allocator.free(self.attention_mask_values_cache);
@@ -3272,6 +3363,632 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }))) return null;
         try self.dynamic_linear_slots.put(self.allocator, key, slot);
         return slot;
+    }
+
+    fn prepareNextStreamedExpertLinearSlot(
+        self: *MetalCompute,
+        weight: CT,
+        in_dim: usize,
+        out_dim: usize,
+    ) !?usize {
+        if (!self.provider_impl.hasDecoderRuntime()) return null;
+
+        // A prepared slot owns the matrix referenced by commands already
+        // encoded into the active frame. Replacing it before those commands
+        // finish can make an earlier projection observe a later expert. Bound
+        // memory with a small ring, and establish the lifetime boundary before
+        // every wrap.
+        if (self.streamed_expert_linear_slot_cursor != 0 and
+            self.streamed_expert_linear_slot_cursor % streamed_expert_linear_slot_count == 0)
+        {
+            const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+            if (metal_runtime.hasActiveFrame(runtime)) {
+                var active = true;
+                try self.submitAndWaitDecoderRuntimeFrame(runtime, &active);
+            }
+        }
+
+        const slot = streamed_expert_linear_slot_start +
+            (self.streamed_expert_linear_slot_cursor % streamed_expert_linear_slot_count);
+        self.streamed_expert_linear_slot_cursor +%= 1;
+        const zero_bias = try self.cachedZeroBiasBuf(out_dim);
+        defer freeOp(self, zero_bias);
+        if (!(try decoderRuntimePrepareLinearOp(self, &.{
+            .slot = slot,
+            .weight = weight,
+            .bias = zero_bias,
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .retain_dense_fallback = false,
+            .force_replace = true,
+            .borrow_quantized_storage = true,
+        }))) return null;
+        return slot;
+    }
+
+    fn clearStreamedExpertLinearSlots(self: *MetalCompute, slots: []const usize) void {
+        for (slots) |slot| metal_runtime.clearRawLinearSlot(self.provider_impl, slot);
+    }
+
+    fn residentExpertFlatIndex(layer_index: usize, local_slot: usize) usize {
+        return layer_index * compact_expert_slot_capacity + local_slot;
+    }
+
+    fn configuredResidentExpertSlots() usize {
+        const requested = getenvUsize("ANTFLY_GEMMA4_COMPACT_EXPERT_SLOTS") orelse
+            return compact_expert_default_active_slots;
+        return switch (requested) {
+            8, 12, 16 => requested,
+            else => compact_expert_default_active_slots,
+        };
+    }
+
+    fn residentExpertProjectionSlots(layer_index: usize, local_slot: usize) ResidentExpertProjectionSlots {
+        const base = compact_expert_linear_slot_start +
+            residentExpertFlatIndex(layer_index, local_slot) * compact_expert_projection_count;
+        return .{ .gate = base, .up = base + 1, .down = base + 2 };
+    }
+
+    fn clearResidentExpertSlot(self: *MetalCompute, layer_index: usize, local_slot: usize) void {
+        const flat_index = residentExpertFlatIndex(layer_index, local_slot);
+        const slot = &self.resident_expert_slots[flat_index];
+        if (slot.layout) |*layout| {
+            const projections = residentExpertProjectionSlots(layer_index, local_slot);
+            metal_runtime.clearRawLinearSlot(self.provider_impl, projections.gate);
+            metal_runtime.clearRawLinearSlot(self.provider_impl, projections.up);
+            metal_runtime.clearRawLinearSlot(self.provider_impl, projections.down);
+            layout.deinit();
+            slot.layout = null;
+        }
+        slot.published = false;
+        slot.expert_index = std.math.maxInt(u16);
+        slot.use_count = 0;
+        slot.last_access_epoch = 0;
+    }
+
+    fn deinitResidentExpertSlots(self: *MetalCompute) void {
+        for (0..compact_expert_layer_count) |layer_index| {
+            for (0..compact_expert_slot_capacity) |local_slot| {
+                const flat_index = residentExpertFlatIndex(layer_index, local_slot);
+                self.clearResidentExpertSlot(layer_index, local_slot);
+                if (self.resident_expert_slots[flat_index].arena) |*arena| arena.deinit();
+                self.resident_expert_slots[flat_index].arena = null;
+            }
+        }
+    }
+
+    fn compactMoeExpertEntries(
+        self: *MetalCompute,
+        layer_index: usize,
+        expert_index: u32,
+    ) ?[3]*gpu_hosted_store_mod.LazyWeightEntry {
+        const projection_names = [_][]const u8{ "w1", "w3", "w2" };
+        var entries: [3]*gpu_hosted_store_mod.LazyWeightEntry = undefined;
+        for (projection_names, 0..) |projection, projection_index| {
+            var name_buf: [192]u8 = undefined;
+            const name = std.fmt.bufPrint(
+                &name_buf,
+                "model.layers.{d}.block_sparse_moe.experts.{d}.{s}.weight",
+                .{ layer_index, expert_index, projection },
+            ) catch return null;
+            entries[projection_index] = self.data.lazy_weights.getPtr(name) orelse return null;
+        }
+        return entries;
+    }
+
+    fn prepareResidentExpertSlot(
+        self: *MetalCompute,
+        request: *const ops.RunMoeBlockRequest,
+        local_slot: usize,
+    ) !bool {
+        const flat_index = residentExpertFlatIndex(request.layer_index, local_slot);
+        const resident = &self.resident_expert_slots[flat_index];
+        const layout = if (resident.layout) |*value| value else return false;
+        const arena = if (resident.arena) |*value| value.data else return false;
+        const slots = residentExpertProjectionSlots(request.layer_index, local_slot);
+        const descriptors = layout.descriptors;
+        if (descriptors[0].rows != request.inter_size or descriptors[0].cols != request.hidden_size or
+            descriptors[1].rows != request.inter_size or descriptors[1].cols != request.hidden_size or
+            descriptors[2].rows != request.hidden_size or descriptors[2].cols != request.inter_size)
+        {
+            return false;
+        }
+        const published = try metal_runtime.decoderRuntimePrepareQ40ExpertArena(
+            self.provider_impl,
+            .{ slots.gate, slots.up, slots.down },
+            .{ &layout.projections[0], &layout.projections[1], &layout.projections[2] },
+            arena,
+            .{ descriptors[0].byte_offset, descriptors[1].byte_offset, descriptors[2].byte_offset },
+            request.hidden_size,
+            request.inter_size,
+        );
+        if (published) self.resident_expert_whole_publications +|= 1;
+        return published;
+    }
+
+    fn chooseResidentExpertVictim(
+        self: *MetalCompute,
+        layer_index: usize,
+        protected: *const [compact_expert_slot_capacity]bool,
+    ) ?usize {
+        var victim: ?usize = null;
+        for (0..self.resident_expert_active_slots) |local_slot| {
+            if (protected[local_slot]) continue;
+            const candidate = &self.resident_expert_slots[residentExpertFlatIndex(layer_index, local_slot)];
+            if (!candidate.ready()) return local_slot;
+            if (victim == null) {
+                victim = local_slot;
+                continue;
+            }
+            const current = &self.resident_expert_slots[residentExpertFlatIndex(layer_index, victim.?)];
+            if (candidate.use_count < current.use_count or
+                (candidate.use_count == current.use_count and candidate.last_access_epoch < current.last_access_epoch))
+            {
+                victim = local_slot;
+            }
+        }
+        return victim;
+    }
+
+    fn beginResidentExpertRoute(
+        self: *MetalCompute,
+        request: *const ops.RunMoeBlockRequest,
+        route: CompactMoeRoute,
+    ) !?PendingCompactMoeRoute {
+        if (request.layer_index >= compact_expert_layer_count or route.count > self.resident_expert_active_slots) return null;
+        self.resident_expert_epoch +|= 1;
+        const epoch = self.resident_expert_epoch;
+        var protected = [_]bool{false} ** compact_expert_slot_capacity;
+        var requests: [8]gpu_hosted_store_mod.ResidentExpertLoadRequest = undefined;
+        var pending = PendingCompactMoeRoute{
+            .layer_index = request.layer_index,
+            .epoch = epoch,
+            .route = route,
+        };
+        errdefer pending.deinit();
+
+        for (0..route.count) |route_slot| {
+            const expert_index: u16 = @intCast(route.indices[route_slot]);
+            var hit: ?usize = null;
+            for (0..self.resident_expert_active_slots) |local_slot| {
+                const resident = &self.resident_expert_slots[residentExpertFlatIndex(request.layer_index, local_slot)];
+                if (resident.ready() and resident.expert_index == expert_index) {
+                    hit = local_slot;
+                    break;
+                }
+            }
+            if (hit) |local_slot| {
+                const resident = &self.resident_expert_slots[residentExpertFlatIndex(request.layer_index, local_slot)];
+                resident.use_count +|= 1;
+                resident.last_access_epoch = epoch;
+                protected[local_slot] = true;
+                pending.route_slots[route_slot] = residentExpertProjectionSlots(request.layer_index, local_slot);
+                self.resident_expert_hits +|= 1;
+                continue;
+            }
+
+            const local_slot = self.chooseResidentExpertVictim(request.layer_index, &protected) orelse return null;
+            self.clearResidentExpertSlot(request.layer_index, local_slot);
+            const flat_index = residentExpertFlatIndex(request.layer_index, local_slot);
+            const resident = &self.resident_expert_slots[flat_index];
+            if (resident.arena == null) {
+                resident.arena = try c_file.MmapRegion.initAnonymous(compact_expert_arena_bytes);
+                resident.arena.?.adviseRandom();
+            }
+            const entries = self.compactMoeExpertEntries(request.layer_index, route.indices[route_slot]) orelse return null;
+            requests[pending.miss_count] = .{
+                .entries = entries,
+                .destination = resident.arena.?.data,
+            };
+            pending.miss_route_slots[pending.miss_count] = route_slot;
+            pending.miss_local_slots[pending.miss_count] = local_slot;
+            protected[local_slot] = true;
+            pending.route_slots[route_slot] = residentExpertProjectionSlots(request.layer_index, local_slot);
+            pending.miss_count += 1;
+            self.resident_expert_misses +|= 1;
+        }
+
+        if (pending.miss_count != 0) {
+            const reader_count = getenvUsize("ANTFLY_GEMMA4_COMPACT_IO_READERS") orelse 1;
+            pending.load_batch = try gpu_hosted_store_mod.beginResidentExpertLayoutsParallel(
+                self.data,
+                requests[0..pending.miss_count],
+                @min(@as(usize, 8), @max(@as(usize, 1), reader_count)),
+            );
+        }
+        return pending;
+    }
+
+    fn finishResidentExpertRoute(
+        self: *MetalCompute,
+        request: *const ops.RunMoeBlockRequest,
+        pending: *PendingCompactMoeRoute,
+    ) !bool {
+        if (pending.layer_index != request.layer_index) return false;
+        if (pending.load_batch) |*batch| {
+            batch.finish(pending.layouts[0..pending.miss_count]) catch return false;
+        }
+
+        for (0..pending.miss_count) |miss_index| {
+            const local_slot = pending.miss_local_slots[miss_index];
+            const flat_index = residentExpertFlatIndex(request.layer_index, local_slot);
+            const resident = &self.resident_expert_slots[flat_index];
+            resident.layout = pending.layouts[miss_index] orelse return false;
+            pending.layouts[miss_index] = null;
+            resident.published = false;
+            resident.expert_index = @intCast(pending.route.indices[pending.miss_route_slots[miss_index]]);
+            resident.use_count = 1;
+            resident.last_access_epoch = pending.epoch;
+            self.resident_expert_load_bytes +|= resident.layout.?.encoded_bytes;
+            if (!(try self.prepareResidentExpertSlot(request, local_slot))) {
+                self.clearResidentExpertSlot(request.layer_index, local_slot);
+                return false;
+            }
+            self.resident_expert_publication_generation +|= 1;
+            resident.generation = self.resident_expert_publication_generation;
+            resident.published = true;
+        }
+        return true;
+    }
+
+    fn ensureResidentExpertRoute(
+        self: *MetalCompute,
+        request: *const ops.RunMoeBlockRequest,
+        route: CompactMoeRoute,
+        route_slots: *[8]ResidentExpertProjectionSlots,
+    ) !bool {
+        var pending = (try self.beginResidentExpertRoute(request, route)) orelse return false;
+        defer pending.deinit();
+        if (!(try self.finishResidentExpertRoute(request, &pending))) return false;
+        route_slots.* = pending.route_slots;
+        return true;
+    }
+
+    fn compactMoeLazyEntries(
+        self: *MetalCompute,
+        layer_index: usize,
+        route: CompactMoeRoute,
+        entries: *[24]*gpu_hosted_store_mod.LazyWeightEntry,
+    ) ?usize {
+        const projection_names = [_][]const u8{ "w1", "w3", "w2" };
+        var entry_count: usize = 0;
+        for (0..route.count) |route_slot| {
+            const expert_index = route.indices[route_slot];
+            for (projection_names) |projection| {
+                var name_buf: [192]u8 = undefined;
+                const name = std.fmt.bufPrint(
+                    &name_buf,
+                    "model.layers.{d}.block_sparse_moe.experts.{d}.{s}.weight",
+                    .{ layer_index, expert_index, projection },
+                ) catch return null;
+                entries[entry_count] = self.data.lazy_weights.getPtr(name) orelse return null;
+                entry_count += 1;
+            }
+        }
+        return entry_count;
+    }
+
+    fn selectCompactMoeRoute(
+        logits: []const f32,
+        top_k: usize,
+    ) ?CompactMoeRoute {
+        if (logits.len == 0 or top_k == 0 or top_k > 8 or top_k > logits.len) return null;
+        var route = CompactMoeRoute{ .count = top_k };
+        var scores = [_]f32{-std.math.inf(f32)} ** 8;
+        for (logits, 0..) |score, expert_index| {
+            var insert_at = top_k;
+            for (0..top_k) |slot| {
+                if (score > scores[slot] or
+                    (score == scores[slot] and expert_index < route.indices[slot]))
+                {
+                    insert_at = slot;
+                    break;
+                }
+            }
+            if (insert_at == top_k) continue;
+            var slot = top_k - 1;
+            while (slot > insert_at) : (slot -= 1) {
+                scores[slot] = scores[slot - 1];
+                route.indices[slot] = route.indices[slot - 1];
+            }
+            scores[insert_at] = score;
+            route.indices[insert_at] = @intCast(expert_index);
+        }
+
+        const max_score = scores[0];
+        var sum: f32 = 0.0;
+        for (0..top_k) |slot| {
+            route.weights[slot] = @exp(scores[slot] - max_score);
+            sum += route.weights[slot];
+        }
+        if (!(sum > 0.0) or !std.math.isFinite(sum)) return null;
+        for (0..top_k) |slot| {
+            route.weights[slot] /= sum;
+        }
+        return route;
+    }
+
+    fn runCompactMoeRow(
+        self: *MetalCompute,
+        request: *const ops.RunMoeBlockRequest,
+        input_row: []const f32,
+        logits_row: []const f32,
+        expert_scales: ?[]const f32,
+        output_row: []f32,
+    ) !bool {
+        const compact_timing = getenvBool("ANTFLY_GEMMA4_COMPACT_TIMING");
+        const compact_started_at = if (compact_timing) monotonicNowNs() else 0;
+        const route = selectCompactMoeRoute(logits_row, request.top_k) orelse return false;
+        const hits_before = self.resident_expert_hits;
+        const misses_before = self.resident_expert_misses;
+        const residency_started_at = if (compact_timing) monotonicNowNs() else 0;
+        var route_slots: [8]ResidentExpertProjectionSlots = undefined;
+        if (!(try self.ensureResidentExpertRoute(request, route, &route_slots))) return false;
+        const residency_ns = if (compact_timing) monotonicNowNs() - residency_started_at else 0;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        const input_shape = [_]i32{ 1, @intCast(request.hidden_size) };
+        const input_host = MetalTensor.borrowed(@constCast(input_row.ptr), input_row.len, &input_shape);
+        var input_device = try MetalTensor.deviceAllocate(
+            @ptrCast(runtime),
+            input_row.len * @sizeOf(f32),
+            uploadStorageMode(input_row.len * @sizeOf(f32)),
+            &input_shape,
+        );
+        defer input_device.deinit();
+        try input_host.copyInto(&input_device);
+        self.resident_expert_host_transfers +|= 1;
+        var result = (try self.runCompactMoeRowPrepared(
+            request,
+            input_device,
+            route,
+            &route_slots,
+            expert_scales,
+            compact_timing,
+            compact_started_at,
+            residency_ns,
+            hits_before,
+            misses_before,
+        )) orelse return false;
+        defer result.deinit();
+        const host = try result.toHostSlice();
+        self.resident_expert_host_transfers +|= 1;
+        if (host.len != output_row.len) return false;
+        @memcpy(output_row, host);
+        return true;
+    }
+
+    fn runCompactMoeRowPrepared(
+        self: *MetalCompute,
+        request: *const ops.RunMoeBlockRequest,
+        input_device: MetalTensor,
+        route: CompactMoeRoute,
+        route_slots: *const [8]ResidentExpertProjectionSlots,
+        expert_scales: ?[]const f32,
+        compact_timing: bool,
+        compact_started_at: u128,
+        residency_ns: u128,
+        hits_before: u64,
+        misses_before: u64,
+    ) !?MetalTensor {
+        self.resident_expert_fused_frame_attempts +|= 1;
+        var succeeded = false;
+        defer {
+            if (!succeeded) self.resident_expert_fused_frame_fallbacks +|= 1;
+        }
+        const execute_started_at = if (compact_timing) monotonicNowNs() else 0;
+
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        if (!input_device.isDevice() or input_device.elemCount() != request.hidden_size) return null;
+
+        var frame_active = try self.beginDecoderRuntimeFrame(runtime);
+        if (!frame_active) return null;
+        defer self.cancelDecoderRuntimeFrame(runtime, &frame_active);
+
+        var accumulated: ?MetalTensor = null;
+        defer if (accumulated) |*tensor| tensor.deinit();
+        for (0..route.count) |route_slot| {
+            const slots = route_slots[route_slot];
+            var pair = (try metal_runtime.tryApplyQuantizedRuntimeLinearPair(
+                self.provider_impl,
+                slots.gate,
+                slots.up,
+                input_device,
+                1,
+                request.hidden_size,
+                request.inter_size,
+            )) orelse return null;
+            defer pair.first.deinit();
+            defer pair.second.deinit();
+
+            var activated = (try metal_runtime.decoderRuntimeApplyActivation(self.provider_impl, .{
+                .input = pair.first,
+                .dim = request.inter_size,
+                .kind = request.activation,
+            }, &self.timing_stats)) orelse return null;
+            defer activated.deinit();
+            var gated = (try metal_runtime.decoderRuntimeApplyMultiply(
+                self.provider_impl,
+                activated,
+                pair.second,
+                request.inter_size,
+            )) orelse return null;
+            defer gated.deinit();
+            var down = (try metal_runtime.tryApplyQuantizedRuntimeLinear(
+                self.provider_impl,
+                slots.down,
+                gated,
+                1,
+                request.inter_size,
+                request.hidden_size,
+            )) orelse return null;
+            defer down.deinit();
+            var expert_scaled: ?MetalTensor = null;
+            defer if (expert_scaled) |*tensor| tensor.deinit();
+            const scale_input = if (expert_scales) |scales| blk: {
+                const expert_index: usize = @intCast(route.indices[route_slot]);
+                if (expert_index >= scales.len) return null;
+                expert_scaled = (try metal_runtime.decoderRuntimeApplyScale(
+                    self.provider_impl,
+                    down,
+                    scales[expert_index],
+                )) orelse return null;
+                break :blk expert_scaled.?;
+            } else down;
+            var scaled = (try metal_runtime.decoderRuntimeApplyScale(
+                self.provider_impl,
+                scale_input,
+                route.weights[route_slot],
+            )) orelse return null;
+
+            if (accumulated) |*current| {
+                const added = (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
+                    .lhs = current.*,
+                    .rhs = scaled,
+                    .dim = request.hidden_size,
+                }, &self.timing_stats)) orelse {
+                    scaled.deinit();
+                    return null;
+                };
+                current.deinit();
+                scaled.deinit();
+                accumulated = added;
+            } else {
+                accumulated = scaled;
+            }
+        }
+
+        try self.submitAndWaitDecoderRuntimeFrame(runtime, &frame_active);
+        const result = accumulated orelse return null;
+        accumulated = null;
+        if (compact_timing) {
+            const finished_at = monotonicNowNs();
+            std.debug.print(
+                "gemma4_resident_moe_timing: layer={d} residency_ms={d} execute_ms={d} total_ms={d} hits={d} misses={d}\n",
+                .{
+                    request.layer_index,
+                    residency_ns / std.time.ns_per_ms,
+                    (finished_at - execute_started_at) / std.time.ns_per_ms,
+                    (finished_at - compact_started_at) / std.time.ns_per_ms,
+                    self.resident_expert_hits - hits_before,
+                    self.resident_expert_misses - misses_before,
+                },
+            );
+        }
+        self.resident_expert_fused_frame_successes +|= 1;
+        succeeded = true;
+        return result;
+    }
+
+    fn compactMoeRequestSupported(request: *const ops.RunMoeBlockRequest, max_total: usize) bool {
+        if (request.total == 0 or request.total > max_total or
+            request.hidden_size == 0 or request.inter_size == 0 or
+            request.num_experts == 0 or request.top_k == 0 or request.top_k > 8)
+        {
+            return false;
+        }
+        return switch (request.activation) {
+            .gelu, .gelu_new, .silu => true,
+            else => false,
+        };
+    }
+
+    fn beginMoeBlockOp(ctx: *anyopaque, request: *const ops.RunMoeBlockRequest) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!compactMoeRequestSupported(request, 1) or self.pending_compact_moe_route != null) return false;
+
+        const compact_timing = getenvBool("ANTFLY_GEMMA4_COMPACT_TIMING");
+        const compact_started_at = if (compact_timing) monotonicNowNs() else 0;
+        const logits = try toFloat32Op(ctx, request.router_logits, self.allocator);
+        defer self.allocator.free(logits);
+        if (logits.len != request.num_experts) return false;
+        const route = selectCompactMoeRoute(logits, request.top_k) orelse return false;
+        const hits_before = self.resident_expert_hits;
+        const misses_before = self.resident_expert_misses;
+        var pending = (self.beginResidentExpertRoute(request, route) catch return false) orelse return false;
+        pending.compact_started_at = compact_started_at;
+        pending.hits_before = hits_before;
+        pending.misses_before = misses_before;
+        self.pending_compact_moe_route = pending;
+        return true;
+    }
+
+    fn finishMoeBlockOp(ctx: *anyopaque, request: *const ops.RunMoeBlockRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!compactMoeRequestSupported(request, 1)) return null;
+        var pending = self.pending_compact_moe_route orelse return null;
+        self.pending_compact_moe_route = null;
+        defer pending.deinit();
+
+        const compact_timing = getenvBool("ANTFLY_GEMMA4_COMPACT_TIMING");
+        const residency_started_at = if (compact_timing) monotonicNowNs() else 0;
+        if (!(try self.finishResidentExpertRoute(request, &pending))) return null;
+        const residency_ns = if (compact_timing) monotonicNowNs() - residency_started_at else 0;
+
+        const input_was_device = if (toBuf(request.input).metal_tensor) |tensor| tensor.isDevice() else false;
+        var input_device = try self.ownedDeviceMetalTensorFromCt(request.input);
+        defer input_device.deinit();
+        if (input_device.elemCount() != request.hidden_size) return null;
+        if (input_was_device) {
+            self.resident_expert_device_input_reuses +|= 1;
+        } else {
+            self.resident_expert_host_transfers +|= 1;
+        }
+        const expert_scales: ?[]f32 = if (request.expert_scale) |scale|
+            try toFloat32Op(ctx, scale, self.allocator)
+        else
+            null;
+        defer if (expert_scales) |scales| self.allocator.free(scales);
+
+        var output = (try self.runCompactMoeRowPrepared(
+            request,
+            input_device,
+            pending.route,
+            &pending.route_slots,
+            expert_scales,
+            compact_timing,
+            pending.compact_started_at,
+            residency_ns,
+            pending.hits_before,
+            pending.misses_before,
+        )) orelse return null;
+        errdefer output.deinit();
+        return self.ctFromOwnedMetalTensor(output);
+    }
+
+    fn runMoeBlockOp(ctx: *anyopaque, request: *const ops.RunMoeBlockRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!compactMoeRequestSupported(request, 16)) return null;
+        if (request.total == 1 and try beginMoeBlockOp(ctx, request)) {
+            return finishMoeBlockOp(ctx, request);
+        }
+        const input = try toFloat32Op(ctx, request.input, self.allocator);
+        defer self.allocator.free(input);
+        const logits = try toFloat32Op(ctx, request.router_logits, self.allocator);
+        defer self.allocator.free(logits);
+        if (input.len != request.total * request.hidden_size or
+            logits.len != request.total * request.num_experts)
+        {
+            return null;
+        }
+        const expert_scales: ?[]f32 = if (request.expert_scale) |scale|
+            try toFloat32Op(ctx, scale, self.allocator)
+        else
+            null;
+        defer if (expert_scales) |scales| self.allocator.free(scales);
+
+        const output = try self.allocator.alloc(f32, request.total * request.hidden_size);
+        errdefer self.allocator.free(output);
+        for (0..request.total) |row| {
+            const input_row = input[row * request.hidden_size ..][0..request.hidden_size];
+            const logits_row = logits[row * request.num_experts ..][0..request.num_experts];
+            const output_row = output[row * request.hidden_size ..][0..request.hidden_size];
+            if (!(try self.runCompactMoeRow(request, input_row, logits_row, expert_scales, output_row))) {
+                self.allocator.free(output);
+                return null;
+            }
+        }
+        const shape = [_]i32{ @intCast(request.total), @intCast(request.hidden_size) };
+        return denseBuf(self.allocator, output, true, &shape);
     }
 
     fn quantizedStorageLinearSlotKey(tensor: CT, in_dim: usize, out_dim: usize) DynamicLinearSlotKey {
@@ -7973,8 +8690,35 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const input_buf = toBuf(input);
         const weight_buf = toBuf(weight);
+        const streamed_expert = if (weight_buf.lazy_entry) |entry| entry.expert_coord != null else false;
         if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
-        if (weight_buf.native_dense_bytes != null and weight_buf.native_dense_dtype != null and self.provider_impl.hasDecoderRuntime()) {
+        if (weight_buf.quantized_storage orelse weight_buf.runtime_quantized_storage) |storage| {
+            // Packed MoE storage describes a logical expert view over the full
+            // source tensor. Generic quantized linear providers accept only a
+            // standalone matrix; passing the packed bytes here would multiply
+            // from the beginning of the tensor and can silently select expert 0.
+            if (storage.packed_expert != null) return error.UnsupportedTensorType;
+        }
+        if (streamed_expert) {
+            // The compact MoE path keeps the surrounding graph's established
+            // host/device policy unchanged. Upload only the routed batch here,
+            // run the projection through the qualified Q4_0 device kernel, and
+            // let the returned tensor remain resident through activation and
+            // the following expert projection.
+            var input_metal = try self.ownedDeviceMetalTensorFromCt(input);
+            defer input_metal.deinit();
+            if (deviceTensorMatchesLinearRows(&input_metal, rows, in_dim)) {
+                if (try self.prepareNextStreamedExpertLinearSlot(weight, in_dim, out_dim)) |slot| {
+                    if (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                        .slot = slot,
+                        .input = input_metal,
+                        .in_dim = in_dim,
+                        .out_dim = out_dim,
+                    })) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+                }
+            }
+        }
+        if (!streamed_expert and weight_buf.native_dense_bytes != null and weight_buf.native_dense_dtype != null and self.provider_impl.hasDecoderRuntime()) {
             const zero_bias = try self.cachedZeroBiasBuf(out_dim);
             defer freeOp(ctx, zero_bias);
             if (try self.ensureDynamicLinearSlot(weight, zero_bias, in_dim, out_dim)) |slot| {
@@ -7992,22 +8736,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             }
         }
-        if (input_buf.metal_tensor) |*input_metal| {
-            if (deviceTensorMatchesLinearRows(input_metal, rows, in_dim)) {
-                const zero_bias = try self.cachedZeroBiasBuf(out_dim);
-                defer freeOp(ctx, zero_bias);
-                if (try self.ensureDynamicLinearSlot(weight, zero_bias, in_dim, out_dim)) |slot| {
-                    if (try decoderRuntimeApplyLinearOp(ctx, &.{
-                        .slot = slot,
-                        .input = input,
-                        .in_dim = in_dim,
-                        .out_dim = out_dim,
-                    })) |tensor| {
-                        if (mtpVerifyTraceRequested()) std.debug.print(
-                            "linear-nobias-route: dynamic_slot rows={d} out={d}\n",
-                            .{ rows, out_dim },
-                        );
-                        return tensor;
+        if (!streamed_expert) {
+            if (input_buf.metal_tensor) |*input_metal| {
+                if (deviceTensorMatchesLinearRows(input_metal, rows, in_dim)) {
+                    const zero_bias = try self.cachedZeroBiasBuf(out_dim);
+                    defer freeOp(ctx, zero_bias);
+                    if (try self.ensureDynamicLinearSlot(weight, zero_bias, in_dim, out_dim)) |slot| {
+                        if (try decoderRuntimeApplyLinearOp(ctx, &.{
+                            .slot = slot,
+                            .input = input,
+                            .in_dim = in_dim,
+                            .out_dim = out_dim,
+                        })) |tensor| {
+                            if (mtpVerifyTraceRequested()) std.debug.print(
+                                "linear-nobias-route: dynamic_slot rows={d} out={d}\n",
+                                .{ rows, out_dim },
+                            );
+                            return tensor;
+                        }
                     }
                 }
             }
@@ -18953,6 +19699,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.provider_impl.raw_quant_runtime_mapped_attempts = 0;
         self.provider_impl.raw_quant_runtime_mapped_fallbacks = 0;
         self.provider_impl.raw_quant_runtime_mapped_failures = 0;
+        self.resident_expert_hits = 0;
+        self.resident_expert_misses = 0;
+        self.resident_expert_load_bytes = 0;
+        self.resident_expert_whole_publications = 0;
+        self.resident_expert_projection_prepares = 0;
+        self.resident_expert_fused_frame_attempts = 0;
+        self.resident_expert_fused_frame_successes = 0;
+        self.resident_expert_fused_frame_fallbacks = 0;
+        self.resident_expert_device_input_reuses = 0;
+        self.resident_expert_host_transfers = 0;
         metal_runtime.resetExactJitDispatchStats(self.provider_impl.raw_decode_runtime) catch {};
         metal_tensor_mod.resetMemoryStats();
     }
@@ -19025,6 +19781,26 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn populateMemoryDebugStats(self: *const MetalCompute, stats: *ops.NativeQuantTimingStats) void {
+        stats.metal_compact_expert_cache_capacity = @intCast(compact_expert_layer_count * self.resident_expert_active_slots);
+        stats.metal_compact_expert_cache_hits = self.resident_expert_hits;
+        stats.metal_compact_expert_cache_misses = self.resident_expert_misses;
+        stats.metal_compact_expert_load_bytes = self.resident_expert_load_bytes;
+        stats.metal_compact_expert_whole_publications = self.resident_expert_whole_publications;
+        stats.metal_compact_expert_projection_prepares = self.resident_expert_projection_prepares;
+        stats.metal_compact_expert_fused_frame_attempts = self.resident_expert_fused_frame_attempts;
+        stats.metal_compact_expert_fused_frame_successes = self.resident_expert_fused_frame_successes;
+        stats.metal_compact_expert_fused_frame_fallbacks = self.resident_expert_fused_frame_fallbacks;
+        stats.metal_compact_expert_device_input_reuses = self.resident_expert_device_input_reuses;
+        stats.metal_compact_expert_host_transfers = self.resident_expert_host_transfers;
+        for (0..compact_expert_layer_count) |layer_index| {
+            for (0..self.resident_expert_active_slots) |local_slot| {
+                const slot = &self.resident_expert_slots[residentExpertFlatIndex(layer_index, local_slot)];
+                if (slot.ready()) {
+                    stats.metal_compact_expert_resident_slots +|= 1;
+                    stats.metal_compact_expert_resident_bytes +|= @intCast(compact_expert_arena_bytes);
+                }
+            }
+        }
         const tensor_stats = metal_tensor_mod.memoryStatsSnapshot();
         stats.metal_tensor_device_owned_buffers_created = tensor_stats.device_owned_buffers_created;
         stats.metal_tensor_device_owned_buffers_released = tensor_stats.device_owned_buffers_released;
@@ -19579,6 +20355,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .prefer_bf16_fallback = request.prefer_bf16_fallback,
             .prefer_f16_mps_fallback = request.prefer_f16_mps_fallback,
             .prefer_f32_mps_fallback = request.prefer_f32_mps_fallback,
+            .force_replace = request.force_replace,
+            .borrow_quantized_storage = request.borrow_quantized_storage,
             .dense_bf16_bytes = dense_bf16_bytes,
             .dense_bf16_no_copy_safe = dense_bf16_no_copy_safe,
         }, &self.timing_stats);
@@ -20664,6 +21442,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.runDenseDecoderBlock = runDenseDecoderBlockOp;
         vt.runGatedFfnResidual = runGatedFfnResidualOp;
         vt.runGatedDecoderBlock = runGatedDecoderBlockOp;
+        vt.runMoeBlock = runMoeBlockOp;
+        vt.beginMoeBlock = beginMoeBlockOp;
+        vt.finishMoeBlock = finishMoeBlockOp;
         vt.add = addOp;
         vt.multiply = multiplyOp;
         vt.debugTimingSnapshot = debugTimingSnapshotOp;
@@ -23987,6 +24768,41 @@ test "metal_compute: dynamic rms norm slot key distinguishes native dense buffer
     try std.testing.expectEqual(@intFromPtr(bytes_a[0..].ptr), key_a.weight_buf);
     try std.testing.expectEqual(@intFromPtr(bytes_b[0..].ptr), key_b.weight_buf);
     try std.testing.expect(key_a.weight_buf != key_b.weight_buf);
+}
+
+test "metal_compute: compact Gemma4 route selection is stable and normalized" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+
+    const logits = [_]f32{ 0.5, 2.0, 2.0, -1.0, 1.5, 0.25, 1.0, 0.75, 1.25, 0.0 };
+    const route = MetalCompute.selectCompactMoeRoute(&logits, 8) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 8), route.count);
+    // Equal scores use the lower expert id, matching the canonical route
+    // selector's deterministic tie break.
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 4, 8, 6, 7, 0, 5 }, route.indices[0..route.count]);
+    var weight_sum: f32 = 0.0;
+    for (route.weights[0..route.count]) |weight| {
+        try std.testing.expect(weight > 0.0);
+        weight_sum += weight;
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), weight_sum, 1e-6);
+}
+
+test "metal_compute: compact Gemma4 resident slots stay within runtime capacity" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+
+    const first = MetalCompute.residentExpertProjectionSlots(0, 0);
+    try std.testing.expectEqual(@as(usize, 512), first.gate);
+    try std.testing.expectEqual(@as(usize, 513), first.up);
+    try std.testing.expectEqual(@as(usize, 514), first.down);
+
+    const last = MetalCompute.residentExpertProjectionSlots(
+        MetalCompute.compact_expert_layer_count - 1,
+        MetalCompute.compact_expert_slot_capacity - 1,
+    );
+    try std.testing.expectEqual(@as(usize, 1949), last.gate);
+    try std.testing.expectEqual(@as(usize, 1950), last.up);
+    try std.testing.expectEqual(@as(usize, 1951), last.down);
+    try std.testing.expect(last.down < MetalCompute.metal_runtime.decoder_runtime_linear_slot_capacity);
 }
 
 test "metal_compute: causal self attention is owned by metal backend" {

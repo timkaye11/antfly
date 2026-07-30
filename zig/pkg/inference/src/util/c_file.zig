@@ -127,6 +127,23 @@ pub const MmapRegion = struct {
         return .{ .data = mapped, .fd = fd };
     }
 
+    /// Allocate a page-aligned anonymous region suitable for Metal
+    /// `newBufferWithBytesNoCopy`. The mapping remains writable so streamed
+    /// weight slots can be refilled in place without reallocating either the
+    /// host mapping or its Metal buffer descriptors.
+    pub fn initAnonymous(len: usize) !MmapRegion {
+        if (len == 0) return error.EmptyFile;
+        const mapped = try std.posix.mmap(
+            null,
+            len,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+            -1,
+            0,
+        );
+        return .{ .data = mapped, .fd = -1 };
+    }
+
     /// Hint sequential access for the first `len` bytes (the header region).
     /// Only the header is read sequentially; the rest of the file (tensor data)
     /// is left with default advice so the kernel doesn't eagerly page in
@@ -150,7 +167,7 @@ pub const MmapRegion = struct {
 
     pub fn deinit(self: *MmapRegion) void {
         std.posix.munmap(self.data);
-        closeFd(self.fd);
+        if (self.fd >= 0) closeFd(self.fd);
     }
 };
 
@@ -245,6 +262,22 @@ pub fn readRegion(allocator: std.mem.Allocator, path: []const u8, offset: u64, l
 
     try readRegionFromFd(fd, buf, offset);
     return buf;
+}
+
+/// Read a byte range through an already-open descriptor. `pread` does not
+/// mutate the descriptor offset, so callers may issue these reads concurrently
+/// without serializing on seek state.
+pub fn readRegionFromOpenFd(allocator: std.mem.Allocator, fd: std.posix.fd_t, offset: u64, len: usize) ![]u8 {
+    const buf = try allocator.alloc(u8, len);
+    errdefer allocator.free(buf);
+    try readRegionFromFd(fd, buf, offset);
+    return buf;
+}
+
+/// Read a range through an already-open descriptor directly into a caller
+/// supplied page-aligned slot.
+pub fn readRegionFromOpenFdInto(fd: std.posix.fd_t, offset: u64, destination: []u8) !void {
+    try readRegionFromFd(fd, destination, offset);
 }
 
 /// Read a byte range from a file into an existing buffer using pread.

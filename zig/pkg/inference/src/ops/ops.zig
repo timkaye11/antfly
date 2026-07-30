@@ -342,10 +342,12 @@ pub const DebertaEmbeddingsRequest = struct {
 pub const MoeForwardFusedRequest = struct {
     input: CT, // [total, hidden_size]
     router_logits: CT, // [total, num_experts]
-    w1: CT, // gate weight (packed experts)
-    w3: CT, // up weight (packed experts)
-    w2: CT, // down weight (packed experts)
+    w1: ?CT = null, // optional gate weight (packed experts)
+    w3: ?CT = null, // optional up weight (packed experts)
+    w2: ?CT = null, // optional down weight (packed experts)
     expert_scale: ?CT, // per-expert output scale [num_experts], or null
+    layer_index: usize,
+    activation: DecoderRuntimeActivationKind,
     total: usize,
     hidden_size: usize,
     inter_size: usize,
@@ -693,6 +695,19 @@ pub const NativeQuantTimingStats = struct {
     metal_provider_quantized_runtime_mapped_attempts: u64 = 0,
     metal_provider_quantized_runtime_mapped_fallbacks: u64 = 0,
     metal_provider_quantized_runtime_mapped_failures: u64 = 0,
+    metal_compact_expert_cache_capacity: u64 = 0,
+    metal_compact_expert_resident_slots: u64 = 0,
+    metal_compact_expert_resident_bytes: u64 = 0,
+    metal_compact_expert_cache_hits: u64 = 0,
+    metal_compact_expert_cache_misses: u64 = 0,
+    metal_compact_expert_load_bytes: u64 = 0,
+    metal_compact_expert_whole_publications: u64 = 0,
+    metal_compact_expert_projection_prepares: u64 = 0,
+    metal_compact_expert_fused_frame_attempts: u64 = 0,
+    metal_compact_expert_fused_frame_successes: u64 = 0,
+    metal_compact_expert_fused_frame_fallbacks: u64 = 0,
+    metal_compact_expert_device_input_reuses: u64 = 0,
+    metal_compact_expert_host_transfers: u64 = 0,
     metal_provider_quantized_runtime_private_nanos: u128 = 0,
     metal_provider_quantized_runtime_mapped_nanos: u128 = 0,
     metal_provider_dense_slot_host_bytes: u64 = 0,
@@ -1422,6 +1437,12 @@ pub const ComputeBackend = struct {
         /// the dense/gated decoder-block contracts and should only exist where
         /// routed-expert execution is structurally distinct.
         runMoeBlock: ?*const fn (ctx: *anyopaque, request: *const RunMoeBlockRequest) anyerror!?CT = null,
+
+        /// Begin routed-expert preparation without executing the block. A
+        /// successful begin owns one backend-local ticket until finish is
+        /// called, allowing independent shared-expert work to overlap disk I/O.
+        beginMoeBlock: ?*const fn (ctx: *anyopaque, request: *const RunMoeBlockRequest) anyerror!bool = null,
+        finishMoeBlock: ?*const fn (ctx: *anyopaque, request: *const RunMoeBlockRequest) anyerror!?CT = null,
 
         /// Store a per-expert output scale tensor for the current MoE layer.
         /// The graph backend threads this into fused_moe_scatter_add so the
@@ -3898,6 +3919,16 @@ pub const ComputeBackend = struct {
         if (self.vtable.runMoeBlock) |op| {
             return op(self.ptr, request);
         }
+        return null;
+    }
+
+    pub fn beginMoeBlock(self: *const ComputeBackend, request: *const RunMoeBlockRequest) !bool {
+        if (self.vtable.beginMoeBlock) |op| return op(self.ptr, request);
+        return false;
+    }
+
+    pub fn finishMoeBlock(self: *const ComputeBackend, request: *const RunMoeBlockRequest) !?CT {
+        if (self.vtable.finishMoeBlock) |op| return op(self.ptr, request);
         return null;
     }
 

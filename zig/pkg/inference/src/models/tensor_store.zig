@@ -28,8 +28,13 @@ const gguf_mod = @import("../gguf/root.zig");
 const c_file = if (builtin.os.tag == .freestanding) struct {
     pub const MmapRegion = struct {
         data: []u8 = &.{},
+        fd: std.posix.fd_t = -1,
 
         pub fn init(_: std.mem.Allocator, _: []const u8) !MmapRegion {
+            return error.UnsupportedOnFreestanding;
+        }
+
+        pub fn initAnonymous(_: usize) !MmapRegion {
             return error.UnsupportedOnFreestanding;
         }
 
@@ -39,6 +44,14 @@ const c_file = if (builtin.os.tag == .freestanding) struct {
     };
 
     pub fn readRegion(_: std.mem.Allocator, _: []const u8, _: u64, _: usize) ![]u8 {
+        return error.UnsupportedOnFreestanding;
+    }
+
+    pub fn readRegionFromOpenFd(_: std.mem.Allocator, _: std.posix.fd_t, _: u64, _: usize) ![]u8 {
+        return error.UnsupportedOnFreestanding;
+    }
+
+    pub fn readRegionFromOpenFdInto(_: std.posix.fd_t, _: u64, _: []u8) !void {
         return error.UnsupportedOnFreestanding;
     }
 } else @import("../util/c_file.zig");
@@ -96,6 +109,64 @@ pub const TensorRangeRef = struct {
     }
 };
 
+/// Exact file-backed byte range for one quantized tensor or packed expert.
+///
+/// `shape` describes the standalone matrix stored in this range. Fused
+/// gate+up aliases share the same range and select their logical rows through
+/// `row_offset` and `row_count`; callers can therefore read an expert's fused
+/// source once and expose both projections without retaining the full packed
+/// tensor mapping.
+pub const QuantizedTensorRangeRef = struct {
+    name: []const u8,
+    source_name: []const u8,
+    path: []const u8,
+    byte_offset: u64,
+    byte_len: usize,
+    tensor_type: gguf_mod.tensor_types.TensorType,
+    shape: []const i64,
+    row_offset: u32 = 0,
+    row_count: u32 = 0,
+    expert_index: ?u32 = null,
+    owned_shape: ?[]i64 = null,
+
+    pub fn deinit(self: *QuantizedTensorRangeRef, allocator: std.mem.Allocator) void {
+        if (self.owned_shape) |shape| allocator.free(shape);
+        self.* = .{
+            .name = &.{},
+            .source_name = &.{},
+            .path = &.{},
+            .byte_offset = 0,
+            .byte_len = 0,
+            .tensor_type = .{ .unknown = 0 },
+            .shape = &.{},
+        };
+    }
+};
+
+pub const QuantizedExpertProjectionDescriptor = struct {
+    byte_offset: usize,
+    byte_len: usize,
+    rows: usize,
+    cols: usize,
+    tensor_type: gguf_mod.tensor_types.TensorType,
+};
+
+/// Three standalone quantized matrix views backed by one caller-owned,
+/// page-aligned expert arena. Projection order is gate, up, down. The views
+/// own only their small shape metadata; `bytes` remains owned by the caller.
+/// `descriptors` is the stable whole-expert ABI used to publish one Metal
+/// buffer with three projection offsets in a single transaction.
+pub const QuantizedExpertLayout = struct {
+    projections: [3]weight_source_mod.QuantizedStorage,
+    descriptors: [3]QuantizedExpertProjectionDescriptor,
+    encoded_bytes: usize,
+
+    pub fn deinit(self: *QuantizedExpertLayout) void {
+        for (&self.projections) |*projection| projection.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const TensorStore = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -105,6 +176,8 @@ pub const TensorStore = struct {
         weightSource: *const fn (*anyopaque) anyerror!?weight_source_mod.WeightSource,
         describeTensor: *const fn (*anyopaque, allocator: std.mem.Allocator, name: []const u8) anyerror!LazyTensorRef,
         describeTensorRange: *const fn (*anyopaque, allocator: std.mem.Allocator, name: []const u8) anyerror!?TensorRangeRef,
+        describeQuantizedTensorRange: *const fn (*anyopaque, allocator: std.mem.Allocator, tensor_ref: *const LazyTensorRef) anyerror!?QuantizedTensorRangeRef,
+        loadQuantizedExpertInto: *const fn (*anyopaque, allocator: std.mem.Allocator, refs: *const [3]LazyTensorRef, destination: []u8) anyerror!?QuantizedExpertLayout,
         loadTensorRef: *const fn (*anyopaque, tensor_ref: *const LazyTensorRef) anyerror!weight_source_mod.LoadedWeight,
         loadQuantizedStorageRef: *const fn (*anyopaque, tensor_ref: *const LazyTensorRef) anyerror!?weight_source_mod.QuantizedStorage,
         ggufFile: *const fn (*anyopaque) ?*const gguf_mod.format.File,
@@ -125,6 +198,19 @@ pub const TensorStore = struct {
 
     pub fn describeTensorRange(self: TensorStore, allocator: std.mem.Allocator, name: []const u8) !?TensorRangeRef {
         return self.vtable.describeTensorRange(self.ptr, allocator, name);
+    }
+
+    pub fn describeQuantizedTensorRange(self: TensorStore, allocator: std.mem.Allocator, tensor_ref: *const LazyTensorRef) !?QuantizedTensorRangeRef {
+        return self.vtable.describeQuantizedTensorRange(self.ptr, allocator, tensor_ref);
+    }
+
+    pub fn loadQuantizedExpertInto(
+        self: TensorStore,
+        allocator: std.mem.Allocator,
+        refs: *const [3]LazyTensorRef,
+        destination: []u8,
+    ) !?QuantizedExpertLayout {
+        return self.vtable.loadQuantizedExpertInto(self.ptr, allocator, refs, destination);
     }
 
     pub fn loadTensorRef(self: TensorStore, tensor_ref: *const LazyTensorRef) !weight_source_mod.LoadedWeight {
@@ -153,6 +239,8 @@ pub const SafetensorsStore = struct {
         .weightSource = @ptrCast(&weightSourceImpl),
         .describeTensor = @ptrCast(&describeTensorImpl),
         .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
+        .describeQuantizedTensorRange = @ptrCast(&describeQuantizedTensorRangeImpl),
+        .loadQuantizedExpertInto = @ptrCast(&loadQuantizedExpertIntoImpl),
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
         .ggufFile = @ptrCast(&ggufFileImpl),
@@ -206,6 +294,14 @@ pub const SafetensorsStore = struct {
         };
     }
 
+    fn describeQuantizedTensorRangeImpl(_: *SafetensorsStore, _: std.mem.Allocator, _: *const LazyTensorRef) !?QuantizedTensorRangeRef {
+        return null;
+    }
+
+    fn loadQuantizedExpertIntoImpl(_: *SafetensorsStore, _: std.mem.Allocator, _: *const [3]LazyTensorRef, _: []u8) !?QuantizedExpertLayout {
+        return null;
+    }
+
     fn loadTensorRefImpl(self: *SafetensorsStore, tensor_ref: *const LazyTensorRef) !weight_source_mod.LoadedWeight {
         return .{
             .tensor = try self.source.reader.readTensor(tensor_ref.name),
@@ -237,6 +333,8 @@ pub const ShardedSafetensorsStore = struct {
         .weightSource = @ptrCast(&weightSourceImpl),
         .describeTensor = @ptrCast(&describeTensorImpl),
         .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
+        .describeQuantizedTensorRange = @ptrCast(&describeQuantizedTensorRangeImpl),
+        .loadQuantizedExpertInto = @ptrCast(&loadQuantizedExpertIntoImpl),
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
         .ggufFile = @ptrCast(&ggufFileImpl),
@@ -288,6 +386,14 @@ pub const ShardedSafetensorsStore = struct {
         };
     }
 
+    fn describeQuantizedTensorRangeImpl(_: *ShardedSafetensorsStore, _: std.mem.Allocator, _: *const LazyTensorRef) !?QuantizedTensorRangeRef {
+        return null;
+    }
+
+    fn loadQuantizedExpertIntoImpl(_: *ShardedSafetensorsStore, _: std.mem.Allocator, _: *const [3]LazyTensorRef, _: []u8) !?QuantizedExpertLayout {
+        return null;
+    }
+
     fn loadTensorRefImpl(self: *ShardedSafetensorsStore, tensor_ref: *const LazyTensorRef) !weight_source_mod.LoadedWeight {
         const resolved = try self.source.findTensorMeta(tensor_ref.name);
         return .{
@@ -323,6 +429,8 @@ pub const GgufStore = struct {
         .weightSource = @ptrCast(&weightSourceImpl),
         .describeTensor = @ptrCast(&describeTensorImpl),
         .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
+        .describeQuantizedTensorRange = @ptrCast(&describeQuantizedTensorRangeImpl),
+        .loadQuantizedExpertInto = @ptrCast(&loadQuantizedExpertIntoImpl),
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
         .ggufFile = @ptrCast(&ggufFileImpl),
@@ -409,6 +517,188 @@ pub const GgufStore = struct {
 
     fn describeTensorRangeImpl(_: *GgufStore, _: std.mem.Allocator, _: []const u8) !?TensorRangeRef {
         return null;
+    }
+
+    fn describeQuantizedTensorRangeImpl(
+        self: *GgufStore,
+        allocator: std.mem.Allocator,
+        tensor_ref: *const LazyTensorRef,
+    ) !?QuantizedTensorRangeRef {
+        // Owned byte stores have no stable file range to pread.
+        if (self.mmap_region == null) return null;
+        const path = self.path orelse return null;
+        const source_name = tensor_ref.source_name orelse tensor_ref.name;
+        const tensor = gguf_mod.tensor_catalog.Catalog.init(&self.parsed).find(source_name) orelse return error.TensorNotFound;
+        if (!tensor.tensor_type.isQuantized()) return null;
+
+        const full_shape = try normalizedShapeFromDims(allocator, tensor.dimensions);
+        defer allocator.free(full_shape);
+        const full_byte_len_u64 = gguf_mod.tensor_types.byteLen(tensor.tensor_type, tensor.dimensions) orelse return error.UnsupportedTensorType;
+        const full_byte_len: usize = @intCast(full_byte_len_u64);
+
+        var byte_offset = tensor.data_offset;
+        var byte_len = full_byte_len;
+        var expert_index: ?u32 = null;
+        var shape_source = full_shape;
+
+        if (tensor_ref.packed_expert_index) |index| {
+            const expert_count = tensor_ref.packed_expert_count;
+            if (expert_count == 0 or index >= expert_count) return error.InvalidPackedExpertTensor;
+            const expert_axis = findPackedExpertAxis(full_shape, expert_count) orelse return error.InvalidPackedExpertTensor;
+            // Reversed GGUF dimensions use row-major order here. Only axis 0
+            // gives a single contiguous source range per expert.
+            if (expert_axis != 0 or full_shape[0] != expert_count) return error.NonContiguousPackedExpertTensor;
+            if (full_byte_len % expert_count != 0) return error.InvalidPackedExpertTensor;
+            byte_len = full_byte_len / expert_count;
+            byte_offset += @as(u64, index) * @as(u64, @intCast(byte_len));
+            expert_index = index;
+            shape_source = full_shape[1..];
+        } else if (tensor_ref.packed_expert_count != 0) {
+            // Compact residency must name an exact expert. A whole packed MoE
+            // tensor is deliberately not exposed as a streamable range.
+            return error.PackedExpertIndexRequired;
+        }
+
+        const shape = try allocator.dupe(i64, shape_source);
+        errdefer allocator.free(shape);
+        if (shape.len != 2) return error.InvalidPackedExpertTensor;
+
+        var row_offset: u32 = 0;
+        var row_count: u32 = @intCast(shape[0]);
+        if (tensor_ref.fused_gate_up) {
+            if (@mod(shape[0], 2) != 0) return error.InvalidPackedExpertTensor;
+            row_count = @intCast(@divExact(shape[0], 2));
+            if (tensor_ref.fused_gate_up_index == 1) row_offset = row_count;
+        }
+
+        return .{
+            .name = tensor_ref.name,
+            .source_name = source_name,
+            .path = path,
+            .byte_offset = byte_offset,
+            .byte_len = byte_len,
+            .tensor_type = tensor.tensor_type,
+            .shape = shape,
+            .row_offset = row_offset,
+            .row_count = row_count,
+            .expert_index = expert_index,
+            .owned_shape = shape,
+        };
+    }
+
+    const ExpertProjectionRange = struct {
+        source_offset: u64,
+        byte_len: usize,
+        rows: usize,
+        cols: usize,
+        tensor_type: gguf_mod.tensor_types.TensorType,
+    };
+
+    fn expertProjectionRange(range: *const QuantizedTensorRangeRef) !ExpertProjectionRange {
+        if (range.shape.len != 2 or range.row_count == 0) return error.InvalidPackedExpertTensor;
+        const source_rows: usize = @intCast(range.shape[0]);
+        const row_offset: usize = @intCast(range.row_offset);
+        const row_count: usize = @intCast(range.row_count);
+        if (source_rows == 0 or row_offset + row_count > source_rows or range.byte_len % source_rows != 0)
+            return error.InvalidPackedExpertTensor;
+        const encoded_row_bytes = range.byte_len / source_rows;
+        return .{
+            .source_offset = try std.math.add(
+                u64,
+                range.byte_offset,
+                try std.math.mul(u64, @intCast(row_offset), @intCast(encoded_row_bytes)),
+            ),
+            .byte_len = try std.math.mul(usize, row_count, encoded_row_bytes),
+            .rows = row_count,
+            .cols = @intCast(range.shape[1]),
+            .tensor_type = range.tensor_type,
+        };
+    }
+
+    fn loadQuantizedExpertIntoImpl(
+        self: *GgufStore,
+        allocator: std.mem.Allocator,
+        refs: *const [3]LazyTensorRef,
+        destination: []u8,
+    ) !?QuantizedExpertLayout {
+        const mapped = self.mmap_region orelse return null;
+        var ranges: [3]QuantizedTensorRangeRef = undefined;
+        var range_count: usize = 0;
+        defer for (ranges[0..range_count]) |*range| range.deinit(allocator);
+        for (refs, 0..) |*tensor_ref, index| {
+            ranges[index] = (try self.describeQuantizedTensorRangeImpl(allocator, tensor_ref)) orelse return null;
+            range_count += 1;
+        }
+
+        var logical_ranges: [3]ExpertProjectionRange = undefined;
+        var encoded_bytes: usize = 0;
+        for (&ranges, 0..) |*range, index| {
+            logical_ranges[index] = try expertProjectionRange(range);
+            encoded_bytes = try std.math.add(usize, encoded_bytes, logical_ranges[index].byte_len);
+        }
+        if (destination.len < encoded_bytes) return error.DestinationTooSmall;
+
+        // Gemma4 gate and up are adjacent halves of one fused source tensor.
+        // Read both halves in one pread when possible; down remains the second
+        // and final file read for the whole expert.
+        const gate = logical_ranges[0];
+        const up = logical_ranges[1];
+        var destination_offset: usize = 0;
+        if (std.mem.eql(u8, ranges[0].source_name, ranges[1].source_name) and
+            gate.source_offset + gate.byte_len == up.source_offset)
+        {
+            const fused_len = try std.math.add(usize, gate.byte_len, up.byte_len);
+            try c_file.readRegionFromOpenFdInto(mapped.fd, gate.source_offset, destination[0..fused_len]);
+            destination_offset = fused_len;
+        } else {
+            try c_file.readRegionFromOpenFdInto(mapped.fd, gate.source_offset, destination[0..gate.byte_len]);
+            destination_offset = gate.byte_len;
+            try c_file.readRegionFromOpenFdInto(
+                mapped.fd,
+                up.source_offset,
+                destination[destination_offset .. destination_offset + up.byte_len],
+            );
+            destination_offset += up.byte_len;
+        }
+        const down = logical_ranges[2];
+        try c_file.readRegionFromOpenFdInto(
+            mapped.fd,
+            down.source_offset,
+            destination[destination_offset .. destination_offset + down.byte_len],
+        );
+        destination_offset += down.byte_len;
+        @memset(destination[destination_offset..], 0);
+
+        var projections: [3]weight_source_mod.QuantizedStorage = undefined;
+        var descriptors: [3]QuantizedExpertProjectionDescriptor = undefined;
+        var projection_count: usize = 0;
+        errdefer for (projections[0..projection_count]) |*projection| projection.deinit();
+        var byte_offset: usize = 0;
+        for (logical_ranges, 0..) |logical, index| {
+            const shape = try allocator.dupe(i64, &.{ @intCast(logical.rows), @intCast(logical.cols) });
+            projections[index] = .{
+                .tensor_type = logical.tensor_type,
+                .raw_bytes = destination[byte_offset .. byte_offset + logical.byte_len],
+                .shape = shape,
+                .raw_owned = false,
+                .raw_mmap_backed = true,
+                .allocator = allocator,
+            };
+            descriptors[index] = .{
+                .byte_offset = byte_offset,
+                .byte_len = logical.byte_len,
+                .rows = logical.rows,
+                .cols = logical.cols,
+                .tensor_type = logical.tensor_type,
+            };
+            projection_count += 1;
+            byte_offset += logical.byte_len;
+        }
+        return .{
+            .projections = projections,
+            .descriptors = descriptors,
+            .encoded_bytes = encoded_bytes,
+        };
     }
 
     fn loadTensorRefImpl(self: *GgufStore, tensor_ref: *const LazyTensorRef) !weight_source_mod.LoadedWeight {
@@ -632,45 +922,42 @@ fn ggufGetPackedExpertQuantizedStorage(
     tensor_ref: *const LazyTensorRef,
     expert_index: u32,
 ) !?weight_source_mod.QuantizedStorage {
-    const source_name = tensor_ref.source_name orelse return error.TensorNotFound;
-    const tensor = gguf_mod.tensor_catalog.Catalog.init(&self.parsed).find(source_name) orelse return error.TensorNotFound;
-    if (!tensor.tensor_type.isQuantized()) return null;
+    _ = expert_index;
+    var range = (try self.describeQuantizedTensorRangeImpl(self.allocator, tensor_ref)) orelse return null;
+    defer range.deinit(self.allocator);
 
-    const full_shape = try normalizedShapeFromDims(self.allocator, tensor.dimensions);
-    errdefer self.allocator.free(full_shape);
-    const expert_axis = findPackedExpertAxis(full_shape, tensor_ref.packed_expert_count) orelse return error.InvalidPackedExpertTensor;
-    if (expert_index >= @as(u32, @intCast(full_shape[expert_axis]))) return error.InvalidPackedExpertTensor;
+    if (range.shape.len != 2 or range.row_count == 0) return error.InvalidPackedExpertTensor;
+    const source_rows: usize = @intCast(range.shape[0]);
+    const row_offset: usize = @intCast(range.row_offset);
+    const row_count: usize = @intCast(range.row_count);
+    if (source_rows == 0 or row_offset + row_count > source_rows or range.byte_len % source_rows != 0)
+        return error.InvalidPackedExpertTensor;
 
-    const byte_len_u64 = gguf_mod.tensor_types.byteLen(tensor.tensor_type, tensor.dimensions) orelse return error.UnsupportedTensorType;
-    const byte_len: usize = @intCast(byte_len_u64);
-    const data_off: usize = @intCast(tensor.data_offset);
-    const raw_bytes = self.rawData()[data_off .. data_off + byte_len];
-
-    // For fused gate+up tensors, set row_offset so w1 (gate) uses the first
-    // half of the out_dim axis and w3 (up) uses the second half.
-    // Keep the full shape for correct stride calculation.
-    var row_offset: u32 = 0;
-    if (tensor_ref.fused_gate_up and full_shape.len == 3) {
-        const out_dim_axis = try ggufPackedFusedGateUpOutputAxis(self, full_shape, expert_axis);
-        const half_dim: u32 = @intCast(@divExact(full_shape[out_dim_axis], 2));
-        if (tensor_ref.fused_gate_up_index == 1) {
-            row_offset = half_dim;
-        }
-    }
+    const encoded_row_bytes = range.byte_len / source_rows;
+    const logical_byte_offset = try std.math.add(
+        u64,
+        range.byte_offset,
+        try std.math.mul(u64, @intCast(row_offset), @intCast(encoded_row_bytes)),
+    );
+    const logical_byte_len = try std.math.mul(usize, row_count, encoded_row_bytes);
+    const raw_bytes = try c_file.readRegionFromOpenFd(
+        self.allocator,
+        self.mmap_region.?.fd,
+        logical_byte_offset,
+        logical_byte_len,
+    );
+    errdefer self.allocator.free(raw_bytes);
+    const logical_shape = try self.allocator.dupe(i64, &.{ @intCast(row_count), range.shape[1] });
+    errdefer self.allocator.free(logical_shape);
 
     return weight_source_mod.QuantizedStorage{
-        .tensor_type = tensor.tensor_type,
-        .raw_bytes = @constCast(raw_bytes),
-        .shape = full_shape,
-        .source_name = try self.allocator.dupe(u8, source_name),
-        .packed_expert = .{
-            .expert_index = expert_index,
-            .expert_count = tensor_ref.packed_expert_count,
-            .expert_axis = @intCast(expert_axis),
-            .row_offset = row_offset,
-        },
-        .raw_owned = false,
-        .raw_mmap_backed = self.mmap_region != null,
+        .tensor_type = range.tensor_type,
+        .raw_bytes = raw_bytes,
+        .shape = logical_shape,
+        .source_name = try self.allocator.dupe(u8, range.source_name),
+        .packed_expert = null,
+        .raw_owned = true,
+        .raw_mmap_backed = false,
         .allocator = self.allocator,
     };
 }
@@ -949,6 +1236,8 @@ pub const CompositeGlinerStore = struct {
         .weightSource = @ptrCast(&weightSourceImpl),
         .describeTensor = @ptrCast(&describeTensorImpl),
         .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
+        .describeQuantizedTensorRange = @ptrCast(&describeQuantizedTensorRangeImpl),
+        .loadQuantizedExpertInto = @ptrCast(&loadQuantizedExpertIntoImpl),
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
         .ggufFile = @ptrCast(&ggufFileImpl),
@@ -1014,6 +1303,28 @@ pub const CompositeGlinerStore = struct {
             return null;
         }
         return null;
+    }
+
+    fn describeQuantizedTensorRangeImpl(self: *CompositeGlinerStore, allocator: std.mem.Allocator, tensor_ref: *const LazyTensorRef) !?QuantizedTensorRangeRef {
+        const source_name = tensor_ref.source_name orelse tensor_ref.name;
+        if (self.hasHeadTensor(source_name)) {
+            if (self.head_safetensors != null) return null;
+            return self.head_gguf.?.describeQuantizedTensorRangeImpl(allocator, tensor_ref);
+        }
+        return self.encoder.describeQuantizedTensorRangeImpl(allocator, tensor_ref);
+    }
+
+    fn loadQuantizedExpertIntoImpl(
+        self: *CompositeGlinerStore,
+        allocator: std.mem.Allocator,
+        refs: *const [3]LazyTensorRef,
+        destination: []u8,
+    ) !?QuantizedExpertLayout {
+        for (refs) |*tensor_ref| {
+            const source_name = tensor_ref.source_name orelse tensor_ref.name;
+            if (self.hasHeadTensor(source_name)) return null;
+        }
+        return self.encoder.loadQuantizedExpertIntoImpl(allocator, refs, destination);
     }
 
     fn loadTensorRefImpl(self: *CompositeGlinerStore, tensor_ref: *const LazyTensorRef) !weight_source_mod.LoadedWeight {
@@ -1297,6 +1608,86 @@ test "open gguf tensor store from manifest" {
     try std.testing.expectEqual(@import("../backends/tensor.zig").DType.f16, loaded.tensor.dtype);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x3C, 0x00, 0x40, 0x00, 0x42, 0x00, 0x44 }, loaded.tensor.data);
     tensor_ref.deinit(allocator);
+}
+
+test "gguf tensor store describes one contiguous quantized expert range" {
+    const allocator = std.testing.allocator;
+
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    const source_name = "blk.0.ffn_gate_up_exps.weight";
+    try data.appendSlice(allocator, "GGUF");
+    try appendLe(u32, allocator, &data, 3);
+    try appendLe(u64, allocator, &data, 1);
+    try appendLe(u64, allocator, &data, 0);
+    try appendString(allocator, &data, source_name);
+    try appendLe(u32, allocator, &data, 3);
+    // GGUF dimensions are innermost first; the normalized shape is [2, 4, 32].
+    try appendLe(u64, allocator, &data, 32);
+    try appendLe(u64, allocator, &data, 4);
+    try appendLe(u64, allocator, &data, 2);
+    try appendLe(u32, allocator, &data, @intFromEnum(gguf_mod.tensor_types.KnownTensorType.Q4_0));
+    try appendLe(u64, allocator, &data, 0);
+    try padToAlignment(allocator, &data, gguf_mod.format.default_alignment);
+    const payload_offset = data.items.len;
+    try data.appendNTimes(allocator, 0x11, 72);
+    try data.appendNTimes(allocator, 0x21, 36);
+    try data.appendNTimes(allocator, 0x22, 36);
+
+    const dir_path = try testScratchDir(allocator, "tensor-store-gguf-quantized-expert-range");
+    defer {
+        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    const path = try std.fs.path.join(allocator, &.{ dir_path, "model.gguf" });
+    defer allocator.free(path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = data.items });
+
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .gguf_path = try allocator.dupe(u8, path),
+    };
+    defer manifest.deinit();
+
+    const store = try openFromManifest(allocator, manifest);
+    defer store.deinit();
+    const tensor_ref = LazyTensorRef{
+        .name = "blk.0.ffn_gate_exps.1.weight",
+        .source_name = source_name,
+        .quantized = true,
+        .packed_expert_index = 1,
+        .packed_expert_count = 2,
+        .fused_gate_up = true,
+        .fused_gate_up_index = 0,
+    };
+
+    var range = (try store.describeQuantizedTensorRange(allocator, &tensor_ref)) orelse return error.TestUnexpectedResult;
+    defer range.deinit(allocator);
+    try std.testing.expectEqualStrings(path, range.path);
+    try std.testing.expectEqual(@as(u64, @intCast(payload_offset + 72)), range.byte_offset);
+    try std.testing.expectEqual(@as(usize, 72), range.byte_len);
+    try std.testing.expect(range.tensor_type.eql(.{ .known = .Q4_0 }));
+    try std.testing.expectEqualSlices(i64, &.{ 4, 32 }, range.shape);
+    try std.testing.expectEqual(@as(u32, 0), range.row_offset);
+    try std.testing.expectEqual(@as(u32, 2), range.row_count);
+    try std.testing.expectEqual(@as(?u32, 1), range.expert_index);
+
+    var gate_storage = (try store.loadQuantizedStorageRef(&tensor_ref)) orelse return error.TestUnexpectedResult;
+    defer gate_storage.deinit();
+    try std.testing.expectEqualSlices(i64, &.{ 2, 32 }, gate_storage.shape);
+    try std.testing.expectEqual(@as(usize, 36), gate_storage.raw_bytes.len);
+    try std.testing.expect(gate_storage.packed_expert == null);
+    for (gate_storage.raw_bytes) |byte| try std.testing.expectEqual(@as(u8, 0x21), byte);
+
+    var up_ref = tensor_ref;
+    up_ref.name = "blk.0.ffn_up_exps.1.weight";
+    up_ref.fused_gate_up_index = 1;
+    var up_storage = (try store.loadQuantizedStorageRef(&up_ref)) orelse return error.TestUnexpectedResult;
+    defer up_storage.deinit();
+    try std.testing.expectEqualSlices(i64, &.{ 2, 32 }, up_storage.shape);
+    try std.testing.expectEqual(@as(usize, 36), up_storage.raw_bytes.len);
+    for (up_storage.raw_bytes) |byte| try std.testing.expectEqual(@as(u8, 0x22), byte);
 }
 
 test "open split gliner gguf bundle from manifest" {

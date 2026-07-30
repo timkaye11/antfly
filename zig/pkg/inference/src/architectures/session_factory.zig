@@ -2871,32 +2871,45 @@ fn appendPackedMoeLazyWeights(
     var base_ref = try store.describeTensor(allocator, full_name);
     defer base_ref.deinit(allocator);
 
-    // For fused gate+up, register both w1 and w3 projections from the same source tensor.
+    // Register exact per-expert aliases for ordinary packed GGUF MoE tensors.
+    // The tensor store turns these aliases into bounded pread ranges, while
+    // the architecture's scalar expert path naturally keeps routing and
+    // eviction independent of the source tensor's packed representation.
     const projs: []const []const u8 = if (packed_tensor.proj2) |p2|
         &.{ packed_tensor.proj, p2 }
     else
         &.{packed_tensor.proj};
 
-    for (projs, 0..) |proj, proj_idx| {
-        const key = try std.fmt.allocPrint(
-            allocator,
-            "model.layers.{d}.block_sparse_moe.packed.{s}.weight",
-            .{ packed_tensor.layer, proj },
-        );
-        errdefer allocator.free(key);
-        try lazy_weights.put(allocator, key, .{
-            .tensor_ref = .{
-                .name = try allocator.dupe(u8, key),
-                .source_name = try allocator.dupe(u8, base_ref.name),
-                .byte_len = base_ref.byte_len,
-                .quantized = base_ref.quantized,
-                .packed_expert_count = gpt_cfg.num_local_experts,
-                .fused_gate_up = packed_tensor.fused_gate_up,
-                .fused_gate_up_index = @intCast(proj_idx),
-            },
-            .projection_mask = projectionMaskForWeightKey(key),
-            .placement = runtime.tier.planner.planForContext(plan_context, key, base_ref.byte_len),
-        });
+    const expert_count: usize = @intCast(gpt_cfg.num_local_experts);
+    if (base_ref.byte_len % expert_count != 0) return error.InvalidPackedExpertTensor;
+    const expert_source_bytes = base_ref.byte_len / expert_count;
+    for (0..expert_count) |expert_index| {
+        for (projs, 0..) |proj, proj_idx| {
+            const key = try std.fmt.allocPrint(
+                allocator,
+                "model.layers.{d}.block_sparse_moe.experts.{d}.{s}.weight",
+                .{ packed_tensor.layer, expert_index, proj },
+            );
+            errdefer allocator.free(key);
+            try lazy_weights.put(allocator, key, .{
+                .tensor_ref = .{
+                    .name = try allocator.dupe(u8, key),
+                    .source_name = try allocator.dupe(u8, base_ref.name),
+                    .byte_len = if (packed_tensor.fused_gate_up) expert_source_bytes / 2 else expert_source_bytes,
+                    .quantized = base_ref.quantized,
+                    .packed_expert_index = @intCast(expert_index),
+                    .packed_expert_count = gpt_cfg.num_local_experts,
+                    .fused_gate_up = packed_tensor.fused_gate_up,
+                    .fused_gate_up_index = @intCast(proj_idx),
+                },
+                .expert_coord = .{
+                    .layer_index = packed_tensor.layer,
+                    .expert_index = @intCast(expert_index),
+                },
+                .projection_mask = projectionMaskForWeightKey(key),
+                .placement = runtime.tier.planner.planForContext(plan_context, key, expert_source_bytes),
+            });
+        }
     }
 
     return true;
@@ -3439,6 +3452,8 @@ test "Metal JIT scope discovers quantized weights in a secondary GGUF store" {
             .weightSource = @ptrCast(&weightSourceImpl),
             .describeTensor = @ptrCast(&describeTensorImpl),
             .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
+            .describeQuantizedTensorRange = @ptrCast(&describeQuantizedTensorRangeImpl),
+            .loadQuantizedExpertInto = @ptrCast(&loadQuantizedExpertIntoImpl),
             .loadTensorRef = @ptrCast(&loadTensorRefImpl),
             .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
             .ggufFile = @ptrCast(&ggufFileImpl),
@@ -3462,6 +3477,23 @@ test "Metal JIT scope discovers quantized weights in a secondary GGUF store" {
         }
 
         fn describeTensorRangeImpl(_: *@This(), _: std.mem.Allocator, _: []const u8) !?tensor_store_mod.TensorRangeRef {
+            return null;
+        }
+
+        fn describeQuantizedTensorRangeImpl(
+            _: *@This(),
+            _: std.mem.Allocator,
+            _: *const tensor_store_mod.LazyTensorRef,
+        ) !?tensor_store_mod.QuantizedTensorRangeRef {
+            return null;
+        }
+
+        fn loadQuantizedExpertIntoImpl(
+            _: *@This(),
+            _: std.mem.Allocator,
+            _: *const [3]tensor_store_mod.LazyTensorRef,
+            _: []u8,
+        ) !?tensor_store_mod.QuantizedExpertLayout {
             return null;
         }
 
@@ -3611,9 +3643,15 @@ fn defaultResidentExpertsPerLayer(arch_config: ArchConfig) usize {
         .gpt => |cfg| blk: {
             if (!cfg.usesMoe() or cfg.num_local_experts <= 0) break :blk 0;
             const num_experts: usize = @intCast(cfg.num_local_experts);
+            if (cfg.family == .gemma) {
+                if (platform.env.getenvUsize("ANTFLY_GEMMA4_COMPACT_EXPERT_SLOTS")) |requested| {
+                    break :blk @min(num_experts, requested);
+                }
+            }
             const top_k = @max(@as(usize, 1), @as(usize, @intCast(cfg.num_experts_per_tok)));
             // For large expert counts (e.g. 128), keep more experts resident
-            // to reduce lazy loading overhead with high top_k.
+            // to reduce lazy loading overhead with high top_k. Compact Gemma
+            // profiles override this explicitly above.
             const multiplier: usize = if (num_experts >= 64) 3 else 2;
             break :blk @min(num_experts, @max(@as(usize, 4), top_k * multiplier));
         },
