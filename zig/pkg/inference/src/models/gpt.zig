@@ -228,6 +228,12 @@ pub const Config = struct {
     attention_k_eq_v: bool = false,
     disable_token_embedding_scale: bool = false,
 
+    // Set at session creation when the model was loaded under a compact
+    // memory profile. Makes the bounded streaming routed-expert route
+    // mandatory: MoE execution must never fall back to a path that maps or
+    // loads the full expert set, and unsupported conditions are errors.
+    compact_moe_streaming: bool = false,
+
     // Weight tying: when true, lm_head reuses embedding weights (no separate lm_head.weight tensor).
     weight_tying: bool = false,
 

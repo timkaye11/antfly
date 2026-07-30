@@ -949,6 +949,11 @@ pub const BackendDebugTimingSnapshot = struct {
     quant: QuantExecutionTimingStats = .{},
 };
 
+pub const CompactMemoryProfile = backend_contracts.CompactMemoryProfile;
+pub const CompactInferenceRequest = backend_contracts.CompactInferenceRequest;
+pub const CompactExpertGeometry = backend_contracts.CompactExpertGeometry;
+pub const CompactInferenceConfig = backend_contracts.CompactInferenceConfig;
+pub const buildCompactInferenceConfig = backend_contracts.buildCompactInferenceConfig;
 pub const DecoderRuntimePrepareReuseResult = backend_contracts.DecoderRuntimePrepareReuseResult;
 pub const AttentionContext = backend_contracts.AttentionContext;
 pub const DecoderRuntimeDecodeContract = backend_contracts.DecoderRuntimeDecodeContract;

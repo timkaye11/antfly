@@ -8234,12 +8234,25 @@ fn beginCompactMoeBlock(
     const inter_size = config.expertIntermediateSize();
     const num_experts: usize = config.num_local_experts;
     const top_k: usize = @min(@as(usize, @intCast(config.num_experts_per_tok)), num_experts);
-    const supported = total == 1 and config.family == .gemma and
+    // Begin/finish overlap is a single-row decode optimization; multi-row
+    // chunks route through runMoeBlock in moeFeedForwardInner.
+    if (total != 1) return null;
+    const geometry_ok = config.family == .gemma and
         hidden_size == 2816 and inter_size == 704 and
-        num_experts == 128 and top_k == 8 and
-        cb.kind() != .graph and cb.vtable.beginMoeBlock != null and cb.vtable.finishMoeBlock != null and
-        !platform.env.getenvBool("ANTFLY_GEMMA4_DISABLE_COMPACT_MOE");
-    if (!supported) return null;
+        num_experts == 128 and top_k == 8;
+    const backend_ok = cb.kind() != .graph and
+        cb.vtable.beginMoeBlock != null and cb.vtable.finishMoeBlock != null;
+    if (config.compact_moe_streaming) {
+        // The load-time contract already validated the geometry, and the
+        // debug kill switch cannot override a mandatory compact session:
+        // falling back would map the full expert set.
+        if (!geometry_ok) return error.CompactMoeGeometryMismatch;
+        if (!backend_ok) return error.CompactMoeBackendUnavailable;
+    } else {
+        const supported = geometry_ok and backend_ok and
+            !platform.env.getenvBool("ANTFLY_GEMMA4_DISABLE_COMPACT_MOE");
+        if (!supported) return null;
+    }
 
     const router_weight_fetch_started_at = monotonicNowNs();
     const router_w = try getMoeRouterWeight(cb, config, layer, name_buf);
@@ -8277,6 +8290,7 @@ fn beginCompactMoeBlock(
     if (!(try cb.beginMoeBlock(&pending.request))) {
         pending.releaseInputs(cb);
         pending.active = false;
+        if (config.compact_moe_streaming) return error.CompactMoeBackendUnavailable;
         return null;
     }
     return pending;
@@ -8331,10 +8345,11 @@ fn moeFeedForwardInner(
     try maybeDebugMoeRoutesLastRow(cb, allocator, layer, router_logits_ct, num_experts, top_k);
     debug_timing_stats.moe_router_proj_nanos += @intCast(monotonicNowNs() - router_proj_started_at);
 
-    const compact_gemma4_moe = config.family == .gemma and
+    const compact_mandatory = config.compact_moe_streaming;
+    const compact_gemma4_moe = compact_mandatory or (config.family == .gemma and
         hidden_size == 2816 and inter_size == 704 and
         num_experts == 128 and top_k == 8 and
-        !platform.env.getenvBool("ANTFLY_GEMMA4_DISABLE_COMPACT_MOE");
+        !platform.env.getenvBool("ANTFLY_GEMMA4_DISABLE_COMPACT_MOE"));
     if (compact_gemma4_moe and cb.kind() != .graph and cb.vtable.runMoeBlock != null) {
         const expert_scale_ct: ?CT = blk: {
             const sn = std.fmt.bufPrint(name_buf, "model.layers.{d}.block_sparse_moe.expert_output_scale", .{layer}) catch break :blk null;
@@ -8356,6 +8371,11 @@ fn moeFeedForwardInner(
             if (skip_shared_expert) return routed_output;
             return maybeAddSharedExpert(cb, allocator, config, input, routed_output, total, layer, name_buf);
         }
+        if (compact_mandatory) return error.CompactMoeUnavailable;
+    } else if (compact_mandatory) {
+        // A compact session must never reach the generic routed path below:
+        // it loads whole experts through the full-residency tiers.
+        return error.CompactMoeBackendUnavailable;
     }
 
     const route_select_started_at = monotonicNowNs();

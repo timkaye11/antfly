@@ -39,6 +39,177 @@ pub const BackendKind = enum {
     graph,
 };
 
+/// Load-time memory profile requested for a model instance. Today the only
+/// profile is the 2 GB-class compact streaming profile for large MoE models.
+pub const CompactMemoryProfile = enum(u8) {
+    compact_2gbs,
+};
+
+/// Caller-chosen half of the compact contract. Carried by value from the CLI
+/// or server through session creation; never transported through the process
+/// environment.
+pub const CompactInferenceRequest = struct {
+    profile: CompactMemoryProfile = .compact_2gbs,
+    /// Resident routed-expert slots per MoE layer. 0 selects the automatic
+    /// tier; explicit values must be 8, 12, or 16.
+    expert_cache_slots: u8 = 0,
+    /// Parallel expert pread workers feeding the streaming cache.
+    io_workers: u8 = 4,
+    /// Preferred prefill chunk in rows. Must be 32, 64, or 128; the runtime
+    /// may only reduce it when the budget or shape requires.
+    preferred_prefill_rows: u16 = 128,
+};
+
+/// Routed-expert geometry derived from model metadata at load time. The
+/// compact profile refuses to run when the derived geometry is not an exact
+/// qualified configuration.
+pub const CompactExpertGeometry = struct {
+    moe_layer_count: u16,
+    expert_count: u16,
+    top_k: u8,
+    hidden_size: u32,
+    expert_intermediate_size: u32,
+    /// Quantized bytes for one whole routed expert (gate, up, and down
+    /// projections) as stored in the model artifact.
+    encoded_expert_bytes: u64,
+};
+
+/// Geometries the compact profile is qualified for. Exactly the released
+/// Gemma 4 26B-A4B Q4_0 layout for now; widening this table requires the
+/// full parity and footprint qualification matrix.
+pub const qualified_compact_geometries = [_]CompactExpertGeometry{
+    .{
+        .moe_layer_count = 30,
+        .expert_count = 128,
+        .top_k = 8,
+        .hidden_size = 2816,
+        .expert_intermediate_size = 704,
+        .encoded_expert_bytes = 3_345_408,
+    },
+};
+
+/// Immutable, validated compact contract for one model instance. Built during
+/// session creation from a `CompactInferenceRequest` plus metadata-derived
+/// geometry, then passed by value to every consumer. Presence of this config
+/// makes the compact route mandatory: unsupported conditions fail the load or
+/// the generation instead of falling back to a full-expert-set route.
+pub const CompactInferenceConfig = struct {
+    profile: CompactMemoryProfile,
+    /// Resolved resident routed-expert slots per MoE layer (8, 12, or 16).
+    expert_cache_slots: u8,
+    /// True when the caller left slot selection automatic; the residency
+    /// ledger may downshift tiers only in this mode.
+    expert_cache_slots_auto: bool,
+    io_workers: u8,
+    preferred_prefill_rows: u16,
+    /// Hard process ceiling for phys_footprint under this profile.
+    resident_ceiling_bytes: u64 = default_resident_ceiling_bytes,
+    /// Reserve kept free below the ceiling; crossing ceiling-reserve starts
+    /// eviction and decommit, crossing the ceiling rejects or aborts.
+    safety_reserve_bytes: u64 = default_safety_reserve_bytes,
+    /// The compact profile budgets an FP16 KV cache.
+    kv_dtype_f16: bool = true,
+    geometry: CompactExpertGeometry,
+
+    pub const default_resident_ceiling_bytes: u64 = 2_120_000_000;
+    pub const default_safety_reserve_bytes: u64 = 128 * 1024 * 1024;
+    /// Automatic slot tier resolution order, highest first.
+    pub const slot_tiers = [_]u8{ 16, 12, 8 };
+
+    pub fn softLimitBytes(self: CompactInferenceConfig) u64 {
+        return self.resident_ceiling_bytes -| self.safety_reserve_bytes;
+    }
+};
+
+pub const CompactConfigError = error{
+    CompactProfileInvalidExpertCacheSlots,
+    CompactProfileInvalidIoWorkers,
+    CompactProfileInvalidPrefillRows,
+    CompactProfileUnsupportedGeometry,
+};
+
+/// Validate a request against derived geometry and freeze the immutable
+/// config. Fail-closed: anything outside the qualified envelope is an error,
+/// never a silent adjustment.
+pub fn buildCompactInferenceConfig(
+    request: CompactInferenceRequest,
+    geometry: CompactExpertGeometry,
+) CompactConfigError!CompactInferenceConfig {
+    const qualified = for (qualified_compact_geometries) |candidate| {
+        if (std.meta.eql(candidate, geometry)) break true;
+    } else false;
+    if (!qualified) return error.CompactProfileUnsupportedGeometry;
+    const slots_auto = request.expert_cache_slots == 0;
+    const slots: u8 = if (slots_auto) 12 else switch (request.expert_cache_slots) {
+        8, 12, 16 => request.expert_cache_slots,
+        else => return error.CompactProfileInvalidExpertCacheSlots,
+    };
+    if (request.io_workers == 0 or request.io_workers > 8) {
+        return error.CompactProfileInvalidIoWorkers;
+    }
+    switch (request.preferred_prefill_rows) {
+        32, 64, 128 => {},
+        else => return error.CompactProfileInvalidPrefillRows,
+    }
+    return .{
+        .profile = request.profile,
+        .expert_cache_slots = slots,
+        .expert_cache_slots_auto = slots_auto,
+        .io_workers = request.io_workers,
+        .preferred_prefill_rows = request.preferred_prefill_rows,
+        .geometry = geometry,
+    };
+}
+
+test "buildCompactInferenceConfig accepts only the qualified A4B geometry" {
+    const good = qualified_compact_geometries[0];
+    const config = try buildCompactInferenceConfig(.{}, good);
+    try std.testing.expectEqual(@as(u8, 12), config.expert_cache_slots);
+    try std.testing.expect(config.expert_cache_slots_auto);
+    try std.testing.expectEqual(@as(u8, 4), config.io_workers);
+    try std.testing.expectEqual(@as(u16, 128), config.preferred_prefill_rows);
+    try std.testing.expectEqual(
+        config.resident_ceiling_bytes - config.safety_reserve_bytes,
+        config.softLimitBytes(),
+    );
+
+    var wrong_experts = good;
+    wrong_experts.expert_count = 64;
+    try std.testing.expectError(
+        error.CompactProfileUnsupportedGeometry,
+        buildCompactInferenceConfig(.{}, wrong_experts),
+    );
+    var wrong_bytes = good;
+    wrong_bytes.encoded_expert_bytes += 1;
+    try std.testing.expectError(
+        error.CompactProfileUnsupportedGeometry,
+        buildCompactInferenceConfig(.{}, wrong_bytes),
+    );
+}
+
+test "buildCompactInferenceConfig validates request knobs fail-closed" {
+    const good = qualified_compact_geometries[0];
+    const explicit = try buildCompactInferenceConfig(.{ .expert_cache_slots = 16 }, good);
+    try std.testing.expectEqual(@as(u8, 16), explicit.expert_cache_slots);
+    try std.testing.expect(!explicit.expert_cache_slots_auto);
+    try std.testing.expectError(
+        error.CompactProfileInvalidExpertCacheSlots,
+        buildCompactInferenceConfig(.{ .expert_cache_slots = 10 }, good),
+    );
+    try std.testing.expectError(
+        error.CompactProfileInvalidIoWorkers,
+        buildCompactInferenceConfig(.{ .io_workers = 0 }, good),
+    );
+    try std.testing.expectError(
+        error.CompactProfileInvalidIoWorkers,
+        buildCompactInferenceConfig(.{ .io_workers = 9 }, good),
+    );
+    try std.testing.expectError(
+        error.CompactProfileInvalidPrefillRows,
+        buildCompactInferenceConfig(.{ .preferred_prefill_rows = 96 }, good),
+    );
+}
+
 pub const TensorStorageClass = enum {
     unknown,
     host_f32,

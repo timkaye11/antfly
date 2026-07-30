@@ -56,7 +56,6 @@ const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
 
 const print = std.debug.print;
 const BackendChoice = native_backend_choice.Choice;
-extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 const ExecutionMode = enum {
     eager,
@@ -293,8 +292,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         if (!serverGenerateSupportsOptions(opts)) return error.UnsupportedServerGenerateOption;
         return error.WarmInferenceServerUnavailable;
     }
-    try configureMemoryProfileProcess(opts);
-
     var preflight_draft_gpt_config: ?gpt_mod.Config = null;
     const effective_draft_model = if (opts.speculation_policy == .off) null else if (opts.backend == .metal and opts.speculation_policy == .auto) blk: {
         const draft_model_dir = opts.draft_model orelse break :blk null;
@@ -503,6 +500,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     configureBackendPreference(&session_manager, if (route_onnx_whole_model_graph) .native else opts.backend);
     session_manager.kernel_jit = jit_config;
     session_manager.kernel_jit_load_context = .startup_preload;
+    session_manager.compact = compactRequestFromOptions(opts);
 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
@@ -3408,14 +3406,14 @@ fn metalStatsCompactJson(
         \\"active_frame_bootstrap_misses":{d},
         \\"misses":{d}
         \\}},
-        \\"compact_expert_execution\":{{
-        \\"whole_publications\":{d},
-        \\"projection_prepares\":{d},
-        \\"fused_frame_attempts\":{d},
-        \\"fused_frame_successes\":{d},
-        \\"fused_frame_fallbacks\":{d},
-        \\"device_input_reuses\":{d},
-        \\"host_transfers\":{d}
+        \\"compact_expert_execution":{{
+        \\"whole_publications":{d},
+        \\"projection_prepares":{d},
+        \\"fused_frame_attempts":{d},
+        \\"fused_frame_successes":{d},
+        \\"fused_frame_fallbacks":{d},
+        \\"device_input_reuses":{d},
+        \\"host_transfers":{d}
         \\}}
         \\}}
     ,
@@ -3449,6 +3447,24 @@ fn metalStatsCompactJson(
         },
     );
     return try out.toOwnedSlice(allocator);
+}
+
+test "metal compact stats JSON is parseable and carries compact expert counters" {
+    var snapshot = ops.BackendDebugTimingSnapshot{};
+    snapshot.native_quant_null = false;
+    snapshot.provider.metal_compact_expert_cache_hits = 21;
+    snapshot.provider.metal_compact_expert_whole_publications = 22;
+    snapshot.provider.metal_compact_expert_host_transfers = 23;
+    const graph_stats: graph_mod.executor_stats.ExecutionStats = .{};
+    const json = try metalStatsCompactJson(std.testing.allocator, snapshot, graph_stats);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"compact_expert_cache_hits\":21"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"compact_expert_execution\":{"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"whole_publications\":22"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"host_transfers\":23"));
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
 }
 
 fn metalResidencyMisses(provider: ops.NativeQuantTimingStats) u64 {
@@ -6808,7 +6824,12 @@ fn parseArgs(args: []const []const u8) !Options {
 }
 
 fn parseMemoryProfile(value: []const u8) ?MemoryProfile {
-    if (std.mem.eql(u8, value, "2gbs") or std.mem.eql(u8, value, "2gb")) return .compact_2gbs;
+    if (std.mem.eql(u8, value, "2gbs") or
+        std.mem.eql(u8, value, "2gb") or
+        std.mem.eql(u8, value, "compact_2gbs"))
+    {
+        return .compact_2gbs;
+    }
     return null;
 }
 
@@ -6824,33 +6845,43 @@ fn applyMemoryProfile(opts: *Options) !void {
             if (opts.mode == null) opts.mode = .eager;
             if (opts.mode.? != .eager) return error.MemoryProfileRequiresEager;
             if (opts.prefill_chunk_size == 0) opts.prefill_chunk_size = 128;
+            switch (opts.prefill_chunk_size) {
+                32, 64, 128 => {},
+                else => return error.CompactProfileInvalidPrefillChunk,
+            }
             if (opts.cache_dtype == null) opts.cache_dtype = "f16";
             if (opts.host_budget_mb == 0) opts.host_budget_mb = 2048;
             if (opts.backend_budget_mb == 0) opts.backend_budget_mb = 2048;
             if (opts.combined_budget_mb == 0) opts.combined_budget_mb = 2048;
             if (opts.kv_budget_mb == 0) opts.kv_budget_mb = 384;
             if (opts.scratch_budget_mb == 0) opts.scratch_budget_mb = 384;
-            if (opts.expert_cache_slots == 0) opts.expert_cache_slots = 12;
+            // expert_cache_slots == 0 stays 0: it means automatic tier
+            // selection inside the immutable compact config.
+            if (opts.image_count > 0 or opts.audio_count > 0) {
+                return error.CompactProfileUnsupportedMultimodal;
+            }
+            if (opts.draft_model != null and opts.speculation_policy != .off) {
+                return error.CompactProfileUnsupportedSpeculation;
+            }
+            // MTP/speculative decoding stays disabled under the compact
+            // profile until it is qualified against the residency budget.
+            opts.speculation_policy = .off;
         },
     }
 }
 
-fn configureMemoryProfileProcess(opts: Options) !void {
-    if (opts.memory_profile != .compact_2gbs) return;
-    // The command runs in its own process, so this process-local cache setting
-    // cannot leak into server models or another invocation.
-    const expert_slots_value: [*:0]const u8 = switch (opts.expert_cache_slots) {
-        8 => "8",
-        12 => "12",
-        16 => "16",
-        else => return error.InvalidExpertCacheSlots,
+/// The compact request carried by value into session creation. Never
+/// transported through the process environment.
+fn compactRequestFromOptions(opts: Options) ?session_factory.CompactInferenceRequest {
+    const profile = opts.memory_profile orelse return null;
+    return .{
+        .profile = switch (profile) {
+            .compact_2gbs => .compact_2gbs,
+        },
+        .expert_cache_slots = @intCast(opts.expert_cache_slots),
+        .io_workers = 4,
+        .preferred_prefill_rows = @intCast(opts.prefill_chunk_size),
     };
-    if (setenv("ANTFLY_GEMMA4_COMPACT_EXPERT_SLOTS", expert_slots_value, 1) != 0) {
-        return error.MemoryProfileConfigurationFailed;
-    }
-    if (setenv("ANTFLY_GEMMA4_COMPACT_IO_READERS", "4", 1) != 0) {
-        return error.MemoryProfileConfigurationFailed;
-    }
 }
 
 fn parseBackendChoice(value: []const u8) ?BackendChoice {
@@ -7239,7 +7270,7 @@ fn metalEagerDenseMaxBytes() u64 {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--memory-profile 2gbs] [--expert-cache-slots 8|12|16] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--memory-profile 2gbs|2gb|compact_2gbs] [--expert-cache-slots 8|12|16] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
         \\  --stream prints generated text incrementally as token deltas arrive.
@@ -7252,7 +7283,7 @@ fn printUsage() void {
         \\  compiled-target=whole-model requests a compiled backend only when it can own the full traced graph shape.
         \\  raw-decode-bench runs transformer-body decode without logits/sampling for llama-bench-style baselines.
         \\  ignore-eos keeps generating after EOS for benchmark compatibility with engines that do not stop on the same EOG token set.
-        \\  --memory-profile 2gbs selects Metal eager compact MoE execution, four bounded expert readers, 128-token prefill chunks, FP16 KV, and explicit 2 GiB residency budgets.
+        \\  --memory-profile 2gbs|2gb|compact_2gbs selects Metal eager compact MoE execution, four bounded expert readers, 128-token prefill chunks, FP16 KV, and explicit 2 GiB residency budgets carried by value into session creation.
         \\  --expert-cache-slots 8|12|16 selects resident expert slots per layer for the 2gbs profile (default: 12; routing still executes exactly top-8 experts).
         \\  Kernel-JIT options are local-only and bypass ANTFLY_INFERENCE_SERVER_URL; an explicit --server remains an error.
         \\  A qualified profile reloads matching package records from the selected cache before model publication; use mode on or required.
@@ -7674,8 +7705,31 @@ test "parseArgs expands compact 2gbs memory profile" {
     try std.testing.expectEqual(@as(usize, 2048), opts.combined_budget_mb);
     try std.testing.expectEqual(@as(usize, 384), opts.kv_budget_mb);
     try std.testing.expectEqual(@as(usize, 384), opts.scratch_budget_mb);
-    try std.testing.expectEqual(@as(usize, 12), opts.expert_cache_slots);
+    // 0 = automatic slot-tier selection inside the immutable compact config.
+    try std.testing.expectEqual(@as(usize, 0), opts.expert_cache_slots);
+    try std.testing.expectEqual(generation.SpeculationPolicy.off, opts.speculation_policy);
     try std.testing.expect(!liveWholeModelExecutorRequested(&opts));
+    const compact_request = compactRequestFromOptions(opts).?;
+    try std.testing.expectEqual(@as(u8, 0), compact_request.expert_cache_slots);
+    try std.testing.expectEqual(@as(u8, 4), compact_request.io_workers);
+    try std.testing.expectEqual(@as(u16, 128), compact_request.preferred_prefill_rows);
+    try std.testing.expect(compactRequestFromOptions(try parseArgs(&.{ "/tmp/model", "hello" })) == null);
+
+    try std.testing.expectEqual(MemoryProfile.compact_2gbs, (try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--memory-profile",
+        "compact_2gbs",
+    })).memory_profile.?);
+
+    try std.testing.expectError(error.CompactProfileInvalidPrefillChunk, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--memory-profile",
+        "2gbs",
+        "--prefill-chunk-size",
+        "200",
+    }));
 
     const slots_16 = try parseArgs(&.{
         "/tmp/model",

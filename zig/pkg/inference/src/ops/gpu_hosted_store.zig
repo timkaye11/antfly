@@ -16,6 +16,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const runtime = @import("../runtime/root.zig");
+const backend_contracts = @import("../graph/backend_contracts.zig");
 const tensor_store_mod = @import("../models/tensor_store.zig");
 const weight_source_mod = @import("../models/weight_source.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
@@ -224,6 +225,10 @@ pub const WeightStore = struct {
     shared_metal_native_provider_lock: if (supports_native_metal_provider) std.Io.Mutex else void =
         if (supports_native_metal_provider) .init else {},
     jina_lora_adapter: ?*JinaLoraAdapter = null,
+    /// Immutable compact-profile contract for this model instance. Set once
+    /// during session creation, before any compute wrapper exists. Presence
+    /// makes the compact streaming route mandatory for routed experts.
+    compact: ?backend_contracts.CompactInferenceConfig = null,
 };
 
 pub fn touchLazyWeight(data: *WeightStore, entry: *LazyWeightEntry) void {

@@ -819,12 +819,34 @@ pub fn build(b: *std.Build) void {
     );
     metal_gemma4_ab_benchmark_contract_test_step.dependOn(&metal_gemma4_ab_benchmark_contract_test.step);
 
+    const gemma4_a4b_turbo_benchmark_contract_test = b.addSystemCommand(&.{
+        "python3",
+        "scripts/test_benchmark_gemma4_a4b_turbo.py",
+    });
+    const gemma4_a4b_turbo_benchmark_contract_test_step = b.step(
+        "test-gemma4-a4b-turbo-benchmark",
+        "Test the fail-closed Gemma4 A4B compact-vs-TurboFieldfare benchmark contract",
+    );
+    gemma4_a4b_turbo_benchmark_contract_test_step.dependOn(&gemma4_a4b_turbo_benchmark_contract_test.step);
+
+    const gemma4_a4b_parity_contract_test = b.addSystemCommand(&.{
+        "python3",
+        "scripts/test_verify_gemma4_a4b_parity.py",
+    });
+    const gemma4_a4b_parity_contract_test_step = b.step(
+        "test-gemma4-a4b-parity-contract",
+        "Test the Gemma4 A4B record-reference/verify-reference parity tooling contract",
+    );
+    gemma4_a4b_parity_contract_test_step.dependOn(&gemma4_a4b_parity_contract_test.step);
+
     const metal_gemma4_benchmark_contracts_test_step = b.step(
         "test-metal-gemma4-benchmark-contracts",
         "Test the Gemma4 Metal comparator and baseline/candidate benchmark contracts",
     );
     metal_gemma4_benchmark_contracts_test_step.dependOn(metal_gemma4_long_output_benchmark_contract_test_step);
     metal_gemma4_benchmark_contracts_test_step.dependOn(metal_gemma4_ab_benchmark_contract_test_step);
+    metal_gemma4_benchmark_contracts_test_step.dependOn(gemma4_a4b_turbo_benchmark_contract_test_step);
+    metal_gemma4_benchmark_contracts_test_step.dependOn(gemma4_a4b_parity_contract_test_step);
 
     const metal_gemma4_tool_calling_test = b.addSystemCommand(&.{
         "bash",

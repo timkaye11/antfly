@@ -732,7 +732,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .data = data,
                 .provider_impl = provider_impl,
                 .owned_native_provider = true,
-                .resident_expert_active_slots = configuredResidentExpertSlots(),
+                .resident_expert_active_slots = residentExpertSlotsForStore(data),
                 .io = io,
             };
         }
@@ -753,7 +753,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .data = data,
             .provider_impl = provider_impl,
             .owned_native_provider = false,
-            .resident_expert_active_slots = configuredResidentExpertSlots(),
+            .resident_expert_active_slots = residentExpertSlotsForStore(data),
             .io = io,
         };
     }
@@ -3414,13 +3414,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return layer_index * compact_expert_slot_capacity + local_slot;
     }
 
-    fn configuredResidentExpertSlots() usize {
-        const requested = getenvUsize("ANTFLY_GEMMA4_COMPACT_EXPERT_SLOTS") orelse
-            return compact_expert_default_active_slots;
-        return switch (requested) {
-            8, 12, 16 => requested,
-            else => compact_expert_default_active_slots,
-        };
+    /// Resolve the active resident-expert slot count from the session's
+    /// immutable compact contract. Configuration travels by value through
+    /// session creation; there is deliberately no environment override.
+    fn residentExpertSlotsForStore(data: *const WeightStore) usize {
+        const config = data.compact orelse return compact_expert_default_active_slots;
+        return @min(@as(usize, config.expert_cache_slots), compact_expert_slot_capacity);
+    }
+
+    /// True when this session carries a compact contract: the compact routed
+    /// -expert route is then mandatory and every unsupported condition is an
+    /// error instead of a silent fallback to a full-expert-set route.
+    fn compactMoeMandatory(self: *const MetalCompute) bool {
+        return self.data.compact != null;
     }
 
     fn residentExpertProjectionSlots(layer_index: usize, local_slot: usize) ResidentExpertProjectionSlots {
@@ -3589,7 +3595,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
 
         if (pending.miss_count != 0) {
-            const reader_count = getenvUsize("ANTFLY_GEMMA4_COMPACT_IO_READERS") orelse 1;
+            const reader_count: usize = if (self.data.compact) |config| config.io_workers else 1;
             pending.load_batch = try gpu_hosted_store_mod.beginResidentExpertLayoutsParallel(
                 self.data,
                 requests[0..pending.miss_count],
@@ -3894,17 +3900,33 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn beginMoeBlockOp(ctx: *anyopaque, request: *const ops.RunMoeBlockRequest) anyerror!bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (!compactMoeRequestSupported(request, 1) or self.pending_compact_moe_route != null) return false;
+        const mandatory = self.compactMoeMandatory();
+        if (!compactMoeRequestSupported(request, 1) or self.pending_compact_moe_route != null) {
+            if (mandatory) return error.CompactMoeUnsupportedRequest;
+            return false;
+        }
 
         const compact_timing = getenvBool("ANTFLY_GEMMA4_COMPACT_TIMING");
         const compact_started_at = if (compact_timing) monotonicNowNs() else 0;
         const logits = try toFloat32Op(ctx, request.router_logits, self.allocator);
         defer self.allocator.free(logits);
-        if (logits.len != request.num_experts) return false;
-        const route = selectCompactMoeRoute(logits, request.top_k) orelse return false;
+        if (logits.len != request.num_experts) {
+            if (mandatory) return error.CompactMoeRouterShapeMismatch;
+            return false;
+        }
+        const route = selectCompactMoeRoute(logits, request.top_k) orelse {
+            if (mandatory) return error.CompactMoeRouteSelectionFailed;
+            return false;
+        };
         const hits_before = self.resident_expert_hits;
         const misses_before = self.resident_expert_misses;
-        var pending = (self.beginResidentExpertRoute(request, route) catch return false) orelse return false;
+        var pending = (self.beginResidentExpertRoute(request, route) catch |err| {
+            if (mandatory) return err;
+            return false;
+        }) orelse {
+            if (mandatory) return error.CompactMoeResidencyUnavailable;
+            return false;
+        };
         pending.compact_started_at = compact_started_at;
         pending.hits_before = hits_before;
         pending.misses_before = misses_before;
@@ -3914,20 +3936,33 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn finishMoeBlockOp(ctx: *anyopaque, request: *const ops.RunMoeBlockRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (!compactMoeRequestSupported(request, 1)) return null;
-        var pending = self.pending_compact_moe_route orelse return null;
+        const mandatory = self.compactMoeMandatory();
+        if (!compactMoeRequestSupported(request, 1)) {
+            if (mandatory) return error.CompactMoeUnsupportedRequest;
+            return null;
+        }
+        var pending = self.pending_compact_moe_route orelse {
+            if (mandatory) return error.CompactMoeFinishWithoutBegin;
+            return null;
+        };
         self.pending_compact_moe_route = null;
         defer pending.deinit();
 
         const compact_timing = getenvBool("ANTFLY_GEMMA4_COMPACT_TIMING");
         const residency_started_at = if (compact_timing) monotonicNowNs() else 0;
-        if (!(try self.finishResidentExpertRoute(request, &pending))) return null;
+        if (!(try self.finishResidentExpertRoute(request, &pending))) {
+            if (mandatory) return error.CompactMoeResidencyLoadFailed;
+            return null;
+        }
         const residency_ns = if (compact_timing) monotonicNowNs() - residency_started_at else 0;
 
         const input_was_device = if (toBuf(request.input).metal_tensor) |tensor| tensor.isDevice() else false;
         var input_device = try self.ownedDeviceMetalTensorFromCt(request.input);
         defer input_device.deinit();
-        if (input_device.elemCount() != request.hidden_size) return null;
+        if (input_device.elemCount() != request.hidden_size) {
+            if (mandatory) return error.CompactMoeInputShapeMismatch;
+            return null;
+        }
         if (input_was_device) {
             self.resident_expert_device_input_reuses +|= 1;
         } else {
@@ -3950,14 +3985,26 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             residency_ns,
             pending.hits_before,
             pending.misses_before,
-        )) orelse return null;
+        )) orelse {
+            if (mandatory) return error.CompactMoeExecutionFailed;
+            return null;
+        };
         errdefer output.deinit();
         return self.ctFromOwnedMetalTensor(output);
     }
 
     fn runMoeBlockOp(ctx: *anyopaque, request: *const ops.RunMoeBlockRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (!compactMoeRequestSupported(request, 16)) return null;
+        const mandatory = self.compactMoeMandatory();
+        // Without a compact contract this route is opportunistic and bows out
+        // above 16 rows. Under the contract it must serve any row count: the
+        // generic fallback would map the full expert set, which the profile
+        // forbids, so large batches run bounded row groups here instead.
+        const row_cap: usize = if (mandatory) request.total else 16;
+        if (!compactMoeRequestSupported(request, row_cap)) {
+            if (mandatory) return error.CompactMoeUnsupportedRequest;
+            return null;
+        }
         if (request.total == 1 and try beginMoeBlockOp(ctx, request)) {
             return finishMoeBlockOp(ctx, request);
         }
@@ -3968,6 +4015,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (input.len != request.total * request.hidden_size or
             logits.len != request.total * request.num_experts)
         {
+            if (mandatory) return error.CompactMoeRequestShapeMismatch;
             return null;
         }
         const expert_scales: ?[]f32 = if (request.expert_scale) |scale|
@@ -3983,6 +4031,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const logits_row = logits[row * request.num_experts ..][0..request.num_experts];
             const output_row = output[row * request.hidden_size ..][0..request.hidden_size];
             if (!(try self.runCompactMoeRow(request, input_row, logits_row, expert_scales, output_row))) {
+                if (mandatory) return error.CompactMoeRowExecutionFailed;
                 self.allocator.free(output);
                 return null;
             }

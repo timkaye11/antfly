@@ -138,6 +138,11 @@ pub const SessionManager = struct {
     /// dispatch goes through the caller's thread pool (linalg.sgemm*Io).
     /// Null means backends use the process-wide futex pool inside lib/linalg.
     io: ?std.Io = null,
+    /// Compact memory-profile request carried by value into session creation.
+    /// Only the Metal GGUF route may satisfy it; when set, model load fails
+    /// closed instead of falling back to another backend or a full-residency
+    /// route.
+    compact: ?session_factory.CompactInferenceRequest = null,
 
     pub fn init(allocator: std.mem.Allocator) SessionManager {
         return .{
@@ -191,6 +196,12 @@ pub const SessionManager = struct {
         var first_err: ?anyerror = null;
 
         for (effective_backends) |backend| {
+            if (self.compact != null and backend != .metal) {
+                // A compact profile is a residency contract, not a
+                // preference: no other backend may satisfy the load.
+                first_err = first_err orelse error.CompactProfileRequiresMetal;
+                continue;
+            }
             if (!backend.available()) continue;
             if (!backend.supportsDirectSessionLoad()) {
                 std.log.err(
@@ -230,25 +241,30 @@ pub const SessionManager = struct {
                         continue;
                     };
                 } else continue,
-                .metal => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))
-                    self.createImportedOnnxSession(effective_model_path, .metal, shared_backend_ctx) catch |err| {
+                .metal => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path)) blk: {
+                    if (self.compact != null) return error.CompactProfileRequiresGguf;
+                    break :blk self.createImportedOnnxSession(effective_model_path, .metal, shared_backend_ctx) catch |err| {
                         std.log.err("imported onnx metal session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;
-                    }
-                else if (build_options.enable_metal)
-                    session_factory.createMetalSessionWithKernelJitAndLoadContext(
-                        self.allocator,
-                        model_path,
-                        self.kernel_jit,
-                        self.kernel_jit_load_context,
-                    ) catch |err| {
+                    };
+                } else if (build_options.enable_metal)
+                    session_factory.createMetalSessionWithOptions(self.allocator, model_path, .{
+                        .kernel_jit = self.kernel_jit,
+                        .kernel_jit_load_context = self.kernel_jit_load_context,
+                        .compact = self.compact,
+                    }) catch |err| {
                         std.log.err("Metal session create failed for {s}: {s}", .{ model_path, @errorName(err) });
+                        // A compact load failure is terminal: falling through
+                        // to another backend would map the full expert set.
+                        if (self.compact != null) return err;
                         if (self.kernel_jit.qualified_profile_path != null or self.kernel_jit.profile_capture_only) return err;
                         if (kernel_jit_mod.isRequiredFailure(self.kernel_jit.mode, err)) return err;
                         first_err = first_err orelse err;
                         continue;
                     }
+                else if (self.compact != null)
+                    return error.CompactProfileRequiresMetal
                 else
                     continue,
                 .cuda => if (self.shouldUseImportedOnnxGraphRuntime(effective_model_path))

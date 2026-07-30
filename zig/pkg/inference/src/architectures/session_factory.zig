@@ -1047,7 +1047,36 @@ pub fn createMetalSessionWithTaskOverrideAndKernelJitAndLoadContext(
     config: kernel_jit.Config,
     load_context: kernel_jit.LoadContext,
 ) !Session {
-    return createGpuHostedSessionWithTaskOverride(allocator, model_path, override, .metal, config, load_context);
+    return createGpuHostedSessionWithTaskOverride(allocator, model_path, override, .metal, config, load_context, null);
+}
+
+pub const CompactInferenceRequest = ops.CompactInferenceRequest;
+pub const CompactInferenceConfig = ops.CompactInferenceConfig;
+
+pub const MetalSessionOptions = struct {
+    task_override: ?TaskOverride = null,
+    kernel_jit: kernel_jit.Config = .{},
+    kernel_jit_load_context: kernel_jit.LoadContext = .dynamic,
+    /// Requesting a compact profile makes the streaming routed-expert route
+    /// mandatory: the load fails unless the model matches a qualified compact
+    /// geometry, and generation never falls back to full-expert residency.
+    compact: ?ops.CompactInferenceRequest = null,
+};
+
+pub fn createMetalSessionWithOptions(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    options: MetalSessionOptions,
+) !Session {
+    return createGpuHostedSessionWithTaskOverride(
+        allocator,
+        model_path,
+        options.task_override,
+        .metal,
+        options.kernel_jit,
+        options.kernel_jit_load_context,
+        options.compact,
+    );
 }
 
 pub fn createCudaSession(allocator: std.mem.Allocator, model_path: []const u8) !Session {
@@ -1353,7 +1382,9 @@ fn createGpuHostedSessionWithTaskOverride(
     backend_type: BackendType,
     kernel_jit_config: kernel_jit.Config,
     kernel_jit_load_context: kernel_jit.LoadContext,
+    compact_request: ?ops.CompactInferenceRequest,
 ) !Session {
+    if (compact_request != null and backend_type != .metal) return error.CompactProfileRequiresMetal;
     try kernel_jit_config.validate();
     try metal_runtime.validateMetalJitLoadContext(kernel_jit_config, kernel_jit_load_context);
     try ensureGpuHostedSessionAvailable(backend_type);
@@ -1498,8 +1529,16 @@ fn createGpuHostedSessionWithTaskOverride(
         .gpt => |cfg| cfg.num_local_experts,
         else => 0,
     };
+    const compact_config: ?ops.CompactInferenceConfig = if (compact_request) |request|
+        try deriveCompactSessionConfig(allocator, request, arch_config, tensor_store, &lazy_weights)
+    else
+        null;
+    if (compact_config != null) arch_config.gpt.compact_moe_streaming = true;
     const residency = if (lazy_weights.count() > 0 and moe_num_experts > 0)
-        runtime.moe.residency.SharedResidency.init(allocator, defaultResidentExpertsPerLayer(arch_config))
+        runtime.moe.residency.SharedResidency.init(allocator, if (compact_config) |config|
+            @as(usize, config.expert_cache_slots)
+        else
+            defaultResidentExpertsPerLayer(arch_config))
     else
         null;
     const tier_cache = if (lazy_weights.count() > 0) blk: {
@@ -1562,6 +1601,7 @@ fn createGpuHostedSessionWithTaskOverride(
             .quant_execution_mode = quant_mode,
             .prefer_f32_dense_tensors = prefer_f32_dense_tensors,
             .jina_lora_adapter = gpu_jina_lora_adapter,
+            .compact = compact_config,
         }),
     };
     backend_resources_transferred = true;
@@ -1585,6 +1625,255 @@ fn createGpuHostedSessionWithTaskOverride(
     }
     try initGpuHostedPrefetch(impl);
     return .{ .ptr = impl, .vtable = &arch_vtable };
+}
+
+/// Derive and validate the immutable compact contract for a session created
+/// with a compact memory profile. Metadata-driven and fail-closed: a model
+/// outside the qualified 26B-A4B Q4_0 envelope refuses to load compactly
+/// instead of silently widening residency to the full expert set.
+fn deriveCompactSessionConfig(
+    allocator: std.mem.Allocator,
+    request: ops.CompactInferenceRequest,
+    arch_config: ArchConfig,
+    tensor_store: ?tensor_store_mod.TensorStore,
+    lazy_weights: *const std.StringHashMapUnmanaged(gpu_hosted_store_mod.LazyWeightEntry),
+) !ops.CompactInferenceConfig {
+    const cfg = switch (arch_config) {
+        .gpt => |cfg| cfg,
+        else => return error.CompactProfileUnsupportedModel,
+    };
+    if (cfg.family != .gemma or !cfg.usesMoe() or !cfg.hasSharedExpert() or cfg.num_hidden_layers == 0) {
+        return error.CompactProfileUnsupportedModel;
+    }
+    const store = tensor_store orelse return error.CompactProfileRequiresGguf;
+    if (store.kind() != .gguf) return error.CompactProfileRequiresGguf;
+
+    // Probe the first and last MoE layers: all three routed projections must
+    // resolve to bounded Q4_0 pread ranges, and both layers must encode a
+    // whole expert to the same byte count.
+    var encoded_expert_bytes: u64 = 0;
+    const probe_layers = [_]usize{ 0, @as(usize, cfg.num_hidden_layers) - 1 };
+    for (probe_layers, 0..) |layer_index, probe_index| {
+        var layer_bytes: u64 = 0;
+        for ([_][]const u8{ "w1", "w3", "w2" }) |projection| {
+            var name_buf: [192]u8 = undefined;
+            const name = std.fmt.bufPrint(
+                &name_buf,
+                "model.layers.{d}.block_sparse_moe.experts.0.{s}.weight",
+                .{ layer_index, projection },
+            ) catch return error.CompactProfileUnsupportedModel;
+            const entry = lazy_weights.get(name) orelse return error.CompactProfileMissingExpertTensors;
+            var range = (try store.describeQuantizedTensorRange(allocator, &entry.tensor_ref)) orelse
+                return error.CompactProfileUnsupportedQuantization;
+            defer range.deinit(allocator);
+            if (!range.tensor_type.eql(.{ .known = .Q4_0 })) {
+                return error.CompactProfileUnsupportedQuantization;
+            }
+            if (range.byte_len == 0) return error.CompactProfileUnsupportedGeometry;
+            layer_bytes += range.byte_len;
+        }
+        if (probe_index == 0) {
+            encoded_expert_bytes = layer_bytes;
+        } else if (layer_bytes != encoded_expert_bytes) {
+            return error.CompactProfileUnsupportedGeometry;
+        }
+    }
+
+    const geometry = ops.CompactExpertGeometry{
+        .moe_layer_count = std.math.cast(u16, cfg.num_hidden_layers) orelse
+            return error.CompactProfileUnsupportedGeometry,
+        .expert_count = std.math.cast(u16, cfg.num_local_experts) orelse
+            return error.CompactProfileUnsupportedGeometry,
+        .top_k = std.math.cast(u8, cfg.num_experts_per_tok) orelse
+            return error.CompactProfileUnsupportedGeometry,
+        .hidden_size = cfg.hidden_size,
+        .expert_intermediate_size = cfg.expertIntermediateSize(),
+        .encoded_expert_bytes = encoded_expert_bytes,
+    };
+    return ops.buildCompactInferenceConfig(request, geometry);
+}
+
+test "deriveCompactSessionConfig fail-closes outside the qualified envelope" {
+    const allocator = std.testing.allocator;
+
+    const StubExpertStore = struct {
+        tensor_type: gguf_mod.tensor_types.TensorType = .{ .known = .Q4_0 },
+        projection_byte_len: usize = 1_115_136,
+
+        const vtable = tensor_store_mod.TensorStore.VTable{
+            .kind = @ptrCast(&kindImpl),
+            .weightSource = @ptrCast(&weightSourceImpl),
+            .describeTensor = @ptrCast(&describeTensorImpl),
+            .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
+            .describeQuantizedTensorRange = @ptrCast(&describeQuantizedTensorRangeImpl),
+            .loadQuantizedExpertInto = @ptrCast(&loadQuantizedExpertIntoImpl),
+            .loadTensorRef = @ptrCast(&loadTensorRefImpl),
+            .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
+            .ggufFile = @ptrCast(&ggufFileImpl),
+            .deinit = @ptrCast(&deinitSelf),
+        };
+
+        fn tensorStore(self: *@This()) tensor_store_mod.TensorStore {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        fn kindImpl(_: *@This()) tensor_store_mod.StoreKind {
+            return .gguf;
+        }
+
+        fn weightSourceImpl(_: *@This()) !?weight_source_mod.WeightSource {
+            return null;
+        }
+
+        fn describeTensorImpl(_: *@This(), _: std.mem.Allocator, _: []const u8) !tensor_store_mod.LazyTensorRef {
+            return error.UnsupportedOperation;
+        }
+
+        fn describeTensorRangeImpl(_: *@This(), _: std.mem.Allocator, _: []const u8) !?tensor_store_mod.TensorRangeRef {
+            return null;
+        }
+
+        fn describeQuantizedTensorRangeImpl(
+            self: *@This(),
+            _: std.mem.Allocator,
+            tensor_ref: *const tensor_store_mod.LazyTensorRef,
+        ) !?tensor_store_mod.QuantizedTensorRangeRef {
+            return .{
+                .name = tensor_ref.name,
+                .source_name = tensor_ref.name,
+                .path = "",
+                .byte_offset = 0,
+                .byte_len = self.projection_byte_len,
+                .tensor_type = self.tensor_type,
+                .shape = &.{},
+            };
+        }
+
+        fn loadQuantizedExpertIntoImpl(
+            _: *@This(),
+            _: std.mem.Allocator,
+            _: *const [3]tensor_store_mod.LazyTensorRef,
+            _: []u8,
+        ) !?tensor_store_mod.QuantizedExpertLayout {
+            return null;
+        }
+
+        fn loadTensorRefImpl(_: *@This(), _: *const tensor_store_mod.LazyTensorRef) !weight_source_mod.LoadedWeight {
+            return error.UnsupportedOperation;
+        }
+
+        fn loadQuantizedStorageRefImpl(
+            _: *@This(),
+            _: *const tensor_store_mod.LazyTensorRef,
+        ) !?weight_source_mod.QuantizedStorage {
+            return null;
+        }
+
+        fn ggufFileImpl(_: *@This()) ?*const gguf_mod.format.File {
+            return null;
+        }
+
+        fn deinitSelf(_: *@This()) void {}
+    };
+
+    var lazy_weights = std.StringHashMapUnmanaged(gpu_hosted_store_mod.LazyWeightEntry){};
+    defer {
+        var it = lazy_weights.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        lazy_weights.deinit(allocator);
+    }
+    for ([_]usize{ 0, 29 }) |layer| {
+        for ([_][]const u8{ "w1", "w3", "w2" }) |projection| {
+            const key = try std.fmt.allocPrint(
+                allocator,
+                "model.layers.{d}.block_sparse_moe.experts.0.{s}.weight",
+                .{ layer, projection },
+            );
+            errdefer allocator.free(key);
+            try lazy_weights.put(allocator, key, .{ .tensor_ref = .{ .name = key } });
+        }
+    }
+
+    const a4b_cfg = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2816,
+        .num_hidden_layers = 30,
+        .num_attention_heads = 22,
+        .intermediate_size = 16384,
+        .expert_intermediate_size = 704,
+        .num_local_experts = 128,
+        .num_experts_per_tok = 8,
+        .num_shared_experts = 1,
+        .vocab_size = 262144,
+    };
+
+    var store_impl = StubExpertStore{};
+    const config = try deriveCompactSessionConfig(
+        allocator,
+        .{},
+        .{ .gpt = a4b_cfg },
+        store_impl.tensorStore(),
+        &lazy_weights,
+    );
+    try std.testing.expectEqual(@as(u64, 3_345_408), config.geometry.encoded_expert_bytes);
+    try std.testing.expectEqual(@as(u16, 30), config.geometry.moe_layer_count);
+    try std.testing.expectEqual(@as(u8, 12), config.expert_cache_slots);
+
+    var not_gemma = a4b_cfg;
+    not_gemma.family = .gpt2;
+    try std.testing.expectError(error.CompactProfileUnsupportedModel, deriveCompactSessionConfig(
+        allocator,
+        .{},
+        .{ .gpt = not_gemma },
+        store_impl.tensorStore(),
+        &lazy_weights,
+    ));
+
+    var no_shared = a4b_cfg;
+    no_shared.num_shared_experts = 0;
+    try std.testing.expectError(error.CompactProfileUnsupportedModel, deriveCompactSessionConfig(
+        allocator,
+        .{},
+        .{ .gpt = no_shared },
+        store_impl.tensorStore(),
+        &lazy_weights,
+    ));
+
+    try std.testing.expectError(error.CompactProfileRequiresGguf, deriveCompactSessionConfig(
+        allocator,
+        .{},
+        .{ .gpt = a4b_cfg },
+        null,
+        &lazy_weights,
+    ));
+
+    var wrong_quant = StubExpertStore{ .tensor_type = .{ .known = .Q4_K } };
+    try std.testing.expectError(error.CompactProfileUnsupportedQuantization, deriveCompactSessionConfig(
+        allocator,
+        .{},
+        .{ .gpt = a4b_cfg },
+        wrong_quant.tensorStore(),
+        &lazy_weights,
+    ));
+
+    var wrong_bytes = StubExpertStore{ .projection_byte_len = 999 };
+    try std.testing.expectError(error.CompactProfileUnsupportedGeometry, deriveCompactSessionConfig(
+        allocator,
+        .{},
+        .{ .gpt = a4b_cfg },
+        wrong_bytes.tensorStore(),
+        &lazy_weights,
+    ));
+
+    var empty_weights = std.StringHashMapUnmanaged(gpu_hosted_store_mod.LazyWeightEntry){};
+    defer empty_weights.deinit(allocator);
+    try std.testing.expectError(error.CompactProfileMissingExpertTensors, deriveCompactSessionConfig(
+        allocator,
+        .{},
+        .{ .gpt = a4b_cfg },
+        store_impl.tensorStore(),
+        &empty_weights,
+    ));
 }
 
 /// Detect the model architecture from config.json.
@@ -3643,15 +3932,11 @@ fn defaultResidentExpertsPerLayer(arch_config: ArchConfig) usize {
         .gpt => |cfg| blk: {
             if (!cfg.usesMoe() or cfg.num_local_experts <= 0) break :blk 0;
             const num_experts: usize = @intCast(cfg.num_local_experts);
-            if (cfg.family == .gemma) {
-                if (platform.env.getenvUsize("ANTFLY_GEMMA4_COMPACT_EXPERT_SLOTS")) |requested| {
-                    break :blk @min(num_experts, requested);
-                }
-            }
             const top_k = @max(@as(usize, 1), @as(usize, @intCast(cfg.num_experts_per_tok)));
             // For large expert counts (e.g. 128), keep more experts resident
-            // to reduce lazy loading overhead with high top_k. Compact Gemma
-            // profiles override this explicitly above.
+            // to reduce lazy loading overhead with high top_k. Compact
+            // sessions bypass this heuristic: their slot count comes from the
+            // immutable CompactInferenceConfig at the creation site.
             const multiplier: usize = if (num_experts >= 64) 3 else 2;
             break :blk @min(num_experts, @max(@as(usize, 4), top_k * multiplier));
         },
@@ -3919,6 +4204,7 @@ const GpuHostedBackendInit = struct {
     quant_execution_mode: GpuHostedQuantExecutionMode,
     prefer_f32_dense_tensors: bool,
     jina_lora_adapter: ?*gpu_hosted_store_mod.JinaLoraAdapter = null,
+    compact: ?ops.CompactInferenceConfig = null,
 };
 
 fn makeGpuHostedBackendData(
@@ -3943,6 +4229,7 @@ fn makeGpuHostedBackendData(
         .prefer_f32_dense_tensors = init.prefer_f32_dense_tensors,
         .mirror_kv_to_manager = false,
         .jina_lora_adapter = init.jina_lora_adapter,
+        .compact = init.compact,
     };
     return switch (backend_type) {
         .metal => if (comptime build_options.enable_metal) .{ .metal = data } else unreachable,
