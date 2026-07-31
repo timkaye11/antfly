@@ -669,6 +669,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     resident_expert_device_input_reuses: u64 = 0,
     resident_expert_host_transfers: u64 = 0,
     pending_compact_moe_route: ?PendingCompactMoeRoute = null,
+    /// Layer accepted by beginMoeBlockOp for the device-side MoE route
+    /// (ANTFLY_GEMMA4_DEVICE_MOE); consumed by finishMoeBlockOp.
+    pending_compact_device_moe_layer: ?usize = null,
+    /// Transient guard so a device-route failure inside finishMoeBlockOp can
+    /// re-enter beginMoeBlockOp on the per-slot streaming path.
+    compact_device_moe_bypass: bool = false,
+    /// Layer executions completed fully on-device (no router readback).
+    compact_device_moe_layers: u64 = 0,
     /// True while a token-scoped decode-step frame opened by
     /// beginDecodeStepFrameOp is live; endDecodeStepFrameOp clears it.
     decode_step_frame_active: bool = false,
@@ -3808,6 +3816,272 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return route;
     }
 
+    /// Feature switch for the fully device-side MoE decode route. OFF by
+    /// default: with the switch off no compact code path changes.
+    fn deviceMoeEnabled() bool {
+        return getenvBool("ANTFLY_GEMMA4_DEVICE_MOE");
+    }
+
+    const CompactFullArenaGeometry = struct {
+        per_expert: usize,
+        gate_bytes: usize,
+        down_bytes: usize,
+    };
+
+    /// Derived Q4_0 byte geometry of one expert region (gate, up, down laid
+    /// out contiguously in that order, exactly as loadQuantizedExpertInto
+    /// writes them).
+    fn compactFullArenaGeometry(request: *const ops.RunMoeBlockRequest) ?CompactFullArenaGeometry {
+        if (request.hidden_size == 0 or request.inter_size == 0) return null;
+        if (request.hidden_size % 32 != 0 or request.inter_size % 32 != 0) return null;
+        const gate_row_bytes = (request.hidden_size / 32) * 18;
+        const down_row_bytes = (request.inter_size / 32) * 18;
+        const gate_bytes = request.inter_size * gate_row_bytes;
+        const down_bytes = request.hidden_size * down_row_bytes;
+        return .{
+            .per_expert = 2 * gate_bytes + down_bytes,
+            .gate_bytes = gate_bytes,
+            .down_bytes = down_bytes,
+        };
+    }
+
+    fn releaseFailedFullLayerArena(
+        state: *gpu_hosted_store_mod.CompactRuntimeState,
+        full: *gpu_hosted_store_mod.CompactLayerFullArena,
+    ) void {
+        // Only safe before publication: a published arena backs a live
+        // no-copy device buffer and must stay mapped for the session.
+        std.debug.assert(!full.published);
+        if (full.arena) |*arena| arena.deinit();
+        full.arena = null;
+        if (full.charged_bytes != 0) {
+            state.ledger.release(.expert_pages, full.charged_bytes);
+            full.charged_bytes = 0;
+        }
+        full.failed = true;
+    }
+
+    /// Load and publish the full-residency arena for one layer: every expert
+    /// read once (bounded parallel preads through the shared expert loader)
+    /// into a single page-aligned anonymous arena, charged whole to the
+    /// .expert_pages ledger, then published as one no-copy buffer plus the
+    /// expert byte-offset table. Only qualifies when the budget-derived slot
+    /// tier already covers the whole expert set. Any failure marks the layer
+    /// so the per-slot streaming route serves it without further retries.
+    fn ensureCompactFullLayerArena(
+        self: *MetalCompute,
+        state: *gpu_hosted_store_mod.CompactRuntimeState,
+        request: *const ops.RunMoeBlockRequest,
+    ) !bool {
+        const layer_index = request.layer_index;
+        if (layer_index >= compact_expert_layer_count) return false;
+        if (layer_index >= metal_runtime.decoder_runtime_moe_layer_capacity) return false;
+        const num_experts = request.num_experts;
+        if (num_experts == 0 or num_experts > compact_expert_slot_capacity) return false;
+        const full = state.fullArenaAt(layer_index);
+        if (full.published) {
+            return full.expert_count == num_experts and
+                metal_runtime.decoderRuntimeMoeLayerArenaPrepared(
+                    self.provider_impl,
+                    layer_index,
+                    num_experts,
+                    request.hidden_size,
+                    request.inter_size,
+                );
+        }
+        if (full.failed) return false;
+        // Full residency only: the active slot tier (and any explicit
+        // contract) must cover the entire expert set, otherwise the arena
+        // would exceed what the budget derived for this session.
+        if (state.cache.activeSlots() != num_experts) return false;
+        if (self.data.compact) |config| {
+            if (@as(usize, config.expert_cache_slots) != num_experts) return false;
+        }
+        const geometry = compactFullArenaGeometry(request) orelse return false;
+        const total_bytes = geometry.per_expert * num_experts;
+        const arena_bytes = std.mem.alignForward(usize, total_bytes, compact_expert_arena_alignment);
+        if (arena_bytes > std.math.maxInt(u32)) {
+            full.failed = true;
+            return false;
+        }
+
+        if (full.arena == null) {
+            state.ledger.reserve(.expert_pages, arena_bytes) catch {
+                full.failed = true;
+                return false;
+            };
+            full.charged_bytes = arena_bytes;
+            var arena = c_file.MmapRegion.initAnonymous(arena_bytes) catch {
+                releaseFailedFullLayerArena(state, full);
+                return false;
+            };
+            arena.adviseRandom();
+            full.arena = arena;
+        }
+
+        const compact_timing = getenvBool("ANTFLY_GEMMA4_COMPACT_TIMING");
+        const load_started_at = if (compact_timing) monotonicNowNs() else 0;
+        const arena_data = full.arena.?.data;
+        const requests = try self.allocator.alloc(gpu_hosted_store_mod.ResidentExpertLoadRequest, num_experts);
+        defer self.allocator.free(requests);
+        for (0..num_experts) |expert| {
+            const entries = self.compactMoeExpertEntries(layer_index, @intCast(expert)) orelse {
+                releaseFailedFullLayerArena(state, full);
+                return false;
+            };
+            requests[expert] = .{
+                .entries = entries,
+                .destination = arena_data[expert * geometry.per_expert ..][0..geometry.per_expert],
+            };
+        }
+        const layouts = try self.allocator.alloc(?tensor_store_mod.QuantizedExpertLayout, num_experts);
+        defer {
+            for (layouts) |*layout| if (layout.*) |*value| value.deinit();
+            self.allocator.free(layouts);
+        }
+        @memset(layouts, null);
+        const reader_count: usize = if (self.data.compact) |config| config.io_workers else 4;
+        gpu_hosted_store_mod.loadResidentExpertLayoutsParallel(
+            self.data,
+            requests,
+            layouts,
+            @min(@as(usize, 8), @max(@as(usize, 1), reader_count)),
+        ) catch {
+            releaseFailedFullLayerArena(state, full);
+            return false;
+        };
+
+        // The kernels assume one uniform projection layout across experts.
+        const expected_offsets = [3]usize{ 0, geometry.gate_bytes, geometry.gate_bytes * 2 };
+        for (layouts) |*maybe_layout| {
+            const layout = if (maybe_layout.*) |*value| value else {
+                releaseFailedFullLayerArena(state, full);
+                return false;
+            };
+            var layout_ok = layout.encoded_bytes == geometry.per_expert;
+            for (layout.descriptors, 0..) |descriptor, index| {
+                const is_down = index == 2;
+                const expected_len = if (is_down) geometry.down_bytes else geometry.gate_bytes;
+                const expected_rows = if (is_down) request.hidden_size else request.inter_size;
+                const expected_cols = if (is_down) request.inter_size else request.hidden_size;
+                layout_ok = layout_ok and
+                    descriptor.byte_offset == expected_offsets[index] and
+                    descriptor.byte_len == expected_len and
+                    descriptor.rows == expected_rows and
+                    descriptor.cols == expected_cols and
+                    metal_runtime.quantizedRuntimeLinearKind(&layout.projections[index]) == .q4_0;
+            }
+            if (!layout_ok) {
+                releaseFailedFullLayerArena(state, full);
+                return false;
+            }
+        }
+        self.resident_expert_load_bytes +|= @intCast(total_bytes);
+
+        const offsets = try self.allocator.alloc(u32, num_experts);
+        defer self.allocator.free(offsets);
+        for (offsets, 0..) |*value, expert| value.* = @intCast(expert * geometry.per_expert);
+        const published = metal_runtime.decoderRuntimePrepareMoeQ40LayerArena(
+            self.provider_impl,
+            layer_index,
+            arena_data,
+            offsets,
+            geometry.per_expert,
+            expected_offsets,
+            request.hidden_size,
+            request.inter_size,
+        ) catch false;
+        if (!published) {
+            releaseFailedFullLayerArena(state, full);
+            return false;
+        }
+        full.expert_stride = geometry.per_expert;
+        full.projection_offsets = expected_offsets;
+        full.expert_count = num_experts;
+        full.published = true;
+        self.resident_expert_whole_publications +|= 1;
+        if (compact_timing) {
+            std.debug.print(
+                "gemma4_device_moe_arena: layer={d} experts={d} bytes={d} load_ms={d}\n",
+                .{
+                    layer_index,
+                    num_experts,
+                    total_bytes,
+                    (monotonicNowNs() - load_started_at) / std.time.ns_per_ms,
+                },
+            );
+        }
+        return true;
+    }
+
+    /// Begin-phase acceptance for the device-side MoE route: only single-row
+    /// decode against a fully resident, published layer arena qualifies.
+    /// Never consulted unless ANTFLY_GEMMA4_DEVICE_MOE is set.
+    fn tryBeginCompactDeviceMoe(self: *MetalCompute, request: *const ops.RunMoeBlockRequest) bool {
+        if (request.total != 1) return false;
+        if (request.top_k == 0 or request.top_k > 8) return false;
+        const state = self.data.compact_runtime orelse return false;
+        if (!self.provider_impl.hasDecoderRuntime()) return false;
+        const ready = self.ensureCompactFullLayerArena(state, request) catch false;
+        if (!ready) return false;
+        self.pending_compact_device_moe_layer = request.layer_index;
+        return true;
+    }
+
+    /// Device-side routed-expert execution for one decode row: topk, gate/up,
+    /// down, and the rank-ordered combine all run on the GPU against the
+    /// published layer arena. Skips the router-logits readback entirely; the
+    /// dispatches join the open decode-step frame when one is active.
+    fn runCompactDeviceMoeRow(self: *MetalCompute, request: *const ops.RunMoeBlockRequest) !?MetalTensor {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+
+        const input_was_device = if (toBuf(request.input).metal_tensor) |tensor| tensor.isDevice() else false;
+        var input_device = try self.ownedDeviceMetalTensorFromCt(request.input);
+        defer input_device.deinit();
+        if (!input_device.isDevice() or input_device.elemCount() != request.hidden_size) return null;
+        if (input_was_device) {
+            self.resident_expert_device_input_reuses +|= 1;
+        } else {
+            self.resident_expert_host_transfers +|= 1;
+        }
+        var logits_device = try self.ownedDeviceMetalTensorFromCt(request.router_logits);
+        defer logits_device.deinit();
+        if (!logits_device.isDevice() or logits_device.elemCount() != request.num_experts) return null;
+        var scale_device: ?MetalTensor = null;
+        defer if (scale_device) |*tensor| tensor.deinit();
+        if (request.expert_scale) |scale| {
+            var device = try self.ownedDeviceMetalTensorFromCt(scale);
+            if (!device.isDevice() or device.elemCount() < request.num_experts) {
+                device.deinit();
+                return null;
+            }
+            scale_device = device;
+        }
+
+        const joined_step_frame = self.decode_step_frame_active and metal_runtime.hasActiveFrame(runtime);
+        var frame_active = if (joined_step_frame) false else try self.beginDecoderRuntimeFrame(runtime);
+        if (!joined_step_frame and !frame_active) return null;
+        defer self.cancelDecoderRuntimeFrame(runtime, &frame_active);
+
+        var output = (try metal_runtime.decoderRuntimeMoeForwardQ40(
+            self.provider_impl,
+            request.layer_index,
+            input_device,
+            logits_device,
+            1,
+            request.hidden_size,
+            request.inter_size,
+            request.num_experts,
+            request.top_k,
+            @intFromEnum(request.activation),
+            scale_device,
+        )) orelse return null;
+        errdefer output.deinit();
+        if (!joined_step_frame) try self.submitAndWaitDecoderRuntimeFrame(runtime, &frame_active);
+        self.compact_device_moe_layers += 1;
+        return output;
+    }
+
     /// Grouped-expert chunk execution: route every row, group the
     /// (expert, row, rank) assignments by expert, and stream unique experts
     /// once per chunk in tiles of at most half the active slot tier so the
@@ -4245,9 +4519,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn beginMoeBlockOp(ctx: *anyopaque, request: *const ops.RunMoeBlockRequest) anyerror!bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const mandatory = self.compactMoeMandatory();
-        if (!compactMoeRequestSupported(request, 1) or self.pending_compact_moe_route != null) {
+        if (!compactMoeRequestSupported(request, 1) or
+            self.pending_compact_moe_route != null or
+            self.pending_compact_device_moe_layer != null)
+        {
             if (mandatory) return error.CompactMoeUnsupportedRequest;
             return false;
+        }
+
+        // Device-side MoE route (default OFF): with a fully resident layer
+        // arena the router logits stay on the GPU, so the readback flush,
+        // the CPU route selection, and the per-slot residency plan below are
+        // all skipped for this layer.
+        if (!self.compact_device_moe_bypass and deviceMoeEnabled() and
+            self.tryBeginCompactDeviceMoe(request))
+        {
+            return true;
         }
 
         const compact_timing = getenvBool("ANTFLY_GEMMA4_COMPACT_TIMING");
@@ -4289,6 +4576,27 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const mandatory = self.compactMoeMandatory();
         if (!compactMoeRequestSupported(request, 1)) {
             if (mandatory) return error.CompactMoeUnsupportedRequest;
+            return null;
+        }
+        if (self.pending_compact_device_moe_layer) |device_layer| {
+            self.pending_compact_device_moe_layer = null;
+            if (device_layer == request.layer_index) {
+                if (self.runCompactDeviceMoeRow(request) catch null) |output| {
+                    var owned = output;
+                    errdefer owned.deinit();
+                    return try self.ctFromOwnedMetalTensor(owned);
+                }
+            }
+            // The device route failed after begin accepted it (or the finish
+            // request does not match). Replay the whole begin/finish pair on
+            // the per-slot streaming route; the bypass flag keeps the replay
+            // off the device route.
+            self.compact_device_moe_bypass = true;
+            defer self.compact_device_moe_bypass = false;
+            if (try beginMoeBlockOp(ctx, request)) {
+                return finishMoeBlockOp(ctx, request);
+            }
+            if (mandatory) return error.CompactMoeResidencyUnavailable;
             return null;
         }
         var pending = self.pending_compact_moe_route orelse {
@@ -20274,6 +20582,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_compact_expert_fused_frame_fallbacks = self.resident_expert_fused_frame_fallbacks;
         stats.metal_compact_expert_device_input_reuses = self.resident_expert_device_input_reuses;
         stats.metal_compact_expert_host_transfers = self.resident_expert_host_transfers;
+        stats.metal_compact_device_moe_layers = self.compact_device_moe_layers;
         stats.metal_compact_frame_begins = self.compact_frame_begins;
         stats.metal_compact_frame_flushes = self.compact_frame_flushes;
         if (self.data.compact_runtime) |state| {
@@ -25302,6 +25611,340 @@ test "metal_compute: compact Gemma4 resident slots stay within runtime capacity"
     try std.testing.expectEqual(@as(usize, 12_030), last.up);
     try std.testing.expectEqual(@as(usize, 12_031), last.down);
     try std.testing.expect(last.down < MetalCompute.metal_runtime.decoder_runtime_linear_slot_capacity);
+}
+
+test "metal_compute: device MoE topk kernel matches the CPU route selector" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    const metal_runtime = MetalCompute.metal_runtime;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const runtime = metal_runtime.termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_decode_runtime_destroy(runtime);
+    if (metal_runtime.termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+
+    const num_experts: usize = 10;
+    // Ties (rows 0 and 2), negatives, and a -inf logit; every case where the
+    // CPU selector produces a route must match the kernel bit-for-bit on ids
+    // and to ~1e-6 on softmax weights (reciprocal-multiply vs division).
+    const logits = [_]f32{
+        0.5,  2.0,                2.0,  -1.0, 1.5,  0.25, 1.0,  0.75, 1.25, 0.0,
+        -3.0, -0.5,               -0.5, 4.0,  0.0,  1.0,  -2.0, 7.5,  -0.5, 2.5,
+        1.0,  1.0,                1.0,  1.0,  1.0,  1.0,  1.0,  1.0,  1.0,  1.0,
+        0.0,  -std.math.inf(f32), 3.0,  2.0,  -1.0, 0.5,  6.0,  -4.0, 2.0,  1.0,
+    };
+    const rows: usize = 4;
+    for ([_]usize{ 8, 2 }) |top_k| {
+        var ids: [4 * 8]u32 = undefined;
+        var weights: [4 * 8]f32 = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_moe_topk_host(
+            runtime,
+            &logits,
+            rows,
+            num_experts,
+            top_k,
+            &ids,
+            &weights,
+        ));
+        for (0..rows) |row| {
+            const row_logits = logits[row * num_experts ..][0..num_experts];
+            const route = MetalCompute.selectCompactMoeRoute(row_logits, top_k) orelse
+                return error.TestUnexpectedResult;
+            for (0..top_k) |rank| {
+                try std.testing.expectEqual(route.indices[rank], ids[row * top_k + rank]);
+                try std.testing.expectApproxEqAbs(
+                    route.weights[rank],
+                    weights[row * top_k + rank],
+                    1e-6,
+                );
+            }
+        }
+    }
+}
+
+fn testEncodeQ4_0Matrix(allocator: std.mem.Allocator, rows: usize, cols: usize, seed: u64) ![]u8 {
+    const values = try allocator.alloc(f32, rows * cols);
+    defer allocator.free(values);
+    var state: u64 = seed;
+    for (values) |*value| {
+        state = state *% 6364136223846793005 +% 1442695040888963407;
+        const bucket: i64 = @intCast((state >> 33) % 17);
+        value.* = @as(f32, @floatFromInt(bucket - 8)) * 0.05;
+    }
+    return quant_codec.quantizeQ4_0FromF32(allocator, values);
+}
+
+fn testDequantQ4_0Matrix(allocator: std.mem.Allocator, raw: []const u8, rows: usize, cols: usize) ![]f32 {
+    const out = try allocator.alloc(f32, rows * cols);
+    errdefer allocator.free(out);
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, raw, out);
+    return out;
+}
+
+fn testSiluReference(x: f32) f32 {
+    // Mirrors the MSL termite_silu clamps exactly.
+    if (!std.math.isFinite(x)) return 0.0;
+    if (x > 20.0) return x;
+    if (x < -20.0) return 0.0;
+    const y = x / (1.0 + @exp(-x));
+    return if (std.math.isFinite(y)) y else 0.0;
+}
+
+/// Scalar CPU reference for the device MoE forward: dequantized Q4_0
+/// matmuls, silu-gated activation, and the (value * expert_scale) *
+/// route_weight rank-ordered combine.
+fn testDeviceMoeReference(
+    allocator: std.mem.Allocator,
+    expert_weights: []const []const u8,
+    logits: []const f32,
+    input: []const f32,
+    hidden: usize,
+    inter: usize,
+    top_k: usize,
+    expert_scales: ?[]const f32,
+    output: []f32,
+) !void {
+    const route = MetalCompute.selectCompactMoeRoute(logits, top_k) orelse
+        return error.TestUnexpectedResult;
+    const gate_bytes = inter * (hidden / 32) * 18;
+    const down_bytes = hidden * (inter / 32) * 18;
+    @memset(output, 0);
+    for (0..route.count) |rank| {
+        const expert: usize = @intCast(route.indices[rank]);
+        const raw = expert_weights[expert];
+        const gate = try testDequantQ4_0Matrix(allocator, raw[0..gate_bytes], inter, hidden);
+        defer allocator.free(gate);
+        const up = try testDequantQ4_0Matrix(allocator, raw[gate_bytes .. 2 * gate_bytes], inter, hidden);
+        defer allocator.free(up);
+        const down = try testDequantQ4_0Matrix(allocator, raw[2 * gate_bytes .. 2 * gate_bytes + down_bytes], hidden, inter);
+        defer allocator.free(down);
+        const activated = try allocator.alloc(f32, inter);
+        defer allocator.free(activated);
+        for (0..inter) |o| {
+            var gate_acc: f32 = 0.0;
+            var up_acc: f32 = 0.0;
+            for (0..hidden) |i| {
+                gate_acc += input[i] * gate[o * hidden + i];
+                up_acc += input[i] * up[o * hidden + i];
+            }
+            const act = testSiluReference(gate_acc);
+            activated[o] = if (act == 0.0) 0.0 else act * up_acc;
+        }
+        const scale: f32 = if (expert_scales) |scales| scales[expert] else 1.0;
+        const weight = route.weights[rank];
+        for (0..hidden) |o| {
+            var acc: f32 = 0.0;
+            for (0..inter) |i| {
+                acc += activated[i] * down[o * inter + i];
+            }
+            output[o] += (acc * scale) * weight;
+        }
+    }
+}
+
+test "metal_compute: device MoE Q4_0 forward matches scalar reference and honors the offset table" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    const metal_runtime = MetalCompute.metal_runtime;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const hidden: usize = 64;
+    const inter: usize = 32;
+    const num_experts: usize = 2;
+    const gate_bytes = inter * (hidden / 32) * 18;
+    const down_bytes = hidden * (inter / 32) * 18;
+    const per_expert = 2 * gate_bytes + down_bytes;
+    const silu_kind: u32 = 2;
+
+    // Two experts with distinct weights: gate, up, down laid out contiguously
+    // per expert, exactly like the production arena layout.
+    var expert_raw: [2][]u8 = undefined;
+    var built: usize = 0;
+    defer for (expert_raw[0..built]) |raw| allocator.free(raw);
+    for (0..num_experts) |expert| {
+        const raw = try allocator.alloc(u8, per_expert);
+        errdefer allocator.free(raw);
+        const gate = try testEncodeQ4_0Matrix(allocator, inter, hidden, 11 + expert * 101);
+        defer allocator.free(gate);
+        const up = try testEncodeQ4_0Matrix(allocator, inter, hidden, 29 + expert * 101);
+        defer allocator.free(up);
+        const down = try testEncodeQ4_0Matrix(allocator, hidden, inter, 47 + expert * 101);
+        defer allocator.free(down);
+        @memcpy(raw[0..gate_bytes], gate);
+        @memcpy(raw[gate_bytes .. 2 * gate_bytes], up);
+        @memcpy(raw[2 * gate_bytes ..], down);
+        expert_raw[expert] = raw;
+        built += 1;
+    }
+
+    // The arena outlives the runtime (declared first, deinit runs last) so
+    // the no-copy device buffers never dangle over unmapped memory.
+    var arena = try c_file.MmapRegion.initAnonymous(std.mem.alignForward(usize, num_experts * per_expert, 16 * 1024));
+    defer arena.deinit();
+    for (0..num_experts) |expert| {
+        @memcpy(arena.data[expert * per_expert ..][0..per_expert], expert_raw[expert]);
+    }
+
+    const runtime = metal_runtime.termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_decode_runtime_destroy(runtime);
+    if (metal_runtime.termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+
+    var input: [64]f32 = undefined;
+    for (&input, 0..) |*value, i| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6)) * 0.05;
+    }
+    const expert_scales = [_]f32{ 0.75, 1.25 };
+    const projection_offsets = [3]usize{ 0, gate_bytes, 2 * gate_bytes };
+
+    // Layer 0: identity offset table, both experts routed (top_k = 2).
+    {
+        const identity = [_]u32{ 0, @intCast(per_expert) };
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_prepare_moe_q4_0_layer_arena(
+            runtime,
+            0,
+            arena.data.ptr,
+            arena.data.len,
+            &identity,
+            num_experts,
+            per_expert,
+            projection_offsets[0],
+            projection_offsets[1],
+            projection_offsets[2],
+            hidden,
+            inter,
+        ));
+        const logits = [_]f32{ 0.4, -0.2 };
+        var output: [64]f32 = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_moe_forward_q4_0_host(
+            runtime,
+            0,
+            &input,
+            &logits,
+            1,
+            hidden,
+            inter,
+            num_experts,
+            2,
+            silu_kind,
+            metal_runtime.moe_addressing_indirect,
+            &expert_scales,
+            &output,
+        ));
+        var expected: [64]f32 = undefined;
+        const weight_slices = [_][]const u8{ expert_raw[0], expert_raw[1] };
+        try testDeviceMoeReference(allocator, &weight_slices, &logits, &input, hidden, inter, 2, &expert_scales, &expected);
+        for (0..hidden) |i| {
+            try std.testing.expectApproxEqAbs(expected[i], output[i], 2e-3);
+        }
+    }
+
+    // Layer 1: swapped offset table. Routing to logical expert 0 must execute
+    // expert 1's weights in indirect mode, while flat mode ignores the table
+    // and still executes expert 0's weights.
+    {
+        const swapped = [_]u32{ @intCast(per_expert), 0 };
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_prepare_moe_q4_0_layer_arena(
+            runtime,
+            1,
+            arena.data.ptr,
+            arena.data.len,
+            &swapped,
+            num_experts,
+            per_expert,
+            projection_offsets[0],
+            projection_offsets[1],
+            projection_offsets[2],
+            hidden,
+            inter,
+        ));
+        // Top-1 route onto expert 0 (route weight exactly 1.0).
+        const logits = [_]f32{ 5.0, -5.0 };
+        var indirect_output: [64]f32 = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_moe_forward_q4_0_host(
+            runtime,
+            1,
+            &input,
+            &logits,
+            1,
+            hidden,
+            inter,
+            num_experts,
+            1,
+            silu_kind,
+            metal_runtime.moe_addressing_indirect,
+            null,
+            &indirect_output,
+        ));
+        var flat_output: [64]f32 = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_moe_forward_q4_0_host(
+            runtime,
+            1,
+            &input,
+            &logits,
+            1,
+            hidden,
+            inter,
+            num_experts,
+            1,
+            silu_kind,
+            metal_runtime.moe_addressing_flat,
+            null,
+            &flat_output,
+        ));
+        var expected_e1: [64]f32 = undefined;
+        var expected_e0: [64]f32 = undefined;
+        // Reference sees the arena through the table: logical expert 0 ->
+        // expert 1 bytes (indirect) vs expert 0 bytes (flat).
+        const swapped_weights = [_][]const u8{ expert_raw[1], expert_raw[0] };
+        const identity_weights = [_][]const u8{ expert_raw[0], expert_raw[1] };
+        try testDeviceMoeReference(allocator, &swapped_weights, &logits, &input, hidden, inter, 1, null, &expected_e1);
+        try testDeviceMoeReference(allocator, &identity_weights, &logits, &input, hidden, inter, 1, null, &expected_e0);
+        var differs = false;
+        for (0..hidden) |i| {
+            try std.testing.expectApproxEqAbs(expected_e1[i], indirect_output[i], 2e-3);
+            try std.testing.expectApproxEqAbs(expected_e0[i], flat_output[i], 2e-3);
+            if (@abs(expected_e1[i] - expected_e0[i]) > 1e-4) differs = true;
+        }
+        // The two experts must actually disagree or the swap proves nothing.
+        try std.testing.expect(differs);
+    }
+
+    // Layer 2: unmapped sentinel for expert 0 zeroes its contribution.
+    {
+        const unmapped = [_]u32{ metal_runtime.moe_expert_slot_unmapped, @intCast(per_expert) };
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_prepare_moe_q4_0_layer_arena(
+            runtime,
+            2,
+            arena.data.ptr,
+            arena.data.len,
+            &unmapped,
+            num_experts,
+            per_expert,
+            projection_offsets[0],
+            projection_offsets[1],
+            projection_offsets[2],
+            hidden,
+            inter,
+        ));
+        const logits = [_]f32{ 5.0, -5.0 };
+        var output: [64]f32 = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_moe_forward_q4_0_host(
+            runtime,
+            2,
+            &input,
+            &logits,
+            1,
+            hidden,
+            inter,
+            num_experts,
+            1,
+            silu_kind,
+            metal_runtime.moe_addressing_indirect,
+            null,
+            &output,
+        ));
+        for (0..hidden) |i| {
+            try std.testing.expectEqual(@as(f32, 0.0), output[i]);
+        }
+    }
 }
 
 test "metal_compute: causal self attention is owned by metal backend" {

@@ -710,6 +710,9 @@ pub const NativeQuantTimingStats = struct {
     metal_compact_expert_host_transfers: u64 = 0,
     metal_compact_expert_evictions: u64 = 0,
     metal_compact_expert_decommitted_bytes: u64 = 0,
+    /// Layers whose routed-expert MoE ran fully on-device (no router
+    /// readback) via the ANTFLY_GEMMA4_DEVICE_MOE route.
+    metal_compact_device_moe_layers: u64 = 0,
     metal_compact_ledger_committed_bytes: u64 = 0,
     metal_compact_ledger_virtual_slot_bytes: u64 = 0,
     metal_compact_ledger_observed_footprint_bytes: u64 = 0,
