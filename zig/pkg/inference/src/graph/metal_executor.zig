@@ -2554,8 +2554,11 @@ test "metal executor only enables split KV policy for mixed local and global Gem
     };
     try std.testing.expect(config.supportsSplitSwaGlobalKvRing());
 
+    // PLE is not required: the ring bounds sliding-window KV regardless of
+    // per-layer embeddings, so a mixed-attention gemma without PLE (the MoE
+    // 26B-A4B) still qualifies.
     config.ple_hidden_size = 0;
-    try std.testing.expect(!config.supportsSplitSwaGlobalKvRing());
+    try std.testing.expect(config.supportsSplitSwaGlobalKvRing());
     config.ple_hidden_size = 256;
 
     config.sliding_window = 0;
