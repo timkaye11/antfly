@@ -4867,6 +4867,7 @@ pub const NativeGenerationPipeline = struct {
                             tokens_generated,
                             decode_state,
                             config,
+                            penalty_state,
                             token_table,
                             json_grammar,
                             gbnf_grammar,
@@ -5283,6 +5284,7 @@ pub const NativeGenerationPipeline = struct {
                         tokens_generated,
                         decode_state,
                         config,
+                        penalty_state,
                         token_table,
                         json_grammar,
                         gbnf_grammar,
@@ -5425,6 +5427,7 @@ pub const NativeGenerationPipeline = struct {
         tokens_generated: usize,
         decode_state: *NativeDecodeState,
         config: GenerationConfig,
+        penalty_state: *const SamplingPenaltyState,
         token_table: ?*const grammar_mod.TokenByteTable,
         json_grammar: *const ?grammar_mod.JsonGrammar,
         gbnf_grammar: ?*const grammar_mod.GbnfGrammar,
@@ -5449,12 +5452,32 @@ pub const NativeGenerationPipeline = struct {
             decoder_runtime_debug_stats.kv_missing += 1;
             return null;
         }
-        if (!isPureGreedyConfig(config)) {
-            decoder_runtime_debug_stats.non_greedy += 1;
-            return null;
-        }
         if (token_table != null or json_grammar.* != null or gbnf_grammar != null) {
             decoder_runtime_debug_stats.grammar_blocked += 1;
+            return null;
+        }
+        if (!isPureGreedyConfig(config)) {
+            // Sampled decoding: run the same fused decoder frame, read back the
+            // final logits, and sample on the host. Without this, temperature>0
+            // fell off the direct runtime onto the per-op eager path, making
+            // sampled chat ~15x slower than greedy on metal.
+            if (backend_kind == .metal and self.gpt_config.family == .gemma and self.gpt_config.hasPle() and gemma4MetalDirectGreedyEnabled()) {
+                self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
+                const sampled_decode_context = decode_runtime.makeDecodeContext(seq_len, 1);
+                if (try decoder_gated_runtime.forwardLastLogits(
+                    &self.cb,
+                    self.allocator,
+                    self.gpt_config,
+                    self.gpt_config.num_hidden_layers,
+                    token_ids[seq_len - 1],
+                    seq_len,
+                    &sampled_decode_context,
+                )) |logits| {
+                    defer self.allocator.free(logits);
+                    return .{ .token = sample(logits, config, penalty_state, self.allocator) };
+                }
+            }
+            decoder_runtime_debug_stats.non_greedy += 1;
             return null;
         }
 
