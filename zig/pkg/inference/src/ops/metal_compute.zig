@@ -15679,7 +15679,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (input_shape.len != 2 or residual_shape.len != 2) return null;
         const rows: usize = @intCast(input_shape[0]);
         if (rows == 0) return null;
-        if (rows == 1 and !getenvBool("TERMITE_METAL_ENABLE_GATED_FFN_RESIDUAL_SINGLE_ROW")) {
+        // Single-row calls are only worthwhile inside a decode-step frame,
+        // where the staged f32 building blocks join the open command buffer
+        // (the compact MoE shared expert). Outside a frame the historical
+        // guard stands: each staged op would self-commit and lose to the
+        // eager path.
+        const single_row_in_frame = rows == 1 and frame_active;
+        if (rows == 1 and !single_row_in_frame and
+            !getenvBool("TERMITE_METAL_ENABLE_GATED_FFN_RESIDUAL_SINGLE_ROW"))
+        {
             return null;
         }
         if (@as(usize, @intCast(input_shape[1])) != request.hidden_size or
@@ -15689,7 +15697,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return null;
         }
 
-        if (input_buf.metal_tensor) |input_mt| {
+        // The monolithic device impl only understands slot-prepared norms;
+        // a weight-only norm request would silently skip the norm there.
+        // Single-row frame calls also stay on the staged path: its f32
+        // building blocks are the same kernels as the eager op sequence
+        // (token parity), while the monolithic rows==1 route uses f16
+        // intermediates.
+        const weight_only_norm =
+            (request.post_down_rms_norm_slot == null and request.post_down_rms_norm_weight != null) or
+            (request.post_gate_rms_norm_slot == null and request.post_gate_rms_norm_weight != null);
+        const allow_monolithic_device = !weight_only_norm and !single_row_in_frame;
+
+        if (if (allow_monolithic_device) input_buf.metal_tensor else null) |input_mt| {
             if (residual_buf.metal_tensor) |residual_mt| {
                 if (input_mt.isDevice() and residual_mt.isDevice()) {
                     if (try metal_runtime.tryDeviceQuantizedGatedFfnResidual(
@@ -15720,7 +15739,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         if (try self.runStagedGatedFfnResidualDevice(request)) |tensor| return tensor;
 
-        if (frame_active) return null;
+        // The raw host path also resolves norms by slot only.
+        if (frame_active or weight_only_norm) return null;
 
         const input_data = try hostSliceForBuf(input_buf);
         const residual_data = try hostSliceForBuf(residual_buf);

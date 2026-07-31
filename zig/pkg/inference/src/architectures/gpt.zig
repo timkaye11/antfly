@@ -5679,20 +5679,14 @@ fn decoderBlock(
                 );
                 defer if (pending_compact_moe) |*pending| pending.deinit(cb);
 
-                const shared_ffn_started_at = monotonicNowNs();
-                const shared_out = try denseFeedForward(cb, allocator, config, shared_normed, total, layer, &name_buf);
-                defer cb.free(shared_out);
-                try maybeDebugLayerTensorLastRow(cb, allocator, layer, "shared_raw", shared_out, hidden_size);
-                const shared_ffn_elapsed = monotonicNowNs() - shared_ffn_started_at;
-                debug_timing_stats.ffn_nanos += @intCast(shared_ffn_elapsed);
-                debug_timing_stats.shared_expert_ffn_nanos += @intCast(shared_ffn_elapsed);
-                norm_started_at = monotonicNowNs();
-                const shared_post = try applyGemmaSharedFfnPostNorm(cb, allocator, config, shared_out, layer, &name_buf);
-                defer if (shared_post != shared_out) cb.free(shared_post);
-                try maybeDebugLayerTensorLastRow(cb, allocator, layer, "shared_post", shared_post, hidden_size);
-                debug_timing_stats.norm_nanos += @intCast(monotonicNowNs() - norm_started_at);
-
-                // MoE routed expert path: RMSNorm → MoE → RMSNorm (branches from sa_out too)
+                // MoE routed expert path: RMSNorm → MoE → RMSNorm (branches
+                // from sa_out too). Runs before the shared expert so the
+                // routed post-norm output can serve as the fused shared-expert
+                // entry's required residual; under the decode-step frame the
+                // shared-FFN work that used to sit here was encode-only, so no
+                // expert-I/O overlap is lost by the reorder, and the final
+                // math is unchanged (each op is a pure function of its
+                // inputs).
                 const moe_started_at = monotonicNowNs();
                 const moe_out = blk_moe_out: {
                     if (pending_compact_moe) |*pending| {
@@ -5707,11 +5701,35 @@ fn decoderBlock(
                 const moe_post = try applyGemmaMoeFfnPostNorm(cb, allocator, config, moe_out, layer, &name_buf);
                 defer if (moe_post != moe_out) cb.free(moe_post);
                 try maybeDebugLayerTensorLastRow(cb, allocator, layer, "moe_post", moe_post, hidden_size);
+                debug_timing_stats.norm_nanos += @intCast(monotonicNowNs() - norm_started_at);
 
-                // Combine: shared + MoE, then overall FFN post-norm, then residual
-                const combined = try cb.add(shared_post, moe_post);
+                // Shared expert FFN, its post norm, and the combine add:
+                //   combined = sharedPostNorm(sharedFFN(shared_normed)) + moe_post
+                // The fused backend entry computes exactly that in one op
+                // (post-down norm in-op, moe_post as the required residual);
+                // the eager fallback is the original op sequence.
+                const shared_ffn_started_at = monotonicNowNs();
+                const combined = blk_combined: {
+                    if (!disableDecoderRuntimeActivationDebug()) {
+                        if (try runSharedExpertFfnCombine(cb, allocator, config, shared_normed, moe_post, total, layer, &name_buf)) |fused| {
+                            break :blk_combined fused;
+                        }
+                    }
+                    const shared_out = try denseFeedForward(cb, allocator, config, shared_normed, total, layer, &name_buf);
+                    defer cb.free(shared_out);
+                    try maybeDebugLayerTensorLastRow(cb, allocator, layer, "shared_raw", shared_out, hidden_size);
+                    const shared_post = try applyGemmaSharedFfnPostNorm(cb, allocator, config, shared_out, layer, &name_buf);
+                    defer if (shared_post != shared_out) cb.free(shared_post);
+                    try maybeDebugLayerTensorLastRow(cb, allocator, layer, "shared_post", shared_post, hidden_size);
+                    break :blk_combined try cb.add(shared_post, moe_post);
+                };
                 defer cb.free(combined);
+                const shared_ffn_elapsed = monotonicNowNs() - shared_ffn_started_at;
+                debug_timing_stats.ffn_nanos += @intCast(shared_ffn_elapsed);
+                debug_timing_stats.shared_expert_ffn_nanos += @intCast(shared_ffn_elapsed);
                 try maybeDebugLayerTensorLastRow(cb, allocator, layer, "ffn_combined", combined, hidden_size);
+
+                norm_started_at = monotonicNowNs();
                 const combined_normed = try applyGemmaFfnPostNorm(cb, allocator, config, combined, layer, &name_buf);
                 defer if (combined_normed != combined) cb.free(combined_normed);
                 try maybeDebugLayerTensorLastRow(cb, allocator, layer, "ffn_post", combined_normed, hidden_size);
@@ -7885,6 +7903,91 @@ pub fn positionOffset(seq_len: usize, query_seq_len: usize, decode_context: ?*co
 }
 
 // --- Feed-forward network ---
+
+/// Gemma 4 MoE shared expert through the backend's fused gated-FFN entry:
+///   out = sharedPostNorm(down(act(gate(x)) * up(x))) + residual
+/// with `residual` being the routed MoE post-norm output, so one backend op
+/// replaces the four eager FFN ops, the post norm, and the combine add while
+/// computing bit-identical math: the weights resolve to the same dynamic
+/// runtime linear slots the eager linears use, and the adjusted norm weight
+/// feeds the same weight-device RMS kernel as cb.rmsNorm. Metal-only: other
+/// backends either lack the ops or ignore weight-based norm requests.
+/// Returns null when any piece is unavailable; the caller falls back to the
+/// eager sequence.
+fn runSharedExpertFfnCombine(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input: CT,
+    residual: CT,
+    total: usize,
+    layer: usize,
+    name_buf: *[256]u8,
+) !?CT {
+    if (total != 1) return null;
+    if (cb.kind() != .metal) return null;
+    if (cb.vtable.runGatedFfnResidual == null or cb.vtable.decoderRuntimeEnsureLinearSlot == null) return null;
+    const hidden_size = config.hidden_size;
+    const inter_size = config.intermediateSize(layer);
+
+    // Shared-expert post norm (post_ffw_norm_1) with the same name fallback
+    // and +offset adjustment as applyGemmaSharedFfnPostNorm. A model without
+    // the weight means the eager path would apply no norm, which the fused
+    // entry cannot express with a residual — decline.
+    var norm_name_buf: [256]u8 = undefined;
+    const norm_primary = std.fmt.bufPrint(&norm_name_buf, "model.layers.{d}.post_feedforward_layernorm_1.weight", .{layer}) catch return error.NameTooLong;
+    const base_norm_w = getModelWeight(cb, config, norm_primary) catch |primary_err| switch (primary_err) {
+        error.MissingWeight, error.WeightNotFound => blk: {
+            const norm_fallback = std.fmt.bufPrint(&norm_name_buf, "model.layers.{d}.post_feedforward_layernorm.weight", .{layer}) catch return error.NameTooLong;
+            break :blk getModelWeight(cb, config, norm_fallback) catch |fallback_err| switch (fallback_err) {
+                error.MissingWeight, error.WeightNotFound => return null,
+                else => return fallback_err,
+            };
+        },
+        else => return primary_err,
+    };
+    defer cb.free(base_norm_w);
+    const norm_w = try maybeAdjustNormWeight(cb, allocator, config, base_norm_w, hidden_size);
+    defer if (norm_w != base_norm_w) cb.free(norm_w);
+
+    const gate_w = try getFFNWeight(cb, config, layer, "gate", name_buf);
+    defer cb.free(gate_w);
+    const gate_slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{
+        .weight = gate_w,
+        .bias = null,
+        .in_dim = hidden_size,
+        .out_dim = inter_size,
+    })) orelse return null;
+    const up_w = try getFFNWeight(cb, config, layer, "up", name_buf);
+    defer cb.free(up_w);
+    const up_slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{
+        .weight = up_w,
+        .bias = null,
+        .in_dim = hidden_size,
+        .out_dim = inter_size,
+    })) orelse return null;
+    const down_w = try getFFNWeight(cb, config, layer, "down", name_buf);
+    defer cb.free(down_w);
+    const down_slot = (try cb.decoderRuntimeEnsureLinearSlot(&.{
+        .weight = down_w,
+        .bias = null,
+        .in_dim = inter_size,
+        .out_dim = hidden_size,
+    })) orelse return null;
+
+    return try cb.runGatedFfnResidual(&.{
+        .gate_linear_slot = gate_slot,
+        .up_linear_slot = up_slot,
+        .down_linear_slot = down_slot,
+        .input = input,
+        .residual = residual,
+        .post_down_rms_norm_weight = norm_w,
+        .hidden_size = hidden_size,
+        .intermediate_size = inter_size,
+        .eps = config.norm_eps,
+        .activation = decoderRuntimeActivationKind(config.activation),
+    });
+}
 
 /// Dense gated FFN using the standard mlp.gate/up/down_proj weights.
 /// Used for the shared expert sublayer in Gemma 4 MoE blocks.
