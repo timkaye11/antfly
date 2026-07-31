@@ -721,6 +721,8 @@ pub const NativeQuantTimingStats = struct {
     metal_compact_expert_read_tasks: u64 = 0,
     metal_compact_expert_read_ns: u64 = 0,
     metal_compact_expert_queue_wait_ns: u64 = 0,
+    metal_compact_frame_begins: u64 = 0,
+    metal_compact_frame_flushes: u64 = 0,
     metal_provider_quantized_runtime_private_nanos: u128 = 0,
     metal_provider_quantized_runtime_mapped_nanos: u128 = 0,
     metal_provider_dense_slot_host_bytes: u64 = 0,
@@ -1461,6 +1463,14 @@ pub const ComputeBackend = struct {
         /// called, allowing independent shared-expert work to overlap disk I/O.
         beginMoeBlock: ?*const fn (ctx: *anyopaque, request: *const RunMoeBlockRequest) anyerror!bool = null,
         finishMoeBlock: ?*const fn (ctx: *anyopaque, request: *const RunMoeBlockRequest) anyerror!?CT = null,
+
+        /// Open a backend command frame spanning one single-token decode step
+        /// so every eager op encodes into a single submission; intermediate
+        /// host readbacks flush and reopen the frame (one sync each). A true
+        /// return obligates the caller to call endDecodeStepFrame. Backends
+        /// without frame support leave these null.
+        beginDecodeStepFrame: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
+        endDecodeStepFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 
         /// Store a per-expert output scale tensor for the current MoE layer.
         /// The graph backend threads this into fused_moe_scatter_add so the
@@ -3948,6 +3958,19 @@ pub const ComputeBackend = struct {
     pub fn finishMoeBlock(self: *const ComputeBackend, request: *const RunMoeBlockRequest) !?CT {
         if (self.vtable.finishMoeBlock) |op| return op(self.ptr, request);
         return null;
+    }
+
+    /// Open a command frame spanning one single-token decode step. Returns
+    /// false when the backend declined (no frame support, frame already
+    /// active, or the step-frame kill switch is set); a true return must be
+    /// paired with endDecodeStepFrame after the step's last host readback.
+    pub fn beginDecodeStepFrame(self: *const ComputeBackend) !bool {
+        if (self.vtable.beginDecodeStepFrame) |op| return op(self.ptr);
+        return false;
+    }
+
+    pub fn endDecodeStepFrame(self: *const ComputeBackend) !void {
+        if (self.vtable.endDecodeStepFrame) |op| return op(self.ptr);
     }
 
     /// GPU-accelerated LoRA gradient accumulation.

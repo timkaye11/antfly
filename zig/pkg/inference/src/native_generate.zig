@@ -1224,7 +1224,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 metalStatsWithRuntimePlanCounters(graph_generate_stats, metal_snapshot.provider),
             );
             print(
-                "metal_compact_expert_cache: resident_slots={d}/{d} resident_bytes={d} hits={d} misses={d} load_bytes={d} whole_publications={d} projection_prepares={d} fused_frames={d}/{d} fused_fallbacks={d} device_input_reuses={d} host_transfers={d}\n",
+                "metal_compact_expert_cache: resident_slots={d}/{d} resident_bytes={d} hits={d} misses={d} load_bytes={d} whole_publications={d} projection_prepares={d} fused_frames={d}/{d} fused_fallbacks={d} device_input_reuses={d} host_transfers={d} step_frames={d} step_flushes={d}\n",
                 .{
                     metal_snapshot.provider.metal_compact_expert_resident_slots,
                     metal_snapshot.provider.metal_compact_expert_cache_capacity,
@@ -1239,6 +1239,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                     metal_snapshot.provider.metal_compact_expert_fused_frame_fallbacks,
                     metal_snapshot.provider.metal_compact_expert_device_input_reuses,
                     metal_snapshot.provider.metal_compact_expert_host_transfers,
+                    metal_snapshot.provider.metal_compact_frame_begins,
+                    metal_snapshot.provider.metal_compact_frame_flushes,
                 },
             );
             print(
