@@ -29,6 +29,14 @@ class PairBenchmarkAccountingTest(unittest.TestCase):
             import pathlib
             import sys
 
+            if order_log := os.environ.get("ORDER_LOG"):
+                with pathlib.Path(order_log).open("a", encoding="utf-8") as output:
+                    output.write("antfly\\n")
+
+            if profile_log := os.environ.get("GQA_PROFILE_LOG"):
+                with pathlib.Path(profile_log).open("a", encoding="utf-8") as output:
+                    output.write(os.environ.get("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE", "unset") + "\\n")
+
             json_path = pathlib.Path(sys.argv[sys.argv.index("--json-timing") + 1])
             payload = {
                 "tokens": int(os.environ.get("FAKE_ANTFLY_ACTUAL_TOKENS", "3")),
@@ -72,6 +80,11 @@ class PairBenchmarkAccountingTest(unittest.TestCase):
             """
             #!/usr/bin/env python3
             import os
+            import pathlib
+
+            if order_log := os.environ.get("ORDER_LOG"):
+                with pathlib.Path(order_log).open("a", encoding="utf-8") as output:
+                    output.write("llama_cpp\\n")
 
             runs = int(os.environ.get("FAKE_LLAMA_EVAL_RUNS", "3"))
             print("common_perf_print: sampling time = 2.00 ms")
@@ -93,6 +106,18 @@ class PairBenchmarkAccountingTest(unittest.TestCase):
         self.case_index += 1
         output_dir = self.root / f"case-{self.case_index}"
         env = os.environ.copy()
+        # Ambient GQA prefill settings would defeat the legacy-bridge set-ness
+        # detection these tests assert on, so scrub them first.
+        for name in (
+            "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE",
+            "ANTFLY_GQA_PREFILL_PROFILE",
+            "antfly_gqa_prefill_profile",
+        ):
+            env.pop(name, None)
+        for suffix in ("FAST", "TILED", "MMA"):
+            env.pop(f"ANTFLY_GQA_PREFILL_{suffix}", None)
+            env.pop(f"ANTFLY_INFERENCE_CUDA_GQA_PREFILL_{suffix}", None)
+            env.pop(f"antfly_gqa_prefill_{suffix.lower()}", None)
         env.update({
             "ANTFLY_BIN": str(self.antfly),
             "LLAMA_CPP_BIN": str(self.llama),
@@ -143,6 +168,21 @@ class PairBenchmarkAccountingTest(unittest.TestCase):
         self.assertIn("antfly_generated_tokens", fields)
         self.assertIn("antfly_generated_q4_0_mmv", fields)
 
+    def test_measurement_pairs_use_balanced_ab_ba_order(self) -> None:
+        order_log = self.root / "order.log"
+        completed, output_dir = self.run_case(REPEATS="2", ORDER_LOG=str(order_log))
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(
+            ["antfly", "llama_cpp", "llama_cpp", "antfly"],
+            order_log.read_text(encoding="utf-8").splitlines(),
+        )
+        summary = json.loads((output_dir / "paired_summary.json").read_text())
+        self.assertEqual("balanced_ab_ba", summary["comparison"]["paired_order"])
+        self.assertEqual(
+            [["antfly", "llama_cpp"], ["llama_cpp", "antfly"]],
+            [row["execution_order"] for row in summary["rows"]],
+        )
+
     def test_rejects_truncated_antfly_generation(self) -> None:
         completed, _ = self.run_case(FAKE_ANTFLY_ACTUAL_TOKENS="2")
         self.assertEqual(1, completed.returncode)
@@ -165,6 +205,31 @@ class PairBenchmarkAccountingTest(unittest.TestCase):
         self.assertEqual(2, completed.returncode)
         self.assertIn("LLAMA_TOKENS = ANTFLY_TOKENS + 1", completed.stderr)
         self.assertFalse(output_dir.exists())
+
+    def test_gqa_prefill_profile_defaults_to_required_fast_without_legacy_vars(self) -> None:
+        profile_log = self.root / "gqa-profile-default.log"
+        completed, output_dir = self.run_case(GQA_PROFILE_LOG=str(profile_log))
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(
+            ["required-fast"],
+            profile_log.read_text(encoding="utf-8").splitlines(),
+        )
+        summary = json.loads((output_dir / "paired_summary.json").read_text())
+        self.assertEqual("required-fast", summary["comparison"]["antfly_gqa_prefill_profile"])
+
+    def test_gqa_prefill_profile_preserves_explicit_legacy_bridge(self) -> None:
+        profile_log = self.root / "gqa-profile-legacy.log"
+        completed, output_dir = self.run_case(
+            GQA_PROFILE_LOG=str(profile_log),
+            ANTFLY_GQA_PREFILL_FAST="1",
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(
+            ["fast"],
+            profile_log.read_text(encoding="utf-8").splitlines(),
+        )
+        summary = json.loads((output_dir / "paired_summary.json").read_text())
+        self.assertEqual("fast", summary["comparison"]["antfly_gqa_prefill_profile"])
 
     def test_lm_route_gate_rejects_fallbacks(self) -> None:
         completed, _ = self.run_case(FAKE_LM_FALLBACKS="1")

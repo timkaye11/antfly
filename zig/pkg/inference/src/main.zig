@@ -279,6 +279,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var ml_dir: []const u8 = defaultMlDir(allocator);
     var config_path: ?[]const u8 = null;
     var max_concurrent_requests_override: ?usize = null;
+    var budget_overrides_mib = inference.runtime.tier.memory.BudgetOverridesMib{};
     var kernel_jit_mode_override: ?inference.graph.kernel_jit.Mode = null;
     var allow_insecure_public_bind = false;
     var allow_unknown_models = false;
@@ -308,6 +309,21 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--max-concurrent-requests") and i + 1 < args.len) {
             max_concurrent_requests_override = try parseAdmissionLimit(args[i + 1]);
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--host-budget-mb") and i + 1 < args.len) {
+            budget_overrides_mib.host = try std.fmt.parseInt(usize, args[i + 1], 10);
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--backend-budget-mb") and i + 1 < args.len) {
+            budget_overrides_mib.backend = try std.fmt.parseInt(usize, args[i + 1], 10);
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--combined-budget-mb") and i + 1 < args.len) {
+            budget_overrides_mib.combined = try std.fmt.parseInt(usize, args[i + 1], 10);
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--kv-budget-mb") and i + 1 < args.len) {
+            budget_overrides_mib.kv = try std.fmt.parseInt(usize, args[i + 1], 10);
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--scratch-budget-mb") and i + 1 < args.len) {
+            budget_overrides_mib.scratch = try std.fmt.parseInt(usize, args[i + 1], 10);
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--kernel-jit-mode")) {
             if (i + 1 >= args.len) return error.MissingKernelJitMode;
@@ -355,9 +371,17 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var config_preload_models: []inference.server.WarmModel = &.{};
     defer if (config_preload_models.len > 0) allocator.free(config_preload_models);
 
+    const budget_override_limits = try budget_overrides_mib.toByteLimits();
     var node_cfg = inference.server.NodeConfig{
         .models_dir = models_dir,
         .ml_dir = ml_dir,
+        .generation_budget_overrides = .{
+            .host_limit_bytes = budget_override_limits.host_limit_bytes,
+            .backend_limit_bytes = budget_override_limits.backend_limit_bytes,
+            .combined_limit_bytes = budget_override_limits.combined_limit_bytes,
+            .kv_limit_bytes = budget_override_limits.kv_limit_bytes,
+            .scratch_limit_bytes = budget_override_limits.scratch_limit_bytes,
+        },
         .preload = preload_models.items,
         .allow_insecure_public_bind = allow_insecure_public_bind,
         .allow_unknown_models = allow_unknown_models,
@@ -550,6 +574,11 @@ fn printUsage(usage_name: []const u8) void {
         \\  --ml-dir <dir>        Traditional ML directory (default: ~/.antfly/inference/ml)
         \\  --config <path>       JSON runtime configuration, including full kernel JIT policy
         \\  --max-concurrent-requests <n> Bound weighted in-flight request capacity before returning 503
+        \\  --host-budget-mb <n> Process-wide inference host-memory admission override (MiB)
+        \\  --backend-budget-mb <n> Process-wide inference device-memory admission override (MiB)
+        \\  --combined-budget-mb <n> Process-wide inference combined-memory admission override (MiB)
+        \\  --kv-budget-mb <n> Process-wide inference KV-cache admission override (MiB)
+        \\  --scratch-budget-mb <n> Process-wide inference scratch-memory admission override (MiB)
         \\  --kernel-jit-mode <off|shadow|on|required> JIT startup-preloaded Metal/CUDA models
         \\  --preload-model <kind:name|kind:backend:name> Preload and warm a configured model before serving
         \\  --allow-unknown-models Permit artifacts whose compatibility cannot be proven; known incompatible models remain blocked

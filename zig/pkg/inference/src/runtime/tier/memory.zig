@@ -94,6 +94,97 @@ pub const Limits = struct {
     scratch_limit_bytes: usize = 0,
 };
 
+pub const bytes_per_mib: usize = 1024 * 1024;
+
+/// CLI-facing memory limit overrides expressed in whole mebibytes. Zero means
+/// that the corresponding limit is not overridden, preserving the established
+/// command-line behavior while keeping the unit conversion checked and
+/// centralized.
+pub const BudgetOverridesMib = struct {
+    host: usize = 0,
+    backend: usize = 0,
+    combined: usize = 0,
+    kv: usize = 0,
+    scratch: usize = 0,
+
+    /// Convert the selectively populated override fields to their byte form.
+    /// The returned `Limits` is an override set: zero fields remain omitted.
+    pub fn toByteLimits(self: @This()) !Limits {
+        return .{
+            .host_limit_bytes = try mibToBytes(self.host),
+            .backend_limit_bytes = try mibToBytes(self.backend),
+            .combined_limit_bytes = try mibToBytes(self.combined),
+            .kv_limit_bytes = try mibToBytes(self.kv),
+            .scratch_limit_bytes = try mibToBytes(self.scratch),
+        };
+    }
+
+    /// Apply explicit overrides after backend defaults and model-specific
+    /// widening have been resolved.
+    pub fn apply(self: @This(), defaults: Limits) !Limits {
+        const overrides = try self.toByteLimits();
+        var limits = defaults;
+        if (overrides.host_limit_bytes != 0) limits.host_limit_bytes = overrides.host_limit_bytes;
+        if (overrides.backend_limit_bytes != 0) limits.backend_limit_bytes = overrides.backend_limit_bytes;
+        if (overrides.combined_limit_bytes != 0) limits.combined_limit_bytes = overrides.combined_limit_bytes;
+        if (overrides.kv_limit_bytes != 0) limits.kv_limit_bytes = overrides.kv_limit_bytes;
+        if (overrides.scratch_limit_bytes != 0) limits.scratch_limit_bytes = overrides.scratch_limit_bytes;
+        return limits;
+    }
+};
+
+fn mibToBytes(value: usize) !usize {
+    return std.math.mul(usize, value, bytes_per_mib);
+}
+
+test "budget MiB overrides convert every memory domain exactly" {
+    const overrides = try (BudgetOverridesMib{
+        .host = 2,
+        .backend = 3,
+        .combined = 4,
+        .kv = 5,
+        .scratch = 6,
+    }).toByteLimits();
+    try std.testing.expectEqual(@as(usize, 2 * bytes_per_mib), overrides.host_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 3 * bytes_per_mib), overrides.backend_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 4 * bytes_per_mib), overrides.combined_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 5 * bytes_per_mib), overrides.kv_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 6 * bytes_per_mib), overrides.scratch_limit_bytes);
+}
+
+test "budget MiB overrides apply selectively and zero remains omitted" {
+    const defaults = Limits{
+        .host_limit_bytes = 10,
+        .backend_limit_bytes = 20,
+        .combined_limit_bytes = 30,
+        .kv_limit_bytes = 40,
+        .scratch_limit_bytes = 50,
+    };
+    const applied = try (BudgetOverridesMib{
+        .host = 2,
+        .kv = 3,
+    }).apply(defaults);
+    try std.testing.expectEqual(@as(usize, 2 * bytes_per_mib), applied.host_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 20), applied.backend_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 30), applied.combined_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 3 * bytes_per_mib), applied.kv_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 50), applied.scratch_limit_bytes);
+    try std.testing.expectEqual(defaults, try (BudgetOverridesMib{}).apply(defaults));
+}
+
+test "budget MiB overrides accept the representable boundary and reject overflow" {
+    const max_mib = std.math.maxInt(usize) / bytes_per_mib;
+    const boundary = try (BudgetOverridesMib{ .host = max_mib }).toByteLimits();
+    try std.testing.expectEqual(max_mib * bytes_per_mib, boundary.host_limit_bytes);
+
+    const overflowing = max_mib + 1;
+    try std.testing.expectError(error.Overflow, (BudgetOverridesMib{ .host = overflowing }).toByteLimits());
+    try std.testing.expectError(error.Overflow, (BudgetOverridesMib{ .backend = overflowing }).toByteLimits());
+    try std.testing.expectError(error.Overflow, (BudgetOverridesMib{ .combined = overflowing }).toByteLimits());
+    try std.testing.expectError(error.Overflow, (BudgetOverridesMib{ .kv = overflowing }).toByteLimits());
+    try std.testing.expectError(error.Overflow, (BudgetOverridesMib{ .scratch = overflowing }).toByteLimits());
+}
+
 pub fn maxCompositeLimits(a: Limits, b: Limits) Limits {
     return .{
         .host_limit_bytes = @max(a.host_limit_bytes, b.host_limit_bytes),
@@ -1815,8 +1906,37 @@ pub fn estimateGptGeneration(
         return error.ResourceLimitExceeded;
     const activation_scratch = std.math.add(usize, hidden_scratch, attn_scratch) catch
         return error.ResourceLimitExceeded;
-    const scratch_bytes = std.math.add(usize, activation_scratch, logits_scratch) catch
+    const base_scratch_bytes = std.math.add(usize, activation_scratch, logits_scratch) catch
         return error.ResourceLimitExceeded;
+    // CUDA Gemma4 prefill enqueues layer temporaries asynchronously. Until the
+    // allocator exposes an admission-grade physical high-water, budget one
+    // maximum FFN activation per layer: a measured 2051-row E2B prefill
+    // otherwise underestimates scratch by roughly 2 GiB and forces a device
+    // synchronization to drain deferred frees. This envelope is deliberately
+    // CUDA/Gemma/PLE-specific so it does not undo the independently qualified
+    // Metal chunk policy.
+    const cuda_deferred_activation_scratch = if (backend == .cuda and
+        config.family == .gemma and config.hasPle())
+    blk: {
+        var max_intermediate: usize = 0;
+        for (0..@as(usize, @intCast(config.num_hidden_layers))) |layer| {
+            max_intermediate = @max(
+                max_intermediate,
+                @as(usize, @intCast(config.intermediateSize(layer))),
+            );
+        }
+        break :blk checkedProduct(&.{
+            scratch_rows,
+            max_intermediate,
+            @as(usize, @intCast(config.num_hidden_layers)),
+            @sizeOf(f32),
+        }) catch return error.ResourceLimitExceeded;
+    } else 0;
+    const scratch_bytes = std.math.add(
+        usize,
+        base_scratch_bytes,
+        cuda_deferred_activation_scratch,
+    ) catch return error.ResourceLimitExceeded;
 
     return .{
         .prompt_tokens = prompt_tokens,
@@ -1840,6 +1960,11 @@ pub const GptGenerationBudgetComponent = struct {
     config: gpt_mod.Config,
 };
 
+pub const GptGenerationPrefillAdmission = struct {
+    max_chunk_rows: usize,
+    max_scratch_bytes: usize,
+};
+
 /// Reserves target and optional draft generation memory at the largest chunk
 /// that fits. Failed attempts are isolated, so only the selected geometry is
 /// committed to the caller's budget.
@@ -1850,6 +1975,27 @@ pub fn reserveGptGenerationAtLargestChunk(
     max_tokens: usize,
     chunk_ceiling: usize,
 ) !usize {
+    return (try reserveGptGenerationPrefill(
+        budget,
+        components,
+        prompt_tokens,
+        max_tokens,
+        chunk_ceiling,
+    )).max_chunk_rows;
+}
+
+/// Reserve generation resources and return the complete metadata needed to
+/// fingerprint an immutable prefill plan. `max_scratch_bytes` is the request's
+/// incremental scratch reservation, excluding reservations already present on
+/// the supplied run budget.
+pub fn reserveGptGenerationPrefill(
+    budget: *RunBudget,
+    components: []const GptGenerationBudgetComponent,
+    prompt_tokens: usize,
+    max_tokens: usize,
+    chunk_ceiling: usize,
+) !GptGenerationPrefillAdmission {
+    const scratch_before = budget.scratchTotalBytes();
     var chunk = @max(chunk_ceiling, 1);
     while (true) {
         var trial = budget.*;
@@ -1869,8 +2015,12 @@ pub fn reserveGptGenerationAtLargestChunk(
             };
         }
         if (!failed) {
+            const selected_scratch = trial.scratchTotalBytes() -| scratch_before;
             budget.* = trial;
-            return chunk;
+            return .{
+                .max_chunk_rows = chunk,
+                .max_scratch_bytes = selected_scratch,
+            };
         }
         if (chunk <= 32) {
             const denial_count = trial.denials;
@@ -2637,6 +2787,71 @@ test "generation budget downshifts target and draft together" {
         2 * (try estimateGptGeneration(.metal, .f16, cfg, 200, 1, 64)).scratch_bytes,
         budget.scratchTotalBytes(),
     );
+}
+
+test "cuda Gemma4 prefill rejects unsafe 2051 row physical envelope" {
+    const cfg = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 1536,
+        .num_hidden_layers = 35,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .intermediate_size = 6144,
+        .shared_layer_intermediate_size = 12288,
+        .num_kv_shared_layers = 20,
+        .vocab_size = 262144,
+        .sliding_window = 512,
+        .sliding_window_pattern = 5,
+        .ple_hidden_size = 256,
+        .position_encoding = .rope,
+    };
+    const unsafe = try estimateGptGeneration(.cuda, .f16, cfg, 2051, 300, 2051);
+    try std.testing.expect(unsafe.scratch_bytes > 2 * 1024 * 1024 * 1024);
+
+    const components = [_]GptGenerationBudgetComponent{
+        .{ .backend = .cuda, .kv_dtype = .f16, .config = cfg },
+    };
+    var budget = RunBudget.init(.{ .scratch_limit_bytes = 2 * 1024 * 1024 * 1024 });
+    const admission = try reserveGptGenerationPrefill(
+        &budget,
+        &components,
+        2051,
+        300,
+        2051,
+    );
+    try std.testing.expect(admission.max_chunk_rows < 2051);
+    try std.testing.expect(admission.max_scratch_bytes <= 2 * 1024 * 1024 * 1024);
+    try std.testing.expectEqual(admission.max_scratch_bytes, budget.scratchTotalBytes());
+}
+
+test "cuda Gemma4 measured 512 ceiling returns plan scratch metadata" {
+    const cfg = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 1536,
+        .num_hidden_layers = 35,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .intermediate_size = 6144,
+        .shared_layer_intermediate_size = 12288,
+        .num_kv_shared_layers = 20,
+        .vocab_size = 262144,
+        .sliding_window = 512,
+        .sliding_window_pattern = 5,
+        .ple_hidden_size = 256,
+        .position_encoding = .rope,
+    };
+    const components = [_]GptGenerationBudgetComponent{
+        .{ .backend = .cuda, .kv_dtype = .f16, .config = cfg },
+    };
+    var budget = RunBudget.init(.{ .scratch_limit_bytes = 2 * 1024 * 1024 * 1024 });
+    const admission = try reserveGptGenerationPrefill(&budget, &components, 2051, 300, 512);
+    try std.testing.expectEqual(@as(usize, 512), admission.max_chunk_rows);
+    try std.testing.expect(admission.max_scratch_bytes > 0);
+    try std.testing.expectEqual(admission.max_scratch_bytes, budget.scratchTotalBytes());
 }
 
 test "generation budget rolls back all components when the minimum chunk fails" {

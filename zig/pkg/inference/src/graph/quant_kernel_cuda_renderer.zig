@@ -35,9 +35,18 @@ pub const KernelKind = enum {
     q4_0_pair_activation_q8_1,
     q4_0_pair_activation_q8_1_e2b_6144,
     q4_0_pair_activation_q8_1_e2b_12288,
+    // llama.cpp CUDA block_q8_1 activation layout: half2(d, raw f32 sum)
+    // plus 32 int8 values. This is an operational CUDA matmul boundary, not
+    // the serialized CPU-reference invariant d * sum(qs).
+    // These remain SM89 diagnostic candidates and are intentionally distinct
+    // from the historical zero-sum 36-byte activation layout above.
+    q4_0_pair_activation_ggml_q8_1_e2b_6144,
+    q4_0_pair_activation_ggml_q8_1_e2b_12288,
     q4_0_down_q8_1,
     q4_0_down_q8_1_e2b_6144,
     q4_0_down_q8_1_e2b_12288,
+    q4_0_down_ggml_q8_1_e2b_6144,
+    q4_0_down_ggml_q8_1_e2b_12288,
     // Exact F32 E2B FFN candidates. These deliberately retain the
     // handwritten F32 activation boundary and warp reduction order.
     q4_0_pair_activation_f32_e2b_6144_exact,
@@ -62,6 +71,12 @@ pub const GridMapping = enum {
     batch_kv_heads_by_splits,
     /// grid.x flattens `(batch, query head, split-KV partition)`.
     batch_query_heads_by_splits,
+    /// grid.x selects `(batch, query head)` and grid.y selects a contiguous
+    /// output-dimension tile within that head.
+    batch_query_heads_by_output_tiles,
+    /// grid.x selects one query head and grid.y selects a contiguous query-row
+    /// tile. The qualified Gemma 4 Flash prefill contract fixes batch to one.
+    query_heads_by_query_tiles,
 };
 
 pub const DimensionConstraint = struct {
@@ -120,6 +135,10 @@ pub const Route = struct {
 pub const QuantDecodePrimitive = enum {
     q4_k_scale_min,
     q4_0_f16_nibbles,
+    /// Historical Antfly 36-byte activation block. Bytes 2..3 are zero and
+    /// Q4 nibbles are centered before DP4A.
+    q4_0_q8_zp_dp4a,
+    /// GGML block_q8_1: half2(d, sum) followed by 32 signed int8 values.
     q4_0_q8_1_dp4a,
     q6_k_q8_1_dp4a,
 };
@@ -159,7 +178,7 @@ pub const Q4ProjectionLowering = struct {
 };
 
 pub const PairActivationQ8Lowering = struct {
-    decode: QuantDecodePrimitive = .q4_0_q8_1_dp4a,
+    decode: QuantDecodePrimitive = .q4_0_q8_zp_dp4a,
     reduction: ReductionPrimitive = .warp_sum_and_max,
     input_blocks: u16,
     output_blocks: u16,
@@ -168,7 +187,7 @@ pub const PairActivationQ8Lowering = struct {
 };
 
 pub const DownQ8Lowering = struct {
-    decode: QuantDecodePrimitive = .q4_0_q8_1_dp4a,
+    decode: QuantDecodePrimitive = .q4_0_q8_zp_dp4a,
     reduction: ReductionPrimitive = .warp_then_shared,
     input_blocks: u16,
     columns_per_block: u8,
@@ -197,7 +216,7 @@ pub const ExactFfnDownF32Lowering = struct {
 };
 
 pub const Q4Q8ArgmaxLowering = struct {
-    decode: QuantDecodePrimitive = .q4_0_q8_1_dp4a,
+    decode: QuantDecodePrimitive = .q4_0_q8_zp_dp4a,
     reduction: ReductionPrimitive = .warp_sum_then_argmax_pairs,
     input_blocks: u16,
     columns_per_block: u8,
@@ -237,7 +256,8 @@ pub const KernelLowering = union(enum) {
             },
             .q4_0_projection => |lowering| try lowering.validate(),
             .q4_0_pair_activation_q8_1 => |lowering| {
-                if (lowering.decode != .q4_0_q8_1_dp4a or lowering.reduction != .warp_sum_and_max or
+                if ((lowering.decode != .q4_0_q8_zp_dp4a and lowering.decode != .q4_0_q8_1_dp4a) or
+                    lowering.reduction != .warp_sum_and_max or
                     lowering.input_blocks == 0 or lowering.output_blocks == 0 or
                     lowering.output_values_per_block != 32 or lowering.warps_per_projection_group == 0)
                 {
@@ -245,8 +265,10 @@ pub const KernelLowering = union(enum) {
                 }
             },
             .q4_0_down_q8_1 => |lowering| {
-                if (lowering.decode != .q4_0_q8_1_dp4a or lowering.reduction != .warp_then_shared or
-                    lowering.input_blocks == 0 or lowering.columns_per_block != 4)
+                if ((lowering.decode != .q4_0_q8_zp_dp4a and lowering.decode != .q4_0_q8_1_dp4a) or
+                    lowering.reduction != .warp_then_shared or
+                    lowering.input_blocks == 0 or
+                    (lowering.columns_per_block != 1 and lowering.columns_per_block != 4))
                 {
                     return error.InvalidDownQ8Lowering;
                 }
@@ -266,7 +288,7 @@ pub const KernelLowering = union(enum) {
                 }
             },
             .q4_0_q8_1_argmax => |lowering| {
-                if (lowering.decode != .q4_0_q8_1_dp4a or
+                if (lowering.decode != .q4_0_q8_zp_dp4a or
                     lowering.reduction != .warp_sum_then_argmax_pairs or
                     lowering.input_blocks == 0 or lowering.columns_per_block != 8 or
                     lowering.warps_per_block == 0)
@@ -462,7 +484,13 @@ pub const AttentionStorage = enum {
     f32,
     f16,
     bf16,
+    /// Page-table-addressed raw F16 rows with an exact runtime format tag.
+    paged_f16,
     paged_f16_or_polar4,
+    /// Paged values consumed through the runtime format tag. The exact score
+    /// prework route keeps F32 as a control and accepts the production F16 KV
+    /// cache without changing the chronological F32 recurrence/output ABI.
+    paged_f16_or_f32,
 };
 
 /// A split-KV partition count is an owned schedule parameter, not a hidden
@@ -522,6 +550,29 @@ pub const generated_attention_score_prework_chunks: u8 = 128;
 /// Keeping this power-of-two capacity fixed preserves CUDA graph launch
 /// topology while leaving room for the normal split candidate when selected.
 pub const generated_attention_score_prework_max_kv_tokens: u16 = 4096;
+pub const generated_attention_score_prework_tiled64_tile_size: u16 = 64;
+pub const generated_attention_score_prework_tiled64_hd256_max_kv_tokens: u16 = 512;
+pub const generated_attention_score_prework_tiled64_hd512_max_kv_tokens: u16 = 4096;
+/// The exact consumer materializes the chronological online-softmax
+/// coefficients once per head, then lets every value lane replay the same
+/// recurrence without a block-wide barrier for every key. Two coefficient
+/// arrays plus the final maximum/denominator fit comfortably below the CUDA
+/// per-block shared-memory limit on the qualified sm_89 route.
+pub const generated_attention_score_prework_recurrence_shared_bytes: u32 =
+    (@as(u32, 2) * generated_attention_score_prework_max_kv_tokens + 2) * @sizeOf(f32);
+
+pub fn generatedAttentionScorePreworkTiled64MaxKvTokens(head_dim: u16) ?u16 {
+    return switch (head_dim) {
+        256 => generated_attention_score_prework_tiled64_hd256_max_kv_tokens,
+        512 => generated_attention_score_prework_tiled64_hd512_max_kv_tokens,
+        else => null,
+    };
+}
+
+pub fn generatedAttentionScorePreworkTiled64SharedBytes(head_dim: u16) ?u32 {
+    const max_kv_tokens = generatedAttentionScorePreworkTiled64MaxKvTokens(head_dim) orelse return null;
+    return (@as(u32, 2) * max_kv_tokens + 2) * @sizeOf(f32);
+}
 
 /// Legacy split-8 IDs. Their values are part of the runtime module ABI.
 pub const generated_attention_hd256_serial_kernel_id = "antfly_gqa_attention_decode_scalars_hd256_f32_v1";
@@ -554,8 +605,10 @@ pub const generated_attention_hd512_split4_stage2_kernel_id = "antfly_gqa_attent
 
 pub const generated_attention_hd256_score_prework_kernel_id = "antfly_gqa_attention_decode_turboquant_score_prework_hd256_f32_v1";
 pub const generated_attention_hd256_score_prework_serial_kernel_id = "antfly_gqa_attention_decode_turboquant_score_prework_serial_hd256_f32_v1";
+pub const generated_attention_hd256_score_prework_tiled64_kernel_id = "antfly_gqa_attention_decode_turboquant_score_prework_tiled64_hd256_f32_v1";
 pub const generated_attention_hd512_score_prework_kernel_id = "antfly_gqa_attention_decode_turboquant_score_prework_hd512_f32_v1";
 pub const generated_attention_hd512_score_prework_serial_kernel_id = "antfly_gqa_attention_decode_turboquant_score_prework_serial_hd512_f32_v1";
+pub const generated_attention_hd512_score_prework_tiled64_kernel_id = "antfly_gqa_attention_decode_turboquant_score_prework_tiled64_hd512_f32_v1";
 
 pub const AttentionWorkspaceLayout = struct {
     partial_values_offset: usize,
@@ -621,15 +674,15 @@ pub const AttentionLowering = struct {
             self.kv_splits != self.split_variant.kvSplits() or
             self.query_heads_per_kv_head == 0 or
             self.query_heads_per_kv_head > generated_attention_query_heads_per_kv_head or
-            self.query_storage != .f32 or self.value_storage != .f32 or
-            self.output_storage != .f32)
+            self.query_storage != .f32 or self.output_storage != .f32)
         {
             return error.InvalidCudaAttentionLowering;
         }
         switch (self.reduction) {
             .split_kv_two_stage => {
                 if (self.softmax != .online_partials_stable_merge or self.split_variant == .score_prework or
-                    self.key_storage != .f32 or self.split_kv_min_tokens_default == 0 or
+                    self.key_storage != .f32 or self.value_storage != .f32 or
+                    self.split_kv_min_tokens_default == 0 or
                     self.max_kv_tokens != 0)
                 {
                     return error.InvalidCudaAttentionLowering;
@@ -639,6 +692,7 @@ pub const AttentionLowering = struct {
                 if (self.softmax != .online_chronological or self.split_variant != .score_prework or
                     self.kv_splits != generated_attention_score_prework_chunks or
                     self.key_storage != .paged_f16_or_polar4 or
+                    self.value_storage != .paged_f16_or_f32 or
                     self.split_kv_min_tokens_default != 0 or
                     self.max_kv_tokens != generated_attention_score_prework_max_kv_tokens)
                 {
@@ -665,12 +719,18 @@ pub const AttentionRenderPlan = struct {
     launch: LaunchMetadata,
     reduction_kernel_id: []const u8,
     reduction_launch: LaunchMetadata,
+    /// Optional exact consumer that repeats the chronological scalar
+    /// recurrence per output tile. It shares the serial consumer ABI and score
+    /// workspace, so choosing it changes launch topology but not graph data.
+    tiled64_kernel_id: ?[]const u8 = null,
+    tiled64_launch: ?LaunchMetadata = null,
     lowering: AttentionLowering,
 
     pub fn validate(self: AttentionRenderPlan) !void {
         try self.serial_launch.validate();
         try self.launch.validate();
         try self.reduction_launch.validate();
+        if (self.tiled64_launch) |launch| try launch.validate();
         try self.lowering.validate();
         if (self.source_id.len == 0 or
             !std.mem.containsAtLeast(u8, self.source_id, 1, self.lowering.split_variant.sourceTag()))
@@ -687,7 +747,252 @@ pub const AttentionRenderPlan = struct {
         if (!std.meta.eql(self.launch, expected.launch)) return error.CudaLaunchDoesNotMatchKind;
         if (!std.mem.eql(u8, self.reduction_kernel_id, expected.reduction_kernel_id)) return error.CudaKernelIdDoesNotMatchKind;
         if (!std.meta.eql(self.reduction_launch, expected.reduction_launch)) return error.CudaLaunchDoesNotMatchKind;
+        if ((self.tiled64_kernel_id == null) != (expected.tiled64_kernel_id == null)) return error.CudaKernelIdDoesNotMatchKind;
+        if (self.tiled64_kernel_id) |kernel_id| {
+            if (!std.mem.eql(u8, kernel_id, expected.tiled64_kernel_id.?)) return error.CudaKernelIdDoesNotMatchKind;
+        }
+        if (!std.meta.eql(self.tiled64_launch, expected.tiled64_launch)) return error.CudaLaunchDoesNotMatchKind;
         if (!std.meta.eql(self.lowering, expected.lowering)) return error.CudaLoweringDoesNotMatchKind;
+    }
+};
+
+/// Dedicated single-kernel Flash-prefill family. It intentionally does not use
+/// `AttentionKernelKind`: decode plans own serial/producer/consumer/reduction
+/// fields that have no meaning for this one-launch production ABI.
+pub const FlashPrefillKernelKind = enum {
+    gqa_prefill_flash_sm89_hd256_swa512_f32,
+    gqa_prefill_flash_sm89_hd512_global_f32,
+};
+
+pub const generated_flash_prefill_hd256_kernel_id =
+    "antfly_gqa_attention_prefill_flash_sm89_hd256_swa512_f32_v1";
+pub const generated_flash_prefill_hd512_kernel_id =
+    "antfly_gqa_attention_prefill_flash_sm89_hd512_global_f32_v1";
+pub const generated_flash_prefill_query_tile: u16 = 16;
+pub const generated_flash_prefill_key_tile: u16 = 16;
+pub const generated_flash_prefill_page_size_tokens: u16 = 16;
+pub const generated_flash_prefill_threads: u16 = 256;
+pub const generated_flash_prefill_format_f16: u32 = 2;
+
+pub const FlashPrefillQueryLengthPolicy = enum {
+    /// Qualified production buckets: q512 at prefixes 0/512/1024/1536 and the
+    /// final q3 tail at prefix 2048. q1 always remains on the decode route.
+    gemma4_q512_or_q3_v1,
+
+    pub fn accepts(self: FlashPrefillQueryLengthPolicy, q_len: usize, query_position_offset: usize) bool {
+        return switch (self) {
+            .gemma4_q512_or_q3_v1 => (q_len == 512 and
+                (query_position_offset == 0 or query_position_offset == 512 or
+                    query_position_offset == 1024 or query_position_offset == 1536)) or
+                (q_len == 3 and query_position_offset == 2048),
+        };
+    }
+};
+
+pub fn generatedFlashPrefillDynamicSharedBytes(head_dim: u16) ?u32 {
+    if (head_dim != 256 and head_dim != 512) return null;
+    return 2 * generated_flash_prefill_query_tile * @as(u32, head_dim) * @sizeOf(f16) +
+        generated_flash_prefill_query_tile * generated_flash_prefill_key_tile * @sizeOf(f32) +
+        generated_flash_prefill_query_tile * generated_flash_prefill_key_tile * @sizeOf(f16) +
+        8 * generated_flash_prefill_query_tile * 16 * @sizeOf(f32) +
+        3 * generated_flash_prefill_query_tile * @sizeOf(u32) +
+        4 * generated_flash_prefill_query_tile * @sizeOf(f32) +
+        @sizeOf(u32);
+}
+
+pub const FlashPrefillLowering = struct {
+    kind: quant_kernel_op.AttentionKind,
+    head_dim: u16,
+    query_heads: u8,
+    kv_heads: u8,
+    query_tile: u16,
+    key_tile: u16,
+    page_size_tokens: u16,
+    sliding_window: u16,
+    query_length_policy: FlashPrefillQueryLengthPolicy,
+    query_storage: AttentionStorage,
+    key_storage: AttentionStorage,
+    value_storage: AttentionStorage,
+    output_storage: AttentionStorage,
+    format: u32,
+    value_format: u32,
+    required_compute_major: u8,
+    required_compute_minor: u8,
+
+    pub fn validate(self: FlashPrefillLowering) !void {
+        if (self.kind != .prefill_flash or
+            (self.head_dim != 256 and self.head_dim != 512) or
+            self.query_heads != 8 or self.kv_heads != 1 or
+            self.query_tile != generated_flash_prefill_query_tile or
+            self.key_tile != generated_flash_prefill_key_tile or
+            self.page_size_tokens != generated_flash_prefill_page_size_tokens or
+            self.sliding_window != @as(u16, if (self.head_dim == 256) 512 else 0) or
+            self.query_storage != .f32 or self.key_storage != .paged_f16 or
+            self.value_storage != .paged_f16 or self.output_storage != .f32 or
+            self.format != generated_flash_prefill_format_f16 or
+            self.value_format != generated_flash_prefill_format_f16 or
+            self.required_compute_major != 8 or self.required_compute_minor != 9)
+        {
+            return error.InvalidCudaFlashPrefillLowering;
+        }
+    }
+};
+
+pub const FlashPrefillRenderPlan = struct {
+    kind: FlashPrefillKernelKind,
+    source_id: []const u8,
+    namespace_id: []const u8,
+    kernel_id: []const u8,
+    production_baseline: []const u8,
+    production_enabled: bool,
+    runtime_default_enabled: bool,
+    /// The HMMA path intentionally rounds F32 Q to F16. Differential evidence
+    /// permits explicit use, but exact generated-token parity remains required
+    /// before this route may become a runtime default.
+    exact_token_parity_required_for_default: bool,
+    exact_token_parity_qualified: bool,
+    launch: LaunchMetadata,
+    lowering: FlashPrefillLowering,
+
+    pub fn validate(self: FlashPrefillRenderPlan) !void {
+        try self.launch.validate();
+        try self.lowering.validate();
+        if (self.runtime_default_enabled and
+            (!self.production_enabled or !self.exact_token_parity_required_for_default or
+                !self.exact_token_parity_qualified))
+        {
+            return error.CudaFlashPrefillDefaultRequiresExactTokenParity;
+        }
+        const expected = flashPrefillPlanFor(self.kind);
+        if (!std.meta.eql(self, expected)) return error.CudaFlashPrefillPlanDoesNotMatchKind;
+    }
+};
+
+/// Dedicated one-launch split-K online-softmax decode family. Like Flash
+/// prefill, this does not reuse `AttentionRenderPlan`: its persistent partial
+/// workspace and last-CTA completion protocol are a distinct ABI/topology.
+pub const SplitkOnlineDecodeKernelKind = enum {
+    gqa_decode_splitk_online_sm89_hd256_swa512_f16_f32,
+    gqa_decode_splitk_online_sm89_hd512_global_f16_f32,
+};
+
+pub const generated_splitk_online_decode_hd256_kernel_id =
+    "antfly_gqa_attention_decode_splitk_online_sm89_hd256_swa512_f16_f32_v1";
+pub const generated_splitk_online_decode_hd512_kernel_id =
+    "antfly_gqa_attention_decode_splitk_online_sm89_hd512_global_f16_f32_v1";
+pub const generated_splitk_online_decode_threads: u16 = 128;
+pub const generated_splitk_online_decode_splits: u16 = 64;
+pub const generated_splitk_online_decode_query_heads: u16 = 8;
+pub const generated_splitk_online_decode_kv_heads: u16 = 1;
+pub const generated_splitk_online_decode_page_size_tokens: u16 = 16;
+pub const generated_splitk_online_decode_format_f16: u32 = 2;
+/// CUDA 13.2 reports 576 bytes of statically allocated shared memory for both
+/// qualified specializations. Keep this explicit so catalog resource
+/// accounting agrees with the packaged SM89 cubin.
+pub const generated_splitk_online_decode_static_shared_memory_bytes: u32 = 576;
+pub const generated_splitk_online_decode_hd256_max_visible_tokens: u16 = 512;
+pub const generated_splitk_online_decode_hd512_max_visible_tokens: u16 = 4096;
+/// The typed replay profile is qualified through this absolute sequence
+/// boundary. Local layers may see only 512 tokens, but share graph/device
+/// scalars and paged storage with the global layers.
+pub const generated_splitk_online_decode_max_sequence_tokens: u16 = 4096;
+
+pub const SplitkOnlineDecodeWorkspaceLayout = struct {
+    completion_counters_offset: usize,
+    partial_values_offset: usize,
+    partial_max_offset: usize,
+    partial_denom_offset: usize,
+    total_bytes: usize,
+};
+
+/// One layout covers both qualified head dimensions. Keeping offsets fixed is
+/// important for CUDA graph replay: the launch parameter identity does not
+/// change when execution crosses a local/global Gemma layer.
+pub fn generatedSplitkOnlineDecodeWorkspaceLayout() SplitkOnlineDecodeWorkspaceLayout {
+    const alignment: usize = 256;
+    const counters_bytes: usize = generated_splitk_online_decode_query_heads * @sizeOf(u32);
+    const partial_count: usize = @as(usize, generated_splitk_online_decode_query_heads) *
+        generated_splitk_online_decode_splits;
+    const partial_values_bytes = partial_count * 512 * @sizeOf(f32);
+    const scalar_partials_bytes = partial_count * @sizeOf(f32);
+    const partial_values_offset = std.mem.alignForward(usize, counters_bytes, alignment);
+    const partial_max_offset = std.mem.alignForward(usize, partial_values_offset + partial_values_bytes, alignment);
+    const partial_denom_offset = std.mem.alignForward(usize, partial_max_offset + scalar_partials_bytes, alignment);
+    return .{
+        .completion_counters_offset = 0,
+        .partial_values_offset = partial_values_offset,
+        .partial_max_offset = partial_max_offset,
+        .partial_denom_offset = partial_denom_offset,
+        .total_bytes = std.mem.alignForward(usize, partial_denom_offset + scalar_partials_bytes, alignment),
+    };
+}
+
+pub const SplitkOnlineDecodeLowering = struct {
+    kind: quant_kernel_op.AttentionKind,
+    head_dim: u16,
+    query_heads: u16,
+    kv_heads: u16,
+    kv_splits: u16,
+    page_size_tokens: u16,
+    sliding_window: u16,
+    max_visible_tokens: u16,
+    query_storage: AttentionStorage,
+    key_storage: AttentionStorage,
+    value_storage: AttentionStorage,
+    output_storage: AttentionStorage,
+    format: u32,
+    value_format: u32,
+    required_compute_major: u8,
+    required_compute_minor: u8,
+
+    pub fn validate(self: SplitkOnlineDecodeLowering) !void {
+        if (self.kind != .decode_1x or
+            (self.head_dim != 256 and self.head_dim != 512) or
+            self.query_heads != generated_splitk_online_decode_query_heads or
+            self.kv_heads != generated_splitk_online_decode_kv_heads or
+            self.kv_splits != generated_splitk_online_decode_splits or
+            self.page_size_tokens != generated_splitk_online_decode_page_size_tokens or
+            self.sliding_window != @as(u16, if (self.head_dim == 256) 512 else 0) or
+            self.max_visible_tokens != @as(u16, if (self.head_dim == 256)
+                generated_splitk_online_decode_hd256_max_visible_tokens
+            else
+                generated_splitk_online_decode_hd512_max_visible_tokens) or
+            self.query_storage != .f32 or self.key_storage != .paged_f16 or
+            self.value_storage != .paged_f16 or self.output_storage != .f32 or
+            self.format != generated_splitk_online_decode_format_f16 or
+            self.value_format != generated_splitk_online_decode_format_f16 or
+            self.required_compute_major != 8 or self.required_compute_minor != 9)
+        {
+            return error.InvalidCudaSplitkOnlineDecodeLowering;
+        }
+    }
+};
+
+pub const SplitkOnlineDecodeRenderPlan = struct {
+    kind: SplitkOnlineDecodeKernelKind,
+    source_id: []const u8,
+    namespace_id: []const u8,
+    kernel_id: []const u8,
+    production_baseline: []const u8,
+    production_enabled: bool,
+    runtime_default_enabled: bool,
+    exact_token_parity_required_for_default: bool,
+    exact_token_parity_qualified: bool,
+    launch: LaunchMetadata,
+    workspace: SplitkOnlineDecodeWorkspaceLayout,
+    lowering: SplitkOnlineDecodeLowering,
+
+    pub fn validate(self: SplitkOnlineDecodeRenderPlan) !void {
+        try self.launch.validate();
+        try self.lowering.validate();
+        if (self.runtime_default_enabled and
+            (!self.production_enabled or !self.exact_token_parity_required_for_default or
+                !self.exact_token_parity_qualified))
+        {
+            return error.CudaSplitkOnlineDecodeDefaultRequiresExactTokenParity;
+        }
+        const expected = splitkOnlineDecodePlanFor(self.kind);
+        if (!std.meta.eql(self, expected)) return error.CudaSplitkOnlineDecodePlanDoesNotMatchKind;
     }
 };
 
@@ -820,6 +1125,7 @@ pub fn planFor(kind: KernelKind) RenderPlan {
             2560,
             10240,
             5,
+            .q4_0_q8_zp_dp4a,
             true,
         ),
         .q4_0_pair_activation_q8_1_e2b_6144 => pairActivationQ8Plan(
@@ -828,6 +1134,7 @@ pub fn planFor(kind: KernelKind) RenderPlan {
             1536,
             6144,
             3,
+            .q4_0_q8_zp_dp4a,
             false,
         ),
         .q4_0_pair_activation_q8_1_e2b_12288 => pairActivationQ8Plan(
@@ -836,6 +1143,25 @@ pub fn planFor(kind: KernelKind) RenderPlan {
             1536,
             12288,
             3,
+            .q4_0_q8_zp_dp4a,
+            false,
+        ),
+        .q4_0_pair_activation_ggml_q8_1_e2b_6144 => pairActivationQ8Plan(
+            kind,
+            "antfly_q4_0_pair_activation_ggml_q8_1_e2b_6144_mmv_v1",
+            1536,
+            6144,
+            3,
+            .q4_0_q8_1_dp4a,
+            false,
+        ),
+        .q4_0_pair_activation_ggml_q8_1_e2b_12288 => pairActivationQ8Plan(
+            kind,
+            "antfly_q4_0_pair_activation_ggml_q8_1_e2b_12288_mmv_v1",
+            1536,
+            12288,
+            3,
+            .q4_0_q8_1_dp4a,
             false,
         ),
         .q4_0_down_q8_1 => downQ8Plan(
@@ -844,6 +1170,7 @@ pub fn planFor(kind: KernelKind) RenderPlan {
             10240,
             2560,
             256,
+            .q4_0_q8_zp_dp4a,
             true,
         ),
         .q4_0_down_q8_1_e2b_6144 => downQ8Plan(
@@ -852,6 +1179,7 @@ pub fn planFor(kind: KernelKind) RenderPlan {
             6144,
             1536,
             128,
+            .q4_0_q8_zp_dp4a,
             false,
         ),
         .q4_0_down_q8_1_e2b_12288 => downQ8Plan(
@@ -860,7 +1188,20 @@ pub fn planFor(kind: KernelKind) RenderPlan {
             12288,
             1536,
             256,
+            .q4_0_q8_zp_dp4a,
             false,
+        ),
+        .q4_0_down_ggml_q8_1_e2b_6144 => downGgmlQ8Plan(
+            kind,
+            "antfly_q4_0_down_ggml_q8_1_e2b_6144_mmv_v1",
+            6144,
+            1536,
+        ),
+        .q4_0_down_ggml_q8_1_e2b_12288 => downGgmlQ8Plan(
+            kind,
+            "antfly_q4_0_down_ggml_q8_1_e2b_12288_mmv_v1",
+            12288,
+            1536,
         ),
         .q4_0_pair_activation_f32_e2b_6144_exact => exactFfnPairF32Plan(
             kind,
@@ -961,6 +1302,7 @@ fn pairActivationQ8Plan(
     input_dim: u16,
     output_dim: u16,
     warps_per_projection_group: u8,
+    decode: QuantDecodePrimitive,
     production_enabled: bool,
 ) RenderPlan {
     const input_blocks = input_dim / 32;
@@ -984,6 +1326,7 @@ fn pairActivationQ8Plan(
             .output_dim = .{ .multiple_of = 32, .fixed = output_dim },
         },
         .lowering = .{ .q4_0_pair_activation_q8_1 = .{
+            .decode = decode,
             .input_blocks = input_blocks,
             .output_blocks = output_blocks,
             .output_values_per_block = 32,
@@ -998,6 +1341,7 @@ fn downQ8Plan(
     input_dim: u16,
     output_dim: u16,
     threads_per_block: u16,
+    decode: QuantDecodePrimitive,
     production_enabled: bool,
 ) RenderPlan {
     const input_blocks = input_dim / 32;
@@ -1019,8 +1363,44 @@ fn downQ8Plan(
             .output_dim = .{ .fixed = output_dim },
         },
         .lowering = .{ .q4_0_down_q8_1 = .{
+            .decode = decode,
             .input_blocks = input_blocks,
             .columns_per_block = 4,
+        } },
+    };
+}
+
+/// Llama.cpp-style MMVQ topology for one output row per CTA on Ada: four
+/// warps (128 threads), grid.x = rows * out_dim. Pair activation keeps its
+/// 32-output CTA because the destination Q8_1 scale/sum requires a complete
+/// 32-value block; the down projection can use the canonical one-row MMVQ.
+fn downGgmlQ8Plan(
+    kind: KernelKind,
+    kernel_id: []const u8,
+    input_dim: u16,
+    output_dim: u16,
+) RenderPlan {
+    const threads_per_block: u16 = 128;
+    return .{
+        .kind = kind,
+        .route = .{ .format = .q4_0, .row_bucket = .rows_1, .epilogue = .gated_down, .dispatch = .mmv },
+        .kernel_id = kernel_id,
+        .production_baseline = "termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down",
+        .production_enabled = false,
+        .launch = .{
+            .grid = .output_cols,
+            .threads_per_block = threads_per_block,
+            .output_rows_per_block = 1,
+            .output_cols_per_block = 1,
+            .static_shared_memory_bytes = 4 * @sizeOf(f32),
+            .rows = .{ .min = 1, .max = 1, .fixed = 1 },
+            .input_dim = .{ .multiple_of = 32, .fixed = input_dim },
+            .output_dim = .{ .fixed = output_dim },
+        },
+        .lowering = .{ .q4_0_down_q8_1 = .{
+            .decode = .q4_0_q8_1_dp4a,
+            .input_blocks = input_dim / 32,
+            .columns_per_block = 1,
         } },
     };
 }
@@ -1146,16 +1526,18 @@ pub fn attentionPlanFor(kind: AttentionKernelKind) AttentionRenderPlan {
         .gqa_decode_score_prework_hd256_f32 => scorePreworkAttentionPlan(
             kind,
             256,
-            "antfly_gqa_attention_decode_turboquant_score_prework_hd256_f32_v1",
+            "antfly_gqa_attention_decode_turboquant_score_prework_hd256_f32_v2",
             generated_attention_hd256_score_prework_kernel_id,
             generated_attention_hd256_score_prework_serial_kernel_id,
+            generated_attention_hd256_score_prework_tiled64_kernel_id,
         ),
         .gqa_decode_score_prework_hd512_f32 => scorePreworkAttentionPlan(
             kind,
             512,
-            "antfly_gqa_attention_decode_turboquant_score_prework_hd512_f32_v1",
+            "antfly_gqa_attention_decode_turboquant_score_prework_hd512_f32_v2",
             generated_attention_hd512_score_prework_kernel_id,
             generated_attention_hd512_score_prework_serial_kernel_id,
+            generated_attention_hd512_score_prework_tiled64_kernel_id,
         ),
     };
 }
@@ -1234,14 +1616,19 @@ fn scorePreworkAttentionPlan(
     source_id: []const u8,
     score_kernel_id: []const u8,
     serial_kernel_id: []const u8,
+    tiled64_kernel_id: []const u8,
 ) AttentionRenderPlan {
     const threads: u16 = if (head_dim == 256) 256 else 512;
+    const tiled64_shared_bytes = generatedAttentionScorePreworkTiled64SharedBytes(head_dim) orelse unreachable;
     return .{
         .kind = kind,
         .source_id = source_id,
         .kernel_id = score_kernel_id,
         .production_baseline = "termite_gqa_attention_decode_turboquant_fast_f32",
-        .production_enabled = false,
+        // Promoted composite: the runtime automatic selector engages this
+        // route by default for the qualified SM89 Gemma 4 F16 geometry at the
+        // 512-token KV crossover.
+        .production_enabled = true,
         // The reduction field names predate this two-kernel lowering. Both
         // refer to the one chronological recurrence consumer; emitting it once
         // keeps the ABI explicit without inventing a fake merge kernel.
@@ -1251,7 +1638,7 @@ fn scorePreworkAttentionPlan(
             .threads_per_block = threads,
             .output_rows_per_block = 1,
             .output_cols_per_block = head_dim,
-            .static_shared_memory_bytes = 4 * @sizeOf(f32),
+            .static_shared_memory_bytes = generated_attention_score_prework_recurrence_shared_bytes,
             .rows = .{ .min = 1, .max = 1, .fixed = 1 },
             .input_dim = .{ .min = head_dim, .max = head_dim, .fixed = head_dim },
             .output_dim = .{},
@@ -1272,7 +1659,18 @@ fn scorePreworkAttentionPlan(
             .threads_per_block = threads,
             .output_rows_per_block = 1,
             .output_cols_per_block = head_dim,
-            .static_shared_memory_bytes = 4 * @sizeOf(f32),
+            .static_shared_memory_bytes = generated_attention_score_prework_recurrence_shared_bytes,
+            .rows = .{ .min = 1, .max = 1, .fixed = 1 },
+            .input_dim = .{ .min = head_dim, .max = head_dim, .fixed = head_dim },
+            .output_dim = .{},
+        },
+        .tiled64_kernel_id = tiled64_kernel_id,
+        .tiled64_launch = .{
+            .grid = .batch_query_heads_by_output_tiles,
+            .threads_per_block = generated_attention_score_prework_tiled64_tile_size,
+            .output_rows_per_block = 1,
+            .output_cols_per_block = generated_attention_score_prework_tiled64_tile_size,
+            .static_shared_memory_bytes = tiled64_shared_bytes,
             .rows = .{ .min = 1, .max = 1, .fixed = 1 },
             .input_dim = .{ .min = head_dim, .max = head_dim, .fixed = head_dim },
             .output_dim = .{},
@@ -1288,10 +1686,156 @@ fn scorePreworkAttentionPlan(
             .query_heads_per_kv_head = generated_attention_query_heads_per_kv_head,
             .query_storage = .f32,
             .key_storage = .paged_f16_or_polar4,
-            .value_storage = .f32,
+            .value_storage = .paged_f16_or_f32,
             .output_storage = .f32,
             .split_kv_min_tokens_default = 0,
             .max_kv_tokens = generated_attention_score_prework_max_kv_tokens,
+        },
+    };
+}
+
+pub fn flashPrefillPlanFor(kind: FlashPrefillKernelKind) FlashPrefillRenderPlan {
+    return switch (kind) {
+        .gqa_prefill_flash_sm89_hd256_swa512_f32 => flashPrefillPlan(
+            kind,
+            256,
+            512,
+            "antfly_gqa_attention_prefill_flash_sm89_hd256_swa512_f32_v1",
+            "antfly_flash_prefill_sm89_hd256_swa512_f32_v1",
+            generated_flash_prefill_hd256_kernel_id,
+        ),
+        .gqa_prefill_flash_sm89_hd512_global_f32 => flashPrefillPlan(
+            kind,
+            512,
+            0,
+            "antfly_gqa_attention_prefill_flash_sm89_hd512_global_f32_v1",
+            "antfly_flash_prefill_sm89_hd512_global_f32_v1",
+            generated_flash_prefill_hd512_kernel_id,
+        ),
+    };
+}
+
+fn flashPrefillPlan(
+    kind: FlashPrefillKernelKind,
+    head_dim: u16,
+    sliding_window: u16,
+    source_id: []const u8,
+    namespace_id: []const u8,
+    kernel_id: []const u8,
+) FlashPrefillRenderPlan {
+    return .{
+        .kind = kind,
+        .source_id = source_id,
+        .namespace_id = namespace_id,
+        .kernel_id = kernel_id,
+        .production_baseline = "termite_gqa_attention_prefill_tiled_f16_warp_f32",
+        .production_enabled = false,
+        .runtime_default_enabled = false,
+        .exact_token_parity_required_for_default = true,
+        .exact_token_parity_qualified = false,
+        .launch = .{
+            .grid = .query_heads_by_query_tiles,
+            .threads_per_block = generated_flash_prefill_threads,
+            .output_rows_per_block = generated_flash_prefill_query_tile,
+            .output_cols_per_block = head_dim,
+            .static_shared_memory_bytes = 0,
+            .dynamic_shared_memory_bytes = generatedFlashPrefillDynamicSharedBytes(head_dim).?,
+            .rows = .{ .min = 3, .max = 512 },
+            .input_dim = .{ .min = head_dim, .max = head_dim, .fixed = head_dim },
+            .output_dim = .{},
+        },
+        .lowering = .{
+            .kind = .prefill_flash,
+            .head_dim = head_dim,
+            .query_heads = 8,
+            .kv_heads = 1,
+            .query_tile = generated_flash_prefill_query_tile,
+            .key_tile = generated_flash_prefill_key_tile,
+            .page_size_tokens = generated_flash_prefill_page_size_tokens,
+            .sliding_window = sliding_window,
+            .query_length_policy = .gemma4_q512_or_q3_v1,
+            .query_storage = .f32,
+            .key_storage = .paged_f16,
+            .value_storage = .paged_f16,
+            .output_storage = .f32,
+            .format = generated_flash_prefill_format_f16,
+            .value_format = generated_flash_prefill_format_f16,
+            .required_compute_major = 8,
+            .required_compute_minor = 9,
+        },
+    };
+}
+
+pub fn splitkOnlineDecodePlanFor(kind: SplitkOnlineDecodeKernelKind) SplitkOnlineDecodeRenderPlan {
+    return switch (kind) {
+        .gqa_decode_splitk_online_sm89_hd256_swa512_f16_f32 => splitkOnlineDecodePlan(
+            kind,
+            256,
+            512,
+            generated_splitk_online_decode_hd256_max_visible_tokens,
+            "antfly_gqa_attention_decode_splitk_online_sm89_hd256_swa512_f16_f32_v1",
+            "antfly_splitk_online_decode_sm89_hd256_swa512_f16_f32_v1",
+            generated_splitk_online_decode_hd256_kernel_id,
+        ),
+        .gqa_decode_splitk_online_sm89_hd512_global_f16_f32 => splitkOnlineDecodePlan(
+            kind,
+            512,
+            0,
+            generated_splitk_online_decode_hd512_max_visible_tokens,
+            "antfly_gqa_attention_decode_splitk_online_sm89_hd512_global_f16_f32_v1",
+            "antfly_splitk_online_decode_sm89_hd512_global_f16_f32_v1",
+            generated_splitk_online_decode_hd512_kernel_id,
+        ),
+    };
+}
+
+fn splitkOnlineDecodePlan(
+    kind: SplitkOnlineDecodeKernelKind,
+    head_dim: u16,
+    sliding_window: u16,
+    max_visible_tokens: u16,
+    source_id: []const u8,
+    namespace_id: []const u8,
+    kernel_id: []const u8,
+) SplitkOnlineDecodeRenderPlan {
+    return .{
+        .kind = kind,
+        .source_id = source_id,
+        .namespace_id = namespace_id,
+        .kernel_id = kernel_id,
+        .production_baseline = "termite_gqa_attention_decode_turboquant_fast_f32",
+        .production_enabled = false,
+        .runtime_default_enabled = false,
+        .exact_token_parity_required_for_default = true,
+        .exact_token_parity_qualified = false,
+        .launch = .{
+            .grid = .batch_query_heads_by_splits,
+            .threads_per_block = generated_splitk_online_decode_threads,
+            .output_rows_per_block = 1,
+            .output_cols_per_block = head_dim,
+            .static_shared_memory_bytes = generated_splitk_online_decode_static_shared_memory_bytes,
+            .rows = .{ .min = 1, .max = 1, .fixed = 1 },
+            .input_dim = .{ .min = head_dim, .max = head_dim, .fixed = head_dim },
+            .output_dim = .{},
+        },
+        .workspace = generatedSplitkOnlineDecodeWorkspaceLayout(),
+        .lowering = .{
+            .kind = .decode_1x,
+            .head_dim = head_dim,
+            .query_heads = generated_splitk_online_decode_query_heads,
+            .kv_heads = generated_splitk_online_decode_kv_heads,
+            .kv_splits = generated_splitk_online_decode_splits,
+            .page_size_tokens = generated_splitk_online_decode_page_size_tokens,
+            .sliding_window = sliding_window,
+            .max_visible_tokens = max_visible_tokens,
+            .query_storage = .f32,
+            .key_storage = .paged_f16,
+            .value_storage = .paged_f16,
+            .output_storage = .f32,
+            .format = generated_splitk_online_decode_format_f16,
+            .value_format = generated_splitk_online_decode_format_f16,
+            .required_compute_major = 8,
+            .required_compute_minor = 9,
         },
     };
 }
@@ -1336,6 +1880,16 @@ fn promotionComment(kind: KernelKind) []const u8 {
         =>
         \\// Shape-specific E2B candidate; not bundled or wired until correctness and
         \\// sequential benchmark evidence clear the promotion gate.
+        ,
+        .q4_0_pair_activation_ggml_q8_1_e2b_6144,
+        .q4_0_pair_activation_ggml_q8_1_e2b_12288,
+        .q4_0_down_ggml_q8_1_e2b_6144,
+        .q4_0_down_ggml_q8_1_e2b_12288,
+        =>
+        \\// SM89-only diagnostic candidates using llama.cpp CUDA's
+        \\// block_q8_1 half2(d,raw_sum) activation contract.
+        \\// Q8_1 contract. Production is default-off pending differential parity
+        \\// and rotating-buffer end-to-end throughput evidence.
         ,
         .q4_0_pair_activation_f32_e2b_6144_exact,
         .q4_0_pair_activation_f32_e2b_12288_exact,
@@ -1417,11 +1971,13 @@ pub fn attentionPlanId(plan: AttentionRenderPlan, allocator: std.mem.Allocator) 
             plan.lowering.split_kv_min_tokens_default,
             @tagName(plan.lowering.query_storage),
         }),
-        .parallel_scores_then_serial => std.fmt.allocPrint(allocator, "cuda/attention/{s}/hd{d}/gqa{d}/score-prework/max{d}/{s}/device_scalars", .{
+        .parallel_scores_then_serial => std.fmt.allocPrint(allocator, "cuda/attention/{s}/hd{d}/gqa{d}/score-prework/max{d}/consumers-serial+tiled{d}-max{d}/{s}/device_scalars", .{
             @tagName(plan.lowering.kind),
             plan.lowering.head_dim,
             plan.lowering.query_heads_per_kv_head,
             plan.lowering.max_kv_tokens,
+            generated_attention_score_prework_tiled64_tile_size,
+            generatedAttentionScorePreworkTiled64MaxKvTokens(plan.lowering.head_dim) orelse 0,
             @tagName(plan.lowering.query_storage),
         }),
     };
@@ -1435,7 +1991,10 @@ pub fn renderAttentionKernel(allocator: std.mem.Allocator, plan: AttentionRender
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, license_header);
-    try out.appendSlice(allocator, "\n\n// Dev-only generated attention kernel from graph/quant_kernel_compiler.zig.\n// plan_id=");
+    try out.appendSlice(allocator, if (plan.production_enabled)
+        "\n\n// Production generated attention kernel from graph/quant_kernel_compiler.zig.\n// plan_id="
+    else
+        "\n\n// Dev-only generated attention kernel from graph/quant_kernel_compiler.zig.\n// plan_id=");
     try out.appendSlice(allocator, route_id);
     try out.appendSlice(allocator, "\n// source_id=");
     try out.appendSlice(allocator, plan.source_id);
@@ -1443,15 +2002,20 @@ pub fn renderAttentionKernel(allocator: std.mem.Allocator, plan: AttentionRender
     try out.appendSlice(allocator, plan.kernel_id);
     try out.appendSlice(allocator, "\n// serial_kernel_id=");
     try out.appendSlice(allocator, plan.serial_kernel_id);
+    if (plan.tiled64_kernel_id) |kernel_id| {
+        try out.appendSlice(allocator, "\n// tiled64_kernel_id=");
+        try out.appendSlice(allocator, kernel_id);
+    }
     try out.appendSlice(allocator, "\n// reduction_kernel_id=");
     try out.appendSlice(allocator, plan.reduction_kernel_id);
     try out.appendSlice(allocator, "\n// production_baseline=");
     try out.appendSlice(allocator, plan.production_baseline);
-    try out.appendSlice(allocator, "\n// production_enabled=false\n");
+    try out.appendSlice(allocator, if (plan.production_enabled) "\n// production_enabled=true\n" else "\n// production_enabled=false\n");
     try out.appendSlice(
         allocator,
         if (plan.lowering.reduction == .parallel_scores_then_serial)
-            "// Runtime opt-in: ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK=1.\n\n"
+            "// Default-on automatic SM89 selection; rollback: ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK=0.\n" ++
+                "// Tiled consumer opt-in: ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER=tiled64.\n\n"
         else
             "// Runtime opt-in: ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE=1.\n\n",
     );
@@ -1476,6 +2040,160 @@ pub fn renderAttentionKernel(allocator: std.mem.Allocator, plan: AttentionRender
     }
     try renderAttentionBody(allocator, &out, plan);
     if (out.items.len == 0 or out.items[out.items.len - 1] != '\n') try out.append(allocator, '\n');
+    return out.toOwnedSlice(allocator);
+}
+
+const flash_prefill_f16_sm89_template =
+    @embedFile("templates/cuda_gqa_flash_prefill_f16_sm89.cuh");
+
+pub fn flashPrefillPlanId(plan: FlashPrefillRenderPlan, allocator: std.mem.Allocator) ![]u8 {
+    try plan.validate();
+    return std.fmt.allocPrint(
+        allocator,
+        "cuda/attention/prefill_flash/sm89/hd{d}/gqa8/page16/q512-or-q3/swa{d}/f32q-f16kv-hmma",
+        .{ plan.lowering.head_dim, plan.lowering.sliding_window },
+    );
+}
+
+pub fn renderFlashPrefillBodyAlloc(
+    allocator: std.mem.Allocator,
+    plan: FlashPrefillRenderPlan,
+) ![]u8 {
+    try plan.validate();
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendFmt(allocator, &out,
+        \\#define ANTFLY_FLASH_NAMESPACE {s}
+        \\#define ANTFLY_FLASH_KERNEL {s}
+        \\#define ANTFLY_FLASH_HEAD_DIM {d}
+        \\#define ANTFLY_FLASH_SLIDING_WINDOW {d}
+        \\
+    , .{
+        plan.namespace_id,
+        plan.kernel_id,
+        plan.lowering.head_dim,
+        plan.lowering.sliding_window,
+    });
+    try out.appendSlice(allocator, flash_prefill_f16_sm89_template);
+    if (out.items.len == 0 or out.items[out.items.len - 1] != '\n') try out.append(allocator, '\n');
+    try out.appendSlice(allocator,
+        \\#undef ANTFLY_FLASH_SLIDING_WINDOW
+        \\#undef ANTFLY_FLASH_HEAD_DIM
+        \\#undef ANTFLY_FLASH_KERNEL
+        \\#undef ANTFLY_FLASH_NAMESPACE
+        \\
+    );
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn renderFlashPrefillKernel(
+    allocator: std.mem.Allocator,
+    plan: FlashPrefillRenderPlan,
+) ![]u8 {
+    try plan.validate();
+    const route_id = try flashPrefillPlanId(plan, allocator);
+    defer allocator.free(route_id);
+    const body = try renderFlashPrefillBodyAlloc(allocator, plan);
+    defer allocator.free(body);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendFmt(allocator, &out,
+        \\// Default-off generated Flash prefill from graph/quant_kernel_compiler.zig.
+        \\// plan_id={s}
+        \\// source_id={s}
+        \\// kernel_id={s}
+        \\// production_baseline={s}
+        \\// runtime_default_enabled=false
+        \\// exact_token_parity_qualified=false
+        \\
+    , .{
+        route_id,
+        plan.source_id,
+        plan.kernel_id,
+        plan.production_baseline,
+    });
+    try out.appendSlice(allocator, body);
+    return out.toOwnedSlice(allocator);
+}
+
+const splitk_online_decode_sm89_template =
+    @embedFile("templates/cuda_gqa_decode_splitk_online_sm89.cuh");
+
+pub fn splitkOnlineDecodePlanId(
+    plan: SplitkOnlineDecodeRenderPlan,
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    try plan.validate();
+    return std.fmt.allocPrint(
+        allocator,
+        "cuda/attention/decode_1x/splitk-online/sm89/hd{d}/gqa8/split64/t128/page16/swa{d}/f32q-f16kv-f32o",
+        .{ plan.lowering.head_dim, plan.lowering.sliding_window },
+    );
+}
+
+pub fn renderSplitkOnlineDecodeBodyAlloc(
+    allocator: std.mem.Allocator,
+    plan: SplitkOnlineDecodeRenderPlan,
+) ![]u8 {
+    try plan.validate();
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendFmt(allocator, &out,
+        \\#define ANTFLY_SPLITK_ONLINE_NAMESPACE {s}
+        \\#define ANTFLY_SPLITK_ONLINE_KERNEL {s}
+        \\#define ANTFLY_SPLITK_ONLINE_HEAD_DIM {d}
+        \\#define ANTFLY_SPLITK_ONLINE_SLIDING_WINDOW {d}
+        \\#define ANTFLY_SPLITK_ONLINE_MAX_VISIBLE_TOKENS {d}
+        \\
+    , .{
+        plan.namespace_id,
+        plan.kernel_id,
+        plan.lowering.head_dim,
+        plan.lowering.sliding_window,
+        plan.lowering.max_visible_tokens,
+    });
+    try out.appendSlice(allocator, splitk_online_decode_sm89_template);
+    if (out.items.len == 0 or out.items[out.items.len - 1] != '\n') try out.append(allocator, '\n');
+    try out.appendSlice(allocator,
+        \\#undef ANTFLY_SPLITK_ONLINE_MAX_VISIBLE_TOKENS
+        \\#undef ANTFLY_SPLITK_ONLINE_SLIDING_WINDOW
+        \\#undef ANTFLY_SPLITK_ONLINE_HEAD_DIM
+        \\#undef ANTFLY_SPLITK_ONLINE_KERNEL
+        \\#undef ANTFLY_SPLITK_ONLINE_NAMESPACE
+        \\
+    );
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn renderSplitkOnlineDecodeKernel(
+    allocator: std.mem.Allocator,
+    plan: SplitkOnlineDecodeRenderPlan,
+) ![]u8 {
+    try plan.validate();
+    const route_id = try splitkOnlineDecodePlanId(plan, allocator);
+    defer allocator.free(route_id);
+    const body = try renderSplitkOnlineDecodeBodyAlloc(allocator, plan);
+    defer allocator.free(body);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendFmt(allocator, &out,
+        \\// Default-off generated split-K online decode from graph/quant_kernel_compiler.zig.
+        \\// plan_id={s}
+        \\// source_id={s}
+        \\// kernel_id={s}
+        \\// production_baseline={s}
+        \\// runtime_default_enabled=false
+        \\// exact_token_parity_qualified=false
+        \\
+    , .{
+        route_id,
+        plan.source_id,
+        plan.kernel_id,
+        plan.production_baseline,
+    });
+    try out.appendSlice(allocator, body);
     return out.toOwnedSlice(allocator);
 }
 
@@ -1760,14 +2478,18 @@ const helper_termite_tq_physical_token = SourceFragment{
     \\    unsigned int page_size_tokens,
     \\    unsigned int physical_token_capacity
     \\) {
-    \\    unsigned int physical = logical_token;
+    \\    unsigned long long physical = (unsigned long long)logical_token;
     \\    if (block_table != 0 && block_count != 0u && page_size_tokens != 0u) {
     \\        unsigned int block_index = logical_token / page_size_tokens;
     \\        if (block_index >= block_count) return 0xffffffffu;
     \\        unsigned int token_offset = logical_token - block_index * page_size_tokens;
-    \\        physical = block_table[block_index] * page_size_tokens + token_offset;
+    \\        const unsigned long long physical_block = (unsigned long long)block_table[block_index];
+    \\        physical = physical_block * (unsigned long long)page_size_tokens +
+    \\            (unsigned long long)token_offset;
     \\    }
-    \\    return physical < physical_token_capacity ? physical : 0xffffffffu;
+    \\    if (physical > 0xffffffffull ||
+    \\        physical >= (unsigned long long)physical_token_capacity) return 0xffffffffu;
+    \\    return (unsigned int)physical;
     \\}
     ,
 };
@@ -1899,6 +2621,43 @@ const helper_q4_0_q8_dot16 = SourceFragment{
     ,
 };
 
+pub const helper_q4_0_ggml_q8_1_dot16 = SourceFragment{
+    .name = "antfly_q4_0_ggml_q8_1_dot16",
+    .source =
+    \\// One of two 16-value contributions for a Q4_0/Q8_1 block. Keeping Q4
+    \\// nibbles unsigned removes four packed-byte centering instructions; each
+    \\// contribution applies half of the block-wide -8*sum correction.
+    \\static __device__ __forceinline__ float antfly_q4_0_ggml_q8_1_dot16(
+    \\    const unsigned char *q4_bp,
+    \\    float q8_d,
+    \\    float q8_sum,
+    \\    unsigned int iqs,
+    \\    int q8_low0,
+    \\    int q8_high0,
+    \\    int q8_low1,
+    \\    int q8_high1
+    \\) {
+    \\    const float q4_d = antfly_half_bits_to_float(((const unsigned short *)q4_bp)[0]);
+    \\    const unsigned int base0 = iqs * 4u;
+    \\    const unsigned int word0 = antfly_q4_0_word_u16(q4_bp + 2u + base0);
+    \\    const unsigned int word1 = antfly_q4_0_word_u16(q4_bp + 2u + base0 + 4u);
+    \\    const unsigned int low0 = word0 & 0x0f0f0f0fu;
+    \\    const unsigned int high0 = (word0 >> 4) & 0x0f0f0f0fu;
+    \\    const unsigned int low1 = word1 & 0x0f0f0f0fu;
+    \\    const unsigned int high1 = (word1 >> 4) & 0x0f0f0f0fu;
+    \\    int sumi = __dp4a((int)low0, q8_low0, 0);
+    \\    sumi = __dp4a((int)high0, q8_high0, sumi);
+    \\    sumi = __dp4a((int)low1, q8_low1, sumi);
+    \\    sumi = __dp4a((int)high1, q8_high1, sumi);
+    \\    return q4_d * (q8_d * (float)sumi - 4.0f * q8_sum);
+    \\}
+    ,
+};
+
+pub const ggml_q8_1_runtime_owned_helpers = [_]SourceFragment{
+    helper_q4_0_ggml_q8_1_dot16,
+};
+
 const q4_0_q8_helpers = [_]SourceFragment{
     helper_half_bits_to_float,
     helper_warp_reduce_sum_f32,
@@ -1913,6 +2672,22 @@ const q4_0_down_q8_helpers = [_]SourceFragment{
     helper_warp_reduce_sum_f32,
     helper_q4_0_word_u16_no_comment,
     helper_q4_0_q8_dot16,
+};
+
+const q4_0_ggml_q8_1_helpers = [_]SourceFragment{
+    helper_half_bits_to_float,
+    helper_warp_reduce_sum_f32,
+    helper_warp_reduce_max_f32,
+    helper_decoder_activation_f32,
+    helper_q4_0_word_u16,
+    helper_q4_0_ggml_q8_1_dot16,
+};
+
+const q4_0_down_ggml_q8_1_helpers = [_]SourceFragment{
+    helper_half_bits_to_float,
+    helper_warp_reduce_sum_f32,
+    helper_q4_0_word_u16_no_comment,
+    helper_q4_0_ggml_q8_1_dot16,
 };
 
 const helper_q6_k_sub_scale_f32 = SourceFragment{
@@ -2420,11 +3195,10 @@ fn renderAttentionScorePreworkBody(
             "            }}\n" ++
             "        }}\n" ++
             "    }}\n" ++
-            "    if (key_end > score_capacity) key_end = score_capacity;\n" ++
-            "    unsigned int chunk_begin = chunk * chunk_size;\n" ++
+            "    const unsigned int visible_count = key_end - key_start;\n" ++
+            "    if (visible_count > score_capacity) return;\n" ++
+            "    unsigned int chunk_begin = key_start + chunk * chunk_size;\n" ++
             "    unsigned int chunk_end = chunk_begin + chunk_size;\n" ++
-            "    if (chunk_end > score_capacity) chunk_end = score_capacity;\n" ++
-            "    if (chunk_begin < key_start) chunk_begin = key_start;\n" ++
             "    if (chunk_end > key_end) chunk_end = key_end;\n" ++
             "    if (chunk_begin >= chunk_end) return;\n" ++
             "    const unsigned int heads_per_group = num_heads / num_kv_heads;\n" ++
@@ -2446,7 +3220,7 @@ fn renderAttentionScorePreworkBody(
             "            partial = q[q_base + lane] * key_value;\n" ++
             "        }}\n" ++
             "        const float dot = termite_block_reduce_sum_f32(partial, warp_sums);\n" ++
-            "        if (lane == 0u && valid) scores[(size_t)head * score_capacity + ki] = dot * scale;\n" ++
+            "        if (lane == 0u && valid) scores[(size_t)head * score_capacity + (ki - key_start)] = dot * scale;\n" ++
             "    }}\n" ++
             "    (void)total_sequence_len;\n" ++
             "}}\n",
@@ -2492,13 +3266,13 @@ fn renderAttentionScorePreworkBody(
         "    const unsigned int head = blockIdx.x;\n" ++
             "    if (batch != 1u || q_seq_len != 1u || head >= num_heads ||\n" ++
             "        head_dim != {d}u || blockDim.x != {d}u || value_row_bytes == 0u ||\n" ++
-            "        value_format != 0u || score_capacity == 0u || score_capacity > {d}u || num_kv_heads == 0u ||\n" ++
+            "        (value_format != 0u && value_format != 2u) || score_capacity == 0u || score_capacity > {d}u || num_kv_heads == 0u ||\n" ++
             "        num_heads == 0u || (num_heads % num_kv_heads) != 0u ||\n" ++
             "        (num_heads / num_kv_heads) > {d}u || num_heads > {d}u) return;\n" ++
             "    __shared__ float shared_max_score;\n" ++
             "    __shared__ float shared_denom;\n" ++
-            "    __shared__ float shared_alpha;\n" ++
-            "    __shared__ float shared_beta;\n" ++
+            "    __shared__ float shared_alpha[{d}];\n" ++
+            "    __shared__ float shared_beta[{d}];\n" ++
             "    const unsigned int lane = threadIdx.x;\n" ++
             "    const unsigned int query_pos = query_position_offset;\n" ++
             "    unsigned int key_start = 0u;\n" ++
@@ -2514,47 +3288,201 @@ fn renderAttentionScorePreworkBody(
             "            }}\n" ++
             "        }}\n" ++
             "    }}\n" ++
-            "    if (key_end > score_capacity) key_end = score_capacity;\n" ++
             "    if (key_start > key_end) key_start = key_end;\n" ++
+            "    if (key_end - key_start > score_capacity) return;\n" ++
             "    const unsigned int heads_per_group = num_heads / num_kv_heads;\n" ++
             "    const unsigned int kv_head = head / heads_per_group;\n" ++
             "    if (lane == 0u) {{\n" ++
             "        shared_max_score = -3.402823466e+38f;\n" ++
             "        shared_denom = 0.0f;\n" ++
+            "        for (unsigned int ki = key_start; ki < key_end; ++ki) {{\n" ++
+            "            const unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);\n" ++
+            "            const bool valid = physical_token != 0xffffffffu;\n" ++
+            "            const unsigned int recurrence_index = ki - key_start;\n" ++
+            "            if (valid) {{\n" ++
+            "                const float score = scores[(size_t)head * score_capacity + (ki - key_start)];\n" ++
+            "                const float next_max = fmaxf(shared_max_score, score);\n" ++
+            "                shared_alpha[recurrence_index] = expf(shared_max_score - next_max);\n" ++
+            "                shared_beta[recurrence_index] = expf(score - next_max);\n" ++
+            "                shared_denom = shared_denom * shared_alpha[recurrence_index] + shared_beta[recurrence_index];\n" ++
+            "                shared_max_score = next_max;\n" ++
+            "            }} else {{\n" ++
+            "                shared_alpha[recurrence_index] = 1.0f;\n" ++
+            "                shared_beta[recurrence_index] = 0.0f;\n" ++
+            "            }}\n" ++
+            "        }}\n" ++
             "    }}\n" ++
             "    __syncthreads();\n" ++
             "    float acc = 0.0f;\n" ++
-            "    for (unsigned int ki = key_start; ki < key_end; ++ki) {{\n" ++
-            "        const unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);\n" ++
-            "        const bool valid = physical_token != 0xffffffffu;\n" ++
-            "        if (lane == 0u) {{\n" ++
-            "            if (valid) {{\n" ++
-            "                const float score = scores[(size_t)head * score_capacity + ki];\n" ++
-            "                const float next_max = fmaxf(shared_max_score, score);\n" ++
-            "                shared_alpha = expf(shared_max_score - next_max);\n" ++
-            "                shared_beta = expf(score - next_max);\n" ++
-            "                shared_denom = shared_denom * shared_alpha + shared_beta;\n" ++
-            "                shared_max_score = next_max;\n" ++
-            "            }} else {{\n" ++
-            "                shared_alpha = 1.0f;\n" ++
-            "                shared_beta = 0.0f;\n" ++
-            "            }}\n" ++
-            "        }}\n" ++
-            "        __syncthreads();\n" ++
-            "        if (lane < head_dim) {{\n" ++
-            "            acc *= shared_alpha;\n" ++
+            "    if (lane < head_dim) {{\n" ++
+            "        for (unsigned int ki = key_start; ki < key_end; ++ki) {{\n" ++
+            "            const unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);\n" ++
+            "            const bool valid = physical_token != 0xffffffffu;\n" ++
+            "            const unsigned int recurrence_index = ki - key_start;\n" ++
+            "            acc *= shared_alpha[recurrence_index];\n" ++
             "            if (valid) {{\n" ++
             "                const unsigned char* v_row = v + (size_t)physical_token * value_row_bytes;\n" ++
-            "                const float value = reinterpret_cast<const float*>(v_row)[kv_head * head_dim + lane];\n" ++
-            "                acc += shared_beta * value;\n" ++
+            "                const unsigned int value_index = kv_head * head_dim + lane;\n" ++
+            "                const float value = value_format == 0u\n" ++
+            "                    ? reinterpret_cast<const float*>(v_row)[value_index]\n" ++
+            "                    : termite_tq_f16_value(v_row, value_index);\n" ++
+            "                acc += shared_beta[recurrence_index] * value;\n" ++
             "            }}\n" ++
             "        }}\n" ++
-            "        __syncthreads();\n" ++
             "    }}\n" ++
             "    if (lane < head_dim) dst[head * head_dim + lane] = shared_denom > 0.0f ? acc / shared_denom : 0.0f;\n" ++
             "    (void)total_sequence_len;\n" ++
             "}}\n",
-        .{ head_dim, threads, generated_attention_score_prework_max_kv_tokens, plan.lowering.query_heads_per_kv_head, generated_attention_workspace_max_query_heads },
+        .{
+            head_dim,
+            threads,
+            generated_attention_score_prework_max_kv_tokens,
+            plan.lowering.query_heads_per_kv_head,
+            generated_attention_workspace_max_query_heads,
+            generated_attention_score_prework_max_kv_tokens,
+            generated_attention_score_prework_max_kv_tokens,
+        },
+    );
+
+    try renderAttentionScorePreworkTiled64Consumer(allocator, out, plan);
+}
+
+/// Emits the default-off output-dimension tiled consumer. Every CTA repeats
+/// the lane-zero chronological coefficient recurrence in exactly the same
+/// operation order as the serial consumer above, then replays those
+/// coefficients for one disjoint 64-value output tile. There is no inter-CTA
+/// reduction, extra workspace, or third launch.
+fn renderAttentionScorePreworkTiled64Consumer(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    plan: AttentionRenderPlan,
+) !void {
+    const kernel_id = plan.tiled64_kernel_id orelse return error.InvalidCudaAttentionLowering;
+    const launch = plan.tiled64_launch orelse return error.InvalidCudaAttentionLowering;
+    const head_dim = plan.lowering.head_dim;
+    const max_kv_tokens = generatedAttentionScorePreworkTiled64MaxKvTokens(head_dim) orelse
+        return error.InvalidCudaAttentionLowering;
+
+    try out.appendSlice(allocator, "\n\n");
+    try appendFmt(allocator, out, "extern \"C\" __global__ void {s}(\n", .{kernel_id});
+    try out.appendSlice(allocator,
+        \\    float* dst,
+        \\    const float* scores,
+        \\    const unsigned char* v,
+        \\    const unsigned int* block_table,
+        \\    unsigned int batch,
+        \\    unsigned int q_seq_len,
+        \\    unsigned int kv_seq_len,
+        \\    unsigned int num_heads,
+        \\    unsigned int num_kv_heads,
+        \\    unsigned int head_dim,
+        \\    unsigned int query_position_offset,
+        \\    unsigned int kv_position_offset,
+        \\    unsigned int sliding_window,
+        \\    unsigned int total_sequence_len,
+        \\    unsigned int value_row_bytes,
+        \\    unsigned int block_count,
+        \\    unsigned int page_size_tokens,
+        \\    unsigned int value_format,
+        \\    unsigned int physical_token_capacity,
+        \\    unsigned int score_capacity,
+        \\    const unsigned int* decode_scalars
+        \\) {
+        \\    if (decode_scalars != 0) {
+        \\        kv_position_offset = decode_scalars[4];
+        \\        query_position_offset = decode_scalars[1];
+        \\        kv_seq_len = decode_scalars[2];
+        \\        total_sequence_len = decode_scalars[3];
+        \\    }
+        \\
+    );
+    try appendFmt(
+        allocator,
+        out,
+        "    const unsigned int head = blockIdx.x;\n" ++
+            "    const unsigned int output_tile = blockIdx.y;\n" ++
+            "    if (batch != 1u || q_seq_len != 1u || head >= num_heads ||\n" ++
+            "        head_dim != {d}u || blockDim.x != {d}u || output_tile >= head_dim / {d}u ||\n" ++
+            "        value_row_bytes == 0u || (value_format != 0u && value_format != 2u) ||\n" ++
+            "        score_capacity == 0u || score_capacity > {d}u || num_kv_heads == 0u ||\n" ++
+            "        num_heads == 0u || (num_heads % num_kv_heads) != 0u ||\n" ++
+            "        (num_heads / num_kv_heads) > {d}u || num_heads > {d}u) return;\n" ++
+            "    __shared__ float shared_max_score;\n" ++
+            "    __shared__ float shared_denom;\n" ++
+            "    __shared__ float shared_alpha[{d}];\n" ++
+            "    __shared__ float shared_beta[{d}];\n" ++
+            "    const unsigned int tile_lane = threadIdx.x;\n" ++
+            "    const unsigned int lane = output_tile * {d}u + tile_lane;\n" ++
+            "    const unsigned int query_pos = query_position_offset;\n" ++
+            "    unsigned int key_start = 0u;\n" ++
+            "    unsigned int key_end = 0u;\n" ++
+            "    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {{\n" ++
+            "        const unsigned int visible = query_pos - kv_position_offset + 1u;\n" ++
+            "        key_end = visible < kv_seq_len ? visible : kv_seq_len;\n" ++
+            "        if (sliding_window != 0u) {{\n" ++
+            "            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;\n" ++
+            "            if (window_start_abs > kv_position_offset) {{\n" ++
+            "                key_start = window_start_abs - kv_position_offset;\n" ++
+            "                if (key_start > key_end) key_start = key_end;\n" ++
+            "            }}\n" ++
+            "        }}\n" ++
+            "    }}\n" ++
+            "    if (key_start > key_end) key_start = key_end;\n" ++
+            "    if (key_end - key_start > score_capacity) return;\n" ++
+            "    const unsigned int heads_per_group = num_heads / num_kv_heads;\n" ++
+            "    const unsigned int kv_head = head / heads_per_group;\n" ++
+            "    if (tile_lane == 0u) {{\n" ++
+            "        shared_max_score = -3.402823466e+38f;\n" ++
+            "        shared_denom = 0.0f;\n" ++
+            "        for (unsigned int ki = key_start; ki < key_end; ++ki) {{\n" ++
+            "            const unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);\n" ++
+            "            const bool valid = physical_token != 0xffffffffu;\n" ++
+            "            const unsigned int recurrence_index = ki - key_start;\n" ++
+            "            if (valid) {{\n" ++
+            "                const float score = scores[(size_t)head * score_capacity + (ki - key_start)];\n" ++
+            "                const float next_max = fmaxf(shared_max_score, score);\n" ++
+            "                shared_alpha[recurrence_index] = expf(shared_max_score - next_max);\n" ++
+            "                shared_beta[recurrence_index] = expf(score - next_max);\n" ++
+            "                shared_denom = shared_denom * shared_alpha[recurrence_index] + shared_beta[recurrence_index];\n" ++
+            "                shared_max_score = next_max;\n" ++
+            "            }} else {{\n" ++
+            "                shared_alpha[recurrence_index] = 1.0f;\n" ++
+            "                shared_beta[recurrence_index] = 0.0f;\n" ++
+            "            }}\n" ++
+            "        }}\n" ++
+            "    }}\n" ++
+            "    __syncthreads();\n" ++
+            "    float acc = 0.0f;\n" ++
+            "    if (lane < head_dim) {{\n" ++
+            "        for (unsigned int ki = key_start; ki < key_end; ++ki) {{\n" ++
+            "            const unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);\n" ++
+            "            const bool valid = physical_token != 0xffffffffu;\n" ++
+            "            const unsigned int recurrence_index = ki - key_start;\n" ++
+            "            acc *= shared_alpha[recurrence_index];\n" ++
+            "            if (valid) {{\n" ++
+            "                const unsigned char* v_row = v + (size_t)physical_token * value_row_bytes;\n" ++
+            "                const unsigned int value_index = kv_head * head_dim + lane;\n" ++
+            "                const float value = value_format == 0u\n" ++
+            "                    ? reinterpret_cast<const float*>(v_row)[value_index]\n" ++
+            "                    : termite_tq_f16_value(v_row, value_index);\n" ++
+            "                acc += shared_beta[recurrence_index] * value;\n" ++
+            "            }}\n" ++
+            "        }}\n" ++
+            "    }}\n" ++
+            "    if (lane < head_dim) dst[head * head_dim + lane] = shared_denom > 0.0f ? acc / shared_denom : 0.0f;\n" ++
+            "    (void)total_sequence_len;\n" ++
+            "}}\n",
+        .{
+            head_dim,
+            launch.threads_per_block,
+            generated_attention_score_prework_tiled64_tile_size,
+            max_kv_tokens,
+            plan.lowering.query_heads_per_kv_head,
+            generated_attention_workspace_max_query_heads,
+            max_kv_tokens,
+            max_kv_tokens,
+            generated_attention_score_prework_tiled64_tile_size,
+        },
     );
 }
 
@@ -2833,8 +3761,14 @@ pub fn supportFor(lowering: KernelLowering) KernelSupport {
         .q4_k_small_batch => .{ .includes = &includes_cuda_fp16_math_stdint, .helpers = &q4_k_helpers },
         .q4_k_projection => .{ .includes = &includes_cuda_fp16_stdint, .helpers = &q4_k_projection_helpers },
         .q4_0_projection => .{ .includes = &includes_cuda_fp16_stdint, .helpers = &q4_0_helpers },
-        .q4_0_pair_activation_q8_1 => .{ .includes = &includes_cuda_fp16, .helpers = &q4_0_q8_helpers },
-        .q4_0_down_q8_1 => .{ .includes = &includes_cuda_fp16, .helpers = &q4_0_down_q8_helpers },
+        .q4_0_pair_activation_q8_1 => |pair| if (pair.decode == .q4_0_q8_1_dp4a)
+            .{ .includes = &includes_cuda_fp16, .helpers = &q4_0_ggml_q8_1_helpers }
+        else
+            .{ .includes = &includes_cuda_fp16, .helpers = &q4_0_q8_helpers },
+        .q4_0_down_q8_1 => |down| if (down.decode == .q4_0_q8_1_dp4a)
+            .{ .includes = &includes_cuda_fp16, .helpers = &q4_0_down_ggml_q8_1_helpers }
+        else
+            .{ .includes = &includes_cuda_fp16, .helpers = &q4_0_down_q8_helpers },
         .q4_0_pair_activation_f32_exact,
         .q4_0_down_f32_exact,
         => .{ .includes = &includes_cuda_fp16, .helpers = &q4_0_exact_ffn_f32_helpers },
@@ -2848,6 +3782,54 @@ pub fn renderBodyAlloc(allocator: std.mem.Allocator, plan: RenderPlan) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     try renderBody(allocator, &out, plan);
+    return out.toOwnedSlice(allocator);
+}
+
+pub const ggml_q8_1_quantize_rows_kernel_id = "antfly_quantize_f32_ggml_q8_1_rows_v1";
+
+/// Common activation-boundary kernel for llama.cpp CUDA's block_q8_1 layout:
+/// half2(d, raw f32 input sum) followed by 32 signed values.
+/// It is emitted once into the runtime dev-matmul region by the repository
+/// code generator, rather than hand-maintained in the canonical CUDA source.
+pub fn renderGgmlQ8_1QuantizeRowsBodyAlloc(allocator: std.mem.Allocator) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendFmt(
+        allocator,
+        &out,
+        \\extern "C" __global__ void {s}(
+        \\    unsigned char *dst_q8,
+        \\    const float *input,
+        \\    unsigned int rows,
+        \\    unsigned int dim
+        \\) {{
+        \\    if (blockDim.x != 32u || rows == 0u || dim == 0u || (dim & 31u) != 0u) return;
+        \\    const unsigned int blocks_per_row = dim >> 5;
+        \\    const unsigned int block = blockIdx.x;
+        \\    const unsigned int row = block / blocks_per_row;
+        \\    const unsigned int value_block = block - row * blocks_per_row;
+        \\    if (row >= rows) return;
+        \\    const unsigned int lane = threadIdx.x;
+        \\    const float x = input[(size_t)row * dim + value_block * 32u + lane];
+        \\    const float amax = antfly_warp_reduce_max_f32(fabsf(x));
+        \\    const float sum = antfly_warp_reduce_sum_f32(x);
+        \\    const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
+        \\    int q = d > 0.0f ? __float2int_rn(x / d) : 0;
+        \\    q = max(-127, min(127, q));
+        \\    unsigned char *bp = dst_q8 + (size_t)block * 36u;
+        \\    bp[4u + lane] = (unsigned char)(signed char)q;
+        \\    if (lane == 0u) {{
+        \\        const unsigned short d_bits = __half_as_ushort(__float2half(d));
+        \\        const unsigned short sum_bits = __half_as_ushort(__float2half(sum));
+        \\        bp[0] = (unsigned char)(d_bits & 0xffu);
+        \\        bp[1] = (unsigned char)(d_bits >> 8);
+        \\        bp[2] = (unsigned char)(sum_bits & 0xffu);
+        \\        bp[3] = (unsigned char)(sum_bits >> 8);
+        \\    }}
+        \\}}
+    ,
+        .{ggml_q8_1_quantize_rows_kernel_id},
+    );
     return out.toOwnedSlice(allocator);
 }
 
@@ -3109,6 +4091,9 @@ fn renderPairActivationQ8Body(
         else => return error.InvalidPairActivationQ8Lowering,
     };
     const warps = lowering.warps_per_projection_group;
+    const ggml_q8_1 = lowering.decode == .q4_0_q8_1_dp4a;
+    const dot_function = if (ggml_q8_1) "antfly_q4_0_ggml_q8_1_dot16" else "antfly_q4_0_q8_dot16";
+    const dot_sum_argument = if (ggml_q8_1) ", q8_sum" else "";
     try appendFmt(allocator, out, "extern \"C\" __global__ void {s}(\n", .{plan.kernel_id});
     try out.appendSlice(allocator,
         \\    unsigned char *dst_q8,
@@ -3162,6 +4147,13 @@ fn renderPairActivationQ8Body(
     try out.appendSlice(allocator,
         \\                const unsigned char *q8_bp = q8_input + (row * row_blocks + block) * 36u;
         \\                const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
+    );
+    try out.appendSlice(allocator, "\n");
+    if (ggml_q8_1) try out.appendSlice(
+        allocator,
+        "                const float q8_sum = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[1]);\n",
+    );
+    try out.appendSlice(allocator,
         \\                const signed char *q8_values = (const signed char *)(q8_bp + 4u);
         \\                const unsigned int q8_base0 = iqs * 4u;
         \\                const unsigned int q8_base1 = q8_base0 + 4u;
@@ -3175,8 +4167,16 @@ fn renderPairActivationQ8Body(
         \\                    const unsigned int col = col_tile + c;
         \\                    const unsigned char *gate_bp = weight_gate + ((size_t)col * row_blocks + block) * 18u;
         \\                    const unsigned char *up_bp = weight_up + ((size_t)col * row_blocks + block) * 18u;
-        \\                    gate_acc[c] += antfly_q4_0_q8_dot16(gate_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-        \\                    up_acc[c] += antfly_q4_0_q8_dot16(up_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+    );
+    try out.appendSlice(allocator, "\n");
+    try appendFmt(
+        allocator,
+        out,
+        "                    gate_acc[c] += {s}(gate_bp, q8_d{s}, iqs, q8_low0, q8_high0, q8_low1, q8_high1);\n" ++
+            "                    up_acc[c] += {s}(up_bp, q8_d{s}, iqs, q8_low0, q8_high0, q8_low1, q8_high1);\n",
+        .{ dot_function, dot_sum_argument, dot_function, dot_sum_argument },
+    );
+    try out.appendSlice(allocator,
         \\                }
         \\            }
         \\
@@ -3211,6 +4211,13 @@ fn renderPairActivationQ8Body(
         \\
         \\    if (warp == 0u) {
         \\        const float x = activated[lane];
+    );
+    try out.appendSlice(allocator, "\n");
+    if (ggml_q8_1) try out.appendSlice(
+        allocator,
+        "        const float sum = antfly_warp_reduce_sum_f32(x);\n",
+    );
+    try out.appendSlice(allocator,
         \\        const float amax = antfly_warp_reduce_max_f32(fabsf(x));
         \\        const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
         \\        int q = 0;
@@ -3224,8 +4231,22 @@ fn renderPairActivationQ8Body(
         \\            const unsigned short d_bits = __half_as_ushort(__float2half(d));
         \\            bp[0] = (unsigned char)(d_bits & 0xffu);
         \\            bp[1] = (unsigned char)(d_bits >> 8);
-        \\            bp[2] = 0u;
-        \\            bp[3] = 0u;
+    );
+    try out.appendSlice(allocator, "\n");
+    if (ggml_q8_1) {
+        try out.appendSlice(allocator,
+            \\            const unsigned short sum_bits = __half_as_ushort(__float2half(sum));
+            \\            bp[2] = (unsigned char)(sum_bits & 0xffu);
+            \\            bp[3] = (unsigned char)(sum_bits >> 8);
+        );
+    } else {
+        try out.appendSlice(allocator,
+            \\            bp[2] = 0u;
+            \\            bp[3] = 0u;
+        );
+    }
+    try out.appendSlice(allocator, "\n");
+    try out.appendSlice(allocator,
         \\        }
         \\    }
         \\}
@@ -3243,6 +4264,10 @@ fn renderDownQ8Body(
     };
     const warps = plan.launch.threads_per_block / 32;
     const block_stride = plan.launch.threads_per_block / 2;
+    const cols = lowering.columns_per_block;
+    const ggml_q8_1 = lowering.decode == .q4_0_q8_1_dp4a;
+    const dot_function = if (ggml_q8_1) "antfly_q4_0_ggml_q8_1_dot16" else "antfly_q4_0_q8_dot16";
+    const dot_sum_argument = if (ggml_q8_1) ", q8_sum" else "";
     try appendFmt(allocator, out, "extern \"C\" __global__ void {s}(\n", .{plan.kernel_id});
     try out.appendSlice(allocator,
         \\    float *dst,
@@ -3252,7 +4277,10 @@ fn renderDownQ8Body(
         \\    unsigned int in_dim,
         \\    unsigned int out_dim
         \\) {
-        \\    const unsigned int cols = 4u;
+    );
+    try out.appendSlice(allocator, "\n");
+    try appendFmt(allocator, out, "    const unsigned int cols = {d}u;\n", .{cols});
+    try out.appendSlice(allocator,
         \\    if (rows == 0u || (in_dim & 31u) != 0u || out_dim == 0u) return;
         \\    const unsigned int row_blocks = in_dim >> 5;
         \\    const unsigned int col_tiles = (out_dim + cols - 1u) / cols;
@@ -3263,9 +4291,9 @@ fn renderDownQ8Body(
         \\    const unsigned int warp = tid >> 5u;
     );
     try appendFmt(allocator, out, "\n    if (blockDim.x != {d}u || row >= rows) return;\n\n", .{plan.launch.threads_per_block});
-    try appendFmt(allocator, out, "    __shared__ float warp_partial[4][{d}];\n", .{warps});
+    try appendFmt(allocator, out, "    __shared__ float warp_partial[{d}][{d}];\n", .{ cols, warps });
+    try appendFmt(allocator, out, "    float acc[{d}];\n", .{cols});
     try out.appendSlice(allocator,
-        \\    float acc[4];
         \\    #pragma unroll
         \\    for (unsigned int c = 0u; c < cols; ++c) acc[c] = 0.0f;
         \\
@@ -3276,6 +4304,13 @@ fn renderDownQ8Body(
     try out.appendSlice(allocator,
         \\        const unsigned char *q8_bp = q8_input + ((size_t)row * row_blocks + block) * 36u;
         \\        const float q8_d = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[0]);
+    );
+    try out.appendSlice(allocator, "\n");
+    if (ggml_q8_1) try out.appendSlice(
+        allocator,
+        "        const float q8_sum = antfly_half_bits_to_float(((const unsigned short *)q8_bp)[1]);\n",
+    );
+    try out.appendSlice(allocator,
         \\        const signed char *q8_values = (const signed char *)(q8_bp + 4u);
         \\        const unsigned int q8_base0 = iqs * 4u;
         \\        const unsigned int q8_base1 = q8_base0 + 4u;
@@ -3289,7 +4324,15 @@ fn renderDownQ8Body(
         \\            const unsigned int col = col_tile + c;
         \\            if (col < out_dim) {
         \\                const unsigned char *bp = weight + ((size_t)col * row_blocks + block) * 18u;
-        \\                acc[c] += antfly_q4_0_q8_dot16(bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+    );
+    try out.appendSlice(allocator, "\n");
+    try appendFmt(
+        allocator,
+        out,
+        "                acc[c] += {s}(bp, q8_d{s}, iqs, q8_low0, q8_high0, q8_low1, q8_high1);\n",
+        .{ dot_function, dot_sum_argument },
+    );
+    try out.appendSlice(allocator,
         \\            }
         \\        }
         \\    }
@@ -3300,7 +4343,10 @@ fn renderDownQ8Body(
         \\        if (lane == 0u) warp_partial[c][warp] = sum;
         \\    }
         \\    __syncthreads();
-        \\    if (tid < 4u) {
+    );
+    try out.appendSlice(allocator, "\n");
+    try appendFmt(allocator, out, "    if (tid < {d}u) {{\n", .{cols});
+    try out.appendSlice(allocator,
         \\        float y = 0.0f;
         \\        #pragma unroll
         \\        for (unsigned int w = 0u; w <
@@ -3312,7 +4358,6 @@ fn renderDownQ8Body(
         \\    }
         \\}
     );
-    _ = lowering;
 }
 
 fn renderExactFfnPairF32Body(
@@ -3763,9 +4808,13 @@ test "cuda renderer exposes exact launch metadata for every kernel family" {
         .{ .kind = .q4_0_pair_activation_q8_1, .threads = 640, .rows = 1, .cols = 32, .shared = 768 },
         .{ .kind = .q4_0_pair_activation_q8_1_e2b_6144, .threads = 384, .rows = 1, .cols = 32, .shared = 512 },
         .{ .kind = .q4_0_pair_activation_q8_1_e2b_12288, .threads = 384, .rows = 1, .cols = 32, .shared = 512 },
+        .{ .kind = .q4_0_pair_activation_ggml_q8_1_e2b_6144, .threads = 384, .rows = 1, .cols = 32, .shared = 512 },
+        .{ .kind = .q4_0_pair_activation_ggml_q8_1_e2b_12288, .threads = 384, .rows = 1, .cols = 32, .shared = 512 },
         .{ .kind = .q4_0_down_q8_1, .threads = 256, .rows = 1, .cols = 4, .shared = 128 },
         .{ .kind = .q4_0_down_q8_1_e2b_6144, .threads = 128, .rows = 1, .cols = 4, .shared = 64 },
         .{ .kind = .q4_0_down_q8_1_e2b_12288, .threads = 256, .rows = 1, .cols = 4, .shared = 128 },
+        .{ .kind = .q4_0_down_ggml_q8_1_e2b_6144, .threads = 128, .rows = 1, .cols = 1, .shared = 16 },
+        .{ .kind = .q4_0_down_ggml_q8_1_e2b_12288, .threads = 128, .rows = 1, .cols = 1, .shared = 16 },
         .{ .kind = .q4_0_q8_1_argmax_e2b_tile8, .threads = 96, .rows = 1, .cols = 8, .shared = 96 },
         .{ .kind = .q6_k_q8_1_argmax_k2560_tile8, .threads = 160, .rows = 1, .cols = 8, .shared = 160 },
         .{ .kind = .q6_k_q8_1_argmax_k3840_tile8, .threads = 256, .rows = 1, .cols = 8, .shared = 256 },
@@ -3778,6 +4827,42 @@ test "cuda renderer exposes exact launch metadata for every kernel family" {
         try std.testing.expectEqual(item.cols, plan.launch.output_cols_per_block);
         try std.testing.expectEqual(item.shared, plan.launch.static_shared_memory_bytes);
     }
+}
+
+test "cuda renderer keeps legacy zero-point Q8 and llama CUDA Q8_1 contracts separate" {
+    const allocator = std.testing.allocator;
+    const legacy_pair = planFor(.q4_0_pair_activation_q8_1_e2b_6144);
+    const ggml_pair = planFor(.q4_0_pair_activation_ggml_q8_1_e2b_6144);
+    const ggml_down = planFor(.q4_0_down_ggml_q8_1_e2b_6144);
+    try legacy_pair.validate();
+    try ggml_pair.validate();
+    try ggml_down.validate();
+    try std.testing.expectEqual(
+        QuantDecodePrimitive.q4_0_q8_zp_dp4a,
+        legacy_pair.lowering.q4_0_pair_activation_q8_1.decode,
+    );
+    try std.testing.expectEqual(
+        QuantDecodePrimitive.q4_0_q8_1_dp4a,
+        ggml_pair.lowering.q4_0_pair_activation_q8_1.decode,
+    );
+    try std.testing.expectEqual(@as(u16, 128), ggml_down.launch.threads_per_block);
+    try std.testing.expectEqual(@as(u16, 1), ggml_down.launch.output_cols_per_block);
+
+    const pair_body = try renderBodyAlloc(allocator, ggml_pair);
+    defer allocator.free(pair_body);
+    try std.testing.expect(std.mem.containsAtLeast(u8, pair_body, 1, "antfly_q4_0_ggml_q8_1_dot16"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, pair_body, 1, "const float q8_sum"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, pair_body, 1, "bp[2] = (unsigned char)(sum_bits & 0xffu)"));
+
+    const full_source = try renderKernel(allocator, ggml_down);
+    defer allocator.free(full_source);
+    try std.testing.expect(std.mem.containsAtLeast(u8, full_source, 1, "- 4.0f * q8_sum"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, full_source, 1, "__vadd4"));
+
+    const quantizer = try renderGgmlQ8_1QuantizeRowsBodyAlloc(allocator);
+    defer allocator.free(quantizer);
+    try std.testing.expect(std.mem.containsAtLeast(u8, quantizer, 1, "const float sum = antfly_warp_reduce_sum_f32(x)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, quantizer, 1, "bp[2] = (unsigned char)(sum_bits & 0xffu)"));
 }
 
 test "cuda renderer emits model-neutral Q4_K decode MMV" {
@@ -4007,6 +5092,7 @@ test "cuda renderer emits typed two-stage split-KV attention" {
         try plan.validate();
         try std.testing.expectEqual(GridMapping.batch_query_heads_by_splits, plan.launch.grid);
         try std.testing.expectEqual(GridMapping.batch_query_heads, plan.reduction_launch.grid);
+        try std.testing.expect(plan.tiled64_launch == null);
         try std.testing.expectEqual(GridMapping.batch_query_heads, plan.serial_launch.grid);
         const expected_threads: u16 = if (plan.lowering.head_dim == 256) 256 else 512;
         try std.testing.expectEqual(expected_threads, plan.launch.threads_per_block);
@@ -4118,13 +5204,29 @@ test "cuda renderer emits paged score prework with chronological softmax" {
         try std.testing.expectEqual(AttentionSoftmax.online_chronological, plan.lowering.softmax);
         try std.testing.expectEqual(AttentionSplitVariant.score_prework, plan.lowering.split_variant);
         try std.testing.expectEqual(generated_attention_score_prework_chunks, plan.lowering.kv_splits);
+        try std.testing.expectEqual(GridMapping.batch_query_heads_by_splits, plan.launch.grid);
+        try std.testing.expectEqual(GridMapping.batch_query_heads, plan.reduction_launch.grid);
+        const tiled64_launch = plan.tiled64_launch orelse return error.MissingTiled64ConsumerPlan;
+        try std.testing.expectEqual(GridMapping.batch_query_heads_by_output_tiles, tiled64_launch.grid);
+        try std.testing.expectEqual(generated_attention_score_prework_tiled64_tile_size, tiled64_launch.threads_per_block);
+        try std.testing.expectEqual(generated_attention_score_prework_tiled64_tile_size, tiled64_launch.output_cols_per_block);
+        try std.testing.expectEqual(
+            generatedAttentionScorePreworkTiled64SharedBytes(plan.lowering.head_dim).?,
+            tiled64_launch.static_shared_memory_bytes,
+        );
         try std.testing.expectEqual(@as(u16, 0), plan.lowering.split_kv_min_tokens_default);
         try std.testing.expectEqual(generated_attention_score_prework_max_kv_tokens, plan.lowering.max_kv_tokens);
         try std.testing.expectEqual(AttentionStorage.paged_f16_or_polar4, plan.lowering.key_storage);
-        try std.testing.expectEqual(@as(u32, 4 * @sizeOf(f32)), plan.serial_launch.static_shared_memory_bytes);
+        try std.testing.expectEqual(AttentionStorage.paged_f16_or_f32, plan.lowering.value_storage);
+        try std.testing.expectEqual(
+            generated_attention_score_prework_recurrence_shared_bytes,
+            plan.serial_launch.static_shared_memory_bytes,
+        );
         try std.testing.expectEqual(plan.serial_launch.static_shared_memory_bytes, plan.reduction_launch.static_shared_memory_bytes);
         try std.testing.expectEqualStrings("termite_gqa_attention_decode_turboquant_fast_f32", plan.production_baseline);
-        try std.testing.expect(!plan.production_enabled);
+        // Promoted for the qualified SM89 automatic selector; see the
+        // score-prework promotion accounting in quant_kernel_compiler.zig.
+        try std.testing.expect(plan.production_enabled);
 
         const source = try renderAttentionKernel(std.testing.allocator, plan);
         defer std.testing.allocator.free(source);
@@ -4132,19 +5234,42 @@ test "cuda renderer emits paged score prework with chronological softmax" {
         defer std.testing.allocator.free(stage1);
         const stage2 = try std.fmt.allocPrint(std.testing.allocator, "extern \"C\" __global__ void {s}(", .{plan.reduction_kernel_id});
         defer std.testing.allocator.free(stage2);
+        const tiled64 = try std.fmt.allocPrint(std.testing.allocator, "extern \"C\" __global__ void {s}(", .{plan.tiled64_kernel_id.?});
+        defer std.testing.allocator.free(tiled64);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, stage1));
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, stage2));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, tiled64));
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 2, "const unsigned int* block_table"));
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 2, "termite_tq_physical_token("));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "unsigned long long physical = (unsigned long long)logical_token;"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "physical_block * (unsigned long long)page_size_tokens"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "physical > 0xffffffffull"));
+        try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "physical = block_table[block_index] * page_size_tokens"));
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "format != 0u && format != 2u"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "value_format != 0u"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "value_format != 0u && value_format != 2u"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_tq_f16_value(v_row, value_index)"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 2, "(ki - key_start)"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "visible_count > score_capacity"));
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "chunk_count != 128u"));
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "for (unsigned int ki = chunk_begin; ki < chunk_end; ++ki)"));
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "for (unsigned int ki = key_start; ki < key_end; ++ki)"));
-        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "shared_denom = shared_denom * shared_alpha + shared_beta;"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "__shared__ float shared_alpha[4096];"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "__shared__ float shared_beta[4096];"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "shared_denom = shared_denom * shared_alpha[recurrence_index] + shared_beta[recurrence_index];"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "acc *= shared_alpha[recurrence_index];"));
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "shared_denom = shared_denom * shared_alpha[recurrence_index] + shared_beta[recurrence_index];"));
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "acc *= shared_alpha[recurrence_index];"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const unsigned int output_tile = blockIdx.y;"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const unsigned int lane = output_tile * 64u + tile_lane;"));
+        try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "shared_alpha = "));
         try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "partial_max"));
         try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "partial_denom"));
     }
+
+    try std.testing.expectEqual(@as(?u16, 512), generatedAttentionScorePreworkTiled64MaxKvTokens(256));
+    try std.testing.expectEqual(@as(?u16, 4096), generatedAttentionScorePreworkTiled64MaxKvTokens(512));
+    try std.testing.expectEqual(@as(?u32, 4104), generatedAttentionScorePreworkTiled64SharedBytes(256));
+    try std.testing.expectEqual(@as(?u32, 32776), generatedAttentionScorePreworkTiled64SharedBytes(512));
 
     const workspace = generatedAttentionWorkspaceLayoutFor(generated_attention_score_prework_chunks) orelse return error.MissingScorePreworkWorkspace;
     try std.testing.expectEqual(@as(usize, 0), workspace.partial_values_offset);
@@ -4177,6 +5302,137 @@ test "cuda renderer rejects attention launch drift" {
     var source_id = attentionPlanFor(.gqa_decode_split2_kv_hd256_f32);
     source_id.source_id = "antfly_gqa_attention_decode_kv_hd256_f32_v1";
     try std.testing.expectError(error.CudaAttentionSourceIdDoesNotMatchSplitCount, source_id.validate());
+}
+
+test "cuda renderer owns default-off SM89 Flash prefill contracts" {
+    const hd256 = flashPrefillPlanFor(.gqa_prefill_flash_sm89_hd256_swa512_f32);
+    const hd512 = flashPrefillPlanFor(.gqa_prefill_flash_sm89_hd512_global_f32);
+    try hd256.validate();
+    try hd512.validate();
+
+    try std.testing.expectEqualStrings(generated_flash_prefill_hd256_kernel_id, hd256.kernel_id);
+    try std.testing.expectEqualStrings(generated_flash_prefill_hd512_kernel_id, hd512.kernel_id);
+    try std.testing.expectEqual(@as(u16, 512), hd256.lowering.sliding_window);
+    try std.testing.expectEqual(@as(u16, 0), hd512.lowering.sliding_window);
+    try std.testing.expectEqual(GridMapping.query_heads_by_query_tiles, hd256.launch.grid);
+    try std.testing.expectEqual(@as(u16, 256), hd256.launch.threads_per_block);
+    try std.testing.expectEqual(@as(u16, 16), hd256.launch.output_rows_per_block);
+    try std.testing.expectEqual(@as(?u32, 26_564), generatedFlashPrefillDynamicSharedBytes(256));
+    try std.testing.expectEqual(@as(?u32, 42_948), generatedFlashPrefillDynamicSharedBytes(512));
+    try std.testing.expectEqual(@as(?u32, null), generatedFlashPrefillDynamicSharedBytes(128));
+    try std.testing.expect(!hd256.production_enabled);
+    try std.testing.expect(!hd256.runtime_default_enabled);
+    try std.testing.expect(hd256.exact_token_parity_required_for_default);
+    try std.testing.expect(!hd256.exact_token_parity_qualified);
+
+    const policy = FlashPrefillQueryLengthPolicy.gemma4_q512_or_q3_v1;
+    inline for ([_]usize{ 0, 512, 1024, 1536 }) |offset| {
+        try std.testing.expect(policy.accepts(512, offset));
+    }
+    try std.testing.expect(policy.accepts(3, 2048));
+    try std.testing.expect(!policy.accepts(1, 2050));
+    try std.testing.expect(!policy.accepts(512, 1));
+    try std.testing.expect(!policy.accepts(3, 1536));
+
+    var unsafe_default = hd256;
+    unsafe_default.production_enabled = true;
+    unsafe_default.runtime_default_enabled = true;
+    try std.testing.expectError(
+        error.CudaFlashPrefillDefaultRequiresExactTokenParity,
+        unsafe_default.validate(),
+    );
+}
+
+test "cuda renderer emits the production Flash prefill ABI from its owned template" {
+    const source = try renderFlashPrefillKernel(
+        std.testing.allocator,
+        flashPrefillPlanFor(.gqa_prefill_flash_sm89_hd256_swa512_f32),
+    );
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, generated_flash_prefill_hd256_kernel_id));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "#define ANTFLY_FLASH_HEAD_DIM 256"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "#define ANTFLY_FLASH_SLIDING_WINDOW 512"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const float* q"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "__float2half_rn(q["));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "wmma::mma_sync("));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 4, "index += kThreads"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "index += blockDim.x"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime_default_enabled=false"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "exact_token_parity_qualified=false"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "_prototype"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "prefill_reference_f16"));
+}
+
+test "cuda renderer owns default-off SM89 split-K online decode contracts" {
+    const hd256 = splitkOnlineDecodePlanFor(.gqa_decode_splitk_online_sm89_hd256_swa512_f16_f32);
+    const hd512 = splitkOnlineDecodePlanFor(.gqa_decode_splitk_online_sm89_hd512_global_f16_f32);
+    try hd256.validate();
+    try hd512.validate();
+
+    try std.testing.expectEqualStrings(generated_splitk_online_decode_hd256_kernel_id, hd256.kernel_id);
+    try std.testing.expectEqualStrings(generated_splitk_online_decode_hd512_kernel_id, hd512.kernel_id);
+    try std.testing.expectEqual(@as(u16, 512), hd256.lowering.sliding_window);
+    try std.testing.expectEqual(@as(u16, 0), hd512.lowering.sliding_window);
+    try std.testing.expectEqual(@as(u16, 512), hd256.lowering.max_visible_tokens);
+    try std.testing.expectEqual(@as(u16, 4096), hd512.lowering.max_visible_tokens);
+    try std.testing.expectEqual(GridMapping.batch_query_heads_by_splits, hd256.launch.grid);
+    try std.testing.expectEqual(@as(u16, 128), hd256.launch.threads_per_block);
+    try std.testing.expectEqual(
+        generated_splitk_online_decode_static_shared_memory_bytes,
+        hd256.launch.static_shared_memory_bytes,
+    );
+    try std.testing.expectEqual(
+        generated_splitk_online_decode_static_shared_memory_bytes,
+        hd512.launch.static_shared_memory_bytes,
+    );
+    try std.testing.expectEqual(@as(u16, 64), hd256.lowering.kv_splits);
+    try std.testing.expect(!hd256.production_enabled);
+    try std.testing.expect(!hd256.runtime_default_enabled);
+    try std.testing.expect(hd256.exact_token_parity_required_for_default);
+    try std.testing.expect(!hd256.exact_token_parity_qualified);
+
+    const workspace = generatedSplitkOnlineDecodeWorkspaceLayout();
+    try std.testing.expectEqual(@as(usize, 0), workspace.completion_counters_offset);
+    try std.testing.expectEqual(@as(usize, 256), workspace.partial_values_offset);
+    try std.testing.expectEqual(@as(usize, 1_048_832), workspace.partial_max_offset);
+    try std.testing.expectEqual(@as(usize, 1_050_880), workspace.partial_denom_offset);
+    try std.testing.expectEqual(@as(usize, 1_052_928), workspace.total_bytes);
+    try std.testing.expectEqual(@as(usize, 0), workspace.partial_values_offset % 256);
+    try std.testing.expectEqual(@as(usize, 0), workspace.partial_max_offset % 256);
+    try std.testing.expectEqual(@as(usize, 0), workspace.partial_denom_offset % 256);
+    try std.testing.expectEqual(@as(usize, 0), workspace.total_bytes % 256);
+
+    var unsafe_default = hd256;
+    unsafe_default.production_enabled = true;
+    unsafe_default.runtime_default_enabled = true;
+    try std.testing.expectError(
+        error.CudaSplitkOnlineDecodeDefaultRequiresExactTokenParity,
+        unsafe_default.validate(),
+    );
+}
+
+test "cuda renderer emits graph-safe SM89 split-K online decode ABI" {
+    const source = try renderSplitkOnlineDecodeKernel(
+        std.testing.allocator,
+        splitkOnlineDecodePlanFor(.gqa_decode_splitk_online_sm89_hd512_global_f16_f32),
+    );
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, generated_splitk_online_decode_hd512_kernel_id));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "#define ANTFLY_SPLITK_ONLINE_HEAD_DIM 512"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "#define ANTFLY_SPLITK_ONLINE_SLIDING_WINDOW 0"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "unsigned* completion_counters"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "volatile float* partial_values"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "volatile float* partial_max"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "volatile float* partial_denom"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const unsigned* decode_scalars"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "__threadfence();"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "atomicAdd(&completion_counters[head], 1u)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "atomicExch(&completion_counters[head], 0u)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "for (unsigned merge_split = 0u;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime_default_enabled=false"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "_prototype"));
 }
 
 test "split-KV chronological merge matches direct online softmax" {

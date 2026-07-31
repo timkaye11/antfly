@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import pathlib
 import signal
@@ -16,6 +17,8 @@ from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+import merge_gemma4_long_e2e_release_summary as merge_long_e2e
+
 from gemma4_cuda_l4_release_gate import (
     CAPTURE_KV_CAPACITY,
     DEFAULT_MIN_COMPARABLE_RATIO,
@@ -24,6 +27,7 @@ from gemma4_cuda_l4_release_gate import (
     FROZEN_PROFILE,
     GEMMA12B_TOKENS,
     FORBIDDEN_GENERATED_Q4_0_ROUTE_COUNTERS,
+    GIT_UNTRACKED_INVENTORY_SCHEMA,
     MAX_TOK_S_CV,
     RELEASE_SCHEMA,
     RELEASE_SCOPE,
@@ -39,6 +43,7 @@ from gemma4_cuda_l4_release_gate import (
     gemma12b_evidence,
     generation_replay_errors,
     git_provenance,
+    git_content_provenance_errors,
     gpu_provenance,
     l4_errors,
     matrix_command,
@@ -53,6 +58,25 @@ from gemma4_cuda_l4_release_gate import (
     run_logged,
     toolchain_provenance,
 )
+
+
+def clean_git_content_provenance() -> dict:
+    files: list[dict] = []
+    return {
+        "tracked_diff_returncode": 0,
+        "tracked_diff_bytes": 0,
+        "tracked_diff_sha256": hashlib.sha256(b"").hexdigest(),
+        "tracked_diff_error": None,
+        "untracked_inventory_schema": GIT_UNTRACKED_INVENTORY_SCHEMA,
+        "untracked_inventory_returncode": 0,
+        "untracked_inventory_sha256": canonical_sha256({
+            "schema": GIT_UNTRACKED_INVENTORY_SCHEMA,
+            "files": files,
+        }),
+        "untracked_file_count": 0,
+        "untracked_files": files,
+        "untracked_inventory_error": None,
+    }
 
 
 def matrix(ratio: float = 0.81, passed: bool = True) -> dict:
@@ -82,6 +106,7 @@ def pair() -> dict:
             "antfly_generated_q6_k_q8_1_lm_head_argmax": "0",
             "antfly_generated_q4_0_e2b_ffn": "0",
             "antfly_generated_q4_0_e2b_ffn_exact": "0",
+            "antfly_generated_q4_0_e2b_ffn_pair_only": "0",
             "antfly_q4_0_q8_1_lm_head_argmax": "1",
         },
         "rows": [{
@@ -103,6 +128,8 @@ def pair() -> dict:
             "antfly_generated_e2b_down": 0,
             "antfly_generated_e2b_pair_fallbacks": 0,
             "antfly_generated_e2b_down_fallbacks": 0,
+            "antfly_generated_e2b_pair_only": 0,
+            "antfly_generated_e2b_pair_only_fallbacks": 0,
             "antfly_generated_e2b_exact_pair": 0,
             "antfly_generated_e2b_exact_down": 0,
             "antfly_generated_e2b_exact_pair_fallbacks": 0,
@@ -130,6 +157,8 @@ def generation_run() -> dict:
                 "q4_0_generated_e2b_down_q8_hits": 0,
                 "q4_0_generated_e2b_pair_q8_fallbacks": 0,
                 "q4_0_generated_e2b_down_q8_fallbacks": 0,
+                "q4_0_generated_e2b_pair_only_hits": 0,
+                "q4_0_generated_e2b_pair_only_fallbacks": 0,
                 "q4_0_generated_e2b_exact_pair_f32_hits": 0,
                 "q4_0_generated_e2b_exact_down_f32_hits": 0,
                 "q4_0_generated_e2b_exact_pair_f32_fallbacks": 0,
@@ -166,6 +195,71 @@ class L4ReleaseGateTest(unittest.TestCase):
         self.assertIn('ZIG_GLOBAL_CACHE_DIR="$RUNNER_TEMP/antfly-zig-global"', prepare)
         self.assertIn('>> "$GITHUB_ENV"', prepare)
 
+    def test_workflow_requires_out_of_band_long_e2e_lock_sha256(self) -> None:
+        workflow = (pathlib.Path(__file__).resolve().parents[4] / ".github/workflows/cuda-gemma4-l4.yml").read_text(encoding="utf-8")
+        prepare = workflow[workflow.index("- name: Prepare CUDA evidence inputs"):workflow.index("- name: Check generated CUDA sources")]
+        lane = workflow[
+            workflow.index("- name: Gate E2B warm-server long-context E2E"):
+            workflow.index("- name: Validate E4B warm-server long-context correctness/regression")
+        ]
+        self.assertEqual(2, workflow.count("      long_e2e_lock_sha256:"))
+        self.assertIn("vars.ANTFLY_CUDA_LONG_E2E_LOCK_SHA256", workflow)
+        self.assertIn('long_e2e_values=("$LLAMA_SERVER_BIN" "$LONG_E2E_LOCK" "$LONG_E2E_LOCK_SHA256")', prepare)
+        self.assertIn('[[ "$long_e2e_configured" -ne 3 ]]', prepare)
+        self.assertIn("LLAMA_SERVER_BIN, LONG_E2E_LOCK, and LONG_E2E_LOCK_SHA256 must be configured together", prepare)
+        self.assertIn('[[ ! "$LONG_E2E_LOCK_SHA256" =~ ^[0-9a-f]{64}$ ]]', prepare)
+        self.assertIn('--model "$E2B_MODEL"', lane)
+        self.assertIn('--lockfile-sha256 "$LONG_E2E_LOCK_SHA256"', lane)
+        self.assertIn('|| benchmark_rc=$?', lane)
+        self.assertIn('merge_gemma4_long_e2e_release_summary.py', lane)
+
+    def test_long_e2e_summary_merge_records_success_and_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            summary_path = root / "release_summary.json"
+            evidence_path = root / "evidence.json"
+            summary_path.write_text(json.dumps({"passed": True, "errors": []}))
+            evidence_bytes = json.dumps({
+                "schema": "antfly.gemma4_long_e2e.v1",
+                "passed": True,
+                "contract": {"profile": "headline"},
+                "comparison": {"ratio": 0.9},
+            }).encode()
+            evidence_path.write_bytes(evidence_bytes)
+
+            merged = merge_long_e2e.merge(summary_path, evidence_path, 0)
+            self.assertTrue(merged["passed"])
+            self.assertTrue(merged["long_e2e"]["passed"])
+            self.assertEqual(hashlib.sha256(evidence_bytes).hexdigest(), merged["long_e2e"]["sha256"])
+
+            summary_path.write_text(json.dumps({"passed": True, "errors": []}))
+            merged = merge_long_e2e.merge(summary_path, root / "missing.json", 7)
+            self.assertFalse(merged["passed"])
+            self.assertFalse(merged["long_e2e"]["passed"])
+            self.assertEqual(7, merged["long_e2e"]["benchmark_exit_code"])
+            self.assertIsNone(merged["long_e2e"]["sha256"])
+            self.assertIn("exit=7", merged["errors"][0])
+
+            summary_path.write_text(json.dumps({"passed": True, "errors": []}))
+            evidence_path.write_bytes(evidence_bytes)
+            merged = merge_long_e2e.merge(
+                summary_path,
+                evidence_path,
+                0,
+                lane_field="e4b_regression",
+                lane_label="Gemma 4 E4B warm-server correctness/regression lane",
+            )
+            self.assertTrue(merged["passed"])
+            self.assertTrue(merged["e4b_regression"]["passed"])
+            self.assertNotIn("long_e2e", merged)
+
+            summary_path.write_text(json.dumps({"passed": True, "errors": []}))
+            evidence_path.write_bytes(b"{not-json")
+            merged = merge_long_e2e.merge(summary_path, evidence_path, 0)
+            self.assertFalse(merged["passed"])
+            self.assertFalse(merged["long_e2e"]["passed"])
+            self.assertIsNotNone(merged["long_e2e"]["parse_error"])
+
     def test_release_publication_does_not_depend_on_unpublished_cuda_artifact(self) -> None:
         repo = pathlib.Path(__file__).resolve().parents[4]
         workflow = (repo / ".github/workflows/cuda-gemma4-l4.yml").read_text(encoding="utf-8")
@@ -198,14 +292,20 @@ class L4ReleaseGateTest(unittest.TestCase):
     def test_profile_locks_candidate_gates_and_returns_a_copy(self) -> None:
         profile = frozen_profile()
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE"])
-        self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK"])
+        # The score-prework default is the automatic selector, expressed by the
+        # variable being absent; the release environment scrub keeps it unset.
+        self.assertNotIn("ANTFLY_GENERATED_ATTENTION_SCORE_PREWORK", profile)
+        self.assertNotIn("ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK", profile)
+        self.assertNotIn("antfly_generated_attention_score_prework", profile)
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION"])
-        self.assertEqual("853", profile["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD"])
-        self.assertEqual("2500", profile["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP"])
+        self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN"])
+        self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD"])
+        self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP"])
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q6_K_Q8_1_LM_HEAD_ARGMAX"])
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN"])
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_CATALOG_FFN_CANDIDATES"])
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT"])
+        self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_PAIR_ONLY"])
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MMV"])
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MM"])
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_PAIR"])
@@ -231,13 +331,19 @@ class L4ReleaseGateTest(unittest.TestCase):
             "CUDA_VISIBLE_DEVICES": "0",
             "ANTFLY_INFERENCE_CUDA_GENERATED_Q6_K_Q8_1_LM_HEAD_ARGMAX": "1",
             "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT": "1",
+            "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_PAIR_ONLY": "1",
+            "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "1",
             "ANTFLY_EXPERIMENTAL_SWITCH": "1",
             "REQUIRE_LM_HEAD_ARGMAX": "0",
             "LLAMA_CACHE_TYPE_K": "q8_0",
         }, clear=True):
             environment = release_environment(args)
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q6_K_Q8_1_LM_HEAD_ARGMAX"])
+        # An inherited explicit score-prework override must not survive: the
+        # release configuration is the automatic default (variable unset).
+        self.assertNotIn("ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK", environment)
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT"])
+        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_PAIR_ONLY"])
         self.assertEqual("1", environment["REQUIRE_LM_HEAD_ARGMAX"])
         self.assertEqual("f32", environment["LLAMA_CACHE_TYPE_K"])
         self.assertNotIn("ANTFLY_EXPERIMENTAL_SWITCH", environment)
@@ -377,11 +483,109 @@ class L4ReleaseGateTest(unittest.TestCase):
             {**clean, "stdout": "?? zig/pkg/inference/new_source.zig"},
             {**clean, "stdout": "?? artifacts/cuda-gemma4-l4/release_summary.json"},
         ]
-        with mock.patch("gemma4_cuda_l4_release_gate.command_capture", side_effect=captures):
+        content = clean_git_content_provenance()
+        content["untracked_files"] = [{
+            "path": "artifacts/cuda-gemma4-l4/release_summary.json",
+            "kind": "file",
+            "mode": 0o644,
+            "bytes": 2,
+            "sha256": hashlib.sha256(b"{}").hexdigest(),
+        }]
+        content["untracked_file_count"] = 1
+        content["untracked_inventory_sha256"] = canonical_sha256({
+            "schema": GIT_UNTRACKED_INVENTORY_SCHEMA,
+            "files": content["untracked_files"],
+        })
+        with (
+            mock.patch("gemma4_cuda_l4_release_gate.command_capture", side_effect=captures),
+            mock.patch(
+                "gemma4_cuda_l4_release_gate._tracked_diff_provenance",
+                return_value={
+                    name: content[name]
+                    for name in (
+                        "tracked_diff_returncode",
+                        "tracked_diff_bytes",
+                        "tracked_diff_sha256",
+                        "tracked_diff_error",
+                    )
+                },
+            ),
+            mock.patch(
+                "gemma4_cuda_l4_release_gate._untracked_content_provenance",
+                return_value={
+                    name: value
+                    for name, value in content.items()
+                    if name.startswith("untracked_")
+                },
+            ),
+        ):
             provenance = git_provenance(pathlib.Path("/repo"))
         self.assertIs(provenance["tracked_dirty"], False)
         self.assertIs(provenance["dirty"], True)
         self.assertEqual(["zig/pkg/inference/new_source.zig"], provenance["source_untracked_paths"])
+        self.assertEqual(1, provenance["untracked_file_count"])
+        self.assertEqual([], git_content_provenance_errors(provenance))
+
+    def test_git_provenance_hashes_dirty_content_not_only_status_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = pathlib.Path(temporary)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Antfly Test"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@antfly.invalid"], check=True)
+            tracked = repo / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+
+            tracked.write_text("first dirty content\n", encoding="utf-8")
+            first = git_provenance(repo)
+            tracked.write_text("second dirty value\n", encoding="utf-8")
+            second = git_provenance(repo)
+
+        self.assertEqual(first["tracked_status_sha256"], second["tracked_status_sha256"])
+        self.assertNotEqual(first["tracked_diff_sha256"], second["tracked_diff_sha256"])
+        self.assertGreater(first["tracked_diff_bytes"], 0)
+        self.assertEqual([], git_content_provenance_errors(first))
+        self.assertEqual([], git_content_provenance_errors(second))
+
+    def test_git_provenance_hashes_untracked_file_and_symlink_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = pathlib.Path(temporary)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Antfly Test"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@antfly.invalid"], check=True)
+            tracked = repo / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+
+            untracked = repo / "candidate.bin"
+            untracked.write_bytes(b"first")
+            (repo / "candidate.link").symlink_to("candidate.bin")
+            first = git_provenance(repo)
+            untracked.write_bytes(b"other")
+            second = git_provenance(repo)
+
+        self.assertEqual(first["status_sha256"], second["status_sha256"])
+        self.assertNotEqual(first["untracked_inventory_sha256"], second["untracked_inventory_sha256"])
+        self.assertEqual(["candidate.bin", "candidate.link"], [
+            entry["path"] for entry in first["untracked_files"]
+        ])
+        self.assertEqual(["file", "symlink"], [
+            entry["kind"] for entry in first["untracked_files"]
+        ])
+        self.assertEqual([], git_content_provenance_errors(first))
+        self.assertEqual([], git_content_provenance_errors(second))
+
+    def test_git_content_provenance_rejects_mutated_or_missing_inventory(self) -> None:
+        content = clean_git_content_provenance()
+        self.assertEqual([], git_content_provenance_errors(content))
+
+        missing = {**content, "tracked_diff_sha256": None}
+        self.assertTrue(any("tracked-content" in error for error in git_content_provenance_errors(missing)))
+
+        mutated = {**content, "untracked_inventory_sha256": "f" * 64}
+        self.assertTrue(any("does not match" in error for error in git_content_provenance_errors(mutated)))
 
     def test_provenance_errors_fail_closed_on_git_absence_and_source_drift(self) -> None:
         tool = {"returncode": 0, "path": "/tool", "sha256": "f" * 64, "version": "ok"}
@@ -396,6 +600,7 @@ class L4ReleaseGateTest(unittest.TestCase):
                 "tracked_dirty": False,
                 "source_status_returncode": 0,
                 "source_untracked_paths": [],
+                **clean_git_content_provenance(),
             },
             "toolchains": toolchains,
         }
@@ -431,6 +636,7 @@ class L4ReleaseGateTest(unittest.TestCase):
                 "tracked_dirty": False,
                 "source_status_returncode": 0,
                 "source_untracked_paths": [],
+                **clean_git_content_provenance(),
             },
             "toolchains": provenance,
         })

@@ -18,6 +18,7 @@ const tensor_mod = @import("../../backends/tensor.zig");
 const buffer_mod = @import("buffer.zig");
 const context_mod = @import("context.zig");
 const driver_mod = @import("driver.zig");
+const execution_plan = @import("execution_plan.zig");
 const kernels_mod = @import("kernels.zig");
 const cublaslt_mod = @import("cublaslt.zig");
 const scratch_mod = @import("scratch.zig");
@@ -328,6 +329,100 @@ const CudaDispatchFallback = enum {
 
 const cuda_dispatch_route_count = @typeInfo(CudaDispatchRoute).@"enum".fields.len;
 const cuda_dispatch_max_entries: usize = 256;
+const cuda_q4_route_census_max_entries: usize = 128;
+
+/// Model-level route identity for the Q4 traffic census. Keep attention/GQA
+/// distinct even though it has no Q4 weight bytes: a single schema can then
+/// correlate the projection traffic with the attention phase that consumes it.
+const CudaQ4RouteOp = enum {
+    linear,
+    lm_head,
+    qkv,
+    qkv_gqa,
+    ffn_pair,
+    ffn_down,
+    attention_gqa_prefill,
+};
+
+const CudaQ4RouteBundle = enum {
+    single,
+    pair,
+    qkv,
+    gqa,
+};
+
+const CudaQ4RouteEpilogue = enum {
+    none,
+    gelu_new,
+    activation_f32,
+    activation_q8_zp,
+    activation_ggml_q8_1,
+};
+
+const CudaQ4RouteProvider = enum {
+    handwritten,
+    generated,
+    fallback,
+};
+
+const CudaQ4KernelLaunch = struct {
+    provider: CudaQ4RouteProvider = .handwritten,
+    kernel_id: []const u8,
+    grid: [3]usize,
+    block: [3]usize,
+};
+
+const cuda_q4_route_provider_count = @typeInfo(CudaQ4RouteProvider).@"enum".fields.len;
+
+const CudaQ4RouteEntry = struct {
+    op: CudaQ4RouteOp,
+    rows: usize,
+    k: usize,
+    n: usize,
+    bundle: CudaQ4RouteBundle,
+    epilogue: CudaQ4RouteEpilogue,
+    provider: CudaQ4RouteProvider,
+    kernel_id: []const u8,
+    grid: [3]u32,
+    block: [3]u32,
+    calls: u64 = 0,
+    q4_bytes_per_call: u64 = 0,
+    weighted_q4_bytes: u64 = 0,
+
+    fn matches(
+        self: CudaQ4RouteEntry,
+        op: CudaQ4RouteOp,
+        rows: usize,
+        k: usize,
+        n: usize,
+        bundle: CudaQ4RouteBundle,
+        epilogue: CudaQ4RouteEpilogue,
+        provider: CudaQ4RouteProvider,
+        kernel_id: []const u8,
+        grid: [3]u32,
+        block: [3]u32,
+    ) bool {
+        return self.op == op and self.rows == rows and self.k == k and self.n == n and
+            self.bundle == bundle and self.epilogue == epilogue and self.provider == provider and
+            std.mem.eql(u8, self.kernel_id, kernel_id) and
+            std.mem.eql(u32, &self.grid, &grid) and std.mem.eql(u32, &self.block, &block);
+    }
+};
+
+fn q4RouteBytesPerCall(rows: usize, k: usize, n: usize, bundle: CudaQ4RouteBundle) u64 {
+    if (rows == 0 or k == 0 or n == 0 or k % 32 != 0) return 0;
+    const projections: u64 = switch (bundle) {
+        .single => 1,
+        .pair => 2,
+        // For QKV, n is the already-combined Q + K + V output width.
+        .qkv => 1,
+        .gqa => return 0,
+    };
+    return @as(u64, @intCast(rows)) *|
+        @as(u64, @intCast(n)) *|
+        @as(u64, @intCast(k / 32)) *|
+        18 *| projections;
+}
 
 const CudaDispatchEntry = struct {
     op: CudaDispatchOp,
@@ -367,6 +462,10 @@ const CudaDispatchStats = struct {
     route_counts: [cuda_dispatch_route_count]u64 = [_]u64{0} ** cuda_dispatch_route_count,
     entries: std.ArrayListUnmanaged(CudaDispatchEntry) = .empty,
     dropped_entries: u64 = 0,
+    q4_entries: std.ArrayListUnmanaged(CudaQ4RouteEntry) = .empty,
+    q4_provider_calls: [cuda_q4_route_provider_count]u64 = [_]u64{0} ** cuda_q4_route_provider_count,
+    q4_provider_weighted_bytes: [cuda_q4_route_provider_count]u64 = [_]u64{0} ** cuda_q4_route_provider_count,
+    q4_dropped_entries: u64 = 0,
 
     fn note(
         self: *CudaDispatchStats,
@@ -411,8 +510,62 @@ const CudaDispatchStats = struct {
         };
     }
 
-    fn printIfEnabled(self: *const CudaDispatchStats) void {
-        if (!cudaDispatchStatsEnabled()) return;
+    fn noteQ4(
+        self: *CudaDispatchStats,
+        allocator: std.mem.Allocator,
+        enabled: bool,
+        op: CudaQ4RouteOp,
+        rows: usize,
+        k: usize,
+        n: usize,
+        bundle: CudaQ4RouteBundle,
+        epilogue: CudaQ4RouteEpilogue,
+        provider: CudaQ4RouteProvider,
+        kernel_id: []const u8,
+        grid: [3]u32,
+        block: [3]u32,
+    ) void {
+        // This census is physical launch traffic, not route-selection intent.
+        // Call only after a launch succeeds. `.fallback` identifies an actual
+        // fallback kernel that ran; failed candidate attempts belong solely in
+        // their dedicated fallback counters.
+        if (!enabled) return;
+        const bytes_per_call = q4RouteBytesPerCall(rows, k, n, bundle);
+        const provider_index = @intFromEnum(provider);
+        self.q4_provider_calls[provider_index] +|= 1;
+        self.q4_provider_weighted_bytes[provider_index] +|= bytes_per_call;
+        for (self.q4_entries.items) |*entry| {
+            if (entry.matches(op, rows, k, n, bundle, epilogue, provider, kernel_id, grid, block)) {
+                entry.calls +|= 1;
+                entry.weighted_q4_bytes +|= bytes_per_call;
+                return;
+            }
+        }
+        if (self.q4_entries.items.len >= cuda_q4_route_census_max_entries) {
+            self.q4_dropped_entries +|= 1;
+            return;
+        }
+        self.q4_entries.append(allocator, .{
+            .op = op,
+            .rows = rows,
+            .k = k,
+            .n = n,
+            .bundle = bundle,
+            .epilogue = epilogue,
+            .provider = provider,
+            .kernel_id = kernel_id,
+            .grid = grid,
+            .block = block,
+            .calls = 1,
+            .q4_bytes_per_call = bytes_per_call,
+            .weighted_q4_bytes = bytes_per_call,
+        }) catch {
+            self.q4_dropped_entries +|= 1;
+        };
+    }
+
+    fn printIfEnabled(self: *const CudaDispatchStats, q4_census_enabled: bool) void {
+        if (!cudaDispatchStatsEnabled() and !q4_census_enabled) return;
         std.debug.print("ANTFLY_CUDA_DISPATCH_STATS {{\"routes\":{{", .{});
         inline for (@typeInfo(CudaDispatchRoute).@"enum".fields, 0..) |field, i| {
             if (i != 0) std.debug.print(",", .{});
@@ -437,11 +590,36 @@ const CudaDispatchStats = struct {
                 },
             );
         }
-        std.debug.print("],\"dropped_entries\":{d}}}\n", .{self.dropped_entries});
+        std.debug.print(
+            "],\"dropped_entries\":{d},\"q4_route_census\":{{\"schema_version\":1,\"scope\":\"q4_0_weight_traffic_plus_gqa_phase_markers\",\"providers\":{{",
+            .{self.dropped_entries},
+        );
+        inline for (@typeInfo(CudaQ4RouteProvider).@"enum".fields, 0..) |field, i| {
+            if (i != 0) std.debug.print(",", .{});
+            std.debug.print(
+                "\"{s}\":{{\"calls\":{d},\"weighted_q4_bytes\":{d}}}",
+                .{ field.name, self.q4_provider_calls[i], self.q4_provider_weighted_bytes[i] },
+            );
+        }
+        std.debug.print("}},\"entries\":[", .{});
+        for (self.q4_entries.items, 0..) |entry, i| {
+            if (i != 0) std.debug.print(",", .{});
+            std.debug.print(
+                "{{\"op\":\"{s}\",\"rows\":{d},\"k\":{d},\"n\":{d},\"bundle\":\"{s}\",\"epilogue\":\"{s}\",\"provider\":\"{s}\",\"kernel_id\":\"{s}\",\"geometry_known\":{s},\"grid\":[{d},{d},{d}],\"block\":[{d},{d},{d}],\"calls\":{d},\"q4_bytes_per_call\":{d},\"weighted_q4_bytes\":{d}}}",
+                .{
+                    @tagName(entry.op),       entry.rows,               entry.k,                 entry.n,                                      @tagName(entry.bundle),
+                    @tagName(entry.epilogue), @tagName(entry.provider), entry.kernel_id,         if (entry.block[0] != 0) "true" else "false", entry.grid[0],
+                    entry.grid[1],            entry.grid[2],            entry.block[0],          entry.block[1],                               entry.block[2],
+                    entry.calls,              entry.q4_bytes_per_call,  entry.weighted_q4_bytes,
+                },
+            );
+        }
+        std.debug.print("] ,\"dropped_entries\":{d}}}}}\n", .{self.q4_dropped_entries});
     }
 
     fn deinit(self: *CudaDispatchStats, allocator: std.mem.Allocator) void {
         self.entries.deinit(allocator);
+        self.q4_entries.deinit(allocator);
         self.* = .{};
     }
 };
@@ -607,6 +785,14 @@ pub const RuntimeStats = struct {
     cuda_graph_capture_scalar_updates: usize = 0,
     cuda_graph_capture_persistent_replays: usize = 0,
     cuda_graph_capture_capacity_skips: usize = 0,
+    cuda_temp_arena_plan_observations: usize = 0,
+    cuda_temp_arena_plan_activations: usize = 0,
+    cuda_temp_arena_plan_invalidations: usize = 0,
+    cuda_temp_arena_plan_slots: usize = 0,
+    cuda_temp_arena_plan_physical_high_water_bytes: usize = 0,
+    cuda_temp_arena_plan_peak_physical_high_water_bytes: usize = 0,
+    cuda_temp_arena_plan_admission_budget_bytes: usize = 0,
+    cuda_temp_arena_plan_admission_denials: usize = 0,
     upload_syncs: usize = 0,
     pinned_scalar_uploads: usize = 0,
     pinned_scalar_upload_bytes: usize = 0,
@@ -680,13 +866,47 @@ pub const RuntimeStats = struct {
     launch_attention: usize = 0,
     launch_attention_gqa_decode: usize = 0,
     launch_attention_gqa_decode_generated: usize = 0,
+    launch_attention_gqa_decode_splitk_online_sm89: usize = 0,
+    launch_attention_gqa_decode_splitk_online_sm89_hd256: usize = 0,
+    launch_attention_gqa_decode_splitk_online_sm89_hd512: usize = 0,
+    launch_attention_gqa_decode_splitk_online_sm89_fallbacks: usize = 0,
+    launch_attention_gqa_decode_splitk_online_sm89_ineligible_fallbacks: usize = 0,
+    launch_attention_gqa_decode_splitk_online_sm89_symbol_fallbacks: usize = 0,
+    launch_attention_gqa_decode_splitk_online_sm89_forbidden_routes: usize = 0,
     launch_attention_gqa_decode_score_prework: usize = 0,
+    launch_attention_gqa_decode_score_prework_serial: usize = 0,
+    launch_attention_gqa_decode_score_prework_serial_hd256: usize = 0,
+    launch_attention_gqa_decode_score_prework_serial_hd512: usize = 0,
+    launch_attention_gqa_decode_score_prework_tiled64: usize = 0,
+    launch_attention_gqa_decode_score_prework_tiled64_hd256: usize = 0,
+    launch_attention_gqa_decode_score_prework_tiled64_hd512: usize = 0,
+    launch_attention_gqa_decode_score_prework_tiled64_fallbacks: usize = 0,
+    launch_attention_gqa_decode_score_prework_tiled64_forbidden_routes: usize = 0,
+    launch_attention_gqa_decode_score_prework_tiled64_symbol_fallbacks: usize = 0,
     launch_attention_gqa_decode_fast: usize = 0,
     launch_attention_gqa_decode_fast_fallbacks: usize = 0,
     launch_attention_gqa_prefill_fast: usize = 0,
     launch_attention_gqa_prefill_tiled: usize = 0,
     launch_attention_gqa_prefill_mma: usize = 0,
     launch_attention_gqa_prefill_mma_m32: usize = 0,
+    launch_attention_gqa_prefill_tiled_f16_exact: usize = 0,
+    launch_attention_gqa_prefill_tiled_f16_exact_hd256: usize = 0,
+    launch_attention_gqa_prefill_tiled_f16_exact_hd512: usize = 0,
+    launch_attention_gqa_prefill_tiled_f16_warp: usize = 0,
+    launch_attention_gqa_prefill_tiled_f16_warp_hd256: usize = 0,
+    launch_attention_gqa_prefill_tiled_f16_warp_hd512: usize = 0,
+    launch_attention_gqa_prefill_flash_f16_sm89: usize = 0,
+    launch_attention_gqa_prefill_flash_f16_sm89_hd256_q512: usize = 0,
+    launch_attention_gqa_prefill_flash_f16_sm89_hd256_q3: usize = 0,
+    launch_attention_gqa_prefill_flash_f16_sm89_hd512_q512: usize = 0,
+    launch_attention_gqa_prefill_flash_f16_sm89_hd512_q3: usize = 0,
+    launch_attention_gqa_prefill_flash_f16_sm89_fallbacks: usize = 0,
+    launch_attention_gqa_prefill_flash_f16_sm89_ineligible_fallbacks: usize = 0,
+    launch_attention_gqa_prefill_flash_f16_sm89_symbol_fallbacks: usize = 0,
+    launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q512: usize = 0,
+    launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q3: usize = 0,
+    launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q512: usize = 0,
+    launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q3: usize = 0,
     launch_attention_gqa_scalar: usize = 0,
     launch_elementwise: usize = 0,
     launch_scalar: usize = 0,
@@ -764,6 +984,9 @@ pub const RuntimeStats = struct {
     linear_pair_fused_q4_0_tile4: usize = 0,
     linear_pair_fused_q4_0_tile8: usize = 0,
     linear_activation_slice_fused_q4_0: usize = 0,
+    ple_gate_prefill_bf16_mirror_first_hits: usize = 0,
+    ple_gate_prefill_bf16_mirror_first_ineligible: usize = 0,
+    ple_gate_decode_q4_fused_preserved: usize = 0,
     linear_pair_fused_q4: usize = 0,
     linear_pair_fallbacks: usize = 0,
     lm_head_argmax_fused_q8: usize = 0,
@@ -780,6 +1003,9 @@ pub const RuntimeStats = struct {
     bf16_cublaslt_activation_staging_calls: usize = 0,
     bf16_cublaslt_activation_mirror_hits: usize = 0,
     bf16_cublaslt_fallbacks: usize = 0,
+    bf16_cublaslt_tuning_tuned_calls: usize = 0,
+    bf16_cublaslt_tuning_heuristic_calls: usize = 0,
+    bf16_cublaslt_tuning_api_fallbacks: usize = 0,
     bf16_scalar_linear_calls: usize = 0,
     bf16_scalar_qkv_calls: usize = 0,
     f16_cublaslt_linear_calls: usize = 0,
@@ -807,10 +1033,17 @@ pub const RuntimeStats = struct {
     q4_0_generated_e2b_pair_q8_fallbacks: usize = 0,
     q4_0_generated_e2b_down_q8_hits: usize = 0,
     q4_0_generated_e2b_down_q8_fallbacks: usize = 0,
+    q4_0_generated_e2b_pair_only_hits: usize = 0,
+    q4_0_generated_e2b_pair_only_fallbacks: usize = 0,
     q4_0_generated_e2b_exact_pair_f32_hits: usize = 0,
     q4_0_generated_e2b_exact_pair_f32_fallbacks: usize = 0,
     q4_0_generated_e2b_exact_down_f32_hits: usize = 0,
     q4_0_generated_e2b_exact_down_f32_fallbacks: usize = 0,
+    q4_0_ggml_q8_1_e2b_ffn_hits: usize = 0,
+    q4_0_ggml_q8_1_e2b_ffn_fallbacks: usize = 0,
+    q4_0_ggml_q8_1_quantize_fallbacks: usize = 0,
+    q4_0_ggml_q8_1_pair_fallbacks: usize = 0,
+    q4_0_ggml_q8_1_down_fallbacks: usize = 0,
     generated_kernel_catalog_resolve_attempts: usize = 0,
     generated_kernel_catalog_resolve_misses: usize = 0,
     generated_kernel_catalog_hits: usize = 0,
@@ -933,6 +1166,59 @@ pub const RuntimeStats = struct {
     dense_prefetch_read_bytes: usize = 0,
 };
 
+fn noteGqaFlashPrefillStats(
+    stats: *RuntimeStats,
+    launch_kind: kernels_mod.GqaAttentionLaunchKind,
+    head_dim: usize,
+    q_seq_len: usize,
+) void {
+    const fallback = launch_kind == .prefill_flash_f16_sm89_ineligible_fallback or
+        launch_kind == .prefill_flash_f16_sm89_symbol_fallback;
+    if (fallback) {
+        stats.launch_attention_gqa_prefill_flash_f16_sm89_fallbacks += 1;
+        if (launch_kind == .prefill_flash_f16_sm89_ineligible_fallback) {
+            stats.launch_attention_gqa_prefill_flash_f16_sm89_ineligible_fallbacks += 1;
+        } else {
+            stats.launch_attention_gqa_prefill_flash_f16_sm89_symbol_fallbacks += 1;
+        }
+        if (head_dim == 256 and q_seq_len == 512) stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q512 += 1;
+        if (head_dim == 256 and q_seq_len == 3) stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q3 += 1;
+        if (head_dim == 512 and q_seq_len == 512) stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q512 += 1;
+        if (head_dim == 512 and q_seq_len == 3) stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q3 += 1;
+        return;
+    }
+    std.debug.assert(launch_kind == .prefill_flash_f16_sm89);
+    stats.launch_attention_gqa_prefill_flash_f16_sm89 += 1;
+    if (head_dim == 256 and q_seq_len == 512) stats.launch_attention_gqa_prefill_flash_f16_sm89_hd256_q512 += 1;
+    if (head_dim == 256 and q_seq_len == 3) stats.launch_attention_gqa_prefill_flash_f16_sm89_hd256_q3 += 1;
+    if (head_dim == 512 and q_seq_len == 512) stats.launch_attention_gqa_prefill_flash_f16_sm89_hd512_q512 += 1;
+    if (head_dim == 512 and q_seq_len == 3) stats.launch_attention_gqa_prefill_flash_f16_sm89_hd512_q3 += 1;
+}
+
+fn noteGqaSplitkOnlineDecodeStats(
+    stats: *RuntimeStats,
+    launch_kind: kernels_mod.GqaAttentionLaunchKind,
+    head_dim: usize,
+) void {
+    switch (launch_kind) {
+        .decode_splitk_online_sm89 => {
+            stats.launch_attention_gqa_decode_splitk_online_sm89 += 1;
+            if (head_dim == 256) stats.launch_attention_gqa_decode_splitk_online_sm89_hd256 += 1;
+            if (head_dim == 512) stats.launch_attention_gqa_decode_splitk_online_sm89_hd512 += 1;
+        },
+        .decode_splitk_online_sm89_ineligible_fallback => {
+            stats.launch_attention_gqa_decode_splitk_online_sm89_fallbacks += 1;
+            stats.launch_attention_gqa_decode_splitk_online_sm89_ineligible_fallbacks += 1;
+            stats.launch_attention_gqa_decode_splitk_online_sm89_forbidden_routes += 1;
+        },
+        .decode_splitk_online_sm89_symbol_fallback => {
+            stats.launch_attention_gqa_decode_splitk_online_sm89_fallbacks += 1;
+            stats.launch_attention_gqa_decode_splitk_online_sm89_symbol_fallbacks += 1;
+        },
+        else => unreachable,
+    }
+}
+
 fn noteTopTransferSize(sizes: *[RuntimeStats.top_transfer_size_count]usize, counts: *[RuntimeStats.top_transfer_size_count]usize, bytes: usize) void {
     if (bytes == 0) return;
     for (sizes, counts) |size, *count| {
@@ -995,6 +1281,11 @@ fn elapsedNsSince(start_ns: u64) u64 {
 
 const max_cuda_graph_replay_slots = 8;
 
+const CudaGraphReplayOutputKind = enum {
+    tensor,
+    greedy_token,
+};
+
 const CudaGraphReplaySlot = struct {
     exec: driver_mod.CUgraphExec = null,
     replay_key: u64 = 0,
@@ -1016,7 +1307,349 @@ const CudaGraphReplaySlot = struct {
     kv_replay_capacity_valid: bool = false,
     decode_scalars_auto_advance: bool = false,
     decode_scalars_auto_advance_delta: [5]u32 = .{ 1, 1, 1, 1, 0 },
+    temp_arena_generation: u64 = 0,
+    captured_temp_allocation_count: usize = 0,
 };
+
+const Bf16MirrorRowSelector = union(enum) {
+    /// Production policy: BF16 mirrors serve multi-row work; single-token
+    /// decode remains on native quantized kernels.
+    production,
+    /// Diagnostic-only minimum row count. For example, 4 keeps a 3-row
+    /// prefill tail on Q4 while preserving BF16 routing for full chunks.
+    diagnostic_min_rows: usize,
+
+    fn resolve() Bf16MirrorRowSelector {
+        const requested = platform.env.getenvUsize(
+            "ANTFLY_INFERENCE_CUDA_BF16_MIRROR_MIN_ROWS_DIAGNOSTIC",
+        ) orelse return .production;
+        // Zero is never a meaningful matrix row threshold. Fail closed to the
+        // production contract instead of silently widening BF16 dispatch.
+        if (requested == 0) return .production;
+        return .{ .diagnostic_min_rows = requested };
+    }
+
+    fn accepts(self: Bf16MirrorRowSelector, rows: usize) bool {
+        return switch (self) {
+            .production => rows > 1,
+            .diagnostic_min_rows => |min_rows| rows >= min_rows,
+        };
+    }
+};
+
+/// Candidate route for Gemma 4 E2B's per-layer-input gate during prefill.
+///
+/// The existing fused PLE kernel quantizes the activation to Q8_1 and reads
+/// the Q4_0 weight directly. When hybrid residency has already admitted a BF16
+/// mirror, the generic PLE fallback can instead use the existing BF16
+/// cuBLASLt linear, then the existing activation/slice operation. Keep this a
+/// typed, default-off profile until locked end-to-end qualification promotes
+/// it; the exact model and SM89 checks prevent an experimental E2B decision
+/// from silently widening to other Gemma variants.
+const PleGatePrefillProfile = enum {
+    off,
+    mirror_first_sm89_e2b,
+
+    fn parse(value: []const u8) ?PleGatePrefillProfile {
+        if (std.mem.eql(u8, value, "off")) return .off;
+        if (std.mem.eql(u8, value, "mirror-first-sm89-e2b")) return .mirror_first_sm89_e2b;
+        return null;
+    }
+
+    fn name(self: PleGatePrefillProfile) []const u8 {
+        return switch (self) {
+            .off => "off",
+            .mirror_first_sm89_e2b => "mirror-first-sm89-e2b",
+        };
+    }
+
+    fn resolve(compute_major: i32, compute_minor: i32) driver_mod.Error!PleGatePrefillProfile {
+        const raw = platform.env.getenv("ANTFLY_INFERENCE_CUDA_PLE_GATE_PREFILL_PROFILE") orelse
+            return .off;
+        const profile = parse(raw) orelse {
+            std.log.err(
+                "cuda_ple_gate_prefill: status=invalid value={s} expected=off|mirror-first-sm89-e2b",
+                .{raw},
+            );
+            return error.InvalidCudaState;
+        };
+        if (profile == .mirror_first_sm89_e2b and
+            (compute_major != 8 or compute_minor != 9))
+        {
+            std.log.err(
+                "cuda_ple_gate_prefill: status=unsupported profile={s} compute={d}.{d}",
+                .{ profile.name(), compute_major, compute_minor },
+            );
+            return error.InvalidCudaState;
+        }
+        std.log.info(
+            "cuda_ple_gate_prefill: status=configured profile={s} compute={d}.{d}",
+            .{ profile.name(), compute_major, compute_minor },
+        );
+        return profile;
+    }
+
+    fn eligibleFor(
+        self: PleGatePrefillProfile,
+        compute_major: i32,
+        compute_minor: i32,
+        model_is_e2b: bool,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        bf16_mirror_admitted: bool,
+        cublaslt_available: bool,
+    ) bool {
+        return self == .mirror_first_sm89_e2b and
+            compute_major == 8 and compute_minor == 9 and model_is_e2b and
+            rows > 1 and in_dim == 1536 and out_dim == 256 and
+            bf16_mirror_admitted and cublaslt_available;
+    }
+};
+
+fn isGemma4E2bPleRuntimeState(state: CudaDecoderRuntimeFamilyState) bool {
+    return state.prepared and state.configured_layer_count == 35 and
+        state.hidden_size == 1536 and state.intermediate_size == 6144 and
+        state.num_hidden_layers == 35 and
+        state.num_attention_heads == 8 and state.num_key_value_heads == 1 and
+        (state.num_global_key_value_heads == 0 or state.num_global_key_value_heads == 1) and
+        state.attention_head_dim == 256 and
+        state.global_head_dim == 512 and state.sliding_window == 512 and
+        state.sliding_window_pattern == 5 and state.ple_hidden_size == 256;
+}
+
+const Sm89Q4_0GgmlQ8_1Gate = enum {
+    off,
+    ggml_ffn_v1,
+
+    fn parse(raw: []const u8) !Sm89Q4_0GgmlQ8_1Gate {
+        if (std.ascii.eqlIgnoreCase(raw, "off") or std.mem.eql(u8, raw, "0")) return .off;
+        if (std.ascii.eqlIgnoreCase(raw, "ggml-ffn-v1") or
+            std.ascii.eqlIgnoreCase(raw, "ggml_ffn_v1")) return .ggml_ffn_v1;
+        return error.InvalidCudaSm89Q4_0GgmlQ8_1Gate;
+    }
+
+    fn resolve() !Sm89Q4_0GgmlQ8_1Gate {
+        const raw = platform.env.getenv("ANTFLY_INFERENCE_CUDA_SM89_Q4_0_Q8_1") orelse return .off;
+        return parse(raw) catch |err| {
+            std.log.err(
+                "invalid ANTFLY_INFERENCE_CUDA_SM89_Q4_0_Q8_1={s}; expected off or ggml-ffn-v1",
+                .{raw},
+            );
+            return err;
+        };
+    }
+
+    fn enabledFor(
+        self: Sm89Q4_0GgmlQ8_1Gate,
+        compute_major: i32,
+        compute_minor: i32,
+        rows: usize,
+        hidden_size: usize,
+        intermediate_size: usize,
+    ) bool {
+        return self == .ggml_ffn_v1 and compute_major == 8 and compute_minor == 9 and
+            rows == 1 and hidden_size == 1536 and
+            (intermediate_size == 6144 or intermediate_size == 12288);
+    }
+};
+
+const CublasLtBf16TuningProfile = enum {
+    off,
+    sm89_prefill,
+
+    fn parse(value: []const u8) ?CublasLtBf16TuningProfile {
+        if (std.ascii.eqlIgnoreCase(value, "off") or std.mem.eql(u8, value, "0")) return .off;
+        if (std.ascii.eqlIgnoreCase(value, "sm89-prefill")) return .sm89_prefill;
+        return null;
+    }
+
+    fn resolve(compute_major: i32, compute_minor: i32) driver_mod.Error!CublasLtBf16TuningProfile {
+        const raw = platform.env.getenv("ANTFLY_INFERENCE_CUDA_CUBLASLT_BF16_TUNING_PROFILE") orelse
+            return .off;
+        const profile = parse(raw) orelse {
+            std.log.err(
+                "cuda_cublaslt_bf16_tuning: status=invalid value={s} expected=off|sm89-prefill",
+                .{raw},
+            );
+            return error.InvalidCudaState;
+        };
+        if (profile == .sm89_prefill and (compute_major != 8 or compute_minor != 9)) {
+            std.log.err(
+                "cuda_cublaslt_bf16_tuning: status=unsupported profile=sm89-prefill compute={d}.{d}",
+                .{ compute_major, compute_minor },
+            );
+            return error.InvalidCudaState;
+        }
+        std.log.info(
+            "cuda_cublaslt_bf16_tuning: status=configured profile={s} candidates=8 warmups=1 iterations=3 min_rows=128 compute={d}.{d}",
+            .{ if (profile == .off) "off" else "sm89-prefill", compute_major, compute_minor },
+        );
+        return profile;
+    }
+
+    fn tuningForRows(self: CublasLtBf16TuningProfile, rows: usize) cublaslt_mod.MatmulTuning {
+        if (self != .sm89_prefill or rows < 128) return .{};
+        return .{
+            .enabled = true,
+            .candidate_count = 8,
+            .warmups = 1,
+            .iterations = 3,
+        };
+    }
+};
+
+test "CUDA BF16 mirror row selector preserves production and diagnostic boundaries" {
+    const production: Bf16MirrorRowSelector = .production;
+    try std.testing.expect(production.accepts(2));
+    try std.testing.expect(!production.accepts(1));
+    const diagnostic = Bf16MirrorRowSelector{ .diagnostic_min_rows = 4 };
+    try std.testing.expect(!diagnostic.accepts(3));
+    try std.testing.expect(diagnostic.accepts(4));
+    try std.testing.expect(diagnostic.accepts(512));
+}
+
+test "CUDA PLE gate mirror-first profile is typed default-safe and E2B bounded" {
+    try std.testing.expectEqual(PleGatePrefillProfile.off, PleGatePrefillProfile.parse("off").?);
+    try std.testing.expectEqual(
+        PleGatePrefillProfile.mirror_first_sm89_e2b,
+        PleGatePrefillProfile.parse("mirror-first-sm89-e2b").?,
+    );
+    try std.testing.expect(PleGatePrefillProfile.parse("MIRROR-FIRST-SM89-E2B") == null);
+    try std.testing.expect(PleGatePrefillProfile.parse("mirror_first_sm89_e2b") == null);
+
+    const candidate = PleGatePrefillProfile.mirror_first_sm89_e2b;
+    try std.testing.expect(candidate.eligibleFor(8, 9, true, 3, 1536, 256, true, true));
+    try std.testing.expect(candidate.eligibleFor(8, 9, true, 512, 1536, 256, true, true));
+    try std.testing.expect(!PleGatePrefillProfile.off.eligibleFor(8, 9, true, 512, 1536, 256, true, true));
+    try std.testing.expect(!candidate.eligibleFor(8, 9, true, 1, 1536, 256, true, true));
+    try std.testing.expect(!candidate.eligibleFor(8, 6, true, 512, 1536, 256, true, true));
+    try std.testing.expect(!candidate.eligibleFor(8, 9, false, 512, 1536, 256, true, true));
+    try std.testing.expect(!candidate.eligibleFor(8, 9, true, 512, 2560, 256, true, true));
+    try std.testing.expect(!candidate.eligibleFor(8, 9, true, 512, 1536, 2560, true, true));
+    try std.testing.expect(!candidate.eligibleFor(8, 9, true, 512, 1536, 256, false, true));
+    try std.testing.expect(!candidate.eligibleFor(8, 9, true, 512, 1536, 256, true, false));
+}
+
+test "CUDA PLE gate E2B runtime identity requires the complete locked contract" {
+    var state = CudaDecoderRuntimeFamilyState{
+        .prepared = true,
+        .configured_layer_count = 35,
+        .hidden_size = 1536,
+        .intermediate_size = 6144,
+        .num_hidden_layers = 35,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .num_global_key_value_heads = 1,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .sliding_window = 512,
+        .sliding_window_pattern = 5,
+        .ple_hidden_size = 256,
+    };
+    try std.testing.expect(isGemma4E2bPleRuntimeState(state));
+    state.num_global_key_value_heads = 0;
+    try std.testing.expect(isGemma4E2bPleRuntimeState(state));
+    state.num_global_key_value_heads = 1;
+    state.num_key_value_heads = 2;
+    try std.testing.expect(!isGemma4E2bPleRuntimeState(state));
+    state.num_key_value_heads = 1;
+    state.ple_hidden_size = 2560;
+    try std.testing.expect(!isGemma4E2bPleRuntimeState(state));
+}
+
+test "CUDA llama Q8_1 gate is typed narrow and default off" {
+    try std.testing.expectEqual(Sm89Q4_0GgmlQ8_1Gate.off, try Sm89Q4_0GgmlQ8_1Gate.parse("off"));
+    try std.testing.expectEqual(Sm89Q4_0GgmlQ8_1Gate.off, try Sm89Q4_0GgmlQ8_1Gate.parse("0"));
+    try std.testing.expectEqual(Sm89Q4_0GgmlQ8_1Gate.ggml_ffn_v1, try Sm89Q4_0GgmlQ8_1Gate.parse("ggml-ffn-v1"));
+    try std.testing.expectEqual(Sm89Q4_0GgmlQ8_1Gate.ggml_ffn_v1, try Sm89Q4_0GgmlQ8_1Gate.parse("GGML_FFN_V1"));
+    try std.testing.expectError(error.InvalidCudaSm89Q4_0GgmlQ8_1Gate, Sm89Q4_0GgmlQ8_1Gate.parse("true"));
+    try std.testing.expect(!Sm89Q4_0GgmlQ8_1Gate.off.enabledFor(8, 9, 1, 1536, 6144));
+    try std.testing.expect(Sm89Q4_0GgmlQ8_1Gate.ggml_ffn_v1.enabledFor(8, 9, 1, 1536, 6144));
+    try std.testing.expect(Sm89Q4_0GgmlQ8_1Gate.ggml_ffn_v1.enabledFor(8, 9, 1, 1536, 12288));
+    try std.testing.expect(!Sm89Q4_0GgmlQ8_1Gate.ggml_ffn_v1.enabledFor(8, 6, 1, 1536, 6144));
+    try std.testing.expect(!Sm89Q4_0GgmlQ8_1Gate.ggml_ffn_v1.enabledFor(8, 9, 2, 1536, 6144));
+    try std.testing.expect(!Sm89Q4_0GgmlQ8_1Gate.ggml_ffn_v1.enabledFor(8, 9, 1, 2560, 10240));
+}
+
+test "CUDA cuBLASLt BF16 tuning profile is typed bounded and tail-safe" {
+    try std.testing.expectEqual(CublasLtBf16TuningProfile.off, CublasLtBf16TuningProfile.parse("off").?);
+    try std.testing.expectEqual(CublasLtBf16TuningProfile.sm89_prefill, CublasLtBf16TuningProfile.parse("sm89-prefill").?);
+    try std.testing.expect(CublasLtBf16TuningProfile.parse("sm90-prefill") == null);
+    try std.testing.expect(!CublasLtBf16TuningProfile.sm89_prefill.tuningForRows(3).enabled);
+    const tuning = CublasLtBf16TuningProfile.sm89_prefill.tuningForRows(128);
+    try std.testing.expect(tuning.enabled);
+    try std.testing.expectEqual(@as(u8, 8), tuning.candidate_count);
+    try std.testing.expectEqual(@as(u8, 1), tuning.warmups);
+    try std.testing.expectEqual(@as(u8, 3), tuning.iterations);
+}
+
+test "CUDA Q4 route census computes actual E2B FFN bytes" {
+    const small_pair = q4RouteBytesPerCall(1, 1536, 6144, .pair);
+    const small_down = q4RouteBytesPerCall(1, 6144, 1536, .single);
+    const large_pair = q4RouteBytesPerCall(1, 1536, 12288, .pair);
+    const large_down = q4RouteBytesPerCall(1, 12288, 1536, .single);
+    try std.testing.expectEqual(@as(u64, 10_616_832), small_pair);
+    try std.testing.expectEqual(@as(u64, 5_308_416), small_down);
+    try std.testing.expectEqual(@as(u64, 21_233_664), large_pair);
+    try std.testing.expectEqual(@as(u64, 10_616_832), large_down);
+    try std.testing.expectEqual(
+        @as(u64, 875_888_640),
+        15 * (small_pair + small_down) + 20 * (large_pair + large_down),
+    );
+    try std.testing.expectEqual(@as(u64, 0), q4RouteBytesPerCall(512, 2048, 2048, .gqa));
+}
+
+test "CUDA Q4 route census aggregates by full launch identity" {
+    var stats = CudaDispatchStats{};
+    defer stats.deinit(std.testing.allocator);
+    stats.noteQ4(
+        std.testing.allocator,
+        true,
+        .ffn_down,
+        1,
+        6144,
+        1536,
+        .single,
+        .none,
+        .generated,
+        "candidate",
+        .{ 1536, 1, 1 },
+        .{ 128, 1, 1 },
+    );
+    stats.noteQ4(
+        std.testing.allocator,
+        true,
+        .ffn_down,
+        1,
+        6144,
+        1536,
+        .single,
+        .none,
+        .generated,
+        "candidate",
+        .{ 1536, 1, 1 },
+        .{ 128, 1, 1 },
+    );
+    stats.noteQ4(
+        std.testing.allocator,
+        true,
+        .ffn_down,
+        1,
+        6144,
+        1536,
+        .single,
+        .none,
+        .fallback,
+        "baseline",
+        .{ 384, 1, 1 },
+        .{ 256, 1, 1 },
+    );
+    try std.testing.expectEqual(@as(usize, 2), stats.q4_entries.items.len);
+    try std.testing.expectEqual(@as(u64, 2), stats.q4_entries.items[0].calls);
+    try std.testing.expectEqual(@as(u64, 10_616_832), stats.q4_entries.items[0].weighted_q4_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stats.q4_provider_calls[@intFromEnum(CudaQ4RouteProvider.fallback)]);
+}
 
 pub const CudaCompute = struct {
     allocator: std.mem.Allocator,
@@ -1042,6 +1675,8 @@ pub const CudaCompute = struct {
     temp_buffer_mutex: std.atomic.Mutex = .unlocked,
     temp_buffers: std.ArrayListUnmanaged(buffer_mod.DeviceBuffer) = .empty,
     temp_pinned_slots: std.ArrayListUnmanaged(TempPinnedSlot) = .empty,
+    temp_arena_planner: execution_plan.TempArenaPlanner = .{},
+    temp_arena_generation: u64 = 1,
     deferred_device_frees: std.ArrayListUnmanaged(buffer_mod.DeviceBuffer) = .empty,
     deferred_device_free_bytes: usize = 0,
     temp_trace_seq: usize = 0,
@@ -1057,9 +1692,11 @@ pub const CudaCompute = struct {
     florence_image_projection_projection_dim: usize = 0,
     debug_cuda_graph_capture_active: bool = false,
     debug_cuda_graph_capture_disabled: bool = false,
+    debug_cuda_graph_capture_inhibit_once: bool = false,
     debug_cuda_graph_slots: [max_cuda_graph_replay_slots]CudaGraphReplaySlot = [_]CudaGraphReplaySlot{.{}} ** max_cuda_graph_replay_slots,
     debug_cuda_graph_active_slot: ?usize = null,
     debug_cuda_graph_prepared_slot: ?usize = null,
+    debug_cuda_graph_prepared_output_kind: CudaGraphReplayOutputKind = .tensor,
     debug_cuda_graph_next_evict_slot: usize = 0,
     debug_cuda_decode_scalars: buffer_mod.DeviceBuffer = .{},
     debug_cuda_decode_scalars_host: [5]u32 = .{ 0, 0, 0, 0, 0 },
@@ -1069,6 +1706,9 @@ pub const CudaCompute = struct {
     debug_cuda_decode_scalars_auto_advance_blocked: bool = false,
     debug_cuda_decode_scalars_upload_deferred: bool = false,
     debug_cuda_graph_decode_kv_seq_len: usize = 0,
+    debug_cuda_graph_capture_temp_seq_begin: usize = 0,
+    generated_gqa_score_prework_templates: std.ArrayListUnmanaged(kernels_mod.GeneratedGqaScorePreworkRequest) = .empty,
+    debug_cuda_graph_prepared_attention_topology: [3]u8 = .{ 0, 0, 0 },
     decode_profile_gqa_attention_active: bool = false,
     pinned_scalar_upload_ring: PinnedScalarUploadRing = .{},
     pinned_scalar_download_buffer: PinnedScalarDownloadBuffer = .{},
@@ -1096,7 +1736,14 @@ pub const CudaCompute = struct {
     cublaslt: ?cublaslt_mod.CublasLt = null,
     stats: RuntimeStats = .{},
     dispatch_stats: CudaDispatchStats = .{},
+    q4_route_census_enabled: bool = false,
+    q4_route_op_override: ?CudaQ4RouteOp = null,
+    bf16_mirror_row_selector: Bf16MirrorRowSelector = .production,
+    ple_gate_prefill_profile: PleGatePrefillProfile = .off,
+    cublaslt_bf16_tuning_profile: CublasLtBf16TuningProfile = .off,
+    sm89_q4_0_ggml_q8_1_gate: Sm89Q4_0GgmlQ8_1Gate = .off,
     generated_q4_0_gates: GeneratedQ4_0Gates = .{},
+    temp_slot_config: CudaTempSlotConfig = .{},
     runtime_jit_shape_gating: bool = false,
     owned_by_backend: bool = false,
 
@@ -1185,7 +1832,24 @@ pub const CudaCompute = struct {
             var kernels_mut = kernels;
             kernels_mut.unload(&ctx);
         }
+        const cublaslt_bf16_tuning_profile = try CublasLtBf16TuningProfile.resolve(
+            ctx.info.compute_major,
+            ctx.info.compute_minor,
+        );
+        const ple_gate_prefill_profile = try PleGatePrefillProfile.resolve(
+            ctx.info.compute_major,
+            ctx.info.compute_minor,
+        );
+        const sm89_q4_0_ggml_q8_1_gate = try Sm89Q4_0GgmlQ8_1Gate.resolve();
         var cublaslt = initCublasLtIfAvailable(allocator, &ctx);
+        errdefer if (cublaslt) |*blas| blas.deinit();
+        if (cublaslt_bf16_tuning_profile != .off and cublaslt == null) {
+            std.log.err(
+                "cuda_cublaslt_bf16_tuning: status=unavailable profile=sm89-prefill",
+                .{},
+            );
+            return error.InvalidCudaState;
+        }
         // Warm up only when a BF16 matmul path is actually enabled: the
         // ~100ms cuBLASLt library load should not tax every backend init
         // (parity harnesses construct dozens of CudaCompute instances).
@@ -1208,17 +1872,34 @@ pub const CudaCompute = struct {
         {
             warmupCublasLtBf16(&cublaslt.?, &ctx);
         }
-        const generated_q4_0_gates = if (jit_config.mode.activates())
-            GeneratedQ4_0Gates.fromJitRoutes(kernels.runtime_jit_routes).withExplicitDisables()
-        else
-            GeneratedQ4_0Gates.resolveForTarget(ctx.info.compute_major, ctx.info.compute_minor);
+        const generated_q4_0_gates = if (jit_config.mode.activates()) blk: {
+            var gates = GeneratedQ4_0Gates.fromJitRoutes(kernels.runtime_jit_routes);
+            // The pair-only E2B route uses checked-in, shape-specific AOT
+            // artifacts rather than a production JIT route. Keep its explicit
+            // candidate gate available in JIT mode, but retain the same target
+            // qualification and master-disable contract as bundled dispatch.
+            gates.e2b_pair_only = (GeneratedQ4_0Gates{
+                .e2b_pair_only = cudaQ4_0GeneratedE2BFfnPairOnlyEnabled(),
+            }).restrictToPromotedTarget(
+                ctx.info.compute_major,
+                ctx.info.compute_minor,
+                platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_ALLOW_UNPROMOTED_GENERATED_KERNELS", false),
+            ).e2b_pair_only;
+            break :blk gates.withExplicitDisables();
+        } else GeneratedQ4_0Gates.resolveForTarget(ctx.info.compute_major, ctx.info.compute_minor);
         if (profile) |value| logKernelJitCompletion(jit_config, value, scope, load_context, &kernels);
         return .{
             .allocator = allocator,
             .ctx = ctx,
             .kernels = kernels,
             .cublaslt = cublaslt,
+            .q4_route_census_enabled = cudaQ4RouteCensusEnabled(),
+            .bf16_mirror_row_selector = Bf16MirrorRowSelector.resolve(),
+            .ple_gate_prefill_profile = ple_gate_prefill_profile,
+            .cublaslt_bf16_tuning_profile = cublaslt_bf16_tuning_profile,
+            .sm89_q4_0_ggml_q8_1_gate = sm89_q4_0_ggml_q8_1_gate,
             .generated_q4_0_gates = generated_q4_0_gates,
+            .temp_slot_config = CudaTempSlotConfig.resolve(),
             .runtime_jit_shape_gating = jit_config.mode.activates(),
         };
     }
@@ -1232,7 +1913,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn deinit(self: *CudaCompute) void {
-        self.dispatch_stats.printIfEnabled();
+        self.dispatch_stats.printIfEnabled(self.q4_route_census_enabled);
         self.dispatch_stats.deinit(self.allocator);
         deinitDenseHostPrefetch(self);
         if (self.lazy_host_store) |store| {
@@ -1279,6 +1960,8 @@ pub const CudaCompute = struct {
         if (self.florence_image_projection_t_f32) |tensor| freeTensor(self, tensor);
         for (self.temp_pinned_slots.items) |*slot| slot.buffer.free(&self.ctx);
         self.temp_pinned_slots.deinit(self.allocator);
+        self.temp_arena_planner.deinit(self.allocator);
+        self.generated_gqa_score_prework_templates.deinit(self.allocator);
         for (self.temp_buffers.items) |*buffer| buffer.free(&self.ctx);
         self.temp_buffers.deinit(self.allocator);
         if (self.deferred_device_frees.items.len != 0) {
@@ -1356,6 +2039,14 @@ pub const CudaCompute = struct {
         for (self.temp_pinned_slots.items) |slot| {
             stats.temp_buffer_cached_bytes += slot.buffer.len;
         }
+        stats.cuda_temp_arena_plan_observations = self.temp_arena_planner.observations;
+        stats.cuda_temp_arena_plan_activations = self.temp_arena_planner.activations;
+        stats.cuda_temp_arena_plan_invalidations = self.temp_arena_planner.invalidations;
+        stats.cuda_temp_arena_plan_slots = self.temp_arena_planner.period();
+        stats.cuda_temp_arena_plan_physical_high_water_bytes = self.temp_arena_planner.planned_physical_high_water_bytes;
+        stats.cuda_temp_arena_plan_peak_physical_high_water_bytes = self.temp_arena_planner.peak_planned_physical_high_water_bytes;
+        stats.cuda_temp_arena_plan_admission_budget_bytes = self.temp_arena_planner.admission_budget_bytes;
+        stats.cuda_temp_arena_plan_admission_denials = self.temp_arena_planner.admission_denials;
         stats.deferred_free_pending_bytes = self.deferred_device_free_bytes;
         return stats;
     }
@@ -1855,12 +2546,39 @@ fn uncompressedCudaKvRequiredCapacity(
     return @max(replay_capacity, forced_replay_capacity orelse 0);
 }
 
+fn cudaKvGrowthCapacity(
+    required_capacity: usize,
+    current_capacity: usize,
+    page_size_tokens: u16,
+) !usize {
+    const doubled_capacity = try checkedMul(current_capacity, 2);
+    const unaligned_capacity = @max(required_capacity, @max(@as(usize, 16), doubled_capacity));
+    if (page_size_tokens == 0) return unaligned_capacity;
+
+    // Compressed paged K/V addresses whole physical pages. Round the growth
+    // policy after applying its minimum/doubling rules so every legal u16
+    // page size—not only powers of two—preserves that allocation invariant.
+    const page_size: usize = page_size_tokens;
+    const page_count = std.math.divCeil(usize, unaligned_capacity, page_size) catch
+        return error.InvalidShape;
+    return checkedMul(page_count, page_size);
+}
+
 test "uncompressed CUDA KV capacity honors explicit replay force" {
     try std.testing.expectEqual(@as(usize, 300), try uncompressedCudaKvRequiredCapacity(300, false, 4096));
     try std.testing.expectEqual(@as(usize, 556), try uncompressedCudaKvRequiredCapacity(300, true, null));
     try std.testing.expectEqual(@as(usize, 556), try uncompressedCudaKvRequiredCapacity(300, true, 512));
     try std.testing.expectEqual(@as(usize, 4096), try uncompressedCudaKvRequiredCapacity(300, true, 4096));
     try std.testing.expectError(error.InvalidShape, uncompressedCudaKvRequiredCapacity(std.math.maxInt(usize), true, null));
+}
+
+test "compressed CUDA KV growth rounds arbitrary page sizes" {
+    try std.testing.expectEqual(@as(usize, 18), try cudaKvGrowthCapacity(17, 0, 3));
+    try std.testing.expectEqual(@as(usize, 20), try cudaKvGrowthCapacity(17, 0, 5));
+    try std.testing.expectEqual(@as(usize, 27), try cudaKvGrowthCapacity(17, 13, 3));
+    try std.testing.expectEqual(@as(usize, 30), try cudaKvGrowthCapacity(17, 13, 5));
+    try std.testing.expectEqual(@as(usize, 26), try cudaKvGrowthCapacity(17, 13, 0));
+    try std.testing.expectError(error.InvalidShape, cudaKvGrowthCapacity(1, std.math.maxInt(usize), 3));
 }
 
 fn traceCudaDeviceKvGatherFailure(
@@ -2075,8 +2793,8 @@ const CudaKvDeviceStorage = struct {
             write.total_token_count;
         if (layer.capacity_tokens < required_capacity) {
             try preparePersistentCudaBufferReallocation(self.compute);
-            const doubled_capacity = try checkedMul(layer.capacity_tokens, 2);
-            const new_capacity = @max(required_capacity, @max(@as(usize, 16), doubled_capacity));
+            const allocation_page_size = if (compressed_format != null) write.page_size_tokens else 0;
+            const new_capacity = try cudaKvGrowthCapacity(required_capacity, layer.capacity_tokens, allocation_page_size);
             const k_bytes = try checkedMul(new_capacity, key_row_bytes);
             const v_bytes = try checkedMul(new_capacity, value_row_bytes);
             var new_k = try buffer_mod.DeviceBuffer.alloc(&self.compute.ctx, k_bytes);
@@ -2459,10 +3177,10 @@ fn cudaDenseHostPrefetchBudgetBytes() usize {
     return budget_mb * 1024 * 1024;
 }
 
-fn initCublasLtIfAvailable(allocator: std.mem.Allocator, ctx: *const context_mod.CudaContext) ?cublaslt_mod.CublasLt {
+fn initCublasLtIfAvailable(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext) ?cublaslt_mod.CublasLt {
     if (!cudaCublasLtEnabled()) return null;
     if (ctx.info.compute_major < 8) return null;
-    return cublaslt_mod.CublasLt.openWithAllocator(allocator) catch null;
+    return cublaslt_mod.CublasLt.openWithAllocator(allocator, ctx) catch null;
 }
 
 fn cudaCublasLtWarmupEnabled() bool {
@@ -2647,6 +3365,11 @@ fn cudaGlinerSpanQ4KernelsEnabled() bool {
 
 fn cudaDispatchStatsEnabled() bool {
     return platform.env.getenvBool("ANTFLY_CUDA_DISPATCH_STATS");
+}
+
+fn cudaQ4RouteCensusEnabled() bool {
+    return cudaDispatchStatsEnabled() or
+        platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DECODE_Q4_ROUTE_CENSUS");
 }
 
 fn cudaQ8TiledKernelsEnabled() bool {
@@ -2878,16 +3601,6 @@ fn backendKind(_: *anyopaque) ops.BackendKind {
 
 fn provisionKvDeviceWriteHook(ctx: *anyopaque, storage: *kv_storage_runtime.KvStorageRuntime) anyerror!void {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    try resetDebugCudaGraphRequestState(self);
-    if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET", false)) {
-        // A server reuses CudaCompute across requests, unlike the CLI benchmark.
-        // Start each request's pinned-temp capture schedule from the same point
-        // after all prior stream work is complete. The server tuning wrapper
-        // disables concurrent batching while this request-scoped replay mode is
-        // active, so no peer can be using the shared allocation sequence.
-        try synchronizeAndDrainDeferredDeviceFrees(self);
-        try resetTempPinnedSlotsForRequest(self);
-    }
     if (storage.device_write_hook != null) return;
     const config = storage.storage.config;
     if (config.dtype != .f32 and cudaPagedKvFormat(config.dtype) == null) return;
@@ -2898,6 +3611,28 @@ fn provisionKvDeviceWriteHook(ctx: *anyopaque, storage: *kv_storage_runtime.KvSt
         self.allocator.destroy(device_storage);
     }
     storage.setDeviceWriteHook(device_storage.hook());
+}
+
+fn beginRequest(ctx: *anyopaque) anyerror!void {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    // A graph launch may still reference its captured temporary addresses.
+    // Establish stream completion before destroying execs or recycling any
+    // pinned slot at a request boundary. This is normally already satisfied
+    // by token readback, but making it explicit keeps the ownership invariant
+    // independent of sampling and response plumbing.
+    if (self.ctx.debug_graph_capture_active) return error.InvalidCudaState;
+    try synchronizeAndDrainDeferredDeviceFrees(self);
+    try resetDebugCudaGraphRequestState(self);
+    if (self.temp_slot_config.autoplan_enabled or
+        platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET", false))
+    {
+        // A server reuses CudaCompute across requests, unlike the CLI benchmark.
+        // Start each request's pinned-temp capture schedule from a fresh
+        // boundary. The learned planner retains only its shape candidate and
+        // proves it again before capture; legacy fixed schedules retain the
+        // synchronization required by their process-global allocation ABI.
+        try resetTempPinnedSlotsForRequest(self);
+    }
 }
 
 fn deinitBackend(ctx: *anyopaque) void {
@@ -3502,6 +4237,10 @@ fn cudaQ4_0GeneratedExactFfnCandidatesEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT", false);
 }
 
+fn cudaQ4_0GeneratedE2BFfnPairOnlyEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_PAIR_ONLY", false);
+}
+
 // Resolved once at CudaCompute.init: these gates sit on the per-op linear
 // dispatch path and getenv is a linear scan of environ.
 pub const GeneratedQ4_0Gates = struct {
@@ -3512,6 +4251,7 @@ pub const GeneratedQ4_0Gates = struct {
     down_q8: bool = generated_q4_0_down_q8_default_enabled,
     catalog_ffn_candidates: bool = false,
     exact_ffn_candidates: bool = false,
+    e2b_pair_only: bool = false,
 
     fn resolveForTarget(compute_major: i32, compute_minor: i32) GeneratedQ4_0Gates {
         const requested = GeneratedQ4_0Gates{
@@ -3522,6 +4262,7 @@ pub const GeneratedQ4_0Gates = struct {
             .down_q8 = cudaQ4_0GeneratedDownQ8Enabled(),
             .catalog_ffn_candidates = cudaQ4_0GeneratedCatalogFfnCandidatesEnabled(),
             .exact_ffn_candidates = cudaQ4_0GeneratedExactFfnCandidatesEnabled(),
+            .e2b_pair_only = cudaQ4_0GeneratedE2BFfnPairOnlyEnabled(),
         };
         return requested.restrictToPromotedTarget(
             compute_major,
@@ -3574,6 +4315,7 @@ pub const GeneratedQ4_0Gates = struct {
             .down_q8 = false,
             .catalog_ffn_candidates = false,
             .exact_ffn_candidates = false,
+            .e2b_pair_only = false,
         };
     }
 
@@ -3638,6 +4380,7 @@ test "generated Q4 routes require promoted CUDA target evidence" {
         .down_q8 = true,
         .catalog_ffn_candidates = true,
         .exact_ffn_candidates = true,
+        .e2b_pair_only = true,
     };
     try std.testing.expect(std.meta.eql(requested, requested.restrictToPromotedTarget(8, 9, false)));
 
@@ -3649,6 +4392,7 @@ test "generated Q4 routes require promoted CUDA target evidence" {
     try std.testing.expect(!blocked.down_q8);
     try std.testing.expect(!blocked.catalog_ffn_candidates);
     try std.testing.expect(!blocked.exact_ffn_candidates);
+    try std.testing.expect(!blocked.e2b_pair_only);
 
     try std.testing.expect(std.meta.eql(requested, requested.restrictToPromotedTarget(9, 0, true)));
 }
@@ -3665,6 +4409,7 @@ test "generated Q4 routes are opt in and master disable wins" {
     try std.testing.expect(!defaults.pair);
     try std.testing.expect(!defaults.pair_q8);
     try std.testing.expect(!defaults.down_q8);
+    try std.testing.expect(!defaults.e2b_pair_only);
 
     const enabled = GeneratedQ4_0Gates{
         .mmv = true,
@@ -3674,6 +4419,7 @@ test "generated Q4 routes are opt in and master disable wins" {
         .down_q8 = true,
         .catalog_ffn_candidates = true,
         .exact_ffn_candidates = true,
+        .e2b_pair_only = true,
     };
     try std.testing.expect(std.meta.eql(enabled, enabled.withMasterDisable(false)));
     try std.testing.expect(std.meta.eql(GeneratedQ4_0Gates.allDisabled(), enabled.withMasterDisable(true)));
@@ -3692,6 +4438,7 @@ test "runtime JIT gates mirror only installed production routes" {
     try std.testing.expect(gates.down_q8);
     try std.testing.expect(!gates.catalog_ffn_candidates);
     try std.testing.expect(!gates.exact_ffn_candidates);
+    try std.testing.expect(!gates.e2b_pair_only);
 }
 
 test "CUDA runtime JIT dispatch shape gate keeps oversized head on bundled kernels" {
@@ -3719,6 +4466,30 @@ test "CUDA runtime JIT dispatch shape gate keeps oversized head on bundled kerne
     try std.testing.expect(!runtimeJitShapeAllows(true, qualified, .pair_q8, 1, 1_536, 8_960));
     // Legacy explicitly-enabled generated kernels retain their pre-JIT behavior.
     try std.testing.expect(runtimeJitShapeAllows(false, .{}, .mm, 22, 2_560, 262_144));
+}
+
+fn generatedQ4_0E2BFfnPairOnlyEligible(
+    enabled: bool,
+    rows: usize,
+    hidden_dim: usize,
+    intermediate_dim: usize,
+    activation: ops.DecoderRuntimeActivationKind,
+) bool {
+    return enabled and kernels_mod.generatedQ4_0PairQ8E2BShapeEligible(
+        rows,
+        hidden_dim,
+        intermediate_dim,
+        @intFromEnum(activation),
+    );
+}
+
+test "generated CUDA E2B FFN pair-only route is narrow and opt-in" {
+    try std.testing.expect(!(GeneratedQ4_0Gates{}).e2b_pair_only);
+    try std.testing.expect(generatedQ4_0E2BFfnPairOnlyEligible(true, 1, 1536, 6144, .gelu_new));
+    try std.testing.expect(generatedQ4_0E2BFfnPairOnlyEligible(true, 1, 1536, 12288, .gelu_new));
+    try std.testing.expect(!generatedQ4_0E2BFfnPairOnlyEligible(false, 1, 1536, 6144, .gelu_new));
+    try std.testing.expect(!generatedQ4_0E2BFfnPairOnlyEligible(true, 2, 1536, 6144, .gelu_new));
+    try std.testing.expect(!generatedQ4_0E2BFfnPairOnlyEligible(true, 1, 2560, 10240, .gelu_new));
 }
 
 const GeneratedQ4_0CatalogFfnRoute = struct {
@@ -3892,10 +4663,23 @@ fn launchLinearQ4_0Tile4ThenBaseF32(
     rows: usize,
     in_dim: usize,
     out_dim: usize,
-) !void {
+) !CudaQ4KernelLaunch {
     self.kernels.launchLinearQ4_0Tile4F32(&self.ctx, dst, input, weight, rows, in_dim, out_dim) catch |tile4_err| switch (tile4_err) {
-        error.CudaKernelUnavailable, error.InvalidCudaState => try self.kernels.launchLinearQ4_0F32(&self.ctx, dst, input, weight, rows, in_dim, out_dim),
+        error.CudaKernelUnavailable, error.InvalidCudaState => {
+            try self.kernels.launchLinearQ4_0F32(&self.ctx, dst, input, weight, rows, in_dim, out_dim);
+            return .{
+                .provider = .fallback,
+                .kernel_id = "termite_linear_q4_0_f32",
+                .grid = .{ (rows * out_dim + 255) / 256, 1, 1 },
+                .block = .{ 256, 1, 1 },
+            };
+        },
         else => return tile4_err,
+    };
+    return .{
+        .kernel_id = "termite_linear_q4_0_f32_tile4",
+        .grid = .{ (out_dim + 3) / 4, rows, 1 },
+        .block = .{ 256, 1, 1 },
     };
 }
 
@@ -4732,8 +5516,8 @@ fn tryDebertaMaterializedAttentionF16(
 // BF16 mirror, return the mirror when the matmul is prefill-shaped
 // (rows > 1) so cuBLASLt handles it; decode (rows == 1) stays on the
 // native Q4/F32 kernels.
-fn weightBf16MirrorForRows(weight: *const CudaTensor, rows: usize) ?buffer_mod.DeviceBuffer {
-    if (rows <= 1) return null;
+fn weightBf16MirrorForRows(self: *const CudaCompute, weight: *const CudaTensor, rows: usize) ?buffer_mod.DeviceBuffer {
+    if (!self.bf16_mirror_row_selector.accepts(rows)) return null;
     if (weight.bf16_mirror.ptr == 0) return null;
     if (weight.bf16_mirror.len < weight.elem_count * @sizeOf(u16)) return null;
     return weight.bf16_mirror;
@@ -4743,6 +5527,39 @@ fn cublasLtWorkspace(self: *CudaCompute) buffer_mod.DeviceBuffer {
     const bytes = cudaCublasLtWorkspaceBytes();
     if (bytes == 0) return .{};
     return self.cublaslt_workspace_scratch.acquire(&self.ctx, bytes) catch .{};
+}
+
+fn runCublasLtBf16Matmul(
+    self: *CudaCompute,
+    dst: buffer_mod.DeviceBuffer,
+    input_bf16: buffer_mod.DeviceBuffer,
+    weight_bf16: buffer_mod.DeviceBuffer,
+    workspace: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) bool {
+    const blas = &(self.cublaslt orelse return false);
+    const tuning = self.cublaslt_bf16_tuning_profile.tuningForRows(rows);
+    const selection = blas.matmulBf16WeightF32OutWithTuning(
+        &self.ctx,
+        dst,
+        input_bf16,
+        weight_bf16,
+        workspace,
+        rows,
+        in_dim,
+        out_dim,
+        tuning,
+    ) catch {
+        if (tuning.enabled) self.stats.bf16_cublaslt_tuning_api_fallbacks += 1;
+        return false;
+    };
+    if (tuning.enabled) switch (selection) {
+        .tuned => self.stats.bf16_cublaslt_tuning_tuned_calls += 1,
+        .heuristic => self.stats.bf16_cublaslt_tuning_heuristic_calls += 1,
+    };
+    return true;
 }
 
 fn tryCublasLtBf16Linear(
@@ -4755,9 +5572,8 @@ fn tryCublasLtBf16Linear(
     out_dim: usize,
 ) !bool {
     const input_bf16 = try stageBf16ActivationForCublasLt(self, input, rows, in_dim) orelse return false;
-    const blas = &(self.cublaslt orelse return false);
     const workspace = cublasLtWorkspace(self);
-    blas.matmulBf16WeightF32Out(&self.ctx, dst, input_bf16, weight, workspace, rows, in_dim, out_dim) catch return false;
+    if (!runCublasLtBf16Matmul(self, dst, input_bf16, weight, workspace, rows, in_dim, out_dim)) return false;
     self.stats.bf16_cublaslt_linear_calls += 1;
     return true;
 }
@@ -4791,10 +5607,9 @@ fn tryCublasLtBf16LinearPair(
     out_dim: usize,
 ) !bool {
     const input_bf16 = try stageBf16ActivationForCublasLt(self, input, rows, in_dim) orelse return false;
-    const blas = &(self.cublaslt orelse return false);
     const workspace = cublasLtWorkspace(self);
-    blas.matmulBf16WeightF32Out(&self.ctx, dst_a, input_bf16, weight_a, workspace, rows, in_dim, out_dim) catch return false;
-    blas.matmulBf16WeightF32Out(&self.ctx, dst_b, input_bf16, weight_b, workspace, rows, in_dim, out_dim) catch return false;
+    if (!runCublasLtBf16Matmul(self, dst_a, input_bf16, weight_a, workspace, rows, in_dim, out_dim)) return false;
+    if (!runCublasLtBf16Matmul(self, dst_b, input_bf16, weight_b, workspace, rows, in_dim, out_dim)) return false;
     self.stats.bf16_cublaslt_linear_calls += 2;
     return true;
 }
@@ -4851,11 +5666,10 @@ fn tryCublasLtBf16Qkv(
     kv_out_dim: usize,
 ) !bool {
     const input_bf16 = try stageBf16ActivationForCublasLt(self, input, rows, in_dim) orelse return false;
-    const blas = &(self.cublaslt orelse return false);
     const workspace = cublasLtWorkspace(self);
-    blas.matmulBf16WeightF32Out(&self.ctx, dst_q, input_bf16, weight_q, workspace, rows, in_dim, q_out_dim) catch return false;
-    blas.matmulBf16WeightF32Out(&self.ctx, dst_k, input_bf16, weight_k, workspace, rows, in_dim, kv_out_dim) catch return false;
-    blas.matmulBf16WeightF32Out(&self.ctx, dst_v, input_bf16, weight_v, workspace, rows, in_dim, kv_out_dim) catch return false;
+    if (!runCublasLtBf16Matmul(self, dst_q, input_bf16, weight_q, workspace, rows, in_dim, q_out_dim)) return false;
+    if (!runCublasLtBf16Matmul(self, dst_k, input_bf16, weight_k, workspace, rows, in_dim, kv_out_dim)) return false;
+    if (!runCublasLtBf16Matmul(self, dst_v, input_bf16, weight_v, workspace, rows, in_dim, kv_out_dim)) return false;
     self.stats.bf16_cublaslt_qkv_calls += 1;
     return true;
 }
@@ -4885,6 +5699,7 @@ fn tryCublasLtF16Qkv(
 }
 
 const default_max_temp_buffers = 256;
+const default_temp_arena_admission_budget_bytes: usize = 512 * 1024 * 1024;
 
 fn cudaTempCacheMaxBuffers() usize {
     return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MAX_BUFFERS") orelse default_max_temp_buffers;
@@ -4893,6 +5708,95 @@ fn cudaTempCacheMaxBuffers() usize {
 fn cudaTempCacheBudgetBytes() usize {
     const mb = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MB") orelse 1024;
     return mb * 1024 * 1024;
+}
+
+fn cudaConfiguredTempArenaAdmissionBudgetBytes() ?usize {
+    const mb = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_ARENA_MAX_MB") orelse return null;
+    return std.math.mul(usize, mb, 1024 * 1024) catch 0;
+}
+
+/// Resolve a non-optional physical-footprint ceiling. An explicit arena limit
+/// can narrow, but never widen, request-level scratch or backend/combined
+/// memory policy. Without a request budget (diagnostic backends and unit
+/// tests), retain a conservative bounded default instead of treating zero as
+/// unlimited.
+fn tempArenaAdmissionBudgetFor(
+    configured_bytes: ?usize,
+    run_budget: ?*const run_memory.RunBudget,
+) usize {
+    var admission_budget = configured_bytes orelse default_temp_arena_admission_budget_bytes;
+    const budget = run_budget orelse return admission_budget;
+
+    const scratch_limit = budget.limits.scratch_limit_bytes;
+    if (configured_bytes == null and scratch_limit != 0) {
+        admission_budget = scratch_limit;
+    } else if (scratch_limit != 0) {
+        admission_budget = @min(admission_budget, scratch_limit);
+    }
+
+    // `backend_scratch_bytes` is the request's estimate for this same scratch
+    // domain and would double-count the arena. We only subtract independently
+    // resident weight/KV reservations when calculating remaining headroom.
+    const backend_non_scratch = std.math.add(
+        usize,
+        budget.backend_weight_bytes,
+        budget.backend_kv_bytes,
+    ) catch std.math.maxInt(usize);
+    if (budget.limits.backend_limit_bytes != 0) {
+        admission_budget = @min(
+            admission_budget,
+            budget.limits.backend_limit_bytes -| backend_non_scratch,
+        );
+    }
+    if (budget.limits.combined_limit_bytes != 0) {
+        const combined_non_arena = std.math.add(
+            usize,
+            budget.hostTotalBytes(),
+            backend_non_scratch,
+        ) catch std.math.maxInt(usize);
+        admission_budget = @min(
+            admission_budget,
+            budget.limits.combined_limit_bytes -| combined_non_arena,
+        );
+    }
+    return admission_budget;
+}
+
+fn cudaTempArenaAdmissionBudgetBytes(self: *const CudaCompute) usize {
+    return tempArenaAdmissionBudgetFor(
+        cudaConfiguredTempArenaAdmissionBudgetBytes(),
+        self.run_budget,
+    );
+}
+
+test "CUDA temp arena admission budget is bounded without a run budget" {
+    try std.testing.expectEqual(
+        default_temp_arena_admission_budget_bytes,
+        tempArenaAdmissionBudgetFor(null, null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), tempArenaAdmissionBudgetFor(0, null));
+    try std.testing.expectEqual(@as(usize, 1234), tempArenaAdmissionBudgetFor(1234, null));
+}
+
+test "CUDA temp arena admission budget cannot widen request memory policy" {
+    var budget = run_memory.RunBudget.init(.{
+        .host_limit_bytes = 1_000,
+        .backend_limit_bytes = 300,
+        .combined_limit_bytes = 250,
+        .scratch_limit_bytes = 200,
+    });
+    budget.host_kv_bytes = 30;
+    budget.backend_weight_bytes = 100;
+    budget.backend_kv_bytes = 50;
+    // Combined non-arena bytes are 30 + 100 + 50, leaving 70. The scratch,
+    // backend, and explicit ceilings are all wider and therefore cannot win.
+    try std.testing.expectEqual(@as(usize, 70), tempArenaAdmissionBudgetFor(null, &budget));
+    try std.testing.expectEqual(@as(usize, 70), tempArenaAdmissionBudgetFor(500, &budget));
+    try std.testing.expectEqual(@as(usize, 40), tempArenaAdmissionBudgetFor(40, &budget));
+
+    budget.limits.combined_limit_bytes = 0;
+    // Backend non-arena bytes leave 150, narrower than the 200 scratch cap.
+    try std.testing.expectEqual(@as(usize, 150), tempArenaAdmissionBudgetFor(null, &budget));
 }
 
 fn cudaDeferredFreeEnabled() bool {
@@ -4940,22 +5844,59 @@ fn cudaDecodeGraphReplayEnabled() bool {
 
 const max_temp_pinned_slots = 16_384;
 
-fn cudaTempSlotPeriod() usize {
+fn cudaConfiguredTempSlotPeriod() usize {
     const period = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD") orelse 0;
     if (period > max_temp_pinned_slots) return 0;
     return period;
 }
 
-fn cudaTempSlotSkip() usize {
+fn cudaConfiguredTempSlotSkip() usize {
     if (platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP")) |configured| return configured;
     if (cudaMtpTargetReplayEnabled() and cudaMtpUnsafeTargetReplayEnabled()) return 2500;
     return cudaTempTraceSkip();
 }
 
-fn cudaDebugGraphCaptureMinAllocSeq() usize {
+fn cudaTempArenaAutoplanEnabled() bool {
+    const graph_capture_requested = cudaDecodeGraphReplayEnabled() or
+        platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY", false) or
+        platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_UPDATE_EXEC", false);
+    return graph_capture_requested and
+        cudaConfiguredTempSlotPeriod() == 0 and
+        platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN", true);
+}
+
+// Resolved once at CudaCompute.init: these settings gate every temporary
+// allocation under temp_buffer_mutex and getenv is a linear scan of environ.
+const CudaTempSlotConfig = struct {
+    autoplan_enabled: bool = false,
+    configured_period: usize = 0,
+    configured_skip: usize = 0,
+
+    fn resolve() CudaTempSlotConfig {
+        return .{
+            .autoplan_enabled = cudaTempArenaAutoplanEnabled(),
+            .configured_period = cudaConfiguredTempSlotPeriod(),
+            .configured_skip = cudaConfiguredTempSlotSkip(),
+        };
+    }
+};
+
+fn cudaEffectiveTempSlotPeriod(self: *const CudaCompute) usize {
+    const configured = self.temp_slot_config.configured_period;
+    if (configured != 0) return configured;
+    if (!self.temp_slot_config.autoplan_enabled) return 0;
+    return self.temp_arena_planner.period();
+}
+
+fn cudaEffectiveTempSlotSkip(self: *const CudaCompute) usize {
+    if (self.temp_slot_config.configured_period != 0) return self.temp_slot_config.configured_skip;
+    return self.temp_arena_planner.allocation_seq_base;
+}
+
+fn cudaDebugGraphCaptureMinAllocSeq(self: *const CudaCompute) usize {
     if (platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_MIN_ALLOC_SEQ")) |seq| return seq;
-    const period = cudaTempSlotPeriod();
-    if (period != 0) return cudaTempSlotSkip() + period;
+    const period = cudaEffectiveTempSlotPeriod(self);
+    if (period != 0) return cudaEffectiveTempSlotSkip(self) + period;
     return 0;
 }
 
@@ -5200,8 +6141,8 @@ fn traceCudaTempAlloc(
                 limit,
                 cudaTempCacheBudgetBytes() / (1024 * 1024),
                 cudaTempStableReuseEnabled(),
-                cudaTempSlotPeriod(),
-                cudaTempSlotSkip(),
+                cudaEffectiveTempSlotPeriod(self),
+                cudaEffectiveTempSlotSkip(self),
             },
         );
     }
@@ -5234,19 +6175,21 @@ fn allocPinnedTempSlot(
     seq: usize,
     len: usize,
 ) !?buffer_mod.DeviceBuffer {
-    const period = cudaTempSlotPeriod();
+    const period = cudaEffectiveTempSlotPeriod(self);
     if (period == 0) return null;
-    const skip = cudaTempSlotSkip();
+    const skip = cudaEffectiveTempSlotSkip(self);
     if (seq < skip) return null;
 
     try ensureTempPinnedSlots(self, period);
     const slot_index = (seq - skip) % period;
     const slot = &self.temp_pinned_slots.items[slot_index];
     if (slot.in_use) {
+        if (self.temp_slot_config.autoplan_enabled) self.temp_arena_planner.markPinnedValidationFailure();
         traceCudaTempAlloc(self, seq, "alloc_slot_busy_fallback", len, .{});
         return null;
     }
     if (slot.requested_len != 0 and slot.requested_len != len) {
+        if (self.temp_slot_config.autoplan_enabled) self.temp_arena_planner.markPinnedValidationFailure();
         traceCudaTempAlloc(self, seq, "alloc_slot_shape_fallback", len, .{});
         return null;
     }
@@ -5286,20 +6229,129 @@ fn releasePinnedTempSlot(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) b
 }
 
 fn resetTempPinnedSlotsForRequest(self: *CudaCompute) !void {
+    // Graph execs retain every captured device address. Destroy them before
+    // returning any pinned arena allocation to the general temp cache.
+    invalidateDebugFinalHiddenGraph(self);
     while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
     defer self.temp_buffer_mutex.unlock();
 
+    try recycleTempPinnedSlotsUnlocked(self);
+    self.temp_trace_seq = 0;
+    self.temp_arena_planner.resetForRequest();
+}
+
+fn recycleTempPinnedSlotsUnlocked(self: *CudaCompute) !void {
     var reusable_count: usize = 0;
     for (self.temp_pinned_slots.items) |slot| {
         if (slot.in_use) return error.InvalidCudaState;
         reusable_count += @intFromBool(slot.buffer.ptr != 0);
     }
     try self.temp_buffers.ensureUnusedCapacity(self.allocator, reusable_count);
+    const cache_budget = cudaTempCacheBudgetBytes();
+    const max_buffers = cudaTempCacheMaxBuffers();
+    var cached_bytes: usize = 0;
+    for (self.temp_buffers.items) |cached| cached_bytes +|= cached.len;
     for (self.temp_pinned_slots.items) |*slot| {
-        if (slot.buffer.ptr != 0) self.temp_buffers.appendAssumeCapacity(slot.buffer);
+        if (slot.buffer.ptr != 0) {
+            var buffer = slot.buffer;
+            if (self.temp_buffers.items.len < max_buffers and
+                buffer.len <= cache_budget and
+                cached_bytes <= cache_budget - buffer.len)
+            {
+                self.temp_buffers.appendAssumeCapacity(buffer);
+                cached_bytes += buffer.len;
+                self.stats.temp_buffer_releases += 1;
+                buffer = .{};
+            } else {
+                evictTempBufferUnlocked(self, &buffer);
+            }
+        }
         slot.* = .{};
     }
-    self.temp_trace_seq = 0;
+    self.temp_arena_generation +%= 1;
+    if (self.temp_arena_generation == 0) self.temp_arena_generation = 1;
+}
+
+fn installLearnedTempArenaPlan(self: *CudaCompute) !bool {
+    const lengths = self.temp_arena_planner.candidate_lengths.items;
+    if (!self.temp_arena_planner.active or lengths.len == 0 or lengths.len > max_temp_pinned_slots) {
+        return error.InvalidCudaState;
+    }
+    const admission = self.temp_arena_planner.admitCandidate(cudaTempArenaAdmissionBudgetBytes(self));
+    if (!admission.admitted) {
+        // Admission is evaluated before installing or allocating a single new
+        // pinned address. Destroy any older graph/arena state as well: its
+        // pointers cannot remain reusable after this planner is disabled.
+        try discardLearnedTempArenaSlots(self);
+        std.log.warn(
+            "cuda_temp_arena_plan: admission_denied slots={d} physical_high_water_bytes={d} largest_slot_bytes={d} budget_bytes={d} overflowed={}",
+            .{
+                lengths.len,
+                admission.physical_high_water_bytes,
+                admission.largest_slot_bytes,
+                admission.budget_bytes,
+                admission.overflowed,
+            },
+        );
+        return false;
+    }
+    invalidateDebugFinalHiddenGraph(self);
+    while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer self.temp_buffer_mutex.unlock();
+
+    try recycleTempPinnedSlotsUnlocked(self);
+    try ensureTempPinnedSlots(self, lengths.len);
+    for (lengths, 0..) |len, index| {
+        self.temp_pinned_slots.items[index].requested_len = len;
+    }
+    return true;
+}
+
+fn discardLearnedTempArenaSlots(self: *CudaCompute) !void {
+    invalidateDebugFinalHiddenGraph(self);
+    while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer self.temp_buffer_mutex.unlock();
+    try recycleTempPinnedSlotsUnlocked(self);
+}
+
+fn noteLearnedTempArenaBoundary(self: *CudaCompute) !void {
+    if (!self.temp_slot_config.autoplan_enabled) return;
+    while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+    const transition = self.temp_arena_planner.beginDecodeIteration(
+        self.allocator,
+        self.temp_trace_seq,
+    ) catch |err| {
+        self.temp_buffer_mutex.unlock();
+        return err;
+    };
+    self.temp_buffer_mutex.unlock();
+    switch (transition) {
+        .activated => {
+            if (!try installLearnedTempArenaPlan(self)) return;
+            std.log.info(
+                "cuda_temp_arena_plan: activated slots={d} physical_high_water_bytes={d} budget_bytes={d} alloc_seq_base={d} observations={d}",
+                .{
+                    self.temp_arena_planner.period(),
+                    self.temp_arena_planner.planned_physical_high_water_bytes,
+                    self.temp_arena_planner.admission_budget_bytes,
+                    self.temp_arena_planner.allocation_seq_base,
+                    self.temp_arena_planner.observations,
+                },
+            );
+        },
+        .invalidated => {
+            // `discardLearnedTempArenaSlots` destroys every graph before it
+            // recycles the addresses those graph execs may still reference.
+            try discardLearnedTempArenaSlots(self);
+            if (cudaDebugGraphCaptureProbeTraceEnabled()) {
+                std.log.warn("cuda_temp_arena_plan: invalidated observations={d} invalidations={d}", .{
+                    self.temp_arena_planner.observations,
+                    self.temp_arena_planner.invalidations,
+                });
+            }
+        },
+        .observing, .unchanged => {},
+    }
 }
 
 fn retainPinnedTempSlot(self: *CudaCompute, buffer: buffer_mod.DeviceBuffer) bool {
@@ -5435,13 +6487,123 @@ fn touchBytesForPageCache(bytes: []const u8) void {
     std.mem.doNotOptimizeAway(checksum);
 }
 
+const DeviceBufferLease = struct {
+    buffer: buffer_mod.DeviceBuffer,
+    owns_buffer: bool,
+    prepared_greedy_slot: ?usize = null,
+};
+
+fn releaseDeviceBufferLease(self: *CudaCompute, lease: *DeviceBufferLease) void {
+    if (lease.owns_buffer) releaseDeviceBuffer(self, &lease.buffer);
+    lease.buffer = .{};
+    lease.owns_buffer = false;
+    lease.prepared_greedy_slot = null;
+}
+
+const PreparedGreedyTokenOutput = struct {
+    buffer: buffer_mod.DeviceBuffer,
+    slot_idx: usize,
+};
+
+fn preparedGreedyTokenOutputBuffer(self: *CudaCompute, byte_len: usize) !?PreparedGreedyTokenOutput {
+    if (self.debug_cuda_graph_prepared_output_kind != .greedy_token) return null;
+    const slot_idx = self.debug_cuda_graph_prepared_slot orelse return error.InvalidCudaState;
+    if (self.debug_cuda_graph_capture_active and self.debug_cuda_graph_active_slot != slot_idx) {
+        return error.InvalidCudaState;
+    }
+    const storage = self.debug_cuda_graph_slots[slot_idx].output_storage;
+    if (storage.ptr == 0 or storage.len < byte_len) return error.InvalidCudaState;
+    return .{
+        .buffer = .{ .ptr = storage.ptr, .len = byte_len },
+        .slot_idx = slot_idx,
+    };
+}
+
+fn allocGreedyTokenDeviceBuffer(self: *CudaCompute, byte_len: usize) !DeviceBufferLease {
+    if (try preparedGreedyTokenOutputBuffer(self, byte_len)) |prepared| {
+        return .{
+            .buffer = prepared.buffer,
+            .owns_buffer = false,
+            .prepared_greedy_slot = prepared.slot_idx,
+        };
+    }
+    return .{ .buffer = try allocDeviceBuffer(self, byte_len), .owns_buffer = true };
+}
+
+test "CUDA greedy graph output borrows only the prepared replay slot" {
+    var self: CudaCompute = undefined;
+    self.debug_cuda_graph_slots = [_]CudaGraphReplaySlot{.{}} ** max_cuda_graph_replay_slots;
+    self.debug_cuda_graph_prepared_slot = 3;
+    self.debug_cuda_graph_active_slot = null;
+    self.debug_cuda_graph_capture_active = false;
+    self.debug_cuda_graph_capture_disabled = false;
+    self.debug_cuda_graph_prepared_output_kind = .tensor;
+    self.debug_cuda_graph_slots[3].output_storage = .{ .ptr = 0x1234, .len = 64 };
+
+    try std.testing.expect((try preparedGreedyTokenOutputBuffer(&self, @sizeOf(i32))) == null);
+    self.debug_cuda_graph_prepared_output_kind = .greedy_token;
+    const borrowed = (try preparedGreedyTokenOutputBuffer(&self, @sizeOf(i32))).?;
+    try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x1234), borrowed.buffer.ptr);
+    try std.testing.expectEqual(@as(usize, @sizeOf(i32)), borrowed.buffer.len);
+    try std.testing.expectEqual(@as(usize, 3), borrowed.slot_idx);
+    try std.testing.expectError(error.InvalidCudaState, preparedGreedyTokenOutputBuffer(&self, 65));
+
+    self.debug_cuda_graph_capture_active = true;
+    self.debug_cuda_graph_active_slot = 2;
+    try std.testing.expectError(error.InvalidCudaState, preparedGreedyTokenOutputBuffer(&self, @sizeOf(i32)));
+}
+
+test "CUDA greedy graph output lease remains armed for retry and consumes on tensor creation" {
+    var self: CudaCompute = undefined;
+    self.allocator = std.testing.allocator;
+    self.debug_cuda_graph_slots = [_]CudaGraphReplaySlot{.{}} ** max_cuda_graph_replay_slots;
+    self.debug_cuda_graph_prepared_slot = 1;
+    self.debug_cuda_graph_active_slot = null;
+    self.debug_cuda_graph_capture_active = false;
+    self.debug_cuda_graph_prepared_output_kind = .greedy_token;
+    self.debug_cuda_graph_slots[1].output_storage = .{ .ptr = 0x5678, .len = 64 };
+
+    var failed_route_lease = try allocGreedyTokenDeviceBuffer(&self, @sizeOf(i32));
+    try std.testing.expect(!failed_route_lease.owns_buffer);
+    try std.testing.expectEqual(@as(?usize, 1), failed_route_lease.prepared_greedy_slot);
+    releaseDeviceBufferLease(&self, &failed_route_lease);
+    try std.testing.expectEqual(CudaGraphReplayOutputKind.greedy_token, self.debug_cuda_graph_prepared_output_kind);
+
+    var successful_lease = try allocGreedyTokenDeviceBuffer(&self, @sizeOf(i32));
+    const token = try createI32ScalarTensorFromLease(&self, &successful_lease);
+    const token_tensor = tensorFromCt(token);
+    try std.testing.expect(!token_tensor.owns_buffer);
+    try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x5678), token_tensor.buffer.ptr);
+    try std.testing.expectEqual(CudaGraphReplayOutputKind.tensor, self.debug_cuda_graph_prepared_output_kind);
+    try std.testing.expect((try preparedGreedyTokenOutputBuffer(&self, @sizeOf(i32))) == null);
+
+    freeTensor(&self, token);
+    try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x5678), self.debug_cuda_graph_slots[1].output_storage.ptr);
+}
+
 fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     if (len == 0) return .{};
     while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
     defer self.temp_buffer_mutex.unlock();
     const seq = self.temp_trace_seq;
     self.temp_trace_seq = seq + 1;
+    if (self.temp_slot_config.autoplan_enabled) {
+        self.temp_arena_planner.noteAllocation(self.allocator, len, max_temp_pinned_slots) catch {
+            self.temp_arena_planner.disabled = true;
+            self.temp_arena_planner.active = false;
+            self.temp_arena_planner.ready_for_capture = false;
+        };
+    }
     if (try allocPinnedTempSlot(self, seq, len)) |buffer| return buffer;
+    if (self.debug_cuda_graph_capture_active and cudaEffectiveTempSlotPeriod(self) != 0) {
+        // Falling through to the ordinary cache would let a graph retain an
+        // address that can be reused immediately after capture. Captures with
+        // a pinned arena therefore fail closed on any slot miss or ABI drift.
+        if (self.temp_slot_config.autoplan_enabled) self.temp_arena_planner.markPinnedValidationFailure();
+        self.debug_cuda_graph_capture_disabled = true;
+        std.log.warn("cuda_graph_capture_probe: unpinned_temp_during_capture seq={d} bytes={d} disabled=1", .{ seq, len });
+        return error.CudaGraphCaptureUnsafeTempAlloc;
+    }
     const stable_reuse = cudaTempStableReuseEnabled();
     var best_index: ?usize = null;
     var best_len: usize = std.math.maxInt(usize);
@@ -5507,6 +6669,11 @@ fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) voi
         buffer.* = .{};
         return;
     }
+    evictTempBufferUnlocked(self, buffer);
+}
+
+fn evictTempBufferUnlocked(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) void {
+    if (buffer.ptr == 0) return;
     self.stats.temp_buffer_evictions += 1;
     if (cudaDeferredFreeEnabled()) {
         self.deferred_device_frees.append(self.allocator, buffer.*) catch {
@@ -5895,18 +7062,35 @@ fn debugProfileCheckpoint(ctx: *anyopaque, label: []const u8, layer: usize) void
 fn debugCudaGraphCaptureBegin(ctx: *anyopaque, label: []const u8) !bool {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (self.debug_cuda_graph_capture_active) return error.InvalidCudaState;
+    if (self.debug_cuda_graph_capture_inhibit_once) {
+        self.debug_cuda_graph_capture_inhibit_once = false;
+        return false;
+    }
     if (self.debug_cuda_graph_capture_disabled) {
         if (cudaDecodeGraphReplayMode() == .required) return error.CudaGraphReplayRequired;
         return false;
     }
-    if (cudaTempSlotPeriod() == 0 and !cudaDebugGraphCaptureAllowUnpinned()) {
+    if (cudaEffectiveTempSlotPeriod(self) == 0 and !cudaDebugGraphCaptureAllowUnpinned()) {
+        if (self.temp_slot_config.autoplan_enabled and !self.temp_arena_planner.disabled) {
+            if (self.temp_arena_planner.captureWarmupExhausted() and cudaDecodeGraphReplayMode() == .required) {
+                return error.CudaGraphReplayRequired;
+            }
+            return false;
+        }
         if (cudaDecodeGraphReplayMode() == .required) return error.CudaGraphReplayRequired;
         return false;
     }
-    const min_alloc_seq = cudaDebugGraphCaptureMinAllocSeq();
+    if (self.temp_slot_config.autoplan_enabled and !self.temp_arena_planner.ready_for_capture) {
+        if (self.temp_arena_planner.captureWarmupExhausted() and cudaDecodeGraphReplayMode() == .required) {
+            return error.CudaGraphReplayRequired;
+        }
+        return false;
+    }
+    const min_alloc_seq = cudaDebugGraphCaptureMinAllocSeq(self);
     // Pinned temporary slots must first observe one complete allocation period.
-    // Required mode permits this bounded warmup; subsequent unsafe capture
-    // state still fails closed through the branches above and capture errors.
+    // Required mode permits this warmup because the planner bounds it: once
+    // its per-request observation budget is exhausted without a stable trace,
+    // the autoplan branches above fail closed with CudaGraphReplayRequired.
     if (self.temp_trace_seq < min_alloc_seq) return false;
     if (self.debug_cuda_decode_scalars_host_valid and self.debug_cuda_decode_scalars_host[4] != 0) {
         if (cudaDecodeGraphReplayMode() == .required) return error.CudaGraphReplayRequired;
@@ -5949,6 +7133,7 @@ fn debugCudaGraphCaptureBegin(ctx: *anyopaque, label: []const u8) !bool {
     try self.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
     capture_started = true;
     self.debug_cuda_graph_capture_active = true;
+    self.debug_cuda_graph_capture_temp_seq_begin = self.temp_trace_seq;
     self.debug_cuda_graph_active_slot = active_slot_idx;
     self.debug_cuda_graph_slots[active_slot_idx].decode_scalars_auto_advance = false;
     self.debug_cuda_graph_slots[active_slot_idx].decode_scalars_auto_advance_delta = auto_decode_scalars_delta;
@@ -5996,6 +7181,36 @@ fn debugCudaGraphPrepareDecodeScalars(
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (!cudaDebugGraphCaptureDeviceScalarsEnabled()) return false;
     if (self.debug_cuda_graph_capture_active) return error.InvalidCudaState;
+    if (self.kernels.gqaSplitkOnlineDecodeProfileSelected()) {
+        const splitk_profile_name = if (self.kernels.gqaSplitkOnlineDecodeProfileFailClosed())
+            "required-splitk-online-sm89"
+        else
+            "splitk-online-sm89";
+        const replay_capacity = cudaDebugGraphForcedKvReplayCapacityTokens() orelse {
+            std.log.err(
+                "cuda_gqa_decode_profile: status=rejected profile={s} reason=missing-forced-replay-capacity",
+                .{splitk_profile_name},
+            );
+            disarmSplitkOnlineDecodeReplay(self);
+            if (self.kernels.gqaSplitkOnlineDecodeProfileFailClosed()) return error.InvalidCudaState;
+            return false;
+        };
+        if (!kernels_mod.gqaSplitkOnlineDecodeReplayScalarsEligible(
+            query_position_offset,
+            kv_seq_len,
+            total_sequence_len,
+            kv_position_offset,
+            replay_capacity,
+        )) {
+            std.log.err(
+                "cuda_gqa_decode_profile: status=rejected profile={s} reason=replay-scalars-outside-qualified-capacity query_position_offset={d} kv_seq_len={d} total_sequence_len={d} kv_position_offset={d} capacity={d}",
+                .{ splitk_profile_name, query_position_offset, kv_seq_len, total_sequence_len, kv_position_offset, replay_capacity },
+            );
+            disarmSplitkOnlineDecodeReplay(self);
+            if (self.kernels.gqaSplitkOnlineDecodeProfileFailClosed()) return error.InvalidCudaState;
+            return false;
+        }
+    }
     self.debug_cuda_graph_decode_kv_seq_len = kv_seq_len;
     if (self.debug_cuda_decode_scalars.ptr == 0) {
         self.debug_cuda_decode_scalars = try buffer_mod.DeviceBuffer.alloc(&self.ctx, 5 * @sizeOf(u32));
@@ -6107,6 +7322,8 @@ fn resetCudaGraphReplaySlotMetadata(self: *CudaCompute, slot: *CudaGraphReplaySl
         slot.exec = null;
     }
     resetCudaGraphReplaySlotMetadataKeepExec(self, slot);
+    slot.temp_arena_generation = 0;
+    slot.captured_temp_allocation_count = 0;
 }
 
 fn resetCudaGraphReplaySlotMetadataKeepExec(self: *CudaCompute, slot: *CudaGraphReplaySlot) void {
@@ -6146,6 +7363,61 @@ fn invalidateDebugFinalHiddenGraph(self: *CudaCompute) void {
     }
     self.debug_cuda_graph_active_slot = null;
     self.debug_cuda_graph_prepared_slot = null;
+    self.debug_cuda_graph_prepared_output_kind = .tensor;
+}
+
+fn disarmSplitkOnlineDecodeReplay(self: *CudaCompute) void {
+    // Optional candidate rejection must return to eager execution, not leave a
+    // prepared exec that callers can replay with the previous token's device
+    // scalars. Destroy all request-local graph slots and make scalar readiness
+    // false before returning from the preparation hook.
+    invalidateDebugFinalHiddenGraph(self);
+    self.debug_cuda_graph_capture_disabled = true;
+    self.debug_cuda_decode_scalars_host_valid = false;
+    self.debug_cuda_decode_scalars_device_valid = false;
+    self.debug_cuda_decode_scalars_upload_deferred = false;
+    self.debug_cuda_decode_scalars_auto_advance_blocked = false;
+    self.debug_cuda_graph_decode_kv_seq_len = 0;
+    self.debug_cuda_graph_capture_inhibit_once = true;
+}
+
+test "split-K replay rejection cannot leave a prepared graph or stale scalars" {
+    var self: CudaCompute = undefined;
+    self.allocator = std.testing.allocator;
+    self.debug_cuda_graph_slots = [_]CudaGraphReplaySlot{.{}} ** max_cuda_graph_replay_slots;
+    self.debug_cuda_graph_slots[1].valid = true;
+    self.debug_cuda_graph_slots[1].kv_replay_capacity_valid = true;
+    self.debug_cuda_graph_slots[1].kv_replay_capacity_tokens = 2432;
+    self.debug_cuda_graph_active_slot = 1;
+    self.debug_cuda_graph_prepared_slot = 1;
+    self.debug_cuda_decode_scalars_host_valid = true;
+    self.debug_cuda_decode_scalars_device_valid = true;
+    self.debug_cuda_decode_scalars_upload_deferred = true;
+    self.debug_cuda_decode_scalars_auto_advance_blocked = false;
+    self.debug_cuda_graph_decode_kv_seq_len = 2433;
+    self.debug_cuda_graph_capture_inhibit_once = false;
+    self.debug_cuda_graph_capture_disabled = false;
+
+    disarmSplitkOnlineDecodeReplay(&self);
+
+    try std.testing.expectEqual(@as(?usize, null), self.debug_cuda_graph_active_slot);
+    try std.testing.expectEqual(@as(?usize, null), self.debug_cuda_graph_prepared_slot);
+    try std.testing.expect(!self.debug_cuda_graph_slots[1].valid);
+    try std.testing.expect(self.debug_cuda_graph_slots[1].exec == null);
+    try std.testing.expect(!self.debug_cuda_decode_scalars_host_valid);
+    try std.testing.expect(!self.debug_cuda_decode_scalars_device_valid);
+    try std.testing.expect(!self.debug_cuda_decode_scalars_upload_deferred);
+    try std.testing.expect(!self.debug_cuda_decode_scalars_auto_advance_blocked);
+    try std.testing.expectEqual(@as(usize, 0), self.debug_cuda_graph_decode_kv_seq_len);
+    try std.testing.expect(self.debug_cuda_graph_capture_inhibit_once);
+    try std.testing.expect(self.debug_cuda_graph_capture_disabled);
+
+    // The immediate capture attempt is consumed as an eager-only operation;
+    // the request-scoped disabled latch prevents any later stale recapture.
+    self.debug_cuda_graph_capture_active = false;
+    try std.testing.expect(!(try debugCudaGraphCaptureBegin(&self, "splitk-rejected")));
+    try std.testing.expect(!self.debug_cuda_graph_capture_inhibit_once);
+    try std.testing.expect(self.debug_cuda_graph_capture_disabled);
 }
 
 fn preparePersistentCudaBufferReallocation(self: *CudaCompute) !void {
@@ -6181,6 +7453,8 @@ fn clearDebugCudaGraphCaptureState(self: *CudaCompute) void {
     self.debug_cuda_graph_capture_active = false;
     self.debug_cuda_graph_capture_disabled = false;
     self.debug_cuda_graph_active_slot = null;
+    self.debug_cuda_graph_capture_temp_seq_begin = 0;
+    self.debug_cuda_graph_prepared_output_kind = .tensor;
 }
 
 test "clearing CUDA graph capture state removes stale disabled latch" {
@@ -6188,17 +7462,20 @@ test "clearing CUDA graph capture state removes stale disabled latch" {
     self.debug_cuda_graph_capture_active = true;
     self.debug_cuda_graph_capture_disabled = true;
     self.debug_cuda_graph_active_slot = 3;
+    self.debug_cuda_graph_prepared_output_kind = .greedy_token;
 
     clearDebugCudaGraphCaptureState(&self);
 
     try std.testing.expect(!self.debug_cuda_graph_capture_active);
     try std.testing.expect(!self.debug_cuda_graph_capture_disabled);
     try std.testing.expectEqual(@as(?usize, null), self.debug_cuda_graph_active_slot);
+    try std.testing.expectEqual(CudaGraphReplayOutputKind.tensor, self.debug_cuda_graph_prepared_output_kind);
 }
 
 test "CUDA graph request reset clears stale capture and scalar state" {
     var self: CudaCompute = undefined;
     self.ctx.debug_graph_capture_active = false;
+    self.generated_gqa_score_prework_templates = .empty;
     self.debug_cuda_graph_slots = [_]CudaGraphReplaySlot{.{}} ** max_cuda_graph_replay_slots;
     self.debug_cuda_graph_capture_active = true;
     self.debug_cuda_graph_capture_disabled = true;
@@ -6236,6 +7513,12 @@ test "CUDA request reset clears pinned temp slot ABI mappings" {
     defer self.temp_buffers.deinit(std.testing.allocator);
     self.temp_pinned_slots = .empty;
     defer self.temp_pinned_slots.deinit(std.testing.allocator);
+    self.temp_arena_planner = .{};
+    defer self.temp_arena_planner.deinit(std.testing.allocator);
+    self.debug_cuda_graph_slots = [_]CudaGraphReplaySlot{.{}} ** max_cuda_graph_replay_slots;
+    self.debug_cuda_graph_active_slot = null;
+    self.debug_cuda_graph_prepared_slot = null;
+    self.temp_arena_generation = 1;
     try self.temp_pinned_slots.append(std.testing.allocator, .{
         .buffer = .{ .ptr = 0x1000, .len = 64 },
         .requested_len = 64,
@@ -6249,6 +7532,7 @@ test "CUDA request reset clears pinned temp slot ABI mappings" {
     try resetTempPinnedSlotsForRequest(&self);
 
     try std.testing.expectEqual(@as(usize, 0), self.temp_trace_seq);
+    try std.testing.expectEqual(@as(u64, 2), self.temp_arena_generation);
     try std.testing.expectEqual(@as(usize, 2), self.temp_buffers.items.len);
     for (self.temp_pinned_slots.items) |slot| {
         try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), slot.buffer.ptr);
@@ -6315,6 +7599,10 @@ fn resetDebugCudaGraphRequestState(self: *CudaCompute) !void {
     self.debug_cuda_decode_scalars_auto_advance_blocked = false;
     self.debug_cuda_decode_scalars_upload_deferred = false;
     self.debug_cuda_graph_decode_kv_seq_len = 0;
+    self.debug_cuda_graph_capture_inhibit_once = false;
+    self.debug_cuda_graph_capture_temp_seq_begin = 0;
+    self.debug_cuda_graph_prepared_attention_topology = .{ 0, 0, 0 };
+    self.generated_gqa_score_prework_templates.clearRetainingCapacity();
     invalidateDebugFinalHiddenGraph(self);
 }
 
@@ -6323,29 +7611,128 @@ fn cudaGraphReplayKey(label: []const u8) u64 {
     return if (key == 0) 1 else key;
 }
 
-fn cudaGraphReplayKeyWithScheduleTag(label: []const u8, schedule_tag: u8) u64 {
-    if (schedule_tag == 0) return cudaGraphReplayKey(label);
-    const tag = [_]u8{schedule_tag};
-    const key = std.hash.Wyhash.hash(cudaGraphReplayKey(label), &tag);
+fn cudaGraphReplayKeyWithAttentionTopology(label: []const u8, topology: [3]u8) u64 {
+    if (topology[0] == 0 and topology[1] == 0 and topology[2] == 0) return cudaGraphReplayKey(label);
+    const key = std.hash.Wyhash.hash(cudaGraphReplayKey(label), &topology);
     return if (key == 0) 1 else key;
 }
 
-fn cudaGraphReplayKeyForDecodeSchedule(label: []const u8, kv_seq_len: usize) u64 {
-    // CUDA graph execs encode kernel topology. A threshold crossing or split
-    // schedule change must use another replay slot rather than updating a
-    // captured serial/2-way/4-way/8-way launch in place.
-    return cudaGraphReplayKeyWithScheduleTag(label, kernels_mod.generatedGqaDecodeScheduleTag(kv_seq_len));
+fn generatedGqaScorePreworkTemplateIdentity(
+    request: kernels_mod.GeneratedGqaScorePreworkRequest,
+) kernels_mod.GeneratedGqaScorePreworkRequest {
+    var identity = request;
+    identity.q_seq_len = 1;
+    identity.kv_seq_len = 1;
+    identity.mask_len = 0;
+    identity.block_count = @intFromBool(request.block_count != 0);
+    identity.physical_token_capacity = 1;
+    return identity;
+}
+
+fn noteGeneratedGqaScorePreworkTemplate(
+    self: *CudaCompute,
+    request: kernels_mod.GeneratedGqaScorePreworkRequest,
+) !void {
+    var decode_template = request;
+    decode_template.q_seq_len = 1;
+    decode_template.mask_len = 0;
+    const identity = generatedGqaScorePreworkTemplateIdentity(decode_template);
+    for (self.generated_gqa_score_prework_templates.items) |*existing| {
+        if (std.meta.eql(generatedGqaScorePreworkTemplateIdentity(existing.*), identity)) {
+            existing.* = decode_template;
+            return;
+        }
+    }
+    try self.generated_gqa_score_prework_templates.append(self.allocator, decode_template);
+}
+
+fn generatedGqaAttentionTopologyForConsumerMode(
+    templates: []const kernels_mod.GeneratedGqaScorePreworkRequest,
+    kv_seq_len: usize,
+    compute_major: i32,
+    compute_minor: i32,
+    score_prework_mode: kernels_mod.GeneratedGqaScorePreworkMode,
+    consumer_mode: kernels_mod.GeneratedGqaScorePreworkConsumerMode,
+) [3]u8 {
+    var score_route_mask: u8 = 0;
+    var score_consumer_mask: u8 = 0;
+    var every_policy_uses_score_prework = templates.len != 0;
+    for (templates) |template| {
+        var request = template;
+        request.q_seq_len = 1;
+        request.kv_seq_len = kv_seq_len;
+        request.mask_len = 0;
+        request.physical_token_capacity = @max(request.physical_token_capacity, kv_seq_len);
+        if (request.block_count != 0) {
+            if (request.page_size_tokens == 0) {
+                every_policy_uses_score_prework = false;
+                continue;
+            }
+            const rounded = std.math.add(usize, kv_seq_len, request.page_size_tokens - 1) catch {
+                every_policy_uses_score_prework = false;
+                continue;
+            };
+            request.block_count = rounded / request.page_size_tokens;
+        }
+        const route = kernels_mod.generatedGqaScorePreworkSelectionWithConsumerFor(
+            request,
+            score_prework_mode,
+            consumer_mode,
+            compute_major,
+            compute_minor,
+        ) orelse {
+            every_policy_uses_score_prework = false;
+            continue;
+        };
+        const shift: u3 = @intCast(@intFromEnum(route.route));
+        score_route_mask |= @as(u8, 1) << shift;
+        const consumer_shift: u3 = @intCast(@intFromEnum(route.consumer));
+        score_consumer_mask |= @as(u8, 1) << consumer_shift;
+    }
+
+    // Score-prework takes precedence over the split-summary launch only when
+    // every observed attention policy selects it. Mixed models retain both
+    // pieces of topology in the key.
+    const split_schedule_tag = if (every_policy_uses_score_prework)
+        0
+    else
+        kernels_mod.generatedGqaDecodeScheduleTag(kv_seq_len);
+    return .{ split_schedule_tag, score_route_mask, score_consumer_mask };
+}
+
+fn generatedGqaAttentionTopology(self: *const CudaCompute, kv_seq_len: usize) [3]u8 {
+    return generatedGqaAttentionTopologyForConsumerMode(
+        self.generated_gqa_score_prework_templates.items,
+        kv_seq_len,
+        self.ctx.info.compute_major,
+        self.ctx.info.compute_minor,
+        self.kernels.gqa_score_prework_mode,
+        self.kernels.gqa_score_prework_consumer_mode,
+    );
+}
+
+fn cudaGraphReplayKeyForDecodeSchedule(self: *const CudaCompute, label: []const u8, kv_seq_len: usize) u64 {
+    // CUDA graph execs encode launch topology. Both generated split schedules
+    // and exact score-prework routes can cross thresholds as KV grows.
+    return cudaGraphReplayKeyWithAttentionTopology(label, generatedGqaAttentionTopology(self, kv_seq_len));
 }
 
 test "CUDA graph replay key separates generated attention schedules" {
     const label = "gpt.final_hidden_decode";
     const base = cudaGraphReplayKey(label);
-    const serial = cudaGraphReplayKeyWithScheduleTag(label, @intFromEnum(kernels_mod.GeneratedGqaDecodeSchedule.serial));
-    const split2 = cudaGraphReplayKeyWithScheduleTag(label, @intFromEnum(kernels_mod.GeneratedGqaDecodeSchedule.split2));
-    const split4 = cudaGraphReplayKeyWithScheduleTag(label, @intFromEnum(kernels_mod.GeneratedGqaDecodeSchedule.split4));
-    const split8 = cudaGraphReplayKeyWithScheduleTag(label, @intFromEnum(kernels_mod.GeneratedGqaDecodeSchedule.split8));
+    const serial = cudaGraphReplayKeyWithAttentionTopology(label, .{ @intFromEnum(kernels_mod.GeneratedGqaDecodeSchedule.serial), 0, 0 });
+    const split2 = cudaGraphReplayKeyWithAttentionTopology(label, .{ @intFromEnum(kernels_mod.GeneratedGqaDecodeSchedule.split2), 0, 0 });
+    const split4 = cudaGraphReplayKeyWithAttentionTopology(label, .{ @intFromEnum(kernels_mod.GeneratedGqaDecodeSchedule.split4), 0, 0 });
+    const split8 = cudaGraphReplayKeyWithAttentionTopology(label, .{ @intFromEnum(kernels_mod.GeneratedGqaDecodeSchedule.split8), 0, 0 });
+    const local_route_mask = @as(u8, 1) << @intFromEnum(kernels_mod.GeneratedGqaScorePreworkRoute.gemma4_f16_local);
+    const global_route_mask = @as(u8, 1) << @intFromEnum(kernels_mod.GeneratedGqaScorePreworkRoute.gemma4_f16_global);
+    const serial_consumer_mask = @as(u8, 1) << @intFromEnum(kernels_mod.GeneratedGqaScorePreworkConsumer.serial);
+    const tiled64_consumer_mask = @as(u8, 1) << @intFromEnum(kernels_mod.GeneratedGqaScorePreworkConsumer.tiled64);
+    const score_local = cudaGraphReplayKeyWithAttentionTopology(label, .{ 0, local_route_mask, serial_consumer_mask });
+    const score_local_tiled64 = cudaGraphReplayKeyWithAttentionTopology(label, .{ 0, local_route_mask, tiled64_consumer_mask });
+    const score_global = cudaGraphReplayKeyWithAttentionTopology(label, .{ 0, global_route_mask, serial_consumer_mask });
 
-    try std.testing.expectEqual(base, cudaGraphReplayKeyWithScheduleTag(label, 0));
+    try std.testing.expectEqual(base, cudaGraphReplayKeyWithAttentionTopology(label, .{ 0, 0, 0 }));
     try std.testing.expect(base != serial);
     try std.testing.expect(base != split2);
     try std.testing.expect(base != split4);
@@ -6356,6 +7743,77 @@ test "CUDA graph replay key separates generated attention schedules" {
     try std.testing.expect(split2 != split4);
     try std.testing.expect(split2 != split8);
     try std.testing.expect(split4 != split8);
+    try std.testing.expect(score_local != score_global);
+    try std.testing.expect(score_local != score_local_tiled64);
+    try std.testing.expect(score_local != split8);
+    try std.testing.expect(score_global != split8);
+}
+
+test "CUDA graph topology retains score route and consumer masks" {
+    const local = kernels_mod.GeneratedGqaScorePreworkRequest{
+        .batch = 1,
+        .q_seq_len = 1,
+        .kv_seq_len = 512,
+        .num_heads = 8,
+        .num_kv_heads = 1,
+        .head_dim = 256,
+        .sliding_window = 512,
+        .mask_len = 0,
+        .bias_mode = 0,
+        .key_row_bytes = 512,
+        .base_key_row_bytes = 512,
+        .value_row_bytes = 512,
+        .block_count = 4,
+        .page_size_tokens = 128,
+        .format = 2,
+        .value_format = 2,
+        .physical_token_capacity = 512,
+    };
+    const global = kernels_mod.GeneratedGqaScorePreworkRequest{
+        .batch = 1,
+        .q_seq_len = 1,
+        .kv_seq_len = 512,
+        .num_heads = 8,
+        .num_kv_heads = 1,
+        .head_dim = 512,
+        .sliding_window = 0,
+        .mask_len = 0,
+        .bias_mode = 0,
+        .key_row_bytes = 1024,
+        .base_key_row_bytes = 1024,
+        .value_row_bytes = 1024,
+        .block_count = 4,
+        .page_size_tokens = 128,
+        .format = 2,
+        .value_format = 2,
+        .physical_token_capacity = 512,
+    };
+    var templates = [_]kernels_mod.GeneratedGqaScorePreworkRequest{ local, global };
+    const serial = generatedGqaAttentionTopologyForConsumerMode(&templates, 512, 8, 9, .automatic, .serial);
+    const tiled64 = generatedGqaAttentionTopologyForConsumerMode(&templates, 512, 8, 9, .automatic, .tiled64);
+    const route_mask = (@as(u8, 1) << @intFromEnum(kernels_mod.GeneratedGqaScorePreworkRoute.gemma4_f16_local)) |
+        (@as(u8, 1) << @intFromEnum(kernels_mod.GeneratedGqaScorePreworkRoute.gemma4_f16_global));
+    try std.testing.expectEqual(@as(u8, 0), serial[0]);
+    try std.testing.expectEqual(route_mask, serial[1]);
+    try std.testing.expectEqual(@as(u8, 1) << @intFromEnum(kernels_mod.GeneratedGqaScorePreworkConsumer.serial), serial[2]);
+    try std.testing.expectEqual(@as(u8, 0), tiled64[0]);
+    try std.testing.expectEqual(route_mask, tiled64[1]);
+    try std.testing.expectEqual(@as(u8, 1) << @intFromEnum(kernels_mod.GeneratedGqaScorePreworkConsumer.tiled64), tiled64[2]);
+    try std.testing.expect(!std.mem.eql(u8, &serial, &tiled64));
+
+    // A mixed qualified/unqualified set retains both consumer bits rather than
+    // collapsing to an aggregate score-prework topology.
+    templates[0].num_kv_heads = 2;
+    templates[0].key_row_bytes = 1024;
+    templates[0].base_key_row_bytes = 1024;
+    templates[0].value_row_bytes = 1024;
+    const mixed = generatedGqaAttentionTopologyForConsumerMode(&templates, 512, 8, 9, .automatic, .tiled64);
+    try std.testing.expectEqual(route_mask, mixed[1]);
+    try std.testing.expectEqual(
+        (@as(u8, 1) << @intFromEnum(kernels_mod.GeneratedGqaScorePreworkConsumer.serial)) |
+            (@as(u8, 1) << @intFromEnum(kernels_mod.GeneratedGqaScorePreworkConsumer.tiled64)),
+        mixed[2],
+    );
 }
 
 fn findCudaGraphReplaySlotForByteLen(self: *CudaCompute, replay_key: u64, byte_len: usize) usize {
@@ -6375,7 +7833,15 @@ fn findCudaGraphReplaySlotForByteLen(self: *CudaCompute, replay_key: u64, byte_l
 
 fn findExistingCudaGraphReplaySlotForByteLen(self: *CudaCompute, replay_key: u64, byte_len: usize) ?usize {
     for (&self.debug_cuda_graph_slots, 0..) |*slot, idx| {
-        if (slot.input_storage.ptr != 0 and slot.input_storage.len == byte_len and slot.replay_key == replay_key and slot.valid and slot.exec != null) return idx;
+        if (slot.input_storage.ptr != 0 and
+            slot.input_storage.len == byte_len and
+            slot.replay_key == replay_key and
+            slot.valid and
+            slot.exec != null and
+            slot.temp_arena_generation == self.temp_arena_generation)
+        {
+            return idx;
+        }
     }
     return null;
 }
@@ -6438,9 +7904,15 @@ fn ensureCudaGraphReplayAuxInputStorage(self: *CudaCompute, slot: *CudaGraphRepl
     }
 }
 
-fn debugCudaGraphPrepareFinalHiddenReplayInput(ctx: *anyopaque, label: []const u8, input: CT, kv_seq_len: usize) !?CT {
-    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+fn debugCudaGraphPrepareReplayInput(
+    self: *CudaCompute,
+    output_kind: CudaGraphReplayOutputKind,
+    label: []const u8,
+    input: CT,
+    kv_seq_len: usize,
+) !?CT {
     self.debug_cuda_graph_prepared_slot = null;
+    self.debug_cuda_graph_prepared_output_kind = .tensor;
     if (!cudaDebugGraphPersistentReplayEnabled()) return null;
     if (self.debug_cuda_graph_capture_active) return error.InvalidCudaState;
 
@@ -6450,14 +7922,37 @@ fn debugCudaGraphPrepareFinalHiddenReplayInput(ctx: *anyopaque, label: []const u
     if (byte_len == 0) return null;
     if (input_tensor.buffer.len < byte_len) return error.InvalidCudaState;
 
-    const capture_possible = cudaTempSlotPeriod() != 0 or cudaDebugGraphCaptureAllowUnpinned();
-    const replay_key = cudaGraphReplayKeyForDecodeSchedule(label, kv_seq_len);
+    // This is the decode-iteration boundary for graph-managed execution.
+    // Process it before arming the current replay slot: activating or
+    // invalidating a learned arena destroys stale graph metadata, including
+    // any prepared slot. Doing that later from decode-scalar preparation
+    // would disarm the operation currently being prepared, route its greedy
+    // result through an ordinary temporary, and perturb the very allocation
+    // ABI being validated.
+    try noteLearnedTempArenaBoundary(self);
+    // Admission denial permanently disables this learned planner. Do not keep
+    // paying the persistent-input D2D copy in automatic mode; returning null
+    // selects the ordinary eager input, while graph-required callers retain
+    // their existing `CudaGraphReplayRequired` failure at the architecture
+    // boundary.
+    if (self.temp_slot_config.autoplan_enabled and self.temp_arena_planner.disabled) return null;
+
+    const capture_possible = self.temp_slot_config.configured_period != 0 or
+        self.temp_slot_config.autoplan_enabled or
+        cudaDebugGraphCaptureAllowUnpinned();
+    const attention_topology = generatedGqaAttentionTopology(self, kv_seq_len);
+    self.debug_cuda_graph_prepared_attention_topology = attention_topology;
+    const replay_key = cudaGraphReplayKeyForDecodeSchedule(self, label, kv_seq_len);
     const slot_idx = if (capture_possible)
         findCudaGraphReplaySlotForByteLen(self, replay_key, byte_len)
     else
         findExistingCudaGraphReplaySlotForByteLen(self, replay_key, byte_len) orelse return null;
     self.debug_cuda_graph_prepared_slot = slot_idx;
+    self.debug_cuda_graph_prepared_output_kind = output_kind;
     const slot = &self.debug_cuda_graph_slots[slot_idx];
+    if (slot.exec != null and slot.temp_arena_generation != self.temp_arena_generation) {
+        resetCudaGraphReplaySlotMetadata(self, slot);
+    }
     try ensureCudaGraphReplaySlotStorage(self, slot, byte_len);
     if (slot.replay_key != replay_key) {
         resetCudaGraphReplaySlotMetadata(self, slot);
@@ -6478,6 +7973,16 @@ fn debugCudaGraphPrepareFinalHiddenReplayInput(ctx: *anyopaque, label: []const u
         .owns_buffer = false,
     };
     return tensor;
+}
+
+fn debugCudaGraphPrepareFinalHiddenReplayInput(ctx: *anyopaque, label: []const u8, input: CT, kv_seq_len: usize) !?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    return debugCudaGraphPrepareReplayInput(self, .tensor, label, input, kv_seq_len);
+}
+
+fn debugCudaGraphPrepareGreedyTokenReplayInput(ctx: *anyopaque, label: []const u8, input: CT, kv_seq_len: usize) !?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    return debugCudaGraphPrepareReplayInput(self, .greedy_token, label, input, kv_seq_len);
 }
 
 fn debugCudaGraphPrepareFinalHiddenReplayAuxInput(ctx: *anyopaque, input: CT) !?CT {
@@ -6563,7 +8068,9 @@ fn debugCudaGraphRegisterFinalHiddenReplayBoundary(ctx: *anyopaque, input: CT, o
     const byte_len = try checkedMul(output_tensor.elem_count, output_tensor.dtype.byteSize());
     if (byte_len == 0) return error.InvalidTensorShape;
     if (slot.output_storage.ptr == 0 or slot.output_storage.len < byte_len) return error.InvalidCudaState;
-    try self.kernels.launchCopyBytes(&self.ctx, slot.output_storage, output_tensor.buffer, byte_len);
+    if (slot.output_storage.ptr != output_tensor.buffer.ptr) {
+        try self.kernels.launchCopyBytes(&self.ctx, slot.output_storage, output_tensor.buffer, byte_len);
+    }
 
     const shape = try dupeShape(self.allocator, output_tensor.shape);
     errdefer self.allocator.free(shape);
@@ -6572,7 +8079,7 @@ fn debugCudaGraphRegisterFinalHiddenReplayBoundary(ctx: *anyopaque, input: CT, o
         self.allocator.free(old_shape);
     }
     slot.shape = shape;
-    slot.output = slot.output_storage;
+    slot.output = .{ .ptr = slot.output_storage.ptr, .len = byte_len };
     slot.elem_count = output_tensor.elem_count;
     slot.dtype = output_tensor.dtype;
     slot.valid = true;
@@ -6589,6 +8096,34 @@ fn debugCudaGraphRegisterFinalHiddenReplayBoundary(ctx: *anyopaque, input: CT, o
             output_tensor.shape,
         });
     }
+}
+
+fn cudaGraphReplayArenaReady(self: *CudaCompute, slot: *const CudaGraphReplaySlot) bool {
+    if (slot.temp_arena_generation == 0 or slot.temp_arena_generation != self.temp_arena_generation) return false;
+    if (self.temp_slot_config.autoplan_enabled) {
+        while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.temp_buffer_mutex.unlock();
+        return self.temp_arena_planner.canGraphReplay(
+            self.temp_trace_seq,
+            slot.captured_temp_allocation_count,
+        );
+    }
+    return true;
+}
+
+fn noteCapturedTempAllocationsReplayed(self: *CudaCompute, allocation_count: usize) !void {
+    // Host allocation calls inside the graph do not run during replay. Advance
+    // the logical sequence and reconstruct their learned lengths so uncaptured
+    // tail work maps to the same pinned slots and the complete iteration is
+    // validated at its next boundary.
+    while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer self.temp_buffer_mutex.unlock();
+    if (self.temp_slot_config.autoplan_enabled and
+        !self.temp_arena_planner.markGraphReplay(self.temp_trace_seq, allocation_count))
+    {
+        return error.InvalidCudaState;
+    }
+    self.temp_trace_seq +%= allocation_count;
 }
 
 fn debugCudaGraphReplayFinalHidden(ctx: *anyopaque, input: CT) !?CT {
@@ -6608,6 +8143,21 @@ fn debugCudaGraphReplayFinalHidden(ctx: *anyopaque, input: CT) !?CT {
         return null;
     };
     if (!slot.valid) {
+        try flushDeferredDecodeScalarUpload(self);
+        return null;
+    }
+    if (!cudaGraphReplayArenaReady(self, slot)) {
+        if (slot.temp_arena_generation != self.temp_arena_generation) {
+            std.log.warn("cuda_graph_capture_probe: stale_temp_arena_generation slot={d} captured={d} current={d}", .{
+                slot_idx,
+                slot.temp_arena_generation,
+                self.temp_arena_generation,
+            });
+        }
+        // A phase/count mismatch is just as unsafe as a stale arena
+        // generation: never retain an exec whose captured addresses cannot be
+        // proven against the current request's allocation ABI.
+        resetCudaGraphReplaySlotMetadata(self, slot);
         try flushDeferredDecodeScalarUpload(self);
         return null;
     }
@@ -6668,6 +8218,8 @@ fn debugCudaGraphReplayFinalHidden(ctx: *anyopaque, input: CT) !?CT {
     var profile_scope = beginDecodeProfile(self, .graph_replay, 1);
     defer if (profile_scope) |*scope| scope.end();
     try self.ctx.launchGraph(exec);
+    self.debug_cuda_graph_prepared_output_kind = .tensor;
+    try noteCapturedTempAllocationsReplayed(self, slot.captured_temp_allocation_count);
     if (slot.decode_scalars_auto_advance) markDecodeScalarsDeviceMatchesHost(self);
     self.stats.cuda_graph_capture_replays += 1;
     self.stats.cuda_graph_capture_persistent_replays += 1;
@@ -6709,6 +8261,18 @@ fn debugCudaGraphReplayFinalHiddenDiscard(ctx: *anyopaque, input: CT) !bool {
         return false;
     };
     if (!slot.valid) {
+        try flushDeferredDecodeScalarUpload(self);
+        return false;
+    }
+    if (!cudaGraphReplayArenaReady(self, slot)) {
+        if (slot.temp_arena_generation != self.temp_arena_generation) {
+            std.log.warn("cuda_graph_capture_probe: stale_temp_arena_generation slot={d} captured={d} current={d}", .{
+                slot_idx,
+                slot.temp_arena_generation,
+                self.temp_arena_generation,
+            });
+        }
+        resetCudaGraphReplaySlotMetadata(self, slot);
         try flushDeferredDecodeScalarUpload(self);
         return false;
     }
@@ -6764,6 +8328,8 @@ fn debugCudaGraphReplayFinalHiddenDiscard(ctx: *anyopaque, input: CT) !bool {
     var profile_scope = beginDecodeProfile(self, .graph_replay, 1);
     defer if (profile_scope) |*scope| scope.end();
     try self.ctx.launchGraph(exec);
+    self.debug_cuda_graph_prepared_output_kind = .tensor;
+    try noteCapturedTempAllocationsReplayed(self, slot.captured_temp_allocation_count);
     if (slot.decode_scalars_auto_advance) markDecodeScalarsDeviceMatchesHost(self);
     self.stats.cuda_graph_capture_replays += 1;
     self.stats.cuda_graph_capture_persistent_replays += 1;
@@ -6838,30 +8404,68 @@ fn debugCudaGraphCaptureEnd(ctx: *anyopaque, replay: bool) !void {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (!self.debug_cuda_graph_capture_active) return;
     const slot_idx = self.debug_cuda_graph_active_slot orelse 0;
-    const capture_was_disabled = self.debug_cuda_graph_capture_disabled;
-    var capture_committed = false;
+    const capture_sequence_valid = self.temp_trace_seq >= self.debug_cuda_graph_capture_temp_seq_begin;
+    const captured_temp_allocation_count = if (capture_sequence_valid)
+        self.temp_trace_seq - self.debug_cuda_graph_capture_temp_seq_begin
+    else
+        0;
+    const captured_attention_topology = generatedGqaAttentionTopology(self, self.debug_cuda_graph_decode_kv_seq_len);
+    const attention_topology_stable = std.mem.eql(
+        u8,
+        &self.debug_cuda_graph_prepared_attention_topology,
+        &captured_attention_topology,
+    );
+    const capture_was_disabled = self.debug_cuda_graph_capture_disabled or
+        !capture_sequence_valid or
+        !attention_topology_stable;
+    if (!attention_topology_stable) {
+        std.log.warn("cuda_graph_capture_probe: attention_topology_changed prepared={any} captured={any} disabled=1", .{
+            self.debug_cuda_graph_prepared_attention_topology,
+            captured_attention_topology,
+        });
+    }
+    var capture_executed = false;
+    var capture_cached = false;
     defer {
         clearDebugCudaGraphCaptureState(self);
-        if (!capture_committed) {
+        if (!capture_cached) {
             resetCudaGraphReplaySlotMetadata(self, &self.debug_cuda_graph_slots[slot_idx]);
+        }
+        if (!capture_executed) {
             restoreDebugCudaGraphDecodeScalars(self, slot_idx);
         }
     }
 
     const graph = self.ctx.endStreamCapture() catch |err| {
         self.stats.cuda_graph_capture_discards += 1;
-        if (capture_was_disabled) return;
+        // A caller requesting replay relies on this function to execute the
+        // captured work. Never report success after end-capture failed: doing
+        // so would expose an uninitialized/stale output tensor.
+        if (!replay and capture_was_disabled) return;
         return err;
     };
     defer self.ctx.destroyGraph(graph);
-    if (replay and !capture_was_disabled) {
-        if (cudaDebugGraphPersistentReplayEnabled() or cudaDebugGraphCaptureUpdateExecEnabled()) {
-            try replayCapturedDebugGraphWithUpdate(self, slot_idx, graph);
+    if (replay) {
+        if (!capture_was_disabled) {
+            const slot = &self.debug_cuda_graph_slots[slot_idx];
+            if (cudaDebugGraphPersistentReplayEnabled() or cudaDebugGraphCaptureUpdateExecEnabled()) {
+                slot.temp_arena_generation = self.temp_arena_generation;
+                slot.captured_temp_allocation_count = captured_temp_allocation_count;
+                try replayCapturedDebugGraphWithUpdate(self, slot_idx, graph);
+                capture_cached = true;
+            } else {
+                try replayCapturedDebugGraphOneShot(self, graph);
+            }
         } else {
+            // Topology or arena validation can make a graph unsafe to retain,
+            // but stream capture deferred all of its work. Execute it exactly
+            // once before discarding its metadata so the caller still receives
+            // the output it requested.
             try replayCapturedDebugGraphOneShot(self, graph);
+            self.stats.cuda_graph_capture_discards += 1;
         }
         markDecodeScalarsDeviceMatchesHost(self);
-        capture_committed = true;
+        capture_executed = true;
     } else {
         self.stats.cuda_graph_capture_discards += 1;
         if (cudaDebugGraphCaptureProbeTraceEnabled()) {
@@ -7151,6 +8755,28 @@ fn createTensorWithDType(
         .shape = shape,
         .elem_count = elem_count,
     };
+    return tensor;
+}
+
+fn createI32ScalarTensorFromLease(self: *CudaCompute, lease: *DeviceBufferLease) !CT {
+    if (lease.prepared_greedy_slot) |slot_idx| {
+        if (self.debug_cuda_graph_prepared_output_kind != .greedy_token or
+            self.debug_cuda_graph_prepared_slot != slot_idx or
+            self.debug_cuda_graph_slots[slot_idx].output_storage.ptr != lease.buffer.ptr)
+        {
+            return error.InvalidCudaState;
+        }
+    }
+    const shape = try self.allocator.alloc(i64, 1);
+    errdefer self.allocator.free(shape);
+    shape[0] = 1;
+    const tensor = try createTensorWithDType(self, lease.buffer, shape, 1, .i32);
+    tensorFromCt(tensor).owns_buffer = lease.owns_buffer;
+    if (lease.prepared_greedy_slot != null) {
+        self.debug_cuda_graph_prepared_output_kind = .tensor;
+    }
+    lease.owns_buffer = false;
+    lease.prepared_greedy_slot = null;
     return tensor;
 }
 
@@ -9257,7 +10883,7 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
     errdefer device.free(&self.ctx);
     var prefill_profile_scope = beginPrefillProfile(self, prefillProfileCategoryForLinearNoBias(weight_tensor, rows, in_dim, out_dim), rows);
     defer if (prefill_profile_scope) |*scope| scope.end();
-    if (weightBf16MirrorForRows(weight_tensor, rows)) |mirror_buffer| {
+    if (weightBf16MirrorForRows(self, weight_tensor, rows)) |mirror_buffer| {
         if (try tryCublasLtBf16Linear(self, device, input_tensor, mirror_buffer, rows, in_dim, out_dim)) {
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .bf16, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
         } else {
@@ -9307,26 +10933,66 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
                     self.dispatch_stats.note(self.allocator, .linear_no_bias, .q8_0, .q8_simt, .none, tcUnavailableReason(), rows, in_dim, out_dim, 0);
                 },
                 .Q4_0 => {
+                    var route = CudaQ4KernelLaunch{
+                        .kernel_id = "termite_linear_q4_0_f32",
+                        .grid = .{ (rows * out_dim + 255) / 256, 1, 1 },
+                        .block = .{ 256, 1, 1 },
+                    };
                     if (try tryLaunchLinearQ4_0Q8_1Dp4a(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
-                        // Prototype path is still reported as the Q4_0 SIMT backend until it proves out.
+                        route = if (cudaQ4_0LinearQ8_1Tile8Enabled()) .{
+                            .kernel_id = "termite_linear_q4_0_q8_1_f32_tile8",
+                            .grid = .{ (out_dim + 7) / 8, rows, 1 },
+                            .block = .{ 128, 1, 1 },
+                        } else if (cudaQ4_0LinearQ8_1Tile4W8Enabled(in_dim)) .{
+                            .kernel_id = "termite_linear_q4_0_q8_1_f32_tile4_w8",
+                            .grid = .{ (out_dim + 3) / 4, rows, 1 },
+                            .block = .{ 256, 1, 1 },
+                        } else .{
+                            .kernel_id = "termite_linear_q4_0_q8_1_f32_tile4",
+                            .grid = .{ (out_dim + 3) / 4, rows, 1 },
+                            .block = .{ 128, 1, 1 },
+                        };
                     } else if (rows == 1 and cudaQ4_0LinearTile8Enabled()) {
                         self.kernels.launchLinearQ4_0Tile8F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tile8_err| switch (tile8_err) {
                             error.CudaKernelUnavailable, error.InvalidCudaState => {
                                 if (cudaQ4_0LinearTile4W4Enabled()) {
                                     self.kernels.launchLinearQ4_0Tile4W4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tile4w4_err| switch (tile4w4_err) {
-                                        error.CudaKernelUnavailable, error.InvalidCudaState => try launchLinearQ4_0Tile4ThenBaseF32(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
+                                        error.CudaKernelUnavailable, error.InvalidCudaState => {
+                                            route = try launchLinearQ4_0Tile4ThenBaseF32(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                                            route.provider = .fallback;
+                                        },
                                         else => return tile4w4_err,
                                     };
+                                    if (route.provider == .handwritten and std.mem.eql(u8, route.kernel_id, "termite_linear_q4_0_f32")) route = .{
+                                        .provider = .fallback,
+                                        .kernel_id = "termite_linear_q4_0_f32_tile4_w4",
+                                        .grid = .{ (out_dim + 3) / 4, rows, 1 },
+                                        .block = .{ 128, 1, 1 },
+                                    };
                                 } else {
-                                    try launchLinearQ4_0Tile4ThenBaseF32(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                                    route = try launchLinearQ4_0Tile4ThenBaseF32(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                                    route.provider = .fallback;
                                 }
                             },
                             else => return tile8_err,
                         };
+                        if (route.provider == .handwritten and std.mem.eql(u8, route.kernel_id, "termite_linear_q4_0_f32")) route = .{
+                            .kernel_id = "termite_linear_q4_0_f32_tile8",
+                            .grid = .{ (out_dim + 7) / 8, rows, 1 },
+                            .block = .{ 256, 1, 1 },
+                        };
                     } else if (rows == 1 and cudaQ4_0LinearTile4W4Enabled()) {
                         self.kernels.launchLinearQ4_0Tile4W4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tile4w4_err| switch (tile4w4_err) {
-                            error.CudaKernelUnavailable, error.InvalidCudaState => try launchLinearQ4_0Tile4ThenBaseF32(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
+                            error.CudaKernelUnavailable, error.InvalidCudaState => {
+                                route = try launchLinearQ4_0Tile4ThenBaseF32(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                                route.provider = .fallback;
+                            },
                             else => return tile4w4_err,
+                        };
+                        if (route.provider == .handwritten and std.mem.eql(u8, route.kernel_id, "termite_linear_q4_0_f32")) route = .{
+                            .kernel_id = "termite_linear_q4_0_f32_tile4_w4",
+                            .grid = .{ (out_dim + 3) / 4, rows, 1 },
+                            .block = .{ 128, 1, 1 },
                         };
                     } else if (rows == 1 and self.generated_q4_0_gates.mmv and
                         runtimeJitShapeAllowsForCompute(self, .mmv, rows, in_dim, out_dim) and
@@ -9338,15 +11004,22 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
                     {
                         if (self.kernels.launchLinearQ4_0GeneratedMmvF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
                             self.stats.q4_0_generated_mmv_hits += 1;
+                            route = .{
+                                .provider = .generated,
+                                .kernel_id = quant_kernel_compiler.first_general_cuda_q4_0_mmv_kernel_id,
+                                .grid = .{ (out_dim + 3) / 4, 1, 1 },
+                                .block = .{ 256, 1, 1 },
+                            };
                         } else |generated_err| switch (generated_err) {
                             error.CudaKernelUnavailable, error.InvalidCudaState => {
                                 self.stats.q4_0_generated_mmv_fallbacks += 1;
-                                try launchLinearQ4_0Tile4ThenBaseF32(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                                route = try launchLinearQ4_0Tile4ThenBaseF32(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                                route.provider = .fallback;
                             },
                             else => return generated_err,
                         }
                     } else if (rows == 1) {
-                        try launchLinearQ4_0Tile4ThenBaseF32(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                        route = try launchLinearQ4_0Tile4ThenBaseF32(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
                     } else if (rows >= 9 and rows <= 64 and self.generated_q4_0_gates.mm and
                         runtimeJitShapeAllowsForCompute(self, .mm, rows, in_dim, out_dim) and
                         quant_kernel_compiler.generatedArtifactSupportsPlan(
@@ -9357,16 +11030,36 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
                     {
                         if (self.kernels.launchLinearQ4_0GeneratedMmF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
                             self.stats.q4_0_generated_mm_hits += 1;
+                            route = .{
+                                .provider = .generated,
+                                .kernel_id = quant_kernel_compiler.first_general_cuda_q4_0_mm_kernel_id,
+                                .grid = .{ (out_dim + 3) / 4, (rows + 7) / 8, 1 },
+                                .block = .{ 256, 1, 1 },
+                            };
                         } else |generated_err| switch (generated_err) {
                             error.CudaKernelUnavailable, error.InvalidCudaState => {
                                 self.stats.q4_0_generated_mm_fallbacks += 1;
                                 try self.kernels.launchLinearQ4_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                                route.provider = .fallback;
                             },
                             else => return generated_err,
                         }
                     } else {
                         try self.kernels.launchLinearQ4_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
                     }
+                    noteQ4Route(
+                        self,
+                        self.q4_route_op_override orelse q4LinearRouteOp(out_dim),
+                        rows,
+                        in_dim,
+                        out_dim,
+                        .single,
+                        .none,
+                        route.provider,
+                        route.kernel_id,
+                        route.grid,
+                        route.block,
+                    );
                     self.dispatch_stats.note(self.allocator, .linear_no_bias, .q4_0, .q4_simt, .none, tcUnavailableReason(), rows, in_dim, out_dim, 0);
                 },
                 .Q4_K => if (mxbaiQ4TiledVariant(rows, in_dim, out_dim)) |variant| {
@@ -9459,6 +11152,22 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
     }
     self.stats.launch_linear += 1;
     return createTensor(self, device, shape, out_count);
+}
+
+fn linearNoBiasForQ4Route(
+    ctx: *anyopaque,
+    route_op: CudaQ4RouteOp,
+    input: CT,
+    weight: CT,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const previous = self.q4_route_op_override;
+    self.q4_route_op_override = route_op;
+    defer self.q4_route_op_override = previous;
+    return linearNoBias(ctx, input, weight, rows, in_dim, out_dim);
 }
 
 fn linearNoBiasPlanned(ctx: *anyopaque, request: *const ops.LinearNoBiasPlannedRequest) anyerror!CT {
@@ -9623,7 +11332,7 @@ fn tryLinearQ4_0Q8_1ArgmaxE2BDevice(
     in_dim: usize,
     out_dim: usize,
     suppress_token_ids: []const i32,
-) !?buffer_mod.DeviceBuffer {
+) !?DeviceBufferLease {
     if (!kernels_mod.linearQ4_0Q8_1ArgmaxE2BShapeEligible(rows, in_dim, out_dim)) {
         if (cudaLazyProfileEnabled()) std.log.err(
             "cuda_lm_argmax_rows_unsupported: reason=q4_0_q8_1_shape rows={d} in_dim={d} out_dim={d}",
@@ -9687,12 +11396,15 @@ fn tryLinearQ4_0Q8_1ArgmaxE2BDevice(
         };
     }
 
-    var token_device = (try allocQ4_0Q8_1ArgmaxTemp(self, @sizeOf(u32))) orelse {
-        noteQ4_0Q8_1ArgmaxFallback(self, "capture_unsafe_token_temp", rows, in_dim, out_dim);
-        return null;
+    var token_device = allocGreedyTokenDeviceBuffer(self, @sizeOf(u32)) catch |err| switch (err) {
+        error.CudaGraphCaptureUnsafeTempAlloc => {
+            noteQ4_0Q8_1ArgmaxFallback(self, "capture_unsafe_token_temp", rows, in_dim, out_dim);
+            return null;
+        },
+        else => return err,
     };
     var token_device_transferred = false;
-    defer if (!token_device_transferred) releaseDeviceBuffer(self, &token_device);
+    defer if (!token_device_transferred) releaseDeviceBufferLease(self, &token_device);
 
     self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input_tensor.buffer, rows, in_dim) catch |err| switch (err) {
         error.CudaKernelUnavailable => {
@@ -9703,7 +11415,7 @@ fn tryLinearQ4_0Q8_1ArgmaxE2BDevice(
     };
     self.kernels.launchLinearQ4_0Q8_1ArgmaxRowsTile8E2B(
         &self.ctx,
-        token_device,
+        token_device.buffer,
         partial_values,
         partial_indices,
         q8_input,
@@ -9720,6 +11432,20 @@ fn tryLinearQ4_0Q8_1ArgmaxE2BDevice(
         },
         else => return err,
     };
+
+    noteQ4Route(
+        self,
+        .lm_head,
+        rows,
+        in_dim,
+        out_dim,
+        .single,
+        .none,
+        .generated,
+        quant_kernel_compiler.first_e2b_cuda_q4_0_q8_1_argmax_kernel_id,
+        .{ rows * ((out_dim + 7) / 8), 1, 1 },
+        .{ 96, 1, 1 },
+    );
 
     self.stats.lm_head_argmax_fused_q4_0_q8_1 += 1;
     self.stats.launch_linear += 1;
@@ -9774,17 +11500,10 @@ fn linearNoBiasArgmaxLastRowSuppressTensor(ctx: *anyopaque, input: CT, weight: C
                 }
             }
             if (!cudaQ4_0LmHeadArgmaxEnabled() or rows != 1) return null;
-            break :candidate (try linearNoBiasArgmaxRowsSuppressDevice(ctx, input, weight, rows, in_dim, out_dim, suppress_token_ids)) orelse return null;
+            break :candidate (try linearNoBiasArgmaxRowsSuppressDevice(ctx, input, weight, rows, in_dim, out_dim, suppress_token_ids, true)) orelse return null;
         };
-        var token_device_owned = false;
-        errdefer if (!token_device_owned) releaseDeviceBuffer(self, &token_device);
-
-        const shape = try self.allocator.alloc(i64, 1);
-        errdefer self.allocator.free(shape);
-        shape[0] = 1;
-        const token_tensor = try createTensorWithDType(self, token_device, shape, 1, .i32);
-        token_device_owned = true;
-        return token_tensor;
+        errdefer releaseDeviceBufferLease(self, &token_device);
+        return createI32ScalarTensorFromLease(self, &token_device);
     }
     if (use_q6) {
         var last_row_shape = [_]i64{ 1, @intCast(in_dim) };
@@ -9806,16 +11525,9 @@ fn linearNoBiasArgmaxLastRowSuppressTensor(ctx: *anyopaque, input: CT, weight: C
             last_row_tensor.owned_by_tensor = false;
             break :blk @ptrCast(&last_row_tensor);
         };
-        var token_device = (try linearNoBiasArgmaxRowsSuppressDevice(ctx, argmax_input, weight, 1, in_dim, out_dim, suppress_token_ids)) orelse return null;
-        var token_device_owned = false;
-        errdefer if (!token_device_owned) releaseDeviceBuffer(self, &token_device);
-
-        const shape = try self.allocator.alloc(i64, 1);
-        errdefer self.allocator.free(shape);
-        shape[0] = 1;
-        const token_tensor = try createTensorWithDType(self, token_device, shape, 1, .i32);
-        token_device_owned = true;
-        return token_tensor;
+        var token_device = (try linearNoBiasArgmaxRowsSuppressDevice(ctx, argmax_input, weight, 1, in_dim, out_dim, suppress_token_ids, true)) orelse return null;
+        errdefer releaseDeviceBufferLease(self, &token_device);
+        return createI32ScalarTensorFromLease(self, &token_device);
     }
 
     if (suppressedArgmaxRequiresEagerRetry(self.debug_cuda_graph_capture_active, suppress_token_ids.len)) {
@@ -9836,14 +11548,13 @@ fn linearNoBiasArgmaxLastRowSuppressTensor(ctx: *anyopaque, input: CT, weight: C
         try copyFromHostTracked(self, suppress_device, std.mem.sliceAsBytes(suppress_token_ids));
     }
 
-    var token_device = try allocDeviceBuffer(self, @sizeOf(i32));
-    var token_device_owned = false;
-    errdefer if (!token_device_owned) releaseDeviceBuffer(self, &token_device);
+    var token_device = try allocGreedyTokenDeviceBuffer(self, @sizeOf(i32));
+    errdefer releaseDeviceBufferLease(self, &token_device);
 
     if (use_q8) {
         self.kernels.launchLinearQ8_0ArgmaxTile4F32(
             &self.ctx,
-            token_device,
+            token_device.buffer,
             partial_values,
             partial_indices,
             input_tensor.buffer,
@@ -9857,8 +11568,7 @@ fn linearNoBiasArgmaxLastRowSuppressTensor(ctx: *anyopaque, input: CT, weight: C
             error.CudaKernelUnavailable, error.InvalidCudaState => {
                 if (cudaLazyProfileEnabled()) std.log.err("cuda_lm_argmax_rows_unsupported: reason=q8_kernel err={s} rows={d} in_dim={d} out_dim={d}", .{ @errorName(err), rows, in_dim, out_dim });
                 self.stats.lm_head_argmax_fallbacks += 1;
-                releaseDeviceBuffer(self, &token_device);
-                token_device_owned = true;
+                releaseDeviceBufferLease(self, &token_device);
                 return null;
             },
             else => return err,
@@ -9867,7 +11577,7 @@ fn linearNoBiasArgmaxLastRowSuppressTensor(ctx: *anyopaque, input: CT, weight: C
     } else {
         self.kernels.launchLinearQ4KArgmaxTile4F32(
             &self.ctx,
-            token_device,
+            token_device.buffer,
             partial_values,
             partial_indices,
             input_tensor.buffer,
@@ -9881,8 +11591,7 @@ fn linearNoBiasArgmaxLastRowSuppressTensor(ctx: *anyopaque, input: CT, weight: C
             error.CudaKernelUnavailable, error.InvalidCudaState => {
                 if (cudaLazyProfileEnabled()) std.log.err("cuda_lm_argmax_rows_unsupported: reason=q4_0_kernel err={s} rows={d} in_dim={d} out_dim={d}", .{ @errorName(err), rows, in_dim, out_dim });
                 self.stats.lm_head_argmax_fallbacks += 1;
-                releaseDeviceBuffer(self, &token_device);
-                token_device_owned = true;
+                releaseDeviceBufferLease(self, &token_device);
                 return null;
             },
             else => return err,
@@ -9892,12 +11601,7 @@ fn linearNoBiasArgmaxLastRowSuppressTensor(ctx: *anyopaque, input: CT, weight: C
 
     self.stats.launch_linear += 1;
     self.stats.launch_argmax += 1;
-    const shape = try self.allocator.alloc(i64, 1);
-    errdefer self.allocator.free(shape);
-    shape[0] = 1;
-    const token_tensor = try createTensorWithDType(self, token_device, shape, 1, .i32);
-    token_device_owned = true;
-    return token_tensor;
+    return createI32ScalarTensorFromLease(self, &token_device);
 }
 
 fn linearNoBiasArgmaxRowsSuppressDevice(
@@ -9908,7 +11612,8 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
     in_dim: usize,
     out_dim: usize,
     suppress_token_ids: []const i32,
-) anyerror!?buffer_mod.DeviceBuffer {
+    allow_prepared_greedy_output: bool,
+) anyerror!?DeviceBufferLease {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
     const weight_tensor = tensorFromCt(weight);
@@ -9970,14 +11675,20 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
         try copyFromHostTracked(self, suppress_device, std.mem.sliceAsBytes(suppress_token_ids));
     }
 
-    var token_device = try allocDeviceBuffer(self, try checkedMul(rows, @sizeOf(u32)));
-    var token_device_owned = false;
-    errdefer if (!token_device_owned) releaseDeviceBuffer(self, &token_device);
+    var token_device = if (rows == 1 and allow_prepared_greedy_output)
+        try allocGreedyTokenDeviceBuffer(self, @sizeOf(u32))
+    else
+        DeviceBufferLease{
+            .buffer = try allocDeviceBuffer(self, try checkedMul(rows, @sizeOf(u32))),
+            .owns_buffer = true,
+        };
+    var token_device_transferred = false;
+    defer if (!token_device_transferred) releaseDeviceBufferLease(self, &token_device);
 
     if (use_q8) {
         self.kernels.launchLinearQ8_0ArgmaxRowsTile4F32(
             &self.ctx,
-            token_device,
+            token_device.buffer,
             partial_values,
             partial_indices,
             input_tensor.buffer,
@@ -9991,8 +11702,6 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
             error.CudaKernelUnavailable, error.InvalidCudaState => {
                 std.log.err("cuda_lm_argmax_rows_unsupported: reason=q8_kernel err={s} rows={d} in_dim={d} out_dim={d}", .{ @errorName(err), rows, in_dim, out_dim });
                 self.stats.lm_head_argmax_fallbacks += 1;
-                releaseDeviceBuffer(self, &token_device);
-                token_device_owned = true;
                 return null;
             },
             else => return err,
@@ -10003,7 +11712,7 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
             if (!cudaQ4_0LmHeadTile16Enabled()) break :blk false;
             self.kernels.launchLinearQ4_0ArgmaxRowsTile16F32(
                 &self.ctx,
-                token_device,
+                token_device.buffer,
                 partial_values,
                 partial_indices,
                 input_tensor.buffer,
@@ -10022,7 +11731,7 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
         if (!launched_tile16) {
             self.kernels.launchLinearQ4_0ArgmaxRowsTile4F32(
                 &self.ctx,
-                token_device,
+                token_device.buffer,
                 partial_values,
                 partial_indices,
                 input_tensor.buffer,
@@ -10036,18 +11745,32 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
                 error.CudaKernelUnavailable, error.InvalidCudaState => {
                     std.log.err("cuda_lm_argmax_rows_unsupported: reason=q4_0_kernel err={s} rows={d} in_dim={d} out_dim={d}", .{ @errorName(err), rows, in_dim, out_dim });
                     self.stats.lm_head_argmax_fallbacks += 1;
-                    releaseDeviceBuffer(self, &token_device);
-                    token_device_owned = true;
                     return null;
                 },
                 else => return err,
             };
         }
+        noteQ4Route(
+            self,
+            .lm_head,
+            rows,
+            in_dim,
+            out_dim,
+            .single,
+            .none,
+            .handwritten,
+            if (launched_tile16)
+                "termite_linear_q4_0_argmax_rows_stage1_tile16"
+            else
+                "termite_linear_q4_0_argmax_rows_stage1_tile4",
+            .{ rows * ((out_dim + (if (launched_tile16) @as(usize, 15) else 3)) / (if (launched_tile16) @as(usize, 16) else 4)), 1, 1 },
+            .{ 256, 1, 1 },
+        );
         self.stats.lm_head_argmax_fused_q4_0 += 1;
     } else if (use_q4) {
         self.kernels.launchLinearQ4KArgmaxRowsTile4F32(
             &self.ctx,
-            token_device,
+            token_device.buffer,
             partial_values,
             partial_indices,
             input_tensor.buffer,
@@ -10061,8 +11784,6 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
             error.CudaKernelUnavailable, error.InvalidCudaState => {
                 std.log.err("cuda_lm_argmax_rows_unsupported: reason=q4k_kernel err={s} rows={d} in_dim={d} out_dim={d}", .{ @errorName(err), rows, in_dim, out_dim });
                 self.stats.lm_head_argmax_fallbacks += 1;
-                releaseDeviceBuffer(self, &token_device);
-                token_device_owned = true;
                 return null;
             },
             else => return err,
@@ -10099,7 +11820,7 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
             const launched_generated = if (generated_q8_1_candidate) generated: {
                 self.kernels.launchLinearQ6KQ8_1GeneratedArgmaxRowsTile8F32(
                     &self.ctx,
-                    token_device,
+                    token_device.buffer,
                     partial_values,
                     partial_indices,
                     q8_input,
@@ -10120,7 +11841,7 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
             if (!launched_generated) {
                 self.kernels.launchLinearQ6KQ8_1ArgmaxRowsTile8F32(
                     &self.ctx,
-                    token_device,
+                    token_device.buffer,
                     partial_values,
                     partial_indices,
                     q8_input,
@@ -10142,7 +11863,7 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
             if (!cudaQ6KLmHeadTile16Enabled()) break :blk false;
             self.kernels.launchLinearQ6KArgmaxRowsTile16F32(
                 &self.ctx,
-                token_device,
+                token_device.buffer,
                 partial_values,
                 partial_indices,
                 input_tensor.buffer,
@@ -10162,7 +11883,7 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
             if (launched_q8_1 or launched_tile16) break :blk true;
             self.kernels.launchLinearQ6KArgmaxRowsTile8F32(
                 &self.ctx,
-                token_device,
+                token_device.buffer,
                 partial_values,
                 partial_indices,
                 input_tensor.buffer,
@@ -10181,7 +11902,7 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
         if (!launched_tile8) {
             self.kernels.launchLinearQ6KArgmaxRowsTile4F32(
                 &self.ctx,
-                token_device,
+                token_device.buffer,
                 partial_values,
                 partial_indices,
                 input_tensor.buffer,
@@ -10195,8 +11916,6 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
                 error.CudaKernelUnavailable, error.InvalidCudaState => {
                     std.log.err("cuda_lm_argmax_rows_unsupported: reason=q6k_kernel err={s} rows={d} in_dim={d} out_dim={d}", .{ @errorName(err), rows, in_dim, out_dim });
                     self.stats.lm_head_argmax_fallbacks += 1;
-                    releaseDeviceBuffer(self, &token_device);
-                    token_device_owned = true;
                     return null;
                 },
                 else => return err,
@@ -10207,7 +11926,7 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
 
     self.stats.launch_linear += 1;
     self.stats.launch_argmax += 1;
-    token_device_owned = true;
+    token_device_transferred = true;
     return token_device;
 }
 
@@ -10222,11 +11941,11 @@ fn linearNoBiasArgmaxRowsSuppress(
     allocator: std.mem.Allocator,
 ) anyerror!?[]u32 {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    var token_device = (try linearNoBiasArgmaxRowsSuppressDevice(ctx, input, weight, rows, in_dim, out_dim, suppress_token_ids)) orelse return null;
-    defer releaseDeviceBuffer(self, &token_device);
+    var token_device = (try linearNoBiasArgmaxRowsSuppressDevice(ctx, input, weight, rows, in_dim, out_dim, suppress_token_ids, false)) orelse return null;
+    defer releaseDeviceBufferLease(self, &token_device);
     const tokens = try allocator.alloc(u32, rows);
     errdefer allocator.free(tokens);
-    try copyToHostTrackedAndSync(self, token_device, std.mem.sliceAsBytes(tokens));
+    try copyToHostTrackedAndSync(self, token_device.buffer, std.mem.sliceAsBytes(tokens));
     self.stats.mtp_verify_commit_choice_downloads += 1;
     return tokens;
 }
@@ -10240,14 +11959,11 @@ fn linearNoBiasArgmaxLastRowTensor(ctx: *anyopaque, input: CT, weight: CT, rows:
     const logits = try linearNoBias(ctx, input, weight, rows, in_dim, out_dim);
     defer freeTensor(ctx, logits);
 
-    var token_device = try allocDeviceBuffer(self, @sizeOf(i32));
-    errdefer token_device.free(&self.ctx);
-    try self.kernels.launchArgmaxLastRowF32(&self.ctx, token_device, tensorFromCt(logits).buffer, rows, out_dim);
+    var token_device = try allocGreedyTokenDeviceBuffer(self, @sizeOf(i32));
+    errdefer releaseDeviceBufferLease(self, &token_device);
+    try self.kernels.launchArgmaxLastRowF32(&self.ctx, token_device.buffer, tensorFromCt(logits).buffer, rows, out_dim);
     self.stats.launch_argmax += 1;
-    const shape = try self.allocator.alloc(i64, 1);
-    errdefer self.allocator.free(shape);
-    shape[0] = 1;
-    return createTensorWithDType(self, token_device, shape, 1, .i32);
+    return createI32ScalarTensorFromLease(self, &token_device);
 }
 
 fn gemma4MtpPreproject(ctx: *anyopaque, request: *const ops.Gemma4MtpPreprojectRequest) anyerror!?CT {
@@ -10544,11 +12260,12 @@ fn gemma4MtpVerifyCommitDeviceResult(
         request.in_dim,
         request.out_dim,
         request.suppress_token_ids,
+        false,
     )) orelse {
         self.stats.mtp_verify_commit_device_fallbacks += 1;
         return null;
     };
-    defer releaseDeviceBuffer(self, &target_choices_device);
+    defer releaseDeviceBufferLease(self, &target_choices_device);
 
     var draft_tokens_device = try allocDeviceBuffer(self, try checkedMul(request.draft_tokens.len, @sizeOf(i64)));
     defer releaseDeviceBuffer(self, &draft_tokens_device);
@@ -10566,7 +12283,7 @@ fn gemma4MtpVerifyCommitDeviceResult(
     const launched = try self.kernels.launchGemma4MtpVerifyCommitU32(
         &self.ctx,
         result_device,
-        target_choices_device,
+        target_choices_device.buffer,
         draft_tokens_device,
         eos_token_ids_device,
         request.draft_tokens.len,
@@ -10690,9 +12407,9 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
     const k_weight_tensor = tensorFromCt(k_weight);
     const v_weight_tensor = tensorFromCt(v_weight);
     try ensureF32(input_tensor);
-    const q_mirror = weightBf16MirrorForRows(q_weight_tensor, rows);
-    const k_mirror = weightBf16MirrorForRows(k_weight_tensor, rows);
-    const v_mirror = weightBf16MirrorForRows(v_weight_tensor, rows);
+    const q_mirror = weightBf16MirrorForRows(self, q_weight_tensor, rows);
+    const k_mirror = weightBf16MirrorForRows(self, k_weight_tensor, rows);
+    const v_mirror = weightBf16MirrorForRows(self, v_weight_tensor, rows);
     const use_hybrid_bf16 = q_mirror != null and k_mirror != null and v_mirror != null;
     const q_weight_bf16 = if (use_hybrid_bf16) q_mirror.? else q_weight_tensor.buffer;
     const k_weight_bf16 = if (use_hybrid_bf16) k_mirror.? else k_weight_tensor.buffer;
@@ -10775,6 +12492,13 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
         self.stats.qkv_fused_q8 += 1;
         self.stats.launch_linear_qkv += 1;
     } else if (use_q4_0) {
+        const combined_out_dim = q_out_dim + 2 * kv_out_dim;
+        const qkv_op: CudaQ4RouteOp = if (q_out_dim == kv_out_dim) .qkv else .qkv_gqa;
+        var route = CudaQ4KernelLaunch{
+            .kernel_id = "termite_linear_q4_0_qkv_nobias_f32_tile4",
+            .grid = .{ rows * ((q_out_dim + 3) / 4 + 2 * ((kv_out_dim + 3) / 4)), 1, 1 },
+            .block = .{ 256, 1, 1 },
+        };
         const used_q4_0_q8_1_dp4a = try tryLaunchLinearQ4_0QkvQ8_1Dp4a(
             self,
             q_device,
@@ -10789,6 +12513,23 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
             q_out_dim,
             kv_out_dim,
         );
+        if (used_q4_0_q8_1_dp4a) {
+            route = if (cudaQ4_0QkvQ8_1Tile8Enabled()) blk: {
+                const w8 = cudaQ4_0QkvQ8_1Tile8W8Enabled(in_dim);
+                break :blk .{
+                    .kernel_id = if (w8)
+                        "termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8"
+                    else
+                        "termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8",
+                    .grid = .{ rows * ((q_out_dim + 7) / 8 + 2 * ((kv_out_dim + 7) / 8)), 1, 1 },
+                    .block = .{ if (w8) 256 else 128, 1, 1 },
+                };
+            } else .{
+                .kernel_id = "termite_linear_q4_0_qkv_nobias_q8_1_f32_tile4",
+                .grid = .{ rows * ((q_out_dim + 3) / 4 + 2 * ((kv_out_dim + 3) / 4)), 1, 1 },
+                .block = .{ 128, 1, 1 },
+            };
+        }
         const used_q4_0_tile8 = blk: {
             if (!used_q4_0_q8_1_dp4a and rows == 1 and cudaQ4_0QkvTile8Enabled()) {
                 self.kernels.launchLinearQ4_0QkvNoBiasTile8F32(
@@ -10807,6 +12548,11 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
                 ) catch |err| switch (err) {
                     error.CudaKernelUnavailable, error.InvalidCudaState => break :blk false,
                     else => return err,
+                };
+                route = .{
+                    .kernel_id = "termite_linear_q4_0_qkv_nobias_f32_tile8",
+                    .grid = .{ rows * ((q_out_dim + 7) / 8 + 2 * ((kv_out_dim + 7) / 8)), 1, 1 },
+                    .block = .{ 256, 1, 1 },
                 };
                 break :blk true;
             }
@@ -10831,6 +12577,11 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
                     ) catch |err| switch (err) {
                         error.CudaKernelUnavailable, error.InvalidCudaState => break :blk false,
                         else => return err,
+                    };
+                    route = .{
+                        .kernel_id = "termite_linear_q4_0_qkv_nobias_f32_tile4_w4",
+                        .grid = .{ rows * ((q_out_dim + 3) / 4 + 2 * ((kv_out_dim + 3) / 4)), 1, 1 },
+                        .block = .{ 128, 1, 1 },
                     };
                     break :blk true;
                 }
@@ -10859,6 +12610,19 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
                 };
             }
         }
+        noteQ4Route(
+            self,
+            qkv_op,
+            rows,
+            in_dim,
+            combined_out_dim,
+            .qkv,
+            .none,
+            route.provider,
+            route.kernel_id,
+            route.grid,
+            route.block,
+        );
         self.stats.qkv_fused_q4_0 += 1;
         if (used_q4_0_tile8 or (used_q4_0_q8_1_dp4a and cudaQ4_0QkvQ8_1Tile8Enabled())) {
             self.stats.qkv_fused_q4_0_tile8 += 1;
@@ -11048,9 +12812,9 @@ fn linearTriple(ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: 
     // numerical behavior. `linearNoBiasQkv` returns null when its fusion is
     // disabled or ineligible, preserving the three-linear fallback below.
     const use_bf16_triple = rows > 1 and
-        weightBf16MirrorForRows(weight_a_tensor, rows) != null and
-        weightBf16MirrorForRows(weight_b_tensor, rows) != null and
-        weightBf16MirrorForRows(weight_c_tensor, rows) != null;
+        weightBf16MirrorForRows(self, weight_a_tensor, rows) != null and
+        weightBf16MirrorForRows(self, weight_b_tensor, rows) != null and
+        weightBf16MirrorForRows(self, weight_c_tensor, rows) != null;
     const use_f16_triple = isF16Weight(weight_a_tensor) and
         isF16Weight(weight_b_tensor) and isF16Weight(weight_c_tensor);
     if (use_bf16_triple or use_f16_triple) {
@@ -11177,8 +12941,8 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
     try ensureCount(weight_a_tensor, try checkedMul(out_dim, in_dim));
     try ensureCount(weight_b_tensor, try checkedMul(out_dim, in_dim));
 
-    const mirror_a = weightBf16MirrorForRows(weight_a_tensor, rows);
-    const mirror_b = weightBf16MirrorForRows(weight_b_tensor, rows);
+    const mirror_a = weightBf16MirrorForRows(self, weight_a_tensor, rows);
+    const mirror_b = weightBf16MirrorForRows(self, weight_b_tensor, rows);
     const use_hybrid_bf16 = mirror_a != null and mirror_b != null;
     const weight_a_bf16 = if (use_hybrid_bf16) mirror_a.? else weight_a_tensor.buffer;
     const weight_b_bf16 = if (use_hybrid_bf16) mirror_b.? else weight_b_tensor.buffer;
@@ -11283,6 +13047,13 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
         };
         self.stats.linear_pair_fused_q8 += 1;
     } else if (use_q4_0) {
+        var route = CudaQ4KernelLaunch{
+            .kernel_id = "termite_linear_q4_0_pair_nobias_f32_tile4",
+            .grid = .{ rows * ((out_dim + 3) / 4) * 2, 1, 1 },
+            .block = .{ 256, 1, 1 },
+        };
+        const generated_pair_candidate = rows == 1 and self.generated_q4_0_gates.pair and
+            runtimeJitShapeAllowsForCompute(self, .pair, rows, in_dim, out_dim);
         const used_q4_0_q8_1_dp4a = try tryLaunchLinearQ4_0PairQ8_1Dp4a(
             self,
             device_a,
@@ -11294,6 +13065,21 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
             in_dim,
             out_dim,
         );
+        if (used_q4_0_q8_1_dp4a) {
+            route = if (cudaQ4_0PairQ8_1Tile8Enabled()) .{
+                .kernel_id = "termite_linear_q4_0_pair_nobias_q8_1_f32_tile8",
+                .grid = .{ rows * ((out_dim + 7) / 8) * 2, 1, 1 },
+                .block = .{ 128, 1, 1 },
+            } else if (cudaQ4_0PairQ8_1Tile4W8Enabled(in_dim)) .{
+                .kernel_id = "termite_linear_q4_0_pair_nobias_q8_1_f32_tile4_w8",
+                .grid = .{ rows * ((out_dim + 3) / 4) * 2, 1, 1 },
+                .block = .{ 256, 1, 1 },
+            } else .{
+                .kernel_id = "termite_linear_q4_0_pair_nobias_q8_1_f32_tile4",
+                .grid = .{ rows * ((out_dim + 3) / 4) * 2, 1, 1 },
+                .block = .{ 128, 1, 1 },
+            };
+        }
         const used_q4_0_tile8 = blk: {
             if (!used_q4_0_q8_1_dp4a and rows == 1 and cudaQ4_0PairTile8Enabled()) {
                 self.kernels.launchLinearQ4_0PairNoBiasTile8F32(
@@ -11310,15 +13096,18 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
                     error.CudaKernelUnavailable, error.InvalidCudaState => break :blk false,
                     else => return err,
                 };
+                route = .{
+                    .kernel_id = "termite_linear_q4_0_pair_nobias_f32_tile8",
+                    .grid = .{ rows * ((out_dim + 7) / 8) * 2, 1, 1 },
+                    .block = .{ 256, 1, 1 },
+                };
                 break :blk true;
             }
             break :blk false;
         };
         if (!used_q4_0_q8_1_dp4a and !used_q4_0_tile8) {
             const used_q4_0_generated_pair = blk: {
-                if (rows == 1 and self.generated_q4_0_gates.pair and
-                    runtimeJitShapeAllowsForCompute(self, .pair, rows, in_dim, out_dim))
-                {
+                if (generated_pair_candidate) {
                     self.kernels.launchLinearQ4_0GeneratedPairF32(
                         &self.ctx,
                         device_a,
@@ -11337,6 +13126,12 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
                         else => return err,
                     };
                     self.stats.q4_0_generated_pair_hits += 1;
+                    route = .{
+                        .provider = .generated,
+                        .kernel_id = quant_kernel_compiler.first_general_cuda_q4_0_pair_kernel_id,
+                        .grid = .{ (out_dim + 3) / 4, 1, 1 },
+                        .block = .{ 256, 1, 1 },
+                    };
                     break :blk true;
                 }
                 break :blk false;
@@ -11356,6 +13151,12 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
                     ) catch |err| switch (err) {
                         error.CudaKernelUnavailable, error.InvalidCudaState => break :blk false,
                         else => return err,
+                    };
+                    route = .{
+                        .provider = if (generated_pair_candidate) .fallback else .handwritten,
+                        .kernel_id = "termite_linear_q4_0_pair_nobias_f32_tile4_w4",
+                        .grid = .{ rows * ((out_dim + 3) / 4) * 2, 1, 1 },
+                        .block = .{ 128, 1, 1 },
                     };
                     break :blk true;
                 }
@@ -11390,8 +13191,27 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
                     },
                     else => return err,
                 };
+                route = .{
+                    .provider = if (generated_pair_candidate) .fallback else .handwritten,
+                    .kernel_id = "termite_linear_q4_0_pair_nobias_f32_tile4",
+                    .grid = .{ rows * ((out_dim + 3) / 4) * 2, 1, 1 },
+                    .block = .{ 256, 1, 1 },
+                };
             }
         }
+        noteQ4Route(
+            self,
+            .ffn_pair,
+            rows,
+            in_dim,
+            out_dim,
+            .pair,
+            .none,
+            route.provider,
+            route.kernel_id,
+            route.grid,
+            route.block,
+        );
         self.stats.linear_pair_fused_q4_0 += 1;
         if (used_q4_0_tile8 or (used_q4_0_q8_1_dp4a and cudaQ4_0PairQ8_1Tile8Enabled())) {
             self.stats.linear_pair_fused_q4_0_tile8 += 1;
@@ -11476,6 +13296,11 @@ fn linearNoBiasPairActivationQ4_0(
 
     var used_q8_1_dp4a = false;
     var used_q8_1_tile8 = false;
+    var route = CudaQ4KernelLaunch{
+        .kernel_id = "termite_linear_q4_0_pair_activation_f32_tile4_w4",
+        .grid = .{ rows * ((out_dim + 3) / 4), 1, 1 },
+        .block = .{ 128, 1, 1 },
+    };
     if (cudaQ4_0PairActivationQ8_1Dp4aEnabled()) q8_1_blk: {
         const row_blocks = in_dim / 32;
         const q8_blocks = try checkedMul(rows, row_blocks);
@@ -11506,6 +13331,11 @@ fn linearNoBiasPairActivationQ4_0(
                 else => return err,
             };
             used_q8_1_tile8 = true;
+            route = .{
+                .kernel_id = "termite_linear_q4_0_pair_activation_q8_1_f32_tile8",
+                .grid = .{ rows * ((out_dim + 7) / 8), 1, 1 },
+                .block = .{ 128, 1, 1 },
+            };
         } else if (cudaQ4_0PairActivationQ8_1Tile4W8Enabled(in_dim)) {
             self.kernels.launchLinearQ4_0PairActivationQ8_1Tile4W8F32(
                 &self.ctx,
@@ -11521,6 +13351,11 @@ fn linearNoBiasPairActivationQ4_0(
                 error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
                 else => return err,
             };
+            route = .{
+                .kernel_id = "termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w8",
+                .grid = .{ rows * ((out_dim + 3) / 4), 1, 1 },
+                .block = .{ 256, 1, 1 },
+            };
         } else {
             self.kernels.launchLinearQ4_0PairActivationQ8_1Tile4F32(
                 &self.ctx,
@@ -11535,6 +13370,11 @@ fn linearNoBiasPairActivationQ4_0(
             ) catch |err| switch (err) {
                 error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
                 else => return err,
+            };
+            route = .{
+                .kernel_id = "termite_linear_q4_0_pair_activation_q8_1_f32_tile4",
+                .grid = .{ rows * ((out_dim + 3) / 4), 1, 1 },
+                .block = .{ 128, 1, 1 },
             };
         }
         used_q8_1_dp4a = true;
@@ -11560,6 +13400,21 @@ fn linearNoBiasPairActivationQ4_0(
         },
         else => return err,
     };
+    if (!used_q8_1_dp4a and cudaQ4_0PairActivationQ8_1Dp4aEnabled()) route.provider = .fallback;
+
+    noteQ4Route(
+        self,
+        .ffn_pair,
+        rows,
+        in_dim,
+        out_dim,
+        .pair,
+        .activation_f32,
+        route.provider,
+        route.kernel_id,
+        route.grid,
+        route.block,
+    );
 
     self.stats.launch_linear += 1;
     self.stats.linear_pair_fused_q4_0 += 1;
@@ -12401,6 +14256,35 @@ fn linearNoBiasActivationSliceLastDim(
     if (source_rows != rows or start > source_cols or out_dim > source_cols - start) return null;
     try ensureCount(source_tensor, try checkedMul(source_rows, source_cols));
 
+    // With an admitted hybrid BF16 mirror, this E2B prefill candidate evaluates
+    // two existing semantic operations in place of the fused Q8_1+Q4_0 PLE
+    // kernel: returning null asks the architecture fallback to run
+    // linearNoBias (BF16 cuBLASLt), sliceLastDim, and activationMultiply.
+    // Decode is deliberately excluded before this decision, so rows == 1
+    // continues through the byte-for-byte existing Q4_0 fused path below.
+    if (self.ple_gate_prefill_profile != .off) {
+        const model_is_e2b = isGemma4E2bPleRuntimeState(self.decoder_runtime_family_state);
+        const bf16_mirror_admitted = weightBf16MirrorForRows(self, weight_tensor, rows) != null;
+        if (self.ple_gate_prefill_profile.eligibleFor(
+            self.ctx.info.compute_major,
+            self.ctx.info.compute_minor,
+            model_is_e2b,
+            rows,
+            in_dim,
+            out_dim,
+            bf16_mirror_admitted,
+            self.cublaslt != null,
+        )) {
+            self.stats.ple_gate_prefill_bf16_mirror_first_hits += 1;
+            return null;
+        }
+        if (model_is_e2b and rows == 1 and in_dim == 1536 and out_dim == 256) {
+            self.stats.ple_gate_decode_q4_fused_preserved += 1;
+        } else {
+            self.stats.ple_gate_prefill_bf16_mirror_first_ineligible += 1;
+        }
+    }
+
     const out_count = try checkedMul(rows, out_dim);
     const shape = try allocShape2(self.allocator, rows, out_dim);
     var shape_owned = false;
@@ -12524,7 +14408,7 @@ fn linearNoBiasGatedDown(
     }
     // Hybrid residency: prefill-shaped gated-down goes through the caller's
     // activation-multiply + BF16-mirror linear fallback instead of Q8_1 kernels.
-    if (weightBf16MirrorForRows(weight_tensor, rows) != null) {
+    if (weightBf16MirrorForRows(self, weight_tensor, rows) != null) {
         self.stats.gated_down_fallbacks += 1;
         return null;
     }
@@ -13138,11 +15022,53 @@ fn gqaDenseAttention(
             self.stats.launch_attention_gqa_decode += 1;
             self.stats.launch_attention_gqa_decode_generated += 1;
         },
+        .decode_splitk_online_sm89,
+        .decode_splitk_online_sm89_ineligible_fallback,
+        .decode_splitk_online_sm89_symbol_fallback,
+        => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+            noteGqaSplitkOnlineDecodeStats(&self.stats, attention_launch, head_dim);
+        },
         .decode_generated_score_prework => {
             self.stats.launch_attention += 1;
             self.stats.launch_attention_gqa_decode += 1;
             self.stats.launch_attention_gqa_decode_generated += 1;
             self.stats.launch_attention_gqa_decode_score_prework += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_serial += 1;
+            if (head_dim == 256) self.stats.launch_attention_gqa_decode_score_prework_serial_hd256 += 1;
+            if (head_dim == 512) self.stats.launch_attention_gqa_decode_score_prework_serial_hd512 += 1;
+        },
+        .decode_generated_score_prework_tiled64 => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+            self.stats.launch_attention_gqa_decode_generated += 1;
+            self.stats.launch_attention_gqa_decode_score_prework += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_tiled64 += 1;
+            if (head_dim == 256) self.stats.launch_attention_gqa_decode_score_prework_tiled64_hd256 += 1;
+            if (head_dim == 512) self.stats.launch_attention_gqa_decode_score_prework_tiled64_hd512 += 1;
+        },
+        .decode_generated_score_prework_tiled64_ineligible_fallback => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+            self.stats.launch_attention_gqa_decode_generated += 1;
+            self.stats.launch_attention_gqa_decode_score_prework += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_serial += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_tiled64_fallbacks += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_tiled64_forbidden_routes += 1;
+            if (head_dim == 256) self.stats.launch_attention_gqa_decode_score_prework_serial_hd256 += 1;
+            if (head_dim == 512) self.stats.launch_attention_gqa_decode_score_prework_serial_hd512 += 1;
+        },
+        .decode_generated_score_prework_tiled64_symbol_fallback => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+            self.stats.launch_attention_gqa_decode_generated += 1;
+            self.stats.launch_attention_gqa_decode_score_prework += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_serial += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_tiled64_fallbacks += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_tiled64_symbol_fallbacks += 1;
+            if (head_dim == 256) self.stats.launch_attention_gqa_decode_score_prework_serial_hd256 += 1;
+            if (head_dim == 512) self.stats.launch_attention_gqa_decode_score_prework_serial_hd512 += 1;
         },
         .decode_fast => {
             self.stats.launch_attention += 1;
@@ -13170,11 +15096,78 @@ fn gqaDenseAttention(
             self.stats.launch_attention += 1;
             self.stats.launch_attention_gqa_prefill_mma_m32 += 1;
         },
+        .prefill_tiled_f16_exact => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_prefill_tiled_f16_exact += 1;
+            if (head_dim == 256) self.stats.launch_attention_gqa_prefill_tiled_f16_exact_hd256 += 1;
+            if (head_dim == 512) self.stats.launch_attention_gqa_prefill_tiled_f16_exact_hd512 += 1;
+        },
+        .prefill_tiled_f16_warp => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_prefill_tiled_f16_warp += 1;
+            if (head_dim == 256) self.stats.launch_attention_gqa_prefill_tiled_f16_warp_hd256 += 1;
+            if (head_dim == 512) self.stats.launch_attention_gqa_prefill_tiled_f16_warp_hd512 += 1;
+        },
+        .prefill_flash_f16_sm89,
+        .prefill_flash_f16_sm89_ineligible_fallback,
+        .prefill_flash_f16_sm89_symbol_fallback,
+        => {
+            self.stats.launch_attention += 1;
+            noteGqaFlashPrefillStats(&self.stats, attention_launch, head_dim, q_seq_len);
+        },
         .scalar => {
             self.stats.launch_attention += 1;
             self.stats.launch_attention_gqa_scalar += 1;
         },
         .none => {},
+    }
+    if (q_seq_len > 1) {
+        const phase_kernel_id: []const u8 = switch (attention_launch) {
+            .prefill_fast => "termite_gqa_attention_prefill_fast_f32",
+            .prefill_tiled => "termite_gqa_attention_prefill_tiled_f32",
+            .prefill_mma => "termite_gqa_attention_prefill_mma_f32",
+            .prefill_mma_m32 => "termite_gqa_attention_prefill_mma_m32_f32",
+            .prefill_tiled_f16_exact => "termite_gqa_attention_prefill_tiled_f16_exact_f32",
+            .prefill_tiled_f16_warp => "termite_gqa_attention_prefill_tiled_f16_warp_f32",
+            .prefill_flash_f16_sm89 => if (head_dim == 256)
+                quant_kernel_compiler.first_prefill_flash_cuda_hd256_kernel_id
+            else
+                quant_kernel_compiler.first_prefill_flash_cuda_hd512_kernel_id,
+            .prefill_flash_f16_sm89_ineligible_fallback => "termite_gqa_attention_decode_turboquant_f32",
+            .prefill_flash_f16_sm89_symbol_fallback => "termite_gqa_attention_decode_turboquant_f32",
+            .scalar => "termite_gqa_attention_scalar_f32",
+            .decode => "termite_gqa_attention_decode_f32",
+            .decode_generated => "antfly_gqa_attention_decode_generated_f32",
+            .decode_splitk_online_sm89 => if (head_dim == 256)
+                quant_kernel_compiler.first_decode_splitk_online_cuda_hd256_kernel_id
+            else
+                quant_kernel_compiler.first_decode_splitk_online_cuda_hd512_kernel_id,
+            .decode_splitk_online_sm89_ineligible_fallback => "termite_gqa_attention_decode_turboquant_f32",
+            .decode_splitk_online_sm89_symbol_fallback => "termite_gqa_attention_decode_turboquant_f32",
+            .decode_generated_score_prework => "antfly_gqa_attention_decode_generated_score_prework_serial_f32",
+            .decode_generated_score_prework_tiled64 => "antfly_gqa_attention_decode_generated_score_prework_tiled64_f32",
+            .decode_generated_score_prework_tiled64_ineligible_fallback => "antfly_gqa_attention_decode_generated_score_prework_tiled64_ineligible_fallback_f32",
+            .decode_generated_score_prework_tiled64_symbol_fallback => "antfly_gqa_attention_decode_generated_score_prework_tiled64_symbol_fallback_f32",
+            .decode_fast => "termite_gqa_attention_decode_fast_f32",
+            .decode_fast_fallback => "termite_gqa_attention_decode_fast_fallback_f32",
+            .none => "none",
+        };
+        // Attention launch topology is selected inside KernelModule and is not
+        // surfaced through this API. Zero geometry is an explicit unknown
+        // sentinel (`geometry_known=false`), not a fabricated launch shape.
+        noteQ4Route(
+            self,
+            .attention_gqa_prefill,
+            batch * q_seq_len,
+            kv_seq_len,
+            q_hidden,
+            .gqa,
+            .none,
+            .handwritten,
+            phase_kernel_id,
+            .{ 0, 0, 0 },
+            .{ 0, 0, 0 },
+        );
     }
     return createTensor(self, device, shape, q_count);
 }
@@ -13355,11 +15348,46 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
     defer if (profile_scope) |*scope| scope.end();
     var prefill_profile_scope = beginPrefillProfile(self, .attention, attention.query_sequence_len);
     defer if (prefill_profile_scope) |*scope| scope.end();
-    // The exact generated score-prework candidate owns precedence when its
-    // explicit gate is set. Its launcher applies the stricter F32-value and
-    // bounded-capacity contract; ineligible shapes use the established fast
-    // decode fallback instead of the numerically divergent split experiment.
-    if (!kernels_mod.generatedGqaScorePreworkEnabled() and
+    // The exact generated score-prework candidate owns precedence whenever
+    // the typed selector accepts this concrete storage/layout policy. The
+    // split-summary experiment remains available only outside that exact
+    // route; it must never shadow the chronological F16 Gemma 4 path.
+    const score_prework_request = kernels_mod.GeneratedGqaScorePreworkRequest{
+        .batch = batch,
+        .q_seq_len = attention.query_sequence_len,
+        .kv_seq_len = attention.kv_sequence_len,
+        .num_heads = num_heads,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+        .sliding_window = attention.sliding_window,
+        .mask_len = mask_len,
+        .bias_mode = bias_mode,
+        .key_row_bytes = paged.key_row_bytes,
+        .base_key_row_bytes = paged.base_key_row_bytes,
+        .value_row_bytes = paged.v_row_stride,
+        .block_count = attention_block_table_len,
+        .page_size_tokens = paged.page_size_tokens,
+        .format = paged.format,
+        .value_format = layer.value_format,
+        .physical_token_capacity = layer.capacity_tokens,
+    };
+    try noteGeneratedGqaScorePreworkTemplate(self, score_prework_request);
+    try kernels_mod.validateGeneratedGqaScorePreworkConsumerRequirementFor(
+        score_prework_request,
+        self.kernels.gqa_score_prework_mode,
+        self.kernels.gqa_score_prework_consumer_mode,
+        self.ctx.info.compute_major,
+        self.ctx.info.compute_minor,
+    );
+    const score_prework_selected = kernels_mod.generatedGqaScorePreworkSelectionWithConsumerFor(
+        score_prework_request,
+        self.kernels.gqa_score_prework_mode,
+        self.kernels.gqa_score_prework_consumer_mode,
+        self.ctx.info.compute_major,
+        self.ctx.info.compute_minor,
+    ) != null;
+    if (!self.kernels.gqaSplitkOnlineDecodeProfileSelected() and
+        !score_prework_selected and
         cudaTurboquantSplitAttentionEnabled() and
         batch == 1 and
         attention.query_sequence_len == 1 and
@@ -13433,7 +15461,7 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
             return createTensor(self, device, shape, q_count);
         }
     }
-    const launch_kind = try self.kernels.launchGqaAttentionDecodeTurboquantF32(
+    const launch_result = try self.kernels.launchGqaAttentionDecodeTurboquantF32(
         &self.ctx,
         device,
         q_tensor.buffer,
@@ -13464,6 +15492,10 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
         layer.capacity_tokens,
         decode_scalars,
     );
+    const launch_kind = launch_result.kind;
+    if (launch_result.splitk_online_fallback) |fallback| {
+        noteGqaSplitkOnlineDecodeStats(&self.stats, fallback, head_dim);
+    }
     switch (launch_kind) {
         .decode => {
             self.stats.launch_attention += 1;
@@ -13474,11 +15506,53 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
             self.stats.launch_attention_gqa_decode += 1;
             self.stats.launch_attention_gqa_decode_generated += 1;
         },
+        .decode_splitk_online_sm89 => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+            noteGqaSplitkOnlineDecodeStats(&self.stats, launch_kind, head_dim);
+        },
+        .decode_splitk_online_sm89_ineligible_fallback,
+        .decode_splitk_online_sm89_symbol_fallback,
+        => unreachable,
         .decode_generated_score_prework => {
             self.stats.launch_attention += 1;
             self.stats.launch_attention_gqa_decode += 1;
             self.stats.launch_attention_gqa_decode_generated += 1;
             self.stats.launch_attention_gqa_decode_score_prework += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_serial += 1;
+            if (head_dim == 256) self.stats.launch_attention_gqa_decode_score_prework_serial_hd256 += 1;
+            if (head_dim == 512) self.stats.launch_attention_gqa_decode_score_prework_serial_hd512 += 1;
+        },
+        .decode_generated_score_prework_tiled64 => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+            self.stats.launch_attention_gqa_decode_generated += 1;
+            self.stats.launch_attention_gqa_decode_score_prework += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_tiled64 += 1;
+            if (head_dim == 256) self.stats.launch_attention_gqa_decode_score_prework_tiled64_hd256 += 1;
+            if (head_dim == 512) self.stats.launch_attention_gqa_decode_score_prework_tiled64_hd512 += 1;
+        },
+        .decode_generated_score_prework_tiled64_ineligible_fallback => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+            self.stats.launch_attention_gqa_decode_generated += 1;
+            self.stats.launch_attention_gqa_decode_score_prework += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_serial += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_tiled64_fallbacks += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_tiled64_forbidden_routes += 1;
+            if (head_dim == 256) self.stats.launch_attention_gqa_decode_score_prework_serial_hd256 += 1;
+            if (head_dim == 512) self.stats.launch_attention_gqa_decode_score_prework_serial_hd512 += 1;
+        },
+        .decode_generated_score_prework_tiled64_symbol_fallback => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+            self.stats.launch_attention_gqa_decode_generated += 1;
+            self.stats.launch_attention_gqa_decode_score_prework += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_serial += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_tiled64_fallbacks += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_tiled64_symbol_fallbacks += 1;
+            if (head_dim == 256) self.stats.launch_attention_gqa_decode_score_prework_serial_hd256 += 1;
+            if (head_dim == 512) self.stats.launch_attention_gqa_decode_score_prework_serial_hd512 += 1;
         },
         .decode_fast => {
             self.stats.launch_attention += 1;
@@ -13505,6 +15579,25 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
         .prefill_mma_m32 => {
             self.stats.launch_attention += 1;
             self.stats.launch_attention_gqa_prefill_mma_m32 += 1;
+        },
+        .prefill_tiled_f16_exact => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_prefill_tiled_f16_exact += 1;
+            if (head_dim == 256) self.stats.launch_attention_gqa_prefill_tiled_f16_exact_hd256 += 1;
+            if (head_dim == 512) self.stats.launch_attention_gqa_prefill_tiled_f16_exact_hd512 += 1;
+        },
+        .prefill_tiled_f16_warp => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_prefill_tiled_f16_warp += 1;
+            if (head_dim == 256) self.stats.launch_attention_gqa_prefill_tiled_f16_warp_hd256 += 1;
+            if (head_dim == 512) self.stats.launch_attention_gqa_prefill_tiled_f16_warp_hd512 += 1;
+        },
+        .prefill_flash_f16_sm89,
+        .prefill_flash_f16_sm89_ineligible_fallback,
+        .prefill_flash_f16_sm89_symbol_fallback,
+        => {
+            self.stats.launch_attention += 1;
+            noteGqaFlashPrefillStats(&self.stats, launch_kind, head_dim, attention.query_sequence_len);
         },
         .scalar => {
             self.stats.launch_attention += 1;
@@ -15022,6 +17115,307 @@ fn decoderRuntimeApplyBlockRmsNorm(
     });
 }
 
+fn noteQ4Route(
+    self: *CudaCompute,
+    op: CudaQ4RouteOp,
+    rows: usize,
+    k: usize,
+    n: usize,
+    bundle: CudaQ4RouteBundle,
+    epilogue: CudaQ4RouteEpilogue,
+    provider: CudaQ4RouteProvider,
+    kernel_id: []const u8,
+    grid: [3]usize,
+    block: [3]usize,
+) void {
+    self.dispatch_stats.noteQ4(
+        self.allocator,
+        self.q4_route_census_enabled,
+        op,
+        rows,
+        k,
+        n,
+        bundle,
+        epilogue,
+        provider,
+        kernel_id,
+        .{
+            std.math.cast(u32, grid[0]) orelse std.math.maxInt(u32),
+            std.math.cast(u32, grid[1]) orelse std.math.maxInt(u32),
+            std.math.cast(u32, grid[2]) orelse std.math.maxInt(u32),
+        },
+        .{
+            std.math.cast(u32, block[0]) orelse std.math.maxInt(u32),
+            std.math.cast(u32, block[1]) orelse std.math.maxInt(u32),
+            std.math.cast(u32, block[2]) orelse std.math.maxInt(u32),
+        },
+    );
+}
+
+fn noteQ4FfnRoute(
+    self: *CudaCompute,
+    op: CudaQ4RouteOp,
+    rows: usize,
+    k: usize,
+    n: usize,
+    bundle: CudaQ4RouteBundle,
+    epilogue: CudaQ4RouteEpilogue,
+    provider: CudaQ4RouteProvider,
+    kernel_id: []const u8,
+    grid_x: usize,
+    block_x: usize,
+) void {
+    noteQ4Route(
+        self,
+        op,
+        rows,
+        k,
+        n,
+        bundle,
+        epilogue,
+        provider,
+        kernel_id,
+        .{ grid_x, 1, 1 },
+        .{ block_x, 1, 1 },
+    );
+}
+
+fn q4LinearRouteOp(out_dim: usize) CudaQ4RouteOp {
+    // This is the same vocabulary-width boundary already used by the CUDA
+    // decode profiler. Keeping it centralized makes sampled (full logits) and
+    // greedy (fused argmax) LM-head traffic reconcile under one census op.
+    return if (out_dim >= 100_000) .lm_head else .linear;
+}
+
+fn generatedExactE2BPairKernelId(intermediate_size: usize) []const u8 {
+    return switch (intermediate_size) {
+        6144 => "antfly_q4_0_pair_activation_f32_e2b_6144_exact_v1",
+        12288 => "antfly_q4_0_pair_activation_f32_e2b_12288_exact_v1",
+        else => "antfly_q4_0_pair_activation_f32_e2b_unknown_exact_v1",
+    };
+}
+
+fn generatedExactE2BDownKernelId(intermediate_size: usize) []const u8 {
+    return switch (intermediate_size) {
+        6144 => "antfly_q4_0_down_f32_e2b_6144_exact_v1",
+        12288 => "antfly_q4_0_down_f32_e2b_12288_exact_v1",
+        else => "antfly_q4_0_down_f32_e2b_unknown_exact_v1",
+    };
+}
+
+fn generatedE2BPairQ8ZpKernelId(intermediate_size: usize) []const u8 {
+    return switch (intermediate_size) {
+        6144 => "antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1",
+        12288 => "antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1",
+        else => "antfly_q4_0_pair_activation_q8_1_mmv_v1",
+    };
+}
+
+fn generatedE2BDownQ8ZpKernelId(intermediate_size: usize) []const u8 {
+    return switch (intermediate_size) {
+        6144 => "antfly_q4_0_down_q8_1_e2b_6144_mmv_v1",
+        12288 => "antfly_q4_0_down_q8_1_e2b_12288_mmv_v1",
+        else => "antfly_q4_0_down_q8_1_mmv_v1",
+    };
+}
+
+fn generatedE2BDownQ8BlockSize(intermediate_size: usize) usize {
+    return if (intermediate_size == 6144) 128 else 256;
+}
+
+fn generatedE2BPairGgmlQ8_1KernelId(intermediate_size: usize) []const u8 {
+    return switch (intermediate_size) {
+        6144 => quant_kernel_compiler.first_e2b_cuda_q4_0_pair_ggml_q8_1_6144_kernel_id,
+        12288 => quant_kernel_compiler.first_e2b_cuda_q4_0_pair_ggml_q8_1_12288_kernel_id,
+        else => "antfly_q4_0_pair_activation_ggml_q8_1_e2b_unknown_mmv_v1",
+    };
+}
+
+fn generatedE2BDownGgmlQ8_1KernelId(intermediate_size: usize) []const u8 {
+    return switch (intermediate_size) {
+        6144 => quant_kernel_compiler.first_e2b_cuda_q4_0_down_ggml_q8_1_6144_kernel_id,
+        12288 => quant_kernel_compiler.first_e2b_cuda_q4_0_down_ggml_q8_1_12288_kernel_id,
+        else => "antfly_q4_0_down_ggml_q8_1_e2b_unknown_mmv_v1",
+    };
+}
+
+fn tryRunQ4_0Sm89GgmlQ8_1E2BFfn(
+    ctx: *anyopaque,
+    request: *const ops.RunGatedFfnResidualRequest,
+    rows: usize,
+) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!self.sm89_q4_0_ggml_q8_1_gate.enabledFor(
+        self.ctx.info.compute_major,
+        self.ctx.info.compute_minor,
+        rows,
+        request.hidden_size,
+        request.intermediate_size,
+    )) return null;
+    if (request.post_gate_rms_norm_slot != null or
+        !kernels_mod.generatedQ4_0PairQ8E2BShapeEligible(
+            rows,
+            request.hidden_size,
+            request.intermediate_size,
+            @intFromEnum(request.activation),
+        ) or
+        !kernels_mod.generatedQ4_0DownQ8E2BShapeEligible(
+            rows,
+            request.intermediate_size,
+            request.hidden_size,
+        ))
+    {
+        return null;
+    }
+
+    const gate_slot = self.decoder_runtime_linear_slots.getPtr(request.gate_linear_slot) orelse return null;
+    const up_slot = self.decoder_runtime_linear_slots.getPtr(request.up_linear_slot) orelse return null;
+    const down_slot = self.decoder_runtime_linear_slots.getPtr(request.down_linear_slot) orelse return null;
+    if (gate_slot.in_dim != request.hidden_size or up_slot.in_dim != request.hidden_size or
+        gate_slot.out_dim != request.intermediate_size or up_slot.out_dim != request.intermediate_size or
+        down_slot.in_dim != request.intermediate_size or down_slot.out_dim != request.hidden_size)
+    {
+        return error.UnexpectedOutputShape;
+    }
+    if (gate_slot.bias != null or up_slot.bias != null or down_slot.bias != null) return null;
+    if (!isKnownQuant(&gate_slot.weight, .Q4_0) or !isKnownQuant(&up_slot.weight, .Q4_0) or
+        !isKnownQuant(&down_slot.weight, .Q4_0)) return null;
+    if (weightBf16MirrorForRows(self, &gate_slot.weight, rows) != null or
+        weightBf16MirrorForRows(self, &up_slot.weight, rows) != null or
+        weightBf16MirrorForRows(self, &down_slot.weight, rows) != null) return null;
+
+    const input_tensor = tensorFromCt(request.input);
+    try ensureF32(input_tensor);
+    if (input_tensor.elem_count != rows * request.hidden_size) return error.InvalidShape;
+
+    const hidden_q8_bytes = try checkedMul(try checkedMul(rows, request.hidden_size / 32), 36);
+    const activated_q8_bytes = try checkedMul(try checkedMul(rows, request.intermediate_size / 32), 36);
+    const output_count = try checkedMul(rows, request.hidden_size);
+    const shape = try allocShape2(self.allocator, rows, request.hidden_size);
+    var shape_transferred = false;
+    defer if (!shape_transferred) self.allocator.free(shape);
+    var projected = allocDeviceBuffer(self, output_count * @sizeOf(f32)) catch |err| switch (err) {
+        error.CudaGraphCaptureUnsafeTempAlloc => return null,
+        else => return err,
+    };
+    var projected_transferred = false;
+    defer if (!projected_transferred) releaseDeviceBuffer(self, &projected);
+    var hidden_storage = allocDeviceBuffer(self, hidden_q8_bytes) catch |err| switch (err) {
+        error.CudaGraphCaptureUnsafeTempAlloc => return null,
+        else => return err,
+    };
+    defer releaseDeviceBuffer(self, &hidden_storage);
+    var activated_storage = allocDeviceBuffer(self, activated_q8_bytes) catch |err| switch (err) {
+        error.CudaGraphCaptureUnsafeTempAlloc => return null,
+        else => return err,
+    };
+    defer releaseDeviceBuffer(self, &activated_storage);
+    const hidden_q8 = kernels_mod.GgmlQ8_1Buffer.init(hidden_storage);
+    const activated_q8 = kernels_mod.GgmlQ8_1Buffer.init(activated_storage);
+
+    self.kernels.launchQuantizeF32GgmlQ8_1Rows(
+        &self.ctx,
+        hidden_q8,
+        input_tensor.buffer,
+        rows,
+        request.hidden_size,
+    ) catch |err| switch (err) {
+        error.CudaKernelUnavailable, error.InvalidCudaState => {
+            self.stats.q4_0_ggml_q8_1_quantize_fallbacks += 1;
+            self.stats.q4_0_ggml_q8_1_e2b_ffn_fallbacks += 1;
+            return null;
+        },
+        else => return err,
+    };
+
+    var pair_profile_scope = beginDecodeProfile(self, .ffn_gate_up, rows);
+    self.kernels.launchLinearQ4_0GeneratedPairGgmlQ8_1E2B(
+        &self.ctx,
+        activated_q8,
+        hidden_q8,
+        gate_slot.weight.buffer,
+        up_slot.weight.buffer,
+        rows,
+        request.hidden_size,
+        request.intermediate_size,
+        @intFromEnum(request.activation),
+    ) catch |err| switch (err) {
+        error.CudaKernelUnavailable, error.InvalidCudaState => {
+            if (pair_profile_scope) |*scope| scope.end();
+            self.stats.q4_0_ggml_q8_1_pair_fallbacks += 1;
+            self.stats.q4_0_ggml_q8_1_e2b_ffn_fallbacks += 1;
+            return null;
+        },
+        else => {
+            if (pair_profile_scope) |*scope| scope.end();
+            return err;
+        },
+    };
+    if (pair_profile_scope) |*scope| scope.end();
+    noteQ4FfnRoute(
+        self,
+        .ffn_pair,
+        rows,
+        request.hidden_size,
+        request.intermediate_size,
+        .pair,
+        .activation_ggml_q8_1,
+        .generated,
+        generatedE2BPairGgmlQ8_1KernelId(request.intermediate_size),
+        rows * (request.intermediate_size / 32),
+        384,
+    );
+
+    var down_profile_scope = beginDecodeProfile(self, .ffn_gated_down, rows);
+    self.kernels.launchLinearQ4_0GeneratedDownGgmlQ8_1E2B(
+        &self.ctx,
+        projected,
+        activated_q8,
+        down_slot.weight.buffer,
+        rows,
+        request.intermediate_size,
+        request.hidden_size,
+    ) catch |err| switch (err) {
+        error.CudaKernelUnavailable, error.InvalidCudaState => {
+            if (down_profile_scope) |*scope| scope.end();
+            self.stats.q4_0_ggml_q8_1_down_fallbacks += 1;
+            self.stats.q4_0_ggml_q8_1_e2b_ffn_fallbacks += 1;
+            return null;
+        },
+        else => {
+            if (down_profile_scope) |*scope| scope.end();
+            return err;
+        },
+    };
+    if (down_profile_scope) |*scope| scope.end();
+    noteQ4FfnRoute(
+        self,
+        .ffn_down,
+        rows,
+        request.intermediate_size,
+        request.hidden_size,
+        .single,
+        .none,
+        .generated,
+        generatedE2BDownGgmlQ8_1KernelId(request.intermediate_size),
+        rows * request.hidden_size,
+        128,
+    );
+
+    self.stats.q4_0_ggml_q8_1_e2b_ffn_hits += 1;
+    self.stats.launch_linear += 2;
+    self.stats.linear_pair_fused_q4_0 += 1;
+    self.stats.linear_pair_fused_q4_0_activation += 1;
+    self.stats.decoder_runtime_linear_apply_hits += 3;
+    self.stats.decoder_runtime_linear_pair_apply_hits += 1;
+    self.stats.gated_down_fused_q4_0 += 1;
+    self.stats.gated_down_fused_q4_0_precompute += 1;
+    const result = try createTensor(self, projected, shape, output_count);
+    projected_transferred = true;
+    shape_transferred = true;
+    return result;
+}
+
 fn tryRunQ4_0GeneratedExactE2BFfn(
     ctx: *anyopaque,
     request: *const ops.RunGatedFfnResidualRequest,
@@ -15047,9 +17441,9 @@ fn tryRunQ4_0GeneratedExactE2BFfn(
     }
     if (gate_slot.bias != null or up_slot.bias != null or down_slot.bias != null) return null;
     if (!isKnownQuant(&gate_slot.weight, .Q4_0) or !isKnownQuant(&up_slot.weight, .Q4_0) or !isKnownQuant(&down_slot.weight, .Q4_0)) return null;
-    if (weightBf16MirrorForRows(&gate_slot.weight, rows) != null or
-        weightBf16MirrorForRows(&up_slot.weight, rows) != null or
-        weightBf16MirrorForRows(&down_slot.weight, rows) != null)
+    if (weightBf16MirrorForRows(self, &gate_slot.weight, rows) != null or
+        weightBf16MirrorForRows(self, &up_slot.weight, rows) != null or
+        weightBf16MirrorForRows(self, &down_slot.weight, rows) != null)
     {
         return null;
     }
@@ -15098,6 +17492,19 @@ fn tryRunQ4_0GeneratedExactE2BFfn(
     };
     if (pair_profile_scope) |*scope| scope.end();
     self.stats.q4_0_generated_e2b_exact_pair_f32_hits += 1;
+    noteQ4FfnRoute(
+        self,
+        .ffn_pair,
+        rows,
+        request.hidden_size,
+        request.intermediate_size,
+        .pair,
+        .activation_f32,
+        .generated,
+        generatedExactE2BPairKernelId(request.intermediate_size),
+        (request.intermediate_size + 3) / 4,
+        128,
+    );
 
     var down_profile_scope = beginDecodeProfile(self, .ffn_gated_down, rows);
     self.kernels.launchLinearQ4_0GeneratedExactFfnDownF32(
@@ -15121,6 +17528,19 @@ fn tryRunQ4_0GeneratedExactE2BFfn(
     };
     if (down_profile_scope) |*scope| scope.end();
     self.stats.q4_0_generated_e2b_exact_down_f32_hits += 1;
+    noteQ4FfnRoute(
+        self,
+        .ffn_down,
+        rows,
+        request.intermediate_size,
+        request.hidden_size,
+        .single,
+        .none,
+        .generated,
+        generatedExactE2BDownKernelId(request.intermediate_size),
+        (request.hidden_size + 3) / 4,
+        256,
+    );
 
     self.stats.launch_linear += 2;
     self.stats.linear_pair_fused_q4_0 += 1;
@@ -15150,32 +17570,46 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
         return null;
     }
 
-    const generated_catalog_ffn_resolution = generatedQ4_0CatalogFfnRoute(
-        self.generated_q4_0_gates.catalog_ffn_candidates,
-        self.generated_q4_0_gates.pair_q8 and runtimeJitShapeAllowsForCompute(
-            self,
-            .pair_q8,
-            rows,
-            request.hidden_size,
-            request.intermediate_size,
-        ),
-        self.generated_q4_0_gates.down_q8 and runtimeJitShapeAllowsForCompute(
-            self,
-            .down_q8,
-            rows,
-            request.intermediate_size,
-            request.hidden_size,
-        ),
+    const generated_e2b_pair_only = generatedQ4_0E2BFfnPairOnlyEligible(
+        self.generated_q4_0_gates.e2b_pair_only,
         rows,
         request.hidden_size,
         request.intermediate_size,
         request.activation,
-        self.ctx.info.compute_major,
-        self.ctx.info.compute_minor,
     );
+    // Pair-only is deliberately distinct from the catalog's coupled pair/down
+    // candidate. The generated pair produces the same Q8_1 bytes as the
+    // existing F32-pair + quantize boundary; retaining the handwritten down
+    // projection therefore avoids changing its reduction order.
+    const generated_catalog_ffn_resolution: GeneratedQ4_0CatalogFfnResolution = if (generated_e2b_pair_only)
+        .{}
+    else
+        generatedQ4_0CatalogFfnRoute(
+            self.generated_q4_0_gates.catalog_ffn_candidates,
+            self.generated_q4_0_gates.pair_q8 and runtimeJitShapeAllowsForCompute(
+                self,
+                .pair_q8,
+                rows,
+                request.hidden_size,
+                request.intermediate_size,
+            ),
+            self.generated_q4_0_gates.down_q8 and runtimeJitShapeAllowsForCompute(
+                self,
+                .down_q8,
+                rows,
+                request.intermediate_size,
+                request.hidden_size,
+            ),
+            rows,
+            request.hidden_size,
+            request.intermediate_size,
+            request.activation,
+            self.ctx.info.compute_major,
+            self.ctx.info.compute_minor,
+        );
     noteGeneratedQ4_0CatalogFfnResolution(&self.stats, generated_catalog_ffn_resolution);
     const generated_catalog_ffn = generated_catalog_ffn_resolution.route;
-    if (generated_catalog_ffn == null and !cudaQ4_0GateUpActivationQ8_1PrecomputeEnabled()) return null;
+    if (!generated_e2b_pair_only and generated_catalog_ffn == null and !cudaQ4_0GateUpActivationQ8_1PrecomputeEnabled()) return null;
 
     const gate_slot = self.decoder_runtime_linear_slots.getPtr(request.gate_linear_slot) orelse return null;
     const up_slot = self.decoder_runtime_linear_slots.getPtr(request.up_linear_slot) orelse return null;
@@ -15193,9 +17627,9 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
     if (!isKnownQuant(&gate_slot.weight, .Q4_0) or !isKnownQuant(&up_slot.weight, .Q4_0) or !isKnownQuant(&down_slot.weight, .Q4_0)) return null;
     // Hybrid residency: prefill-shaped FFN runs go through the BF16 mirror
     // pair+linear path instead of the Q8_1 fused kernels.
-    if (weightBf16MirrorForRows(&gate_slot.weight, rows) != null and
-        weightBf16MirrorForRows(&up_slot.weight, rows) != null and
-        weightBf16MirrorForRows(&down_slot.weight, rows) != null) return null;
+    if (weightBf16MirrorForRows(self, &gate_slot.weight, rows) != null and
+        weightBf16MirrorForRows(self, &up_slot.weight, rows) != null and
+        weightBf16MirrorForRows(self, &down_slot.weight, rows) != null) return null;
 
     const hidden_q8_blocks = request.hidden_size / 32;
     const hidden_q8_bytes = try checkedMul(try checkedMul(rows, hidden_q8_blocks), 36);
@@ -15248,6 +17682,48 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
     const pair_prefill_variant = self.kernels.q4_0PairActivationQ8_1Tile32W5E4BPrefillRowsVariant(rows);
     var pair_profile_scope = beginPrefillProfile(self, .q4_pair, rows);
     const used_generated_pair_q8 = blk: {
+        if (generated_e2b_pair_only) {
+            self.kernels.launchLinearQ4_0GeneratedPairQ8E2B(
+                &self.ctx,
+                q8_activated,
+                q8_hidden,
+                gate_slot.weight.buffer,
+                up_slot.weight.buffer,
+                rows,
+                request.hidden_size,
+                request.intermediate_size,
+                @intFromEnum(request.activation),
+            ) catch |err| switch (err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => {
+                    if (pair_profile_scope) |*scope| scope.end();
+                    self.stats.q4_0_generated_e2b_pair_only_fallbacks += 1;
+                    projected_device.free(&self.ctx);
+                    projected_owned = true;
+                    self.allocator.free(shape);
+                    shape_owned = true;
+                    return null;
+                },
+                else => {
+                    if (pair_profile_scope) |*scope| scope.end();
+                    return err;
+                },
+            };
+            self.stats.q4_0_generated_e2b_pair_only_hits += 1;
+            noteQ4FfnRoute(
+                self,
+                .ffn_pair,
+                rows,
+                request.hidden_size,
+                request.intermediate_size,
+                .pair,
+                .activation_q8_zp,
+                .generated,
+                generatedE2BPairQ8ZpKernelId(request.intermediate_size),
+                rows * (request.intermediate_size / 32),
+                384,
+            );
+            break :blk true;
+        }
         if (generated_catalog_ffn) |route| {
             self.kernels.launchLinearQ4_0GeneratedPairQ8Catalog(
                 &self.ctx,
@@ -15268,6 +17744,19 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
                 else => return err,
             };
             noteGeneratedQ4_0CatalogFfnResult(&self.stats, .pair_q8, true);
+            noteQ4FfnRoute(
+                self,
+                .ffn_pair,
+                rows,
+                request.hidden_size,
+                request.intermediate_size,
+                .pair,
+                .activation_q8_zp,
+                .generated,
+                route.pair_kernel_id,
+                rows * (request.intermediate_size / 32),
+                if (request.hidden_size == 1536) 384 else 640,
+            );
             break :blk true;
         }
         if (rows != 1 or !self.generated_q4_0_gates.pair_q8 or
@@ -15296,36 +17785,67 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
             else => return err,
         };
         self.stats.q4_0_generated_pair_q8_hits += 1;
+        noteQ4FfnRoute(
+            self,
+            .ffn_pair,
+            rows,
+            request.hidden_size,
+            request.intermediate_size,
+            .pair,
+            .activation_q8_zp,
+            .generated,
+            "antfly_q4_0_pair_activation_q8_1_mmv_v1",
+            rows * (request.intermediate_size / 32),
+            640,
+        );
         break :blk true;
     };
-    if (!used_generated_pair_q8) self.kernels.launchLinearQ4_0PairActivationQ8_1Tile32W5E4BFfnQ8_1(
-        &self.ctx,
-        q8_activated,
-        q8_hidden,
-        gate_slot.weight.buffer,
-        up_slot.weight.buffer,
-        rows,
-        request.hidden_size,
-        request.intermediate_size,
-        @intFromEnum(request.activation),
-    ) catch |err| switch (err) {
-        error.CudaKernelUnavailable, error.InvalidCudaState => {
-            if (pair_profile_scope) |*scope| scope.end();
-            projected_device.free(&self.ctx);
-            projected_owned = true;
-            self.allocator.free(shape);
-            shape_owned = true;
-            return null;
-        },
-        else => {
-            if (pair_profile_scope) |*scope| scope.end();
-            return err;
-        },
-    };
+    if (!used_generated_pair_q8) {
+        self.kernels.launchLinearQ4_0PairActivationQ8_1Tile32W5E4BFfnQ8_1(
+            &self.ctx,
+            q8_activated,
+            q8_hidden,
+            gate_slot.weight.buffer,
+            up_slot.weight.buffer,
+            rows,
+            request.hidden_size,
+            request.intermediate_size,
+            @intFromEnum(request.activation),
+        ) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => {
+                if (pair_profile_scope) |*scope| scope.end();
+                projected_device.free(&self.ctx);
+                projected_owned = true;
+                self.allocator.free(shape);
+                shape_owned = true;
+                return null;
+            },
+            else => {
+                if (pair_profile_scope) |*scope| scope.end();
+                return err;
+            },
+        };
+        noteQ4FfnRoute(
+            self,
+            .ffn_pair,
+            rows,
+            request.hidden_size,
+            request.intermediate_size,
+            .pair,
+            .activation_q8_zp,
+            .handwritten,
+            "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn",
+            rows * (request.intermediate_size / 32),
+            640,
+        );
+    }
     if (pair_profile_scope) |*scope| scope.end();
     const down_prefill_variant = self.kernels.q4_0Q8_1Tile4W8PrefillRowsVariant(rows, request.intermediate_size, request.hidden_size);
     var down_profile_scope = beginPrefillProfile(self, .q4_gated_down, rows);
     const used_generated_down_q8 = blk: {
+        // The pair-only candidate's numerical contract ends at its exact Q8_1
+        // boundary. Always preserve the existing handwritten down reduction.
+        if (generated_e2b_pair_only) break :blk false;
         if (generated_catalog_ffn) |route| {
             self.kernels.launchLinearQ4_0GeneratedDownQ8Catalog(
                 &self.ctx,
@@ -15344,6 +17864,19 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
                 else => return err,
             };
             noteGeneratedQ4_0CatalogFfnResult(&self.stats, .down_q8, true);
+            noteQ4FfnRoute(
+                self,
+                .ffn_down,
+                rows,
+                request.intermediate_size,
+                request.hidden_size,
+                .single,
+                .none,
+                .generated,
+                route.down_kernel_id,
+                rows * ((request.hidden_size + 3) / 4),
+                generatedE2BDownQ8BlockSize(request.intermediate_size),
+            );
             break :blk true;
         }
         if (rows != 1 or !self.generated_q4_0_gates.down_q8 or
@@ -15370,22 +17903,50 @@ fn tryRunQ4_0GateUpActivationQ8_1Precompute(
             else => return err,
         };
         self.stats.q4_0_generated_down_q8_hits += 1;
+        noteQ4FfnRoute(
+            self,
+            .ffn_down,
+            rows,
+            request.intermediate_size,
+            request.hidden_size,
+            .single,
+            .none,
+            .generated,
+            "antfly_q4_0_down_q8_1_mmv_v1",
+            rows * ((request.hidden_size + 3) / 4),
+            256,
+        );
         break :blk true;
     };
-    if (!used_generated_down_q8) self.kernels.launchLinearQ4_0Q8_1Tile4W8F32(&self.ctx, projected_device, q8_activated, down_slot.weight.buffer, rows, request.intermediate_size, request.hidden_size) catch |err| switch (err) {
-        error.CudaKernelUnavailable, error.InvalidCudaState => {
-            if (down_profile_scope) |*scope| scope.end();
-            projected_device.free(&self.ctx);
-            projected_owned = true;
-            self.allocator.free(shape);
-            shape_owned = true;
-            return null;
-        },
-        else => {
-            if (down_profile_scope) |*scope| scope.end();
-            return err;
-        },
-    };
+    if (!used_generated_down_q8) {
+        self.kernels.launchLinearQ4_0Q8_1Tile4W8F32(&self.ctx, projected_device, q8_activated, down_slot.weight.buffer, rows, request.intermediate_size, request.hidden_size) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => {
+                if (down_profile_scope) |*scope| scope.end();
+                projected_device.free(&self.ctx);
+                projected_owned = true;
+                self.allocator.free(shape);
+                shape_owned = true;
+                return null;
+            },
+            else => {
+                if (down_profile_scope) |*scope| scope.end();
+                return err;
+            },
+        };
+        noteQ4FfnRoute(
+            self,
+            .ffn_down,
+            rows,
+            request.intermediate_size,
+            request.hidden_size,
+            .single,
+            .none,
+            .handwritten,
+            "termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down",
+            rows * ((request.hidden_size + 3) / 4),
+            256,
+        );
+    }
     if (down_profile_scope) |*scope| scope.end();
 
     self.stats.launch_linear += 2;
@@ -15425,9 +17986,16 @@ fn runGatedFfnResidualOp(ctx: *anyopaque, request: *const ops.RunGatedFfnResidua
     var current: CT = undefined;
     var current_is_down_projection = false;
 
-    if (try tryRunQ4_0GeneratedExactE2BFfn(ctx, request, rows)) |projected| {
+    if (try tryRunQ4_0Sm89GgmlQ8_1E2BFfn(ctx, request, rows)) |projected| {
         current = projected;
         current_is_down_projection = true;
+    }
+
+    if (!current_is_down_projection) {
+        if (try tryRunQ4_0GeneratedExactE2BFfn(ctx, request, rows)) |projected| {
+            current = projected;
+            current_is_down_projection = true;
+        }
     }
 
     if (!current_is_down_projection) {
@@ -15473,7 +18041,7 @@ fn runGatedFfnResidualOp(ctx: *anyopaque, request: *const ops.RunGatedFfnResidua
         self.stats.decoder_runtime_linear_pair_apply_hits += 1;
 
         var down_profile_scope = beginDecodeProfile(self, .ffn_gated_down, rows);
-        const projected = linearNoBias(ctx, activated, &down_slot.weight, rows, request.intermediate_size, request.hidden_size) catch |err| {
+        const projected = linearNoBiasForQ4Route(ctx, .ffn_down, activated, &down_slot.weight, rows, request.intermediate_size, request.hidden_size) catch |err| {
             if (down_profile_scope) |*scope| scope.end();
             return err;
         };
@@ -15542,15 +18110,20 @@ fn runGatedFfnResidualOp(ctx: *anyopaque, request: *const ops.RunGatedFfnResidua
                 current = normed;
             }
 
-            const projected = (try decoderRuntimeApplyLinearOp(ctx, &.{
-                .slot = request.down_linear_slot,
-                .input = current,
-                .in_dim = request.intermediate_size,
-                .out_dim = request.hidden_size,
-            })) orelse {
-                freeTensor(ctx, current);
-                self.stats.decoder_runtime_gated_ffn_misses += 1;
-                return null;
+            const projected = projected_blk: {
+                const previous_route_op = self.q4_route_op_override;
+                self.q4_route_op_override = .ffn_down;
+                defer self.q4_route_op_override = previous_route_op;
+                break :projected_blk (try decoderRuntimeApplyLinearOp(ctx, &.{
+                    .slot = request.down_linear_slot,
+                    .input = current,
+                    .in_dim = request.intermediate_size,
+                    .out_dim = request.hidden_size,
+                })) orelse {
+                    freeTensor(ctx, current);
+                    self.stats.decoder_runtime_gated_ffn_misses += 1;
+                    return null;
+                };
             };
             freeTensor(ctx, current);
             current = projected;
@@ -16182,6 +18755,7 @@ const vtable = ops.ComputeBackend.VTable{
     .backendKind = &backendKind,
     .deinitBackend = &deinitBackend,
     .freeTensor = &freeTensor,
+    .beginRequest = &beginRequest,
     .provisionKvDeviceWriteHook = &provisionKvDeviceWriteHook,
     .getWeight = &getWeight,
     .prefetchWeightHint = &prefetchWeightHint,
@@ -16194,6 +18768,7 @@ const vtable = ops.ComputeBackend.VTable{
     .debugCudaGraphRegisterFinalHiddenReplayInput = &debugCudaGraphRegisterFinalHiddenReplayInput,
     .debugCudaGraphRegisterFinalHiddenReplayAuxInput = &debugCudaGraphRegisterFinalHiddenReplayAuxInput,
     .debugCudaGraphPrepareFinalHiddenReplayInput = &debugCudaGraphPrepareFinalHiddenReplayInput,
+    .debugCudaGraphPrepareGreedyTokenReplayInput = &debugCudaGraphPrepareGreedyTokenReplayInput,
     .debugCudaGraphPrepareFinalHiddenReplayAuxInput = &debugCudaGraphPrepareFinalHiddenReplayAuxInput,
     .debugCudaGraphReplayFinalHidden = &debugCudaGraphReplayFinalHidden,
     .debugCudaGraphReplayFinalHiddenDiscard = &debugCudaGraphReplayFinalHiddenDiscard,
@@ -16338,12 +18913,14 @@ test "cuda compute vtable is type checked" {
     const rms_norm_fn: *const fn (*anyopaque, CT, CT, usize, f32) anyerror!CT = &rmsNorm;
     const rope_per_item_fn: *const fn (*anyopaque, CT, usize, usize, usize, usize, f32, f32, []const usize, []const usize, bool) anyerror!CT = &ropePerItem;
     const graph_prepare_input_fn: *const fn (*anyopaque, []const u8, CT, usize) anyerror!?CT = &debugCudaGraphPrepareFinalHiddenReplayInput;
+    const graph_prepare_greedy_input_fn: *const fn (*anyopaque, []const u8, CT, usize) anyerror!?CT = &debugCudaGraphPrepareGreedyTokenReplayInput;
     _ = backend_kind_fn;
     _ = linear_fn;
     _ = linear_no_bias_fn;
     _ = rms_norm_fn;
     _ = rope_per_item_fn;
     _ = graph_prepare_input_fn;
+    _ = graph_prepare_greedy_input_fn;
     _ = vtable;
 }
 
@@ -16393,6 +18970,22 @@ test "deberta generated attention variants parse strictly" {
     try std.testing.expectEqual(CudaDebertaGeneratedTcVariant.m32, parseCudaDebertaGeneratedTcVariant("m32n16").?);
     try std.testing.expectEqual(CudaDebertaGeneratedTcVariant.m16, parseCudaDebertaGeneratedTcVariant("m16").?);
     try std.testing.expectEqual(@as(?CudaDebertaGeneratedTcVariant, null), parseCudaDebertaGeneratedTcVariant("m64"));
+}
+
+test "cuda Flash prefill stats preserve head and query buckets" {
+    var stats = RuntimeStats{};
+    noteGqaFlashPrefillStats(&stats, .prefill_flash_f16_sm89, 256, 512);
+    noteGqaFlashPrefillStats(&stats, .prefill_flash_f16_sm89, 512, 3);
+    noteGqaFlashPrefillStats(&stats, .prefill_flash_f16_sm89_ineligible_fallback, 256, 3);
+    noteGqaFlashPrefillStats(&stats, .prefill_flash_f16_sm89_symbol_fallback, 512, 512);
+    try std.testing.expectEqual(@as(usize, 2), stats.launch_attention_gqa_prefill_flash_f16_sm89);
+    try std.testing.expectEqual(@as(usize, 1), stats.launch_attention_gqa_prefill_flash_f16_sm89_hd256_q512);
+    try std.testing.expectEqual(@as(usize, 1), stats.launch_attention_gqa_prefill_flash_f16_sm89_hd512_q3);
+    try std.testing.expectEqual(@as(usize, 2), stats.launch_attention_gqa_prefill_flash_f16_sm89_fallbacks);
+    try std.testing.expectEqual(@as(usize, 1), stats.launch_attention_gqa_prefill_flash_f16_sm89_ineligible_fallbacks);
+    try std.testing.expectEqual(@as(usize, 1), stats.launch_attention_gqa_prefill_flash_f16_sm89_symbol_fallbacks);
+    try std.testing.expectEqual(@as(usize, 1), stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd256_q3);
+    try std.testing.expectEqual(@as(usize, 1), stats.launch_attention_gqa_prefill_flash_f16_sm89_fallback_hd512_q512);
 }
 
 test "cuda lazy demand cancels pending host prefetch item" {

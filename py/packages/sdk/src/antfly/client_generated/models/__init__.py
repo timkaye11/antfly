@@ -338,6 +338,7 @@ from .inference_generate_batch_response import InferenceGenerateBatchResponse
 from .inference_generate_batch_response_object import InferenceGenerateBatchResponseObject
 from .inference_generate_batch_result_item import InferenceGenerateBatchResultItem
 from .inference_generate_batch_summary import InferenceGenerateBatchSummary
+from .inference_generate_chat_template_kwargs import InferenceGenerateChatTemplateKwargs
 from .inference_generate_choice import InferenceGenerateChoice
 from .inference_generate_choice_logprobs_type_0 import InferenceGenerateChoiceLogprobsType0
 from .inference_generate_chunk import InferenceGenerateChunk
@@ -358,6 +359,7 @@ from .inference_generate_response_format import InferenceGenerateResponseFormat
 from .inference_generate_response_format_type import InferenceGenerateResponseFormatType
 from .inference_generate_response_object import InferenceGenerateResponseObject
 from .inference_generate_speculation_status import InferenceGenerateSpeculationStatus
+from .inference_generate_stream_options import InferenceGenerateStreamOptions
 from .inference_generate_usage import InferenceGenerateUsage
 from .inference_image_url import InferenceImageURL
 from .inference_image_url_content_part import InferenceImageURLContentPart
@@ -1045,6 +1047,7 @@ __all__ = (
     "InferenceGenerateBatchResponseObject",
     "InferenceGenerateBatchResultItem",
     "InferenceGenerateBatchSummary",
+    "InferenceGenerateChatTemplateKwargs",
     "InferenceGenerateChoice",
     "InferenceGenerateChoiceLogprobsType0",
     "InferenceGenerateChunk",
@@ -1065,6 +1068,7 @@ __all__ = (
     "InferenceGenerateResponseFormatType",
     "InferenceGenerateResponseObject",
     "InferenceGenerateSpeculationStatus",
+    "InferenceGenerateStreamOptions",
     "InferenceGenerateUsage",
     "InferenceImageURL",
     "InferenceImageURLContentPart",

@@ -26,6 +26,7 @@ const c_file = @import("../util/c_file.zig");
 const gguf_format = @import("../gguf/format.zig");
 const gguf_metadata = @import("../gguf/metadata.zig");
 const build_options = @import("build_options");
+const jinja = @import("jinja");
 
 /// Built-in chat template for Gemma 4 models (uses <|turn>/<turn|> tokens).
 /// Applied when tokenizer_config.json has sot_token=<|turn> but no
@@ -67,7 +68,11 @@ const gemma4_chat_template =
     "{{ '<turn|>\\n' }}" ++
     "{%- endfor -%}" ++
     "{%- if add_generation_prompt -%}" ++
+    "{%- if enable_thinking is defined and not enable_thinking -%}" ++
+    "{{ '<|turn>model\\n<|channel>final\\n<channel|>' }}" ++
+    "{%- else -%}" ++
     "{{ '<|turn>model\\n<|channel>thought\\n<channel|>' }}" ++
+    "{%- endif -%}" ++
     "{%- endif -%}";
 
 pub const ModelType = enum {
@@ -80,6 +85,20 @@ pub const ModelType = enum {
     classifier,
     reader,
     transcriber,
+};
+
+/// Records why `model_type` was selected. The default enum value is a neutral
+/// placeholder, not an explicit embedder declaration; compatibility policy
+/// must be able to distinguish those cases before using artifact metadata to
+/// infer a serving route.
+pub const ModelTypeOrigin = enum {
+    default,
+    path,
+    config,
+    manifest,
+    tasks,
+    heuristic,
+    bundle,
 };
 
 pub const TokenizerType = enum {
@@ -149,6 +168,7 @@ pub const ModelManifest = struct {
 
     // Identity
     model_type: ModelType = .embedder,
+    model_type_origin: ModelTypeOrigin = .default,
 
     // Files (allocated strings — absolute paths)
     onnx_path: ?[]const u8 = null,
@@ -474,6 +494,7 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
 
     if (inferModelTypeFromPath(model_dir_path)) |model_type| {
         manifest.model_type = model_type;
+        manifest.model_type_origin = .path;
     }
 
     // Try to parse config.json, then clip_config.json for CLIPCLAP-style repos.
@@ -598,6 +619,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
 
     if (inferModelTypeFromPath(model_dir_path)) |model_type| {
         manifest.model_type = model_type;
+        manifest.model_type_origin = .path;
     }
 
     if (c_file.readFileFromDir(allocator, model_dir_path, "config.json")) |config_bytes| {
@@ -702,16 +724,23 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
 
     if (hasRerankPathHint(model_dir_path) and (manifest.model_type == .embedder or manifest.model_type == .classifier)) {
         manifest.model_type = .reranker;
+        manifest.model_type_origin = .path;
         return;
     }
 
     if (inferModelTypeFromTasks(manifest.tasks)) |task_model_type| {
         manifest.model_type = task_model_type;
+        manifest.model_type_origin = .tasks;
         return;
     }
 
     if (manifest.gliner_model_type.len > 0) {
         manifest.model_type = .recognizer;
+        if (manifest.inference_bundle_family.len > 0) {
+            manifest.model_type_origin = .bundle;
+        } else if (manifest.model_type_origin != .config) {
+            manifest.model_type_origin = .heuristic;
+        }
         return;
     }
 
@@ -719,16 +748,19 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
 
     if (manifest.native_arch_hint == .whisper) {
         manifest.model_type = .transcriber;
+        manifest.model_type_origin = .config;
         return;
     }
     if (manifest.native_arch_hint == .florence or
         std.mem.eql(u8, manifest.config_model_arch, "vision-encoder-decoder"))
     {
         manifest.model_type = .reader;
+        manifest.model_type_origin = .config;
         return;
     }
     if (manifest.config_model_arch.len > 0 and gpt.isGenerativeModel(manifest.config_model_arch)) {
         manifest.model_type = .generator;
+        manifest.model_type_origin = .config;
     }
 }
 
@@ -1162,6 +1194,7 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
                 if (item != .string) continue;
                 if (inferModelTypeFromArchitectureName(item.string)) |inferred| {
                     manifest.model_type = inferred;
+                    manifest.model_type_origin = .config;
                     break;
                 }
             }
@@ -1173,6 +1206,10 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
             const s = v.string;
             if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
             manifest.config_model_arch = allocator.dupe(u8, s) catch "";
+            // Even when `model_type` describes an encoder family and leaves the
+            // enum at its embedder value, it is explicit role evidence rather
+            // than the neutral ModelManifest default.
+            manifest.model_type_origin = .config;
             if (std.mem.eql(u8, s, "roberta") or std.mem.eql(u8, s, "xlm-roberta")) {
                 manifest.bert_model_type = .roberta;
             } else if (std.mem.eql(u8, s, "distilbert")) {
@@ -1204,6 +1241,7 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
 
     if (jina_v5_embedding_config) {
         manifest.model_type = .embedder;
+        manifest.model_type_origin = .config;
         manifest.pooling = .last;
         manifest.normalize = true;
         if (manifest.embedding_text_prefix.len > 0) allocator.free(manifest.embedding_text_prefix);
@@ -1234,6 +1272,7 @@ fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator
                 if (item != .string) continue;
                 if (inferModelTypeFromArchitectureName(item.string)) |inferred| {
                     manifest.model_type = inferred;
+                    manifest.model_type_origin = .config;
                     break;
                 }
             }
@@ -1245,6 +1284,7 @@ fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator
             const s = v.string;
             if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
             manifest.config_model_arch = allocator.dupe(u8, s) catch "";
+            manifest.model_type_origin = .config;
             if (std.mem.eql(u8, s, "whisper")) {
                 manifest.native_arch_hint = .whisper;
             } else if (std.mem.eql(u8, s, "florence2") or
@@ -1272,6 +1312,7 @@ fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator
 
     if (isJinaV5TextEmbeddingConfig(&obj)) {
         manifest.model_type = .embedder;
+        manifest.model_type_origin = .config;
     }
 }
 
@@ -1313,6 +1354,7 @@ fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator
             inline for (.{ "embedder", "reranker", "chunker", "generator", "recognizer", "rewriter", "classifier", "reader", "transcriber" }) |name| {
                 if (std.mem.eql(u8, s, name)) {
                     manifest.model_type = @field(ModelType, name);
+                    manifest.model_type_origin = .manifest;
                 }
             }
         }
@@ -1410,6 +1452,7 @@ fn parseGlinerConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, jso
         if (v == .string and v.string.len > 0) {
             if (manifest.gliner_model_type.len > 0) allocator.free(manifest.gliner_model_type);
             manifest.gliner_model_type = allocator.dupe(u8, v.string) catch "";
+            manifest.model_type_origin = .config;
         }
     }
     if (obj.get("default_labels")) |v| {
@@ -1520,6 +1563,7 @@ fn parseInferenceBundleJson(manifest: *ModelManifest, allocator: std.mem.Allocat
                 }
             }
             manifest.model_type = .recognizer;
+            manifest.model_type_origin = .bundle;
             try setManifestInputs(allocator, manifest, &.{"text"});
         }
         if (std.mem.eql(u8, bundle_family, "clipclap_gguf_bundle/v1")) {
@@ -1534,6 +1578,7 @@ fn parseInferenceBundleJson(manifest: *ModelManifest, allocator: std.mem.Allocat
                 }
             }
             manifest.native_arch_hint = .clip;
+            manifest.model_type_origin = .bundle;
             if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
             manifest.config_model_arch = allocator.dupe(u8, "clipclap") catch "";
             try setManifestInputs(allocator, manifest, &.{ "text", "image", "audio" });
@@ -1635,6 +1680,7 @@ fn parseInferenceVariantsJson(manifest: *ModelManifest, allocator: std.mem.Alloc
     setOptionalPath(allocator, &manifest.audio_model_path, pair.clap_path);
     pair.clap_path = "";
     manifest.native_arch_hint = .clip;
+    manifest.model_type_origin = .bundle;
     if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
     manifest.config_model_arch = arch;
     try setManifestInputs(allocator, manifest, &.{ "text", "image", "audio" });
@@ -1692,6 +1738,7 @@ fn parseGliner2InferenceVariantsJson(
     setOptionalPath(allocator, &manifest.gliner_head_gguf_path, pair.head_path);
     pair.head_path = "";
     manifest.model_type = .recognizer;
+    manifest.model_type_origin = .bundle;
     try setManifestInputs(allocator, manifest, &.{"text"});
 }
 
@@ -1751,6 +1798,7 @@ fn applyFlorence2GgufBundle(
     path = "";
     manifest.native_arch_hint = .florence;
     manifest.model_type = .reader;
+    manifest.model_type_origin = .bundle;
     if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
     manifest.config_model_arch = arch;
     arch = "";
@@ -2020,9 +2068,11 @@ test "rerank model name overrides sequence classifier config" {
     var manifest = ModelManifest{
         .allocator = std.testing.allocator,
         .model_type = .classifier,
+        .model_type_origin = .config,
     };
     applyImplicitModelTypeHints(&manifest, "/tmp/models/mixedbread-ai/mxbai-rerank-base-v1");
     try std.testing.expectEqual(ModelType.reranker, manifest.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.path, manifest.model_type_origin);
 }
 
 test "inferModelTypeFromPath detects recognizer directory" {
@@ -2043,6 +2093,7 @@ test "parseModelManifestJson parses inputs array" {
     try std.testing.expect(manifest.hasInput("text"));
     try std.testing.expect(manifest.hasInput("image"));
     try std.testing.expectEqual(Sparse3DOutputLayout.seq_batch, manifest.sparse_3d_output_layout.?);
+    try std.testing.expectEqual(ModelTypeOrigin.manifest, manifest.model_type_origin);
 }
 
 fn parseTokenizerConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
@@ -2151,6 +2202,7 @@ test "manifest from config.json" {
     try std.testing.expectEqual(@as(u32, 6), manifest.num_hidden_layers);
     try std.testing.expectEqual(bert.ModelType.bert, manifest.bert_model_type);
     try std.testing.expectEqualStrings("bert", manifest.config_model_arch);
+    try std.testing.expectEqual(ModelTypeOrigin.config, manifest.model_type_origin);
 }
 
 test "RoBERTa manifest reserves padding position indices" {
@@ -2393,6 +2445,7 @@ test "manifest parses clipclap gguf bundle marker" {
     );
 
     try std.testing.expect(manifest.isClipclapGgufBundle());
+    try std.testing.expectEqual(ModelTypeOrigin.bundle, manifest.model_type_origin);
     try std.testing.expectEqual(NativeArchHint.clip, manifest.native_arch_hint);
     try std.testing.expectEqualStrings("clipclap", manifest.config_model_arch);
     try std.testing.expect(manifest.gguf_path != null);
@@ -3223,6 +3276,34 @@ test "gemma4 tokenizer config replaces unsupported upstream chat template" {
     try std.testing.expect(manifest.chat_template != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.chat_template.?, "<|turn>model") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.chat_template.?, "format_parameters") == null);
+}
+
+test "built-in gemma4 chat template renders explicit thinking modes" {
+    var template = try jinja.Template.init(std.testing.allocator, gemma4_chat_template);
+    defer template.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const messages = [_]jinja.ChatMessage{.{ .role = "user", .content = "hello" }};
+
+    var default_context = try jinja.chatTemplateContext(arena, &messages, .{ .bos_token = "<bos>" });
+    const default_prompt = try template.render(arena, &default_context);
+    try std.testing.expect(std.mem.endsWith(u8, default_prompt, "<|channel>thought\n<channel|>"));
+
+    var enabled_context = try jinja.chatTemplateContext(arena, &messages, .{
+        .bos_token = "<bos>",
+        .enable_thinking = true,
+    });
+    const enabled_prompt = try template.render(arena, &enabled_context);
+    try std.testing.expect(std.mem.endsWith(u8, enabled_prompt, "<|channel>thought\n<channel|>"));
+
+    var disabled_context = try jinja.chatTemplateContext(arena, &messages, .{
+        .bos_token = "<bos>",
+        .enable_thinking = false,
+    });
+    const disabled_prompt = try template.render(arena, &disabled_context);
+    try std.testing.expect(std.mem.endsWith(u8, disabled_prompt, "<|channel>final\n<channel|>"));
 }
 
 test "manifest infers huggingface tokenizer from gguf gpt2 metadata" {

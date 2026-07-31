@@ -6,6 +6,7 @@ import type {
   ContentPart,
   EmbedInput,
   EmbedResponse,
+  GenerateRequest,
   InferenceConfig,
   ModelsResponse,
   RerankResponse,
@@ -20,6 +21,15 @@ describe("Type exports", () => {
       maxBinaryResponseBytes: 64 << 20,
     };
     expect(config.baseUrl).toBe("http://localhost:8080/api");
+  });
+
+  it("should preserve explicit false chat-template thinking mode", () => {
+    const request: GenerateRequest = {
+      model: "gemma4",
+      messages: [{ role: "user", content: "hello" }],
+      chat_template_kwargs: { enable_thinking: false },
+    };
+    expect(request.chat_template_kwargs?.enable_thinking).toBe(false);
   });
 
   it("should export EmbedInput type supporting all formats", () => {

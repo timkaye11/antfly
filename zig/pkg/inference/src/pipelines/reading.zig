@@ -1069,7 +1069,7 @@ pub const ReadingPipeline = struct {
             errdefer if (capture_graph) cb.debugCudaGraphCaptureEnd(false) catch {};
             if (florenceCudaGraphEnabled()) {
                 if (suppress_tokens.len == 0) {
-                    if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput("florence.lm_head_argmax", hidden.*, 0)) |prepared| {
+                    if (try cb.debugCudaGraphPrepareGreedyTokenReplayInput("florence.lm_head_argmax", hidden.*, 0)) |prepared| {
                         cb.free(hidden.*);
                         hidden.* = prepared;
                         hidden_live.* = true;

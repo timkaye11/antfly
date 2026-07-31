@@ -220,7 +220,9 @@ pub const Config = struct {
     rope_layout: RopeLayout = .half_split,
     sliding_window_pattern: u32 = 6,
     rope_partial_factor: f32 = 1.0, // Gemma 4 full attention: 0.25 (only rotate 25% of head_dim)
-    rope_dim_override: u32 = 0, // When >0, overrides rope_dim for all layers (from rope_freqs.weight)
+    // Active rotary width decoded from rope_freqs.weight. For Gemma 4 this
+    // limits non-sliding layers while preserving their full frequency domain.
+    rope_dim_override: u32 = 0,
 
     // Optional model-specific decode semantics.
     norm_weight_offset: f32 = 0.0,

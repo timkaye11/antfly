@@ -319,6 +319,15 @@ generated Q4_0 route and candidate.
 Details and promotion evidence: `QUANT_KERNEL_COMPILER.md` (Current CUDA
 State).
 
+Update 2026-07-31 on branch `quant-kernel-long-context`: ten-pair warm-server
+long-context evidence (2,051-token prompt, 300 greedy tokens, F16 K/V, L4)
+puts the tuned frontier profile at 740.8 ms TTFT and 110.2 decode tokens/s
+versus llama.cpp at 329.5 ms and 114.4 tokens/s, a 1.173 total-latency ratio —
+decode is within 4% and prefill projections remain the whole gap. This is not
+a superiority result. See `docs/CUDA_TUNING.md` ("Gemma 4 E2B SM89
+optimization status") for the paired statistics, the promoted-routes-only
+measurement, and the F32-cache decode caveat.
+
 Status checked on 2026-06-21 on branch `gemma4_gpu_stuff`:
 
 - `zig build -Dcuda=true` succeeds.

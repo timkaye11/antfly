@@ -955,9 +955,18 @@ test "quant kernel codegen emits a self-contained microkernel source per microke
     for (quant_kernel_compiler.first_generated_attention_artifacts, sources[matmul_count + micro_count .. matmul_count + micro_count + attn_count]) |artifact, source| {
         try std.testing.expectEqualStrings(artifact.source_path, source.path);
         try std.testing.expect(source.data.len != 0);
+        // Flash and split-K online sources export their entry point through a
+        // typed `#define` consumed by a macro-declared kernel and take the
+        // device decode scalars as `const unsigned*`; the decode composites
+        // declare the kernel identifier directly with `const unsigned int*`.
         const kernel_decl = switch (artifact.backend) {
             .metal => try std.fmt.allocPrint(std.testing.allocator, "kernel void {s}(", .{artifact.kernel_id}),
-            .cuda => try std.fmt.allocPrint(std.testing.allocator, "extern \"C\" __global__ void {s}(", .{artifact.kernel_id}),
+            .cuda => if (artifact.cuda_flash_prefill_kernel != null)
+                try std.fmt.allocPrint(std.testing.allocator, "#define ANTFLY_FLASH_KERNEL {s}\n", .{artifact.kernel_id})
+            else if (artifact.cuda_splitk_online_decode_kernel != null)
+                try std.fmt.allocPrint(std.testing.allocator, "#define ANTFLY_SPLITK_ONLINE_KERNEL {s}\n", .{artifact.kernel_id})
+            else
+                try std.fmt.allocPrint(std.testing.allocator, "extern \"C\" __global__ void {s}(", .{artifact.kernel_id}),
         };
         defer std.testing.allocator.free(kernel_decl);
         try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, kernel_decl));
@@ -967,7 +976,12 @@ test "quant kernel codegen emits a self-contained microkernel source per microke
                 // Self-contained: its own params struct + paging helper travel with it.
                 try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "struct antfly_paged_attention_1x_params {"));
             },
-            .cuda => {
+            .cuda => if (artifact.cuda_flash_prefill_kernel != null or
+                artifact.cuda_splitk_online_decode_kernel != null)
+            {
+                try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "#include <cuda_fp16.h>"));
+                try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "const unsigned* decode_scalars"));
+            } else {
                 try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "#include <math.h>"));
                 try std.testing.expect(std.mem.containsAtLeast(u8, source.data, 1, "const unsigned int* decode_scalars"));
             },

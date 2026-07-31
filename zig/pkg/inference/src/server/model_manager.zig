@@ -787,6 +787,7 @@ fn componentPlanKey(
     updateComponentPlanKeySlice(&hash, model_dir);
     hash.update(&.{
         @intFromEnum(man.model_type),
+        @intFromEnum(man.model_type_origin),
         @intFromEnum(man.native_arch_hint),
         @intFromEnum(contract),
         @intFromBool(policy.allow_unknown),

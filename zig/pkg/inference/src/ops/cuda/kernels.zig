@@ -29,6 +29,25 @@ const platform = @import("antfly_platform");
 const turboquant = @import("../../runtime/kv/turboquant.zig");
 const kv_pool_mod = @import("../../runtime/kv/pool.zig");
 
+pub const Q8ActivationEncoding = enum {
+    /// Historical Antfly layout: half d, zero half, 32 signed values.
+    q8_zp_legacy,
+    /// llama.cpp CUDA block_q8_1: half2(d, raw f32 sum), 32 signed values.
+    /// This runtime activation contract differs from the CPU serialization
+    /// invariant that derives the second half from the quantized payload.
+    ggml_q8_1,
+};
+
+/// Prevents accidental cross-wiring of the byte-compatible but semantically
+/// different 36-byte activation layouts at new call sites.
+pub const GgmlQ8_1Buffer = struct {
+    buffer: buffer_mod.DeviceBuffer,
+
+    pub fn init(buffer: buffer_mod.DeviceBuffer) GgmlQ8_1Buffer {
+        return .{ .buffer = buffer };
+    }
+};
+
 fn captureParamTraceIndex(ctx: *context_mod.CudaContext) ?usize {
     if (!ctx.debug_graph_capture_active) return null;
     if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_PARAM_TRACE", false)) return null;
@@ -125,6 +144,459 @@ pub fn generatedGqaScorePreworkEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK", false);
 }
 
+pub const GeneratedGqaScorePreworkMode = enum {
+    disabled,
+    automatic,
+    explicit,
+};
+
+fn generatedGqaScorePreworkModeFor(configured: ?bool) GeneratedGqaScorePreworkMode {
+    return if (configured) |enabled|
+        if (enabled) .explicit else .disabled
+    else
+        .automatic;
+}
+
+fn generatedGqaScorePreworkMode() GeneratedGqaScorePreworkMode {
+    if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK") == null) {
+        return .automatic;
+    }
+    return generatedGqaScorePreworkModeFor(generatedGqaScorePreworkEnabled());
+}
+
+/// Consumer topology for the exact score-prework pipeline. Values are stable
+/// CUDA-graph/telemetry tags; zero remains reserved for "no score-prework".
+pub const GeneratedGqaScorePreworkConsumer = enum(u8) {
+    serial = 1,
+    tiled64 = 2,
+
+    pub fn name(self: GeneratedGqaScorePreworkConsumer) []const u8 {
+        return switch (self) {
+            .serial => "serial",
+            .tiled64 => "tiled64",
+        };
+    }
+};
+
+pub const GeneratedGqaScorePreworkConsumerMode = enum(u8) {
+    serial,
+    tiled64,
+    required_tiled64,
+    invalid,
+
+    pub fn name(self: GeneratedGqaScorePreworkConsumerMode) []const u8 {
+        return switch (self) {
+            .serial => "serial",
+            .tiled64 => "tiled64",
+            .required_tiled64 => "required-tiled64",
+            .invalid => "invalid",
+        };
+    }
+
+    fn requiresTiled64(self: GeneratedGqaScorePreworkConsumerMode) bool {
+        return self == .required_tiled64;
+    }
+};
+
+var generated_gqa_score_prework_invalid_consumer_warned = std.atomic.Value(bool).init(false);
+var generated_gqa_score_prework_consumer_config_log_mask = std.atomic.Value(u8).init(0);
+
+fn parseGeneratedGqaScorePreworkConsumerMode(value: []const u8) ?GeneratedGqaScorePreworkConsumerMode {
+    if (std.ascii.eqlIgnoreCase(value, "serial")) return .serial;
+    if (std.ascii.eqlIgnoreCase(value, "tiled64")) return .tiled64;
+    if (std.ascii.eqlIgnoreCase(value, "required-tiled64")) return .required_tiled64;
+    return null;
+}
+
+fn generatedGqaScorePreworkConsumerMode() GeneratedGqaScorePreworkConsumerMode {
+    const value = platform.env.getenv("ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER") orelse {
+        noteGeneratedGqaScorePreworkConsumerConfigured(.serial, "default");
+        return .serial;
+    };
+    const mode = parseGeneratedGqaScorePreworkConsumerMode(value) orelse {
+        if (!generated_gqa_score_prework_invalid_consumer_warned.swap(true, .monotonic)) {
+            std.log.warn("invalid ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER='{s}'; rejecting configuration", .{value});
+            std.log.err(
+                "cuda_gqa_score_prework_consumer: event=rejected configured=invalid consumer=none route=none head_dim=0 fallback_reason=invalid_configuration source=environment",
+                .{},
+            );
+        }
+        return .invalid;
+    };
+    noteGeneratedGqaScorePreworkConsumerConfigured(mode, "environment");
+    return mode;
+}
+
+fn noteGeneratedGqaScorePreworkConsumerConfigured(
+    mode: GeneratedGqaScorePreworkConsumerMode,
+    source: []const u8,
+) void {
+    const bit = @as(u8, 1) << @intCast(@intFromEnum(mode));
+    if (generated_gqa_score_prework_consumer_config_log_mask.fetchOr(bit, .monotonic) & bit != 0) return;
+    std.log.info(
+        "cuda_gqa_score_prework_consumer: event=configured configured={s} consumer=none route=none head_dim=0 fallback_reason=none source={s}",
+        .{ mode.name(), source },
+    );
+}
+
+/// Exact score-prework routes. These tags are stable runtime telemetry and
+/// graph-schedule inputs: F32 remains an explicit control while the two F16
+/// routes name Gemma 4's local/global attention policies.
+pub const GeneratedGqaScorePreworkRoute = enum(u8) {
+    none = 0,
+    f32_control = 1,
+    gemma4_f16_local = 2,
+    gemma4_f16_global = 3,
+
+    fn name(self: GeneratedGqaScorePreworkRoute) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .f32_control => "f32_control",
+            .gemma4_f16_local => "gemma4_f16_local",
+            .gemma4_f16_global => "gemma4_f16_global",
+        };
+    }
+};
+
+pub const GeneratedGqaScorePreworkRequest = struct {
+    batch: usize,
+    q_seq_len: usize,
+    kv_seq_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sliding_window: usize,
+    mask_len: usize,
+    bias_mode: u32,
+    key_row_bytes: usize,
+    base_key_row_bytes: usize,
+    value_row_bytes: usize,
+    block_count: usize,
+    page_size_tokens: usize,
+    format: u32,
+    value_format: u32,
+    physical_token_capacity: usize,
+};
+
+pub const GeneratedGqaScorePreworkSelection = struct {
+    route: GeneratedGqaScorePreworkRoute,
+    score_capacity: u16,
+    consumer: GeneratedGqaScorePreworkConsumer = .serial,
+    tiled64_required: bool = false,
+    consumer_resolution: ConsumerResolution = .serial_configured,
+
+    pub const ConsumerResolution = enum(u8) {
+        serial_configured = 1,
+        tiled64_selected = 2,
+        tiled64_ineligible_fallback = 3,
+        required_tiled64_ineligible = 4,
+    };
+
+    pub fn workspaceBytes(self: GeneratedGqaScorePreworkSelection, num_heads: usize) ?usize {
+        const scores = std.math.mul(usize, num_heads, self.score_capacity) catch return null;
+        return std.math.mul(usize, scores, @sizeOf(f32)) catch null;
+    }
+};
+
+const GeneratedGqaScorePreworkConsumerLogEvent = enum(u8) {
+    active,
+    fallback_ineligible,
+    fallback_symbol,
+    rejected_required,
+};
+
+var generated_gqa_score_prework_consumer_event_log_word = std.atomic.Value(u64).init(0);
+
+fn generatedGqaScorePreworkConsumerLogBit(
+    event: GeneratedGqaScorePreworkConsumerLogEvent,
+    consumer: ?GeneratedGqaScorePreworkConsumer,
+    head_dim: usize,
+) ?u64 {
+    const consumer_slot: usize = if (consumer) |selected|
+        switch (selected) {
+            .serial => 0,
+            .tiled64 => 1,
+        }
+    else
+        2;
+    const head_dim_slot: usize = switch (head_dim) {
+        256 => 0,
+        512 => 1,
+        else => return null,
+    };
+    const bit_index = @as(usize, @intFromEnum(event)) * 6 + consumer_slot * 2 + head_dim_slot;
+    return @as(u64, 1) << @intCast(bit_index);
+}
+
+fn claimGeneratedGqaScorePreworkConsumerLog(
+    word: *std.atomic.Value(u64),
+    event: GeneratedGqaScorePreworkConsumerLogEvent,
+    consumer: ?GeneratedGqaScorePreworkConsumer,
+    head_dim: usize,
+) bool {
+    const bit = generatedGqaScorePreworkConsumerLogBit(event, consumer, head_dim) orelse return false;
+    return word.fetchOr(bit, .monotonic) & bit == 0;
+}
+
+fn generatedGqaScorePreworkConfiguredModeName(selection: GeneratedGqaScorePreworkSelection) []const u8 {
+    if (selection.tiled64_required) return "required-tiled64";
+    return switch (selection.consumer_resolution) {
+        .serial_configured => "serial",
+        .tiled64_selected, .tiled64_ineligible_fallback => "tiled64",
+        .required_tiled64_ineligible => "required-tiled64",
+    };
+}
+
+fn noteGeneratedGqaScorePreworkConsumerEvent(
+    event: GeneratedGqaScorePreworkConsumerLogEvent,
+    configured: []const u8,
+    consumer: ?GeneratedGqaScorePreworkConsumer,
+    route: GeneratedGqaScorePreworkRoute,
+    head_dim: usize,
+    fallback_reason: []const u8,
+) void {
+    if (!claimGeneratedGqaScorePreworkConsumerLog(
+        &generated_gqa_score_prework_consumer_event_log_word,
+        event,
+        consumer,
+        head_dim,
+    )) return;
+    const consumer_name = if (consumer) |selected| selected.name() else "none";
+    const event_name: []const u8 = switch (event) {
+        .active => "active",
+        .fallback_ineligible, .fallback_symbol => "fallback",
+        .rejected_required => "rejected",
+    };
+    if (event == .active) {
+        std.log.info(
+            "cuda_gqa_score_prework_consumer: event={s} configured={s} consumer={s} route={s} head_dim={d} fallback_reason={s} source=runtime",
+            .{ event_name, configured, consumer_name, route.name(), head_dim, fallback_reason },
+        );
+    } else if (event == .rejected_required) {
+        std.log.err(
+            "cuda_gqa_score_prework_consumer: event={s} configured={s} consumer={s} route={s} head_dim={d} fallback_reason={s} source=runtime",
+            .{ event_name, configured, consumer_name, route.name(), head_dim, fallback_reason },
+        );
+    } else {
+        std.log.warn(
+            "cuda_gqa_score_prework_consumer: event={s} configured={s} consumer={s} route={s} head_dim={d} fallback_reason={s} source=runtime",
+            .{ event_name, configured, consumer_name, route.name(), head_dim, fallback_reason },
+        );
+    }
+}
+
+fn generatedGqaScorePreworkTiled64Eligible(
+    request: GeneratedGqaScorePreworkRequest,
+    selection: GeneratedGqaScorePreworkSelection,
+    compute_major: i32,
+    compute_minor: i32,
+) bool {
+    if (compute_major != 8 or compute_minor != 9 or
+        request.num_heads != 8 or request.num_kv_heads != 1 or
+        request.format != 2 or request.value_format != 2)
+    {
+        return false;
+    }
+    const head_dim = std.math.cast(u16, request.head_dim) orelse return false;
+    const max_kv_tokens = cuda_kernel_renderer.generatedAttentionScorePreworkTiled64MaxKvTokens(head_dim) orelse
+        return false;
+    if (selection.score_capacity > max_kv_tokens) return false;
+    return switch (selection.route) {
+        .gemma4_f16_local => request.head_dim == 256 and request.sliding_window == 512 and selection.score_capacity == 512,
+        .gemma4_f16_global => request.head_dim == 512 and request.sliding_window == 0 and
+            selection.score_capacity == cuda_kernel_renderer.generated_attention_score_prework_tiled64_hd512_max_kv_tokens,
+        .none, .f32_control => false,
+    };
+}
+
+fn generatedGqaScorePreworkPagedLayoutEligible(request: GeneratedGqaScorePreworkRequest) bool {
+    if (request.physical_token_capacity == 0 or request.physical_token_capacity > std.math.maxInt(u32)) return false;
+    if (request.block_count == 0) return request.physical_token_capacity >= request.kv_seq_len;
+    if (request.page_size_tokens == 0 or request.page_size_tokens > std.math.maxInt(u32) or
+        request.block_count > std.math.maxInt(u32)) return false;
+    const rounded_tokens = std.math.add(usize, request.kv_seq_len, request.page_size_tokens - 1) catch return false;
+    const required_blocks = rounded_tokens / request.page_size_tokens;
+    return request.block_count >= required_blocks;
+}
+
+fn generatedGqaScorePreworkBaseEligible(request: GeneratedGqaScorePreworkRequest) bool {
+    return generatedGqaDecodeShapeEligible(
+        request.batch,
+        request.q_seq_len,
+        request.head_dim,
+        request.num_heads,
+        request.num_kv_heads,
+    ) and
+        request.kv_seq_len > 0 and
+        request.kv_seq_len <= cuda_kernel_renderer.generated_attention_score_prework_max_kv_tokens and
+        request.mask_len == 0 and
+        request.bias_mode == 0 and
+        request.key_row_bytes > 0 and
+        request.base_key_row_bytes == request.key_row_bytes and
+        generatedGqaScorePreworkPagedLayoutEligible(request);
+}
+
+fn generatedGqaScorePreworkSelectionFor(
+    request: GeneratedGqaScorePreworkRequest,
+    mode: GeneratedGqaScorePreworkMode,
+    compute_major: i32,
+    compute_minor: i32,
+) ?GeneratedGqaScorePreworkSelection {
+    if (mode == .disabled or !generatedGqaScorePreworkBaseEligible(request)) return null;
+    const compute_supported = compute_major > 7 or (compute_major == 7 and compute_minor >= 5);
+    if (!compute_supported) return null;
+
+    const kv_row_values = std.math.mul(usize, request.num_kv_heads, request.head_dim) catch return null;
+    const f16_row_bytes = std.math.mul(usize, kv_row_values, @sizeOf(f16)) catch return null;
+    const f32_row_bytes = std.math.mul(usize, kv_row_values, @sizeOf(f32)) catch return null;
+    const f16_gemma4 = request.num_heads == 8 and
+        (request.num_kv_heads == 1 or request.num_kv_heads == 2) and
+        request.format == 2 and request.value_format == 2 and
+        request.key_row_bytes == f16_row_bytes and request.value_row_bytes == f16_row_bytes;
+
+    if (f16_gemma4) {
+        const selection: ?GeneratedGqaScorePreworkSelection = if (request.head_dim == 256 and request.sliding_window == 512)
+            .{ .route = .gemma4_f16_local, .score_capacity = 512 }
+        else if (request.head_dim == 512 and request.sliding_window == 0)
+            .{ .route = .gemma4_f16_global, .score_capacity = cuda_kernel_renderer.generated_attention_score_prework_max_kv_tokens }
+        else
+            null;
+        if (selection) |selected| {
+            if (mode == .explicit) return selected;
+            // The default is intentionally architecture- and evidence-bound:
+            // the exact route was qualified on sm_89 and only wins once the
+            // long-context crossover is reached. Explicit mode remains the
+            // controlled path for qualifying other supported architectures.
+            if (compute_major == 8 and compute_minor == 9 and request.kv_seq_len >= 512) return selected;
+        }
+        return null;
+    }
+
+    if (mode != .explicit or request.value_format != 0 or request.value_row_bytes != f32_row_bytes or
+        (request.format != 0 and request.format != 2))
+    {
+        return null;
+    }
+    if (request.format == 2 and request.key_row_bytes != f16_row_bytes) return null;
+    const capacity = if (request.sliding_window == 0)
+        cuda_kernel_renderer.generated_attention_score_prework_max_kv_tokens
+    else
+        @min(request.sliding_window, cuda_kernel_renderer.generated_attention_score_prework_max_kv_tokens);
+    if (capacity == 0) return null;
+    return .{ .route = .f32_control, .score_capacity = @intCast(capacity) };
+}
+
+const GeneratedGqaScorePreworkDecision = union(enum) {
+    not_selected,
+    selected: GeneratedGqaScorePreworkSelection,
+    required_tiled64_rejected,
+    invalid_config_rejected,
+};
+
+fn generatedGqaScorePreworkDecisionFor(
+    request: GeneratedGqaScorePreworkRequest,
+    mode: GeneratedGqaScorePreworkMode,
+    consumer_mode: GeneratedGqaScorePreworkConsumerMode,
+    compute_major: i32,
+    compute_minor: i32,
+) GeneratedGqaScorePreworkDecision {
+    if (consumer_mode == .invalid) return .invalid_config_rejected;
+    var selection = generatedGqaScorePreworkSelectionFor(request, mode, compute_major, compute_minor) orelse
+        return if (consumer_mode.requiresTiled64() and request.q_seq_len == 1)
+            .required_tiled64_rejected
+        else
+            .not_selected;
+    selection.tiled64_required = consumer_mode.requiresTiled64();
+    switch (consumer_mode) {
+        .serial => selection.consumer_resolution = .serial_configured,
+        .invalid => unreachable,
+        .tiled64, .required_tiled64 => {
+            if (generatedGqaScorePreworkTiled64Eligible(request, selection, compute_major, compute_minor)) {
+                selection.consumer = .tiled64;
+                selection.consumer_resolution = .tiled64_selected;
+            } else {
+                selection.consumer_resolution = if (consumer_mode == .required_tiled64)
+                    .required_tiled64_ineligible
+                else
+                    .tiled64_ineligible_fallback;
+            }
+        },
+    }
+    if (selection.consumer_resolution == .required_tiled64_ineligible) return .required_tiled64_rejected;
+    return .{ .selected = selection };
+}
+
+pub fn generatedGqaScorePreworkSelectionWithConsumerFor(
+    request: GeneratedGqaScorePreworkRequest,
+    mode: GeneratedGqaScorePreworkMode,
+    consumer_mode: GeneratedGqaScorePreworkConsumerMode,
+    compute_major: i32,
+    compute_minor: i32,
+) ?GeneratedGqaScorePreworkSelection {
+    return switch (generatedGqaScorePreworkDecisionFor(request, mode, consumer_mode, compute_major, compute_minor)) {
+        .selected => |selection| selection,
+        .not_selected, .required_tiled64_rejected, .invalid_config_rejected => null,
+    };
+}
+
+fn generatedGqaScorePreworkDecision(
+    request: GeneratedGqaScorePreworkRequest,
+    compute_major: i32,
+    compute_minor: i32,
+) GeneratedGqaScorePreworkDecision {
+    return generatedGqaScorePreworkDecisionFor(
+        request,
+        generatedGqaScorePreworkMode(),
+        generatedGqaScorePreworkConsumerMode(),
+        compute_major,
+        compute_minor,
+    );
+}
+
+pub fn generatedGqaScorePreworkSelection(
+    request: GeneratedGqaScorePreworkRequest,
+    compute_major: i32,
+    compute_minor: i32,
+) ?GeneratedGqaScorePreworkSelection {
+    return switch (generatedGqaScorePreworkDecision(request, compute_major, compute_minor)) {
+        .selected => |selection| selection,
+        .not_selected, .required_tiled64_rejected, .invalid_config_rejected => null,
+    };
+}
+
+pub fn validateGeneratedGqaScorePreworkConsumerRequirementFor(
+    request: GeneratedGqaScorePreworkRequest,
+    mode: GeneratedGqaScorePreworkMode,
+    consumer_mode: GeneratedGqaScorePreworkConsumerMode,
+    compute_major: i32,
+    compute_minor: i32,
+) driver_mod.Error!void {
+    switch (generatedGqaScorePreworkDecisionFor(request, mode, consumer_mode, compute_major, compute_minor)) {
+        .not_selected, .selected => {},
+        .required_tiled64_rejected => {
+            noteGeneratedGqaScorePreworkConsumerEvent(
+                .rejected_required,
+                "required-tiled64",
+                null,
+                .none,
+                request.head_dim,
+                "consumer_ineligible",
+            );
+            return error.CudaKernelUnavailable;
+        },
+        .invalid_config_rejected => return error.InvalidCudaState,
+    }
+}
+
+pub fn generatedGqaScorePreworkScheduleTag(
+    request: GeneratedGqaScorePreworkRequest,
+    compute_major: i32,
+    compute_minor: i32,
+) u8 {
+    const selection = generatedGqaScorePreworkSelection(request, compute_major, compute_minor) orelse return 0;
+    return @intFromEnum(selection.route);
+}
+
 fn generatedGqaDecodeSplitKvMinTokens() u32 {
     const configured = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SPLIT_KV_MIN_TOKENS") orelse
         cuda_kernel_renderer.generated_attention_split_kv_min_tokens_default;
@@ -200,6 +672,21 @@ fn generatedGqaDecodeWorkspaceBytes() usize {
     return @max(split_workspace.total_bytes, score_workspace.total_bytes);
 }
 
+fn allocGqaSplitkOnlineDecodeWorkspace(
+    ctx: *context_mod.CudaContext,
+) driver_mod.Error!buffer_mod.DeviceBuffer {
+    const layout = cuda_kernel_renderer.generatedSplitkOnlineDecodeWorkspaceLayout();
+    var workspace = try buffer_mod.DeviceBuffer.alloc(ctx, layout.total_bytes);
+    errdefer workspace.free(ctx);
+    const zero_counters = [_]u32{0} ** cuda_kernel_renderer.generated_splitk_online_decode_query_heads;
+    const counters = buffer_mod.DeviceBuffer{
+        .ptr = workspace.ptr + layout.completion_counters_offset,
+        .len = zero_counters.len * @sizeOf(u32),
+    };
+    try counters.copyFromHost(ctx, std.mem.sliceAsBytes(&zero_counters));
+    return workspace;
+}
+
 fn generatedGqaDecodeShapeEligible(batch: usize, q_seq_len: usize, head_dim: usize, num_heads: usize, num_kv_heads: usize) bool {
     return batch == cuda_kernel_renderer.generated_attention_workspace_max_batch and
         q_seq_len == 1 and
@@ -211,46 +698,190 @@ fn generatedGqaDecodeShapeEligible(batch: usize, q_seq_len: usize, head_dim: usi
         num_heads <= cuda_kernel_renderer.generated_attention_workspace_max_query_heads;
 }
 
-fn generatedGqaScorePreworkShapeEligible(
-    batch: usize,
-    q_seq_len: usize,
-    kv_seq_len: usize,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    mask_len: usize,
-    bias_mode: u32,
-    key_row_bytes: usize,
-    base_key_row_bytes: usize,
-    value_row_bytes: usize,
-    format: u32,
-    value_format: u32,
-    physical_token_capacity: usize,
-) bool {
-    return generatedGqaDecodeShapeEligible(batch, q_seq_len, head_dim, num_heads, num_kv_heads) and
-        kv_seq_len > 0 and
-        kv_seq_len <= cuda_kernel_renderer.generated_attention_score_prework_max_kv_tokens and
-        physical_token_capacity >= kv_seq_len and
-        physical_token_capacity <= cuda_kernel_renderer.generated_attention_score_prework_max_kv_tokens and
-        mask_len == 0 and
-        bias_mode == 0 and
-        key_row_bytes > 0 and
-        base_key_row_bytes == key_row_bytes and
-        value_row_bytes >= num_kv_heads * head_dim * @sizeOf(f32) and
-        (format == 0 or format == 2) and
-        value_format == 0;
+const GqaDecodeProfile = enum {
+    off,
+    splitk_online_sm89,
+    required_splitk_online_sm89,
+
+    fn name(self: GqaDecodeProfile) []const u8 {
+        return switch (self) {
+            .off => "off",
+            .splitk_online_sm89 => "splitk-online-sm89",
+            .required_splitk_online_sm89 => "required-splitk-online-sm89",
+        };
+    }
+
+    fn selectsSplitkOnlineSm89(self: GqaDecodeProfile) bool {
+        return self == .splitk_online_sm89 or self == .required_splitk_online_sm89;
+    }
+
+    fn failClosed(self: GqaDecodeProfile) bool {
+        return self == .required_splitk_online_sm89;
+    }
+};
+
+fn parseGqaDecodeProfile(value: []const u8) ?GqaDecodeProfile {
+    if (std.mem.eql(u8, value, "off")) return .off;
+    if (std.mem.eql(u8, value, "splitk-online-sm89")) return .splitk_online_sm89;
+    if (std.mem.eql(u8, value, "required-splitk-online-sm89")) return .required_splitk_online_sm89;
+    return null;
 }
 
-fn fastGqaPrefillEnabled() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_FAST", false);
+fn configuredGqaDecodeProfile() driver_mod.Error!GqaDecodeProfile {
+    const value = platform.env.getenv("ANTFLY_INFERENCE_CUDA_GQA_DECODE_PROFILE") orelse {
+        std.log.info("cuda_gqa_decode_profile: status=configured profile=off source=default", .{});
+        return .off;
+    };
+    const profile = parseGqaDecodeProfile(value) orelse {
+        std.log.err(
+            "cuda_gqa_decode_profile: status=invalid source=canonical value={s}",
+            .{value},
+        );
+        return error.InvalidCudaState;
+    };
+    std.log.info(
+        "cuda_gqa_decode_profile: status=configured profile={s} source=canonical",
+        .{profile.name()},
+    );
+    return profile;
 }
 
-fn tiledGqaPrefillEnabled() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_TILED", false);
+const GqaPrefillProfile = enum {
+    off,
+    fast,
+    required_fast,
+    tiled,
+    mma,
+    tiled_f16_exact,
+    required_tiled_f16_exact,
+    tiled_f16_warp,
+    required_tiled_f16_warp,
+    flash_f16_sm89,
+    required_flash_f16_sm89,
+
+    fn name(self: GqaPrefillProfile) []const u8 {
+        return switch (self) {
+            .off => "off",
+            .fast => "fast",
+            .required_fast => "required-fast",
+            .tiled => "tiled",
+            .mma => "mma",
+            .tiled_f16_exact => "tiled-f16-exact",
+            .required_tiled_f16_exact => "required-tiled-f16-exact",
+            .tiled_f16_warp => "tiled-f16-warp",
+            .required_tiled_f16_warp => "required-tiled-f16-warp",
+            .flash_f16_sm89 => "flash-f16-sm89",
+            .required_flash_f16_sm89 => "required-flash-f16-sm89",
+        };
+    }
+
+    fn selectsFast(self: GqaPrefillProfile) bool {
+        return self == .fast or self == .required_fast;
+    }
+
+    fn failClosed(self: GqaPrefillProfile) bool {
+        return self == .required_fast or
+            self == .required_tiled_f16_exact or
+            self == .required_tiled_f16_warp or
+            self == .required_flash_f16_sm89;
+    }
+
+    fn selectsTiledF16Exact(self: GqaPrefillProfile) bool {
+        return self == .tiled_f16_exact or self == .required_tiled_f16_exact;
+    }
+
+    fn selectsTiledF16Warp(self: GqaPrefillProfile) bool {
+        return self == .tiled_f16_warp or self == .required_tiled_f16_warp;
+    }
+
+    fn selectsFlashF16Sm89(self: GqaPrefillProfile) bool {
+        return self == .flash_f16_sm89 or self == .required_flash_f16_sm89;
+    }
+};
+
+const GqaPrefillProfileSource = enum {
+    default,
+    canonical,
+    legacy,
+
+    fn name(self: GqaPrefillProfileSource) []const u8 {
+        return switch (self) {
+            .default => "default",
+            .canonical => "canonical",
+            .legacy => "legacy",
+        };
+    }
+};
+
+const GqaPrefillProfileConfig = struct {
+    profile: GqaPrefillProfile,
+    source: GqaPrefillProfileSource,
+};
+
+fn parseGqaPrefillProfile(value: []const u8) ?GqaPrefillProfile {
+    if (std.mem.eql(u8, value, "off")) return .off;
+    if (std.mem.eql(u8, value, "fast")) return .fast;
+    if (std.mem.eql(u8, value, "required-fast")) return .required_fast;
+    if (std.mem.eql(u8, value, "tiled")) return .tiled;
+    if (std.mem.eql(u8, value, "mma")) return .mma;
+    if (std.mem.eql(u8, value, "tiled-f16-exact")) return .tiled_f16_exact;
+    if (std.mem.eql(u8, value, "required-tiled-f16-exact")) return .required_tiled_f16_exact;
+    if (std.mem.eql(u8, value, "tiled-f16-warp")) return .tiled_f16_warp;
+    if (std.mem.eql(u8, value, "required-tiled-f16-warp")) return .required_tiled_f16_warp;
+    if (std.mem.eql(u8, value, "flash-f16-sm89")) return .flash_f16_sm89;
+    if (std.mem.eql(u8, value, "required-flash-f16-sm89")) return .required_flash_f16_sm89;
+    return null;
 }
 
-fn mmaGqaPrefillEnabled() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_MMA", false);
+/// Resolve the canonical typed profile once at module load. The independent
+/// booleans remain a compatibility bridge, but ambiguous legacy combinations
+/// are rejected instead of relying on route-order precedence.
+fn resolveGqaPrefillProfile(
+    canonical: ?[]const u8,
+    legacy_fast: bool,
+    legacy_tiled: bool,
+    legacy_mma: bool,
+) error{InvalidCudaState}!GqaPrefillProfileConfig {
+    if (canonical) |value| {
+        return .{
+            .profile = parseGqaPrefillProfile(value) orelse return error.InvalidCudaState,
+            .source = .canonical,
+        };
+    }
+    const enabled_count = @as(u2, @intFromBool(legacy_fast)) +
+        @as(u2, @intFromBool(legacy_tiled)) +
+        @as(u2, @intFromBool(legacy_mma));
+    if (enabled_count > 1) return error.InvalidCudaState;
+    if (legacy_fast) return .{ .profile = .fast, .source = .legacy };
+    if (legacy_tiled) return .{ .profile = .tiled, .source = .legacy };
+    if (legacy_mma) return .{ .profile = .mma, .source = .legacy };
+    return .{ .profile = .off, .source = .default };
+}
+
+fn configuredGqaPrefillProfile() driver_mod.Error!GqaPrefillProfileConfig {
+    const canonical = platform.env.getenv("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE");
+    const legacy_fast = platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_FAST", false);
+    const legacy_tiled = platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_TILED", false);
+    const legacy_mma = platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_MMA", false);
+    const config = resolveGqaPrefillProfile(canonical, legacy_fast, legacy_tiled, legacy_mma) catch {
+        if (canonical) |value| {
+            std.log.err(
+                "cuda_gqa_prefill_profile: status=invalid source=canonical value={s}",
+                .{value},
+            );
+        } else {
+            std.log.err(
+                "cuda_gqa_prefill_profile: status=invalid source=legacy reason=ambiguous-booleans fast={d} tiled={d} mma={d}",
+                .{ @intFromBool(legacy_fast), @intFromBool(legacy_tiled), @intFromBool(legacy_mma) },
+            );
+        }
+        return error.InvalidCudaState;
+    };
+    std.log.info(
+        "cuda_gqa_prefill_profile: status=configured profile={s} source={s}",
+        .{ config.profile.name(), config.source.name() },
+    );
+    return config;
 }
 
 fn mmaM32GqaPrefillEnabled() bool {
@@ -279,8 +910,8 @@ fn gqaPrefillShapeEligible(batch: usize, q_seq_len: usize, num_heads: usize, num
         head_dim % 32 == 0;
 }
 
-fn fastGqaPrefillEligible(batch: usize, q_seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, mask_len: usize, bias_mode: u32) bool {
-    return fastGqaPrefillEnabled() and
+fn fastGqaPrefillEligible(profile: GqaPrefillProfile, batch: usize, q_seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, mask_len: usize, bias_mode: u32) bool {
+    return profile.selectsFast() and
         gqaPrefillShapeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode);
 }
 
@@ -288,15 +919,556 @@ pub const GqaAttentionLaunchKind = enum {
     none,
     decode,
     decode_generated,
+    decode_splitk_online_sm89,
+    decode_splitk_online_sm89_ineligible_fallback,
+    decode_splitk_online_sm89_symbol_fallback,
     decode_generated_score_prework,
+    decode_generated_score_prework_tiled64,
+    decode_generated_score_prework_tiled64_ineligible_fallback,
+    decode_generated_score_prework_tiled64_symbol_fallback,
     decode_fast,
     decode_fast_fallback,
     prefill_fast,
     prefill_tiled,
     prefill_mma,
     prefill_mma_m32,
+    prefill_tiled_f16_exact,
+    prefill_tiled_f16_warp,
+    prefill_flash_f16_sm89,
+    prefill_flash_f16_sm89_ineligible_fallback,
+    prefill_flash_f16_sm89_symbol_fallback,
     scalar,
 };
+
+/// A candidate attempt can fall back while the actual production attention
+/// route still succeeds. Keep both facts so runtime counters report the real
+/// kernel and the candidate fallback without conflating them.
+pub const GqaAttentionLaunchResult = struct {
+    kind: GqaAttentionLaunchKind,
+    splitk_online_fallback: ?GqaAttentionLaunchKind = null,
+};
+
+const GqaSplitkOnlineDecodeEligibility = enum {
+    eligible,
+    compute_capability_ineligible,
+    shape_ineligible,
+    storage_format_ineligible,
+    row_bytes_ineligible,
+    empty_kv_sequence,
+    position_policy_ineligible,
+    sliding_window_ineligible,
+    page_table_ineligible,
+    page_size_ineligible,
+    physical_capacity_ineligible,
+    block_count_ineligible,
+    max_visible_tokens_ineligible,
+    workspace_ineligible,
+};
+
+const GqaSplitkOnlineDecodeRequest = struct {
+    compute_major: i32,
+    compute_minor: i32,
+    batch: usize,
+    q_seq_len: usize,
+    kv_seq_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    query_position_offset: usize,
+    kv_position_offset: usize,
+    sliding_window: usize,
+    total_sequence_len: usize,
+    mask_len: usize,
+    bias_mode: u32,
+    key_row_bytes: usize,
+    base_key_row_bytes: usize,
+    value_row_bytes: usize,
+    block_count: usize,
+    page_size_tokens: usize,
+    format: u32,
+    value_format: u32,
+    physical_token_capacity: usize,
+    block_table_present: bool,
+    decode_scalars_present: bool,
+    workspace_available: bool,
+};
+
+/// Graph replay updates these fields through device scalars after ordinary
+/// host launch eligibility has already run. Keep that dynamic contract typed
+/// and independently testable so a required split-K profile cannot replay
+/// beyond its qualified/global-storage boundary.
+pub fn gqaSplitkOnlineDecodeReplayScalarsEligible(
+    query_position_offset: usize,
+    kv_seq_len: usize,
+    total_sequence_len: usize,
+    kv_position_offset: usize,
+    logical_replay_limit: usize,
+) bool {
+    const qualified_limit = @min(
+        logical_replay_limit,
+        cuda_kernel_renderer.generated_splitk_online_decode_max_sequence_tokens,
+    );
+    if (qualified_limit == 0 or
+        kv_seq_len == 0 or kv_seq_len > qualified_limit or
+        total_sequence_len == 0 or total_sequence_len > qualified_limit)
+    {
+        return false;
+    }
+    const query_end = std.math.add(usize, query_position_offset, 1) catch return false;
+    const kv_end = std.math.add(usize, kv_position_offset, kv_seq_len) catch return false;
+    return query_end == total_sequence_len and kv_end == total_sequence_len;
+}
+
+fn gqaSplitkOnlineDecodeEligibility(
+    request: GqaSplitkOnlineDecodeRequest,
+) GqaSplitkOnlineDecodeEligibility {
+    if (request.compute_major != 8 or request.compute_minor != 9) {
+        return .compute_capability_ineligible;
+    }
+    if (request.batch != 1 or request.q_seq_len != 1 or
+        request.num_heads != cuda_kernel_renderer.generated_splitk_online_decode_query_heads or
+        request.num_kv_heads != cuda_kernel_renderer.generated_splitk_online_decode_kv_heads or
+        (request.head_dim != 256 and request.head_dim != 512) or
+        request.mask_len != 0 or request.bias_mode != 0)
+    {
+        return .shape_ineligible;
+    }
+    if (request.format != cuda_kernel_renderer.generated_splitk_online_decode_format_f16 or
+        request.value_format != cuda_kernel_renderer.generated_splitk_online_decode_format_f16)
+    {
+        return .storage_format_ineligible;
+    }
+    const expected_row_bytes = std.math.mul(usize, request.head_dim, @sizeOf(u16)) catch
+        return .row_bytes_ineligible;
+    if (request.key_row_bytes != expected_row_bytes or
+        request.base_key_row_bytes != expected_row_bytes or
+        request.value_row_bytes != expected_row_bytes)
+    {
+        return .row_bytes_ineligible;
+    }
+    if (request.kv_seq_len == 0) return .empty_kv_sequence;
+    if (request.query_position_offset < request.kv_position_offset) {
+        return .position_policy_ineligible;
+    }
+    const expected_window: usize = if (request.head_dim == 256) 512 else 0;
+    if (request.sliding_window != expected_window) return .sliding_window_ineligible;
+    if (request.block_table_present != (request.block_count != 0)) return .page_table_ineligible;
+    if (request.page_size_tokens != cuda_kernel_renderer.generated_splitk_online_decode_page_size_tokens) {
+        return .page_size_ineligible;
+    }
+    if (request.physical_token_capacity == 0 or
+        request.physical_token_capacity % request.page_size_tokens != 0 or
+        request.physical_token_capacity > std.math.maxInt(u32))
+    {
+        return .physical_capacity_ineligible;
+    }
+    if (!gqaSplitkOnlineDecodeReplayScalarsEligible(
+        request.query_position_offset,
+        request.kv_seq_len,
+        request.total_sequence_len,
+        request.kv_position_offset,
+        cuda_kernel_renderer.generated_splitk_online_decode_max_sequence_tokens,
+    )) return .position_policy_ineligible;
+    if (!request.block_table_present) {
+        if (request.physical_token_capacity < request.kv_seq_len) {
+            return .physical_capacity_ineligible;
+        }
+    } else {
+        const required_blocks = std.math.divCeil(usize, request.kv_seq_len, request.page_size_tokens) catch
+            return .block_count_ineligible;
+        if (request.block_count < required_blocks or request.block_count > std.math.maxInt(u32)) {
+            return .block_count_ineligible;
+        }
+    }
+    const max_visible_tokens: usize = if (request.head_dim == 256)
+        cuda_kernel_renderer.generated_splitk_online_decode_hd256_max_visible_tokens
+    else
+        cuda_kernel_renderer.generated_splitk_online_decode_hd512_max_visible_tokens;
+    if (request.head_dim == 512 and request.kv_seq_len > max_visible_tokens) {
+        return .max_visible_tokens_ineligible;
+    }
+    // Decode scalars preserve the same typed ABI during graph replay. The host
+    // fallback values are still bounded here; the generation admission gate
+    // keeps replay inside the qualified 4096-token global policy.
+    _ = request.decode_scalars_present;
+    if (!request.workspace_available) return .workspace_ineligible;
+    return .eligible;
+}
+
+fn requiredGqaSplitkOnlineDecodeRejectionReason(
+    eligibility: GqaSplitkOnlineDecodeEligibility,
+    symbol_available: bool,
+) []const u8 {
+    return switch (eligibility) {
+        .eligible => if (symbol_available) "splitk-online-sm89-not-selected" else "splitk-online-sm89-kernel-unavailable",
+        .compute_capability_ineligible => "splitk-online-sm89-compute-capability-ineligible",
+        .shape_ineligible => "splitk-online-sm89-shape-ineligible",
+        .storage_format_ineligible => "splitk-online-sm89-storage-format-ineligible",
+        .row_bytes_ineligible => "splitk-online-sm89-row-bytes-ineligible",
+        .empty_kv_sequence => "splitk-online-sm89-empty-kv-sequence",
+        .position_policy_ineligible => "splitk-online-sm89-position-policy-ineligible",
+        .sliding_window_ineligible => "splitk-online-sm89-sliding-window-ineligible",
+        .page_table_ineligible => "splitk-online-sm89-page-table-ineligible",
+        .page_size_ineligible => "splitk-online-sm89-page-size-ineligible",
+        .physical_capacity_ineligible => "splitk-online-sm89-physical-capacity-ineligible",
+        .block_count_ineligible => "splitk-online-sm89-block-count-ineligible",
+        .max_visible_tokens_ineligible => "splitk-online-sm89-max-visible-tokens-ineligible",
+        .workspace_ineligible => "splitk-online-sm89-workspace-ineligible",
+    };
+}
+
+const GqaSplitkOnlineDecodeTelemetryEvent = enum(u2) {
+    active,
+    ineligible_fallback,
+    symbol_fallback,
+    rejected,
+};
+
+fn claimGqaSplitkOnlineDecodeTelemetry(
+    word: *std.atomic.Value(u64),
+    event: GqaSplitkOnlineDecodeTelemetryEvent,
+    head_dim: usize,
+) bool {
+    const head_slot: usize = if (head_dim == 256) 0 else if (head_dim == 512) 1 else 2;
+    const bit_index = @as(usize, @intFromEnum(event)) * 3 + head_slot;
+    const bit = @as(u64, 1) << @intCast(bit_index);
+    return word.fetchOr(bit, .monotonic) & bit == 0;
+}
+
+const GeneratedGqaScorePreworkLaunchKind = enum {
+    none,
+    serial,
+    serial_tiled64_ineligible_fallback,
+    serial_tiled64_symbol_fallback,
+    tiled64,
+};
+
+const GqaF16PrefillEligibility = enum {
+    eligible,
+    shape_ineligible,
+    storage_format_ineligible,
+    row_bytes_ineligible,
+    decode_scalars_present,
+    empty_kv_sequence,
+    block_table_count_inconsistent,
+    page_size_ineligible,
+    physical_capacity_ineligible,
+    block_count_ineligible,
+    page_layout_ineligible,
+};
+
+const GqaF16PrefillRequest = struct {
+    batch: usize,
+    q_seq_len: usize,
+    kv_seq_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    mask_len: usize,
+    bias_mode: u32,
+    key_row_bytes: usize,
+    base_key_row_bytes: usize,
+    value_row_bytes: usize,
+    block_count: usize,
+    page_size_tokens: usize,
+    format: u32,
+    value_format: u32,
+    physical_token_capacity: usize,
+    block_table_present: bool,
+    decode_scalars_present: bool,
+};
+
+fn gqaF16PrefillEligibility(request: GqaF16PrefillRequest) GqaF16PrefillEligibility {
+    if (request.batch != 1 or
+        request.q_seq_len <= 1 or
+        request.num_heads != 8 or
+        request.num_kv_heads != 1 or
+        (request.head_dim != 256 and request.head_dim != 512) or
+        request.mask_len != 0 or
+        request.bias_mode != 0)
+    {
+        return .shape_ineligible;
+    }
+    if (request.format != 2 or request.value_format != 2)
+        return .storage_format_ineligible;
+    const expected_row_bytes = std.math.mul(usize, request.head_dim, @sizeOf(u16)) catch
+        return .row_bytes_ineligible;
+    if (request.key_row_bytes != expected_row_bytes or
+        request.base_key_row_bytes != expected_row_bytes or
+        request.value_row_bytes != expected_row_bytes)
+    {
+        return .row_bytes_ineligible;
+    }
+    if (request.decode_scalars_present) return .decode_scalars_present;
+    if (request.kv_seq_len == 0) return .empty_kv_sequence;
+
+    // CUDA's identity-page ABI deliberately represents an omitted identity
+    // table as (null, 0). An explicit page table must use (non-null, nonzero).
+    // Reject the two mixed states so a malformed call cannot silently switch
+    // between identity and explicit address translation.
+    if (request.block_table_present != (request.block_count != 0))
+        return .block_table_count_inconsistent;
+    if (request.page_size_tokens == 0) return .page_size_ineligible;
+
+    // Device KV allocation is always made in complete pages. Keeping this
+    // invariant at the selector boundary makes physical-token bounds stable
+    // for both the identity and explicit-table contracts.
+    if (request.physical_token_capacity == 0 or
+        request.physical_token_capacity % request.page_size_tokens != 0)
+    {
+        return .physical_capacity_ineligible;
+    }
+    if (!request.block_table_present) {
+        return if (request.physical_token_capacity >= request.kv_seq_len)
+            .eligible
+        else
+            .physical_capacity_ineligible;
+    }
+    if (request.physical_token_capacity < request.page_size_tokens)
+        return .physical_capacity_ineligible;
+    const required_blocks = std.math.divCeil(usize, request.kv_seq_len, request.page_size_tokens) catch
+        return .page_layout_ineligible;
+    if (request.block_count < required_blocks) return .block_count_ineligible;
+    return .eligible;
+}
+
+fn selectGqaF16PrefillLaunch(
+    profile: GqaPrefillProfile,
+    eligibility: GqaF16PrefillEligibility,
+    exact_available: bool,
+    warp_available: bool,
+) GqaAttentionLaunchKind {
+    if (eligibility != .eligible) return .none;
+    if (profile.selectsTiledF16Exact() and exact_available) return .prefill_tiled_f16_exact;
+    if (profile.selectsTiledF16Warp() and warp_available) return .prefill_tiled_f16_warp;
+    return .none;
+}
+
+fn requiredGqaPrefillLaunch(profile: GqaPrefillProfile) ?GqaAttentionLaunchKind {
+    return switch (profile) {
+        .required_fast => .prefill_fast,
+        .required_tiled_f16_exact => .prefill_tiled_f16_exact,
+        .required_tiled_f16_warp => .prefill_tiled_f16_warp,
+        .required_flash_f16_sm89 => .prefill_flash_f16_sm89,
+        else => null,
+    };
+}
+
+fn requiredGqaF16PrefillRejectionReason(
+    profile: GqaPrefillProfile,
+    eligibility: GqaF16PrefillEligibility,
+) []const u8 {
+    const exact = profile == .required_tiled_f16_exact;
+    return switch (eligibility) {
+        .eligible => if (exact) "tiled-f16-exact-kernel-unavailable" else "tiled-f16-warp-kernel-unavailable",
+        .shape_ineligible => if (exact) "tiled-f16-exact-shape-ineligible" else "tiled-f16-warp-shape-ineligible",
+        .storage_format_ineligible => if (exact) "tiled-f16-exact-storage-format-ineligible" else "tiled-f16-warp-storage-format-ineligible",
+        .row_bytes_ineligible => if (exact) "tiled-f16-exact-row-bytes-ineligible" else "tiled-f16-warp-row-bytes-ineligible",
+        .decode_scalars_present => if (exact) "tiled-f16-exact-decode-scalars-present" else "tiled-f16-warp-decode-scalars-present",
+        .empty_kv_sequence => if (exact) "tiled-f16-exact-empty-kv-sequence" else "tiled-f16-warp-empty-kv-sequence",
+        .block_table_count_inconsistent => if (exact) "tiled-f16-exact-block-table-count-inconsistent" else "tiled-f16-warp-block-table-count-inconsistent",
+        .page_size_ineligible => if (exact) "tiled-f16-exact-page-size-ineligible" else "tiled-f16-warp-page-size-ineligible",
+        .physical_capacity_ineligible => if (exact) "tiled-f16-exact-physical-capacity-ineligible" else "tiled-f16-warp-physical-capacity-ineligible",
+        .block_count_ineligible => if (exact) "tiled-f16-exact-block-count-ineligible" else "tiled-f16-warp-block-count-ineligible",
+        .page_layout_ineligible => if (exact) "tiled-f16-exact-page-layout-ineligible" else "tiled-f16-warp-page-layout-ineligible",
+    };
+}
+
+const GqaFlashPrefillEligibility = union(enum) {
+    eligible,
+    compute_capability_ineligible,
+    physical_capacity_ineligible,
+    page_size_ineligible,
+    query_length_policy_ineligible,
+    position_policy_ineligible,
+    sliding_window_ineligible,
+    base: GqaF16PrefillEligibility,
+};
+
+const GqaFlashPrefillRequest = struct {
+    base: GqaF16PrefillRequest,
+    compute_major: i32,
+    compute_minor: i32,
+    query_position_offset: usize,
+    kv_position_offset: usize,
+    sliding_window: usize,
+    total_sequence_len: usize,
+};
+
+fn gqaFlashPrefillEligibility(request: GqaFlashPrefillRequest) GqaFlashPrefillEligibility {
+    if (request.compute_major != 8 or request.compute_minor != 9) {
+        return .compute_capability_ineligible;
+    }
+    const base = gqaF16PrefillEligibility(request.base);
+    if (base != .eligible) return .{ .base = base };
+    // Flash qualification covers unique production-style pages, not an
+    // aliased physical ring. The host cannot inspect device table entries at
+    // dispatch, so require enough physical rows for every logical KV token on
+    // both identity and explicit-table routes. Existing exact/warp selectors
+    // deliberately retain their broader contract.
+    if (request.base.physical_token_capacity < request.base.kv_seq_len) {
+        return .physical_capacity_ineligible;
+    }
+    if (request.base.page_size_tokens != cuda_kernel_renderer.generated_flash_prefill_page_size_tokens) {
+        return .page_size_ineligible;
+    }
+    if (!cuda_kernel_renderer.FlashPrefillQueryLengthPolicy.gemma4_q512_or_q3_v1.accepts(
+        request.base.q_seq_len,
+        request.query_position_offset,
+    )) {
+        return .query_length_policy_ineligible;
+    }
+    const expected_kv_len = std.math.add(usize, request.query_position_offset, request.base.q_seq_len) catch
+        return .position_policy_ineligible;
+    if (request.kv_position_offset != 0 or
+        request.base.kv_seq_len != expected_kv_len or
+        request.total_sequence_len != request.base.kv_seq_len)
+    {
+        return .position_policy_ineligible;
+    }
+    const expected_sliding_window: usize = if (request.base.head_dim == 256) 512 else 0;
+    if (request.sliding_window != expected_sliding_window) return .sliding_window_ineligible;
+    return .eligible;
+}
+
+fn selectGqaFlashPrefillLaunch(
+    profile: GqaPrefillProfile,
+    eligibility: GqaFlashPrefillEligibility,
+    symbol_available: bool,
+) GqaAttentionLaunchKind {
+    if (!profile.selectsFlashF16Sm89() or eligibility != .eligible or !symbol_available) return .none;
+    return .prefill_flash_f16_sm89;
+}
+
+fn optionalGqaFlashPrefillFallbackLaunch(
+    profile: GqaPrefillProfile,
+    eligibility: GqaFlashPrefillEligibility,
+    symbol_available: bool,
+) ?GqaAttentionLaunchKind {
+    if (profile != .flash_f16_sm89) return null;
+    if (std.meta.activeTag(eligibility) != .eligible) {
+        return .prefill_flash_f16_sm89_ineligible_fallback;
+    }
+    if (!symbol_available) return .prefill_flash_f16_sm89_symbol_fallback;
+    return null;
+}
+
+fn requiredGqaFlashPrefillRejectionReason(
+    eligibility: GqaFlashPrefillEligibility,
+    symbol_available: bool,
+) []const u8 {
+    return switch (eligibility) {
+        .eligible => if (symbol_available) "flash-f16-sm89-not-selected" else "flash-f16-sm89-kernel-unavailable",
+        .compute_capability_ineligible => "flash-f16-sm89-compute-capability-ineligible",
+        .physical_capacity_ineligible => "flash-f16-sm89-physical-capacity-ineligible",
+        .page_size_ineligible => "flash-f16-sm89-page-size-ineligible",
+        .query_length_policy_ineligible => "flash-f16-sm89-query-length-policy-ineligible",
+        .position_policy_ineligible => "flash-f16-sm89-position-policy-ineligible",
+        .sliding_window_ineligible => "flash-f16-sm89-sliding-window-ineligible",
+        .base => |reason| switch (reason) {
+            .eligible => "flash-f16-sm89-base-contract-internal-error",
+            .shape_ineligible => "flash-f16-sm89-shape-ineligible",
+            .storage_format_ineligible => "flash-f16-sm89-storage-format-ineligible",
+            .row_bytes_ineligible => "flash-f16-sm89-row-bytes-ineligible",
+            .decode_scalars_present => "flash-f16-sm89-decode-scalars-present",
+            .empty_kv_sequence => "flash-f16-sm89-empty-kv-sequence",
+            .block_table_count_inconsistent => "flash-f16-sm89-block-table-count-inconsistent",
+            .page_size_ineligible => "flash-f16-sm89-page-size-ineligible",
+            .physical_capacity_ineligible => "flash-f16-sm89-physical-capacity-ineligible",
+            .block_count_ineligible => "flash-f16-sm89-block-count-ineligible",
+            .page_layout_ineligible => "flash-f16-sm89-page-layout-ineligible",
+        },
+    };
+}
+
+const gqa_prefill_route_log_word_count = 2;
+
+const GqaPrefillRouteLogSlot = struct {
+    word: usize,
+    bit: u64,
+};
+
+/// Allocate one stable telemetry slot per (prefill route, head dimension).
+///
+/// Gemma 4 mixes 256-d local-attention heads with 512-d global-attention
+/// heads. Logging only the first successful prefill launch can therefore hide
+/// a fallback in half of the model. Keep the route and exact supported head
+/// dimension in the key so release evidence can prove both geometries ran the
+/// configured kernel. The atomic claim also keeps concurrent server requests
+/// from racing the one-shot telemetry state.
+fn gqaPrefillRouteLogSlot(kind: GqaAttentionLaunchKind, head_dim: usize) ?GqaPrefillRouteLogSlot {
+    const route_slot: usize = switch (kind) {
+        .prefill_fast => 0,
+        .prefill_tiled => 1,
+        .prefill_mma => 2,
+        .prefill_mma_m32 => 3,
+        .prefill_tiled_f16_exact => 4,
+        .prefill_tiled_f16_warp => 5,
+        .prefill_flash_f16_sm89 => 6,
+        else => return null,
+    };
+    if (head_dim == 0 or head_dim > 512 or head_dim % 32 != 0) return null;
+    const head_dim_slot = head_dim / 32 - 1;
+    const bit_index = route_slot * 16 + head_dim_slot;
+    const word = bit_index / 64;
+    if (word >= gqa_prefill_route_log_word_count) return null;
+    return .{
+        .word = word,
+        .bit = @as(u64, 1) << @intCast(bit_index % 64),
+    };
+}
+
+fn claimGqaPrefillRouteLog(
+    words: *[gqa_prefill_route_log_word_count]std.atomic.Value(u64),
+    kind: GqaAttentionLaunchKind,
+    head_dim: usize,
+) bool {
+    const slot = gqaPrefillRouteLogSlot(kind, head_dim) orelse return false;
+    return words[slot.word].fetchOr(slot.bit, .monotonic) & slot.bit == 0;
+}
+
+const GqaFlashPrefillTelemetryEvent = enum(u2) {
+    active,
+    ineligible_fallback,
+    symbol_fallback,
+    rejected,
+};
+
+fn gqaFlashPrefillTelemetryBit(
+    event: GqaFlashPrefillTelemetryEvent,
+    head_dim: usize,
+    q_seq_len: usize,
+) u64 {
+    const head_bucket: usize = if (head_dim == 256) 0 else if (head_dim == 512) 1 else 2;
+    const query_bucket: usize = if (q_seq_len == 512) 0 else if (q_seq_len == 3) 1 else 2;
+    const bit_index = @as(usize, @intFromEnum(event)) * 9 + head_bucket * 3 + query_bucket;
+    return @as(u64, 1) << @intCast(bit_index);
+}
+
+fn claimGqaFlashPrefillTelemetry(
+    word: *std.atomic.Value(u64),
+    event: GqaFlashPrefillTelemetryEvent,
+    head_dim: usize,
+    q_seq_len: usize,
+) bool {
+    const bit = gqaFlashPrefillTelemetryBit(event, head_dim, q_seq_len);
+    return word.fetchOr(bit, .monotonic) & bit == 0;
+}
+
+fn gqaPrefillLaunchName(kind: GqaAttentionLaunchKind) ?[]const u8 {
+    return switch (kind) {
+        .prefill_fast => "prefill-fast",
+        .prefill_tiled => "prefill-tiled",
+        .prefill_mma => "prefill-mma",
+        .prefill_mma_m32 => "prefill-mma-m32",
+        .prefill_tiled_f16_exact => "prefill-tiled-f16-exact",
+        .prefill_tiled_f16_warp => "prefill-tiled-f16-warp",
+        .prefill_flash_f16_sm89 => "prefill-flash-f16-sm89",
+        .prefill_flash_f16_sm89_ineligible_fallback => "prefill-flash-f16-sm89-ineligible-fallback",
+        .prefill_flash_f16_sm89_symbol_fallback => "prefill-flash-f16-sm89-symbol-fallback",
+        else => null,
+    };
+}
 
 pub const QMatmulVariant = enum {
     legacy,
@@ -1073,15 +2245,36 @@ pub const KernelModule = struct {
     gqa_attention_decode_split4_kv_hd512_stage2_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_score_prework_hd256_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_score_prework_consume_hd256_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_score_prework_tiled64_hd256_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_score_prework_hd512_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_score_prework_consume_hd512_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_score_prework_tiled64_hd512_f32: driver_mod.CUfunction = null,
     gqa_attention_generated_workspace: buffer_mod.DeviceBuffer = .{},
+    gqa_attention_decode_splitk_online_sm89_hd256_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_splitk_online_sm89_hd512_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_splitk_online_workspace: buffer_mod.DeviceBuffer = .{},
+    gqa_decode_profile: GqaDecodeProfile = .off,
+    gqa_splitk_online_decode_telemetry_word: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     kv_write_suffix_decode_scalars_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_turboquant_fast_f32: driver_mod.CUfunction = null,
     gqa_attention_prefill_turboquant_fast_f32: driver_mod.CUfunction = null,
     gqa_attention_prefill_turboquant_tiled_f32: driver_mod.CUfunction = null,
     gqa_attention_prefill_turboquant_mma_f32: driver_mod.CUfunction = null,
     gqa_attention_prefill_turboquant_mma_m32_f32: driver_mod.CUfunction = null,
+    gqa_attention_prefill_tiled_f16_exact_f32: driver_mod.CUfunction = null,
+    gqa_attention_prefill_tiled_f16_warp_f32: driver_mod.CUfunction = null,
+    gqa_attention_prefill_flash_sm89_hd256_f32: driver_mod.CUfunction = null,
+    gqa_attention_prefill_flash_sm89_hd512_f32: driver_mod.CUfunction = null,
+    gqa_prefill_profile: GqaPrefillProfile = .off,
+    // Resolved once at module load: the score-prework decision runs per layer
+    // per decoded token and getenv is a linear scan of environ.
+    gqa_score_prework_mode: GeneratedGqaScorePreworkMode = .automatic,
+    gqa_score_prework_consumer_mode: GeneratedGqaScorePreworkConsumerMode = .serial,
+    gqa_prefill_route_log_words: [gqa_prefill_route_log_word_count]std.atomic.Value(u64) = .{
+        std.atomic.Value(u64).init(0),
+        std.atomic.Value(u64).init(0),
+    },
+    gqa_flash_prefill_telemetry_word: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// The mma prefill kernels need 64-95KB dynamic smem, above the 48KB
     /// default; CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES is raised
     /// once per module load (per function).
@@ -1127,6 +2320,7 @@ pub const KernelModule = struct {
     linear_q8_0_gated_down_f32_tile4: driver_mod.CUfunction = null,
     quantize_f32_q8_1_rows: driver_mod.CUfunction = null,
     quantize_gated_f32_q8_1_rows: driver_mod.CUfunction = null,
+    quantize_f32_ggml_q8_1_rows: driver_mod.CUfunction = null,
     linear_q4_k_generated_bias_gelu: driver_mod.CUfunction = null,
     linear_q4_k_generated_mmv: driver_mod.CUfunction = null,
     linear_q4_0_f32: driver_mod.CUfunction = null,
@@ -1139,6 +2333,10 @@ pub const KernelModule = struct {
     linear_q4_0_generated_pair_q8_e2b_12288: driver_mod.CUfunction = null,
     linear_q4_0_generated_down_q8_e2b_6144: driver_mod.CUfunction = null,
     linear_q4_0_generated_down_q8_e2b_12288: driver_mod.CUfunction = null,
+    linear_q4_0_generated_pair_ggml_q8_1_e2b_6144: driver_mod.CUfunction = null,
+    linear_q4_0_generated_pair_ggml_q8_1_e2b_12288: driver_mod.CUfunction = null,
+    linear_q4_0_generated_down_ggml_q8_1_e2b_6144: driver_mod.CUfunction = null,
+    linear_q4_0_generated_down_ggml_q8_1_e2b_12288: driver_mod.CUfunction = null,
     linear_q4_0_generated_pair_f32_e2b_6144_exact: driver_mod.CUfunction = null,
     linear_q4_0_generated_pair_f32_e2b_12288_exact: driver_mod.CUfunction = null,
     linear_q4_0_generated_down_f32_e2b_6144_exact: driver_mod.CUfunction = null,
@@ -1264,9 +2462,13 @@ pub const KernelModule = struct {
                 .q4_0_pair_activation_q8_1 => &self.linear_q4_0_generated_pair_q8,
                 .q4_0_pair_activation_q8_1_e2b_6144 => &self.linear_q4_0_generated_pair_q8_e2b_6144,
                 .q4_0_pair_activation_q8_1_e2b_12288 => &self.linear_q4_0_generated_pair_q8_e2b_12288,
+                .q4_0_pair_activation_ggml_q8_1_e2b_6144 => &self.linear_q4_0_generated_pair_ggml_q8_1_e2b_6144,
+                .q4_0_pair_activation_ggml_q8_1_e2b_12288 => &self.linear_q4_0_generated_pair_ggml_q8_1_e2b_12288,
                 .q4_0_down_q8_1 => &self.linear_q4_0_generated_down_q8,
                 .q4_0_down_q8_1_e2b_6144 => &self.linear_q4_0_generated_down_q8_e2b_6144,
                 .q4_0_down_q8_1_e2b_12288 => &self.linear_q4_0_generated_down_q8_e2b_12288,
+                .q4_0_down_ggml_q8_1_e2b_6144 => &self.linear_q4_0_generated_down_ggml_q8_1_e2b_6144,
+                .q4_0_down_ggml_q8_1_e2b_12288 => &self.linear_q4_0_generated_down_ggml_q8_1_e2b_12288,
                 .q4_0_pair_activation_f32_e2b_6144_exact => &self.linear_q4_0_generated_pair_f32_e2b_6144_exact,
                 .q4_0_pair_activation_f32_e2b_12288_exact => &self.linear_q4_0_generated_pair_f32_e2b_12288_exact,
                 .q4_0_down_f32_e2b_6144_exact => &self.linear_q4_0_generated_down_f32_e2b_6144_exact,
@@ -1328,17 +2530,45 @@ pub const KernelModule = struct {
                     &self.gqa_attention_decode_scalars_generated_hd512_f32,
                     plan.serial_kernel_id,
                 ),
-                .gqa_decode_score_prework_hd256_f32 => RuntimeJitFunctionMapping.two(
+                .gqa_decode_score_prework_hd256_f32 => RuntimeJitFunctionMapping.three(
                     &self.gqa_attention_decode_score_prework_hd256_f32,
                     plan.kernel_id,
                     &self.gqa_attention_decode_score_prework_consume_hd256_f32,
                     plan.serial_kernel_id,
+                    &self.gqa_attention_decode_score_prework_tiled64_hd256_f32,
+                    plan.tiled64_kernel_id.?,
                 ),
-                .gqa_decode_score_prework_hd512_f32 => RuntimeJitFunctionMapping.two(
+                .gqa_decode_score_prework_hd512_f32 => RuntimeJitFunctionMapping.three(
                     &self.gqa_attention_decode_score_prework_hd512_f32,
                     plan.kernel_id,
                     &self.gqa_attention_decode_score_prework_consume_hd512_f32,
                     plan.serial_kernel_id,
+                    &self.gqa_attention_decode_score_prework_tiled64_hd512_f32,
+                    plan.tiled64_kernel_id.?,
+                ),
+            };
+        }
+        if (artifact.cuda_flash_prefill_kernel) |kind| {
+            return switch (kind) {
+                .gqa_prefill_flash_sm89_hd256_swa512_f32 => RuntimeJitFunctionMapping.one(
+                    &self.gqa_attention_prefill_flash_sm89_hd256_f32,
+                    artifact.kernel_id,
+                ),
+                .gqa_prefill_flash_sm89_hd512_global_f32 => RuntimeJitFunctionMapping.one(
+                    &self.gqa_attention_prefill_flash_sm89_hd512_f32,
+                    artifact.kernel_id,
+                ),
+            };
+        }
+        if (artifact.cuda_splitk_online_decode_kernel) |kind| {
+            return switch (kind) {
+                .gqa_decode_splitk_online_sm89_hd256_swa512_f16_f32 => RuntimeJitFunctionMapping.one(
+                    &self.gqa_attention_decode_splitk_online_sm89_hd256_f32,
+                    artifact.kernel_id,
+                ),
+                .gqa_decode_splitk_online_sm89_hd512_global_f16_f32 => RuntimeJitFunctionMapping.one(
+                    &self.gqa_attention_decode_splitk_online_sm89_hd512_f32,
+                    artifact.kernel_id,
                 ),
             };
         }
@@ -1886,6 +3116,12 @@ pub const KernelModule = struct {
     }
 
     pub fn load(ctx: *context_mod.CudaContext) driver_mod.Error!KernelModule {
+        const gqa_decode_profile = try configuredGqaDecodeProfile();
+        const gqa_prefill_profile_config = try configuredGqaPrefillProfile();
+        // Resolved once at module load: these settings gate the per-layer
+        // decode attention dispatch and getenv is a linear scan of environ.
+        const gqa_score_prework_mode = generatedGqaScorePreworkMode();
+        const gqa_score_prework_consumer_mode = generatedGqaScorePreworkConsumerMode();
         try ctx.makeCurrent();
         var module: driver_mod.CUmodule = null;
         try loadModuleWithJitLog(ctx, &module);
@@ -2064,8 +3300,10 @@ pub const KernelModule = struct {
         const gqa_attention_decode_split4_kv_hd512_stage2_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_split4_stage2_kernel_id);
         const gqa_attention_decode_score_prework_hd256_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_score_prework_kernel_id);
         const gqa_attention_decode_score_prework_consume_hd256_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_score_prework_serial_kernel_id);
+        const gqa_attention_decode_score_prework_tiled64_hd256_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_score_prework_tiled64_kernel_id);
         const gqa_attention_decode_score_prework_hd512_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_score_prework_kernel_id);
         const gqa_attention_decode_score_prework_consume_hd512_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_score_prework_serial_kernel_id);
+        const gqa_attention_decode_score_prework_tiled64_hd512_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_score_prework_tiled64_kernel_id);
         const generated_split_functions_available = switch (generatedGqaDecodeSplitVariant()) {
             .split2 => gqa_attention_decode_split2_kv_hd256_stage1_f32 != null and
                 gqa_attention_decode_split2_kv_hd256_stage2_f32 != null and
@@ -2088,11 +3326,19 @@ pub const KernelModule = struct {
         {
             return error.CudaKernelUnavailable;
         }
-        if (generatedGqaScorePreworkEnabled() and
+        if (gqa_score_prework_mode == .explicit and
             (gqa_attention_decode_score_prework_hd256_f32 == null or
                 gqa_attention_decode_score_prework_consume_hd256_f32 == null or
                 gqa_attention_decode_score_prework_hd512_f32 == null or
                 gqa_attention_decode_score_prework_consume_hd512_f32 == null))
+        {
+            return error.CudaKernelUnavailable;
+        }
+        if (gqa_score_prework_consumer_mode.requiresTiled64() and
+            (gqa_attention_decode_score_prework_hd256_f32 == null or
+                gqa_attention_decode_score_prework_tiled64_hd256_f32 == null or
+                gqa_attention_decode_score_prework_hd512_f32 == null or
+                gqa_attention_decode_score_prework_tiled64_hd512_f32 == null))
         {
             return error.CudaKernelUnavailable;
         }
@@ -2102,6 +3348,56 @@ pub const KernelModule = struct {
         const gqa_attention_prefill_turboquant_tiled_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_turboquant_tiled_f32");
         const gqa_attention_prefill_turboquant_mma_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_turboquant_mma_f32");
         const gqa_attention_prefill_turboquant_mma_m32_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_turboquant_mma_m32_f32");
+        const gqa_attention_prefill_tiled_f16_exact_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_tiled_f16_exact_f32");
+        const gqa_attention_prefill_tiled_f16_warp_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_tiled_f16_warp_f32");
+        const gqa_attention_prefill_flash_sm89_hd256_f32 = loadOptionalFunction(
+            ctx,
+            module,
+            cuda_kernel_renderer.generated_flash_prefill_hd256_kernel_id,
+        );
+        const gqa_attention_prefill_flash_sm89_hd512_f32 = loadOptionalFunction(
+            ctx,
+            module,
+            cuda_kernel_renderer.generated_flash_prefill_hd512_kernel_id,
+        );
+        const gqa_attention_decode_splitk_online_sm89_hd256_f32 = loadOptionalFunction(
+            ctx,
+            module,
+            cuda_kernel_renderer.generated_splitk_online_decode_hd256_kernel_id,
+        );
+        const gqa_attention_decode_splitk_online_sm89_hd512_f32 = loadOptionalFunction(
+            ctx,
+            module,
+            cuda_kernel_renderer.generated_splitk_online_decode_hd512_kernel_id,
+        );
+        if (gqa_decode_profile.failClosed() and
+            (gqa_attention_decode_splitk_online_sm89_hd256_f32 == null or
+                gqa_attention_decode_splitk_online_sm89_hd512_f32 == null))
+        {
+            std.log.err(
+                "cuda_gqa_decode_profile: status=rejected profile={s} reason=required-symbol-set-unavailable hd256_available={} hd512_available={}",
+                .{
+                    gqa_decode_profile.name(),
+                    gqa_attention_decode_splitk_online_sm89_hd256_f32 != null,
+                    gqa_attention_decode_splitk_online_sm89_hd512_f32 != null,
+                },
+            );
+            return error.CudaKernelUnavailable;
+        }
+        if (gqa_prefill_profile_config.profile == .required_flash_f16_sm89 and
+            (gqa_attention_prefill_flash_sm89_hd256_f32 == null or
+                gqa_attention_prefill_flash_sm89_hd512_f32 == null))
+        {
+            std.log.err(
+                "cuda_gqa_prefill_profile: status=rejected profile={s} reason=required-symbol-set-unavailable hd256_available={} hd512_available={}",
+                .{
+                    gqa_prefill_profile_config.profile.name(),
+                    gqa_attention_prefill_flash_sm89_hd256_f32 != null,
+                    gqa_attention_prefill_flash_sm89_hd512_f32 != null,
+                },
+            );
+            return error.CudaKernelUnavailable;
+        }
         const gqa_attention_decode_turboquant_split_stage1_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_split_stage1_f32");
         const gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32");
         const gqa_attention_decode_turboquant_split_stage2_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_split_stage2_f32");
@@ -2146,6 +3442,7 @@ pub const KernelModule = struct {
         const linear_q8_0_bias_add_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_add_f32_tc_hmma");
         const quantize_f32_q8_1_rows = loadOptionalFunction(ctx, module, "termite_quantize_f32_q8_1_rows");
         const quantize_gated_f32_q8_1_rows = loadOptionalFunction(ctx, module, "termite_quantize_gated_f32_q8_1_rows");
+        const quantize_f32_ggml_q8_1_rows = loadOptionalFunction(ctx, module, cuda_kernel_renderer.ggml_q8_1_quantize_rows_kernel_id);
         var linear_q4_0_f32: driver_mod.CUfunction = null;
         const q4_result = ctx.driver.fns.cuModuleGetFunction(&linear_q4_0_f32, module, "termite_linear_q4_0_f32");
         if (q4_result != driver_mod.CUDA_SUCCESS) {
@@ -2162,6 +3459,10 @@ pub const KernelModule = struct {
         const linear_q4_0_generated_pair_q8_e2b_12288 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_pair_q8_12288_kernel_id);
         const linear_q4_0_generated_down_q8_e2b_6144 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_down_q8_6144_kernel_id);
         const linear_q4_0_generated_down_q8_e2b_12288 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_down_q8_12288_kernel_id);
+        const linear_q4_0_generated_pair_ggml_q8_1_e2b_6144 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_pair_ggml_q8_1_6144_kernel_id);
+        const linear_q4_0_generated_pair_ggml_q8_1_e2b_12288 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_pair_ggml_q8_1_12288_kernel_id);
+        const linear_q4_0_generated_down_ggml_q8_1_e2b_6144 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_down_ggml_q8_1_6144_kernel_id);
+        const linear_q4_0_generated_down_ggml_q8_1_e2b_12288 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_down_ggml_q8_1_12288_kernel_id);
         const linear_q4_0_generated_pair_f32_e2b_6144_exact = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_pair_f32_6144_exact_kernel_id);
         const linear_q4_0_generated_pair_f32_e2b_12288_exact = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_pair_f32_12288_exact_kernel_id);
         const linear_q4_0_generated_down_f32_e2b_6144_exact = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_down_f32_6144_exact_kernel_id);
@@ -2305,6 +3606,25 @@ pub const KernelModule = struct {
         var gqa_attention_generated_workspace = try buffer_mod.DeviceBuffer.alloc(ctx, generatedGqaDecodeWorkspaceBytes());
         errdefer gqa_attention_generated_workspace.free(ctx);
 
+        var gqa_attention_decode_splitk_online_workspace: buffer_mod.DeviceBuffer = .{};
+        if (gqa_decode_profile.selectsSplitkOnlineSm89()) {
+            gqa_attention_decode_splitk_online_workspace = allocGqaSplitkOnlineDecodeWorkspace(ctx) catch |err| blk: {
+                if (gqa_decode_profile.failClosed()) {
+                    std.log.err(
+                        "cuda_gqa_decode_profile: status=rejected profile={s} reason=required-workspace-allocation-failed error={s}",
+                        .{ gqa_decode_profile.name(), @errorName(err) },
+                    );
+                    return err;
+                }
+                std.log.warn(
+                    "cuda_gqa_decode_profile: status=fallback profile={s} reason=workspace-allocation-failed error={s}",
+                    .{ gqa_decode_profile.name(), @errorName(err) },
+                );
+                break :blk .{};
+            };
+        }
+        errdefer gqa_attention_decode_splitk_online_workspace.free(ctx);
+
         return .{
             .module = module,
             .fill_f32 = fill_f32,
@@ -2431,15 +3751,28 @@ pub const KernelModule = struct {
             .gqa_attention_decode_split4_kv_hd512_stage2_f32 = gqa_attention_decode_split4_kv_hd512_stage2_f32,
             .gqa_attention_decode_score_prework_hd256_f32 = gqa_attention_decode_score_prework_hd256_f32,
             .gqa_attention_decode_score_prework_consume_hd256_f32 = gqa_attention_decode_score_prework_consume_hd256_f32,
+            .gqa_attention_decode_score_prework_tiled64_hd256_f32 = gqa_attention_decode_score_prework_tiled64_hd256_f32,
             .gqa_attention_decode_score_prework_hd512_f32 = gqa_attention_decode_score_prework_hd512_f32,
             .gqa_attention_decode_score_prework_consume_hd512_f32 = gqa_attention_decode_score_prework_consume_hd512_f32,
+            .gqa_attention_decode_score_prework_tiled64_hd512_f32 = gqa_attention_decode_score_prework_tiled64_hd512_f32,
             .gqa_attention_generated_workspace = gqa_attention_generated_workspace,
+            .gqa_attention_decode_splitk_online_sm89_hd256_f32 = gqa_attention_decode_splitk_online_sm89_hd256_f32,
+            .gqa_attention_decode_splitk_online_sm89_hd512_f32 = gqa_attention_decode_splitk_online_sm89_hd512_f32,
+            .gqa_attention_decode_splitk_online_workspace = gqa_attention_decode_splitk_online_workspace,
+            .gqa_decode_profile = gqa_decode_profile,
             .kv_write_suffix_decode_scalars_f32 = kv_write_suffix_decode_scalars_f32,
             .gqa_attention_decode_turboquant_fast_f32 = gqa_attention_decode_turboquant_fast_f32,
             .gqa_attention_prefill_turboquant_fast_f32 = gqa_attention_prefill_turboquant_fast_f32,
             .gqa_attention_prefill_turboquant_tiled_f32 = gqa_attention_prefill_turboquant_tiled_f32,
             .gqa_attention_prefill_turboquant_mma_f32 = gqa_attention_prefill_turboquant_mma_f32,
             .gqa_attention_prefill_turboquant_mma_m32_f32 = gqa_attention_prefill_turboquant_mma_m32_f32,
+            .gqa_attention_prefill_tiled_f16_exact_f32 = gqa_attention_prefill_tiled_f16_exact_f32,
+            .gqa_attention_prefill_tiled_f16_warp_f32 = gqa_attention_prefill_tiled_f16_warp_f32,
+            .gqa_attention_prefill_flash_sm89_hd256_f32 = gqa_attention_prefill_flash_sm89_hd256_f32,
+            .gqa_attention_prefill_flash_sm89_hd512_f32 = gqa_attention_prefill_flash_sm89_hd512_f32,
+            .gqa_prefill_profile = gqa_prefill_profile_config.profile,
+            .gqa_score_prework_mode = gqa_score_prework_mode,
+            .gqa_score_prework_consumer_mode = gqa_score_prework_consumer_mode,
             .gqa_attention_decode_turboquant_split_stage1_f32 = gqa_attention_decode_turboquant_split_stage1_f32,
             .gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 = gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32,
             .gqa_attention_decode_turboquant_split_stage2_f32 = gqa_attention_decode_turboquant_split_stage2_f32,
@@ -2475,6 +3808,7 @@ pub const KernelModule = struct {
             .linear_q8_0_bias_add_f32_tc_hmma = linear_q8_0_bias_add_f32_tc_hmma,
             .quantize_f32_q8_1_rows = quantize_f32_q8_1_rows,
             .quantize_gated_f32_q8_1_rows = quantize_gated_f32_q8_1_rows,
+            .quantize_f32_ggml_q8_1_rows = quantize_f32_ggml_q8_1_rows,
             .linear_q4_0_f32 = linear_q4_0_f32,
             .linear_q4_0_generated_mmv = linear_q4_0_generated_mmv,
             .linear_q4_0_generated_mm = linear_q4_0_generated_mm,
@@ -2485,6 +3819,10 @@ pub const KernelModule = struct {
             .linear_q4_0_generated_pair_q8_e2b_12288 = linear_q4_0_generated_pair_q8_e2b_12288,
             .linear_q4_0_generated_down_q8_e2b_6144 = linear_q4_0_generated_down_q8_e2b_6144,
             .linear_q4_0_generated_down_q8_e2b_12288 = linear_q4_0_generated_down_q8_e2b_12288,
+            .linear_q4_0_generated_pair_ggml_q8_1_e2b_6144 = linear_q4_0_generated_pair_ggml_q8_1_e2b_6144,
+            .linear_q4_0_generated_pair_ggml_q8_1_e2b_12288 = linear_q4_0_generated_pair_ggml_q8_1_e2b_12288,
+            .linear_q4_0_generated_down_ggml_q8_1_e2b_6144 = linear_q4_0_generated_down_ggml_q8_1_e2b_6144,
+            .linear_q4_0_generated_down_ggml_q8_1_e2b_12288 = linear_q4_0_generated_down_ggml_q8_1_e2b_12288,
             .linear_q4_0_generated_pair_f32_e2b_6144_exact = linear_q4_0_generated_pair_f32_e2b_6144_exact,
             .linear_q4_0_generated_pair_f32_e2b_12288_exact = linear_q4_0_generated_pair_f32_e2b_12288_exact,
             .linear_q4_0_generated_down_f32_e2b_6144_exact = linear_q4_0_generated_down_f32_e2b_6144_exact,
@@ -2599,6 +3937,7 @@ pub const KernelModule = struct {
 
     pub fn unload(self: *KernelModule, ctx: *context_mod.CudaContext) void {
         self.gqa_attention_generated_workspace.free(ctx);
+        self.gqa_attention_decode_splitk_online_workspace.free(ctx);
         if (self.runtime_jit_module_count > 0) ctx.makeCurrent() catch {};
         while (self.popRuntimeJitModule()) |module| {
             _ = ctx.driver.fns.cuModuleUnload(module);
@@ -2736,14 +4075,29 @@ pub const KernelModule = struct {
             self.gqa_attention_decode_split4_kv_hd512_stage2_f32 = null;
             self.gqa_attention_decode_score_prework_hd256_f32 = null;
             self.gqa_attention_decode_score_prework_consume_hd256_f32 = null;
+            self.gqa_attention_decode_score_prework_tiled64_hd256_f32 = null;
             self.gqa_attention_decode_score_prework_hd512_f32 = null;
             self.gqa_attention_decode_score_prework_consume_hd512_f32 = null;
+            self.gqa_attention_decode_score_prework_tiled64_hd512_f32 = null;
+            self.gqa_attention_decode_splitk_online_sm89_hd256_f32 = null;
+            self.gqa_attention_decode_splitk_online_sm89_hd512_f32 = null;
+            self.gqa_decode_profile = .off;
+            self.gqa_splitk_online_decode_telemetry_word.store(0, .monotonic);
             self.kv_write_suffix_decode_scalars_f32 = null;
             self.gqa_attention_decode_turboquant_fast_f32 = null;
             self.gqa_attention_prefill_turboquant_fast_f32 = null;
             self.gqa_attention_prefill_turboquant_tiled_f32 = null;
             self.gqa_attention_prefill_turboquant_mma_f32 = null;
             self.gqa_attention_prefill_turboquant_mma_m32_f32 = null;
+            self.gqa_attention_prefill_tiled_f16_exact_f32 = null;
+            self.gqa_attention_prefill_tiled_f16_warp_f32 = null;
+            self.gqa_attention_prefill_flash_sm89_hd256_f32 = null;
+            self.gqa_attention_prefill_flash_sm89_hd512_f32 = null;
+            self.gqa_prefill_profile = .off;
+            self.gqa_score_prework_mode = .automatic;
+            self.gqa_score_prework_consumer_mode = .serial;
+            for (&self.gqa_prefill_route_log_words) |*word| word.store(0, .monotonic);
+            self.gqa_flash_prefill_telemetry_word.store(0, .monotonic);
             self.gqa_prefill_mma_smem_opted_in = false;
             self.gqa_prefill_mma_m32_smem_opted_in = false;
             self.gqa_attention_decode_turboquant_split_stage1_f32 = null;
@@ -2781,6 +4135,7 @@ pub const KernelModule = struct {
             self.linear_q8_0_bias_add_f32_tc_hmma = null;
             self.quantize_f32_q8_1_rows = null;
             self.quantize_gated_f32_q8_1_rows = null;
+            self.quantize_f32_ggml_q8_1_rows = null;
             self.linear_q4_k_generated_bias_gelu = null;
             self.linear_q4_k_generated_mmv = null;
             self.linear_q4_0_f32 = null;
@@ -2793,6 +4148,10 @@ pub const KernelModule = struct {
             self.linear_q4_0_generated_pair_q8_e2b_12288 = null;
             self.linear_q4_0_generated_down_q8_e2b_6144 = null;
             self.linear_q4_0_generated_down_q8_e2b_12288 = null;
+            self.linear_q4_0_generated_pair_ggml_q8_1_e2b_6144 = null;
+            self.linear_q4_0_generated_pair_ggml_q8_1_e2b_12288 = null;
+            self.linear_q4_0_generated_down_ggml_q8_1_e2b_6144 = null;
+            self.linear_q4_0_generated_down_ggml_q8_1_e2b_12288 = null;
             self.linear_q4_0_generated_pair_f32_e2b_6144_exact = null;
             self.linear_q4_0_generated_pair_f32_e2b_12288_exact = null;
             self.linear_q4_0_generated_down_f32_e2b_6144_exact = null;
@@ -7556,6 +8915,179 @@ pub const KernelModule = struct {
         }
     }
 
+    fn noteGqaPrefillRouteActive(
+        self: *KernelModule,
+        launch_kind: GqaAttentionLaunchKind,
+        batch: usize,
+        q_seq_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) void {
+        const route = gqaPrefillLaunchName(launch_kind) orelse return;
+        if (!claimGqaPrefillRouteLog(&self.gqa_prefill_route_log_words, launch_kind, head_dim)) return;
+        std.log.info(
+            "cuda_gqa_prefill_profile: status=active profile={s} route={s} batch={d} q_seq_len={d} num_heads={d} num_kv_heads={d} head_dim={d}",
+            .{ self.gqa_prefill_profile.name(), route, batch, q_seq_len, num_heads, num_kv_heads, head_dim },
+        );
+    }
+
+    fn noteRequiredGqaPrefillRejected(
+        self: *const KernelModule,
+        reason: []const u8,
+        batch: usize,
+        q_seq_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        mask_len: usize,
+        bias_mode: u32,
+    ) void {
+        std.log.err(
+            "cuda_gqa_prefill_profile: status=rejected profile={s} reason={s} batch={d} q_seq_len={d} num_heads={d} num_kv_heads={d} head_dim={d} mask_len={d} bias_mode={d}",
+            .{ self.gqa_prefill_profile.name(), reason, batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode },
+        );
+    }
+
+    fn noteRequiredGqaF16PrefillRejected(
+        self: *const KernelModule,
+        reason: []const u8,
+        request: GqaF16PrefillRequest,
+    ) void {
+        std.log.err(
+            "cuda_gqa_prefill_profile: status=rejected profile={s} reason={s} batch={d} q_seq_len={d} kv_seq_len={d} num_heads={d} num_kv_heads={d} head_dim={d} mask_len={d} bias_mode={d} format={d} value_format={d} key_row_bytes={d} base_key_row_bytes={d} value_row_bytes={d} block_table_present={} block_count={d} page_size_tokens={d} physical_token_capacity={d} decode_scalars_present={}",
+            .{
+                self.gqa_prefill_profile.name(),
+                reason,
+                request.batch,
+                request.q_seq_len,
+                request.kv_seq_len,
+                request.num_heads,
+                request.num_kv_heads,
+                request.head_dim,
+                request.mask_len,
+                request.bias_mode,
+                request.format,
+                request.value_format,
+                request.key_row_bytes,
+                request.base_key_row_bytes,
+                request.value_row_bytes,
+                request.block_table_present,
+                request.block_count,
+                request.page_size_tokens,
+                request.physical_token_capacity,
+                request.decode_scalars_present,
+            },
+        );
+    }
+
+    fn noteGqaFlashPrefillTelemetry(
+        self: *KernelModule,
+        event: GqaFlashPrefillTelemetryEvent,
+        reason: []const u8,
+        request: GqaFlashPrefillRequest,
+    ) void {
+        if (!claimGqaFlashPrefillTelemetry(
+            &self.gqa_flash_prefill_telemetry_word,
+            event,
+            request.base.head_dim,
+            request.base.q_seq_len,
+        )) return;
+        const status = switch (event) {
+            .active => "active",
+            .ineligible_fallback, .symbol_fallback => "fallback",
+            .rejected => "rejected",
+        };
+        const route = switch (event) {
+            .active => "prefill-flash-f16-sm89",
+            .ineligible_fallback => "prefill-flash-f16-sm89-ineligible-fallback",
+            .symbol_fallback => "prefill-flash-f16-sm89-symbol-fallback",
+            .rejected => "prefill-flash-f16-sm89",
+        };
+        std.log.info(
+            "cuda_gqa_prefill_profile: status={s} profile={s} route={s} reason={s} compute={d}.{d} batch={d} q_seq_len={d} kv_seq_len={d} query_position_offset={d} kv_position_offset={d} total_sequence_len={d} sliding_window={d} num_heads={d} num_kv_heads={d} head_dim={d} format={d} value_format={d} block_table_present={} block_count={d} page_size_tokens={d} physical_token_capacity={d}",
+            .{
+                status,
+                self.gqa_prefill_profile.name(),
+                route,
+                reason,
+                request.compute_major,
+                request.compute_minor,
+                request.base.batch,
+                request.base.q_seq_len,
+                request.base.kv_seq_len,
+                request.query_position_offset,
+                request.kv_position_offset,
+                request.total_sequence_len,
+                request.sliding_window,
+                request.base.num_heads,
+                request.base.num_kv_heads,
+                request.base.head_dim,
+                request.base.format,
+                request.base.value_format,
+                request.base.block_table_present,
+                request.base.block_count,
+                request.base.page_size_tokens,
+                request.base.physical_token_capacity,
+            },
+        );
+    }
+
+    fn noteGqaSplitkOnlineDecodeTelemetry(
+        self: *KernelModule,
+        event: GqaSplitkOnlineDecodeTelemetryEvent,
+        reason: []const u8,
+        request: GqaSplitkOnlineDecodeRequest,
+    ) void {
+        if (!claimGqaSplitkOnlineDecodeTelemetry(
+            &self.gqa_splitk_online_decode_telemetry_word,
+            event,
+            request.head_dim,
+        )) return;
+        const status = switch (event) {
+            .active => "active",
+            .ineligible_fallback, .symbol_fallback => "fallback",
+            .rejected => "rejected",
+        };
+        const route = switch (event) {
+            .active, .rejected => "decode-splitk-online-sm89",
+            .ineligible_fallback => "decode-splitk-online-sm89-ineligible-fallback",
+            .symbol_fallback => "decode-splitk-online-sm89-symbol-fallback",
+        };
+        const args = .{
+            status,
+            self.gqa_decode_profile.name(),
+            route,
+            reason,
+            request.compute_major,
+            request.compute_minor,
+            request.batch,
+            request.q_seq_len,
+            request.kv_seq_len,
+            request.query_position_offset,
+            request.kv_position_offset,
+            request.total_sequence_len,
+            request.sliding_window,
+            request.num_heads,
+            request.num_kv_heads,
+            request.head_dim,
+            request.format,
+            request.value_format,
+            request.block_table_present,
+            request.block_count,
+            request.page_size_tokens,
+            request.physical_token_capacity,
+            request.decode_scalars_present,
+            request.workspace_available,
+        };
+        const format = "cuda_gqa_decode_profile: status={s} profile={s} route={s} reason={s} compute={d}.{d} batch={d} q_seq_len={d} kv_seq_len={d} query_position_offset={d} kv_position_offset={d} total_sequence_len={d} sliding_window={d} num_heads={d} num_kv_heads={d} head_dim={d} format={d} value_format={d} block_table_present={} block_count={d} page_size_tokens={d} physical_token_capacity={d} decode_scalars_present={} workspace_available={}";
+        switch (event) {
+            .active => std.log.info(format, args),
+            .ineligible_fallback, .symbol_fallback => std.log.warn(format, args),
+            .rejected => std.log.err(format, args),
+        }
+    }
+
     pub fn launchGqaAttentionF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -7657,7 +9189,7 @@ pub const KernelModule = struct {
         // intentionally reachable only from launchGqaAttentionDecodeScalarsF32.
         // This host-scalar entry point must keep its normal decode topology.
         if (self.gqa_attention_prefill_fast_f32) |prefill_function| {
-            if (fastGqaPrefillEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode)) {
+            if (fastGqaPrefillEligible(self.gqa_prefill_profile, batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode)) {
                 const block: c_uint = if (head_dim <= 256) 256 else 512;
                 const grid = try toU32(try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), num_heads));
                 try ctx.makeCurrent();
@@ -7675,8 +9207,21 @@ pub const KernelModule = struct {
                     null,
                 ));
                 ctx.noteKernelLaunch();
+                self.noteGqaPrefillRouteActive(.prefill_fast, batch, q_seq_len, num_heads, num_kv_heads, head_dim);
                 return .prefill_fast;
             }
+        }
+        if (self.gqa_prefill_profile.failClosed() and q_seq_len > 1) {
+            const reason: []const u8 = switch (self.gqa_prefill_profile) {
+                .required_tiled_f16_exact => "tiled-f16-exact-paged-f16-route-required",
+                .required_tiled_f16_warp => "tiled-f16-warp-paged-f16-route-required",
+                else => if (!gqaPrefillShapeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode))
+                    "shape-ineligible"
+                else
+                    "kernel-unavailable",
+            };
+            self.noteRequiredGqaPrefillRejected(reason, batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode);
+            return error.CudaKernelUnavailable;
         }
         if (self.gqa_attention_decode_f32) |decode_function| {
             if (head_dim <= 512) {
@@ -8029,6 +9574,213 @@ pub const KernelModule = struct {
         try launch1d(function, ctx, work_items, &params);
     }
 
+    fn launchGqaAttentionDecodeSplitkOnlineSm89F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        block_table: buffer_mod.DeviceBuffer,
+        batch: usize,
+        q_seq_len: usize,
+        kv_seq_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        query_position_offset: usize,
+        kv_position_offset: usize,
+        sliding_window: usize,
+        total_sequence_len: usize,
+        mask_len: usize,
+        bias_mode: u32,
+        key_row_bytes: usize,
+        base_key_row_bytes: usize,
+        value_row_bytes: usize,
+        block_count: usize,
+        page_size_tokens: usize,
+        format: u32,
+        value_format: u32,
+        physical_token_capacity: usize,
+        decode_scalars: buffer_mod.DeviceBuffer,
+    ) driver_mod.Error!?GqaAttentionLaunchKind {
+        if (!self.gqa_decode_profile.selectsSplitkOnlineSm89() or q_seq_len != 1) return null;
+        const layout = cuda_kernel_renderer.generatedSplitkOnlineDecodeWorkspaceLayout();
+        const workspace_available = self.gqa_attention_decode_splitk_online_workspace.ptr != 0 and
+            self.gqa_attention_decode_splitk_online_workspace.len >= layout.total_bytes;
+        const request = GqaSplitkOnlineDecodeRequest{
+            .compute_major = ctx.info.compute_major,
+            .compute_minor = ctx.info.compute_minor,
+            .batch = batch,
+            .q_seq_len = q_seq_len,
+            .kv_seq_len = kv_seq_len,
+            .num_heads = num_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .query_position_offset = query_position_offset,
+            .kv_position_offset = kv_position_offset,
+            .sliding_window = sliding_window,
+            .total_sequence_len = total_sequence_len,
+            .mask_len = mask_len,
+            .bias_mode = bias_mode,
+            .key_row_bytes = key_row_bytes,
+            .base_key_row_bytes = base_key_row_bytes,
+            .value_row_bytes = value_row_bytes,
+            .block_count = block_count,
+            .page_size_tokens = page_size_tokens,
+            .format = format,
+            .value_format = value_format,
+            .physical_token_capacity = physical_token_capacity,
+            .block_table_present = block_table.ptr != 0,
+            .decode_scalars_present = decode_scalars.ptr != 0,
+            .workspace_available = workspace_available,
+        };
+        const eligibility = gqaSplitkOnlineDecodeEligibility(request);
+        const function = switch (head_dim) {
+            256 => self.gqa_attention_decode_splitk_online_sm89_hd256_f32,
+            512 => self.gqa_attention_decode_splitk_online_sm89_hd512_f32,
+            else => null,
+        };
+        if (eligibility != .eligible or function == null) {
+            const reason = requiredGqaSplitkOnlineDecodeRejectionReason(eligibility, function != null);
+            if (self.gqa_decode_profile.failClosed()) {
+                self.noteGqaSplitkOnlineDecodeTelemetry(.rejected, reason, request);
+                return error.CudaKernelUnavailable;
+            }
+            const event: GqaSplitkOnlineDecodeTelemetryEvent = if (eligibility == .eligible)
+                .symbol_fallback
+            else
+                .ineligible_fallback;
+            self.noteGqaSplitkOnlineDecodeTelemetry(event, reason, request);
+            return if (event == .symbol_fallback)
+                .decode_splitk_online_sm89_symbol_fallback
+            else
+                .decode_splitk_online_sm89_ineligible_fallback;
+        }
+
+        var dst_ptr = dst.ptr;
+        var completion_counters_ptr = self.gqa_attention_decode_splitk_online_workspace.ptr + layout.completion_counters_offset;
+        var partial_values_ptr = self.gqa_attention_decode_splitk_online_workspace.ptr + layout.partial_values_offset;
+        var partial_max_ptr = self.gqa_attention_decode_splitk_online_workspace.ptr + layout.partial_max_offset;
+        var partial_denom_ptr = self.gqa_attention_decode_splitk_online_workspace.ptr + layout.partial_denom_offset;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var block_table_ptr = block_table.ptr;
+        var batch_u32 = try toU32(batch);
+        var q_seq_len_u32 = try toU32(q_seq_len);
+        var kv_seq_len_u32 = try toU32(kv_seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var num_kv_heads_u32 = try toU32(num_kv_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var query_position_offset_u32 = try toU32(query_position_offset);
+        var kv_position_offset_u32 = try toU32(kv_position_offset);
+        var sliding_window_u32 = try toU32(sliding_window);
+        var total_sequence_len_u32 = try toU32(total_sequence_len);
+        var key_row_bytes_u32 = try toU32(key_row_bytes);
+        var base_key_row_bytes_u32 = try toU32(base_key_row_bytes);
+        var value_row_bytes_u32 = try toU32(value_row_bytes);
+        var block_count_u32 = try toU32(block_count);
+        var page_size_tokens_u32 = try toU32(page_size_tokens);
+        var format_u32 = format;
+        var value_format_u32 = value_format;
+        var physical_token_capacity_u32 = try toU32(physical_token_capacity);
+        var score_capacity_u32 = try toU32(if (head_dim == 256)
+            cuda_kernel_renderer.generated_splitk_online_decode_hd256_max_visible_tokens
+        else
+            cuda_kernel_renderer.generated_splitk_online_decode_hd512_max_visible_tokens);
+        var decode_scalars_ptr = decode_scalars.ptr;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&completion_counters_ptr),
+            @ptrCast(&partial_values_ptr),
+            @ptrCast(&partial_max_ptr),
+            @ptrCast(&partial_denom_ptr),
+            @ptrCast(&q_ptr),
+            @ptrCast(&k_ptr),
+            @ptrCast(&v_ptr),
+            @ptrCast(&block_table_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&q_seq_len_u32),
+            @ptrCast(&kv_seq_len_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&num_kv_heads_u32),
+            @ptrCast(&head_dim_u32),
+            @ptrCast(&query_position_offset_u32),
+            @ptrCast(&kv_position_offset_u32),
+            @ptrCast(&sliding_window_u32),
+            @ptrCast(&total_sequence_len_u32),
+            @ptrCast(&key_row_bytes_u32),
+            @ptrCast(&base_key_row_bytes_u32),
+            @ptrCast(&value_row_bytes_u32),
+            @ptrCast(&block_count_u32),
+            @ptrCast(&page_size_tokens_u32),
+            @ptrCast(&format_u32),
+            @ptrCast(&value_format_u32),
+            @ptrCast(&physical_token_capacity_u32),
+            @ptrCast(&score_capacity_u32),
+            @ptrCast(&decode_scalars_ptr),
+        };
+        if (captureParamTraceIndex(ctx)) |trace_index| {
+            std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=gqa_attention_decode_splitk_online_sm89 dst=0x{x} counters=0x{x} partial_values=0x{x} partial_max=0x{x} partial_denom=0x{x} q=0x{x} k=0x{x} v=0x{x} block_table=0x{x} scalars=0x{x} batch={d} q_seq_len={d} kv_seq_len={d} num_heads={d} num_kv_heads={d} head_dim={d} key_row_bytes={d} value_row_bytes={d} block_count={d} page_size={d} format={d} value_format={d} score_capacity={d}", .{
+                ctx.debug_graph_capture_id,
+                trace_index,
+                dst_ptr,
+                completion_counters_ptr,
+                partial_values_ptr,
+                partial_max_ptr,
+                partial_denom_ptr,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                block_table_ptr,
+                decode_scalars_ptr,
+                batch_u32,
+                q_seq_len_u32,
+                kv_seq_len_u32,
+                num_heads_u32,
+                num_kv_heads_u32,
+                head_dim_u32,
+                key_row_bytes_u32,
+                value_row_bytes_u32,
+                block_count_u32,
+                page_size_tokens_u32,
+                format_u32,
+                value_format_u32,
+                score_capacity_u32,
+            });
+        }
+        try ctx.makeCurrent();
+        const grid_x = try toU32(try checkedTensorElements(
+            num_heads,
+            cuda_kernel_renderer.generated_splitk_online_decode_splits,
+        ));
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+            function.?,
+            grid_x,
+            1,
+            1,
+            cuda_kernel_renderer.generated_splitk_online_decode_threads,
+            1,
+            1,
+            0,
+            ctx.stream,
+            &params,
+            null,
+        ));
+        ctx.noteKernelLaunch();
+        self.noteGqaSplitkOnlineDecodeTelemetry(.active, "qualified-contract", request);
+        return .decode_splitk_online_sm89;
+    }
+
+    pub fn gqaSplitkOnlineDecodeProfileSelected(self: *const KernelModule) bool {
+        return self.gqa_decode_profile.selectsSplitkOnlineSm89();
+    }
+
+    pub fn gqaSplitkOnlineDecodeProfileFailClosed(self: *const KernelModule) bool {
+        return self.gqa_decode_profile.failClosed();
+    }
+
     pub fn launchGqaAttentionDecodeTurboquantF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -8060,8 +9812,7 @@ pub const KernelModule = struct {
         value_format: u32,
         physical_token_capacity: usize,
         decode_scalars: buffer_mod.DeviceBuffer,
-    ) driver_mod.Error!GqaAttentionLaunchKind {
-        const fallback_function = self.gqa_attention_decode_turboquant_f32 orelse return error.CudaKernelUnavailable;
+    ) driver_mod.Error!GqaAttentionLaunchResult {
         if (head_dim > 512 or key_row_bytes == 0 or base_key_row_bytes == 0 or value_row_bytes == 0 or base_key_row_bytes > key_row_bytes) return error.CudaKernelUnavailable;
         const q_hidden = try checkedTensorElements(num_heads, head_dim);
         const q_count = try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), q_hidden);
@@ -8073,9 +9824,9 @@ pub const KernelModule = struct {
         if (mask_len != 0) try checkRawBytes(attn_or_mask, mask_len);
         if (bias_mode != 0) try checkBytes(bias, try checkedTensorElements(if (bias_mode == 2) batch * num_heads else num_heads, try checkedTensorElements(q_seq_len, kv_seq_len)));
         if (decode_scalars.ptr != 0) try checkRawBytes(decode_scalars, 5 * @sizeOf(u32));
-        if (q_count == 0) return .none;
+        if (q_count == 0) return .{ .kind = .none };
 
-        if (generatedGqaScorePreworkEnabled() and try self.launchGqaAttentionDecodeTurboquantScorePreworkF32(
+        const splitk_online_launch = try self.launchGqaAttentionDecodeSplitkOnlineSm89F32(
             ctx,
             dst,
             q,
@@ -8103,7 +9854,56 @@ pub const KernelModule = struct {
             value_format,
             physical_token_capacity,
             decode_scalars,
-        )) return .decode_generated_score_prework;
+        );
+        if (splitk_online_launch == .decode_splitk_online_sm89) {
+            return .{ .kind = .decode_splitk_online_sm89 };
+        }
+        const splitk_online_fallback: ?GqaAttentionLaunchKind = switch (splitk_online_launch orelse .none) {
+            .decode_splitk_online_sm89_ineligible_fallback,
+            .decode_splitk_online_sm89_symbol_fallback,
+            => splitk_online_launch,
+            else => null,
+        };
+
+        // Optional split-K rejection is telemetry, not a route-selection
+        // barrier. Preserve the normal score-prework/fast production
+        // precedence so an exploratory profile cannot create a scalar cliff.
+        const score_prework_launch = try self.launchGqaAttentionDecodeTurboquantScorePreworkF32(
+            ctx,
+            dst,
+            q,
+            k,
+            v,
+            block_table,
+            batch,
+            q_seq_len,
+            kv_seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            query_position_offset,
+            kv_position_offset,
+            sliding_window,
+            total_sequence_len,
+            mask_len,
+            bias_mode,
+            key_row_bytes,
+            base_key_row_bytes,
+            value_row_bytes,
+            block_count,
+            page_size_tokens,
+            format,
+            value_format,
+            physical_token_capacity,
+            decode_scalars,
+        );
+        switch (score_prework_launch) {
+            .none => {},
+            .serial => return .{ .kind = .decode_generated_score_prework, .splitk_online_fallback = splitk_online_fallback },
+            .serial_tiled64_ineligible_fallback => return .{ .kind = .decode_generated_score_prework_tiled64_ineligible_fallback, .splitk_online_fallback = splitk_online_fallback },
+            .serial_tiled64_symbol_fallback => return .{ .kind = .decode_generated_score_prework_tiled64_symbol_fallback, .splitk_online_fallback = splitk_online_fallback },
+            .tiled64 => return .{ .kind = .decode_generated_score_prework_tiled64, .splitk_online_fallback = splitk_online_fallback },
+        }
 
         var dst_ptr = dst.ptr;
         var q_ptr = q.ptr;
@@ -8163,47 +9963,154 @@ pub const KernelModule = struct {
             @ptrCast(&physical_token_capacity_u32),
             @ptrCast(&decode_scalars_ptr),
         };
+        // A qualified split-K or score-prework route does not depend on the
+        // unrelated scalar baseline symbol. Resolve it only when normal route
+        // selection actually needs that fallback family.
+        const fallback_function = self.gqa_attention_decode_turboquant_f32 orelse return error.CudaKernelUnavailable;
         var function = fallback_function;
         var launch_kind: GqaAttentionLaunchKind = .decode;
+        const prefill_storage_eligible = (format == 0 or format == 2) and
+            base_key_row_bytes == key_row_bytes and decode_scalars.ptr == 0;
+        const prefill_shape_eligible = gqaPrefillShapeEligible(
+            batch,
+            q_seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            mask_len,
+            bias_mode,
+        );
+        const f16_prefill_request = GqaF16PrefillRequest{
+            .batch = batch,
+            .q_seq_len = q_seq_len,
+            .kv_seq_len = kv_seq_len,
+            .num_heads = num_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .mask_len = mask_len,
+            .bias_mode = bias_mode,
+            .key_row_bytes = key_row_bytes,
+            .base_key_row_bytes = base_key_row_bytes,
+            .value_row_bytes = value_row_bytes,
+            .block_count = block_count,
+            .page_size_tokens = page_size_tokens,
+            .format = format,
+            .value_format = value_format,
+            .physical_token_capacity = physical_token_capacity,
+            .block_table_present = block_table.ptr != 0,
+            .decode_scalars_present = decode_scalars.ptr != 0,
+        };
+        const f16_prefill_eligibility = gqaF16PrefillEligibility(f16_prefill_request);
+        const flash_prefill_request = GqaFlashPrefillRequest{
+            .base = f16_prefill_request,
+            .compute_major = ctx.info.compute_major,
+            .compute_minor = ctx.info.compute_minor,
+            .query_position_offset = query_position_offset,
+            .kv_position_offset = kv_position_offset,
+            .sliding_window = sliding_window,
+            .total_sequence_len = total_sequence_len,
+        };
+        const flash_prefill_eligibility = gqaFlashPrefillEligibility(flash_prefill_request);
+        const flash_prefill_function = switch (head_dim) {
+            256 => self.gqa_attention_prefill_flash_sm89_hd256_f32,
+            512 => self.gqa_attention_prefill_flash_sm89_hd512_f32,
+            else => null,
+        };
+        const flash_prefill_launch = selectGqaFlashPrefillLaunch(
+            self.gqa_prefill_profile,
+            flash_prefill_eligibility,
+            flash_prefill_function != null,
+        );
+        const f16_prefill_launch = selectGqaF16PrefillLaunch(
+            self.gqa_prefill_profile,
+            f16_prefill_eligibility,
+            self.gqa_attention_prefill_tiled_f16_exact_f32 != null,
+            self.gqa_attention_prefill_tiled_f16_warp_f32 != null,
+        );
+        if (self.gqa_prefill_profile.selectsFlashF16Sm89() and q_seq_len > 1) {
+            if (flash_prefill_launch == .prefill_flash_f16_sm89) {
+                function = flash_prefill_function.?;
+                launch_kind = .prefill_flash_f16_sm89;
+            } else if (optionalGqaFlashPrefillFallbackLaunch(
+                self.gqa_prefill_profile,
+                flash_prefill_eligibility,
+                flash_prefill_function != null,
+            )) |fallback_launch| {
+                launch_kind = fallback_launch;
+            }
+        }
+        if (self.gqa_prefill_profile != .off and prefill_storage_eligible and prefill_shape_eligible) {
+            switch (self.gqa_prefill_profile) {
+                .off => unreachable,
+                .fast, .required_fast => {
+                    if (self.gqa_attention_prefill_turboquant_fast_f32) |prefill_function| {
+                        function = prefill_function;
+                        launch_kind = .prefill_fast;
+                    }
+                },
+                .tiled => {
+                    if (self.gqa_attention_prefill_turboquant_tiled_f32) |tiled_function| {
+                        function = tiled_function;
+                        launch_kind = .prefill_tiled;
+                    }
+                },
+                .mma => {
+                    // Tensor-core prefill. The >48KB dynamic-smem opt-in needs
+                    // cuFuncSetAttribute. head_dim <= 256 runs everywhere; the
+                    // head_dim-512 global layers and TILE_M=32 need sm80+.
+                    if (ctx.driver.fns.cuFuncSetAttribute != null) {
+                        const sm80_plus = ctx.info.compute_major >= 8;
+                        const mma_hd_ok = head_dim <= 256 or (head_dim <= 512 and sm80_plus);
+                        if (head_dim <= 256 and sm80_plus and mmaM32GqaPrefillEnabled()) {
+                            if (self.gqa_attention_prefill_turboquant_mma_m32_f32) |mma_m32_function| {
+                                function = mma_m32_function;
+                                launch_kind = .prefill_mma_m32;
+                            }
+                        }
+                        if (launch_kind != .prefill_mma_m32 and mma_hd_ok) {
+                            if (self.gqa_attention_prefill_turboquant_mma_f32) |mma_function| {
+                                function = mma_function;
+                                launch_kind = .prefill_mma;
+                            }
+                        }
+                    }
+                },
+                .tiled_f16_exact, .required_tiled_f16_exact => {
+                    if (f16_prefill_launch == .prefill_tiled_f16_exact) {
+                        function = self.gqa_attention_prefill_tiled_f16_exact_f32.?;
+                        launch_kind = .prefill_tiled_f16_exact;
+                    }
+                },
+                .tiled_f16_warp, .required_tiled_f16_warp => {
+                    if (f16_prefill_launch == .prefill_tiled_f16_warp) {
+                        function = self.gqa_attention_prefill_tiled_f16_warp_f32.?;
+                        launch_kind = .prefill_tiled_f16_warp;
+                    }
+                },
+                .flash_f16_sm89, .required_flash_f16_sm89 => {},
+            }
+        }
+        if (requiredGqaPrefillLaunch(self.gqa_prefill_profile)) |required_launch| {
+            if (q_seq_len > 1 and launch_kind != required_launch) {
+                const reason: []const u8 = switch (self.gqa_prefill_profile) {
+                    .required_tiled_f16_exact, .required_tiled_f16_warp => requiredGqaF16PrefillRejectionReason(self.gqa_prefill_profile, f16_prefill_eligibility),
+                    .required_flash_f16_sm89 => requiredGqaFlashPrefillRejectionReason(flash_prefill_eligibility, flash_prefill_function != null),
+                    else => if (!prefill_storage_eligible)
+                        "storage-ineligible"
+                    else if (!prefill_shape_eligible)
+                        "shape-ineligible"
+                    else
+                        "kernel-unavailable",
+                };
+                switch (self.gqa_prefill_profile) {
+                    .required_tiled_f16_exact, .required_tiled_f16_warp => self.noteRequiredGqaF16PrefillRejected(reason, f16_prefill_request),
+                    .required_flash_f16_sm89 => self.noteGqaFlashPrefillTelemetry(.rejected, reason, flash_prefill_request),
+                    else => self.noteRequiredGqaPrefillRejected(reason, batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode),
+                }
+                return error.CudaKernelUnavailable;
+            }
+        }
         if ((format == 0 or format == 2) and
-            base_key_row_bytes == key_row_bytes and
-            decode_scalars.ptr == 0 and
-            (fastGqaPrefillEnabled() or tiledGqaPrefillEnabled() or mmaGqaPrefillEnabled()) and
-            gqaPrefillShapeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode))
-        {
-            if (fastGqaPrefillEnabled()) {
-                if (self.gqa_attention_prefill_turboquant_fast_f32) |prefill_function| {
-                    function = prefill_function;
-                    launch_kind = .prefill_fast;
-                }
-            }
-            if (tiledGqaPrefillEnabled()) {
-                if (self.gqa_attention_prefill_turboquant_tiled_f32) |tiled_function| {
-                    function = tiled_function;
-                    launch_kind = .prefill_tiled;
-                }
-            }
-            // Tensor-core prefill. The >48KB dynamic-smem opt-in needs
-            // cuFuncSetAttribute. head_dim <= 256 runs everywhere; the
-            // head_dim-512 global layers and the TILE_M=32 variant need the
-            // larger sm80+ shared-memory budget (89-97KB per block).
-            if (mmaGqaPrefillEnabled() and ctx.driver.fns.cuFuncSetAttribute != null) {
-                const sm80_plus = ctx.info.compute_major >= 8;
-                const mma_hd_ok = head_dim <= 256 or (head_dim <= 512 and sm80_plus);
-                if (head_dim <= 256 and sm80_plus and mmaM32GqaPrefillEnabled()) {
-                    if (self.gqa_attention_prefill_turboquant_mma_m32_f32) |mma_m32_function| {
-                        function = mma_m32_function;
-                        launch_kind = .prefill_mma_m32;
-                    }
-                }
-                if (launch_kind != .prefill_mma_m32 and mma_hd_ok) {
-                    if (self.gqa_attention_prefill_turboquant_mma_f32) |mma_function| {
-                        function = mma_function;
-                        launch_kind = .prefill_mma;
-                    }
-                }
-            }
-        } else if ((format == 0 or format == 2) and
             base_key_row_bytes == key_row_bytes and
             fastGqaDecodeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode))
         {
@@ -8222,6 +10129,9 @@ pub const KernelModule = struct {
                 .prefill_tiled => "gqa_attention_prefill_turboquant_tiled",
                 .prefill_mma => "gqa_attention_prefill_turboquant_mma",
                 .prefill_mma_m32 => "gqa_attention_prefill_turboquant_mma_m32",
+                .prefill_tiled_f16_exact => "gqa_attention_prefill_tiled_f16_exact",
+                .prefill_tiled_f16_warp => "gqa_attention_prefill_tiled_f16_warp",
+                .prefill_flash_f16_sm89 => "gqa_attention_prefill_flash_f16_sm89",
                 else => "gqa_attention_decode_turboquant",
             };
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel={s} dst=0x{x} q=0x{x} k=0x{x} v=0x{x} block_table=0x{x} mask=0x{x} bias=0x{x} scalars=0x{x} batch={d} q_seq_len={d} kv_seq_len={d} num_heads={d} num_kv_heads={d} head_dim={d} key_row_bytes={d} base_key_row_bytes={d} value_row_bytes={d} block_count={d} page_size={d} format={d} value_format={d}", .{
@@ -8283,6 +10193,28 @@ pub const KernelModule = struct {
             grid_x = try toU32(num_heads);
             grid_y = try toU32((q_seq_len + 31) / 32);
             shared_bytes = try toU32(320 * head_dim + 14848);
+        } else if (launch_kind == .prefill_tiled_f16_exact) {
+            // Exact path preserves the baseline reduction order: one thread
+            // per head dimension, one 16-query tile per CTA.
+            block = try toU32(head_dim);
+            grid_x = try toU32(num_heads);
+            grid_y = try toU32((q_seq_len + 15) / 16);
+        } else if (launch_kind == .prefill_tiled_f16_warp) {
+            // Eight warps own two queries each and replay 32-key QK spans.
+            block = 256;
+            grid_x = try toU32(num_heads);
+            grid_y = try toU32((q_seq_len + 15) / 16);
+        } else if (launch_kind == .prefill_flash_f16_sm89) {
+            const plan = cuda_kernel_renderer.flashPrefillPlanFor(switch (head_dim) {
+                256 => .gqa_prefill_flash_sm89_hd256_swa512_f32,
+                512 => .gqa_prefill_flash_sm89_hd512_global_f32,
+                else => unreachable,
+            });
+            block = @intCast(plan.launch.threads_per_block);
+            grid_x = try toU32(num_heads);
+            grid_y = try toU32(std.math.divCeil(usize, q_seq_len, @as(usize, plan.launch.output_rows_per_block)) catch
+                return error.CudaKernelUnavailable);
+            shared_bytes = @intCast(plan.launch.dynamic_shared_memory_bytes);
         }
         try ctx.makeCurrent();
         if (launch_kind == .prefill_mma and !self.gqa_prefill_mma_smem_opted_in) {
@@ -8314,7 +10246,26 @@ pub const KernelModule = struct {
             null,
         ));
         ctx.noteKernelLaunch();
-        return launch_kind;
+        self.noteGqaPrefillRouteActive(launch_kind, batch, q_seq_len, num_heads, num_kv_heads, head_dim);
+        switch (launch_kind) {
+            .prefill_flash_f16_sm89 => self.noteGqaFlashPrefillTelemetry(
+                .active,
+                "qualified-contract",
+                flash_prefill_request,
+            ),
+            .prefill_flash_f16_sm89_ineligible_fallback => self.noteGqaFlashPrefillTelemetry(
+                .ineligible_fallback,
+                requiredGqaFlashPrefillRejectionReason(flash_prefill_eligibility, flash_prefill_function != null),
+                flash_prefill_request,
+            ),
+            .prefill_flash_f16_sm89_symbol_fallback => self.noteGqaFlashPrefillTelemetry(
+                .symbol_fallback,
+                "flash-f16-sm89-kernel-unavailable",
+                flash_prefill_request,
+            ),
+            else => {},
+        }
+        return .{ .kind = launch_kind, .splitk_online_fallback = splitk_online_fallback };
     }
 
     pub fn launchGqaAttentionDecodeTurboquantScorePreworkF32(
@@ -8346,48 +10297,124 @@ pub const KernelModule = struct {
         value_format: u32,
         physical_token_capacity: usize,
         decode_scalars: buffer_mod.DeviceBuffer,
-    ) driver_mod.Error!bool {
-        if (!generatedGqaScorePreworkShapeEligible(
-            batch,
-            q_seq_len,
-            kv_seq_len,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            mask_len,
-            bias_mode,
-            key_row_bytes,
-            base_key_row_bytes,
-            value_row_bytes,
-            format,
-            value_format,
-            physical_token_capacity,
-        )) return false;
-        if (block_count != 0 and page_size_tokens == 0) return false;
+    ) driver_mod.Error!GeneratedGqaScorePreworkLaunchKind {
+        const request = GeneratedGqaScorePreworkRequest{
+            .batch = batch,
+            .q_seq_len = q_seq_len,
+            .kv_seq_len = kv_seq_len,
+            .num_heads = num_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .sliding_window = sliding_window,
+            .mask_len = mask_len,
+            .bias_mode = bias_mode,
+            .key_row_bytes = key_row_bytes,
+            .base_key_row_bytes = base_key_row_bytes,
+            .value_row_bytes = value_row_bytes,
+            .block_count = block_count,
+            .page_size_tokens = page_size_tokens,
+            .format = format,
+            .value_format = value_format,
+            .physical_token_capacity = physical_token_capacity,
+        };
+        const selection = switch (generatedGqaScorePreworkDecisionFor(
+            request,
+            self.gqa_score_prework_mode,
+            self.gqa_score_prework_consumer_mode,
+            ctx.info.compute_major,
+            ctx.info.compute_minor,
+        )) {
+            .not_selected => return .none,
+            .selected => |selected| selected,
+            .required_tiled64_rejected => {
+                noteGeneratedGqaScorePreworkConsumerEvent(
+                    .rejected_required,
+                    "required-tiled64",
+                    null,
+                    .none,
+                    request.head_dim,
+                    "consumer_ineligible",
+                );
+                return error.CudaKernelUnavailable;
+            },
+            .invalid_config_rejected => return error.InvalidCudaState,
+        };
 
         const plan = switch (head_dim) {
             256 => cuda_kernel_renderer.attentionPlanFor(.gqa_decode_score_prework_hd256_f32),
             512 => cuda_kernel_renderer.attentionPlanFor(.gqa_decode_score_prework_hd512_f32),
-            else => return false,
+            else => return .none,
         };
-        const score_function, const consume_function = switch (head_dim) {
+        const score_function, const serial_consume_function, const tiled64_consume_function = switch (head_dim) {
             256 => .{
                 self.gqa_attention_decode_score_prework_hd256_f32,
                 self.gqa_attention_decode_score_prework_consume_hd256_f32,
+                self.gqa_attention_decode_score_prework_tiled64_hd256_f32,
             },
             512 => .{
                 self.gqa_attention_decode_score_prework_hd512_f32,
                 self.gqa_attention_decode_score_prework_consume_hd512_f32,
+                self.gqa_attention_decode_score_prework_tiled64_hd512_f32,
             },
             else => unreachable,
         };
-        const score = score_function orelse return false;
-        const consume = consume_function orelse return false;
-        const workspace_layout = cuda_kernel_renderer.generatedAttentionWorkspaceLayoutFor(
-            cuda_kernel_renderer.generated_attention_score_prework_chunks,
-        ) orelse return error.InvalidCudaState;
+        const score = score_function orelse {
+            if (selection.tiled64_required) {
+                noteGeneratedGqaScorePreworkConsumerEvent(
+                    .rejected_required,
+                    generatedGqaScorePreworkConfiguredModeName(selection),
+                    selection.consumer,
+                    selection.route,
+                    head_dim,
+                    "score_symbol_unavailable",
+                );
+                return error.CudaKernelUnavailable;
+            }
+            return .none;
+        };
+        var consumer = selection.consumer;
+        var serial_launch_kind: GeneratedGqaScorePreworkLaunchKind = switch (selection.consumer_resolution) {
+            .serial_configured => .serial,
+            .tiled64_ineligible_fallback => .serial_tiled64_ineligible_fallback,
+            .tiled64_selected => .serial,
+            .required_tiled64_ineligible => return error.CudaKernelUnavailable,
+        };
+        if (selection.tiled64_required and consumer != .tiled64) return error.CudaKernelUnavailable;
+        if (consumer == .tiled64 and tiled64_consume_function == null) {
+            if (selection.tiled64_required) {
+                noteGeneratedGqaScorePreworkConsumerEvent(
+                    .rejected_required,
+                    generatedGqaScorePreworkConfiguredModeName(selection),
+                    .tiled64,
+                    selection.route,
+                    head_dim,
+                    "consumer_symbol_unavailable",
+                );
+                return error.CudaKernelUnavailable;
+            }
+            consumer = .serial;
+            serial_launch_kind = .serial_tiled64_symbol_fallback;
+        }
+        const consume = switch (consumer) {
+            .serial => serial_consume_function,
+            .tiled64 => tiled64_consume_function,
+        } orelse {
+            if (selection.tiled64_required) {
+                noteGeneratedGqaScorePreworkConsumerEvent(
+                    .rejected_required,
+                    generatedGqaScorePreworkConfiguredModeName(selection),
+                    selection.consumer,
+                    selection.route,
+                    head_dim,
+                    "consumer_symbol_unavailable",
+                );
+                return error.CudaKernelUnavailable;
+            }
+            return .none;
+        };
+        const workspace_bytes = selection.workspaceBytes(num_heads) orelse return error.InvalidCudaState;
         if (self.gqa_attention_generated_workspace.ptr == 0 or
-            self.gqa_attention_generated_workspace.len < workspace_layout.total_bytes)
+            self.gqa_attention_generated_workspace.len < workspace_bytes)
         {
             return error.InvalidCudaState;
         }
@@ -8400,7 +10427,7 @@ pub const KernelModule = struct {
         if (block_count != 0) try checkRawBytes(block_table, try checkedTensorElements(block_count, @sizeOf(u32)));
         if (decode_scalars.ptr != 0) try checkRawBytes(decode_scalars, 5 * @sizeOf(u32));
 
-        var scores_ptr = self.gqa_attention_generated_workspace.ptr + workspace_layout.partial_values_offset;
+        var scores_ptr = self.gqa_attention_generated_workspace.ptr;
         var dst_ptr = dst.ptr;
         var q_ptr = q.ptr;
         var k_ptr = k.ptr;
@@ -8424,7 +10451,7 @@ pub const KernelModule = struct {
         var format_u32 = format;
         var value_format_u32 = value_format;
         var physical_token_capacity_u32 = try toU32(physical_token_capacity);
-        var score_capacity_u32: u32 = cuda_kernel_renderer.generated_attention_score_prework_max_kv_tokens;
+        var score_capacity_u32: u32 = selection.score_capacity;
         var chunk_count_u32: u32 = cuda_kernel_renderer.generated_attention_score_prework_chunks;
         var chunk_size_u32: u32 = @intCast(
             (@as(usize, score_capacity_u32) + @as(usize, chunk_count_u32) - 1) / @as(usize, chunk_count_u32),
@@ -8480,13 +10507,33 @@ pub const KernelModule = struct {
             @ptrCast(&decode_scalars_ptr),
         };
 
+        const consume_launch = switch (consumer) {
+            .serial => plan.reduction_launch,
+            .tiled64 => plan.tiled64_launch orelse return error.InvalidCudaState,
+        };
+        const expected_consume_grid = switch (consumer) {
+            .serial => cuda_kernel_renderer.GridMapping.batch_query_heads,
+            .tiled64 => cuda_kernel_renderer.GridMapping.batch_query_heads_by_output_tiles,
+        };
+        if (plan.launch.grid != .batch_query_heads_by_splits or consume_launch.grid != expected_consume_grid) {
+            return error.InvalidCudaState;
+        }
+        const score_grid_x = try toU32(try checkedTensorElements(num_heads, plan.lowering.kv_splits));
+        const consume_grid_x = try toU32(num_heads);
+        const consume_grid_y: u32 = switch (consumer) {
+            .serial => 1,
+            .tiled64 => try toU32(head_dim / consume_launch.output_cols_per_block),
+        };
+
         if (captureParamTraceIndex(ctx)) |trace_index| {
-            std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=gqa_attention_decode_turboquant_score_prework dst=0x{x} scores=0x{x} q=0x{x} k=0x{x} v=0x{x} block_table=0x{x} scalars=0x{x} kv_seq_len={d} num_heads={d} num_kv_heads={d} head_dim={d} key_row_bytes={d} value_row_bytes={d} block_count={d} page_size={d} format={d} value_format={d} physical_capacity={d} score_capacity={d} chunks={d}", .{
+            std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=gqa_attention_decode_turboquant_score_prework route={s} consumer={s} consumer_resolution={s} dst=0x{x} scores=0x{x} k=0x{x} v=0x{x} block_table=0x{x} scalars=0x{x} kv_seq_len={d} num_heads={d} num_kv_heads={d} head_dim={d} sliding_window={d} key_row_bytes={d} value_row_bytes={d} block_count={d} page_size={d} format={d} value_format={d} physical_capacity={d} score_capacity={d} workspace_bytes={d} chunks={d} score_grid={d}x1 score_block={d} consume_grid={d}x{d} consume_block={d} consume_static_shared={d}", .{
                 ctx.debug_graph_capture_id,
                 trace_index,
+                selection.route.name(),
+                consumer.name(),
+                @tagName(selection.consumer_resolution),
                 dst_ptr,
                 scores_ptr,
-                q_ptr,
                 k_ptr,
                 v_ptr,
                 block_table_ptr,
@@ -8495,6 +10542,7 @@ pub const KernelModule = struct {
                 num_heads_u32,
                 num_kv_heads_u32,
                 head_dim_u32,
+                sliding_window_u32,
                 key_row_bytes_u32,
                 value_row_bytes_u32,
                 block_count_u32,
@@ -8503,16 +10551,20 @@ pub const KernelModule = struct {
                 value_format_u32,
                 physical_token_capacity_u32,
                 score_capacity_u32,
+                workspace_bytes,
                 chunk_count_u32,
+                score_grid_x,
+                plan.launch.threads_per_block,
+                consume_grid_x,
+                consume_grid_y,
+                consume_launch.threads_per_block,
+                consume_launch.static_shared_memory_bytes,
             });
         }
-
-        const score_grid = try toU32(try checkedTensorElements(num_heads, plan.lowering.kv_splits));
-        const consume_grid = try toU32(num_heads);
         try ctx.makeCurrent();
         try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
             score,
-            score_grid,
+            score_grid_x,
             1,
             1,
             plan.launch.threads_per_block,
@@ -8526,19 +10578,59 @@ pub const KernelModule = struct {
         ctx.noteKernelLaunch();
         try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
             consume,
-            consume_grid,
+            consume_grid_x,
+            consume_grid_y,
+            1,
+            consume_launch.threads_per_block,
             1,
             1,
-            plan.reduction_launch.threads_per_block,
-            1,
-            1,
-            plan.reduction_launch.dynamic_shared_memory_bytes,
+            consume_launch.dynamic_shared_memory_bytes,
             ctx.stream,
             &consume_params,
             null,
         ));
         ctx.noteKernelLaunch();
-        return true;
+        switch (consumer) {
+            .tiled64 => noteGeneratedGqaScorePreworkConsumerEvent(
+                .active,
+                generatedGqaScorePreworkConfiguredModeName(selection),
+                .tiled64,
+                selection.route,
+                head_dim,
+                "none",
+            ),
+            .serial => switch (serial_launch_kind) {
+                .serial => noteGeneratedGqaScorePreworkConsumerEvent(
+                    .active,
+                    generatedGqaScorePreworkConfiguredModeName(selection),
+                    .serial,
+                    selection.route,
+                    head_dim,
+                    "none",
+                ),
+                .serial_tiled64_ineligible_fallback => noteGeneratedGqaScorePreworkConsumerEvent(
+                    .fallback_ineligible,
+                    generatedGqaScorePreworkConfiguredModeName(selection),
+                    .serial,
+                    selection.route,
+                    head_dim,
+                    "consumer_ineligible",
+                ),
+                .serial_tiled64_symbol_fallback => noteGeneratedGqaScorePreworkConsumerEvent(
+                    .fallback_symbol,
+                    generatedGqaScorePreworkConfiguredModeName(selection),
+                    .serial,
+                    selection.route,
+                    head_dim,
+                    "consumer_symbol_unavailable",
+                ),
+                .none, .tiled64 => unreachable,
+            },
+        }
+        return switch (consumer) {
+            .serial => serial_launch_kind,
+            .tiled64 => .tiled64,
+        };
     }
 
     pub fn launchGqaAttentionDecodeTurboquantSplitF32(
@@ -9961,6 +12053,34 @@ pub const KernelModule = struct {
             @ptrCast(&in_dim_u32),
         };
         try launchBlocks(function, ctx, (total_blocks + q8_1_quantize_warps - 1) / q8_1_quantize_warps, q8_1_quantize_threads, &params);
+    }
+
+    pub fn launchQuantizeF32GgmlQ8_1Rows(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: GgmlQ8_1Buffer,
+        input: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.quantize_f32_ggml_q8_1_rows orelse return error.CudaKernelUnavailable;
+        if (in_dim == 0 or in_dim % q8_1_values_per_block != 0) return error.InvalidCudaState;
+        const total_blocks = try checkedTensorElements(rows, in_dim / q8_1_values_per_block);
+        try checkRawBytes(dst.buffer, try checkedTensorElements(total_blocks, q8_1_block_bytes));
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        if (total_blocks == 0) return;
+
+        var dst_ptr = dst.buffer.ptr;
+        var input_ptr = input.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+        };
+        try launchBlocks(function, ctx, total_blocks, 32, &params);
     }
 
     pub fn launchQuantizeGatedF32Q8_1Rows(
@@ -12164,6 +14284,47 @@ pub const KernelModule = struct {
         try launchBlocks(function, ctx, try checkedTensorElements(rows, out_row_blocks), generated_q4_0_q8_e2b_pair_threads, &params);
     }
 
+    pub fn launchLinearQ4_0GeneratedPairGgmlQ8_1E2B(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: GgmlQ8_1Buffer,
+        input: GgmlQ8_1Buffer,
+        weight_gate: buffer_mod.DeviceBuffer,
+        weight_up: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        activation: u8,
+    ) driver_mod.Error!void {
+        if (!generatedQ4_0PairQ8E2BShapeEligible(rows, in_dim, out_dim, activation)) return error.InvalidCudaState;
+        const function = switch (out_dim) {
+            generated_q4_0_q8_e2b_intermediate_small => self.linear_q4_0_generated_pair_ggml_q8_1_e2b_6144,
+            generated_q4_0_q8_e2b_intermediate_large => self.linear_q4_0_generated_pair_ggml_q8_1_e2b_12288,
+            else => unreachable,
+        } orelse return error.CudaKernelUnavailable;
+        const input_row_blocks = in_dim / q8_1_values_per_block;
+        const out_row_blocks = out_dim / q8_1_values_per_block;
+        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, input_row_blocks), q4_0_block_bytes);
+        try checkRawBytes(dst.buffer, try checkedTensorElements(try checkedTensorElements(rows, out_row_blocks), q8_1_block_bytes));
+        try checkRawBytes(input.buffer, try checkedTensorElements(try checkedTensorElements(rows, input_row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_gate, weight_bytes);
+        try checkRawBytes(weight_up, weight_bytes);
+
+        var dst_ptr = dst.buffer.ptr;
+        var input_ptr = input.buffer.ptr;
+        var weight_gate_ptr = weight_gate.ptr;
+        var weight_up_ptr = weight_up.ptr;
+        var activation_u32: u32 = activation;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),        @ptrCast(&input_ptr), @ptrCast(&weight_gate_ptr), @ptrCast(&weight_up_ptr),
+            @ptrCast(&activation_u32), @ptrCast(&rows_u32),  @ptrCast(&in_dim_u32),      @ptrCast(&out_dim_u32),
+        };
+        try launchBlocks(function, ctx, try checkedTensorElements(rows, out_row_blocks), generated_q4_0_q8_e2b_pair_threads, &params);
+    }
+
     pub fn launchLinearQ4_0GeneratedPairQ8Catalog(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -12245,6 +14406,42 @@ pub const KernelModule = struct {
             @ptrCast(&out_dim_u32),
         };
         try launchBlocks(kernel, ctx, try checkedTensorElements(rows, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile), threads, &params);
+    }
+
+    pub fn launchLinearQ4_0GeneratedDownGgmlQ8_1E2B(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: GgmlQ8_1Buffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        if (!generatedQ4_0DownQ8E2BShapeEligible(rows, in_dim, out_dim)) return error.InvalidCudaState;
+        const function = switch (in_dim) {
+            generated_q4_0_q8_e2b_intermediate_small => self.linear_q4_0_generated_down_ggml_q8_1_e2b_6144,
+            generated_q4_0_q8_e2b_intermediate_large => self.linear_q4_0_generated_down_ggml_q8_1_e2b_12288,
+            else => unreachable,
+        } orelse return error.CudaKernelUnavailable;
+        const input_row_blocks = in_dim / q8_1_values_per_block;
+        try checkBytes(dst, try checkedTensorElements(rows, out_dim));
+        try checkRawBytes(input.buffer, try checkedTensorElements(try checkedTensorElements(rows, input_row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, input_row_blocks), q4_0_block_bytes));
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.buffer.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),  @ptrCast(&input_ptr),  @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32), @ptrCast(&in_dim_u32), @ptrCast(&out_dim_u32),
+        };
+        // Mirrors llama.cpp's Ada MMVQ launch: four warps and one output row
+        // per CTA, so grid.x is exactly rows*out_dim.
+        try launchBlocks(function, ctx, try checkedTensorElements(rows, out_dim), generated_q4_0_ggml_q8_1_down_threads, &params);
     }
 
     pub fn launchLinearQ4_0GeneratedDownQ8Catalog(
@@ -13704,6 +15901,7 @@ const generated_q4_0_q8_e2b_intermediate_large: usize = 12288;
 const generated_q4_0_q8_e2b_pair_threads: usize = 384;
 const generated_q4_0_q8_e2b_down_small_threads: usize = 128;
 const generated_q4_0_q8_e2b_down_large_threads: usize = 256;
+const generated_q4_0_ggml_q8_1_down_threads: usize = 128;
 const generated_q4_0_q8_e2b_max_activation: u8 = @intFromEnum(@import("../../graph/backend_contracts.zig").DecoderRuntimeActivationKind.relu_squared);
 const generated_q4_0_exact_ffn_pair_threads: usize = 128;
 const generated_q4_0_exact_ffn_down_threads: usize = 256;
@@ -15262,10 +17460,8 @@ test "CUDA runtime JIT mappings cover complete artifact function bundles" {
         try std.testing.expectEqualStrings(artifact.kernel_id, mapping.names[0]);
         const expected_count: usize = if (artifact.cuda_attention_kernel == null)
             1
-        else switch (artifact.cuda_attention_kernel.?) {
-            .gqa_decode_score_prework_hd256_f32, .gqa_decode_score_prework_hd512_f32 => @as(usize, 2),
-            else => @as(usize, 3),
-        };
+        else
+            3;
         try std.testing.expectEqual(expected_count, mapping.count);
         if (artifact.cuda_attention_kernel != null) attention_artifacts += 1;
         for (0..mapping.count) |index| {
@@ -15297,16 +17493,24 @@ test "CUDA runtime JIT profile scope covers only Gemma4 production routes" {
     try std.testing.expect(scope.production.down_q8);
     var selected: usize = 0;
     var production: usize = 0;
+    var production_matmul: usize = 0;
     for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
         if (artifact.backend != .cuda) continue;
-        if (artifact.production_enabled) production += 1;
+        if (artifact.production_enabled) {
+            production += 1;
+            if (artifact.matmulOp() != null) production_matmul += 1;
+        }
         if (!scope.includesArtifact(artifact)) continue;
         selected += 1;
         try std.testing.expect(artifact.production_enabled);
         try std.testing.expect(liveRuntimeJitRoute(artifact) != null);
     }
-    try std.testing.expectEqual(@as(usize, 5), production);
-    try std.testing.expectEqual(production, selected);
+    // The runtime JIT owns the five promoted Q4_0 matmul routes. The two
+    // promoted score-prework attention composites ship in the prebuilt
+    // runtime module and deliberately stay outside JIT scope.
+    try std.testing.expectEqual(@as(usize, 7), production);
+    try std.testing.expectEqual(@as(usize, 5), production_matmul);
+    try std.testing.expectEqual(production_matmul, selected);
 }
 
 test "CUDA runtime JIT required mode rejects an empty model scope before CUDA access" {
@@ -18329,6 +20533,506 @@ test "generated CUDA GQA decode shape supports bounded ratios" {
     try std.testing.expect(!generatedGqaDecodeShapeEligible(1, 1, 512, 40, 5));
 }
 
+test "CUDA SM89 split-K online decode profile and telemetry are typed and bounded" {
+    try std.testing.expectEqual(GqaDecodeProfile.off, parseGqaDecodeProfile("off").?);
+    try std.testing.expectEqual(
+        GqaDecodeProfile.splitk_online_sm89,
+        parseGqaDecodeProfile("splitk-online-sm89").?,
+    );
+    try std.testing.expectEqual(
+        GqaDecodeProfile.required_splitk_online_sm89,
+        parseGqaDecodeProfile("required-splitk-online-sm89").?,
+    );
+    try std.testing.expect(parseGqaDecodeProfile("splitk_online_sm89") == null);
+    try std.testing.expect(parseGqaDecodeProfile("REQUIRED-SPLITK-ONLINE-SM89") == null);
+    try std.testing.expect(GqaDecodeProfile.splitk_online_sm89.selectsSplitkOnlineSm89());
+    try std.testing.expect(!GqaDecodeProfile.splitk_online_sm89.failClosed());
+    try std.testing.expect(GqaDecodeProfile.required_splitk_online_sm89.failClosed());
+
+    var word = std.atomic.Value(u64).init(0);
+    try std.testing.expect(claimGqaSplitkOnlineDecodeTelemetry(&word, .active, 256));
+    try std.testing.expect(!claimGqaSplitkOnlineDecodeTelemetry(&word, .active, 256));
+    try std.testing.expect(claimGqaSplitkOnlineDecodeTelemetry(&word, .active, 512));
+    try std.testing.expect(claimGqaSplitkOnlineDecodeTelemetry(&word, .ineligible_fallback, 256));
+    try std.testing.expect(claimGqaSplitkOnlineDecodeTelemetry(&word, .symbol_fallback, 512));
+    try std.testing.expect(claimGqaSplitkOnlineDecodeTelemetry(&word, .rejected, 384));
+}
+
+test "CUDA SM89 split-K online decode selector enforces locked replay capacity" {
+    try std.testing.expect(gqaSplitkOnlineDecodeReplayScalarsEligible(2431, 2432, 2432, 0, 2432));
+    try std.testing.expect(!gqaSplitkOnlineDecodeReplayScalarsEligible(2430, 2432, 2432, 0, 2432));
+    try std.testing.expect(!gqaSplitkOnlineDecodeReplayScalarsEligible(2431, 2431, 2432, 0, 2432));
+    try std.testing.expect(!gqaSplitkOnlineDecodeReplayScalarsEligible(4096, 4097, 4097, 0, 4097));
+
+    var request = GqaSplitkOnlineDecodeRequest{
+        .compute_major = 8,
+        .compute_minor = 9,
+        .batch = 1,
+        .q_seq_len = 1,
+        // Graph construction uses the forced 2432-token capacity. Device
+        // scalars narrow these values on replay without changing the ABI.
+        .kv_seq_len = 2432,
+        .num_heads = 8,
+        .num_kv_heads = 1,
+        .head_dim = 256,
+        .query_position_offset = 2431,
+        .kv_position_offset = 0,
+        .sliding_window = 512,
+        .total_sequence_len = 2432,
+        .mask_len = 0,
+        .bias_mode = 0,
+        .key_row_bytes = 512,
+        .base_key_row_bytes = 512,
+        .value_row_bytes = 512,
+        .block_count = 152,
+        .page_size_tokens = 16,
+        .format = 2,
+        .value_format = 2,
+        .physical_token_capacity = 2432,
+        .block_table_present = true,
+        .decode_scalars_present = true,
+        .workspace_available = true,
+    };
+    try std.testing.expectEqual(
+        GqaSplitkOnlineDecodeEligibility.eligible,
+        gqaSplitkOnlineDecodeEligibility(request),
+    );
+
+    // The global layers use the same forced-capacity graph/workspace ABI.
+    request.head_dim = 512;
+    request.sliding_window = 0;
+    request.key_row_bytes = 1024;
+    request.base_key_row_bytes = 1024;
+    request.value_row_bytes = 1024;
+    try std.testing.expectEqual(
+        GqaSplitkOnlineDecodeEligibility.eligible,
+        gqaSplitkOnlineDecodeEligibility(request),
+    );
+
+    request.compute_minor = 0;
+    try std.testing.expectEqual(
+        GqaSplitkOnlineDecodeEligibility.compute_capability_ineligible,
+        gqaSplitkOnlineDecodeEligibility(request),
+    );
+    request.compute_minor = 9;
+    request.physical_token_capacity = 4112;
+    try std.testing.expectEqual(
+        GqaSplitkOnlineDecodeEligibility.eligible,
+        gqaSplitkOnlineDecodeEligibility(request),
+    );
+    request.physical_token_capacity = 2432;
+    request.block_count = 151;
+    try std.testing.expectEqual(
+        GqaSplitkOnlineDecodeEligibility.block_count_ineligible,
+        gqaSplitkOnlineDecodeEligibility(request),
+    );
+    request.block_count = 152;
+    request.page_size_tokens = 32;
+    try std.testing.expectEqual(
+        GqaSplitkOnlineDecodeEligibility.page_size_ineligible,
+        gqaSplitkOnlineDecodeEligibility(request),
+    );
+    request.page_size_tokens = 16;
+    request.total_sequence_len = 2431;
+    try std.testing.expectEqual(
+        GqaSplitkOnlineDecodeEligibility.position_policy_ineligible,
+        gqaSplitkOnlineDecodeEligibility(request),
+    );
+    request.total_sequence_len = 2432;
+    request.workspace_available = false;
+    try std.testing.expectEqual(
+        GqaSplitkOnlineDecodeEligibility.workspace_ineligible,
+        gqaSplitkOnlineDecodeEligibility(request),
+    );
+
+    // Identity paging is a separate valid contract; mixed pointer/count forms
+    // fail before launch so the device cannot silently use the wrong mapping.
+    request.workspace_available = true;
+    request.block_table_present = false;
+    request.block_count = 0;
+    try std.testing.expectEqual(
+        GqaSplitkOnlineDecodeEligibility.eligible,
+        gqaSplitkOnlineDecodeEligibility(request),
+    );
+    request.block_count = 152;
+    try std.testing.expectEqual(
+        GqaSplitkOnlineDecodeEligibility.page_table_ineligible,
+        gqaSplitkOnlineDecodeEligibility(request),
+    );
+}
+
+test "CUDA GQA prefill profile is canonical and legacy resolution is unambiguous" {
+    inline for (.{
+        .{ "off", GqaPrefillProfile.off },
+        .{ "fast", GqaPrefillProfile.fast },
+        .{ "required-fast", GqaPrefillProfile.required_fast },
+        .{ "tiled", GqaPrefillProfile.tiled },
+        .{ "mma", GqaPrefillProfile.mma },
+        .{ "tiled-f16-exact", GqaPrefillProfile.tiled_f16_exact },
+        .{ "required-tiled-f16-exact", GqaPrefillProfile.required_tiled_f16_exact },
+        .{ "tiled-f16-warp", GqaPrefillProfile.tiled_f16_warp },
+        .{ "required-tiled-f16-warp", GqaPrefillProfile.required_tiled_f16_warp },
+        .{ "flash-f16-sm89", GqaPrefillProfile.flash_f16_sm89 },
+        .{ "required-flash-f16-sm89", GqaPrefillProfile.required_flash_f16_sm89 },
+    }) |entry| {
+        try std.testing.expectEqual(entry[1], parseGqaPrefillProfile(entry[0]).?);
+    }
+    try std.testing.expect(parseGqaPrefillProfile("required_fast") == null);
+    try std.testing.expect(parseGqaPrefillProfile("FAST") == null);
+
+    const canonical = try resolveGqaPrefillProfile("required-fast", true, true, true);
+    try std.testing.expectEqual(GqaPrefillProfile.required_fast, canonical.profile);
+    try std.testing.expectEqual(GqaPrefillProfileSource.canonical, canonical.source);
+    try std.testing.expect(canonical.profile.selectsFast());
+    try std.testing.expect(canonical.profile.failClosed());
+    try std.testing.expect(GqaPrefillProfile.required_tiled_f16_exact.failClosed());
+    try std.testing.expect(GqaPrefillProfile.required_tiled_f16_warp.failClosed());
+    try std.testing.expect(GqaPrefillProfile.required_flash_f16_sm89.failClosed());
+    try std.testing.expect(GqaPrefillProfile.flash_f16_sm89.selectsFlashF16Sm89());
+    try std.testing.expect(!GqaPrefillProfile.tiled_f16_exact.failClosed());
+    try std.testing.expect(!GqaPrefillProfile.tiled_f16_warp.failClosed());
+
+    const legacy = try resolveGqaPrefillProfile(null, true, false, false);
+    try std.testing.expectEqual(GqaPrefillProfile.fast, legacy.profile);
+    try std.testing.expectEqual(GqaPrefillProfileSource.legacy, legacy.source);
+    const defaults = try resolveGqaPrefillProfile(null, false, false, false);
+    try std.testing.expectEqual(GqaPrefillProfile.off, defaults.profile);
+    try std.testing.expectEqual(GqaPrefillProfileSource.default, defaults.source);
+
+    try std.testing.expectError(error.InvalidCudaState, resolveGqaPrefillProfile("auto", false, false, false));
+    try std.testing.expectError(error.InvalidCudaState, resolveGqaPrefillProfile(null, true, true, false));
+}
+
+test "CUDA GQA prefill telemetry distinguishes mixed Gemma head geometries" {
+    const local = gqaPrefillRouteLogSlot(.prefill_fast, 256) orelse return error.MissingLocalRouteBit;
+    const global = gqaPrefillRouteLogSlot(.prefill_fast, 512) orelse return error.MissingGlobalRouteBit;
+    const mma_local = gqaPrefillRouteLogSlot(.prefill_mma_m32, 256) orelse return error.MissingMmaRouteBit;
+    const exact_local = gqaPrefillRouteLogSlot(.prefill_tiled_f16_exact, 256) orelse return error.MissingExactRouteBit;
+    const warp_global = gqaPrefillRouteLogSlot(.prefill_tiled_f16_warp, 512) orelse return error.MissingWarpRouteBit;
+    const flash_local = gqaPrefillRouteLogSlot(.prefill_flash_f16_sm89, 256) orelse return error.MissingFlashRouteBit;
+    try std.testing.expectEqual(@as(usize, 0), local.word);
+    try std.testing.expectEqual(@as(usize, 0), global.word);
+    try std.testing.expectEqual(@as(usize, 0), mma_local.word);
+    try std.testing.expectEqual(@as(usize, 1), exact_local.word);
+    try std.testing.expectEqual(@as(usize, 1), warp_global.word);
+    try std.testing.expectEqual(@as(usize, 1), flash_local.word);
+    try std.testing.expect(local.bit != global.bit);
+    try std.testing.expect(local.bit != mma_local.bit);
+    try std.testing.expect(exact_local.bit != warp_global.bit);
+    try std.testing.expect(flash_local.bit != warp_global.bit);
+    try std.testing.expect(gqaPrefillRouteLogSlot(.decode_fast, 256) == null);
+    try std.testing.expect(gqaPrefillRouteLogSlot(.prefill_fast, 255) == null);
+    try std.testing.expect(gqaPrefillRouteLogSlot(.prefill_fast, 544) == null);
+
+    var words: [gqa_prefill_route_log_word_count]std.atomic.Value(u64) = .{
+        std.atomic.Value(u64).init(0),
+        std.atomic.Value(u64).init(0),
+    };
+    try std.testing.expect(claimGqaPrefillRouteLog(&words, .prefill_fast, 256));
+    try std.testing.expect(!claimGqaPrefillRouteLog(&words, .prefill_fast, 256));
+    try std.testing.expect(claimGqaPrefillRouteLog(&words, .prefill_fast, 512));
+    try std.testing.expect(claimGqaPrefillRouteLog(&words, .prefill_mma_m32, 256));
+    try std.testing.expect(claimGqaPrefillRouteLog(&words, .prefill_tiled_f16_exact, 256));
+    try std.testing.expect(claimGqaPrefillRouteLog(&words, .prefill_tiled_f16_warp, 512));
+    try std.testing.expect(claimGqaPrefillRouteLog(&words, .prefill_flash_f16_sm89, 256));
+    try std.testing.expectEqual(local.bit | global.bit | mma_local.bit, words[0].load(.monotonic));
+    try std.testing.expectEqual(exact_local.bit | warp_global.bit | flash_local.bit, words[1].load(.monotonic));
+}
+
+test "CUDA exact F16 GQA prefill selector gates storage rows shape and explicit pages" {
+    var request = GqaF16PrefillRequest{
+        .batch = 1,
+        .q_seq_len = 513,
+        .kv_seq_len = 513,
+        .num_heads = 8,
+        .num_kv_heads = 1,
+        .head_dim = 256,
+        .mask_len = 0,
+        .bias_mode = 0,
+        .key_row_bytes = 512,
+        .base_key_row_bytes = 512,
+        .value_row_bytes = 512,
+        .block_count = 3,
+        .page_size_tokens = 256,
+        .format = 2,
+        .value_format = 2,
+        .physical_token_capacity = 768,
+        .block_table_present = true,
+        .decode_scalars_present = false,
+    };
+    try std.testing.expectEqual(GqaF16PrefillEligibility.eligible, gqaF16PrefillEligibility(request));
+    try std.testing.expectEqual(
+        GqaAttentionLaunchKind.prefill_tiled_f16_exact,
+        selectGqaF16PrefillLaunch(.tiled_f16_exact, .eligible, true, true),
+    );
+    try std.testing.expectEqual(
+        GqaAttentionLaunchKind.prefill_tiled_f16_warp,
+        selectGqaF16PrefillLaunch(.required_tiled_f16_warp, .eligible, true, true),
+    );
+    try std.testing.expectEqual(
+        GqaAttentionLaunchKind.none,
+        selectGqaF16PrefillLaunch(.tiled_f16_exact, .eligible, false, true),
+    );
+    try std.testing.expectEqual(
+        GqaAttentionLaunchKind.prefill_tiled_f16_exact,
+        requiredGqaPrefillLaunch(.required_tiled_f16_exact).?,
+    );
+    try std.testing.expectEqual(
+        GqaAttentionLaunchKind.prefill_tiled_f16_warp,
+        requiredGqaPrefillLaunch(.required_tiled_f16_warp).?,
+    );
+    try std.testing.expect(requiredGqaPrefillLaunch(.tiled_f16_exact) == null);
+
+    request.format = 0;
+    try std.testing.expectEqual(GqaF16PrefillEligibility.storage_format_ineligible, gqaF16PrefillEligibility(request));
+    request.format = 2;
+    request.value_row_bytes = 516;
+    try std.testing.expectEqual(GqaF16PrefillEligibility.row_bytes_ineligible, gqaF16PrefillEligibility(request));
+    request.value_row_bytes = 512;
+    request.decode_scalars_present = true;
+    try std.testing.expectEqual(GqaF16PrefillEligibility.decode_scalars_present, gqaF16PrefillEligibility(request));
+    request.decode_scalars_present = false;
+    request.block_count = 2;
+    try std.testing.expectEqual(GqaF16PrefillEligibility.block_count_ineligible, gqaF16PrefillEligibility(request));
+    request.block_count = 3;
+    request.head_dim = 128;
+    try std.testing.expectEqual(GqaF16PrefillEligibility.shape_ineligible, gqaF16PrefillEligibility(request));
+
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        requiredGqaF16PrefillRejectionReason(.required_tiled_f16_exact, .row_bytes_ineligible),
+        requiredGqaF16PrefillRejectionReason(.required_tiled_f16_warp, .row_bytes_ineligible),
+    ));
+}
+
+test "CUDA F16 GQA prefill identity-page contract is explicit and bounded" {
+    var request = GqaF16PrefillRequest{
+        .batch = 1,
+        .q_seq_len = 513,
+        .kv_seq_len = 513,
+        .num_heads = 8,
+        .num_kv_heads = 1,
+        .head_dim = 256,
+        .mask_len = 0,
+        .bias_mode = 0,
+        .key_row_bytes = 512,
+        .base_key_row_bytes = 512,
+        .value_row_bytes = 512,
+        .block_count = 0,
+        .page_size_tokens = 256,
+        .format = 2,
+        .value_format = 2,
+        .physical_token_capacity = 768,
+        .block_table_present = false,
+        .decode_scalars_present = false,
+    };
+
+    const identity_eligibility = gqaF16PrefillEligibility(request);
+    try std.testing.expectEqual(GqaF16PrefillEligibility.eligible, identity_eligibility);
+    try std.testing.expectEqual(
+        GqaAttentionLaunchKind.prefill_tiled_f16_exact,
+        selectGqaF16PrefillLaunch(.tiled_f16_exact, identity_eligibility, true, true),
+    );
+    try std.testing.expectEqual(
+        GqaAttentionLaunchKind.prefill_tiled_f16_warp,
+        selectGqaF16PrefillLaunch(.required_tiled_f16_warp, identity_eligibility, true, true),
+    );
+
+    request.block_count = 3;
+    try std.testing.expectEqual(
+        GqaF16PrefillEligibility.block_table_count_inconsistent,
+        gqaF16PrefillEligibility(request),
+    );
+    request.block_count = 0;
+    request.block_table_present = true;
+    try std.testing.expectEqual(
+        GqaF16PrefillEligibility.block_table_count_inconsistent,
+        gqaF16PrefillEligibility(request),
+    );
+
+    request.block_table_present = false;
+    request.page_size_tokens = 0;
+    try std.testing.expectEqual(GqaF16PrefillEligibility.page_size_ineligible, gqaF16PrefillEligibility(request));
+    request.page_size_tokens = 256;
+    request.physical_token_capacity = 512;
+    const undersized_identity = gqaF16PrefillEligibility(request);
+    try std.testing.expectEqual(GqaF16PrefillEligibility.physical_capacity_ineligible, undersized_identity);
+    try std.testing.expectEqual(
+        GqaAttentionLaunchKind.none,
+        selectGqaF16PrefillLaunch(.tiled_f16_warp, undersized_identity, true, true),
+    );
+    request.physical_token_capacity = 769;
+    try std.testing.expectEqual(GqaF16PrefillEligibility.physical_capacity_ineligible, gqaF16PrefillEligibility(request));
+
+    request.block_table_present = true;
+    request.block_count = 2;
+    request.physical_token_capacity = 768;
+    try std.testing.expectEqual(GqaF16PrefillEligibility.block_count_ineligible, gqaF16PrefillEligibility(request));
+    request.block_count = 3;
+    request.physical_token_capacity = 0;
+    try std.testing.expectEqual(GqaF16PrefillEligibility.physical_capacity_ineligible, gqaF16PrefillEligibility(request));
+    request.physical_token_capacity = 770;
+    try std.testing.expectEqual(GqaF16PrefillEligibility.physical_capacity_ineligible, gqaF16PrefillEligibility(request));
+
+    request.physical_token_capacity = 768;
+    request.kv_seq_len = 0;
+    try std.testing.expectEqual(GqaF16PrefillEligibility.empty_kv_sequence, gqaF16PrefillEligibility(request));
+
+    try std.testing.expectEqualStrings(
+        "tiled-f16-exact-block-table-count-inconsistent",
+        requiredGqaF16PrefillRejectionReason(.required_tiled_f16_exact, .block_table_count_inconsistent),
+    );
+    try std.testing.expectEqualStrings(
+        "tiled-f16-warp-physical-capacity-ineligible",
+        requiredGqaF16PrefillRejectionReason(.required_tiled_f16_warp, .physical_capacity_ineligible),
+    );
+}
+
+test "CUDA SM89 Flash prefill selector enforces the qualified production ABI" {
+    var request = GqaFlashPrefillRequest{
+        .base = .{
+            .batch = 1,
+            .q_seq_len = 512,
+            .kv_seq_len = 512,
+            .num_heads = 8,
+            .num_kv_heads = 1,
+            .head_dim = 256,
+            .mask_len = 0,
+            .bias_mode = 0,
+            .key_row_bytes = 512,
+            .base_key_row_bytes = 512,
+            .value_row_bytes = 512,
+            .block_count = 32,
+            .page_size_tokens = 16,
+            .format = 2,
+            .value_format = 2,
+            .physical_token_capacity = 512,
+            .block_table_present = true,
+            .decode_scalars_present = false,
+        },
+        .compute_major = 8,
+        .compute_minor = 9,
+        .query_position_offset = 0,
+        .kv_position_offset = 0,
+        .sliding_window = 512,
+        .total_sequence_len = 512,
+    };
+    try std.testing.expectEqual(
+        std.meta.Tag(GqaFlashPrefillEligibility).eligible,
+        std.meta.activeTag(gqaFlashPrefillEligibility(request)),
+    );
+    try std.testing.expectEqual(
+        GqaAttentionLaunchKind.prefill_flash_f16_sm89,
+        selectGqaFlashPrefillLaunch(.flash_f16_sm89, .eligible, true),
+    );
+    try std.testing.expectEqual(
+        GqaAttentionLaunchKind.prefill_flash_f16_sm89,
+        requiredGqaPrefillLaunch(.required_flash_f16_sm89).?,
+    );
+    try std.testing.expectEqual(
+        GqaAttentionLaunchKind.none,
+        selectGqaFlashPrefillLaunch(.flash_f16_sm89, .eligible, false),
+    );
+
+    // Sparse production page IDs increase physical capacity but retain the
+    // same unique page-table ABI; they are not an identity-table requirement.
+    request.base.physical_token_capacity = 1024;
+    try std.testing.expectEqual(
+        std.meta.Tag(GqaFlashPrefillEligibility).eligible,
+        std.meta.activeTag(gqaFlashPrefillEligibility(request)),
+    );
+    request.base.physical_token_capacity = 256;
+    const aliased_capacity = gqaFlashPrefillEligibility(request);
+    try std.testing.expectEqual(
+        std.meta.Tag(GqaFlashPrefillEligibility).physical_capacity_ineligible,
+        std.meta.activeTag(aliased_capacity),
+    );
+    try std.testing.expectEqual(
+        GqaAttentionLaunchKind.prefill_flash_f16_sm89_ineligible_fallback,
+        optionalGqaFlashPrefillFallbackLaunch(.flash_f16_sm89, aliased_capacity, true).?,
+    );
+    try std.testing.expectEqualStrings(
+        "flash-f16-sm89-physical-capacity-ineligible",
+        requiredGqaFlashPrefillRejectionReason(aliased_capacity, true),
+    );
+    try std.testing.expect(
+        optionalGqaFlashPrefillFallbackLaunch(.required_flash_f16_sm89, aliased_capacity, true) == null,
+    );
+
+    var locked_tail = request;
+    locked_tail.base.q_seq_len = 3;
+    locked_tail.base.kv_seq_len = 2051;
+    locked_tail.base.head_dim = 512;
+    locked_tail.base.key_row_bytes = 1024;
+    locked_tail.base.base_key_row_bytes = 1024;
+    locked_tail.base.value_row_bytes = 1024;
+    locked_tail.base.block_count = 129;
+    locked_tail.base.physical_token_capacity = 2432;
+    locked_tail.query_position_offset = 2048;
+    locked_tail.sliding_window = 0;
+    locked_tail.total_sequence_len = 2051;
+    try std.testing.expectEqual(
+        std.meta.Tag(GqaFlashPrefillEligibility).eligible,
+        std.meta.activeTag(gqaFlashPrefillEligibility(locked_tail)),
+    );
+
+    request.base.physical_token_capacity = 1024;
+    request.compute_minor = 0;
+    try std.testing.expectEqual(
+        std.meta.Tag(GqaFlashPrefillEligibility).compute_capability_ineligible,
+        std.meta.activeTag(gqaFlashPrefillEligibility(request)),
+    );
+    request.compute_minor = 9;
+    request.base.page_size_tokens = 32;
+    try std.testing.expectEqual(
+        std.meta.Tag(GqaFlashPrefillEligibility).page_size_ineligible,
+        std.meta.activeTag(gqaFlashPrefillEligibility(request)),
+    );
+    request.base.page_size_tokens = 16;
+    request.query_position_offset = 1;
+    try std.testing.expectEqual(
+        std.meta.Tag(GqaFlashPrefillEligibility).query_length_policy_ineligible,
+        std.meta.activeTag(gqaFlashPrefillEligibility(request)),
+    );
+    request.query_position_offset = 0;
+    request.sliding_window = 0;
+    try std.testing.expectEqual(
+        std.meta.Tag(GqaFlashPrefillEligibility).sliding_window_ineligible,
+        std.meta.activeTag(gqaFlashPrefillEligibility(request)),
+    );
+
+    request.base.q_seq_len = 1;
+    request.base.kv_seq_len = 1;
+    request.total_sequence_len = 1;
+    request.sliding_window = 512;
+    try std.testing.expectEqual(
+        std.meta.Tag(GqaFlashPrefillEligibility).base,
+        std.meta.activeTag(gqaFlashPrefillEligibility(request)),
+    );
+}
+
+test "CUDA SM89 Flash prefill telemetry is bounded per head and query bucket" {
+    const active_local_q512 = gqaFlashPrefillTelemetryBit(.active, 256, 512);
+    const active_local_q3 = gqaFlashPrefillTelemetryBit(.active, 256, 3);
+    const active_global_q512 = gqaFlashPrefillTelemetryBit(.active, 512, 512);
+    const fallback_local_q512 = gqaFlashPrefillTelemetryBit(.ineligible_fallback, 256, 512);
+    const rejected_global_q3 = gqaFlashPrefillTelemetryBit(.rejected, 512, 3);
+    try std.testing.expect(active_local_q512 != active_local_q3);
+    try std.testing.expect(active_local_q512 != active_global_q512);
+    try std.testing.expect(active_local_q512 != fallback_local_q512);
+    try std.testing.expect(rejected_global_q3 != fallback_local_q512);
+
+    var word = std.atomic.Value(u64).init(0);
+    try std.testing.expect(claimGqaFlashPrefillTelemetry(&word, .active, 256, 512));
+    try std.testing.expect(!claimGqaFlashPrefillTelemetry(&word, .active, 256, 512));
+    try std.testing.expect(claimGqaFlashPrefillTelemetry(&word, .active, 256, 3));
+    try std.testing.expect(claimGqaFlashPrefillTelemetry(&word, .rejected, 512, 3));
+    try std.testing.expectEqual(
+        active_local_q512 | active_local_q3 | rejected_global_q3,
+        word.load(.monotonic),
+    );
+}
+
 test "BERT tensor-core prefill mode is explicit and shape-bounded" {
     try std.testing.expectEqual(BertPrefillAttentionMode.generic, parseBertPrefillAttentionMode("generic").?);
     try std.testing.expectEqual(BertPrefillAttentionMode.exact, parseBertPrefillAttentionMode("exact").?);
@@ -18354,48 +21058,299 @@ test "BERT tensor-core prefill mode is explicit and shape-bounded" {
     try std.testing.expectEqual(@as(usize, 45312), bert_prefill_attention_mma_shared_bytes);
 }
 
-test "generated CUDA paged score prework has a strict production boundary" {
-    try std.testing.expect(generatedGqaScorePreworkShapeEligible(
-        1,
-        1,
-        544,
-        16,
-        1,
-        256,
-        0,
-        0,
-        128,
-        128,
-        1024,
-        0,
-        0,
-        544,
-    ));
-    try std.testing.expect(generatedGqaScorePreworkShapeEligible(
-        1,
-        1,
-        4096,
-        32,
-        2,
-        512,
-        0,
-        0,
-        2048,
-        2048,
-        4096,
-        2,
-        0,
-        4096,
-    ));
-    try std.testing.expect(!generatedGqaScorePreworkShapeEligible(2, 1, 544, 16, 1, 256, 0, 0, 128, 128, 1024, 0, 0, 544));
-    try std.testing.expect(!generatedGqaScorePreworkShapeEligible(1, 2, 544, 16, 1, 256, 0, 0, 128, 128, 1024, 0, 0, 544));
-    try std.testing.expect(!generatedGqaScorePreworkShapeEligible(1, 1, 4097, 16, 1, 256, 0, 0, 128, 128, 1024, 0, 0, 4097));
-    try std.testing.expect(!generatedGqaScorePreworkShapeEligible(1, 1, 544, 16, 1, 256, 1, 0, 128, 128, 1024, 0, 0, 544));
-    try std.testing.expect(!generatedGqaScorePreworkShapeEligible(1, 1, 544, 16, 1, 256, 0, 1, 128, 128, 1024, 0, 0, 544));
-    try std.testing.expect(!generatedGqaScorePreworkShapeEligible(1, 1, 544, 16, 1, 256, 0, 0, 128, 256, 1024, 0, 0, 544));
-    try std.testing.expect(!generatedGqaScorePreworkShapeEligible(1, 1, 544, 16, 1, 256, 0, 0, 128, 128, 1024, 1, 0, 544));
-    try std.testing.expect(!generatedGqaScorePreworkShapeEligible(1, 1, 544, 16, 1, 256, 0, 0, 128, 128, 1024, 0, 1, 544));
-    try std.testing.expect(!generatedGqaScorePreworkShapeEligible(1, 1, 544, 16, 1, 256, 0, 0, 128, 128, 1024, 0, 0, 8192));
+test "generated CUDA paged score prework selects exact Gemma 4 F16 boundaries" {
+    var request = GeneratedGqaScorePreworkRequest{
+        .batch = 1,
+        .q_seq_len = 1,
+        .kv_seq_len = 511,
+        .num_heads = 8,
+        .num_kv_heads = 2,
+        .head_dim = 256,
+        .sliding_window = 512,
+        .mask_len = 0,
+        .bias_mode = 0,
+        .key_row_bytes = 1024,
+        .base_key_row_bytes = 1024,
+        .value_row_bytes = 1024,
+        .block_count = 4,
+        .page_size_tokens = 128,
+        .format = 2,
+        .value_format = 2,
+        .physical_token_capacity = 512,
+    };
+    try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 9) == null);
+    request.kv_seq_len = 512;
+    const at_boundary = generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 9) orelse
+        return error.MissingScorePreworkSelection;
+    try std.testing.expectEqual(GeneratedGqaScorePreworkRoute.gemma4_f16_local, at_boundary.route);
+    try std.testing.expectEqual(@as(u16, 512), at_boundary.score_capacity);
+    try std.testing.expectEqual(@as(?usize, 16 * 1024), at_boundary.workspaceBytes(8));
+    request.kv_seq_len = 513;
+    request.block_count = 5;
+    request.physical_token_capacity = 640;
+    try std.testing.expectEqual(
+        GeneratedGqaScorePreworkRoute.gemma4_f16_local,
+        (generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 9) orelse return error.MissingScorePreworkSelection).route,
+    );
+
+    // A local paged/ring layout need not reserve one physical row per logical
+    // token. Coverage is proven by the logical block table; page order itself
+    // is intentionally opaque to the selector and validated by the kernel.
+    request.kv_seq_len = 2003;
+    request.block_count = 16;
+    request.physical_token_capacity = 512;
+    try std.testing.expectEqual(
+        GeneratedGqaScorePreworkRoute.gemma4_f16_local,
+        (generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 9) orelse return error.MissingScorePreworkSelection).route,
+    );
+    request.block_count = 15;
+    try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 9) == null);
+
+    request.block_count = 16;
+    try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 0) == null);
+    try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .disabled, 8, 9) == null);
+
+    request.head_dim = 512;
+    request.sliding_window = 0;
+    request.key_row_bytes = 2048;
+    request.base_key_row_bytes = 2048;
+    request.value_row_bytes = 2048;
+    const global = generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 9) orelse
+        return error.MissingScorePreworkSelection;
+    try std.testing.expectEqual(GeneratedGqaScorePreworkRoute.gemma4_f16_global, global.route);
+    try std.testing.expectEqual(@as(u16, 4096), global.score_capacity);
+    try std.testing.expectEqual(@as(?usize, 128 * 1024), global.workspaceBytes(8));
+}
+
+test "generated CUDA paged score prework selects exact Gemma 4 one-KV-head boundaries" {
+    var request = GeneratedGqaScorePreworkRequest{
+        .batch = 1,
+        .q_seq_len = 1,
+        .kv_seq_len = 511,
+        .num_heads = 8,
+        .num_kv_heads = 1,
+        .head_dim = 256,
+        .sliding_window = 512,
+        .mask_len = 0,
+        .bias_mode = 0,
+        .key_row_bytes = 512,
+        .base_key_row_bytes = 512,
+        .value_row_bytes = 512,
+        .block_count = 4,
+        .page_size_tokens = 128,
+        .format = 2,
+        .value_format = 2,
+        .physical_token_capacity = 512,
+    };
+
+    // Automatic dispatch retains the qualified SM89 long-context crossover;
+    // explicit mode remains available for controlled short-context evidence.
+    try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 9) == null);
+    try std.testing.expectEqual(
+        GeneratedGqaScorePreworkRoute.gemma4_f16_local,
+        (generatedGqaScorePreworkSelectionFor(request, .explicit, 8, 9) orelse
+            return error.MissingScorePreworkSelection).route,
+    );
+
+    request.kv_seq_len = 512;
+    const local = generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 9) orelse
+        return error.MissingScorePreworkSelection;
+    try std.testing.expectEqual(GeneratedGqaScorePreworkRoute.gemma4_f16_local, local.route);
+    try std.testing.expectEqual(@as(u16, 512), local.score_capacity);
+    try std.testing.expectEqual(@as(?usize, 16 * 1024), local.workspaceBytes(8));
+    try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 0) == null);
+
+    // The benchmark's 2,051 prompt tokens plus 299 subsequent decode
+    // positions remain eligible with logical page coverage independent of a
+    // local ring's smaller physical capacity.
+    request.kv_seq_len = 2350;
+    request.block_count = 19;
+    request.physical_token_capacity = 512;
+    try std.testing.expectEqual(
+        GeneratedGqaScorePreworkRoute.gemma4_f16_local,
+        (generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 9) orelse
+            return error.MissingScorePreworkSelection).route,
+    );
+    request.block_count = 18;
+    try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 9) == null);
+
+    request.block_count = 19;
+    request.physical_token_capacity = 2432;
+    request.head_dim = 512;
+    request.sliding_window = 0;
+    request.key_row_bytes = 1024;
+    request.base_key_row_bytes = 1024;
+    request.value_row_bytes = 1024;
+    const global = generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 9) orelse
+        return error.MissingScorePreworkSelection;
+    try std.testing.expectEqual(GeneratedGqaScorePreworkRoute.gemma4_f16_global, global.route);
+    try std.testing.expectEqual(@as(u16, 4096), global.score_capacity);
+    try std.testing.expectEqual(@as(?usize, 128 * 1024), global.workspaceBytes(8));
+
+    // Other F16 GQA head topologies remain fail-closed until independently
+    // qualified, even when the generic generated kernel could execute them.
+    request.num_kv_heads = 4;
+    request.key_row_bytes = 4096;
+    request.base_key_row_bytes = 4096;
+    request.value_row_bytes = 4096;
+    try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 9) == null);
+    try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .explicit, 8, 9) == null);
+}
+
+test "generated CUDA score prework tiled64 consumer is typed and fail closed" {
+    try std.testing.expectEqual(GeneratedGqaScorePreworkConsumerMode.serial, parseGeneratedGqaScorePreworkConsumerMode("serial").?);
+    try std.testing.expectEqual(GeneratedGqaScorePreworkConsumerMode.tiled64, parseGeneratedGqaScorePreworkConsumerMode("TILED64").?);
+    try std.testing.expectEqual(GeneratedGqaScorePreworkConsumerMode.required_tiled64, parseGeneratedGqaScorePreworkConsumerMode("required-tiled64").?);
+    try std.testing.expect(parseGeneratedGqaScorePreworkConsumerMode("tile") == null);
+
+    var request = GeneratedGqaScorePreworkRequest{
+        .batch = 1,
+        .q_seq_len = 1,
+        .kv_seq_len = 512,
+        .num_heads = 8,
+        .num_kv_heads = 1,
+        .head_dim = 256,
+        .sliding_window = 512,
+        .mask_len = 0,
+        .bias_mode = 0,
+        .key_row_bytes = 512,
+        .base_key_row_bytes = 512,
+        .value_row_bytes = 512,
+        .block_count = 4,
+        .page_size_tokens = 128,
+        .format = 2,
+        .value_format = 2,
+        .physical_token_capacity = 512,
+    };
+
+    const serial = generatedGqaScorePreworkSelectionWithConsumerFor(request, .automatic, .serial, 8, 9) orelse
+        return error.MissingScorePreworkSelection;
+    try std.testing.expectEqual(GeneratedGqaScorePreworkConsumer.serial, serial.consumer);
+    try std.testing.expect(!serial.tiled64_required);
+
+    const tiled = generatedGqaScorePreworkSelectionWithConsumerFor(request, .automatic, .tiled64, 8, 9) orelse
+        return error.MissingScorePreworkSelection;
+    try std.testing.expectEqual(GeneratedGqaScorePreworkConsumer.tiled64, tiled.consumer);
+    try std.testing.expect(!tiled.tiled64_required);
+
+    const required = generatedGqaScorePreworkSelectionWithConsumerFor(request, .automatic, .required_tiled64, 8, 9) orelse
+        return error.MissingScorePreworkSelection;
+    try std.testing.expectEqual(GeneratedGqaScorePreworkConsumer.tiled64, required.consumer);
+    try std.testing.expect(required.tiled64_required);
+
+    // Explicit score prework can run on other architectures, but the tiled
+    // candidate remains SM89-only. Required mode carries the unsatisfied
+    // requirement to launch-time so it errors instead of silently falling
+    // back to serial.
+    try std.testing.expectEqual(
+        std.meta.Tag(GeneratedGqaScorePreworkDecision).required_tiled64_rejected,
+        std.meta.activeTag(generatedGqaScorePreworkDecisionFor(request, .explicit, .required_tiled64, 8, 0)),
+    );
+
+    // Required mode rejects every miss in the base score selector as well as
+    // consumer-specific misses; none may turn into the ordinary `.none`
+    // fallback path.
+    request.batch = 2;
+    try std.testing.expectEqual(
+        std.meta.Tag(GeneratedGqaScorePreworkDecision).required_tiled64_rejected,
+        std.meta.activeTag(generatedGqaScorePreworkDecisionFor(request, .explicit, .required_tiled64, 8, 9)),
+    );
+    request.batch = 1;
+    try std.testing.expectEqual(
+        std.meta.Tag(GeneratedGqaScorePreworkDecision).required_tiled64_rejected,
+        std.meta.activeTag(generatedGqaScorePreworkDecisionFor(request, .disabled, .required_tiled64, 8, 9)),
+    );
+    request.block_count = 3;
+    try std.testing.expectEqual(
+        std.meta.Tag(GeneratedGqaScorePreworkDecision).required_tiled64_rejected,
+        std.meta.activeTag(generatedGqaScorePreworkDecisionFor(request, .explicit, .required_tiled64, 8, 9)),
+    );
+    request.block_count = 4;
+
+    // The consumer contract governs decode only. A required decode consumer
+    // must not reject the independent prefill route.
+    request.q_seq_len = 512;
+    try std.testing.expectEqual(
+        std.meta.Tag(GeneratedGqaScorePreworkDecision).not_selected,
+        std.meta.activeTag(generatedGqaScorePreworkDecisionFor(request, .automatic, .required_tiled64, 8, 9)),
+    );
+    request.q_seq_len = 1;
+    request.num_kv_heads = 2;
+    try std.testing.expectEqual(
+        std.meta.Tag(GeneratedGqaScorePreworkDecision).required_tiled64_rejected,
+        std.meta.activeTag(generatedGqaScorePreworkDecisionFor(request, .automatic, .required_tiled64, 8, 9)),
+    );
+    request.num_kv_heads = 1;
+
+    try std.testing.expectEqual(
+        std.meta.Tag(GeneratedGqaScorePreworkDecision).invalid_config_rejected,
+        std.meta.activeTag(generatedGqaScorePreworkDecisionFor(request, .automatic, .invalid, 8, 9)),
+    );
+
+    request.num_kv_heads = 2;
+    request.key_row_bytes = 1024;
+    request.base_key_row_bytes = 1024;
+    request.value_row_bytes = 1024;
+    const unqualified_gqa = generatedGqaScorePreworkSelectionWithConsumerFor(request, .automatic, .tiled64, 8, 9) orelse
+        return error.MissingScorePreworkSelection;
+    try std.testing.expectEqual(GeneratedGqaScorePreworkConsumer.serial, unqualified_gqa.consumer);
+    try std.testing.expectEqual(GeneratedGqaScorePreworkSelection.ConsumerResolution.tiled64_ineligible_fallback, unqualified_gqa.consumer_resolution);
+
+    request.num_kv_heads = 1;
+    request.head_dim = 512;
+    request.sliding_window = 0;
+    request.key_row_bytes = 1024;
+    request.base_key_row_bytes = 1024;
+    request.value_row_bytes = 1024;
+    const global = generatedGqaScorePreworkSelectionWithConsumerFor(request, .automatic, .tiled64, 8, 9) orelse
+        return error.MissingScorePreworkSelection;
+    try std.testing.expectEqual(GeneratedGqaScorePreworkConsumer.tiled64, global.consumer);
+    try std.testing.expectEqual(@as(u16, 4096), global.score_capacity);
+}
+
+test "generated CUDA score prework consumer telemetry is bounded by event consumer and head dim" {
+    var word = std.atomic.Value(u64).init(0);
+    try std.testing.expect(claimGeneratedGqaScorePreworkConsumerLog(&word, .active, .tiled64, 256));
+    try std.testing.expect(!claimGeneratedGqaScorePreworkConsumerLog(&word, .active, .tiled64, 256));
+    try std.testing.expect(claimGeneratedGqaScorePreworkConsumerLog(&word, .active, .tiled64, 512));
+    try std.testing.expect(claimGeneratedGqaScorePreworkConsumerLog(&word, .active, .serial, 256));
+    try std.testing.expect(claimGeneratedGqaScorePreworkConsumerLog(&word, .fallback_ineligible, .serial, 256));
+    try std.testing.expect(claimGeneratedGqaScorePreworkConsumerLog(&word, .fallback_symbol, .serial, 256));
+    try std.testing.expect(claimGeneratedGqaScorePreworkConsumerLog(&word, .rejected_required, null, 256));
+    try std.testing.expect(!claimGeneratedGqaScorePreworkConsumerLog(&word, .active, .tiled64, 255));
+    try std.testing.expectEqualStrings("required-tiled64", GeneratedGqaScorePreworkConsumerMode.required_tiled64.name());
+}
+
+test "generated CUDA paged score prework keeps F32 as explicit control" {
+    var request = GeneratedGqaScorePreworkRequest{
+        .batch = 1,
+        .q_seq_len = 1,
+        .kv_seq_len = 2003,
+        .num_heads = 16,
+        .num_kv_heads = 1,
+        .head_dim = 256,
+        .sliding_window = 0,
+        .mask_len = 0,
+        .bias_mode = 0,
+        .key_row_bytes = 512,
+        .base_key_row_bytes = 512,
+        .value_row_bytes = 1024,
+        .block_count = 16,
+        .page_size_tokens = 128,
+        .format = 2,
+        .value_format = 0,
+        .physical_token_capacity = 2048,
+    };
+    try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 9) == null);
+    const control = generatedGqaScorePreworkSelectionFor(request, .explicit, 8, 0) orelse
+        return error.MissingScorePreworkSelection;
+    try std.testing.expectEqual(GeneratedGqaScorePreworkRoute.f32_control, control.route);
+    try std.testing.expectEqual(@as(u16, 4096), control.score_capacity);
+    request.kv_seq_len = 4097;
+    try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .explicit, 8, 9) == null);
+    request.kv_seq_len = 2003;
+    request.value_format = 1;
+    try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .explicit, 8, 9) == null);
 }
 
 test "generated CUDA GQA decode schedule switches at the split boundary" {
@@ -18475,6 +21430,76 @@ test "generated CUDA Q4_0 Q8_1 E2B argmax launch contract is exact" {
             262144,
             0,
         ),
+    );
+}
+
+test "generated CUDA llama Q8_1 E2B launch contract is typed and narrow" {
+    try std.testing.expect(Q8ActivationEncoding.q8_zp_legacy != Q8ActivationEncoding.ggml_q8_1);
+    try std.testing.expectEqual(@as(usize, 128), generated_q4_0_ggml_q8_1_down_threads);
+    try std.testing.expect(generatedQ4_0PairQ8E2BShapeEligible(1, 1536, 6144, 0));
+    try std.testing.expect(generatedQ4_0PairQ8E2BShapeEligible(1, 1536, 12288, 0));
+    try std.testing.expect(generatedQ4_0DownQ8E2BShapeEligible(1, 6144, 1536));
+    try std.testing.expect(generatedQ4_0DownQ8E2BShapeEligible(1, 12288, 1536));
+
+    var module: KernelModule = .{};
+    var ctx: context_mod.CudaContext = undefined;
+    const empty: buffer_mod.DeviceBuffer = .{};
+    const typed_empty = GgmlQ8_1Buffer.init(empty);
+    try std.testing.expectError(
+        error.InvalidCudaState,
+        module.launchLinearQ4_0GeneratedPairGgmlQ8_1E2B(
+            &ctx,
+            typed_empty,
+            typed_empty,
+            empty,
+            empty,
+            2,
+            1536,
+            6144,
+            0,
+        ),
+    );
+    try std.testing.expectError(
+        error.CudaKernelUnavailable,
+        module.launchLinearQ4_0GeneratedPairGgmlQ8_1E2B(
+            &ctx,
+            typed_empty,
+            typed_empty,
+            empty,
+            empty,
+            1,
+            1536,
+            6144,
+            0,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidCudaState,
+        module.launchLinearQ4_0GeneratedDownGgmlQ8_1E2B(
+            &ctx,
+            empty,
+            typed_empty,
+            empty,
+            1,
+            6144,
+            2560,
+        ),
+    );
+    try std.testing.expectError(
+        error.CudaKernelUnavailable,
+        module.launchLinearQ4_0GeneratedDownGgmlQ8_1E2B(
+            &ctx,
+            empty,
+            typed_empty,
+            empty,
+            1,
+            6144,
+            1536,
+        ),
+    );
+    try std.testing.expectError(
+        error.CudaKernelUnavailable,
+        module.launchQuantizeF32GgmlQ8_1Rows(&ctx, typed_empty, empty, 1, 1536),
     );
 }
 

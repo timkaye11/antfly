@@ -599,6 +599,44 @@ pub fn build(b: *std.Build) void {
         quant_kernel_cuda_paged_attention_diff_step.dependOn(&cuda_paged_attention_diff_unavailable.step);
     }
 
+    const quant_kernel_cuda_paged_prefill_diff_step = b.step(
+        "quant-kernel-cuda-paged-prefill-diff",
+        "Run embedded CUDA paged-prefill attention differential and timing checks",
+    );
+    if (enable_cuda and targetRunsOnBuildHost(b, target)) {
+        const quant_kernel_cuda_paged_prefill_diff_exe = b.addExecutable(.{
+            .name = "antfly-quant-kernel-cuda-paged-prefill-diff",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/quant_kernel_cuda_paged_prefill_diff.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        quant_kernel_cuda_paged_prefill_diff_exe.root_module.addImport("build_options", build_options_mod);
+        quant_kernel_cuda_paged_prefill_diff_exe.root_module.link_libc = true;
+        const quant_kernel_cuda_paged_prefill_diff_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/quant_kernel_cuda_paged_prefill_diff.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        quant_kernel_cuda_paged_prefill_diff_tests.root_module.addImport("build_options", build_options_mod);
+        quant_kernel_cuda_paged_prefill_diff_tests.root_module.link_libc = true;
+        const run_quant_kernel_cuda_paged_prefill_diff_tests = b.addRunArtifact(quant_kernel_cuda_paged_prefill_diff_tests);
+        const run_quant_kernel_cuda_paged_prefill_diff = b.addRunArtifact(quant_kernel_cuda_paged_prefill_diff_exe);
+        if (b.args) |args| run_quant_kernel_cuda_paged_prefill_diff.addArgs(args);
+        run_quant_kernel_cuda_paged_prefill_diff.step.dependOn(&cuda_artifact_source_policy_check.step);
+        run_quant_kernel_cuda_paged_prefill_diff.step.dependOn(&cuda_artifacts_freshness_check.step);
+        run_quant_kernel_cuda_paged_prefill_diff.step.dependOn(&run_quant_kernel_cuda_paged_prefill_diff_tests.step);
+        quant_kernel_cuda_paged_prefill_diff_step.dependOn(&run_quant_kernel_cuda_paged_prefill_diff.step);
+    } else {
+        const cuda_paged_prefill_diff_unavailable = b.addFail(
+            "quant-kernel-cuda-paged-prefill-diff requires a host CUDA build; pass -Dcuda=true",
+        );
+        quant_kernel_cuda_paged_prefill_diff_step.dependOn(&cuda_paged_prefill_diff_unavailable.step);
+    }
+
     const quant_kernel_cuda_ffn_diff_step = b.step(
         "quant-kernel-cuda-ffn-diff",
         "Run raw handwritten-vs-generated CUDA exact F32 E2B FFN differential checks",

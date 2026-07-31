@@ -46,6 +46,7 @@ done
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 pkg_dir="$(cd "$script_dir/.." && pwd)"
+repo_dir="$(cd "$pkg_dir/../../.." && pwd)"
 artifact_src_dir="$pkg_dir/src/ops/cuda/artifacts"
 dev_generated_src_dir="$pkg_dir/src/ops/cuda/generated"
 src="$pkg_dir/src/ops/cuda/artifacts/inference_cuda_kernels.cu"
@@ -109,6 +110,34 @@ if [ "$source_policy_only" = "true" ]; then
     "$src" "$CUDA_RUNTIME_WIRED_DEV_CANDIDATE_COUNT"
   exit 0
 fi
+
+# Artifact freshness is meaningful only after the compiler-owned source and
+# manifest regions are current. Fail before invoking nvcc so --check cannot
+# bless stale CUDA source and --write cannot publish artifacts from it. Source
+# regeneration remains a separate, explicit review step:
+#   zig build quant-kernel-codegen -- --write
+if [ -n "${ZIG_BIN:-}" ]; then
+  zig_bin="$ZIG_BIN"
+elif [ -n "${ANTFLY_ZIG:-}" ]; then
+  zig_bin="$ANTFLY_ZIG"
+elif [ -n "${ZIG:-}" ]; then
+  zig_bin="$ZIG"
+elif [ -x "$repo_dir/.tools/zig-x86_64-linux-0.16.0/zig" ]; then
+  zig_bin="$repo_dir/.tools/zig-x86_64-linux-0.16.0/zig"
+elif command -v zig >/dev/null 2>&1; then
+  zig_bin="$(command -v zig)"
+else
+  zig_bin="zig"
+fi
+if [ ! -x "$zig_bin" ]; then
+  printf 'error: Zig compiler is not executable: %s\n' "$zig_bin" >&2
+  printf 'set ZIG_BIN, ANTFLY_ZIG, or ZIG to the pinned compiler path\n' >&2
+  exit 1
+fi
+(
+  cd "$pkg_dir"
+  "$zig_bin" build quant-kernel-codegen -- --check
+)
 
 cuda_home="${CUDA_HOME:-}"
 
@@ -213,14 +242,22 @@ required_symbols=(
   antfly_gqa_attention_decode_split4_kv_hd512_f32_stage2_v1
   antfly_gqa_attention_decode_turboquant_score_prework_hd256_f32_v1
   antfly_gqa_attention_decode_turboquant_score_prework_serial_hd256_f32_v1
+  antfly_gqa_attention_decode_turboquant_score_prework_tiled64_hd256_f32_v1
   antfly_gqa_attention_decode_turboquant_score_prework_hd512_f32_v1
   antfly_gqa_attention_decode_turboquant_score_prework_serial_hd512_f32_v1
+  antfly_gqa_attention_decode_turboquant_score_prework_tiled64_hd512_f32_v1
+  antfly_gqa_attention_prefill_flash_sm89_hd256_swa512_f32_v1
+  antfly_gqa_attention_prefill_flash_sm89_hd512_global_f32_v1
+  antfly_gqa_attention_decode_splitk_online_sm89_hd256_swa512_f16_f32_v1
+  antfly_gqa_attention_decode_splitk_online_sm89_hd512_global_f16_f32_v1
   termite_kv_write_suffix_decode_scalars_f32
   termite_gqa_attention_decode_turboquant_fast_f32
   termite_gqa_attention_prefill_turboquant_fast_f32
   termite_gqa_attention_prefill_turboquant_tiled_f32
   termite_gqa_attention_prefill_turboquant_mma_f32
   termite_gqa_attention_prefill_turboquant_mma_m32_f32
+  termite_gqa_attention_prefill_tiled_f16_exact_f32
+  termite_gqa_attention_prefill_tiled_f16_warp_f32
   termite_dequant_q4_0_bf16
   termite_linear_q6_k_q8_1_f32_tile8_e4b
   termite_gqa_attention_decode_turboquant_split_stage1_f32
@@ -278,6 +315,11 @@ required_symbols=(
   antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1
   antfly_q4_0_down_q8_1_e2b_6144_mmv_v1
   antfly_q4_0_down_q8_1_e2b_12288_mmv_v1
+  antfly_quantize_f32_ggml_q8_1_rows_v1
+  antfly_q4_0_pair_activation_ggml_q8_1_e2b_6144_mmv_v1
+  antfly_q4_0_pair_activation_ggml_q8_1_e2b_12288_mmv_v1
+  antfly_q4_0_down_ggml_q8_1_e2b_6144_mmv_v1
+  antfly_q4_0_down_ggml_q8_1_e2b_12288_mmv_v1
   antfly_q4_0_q8_1_argmax_rows_stage1_tile8_v1
   antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1
   antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1

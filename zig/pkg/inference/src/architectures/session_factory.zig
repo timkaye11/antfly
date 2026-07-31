@@ -1781,18 +1781,12 @@ fn detectArchitectureFromGgufFile(file: *const gguf_mod.format.File) !?ArchConfi
 }
 
 /// Detect effective RoPE dimension from rope_freqs.weight tensor.
-/// Models like Gemma 4 include custom RoPE frequency factors where most dimensions
-/// have factor ~1e30 (effectively disabling rotation). Count the active (1.0) entries
-/// to derive the true RoPE dimension.
+/// Gemma 4 uses rope.dimension_count for the frequency domain and may also
+/// provide custom frequency factors where a leading prefix is 1.0 and the
+/// remaining lanes are ~1e30 (effectively disabling rotation). llama.cpp
+/// consumes both contracts. Count that exact mask-shaped prefix to derive the
+/// active rotary width while preserving the metadata-derived frequency width.
 fn refineRopeDimFromFreqs(config: *gpt_mod.Config, file: *const gguf_mod.format.File, raw_data: []const u8) void {
-    if (config.family == .gemma and hasExplicitGgufRopeDim(file, config)) {
-        // Modern Gemma GGUF files expose authoritative rope.dimension_count
-        // metadata and may still carry rope_freqs.weight as frequency factors.
-        // Treating those factors as an active-lane mask under-rotates full
-        // attention layers and diverges from llama.cpp.
-        return;
-    }
-
     const tensor = findGgufTensor(file, "rope_freqs.weight") orelse return;
     if (tensor.dimensions.len < 1) return;
     switch (tensor.tensor_type) {
@@ -1801,36 +1795,95 @@ fn refineRopeDimFromFreqs(config: *gpt_mod.Config, file: *const gguf_mod.format.
         .unknown => return,
     }
 
-    const n_vals: usize = @intCast(tensor.dimensions[0]);
-    const byte_offset: usize = @intCast(file.data_region_offset + tensor.offset);
-    const end = byte_offset + n_vals * 4;
+    const n_vals = std.math.cast(usize, tensor.dimensions[0]) orelse return;
+    const byte_offset_u64 = std.math.add(u64, file.data_region_offset, tensor.offset) catch return;
+    const byte_offset = std.math.cast(usize, byte_offset_u64) orelse return;
+    const byte_len = std.math.mul(usize, n_vals, @sizeOf(f32)) catch return;
+    const end = std.math.add(usize, byte_offset, byte_len) catch return;
     if (end > raw_data.len) return;
 
-    // Read f32 values from the mmap'd data. Count leading 1.0 entries;
-    // the remaining entries are ~1e30 (disable rotation for those dims).
-    const float_data: [*]const f32 = @ptrCast(@alignCast(raw_data.ptr + byte_offset));
+    const factors = raw_data[byte_offset..end];
     var n_active: u32 = 0;
     for (0..n_vals) |i| {
-        if (float_data[i] == 1.0) {
+        const bits = std.mem.readInt(u32, factors[i * @sizeOf(f32) ..][0..4], .little);
+        const factor: f32 = @bitCast(bits);
+        if (factor == 1.0) {
             n_active += 1;
         } else break;
     }
-    if (n_active > 0 and n_active < n_vals) {
-        config.rope_dim_override = n_active * 2; // each entry covers a pair of dimensions
-        std.log.info("rope_freqs.weight: {d}/{d} active entries → rope_dim_override={d}", .{ n_active, n_vals, config.rope_dim_override });
+    if (n_active == 0 or n_active >= n_vals) return;
+    // This runtime representation models Gemma's binary active/disabled mask,
+    // not arbitrary per-lane scaling. Fail closed for any other factor table.
+    for (n_active..n_vals) |i| {
+        const bits = std.mem.readInt(u32, factors[i * @sizeOf(f32) ..][0..4], .little);
+        const factor: f32 = @bitCast(bits);
+        if (!std.math.isFinite(factor) or factor < 1.0e20) return;
     }
+    config.rope_dim_override = n_active * 2; // each factor covers a pair of dimensions
+    std.log.info("rope_freqs.weight: {d}/{d} active entries -> rope_dim_override={d}", .{ n_active, n_vals, config.rope_dim_override });
 }
 
-fn hasExplicitGgufRopeDim(file: *const gguf_mod.format.File, config: *const gpt_mod.Config) bool {
-    const arch = switch (config.family) {
-        .gemma => "gemma4",
-        else => return false,
+test "Gemma4 GGUF rope factors refine active lanes despite explicit frequency dimension" {
+    var dimensions = [_]u64{256};
+    var metadata = [_]gguf_mod.format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "gemma4" } },
+        .{ .key = "gemma4.rope.dimension_count", .value = .{ .u32 = 512 } },
+        .{ .key = "gemma4.rope.dimension_count_swa", .value = .{ .u32 = 256 } },
     };
-    var key_buf: [96]u8 = undefined;
-    const global_key = std.fmt.bufPrint(&key_buf, "{s}.rope.dimension_count", .{arch}) catch return false;
-    if (gguf_mod.metadata.View.init(file).find(global_key) != null) return true;
-    const local_key = std.fmt.bufPrint(&key_buf, "{s}.rope.dimension_count_swa", .{arch}) catch return false;
-    return gguf_mod.metadata.View.init(file).find(local_key) != null;
+    var tensors = [_]gguf_mod.format.TensorInfo{.{
+        .name = "rope_freqs.weight",
+        .dimensions = &dimensions,
+        .tensor_type = .{ .known = .F32 },
+        .offset = 0,
+        .data_offset = 0,
+    }};
+    const file = gguf_mod.format.File{
+        .header = .{ .version = 3, .tensor_count = 1, .metadata_count = metadata.len },
+        .metadata = &metadata,
+        .tensors = &tensors,
+        .alignment = 32,
+        .data_region_offset = 0,
+    };
+    var factors: [256]f32 = undefined;
+    @memset(factors[0..64], 1.0);
+    @memset(factors[64..], 1.0e30);
+
+    var config = gpt_mod.Config{
+        .family = .gemma,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .sliding_window = 512,
+        .sliding_window_pattern = 5,
+        .rope_partial_factor = 1.0,
+    };
+    refineRopeDimFromFreqs(&config, &file, std.mem.sliceAsBytes(factors[0..]));
+
+    try std.testing.expectEqual(@as(u32, 128), config.rope_dim_override);
+    try std.testing.expectEqual(@as(u32, 256), config.layerRopeActiveDim(0));
+    try std.testing.expectEqual(@as(u32, 128), config.layerRopeActiveDim(4));
+    try std.testing.expectEqual(@as(u32, 512), config.layerRopeFrequencyDim(4));
+}
+
+test "GGUF rope refinement rejects non-mask frequency factors" {
+    var dimensions = [_]u64{4};
+    var tensors = [_]gguf_mod.format.TensorInfo{.{
+        .name = "rope_freqs.weight",
+        .dimensions = &dimensions,
+        .tensor_type = .{ .known = .F32 },
+        .offset = 0,
+        .data_offset = 0,
+    }};
+    const file = gguf_mod.format.File{
+        .header = .{ .version = 3, .tensor_count = 1, .metadata_count = 0 },
+        .metadata = &.{},
+        .tensors = &tensors,
+        .alignment = 32,
+        .data_region_offset = 0,
+    };
+    var factors = [_]f32{ 1.0, 1.0, 2.0, 2.0 };
+    var config = gpt_mod.Config{ .family = .gemma, .rope_dim_override = 0 };
+    refineRopeDimFromFreqs(&config, &file, std.mem.sliceAsBytes(factors[0..]));
+    try std.testing.expectEqual(@as(u32, 0), config.rope_dim_override);
 }
 
 fn overlayGptStructuralConfig(target: *gpt_mod.Config, source: gpt_mod.Config) void {
@@ -1879,7 +1932,7 @@ fn overlayGptStructuralConfig(target: *gpt_mod.Config, source: gpt_mod.Config) v
     }
     // Gemma 4: Per-Layer Embeddings (PLE).
     if (source.ple_hidden_size > 0) target.ple_hidden_size = source.ple_hidden_size;
-    // RoPE dim override from rope_freqs.weight tensor.
+    // Active RoPE lanes refined from a mask-shaped rope_freqs.weight tensor.
     if (source.rope_dim_override > 0) target.rope_dim_override = source.rope_dim_override;
 
     // Fields below describe the GGUF artifact itself rather than a preference, so the
@@ -5400,7 +5453,10 @@ pub fn runFlorenceDecoderResident(
 pub fn getComputeBackend(session: Session, allocator: std.mem.Allocator) !ops.ComputeBackend {
     if (session.vtable != &arch_vtable) return error.NotArchSession;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
-    return makeComputeBackend(self, allocator, null);
+    var cb = try makeComputeBackend(self, allocator, null);
+    errdefer cb.deinit();
+    try cb.beginRequest();
+    return cb;
 }
 
 pub fn replaceBlasResidentWeight(session: Session, name: []const u8, weight: LoadedWeight) !void {
@@ -5425,7 +5481,14 @@ pub fn getComputeBackendWithBudget(
 ) !ops.ComputeBackend {
     if (session.vtable != &arch_vtable) return error.NotArchSession;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
-    return makeComputeBackend(self, allocator, run_budget);
+    var cb = try makeComputeBackend(self, allocator, run_budget);
+    errdefer cb.deinit();
+    // The CUDA implementation is shared by the loaded session. Establish an
+    // unconditional request boundary here, before prompt-cache selection can
+    // bypass KV-hook provisioning, so no graph or pinned-address ABI survives
+    // from the preceding request.
+    try cb.beginRequest();
+    return cb;
 }
 
 pub fn getGenericEncoderArchConfig(session: Session) !GenericEncoderArchConfig {

@@ -43,8 +43,11 @@ Environment overrides:
                           1 to enable row-batched Q8_1 QAT prefill kernels (default: 1)
   ANTFLY_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE
                           1 to benchmark experimental generated Q8_1 FFN decode (default: 0)
+  ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE
+                          canonical GQA prefill attention profile (default: required-fast)
   ANTFLY_GQA_PREFILL_FAST
-                          1 to enable the fast row-batched GQA prefill kernel (default: 1)
+                          legacy boolean bridge for the fast row-batched GQA prefill
+                          kernel; leave unset to keep the fail-closed required-fast default
   ANTFLY_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM
                           Minimum input dimension for W8 row-prefill linear kernels (default: 2048)
   ANTFLY_Q4_0_LINEAR_Q8_1_ROWS8_C4
@@ -68,9 +71,9 @@ Environment overrides:
   ANTFLY_RMS_NORM_BF16_MIRROR
                           1 to let RMSNorm write a BF16 activation mirror for cuBLASLt staging reuse (default: 0)
   ANTFLY_GQA_PREFILL_TILED
-                          1 to use the tiled turboquant prefill attention kernel (default: 0)
+                          1 to use the tiled turboquant prefill attention kernel (default: unset)
   ANTFLY_GQA_PREFILL_MMA
-                          1 to use the tensor-core (wmma) turboquant prefill attention kernel for head_dim <= 256 (default: 0)
+                          1 to use the tensor-core (wmma) turboquant prefill attention kernel for head_dim <= 256 (default: unset)
   ANTFLY_BF16_RESIDENT_WEIGHTS
                           1 to dequantize Q4_0 matrix weights to BF16 at upload (BF16-resident prefill path) (default: 0)
   ANTFLY_HYBRID_BF16_PREFILL
@@ -131,11 +134,12 @@ require_generated_q6_lm_head_argmax="${REQUIRE_GENERATED_Q6_LM_HEAD_ARGMAX:-0}"
 require_generated_e2b_ffn="${REQUIRE_GENERATED_E2B_FFN:-0}"
 antfly_q4_0_q8_1_prefill_rows="${ANTFLY_Q4_0_Q8_1_PREFILL_ROWS:-1}"
 antfly_q4_0_gate_up_activation_q8_1_precompute="${ANTFLY_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE:-0}"
-antfly_gqa_prefill_fast="${ANTFLY_GQA_PREFILL_FAST:-1}"
-# Wrapper vars fall back to the raw production env name so callers that
-# export ANTFLY_INFERENCE_CUDA_* directly are honored rather than clobbered.
-antfly_gqa_prefill_tiled="${ANTFLY_GQA_PREFILL_TILED:-${ANTFLY_INFERENCE_CUDA_GQA_PREFILL_TILED:-0}}"
-antfly_gqa_prefill_mma="${ANTFLY_GQA_PREFILL_MMA:-${ANTFLY_INFERENCE_CUDA_GQA_PREFILL_MMA:-0}}"
+# The legacy GQA prefill booleans (ANTFLY_GQA_PREFILL_FAST/TILED/MMA and their
+# ANTFLY_INFERENCE_CUDA_* spellings) are an input-only compatibility bridge that
+# gemma4_qat_cuda_tuning_env detects by set-ness, so never materialize defaults
+# for them here: doing so would silently downgrade the fail-closed required-fast
+# default profile to plain fast. Callers that export any of those names are
+# honored directly by the sourced tuning profile.
 antfly_q4_0_linear_q8_1_tile4_w8_min_in_dim="${ANTFLY_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM:-2048}"
 antfly_q4_0_linear_q8_1_rows8_c4="${ANTFLY_Q4_0_LINEAR_Q8_1_ROWS8_C4:-1}"
 antfly_q4_0_pair_activation_q8_1_rows8_c2="${ANTFLY_Q4_0_PAIR_ACTIVATION_Q8_1_ROWS8_C2:-1}"
@@ -308,11 +312,13 @@ tuning_value() {
   return 1
 }
 
+effective_gqa_prefill_profile="$(tuning_value ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE)"
 effective_generated_attention="$(tuning_value ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE)"
 effective_lm_head_argmax="$(tuning_value ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX)"
 effective_generated_q6_lm_head_argmax="$(tuning_value ANTFLY_INFERENCE_CUDA_GENERATED_Q6_K_Q8_1_LM_HEAD_ARGMAX)"
 effective_generated_e2b_ffn="$(tuning_value ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN)"
 effective_generated_e2b_ffn_exact="$(tuning_value ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT)"
+effective_generated_e2b_ffn_pair_only="$(tuning_value ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_PAIR_ONLY)"
 
 run_antfly_command() {
   if [[ -n "$command_timeout" && "$command_timeout" != "0" && "$command_timeout" != "off" && "$command_timeout" != "none" ]]; then
@@ -370,20 +376,30 @@ run_llama() {
 }
 
 for ((i = 1; i <= warmups; i++)); do
-  run_antfly "warmup_${i}"
-  run_llama "warmup_${i}"
+  if ((i % 2 == 1)); then
+    run_antfly "warmup_${i}"
+    run_llama "warmup_${i}"
+  else
+    run_llama "warmup_${i}"
+    run_antfly "warmup_${i}"
+  fi
 done
 
 for ((i = 1; i <= repeats; i++)); do
-  run_antfly "$i"
-  run_llama "$i"
+  if ((i % 2 == 1)); then
+    run_antfly "$i"
+    run_llama "$i"
+  else
+    run_llama "$i"
+    run_antfly "$i"
+  fi
 done
 
 python3 - "$out_dir" "$repeats" "$require_antfly_win" "$min_win_ms" \
   "$require_antfly_prefill_win" "$min_prefill_win_ms" \
   "$require_antfly_decode_win" "$min_decode_win_ms" \
   "$antfly_tokens" "$llama_tokens" "$antfly_cache_dtype" "$llama_cache_type_k" "$llama_cache_type_v" \
-  "$prompt_repeat" "$prompt_bytes" "$antfly_prefill_chunk_size" "$antfly_q4_0_q8_1_prefill_rows" "$antfly_gqa_prefill_fast" \
+  "$prompt_repeat" "$prompt_bytes" "$antfly_prefill_chunk_size" "$antfly_q4_0_q8_1_prefill_rows" "$effective_gqa_prefill_profile" \
   "$antfly_q4_0_linear_q8_1_tile4_w8_min_in_dim" "$antfly_q4_0_linear_q8_1_rows8_c4" "$antfly_q4_0_pair_activation_q8_1_rows8_c2" \
   "$antfly_q4_0_pair_activation_q8_1_rows16_c1" "$antfly_cuda_gemma_prefill_prewarm" \
   "$antfly_cuda_prefill_first_token" "$antfly_cuda_prefill_first_token_coalesce_tokens" \
@@ -393,7 +409,8 @@ python3 - "$out_dir" "$repeats" "$require_antfly_win" "$min_win_ms" \
   "$max_antfly_tok_s_cv" "$require_graph_replay" "$require_generated_attention" \
   "$require_lm_head_argmax" "$require_generated_e2b_ffn" \
   "$effective_generated_attention" "$effective_lm_head_argmax" "$effective_generated_e2b_ffn" \
-  "$effective_generated_e2b_ffn_exact" "$require_generated_q6_lm_head_argmax" "$effective_generated_q6_lm_head_argmax" <<'PY'
+  "$effective_generated_e2b_ffn_exact" "$require_generated_q6_lm_head_argmax" "$effective_generated_q6_lm_head_argmax" \
+  "$effective_generated_e2b_ffn_pair_only" <<'PY'
 import json
 import math
 import pathlib
@@ -418,7 +435,7 @@ prompt_repeat = int(sys.argv[14])
 prompt_bytes = int(sys.argv[15])
 antfly_prefill_chunk_size = int(sys.argv[16])
 antfly_q4_0_q8_1_prefill_rows = sys.argv[17]
-antfly_gqa_prefill_fast = sys.argv[18]
+antfly_gqa_prefill_profile = sys.argv[18]
 antfly_q4_0_linear_q8_1_tile4_w8_min_in_dim = sys.argv[19]
 antfly_q4_0_linear_q8_1_rows8_c4 = sys.argv[20]
 antfly_q4_0_pair_activation_q8_1_rows8_c2 = sys.argv[21]
@@ -445,6 +462,7 @@ effective_generated_e2b_ffn = sys.argv[41]
 effective_generated_e2b_ffn_exact = sys.argv[42]
 require_generated_q6_lm_head_argmax = sys.argv[43].lower() not in {"0", "false", "off", "no"}
 effective_generated_q6_lm_head_argmax = sys.argv[44]
+effective_generated_e2b_ffn_pair_only = sys.argv[45]
 expected_llama_eval_runs = llama_tokens - 1
 
 llama_patterns = {
@@ -533,6 +551,8 @@ for index in range(1, repeats + 1):
     antfly_generated_e2b_down = int(cuda.get("q4_0_generated_e2b_down_q8_hits") or 0)
     antfly_generated_e2b_pair_fallbacks = int(cuda.get("q4_0_generated_e2b_pair_q8_fallbacks") or 0)
     antfly_generated_e2b_down_fallbacks = int(cuda.get("q4_0_generated_e2b_down_q8_fallbacks") or 0)
+    antfly_generated_e2b_pair_only = int(cuda.get("q4_0_generated_e2b_pair_only_hits") or 0)
+    antfly_generated_e2b_pair_only_fallbacks = int(cuda.get("q4_0_generated_e2b_pair_only_fallbacks") or 0)
     antfly_generated_e2b_exact_pair = int(cuda.get("q4_0_generated_e2b_exact_pair_f32_hits") or 0)
     antfly_generated_e2b_exact_down = int(cuda.get("q4_0_generated_e2b_exact_down_f32_hits") or 0)
     antfly_generated_e2b_exact_pair_fallbacks = int(cuda.get("q4_0_generated_e2b_exact_pair_f32_fallbacks") or 0)
@@ -627,6 +647,7 @@ for index in range(1, repeats + 1):
     rows.append(
         {
             "sample": index,
+            "execution_order": ["antfly", "llama_cpp"] if index % 2 else ["llama_cpp", "antfly"],
             "antfly_total_ms": antfly_total,
             "antfly_prefill_ms": antfly_prefill,
             "antfly_decode_ms": antfly_decode,
@@ -655,6 +676,8 @@ for index in range(1, repeats + 1):
             "antfly_generated_e2b_down": antfly_generated_e2b_down,
             "antfly_generated_e2b_pair_fallbacks": antfly_generated_e2b_pair_fallbacks,
             "antfly_generated_e2b_down_fallbacks": antfly_generated_e2b_down_fallbacks,
+            "antfly_generated_e2b_pair_only": antfly_generated_e2b_pair_only,
+            "antfly_generated_e2b_pair_only_fallbacks": antfly_generated_e2b_pair_only_fallbacks,
             "antfly_generated_e2b_exact_pair": antfly_generated_e2b_exact_pair,
             "antfly_generated_e2b_exact_down": antfly_generated_e2b_exact_down,
             "antfly_generated_e2b_exact_pair_fallbacks": antfly_generated_e2b_exact_pair_fallbacks,
@@ -710,6 +733,7 @@ if errors:
 summary = {
     "repeats": repeats,
     "comparison": {
+        "paired_order": "balanced_ab_ba",
         "prompt": "raw prompt, no chat template",
         "prompt_repeat": prompt_repeat,
         "prompt_bytes": prompt_bytes,
@@ -721,7 +745,7 @@ summary = {
         "llama_cache_type_k": llama_cache_type_k,
         "llama_cache_type_v": llama_cache_type_v,
         "antfly_q4_0_q8_1_prefill_rows": antfly_q4_0_q8_1_prefill_rows,
-        "antfly_gqa_prefill_fast": antfly_gqa_prefill_fast,
+        "antfly_gqa_prefill_profile": antfly_gqa_prefill_profile,
         "antfly_q4_0_linear_q8_1_tile4_w8_min_in_dim": antfly_q4_0_linear_q8_1_tile4_w8_min_in_dim,
         "antfly_q4_0_linear_q8_1_rows8_c4": antfly_q4_0_linear_q8_1_rows8_c4,
         "antfly_q4_0_pair_activation_q8_1_rows8_c2": antfly_q4_0_pair_activation_q8_1_rows8_c2,
@@ -736,6 +760,7 @@ summary = {
         "antfly_generated_q6_k_q8_1_lm_head_argmax": effective_generated_q6_lm_head_argmax,
         "antfly_generated_q4_0_e2b_ffn": effective_generated_e2b_ffn,
         "antfly_generated_q4_0_e2b_ffn_exact": effective_generated_e2b_ffn_exact,
+        "antfly_generated_q4_0_e2b_ffn_pair_only": effective_generated_e2b_ffn_pair_only,
     },
     "antfly_total_ms": stats(antfly_totals),
     "antfly_prefill_ms": stats(antfly_prefills),
@@ -863,6 +888,8 @@ with (out_dir / "paired_summary.tsv").open("w", encoding="utf-8") as f:
         "antfly_generated_e2b_down",
         "antfly_generated_e2b_pair_fallbacks",
         "antfly_generated_e2b_down_fallbacks",
+        "antfly_generated_e2b_pair_only",
+        "antfly_generated_e2b_pair_only_fallbacks",
         "antfly_generated_e2b_exact_pair",
         "antfly_generated_e2b_exact_down",
         "antfly_generated_e2b_exact_pair_fallbacks",

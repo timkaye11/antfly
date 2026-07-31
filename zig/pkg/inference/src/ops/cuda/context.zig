@@ -234,6 +234,20 @@ pub const CudaContext = struct {
         self.noteKernelLaunch();
     }
 
+    /// Return the driver's authoritative stream-capture state when the
+    /// installed CUDA driver exposes it. The local flag remains the fallback
+    /// for older drivers and for unit-test contexts. Treat an invalidated
+    /// capture as active: descriptor creation, event timing, and other
+    /// capture-unsafe first-use work must still be rejected on that stream.
+    pub fn streamCaptureActive(self: *CudaContext) driver_mod.Error!bool {
+        const query = self.driver.fns.cuStreamIsCapturing orelse
+            return self.debug_graph_capture_active;
+        try self.makeCurrent();
+        var status: driver_mod.CUstreamCaptureStatus = driver_mod.CU_STREAM_CAPTURE_STATUS_NONE;
+        try self.driver.check(query(self.stream, &status));
+        return status != driver_mod.CU_STREAM_CAPTURE_STATUS_NONE;
+    }
+
     pub fn beginProfileEventPair(self: *CudaContext) driver_mod.Error!ProfileEventPair {
         try self.makeCurrent();
         var pair = ProfileEventPair{};

@@ -22,6 +22,56 @@ const op = @import("quant_kernel_op.zig");
 
 pub const cuda_sm89_target = compiler.cuda_sm89_promotion_target;
 
+/// Sub-kernel inventory for the composite score-prework artifacts. These are
+/// not standalone `CatalogEntry` operations: both consumers require the same
+/// score producer and workspace. Keeping distinct candidate IDs here lets
+/// release evidence and telemetry name the tiled topology without pretending
+/// it is an independently dispatchable attention operation.
+pub const AttentionConsumerCandidate = struct {
+    candidate_id: []const u8,
+    head_dim: u16,
+    score_kernel_id: []const u8,
+    consumer_kernel_id: []const u8,
+    source_fingerprint: u64,
+    threads_per_block: u16,
+    output_cols_per_block: u16,
+    max_kv_tokens: u16,
+    static_shared_memory_bytes: u32,
+    target: compiler.Target,
+    production_enabled: bool,
+};
+
+pub const cuda_score_prework_tiled64_candidate_id = "cuda_gqa_score_prework_tiled64";
+
+pub const score_prework_tiled64_candidates = [_]AttentionConsumerCandidate{
+    .{
+        .candidate_id = cuda_score_prework_tiled64_candidate_id ++ "/hd256/cap512/sm89",
+        .head_dim = 256,
+        .score_kernel_id = cuda_renderer.generated_attention_hd256_score_prework_kernel_id,
+        .consumer_kernel_id = cuda_renderer.generated_attention_hd256_score_prework_tiled64_kernel_id,
+        .source_fingerprint = compiler.first_decode_attention_1x_cuda_score_prework_hd256_source_fingerprint,
+        .threads_per_block = cuda_renderer.generated_attention_score_prework_tiled64_tile_size,
+        .output_cols_per_block = cuda_renderer.generated_attention_score_prework_tiled64_tile_size,
+        .max_kv_tokens = cuda_renderer.generated_attention_score_prework_tiled64_hd256_max_kv_tokens,
+        .static_shared_memory_bytes = cuda_renderer.generatedAttentionScorePreworkTiled64SharedBytes(256).?,
+        .target = cuda_sm89_target,
+        .production_enabled = false,
+    },
+    .{
+        .candidate_id = cuda_score_prework_tiled64_candidate_id ++ "/hd512/cap4096/sm89",
+        .head_dim = 512,
+        .score_kernel_id = cuda_renderer.generated_attention_hd512_score_prework_kernel_id,
+        .consumer_kernel_id = cuda_renderer.generated_attention_hd512_score_prework_tiled64_kernel_id,
+        .source_fingerprint = compiler.first_decode_attention_1x_cuda_score_prework_hd512_source_fingerprint,
+        .threads_per_block = cuda_renderer.generated_attention_score_prework_tiled64_tile_size,
+        .output_cols_per_block = cuda_renderer.generated_attention_score_prework_tiled64_tile_size,
+        .max_kv_tokens = cuda_renderer.generated_attention_score_prework_tiled64_hd512_max_kv_tokens,
+        .static_shared_memory_bytes = cuda_renderer.generatedAttentionScorePreworkTiled64SharedBytes(512).?,
+        .target = cuda_sm89_target,
+        .production_enabled = false,
+    },
+};
+
 const RegistryBinding = struct {
     artifact: compiler.GeneratedArtifact,
     source_fingerprint: u64,
@@ -207,6 +257,28 @@ fn downQ8Entry(
     };
 }
 
+fn pairGgmlQ8_1Entry(
+    hidden_dim: u32,
+    intermediate_dim: u32,
+    comptime kernel_id: []const u8,
+) compiler.CatalogEntry {
+    var entry = pairQ8Entry(hidden_dim, intermediate_dim, 384, kernel_id);
+    entry.schedule.family = "q4_0_pair_activation_ggml_q8_1_c32_sm89";
+    return entry;
+}
+
+fn downGgmlQ8_1Entry(
+    intermediate_dim: u32,
+    hidden_dim: u32,
+    comptime kernel_id: []const u8,
+) compiler.CatalogEntry {
+    var entry = downQ8Entry(intermediate_dim, hidden_dim, 128, kernel_id);
+    entry.schedule.family = "q4_0_down_ggml_q8_1_mmvq_c1_w4_sm89";
+    entry.schedule.cols_per_block = 1;
+    entry.schedule.resources.static_shared_memory_bytes = 4 * @sizeOf(f32);
+    return entry;
+}
+
 /// The exact F32 candidates intentionally model the handwritten FFN ABI rather
 /// than the Q8_1 intermediate route. They are cataloged for inventory and
 /// validation only; both artifacts remain production-disabled.
@@ -301,6 +373,151 @@ fn attentionEntry(
     };
 }
 
+fn scorePreworkDecodeEntry(
+    head_dim: u32,
+    query_heads: u32,
+    kv_heads: u32,
+    comptime kernel_id: []const u8,
+) compiler.CatalogEntry {
+    const binding = registryBinding(kernel_id);
+    return .{
+        .signature = .{ .attention = .{
+            .kind = .decode_1x,
+            .query = .f32,
+            .key = .paged_f16_or_polar4,
+            .value = .paged_f16_or_f32,
+            .output = .f32,
+        } },
+        .runtime = .{
+            .rows = .exact(1),
+            .head_dim = .exact(head_dim),
+            .query_heads = .exact(query_heads),
+            .kv_heads = .exact(kv_heads),
+            // RuntimeShape carries total logical sequence length. The typed
+            // runtime selector additionally owns the sliding-window/global
+            // pairing, the F16 storage checks, and the SM89 512-token
+            // automatic crossover; explicit mode may engage the route below
+            // that crossover on other CUDA >= 7.5 targets.
+            .sequence_length = .{
+                .min = 1,
+                .max = cuda_renderer.generated_attention_score_prework_max_kv_tokens,
+            },
+        },
+        .target = cuda_sm89_target,
+        .schedule = .{
+            .family = "attention_score_prework_chunk128",
+            .threads_per_block = @intCast(head_dim),
+            .cols_per_block = 1,
+            .split_count = cuda_renderer.generated_attention_score_prework_chunks,
+            .resources = .{ .static_shared_memory_bytes = if (head_dim == 256) 32 else 64 },
+        },
+        .kernel_id = kernel_id,
+        .source_fingerprint = binding.source_fingerprint,
+        .production_enabled = binding.production_enabled,
+    };
+}
+
+fn splitkOnlineDecodeEntry(
+    head_dim: u32,
+    comptime kernel_id: []const u8,
+) compiler.CatalogEntry {
+    const binding = registryBinding(kernel_id);
+    return .{
+        .signature = .{ .attention = .{
+            .kind = .decode_1x,
+            .query = .f32,
+            .key = .paged_f16,
+            .value = .paged_f16,
+            .output = .f32,
+        } },
+        .runtime = .{
+            .rows = .exact(1),
+            .head_dim = .exact(head_dim),
+            .query_heads = .exact(8),
+            .kv_heads = .exact(1),
+            // RuntimeShape carries total logical sequence length. HD256 still
+            // limits the visible interval to SWA512 in its typed lowering;
+            // it must remain catalog-resolvable for the same 2k+ contexts as
+            // the HD512 global layers.
+            .sequence_length = .{
+                .min = 1,
+                .max = cuda_renderer.generated_splitk_online_decode_max_sequence_tokens,
+            },
+        },
+        .target = cuda_sm89_target,
+        .schedule = .{
+            .family = if (head_dim == 256)
+                "gqa_decode_splitk_online_sm89_hd256_swa512_f16"
+            else
+                "gqa_decode_splitk_online_sm89_hd512_global_f16",
+            .threads_per_block = cuda_renderer.generated_splitk_online_decode_threads,
+            .rows_per_block = 1,
+            .cols_per_block = @intCast(head_dim),
+            .split_count = cuda_renderer.generated_splitk_online_decode_splits,
+            .resources = .{
+                .static_shared_memory_bytes = cuda_renderer.generated_splitk_online_decode_static_shared_memory_bytes,
+            },
+        },
+        .kernel_id = kernel_id,
+        .source_fingerprint = binding.source_fingerprint,
+        .production_enabled = binding.production_enabled,
+    };
+}
+
+fn flashPrefillSequenceConstraint(query_len: u32) op.RuntimeDimensionConstraint {
+    return switch (query_len) {
+        // The qualified q512 kernel accepts prefixes 0/512/1024/1536. The
+        // catalog carries total sequence length, so encode those four points
+        // as the exact aligned set 512/1024/1536/2048.
+        512 => .{ .min = 512, .max = 2048, .multiple_of = 512 },
+        // The long-context fixture ends with a three-token tail at prefix 2048.
+        3 => .exact(2051),
+        else => unreachable,
+    };
+}
+
+fn flashPrefillEntry(
+    head_dim: u32,
+    query_len: u32,
+    comptime kernel_id: []const u8,
+) compiler.CatalogEntry {
+    const binding = registryBinding(kernel_id);
+    const family = switch (head_dim) {
+        256 => "gqa_flash_prefill_f16_sm89_hd256_swa512",
+        512 => "gqa_flash_prefill_f16_sm89_hd512_global",
+        else => unreachable,
+    };
+    return .{
+        .signature = .{ .attention = .{
+            .kind = .prefill_flash,
+            .query = .f32,
+            .key = .paged_f16,
+            .value = .paged_f16,
+            .output = .f32,
+        } },
+        .runtime = .{
+            .rows = .exact(query_len),
+            .head_dim = .exact(head_dim),
+            .query_heads = .exact(8),
+            .kv_heads = .exact(1),
+            .sequence_length = flashPrefillSequenceConstraint(query_len),
+        },
+        .target = cuda_sm89_target,
+        .schedule = .{
+            .family = family,
+            .threads_per_block = cuda_renderer.generated_flash_prefill_threads,
+            .rows_per_block = cuda_renderer.generated_flash_prefill_query_tile,
+            .cols_per_block = @intCast(head_dim),
+            .resources = .{
+                .dynamic_shared_memory_bytes = cuda_renderer.generatedFlashPrefillDynamicSharedBytes(@intCast(head_dim)).?,
+            },
+        },
+        .kernel_id = kernel_id,
+        .source_fingerprint = binding.source_fingerprint,
+        .production_enabled = binding.production_enabled,
+    };
+}
+
 pub const entries = [_]compiler.CatalogEntry{
     // Q4_0 projection signatures observed in the E2B QAT checkpoint.
     q4MmvEntry(256, 1536),
@@ -367,9 +584,46 @@ pub const entries = [_]compiler.CatalogEntry{
     attentionEntry(512, 8, 2, compiler.first_decode_attention_1x_cuda_hd512_kernel_id),
     attentionEntry(256, 16, 8, compiler.first_decode_attention_1x_cuda_kernel_id),
     attentionEntry(512, 16, 1, compiler.first_decode_attention_1x_cuda_hd512_kernel_id),
+
+    // Promoted paged exact score-prework decode composites for the qualified
+    // SM89 Gemma 4 F16 geometry (8 query heads over 1 or 2 KV heads). The
+    // production runtime engages them automatically at the 512-token KV
+    // crossover; the entries carry the composite score/serial/tiled64
+    // schedule and the paged K/V storage contract.
+    scorePreworkDecodeEntry(256, 8, 1, compiler.first_decode_attention_1x_cuda_score_prework_hd256_kernel_id),
+    scorePreworkDecodeEntry(256, 8, 2, compiler.first_decode_attention_1x_cuda_score_prework_hd256_kernel_id),
+    scorePreworkDecodeEntry(512, 8, 1, compiler.first_decode_attention_1x_cuda_score_prework_hd512_kernel_id),
+    scorePreworkDecodeEntry(512, 8, 2, compiler.first_decode_attention_1x_cuda_score_prework_hd512_kernel_id),
+
+    // Qualified SM89 Gemma 4 q=1 split-K online-softmax candidates. They are
+    // separate catalog identities from the portable generated decode family.
+    splitkOnlineDecodeEntry(256, compiler.first_decode_splitk_online_cuda_hd256_kernel_id),
+    splitkOnlineDecodeEntry(512, compiler.first_decode_splitk_online_cuda_hd512_kernel_id),
+
+    // Qualified single-launch Flash-prefill topology. Runtime constraints can
+    // express query length and total-length/prefix buckets; the exact page-16,
+    // sliding/global policy, format tags, and SM89 contract remain owned by the
+    // typed renderer plan and the fail-closed runtime selector.
+    flashPrefillEntry(256, 512, compiler.first_prefill_flash_cuda_hd256_kernel_id),
+    flashPrefillEntry(256, 3, compiler.first_prefill_flash_cuda_hd256_kernel_id),
+    flashPrefillEntry(512, 512, compiler.first_prefill_flash_cuda_hd512_kernel_id),
+    flashPrefillEntry(512, 3, compiler.first_prefill_flash_cuda_hd512_kernel_id),
 };
 
 pub const catalog = compiler.Catalog{ .entries = &entries };
+
+/// Layout-qualified candidate suite. The generic Q8_1 semantic ABI predates
+/// explicit activation-layout typing, so these entries live in a dedicated
+/// resolver rather than making the primary catalog ambiguous with the legacy
+/// zero-sum routes at identical shapes.
+pub const ggml_q8_1_entries = [_]compiler.CatalogEntry{
+    pairGgmlQ8_1Entry(1536, 6144, compiler.first_e2b_cuda_q4_0_pair_ggml_q8_1_6144_kernel_id),
+    pairGgmlQ8_1Entry(1536, 12_288, compiler.first_e2b_cuda_q4_0_pair_ggml_q8_1_12288_kernel_id),
+    downGgmlQ8_1Entry(6144, 1536, compiler.first_e2b_cuda_q4_0_down_ggml_q8_1_6144_kernel_id),
+    downGgmlQ8_1Entry(12_288, 1536, compiler.first_e2b_cuda_q4_0_down_ggml_q8_1_12288_kernel_id),
+};
+
+pub const ggml_q8_1_catalog = compiler.Catalog{ .entries = &ggml_q8_1_entries };
 
 fn rendererDimensionMatches(constraint: anytype, value: u32) bool {
     if (value == 0) return false;
@@ -438,7 +692,9 @@ fn activationEncodingForAttentionStorage(storage: anytype) op.ActivationEncoding
         .f32 => .f32,
         .f16 => .f16,
         .bf16 => .bf16,
+        .paged_f16 => .paged_f16,
         .paged_f16_or_polar4 => .paged_f16_or_polar4,
+        .paged_f16_or_f32 => .paged_f16_or_f32,
     };
 }
 
@@ -447,8 +703,139 @@ fn outputEncodingForAttentionStorage(storage: anytype) op.OutputEncoding {
         .f32 => .f32,
         .f16 => .f16,
         .bf16 => .bf16,
-        .paged_f16_or_polar4 => unreachable,
+        .paged_f16, .paged_f16_or_polar4, .paged_f16_or_f32 => unreachable,
     };
+}
+
+fn validateFlashPrefillSemanticAndSchedule(
+    entry: compiler.CatalogEntry,
+    signature: op.AttentionSpecialization,
+    artifact: compiler.GeneratedArtifact,
+) !void {
+    const artifact_op = artifact.attentionOp() orelse return error.CatalogArtifactOperationKindMismatch;
+    const plan = compiler.cudaFlashPrefillRenderPlanForArtifact(artifact) orelse
+        return error.CatalogArtifactCudaRenderPlanMissing;
+    if (signature.kind != artifact_op.kind or
+        signature.query != activationEncodingForAttentionStorage(plan.lowering.query_storage) or
+        signature.key != activationEncodingForAttentionStorage(plan.lowering.key_storage) or
+        signature.value != activationEncodingForAttentionStorage(plan.lowering.value_storage) or
+        signature.output != outputEncodingForAttentionStorage(plan.lowering.output_storage))
+    {
+        return error.CatalogArtifactSemanticAbiMismatch;
+    }
+
+    const query_len = entry.runtime.rows.exactValue() orelse return error.CatalogRuntimeShapeMismatch;
+    const head_dim = entry.runtime.head_dim.exactValue() orelse return error.CatalogRuntimeShapeMismatch;
+    const query_heads = entry.runtime.query_heads.exactValue() orelse return error.CatalogRuntimeShapeMismatch;
+    const kv_heads = entry.runtime.kv_heads.exactValue() orelse return error.CatalogRuntimeShapeMismatch;
+    const policy_matches = switch (query_len) {
+        512 => blk: {
+            for ([_]usize{ 0, 512, 1024, 1536 }) |prefix| {
+                if (!plan.lowering.query_length_policy.accepts(512, prefix)) break :blk false;
+            }
+            break :blk !plan.lowering.query_length_policy.accepts(512, 2048);
+        },
+        3 => plan.lowering.query_length_policy.accepts(3, 2048) and
+            !plan.lowering.query_length_policy.accepts(3, 1536),
+        else => false,
+    };
+    if ((query_len != 512 and query_len != 3) or
+        !std.meta.eql(entry.runtime.sequence_length, flashPrefillSequenceConstraint(query_len)) or
+        !policy_matches or
+        !rendererDimensionMatches(plan.launch.rows, query_len) or
+        !rendererDimensionMatches(plan.launch.input_dim, head_dim) or
+        head_dim != plan.lowering.head_dim or
+        query_heads != plan.lowering.query_heads or
+        kv_heads != plan.lowering.kv_heads or
+        plan.lowering.page_size_tokens != cuda_renderer.generated_flash_prefill_page_size_tokens or
+        plan.lowering.sliding_window != @as(u16, if (head_dim == 256) 512 else 0) or
+        plan.lowering.query_length_policy != .gemma4_q512_or_q3_v1 or
+        plan.lowering.format != cuda_renderer.generated_flash_prefill_format_f16 or
+        plan.lowering.value_format != cuda_renderer.generated_flash_prefill_format_f16 or
+        plan.lowering.required_compute_major != 8 or
+        plan.lowering.required_compute_minor != 9 or
+        compiler.targetFingerprint(entry.target) != compiler.targetFingerprint(cuda_sm89_target))
+    {
+        return error.CatalogRuntimeShapeMismatch;
+    }
+
+    const expected_family: []const u8 = switch (head_dim) {
+        256 => "gqa_flash_prefill_f16_sm89_hd256_swa512",
+        512 => "gqa_flash_prefill_f16_sm89_hd512_global",
+        else => return error.CatalogRuntimeShapeMismatch,
+    };
+    if (!std.mem.eql(u8, entry.schedule.family, expected_family) or
+        entry.schedule.threads_per_block != plan.launch.threads_per_block or
+        entry.schedule.rows_per_block != plan.launch.output_rows_per_block or
+        entry.schedule.cols_per_block != plan.launch.output_cols_per_block or
+        entry.schedule.vector_width != 1 or
+        entry.schedule.split_count != 1 or
+        entry.schedule.resources.static_shared_memory_bytes != plan.launch.static_shared_memory_bytes or
+        entry.schedule.resources.dynamic_shared_memory_bytes != plan.launch.dynamic_shared_memory_bytes)
+    {
+        return error.CatalogCudaLaunchScheduleMismatch;
+    }
+}
+
+fn validateSplitkOnlineDecodeSemanticAndSchedule(
+    entry: compiler.CatalogEntry,
+    signature: op.AttentionSpecialization,
+    artifact: compiler.GeneratedArtifact,
+) !void {
+    const artifact_op = artifact.attentionOp() orelse return error.CatalogArtifactOperationKindMismatch;
+    const plan = compiler.cudaSplitkOnlineDecodeRenderPlanForArtifact(artifact) orelse
+        return error.CatalogArtifactCudaRenderPlanMissing;
+    if (signature.kind != artifact_op.kind or
+        signature.query != activationEncodingForAttentionStorage(plan.lowering.query_storage) or
+        signature.key != activationEncodingForAttentionStorage(plan.lowering.key_storage) or
+        signature.value != activationEncodingForAttentionStorage(plan.lowering.value_storage) or
+        signature.output != outputEncodingForAttentionStorage(plan.lowering.output_storage))
+    {
+        return error.CatalogArtifactSemanticAbiMismatch;
+    }
+
+    const rows = entry.runtime.rows.exactValue() orelse return error.CatalogRuntimeShapeMismatch;
+    const head_dim = entry.runtime.head_dim.exactValue() orelse return error.CatalogRuntimeShapeMismatch;
+    const query_heads = entry.runtime.query_heads.exactValue() orelse return error.CatalogRuntimeShapeMismatch;
+    const kv_heads = entry.runtime.kv_heads.exactValue() orelse return error.CatalogRuntimeShapeMismatch;
+    const expected_sequence = op.RuntimeDimensionConstraint{
+        .min = 1,
+        .max = cuda_renderer.generated_splitk_online_decode_max_sequence_tokens,
+    };
+    if (rows != 1 or
+        !rendererDimensionMatches(plan.launch.rows, rows) or
+        !rendererDimensionMatches(plan.launch.input_dim, head_dim) or
+        head_dim != plan.lowering.head_dim or
+        query_heads != plan.lowering.query_heads or
+        kv_heads != plan.lowering.kv_heads or
+        !std.meta.eql(entry.runtime.sequence_length, expected_sequence) or
+        plan.lowering.kv_splits != cuda_renderer.generated_splitk_online_decode_splits or
+        plan.lowering.page_size_tokens != cuda_renderer.generated_splitk_online_decode_page_size_tokens or
+        plan.lowering.sliding_window != @as(u16, if (head_dim == 256) 512 else 0) or
+        plan.lowering.format != cuda_renderer.generated_splitk_online_decode_format_f16 or
+        plan.lowering.value_format != cuda_renderer.generated_splitk_online_decode_format_f16 or
+        plan.lowering.required_compute_major != 8 or
+        plan.lowering.required_compute_minor != 9 or
+        compiler.targetFingerprint(entry.target) != compiler.targetFingerprint(cuda_sm89_target))
+    {
+        return error.CatalogRuntimeShapeMismatch;
+    }
+
+    const expected_family: []const u8 = if (head_dim == 256)
+        "gqa_decode_splitk_online_sm89_hd256_swa512_f16"
+    else
+        "gqa_decode_splitk_online_sm89_hd512_global_f16";
+    if (!std.mem.eql(u8, entry.schedule.family, expected_family) or
+        entry.schedule.threads_per_block != plan.launch.threads_per_block or
+        entry.schedule.rows_per_block != plan.launch.output_rows_per_block or
+        entry.schedule.cols_per_block != plan.launch.output_cols_per_block or
+        entry.schedule.vector_width != 1 or
+        entry.schedule.split_count != plan.lowering.kv_splits or
+        entry.schedule.resources.static_shared_memory_bytes != plan.launch.static_shared_memory_bytes or
+        entry.schedule.resources.dynamic_shared_memory_bytes != plan.launch.dynamic_shared_memory_bytes)
+    {
+        return error.CatalogCudaLaunchScheduleMismatch;
+    }
 }
 
 fn validateAttentionSemanticAndSchedule(
@@ -456,6 +843,12 @@ fn validateAttentionSemanticAndSchedule(
     signature: op.AttentionSpecialization,
     artifact: compiler.GeneratedArtifact,
 ) !void {
+    if (artifact.cuda_splitk_online_decode_kernel != null) {
+        return validateSplitkOnlineDecodeSemanticAndSchedule(entry, signature, artifact);
+    }
+    if (signature.kind == .prefill_flash) {
+        return validateFlashPrefillSemanticAndSchedule(entry, signature, artifact);
+    }
     const artifact_op = artifact.attentionOp() orelse return error.CatalogArtifactOperationKindMismatch;
     const plan = compiler.cudaAttentionRenderPlanForArtifact(artifact) orelse
         return error.CatalogArtifactCudaRenderPlanMissing;
@@ -493,6 +886,45 @@ fn validateAttentionSemanticAndSchedule(
     }
 }
 
+/// A promoted decode-attention composite must expose the complete contract the
+/// host relies on: the score producer plus serial and tiled64 consumer entry
+/// points, the typed score-capacity/threshold rules and paged K/V storage in
+/// its checked-in schedule, runtime linkage, and a tiled64 consumer inventory
+/// record bound to the same generated source and target. Only the exact
+/// score-prework composites satisfy this; dense split candidates keep their
+/// host-owned rules outside the catalog and stay unpromotable.
+fn decodeCompositeContractComplete(
+    entry: compiler.CatalogEntry,
+    artifact: compiler.GeneratedArtifact,
+) bool {
+    if (!compiler.cudaAttentionArtifactRuntimeWired(artifact)) return false;
+    const attention = artifact.attentionOp() orelse return false;
+    const plan = compiler.cudaAttentionRenderPlanForArtifact(artifact) orelse return false;
+    if (plan.lowering.split_variant != .score_prework) return false;
+    const schedule = attention.schedule;
+    if (schedule.attention_serial_threads_per_threadgroup == 0 or
+        schedule.attention_stage2_threads_per_threadgroup == 0 or
+        schedule.attention_tiled64_threads_per_threadgroup == 0 or
+        schedule.attention_max_kv_tokens == 0 or
+        schedule.attention_tiled64_max_kv_tokens == 0 or
+        schedule.attention_key_storage != .paged_f16_or_polar4 or
+        schedule.attention_value_storage != .paged_f16_or_f32)
+    {
+        return false;
+    }
+    const source_fingerprint = compiler.artifactSourceFingerprint(artifact);
+    for (score_prework_tiled64_candidates) |candidate| {
+        if (candidate.head_dim == attention.head_dim and
+            candidate.source_fingerprint == source_fingerprint and
+            candidate.target.backend == entry.target.backend and
+            std.mem.eql(u8, candidate.target.architecture, entry.target.architecture))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn validateEntryAgainstArtifact(
     entry: compiler.CatalogEntry,
     artifact: compiler.GeneratedArtifact,
@@ -501,11 +933,25 @@ fn validateEntryAgainstArtifact(
     if (entry.target.backend != artifact.backend) return error.CatalogArtifactBackendMismatch;
     if (!std.mem.eql(u8, entry.kernel_id, artifact.kernel_id)) return error.CatalogArtifactKernelIdMismatch;
 
-    // The current attention artifact contains three entry points and host-owned
-    // workspace/threshold rules. A stage-1 catalog record must not promote that
-    // composite route until those contracts are represented by the catalog.
+    // Decode attention contains three entry points and host-owned
+    // workspace/threshold rules. A catalog record may promote that composite
+    // route only when those contracts are represented: the typed score-prework
+    // plan carries the paged K/V storage, score capacity, and consumer
+    // thresholds in its checked-in schedule, and the tiled64 consumer is
+    // inventoried against the same generated source. Stage-1 dense split
+    // candidates carry none of that and remain unpromotable. Flash prefill is
+    // a dedicated one-launch plan and may be promoted only after its
+    // explicit-profile runtime wiring is present.
     if (entry.production_enabled and artifact.opKind() == .attention) {
-        return error.ProductionAttentionCompositeContractIncomplete;
+        const attention = artifact.attentionOp() orelse return error.CatalogArtifactOperationKindMismatch;
+        switch (attention.kind) {
+            .decode_1x => if (!decodeCompositeContractComplete(entry, artifact)) {
+                return error.ProductionAttentionCompositeContractIncomplete;
+            },
+            .prefill_flash => if (!compiler.cudaFlashPrefillArtifactRuntimeWired(artifact)) {
+                return error.ProductionCatalogArtifactNotRuntimeWired;
+            },
+        }
     }
     if (entry.production_enabled) switch (entry.signature) {
         .small_batch_matmul => |signature| if (signature.epilogue == .argmax) {
@@ -539,11 +985,14 @@ fn validateEntryAgainstArtifact(
     }
 
     if (!entry.production_enabled) return;
-    const matmul = compiler.matmulArtifactView(artifact);
     if (artifact.runtime_evidence_command.len == 0) return error.ProductionCatalogArtifactMissingRuntimeEvidence;
     if (artifact.promotion_evidence_command.len == 0) return error.ProductionCatalogArtifactMissingPromotionEvidence;
-    if (!compiler.artifactHasPromotionEvidence(matmul)) return error.ProductionCatalogArtifactPromotionEvidenceRejected;
-    const evidence_target = compiler.artifactPromotionTargetFingerprint(matmul) orelse
+    const maybe_evidence_target = if (artifact.matmulOp() != null) target: {
+        const matmul = compiler.matmulArtifactView(artifact);
+        if (!compiler.artifactHasPromotionEvidence(matmul)) return error.ProductionCatalogArtifactPromotionEvidenceRejected;
+        break :target compiler.artifactPromotionTargetFingerprint(matmul);
+    } else compiler.attentionArtifactPromotionTargetFingerprint(artifact);
+    const evidence_target = maybe_evidence_target orelse
         return error.ProductionCatalogArtifactMissingTargetEvidence;
     if (evidence_target != compiler.targetFingerprint(entry.target)) {
         return error.ProductionCatalogArtifactTargetEvidenceMismatch;
@@ -559,6 +1008,8 @@ pub fn validateEntryAgainstRegistry(entry: compiler.CatalogEntry) !void {
 pub fn validateCheckedInCatalog() !void {
     try catalog.validate();
     for (entries) |entry| try validateEntryAgainstRegistry(entry);
+    try ggml_q8_1_catalog.validate();
+    for (ggml_q8_1_entries) |entry| try validateEntryAgainstRegistry(entry);
 }
 
 comptime {
@@ -579,6 +1030,16 @@ pub fn resolve(
 ) !?compiler.CatalogEntry {
     const target = targetForComputeCapability(major, minor) orelse return null;
     return catalog.resolve(.{ .signature = signature, .runtime = shape, .target = target });
+}
+
+pub fn resolveGgmlQ8_1(
+    signature: op.SpecializationSignature,
+    shape: op.RuntimeShape,
+    major: i32,
+    minor: i32,
+) !?compiler.CatalogEntry {
+    const target = targetForComputeCapability(major, minor) orelse return null;
+    return ggml_q8_1_catalog.resolve(.{ .signature = signature, .runtime = shape, .target = target });
 }
 
 test "checked-in CUDA AOT catalog is unambiguous" {
@@ -865,6 +1326,58 @@ test "catalog resolves exact F32 E2B FFN candidates without promotion" {
     try std.testing.expectEqualStrings(compiler.first_e2b_cuda_q4_0_pair_q8_6144_kernel_id, q8_pair.kernel_id);
 }
 
+test "catalog resolves llama CUDA Q8_1 E2B candidates only through typed catalog" {
+    const pair_signature = op.SpecializationSignature{ .small_batch_matmul = .{
+        .format = .q4_0,
+        .row_bucket = .rows_1,
+        .dispatch = .mmv,
+        .epilogue = .pair_activation,
+        .activation = .q8_1,
+        .function = .gelu_new,
+        .output = .q8_1,
+    } };
+    const down_signature = op.SpecializationSignature{ .small_batch_matmul = .{
+        .format = .q4_0,
+        .row_bucket = .rows_1,
+        .dispatch = .mmv,
+        .epilogue = .gated_down,
+        .activation = .q8_1,
+    } };
+    const pair = (try resolveGgmlQ8_1(
+        pair_signature,
+        .{ .rows = 1, .input_dim = 1536, .output_dim = 6144 },
+        8,
+        9,
+    )) orelse return error.MissingCatalogEntry;
+    try std.testing.expectEqualStrings(
+        compiler.first_e2b_cuda_q4_0_pair_ggml_q8_1_6144_kernel_id,
+        pair.kernel_id,
+    );
+    try std.testing.expectEqualStrings("q4_0_pair_activation_ggml_q8_1_c32_sm89", pair.schedule.family);
+    try std.testing.expect(!pair.production_enabled);
+
+    const down = (try resolveGgmlQ8_1(
+        down_signature,
+        .{ .rows = 1, .input_dim = 12_288, .output_dim = 1536 },
+        8,
+        9,
+    )) orelse return error.MissingCatalogEntry;
+    try std.testing.expectEqualStrings(
+        compiler.first_e2b_cuda_q4_0_down_ggml_q8_1_12288_kernel_id,
+        down.kernel_id,
+    );
+    try std.testing.expectEqual(@as(u16, 128), down.schedule.threads_per_block);
+    try std.testing.expectEqual(@as(u16, 1), down.schedule.cols_per_block);
+    try std.testing.expect(!down.production_enabled);
+
+    try std.testing.expect((try resolveGgmlQ8_1(
+        pair_signature,
+        .{ .rows = 2, .input_dim = 1536, .output_dim = 6144 },
+        8,
+        9,
+    )) == null);
+}
+
 test "catalog resolves model-neutral Gemma 4 attention topologies" {
     const signature = op.SpecializationSignature{ .attention = .{ .kind = .decode_1x } };
     const resolved = (try resolve(signature, .{
@@ -901,6 +1414,246 @@ test "catalog resolves model-neutral Gemma 4 attention topologies" {
         .kv_heads = 1,
         .sequence_length = 256,
     }, 8, 0)) == null);
+}
+
+test "catalog resolves long-context SM89 split-K online decode without widening visibility" {
+    const signature = op.SpecializationSignature{ .attention = .{
+        .kind = .decode_1x,
+        .query = .f32,
+        .key = .paged_f16,
+        .value = .paged_f16,
+        .output = .f32,
+    } };
+    const expected = [_]struct {
+        head_dim: u32,
+        kernel_id: []const u8,
+        sliding_window: u16,
+        max_visible_tokens: u16,
+    }{
+        .{ .head_dim = 256, .kernel_id = compiler.first_decode_splitk_online_cuda_hd256_kernel_id, .sliding_window = 512, .max_visible_tokens = 512 },
+        .{ .head_dim = 512, .kernel_id = compiler.first_decode_splitk_online_cuda_hd512_kernel_id, .sliding_window = 0, .max_visible_tokens = 4096 },
+    };
+    for (expected) |item| {
+        const resolved = (try resolve(signature, .{
+            .rows = 1,
+            .head_dim = item.head_dim,
+            .query_heads = 8,
+            .kv_heads = 1,
+            .sequence_length = 2432,
+        }, 8, 9)) orelse return error.MissingCatalogEntry;
+        try std.testing.expectEqualStrings(item.kernel_id, resolved.kernel_id);
+        try std.testing.expectEqual(@as(u32, 4096), resolved.runtime.sequence_length.max);
+        const artifact = compiler.generatedRegistryArtifactForKernel(resolved.target.backend, resolved.kernel_id) orelse
+            return error.CatalogArtifactMissing;
+        const plan = compiler.cudaSplitkOnlineDecodeRenderPlanForArtifact(artifact) orelse
+            return error.CatalogArtifactCudaRenderPlanMissing;
+        try std.testing.expectEqual(item.sliding_window, plan.lowering.sliding_window);
+        try std.testing.expectEqual(item.max_visible_tokens, plan.lowering.max_visible_tokens);
+        try std.testing.expect(compiler.cudaSplitkOnlineDecodeArtifactRuntimeWired(artifact));
+        try std.testing.expect(!artifact.production_enabled);
+        try validateEntryAgainstArtifact(resolved, artifact);
+    }
+
+    var outside = op.RuntimeShape{
+        .rows = 1,
+        .head_dim = 512,
+        .query_heads = 8,
+        .kv_heads = 1,
+        .sequence_length = 4097,
+    };
+    try std.testing.expect((try resolve(signature, outside, 8, 9)) == null);
+    outside.sequence_length = 2432;
+    outside.query_heads = 16;
+    try std.testing.expect((try resolve(signature, outside, 8, 9)) == null);
+    outside.query_heads = 8;
+    try std.testing.expect((try resolve(signature, outside, 8, 0)) == null);
+}
+
+test "catalog resolves qualified SM89 F16 Flash-prefill buckets" {
+    const signature = op.SpecializationSignature{ .attention = .{
+        .kind = .prefill_flash,
+        .query = .f32,
+        .key = .paged_f16,
+        .value = .paged_f16,
+        .output = .f32,
+    } };
+    const expected = [_]struct {
+        head_dim: u32,
+        query_len: u32,
+        total_len: u32,
+        kernel_id: []const u8,
+        family: []const u8,
+        dynamic_shared_bytes: u32,
+    }{
+        .{ .head_dim = 256, .query_len = 512, .total_len = 2048, .kernel_id = compiler.first_prefill_flash_cuda_hd256_kernel_id, .family = "gqa_flash_prefill_f16_sm89_hd256_swa512", .dynamic_shared_bytes = 26_564 },
+        .{ .head_dim = 256, .query_len = 3, .total_len = 2051, .kernel_id = compiler.first_prefill_flash_cuda_hd256_kernel_id, .family = "gqa_flash_prefill_f16_sm89_hd256_swa512", .dynamic_shared_bytes = 26_564 },
+        .{ .head_dim = 512, .query_len = 512, .total_len = 2048, .kernel_id = compiler.first_prefill_flash_cuda_hd512_kernel_id, .family = "gqa_flash_prefill_f16_sm89_hd512_global", .dynamic_shared_bytes = 42_948 },
+        .{ .head_dim = 512, .query_len = 3, .total_len = 2051, .kernel_id = compiler.first_prefill_flash_cuda_hd512_kernel_id, .family = "gqa_flash_prefill_f16_sm89_hd512_global", .dynamic_shared_bytes = 42_948 },
+    };
+
+    var flash_entry_count: usize = 0;
+    for (entries) |entry| switch (entry.signature) {
+        .attention => |attention| if (attention.kind == .prefill_flash) {
+            flash_entry_count += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 4), flash_entry_count);
+
+    for (expected) |item| {
+        const resolved = (try resolve(signature, .{
+            .rows = item.query_len,
+            .head_dim = item.head_dim,
+            .query_heads = 8,
+            .kv_heads = 1,
+            .sequence_length = item.total_len,
+        }, 8, 9)) orelse return error.MissingCatalogEntry;
+        try std.testing.expectEqualStrings(item.kernel_id, resolved.kernel_id);
+        try std.testing.expectEqualStrings(item.family, resolved.schedule.family);
+        try std.testing.expectEqual(cuda_renderer.generated_flash_prefill_threads, resolved.schedule.threads_per_block);
+        try std.testing.expectEqual(cuda_renderer.generated_flash_prefill_query_tile, resolved.schedule.rows_per_block);
+        try std.testing.expectEqual(@as(u16, @intCast(item.head_dim)), resolved.schedule.cols_per_block);
+        try std.testing.expectEqual(item.dynamic_shared_bytes, resolved.schedule.resources.dynamic_shared_memory_bytes);
+        try std.testing.expect(!resolved.production_enabled);
+
+        const artifact = compiler.generatedRegistryArtifactForKernel(resolved.target.backend, resolved.kernel_id) orelse
+            return error.CatalogArtifactMissing;
+        try std.testing.expect(!artifact.production_enabled);
+        try std.testing.expect(!artifact.runtime_default_enabled);
+        try std.testing.expect(compiler.cudaFlashPrefillArtifactRuntimeWired(artifact));
+        try validateEntryAgainstArtifact(resolved, artifact);
+    }
+
+    // The q512 entry represents exactly the four qualified prefix buckets.
+    for ([_]u32{ 512, 1024, 1536, 2048 }) |total_len| {
+        try std.testing.expect((try resolve(signature, .{
+            .rows = 512,
+            .head_dim = 256,
+            .query_heads = 8,
+            .kv_heads = 1,
+            .sequence_length = total_len,
+        }, 8, 9)) != null);
+    }
+}
+
+test "catalog rejects unqualified Flash-prefill shapes targets and storage" {
+    const signature = op.SpecializationSignature{ .attention = .{
+        .kind = .prefill_flash,
+        .query = .f32,
+        .key = .paged_f16,
+        .value = .paged_f16,
+        .output = .f32,
+    } };
+    const base_shape = op.RuntimeShape{
+        .rows = 512,
+        .head_dim = 256,
+        .query_heads = 8,
+        .kv_heads = 1,
+        .sequence_length = 2048,
+    };
+
+    var shape = base_shape;
+    shape.rows = 1;
+    try std.testing.expect((try resolve(signature, shape, 8, 9)) == null);
+    shape = base_shape;
+    shape.sequence_length = 2560;
+    try std.testing.expect((try resolve(signature, shape, 8, 9)) == null);
+    shape = base_shape;
+    shape.query_heads = 16;
+    try std.testing.expect((try resolve(signature, shape, 8, 9)) == null);
+    try std.testing.expect((try resolve(signature, base_shape, 8, 0)) == null);
+
+    var broad_storage = signature;
+    broad_storage.attention.key = .paged_f16_or_polar4;
+    broad_storage.attention.value = .paged_f16_or_f32;
+    try std.testing.expect((try resolve(broad_storage, base_shape, 8, 9)) == null);
+
+    const resolved = (try resolve(signature, base_shape, 8, 9)) orelse return error.MissingCatalogEntry;
+    const artifact = compiler.generatedRegistryArtifactForKernel(resolved.target.backend, resolved.kernel_id) orelse
+        return error.CatalogArtifactMissing;
+    var bad_policy = resolved;
+    bad_policy.runtime.sequence_length.max = 2560;
+    try std.testing.expectError(
+        error.CatalogRuntimeShapeMismatch,
+        validateEntryAgainstArtifact(bad_policy, artifact),
+    );
+    var bad_schedule = resolved;
+    bad_schedule.schedule.resources.dynamic_shared_memory_bytes -= 4;
+    try std.testing.expectError(
+        error.CatalogCudaLaunchScheduleMismatch,
+        validateEntryAgainstArtifact(bad_schedule, artifact),
+    );
+}
+
+test "catalog resolves promoted SM89 score-prework decode composites" {
+    const signature = op.SpecializationSignature{ .attention = .{
+        .kind = .decode_1x,
+        .query = .f32,
+        .key = .paged_f16_or_polar4,
+        .value = .paged_f16_or_f32,
+        .output = .f32,
+    } };
+    const local = (try resolve(signature, .{
+        .rows = 1,
+        .head_dim = 256,
+        .query_heads = 8,
+        .kv_heads = 2,
+        .sequence_length = 2048,
+    }, 8, 9)) orelse return error.MissingCatalogEntry;
+    try std.testing.expectEqualStrings(
+        compiler.first_decode_attention_1x_cuda_score_prework_hd256_kernel_id,
+        local.kernel_id,
+    );
+    try std.testing.expect(local.production_enabled);
+    try std.testing.expectEqual(
+        @as(u16, cuda_renderer.generated_attention_score_prework_chunks),
+        local.schedule.split_count,
+    );
+
+    const global = (try resolve(signature, .{
+        .rows = 1,
+        .head_dim = 512,
+        .query_heads = 8,
+        .kv_heads = 1,
+        .sequence_length = cuda_renderer.generated_attention_score_prework_max_kv_tokens,
+    }, 8, 9)) orelse return error.MissingCatalogEntry;
+    try std.testing.expectEqualStrings(
+        compiler.first_decode_attention_1x_cuda_score_prework_hd512_kernel_id,
+        global.kernel_id,
+    );
+    try std.testing.expect(global.production_enabled);
+
+    // Beyond the typed score capacity, and away from the qualified Gemma 4
+    // topology, the composite must not resolve.
+    try std.testing.expect((try resolve(signature, .{
+        .rows = 1,
+        .head_dim = 512,
+        .query_heads = 8,
+        .kv_heads = 1,
+        .sequence_length = cuda_renderer.generated_attention_score_prework_max_kv_tokens + 1,
+    }, 8, 9)) == null);
+    try std.testing.expect((try resolve(signature, .{
+        .rows = 1,
+        .head_dim = 256,
+        .query_heads = 16,
+        .kv_heads = 8,
+        .sequence_length = 2048,
+    }, 8, 9)) == null);
+}
+
+test "catalog inventories tiled64 score-prework consumers as composite candidates" {
+    try std.testing.expectEqual(@as(usize, 2), score_prework_tiled64_candidates.len);
+    for (score_prework_tiled64_candidates) |candidate| {
+        try std.testing.expect(std.mem.startsWith(u8, candidate.candidate_id, cuda_score_prework_tiled64_candidate_id));
+        try std.testing.expect(candidate.head_dim == 256 or candidate.head_dim == 512);
+        try std.testing.expectEqual(cuda_renderer.generated_attention_score_prework_tiled64_tile_size, candidate.threads_per_block);
+        try std.testing.expectEqual(candidate.threads_per_block, candidate.output_cols_per_block);
+        try std.testing.expectEqualStrings(cuda_sm89_target.architecture, candidate.target.architecture);
+        try std.testing.expectEqual(cuda_sm89_target.backend, candidate.target.backend);
+        try std.testing.expect(candidate.source_fingerprint != 0);
+        try std.testing.expect(!candidate.production_enabled);
+        try std.testing.expect(std.mem.containsAtLeast(u8, candidate.consumer_kernel_id, 1, "score_prework_tiled64"));
+    }
 }
 
 test "catalog resolves exact SM89 Q6_K Q8_1 argmax family shapes" {

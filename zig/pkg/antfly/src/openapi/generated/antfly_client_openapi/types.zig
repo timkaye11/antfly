@@ -4667,6 +4667,12 @@ pub const InferenceGenerateBatchSummary = struct {
     failed: i64,
 };
 
+/// Typed options passed to the model's chat template.
+pub const InferenceGenerateChatTemplateKwargs = struct {
+    /// Controls templates that support an `enable_thinking` variable. False asks the template to open a public/final response channel directly. Omitted preserves the model template's default behavior.
+    enable_thinking: ?bool = null,
+};
+
 pub const InferenceGenerateChoice = struct {
     /// Index of this choice in the list
     index: i64,
@@ -4683,6 +4689,8 @@ pub const InferenceGenerateChunk = struct {
     created: i64,
     model: []const u8,
     choices: []const InferenceGenerateChunkChoice,
+    /// Authoritative token accounting. When `stream_options.include_usage` is true, streaming responses emit this only on the final chunk, after the finish chunk and before the `[DONE]` sentinel; that chunk has an empty `choices` array.
+    usage: ?InferenceGenerateUsage = null,
     speculation: ?InferenceGenerateSpeculationStatus = null,
 };
 
@@ -4733,6 +4741,10 @@ pub const InferenceGenerateRequest = struct {
     top_k: ?i64 = null,
     /// If true, partial message deltas will be sent as SSE events
     stream: ?bool = null,
+    stream_options: ?InferenceGenerateStreamOptions = null,
+    chat_template_kwargs: ?InferenceGenerateChatTemplateKwargs = null,
+    /// inference-native benchmarking and controlled-generation extension. When true, generation does not stop on the model's end-of-sequence token and continues until another stop condition, such as `max_tokens`, is reached. Omitted or false preserves normal EOS handling.
+    ignore_eos: ?bool = null,
     /// List of tools (functions) the model can call. Only supported by models with tool_call_format configured.
     tools: ?[]const InferenceTool = null,
     /// Min-p sampling threshold. Filters tokens where p < min_p * max_p. Simpler alternative to top_p.
@@ -4801,6 +4813,12 @@ pub const InferenceGenerateSpeculationStatus = struct {
     calibration: []const u8,
     decision: []const u8,
     disabled_reason: ?[]const u8 = null,
+};
+
+/// Options that apply only to streamed generation responses.
+pub const InferenceGenerateStreamOptions = struct {
+    /// When true, emit a final usage-only chunk before the `[DONE]` sentinel. All preceding chunks carry null or omitted usage.
+    include_usage: ?bool = null,
 };
 
 pub const InferenceGenerateUsage = struct {

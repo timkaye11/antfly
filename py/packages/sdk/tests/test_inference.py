@@ -8,6 +8,7 @@ import antfly.client as client_module
 from antfly import AntflyClient, AntflyException, InferenceAPIError
 from antfly.client_generated.models import (
     InferenceChatMessage,
+    InferenceGenerateChatTemplateKwargs,
     InferenceGenerateRequest,
     InferenceRole,
 )
@@ -30,6 +31,15 @@ def generation_request() -> InferenceGenerateRequest:
         model="gemma",
         messages=[InferenceChatMessage(role=InferenceRole.USER, content="hello")],
     )
+
+
+def test_generate_request_preserves_explicit_thinking_false() -> None:
+    omitted = generation_request().to_dict()
+    assert "chat_template_kwargs" not in omitted
+
+    request = generation_request()
+    request.chat_template_kwargs = InferenceGenerateChatTemplateKwargs(enable_thinking=False)
+    assert request.to_dict()["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 def install_transport(client: AntflyClient, handler: httpx.MockTransport) -> None:

@@ -35,7 +35,11 @@ if [[ "$disable_continuous_batching" -eq 0 ]]; then
       ;;
   esac
 fi
-gemma4_qat_cuda_tuning_env "${ANTFLY_CAPTURE_FORCE_KV_CAPACITY:-544}"
+# The typed runtime variable is the canonical contract used by benchmark and
+# server profiles. Keep the legacy alias as a compatibility fallback only;
+# otherwise the wrapper could silently replace a reviewed long-context graph
+# capacity with its historical 544-token default.
+gemma4_qat_cuda_tuning_env "${ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY:-${ANTFLY_CAPTURE_FORCE_KV_CAPACITY:-544}}"
 exec env "${GEMMA4_QAT_CUDA_ENV[@]}" \
   ANTFLY_INFERENCE_DISABLE_CONTINUOUS_BATCHING="$disable_continuous_batching" \
   "$@"

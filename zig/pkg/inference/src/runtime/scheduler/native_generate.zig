@@ -27,6 +27,159 @@ pub const Phase = enum {
     decode,
 };
 
+/// Fairness state captured when prefill memory is admitted. A plan is never
+/// resized after this snapshot: later arrivals wait for scheduler turns rather
+/// than silently changing the memory geometry underneath the running request.
+pub const PrefillFairness = enum(u8) {
+    sole_idle,
+    shared,
+};
+
+/// Weight-route intent carried with every admitted chunk. Execution currently
+/// treats this as telemetry; keeping the intent in the immutable plan lets a
+/// qualified backend route a pathological tiny tail to its quantized matvec
+/// path without reconstructing chunk geometry at dispatch time.
+pub const PrefillWeightRouteHint = enum(u8) {
+    default,
+    prefer_quantized,
+};
+
+pub const PrefillChunk = struct {
+    rows: usize,
+    weight_route_hint: PrefillWeightRouteHint = .default,
+};
+
+/// Production retains the measured fixed-ceiling schedule. Balanced geometry
+/// remains an explicit candidate so it can be benchmarked and promoted without
+/// changing the admission/execution contract.
+pub const PrefillChunkSelection = enum(u8) {
+    fixed_ceiling,
+    balanced_candidate,
+};
+
+pub const PrefillChunkPlan = struct {
+    pub const fingerprint_version: u64 = 1;
+    pub const tiny_tail_rows: usize = 31;
+
+    chunks: []const PrefillChunk = &.{},
+    prompt_tokens: usize = 0,
+    max_chunk_rows: usize = 0,
+    max_scratch_bytes: usize = 0,
+    fairness: PrefillFairness = .shared,
+    selection: PrefillChunkSelection = .fixed_ceiling,
+    /// A prefill plan must not rely on synchronizing the device merely to
+    /// reclaim deferred temporaries. This remains zero until the runtime has a
+    /// separately qualified non-zero envelope.
+    forced_drain_budget_bytes: usize = 0,
+    fingerprint: u64 = 0,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        prompt_tokens: usize,
+        max_chunk_rows: usize,
+        max_scratch_bytes: usize,
+        fairness: PrefillFairness,
+        selection: PrefillChunkSelection,
+    ) !PrefillChunkPlan {
+        if (prompt_tokens == 0 or max_chunk_rows == 0) return error.InvalidPrefillChunkPlan;
+        const chunk_count = std.math.divCeil(usize, prompt_tokens, max_chunk_rows) catch
+            return error.InvalidPrefillChunkPlan;
+        const chunks = try allocator.alloc(PrefillChunk, chunk_count);
+        errdefer allocator.free(chunks);
+
+        switch (selection) {
+            .fixed_ceiling => {
+                var remaining = prompt_tokens;
+                for (chunks, 0..) |*chunk, idx| {
+                    const rows = @min(remaining, max_chunk_rows);
+                    chunk.* = .{
+                        .rows = rows,
+                        .weight_route_hint = if (idx + 1 == chunks.len and
+                            chunks.len > 1 and rows <= tiny_tail_rows)
+                            .prefer_quantized
+                        else
+                            .default,
+                    };
+                    remaining -= rows;
+                }
+                std.debug.assert(remaining == 0);
+            },
+            .balanced_candidate => {
+                const base_rows = prompt_tokens / chunk_count;
+                const wider_chunks = prompt_tokens % chunk_count;
+                for (chunks, 0..) |*chunk, idx| {
+                    chunk.* = .{ .rows = base_rows + @intFromBool(idx < wider_chunks) };
+                }
+            },
+        }
+
+        var plan = PrefillChunkPlan{
+            .chunks = chunks,
+            .prompt_tokens = prompt_tokens,
+            .max_chunk_rows = max_chunk_rows,
+            .max_scratch_bytes = max_scratch_bytes,
+            .fairness = fairness,
+            .selection = selection,
+        };
+        plan.fingerprint = plan.computeFingerprint();
+        try plan.validate();
+        return plan;
+    }
+
+    pub fn deinit(self: *PrefillChunkPlan, allocator: std.mem.Allocator) void {
+        if (self.chunks.len != 0) allocator.free(self.chunks);
+        self.* = .{};
+    }
+
+    pub fn isAdmitted(self: PrefillChunkPlan) bool {
+        return self.chunks.len != 0 and self.fingerprint != 0;
+    }
+
+    pub fn validate(self: PrefillChunkPlan) !void {
+        if (!self.isAdmitted() or self.prompt_tokens == 0 or self.max_chunk_rows == 0)
+            return error.InvalidPrefillChunkPlan;
+        if (self.forced_drain_budget_bytes != 0) return error.InvalidPrefillChunkPlan;
+        var total_rows: usize = 0;
+        for (self.chunks) |chunk| {
+            if (chunk.rows == 0 or chunk.rows > self.max_chunk_rows)
+                return error.InvalidPrefillChunkPlan;
+            total_rows = std.math.add(usize, total_rows, chunk.rows) catch
+                return error.InvalidPrefillChunkPlan;
+        }
+        if (total_rows != self.prompt_tokens or self.computeFingerprint() != self.fingerprint)
+            return error.InvalidPrefillChunkPlan;
+    }
+
+    pub fn tail(self: PrefillChunkPlan) PrefillChunk {
+        return self.chunks[self.chunks.len - 1];
+    }
+
+    fn hashU64(hash: *u64, value: u64) void {
+        var remaining = value;
+        for (0..@sizeOf(u64)) |_| {
+            hash.* = (hash.* ^ @as(u8, @truncate(remaining))) *% 1099511628211;
+            remaining >>= 8;
+        }
+    }
+
+    fn computeFingerprint(self: PrefillChunkPlan) u64 {
+        var hash: u64 = 14695981039346656037;
+        hashU64(&hash, fingerprint_version);
+        hashU64(&hash, self.prompt_tokens);
+        hashU64(&hash, self.max_chunk_rows);
+        hashU64(&hash, self.max_scratch_bytes);
+        hashU64(&hash, @intFromEnum(self.fairness));
+        hashU64(&hash, @intFromEnum(self.selection));
+        hashU64(&hash, self.forced_drain_budget_bytes);
+        hashU64(&hash, self.chunks.len);
+        for (self.chunks) |chunk| {
+            hashU64(&hash, chunk.rows);
+            hashU64(&hash, @intFromEnum(chunk.weight_route_hint));
+        }
+        return hash;
+    }
+};
+
 pub const Admission = struct {
     requested_units: usize,
     prompt_bytes: usize,
@@ -46,6 +199,10 @@ pub const Lease = struct {
     max_tokens: i32,
     prefill_chunk_size: usize,
     active_requests_snapshot: usize,
+    /// Borrowed immutable view. The coordinator owns the chunk storage until
+    /// `release`; standalone callers may leave this empty and use the legacy
+    /// scalar fallback.
+    prefill_chunk_plan: PrefillChunkPlan = .{},
 };
 
 pub const Policy = struct {
@@ -124,6 +281,7 @@ const Entry = struct {
     prompt_bytes: usize,
     prompt_tokens: usize,
     prefill_chunk_limit: usize,
+    prefill_chunk_plan: PrefillChunkPlan = .{},
     phase: Phase = .waiting,
     prompt_tokens_processed: usize = 0,
     total_prompt_tokens: usize = 0,
@@ -229,6 +387,9 @@ pub const NativeGenerateCoordinator = struct {
     pub fn deinit(self: *NativeGenerateCoordinator) void {
         self.lockCoordinator();
         defer self.unlockCoordinator();
+        for (self.entries.items) |*entry| {
+            entry.prefill_chunk_plan.deinit(self.allocator);
+        }
         self.entries.deinit(self.allocator);
         self.pending_prefill.deinit(self.allocator);
         self.pending_decode.deinit(self.allocator);
@@ -264,7 +425,7 @@ pub const NativeGenerateCoordinator = struct {
         self.lockCoordinator();
         defer self.unlockCoordinator();
         const idx = self.indexOf(lease.request_id) orelse return;
-        const entry = self.entries.items[idx];
+        const entry = &self.entries.items[idx];
         self.removePendingPrefillByRequest(lease.request_id);
         self.removePendingDecodeByRequest(lease.request_id);
         if (self.in_turn == lease.request_id) {
@@ -276,7 +437,47 @@ pub const NativeGenerateCoordinator = struct {
         } else {
             self.active_units = 0;
         }
+        entry.prefill_chunk_plan.deinit(self.allocator);
         _ = self.entries.swapRemove(idx);
+    }
+
+    /// Finalize the request's immutable prefill geometry after memory
+    /// reservation. The coordinator owns the chunk storage through `release`;
+    /// the lease and generation config receive borrowed views only.
+    pub fn admitPrefillChunkPlan(
+        self: *NativeGenerateCoordinator,
+        lease: *Lease,
+        prompt_tokens: usize,
+        max_chunk_rows: usize,
+        max_scratch_bytes: usize,
+        selection: PrefillChunkSelection,
+    ) !void {
+        self.lockCoordinator();
+        defer self.unlockCoordinator();
+        const idx = self.indexOf(lease.request_id) orelse return error.InvalidPrefillChunkPlan;
+        const entry = &self.entries.items[idx];
+        if (entry.prefill_chunk_plan.isAdmitted() or lease.prefill_chunk_plan.isAdmitted())
+            return error.PrefillChunkPlanAlreadyAdmitted;
+        if (entry.prompt_tokens != 0 and entry.prompt_tokens != prompt_tokens)
+            return error.InvalidPrefillChunkPlan;
+
+        const state = self.snapshotUnlocked();
+        const fairness: PrefillFairness = if (self.entries.items.len == 1 and state.decode_requests == 0)
+            .sole_idle
+        else
+            .shared;
+        var plan = try PrefillChunkPlan.init(
+            self.allocator,
+            prompt_tokens,
+            max_chunk_rows,
+            max_scratch_bytes,
+            fairness,
+            selection,
+        );
+        errdefer plan.deinit(self.allocator);
+        entry.prefill_chunk_plan = plan;
+        lease.prefill_chunk_plan = plan;
+        lease.prefill_chunk_size = max_chunk_rows;
     }
 
     pub fn enqueuePrefillWork(
@@ -851,7 +1052,9 @@ pub const NativeGenerateCoordinator = struct {
         entry.phase = .prefill;
         entry.prompt_tokens_processed = processed_tokens;
         entry.total_prompt_tokens = total_prompt_tokens;
-        lease.prefill_chunk_size = self.recommendPrefillChunkForUnlocked(lease.request_id);
+        if (!lease.prefill_chunk_plan.isAdmitted()) {
+            lease.prefill_chunk_size = self.recommendPrefillChunkForUnlocked(lease.request_id);
+        }
     }
 
     pub fn beginDecode(self: *NativeGenerateCoordinator, lease: *Lease, total_prompt_tokens: usize) void {
@@ -863,7 +1066,9 @@ pub const NativeGenerateCoordinator = struct {
         entry.prompt_tokens_processed = total_prompt_tokens;
         entry.total_prompt_tokens = total_prompt_tokens;
         entry.next_decode_work_total_sequence_len = null;
-        lease.prefill_chunk_size = self.recommendPrefillChunkForUnlocked(lease.request_id);
+        if (!lease.prefill_chunk_plan.isAdmitted()) {
+            lease.prefill_chunk_size = self.recommendPrefillChunkForUnlocked(lease.request_id);
+        }
     }
 
     pub fn noteDecodeProgress(self: *NativeGenerateCoordinator, lease: *Lease, generated_tokens: usize) void {
@@ -1228,6 +1433,115 @@ test "native generate coordinator honors a per-request prefill ceiling" {
     defer coordinator.release(lease);
 
     try std.testing.expectEqual(@as(usize, 128), lease.prefill_chunk_size);
+}
+
+test "prefill chunk plan retains measured fixed schedule and marks tiny tail" {
+    const allocator = std.testing.allocator;
+    var plan = try PrefillChunkPlan.init(
+        allocator,
+        2051,
+        512,
+        900 * 1024 * 1024,
+        .sole_idle,
+        .fixed_ceiling,
+    );
+    defer plan.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 5), plan.chunks.len);
+    try std.testing.expectEqualSlices(
+        usize,
+        &.{ 512, 512, 512, 512, 3 },
+        &.{
+            plan.chunks[0].rows,
+            plan.chunks[1].rows,
+            plan.chunks[2].rows,
+            plan.chunks[3].rows,
+            plan.chunks[4].rows,
+        },
+    );
+    try std.testing.expectEqual(PrefillWeightRouteHint.prefer_quantized, plan.tail().weight_route_hint);
+    try std.testing.expectEqual(@as(usize, 0), plan.forced_drain_budget_bytes);
+    try std.testing.expect(plan.fingerprint != 0);
+    try plan.validate();
+}
+
+test "balanced prefill candidate avoids boundary micro tails" {
+    const allocator = std.testing.allocator;
+    const boundaries = [_]usize{ 511, 512, 513, 1023, 1024, 1025, 2047, 2048, 2049, 2051 };
+    for (boundaries) |prompt_tokens| {
+        var plan = try PrefillChunkPlan.init(
+            allocator,
+            prompt_tokens,
+            512,
+            1,
+            .sole_idle,
+            .balanced_candidate,
+        );
+        defer plan.deinit(allocator);
+        var total: usize = 0;
+        var min_rows: usize = std.math.maxInt(usize);
+        var max_rows: usize = 0;
+        for (plan.chunks) |chunk| {
+            total += chunk.rows;
+            min_rows = @min(min_rows, chunk.rows);
+            max_rows = @max(max_rows, chunk.rows);
+            try std.testing.expectEqual(PrefillWeightRouteHint.default, chunk.weight_route_hint);
+        }
+        try std.testing.expectEqual(prompt_tokens, total);
+        try std.testing.expect(max_rows - min_rows <= 1);
+        try plan.validate();
+    }
+
+    var canonical = try PrefillChunkPlan.init(
+        allocator,
+        2051,
+        512,
+        1,
+        .sole_idle,
+        .balanced_candidate,
+    );
+    defer canonical.deinit(allocator);
+    try std.testing.expectEqualSlices(
+        usize,
+        &.{ 411, 410, 410, 410, 410 },
+        &.{
+            canonical.chunks[0].rows,
+            canonical.chunks[1].rows,
+            canonical.chunks[2].rows,
+            canonical.chunks[3].rows,
+            canonical.chunks[4].rows,
+        },
+    );
+}
+
+test "admitted prefill plan remains immutable when a peer arrives" {
+    const allocator = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(allocator);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .max_idle_prefill_chunk_size = 512 });
+
+    var sole = try coordinator.acquire(.{
+        .requested_units = 1,
+        .prompt_bytes = 8_000,
+        .prompt_tokens = 2051,
+        .max_tokens = 300,
+    });
+    defer coordinator.release(sole);
+    try coordinator.admitPrefillChunkPlan(&sole, 2051, 512, 900 * 1024 * 1024, .fixed_ceiling);
+    const admitted_fingerprint = sole.prefill_chunk_plan.fingerprint;
+
+    const peer = try coordinator.acquire(.{
+        .requested_units = 1,
+        .prompt_bytes = 64,
+        .prompt_tokens = 16,
+        .max_tokens = 16,
+    });
+    defer coordinator.release(peer);
+    coordinator.notePrefillProgress(&sole, 512, 2051);
+
+    try std.testing.expectEqual(@as(usize, 512), sole.prefill_chunk_size);
+    try std.testing.expectEqual(admitted_fingerprint, sole.prefill_chunk_plan.fingerprint);
+    try std.testing.expectEqual(@as(usize, 3), sole.prefill_chunk_plan.tail().rows);
 }
 
 test "native generate coordinator shrinks a sole long request after a peer arrives" {

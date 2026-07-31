@@ -916,15 +916,23 @@ pub const ComputeBackend = struct {
     }
 
     /// Install a backend-provided device-write hook on `storage` if this
-    /// backend supports one (today: Metal + compressed KV dtypes). When the
-    /// backend can't accelerate device writes for the storage's geometry, the
-    /// call is a no-op and the storage continues using its host write path.
+    /// backend supports one. When the backend can't accelerate device writes
+    /// for the storage's dtype or geometry, the call is a no-op and the
+    /// storage continues using its host write path.
     pub fn provisionKvDeviceWriteHook(
         self: *const ComputeBackend,
         storage: *runtime.kv.storage_runtime.KvStorageRuntime,
     ) anyerror!void {
         const hook = self.vtable.provisionKvDeviceWriteHook orelse return;
         return hook(self.ptr, storage);
+    }
+
+    /// Start a request-scoped use of a shared compute backend. Backends with
+    /// request-local execution plans use this boundary to discard captured
+    /// addresses and other state that must never leak between requests.
+    pub fn beginRequest(self: *const ComputeBackend) anyerror!void {
+        const op = self.vtable.beginRequest orelse return;
+        return op(self.ptr);
     }
 
     /// Returns the backend's Io if it was constructed with one.  Free
@@ -996,6 +1004,11 @@ pub const ComputeBackend = struct {
         return op(self.ptr, label, input, kv_seq_len);
     }
 
+    pub fn debugCudaGraphPrepareGreedyTokenReplayInput(self: *const ComputeBackend, label: []const u8, input: CT, kv_seq_len: usize) !?CT {
+        const op = self.vtable.debugCudaGraphPrepareGreedyTokenReplayInput orelse return null;
+        return op(self.ptr, label, input, kv_seq_len);
+    }
+
     pub fn debugCudaGraphPrepareFinalHiddenReplayAuxInput(self: *const ComputeBackend, input: CT) !?CT {
         const op = self.vtable.debugCudaGraphPrepareFinalHiddenReplayAuxInput orelse return null;
         return op(self.ptr, input);
@@ -1025,11 +1038,14 @@ pub const ComputeBackend = struct {
         backendKind: *const fn (ctx: *anyopaque) BackendKind,
         deinitBackend: *const fn (ctx: *anyopaque) void,
         freeTensor: *const fn (ctx: *anyopaque, tensor: CT) void,
-        /// Optional backend-provided device-write hook installer. Metal sets
-        /// this to construct a MetalKvStorage when the storage config matches
-        /// its fast-path (polar4/turbo3 keys). Backends without a device KV
-        /// impl leave this null.
+        /// Optional backend-provided device-write hook installer. CUDA and
+        /// Metal use this when the storage config matches their device KV
+        /// fast paths; backends without a device KV implementation leave it
+        /// null.
         provisionKvDeviceWriteHook: ?*const fn (ctx: *anyopaque, storage: *runtime.kv.storage_runtime.KvStorageRuntime) anyerror!void = null,
+
+        /// Optional request boundary for shared backend implementations.
+        beginRequest: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 
         /// Optional accessor for the backend's stored Io.  Free functions that
         /// receive a `*const ComputeBackend` (rerank_api, kv compaction, etc.)
@@ -1061,6 +1077,7 @@ pub const ComputeBackend = struct {
         debugCudaGraphRegisterFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!void = null,
         debugCudaGraphRegisterFinalHiddenReplayAuxInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!void = null,
         debugCudaGraphPrepareFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, label: []const u8, input: CT, kv_seq_len: usize) anyerror!?CT = null,
+        debugCudaGraphPrepareGreedyTokenReplayInput: ?*const fn (ctx: *anyopaque, label: []const u8, input: CT, kv_seq_len: usize) anyerror!?CT = null,
         debugCudaGraphPrepareFinalHiddenReplayAuxInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
         debugCudaGraphReplayFinalHidden: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
         debugCudaGraphReplayFinalHiddenDiscard: ?*const fn (ctx: *anyopaque, input: CT) anyerror!bool = null,

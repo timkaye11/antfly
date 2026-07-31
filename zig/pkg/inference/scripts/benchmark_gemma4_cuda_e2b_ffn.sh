@@ -4,26 +4,32 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 inference_dir="$(cd "$script_dir/.." && pwd)"
 repo_dir="$(cd "$inference_dir/../../.." && pwd)"
-nvcc="${NVCC:-/usr/local/cuda-13.2/bin/nvcc}"
 zig_bin="${ZIG_BIN:-$repo_dir/.tools/zig-x86_64-linux-0.16.0/zig}"
 default_binary="$inference_dir/zig-out/bin/antfly-inference"
 binary="${ANTFLY_INFERENCE_BINARY:-$default_binary}"
 optimize="${OPTIMIZE:-ReleaseFast}"
-artifact_dir="${ARTIFACT_DIR:-/tmp/antfly-e2b-ffn-sm89}"
+artifact_dir="${ARTIFACT_DIR:-$inference_dir/src/ops/cuda/artifacts}"
 warmups="${WARMUPS:-20}"
 measure="${MEASURE:-200}"
 repeats="${REPEATS:-5}"
 
-if [[ ! -x "$nvcc" ]]; then
-  printf 'error: CUDA compiler is not executable: %s\n' "$nvcc" >&2
+if [[ ! -x "$zig_bin" ]]; then
+  printf 'error: Zig compiler is not executable: %s\n' "$zig_bin" >&2
+  exit 1
+fi
+(
+  cd "$inference_dir"
+  "$zig_bin" build quant-kernel-codegen -- --check
+)
+"$script_dir/regen-cuda-artifacts.sh" --check --sm89
+
+if [[ ! -f "$artifact_dir/inference_cuda_kernels_sm89.cubin" ]]; then
+  printf 'error: canonical SM89 artifact missing: %s\n' "$artifact_dir/inference_cuda_kernels_sm89.cubin" >&2
+  printf 'regenerate only via: %s --write --sm89\n' "$script_dir/regen-cuda-artifacts.sh" >&2
   exit 1
 fi
 
 if [[ -z "${ANTFLY_INFERENCE_BINARY+x}" ]]; then
-  if [[ ! -x "$zig_bin" ]]; then
-    printf 'error: Zig compiler is not executable: %s\n' "$zig_bin" >&2
-    exit 1
-  fi
   printf 'building CUDA benchmark binary (%s): %s\n' "$optimize" "$default_binary"
   (
     cd "$inference_dir"
@@ -52,27 +58,6 @@ if [[ ! -x "$binary" ]]; then
   printf 'error: inference binary is not executable: %s\n' "$binary" >&2
   exit 1
 fi
-
-mkdir -p "$artifact_dir"
-
-compile_candidate() {
-  local source="$1"
-  local output="$2"
-  "$nvcc" -cubin -arch=sm_89 "$inference_dir/$source" -o "$artifact_dir/$output"
-}
-
-compile_candidate \
-  src/ops/cuda/generated/quant_kernel_q4_0_pair_activation_q8_1_e2b_6144.cu \
-  antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1.sm89.cubin
-compile_candidate \
-  src/ops/cuda/generated/quant_kernel_q4_0_pair_activation_q8_1_e2b_12288.cu \
-  antfly_q4_0_pair_activation_q8_1_e2b_12288_mmv_v1.sm89.cubin
-compile_candidate \
-  src/ops/cuda/generated/quant_kernel_q4_0_down_q8_1_e2b_6144.cu \
-  antfly_q4_0_down_q8_1_e2b_6144_mmv_v1.sm89.cubin
-compile_candidate \
-  src/ops/cuda/generated/quant_kernel_q4_0_down_q8_1_e2b_12288.cu \
-  antfly_q4_0_down_q8_1_e2b_12288_mmv_v1.sm89.cubin
 
 cd "$repo_dir"
 exec "$binary" bench-cuda \

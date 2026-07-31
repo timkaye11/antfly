@@ -11632,6 +11632,20 @@ export interface components {
             /** @description ID of the tool call this message is responding to (only for role=tool) */
             tool_call_id?: string;
         };
+        /** @description Options that apply only to streamed generation responses. */
+        InferenceGenerateStreamOptions: {
+            /**
+             * @description When true, emit a final usage-only chunk before the `[DONE]` sentinel.
+             *     All preceding chunks carry null or omitted usage.
+             * @default false
+             */
+            include_usage?: boolean;
+        };
+        /** @description Typed options passed to the model's chat template. */
+        InferenceGenerateChatTemplateKwargs: {
+            /** @description Controls templates that support an `enable_thinking` variable. False asks the template to open a public/final response channel directly. Omitted preserves the model template's default behavior. */
+            enable_thinking?: boolean;
+        };
         InferenceGenerateRequest: {
             /**
              * @description Name of the generator model from models_dir/generators/
@@ -11669,6 +11683,15 @@ export interface components {
              * @default false
              */
             stream?: boolean;
+            stream_options?: components["schemas"]["InferenceGenerateStreamOptions"];
+            chat_template_kwargs?: components["schemas"]["InferenceGenerateChatTemplateKwargs"];
+            /**
+             * @description inference-native benchmarking and controlled-generation extension. When true, generation
+             *     does not stop on the model's end-of-sequence token and continues until another stop
+             *     condition, such as `max_tokens`, is reached. Omitted or false preserves normal EOS handling.
+             * @default false
+             */
+            ignore_eos?: boolean;
             /**
              * @description List of tools (functions) the model can call.
              *     Only supported by models with tool_call_format configured.
@@ -11887,6 +11910,12 @@ export interface components {
             created: number;
             model: string;
             choices: components["schemas"]["InferenceGenerateChunkChoice"][];
+            /**
+             * @description Authoritative token accounting. When `stream_options.include_usage` is true,
+             *     streaming responses emit this only on the final chunk, after the finish chunk
+             *     and before the `[DONE]` sentinel; that chunk has an empty `choices` array.
+             */
+            usage?: components["schemas"]["InferenceGenerateUsage"] | null;
             speculation?: components["schemas"]["InferenceGenerateSpeculationStatus"] | null;
         };
         InferenceGenerateChunkChoice: {

@@ -17,7 +17,9 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.inference_chat_message import InferenceChatMessage
+    from ..models.inference_generate_chat_template_kwargs import InferenceGenerateChatTemplateKwargs
     from ..models.inference_generate_response_format import InferenceGenerateResponseFormat
+    from ..models.inference_generate_stream_options import InferenceGenerateStreamOptions
     from ..models.inference_tool import InferenceTool
     from ..models.inference_tool_choice_type_1 import InferenceToolChoiceType1
 
@@ -37,6 +39,15 @@ class InferenceGenerateRequest:
         top_p (float | Unset): Nucleus sampling probability Default: 0.0.
         top_k (int | Unset): Top-k sampling (inference extension, not in OpenAI API) Default: 0.
         stream (bool | Unset): If true, partial message deltas will be sent as SSE events Default: False.
+        stream_options (InferenceGenerateStreamOptions | Unset): Options that apply only to streamed generation
+            responses.
+        chat_template_kwargs (InferenceGenerateChatTemplateKwargs | Unset): Typed options passed to the model's chat
+            template.
+        ignore_eos (bool | Unset): inference-native benchmarking and controlled-generation extension. When true,
+            generation
+            does not stop on the model's end-of-sequence token and continues until another stop
+            condition, such as `max_tokens`, is reached. Omitted or false preserves normal EOS handling.
+             Default: False.
         tools (list[InferenceTool] | Unset): List of tools (functions) the model can call.
             Only supported by models with tool_call_format configured.
         min_p (float | Unset): Min-p sampling threshold. Filters tokens where p < min_p * max_p. Simpler alternative to
@@ -106,6 +117,9 @@ class InferenceGenerateRequest:
     top_p: float | Unset = 0.0
     top_k: int | Unset = 0
     stream: bool | Unset = False
+    stream_options: InferenceGenerateStreamOptions | Unset = UNSET
+    chat_template_kwargs: InferenceGenerateChatTemplateKwargs | Unset = UNSET
+    ignore_eos: bool | Unset = False
     tools: list[InferenceTool] | Unset = UNSET
     min_p: float | Unset = 0.0
     repetition_penalty: float | Unset = 1.0
@@ -144,6 +158,16 @@ class InferenceGenerateRequest:
         top_k = self.top_k
 
         stream = self.stream
+
+        stream_options: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.stream_options, Unset):
+            stream_options = self.stream_options.to_dict()
+
+        chat_template_kwargs: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.chat_template_kwargs, Unset):
+            chat_template_kwargs = self.chat_template_kwargs.to_dict()
+
+        ignore_eos = self.ignore_eos
 
         tools: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.tools, Unset):
@@ -226,6 +250,12 @@ class InferenceGenerateRequest:
             field_dict["top_k"] = top_k
         if stream is not UNSET:
             field_dict["stream"] = stream
+        if stream_options is not UNSET:
+            field_dict["stream_options"] = stream_options
+        if chat_template_kwargs is not UNSET:
+            field_dict["chat_template_kwargs"] = chat_template_kwargs
+        if ignore_eos is not UNSET:
+            field_dict["ignore_eos"] = ignore_eos
         if tools is not UNSET:
             field_dict["tools"] = tools
         if min_p is not UNSET:
@@ -270,7 +300,9 @@ class InferenceGenerateRequest:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.inference_chat_message import InferenceChatMessage
+        from ..models.inference_generate_chat_template_kwargs import InferenceGenerateChatTemplateKwargs
         from ..models.inference_generate_response_format import InferenceGenerateResponseFormat
+        from ..models.inference_generate_stream_options import InferenceGenerateStreamOptions
         from ..models.inference_tool import InferenceTool
         from ..models.inference_tool_choice_type_1 import InferenceToolChoiceType1
 
@@ -293,6 +325,22 @@ class InferenceGenerateRequest:
         top_k = d.pop("top_k", UNSET)
 
         stream = d.pop("stream", UNSET)
+
+        _stream_options = d.pop("stream_options", UNSET)
+        stream_options: InferenceGenerateStreamOptions | Unset
+        if isinstance(_stream_options, Unset):
+            stream_options = UNSET
+        else:
+            stream_options = InferenceGenerateStreamOptions.from_dict(_stream_options)
+
+        _chat_template_kwargs = d.pop("chat_template_kwargs", UNSET)
+        chat_template_kwargs: InferenceGenerateChatTemplateKwargs | Unset
+        if isinstance(_chat_template_kwargs, Unset):
+            chat_template_kwargs = UNSET
+        else:
+            chat_template_kwargs = InferenceGenerateChatTemplateKwargs.from_dict(_chat_template_kwargs)
+
+        ignore_eos = d.pop("ignore_eos", UNSET)
 
         _tools = d.pop("tools", UNSET)
         tools: list[InferenceTool] | Unset = UNSET
@@ -399,6 +447,9 @@ class InferenceGenerateRequest:
             top_p=top_p,
             top_k=top_k,
             stream=stream,
+            stream_options=stream_options,
+            chat_template_kwargs=chat_template_kwargs,
+            ignore_eos=ignore_eos,
             tools=tools,
             min_p=min_p,
             repetition_penalty=repetition_penalty,

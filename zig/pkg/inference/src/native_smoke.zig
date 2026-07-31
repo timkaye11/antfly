@@ -192,7 +192,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     };
     var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
     budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
-    budget_limits = applyBudgetOverrides(budget_limits, opts);
+    budget_limits = try applyBudgetOverrides(budget_limits, opts);
     var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
     const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
         .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config },
@@ -574,7 +574,7 @@ fn preflightModelLoadBudget(
         limits,
         predicted_backend_type,
     );
-    limits = applyBudgetOverrides(limits, opts);
+    limits = try applyBudgetOverrides(limits, opts);
     var run_budget = runtime.tier.memory.RunBudget.init(limits);
     _ = run_budget.tryReserveWeight(reservation_tier, weight_bytes) catch |err| {
         if (err == error.MemoryBudgetExceeded) {
@@ -829,14 +829,14 @@ fn printUsage() void {
     , .{});
 }
 
-fn applyBudgetOverrides(defaults: runtime.tier.memory.Limits, opts: Options) runtime.tier.memory.Limits {
-    var limits = defaults;
-    if (opts.host_budget_mb > 0) limits.host_limit_bytes = opts.host_budget_mb * 1024 * 1024;
-    if (opts.backend_budget_mb > 0) limits.backend_limit_bytes = opts.backend_budget_mb * 1024 * 1024;
-    if (opts.combined_budget_mb > 0) limits.combined_limit_bytes = opts.combined_budget_mb * 1024 * 1024;
-    if (opts.kv_budget_mb > 0) limits.kv_limit_bytes = opts.kv_budget_mb * 1024 * 1024;
-    if (opts.scratch_budget_mb > 0) limits.scratch_limit_bytes = opts.scratch_budget_mb * 1024 * 1024;
-    return limits;
+fn applyBudgetOverrides(defaults: runtime.tier.memory.Limits, opts: Options) !runtime.tier.memory.Limits {
+    return (runtime.tier.memory.BudgetOverridesMib{
+        .host = opts.host_budget_mb,
+        .backend = opts.backend_budget_mb,
+        .combined = opts.combined_budget_mb,
+        .kv = opts.kv_budget_mb,
+        .scratch = opts.scratch_budget_mb,
+    }).apply(defaults);
 }
 
 fn countPromptTokens(attention_mask: anytype) usize {

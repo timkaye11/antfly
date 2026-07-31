@@ -2705,6 +2705,28 @@ components:
         tool_call_id:
           type: string
           description: ID of the tool call this message is responding to (only for role=tool)
+    GenerateStreamOptions:
+      type: object
+      description: Options that apply only to streamed generation responses.
+      properties:
+        include_usage:
+          type: boolean
+          description: |
+            When true, emit a final usage-only chunk before the `[DONE]` sentinel.
+            All preceding chunks carry null or omitted usage.
+          default: false
+    GenerateChatTemplateKwargs:
+      type: object
+      additionalProperties: false
+      description: Typed options passed to the model's chat template.
+      properties:
+        enable_thinking:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: |
+            Controls templates that support an `enable_thinking` variable. False asks the
+            template to open a public/final response channel directly. Omitted preserves the
+            model template's default behavior.
     GenerateRequest:
       type: object
       required:
@@ -2754,6 +2776,17 @@ components:
         stream:
           type: boolean
           description: If true, partial message deltas will be sent as SSE events
+          default: false
+        stream_options:
+          $ref: '#/components/schemas/GenerateStreamOptions'
+        chat_template_kwargs:
+          $ref: '#/components/schemas/GenerateChatTemplateKwargs'
+        ignore_eos:
+          type: boolean
+          description: |
+            inference-native benchmarking and controlled-generation extension. When true, generation
+            does not stop on the model's end-of-sequence token and continues until another stop
+            condition, such as `max_tokens`, is reached. Omitted or false preserves normal EOS handling.
           default: false
         tools:
           type: array
@@ -3134,6 +3167,15 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/GenerateChunkChoice'
+        usage:
+          x-go-type-skip-optional-pointer: false
+          nullable: true
+          description: |
+            Authoritative token accounting. When `stream_options.include_usage` is true,
+            streaming responses emit this only on the final chunk, after the finish chunk
+            and before the `[DONE]` sentinel; that chunk has an empty `choices` array.
+          allOf:
+            - $ref: '#/components/schemas/GenerateUsage'
         speculation:
           x-go-type-skip-optional-pointer: false
           nullable: true

@@ -91,6 +91,19 @@ fn shouldSkipAutoMtpDraftLoad(config: generation.GenerationConfig, draft_cfg: gp
     return requested_max_tokens < generation.gemma4MtpAutoMinGenerationTokens();
 }
 
+fn requiresNativeChannelProjection(config: gpt_model_mod.Config) bool {
+    return config.family == .gemma and config.hasPle();
+}
+
+test "channel-aware Gemma generation stays on projected native backends" {
+    try std.testing.expect(!requiresNativeChannelProjection(.{}));
+    try std.testing.expect(!requiresNativeChannelProjection(.{ .family = .gemma }));
+    try std.testing.expect(requiresNativeChannelProjection(.{
+        .family = .gemma,
+        .ple_hidden_size = 256,
+    }));
+}
+
 const GenerateSpeculationOptions = struct {
     k: u32,
     policy: generation.SpeculationPolicy,
@@ -445,6 +458,64 @@ test "concurrent first prompt cache activations share the node budget" {
     try std.testing.expect(!second.prompt_prefix_cache.isParticipating());
 }
 
+fn chatTemplateKwargsValueIsValid(value: std.json.Value) bool {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return false,
+    };
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "enable_thinking")) return false;
+        switch (entry.value_ptr.*) {
+            .bool => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+fn generateRequestChatTemplateKwargsAreValid(value: std.json.Value) bool {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return true,
+    };
+    const kwargs = object.get("chat_template_kwargs") orelse return true;
+    return chatTemplateKwargsValueIsValid(kwargs);
+}
+
+fn rawGenerateChatTemplateKwargsAreValid(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    batch: bool,
+) bool {
+    // Cheap pre-gate: the field cannot be present when its name never appears in
+    // the raw body, so skip the full Value parse (substring false positives just
+    // fall through to the full validation below).
+    if (std.mem.indexOf(u8, raw, "chat_template_kwargs") == null) return true;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return true;
+    defer parsed.deinit();
+    if (!batch) return generateRequestChatTemplateKwargsAreValid(parsed.value);
+
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return true,
+    };
+    const requests_value = root.get("requests") orelse return true;
+    const requests = switch (requests_value) {
+        .array => |array| array,
+        else => return true,
+    };
+    for (requests.items) |item| {
+        const item_object = switch (item) {
+            .object => |object| object,
+            else => continue,
+        };
+        const request_body = item_object.get("body") orelse continue;
+        if (!generateRequestChatTemplateKwargsAreValid(request_body)) return false;
+    }
+    return true;
+}
+
 pub const NodeConfig = struct {
     models_dir: []const u8 = "./models",
     ml_dir: []const u8 = "./ml",
@@ -557,6 +628,25 @@ pub const GenerationBatchingConfig = struct {
         };
     }
 };
+
+fn logAdmittedPrefillChunkPlan(plan: runtime.scheduler.native_generate.PrefillChunkPlan) void {
+    const tail = plan.tail();
+    std.log.info(
+        "prefill_chunk_plan: status=admitted fingerprint={x} selection={s} fairness={s} prompt_tokens={d} chunks={d} max_chunk_rows={d} max_scratch_bytes={d} forced_drain_budget_bytes={d} tail_rows={d} tail_weight_route={s}",
+        .{
+            plan.fingerprint,
+            @tagName(plan.selection),
+            @tagName(plan.fairness),
+            plan.prompt_tokens,
+            plan.chunks.len,
+            plan.max_chunk_rows,
+            plan.max_scratch_bytes,
+            plan.forced_drain_budget_bytes,
+            tail.rows,
+            @tagName(tail.weight_route_hint),
+        },
+    );
+}
 
 fn promptCacheEligibleForNativeRequest(
     enabled: bool,
@@ -946,6 +1036,16 @@ fn tokenUsage(prompt_tokens: usize, completion_tokens: usize) api.GenerateUsage 
         .completion_tokens = @intCast(completion_tokens),
         .total_tokens = @intCast(prompt_tokens + completion_tokens),
     };
+}
+
+fn tokenUsageWithCachedPrompt(
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    cached_prompt_tokens: usize,
+) api.GenerateUsage {
+    var usage = tokenUsage(prompt_tokens, completion_tokens);
+    usage.cached_prompt_tokens = if (cached_prompt_tokens == 0) null else @intCast(cached_prompt_tokens);
+    return usage;
 }
 
 fn estimateTextTokens(text: []const u8) usize {
@@ -1347,8 +1447,9 @@ fn addCompatibilityManifestFacts(
     man: *const manifest_mod.ModelManifest,
 ) void {
     const model_type: u8 = @intFromEnum(man.model_type);
+    const model_type_origin: u8 = @intFromEnum(man.model_type_origin);
     const native_arch_hint: u8 = @intFromEnum(man.native_arch_hint);
-    signature.update(&.{ model_type, native_arch_hint });
+    signature.update(&.{ model_type, model_type_origin, native_arch_hint });
     updateCompatibilitySignatureSlice(signature, man.config_model_arch);
     updateCompatibilitySignatureSlice(signature, man.gliner_model_type);
     updateCompatibilitySignatureSlice(signature, man.inference_bundle_family);
@@ -3933,10 +4034,11 @@ pub const Node = struct {
         messages: []const generation.Message,
         max_tokens: i32,
         speculative_bonus_tokens: usize,
+        enable_thinking: ?bool,
     ) !usize {
         _ = self;
         const prompt = if (model.chat_tmpl) |ct|
-            try ct.apply(allocator, messages, true)
+            try ct.applyWithOptions(allocator, messages, .{ .enable_thinking = enable_thinking })
         else
             try generation.formatMessages(allocator, messages);
         defer allocator.free(prompt);
@@ -4462,6 +4564,14 @@ pub const Node = struct {
     }
 
     pub fn generateContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const raw_body = (try ctx.body()) orelse
+            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+        if (!rawGenerateChatTemplateKwargsAreValid(ctx.allocator, raw_body, false)) {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "chat_template_kwargs accepts only a boolean enable_thinking field",
+            });
+        }
         var parsed = (try ctx.parseJson(api.GenerateRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -4680,6 +4790,10 @@ pub const Node = struct {
         if (requested_draft_model_name != null) self.metrics.incSpeculationRequested();
 
         const want_stream = body.stream orelse false;
+        const include_stream_usage = want_stream and (if (body.stream_options) |options|
+            options.include_usage orelse false
+        else
+            false);
         // Caching requires an explicit non-empty key: keyless requests would all
         // share one per-model namespace, leaking prompt presence across callers.
         const prompt_cache_key: ?[]const u8 = if (body.prompt_cache_key) |key|
@@ -4690,6 +4804,8 @@ pub const Node = struct {
 
         var config = generation.GenerationConfig{
             .max_tokens = configured_max_tokens,
+            .ignore_eos = body.ignore_eos orelse false,
+            .enable_thinking = if (body.chat_template_kwargs) |kwargs| kwargs.enable_thinking else null,
             .temperature = sampling.temperature,
             .top_p = sampling.top_p,
             .top_k = numeric.top_k,
@@ -4805,6 +4921,13 @@ pub const Node = struct {
             defer pipeline.deinit();
             pipeline.prompt_override = if (prompt_override) |prompt| prompt else null;
 
+            if (requiresNativeChannelProjection(pipeline.gpt_config)) {
+                return ctx.status(400).json(.{
+                    .@"error" = "UNSUPPORTED_FEATURE",
+                    .message = "channel-aware Gemma generation requires the native, Metal, or CUDA backend",
+                });
+            }
+
             if (config.grammar != null) {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
@@ -4813,7 +4936,15 @@ pub const Node = struct {
             }
 
             if (want_stream) {
-                return self.streamGenerate(ctx, body.model, &pipeline, messages.items, config, if (tool_parser) |*parser| parser else null);
+                return self.streamGenerate(
+                    ctx,
+                    body.model,
+                    &pipeline,
+                    messages.items,
+                    config,
+                    if (tool_parser) |*parser| parser else null,
+                    include_stream_usage,
+                );
             }
 
             var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
@@ -4868,9 +4999,28 @@ pub const Node = struct {
             const ort_model_dir = ortgenai.prepareGenerativeModelPackage(ctx.allocator, model_path) catch null;
             defer if (ort_model_dir) |prepared| ctx.allocator.free(prepared);
             if (ort_model_dir) |prepared_model_dir| {
+                if (config.ignore_eos) {
+                    return ctx.status(400).json(.{
+                        .@"error" = "UNSUPPORTED_FEATURE",
+                        .message = "ignore_eos is not supported by the ONNX Runtime GenAI backend",
+                    });
+                }
                 var ort_manifest = manifest_mod.loadFromDir(ctx.allocator, prepared_model_dir) catch |err|
                     return modelLoadFailureResponse(ctx, err);
                 defer ort_manifest.deinit();
+                const ort_gpt_config = session_factory.loadGptConfigFromModelDir(
+                    ctx.allocator,
+                    prepared_model_dir,
+                    ort_manifest,
+                ) catch null;
+                if (ort_gpt_config) |gpt_config| {
+                    if (requiresNativeChannelProjection(gpt_config)) {
+                        return ctx.status(400).json(.{
+                            .@"error" = "UNSUPPORTED_FEATURE",
+                            .message = "channel-aware Gemma generation requires the native, Metal, or CUDA backend",
+                        });
+                    }
+                }
 
                 const use_functiongemma_prompt_override = if (tool_parser) |*parser|
                     std.mem.eql(u8, parser.name(), "functiongemma")
@@ -4924,7 +5074,15 @@ pub const Node = struct {
                 }
 
                 if (want_stream) {
-                    return self.streamGenerate(ctx, body.model, &pipeline, messages.items, config, if (tool_parser) |*parser| parser else null);
+                    return self.streamGenerate(
+                        ctx,
+                        body.model,
+                        &pipeline,
+                        messages.items,
+                        config,
+                        if (tool_parser) |*parser| parser else null,
+                        include_stream_usage,
+                    );
                 }
 
                 var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
@@ -5038,6 +5196,7 @@ pub const Node = struct {
             messages.items,
             configured_max_tokens,
             if (config.speculation_requested and config.speculation_policy != .off and config.speculative_k > 0) 1 else 0,
+            config.enable_thinking,
         ) catch |err| {
             if (err == error.PromptTooLong) {
                 return ctx.status(400).json(.{
@@ -5235,7 +5394,7 @@ pub const Node = struct {
             config.speculation_policy != .off and
             config.speculative_k > 0) 1 else 0;
         const budget_max_tokens = @as(usize, @intCast(@max(config.max_tokens, 1))) + speculative_budget_bonus;
-        config.prefill_chunk_size = runtime.tier.memory.reserveGptGenerationAtLargestChunk(
+        const prefill_admission = runtime.tier.memory.reserveGptGenerationPrefill(
             &run_budget,
             budget_components[0..budget_component_count],
             prompt_tokens,
@@ -5250,6 +5409,45 @@ pub const Node = struct {
             }
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
         };
+        config.prefill_chunk_size = prefill_admission.max_chunk_rows;
+        var standalone_prefill_plan: ?runtime.scheduler.native_generate.PrefillChunkPlan = null;
+        defer if (standalone_prefill_plan) |*plan| plan.deinit(ctx.allocator);
+        const prefill_plan_applicable = !generation.messagesHaveImages(messages.items) and
+            !generation.messagesHaveAudio(messages.items) and
+            !(effective_compiled_partition_backend != null and
+                effective_compiled_attachment_target == .whole_model);
+        if (prefill_plan_applicable) {
+            if (model.native_generate_coordinator) |coordinator| {
+                if (native_generate_lease) |*lease| {
+                    coordinator.admitPrefillChunkPlan(
+                        lease,
+                        prompt_tokens,
+                        prefill_admission.max_chunk_rows,
+                        prefill_admission.max_scratch_bytes,
+                        .fixed_ceiling,
+                    ) catch |err| return ctx.status(500).json(.{
+                        .@"error" = "BACKEND_ERROR",
+                        .message = internalErrorMessage("PREFILL_PLAN_ADMISSION_FAILED", err),
+                    });
+                    config.prefill_chunk_plan = lease.prefill_chunk_plan;
+                }
+            }
+            if (config.prefill_chunk_plan == null) {
+                standalone_prefill_plan = runtime.scheduler.native_generate.PrefillChunkPlan.init(
+                    ctx.allocator,
+                    prompt_tokens,
+                    prefill_admission.max_chunk_rows,
+                    prefill_admission.max_scratch_bytes,
+                    .sole_idle,
+                    .fixed_ceiling,
+                ) catch |err| return ctx.status(500).json(.{
+                    .@"error" = "BACKEND_ERROR",
+                    .message = internalErrorMessage("PREFILL_PLAN_ADMISSION_FAILED", err),
+                });
+                config.prefill_chunk_plan = standalone_prefill_plan.?;
+            }
+            logAdmittedPrefillChunkPlan(config.prefill_chunk_plan.?);
+        }
         const resource_estimate = try runtime.tier.memory.estimateGptGeneration(
             backend_kind,
             kv_dtype,
@@ -5501,7 +5699,15 @@ pub const Node = struct {
         };
 
         if (want_stream) {
-            return self.streamGenerate(ctx, body.model, &pipeline, messages.items, config, if (tool_parser) |*parser| parser else null);
+            return self.streamGenerate(
+                ctx,
+                body.model,
+                &pipeline,
+                messages.items,
+                config,
+                if (tool_parser) |*parser| parser else null,
+                include_stream_usage,
+            );
         }
 
         var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
@@ -5853,6 +6059,8 @@ pub const Node = struct {
         );
         var config = generation.GenerationConfig{
             .max_tokens = numeric.max_tokens,
+            .ignore_eos = body.ignore_eos orelse false,
+            .enable_thinking = if (body.chat_template_kwargs) |kwargs| kwargs.enable_thinking else null,
             .temperature = sampling.temperature,
             .top_p = sampling.top_p,
             .top_k = numeric.top_k,
@@ -6109,6 +6317,14 @@ pub const Node = struct {
     }
 
     pub fn generateBatchContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const raw_body = (try ctx.body()) orelse
+            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+        if (!rawGenerateChatTemplateKwargsAreValid(ctx.allocator, raw_body, true)) {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "chat_template_kwargs accepts only a boolean enable_thinking field",
+            });
+        }
         var parsed = (try ctx.parseJson(api.GenerateBatchRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -6311,6 +6527,7 @@ pub const Node = struct {
                         owned_messages[idx].messages,
                         configs[pos].max_tokens,
                         if (configs[pos].speculation_requested and configs[pos].speculation_policy != .off and configs[pos].speculative_k > 0) 1 else 0,
+                        configs[pos].enable_thinking,
                     ) catch |err| {
                         results[idx].@"error" = if (err == error.PromptTooLong)
                             .{
@@ -6348,6 +6565,11 @@ pub const Node = struct {
                 ));
                 var leases = try ctx.allocator.alloc(runtime.scheduler.native_generate.Lease, group_indices.items.len);
                 for (leases) |*lease| lease.* = .{ .request_id = 0, .reserved_units = 0, .prompt_bytes = 0, .max_tokens = 0, .prefill_chunk_size = 0, .active_requests_snapshot = 0 };
+                const standalone_prefill_plans = try ctx.allocator.alloc(
+                    ?runtime.scheduler.native_generate.PrefillChunkPlan,
+                    group_indices.items.len,
+                );
+                @memset(standalone_prefill_plans, null);
                 defer {
                     if (model.native_generate_coordinator) |coordinator| {
                         for (leases) |*lease| {
@@ -6357,6 +6579,10 @@ pub const Node = struct {
                             }
                         }
                     }
+                    for (standalone_prefill_plans) |*maybe_plan| {
+                        if (maybe_plan.*) |*plan| plan.deinit(ctx.allocator);
+                    }
+                    ctx.allocator.free(standalone_prefill_plans);
                     ctx.allocator.free(leases);
                 }
                 if (model.native_generate_coordinator) |coordinator| {
@@ -6435,7 +6661,7 @@ pub const Node = struct {
                         configs[pos].speculative_k > 0) 1 else 0;
                     const budget_max_tokens = @as(usize, @intCast(@max(configs[pos].max_tokens, 1))) + speculative_budget_bonus;
                     var sizing_budget = runtime.tier.memory.RunBudget.init(budget_limits);
-                    configs[pos].prefill_chunk_size = runtime.tier.memory.reserveGptGenerationAtLargestChunk(
+                    const prefill_admission = runtime.tier.memory.reserveGptGenerationPrefill(
                         &sizing_budget,
                         &budget_components,
                         prompt_tokens[pos],
@@ -6454,6 +6680,46 @@ pub const Node = struct {
                         }
                         continue;
                     };
+                    configs[pos].prefill_chunk_size = prefill_admission.max_chunk_rows;
+                    if (model.native_generate_coordinator) |coordinator| {
+                        coordinator.admitPrefillChunkPlan(
+                            &leases[pos],
+                            prompt_tokens[pos],
+                            prefill_admission.max_chunk_rows,
+                            prefill_admission.max_scratch_bytes,
+                            .fixed_ceiling,
+                        ) catch |err| {
+                            results[idx].@"error" = .{
+                                .code = "PREFILL_PLAN_ADMISSION_FAILED",
+                                .message = @errorName(err),
+                                .retryable = false,
+                            };
+                            pending[idx] = false;
+                            coordinator.release(leases[pos]);
+                            leases[pos].request_id = 0;
+                            continue;
+                        };
+                        configs[pos].prefill_chunk_plan = leases[pos].prefill_chunk_plan;
+                    } else {
+                        standalone_prefill_plans[pos] = runtime.scheduler.native_generate.PrefillChunkPlan.init(
+                            ctx.allocator,
+                            prompt_tokens[pos],
+                            prefill_admission.max_chunk_rows,
+                            prefill_admission.max_scratch_bytes,
+                            if (valid_count == 1) .sole_idle else .shared,
+                            .fixed_ceiling,
+                        ) catch |err| {
+                            results[idx].@"error" = .{
+                                .code = "PREFILL_PLAN_ADMISSION_FAILED",
+                                .message = @errorName(err),
+                                .retryable = false,
+                            };
+                            pending[idx] = false;
+                            continue;
+                        };
+                        configs[pos].prefill_chunk_plan = standalone_prefill_plans[pos].?;
+                    }
+                    logAdmittedPrefillChunkPlan(configs[pos].prefill_chunk_plan.?);
                     const resource_estimate = runtime.tier.memory.estimateGptGeneration(
                         backend_kind,
                         kv_dtype,
@@ -6788,6 +7054,7 @@ pub const Node = struct {
         model_name: []const u8,
         result: *@import("../pipelines/generation.zig").GenerationResult,
         tool_parser: ?*tool_parser_mod.Parser,
+        include_usage: bool,
     ) !httpx.Response {
         var writer = ctx.streamResponse(200) catch |err| {
             std.debug.print("streamResponse failed: {}\n", .{err});
@@ -6818,7 +7085,21 @@ pub const Node = struct {
             writer.close() catch {};
             return ctx.response.build();
         };
-        writer.writeEvent(null, "[DONE]") catch {};
+        emitTerminalUsageOrDone(
+            &writer,
+            ctx.allocator,
+            stream_id,
+            stream_created,
+            model_name,
+            result.prompt_tokens,
+            result.tokens_used,
+            result.cached_prompt_tokens,
+            include_usage,
+        ) catch |err| {
+            writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+            writer.close() catch {};
+            return ctx.response.build();
+        };
         writer.close() catch {};
         return ctx.response.build();
     }
@@ -6994,12 +7275,7 @@ pub const Node = struct {
             .created = created,
             .model = model_name,
             .choices = &choices,
-            .usage = .{
-                .prompt_tokens = @intCast(prompt_tokens),
-                .completion_tokens = @intCast(completion_tokens),
-                .total_tokens = @intCast(prompt_tokens + completion_tokens),
-                .cached_prompt_tokens = if (cached_prompt_tokens == 0) null else @intCast(cached_prompt_tokens),
-            },
+            .usage = tokenUsageWithCachedPrompt(prompt_tokens, completion_tokens, cached_prompt_tokens),
             .speculation = generateSpeculationStatus(speculative),
         });
     }
@@ -7061,6 +7337,7 @@ pub const Node = struct {
         messages: []const @import("../pipelines/generation.zig").Message,
         config: @import("../pipelines/generation.zig").GenerationConfig,
         tool_parser: ?*tool_parser_mod.Parser,
+        include_usage: bool,
     ) !httpx.Response {
         var writer = ctx.streamResponse(200) catch |err| {
             std.debug.print("streamResponse failed: {}\n", .{err});
@@ -7168,11 +7445,28 @@ pub const Node = struct {
                 return ctx.response.build();
             };
         } else {
-            emitFinishDelta(&writer, ctx.allocator, stream_id, stream_created, model_name, result.finish_reason, speculative) catch {};
+            emitFinishDelta(&writer, ctx.allocator, stream_id, stream_created, model_name, result.finish_reason, speculative) catch |err| {
+                writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                writer.close() catch {};
+                return ctx.response.build();
+            };
         }
 
-        // Send the final [DONE] event (OpenAI convention)
-        writer.writeEvent(null, "[DONE]") catch {};
+        emitTerminalUsageOrDone(
+            &writer,
+            ctx.allocator,
+            stream_id,
+            stream_created,
+            model_name,
+            result.prompt_tokens,
+            result.tokens_used,
+            result.cached_prompt_tokens,
+            include_usage,
+        ) catch |err| {
+            writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+            writer.close() catch {};
+            return ctx.response.build();
+        };
         writer.close() catch {};
 
         return ctx.response.build();
@@ -7245,7 +7539,7 @@ pub const Node = struct {
     }
 
     fn writeGenerateChunkEvent(
-        writer: *httpx.Context.StreamWriter,
+        writer: anytype,
         allocator: std.mem.Allocator,
         chunk: api.GenerateChunk,
     ) !void {
@@ -7345,7 +7639,7 @@ pub const Node = struct {
     }
 
     fn emitFinishDelta(
-        writer: *httpx.Context.StreamWriter,
+        writer: anytype,
         allocator: std.mem.Allocator,
         stream_id: []const u8,
         stream_created: i64,
@@ -7366,6 +7660,53 @@ pub const Node = struct {
             .choices = &choices,
             .speculation = generateSpeculationStatus(speculative),
         });
+    }
+
+    fn emitTerminalUsageAndDone(
+        writer: anytype,
+        allocator: std.mem.Allocator,
+        stream_id: []const u8,
+        stream_created: i64,
+        model_name: []const u8,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        cached_prompt_tokens: usize,
+    ) !void {
+        try writeGenerateChunkEvent(writer, allocator, .{
+            .id = stream_id,
+            .object = "chat.completion.chunk",
+            .created = stream_created,
+            .model = model_name,
+            .choices = &.{},
+            .usage = tokenUsageWithCachedPrompt(prompt_tokens, completion_tokens, cached_prompt_tokens),
+        });
+        try writer.writeEvent(null, "[DONE]");
+    }
+
+    fn emitTerminalUsageOrDone(
+        writer: anytype,
+        allocator: std.mem.Allocator,
+        stream_id: []const u8,
+        stream_created: i64,
+        model_name: []const u8,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        cached_prompt_tokens: usize,
+        include_usage: bool,
+    ) !void {
+        if (include_usage) {
+            return emitTerminalUsageAndDone(
+                writer,
+                allocator,
+                stream_id,
+                stream_created,
+                model_name,
+                prompt_tokens,
+                completion_tokens,
+                cached_prompt_tokens,
+            );
+        }
+        try writer.writeEvent(null, "[DONE]");
     }
 
     pub fn recognizeEntities(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -10396,6 +10737,208 @@ test "generate sampling options validate the HTTP trust boundary" {
     try std.testing.expectError(error.InvalidRepetitionPenalty, parseGenerateSamplingOptions(null, null, null, 0, null, null));
     try std.testing.expectError(error.InvalidFrequencyPenalty, parseGenerateSamplingOptions(null, null, null, null, -2.01, null));
     try std.testing.expectError(error.InvalidPresencePenalty, parseGenerateSamplingOptions(null, null, null, null, null, 2.01));
+}
+
+test "generation SSE usage chunk serializes authoritative accounting" {
+    const allocator = std.testing.allocator;
+    const payload = try std.json.Stringify.valueAlloc(allocator, api.GenerateChunk{
+        .id = "chatcmpl-test",
+        .object = "chat.completion.chunk",
+        .created = 42,
+        .model = "gemma-4",
+        .choices = &.{},
+        .usage = tokenUsageWithCachedPrompt(2003, 300, 512),
+    }, .{});
+    defer allocator.free(payload);
+
+    var parsed = try std.json.parseFromSlice(api.GenerateChunk, allocator, payload, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.choices.len);
+    const usage = parsed.value.usage orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(i64, 2003), usage.prompt_tokens);
+    try std.testing.expectEqual(@as(i64, 300), usage.completion_tokens);
+    try std.testing.expectEqual(@as(i64, 2303), usage.total_tokens);
+    try std.testing.expectEqual(@as(?i64, 512), usage.cached_prompt_tokens);
+
+    const uncached = tokenUsageWithCachedPrompt(7, 3, 0);
+    try std.testing.expectEqual(@as(?i64, null), uncached.cached_prompt_tokens);
+}
+
+test "generation SSE orders finish then usage then done" {
+    const allocator = std.testing.allocator;
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        events: std.ArrayListUnmanaged([]u8) = .empty,
+
+        fn deinit(self: *@This()) void {
+            for (self.events.items) |event| self.allocator.free(event);
+            self.events.deinit(self.allocator);
+        }
+
+        fn writeEvent(self: *@This(), event_name: ?[]const u8, data: []const u8) !void {
+            try std.testing.expect(event_name == null);
+            const owned = try self.allocator.dupe(u8, data);
+            errdefer self.allocator.free(owned);
+            try self.events.append(self.allocator, owned);
+        }
+    };
+
+    var capture = Capture{ .allocator = allocator };
+    defer capture.deinit();
+    try Node.emitFinishDelta(&capture, allocator, "chatcmpl-test", 42, "gemma-4", "length", null);
+    try Node.emitTerminalUsageAndDone(&capture, allocator, "chatcmpl-test", 42, "gemma-4", 2003, 300, 0);
+
+    try std.testing.expectEqual(@as(usize, 3), capture.events.items.len);
+    var finish = try std.json.parseFromSlice(api.GenerateChunk, allocator, capture.events.items[0], .{});
+    defer finish.deinit();
+    try std.testing.expectEqual(@as(usize, 1), finish.value.choices.len);
+    try std.testing.expectEqual(api.FinishReason.length, finish.value.choices[0].finish_reason.?);
+    try std.testing.expect(finish.value.usage == null);
+
+    var usage = try std.json.parseFromSlice(api.GenerateChunk, allocator, capture.events.items[1], .{});
+    defer usage.deinit();
+    try std.testing.expectEqual(@as(usize, 0), usage.value.choices.len);
+    try std.testing.expectEqual(@as(i64, 300), usage.value.usage.?.completion_tokens);
+    try std.testing.expectEqualStrings("[DONE]", capture.events.items[2]);
+}
+
+test "generation SSE omits usage unless requested" {
+    const allocator = std.testing.allocator;
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        events: std.ArrayListUnmanaged([]u8) = .empty,
+
+        fn deinit(self: *@This()) void {
+            for (self.events.items) |event| self.allocator.free(event);
+            self.events.deinit(self.allocator);
+        }
+
+        fn writeEvent(self: *@This(), event_name: ?[]const u8, data: []const u8) !void {
+            try std.testing.expect(event_name == null);
+            const owned = try self.allocator.dupe(u8, data);
+            errdefer self.allocator.free(owned);
+            try self.events.append(self.allocator, owned);
+        }
+    };
+
+    var capture = Capture{ .allocator = allocator };
+    defer capture.deinit();
+    try Node.emitFinishDelta(&capture, allocator, "chatcmpl-test", 42, "gemma-4", "length", null);
+    try Node.emitTerminalUsageOrDone(&capture, allocator, "chatcmpl-test", 42, "gemma-4", 2003, 300, 0, false);
+
+    try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+    try std.testing.expectEqualStrings("[DONE]", capture.events.items[1]);
+}
+
+test "generate ignore eos defaults false and requires explicit true" {
+    const allocator = std.testing.allocator;
+    const omitted_json =
+        \\{"model":"m","messages":[{"role":"user","content":"hello"}]}
+    ;
+    var omitted = try std.json.parseFromSlice(api.GenerateRequest, allocator, omitted_json, .{ .ignore_unknown_fields = true });
+    defer omitted.deinit();
+    try std.testing.expect(omitted.value.ignore_eos == null);
+    var omitted_grammar: ?[]u8 = null;
+    const omitted_config = try Node.generateConfigFromBody(allocator, omitted.value, &omitted_grammar);
+    defer if (omitted_grammar) |grammar| allocator.free(grammar);
+    try std.testing.expect(!omitted_config.ignore_eos);
+
+    const false_json =
+        \\{"model":"m","ignore_eos":false,"messages":[{"role":"user","content":"hello"}]}
+    ;
+    var explicit_false = try std.json.parseFromSlice(api.GenerateRequest, allocator, false_json, .{ .ignore_unknown_fields = true });
+    defer explicit_false.deinit();
+    try std.testing.expectEqual(@as(?bool, false), explicit_false.value.ignore_eos);
+    var false_grammar: ?[]u8 = null;
+    const false_config = try Node.generateConfigFromBody(allocator, explicit_false.value, &false_grammar);
+    defer if (false_grammar) |grammar| allocator.free(grammar);
+    try std.testing.expect(!false_config.ignore_eos);
+
+    const true_json =
+        \\{"model":"m","ignore_eos":true,"messages":[{"role":"user","content":"hello"}]}
+    ;
+    var explicit_true = try std.json.parseFromSlice(api.GenerateRequest, allocator, true_json, .{ .ignore_unknown_fields = true });
+    defer explicit_true.deinit();
+    try std.testing.expectEqual(@as(?bool, true), explicit_true.value.ignore_eos);
+    var true_grammar: ?[]u8 = null;
+    const true_config = try Node.generateConfigFromBody(allocator, explicit_true.value, &true_grammar);
+    defer if (true_grammar) |grammar| allocator.free(grammar);
+    try std.testing.expect(true_config.ignore_eos);
+}
+
+test "generate chat template kwargs preserve default and parse explicit thinking control" {
+    const allocator = std.testing.allocator;
+    const omitted_json =
+        \\{"model":"m","messages":[{"role":"user","content":"hello"}]}
+    ;
+    var omitted = try std.json.parseFromSlice(api.GenerateRequest, allocator, omitted_json, .{ .ignore_unknown_fields = true });
+    defer omitted.deinit();
+    try std.testing.expect(omitted.value.chat_template_kwargs == null);
+    var omitted_grammar: ?[]u8 = null;
+    const omitted_config = try Node.generateConfigFromBody(allocator, omitted.value, &omitted_grammar);
+    defer if (omitted_grammar) |grammar| allocator.free(grammar);
+    try std.testing.expect(omitted_config.enable_thinking == null);
+
+    const disabled_json =
+        \\{"model":"m","chat_template_kwargs":{"enable_thinking":false},"messages":[{"role":"user","content":"hello"}]}
+    ;
+    var disabled = try std.json.parseFromSlice(api.GenerateRequest, allocator, disabled_json, .{ .ignore_unknown_fields = true });
+    defer disabled.deinit();
+    try std.testing.expectEqual(@as(?bool, false), disabled.value.chat_template_kwargs.?.enable_thinking);
+    var disabled_grammar: ?[]u8 = null;
+    const disabled_config = try Node.generateConfigFromBody(allocator, disabled.value, &disabled_grammar);
+    defer if (disabled_grammar) |grammar| allocator.free(grammar);
+    try std.testing.expectEqual(@as(?bool, false), disabled_config.enable_thinking);
+
+    try std.testing.expect(rawGenerateChatTemplateKwargsAreValid(allocator, omitted_json, false));
+    try std.testing.expect(rawGenerateChatTemplateKwargsAreValid(allocator, disabled_json, false));
+    try std.testing.expect(rawGenerateChatTemplateKwargsAreValid(
+        allocator,
+        \\{"model":"m","chat_template_kwargs":{"enable_thinking":true},"messages":[]}
+    ,
+        false,
+    ));
+    try std.testing.expect(!rawGenerateChatTemplateKwargsAreValid(
+        allocator,
+        \\{"model":"m","chat_template_kwargs":{"enable_thinkng":false},"messages":[]}
+    ,
+        false,
+    ));
+    try std.testing.expect(!rawGenerateChatTemplateKwargsAreValid(
+        allocator,
+        \\{"model":"m","chat_template_kwargs":{"enable_thinking":null},"messages":[]}
+    ,
+        false,
+    ));
+    try std.testing.expect(!rawGenerateChatTemplateKwargsAreValid(
+        allocator,
+        \\{"requests":[{"custom_id":"one","body":{"model":"m","chat_template_kwargs":{"unknown":false},"messages":[]}}]}
+    ,
+        true,
+    ));
+    // Bodies without the field name skip the Value parse entirely via the
+    // substring pre-gate and validate successfully.
+    try std.testing.expect(rawGenerateChatTemplateKwargsAreValid(
+        allocator,
+        \\{"model":"m","messages":[{"role":"user","content":"no kwargs here"}]}
+    ,
+        false,
+    ));
+    // The field name appearing only inside a string value is a pre-gate false
+    // positive: the full parse still runs and the request remains accepted.
+    try std.testing.expect(rawGenerateChatTemplateKwargsAreValid(
+        allocator,
+        \\{"model":"m","messages":[{"role":"user","content":"mention chat_template_kwargs in text"}]}
+    ,
+        false,
+    ));
+    // ... and a real invalid field alongside such a string is still rejected.
+    try std.testing.expect(!rawGenerateChatTemplateKwargsAreValid(
+        allocator,
+        \\{"model":"m","chat_template_kwargs":{"unknown":true},"messages":[{"role":"user","content":"chat_template_kwargs"}]}
+    ,
+        false,
+    ));
 }
 
 test "generate speculation status exposes disabled decisions" {

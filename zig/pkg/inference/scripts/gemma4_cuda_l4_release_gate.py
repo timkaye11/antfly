@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Collect reproducible target-only Gemma 4 CUDA L4 release evidence.
 
-The production target deliberately keeps generated attention, generated E2B
-Q8-intermediate and exact-F32 FFN, and generated Q6_K LM-head candidates
-disabled. This command proves the fixed E2B QAT decode contract against
-llama.cpp and records a separate 12B Q4_K_M deterministic/replay regression
-without changing that policy.
+The production target deliberately keeps dense generated attention, generated
+E2B Q8-intermediate and exact-F32 FFN, and generated Q6_K LM-head candidates
+disabled. The promoted paged score-prework attention default stays on its
+automatic selector (variable unset); under this gate's frozen F32-KV profile
+that selector is ineligible by design, so the route must record zero launches.
+This command proves the fixed E2B QAT decode contract against llama.cpp and
+records a separate 12B Q4_K_M deterministic/replay regression without changing
+that policy.
 
 CUDA MTP is outside this release contract. It remains experimental and is not
 executed, certified, or compared with llama.cpp by this command.
@@ -24,6 +27,7 @@ import platform
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 from typing import Any
@@ -31,6 +35,7 @@ from typing import Any
 
 RELEASE_SCHEMA = "antfly.gemma4_cuda_l4_release_gate.v2"
 RELEASE_SCOPE = "target_only"
+GIT_UNTRACKED_INVENTORY_SCHEMA = "antfly.git_untracked_inventory.v1"
 E2B_PROMPT = "Here is a sentence about ants:"
 E2B_ANTFLY_TOKENS = 255
 E2B_LLAMA_TOKENS = 256
@@ -71,18 +76,24 @@ FROZEN_PROFILE = {
     "antfly_decode_graph_replay": "required",
     "ANTFLY_SERVER_DISABLE_CONTINUOUS_BATCHING": "1",
     "ANTFLY_INFERENCE_DISABLE_CONTINUOUS_BATCHING": "1",
-    "ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD": "853",
-    "ANTFLY_CUDA_TEMP_SLOT_PERIOD": "853",
-    "antfly_cuda_temp_slot_period": "853",
-    "ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP": "2500",
-    "ANTFLY_CUDA_TEMP_SLOT_SKIP": "2500",
-    "antfly_cuda_temp_slot_skip": "2500",
+    "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN": "1",
+    "ANTFLY_CUDA_TEMP_ARENA_AUTOPLAN": "1",
+    "antfly_cuda_temp_arena_autoplan": "1",
+    "ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD": "0",
+    "ANTFLY_CUDA_TEMP_SLOT_PERIOD": "0",
+    "antfly_cuda_temp_slot_period": "0",
+    "ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP": "0",
+    "ANTFLY_CUDA_TEMP_SLOT_SKIP": "0",
+    "antfly_cuda_temp_slot_skip": "0",
     "ANTFLY_GENERATED_ATTENTION_DECODE": "0",
     "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE": "0",
     "antfly_generated_attention_decode": "0",
-    "ANTFLY_GENERATED_ATTENTION_SCORE_PREWORK": "0",
-    "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "0",
-    "antfly_generated_attention_score_prework": "0",
+    # ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK is deliberately
+    # absent: the production default is the automatic selector, expressed by
+    # leaving the variable unset.  release_environment() scrubs any inherited
+    # value, so absence here freezes the default; "0" is the explicit rollback
+    # and "1" the explicit qualification override, neither of which is the
+    # release configuration.
     "ANTFLY_TURBOQUANT_SPLIT_ATTENTION": "0",
     "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION": "0",
     "antfly_turboquant_split_attention": "0",
@@ -93,6 +104,8 @@ FROZEN_PROFILE = {
     "antfly_generated_q4_0_e2b_ffn": "0",
     "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT": "0",
     "antfly_generated_q4_0_e2b_ffn_exact": "0",
+    "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_PAIR_ONLY": "0",
+    "antfly_generated_q4_0_e2b_ffn_pair_only": "0",
     # This gate certifies the default release path. Candidate lanes have
     # separate exact-kernel gates that require positive generated-route hits.
     "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_MMV": "0",
@@ -111,9 +124,7 @@ FROZEN_PROFILE = {
     "REQUIRE_GENERATED_E2B_FFN": "0",
     "ANTFLY_Q4_0_Q8_1_PREFILL_ROWS": "1",
     "ANTFLY_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE": "0",
-    "ANTFLY_GQA_PREFILL_FAST": "1",
-    "ANTFLY_GQA_PREFILL_TILED": "0",
-    "ANTFLY_GQA_PREFILL_MMA": "0",
+    "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "required-fast",
     "ANTFLY_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
     "ANTFLY_Q4_0_LINEAR_Q8_1_ROWS8_C4": "1",
     "ANTFLY_Q4_0_PAIR_ACTIVATION_Q8_1_ROWS8_C2": "1",
@@ -257,6 +268,35 @@ def command_capture(*command: str) -> dict[str, Any]:
     return result
 
 
+def command_capture_bytes(*command: str) -> dict[str, Any]:
+    """Capture exact stdout bytes for content-addressed Git provenance."""
+    result: dict[str, Any] = {
+        "command": list(command),
+        "returncode": None,
+        "stdout": None,
+        "stderr": None,
+    }
+    environment = os.environ.copy()
+    environment.update({"LC_ALL": "C", "LANG": "C"})
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=environment,
+        )
+    except OSError as exc:
+        result["stderr"] = str(exc)
+        return result
+    result.update({
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr.decode("utf-8", errors="replace").strip() or None,
+    })
+    return result
+
+
 def _status_sha256(status: str | None) -> str | None:
     return hashlib.sha256(status.encode("utf-8")).hexdigest() if status is not None else None
 
@@ -265,6 +305,217 @@ def _untracked_paths(status: str | None) -> list[str]:
     if status is None:
         return []
     return sorted(line[3:] for line in status.splitlines() if line.startswith("?? "))
+
+
+def _tracked_diff_provenance(repo: pathlib.Path) -> dict[str, Any]:
+    capture = command_capture_bytes(
+        "git",
+        "-c",
+        "core.quotePath=true",
+        "-C",
+        str(repo),
+        "diff",
+        "--binary",
+        "--full-index",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--no-indent-heuristic",
+        "--diff-algorithm=myers",
+        "HEAD",
+        "--",
+    )
+    output = capture.get("stdout")
+    available = capture.get("returncode") == 0 and isinstance(output, bytes)
+    return {
+        "tracked_diff_returncode": capture.get("returncode"),
+        "tracked_diff_bytes": len(output) if available else None,
+        "tracked_diff_sha256": hashlib.sha256(output).hexdigest() if available else None,
+        "tracked_diff_error": capture.get("stderr") if not available else None,
+    }
+
+
+def _stable_regular_file_provenance(path: pathlib.Path) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        before = os.fstat(source.fileno())
+        while chunk := source.read(8 * 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(source.fileno())
+    final = path.stat()
+    def identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_size,
+            value.st_mtime_ns,
+        )
+    if identity(before) != identity(after) or identity(after) != identity(final):
+        raise RuntimeError(f"untracked file changed while hashing: {path}")
+    return {
+        "kind": "file",
+        "mode": stat.S_IMODE(after.st_mode),
+        "bytes": after.st_size,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _untracked_file_provenance(repo: pathlib.Path, raw_path: bytes) -> dict[str, Any]:
+    if (
+        not raw_path
+        or raw_path.startswith(b"/")
+        or any(component in (b"", b".", b"..") for component in raw_path.split(b"/"))
+    ):
+        raise RuntimeError(f"invalid untracked Git path: {raw_path!r}")
+    display_path = os.fsdecode(raw_path)
+    path = repo / display_path
+    before = path.lstat()
+    if stat.S_ISLNK(before.st_mode):
+        target = os.fsencode(os.readlink(path))
+        after = path.lstat()
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_size,
+            before.st_mtime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_size,
+            after.st_mtime_ns,
+        )
+        if before_identity != after_identity:
+            raise RuntimeError(f"untracked symlink changed while hashing: {path}")
+        value = {
+            "kind": "symlink",
+            "mode": stat.S_IMODE(after.st_mode),
+            "bytes": len(target),
+            "sha256": hashlib.sha256(target).hexdigest(),
+        }
+    elif stat.S_ISREG(before.st_mode):
+        value = _stable_regular_file_provenance(path)
+    else:
+        raise RuntimeError(f"unsupported untracked filesystem entry: {path}")
+    return {"path": display_path, **value}
+
+
+def _untracked_content_provenance(repo: pathlib.Path) -> dict[str, Any]:
+    command = (
+        "git",
+        "-C",
+        str(repo),
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    )
+    before = command_capture_bytes(*command)
+    raw = before.get("stdout")
+    if before.get("returncode") != 0 or not isinstance(raw, bytes):
+        return {
+            "untracked_inventory_schema": GIT_UNTRACKED_INVENTORY_SCHEMA,
+            "untracked_inventory_returncode": before.get("returncode"),
+            "untracked_inventory_sha256": None,
+            "untracked_file_count": None,
+            "untracked_files": None,
+            "untracked_inventory_error": before.get("stderr") or "could not list untracked files",
+        }
+    raw_paths = sorted(path for path in raw.split(b"\0") if path)
+    try:
+        files = [_untracked_file_provenance(repo, path) for path in raw_paths]
+    except (OSError, RuntimeError) as exc:
+        return {
+            "untracked_inventory_schema": GIT_UNTRACKED_INVENTORY_SCHEMA,
+            "untracked_inventory_returncode": 1,
+            "untracked_inventory_sha256": None,
+            "untracked_file_count": None,
+            "untracked_files": None,
+            "untracked_inventory_error": str(exc),
+        }
+    after = command_capture_bytes(*command)
+    if after.get("returncode") != 0 or after.get("stdout") != raw:
+        return {
+            "untracked_inventory_schema": GIT_UNTRACKED_INVENTORY_SCHEMA,
+            "untracked_inventory_returncode": after.get("returncode") or 1,
+            "untracked_inventory_sha256": None,
+            "untracked_file_count": None,
+            "untracked_files": None,
+            "untracked_inventory_error": (
+                after.get("stderr") or "untracked file inventory changed while hashing"
+            ),
+        }
+    identity = {
+        "schema": GIT_UNTRACKED_INVENTORY_SCHEMA,
+        "files": files,
+    }
+    return {
+        "untracked_inventory_schema": GIT_UNTRACKED_INVENTORY_SCHEMA,
+        "untracked_inventory_returncode": 0,
+        "untracked_inventory_sha256": canonical_sha256(identity),
+        "untracked_file_count": len(files),
+        "untracked_files": files,
+        "untracked_inventory_error": None,
+    }
+
+
+def git_content_provenance_errors(git: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    digest_pattern = re.compile(r"[0-9a-f]{64}")
+    if (
+        git.get("tracked_diff_returncode") != 0
+        or not isinstance(git.get("tracked_diff_bytes"), int)
+        or git.get("tracked_diff_bytes", -1) < 0
+        or not isinstance(git.get("tracked_diff_sha256"), str)
+        or digest_pattern.fullmatch(git["tracked_diff_sha256"]) is None
+    ):
+        errors.append("Git tracked-content diff provenance is unavailable")
+
+    files = git.get("untracked_files")
+    if (
+        git.get("untracked_inventory_schema") != GIT_UNTRACKED_INVENTORY_SCHEMA
+        or git.get("untracked_inventory_returncode") != 0
+        or not isinstance(files, list)
+        or git.get("untracked_file_count") != len(files or [])
+        or not isinstance(git.get("untracked_inventory_sha256"), str)
+        or digest_pattern.fullmatch(git.get("untracked_inventory_sha256") or "") is None
+    ):
+        errors.append("Git untracked-content inventory provenance is unavailable")
+        return errors
+
+    paths: list[str] = []
+    for entry in files:
+        if not isinstance(entry, dict):
+            errors.append("Git untracked-content inventory contains an invalid entry")
+            break
+        path = entry.get("path")
+        if (
+            not isinstance(path, str)
+            or not path
+            or entry.get("kind") not in {"file", "symlink"}
+            or not isinstance(entry.get("mode"), int)
+            or not 0 <= entry.get("mode", -1) <= 0o7777
+            or not isinstance(entry.get("bytes"), int)
+            or entry.get("bytes", -1) < 0
+            or not isinstance(entry.get("sha256"), str)
+            or digest_pattern.fullmatch(entry.get("sha256") or "") is None
+        ):
+            errors.append("Git untracked-content inventory contains an invalid entry")
+            break
+        paths.append(path)
+    if paths != sorted(paths) or len(paths) != len(set(paths)):
+        errors.append("Git untracked-content inventory paths are not unique and sorted")
+    identity = {
+        "schema": GIT_UNTRACKED_INVENTORY_SCHEMA,
+        "files": files,
+    }
+    if git.get("untracked_inventory_sha256") != canonical_sha256(identity):
+        errors.append("Git untracked-content inventory hash does not match its contents")
+    return errors
 
 
 def git_provenance(repo: pathlib.Path) -> dict[str, Any]:
@@ -278,6 +529,8 @@ def git_provenance(repo: pathlib.Path) -> dict[str, Any]:
     tracked_status = (tracked["stdout"] or "") if tracked["returncode"] == 0 else None
     source_status = (source["stdout"] or "") if source["returncode"] == 0 else None
     worktree_status = (worktree["stdout"] or "") if worktree["returncode"] == 0 else None
+    tracked_content = _tracked_diff_provenance(repo)
+    untracked_content = _untracked_content_provenance(repo)
     return {
         "commit": commit["stdout"] if commit["returncode"] == 0 else None,
         "commit_returncode": commit["returncode"],
@@ -292,6 +545,8 @@ def git_provenance(repo: pathlib.Path) -> dict[str, Any]:
         "dirty": bool(worktree_status) if worktree_status is not None else None,
         "status_returncode": worktree["returncode"],
         "status_sha256": _status_sha256(worktree_status),
+        **tracked_content,
+        **untracked_content,
     }
 
 
@@ -354,6 +609,7 @@ def provenance_errors(provenance: dict[str, Any]) -> list[str]:
         errors.append("Git untracked-source status is unavailable")
     elif git.get("source_untracked_paths"):
         errors.append("untracked source files are present: " + ", ".join(git["source_untracked_paths"]))
+    errors.extend(git_content_provenance_errors(git))
 
     toolchains = provenance.get("toolchains") or {}
     for name in ("python", "git", "zig", "nvcc", "cuobjdump", "nvidia_smi"):
@@ -636,6 +892,7 @@ def e2b_pair_contract_errors(pair: dict[str, Any]) -> list[str]:
         "antfly_generated_q6_k_q8_1_lm_head_argmax": "0",
         "antfly_generated_q4_0_e2b_ffn": "0",
         "antfly_generated_q4_0_e2b_ffn_exact": "0",
+        "antfly_generated_q4_0_e2b_ffn_pair_only": "0",
         "antfly_q4_0_q8_1_lm_head_argmax": "1",
     }
     for key, value in expected.items():
@@ -672,6 +929,8 @@ def e2b_pair_contract_errors(pair: dict[str, Any]) -> list[str]:
             "antfly_generated_e2b_down",
             "antfly_generated_e2b_pair_fallbacks",
             "antfly_generated_e2b_down_fallbacks",
+            "antfly_generated_e2b_pair_only",
+            "antfly_generated_e2b_pair_only_fallbacks",
             "antfly_generated_e2b_exact_pair",
             "antfly_generated_e2b_exact_down",
             "antfly_generated_e2b_exact_pair_fallbacks",
@@ -748,6 +1007,10 @@ def disabled_candidate_errors(timing: dict[str, Any], label: str) -> list[str]:
     cuda = timing.get("cuda") if isinstance(timing.get("cuda"), dict) else {}
     counters = (
         "launch_attention_gqa_decode_generated",
+        # Score-prework is production default-on via the automatic selector,
+        # but its qualification is F16-KV-only; the frozen F32-cache release
+        # profile must never select it, so any launch here signals a selector
+        # policy violation rather than an enabled candidate.
         "launch_attention_gqa_decode_score_prework",
         "lm_head_argmax_generated_q6_k_q8_1_hits",
         "lm_head_argmax_generated_q6_k_q8_1_fallbacks",
@@ -755,6 +1018,8 @@ def disabled_candidate_errors(timing: dict[str, Any], label: str) -> list[str]:
         "q4_0_generated_e2b_down_q8_hits",
         "q4_0_generated_e2b_pair_q8_fallbacks",
         "q4_0_generated_e2b_down_q8_fallbacks",
+        "q4_0_generated_e2b_pair_only_hits",
+        "q4_0_generated_e2b_pair_only_fallbacks",
         "q4_0_generated_e2b_exact_pair_f32_hits",
         "q4_0_generated_e2b_exact_down_f32_hits",
         "q4_0_generated_e2b_exact_pair_f32_fallbacks",
