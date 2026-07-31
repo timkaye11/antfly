@@ -1107,6 +1107,41 @@ test "prompt cache block hash walks chained blocks" {
     try std.testing.expectEqual(@as(u64, 1), stats_value.block_hash_hits);
 }
 
+test "prompt cache block hash strict extension reuses every stored page" {
+    const allocator = std.testing.allocator;
+    var cache = PromptPrefixCache.init(allocator);
+    defer cache.deinit();
+    cache.configure(.{ .enabled = true, .mode = .block_hash, .min_tokens = 2, .max_bytes = 1 << 20 });
+
+    const pool_id = (try cache.ensurePool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    })).?;
+    const source_id = try cache.manager.attachSequence(pool_id);
+    try cache.manager.appendTokens(source_id, 6);
+    try cache.storeFromSequence("agent", &.{ 1, 2, 3, 4, 5, 6 }, source_id);
+
+    // Strict continuation: the prior prompt plus a new tail, attached with
+    // the pipeline's limit (seq_len minus one page kept for prefill). Every
+    // stored page participates in the hit.
+    const prompt = [_]i64{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const hit = (try cache.attachLongestPrefix("agent", &prompt, prompt.len - 2)).?;
+    try std.testing.expectEqual(@as(usize, 6), hit.token_count);
+    try cache.manager.releaseSequence(hit.sequence_id);
+
+    // The identical continuation under another namespace shares no pages:
+    // the per-request prompt_cache_key is part of every block hash.
+    try std.testing.expect((try cache.attachLongestPrefix("tenant-b", &prompt, prompt.len - 2)) == null);
+
+    const stats_value = cache.stats();
+    try std.testing.expectEqual(@as(u64, 1), stats_value.block_hash_hits);
+    try std.testing.expectEqual(@as(u64, 1), stats_value.block_hash_misses);
+}
+
 test "prompt cache block hash evicts retained blocks by budget" {
     const allocator = std.testing.allocator;
     var cache = PromptPrefixCache.init(allocator);

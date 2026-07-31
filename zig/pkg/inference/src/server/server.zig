@@ -419,9 +419,11 @@ test "concurrent first prompt cache activations share the node budget" {
 
     var first: model_manager_mod.LoadedModel = undefined;
     first.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    first.prompt_cache_ledger_observer = null;
     defer first.prompt_prefix_cache.deinit();
     var second: model_manager_mod.LoadedModel = undefined;
     second.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    second.prompt_cache_ledger_observer = null;
     defer second.prompt_prefix_cache.deinit();
     try manager.loaded.put(allocator, "first", &first);
     try manager.loaded.put(allocator, "second", &second);
@@ -733,12 +735,18 @@ fn shouldAutoUseMetalWholeModelGenerate(
     loaded_backend: backends_mod.BackendType,
     metal_executor_supported: bool,
     deepseek_compressed_cache: bool,
+    compact_profile_registered: bool,
     selection: GenerateBackendSelection,
 ) bool {
     if (!build_options.enable_metal) return false;
     if (selection.eager_mode_requested) return false;
     if (selection.compiled_partition_backend != null) return false;
     if (selection.native_choice == .native) return false;
+    // Compact-profile models stay on the eager partitioned-scheduler path:
+    // whole-model execution is non-paged, which disables the prompt prefix
+    // cache and bypasses the ledger-governed KV pools the compact residency
+    // contract depends on.
+    if (compact_profile_registered) return false;
     return loaded_backend == .metal and metal_executor_supported and !deepseek_compressed_cache;
 }
 
@@ -975,6 +983,22 @@ fn tokenUsage(prompt_tokens: usize, completion_tokens: usize) api.GenerateUsage 
         .prompt_tokens = @intCast(prompt_tokens),
         .completion_tokens = @intCast(completion_tokens),
         .total_tokens = @intCast(prompt_tokens + completion_tokens),
+    };
+}
+
+/// Usage for generation responses that can be served from the prompt prefix
+/// cache. `cached_prompt_tokens == 0` reports as absent, matching the
+/// non-streaming response builder.
+fn generateTokenUsage(
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    cached_prompt_tokens: usize,
+) api.GenerateUsage {
+    return .{
+        .prompt_tokens = @intCast(prompt_tokens),
+        .completion_tokens = @intCast(completion_tokens),
+        .total_tokens = @intCast(prompt_tokens + completion_tokens),
+        .cached_prompt_tokens = if (cached_prompt_tokens == 0) null else @intCast(cached_prompt_tokens),
     };
 }
 
@@ -4745,7 +4769,13 @@ pub const Node = struct {
             .prefill_chunk_size = 0,
             .cache_dtype = body.cache_dtype,
             .cache_compaction_ratio = body.cache_compaction_ratio,
-            .prompt_cache_enabled = self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and prompt_cache_key != null and !want_stream,
+            // Streaming and non-streaming share generateWithCallback: the
+            // prefix attach happens before prefill and the store lands
+            // immediately after prefill, before the first decode token is
+            // emitted, so caching is mode-agnostic. The original streaming
+            // exclusion (a52541e20) predates cached-token reporting and
+            // carried no other rationale.
+            .prompt_cache_enabled = self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and prompt_cache_key != null,
             .prompt_cache_key = prompt_cache_key,
         };
         const backend_selection = parseGenerateBackendSelection(body.backend, body.mode, body.compiled_target) catch |err| {
@@ -5056,6 +5086,7 @@ pub const Node = struct {
             model.session.backend(),
             graph_mod.metal_executor.supportsSession(model.session),
             generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config),
+            self.model_manager.compactProfileForDir(model.model_dir) != null,
             backend_selection,
         );
         const effective_compiled_partition_backend: ?ops.BackendKind = if (auto_metal_whole_model)
@@ -5438,6 +5469,13 @@ pub const Node = struct {
                 pool_id = model.prompt_prefix_cache.pool_id.?;
                 prompt_cache = &model.prompt_prefix_cache;
             } else {
+                // The request keeps working through a private non-cached
+                // pool, but silently losing prefix reuse defeats the
+                // cached-TTFT contract — say why it happened.
+                std.log.warn(
+                    "prompt cache unavailable for {s} (backend={s}): pool provisioning produced no cache-backed KV pool (incompatible pool geometry or missing device write hook); continuing without prefix reuse",
+                    .{ model.model_dir, @tagName(backend_kind) },
+                );
                 pool_id = kv_manager.addPool(pool_config) catch |err|
                     return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
                 config.prompt_cache_enabled = false;
@@ -6854,6 +6892,7 @@ pub const Node = struct {
             result.finish_reason,
             tool_parser,
             result.speculative,
+            generateTokenUsage(result.prompt_tokens, result.tokens_used, result.cached_prompt_tokens),
         ) catch |err| {
             writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
             writer.close() catch {};
@@ -7035,12 +7074,7 @@ pub const Node = struct {
             .created = created,
             .model = model_name,
             .choices = &choices,
-            .usage = .{
-                .prompt_tokens = @intCast(prompt_tokens),
-                .completion_tokens = @intCast(completion_tokens),
-                .total_tokens = @intCast(prompt_tokens + completion_tokens),
-                .cached_prompt_tokens = if (cached_prompt_tokens == 0) null else @intCast(cached_prompt_tokens),
-            },
+            .usage = generateTokenUsage(prompt_tokens, completion_tokens, cached_prompt_tokens),
             .speculation = generateSpeculationStatus(speculative),
         });
     }
@@ -7201,15 +7235,16 @@ pub const Node = struct {
             config.speculation_calibration,
         );
         recordSpeculationOutcome(&self.metrics, speculative);
+        const usage = generateTokenUsage(result.prompt_tokens, result.tokens_used, result.cached_prompt_tokens);
 
         if (tool_parser != null) {
-            flushStreamParserState(ctx.allocator, &writer, stream_id, stream_created, model_name, result.finish_reason, tool_parser.?, speculative) catch |err| {
+            flushStreamParserState(ctx.allocator, &writer, stream_id, stream_created, model_name, result.finish_reason, tool_parser.?, speculative, usage) catch |err| {
                 writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
                 writer.close() catch {};
                 return ctx.response.build();
             };
         } else {
-            emitFinishDelta(&writer, ctx.allocator, stream_id, stream_created, model_name, result.finish_reason, speculative) catch {};
+            emitFinishDelta(&writer, ctx.allocator, stream_id, stream_created, model_name, result.finish_reason, speculative, usage) catch {};
         }
 
         // Send the final [DONE] event (OpenAI convention)
@@ -7229,6 +7264,7 @@ pub const Node = struct {
         default_finish_reason: []const u8,
         tool_parser: ?*tool_parser_mod.Parser,
         speculative: ?generation.SpeculativeDecodeStats,
+        usage: ?api.GenerateUsage,
     ) !void {
         if (tool_parser) |parser| {
             parser.reset();
@@ -7245,16 +7281,16 @@ pub const Node = struct {
                     .name = call.function.name,
                     .arguments = call.function.arguments,
                 });
-                try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, "tool_calls", speculative);
+                try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, "tool_calls", speculative, usage);
                 return;
             }
             if (remaining.len == 0 and full_text.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, full_text);
-            try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, default_finish_reason, speculative);
+            try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, default_finish_reason, speculative, usage);
             return;
         }
 
         if (full_text.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, full_text);
-        try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, default_finish_reason, speculative);
+        try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, default_finish_reason, speculative, usage);
     }
 
     fn flushStreamParserState(
@@ -7266,12 +7302,13 @@ pub const Node = struct {
         default_finish_reason: []const u8,
         parser: *tool_parser_mod.Parser,
         speculative: ?generation.SpeculativeDecodeStats,
+        usage: ?api.GenerateUsage,
     ) !void {
         const remaining = try parser.finishRemainingText(allocator);
         defer allocator.free(remaining);
         if (remaining.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, remaining);
         const finish_reason = if (parser.toolCalls().len > 0) "tool_calls" else default_finish_reason;
-        try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, finish_reason, speculative);
+        try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, finish_reason, speculative, usage);
     }
 
     fn parseFinishReason(s: []const u8) api.FinishReason {
@@ -7385,6 +7422,21 @@ pub const Node = struct {
         });
     }
 
+    /// GenerateChunk plus the OpenAI-convention `usage` object streaming
+    /// clients read from the final chunk. The OpenAPI GenerateChunk schema
+    /// does not declare `usage` yet (spec change plus cross-language SDK
+    /// regeneration is a separate step); generated clients decode chunks
+    /// field-tolerantly, so the extra member is ignored until then.
+    const GenerateTerminalChunk = struct {
+        id: []const u8,
+        object: []const u8,
+        created: i64,
+        model: []const u8,
+        choices: []const api.GenerateChunkChoice,
+        speculation: ?api.GenerateSpeculationStatus = null,
+        usage: api.GenerateUsage,
+    };
+
     fn emitFinishDelta(
         writer: *httpx.Context.StreamWriter,
         allocator: std.mem.Allocator,
@@ -7393,12 +7445,28 @@ pub const Node = struct {
         model_name: []const u8,
         finish_reason: []const u8,
         speculative: ?generation.SpeculativeDecodeStats,
+        usage: ?api.GenerateUsage,
     ) !void {
         const choices = [_]api.GenerateChunkChoice{.{
             .index = 0,
             .delta = .{},
             .finish_reason = parseFinishReason(finish_reason),
         }};
+        if (usage) |usage_value| {
+            const terminal = GenerateTerminalChunk{
+                .id = stream_id,
+                .object = "chat.completion.chunk",
+                .created = stream_created,
+                .model = model_name,
+                .choices = &choices,
+                .speculation = generateSpeculationStatus(speculative),
+                .usage = usage_value,
+            };
+            const payload = try std.json.Stringify.valueAlloc(allocator, terminal, .{});
+            defer allocator.free(payload);
+            try writer.writeEvent(null, payload);
+            return;
+        }
         try writeGenerateChunkEvent(writer, allocator, .{
             .id = stream_id,
             .object = "chat.completion.chunk",
@@ -12099,15 +12167,15 @@ test "generate backend selection keeps compiled mode explicit" {
     try std.testing.expect(auto_compiled.graph_mode_requested);
 
     const auto_default = try parseGenerateBackendSelection(null, null, null);
-    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.native, true, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, auto_default));
+    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.native, true, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, false, auto_default));
 
     if (build_options.enable_metal) {
         const metal_eager = try parseGenerateBackendSelection(.metal, "eager", null);
         try std.testing.expect(metal_eager.eager_mode_requested);
-        try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, metal_eager));
+        try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, metal_eager));
     } else {
         try std.testing.expectError(
             error.BackendUnavailable,
@@ -12117,6 +12185,47 @@ test "generate backend selection keeps compiled mode explicit" {
 
     try std.testing.expectError(error.InvalidGenerateMode, parseGenerateBackendSelection(null, "graph", null));
     try std.testing.expectError(error.InvalidCompiledTarget, parseGenerateBackendSelection(null, "compiled", "full"));
+}
+
+test "compact profile routes generate away from metal whole-model execution" {
+    // A registered compact residency contract forces the eager partitioned
+    // scheduler + paged-KV route, where the prompt prefix cache is usable,
+    // regardless of Metal executor support.
+    const auto_default = try parseGenerateBackendSelection(null, null, null);
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, true, auto_default));
+    // Without the compact contract the default routing is unchanged.
+    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, auto_default));
+}
+
+test "generate usage reports cached prompt tokens only when present" {
+    try std.testing.expectEqual(@as(?i64, null), generateTokenUsage(7, 3, 0).cached_prompt_tokens);
+    const usage = generateTokenUsage(9, 4, 6);
+    try std.testing.expectEqual(@as(i64, 9), usage.prompt_tokens);
+    try std.testing.expectEqual(@as(i64, 4), usage.completion_tokens);
+    try std.testing.expectEqual(@as(i64, 13), usage.total_tokens);
+    try std.testing.expectEqual(@as(?i64, 6), usage.cached_prompt_tokens);
+}
+
+test "streaming terminal chunk serializes usage with cached prompt tokens" {
+    const allocator = std.testing.allocator;
+    const choices = [_]api.GenerateChunkChoice{.{
+        .index = 0,
+        .delta = .{},
+        .finish_reason = .stop,
+    }};
+    const chunk = Node.GenerateTerminalChunk{
+        .id = "chatcmpl-test",
+        .object = "chat.completion.chunk",
+        .created = 1,
+        .model = "gemma4-a4b",
+        .choices = &choices,
+        .usage = generateTokenUsage(9, 4, 6),
+    };
+    const payload = try std.json.Stringify.valueAlloc(allocator, chunk, .{});
+    defer allocator.free(payload);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"cached_prompt_tokens\":6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"total_tokens\":13") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"finish_reason\":\"stop\"") != null);
 }
 
 test "singleBackendPreference is strict" {
