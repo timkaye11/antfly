@@ -741,9 +741,14 @@ fn metalJitRejectionMemoClear(key: kernel_jit.ArtifactKey) void {
 pub const decoder_runtime_layer_norm_slot_capacity: usize = 256;
 pub const decoder_runtime_rms_norm_slot_capacity: usize = 512;
 // Slots [0, 512) retain the long-standing dense/dynamic decoder layout.
-// Gemma4 A4B reserves 1,080 additional descriptors (30 layers * 12 resident
-// experts * gate/up/down) without displacing any existing slot assignment.
-pub const decoder_runtime_linear_slot_capacity: usize = 2048;
+// The compact profile reserves [512, 12_032) for resident routed experts
+// (30 layers * up to 128 budget-derived slots * gate/up/down) without
+// displacing any existing slot assignment. Cost of the capacity: the
+// per-slot descriptor arrays in MetalNativeProvider (two ?MetalTensor at
+// ~104 B each plus ~28 B of dims/kind/flag fields, ~236 B per slot) total
+// roughly 3 MB per provider; no per-slot device memory is reserved until a
+// slot is actually prepared.
+pub const decoder_runtime_linear_slot_capacity: usize = 12_288;
 
 pub const RawQuantizedRuntimeLinearKind = enum {
     none,

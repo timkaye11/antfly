@@ -597,31 +597,91 @@ pub const WarmModel = struct {
     /// demand — resolves the same immutable residency contract, and the
     /// instance is pinned against idle eviction.
     memory_profile: ?[]const u8 = null,
-    /// Resident routed-expert slots per MoE layer (8/12/16); omission means
-    /// automatic tier selection.
+    /// Total resident memory budget in MiB for the compact profile
+    /// (minimum 2048). Omission keeps the 2048 MiB floor; setting it
+    /// without `memory_profile` implies the compact profile.
+    memory_budget_mb: ?u32 = null,
+    /// Resident routed-expert slots per MoE layer, in [4, 128]; omission
+    /// means automatic budget-derived selection.
     expert_cache_slots: ?u8 = null,
 };
 
 pub fn compactRequestForWarmModel(model: WarmModel) !?backends_mod.SessionManager.CompactRequest {
-    const profile = model.memory_profile orelse {
+    if (model.memory_profile == null and model.memory_budget_mb == null) {
         if (model.expert_cache_slots != null) return error.ExpertCacheSlotsRequireMemoryProfile;
         return null;
-    };
-    if (!std.mem.eql(u8, profile, "compact_2gbs") and
-        !std.mem.eql(u8, profile, "2gbs") and
-        !std.mem.eql(u8, profile, "2gb"))
+    }
+    if (model.memory_profile) |profile| {
+        if (!std.mem.eql(u8, profile, "compact_2gbs") and
+            !std.mem.eql(u8, profile, "2gbs") and
+            !std.mem.eql(u8, profile, "2gb"))
+        {
+            return error.InvalidMemoryProfile;
+        }
+    }
+    const budget = model.memory_budget_mb orelse 0;
+    if (budget != 0 and
+        budget < session_factory.CompactInferenceConfig.min_memory_budget_mb)
     {
-        return error.InvalidMemoryProfile;
+        return error.CompactProfileBudgetTooSmall;
     }
     const slots = model.expert_cache_slots orelse 0;
-    switch (slots) {
-        0, 8, 12, 16 => {},
-        else => return error.InvalidExpertCacheSlots,
+    if (slots != 0 and
+        (slots < session_factory.CompactInferenceConfig.min_expert_cache_slots or
+            slots > session_factory.CompactInferenceConfig.max_expert_cache_slots))
+    {
+        return error.InvalidExpertCacheSlots;
     }
     return .{
         .profile = .compact_2gbs,
+        .memory_budget_mb = budget,
         .expert_cache_slots = slots,
     };
+}
+
+test "compactRequestForWarmModel maps profile, budget, and slots fail-closed" {
+    try std.testing.expect((try compactRequestForWarmModel(.{ .name = "m" })) == null);
+
+    const profiled = (try compactRequestForWarmModel(.{
+        .name = "m",
+        .memory_profile = "compact_2gbs",
+    })).?;
+    try std.testing.expectEqual(@as(u32, 0), profiled.memory_budget_mb);
+    try std.testing.expectEqual(@as(u8, 0), profiled.expert_cache_slots);
+
+    // A budget alone implies the compact profile; explicit knobs pass
+    // through by value.
+    const budgeted = (try compactRequestForWarmModel(.{
+        .name = "m",
+        .memory_budget_mb = 8192,
+        .expert_cache_slots = 100,
+    })).?;
+    try std.testing.expect(budgeted.profile == .compact_2gbs);
+    try std.testing.expectEqual(@as(u32, 8192), budgeted.memory_budget_mb);
+    try std.testing.expectEqual(@as(u8, 100), budgeted.expert_cache_slots);
+
+    try std.testing.expectError(error.InvalidMemoryProfile, compactRequestForWarmModel(.{
+        .name = "m",
+        .memory_profile = "8gb",
+    }));
+    try std.testing.expectError(error.CompactProfileBudgetTooSmall, compactRequestForWarmModel(.{
+        .name = "m",
+        .memory_budget_mb = 2047,
+    }));
+    try std.testing.expectError(error.InvalidExpertCacheSlots, compactRequestForWarmModel(.{
+        .name = "m",
+        .memory_profile = "2gbs",
+        .expert_cache_slots = 3,
+    }));
+    try std.testing.expectError(error.InvalidExpertCacheSlots, compactRequestForWarmModel(.{
+        .name = "m",
+        .memory_profile = "2gbs",
+        .expert_cache_slots = 129,
+    }));
+    try std.testing.expectError(error.ExpertCacheSlotsRequireMemoryProfile, compactRequestForWarmModel(.{
+        .name = "m",
+        .expert_cache_slots = 8,
+    }));
 }
 
 fn warmModelTaskDir(kind: WarmModelKind) []const u8 {

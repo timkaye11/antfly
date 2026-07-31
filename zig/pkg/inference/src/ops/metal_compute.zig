@@ -308,12 +308,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     const MetalNativeProvider = metal_native_provider_mod.MetalNativeProvider;
     const ProviderImpl = MetalNativeProvider;
     const compact_expert_layer_count: usize = 30;
-    // Top-8 routing needs at least eight resident entries. Keep capacity for
-    // the supported 8/12/16 A/B choices while only scanning and allocating the
-    // configured active prefix. Twelve preserves four historical experts per
-    // layer and is the compact profile default.
-    const compact_expert_slot_capacity: usize = 16;
-    const compact_expert_default_active_slots: usize = 12;
+    // Static capacity for budget-derived slot counts: the memory budget can
+    // resolve anywhere in [4, 128] resident experts per layer, so the linear
+    // slot map and arena table cover the maximum while the cache only scans
+    // and allocates the configured active prefix.
+    const compact_expert_slot_capacity: usize = 128;
     const compact_expert_projection_count: usize = 3;
     const compact_expert_linear_slot_start: usize = 512;
     const compact_expert_linear_slot_count: usize = compact_expert_layer_count * compact_expert_slot_capacity * compact_expert_projection_count;
@@ -3491,13 +3490,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (count == 0) break;
         }
         if (state.ledger.samplePressure() != .hard) return;
-        // Automatic tier selection may downshift once per pressure event
-        // before the session gives up; only stranded above-tier slots are
-        // drained so in-tier contents survive.
+        // Automatic slot selection may downshift once per pressure event
+        // before the session gives up: a monotonic three-quarters step with
+        // a floor of four slots (top-8 routing still needs a resident
+        // working set). Only stranded above-count slots are drained so
+        // in-count contents survive.
         if (self.data.compact) |config| {
             if (config.expert_cache_slots_auto) {
+                const min_slots: usize = backend_contracts.CompactInferenceConfig.min_expert_cache_slots;
                 const active = state.cache.activeSlots();
-                const next: usize = if (active > 12) 12 else if (active > 8) 8 else 0;
+                const next: usize = if (active > min_slots)
+                    @max(min_slots, (active * 3) / 4)
+                else
+                    0;
                 if (next != 0) {
                     state.cache.setActiveSlots(next);
                     var stranded: [8]gpu_hosted_store_mod.CompactSlotRef = undefined;
@@ -25170,9 +25175,10 @@ test "metal_compute: compact Gemma4 resident slots stay within runtime capacity"
         MetalCompute.compact_expert_layer_count - 1,
         MetalCompute.compact_expert_slot_capacity - 1,
     );
-    try std.testing.expectEqual(@as(usize, 1949), last.gate);
-    try std.testing.expectEqual(@as(usize, 1950), last.up);
-    try std.testing.expectEqual(@as(usize, 1951), last.down);
+    // Layer 29, slot 127: base = 512 + (29 * 128 + 127) * 3 = 12_029.
+    try std.testing.expectEqual(@as(usize, 12_029), last.gate);
+    try std.testing.expectEqual(@as(usize, 12_030), last.up);
+    try std.testing.expectEqual(@as(usize, 12_031), last.down);
     try std.testing.expect(last.down < MetalCompute.metal_runtime.decoder_runtime_linear_slot_capacity);
 }
 

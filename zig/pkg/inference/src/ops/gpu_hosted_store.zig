@@ -90,7 +90,10 @@ pub const PrefetchQueue = prefetch_mod.Queue(*LazyWeightEntry);
 pub const ExpertSource = tensor_store_mod.TensorStore;
 
 pub const compact_runtime_layer_capacity = 30;
-pub const compact_runtime_slot_capacity = 16;
+/// Static per-layer slot capacity. Covers the maximum budget-derived
+/// expert-cache slot count (128); the configured active count is usually far
+/// smaller and arenas are only ever mapped for active slots.
+pub const compact_runtime_slot_capacity = 128;
 pub const CompactSlotRef = runtime.moe.streaming_cache.SlotRef;
 pub const CompactBudgetCategory = runtime.moe.budget_ledger.BudgetCategory;
 pub const CompactExpertCache = runtime.moe.streaming_cache.StreamingExpertCache(

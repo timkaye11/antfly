@@ -371,7 +371,6 @@ from .inference_model_info import InferenceModelInfo
 from .inference_model_kind import InferenceModelKind
 from .inference_model_quantization import InferenceModelQuantization
 from .inference_model_ref import InferenceModelRef
-from .inference_model_ref_expert_cache_slots import InferenceModelRefExpertCacheSlots
 from .inference_model_ref_memory_profile import InferenceModelRefMemoryProfile
 from .inference_models_response import InferenceModelsResponse
 from .inference_models_response_chunkers import InferenceModelsResponseChunkers
@@ -1080,7 +1079,6 @@ __all__ = (
     "InferenceModelKind",
     "InferenceModelQuantization",
     "InferenceModelRef",
-    "InferenceModelRefExpertCacheSlots",
     "InferenceModelRefMemoryProfile",
     "InferenceModelsResponse",
     "InferenceModelsResponseChunkers",

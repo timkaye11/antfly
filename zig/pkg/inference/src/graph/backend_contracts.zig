@@ -40,7 +40,9 @@ pub const BackendKind = enum {
 };
 
 /// Load-time memory profile requested for a model instance. Today the only
-/// profile is the 2 GB-class compact streaming profile for large MoE models.
+/// profile is the compact streaming profile for large MoE models; its
+/// residency envelope is set by `CompactInferenceRequest.memory_budget_mb`
+/// (floor and default: 2048 MiB).
 pub const CompactMemoryProfile = enum(u8) {
     compact_2gbs,
 };
@@ -50,8 +52,13 @@ pub const CompactMemoryProfile = enum(u8) {
 /// environment.
 pub const CompactInferenceRequest = struct {
     profile: CompactMemoryProfile = .compact_2gbs,
-    /// Resident routed-expert slots per MoE layer. 0 selects the automatic
-    /// tier; explicit values must be 8, 12, or 16.
+    /// Total resident memory budget in MiB. 0 selects the profile floor of
+    /// 2048 MiB. Nonzero values below the floor are rejected fail-closed;
+    /// anything at or above it is accepted and every derived knob (resident
+    /// ceiling, KV share, automatic expert-cache slots) scales from it.
+    memory_budget_mb: u32 = 0,
+    /// Resident routed-expert slots per MoE layer. 0 derives the count from
+    /// the memory budget; explicit values must lie in [4, 128].
     expert_cache_slots: u8 = 0,
     /// Parallel expert pread workers feeding the streaming cache.
     io_workers: u8 = 4,
@@ -59,8 +66,9 @@ pub const CompactInferenceRequest = struct {
     /// may only reduce it when the budget or shape requires.
     preferred_prefill_rows: u16 = 128,
     /// Diagnostic override of the resident footprint ceiling in bytes;
-    /// 0 keeps the profile's contract ceiling. Qualification runs must not
-    /// set this.
+    /// 0 keeps the budget-derived ceiling. When nonzero this wins over
+    /// `memory_budget_mb` for the enforced ceiling (slot derivation still
+    /// follows the budget). Qualification runs must not set this.
     resident_ceiling_override_bytes: u64 = 0,
 };
 
@@ -99,33 +107,64 @@ pub const qualified_compact_geometries = [_]CompactExpertGeometry{
 /// the generation instead of falling back to a full-expert-set route.
 pub const CompactInferenceConfig = struct {
     profile: CompactMemoryProfile,
-    /// Resolved resident routed-expert slots per MoE layer (8, 12, or 16).
+    /// Resolved resident routed-expert slots per MoE layer, in [4, 128].
     expert_cache_slots: u8,
     /// True when the caller left slot selection automatic; the residency
-    /// ledger may downshift tiers only in this mode.
+    /// ledger may downshift the slot count only in this mode.
     expert_cache_slots_auto: bool,
     io_workers: u8,
     preferred_prefill_rows: u16,
-    /// Hard process ceiling for phys_footprint under this profile.
+    /// Hard process ceiling for phys_footprint under this profile. Equal to
+    /// the memory budget unless the diagnostic override replaced it.
     resident_ceiling_bytes: u64 = default_resident_ceiling_bytes,
     /// Reserve kept free below the ceiling; crossing ceiling-reserve starts
     /// eviction and decommit, crossing the ceiling rejects or aborts.
     safety_reserve_bytes: u64 = default_safety_reserve_bytes,
+    /// Budget share reserved for the KV cache, derived from the memory
+    /// budget: max(384 MiB, min(budget / 4, 1 GiB)).
+    kv_budget_bytes: u64 = default_kv_budget_bytes,
     /// The compact profile budgets an FP16 KV cache.
     kv_dtype_f16: bool = true,
     geometry: CompactExpertGeometry,
 
-    pub const default_resident_ceiling_bytes: u64 = 2_120_000_000;
+    /// Budget floor; requests naming a smaller nonzero budget fail closed.
+    pub const min_memory_budget_mb: u32 = 2048;
+    /// Ceiling at the budget floor (2048 MiB).
+    pub const default_resident_ceiling_bytes: u64 =
+        @as(u64, min_memory_budget_mb) * 1024 * 1024;
     pub const default_safety_reserve_bytes: u64 = 128 * 1024 * 1024;
-    /// Automatic slot tier resolution order, highest first.
-    pub const slot_tiers = [_]u8{ 16, 12, 8 };
+    /// KV share at the budget floor: max(384 MiB, min(2048/4, 1024) MiB).
+    pub const default_kv_budget_bytes: u64 =
+        kvBudgetBytesForBudget(default_resident_ceiling_bytes);
+    /// Fixed non-expert residency estimate used by automatic slot
+    /// derivation: resident dense/shared weights plus scratch reserve.
+    pub const static_overhead_bytes: u64 = 700 * 1024 * 1024;
+    /// Explicit and derived expert-cache slot bounds. The runtime slot
+    /// capacity in gpu_hosted_store/metal_compute must cover the maximum.
+    pub const min_expert_cache_slots: u8 = 4;
+    pub const max_expert_cache_slots: u8 = 128;
+    /// Arena alignment shared with the Metal runtime's expert arenas.
+    pub const expert_arena_alignment: u64 = 16 * 1024;
 
     pub fn softLimitBytes(self: CompactInferenceConfig) u64 {
         return self.resident_ceiling_bytes -| self.safety_reserve_bytes;
     }
+
+    /// KV budget share for a total budget in bytes:
+    /// max(384 MiB, min(budget / 4, 1 GiB)), with the quarter share
+    /// quantized down to a whole MiB so budget knobs expressed in MiB (CLI,
+    /// server) can mirror the value exactly.
+    pub fn kvBudgetBytesForBudget(budget_bytes: u64) u64 {
+        const mib: u64 = 1024 * 1024;
+        const floor: u64 = 384 * mib;
+        const cap: u64 = 1024 * mib;
+        const quarter = (budget_bytes / 4 / mib) * mib;
+        return @max(floor, @min(quarter, cap));
+    }
 };
 
 pub const CompactConfigError = error{
+    CompactProfileBudgetTooSmall,
     CompactProfileInvalidExpertCacheSlots,
     CompactProfileInvalidIoWorkers,
     CompactProfileInvalidPrefillRows,
@@ -143,12 +182,45 @@ pub fn buildCompactInferenceConfig(
         if (std.meta.eql(candidate, geometry)) break true;
     } else false;
     if (!qualified) return error.CompactProfileUnsupportedGeometry;
+    // An explicitly named budget below the floor is a caller error, never a
+    // silent clamp; 0 selects the floor.
+    if (request.memory_budget_mb != 0 and
+        request.memory_budget_mb < CompactInferenceConfig.min_memory_budget_mb)
+    {
+        return error.CompactProfileBudgetTooSmall;
+    }
+    const budget_mb: u32 = if (request.memory_budget_mb == 0)
+        CompactInferenceConfig.min_memory_budget_mb
+    else
+        request.memory_budget_mb;
+    const budget_bytes = @as(u64, budget_mb) * 1024 * 1024;
+    const kv_budget_bytes = CompactInferenceConfig.kvBudgetBytesForBudget(budget_bytes);
     const slots_auto = request.expert_cache_slots == 0;
-    // Automatic selection starts at the highest tier; the residency ledger
-    // downshifts 16 -> 12 -> 8 only when the footprint ceiling demands it.
-    const slots: u8 = if (slots_auto) CompactInferenceConfig.slot_tiers[0] else switch (request.expert_cache_slots) {
-        8, 12, 16 => request.expert_cache_slots,
-        else => return error.CompactProfileInvalidExpertCacheSlots,
+    // Automatic selection spends whatever the budget leaves after the fixed
+    // static estimate and the KV share on resident expert arenas; the
+    // residency ledger downshifts from there only when the observed
+    // footprint ceiling demands it.
+    const slots: u8 = if (slots_auto) blk: {
+        const arena_bytes = std.mem.alignForward(
+            u64,
+            geometry.encoded_expert_bytes,
+            CompactInferenceConfig.expert_arena_alignment,
+        );
+        const per_slot_bytes = @as(u64, geometry.moe_layer_count) * arena_bytes;
+        const available = budget_bytes -|
+            CompactInferenceConfig.static_overhead_bytes -| kv_budget_bytes;
+        break :blk @intCast(std.math.clamp(
+            available / per_slot_bytes,
+            @as(u64, CompactInferenceConfig.min_expert_cache_slots),
+            @as(u64, CompactInferenceConfig.max_expert_cache_slots),
+        ));
+    } else blk: {
+        if (request.expert_cache_slots < CompactInferenceConfig.min_expert_cache_slots or
+            request.expert_cache_slots > CompactInferenceConfig.max_expert_cache_slots)
+        {
+            return error.CompactProfileInvalidExpertCacheSlots;
+        }
+        break :blk request.expert_cache_slots;
     };
     if (request.io_workers == 0 or request.io_workers > 8) {
         return error.CompactProfileInvalidIoWorkers;
@@ -163,6 +235,8 @@ pub fn buildCompactInferenceConfig(
         .expert_cache_slots_auto = slots_auto,
         .io_workers = request.io_workers,
         .preferred_prefill_rows = request.preferred_prefill_rows,
+        .resident_ceiling_bytes = budget_bytes,
+        .kv_budget_bytes = kv_budget_bytes,
         .geometry = geometry,
     };
     if (request.resident_ceiling_override_bytes != 0) {
@@ -174,10 +248,15 @@ pub fn buildCompactInferenceConfig(
 test "buildCompactInferenceConfig accepts only the qualified A4B geometry" {
     const good = qualified_compact_geometries[0];
     const config = try buildCompactInferenceConfig(.{}, good);
-    try std.testing.expectEqual(@as(u8, 16), config.expert_cache_slots);
+    // Automatic slots at the 2048 MiB budget floor with A4B geometry:
+    // (2048 - 700 static - 512 KV) MiB / (30 layers * 3_358_720 arena bytes)
+    // = 8.69 -> 8.
+    try std.testing.expectEqual(@as(u8, 8), config.expert_cache_slots);
     try std.testing.expect(config.expert_cache_slots_auto);
     try std.testing.expectEqual(@as(u8, 4), config.io_workers);
     try std.testing.expectEqual(@as(u16, 128), config.preferred_prefill_rows);
+    try std.testing.expectEqual(@as(u64, 2048) * 1024 * 1024, config.resident_ceiling_bytes);
+    try std.testing.expectEqual(@as(u64, 512) * 1024 * 1024, config.kv_budget_bytes);
     try std.testing.expectEqual(
         config.resident_ceiling_bytes - config.safety_reserve_bytes,
         config.softLimitBytes(),
@@ -197,14 +276,70 @@ test "buildCompactInferenceConfig accepts only the qualified A4B geometry" {
     );
 }
 
+test "buildCompactInferenceConfig derives slots and KV share from the budget" {
+    const good = qualified_compact_geometries[0];
+
+    // Explicit floor budget behaves exactly like the default.
+    const floor = try buildCompactInferenceConfig(.{ .memory_budget_mb = 2048 }, good);
+    try std.testing.expectEqual(@as(u8, 8), floor.expert_cache_slots);
+    try std.testing.expectEqual(@as(u64, 2048) * 1024 * 1024, floor.resident_ceiling_bytes);
+    try std.testing.expectEqual(@as(u64, 512) * 1024 * 1024, floor.kv_budget_bytes);
+
+    // 4 GiB: KV share caps at 1 GiB; (4096 - 700 - 1024) MiB of arenas.
+    const mid = try buildCompactInferenceConfig(.{ .memory_budget_mb = 4096 }, good);
+    try std.testing.expectEqual(@as(u8, 24), mid.expert_cache_slots);
+    try std.testing.expectEqual(@as(u64, 1024) * 1024 * 1024, mid.kv_budget_bytes);
+
+    // 8 GiB derives 67 slots; 16 GiB saturates at the 128-slot capacity.
+    const big = try buildCompactInferenceConfig(.{ .memory_budget_mb = 8192 }, good);
+    try std.testing.expectEqual(@as(u8, 67), big.expert_cache_slots);
+    try std.testing.expectEqual(@as(u64, 8192) * 1024 * 1024, big.resident_ceiling_bytes);
+    const huge = try buildCompactInferenceConfig(.{ .memory_budget_mb = 16384 }, good);
+    try std.testing.expectEqual(@as(u8, 128), huge.expert_cache_slots);
+    try std.testing.expect(huge.expert_cache_slots_auto);
+
+    // The diagnostic ceiling override wins over the budget-derived ceiling
+    // without touching slot derivation.
+    const overridden = try buildCompactInferenceConfig(.{
+        .memory_budget_mb = 8192,
+        .resident_ceiling_override_bytes = 1_000_000_000,
+    }, good);
+    try std.testing.expectEqual(@as(u64, 1_000_000_000), overridden.resident_ceiling_bytes);
+    try std.testing.expectEqual(@as(u8, 67), overridden.expert_cache_slots);
+
+    // Nonzero budgets below the floor fail closed instead of clamping.
+    try std.testing.expectError(
+        error.CompactProfileBudgetTooSmall,
+        buildCompactInferenceConfig(.{ .memory_budget_mb = 2047 }, good),
+    );
+    try std.testing.expectError(
+        error.CompactProfileBudgetTooSmall,
+        buildCompactInferenceConfig(.{ .memory_budget_mb = 1 }, good),
+    );
+}
+
 test "buildCompactInferenceConfig validates request knobs fail-closed" {
     const good = qualified_compact_geometries[0];
     const explicit = try buildCompactInferenceConfig(.{ .expert_cache_slots = 16 }, good);
     try std.testing.expectEqual(@as(u8, 16), explicit.expert_cache_slots);
     try std.testing.expect(!explicit.expert_cache_slots_auto);
+    // Any explicit count in [4, 128] is accepted regardless of budget.
+    const min_slots = try buildCompactInferenceConfig(.{ .expert_cache_slots = 4 }, good);
+    try std.testing.expectEqual(@as(u8, 4), min_slots.expert_cache_slots);
+    const odd_slots = try buildCompactInferenceConfig(.{ .expert_cache_slots = 10 }, good);
+    try std.testing.expectEqual(@as(u8, 10), odd_slots.expert_cache_slots);
+    const max_slots = try buildCompactInferenceConfig(.{
+        .memory_budget_mb = 16384,
+        .expert_cache_slots = 128,
+    }, good);
+    try std.testing.expectEqual(@as(u8, 128), max_slots.expert_cache_slots);
     try std.testing.expectError(
         error.CompactProfileInvalidExpertCacheSlots,
-        buildCompactInferenceConfig(.{ .expert_cache_slots = 10 }, good),
+        buildCompactInferenceConfig(.{ .expert_cache_slots = 3 }, good),
+    );
+    try std.testing.expectError(
+        error.CompactProfileInvalidExpertCacheSlots,
+        buildCompactInferenceConfig(.{ .expert_cache_slots = 129 }, good),
     );
     try std.testing.expectError(
         error.CompactProfileInvalidIoWorkers,

@@ -677,9 +677,11 @@ pub const ModelRef = struct {
     backend: ?ModelBackend = null,
     format: ?ModelFormat = null,
     quantization: ?ModelQuantization = null,
-    /// Load-time memory profile for this model instance. `compact_2gbs` selects the bounded streaming routed-expert runtime with an enforced 2 GB-class resident footprint ceiling. Only qualified model geometries load under a compact profile, the load fails closed otherwise, and request-time APIs cannot change residency policy.
+    /// Load-time memory profile for this model instance. `compact_2gbs` selects the bounded streaming routed-expert runtime with an enforced resident footprint ceiling sized by `memory_budget_mb` (default 2048 MiB). Only qualified model geometries load under a compact profile, the load fails closed otherwise, and request-time APIs cannot change residency policy.
     memory_profile: ?[]const u8 = null,
-    /// Resident routed-expert cache slots per MoE layer under a compact memory profile. Omission selects the automatic tier, which starts at the highest qualified tier and downshifts under the residency ceiling.
+    /// Total resident memory budget in MiB for the compact memory profile. The enforced footprint ceiling, the KV-cache share, and the automatic expert-cache slot count all derive from it. Omission keeps the 2048 MiB floor; values below the floor are rejected. Setting a budget without `memory_profile` implies the compact profile.
+    memory_budget_mb: ?i64 = null,
+    /// Resident routed-expert cache slots per MoE layer under a compact memory profile. Omission derives the count from `memory_budget_mb`, downshifting under residency-ceiling pressure; explicit values pin it within [4, 128].
     expert_cache_slots: ?i64 = null,
 };
 

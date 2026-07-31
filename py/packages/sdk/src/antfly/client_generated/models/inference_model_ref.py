@@ -10,7 +10,6 @@ from ..models.inference_model_backend import InferenceModelBackend
 from ..models.inference_model_format import InferenceModelFormat
 from ..models.inference_model_kind import InferenceModelKind
 from ..models.inference_model_quantization import InferenceModelQuantization
-from ..models.inference_model_ref_expert_cache_slots import InferenceModelRefExpertCacheSlots
 from ..models.inference_model_ref_memory_profile import InferenceModelRefMemoryProfile
 from ..types import UNSET, Unset
 
@@ -37,15 +36,20 @@ class InferenceModelRef:
         memory_profile (InferenceModelRefMemoryProfile | Unset): Load-time memory profile for this model instance.
             `compact_2gbs`
             selects the bounded streaming routed-expert runtime with an
-            enforced 2 GB-class resident footprint ceiling. Only qualified
-            model geometries load under a compact profile, the load fails
-            closed otherwise, and request-time APIs cannot change residency
-            policy.
-        expert_cache_slots (InferenceModelRefExpertCacheSlots | Unset): Resident routed-expert cache slots per MoE layer
-            under a compact
-            memory profile. Omission selects the automatic tier, which starts
-            at the highest qualified tier and downshifts under the residency
-            ceiling.
+            enforced resident footprint ceiling sized by `memory_budget_mb`
+            (default 2048 MiB). Only qualified model geometries load under a
+            compact profile, the load fails closed otherwise, and
+            request-time APIs cannot change residency policy.
+        memory_budget_mb (int | Unset): Total resident memory budget in MiB for the compact memory
+            profile. The enforced footprint ceiling, the KV-cache share, and
+            the automatic expert-cache slot count all derive from it.
+            Omission keeps the 2048 MiB floor; values below the floor are
+            rejected. Setting a budget without `memory_profile` implies the
+            compact profile.
+        expert_cache_slots (int | Unset): Resident routed-expert cache slots per MoE layer under a compact
+            memory profile. Omission derives the count from
+            `memory_budget_mb`, downshifting under residency-ceiling
+            pressure; explicit values pin it within [4, 128].
     """
 
     kind: InferenceModelKind
@@ -54,7 +58,8 @@ class InferenceModelRef:
     format_: InferenceModelFormat | Unset = UNSET
     quantization: InferenceModelQuantization | Unset = UNSET
     memory_profile: InferenceModelRefMemoryProfile | Unset = UNSET
-    expert_cache_slots: InferenceModelRefExpertCacheSlots | Unset = UNSET
+    memory_budget_mb: int | Unset = UNSET
+    expert_cache_slots: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -78,9 +83,9 @@ class InferenceModelRef:
         if not isinstance(self.memory_profile, Unset):
             memory_profile = self.memory_profile.value
 
-        expert_cache_slots: int | Unset = UNSET
-        if not isinstance(self.expert_cache_slots, Unset):
-            expert_cache_slots = self.expert_cache_slots.value
+        memory_budget_mb = self.memory_budget_mb
+
+        expert_cache_slots = self.expert_cache_slots
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -98,6 +103,8 @@ class InferenceModelRef:
             field_dict["quantization"] = quantization
         if memory_profile is not UNSET:
             field_dict["memory_profile"] = memory_profile
+        if memory_budget_mb is not UNSET:
+            field_dict["memory_budget_mb"] = memory_budget_mb
         if expert_cache_slots is not UNSET:
             field_dict["expert_cache_slots"] = expert_cache_slots
 
@@ -138,12 +145,9 @@ class InferenceModelRef:
         else:
             memory_profile = InferenceModelRefMemoryProfile(_memory_profile)
 
-        _expert_cache_slots = d.pop("expert_cache_slots", UNSET)
-        expert_cache_slots: InferenceModelRefExpertCacheSlots | Unset
-        if isinstance(_expert_cache_slots, Unset):
-            expert_cache_slots = UNSET
-        else:
-            expert_cache_slots = InferenceModelRefExpertCacheSlots(_expert_cache_slots)
+        memory_budget_mb = d.pop("memory_budget_mb", UNSET)
+
+        expert_cache_slots = d.pop("expert_cache_slots", UNSET)
 
         inference_model_ref = cls(
             kind=kind,
@@ -152,6 +156,7 @@ class InferenceModelRef:
             format_=format_,
             quantization=quantization,
             memory_profile=memory_profile,
+            memory_budget_mb=memory_budget_mb,
             expert_cache_slots=expert_cache_slots,
         )
 
