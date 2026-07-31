@@ -5457,13 +5457,39 @@ pub const NativeGenerationPipeline = struct {
             return null;
         }
         if (!isPureGreedyConfig(config)) {
-            // Sampled decoding: run the same fused decoder frame, read back the
-            // final logits, and sample on the host. Without this, temperature>0
-            // fell off the direct runtime onto the per-op eager path, making
-            // sampled chat ~15x slower than greedy on metal.
+            // Sampled decoding must stay on the fused decoder frame; without
+            // this it fell off onto the per-op eager path, making sampled chat
+            // ~15x slower than greedy on metal.
             if (backend_kind == .metal and self.gpt_config.family == .gemma and self.gpt_config.hasPle() and gemma4MetalDirectGreedyEnabled()) {
                 self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
                 const sampled_decode_context = decode_runtime.makeDecodeContext(seq_len, 1);
+                // Preferred: the backend-owned sampled frame (device-resident
+                // logit sampling / prepared sampled tail).
+                const sampling = graph_mod.model_runtime.SamplingConfig{
+                    .temperature = config.temperature,
+                    .top_p = config.top_p,
+                    .top_k = config.top_k,
+                    .min_p = config.min_p,
+                    .repetition_penalty = config.repetition_penalty,
+                    .frequency_penalty = config.frequency_penalty,
+                    .presence_penalty = config.presence_penalty,
+                };
+                if (try decoder_gated_runtime.forwardSampledToken(
+                    &self.cb,
+                    self.allocator,
+                    self.gpt_config,
+                    self.gpt_config.num_hidden_layers,
+                    token_ids[seq_len - 1],
+                    seq_len,
+                    &sampled_decode_context,
+                    sampling,
+                    token_ids[0..seq_len],
+                )) |sampled_token_id| {
+                    if (sampled_token_id < 0) return error.InvalidModelOutput;
+                    return .{ .token = @intCast(sampled_token_id) };
+                }
+                // Fallback: same fused forward, host-side sampling from the
+                // read-back logits.
                 if (try decoder_gated_runtime.forwardLastLogits(
                     &self.cb,
                     self.allocator,
