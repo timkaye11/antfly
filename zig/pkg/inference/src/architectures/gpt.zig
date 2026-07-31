@@ -8381,7 +8381,15 @@ fn beginCompactMoeBlock(
     try maybeDebugLayerTensorLastRow(cb, allocator, layer, "router_input", router_input, hidden_size);
 
     const router_proj_started_at = monotonicNowNs();
-    const router_logits = try cb.linearNoBias(router_input, router_w, total, hidden_size, num_experts);
+    // Allocate the router-logits output in Shared storage so the immediate host
+    // readback in finishMoeBlock/beginMoeBlock aliases the contents pointer
+    // directly (one frame drain, no private->host download command buffer).
+    cb.hintCompactRouterSharedOutput(true);
+    const router_logits = cb.linearNoBias(router_input, router_w, total, hidden_size, num_experts) catch |err| {
+        cb.hintCompactRouterSharedOutput(false);
+        return err;
+    };
+    cb.hintCompactRouterSharedOutput(false);
     errdefer cb.free(router_logits);
     try maybeDebugLayerTensorLastRow(cb, allocator, layer, "router_logits", router_logits, num_experts);
     try maybeDebugMoeRoutesLastRow(cb, allocator, layer, router_logits, num_experts, top_k);

@@ -46636,11 +46636,21 @@ int termite_metal_buffer_download(
     @autoreleasepool {
         id<MTLBuffer> src = (__bridge id<MTLBuffer>)handle;
         if (offset + length > src.length) return -2;
+        // Belt-and-braces: a flush is only needed when something is actually
+        // pending. If there is no submitted frame in flight and the active
+        // frame (if any) has encoded no work since begin, nothing can be
+        // draining into this buffer, so the flush would only cancel+rebegin an
+        // empty frame (pure churn). Skip it in that case.
+        const bool download_nothing_pending = (runtime == NULL) ||
+            ((runtime->submitted_frame_cb == nil) &&
+             (runtime->active_frame_cb == nil ||
+              termite_metal_decode_runtime_active_frame_empty(runtime)));
         if (src.storageMode == MTLStorageModeShared) {
             if (termite_metal_trace_frame_lifecycle_enabled()) {
                 fprintf(stderr, "metal_frame_lifecycle: buffer_download storage=shared length=%zu offset=%zu\n", length, offset);
             }
-            if (runtime != NULL && termite_metal_decode_runtime_flush_active_frame(runtime) != 0) return -8;
+            if (runtime != NULL && !download_nothing_pending &&
+                termite_metal_decode_runtime_flush_active_frame(runtime) != 0) return -8;
             memcpy(dst, (const uint8_t *)src.contents + offset, length);
             return 0;
         }
@@ -46648,7 +46658,8 @@ int termite_metal_buffer_download(
         if (termite_metal_trace_frame_lifecycle_enabled()) {
             fprintf(stderr, "metal_frame_lifecycle: buffer_download storage=private length=%zu offset=%zu\n", length, offset);
         }
-        if (termite_metal_decode_runtime_flush_active_frame(runtime) != 0) return -8;
+        if (!download_nothing_pending &&
+            termite_metal_decode_runtime_flush_active_frame(runtime) != 0) return -8;
         id<MTLBuffer> staging = [runtime->device newBufferWithLength:length options:MTLResourceStorageModeShared];
         if (staging == nil) return -4;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);

@@ -19509,6 +19509,18 @@ pub fn tryApplyQuantizedRuntimeLinearBiasGelu(
     );
 }
 
+/// Storage mode for a single-row device linear output. Honors the provider's
+/// narrowly-scoped `shared_linear_output_hint` (set only around the compact-MoE
+/// router projection) so the router-logits host readback can alias the Shared
+/// contents pointer directly instead of paying a private->host download CB.
+fn singleRowLinearOutputMode(self: anytype, rows: usize) metal_tensor.StorageMode {
+    if (rows != 1) return .private;
+    const info = @typeInfo(@TypeOf(self));
+    const T = if (info == .pointer) info.pointer.child else @TypeOf(self);
+    if (@hasField(T, "shared_linear_output_hint") and self.shared_linear_output_hint) return .shared;
+    return .private;
+}
+
 pub fn tryApplyQuantizedRuntimeLinear(
     self: anytype,
     slot: usize,
@@ -19566,7 +19578,7 @@ pub fn tryApplyQuantizedRuntimeLinear(
             if (!descriptor.supported()) return null;
         }
         const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
-        var output_device = try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &shape);
+        var output_device = try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), singleRowLinearOutputMode(self, rows), &shape);
         errdefer output_device.deinit();
         const device_rc = termite_metal_decode_runtime_apply_quantized_linear_slot_device(
             runtime,
@@ -20302,7 +20314,7 @@ pub fn tryApplyDenseRuntimeLinear(
 
     if (rows == 1 and input.isDevice()) {
         const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
-        var output_device = try MetalTensor.deviceAllocate(runtime, output_bytes, .private, &shape);
+        var output_device = try MetalTensor.deviceAllocate(runtime, output_bytes, singleRowLinearOutputMode(self, rows), &shape);
         errdefer output_device.deinit();
         const device_rc = termite_metal_decode_runtime_apply_linear_device(
             runtime,

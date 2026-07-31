@@ -92,6 +92,11 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     raw_quant_runtime_mapped_attempts: u64 = 0,
     raw_quant_runtime_mapped_fallbacks: u64 = 0,
     raw_quant_runtime_mapped_failures: u64 = 0,
+    // When set, the next single-row device linear allocates its output buffer
+    // with Shared storage instead of Private. Scoped narrowly around the
+    // compact-MoE router projection so the router-logits host readback can
+    // alias the Shared contents pointer directly (one drain, no download CB).
+    shared_linear_output_hint: bool = false,
     gathered_spans: std.AutoHashMapUnmanaged(GatheredSpanKey, GatheredSpanEntry) = .empty,
 
     pub fn create() !MetalNativeProvider {

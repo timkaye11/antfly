@@ -646,6 +646,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     backend_kv_write_serial: u64 = 0,
     dense_weight_cache: std.StringHashMapUnmanaged(CachedDenseWeight) = .empty,
     layer_output_scale_device_cache: std.AutoHashMapUnmanaged(usize, MetalTensor) = .empty,
+    /// Device mirror of each layer's MoE expert_output_scale on the device-MoE
+    /// route (ANTFLY_GEMMA4_DEVICE_MOE). The scale is constant per layer, so it
+    /// is uploaded once per session instead of once per token.
+    compact_device_moe_scale_cache: std.AutoHashMapUnmanaged(usize, MetalTensor) = .empty,
     unit_rms_weight_device_cache: std.AutoHashMapUnmanaged(usize, MetalTensor) = .empty,
     attention_mask_device_cache: ?MetalTensor = null,
     attention_mask_values_cache: []i64 = &.{},
@@ -3034,6 +3038,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var scale_it = self.layer_output_scale_device_cache.iterator();
         while (scale_it.next()) |entry| entry.value_ptr.deinit();
         self.layer_output_scale_device_cache.deinit(self.allocator);
+        var device_moe_scale_it = self.compact_device_moe_scale_cache.iterator();
+        while (device_moe_scale_it.next()) |entry| entry.value_ptr.deinit();
+        self.compact_device_moe_scale_cache.deinit(self.allocator);
         var unit_it = self.unit_rms_weight_device_cache.iterator();
         while (unit_it.next()) |entry| entry.value_ptr.deinit();
         self.unit_rms_weight_device_cache.deinit(self.allocator);
@@ -4121,6 +4128,35 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return true;
     }
 
+    /// Device mirror of a layer's MoE expert_output_scale, uploaded once per
+    /// session and reused every token on the device-MoE route (the scale is
+    /// constant per layer). Mirrors layerOutputScaleDeviceTensor.
+    fn compactDeviceMoeScaleTensor(
+        self: *MetalCompute,
+        scale_ct: CT,
+        layer_index: usize,
+        num_experts: usize,
+    ) !?MetalTensor {
+        if (self.compact_device_moe_scale_cache.getPtr(layer_index)) |cached| {
+            if (cached.isDevice() and cached.elemCount() >= num_experts) {
+                return try cached.retainedCopy();
+            }
+        }
+        var scale_device = try self.ownedDeviceMetalTensorFromCt(scale_ct);
+        errdefer scale_device.deinit();
+        if (!scale_device.isDevice() or scale_device.elemCount() < num_experts) {
+            scale_device.deinit();
+            return null;
+        }
+        const gop = try self.compact_device_moe_scale_cache.getOrPut(self.allocator, layer_index);
+        if (gop.found_existing) {
+            scale_device.deinit();
+        } else {
+            gop.value_ptr.* = scale_device;
+        }
+        return try gop.value_ptr.retainedCopy();
+    }
+
     /// Device-side routed-expert execution for one decode row: topk, gate/up,
     /// down, and the rank-ordered combine all run on the GPU against the
     /// published layer arena. Skips the router-logits readback entirely; the
@@ -4143,12 +4179,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var scale_device: ?MetalTensor = null;
         defer if (scale_device) |*tensor| tensor.deinit();
         if (request.expert_scale) |scale| {
-            var device = try self.ownedDeviceMetalTensorFromCt(scale);
-            if (!device.isDevice() or device.elemCount() < request.num_experts) {
-                device.deinit();
-                return null;
-            }
-            scale_device = device;
+            scale_device = (try self.compactDeviceMoeScaleTensor(
+                scale,
+                request.layer_index,
+                request.num_experts,
+            )) orelse return null;
         }
 
         const joined_step_frame = self.decode_step_frame_active and metal_runtime.hasActiveFrame(runtime);
@@ -20434,6 +20469,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return true;
     }
 
+    fn hintCompactRouterSharedOutputOp(ctx: *anyopaque, enable: bool) void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        self.provider_impl.shared_linear_output_hint = enable;
+    }
+
     fn endDecodeStepFrameOp(ctx: *anyopaque) anyerror!void {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (!self.decode_step_frame_active) return;
@@ -22379,6 +22419,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.finishMoeBlock = finishMoeBlockOp;
         vt.beginDecodeStepFrame = beginDecodeStepFrameOp;
         vt.endDecodeStepFrame = endDecodeStepFrameOp;
+        vt.hintCompactRouterSharedOutput = hintCompactRouterSharedOutputOp;
         vt.add = addOp;
         vt.multiply = multiplyOp;
         vt.debugTimingSnapshot = debugTimingSnapshotOp;

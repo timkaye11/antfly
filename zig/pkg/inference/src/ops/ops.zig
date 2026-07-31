@@ -1513,6 +1513,13 @@ pub const ComputeBackend = struct {
         beginDecodeStepFrame: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
         endDecodeStepFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 
+        /// Hint that the next single-row device linear should allocate its
+        /// output with Shared storage so the following host readback can alias
+        /// the contents pointer (no private->host download). Scoped narrowly
+        /// around the compact-MoE router projection; backends without the hint
+        /// leave this null.
+        hintCompactRouterSharedOutput: ?*const fn (ctx: *anyopaque, enable: bool) void = null,
+
         /// Store a per-expert output scale tensor for the current MoE layer.
         /// The graph backend threads this into fused_moe_scatter_add so the
         /// interpreter can apply it to route weights at execution time.
@@ -4012,6 +4019,12 @@ pub const ComputeBackend = struct {
 
     pub fn endDecodeStepFrame(self: *const ComputeBackend) !void {
         if (self.vtable.endDecodeStepFrame) |op| return op(self.ptr);
+    }
+
+    /// Enable/disable the Shared-output hint for the compact-MoE router
+    /// projection. No-op on backends that do not implement it.
+    pub fn hintCompactRouterSharedOutput(self: *const ComputeBackend, enable: bool) void {
+        if (self.vtable.hintCompactRouterSharedOutput) |op| op(self.ptr, enable);
     }
 
     /// GPU-accelerated LoRA gradient accumulation.
