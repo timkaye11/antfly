@@ -115,6 +115,23 @@ because speculative decoding disables prompt-prefix reuse (the
 `!use_speculative` eligibility gate in `pipelines/generation.zig`) and forfeits
 the multi-turn TTFT win. Use `generate --draft-model` for the speculative path.
 
+### Sampling performance and temperature
+
+Sampled decoding (temperature > 0, chat's default is 0.7) runs through the
+backend-owned sampled decoder frame
+(`decoder_gated_runtime.forwardSampledToken`: device-resident Gumbel/top-k
+sampling with a prepared sampled tail), the same fused frame family as greedy
+decoding. Reference numbers on an M4 Pro with the E2B QAT q4_0 checkpoint:
+~52 tok/s sampled, ~80 tok/s greedy. Before this wiring, non-greedy configs
+fell off the fused frame onto the per-op eager path (~5 tok/s), and the host
+sampler's top-k/top-p were O(k·vocab) rescans — both are fixed, so do not
+"optimize" chat by forcing temperature 0 for speed.
+
+One temperature note for the QAT checkpoints: at temperature >= 0.7 the model
+sometimes spends its whole turn in the thought channel and ends without a
+public reply (chat prints an explicit notice instead of a blank response);
+temperature 0-0.3 transitions to the public answer reliably.
+
 ### Channel transition conventions
 
 The final-channel projection accepts two observed checkpoint conventions for
