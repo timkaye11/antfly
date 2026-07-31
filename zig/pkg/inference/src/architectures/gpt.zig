@@ -574,6 +574,15 @@ pub fn forward(
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
     const total = batch * query_seq_len;
 
+    // Compact-MoE decode: hold one backend frame open across the whole
+    // single-token step so every eager op encodes into a single submission.
+    // Host readbacks (per-layer router logits, final sampling logits) flush
+    // and reopen the frame; the deferred end cancels the trailing empty
+    // frame after the logits have been materialized for sampling.
+    const step_frame_open = total == 1 and decode_context != null and config.usesMoe() and
+        try cb.beginDecodeStepFrame();
+    defer if (step_frame_open) cb.endDecodeStepFrame() catch {};
+
     const embed_w = try getEmbeddingWeight(cb, config);
     defer cb.free(embed_w);
     const embedded = try cb.embeddingLookup(embed_w, input_ids, total, hidden_size);
@@ -838,6 +847,11 @@ pub fn forwardGreedyLastToken(
     const hidden_size = config.hidden_size;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
     const total = batch * query_seq_len;
+
+    // Compact-MoE decode: token-scoped frame; see forward() for semantics.
+    const step_frame_open = total == 1 and decode_context != null and config.usesMoe() and
+        try cb.beginDecodeStepFrame();
+    defer if (step_frame_open) cb.endDecodeStepFrame() catch {};
 
     const embed_w = try getEmbeddingWeight(cb, config);
     defer cb.free(embed_w);

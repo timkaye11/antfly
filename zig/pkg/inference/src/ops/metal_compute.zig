@@ -495,6 +495,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
     };
 
+    /// Per-decode-step aggregation for the ANTFLY_GEMMA4_COMPACT_TIMING
+    /// breakdown. Reset by beginDecodeStepFrameOp, printed and folded into
+    /// counters by endDecodeStepFrameOp. All fields stay zero when the
+    /// timing env is unset so the hot path only pays the reset.
+    const CompactStepStats = struct {
+        started_ns: u128 = 0,
+        router_readback_ns: u64 = 0,
+        io_wait_ns: u64 = 0,
+        publications_base: u64 = 0,
+        frame_begins_base: u64 = 0,
+        frame_submits_base: u64 = 0,
+        frame_wait_base: u64 = 0,
+        frame_gpu_base: u64 = 0,
+    };
+
     pub const ReservedHiddenStatePair = struct {
         front: CT,
         back: CT,
@@ -655,6 +670,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     resident_expert_device_input_reuses: u64 = 0,
     resident_expert_host_transfers: u64 = 0,
     pending_compact_moe_route: ?PendingCompactMoeRoute = null,
+    /// True while a token-scoped decode-step frame opened by
+    /// beginDecodeStepFrameOp is live; endDecodeStepFrameOp clears it.
+    decode_step_frame_active: bool = false,
+    compact_frame_begins: u64 = 0,
+    compact_frame_flushes: u64 = 0,
+    compact_step_stats: CompactStepStats = .{},
     next_dynamic_layer_norm_slot: usize = metal_runtime.decoder_runtime_layer_norm_slot_capacity,
     next_dynamic_rms_norm_slot: usize = metal_runtime.decoder_runtime_rms_norm_slot_capacity,
     active_prefill_frame_plan: ?metal_command_planner.GatedFrameCommandLowerer = null,
@@ -3677,7 +3698,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (pending.layer_index != request.layer_index) return false;
         if (pending.load_batch) |*batch| {
             defer pending.load_batch = null;
+            const io_started_at = if (getenvBool("ANTFLY_GEMMA4_COMPACT_TIMING")) monotonicNowNs() else 0;
             batch.finish(pending.layouts[0..pending.miss_count]) catch return false;
+            if (io_started_at != 0) {
+                self.compact_step_stats.io_wait_ns +|= @intCast(monotonicNowNs() - io_started_at);
+            }
         }
 
         for (0..pending.miss_count) |miss_index| {
@@ -4094,8 +4119,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
         if (!input_device.isDevice() or input_device.elemCount() != request.hidden_size) return null;
 
-        var frame_active = try self.beginDecoderRuntimeFrame(runtime);
-        if (!frame_active) return null;
+        // Join a token-scoped decode-step frame when one is open: the expert
+        // dispatches then encode into the step's command buffer and the next
+        // host readback (the following layer's router logits) submits them.
+        // Only when no frame is active does this route own its own frame.
+        const joined_step_frame = self.decode_step_frame_active and metal_runtime.hasActiveFrame(runtime);
+        var frame_active = if (joined_step_frame) false else try self.beginDecoderRuntimeFrame(runtime);
+        if (!joined_step_frame and !frame_active) return null;
         defer self.cancelDecoderRuntimeFrame(runtime, &frame_active);
 
         var accumulated: ?MetalTensor = null;
@@ -4171,13 +4201,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
         }
 
-        try self.submitAndWaitDecoderRuntimeFrame(runtime, &frame_active);
+        if (!joined_step_frame) try self.submitAndWaitDecoderRuntimeFrame(runtime, &frame_active);
         const result = accumulated orelse return null;
         accumulated = null;
         if (compact_timing) {
             const finished_at = monotonicNowNs();
             std.debug.print(
-                "gemma4_resident_moe_timing: layer={d} residency_ms={d} execute_ms={d} total_ms={d} hits={d} misses={d}\n",
+                "gemma4_resident_moe_timing: layer={d} residency_ms={d} execute_ms={d} total_ms={d} hits={d} misses={d} joined_frame={}\n",
                 .{
                     request.layer_index,
                     residency_ns / std.time.ns_per_ms,
@@ -4185,6 +4215,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     (finished_at - compact_started_at) / std.time.ns_per_ms,
                     self.resident_expert_hits - hits_before,
                     self.resident_expert_misses - misses_before,
+                    joined_step_frame,
                 },
             );
         }
@@ -4218,6 +4249,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const compact_started_at = if (compact_timing) monotonicNowNs() else 0;
         const logits = try toFloat32Op(ctx, request.router_logits, self.allocator);
         defer self.allocator.free(logits);
+        if (compact_timing) {
+            // The router readback is the per-layer sync point: inside a
+            // decode-step frame it submits and waits on everything encoded
+            // since the previous readback.
+            self.compact_step_stats.router_readback_ns +|= @intCast(monotonicNowNs() - compact_started_at);
+        }
         if (logits.len != request.num_experts) {
             if (mandatory) return error.CompactMoeRouterShapeMismatch;
             return false;
@@ -19918,6 +19955,67 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.clearPendingPrefillKvDeviceSeeds();
     }
 
+    /// Token-scoped decode-step frame for the compact MoE eager path: hold
+    /// one decoder-runtime frame open across a whole single-token decode
+    /// step so every eager op joins one command buffer. Host readbacks
+    /// (per-layer router logits, final sampling logits) flush and reopen the
+    /// frame, costing one sync each instead of one per op. Gated to compact
+    /// sessions so the dense/gated whole-token runtime paths never see an
+    /// unexpected pre-opened frame.
+    fn beginDecodeStepFrameOp(ctx: *anyopaque) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (self.data.compact_runtime == null) return false;
+        if (getenvBool("ANTFLY_GEMMA4_DISABLE_DECODE_STEP_FRAME")) return false;
+        if (self.decode_step_frame_active) return false;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        if (metal_runtime.hasActiveFrame(runtime) or metal_runtime.hasSubmittedFrame(runtime)) return false;
+        if (!(try self.beginDecoderRuntimeFrame(runtime))) return false;
+        self.decode_step_frame_active = true;
+        self.compact_frame_begins += 1;
+        const snapshot = metal_runtime.runtimeMemorySnapshot(runtime);
+        self.compact_step_stats = .{
+            .started_ns = if (getenvBool("ANTFLY_GEMMA4_COMPACT_TIMING")) monotonicNowNs() else 0,
+            .publications_base = self.resident_expert_whole_publications,
+            .frame_begins_base = snapshot.frame_begin_count,
+            .frame_submits_base = snapshot.frame_submit_count,
+            .frame_wait_base = snapshot.frame_wait_nanos,
+            .frame_gpu_base = snapshot.frame_gpu_nanos,
+        };
+        return true;
+    }
+
+    fn endDecodeStepFrameOp(ctx: *anyopaque) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!self.decode_step_frame_active) return;
+        self.decode_step_frame_active = false;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return;
+        var active = metal_runtime.hasActiveFrame(runtime);
+        try self.submitAndWaitDecoderRuntimeFrame(runtime, &active);
+        const snapshot = metal_runtime.runtimeMemorySnapshot(runtime);
+        // The runtime's begin counter also increments on every flush-reopen,
+        // so the per-step delta minus the step's own begin counts the
+        // intermediate host-readback syncs.
+        const begins_delta = snapshot.frame_begin_count -| self.compact_step_stats.frame_begins_base;
+        self.compact_frame_flushes += begins_delta -| 1;
+        if (self.compact_step_stats.started_ns != 0) {
+            const step_ns = monotonicNowNs() - self.compact_step_stats.started_ns;
+            std.debug.print(
+                "gemma4_compact_step_timing: step_ms={d} router_readback_ms={d} io_wait_ms={d} publishes={d} frame_begins={d} frame_submits={d} frame_wait_ms={d} frame_gpu_ms={d}\n",
+                .{
+                    step_ns / std.time.ns_per_ms,
+                    self.compact_step_stats.router_readback_ns / std.time.ns_per_ms,
+                    self.compact_step_stats.io_wait_ns / std.time.ns_per_ms,
+                    self.resident_expert_whole_publications -| self.compact_step_stats.publications_base,
+                    begins_delta,
+                    snapshot.frame_submit_count -| self.compact_step_stats.frame_submits_base,
+                    (snapshot.frame_wait_nanos -| self.compact_step_stats.frame_wait_base) / std.time.ns_per_ms,
+                    (snapshot.frame_gpu_nanos -| self.compact_step_stats.frame_gpu_base) / std.time.ns_per_ms,
+                },
+            );
+        }
+        self.compact_step_stats = .{};
+    }
+
     fn decoderRuntimeBeginFrameOp(ctx: *anyopaque) anyerror!bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const runtime = self.provider_impl.raw_decode_runtime orelse return false;
@@ -20151,6 +20249,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_compact_expert_fused_frame_fallbacks = self.resident_expert_fused_frame_fallbacks;
         stats.metal_compact_expert_device_input_reuses = self.resident_expert_device_input_reuses;
         stats.metal_compact_expert_host_transfers = self.resident_expert_host_transfers;
+        stats.metal_compact_frame_begins = self.compact_frame_begins;
+        stats.metal_compact_frame_flushes = self.compact_frame_flushes;
         if (self.data.compact_runtime) |state| {
             const cache_counts = state.cache.counts();
             const occupied = cache_counts.resident + cache_counts.in_flight;
@@ -21816,6 +21916,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.runMoeBlock = runMoeBlockOp;
         vt.beginMoeBlock = beginMoeBlockOp;
         vt.finishMoeBlock = finishMoeBlockOp;
+        vt.beginDecodeStepFrame = beginDecodeStepFrameOp;
+        vt.endDecodeStepFrame = endDecodeStepFrameOp;
         vt.add = addOp;
         vt.multiply = multiplyOp;
         vt.debugTimingSnapshot = debugTimingSnapshotOp;
