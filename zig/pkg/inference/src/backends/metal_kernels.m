@@ -44599,6 +44599,122 @@ int termite_metal_decode_runtime_reset_state(termite_metal_decode_runtime *runti
     return 0;
 }
 
+// Drop every persistent alias of `buffer` so releasing a graph-plan slot
+// actually frees its memory: the alias fields hold strong references, and a
+// stale alias with a nonzero capacity would also hand later encodes a buffer
+// the plan no longer owns. Identity compares keep this safe for the
+// attention-span slot-0 pair, which holds either the scratch alias of plan
+// slots 15/16 (cleared here) or a sequence's persistent KV buffers (never
+// plan-aliased, left untouched).
+static void termite_metal_decode_runtime_clear_graph_plan_buffer_aliases(
+    termite_metal_decode_runtime *runtime,
+    id<MTLBuffer> buffer
+) {
+    if (runtime == NULL || buffer == nil) return;
+    for (size_t i = 0; i < 6; ++i) {
+        if (runtime->active_layer_projection_buffers[i] == buffer) {
+            runtime->active_layer_projection_buffers[i] = nil;
+            runtime->active_layer_projection_capacities[i] = 0;
+        }
+    }
+    for (size_t i = 0; i < TERMITE_METAL_DIRECT_BLOCK_HIDDEN_BUFFER_COUNT; ++i) {
+        if (runtime->direct_block_hidden_buffers[i] == buffer) {
+            runtime->direct_block_hidden_buffers[i] = nil;
+            runtime->direct_block_hidden_capacity = 0;
+        }
+    }
+    if (runtime->direct_block_q_buffer == buffer) {
+        runtime->direct_block_q_buffer = nil;
+        runtime->direct_block_q_capacity = 0;
+    }
+    if (runtime->sample_logits_buffer == buffer) {
+        runtime->sample_logits_buffer = nil;
+        runtime->sample_logits_capacity = 0;
+    }
+    if (runtime->sample_topk_values_buffer == buffer) {
+        runtime->sample_topk_values_buffer = nil;
+        runtime->sample_topk_capacity = 0;
+    }
+    if (runtime->sample_topk_ids_buffer == buffer) {
+        runtime->sample_topk_ids_buffer = nil;
+        runtime->sample_topk_capacity = 0;
+    }
+    if (runtime->scratch_buffer == buffer) {
+        runtime->scratch_buffer = nil;
+        runtime->scratch_capacity = 0;
+    }
+    if (runtime->attention_span_encoded_key_buffers[0] == buffer) {
+        runtime->attention_span_encoded_key_buffers[0] = nil;
+        runtime->attention_span_encoded_key_capacities[0] = 0;
+    }
+    if (runtime->attention_span_v_buffers[0] == buffer) {
+        runtime->attention_span_v_buffers[0] = nil;
+        runtime->attention_span_v_capacities[0] = 0;
+    }
+    if (runtime->attention_span_encoded_key_buffer == buffer) {
+        runtime->attention_span_encoded_key_buffer = nil;
+        runtime->attention_span_encoded_key_capacity = 0;
+    }
+    if (runtime->attention_span_v_buffer == buffer) {
+        runtime->attention_span_v_buffer = nil;
+        runtime->attention_span_v_capacity = 0;
+    }
+    for (size_t i = 0; i < 4; ++i) {
+        if (runtime->hot_hidden_buffers[i] == buffer) {
+            runtime->hot_hidden_buffers[i] = nil;
+            runtime->hot_hidden_capacity = 0;
+        }
+    }
+    for (size_t i = 0; i < 5; ++i) {
+        if (runtime->hot_intermediate_buffers[i] == buffer) {
+            runtime->hot_intermediate_buffers[i] = nil;
+            runtime->hot_intermediate_capacity = 0;
+        }
+    }
+}
+
+// Footprint-diet trim for the compact profile's soft-pressure reaction:
+// release transient pool buffers that only exist as high-water reuse caches.
+// Never runs while a frame is active or submitted — with neither, no queued
+// GPU work can still reference these buffers, and every consumer re-reserves
+// (or re-plans) capacity before its next use.
+//
+// Released classes:
+// - scratch-pool slots that are idle (not in use, no pending frame release);
+// - graph-plan slots outside the currently committed plan (all of them when
+//   no plan is active), including the attention-span scratch slots 15/16,
+//   together with every persistent alias into the released buffers so the
+//   next commit truly reallocates.
+//
+// Returns the number of released buffers, 0 when nothing was releasable (or
+// a frame was active), -1 on a missing runtime.
+int termite_metal_decode_runtime_trim_transient_pools(termite_metal_decode_runtime *runtime) {
+    if (runtime == NULL) return -1;
+    if (runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return 0;
+    int released = 0;
+    @autoreleasepool {
+        for (size_t slot = 0; slot < TERMITE_METAL_SCRATCH_POOL_CAPACITY; ++slot) {
+            if (runtime->scratch_pool_buffers[slot] == nil) continue;
+            if (runtime->scratch_pool_in_use[slot] != 0) continue;
+            if (runtime->scratch_pool_pending_frame_release[slot] != 0) continue;
+            runtime->scratch_pool_buffers[slot] = nil;
+            runtime->scratch_pool_capacities[slot] = 0;
+            released += 1;
+        }
+        for (size_t slot = 0; slot < TERMITE_METAL_GRAPH_PLAN_SLOT_CAPACITY; ++slot) {
+            if (runtime->graph_plan_buffers[slot] == nil) continue;
+            if (runtime->graph_plan_active != 0 && runtime->graph_plan_requested_bytes[slot] != 0) continue;
+            id<MTLBuffer> buffer = runtime->graph_plan_buffers[slot];
+            termite_metal_decode_runtime_clear_graph_plan_buffer_aliases(runtime, buffer);
+            runtime->graph_plan_buffers[slot] = nil;
+            runtime->graph_plan_capacities[slot] = 0;
+            runtime->graph_plan_requested_bytes[slot] = 0;
+            released += 1;
+        }
+    }
+    return released;
+}
+
 // Phase 4 — frame API. See struct declaration for semantics. When a
 // frame is active, internal `encode_*` helpers and public
 // `apply_*_device` entrypoints that opt in will encode into the active
