@@ -6577,6 +6577,7 @@ fn serverGenerateSupportsOptions(opts: Options) bool {
         !opts.debug_gemma4_target and
         !opts.disable_gemma_embedding_scale and
         opts.memory_profile == null and
+        opts.memory_budget_mb == 0 and
         opts.prefill_chunk_size == 0 and
         opts.host_budget_mb == 0 and
         opts.backend_budget_mb == 0 and
