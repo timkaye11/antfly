@@ -39,6 +39,11 @@
 #define TERMITE_METAL_LINEAR_SLOT_CAPACITY 12288
 #define TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY 256
 #define TERMITE_METAL_SCRATCH_POOL_CAPACITY 16
+// Compact MoE expert arenas are stable anonymous mappings (one per
+// layer x slot, <= 30 x 128 = 3840); republishing a slot re-wraps the same
+// base pointer, so the no-copy MTLBuffer is cached per (base, length).
+// Power of two >= 2x the arena bound keeps open-addressing probes short.
+#define TERMITE_METAL_EXPERT_ARENA_BUFFER_CACHE_CAPACITY 8192u
 #define TERMITE_METAL_GENERATED_DECODE_THREADS 256u
 #define TERMITE_METAL_GENERATED_FLASH_THREADS 128u
 #define TERMITE_METAL_GENERATED_FLASH_HD512_THREADS 256u
@@ -1429,6 +1434,15 @@ typedef struct termite_metal_decode_runtime {
     BOOL generated_quant_disabled_initialized;
     termite_metal_generated_gate_entry generated_gate_cache[TERMITE_METAL_GENERATED_GATE_CACHE_CAPACITY];
     size_t generated_gate_cache_len;
+    // Open-addressing cache of no-copy MTLBuffers wrapping compact expert
+    // arenas, keyed by (base pointer, mapped length). Entries persist for the
+    // runtime's lifetime (arenas are never unmapped while the runtime lives);
+    // destroy releases them.
+    const void *expert_arena_buffer_cache_ptrs[TERMITE_METAL_EXPERT_ARENA_BUFFER_CACHE_CAPACITY];
+    size_t expert_arena_buffer_cache_lens[TERMITE_METAL_EXPERT_ARENA_BUFFER_CACHE_CAPACITY];
+    id<MTLBuffer> expert_arena_buffer_cache_buffers[TERMITE_METAL_EXPERT_ARENA_BUFFER_CACHE_CAPACITY];
+    uint64_t expert_arena_buffer_cache_hits;
+    uint64_t expert_arena_buffer_cache_misses;
 } termite_metal_decode_runtime;
 
 // Generated-route env gates are resolved once per decode-runtime instance and
@@ -19280,6 +19294,11 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
         runtime->scratch_pool_in_use[slot] = 0;
         runtime->scratch_pool_pending_frame_release[slot] = 0;
     }
+    for (size_t slot = 0; slot < TERMITE_METAL_EXPERT_ARENA_BUFFER_CACHE_CAPACITY; ++slot) {
+        runtime->expert_arena_buffer_cache_ptrs[slot] = NULL;
+        runtime->expert_arena_buffer_cache_lens[slot] = 0;
+        runtime->expert_arena_buffer_cache_buffers[slot] = nil;
+    }
     for (size_t slot = 0; slot < TERMITE_METAL_GRAPH_PLAN_SLOT_CAPACITY; ++slot) {
         runtime->graph_plan_buffers[slot] = nil;
         runtime->graph_plan_capacities[slot] = 0;
@@ -24062,6 +24081,66 @@ int termite_metal_decode_runtime_prepare_quantized_linear_slot_no_copy_region(
     }
 }
 
+// Cached no-copy wrap of a compact expert arena. Arenas are page-aligned
+// anonymous mappings whose base address is stable for the slot's lifetime
+// (decommit uses madvise, keeping the VA), so a republish can reinstall the
+// slot views over the buffer created on the first publish. Linear-probe
+// open addressing; a same-pointer entry with a different length is replaced
+// (a remapped arena must not alias the old wrap). Returns nil only when
+// buffer creation itself fails; a full table falls back to an uncached wrap.
+static id<MTLBuffer> termite_metal_decode_runtime_cached_expert_arena_buffer(
+    termite_metal_decode_runtime *runtime,
+    const void *base,
+    size_t length
+) {
+    const size_t capacity = TERMITE_METAL_EXPERT_ARENA_BUFFER_CACHE_CAPACITY;
+    const size_t mask = capacity - 1u;
+    // Fibonacci hash of the page number: arena bases are page-aligned, so
+    // dropping the offset bits before mixing keeps the distribution flat.
+    size_t index = (size_t)((((uintptr_t)base >> 12) * (uintptr_t)0x9E3779B97F4A7C15ull) & mask);
+    for (size_t probe = 0; probe < capacity; ++probe) {
+        const size_t at = (index + probe) & mask;
+        const void *entry_ptr = runtime->expert_arena_buffer_cache_ptrs[at];
+        if (entry_ptr == base) {
+            if (runtime->expert_arena_buffer_cache_lens[at] == length &&
+                runtime->expert_arena_buffer_cache_buffers[at] != nil)
+            {
+                runtime->expert_arena_buffer_cache_hits += 1;
+                return runtime->expert_arena_buffer_cache_buffers[at];
+            }
+            id<MTLBuffer> replacement = [runtime->device
+                newBufferWithBytesNoCopy:(void *)base
+                                  length:length
+                                 options:MTLResourceStorageModeShared
+                             deallocator:nil];
+            if (replacement == nil) return nil;
+            runtime->expert_arena_buffer_cache_lens[at] = length;
+            runtime->expert_arena_buffer_cache_buffers[at] = replacement;
+            runtime->expert_arena_buffer_cache_misses += 1;
+            return replacement;
+        }
+        if (entry_ptr == NULL) {
+            id<MTLBuffer> created = [runtime->device
+                newBufferWithBytesNoCopy:(void *)base
+                                  length:length
+                                 options:MTLResourceStorageModeShared
+                             deallocator:nil];
+            if (created == nil) return nil;
+            runtime->expert_arena_buffer_cache_ptrs[at] = base;
+            runtime->expert_arena_buffer_cache_lens[at] = length;
+            runtime->expert_arena_buffer_cache_buffers[at] = created;
+            runtime->expert_arena_buffer_cache_misses += 1;
+            return created;
+        }
+    }
+    runtime->expert_arena_buffer_cache_misses += 1;
+    return [runtime->device
+        newBufferWithBytesNoCopy:(void *)base
+                          length:length
+                         options:MTLResourceStorageModeShared
+                     deallocator:nil];
+}
+
 // Atomically publish one page-aligned Q4_0 expert arena as three linear
 // projection views. Validation completes before any runtime slot is changed,
 // and one MTLBuffer owns the gate/up/down regions for the arena lifetime.
@@ -24106,11 +24185,8 @@ int termite_metal_decode_runtime_prepare_q4_0_expert_slot_no_copy_region(
     if (rc != 0) return -50 + rc;
     if (!termite_metal_can_make_no_copy_buffer(mapped_raw, mapped_bytes)) return -70;
     @autoreleasepool {
-        id<MTLBuffer> expert_buffer = [runtime->device
-            newBufferWithBytesNoCopy:(void *)mapped_raw
-                              length:mapped_bytes
-                             options:MTLResourceStorageModeShared
-                         deallocator:nil];
+        id<MTLBuffer> expert_buffer = termite_metal_decode_runtime_cached_expert_arena_buffer(
+            runtime, mapped_raw, mapped_bytes);
         if (expert_buffer == nil) return -71;
         termite_metal_decode_runtime_prepare_quantized_linear_slot_from_buffer(
             runtime, TERMITE_METAL_QUANT_FORMAT_Q4_0, gate_slot, expert_buffer,
