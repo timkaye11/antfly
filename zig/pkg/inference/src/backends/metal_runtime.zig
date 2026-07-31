@@ -15089,6 +15089,70 @@ pub extern fn termite_metal_decode_runtime_prepare_q4_0_expert_slot_no_copy_regi
     hidden_size: usize,
     intermediate_size: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_prepare_moe_q4_0_layer_arena(
+    runtime: ?*RawMetalDecodeRuntime,
+    layer: usize,
+    mapped_raw: [*c]const u8,
+    mapped_bytes: usize,
+    expert_offsets: [*c]const u32,
+    expert_count: usize,
+    expert_stride: usize,
+    gate_offset: usize,
+    up_offset: usize,
+    down_offset: usize,
+    hidden_size: usize,
+    inter_size: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_moe_q4_0_layer_arena_prepared(
+    runtime: ?*RawMetalDecodeRuntime,
+    layer: usize,
+    expert_count: usize,
+    hidden_size: usize,
+    inter_size: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_moe_forward_q4_0_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    layer: usize,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    router_logits_handle: ?*anyopaque,
+    router_logits_offset: usize,
+    total_rows: usize,
+    hidden_size: usize,
+    inter_size: usize,
+    num_experts: usize,
+    top_k: usize,
+    activation_kind: u32,
+    addressing_mode: u32,
+    expert_scale_handle: ?*anyopaque,
+    expert_scale_offset: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_moe_topk_host(
+    runtime: ?*RawMetalDecodeRuntime,
+    logits: [*c]const f32,
+    rows: usize,
+    num_experts: usize,
+    top_k: usize,
+    expert_ids_out: [*c]u32,
+    route_weights_out: [*c]f32,
+) c_int;
+pub extern fn termite_metal_decode_runtime_moe_forward_q4_0_host(
+    runtime: ?*RawMetalDecodeRuntime,
+    layer: usize,
+    input: [*c]const f32,
+    router_logits: [*c]const f32,
+    total_rows: usize,
+    hidden_size: usize,
+    inter_size: usize,
+    num_experts: usize,
+    top_k: usize,
+    activation_kind: u32,
+    addressing_mode: u32,
+    expert_scale: [*c]const f32,
+    output: [*c]f32,
+) c_int;
 pub extern fn termite_metal_decode_runtime_prepare_bitnet_tl1_linear_slot(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
@@ -19092,6 +19156,125 @@ pub fn decoderRuntimePrepareQ40ExpertArena(
     }
     borrowed_count = 0;
     return true;
+}
+
+/// Per-layer full-residency MoE arena slots on the decode runtime. Mirrors
+/// TERMITE_METAL_MOE_LAYER_SLOT_CAPACITY in metal_kernels.m.
+pub const decoder_runtime_moe_layer_capacity: usize = 32;
+pub const moe_addressing_flat: u32 = 0;
+pub const moe_addressing_indirect: u32 = 1;
+pub const moe_expert_slot_unmapped: u32 = 0xFFFF_FFFF;
+
+/// Publish one page-aligned multi-expert Q4_0 layer arena as a single
+/// no-copy device buffer plus a per-expert byte-offset table. Every expert
+/// shares one projection layout: `projection_offsets` gives the gate/up/down
+/// byte offsets relative to an expert's region start and `expert_stride` the
+/// region size. Used by the ANTFLY_GEMMA4_DEVICE_MOE decode route.
+pub fn decoderRuntimePrepareMoeQ40LayerArena(
+    self: anytype,
+    layer: usize,
+    arena: []const u8,
+    expert_offsets: []const u32,
+    expert_stride: usize,
+    projection_offsets: [3]usize,
+    hidden_size: usize,
+    inter_size: usize,
+) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (arena.len == 0 or expert_offsets.len == 0) return false;
+    const rc = termite_metal_decode_runtime_prepare_moe_q4_0_layer_arena(
+        runtime,
+        layer,
+        arena.ptr,
+        arena.len,
+        expert_offsets.ptr,
+        expert_offsets.len,
+        expert_stride,
+        projection_offsets[0],
+        projection_offsets[1],
+        projection_offsets[2],
+        hidden_size,
+        inter_size,
+    );
+    return rc == 0;
+}
+
+pub fn decoderRuntimeMoeLayerArenaPrepared(
+    self: anytype,
+    layer: usize,
+    expert_count: usize,
+    hidden_size: usize,
+    inter_size: usize,
+) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    return termite_metal_decode_runtime_moe_q4_0_layer_arena_prepared(
+        runtime,
+        layer,
+        expert_count,
+        hidden_size,
+        inter_size,
+    ) != 0;
+}
+
+/// Fully device-side routed-expert MoE forward against a prepared layer
+/// arena: device router logits in, device combined output out, no host
+/// readback. Encodes into the active frame when one is open. Returns null on
+/// any precondition failure so callers can fall back to the slot route.
+pub fn decoderRuntimeMoeForwardQ40(
+    self: anytype,
+    layer: usize,
+    input: MetalTensor,
+    router_logits: MetalTensor,
+    total_rows: usize,
+    hidden_size: usize,
+    inter_size: usize,
+    num_experts: usize,
+    top_k: usize,
+    activation_kind: u32,
+    expert_scale: ?MetalTensor,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (total_rows == 0 or hidden_size == 0 or inter_size == 0 or num_experts == 0) return null;
+    if (!input.isDevice() or !router_logits.isDevice()) return null;
+    if (input.elemCount() < total_rows * hidden_size) return null;
+    if (router_logits.elemCount() < total_rows * num_experts) return null;
+    if (expert_scale) |scale| {
+        if (!scale.isDevice() or scale.elemCount() < num_experts) return null;
+    }
+    const shape = [_]i32{ @intCast(total_rows), @intCast(hidden_size) };
+    var output = try MetalTensor.deviceAllocate(
+        runtime,
+        total_rows * hidden_size * @sizeOf(f32),
+        .private,
+        &shape,
+    );
+    errdefer output.deinit();
+    const rc = termite_metal_decode_runtime_moe_forward_q4_0_device(
+        runtime,
+        layer,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        router_logits.deviceHandle(),
+        router_logits.deviceByteOffset(),
+        total_rows,
+        hidden_size,
+        inter_size,
+        num_experts,
+        top_k,
+        activation_kind,
+        moe_addressing_indirect,
+        if (expert_scale) |scale| scale.deviceHandle() else null,
+        if (expert_scale) |scale| scale.deviceByteOffset() else 0,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc != 0) {
+        output.deinit();
+        return null;
+    }
+    return output;
 }
 
 test "borrowQuantizedStorage borrows raw bytes and owns only metadata" {
