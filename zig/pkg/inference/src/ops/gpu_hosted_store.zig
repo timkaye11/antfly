@@ -13,10 +13,12 @@
 // limitations under the License.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const runtime = @import("../runtime/root.zig");
 const backend_contracts = @import("../graph/backend_contracts.zig");
+const c_file = @import("../util/c_file.zig");
 const tensor_store_mod = @import("../models/tensor_store.zig");
 const weight_source_mod = @import("../models/weight_source.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
@@ -78,6 +80,63 @@ pub const LazyWeightEntry = struct {
 };
 
 pub const PrefetchQueue = prefetch_mod.Queue(*LazyWeightEntry);
+
+/// The source a streaming expert is read from. Today this is always the
+/// GGUF-backed TensorStore, whose `describeQuantizedTensorRange` /
+/// `loadQuantizedExpertInto` vtable entries perform exactly one fused
+/// gate/up pread plus one down pread per expert. A verified contiguous
+/// sidecar would slot in behind the same interface if attribution ever
+/// proves the two-read layout blocks the performance gate.
+pub const ExpertSource = tensor_store_mod.TensorStore;
+
+pub const compact_runtime_layer_capacity = 30;
+pub const compact_runtime_slot_capacity = 16;
+pub const CompactSlotRef = runtime.moe.streaming_cache.SlotRef;
+pub const CompactExpertCache = runtime.moe.streaming_cache.StreamingExpertCache(
+    compact_runtime_layer_capacity,
+    compact_runtime_slot_capacity,
+);
+
+/// Backing memory for one resident-expert slot: a page-aligned anonymous
+/// arena published to the device as a no-copy buffer, plus the quantized
+/// layout views into it. The slot's lifecycle state lives in the
+/// backend-neutral `CompactExpertCache`, never here.
+pub const CompactExpertArena = struct {
+    arena: ?c_file.MmapRegion = null,
+    layout: ?tensor_store_mod.QuantizedExpertLayout = null,
+    /// Physical pages returned to the OS while the mapping (and its device
+    /// buffer) stays valid; must be recommitted before the next fill.
+    decommitted: bool = false,
+};
+
+/// Session-scoped compact streaming state shared by every compute wrapper:
+/// slot bookkeeping, the residency ledger, and the arenas that back device
+/// publication. Living on the WeightStore keeps cache contents warm across
+/// wrapper recreation and, later, across server requests.
+pub const CompactRuntimeState = struct {
+    cache: CompactExpertCache = .{},
+    ledger: runtime.moe.budget_ledger.ResidentBudgetLedger,
+    arenas: [compact_runtime_layer_capacity * compact_runtime_slot_capacity]CompactExpertArena =
+        [_]CompactExpertArena{.{}} ** (compact_runtime_layer_capacity * compact_runtime_slot_capacity),
+    /// True under a compact memory profile: budget pressure rejects work.
+    /// Opportunistic sessions keep the same machinery in report-only mode.
+    enforcing: bool = false,
+    evictions: u64 = 0,
+    decommitted_bytes: u64 = 0,
+
+    pub fn arenaAt(self: *CompactRuntimeState, layer: usize, slot: usize) *CompactExpertArena {
+        return &self.arenas[layer * compact_runtime_slot_capacity + slot];
+    }
+
+    pub fn deinitArenas(self: *CompactRuntimeState) void {
+        for (&self.arenas) |*slot| {
+            if (slot.layout) |*layout| layout.deinit();
+            slot.layout = null;
+            if (slot.arena) |*arena| arena.deinit();
+            slot.arena = null;
+        }
+    }
+};
 
 pub const JinaLoraAdapter = struct {
     allocator: std.mem.Allocator,
@@ -229,6 +288,10 @@ pub const WeightStore = struct {
     /// during session creation, before any compute wrapper exists. Presence
     /// makes the compact streaming route mandatory for routed experts.
     compact: ?backend_contracts.CompactInferenceConfig = null,
+    /// Shared compact streaming residency (slot cache, ledger, arenas).
+    /// Owned by the session; created when the model matches the qualified
+    /// streaming geometry, enforcing only under a compact contract.
+    compact_runtime: ?*CompactRuntimeState = null,
 };
 
 pub fn touchLazyWeight(data: *WeightStore, entry: *LazyWeightEntry) void {
@@ -351,102 +414,144 @@ fn parallelQuantLoadMain(task: *ParallelQuantLoadTask) void {
     };
 }
 
-const ParallelQuantLoader = struct {
-    const max_worker_count = 8;
+/// Bounded condition-variable worker pool for background weight reads.
+///
+/// One caller-owned batch at a time: `begin` publishes the task slice and
+/// wakes the workers; a second `begin` before the batch drains is an error,
+/// which bounds queued work to exactly one route's misses. Workers park on
+/// the work condition instead of spinning, and the batch waiter parks on a
+/// completion condition. `cancel` declines every not-yet-started task
+/// (surfaced as error.ExpertLoadCanceled); tasks already inside a pread
+/// finish normally. `deinit` is shutdown: stop, broadcast, join. Task
+/// errors — including short reads surfaced as error.IncompleteRead — stay
+/// on the task until the caller harvests results.
+fn LoadWorkerPool(comptime Task: type, comptime runTask: fn (*Task) void) type {
+    return struct {
+        const Self = @This();
+        const max_worker_count = 8;
 
-    mutex: std.atomic.Mutex = .unlocked,
-    workers: [max_worker_count]?std.Thread = [_]?std.Thread{null} ** max_worker_count,
-    worker_count: usize = 0,
-    tasks: ?[]ParallelQuantLoadTask = null,
-    next_task: usize = 0,
-    completed_tasks: usize = 0,
-    stop_workers: bool = false,
+        mutex: std.Io.Mutex = .init,
+        work_available: std.Io.Condition = .init,
+        batch_complete: std.Io.Condition = .init,
+        workers: [max_worker_count]?std.Thread = [_]?std.Thread{null} ** max_worker_count,
+        worker_count: usize = 0,
+        tasks: ?[]Task = null,
+        next_task: usize = 0,
+        completed_tasks: usize = 0,
+        canceled: bool = false,
+        stop_workers: bool = false,
 
-    fn lock(self: *ParallelQuantLoader) void {
-        while (!self.mutex.tryLock()) platform.time.yieldBriefly();
-    }
-
-    fn unlock(self: *ParallelQuantLoader) void {
-        self.mutex.unlock();
-    }
-
-    fn ensureStarted(self: *ParallelQuantLoader, requested_workers: usize) !void {
-        if (self.worker_count != 0) return;
-        const count = @min(@as(usize, max_worker_count), @max(@as(usize, 1), requested_workers));
-        self.stop_workers = false;
-        for (0..count) |index| {
-            self.workers[index] = try std.Thread.spawn(.{}, workerMain, .{self});
-            self.worker_count += 1;
+        /// Futex-capable Io for parking plain worker threads; mirrors the
+        /// metalComputeLockIo convention used elsewhere in this backend.
+        fn syncIo() std.Io {
+            return if (builtin.is_test) std.testing.io else std.Options.debug_io;
         }
-    }
 
-    fn workerMain(self: *ParallelQuantLoader) void {
-        while (true) {
-            var task: ?*ParallelQuantLoadTask = null;
-            self.lock();
-            if (self.stop_workers) {
-                self.unlock();
-                return;
+        fn ensureStarted(self: *Self, requested_workers: usize) !void {
+            const io = syncIo();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            if (self.worker_count != 0) return;
+            const count = @min(@as(usize, max_worker_count), @max(@as(usize, 1), requested_workers));
+            self.stop_workers = false;
+            for (0..count) |index| {
+                self.workers[index] = try std.Thread.spawn(.{}, workerMain, .{self});
+                self.worker_count += 1;
             }
-            if (self.tasks) |tasks| {
-                if (self.next_task < tasks.len) {
-                    task = &tasks[self.next_task];
-                    self.next_task += 1;
+        }
+
+        fn takeTaskLocked(self: *Self) ?*Task {
+            const tasks = self.tasks orelse return null;
+            if (self.next_task >= tasks.len) return null;
+            const task = &tasks[self.next_task];
+            self.next_task += 1;
+            return task;
+        }
+
+        fn workerMain(self: *Self) void {
+            const io = syncIo();
+            self.mutex.lockUncancelable(io);
+            while (true) {
+                if (self.stop_workers) break;
+                if (self.takeTaskLocked()) |task| {
+                    const declined = self.canceled;
+                    self.mutex.unlock(io);
+                    if (declined) task.load_error = error.ExpertLoadCanceled else runTask(task);
+                    self.mutex.lockUncancelable(io);
+                    self.completed_tasks += 1;
+                    if (self.tasks) |tasks| {
+                        if (self.completed_tasks == tasks.len) self.batch_complete.broadcast(io);
+                    }
+                } else {
+                    self.work_available.waitUncancelable(io, &self.mutex);
                 }
             }
-            self.unlock();
+            self.mutex.unlock(io);
+        }
 
-            if (task) |load_task| {
-                parallelQuantLoadMain(load_task);
-                self.lock();
-                self.completed_tasks += 1;
-                self.unlock();
-            } else {
-                platform.time.yieldBriefly();
+        fn begin(self: *Self, tasks: []Task, requested_workers: usize) !void {
+            if (tasks.len == 0) return;
+            try self.ensureStarted(requested_workers);
+            const io = syncIo();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            if (self.tasks != null) return error.ExpertLoaderBusy;
+            self.tasks = tasks;
+            self.next_task = 0;
+            self.completed_tasks = 0;
+            self.canceled = false;
+            self.work_available.broadcast(io);
+        }
+
+        fn wait(self: *Self, task_count: usize) void {
+            if (task_count == 0) return;
+            const io = syncIo();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            if (self.tasks == null) return;
+            while (self.completed_tasks != task_count) self.batch_complete.waitUncancelable(io, &self.mutex);
+            self.tasks = null;
+        }
+
+        /// Decline every not-yet-started task in the active batch. The
+        /// caller still drains through `wait` (or a batch deinit) so worker
+        /// threads never outlive the task slice.
+        fn cancel(self: *Self) void {
+            const io = syncIo();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            self.canceled = true;
+        }
+
+        fn run(self: *Self, tasks: []Task, requested_workers: usize) !void {
+            if (tasks.len == 0) return;
+            if (requested_workers <= 1) {
+                for (tasks) |*task| runTask(task);
+                return;
             }
+            try self.begin(tasks, requested_workers);
+            self.wait(tasks.len);
         }
-    }
 
-    fn begin(self: *ParallelQuantLoader, tasks: []ParallelQuantLoadTask, requested_workers: usize) !void {
-        if (tasks.len == 0) return;
-        if (requested_workers <= 1) {
-            for (tasks) |*task| parallelQuantLoadMain(task);
-            return;
+        fn deinit(self: *Self) void {
+            const io = syncIo();
+            self.mutex.lockUncancelable(io);
+            if (self.worker_count == 0) {
+                self.mutex.unlock(io);
+                self.* = .{};
+                return;
+            }
+            self.stop_workers = true;
+            self.canceled = true;
+            self.work_available.broadcast(io);
+            self.mutex.unlock(io);
+            for (self.workers[0..self.worker_count]) |worker| if (worker) |handle| handle.join();
+            self.* = .{};
         }
-        try self.ensureStarted(requested_workers);
-        self.lock();
-        self.tasks = tasks;
-        self.next_task = 0;
-        self.completed_tasks = 0;
-        self.unlock();
-    }
+    };
+}
 
-    fn wait(self: *ParallelQuantLoader, task_count: usize) void {
-        if (task_count == 0 or self.tasks == null) return;
-        while (true) {
-            self.lock();
-            const complete = self.completed_tasks == task_count;
-            if (complete) self.tasks = null;
-            self.unlock();
-            if (complete) return;
-            platform.time.yieldBriefly();
-        }
-    }
-
-    fn run(self: *ParallelQuantLoader, tasks: []ParallelQuantLoadTask, requested_workers: usize) !void {
-        try self.begin(tasks, requested_workers);
-        self.wait(tasks.len);
-    }
-
-    fn deinit(self: *ParallelQuantLoader) void {
-        if (self.worker_count == 0) return;
-        self.lock();
-        self.stop_workers = true;
-        self.unlock();
-        for (self.workers[0..self.worker_count]) |worker| if (worker) |handle| handle.join();
-        self.* = .{};
-    }
-};
+const ParallelQuantLoader = LoadWorkerPool(ParallelQuantLoadTask, parallelQuantLoadMain);
 
 pub const ResidentExpertLoadRequest = struct {
     entries: [3]*LazyWeightEntry,
@@ -472,102 +577,7 @@ fn parallelExpertLoadMain(task: *ParallelExpertLoadTask) void {
     };
 }
 
-const ParallelExpertLoader = struct {
-    const max_worker_count = 8;
-
-    mutex: std.atomic.Mutex = .unlocked,
-    workers: [max_worker_count]?std.Thread = [_]?std.Thread{null} ** max_worker_count,
-    worker_count: usize = 0,
-    tasks: ?[]ParallelExpertLoadTask = null,
-    next_task: usize = 0,
-    completed_tasks: usize = 0,
-    stop_workers: bool = false,
-
-    fn lock(self: *ParallelExpertLoader) void {
-        while (!self.mutex.tryLock()) platform.time.yieldBriefly();
-    }
-
-    fn unlock(self: *ParallelExpertLoader) void {
-        self.mutex.unlock();
-    }
-
-    fn ensureStarted(self: *ParallelExpertLoader, requested_workers: usize) !void {
-        if (self.worker_count != 0) return;
-        const count = @min(@as(usize, max_worker_count), @max(@as(usize, 1), requested_workers));
-        self.stop_workers = false;
-        for (0..count) |index| {
-            self.workers[index] = try std.Thread.spawn(.{}, workerMain, .{self});
-            self.worker_count += 1;
-        }
-    }
-
-    fn workerMain(self: *ParallelExpertLoader) void {
-        while (true) {
-            var task: ?*ParallelExpertLoadTask = null;
-            self.lock();
-            if (self.stop_workers) {
-                self.unlock();
-                return;
-            }
-            if (self.tasks) |tasks| {
-                if (self.next_task < tasks.len) {
-                    task = &tasks[self.next_task];
-                    self.next_task += 1;
-                }
-            }
-            self.unlock();
-
-            if (task) |load_task| {
-                parallelExpertLoadMain(load_task);
-                self.lock();
-                self.completed_tasks += 1;
-                self.unlock();
-            } else {
-                platform.time.yieldBriefly();
-            }
-        }
-    }
-
-    fn begin(self: *ParallelExpertLoader, tasks: []ParallelExpertLoadTask, requested_workers: usize) !void {
-        if (tasks.len == 0) return;
-        try self.ensureStarted(requested_workers);
-        self.lock();
-        if (self.tasks != null) {
-            self.unlock();
-            return error.ExpertLoaderBusy;
-        }
-        self.tasks = tasks;
-        self.next_task = 0;
-        self.completed_tasks = 0;
-        self.unlock();
-    }
-
-    fn wait(self: *ParallelExpertLoader, task_count: usize) void {
-        if (task_count == 0) return;
-        while (true) {
-            self.lock();
-            const complete = self.completed_tasks == task_count;
-            if (complete) self.tasks = null;
-            self.unlock();
-            if (complete) return;
-            platform.time.yieldBriefly();
-        }
-    }
-
-    fn run(self: *ParallelExpertLoader, tasks: []ParallelExpertLoadTask, requested_workers: usize) !void {
-        try self.begin(tasks, requested_workers);
-        self.wait(tasks.len);
-    }
-
-    fn deinit(self: *ParallelExpertLoader) void {
-        if (self.worker_count == 0) return;
-        self.lock();
-        self.stop_workers = true;
-        self.unlock();
-        for (self.workers[0..self.worker_count]) |worker| if (worker) |handle| handle.join();
-        self.* = .{};
-    }
-};
+const ParallelExpertLoader = LoadWorkerPool(ParallelExpertLoadTask, parallelExpertLoadMain);
 
 pub const ResidentExpertLoadBatch = struct {
     data: *WeightStore,
@@ -601,6 +611,16 @@ pub const ResidentExpertLoadBatch = struct {
         self.data.allocator.free(self.tasks);
         self.tasks = &.{};
         self.active = false;
+    }
+
+    /// Cancel not-yet-started reads and drain the batch. Preads already in
+    /// flight complete first; every produced layout is dropped. Used by
+    /// request cancellation so no loader thread ever outlives the arenas it
+    /// writes into.
+    pub fn cancel(self: *ResidentExpertLoadBatch) void {
+        if (!self.active) return;
+        self.data.parallel_expert_loader.cancel();
+        self.deinit();
     }
 };
 
@@ -799,6 +819,101 @@ fn unloadSimpleExpert(data: *WeightStore, coord: ExpertCoord) void {
             if (data.residency) |*residency| residency.noteUnload(coord, entry.projection_mask, released_bytes);
         }
     }
+}
+
+const PoolTestTask = struct {
+    completed: *std.atomic.Value(usize),
+    gate: ?*std.atomic.Value(bool) = null,
+    started: ?*std.atomic.Value(bool) = null,
+    fail: bool = false,
+    load_error: ?anyerror = null,
+};
+
+fn poolTestTaskMain(task: *PoolTestTask) void {
+    if (task.started) |started| started.store(true, .release);
+    if (task.gate) |gate| {
+        while (!gate.load(.acquire)) platform.time.yieldBriefly();
+    }
+    if (task.fail) {
+        task.load_error = error.IncompleteRead;
+        return;
+    }
+    _ = task.completed.fetchAdd(1, .monotonic);
+}
+
+const PoolUnderTest = LoadWorkerPool(PoolTestTask, poolTestTaskMain);
+
+test "load worker pool runs a batch and propagates task errors" {
+    var pool = PoolUnderTest{};
+    defer pool.deinit();
+    var completed = std.atomic.Value(usize).init(0);
+    var tasks = [_]PoolTestTask{
+        .{ .completed = &completed },
+        .{ .completed = &completed, .fail = true },
+        .{ .completed = &completed },
+        .{ .completed = &completed },
+    };
+    try pool.begin(tasks[0..], 3);
+    pool.wait(tasks.len);
+    try std.testing.expectEqual(@as(usize, 3), completed.load(.monotonic));
+    try std.testing.expectEqual(@as(?anyerror, error.IncompleteRead), tasks[1].load_error);
+    try std.testing.expectEqual(@as(?anyerror, null), tasks[0].load_error);
+}
+
+test "load worker pool rejects a second batch while one is active" {
+    var pool = PoolUnderTest{};
+    defer pool.deinit();
+    var completed = std.atomic.Value(usize).init(0);
+    var gate = std.atomic.Value(bool).init(false);
+    var tasks = [_]PoolTestTask{.{ .completed = &completed, .gate = &gate }};
+    var second = [_]PoolTestTask{.{ .completed = &completed }};
+    try pool.begin(tasks[0..], 1);
+    try std.testing.expectError(error.ExpertLoaderBusy, pool.begin(second[0..], 1));
+    gate.store(true, .release);
+    pool.wait(tasks.len);
+    try std.testing.expectEqual(@as(usize, 1), completed.load(.monotonic));
+}
+
+test "load worker pool cancellation declines queued tasks and drains" {
+    var pool = PoolUnderTest{};
+    defer pool.deinit();
+    var completed = std.atomic.Value(usize).init(0);
+    var gate = std.atomic.Value(bool).init(false);
+    var started = std.atomic.Value(bool).init(false);
+    // One worker: the gated task holds the only thread, so the trailing
+    // tasks are provably unstarted when cancel lands.
+    var tasks = [_]PoolTestTask{
+        .{ .completed = &completed, .gate = &gate, .started = &started },
+        .{ .completed = &completed },
+        .{ .completed = &completed },
+    };
+    try pool.begin(tasks[0..], 1);
+    while (!started.load(.acquire)) platform.time.yieldBriefly();
+    pool.cancel();
+    gate.store(true, .release);
+    pool.wait(tasks.len);
+    try std.testing.expectEqual(@as(usize, 1), completed.load(.monotonic));
+    try std.testing.expectEqual(@as(?anyerror, error.ExpertLoadCanceled), tasks[1].load_error);
+    try std.testing.expectEqual(@as(?anyerror, error.ExpertLoadCanceled), tasks[2].load_error);
+}
+
+test "load worker pool shutdown joins parked workers and allows restart" {
+    var pool = PoolUnderTest{};
+    var completed = std.atomic.Value(usize).init(0);
+    var tasks = [_]PoolTestTask{
+        .{ .completed = &completed },
+        .{ .completed = &completed },
+    };
+    try pool.begin(tasks[0..], 2);
+    pool.wait(tasks.len);
+    pool.deinit();
+    try std.testing.expectEqual(@as(usize, 0), pool.worker_count);
+    // A drained pool restarts cleanly after shutdown.
+    var more = [_]PoolTestTask{.{ .completed = &completed }};
+    try pool.begin(more[0..], 1);
+    pool.wait(more.len);
+    pool.deinit();
+    try std.testing.expectEqual(@as(usize, 3), completed.load(.monotonic));
 }
 
 test "jina adapter names map base weight to PEFT LoRA tensors" {

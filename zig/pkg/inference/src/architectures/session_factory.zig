@@ -1534,6 +1534,46 @@ fn createGpuHostedSessionWithTaskOverride(
     else
         null;
     if (compact_config != null) arch_config.gpt.compact_moe_streaming = true;
+    // Shared streaming residency: mandatory and ledger-enforced under a
+    // compact contract; the same machinery runs report-only for models that
+    // opportunistically match the qualified streaming geometry.
+    const compact_runtime_state: ?*gpu_hosted_store_mod.CompactRuntimeState = blk: {
+        if (comptime !build_options.enable_metal) break :blk null;
+        if (backend_type != .metal) break :blk null;
+        const effective_config = compact_config orelse
+            (deriveCompactSessionConfig(allocator, .{}, arch_config, tensor_store, &lazy_weights) catch null) orelse
+            break :blk null;
+        const enforcing = compact_config != null;
+        const geometry = effective_config.geometry;
+        const arena_bytes = std.mem.alignForward(u64, geometry.encoded_expert_bytes, 16 * 1024);
+        const expert_total_bytes = geometry.encoded_expert_bytes *|
+            @as(u64, geometry.expert_count) *| geometry.moe_layer_count;
+        const fixed_model_bytes = @as(u64, model_weight_bytes) -| expert_total_bytes;
+        const state = try allocator.create(gpu_hosted_store_mod.CompactRuntimeState);
+        state.* = .{
+            .ledger = if (enforcing)
+                runtime.moe.budget_ledger.ResidentBudgetLedger.init(
+                    effective_config.resident_ceiling_bytes,
+                    effective_config.safety_reserve_bytes,
+                )
+            else
+                runtime.moe.budget_ledger.ResidentBudgetLedger.init(std.math.maxInt(u64), 0),
+            .enforcing = enforcing,
+        };
+        state.cache.setActiveSlots(effective_config.expert_cache_slots);
+        state.ledger.setVirtualSlotCapacity(@as(u64, geometry.moe_layer_count) *|
+            gpu_hosted_store_mod.compact_runtime_slot_capacity *| arena_bytes);
+        state.ledger.reserve(.fixed_model, fixed_model_bytes) catch |err| {
+            allocator.destroy(state);
+            return err;
+        };
+        break :blk state;
+    };
+    errdefer {
+        if (!backend_resources_transferred) {
+            if (compact_runtime_state) |state| allocator.destroy(state);
+        }
+    }
     const residency = if (lazy_weights.count() > 0 and moe_num_experts > 0)
         runtime.moe.residency.SharedResidency.init(allocator, if (compact_config) |config|
             @as(usize, config.expert_cache_slots)
@@ -1602,6 +1642,7 @@ fn createGpuHostedSessionWithTaskOverride(
             .prefer_f32_dense_tensors = prefer_f32_dense_tensors,
             .jina_lora_adapter = gpu_jina_lora_adapter,
             .compact = compact_config,
+            .compact_runtime = compact_runtime_state,
         }),
     };
     backend_resources_transferred = true;
@@ -1817,7 +1858,7 @@ test "deriveCompactSessionConfig fail-closes outside the qualified envelope" {
     );
     try std.testing.expectEqual(@as(u64, 3_345_408), config.geometry.encoded_expert_bytes);
     try std.testing.expectEqual(@as(u16, 30), config.geometry.moe_layer_count);
-    try std.testing.expectEqual(@as(u8, 12), config.expert_cache_slots);
+    try std.testing.expectEqual(@as(u8, 16), config.expert_cache_slots);
 
     var not_gemma = a4b_cfg;
     not_gemma.family = .gpt2;
@@ -4205,6 +4246,7 @@ const GpuHostedBackendInit = struct {
     prefer_f32_dense_tensors: bool,
     jina_lora_adapter: ?*gpu_hosted_store_mod.JinaLoraAdapter = null,
     compact: ?ops.CompactInferenceConfig = null,
+    compact_runtime: ?*gpu_hosted_store_mod.CompactRuntimeState = null,
 };
 
 fn makeGpuHostedBackendData(
@@ -4230,6 +4272,7 @@ fn makeGpuHostedBackendData(
         .mirror_kv_to_manager = false,
         .jina_lora_adapter = init.jina_lora_adapter,
         .compact = init.compact,
+        .compact_runtime = init.compact_runtime,
     };
     return switch (backend_type) {
         .metal => if (comptime build_options.enable_metal) .{ .metal = data } else unreachable,
@@ -6878,6 +6921,13 @@ fn archClose(ptr: *anyopaque) void {
                 if (gpu_data.residency) |*residency| residency.deinit();
                 if (gpu_data.jina_lora_adapter) |adapter| adapter.destroy();
                 if (gpu_data.tensor_store) |store| store.deinit();
+                // Arena teardown comes after provider teardown so no device
+                // command can still reference the no-copy mappings.
+                if (gpu_data.compact_runtime) |state| {
+                    state.deinitArenas();
+                    self.allocator.destroy(state);
+                    gpu_data.compact_runtime = null;
+                }
             }
         },
         .pjrt => {

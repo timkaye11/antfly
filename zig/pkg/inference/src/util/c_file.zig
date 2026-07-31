@@ -165,6 +165,20 @@ pub const MmapRegion = struct {
         advise(self.data.ptr, self.data.len, .random);
     }
 
+    /// Release the physical pages backing this region while keeping the
+    /// mapping — and any Metal no-copy buffer built on it — valid. On Darwin
+    /// MADV_FREE_REUSABLE removes the pages from phys_footprint immediately;
+    /// elsewhere MADV_DONTNEED decommits. Call `recommit` before refilling.
+    pub fn decommit(self: *MmapRegion) void {
+        advise(self.data.ptr, self.data.len, .free_reusable);
+    }
+
+    /// Re-account decommitted pages before the arena is filled again so
+    /// Darwin's footprint bookkeeping stays exact.
+    pub fn recommit(self: *MmapRegion) void {
+        advise(self.data.ptr, self.data.len, .free_reuse);
+    }
+
     pub fn deinit(self: *MmapRegion) void {
         std.posix.munmap(self.data);
         if (self.fd >= 0) closeFd(self.fd);
@@ -370,7 +384,7 @@ fn statSize(stat: c.struct_stat) std.c.off_t {
     return stat.size;
 }
 
-const Advice = enum { sequential, random };
+const Advice = enum { sequential, random, free_reusable, free_reuse };
 
 fn openReadOnlyZ(path_z: [:0]const u8) !std.posix.fd_t {
     if (comptime build_options.link_libc) {
@@ -436,9 +450,14 @@ fn writeAllAt(fd: std.posix.fd_t, bytes: []const u8, offset: u64) !void {
 
 fn advise(ptr: [*]u8, len: usize, advice: Advice) void {
     if (comptime build_options.link_libc) {
+        const is_darwin = builtin.os.tag.isDarwin();
         const c_advice: u32 = switch (advice) {
             .sequential => c.MADV_SEQUENTIAL,
             .random => c.MADV_RANDOM,
+            // Darwin's reusable pair keeps phys_footprint accounting exact;
+            // other systems decommit with DONTNEED and need no reuse step.
+            .free_reusable => if (is_darwin) std.c.MADV.FREE_REUSABLE else std.c.MADV.DONTNEED,
+            .free_reuse => if (is_darwin) std.c.MADV.FREE_REUSE else return,
         };
         const page_size = std.heap.page_size_min;
         const start = @intFromPtr(ptr);

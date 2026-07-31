@@ -15,9 +15,13 @@
 pub const runtime = @import("runtime.zig");
 pub const shared = @import("shared.zig");
 pub const residency = @import("residency.zig");
+pub const streaming_cache = @import("streaming_cache.zig");
+pub const budget_ledger = @import("budget_ledger.zig");
 
 test {
     _ = runtime;
     _ = shared;
     _ = residency;
+    _ = streaming_cache;
+    _ = budget_ledger;
 }

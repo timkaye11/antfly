@@ -140,7 +140,9 @@ pub fn buildCompactInferenceConfig(
     } else false;
     if (!qualified) return error.CompactProfileUnsupportedGeometry;
     const slots_auto = request.expert_cache_slots == 0;
-    const slots: u8 = if (slots_auto) 12 else switch (request.expert_cache_slots) {
+    // Automatic selection starts at the highest tier; the residency ledger
+    // downshifts 16 -> 12 -> 8 only when the footprint ceiling demands it.
+    const slots: u8 = if (slots_auto) CompactInferenceConfig.slot_tiers[0] else switch (request.expert_cache_slots) {
         8, 12, 16 => request.expert_cache_slots,
         else => return error.CompactProfileInvalidExpertCacheSlots,
     };
@@ -164,7 +166,7 @@ pub fn buildCompactInferenceConfig(
 test "buildCompactInferenceConfig accepts only the qualified A4B geometry" {
     const good = qualified_compact_geometries[0];
     const config = try buildCompactInferenceConfig(.{}, good);
-    try std.testing.expectEqual(@as(u8, 12), config.expert_cache_slots);
+    try std.testing.expectEqual(@as(u8, 16), config.expert_cache_slots);
     try std.testing.expect(config.expert_cache_slots_auto);
     try std.testing.expectEqual(@as(u8, 4), config.io_workers);
     try std.testing.expectEqual(@as(u16, 128), config.preferred_prefill_rows);
