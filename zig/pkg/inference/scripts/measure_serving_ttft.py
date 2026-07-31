@@ -98,6 +98,26 @@ def build_prompt(target_words: int, seed_offset: int = 0) -> str:
 # ---------------------------------------------------------------------------
 
 
+class BusyError(RuntimeError):
+    """The server rejected the request for transient resource pressure (503).
+
+    Admission runs before any token streams, so a fresh retry produces a clean
+    TTFT for the succeeding attempt.
+    """
+
+
+def call_with_retry(fn, attempts=6, backoff=6.0):
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except BusyError as exc:
+            last = exc
+            print(f"  [busy] {exc}; retry {i + 1}/{attempts} in {backoff:.0f}s", flush=True)
+            time.sleep(backoff)
+    raise last
+
+
 def _delta_content(obj):
     try:
         choices = obj.get("choices") or []
@@ -127,7 +147,10 @@ def stream_generate(host, port, body, timeout):
     if resp.status != 200:
         data = resp.read()
         conn.close()
-        raise RuntimeError(f"HTTP {resp.status}: {data[:600].decode('utf-8', 'replace')}")
+        msg = f"HTTP {resp.status}: {data[:600].decode('utf-8', 'replace')}"
+        if resp.status == 503:
+            raise BusyError(msg)
+        raise RuntimeError(msg)
 
     ttft_ms = None
     first_event_ms = None
@@ -200,7 +223,10 @@ def nonstream_generate(host, port, body, timeout):
     total_ms = (time.perf_counter() - t0) * 1000.0
     conn.close()
     if resp.status != 200:
-        raise RuntimeError(f"HTTP {resp.status}: {raw[:600].decode('utf-8', 'replace')}")
+        msg = f"HTTP {resp.status}: {raw[:600].decode('utf-8', 'replace')}"
+        if resp.status == 503:
+            raise BusyError(msg)
+        raise RuntimeError(msg)
     obj = json.loads(raw)
     usage = obj.get("usage") or {}
     return {
@@ -412,33 +438,41 @@ def main():
         k1 = "measure-k1"
         k2 = "measure-k2"
 
+        def stream_case(prompt, key):
+            return call_with_retry(
+                lambda: stream_generate(args.host, args.port, gen_body(prompt, key, True), args.request_timeout))
+
+        def nonstream_case(prompt, key):
+            return call_with_retry(
+                lambda: nonstream_generate(args.host, args.port, gen_body(prompt, key, False), args.request_timeout))
+
         # (a) COLD
         print("[case] cold (K1, fresh prompt)...", flush=True)
-        cold = stream_generate(args.host, args.port, gen_body(p1, k1, True), args.request_timeout)
+        cold = stream_case(p1, k1)
         result["cases"]["cold"] = cold
 
         # (b) REPLAY (identical prompt, same key)
         print("[case] replay (K1, identical prompt)...", flush=True)
-        replay = stream_generate(args.host, args.port, gen_body(p1, k1, True), args.request_timeout)
+        replay = stream_case(p1, k1)
         result["cases"]["replay"] = replay
 
         # (c) STRICT EXTENSION (same key, prompt + appended paragraph + question)
         print("[case] strict-extension (K1, prompt + appendix)...", flush=True)
-        ext = stream_generate(args.host, args.port, gen_body(p1 + ext_para, k1, True), args.request_timeout)
+        ext = stream_case(p1 + ext_para, k1)
         result["cases"]["strict_extension"] = ext
 
         # (d) SECOND KEY (different prompt) then K1 extension again (survives interleaving)
         print("[case] second-key (K2, different prompt)...", flush=True)
-        second = stream_generate(args.host, args.port, gen_body(p2, k2, True), args.request_timeout)
+        second = stream_case(p2, k2)
         result["cases"]["second_key"] = second
 
         print("[case] strict-extension-after-interleave (K1)...", flush=True)
-        ext2 = stream_generate(args.host, args.port, gen_body(p1 + ext_para2, k1, True), args.request_timeout)
+        ext2 = stream_case(p1 + ext_para2, k1)
         result["cases"]["strict_extension_interleaved"] = ext2
 
         # (e) NON-STREAMING replay asserting usage.cached_prompt_tokens in the body
         print("[case] non-streaming replay (K1)...", flush=True)
-        nonstream = nonstream_generate(args.host, args.port, gen_body(p1, k1, False), args.request_timeout)
+        nonstream = nonstream_case(p1, k1)
         result["cases"]["nonstream_replay"] = nonstream
 
         result["metrics_final"] = scrape_prompt_cache_metrics(args.host, args.port)
