@@ -2003,6 +2003,19 @@ fn ownSelectedFirstBackendPreference(
     return result;
 }
 
+/// Build the prompt-cache resource observer for a session that owns a
+/// compact residency ledger. Covers both enforcing compact contracts and
+/// report-only opportunistic ledgers (maxInt ceiling): the latter never
+/// reject, so attaching costs nothing and telemetry gains the
+/// prompt_cache_kv category either way.
+fn promptCacheLedgerObserverForSession(session: backends.Session) ?runtime.kv.prompt_cache.ResourceUsageObserver {
+    const ledger = session_factory.compactResidencyLedger(session) orelse return null;
+    return .{
+        .context = ledger,
+        .update = runtime.moe.budget_ledger.promptCacheObserverUpdate,
+    };
+}
+
 pub const LoadedModel = struct {
     manifest: manifest_mod.ModelManifest,
     hf_tok: ?*hf_tokenizer.HfTokenizer,
@@ -2019,6 +2032,13 @@ pub const LoadedModel = struct {
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = null,
     shared_prefetch: ?*runtime.tier.shared.SharedPrefetchState = null,
     prompt_prefix_cache: runtime.kv.prompt_cache.PromptPrefixCache,
+    /// Pre-resolved observer charging retained prompt-KV bytes to this
+    /// model's compact residency ledger (BudgetCategory.prompt_cache_kv).
+    /// Non-null only for sessions that own a CompactRuntimeState. Lifetime:
+    /// the ledger lives on the session's WeightStore and deinit() tears down
+    /// prompt_prefix_cache (whose configure/evict paths invoke the observer)
+    /// before session.close(), so the observer never outlives its ledger.
+    prompt_cache_ledger_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver = null,
     native_generate_coordinator: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = null,
     native_generation_graph_cache: graph_mod.cache.GraphCache,
     // ponytail: model-wide safety lock; replace with per-request backend state only when continuous batching is proven safe.
@@ -3462,7 +3482,14 @@ pub const ModelManager = struct {
         self.lockLoadedModels();
         defer self.unlockLoadedModels();
         var it = self.loaded.valueIterator();
-        while (it.next()) |model| model.*.prompt_prefix_cache.detachResourceUsageObserver();
+        while (it.next()) |model| {
+            // A model-owned compact-ledger observer references this model's
+            // own session state, not the external caller's context that is
+            // being torn down; keep it attached so residency accounting
+            // survives until the model itself is unloaded.
+            if (model.*.prompt_cache_ledger_observer != null) continue;
+            model.*.prompt_prefix_cache.detachResourceUsageObserver();
+        }
     }
 
     /// Counts loaded models participating in the prompt-cache accounting target.
@@ -3479,6 +3506,22 @@ pub const ModelManager = struct {
         return count + 1;
     }
 
+    /// Resolve the observer for one model's cache. Compact models charge
+    /// their own session ledger; everything else keeps the node-level
+    /// observer supplied by the embedding application. Resolved here rather
+    /// than in the caller-supplied config because rebalance broadcasts one
+    /// node config to every participating cache — a model-specific observer
+    /// baked into that shared config would migrate another model's
+    /// accounting onto the wrong ledger.
+    fn perModelPromptCacheConfig(
+        base: runtime.kv.prompt_cache.Config,
+        model: *LoadedModel,
+    ) runtime.kv.prompt_cache.Config {
+        var config = base;
+        if (model.prompt_cache_ledger_observer) |observer| config.resource_usage_observer = observer;
+        return config;
+    }
+
     /// Apply one node-wide prompt-cache target to the cache being activated and
     /// every cache that is already active. configure() synchronously evicts
     /// entries against their estimated logical cache bytes.
@@ -3492,13 +3535,13 @@ pub const ModelManager = struct {
         include.prompt_prefix_cache.reserveActivation();
         var per_cache = node_config;
         per_cache.max_bytes /= self.participatingPromptCacheCount(include);
-        include.prompt_prefix_cache.configure(per_cache);
+        include.prompt_prefix_cache.configure(perModelPromptCacheConfig(per_cache, include));
 
         var it = self.loaded.iterator();
         while (it.next()) |entry| {
             const model = entry.value_ptr.*;
             if (model != include and model.prompt_prefix_cache.isParticipating()) {
-                model.prompt_prefix_cache.configure(per_cache);
+                model.prompt_prefix_cache.configure(perModelPromptCacheConfig(per_cache, model));
             }
         }
     }
@@ -3528,7 +3571,7 @@ pub const ModelManager = struct {
         while (rebalance_it.next()) |entry| {
             const model = entry.value_ptr.*;
             if (model.prompt_prefix_cache.isParticipating()) {
-                model.prompt_prefix_cache.configure(per_cache);
+                model.prompt_prefix_cache.configure(perModelPromptCacheConfig(per_cache, model));
             }
         }
     }
@@ -3941,6 +3984,7 @@ pub const ModelManager = struct {
             .shared_moe_cache = shared_moe_cache,
             .shared_prefetch = shared_prefetch,
             .prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(self.allocator),
+            .prompt_cache_ledger_observer = promptCacheLedgerObserverForSession(session),
             .native_generate_coordinator = native_generate_coordinator,
             .native_generation_graph_cache = graph_mod.cache.GraphCache.init(self.allocator),
             .vision_session = null,
@@ -4205,6 +4249,144 @@ test "model cache idle expiration can be disabled" {
     try std.testing.expect(expired != null);
     try std.testing.expect(expired.?.model == &idle);
     allocator.free(expired.?.key);
+}
+
+test "prompt cache charges retained bytes to the compact ledger observer" {
+    const allocator = std.testing.allocator;
+    // Same lifetime shape as production: the ledger (session-owned) outlives
+    // the cache, whose deinit runs first in LoadedModel.deinit.
+    var ledger = runtime.moe.budget_ledger.ResidentBudgetLedger.init(1 << 20, 0);
+    var cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    defer cache.deinit();
+    cache.configure(.{
+        .enabled = true,
+        .mode = .block_hash,
+        .min_tokens = 2,
+        .max_bytes = 1 << 20,
+        .resource_usage_observer = .{
+            .context = &ledger,
+            .update = runtime.moe.budget_ledger.promptCacheObserverUpdate,
+        },
+    });
+
+    const pool_id = (try cache.ensurePool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    })).?;
+    const source_id = try cache.manager.attachSequence(pool_id);
+    try cache.manager.appendTokens(source_id, 4);
+    try cache.storeFromSequence("agent", &.{ 1, 2, 3, 4 }, source_id);
+
+    const live_bytes: u64 = @intCast(cache.stats().live_bytes);
+    try std.testing.expect(live_bytes > 0);
+    const category = @intFromEnum(runtime.moe.budget_ledger.BudgetCategory.prompt_cache_kv);
+    var snap = ledger.snapshot();
+    try std.testing.expectEqual(live_bytes, snap.committed_by_category[category]);
+    try std.testing.expectEqual(@as(u64, 0), snap.prompt_cache_overcommit_bytes);
+
+    // Evicting every entry walks the accounting back to zero.
+    var tighter = cache.config;
+    tighter.max_bytes = 1;
+    cache.configure(tighter);
+    try std.testing.expectEqual(@as(usize, 0), cache.stats().live_entries);
+    snap = ledger.snapshot();
+    try std.testing.expectEqual(@as(u64, 0), snap.committed_by_category[category]);
+}
+
+test "prompt cache observer reports overcommit when the compact ceiling is tiny" {
+    const allocator = std.testing.allocator;
+    var ledger = runtime.moe.budget_ledger.ResidentBudgetLedger.init(16, 0);
+    var cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    defer cache.deinit();
+    cache.configure(.{
+        .enabled = true,
+        .mode = .block_hash,
+        .min_tokens = 2,
+        .max_bytes = 1 << 20,
+        .resource_usage_observer = .{
+            .context = &ledger,
+            .update = runtime.moe.budget_ledger.promptCacheObserverUpdate,
+        },
+    });
+
+    const pool_id = (try cache.ensurePool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    })).?;
+    const source_id = try cache.manager.attachSequence(pool_id);
+    try cache.manager.appendTokens(source_id, 2);
+    try cache.storeFromSequence("agent", &.{ 1, 2 }, source_id);
+
+    // The cache keeps the entry (its own budget allows it) while the ledger
+    // stays fail-closed and surfaces the unaccounted bytes.
+    const live_bytes: u64 = @intCast(cache.stats().live_bytes);
+    try std.testing.expect(live_bytes > 16);
+    const category = @intFromEnum(runtime.moe.budget_ledger.BudgetCategory.prompt_cache_kv);
+    const snap = ledger.snapshot();
+    try std.testing.expectEqual(@as(u64, 0), snap.committed_by_category[category]);
+    try std.testing.expectEqual(live_bytes, snap.prompt_cache_overcommit_bytes);
+    try std.testing.expect(snap.hard_limit_rejections >= 1);
+}
+
+test "rebalance resolves the ledger observer per model" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer {
+        manager.loaded.deinit(allocator);
+        manager.loaded_aliases.deinit(allocator);
+        manager.in_flight_loads.deinit(allocator);
+    }
+
+    const NodeProbe = struct {
+        fn update(_: *anyopaque, current: *u64, next: u64) void {
+            current.* = next;
+        }
+    };
+    var compact_ledger = runtime.moe.budget_ledger.ResidentBudgetLedger.init(1 << 20, 0);
+    var node_probe_ctx: u8 = 0;
+
+    var compact: LoadedModel = undefined;
+    compact.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    compact.prompt_cache_ledger_observer = .{
+        .context = &compact_ledger,
+        .update = runtime.moe.budget_ledger.promptCacheObserverUpdate,
+    };
+    defer compact.prompt_prefix_cache.deinit();
+    var plain: LoadedModel = undefined;
+    plain.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    plain.prompt_cache_ledger_observer = null;
+    defer plain.prompt_prefix_cache.deinit();
+    try manager.loaded.put(allocator, "compact", &compact);
+    try manager.loaded.put(allocator, "plain", &plain);
+
+    const node_config = runtime.kv.prompt_cache.Config{
+        .enabled = true,
+        .max_bytes = 1024,
+        .resource_usage_observer = .{ .context = &node_probe_ctx, .update = NodeProbe.update },
+    };
+    manager.rebalancePromptCaches(&compact, node_config);
+    // The second activation broadcasts the shared node config to the compact
+    // model's cache again; per-model resolution must keep its ledger
+    // observer instead of migrating accounting onto the node context.
+    manager.rebalancePromptCaches(&plain, node_config);
+
+    const compact_observer = compact.prompt_prefix_cache.config.resource_usage_observer.?;
+    try std.testing.expectEqual(@intFromPtr(&compact_ledger), @intFromPtr(compact_observer.context));
+    const plain_observer = plain.prompt_prefix_cache.config.resource_usage_observer.?;
+    try std.testing.expectEqual(@intFromPtr(&node_probe_ctx), @intFromPtr(plain_observer.context));
+
+    // External-observer teardown detaches only node-observer caches.
+    manager.detachPromptCacheResourceUsageObserver();
+    try std.testing.expect(compact.prompt_prefix_cache.config.resource_usage_observer != null);
+    try std.testing.expect(plain.prompt_prefix_cache.config.resource_usage_observer == null);
 }
 
 fn preferredModelPathForBackend(

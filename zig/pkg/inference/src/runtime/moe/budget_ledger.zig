@@ -29,6 +29,7 @@
 //! even before those call sites are individually instrumented.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 
 pub const BudgetCategory = enum(u8) {
@@ -62,6 +63,7 @@ pub const LedgerSnapshot = struct {
     observed_footprint_peak_bytes: u64,
     soft_limit_trips: u64,
     hard_limit_rejections: u64,
+    prompt_cache_overcommit_bytes: u64,
 };
 
 pub const ResidentBudgetLedger = struct {
@@ -75,6 +77,12 @@ pub const ResidentBudgetLedger = struct {
     observed_footprint_peak_bytes: u64 = 0,
     soft_limit_trips: u64 = 0,
     hard_limit_rejections: u64 = 0,
+    /// Retained prompt-cache KV bytes the ledger refused to commit because
+    /// they would cross the hard ceiling. Absolute gauge, not a counter: the
+    /// prompt-cache observer rewrites it on every accounting update. Nonzero
+    /// means the cache's own max_bytes budget admits more retained KV than
+    /// this instance's residency contract does.
+    prompt_cache_overcommit_bytes: u64 = 0,
     /// Test seam: when set, the sampler reads this instead of the OS.
     footprint_override: ?u64 = null,
 
@@ -137,6 +145,16 @@ pub const ResidentBudgetLedger = struct {
         slot.* -|= bytes;
     }
 
+    /// Replace the prompt-cache overcommit gauge, returning the previous
+    /// value so the caller can log only on the idle -> overcommitted edge.
+    fn swapPromptCacheOvercommit(self: *ResidentBudgetLedger, bytes: u64) u64 {
+        self.lock();
+        defer self.unlock();
+        const previous = self.prompt_cache_overcommit_bytes;
+        self.prompt_cache_overcommit_bytes = bytes;
+        return previous;
+    }
+
     /// Sample the Darwin phys_footprint (or the override in tests) and fold
     /// it into the pressure decision alongside the ledger's own accounting.
     pub fn samplePressure(self: *ResidentBudgetLedger) BudgetPressure {
@@ -179,9 +197,47 @@ pub const ResidentBudgetLedger = struct {
             .observed_footprint_peak_bytes = self.observed_footprint_peak_bytes,
             .soft_limit_trips = self.soft_limit_trips,
             .hard_limit_rejections = self.hard_limit_rejections,
+            .prompt_cache_overcommit_bytes = self.prompt_cache_overcommit_bytes,
         };
     }
 };
+
+/// Prompt-prefix-cache resource observer endpoint. `context` is the owning
+/// model instance's ledger; the cache reports absolute retained bytes and
+/// this converts them to release-then-reserve against `.prompt_cache_kv`.
+///
+/// The observer contract (runtime/kv/prompt_cache.zig ResourceUsageObserver)
+/// is void-return advisory accounting: the cache has already retained or
+/// released the KV blocks by the time it reports, and its own `max_bytes`
+/// config drives eviction. On reserve failure this therefore stays
+/// fail-closed for the LEDGER — committed bytes never cross the ceiling —
+/// while the unaccounted retained bytes are surfaced through the
+/// `prompt_cache_overcommit_bytes` gauge (and a one-shot warning per
+/// overcommit episode) instead of being silently clamped or partially
+/// reserved. `current` is set to what was actually committed, so the next
+/// update releases exactly that amount. A nonzero gauge is the signal to
+/// lower the node prompt-cache target or raise the compact ceiling; the
+/// eviction decision itself stays with the cache.
+///
+/// Exactly one cache feeds a given ledger's `.prompt_cache_kv` category (the
+/// per-model PromptPrefixCache), so the absolute-value rewrite is race-free.
+pub fn promptCacheObserverUpdate(context: *anyopaque, current: *u64, next: u64) void {
+    const ledger: *ResidentBudgetLedger = @ptrCast(@alignCast(context));
+    ledger.release(.prompt_cache_kv, current.*);
+    if (ledger.reserve(.prompt_cache_kv, next)) {
+        _ = ledger.swapPromptCacheOvercommit(0);
+        current.* = next;
+    } else |_| {
+        const previous = ledger.swapPromptCacheOvercommit(next);
+        current.* = 0;
+        if (previous == 0 and !builtin.is_test) {
+            std.log.warn(
+                "prompt cache retained KV exceeds the compact residency budget: {d} bytes uncommitted (ceiling {d}); lower the prompt cache target or raise the profile ceiling",
+                .{ next, ledger.ceiling_bytes },
+            );
+        }
+    }
+}
 
 test "budget ledger accounts categories and rejects at the hard ceiling" {
     var ledger = ResidentBudgetLedger.init(1000, 100);
@@ -230,6 +286,60 @@ test "budget ledger pressure tiers use the larger of ledger and sampler" {
     try std.testing.expectEqual(@as(u64, 1000), snap.observed_footprint_peak_bytes);
     try std.testing.expect(snap.soft_limit_trips >= 2);
     try std.testing.expect(snap.hard_limit_rejections >= 1);
+}
+
+test "prompt cache observer converts absolute usage to ledger transitions" {
+    var ledger = ResidentBudgetLedger.init(1000, 0);
+    try ledger.reserve(.fixed_model, 400);
+    var accounted: u64 = 0;
+
+    // Grow: 0 -> 300.
+    promptCacheObserverUpdate(&ledger, &accounted, 300);
+    try std.testing.expectEqual(@as(u64, 300), accounted);
+    var snap = ledger.snapshot();
+    try std.testing.expectEqual(@as(u64, 300), snap.committed_by_category[@intFromEnum(BudgetCategory.prompt_cache_kv)]);
+    try std.testing.expectEqual(@as(u64, 700), snap.committed_total_bytes);
+    try std.testing.expectEqual(@as(u64, 0), snap.prompt_cache_overcommit_bytes);
+
+    // Shrink: 300 -> 100 releases the difference.
+    promptCacheObserverUpdate(&ledger, &accounted, 100);
+    try std.testing.expectEqual(@as(u64, 100), accounted);
+    snap = ledger.snapshot();
+    try std.testing.expectEqual(@as(u64, 100), snap.committed_by_category[@intFromEnum(BudgetCategory.prompt_cache_kv)]);
+
+    // Release-on-zero: the category empties without touching other classes.
+    promptCacheObserverUpdate(&ledger, &accounted, 0);
+    try std.testing.expectEqual(@as(u64, 0), accounted);
+    snap = ledger.snapshot();
+    try std.testing.expectEqual(@as(u64, 0), snap.committed_by_category[@intFromEnum(BudgetCategory.prompt_cache_kv)]);
+    try std.testing.expectEqual(@as(u64, 400), snap.committed_total_bytes);
+}
+
+test "prompt cache observer stays fail-closed and reports overcommit" {
+    var ledger = ResidentBudgetLedger.init(1000, 0);
+    try ledger.reserve(.fixed_model, 900);
+    var accounted: u64 = 0;
+
+    // Fits: 0 -> 80.
+    promptCacheObserverUpdate(&ledger, &accounted, 80);
+    try std.testing.expectEqual(@as(u64, 80), accounted);
+
+    // Would cross the ceiling: nothing stays committed, the retained bytes
+    // surface as the overcommit gauge, and the rejection is counted.
+    promptCacheObserverUpdate(&ledger, &accounted, 200);
+    try std.testing.expectEqual(@as(u64, 0), accounted);
+    var snap = ledger.snapshot();
+    try std.testing.expectEqual(@as(u64, 0), snap.committed_by_category[@intFromEnum(BudgetCategory.prompt_cache_kv)]);
+    try std.testing.expectEqual(@as(u64, 900), snap.committed_total_bytes);
+    try std.testing.expectEqual(@as(u64, 200), snap.prompt_cache_overcommit_bytes);
+    try std.testing.expect(snap.hard_limit_rejections >= 1);
+
+    // The cache evicting back under budget clears the gauge and recommits.
+    promptCacheObserverUpdate(&ledger, &accounted, 50);
+    try std.testing.expectEqual(@as(u64, 50), accounted);
+    snap = ledger.snapshot();
+    try std.testing.expectEqual(@as(u64, 50), snap.committed_by_category[@intFromEnum(BudgetCategory.prompt_cache_kv)]);
+    try std.testing.expectEqual(@as(u64, 0), snap.prompt_cache_overcommit_bytes);
 }
 
 test "budget ledger live darwin sampler reports this process when available" {

@@ -5372,6 +5372,22 @@ pub fn endMetalWorkloadProfile(
     return try metal_runtime.workloadProfileExportWithTuningAlloc(allocator, snapshot, tuning, &provider.jit_scope);
 }
 
+/// Returns the resident-budget ledger owned by a session's shared
+/// CompactRuntimeState, or null for sessions without compact streaming
+/// state (non-Metal backends, dense models, foreign session vtables).
+/// Mirrors beginMetalWorkloadProfile: no backend-pointer downcast escapes
+/// this factory. The ledger lives on the session's WeightStore and is
+/// destroyed by Session.close(), so callers wiring it into longer-lived
+/// observers must tear those down before closing the session.
+pub fn compactResidencyLedger(session: Session) ?*runtime.moe.budget_ledger.ResidentBudgetLedger {
+    if (comptime !build_options.enable_metal) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const arch_session: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (arch_session.backend_type != .metal) return null;
+    const state = gpuBackendData(arch_session).compact_runtime orelse return null;
+    return &state.ledger;
+}
+
 test "attachIo reaches native compute backend" {
     const allocator = std.testing.allocator;
     var arch_session = ArchSession{

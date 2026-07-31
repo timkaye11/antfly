@@ -419,9 +419,11 @@ test "concurrent first prompt cache activations share the node budget" {
 
     var first: model_manager_mod.LoadedModel = undefined;
     first.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    first.prompt_cache_ledger_observer = null;
     defer first.prompt_prefix_cache.deinit();
     var second: model_manager_mod.LoadedModel = undefined;
     second.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    second.prompt_cache_ledger_observer = null;
     defer second.prompt_prefix_cache.deinit();
     try manager.loaded.put(allocator, "first", &first);
     try manager.loaded.put(allocator, "second", &second);
@@ -5445,6 +5447,13 @@ pub const Node = struct {
                 pool_id = model.prompt_prefix_cache.pool_id.?;
                 prompt_cache = &model.prompt_prefix_cache;
             } else {
+                // The request keeps working through a private non-cached
+                // pool, but silently losing prefix reuse defeats the
+                // cached-TTFT contract — say why it happened.
+                std.log.warn(
+                    "prompt cache unavailable for {s} (backend={s}): pool provisioning produced no cache-backed KV pool (incompatible pool geometry or missing device write hook); continuing without prefix reuse",
+                    .{ model.model_dir, @tagName(backend_kind) },
+                );
                 pool_id = kv_manager.addPool(pool_config) catch |err|
                     return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
                 config.prompt_cache_enabled = false;
