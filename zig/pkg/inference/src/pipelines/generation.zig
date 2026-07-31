@@ -3381,6 +3381,37 @@ pub const NativeGenerationPipeline = struct {
         errdefer allocator.free(projected_gen_ids);
         for (projected_gen_token_ids, 0..) |token_id, idx| projected_gen_ids[idx] = @intCast(token_id);
 
+        // Channel-protocol debugging: dump the raw generated stream before the
+        // final-channel projection strips private content. Never enable in
+        // production serving — this reveals withheld reasoning channels.
+        if (getenvBool("ANTFLY_GENERATION_DEBUG_RAW_OUTPUT")) {
+            std.debug.print(
+                "channel_protocol: required={} channel_end={?d} channel_start={?d} turn_end={?d} header_len={d} saw_final={}\n",
+                .{
+                    streaming_text.final_channel_required,
+                    streaming_text.final_channel_end_token_id,
+                    streaming_text.channel_start_token_id,
+                    streaming_text.turn_end_token_id,
+                    streaming_text.final_channel_header_token_ids.len,
+                    streaming_text.saw_final_channel,
+                },
+            );
+            const raw_slice = token_ids[gen_start..seq_len];
+            std.debug.print("raw_generated_token_ids:", .{});
+            for (raw_slice) |tid| std.debug.print(" {d}", .{tid});
+            std.debug.print("\n", .{});
+            if (allocator.alloc(i32, raw_slice.len)) |raw_ids| {
+                defer allocator.free(raw_ids);
+                for (raw_slice, 0..) |tid, idx| raw_ids[idx] = @intCast(tid);
+                if (self.tokenizer.decode(allocator, raw_ids)) |raw_text| {
+                    defer allocator.free(raw_text);
+                    std.debug.print("raw_generated_text: {s}\n", .{raw_text});
+                } else |err| {
+                    std.debug.print("raw_generated_text: <decode failed: {s}>\n", .{@errorName(err)});
+                }
+            } else |_| {}
+        }
+
         const text_decode_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         const text = try self.tokenizer.decode(allocator, projected_gen_ids);
         const finished_generate_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
