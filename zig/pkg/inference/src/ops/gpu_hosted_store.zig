@@ -113,6 +113,38 @@ pub const CompactExpertArena = struct {
     decommitted: bool = false,
 };
 
+/// Full-residency backing for one MoE layer under the device-side MoE route
+/// (ANTFLY_GEMMA4_DEVICE_MOE): a single page-aligned anonymous arena holding
+/// every expert of the layer contiguously in expert-id order, published to
+/// the device as one no-copy buffer plus a per-expert byte-offset table.
+/// Unlike per-slot arenas this arena is never evicted or decommitted for the
+/// session lifetime; the ledger carries the whole layer as .expert_pages.
+///
+/// Partial residency is deliberately out of scope: the per-slot streaming
+/// cache keeps each expert in its own anonymous arena, i.e. a separate
+/// MTLBuffer, and one bound weight buffer cannot span scattered buffers. The
+/// device kernels' offset-table indirection (with the 0xFFFFFFFF unmapped
+/// sentinel) is already shaped for that future, but serving a partially
+/// resident layer device-side needs argument buffers or indirect command
+/// buffers to bind per-expert buffers; until then partially resident layers
+/// stay on the per-slot streaming route.
+pub const CompactLayerFullArena = struct {
+    arena: ?c_file.MmapRegion = null,
+    /// Bytes charged to the ledger for the arena (page-aligned total).
+    charged_bytes: usize = 0,
+    /// Bytes each expert region occupies inside the arena.
+    expert_stride: usize = 0,
+    /// Gate/up/down byte offsets relative to an expert's region start;
+    /// identical for every expert by construction.
+    projection_offsets: [3]usize = .{ 0, 0, 0 },
+    expert_count: usize = 0,
+    /// Arena loaded and published to the decode runtime.
+    published: bool = false,
+    /// Load or publication failed once; the decode path stops retrying and
+    /// stays on the per-slot streaming route for this layer.
+    failed: bool = false,
+};
+
 /// Session-scoped compact streaming state shared by every compute wrapper:
 /// slot bookkeeping, the residency ledger, and the arenas that back device
 /// publication. Living on the WeightStore keeps cache contents warm across
@@ -122,6 +154,11 @@ pub const CompactRuntimeState = struct {
     ledger: runtime.moe.budget_ledger.ResidentBudgetLedger,
     arenas: [compact_runtime_layer_capacity * compact_runtime_slot_capacity]CompactExpertArena =
         [_]CompactExpertArena{.{}} ** (compact_runtime_layer_capacity * compact_runtime_slot_capacity),
+    /// Per-layer full-residency arenas for the device-side MoE route.
+    /// Untouched (all-defaults) unless ANTFLY_GEMMA4_DEVICE_MOE is enabled
+    /// and the budget derives slots == expert_count.
+    full_arenas: [compact_runtime_layer_capacity]CompactLayerFullArena =
+        [_]CompactLayerFullArena{.{}} ** compact_runtime_layer_capacity,
     /// True under a compact memory profile: budget pressure rejects work.
     /// Opportunistic sessions keep the same machinery in report-only mode.
     enforcing: bool = false,
@@ -132,12 +169,20 @@ pub const CompactRuntimeState = struct {
         return &self.arenas[layer * compact_runtime_slot_capacity + slot];
     }
 
+    pub fn fullArenaAt(self: *CompactRuntimeState, layer: usize) *CompactLayerFullArena {
+        return &self.full_arenas[layer];
+    }
+
     pub fn deinitArenas(self: *CompactRuntimeState) void {
         for (&self.arenas) |*slot| {
             if (slot.layout) |*layout| layout.deinit();
             slot.layout = null;
             if (slot.arena) |*arena| arena.deinit();
             slot.arena = null;
+        }
+        for (&self.full_arenas) |*full| {
+            if (full.arena) |*arena| arena.deinit();
+            full.* = .{};
         }
     }
 };
