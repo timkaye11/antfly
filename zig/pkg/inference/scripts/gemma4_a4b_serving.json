@@ -1,0 +1,20 @@
+{
+  "models_dir": "/Users/timkaye/Documents/af/models",
+  "max_concurrent_requests": 32,
+  "preload": [
+    {
+      "kind": "generator",
+      "name": "gemma-4-26B-A4B-it-qat-q4_0-gguf",
+      "backend": "metal",
+      "memory_profile": "compact_2gbs",
+      "memory_budget_mb": 6144
+    }
+  ],
+  "prompt_cache": {
+    "enabled": true,
+    "mode": "block_hash",
+    "max_bytes_mb": 512,
+    "min_tokens": 64,
+    "ttl_ms": 300000
+  }
+}
