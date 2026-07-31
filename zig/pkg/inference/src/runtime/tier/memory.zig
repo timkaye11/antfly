@@ -1747,6 +1747,7 @@ pub fn estimateGptGeneration(
     backend: kv_pool.BackendKind,
     kv_dtype: kv_pool.KvDType,
     config: gpt_mod.Config,
+    allow_swa_ring: bool,
     prompt_tokens: usize,
     max_tokens: usize,
     prefill_chunk_size: usize,
@@ -1775,7 +1776,7 @@ pub fn estimateGptGeneration(
     for (0..@as(usize, @intCast(config.num_hidden_layers))) |layer| {
         if (config.layerSharesKv(layer)) continue;
         var layer_capacity_tokens = if (backend == .metal) metal_capacity_tokens else page_aligned_tokens;
-        if (split_gemma_kv and config.layerUsesSlidingAttention(layer)) {
+        if (split_gemma_kv and allow_swa_ring and config.layerUsesSlidingAttention(layer)) {
             const ring_pages = storage_runtime.swaRingPageCount(
                 16,
                 config.sliding_window,
@@ -1784,7 +1785,11 @@ pub fn estimateGptGeneration(
             ) catch return error.ResourceLimitExceeded;
             const ring_tokens = std.math.mul(usize, ring_pages, 16) catch
                 return error.ResourceLimitExceeded;
-            layer_capacity_tokens = @max(layer_capacity_tokens, ring_tokens);
+            // A ring slot always allocates its full ring capacity — no more
+            // for long prompts, no less for short ones — so the estimate is
+            // exactly the ring. Ring-ineligible requests estimate full
+            // context, matching their full-length allocation.
+            layer_capacity_tokens = ring_tokens;
         }
         const kv_heads = config.effectiveKVHeadsForLayer(layer);
         const head_dim = if (config.family == .deepseek_v4)
@@ -1838,6 +1843,11 @@ pub const GptGenerationBudgetComponent = struct {
     backend: kv_pool.BackendKind,
     kv_dtype: kv_pool.KvDType,
     config: gpt_mod.Config,
+    /// The request qualifies for the split-SWA KV ring (metal, fresh
+    /// sequence, no prompt cache, no compaction): sliding-window layers are
+    /// then estimated at the bounded ring capacity the allocator will
+    /// actually use, instead of full context.
+    allow_swa_ring: bool = false,
 };
 
 /// Reserves target and optional draft generation memory at the largest chunk
@@ -1859,6 +1869,7 @@ pub fn reserveGptGenerationAtLargestChunk(
                 component.backend,
                 component.kv_dtype,
                 component.config,
+                component.allow_swa_ring,
                 prompt_tokens,
                 max_tokens,
                 chunk,
@@ -2537,18 +2548,18 @@ test "gpt generation estimate accounts for sliding window and page alignment" {
         .position_encoding = .rope,
     };
 
-    const estimate = try estimateGptGeneration(.metal, .f16, cfg, 100, 10, 64);
+    const estimate = try estimateGptGeneration(.metal, .f16, cfg, false, 100, 10, 64);
     try std.testing.expectEqual(@as(usize, 110), estimate.retained_tokens);
     try std.testing.expectEqual(@as(usize, 176), estimate.kv_bytes / (32 * 8 * 128 * 2 * 2));
     try std.testing.expectEqual(ResidencyTier.backend, estimate.kv_tier);
     try std.testing.expect(estimate.scratch_bytes > 0);
 
     // int8: bytesForTokenRow(8, 128) = 1024 + 8*4 = 1056
-    const est_int8 = try estimateGptGeneration(.metal, .int8, cfg, 100, 10, 64);
+    const est_int8 = try estimateGptGeneration(.metal, .int8, cfg, false, 100, 10, 64);
     try std.testing.expectEqual(@as(usize, 176 * 32 * 1056 * 2), est_int8.kv_bytes);
 
     // int4: bytesForTokenRow(8, 128) = ceil(1024/32)*18 = 32*18 = 576
-    const est_int4 = try estimateGptGeneration(.metal, .int4, cfg, 100, 10, 64);
+    const est_int4 = try estimateGptGeneration(.metal, .int4, cfg, false, 100, 10, 64);
     try std.testing.expectEqual(@as(usize, 176 * 32 * 576 * 2), est_int4.kv_bytes);
 }
 
@@ -2581,7 +2592,7 @@ test "gpt generation estimate keeps mixed Gemma global history" {
         .position_encoding = .rope,
     };
 
-    const estimate = try estimateGptGeneration(.metal, .f16, cfg, 2000, 100, 512);
+    const estimate = try estimateGptGeneration(.metal, .f16, cfg, false, 2000, 100, 512);
     try std.testing.expectEqual(@as(usize, 2100), estimate.retained_tokens);
     // All 24 donor layers budget the 3168-token Metal growth capacity. The
     // 18 shared tail layers do not own KV storage.
@@ -2604,7 +2615,7 @@ test "gpt generation estimate covers a sliding ring larger than global growth" {
         .position_encoding = .rope,
     };
 
-    const estimate = try estimateGptGeneration(.metal, .f16, cfg, 16, 1, 16);
+    const estimate = try estimateGptGeneration(.metal, .f16, cfg, true, 16, 1, 16);
     // Local ring: 34 pages = 544 tokens. Global growth: 32 -> 48 tokens.
     try std.testing.expectEqual(@as(usize, 1_310_720), estimate.kv_bytes);
 }
@@ -2634,7 +2645,7 @@ test "generation budget downshifts target and draft together" {
     );
     try std.testing.expectEqual(@as(usize, 64), selected);
     try std.testing.expectEqual(
-        2 * (try estimateGptGeneration(.metal, .f16, cfg, 200, 1, 64)).scratch_bytes,
+        2 * (try estimateGptGeneration(.metal, .f16, cfg, false, 200, 1, 64)).scratch_bytes,
         budget.scratchTotalBytes(),
     );
 }
@@ -2651,7 +2662,7 @@ test "generation budget rolls back all components when the minimum chunk fails" 
         .{ .backend = .native, .kv_dtype = .f16, .config = cfg },
         .{ .backend = .native, .kv_dtype = .f16, .config = cfg },
     };
-    const one_component_scratch = (try estimateGptGeneration(.native, .f16, cfg, 200, 1, 32)).scratch_bytes;
+    const one_component_scratch = (try estimateGptGeneration(.native, .f16, cfg, false, 200, 1, 32)).scratch_bytes;
     var budget = RunBudget.init(.{ .scratch_limit_bytes = one_component_scratch + 1 });
 
     try std.testing.expectError(
@@ -2674,13 +2685,13 @@ test "gpt generation estimate rejects malformed and overflowing inputs" {
     };
     try std.testing.expectError(
         error.ResourceLimitExceeded,
-        estimateGptGeneration(.native, .f16, cfg, std.math.maxInt(usize), 1, 256),
+        estimateGptGeneration(.native, .f16, cfg, false, std.math.maxInt(usize), 1, 256),
     );
 
     cfg.num_attention_heads = 0;
     try std.testing.expectError(
         error.InvalidModelConfig,
-        estimateGptGeneration(.native, .f16, cfg, 1, 1, 256),
+        estimateGptGeneration(.native, .f16, cfg, false, 1, 1, 256),
     );
 
     cfg.num_attention_heads = 32;
@@ -2689,7 +2700,7 @@ test "gpt generation estimate rejects malformed and overflowing inputs" {
     cfg.deepseek_v4_qk_rope_head_dim = std.math.maxInt(u32);
     try std.testing.expectError(
         error.ResourceLimitExceeded,
-        estimateGptGeneration(.native, .f16, cfg, 1, 1, 256),
+        estimateGptGeneration(.native, .f16, cfg, false, 1, 1, 256),
     );
 }
 

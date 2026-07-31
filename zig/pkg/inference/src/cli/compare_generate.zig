@@ -2788,6 +2788,7 @@ fn makeAnalyzeRunBudget(
         backend_kind,
         kv_dtype,
         cfg,
+        false,
         prompt_tokens,
         1,
         256,

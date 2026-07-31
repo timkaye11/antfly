@@ -823,7 +823,18 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             requested_draft_kv_dtype;
     } else null;
     var budget_components: [2]runtime.tier.memory.GptGenerationBudgetComponent = undefined;
-    budget_components[0] = .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config };
+    // Local CLI generation has no prompt cache and always starts a fresh
+    // sequence, so ring eligibility at admission mirrors the pipeline's
+    // request predicate: metal + a ring-capable model + no KV compaction.
+    const admission_allows_swa_ring = backend_kind == .metal and
+        opts.cache_compaction_ratio == null and
+        gpt_config.supportsSplitSwaGlobalKvRing();
+    budget_components[0] = .{
+        .backend = backend_kind,
+        .kv_dtype = kv_dtype,
+        .config = gpt_config,
+        .allow_swa_ring = admission_allows_swa_ring,
+    };
     var budget_component_count: usize = 1;
     if (draft_gpt_config) |draft_cfg| {
         if (draft_backend_kind != null and draft_kv_dtype != null) {

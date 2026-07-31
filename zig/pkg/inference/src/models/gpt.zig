@@ -329,8 +329,11 @@ pub const Config = struct {
     }
 
     pub fn supportsSplitSwaGlobalKvRing(self: Config) bool {
+        // PLE is not required: the ring bounds KV for sliding-window layers,
+        // which by model semantics never attend past the window, so it
+        // applies to every gemma with mixed sliding/global attention (the
+        // E-series with PLE and the MoE 26B-A4B without it alike).
         return self.family == .gemma and
-            self.hasPle() and
             self.sliding_window > 0 and
             self.hasGlobalAttentionLayers();
     }
