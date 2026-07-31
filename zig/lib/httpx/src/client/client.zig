@@ -4,11 +4,11 @@
 //!
 //! ## HTTP/2 Support
 //!
-//! Set `http2_enabled` or `force_http2` in `ClientConfig`. The client uses
-//! "prior knowledge" mode (RFC 7540 §3.4), sending the h2 connection preface
-//! directly. ALPN negotiation is not available (Zig stdlib limitation).
+//! `http2_enabled` enables cleartext prior-knowledge H2 (RFC 7540 §3.4).
+//! Zig's TLS client cannot negotiate or report ALPN, so HTTPS stays on
+//! HTTP/1.1 unless `force_http2` explicitly opts into non-negotiated H2.
 //!
-//! One h2 connection is maintained per host:port in `h2_conns`. When the Io
+//! One h2 connection is maintained per transport + host:port in `h2_conns`. When the Io
 //! backend supports fibers, a background receive-loop fiber pumps frames
 //! continuously, enabling true stream multiplexing — multiple request fibers
 //! can share the connection, with writes serialized via `write_mutex` and
@@ -34,7 +34,9 @@ const Status = @import("../core/status.zig").Status;
 const socket_mod = @import("../net/socket.zig");
 const Socket = socket_mod.Socket;
 const Address = socket_mod.Address;
+const AddressFilter = socket_mod.AddressFilter;
 const resolveAddress = socket_mod.resolveAddress;
+const resolveAddressFiltered = socket_mod.resolveAddressFiltered;
 const SocketIoReader = socket_mod.SocketIoReader;
 const SocketIoWriter = socket_mod.SocketIoWriter;
 const SliceIoReader = socket_mod.SliceIoReader;
@@ -55,6 +57,32 @@ const H2Connection = h2_mod.H2Connection;
 const hpack = @import("../protocol/hpack.zig");
 const Stream = @import("../protocol/stream.zig").Stream;
 
+const h2_pool_key_buffer_size = 320;
+
+fn formatH2PoolKey(buffer: []u8, host: []const u8, port: u16, is_tls: bool) ![]const u8 {
+    const scheme: []const u8 = if (is_tls) "https" else "http";
+    const result = if (mem.indexOfScalar(u8, host, ':') != null)
+        std.fmt.bufPrint(buffer, "{s}://[{s}]:{d}", .{ scheme, host, port }) catch return error.InvalidUri
+    else
+        std.fmt.bufPrint(buffer, "{s}://{s}:{d}", .{ scheme, host, port }) catch return error.InvalidUri;
+    for (result) |*byte| byte.* = std.ascii.toLower(byte.*);
+    return result;
+}
+
+fn formatRequestAuthority(allocator: Allocator, uri: Uri) ![]u8 {
+    const host = uri.host orelse return error.InvalidUri;
+    var authority = std.ArrayListUnmanaged(u8).empty;
+    errdefer authority.deinit(allocator);
+    const writer = arrayListWriter(&authority, allocator);
+    if (mem.indexOfScalar(u8, host, ':') != null) {
+        try writer.print("[{s}]", .{host});
+    } else {
+        try writer.writeAll(host);
+    }
+    if (uri.port) |port| try writer.print(":{d}", .{port});
+    return authority.toOwnedSlice(allocator);
+}
+
 /// HTTP client configuration.
 pub const ClientConfig = struct {
     base_url: ?[]const u8 = null,
@@ -66,18 +94,21 @@ pub const ClientConfig = struct {
     max_response_size: usize = types.default_max_body_size,
     max_response_headers: usize = 256,
     verify_ssl: bool = true,
-    /// Enable HTTP/2 via "prior knowledge" mode (RFC 7540 §3.4).
-    /// The client sends the h2 preface directly without ALPN negotiation.
-    /// When Zig's stdlib exposes ALPN, this will additionally negotiate h2.
+    /// Enable cleartext HTTP/2 via "prior knowledge" mode (RFC 7540 §3.4).
+    /// HTTPS requests remain on HTTP/1.1 because Zig's TLS client cannot
+    /// negotiate or report ALPN.
     http2_enabled: bool = false,
-    /// Alias for `http2_enabled`. When true, the client always speaks HTTP/2
-    /// to every host, regardless of ALPN (which the stdlib doesn't support yet).
+    /// Force non-negotiated HTTP/2 for both cleartext and TLS endpoints.
+    /// Use only with an endpoint known to accept an H2 preface without ALPN.
     force_http2: bool = false,
     http3_enabled: bool = false,
     keep_alive: bool = true,
     pool_max_connections: u32 = 20,
     pool_max_per_host: u32 = 5,
     max_cookies: usize = 1000,
+    /// Optional connection-time address policy. When set, pooled HTTP/1
+    /// connections are bypassed so every new connection uses a vetted result.
+    address_filter: ?AddressFilter = null,
     /// Send a PING health check after this many ms of no frames received on
     /// an H2 connection. 0 = disabled. Similar to Go's http2.Transport.ReadIdleTimeout.
     h2_read_idle_timeout_ms: u64 = 30_000,
@@ -116,6 +147,65 @@ fn ensureRequestDeadline(io: Io, deadline_ms: ?i64) !void {
     if (common.milliTimestamp(io) >= deadline) return error.Timeout;
 }
 
+fn shouldUseHttp2(config: ClientConfig, is_tls: bool) bool {
+    return config.force_http2 or (config.http2_enabled and !is_tls);
+}
+
+fn shouldSendConnectionClose(config: ClientConfig, is_tls: bool) bool {
+    if (!config.keep_alive) return true;
+    return config.address_filter != null and !shouldUseHttp2(config, is_tls);
+}
+
+fn isSafeUnsentRetryError(err: anyerror) bool {
+    return switch (err) {
+        error.GoawayRefused,
+        error.MaxConcurrentStreamsExceeded,
+        error.StreamIdExhausted,
+        => true,
+        else => false,
+    };
+}
+
+fn isRetryableTransportError(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionClosed,
+        error.ConnectionRefused,
+        error.Closed,
+        error.NotConnected,
+        error.EndOfStream,
+        error.UnexpectedEof,
+        error.ReadFailed,
+        error.WriteFailed,
+        error.RecvFailed,
+        error.SendFailed,
+        => true,
+        else => false,
+    };
+}
+
+test "filtered HTTP1 connections advertise close when pools are bypassed" {
+    const Policy = struct {
+        fn acceptAll(_: Address) bool {
+            return true;
+        }
+    };
+
+    try std.testing.expect(shouldSendConnectionClose(.{ .address_filter = Policy.acceptAll }, false));
+    try std.testing.expect(!shouldSendConnectionClose(.{
+        .address_filter = Policy.acceptAll,
+        .http2_enabled = true,
+    }, false));
+    try std.testing.expect(shouldSendConnectionClose(.{
+        .address_filter = Policy.acceptAll,
+        .http2_enabled = true,
+    }, true));
+    try std.testing.expect(!shouldSendConnectionClose(.{
+        .address_filter = Policy.acceptAll,
+        .force_http2 = true,
+    }, true));
+    try std.testing.expect(!shouldSendConnectionClose(.{}, false));
+}
+
 /// Request interceptor function type.
 pub const RequestInterceptor = *const fn (*Request, ?*anyopaque) anyerror!void;
 
@@ -138,7 +228,21 @@ const H2PoolEntry = struct {
     session: TlsSession,
     h2: H2Connection,
     is_tls: bool,
-    broken: bool = false,
+    /// Set once the connection can no longer accept new streams. Read and
+    /// written by request, receive, and ping fibers.
+    broken: std.atomic.Value(bool) = .init(false),
+    /// Set after GOAWAY. New streams move to a fresh connection, while
+    /// already accepted streams are allowed to finish on this socket.
+    draining: std.atomic.Value(bool) = .init(false),
+    /// Makes socket shutdown idempotent across retirement, ping failure, and
+    /// client teardown.
+    socket_closed: std.atomic.Value(bool) = .init(false),
+    /// Protected by Client.h2_mutex. A lease keeps this entry alive after it
+    /// has been removed from the host map. Fatal entries close immediately;
+    /// graceful draining entries close after their final lease.
+    active_leases: usize = 0,
+    retired: bool = false,
+    retired_next: ?*H2PoolEntry = null,
     /// Tracks the background receive-loop fiber (if spawned).
     recv_group: Io.Group = Io.Group.init,
     /// True when a receive-loop fiber is actively pumping frames.
@@ -147,12 +251,118 @@ const H2PoolEntry = struct {
     ping_group: Io.Group = Io.Group.init,
     /// Monotonic timestamp (ms) of the last received frame, updated by the
     /// receive loop fiber and read by the ping timer fiber.
-    last_frame_ts: i64 = 0,
+    last_frame_ts: std.atomic.Value(i64) = .init(0),
     /// Client config for timeout values (set during creation).
     read_idle_timeout_ms: u64 = 0,
     ping_timeout_ms: u64 = 15_000,
     io: Io = undefined,
 };
+
+fn closeH2EntrySocket(entry: *H2PoolEntry) void {
+    if (!entry.socket_closed.swap(true, .acq_rel)) entry.socket.close();
+}
+
+fn createH2StreamLocked(entry: *H2PoolEntry, io: Io, data_event: ?*Io.Event) !*Stream {
+    const h2 = &entry.h2;
+    h2.write_mutex.lockUncancelable(io);
+    defer h2.write_mutex.unlock(io);
+    if (entry.broken.load(.acquire)) return error.ConnectionClosed;
+    if (entry.draining.load(.acquire) or h2.goaway_received) {
+        entry.draining.store(true, .release);
+        return error.GoawayRefused;
+    }
+    const stream = try h2.stream_manager.createStream();
+    stream.data_event = data_event;
+    return stream;
+}
+
+/// Caller must hold h2.write_mutex. GOAWAY can arrive after stream allocation
+/// but before HEADERS are encoded, so every send path revalidates here.
+fn validateH2StreamSendLocked(entry: *H2PoolEntry, stream: *Stream) !void {
+    if (entry.broken.load(.acquire)) return error.ConnectionClosed;
+    if (stream.stream_error) |err| return err;
+    if (entry.draining.load(.acquire) or entry.h2.goaway_received) return error.GoawayRefused;
+}
+
+fn cancelAndRemoveH2StreamLocked(entry: *H2PoolEntry, io: Io, stream_id: u31, send_cancel: bool) void {
+    const h2 = &entry.h2;
+    h2.write_mutex.lockUncancelable(io);
+    defer h2.write_mutex.unlock(io);
+
+    if (h2.stream_manager.getStream(stream_id)) |stream| {
+        stream.data_event = null;
+        if (send_cancel and !stream.completed and !entry.broken.load(.acquire)) {
+            if (entry.is_tls) {
+                if (entry.session.getWriter()) |writer|
+                    h2.sendRstStream(writer, stream_id, .cancel) catch {}
+                else |_| {}
+            } else {
+                h2.sendRstStream(&entry.socket, stream_id, .cancel) catch {};
+            }
+        }
+    }
+    h2.stream_manager.removeStream(stream_id);
+}
+
+const H2RequestFailureDisposition = enum {
+    stream_local,
+    draining,
+    connection_fatal,
+};
+
+fn classifyH2RequestFailure(err: anyerror) H2RequestFailureDisposition {
+    return switch (err) {
+        error.Canceled,
+        error.Timeout,
+        error.MaxConcurrentStreamsExceeded,
+        error.ContentLengthMismatch,
+        error.StreamDataOverflow,
+        error.ResponseTooLarge,
+        error.OutOfMemory,
+        error.InvalidUri,
+        error.MultiplexingRequired,
+        error.StreamReset,
+        error.StreamClosed,
+        error.ClosedStream,
+        error.ProtocolError,
+        error.FlowControlError,
+        error.InvalidResponse,
+        => .stream_local,
+        error.GoawayRefused,
+        error.StreamIdExhausted,
+        => .draining,
+        else => .connection_fatal,
+    };
+}
+
+fn isAmbiguousH2StreamError(err: anyerror) bool {
+    return switch (err) {
+        error.ProtocolError,
+        error.FlowControlError,
+        error.InvalidResponse,
+        => true,
+        else => false,
+    };
+}
+
+fn writeH2BodyChunk(
+    status_code: u16,
+    writer: anytype,
+    chunk: []const u8,
+    bytes_written: *u64,
+    total_bytes: ?u64,
+    progress_cb: ?WriterProgressCallback,
+    progress_ctx: ?*anyopaque,
+) !void {
+    // Redirect recursion reuses the same caller writer. Drain 3xx bodies but
+    // do not commit them, matching the HTTP/1 streaming path.
+    if (status_code >= 300 and status_code < 400) return;
+    try writer.writeAll(chunk);
+    bytes_written.* += @intCast(chunk.len);
+    if (progress_cb) |callback| {
+        callback(.{ .bytes_written = bytes_written.*, .total_bytes = total_bytes }, progress_ctx);
+    }
+}
 
 const TlsSessionIoReader = struct {
     inner: *TlsSession,
@@ -249,11 +459,14 @@ pub const Client = struct {
     cookie_mutex: Io.Mutex = Io.Mutex.init,
     pool: ConnectionPool,
     tls_pool: TlsPool,
-    /// Cached HTTP/2 connections keyed by "host:port".
+    /// Cached HTTP/2 connections keyed by transport + host:port.
     h2_conns: std.StringHashMapUnmanaged(*H2PoolEntry) = .{},
     /// Protects h2_conns from concurrent fiber access during connection
     /// creation (getOrCreateH2Conn yields on DNS, connect, TLS handshake).
     h2_mutex: Io.Mutex = Io.Mutex.init,
+    /// Fatal or draining entries removed from h2_conns but still held by
+    /// request or streaming-response leases. Protected by h2_mutex.
+    retired_h2_entries: ?*H2PoolEntry = null,
 
     const Self = @This();
 
@@ -277,6 +490,107 @@ pub const Client = struct {
         };
     }
 
+    fn leaseH2EntryLocked(_: *Self, entry: *H2PoolEntry) void {
+        std.debug.assert(!entry.retired);
+        entry.active_leases += 1;
+    }
+
+    /// Detaches an entry from reuse without invalidating existing request
+    /// pointers. Fatal entries close now; draining entries keep their socket
+    /// until accepted streams return their leases.
+    fn detachH2EntryLocked(self: *Self, entry: *H2PoolEntry, close_socket: bool) ?*H2PoolEntry {
+        std.debug.assert(!entry.retired);
+        entry.retired = true;
+        if (close_socket) closeH2EntrySocket(entry);
+        if (entry.active_leases == 0) return entry;
+        entry.retired_next = self.retired_h2_entries;
+        self.retired_h2_entries = entry;
+        return null;
+    }
+
+    fn unlinkRetiredH2EntryLocked(self: *Self, entry: *H2PoolEntry) void {
+        var link: *?*H2PoolEntry = &self.retired_h2_entries;
+        while (link.*) |current| {
+            if (current == entry) {
+                link.* = current.retired_next;
+                current.retired_next = null;
+                return;
+            }
+            link = &current.retired_next;
+        }
+        unreachable;
+    }
+
+    fn releaseH2EntryLocked(self: *Self, entry: *H2PoolEntry) ?*H2PoolEntry {
+        std.debug.assert(entry.active_leases > 0);
+        entry.active_leases -= 1;
+        if (entry.active_leases != 0 or !entry.retired) return null;
+        self.unlinkRetiredH2EntryLocked(entry);
+        return entry;
+    }
+
+    fn releaseH2Entry(self: *Self, entry: *H2PoolEntry) void {
+        const ready = blk: {
+            self.h2_mutex.lockUncancelable(self.io);
+            defer self.h2_mutex.unlock(self.io);
+            break :blk self.releaseH2EntryLocked(entry);
+        };
+        if (ready) |retired| self.destroyH2Entry(retired);
+    }
+
+    fn detachMappedH2Entry(self: *Self, host: []const u8, port: u16, entry: *H2PoolEntry, close_socket: bool) void {
+        var key_buffer: [h2_pool_key_buffer_size]u8 = undefined;
+        const key = formatH2PoolKey(&key_buffer, host, port, entry.is_tls) catch return;
+        var removed_key: ?[]const u8 = null;
+        var ready_to_destroy: ?*H2PoolEntry = null;
+        {
+            self.h2_mutex.lockUncancelable(self.io);
+            defer self.h2_mutex.unlock(self.io);
+
+            if (!entry.retired and self.h2_conns.get(key) == entry) {
+                const removed = self.h2_conns.fetchRemove(key).?;
+                removed_key = removed.key;
+                ready_to_destroy = self.detachH2EntryLocked(entry, close_socket);
+            }
+        }
+        if (removed_key) |owned_key| self.allocator.free(owned_key);
+        if (ready_to_destroy) |retired| self.destroyH2Entry(retired);
+    }
+
+    /// Makes a transport-failed entry unavailable immediately. Closing the
+    /// socket wakes its receive loop; allocation teardown still waits for the
+    /// final request/stream lease and always happens outside h2_mutex.
+    fn breakAndRetireH2Entry(self: *Self, host: []const u8, port: u16, entry: *H2PoolEntry) void {
+        entry.broken.store(true, .release);
+        closeH2EntrySocket(entry);
+        self.detachMappedH2Entry(host, port, entry, true);
+    }
+
+    /// Detaches a GOAWAY connection from reuse without disrupting streams the
+    /// peer already accepted.
+    fn drainH2Entry(self: *Self, host: []const u8, port: u16, entry: *H2PoolEntry) void {
+        entry.draining.store(true, .release);
+        self.detachMappedH2Entry(host, port, entry, false);
+    }
+
+    fn handleH2RequestFailure(
+        self: *Self,
+        host: []const u8,
+        port: u16,
+        entry: *H2PoolEntry,
+        err: anyerror,
+    ) void {
+        if (entry.broken.load(.acquire) or (!entry.recv_running and isAmbiguousH2StreamError(err))) {
+            self.breakAndRetireH2Entry(host, port, entry);
+            return;
+        }
+        switch (classifyH2RequestFailure(err)) {
+            .stream_local => {},
+            .draining => self.drainH2Entry(host, port, entry),
+            .connection_fatal => self.breakAndRetireH2Entry(host, port, entry),
+        }
+    }
+
     /// Releases all allocated resources.
     pub fn deinit(self: *Self) void {
         self.interceptors.deinit(self.allocator);
@@ -289,25 +603,25 @@ pub const Client = struct {
         self.pool.deinit();
         self.tls_pool.deinit();
 
-        // Clean up cached HTTP/2 connections.
+        // Client teardown requires all request/stream leases to have been
+        // returned by callers. Close first so receive and ping fibers stop.
         var h2_it = self.h2_conns.iterator();
         while (h2_it.next()) |entry| {
             const e = entry.value_ptr.*;
-            // Close the socket first so the receive loop's blocking read
-            // returns ConnectionClosed, allowing the fiber to exit cleanly.
-            // This also causes the ping timer's waitTimeout to fail.
-            e.socket.close();
-            // Await recv_group first: the receive loop sets entry.broken=true
-            // on exit, which causes the ping fiber's while(!broken) loop to
-            // terminate without waiting for a full ping timeout cycle.
-            e.recv_group.await(self.io) catch {};
-            e.ping_group.await(self.io) catch {};
-            e.h2.deinit();
-            e.session.deinit();
-            self.allocator.destroy(e);
+            std.debug.assert(e.active_leases == 0);
+            self.destroyH2Entry(e);
             self.allocator.free(entry.key_ptr.*);
         }
         self.h2_conns.deinit(self.allocator);
+
+        var retired = self.retired_h2_entries;
+        while (retired) |entry| {
+            const next = entry.retired_next;
+            std.debug.assert(entry.active_leases == 0);
+            self.destroyH2Entry(entry);
+            retired = next;
+        }
+        self.retired_h2_entries = null;
     }
 
     /// Adds an interceptor to the client.
@@ -371,7 +685,7 @@ pub const Client = struct {
             }
         }
 
-        if (!self.config.keep_alive and !req.headers.contains(HeaderName.CONNECTION)) {
+        if (shouldSendConnectionClose(self.config, req.uri.isTls()) and !req.headers.contains(HeaderName.CONNECTION)) {
             try req.headers.set(HeaderName.CONNECTION, "close");
         }
 
@@ -466,7 +780,7 @@ pub const Client = struct {
             }
         }
 
-        if (!self.config.keep_alive and !req.headers.contains(HeaderName.CONNECTION)) {
+        if (shouldSendConnectionClose(self.config, req.uri.isTls()) and !req.headers.contains(HeaderName.CONNECTION)) {
             try req.headers.set(HeaderName.CONNECTION, "close");
         }
 
@@ -591,20 +905,16 @@ pub const Client = struct {
         var attempt: u32 = 0;
         while (true) {
             var res = self.executeRequestOnce(req, timeout_override_ms, deadline_ms) catch |err| {
+                self.io.checkCancel() catch return error.Canceled;
                 ensureRequestDeadline(self.io, deadline_ms) catch return error.Timeout;
-                // RFC 7540 §6.8: Streams refused via GOAWAY were never
-                // processed and are always safe to retry on a new connection.
-                const is_goaway_refused = (err == error.GoawayRefused);
-                const is_max_streams = (err == error.MaxConcurrentStreamsExceeded);
-                if ((is_goaway_refused or
-                    is_max_streams or
-                    (policy.retry_on_connection_error and can_retry_method and mayRetryConnectionError(err))) and
-                    attempt < policy.max_retries)
-                {
+                const safe_unsent = isSafeUnsentRetryError(err);
+                const replayable_transport = policy.retry_on_connection_error and
+                    can_retry_method and isRetryableTransportError(err);
+                if ((safe_unsent or replayable_transport) and attempt < policy.max_retries) {
                     attempt += 1;
                     const delay_ms = policy.calculateDelay(attempt);
                     if (delay_ms > 0) {
-                        self.io.sleep(Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
+                        try self.io.sleep(Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake);
                     }
                     continue;
                 }
@@ -616,7 +926,7 @@ pub const Client = struct {
                 attempt += 1;
                 const delay_ms = policy.calculateDelay(attempt);
                 if (delay_ms > 0) {
-                    self.io.sleep(Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
+                    try self.io.sleep(Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake);
                 }
                 continue;
             }
@@ -708,42 +1018,14 @@ pub const Client = struct {
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
     ) !Response {
-        const policy = self.config.retry_policy;
-        const can_retry_method = (!policy.retry_only_idempotent) or req.method.isIdempotent();
-
-        var attempt: u32 = 0;
-        while (true) {
-            var res = self.executeRequestToWriterOnce(req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx) catch |err| {
-                ensureRequestDeadline(self.io, deadline_ms) catch return error.Timeout;
-                const is_goaway_refused = (err == error.GoawayRefused);
-                const is_max_streams = (err == error.MaxConcurrentStreamsExceeded);
-                if ((is_goaway_refused or
-                    is_max_streams or
-                    (policy.retry_on_connection_error and can_retry_method and mayRetryConnectionError(err))) and
-                    attempt < policy.max_retries)
-                {
-                    attempt += 1;
-                    const delay_ms = policy.calculateDelay(attempt);
-                    if (delay_ms > 0) {
-                        self.io.sleep(Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
-                    }
-                    continue;
-                }
-                return err;
-            };
-
-            if (can_retry_method and attempt < policy.max_retries and policy.shouldRetryStatus(res.status.code)) {
-                res.deinit();
-                attempt += 1;
-                const delay_ms = policy.calculateDelay(attempt);
-                if (delay_ms > 0) {
-                    self.io.sleep(Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
-                }
-                continue;
-            }
-
-            return res;
-        }
+        // Once a generic writer observes bytes, replaying would duplicate or
+        // corrupt its output. This API therefore performs one attempt and does
+        // not status-retry after a response body has been committed.
+        return self.executeRequestToWriterOnce(req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx) catch |err| {
+            self.io.checkCancel() catch return error.Canceled;
+            ensureRequestDeadline(self.io, deadline_ms) catch return error.Timeout;
+            return err;
+        };
     }
 
     fn applyTimeouts(socket: *Socket, recv_ms: u64, send_ms: u64, deadline_ms: ?i64) !void {
@@ -752,6 +1034,10 @@ pub const Client = struct {
         try socket.setRecvTimeout(recv_ms);
         try socket.setSendTimeout(send_ms);
         socket.setRequestDeadline(deadline_ms);
+    }
+
+    fn resolveRequestAddress(self: *Self, host: []const u8, port: u16) !Address {
+        return resolveAddressFiltered(self.io, host, port, self.config.address_filter);
     }
 
     fn responseSizeLimit(self: *const Self, req: *const Request) usize {
@@ -795,30 +1081,25 @@ pub const Client = struct {
 
         // HTTP/2 "prior knowledge" path (RFC 7540 §3.4).
         // Reuses a pooled connection per host when available.
-        if (self.config.http2_enabled or self.config.force_http2) {
+        if (shouldUseHttp2(self.config, req.uri.isTls())) {
             const is_tls = req.uri.isTls();
             const entry = try self.getOrCreateH2Conn(host, port, is_tls);
+            defer self.releaseH2Entry(entry);
             const result = self.executeH2OnPooled(entry, req) catch |err| {
-                // Only mark the connection broken for transport/framing errors.
-                // Stream-level errors (MaxConcurrentStreamsExceeded, ContentLengthMismatch,
-                // StreamDataOverflow) don't indicate a bad connection — other streams
-                // may still be healthy.
-                switch (err) {
-                    error.MaxConcurrentStreamsExceeded,
-                    error.ContentLengthMismatch,
-                    error.StreamDataOverflow,
-                    => {},
-                    else => entry.broken = true,
-                }
+                self.handleH2RequestFailure(host, port, entry, err);
                 return normalizeH2ResponseError(err);
             };
-            // Mark broken if peer sent GOAWAY — next request gets a fresh connection.
-            if (entry.h2.goaway_received) entry.broken = true;
+            // Snapshot GOAWAY under the delivery lock, then detach from the
+            // reusable map without taking h2_mutex while write_mutex is held.
+            entry.h2.write_mutex.lockUncancelable(self.io);
+            const goaway_received = entry.h2.goaway_received;
+            entry.h2.write_mutex.unlock(self.io);
+            if (goaway_received) self.drainH2Entry(host, port, entry);
             return result;
         }
 
         if (req.uri.isTls()) {
-            if (self.config.keep_alive) {
+            if (self.config.keep_alive and self.config.address_filter == null) {
                 var tls_conn = try self.tls_pool.getConnection(host, port);
                 var ok = false;
                 defer {
@@ -830,14 +1111,14 @@ pub const Client = struct {
             }
 
             // Non-pooled TLS fallback (keep_alive disabled).
-            const addr = try resolveAddress(self.io, host, port);
+            const addr = try self.resolveRequestAddress(host, port);
             var socket = try Socket.connect(addr, self.io);
             defer socket.close();
             try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
             return self.executeOnNewTls(&socket, host, req);
         }
 
-        if (self.config.keep_alive) {
+        if (self.config.keep_alive and self.config.address_filter == null) {
             var conn = try self.pool.getConnection(host, port);
             var ok = false;
             defer {
@@ -848,7 +1129,7 @@ pub const Client = struct {
             return self.executeOnSocket(&conn.socket, req, &ok);
         }
 
-        const addr = try resolveAddress(self.io, host, port);
+        const addr = try self.resolveRequestAddress(host, port);
         var socket = try Socket.connect(addr, self.io);
         defer socket.close();
         try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
@@ -875,15 +1156,12 @@ pub const Client = struct {
             break :blk self.config.timeouts.write_ms;
         };
 
-        if (self.config.http2_enabled or self.config.force_http2) {
-            var res = try self.executeRequestOnce(req, timeout_override_ms, deadline_ms);
-            errdefer res.deinit();
-            try writeBufferedBody(&res, writer, progress_cb, progress_ctx);
-            return res;
+        if (shouldUseHttp2(self.config, req.uri.isTls())) {
+            return self.executeH2ToWriter(req, writer, progress_cb, progress_ctx);
         }
 
         if (req.uri.isTls()) {
-            if (self.config.keep_alive) {
+            if (self.config.keep_alive and self.config.address_filter == null) {
                 var tls_conn = try self.tls_pool.getConnection(host, port);
                 var ok = false;
                 defer {
@@ -894,14 +1172,14 @@ pub const Client = struct {
                 return self.executeOnTlsToWriter(&tls_conn.session, req, writer, progress_cb, progress_ctx, &ok);
             }
 
-            const addr = try resolveAddress(self.io, host, port);
+            const addr = try self.resolveRequestAddress(host, port);
             var socket = try Socket.connect(addr, self.io);
             defer socket.close();
             try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
             return self.executeOnNewTlsToWriter(&socket, host, req, writer, progress_cb, progress_ctx);
         }
 
-        if (self.config.keep_alive) {
+        if (self.config.keep_alive and self.config.address_filter == null) {
             var conn = try self.pool.getConnection(host, port);
             var ok = false;
             defer {
@@ -912,7 +1190,7 @@ pub const Client = struct {
             return self.executeOnSocketToWriter(&conn.socket, req, writer, progress_cb, progress_ctx, &ok);
         }
 
-        const addr = try resolveAddress(self.io, host, port);
+        const addr = try self.resolveRequestAddress(host, port);
         var socket = try Socket.connect(addr, self.io);
         defer socket.close();
         try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
@@ -1037,39 +1315,60 @@ pub const Client = struct {
     /// If two fibers race to create the same host:port, the loser discards
     /// its connection and uses the winner's.
     fn getOrCreateH2Conn(self: *Self, host: []const u8, port: u16, is_tls: bool) !*H2PoolEntry {
-        var key_buf: [280]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "{s}:{d}", .{ host, port }) catch return error.InvalidUri;
+        var key_buf: [h2_pool_key_buffer_size]u8 = undefined;
+        const key = try formatH2PoolKey(&key_buf, host, port, is_tls);
 
-        // --- Phase 1: Check map under lock ---
+        // --- Phase 1: Lease a reusable entry or retire a broken one. ---
+        var first_removed_key: ?[]const u8 = null;
+        var first_ready_to_destroy: ?*H2PoolEntry = null;
         {
             self.h2_mutex.lockUncancelable(self.io);
             defer self.h2_mutex.unlock(self.io);
 
             if (self.h2_conns.get(key)) |entry| {
-                if (!entry.broken and !entry.h2.goaway_received) return entry;
-                if (entry.h2.goaway_received) entry.broken = true;
+                const broken = entry.broken.load(.acquire);
+                const draining = entry.draining.load(.acquire);
+                if (!broken and !draining) {
+                    self.leaseH2EntryLocked(entry);
+                    return entry;
+                }
+                const removed = self.h2_conns.fetchRemove(key).?;
+                first_removed_key = removed.key;
+                first_ready_to_destroy = self.detachH2EntryLocked(removed.value, broken);
             }
         }
+        if (first_removed_key) |removed_key| self.allocator.free(removed_key);
+        if (first_ready_to_destroy) |retired| self.destroyH2Entry(retired);
 
         // --- Phase 2: Create connection without lock (blocking I/O) ---
         const entry = try self.allocator.create(H2PoolEntry);
-        entry.recv_running = false;
         errdefer self.allocator.destroy(entry);
 
-        const addr = try resolveAddress(self.io, host, port);
-        entry.socket = try Socket.connect(addr, self.io);
+        const addr = try self.resolveRequestAddress(host, port);
+        const socket = try Socket.connect(addr, self.io);
+        entry.* = .{
+            .socket = socket,
+            .session = undefined,
+            .h2 = undefined,
+            .is_tls = is_tls,
+            .broken = .init(false),
+            .draining = .init(false),
+            .socket_closed = .init(false),
+            .recv_group = Io.Group.init,
+            .ping_group = Io.Group.init,
+            .last_frame_ts = .init(common.milliTimestamp(self.io)),
+            .read_idle_timeout_ms = self.config.h2_read_idle_timeout_ms,
+            .ping_timeout_ms = self.config.h2_ping_timeout_ms,
+            .io = self.io,
+        };
         // Guard socket close only until fibers take ownership (recv_running).
-        // After fibers start, the errdefer at line ~521 handles shutdown.
-        errdefer if (!entry.recv_running) entry.socket.close();
+        // After fibers start, the later errdefer cancels both groups.
+        errdefer if (!entry.recv_running) closeH2EntrySocket(entry);
         entry.socket.setNoDelay(true) catch {};
         entry.socket.setKeepAlive(true) catch {};
 
-        entry.is_tls = is_tls;
-        entry.broken = false;
-
         if (is_tls) {
-            var tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
-            tls_cfg.alpn_protocols = &.{ "h2", "http/1.1" };
+            const tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
             entry.session = TlsSession.init(tls_cfg, self.io);
             errdefer entry.session.deinit();
             entry.session.attachSocket(&entry.socket);
@@ -1084,10 +1383,6 @@ pub const Client = struct {
 
         entry.h2 = H2Connection.initClient(self.allocator, self.io);
         entry.h2.max_stream_data_size = self.config.max_response_size;
-        entry.io = self.io;
-        entry.last_frame_ts = common.milliTimestamp(self.io);
-        entry.read_idle_timeout_ms = self.config.h2_read_idle_timeout_ms;
-        entry.ping_timeout_ms = self.config.h2_ping_timeout_ms;
         errdefer entry.h2.deinit();
 
         // Perform h2 handshake: preface + SETTINGS exchange.
@@ -1110,18 +1405,28 @@ pub const Client = struct {
         } else |_| {}
 
         errdefer if (entry.recv_running) {
-            entry.socket.close();
-            entry.recv_group.await(self.io) catch {};
-            entry.ping_group.await(self.io) catch {};
+            closeH2EntrySocket(entry);
+            entry.recv_group.cancel(self.io);
+            entry.ping_group.cancel(self.io);
         };
 
         // --- Phase 3: Re-check and insert under lock ---
-        // Collect entries to tear down outside the lock (await yields the
-        // fiber, so we must not hold h2_mutex during teardown).
+        if (entry.broken.load(.acquire)) return error.ConnectionClosed;
+        if (entry.draining.load(.acquire)) return error.GoawayRefused;
+
+        const owned_key = try self.allocator.dupe(u8, key);
+        var keep_owned_key = false;
+        defer if (!keep_owned_key) self.allocator.free(owned_key);
+
         var race_winner: ?*H2PoolEntry = null;
-        var stale_removed: ?std.StringHashMapUnmanaged(*H2PoolEntry).KV = null;
-        // Use defer so stale entry is cleaned up even if allocPrint/put fail.
-        defer if (stale_removed) |removed| self.destroyH2EntryKeyed(removed);
+        var stale_removed_key: ?[]const u8 = null;
+        var stale_ready_to_destroy: ?*H2PoolEntry = null;
+        // Teardown can wait for background fibers, so it must happen after
+        // the h2_mutex block even when map insertion fails.
+        defer {
+            if (stale_removed_key) |removed_key| self.allocator.free(removed_key);
+            if (stale_ready_to_destroy) |retired| self.destroyH2Entry(retired);
+        }
 
         {
             self.h2_mutex.lockUncancelable(self.io);
@@ -1129,18 +1434,22 @@ pub const Client = struct {
 
             // Another fiber may have raced us and inserted a connection.
             if (self.h2_conns.get(key)) |existing| {
-                if (!existing.broken and !existing.h2.goaway_received) {
+                const broken = existing.broken.load(.acquire);
+                const draining = existing.draining.load(.acquire);
+                if (!broken and !draining) {
+                    self.leaseH2EntryLocked(existing);
                     race_winner = existing;
+                } else {
+                    const removed = self.h2_conns.fetchRemove(key).?;
+                    stale_removed_key = removed.key;
+                    stale_ready_to_destroy = self.detachH2EntryLocked(removed.value, broken);
                 }
             }
 
             if (race_winner == null) {
-                // Remove stale/broken entry if present.
-                stale_removed = self.h2_conns.fetchRemove(key);
-
-                const owned_key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ host, port });
-                errdefer self.allocator.free(owned_key);
                 try self.h2_conns.put(self.allocator, owned_key, entry);
+                self.leaseH2EntryLocked(entry);
+                keep_owned_key = true;
             }
         }
 
@@ -1155,28 +1464,12 @@ pub const Client = struct {
 
     /// Tears down an H2PoolEntry that was never inserted into h2_conns.
     fn destroyH2Entry(self: *Self, entry: *H2PoolEntry) void {
-        if (entry.recv_running) {
-            entry.socket.close();
-            entry.recv_group.await(self.io) catch {};
-            entry.ping_group.await(self.io) catch {};
-        } else {
-            entry.socket.close();
-        }
+        closeH2EntrySocket(entry);
+        entry.recv_group.cancel(self.io);
+        entry.ping_group.cancel(self.io);
         entry.h2.deinit();
         entry.session.deinit();
         self.allocator.destroy(entry);
-    }
-
-    /// Tears down an H2PoolEntry that was removed from h2_conns via fetchRemove.
-    fn destroyH2EntryKeyed(self: *Self, removed: std.StringHashMapUnmanaged(*H2PoolEntry).KV) void {
-        const e = removed.value;
-        e.socket.close();
-        e.recv_group.await(self.io) catch {};
-        e.ping_group.await(self.io) catch {};
-        e.h2.deinit();
-        e.session.deinit();
-        self.allocator.destroy(e);
-        self.allocator.free(removed.key);
     }
 
     /// Reads frames until the server's initial SETTINGS has been received and ACKed.
@@ -1205,18 +1498,22 @@ pub const Client = struct {
     fn h2RecvLoopFiber(entry: *H2PoolEntry) Io.Cancelable!void {
         if (entry.is_tls) {
             const r = entry.session.getReader() catch {
-                entry.broken = true;
+                entry.broken.store(true, .release);
+                closeH2EntrySocket(entry);
+                entry.h2.signalAllStreams(error.ConnectionClosed);
                 return;
             };
             const w = entry.session.getWriter() catch {
-                entry.broken = true;
+                entry.broken.store(true, .release);
+                closeH2EntrySocket(entry);
+                entry.h2.signalAllStreams(error.ConnectionClosed);
                 return;
             };
             h2RecvLoop(entry, r, w);
         } else {
             h2RecvLoop(entry, &entry.socket, &entry.socket);
         }
-        // h2RecvLoop's defer already sets entry.broken = true
+        // h2RecvLoop's defer already marks the entry broken.
     }
 
     fn h2RecvLoop(entry: *H2PoolEntry, reader: anytype, writer: anytype) void {
@@ -1224,11 +1521,24 @@ pub const Client = struct {
         // (woken by signalAllStreams) see entry.broken=true and don't reuse
         // this dead connection.
         var last_err: anyerror = error.ConnectionClosed;
+        var graceful_drain = false;
         defer entry.h2.signalAllStreams(last_err);
         defer {
-            entry.broken = true;
+            if (graceful_drain) {
+                entry.draining.store(true, .release);
+            } else {
+                entry.broken.store(true, .release);
+            }
         }
-        while (!entry.h2.goaway_received) {
+        while (true) {
+            switch (entry.h2.peerGoawayState()) {
+                .none => {},
+                .draining => entry.draining.store(true, .release),
+                .drained => {
+                    graceful_drain = true;
+                    return;
+                },
+            }
             _ = entry.h2.processOneFrameLocked(reader, writer) catch |err| switch (err) {
                 error.ConnectionClosed => return,
                 else => {
@@ -1238,7 +1548,7 @@ pub const Client = struct {
                     return;
                 },
             };
-            entry.last_frame_ts = common.milliTimestamp(entry.io);
+            entry.last_frame_ts.store(common.milliTimestamp(entry.io), .release);
         }
     }
 
@@ -1252,15 +1562,15 @@ pub const Client = struct {
         const ping_ms = entry.ping_timeout_ms;
         if (idle_ms == 0) return;
 
-        while (!entry.broken) {
+        while (!entry.broken.load(.acquire)) {
             // Sleep for the idle timeout period.
             entry.io.sleep(Io.Duration.fromMilliseconds(@intCast(idle_ms)), .awake) catch return;
 
-            if (entry.broken) return;
+            if (entry.broken.load(.acquire)) return;
 
             // Check if we received any frame during the sleep period.
             const now = common.milliTimestamp(entry.io);
-            const since_last = now - entry.last_frame_ts;
+            const since_last = now - entry.last_frame_ts.load(.acquire);
             if (since_last < @as(i64, @intCast(idle_ms))) continue;
 
             // No frames received — send a PING to probe liveness.
@@ -1286,12 +1596,12 @@ pub const Client = struct {
             } };
             entry.h2.ping_ack_event.waitTimeout(entry.io, timeout) catch {
                 // Timeout or canceled — connection is dead.
-                entry.broken = true;
-                entry.socket.close();
+                entry.broken.store(true, .release);
+                closeH2EntrySocket(entry);
                 return;
             };
             // ACK received — connection is alive. Update timestamp.
-            entry.last_frame_ts = common.milliTimestamp(entry.io);
+            entry.last_frame_ts.store(common.milliTimestamp(entry.io), .release);
         }
     }
 
@@ -1301,24 +1611,23 @@ pub const Client = struct {
     /// In multiplexed mode (recv_running=true), the background receive fiber
     /// pumps frames while this fiber waits on a per-stream event.
     /// In fallback mode, frames are pumped inline via awaitStreamComplete.
-    fn executeH2OnPooled(self: *Self, entry: *H2PoolEntry, req: *Request) !Response {
+    fn executeH2OnPooled(self: *Self, entry: *H2PoolEntry, req: *Request) anyerror!Response {
         const h2 = &entry.h2;
-        if (h2.goaway_received) {
-            entry.broken = true;
-            return error.ConnectionClosed;
-        }
-        const stream = try h2.stream_manager.createStream();
+        const stream = try createH2StreamLocked(entry, self.io, null);
         self.configureH2ResponseStream(stream, req);
         const stream_id = stream.id;
-        errdefer h2.stream_manager.removeStream(stream_id);
+        var owns_stream = true;
+        var peer_stream_maybe_open = false;
+        errdefer if (owns_stream) cancelAndRemoveH2StreamLocked(entry, self.io, stream_id, peer_stream_maybe_open);
 
         // Build request pseudo-headers.
         const method_str = if (req.method == .CUSTOM)
             req.custom_method orelse "CUSTOM"
         else
             req.method.toString();
-        const scheme = req.uri.scheme orelse "http";
-        const authority = req.uri.host orelse return error.InvalidUri;
+        const scheme: []const u8 = if (req.uri.isTls()) "https" else "http";
+        const authority = try formatRequestAuthority(self.allocator, req.uri);
+        defer self.allocator.free(authority);
         var path_buf = std.ArrayListUnmanaged(u8).empty;
         defer path_buf.deinit(self.allocator);
         const alw = arrayListWriter(&path_buf, self.allocator);
@@ -1352,57 +1661,54 @@ pub const Client = struct {
         const has_body = req.body != null;
 
         if (entry.recv_running) {
-            // Multiplexed mode: background fiber pumps frames; we wait on a
-            // per-stream completion semaphore that the receive loop posts.
-            // Heap-allocated for pointer stability: the receive loop may post
-            // after this function returns on a write error path, so a stack-
-            // allocated semaphore would be use-after-free.
-            const sem = try self.allocator.create(Io.Semaphore);
-            sem.* = .{ .permits = 0 };
-            stream.completion_sem = sem;
-            // Re-fetch the stream pointer for cleanup since the backing
-            // map may have rehashed while we were blocked on I/O.
-            defer {
-                if (h2.stream_manager.getStream(stream_id)) |s| {
-                    s.completion_sem = null;
-                }
-                self.allocator.destroy(sem);
-            }
+            // Multiplexed mode: the background fiber pumps frames while this
+            // request waits on synchronization state owned by the stream.
 
             // Serialize frame writes via the connection's write mutex.
             {
                 h2.write_mutex.lockUncancelable(self.io);
                 defer h2.write_mutex.unlock(self.io);
+                try validateH2StreamSendLocked(entry, stream);
                 if (entry.is_tls) {
                     const w = try entry.session.getWriter();
                     try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
+                    peer_stream_maybe_open = true;
                     if (req.body) |body| try h2.writeDataBlocking(w, stream_id, body, true);
                 } else {
                     try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
+                    peer_stream_maybe_open = true;
                     if (req.body) |body| try h2.writeDataBlocking(&entry.socket, stream_id, body, true);
                 }
             }
-
             // Wait for the receive loop to deliver the response.
-            sem.waitUncancelable(self.io);
+            try stream.completion_event.wait(self.io);
         } else {
             // Fallback mode: pump frames inline (no fiber support).
             if (entry.is_tls) {
                 const r = try entry.session.getReader();
                 const w = try entry.session.getWriter();
                 try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
+                peer_stream_maybe_open = true;
                 if (req.body) |body| try h2.writeData(w, stream_id, body, true);
                 try h2.awaitStreamComplete(r, w, stream_id);
             } else {
                 try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
+                peer_stream_maybe_open = true;
                 if (req.body) |body| try h2.writeData(&entry.socket, stream_id, body, true);
                 try h2.awaitStreamComplete(&entry.socket, &entry.socket, stream_id);
             }
         }
 
-        // Extract response from mailbox.
+        // Extract and remove under the same lock used by mailbox delivery.
+        // A completion wake can race the tail of delivery; the lock keeps the
+        // stream alive until all response data has been copied out.
+        h2.write_mutex.lockUncancelable(self.io);
+        defer h2.write_mutex.unlock(self.io);
+        defer {
+            h2.stream_manager.removeStream(stream_id);
+            owns_stream = false;
+        }
         const s = h2.stream_manager.getStream(stream_id) orelse return error.InvalidResponse;
-        defer h2.stream_manager.removeStream(stream_id);
         if (s.stream_error) |err| return err;
 
         // Headers were decoded in deliverToMailbox (receive loop) to avoid
@@ -1443,36 +1749,40 @@ pub const Client = struct {
         io: Io,
         h2: *H2Connection,
         entry: *H2PoolEntry,
+        client: *Self,
         data_event: *Io.Event,
         allocator: Allocator,
         read_timeout: Io.Timeout = .none,
+        closed: bool = false,
 
         /// Reads up to `buf.len` bytes. Blocks until data is available.
         /// Returns 0 at EOF. Returns error.Timeout if no data arrives
         /// within the configured read_timeout.
-        pub fn read(self: *H2StreamReader, buf: []u8) !usize {
+        pub fn read(self: *H2StreamReader, buf: []u8) anyerror!usize {
+            if (self.closed) return error.StreamClosed;
             while (true) {
-                const avail = self.stream.data_buf.items.len - self.stream.read_offset;
-                if (avail > 0) {
-                    const n = @min(avail, buf.len);
-                    const start = self.stream.read_offset;
-                    @memcpy(buf[0..n], self.stream.data_buf.items[start..][0..n]);
-                    self.stream.read_offset += n;
-                    if (self.stream.read_offset >= Stream.compact_threshold) {
-                        self.stream.compactDataBuf();
-                    }
-                    return n;
-                }
-                if (self.stream.stream_error) |err| return normalizeH2ResponseError(err);
-                if (self.stream.completed) return 0;
+                {
+                    self.h2.write_mutex.lockUncancelable(self.io);
+                    defer self.h2.write_mutex.unlock(self.io);
 
-                // Reset event, re-check buffer (handles race with receive loop),
-                // then wait with timeout.
-                self.data_event.reset();
-                const avail2 = self.stream.data_buf.items.len - self.stream.read_offset;
-                if (avail2 > 0) continue;
-                if (self.stream.stream_error) |err| return normalizeH2ResponseError(err);
-                if (self.stream.completed) return 0;
+                    const avail = self.stream.data_buf.items.len - self.stream.read_offset;
+                    if (avail > 0) {
+                        const n = @min(avail, buf.len);
+                        const start = self.stream.read_offset;
+                        @memcpy(buf[0..n], self.stream.data_buf.items[start..][0..n]);
+                        self.stream.read_offset += n;
+                        if (self.stream.read_offset >= Stream.compact_threshold) {
+                            self.stream.compactDataBuf();
+                        }
+                        return n;
+                    }
+                    if (self.stream.stream_error) |err| return normalizeH2ResponseError(err);
+                    if (self.stream.completed) return 0;
+
+                    // Delivery uses the same lock, so no signal can land
+                    // between resetting the event and checking stream state.
+                    self.data_event.reset();
+                }
 
                 self.data_event.waitTimeout(self.io, self.read_timeout) catch |err| switch (err) {
                     error.Timeout => return error.Timeout,
@@ -1484,25 +1794,29 @@ pub const Client = struct {
         /// Releases the stream. Sends RST_STREAM(CANCEL) if the stream
         /// hasn't completed, telling the server to stop sending DATA frames.
         pub fn close(self: *H2StreamReader) void {
+            if (self.closed) return;
+            self.closed = true;
             const stream_id = self.stream.id;
-            const completed = self.stream.completed;
-            self.stream.data_event = null;
-            self.stream.completion_sem = null;
-
-            if (!completed) {
+            {
                 self.h2.write_mutex.lockUncancelable(self.io);
                 defer self.h2.write_mutex.unlock(self.io);
-                if (self.entry.is_tls) {
-                    if (self.entry.session.getWriter()) |w|
-                        self.h2.sendRstStream(w, stream_id, .cancel) catch {}
-                    else |_| {}
-                } else {
-                    self.h2.sendRstStream(&self.entry.socket, stream_id, .cancel) catch {};
+
+                const completed = self.stream.completed;
+                self.stream.data_event = null;
+                if (!completed) {
+                    if (self.entry.is_tls) {
+                        if (self.entry.session.getWriter()) |w|
+                            self.h2.sendRstStream(w, stream_id, .cancel) catch {}
+                        else |_| {}
+                    } else {
+                        self.h2.sendRstStream(&self.entry.socket, stream_id, .cancel) catch {};
+                    }
                 }
+                self.h2.stream_manager.removeStream(stream_id);
             }
 
-            self.h2.stream_manager.removeStream(stream_id);
             self.allocator.destroy(self.data_event);
+            self.client.releaseH2Entry(self.entry);
         }
     };
 
@@ -1522,39 +1836,36 @@ pub const Client = struct {
     /// Sends an HTTP/2 request and returns response headers + an incremental
     /// body reader. The caller reads DATA frames as they arrive without
     /// waiting for END_STREAM. Requires multiplexed mode (recv_running=true).
-    pub fn requestStream(self: *Self, req: *Request) !H2StreamResponse {
+    pub fn requestStream(self: *Self, req: *Request) anyerror!H2StreamResponse {
         const host = req.uri.host orelse return error.InvalidUri;
         const is_tls = req.uri.isTls();
         const port = req.uri.effectivePort();
         const entry = try self.getOrCreateH2Conn(host, port, is_tls);
+        errdefer self.releaseH2Entry(entry);
+        errdefer |err| self.handleH2RequestFailure(host, port, entry, err);
         if (!entry.recv_running) return error.MultiplexingRequired;
 
         const h2 = &entry.h2;
-        if (h2.goaway_received) {
-            entry.broken = true;
-            return error.ConnectionClosed;
-        }
-        const stream = try h2.stream_manager.createStream();
-        self.configureH2ResponseStream(stream, req);
-        const stream_id = stream.id;
-        errdefer h2.stream_manager.removeStream(stream_id);
 
         // Heap-allocate event for pointer stability and timed waits.
         const data_event = try self.allocator.create(Io.Event);
+        errdefer self.allocator.destroy(data_event);
         data_event.* = .unset;
-        stream.data_event = data_event;
-        errdefer {
-            stream.data_event = null;
-            self.allocator.destroy(data_event);
-        }
+
+        const stream = try createH2StreamLocked(entry, self.io, data_event);
+        self.configureH2ResponseStream(stream, req);
+        const stream_id = stream.id;
+        var peer_stream_maybe_open = false;
+        errdefer cancelAndRemoveH2StreamLocked(entry, self.io, stream_id, peer_stream_maybe_open);
 
         // Build request pseudo-headers.
         const method_str = if (req.method == .CUSTOM)
             req.custom_method orelse "CUSTOM"
         else
             req.method.toString();
-        const scheme = req.uri.scheme orelse "http";
-        const authority = host;
+        const scheme: []const u8 = if (req.uri.isTls()) "https" else "http";
+        const authority = try formatRequestAuthority(self.allocator, req.uri);
+        defer self.allocator.free(authority);
         var path_buf = std.ArrayListUnmanaged(u8).empty;
         defer path_buf.deinit(self.allocator);
         const alw = arrayListWriter(&path_buf, self.allocator);
@@ -1591,16 +1902,18 @@ pub const Client = struct {
         {
             h2.write_mutex.lockUncancelable(self.io);
             defer h2.write_mutex.unlock(self.io);
+            try validateH2StreamSendLocked(entry, stream);
             if (entry.is_tls) {
                 const w = try entry.session.getWriter();
                 try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
+                peer_stream_maybe_open = true;
                 if (req.body) |body| try h2.writeDataBlocking(w, stream_id, body, true);
             } else {
                 try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
+                peer_stream_maybe_open = true;
                 if (req.body) |body| try h2.writeDataBlocking(&entry.socket, stream_id, body, true);
             }
         }
-
         // Wait for HEADERS response (not END_STREAM) with timeout.
         const header_timeout: Io.Timeout = if (self.config.timeouts.read_ms > 0)
             .{ .duration = .{
@@ -1609,30 +1922,37 @@ pub const Client = struct {
             } }
         else
             .none;
-        while (!stream.got_headers and !stream.completed) {
-            data_event.reset();
-            if (stream.got_headers or stream.completed) break;
+        while (true) {
+            const done = blk: {
+                h2.write_mutex.lockUncancelable(self.io);
+                defer h2.write_mutex.unlock(self.io);
+                data_event.reset();
+                break :blk stream.got_headers or stream.completed;
+            };
+            if (done) break;
             data_event.waitTimeout(self.io, header_timeout) catch |err| switch (err) {
                 error.Timeout => return error.Timeout,
                 error.Canceled => return error.Canceled,
             };
         }
-        if (stream.stream_error) |err| return normalizeH2ResponseError(err);
-
-        // Headers were decoded in deliverToMailbox (receive loop) to avoid
-        // concurrent HPACK decode races on the shared hpack_ctx.
-        const decoded_headers = stream.request_headers orelse return error.InvalidResponse;
-
         var status_code: ?u16 = null;
         var response_headers = Headers.init(self.allocator);
         errdefer response_headers.deinit();
 
-        for (decoded_headers) |h| {
-            if (mem.eql(u8, h.name, ":status")) {
-                status_code = std.fmt.parseInt(u16, h.value, 10) catch
-                    return error.InvalidResponse;
-            } else if (h.name.len > 0 and h.name[0] != ':') {
-                try response_headers.append(h.name, h.value);
+        // Copy headers under the delivery lock; decoded mailbox storage stays
+        // owned by the stream and may otherwise change concurrently.
+        {
+            h2.write_mutex.lockUncancelable(self.io);
+            defer h2.write_mutex.unlock(self.io);
+            if (stream.stream_error) |err| return @as(anyerror!H2StreamResponse, normalizeH2ResponseError(err));
+            const decoded_headers = stream.request_headers orelse return error.InvalidResponse;
+            for (decoded_headers) |h| {
+                if (mem.eql(u8, h.name, ":status")) {
+                    status_code = std.fmt.parseInt(u16, h.value, 10) catch
+                        return error.InvalidResponse;
+                } else if (h.name.len > 0 and h.name[0] != ':') {
+                    try response_headers.append(h.name, h.value);
+                }
             }
         }
 
@@ -1644,8 +1964,10 @@ pub const Client = struct {
                 .io = self.io,
                 .h2 = h2,
                 .entry = entry,
+                .client = self,
                 .data_event = data_event,
                 .allocator = self.allocator,
+                .read_timeout = header_timeout,
             },
         };
     }
@@ -1735,7 +2057,6 @@ pub const Client = struct {
         parser.headers_only = true;
 
         var buf: [16 * 1024]u8 = undefined;
-        var total_read: usize = 0;
         var leftover: usize = 0;
         var informational_count: u8 = 0;
 
@@ -1758,8 +2079,6 @@ pub const Client = struct {
                     return err;
                 };
                 if (n == 0) break;
-                total_read += n;
-                if (total_read > self.config.max_response_size) return error.ResponseTooLarge;
                 const total = leftover + n;
                 const consumed = try parser.feed(buf[0..total]);
                 leftover = total - consumed;
@@ -1777,7 +2096,6 @@ pub const Client = struct {
                     if (informational_count > 20) return error.TooManyInformationalResponses;
                     parser.reset();
                     parser.headers_only = true;
-                    total_read = 0;
                     continue;
                 }
             }
@@ -1859,6 +2177,9 @@ pub const Client = struct {
         const has_body = !no_body_status and req_method != .HEAD and
             (parser.chunked or (parser.content_length orelse 1) > 0);
         if (!has_body) return res;
+        if (parser.content_length) |len| {
+            if (len > self.config.max_response_size) return error.ResponseTooLarge;
+        }
 
         // Detect Content-Encoding for transparent decompression.
         const container: ?flate.Container = if (res.headers.get(HeaderName.CONTENT_ENCODING)) |raw_enc| blk: {
@@ -2108,16 +2429,31 @@ pub const Client = struct {
         return res;
     }
 
-    fn writeBufferedBody(res: *Response, writer: anytype, progress_cb: ?WriterProgressCallback, progress_ctx: ?*anyopaque) !void {
-        if (res.body) |body| {
-            try writer.writeAll(body);
-            if (progress_cb) |cb| cb(.{ .bytes_written = body.len, .total_bytes = res.contentLength() }, progress_ctx);
-            if (res.body_owned) {
-                res.allocator.free(body);
-                res.body_owned = false;
-            }
-            res.body = null;
+    fn executeH2ToWriter(
+        self: *Self,
+        req: *Request,
+        writer: anytype,
+        progress_cb: ?WriterProgressCallback,
+        progress_ctx: ?*anyopaque,
+    ) !Response {
+        var streamed = try self.requestStream(req);
+        defer streamed.reader.close();
+
+        var res = Response.init(self.allocator, streamed.status_code);
+        errdefer res.deinit();
+        res.version = .HTTP_2;
+        res.headers.deinit();
+        res.headers = streamed.headers;
+
+        const total_bytes = res.contentLength();
+        var bytes_written: u64 = 0;
+        var buffer: [32 * 1024]u8 = undefined;
+        while (true) {
+            const n = try streamed.reader.read(&buffer);
+            if (n == 0) break;
+            try writeH2BodyChunk(streamed.status_code, writer, buffer[0..n], &bytes_written, total_bytes, progress_cb, progress_ctx);
         }
+        return res;
     }
 
     fn readChunkedTlsBody(
@@ -2697,8 +3033,106 @@ test "client resolveAddress falls back to hostname lookup" {
     }
 }
 
+test "H2 pool keys separate transport mode and bracket IPv6" {
+    var clear_buffer: [h2_pool_key_buffer_size]u8 = undefined;
+    var tls_buffer: [h2_pool_key_buffer_size]u8 = undefined;
+    var ipv6_buffer: [h2_pool_key_buffer_size]u8 = undefined;
+    const clear = try formatH2PoolKey(&clear_buffer, "example.com", 443, false);
+    const tls = try formatH2PoolKey(&tls_buffer, "EXAMPLE.COM", 443, true);
+    const ipv6 = try formatH2PoolKey(&ipv6_buffer, "2001:db8::1", 8443, true);
+
+    try std.testing.expectEqualStrings("http://example.com:443", clear);
+    try std.testing.expectEqualStrings("https://example.com:443", tls);
+    try std.testing.expectEqualStrings("https://[2001:db8::1]:8443", ipv6);
+    try std.testing.expect(!mem.eql(u8, clear, tls));
+}
+
+test "H2 request authority preserves explicit ports and brackets IPv6" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { url: []const u8, expected: []const u8 }{
+        .{ .url = "https://example.com/path", .expected = "example.com" },
+        .{ .url = "https://example.com:443/path", .expected = "example.com:443" },
+        .{ .url = "https://example.com:8443/path", .expected = "example.com:8443" },
+        .{ .url = "https://[2001:db8::1]/path", .expected = "[2001:db8::1]" },
+        .{ .url = "http://[2001:db8::1]:8080/path", .expected = "[2001:db8::1]:8080" },
+    };
+    for (cases) |case| {
+        const uri = try Uri.parse(case.url);
+        const authority = try formatRequestAuthority(allocator, uri);
+        defer allocator.free(authority);
+        try std.testing.expectEqualStrings(case.expected, authority);
+    }
+}
+
+test "H2 request failures distinguish stream, drain, and fatal scope" {
+    try std.testing.expectEqual(H2RequestFailureDisposition.stream_local, classifyH2RequestFailure(error.Timeout));
+    try std.testing.expectEqual(H2RequestFailureDisposition.stream_local, classifyH2RequestFailure(error.Canceled));
+    try std.testing.expectEqual(H2RequestFailureDisposition.stream_local, classifyH2RequestFailure(error.StreamReset));
+    try std.testing.expectEqual(H2RequestFailureDisposition.stream_local, classifyH2RequestFailure(error.ProtocolError));
+    try std.testing.expectEqual(H2RequestFailureDisposition.stream_local, classifyH2RequestFailure(error.FlowControlError));
+    try std.testing.expectEqual(H2RequestFailureDisposition.draining, classifyH2RequestFailure(error.GoawayRefused));
+    try std.testing.expectEqual(H2RequestFailureDisposition.draining, classifyH2RequestFailure(error.StreamIdExhausted));
+    try std.testing.expectEqual(H2RequestFailureDisposition.connection_fatal, classifyH2RequestFailure(error.ConnectionClosed));
+    try std.testing.expectEqual(H2RequestFailureDisposition.connection_fatal, classifyH2RequestFailure(error.SendFailed));
+}
+
+test "buffered retries are limited to safe unsent or transport failures" {
+    try std.testing.expect(isSafeUnsentRetryError(error.GoawayRefused));
+    try std.testing.expect(isSafeUnsentRetryError(error.MaxConcurrentStreamsExceeded));
+    try std.testing.expect(isRetryableTransportError(error.ConnectionClosed));
+    try std.testing.expect(isRetryableTransportError(error.ReadFailed));
+    try std.testing.expect(!isRetryableTransportError(error.Timeout));
+    try std.testing.expect(!isRetryableTransportError(error.ProtocolError));
+    try std.testing.expect(!isRetryableTransportError(error.OutOfMemory));
+}
+
+test "H2 writer drains redirect bodies without contaminating final output" {
+    var output = std.ArrayListUnmanaged(u8).empty;
+    defer output.deinit(std.testing.allocator);
+    const writer = arrayListWriter(&output, std.testing.allocator);
+    var bytes_written: u64 = 0;
+
+    try writeH2BodyChunk(302, writer, "redirect-payload", &bytes_written, null, null, null);
+    try writeH2BodyChunk(200, writer, "final-payload", &bytes_written, null, null, null);
+
+    try std.testing.expectEqualStrings("final-payload", output.items);
+    try std.testing.expectEqual(@as(u64, "final-payload".len), bytes_written);
+}
+
+test "H2 stream cleanup removes only its target stream" {
+    var entry: H2PoolEntry = undefined;
+    entry.h2 = H2Connection.initClient(std.testing.allocator, std.testing.io);
+    defer entry.h2.deinit();
+    const target = try entry.h2.stream_manager.createStream();
+    const survivor = try entry.h2.stream_manager.createStream();
+
+    cancelAndRemoveH2StreamLocked(&entry, std.testing.io, target.id, false);
+
+    try std.testing.expect(entry.h2.stream_manager.getStream(target.id) == null);
+    try std.testing.expect(entry.h2.stream_manager.getStream(survivor.id) == survivor);
+}
+
+test "H2 pre-send validation rejects a stream after GOAWAY" {
+    var entry: H2PoolEntry = undefined;
+    entry.h2 = H2Connection.initClient(std.testing.allocator, std.testing.io);
+    defer entry.h2.deinit();
+    entry.broken = .init(false);
+    entry.draining = .init(false);
+    const stream = try entry.h2.stream_manager.createStream();
+    entry.h2.goaway_received = true;
+
+    try std.testing.expectError(error.GoawayRefused, validateH2StreamSendLocked(&entry, stream));
+}
+
 test "H2StreamReader reads pre-buffered data and returns EOF" {
     const allocator = std.testing.allocator;
+
+    var client = Client.init(allocator, std.testing.io);
+    defer client.deinit();
+    var entry: H2PoolEntry = undefined;
+    entry.active_leases = 1;
+    entry.retired = false;
+    entry.retired_next = null;
 
     // Set up an H2Connection with a stream that has pre-buffered data.
     var h2 = H2Connection.initClient(allocator, std.testing.io);
@@ -2720,7 +3154,8 @@ test "H2StreamReader reads pre-buffered data and returns EOF" {
         .stream = stream,
         .io = std.testing.io,
         .h2 = &h2,
-        .entry = undefined, // Not dereferenced: stream.completed=true so close() skips RST_STREAM.
+        .entry = &entry, // Only lease state is used: completed streams skip RST_STREAM.
+        .client = &client,
         .data_event = data_event,
         .allocator = allocator,
     };
@@ -2743,9 +3178,30 @@ test "H2StreamReader reads pre-buffered data and returns EOF" {
 
     // Clean up — close frees the event and removes the stream.
     reader.close();
+    try std.testing.expectEqual(@as(usize, 0), entry.active_leases);
+    try std.testing.expectError(error.StreamClosed, reader.read(&buf2));
 
     // Verify stream was removed.
     try std.testing.expect(h2.stream_manager.getStream(stream_id) == null);
+}
+
+test "retired H2 entry waits for its final lease" {
+    var client = Client.init(std.testing.allocator, std.testing.io);
+    defer client.deinit();
+
+    var entry: H2PoolEntry = undefined;
+    entry.active_leases = 2;
+    entry.retired = true;
+    entry.retired_next = null;
+    client.retired_h2_entries = &entry;
+
+    try std.testing.expect(client.releaseH2EntryLocked(&entry) == null);
+    try std.testing.expectEqual(@as(usize, 1), entry.active_leases);
+    try std.testing.expect(client.retired_h2_entries == &entry);
+
+    try std.testing.expect(client.releaseH2EntryLocked(&entry) == &entry);
+    try std.testing.expectEqual(@as(usize, 0), entry.active_leases);
+    try std.testing.expect(client.retired_h2_entries == null);
 }
 
 const test_tls_cert_pem =
@@ -2891,6 +3347,11 @@ const python_redirect_writer_server_script =
     "\n" ++
     "class Handler(BaseHTTPRequestHandler):\n" ++
     "    protocol_version = 'HTTP/1.1'\n" ++
+    "    def do_HEAD(self):\n" ++
+    "        self.send_response(200)\n" ++
+    "        self.send_header('Content-Length', '2')\n" ++
+    "        self.send_header('Connection', 'close')\n" ++
+    "        self.end_headers()\n" ++
     "    def do_GET(self):\n" ++
     "        if self.path == '/redirect':\n" ++
     "            self.send_response(307)\n" ++
@@ -2911,6 +3372,32 @@ const python_redirect_writer_server_script =
     "        self.send_header('Content-Length', '0')\n" ++
     "        self.send_header('Connection', 'close')\n" ++
     "        self.end_headers()\n" ++
+    "    def log_message(self, fmt, *args):\n" ++
+    "        pass\n" ++
+    "\n" ++
+    "class ReuseTCPServer(socketserver.TCPServer):\n" ++
+    "    allow_reuse_address = True\n" ++
+    "\n" ++
+    "with ReuseTCPServer(('127.0.0.1', port), Handler) as httpd:\n" ++
+    "    httpd.serve_forever()\n";
+
+const python_response_size_server_script =
+    "import socketserver\n" ++
+    "import sys\n" ++
+    "from http.server import BaseHTTPRequestHandler\n" ++
+    "\n" ++
+    "port = int(sys.argv[1])\n" ++
+    "\n" ++
+    "class Handler(BaseHTTPRequestHandler):\n" ++
+    "    protocol_version = 'HTTP/1.1'\n" ++
+    "    def do_GET(self):\n" ++
+    "        body = b'x' if self.path == '/one' else b'xy'\n" ++
+    "        self.send_response(200)\n" ++
+    "        self.send_header('Content-Type', 'text/plain')\n" ++
+    "        self.send_header('Content-Length', str(len(body)))\n" ++
+    "        self.send_header('Connection', 'close')\n" ++
+    "        self.end_headers()\n" ++
+    "        self.wfile.write(body)\n" ++
     "    def log_message(self, fmt, *args):\n" ++
     "        pass\n" ++
     "\n" ++
@@ -3066,6 +3553,70 @@ fn requestWithRetry(client: *Client, io: Io, method: types.Method, url: []const 
         };
     }
     unreachable;
+}
+
+test "response size limit counts body bytes exactly for buffered and writer APIs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const port = try reserveEphemeralPort(io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_response_size_server_script });
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", port_arg },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer child.kill(io);
+    io.sleep(Io.Duration.fromMilliseconds(500), .awake) catch {};
+
+    const one_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/one", .{port});
+    defer allocator.free(one_url);
+    const two_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/two", .{port});
+    defer allocator.free(two_url);
+
+    var client = Client.initWithConfig(allocator, io, .{
+        .keep_alive = false,
+        .max_response_size = 1,
+        .retry_policy = .{ .max_retries = 0 },
+        .timeouts = .{ .request_ms = 2_000, .read_ms = 2_000, .write_ms = 2_000 },
+    });
+    defer client.deinit();
+
+    var response = try getWithRetry(&client, io, one_url, 20);
+    defer response.deinit();
+    try std.testing.expectEqualStrings("x", response.body orelse "");
+    try std.testing.expectError(error.ResponseTooLarge, client.get(two_url, .{}));
+
+    var head_response = try client.head(two_url, .{});
+    defer head_response.deinit();
+    try std.testing.expect(head_response.body == null);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(allocator);
+    var streamed = try client.getToWriter(one_url, .{}, arrayListWriter(&out, allocator), null, null);
+    defer streamed.deinit();
+    try std.testing.expectEqualStrings("x", out.items);
+
+    out.clearRetainingCapacity();
+    var streamed_head = try client.requestToWriter(.HEAD, two_url, .{}, arrayListWriter(&out, allocator), null, null);
+    defer streamed_head.deinit();
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+
+    out.clearRetainingCapacity();
+    try std.testing.expectError(
+        error.ResponseTooLarge,
+        client.getToWriter(two_url, .{}, arrayListWriter(&out, allocator), null, null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
 test "request timeout is absolute across a slow-drip response" {

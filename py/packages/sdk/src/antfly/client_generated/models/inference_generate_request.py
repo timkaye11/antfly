@@ -9,6 +9,8 @@ from attrs import field as _attrs_field
 from ..models.inference_generate_request_cache_dtype import InferenceGenerateRequestCacheDtype
 from ..models.inference_generate_request_compiled_target import InferenceGenerateRequestCompiledTarget
 from ..models.inference_generate_request_mode import InferenceGenerateRequestMode
+from ..models.inference_generate_request_speculation_calibration import InferenceGenerateRequestSpeculationCalibration
+from ..models.inference_generate_request_speculation_policy import InferenceGenerateRequestSpeculationPolicy
 from ..models.inference_model_backend import InferenceModelBackend
 from ..models.inference_tool_choice_type_0 import InferenceToolChoiceType0
 from ..types import UNSET, Unset
@@ -30,10 +32,10 @@ class InferenceGenerateRequest:
         model (str): Name of the generator model from models_dir/generators/ Example: google/gemma-3-1b-it.
         messages (list[InferenceChatMessage]): Conversation messages (OpenAI-compatible format)
         max_tokens (int | Unset): Maximum tokens to generate Default: 256. Example: 256.
-        temperature (float | Unset): Sampling temperature (0.0 = deterministic, higher = more random) Default: 1.0.
+        temperature (float | Unset): Sampling temperature (0.0 = deterministic, higher = more random) Default: 0.0.
             Example: 0.7.
-        top_p (float | Unset): Nucleus sampling probability Default: 1.0.
-        top_k (int | Unset): Top-k sampling (inference extension, not in OpenAI API) Default: 50.
+        top_p (float | Unset): Nucleus sampling probability Default: 0.0.
+        top_k (int | Unset): Top-k sampling (inference extension, not in OpenAI API) Default: 0.
         stream (bool | Unset): If true, partial message deltas will be sent as SSE events Default: False.
         tools (list[InferenceTool] | Unset): List of tools (functions) the model can call.
             Only supported by models with tool_call_format configured.
@@ -53,7 +55,13 @@ class InferenceGenerateRequest:
             smaller draft model.
         speculative_k (int | Unset): inference-native speculative decoding extension. Number of draft tokens proposed
             per verification round.
-             Default: 4.
+        speculation_policy (InferenceGenerateRequestSpeculationPolicy | Unset): inference-native speculative decoding
+            policy: `auto`, `force`, or `off`.
+            Defaults to `auto` when a draft model is requested.
+        speculation_calibration (InferenceGenerateRequestSpeculationCalibration | Unset): inference-native speculative
+            decoding calibration state: `none`, `probe`, or `positive`.
+            Defaults to `probe` for `auto` draft requests so they are measured instead of silently disabled,
+            and to `none` for `force` or `off`.
         cache_dtype (InferenceGenerateRequestCacheDtype | Unset): inference-native KV cache quantization format. Lower
             precision reduces memory usage but may
             affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
@@ -61,6 +69,8 @@ class InferenceGenerateRequest:
             Attention Matching.
             Selects a subset of keys and fits new values via OLS to preserve attention behavior.
             0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
+            The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`;
+            device-backed compaction is not yet supported.
         prompt_cache_key (str | Unset): inference-native prompt prefix cache namespace key. Requests with the same key
             can
             reuse matching prompt-prefix KV on the same node. Required to enable prompt caching;
@@ -92,9 +102,9 @@ class InferenceGenerateRequest:
     model: str
     messages: list[InferenceChatMessage]
     max_tokens: int | Unset = 256
-    temperature: float | Unset = 1.0
-    top_p: float | Unset = 1.0
-    top_k: int | Unset = 50
+    temperature: float | Unset = 0.0
+    top_p: float | Unset = 0.0
+    top_k: int | Unset = 0
     stream: bool | Unset = False
     tools: list[InferenceTool] | Unset = UNSET
     min_p: float | Unset = 0.0
@@ -104,7 +114,9 @@ class InferenceGenerateRequest:
     response_format: InferenceGenerateResponseFormat | Unset = UNSET
     grammar: str | Unset = UNSET
     draft_model: str | Unset = UNSET
-    speculative_k: int | Unset = 4
+    speculative_k: int | Unset = UNSET
+    speculation_policy: InferenceGenerateRequestSpeculationPolicy | Unset = UNSET
+    speculation_calibration: InferenceGenerateRequestSpeculationCalibration | Unset = UNSET
     cache_dtype: InferenceGenerateRequestCacheDtype | Unset = UNSET
     cache_compaction_ratio: float | Unset = UNSET
     prompt_cache_key: str | Unset = UNSET
@@ -157,6 +169,14 @@ class InferenceGenerateRequest:
         draft_model = self.draft_model
 
         speculative_k = self.speculative_k
+
+        speculation_policy: str | Unset = UNSET
+        if not isinstance(self.speculation_policy, Unset):
+            speculation_policy = self.speculation_policy.value
+
+        speculation_calibration: str | Unset = UNSET
+        if not isinstance(self.speculation_calibration, Unset):
+            speculation_calibration = self.speculation_calibration.value
 
         cache_dtype: str | Unset = UNSET
         if not isinstance(self.cache_dtype, Unset):
@@ -224,6 +244,10 @@ class InferenceGenerateRequest:
             field_dict["draft_model"] = draft_model
         if speculative_k is not UNSET:
             field_dict["speculative_k"] = speculative_k
+        if speculation_policy is not UNSET:
+            field_dict["speculation_policy"] = speculation_policy
+        if speculation_calibration is not UNSET:
+            field_dict["speculation_calibration"] = speculation_calibration
         if cache_dtype is not UNSET:
             field_dict["cache_dtype"] = cache_dtype
         if cache_compaction_ratio is not UNSET:
@@ -300,6 +324,20 @@ class InferenceGenerateRequest:
 
         speculative_k = d.pop("speculative_k", UNSET)
 
+        _speculation_policy = d.pop("speculation_policy", UNSET)
+        speculation_policy: InferenceGenerateRequestSpeculationPolicy | Unset
+        if isinstance(_speculation_policy, Unset):
+            speculation_policy = UNSET
+        else:
+            speculation_policy = InferenceGenerateRequestSpeculationPolicy(_speculation_policy)
+
+        _speculation_calibration = d.pop("speculation_calibration", UNSET)
+        speculation_calibration: InferenceGenerateRequestSpeculationCalibration | Unset
+        if isinstance(_speculation_calibration, Unset):
+            speculation_calibration = UNSET
+        else:
+            speculation_calibration = InferenceGenerateRequestSpeculationCalibration(_speculation_calibration)
+
         _cache_dtype = d.pop("cache_dtype", UNSET)
         cache_dtype: InferenceGenerateRequestCacheDtype | Unset
         if isinstance(_cache_dtype, Unset):
@@ -370,6 +408,8 @@ class InferenceGenerateRequest:
             grammar=grammar,
             draft_model=draft_model,
             speculative_k=speculative_k,
+            speculation_policy=speculation_policy,
+            speculation_calibration=speculation_calibration,
             cache_dtype=cache_dtype,
             cache_compaction_ratio=cache_compaction_ratio,
             prompt_cache_key=prompt_cache_key,

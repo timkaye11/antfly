@@ -18,6 +18,8 @@ This file fits with the other architecture docs:
   boundaries, compiled backend attachment, and graph memory planning.
 - [GGML.md](GGML.md): GGUF/GGML format compatibility plus the upstream ggml
   execution shape we use as a reference.
+- [QUANT_KERNEL_COMPILER.md](QUANT_KERNEL_COMPILER.md): build-time quant kernel
+  specs, generated artifacts, Metal promotion gates, and evidence flow.
 - this file: the concrete Metal backend plan, kernels, runtime
   session shape, scratch/frame ownership, and performance gap.
 

@@ -23,6 +23,7 @@
 const std = @import("std");
 const runtime = @import("../runtime/root.zig");
 const backend_contracts = @import("../graph/backend_contracts.zig");
+const quant_matmul = @import("../graph/quant_matmul.zig");
 const operator_plan = @import("../graph/operator_plan.zig");
 const tensor_mod = @import("../backends/tensor.zig");
 const gguf_tensor_types = @import("../gguf/tensor_types.zig");
@@ -373,6 +374,8 @@ pub const DecoderRuntimeSampleResidentLogitsRequest = backend_contracts.DecoderR
 pub const DecoderRuntimePrepareLinearRequest = backend_contracts.DecoderRuntimePrepareLinearRequest;
 pub const DecoderRuntimeEnsureLinearSlotRequest = backend_contracts.DecoderRuntimeEnsureLinearSlotRequest;
 pub const DecoderRuntimeApplyLinearRequest = backend_contracts.DecoderRuntimeApplyLinearRequest;
+pub const DecoderRuntimeApplyLinearLayerNormRequest = backend_contracts.DecoderRuntimeApplyLinearLayerNormRequest;
+pub const DecoderRuntimeApplyFfnLayerNormRequest = backend_contracts.DecoderRuntimeApplyFfnLayerNormRequest;
 pub const DecoderRuntimeApplyLinearArgmaxRequest = backend_contracts.DecoderRuntimeApplyLinearArgmaxRequest;
 pub const DecoderRuntimeApplyLinearPairRequest = backend_contracts.DecoderRuntimeApplyLinearPairRequest;
 pub const DecoderRuntimeApplyLinearQkvRequest = backend_contracts.DecoderRuntimeApplyLinearQkvRequest;
@@ -468,8 +471,11 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_dense_linear_weight_bytes: u64 = 0,
     metal_runtime_dense_linear_f32_weight_bytes: u64 = 0,
     metal_runtime_dense_linear_bf16_weight_bytes: u64 = 0,
+    metal_runtime_dense_linear_f16_weight_bytes: u64 = 0,
     metal_runtime_dense_linear_f32_slots: u64 = 0,
     metal_runtime_dense_linear_bf16_slots: u64 = 0,
+    metal_runtime_dense_linear_f16_slots: u64 = 0,
+    metal_runtime_dense_qkv_packed_bytes: u64 = 0,
     metal_runtime_quant_linear_bytes: u64 = 0,
     metal_runtime_scratch_bytes: u64 = 0,
     metal_runtime_scratch_pool_bytes: u64 = 0,
@@ -514,6 +520,11 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_deberta_attention_gemm_calls: u64 = 0,
     metal_runtime_deberta_attention_gemm_fallbacks: u64 = 0,
     metal_runtime_paged_attention_1x_calls: u64 = 0,
+    metal_runtime_decode_gqa_split_calls: u64 = 0,
+    metal_runtime_generated_attention_decode_1x_calls: u64 = 0,
+    metal_runtime_generated_attention_flash_prefill_calls: u64 = 0,
+    metal_runtime_generated_attention_flash_prefill_hd512_calls: u64 = 0,
+    metal_runtime_generated_rms_norm_calls: u64 = 0,
     metal_runtime_compute_encoder_count: u64 = 0,
     metal_runtime_blit_encoder_count: u64 = 0,
     metal_runtime_last_frame_compute_encoder_count: u64 = 0,
@@ -567,6 +578,10 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_q8_0_linear_mmv_f16_input: u64 = 0,
     metal_runtime_q8_0_linear_family_dispatch_counts: [12][4]u64 = [_][4]u64{[_]u64{0} ** 4} ** 12,
     metal_runtime_q4_0_linear_reduce: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_rows_1: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_rows_2_8: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_rows_9_64: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_rows_65_plus: u64 = 0,
     metal_runtime_q4_0_linear_reduce_f16_input: u64 = 0,
     metal_runtime_q4_0_linear_reduce_f16_output: u64 = 0,
     metal_runtime_q4_0_linear_reduce_f16_input_f16_output: u64 = 0,
@@ -585,12 +600,27 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_q4_0_pair_activation_reduce_encode_nanos: u64 = 0,
     metal_runtime_q4_0_activation_rhs_reduce_encode_nanos: u64 = 0,
     metal_runtime_q4_k_linear_reduce: u64 = 0,
+    metal_runtime_q4_k_linear_reduce_rows_1: u64 = 0,
+    metal_runtime_q4_k_linear_reduce_rows_2_8: u64 = 0,
+    metal_runtime_q4_k_linear_reduce_rows_9_64: u64 = 0,
+    metal_runtime_q4_k_linear_reduce_rows_65_plus: u64 = 0,
     metal_runtime_q4_k_pair_reduce: u64 = 0,
     metal_runtime_q4_k_pair_activation_reduce: u64 = 0,
     metal_runtime_q4_k_pair_activation_reduce_f16_output: u64 = 0,
     metal_runtime_q4_k_activation_rhs_reduce: u64 = 0,
     metal_runtime_q6_k_linear_reduce: u64 = 0,
+    metal_runtime_q6_k_linear_reduce_rows_1: u64 = 0,
+    metal_runtime_q6_k_linear_reduce_rows_2_8: u64 = 0,
+    metal_runtime_q6_k_linear_reduce_rows_9_64: u64 = 0,
+    metal_runtime_q6_k_linear_reduce_rows_65_plus: u64 = 0,
     metal_runtime_q6_k_linear_reduce_f16_input: u64 = 0,
+    /// Generated small-batch quant kernel dispatch counters indexed by
+    /// [quant_matmul.GeneratedQuantFormatIndex][quant_matmul.GeneratedQuantEpilogueIndex].
+    metal_runtime_antfly_generated_dispatch_counts: quant_matmul.GeneratedQuantDispatchCounts = quant_matmul.generated_quant_dispatch_counts_zero,
+    /// Exact workload-qualified runtime JIT dispatches. These counters prove
+    /// that a profile-installed pipeline was selected, not merely compiled.
+    metal_runtime_jit_exact_q4_0_hits: u64 = 0,
+    metal_runtime_jit_exact_q4_k_hits: u64 = 0,
     metal_runtime_rms_norm_add_sumsq: u64 = 0,
     metal_provider_quantized_slots: u64 = 0,
     metal_provider_quantized_raw_bytes: u64 = 0,
@@ -864,6 +894,18 @@ pub const GraphPlanSlot = struct {
     bytes: usize,
 };
 
+/// Explicit workload phase used by backend profilers. It is intentionally not
+/// inferred from row count: decode, prefill, and speculative verification can
+/// share the same matrix geometry.
+pub const WorkloadRegime = enum(u8) {
+    unknown = 0,
+    encoder = 1,
+    prefill = 2,
+    decode = 3,
+    speculative_draft = 4,
+    speculative_verify = 5,
+};
+
 /// Abstract compute backend for tensor operations.
 pub const ComputeBackend = struct {
     ptr: *anyopaque,
@@ -892,6 +934,11 @@ pub const ComputeBackend = struct {
     pub fn getIo(self: *const ComputeBackend) ?std.Io {
         const accessor = self.vtable.getIo orelse return null;
         return accessor(self.ptr);
+    }
+
+    pub fn workloadProfileSetRegime(self: *const ComputeBackend, regime: WorkloadRegime) !void {
+        const op = self.vtable.workloadProfileSetRegime orelse return;
+        return op(self.ptr, regime);
     }
 
     pub fn reserveGraphPlanSlots(self: *const ComputeBackend, slots: []const GraphPlanSlot) !bool {
@@ -944,9 +991,9 @@ pub const ComputeBackend = struct {
         return op(self.ptr, input);
     }
 
-    pub fn debugCudaGraphPrepareFinalHiddenReplayInput(self: *const ComputeBackend, label: []const u8, input: CT) !?CT {
+    pub fn debugCudaGraphPrepareFinalHiddenReplayInput(self: *const ComputeBackend, label: []const u8, input: CT, kv_seq_len: usize) !?CT {
         const op = self.vtable.debugCudaGraphPrepareFinalHiddenReplayInput orelse return null;
-        return op(self.ptr, label, input);
+        return op(self.ptr, label, input, kv_seq_len);
     }
 
     pub fn debugCudaGraphPrepareFinalHiddenReplayAuxInput(self: *const ComputeBackend, input: CT) !?CT {
@@ -992,6 +1039,10 @@ pub const ComputeBackend = struct {
         /// also be null for backends that have no notion of an Io.
         getIo: ?*const fn (ctx: *anyopaque) ?std.Io = null,
 
+        /// Changes only the tag applied to subsequent physical dispatches.
+        /// Capture ownership and snapshot export remain provider/session APIs.
+        workloadProfileSetRegime: ?*const fn (ctx: *anyopaque, regime: WorkloadRegime) anyerror!void = null,
+
         /// Reserve backend-owned graph-plan scratch/storage slots before a
         /// partition executes. Metal maps these to persistent MTLBuffer slots.
         reserveGraphPlanSlots: ?*const fn (ctx: *anyopaque, slots: []const GraphPlanSlot) anyerror!bool = null,
@@ -1009,7 +1060,7 @@ pub const ComputeBackend = struct {
         debugCudaGraphRegisterFinalHiddenReplayBoundary: ?*const fn (ctx: *anyopaque, input: CT, output: CT) anyerror!void = null,
         debugCudaGraphRegisterFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!void = null,
         debugCudaGraphRegisterFinalHiddenReplayAuxInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!void = null,
-        debugCudaGraphPrepareFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, label: []const u8, input: CT) anyerror!?CT = null,
+        debugCudaGraphPrepareFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, label: []const u8, input: CT, kv_seq_len: usize) anyerror!?CT = null,
         debugCudaGraphPrepareFinalHiddenReplayAuxInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
         debugCudaGraphReplayFinalHidden: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
         debugCudaGraphReplayFinalHiddenDiscard: ?*const fn (ctx: *anyopaque, input: CT) anyerror!bool = null,
@@ -1056,6 +1107,10 @@ pub const ComputeBackend = struct {
         /// takes the first encoder hidden row by a host words_mask into
         /// [batch * num_words, hidden_size].
         glinerWordEmbeddings: ?*const fn (ctx: *anyopaque, request: *const GlinerWordEmbeddingsRequest) anyerror!?CT = null,
+        // Optional backend hint: prefer dense mirrors for eager-path quantized
+        // linears (set by architectures whose eager weights are hot GEMMs, e.g.
+        // the GLiNER span head). No-op on backends without the concept.
+        preferEagerQuantMirrors: ?*const fn (ctx: *anyopaque, enabled: bool) void = null,
 
         /// GLiNER-specific CountLSTM GRU step plus skip connection:
         /// returns `gru(label_embeddings, pos0) + label_embeddings` as
@@ -1621,6 +1676,10 @@ pub const ComputeBackend = struct {
         /// small list of suppressed token ids.
         argmaxRowsSuppress: ?*const fn (ctx: *anyopaque, tensor: CT, row_start: usize, row_count: usize, dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) anyerror!?[]u32 = null,
 
+        /// Consume an active decoder-runtime frame with a batched masked
+        /// argmax. Backends return null when there is no compatible frame.
+        decoderRuntimeArgmaxRowsSuppress: ?*const fn (ctx: *anyopaque, tensor: CT, row_start: usize, row_count: usize, dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) anyerror!?[]u32 = null,
+
         /// Return the argmax token id as a backend tensor while masking a small
         /// list of suppressed token ids. Used by pure-greedy decode paths that
         /// must avoid full-logit host transfers.
@@ -1780,6 +1839,11 @@ pub const ComputeBackend = struct {
         /// of the prepared runtime.
         decoderRuntimePrepareLayerNorm: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimePrepareLayerNormRequest) anyerror!bool = null,
 
+        /// Report whether a layer-norm slot with the requested shape is
+        /// already resident. This lets architecture warmup paths avoid
+        /// reloading model weights merely to rediscover prepared state.
+        decoderRuntimeLayerNormSlotPrepared: ?*const fn (ctx: *anyopaque, slot: usize, hidden_size: usize) bool = null,
+
         /// Reuse or prepare a backend-owned graph/runtime layer-norm slot
         /// without exposing backend slot allocation policy to graph executors.
         decoderRuntimeEnsureLayerNormSlot: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeEnsureLayerNormSlotRequest) anyerror!?usize = null,
@@ -1841,6 +1905,11 @@ pub const ComputeBackend = struct {
         /// [out_dim].
         decoderRuntimePrepareLinear: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimePrepareLinearRequest) anyerror!bool = null,
 
+        /// Report whether a linear slot with the requested shape is already
+        /// resident. Backends that do not expose resident slots leave this
+        /// null and callers perform ordinary preparation.
+        decoderRuntimeLinearSlotPrepared: ?*const fn (ctx: *anyopaque, slot: usize, in_dim: usize, out_dim: usize) bool = null,
+
         /// Reuse or prepare a backend-owned graph/runtime dense linear slot
         /// without exposing backend slot allocation policy to graph executors.
         decoderRuntimeEnsureLinearSlot: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeEnsureLinearSlotRequest) anyerror!?usize = null,
@@ -1848,6 +1917,12 @@ pub const ComputeBackend = struct {
         /// Apply a previously prepared dense linear slot to a [1, in_dim]
         /// input and return a [1, out_dim] tensor.
         decoderRuntimeApplyLinear: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearRequest) anyerror!?CT = null,
+
+        /// Apply a prepared linear slot, residual add, and prepared layer norm.
+        decoderRuntimeApplyLinearLayerNorm: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearLayerNormRequest) anyerror!?CT = null,
+
+        /// Apply a prepared two-linear FFN, residual add, and prepared layer norm.
+        decoderRuntimeApplyFfnLayerNorm: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyFfnLayerNormRequest) anyerror!?CT = null,
 
         /// Apply a previously prepared dense linear slot to a [1, in_dim]
         /// input and return the argmax token id without materializing full
@@ -2116,6 +2191,10 @@ pub const ComputeBackend = struct {
             });
         }
         return null;
+    }
+
+    pub fn preferEagerQuantMirrors(self: *const ComputeBackend, enabled: bool) void {
+        if (self.vtable.preferEagerQuantMirrors) |op| op(self.ptr, enabled);
     }
 
     pub fn glinerWordEmbeddings(self: *const ComputeBackend, hidden: CT, words_mask: []const i64, batch: usize, seq_len: usize, hidden_size: usize, num_words: usize) !?CT {
@@ -3239,6 +3318,13 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    pub fn decoderRuntimeArgmaxRowsSuppress(self: *const ComputeBackend, tensor: CT, row_start: usize, row_count: usize, dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) !?[]u32 {
+        if (self.vtable.decoderRuntimeArgmaxRowsSuppress) |argmax_rows_suppress| {
+            return argmax_rows_suppress(self.ptr, tensor, row_start, row_count, dim, suppress_token_ids, allocator);
+        }
+        return null;
+    }
+
     pub fn argmaxLastRowSuppressTensor(self: *const ComputeBackend, tensor: CT, rows: usize, dim: usize, suppress_token_ids: []const i32) !?CT {
         if (self.vtable.argmaxLastRowSuppressTensor) |argmax_last_row_suppress_tensor| {
             return argmax_last_row_suppress_tensor(self.ptr, tensor, rows, dim, suppress_token_ids);
@@ -3495,6 +3581,13 @@ pub const ComputeBackend = struct {
         return false;
     }
 
+    pub fn decoderRuntimeLayerNormSlotPrepared(self: *const ComputeBackend, slot: usize, hidden_size: usize) bool {
+        if (self.vtable.decoderRuntimeLayerNormSlotPrepared) |op| {
+            return op(self.ptr, slot, hidden_size);
+        }
+        return false;
+    }
+
     pub fn decoderRuntimeEnsureLayerNormSlot(self: *const ComputeBackend, request: *const DecoderRuntimeEnsureLayerNormSlotRequest) !?usize {
         if (self.vtable.decoderRuntimeEnsureLayerNormSlot) |op| {
             return op(self.ptr, request);
@@ -3586,6 +3679,13 @@ pub const ComputeBackend = struct {
         return false;
     }
 
+    pub fn decoderRuntimeLinearSlotPrepared(self: *const ComputeBackend, slot: usize, in_dim: usize, out_dim: usize) bool {
+        if (self.vtable.decoderRuntimeLinearSlotPrepared) |op| {
+            return op(self.ptr, slot, in_dim, out_dim);
+        }
+        return false;
+    }
+
     pub fn decoderRuntimeEnsureLinearSlot(self: *const ComputeBackend, request: *const DecoderRuntimeEnsureLinearSlotRequest) !?usize {
         if (self.vtable.decoderRuntimeEnsureLinearSlot) |op| {
             return op(self.ptr, request);
@@ -3595,6 +3695,20 @@ pub const ComputeBackend = struct {
 
     pub fn decoderRuntimeApplyLinear(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearRequest) !?CT {
         if (self.vtable.decoderRuntimeApplyLinear) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeApplyLinearLayerNorm(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearLayerNormRequest) !?CT {
+        if (self.vtable.decoderRuntimeApplyLinearLayerNorm) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeApplyFfnLayerNorm(self: *const ComputeBackend, request: *const DecoderRuntimeApplyFfnLayerNormRequest) !?CT {
+        if (self.vtable.decoderRuntimeApplyFfnLayerNorm) |op| {
             return op(self.ptr, request);
         }
         return null;

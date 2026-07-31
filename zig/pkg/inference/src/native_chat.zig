@@ -59,7 +59,10 @@ const Options = struct {
     models_dir: ?[]const u8 = null,
     hf_token: ?[]const u8 = null,
     server_url: ?[]const u8 = null,
-    no_prompt_cache: bool = false,
+    /// Multi-turn KV prefix reuse is opt-in until the prompt-cache attach
+    /// path is fixed: attached prefixes decode with degraded KV on metal and
+    /// can hang the native backend (see GEMMA4.md "Chat REPL").
+    prompt_cache: bool = false,
     print_timing: bool = false,
 };
 
@@ -457,7 +460,6 @@ const LocalChatSession = struct {
             .add_bos_token = self.model.manifest.add_bos_token,
             .bos_token = self.model.manifest.bos_token,
             .chat_template = self.model.chat_tmpl,
-            .prompt_max_tokens = self.effective_max_context,
             .print_timing = self.print_timing,
             .model_dir = self.model_dir,
             .gguf_projector_path = self.model.manifest.gguf_projector_path,
@@ -699,13 +701,14 @@ fn runLocalChat(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     var active_kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null;
     var pool_id: runtime.kv.block.KvPoolId = undefined;
 
-    if (!opts.no_prompt_cache) {
+    if (opts.prompt_cache) {
         model.prompt_prefix_cache.configure(.{
             .enabled = true,
             .mode = .block_hash,
             // The default 64-token minimum would skip caching short opening
             // turns, which is exactly where chat reuse starts paying off.
-            .min_tokens = 32,
+            // One KV page (16 tokens) is the smallest storable prefix.
+            .min_tokens = 16,
             .ttl_ms = chat_prompt_cache_ttl_ms,
         });
         const cache_ready = if (backend_kind == .metal or backend_kind == .cuda) blk: {
@@ -1046,8 +1049,10 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             opts.server_url = args[i];
+        } else if (std.mem.eql(u8, arg, "--prompt-cache")) {
+            opts.prompt_cache = true;
         } else if (std.mem.eql(u8, arg, "--no-prompt-cache")) {
-            opts.no_prompt_cache = true;
+            opts.prompt_cache = false;
         } else if (std.mem.eql(u8, arg, "--print-timing")) {
             opts.print_timing = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -1083,7 +1088,9 @@ fn printUsage() void {
         \\  --models-dir <dir>        models directory (default: ~/.antfly/inference/models)
         \\  --token <token>           HuggingFace token for pulls (or HF_TOKEN)
         \\  --server <url>            chat against a running inference server
-        \\  --no-prompt-cache         disable multi-turn KV prefix reuse
+        \\  --prompt-cache            experimental multi-turn KV prefix reuse; currently
+        \\                            degrades attached-prefix decode on metal and can
+        \\                            hang the native backend (see GEMMA4.md "Chat REPL")
         \\  --print-timing            verbose per-turn pipeline timing
         \\
         \\slash commands: /bye /clear /set /show /help, and """ for multi-line input.
@@ -1197,7 +1204,7 @@ test "parseArgs parses model, flags, and rejects unknown options" {
         "0",
         "--system",
         "be brief",
-        "--no-prompt-cache",
+        "--prompt-cache",
         "--server",
         "http://127.0.0.1:8090",
     });
@@ -1205,7 +1212,7 @@ test "parseArgs parses model, flags, and rejects unknown options" {
     try std.testing.expectEqual(@as(i32, 128), opts.max_tokens);
     try std.testing.expectApproxEqAbs(@as(f32, 0), opts.temperature, 0.0001);
     try std.testing.expectEqualStrings("be brief", opts.system.?);
-    try std.testing.expect(opts.no_prompt_cache);
+    try std.testing.expect(opts.prompt_cache);
     try std.testing.expectEqualStrings("http://127.0.0.1:8090", opts.server_url.?);
 
     try std.testing.expectError(error.InvalidArguments, parseArgs(&.{}));

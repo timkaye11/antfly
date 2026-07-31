@@ -20,12 +20,27 @@ const is_windows = builtin.os.tag == .windows;
 /// Network address type (std.Io.net.IpAddress).
 pub const Address = net.IpAddress;
 
+/// Optional policy applied to every resolved address before connecting.
+pub const AddressFilter = *const fn (Address) bool;
+
 const HostName = net.HostName;
 
 /// Resolves a host string to an address, trying IP literal parsing first
 /// and falling back to DNS lookup.
 pub fn resolveAddress(io: Io, host: []const u8, port: u16) !Address {
-    if (Address.resolve(io, host, port)) |addr| return addr else |_| {}
+    return resolveAddressFiltered(io, host, port, null);
+}
+
+/// Resolves a host and returns the first address accepted by `filter`.
+/// Literal and DNS results pass through the same policy so callers can pin
+/// SSRF checks to the address that is actually connected.
+pub fn resolveAddressFiltered(io: Io, host: []const u8, port: u16, filter: ?AddressFilter) !Address {
+    if (Address.resolve(io, host, port)) |addr| {
+        if (filter) |accept| {
+            if (!accept(addr)) return error.AddressRejected;
+        }
+        return addr;
+    } else |_| {}
 
     const host_name = try HostName.init(host);
     var canonical_name_buffer: [HostName.max_len]u8 = undefined;
@@ -35,17 +50,51 @@ pub fn resolveAddress(io: Io, host: []const u8, port: u16) !Address {
         .port = port,
         .canonical_name_buffer = &canonical_name_buffer,
     });
+    var saw_address = false;
     while (true) {
         const result = lookup_queue.getOne(io) catch |err| switch (err) {
             error.Closed => break,
             else => return err,
         };
         switch (result) {
-            .address => |address| return address,
+            .address => |address| {
+                saw_address = true;
+                if (filter) |accept| {
+                    if (!accept(address)) continue;
+                }
+                return address;
+            },
             .canonical_name => {},
         }
     }
+    if (saw_address) return error.AddressRejected;
     return error.UnknownHostName;
+}
+
+test "resolveAddressFiltered applies policy to literal and DNS results" {
+    const Policy = struct {
+        fn rejectLoopback(address: Address) bool {
+            return switch (address) {
+                .ip4 => |ip4| ip4.bytes[0] != 127,
+                .ip6 => true,
+            };
+        }
+
+        fn rejectAll(_: Address) bool {
+            return false;
+        }
+    };
+
+    try std.testing.expectError(
+        error.AddressRejected,
+        resolveAddressFiltered(std.testing.io, "127.0.0.1", 80, Policy.rejectLoopback),
+    );
+    const accepted = try resolveAddressFiltered(std.testing.io, "8.8.8.8", 53, Policy.rejectLoopback);
+    try std.testing.expectEqual(@as(u8, 8), accepted.ip4.bytes[0]);
+    try std.testing.expectError(
+        error.AddressRejected,
+        resolveAddressFiltered(std.testing.io, "localhost", 80, Policy.rejectAll),
+    );
 }
 
 fn firstNonEmptyBuffer(bufs: [][]u8) ?struct { index: usize, buf: []u8 } {
@@ -105,7 +154,10 @@ pub const Socket = struct {
     /// Sends data, returning the number of bytes written.
     pub fn send(self: *Self, data: []const u8) !usize {
         try self.applyRequestDeadline(.send);
-        const sent = self.io.vtable.netWrite(self.io.userdata, self.handle, "", &.{data}, 1) catch return error.SendFailed;
+        const sent = self.io.vtable.netWrite(self.io.userdata, self.handle, "", &.{data}, 1) catch |err| {
+            if (err == error.Canceled) self.io.recancel();
+            return error.SendFailed;
+        };
         try self.checkRequestDeadline();
         return sent;
     }
@@ -137,7 +189,10 @@ pub const Socket = struct {
             return received;
         }
         var bufs = [_][]u8{buffer};
-        const received = self.io.vtable.netRead(self.io.userdata, self.handle, &bufs) catch return error.RecvFailed;
+        const received = self.io.vtable.netRead(self.io.userdata, self.handle, &bufs) catch |err| {
+            if (err == error.Canceled) self.io.recancel();
+            return error.RecvFailed;
+        };
         try self.checkRequestDeadline();
         return received;
     }
@@ -429,7 +484,10 @@ pub const SocketIoWriter = struct {
             p.socket.sendAll(buffered) catch return error.WriteFailed;
             return w.consumeAll();
         }
-        const n = p.socket.io.vtable.netWrite(p.socket.io.userdata, p.socket.handle, w.buffered(), bufs, splat) catch return error.WriteFailed;
+        const n = p.socket.io.vtable.netWrite(p.socket.io.userdata, p.socket.handle, w.buffered(), bufs, splat) catch |err| {
+            if (err == error.Canceled) p.socket.io.recancel();
+            return error.WriteFailed;
+        };
         return w.consume(n);
     }
 
@@ -812,6 +870,13 @@ pub const TcpListener = struct {
     /// Closes the listener.
     pub fn deinit(self: *Self) void {
         self.server.deinit(self.io);
+    }
+
+    /// Interrupts a concurrent accept without closing the underlying handle.
+    /// Call this before `deinit` when another thread may be blocked in accept.
+    pub fn shutdown(self: *Self) void {
+        var socket = Socket.fromHandle(self.server.socket.handle, self.io);
+        socket.shutdown();
     }
 
     /// Accepts an incoming connection.

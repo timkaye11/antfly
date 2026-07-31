@@ -13,10 +13,18 @@
 // limitations under the License.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const buffer_mod = @import("buffer.zig");
 const context_mod = @import("context.zig");
 const driver_mod = @import("driver.zig");
 const cuda_artifact = @import("artifact.zig");
+const nvrtc_mod = @import("nvrtc.zig");
+const kernel_jit = @import("../../graph/kernel_jit.zig");
+const io_compat = @import("../../io/compat.zig");
+const quant_kernel_compiler = @import("../../graph/quant_kernel_compiler.zig");
+const quant_matmul = @import("../../graph/quant_matmul.zig");
+const cuda_kernel_renderer = @import("../../graph/quant_kernel_cuda_renderer.zig");
+const quant_codec = @import("../../gguf/quant_codec.zig");
 const platform = @import("antfly_platform");
 const turboquant = @import("../../runtime/kv/turboquant.zig");
 const kv_pool_mod = @import("../../runtime/kv/pool.zig");
@@ -33,6 +41,204 @@ fn captureParamTraceIndex(ctx: *context_mod.CudaContext) ?usize {
 
 fn fastGqaDecodeDisabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_CUDA_DISABLE_FAST_GQA_DECODE", false);
+}
+
+fn generatedGqaDecodeEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE", false);
+}
+
+// Kept switchable so the shape-specialized encoder prefill path can be
+// validated directly against the generic implementation on a given GPU.
+fn bertPrefillAttentionEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_BERT_PREFILL_ATTENTION", true);
+}
+
+fn bertPrefillAttentionQueryTilingEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_BERT_PREFILL_ATTENTION_Q8", true);
+}
+
+const BertPrefillAttentionMode = enum {
+    generic,
+    exact,
+    exact_q8,
+    tensor_core,
+};
+
+const bert_prefill_attention_mma_seq_len: usize = 256;
+const bert_prefill_attention_mma_head_dim: usize = 64;
+const bert_prefill_attention_mma_query_tile: usize = 16;
+const bert_prefill_attention_mma_threads: usize = 256;
+// f16 V-hi plus f32 S/P/V/O. QK is exact FP32; the P*V residual correction
+// fits below CUDA's 48 KiB default dynamic-shared-memory limit.
+const bert_prefill_attention_mma_shared_bytes: usize = 45312;
+
+fn parseBertPrefillAttentionMode(value: []const u8) ?BertPrefillAttentionMode {
+    if (std.ascii.eqlIgnoreCase(value, "generic")) return .generic;
+    if (std.ascii.eqlIgnoreCase(value, "exact")) return .exact;
+    if (std.ascii.eqlIgnoreCase(value, "exact-q8") or std.ascii.eqlIgnoreCase(value, "exact_q8")) return .exact_q8;
+    if (std.ascii.eqlIgnoreCase(value, "tensor-core") or
+        std.ascii.eqlIgnoreCase(value, "tensor_core") or
+        std.ascii.eqlIgnoreCase(value, "mma")) return .tensor_core;
+    return null;
+}
+
+// `exact` is the production default. Tensor-core is a deliberate opt-in: it
+// changes the FP32 Q/K/V arithmetic contract, so it must be qualified for a
+// model and retrieval-quality target before deployment. The legacy boolean is
+// retained for existing experiment scripts; MODE is the canonical interface.
+fn bertPrefillAttentionMode() BertPrefillAttentionMode {
+    if (!bertPrefillAttentionEnabled()) return .generic;
+    if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_BERT_PREFILL_ATTENTION_MODE")) |value| {
+        return parseBertPrefillAttentionMode(value) orelse .exact;
+    }
+    if (platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_BERT_PREFILL_ATTENTION_MMA", false)) return .tensor_core;
+    return .exact;
+}
+
+fn bertPrefillAttentionMmaComputeEligible(compute_major: i32, compute_minor: i32) bool {
+    // The checked-in portable CUDA artifact targets sm_75. Do not select a
+    // WMMA symbol on an older device and rely on module-load/JIT failure.
+    return compute_major > 7 or (compute_major == 7 and compute_minor >= 5);
+}
+
+fn bertPrefillAttentionMmaShapeEligible(
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    causal: bool,
+    has_mask: bool,
+    bias_mode: u32,
+    head_major: bool,
+) bool {
+    return batch > 0 and
+        num_heads > 0 and
+        !causal and
+        !has_mask and
+        bias_mode == 0 and
+        head_major and
+        seq_len == bert_prefill_attention_mma_seq_len and
+        head_dim == bert_prefill_attention_mma_head_dim;
+}
+
+pub fn generatedGqaScorePreworkEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK", false);
+}
+
+fn generatedGqaDecodeSplitKvMinTokens() u32 {
+    const configured = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SPLIT_KV_MIN_TOKENS") orelse
+        cuda_kernel_renderer.generated_attention_split_kv_min_tokens_default;
+    return @intCast(@min(@max(configured, 1), std.math.maxInt(u32)));
+}
+
+fn generatedGqaDecodeSplitVariantFor(configured: ?usize) cuda_kernel_renderer.AttentionSplitVariant {
+    return switch (configured orelse cuda_kernel_renderer.generated_attention_kv_splits) {
+        2 => .split2,
+        4 => .split4,
+        8 => .split8,
+        else => .split8,
+    };
+}
+
+fn generatedGqaDecodeSplitVariant() cuda_kernel_renderer.AttentionSplitVariant {
+    return generatedGqaDecodeSplitVariantFor(
+        platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SPLIT_KV_SPLITS"),
+    );
+}
+
+pub const GeneratedGqaDecodeSchedule = enum(u8) {
+    none = 0,
+    serial = 1,
+    split2 = 2,
+    split4 = 3,
+    split8 = 4,
+
+    fn splitVariant(self: GeneratedGqaDecodeSchedule) ?cuda_kernel_renderer.AttentionSplitVariant {
+        return switch (self) {
+            .split2 => .split2,
+            .split4 => .split4,
+            .split8 => .split8,
+            .none, .serial => null,
+        };
+    }
+};
+
+fn generatedGqaDecodeScheduleFor(
+    kv_seq_len: usize,
+    enabled: bool,
+    split_kv_min_tokens: u32,
+    split_variant: cuda_kernel_renderer.AttentionSplitVariant,
+) GeneratedGqaDecodeSchedule {
+    if (!enabled) return .none;
+    if (kv_seq_len < split_kv_min_tokens) return .serial;
+    return switch (split_variant) {
+        .split2 => .split2,
+        .split4 => .split4,
+        .split8 => .split8,
+        .score_prework => .split8,
+    };
+}
+
+fn generatedGqaDecodeScheduleForKvSeqLen(kv_seq_len: usize) GeneratedGqaDecodeSchedule {
+    return generatedGqaDecodeScheduleFor(
+        kv_seq_len,
+        generatedGqaDecodeEnabled(),
+        generatedGqaDecodeSplitKvMinTokens(),
+        generatedGqaDecodeSplitVariant(),
+    );
+}
+
+pub fn generatedGqaDecodeScheduleTag(kv_seq_len: usize) u8 {
+    return @intFromEnum(generatedGqaDecodeScheduleForKvSeqLen(kv_seq_len));
+}
+
+fn generatedGqaDecodeWorkspaceBytes() usize {
+    const split_workspace = cuda_kernel_renderer.generatedAttentionWorkspaceLayout();
+    const score_workspace = cuda_kernel_renderer.generatedAttentionWorkspaceLayoutFor(
+        cuda_kernel_renderer.generated_attention_score_prework_chunks,
+    ) orelse unreachable;
+    return @max(split_workspace.total_bytes, score_workspace.total_bytes);
+}
+
+fn generatedGqaDecodeShapeEligible(batch: usize, q_seq_len: usize, head_dim: usize, num_heads: usize, num_kv_heads: usize) bool {
+    return batch == cuda_kernel_renderer.generated_attention_workspace_max_batch and
+        q_seq_len == 1 and
+        (head_dim == 256 or head_dim == 512) and
+        num_kv_heads > 0 and
+        num_heads > 0 and
+        num_heads % num_kv_heads == 0 and
+        num_heads / num_kv_heads <= cuda_kernel_renderer.generated_attention_query_heads_per_kv_head and
+        num_heads <= cuda_kernel_renderer.generated_attention_workspace_max_query_heads;
+}
+
+fn generatedGqaScorePreworkShapeEligible(
+    batch: usize,
+    q_seq_len: usize,
+    kv_seq_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    mask_len: usize,
+    bias_mode: u32,
+    key_row_bytes: usize,
+    base_key_row_bytes: usize,
+    value_row_bytes: usize,
+    format: u32,
+    value_format: u32,
+    physical_token_capacity: usize,
+) bool {
+    return generatedGqaDecodeShapeEligible(batch, q_seq_len, head_dim, num_heads, num_kv_heads) and
+        kv_seq_len > 0 and
+        kv_seq_len <= cuda_kernel_renderer.generated_attention_score_prework_max_kv_tokens and
+        physical_token_capacity >= kv_seq_len and
+        physical_token_capacity <= cuda_kernel_renderer.generated_attention_score_prework_max_kv_tokens and
+        mask_len == 0 and
+        bias_mode == 0 and
+        key_row_bytes > 0 and
+        base_key_row_bytes == key_row_bytes and
+        value_row_bytes >= num_kv_heads * head_dim * @sizeOf(f32) and
+        (format == 0 or format == 2) and
+        value_format == 0;
 }
 
 fn fastGqaPrefillEnabled() bool {
@@ -81,6 +287,8 @@ fn fastGqaPrefillEligible(batch: usize, q_seq_len: usize, num_heads: usize, num_
 pub const GqaAttentionLaunchKind = enum {
     none,
     decode,
+    decode_generated,
+    decode_generated_score_prework,
     decode_fast,
     decode_fast_fallback,
     prefill_fast,
@@ -112,12 +320,634 @@ pub const Q4_0Q8_1PrefillRowsVariant = enum {
     e4b_down_rows,
 };
 
+pub const JitProductionRoutes = struct {
+    mmv: bool = false,
+    mm: bool = false,
+    pair: bool = false,
+    pair_q8: bool = false,
+    down_q8: bool = false,
+
+    fn enableArtifact(self: *JitProductionRoutes, artifact: quant_kernel_compiler.GeneratedArtifact) bool {
+        const kind = artifact.cuda_kernel orelse return false;
+        switch (kind) {
+            .q4_0_mmv => self.mmv = true,
+            .q4_0_mm => self.mm = true,
+            .q4_0_pair_mmv => self.pair = true,
+            .q4_0_pair_activation_q8_1 => self.pair_q8 = true,
+            .q4_0_down_q8_1 => self.down_q8 = true,
+            else => return false,
+        }
+        return true;
+    }
+
+    fn disableArtifact(self: *JitProductionRoutes, artifact: quant_kernel_compiler.GeneratedArtifact) bool {
+        const kind = artifact.cuda_kernel orelse return false;
+        switch (kind) {
+            .q4_0_mmv => self.mmv = false,
+            .q4_0_mm => self.mm = false,
+            .q4_0_pair_mmv => self.pair = false,
+            .q4_0_pair_activation_q8_1 => self.pair_q8 = false,
+            .q4_0_down_q8_1 => self.down_q8 = false,
+            else => return false,
+        }
+        return true;
+    }
+
+    pub fn includesArtifact(self: JitProductionRoutes, artifact: quant_kernel_compiler.GeneratedArtifact) bool {
+        const kind = artifact.cuda_kernel orelse return false;
+        return switch (kind) {
+            .q4_0_mmv => self.mmv,
+            .q4_0_mm => self.mm,
+            .q4_0_pair_mmv => self.pair,
+            .q4_0_pair_activation_q8_1 => self.pair_q8,
+            .q4_0_down_q8_1 => self.down_q8,
+            else => false,
+        };
+    }
+
+    pub fn any(self: JitProductionRoutes) bool {
+        return self.mmv or self.mm or self.pair or self.pair_q8 or self.down_q8;
+    }
+
+    fn intersect(self: JitProductionRoutes, allowed: JitProductionRoutes) JitProductionRoutes {
+        return .{
+            .mmv = self.mmv and allowed.mmv,
+            .mm = self.mm and allowed.mm,
+            .pair = self.pair and allowed.pair,
+            .pair_q8 = self.pair_q8 and allowed.pair_q8,
+            .down_q8 = self.down_q8 and allowed.down_q8,
+        };
+    }
+
+    fn eql(self: JitProductionRoutes, other: JitProductionRoutes) bool {
+        return self.mmv == other.mmv and
+            self.mm == other.mm and
+            self.pair == other.pair and
+            self.pair_q8 == other.pair_q8 and
+            self.down_q8 == other.down_q8;
+    }
+};
+
+pub const JitModelProfile = enum {
+    clipclap,
+    bert_encoder,
+    deberta_reranker,
+    gliner2,
+    florence2,
+    gemma4,
+};
+
+pub const JitRouteScope = struct {
+    pub const max_observed_shapes = 16;
+
+    production: JitProductionRoutes = .{},
+    // Deterministically sorted distinct [out_dim, in_dim] Q4_0 shapes that can
+    // reach generated dispatch for this model. They define the live
+    // conformance domain and are part of the exact qualification cache key.
+    observed_shapes: [max_observed_shapes][2]usize = [_][2]usize{.{ 0, 0 }} ** max_observed_shapes,
+    observed_shape_count: usize = 0,
+    prefill_shapes: [max_observed_shapes][2]usize = [_][2]usize{.{ 0, 0 }} ** max_observed_shapes,
+    prefill_shape_count: usize = 0,
+    pair_shapes: [max_observed_shapes][2]usize = [_][2]usize{.{ 0, 0 }} ** max_observed_shapes,
+    pair_shape_count: usize = 0,
+    conformance_complete: bool = true,
+
+    pub fn maximumForProfile(profile: JitModelProfile) JitRouteScope {
+        return switch (profile) {
+            // Current production CUDA JIT evidence is exclusively Gemma4
+            // E2B/E4B Q4_0. Encoder models keep the bundled runtime.
+            .clipclap, .bert_encoder, .deberta_reranker, .gliner2, .florence2 => .{},
+            .gemma4 => .{ .production = .{
+                .mmv = true,
+                .mm = true,
+                .pair = true,
+                .pair_q8 = true,
+                .down_q8 = true,
+            } },
+        };
+    }
+
+    pub fn forObservedRoutes(profile: JitModelProfile, observed: JitProductionRoutes) JitRouteScope {
+        return .{
+            .production = observed.intersect(maximumForProfile(profile).production),
+        };
+    }
+
+    pub fn includesArtifact(self: JitRouteScope, artifact: quant_kernel_compiler.GeneratedArtifact) bool {
+        return artifact.production_enabled and self.production.includesArtifact(artifact);
+    }
+
+    pub fn enabled(self: JitRouteScope) bool {
+        return self.production.any();
+    }
+
+    pub fn containsMmvShape(self: JitRouteScope, out_dim: usize, in_dim: usize) bool {
+        return containsJitShape(self.observed_shapes[0..self.observed_shape_count], out_dim, in_dim);
+    }
+
+    pub fn containsMmShape(self: JitRouteScope, out_dim: usize, in_dim: usize) bool {
+        return containsJitShape(self.prefill_shapes[0..self.prefill_shape_count], out_dim, in_dim);
+    }
+
+    pub fn containsPairShape(self: JitRouteScope, out_dim: usize, in_dim: usize) bool {
+        return containsJitShape(self.pair_shapes[0..self.pair_shape_count], out_dim, in_dim);
+    }
+
+    fn mergeQualified(self: *JitRouteScope, other: JitRouteScope) void {
+        self.production.mmv = self.production.mmv or other.production.mmv;
+        self.production.mm = self.production.mm or other.production.mm;
+        self.production.pair = self.production.pair or other.production.pair;
+        self.production.pair_q8 = self.production.pair_q8 or other.production.pair_q8;
+        self.production.down_q8 = self.production.down_q8 or other.production.down_q8;
+        for (other.observed_shapes[0..other.observed_shape_count]) |shape| {
+            self.conformance_complete = mergeQualifiedJitShape(
+                &self.observed_shapes,
+                &self.observed_shape_count,
+                shape,
+            ) and self.conformance_complete;
+        }
+        for (other.prefill_shapes[0..other.prefill_shape_count]) |shape| {
+            self.conformance_complete = mergeQualifiedJitShape(
+                &self.prefill_shapes,
+                &self.prefill_shape_count,
+                shape,
+            ) and self.conformance_complete;
+        }
+        for (other.pair_shapes[0..other.pair_shape_count]) |shape| {
+            self.conformance_complete = mergeQualifiedJitShape(
+                &self.pair_shapes,
+                &self.pair_shape_count,
+                shape,
+            ) and self.conformance_complete;
+        }
+    }
+};
+
+fn containsJitShape(shapes: []const [2]usize, out_dim: usize, in_dim: usize) bool {
+    for (shapes) |shape| {
+        if (shape[0] == out_dim and shape[1] == in_dim) return true;
+    }
+    return false;
+}
+
+fn mergeQualifiedJitShape(
+    shapes: *[JitRouteScope.max_observed_shapes][2]usize,
+    count: *usize,
+    shape: [2]usize,
+) bool {
+    if (containsJitShape(shapes[0..count.*], shape[0], shape[1])) return true;
+    if (count.* == shapes.len) return false;
+    var insert_at = count.*;
+    for (shapes[0..count.*], 0..) |existing, index| {
+        if (shape[0] < existing[0] or (shape[0] == existing[0] and shape[1] < existing[1])) {
+            insert_at = index;
+            break;
+        }
+    }
+    var index = count.*;
+    while (index > insert_at) : (index -= 1) shapes[index] = shapes[index - 1];
+    shapes[insert_at] = shape;
+    count.* += 1;
+    return true;
+}
+
+pub const JitRouteScopeBuilder = struct {
+    profile: JitModelProfile,
+    routes: JitProductionRoutes = .{},
+    observed_shapes: [JitRouteScope.max_observed_shapes][2]usize = undefined,
+    observed_shape_count: usize = 0,
+    prefill_shapes: [JitRouteScope.max_observed_shapes][2]usize = undefined,
+    prefill_shape_count: usize = 0,
+    gate_shapes: [JitRouteScope.max_observed_shapes][2]usize = undefined,
+    gate_shape_count: usize = 0,
+    up_shapes: [JitRouteScope.max_observed_shapes][2]usize = undefined,
+    up_shape_count: usize = 0,
+    pair_shapes: [JitRouteScope.max_observed_shapes][2]usize = undefined,
+    pair_shape_count: usize = 0,
+    conformance_complete: bool = true,
+    pair_shape_observed: bool = false,
+    e4b_gate_observed: bool = false,
+    e4b_up_observed: bool = false,
+    e4b_down_observed: bool = false,
+
+    pub fn init(profile: JitModelProfile) JitRouteScopeBuilder {
+        return .{ .profile = profile };
+    }
+
+    /// Observe a matrix that will remain Q4_0 on CUDA after upload. Shapes are
+    /// logical [out_dim, in_dim]; callers pass whether rows>1 can still reach
+    /// quant dispatch (false when a BF16 mirror intercepts prefill).
+    pub fn observeQ4_0Matrix(
+        self: *JitRouteScopeBuilder,
+        name: []const u8,
+        out_dim: usize,
+        in_dim: usize,
+        multi_row_quant_reachable: bool,
+    ) void {
+        if (self.profile != .gemma4 or in_dim == 0 or out_dim == 0) return;
+        const decode_plan = quant_matmul.plan(.{
+            .rows = 1,
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .format = .q4_0,
+        });
+        const decode_supported = quant_kernel_compiler.generatedArtifactSupportsPlan(.cuda, decode_plan, .none);
+        if (decode_supported) {
+            self.routes.mmv = true;
+            self.conformance_complete = appendDistinctJitShape(
+                &self.observed_shapes,
+                &self.observed_shape_count,
+                .{ out_dim, in_dim },
+            ) and self.conformance_complete;
+        }
+        if (multi_row_quant_reachable) {
+            const prefill_plan = quant_matmul.plan(.{
+                .rows = 22,
+                .in_dim = in_dim,
+                .out_dim = out_dim,
+                .format = .q4_0,
+            });
+            if (quant_kernel_compiler.generatedArtifactSupportsPlan(.cuda, prefill_plan, .none)) {
+                self.routes.mm = true;
+                self.conformance_complete = appendDistinctJitShape(
+                    &self.prefill_shapes,
+                    &self.prefill_shape_count,
+                    .{ out_dim, in_dim },
+                ) and self.conformance_complete;
+            }
+        }
+
+        const shape = [2]usize{ out_dim, in_dim };
+        if (std.mem.endsWith(u8, name, ".mlp.gate_proj.weight")) {
+            for (self.up_shapes[0..self.up_shape_count]) |up| {
+                if (up[0] == shape[0] and up[1] == shape[1] and jitPairShapeSupported(shape)) {
+                    self.pair_shape_observed = true;
+                    self.conformance_complete = appendDistinctJitShape(
+                        &self.pair_shapes,
+                        &self.pair_shape_count,
+                        shape,
+                    ) and self.conformance_complete;
+                }
+            }
+            self.conformance_complete = appendDistinctJitShape(
+                &self.gate_shapes,
+                &self.gate_shape_count,
+                shape,
+            ) and self.conformance_complete;
+            if (out_dim == generated_q4_0_q8_e4b_intermediate_dim and
+                in_dim == generated_q4_0_q8_e4b_hidden_dim)
+            {
+                self.e4b_gate_observed = true;
+            }
+        }
+        if (std.mem.endsWith(u8, name, ".mlp.up_proj.weight")) {
+            for (self.gate_shapes[0..self.gate_shape_count]) |gate| {
+                if (gate[0] == shape[0] and gate[1] == shape[1] and jitPairShapeSupported(shape)) {
+                    self.pair_shape_observed = true;
+                    self.conformance_complete = appendDistinctJitShape(
+                        &self.pair_shapes,
+                        &self.pair_shape_count,
+                        shape,
+                    ) and self.conformance_complete;
+                }
+            }
+            self.conformance_complete = appendDistinctJitShape(
+                &self.up_shapes,
+                &self.up_shape_count,
+                shape,
+            ) and self.conformance_complete;
+            if (out_dim == generated_q4_0_q8_e4b_intermediate_dim and
+                in_dim == generated_q4_0_q8_e4b_hidden_dim)
+            {
+                self.e4b_up_observed = true;
+            }
+        }
+        if (std.mem.endsWith(u8, name, ".mlp.down_proj.weight") and
+            out_dim == generated_q4_0_q8_e4b_hidden_dim and
+            in_dim == generated_q4_0_q8_e4b_intermediate_dim)
+        {
+            self.e4b_down_observed = true;
+        }
+    }
+
+    pub fn finish(self: JitRouteScopeBuilder) JitRouteScope {
+        var observed = self.routes;
+        if (self.pair_shape_observed) {
+            // The general pair artifact has the same runtime-shape contract as
+            // the observed standalone Q4_0 decode projections.
+            observed.pair = true;
+        }
+        observed.pair_q8 = self.e4b_gate_observed and self.e4b_up_observed;
+        observed.down_q8 = observed.pair_q8 and self.e4b_down_observed;
+        var result = JitRouteScope.forObservedRoutes(self.profile, observed);
+        result.observed_shape_count = self.observed_shape_count;
+        @memcpy(
+            result.observed_shapes[0..self.observed_shape_count],
+            self.observed_shapes[0..self.observed_shape_count],
+        );
+        result.prefill_shape_count = self.prefill_shape_count;
+        @memcpy(
+            result.prefill_shapes[0..self.prefill_shape_count],
+            self.prefill_shapes[0..self.prefill_shape_count],
+        );
+        result.pair_shape_count = self.pair_shape_count;
+        @memcpy(
+            result.pair_shapes[0..self.pair_shape_count],
+            self.pair_shapes[0..self.pair_shape_count],
+        );
+        result.conformance_complete = self.conformance_complete and
+            liveRuntimeJitScopeWithinFixtureBudget(result);
+        return result;
+    }
+
+    fn appendDistinctJitShape(
+        shapes: *[JitRouteScope.max_observed_shapes][2]usize,
+        count: *usize,
+        shape: [2]usize,
+    ) bool {
+        for (shapes[0..count.*]) |existing| {
+            if (existing[0] == shape[0] and existing[1] == shape[1]) return true;
+        }
+        if (count.* == shapes.len) return false;
+        var insert_at = count.*;
+        for (shapes[0..count.*], 0..) |existing, index| {
+            if (shape[0] < existing[0] or (shape[0] == existing[0] and shape[1] < existing[1])) {
+                insert_at = index;
+                break;
+            }
+        }
+        var index = count.*;
+        while (index > insert_at) : (index -= 1) shapes[index] = shapes[index - 1];
+        shapes[insert_at] = shape;
+        count.* += 1;
+        return true;
+    }
+
+    fn jitPairShapeSupported(shape: [2]usize) bool {
+        return quant_kernel_compiler.generatedArtifactSupportsPlan(
+            .cuda,
+            quant_matmul.plan(.{
+                .rows = 1,
+                .in_dim = shape[1],
+                .out_dim = shape[0],
+                .format = .q4_0,
+            }),
+            .pair,
+        );
+    }
+};
+
+const max_runtime_jit_functions_per_artifact = 3;
+
+const RuntimeJitFunctionMapping = struct {
+    slots: [max_runtime_jit_functions_per_artifact]?*driver_mod.CUfunction =
+        [_]?*driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact,
+    names: [max_runtime_jit_functions_per_artifact][]const u8 =
+        [_][]const u8{""} ** max_runtime_jit_functions_per_artifact,
+    count: usize = 0,
+
+    fn one(slot: *driver_mod.CUfunction, name: []const u8) RuntimeJitFunctionMapping {
+        return .{ .slots = .{ slot, null, null }, .names = .{ name, "", "" }, .count = 1 };
+    }
+
+    fn two(
+        first_slot: *driver_mod.CUfunction,
+        first_name: []const u8,
+        second_slot: *driver_mod.CUfunction,
+        second_name: []const u8,
+    ) RuntimeJitFunctionMapping {
+        return .{
+            .slots = .{ first_slot, second_slot, null },
+            .names = .{ first_name, second_name, "" },
+            .count = 2,
+        };
+    }
+
+    fn three(
+        first_slot: *driver_mod.CUfunction,
+        first_name: []const u8,
+        second_slot: *driver_mod.CUfunction,
+        second_name: []const u8,
+        third_slot: *driver_mod.CUfunction,
+        third_name: []const u8,
+    ) RuntimeJitFunctionMapping {
+        return .{
+            .slots = .{ first_slot, second_slot, third_slot },
+            .names = .{ first_name, second_name, third_name },
+            .count = 3,
+        };
+    }
+};
+
+pub const RuntimeJitQualificationRequest = struct {
+    allocator: std.mem.Allocator,
+    ctx: *context_mod.CudaContext,
+    module: *KernelModule,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    candidate_functions: [max_runtime_jit_functions_per_artifact]driver_mod.CUfunction,
+    scope: JitRouteScope = .{},
+    cancellation: ?RuntimeJitCancellation = null,
+
+    fn checkCanceled(self: RuntimeJitQualificationRequest) !void {
+        if (self.cancellation) |cancellation| {
+            if (cancellation.isCanceled()) return error.KernelJitCanceled;
+        }
+    }
+};
+
+pub const RuntimeJitCancellation = struct {
+    context: *anyopaque,
+    isCanceledFn: *const fn (*anyopaque) bool,
+
+    fn isCanceled(self: RuntimeJitCancellation) bool {
+        return self.isCanceledFn(self.context);
+    }
+};
+
+fn runtimeJitMonotonicNowNs() u64 {
+    const value = std.Io.Clock.awake.now(io_compat.io()).nanoseconds;
+    if (value <= 0) return 0;
+    return @intCast(@min(value, std.math.maxInt(u64)));
+}
+
+const RuntimeJitWorkControl = struct {
+    deadline_ns: ?u64 = null,
+    clock_failed: bool = false,
+
+    fn foreground(config: kernel_jit.Config) RuntimeJitWorkControl {
+        return foregroundAt(config, runtimeJitMonotonicNowNs());
+    }
+
+    fn foregroundAt(config: kernel_jit.Config, now: u64) RuntimeJitWorkControl {
+        if (config.mode.failClosed()) return .{};
+        if (now == 0) return .{ .clock_failed = true };
+        const budget_ns = std.math.mul(
+            u64,
+            config.preload_budget_ms,
+            std.time.ns_per_ms,
+        ) catch std.math.maxInt(u64);
+        return .{ .deadline_ns = now +| budget_ns };
+    }
+
+    fn deadlineReached(self: *const RuntimeJitWorkControl) bool {
+        return self.deadlineReachedAt(runtimeJitMonotonicNowNs());
+    }
+
+    fn deadlineReachedAt(self: *const RuntimeJitWorkControl, now: u64) bool {
+        if (self.clock_failed) return true;
+        const deadline = self.deadline_ns orelse return false;
+        return now == 0 or now >= deadline;
+    }
+
+    fn stopped(self: *const RuntimeJitWorkControl) bool {
+        return self.deadlineReached();
+    }
+
+    fn isCanceledRaw(raw: *anyopaque) bool {
+        const self: *const RuntimeJitWorkControl = @ptrCast(@alignCast(raw));
+        return self.stopped();
+    }
+
+    fn cancellation(self: *RuntimeJitWorkControl) RuntimeJitCancellation {
+        return .{ .context = self, .isCanceledFn = isCanceledRaw };
+    }
+};
+
+const RuntimeJitLoadDisposition = enum { bundled, qualify, reject_required };
+
+fn runtimeJitLoadDisposition(
+    mode: kernel_jit.Mode,
+    scope: JitRouteScope,
+    load_context: kernel_jit.LoadContext,
+) RuntimeJitLoadDisposition {
+    if (!mode.compiles()) return .bundled;
+    if (!scope.enabled() or !load_context.allowsQualification()) {
+        return if (mode.failClosed()) .reject_required else .bundled;
+    }
+    return .qualify;
+}
+
+// CUDA driver compilation and qualification consume process-global compiler
+// and GPU resources. Serialize the exact cache-check -> compile -> qualify ->
+// cache-write transaction so concurrent sessions do not benchmark together and
+// waiters re-read the first session's completed cache entry.
+var runtime_jit_process_mutex: std.atomic.Mutex = .unlocked;
+
+const runtime_jit_rejection_ttl_ns: u64 = std.time.ns_per_hour;
+const runtime_jit_rejection_capacity: usize = 256;
+
+const RuntimeJitRejectionMemo = struct {
+    const Entry = struct {
+        key: kernel_jit.ArtifactKey = [_]u8{0} ** @sizeOf(kernel_jit.ArtifactKey),
+        rejected_at_ns: u64 = 0,
+        valid: bool = false,
+    };
+
+    entries: [runtime_jit_rejection_capacity]Entry = [_]Entry{.{}} ** runtime_jit_rejection_capacity,
+    next_evict: usize = 0,
+
+    fn activeAt(self: *RuntimeJitRejectionMemo, key: kernel_jit.ArtifactKey, now_ns: u64) bool {
+        if (now_ns == 0) return false;
+        for (&self.entries) |*entry| {
+            if (!entry.valid or !std.mem.eql(u8, &entry.key, &key)) continue;
+            if (now_ns < entry.rejected_at_ns or now_ns - entry.rejected_at_ns >= runtime_jit_rejection_ttl_ns) {
+                entry.valid = false;
+                return false;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    fn rememberAt(self: *RuntimeJitRejectionMemo, key: kernel_jit.ArtifactKey, now_ns: u64) void {
+        if (now_ns == 0) return;
+        var free_index: ?usize = null;
+        for (&self.entries, 0..) |*entry, index| {
+            if (entry.valid and std.mem.eql(u8, &entry.key, &key)) {
+                entry.rejected_at_ns = now_ns;
+                return;
+            }
+            if (!entry.valid and free_index == null) free_index = index;
+        }
+        const index = free_index orelse self.next_evict;
+        self.entries[index] = .{ .key = key, .rejected_at_ns = now_ns, .valid = true };
+        if (free_index == null) self.next_evict = (self.next_evict + 1) % self.entries.len;
+    }
+
+    fn clear(self: *RuntimeJitRejectionMemo, key: kernel_jit.ArtifactKey) void {
+        for (&self.entries) |*entry| {
+            if (entry.valid and std.mem.eql(u8, &entry.key, &key)) {
+                entry.valid = false;
+                return;
+            }
+        }
+    }
+};
+
+// Protected by runtime_jit_process_mutex. Qualification rejection is exact-key
+// and deliberately process-local: positive evidence remains persistent, while
+// a changed device/compiler/source/policy key retries immediately.
+var runtime_jit_rejections = RuntimeJitRejectionMemo{};
+
+fn lockRuntimeJitProcess(control: ?*const RuntimeJitWorkControl) !bool {
+    while (!runtime_jit_process_mutex.tryLock()) {
+        if (control) |value| {
+            if (value.deadlineReached()) return false;
+        }
+        platform.time.yieldBriefly();
+    }
+    if (control) |value| {
+        if (value.deadlineReached()) {
+            runtime_jit_process_mutex.unlock();
+            return false;
+        }
+    }
+    return true;
+}
+
+pub const RuntimeJitQualifier = struct {
+    context: ?*anyopaque = null,
+    runFn: *const fn (?*anyopaque, RuntimeJitQualificationRequest) anyerror!?kernel_jit.QualificationRecord,
+
+    pub fn live() RuntimeJitQualifier {
+        return .{ .runFn = liveRuntimeJitQualification };
+    }
+
+    fn run(
+        self: RuntimeJitQualifier,
+        request: RuntimeJitQualificationRequest,
+    ) !?kernel_jit.QualificationRecord {
+        return self.runFn(self.context, request);
+    }
+};
+
+pub const RuntimeJitStats = struct {
+    qualification_cache_hits: usize = 0,
+    qualification_cache_misses: usize = 0,
+    compiled: usize = 0,
+    qualified: usize = 0,
+    active: usize = 0,
+    rejected: usize = 0,
+    quarantined: usize = 0,
+    sync_elapsed_ms: u64 = 0,
+    budget_reached: bool = false,
+    skipped_dynamic: bool = false,
+};
+
 pub const KernelModule = struct {
     module: driver_mod.CUmodule = null,
+    runtime_jit_modules: [quant_kernel_compiler.first_generated_artifacts.len]driver_mod.CUmodule =
+        [_]driver_mod.CUmodule{null} ** quant_kernel_compiler.first_generated_artifacts.len,
+    runtime_jit_module_count: usize = 0,
+    runtime_jit_routes: JitProductionRoutes = .{},
+    runtime_jit_pending_routes: JitProductionRoutes = .{},
+    runtime_jit_qualified_scope: JitRouteScope = .{},
+    runtime_jit_stats: RuntimeJitStats = .{},
     fill_f32: driver_mod.CUfunction = null,
     copy_f32: driver_mod.CUfunction = null,
     copy_u8: driver_mod.CUfunction = null,
     f32_to_bf16: driver_mod.CUfunction = null,
+    f32_to_f16: driver_mod.CUfunction = null,
     dequant_q4_0_bf16: driver_mod.CUfunction = null,
     scale_f32: driver_mod.CUfunction = null,
     add_scalar_f32: driver_mod.CUfunction = null,
@@ -127,6 +957,7 @@ pub const KernelModule = struct {
     linear_f32: driver_mod.CUfunction = null,
     linear_f32_tiled: driver_mod.CUfunction = null,
     linear_bf16_weight_f32_tiled: driver_mod.CUfunction = null,
+    linear_f16_weight_f32_tiled: driver_mod.CUfunction = null,
     argmax_last_row_f32: driver_mod.CUfunction = null,
     argmax_rows_f32: driver_mod.CUfunction = null,
     argmax_rows_suppress_f32: driver_mod.CUfunction = null,
@@ -137,12 +968,15 @@ pub const KernelModule = struct {
     linear_q8_0_argmax_rows_stage1_tile4: driver_mod.CUfunction = null,
     linear_q4_0_argmax_rows_stage1_tile4: driver_mod.CUfunction = null,
     linear_q4_0_argmax_rows_stage1_tile16: driver_mod.CUfunction = null,
+    linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b: driver_mod.CUfunction = null,
     linear_q4_k_argmax_rows_stage1_tile4: driver_mod.CUfunction = null,
     linear_q6_k_argmax_rows_stage1_tile4: driver_mod.CUfunction = null,
     linear_q6_k_argmax_rows_stage1_tile8: driver_mod.CUfunction = null,
     linear_q6_k_argmax_rows_stage1_tile16: driver_mod.CUfunction = null,
     linear_q6_k_q8_1_argmax_rows_stage1_tile8: driver_mod.CUfunction = null,
     linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b: driver_mod.CUfunction = null,
+    linear_q6_k_q8_1_argmax_generated_k2560: driver_mod.CUfunction = null,
+    linear_q6_k_q8_1_argmax_generated_k3840: driver_mod.CUfunction = null,
     linear_q6_k_q8_1_f32_tile8_e4b: driver_mod.CUfunction = null,
     argmax_reduce_rows_pairs_f32: driver_mod.CUfunction = null,
     argmax_reduce_rows_pairs_f32_w16: driver_mod.CUfunction = null,
@@ -157,6 +991,7 @@ pub const KernelModule = struct {
     gemma4_mtp_verify_commit_u32: driver_mod.CUfunction = null,
     linear_bias_f32: driver_mod.CUfunction = null,
     add_bias_rows_f32: driver_mod.CUfunction = null,
+    add_bias_relu_rows_f32: driver_mod.CUfunction = null,
     linear_bias_f32_tile4_r2: driver_mod.CUfunction = null,
     linear_bias_relu_f32_tile4_r2: driver_mod.CUfunction = null,
     linear_bias_gelu_f32_tile4_r2: driver_mod.CUfunction = null,
@@ -178,7 +1013,9 @@ pub const KernelModule = struct {
     activation_multiply_slice_last_dim_f32: driver_mod.CUfunction = null,
     embedding_lookup_f32: driver_mod.CUfunction = null,
     embedding_lookup_bf16_weight_f32: driver_mod.CUfunction = null,
+    embedding_lookup_f16_weight_f32: driver_mod.CUfunction = null,
     embedding_lookup_i32_f32: driver_mod.CUfunction = null,
+    embedding_lookup_i32_f16_weight_f32: driver_mod.CUfunction = null,
     take_rows_f32: driver_mod.CUfunction = null,
     gliner_gather_concat_relu_f32: driver_mod.CUfunction = null,
     gliner_word_embeddings_f32: driver_mod.CUfunction = null,
@@ -188,6 +1025,16 @@ pub const KernelModule = struct {
     conv2d_f32: driver_mod.CUfunction = null,
     attention_f32: driver_mod.CUfunction = null,
     attention_f32_block: driver_mod.CUfunction = null,
+    // Generated-shape BERT prefill attention: full, head-major [B,H,256,64].
+    // It replaces the legacy block-wide reduction performed once per key.
+    attention_f32_bert_prefill_s256_hd64: driver_mod.CUfunction = null,
+    // Eight independent query rows per block for the occupancy-sensitive
+    // encoder prefill path.
+    attention_f32_bert_prefill_s256_hd64_q8: driver_mod.CUfunction = null,
+    // Exact sixteen-query tile. It preserves q8 arithmetic while reducing
+    // prefill grid traffic for the BERT 256x64 contract.
+    attention_f32_bert_prefill_s256_hd64_q16: driver_mod.CUfunction = null,
+    attention_f32_bert_prefill_s256_hd64_mma: driver_mod.CUfunction = null,
     cross_attention_f32: driver_mod.CUfunction = null,
     cross_attention_q1_f32: driver_mod.CUfunction = null,
     token_to_nchw_f32: driver_mod.CUfunction = null,
@@ -210,6 +1057,25 @@ pub const KernelModule = struct {
     gqa_attention_decode_scalars_fast_f32: driver_mod.CUfunction = null,
     gqa_attention_prefill_fast_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_scalars_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_scalars_generated_hd256_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_split_kv_hd256_stage1_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_split_kv_hd256_stage2_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_scalars_generated_hd512_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_split_kv_hd512_stage1_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_split_kv_hd512_stage2_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_split2_kv_hd256_stage1_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_split2_kv_hd256_stage2_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_split2_kv_hd512_stage1_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_split2_kv_hd512_stage2_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_split4_kv_hd256_stage1_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_split4_kv_hd256_stage2_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_split4_kv_hd512_stage1_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_split4_kv_hd512_stage2_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_score_prework_hd256_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_score_prework_consume_hd256_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_score_prework_hd512_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_score_prework_consume_hd512_f32: driver_mod.CUfunction = null,
+    gqa_attention_generated_workspace: buffer_mod.DeviceBuffer = .{},
     kv_write_suffix_decode_scalars_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_turboquant_fast_f32: driver_mod.CUfunction = null,
     gqa_attention_prefill_turboquant_fast_f32: driver_mod.CUfunction = null,
@@ -227,6 +1093,17 @@ pub const KernelModule = struct {
     gqa_attention_decode_turboquant_f32: driver_mod.CUfunction = null,
     kv_write_suffix_turboquant_f32: driver_mod.CUfunction = null,
     deberta_attention_f32: driver_mod.CUfunction = null,
+    deberta_attention_fused_f32: driver_mod.CUfunction = null,
+    deberta_attention_stream_f16: driver_mod.CUfunction = null,
+    /// Generated tensor-core DeBERTa prefill schedule. It consumes graph
+    /// layout F32 directly and owns a 16-query x 32-key tile per CTA.
+    deberta_attention_tc_f16_m16n32: driver_mod.CUfunction = null,
+    /// Preferred generated tensor-core DeBERTa prefill schedule. Its 32-query
+    /// x 16-key CTA reduces K/V rereads while remaining under 48 KiB shared.
+    deberta_attention_tc_f16_m32n16: driver_mod.CUfunction = null,
+    deberta_pack_heads_f16: driver_mod.CUfunction = null,
+    deberta_scores_softmax_f32: driver_mod.CUfunction = null,
+    deberta_unpack_heads_f32: driver_mod.CUfunction = null,
     split_last_dim3_f32: driver_mod.CUfunction = null,
     linear_q8_0_f32: driver_mod.CUfunction = null,
 
@@ -250,7 +1127,22 @@ pub const KernelModule = struct {
     linear_q8_0_gated_down_f32_tile4: driver_mod.CUfunction = null,
     quantize_f32_q8_1_rows: driver_mod.CUfunction = null,
     quantize_gated_f32_q8_1_rows: driver_mod.CUfunction = null,
+    linear_q4_k_generated_bias_gelu: driver_mod.CUfunction = null,
+    linear_q4_k_generated_mmv: driver_mod.CUfunction = null,
     linear_q4_0_f32: driver_mod.CUfunction = null,
+    linear_q4_0_generated_mmv: driver_mod.CUfunction = null,
+    linear_q4_0_generated_mm: driver_mod.CUfunction = null,
+    linear_q4_0_generated_pair: driver_mod.CUfunction = null,
+    linear_q4_0_generated_pair_q8: driver_mod.CUfunction = null,
+    linear_q4_0_generated_down_q8: driver_mod.CUfunction = null,
+    linear_q4_0_generated_pair_q8_e2b_6144: driver_mod.CUfunction = null,
+    linear_q4_0_generated_pair_q8_e2b_12288: driver_mod.CUfunction = null,
+    linear_q4_0_generated_down_q8_e2b_6144: driver_mod.CUfunction = null,
+    linear_q4_0_generated_down_q8_e2b_12288: driver_mod.CUfunction = null,
+    linear_q4_0_generated_pair_f32_e2b_6144_exact: driver_mod.CUfunction = null,
+    linear_q4_0_generated_pair_f32_e2b_12288_exact: driver_mod.CUfunction = null,
+    linear_q4_0_generated_down_f32_e2b_6144_exact: driver_mod.CUfunction = null,
+    linear_q4_0_generated_down_f32_e2b_12288_exact: driver_mod.CUfunction = null,
     linear_q4_0_f32_tile4: driver_mod.CUfunction = null,
     linear_q4_0_f32_tile4_w4: driver_mod.CUfunction = null,
     linear_q4_0_q8_1_f32_tile4: driver_mod.CUfunction = null,
@@ -358,6 +1250,641 @@ pub const KernelModule = struct {
     rms_norm_add_weighted_embedding_i32_q6_k_f32: driver_mod.CUfunction = null,
     slice_last_dim_f32: driver_mod.CUfunction = null,
 
+    fn generatedFunctionMapping(
+        self: *KernelModule,
+        artifact: quant_kernel_compiler.GeneratedArtifact,
+    ) ?RuntimeJitFunctionMapping {
+        if (artifact.cuda_kernel) |kind| {
+            const slot = switch (kind) {
+                .q4_k_small_batch_bias_gelu => &self.linear_q4_k_generated_bias_gelu,
+                .q4_k_mmv => &self.linear_q4_k_generated_mmv,
+                .q4_0_mmv => &self.linear_q4_0_generated_mmv,
+                .q4_0_mm => &self.linear_q4_0_generated_mm,
+                .q4_0_pair_mmv => &self.linear_q4_0_generated_pair,
+                .q4_0_pair_activation_q8_1 => &self.linear_q4_0_generated_pair_q8,
+                .q4_0_pair_activation_q8_1_e2b_6144 => &self.linear_q4_0_generated_pair_q8_e2b_6144,
+                .q4_0_pair_activation_q8_1_e2b_12288 => &self.linear_q4_0_generated_pair_q8_e2b_12288,
+                .q4_0_down_q8_1 => &self.linear_q4_0_generated_down_q8,
+                .q4_0_down_q8_1_e2b_6144 => &self.linear_q4_0_generated_down_q8_e2b_6144,
+                .q4_0_down_q8_1_e2b_12288 => &self.linear_q4_0_generated_down_q8_e2b_12288,
+                .q4_0_pair_activation_f32_e2b_6144_exact => &self.linear_q4_0_generated_pair_f32_e2b_6144_exact,
+                .q4_0_pair_activation_f32_e2b_12288_exact => &self.linear_q4_0_generated_pair_f32_e2b_12288_exact,
+                .q4_0_down_f32_e2b_6144_exact => &self.linear_q4_0_generated_down_f32_e2b_6144_exact,
+                .q4_0_down_f32_e2b_12288_exact => &self.linear_q4_0_generated_down_f32_e2b_12288_exact,
+                .q4_0_q8_1_argmax_e2b_tile8 => &self.linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b,
+                .q6_k_q8_1_argmax_k2560_tile8 => &self.linear_q6_k_q8_1_argmax_generated_k2560,
+                .q6_k_q8_1_argmax_k3840_tile8 => &self.linear_q6_k_q8_1_argmax_generated_k3840,
+            };
+            return RuntimeJitFunctionMapping.one(slot, artifact.kernel_id);
+        }
+        if (artifact.cuda_attention_kernel) |kind| {
+            const plan = cuda_kernel_renderer.attentionPlanFor(kind);
+            return switch (kind) {
+                .gqa_decode_split_kv_hd256_f32 => RuntimeJitFunctionMapping.three(
+                    &self.gqa_attention_decode_split_kv_hd256_stage1_f32,
+                    plan.kernel_id,
+                    &self.gqa_attention_decode_split_kv_hd256_stage2_f32,
+                    plan.reduction_kernel_id,
+                    &self.gqa_attention_decode_scalars_generated_hd256_f32,
+                    plan.serial_kernel_id,
+                ),
+                .gqa_decode_split_kv_hd512_f32 => RuntimeJitFunctionMapping.three(
+                    &self.gqa_attention_decode_split_kv_hd512_stage1_f32,
+                    plan.kernel_id,
+                    &self.gqa_attention_decode_split_kv_hd512_stage2_f32,
+                    plan.reduction_kernel_id,
+                    &self.gqa_attention_decode_scalars_generated_hd512_f32,
+                    plan.serial_kernel_id,
+                ),
+                .gqa_decode_split2_kv_hd256_f32 => RuntimeJitFunctionMapping.three(
+                    &self.gqa_attention_decode_split2_kv_hd256_stage1_f32,
+                    plan.kernel_id,
+                    &self.gqa_attention_decode_split2_kv_hd256_stage2_f32,
+                    plan.reduction_kernel_id,
+                    &self.gqa_attention_decode_scalars_generated_hd256_f32,
+                    plan.serial_kernel_id,
+                ),
+                .gqa_decode_split2_kv_hd512_f32 => RuntimeJitFunctionMapping.three(
+                    &self.gqa_attention_decode_split2_kv_hd512_stage1_f32,
+                    plan.kernel_id,
+                    &self.gqa_attention_decode_split2_kv_hd512_stage2_f32,
+                    plan.reduction_kernel_id,
+                    &self.gqa_attention_decode_scalars_generated_hd512_f32,
+                    plan.serial_kernel_id,
+                ),
+                .gqa_decode_split4_kv_hd256_f32 => RuntimeJitFunctionMapping.three(
+                    &self.gqa_attention_decode_split4_kv_hd256_stage1_f32,
+                    plan.kernel_id,
+                    &self.gqa_attention_decode_split4_kv_hd256_stage2_f32,
+                    plan.reduction_kernel_id,
+                    &self.gqa_attention_decode_scalars_generated_hd256_f32,
+                    plan.serial_kernel_id,
+                ),
+                .gqa_decode_split4_kv_hd512_f32 => RuntimeJitFunctionMapping.three(
+                    &self.gqa_attention_decode_split4_kv_hd512_stage1_f32,
+                    plan.kernel_id,
+                    &self.gqa_attention_decode_split4_kv_hd512_stage2_f32,
+                    plan.reduction_kernel_id,
+                    &self.gqa_attention_decode_scalars_generated_hd512_f32,
+                    plan.serial_kernel_id,
+                ),
+                .gqa_decode_score_prework_hd256_f32 => RuntimeJitFunctionMapping.two(
+                    &self.gqa_attention_decode_score_prework_hd256_f32,
+                    plan.kernel_id,
+                    &self.gqa_attention_decode_score_prework_consume_hd256_f32,
+                    plan.serial_kernel_id,
+                ),
+                .gqa_decode_score_prework_hd512_f32 => RuntimeJitFunctionMapping.two(
+                    &self.gqa_attention_decode_score_prework_hd512_f32,
+                    plan.kernel_id,
+                    &self.gqa_attention_decode_score_prework_consume_hd512_f32,
+                    plan.serial_kernel_id,
+                ),
+            };
+        }
+        return null;
+    }
+
+    fn retainRuntimeJitModule(self: *KernelModule, module: driver_mod.CUmodule) !void {
+        if (module == null) return error.InvalidCudaJitModule;
+        if (self.runtime_jit_module_count >= self.runtime_jit_modules.len) {
+            return error.CudaJitModuleCapacityExceeded;
+        }
+        self.runtime_jit_modules[self.runtime_jit_module_count] = module;
+        self.runtime_jit_module_count += 1;
+    }
+
+    fn popRuntimeJitModule(self: *KernelModule) ?driver_mod.CUmodule {
+        if (self.runtime_jit_module_count == 0) return null;
+        self.runtime_jit_module_count -= 1;
+        const module = self.runtime_jit_modules[self.runtime_jit_module_count];
+        self.runtime_jit_modules[self.runtime_jit_module_count] = null;
+        return module;
+    }
+
+    fn installRuntimeJitFunctions(
+        self: *KernelModule,
+        artifact: quant_kernel_compiler.GeneratedArtifact,
+        mapping: RuntimeJitFunctionMapping,
+        functions: [max_runtime_jit_functions_per_artifact]driver_mod.CUfunction,
+        mode: kernel_jit.Mode,
+        qualified: bool,
+    ) bool {
+        if (!mode.activates() or !artifact.production_enabled or !qualified) return true;
+        var routes = self.runtime_jit_routes;
+        if (!routes.enableArtifact(artifact)) return false;
+        for (0..mapping.count) |index| {
+            _ = mapping.slots[index] orelse return false;
+            if (functions[index] == null) return false;
+        }
+        for (0..mapping.count) |index| mapping.slots[index].?.* = functions[index];
+        self.runtime_jit_routes = routes;
+        return true;
+    }
+
+    pub fn loadWithKernelJit(
+        ctx: *context_mod.CudaContext,
+        allocator: std.mem.Allocator,
+        config: kernel_jit.Config,
+    ) !KernelModule {
+        return loadWithKernelJitAndLoadContext(ctx, allocator, config, .dynamic);
+    }
+
+    pub fn loadWithKernelJitAndLoadContext(
+        ctx: *context_mod.CudaContext,
+        allocator: std.mem.Allocator,
+        config: kernel_jit.Config,
+        load_context: kernel_jit.LoadContext,
+    ) !KernelModule {
+        return loadWithKernelJitScopedAndLoadContext(
+            ctx,
+            allocator,
+            config,
+            .{},
+            null,
+            load_context,
+        );
+    }
+
+    pub fn loadWithKernelJitForScope(
+        ctx: *context_mod.CudaContext,
+        allocator: std.mem.Allocator,
+        config: kernel_jit.Config,
+        profile: JitModelProfile,
+        scope: JitRouteScope,
+    ) !KernelModule {
+        return loadWithKernelJitForScopeAndLoadContext(
+            ctx,
+            allocator,
+            config,
+            profile,
+            scope,
+            .dynamic,
+        );
+    }
+
+    pub fn loadWithKernelJitForScopeAndLoadContext(
+        ctx: *context_mod.CudaContext,
+        allocator: std.mem.Allocator,
+        config: kernel_jit.Config,
+        profile: JitModelProfile,
+        scope: JitRouteScope,
+        load_context: kernel_jit.LoadContext,
+    ) !KernelModule {
+        try config.validate();
+        if (config.mode.failClosed() and !scope.enabled()) {
+            std.log.warn(
+                "CUDA runtime JIT required mode found zero eligible production routes for profile {s}",
+                .{@tagName(profile)},
+            );
+            return error.CudaJitRequiredRouteFailed;
+        }
+        if (!scope.conformance_complete) {
+            if (config.mode.failClosed()) return error.CudaJitRequiredRouteFailed;
+            std.log.warn(
+                "CUDA runtime JIT model scope exceeds bounded conformance capacity; oversized or excess shapes keep bundled fallback",
+                .{},
+            );
+        }
+        const allowed = JitRouteScope.forObservedRoutes(profile, scope.production);
+        if (!scope.production.eql(allowed.production) or
+            scope.observed_shape_count > scope.observed_shapes.len or
+            scope.prefill_shape_count > scope.prefill_shapes.len or
+            scope.pair_shape_count > scope.pair_shapes.len)
+        {
+            return error.InvalidCudaJitRouteScope;
+        }
+        return loadWithKernelJitScopedAndLoadContext(
+            ctx,
+            allocator,
+            config,
+            scope,
+            RuntimeJitQualifier.live(),
+            load_context,
+        );
+    }
+
+    pub fn loadWithKernelJitScoped(
+        ctx: *context_mod.CudaContext,
+        allocator: std.mem.Allocator,
+        config: kernel_jit.Config,
+        scope: JitRouteScope,
+        qualifier: ?RuntimeJitQualifier,
+    ) !KernelModule {
+        return loadWithKernelJitScopedAndLoadContext(
+            ctx,
+            allocator,
+            config,
+            scope,
+            qualifier,
+            .dynamic,
+        );
+    }
+
+    pub fn loadWithKernelJitScopedAndLoadContext(
+        ctx: *context_mod.CudaContext,
+        allocator: std.mem.Allocator,
+        config: kernel_jit.Config,
+        scope: JitRouteScope,
+        qualifier: ?RuntimeJitQualifier,
+        load_context: kernel_jit.LoadContext,
+    ) !KernelModule {
+        try config.validate();
+        switch (runtimeJitLoadDisposition(config.mode, scope, load_context)) {
+            .reject_required => return error.CudaJitRequiredRouteFailed,
+            .bundled => {
+                var fallback = try KernelModule.load(ctx);
+                if (config.mode.compiles() and scope.enabled()) {
+                    fallback.runtime_jit_pending_routes = scope.production;
+                    fallback.runtime_jit_stats.skipped_dynamic = true;
+                }
+                return fallback;
+            },
+            .qualify => {},
+        }
+        var control = RuntimeJitWorkControl.foreground(config);
+        return loadWithKernelJitScopedControlled(
+            ctx,
+            allocator,
+            config,
+            scope,
+            qualifier,
+            &control,
+        );
+    }
+
+    fn loadWithKernelJitScopedControlled(
+        ctx: *context_mod.CudaContext,
+        allocator: std.mem.Allocator,
+        config: kernel_jit.Config,
+        scope: JitRouteScope,
+        qualifier: ?RuntimeJitQualifier,
+        control: ?*RuntimeJitWorkControl,
+    ) !KernelModule {
+        try config.validate();
+        var result = try KernelModule.load(ctx);
+        errdefer result.unload(ctx);
+        if (!config.mode.compiles() or !scope.enabled()) return result;
+        result.runtime_jit_pending_routes = scope.production;
+        result.loadRuntimeJit(ctx, allocator, config, scope, qualifier, control) catch |err| {
+            try handleRuntimeJitLoadFailure(config.mode, err);
+        };
+        return result;
+    }
+
+    fn loadRuntimeJit(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        allocator: std.mem.Allocator,
+        config: kernel_jit.Config,
+        scope: JitRouteScope,
+        qualifier: ?RuntimeJitQualifier,
+        control: ?*RuntimeJitWorkControl,
+    ) !void {
+        const mode = config.mode;
+        const sync_started_ns = runtimeJitMonotonicNowNs();
+        defer {
+            const finished_ns = runtimeJitMonotonicNowNs();
+            if (sync_started_ns != 0 and finished_ns >= sync_started_ns) {
+                self.runtime_jit_stats.sync_elapsed_ms =
+                    (finished_ns - sync_started_ns) / std.time.ns_per_ms;
+            }
+        }
+        if (!try lockRuntimeJitProcess(control)) {
+            self.runtime_jit_stats.budget_reached = true;
+            std.log.warn(
+                "CUDA runtime JIT {s} preload budget exhausted while waiting for process-wide qualification; remaining routes keep bundled fallback",
+                .{@tagName(mode)},
+            );
+            if (mode.failClosed()) return error.CudaJitRequiredRouteFailed;
+            return;
+        }
+        defer runtime_jit_process_mutex.unlock();
+        const major = std.math.cast(u8, ctx.info.compute_major) orelse return error.InvalidCudaJitComputeCapability;
+        const minor = std.math.cast(u8, ctx.info.compute_minor) orelse return error.InvalidCudaJitComputeCapability;
+        const capability: nvrtc_mod.ComputeCapability = .{ .major = major, .minor = minor };
+        var compiler = try nvrtc_mod.Nvrtc.open();
+        defer compiler.deinit();
+
+        const cache_path = try config.resolveCacheDir(allocator, platform.env.getenv("HOME"));
+        defer if (cache_path) |path| allocator.free(path);
+        var cache: ?kernel_jit.ArtifactCache = null;
+        defer if (cache) |*value| value.deinit();
+        if (cache_path) |path| {
+            cache = kernel_jit.ArtifactCache.initPath(
+                allocator,
+                io_compat.io(),
+                path,
+                try config.maxCacheBytes(),
+            ) catch |err| blk: {
+                handleRuntimeJitCacheFailure("initialization", @errorName(err));
+                break :blk null;
+            };
+        }
+
+        var target_buffer: [32]u8 = undefined;
+        const target_identity = std.fmt.bufPrint(&target_buffer, "sm_{d}{d}", .{ major, minor }) catch
+            return error.InvalidCudaJitCacheIdentity;
+        var device_buffer: [320]u8 = undefined;
+        const device_identity = std.fmt.bufPrint(
+            &device_buffer,
+            "{s}/driver-{d}",
+            .{ ctx.info.nameSlice(), ctx.info.driver_version },
+        ) catch return error.InvalidCudaJitCacheIdentity;
+        var compiler_buffer: [32]u8 = undefined;
+        const compiler_identity = std.fmt.bufPrint(
+            &compiler_buffer,
+            "nvrtc/{d}.{d}",
+            .{ compiler.version_major, compiler.version_minor },
+        ) catch return error.InvalidCudaJitCacheIdentity;
+        var option_buffer: [48]u8 = undefined;
+        const compiler_options = try capability.option(&option_buffer);
+        const bundled_image_sha256 = cudaBundledImageSha256Hex();
+
+        artifact_loop: for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+            if (artifact.backend != .cuda or !scope.includesArtifact(artifact)) continue;
+            if (control) |value| {
+                if (value.deadlineReached()) {
+                    self.runtime_jit_stats.budget_reached = true;
+                    std.log.warn(
+                        "CUDA runtime JIT {s} preload budget exhausted before {s}; remaining routes keep bundled fallback",
+                        .{ @tagName(mode), artifact.kernel_id },
+                    );
+                    if (mode.failClosed()) return error.CudaJitRequiredRouteFailed;
+                    return;
+                }
+            }
+            const required_route = scope.includesArtifact(artifact);
+            const qualification_scopes = RuntimeJitQualificationScopes.forArtifact(artifact, scope);
+            if (qualification_scopes.count == 0) {
+                std.log.warn(
+                    "CUDA runtime JIT has no bounded qualification shapes for {s}; dispatch keeps bundled fallback",
+                    .{artifact.kernel_id},
+                );
+                if (mode.failClosed()) return error.CudaJitRequiredRouteFailed;
+                continue;
+            }
+            const emitted = quant_kernel_compiler.emitRuntimeArtifactSource(allocator, artifact) catch |err| {
+                try handleRuntimeJitFailure(mode, required_route, artifact, "source emission", @errorName(err), "");
+                continue;
+            };
+            defer emitted.deinit(allocator);
+            const mapping = self.generatedFunctionMapping(artifact) orelse {
+                try handleRuntimeJitFailure(mode, required_route, artifact, "field mapping", "missing generated-function bundle", "");
+                continue;
+            };
+
+            const compile_key = runtimeJitCompileKey(
+                artifact,
+                emitted.data,
+                target_identity,
+                compiler_identity,
+                compiler_options,
+            );
+            var cached_ptx = loadRuntimeJitCachedPtx(if (cache) |*value| value else null, compile_key) catch |err| blk: {
+                handleRuntimeJitCacheFailure("load", @errorName(err));
+                break :blk null;
+            };
+            defer if (cached_ptx) |ptx| allocator.free(ptx);
+            if (cached_ptx) |ptx| {
+                if (!validRuntimeJitPtx(ptx)) {
+                    allocator.free(ptx);
+                    cached_ptx = null;
+                    handleRuntimeJitCacheFailure("validation", "invalid cached PTX");
+                }
+            }
+
+            const kernel_name = allocator.dupeZ(u8, artifact.kernel_id) catch |err| {
+                try handleRuntimeJitFailure(mode, required_route, artifact, "kernel name allocation", @errorName(err), "");
+                continue;
+            };
+            defer allocator.free(kernel_name);
+            var compilation: ?nvrtc_mod.Compilation = null;
+            defer if (compilation) |*value| value.deinit(allocator);
+            const ptx = cached_ptx orelse blk: {
+                compilation = compiler.compile(
+                    allocator,
+                    kernel_name,
+                    emitted.data,
+                    capability,
+                    &.{},
+                ) catch |err| {
+                    try handleRuntimeJitFailure(mode, required_route, artifact, "NVRTC invocation", @errorName(err), "");
+                    continue;
+                };
+                if (!compilation.?.succeeded()) {
+                    try handleRuntimeJitFailure(
+                        mode,
+                        required_route,
+                        artifact,
+                        "NVRTC compilation",
+                        compilation.?.message,
+                        compilation.?.log,
+                    );
+                    continue;
+                }
+                self.runtime_jit_stats.compiled += 1;
+                const compiled_ptx = compilation.?.ptx.?;
+                if (cache) |*value| {
+                    value.store(.cuda_ptx, compile_key, compiled_ptx) catch |err| {
+                        handleRuntimeJitCacheFailure("store", @errorName(err));
+                    };
+                }
+                break :blk compiled_ptx;
+            };
+            const candidate_ptx_sha256 = runtimeJitSha256(ptx);
+
+            var module: driver_mod.CUmodule = null;
+            loadPtxModuleWithJitLog(ctx, &module, ptx, artifact.kernel_id) catch |err| {
+                try handleRuntimeJitFailure(mode, required_route, artifact, "PTX module load", @errorName(err), "");
+                continue;
+            };
+            var functions = [_]driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact;
+            var all_symbols_resolved = true;
+            for (0..mapping.count) |index| {
+                const symbol_name = allocator.dupeZ(u8, mapping.names[index]) catch |err| {
+                    _ = ctx.driver.fns.cuModuleUnload(module);
+                    try handleRuntimeJitFailure(mode, required_route, artifact, "symbol name allocation", @errorName(err), "");
+                    all_symbols_resolved = false;
+                    break;
+                };
+                defer allocator.free(symbol_name);
+                const symbol_status = ctx.driver.fns.cuModuleGetFunction(
+                    &functions[index],
+                    module,
+                    symbol_name.ptr,
+                );
+                if (symbol_status != driver_mod.CUDA_SUCCESS or functions[index] == null) {
+                    _ = ctx.driver.fns.cuModuleUnload(module);
+                    std.log.warn(
+                        "CUDA runtime JIT required symbol {s} is unavailable in {s}",
+                        .{ mapping.names[index], artifact.kernel_id },
+                    );
+                    try handleRuntimeJitFailure(
+                        mode,
+                        required_route,
+                        artifact,
+                        "symbol resolution",
+                        ctx.driver.errorName(symbol_status),
+                        ctx.driver.errorString(symbol_status),
+                    );
+                    all_symbols_resolved = false;
+                    break;
+                }
+            }
+            if (!all_symbols_resolved) continue;
+            var any_qualified = false;
+            var all_qualified = qualification_scopes.complete;
+            var qualified_scope = JitRouteScope{};
+            qualification_loop: for (qualification_scopes.scopes[0..qualification_scopes.count]) |qualification_scope| {
+                if (control) |value| {
+                    if (value.deadlineReached()) {
+                        _ = ctx.driver.fns.cuModuleUnload(module);
+                        self.runtime_jit_stats.budget_reached = true;
+                        std.log.warn(
+                            "CUDA runtime JIT {s} preload budget exhausted while qualifying {s}; remaining shapes keep bundled fallback",
+                            .{ @tagName(mode), artifact.kernel_id },
+                        );
+                        if (mode.failClosed()) return error.CudaJitRequiredRouteFailed;
+                        return;
+                    }
+                }
+                const qualification_key = runtimeJitQualificationKey(
+                    artifact,
+                    qualification_scope,
+                    compile_key,
+                    candidate_ptx_sha256,
+                    &bundled_image_sha256,
+                    device_identity,
+                );
+                const cached_qualification = loadRuntimeJitQualification(
+                    allocator,
+                    if (cache) |*value| value else null,
+                    qualification_key,
+                    artifact,
+                );
+                if (cached_qualification != null) {
+                    self.runtime_jit_stats.qualification_cache_hits += 1;
+                    runtime_jit_rejections.clear(qualification_key);
+                } else {
+                    self.runtime_jit_stats.qualification_cache_misses += 1;
+                }
+                if (cached_qualification == null and
+                    runtime_jit_rejections.activeAt(qualification_key, runtimeJitMonotonicNowNs()))
+                {
+                    self.runtime_jit_stats.quarantined += 1;
+                    all_qualified = false;
+                    std.log.warn(
+                        "CUDA runtime JIT qualification for {s} shape is quarantined after a recent rejection",
+                        .{artifact.kernel_id},
+                    );
+                    if (mode.failClosed()) {
+                        _ = ctx.driver.fns.cuModuleUnload(module);
+                        return error.CudaJitRequiredRouteFailed;
+                    }
+                    continue :qualification_loop;
+                }
+                const qualification = resolveRuntimeJitQualification(
+                    mode,
+                    required_route,
+                    cached_qualification,
+                    qualifier,
+                    .{
+                        .allocator = allocator,
+                        .ctx = ctx,
+                        .module = self,
+                        .artifact = artifact,
+                        .candidate_functions = functions,
+                        .scope = qualification_scope,
+                        .cancellation = if (control) |value| value.cancellation() else null,
+                    },
+                ) catch |err| {
+                    if (control) |value| {
+                        if (value.deadlineReached()) {
+                            _ = ctx.driver.fns.cuModuleUnload(module);
+                            self.runtime_jit_stats.budget_reached = true;
+                            std.log.warn(
+                                "CUDA runtime JIT {s} preload budget exhausted while qualifying {s}; remaining shapes keep bundled fallback",
+                                .{ @tagName(mode), artifact.kernel_id },
+                            );
+                            if (mode.failClosed()) return error.CudaJitRequiredRouteFailed;
+                            return;
+                        }
+                    }
+                    self.runtime_jit_stats.rejected += 1;
+                    all_qualified = false;
+                    handleRuntimeJitFailure(
+                        mode,
+                        required_route,
+                        artifact,
+                        "live qualification",
+                        @errorName(err),
+                        "",
+                    ) catch |failure| {
+                        _ = ctx.driver.fns.cuModuleUnload(module);
+                        return failure;
+                    };
+                    continue :qualification_loop;
+                };
+                if (qualification.measured_live) {
+                    if (qualification.record) |record| {
+                        runtime_jit_rejections.clear(qualification_key);
+                        if (cache) |*value| {
+                            if (record.encode()) |encoded| {
+                                value.store(.qualification, qualification_key, &encoded) catch |err| {
+                                    handleRuntimeJitCacheFailure("qualification store", @errorName(err));
+                                };
+                            } else |err| {
+                                handleRuntimeJitCacheFailure("qualification encode", @errorName(err));
+                            }
+                        }
+                    } else {
+                        runtime_jit_rejections.rememberAt(qualification_key, runtimeJitMonotonicNowNs());
+                    }
+                }
+                if (qualification.record != null) {
+                    any_qualified = true;
+                    self.runtime_jit_stats.qualified += 1;
+                    qualified_scope.mergeQualified(qualification_scope);
+                } else {
+                    all_qualified = false;
+                    if (qualification.measured_live) self.runtime_jit_stats.rejected += 1;
+                    std.log.warn(
+                        "CUDA runtime JIT route {s} shape lacks qualifying live evidence; that shape keeps bundled fallback",
+                        .{artifact.kernel_id},
+                    );
+                    if (mode.failClosed()) {
+                        _ = ctx.driver.fns.cuModuleUnload(module);
+                        return error.CudaJitRequiredRouteUnqualified;
+                    }
+                }
+            }
+            if (all_qualified) _ = self.runtime_jit_pending_routes.disableArtifact(artifact);
+            const activate = shouldActivateRuntimeJitArtifact(artifact, mode, required_route, any_qualified) catch |err| {
+                _ = ctx.driver.fns.cuModuleUnload(module);
+                return err;
+            };
+            if (!activate) {
+                _ = ctx.driver.fns.cuModuleUnload(module);
+                continue :artifact_loop;
+            }
+            self.retainRuntimeJitModule(module) catch |err| {
+                _ = ctx.driver.fns.cuModuleUnload(module);
+                try handleRuntimeJitFailure(mode, required_route, artifact, "module retention", @errorName(err), "");
+                continue;
+            };
+            if (!self.installRuntimeJitFunctions(artifact, mapping, functions, mode, any_qualified)) {
+                const retained = self.popRuntimeJitModule().?;
+                _ = ctx.driver.fns.cuModuleUnload(retained);
+                try handleRuntimeJitFailure(mode, required_route, artifact, "route activation", "missing production gate mapping", "");
+                continue;
+            }
+            self.runtime_jit_qualified_scope.mergeQualified(qualified_scope);
+            self.runtime_jit_stats.active += 1;
+        }
+        try ensureRuntimeJitRequiredComplete(mode, self.runtime_jit_pending_routes);
+    }
+
     pub fn load(ctx: *context_mod.CudaContext) driver_mod.Error!KernelModule {
         try ctx.makeCurrent();
         var module: driver_mod.CUmodule = null;
@@ -369,6 +1896,7 @@ pub const KernelModule = struct {
         const copy_f32 = loadOptionalFunction(ctx, module, "termite_copy_f32");
         const copy_u8 = loadOptionalFunction(ctx, module, "termite_copy_u8");
         const f32_to_bf16 = loadOptionalFunction(ctx, module, "termite_f32_to_bf16");
+        const f32_to_f16 = loadOptionalFunction(ctx, module, "termite_f32_to_f16");
         const dequant_q4_0_bf16 = loadOptionalFunction(ctx, module, "termite_dequant_q4_0_bf16");
         var scale_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&scale_f32, module, "termite_scale_f32"));
@@ -384,6 +1912,7 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_f32, module, "termite_linear_f32"));
         const linear_f32_tiled = loadOptionalFunction(ctx, module, "termite_linear_f32_tiled");
         const linear_bf16_weight_f32_tiled = loadOptionalFunction(ctx, module, "termite_linear_bf16_weight_f32_tiled");
+        const linear_f16_weight_f32_tiled = loadOptionalFunction(ctx, module, "termite_linear_f16_weight_f32_tiled");
         var argmax_last_row_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&argmax_last_row_f32, module, "termite_argmax_last_row_f32"));
         const argmax_rows_f32 = loadOptionalFunction(ctx, module, "termite_argmax_rows_f32");
@@ -395,12 +1924,27 @@ pub const KernelModule = struct {
         const linear_q8_0_argmax_rows_stage1_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_argmax_rows_stage1_tile4");
         const linear_q4_0_argmax_rows_stage1_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_argmax_rows_stage1_tile4");
         const linear_q4_0_argmax_rows_stage1_tile16 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_argmax_rows_stage1_tile16");
+        const linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b = loadOptionalFunction(
+            ctx,
+            module,
+            quant_kernel_compiler.first_e2b_cuda_q4_0_q8_1_argmax_kernel_id,
+        );
         const linear_q4_k_argmax_rows_stage1_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_argmax_rows_stage1_tile4");
         const linear_q6_k_argmax_rows_stage1_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_argmax_rows_stage1_tile4");
         const linear_q6_k_argmax_rows_stage1_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_argmax_rows_stage1_tile8");
         const linear_q6_k_argmax_rows_stage1_tile16 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_argmax_rows_stage1_tile16");
         const linear_q6_k_q8_1_argmax_rows_stage1_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8");
         const linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b = loadOptionalFunction(ctx, module, "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b");
+        const linear_q6_k_q8_1_argmax_generated_k2560 = loadOptionalFunction(
+            ctx,
+            module,
+            quant_kernel_compiler.first_cuda_q6_k_q8_1_argmax_k2560_kernel_id,
+        );
+        const linear_q6_k_q8_1_argmax_generated_k3840 = loadOptionalFunction(
+            ctx,
+            module,
+            quant_kernel_compiler.first_cuda_q6_k_q8_1_argmax_k3840_kernel_id,
+        );
         const linear_q6_k_q8_1_f32_tile8_e4b = loadOptionalFunction(ctx, module, "termite_linear_q6_k_q8_1_f32_tile8_e4b");
         const argmax_reduce_rows_pairs_f32 = loadOptionalFunction(ctx, module, "termite_argmax_reduce_rows_pairs_f32");
         const argmax_reduce_rows_pairs_f32_w16 = loadOptionalFunction(ctx, module, "termite_argmax_reduce_rows_pairs_f32_w16");
@@ -417,6 +1961,9 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_bias_f32, module, "termite_linear_bias_f32"));
         var add_bias_rows_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&add_bias_rows_f32, module, "termite_add_bias_rows_f32"));
+        // Optional: absent from CUDA artifact bundles that predate the FP16
+        // GLiNER2 epilogue; callers decline the fused route instead.
+        const add_bias_relu_rows_f32 = loadOptionalFunction(ctx, module, "termite_add_bias_relu_rows_f32");
         var linear_bias_f32_tile4_r2: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_bias_f32_tile4_r2, module, "termite_linear_bias_f32_tile4_r2"));
         var linear_bias_relu_f32_tile4_r2: driver_mod.CUfunction = null;
@@ -454,8 +2001,10 @@ pub const KernelModule = struct {
         var embedding_lookup_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_f32, module, "termite_embedding_lookup_f32"));
         const embedding_lookup_bf16_weight_f32 = loadOptionalFunction(ctx, module, "termite_embedding_lookup_bf16_weight_f32");
+        const embedding_lookup_f16_weight_f32 = loadOptionalFunction(ctx, module, "termite_embedding_lookup_f16_weight_f32");
         var embedding_lookup_i32_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_i32_f32, module, "termite_embedding_lookup_i32_f32"));
+        const embedding_lookup_i32_f16_weight_f32 = loadOptionalFunction(ctx, module, "termite_embedding_lookup_i32_f16_weight_f32");
         var take_rows_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&take_rows_f32, module, "termite_take_rows_f32"));
         const gliner_gather_concat_relu_f32 = loadOptionalFunction(ctx, module, "termite_gliner_gather_concat_relu_f32");
@@ -473,6 +2022,10 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32, module, "termite_attention_f32"));
         var attention_f32_block: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32_block, module, "termite_attention_f32_block"));
+        const attention_f32_bert_prefill_s256_hd64 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64");
+        const attention_f32_bert_prefill_s256_hd64_q8 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64_q8");
+        const attention_f32_bert_prefill_s256_hd64_q16 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64_q16");
+        const attention_f32_bert_prefill_s256_hd64_mma = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64_mma");
         const cross_attention_f32 = loadOptionalFunction(ctx, module, "termite_cross_attention_f32");
         const cross_attention_q1_f32 = loadOptionalFunction(ctx, module, "termite_cross_attention_q1_f32");
         const token_to_nchw_f32 = loadOptionalFunction(ctx, module, "termite_token_to_nchw_f32");
@@ -495,6 +2048,54 @@ pub const KernelModule = struct {
         const gqa_attention_decode_scalars_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_scalars_fast_f32");
         const gqa_attention_prefill_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_fast_f32");
         const gqa_attention_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_scalars_f32");
+        const gqa_attention_decode_scalars_generated_hd256_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_serial_kernel_id);
+        const gqa_attention_decode_split_kv_hd256_stage1_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_stage1_kernel_id);
+        const gqa_attention_decode_split_kv_hd256_stage2_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_stage2_kernel_id);
+        const gqa_attention_decode_scalars_generated_hd512_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_serial_kernel_id);
+        const gqa_attention_decode_split_kv_hd512_stage1_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_stage1_kernel_id);
+        const gqa_attention_decode_split_kv_hd512_stage2_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_stage2_kernel_id);
+        const gqa_attention_decode_split2_kv_hd256_stage1_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_split2_stage1_kernel_id);
+        const gqa_attention_decode_split2_kv_hd256_stage2_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_split2_stage2_kernel_id);
+        const gqa_attention_decode_split2_kv_hd512_stage1_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_split2_stage1_kernel_id);
+        const gqa_attention_decode_split2_kv_hd512_stage2_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_split2_stage2_kernel_id);
+        const gqa_attention_decode_split4_kv_hd256_stage1_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_split4_stage1_kernel_id);
+        const gqa_attention_decode_split4_kv_hd256_stage2_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_split4_stage2_kernel_id);
+        const gqa_attention_decode_split4_kv_hd512_stage1_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_split4_stage1_kernel_id);
+        const gqa_attention_decode_split4_kv_hd512_stage2_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_split4_stage2_kernel_id);
+        const gqa_attention_decode_score_prework_hd256_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_score_prework_kernel_id);
+        const gqa_attention_decode_score_prework_consume_hd256_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_score_prework_serial_kernel_id);
+        const gqa_attention_decode_score_prework_hd512_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_score_prework_kernel_id);
+        const gqa_attention_decode_score_prework_consume_hd512_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_score_prework_serial_kernel_id);
+        const generated_split_functions_available = switch (generatedGqaDecodeSplitVariant()) {
+            .split2 => gqa_attention_decode_split2_kv_hd256_stage1_f32 != null and
+                gqa_attention_decode_split2_kv_hd256_stage2_f32 != null and
+                gqa_attention_decode_split2_kv_hd512_stage1_f32 != null and
+                gqa_attention_decode_split2_kv_hd512_stage2_f32 != null,
+            .split4 => gqa_attention_decode_split4_kv_hd256_stage1_f32 != null and
+                gqa_attention_decode_split4_kv_hd256_stage2_f32 != null and
+                gqa_attention_decode_split4_kv_hd512_stage1_f32 != null and
+                gqa_attention_decode_split4_kv_hd512_stage2_f32 != null,
+            .split8 => gqa_attention_decode_split_kv_hd256_stage1_f32 != null and
+                gqa_attention_decode_split_kv_hd256_stage2_f32 != null and
+                gqa_attention_decode_split_kv_hd512_stage1_f32 != null and
+                gqa_attention_decode_split_kv_hd512_stage2_f32 != null,
+            .score_prework => false,
+        };
+        if (generatedGqaDecodeEnabled() and
+            (gqa_attention_decode_scalars_generated_hd256_f32 == null or
+                gqa_attention_decode_scalars_generated_hd512_f32 == null or
+                !generated_split_functions_available))
+        {
+            return error.CudaKernelUnavailable;
+        }
+        if (generatedGqaScorePreworkEnabled() and
+            (gqa_attention_decode_score_prework_hd256_f32 == null or
+                gqa_attention_decode_score_prework_consume_hd256_f32 == null or
+                gqa_attention_decode_score_prework_hd512_f32 == null or
+                gqa_attention_decode_score_prework_consume_hd512_f32 == null))
+        {
+            return error.CudaKernelUnavailable;
+        }
         const kv_write_suffix_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_kv_write_suffix_decode_scalars_f32");
         const gqa_attention_decode_turboquant_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_fast_f32");
         const gqa_attention_prefill_turboquant_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_turboquant_fast_f32");
@@ -508,6 +2109,13 @@ pub const KernelModule = struct {
         const kv_write_suffix_turboquant_f32 = loadOptionalFunction(ctx, module, "termite_kv_write_suffix_turboquant_f32");
         var deberta_attention_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&deberta_attention_f32, module, "termite_deberta_attention_f32"));
+        const deberta_attention_fused_f32 = loadOptionalFunction(ctx, module, "termite_deberta_attention_fused_f32");
+        const deberta_attention_stream_f16 = loadOptionalFunction(ctx, module, "termite_deberta_attention_stream_f16");
+        const deberta_attention_tc_f16_m16n32 = loadOptionalFunction(ctx, module, "termite_deberta_attention_tc_f16_m16n32");
+        const deberta_attention_tc_f16_m32n16 = loadOptionalFunction(ctx, module, "termite_deberta_attention_tc_f16_m32n16");
+        const deberta_pack_heads_f16 = loadOptionalFunction(ctx, module, "termite_deberta_pack_heads_f16");
+        const deberta_scores_softmax_f32 = loadOptionalFunction(ctx, module, "termite_deberta_scores_softmax_f32");
+        const deberta_unpack_heads_f32 = loadOptionalFunction(ctx, module, "termite_deberta_unpack_heads_f32");
         var split_last_dim3_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&split_last_dim3_f32, module, "termite_split_last_dim3_f32"));
         var linear_q8_0_f32: driver_mod.CUfunction = null;
@@ -545,6 +2153,19 @@ pub const KernelModule = struct {
         } else {
             try ctx.driver.check(q4_result);
         }
+        const linear_q4_0_generated_mmv = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_general_cuda_q4_0_mmv_kernel_id);
+        const linear_q4_0_generated_mm = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_general_cuda_q4_0_mm_kernel_id);
+        const linear_q4_0_generated_pair = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_general_cuda_q4_0_pair_kernel_id);
+        const linear_q4_0_generated_pair_q8 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_general_cuda_q4_0_pair_q8_kernel_id);
+        const linear_q4_0_generated_down_q8 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_general_cuda_q4_0_down_q8_kernel_id);
+        const linear_q4_0_generated_pair_q8_e2b_6144 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_pair_q8_6144_kernel_id);
+        const linear_q4_0_generated_pair_q8_e2b_12288 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_pair_q8_12288_kernel_id);
+        const linear_q4_0_generated_down_q8_e2b_6144 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_down_q8_6144_kernel_id);
+        const linear_q4_0_generated_down_q8_e2b_12288 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_down_q8_12288_kernel_id);
+        const linear_q4_0_generated_pair_f32_e2b_6144_exact = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_pair_f32_6144_exact_kernel_id);
+        const linear_q4_0_generated_pair_f32_e2b_12288_exact = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_pair_f32_12288_exact_kernel_id);
+        const linear_q4_0_generated_down_f32_e2b_6144_exact = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_down_f32_6144_exact_kernel_id);
+        const linear_q4_0_generated_down_f32_e2b_12288_exact = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_down_f32_12288_exact_kernel_id);
         const linear_q4_0_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_f32_tile4");
         const linear_q4_0_f32_tile4_w4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_f32_tile4_w4");
         const linear_q4_0_q8_1_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4");
@@ -678,12 +2299,19 @@ pub const KernelModule = struct {
         var slice_last_dim_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&slice_last_dim_f32, module, "termite_slice_last_dim_f32"));
 
+        // Reserve the fixed split-KV workspace for every CUDA module. Keeping
+        // this allocation independent of the candidate gate makes baseline
+        // and generated-attention runs share the same allocation layout.
+        var gqa_attention_generated_workspace = try buffer_mod.DeviceBuffer.alloc(ctx, generatedGqaDecodeWorkspaceBytes());
+        errdefer gqa_attention_generated_workspace.free(ctx);
+
         return .{
             .module = module,
             .fill_f32 = fill_f32,
             .copy_f32 = copy_f32,
             .copy_u8 = copy_u8,
             .f32_to_bf16 = f32_to_bf16,
+            .f32_to_f16 = f32_to_f16,
             .dequant_q4_0_bf16 = dequant_q4_0_bf16,
             .scale_f32 = scale_f32,
             .add_scalar_f32 = add_scalar_f32,
@@ -693,6 +2321,7 @@ pub const KernelModule = struct {
             .linear_f32 = linear_f32,
             .linear_f32_tiled = linear_f32_tiled,
             .linear_bf16_weight_f32_tiled = linear_bf16_weight_f32_tiled,
+            .linear_f16_weight_f32_tiled = linear_f16_weight_f32_tiled,
             .argmax_last_row_f32 = argmax_last_row_f32,
             .argmax_rows_f32 = argmax_rows_f32,
             .argmax_rows_suppress_f32 = argmax_rows_suppress_f32,
@@ -703,12 +2332,15 @@ pub const KernelModule = struct {
             .linear_q8_0_argmax_rows_stage1_tile4 = linear_q8_0_argmax_rows_stage1_tile4,
             .linear_q4_0_argmax_rows_stage1_tile4 = linear_q4_0_argmax_rows_stage1_tile4,
             .linear_q4_0_argmax_rows_stage1_tile16 = linear_q4_0_argmax_rows_stage1_tile16,
+            .linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b = linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b,
             .linear_q4_k_argmax_rows_stage1_tile4 = linear_q4_k_argmax_rows_stage1_tile4,
             .linear_q6_k_argmax_rows_stage1_tile4 = linear_q6_k_argmax_rows_stage1_tile4,
             .linear_q6_k_argmax_rows_stage1_tile8 = linear_q6_k_argmax_rows_stage1_tile8,
             .linear_q6_k_argmax_rows_stage1_tile16 = linear_q6_k_argmax_rows_stage1_tile16,
             .linear_q6_k_q8_1_argmax_rows_stage1_tile8 = linear_q6_k_q8_1_argmax_rows_stage1_tile8,
             .linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b = linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b,
+            .linear_q6_k_q8_1_argmax_generated_k2560 = linear_q6_k_q8_1_argmax_generated_k2560,
+            .linear_q6_k_q8_1_argmax_generated_k3840 = linear_q6_k_q8_1_argmax_generated_k3840,
             .linear_q6_k_q8_1_f32_tile8_e4b = linear_q6_k_q8_1_f32_tile8_e4b,
             .argmax_reduce_rows_pairs_f32 = argmax_reduce_rows_pairs_f32,
             .argmax_reduce_rows_pairs_f32_w16 = argmax_reduce_rows_pairs_f32_w16,
@@ -723,6 +2355,7 @@ pub const KernelModule = struct {
             .gemma4_mtp_verify_commit_u32 = gemma4_mtp_verify_commit_u32,
             .linear_bias_f32 = linear_bias_f32,
             .add_bias_rows_f32 = add_bias_rows_f32,
+            .add_bias_relu_rows_f32 = add_bias_relu_rows_f32,
             .linear_bias_f32_tile4_r2 = linear_bias_f32_tile4_r2,
             .linear_bias_relu_f32_tile4_r2 = linear_bias_relu_f32_tile4_r2,
             .linear_bias_gelu_f32_tile4_r2 = linear_bias_gelu_f32_tile4_r2,
@@ -744,7 +2377,9 @@ pub const KernelModule = struct {
             .activation_multiply_slice_last_dim_f32 = activation_multiply_slice_last_dim_f32,
             .embedding_lookup_f32 = embedding_lookup_f32,
             .embedding_lookup_bf16_weight_f32 = embedding_lookup_bf16_weight_f32,
+            .embedding_lookup_f16_weight_f32 = embedding_lookup_f16_weight_f32,
             .embedding_lookup_i32_f32 = embedding_lookup_i32_f32,
+            .embedding_lookup_i32_f16_weight_f32 = embedding_lookup_i32_f16_weight_f32,
             .take_rows_f32 = take_rows_f32,
             .gliner_gather_concat_relu_f32 = gliner_gather_concat_relu_f32,
             .gliner_word_embeddings_f32 = gliner_word_embeddings_f32,
@@ -754,6 +2389,10 @@ pub const KernelModule = struct {
             .conv2d_f32 = conv2d_f32,
             .attention_f32 = attention_f32,
             .attention_f32_block = attention_f32_block,
+            .attention_f32_bert_prefill_s256_hd64 = attention_f32_bert_prefill_s256_hd64,
+            .attention_f32_bert_prefill_s256_hd64_q8 = attention_f32_bert_prefill_s256_hd64_q8,
+            .attention_f32_bert_prefill_s256_hd64_q16 = attention_f32_bert_prefill_s256_hd64_q16,
+            .attention_f32_bert_prefill_s256_hd64_mma = attention_f32_bert_prefill_s256_hd64_mma,
             .cross_attention_f32 = cross_attention_f32,
             .cross_attention_q1_f32 = cross_attention_q1_f32,
             .token_to_nchw_f32 = token_to_nchw_f32,
@@ -776,6 +2415,25 @@ pub const KernelModule = struct {
             .gqa_attention_decode_scalars_fast_f32 = gqa_attention_decode_scalars_fast_f32,
             .gqa_attention_prefill_fast_f32 = gqa_attention_prefill_fast_f32,
             .gqa_attention_decode_scalars_f32 = gqa_attention_decode_scalars_f32,
+            .gqa_attention_decode_scalars_generated_hd256_f32 = gqa_attention_decode_scalars_generated_hd256_f32,
+            .gqa_attention_decode_split_kv_hd256_stage1_f32 = gqa_attention_decode_split_kv_hd256_stage1_f32,
+            .gqa_attention_decode_split_kv_hd256_stage2_f32 = gqa_attention_decode_split_kv_hd256_stage2_f32,
+            .gqa_attention_decode_scalars_generated_hd512_f32 = gqa_attention_decode_scalars_generated_hd512_f32,
+            .gqa_attention_decode_split_kv_hd512_stage1_f32 = gqa_attention_decode_split_kv_hd512_stage1_f32,
+            .gqa_attention_decode_split_kv_hd512_stage2_f32 = gqa_attention_decode_split_kv_hd512_stage2_f32,
+            .gqa_attention_decode_split2_kv_hd256_stage1_f32 = gqa_attention_decode_split2_kv_hd256_stage1_f32,
+            .gqa_attention_decode_split2_kv_hd256_stage2_f32 = gqa_attention_decode_split2_kv_hd256_stage2_f32,
+            .gqa_attention_decode_split2_kv_hd512_stage1_f32 = gqa_attention_decode_split2_kv_hd512_stage1_f32,
+            .gqa_attention_decode_split2_kv_hd512_stage2_f32 = gqa_attention_decode_split2_kv_hd512_stage2_f32,
+            .gqa_attention_decode_split4_kv_hd256_stage1_f32 = gqa_attention_decode_split4_kv_hd256_stage1_f32,
+            .gqa_attention_decode_split4_kv_hd256_stage2_f32 = gqa_attention_decode_split4_kv_hd256_stage2_f32,
+            .gqa_attention_decode_split4_kv_hd512_stage1_f32 = gqa_attention_decode_split4_kv_hd512_stage1_f32,
+            .gqa_attention_decode_split4_kv_hd512_stage2_f32 = gqa_attention_decode_split4_kv_hd512_stage2_f32,
+            .gqa_attention_decode_score_prework_hd256_f32 = gqa_attention_decode_score_prework_hd256_f32,
+            .gqa_attention_decode_score_prework_consume_hd256_f32 = gqa_attention_decode_score_prework_consume_hd256_f32,
+            .gqa_attention_decode_score_prework_hd512_f32 = gqa_attention_decode_score_prework_hd512_f32,
+            .gqa_attention_decode_score_prework_consume_hd512_f32 = gqa_attention_decode_score_prework_consume_hd512_f32,
+            .gqa_attention_generated_workspace = gqa_attention_generated_workspace,
             .kv_write_suffix_decode_scalars_f32 = kv_write_suffix_decode_scalars_f32,
             .gqa_attention_decode_turboquant_fast_f32 = gqa_attention_decode_turboquant_fast_f32,
             .gqa_attention_prefill_turboquant_fast_f32 = gqa_attention_prefill_turboquant_fast_f32,
@@ -788,6 +2446,13 @@ pub const KernelModule = struct {
             .gqa_attention_decode_turboquant_f32 = gqa_attention_decode_turboquant_f32,
             .kv_write_suffix_turboquant_f32 = kv_write_suffix_turboquant_f32,
             .deberta_attention_f32 = deberta_attention_f32,
+            .deberta_attention_fused_f32 = deberta_attention_fused_f32,
+            .deberta_attention_stream_f16 = deberta_attention_stream_f16,
+            .deberta_attention_tc_f16_m16n32 = deberta_attention_tc_f16_m16n32,
+            .deberta_attention_tc_f16_m32n16 = deberta_attention_tc_f16_m32n16,
+            .deberta_pack_heads_f16 = deberta_pack_heads_f16,
+            .deberta_scores_softmax_f32 = deberta_scores_softmax_f32,
+            .deberta_unpack_heads_f32 = deberta_unpack_heads_f32,
             .split_last_dim3_f32 = split_last_dim3_f32,
             .linear_q8_0_f32 = linear_q8_0_f32,
             .linear_q8_0_f32_tile4 = linear_q8_0_f32_tile4,
@@ -811,6 +2476,19 @@ pub const KernelModule = struct {
             .quantize_f32_q8_1_rows = quantize_f32_q8_1_rows,
             .quantize_gated_f32_q8_1_rows = quantize_gated_f32_q8_1_rows,
             .linear_q4_0_f32 = linear_q4_0_f32,
+            .linear_q4_0_generated_mmv = linear_q4_0_generated_mmv,
+            .linear_q4_0_generated_mm = linear_q4_0_generated_mm,
+            .linear_q4_0_generated_pair = linear_q4_0_generated_pair,
+            .linear_q4_0_generated_pair_q8 = linear_q4_0_generated_pair_q8,
+            .linear_q4_0_generated_down_q8 = linear_q4_0_generated_down_q8,
+            .linear_q4_0_generated_pair_q8_e2b_6144 = linear_q4_0_generated_pair_q8_e2b_6144,
+            .linear_q4_0_generated_pair_q8_e2b_12288 = linear_q4_0_generated_pair_q8_e2b_12288,
+            .linear_q4_0_generated_down_q8_e2b_6144 = linear_q4_0_generated_down_q8_e2b_6144,
+            .linear_q4_0_generated_down_q8_e2b_12288 = linear_q4_0_generated_down_q8_e2b_12288,
+            .linear_q4_0_generated_pair_f32_e2b_6144_exact = linear_q4_0_generated_pair_f32_e2b_6144_exact,
+            .linear_q4_0_generated_pair_f32_e2b_12288_exact = linear_q4_0_generated_pair_f32_e2b_12288_exact,
+            .linear_q4_0_generated_down_f32_e2b_6144_exact = linear_q4_0_generated_down_f32_e2b_6144_exact,
+            .linear_q4_0_generated_down_f32_e2b_12288_exact = linear_q4_0_generated_down_f32_e2b_12288_exact,
             .linear_q4_0_f32_tile4 = linear_q4_0_f32_tile4,
             .linear_q4_0_f32_tile4_w4 = linear_q4_0_f32_tile4_w4,
             .linear_q4_0_q8_1_f32_tile4 = linear_q4_0_q8_1_f32_tile4,
@@ -920,12 +2598,27 @@ pub const KernelModule = struct {
     }
 
     pub fn unload(self: *KernelModule, ctx: *context_mod.CudaContext) void {
+        self.gqa_attention_generated_workspace.free(ctx);
+        if (self.runtime_jit_module_count > 0) ctx.makeCurrent() catch {};
+        while (self.popRuntimeJitModule()) |module| {
+            _ = ctx.driver.fns.cuModuleUnload(module);
+        }
+        self.runtime_jit_routes = .{};
+        self.runtime_jit_pending_routes = .{};
+        self.runtime_jit_qualified_scope = .{};
+        self.runtime_jit_stats = .{};
+        for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+            if (artifact.backend != .cuda) continue;
+            const mapping = self.generatedFunctionMapping(artifact) orelse continue;
+            for (0..mapping.count) |index| mapping.slots[index].?.* = null;
+        }
         if (self.module != null) {
             ctx.makeCurrent() catch {};
             _ = ctx.driver.fns.cuModuleUnload(self.module);
             self.module = null;
             self.fill_f32 = null;
             self.f32_to_bf16 = null;
+            self.f32_to_f16 = null;
             self.dequant_q4_0_bf16 = null;
             self.scale_f32 = null;
             self.add_scalar_f32 = null;
@@ -935,6 +2628,7 @@ pub const KernelModule = struct {
             self.linear_f32 = null;
             self.linear_f32_tiled = null;
             self.linear_bf16_weight_f32_tiled = null;
+            self.linear_f16_weight_f32_tiled = null;
             self.argmax_last_row_f32 = null;
             self.argmax_rows_f32 = null;
             self.argmax_rows_suppress_f32 = null;
@@ -945,12 +2639,15 @@ pub const KernelModule = struct {
             self.linear_q8_0_argmax_rows_stage1_tile4 = null;
             self.linear_q4_0_argmax_rows_stage1_tile4 = null;
             self.linear_q4_0_argmax_rows_stage1_tile16 = null;
+            self.linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b = null;
             self.linear_q4_k_argmax_rows_stage1_tile4 = null;
             self.linear_q6_k_argmax_rows_stage1_tile4 = null;
             self.linear_q6_k_argmax_rows_stage1_tile8 = null;
             self.linear_q6_k_argmax_rows_stage1_tile16 = null;
             self.linear_q6_k_q8_1_argmax_rows_stage1_tile8 = null;
             self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b = null;
+            self.linear_q6_k_q8_1_argmax_generated_k2560 = null;
+            self.linear_q6_k_q8_1_argmax_generated_k3840 = null;
             self.linear_q6_k_q8_1_f32_tile8_e4b = null;
             self.argmax_reduce_rows_pairs_f32 = null;
             self.argmax_reduce_rows_pairs_f32_w16 = null;
@@ -965,6 +2662,7 @@ pub const KernelModule = struct {
             self.gemma4_mtp_verify_commit_u32 = null;
             self.linear_bias_f32 = null;
             self.add_bias_rows_f32 = null;
+            self.add_bias_relu_rows_f32 = null;
             self.linear_bias_f32_tile4_r2 = null;
             self.linear_bias_relu_f32_tile4_r2 = null;
             self.linear_bias_gelu_f32_tile4_r2 = null;
@@ -985,7 +2683,9 @@ pub const KernelModule = struct {
             self.activation_multiply_slice_last_dim_f32 = null;
             self.embedding_lookup_f32 = null;
             self.embedding_lookup_bf16_weight_f32 = null;
+            self.embedding_lookup_f16_weight_f32 = null;
             self.embedding_lookup_i32_f32 = null;
+            self.embedding_lookup_i32_f16_weight_f32 = null;
             self.take_rows_f32 = null;
             self.gliner_gather_concat_relu_f32 = null;
             self.gliner_word_embeddings_f32 = null;
@@ -995,6 +2695,10 @@ pub const KernelModule = struct {
             self.conv2d_f32 = null;
             self.attention_f32 = null;
             self.attention_f32_block = null;
+            self.attention_f32_bert_prefill_s256_hd64 = null;
+            self.attention_f32_bert_prefill_s256_hd64_q8 = null;
+            self.attention_f32_bert_prefill_s256_hd64_q16 = null;
+            self.attention_f32_bert_prefill_s256_hd64_mma = null;
             self.cross_attention_f32 = null;
             self.cross_attention_q1_f32 = null;
             self.token_to_nchw_f32 = null;
@@ -1016,6 +2720,24 @@ pub const KernelModule = struct {
             self.gqa_attention_decode_scalars_fast_f32 = null;
             self.gqa_attention_prefill_fast_f32 = null;
             self.gqa_attention_decode_scalars_f32 = null;
+            self.gqa_attention_decode_scalars_generated_hd256_f32 = null;
+            self.gqa_attention_decode_split_kv_hd256_stage1_f32 = null;
+            self.gqa_attention_decode_split_kv_hd256_stage2_f32 = null;
+            self.gqa_attention_decode_scalars_generated_hd512_f32 = null;
+            self.gqa_attention_decode_split_kv_hd512_stage1_f32 = null;
+            self.gqa_attention_decode_split_kv_hd512_stage2_f32 = null;
+            self.gqa_attention_decode_split2_kv_hd256_stage1_f32 = null;
+            self.gqa_attention_decode_split2_kv_hd256_stage2_f32 = null;
+            self.gqa_attention_decode_split2_kv_hd512_stage1_f32 = null;
+            self.gqa_attention_decode_split2_kv_hd512_stage2_f32 = null;
+            self.gqa_attention_decode_split4_kv_hd256_stage1_f32 = null;
+            self.gqa_attention_decode_split4_kv_hd256_stage2_f32 = null;
+            self.gqa_attention_decode_split4_kv_hd512_stage1_f32 = null;
+            self.gqa_attention_decode_split4_kv_hd512_stage2_f32 = null;
+            self.gqa_attention_decode_score_prework_hd256_f32 = null;
+            self.gqa_attention_decode_score_prework_consume_hd256_f32 = null;
+            self.gqa_attention_decode_score_prework_hd512_f32 = null;
+            self.gqa_attention_decode_score_prework_consume_hd512_f32 = null;
             self.kv_write_suffix_decode_scalars_f32 = null;
             self.gqa_attention_decode_turboquant_fast_f32 = null;
             self.gqa_attention_prefill_turboquant_fast_f32 = null;
@@ -1030,6 +2752,13 @@ pub const KernelModule = struct {
             self.gqa_attention_decode_turboquant_f32 = null;
             self.kv_write_suffix_turboquant_f32 = null;
             self.deberta_attention_f32 = null;
+            self.deberta_attention_fused_f32 = null;
+            self.deberta_attention_stream_f16 = null;
+            self.deberta_attention_tc_f16_m16n32 = null;
+            self.deberta_attention_tc_f16_m32n16 = null;
+            self.deberta_pack_heads_f16 = null;
+            self.deberta_scores_softmax_f32 = null;
+            self.deberta_unpack_heads_f32 = null;
             self.split_last_dim3_f32 = null;
             self.linear_q8_0_f32 = null;
             self.linear_q8_0_f32_tile4 = null;
@@ -1052,7 +2781,22 @@ pub const KernelModule = struct {
             self.linear_q8_0_bias_add_f32_tc_hmma = null;
             self.quantize_f32_q8_1_rows = null;
             self.quantize_gated_f32_q8_1_rows = null;
+            self.linear_q4_k_generated_bias_gelu = null;
+            self.linear_q4_k_generated_mmv = null;
             self.linear_q4_0_f32 = null;
+            self.linear_q4_0_generated_mmv = null;
+            self.linear_q4_0_generated_mm = null;
+            self.linear_q4_0_generated_pair = null;
+            self.linear_q4_0_generated_pair_q8 = null;
+            self.linear_q4_0_generated_down_q8 = null;
+            self.linear_q4_0_generated_pair_q8_e2b_6144 = null;
+            self.linear_q4_0_generated_pair_q8_e2b_12288 = null;
+            self.linear_q4_0_generated_down_q8_e2b_6144 = null;
+            self.linear_q4_0_generated_down_q8_e2b_12288 = null;
+            self.linear_q4_0_generated_pair_f32_e2b_6144_exact = null;
+            self.linear_q4_0_generated_pair_f32_e2b_12288_exact = null;
+            self.linear_q4_0_generated_down_f32_e2b_6144_exact = null;
+            self.linear_q4_0_generated_down_f32_e2b_12288_exact = null;
             self.linear_q4_0_f32_tile4 = null;
             self.linear_q4_0_f32_tile4_w4 = null;
             self.linear_q4_0_q8_1_f32_tile4 = null;
@@ -1501,6 +3245,29 @@ pub const KernelModule = struct {
         try launch1d(function, ctx, count, &params);
     }
 
+    pub fn launchF32ToF16(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        count: usize,
+    ) driver_mod.Error!void {
+        const function = self.f32_to_f16 orelse return error.CudaKernelUnavailable;
+        try checkRawBytes(dst, try checkedTensorElements(count, @sizeOf(u16)));
+        try checkBytes(input, count);
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var count_u32 = try toU32(count);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&count_u32),
+        };
+        try launch1d(function, ctx, count, &params);
+    }
+
     pub fn launchLinearBf16WeightF32Tiled(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -1513,6 +3280,44 @@ pub const KernelModule = struct {
     ) driver_mod.Error!void {
         const function = self.linear_bf16_weight_f32_tiled orelse return error.CudaKernelUnavailable;
         const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight, try checkedTensorElements(try checkedTensorElements(out_dim, in_dim), @sizeOf(u16)));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launchBlocks(function, ctx, out_count, f32_tiled_threads, &params);
+    }
+
+    pub fn launchLinearF16WeightF32Tiled(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_f16_weight_f32_tiled orelse return error.CudaKernelUnavailable;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        // The compatibility kernel indexes its launch domain with u32. Fail
+        // closed before launch instead of allowing rows*out_dim to wrap in
+        // device code for an otherwise representable host-side allocation.
+        _ = try toU32(out_count);
         try checkBytes(dst, out_count);
         try checkBytes(input, try checkedTensorElements(rows, in_dim));
         try checkRawBytes(weight, try checkedTensorElements(try checkedTensorElements(out_dim, in_dim), @sizeOf(u16)));
@@ -2201,6 +4006,70 @@ pub const KernelModule = struct {
         try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
     }
 
+    pub fn hasLinearQ4_0Q8_1ArgmaxE2BPrimitives(self: *const KernelModule) bool {
+        return self.quantize_f32_q8_1_rows != null and
+            self.linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b != null and
+            self.argmax_reduce_rows_pairs_f32_w16 != null;
+    }
+
+    pub fn launchLinearQ4_0Q8_1ArgmaxRowsTile8E2B(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        partial_values: buffer_mod.DeviceBuffer,
+        partial_indices: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        suppress_token_ids: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        suppress_count: usize,
+    ) driver_mod.Error!void {
+        const bounds = try generatedQ4_0Q8_1ArgmaxLaunchBounds(rows, in_dim, out_dim);
+        const stage1 = self.linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b orelse return error.CudaKernelUnavailable;
+        const reduce = self.argmax_reduce_rows_pairs_f32_w16 orelse return error.CudaKernelUnavailable;
+        try checkRawBytes(dst, bounds.output_bytes);
+        try checkRawBytes(partial_values, bounds.partial_bytes);
+        try checkRawBytes(partial_indices, bounds.partial_bytes);
+        try checkRawBytes(input_q8_1, bounds.q8_input_bytes);
+        try checkRawBytes(weight_raw, bounds.weight_bytes);
+        try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
+
+        var partial_values_ptr = partial_values.ptr;
+        var partial_indices_ptr = partial_indices.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var suppress_ptr = suppress_token_ids.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var suppress_count_u32 = try toU32(suppress_count);
+        var stage1_params = [_]?*anyopaque{
+            @ptrCast(&partial_values_ptr),
+            @ptrCast(&partial_indices_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&suppress_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            @ptrCast(&suppress_count_u32),
+        };
+        try launchBlocks(stage1, ctx, bounds.partial_count, generated_q4_0_q8_1_argmax_tile8_threads, &stage1_params);
+
+        var dst_ptr = dst.ptr;
+        var col_tiles_u32 = try toU32(bounds.col_tiles);
+        var reduce_params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&partial_values_ptr),
+            @ptrCast(&partial_indices_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&col_tiles_u32),
+        };
+        try launchBlocks(reduce, ctx, rows, generated_q4_0_q8_1_argmax_reduce_threads, &reduce_params);
+    }
+
     pub fn launchLinearQ4KArgmaxRowsTile4F32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -2541,6 +4410,73 @@ pub const KernelModule = struct {
         };
         const reduce_threads: usize = if (self.argmax_reduce_rows_pairs_f32_w16 != null) 512 else f32_tiled_threads;
         try launchBlocks(reduce, ctx, rows, reduce_threads, &reduce_params);
+    }
+
+    /// Launches a shape-specialized generated Q6_K x Q8_1 greedy LM-head
+    /// stage 1. Suppression stays on the handwritten path because these
+    /// candidates intentionally omit its per-token filter.
+    pub fn launchLinearQ6KQ8_1GeneratedArgmaxRowsTile8F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        partial_values: buffer_mod.DeviceBuffer,
+        partial_indices: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        if (!linearQ6KQ8_1GeneratedArgmaxShapeEligible(rows, in_dim, out_dim)) return error.InvalidCudaState;
+        const stage1 = switch (in_dim) {
+            generated_q6_k_q8_1_argmax_k2560_in_dim => self.linear_q6_k_q8_1_argmax_generated_k2560 orelse return error.CudaKernelUnavailable,
+            generated_q6_k_q8_1_argmax_k3840_in_dim => self.linear_q6_k_q8_1_argmax_generated_k3840 orelse return error.CudaKernelUnavailable,
+            else => return error.InvalidCudaState,
+        };
+        const stage1_threads = generatedQ6KQ8_1ArgmaxStage1Threads(in_dim);
+        const reduce = self.argmax_reduce_rows_pairs_f32_w16 orelse return error.CudaKernelUnavailable;
+        const row_blocks = in_dim / q6_k_values_per_block;
+        const q8_row_blocks = in_dim / q8_1_values_per_block;
+        const col_tiles = (out_dim + q6_k_col_tile8 - 1) / q6_k_col_tile8;
+        const partial_count = try checkedTensorElements(rows, col_tiles);
+        try checkRawBytes(dst, try checkedTensorElements(rows, @sizeOf(u32)));
+        try checkBytes(partial_values, partial_count);
+        try checkRawBytes(partial_indices, try checkedTensorElements(partial_count, @sizeOf(u32)));
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, q8_row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q6_k_block_bytes));
+
+        var partial_values_ptr = partial_values.ptr;
+        var partial_indices_ptr = partial_indices.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var suppress_ptr: u64 = 0;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var suppress_count_u32: u32 = 0;
+        var stage1_params = [_]?*anyopaque{
+            @ptrCast(&partial_values_ptr),
+            @ptrCast(&partial_indices_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&suppress_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            @ptrCast(&suppress_count_u32),
+        };
+        try launchBlocks(stage1, ctx, partial_count, stage1_threads, &stage1_params);
+
+        var dst_ptr = dst.ptr;
+        var col_tiles_u32 = try toU32(col_tiles);
+        var reduce_params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&partial_values_ptr),
+            @ptrCast(&partial_indices_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&col_tiles_u32),
+        };
+        try launchBlocks(reduce, ctx, rows, generated_q6_k_q8_1_argmax_reduce_threads, &reduce_params);
     }
 
     pub fn launchGemma4MtpPreprojectF32(
@@ -2935,6 +4871,33 @@ pub const KernelModule = struct {
             @ptrCast(&out_dim_u32),
         };
         try launch1d(self.add_bias_rows_f32, ctx, out_count, &params);
+    }
+
+    pub fn launchAddBiasReluRowsF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        bias: buffer_mod.DeviceBuffer,
+        rows: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(bias, out_dim);
+        if (out_count == 0) return;
+
+        const function = self.add_bias_relu_rows_f32 orelse return error.CudaKernelUnavailable;
+        var dst_ptr = dst.ptr;
+        var bias_ptr = bias.ptr;
+        var rows_u32 = try toU32(rows);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&bias_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launch1d(function, ctx, out_count, &params);
     }
 
     pub fn launchLinearBiasTile4Rows2F32(
@@ -3605,6 +5568,40 @@ pub const KernelModule = struct {
         try launch1d(function, ctx, count, &params);
     }
 
+    pub fn launchEmbeddingLookupF16WeightF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        ids: buffer_mod.DeviceBuffer,
+        total: usize,
+        dim: usize,
+        scale: f32,
+    ) driver_mod.Error!void {
+        const function = self.embedding_lookup_f16_weight_f32 orelse return error.CudaKernelUnavailable;
+        const count = try checkedTensorElements(total, dim);
+        try checkBytes(dst, count);
+        try checkRawBytes(weight, dim * @sizeOf(u16));
+        try checkRawBytes(ids, total * @sizeOf(i64));
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var weight_ptr = weight.ptr;
+        var ids_ptr = ids.ptr;
+        var total_u32 = try toU32(total);
+        var dim_u32 = try toU32(dim);
+        var scale_value = scale;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&ids_ptr),
+            @ptrCast(&total_u32),
+            @ptrCast(&dim_u32),
+            @ptrCast(&scale_value),
+        };
+        try launch1d(function, ctx, count, &params);
+    }
+
     pub fn launchEmbeddingLookupI32F32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -3636,6 +5633,40 @@ pub const KernelModule = struct {
             @ptrCast(&scale_value),
         };
         try launch1d(self.embedding_lookup_i32_f32, ctx, count, &params);
+    }
+
+    pub fn launchEmbeddingLookupI32F16WeightF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        ids: buffer_mod.DeviceBuffer,
+        total: usize,
+        dim: usize,
+        scale: f32,
+    ) driver_mod.Error!void {
+        const function = self.embedding_lookup_i32_f16_weight_f32 orelse return error.CudaKernelUnavailable;
+        const count = try checkedTensorElements(total, dim);
+        try checkBytes(dst, count);
+        try checkRawBytes(weight, dim * @sizeOf(u16));
+        try checkRawBytes(ids, total * @sizeOf(i32));
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var weight_ptr = weight.ptr;
+        var ids_ptr = ids.ptr;
+        var total_u32 = try toU32(total);
+        var dim_u32 = try toU32(dim);
+        var scale_value = scale;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&ids_ptr),
+            @ptrCast(&total_u32),
+            @ptrCast(&dim_u32),
+            @ptrCast(&scale_value),
+        };
+        try launch1d(function, ctx, count, &params);
     }
 
     pub fn launchTakeRowsF32(
@@ -4382,7 +6413,45 @@ pub const KernelModule = struct {
             @ptrCast(&bias_mode_u32),
             @ptrCast(&head_major_u32),
         };
-        if (seq_len <= 512 and head_dim <= 128) {
+        const attention_mode = bertPrefillAttentionMode();
+        if (attention_mode == .tensor_core and
+            bertPrefillAttentionMmaComputeEligible(ctx.info.compute_major, ctx.info.compute_minor) and
+            bertPrefillAttentionMmaShapeEligible(batch, seq_len, num_heads, head_dim, causal, has_mask, bias_mode, head_major) and
+            self.attention_f32_bert_prefill_s256_hd64_mma != null)
+        {
+            const query_tiles = seq_len / bert_prefill_attention_mma_query_tile;
+            try launchBlocksShared(
+                self.attention_f32_bert_prefill_s256_hd64_mma,
+                ctx,
+                try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles),
+                bert_prefill_attention_mma_threads,
+                bert_prefill_attention_mma_shared_bytes,
+                &params,
+            );
+        } else if (attention_mode == .exact and !causal and !has_mask and bias_mode == 0 and head_major and
+            seq_len == bert_prefill_attention_mma_seq_len and head_dim == bert_prefill_attention_mma_head_dim and
+            self.attention_f32_bert_prefill_s256_hd64_q16 != null)
+        {
+            const query_tiles = seq_len / 16;
+            try launchBlocks(
+                self.attention_f32_bert_prefill_s256_hd64_q16,
+                ctx,
+                try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles),
+                512,
+                &params,
+            );
+        } else if (attention_mode != .generic and bertPrefillAttentionQueryTilingEnabled() and !causal and !has_mask and bias_mode == 0 and head_major and
+            seq_len == 256 and head_dim == 64 and
+            self.attention_f32_bert_prefill_s256_hd64_q8 != null)
+        {
+            const query_tiles = seq_len / 8;
+            try launchBlocks(self.attention_f32_bert_prefill_s256_hd64_q8, ctx, try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles), 256, &params);
+        } else if (attention_mode != .generic and !causal and !has_mask and bias_mode == 0 and head_major and
+            seq_len == 256 and head_dim == 64 and
+            self.attention_f32_bert_prefill_s256_hd64 != null)
+        {
+            try launchBlocks(self.attention_f32_bert_prefill_s256_hd64, ctx, try checkedTensorElements(try checkedTensorElements(batch, seq_len), num_heads), 256, &params);
+        } else if (seq_len <= 512 and head_dim <= 128) {
             try launchBlocks(self.attention_f32_block, ctx, try checkedTensorElements(try checkedTensorElements(batch, seq_len), num_heads), 128, &params);
         } else {
             try launch1d(self.attention_f32, ctx, count, &params);
@@ -5254,6 +7323,239 @@ pub const KernelModule = struct {
         try launchBlocks(function, ctx, total_chunks, f32_tiled_threads, &params);
     }
 
+    fn launchGeneratedGqaAttentionDecodeF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        attn_or_mask: buffer_mod.DeviceBuffer,
+        bias: buffer_mod.DeviceBuffer,
+        decode_scalars_ptr_value: driver_mod.CUdeviceptr,
+        batch: usize,
+        q_seq_len: usize,
+        kv_seq_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        query_position_offset: usize,
+        kv_position_offset: usize,
+        sliding_window: usize,
+        total_sequence_len: usize,
+        mask_len: usize,
+        bias_mode: u32,
+    ) driver_mod.Error!void {
+        const schedule = generatedGqaDecodeScheduleForKvSeqLen(kv_seq_len);
+        if (schedule == .none) return error.InvalidCudaState;
+        // Serial remains on the established bit-exact entry point. The explicit
+        // split schedule only changes the two-stage launch topology and its
+        // workspace layout, which is part of the graph-replay identity.
+        const plan = switch (schedule) {
+            .serial, .split8 => switch (head_dim) {
+                256 => cuda_kernel_renderer.attentionPlanFor(.gqa_decode_split_kv_hd256_f32),
+                512 => cuda_kernel_renderer.attentionPlanFor(.gqa_decode_split_kv_hd512_f32),
+                else => return error.InvalidCudaState,
+            },
+            .split2 => switch (head_dim) {
+                256 => cuda_kernel_renderer.attentionPlanFor(.gqa_decode_split2_kv_hd256_f32),
+                512 => cuda_kernel_renderer.attentionPlanFor(.gqa_decode_split2_kv_hd512_f32),
+                else => return error.InvalidCudaState,
+            },
+            .split4 => switch (head_dim) {
+                256 => cuda_kernel_renderer.attentionPlanFor(.gqa_decode_split4_kv_hd256_f32),
+                512 => cuda_kernel_renderer.attentionPlanFor(.gqa_decode_split4_kv_hd512_f32),
+                else => return error.InvalidCudaState,
+            },
+            .none => unreachable,
+        };
+        const serial_function = switch (head_dim) {
+            256 => self.gqa_attention_decode_scalars_generated_hd256_f32,
+            512 => self.gqa_attention_decode_scalars_generated_hd512_f32,
+            else => unreachable,
+        };
+        const stage1_function, const stage2_function = switch (schedule) {
+            .serial, .split8 => switch (head_dim) {
+                256 => .{
+                    self.gqa_attention_decode_split_kv_hd256_stage1_f32,
+                    self.gqa_attention_decode_split_kv_hd256_stage2_f32,
+                },
+                512 => .{
+                    self.gqa_attention_decode_split_kv_hd512_stage1_f32,
+                    self.gqa_attention_decode_split_kv_hd512_stage2_f32,
+                },
+                else => unreachable,
+            },
+            .split2 => switch (head_dim) {
+                256 => .{
+                    self.gqa_attention_decode_split2_kv_hd256_stage1_f32,
+                    self.gqa_attention_decode_split2_kv_hd256_stage2_f32,
+                },
+                512 => .{
+                    self.gqa_attention_decode_split2_kv_hd512_stage1_f32,
+                    self.gqa_attention_decode_split2_kv_hd512_stage2_f32,
+                },
+                else => unreachable,
+            },
+            .split4 => switch (head_dim) {
+                256 => .{
+                    self.gqa_attention_decode_split4_kv_hd256_stage1_f32,
+                    self.gqa_attention_decode_split4_kv_hd256_stage2_f32,
+                },
+                512 => .{
+                    self.gqa_attention_decode_split4_kv_hd512_stage1_f32,
+                    self.gqa_attention_decode_split4_kv_hd512_stage2_f32,
+                },
+                else => unreachable,
+            },
+            .none => unreachable,
+        };
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var mask_ptr = attn_or_mask.ptr;
+        var bias_ptr = bias.ptr;
+        var decode_scalars_ptr = decode_scalars_ptr_value;
+        var batch_u32 = try toU32(batch);
+        var q_seq_len_u32 = try toU32(q_seq_len);
+        var kv_seq_len_u32 = try toU32(kv_seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var num_kv_heads_u32 = try toU32(num_kv_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var query_position_offset_u32 = try toU32(query_position_offset);
+        var kv_position_offset_u32 = try toU32(kv_position_offset);
+        var sliding_window_u32 = try toU32(sliding_window);
+        var total_sequence_len_u32 = try toU32(total_sequence_len);
+        var mask_len_u32 = try toU32(mask_len);
+        var bias_mode_u32 = bias_mode;
+        var split_kv_min_tokens_u32 = generatedGqaDecodeSplitKvMinTokens();
+
+        const serial_grid = try toU32(try checkedTensorElements(batch, num_heads));
+        try ctx.makeCurrent();
+        switch (schedule) {
+            .serial => {
+                const function = serial_function orelse return error.CudaKernelUnavailable;
+                var serial_params = [_]?*anyopaque{
+                    @ptrCast(&dst_ptr),
+                    @ptrCast(&q_ptr),
+                    @ptrCast(&k_ptr),
+                    @ptrCast(&v_ptr),
+                    @ptrCast(&mask_ptr),
+                    @ptrCast(&bias_ptr),
+                    @ptrCast(&batch_u32),
+                    @ptrCast(&q_seq_len_u32),
+                    @ptrCast(&kv_seq_len_u32),
+                    @ptrCast(&num_heads_u32),
+                    @ptrCast(&num_kv_heads_u32),
+                    @ptrCast(&head_dim_u32),
+                    @ptrCast(&query_position_offset_u32),
+                    @ptrCast(&kv_position_offset_u32),
+                    @ptrCast(&sliding_window_u32),
+                    @ptrCast(&total_sequence_len_u32),
+                    @ptrCast(&mask_len_u32),
+                    @ptrCast(&bias_mode_u32),
+                    @ptrCast(&split_kv_min_tokens_u32),
+                    @ptrCast(&decode_scalars_ptr),
+                };
+                try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+                    function,
+                    serial_grid,
+                    1,
+                    1,
+                    plan.serial_launch.threads_per_block,
+                    1,
+                    1,
+                    plan.serial_launch.dynamic_shared_memory_bytes,
+                    ctx.stream,
+                    &serial_params,
+                    null,
+                ));
+                ctx.noteKernelLaunch();
+            },
+            .split2, .split4, .split8 => {
+                const stage1 = stage1_function orelse return error.CudaKernelUnavailable;
+                const stage2 = stage2_function orelse return error.CudaKernelUnavailable;
+                const workspace_layout = cuda_kernel_renderer.generatedAttentionWorkspaceLayoutFor(plan.lowering.kv_splits) orelse return error.InvalidCudaState;
+                if (self.gqa_attention_generated_workspace.ptr == 0 or self.gqa_attention_generated_workspace.len < workspace_layout.total_bytes) {
+                    return error.InvalidCudaState;
+                }
+                var partial_values_ptr = self.gqa_attention_generated_workspace.ptr + workspace_layout.partial_values_offset;
+                var partial_max_ptr = self.gqa_attention_generated_workspace.ptr + workspace_layout.partial_max_offset;
+                var partial_denom_ptr = self.gqa_attention_generated_workspace.ptr + workspace_layout.partial_denom_offset;
+                var stage1_params = [_]?*anyopaque{
+                    @ptrCast(&partial_values_ptr),
+                    @ptrCast(&partial_max_ptr),
+                    @ptrCast(&partial_denom_ptr),
+                    @ptrCast(&q_ptr),
+                    @ptrCast(&k_ptr),
+                    @ptrCast(&v_ptr),
+                    @ptrCast(&mask_ptr),
+                    @ptrCast(&bias_ptr),
+                    @ptrCast(&batch_u32),
+                    @ptrCast(&q_seq_len_u32),
+                    @ptrCast(&kv_seq_len_u32),
+                    @ptrCast(&num_heads_u32),
+                    @ptrCast(&num_kv_heads_u32),
+                    @ptrCast(&head_dim_u32),
+                    @ptrCast(&query_position_offset_u32),
+                    @ptrCast(&kv_position_offset_u32),
+                    @ptrCast(&sliding_window_u32),
+                    @ptrCast(&total_sequence_len_u32),
+                    @ptrCast(&mask_len_u32),
+                    @ptrCast(&bias_mode_u32),
+                    @ptrCast(&split_kv_min_tokens_u32),
+                    @ptrCast(&decode_scalars_ptr),
+                };
+                var stage2_params = [_]?*anyopaque{
+                    @ptrCast(&dst_ptr),
+                    @ptrCast(&partial_values_ptr),
+                    @ptrCast(&partial_max_ptr),
+                    @ptrCast(&partial_denom_ptr),
+                    @ptrCast(&batch_u32),
+                    @ptrCast(&num_heads_u32),
+                    @ptrCast(&head_dim_u32),
+                    @ptrCast(&kv_seq_len_u32),
+                    @ptrCast(&split_kv_min_tokens_u32),
+                    @ptrCast(&decode_scalars_ptr),
+                };
+                const stage1_grid = try toU32(try checkedTensorElements(
+                    try checkedTensorElements(batch, num_heads),
+                    plan.lowering.kv_splits,
+                ));
+                try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+                    stage1,
+                    stage1_grid,
+                    1,
+                    1,
+                    plan.launch.threads_per_block,
+                    1,
+                    1,
+                    plan.launch.dynamic_shared_memory_bytes,
+                    ctx.stream,
+                    &stage1_params,
+                    null,
+                ));
+                ctx.noteKernelLaunch();
+                try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+                    stage2,
+                    serial_grid,
+                    1,
+                    1,
+                    plan.reduction_launch.threads_per_block,
+                    1,
+                    1,
+                    plan.reduction_launch.dynamic_shared_memory_bytes,
+                    ctx.stream,
+                    &stage2_params,
+                    null,
+                ));
+                ctx.noteKernelLaunch();
+            },
+            .none => unreachable,
+        }
+    }
+
     pub fn launchGqaAttentionF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -5351,6 +7653,9 @@ pub const KernelModule = struct {
                 bias_mode_u32,
             });
         }
+        // Generated decode consumes device-resident scalar parameters and is
+        // intentionally reachable only from launchGqaAttentionDecodeScalarsF32.
+        // This host-scalar entry point must keep its normal decode topology.
         if (self.gqa_attention_prefill_fast_f32) |prefill_function| {
             if (fastGqaPrefillEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode)) {
                 const block: c_uint = if (head_dim <= 256) 256 else 512;
@@ -5478,6 +7783,46 @@ pub const KernelModule = struct {
             @ptrCast(&bias_mode_u32),
             @ptrCast(&decode_scalars_ptr),
         };
+        if (generatedGqaDecodeEnabled() and mask_len == 0 and bias_mode == 0 and generatedGqaDecodeShapeEligible(batch, q_seq_len, head_dim, num_heads, num_kv_heads)) {
+            const generated_schedule = generatedGqaDecodeScheduleForKvSeqLen(kv_seq_len);
+            if (captureParamTraceIndex(ctx)) |trace_index| {
+                std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=gqa_attention_decode_generated_{s}_hd{d} dst=0x{x} q=0x{x} k=0x{x} v=0x{x} scalars=0x{x} split_kv_min_tokens={d}", .{
+                    ctx.debug_graph_capture_id,
+                    trace_index,
+                    @tagName(generated_schedule),
+                    head_dim,
+                    dst_ptr,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    decode_scalars_ptr,
+                    generatedGqaDecodeSplitKvMinTokens(),
+                });
+            }
+            try self.launchGeneratedGqaAttentionDecodeF32(
+                ctx,
+                dst,
+                q,
+                k,
+                v,
+                attn_or_mask,
+                bias,
+                decode_scalars.ptr,
+                batch,
+                q_seq_len,
+                kv_seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                query_position_offset,
+                kv_position_offset,
+                sliding_window,
+                total_sequence_len,
+                mask_len,
+                bias_mode,
+            );
+            return .decode_generated;
+        }
         var function = fallback_function;
         var launch_kind: GqaAttentionLaunchKind = .decode;
         if (fastGqaDecodeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode)) {
@@ -5490,7 +7835,11 @@ pub const KernelModule = struct {
             }
         }
         if (captureParamTraceIndex(ctx)) |trace_index| {
-            const kernel_name = if (launch_kind == .decode_fast) "gqa_attention_decode_scalars_fast" else "gqa_attention_decode_scalars";
+            const kernel_name = switch (launch_kind) {
+                .decode_generated => "gqa_attention_decode_scalars_generated_hd256",
+                .decode_fast => "gqa_attention_decode_scalars_fast",
+                else => "gqa_attention_decode_scalars",
+            };
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel={s} dst=0x{x} q=0x{x} k=0x{x} v=0x{x} scalars=0x{x} fallback_query_position_offset={d} fallback_kv_seq_len={d} fallback_total_sequence_len={d}", .{
                 ctx.debug_graph_capture_id,
                 trace_index,
@@ -5726,6 +8075,36 @@ pub const KernelModule = struct {
         if (decode_scalars.ptr != 0) try checkRawBytes(decode_scalars, 5 * @sizeOf(u32));
         if (q_count == 0) return .none;
 
+        if (generatedGqaScorePreworkEnabled() and try self.launchGqaAttentionDecodeTurboquantScorePreworkF32(
+            ctx,
+            dst,
+            q,
+            k,
+            v,
+            block_table,
+            batch,
+            q_seq_len,
+            kv_seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            query_position_offset,
+            kv_position_offset,
+            sliding_window,
+            total_sequence_len,
+            mask_len,
+            bias_mode,
+            key_row_bytes,
+            base_key_row_bytes,
+            value_row_bytes,
+            block_count,
+            page_size_tokens,
+            format,
+            value_format,
+            physical_token_capacity,
+            decode_scalars,
+        )) return .decode_generated_score_prework;
+
         var dst_ptr = dst.ptr;
         var q_ptr = q.ptr;
         var k_ptr = k.ptr;
@@ -5938,6 +8317,230 @@ pub const KernelModule = struct {
         return launch_kind;
     }
 
+    pub fn launchGqaAttentionDecodeTurboquantScorePreworkF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        block_table: buffer_mod.DeviceBuffer,
+        batch: usize,
+        q_seq_len: usize,
+        kv_seq_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        query_position_offset: usize,
+        kv_position_offset: usize,
+        sliding_window: usize,
+        total_sequence_len: usize,
+        mask_len: usize,
+        bias_mode: u32,
+        key_row_bytes: usize,
+        base_key_row_bytes: usize,
+        value_row_bytes: usize,
+        block_count: usize,
+        page_size_tokens: usize,
+        format: u32,
+        value_format: u32,
+        physical_token_capacity: usize,
+        decode_scalars: buffer_mod.DeviceBuffer,
+    ) driver_mod.Error!bool {
+        if (!generatedGqaScorePreworkShapeEligible(
+            batch,
+            q_seq_len,
+            kv_seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            mask_len,
+            bias_mode,
+            key_row_bytes,
+            base_key_row_bytes,
+            value_row_bytes,
+            format,
+            value_format,
+            physical_token_capacity,
+        )) return false;
+        if (block_count != 0 and page_size_tokens == 0) return false;
+
+        const plan = switch (head_dim) {
+            256 => cuda_kernel_renderer.attentionPlanFor(.gqa_decode_score_prework_hd256_f32),
+            512 => cuda_kernel_renderer.attentionPlanFor(.gqa_decode_score_prework_hd512_f32),
+            else => return false,
+        };
+        const score_function, const consume_function = switch (head_dim) {
+            256 => .{
+                self.gqa_attention_decode_score_prework_hd256_f32,
+                self.gqa_attention_decode_score_prework_consume_hd256_f32,
+            },
+            512 => .{
+                self.gqa_attention_decode_score_prework_hd512_f32,
+                self.gqa_attention_decode_score_prework_consume_hd512_f32,
+            },
+            else => unreachable,
+        };
+        const score = score_function orelse return false;
+        const consume = consume_function orelse return false;
+        const workspace_layout = cuda_kernel_renderer.generatedAttentionWorkspaceLayoutFor(
+            cuda_kernel_renderer.generated_attention_score_prework_chunks,
+        ) orelse return error.InvalidCudaState;
+        if (self.gqa_attention_generated_workspace.ptr == 0 or
+            self.gqa_attention_generated_workspace.len < workspace_layout.total_bytes)
+        {
+            return error.InvalidCudaState;
+        }
+
+        const q_count = try checkedTensorElements(num_heads, head_dim);
+        try checkBytes(dst, q_count);
+        try checkBytes(q, q_count);
+        try checkRawBytes(k, try checkedTensorElements(physical_token_capacity, key_row_bytes));
+        try checkRawBytes(v, try checkedTensorElements(physical_token_capacity, value_row_bytes));
+        if (block_count != 0) try checkRawBytes(block_table, try checkedTensorElements(block_count, @sizeOf(u32)));
+        if (decode_scalars.ptr != 0) try checkRawBytes(decode_scalars, 5 * @sizeOf(u32));
+
+        var scores_ptr = self.gqa_attention_generated_workspace.ptr + workspace_layout.partial_values_offset;
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var block_table_ptr = block_table.ptr;
+        var batch_u32 = try toU32(batch);
+        var q_seq_len_u32 = try toU32(q_seq_len);
+        var kv_seq_len_u32 = try toU32(kv_seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var num_kv_heads_u32 = try toU32(num_kv_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var query_position_offset_u32 = try toU32(query_position_offset);
+        var kv_position_offset_u32 = try toU32(kv_position_offset);
+        var sliding_window_u32 = try toU32(sliding_window);
+        var total_sequence_len_u32 = try toU32(total_sequence_len);
+        var key_row_bytes_u32 = try toU32(key_row_bytes);
+        var base_key_row_bytes_u32 = try toU32(base_key_row_bytes);
+        var value_row_bytes_u32 = try toU32(value_row_bytes);
+        var block_count_u32 = try toU32(block_count);
+        var page_size_tokens_u32 = try toU32(page_size_tokens);
+        var format_u32 = format;
+        var value_format_u32 = value_format;
+        var physical_token_capacity_u32 = try toU32(physical_token_capacity);
+        var score_capacity_u32: u32 = cuda_kernel_renderer.generated_attention_score_prework_max_kv_tokens;
+        var chunk_count_u32: u32 = cuda_kernel_renderer.generated_attention_score_prework_chunks;
+        var chunk_size_u32: u32 = @intCast(
+            (@as(usize, score_capacity_u32) + @as(usize, chunk_count_u32) - 1) / @as(usize, chunk_count_u32),
+        );
+        var decode_scalars_ptr = decode_scalars.ptr;
+        var score_params = [_]?*anyopaque{
+            @ptrCast(&scores_ptr),
+            @ptrCast(&q_ptr),
+            @ptrCast(&k_ptr),
+            @ptrCast(&block_table_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&q_seq_len_u32),
+            @ptrCast(&kv_seq_len_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&num_kv_heads_u32),
+            @ptrCast(&head_dim_u32),
+            @ptrCast(&query_position_offset_u32),
+            @ptrCast(&kv_position_offset_u32),
+            @ptrCast(&sliding_window_u32),
+            @ptrCast(&total_sequence_len_u32),
+            @ptrCast(&key_row_bytes_u32),
+            @ptrCast(&base_key_row_bytes_u32),
+            @ptrCast(&block_count_u32),
+            @ptrCast(&page_size_tokens_u32),
+            @ptrCast(&format_u32),
+            @ptrCast(&physical_token_capacity_u32),
+            @ptrCast(&score_capacity_u32),
+            @ptrCast(&chunk_size_u32),
+            @ptrCast(&chunk_count_u32),
+            @ptrCast(&decode_scalars_ptr),
+        };
+        var consume_params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&scores_ptr),
+            @ptrCast(&v_ptr),
+            @ptrCast(&block_table_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&q_seq_len_u32),
+            @ptrCast(&kv_seq_len_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&num_kv_heads_u32),
+            @ptrCast(&head_dim_u32),
+            @ptrCast(&query_position_offset_u32),
+            @ptrCast(&kv_position_offset_u32),
+            @ptrCast(&sliding_window_u32),
+            @ptrCast(&total_sequence_len_u32),
+            @ptrCast(&value_row_bytes_u32),
+            @ptrCast(&block_count_u32),
+            @ptrCast(&page_size_tokens_u32),
+            @ptrCast(&value_format_u32),
+            @ptrCast(&physical_token_capacity_u32),
+            @ptrCast(&score_capacity_u32),
+            @ptrCast(&decode_scalars_ptr),
+        };
+
+        if (captureParamTraceIndex(ctx)) |trace_index| {
+            std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=gqa_attention_decode_turboquant_score_prework dst=0x{x} scores=0x{x} q=0x{x} k=0x{x} v=0x{x} block_table=0x{x} scalars=0x{x} kv_seq_len={d} num_heads={d} num_kv_heads={d} head_dim={d} key_row_bytes={d} value_row_bytes={d} block_count={d} page_size={d} format={d} value_format={d} physical_capacity={d} score_capacity={d} chunks={d}", .{
+                ctx.debug_graph_capture_id,
+                trace_index,
+                dst_ptr,
+                scores_ptr,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                block_table_ptr,
+                decode_scalars_ptr,
+                kv_seq_len_u32,
+                num_heads_u32,
+                num_kv_heads_u32,
+                head_dim_u32,
+                key_row_bytes_u32,
+                value_row_bytes_u32,
+                block_count_u32,
+                page_size_tokens_u32,
+                format_u32,
+                value_format_u32,
+                physical_token_capacity_u32,
+                score_capacity_u32,
+                chunk_count_u32,
+            });
+        }
+
+        const score_grid = try toU32(try checkedTensorElements(num_heads, plan.lowering.kv_splits));
+        const consume_grid = try toU32(num_heads);
+        try ctx.makeCurrent();
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+            score,
+            score_grid,
+            1,
+            1,
+            plan.launch.threads_per_block,
+            1,
+            1,
+            plan.launch.dynamic_shared_memory_bytes,
+            ctx.stream,
+            &score_params,
+            null,
+        ));
+        ctx.noteKernelLaunch();
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+            consume,
+            consume_grid,
+            1,
+            1,
+            plan.reduction_launch.threads_per_block,
+            1,
+            1,
+            plan.reduction_launch.dynamic_shared_memory_bytes,
+            ctx.stream,
+            &consume_params,
+            null,
+        ));
+        ctx.noteKernelLaunch();
+        return true;
+    }
+
     pub fn launchGqaAttentionDecodeTurboquantSplitF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -6104,6 +8707,375 @@ pub const KernelModule = struct {
             @ptrCast(&head_dim_u32),
         };
         try launch1d(self.deberta_attention_f32, ctx, count, &params);
+    }
+
+    /// Fused one-block-per-(batch, head, query) DeBERTa attention.  The
+    /// kernel owns a fixed 512-token shared-memory score tile; callers use
+    /// the general elementwise implementation outside that envelope.
+    pub fn launchDebertaAttentionFusedF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        q_r: buffer_mod.DeviceBuffer,
+        k_r: buffer_mod.DeviceBuffer,
+        mask: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) driver_mod.Error!bool {
+        const function = self.deberta_attention_fused_f32 orelse return false;
+        if (seq_len == 0 or seq_len > 512 or batch == 0 or num_heads == 0 or head_dim == 0) return false;
+        const hidden = try checkedTensorElements(num_heads, head_dim);
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), hidden);
+        const rel_count = try checkedTensorElements(2 * seq_len - 1, hidden);
+        try checkBytes(dst, count);
+        try checkBytes(q, count);
+        try checkBytes(k, count);
+        try checkBytes(v, count);
+        try checkBytes(q_r, rel_count);
+        try checkBytes(k_r, rel_count);
+        try checkRawBytes(mask, try checkedTensorElements(batch, seq_len) * @sizeOf(i64));
+
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var q_r_ptr = q_r.ptr;
+        var k_r_ptr = k_r.ptr;
+        var mask_ptr = mask.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_len_u32 = try toU32(seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&q_ptr),
+            @ptrCast(&k_ptr),
+            @ptrCast(&v_ptr),
+            @ptrCast(&q_r_ptr),
+            @ptrCast(&k_r_ptr),
+            @ptrCast(&mask_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&seq_len_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&head_dim_u32),
+        };
+        const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), seq_len);
+        try launchBlocks(function, ctx, blocks, 256, &params);
+        return true;
+    }
+
+    /// Generated-style Flash/streaming DeBERTa encoder attention. The
+    /// specialized FP16-storage route is intentionally narrow: DeBERTa-base's
+    /// 64-wide heads and encoder prefill up to 256 tokens. Callers retain F32
+    /// output and use the fused-F32 route outside this envelope.
+    pub fn launchDebertaAttentionStreamF16(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        q_r: buffer_mod.DeviceBuffer,
+        k_r: buffer_mod.DeviceBuffer,
+        mask: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) driver_mod.Error!bool {
+        const function = self.deberta_attention_stream_f16 orelse return false;
+        if (seq_len == 0 or seq_len > 256 or batch == 0 or num_heads == 0 or head_dim != 64) return false;
+        const hidden = try checkedTensorElements(num_heads, head_dim);
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), hidden);
+        const rel_count = try checkedTensorElements(2 * seq_len - 1, hidden);
+        try checkBytes(dst, count);
+        try checkRawBytes(q, count * @sizeOf(u16));
+        try checkRawBytes(k, count * @sizeOf(u16));
+        try checkRawBytes(v, count * @sizeOf(u16));
+        try checkRawBytes(q_r, rel_count * @sizeOf(u16));
+        try checkRawBytes(k_r, rel_count * @sizeOf(u16));
+        try checkRawBytes(mask, try checkedTensorElements(batch, seq_len) * @sizeOf(i64));
+
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var q_r_ptr = q_r.ptr;
+        var k_r_ptr = k_r.ptr;
+        var mask_ptr = mask.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_len_u32 = try toU32(seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&q_ptr),
+            @ptrCast(&k_ptr),
+            @ptrCast(&v_ptr),
+            @ptrCast(&q_r_ptr),
+            @ptrCast(&k_r_ptr),
+            @ptrCast(&mask_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&seq_len_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&head_dim_u32),
+        };
+        const query_groups = (seq_len + 7) / 8;
+        const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_groups);
+        try launchBlocks(function, ctx, blocks, 256, &params);
+        return true;
+    }
+
+    /// Fully fused generated tensor-core DeBERTa prefill attention. Unlike
+    /// the legacy streaming route it accepts the graph's F32 tensors directly:
+    /// conversion, relative-position gathers, online softmax, and P*V all
+    /// happen inside one CTA-local schedule. This deliberately has no scratch
+    /// buffer parameters, which makes accidental reintroduction of the four
+    /// materialized cuBLASLt attention launches impossible at this ABI.
+    pub fn launchDebertaAttentionTcF16M16N32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        q_r: buffer_mod.DeviceBuffer,
+        k_r: buffer_mod.DeviceBuffer,
+        mask: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) driver_mod.Error!bool {
+        const function = self.deberta_attention_tc_f16_m16n32 orelse return false;
+        if (ctx.info.compute_major < 8 or seq_len == 0 or seq_len > 256 or batch == 0 or num_heads == 0 or head_dim != 64) return false;
+        const hidden = try checkedTensorElements(num_heads, head_dim);
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), hidden);
+        const rel_count = try checkedTensorElements(2 * seq_len - 1, hidden);
+        try checkBytes(dst, count);
+        try checkBytes(q, count);
+        try checkBytes(k, count);
+        try checkBytes(v, count);
+        try checkBytes(q_r, rel_count);
+        try checkBytes(k_r, rel_count);
+        try checkRawBytes(mask, try checkedTensorElements(batch, seq_len) * @sizeOf(i64));
+
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var q_r_ptr = q_r.ptr;
+        var k_r_ptr = k_r.ptr;
+        var mask_ptr = mask.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_len_u32 = try toU32(seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&q_ptr),
+            @ptrCast(&k_ptr),
+            @ptrCast(&v_ptr),
+            @ptrCast(&q_r_ptr),
+            @ptrCast(&k_r_ptr),
+            @ptrCast(&mask_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&seq_len_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&head_dim_u32),
+        };
+        const query_tiles = (seq_len + 15) / 16;
+        const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles);
+        try launchBlocks(function, ctx, blocks, 256, &params);
+        return true;
+    }
+
+    pub fn launchDebertaAttentionTcF16M32N16(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        q_r: buffer_mod.DeviceBuffer,
+        k_r: buffer_mod.DeviceBuffer,
+        mask: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) driver_mod.Error!bool {
+        const function = self.deberta_attention_tc_f16_m32n16 orelse return false;
+        if (ctx.info.compute_major < 8 or seq_len == 0 or seq_len > 256 or batch == 0 or num_heads == 0 or head_dim != 64) return false;
+        const hidden = try checkedTensorElements(num_heads, head_dim);
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), hidden);
+        const rel_count = try checkedTensorElements(2 * seq_len - 1, hidden);
+        try checkBytes(dst, count);
+        try checkBytes(q, count);
+        try checkBytes(k, count);
+        try checkBytes(v, count);
+        try checkBytes(q_r, rel_count);
+        try checkBytes(k_r, rel_count);
+        try checkRawBytes(mask, try checkedTensorElements(batch, seq_len) * @sizeOf(i64));
+
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var q_r_ptr = q_r.ptr;
+        var k_r_ptr = k_r.ptr;
+        var mask_ptr = mask.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_len_u32 = try toU32(seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&q_ptr),
+            @ptrCast(&k_ptr),
+            @ptrCast(&v_ptr),
+            @ptrCast(&q_r_ptr),
+            @ptrCast(&k_r_ptr),
+            @ptrCast(&mask_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&seq_len_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&head_dim_u32),
+        };
+        const query_tiles = (seq_len + 31) / 32;
+        const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles);
+        try launchBlocks(function, ctx, blocks, 256, &params);
+        return true;
+    }
+
+    pub fn launchDebertaPackHeadsF16(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        q_out: buffer_mod.DeviceBuffer,
+        k_out: buffer_mod.DeviceBuffer,
+        v_out: buffer_mod.DeviceBuffer,
+        q_r_out: buffer_mod.DeviceBuffer,
+        k_r_out: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        q_r: buffer_mod.DeviceBuffer,
+        k_r: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) driver_mod.Error!bool {
+        const function = self.deberta_pack_heads_f16 orelse return false;
+        if (seq_len == 0 or batch == 0 or num_heads == 0 or head_dim == 0) return false;
+        const hidden = try checkedTensorElements(num_heads, head_dim);
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), hidden);
+        const rel_len = 2 * seq_len - 1;
+        const rel_count = try checkedTensorElements(rel_len, hidden);
+        const packed_rel_count = try checkedTensorElements(batch, rel_count);
+        try checkRawBytes(q_out, count * @sizeOf(u16));
+        try checkRawBytes(k_out, count * @sizeOf(u16));
+        try checkRawBytes(v_out, count * @sizeOf(u16));
+        try checkRawBytes(q_r_out, packed_rel_count * @sizeOf(u16));
+        try checkRawBytes(k_r_out, packed_rel_count * @sizeOf(u16));
+        try checkBytes(q, count);
+        try checkBytes(k, count);
+        try checkBytes(v, count);
+        try checkBytes(q_r, rel_count);
+        try checkBytes(k_r, rel_count);
+
+        var q_out_ptr = q_out.ptr;
+        var k_out_ptr = k_out.ptr;
+        var v_out_ptr = v_out.ptr;
+        var q_r_out_ptr = q_r_out.ptr;
+        var k_r_out_ptr = k_r_out.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var q_r_ptr = q_r.ptr;
+        var k_r_ptr = k_r.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_len_u32 = try toU32(seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&q_out_ptr), @ptrCast(&k_out_ptr),   @ptrCast(&v_out_ptr),     @ptrCast(&q_r_out_ptr),  @ptrCast(&k_r_out_ptr),
+            @ptrCast(&q_ptr),     @ptrCast(&k_ptr),       @ptrCast(&v_ptr),         @ptrCast(&q_r_ptr),      @ptrCast(&k_r_ptr),
+            @ptrCast(&batch_u32), @ptrCast(&seq_len_u32), @ptrCast(&num_heads_u32), @ptrCast(&head_dim_u32),
+        };
+        try launch1d(function, ctx, @max(count, packed_rel_count), &params);
+        return true;
+    }
+
+    pub fn launchDebertaScoresSoftmaxF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        content_scores: buffer_mod.DeviceBuffer,
+        c2p_scores: buffer_mod.DeviceBuffer,
+        p2c_scores: buffer_mod.DeviceBuffer,
+        mask: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) driver_mod.Error!bool {
+        const function = self.deberta_scores_softmax_f32 orelse return false;
+        if (seq_len == 0 or batch == 0 or num_heads == 0 or head_dim == 0) return false;
+        const matrices = try checkedTensorElements(batch, num_heads);
+        const score_count = try checkedTensorElements(matrices, try checkedTensorElements(seq_len, seq_len));
+        const rel_len = 2 * seq_len - 1;
+        const rel_score_count = try checkedTensorElements(matrices, try checkedTensorElements(seq_len, rel_len));
+        try checkRawBytes(content_scores, score_count * @sizeOf(f32));
+        try checkRawBytes(c2p_scores, rel_score_count * @sizeOf(f32));
+        try checkRawBytes(p2c_scores, rel_score_count * @sizeOf(f32));
+        try checkRawBytes(mask, try checkedTensorElements(batch, seq_len) * @sizeOf(i64));
+        var content_ptr = content_scores.ptr;
+        var c2p_ptr = c2p_scores.ptr;
+        var p2c_ptr = p2c_scores.ptr;
+        var mask_ptr = mask.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_len_u32 = try toU32(seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&content_ptr), @ptrCast(&c2p_ptr),     @ptrCast(&p2c_ptr),       @ptrCast(&mask_ptr),
+            @ptrCast(&batch_u32),   @ptrCast(&seq_len_u32), @ptrCast(&num_heads_u32), @ptrCast(&head_dim_u32),
+        };
+        try launchBlocks(function, ctx, try checkedTensorElements(matrices, seq_len), 256, &params);
+        return true;
+    }
+
+    pub fn launchDebertaUnpackHeadsF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        packed_input: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) driver_mod.Error!bool {
+        const function = self.deberta_unpack_heads_f32 orelse return false;
+        if (seq_len == 0 or batch == 0 or num_heads == 0 or head_dim == 0) return false;
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), try checkedTensorElements(num_heads, head_dim));
+        try checkBytes(dst, count);
+        try checkBytes(packed_input, count);
+        var dst_ptr = dst.ptr;
+        var packed_ptr = packed_input.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_len_u32 = try toU32(seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr), @ptrCast(&packed_ptr), @ptrCast(&batch_u32), @ptrCast(&seq_len_u32), @ptrCast(&num_heads_u32), @ptrCast(&head_dim_u32),
+        };
+        try launch1d(function, ctx, count, &params);
+        return true;
     }
 
     pub fn launchSplitLastDim3F32(
@@ -6804,6 +9776,126 @@ pub const KernelModule = struct {
             @ptrCast(&out_dim_u32),
         };
         try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads, &params);
+    }
+
+    pub fn launchLinearQ4_0GeneratedMmvF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_generated_mmv orelse return error.CudaKernelUnavailable;
+        if (rows != 1) return error.InvalidCudaState;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&dst_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, 1, q4_0_tiled_threads, &params);
+    }
+
+    pub fn launchLinearQ4_0GeneratedPairF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_a: buffer_mod.DeviceBuffer,
+        dst_b: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_a_raw: buffer_mod.DeviceBuffer,
+        weight_b_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_generated_pair orelse return error.CudaKernelUnavailable;
+        if (rows != 1) return error.InvalidCudaState;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst_a, out_count);
+        try checkBytes(dst_b, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes);
+        try checkRawBytes(weight_a_raw, weight_bytes);
+        try checkRawBytes(weight_b_raw, weight_bytes);
+        if (out_count == 0) return;
+
+        var input_ptr = input.ptr;
+        var weight_a_ptr = weight_a_raw.ptr;
+        var weight_b_ptr = weight_b_raw.ptr;
+        var dst_a_ptr = dst_a.ptr;
+        var dst_b_ptr = dst_b.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_a_ptr),
+            @ptrCast(&weight_b_ptr),
+            @ptrCast(&dst_a_ptr),
+            @ptrCast(&dst_b_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, 1, q4_0_tiled_threads, &params);
+    }
+
+    pub fn launchLinearQ4_0GeneratedMmF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_generated_mm orelse return error.CudaKernelUnavailable;
+        if (rows < 9 or rows > 64) return error.InvalidCudaState;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&dst_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, (rows + 7) / 8, q4_0_tiled_threads, &params);
     }
 
     pub fn launchLinearQ4_0Tile4W4F32(
@@ -9025,8 +12117,324 @@ pub const KernelModule = struct {
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
     }
 
-    // E4B FFN-specific: the CUDA body bakes in 2560 input columns and
-    // 10240 activated columns to keep row-aware Q8_1 prefill fast.
+    pub fn launchLinearQ4_0GeneratedPairQ8E2B(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_q8_1: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_gate: buffer_mod.DeviceBuffer,
+        weight_up: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        activation: u8,
+    ) driver_mod.Error!void {
+        if (!generatedQ4_0PairQ8E2BShapeEligible(rows, in_dim, out_dim, activation)) return error.InvalidCudaState;
+        const function = switch (out_dim) {
+            generated_q4_0_q8_e2b_intermediate_small => self.linear_q4_0_generated_pair_q8_e2b_6144,
+            generated_q4_0_q8_e2b_intermediate_large => self.linear_q4_0_generated_pair_q8_e2b_12288,
+            else => unreachable,
+        } orelse return error.CudaKernelUnavailable;
+        const input_row_blocks = in_dim / q8_1_values_per_block;
+        const out_row_blocks = out_dim / q8_1_values_per_block;
+        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, input_row_blocks), q4_0_block_bytes);
+        try checkRawBytes(dst_q8_1, try checkedTensorElements(try checkedTensorElements(rows, out_row_blocks), q8_1_block_bytes));
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, input_row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_gate, weight_bytes);
+        try checkRawBytes(weight_up, weight_bytes);
+
+        var dst_ptr = dst_q8_1.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_gate_ptr = weight_gate.ptr;
+        var weight_up_ptr = weight_up.ptr;
+        var activation_u32: u32 = activation;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_gate_ptr),
+            @ptrCast(&weight_up_ptr),
+            @ptrCast(&activation_u32),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launchBlocks(function, ctx, try checkedTensorElements(rows, out_row_blocks), generated_q4_0_q8_e2b_pair_threads, &params);
+    }
+
+    pub fn launchLinearQ4_0GeneratedPairQ8Catalog(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        kernel_id: []const u8,
+        dst_q8_1: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_gate: buffer_mod.DeviceBuffer,
+        weight_up: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        activation: u8,
+    ) driver_mod.Error!void {
+        if (std.mem.eql(u8, kernel_id, cuda_kernel_renderer.planFor(.q4_0_pair_activation_q8_1).kernel_id)) {
+            return self.launchLinearQ4_0GeneratedPairQ8(
+                ctx,
+                dst_q8_1,
+                input_q8_1,
+                weight_gate,
+                weight_up,
+                rows,
+                in_dim,
+                out_dim,
+                activation,
+            );
+        }
+        if (!std.mem.eql(u8, kernel_id, cuda_kernel_renderer.planFor(.q4_0_pair_activation_q8_1_e2b_6144).kernel_id) and
+            !std.mem.eql(u8, kernel_id, cuda_kernel_renderer.planFor(.q4_0_pair_activation_q8_1_e2b_12288).kernel_id))
+        {
+            return error.CudaKernelUnavailable;
+        }
+        return self.launchLinearQ4_0GeneratedPairQ8E2B(
+            ctx,
+            dst_q8_1,
+            input_q8_1,
+            weight_gate,
+            weight_up,
+            rows,
+            in_dim,
+            out_dim,
+            activation,
+        );
+    }
+
+    pub fn launchLinearQ4_0GeneratedDownQ8E2B(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        if (!generatedQ4_0DownQ8E2BShapeEligible(rows, in_dim, out_dim)) return error.InvalidCudaState;
+        const function, const threads = switch (in_dim) {
+            generated_q4_0_q8_e2b_intermediate_small => .{ self.linear_q4_0_generated_down_q8_e2b_6144, generated_q4_0_q8_e2b_down_small_threads },
+            generated_q4_0_q8_e2b_intermediate_large => .{ self.linear_q4_0_generated_down_q8_e2b_12288, generated_q4_0_q8_e2b_down_large_threads },
+            else => unreachable,
+        };
+        const kernel = function orelse return error.CudaKernelUnavailable;
+        const input_row_blocks = in_dim / q8_1_values_per_block;
+        try checkBytes(dst, try checkedTensorElements(rows, out_dim));
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, input_row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, input_row_blocks), q4_0_block_bytes));
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launchBlocks(kernel, ctx, try checkedTensorElements(rows, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile), threads, &params);
+    }
+
+    pub fn launchLinearQ4_0GeneratedDownQ8Catalog(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        kernel_id: []const u8,
+        dst: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        if (std.mem.eql(u8, kernel_id, cuda_kernel_renderer.planFor(.q4_0_down_q8_1).kernel_id)) {
+            return self.launchLinearQ4_0GeneratedDownQ8(ctx, dst, input_q8_1, weight_raw, rows, in_dim, out_dim);
+        }
+        if (!std.mem.eql(u8, kernel_id, cuda_kernel_renderer.planFor(.q4_0_down_q8_1_e2b_6144).kernel_id) and
+            !std.mem.eql(u8, kernel_id, cuda_kernel_renderer.planFor(.q4_0_down_q8_1_e2b_12288).kernel_id))
+        {
+            return error.CudaKernelUnavailable;
+        }
+        return self.launchLinearQ4_0GeneratedDownQ8E2B(ctx, dst, input_q8_1, weight_raw, rows, in_dim, out_dim);
+    }
+
+    /// Exact F32 E2B gate/up kernel. This route intentionally writes the same
+    /// F32 activated intermediate as the handwritten tile4-w4 kernel.
+    pub fn launchLinearQ4_0GeneratedExactFfnPairF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_gate: buffer_mod.DeviceBuffer,
+        weight_up: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        activation: u8,
+    ) driver_mod.Error!void {
+        if (!generatedQ4_0ExactFfnPairE2BShapeEligible(rows, in_dim, out_dim)) return error.InvalidCudaState;
+        const function = switch (out_dim) {
+            generated_q4_0_q8_e2b_intermediate_small => self.linear_q4_0_generated_pair_f32_e2b_6144_exact,
+            generated_q4_0_q8_e2b_intermediate_large => self.linear_q4_0_generated_pair_f32_e2b_12288_exact,
+            else => unreachable,
+        } orelse return error.CudaKernelUnavailable;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes);
+        try checkBytes(dst, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_gate, weight_bytes);
+        try checkRawBytes(weight_up, weight_bytes);
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_gate_ptr = weight_gate.ptr;
+        var weight_up_ptr = weight_up.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var activation_u32: u32 = activation;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_gate_ptr),
+            @ptrCast(&weight_up_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            @ptrCast(&activation_u32),
+        };
+        try launchBlocks(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, generated_q4_0_exact_ffn_pair_threads, &params);
+    }
+
+    /// Exact F32 E2B down projection after the normal activated F32 buffer.
+    pub fn launchLinearQ4_0GeneratedExactFfnDownF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        if (!generatedQ4_0ExactFfnDownE2BShapeEligible(rows, in_dim, out_dim)) return error.InvalidCudaState;
+        const function = switch (in_dim) {
+            generated_q4_0_q8_e2b_intermediate_small => self.linear_q4_0_generated_down_f32_e2b_6144_exact,
+            generated_q4_0_q8_e2b_intermediate_large => self.linear_q4_0_generated_down_f32_e2b_12288_exact,
+            else => unreachable,
+        } orelse return error.CudaKernelUnavailable;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        try checkBytes(dst, try checkedTensorElements(rows, out_dim));
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launchBlocks(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, generated_q4_0_exact_ffn_down_threads, &params);
+    }
+
+    // Generated Q8_1 gated-down projection for decode and small batches.
+    pub fn launchLinearQ4_0GeneratedDownQ8(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        if (!generatedQ4_0DownQ8E4BShapeEligible(rows, in_dim, out_dim)) return error.InvalidCudaState;
+        const function = self.linear_q4_0_generated_down_q8 orelse return error.CudaKernelUnavailable;
+        const input_row_blocks = in_dim / q8_1_values_per_block;
+        try checkBytes(dst, try checkedTensorElements(rows, out_dim));
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, input_row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, input_row_blocks), q4_0_block_bytes));
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launchBlocks(function, ctx, try checkedTensorElements(rows, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile), q4_0_tiled_threads, &params);
+    }
+
+    pub fn launchLinearQ4_0GeneratedPairQ8(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_q8_1: buffer_mod.DeviceBuffer,
+        input_q8_1: buffer_mod.DeviceBuffer,
+        weight_gate: buffer_mod.DeviceBuffer,
+        weight_up: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        activation: u8,
+    ) driver_mod.Error!void {
+        if (!generatedQ4_0PairQ8E4BShapeEligible(rows, in_dim, out_dim)) return error.InvalidCudaState;
+        const function = self.linear_q4_0_generated_pair_q8 orelse return error.CudaKernelUnavailable;
+        const input_row_blocks = in_dim / q8_1_values_per_block;
+        const out_row_blocks = out_dim / q8_1_values_per_block;
+        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, input_row_blocks), q4_0_block_bytes);
+        try checkRawBytes(dst_q8_1, try checkedTensorElements(try checkedTensorElements(rows, out_row_blocks), q8_1_block_bytes));
+        try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, input_row_blocks), q8_1_block_bytes));
+        try checkRawBytes(weight_gate, weight_bytes);
+        try checkRawBytes(weight_up, weight_bytes);
+
+        var dst_ptr = dst_q8_1.ptr;
+        var input_ptr = input_q8_1.ptr;
+        var weight_gate_ptr = weight_gate.ptr;
+        var weight_up_ptr = weight_up.ptr;
+        var activation_u32: u32 = activation;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_gate_ptr),
+            @ptrCast(&weight_up_ptr),
+            @ptrCast(&activation_u32),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launchBlocks(function, ctx, try checkedTensorElements(rows, out_row_blocks), q4_0_pair_activation_q8_1_tile32_w5_threads, &params);
+    }
+
     pub fn launchLinearQ4_0PairActivationQ8_1Tile32W5E4BFfnQ8_1(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -10283,6 +13691,122 @@ const q4_0_pair_activation_q8_1_tile32_w5_rows16_threads: usize = 512;
 const q4_0_col_tile: usize = 4;
 const q4_0_col_tile8: usize = 8;
 const q4_0_col_tile16: usize = 16;
+
+// Generated Q8_1 FFN plans remain shape-specific at the launch boundary.
+const generated_q4_0_q8_e4b_rows: usize = 1;
+const generated_q4_0_q8_e4b_hidden_dim: usize = 2560;
+const generated_q4_0_q8_e4b_intermediate_dim: usize = 10240;
+
+const generated_q4_0_q8_e2b_rows: usize = 1;
+const generated_q4_0_q8_e2b_hidden_dim: usize = 1536;
+const generated_q4_0_q8_e2b_intermediate_small: usize = 6144;
+const generated_q4_0_q8_e2b_intermediate_large: usize = 12288;
+const generated_q4_0_q8_e2b_pair_threads: usize = 384;
+const generated_q4_0_q8_e2b_down_small_threads: usize = 128;
+const generated_q4_0_q8_e2b_down_large_threads: usize = 256;
+const generated_q4_0_q8_e2b_max_activation: u8 = @intFromEnum(@import("../../graph/backend_contracts.zig").DecoderRuntimeActivationKind.relu_squared);
+const generated_q4_0_exact_ffn_pair_threads: usize = 128;
+const generated_q4_0_exact_ffn_down_threads: usize = 256;
+
+const generated_q4_0_q8_1_argmax_e2b_rows: usize = 1;
+const generated_q4_0_q8_1_argmax_e2b_in_dim: usize = 1536;
+const generated_q4_0_q8_1_argmax_e2b_out_dim: usize = 262144;
+const generated_q4_0_q8_1_argmax_tile8_cols: usize = 8;
+const generated_q4_0_q8_1_argmax_tile8_threads: usize = 96;
+const generated_q4_0_q8_1_argmax_reduce_threads: usize = 512;
+
+const generated_q6_k_q8_1_argmax_rows: usize = 1;
+const generated_q6_k_q8_1_argmax_out_dim: usize = 262144;
+const generated_q6_k_q8_1_argmax_k2560_in_dim: usize = 2560;
+const generated_q6_k_q8_1_argmax_k3840_in_dim: usize = 3840;
+const generated_q6_k_q8_1_argmax_k2560_threads: usize = 160;
+const generated_q6_k_q8_1_argmax_k3840_threads: usize = 256;
+const generated_q6_k_q8_1_argmax_reduce_threads: usize = 512;
+
+const GeneratedQ4_0Q8_1ArgmaxLaunchBounds = struct {
+    row_blocks: usize,
+    col_tiles: usize,
+    partial_count: usize,
+    partial_bytes: usize,
+    q8_input_bytes: usize,
+    weight_bytes: usize,
+    output_bytes: usize,
+};
+
+pub fn linearQ4_0Q8_1ArgmaxE2BShapeEligible(rows: usize, in_dim: usize, out_dim: usize) bool {
+    return rows == generated_q4_0_q8_1_argmax_e2b_rows and
+        in_dim == generated_q4_0_q8_1_argmax_e2b_in_dim and
+        out_dim == generated_q4_0_q8_1_argmax_e2b_out_dim;
+}
+
+pub fn linearQ6KQ8_1GeneratedArgmaxShapeEligible(rows: usize, in_dim: usize, out_dim: usize) bool {
+    return rows == generated_q6_k_q8_1_argmax_rows and
+        out_dim == generated_q6_k_q8_1_argmax_out_dim and
+        (in_dim == generated_q6_k_q8_1_argmax_k2560_in_dim or
+            in_dim == generated_q6_k_q8_1_argmax_k3840_in_dim);
+}
+
+fn generatedQ6KQ8_1ArgmaxStage1Threads(in_dim: usize) usize {
+    return switch (in_dim) {
+        generated_q6_k_q8_1_argmax_k2560_in_dim => generated_q6_k_q8_1_argmax_k2560_threads,
+        generated_q6_k_q8_1_argmax_k3840_in_dim => generated_q6_k_q8_1_argmax_k3840_threads,
+        else => unreachable,
+    };
+}
+
+fn generatedQ4_0Q8_1ArgmaxLaunchBounds(rows: usize, in_dim: usize, out_dim: usize) driver_mod.Error!GeneratedQ4_0Q8_1ArgmaxLaunchBounds {
+    if (!linearQ4_0Q8_1ArgmaxE2BShapeEligible(rows, in_dim, out_dim)) return error.InvalidCudaState;
+    const row_blocks = in_dim / q8_1_values_per_block;
+    const col_tiles = (out_dim + generated_q4_0_q8_1_argmax_tile8_cols - 1) / generated_q4_0_q8_1_argmax_tile8_cols;
+    const partial_count = try checkedTensorElements(rows, col_tiles);
+    return .{
+        .row_blocks = row_blocks,
+        .col_tiles = col_tiles,
+        .partial_count = partial_count,
+        .partial_bytes = try checkedTensorElements(partial_count, @sizeOf(f32)),
+        .q8_input_bytes = try checkedTensorElements(try checkedTensorElements(rows, row_blocks), q8_1_block_bytes),
+        .weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes),
+        .output_bytes = try checkedTensorElements(rows, @sizeOf(u32)),
+    };
+}
+
+pub fn generatedQ4_0PairQ8E4BShapeEligible(rows: usize, in_dim: usize, out_dim: usize) bool {
+    return rows == generated_q4_0_q8_e4b_rows and
+        in_dim == generated_q4_0_q8_e4b_hidden_dim and
+        out_dim == generated_q4_0_q8_e4b_intermediate_dim;
+}
+
+pub fn generatedQ4_0DownQ8E4BShapeEligible(rows: usize, in_dim: usize, out_dim: usize) bool {
+    return rows == generated_q4_0_q8_e4b_rows and
+        in_dim == generated_q4_0_q8_e4b_intermediate_dim and
+        out_dim == generated_q4_0_q8_e4b_hidden_dim;
+}
+
+pub fn generatedQ4_0PairQ8E2BShapeEligible(rows: usize, in_dim: usize, out_dim: usize, activation: u8) bool {
+    return rows == generated_q4_0_q8_e2b_rows and
+        in_dim == generated_q4_0_q8_e2b_hidden_dim and
+        (out_dim == generated_q4_0_q8_e2b_intermediate_small or out_dim == generated_q4_0_q8_e2b_intermediate_large) and
+        activation <= generated_q4_0_q8_e2b_max_activation;
+}
+
+pub fn generatedQ4_0DownQ8E2BShapeEligible(rows: usize, in_dim: usize, out_dim: usize) bool {
+    return rows == generated_q4_0_q8_e2b_rows and
+        (in_dim == generated_q4_0_q8_e2b_intermediate_small or in_dim == generated_q4_0_q8_e2b_intermediate_large) and
+        out_dim == generated_q4_0_q8_e2b_hidden_dim;
+}
+
+pub fn generatedQ4_0ExactFfnPairE2BShapeEligible(rows: usize, in_dim: usize, out_dim: usize) bool {
+    return rows == generated_q4_0_q8_e2b_rows and
+        in_dim == generated_q4_0_q8_e2b_hidden_dim and
+        (out_dim == generated_q4_0_q8_e2b_intermediate_small or out_dim == generated_q4_0_q8_e2b_intermediate_large);
+}
+
+pub fn generatedQ4_0ExactFfnDownE2BShapeEligible(rows: usize, in_dim: usize, out_dim: usize) bool {
+    return rows == generated_q4_0_q8_e2b_rows and
+        (in_dim == generated_q4_0_q8_e2b_intermediate_small or in_dim == generated_q4_0_q8_e2b_intermediate_large) and
+        out_dim == generated_q4_0_q8_e2b_hidden_dim;
+}
+
 const q4_k_values_per_block: usize = 256;
 const q4_k_block_bytes: usize = 144;
 const q6_k_values_per_block: usize = 256;
@@ -10468,7 +13992,2032 @@ fn loadOptionalFunction(ctx: *context_mod.CudaContext, module: driver_mod.CUmodu
     return function;
 }
 
+const LiveRuntimeJitRoute = enum {
+    mmv,
+    mm,
+    pair,
+    pair_q8,
+    down_q8,
+};
+
+const LiveRuntimeJitShape = struct {
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+};
+
+const LiveRuntimeJitFixture = struct {
+    shape: LiveRuntimeJitShape,
+    measure: bool,
+};
+
+// Qualification allocates deterministic host and device fixtures. Keep the
+// peak allocation bounded even if a model contains an unexpected giant 2-D
+// table that otherwise resembles a quantized linear weight.
+const live_runtime_jit_max_fixture_bytes: usize = 128 * 1024 * 1024;
+const live_runtime_jit_sampled_output_count: usize = 8;
+const live_runtime_jit_weight_pattern_count: usize = 29;
+const live_runtime_jit_conformance_policy_identity =
+    "cuda-runtime-jit-conformance/v4:sampled-output8-all-input-rows;weight-pattern-bank29-row-strided;input-row-strided;fixture-heap-accounted";
+
+const LiveRuntimeJitConformance = struct {
+    const max_fixtures = JitRouteScope.max_observed_shapes * 3 + 3;
+
+    fixtures: [max_fixtures]LiveRuntimeJitFixture = undefined,
+    count: usize = 0,
+
+    fn append(self: *LiveRuntimeJitConformance, shape: LiveRuntimeJitShape, measure: bool) void {
+        for (self.fixtures[0..self.count]) |*fixture| {
+            if (fixture.shape.rows == shape.rows and
+                fixture.shape.in_dim == shape.in_dim and
+                fixture.shape.out_dim == shape.out_dim)
+            {
+                fixture.measure = fixture.measure or measure;
+                return;
+            }
+        }
+        if (self.count == self.fixtures.len) return;
+        self.fixtures[self.count] = .{ .shape = shape, .measure = measure };
+        self.count += 1;
+    }
+
+    fn forRoute(route: LiveRuntimeJitRoute, scope: JitRouteScope) LiveRuntimeJitConformance {
+        var result = LiveRuntimeJitConformance{};
+        switch (route) {
+            .mmv => {
+                // Minimum reduction domain plus output/reduction tile tails.
+                result.append(.{ .rows = 1, .in_dim = 512, .out_dim = 33 }, false);
+                result.append(.{ .rows = 1, .in_dim = 544, .out_dim = 64 }, false);
+                for (scope.observed_shapes[0..scope.observed_shape_count]) |shape| {
+                    result.append(.{ .rows = 1, .in_dim = shape[1], .out_dim = shape[0] }, true);
+                }
+                if (!hasMeasuredFixture(result)) {
+                    result.append(.{ .rows = 1, .in_dim = 1536, .out_dim = 8960 }, true);
+                }
+            },
+            .mm => {
+                // The dispatch bucket is rows 9...64. Exercise both boundaries,
+                // row/output tails, and each model-observed prefill shape.
+                result.append(.{ .rows = 9, .in_dim = 512, .out_dim = 33 }, false);
+                result.append(.{ .rows = 64, .in_dim = 544, .out_dim = 64 }, false);
+                for (scope.prefill_shapes[0..scope.prefill_shape_count]) |shape| {
+                    result.append(.{ .rows = 9, .in_dim = shape[1], .out_dim = shape[0] }, true);
+                    result.append(.{ .rows = 22, .in_dim = shape[1], .out_dim = shape[0] }, true);
+                    result.append(.{ .rows = 64, .in_dim = shape[1], .out_dim = shape[0] }, true);
+                }
+                if (!hasMeasuredFixture(result)) {
+                    result.append(.{ .rows = 9, .in_dim = 1536, .out_dim = 8960 }, true);
+                    result.append(.{ .rows = 22, .in_dim = 1536, .out_dim = 8960 }, true);
+                    result.append(.{ .rows = 64, .in_dim = 1536, .out_dim = 8960 }, true);
+                }
+            },
+            .pair => {
+                result.append(.{ .rows = 1, .in_dim = 512, .out_dim = 33 }, false);
+                result.append(.{ .rows = 1, .in_dim = 544, .out_dim = 64 }, false);
+                for (scope.pair_shapes[0..scope.pair_shape_count]) |shape| {
+                    result.append(.{ .rows = 1, .in_dim = shape[1], .out_dim = shape[0] }, true);
+                }
+                if (!hasMeasuredFixture(result)) {
+                    result.append(.{ .rows = 1, .in_dim = 1536, .out_dim = 8960 }, true);
+                }
+            },
+            .pair_q8 => result.append(.{ .rows = 1, .in_dim = 2560, .out_dim = 10240 }, true),
+            .down_q8 => result.append(.{ .rows = 1, .in_dim = 10240, .out_dim = 2560 }, true),
+        }
+        return result;
+    }
+
+    fn hasMeasuredFixture(self: LiveRuntimeJitConformance) bool {
+        for (self.fixtures[0..self.count]) |fixture| if (fixture.measure) return true;
+        return false;
+    }
+
+    fn identity(self: LiveRuntimeJitConformance, route: LiveRuntimeJitRoute) kernel_jit.ArtifactKey {
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(live_runtime_jit_conformance_policy_identity);
+        hasher.update(&.{@intFromEnum(route)});
+        var budget_encoded: [@sizeOf(u64)]u8 = undefined;
+        std.mem.writeInt(u64, &budget_encoded, live_runtime_jit_max_fixture_bytes, .little);
+        hasher.update(&budget_encoded);
+        for (self.fixtures[0..self.count]) |fixture| {
+            var encoded: [@sizeOf(u64) * 3 + 1]u8 = undefined;
+            std.mem.writeInt(u64, encoded[0..8], fixture.shape.rows, .little);
+            std.mem.writeInt(u64, encoded[8..16], fixture.shape.in_dim, .little);
+            std.mem.writeInt(u64, encoded[16..24], fixture.shape.out_dim, .little);
+            encoded[24] = @intFromBool(fixture.measure);
+            hasher.update(&encoded);
+        }
+        var digest: kernel_jit.ArtifactKey = undefined;
+        hasher.final(&digest);
+        return digest;
+    }
+};
+
+fn liveRuntimeJitFixtureAllocationBytes(
+    route: LiveRuntimeJitRoute,
+    fixture: LiveRuntimeJitFixture,
+) ?usize {
+    const shape = fixture.shape;
+    if (shape.rows == 0 or shape.in_dim == 0 or shape.out_dim == 0 or
+        shape.in_dim % q4_0_values_per_block != 0)
+    {
+        return null;
+    }
+    const input_count = std.math.mul(usize, shape.rows, shape.in_dim) catch return null;
+    const output_count = std.math.mul(usize, shape.rows, shape.out_dim) catch return null;
+    const input_f32_bytes = std.math.mul(usize, input_count, @sizeOf(f32)) catch return null;
+    const output_f32_bytes = std.math.mul(usize, output_count, @sizeOf(f32)) catch return null;
+    const row_blocks = shape.in_dim / q4_0_values_per_block;
+    const weight_bytes = std.math.mul(
+        usize,
+        std.math.mul(usize, shape.out_dim, row_blocks) catch return null,
+        q4_0_block_bytes,
+    ) catch return null;
+    const q8_input = route == .pair_q8 or route == .down_q8;
+    const q8_output = route == .pair_q8;
+    const paired = route == .pair or route == .pair_q8;
+
+    var total: usize = 0;
+    total = std.math.add(usize, total, input_f32_bytes) catch return null;
+    if (q8_input) {
+        if (input_count % q8_1_values_per_block != 0) return null;
+        const input_q8_bytes = std.math.mul(
+            usize,
+            input_count / q8_1_values_per_block,
+            q8_1_block_bytes,
+        ) catch return null;
+        // Quantized input remains resident in host and device memory while the
+        // original f32 host input is retained for deterministic generation.
+        total = std.math.add(
+            usize,
+            total,
+            std.math.mul(usize, input_q8_bytes, 2) catch return null,
+        ) catch return null;
+    } else {
+        total = std.math.add(usize, total, input_f32_bytes) catch return null;
+    }
+    // One host and one device copy per weight; pair routes hold two weights.
+    total = std.math.add(
+        usize,
+        total,
+        std.math.mul(usize, weight_bytes, if (paired) 4 else 2) catch return null,
+    ) catch return null;
+
+    const output_bytes = if (q8_output) blk: {
+        if (output_count % q8_1_values_per_block != 0) return null;
+        break :blk std.math.mul(
+            usize,
+            output_count / q8_1_values_per_block,
+            q8_1_block_bytes,
+        ) catch return null;
+    } else output_f32_bytes;
+    total = std.math.add(
+        usize,
+        total,
+        std.math.mul(usize, output_bytes, if (route == .pair) 4 else 2) catch return null,
+    ) catch return null;
+    if (q8_output) {
+        total = std.math.add(
+            usize,
+            total,
+            std.math.mul(usize, output_bytes, 2) catch return null,
+        ) catch return null;
+        total = std.math.add(
+            usize,
+            total,
+            std.math.mul(usize, output_f32_bytes, 2) catch return null,
+        ) catch return null;
+    } else {
+        total = std.math.add(
+            usize,
+            total,
+            std.math.mul(usize, output_f32_bytes, if (route == .pair) 4 else 2) catch return null,
+        ) catch return null;
+    }
+    const cpu_oracle_bytes = if (q8_input)
+        // Sparse Q8 oracles hold a dequantized input and one Q4 weight row.
+        std.math.mul(usize, shape.in_dim, 2 * @sizeOf(f32)) catch return null
+    else if (fixture.measure)
+        // Observed-shape oracles dequantize one sampled Q4 output row at a time.
+        std.math.mul(usize, shape.in_dim, @sizeOf(f32)) catch return null
+    else blk: {
+        // Boundary fixtures use the full independent oracle. Its dense f32
+        // weight and returned f32 output coexist at the helper's peak.
+        const dense_weight_bytes = std.math.mul(
+            usize,
+            std.math.mul(usize, shape.out_dim, shape.in_dim) catch return null,
+            @sizeOf(f32),
+        ) catch return null;
+        break :blk std.math.add(usize, dense_weight_bytes, output_f32_bytes) catch return null;
+    };
+    total = std.math.add(usize, total, cpu_oracle_bytes) catch return null;
+    return total;
+}
+
+fn liveRuntimeJitScopeWithinFixtureBudget(scope: JitRouteScope) bool {
+    const routes = [_]struct { enabled: bool, route: LiveRuntimeJitRoute }{
+        .{ .enabled = scope.production.mmv, .route = .mmv },
+        .{ .enabled = scope.production.mm, .route = .mm },
+        .{ .enabled = scope.production.pair, .route = .pair },
+        .{ .enabled = scope.production.pair_q8, .route = .pair_q8 },
+        .{ .enabled = scope.production.down_q8, .route = .down_q8 },
+    };
+    for (routes) |entry| {
+        if (!entry.enabled) continue;
+        const conformance = LiveRuntimeJitConformance.forRoute(entry.route, scope);
+        for (conformance.fixtures[0..conformance.count]) |fixture| {
+            const bytes = liveRuntimeJitFixtureAllocationBytes(entry.route, fixture) orelse
+                return false;
+            if (bytes > live_runtime_jit_max_fixture_bytes) return false;
+        }
+    }
+    return true;
+}
+
+const RuntimeJitQualificationScopes = struct {
+    scopes: [JitRouteScope.max_observed_shapes]JitRouteScope =
+        [_]JitRouteScope{.{}} ** JitRouteScope.max_observed_shapes,
+    count: usize = 0,
+    complete: bool = true,
+
+    fn forArtifact(
+        artifact: quant_kernel_compiler.GeneratedArtifact,
+        scope: JitRouteScope,
+    ) RuntimeJitQualificationScopes {
+        var result = RuntimeJitQualificationScopes{ .complete = scope.conformance_complete };
+        const route = liveRuntimeJitRoute(artifact) orelse return result;
+        switch (route) {
+            .mmv => for (scope.observed_shapes[0..scope.observed_shape_count]) |shape| {
+                var candidate = JitRouteScope{ .production = .{ .mmv = true } };
+                candidate.observed_shapes[0] = shape;
+                candidate.observed_shape_count = 1;
+                result.appendIfBounded(candidate);
+            },
+            .mm => for (scope.prefill_shapes[0..scope.prefill_shape_count]) |shape| {
+                var candidate = JitRouteScope{ .production = .{ .mm = true } };
+                candidate.prefill_shapes[0] = shape;
+                candidate.prefill_shape_count = 1;
+                result.appendIfBounded(candidate);
+            },
+            .pair => for (scope.pair_shapes[0..scope.pair_shape_count]) |shape| {
+                var candidate = JitRouteScope{ .production = .{ .pair = true } };
+                candidate.pair_shapes[0] = shape;
+                candidate.pair_shape_count = 1;
+                result.appendIfBounded(candidate);
+            },
+            .pair_q8 => result.appendIfBounded(.{ .production = .{ .pair_q8 = true } }),
+            .down_q8 => result.appendIfBounded(.{ .production = .{ .down_q8 = true } }),
+        }
+        return result;
+    }
+
+    fn appendIfBounded(self: *RuntimeJitQualificationScopes, scope: JitRouteScope) void {
+        if (!liveRuntimeJitScopeWithinFixtureBudget(scope) or self.count == self.scopes.len) {
+            self.complete = false;
+            return;
+        }
+        self.scopes[self.count] = scope;
+        self.count += 1;
+    }
+};
+
+const LiveRuntimeJitStep = struct {
+    route: LiveRuntimeJitRoute,
+    generated: bool,
+    module: *KernelModule,
+    ctx: *context_mod.CudaContext,
+    output: buffer_mod.DeviceBuffer,
+    output_b: buffer_mod.DeviceBuffer = .{},
+    input: buffer_mod.DeviceBuffer,
+    weight: buffer_mod.DeviceBuffer,
+    weight_b: buffer_mod.DeviceBuffer = .{},
+    shape: LiveRuntimeJitShape,
+
+    fn run(self: LiveRuntimeJitStep) !void {
+        switch (self.route) {
+            .mmv => if (self.generated)
+                try self.module.launchLinearQ4_0GeneratedMmvF32(
+                    self.ctx,
+                    self.output,
+                    self.input,
+                    self.weight,
+                    self.shape.rows,
+                    self.shape.in_dim,
+                    self.shape.out_dim,
+                )
+            else
+                try self.module.launchLinearQ4_0Tile4F32(
+                    self.ctx,
+                    self.output,
+                    self.input,
+                    self.weight,
+                    self.shape.rows,
+                    self.shape.in_dim,
+                    self.shape.out_dim,
+                ),
+            .mm => if (self.generated)
+                try self.module.launchLinearQ4_0GeneratedMmF32(
+                    self.ctx,
+                    self.output,
+                    self.input,
+                    self.weight,
+                    self.shape.rows,
+                    self.shape.in_dim,
+                    self.shape.out_dim,
+                )
+            else
+                try self.module.launchLinearQ4_0F32(
+                    self.ctx,
+                    self.output,
+                    self.input,
+                    self.weight,
+                    self.shape.rows,
+                    self.shape.in_dim,
+                    self.shape.out_dim,
+                ),
+            .pair => if (self.generated)
+                try self.module.launchLinearQ4_0GeneratedPairF32(
+                    self.ctx,
+                    self.output,
+                    self.output_b,
+                    self.input,
+                    self.weight,
+                    self.weight_b,
+                    self.shape.rows,
+                    self.shape.in_dim,
+                    self.shape.out_dim,
+                )
+            else
+                try self.module.launchLinearQ4_0PairNoBiasTile4W4F32(
+                    self.ctx,
+                    self.output,
+                    self.output_b,
+                    self.input,
+                    self.weight,
+                    self.weight_b,
+                    self.shape.rows,
+                    self.shape.in_dim,
+                    self.shape.out_dim,
+                ),
+            .pair_q8 => if (self.generated)
+                try self.module.launchLinearQ4_0GeneratedPairQ8(
+                    self.ctx,
+                    self.output,
+                    self.input,
+                    self.weight,
+                    self.weight_b,
+                    self.shape.rows,
+                    self.shape.in_dim,
+                    self.shape.out_dim,
+                    0,
+                )
+            else
+                try self.module.launchLinearQ4_0PairActivationQ8_1Tile32W5E4BFfnQ8_1(
+                    self.ctx,
+                    self.output,
+                    self.input,
+                    self.weight,
+                    self.weight_b,
+                    self.shape.rows,
+                    self.shape.in_dim,
+                    self.shape.out_dim,
+                    0,
+                ),
+            .down_q8 => if (self.generated)
+                try self.module.launchLinearQ4_0GeneratedDownQ8(
+                    self.ctx,
+                    self.output,
+                    self.input,
+                    self.weight,
+                    self.shape.rows,
+                    self.shape.in_dim,
+                    self.shape.out_dim,
+                )
+            else
+                try self.module.launchLinearQ4_0Q8_1Tile4W8F32(
+                    self.ctx,
+                    self.output,
+                    self.input,
+                    self.weight,
+                    self.shape.rows,
+                    self.shape.in_dim,
+                    self.shape.out_dim,
+                ),
+        }
+    }
+};
+
+const LiveRuntimeJitErrors = struct {
+    max_absolute: f64 = 0,
+    max_relative: f64 = 0,
+
+    fn merge(self: *LiveRuntimeJitErrors, other: LiveRuntimeJitErrors) void {
+        self.max_absolute = @max(self.max_absolute, other.max_absolute);
+        self.max_relative = @max(self.max_relative, other.max_relative);
+    }
+};
+
+fn liveRuntimeJitRoute(artifact: quant_kernel_compiler.GeneratedArtifact) ?LiveRuntimeJitRoute {
+    const kind = artifact.cuda_kernel orelse return null;
+    return switch (kind) {
+        .q4_0_mmv => .mmv,
+        .q4_0_mm => .mm,
+        .q4_0_pair_mmv => .pair,
+        .q4_0_pair_activation_q8_1 => .pair_q8,
+        .q4_0_down_q8_1 => .down_q8,
+        else => null,
+    };
+}
+
+fn liveRuntimeJitCandidateModule(request: RuntimeJitQualificationRequest) !KernelModule {
+    const function = request.candidate_functions[0];
+    if (function == null) return error.CudaJitCandidateSymbolMissing;
+    var candidate = request.module.*;
+    switch (liveRuntimeJitRoute(request.artifact) orelse return error.CudaJitQualificationUnsupported) {
+        .mmv => candidate.linear_q4_0_generated_mmv = function,
+        .mm => candidate.linear_q4_0_generated_mm = function,
+        .pair => candidate.linear_q4_0_generated_pair = function,
+        .pair_q8 => candidate.linear_q4_0_generated_pair_q8 = function,
+        .down_q8 => candidate.linear_q4_0_generated_down_q8 = function,
+    }
+    return candidate;
+}
+
+fn liveRuntimeJitMul(a: usize, b: usize) !usize {
+    return std.math.mul(usize, a, b) catch error.CudaJitQualificationSizeOverflow;
+}
+
+fn fillLiveRuntimeJitInput(values: []f32, shape: LiveRuntimeJitShape) !void {
+    if (values.len != try liveRuntimeJitMul(shape.rows, shape.in_dim) or shape.in_dim == 0) {
+        return error.CudaJitQualificationInvalidInputSize;
+    }
+    for (values, 0..) |*value, index| {
+        const row = index / shape.in_dim;
+        const column = index % shape.in_dim;
+        const lane: f32 = @floatFromInt((column * 5 + row * 17) % 97);
+        value.* = (lane - 48.0) * 0.005;
+    }
+}
+
+fn fillLiveRuntimeJitQ4_0(bytes: []u8, blocks_per_row: usize, alternate: bool) !void {
+    if (blocks_per_row == 0 or bytes.len % q4_0_block_bytes != 0) {
+        return error.CudaJitQualificationInvalidWeightSize;
+    }
+    const block_count = bytes.len / q4_0_block_bytes;
+    if (block_count % blocks_per_row != 0) return error.CudaJitQualificationInvalidWeightSize;
+    var patterns: [live_runtime_jit_weight_pattern_count][q4_0_block_bytes]u8 = undefined;
+    for (&patterns, 0..) |*pattern, block_index| {
+        var block: [q4_0_values_per_block]f32 = undefined;
+        for (&block, 0..) |*value, index| {
+            const lane: f32 = if (alternate)
+                @floatFromInt((index * 3 + block_index * 17) % 23)
+            else
+                @floatFromInt((index + block_index * 11) % 29);
+            value.* = if (alternate) (lane - 11.0) * 0.012 else (lane - 14.0) * 0.01;
+        }
+        quant_codec.quantizeQ4_0Block(&block, pattern);
+    }
+    for (0..block_count) |block_index| {
+        const output_row = block_index / blocks_per_row;
+        const local_block = block_index % blocks_per_row;
+        const pattern_index = (local_block * 7 + output_row * 11) % patterns.len;
+        const offset = block_index * q4_0_block_bytes;
+        @memcpy(bytes[offset..][0..q4_0_block_bytes], &patterns[pattern_index]);
+    }
+}
+
+fn compareLiveRuntimeJitF32(expected: []const f32, actual: []const f32) !LiveRuntimeJitErrors {
+    if (expected.len != actual.len) return error.CudaJitQualificationOutputSizeMismatch;
+    var result = LiveRuntimeJitErrors{};
+    for (expected, actual) |baseline, candidate| {
+        if (!std.math.isFinite(baseline) or !std.math.isFinite(candidate)) {
+            return error.CudaJitQualificationNonFiniteOutput;
+        }
+        const absolute: f64 = @floatCast(@abs(candidate - baseline));
+        const denominator = @max(@as(f64, @floatCast(@abs(baseline))), 1.0e-12);
+        result.max_absolute = @max(result.max_absolute, absolute);
+        result.max_relative = @max(result.max_relative, absolute / denominator);
+    }
+    return result;
+}
+
+fn liveRuntimeJitCpuQ4Reference(
+    allocator: std.mem.Allocator,
+    input: []const f32,
+    weight_bytes: []const u8,
+    shape: LiveRuntimeJitShape,
+) ![]f32 {
+    const weight_count = try liveRuntimeJitMul(shape.out_dim, shape.in_dim);
+    const weights = try allocator.alloc(f32, weight_count);
+    defer allocator.free(weights);
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, weight_bytes, weights);
+    const output_count = try liveRuntimeJitMul(shape.rows, shape.out_dim);
+    const output = try allocator.alloc(f32, output_count);
+    errdefer allocator.free(output);
+    for (0..shape.rows) |row| {
+        const input_row = input[row * shape.in_dim ..][0..shape.in_dim];
+        for (0..shape.out_dim) |out| {
+            const weight_row = weights[out * shape.in_dim ..][0..shape.in_dim];
+            var sum: f32 = 0;
+            for (input_row, weight_row) |lhs, rhs| sum += lhs * rhs;
+            output[row * shape.out_dim + out] = sum;
+        }
+    }
+    return output;
+}
+
+fn liveRuntimeJitCpuDot(input: []const f32, weight: []const f32) f32 {
+    std.debug.assert(input.len == weight.len);
+    var sum: f32 = 0;
+    for (input, weight) |lhs, rhs| sum += lhs * rhs;
+    return sum;
+}
+
+// Validate observed model strides without materializing a dense f32 weight.
+// Eight evenly spaced output rows are dequantized independently and checked
+// against both CUDA implementations for every input row.
+fn liveRuntimeJitCpuSampledQ4ReferenceErrors(
+    allocator: std.mem.Allocator,
+    input: []const f32,
+    weight_bytes: []const u8,
+    shape: LiveRuntimeJitShape,
+    baseline: []const f32,
+    candidate: []const f32,
+) !LiveRuntimeJitErrors {
+    const input_count = try liveRuntimeJitMul(shape.rows, shape.in_dim);
+    const output_count = try liveRuntimeJitMul(shape.rows, shape.out_dim);
+    if (shape.rows == 0 or shape.in_dim == 0 or shape.out_dim == 0 or
+        shape.in_dim % q4_0_values_per_block != 0 or
+        input.len != input_count or baseline.len != output_count or
+        candidate.len != output_count)
+    {
+        return error.CudaJitQualificationInvalidReferenceShape;
+    }
+    const weight_row_bytes = try liveRuntimeJitMul(
+        shape.in_dim / q4_0_values_per_block,
+        q4_0_block_bytes,
+    );
+    if (weight_bytes.len != try liveRuntimeJitMul(shape.out_dim, weight_row_bytes)) {
+        return error.CudaJitQualificationInvalidReferenceShape;
+    }
+
+    const weight_row = try allocator.alloc(f32, shape.in_dim);
+    defer allocator.free(weight_row);
+    const sample_count = @min(shape.out_dim, live_runtime_jit_sampled_output_count);
+    var result = LiveRuntimeJitErrors{};
+    for (0..sample_count) |sample_index| {
+        const output_row = if (sample_count == 1)
+            0
+        else
+            @as(usize, @intCast(
+                (@as(u128, sample_index) * @as(u128, shape.out_dim - 1)) /
+                    @as(u128, sample_count - 1),
+            ));
+        try quant_codec.dequantizeRow(
+            .{ .known = .Q4_0 },
+            weight_bytes,
+            shape.in_dim,
+            output_row,
+            weight_row,
+        );
+        for (0..shape.rows) |input_row_index| {
+            const input_row = input[input_row_index * shape.in_dim ..][0..shape.in_dim];
+            const expected = [_]f32{liveRuntimeJitCpuDot(input_row, weight_row)};
+            const output_index = input_row_index * shape.out_dim + output_row;
+            result.merge(try compareLiveRuntimeJitF32(
+                &expected,
+                baseline[output_index..][0..1],
+            ));
+            result.merge(try compareLiveRuntimeJitF32(
+                &expected,
+                candidate[output_index..][0..1],
+            ));
+        }
+    }
+    return result;
+}
+
+fn liveRuntimeJitCpuGelu(value: f32) f32 {
+    const inner = 0.7978845608028654 *
+        (value + 0.044715 * value * value * value);
+    return 0.5 * value * (1.0 + std.math.tanh(inner));
+}
+
+// The production pair-Q8 kernel is only eligible for the full E4B shape, so a
+// reduced-shape fixture cannot reach it. Instead, independently reconstruct a
+// sparse set of complete output quantization blocks. The samples span the
+// first two blocks, an interior block, and the final block, which covers both
+// weight-row indexing and output-block boundary behavior without materializing
+// either 100 MiB dense weight matrix.
+fn liveRuntimeJitCpuPairQ8ReferenceErrors(
+    allocator: std.mem.Allocator,
+    input_q8: []const u8,
+    weight_gate: []const u8,
+    weight_up: []const u8,
+    shape: LiveRuntimeJitShape,
+    baseline: []const f32,
+    candidate: []const f32,
+) !LiveRuntimeJitErrors {
+    if (shape.rows != 1 or shape.in_dim % q4_0_values_per_block != 0 or
+        shape.out_dim < q8_1_values_per_block or
+        shape.out_dim % q8_1_values_per_block != 0 or
+        baseline.len != shape.out_dim or candidate.len != shape.out_dim)
+    {
+        return error.CudaJitQualificationInvalidReferenceShape;
+    }
+
+    const input = try allocator.alloc(f32, shape.in_dim);
+    defer allocator.free(input);
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q8_1 }, input_q8, input);
+    const weight_row = try allocator.alloc(f32, shape.in_dim);
+    defer allocator.free(weight_row);
+    const weight_row_bytes = try liveRuntimeJitMul(
+        shape.in_dim / q4_0_values_per_block,
+        q4_0_block_bytes,
+    );
+    const expected_weight_bytes = try liveRuntimeJitMul(shape.out_dim, weight_row_bytes);
+    if (weight_gate.len != expected_weight_bytes or weight_up.len != expected_weight_bytes) {
+        return error.CudaJitQualificationInvalidReferenceShape;
+    }
+    const output_blocks = shape.out_dim / q8_1_values_per_block;
+    const sample_blocks = [_]usize{ 0, 1, output_blocks / 2, output_blocks - 1 };
+    var result = LiveRuntimeJitErrors{};
+
+    for (sample_blocks) |block_index| {
+        var activated: [q8_1_values_per_block]f32 = undefined;
+        for (&activated, 0..) |*value, lane| {
+            const output_index = block_index * q8_1_values_per_block + lane;
+            const gate_row = weight_gate[output_index * weight_row_bytes ..][0..weight_row_bytes];
+            try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, gate_row, weight_row);
+            const gate = liveRuntimeJitCpuDot(input, weight_row);
+            const up_row = weight_up[output_index * weight_row_bytes ..][0..weight_row_bytes];
+            try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, up_row, weight_row);
+            const up = liveRuntimeJitCpuDot(input, weight_row);
+            value.* = liveRuntimeJitCpuGelu(gate) * up;
+        }
+
+        var expected_q8: [q8_1_block_bytes]u8 = undefined;
+        quant_codec.quantizeQ8_1Block(&activated, &expected_q8);
+        var expected: [q8_1_values_per_block]f32 = undefined;
+        try quant_codec.dequantizeToFloat32(.{ .known = .Q8_1 }, &expected_q8, &expected);
+        const output_offset = block_index * q8_1_values_per_block;
+        result.merge(try compareLiveRuntimeJitF32(
+            &expected,
+            baseline[output_offset..][0..q8_1_values_per_block],
+        ));
+        result.merge(try compareLiveRuntimeJitF32(
+            &expected,
+            candidate[output_offset..][0..q8_1_values_per_block],
+        ));
+    }
+    return result;
+}
+
+// The down-Q8 route also has one exact E4B shape. Sample both sides of its
+// four-column launch tiles, a 32-column boundary, the midpoint, and the final
+// two output rows using a scalar Q8-by-Q4 reference.
+fn liveRuntimeJitCpuDownQ8ReferenceErrors(
+    allocator: std.mem.Allocator,
+    input_q8: []const u8,
+    weight_bytes: []const u8,
+    shape: LiveRuntimeJitShape,
+    baseline: []const f32,
+    candidate: []const f32,
+) !LiveRuntimeJitErrors {
+    if (shape.rows != 1 or shape.in_dim % q4_0_values_per_block != 0 or
+        shape.out_dim < 33 or baseline.len != shape.out_dim or
+        candidate.len != shape.out_dim)
+    {
+        return error.CudaJitQualificationInvalidReferenceShape;
+    }
+
+    const input = try allocator.alloc(f32, shape.in_dim);
+    defer allocator.free(input);
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q8_1 }, input_q8, input);
+    const weight_row = try allocator.alloc(f32, shape.in_dim);
+    defer allocator.free(weight_row);
+    const weight_row_bytes = try liveRuntimeJitMul(
+        shape.in_dim / q4_0_values_per_block,
+        q4_0_block_bytes,
+    );
+    if (weight_bytes.len != try liveRuntimeJitMul(shape.out_dim, weight_row_bytes)) {
+        return error.CudaJitQualificationInvalidReferenceShape;
+    }
+    const sample_outputs = [_]usize{
+        0,
+        3,
+        4,
+        31,
+        32,
+        shape.out_dim / 2,
+        shape.out_dim - 2,
+        shape.out_dim - 1,
+    };
+    var result = LiveRuntimeJitErrors{};
+    for (sample_outputs) |output_index| {
+        const weight_row_raw = weight_bytes[output_index * weight_row_bytes ..][0..weight_row_bytes];
+        try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, weight_row_raw, weight_row);
+        const expected = [_]f32{liveRuntimeJitCpuDot(input, weight_row)};
+        result.merge(try compareLiveRuntimeJitF32(&expected, baseline[output_index..][0..1]));
+        result.merge(try compareLiveRuntimeJitF32(&expected, candidate[output_index..][0..1]));
+    }
+    return result;
+}
+
+fn timeLiveRuntimeJitStep(step: LiveRuntimeJitStep) !u64 {
+    const pair = try step.ctx.beginProfileEventPair();
+    try step.run();
+    const elapsed_us = try step.ctx.endProfileEventPairUs(pair);
+    return @max(try std.math.mul(u64, elapsed_us, std.time.ns_per_us), 1);
+}
+
+fn qualifyLiveRuntimeJitTimings(
+    baseline: LiveRuntimeJitStep,
+    candidate: LiveRuntimeJitStep,
+    errors: LiveRuntimeJitErrors,
+    cancellation: ?RuntimeJitCancellation,
+) !?kernel_jit.QualificationRecord {
+    for (0..kernel_jit.warmup_repeats) |repeat| {
+        if (cancellation) |value| if (value.isCanceled()) return error.KernelJitCanceled;
+        if (repeat % 2 == 0) {
+            try baseline.run();
+            try candidate.run();
+        } else {
+            try candidate.run();
+            try baseline.run();
+        }
+        try baseline.ctx.synchronize();
+    }
+
+    var baseline_nanos: [kernel_jit.measurement_repeats]u64 = undefined;
+    var candidate_nanos: [kernel_jit.measurement_repeats]u64 = undefined;
+    for (0..kernel_jit.measurement_repeats) |repeat| {
+        if (cancellation) |value| if (value.isCanceled()) return error.KernelJitCanceled;
+        if (repeat % 2 == 0) {
+            baseline_nanos[repeat] = try timeLiveRuntimeJitStep(baseline);
+            candidate_nanos[repeat] = try timeLiveRuntimeJitStep(candidate);
+        } else {
+            candidate_nanos[repeat] = try timeLiveRuntimeJitStep(candidate);
+            baseline_nanos[repeat] = try timeLiveRuntimeJitStep(baseline);
+        }
+    }
+    const evidence = try kernel_jit.evidenceFromPairedNanos(
+        0,
+        true,
+        &baseline_nanos,
+        &candidate_nanos,
+    );
+    if (!kernel_jit.qualifies(evidence)) return null;
+    return .{
+        .candidate_index = 0,
+        .repeat_count = kernel_jit.measurement_repeats,
+        .correctness_passed = true,
+        .measured_speedup = evidence.measured_speedup,
+        .minimum_repeat_speedup = evidence.minimum_repeat_speedup,
+        .max_absolute_error = errors.max_absolute,
+        .max_relative_error = errors.max_relative,
+    };
+}
+
+const LiveRuntimeJitFixtureResult = struct {
+    errors: LiveRuntimeJitErrors,
+    correctness_passed: bool,
+    record: ?kernel_jit.QualificationRecord = null,
+};
+
+fn qualifyLiveRuntimeJitFixture(
+    request: RuntimeJitQualificationRequest,
+    route: LiveRuntimeJitRoute,
+    fixture: LiveRuntimeJitFixture,
+) !LiveRuntimeJitFixtureResult {
+    try request.checkCanceled();
+    const shape = fixture.shape;
+    const input_count = try liveRuntimeJitMul(shape.rows, shape.in_dim);
+    const output_count = try liveRuntimeJitMul(shape.rows, shape.out_dim);
+    const row_blocks = shape.in_dim / q4_0_values_per_block;
+    const weight_bytes = try liveRuntimeJitMul(
+        try liveRuntimeJitMul(shape.out_dim, row_blocks),
+        q4_0_block_bytes,
+    );
+    const q8_input = route == .pair_q8 or route == .down_q8;
+    const q8_output = route == .pair_q8;
+    const paired = route == .pair or route == .pair_q8;
+
+    const input_host = try request.allocator.alloc(f32, input_count);
+    defer request.allocator.free(input_host);
+    try fillLiveRuntimeJitInput(input_host, shape);
+    const input_q8_host = if (q8_input)
+        try quant_codec.quantizeQ8_1FromF32(request.allocator, input_host)
+    else
+        null;
+    defer if (input_q8_host) |bytes| request.allocator.free(bytes);
+    const input_bytes: []const u8 = if (input_q8_host) |bytes|
+        bytes
+    else
+        std.mem.sliceAsBytes(input_host);
+
+    const weight_host = try request.allocator.alloc(u8, weight_bytes);
+    defer request.allocator.free(weight_host);
+    try fillLiveRuntimeJitQ4_0(weight_host, row_blocks, false);
+    const weight_b_host = if (paired) try request.allocator.alloc(u8, weight_bytes) else null;
+    defer if (weight_b_host) |bytes| request.allocator.free(bytes);
+    if (weight_b_host) |bytes| try fillLiveRuntimeJitQ4_0(bytes, row_blocks, true);
+    try request.checkCanceled();
+
+    const output_bytes = if (q8_output)
+        try liveRuntimeJitMul(output_count / q8_1_values_per_block, q8_1_block_bytes)
+    else
+        try liveRuntimeJitMul(output_count, @sizeOf(f32));
+
+    var input = try buffer_mod.DeviceBuffer.alloc(request.ctx, input_bytes.len);
+    defer input.free(request.ctx);
+    var weight = try buffer_mod.DeviceBuffer.alloc(request.ctx, weight_bytes);
+    defer weight.free(request.ctx);
+    var weight_b = if (paired)
+        try buffer_mod.DeviceBuffer.alloc(request.ctx, weight_bytes)
+    else
+        buffer_mod.DeviceBuffer{};
+    defer weight_b.free(request.ctx);
+    var baseline_output = try buffer_mod.DeviceBuffer.alloc(request.ctx, output_bytes);
+    defer baseline_output.free(request.ctx);
+    var candidate_output = try buffer_mod.DeviceBuffer.alloc(request.ctx, output_bytes);
+    defer candidate_output.free(request.ctx);
+    var baseline_output_b = if (route == .pair)
+        try buffer_mod.DeviceBuffer.alloc(request.ctx, output_bytes)
+    else
+        buffer_mod.DeviceBuffer{};
+    defer baseline_output_b.free(request.ctx);
+    var candidate_output_b = if (route == .pair)
+        try buffer_mod.DeviceBuffer.alloc(request.ctx, output_bytes)
+    else
+        buffer_mod.DeviceBuffer{};
+    defer candidate_output_b.free(request.ctx);
+
+    try input.copyFromHost(request.ctx, input_bytes);
+    try weight.copyFromHost(request.ctx, weight_host);
+    if (weight_b_host) |bytes| try weight_b.copyFromHost(request.ctx, bytes);
+    try request.ctx.synchronize();
+    try request.checkCanceled();
+
+    var candidate_module = try liveRuntimeJitCandidateModule(request);
+    const baseline_step = LiveRuntimeJitStep{
+        .route = route,
+        .generated = false,
+        .module = request.module,
+        .ctx = request.ctx,
+        .output = baseline_output,
+        .output_b = baseline_output_b,
+        .input = input,
+        .weight = weight,
+        .weight_b = weight_b,
+        .shape = shape,
+    };
+    const candidate_step = LiveRuntimeJitStep{
+        .route = route,
+        .generated = true,
+        .module = &candidate_module,
+        .ctx = request.ctx,
+        .output = candidate_output,
+        .output_b = candidate_output_b,
+        .input = input,
+        .weight = weight,
+        .weight_b = weight_b,
+        .shape = shape,
+    };
+
+    try baseline_step.run();
+    var errors = LiveRuntimeJitErrors{};
+    if (q8_output) {
+        const baseline_raw = try request.allocator.alloc(u8, output_bytes);
+        defer request.allocator.free(baseline_raw);
+        const candidate_raw = try request.allocator.alloc(u8, output_bytes);
+        defer request.allocator.free(candidate_raw);
+        @memset(candidate_raw, 0x7f);
+        try candidate_output.copyFromHost(request.ctx, candidate_raw);
+        try candidate_step.run();
+        try baseline_output.copyToHost(request.ctx, baseline_raw);
+        try candidate_output.copyToHost(request.ctx, candidate_raw);
+        try request.ctx.synchronize();
+        const baseline_f32 = try request.allocator.alloc(f32, output_count);
+        defer request.allocator.free(baseline_f32);
+        const candidate_f32 = try request.allocator.alloc(f32, output_count);
+        defer request.allocator.free(candidate_f32);
+        try quant_codec.dequantizeToFloat32(.{ .known = .Q8_1 }, baseline_raw, baseline_f32);
+        try quant_codec.dequantizeToFloat32(.{ .known = .Q8_1 }, candidate_raw, candidate_f32);
+        errors = try compareLiveRuntimeJitF32(baseline_f32, candidate_f32);
+        errors.merge(try liveRuntimeJitCpuPairQ8ReferenceErrors(
+            request.allocator,
+            input_q8_host.?,
+            weight_host,
+            weight_b_host.?,
+            shape,
+            baseline_f32,
+            candidate_f32,
+        ));
+    } else {
+        const baseline_f32 = try request.allocator.alloc(f32, output_count);
+        defer request.allocator.free(baseline_f32);
+        const candidate_f32 = try request.allocator.alloc(f32, output_count);
+        defer request.allocator.free(candidate_f32);
+        @memset(candidate_f32, std.math.nan(f32));
+        try candidate_output.copyFromHost(request.ctx, std.mem.sliceAsBytes(candidate_f32));
+        try candidate_step.run();
+        try baseline_output.copyToHost(request.ctx, std.mem.sliceAsBytes(baseline_f32));
+        try candidate_output.copyToHost(request.ctx, std.mem.sliceAsBytes(candidate_f32));
+        if (route == .pair) {
+            const baseline_b = try request.allocator.alloc(f32, output_count);
+            defer request.allocator.free(baseline_b);
+            const candidate_b = try request.allocator.alloc(f32, output_count);
+            defer request.allocator.free(candidate_b);
+            @memset(candidate_b, std.math.nan(f32));
+            try candidate_output_b.copyFromHost(request.ctx, std.mem.sliceAsBytes(candidate_b));
+            // Re-run after poisoning both candidate outputs: a fused kernel must
+            // prove that it writes the complete output bundle in one launch.
+            @memset(candidate_f32, std.math.nan(f32));
+            try candidate_output.copyFromHost(request.ctx, std.mem.sliceAsBytes(candidate_f32));
+            try candidate_step.run();
+            try candidate_output.copyToHost(request.ctx, std.mem.sliceAsBytes(candidate_f32));
+            try baseline_output_b.copyToHost(request.ctx, std.mem.sliceAsBytes(baseline_b));
+            try candidate_output_b.copyToHost(request.ctx, std.mem.sliceAsBytes(candidate_b));
+            try request.ctx.synchronize();
+            errors.merge(try compareLiveRuntimeJitF32(baseline_b, candidate_b));
+            if (fixture.measure) {
+                errors.merge(try liveRuntimeJitCpuSampledQ4ReferenceErrors(
+                    request.allocator,
+                    input_host,
+                    weight_b_host.?,
+                    shape,
+                    baseline_b,
+                    candidate_b,
+                ));
+            } else {
+                const reference_b = try liveRuntimeJitCpuQ4Reference(
+                    request.allocator,
+                    input_host,
+                    weight_b_host.?,
+                    shape,
+                );
+                defer request.allocator.free(reference_b);
+                errors.merge(try compareLiveRuntimeJitF32(reference_b, baseline_b));
+                errors.merge(try compareLiveRuntimeJitF32(reference_b, candidate_b));
+            }
+        } else {
+            try request.ctx.synchronize();
+        }
+        errors.merge(try compareLiveRuntimeJitF32(baseline_f32, candidate_f32));
+        if (route == .down_q8) {
+            errors.merge(try liveRuntimeJitCpuDownQ8ReferenceErrors(
+                request.allocator,
+                input_q8_host.?,
+                weight_host,
+                shape,
+                baseline_f32,
+                candidate_f32,
+            ));
+        } else if (fixture.measure) {
+            errors.merge(try liveRuntimeJitCpuSampledQ4ReferenceErrors(
+                request.allocator,
+                input_host,
+                weight_host,
+                shape,
+                baseline_f32,
+                candidate_f32,
+            ));
+        } else {
+            const reference = try liveRuntimeJitCpuQ4Reference(
+                request.allocator,
+                input_host,
+                weight_host,
+                shape,
+            );
+            defer request.allocator.free(reference);
+            errors.merge(try compareLiveRuntimeJitF32(reference, baseline_f32));
+            errors.merge(try compareLiveRuntimeJitF32(reference, candidate_f32));
+        }
+    }
+    try request.checkCanceled();
+
+    const tolerance: f64 = 0.01;
+    if (errors.max_absolute > tolerance) {
+        std.log.warn(
+            "CUDA runtime JIT correctness rejected {s} rows={d} in={d} out={d}: max_abs={d:.6} tolerance={d:.6}",
+            .{ request.artifact.kernel_id, shape.rows, shape.in_dim, shape.out_dim, errors.max_absolute, tolerance },
+        );
+        return .{ .errors = errors, .correctness_passed = false };
+    }
+    if (!fixture.measure) return .{ .errors = errors, .correctness_passed = true };
+    const record = try qualifyLiveRuntimeJitTimings(
+        baseline_step,
+        candidate_step,
+        errors,
+        request.cancellation,
+    );
+    if (record == null) {
+        std.log.warn(
+            "CUDA runtime JIT timing rejected {s} rows={d} in={d} out={d}: requires median and every repeat >= {d:.2}x",
+            .{ request.artifact.kernel_id, shape.rows, shape.in_dim, shape.out_dim, kernel_jit.minimum_speedup },
+        );
+    }
+    return .{ .errors = errors, .correctness_passed = true, .record = record };
+}
+
+fn liveRuntimeJitQualification(
+    _: ?*anyopaque,
+    request: RuntimeJitQualificationRequest,
+) !?kernel_jit.QualificationRecord {
+    const route = liveRuntimeJitRoute(request.artifact) orelse
+        return error.CudaJitQualificationUnsupported;
+    const conformance = LiveRuntimeJitConformance.forRoute(route, request.scope);
+    var aggregate_errors = LiveRuntimeJitErrors{};
+    var aggregate_record: ?kernel_jit.QualificationRecord = null;
+    for (conformance.fixtures[0..conformance.count]) |fixture| {
+        const result = try qualifyLiveRuntimeJitFixture(request, route, fixture);
+        aggregate_errors.merge(result.errors);
+        if (!result.correctness_passed) return null;
+        if (!fixture.measure) continue;
+        const record = result.record orelse return null;
+        if (aggregate_record) |*aggregate| {
+            aggregate.measured_speedup = @min(aggregate.measured_speedup, record.measured_speedup);
+            aggregate.minimum_repeat_speedup = @min(
+                aggregate.minimum_repeat_speedup,
+                record.minimum_repeat_speedup,
+            );
+        } else {
+            aggregate_record = record;
+        }
+    }
+    var qualified = aggregate_record orelse return null;
+    qualified.max_absolute_error = aggregate_errors.max_absolute;
+    qualified.max_relative_error = aggregate_errors.max_relative;
+    std.log.info(
+        "CUDA runtime JIT qualified {s}: fixtures={d} median_floor={d:.3} worst_floor={d:.3} max_abs={d:.6}",
+        .{
+            request.artifact.kernel_id,
+            conformance.count,
+            qualified.measured_speedup,
+            qualified.minimum_repeat_speedup,
+            qualified.max_absolute_error,
+        },
+    );
+    return qualified;
+}
+
+fn handleRuntimeJitFailure(
+    mode: kernel_jit.Mode,
+    required_route: bool,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    stage: []const u8,
+    message: []const u8,
+    detail: []const u8,
+) !void {
+    if (detail.len == 0) {
+        std.log.warn("CUDA runtime JIT {s} failed for {s}: {s}", .{ stage, artifact.kernel_id, message });
+    } else {
+        std.log.warn("CUDA runtime JIT {s} failed for {s}: {s}: {s}", .{ stage, artifact.kernel_id, message, detail });
+    }
+    if (mode.failClosed() and required_route) return error.CudaJitRequiredRouteFailed;
+}
+
+fn handleRuntimeJitLoadFailure(mode: kernel_jit.Mode, err: anyerror) !void {
+    if (mode.failClosed()) {
+        std.log.warn(
+            "CUDA runtime JIT required scope failed before activation: {s}",
+            .{@errorName(err)},
+        );
+        return error.CudaJitRequiredRouteFailed;
+    }
+    std.log.warn("CUDA runtime JIT unavailable; using bundled kernels: {s}", .{@errorName(err)});
+}
+
+fn handleRuntimeJitCacheFailure(stage: []const u8, message: []const u8) void {
+    std.log.warn("CUDA runtime JIT cache {s} failed: {s}", .{ stage, message });
+}
+
+fn runtimeJitBaseline(artifact: quant_kernel_compiler.GeneratedArtifact) []const u8 {
+    if (artifact.cuda_kernel) |kind| return cuda_kernel_renderer.planFor(kind).production_baseline;
+    if (artifact.cuda_attention_kernel) |kind| return cuda_kernel_renderer.attentionPlanFor(kind).production_baseline;
+    return artifact.source_path;
+}
+
+fn runtimeJitCompileKey(
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    source: []const u8,
+    target_identity: []const u8,
+    compiler_identity: []const u8,
+    compiler_options: []const u8,
+) kernel_jit.ArtifactKey {
+    return kernel_jit.compileArtifactKey(.{
+        .backend = .cuda,
+        .semantic_identity = artifact.kernel_id,
+        .runtime_identity = @tagName(artifact.opKind()),
+        .target_identity = target_identity,
+        .device_identity = "",
+        .schedule_identity = artifact.source_path,
+        .baseline_identity = "",
+        .compiler_identity = compiler_identity,
+        .compiler_options = compiler_options,
+        .source = source,
+    });
+}
+
+fn runtimeJitQualificationKey(
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    scope: JitRouteScope,
+    compile_key: kernel_jit.ArtifactKey,
+    candidate_ptx_sha256: kernel_jit.ArtifactKey,
+    bundled_image_sha256: []const u8,
+    device_identity: []const u8,
+) kernel_jit.ArtifactKey {
+    var conformance_hex_buffer: [@sizeOf(kernel_jit.ArtifactKey) * 2]u8 = @splat('0');
+    if (liveRuntimeJitRoute(artifact)) |route| {
+        const conformance = LiveRuntimeJitConformance.forRoute(route, scope);
+        conformance_hex_buffer = std.fmt.bytesToHex(conformance.identity(route), .lower);
+    }
+    var baseline_identity_buffer: [1024]u8 = undefined;
+    const baseline_identity = std.fmt.bufPrint(
+        &baseline_identity_buffer,
+        "{s};artifact_mode={s};artifact_format={s};artifact_target={s};artifact_image_sha256={s};bundle_sha256={s};qualifier_sha256={s};dispatch_sha256={s};conformance_sha256={s}",
+        .{
+            runtimeJitBaseline(artifact),
+            cuda_artifact.mode,
+            cuda_artifact.format,
+            cuda_artifact.target,
+            bundled_image_sha256,
+            build_options.cuda_jit_baseline_implementation_sha256,
+            build_options.cuda_jit_qualification_implementation_sha256,
+            build_options.cuda_jit_dispatch_implementation_sha256,
+            &conformance_hex_buffer,
+        },
+    ) catch unreachable;
+    const compile_key_hex = kernel_jit.artifactKeyHex(compile_key);
+    return kernel_jit.artifactKey(.{
+        .backend = .cuda,
+        .semantic_identity = artifact.kernel_id,
+        .runtime_identity = @tagName(artifact.opKind()),
+        .target_identity = &compile_key_hex,
+        .device_identity = device_identity,
+        .schedule_identity = &conformance_hex_buffer,
+        .baseline_identity = baseline_identity,
+        .compiler_identity = "",
+        .compiler_options = "",
+        .source = &candidate_ptx_sha256,
+    });
+}
+
+fn runtimeJitSha256(bytes: []const u8) kernel_jit.ArtifactKey {
+    var digest: kernel_jit.ArtifactKey = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return digest;
+}
+
+fn cudaBundledImageSha256Hex() [std.crypto.hash.sha2.Sha256.digest_length * 2]u8 {
+    return std.fmt.bytesToHex(runtimeJitSha256(cuda_artifact.image), .lower);
+}
+
+fn loadRuntimeJitCachedPtx(
+    cache: ?*kernel_jit.ArtifactCache,
+    key: kernel_jit.ArtifactKey,
+) !?[]u8 {
+    const value = cache orelse return null;
+    return value.load(.cuda_ptx, key);
+}
+
+fn validRuntimeJitPtx(ptx: []const u8) bool {
+    return ptx.len > 0 and ptx.len <= nvrtc_mod.max_ptx_bytes and ptx[ptx.len - 1] == 0;
+}
+
+fn loadRuntimeJitQualification(
+    allocator: std.mem.Allocator,
+    cache: ?*kernel_jit.ArtifactCache,
+    key: kernel_jit.ArtifactKey,
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+) ?kernel_jit.QualificationRecord {
+    const value = cache orelse return null;
+    const encoded = value.load(.qualification, key) catch |err| {
+        handleRuntimeJitCacheFailure("qualification load", @errorName(err));
+        return null;
+    } orelse return null;
+    defer allocator.free(encoded);
+    const record = kernel_jit.QualificationRecord.decode(encoded) catch |err| {
+        std.log.warn(
+            "CUDA runtime JIT qualification for {s} is invalid: {s}",
+            .{ artifact.kernel_id, @errorName(err) },
+        );
+        return null;
+    };
+    return if (record.eligible()) record else null;
+}
+
+const RuntimeJitQualificationResolution = struct {
+    record: ?kernel_jit.QualificationRecord = null,
+    measured_live: bool = false,
+};
+
+fn resolveRuntimeJitQualification(
+    mode: kernel_jit.Mode,
+    required_route: bool,
+    cached: ?kernel_jit.QualificationRecord,
+    qualifier: ?RuntimeJitQualifier,
+    request: RuntimeJitQualificationRequest,
+) !RuntimeJitQualificationResolution {
+    if (cached) |record| return .{ .record = record };
+    _ = mode;
+    if (!required_route) return .{};
+    const runner = qualifier orelse return .{ .measured_live = true };
+    const measured = try runner.run(request);
+    return .{
+        .record = if (measured) |record| if (record.eligible()) record else null else null,
+        .measured_live = true,
+    };
+}
+
+fn shouldActivateRuntimeJitArtifact(
+    artifact: quant_kernel_compiler.GeneratedArtifact,
+    mode: kernel_jit.Mode,
+    required_route: bool,
+    qualified: bool,
+) !bool {
+    if (!artifact.production_enabled or !required_route or !mode.activates()) return false;
+    if (qualified) return true;
+    if (mode.failClosed()) return error.CudaJitRequiredRouteUnqualified;
+    return false;
+}
+
+fn ensureRuntimeJitRequiredComplete(
+    mode: kernel_jit.Mode,
+    pending: JitProductionRoutes,
+) !void {
+    if (mode.failClosed() and pending.any()) return error.CudaJitRequiredRouteFailed;
+}
+
+test "CUDA runtime JIT mappings cover complete artifact function bundles" {
+    var module = KernelModule{};
+    var cuda_artifacts: usize = 0;
+    var attention_artifacts: usize = 0;
+    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+        if (artifact.backend != .cuda) continue;
+        cuda_artifacts += 1;
+        const mapping = module.generatedFunctionMapping(artifact) orelse
+            return error.MissingCudaRuntimeJitFunctionMapping;
+        try std.testing.expectEqualStrings(artifact.kernel_id, mapping.names[0]);
+        const expected_count: usize = if (artifact.cuda_attention_kernel == null)
+            1
+        else switch (artifact.cuda_attention_kernel.?) {
+            .gqa_decode_score_prework_hd256_f32, .gqa_decode_score_prework_hd512_f32 => @as(usize, 2),
+            else => @as(usize, 3),
+        };
+        try std.testing.expectEqual(expected_count, mapping.count);
+        if (artifact.cuda_attention_kernel != null) attention_artifacts += 1;
+        for (0..mapping.count) |index| {
+            try std.testing.expect(mapping.slots[index] != null);
+            try std.testing.expect(mapping.names[index].len > 0);
+        }
+    }
+    try std.testing.expect(cuda_artifacts > 0);
+    try std.testing.expect(attention_artifacts > 0);
+}
+
+test "CUDA runtime JIT profile scope covers only Gemma4 production routes" {
+    inline for (.{
+        JitModelProfile.clipclap,
+        JitModelProfile.bert_encoder,
+        JitModelProfile.deberta_reranker,
+        JitModelProfile.gliner2,
+        JitModelProfile.florence2,
+    }) |profile| {
+        try std.testing.expect(!JitRouteScope.maximumForProfile(profile).enabled());
+    }
+
+    const scope = JitRouteScope.maximumForProfile(.gemma4);
+    try std.testing.expect(scope.enabled());
+    try std.testing.expect(scope.production.mmv);
+    try std.testing.expect(scope.production.mm);
+    try std.testing.expect(scope.production.pair);
+    try std.testing.expect(scope.production.pair_q8);
+    try std.testing.expect(scope.production.down_q8);
+    var selected: usize = 0;
+    var production: usize = 0;
+    for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+        if (artifact.backend != .cuda) continue;
+        if (artifact.production_enabled) production += 1;
+        if (!scope.includesArtifact(artifact)) continue;
+        selected += 1;
+        try std.testing.expect(artifact.production_enabled);
+        try std.testing.expect(liveRuntimeJitRoute(artifact) != null);
+    }
+    try std.testing.expectEqual(@as(usize, 5), production);
+    try std.testing.expectEqual(production, selected);
+}
+
+test "CUDA runtime JIT required mode rejects an empty model scope before CUDA access" {
+    try std.testing.expectError(
+        error.CudaJitRequiredRouteFailed,
+        KernelModule.loadWithKernelJitForScope(
+            @ptrFromInt(4096),
+            std.testing.allocator,
+            .{ .mode = .required },
+            .gliner2,
+            .{},
+        ),
+    );
+}
+
+test "CUDA runtime JIT load context gates all live work before CUDA access" {
+    const scope = JitRouteScope.maximumForProfile(.gemma4);
+    try std.testing.expectEqual(
+        RuntimeJitLoadDisposition.bundled,
+        runtimeJitLoadDisposition(.on, scope, .dynamic),
+    );
+    try std.testing.expectEqual(
+        RuntimeJitLoadDisposition.bundled,
+        runtimeJitLoadDisposition(.shadow, scope, .dynamic),
+    );
+    try std.testing.expectEqual(
+        RuntimeJitLoadDisposition.qualify,
+        runtimeJitLoadDisposition(.on, scope, .startup_preload),
+    );
+    try std.testing.expectEqual(
+        RuntimeJitLoadDisposition.reject_required,
+        runtimeJitLoadDisposition(.required, scope, .dynamic),
+    );
+    try std.testing.expectError(
+        error.CudaJitRequiredRouteFailed,
+        KernelModule.loadWithKernelJitForScope(
+            @ptrFromInt(4096),
+            std.testing.allocator,
+            .{ .mode = .required },
+            .gemma4,
+            scope,
+        ),
+    );
+}
+
+test "CUDA runtime JIT route builder derives required scope from observed Q4_0 shapes" {
+    var unsupported = JitRouteScopeBuilder.init(.gliner2);
+    unsupported.observeQ4_0Matrix("model.layers.0.mlp.gate_proj.weight", 10240, 2560, true);
+    try std.testing.expect(!unsupported.finish().enabled());
+
+    var generic = JitRouteScopeBuilder.init(.gemma4);
+    generic.observeQ4_0Matrix("model.layers.0.self_attn.q_proj.weight", 2048, 1536, true);
+    const generic_scope = generic.finish();
+    try std.testing.expect(generic_scope.production.mmv);
+    try std.testing.expect(generic_scope.production.mm);
+    try std.testing.expect(!generic_scope.production.pair);
+    try std.testing.expect(!generic_scope.production.pair_q8);
+    try std.testing.expect(!generic_scope.production.down_q8);
+
+    var decode_only = JitRouteScopeBuilder.init(.gemma4);
+    decode_only.observeQ4_0Matrix("model.layers.0.self_attn.q_proj.weight", 2048, 1536, false);
+    const decode_scope = decode_only.finish();
+    try std.testing.expect(decode_scope.production.mmv);
+    try std.testing.expect(!decode_scope.production.mm);
+
+    var e2b = JitRouteScopeBuilder.init(.gemma4);
+    e2b.observeQ4_0Matrix("model.layers.0.mlp.gate_proj.weight", 8960, 1536, true);
+    e2b.observeQ4_0Matrix("model.layers.0.mlp.up_proj.weight", 8960, 1536, true);
+    e2b.observeQ4_0Matrix("model.layers.0.mlp.down_proj.weight", 1536, 8960, true);
+    const e2b_scope = e2b.finish();
+    try std.testing.expect(e2b_scope.production.pair);
+    try std.testing.expect(!e2b_scope.production.pair_q8);
+    try std.testing.expect(!e2b_scope.production.down_q8);
+
+    var e4b = JitRouteScopeBuilder.init(.gemma4);
+    e4b.observeQ4_0Matrix("model.layers.0.mlp.gate_proj.weight", 10240, 2560, true);
+    e4b.observeQ4_0Matrix("model.layers.0.mlp.up_proj.weight", 10240, 2560, true);
+    e4b.observeQ4_0Matrix("model.layers.0.mlp.down_proj.weight", 2560, 10240, true);
+    // Later heterogeneous layers must not erase an already reachable trio.
+    e4b.observeQ4_0Matrix("model.layers.1.mlp.gate_proj.weight", 8960, 1536, true);
+    e4b.observeQ4_0Matrix("model.layers.1.mlp.up_proj.weight", 6144, 1536, true);
+    e4b.observeQ4_0Matrix("model.layers.1.mlp.down_proj.weight", 1536, 6144, true);
+    const e4b_scope = e4b.finish();
+    try std.testing.expect(e4b_scope.production.pair);
+    try std.testing.expect(e4b_scope.production.pair_q8);
+    try std.testing.expect(e4b_scope.production.down_q8);
+}
+
+test "CUDA runtime JIT conformance covers row boundaries tails and observed shapes" {
+    var builder = JitRouteScopeBuilder.init(.gemma4);
+    builder.observeQ4_0Matrix("model.layers.0.mlp.gate_proj.weight", 8960, 1536, true);
+    builder.observeQ4_0Matrix("model.layers.0.mlp.up_proj.weight", 8960, 1536, true);
+    builder.observeQ4_0Matrix("model.layers.0.mlp.down_proj.weight", 1536, 8960, true);
+    const scope = builder.finish();
+    try std.testing.expect(scope.conformance_complete);
+    try std.testing.expect(scope.observed_shape_count >= 2);
+    try std.testing.expectEqual(@as(usize, 1), scope.pair_shape_count);
+
+    const mm = LiveRuntimeJitConformance.forRoute(.mm, scope);
+    var saw_min_rows_tail = false;
+    var saw_max_rows_tail = false;
+    var saw_observed = false;
+    var saw_observed_min_rows = false;
+    var saw_observed_max_rows = false;
+    for (mm.fixtures[0..mm.count]) |fixture| {
+        if (fixture.shape.rows == 9 and fixture.shape.in_dim == 512 and fixture.shape.out_dim == 33) {
+            saw_min_rows_tail = true;
+        }
+        if (fixture.shape.rows == 64 and fixture.shape.in_dim == 544 and fixture.shape.out_dim == 64) {
+            saw_max_rows_tail = true;
+        }
+        if (fixture.measure and fixture.shape.rows == 22 and
+            fixture.shape.in_dim == 1536 and fixture.shape.out_dim == 8960)
+        {
+            saw_observed = true;
+        }
+        if (fixture.measure and fixture.shape.rows == 9 and
+            fixture.shape.in_dim == 1536 and fixture.shape.out_dim == 8960)
+        {
+            saw_observed_min_rows = true;
+        }
+        if (fixture.measure and fixture.shape.rows == 64 and
+            fixture.shape.in_dim == 1536 and fixture.shape.out_dim == 8960)
+        {
+            saw_observed_max_rows = true;
+        }
+    }
+    try std.testing.expect(saw_min_rows_tail);
+    try std.testing.expect(saw_max_rows_tail);
+    try std.testing.expect(saw_observed);
+    try std.testing.expect(saw_observed_min_rows);
+    try std.testing.expect(saw_observed_max_rows);
+
+    const pair = LiveRuntimeJitConformance.forRoute(.pair, scope);
+    var saw_exact_pair = false;
+    for (pair.fixtures[0..pair.count]) |fixture| {
+        if (fixture.measure and fixture.shape.rows == 1 and
+            fixture.shape.in_dim == 1536 and fixture.shape.out_dim == 8960)
+        {
+            saw_exact_pair = true;
+        }
+    }
+    try std.testing.expect(saw_exact_pair);
+}
+
+test "CUDA runtime JIT observed shape overflow fails conformance closed" {
+    var builder = JitRouteScopeBuilder.init(.gemma4);
+    var index: usize = 0;
+    while (index <= JitRouteScope.max_observed_shapes) : (index += 1) {
+        builder.observeQ4_0Matrix(
+            "model.layers.0.self_attn.q_proj.weight",
+            1024 + index,
+            512 + index * q4_0_values_per_block,
+            true,
+        );
+    }
+    const scope = builder.finish();
+    try std.testing.expect(scope.production.mmv);
+    try std.testing.expect(!scope.conformance_complete);
+    try std.testing.expectEqual(JitRouteScope.max_observed_shapes, scope.observed_shape_count);
+}
+
+test "CUDA runtime JIT sampled oracle spans rows and fixture patterns vary output rows" {
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        live_runtime_jit_conformance_policy_identity,
+        1,
+        "sampled-output8-all-input-rows",
+    ));
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        live_runtime_jit_conformance_policy_identity,
+        1,
+        "weight-pattern-bank29-row-strided",
+    ));
+
+    var row_strided_weights: [2 * live_runtime_jit_weight_pattern_count * q4_0_block_bytes]u8 = undefined;
+    try fillLiveRuntimeJitQ4_0(
+        &row_strided_weights,
+        live_runtime_jit_weight_pattern_count,
+        false,
+    );
+    const second_row_offset = live_runtime_jit_weight_pattern_count * q4_0_block_bytes;
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        row_strided_weights[0..q4_0_block_bytes],
+        row_strided_weights[second_row_offset..][0..q4_0_block_bytes],
+    ));
+
+    const shape = LiveRuntimeJitShape{ .rows = 2, .in_dim = 32, .out_dim = 15 };
+    var input: [shape.rows * shape.in_dim]f32 = undefined;
+    try fillLiveRuntimeJitInput(&input, shape);
+    try std.testing.expect(!std.mem.eql(
+        f32,
+        input[0..shape.in_dim],
+        input[shape.in_dim..][0..shape.in_dim],
+    ));
+    var raw_weight: [shape.out_dim * q4_0_block_bytes]u8 = undefined;
+    try fillLiveRuntimeJitQ4_0(&raw_weight, 1, false);
+    const reference = try liveRuntimeJitCpuQ4Reference(
+        std.testing.allocator,
+        &input,
+        &raw_weight,
+        shape,
+    );
+    defer std.testing.allocator.free(reference);
+    const candidate = try std.testing.allocator.dupe(f32, reference);
+    defer std.testing.allocator.free(candidate);
+    const clean = try liveRuntimeJitCpuSampledQ4ReferenceErrors(
+        std.testing.allocator,
+        &input,
+        &raw_weight,
+        shape,
+        reference,
+        candidate,
+    );
+    try std.testing.expectEqual(@as(f64, 0), clean.max_absolute);
+    candidate[(shape.rows - 1) * shape.out_dim + shape.out_dim - 1] += 1;
+    const corrupted = try liveRuntimeJitCpuSampledQ4ReferenceErrors(
+        std.testing.allocator,
+        &input,
+        &raw_weight,
+        shape,
+        reference,
+        candidate,
+    );
+    try std.testing.expect(corrupted.max_absolute > 0.9);
+
+    const measured_bytes = liveRuntimeJitFixtureAllocationBytes(
+        .mm,
+        .{ .shape = shape, .measure = true },
+    ).?;
+    const full_oracle_bytes = liveRuntimeJitFixtureAllocationBytes(
+        .mm,
+        .{ .shape = shape, .measure = false },
+    ).?;
+    try std.testing.expect(full_oracle_bytes > measured_bytes);
+}
+
+test "CUDA runtime JIT oversized fixture allocation fails conformance closed" {
+    const oversized = LiveRuntimeJitShape{
+        .rows = 1,
+        .in_dim = 2560,
+        .out_dim = 262_144,
+    };
+    try std.testing.expect(
+        liveRuntimeJitFixtureAllocationBytes(.pair, .{ .shape = oversized, .measure = true }).? >
+            live_runtime_jit_max_fixture_bytes,
+    );
+
+    var builder = JitRouteScopeBuilder.init(.gemma4);
+    builder.observeQ4_0Matrix(
+        "model.layers.0.self_attn.q_proj.weight",
+        oversized.out_dim,
+        oversized.in_dim,
+        true,
+    );
+    const scope = builder.finish();
+    try std.testing.expect(scope.enabled());
+    try std.testing.expect(!scope.conformance_complete);
+}
+
+test "CUDA runtime JIT qualification scopes retain bounded body and omit oversized head" {
+    var builder = JitRouteScopeBuilder.init(.gemma4);
+    builder.observeQ4_0Matrix("model.layers.0.mlp.gate_proj.weight", 10_240, 2_560, true);
+    builder.observeQ4_0Matrix("lm_head.weight", 262_144, 2_560, true);
+    const scope = builder.finish();
+    try std.testing.expect(!scope.conformance_complete);
+
+    const mmv_artifact = blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+            const route = liveRuntimeJitRoute(artifact) orelse continue;
+            if (route == .mmv) break :blk artifact;
+        }
+        return error.MissingCudaRuntimeJitProductionArtifact;
+    };
+    const mm_artifact = blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+            const route = liveRuntimeJitRoute(artifact) orelse continue;
+            if (route == .mm) break :blk artifact;
+        }
+        return error.MissingCudaRuntimeJitProductionArtifact;
+    };
+    const mmv_scopes = RuntimeJitQualificationScopes.forArtifact(mmv_artifact, scope);
+    const mm_scopes = RuntimeJitQualificationScopes.forArtifact(mm_artifact, scope);
+    try std.testing.expectEqual(@as(usize, 1), mmv_scopes.count);
+    try std.testing.expectEqual(@as(usize, 1), mm_scopes.count);
+    try std.testing.expect(!mmv_scopes.complete);
+    try std.testing.expect(!mm_scopes.complete);
+    try std.testing.expect(mmv_scopes.scopes[0].containsMmvShape(10_240, 2_560));
+    try std.testing.expect(mm_scopes.scopes[0].containsMmShape(10_240, 2_560));
+    try std.testing.expect(!mmv_scopes.scopes[0].containsMmvShape(262_144, 2_560));
+    try std.testing.expect(!mm_scopes.scopes[0].containsMmShape(262_144, 2_560));
+
+    var installed = JitRouteScope{};
+    installed.mergeQualified(mmv_scopes.scopes[0]);
+    installed.mergeQualified(mm_scopes.scopes[0]);
+    try std.testing.expect(installed.containsMmvShape(10_240, 2_560));
+    try std.testing.expect(installed.containsMmShape(10_240, 2_560));
+    try std.testing.expect(!installed.containsMmShape(262_144, 2_560));
+}
+
+test "CUDA runtime JIT negative qualification memo is exact bounded and expiring" {
+    var memo = RuntimeJitRejectionMemo{};
+    var key = [_]u8{0} ** @sizeOf(kernel_jit.ArtifactKey);
+    key[0] = 1;
+    var other = key;
+    other[0] = 2;
+    const started: u64 = 10;
+    try std.testing.expect(!memo.activeAt(key, started));
+    memo.rememberAt(key, started);
+    try std.testing.expect(memo.activeAt(key, started));
+    try std.testing.expect(!memo.activeAt(other, started));
+    try std.testing.expect(memo.activeAt(key, started + runtime_jit_rejection_ttl_ns - 1));
+    try std.testing.expect(!memo.activeAt(key, started + runtime_jit_rejection_ttl_ns));
+}
+
+test "CUDA runtime JIT live qualifier is prepublication-sync and injectable" {
+    const Fake = struct {
+        calls: usize = 0,
+        result: ?kernel_jit.QualificationRecord,
+
+        fn run(
+            raw: ?*anyopaque,
+            _: RuntimeJitQualificationRequest,
+        ) !?kernel_jit.QualificationRecord {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return self.result;
+        }
+    };
+    const artifact = blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |candidate| {
+            if (candidate.backend == .cuda and candidate.production_enabled) break :blk candidate;
+        }
+        return error.MissingCudaRuntimeJitProductionArtifact;
+    };
+    const qualified = kernel_jit.QualificationRecord{
+        .candidate_index = 0,
+        .repeat_count = kernel_jit.measurement_repeats,
+        .correctness_passed = true,
+        .measured_speedup = 1.20,
+        .minimum_repeat_speedup = 1.11,
+        .max_absolute_error = 0.001,
+        .max_relative_error = 0.01,
+    };
+    var module = KernelModule{};
+    var fake = Fake{ .result = qualified };
+    const qualifier = RuntimeJitQualifier{ .context = &fake, .runFn = Fake.run };
+    const request = RuntimeJitQualificationRequest{
+        .allocator = std.testing.allocator,
+        .ctx = @ptrFromInt(4096),
+        .module = &module,
+        .artifact = artifact,
+        .candidate_functions = [_]driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact,
+    };
+
+    const cached = try resolveRuntimeJitQualification(.on, true, qualified, qualifier, request);
+    try std.testing.expect(cached.record != null);
+    try std.testing.expect(!cached.measured_live);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+
+    inline for (.{ kernel_jit.Mode.shadow, kernel_jit.Mode.on }) |mode| {
+        const miss = try resolveRuntimeJitQualification(mode, true, null, qualifier, request);
+        try std.testing.expect(miss.record != null);
+        try std.testing.expect(miss.measured_live);
+    }
+    const irrelevant = try resolveRuntimeJitQualification(.required, false, null, qualifier, request);
+    try std.testing.expect(irrelevant.record == null);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+
+    const live = try resolveRuntimeJitQualification(.required, true, null, qualifier, request);
+    try std.testing.expect(live.record != null);
+    try std.testing.expect(live.measured_live);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+
+    var rejected = qualified;
+    rejected.minimum_repeat_speedup = 1.01;
+    fake.result = rejected;
+    const rejected_live = try resolveRuntimeJitQualification(.required, true, null, qualifier, request);
+    try std.testing.expect(rejected_live.record == null);
+    try std.testing.expect(rejected_live.measured_live);
+    try std.testing.expectEqual(@as(usize, 4), fake.calls);
+
+    const Canceling = struct {
+        fn run(
+            _: ?*anyopaque,
+            _: RuntimeJitQualificationRequest,
+        ) !?kernel_jit.QualificationRecord {
+            return error.KernelJitCanceled;
+        }
+    };
+    try std.testing.expectError(
+        error.KernelJitCanceled,
+        resolveRuntimeJitQualification(
+            .required,
+            true,
+            null,
+            .{ .runFn = Canceling.run },
+            request,
+        ),
+    );
+}
+
+test "CUDA runtime JIT required boundary canonicalizes every scoped failure" {
+    try handleRuntimeJitLoadFailure(.on, error.OutOfMemory);
+    try std.testing.expectError(
+        error.CudaJitRequiredRouteFailed,
+        handleRuntimeJitLoadFailure(.required, error.OutOfMemory),
+    );
+    try std.testing.expect(kernel_jit.isRequiredFailure(
+        .required,
+        error.CudaJitRequiredRouteFailed,
+    ));
+    try ensureRuntimeJitRequiredComplete(.on, .{ .mmv = true });
+    try std.testing.expectError(
+        error.CudaJitRequiredRouteFailed,
+        ensureRuntimeJitRequiredComplete(.required, .{ .mmv = true }),
+    );
+    try ensureRuntimeJitRequiredComplete(.required, .{});
+}
+
+test "CUDA runtime JIT expired budget does not spin waiting for process lock" {
+    try std.testing.expect(runtime_jit_process_mutex.tryLock());
+    defer runtime_jit_process_mutex.unlock();
+    const expired = RuntimeJitWorkControl{ .deadline_ns = 1 };
+    try std.testing.expect(!(try lockRuntimeJitProcess(&expired)));
+    try std.testing.expect(expired.deadlineReached());
+}
+
+test "CUDA runtime JIT optional work fails closed when its clock fails" {
+    const budget_ms: u64 = 1_000;
+    const budget_ns = budget_ms * std.time.ns_per_ms;
+    const cases = [_]struct {
+        mode: kernel_jit.Mode,
+        start_ns: u64,
+        check_ns: u64,
+        expected_deadline_ns: ?u64,
+        expected_clock_failed: bool,
+        expected_stopped: bool,
+    }{
+        .{
+            .mode = .shadow,
+            .start_ns = 0,
+            .check_ns = 10,
+            .expected_deadline_ns = null,
+            .expected_clock_failed = true,
+            .expected_stopped = true,
+        },
+        .{
+            .mode = .on,
+            .start_ns = 10,
+            .check_ns = 0,
+            .expected_deadline_ns = 10 + budget_ns,
+            .expected_clock_failed = false,
+            .expected_stopped = true,
+        },
+        .{
+            .mode = .on,
+            .start_ns = 10,
+            .check_ns = 10 + budget_ns - 1,
+            .expected_deadline_ns = 10 + budget_ns,
+            .expected_clock_failed = false,
+            .expected_stopped = false,
+        },
+        .{
+            .mode = .on,
+            .start_ns = 10,
+            .check_ns = 10 + budget_ns,
+            .expected_deadline_ns = 10 + budget_ns,
+            .expected_clock_failed = false,
+            .expected_stopped = true,
+        },
+        .{
+            .mode = .required,
+            .start_ns = 0,
+            .check_ns = 0,
+            .expected_deadline_ns = null,
+            .expected_clock_failed = false,
+            .expected_stopped = false,
+        },
+    };
+
+    for (cases) |case| {
+        const control = RuntimeJitWorkControl.foregroundAt(.{
+            .mode = case.mode,
+            .preload_budget_ms = budget_ms,
+        }, case.start_ns);
+        try std.testing.expectEqual(case.expected_deadline_ns, control.deadline_ns);
+        try std.testing.expectEqual(case.expected_clock_failed, control.clock_failed);
+        try std.testing.expectEqual(case.expected_stopped, control.deadlineReachedAt(case.check_ns));
+    }
+}
+
+test "CUDA runtime JIT activation requires exact qualification and publishes bundles atomically" {
+    const production = blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+            if (artifact.backend == .cuda and artifact.production_enabled) break :blk artifact;
+        }
+        return error.MissingCudaRuntimeJitProductionArtifact;
+    };
+    var module = KernelModule{};
+    const mapping = module.generatedFunctionMapping(production).?;
+    var functions = [_]driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact;
+    for (0..mapping.count) |index| functions[index] = @ptrFromInt(index + 1);
+
+    try std.testing.expect(module.installRuntimeJitFunctions(production, mapping, functions, .shadow, true));
+    try std.testing.expectEqual(@as(driver_mod.CUfunction, null), mapping.slots[0].?.*);
+    try std.testing.expect(module.installRuntimeJitFunctions(production, mapping, functions, .on, false));
+    try std.testing.expectEqual(@as(driver_mod.CUfunction, null), mapping.slots[0].?.*);
+    try std.testing.expectError(
+        error.CudaJitRequiredRouteUnqualified,
+        shouldActivateRuntimeJitArtifact(production, .required, true, false),
+    );
+    try std.testing.expect(try shouldActivateRuntimeJitArtifact(production, .on, true, true));
+    try std.testing.expect(module.installRuntimeJitFunctions(production, mapping, functions, .on, true));
+    try std.testing.expectEqual(functions[0], mapping.slots[0].?.*);
+
+    const attention_artifact = blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |artifact| {
+            if (artifact.backend == .cuda and artifact.cuda_attention_kernel != null) break :blk artifact;
+        }
+        return error.MissingCudaRuntimeJitAttentionArtifact;
+    };
+    var promoted_attention = attention_artifact;
+    promoted_attention.production_enabled = true;
+    var attention_module = KernelModule{};
+    const attention_mapping = attention_module.generatedFunctionMapping(promoted_attention).?;
+    var old_functions = [_]driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact;
+    var new_functions = [_]driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact;
+    for (0..attention_mapping.count) |index| {
+        old_functions[index] = @ptrFromInt(index + 11);
+        new_functions[index] = @ptrFromInt(index + 21);
+        attention_mapping.slots[index].?.* = old_functions[index];
+    }
+    try std.testing.expect(!attention_module.installRuntimeJitFunctions(
+        promoted_attention,
+        attention_mapping,
+        new_functions,
+        .on,
+        true,
+    ));
+    for (0..attention_mapping.count) |index| {
+        try std.testing.expectEqual(old_functions[index], attention_mapping.slots[index].?.*);
+    }
+}
+
+test "CUDA runtime JIT retained modules pop in reverse ownership order" {
+    var module = KernelModule{};
+    const first: driver_mod.CUmodule = @ptrFromInt(1);
+    const second: driver_mod.CUmodule = @ptrFromInt(2);
+    try module.retainRuntimeJitModule(first);
+    try module.retainRuntimeJitModule(second);
+    try std.testing.expectEqual(second, module.popRuntimeJitModule().?);
+    try std.testing.expectEqual(first, module.popRuntimeJitModule().?);
+    try std.testing.expectEqual(@as(?driver_mod.CUmodule, null), module.popRuntimeJitModule());
+    try std.testing.expectEqual(@as(usize, 0), module.runtime_jit_module_count);
+}
+
+test "CUDA runtime JIT cache misses then reuses exact keyed PTX and qualification" {
+    const artifact = blk: {
+        for (quant_kernel_compiler.first_generated_artifacts) |candidate| {
+            if (candidate.backend == .cuda and candidate.production_enabled) break :blk candidate;
+        }
+        return error.MissingCudaRuntimeJitProductionArtifact;
+    };
+    const source = "extern \"C\" __global__ void generated() {}";
+    const scope = JitRouteScope.maximumForProfile(.gemma4);
+    const compile_key = runtimeJitCompileKey(
+        artifact,
+        source,
+        "sm_89",
+        "nvrtc/12.0",
+        "--gpu-architecture=compute_89",
+    );
+    const bundled_image_sha256 = cudaBundledImageSha256Hex();
+    const candidate_ptx_sha256 = runtimeJitSha256("ptx\x00");
+    const qualification_key = runtimeJitQualificationKey(
+        artifact,
+        scope,
+        compile_key,
+        candidate_ptx_sha256,
+        &bundled_image_sha256,
+        "test-device/driver-12000",
+    );
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var cache = try kernel_jit.ArtifactCache.initDir(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        1024 * 1024,
+    );
+    defer cache.deinit();
+
+    try std.testing.expectEqual(@as(?[]u8, null), try loadRuntimeJitCachedPtx(&cache, compile_key));
+    try cache.store(.cuda_ptx, compile_key, "ptx\x00");
+    const ptx = (try loadRuntimeJitCachedPtx(&cache, compile_key)).?;
+    defer std.testing.allocator.free(ptx);
+    try std.testing.expect(validRuntimeJitPtx(ptx));
+
+    const record = kernel_jit.QualificationRecord{
+        .candidate_index = 0,
+        .repeat_count = kernel_jit.measurement_repeats,
+        .correctness_passed = true,
+        .measured_speedup = 1.20,
+        .minimum_repeat_speedup = 1.11,
+        .max_absolute_error = 0,
+        .max_relative_error = 0,
+    };
+    const encoded = try record.encode();
+    try cache.store(.qualification, qualification_key, &encoded);
+    try std.testing.expect(loadRuntimeJitQualification(
+        std.testing.allocator,
+        &cache,
+        qualification_key,
+        artifact,
+    ) != null);
+
+    const changed_target_key = runtimeJitCompileKey(
+        artifact,
+        source,
+        "sm_90",
+        "nvrtc/12.0",
+        "--gpu-architecture=compute_90",
+    );
+    try std.testing.expectEqual(
+        @as(?[]u8, null),
+        try loadRuntimeJitCachedPtx(&cache, changed_target_key),
+    );
+
+    var changed_scope = scope;
+    changed_scope.observed_shapes[0] = .{ 2048, 1536 };
+    changed_scope.observed_shape_count = 1;
+    const changed_scope_qualification_key = runtimeJitQualificationKey(
+        artifact,
+        changed_scope,
+        compile_key,
+        candidate_ptx_sha256,
+        &bundled_image_sha256,
+        "test-device/driver-12000",
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &qualification_key,
+        &changed_scope_qualification_key,
+    ));
+    const changed_candidate_qualification_key = runtimeJitQualificationKey(
+        artifact,
+        scope,
+        compile_key,
+        runtimeJitSha256("different-ptx\x00"),
+        &bundled_image_sha256,
+        "test-device/driver-12000",
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &qualification_key,
+        &changed_candidate_qualification_key,
+    ));
+    var changed_bundled_image_sha256 = bundled_image_sha256;
+    changed_bundled_image_sha256[0] = if (changed_bundled_image_sha256[0] == '0') '1' else '0';
+    const changed_baseline_qualification_key = runtimeJitQualificationKey(
+        artifact,
+        scope,
+        compile_key,
+        candidate_ptx_sha256,
+        &changed_bundled_image_sha256,
+        "test-device/driver-12000",
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &qualification_key,
+        &changed_baseline_qualification_key,
+    ));
+    const reused_ptx = (try loadRuntimeJitCachedPtx(&cache, compile_key)).?;
+    defer std.testing.allocator.free(reused_ptx);
+    try std.testing.expect(validRuntimeJitPtx(reused_ptx));
+    try std.testing.expectEqual(
+        @as(?kernel_jit.QualificationRecord, null),
+        loadRuntimeJitQualification(
+            std.testing.allocator,
+            &cache,
+            changed_scope_qualification_key,
+            artifact,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 64), build_options.cuda_jit_baseline_implementation_sha256.len);
+    try std.testing.expectEqual(@as(usize, 64), build_options.cuda_jit_qualification_implementation_sha256.len);
+    try std.testing.expectEqual(@as(usize, 64), build_options.cuda_jit_dispatch_implementation_sha256.len);
+}
+
 fn loadModuleWithJitLog(ctx: *context_mod.CudaContext, module: *driver_mod.CUmodule) driver_mod.Error!void {
+    if (cuda_artifact.uses_jit) {
+        return loadPtxModuleWithJitLog(ctx, module, cuda_artifact.image, cuda_artifact.format);
+    }
+    const result = ctx.driver.fns.cuModuleLoadDataEx(module, cuda_artifact.image.ptr, 0, null, null);
+    if (result == driver_mod.CUDA_SUCCESS) return;
+    std.debug.print(
+        "cuda {s}: module load failed: {s}: {s}\n",
+        .{ cuda_artifact.format, ctx.driver.errorName(result), ctx.driver.errorString(result) },
+    );
+    return error.CudaDriverError;
+}
+
+fn loadPtxModuleWithJitLog(
+    ctx: *context_mod.CudaContext,
+    module: *driver_mod.CUmodule,
+    ptx: []const u8,
+    label: []const u8,
+) driver_mod.Error!void {
     var info_log: [4096]u8 = .{0} ** 4096;
     var error_log: [4096]u8 = .{0} ** 4096;
     var options = [_]driver_mod.CUjit_option{
@@ -10483,15 +16032,12 @@ fn loadModuleWithJitLog(ctx: *context_mod.CudaContext, module: *driver_mod.CUmod
         @ptrCast(error_log[0..].ptr),
         @ptrFromInt(error_log.len),
     };
-    const result = if (cuda_artifact.uses_jit)
-        ctx.driver.fns.cuModuleLoadDataEx(module, cuda_artifact.image.ptr, options.len, &options, &values)
-    else
-        ctx.driver.fns.cuModuleLoadDataEx(module, cuda_artifact.image.ptr, 0, null, null);
+    const result = ctx.driver.fns.cuModuleLoadDataEx(module, ptx.ptr, options.len, &options, &values);
     if (result == driver_mod.CUDA_SUCCESS) return;
 
     std.debug.print(
         "cuda {s}: module load failed: {s}: {s}\n",
-        .{ cuda_artifact.format, ctx.driver.errorName(result), ctx.driver.errorString(result) },
+        .{ label, ctx.driver.errorName(result), ctx.driver.errorString(result) },
     );
     const error_message = trimCudaLog(&error_log);
     if (error_message.len > 0) std.debug.print("cuda jit error log:\n{s}\n", .{error_message});
@@ -10860,6 +16406,19 @@ fn smokeBf16WeightPrimitives(allocator: std.mem.Allocator, ctx: *context_mod.Cud
 
     const out = try allocator.alloc(f32, rows * out_dim);
     defer allocator.free(out);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_linear, 0.0001);
+
+    const weight_f16_data = [_]u16{
+        @bitCast(@as(f16, 1.0)), @bitCast(@as(f16, 0.0)), @bitCast(@as(f16, -1.0)),
+        @bitCast(@as(f16, 0.5)), @bitCast(@as(f16, 2.0)), @bitCast(@as(f16, 1.0)),
+    };
+    var weight_f16 = try buffer_mod.DeviceBuffer.alloc(ctx, weight_f16_data.len * @sizeOf(u16));
+    defer weight_f16.free(ctx);
+    try weight_f16.copyFromHost(ctx, std.mem.sliceAsBytes(&weight_f16_data));
+    try module.launchLinearF16WeightF32Tiled(ctx, output, input, weight_f16, rows, in_dim, out_dim);
+    try ctx.synchronize();
     try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
     try expectApproxSlice(out, &expected_linear, 0.0001);
@@ -12753,6 +18312,391 @@ fn expectApproxSlice(actual: []const f32, expected: []const f32, tolerance: f32)
             return error.CudaSmokeMismatch;
         }
     }
+}
+
+test "generated CUDA GQA decode shape supports bounded ratios" {
+    try std.testing.expect(generatedGqaDecodeShapeEligible(1, 1, 256, 8, 1));
+    try std.testing.expect(generatedGqaDecodeShapeEligible(1, 1, 512, 8, 1));
+    try std.testing.expect(generatedGqaDecodeShapeEligible(1, 1, 256, 32, 4));
+    try std.testing.expect(!generatedGqaDecodeShapeEligible(2, 1, 256, 8, 1));
+    try std.testing.expect(!generatedGqaDecodeShapeEligible(1, 2, 256, 8, 1));
+    try std.testing.expect(!generatedGqaDecodeShapeEligible(1, 1, 128, 8, 1));
+    try std.testing.expect(generatedGqaDecodeShapeEligible(1, 1, 256, 8, 4));
+    try std.testing.expect(generatedGqaDecodeShapeEligible(1, 1, 256, 12, 1));
+    try std.testing.expect(generatedGqaDecodeShapeEligible(1, 1, 512, 32, 4));
+    try std.testing.expect(!generatedGqaDecodeShapeEligible(1, 1, 256, 18, 4));
+    try std.testing.expect(!generatedGqaDecodeShapeEligible(1, 1, 256, 17, 1));
+    try std.testing.expect(!generatedGqaDecodeShapeEligible(1, 1, 512, 40, 5));
+}
+
+test "BERT tensor-core prefill mode is explicit and shape-bounded" {
+    try std.testing.expectEqual(BertPrefillAttentionMode.generic, parseBertPrefillAttentionMode("generic").?);
+    try std.testing.expectEqual(BertPrefillAttentionMode.exact, parseBertPrefillAttentionMode("exact").?);
+    try std.testing.expectEqual(BertPrefillAttentionMode.exact_q8, parseBertPrefillAttentionMode("exact-q8").?);
+    try std.testing.expectEqual(BertPrefillAttentionMode.tensor_core, parseBertPrefillAttentionMode("tensor-core").?);
+    try std.testing.expectEqual(BertPrefillAttentionMode.tensor_core, parseBertPrefillAttentionMode("MMA").?);
+    try std.testing.expect(parseBertPrefillAttentionMode("fast") == null);
+
+    try std.testing.expect(bertPrefillAttentionMmaComputeEligible(7, 5));
+    try std.testing.expect(bertPrefillAttentionMmaComputeEligible(8, 0));
+    try std.testing.expect(!bertPrefillAttentionMmaComputeEligible(7, 0));
+    try std.testing.expect(!bertPrefillAttentionMmaComputeEligible(6, 1));
+
+    try std.testing.expect(bertPrefillAttentionMmaShapeEligible(1, 256, 12, 64, false, false, 0, true));
+    try std.testing.expect(bertPrefillAttentionMmaShapeEligible(32, 256, 12, 64, false, false, 0, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(0, 256, 12, 64, false, false, 0, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(1, 512, 12, 64, false, false, 0, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(1, 256, 12, 128, false, false, 0, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(1, 256, 12, 64, true, false, 0, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(1, 256, 12, 64, false, true, 0, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(1, 256, 12, 64, false, false, 1, true));
+    try std.testing.expect(!bertPrefillAttentionMmaShapeEligible(1, 256, 12, 64, false, false, 0, false));
+    try std.testing.expectEqual(@as(usize, 45312), bert_prefill_attention_mma_shared_bytes);
+}
+
+test "generated CUDA paged score prework has a strict production boundary" {
+    try std.testing.expect(generatedGqaScorePreworkShapeEligible(
+        1,
+        1,
+        544,
+        16,
+        1,
+        256,
+        0,
+        0,
+        128,
+        128,
+        1024,
+        0,
+        0,
+        544,
+    ));
+    try std.testing.expect(generatedGqaScorePreworkShapeEligible(
+        1,
+        1,
+        4096,
+        32,
+        2,
+        512,
+        0,
+        0,
+        2048,
+        2048,
+        4096,
+        2,
+        0,
+        4096,
+    ));
+    try std.testing.expect(!generatedGqaScorePreworkShapeEligible(2, 1, 544, 16, 1, 256, 0, 0, 128, 128, 1024, 0, 0, 544));
+    try std.testing.expect(!generatedGqaScorePreworkShapeEligible(1, 2, 544, 16, 1, 256, 0, 0, 128, 128, 1024, 0, 0, 544));
+    try std.testing.expect(!generatedGqaScorePreworkShapeEligible(1, 1, 4097, 16, 1, 256, 0, 0, 128, 128, 1024, 0, 0, 4097));
+    try std.testing.expect(!generatedGqaScorePreworkShapeEligible(1, 1, 544, 16, 1, 256, 1, 0, 128, 128, 1024, 0, 0, 544));
+    try std.testing.expect(!generatedGqaScorePreworkShapeEligible(1, 1, 544, 16, 1, 256, 0, 1, 128, 128, 1024, 0, 0, 544));
+    try std.testing.expect(!generatedGqaScorePreworkShapeEligible(1, 1, 544, 16, 1, 256, 0, 0, 128, 256, 1024, 0, 0, 544));
+    try std.testing.expect(!generatedGqaScorePreworkShapeEligible(1, 1, 544, 16, 1, 256, 0, 0, 128, 128, 1024, 1, 0, 544));
+    try std.testing.expect(!generatedGqaScorePreworkShapeEligible(1, 1, 544, 16, 1, 256, 0, 0, 128, 128, 1024, 0, 1, 544));
+    try std.testing.expect(!generatedGqaScorePreworkShapeEligible(1, 1, 544, 16, 1, 256, 0, 0, 128, 128, 1024, 0, 0, 8192));
+}
+
+test "generated CUDA GQA decode schedule switches at the split boundary" {
+    try std.testing.expectEqual(GeneratedGqaDecodeSchedule.none, generatedGqaDecodeScheduleFor(512, false, 512, .split8));
+    try std.testing.expectEqual(GeneratedGqaDecodeSchedule.serial, generatedGqaDecodeScheduleFor(511, true, 512, .split2));
+    try std.testing.expectEqual(GeneratedGqaDecodeSchedule.split2, generatedGqaDecodeScheduleFor(512, true, 512, .split2));
+    try std.testing.expectEqual(GeneratedGqaDecodeSchedule.split4, generatedGqaDecodeScheduleFor(1, true, 1, .split4));
+    try std.testing.expectEqual(GeneratedGqaDecodeSchedule.split8, generatedGqaDecodeScheduleFor(1, true, 1, .split8));
+    try std.testing.expectEqual(cuda_kernel_renderer.AttentionSplitVariant.split4, GeneratedGqaDecodeSchedule.split4.splitVariant().?);
+}
+
+test "generated CUDA GQA decode split selector accepts explicit schedules" {
+    try std.testing.expectEqual(cuda_kernel_renderer.AttentionSplitVariant.split2, generatedGqaDecodeSplitVariantFor(2));
+    try std.testing.expectEqual(cuda_kernel_renderer.AttentionSplitVariant.split4, generatedGqaDecodeSplitVariantFor(4));
+    try std.testing.expectEqual(cuda_kernel_renderer.AttentionSplitVariant.split8, generatedGqaDecodeSplitVariantFor(8));
+    try std.testing.expectEqual(cuda_kernel_renderer.AttentionSplitVariant.split8, generatedGqaDecodeSplitVariantFor(null));
+    try std.testing.expectEqual(cuda_kernel_renderer.AttentionSplitVariant.split8, generatedGqaDecodeSplitVariantFor(3));
+}
+
+test "generated CUDA GQA workspace reservation is fixed" {
+    try std.testing.expectEqual(cuda_kernel_renderer.generatedAttentionWorkspaceLayout().total_bytes, generatedGqaDecodeWorkspaceBytes());
+    try std.testing.expectEqual(@as(usize, 526_336), generatedGqaDecodeWorkspaceBytes());
+    const score_workspace = cuda_kernel_renderer.generatedAttentionWorkspaceLayoutFor(cuda_kernel_renderer.generated_attention_score_prework_chunks) orelse return error.MissingScorePreworkWorkspace;
+    try std.testing.expect(generatedGqaDecodeWorkspaceBytes() >= score_workspace.total_bytes);
+}
+
+test "generated CUDA Q4_0 Q8_1 E2B argmax launch contract is exact" {
+    try std.testing.expect(linearQ4_0Q8_1ArgmaxE2BShapeEligible(1, 1536, 262144));
+    try std.testing.expect(!linearQ4_0Q8_1ArgmaxE2BShapeEligible(2, 1536, 262144));
+    try std.testing.expect(!linearQ4_0Q8_1ArgmaxE2BShapeEligible(1, 2560, 262144));
+    try std.testing.expect(!linearQ4_0Q8_1ArgmaxE2BShapeEligible(1, 1536, 256000));
+
+    const bounds = try generatedQ4_0Q8_1ArgmaxLaunchBounds(1, 1536, 262144);
+    try std.testing.expectEqual(@as(usize, 48), bounds.row_blocks);
+    try std.testing.expectEqual(@as(usize, 32768), bounds.col_tiles);
+    try std.testing.expectEqual(@as(usize, 32768), bounds.partial_count);
+    try std.testing.expectEqual(@as(usize, 131072), bounds.partial_bytes);
+    try std.testing.expectEqual(@as(usize, 1728), bounds.q8_input_bytes);
+    try std.testing.expectEqual(@as(usize, 226492416), bounds.weight_bytes);
+    try std.testing.expectEqual(@as(usize, 4), bounds.output_bytes);
+    try std.testing.expectEqual(@as(usize, 96), generated_q4_0_q8_1_argmax_tile8_threads);
+    try std.testing.expectEqual(@as(usize, 512), generated_q4_0_q8_1_argmax_reduce_threads);
+    try std.testing.expectError(error.InvalidCudaState, generatedQ4_0Q8_1ArgmaxLaunchBounds(1, 2560, 262144));
+
+    var module: KernelModule = .{};
+    var ctx: context_mod.CudaContext = undefined;
+    const empty_buffer: buffer_mod.DeviceBuffer = .{};
+    try std.testing.expect(!module.hasLinearQ4_0Q8_1ArgmaxE2BPrimitives());
+    try std.testing.expectError(
+        error.InvalidCudaState,
+        module.launchLinearQ4_0Q8_1ArgmaxRowsTile8E2B(
+            &ctx,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            1,
+            2560,
+            262144,
+            0,
+        ),
+    );
+    try std.testing.expectError(
+        error.CudaKernelUnavailable,
+        module.launchLinearQ4_0Q8_1ArgmaxRowsTile8E2B(
+            &ctx,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            1,
+            1536,
+            262144,
+            0,
+        ),
+    );
+}
+
+test "generated CUDA Q6_K Q8_1 argmax launch contracts are exact" {
+    try std.testing.expect(linearQ6KQ8_1GeneratedArgmaxShapeEligible(1, 2560, 262144));
+    try std.testing.expect(linearQ6KQ8_1GeneratedArgmaxShapeEligible(1, 3840, 262144));
+    try std.testing.expect(!linearQ6KQ8_1GeneratedArgmaxShapeEligible(2, 2560, 262144));
+    try std.testing.expect(!linearQ6KQ8_1GeneratedArgmaxShapeEligible(1, 4096, 262144));
+    try std.testing.expect(!linearQ6KQ8_1GeneratedArgmaxShapeEligible(1, 2560, 256000));
+    try std.testing.expectEqual(@as(usize, 160), generatedQ6KQ8_1ArgmaxStage1Threads(2560));
+    try std.testing.expectEqual(@as(usize, 256), generatedQ6KQ8_1ArgmaxStage1Threads(3840));
+    try std.testing.expectEqual(@as(usize, 512), generated_q6_k_q8_1_argmax_reduce_threads);
+
+    var module: KernelModule = .{};
+    var ctx: context_mod.CudaContext = undefined;
+    const empty_buffer: buffer_mod.DeviceBuffer = .{};
+    try std.testing.expectError(
+        error.InvalidCudaState,
+        module.launchLinearQ6KQ8_1GeneratedArgmaxRowsTile8F32(
+            &ctx,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            1,
+            2560,
+            256000,
+        ),
+    );
+    try std.testing.expectError(
+        error.CudaKernelUnavailable,
+        module.launchLinearQ6KQ8_1GeneratedArgmaxRowsTile8F32(
+            &ctx,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            1,
+            2560,
+            262144,
+        ),
+    );
+    try std.testing.expectError(
+        error.CudaKernelUnavailable,
+        module.launchLinearQ6KQ8_1GeneratedArgmaxRowsTile8F32(
+            &ctx,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            1,
+            3840,
+            262144,
+        ),
+    );
+}
+
+test "generated CUDA Q4_0 Q8_1 E2B launch contracts are exact" {
+    const silu_activation: u8 = @intFromEnum(@import("../../graph/backend_contracts.zig").DecoderRuntimeActivationKind.silu);
+    try std.testing.expect(generatedQ4_0PairQ8E2BShapeEligible(1, 1536, 6144, silu_activation));
+    try std.testing.expect(generatedQ4_0PairQ8E2BShapeEligible(1, 1536, 12288, silu_activation));
+    try std.testing.expect(generatedQ4_0DownQ8E2BShapeEligible(1, 6144, 1536));
+    try std.testing.expect(generatedQ4_0DownQ8E2BShapeEligible(1, 12288, 1536));
+    try std.testing.expectEqual(@as(usize, 384), generated_q4_0_q8_e2b_pair_threads);
+    try std.testing.expectEqual(@as(usize, 128), generated_q4_0_q8_e2b_down_small_threads);
+    try std.testing.expectEqual(@as(usize, 256), generated_q4_0_q8_e2b_down_large_threads);
+
+    try std.testing.expect(!generatedQ4_0PairQ8E2BShapeEligible(2, 1536, 6144, silu_activation));
+    try std.testing.expect(!generatedQ4_0PairQ8E2BShapeEligible(1, 2560, 6144, silu_activation));
+    try std.testing.expect(!generatedQ4_0PairQ8E2BShapeEligible(1, 1536, 8960, silu_activation));
+    try std.testing.expect(!generatedQ4_0PairQ8E2BShapeEligible(1, 1536, 6144, generated_q4_0_q8_e2b_max_activation + 1));
+    try std.testing.expect(!generatedQ4_0DownQ8E2BShapeEligible(2, 6144, 1536));
+    try std.testing.expect(!generatedQ4_0DownQ8E2BShapeEligible(1, 10240, 1536));
+    try std.testing.expect(!generatedQ4_0DownQ8E2BShapeEligible(1, 6144, 2560));
+
+    var module: KernelModule = .{};
+    var ctx: context_mod.CudaContext = undefined;
+    const empty_buffer: buffer_mod.DeviceBuffer = .{};
+    try std.testing.expectError(
+        error.CudaKernelUnavailable,
+        module.launchLinearQ4_0GeneratedPairQ8E2B(
+            &ctx,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            1,
+            1536,
+            6144,
+            silu_activation,
+        ),
+    );
+    try std.testing.expectError(
+        error.CudaKernelUnavailable,
+        module.launchLinearQ4_0GeneratedDownQ8E2B(
+            &ctx,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            1,
+            12288,
+            1536,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidCudaState,
+        module.launchLinearQ4_0GeneratedPairQ8E2B(
+            &ctx,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            1,
+            1536,
+            8960,
+            silu_activation,
+        ),
+    );
+}
+
+test "generated CUDA exact F32 E2B FFN launch contracts preserve the activation boundary" {
+    try std.testing.expect(generatedQ4_0ExactFfnPairE2BShapeEligible(1, 1536, 6144));
+    try std.testing.expect(generatedQ4_0ExactFfnPairE2BShapeEligible(1, 1536, 12288));
+    try std.testing.expect(generatedQ4_0ExactFfnDownE2BShapeEligible(1, 6144, 1536));
+    try std.testing.expect(generatedQ4_0ExactFfnDownE2BShapeEligible(1, 12288, 1536));
+    try std.testing.expectEqual(@as(usize, 128), generated_q4_0_exact_ffn_pair_threads);
+    try std.testing.expectEqual(@as(usize, 256), generated_q4_0_exact_ffn_down_threads);
+    try std.testing.expect(!generatedQ4_0ExactFfnPairE2BShapeEligible(2, 1536, 6144));
+    try std.testing.expect(!generatedQ4_0ExactFfnPairE2BShapeEligible(1, 2560, 6144));
+    try std.testing.expect(!generatedQ4_0ExactFfnDownE2BShapeEligible(1, 6144, 2560));
+
+    var module: KernelModule = .{};
+    var ctx: context_mod.CudaContext = undefined;
+    const empty_buffer: buffer_mod.DeviceBuffer = .{};
+    try std.testing.expectError(
+        error.CudaKernelUnavailable,
+        module.launchLinearQ4_0GeneratedExactFfnPairF32(
+            &ctx,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            1,
+            1536,
+            6144,
+            5,
+        ),
+    );
+    try std.testing.expectError(
+        error.CudaKernelUnavailable,
+        module.launchLinearQ4_0GeneratedExactFfnDownF32(
+            &ctx,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            1,
+            12288,
+            1536,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidCudaState,
+        module.launchLinearQ4_0GeneratedExactFfnPairF32(
+            &ctx,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            1,
+            1536,
+            8960,
+            5,
+        ),
+    );
+}
+
+test "generated CUDA Q4_0 Q8_1 E4B plans reject other model shapes" {
+    try std.testing.expect(generatedQ4_0PairQ8E4BShapeEligible(1, 2560, 10240));
+    try std.testing.expect(generatedQ4_0DownQ8E4BShapeEligible(1, 10240, 2560));
+
+    try std.testing.expect(!generatedQ4_0PairQ8E4BShapeEligible(2, 2560, 10240));
+    try std.testing.expect(!generatedQ4_0PairQ8E4BShapeEligible(1, 1536, 6144));
+    try std.testing.expect(!generatedQ4_0PairQ8E4BShapeEligible(1, 1536, 12288));
+    try std.testing.expect(!generatedQ4_0DownQ8E4BShapeEligible(2, 10240, 2560));
+    try std.testing.expect(!generatedQ4_0DownQ8E4BShapeEligible(1, 6144, 1536));
+    try std.testing.expect(!generatedQ4_0DownQ8E4BShapeEligible(1, 12288, 1536));
+
+    try std.testing.expect(!generatedQ4_0PairQ8E4BShapeEligible(1, 2560, 10208));
+    try std.testing.expect(!generatedQ4_0DownQ8E4BShapeEligible(1, 10240, 2528));
+
+    var module: KernelModule = .{};
+    var ctx: context_mod.CudaContext = undefined;
+    const empty_buffer: buffer_mod.DeviceBuffer = .{};
+    try std.testing.expectError(
+        error.InvalidCudaState,
+        module.launchLinearQ4_0GeneratedPairQ8(
+            &ctx,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            1,
+            1536,
+            6144,
+            0,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidCudaState,
+        module.launchLinearQ4_0GeneratedDownQ8(
+            &ctx,
+            empty_buffer,
+            empty_buffer,
+            empty_buffer,
+            1,
+            12288,
+            1536,
+        ),
+    );
 }
 
 test "cuda kernel launch helper bounds" {

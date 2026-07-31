@@ -712,7 +712,20 @@ pub const HfTokenizer = struct {
 
     /// Parse tokenizer.json content from memory.
     pub fn loadFromBytes(allocator: std.mem.Allocator, json_bytes: []const u8) !*HfTokenizer {
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+        return loadFromBytesConfigured(allocator, json_bytes, false);
+    }
+
+    /// Parse generated tokenizer JSON whose vocab may contain duplicate token
+    /// strings. GGUF keeps every token ID, while encoding resolves duplicates
+    /// to the last ID.
+    pub fn loadFromBytesAllowDuplicateFields(allocator: std.mem.Allocator, json_bytes: []const u8) !*HfTokenizer {
+        return loadFromBytesConfigured(allocator, json_bytes, true);
+    }
+
+    fn loadFromBytesConfigured(allocator: std.mem.Allocator, json_bytes: []const u8, allow_duplicate_fields: bool) !*HfTokenizer {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{
+            .duplicate_field_behavior = if (allow_duplicate_fields) .use_last else .@"error",
+        });
         defer parsed.deinit();
 
         const root = parsed.value;
@@ -841,6 +854,14 @@ pub const HfTokenizer = struct {
         }
 
         return self;
+    }
+
+    /// Preserve an alternate token ID for decoding after duplicate vocab keys
+    /// have resolved to the canonical encoding ID.
+    pub fn addTokenIdAliasForDecode(self: *HfTokenizer, token: []const u8, id: i32) !void {
+        if (self.id_to_token.contains(id)) return;
+        const canonical = self.vocab.getKey(token) orelse return error.InvalidTokenizerJson;
+        try self.id_to_token.put(self.allocator, id, canonical);
     }
 
     fn adoptArenaString(self: *HfTokenizer, owned: []u8) ![]const u8 {
@@ -6940,7 +6961,7 @@ pub const HfTokenizer = struct {
     }
 
     fn getVocabSize(self: *HfTokenizer) usize {
-        return self.vocab.count();
+        return self.id_to_token.count();
     }
 
     pub fn deinitSelf(self: *HfTokenizer) void {
