@@ -16678,6 +16678,13 @@ pub extern fn termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
     key_row_bytes: usize,
     v_row_stride: usize,
 ) c_int;
+/// Release idle scratch-pool slots and out-of-plan graph-plan slot buffers
+/// (including the attention-span scratch slots and their aliases). No-ops
+/// while a frame is active or submitted. Returns the number of released
+/// buffers, 0 when nothing was releasable, -1 on a missing runtime.
+pub extern fn termite_metal_decode_runtime_trim_transient_pools(
+    runtime: ?*RawMetalDecodeRuntime,
+) c_int;
 
 /// Mirror of the C-side `TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY` used to
 /// bound slot indices on the Zig side. Keep in sync with metal_kernels.m.
@@ -35569,6 +35576,97 @@ test "metal native decoder runtime activation scratch pool and hidden state" {
     for (handles[0..capacity]) |h| {
         if (h) |ptr| releaseScratch(runtime, ptr);
     }
+}
+
+test "metal trim transient pools releases idle scratch and out-of-plan graph slots" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(runtime);
+    defer _ = termite_metal_decode_runtime_reset_state(runtime);
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+
+    // One idle scratch slot (releasable) and one held slot (must survive).
+    // Acquire both before releasing: a released idle slot with enough
+    // capacity would just be handed back by the second acquire.
+    const idle_scratch = try acquireScratch(runtime, 4096);
+    const held_scratch = try acquireScratch(runtime, 4096);
+    releaseScratch(runtime, idle_scratch);
+
+    // A committed graph plan covering the attention-span scratch slots 15/16,
+    // reserved the way attention does it so the plan buffers are also aliased
+    // into the span slot-0 scratch fields.
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        termite_metal_decode_runtime_reserve_attention_span_scratch(runtime, 16, 64, 16),
+    );
+    const planned = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 2), planned.graph_plan_slots);
+    try std.testing.expect(planned.scratch_pool_slots >= 2);
+    var span_key_capacity: usize = 0;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_attention_span_slot_info(
+        runtime,
+        0,
+        null,
+        &span_key_capacity,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+    ));
+    try std.testing.expect(span_key_capacity != 0);
+
+    // Guard: an active frame makes the trim a no-op.
+    try beginFrame(runtime);
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_trim_transient_pools(runtime));
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+
+    // Between frames: the idle scratch slot goes; the held slot and the
+    // committed plan's slots stay.
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_decode_runtime_trim_transient_pools(runtime));
+    const after_scratch_trim = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 2), after_scratch_trim.graph_plan_slots);
+    try std.testing.expectEqual(@as(u64, 1), after_scratch_trim.scratch_pool_slots);
+    try std.testing.expectEqual(@as(u64, 1), after_scratch_trim.scratch_pool_in_use_slots);
+
+    // Once the next plan window opens (no slots reserved yet), the previous
+    // plan's buffers are out-of-plan and releasable.
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_begin_graph_plan(runtime));
+    try std.testing.expectEqual(@as(c_int, 2), termite_metal_decode_runtime_trim_transient_pools(runtime));
+    const after_plan_trim = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 0), after_plan_trim.graph_plan_slots);
+    try std.testing.expectEqual(@as(u64, 0), after_plan_trim.graph_plan_bytes);
+    // The attention-span slot-0 aliases of plan slots 15/16 were dropped too:
+    // stale aliases would keep the released memory alive and hand later
+    // encodes a buffer the plan no longer owns.
+    try std.testing.expectEqual(@as(u64, 0), after_plan_trim.attention_span_bytes);
+    var span_key_handle: ?*anyopaque = null;
+    span_key_capacity = 0;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_attention_span_slot_info(
+        runtime,
+        0,
+        &span_key_handle,
+        &span_key_capacity,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+    ));
+    try std.testing.expectEqual(@as(?*anyopaque, null), span_key_handle);
+    try std.testing.expectEqual(@as(usize, 0), span_key_capacity);
+
+    // Nothing left to release besides the held slot, which must survive.
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_trim_transient_pools(runtime));
+    releaseScratch(runtime, held_scratch);
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_decode_runtime_trim_transient_pools(runtime));
+    const drained = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 0), drained.scratch_pool_slots);
 }
 
 test "metal donated KV on-frame attention executes on caller frame" {

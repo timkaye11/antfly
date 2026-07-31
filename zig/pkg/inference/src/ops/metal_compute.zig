@@ -682,6 +682,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     decode_step_frame_active: bool = false,
     compact_frame_begins: u64 = 0,
     compact_frame_flushes: u64 = 0,
+    /// Times compact soft pressure released transient device pools (idle
+    /// scratch-pool slots, out-of-plan graph-plan slots) before expert
+    /// eviction. Counts only trims that actually released buffers.
+    compact_pool_trims: u64 = 0,
     compact_step_stats: CompactStepStats = .{},
     next_dynamic_layer_norm_slot: usize = metal_runtime.decoder_runtime_layer_norm_slot_capacity,
     next_dynamic_rms_norm_slot: usize = metal_runtime.decoder_runtime_rms_norm_slot_capacity,
@@ -2918,6 +2922,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const runtime = self.provider_impl.raw_decode_runtime orelse return;
         const config = storage.storage.config;
         const metal_kv_storage = @import("../backends/metal_kv_storage.zig");
+        // The KV storage has no session view; hand it the compact contract's
+        // slot policy here, where both are visible. Exact-fit growth keeps
+        // slot slack out of the enforced phys-footprint ceiling and the
+        // session ledger (owned by the longer-lived CompactRuntimeState)
+        // receives observability-only KV charges.
         const metal_storage = metal_kv_storage.MetalKvStorage.create(
             self.allocator,
             runtime,
@@ -2925,6 +2934,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             config.num_kv_heads,
             config.head_dim,
             config.page_size_tokens,
+            .{
+                .prefer_exact_kv_growth = self.data.compact != null,
+                .ledger = if (self.data.compact_runtime) |state| &state.ledger else null,
+            },
         ) catch |err| switch (err) {
             // Silently skip on unsupported dtype — the host write path stays
             // authoritative and the device fast-path never fires.
@@ -3499,14 +3512,30 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         state.evictions +|= 1;
     }
 
+    /// Release the Metal runtime's transient device pools (idle scratch-pool
+    /// slots, graph-plan slots outside the committed plan, attention-span
+    /// scratch) when residency pressure trips. The C entry no-ops while a
+    /// frame is active or submitted, so this is always safe to attempt.
+    fn trimTransientDevicePools(self: *MetalCompute) void {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return;
+        const released = metal_runtime.termite_metal_decode_runtime_trim_transient_pools(runtime);
+        if (released > 0) self.compact_pool_trims +|= 1;
+    }
+
     /// React to residency pressure before growing the cache: soft pressure
-    /// evicts and decommits cold experts (downshifting the automatic slot
-    /// tier when that is not enough); hard pressure after eviction aborts
-    /// enforcing sessions instead of exceeding the ceiling.
+    /// first drops transient device pools, then evicts and decommits cold
+    /// experts (downshifting the automatic slot tier when that is not
+    /// enough); hard pressure after eviction aborts enforcing sessions
+    /// instead of exceeding the ceiling.
     fn enforceCompactPressure(
         self: *MetalCompute,
         state: *gpu_hosted_store_mod.CompactRuntimeState,
     ) !void {
+        if (state.ledger.samplePressure() == .ok) return;
+        // Transient pools are pure reuse caches: dropping them costs a later
+        // reallocation but no model state, so they go before any expert
+        // eviction.
+        self.trimTransientDevicePools();
         if (state.ledger.samplePressure() == .ok) return;
         var rounds: usize = 0;
         while (rounds < compact_expert_layer_count * compact_expert_slot_capacity) : (rounds += 1) {
@@ -20495,6 +20524,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.resident_expert_fused_frame_fallbacks = 0;
         self.resident_expert_device_input_reuses = 0;
         self.resident_expert_host_transfers = 0;
+        self.compact_pool_trims = 0;
         metal_runtime.resetExactJitDispatchStats(self.provider_impl.raw_decode_runtime) catch {};
         metal_tensor_mod.resetMemoryStats();
     }
@@ -20585,6 +20615,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_compact_device_moe_layers = self.compact_device_moe_layers;
         stats.metal_compact_frame_begins = self.compact_frame_begins;
         stats.metal_compact_frame_flushes = self.compact_frame_flushes;
+        stats.metal_compact_pool_trims = self.compact_pool_trims;
         if (self.data.compact_runtime) |state| {
             const cache_counts = state.cache.counts();
             const occupied = cache_counts.resident + cache_counts.in_flight;
@@ -20601,6 +20632,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             stats.metal_compact_ledger_hard_limit_rejections = ledger.hard_limit_rejections;
             stats.metal_compact_ledger_fixed_model_bytes =
                 ledger.committed_by_category[@intFromEnum(gpu_hosted_store_mod.CompactBudgetCategory.fixed_model)];
+            stats.metal_compact_kv_reserved_bytes =
+                ledger.committed_by_category[@intFromEnum(gpu_hosted_store_mod.CompactBudgetCategory.kv_cache)];
             stats.metal_compact_expert_read_batches = self.data.parallel_expert_loader.total_batches;
             stats.metal_compact_expert_read_tasks = self.data.parallel_expert_loader.total_tasks;
             stats.metal_compact_expert_read_ns = self.data.parallel_expert_loader.total_read_ns;

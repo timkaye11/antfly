@@ -3472,23 +3472,27 @@ fn metalStatsCompactJson(
         \\"compact_ledger":{{
         \\"schema":2,
         \\"fixed_model_bytes":{d},
+        \\"kv_reserved_bytes":{d},
         \\"committed_bytes":{d},
         \\"virtual_slot_bytes":{d},
         \\"observed_footprint_bytes":{d},
         \\"observed_footprint_peak_bytes":{d},
         \\"soft_limit_trips":{d},
-        \\"hard_limit_rejections":{d}
+        \\"hard_limit_rejections":{d},
+        \\"pool_trims":{d}
         \\}}
         \\}}
     ,
         .{
             provider.metal_compact_ledger_fixed_model_bytes,
+            provider.metal_compact_kv_reserved_bytes,
             provider.metal_compact_ledger_committed_bytes,
             provider.metal_compact_ledger_virtual_slot_bytes,
             provider.metal_compact_ledger_observed_footprint_bytes,
             provider.metal_compact_ledger_observed_footprint_peak_bytes,
             provider.metal_compact_ledger_soft_limit_trips,
             provider.metal_compact_ledger_hard_limit_rejections,
+            provider.metal_compact_pool_trims,
         },
     );
     return try out.toOwnedSlice(allocator);
@@ -3503,6 +3507,8 @@ test "metal compact stats JSON is parseable and carries compact expert counters"
     snapshot.provider.metal_compact_ledger_committed_bytes = 24;
     snapshot.provider.metal_compact_ledger_observed_footprint_peak_bytes = 25;
     snapshot.provider.metal_compact_expert_read_ns = 26;
+    snapshot.provider.metal_compact_kv_reserved_bytes = 27;
+    snapshot.provider.metal_compact_pool_trims = 28;
     const graph_stats: graph_mod.executor_stats.ExecutionStats = .{};
     const json = try metalStatsCompactJson(std.testing.allocator, snapshot, graph_stats);
     defer std.testing.allocator.free(json);
@@ -3515,6 +3521,8 @@ test "metal compact stats JSON is parseable and carries compact expert counters"
     try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"committed_bytes\":24"));
     try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"observed_footprint_peak_bytes\":25"));
     try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"read_ns\":26"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"kv_reserved_bytes\":27"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"pool_trims\":28"));
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value == .object);
