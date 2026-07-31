@@ -3034,6 +3034,10 @@ pub const Node = struct {
             budget_backend_class,
             budget_limits,
             resource_estimate,
+            // Compact models bound their KV/scratch within the ledger-enforced
+            // budget, so the node-wide live-memory headroom must not gate a
+            // request against RAM the streaming footprint never occupies.
+            self.model_manager.compactProfileForDir(model.model_dir) == null,
         );
         defer admission_lease.release();
 
@@ -5650,6 +5654,9 @@ pub const Node = struct {
         } else 1;
         var admission_lease = self.model_manager.acquireRunResourceEstimates(
             admission_requests[0..admission_request_count],
+            // Compact models bound KV/scratch within the ledger-enforced budget;
+            // the node-wide live-memory headroom must not gate their requests.
+            self.model_manager.compactProfileForDir(model.model_dir) == null,
         ) catch |err| switch (err) {
             error.ResourceLimitExceeded => return ctx.status(400).json(.{
                 .@"error" = "MODEL_RESOURCE_LIMIT",
@@ -6442,6 +6449,7 @@ pub const Node = struct {
         limits: runtime.tier.memory.Limits,
         run_budget: *runtime.tier.memory.RunBudget,
         estimate: runtime.tier.memory.Estimate,
+        check_live_memory: bool,
     ) !BatchAdmission {
         try run_budget.reserveEstimate(estimate);
         errdefer run_budget.releaseEstimate(estimate);
@@ -6450,6 +6458,7 @@ pub const Node = struct {
                 backend_class,
                 limits,
                 estimate,
+                check_live_memory,
             ),
             .estimate = estimate,
         };
@@ -6700,6 +6709,11 @@ pub const Node = struct {
                     .native => .cpu,
                     .metal, .cuda => .gpu,
                 };
+                // Compact models bound their KV/scratch within the ledger-enforced
+                // budget, so the run-admission live-memory headroom must not gate
+                // their requests against RAM the streaming footprint never occupies.
+                const admission_check_live_memory =
+                    self.model_manager.compactProfileForDir(model.model_dir) == null;
                 const budget_limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(
                     model.session,
                     runtime.tier.memory.defaultLimitsForBackend(budget_backend_class),
@@ -6843,6 +6857,7 @@ pub const Node = struct {
                         budget_limits,
                         &task_run_budgets[pos],
                         resource_estimate,
+                        admission_check_live_memory,
                     ) catch |err| {
                         results[idx].@"error" = .{
                             .code = if (err == error.ResourceTemporarilyUnavailable) "MODEL_RESOURCE_BUSY" else "MODEL_RESOURCE_LIMIT",
@@ -6870,6 +6885,7 @@ pub const Node = struct {
                             budget_limits,
                             &shared_run_budget,
                             resource_estimates[pos].?,
+                            admission_check_live_memory,
                         ) catch |err| {
                             results[idx].@"error" = .{
                                 .code = if (err == error.ResourceTemporarilyUnavailable) "MODEL_RESOURCE_BUSY" else "MODEL_RESOURCE_LIMIT",
@@ -6975,6 +6991,7 @@ pub const Node = struct {
                             budget_limits,
                             &shared_run_budget,
                             resource_estimate,
+                            admission_check_live_memory,
                         ) catch |err| {
                             results[idx].@"error" = .{
                                 .code = if (err == error.ResourceTemporarilyUnavailable) "MODEL_RESOURCE_BUSY" else "MODEL_RESOURCE_LIMIT",

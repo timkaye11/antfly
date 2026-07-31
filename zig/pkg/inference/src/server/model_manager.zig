@@ -2656,11 +2656,13 @@ pub const ModelManager = struct {
         backend_class: runtime.tier.memory.BackendClass,
         limits: runtime.tier.memory.Limits,
         estimate: runtime.tier.memory.Estimate,
+        check_live_memory: bool,
     ) !runtime.tier.memory.AdmissionLease {
         return self.acquireAmountsWithEviction(
             backend_class,
             limits,
             .fromEstimate(estimate),
+            check_live_memory,
         );
     }
 
@@ -2670,8 +2672,9 @@ pub const ModelManager = struct {
     pub fn acquireRunResourceEstimates(
         self: *ModelManager,
         requests: []const runtime.tier.memory.AdmissionRequest,
+        check_live_memory: bool,
     ) !runtime.tier.memory.AdmissionLease {
-        return self.acquireRequestsWithEviction(requests);
+        return self.acquireRequestsWithEviction(requests, check_live_memory);
     }
 
     pub fn configureAdmissionLimits(
@@ -2774,12 +2777,13 @@ pub const ModelManager = struct {
         backend_class: runtime.tier.memory.BackendClass,
         limits: runtime.tier.memory.Limits,
         amounts: runtime.tier.memory.AdmissionAmounts,
+        check_live_memory: bool,
     ) !runtime.tier.memory.AdmissionLease {
         return self.admission.tryAcquire(
             backend_class,
             limits,
             amounts,
-            true,
+            check_live_memory,
         ) catch |first_err| switch (first_err) {
             error.ResourceTemporarilyUnavailable => {
                 spinLock(&self.eviction_lock);
@@ -2789,7 +2793,7 @@ pub const ModelManager = struct {
                         backend_class,
                         limits,
                         amounts,
-                        true,
+                        check_live_memory,
                     )) |lease| return lease else |retry_err| switch (retry_err) {
                         error.ResourceTemporarilyUnavailable => {},
                         else => return retry_err,
@@ -2811,13 +2815,14 @@ pub const ModelManager = struct {
     fn acquireRequestsWithEviction(
         self: *ModelManager,
         requests: []const runtime.tier.memory.AdmissionRequest,
+        check_live_memory: bool,
     ) !runtime.tier.memory.AdmissionLease {
-        return self.admission.tryAcquireRequests(requests, true) catch |first_err| switch (first_err) {
+        return self.admission.tryAcquireRequests(requests, check_live_memory) catch |first_err| switch (first_err) {
             error.ResourceTemporarilyUnavailable => {
                 spinLock(&self.eviction_lock);
                 defer self.eviction_lock.unlock();
                 while (true) {
-                    if (self.admission.tryAcquireRequests(requests, true)) |lease|
+                    if (self.admission.tryAcquireRequests(requests, check_live_memory)) |lease|
                         return lease
                     else |retry_err| switch (retry_err) {
                         error.ResourceTemporarilyUnavailable => {},
@@ -3287,12 +3292,27 @@ pub const ModelManager = struct {
                     onnxModelLoadAdmission(artifact_bytes, backend_runtime)
                 else
                     nativeModelLoadAdmission(artifact_bytes, backend_runtime.backend);
-                const admission_plan = plan catch |err| {
+                var admission_plan = plan catch |err| {
                     if (first_err == null) first_err = err;
                     continue;
                 };
+                // Compact-profiled models stream experts under an enforced
+                // resident ceiling; admit against the ceiling, not the full
+                // artifact weight (mirrors the preload path).
+                if (session_manager.compact) |compact_request| {
+                    admission_plan = capModelLoadAdmissionToCompact(
+                        admission_plan,
+                        compactResidentCeilingBytes(compact_request),
+                    );
+                }
                 resident_amounts = admission_plan.resident;
                 admission_limits = self.admissionLimitsForBackend(backend_runtime);
+                if (session_manager.compact) |compact_request| {
+                    admission_limits = widenAdmissionLimitsToCompactCeiling(
+                        admission_limits,
+                        compactResidentCeilingBytes(compact_request),
+                    );
+                }
                 if (try admittedSessionCudaLimit(
                     backend_runtime,
                     resident_amounts,
@@ -3303,6 +3323,7 @@ pub const ModelManager = struct {
                     admissionBackendClassForRuntime(backend_runtime),
                     admission_limits,
                     admission_plan.peak,
+                    session_manager.compact == null,
                 ) catch |err| {
                     if (first_err == null) first_err = err;
                     continue;
@@ -3381,6 +3402,7 @@ pub const ModelManager = struct {
             .cpu,
             self.admissionLimitsForBackend(.{ .backend = .native }),
             plan.peak,
+            true,
         );
     }
 
@@ -4902,6 +4924,36 @@ fn capModelLoadAdmissionToCompact(
     };
 }
 
+/// Raise a backend's per-load admission caps so an explicitly-configured
+/// compact ceiling always fits. The node's derived backend/combined/host caps
+/// are conservative defaults for unbounded loads; a compact model's footprint
+/// is hard-bounded by the runtime ledger at the operator-set budget, so its
+/// ceiling — not the machine's default policy — is authoritative. A zero limit
+/// means "unlimited" and is left untouched.
+fn widenAdmissionLimitsToCompactCeiling(
+    limits: runtime.tier.memory.Limits,
+    ceiling: u64,
+) runtime.tier.memory.Limits {
+    const cap: usize = std.math.cast(usize, ceiling) orelse std.math.maxInt(usize);
+    var out = limits;
+    if (out.backend_limit_bytes != 0 and out.backend_limit_bytes < cap) out.backend_limit_bytes = cap;
+    if (out.combined_limit_bytes != 0 and out.combined_limit_bytes < cap) out.combined_limit_bytes = cap;
+    if (out.host_limit_bytes != 0 and out.host_limit_bytes < cap) out.host_limit_bytes = cap;
+    return out;
+}
+
+test "widen admission limits lifts sub-ceiling caps and preserves unlimited" {
+    const ceiling: u64 = @as(u64, 6144) * 1024 * 1024;
+    const widened = widenAdmissionLimitsToCompactCeiling(.{
+        .backend_limit_bytes = 4 * 1024 * 1024 * 1024, // below ceiling -> lifted
+        .combined_limit_bytes = 8 * 1024 * 1024 * 1024, // above ceiling -> kept
+        .host_limit_bytes = 0, // unlimited -> kept
+    }, ceiling);
+    try std.testing.expectEqual(@as(usize, 6144) * 1024 * 1024, widened.backend_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 8) * 1024 * 1024 * 1024, widened.combined_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 0), widened.host_limit_bytes);
+}
+
 test "compact resident ceiling resolves from budget, floor, and override" {
     // Explicit budget maps MiB -> bytes.
     try std.testing.expectEqual(
@@ -4991,6 +5043,7 @@ fn loadSessionForPreferredBackends(
             // model is rejected on smaller machines whose stable backend limit
             // is below the full weights (the estimate the CLI path skips by
             // running with admission disabled).
+            const is_compact_load = manager.compactProfileForDir(model_dir) != null;
             if (manager.compactProfileForDir(model_dir)) |compact_request| {
                 admission_plan = capModelLoadAdmissionToCompact(
                     admission_plan,
@@ -4999,6 +5052,17 @@ fn loadSessionForPreferredBackends(
             }
             resident_amounts = admission_plan.resident;
             admission_limits = manager.admissionLimitsForBackend(backend_runtime);
+            if (manager.compactProfileForDir(model_dir)) |compact_request| {
+                // The node's derived backend/combined caps are conservative
+                // defaults for unbounded loads. A compact model's footprint is
+                // hard-bounded by the runtime ledger at the user's explicitly
+                // configured budget, so raise the caps to at least that ceiling
+                // rather than reject a model the operator deliberately sized.
+                admission_limits = widenAdmissionLimitsToCompactCeiling(
+                    admission_limits,
+                    compactResidentCeilingBytes(compact_request),
+                );
+            }
             if (admittedSessionCudaLimit(
                 backend_runtime,
                 resident_amounts,
@@ -5012,6 +5076,12 @@ fn loadSessionForPreferredBackends(
                 admissionBackendClassForRuntime(backend_runtime),
                 admission_limits,
                 admission_plan.peak,
+                // Compact loads enforce their resident ceiling via the runtime
+                // ledger; the node-wide live-memory headroom (designed for a
+                // non-streaming load that transiently materializes the whole
+                // artifact) is redundant for them and would reject a bounded
+                // model on a machine with less free RAM than the headroom.
+                !is_compact_load,
             ) catch |err| {
                 if (first_err == null) first_err = err;
                 continue;
