@@ -58,6 +58,10 @@ pub const CompactInferenceRequest = struct {
     /// Preferred prefill chunk in rows. Must be 32, 64, or 128; the runtime
     /// may only reduce it when the budget or shape requires.
     preferred_prefill_rows: u16 = 128,
+    /// Diagnostic override of the resident footprint ceiling in bytes;
+    /// 0 keeps the profile's contract ceiling. Qualification runs must not
+    /// set this.
+    resident_ceiling_override_bytes: u64 = 0,
 };
 
 /// Routed-expert geometry derived from model metadata at load time. The
@@ -153,7 +157,7 @@ pub fn buildCompactInferenceConfig(
         32, 64, 128 => {},
         else => return error.CompactProfileInvalidPrefillRows,
     }
-    return .{
+    var config = CompactInferenceConfig{
         .profile = request.profile,
         .expert_cache_slots = slots,
         .expert_cache_slots_auto = slots_auto,
@@ -161,6 +165,10 @@ pub fn buildCompactInferenceConfig(
         .preferred_prefill_rows = request.preferred_prefill_rows,
         .geometry = geometry,
     };
+    if (request.resident_ceiling_override_bytes != 0) {
+        config.resident_ceiling_bytes = request.resident_ceiling_override_bytes;
+    }
+    return config;
 }
 
 test "buildCompactInferenceConfig accepts only the qualified A4B geometry" {

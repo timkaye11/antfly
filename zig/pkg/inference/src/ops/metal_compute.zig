@@ -3512,7 +3512,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             }
         }
-        if (state.enforcing) return error.CompactBudgetExceeded;
+        if (state.enforcing) {
+            const snapshot = state.ledger.snapshot();
+            const cache_counts = state.cache.counts();
+            std.log.err(
+                "compact budget exceeded: footprint={d} committed={d} expert_pages={d} scratch={d} kv={d} resident_slots={d} in_flight={d} evictions={d} decommitted={d}",
+                .{
+                    snapshot.observed_footprint_bytes,
+                    snapshot.committed_total_bytes,
+                    snapshot.committed_by_category[@intFromEnum(gpu_hosted_store_mod.CompactBudgetCategory.expert_pages)],
+                    snapshot.committed_by_category[@intFromEnum(gpu_hosted_store_mod.CompactBudgetCategory.scratch)],
+                    snapshot.committed_by_category[@intFromEnum(gpu_hosted_store_mod.CompactBudgetCategory.kv_cache)],
+                    cache_counts.resident,
+                    cache_counts.in_flight,
+                    state.evictions,
+                    state.decommitted_bytes,
+                },
+            );
+            return error.CompactBudgetExceeded;
+        }
     }
 
     fn compactMoeExpertEntries(
@@ -3839,7 +3857,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer state.ledger.release(.scratch, staging_bytes);
         const staging = try self.allocator.alloc(f32, staging_len);
         defer self.allocator.free(staging);
-        const gather_scratch = try self.allocator.alloc(f32, total * hidden);
+        const gather_scratch = try self.allocator.alloc(f32, @max(total, 128) * hidden);
         defer self.allocator.free(gather_scratch);
 
         // Tiles sized to half the active tier so the lookahead tile's slots
@@ -3920,6 +3938,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// Run one published tile: batched gate/up + activation + gated multiply
     /// + down projection per expert over all rows assigned to it, then
     /// scatter the down outputs into (row, rank) staging.
+    /// Round an expert's row batch up to one of a few fixed buckets so the
+    /// runtime's shape-keyed intermediate pools stay bounded.
+    fn compactRowsBucket(rows: usize) usize {
+        if (rows <= 8) return 8;
+        if (rows <= 16) return 16;
+        if (rows <= 32) return 32;
+        if (rows <= 64) return 64;
+        return 128;
+    }
+
     fn executeCompactMoeTile(
         self: *MetalCompute,
         request: *const ops.RunMoeBlockRequest,
@@ -3950,18 +3978,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const begin: usize = offsets[expert];
             const end: usize = offsets[expert + 1];
             const rows_e = end - begin;
+            // Pad every expert batch up to a small bucket set. The runtime
+            // pools intermediate buffers by shape, so unbounded distinct row
+            // counts would grow those pools linearly with the prompt; a
+            // handful of buckets keeps them fixed. Padded rows are zeros and
+            // their outputs are never scattered, so real rows are unchanged.
+            const rows_bucket = compactRowsBucket(rows_e);
             for (assignment_rows[begin..end], 0..) |row, gather_index| {
                 @memcpy(
                     gather_scratch[gather_index * hidden ..][0..hidden],
                     input[@as(usize, row) * hidden ..][0..hidden],
                 );
             }
-            const gathered_shape = [_]i32{ @intCast(rows_e), @intCast(hidden) };
-            const gathered_host = MetalTensor.borrowed(gather_scratch.ptr, rows_e * hidden, &gathered_shape);
+            @memset(gather_scratch[rows_e * hidden .. rows_bucket * hidden], 0);
+            const gathered_shape = [_]i32{ @intCast(rows_bucket), @intCast(hidden) };
+            const gathered_host = MetalTensor.borrowed(gather_scratch.ptr, rows_bucket * hidden, &gathered_shape);
             var device = try MetalTensor.deviceAllocate(
                 @ptrCast(runtime),
-                rows_e * hidden * @sizeOf(f32),
-                uploadStorageMode(rows_e * hidden * @sizeOf(f32)),
+                rows_bucket * hidden * @sizeOf(f32),
+                uploadStorageMode(rows_bucket * hidden * @sizeOf(f32)),
                 &gathered_shape,
             );
             errdefer device.deinit();
@@ -3977,7 +4012,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var downs: [8]?MetalTensor = [_]?MetalTensor{null} ** 8;
         defer for (&downs) |*tensor| if (tensor.*) |*value| value.deinit();
         for (tile, 0..) |expert, position| {
-            const rows_e: usize = offsets[expert + 1] - offsets[expert];
+            const rows_e: usize = compactRowsBucket(offsets[expert + 1] - offsets[expert]);
             const slots = pending.route_slots[position];
             const expert_input = inputs_device[position].?;
             var pair = (try metal_runtime.tryApplyQuantizedRuntimeLinearPair(
@@ -4023,7 +4058,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             var down = downs[position].?;
             const host = try down.toHostSlice();
             self.resident_expert_host_transfers +|= 1;
-            if (host.len != (end - begin) * hidden) return false;
+            if (host.len != compactRowsBucket(end - begin) * hidden) return false;
             for (assignment_rows[begin..end], assignment_ranks[begin..end], 0..) |row, rank, local_index| {
                 @memcpy(
                     staging[(@as(usize, row) * top_k + rank) * hidden ..][0..hidden],

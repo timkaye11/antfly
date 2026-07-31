@@ -1546,9 +1546,6 @@ fn createGpuHostedSessionWithTaskOverride(
         const enforcing = compact_config != null;
         const geometry = effective_config.geometry;
         const arena_bytes = std.mem.alignForward(u64, geometry.encoded_expert_bytes, 16 * 1024);
-        const expert_total_bytes = geometry.encoded_expert_bytes *|
-            @as(u64, geometry.expert_count) *| geometry.moe_layer_count;
-        const fixed_model_bytes = @as(u64, model_weight_bytes) -| expert_total_bytes;
         const state = try allocator.create(gpu_hosted_store_mod.CompactRuntimeState);
         state.* = .{
             .ledger = if (enforcing)
@@ -1563,10 +1560,12 @@ fn createGpuHostedSessionWithTaskOverride(
         state.cache.setActiveSlots(effective_config.expert_cache_slots);
         state.ledger.setVirtualSlotCapacity(@as(u64, geometry.moe_layer_count) *|
             gpu_hosted_store_mod.compact_runtime_slot_capacity *| arena_bytes);
-        state.ledger.reserve(.fixed_model, fixed_model_bytes) catch |err| {
-            allocator.destroy(state);
-            return err;
-        };
+        // Fixed model buffers are mapped read-only: their *resident* share is
+        // whatever the OS keeps paged in, which the independent
+        // phys_footprint sampler already observes. Charging the artifact
+        // size here would conflate virtual mapping with residency and trip
+        // the soft limit immediately, evicting the expert cache on every
+        // plan. The category stays for buffers that are explicitly wired.
         break :blk state;
     };
     errdefer {
@@ -1710,8 +1709,16 @@ fn deriveCompactSessionConfig(
             if (!range.tensor_type.eql(.{ .known = .Q4_0 })) {
                 return error.CompactProfileUnsupportedQuantization;
             }
-            if (range.byte_len == 0) return error.CompactProfileUnsupportedGeometry;
-            layer_bytes += range.byte_len;
+            // For fused gate/up aliases the range spans the whole per-expert
+            // fused slice and row_offset/row_count select the logical half,
+            // so the projection's encoded bytes are the row fraction.
+            if (range.byte_len == 0 or range.shape.len != 2 or range.shape[0] <= 0 or range.row_count == 0) {
+                return error.CompactProfileUnsupportedGeometry;
+            }
+            const source_rows: u64 = @intCast(range.shape[0]);
+            const scaled: u64 = @as(u64, range.byte_len) * range.row_count;
+            if (scaled % source_rows != 0) return error.CompactProfileUnsupportedGeometry;
+            layer_bytes += scaled / source_rows;
         }
         if (probe_index == 0) {
             encoded_expert_bytes = layer_bytes;
@@ -1740,6 +1747,8 @@ test "deriveCompactSessionConfig fail-closes outside the qualified envelope" {
     const StubExpertStore = struct {
         tensor_type: gguf_mod.tensor_types.TensorType = .{ .known = .Q4_0 },
         projection_byte_len: usize = 1_115_136,
+        fused_shape: [2]i64 = .{ 1408, 2816 },
+        down_shape: [2]i64 = .{ 2816, 704 },
 
         const vtable = tensor_store_mod.TensorStore.VTable{
             .kind = @ptrCast(&kindImpl),
@@ -1779,6 +1788,23 @@ test "deriveCompactSessionConfig fail-closes outside the qualified envelope" {
             _: std.mem.Allocator,
             tensor_ref: *const tensor_store_mod.LazyTensorRef,
         ) !?tensor_store_mod.QuantizedTensorRangeRef {
+            // Mirror the GGUF store: gate/up aliases describe the whole
+            // fused per-expert slice with rows selecting the logical half;
+            // the down projection is a standalone matrix.
+            const fused = std.mem.indexOf(u8, tensor_ref.name, ".w2.") == null;
+            if (fused) {
+                return .{
+                    .name = tensor_ref.name,
+                    .source_name = tensor_ref.name,
+                    .path = "",
+                    .byte_offset = 0,
+                    .byte_len = self.projection_byte_len * 2,
+                    .tensor_type = self.tensor_type,
+                    .shape = self.fused_shape[0..],
+                    .row_offset = if (std.mem.indexOf(u8, tensor_ref.name, ".w3.") != null) 704 else 0,
+                    .row_count = 704,
+                };
+            }
             return .{
                 .name = tensor_ref.name,
                 .source_name = tensor_ref.name,
@@ -1786,7 +1812,9 @@ test "deriveCompactSessionConfig fail-closes outside the qualified envelope" {
                 .byte_offset = 0,
                 .byte_len = self.projection_byte_len,
                 .tensor_type = self.tensor_type,
-                .shape = &.{},
+                .shape = self.down_shape[0..],
+                .row_offset = 0,
+                .row_count = 2816,
             };
         }
 

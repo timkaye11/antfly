@@ -117,6 +117,7 @@ const Options = struct {
     scratch_budget_mb: usize = 0,
     memory_profile: ?MemoryProfile = null,
     expert_cache_slots: usize = 0,
+    compact_ceiling_mb: usize = 0,
     raw_prompt: bool = false,
     no_bos: bool = false,
     raw_decode_bench: bool = false,
@@ -6846,6 +6847,10 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingMemoryProfile;
             opts.memory_profile = parseMemoryProfile(args[i]) orelse return error.InvalidMemoryProfile;
+        } else if (std.mem.eql(u8, arg, "--compact-ceiling-mb")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgumentValue;
+            opts.compact_ceiling_mb = try std.fmt.parseInt(usize, args[i], 10);
         } else if (std.mem.eql(u8, arg, "--expert-cache-slots")) {
             i += 1;
             if (i >= args.len) return error.MissingExpertCacheSlots;
@@ -6927,6 +6932,7 @@ fn compactRequestFromOptions(opts: Options) ?session_factory.CompactInferenceReq
         .expert_cache_slots = @intCast(opts.expert_cache_slots),
         .io_workers = 4,
         .preferred_prefill_rows = @intCast(opts.prefill_chunk_size),
+        .resident_ceiling_override_bytes = @as(u64, opts.compact_ceiling_mb) * 1024 * 1024,
     };
 }
 
