@@ -4856,6 +4856,100 @@ fn nativeModelLoadAdmission(
     };
 }
 
+/// Enforced resident phys_footprint ceiling in bytes for a compact profile:
+/// the diagnostic override if set, otherwise the memory budget (floored at
+/// the profile minimum). The compact streaming loader keeps at most this many
+/// bytes resident, so the full-artifact weight estimate must not be charged
+/// against admission for these models.
+fn compactResidentCeilingBytes(request: backends.SessionManager.CompactRequest) u64 {
+    if (request.resident_ceiling_override_bytes != 0) return request.resident_ceiling_override_bytes;
+    const budget_mb: u64 = if (request.memory_budget_mb == 0)
+        session_factory.CompactInferenceConfig.min_memory_budget_mb
+    else
+        request.memory_budget_mb;
+    return budget_mb * 1024 * 1024;
+}
+
+fn capAmountWeightBytes(
+    amounts: runtime.tier.memory.AdmissionAmounts,
+    ceiling: u64,
+) runtime.tier.memory.AdmissionAmounts {
+    const cap: usize = std.math.cast(usize, ceiling) orelse std.math.maxInt(usize);
+    var out = amounts;
+    // The compact ceiling bounds the total resident footprint. Bound the sum
+    // of host+backend weight to it (backend first, host fills the remainder),
+    // so on unified memory the live-host check — which adds both buckets — sees
+    // the ceiling rather than the full non-streaming host+device weight peak.
+    if (out.backend_weight_bytes > cap) out.backend_weight_bytes = cap;
+    const host_room = cap - out.backend_weight_bytes;
+    if (out.host_weight_bytes > host_room) out.host_weight_bytes = host_room;
+    return out;
+}
+
+/// Bound a load-admission plan's weight residency to the compact residency
+/// ceiling. Streaming compact loads never materialize the whole artifact, so
+/// admitting them against the full-weight estimate would reject a valid
+/// bounded-footprint model on smaller machines even though its enforced
+/// resident footprint fits. Only the weight bytes are capped; KV and scratch
+/// amounts (already tiny at load time) are left unchanged.
+fn capModelLoadAdmissionToCompact(
+    plan: ModelLoadAdmissionPlan,
+    ceiling: u64,
+) ModelLoadAdmissionPlan {
+    return .{
+        .peak = capAmountWeightBytes(plan.peak, ceiling),
+        .resident = capAmountWeightBytes(plan.resident, ceiling),
+    };
+}
+
+test "compact resident ceiling resolves from budget, floor, and override" {
+    // Explicit budget maps MiB -> bytes.
+    try std.testing.expectEqual(
+        @as(u64, 6144) * 1024 * 1024,
+        compactResidentCeilingBytes(.{ .memory_budget_mb = 6144 }),
+    );
+    // Zero budget selects the profile floor.
+    try std.testing.expectEqual(
+        @as(u64, session_factory.CompactInferenceConfig.min_memory_budget_mb) * 1024 * 1024,
+        compactResidentCeilingBytes(.{ .memory_budget_mb = 0 }),
+    );
+    // Diagnostic override wins over the budget.
+    try std.testing.expectEqual(
+        @as(u64, 3 * 1024 * 1024 * 1024),
+        compactResidentCeilingBytes(.{ .memory_budget_mb = 6144, .resident_ceiling_override_bytes = 3 * 1024 * 1024 * 1024 }),
+    );
+}
+
+test "compact load admission caps total weight residency to the ceiling" {
+    const ceiling: u64 = @as(u64, 6144) * 1024 * 1024;
+    // A non-streaming metal estimate: ~14 GiB device weights plus host staging.
+    const plan = ModelLoadAdmissionPlan{
+        .peak = .{
+            .backend_weight_bytes = 14 * 1024 * 1024 * 1024,
+            .host_weight_bytes = 3 * 1024 * 1024 * 1024,
+        },
+        .resident = .{
+            .backend_weight_bytes = 14 * 1024 * 1024 * 1024,
+        },
+    };
+    const capped = capModelLoadAdmissionToCompact(plan, ceiling);
+    // Backend weight is bounded to the ceiling and host fills no remainder, so
+    // the unified live-host charge (host + backend) equals the ceiling.
+    try std.testing.expectEqual(@as(usize, @intCast(ceiling)), capped.peak.backend_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 0), capped.peak.host_weight_bytes);
+    try std.testing.expect(capped.peak.host_weight_bytes + capped.peak.backend_weight_bytes <= @as(usize, @intCast(ceiling)));
+    try std.testing.expectEqual(@as(usize, @intCast(ceiling)), capped.resident.backend_weight_bytes);
+
+    // Amounts already under the ceiling are unchanged.
+    const small = ModelLoadAdmissionPlan{
+        .peak = .{ .backend_weight_bytes = 512 * 1024 * 1024, .host_weight_bytes = 128 * 1024 * 1024 },
+        .resident = .{ .backend_weight_bytes = 512 * 1024 * 1024 },
+    };
+    const small_capped = capModelLoadAdmissionToCompact(small, ceiling);
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), small_capped.peak.backend_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), small_capped.peak.host_weight_bytes);
+}
+
 fn loadSessionForPreferredBackends(
     manager: *ModelManager,
     preferred_backends: []const backends.BackendType,
@@ -4887,10 +4981,22 @@ fn loadSessionForPreferredBackends(
         var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
         var admission_limits = runtime.tier.memory.Limits{};
         if (manager.admission_enabled) {
-            const admission_plan = estimateModelLoadAdmission(man, backend_runtime) catch |err| {
+            var admission_plan = estimateModelLoadAdmission(man, backend_runtime) catch |err| {
                 if (first_err == null) first_err = err;
                 continue;
             };
+            // Compact-profiled models stream routed experts under an enforced
+            // resident ceiling, so admit them against that ceiling rather than
+            // the full-artifact weight estimate; otherwise a bounded-footprint
+            // model is rejected on smaller machines whose stable backend limit
+            // is below the full weights (the estimate the CLI path skips by
+            // running with admission disabled).
+            if (manager.compactProfileForDir(model_dir)) |compact_request| {
+                admission_plan = capModelLoadAdmissionToCompact(
+                    admission_plan,
+                    compactResidentCeilingBytes(compact_request),
+                );
+            }
             resident_amounts = admission_plan.resident;
             admission_limits = manager.admissionLimitsForBackend(backend_runtime);
             if (admittedSessionCudaLimit(
