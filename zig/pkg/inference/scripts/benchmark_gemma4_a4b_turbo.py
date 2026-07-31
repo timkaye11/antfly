@@ -55,7 +55,11 @@ TURBO_FOOTER_RE = re.compile(
 TIME_REAL_RE = re.compile(r"^\s*(?P<seconds>[0-9.]+)\s+real\b", re.MULTILINE)
 TIME_RSS_RE = re.compile(r"^\s*(?P<bytes>\d+)\s+maximum resident set size\s*$", re.MULTILINE)
 
-DEFAULT_MAX_PHYS_FOOTPRINT_BYTES = 2_120_000_000
+# Matches the compact contract's resident ceiling at the 2048 MiB budget
+# floor (CompactInferenceConfig.default_resident_ceiling_bytes). Runs
+# qualifying a larger --memory-budget-mb should pass the matching ceiling via
+# --max-phys-footprint-bytes.
+DEFAULT_MAX_PHYS_FOOTPRINT_BYTES = 2048 * 1024 * 1024
 DEFAULT_MAX_DECODE_CV = 0.03
 FOOTPRINT_POLL_SECONDS = 0.05
 RUSAGE_INFO_V4 = 4
