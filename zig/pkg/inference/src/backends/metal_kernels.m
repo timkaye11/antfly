@@ -31,7 +31,12 @@
 
 #define TERMITE_METAL_LAYER_NORM_SLOT_CAPACITY 256
 #define TERMITE_METAL_RMS_NORM_SLOT_CAPACITY 512
-#define TERMITE_METAL_LINEAR_SLOT_CAPACITY 2048
+// Mirrors metal_runtime.decoder_runtime_linear_slot_capacity: slots
+// [512, 12_032) host compact resident routed experts (30 layers * up to 128
+// budget-derived slots * 3 projections). Per-slot state below is ~350 B
+// (pointers, dims, quant metadata), so the capacity costs ~4.3 MB in the
+// runtime struct; device buffers are only ever attached to prepared slots.
+#define TERMITE_METAL_LINEAR_SLOT_CAPACITY 12288
 #define TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY 256
 #define TERMITE_METAL_SCRATCH_POOL_CAPACITY 16
 #define TERMITE_METAL_GENERATED_DECODE_THREADS 256u
