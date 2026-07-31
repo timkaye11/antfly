@@ -95,6 +95,43 @@ history. The ring is disabled for prompt-cache requests, cache compaction, and
 non-paged attention; `TERMITE_METAL_DISABLE_SPLIT_SWA_KV_RING=1` is the master
 rollback while the long-context rollout gate remains experimental.
 
+### Warm serving prompt cache (compact A4B)
+
+The compact A4B model serves warm-TTFT through the inference-native prompt
+prefix cache. Operational contract:
+
+- **Node default off, key required.** `inference.prompt_cache.enabled` defaults
+  to `false` (`server.zig` `PromptCacheConfig`). A request caches only when the
+  node cache is enabled *and* the request carries a non-empty
+  `prompt_cache_key`; keyless requests share no namespace and are never cached.
+  See `scripts/gemma4_a4b_serving.json` for a serving config that preloads the
+  A4B directory under `memory_profile: compact_2gbs` +
+  `memory_budget_mb: 6144` and enables the cache.
+- **Cache-on retains full KV; the SWA ring is per-request disabled by design.**
+  Prefix reuse requires the full key/value history to stay resident, so
+  `eagerPrefillAllowsSplitSwaRing` (`pipelines/generation.zig`) returns false
+  whenever `prompt_cache_enabled` is set. Cache and ring are mutually exclusive
+  per request; when a key is present the cache wins. This is expected and
+  correct, not a regression.
+- **Ledger charges `prompt_cache_kv`.** Retained cache blocks are billed to the
+  compact session ledger through the resource-usage observer wired at
+  `model_manager.zig` (`promptCacheLedgerObserverForSession`, charging
+  `BudgetCategory.prompt_cache_kv`). Retained logical bytes surface at
+  `antfly_inference_prompt_cache_live_bytes`; block-hash hits/misses and cached
+  blocks surface at `antfly_inference_prompt_cache_block_hash_*`.
+- **Pool provisioned at warm boot.** When the node cache is enabled and a
+  cache-eligible generator is preloaded, the warm ping creates the per-model
+  cache pool, its device-backed KV storage, and the KV device write hook at
+  boot (reserved namespace `__warmup__`, whose sub-`min_tokens` prompt stores
+  nothing). The first real cached request therefore does not pay pool
+  provisioning on its TTFT.
+
+Measure warm serving TTFT end-to-end with
+`scripts/measure_serving_ttft.py` (stdlib-only): it starts the server with a
+compact + cache config and runs cold / replay / strict-extension / second-key /
+non-streaming cases, emitting per-case TTFT, `cached_prompt_tokens`, and the
+prompt-cache ledger metrics.
+
 The drafter must use the same tokenizer vocabulary and special token ids as the
 target. Speculative decoding is currently native text-only generation; it is not
 enabled for multimodal prompts or the ONNX direct path.
