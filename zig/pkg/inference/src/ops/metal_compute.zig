@@ -11845,6 +11845,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                                 .query_position_offset = query_position_offset,
                                 .kv_position_offset = attention.kv_position_offset,
                                 .sliding_window = attention.sliding_window,
+                                // Compact decode-step frame: the KV write, this
+                                // attention encode, and every downstream consumer
+                                // share this runtime's open frame, so skip the
+                                // per-layer drain flush inside the slot-attention
+                                // wrapper. Gated exactly like the step frame.
+                                .consume_on_active_frame = self.decode_step_frame_active,
                             })) |tensor| return self.ctFromOwnedMetalTensor(tensor);
                         }
                     }

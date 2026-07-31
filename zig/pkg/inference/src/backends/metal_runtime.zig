@@ -3056,6 +3056,18 @@ pub fn decoderRuntimeApplyPagedKvAttentionSlotOnRuntime(runtime: *RawMetalDecode
     // caller may consume `output` from a DIFFERENT runtime's queue with no
     // cross-queue ordering. Drain the owner's frame before handing the
     // output back so it is complete.
+    //
+    // Same-queue exception (`consume_on_active_frame`): when the caller
+    // owns the active frame on THIS runtime (the compact decode-step
+    // frame) and consumes the output through ops that encode onto the
+    // same frame or sync it before host reads, the encode joined that
+    // frame and command-buffer order plus tracked-resource hazards give
+    // the required ordering — no drain needed.
+    const consume_on_active_frame = @hasField(@TypeOf(request), "consume_on_active_frame") and
+        request.consume_on_active_frame;
+    if (consume_on_active_frame and termite_metal_decode_runtime_has_active_frame(runtime) != 0) {
+        return output;
+    }
     if (termite_metal_decode_runtime_has_active_frame(runtime) != 0 or
         termite_metal_decode_runtime_has_submitted_frame(runtime) != 0)
     {
