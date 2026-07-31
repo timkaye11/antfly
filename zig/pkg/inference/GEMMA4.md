@@ -132,6 +132,34 @@ compact + cache config and runs cold / replay / strict-extension / second-key /
 non-streaming cases, emitting per-case TTFT, `cached_prompt_tokens`, and the
 prompt-cache ledger metrics.
 
+#### Serving-path admission (compact loads)
+
+Unlike the CLI `generate` path (which runs with admission disabled), the
+server enables load admission. Two facts govern whether the compact model
+loads and serves on a given host:
+
+- **Load estimate is capped to the compact ceiling.** The load-admission
+  estimate otherwise charges the full artifact weight footprint (~14 GiB for
+  26B q4_0), which a machine whose stable backend limit is below that would
+  reject even though the compact runtime streams routed experts under an
+  enforced resident ceiling. `capModelLoadAdmissionToCompact`
+  (`model_manager.zig`) bounds the weight residency (both the stable-limit and
+  unified live-host charges) to the compact resident ceiling for
+  compact-profiled models only.
+- **Live-memory headroom sets the real budget floor for a host.** The load's
+  live-host check requires `available >= ceiling + liveHostMemoryHeadroom`.
+  On a 16 GiB host the headroom is 6 GiB, so a `memory_budget_mb: 6144` model
+  needs ~12 GiB of `free+inactive+speculative` available at load — more than a
+  16 GiB machine with a normal desktop/app baseline can present. Size
+  `memory_budget_mb` for the serving host's real available memory (the compact
+  profile's namesake 2048 MiB floor is the safe minimum), or serve on a host
+  with more RAM. This is why the compact A4B is qualified on a 24 GiB machine.
+- **Served requests need `--allow-unknown-models`.** The warm/preload loader
+  accepts the Gemma-4 26B-A4B geometry, but the served-request compatibility
+  gate flags it as an unknown architecture; start the server with
+  `--allow-unknown-models` (as the measurement script does) so requests resolve
+  the preloaded model.
+
 The drafter must use the same tokenizer vocabulary and special token ids as the
 target. Speculative decoding is currently native text-only generation; it is not
 enabled for multimodal prompts or the ONNX direct path.
