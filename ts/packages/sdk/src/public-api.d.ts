@@ -11981,21 +11981,29 @@ export interface components {
             /**
              * @description Load-time memory profile for this model instance. `compact_2gbs`
              *     selects the bounded streaming routed-expert runtime with an
-             *     enforced 2 GB-class resident footprint ceiling. Only qualified
-             *     model geometries load under a compact profile, the load fails
-             *     closed otherwise, and request-time APIs cannot change residency
-             *     policy.
+             *     enforced resident footprint ceiling sized by `memory_budget_mb`
+             *     (default 2048 MiB). Only qualified model geometries load under a
+             *     compact profile, the load fails closed otherwise, and
+             *     request-time APIs cannot change residency policy.
              * @enum {string}
              */
             memory_profile?: "compact_2gbs";
             /**
-             * @description Resident routed-expert cache slots per MoE layer under a compact
-             *     memory profile. Omission selects the automatic tier, which starts
-             *     at the highest qualified tier and downshifts under the residency
-             *     ceiling.
-             * @enum {integer}
+             * @description Total resident memory budget in MiB for the compact memory
+             *     profile. The enforced footprint ceiling, the KV-cache share, and
+             *     the automatic expert-cache slot count all derive from it.
+             *     Omission keeps the 2048 MiB floor; values below the floor are
+             *     rejected. Setting a budget without `memory_profile` implies the
+             *     compact profile.
              */
-            expert_cache_slots?: 8 | 12 | 16;
+            memory_budget_mb?: number;
+            /**
+             * @description Resident routed-expert cache slots per MoE layer under a compact
+             *     memory profile. Omission derives the count from
+             *     `memory_budget_mb`, downshifting under residency-ceiling
+             *     pressure; explicit values pin it within [4, 128].
+             */
+            expert_cache_slots?: number;
         };
         /** @description Native generator prompt KV cache configuration. */
         InferencePromptCacheConfig: {

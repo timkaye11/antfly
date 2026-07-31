@@ -3602,14 +3602,19 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
     ) ![]u8 {
-        const profile_slots: i64 = if (self.compactProfileForDir(model_dir)) |request|
+        const compact_request = self.compactProfileForDir(model_dir);
+        const profile_slots: i64 = if (compact_request) |request|
             request.expert_cache_slots
+        else
+            -1;
+        const profile_budget: i64 = if (compact_request) |request|
+            request.memory_budget_mb
         else
             -1;
         const prefix = try std.fmt.allocPrint(
             self.allocator,
-            "{d}:{s}:{d}:compact={d}:",
-            .{ model_dir.len, model_dir, @intFromBool(cache_default_alias), profile_slots },
+            "{d}:{s}:{d}:compact={d}:budget={d}:",
+            .{ model_dir.len, model_dir, @intFromBool(cache_default_alias), profile_slots, profile_budget },
         );
         defer self.allocator.free(prefix);
         const key = try self.allocator.alloc(u8, prefix.len + preferred_backends.len);
@@ -4112,10 +4117,11 @@ fn backendVariantCacheKeyWithProfile(
     backend: backends.BackendType,
 ) ![]u8 {
     if (self.compactProfileForDir(model_dir)) |request| {
-        return std.fmt.allocPrint(allocator, "{s}\nbackend={s}\nmemory_profile={s}\nexpert_cache_slots={d}", .{
+        return std.fmt.allocPrint(allocator, "{s}\nbackend={s}\nmemory_profile={s}\nmemory_budget_mb={d}\nexpert_cache_slots={d}", .{
             model_dir,
             @tagName(backend),
             @tagName(request.profile),
+            request.memory_budget_mb,
             request.expert_cache_slots,
         });
     }

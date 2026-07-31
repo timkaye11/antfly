@@ -46,6 +46,7 @@ const RunConfig = struct {
         format: ?[]const u8 = null,
         quantization: ?[]const u8 = null,
         memory_profile: ?[]const u8 = null,
+        memory_budget_mb: ?u32 = null,
         expert_cache_slots: ?u8 = null,
     };
 
@@ -173,6 +174,7 @@ fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConf
             .format = value.format,
             .quantization = value.quantization,
             .memory_profile = value.memory_profile,
+            .memory_budget_mb = value.memory_budget_mb,
             .expert_cache_slots = value.expert_cache_slots,
         };
     }
