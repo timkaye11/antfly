@@ -73,16 +73,20 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     raw_rms_norm_slots_prepared: [decoder_runtime_rms_norm_slot_capacity]bool = [_]bool{false} ** decoder_runtime_rms_norm_slot_capacity,
     raw_rms_norm_slot_hidden_sizes: [decoder_runtime_rms_norm_slot_capacity]usize = [_]usize{0} ** decoder_runtime_rms_norm_slot_capacity,
     raw_rms_norm_slot_weights: [decoder_runtime_rms_norm_slot_capacity]?MetalTensor = [_]?MetalTensor{null} ** decoder_runtime_rms_norm_slot_capacity,
-    raw_linear_slots_prepared: [decoder_runtime_linear_slot_capacity]bool = [_]bool{false} ** decoder_runtime_linear_slot_capacity,
-    raw_linear_slot_kinds: [decoder_runtime_linear_slot_capacity]RawLinearSlotKind = [_]RawLinearSlotKind{.none} ** decoder_runtime_linear_slot_capacity,
-    raw_linear_slot_in_dims: [decoder_runtime_linear_slot_capacity]usize = [_]usize{0} ** decoder_runtime_linear_slot_capacity,
-    raw_linear_slot_out_dims: [decoder_runtime_linear_slot_capacity]usize = [_]usize{0} ** decoder_runtime_linear_slot_capacity,
-    raw_linear_slot_quantized_storage: [decoder_runtime_linear_slot_capacity]?*QuantizedStorage = [_]?*QuantizedStorage{null} ** decoder_runtime_linear_slot_capacity,
-    raw_linear_slot_dense_weights: [decoder_runtime_linear_slot_capacity]?MetalTensor = [_]?MetalTensor{null} ** decoder_runtime_linear_slot_capacity,
-    raw_linear_slot_dense_biases: [decoder_runtime_linear_slot_capacity]?MetalTensor = [_]?MetalTensor{null} ** decoder_runtime_linear_slot_capacity,
-    raw_linear_slot_runtime_prepared_kind: [decoder_runtime_linear_slot_capacity]RawQuantizedRuntimeLinearKind = [_]RawQuantizedRuntimeLinearKind{.none} ** decoder_runtime_linear_slot_capacity,
-    raw_linear_slot_runtime_prepared_modes: [decoder_runtime_linear_slot_capacity]RawQuantizedRuntimeLinearStorageMode = [_]RawQuantizedRuntimeLinearStorageMode{.none} ** decoder_runtime_linear_slot_capacity,
-    raw_linear_slot_disable_mapped_quant_weight: [decoder_runtime_linear_slot_capacity]bool = [_]bool{false} ** decoder_runtime_linear_slot_capacity,
+    // Per-linear-slot state lives on the heap: at the 12,288-slot capacity
+    // the inline arrays total several megabytes, and a by-value provider
+    // construction would overflow thread stacks. Slices keep every existing
+    // `provider.field[slot]` access site unchanged.
+    raw_linear_slots_prepared: []bool = &.{},
+    raw_linear_slot_kinds: []RawLinearSlotKind = &.{},
+    raw_linear_slot_in_dims: []usize = &.{},
+    raw_linear_slot_out_dims: []usize = &.{},
+    raw_linear_slot_quantized_storage: []?*QuantizedStorage = &.{},
+    raw_linear_slot_dense_weights: []?MetalTensor = &.{},
+    raw_linear_slot_dense_biases: []?MetalTensor = &.{},
+    raw_linear_slot_runtime_prepared_kind: []RawQuantizedRuntimeLinearKind = &.{},
+    raw_linear_slot_runtime_prepared_modes: []RawQuantizedRuntimeLinearStorageMode = &.{},
+    raw_linear_slot_disable_mapped_quant_weight: []bool = &.{},
     raw_quant_runtime_private_prepare_nanos: u128 = 0,
     raw_quant_runtime_mapped_prepare_nanos: u128 = 0,
     raw_quant_runtime_mapped_attempts: u64 = 0,
@@ -98,6 +102,12 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         return createWithKernelJitOptions(.{ .config = config });
     }
 
+    fn allocLinearSlotSlice(comptime T: type, fill: T) ![]T {
+        const slice = try std.heap.c_allocator.alloc(T, decoder_runtime_linear_slot_capacity);
+        @memset(slice, fill);
+        return slice;
+    }
+
     pub fn createWithKernelJitOptions(options: metal_runtime.MetalJitOptions) !MetalNativeProvider {
         const raw_provider = metal_runtime.termite_metal_provider_create();
         const raw_decode_runtime = metal_runtime.termite_metal_decode_runtime_create();
@@ -106,6 +116,16 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
             .raw_decode_runtime = raw_decode_runtime,
         };
         errdefer result.deinitOwned();
+        result.raw_linear_slots_prepared = try allocLinearSlotSlice(bool, false);
+        result.raw_linear_slot_kinds = try allocLinearSlotSlice(RawLinearSlotKind, .none);
+        result.raw_linear_slot_in_dims = try allocLinearSlotSlice(usize, 0);
+        result.raw_linear_slot_out_dims = try allocLinearSlotSlice(usize, 0);
+        result.raw_linear_slot_quantized_storage = try allocLinearSlotSlice(?*QuantizedStorage, null);
+        result.raw_linear_slot_dense_weights = try allocLinearSlotSlice(?MetalTensor, null);
+        result.raw_linear_slot_dense_biases = try allocLinearSlotSlice(?MetalTensor, null);
+        result.raw_linear_slot_runtime_prepared_kind = try allocLinearSlotSlice(RawQuantizedRuntimeLinearKind, .none);
+        result.raw_linear_slot_runtime_prepared_modes = try allocLinearSlotSlice(RawQuantizedRuntimeLinearStorageMode, .none);
+        result.raw_linear_slot_disable_mapped_quant_weight = try allocLinearSlotSlice(bool, false);
         // Non-generative Metal graphs (embedding, vision, and audio encoders)
         // have no later regime transition hook. Generation explicitly switches
         // to prefill/decode/speculative regimes before dispatching its work.
@@ -170,12 +190,29 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
             metal_runtime.waitFrame(self.raw_decode_runtime) catch {};
         }
         metal_runtime.resetGatheredSpans(self);
-        for (0..decoder_runtime_linear_slot_capacity) |slot| metal_runtime.releaseRawLinearSlot(self, slot);
+        // Slice length (not the capacity constant): a partially constructed
+        // provider on the error path has empty slices.
+        for (0..self.raw_linear_slots_prepared.len) |slot| metal_runtime.releaseRawLinearSlot(self, slot);
         for (0..decoder_runtime_layer_norm_slot_capacity) |slot| metal_runtime.releaseRawLayerNormSlot(self, slot);
         for (0..decoder_runtime_rms_norm_slot_capacity) |slot| metal_runtime.releaseRawRmsNormSlot(self, slot);
         metal_runtime.termite_metal_provider_destroy(self.raw_provider);
         metal_runtime.termite_metal_decode_runtime_destroy(self.raw_decode_runtime);
         for (&self.jit_pipeline_owners) |*generated| metal_runtime.termite_metal_generated_pipeline_destroy(generated.*);
         for (&self.jit_exact_pipeline_owners) |*generated| metal_runtime.termite_metal_generated_pipeline_destroy(generated.*);
+        freeLinearSlotSlices(self);
+    }
+
+    fn freeLinearSlotSlices(self: *MetalNativeProvider) void {
+        if (self.raw_linear_slots_prepared.len != 0) std.heap.c_allocator.free(self.raw_linear_slots_prepared);
+        if (self.raw_linear_slot_kinds.len != 0) std.heap.c_allocator.free(self.raw_linear_slot_kinds);
+        if (self.raw_linear_slot_in_dims.len != 0) std.heap.c_allocator.free(self.raw_linear_slot_in_dims);
+        if (self.raw_linear_slot_out_dims.len != 0) std.heap.c_allocator.free(self.raw_linear_slot_out_dims);
+        if (self.raw_linear_slot_quantized_storage.len != 0) std.heap.c_allocator.free(self.raw_linear_slot_quantized_storage);
+        if (self.raw_linear_slot_dense_weights.len != 0) std.heap.c_allocator.free(self.raw_linear_slot_dense_weights);
+        if (self.raw_linear_slot_dense_biases.len != 0) std.heap.c_allocator.free(self.raw_linear_slot_dense_biases);
+        if (self.raw_linear_slot_runtime_prepared_kind.len != 0) std.heap.c_allocator.free(self.raw_linear_slot_runtime_prepared_kind);
+        if (self.raw_linear_slot_runtime_prepared_modes.len != 0) std.heap.c_allocator.free(self.raw_linear_slot_runtime_prepared_modes);
+        if (self.raw_linear_slot_disable_mapped_quant_weight.len != 0) std.heap.c_allocator.free(self.raw_linear_slot_disable_mapped_quant_weight);
+        self.* = undefined;
     }
 } else void;
