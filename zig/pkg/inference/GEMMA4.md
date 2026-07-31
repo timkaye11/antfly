@@ -34,6 +34,33 @@ The drafter must use the same tokenizer vocabulary and special token ids as the
 target. Speculative decoding is currently native text-only generation; it is not
 enabled for multimodal prompts or the ONNX direct path.
 
+## Chat REPL
+
+`antfly inference chat` is the ollama-style interactive path: it resolves a
+friendly model name, pulls the model from HuggingFace when missing, loads it,
+and starts a multi-turn REPL:
+
+```sh
+antfly inference chat gemma4-e2b
+```
+
+`gemma4-e2b` and `gemma4-e4b` (plus `gemma-4-*` and `*-it` spellings) are
+pinned to `ggml-org/gemma-4-*-it-gguf:gguf:Q8_0`; any `owner/name[:variant]`
+reference or local model directory also works. The quant pin exists because
+those repos only publish BF16/Q4_0/Q8_0 and the Metal backend currently
+segfaults decoding their Q4_0 conversion (`generate` reproduces it without
+chat; `--backend native` works). Revisit the pin when Metal Q4_0 is fixed. The REPL
+supports `/set`, `/show`, `/clear`, `"""` multi-line input, and Ctrl-C to stop
+a response without leaving the chat (see `antfly inference chat --help`).
+
+Chat keeps the model's `PromptPrefixCache` active across turns with a fresh
+paged decode state per turn, so turn N+1 only prefills the previous reply plus
+the new user message; the per-turn footer reports the reused prefix as
+`N cached`. Chat is target-only generation: no MTP assistant is pulled or used
+because speculative decoding disables prompt-prefix reuse (the
+`!use_speculative` eligibility gate in `pipelines/generation.zig`) and forfeits
+the multi-turn TTFT win. Use `generate --draft-model` for the speculative path.
+
 ## Google Gemma 4 MTP Design
 
 Google's MTP assistants are not just arbitrary smaller language models. They

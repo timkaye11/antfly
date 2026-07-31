@@ -199,6 +199,8 @@ pub fn runFromArgs(
         try inference.native_rerank.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "generate")) {
         try inference.native_generate.main(allocator, init.io, command_args);
+    } else if (std.mem.eql(u8, command, "chat")) {
+        try inference.native_chat.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "compile-artifact")) {
         try inference.native_compile.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "export")) {
@@ -468,6 +470,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  classify  Run native text classification from the command line
         \\  rerank    Run native text reranking from the command line
         \\  generate  Run native text generation from the command line
+        \\  chat      Interactive chat with a local model (pulls known models on first use)
         \\  compile-artifact Compile one or more traced generation artifacts
         \\  export    Convert a model artifact to ONNX, GGUF, or safetensors
         \\  quantize  Create a quantized model variant

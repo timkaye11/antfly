@@ -2349,6 +2349,10 @@ pub const NativeGenerationPipeline = struct {
     bos_token: []const u8 = "",
     chat_template: ?*const ChatTemplate = null,
     prompt_override: ?[]const u8 = null,
+    /// Maximum prompt tokens accepted by tokenization. The tokenizer silently
+    /// truncates anything beyond this, so multi-turn callers (chat) must raise
+    /// it to the model's context length and trim history themselves.
+    prompt_max_tokens: usize = 2048,
     print_timing: bool = false,
     model_dir: ?[]const u8 = null,
     artifact_dir: ?[]const u8 = null,
@@ -2486,7 +2490,7 @@ pub const NativeGenerationPipeline = struct {
         const formatted_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
 
         // Tokenize
-        var encoded = try encodePromptForGeneration(self.tokenizer, allocator, prompt, 2048, self.add_bos_token, self.bos_token);
+        var encoded = try encodePromptForGeneration(self.tokenizer, allocator, prompt, self.prompt_max_tokens, self.add_bos_token, self.bos_token);
         const encoded_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         defer encoded.deinit();
 

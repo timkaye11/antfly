@@ -38,7 +38,9 @@ Implemented now:
 
 Still missing on the critical path:
 
-- prefix cache integration across requests, not just runtime support inside `KvManager`
+- prefix cache integration across server requests, not just runtime support
+  inside `KvManager` (the `chat` CLI already drives `PromptPrefixCache`
+  across REPL turns; the server still re-prefills streamed requests)
 - multi-request chunked prefill interleaving (single-request chunked prefill is done)
 - tiered expert streaming and storage placement
 

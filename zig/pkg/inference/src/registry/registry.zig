@@ -50,6 +50,57 @@ test {
     _ = download;
 }
 
+/// Friendly short names accepted by user-facing commands (chat) in place of a
+/// full HuggingFace `owner/name[:variant]` reference. The blessed sources are
+/// the ggml-org GGUF repos (the documented smoke path in GEMMA4.md). The quant
+/// is pinned to Q8_0 rather than the auto preference because those repos only
+/// publish BF16/Q4_0/Q8_0 and the Metal backend currently segfaults decoding
+/// their Q4_0 conversion; Q8_0 is verified working on metal and native.
+pub const FriendlyAlias = struct {
+    alias: []const u8,
+    ref: []const u8,
+};
+
+pub const friendly_aliases = [_]FriendlyAlias{
+    .{ .alias = "gemma4-e2b", .ref = "ggml-org/gemma-4-e2b-it-gguf:gguf:Q8_0" },
+    .{ .alias = "gemma-4-e2b", .ref = "ggml-org/gemma-4-e2b-it-gguf:gguf:Q8_0" },
+    .{ .alias = "gemma4-e2b-it", .ref = "ggml-org/gemma-4-e2b-it-gguf:gguf:Q8_0" },
+    .{ .alias = "gemma4-e4b", .ref = "ggml-org/gemma-4-e4b-it-gguf:gguf:Q8_0" },
+    .{ .alias = "gemma-4-e4b", .ref = "ggml-org/gemma-4-e4b-it-gguf:gguf:Q8_0" },
+    .{ .alias = "gemma4-e4b-it", .ref = "ggml-org/gemma-4-e4b-it-gguf:gguf:Q8_0" },
+};
+
+/// Resolve a friendly alias to its pinned `owner/name:variant` reference.
+/// Returns null when the name is not a known alias (callers then treat it as
+/// a raw model reference or path).
+pub fn resolveFriendlyRef(name: []const u8) ?[]const u8 {
+    for (friendly_aliases) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.alias, name)) return entry.ref;
+    }
+    return null;
+}
+
+test "resolveFriendlyRef resolves gemma4 aliases case-insensitively" {
+    const expected_e2b = "ggml-org/gemma-4-e2b-it-gguf:gguf:Q8_0";
+    const expected_e4b = "ggml-org/gemma-4-e4b-it-gguf:gguf:Q8_0";
+    try std.testing.expectEqualStrings(expected_e2b, resolveFriendlyRef("gemma4-e2b").?);
+    try std.testing.expectEqualStrings(expected_e2b, resolveFriendlyRef("gemma-4-e2b").?);
+    try std.testing.expectEqualStrings(expected_e2b, resolveFriendlyRef("Gemma4-E2B").?);
+    try std.testing.expectEqualStrings(expected_e4b, resolveFriendlyRef("gemma4-e4b").?);
+    try std.testing.expectEqualStrings(expected_e4b, resolveFriendlyRef("gemma4-e4b-it").?);
+    try std.testing.expect(resolveFriendlyRef("gemma4") == null);
+    try std.testing.expect(resolveFriendlyRef("ggml-org/gemma-4-e2b-it-gguf") == null);
+}
+
+test "friendly alias refs parse as model refs" {
+    for (friendly_aliases) |entry| {
+        const ref = try ModelRef.parse(entry.ref);
+        try std.testing.expect(ref.owner.len > 0);
+        try std.testing.expect(ref.name.len > 0);
+        try std.testing.expectEqualStrings("gguf:Q8_0", ref.variant);
+    }
+}
+
 pub const ModelRef = struct {
     owner: []const u8,
     name: []const u8,

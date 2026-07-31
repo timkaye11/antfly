@@ -5087,13 +5087,16 @@ const SseEventBoundary = struct {
     delimiter_len: usize,
 };
 
-const ServerGenerateSseWriter = struct {
+pub const ServerGenerateSseWriter = struct {
     allocator: std.mem.Allocator,
     buffer: std.ArrayListUnmanaged(u8) = .empty,
     finish_reason: ?api.FinishReason = null,
     stream_error: bool = false,
+    /// When set, streamed content deltas are also appended here so callers
+    /// (chat) can retain the assistant reply for multi-turn history.
+    capture: ?*std.ArrayListUnmanaged(u8) = null,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.buffer.deinit(self.allocator);
     }
 
@@ -5102,7 +5105,7 @@ const ServerGenerateSseWriter = struct {
         try self.processCompleteEvents();
     }
 
-    fn finish(self: *@This()) !void {
+    pub fn finish(self: *@This()) !void {
         try self.processCompleteEvents();
         if (std.mem.trim(u8, self.buffer.items, " \t\r\n").len != 0) return error.InvalidResponse;
     }
@@ -5151,6 +5154,9 @@ const ServerGenerateSseWriter = struct {
         for (parsed.value.choices) |choice| {
             if (choice.delta.content) |content| {
                 print("{s}", .{content});
+                if (self.capture) |capture| {
+                    try capture.appendSlice(self.allocator, content);
+                }
             }
             if (choice.finish_reason) |finish_reason| {
                 self.finish_reason = finish_reason;
@@ -5290,7 +5296,7 @@ fn serverGenerateCompiledTargetName(opts: Options) ?[]const u8 {
     return null;
 }
 
-fn generateEndpointUrl(allocator: std.mem.Allocator, server_url: []const u8) ![]u8 {
+pub fn generateEndpointUrl(allocator: std.mem.Allocator, server_url: []const u8) ![]u8 {
     const root = trimRightSlash(server_url);
     if (std.mem.endsWith(u8, root, "/ai/v1")) {
         return try std.fmt.allocPrint(allocator, "{s}/generate", .{root});
@@ -5901,7 +5907,7 @@ fn nativeGenerateSchedulerEnabled() bool {
     return !getenvBool("TERMITE_DISABLE_NATIVE_GENERATE_SCHEDULER");
 }
 
-fn effectiveGenerationKvDType(
+pub fn effectiveGenerationKvDType(
     requested: runtime.kv.pool.KvDType,
     backend_kind: runtime.kv.pool.BackendKind,
     config: gpt_mod.Config,

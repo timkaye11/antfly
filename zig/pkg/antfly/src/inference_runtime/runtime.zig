@@ -165,6 +165,8 @@ pub fn runFromIterator(
             else => return err,
         };
         return;
+    } else if (std.mem.eql(u8, command, "chat")) {
+        return try inference.native_chat.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "compile-artifact")) {
         return try inference.native_compile.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "export")) {
@@ -579,6 +581,7 @@ fn printUsage() void {
         \\  embed       Run text/image/audio embedding
         \\  classify    Run native text classification
         \\  generate    Run text generation
+        \\  chat        Interactive chat with a local model (pulls known models on first use)
         \\  compile-artifact Compile traced generation artifacts
         \\  export      Export model data
         \\  quantize    Create a quantized model variant
