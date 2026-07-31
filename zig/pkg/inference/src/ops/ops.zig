@@ -717,6 +717,14 @@ pub const NativeQuantTimingStats = struct {
     metal_compact_ledger_soft_limit_trips: u64 = 0,
     metal_compact_ledger_hard_limit_rejections: u64 = 0,
     metal_compact_ledger_fixed_model_bytes: u64 = 0,
+    /// Device KV bytes charged to the compact residency ledger's `.kv_cache`
+    /// category by the Metal KV storage hook (observability, not
+    /// enforcement).
+    metal_compact_kv_reserved_bytes: u64 = 0,
+    /// Times compact soft pressure trimmed the Metal runtime's transient
+    /// pools (idle scratch-pool slots + out-of-plan graph-plan slots) before
+    /// resorting to expert eviction.
+    metal_compact_pool_trims: u64 = 0,
     metal_compact_expert_read_batches: u64 = 0,
     metal_compact_expert_read_tasks: u64 = 0,
     metal_compact_expert_read_ns: u64 = 0,

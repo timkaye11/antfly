@@ -137,6 +137,19 @@ pub const ResidentBudgetLedger = struct {
         self.peak_committed_bytes = @max(self.peak_committed_bytes, projected);
     }
 
+    /// Observability-only charge for byte classes whose device allocation
+    /// already happened elsewhere (e.g. Metal KV slot buffers): the bytes are
+    /// recorded so category accounting, snapshots, and pressure logs stay
+    /// honest, but the charge is never rejected — enforcement for these
+    /// classes remains with the independent phys-footprint sampler, which
+    /// observes them regardless of ledger accounting.
+    pub fn noteCommittedObserved(self: *ResidentBudgetLedger, category: BudgetCategory, bytes: u64) void {
+        self.lock();
+        defer self.unlock();
+        self.committed[@intFromEnum(category)] +|= bytes;
+        self.peak_committed_bytes = @max(self.peak_committed_bytes, self.committedTotalLocked());
+    }
+
     /// Return committed bytes (page decommit, buffer release, eviction).
     pub fn release(self: *ResidentBudgetLedger, category: BudgetCategory, bytes: u64) void {
         self.lock();
@@ -255,6 +268,26 @@ test "budget ledger accounts categories and rejects at the hard ceiling" {
     try std.testing.expectEqual(@as(u64, 100), snap.committed_by_category[@intFromEnum(BudgetCategory.expert_pages)]);
     try std.testing.expectEqual(@as(u64, 900), snap.peak_committed_bytes);
     try std.testing.expectEqual(@as(u64, 1), snap.hard_limit_rejections);
+}
+
+test "budget ledger observed charges never reject and stay releasable" {
+    var ledger = ResidentBudgetLedger.init(1000, 100);
+    try ledger.reserve(.fixed_model, 900);
+    // A fail-closed reserve would reject this; the observed charge records
+    // it so the KV category and pressure logs stay honest.
+    ledger.noteCommittedObserved(.kv_cache, 300);
+    var snap = ledger.snapshot();
+    try std.testing.expectEqual(@as(u64, 300), snap.committed_by_category[@intFromEnum(BudgetCategory.kv_cache)]);
+    try std.testing.expectEqual(@as(u64, 1200), snap.committed_total_bytes);
+    try std.testing.expectEqual(@as(u64, 1200), snap.peak_committed_bytes);
+    try std.testing.expectEqual(@as(u64, 0), snap.hard_limit_rejections);
+    // Observed bytes participate in pressure like every other category.
+    ledger.footprint_override = 0;
+    try std.testing.expectEqual(BudgetPressure.hard, ledger.samplePressure());
+    ledger.release(.kv_cache, 300);
+    snap = ledger.snapshot();
+    try std.testing.expectEqual(@as(u64, 0), snap.committed_by_category[@intFromEnum(BudgetCategory.kv_cache)]);
+    try std.testing.expectEqual(@as(u64, 900), snap.committed_total_bytes);
 }
 
 test "budget ledger decommit accounting keeps virtual capacity separate" {

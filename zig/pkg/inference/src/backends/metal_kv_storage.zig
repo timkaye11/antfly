@@ -41,6 +41,7 @@ const build_options = @import("build_options");
 const storage_runtime = @import("../runtime/kv/storage_runtime.zig");
 const pool_mod = @import("../runtime/kv/pool.zig");
 const turboquant = @import("../runtime/kv/turboquant.zig");
+const budget_ledger = @import("../runtime/moe/budget_ledger.zig");
 const metal_runtime = @import("metal_runtime.zig");
 
 /// Matches the `format` values accepted by
@@ -87,6 +88,22 @@ const SlotKey = struct {
     layer_index: u32,
 };
 
+/// Session-level slot policy threaded in from the backend that provisions
+/// the device-write hook. The KV storage itself has no view of the session,
+/// so the compact contract's decisions arrive here by value/pointer.
+pub const SlotPolicy = struct {
+    /// Grow slot buffers to exactly the required token count instead of the
+    /// geometric 1.5x schedule. Set for compact sessions, where slack
+    /// capacity is charged against a hard phys-footprint ceiling. The
+    /// `TERMITE_METAL_DISABLE_GEOMETRIC_KV_GROWTH` env override forces
+    /// exact fit regardless of this flag.
+    prefer_exact_kv_growth: bool = false,
+    /// Compact residency ledger for observability-only KV accounting.
+    /// Owned by the session's CompactRuntimeState, which outlives this
+    /// storage; null outside the compact profile.
+    ledger: ?*budget_ledger.ResidentBudgetLedger = null,
+};
+
 pub const MetalKvStorage = struct {
     allocator: std.mem.Allocator,
     runtime: *metal_runtime.RawMetalDecodeRuntime,
@@ -94,6 +111,7 @@ pub const MetalKvStorage = struct {
     num_kv_heads: u32,
     head_dim: u32,
     page_size_tokens: u16,
+    policy: SlotPolicy = .{},
     /// (seq, layer) → slot. Inserted on first write for the pair; removed and
     /// the slot returned to `free_slots` when the sequence is released.
     slot_map: std.AutoHashMapUnmanaged(SlotKey, usize) = .empty,
@@ -115,12 +133,20 @@ pub const MetalKvStorage = struct {
     slot_ring_page_count: [metal_runtime.attention_span_slot_capacity]usize = [_]usize{0} ** metal_runtime.attention_span_slot_capacity,
     slot_ring_policy_initialized: [metal_runtime.attention_span_slot_capacity]bool = [_]bool{false} ** metal_runtime.attention_span_slot_capacity,
     slot_buffer_capacity_tokens: [metal_runtime.attention_span_slot_capacity]usize = [_]usize{0} ** metal_runtime.attention_span_slot_capacity,
+    /// Ledger-charged device bytes per slot. Mirrors the C-side slot buffer
+    /// capacities, which only ever grow: sequence release returns a slot to
+    /// the free list but keeps its backing MTLBuffers, so the charge must
+    /// survive slot reuse and only positive deltas are ever charged.
+    slot_charged_bytes: [metal_runtime.attention_span_slot_capacity]u64 = [_]u64{0} ** metal_runtime.attention_span_slot_capacity,
+    charged_total_bytes: u64 = 0,
     cyclic_page_table_cache: storage_runtime.CyclicPageTableCache = .{},
 
     /// Allocate a MetalKvStorage keyed to `runtime`. The storage does not own
     /// the runtime — callers are responsible for its lifetime. `dtype` must
     /// resolve to a compressed key format; other formats are unsupported by
-    /// this fast path (caller falls back to the host write path).
+    /// this fast path (caller falls back to the host write path). `policy`
+    /// carries the session-level knobs (compact exact-fit growth and the
+    /// residency ledger); pass `.{}` outside the compact profile.
     pub fn create(
         allocator: std.mem.Allocator,
         runtime: *metal_runtime.RawMetalDecodeRuntime,
@@ -128,6 +154,7 @@ pub const MetalKvStorage = struct {
         num_kv_heads: u32,
         head_dim: u32,
         page_size_tokens: u16,
+        policy: SlotPolicy,
     ) !*MetalKvStorage {
         const format = KeyFormat.fromKvDType(dtype) orelse return error.DeviceWriteFormatUnsupported;
         const self = try allocator.create(MetalKvStorage);
@@ -138,6 +165,7 @@ pub const MetalKvStorage = struct {
             .num_kv_heads = num_kv_heads,
             .head_dim = head_dim,
             .page_size_tokens = page_size_tokens,
+            .policy = policy,
         };
         return self;
     }
@@ -232,6 +260,56 @@ pub const MetalKvStorage = struct {
         return .{ .owned = offsets };
     }
 
+    /// Pure capacity decision for one slot reservation. Ring slots are fixed
+    /// at their ring span and never grow; exact fit is chosen by the session
+    /// policy (compact contract) or the env override; everything else takes
+    /// the geometric 1.5x growth schedule to amortize copy-on-grow.
+    fn slotCapacityTargetTokens(
+        current: usize,
+        required_tokens: usize,
+        page_size_tokens: usize,
+        ring_page_count: usize,
+        prefer_exact: bool,
+    ) !usize {
+        if (ring_page_count > 0 or prefer_exact) return required_tokens;
+        return storage_runtime.geometricKvTokenCapacity(current, required_tokens, page_size_tokens);
+    }
+
+    /// Device bytes the C runtime allocates for a slot reservation. Mirrors
+    /// `termite_metal_decode_runtime_reserve_attention_span_slot_buffers`:
+    /// one encoded-key buffer of `tokens * key_row_bytes` plus one value
+    /// buffer of `tokens * v_row_stride * element_bytes` (f16 values are
+    /// halfs, every other format stores f32 values).
+    fn slotReservedBytes(
+        format: KeyFormat,
+        token_capacity: usize,
+        key_row_bytes: usize,
+        v_row_stride: usize,
+    ) u64 {
+        const v_element_bytes: u64 = if (format == .f16) @sizeOf(u16) else @sizeOf(f32);
+        const tokens: u64 = @intCast(token_capacity);
+        const key_bytes = tokens *| @as(u64, @intCast(key_row_bytes));
+        const v_bytes = tokens *| @as(u64, @intCast(v_row_stride)) *| v_element_bytes;
+        return key_bytes +| v_bytes;
+    }
+
+    /// Observability-only ledger accounting for slot growth. The C-side slot
+    /// buffers only ever grow, and released sequences keep their buffers for
+    /// reuse, so `slot_charged_bytes` tracks the high water per slot and only
+    /// positive deltas are charged. The whole balance is returned on
+    /// `hookDeinit`; buffers that outlive this storage in the runtime's slot
+    /// pool are then observed only by the profile's phys-footprint sampler.
+    fn chargeSlotReservation(self: *MetalKvStorage, slot: usize, target_tokens: usize, key_row_bytes: usize, v_row_stride: usize) void {
+        const ledger = self.policy.ledger orelse return;
+        const reserved = slotReservedBytes(self.format, target_tokens, key_row_bytes, v_row_stride);
+        const charged = self.slot_charged_bytes[slot];
+        if (reserved <= charged) return;
+        const delta = reserved - charged;
+        ledger.noteCommittedObserved(.kv_cache, delta);
+        self.slot_charged_bytes[slot] = reserved;
+        self.charged_total_bytes +|= delta;
+    }
+
     fn reserveSlotCapacity(
         self: *MetalKvStorage,
         slot: usize,
@@ -243,10 +321,15 @@ pub const MetalKvStorage = struct {
     ) !void {
         const current = self.slot_buffer_capacity_tokens[slot];
         if (required_tokens <= current) return;
-        const target = if (ring_page_count > 0 or envFlagEnabled("TERMITE_METAL_DISABLE_GEOMETRIC_KV_GROWTH"))
-            required_tokens
-        else
-            try storage_runtime.geometricKvTokenCapacity(current, required_tokens, page_size_tokens);
+        const prefer_exact = self.policy.prefer_exact_kv_growth or
+            envFlagEnabled("TERMITE_METAL_DISABLE_GEOMETRIC_KV_GROWTH");
+        const target = try slotCapacityTargetTokens(
+            current,
+            required_tokens,
+            page_size_tokens,
+            ring_page_count,
+            prefer_exact,
+        );
         const rc = metal_runtime.termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
             self.runtime,
             slot,
@@ -257,6 +340,7 @@ pub const MetalKvStorage = struct {
         );
         if (rc != 0) return error.DeviceWriteFallback;
         self.slot_buffer_capacity_tokens[slot] = target;
+        self.chargeSlotReservation(slot, target, key_row_bytes, v_row_stride);
     }
 
     fn requiredTokenCapacity(block_offsets: []const u32, page_size_tokens: usize) !usize {
@@ -562,6 +646,9 @@ pub const MetalKvStorage = struct {
 
     fn hookDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
         const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        if (self.policy.ledger) |ledger| {
+            ledger.release(.kv_cache, self.charged_total_bytes);
+        }
         self.slot_map.deinit(allocator);
         self.free_slots.deinit(allocator);
         self.cyclic_page_table_cache.deinit(allocator);
@@ -829,12 +916,93 @@ test "MetalKvStorage.create rejects unsupported dtype" {
     // int4 and fp8 still have no device kernel — fall through to host.
     try std.testing.expectError(
         error.DeviceWriteFormatUnsupported,
-        MetalKvStorage.create(allocator, fake_runtime, .int4, 8, 128, 256),
+        MetalKvStorage.create(allocator, fake_runtime, .int4, 8, 128, 256, .{}),
     );
     try std.testing.expectError(
         error.DeviceWriteFormatUnsupported,
-        MetalKvStorage.create(allocator, fake_runtime, .fp8, 8, 128, 256),
+        MetalKvStorage.create(allocator, fake_runtime, .fp8, 8, 128, 256, .{}),
     );
+}
+
+test "Metal KV slot capacity growth is exact for rings and compact sessions" {
+    // Ring slots are fixed at their ring span regardless of policy.
+    try std.testing.expectEqual(
+        @as(usize, 640),
+        try MetalKvStorage.slotCapacityTargetTokens(0, 640, 16, 40, false),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 640),
+        try MetalKvStorage.slotCapacityTargetTokens(512, 640, 16, 40, true),
+    );
+    // Exact-fit policy (compact contract or env override) never overshoots.
+    try std.testing.expectEqual(
+        @as(usize, 2488),
+        try MetalKvStorage.slotCapacityTargetTokens(2432, 2488, 16, 0, true),
+    );
+    // Default policy keeps the geometric 1.5x schedule from storage_runtime.
+    try std.testing.expectEqual(
+        @as(usize, 100),
+        try MetalKvStorage.slotCapacityTargetTokens(0, 100, 16, 0, false),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 160),
+        try MetalKvStorage.slotCapacityTargetTokens(100, 101, 16, 0, false),
+    );
+}
+
+test "Metal KV slot reservation bytes mirror the C-side buffer math" {
+    // f16: keys are halfs (key_row_bytes already reflects that) and values
+    // are halfs. One token of 8 heads x 128 dims = 1024 values.
+    try std.testing.expectEqual(
+        @as(u64, 1024 * 2 + 1024 * 2),
+        MetalKvStorage.slotReservedBytes(.f16, 1, 1024 * 2, 1024),
+    );
+    // raw f32 stores 4-byte keys and values.
+    try std.testing.expectEqual(
+        @as(u64, 2 * (1024 * 4 + 1024 * 4)),
+        MetalKvStorage.slotReservedBytes(.raw_f32, 2, 1024 * 4, 1024),
+    );
+    // Compressed key formats keep f32 values.
+    try std.testing.expectEqual(
+        @as(u64, 3 * (40 + 1024 * 4)),
+        MetalKvStorage.slotReservedBytes(.polar4, 3, 40, 1024),
+    );
+}
+
+test "Metal KV ledger charges only positive high-water deltas" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+
+    var ledger = budget_ledger.ResidentBudgetLedger.init(std.math.maxInt(u64), 0);
+    const fake_runtime: *metal_runtime.RawMetalDecodeRuntime = @ptrFromInt(@alignOf(usize));
+    var storage = MetalKvStorage{
+        .allocator = std.testing.allocator,
+        .runtime = fake_runtime,
+        .format = .f16,
+        .num_kv_heads = 8,
+        .head_dim = 128,
+        .page_size_tokens = 16,
+        .policy = .{ .prefer_exact_kv_growth = true, .ledger = &ledger },
+    };
+
+    const kv_index = @intFromEnum(budget_ledger.BudgetCategory.kv_cache);
+    storage.chargeSlotReservation(3, 128, 2048, 1024);
+    const first = MetalKvStorage.slotReservedBytes(.f16, 128, 2048, 1024);
+    try std.testing.expectEqual(first, ledger.snapshot().committed_by_category[kv_index]);
+
+    // Growth charges the delta only.
+    storage.chargeSlotReservation(3, 256, 2048, 1024);
+    const second = MetalKvStorage.slotReservedBytes(.f16, 256, 2048, 1024);
+    try std.testing.expectEqual(second, ledger.snapshot().committed_by_category[kv_index]);
+    try std.testing.expectEqual(second, storage.charged_total_bytes);
+
+    // A reused slot re-reserved below its high water charges nothing: the
+    // C-side buffer never shrank.
+    storage.chargeSlotReservation(3, 64, 2048, 1024);
+    try std.testing.expectEqual(second, ledger.snapshot().committed_by_category[kv_index]);
+
+    // Deinit-time release returns the whole balance.
+    ledger.release(.kv_cache, storage.charged_total_bytes);
+    try std.testing.expectEqual(@as(u64, 0), ledger.snapshot().committed_by_category[kv_index]);
 }
 
 test "KeyFormat.fromKvDType covers supported dtypes" {
