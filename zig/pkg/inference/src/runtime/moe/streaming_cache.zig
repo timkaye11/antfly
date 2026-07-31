@@ -116,9 +116,10 @@ pub fn StreamingExpertCache(comptime layer_count: usize, comptime slot_capacity:
             return slot;
         }
 
-        /// Set the active tier (8/12/16 for the compact profile). Shrinking
-        /// does not touch occupied trailing slots by itself; the caller
-        /// drains them through `collectEvictions` so it can decommit arenas.
+        /// Set the active slot count (budget-derived for the compact
+        /// profile, clamped to this cache's capacity). Shrinking does not
+        /// touch occupied trailing slots by itself; the caller drains them
+        /// through `collectEvictions` so it can decommit arenas.
         pub fn setActiveSlots(self: *Self, count: usize) void {
             self.lock();
             defer self.unlock();

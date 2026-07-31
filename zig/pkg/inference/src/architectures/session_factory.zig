@@ -1558,8 +1558,11 @@ fn createGpuHostedSessionWithTaskOverride(
             .enforcing = enforcing,
         };
         state.cache.setActiveSlots(effective_config.expert_cache_slots);
+        // Virtual capacity telemetry tracks the configured active slots, not
+        // the (much larger) static runtime slot capacity; arenas never grow
+        // beyond the configured count.
         state.ledger.setVirtualSlotCapacity(@as(u64, geometry.moe_layer_count) *|
-            gpu_hosted_store_mod.compact_runtime_slot_capacity *| arena_bytes);
+            effective_config.expert_cache_slots *| arena_bytes);
         // Fixed model buffers are mapped read-only: their *resident* share is
         // whatever the OS keeps paged in, which the independent
         // phys_footprint sampler already observes. Charging the artifact
@@ -1886,7 +1889,18 @@ test "deriveCompactSessionConfig fail-closes outside the qualified envelope" {
     );
     try std.testing.expectEqual(@as(u64, 3_345_408), config.geometry.encoded_expert_bytes);
     try std.testing.expectEqual(@as(u16, 30), config.geometry.moe_layer_count);
-    try std.testing.expectEqual(@as(u8, 16), config.expert_cache_slots);
+    // Automatic slot derivation at the default 2048 MiB budget floor.
+    try std.testing.expectEqual(@as(u8, 8), config.expert_cache_slots);
+
+    const budgeted = try deriveCompactSessionConfig(
+        allocator,
+        .{ .memory_budget_mb = 8192 },
+        .{ .gpt = a4b_cfg },
+        store_impl.tensorStore(),
+        &lazy_weights,
+    );
+    try std.testing.expectEqual(@as(u8, 67), budgeted.expert_cache_slots);
+    try std.testing.expectEqual(@as(u64, 8192) * 1024 * 1024, budgeted.resident_ceiling_bytes);
 
     var not_gemma = a4b_cfg;
     not_gemma.family = .gpt2;
