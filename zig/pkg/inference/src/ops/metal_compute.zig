@@ -3760,58 +3760,279 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return route;
     }
 
-    fn runCompactMoeRow(
+    /// Grouped-expert chunk execution: route every row, group the
+    /// (expert, row, rank) assignments by expert, and stream unique experts
+    /// once per chunk in tiles of at most half the active slot tier so the
+    /// next tile's reads overlap the current tile's GPU work (depth-one
+    /// lookahead). Each expert runs batched Q4_0 kernels over all of its
+    /// assigned rows; the final combine applies expert scale, then route
+    /// weight, then a per-row rank-ordered f32 reduction — the same order
+    /// as the reference implementation, so grouping cannot change tokens.
+    fn runCompactMoeChunkGrouped(
         self: *MetalCompute,
         request: *const ops.RunMoeBlockRequest,
-        input_row: []const f32,
-        logits_row: []const f32,
+        input: []const f32,
+        logits: []const f32,
         expert_scales: ?[]const f32,
-        output_row: []f32,
+        output: []f32,
     ) !bool {
-        const compact_timing = getenvBool("ANTFLY_GEMMA4_COMPACT_TIMING");
-        const compact_started_at = if (compact_timing) monotonicNowNs() else 0;
-        const route = selectCompactMoeRoute(logits_row, request.top_k) orelse return false;
-        const hits_before = self.resident_expert_hits;
-        const misses_before = self.resident_expert_misses;
-        const residency_started_at = if (compact_timing) monotonicNowNs() else 0;
-        var pending = (try self.ensureResidentExpertRoute(request, route)) orelse return false;
-        defer pending.deinit();
-        const route_slots = pending.route_slots;
-        const residency_ns = if (compact_timing) monotonicNowNs() - residency_started_at else 0;
+        const state = self.data.compact_runtime orelse return false;
+        const total = request.total;
+        const hidden = request.hidden_size;
+        const top_k = request.top_k;
+        const num_experts = request.num_experts;
+        if (total == 0 or top_k == 0 or top_k > 8) return false;
+        if (request.layer_index >= compact_expert_layer_count) return false;
+
+        const routes = try self.allocator.alloc(CompactMoeRoute, total);
+        defer self.allocator.free(routes);
+        for (0..total) |row| {
+            const row_logits = logits[row * num_experts ..][0..num_experts];
+            routes[row] = selectCompactMoeRoute(row_logits, top_k) orelse return false;
+        }
+
+        // Counting sort of (row, rank) assignments by expert.
+        const counts = try self.allocator.alloc(u32, num_experts);
+        defer self.allocator.free(counts);
+        @memset(counts, 0);
+        for (routes) |route| {
+            for (0..route.count) |rank| counts[@intCast(route.indices[rank])] += 1;
+        }
+        const offsets = try self.allocator.alloc(u32, num_experts + 1);
+        defer self.allocator.free(offsets);
+        offsets[0] = 0;
+        for (0..num_experts) |expert| offsets[expert + 1] = offsets[expert] + counts[expert];
+        const assignment_total: usize = offsets[num_experts];
+        const assignment_rows = try self.allocator.alloc(u32, assignment_total);
+        defer self.allocator.free(assignment_rows);
+        const assignment_ranks = try self.allocator.alloc(u8, assignment_total);
+        defer self.allocator.free(assignment_ranks);
+        {
+            const cursor = try self.allocator.alloc(u32, num_experts);
+            defer self.allocator.free(cursor);
+            @memcpy(cursor, offsets[0..num_experts]);
+            for (routes, 0..) |route, row| {
+                for (0..route.count) |rank| {
+                    const expert: usize = @intCast(route.indices[rank]);
+                    assignment_rows[cursor[expert]] = @intCast(row);
+                    assignment_ranks[cursor[expert]] = @intCast(rank);
+                    cursor[expert] += 1;
+                }
+            }
+        }
+
+        var unique_experts_buf: [8 * 128]u16 = undefined;
+        var unique_count: usize = 0;
+        for (0..num_experts) |expert| {
+            if (counts[expert] == 0) continue;
+            if (unique_count >= unique_experts_buf.len) return false;
+            unique_experts_buf[unique_count] = @intCast(expert);
+            unique_count += 1;
+        }
+        const unique_experts = unique_experts_buf[0..unique_count];
+
+        // Down-projection staging for every (row, rank) pair; charged to the
+        // scratch budget for the duration of the chunk.
+        const staging_len = total * top_k * hidden;
+        const staging_bytes: u64 = @as(u64, staging_len) * @sizeOf(f32);
+        try state.ledger.reserve(.scratch, staging_bytes);
+        defer state.ledger.release(.scratch, staging_bytes);
+        const staging = try self.allocator.alloc(f32, staging_len);
+        defer self.allocator.free(staging);
+        const gather_scratch = try self.allocator.alloc(f32, total * hidden);
+        defer self.allocator.free(gather_scratch);
+
+        // Tiles sized to half the active tier so the lookahead tile's slots
+        // fit alongside the executing tile's pinned bank.
+        const tile_capacity = @max(@as(usize, 1), @min(@as(usize, 8), state.cache.activeSlots() / 2));
+        var tile_start: usize = 0;
+        var current: ?PendingCompactMoeRoute = null;
+        defer if (current) |*pending| pending.deinit();
+        var next: ?PendingCompactMoeRoute = null;
+        defer if (next) |*pending| pending.deinit();
+
+        while (tile_start < unique_count) {
+            const tile_end = @min(unique_count, tile_start + tile_capacity);
+            const tile = unique_experts[tile_start..tile_end];
+            if (current == null) {
+                var tile_route = CompactMoeRoute{ .count = tile.len };
+                for (tile, 0..) |expert, position| tile_route.indices[position] = expert;
+                current = (try self.beginResidentExpertRoute(request, tile_route)) orelse return false;
+            }
+            if (!(try self.finishResidentExpertRoute(request, &current.?))) return false;
+
+            // Depth-one lookahead: start the next tile's reads before this
+            // tile's GPU work so I/O and compute overlap. A tight slot tier
+            // may refuse (every slot pinned); the begin then happens on the
+            // next loop iteration after this tile releases its bank.
+            const lookahead_start = tile_end;
+            if (lookahead_start < unique_count) {
+                const lookahead_end = @min(unique_count, lookahead_start + tile_capacity);
+                const lookahead = unique_experts[lookahead_start..lookahead_end];
+                var lookahead_route = CompactMoeRoute{ .count = lookahead.len };
+                for (lookahead, 0..) |expert, position| lookahead_route.indices[position] = expert;
+                next = self.beginResidentExpertRoute(request, lookahead_route) catch |err| switch (err) {
+                    error.CompactBudgetExceeded => return err,
+                    else => null,
+                };
+            }
+
+            if (!(try self.executeCompactMoeTile(
+                request,
+                &current.?,
+                tile,
+                offsets,
+                assignment_rows,
+                assignment_ranks,
+                input,
+                gather_scratch,
+                staging,
+            ))) return false;
+
+            current.?.deinit();
+            current = next;
+            next = null;
+            tile_start = tile_end;
+        }
+
+        // Rank-ordered combine: value * expert_scale, then * route weight,
+        // accumulated per row in rank order — reference reduction order.
+        for (0..total) |row| {
+            const out_row = output[row * hidden ..][0..hidden];
+            @memset(out_row, 0);
+            const route = routes[row];
+            for (0..route.count) |rank| {
+                const expert: usize = @intCast(route.indices[rank]);
+                const expert_scale: f32 = if (expert_scales) |scales| blk: {
+                    if (expert >= scales.len) return false;
+                    break :blk scales[expert];
+                } else 1.0;
+                const weight = route.weights[rank];
+                const staged = staging[(row * top_k + rank) * hidden ..][0..hidden];
+                for (out_row, staged) |*acc, value| {
+                    acc.* += (value * expert_scale) * weight;
+                }
+            }
+        }
+        return true;
+    }
+
+    /// Run one published tile: batched gate/up + activation + gated multiply
+    /// + down projection per expert over all rows assigned to it, then
+    /// scatter the down outputs into (row, rank) staging.
+    fn executeCompactMoeTile(
+        self: *MetalCompute,
+        request: *const ops.RunMoeBlockRequest,
+        pending: *PendingCompactMoeRoute,
+        tile: []const u16,
+        offsets: []const u32,
+        assignment_rows: []const u32,
+        assignment_ranks: []const u8,
+        input: []const f32,
+        gather_scratch: []f32,
+        staging: []f32,
+    ) !bool {
         const runtime = self.provider_impl.raw_decode_runtime orelse return false;
-        const input_shape = [_]i32{ 1, @intCast(request.hidden_size) };
-        const input_host = MetalTensor.borrowed(@constCast(input_row.ptr), input_row.len, &input_shape);
-        var input_device = try MetalTensor.deviceAllocate(
-            @ptrCast(runtime),
-            input_row.len * @sizeOf(f32),
-            uploadStorageMode(input_row.len * @sizeOf(f32)),
-            &input_shape,
-        );
-        defer input_device.deinit();
-        try input_host.copyInto(&input_device);
-        self.resident_expert_host_transfers +|= 1;
+        const hidden = request.hidden_size;
+        const top_k = request.top_k;
+        self.resident_expert_fused_frame_attempts +|= 1;
+        var succeeded = false;
+        defer {
+            if (!succeeded) self.resident_expert_fused_frame_fallbacks +|= 1;
+        }
+
         for (pending.plan.slice()) |entry| pending.state.cache.beginUse(entry.ref) catch {};
-        var result = (try self.runCompactMoeRowPrepared(
-            request,
-            input_device,
-            route,
-            &route_slots,
-            expert_scales,
-            compact_timing,
-            compact_started_at,
-            residency_ns,
-            hits_before,
-            misses_before,
-        )) orelse {
-            for (pending.plan.slice()) |entry| pending.state.cache.endUse(entry.ref) catch {};
-            return false;
-        };
-        for (pending.plan.slice()) |entry| pending.state.cache.endUse(entry.ref) catch {};
-        defer result.deinit();
-        const host = try result.toHostSlice();
-        self.resident_expert_host_transfers +|= 1;
-        if (host.len != output_row.len) return false;
-        @memcpy(output_row, host);
+        defer for (pending.plan.slice()) |entry| pending.state.cache.endUse(entry.ref) catch {};
+
+        var inputs_device: [8]?MetalTensor = [_]?MetalTensor{null} ** 8;
+        defer for (&inputs_device) |*tensor| if (tensor.*) |*value| value.deinit();
+        for (tile, 0..) |expert, position| {
+            const begin: usize = offsets[expert];
+            const end: usize = offsets[expert + 1];
+            const rows_e = end - begin;
+            for (assignment_rows[begin..end], 0..) |row, gather_index| {
+                @memcpy(
+                    gather_scratch[gather_index * hidden ..][0..hidden],
+                    input[@as(usize, row) * hidden ..][0..hidden],
+                );
+            }
+            const gathered_shape = [_]i32{ @intCast(rows_e), @intCast(hidden) };
+            const gathered_host = MetalTensor.borrowed(gather_scratch.ptr, rows_e * hidden, &gathered_shape);
+            var device = try MetalTensor.deviceAllocate(
+                @ptrCast(runtime),
+                rows_e * hidden * @sizeOf(f32),
+                uploadStorageMode(rows_e * hidden * @sizeOf(f32)),
+                &gathered_shape,
+            );
+            errdefer device.deinit();
+            try gathered_host.copyInto(&device);
+            self.resident_expert_host_transfers +|= 1;
+            inputs_device[position] = device;
+        }
+
+        var frame_active = try self.beginDecoderRuntimeFrame(runtime);
+        if (!frame_active) return false;
+        defer self.cancelDecoderRuntimeFrame(runtime, &frame_active);
+
+        var downs: [8]?MetalTensor = [_]?MetalTensor{null} ** 8;
+        defer for (&downs) |*tensor| if (tensor.*) |*value| value.deinit();
+        for (tile, 0..) |expert, position| {
+            const rows_e: usize = offsets[expert + 1] - offsets[expert];
+            const slots = pending.route_slots[position];
+            const expert_input = inputs_device[position].?;
+            var pair = (try metal_runtime.tryApplyQuantizedRuntimeLinearPair(
+                self.provider_impl,
+                slots.gate,
+                slots.up,
+                expert_input,
+                rows_e,
+                hidden,
+                request.inter_size,
+            )) orelse return false;
+            defer pair.first.deinit();
+            defer pair.second.deinit();
+            var activated = (try metal_runtime.decoderRuntimeApplyActivation(self.provider_impl, .{
+                .input = pair.first,
+                .dim = request.inter_size,
+                .kind = request.activation,
+            }, &self.timing_stats)) orelse return false;
+            defer activated.deinit();
+            var gated = (try metal_runtime.decoderRuntimeApplyMultiply(
+                self.provider_impl,
+                activated,
+                pair.second,
+                request.inter_size,
+            )) orelse return false;
+            defer gated.deinit();
+            const down = (try metal_runtime.tryApplyQuantizedRuntimeLinear(
+                self.provider_impl,
+                slots.down,
+                gated,
+                rows_e,
+                request.inter_size,
+                hidden,
+            )) orelse return false;
+            downs[position] = down;
+        }
+
+        try self.submitAndWaitDecoderRuntimeFrame(runtime, &frame_active);
+
+        for (tile, 0..) |expert, position| {
+            const begin: usize = offsets[expert];
+            const end: usize = offsets[expert + 1];
+            var down = downs[position].?;
+            const host = try down.toHostSlice();
+            self.resident_expert_host_transfers +|= 1;
+            if (host.len != (end - begin) * hidden) return false;
+            for (assignment_rows[begin..end], assignment_ranks[begin..end], 0..) |row, rank, local_index| {
+                @memcpy(
+                    staging[(@as(usize, row) * top_k + rank) * hidden ..][0..hidden],
+                    host[local_index * hidden ..][0..hidden],
+                );
+            }
+        }
+        self.resident_expert_fused_frame_successes +|= 1;
+        succeeded = true;
         return true;
     }
 
@@ -4051,10 +4272,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const mandatory = self.compactMoeMandatory();
         // Without a compact contract this route is opportunistic and bows out
-        // above 16 rows. Under the contract it must serve any row count: the
-        // generic fallback would map the full expert set, which the profile
-        // forbids, so large batches run bounded row groups here instead.
-        const row_cap: usize = if (mandatory) request.total else 16;
+        // above one full prefill chunk. Under the contract it must serve any
+        // row count: the generic fallback would map the full expert set,
+        // which the profile forbids, so large batches run the grouped-expert
+        // chunk executor instead.
+        const row_cap: usize = if (mandatory) request.total else 128;
         if (!compactMoeRequestSupported(request, row_cap)) {
             if (mandatory) return error.CompactMoeUnsupportedRequest;
             return null;
@@ -4080,15 +4302,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         const output = try self.allocator.alloc(f32, request.total * request.hidden_size);
         errdefer self.allocator.free(output);
-        for (0..request.total) |row| {
-            const input_row = input[row * request.hidden_size ..][0..request.hidden_size];
-            const logits_row = logits[row * request.num_experts ..][0..request.num_experts];
-            const output_row = output[row * request.hidden_size ..][0..request.hidden_size];
-            if (!(try self.runCompactMoeRow(request, input_row, logits_row, expert_scales, output_row))) {
-                if (mandatory) return error.CompactMoeRowExecutionFailed;
-                self.allocator.free(output);
-                return null;
-            }
+        if (!(try self.runCompactMoeChunkGrouped(request, input, logits, expert_scales, output))) {
+            if (mandatory) return error.CompactMoeChunkExecutionFailed;
+            self.allocator.free(output);
+            return null;
         }
         const shape = [_]i32{ @intCast(request.total), @intCast(request.hidden_size) };
         return denseBuf(self.allocator, output, true, &shape);

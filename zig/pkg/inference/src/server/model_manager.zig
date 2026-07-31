@@ -4194,6 +4194,7 @@ fn sessionManagerForPreferredBackends(
         .onnx_execution_provider = source.onnx_execution_provider,
         .onnx_cuda_memory_limit_bytes = source.onnx_cuda_memory_limit_bytes,
         .io = source.io,
+        .compact = source.compact,
     };
 }
 
