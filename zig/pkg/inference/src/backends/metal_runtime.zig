@@ -15166,6 +15166,26 @@ pub extern fn termite_metal_decode_runtime_moe_forward_q4_0_host(
     expert_scale: [*c]const f32,
     output: [*c]f32,
 ) c_int;
+// Test-only pre-routed device-MoE host round-trip (S0 bit-parity harness): the
+// caller supplies the route (expert_ids + route_weights, [total_rows][top_k])
+// instead of the device topk kernel, so the fused device chain runs the exact
+// CPU-selected route.
+pub extern fn termite_metal_decode_runtime_moe_forward_q4_0_prerouted_host(
+    runtime: ?*RawMetalDecodeRuntime,
+    layer: usize,
+    input: [*c]const f32,
+    expert_ids: [*c]const u32,
+    route_weights: [*c]const f32,
+    total_rows: usize,
+    hidden_size: usize,
+    inter_size: usize,
+    num_experts: usize,
+    top_k: usize,
+    activation_kind: u32,
+    addressing_mode: u32,
+    expert_scale: [*c]const f32,
+    output: [*c]f32,
+) c_int;
 pub extern fn termite_metal_decode_runtime_prepare_bitnet_tl1_linear_slot(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
