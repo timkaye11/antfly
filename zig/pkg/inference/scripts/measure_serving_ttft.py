@@ -399,9 +399,12 @@ def main():
     try:
         print(f"[server] starting {args.binary} run --config {cfg_path} "
               f"--host {args.host} --port {args.port}", flush=True)
+        # The compact Gemma-4 26B-A4B is a newer architecture that the request
+        # path's compatibility gate flags as unknown even though the warm/preload
+        # loader accepts it; opt in so served requests resolve the same model.
         proc = subprocess.Popen(
             [args.binary, "run", "--config", cfg_path, "--host", args.host,
-             "--port", str(args.port)],
+             "--port", str(args.port), "--allow-unknown-models"],
             stdout=log_fh, stderr=subprocess.STDOUT, env=env,
         )
         if not wait_for_health(proc, args.host, args.port, args.ready_timeout):
