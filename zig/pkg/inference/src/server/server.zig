@@ -590,7 +590,37 @@ pub const WarmModel = struct {
     backend: ?backends_mod.BackendType = null,
     format: ?[]const u8 = null,
     quantization: ?[]const u8 = null,
+    /// Load-time memory profile (`compact_2gbs`). Registered with the model
+    /// manager before warming so every load of this model — warm or on
+    /// demand — resolves the same immutable residency contract, and the
+    /// instance is pinned against idle eviction.
+    memory_profile: ?[]const u8 = null,
+    /// Resident routed-expert slots per MoE layer (8/12/16); omission means
+    /// automatic tier selection.
+    expert_cache_slots: ?u8 = null,
 };
+
+pub fn compactRequestForWarmModel(model: WarmModel) !?backends_mod.SessionManager.CompactRequest {
+    const profile = model.memory_profile orelse {
+        if (model.expert_cache_slots != null) return error.ExpertCacheSlotsRequireMemoryProfile;
+        return null;
+    };
+    if (!std.mem.eql(u8, profile, "compact_2gbs") and
+        !std.mem.eql(u8, profile, "2gbs") and
+        !std.mem.eql(u8, profile, "2gb"))
+    {
+        return error.InvalidMemoryProfile;
+    }
+    const slots = model.expert_cache_slots orelse 0;
+    switch (slots) {
+        0, 8, 12, 16 => {},
+        else => return error.InvalidExpertCacheSlots,
+    }
+    return .{
+        .profile = .compact_2gbs,
+        .expert_cache_slots = slots,
+    };
+}
 
 fn warmModelTaskDir(kind: WarmModelKind) []const u8 {
     return switch (kind) {
@@ -2836,6 +2866,17 @@ pub const Node = struct {
     }
 
     pub fn warmConfiguredModels(self: *Node, allocator: std.mem.Allocator) !void {
+        // Residency contracts are part of model identity: register them
+        // before the first load so warm and on-demand loads agree.
+        for (self.config.preload) |model| {
+            if (try compactRequestForWarmModel(model)) |request| {
+                var io_impl = std.Io.Threaded.init(allocator, .{});
+                defer io_impl.deinit();
+                const model_path = try self.resolveModelPath(io_impl.io(), model.name, warmModelTaskDir(model.kind));
+                defer self.allocator.free(model_path);
+                try self.model_manager.registerCompactProfile(model_path, request);
+            }
+        }
         for (self.config.preload) |model| {
             self.warmModel(allocator, model) catch |err| {
                 const backend_name = if (model.backend) |backend| @tagName(backend) else "auto";

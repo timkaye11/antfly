@@ -11978,6 +11978,24 @@ export interface components {
             backend?: components["schemas"]["InferenceModelBackend"];
             format?: components["schemas"]["InferenceModelFormat"];
             quantization?: components["schemas"]["InferenceModelQuantization"];
+            /**
+             * @description Load-time memory profile for this model instance. `compact_2gbs`
+             *     selects the bounded streaming routed-expert runtime with an
+             *     enforced 2 GB-class resident footprint ceiling. Only qualified
+             *     model geometries load under a compact profile, the load fails
+             *     closed otherwise, and request-time APIs cannot change residency
+             *     policy.
+             * @enum {string}
+             */
+            memory_profile?: "compact_2gbs";
+            /**
+             * @description Resident routed-expert cache slots per MoE layer under a compact
+             *     memory profile. Omission selects the automatic tier, which starts
+             *     at the highest qualified tier and downshifts under the residency
+             *     ceiling.
+             * @enum {integer}
+             */
+            expert_cache_slots?: 8 | 12 | 16;
         };
         /** @description Native generator prompt KV cache configuration. */
         InferencePromptCacheConfig: {

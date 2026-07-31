@@ -45,6 +45,8 @@ const RunConfig = struct {
         backend: ?[]const u8 = null,
         format: ?[]const u8 = null,
         quantization: ?[]const u8 = null,
+        memory_profile: ?[]const u8 = null,
+        expert_cache_slots: ?u8 = null,
     };
 
     const PromptCacheConfig = struct {
@@ -170,6 +172,8 @@ fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConf
             .backend = try parseOptionalBackendType(value.backend),
             .format = value.format,
             .quantization = value.quantization,
+            .memory_profile = value.memory_profile,
+            .expert_cache_slots = value.expert_cache_slots,
         };
     }
     return out;

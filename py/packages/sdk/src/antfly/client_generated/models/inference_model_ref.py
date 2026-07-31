@@ -10,6 +10,8 @@ from ..models.inference_model_backend import InferenceModelBackend
 from ..models.inference_model_format import InferenceModelFormat
 from ..models.inference_model_kind import InferenceModelKind
 from ..models.inference_model_quantization import InferenceModelQuantization
+from ..models.inference_model_ref_expert_cache_slots import InferenceModelRefExpertCacheSlots
+from ..models.inference_model_ref_memory_profile import InferenceModelRefMemoryProfile
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="InferenceModelRef")
@@ -32,6 +34,18 @@ class InferenceModelRef:
             `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
         format_ (InferenceModelFormat | Unset): Optional artifact format preference for loading a model.
         quantization (InferenceModelQuantization | Unset): Optional quantization preference for loading a model.
+        memory_profile (InferenceModelRefMemoryProfile | Unset): Load-time memory profile for this model instance.
+            `compact_2gbs`
+            selects the bounded streaming routed-expert runtime with an
+            enforced 2 GB-class resident footprint ceiling. Only qualified
+            model geometries load under a compact profile, the load fails
+            closed otherwise, and request-time APIs cannot change residency
+            policy.
+        expert_cache_slots (InferenceModelRefExpertCacheSlots | Unset): Resident routed-expert cache slots per MoE layer
+            under a compact
+            memory profile. Omission selects the automatic tier, which starts
+            at the highest qualified tier and downshifts under the residency
+            ceiling.
     """
 
     kind: InferenceModelKind
@@ -39,6 +53,8 @@ class InferenceModelRef:
     backend: InferenceModelBackend | Unset = UNSET
     format_: InferenceModelFormat | Unset = UNSET
     quantization: InferenceModelQuantization | Unset = UNSET
+    memory_profile: InferenceModelRefMemoryProfile | Unset = UNSET
+    expert_cache_slots: InferenceModelRefExpertCacheSlots | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -58,6 +74,14 @@ class InferenceModelRef:
         if not isinstance(self.quantization, Unset):
             quantization = self.quantization.value
 
+        memory_profile: str | Unset = UNSET
+        if not isinstance(self.memory_profile, Unset):
+            memory_profile = self.memory_profile.value
+
+        expert_cache_slots: int | Unset = UNSET
+        if not isinstance(self.expert_cache_slots, Unset):
+            expert_cache_slots = self.expert_cache_slots.value
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -72,6 +96,10 @@ class InferenceModelRef:
             field_dict["format"] = format_
         if quantization is not UNSET:
             field_dict["quantization"] = quantization
+        if memory_profile is not UNSET:
+            field_dict["memory_profile"] = memory_profile
+        if expert_cache_slots is not UNSET:
+            field_dict["expert_cache_slots"] = expert_cache_slots
 
         return field_dict
 
@@ -103,12 +131,28 @@ class InferenceModelRef:
         else:
             quantization = InferenceModelQuantization(_quantization)
 
+        _memory_profile = d.pop("memory_profile", UNSET)
+        memory_profile: InferenceModelRefMemoryProfile | Unset
+        if isinstance(_memory_profile, Unset):
+            memory_profile = UNSET
+        else:
+            memory_profile = InferenceModelRefMemoryProfile(_memory_profile)
+
+        _expert_cache_slots = d.pop("expert_cache_slots", UNSET)
+        expert_cache_slots: InferenceModelRefExpertCacheSlots | Unset
+        if isinstance(_expert_cache_slots, Unset):
+            expert_cache_slots = UNSET
+        else:
+            expert_cache_slots = InferenceModelRefExpertCacheSlots(_expert_cache_slots)
+
         inference_model_ref = cls(
             kind=kind,
             name=name,
             backend=backend,
             format_=format_,
             quantization=quantization,
+            memory_profile=memory_profile,
+            expert_cache_slots=expert_cache_slots,
         )
 
         inference_model_ref.additional_properties = d

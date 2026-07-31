@@ -1459,6 +1459,28 @@ components:
           $ref: "#/components/schemas/ModelFormat"
         quantization:
           $ref: "#/components/schemas/ModelQuantization"
+        memory_profile:
+          type: string
+          description: |
+            Load-time memory profile for this model instance. `compact_2gbs`
+            selects the bounded streaming routed-expert runtime with an
+            enforced 2 GB-class resident footprint ceiling. Only qualified
+            model geometries load under a compact profile, the load fails
+            closed otherwise, and request-time APIs cannot change residency
+            policy.
+          enum:
+            - compact_2gbs
+        expert_cache_slots:
+          type: integer
+          description: |
+            Resident routed-expert cache slots per MoE layer under a compact
+            memory profile. Omission selects the automatic tier, which starts
+            at the highest qualified tier and downshifts under the residency
+            ceiling.
+          enum:
+            - 8
+            - 12
+            - 16
 
     KernelJitMode:
       type: string

@@ -677,6 +677,10 @@ pub const ModelRef = struct {
     backend: ?ModelBackend = null,
     format: ?ModelFormat = null,
     quantization: ?ModelQuantization = null,
+    /// Load-time memory profile for this model instance. `compact_2gbs` selects the bounded streaming routed-expert runtime with an enforced 2 GB-class resident footprint ceiling. Only qualified model geometries load under a compact profile, the load fails closed otherwise, and request-time APIs cannot change residency policy.
+    memory_profile: ?[]const u8 = null,
+    /// Resident routed-expert cache slots per MoE layer under a compact memory profile. Omission selects the automatic tier, which starts at the highest qualified tier and downshifts under the residency ceiling.
+    expert_cache_slots: ?i64 = null,
 };
 
 pub const ModelsResponse = struct {

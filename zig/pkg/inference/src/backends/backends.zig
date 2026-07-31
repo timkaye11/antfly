@@ -122,6 +122,8 @@ const backend_order_capacity = std.meta.fields(BackendType).len;
 
 /// SessionManager selects the best available backend and creates sessions.
 pub const SessionManager = struct {
+    pub const CompactRequest = session_factory.CompactInferenceRequest;
+
     allocator: std.mem.Allocator,
     preferred_backends: []const BackendType,
     graph_runtime_strategy: ?graph_runtime_mod.Strategy = null,

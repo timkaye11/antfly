@@ -92,6 +92,7 @@ pub const ExpertSource = tensor_store_mod.TensorStore;
 pub const compact_runtime_layer_capacity = 30;
 pub const compact_runtime_slot_capacity = 16;
 pub const CompactSlotRef = runtime.moe.streaming_cache.SlotRef;
+pub const CompactBudgetCategory = runtime.moe.budget_ledger.BudgetCategory;
 pub const CompactExpertCache = runtime.moe.streaming_cache.StreamingExpertCache(
     compact_runtime_layer_capacity,
     compact_runtime_slot_capacity,
@@ -440,6 +441,11 @@ fn LoadWorkerPool(comptime Task: type, comptime runTask: fn (*Task) void) type {
         completed_tasks: usize = 0,
         canceled: bool = false,
         stop_workers: bool = false,
+        batch_started_ns: u64 = 0,
+        total_batches: u64 = 0,
+        total_tasks: u64 = 0,
+        total_queue_wait_ns: u64 = 0,
+        total_read_ns: u64 = 0,
 
         /// Futex-capable Io for parking plain worker threads; mirrors the
         /// metalComputeLockIo convention used elsewhere in this backend.
@@ -475,10 +481,22 @@ fn LoadWorkerPool(comptime Task: type, comptime runTask: fn (*Task) void) type {
                 if (self.stop_workers) break;
                 if (self.takeTaskLocked()) |task| {
                     const declined = self.canceled;
+                    const queued_since = self.batch_started_ns;
                     self.mutex.unlock(io);
-                    if (declined) task.load_error = error.ExpertLoadCanceled else runTask(task);
+                    var read_ns: u64 = 0;
+                    var queue_wait_ns: u64 = 0;
+                    if (declined) {
+                        task.load_error = error.ExpertLoadCanceled;
+                    } else {
+                        queue_wait_ns = platform.time.monotonicNs() -| queued_since;
+                        const read_started = platform.time.monotonicNs();
+                        runTask(task);
+                        read_ns = platform.time.monotonicNs() -| read_started;
+                    }
                     self.mutex.lockUncancelable(io);
                     self.completed_tasks += 1;
+                    self.total_queue_wait_ns +|= queue_wait_ns;
+                    self.total_read_ns +|= read_ns;
                     if (self.tasks) |tasks| {
                         if (self.completed_tasks == tasks.len) self.batch_complete.broadcast(io);
                     }
@@ -500,6 +518,9 @@ fn LoadWorkerPool(comptime Task: type, comptime runTask: fn (*Task) void) type {
             self.next_task = 0;
             self.completed_tasks = 0;
             self.canceled = false;
+            self.batch_started_ns = platform.time.monotonicNs();
+            self.total_batches +|= 1;
+            self.total_tasks +|= tasks.len;
             self.work_available.broadcast(io);
         }
 

@@ -3407,14 +3407,20 @@ fn metalStatsCompactJson(
         \\"misses":{d}
         \\}},
         \\"compact_expert_execution":{{
+        \\"schema":2,
         \\"whole_publications":{d},
         \\"projection_prepares":{d},
         \\"fused_frame_attempts":{d},
         \\"fused_frame_successes":{d},
         \\"fused_frame_fallbacks":{d},
         \\"device_input_reuses":{d},
-        \\"host_transfers":{d}
-        \\}}
+        \\"host_transfers":{d},
+        \\"evictions":{d},
+        \\"decommitted_bytes":{d},
+        \\"read_batches":{d},
+        \\"read_tasks":{d},
+        \\"read_ns":{d},
+        \\"queue_wait_ns":{d}
         \\}}
     ,
         .{
@@ -3444,6 +3450,38 @@ fn metalStatsCompactJson(
             provider.metal_compact_expert_fused_frame_fallbacks,
             provider.metal_compact_expert_device_input_reuses,
             provider.metal_compact_expert_host_transfers,
+            provider.metal_compact_expert_evictions,
+            provider.metal_compact_expert_decommitted_bytes,
+            provider.metal_compact_expert_read_batches,
+            provider.metal_compact_expert_read_tasks,
+            provider.metal_compact_expert_read_ns,
+            provider.metal_compact_expert_queue_wait_ns,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"compact_ledger":{{
+        \\"schema":2,
+        \\"fixed_model_bytes":{d},
+        \\"committed_bytes":{d},
+        \\"virtual_slot_bytes":{d},
+        \\"observed_footprint_bytes":{d},
+        \\"observed_footprint_peak_bytes":{d},
+        \\"soft_limit_trips":{d},
+        \\"hard_limit_rejections":{d}
+        \\}}
+        \\}}
+    ,
+        .{
+            provider.metal_compact_ledger_fixed_model_bytes,
+            provider.metal_compact_ledger_committed_bytes,
+            provider.metal_compact_ledger_virtual_slot_bytes,
+            provider.metal_compact_ledger_observed_footprint_bytes,
+            provider.metal_compact_ledger_observed_footprint_peak_bytes,
+            provider.metal_compact_ledger_soft_limit_trips,
+            provider.metal_compact_ledger_hard_limit_rejections,
         },
     );
     return try out.toOwnedSlice(allocator);
@@ -3455,6 +3493,9 @@ test "metal compact stats JSON is parseable and carries compact expert counters"
     snapshot.provider.metal_compact_expert_cache_hits = 21;
     snapshot.provider.metal_compact_expert_whole_publications = 22;
     snapshot.provider.metal_compact_expert_host_transfers = 23;
+    snapshot.provider.metal_compact_ledger_committed_bytes = 24;
+    snapshot.provider.metal_compact_ledger_observed_footprint_peak_bytes = 25;
+    snapshot.provider.metal_compact_expert_read_ns = 26;
     const graph_stats: graph_mod.executor_stats.ExecutionStats = .{};
     const json = try metalStatsCompactJson(std.testing.allocator, snapshot, graph_stats);
     defer std.testing.allocator.free(json);
@@ -3462,6 +3503,11 @@ test "metal compact stats JSON is parseable and carries compact expert counters"
     try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"compact_expert_execution\":{"));
     try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"whole_publications\":22"));
     try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"host_transfers\":23"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"compact_ledger\":{"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 2, "\"schema\":2"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"committed_bytes\":24"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"observed_footprint_peak_bytes\":25"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"read_ns\":26"));
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value == .object);

@@ -20130,6 +20130,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             stats.metal_compact_ledger_observed_footprint_peak_bytes = ledger.observed_footprint_peak_bytes;
             stats.metal_compact_ledger_soft_limit_trips = ledger.soft_limit_trips;
             stats.metal_compact_ledger_hard_limit_rejections = ledger.hard_limit_rejections;
+            stats.metal_compact_ledger_fixed_model_bytes =
+                ledger.committed_by_category[@intFromEnum(gpu_hosted_store_mod.CompactBudgetCategory.fixed_model)];
+            stats.metal_compact_expert_read_batches = self.data.parallel_expert_loader.total_batches;
+            stats.metal_compact_expert_read_tasks = self.data.parallel_expert_loader.total_tasks;
+            stats.metal_compact_expert_read_ns = self.data.parallel_expert_loader.total_read_ns;
+            stats.metal_compact_expert_queue_wait_ns = self.data.parallel_expert_loader.total_queue_wait_ns;
         }
         const tensor_stats = metal_tensor_mod.memoryStatsSnapshot();
         stats.metal_tensor_device_owned_buffers_created = tensor_stats.device_owned_buffers_created;

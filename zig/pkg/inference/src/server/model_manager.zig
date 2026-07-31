@@ -2567,6 +2567,12 @@ pub const ModelManager = struct {
 
     allocator: std.mem.Allocator,
     session_manager: backends.SessionManager,
+    /// Compact residency contracts keyed by resolved model directory.
+    /// Registered during startup before any load; every subsequent load of
+    /// a registered directory carries the same immutable request, so a
+    /// compact-configured instance can never be shared with (or replaced
+    /// by) a non-compact load of the same model.
+    compact_profiles: std.StringHashMapUnmanaged(backends.SessionManager.CompactRequest) = .empty,
     /// Null for diagnostic/offline CLIs. Serving Nodes set this before any model load.
     serving_policy: ?model_compatibility.Policy = null,
     admission: runtime.tier.memory.AdmissionController = .{},
@@ -3180,6 +3186,28 @@ pub const ModelManager = struct {
     /// process-wide admission accounting as the primary session. Reserve their
     /// construction peak immediately before import, then retain only completed
     /// residency for the component lifetime.
+    /// Register a load-time compact residency contract for a model
+    /// directory. Call during startup, before the first load of that model.
+    pub fn registerCompactProfile(
+        self: *ModelManager,
+        model_dir: []const u8,
+        request: backends.SessionManager.CompactRequest,
+    ) !void {
+        const key = try self.allocator.dupe(u8, model_dir);
+        errdefer self.allocator.free(key);
+        const entry = try self.compact_profiles.getOrPut(self.allocator, key);
+        if (entry.found_existing) {
+            self.allocator.free(key);
+            if (!std.meta.eql(entry.value_ptr.*, request)) return error.ConflictingCompactProfile;
+            return;
+        }
+        entry.value_ptr.* = request;
+    }
+
+    pub fn compactProfileForDir(self: *const ModelManager, model_dir: []const u8) ?backends.SessionManager.CompactRequest {
+        return self.compact_profiles.get(model_dir);
+    }
+
     fn loadManagedSessionWithAdmission(
         self: *ModelManager,
         model_path: []const u8,
@@ -3220,6 +3248,7 @@ pub const ModelManager = struct {
                 single_backend[0..],
                 source_session_manager,
             );
+            if (self.compactProfileForDir(model_path)) |request| session_manager.compact = request;
             const backend_runtime = session_manager.resolveBackendRuntime(backend) catch |err| {
                 if (first_err == null) first_err = err;
                 continue;
@@ -3406,6 +3435,11 @@ pub const ModelManager = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.loaded_aliases.deinit(self.allocator);
+        var profile_it = self.compact_profiles.iterator();
+        while (profile_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.compact_profiles.deinit(self.allocator);
     }
 
     pub fn attachIo(self: *ModelManager, io: std.Io) void {
@@ -3554,7 +3588,7 @@ pub const ModelManager = struct {
         }
         for (preferred_backends) |backend| {
             if (!backend.supportsDirectSessionLoad()) continue;
-            const variant_key = try backendVariantCacheKey(self.allocator, model_dir, backend);
+            const variant_key = try backendVariantCacheKeyWithProfile(self, self.allocator, model_dir, backend);
             defer self.allocator.free(variant_key);
             if (self.loaded.get(variant_key)) |model| return model;
             if (self.loaded_aliases.get(variant_key)) |model| return model;
@@ -3568,10 +3602,14 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
     ) ![]u8 {
+        const profile_slots: i64 = if (self.compactProfileForDir(model_dir)) |request|
+            request.expert_cache_slots
+        else
+            -1;
         const prefix = try std.fmt.allocPrint(
             self.allocator,
-            "{d}:{s}:{d}:",
-            .{ model_dir.len, model_dir, @intFromBool(cache_default_alias) },
+            "{d}:{s}:{d}:compact={d}:",
+            .{ model_dir.len, model_dir, @intFromBool(cache_default_alias), profile_slots },
         );
         defer self.allocator.free(prefix);
         const key = try self.allocator.alloc(u8, prefix.len + preferred_backends.len);
@@ -3962,7 +4000,8 @@ pub const ModelManager = struct {
             self.allocator.destroy(model);
         };
 
-        const variant_key = try backendVariantCacheKey(
+        const variant_key = try backendVariantCacheKeyWithProfile(
+            self,
             self.allocator,
             model.model_dir,
             model.session.backend(),
@@ -3970,6 +4009,11 @@ pub const ModelManager = struct {
         var variant_key_owned = true;
         defer if (variant_key_owned) self.allocator.free(variant_key);
 
+        if (self.compactProfileForDir(model.model_dir) != null) {
+            // A compact instance is preloaded and pinned: idle eviction must
+            // not drop it, and reload thrash would defeat the warm cache.
+            model.pinned = true;
+        }
         const alias_key = if (cache_default_alias)
             try self.allocator.dupe(u8, model.model_dir)
         else
@@ -4056,6 +4100,26 @@ fn backendVariantCacheKey(
     backend: backends.BackendType,
 ) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}\nbackend={s}", .{ model_dir, @tagName(backend) });
+}
+
+/// Variant key that also folds in the model's compact residency contract, so
+/// a compact-configured instance and a plain instance of the same directory
+/// can never alias each other in the cache.
+fn backendVariantCacheKeyWithProfile(
+    self: *const ModelManager,
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    backend: backends.BackendType,
+) ![]u8 {
+    if (self.compactProfileForDir(model_dir)) |request| {
+        return std.fmt.allocPrint(allocator, "{s}\nbackend={s}\nmemory_profile={s}\nexpert_cache_slots={d}", .{
+            model_dir,
+            @tagName(backend),
+            @tagName(request.profile),
+            request.expert_cache_slots,
+        });
+    }
+    return backendVariantCacheKey(allocator, model_dir, backend);
 }
 
 test "model cache eviction skips active and pinned models and removes aliases" {
