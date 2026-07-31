@@ -447,6 +447,96 @@ test "concurrent first prompt cache activations share the node budget" {
     try std.testing.expect(!second.prompt_prefix_cache.isParticipating());
 }
 
+test "warm boot provisions the prompt cache pool before any request" {
+    const allocator = std.testing.allocator;
+    var manager = model_manager_mod.ModelManager.init(allocator, backends_mod.SessionManager.init(allocator));
+    defer manager.loaded.deinit(allocator);
+    defer manager.loaded_aliases.deinit(allocator);
+
+    var model: model_manager_mod.LoadedModel = undefined;
+    model.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    model.prompt_cache_ledger_observer = null;
+    defer model.prompt_prefix_cache.deinit();
+    try manager.loaded.put(allocator, "warm", &model);
+
+    // Before the warm ping the cache has no pool: the first cached request
+    // would otherwise pay pool provisioning on its TTFT.
+    try std.testing.expect(model.prompt_prefix_cache.pool_id == null);
+    try std.testing.expect(!model.prompt_prefix_cache.isParticipating());
+
+    const node_config = runtime.kv.prompt_cache.Config{ .enabled = true, .max_bytes = 512 * 1024 * 1024 };
+    const pool_config = runtime.kv.pool.KvPoolConfig{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 16,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    };
+
+    // Native needs no device write hook, so a warm activation with a null
+    // compute backend still materializes the pool.
+    const activation = (try ensureWarmPromptCachePool(
+        &manager,
+        true,
+        node_config,
+        &model,
+        .native,
+        pool_config,
+        null,
+    )).?;
+
+    try std.testing.expect(model.prompt_prefix_cache.pool_id != null);
+    try std.testing.expectEqual(model.prompt_prefix_cache.pool_id.?, activation.pool_id);
+    try std.testing.expectEqual(model.prompt_prefix_cache.managerPtr(), activation.manager);
+    try std.testing.expect(activation.storage == null);
+    try std.testing.expect(model.prompt_prefix_cache.isParticipating());
+
+    // A second warm/ready activation reuses the same pool rather than churning it.
+    const again = (try ensureWarmPromptCachePool(
+        &manager,
+        true,
+        node_config,
+        &model,
+        .native,
+        pool_config,
+        null,
+    )).?;
+    try std.testing.expectEqual(activation.pool_id, again.pool_id);
+}
+
+test "warm prompt cache activation is skipped when the node cache is disabled" {
+    const allocator = std.testing.allocator;
+    var manager = model_manager_mod.ModelManager.init(allocator, backends_mod.SessionManager.init(allocator));
+    defer manager.loaded.deinit(allocator);
+    defer manager.loaded_aliases.deinit(allocator);
+
+    var model: model_manager_mod.LoadedModel = undefined;
+    model.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    model.prompt_cache_ledger_observer = null;
+    defer model.prompt_prefix_cache.deinit();
+    try manager.loaded.put(allocator, "warm", &model);
+
+    const node_config = runtime.kv.prompt_cache.Config{ .enabled = false };
+    const pool_config = runtime.kv.pool.KvPoolConfig{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 16,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    };
+    try std.testing.expect((try ensureWarmPromptCachePool(
+        &manager,
+        false,
+        node_config,
+        &model,
+        .native,
+        pool_config,
+        null,
+    )) == null);
+    try std.testing.expect(model.prompt_prefix_cache.pool_id == null);
+}
+
 pub const NodeConfig = struct {
     models_dir: []const u8 = "./models",
     ml_dir: []const u8 = "./ml",
@@ -572,6 +662,81 @@ fn promptCacheEligibleForNativeRequest(
         (backend == .native or backend == .metal or backend == .cuda) and
         !has_compiled_partition and !has_draft and !has_compaction;
 }
+
+/// A per-model prompt cache pool that a warm-boot ping (or a request) has
+/// bound its decode state to. When present the caller runs prefill/decode
+/// through the cache-owned KV pool instead of a private per-request pool.
+const WarmPromptCachePool = struct {
+    manager: *runtime.kv.manager.KvManager,
+    pool_id: runtime.kv.block.KvPoolId,
+    /// Device-backed KV storage (metal/cuda). Null for native, whose KV lives
+    /// in the pool manager itself.
+    storage: ?*runtime.kv.storage_runtime.KvStorageRuntime,
+    cache: *runtime.kv.prompt_cache.PromptPrefixCache,
+};
+
+/// Create — or reuse — the per-model prompt cache pool, its device-backed
+/// storage, and the KV device write hook. Sharing this between the warm-ping
+/// path and the request path lets the cache pool, storage, and write hook be
+/// provisioned once at boot (off a preloaded model) so the first user request
+/// under a `prompt_cache_key` does not pay pool creation on its TTFT.
+///
+/// Returns null when caching is disabled or the pool cannot be provisioned
+/// (incompatible geometry, or a backend that cannot install a device write
+/// hook); the caller then falls back to a private per-request pool. On any
+/// failure the pending node-budget reservation is rolled back so a later
+/// request can retry activation cleanly.
+fn ensureWarmPromptCachePool(
+    model_manager: *model_manager_mod.ModelManager,
+    prompt_cache_enabled: bool,
+    prompt_cache_config: runtime.kv.prompt_cache.Config,
+    model: *model_manager_mod.LoadedModel,
+    backend_kind: runtime.kv.pool.BackendKind,
+    pool_config: runtime.kv.pool.KvPoolConfig,
+    cb: ?*const ops.ComputeBackend,
+) !?WarmPromptCachePool {
+    if (!prompt_cache_enabled) return null;
+    if (backend_kind != .native and backend_kind != .metal and backend_kind != .cuda) return null;
+
+    model_manager.rebalancePromptCaches(model, prompt_cache_config);
+    // A throwing pool/storage/hook provisioning must not leave the node-budget
+    // reservation dangling; a clean return-null path cancels it explicitly.
+    errdefer model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
+
+    var storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null;
+    if (backend_kind == .metal or backend_kind == .cuda) {
+        const ensured = (try model.prompt_prefix_cache.ensureStorage(pool_config)) orelse {
+            model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
+            return null;
+        };
+        if (ensured.storage.device_write_hook == null) {
+            if (cb) |backend| try backend.provisionKvDeviceWriteHook(ensured.storage);
+        }
+        if (ensured.storage.device_write_hook == null) {
+            model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
+            return null;
+        }
+        storage = ensured.storage;
+    } else {
+        if ((try model.prompt_prefix_cache.ensurePool(pool_config)) == null) {
+            model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
+            return null;
+        }
+    }
+
+    return .{
+        .manager = model.prompt_prefix_cache.managerPtr(),
+        .pool_id = model.prompt_prefix_cache.pool_id.?,
+        .storage = storage,
+        .cache = &model.prompt_prefix_cache,
+    };
+}
+
+/// Reserved prompt-cache namespace used by the warm-boot ping. The ping
+/// prompt is far shorter than `min_tokens`, so nothing is ever stored under
+/// this key — its only purpose is to drive pool/storage/write-hook creation
+/// at boot rather than on the first real cached request.
+const warm_prompt_cache_namespace = "__warmup__";
 
 pub const WarmModelKind = enum {
     generator,
@@ -2606,7 +2771,7 @@ pub const Node = struct {
             };
         }
 
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null, false);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null, false, false);
     }
 
     pub fn generateMessagesDirect(
@@ -2615,7 +2780,7 @@ pub const Node = struct {
         model_name: []const u8,
         messages: []const generation.Message,
     ) ![]u8 {
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null, false);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null, false, false);
     }
 
     pub fn beginDirectGenerateAdmission(
@@ -2692,6 +2857,7 @@ pub const Node = struct {
             false,
             null,
             false,
+            false,
         );
     }
 
@@ -2750,6 +2916,7 @@ pub const Node = struct {
         cache_default_alias: bool,
         timing: ?*DirectGenerateTiming,
         pin_after_success: bool,
+        activate_prompt_cache: bool,
     ) ![]u8 {
         if (messages.len == 0) return error.InvalidGenerationRequest;
         const preflight = try directGeneratePreflightForMessages(messages);
@@ -2764,6 +2931,7 @@ pub const Node = struct {
             cache_default_alias,
             timing,
             pin_after_success,
+            activate_prompt_cache,
         );
     }
 
@@ -2777,6 +2945,7 @@ pub const Node = struct {
         cache_default_alias: bool,
         timing: ?*DirectGenerateTiming,
         pin_after_success: bool,
+        activate_prompt_cache: bool,
     ) ![]u8 {
         if (messages.len == 0) return error.InvalidGenerationRequest;
         const admitted_node = admission.node orelse return error.InvalidGenerationAdmission;
@@ -2883,18 +3052,59 @@ pub const Node = struct {
         defer cb.deinit();
 
         const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
-        const pool_id = try kv_manager.addPool(kv_pool_config);
-        var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config);
-        defer kv_storage.deinit();
-        try cb.provisionKvDeviceWriteHook(&kv_storage);
-        var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
-        decode_state.kv_storage = &kv_storage;
+
+        // Warm-boot prompt cache activation. When the node cache is enabled and
+        // this call is the preload warm ping, create the per-model cache pool,
+        // its device-backed storage, and the KV device write hook now so the
+        // first real cached request finds them ready. The warm ping's prompt is
+        // far shorter than `min_tokens`, so nothing is stored under the reserved
+        // namespace; only the pool/storage/hook are materialized.
+        const warm_cache: ?WarmPromptCachePool = if (activate_prompt_cache)
+            ensureWarmPromptCachePool(
+                &self.model_manager,
+                self.config.prompt_cache.enabled,
+                self.config.prompt_cache.runtimeConfig(self.config.prompt_cache_resource_usage_observer),
+                model,
+                backend_kind,
+                kv_pool_config,
+                &cb,
+            ) catch |err| blk: {
+                std.log.warn("warm prompt cache activation failed model={s}: {s}; continuing without cache pool", .{ model_name, @errorName(err) });
+                break :blk null;
+            }
+        else
+            null;
+
+        const pool_id = if (warm_cache) |wc| wc.pool_id else try kv_manager.addPool(kv_pool_config);
+        // Only create a private per-request storage when the cache did not
+        // provide device-backed storage bound to its own pool.
+        var kv_storage: ?runtime.kv.storage_runtime.KvStorageRuntime = if (warm_cache == null or warm_cache.?.storage == null)
+            try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config)
+        else
+            null;
+        defer if (kv_storage) |*storage| storage.deinit();
+        if (kv_storage) |*storage| try cb.provisionKvDeviceWriteHook(storage);
+        const active_kv_manager = if (warm_cache) |wc| wc.manager else &kv_manager;
+        var decode_state = generation.NativeDecodeState.initPaged(allocator, active_kv_manager, pool_id, model.shared_moe_cache);
+        if (warm_cache) |wc| {
+            if (wc.storage) |storage| decode_state.kv_storage = storage;
+        }
+        if (decode_state.kv_storage == null) {
+            if (kv_storage) |*storage| decode_state.kv_storage = storage;
+        }
         defer decode_state.deinit();
 
+        // Compact-profile models must stay on the eager partitioned-scheduler
+        // (paged-KV) path — whole-model execution is non-paged, which disables
+        // the prompt prefix cache and bypasses the ledger-governed KV pools the
+        // compact residency contract depends on. This mirrors the HTTP request
+        // path's `shouldAutoUseMetalWholeModelGenerate` compact gate so a warm
+        // ping provisions and exercises the exact KV geometry real requests use.
         const use_metal_whole_model = build_options.enable_metal and
             model.session.backend() == .metal and
             graph_mod.metal_executor.supportsSession(model.session) and
-            !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config);
+            !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and
+            self.model_manager.compactProfileForDir(model.model_dir) == null;
 
         var pipeline = generation.NativeGenerationPipeline{
             .allocator = allocator,
@@ -2911,6 +3121,7 @@ pub const Node = struct {
             .model_dir = model_path,
             .gguf_projector_path = model.manifest.gguf_projector_path,
             .decode_state = &decode_state,
+            .prompt_cache = if (warm_cache) |wc| wc.cache else null,
             .graph_cache = if (use_metal_whole_model) &model.native_generation_graph_cache else null,
             .compiled_partition_backend = if (use_metal_whole_model) .metal else null,
             .compiled_attachment_target = if (use_metal_whole_model) .whole_model else .partitioned,
@@ -2921,7 +3132,12 @@ pub const Node = struct {
         if (timing != null) {
             std.log.info("direct generator starting generation model={s} backend={s}", .{ model_name, @tagName(model.session.backend()) });
         }
-        var result = pipeline.generate(messages, .{ .max_tokens = max_tokens, .prefill_chunk_size = admitted_prefill_chunk }) catch |err| {
+        var result = pipeline.generate(messages, .{
+            .max_tokens = max_tokens,
+            .prefill_chunk_size = admitted_prefill_chunk,
+            .prompt_cache_enabled = warm_cache != null,
+            .prompt_cache_key = if (warm_cache != null) warm_prompt_cache_namespace else null,
+        }) catch |err| {
             std.log.err("direct generator generation failed model={s} backend={s}: {s}", .{
                 model_name,
                 @tagName(model.session.backend()),
@@ -3070,7 +3286,7 @@ pub const Node = struct {
             .content = "ping",
         }};
         var timing = DirectGenerateTiming{};
-        const text = try self.generateMessagesDirectMaxTokens(allocator, model_name, &messages, 1, preferred_backends, true, &timing, true);
+        const text = try self.generateMessagesDirectMaxTokens(allocator, model_name, &messages, 1, preferred_backends, true, &timing, true, true);
         defer allocator.free(text);
         const elapsed_ms = elapsedMs(started_at_ns, embedTimingNowNs());
         std.log.info(
