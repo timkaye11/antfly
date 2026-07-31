@@ -151,11 +151,15 @@ pub const CompactInferenceConfig = struct {
     }
 
     /// KV budget share for a total budget in bytes:
-    /// max(384 MiB, min(budget / 4, 1 GiB)).
+    /// max(384 MiB, min(budget / 4, 1 GiB)), with the quarter share
+    /// quantized down to a whole MiB so budget knobs expressed in MiB (CLI,
+    /// server) can mirror the value exactly.
     pub fn kvBudgetBytesForBudget(budget_bytes: u64) u64 {
-        const floor: u64 = 384 * 1024 * 1024;
-        const cap: u64 = 1024 * 1024 * 1024;
-        return @max(floor, @min(budget_bytes / 4, cap));
+        const mib: u64 = 1024 * 1024;
+        const floor: u64 = 384 * mib;
+        const cap: u64 = 1024 * mib;
+        const quarter = (budget_bytes / 4 / mib) * mib;
+        return @max(floor, @min(quarter, cap));
     }
 };
 

@@ -116,6 +116,10 @@ const Options = struct {
     kv_budget_mb: usize = 0,
     scratch_budget_mb: usize = 0,
     memory_profile: ?MemoryProfile = null,
+    /// Total resident memory budget in MiB for the compact profile. 0 keeps
+    /// the 2048 MiB floor; setting it without --memory-profile implies the
+    /// compact profile.
+    memory_budget_mb: usize = 0,
     expert_cache_slots: usize = 0,
     compact_ceiling_mb: usize = 0,
     raw_prompt: bool = false,
@@ -6846,7 +6850,14 @@ fn parseArgs(args: []const []const u8) !Options {
         } else if (std.mem.eql(u8, arg, "--memory-profile")) {
             i += 1;
             if (i >= args.len) return error.MissingMemoryProfile;
-            opts.memory_profile = parseMemoryProfile(args[i]) orelse return error.InvalidMemoryProfile;
+            const parsed = parseMemoryProfile(args[i]) orelse return error.InvalidMemoryProfile;
+            opts.memory_profile = parsed.profile;
+            opts.memory_budget_mb = parsed.budget_mb;
+        } else if (std.mem.eql(u8, arg, "--memory-budget-mb")) {
+            i += 1;
+            if (i >= args.len) return error.MissingMemoryBudget;
+            opts.memory_budget_mb = try std.fmt.parseInt(usize, args[i], 10);
+            if (std.math.cast(u32, opts.memory_budget_mb) == null) return error.InvalidMemoryBudget;
         } else if (std.mem.eql(u8, arg, "--compact-ceiling-mb")) {
             i += 1;
             if (i >= args.len) return error.MissingArgumentValue;
@@ -6855,7 +6866,9 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingExpertCacheSlots;
             opts.expert_cache_slots = try std.fmt.parseInt(usize, args[i], 10);
-            if (opts.expert_cache_slots != 8 and opts.expert_cache_slots != 12 and opts.expert_cache_slots != 16) {
+            if (opts.expert_cache_slots < min_expert_cache_slots or
+                opts.expert_cache_slots > max_expert_cache_slots)
+            {
                 return error.InvalidExpertCacheSlots;
             }
         } else if (std.mem.eql(u8, arg, "--server")) {
@@ -6874,23 +6887,65 @@ fn parseArgs(args: []const []const u8) !Options {
     return opts;
 }
 
-fn parseMemoryProfile(value: []const u8) ?MemoryProfile {
-    if (std.mem.eql(u8, value, "2gbs") or
-        std.mem.eql(u8, value, "2gb") or
-        std.mem.eql(u8, value, "compact_2gbs"))
-    {
-        return .compact_2gbs;
+const min_memory_budget_mb: usize = session_factory.CompactInferenceConfig.min_memory_budget_mb;
+const min_expert_cache_slots: usize = session_factory.CompactInferenceConfig.min_expert_cache_slots;
+const max_expert_cache_slots: usize = session_factory.CompactInferenceConfig.max_expert_cache_slots;
+
+const ParsedMemoryProfile = struct {
+    profile: MemoryProfile,
+    budget_mb: usize,
+};
+
+/// `compact_2gbs` and the `<N>gb`/`<N>gbs` spellings (`2gbs`, `8gb`,
+/// `12gbs`, ...) all select the compact profile; the numeric forms carry an
+/// N GiB memory budget. Budgets below the 2 GiB floor are rejected later by
+/// `applyMemoryProfile`, never clamped.
+fn parseMemoryProfile(value: []const u8) ?ParsedMemoryProfile {
+    if (std.mem.eql(u8, value, "compact_2gbs")) {
+        return .{ .profile = .compact_2gbs, .budget_mb = min_memory_budget_mb };
     }
-    return null;
+    const suffix_len: usize = if (std.mem.endsWith(u8, value, "gbs"))
+        3
+    else if (std.mem.endsWith(u8, value, "gb"))
+        2
+    else
+        return null;
+    const digits = value[0 .. value.len - suffix_len];
+    if (digits.len == 0) return null;
+    const gib = std.fmt.parseInt(u32, digits, 10) catch return null;
+    if (gib == 0) return null;
+    const budget_mb = std.math.mul(u32, gib, 1024) catch return null;
+    return .{ .profile = .compact_2gbs, .budget_mb = budget_mb };
+}
+
+/// CLI-side mirror of `CompactInferenceConfig.kvBudgetBytesForBudget` for
+/// the pre-geometry `--kv-budget-mb` default. The 2048 MiB floor keeps the
+/// historical 384 MiB default; larger budgets follow the contract share
+/// max(384, min(budget/4, 1024)) MiB. A unit test cross-checks this against
+/// the config formula so the two never drift.
+fn compactKvBudgetMbDefault(budget_mb: usize) usize {
+    if (budget_mb <= min_memory_budget_mb) return 384;
+    return @max(@as(usize, 384), @min(budget_mb / 4, 1024));
 }
 
 fn applyMemoryProfile(opts: *Options) !void {
+    if (opts.memory_budget_mb != 0 and opts.memory_budget_mb < min_memory_budget_mb) {
+        return error.CompactProfileBudgetTooSmall;
+    }
+    // A named budget implies the compact profile.
+    if (opts.memory_profile == null and opts.memory_budget_mb != 0) {
+        opts.memory_profile = .compact_2gbs;
+    }
     const profile = opts.memory_profile orelse {
         if (opts.expert_cache_slots != 0) return error.ExpertCacheSlotsRequireMemoryProfile;
         return;
     };
     switch (profile) {
         .compact_2gbs => {
+            const budget_mb: usize = if (opts.memory_budget_mb == 0)
+                min_memory_budget_mb
+            else
+                opts.memory_budget_mb;
             if (opts.backend == .auto) opts.backend = .metal;
             if (opts.backend != .metal) return error.MemoryProfileRequiresMetal;
             if (opts.mode == null) opts.mode = .eager;
@@ -6901,13 +6956,14 @@ fn applyMemoryProfile(opts: *Options) !void {
                 else => return error.CompactProfileInvalidPrefillChunk,
             }
             if (opts.cache_dtype == null) opts.cache_dtype = "f16";
-            if (opts.host_budget_mb == 0) opts.host_budget_mb = 2048;
-            if (opts.backend_budget_mb == 0) opts.backend_budget_mb = 2048;
-            if (opts.combined_budget_mb == 0) opts.combined_budget_mb = 2048;
-            if (opts.kv_budget_mb == 0) opts.kv_budget_mb = 384;
+            if (opts.host_budget_mb == 0) opts.host_budget_mb = budget_mb;
+            if (opts.backend_budget_mb == 0) opts.backend_budget_mb = budget_mb;
+            if (opts.combined_budget_mb == 0) opts.combined_budget_mb = budget_mb;
+            if (opts.kv_budget_mb == 0) opts.kv_budget_mb = compactKvBudgetMbDefault(budget_mb);
             if (opts.scratch_budget_mb == 0) opts.scratch_budget_mb = 384;
-            // expert_cache_slots == 0 stays 0: it means automatic tier
-            // selection inside the immutable compact config.
+            // expert_cache_slots == 0 stays 0: it means automatic
+            // budget-derived slot selection inside the immutable compact
+            // config.
             if (opts.image_count > 0 or opts.audio_count > 0) {
                 return error.CompactProfileUnsupportedMultimodal;
             }
@@ -6929,6 +6985,7 @@ fn compactRequestFromOptions(opts: Options) ?session_factory.CompactInferenceReq
         .profile = switch (profile) {
             .compact_2gbs => .compact_2gbs,
         },
+        .memory_budget_mb = @intCast(opts.memory_budget_mb),
         .expert_cache_slots = @intCast(opts.expert_cache_slots),
         .io_workers = 4,
         .preferred_prefill_rows = @intCast(opts.prefill_chunk_size),
@@ -7322,7 +7379,7 @@ fn metalEagerDenseMaxBytes() u64 {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--memory-profile 2gbs|2gb|compact_2gbs] [--expert-cache-slots 8|12|16] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--memory-profile <N>gb|<N>gbs|compact_2gbs] [--memory-budget-mb N] [--expert-cache-slots 4..128] [--compact-ceiling-mb N] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
         \\  --stream prints generated text incrementally as token deltas arrive.
@@ -7335,8 +7392,10 @@ fn printUsage() void {
         \\  compiled-target=whole-model requests a compiled backend only when it can own the full traced graph shape.
         \\  raw-decode-bench runs transformer-body decode without logits/sampling for llama-bench-style baselines.
         \\  ignore-eos keeps generating after EOS for benchmark compatibility with engines that do not stop on the same EOG token set.
-        \\  --memory-profile 2gbs|2gb|compact_2gbs selects Metal eager compact MoE execution, four bounded expert readers, 128-token prefill chunks, FP16 KV, and explicit 2 GiB residency budgets carried by value into session creation.
-        \\  --expert-cache-slots 8|12|16 selects resident expert slots per layer for the 2gbs profile (default: 12; routing still executes exactly top-8 experts).
+        \\  --memory-profile <N>gb|<N>gbs (e.g. 2gbs, 8gb, 12gbs; compact_2gbs is an alias for 2gbs) selects Metal eager compact MoE execution, four bounded expert readers, 128-token prefill chunks, FP16 KV, and an N GiB residency budget carried by value into session creation.
+        \\  --memory-budget-mb N sets the compact residency budget in MiB directly (minimum 2048; implies the compact profile when --memory-profile is omitted).
+        \\  --expert-cache-slots 4..128 pins resident expert slots per layer for the compact profile (default: derived from the memory budget; routing still executes exactly top-8 experts).
+        \\  --compact-ceiling-mb N is a diagnostic override of the enforced resident ceiling; normal use sizes the contract with --memory-budget-mb instead.
         \\  Kernel-JIT options are local-only and bypass ANTFLY_INFERENCE_SERVER_URL; an explicit --server remains an error.
         \\  A qualified profile reloads matching package records from the selected cache before model publication; use mode on or required.
         \\  Profile capture auto-selects shadow unless a conflicting mode is explicit. Target and draft profiles are model-bound and separate.
@@ -7757,11 +7816,14 @@ test "parseArgs expands compact 2gbs memory profile" {
     try std.testing.expectEqual(@as(usize, 2048), opts.combined_budget_mb);
     try std.testing.expectEqual(@as(usize, 384), opts.kv_budget_mb);
     try std.testing.expectEqual(@as(usize, 384), opts.scratch_budget_mb);
-    // 0 = automatic slot-tier selection inside the immutable compact config.
+    try std.testing.expectEqual(@as(usize, 2048), opts.memory_budget_mb);
+    // 0 = automatic budget-derived slot selection inside the immutable
+    // compact config.
     try std.testing.expectEqual(@as(usize, 0), opts.expert_cache_slots);
     try std.testing.expectEqual(generation.SpeculationPolicy.off, opts.speculation_policy);
     try std.testing.expect(!liveWholeModelExecutorRequested(&opts));
     const compact_request = compactRequestFromOptions(opts).?;
+    try std.testing.expectEqual(@as(u32, 2048), compact_request.memory_budget_mb);
     try std.testing.expectEqual(@as(u8, 0), compact_request.expert_cache_slots);
     try std.testing.expectEqual(@as(u8, 4), compact_request.io_workers);
     try std.testing.expectEqual(@as(u16, 128), compact_request.preferred_prefill_rows);
@@ -7793,13 +7855,33 @@ test "parseArgs expands compact 2gbs memory profile" {
     });
     try std.testing.expectEqual(@as(usize, 16), slots_16.expert_cache_slots);
 
+    // The explicit slot range is [4, 128] now, not the old {8, 12, 16}.
+    const slots_100 = try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--memory-profile",
+        "8gb",
+        "--expert-cache-slots",
+        "100",
+    });
+    try std.testing.expectEqual(@as(usize, 100), slots_100.expert_cache_slots);
+
     try std.testing.expectError(error.InvalidExpertCacheSlots, parseArgs(&.{
         "/tmp/model",
         "hello",
         "--memory-profile",
         "2gbs",
         "--expert-cache-slots",
-        "10",
+        "3",
+    }));
+
+    try std.testing.expectError(error.InvalidExpertCacheSlots, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--memory-profile",
+        "2gbs",
+        "--expert-cache-slots",
+        "129",
     }));
 
     try std.testing.expectError(error.ExpertCacheSlotsRequireMemoryProfile, parseArgs(&.{
@@ -7817,6 +7899,92 @@ test "parseArgs expands compact 2gbs memory profile" {
         "--memory-profile",
         "2gbs",
     }));
+}
+
+test "parseArgs generalizes the compact memory budget" {
+    // "<N>gb"/"<N>gbs" profile spellings carry an N GiB budget and scale the
+    // derived run-budget defaults.
+    const opts_8gb = try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--memory-profile",
+        "8gb",
+    });
+    try std.testing.expectEqual(MemoryProfile.compact_2gbs, opts_8gb.memory_profile.?);
+    try std.testing.expectEqual(@as(usize, 8192), opts_8gb.memory_budget_mb);
+    try std.testing.expectEqual(BackendChoice.metal, opts_8gb.backend);
+    try std.testing.expectEqual(@as(usize, 8192), opts_8gb.host_budget_mb);
+    try std.testing.expectEqual(@as(usize, 8192), opts_8gb.backend_budget_mb);
+    try std.testing.expectEqual(@as(usize, 8192), opts_8gb.combined_budget_mb);
+    try std.testing.expectEqual(@as(usize, 1024), opts_8gb.kv_budget_mb);
+    try std.testing.expectEqual(@as(usize, 384), opts_8gb.scratch_budget_mb);
+    try std.testing.expectEqual(
+        @as(u32, 8192),
+        compactRequestFromOptions(opts_8gb).?.memory_budget_mb,
+    );
+
+    try std.testing.expectEqual(@as(usize, 12_288), (try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--memory-profile",
+        "12gbs",
+    })).memory_budget_mb);
+
+    // --memory-budget-mb alone implies the compact profile.
+    const implied = try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--memory-budget-mb",
+        "4096",
+    });
+    try std.testing.expectEqual(MemoryProfile.compact_2gbs, implied.memory_profile.?);
+    try std.testing.expectEqual(@as(usize, 4096), implied.memory_budget_mb);
+    try std.testing.expectEqual(@as(usize, 1024), implied.kv_budget_mb);
+    try std.testing.expectEqual(
+        @as(u32, 4096),
+        compactRequestFromOptions(implied).?.memory_budget_mb,
+    );
+
+    // Nonzero budgets below the 2048 MiB floor fail closed at parse time.
+    try std.testing.expectError(error.CompactProfileBudgetTooSmall, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--memory-budget-mb",
+        "1024",
+    }));
+    try std.testing.expectError(error.CompactProfileBudgetTooSmall, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--memory-profile",
+        "1gb",
+    }));
+
+    try std.testing.expectError(error.InvalidMemoryProfile, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--memory-profile",
+        "8tb",
+    }));
+}
+
+test "compact CLI KV default mirrors the contract KV share formula" {
+    // The CLI default is computed before geometry exists, so it duplicates
+    // the contract formula; this cross-check keeps the two from drifting.
+    for ([_]usize{ 2049, 3000, 4096, 8192, 12_288, 16_384, 65_536 }) |budget_mb| {
+        try std.testing.expectEqual(
+            session_factory.CompactInferenceConfig.kvBudgetBytesForBudget(
+                @as(u64, budget_mb) * 1024 * 1024,
+            ),
+            @as(u64, compactKvBudgetMbDefault(budget_mb)) * 1024 * 1024,
+        );
+    }
+    // At the 2048 floor the CLI keeps the historical 384 MiB run-budget
+    // default while the contract reserves its 512 MiB share.
+    try std.testing.expectEqual(@as(usize, 384), compactKvBudgetMbDefault(2048));
+    try std.testing.expectEqual(
+        @as(u64, 512) * 1024 * 1024,
+        session_factory.CompactInferenceConfig.kvBudgetBytesForBudget(@as(u64, 2048) * 1024 * 1024),
+    );
 }
 
 test "parseArgs accepts compiled target" {
