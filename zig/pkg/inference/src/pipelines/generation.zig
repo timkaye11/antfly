@@ -1623,6 +1623,34 @@ fn schedulerChunkForPrefillIteration(scheduler_chunk: usize, current_chunk_size:
     return current_chunk_size;
 }
 
+/// Request-level admission for the split-SWA/global KV ring on the eager
+/// prefill path — the counterpart of native_generate's
+/// `liveWholeModelAllowsSplitSwaRing`. The compact memory profile always runs
+/// eager Metal prefill, so this predicate is what lets its 25/30
+/// sliding-window layers keep ring-bounded device KV instead of full-context
+/// buffers. The model-level half (`Config.supportsSplitSwaGlobalKvRing`) is
+/// folded in by `NativeDecodeState.configureForGptConfig`.
+///
+/// Ring page ids are absolute from sequence position zero and a ring drops
+/// pre-window history, so every condition here is a correctness guard, not a
+/// tuning knob:
+/// - only the Metal backend has the ring-aware paged-slot KV kernels;
+/// - a resumed sequence (`prefilled_tokens != 0`) may already own
+///   full-history slots whose ring geometry is pinned;
+/// - prompt caching retains full KV for later prefix reuse;
+/// - cache compaction front-trims the logical block table, which would make
+///   absolute ring page ids view-relative.
+pub fn eagerPrefillAllowsSplitSwaRing(
+    backend_kind: ops.BackendKind,
+    prefilled_tokens: usize,
+    config: GenerationConfig,
+) bool {
+    return backend_kind == .metal and
+        prefilled_tokens == 0 and
+        !config.prompt_cache_enabled and
+        config.cache_compaction_ratio == null;
+}
+
 pub const DecoderRuntimeDebugStats = struct {
     forward_attempts: u64 = 0,
     flag_disabled: u64 = 0,
@@ -4104,9 +4132,7 @@ pub const NativeGenerationPipeline = struct {
             const max_speculative_rows = @min(@as(usize, @intCast(config.speculative_k)), 16) + 1;
             decode_state.configureKvMaxInflightTokens(
                 @max(seq_len, max_speculative_rows),
-                self.cb.kind() == .metal and
-                    !config.prompt_cache_enabled and
-                    config.cache_compaction_ratio == null,
+                eagerPrefillAllowsSplitSwaRing(self.cb.kind(), prefilled_tokens, config),
             );
             debugGenerationStage("executePrefill whole-model fast path seq_len={d}", .{seq_len});
             const decode_context = try decode_runtime.preparePrefill(seq_len, seq_len);
@@ -4177,10 +4203,7 @@ pub const NativeGenerationPipeline = struct {
             const max_speculative_rows = @min(@as(usize, @intCast(config.speculative_k)), 16) + 1;
             decode_state.configureKvMaxInflightTokens(
                 @max(current_chunk_size, max_speculative_rows),
-                self.cb.kind() == .metal and
-                    prefilled_tokens == 0 and
-                    !config.prompt_cache_enabled and
-                    config.cache_compaction_ratio == null,
+                eagerPrefillAllowsSplitSwaRing(self.cb.kind(), prefilled_tokens, config),
             );
             var processed: usize = 0;
             while (processed < query_len) {
@@ -10765,6 +10788,82 @@ test "native decode state sliding-window view stays block-aligned" {
         try std.testing.expect(view.token_count >= 8);
         try std.testing.expect(view.token_count < 8 + page_size);
     }
+}
+
+test "eager prefill SWA ring admission mirrors the live whole-model gate" {
+    // The compact profile's request shape: Metal backend, fresh sequence,
+    // no prompt caching, no cache compaction.
+    try std.testing.expect(eagerPrefillAllowsSplitSwaRing(.metal, 0, .{}));
+
+    // Only Metal has ring-aware paged-slot KV kernels.
+    try std.testing.expect(!eagerPrefillAllowsSplitSwaRing(.native, 0, .{}));
+    try std.testing.expect(!eagerPrefillAllowsSplitSwaRing(.cuda, 0, .{}));
+
+    // Resumed sequences may already own full-history slots.
+    try std.testing.expect(!eagerPrefillAllowsSplitSwaRing(.metal, 128, .{}));
+
+    // Caching requests keep full KV for later prefix reuse.
+    try std.testing.expect(!eagerPrefillAllowsSplitSwaRing(.metal, 0, .{
+        .prompt_cache_enabled = true,
+    }));
+
+    // Cache compaction front-trims the block table; absolute ring page ids
+    // would become view-relative.
+    try std.testing.expect(!eagerPrefillAllowsSplitSwaRing(.metal, 0, .{
+        .cache_compaction_ratio = 0.5,
+    }));
+}
+
+test "compact eager prefill enables the SWA ring for the A4B config" {
+    // Model half of the gate: the qualified compact geometry (Gemma 4
+    // 26B-A4B) is a gemma family model with PLE, a 512-token sliding window,
+    // and interleaved global layers (pattern 6), so it must qualify for the
+    // split SWA/global ring and must NOT report a whole-pool sliding window
+    // (global layers need full history).
+    const a4b_like = gpt_mod.Config{
+        .family = .gemma,
+        .num_hidden_layers = 30,
+        .ple_hidden_size = 256,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+    };
+    try std.testing.expect(a4b_like.supportsSplitSwaGlobalKvRing());
+    try std.testing.expectEqual(@as(?u32, null), a4b_like.kvPoolSlidingWindowSize(false));
+
+    // State half: configureForGptConfig folds the model gate in, and the
+    // request gate + chunk size flow into the KV view consumed by the Metal
+    // device-write hook. 128 is the compact profile's preferred prefill rows.
+    const allocator = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+    const pool_id = try manager.addPool(.{
+        .backend = .metal,
+        .dtype = .f16,
+        .page_size_tokens = 16,
+        .num_kv_heads = 1,
+        .head_dim = 8,
+    });
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    defer state.deinit();
+
+    state.configureForGptConfig(a4b_like);
+    try std.testing.expect(state.allow_swa_ring);
+    state.configureKvMaxInflightTokens(128, eagerPrefillAllowsSplitSwaRing(.metal, 0, .{}));
+    try std.testing.expect(state.allow_swa_ring);
+    try std.testing.expectEqual(@as(usize, 128), state.kv_max_inflight_tokens);
+    try state.notePrefill(128);
+    try std.testing.expect(state.kvView().?.allow_swa_ring);
+    try std.testing.expectEqual(@as(usize, 128), state.kvView().?.max_inflight_tokens);
+
+    // A caching request on the same config keeps full KV.
+    var caching = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    defer caching.deinit();
+    caching.configureForGptConfig(a4b_like);
+    caching.configureKvMaxInflightTokens(128, eagerPrefillAllowsSplitSwaRing(.metal, 0, .{
+        .prompt_cache_enabled = true,
+    }));
+    try std.testing.expect(!caching.allow_swa_ring);
+    try std.testing.expectEqual(@as(usize, 0), caching.kv_max_inflight_tokens);
 }
 
 test "native decode state disables SWA ring when the KV pool trims history" {
