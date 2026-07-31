@@ -728,6 +728,14 @@ pub const NativeQuantTimingStats = struct {
     /// pools (idle scratch-pool slots + out-of-plan graph-plan slots) before
     /// resorting to expert eviction.
     metal_compact_pool_trims: u64 = 0,
+    /// A2 gate: attention-span slot buffers that grew (realloc + copy) while a
+    /// frame was active/submitted. One-shot KV pre-reservation (A1) must keep
+    /// this at zero; nonzero means a KV-growth path still runs mid-frame.
+    metal_compact_kv_midframe_growths: u64 = 0,
+    /// A6 tripwire: times a compact session fell into the gathered-span f32
+    /// full-KV attention fallback — ledger-invisible KV duplication that must
+    /// stay loudly visible.
+    metal_compact_gathered_span_fallbacks: u64 = 0,
     metal_compact_expert_read_batches: u64 = 0,
     metal_compact_expert_read_tasks: u64 = 0,
     metal_compact_expert_read_ns: u64 = 0,
@@ -1031,6 +1039,19 @@ pub const ComputeBackend = struct {
         return hook(self.ptr, storage);
     }
 
+    /// A1 gate: whether this backend runs under the compact residency contract.
+    pub fn compactSessionActive(self: *const ComputeBackend) bool {
+        const op = self.vtable.compactSessionActive orelse return false;
+        return op(self.ptr);
+    }
+
+    /// A3 + A5: notify the backend a compact prefill chunk finished (its frame
+    /// drained). Drives stranded-memory telemetry and idle-pool reclamation.
+    pub fn compactPrefillChunkBoundary(self: *const ComputeBackend, chunk_index: usize) void {
+        const op = self.vtable.compactPrefillChunkBoundary orelse return;
+        op(self.ptr, chunk_index);
+    }
+
     /// Returns the backend's Io if it was constructed with one.  Free
     /// functions that take `*const ComputeBackend` (web/rerank_api,
     /// runtime/kv/compaction) can use this to dispatch parallel work through
@@ -1134,6 +1155,15 @@ pub const ComputeBackend = struct {
         /// its fast-path (polar4/turbo3 keys). Backends without a device KV
         /// impl leave this null.
         provisionKvDeviceWriteHook: ?*const fn (ctx: *anyopaque, storage: *runtime.kv.storage_runtime.KvStorageRuntime) anyerror!void = null,
+
+        /// A1 gate: true when this backend runs under the compact residency
+        /// contract. Null vtable entry (non-compact backends) reads as false.
+        compactSessionActive: ?*const fn (ctx: *anyopaque) bool = null,
+
+        /// A3 + A5: compact prefill chunk-boundary hook. Called once per chunk
+        /// after its frame drains; prints the stranded-memory telemetry line
+        /// and reclaims idle device pools. No-op for non-compact backends.
+        compactPrefillChunkBoundary: ?*const fn (ctx: *anyopaque, chunk_index: usize) void = null,
 
         /// Optional accessor for the backend's stored Io.  Free functions that
         /// receive a `*const ComputeBackend` (rerank_api, kv compaction, etc.)

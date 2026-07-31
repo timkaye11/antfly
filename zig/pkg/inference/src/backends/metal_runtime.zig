@@ -8270,6 +8270,7 @@ pub const RawRuntimeMemoryStats = extern struct {
     graph_plan_count: u64 = 0,
     graph_plan_allocations: u64 = 0,
     graph_plan_reuses: u64 = 0,
+    compact_kv_midframe_growths: u64 = 0,
     mps_dense_linear_standalone_calls: u64 = 0,
     mps_dense_linear_active_frame_calls: u64 = 0,
     mps_dense_linear_standalone_wait_nanos: u64 = 0,
@@ -16696,6 +16697,23 @@ pub extern fn termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
 /// buffers, 0 when nothing was releasable, -1 on a missing runtime.
 pub extern fn termite_metal_decode_runtime_trim_transient_pools(
     runtime: ?*RawMetalDecodeRuntime,
+) c_int;
+
+/// A3: chunk-boundary reclamation for the compact prefill driver. Extends the
+/// transient-pool trim with idle attention-span slot release and a graph-plan
+/// ratchet reset. Only safe at a true chunk boundary with no active/submitted
+/// frame. Returns released buffer count, 0 when a frame is in flight, -1 on a
+/// missing runtime.
+pub extern fn termite_metal_decode_runtime_compact_chunk_boundary_trim(
+    runtime: ?*RawMetalDecodeRuntime,
+) c_int;
+
+/// A4: opt the compact profile into exact-fit graph-plan allocations (no 2x
+/// overshoot). Idempotent; threaded from the compute wrapper once the compact
+/// contract is known.
+pub extern fn termite_metal_decode_runtime_set_compact_graph_plan_no_overshoot(
+    runtime: ?*RawMetalDecodeRuntime,
+    enabled: c_int,
 ) c_int;
 
 /// Mirror of the C-side `TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY` used to

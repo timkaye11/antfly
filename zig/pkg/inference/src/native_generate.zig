@@ -1255,6 +1255,15 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 },
             );
             print(
+                "metal_compact_residency: kv_reserved_bytes={d} midframe_growths={d} gathered_span_fallbacks={d} pool_trims={d}\n",
+                .{
+                    metal_snapshot.provider.metal_compact_kv_reserved_bytes,
+                    metal_snapshot.provider.metal_compact_kv_midframe_growths,
+                    metal_snapshot.provider.metal_compact_gathered_span_fallbacks,
+                    metal_snapshot.provider.metal_compact_pool_trims,
+                },
+            );
+            print(
                 "metal_gated_quantized_block: calls={d} quantized_branch={d} attn_calls={d} attn_nulls={d} attn_prefill_nulls={d} attn_decode_nulls={d} norm_nulls={d} f32_kv_calls={d} f32_kv_ok={d} f32_kv_nulls={d} f32_quant_direct_ok={d} f32_quant_direct_fail={d} compressed_f32_reroutes={d} active_bootstrap_misses={d}\n",
                 .{
                     metal_snapshot.provider.compressed_block_gated_calls,

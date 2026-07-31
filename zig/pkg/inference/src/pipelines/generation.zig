@@ -1882,6 +1882,59 @@ pub const NativeDecodeState = struct {
         if (self.kv_storage) |storage| try storage.reserveTokenCapacity(sequence_id, token_capacity);
     }
 
+    /// A1: at compact prefill start (once per generation, before the chunk
+    /// loop), reserve every layer's device KV span capacity for the FINAL
+    /// sequence length — cached prefix + prompt suffix + max_new_tokens, the
+    /// same total the admission estimator sizes the budget for. Reuses the
+    /// per-chunk `reserveLayerKvDeviceCapacity` machinery, so its physical
+    /// block-end capacity math matches the seed path exactly; every later
+    /// per-chunk reserve and seed re-ensure then early-returns (capacity
+    /// already sufficient) and no attention-span KV buffer grows inside an open
+    /// frame. Global (non-sliding) layers, which otherwise grow to full context
+    /// every chunk and strand a KV generation per chunk in the driver, are the
+    /// primary target; ring/sliding layers clamp to their fixed ring span.
+    /// Decode is covered too: global layers stop reallocating per token.
+    /// Compact-only — the caller gates on `ComputeBackend.compactSessionActive`.
+    fn reserveCompactPrefillKvCapacity(self: *NativeDecodeState, config: gpt_mod.Config, final_tokens: usize) !void {
+        if (!self.isPaged()) return;
+        if (final_tokens == 0) return;
+        const storage = self.kv_storage orelse return;
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        try self.ensureAttachedUnlocked();
+        const sequence_id = self.sequence_id orelse return;
+        // One block reservation for the full final length; keeps every layer's
+        // logical-block set (and thus its physical-block-end capacity) stable.
+        try storage.reserveTokenCapacity(sequence_id, final_tokens);
+        const layer_count: usize = @intCast(config.num_hidden_layers);
+        var layer: usize = 0;
+        while (layer < layer_count) : (layer += 1) {
+            const num_kv_heads = config.effectiveKVHeadsForLayer(layer);
+            const head_dim = config.effectiveHeadDimForLayer(layer);
+            const sliding_window: usize = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0;
+            storage.reserveLayerKvDeviceCapacity(
+                sequence_id,
+                layer,
+                final_tokens,
+                0,
+                num_kv_heads,
+                head_dim,
+                sliding_window,
+                self.kv_max_inflight_tokens,
+                self.allow_swa_ring,
+            ) catch |err| switch (err) {
+                // The device hook is best-effort. An unsupported dtype/geometry
+                // or a slot-exhaustion fallback just skips the pre-reservation;
+                // the per-chunk path stays authoritative exactly as before.
+                error.DeviceWriteUnsupported,
+                error.DeviceWriteFormatUnsupported,
+                error.DeviceWriteFallback,
+                => return,
+                else => return err,
+            };
+        }
+    }
+
     fn setPagedKvView(self: *NativeDecodeState, token_count: usize, position_offset: usize) void {
         const sequence_id = self.sequence_id orelse {
             self.kv_view = null;
@@ -4205,7 +4258,19 @@ pub const NativeGenerationPipeline = struct {
                 @max(current_chunk_size, max_speculative_rows),
                 eagerPrefillAllowsSplitSwaRing(self.cb.kind(), prefilled_tokens, config),
             );
+            // A1: compact profile only — pre-reserve every layer's device KV
+            // span capacity for the final sequence length once, before the
+            // chunk loop opens any frame, so no attention-span KV buffer grows
+            // mid-frame and strands a generation of freed device memory.
+            if (self.cb.compactSessionActive()) {
+                const final_tokens = seq_len + @as(usize, @intCast(@max(config.max_tokens, 1)));
+                decode_state.reserveCompactPrefillKvCapacity(self.gpt_config, final_tokens) catch |err| {
+                    debugGenerationStage("executePrefill compact KV pre-reserve failed: {s}", .{@errorName(err)});
+                    return err;
+                };
+            }
             var processed: usize = 0;
+            var compact_chunk_index: usize = 0;
             while (processed < query_len) {
                 var direct_prefill_turn_acquired = false;
                 defer if (direct_prefill_turn_acquired) {
@@ -4240,6 +4305,12 @@ pub const NativeGenerationPipeline = struct {
                                 };
                                 processed = chunk_end;
                                 scheduler.notePrefillProgress(lease, prefilled_tokens + processed, seq_len);
+                                // A3 + A5: the scheduled batch drains its frame
+                                // synchronously, so this is a true chunk
+                                // boundary too — reclaim idle pools and log the
+                                // stranded-memory line before the next chunk.
+                                self.cb.compactPrefillChunkBoundary(compact_chunk_index);
+                                compact_chunk_index += 1;
                                 continue;
                             }
                         }
@@ -4383,6 +4454,12 @@ pub const NativeGenerationPipeline = struct {
                         scheduler.finishTurn(lease, .prefill);
                     }
                 }
+                // A3 + A5: the chunk's frame has drained here. Log stranded
+                // memory and reclaim idle span slots / reset the graph-plan
+                // ratchet (compact-only; no-op otherwise, and self-guarded to
+                // a true no-frame boundary).
+                self.cb.compactPrefillChunkBoundary(compact_chunk_index);
+                compact_chunk_index += 1;
             }
         } else {
             if (prefilled_tokens != 0) return error.UnsupportedShape;

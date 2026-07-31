@@ -686,6 +686,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// scratch-pool slots, out-of-plan graph-plan slots) before expert
     /// eviction. Counts only trims that actually released buffers.
     compact_pool_trims: u64 = 0,
+    /// A6 tripwire: times this compact session engaged the gathered-span f32
+    /// full-KV attention fallback (ledger-invisible KV duplication).
+    compact_gathered_span_fallbacks: u64 = 0,
+    /// A6: gate the one-time loud warning to the first fallback per session.
+    compact_gathered_span_fallback_warned: bool = false,
     compact_step_stats: CompactStepStats = .{},
     next_dynamic_layer_norm_slot: usize = metal_runtime.decoder_runtime_layer_norm_slot_capacity,
     next_dynamic_rms_norm_slot: usize = metal_runtime.decoder_runtime_rms_norm_slot_capacity,
@@ -2920,6 +2925,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (!self.provider_impl.hasDecoderRuntime()) return;
         const runtime = self.provider_impl.raw_decode_runtime orelse return;
+        // A4: the compact profile cannot afford the graph-plan 2x overshoot
+        // against its enforced phys-footprint ceiling — commit exact-fit.
+        if (self.data.compact != null) {
+            _ = metal_runtime.termite_metal_decode_runtime_set_compact_graph_plan_no_overshoot(runtime, 1);
+        }
         const config = storage.storage.config;
         const metal_kv_storage = @import("../backends/metal_kv_storage.zig");
         // The KV storage has no session view; hand it the compact contract's
@@ -2945,6 +2955,60 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             else => return err,
         };
         storage.setDeviceWriteHook(metal_storage.deviceWriteHook());
+    }
+
+    /// A1 gate: true when this backend runs under the compact residency
+    /// contract. The prefill driver uses it to decide whether to pre-reserve
+    /// every layer's KV span capacity once, up front.
+    fn compactSessionActiveOp(ctx: *anyopaque) bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.data.compact != null;
+    }
+
+    /// A3 + A5: chunk-boundary hook for the compact prefill driver. Called
+    /// once per prefill chunk after its frame has drained (no active/submitted
+    /// frame). Prints the allocator-stranded memory line under
+    /// ANTFLY_GEMMA4_COMPACT_TIMING (A5) and reclaims idle span slots + resets
+    /// the graph-plan ratchet (A3). No-op outside the compact profile.
+    fn compactPrefillChunkBoundaryOp(ctx: *anyopaque, chunk_index: usize) void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (self.data.compact == null) return;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return;
+        if (getenvBool("ANTFLY_GEMMA4_COMPACT_TIMING")) {
+            const snapshot = metal_runtime.runtimeMemorySnapshot(runtime);
+            // A5 footprint via the compact ledger's Darwin phys_footprint
+            // sampler — the same signal enforceCompactPressure reads.
+            var footprint_bytes: u64 = 0;
+            if (self.data.compact_runtime) |state| {
+                _ = state.ledger.samplePressure();
+                footprint_bytes = state.ledger.snapshot().observed_footprint_bytes;
+            }
+            const span_bytes = snapshot.attention_span_bytes;
+            const plan_bytes = snapshot.graph_plan_bytes;
+            const retained_bytes = snapshot.frame_retained_bytes;
+            const snapshot_total = snapshot.total_bytes;
+            const resid_bytes: u64 = footprint_bytes -| snapshot_total;
+            const mb = 1024 * 1024;
+            std.debug.print(
+                "gemma4_compact_prefill_mem: chunk={d} footprint_mb={d} snapshot_mb={d} resid_mb={d} span_mb={d} plan_mb={d} retained_mb={d} quant_mb={d} midframe_growths={d} gathered_span_fallbacks={d}\n",
+                .{
+                    chunk_index,
+                    footprint_bytes / mb,
+                    snapshot_total / mb,
+                    resid_bytes / mb,
+                    span_bytes / mb,
+                    plan_bytes / mb,
+                    retained_bytes / mb,
+                    snapshot.quant_linear_bytes / mb,
+                    snapshot.compact_kv_midframe_growths,
+                    self.compact_gathered_span_fallbacks,
+                },
+            );
+        }
+        // A3: reclaim idle span slots and reset the graph-plan ratchet. No-ops
+        // when a frame is still in flight (not a true boundary).
+        const released = metal_runtime.termite_metal_decode_runtime_compact_chunk_boundary_trim(runtime);
+        if (released > 0) self.compact_pool_trims +|= 1;
     }
 
     pub fn deinit(self: *MetalCompute) void {
@@ -10697,6 +10761,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
     }
 
+    /// A6 tripwire: a compact session reached the gathered-span f32 full-KV
+    /// attention fallback. That path materializes a full-context host/device
+    /// KV copy the residency ledger never charges, so it must stay loudly
+    /// visible: count every engagement and warn once per session.
+    fn noteCompactGatheredSpanFallback(self: *MetalCompute) void {
+        if (self.data.compact == null) return;
+        self.compact_gathered_span_fallbacks +|= 1;
+        if (!self.compact_gathered_span_fallback_warned) {
+            self.compact_gathered_span_fallback_warned = true;
+            std.log.warn(
+                "compact session engaged the gathered-span f32 full-KV attention fallback: ledger-invisible KV duplication (device paged-slot attention declined; check KV geometry and TERMITE_METAL_DISABLE_PAGED_SLOT_ATTENTION)",
+                .{},
+            );
+        }
+    }
+
     fn pagedKvLayerFromDeviceHook(
         attention: ops.AttentionContext,
         num_kv_heads: usize,
@@ -11942,6 +12022,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     }
                 }
                 const kv = attention.kv_cache.?;
+                self.noteCompactGatheredSpanFallback();
                 const entry = (try metal_runtime.updateGatheredSpan(
                     self.provider_impl,
                     .{
@@ -12180,6 +12261,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         break :blk .{ gathered_full.?.k, gathered_full.?.v };
                     }
                 }
+                self.noteCompactGatheredSpanFallback();
                 const entry = (try metal_runtime.updateGatheredSpan(
                     self.provider_impl,
                     .{
@@ -20531,6 +20613,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.resident_expert_device_input_reuses = 0;
         self.resident_expert_host_transfers = 0;
         self.compact_pool_trims = 0;
+        self.compact_gathered_span_fallbacks = 0;
+        self.compact_gathered_span_fallback_warned = false;
         metal_runtime.resetExactJitDispatchStats(self.provider_impl.raw_decode_runtime) catch {};
         metal_tensor_mod.resetMemoryStats();
     }
@@ -20622,6 +20706,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_compact_frame_begins = self.compact_frame_begins;
         stats.metal_compact_frame_flushes = self.compact_frame_flushes;
         stats.metal_compact_pool_trims = self.compact_pool_trims;
+        stats.metal_compact_gathered_span_fallbacks = self.compact_gathered_span_fallbacks;
         if (self.data.compact_runtime) |state| {
             const cache_counts = state.cache.counts();
             const occupied = cache_counts.resident + cache_counts.in_flight;
@@ -20658,6 +20743,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_tensor_to_host_calls = tensor_stats.to_host_calls;
         stats.metal_tensor_to_host_device_calls = tensor_stats.to_host_device_calls;
         const runtime_stats = metal_runtime.runtimeMemorySnapshot(self.provider_impl.raw_decode_runtime);
+        stats.metal_compact_kv_midframe_growths = runtime_stats.compact_kv_midframe_growths;
         stats.decoder_runtime_frame_begins = runtime_stats.frame_begin_count -| self.runtime_frame_begin_baseline;
         stats.decoder_runtime_frame_submits = runtime_stats.frame_submit_count -| self.runtime_frame_submit_baseline;
         stats.decoder_runtime_frame_wait_nanos = runtime_stats.frame_wait_nanos -| self.runtime_frame_wait_baseline;
@@ -22282,6 +22368,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.runAttentionResidual = runAttentionResidualOp;
         vt.runAttentionOutputResidual = runAttentionOutputResidualOp;
         vt.provisionKvDeviceWriteHook = provisionKvDeviceWriteHookOp;
+        vt.compactSessionActive = compactSessionActiveOp;
+        vt.compactPrefillChunkBoundary = compactPrefillChunkBoundaryOp;
         vt.runDenseFfnResidual = runDenseFfnResidualOp;
         vt.runDenseDecoderBlock = runDenseDecoderBlockOp;
         vt.runGatedFfnResidual = runGatedFfnResidualOp;

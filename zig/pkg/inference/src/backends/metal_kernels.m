@@ -1358,6 +1358,17 @@ typedef struct termite_metal_decode_runtime {
     uint64_t graph_plan_count;
     uint64_t graph_plan_allocations;
     uint64_t graph_plan_reuses;
+    // Compact profile (A4): when set, graph-plan commits allocate the exact
+    // requested bytes instead of the 2x geometric overshoot, keeping slack
+    // capacity out of the enforced phys-footprint ceiling. Threaded in from
+    // the Zig side via termite_metal_decode_runtime_set_compact_graph_plan_no_overshoot.
+    uint8_t compact_graph_plan_no_overshoot;
+    // Compact profile (A2 verification): number of times an attention-span
+    // slot buffer actually GREW (realloc + copy of an existing buffer) while a
+    // frame was active or submitted. One-shot pre-reservation (A1) should
+    // drive this to zero; any nonzero value means a KV-growth path still runs
+    // inside an open frame and strands the freed buffer until frame drain.
+    uint64_t compact_kv_midframe_growths;
     uint64_t mps_dense_linear_standalone_calls;
     uint64_t mps_dense_linear_active_frame_calls;
     uint64_t mps_dense_linear_standalone_wait_nanos;
@@ -1939,6 +1950,7 @@ typedef struct termite_metal_decode_runtime_memory_stats {
     uint64_t graph_plan_count;
     uint64_t graph_plan_allocations;
     uint64_t graph_plan_reuses;
+    uint64_t compact_kv_midframe_growths;
     uint64_t mps_dense_linear_standalone_calls;
     uint64_t mps_dense_linear_active_frame_calls;
     uint64_t mps_dense_linear_standalone_wait_nanos;
@@ -19635,6 +19647,15 @@ int termite_metal_decode_runtime_begin_graph_plan(termite_metal_decode_runtime *
     return 0;
 }
 
+// A4: opt the compact profile into exact-fit graph-plan allocations (no 2x
+// overshoot). Threaded from the Zig side once per session when the compact
+// contract is active. Idempotent.
+int termite_metal_decode_runtime_set_compact_graph_plan_no_overshoot(termite_metal_decode_runtime *runtime, int enabled) {
+    if (runtime == NULL) return -1;
+    runtime->compact_graph_plan_no_overshoot = enabled != 0 ? 1 : 0;
+    return 0;
+}
+
 int termite_metal_decode_runtime_reserve_graph_plan_slot(
     termite_metal_decode_runtime *runtime,
     size_t slot,
@@ -19647,8 +19668,15 @@ int termite_metal_decode_runtime_reserve_graph_plan_slot(
     return 0;
 }
 
-static size_t termite_metal_decode_runtime_graph_plan_allocation_bytes(size_t current_capacity, size_t requested_bytes) {
+static size_t termite_metal_decode_runtime_graph_plan_allocation_bytes(size_t current_capacity, size_t requested_bytes, bool no_overshoot) {
     if (requested_bytes == 0) return 0;
+    // Compact profile (A4): allocate exactly what was requested. The 2x
+    // overshoot amortizes re-allocations across growth-heavy decode families
+    // but keeps slack device memory pinned in-plan, which the enforced
+    // phys-footprint ceiling cannot afford at the 2 GB floor.
+    if (no_overshoot) {
+        return requested_bytes > current_capacity ? requested_bytes : current_capacity;
+    }
     size_t allocation_bytes = requested_bytes;
     if (current_capacity > 0) {
         if (current_capacity <= SIZE_MAX / 2u && current_capacity * 2u > allocation_bytes) {
@@ -19681,7 +19709,7 @@ int termite_metal_decode_runtime_commit_graph_plan(termite_metal_decode_runtime 
                 trace_reuses += 1;
                 continue;
             }
-            const size_t allocation_bytes = termite_metal_decode_runtime_graph_plan_allocation_bytes(runtime->graph_plan_capacities[slot], bytes);
+            const size_t allocation_bytes = termite_metal_decode_runtime_graph_plan_allocation_bytes(runtime->graph_plan_capacities[slot], bytes, runtime->compact_graph_plan_no_overshoot != 0);
             id<MTLBuffer> buffer = [runtime->device newBufferWithLength:allocation_bytes options:MTLResourceStorageModePrivate];
             if (buffer == nil) return -2;
             runtime->graph_plan_buffers[slot] = buffer;
@@ -23392,6 +23420,7 @@ static int termite_metal_decode_runtime_ensure_attention_span_slot_buffers(
 ) {
     if (runtime == NULL || slot >= TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY) return -1;
     if (encoded_bytes == 0 || v_bytes == 0) return -2;
+    const bool frame_open = runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil;
     @autoreleasepool {
         if (encoded_bytes > runtime->attention_span_encoded_key_capacities[slot] ||
             runtime->attention_span_encoded_key_buffers[slot] == nil)
@@ -23401,6 +23430,10 @@ static int termite_metal_decode_runtime_ensure_attention_span_slot_buffers(
             id<MTLBuffer> buffer = [runtime->device newBufferWithLength:encoded_bytes options:MTLResourceStorageModePrivate];
             if (buffer == nil) return -5;
             if (old_buffer != nil && old_capacity > 0) {
+                // A real grow of an existing buffer: the old block is retained
+                // to the open frame (if any) and only freed at frame drain, so
+                // count it as a mid-frame growth for the A2 gate.
+                if (frame_open) runtime->compact_kv_midframe_growths += 1;
                 if (termite_metal_decode_runtime_copy_grown_buffer(runtime, old_buffer, buffer, old_capacity, -10) != 0) return -10;
             }
             runtime->attention_span_encoded_key_buffers[slot] = buffer;
@@ -23414,6 +23447,7 @@ static int termite_metal_decode_runtime_ensure_attention_span_slot_buffers(
             id<MTLBuffer> buffer = [runtime->device newBufferWithLength:v_bytes options:MTLResourceStorageModePrivate];
             if (buffer == nil) return -6;
             if (old_buffer != nil && old_capacity > 0) {
+                if (frame_open) runtime->compact_kv_midframe_growths += 1;
                 if (termite_metal_decode_runtime_copy_grown_buffer(runtime, old_buffer, buffer, old_capacity, -14) != 0) return -14;
             }
             runtime->attention_span_v_buffers[slot] = buffer;
@@ -45340,10 +45374,41 @@ static void termite_metal_decode_runtime_clear_graph_plan_buffer_aliases(
 //
 // Returns the number of released buffers, 0 when nothing was releasable (or
 // a frame was active), -1 on a missing runtime.
-int termite_metal_decode_runtime_trim_transient_pools(termite_metal_decode_runtime *runtime) {
+// Release the backing buffers for an attention-span slot whose logical KV is
+// empty (slot_tokens == 0: an unused layer or a reset/released tenant). Slot 0
+// mirrors its buffers into standalone fields, so those are cleared too. Only
+// safe with no frame active — the caller guarantees that.
+static void termite_metal_decode_runtime_release_idle_attention_span_slot(termite_metal_decode_runtime *runtime, size_t slot) {
+    runtime->attention_span_encoded_key_buffers[slot] = nil;
+    runtime->attention_span_encoded_key_capacities[slot] = 0;
+    runtime->attention_span_v_buffers[slot] = nil;
+    runtime->attention_span_v_capacities[slot] = 0;
+    if (slot == 0) {
+        runtime->attention_span_encoded_key_buffer = nil;
+        runtime->attention_span_encoded_key_capacity = 0;
+        runtime->attention_span_v_buffer = nil;
+        runtime->attention_span_v_capacity = 0;
+    }
+}
+
+static int termite_metal_decode_runtime_trim_transient_pools_impl(
+    termite_metal_decode_runtime *runtime,
+    bool release_idle_span_slots,
+    bool reset_graph_plan_ratchet
+) {
     if (runtime == NULL) return -1;
     if (runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return 0;
     int released = 0;
+    // A3: dropping the graph-plan ratchet (requested-bytes high-water + active
+    // flag) makes every graph-plan slot out-of-plan so the release loop below
+    // reclaims it; the next chunk's first ensure re-begins and re-commits the
+    // plan. Only used at a true chunk boundary with no frame in flight.
+    if (reset_graph_plan_ratchet) {
+        for (size_t slot = 0; slot < TERMITE_METAL_GRAPH_PLAN_SLOT_CAPACITY; ++slot) {
+            runtime->graph_plan_requested_bytes[slot] = 0;
+        }
+        runtime->graph_plan_active = 0;
+    }
     @autoreleasepool {
         for (size_t slot = 0; slot < TERMITE_METAL_SCRATCH_POOL_CAPACITY; ++slot) {
             if (runtime->scratch_pool_buffers[slot] == nil) continue;
@@ -45363,8 +45428,49 @@ int termite_metal_decode_runtime_trim_transient_pools(termite_metal_decode_runti
             runtime->graph_plan_requested_bytes[slot] = 0;
             released += 1;
         }
+        // A3: release attention-span slot buffers that hold no logical KV.
+        // Restricted to the chunk-boundary caller: during prefill every model
+        // layer is written each chunk, so an idle (slot_tokens == 0) slot at a
+        // boundary is genuinely unused and cannot be a pre-reserved slot whose
+        // first write is still pending inside an open frame.
+        if (release_idle_span_slots) {
+            for (size_t slot = 0; slot < TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY; ++slot) {
+                if (runtime->attention_span_slot_tokens[slot] != 0) continue;
+                if (runtime->attention_span_encoded_key_buffers[slot] == nil &&
+                    runtime->attention_span_v_buffers[slot] == nil) continue;
+                termite_metal_decode_runtime_release_idle_attention_span_slot(runtime, slot);
+                released += 1;
+            }
+        }
     }
     return released;
+}
+
+// Footprint-diet trim for the compact profile's soft-pressure reaction:
+// release transient pool buffers that only exist as high-water reuse caches.
+// Never runs while a frame is active or submitted — with neither, no queued
+// GPU work can still reference these buffers, and every consumer re-reserves
+// (or re-plans) capacity before its next use.
+//
+// Released classes:
+// - scratch-pool slots that are idle (not in use, no pending frame release);
+// - graph-plan slots outside the currently committed plan (all of them when
+//   no plan is active), including the attention-span scratch slots 15/16,
+//   together with every persistent alias into the released buffers so the
+//   next commit truly reallocates.
+//
+// Returns the number of released buffers, 0 when nothing was releasable (or
+// a frame was active), -1 on a missing runtime.
+int termite_metal_decode_runtime_trim_transient_pools(termite_metal_decode_runtime *runtime) {
+    return termite_metal_decode_runtime_trim_transient_pools_impl(runtime, false, false);
+}
+
+// A3 chunk-boundary reclamation for the compact prefill driver. Extends the
+// soft-pressure trim with idle attention-span slot release and a graph-plan
+// ratchet reset so stale (out-of-plan) slots become trimmable between chunks.
+// Only safe at a true chunk boundary with no active/submitted frame.
+int termite_metal_decode_runtime_compact_chunk_boundary_trim(termite_metal_decode_runtime *runtime) {
+    return termite_metal_decode_runtime_trim_transient_pools_impl(runtime, true, true);
 }
 
 // Phase 4 — frame API. See struct declaration for semantics. When a
@@ -46101,6 +46207,7 @@ int termite_metal_decode_runtime_memory_snapshot(
     snapshot->graph_plan_count = runtime->graph_plan_count;
     snapshot->graph_plan_allocations = runtime->graph_plan_allocations;
     snapshot->graph_plan_reuses = runtime->graph_plan_reuses;
+    snapshot->compact_kv_midframe_growths = runtime->compact_kv_midframe_growths;
     snapshot->mps_dense_linear_standalone_calls = runtime->mps_dense_linear_standalone_calls;
     snapshot->mps_dense_linear_active_frame_calls = runtime->mps_dense_linear_active_frame_calls;
     snapshot->mps_dense_linear_standalone_wait_nanos = runtime->mps_dense_linear_standalone_wait_nanos;
