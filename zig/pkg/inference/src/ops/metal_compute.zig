@@ -4370,8 +4370,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     /// Begin-phase acceptance for the device-side MoE route: only single-row
-    /// decode against a fully resident, published layer arena qualifies.
-    /// Never consulted unless ANTFLY_GEMMA4_DEVICE_MOE is set.
+    /// decode against a fully resident, published layer arena qualifies. Reached
+    /// whenever compactDeviceRoutingMode() resolves to .full — the legacy
+    /// ANTFLY_GEMMA4_DEVICE_MOE switch, an explicit device_routing=full contract,
+    /// or device_routing=auto at the 128-slot residency tier. Any not-ready
+    /// condition falls through to the streamed/partial route.
     fn tryBeginCompactDeviceMoe(self: *MetalCompute, request: *const ops.RunMoeBlockRequest) bool {
         if (request.total != 1) return false;
         if (request.top_k == 0 or request.top_k > 8) return false;
@@ -26283,6 +26286,184 @@ test "metal_compute: device MoE topk kernel matches the CPU route selector" {
     }
 }
 
+// T1 — Device route SELECTION parity gate (the one correctness surface the S0
+// FFN harness does not cover). Machine-diffs the DEVICE route selector
+// termite_moe_topk (top-k + softmax in a kernel) against the CPU reference
+// selectCompactMoeRoute on identical 128-expert synthetic router logits. The
+// CPU selector is the fixed reference: it feeds the streamed/partial path,
+// which matches llama.cpp. The full-residency device decode path selects the
+// route entirely on device, so any divergence here (a different 8th expert, a
+// different tie break, or a perturbed softmax weight) reaches the FFN and can
+// flip a token — the same argmax-flip class already closed in the FFN.
+//
+// Selection (expert ids + rank order) MUST be bit-exact: the kernel's stable
+// insertion (skip on `value <= values[top_k-1]`, bubble on strict `>`) and the
+// CPU selector's ascending-id scan with strict `>` both keep the lower expert
+// id on every tie, so on identical f32 logits (selection does no arithmetic,
+// only comparison) the two never disagree. Softmax weights are aligned to the
+// CPU accumulation: same max-subtraction, same rank-order sum, and the device
+// now divides by the sum (was reciprocal-multiply) exactly like the CPU. The
+// only residual weight source is the transcendental exp itself (Metal precise
+// exp on GPU vs Zig @exp / libm on CPU), a cross-ISA difference of at most a
+// couple ULP that cannot be bit-aligned; this test measures it precisely.
+//
+// Coverage: (1) clean well-separated logits; (2) near-ties at the 8/9 boundary
+// one ULP apart (larger id wins the 8th slot); (3) exact ties at the boundary
+// and an all-equal row (lowest ids win); (4) a near-tie INSIDE the top-k (rank
+// order stability); (5) realistic-scale pseudo-random rows (genuine near-ties).
+test "metal_compute: device MoE topk route selection is bit-exact to the CPU selector (128 experts)" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    const metal_runtime = MetalCompute.metal_runtime;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const runtime = metal_runtime.termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_decode_runtime_destroy(runtime);
+    if (metal_runtime.termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const num_experts: usize = 128;
+    const top_k: usize = 8;
+    const rows: usize = 12;
+
+    const logits = try allocator.alloc(f32, rows * num_experts);
+    defer allocator.free(logits);
+
+    const ulpUp = struct {
+        fn f(x: f32) f32 {
+            return @bitCast(@as(u32, @bitCast(x)) +% 1);
+        }
+    }.f;
+    const Lcg = struct {
+        state: u64,
+        fn next(self: *@This()) u64 {
+            self.state = self.state *% 6364136223846793005 +% 1442695040888963407;
+            return self.state >> 33;
+        }
+        // Realistic router logit in ~[-12, 12], quantized to 1/256 so most
+        // experts separate cleanly but genuine near-ties still occur.
+        fn logit(self: *@This()) f32 {
+            const q: i32 = @intCast(self.next() % 6145);
+            return @as(f32, @floatFromInt(q - 3072)) / 256.0;
+        }
+    };
+
+    // Row 0: clean, well-separated — distinct floor plus 8 scattered peaks.
+    {
+        const r = logits[0 * num_experts ..][0..num_experts];
+        for (r, 0..) |*v, i| v.* = -0.01 * @as(f32, @floatFromInt(i));
+        const peaks = [_][2]f32{
+            .{ 11, 9.0 }, .{ 97, 8.5 }, .{ 3, 8.0 }, .{ 64, 7.5 },
+            .{ 120, 7.0 }, .{ 42, 6.5 }, .{ 8, 6.0 }, .{ 77, 5.5 },
+        };
+        for (peaks) |p| r[@intFromFloat(p[0])] = p[1];
+    }
+    // Row 1: near-tie at the 8th/9th boundary, one ULP apart — id 41 = id 40 + 1
+    // ULP, so id 41 takes the 8th slot and id 40 is excluded, on both selectors.
+    {
+        const r = logits[1 * num_experts ..][0..num_experts];
+        for (r, 0..) |*v, i| v.* = -3.0 - 0.01 * @as(f32, @floatFromInt(i));
+        const highs = [_]usize{ 5, 19, 33, 47, 61, 75, 89 };
+        for (highs, 0..) |id, k| r[id] = 4.0 - 0.1 * @as(f32, @floatFromInt(k));
+        r[40] = 2.0;
+        r[41] = ulpUp(2.0);
+    }
+    // Row 2: exact tie at the boundary — id 40 and id 41 equal, so the lower id
+    // (40) takes the 8th slot on both selectors.
+    {
+        const r = logits[2 * num_experts ..][0..num_experts];
+        for (r, 0..) |*v, i| v.* = -3.0 - 0.01 * @as(f32, @floatFromInt(i));
+        const highs = [_]usize{ 5, 19, 33, 47, 61, 75, 89 };
+        for (highs, 0..) |id, k| r[id] = 4.0 - 0.1 * @as(f32, @floatFromInt(k));
+        r[40] = 2.0;
+        r[41] = 2.0;
+    }
+    // Row 3: exact-tie cluster at the boundary — 6 clear highs then 5 experts
+    // equal at 1.0; the 2 lowest cluster ids (100, 101) fill slots 7 and 8.
+    {
+        const r = logits[3 * num_experts ..][0..num_experts];
+        for (r, 0..) |*v, i| v.* = -5.0 - 0.001 * @as(f32, @floatFromInt(i));
+        const highs = [_]usize{ 2, 13, 24, 35, 46, 57 };
+        for (highs, 0..) |id, k| r[id] = 3.0 - 0.1 * @as(f32, @floatFromInt(k));
+        for ([_]usize{ 100, 101, 102, 103, 104 }) |id| r[id] = 1.0;
+    }
+    // Row 4: all experts equal — top-8 must be the 8 lowest ids (0..7).
+    {
+        const r = logits[4 * num_experts ..][0..num_experts];
+        for (r) |*v| v.* = 1.0;
+    }
+    // Row 5: near-tie INSIDE the top-k — id 63 = 3.0 + 1 ULP ranks immediately
+    // above id 49 = 3.0; both selectors must order id 63 before id 49.
+    {
+        const r = logits[5 * num_experts ..][0..num_experts];
+        for (r, 0..) |*v, i| v.* = -2.0 - 0.01 * @as(f32, @floatFromInt(i));
+        const ids_in = [_]usize{ 7, 21, 35, 49, 63, 77, 91, 105 };
+        for (ids_in, 0..) |id, k| r[id] = 5.0 - 0.2 * @as(f32, @floatFromInt(k));
+        r[49] = 3.0;
+        r[63] = ulpUp(3.0);
+    }
+    // Rows 6..11: realistic-scale pseudo-random logits (fine-grained, so genuine
+    // boundary near-ties arise naturally).
+    for (6..rows) |row| {
+        var lcg = Lcg{ .state = 0x9E3779B97F4A7C15 ^ (@as(u64, row) *% 0xD1B54A32D192ED03) };
+        const r = logits[row * num_experts ..][0..num_experts];
+        for (r) |*v| v.* = lcg.logit();
+    }
+
+    var ids: [12 * 8]u32 = undefined;
+    var weights: [12 * 8]f32 = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_moe_topk_host(
+        runtime,
+        logits.ptr,
+        rows,
+        num_experts,
+        top_k,
+        &ids,
+        &weights,
+    ));
+
+    var expert_mismatches: usize = 0;
+    var weight_mismatches: usize = 0;
+    var max_weight_ulp: u32 = 0;
+    var max_weight_abs: f32 = 0;
+    for (0..rows) |row| {
+        const row_logits = logits[row * num_experts ..][0..num_experts];
+        const route = MetalCompute.selectCompactMoeRoute(row_logits, top_k) orelse
+            return error.TestUnexpectedResult;
+        for (0..top_k) |rank| {
+            const cpu_id = route.indices[rank];
+            const dev_id = ids[row * top_k + rank];
+            if (cpu_id != dev_id) {
+                expert_mismatches += 1;
+                std.debug.print(
+                    "T1 route mismatch: row {d} rank {d}: cpu_id={d} dev_id={d}\n",
+                    .{ row, rank, cpu_id, dev_id },
+                );
+            }
+            const cpu_w = route.weights[rank];
+            const dev_w = weights[row * top_k + rank];
+            const cb: u32 = @bitCast(cpu_w);
+            const db: u32 = @bitCast(dev_w);
+            if (cb != db) {
+                weight_mismatches += 1;
+                const ulp = if (cb > db) cb - db else db - cb;
+                if (ulp > max_weight_ulp) max_weight_ulp = ulp;
+                const abs = @abs(cpu_w - dev_w);
+                if (abs > max_weight_abs) max_weight_abs = abs;
+            }
+        }
+    }
+
+    std.debug.print(
+        "T1 device-topk parity: rows={d} top_k={d} experts={d} | expert_mismatches={d} | weight_lanes_differ={d}/{d} max_ulp={d} max_abs={e}\n",
+        .{ rows, top_k, num_experts, expert_mismatches, weight_mismatches, rows * top_k, max_weight_ulp, max_weight_abs },
+    );
+
+    // Selection must be exact: same experts in the same rank order.
+    try std.testing.expectEqual(@as(usize, 0), expert_mismatches);
+    // Softmax weights: after aligning the normalize to CPU division the only
+    // residual is the GPU-vs-CPU exp implementation, bounded to a couple ULP.
+    try std.testing.expect(max_weight_ulp <= 2);
+}
+
 fn testEncodeQ4_0Matrix(allocator: std.mem.Allocator, rows: usize, cols: usize, seed: u64) ![]u8 {
     const values = try allocator.alloc(f32, rows * cols);
     defer allocator.free(values);
@@ -26943,6 +27124,326 @@ test "metal_compute: device MoE Q4_0 fused chain matches streamed chain bit-for-
         // the existing 2e-3 approx test already qualifies the device path).
         return error.SkipZigTest;
     }
+}
+
+// T2 — Full device MoE chain end-to-end certification. Composes the T1 routing
+// parity (device termite_moe_topk selects the same route as the CPU selector)
+// with the S0 FFN parity (device gate_up/activation-multiply/down/reduce is
+// bit-exact given an identical route) into a full-chain proof for the
+// full-residency device decode path.
+//
+// Three outputs from the SAME synthetic logits + expert weights:
+//   streamed   — CPU selectCompactMoeRoute -> streamed per-slot FFN chain
+//                (q4_0 pair -> activation -> multiply -> q4_0 down -> expert
+//                scale -> route weight -> rank-ordered adds). The reference.
+//   prerouted  — the fused DEVICE FFN fed the exact CPU route (device topk
+//                skipped). Isolates the FFN + combine kernels.
+//   full       — moe_forward_q4_0_host: the device topk kernel selects the
+//                route on-GPU, then the same fused device FFN runs. This is the
+//                production full-residency path with zero host route readback.
+//
+// Asserts: (1) the device topk route (ids + rank order) is IDENTICAL to the CPU
+// route — the correctness surface; (2) prerouted == streamed BIT-FOR-BIT — the
+// FFN + combine add nothing given an identical route; (3) full vs streamed
+// differs only by the softmax-weight exp residual (device precise exp vs CPU
+// @exp, <= 2 ulp per weight from T1), which propagates through the combine to a
+// tiny relative output difference — never an expert-selection difference.
+test "metal_compute: full device MoE chain (device topk -> FFN) matches streamed chain" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    const metal_runtime = MetalCompute.metal_runtime;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    const provider = metal_compute.provider_impl;
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    if (metal_runtime.termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+
+    const Shape = struct { hidden: usize, inter: usize, layer: usize };
+    const shapes = [_]Shape{
+        .{ .hidden = 64, .inter = 32, .layer = 0 },
+        .{ .hidden = 2816, .inter = 704, .layer = 1 },
+    };
+    const num_experts: usize = 4;
+    const top_k: usize = 3;
+    const gelu_kind: u32 = @intFromEnum(backend_contracts.DecoderRuntimeActivationKind.gelu);
+
+    var any_selection_mismatch = false;
+    var any_prerouted_mismatch = false;
+    var any_full_vs_prerouted_mismatch = false;
+    var worst_full_rel: f32 = 0;
+
+    for (shapes) |shape| {
+        const hidden = shape.hidden;
+        const inter = shape.inter;
+        const gate_bytes = inter * (hidden / 32) * 18;
+        const down_bytes = hidden * (inter / 32) * 18;
+        const per_expert = 2 * gate_bytes + down_bytes;
+
+        var expert_raw = try allocator.alloc([]u8, num_experts);
+        defer {
+            for (expert_raw) |raw| allocator.free(raw);
+            allocator.free(expert_raw);
+        }
+        for (0..num_experts) |expert| {
+            const raw = try allocator.alloc(u8, per_expert);
+            const gate = try testEncodeQ4_0Matrix(allocator, inter, hidden, 11 + expert * 101 + shape.layer * 7919);
+            defer allocator.free(gate);
+            const up = try testEncodeQ4_0Matrix(allocator, inter, hidden, 29 + expert * 101 + shape.layer * 7919);
+            defer allocator.free(up);
+            const down = try testEncodeQ4_0Matrix(allocator, hidden, inter, 47 + expert * 101 + shape.layer * 7919);
+            defer allocator.free(down);
+            @memcpy(raw[0..gate_bytes], gate);
+            @memcpy(raw[gate_bytes .. 2 * gate_bytes], up);
+            @memcpy(raw[2 * gate_bytes ..], down);
+            expert_raw[expert] = raw;
+        }
+
+        var arena = try c_file.MmapRegion.initAnonymous(std.mem.alignForward(usize, num_experts * per_expert, 16 * 1024));
+        defer arena.deinit();
+        for (0..num_experts) |expert| {
+            @memcpy(arena.data[expert * per_expert ..][0..per_expert], expert_raw[expert]);
+        }
+        var offsets = try allocator.alloc(u32, num_experts);
+        defer allocator.free(offsets);
+        for (0..num_experts) |expert| offsets[expert] = @intCast(expert * per_expert);
+        const projection_offsets = [3]usize{ 0, gate_bytes, 2 * gate_bytes };
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_prepare_moe_q4_0_layer_arena(
+            runtime,
+            shape.layer,
+            arena.data.ptr,
+            arena.data.len,
+            offsets.ptr,
+            num_experts,
+            per_expert,
+            projection_offsets[0],
+            projection_offsets[1],
+            projection_offsets[2],
+            hidden,
+            inter,
+        ));
+
+        const input = try allocator.alloc(f32, hidden);
+        defer allocator.free(input);
+        for (input, 0..) |*value, i| {
+            value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6)) * 0.05;
+        }
+        const input_shape = [_]i32{ 1, @intCast(hidden) };
+        var input_dev = try MetalTensor.deviceAllocate(runtime, input.len * @sizeOf(f32), .shared, &input_shape);
+        defer input_dev.deinit();
+        try MetalTensor.borrowed(input.ptr, input.len, &input_shape).copyInto(&input_dev);
+
+        // top-3 selects experts {2,1,0} in rank order with distinct weights.
+        const logits = [_]f32{ 1.0, 2.5, 3.0, 0.5 };
+        const route = MetalCompute.selectCompactMoeRoute(&logits, top_k) orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, top_k), route.count);
+        const expert_scales = [_]f32{ 0.75, 1.5, 1.25, 0.5 };
+
+        // --- Streamed reference (CPU route -> streamed per-slot chain). ---
+        const streamed_out = try allocator.alloc(f32, hidden);
+        defer allocator.free(streamed_out);
+        {
+            var accumulated: ?MetalTensor = null;
+            defer if (accumulated) |*t| t.deinit();
+            for (0..route.count) |rank| {
+                const expert: usize = @intCast(route.indices[rank]);
+                const raw = expert_raw[expert];
+                var down = (try testStreamedMoeExpertDown(
+                    provider,
+                    input_dev,
+                    raw[0..gate_bytes],
+                    raw[gate_bytes .. 2 * gate_bytes],
+                    raw[2 * gate_bytes ..],
+                    hidden,
+                    inter,
+                    rank * 3 + 0,
+                    rank * 3 + 1,
+                    rank * 3 + 2,
+                    .gelu,
+                    &metal_compute.timing_stats,
+                    allocator,
+                )) orelse return error.SkipZigTest;
+                defer down.deinit();
+                var expert_scaled = (try metal_runtime.decoderRuntimeApplyScale(
+                    provider,
+                    down,
+                    expert_scales[expert],
+                )) orelse return error.SkipZigTest;
+                defer expert_scaled.deinit();
+                var scaled = (try metal_runtime.decoderRuntimeApplyScale(
+                    provider,
+                    expert_scaled,
+                    route.weights[rank],
+                )) orelse return error.SkipZigTest;
+                if (accumulated) |*current| {
+                    const added = (try metal_runtime.decoderRuntimeApplyAdd(provider, .{
+                        .lhs = current.*,
+                        .rhs = scaled,
+                        .dim = hidden,
+                    }, &metal_compute.timing_stats)) orelse {
+                        scaled.deinit();
+                        return error.SkipZigTest;
+                    };
+                    current.deinit();
+                    scaled.deinit();
+                    accumulated = added;
+                } else {
+                    accumulated = scaled;
+                }
+            }
+            var result = accumulated orelse return error.SkipZigTest;
+            const host = try result.toHostSlice();
+            @memcpy(streamed_out, host[0..hidden]);
+        }
+
+        // --- Device route via the topk kernel; must equal the CPU route. ---
+        var dev_ids: [8]u32 = undefined;
+        var dev_weights: [8]f32 = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_moe_topk_host(
+            runtime,
+            &logits,
+            1,
+            num_experts,
+            top_k,
+            &dev_ids,
+            &dev_weights,
+        ));
+        for (0..top_k) |rank| {
+            if (route.indices[rank] != dev_ids[rank]) any_selection_mismatch = true;
+        }
+
+        // --- Pre-routed device FFN (CPU route): expect bit-for-bit vs streamed. ---
+        var cpu_ids: [8]u32 = undefined;
+        var cpu_weights: [8]f32 = undefined;
+        for (0..route.count) |rank| {
+            cpu_ids[rank] = route.indices[rank];
+            cpu_weights[rank] = route.weights[rank];
+        }
+        const prerouted_out = try allocator.alloc(f32, hidden);
+        defer allocator.free(prerouted_out);
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_moe_forward_q4_0_prerouted_host(
+            runtime,
+            shape.layer,
+            input.ptr,
+            &cpu_ids,
+            &cpu_weights,
+            1,
+            hidden,
+            inter,
+            num_experts,
+            top_k,
+            gelu_kind,
+            metal_runtime.moe_addressing_indirect,
+            &expert_scales,
+            prerouted_out.ptr,
+        ));
+
+        // --- Full device chain (device topk -> fused device FFN). ---
+        const full_out = try allocator.alloc(f32, hidden);
+        defer allocator.free(full_out);
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_moe_forward_q4_0_host(
+            runtime,
+            shape.layer,
+            input.ptr,
+            &logits,
+            1,
+            hidden,
+            inter,
+            num_experts,
+            top_k,
+            gelu_kind,
+            metal_runtime.moe_addressing_indirect,
+            &expert_scales,
+            full_out.ptr,
+        ));
+
+        // --- Pre-routed device FFN fed the DEVICE route (ids + device weights).
+        // Isolates the full chain's only moving part: if this equals full_out
+        // bit-for-bit, the full path's FFN is the identical kernel chain and the
+        // sole difference vs streamed is the device-computed route itself. ---
+        const prerouted_dev_out = try allocator.alloc(f32, hidden);
+        defer allocator.free(prerouted_dev_out);
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_moe_forward_q4_0_prerouted_host(
+            runtime,
+            shape.layer,
+            input.ptr,
+            dev_ids[0..top_k].ptr,
+            dev_weights[0..top_k].ptr,
+            1,
+            hidden,
+            inter,
+            num_experts,
+            top_k,
+            gelu_kind,
+            metal_runtime.moe_addressing_indirect,
+            &expert_scales,
+            prerouted_dev_out.ptr,
+        ));
+
+        // Pre-routed device FFN (CPU route) is bit-for-bit with the streamed chain.
+        var prerouted_mismatch: usize = 0;
+        for (0..hidden) |i| {
+            if (@as(u32, @bitCast(prerouted_out[i])) != @as(u32, @bitCast(streamed_out[i]))) prerouted_mismatch += 1;
+        }
+        if (prerouted_mismatch != 0) any_prerouted_mismatch = true;
+
+        // Full chain == pre-routed FFN fed the device route, BIT-FOR-BIT: proves
+        // the full path adds nothing beyond selecting the route on device.
+        var full_vs_prerouted_dev: usize = 0;
+        for (0..hidden) |i| {
+            if (@as(u32, @bitCast(full_out[i])) != @as(u32, @bitCast(prerouted_dev_out[i]))) full_vs_prerouted_dev += 1;
+        }
+        if (full_vs_prerouted_dev != 0) any_full_vs_prerouted_mismatch = true;
+
+        // Full chain vs streamed: the residual is only the <=2 ulp softmax-weight
+        // exp difference propagated through the combine. Report it against the
+        // output vector scale (a per-lane relative metric is meaningless where
+        // combine cancellation drives a lane near zero).
+        var full_lane_diff: usize = 0;
+        var full_max_abs: f32 = 0;
+        var out_scale: f32 = 0;
+        for (0..hidden) |i| {
+            if (@as(u32, @bitCast(full_out[i])) != @as(u32, @bitCast(streamed_out[i]))) full_lane_diff += 1;
+            const d = @abs(full_out[i] - streamed_out[i]);
+            if (d > full_max_abs) full_max_abs = d;
+            const m = @abs(streamed_out[i]);
+            if (m > out_scale) out_scale = m;
+        }
+        const vec_rel = if (out_scale > 0) full_max_abs / out_scale else full_max_abs;
+        if (vec_rel > worst_full_rel) worst_full_rel = vec_rel;
+
+        std.debug.print(
+            "T2 full-chain: hidden={d} inter={d} | selection cpu=[{d},{d},{d}] dev=[{d},{d},{d}] | prerouted(cpu)==streamed diff={d}/{d} | full==prerouted(dev) diff={d}/{d} | full_vs_streamed lanes={d}/{d} max_abs={e} out_scale={e} vec_rel={e}\n",
+            .{
+                hidden,                inter,
+                route.indices[0],      route.indices[1],
+                route.indices[2],      dev_ids[0],
+                dev_ids[1],            dev_ids[2],
+                prerouted_mismatch,    hidden,
+                full_vs_prerouted_dev, hidden,
+                full_lane_diff,        hidden,
+                full_max_abs,          out_scale,
+                vec_rel,
+            },
+        );
+    }
+
+    // The device topk selects exactly the CPU route (the correctness surface).
+    try std.testing.expect(!any_selection_mismatch);
+    // Given that identical route, the fused device FFN + combine is bit-for-bit
+    // with the streamed chain (composes S0 through the production host entry).
+    try std.testing.expect(!any_prerouted_mismatch);
+    // The full device chain is bit-for-bit the pre-routed FFN fed the device
+    // route: the only difference vs streamed is the device-selected route.
+    try std.testing.expect(!any_full_vs_prerouted_mismatch);
+    // That residual is only the <=2 ulp softmax-weight exp difference, a tiny
+    // perturbation relative to the output scale, never a routing difference.
+    try std.testing.expect(worst_full_rel <= 1e-5);
 }
 
 test "metal_compute: causal self attention is owned by metal backend" {

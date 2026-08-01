@@ -4798,11 +4798,19 @@ static NSString *termite_metal_shader_source(void) {
            //     returns null when the weight sum is non-finite).
            //   * All -inf rows: CPU returns null (route selection fails);
            //     this kernel emits all-zero weights (sum == 0 guard).
-           //   * Weight rounding: CPU divides each weight by the sum; this
-           //     kernel multiplies by the reciprocal (<= 1 ulp difference),
-           //     and Metal precise exp() may differ from Zig @exp by ~1 ulp.
+           //   * Weight rounding: SELECTION (expert ids + rank order) is bit-
+           //     exact — both keep the lower id on every tie and neither does
+           //     any arithmetic during selection. The softmax weights are
+           //     aligned to the CPU accumulation: same max-subtraction, same
+           //     rank-order sum, and this kernel now DIVIDES by the sum (was a
+           //     reciprocal-multiply) exactly like selectCompactMoeRoute. The
+           //     sole residual is the transcendental exp itself — Metal precise
+           //     exp() on the GPU vs Zig @exp / libm expf on the CPU — a cross-
+           //     ISA difference the T1 harness measures at <= 2 ulp (max abs
+           //     ~3e-8). Apple GPUs have no fp64, so this cannot be narrowed to
+           //     bit-equality; the ids the FFN routes on are identical.
            "kernel void termite_moe_topk(device const float *logits [[buffer(0)]], device uint *expert_ids [[buffer(1)]], device float *route_weights [[buffer(2)]], constant termite_metal_moe_topk_params &p [[buffer(3)]], uint row [[thread_position_in_grid]]) {\n"
-           "    if (row >= p.rows || p.top_k == 0u || p.top_k > 8u) return; float values[8]; uint ids[8]; for (uint k = 0u; k < 8u; ++k) { values[k] = -INFINITY; ids[k] = 0u; } uint base = row * p.num_experts; for (uint expert = 0u; expert < p.num_experts; ++expert) { float value = logits[base + expert]; if (value <= values[p.top_k - 1u]) continue; uint at = p.top_k - 1u; while (at > 0u && value > values[at - 1u]) { values[at] = values[at - 1u]; ids[at] = ids[at - 1u]; --at; } values[at] = value; ids[at] = expert; } float max_value = values[0]; float sum = 0.0f; for (uint k = 0u; k < p.top_k; ++k) { float weight = exp(values[k] - max_value); values[k] = weight; sum += weight; } float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f; for (uint k = 0u; k < p.top_k; ++k) { uint route = row * p.top_k + k; expert_ids[route] = ids[k]; route_weights[route] = values[k] * inv_sum; } }\n"
+           "    if (row >= p.rows || p.top_k == 0u || p.top_k > 8u) return; float values[8]; uint ids[8]; for (uint k = 0u; k < 8u; ++k) { values[k] = -INFINITY; ids[k] = 0u; } uint base = row * p.num_experts; for (uint expert = 0u; expert < p.num_experts; ++expert) { float value = logits[base + expert]; if (value <= values[p.top_k - 1u]) continue; uint at = p.top_k - 1u; while (at > 0u && value > values[at - 1u]) { values[at] = values[at - 1u]; ids[at] = ids[at - 1u]; --at; } values[at] = value; ids[at] = expert; } float max_value = values[0]; float sum = 0.0f; for (uint k = 0u; k < p.top_k; ++k) { float weight = exp(values[k] - max_value); values[k] = weight; sum += weight; } for (uint k = 0u; k < p.top_k; ++k) { uint route = row * p.top_k + k; expert_ids[route] = ids[k]; route_weights[route] = sum > 0.0f ? values[k] / sum : 0.0f; } }\n"
            // Q4_0 raw gate + raw up per (route, out_element), NO activation.
            // BIT-EXACT with the STREAMED per-slot decode chain. Two things make
            // it bit-identical to termite_q4_0_pair_linear_1x_reduce (the pair
