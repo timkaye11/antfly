@@ -4802,22 +4802,37 @@ static NSString *termite_metal_shader_source(void) {
            //     and Metal precise exp() may differ from Zig @exp by ~1 ulp.
            "kernel void termite_moe_topk(device const float *logits [[buffer(0)]], device uint *expert_ids [[buffer(1)]], device float *route_weights [[buffer(2)]], constant termite_metal_moe_topk_params &p [[buffer(3)]], uint row [[thread_position_in_grid]]) {\n"
            "    if (row >= p.rows || p.top_k == 0u || p.top_k > 8u) return; float values[8]; uint ids[8]; for (uint k = 0u; k < 8u; ++k) { values[k] = -INFINITY; ids[k] = 0u; } uint base = row * p.num_experts; for (uint expert = 0u; expert < p.num_experts; ++expert) { float value = logits[base + expert]; if (value <= values[p.top_k - 1u]) continue; uint at = p.top_k - 1u; while (at > 0u && value > values[at - 1u]) { values[at] = values[at - 1u]; ids[at] = ids[at - 1u]; --at; } values[at] = value; ids[at] = expert; } float max_value = values[0]; float sum = 0.0f; for (uint k = 0u; k < p.top_k; ++k) { float weight = exp(values[k] - max_value); values[k] = weight; sum += weight; } float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f; for (uint k = 0u; k < p.top_k; ++k) { uint route = row * p.top_k + k; expert_ids[route] = ids[k]; route_weights[route] = values[k] * inv_sum; } }\n"
-           // Q4_0 gate/up + gated activation per (route, out_element). Mirrors
-           // the dovinmu termite_moe_q4_k_gate_up_reduce structure (route via
-           // tg.y, expert via expert_ids) with the Q4_0 dot math taken from
-           // termite_q4_0_pair_activation_mmv_impl above. The expert's weight
-           // region is resolved either flat (expert * expert_stride) or
-           // through the expert_slot_offsets byte table; unmapped experts
-           // write zero contributions.
-           "kernel void termite_moe_q4_0_gate_up_reduce(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device const uint *expert_ids [[buffer(2)]], device const uint *expert_slot_offsets [[buffer(3)]], device float *output [[buffer(4)]], constant termite_metal_moe_q4_0_gate_up_params &p [[buffer(5)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
-           "    const uint NR0 = 4u; const uint NSG = 2u; const uint NQ = 16u; const uint NW = 32u; uint route = tg.y; uint first_o = (tg.x * NSG + uint(sgitg)) * NR0; if (route >= p.route_rows || lane >= NW) return;\n"
+           // Q4_0 raw gate + raw up per (route, out_element), NO activation.
+           // BIT-EXACT with the STREAMED per-slot decode chain. Two things make
+           // it bit-identical to termite_q4_0_pair_linear_1x_reduce (the pair
+           // kernel the streamed decode path runs):
+           //   1. Same reduction tiling: NR0=2, NSG=4, block stride NSG*NQ=64,
+           //      two-level simdgroup reduction (identical accumulation order).
+           //   2. Same math mode: this kernel is built from `library` (the same
+           //      library the streamed pair/down kernels use), so the compiler
+           //      makes identical fma-contraction/reassociation choices. Building
+           //      it from precise_library instead leaves a ~1 ULP delta.
+           // Because the streamed activation (termite_apply_activation_1x) is the
+           // one streamed step that genuinely needs precise math, the activation
+           // is NOT fused here: this kernel emits RAW gate -> `output` and RAW up
+           // -> `output_up`, and the caller then runs the precise activation +
+           // the (library) elementwise multiply as separate passes, exactly like
+           // the streamed chain. The 8-expert batching stays an OUTER dimension
+           // (route via tg.y), preserving the batched-dispatch speedup. The
+           // expert's weight region is resolved either flat (expert *
+           // expert_stride) or through the expert_slot_offsets byte table;
+           // unmapped experts write zero gate AND zero up.
+           "kernel void termite_moe_q4_0_gate_up_reduce(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device const uint *expert_ids [[buffer(2)]], device const uint *expert_slot_offsets [[buffer(3)]], device float *output [[buffer(4)]], constant termite_metal_moe_q4_0_gate_up_params &p [[buffer(5)]], device float *output_up [[buffer(6)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    const uint NR0 = 2u; const uint NSG = 4u; const uint NQ = 16u; const uint NW = 32u; uint route = tg.y; uint first_o = tg.x * NR0; if (route >= p.route_rows || lane >= NW) return;\n"
            "    uint expert = expert_ids[route]; uint input_row = p.top_k == 0u ? 0u : route / p.top_k; ulong expert_base = 0ul; bool mapped = expert < p.expert_count && input_row < p.total_rows;\n"
            "    if (mapped) { if (p.addressing_mode == 1u) { uint table_offset = expert_slot_offsets[expert]; if (table_offset == 0xFFFFFFFFu) { mapped = false; } else { expert_base = ulong(table_offset); } } else { expert_base = ulong(expert) * ulong(p.expert_stride); } }\n"
-           "    if (!mapped) { if (lane == 0u) { uint idx = route * p.out_dim + first_o; for (uint row = 0u; row < NR0; ++row) { if (first_o + row < p.out_dim) output[idx + row] = 0.0f; } } return; }\n"
+           "    if (!mapped) { if (lane == 0u && sgitg == 0u) { uint idx = route * p.out_dim + first_o; if (first_o < p.out_dim) { output[idx] = 0.0f; output_up[idx] = 0.0f; } if (first_o + 1u < p.out_dim) { output[idx + 1u] = 0.0f; output_up[idx + 1u] = 0.0f; } } return; }\n"
            "    device const uchar *weight_gate = weight + expert_base + ulong(p.gate_offset); device const uchar *weight_up = weight + expert_base + ulong(p.up_offset);\n"
-           "    uint ix = lane / (NW / NQ); uint il = (lane - ix * (NW / NQ)) * 8u; uint in_row = input_row * p.in_dim; float gate[4] = {0.0f, 0.0f, 0.0f, 0.0f}; float up[4] = {0.0f, 0.0f, 0.0f, 0.0f};\n"
-           "    for (uint b = ix; b < p.row_blocks; b += NQ) { float yl[16]; float sumy = 0.0f; uint in_off = in_row + b * 32u + il; for (uint i = 0u; i < 8u; i += 2u) { float x0 = input[in_off + i]; float x1 = input[in_off + i + 1u]; float x16 = input[in_off + 16u + i]; float x17 = input[in_off + 16u + i + 1u]; sumy += x0 + x1 + x16 + x17; yl[i] = x0; yl[i + 1u] = x1 / 256.0f; yl[i + 8u] = x16 / 16.0f; yl[i + 9u] = x17 / 4096.0f; } for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o >= p.out_dim) continue; uint off = o * p.row_blocks * 18u + b * 18u; ushort gate_bits = (ushort(weight_gate[off + 1u]) << 8) | ushort(weight_gate[off]); ushort up_bits = (ushort(weight_up[off + 1u]) << 8) | ushort(weight_up[off]); float d_gate = float(as_type<half>(gate_bits)); float d_up = float(as_type<half>(up_bits)); const device ushort *qs_gate = reinterpret_cast<const device ushort *>(weight_gate + off + 2u) + (il >> 1); const device ushort *qs_up = reinterpret_cast<const device ushort *>(weight_up + off + 2u) + (il >> 1); float qacc_gate = 0.0f; float qacc_up = 0.0f; for (uint i = 0u; i < 8u; i += 2u) { uint packed_gate = uint(qs_gate[i >> 1]); uint packed_up = uint(qs_up[i >> 1]); qacc_gate += yl[i] * float(packed_gate & 0x000Fu); qacc_gate += yl[i + 1u] * float(packed_gate & 0x0F00u); qacc_gate += yl[i + 8u] * float(packed_gate & 0x00F0u); qacc_gate += yl[i + 9u] * float(packed_gate & 0xF000u); qacc_up += yl[i] * float(packed_up & 0x000Fu); qacc_up += yl[i + 1u] * float(packed_up & 0x0F00u); qacc_up += yl[i + 8u] * float(packed_up & 0x00F0u); qacc_up += yl[i + 9u] * float(packed_up & 0xF000u); } gate[row] += d_gate * (qacc_gate - 8.0f * sumy); up[row] += d_up * (qacc_up - 8.0f * sumy); } }\n"
-           "    for (uint row = 0u; row < NR0; ++row) { gate[row] = simd_sum(gate[row]); up[row] = simd_sum(up[row]); } if (lane == 0u) { uint idx = route * p.out_dim + first_o; for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o < p.out_dim) output[idx + row] = termite_gated_activation_product(gate[row], up[row], p.activation_kind); } }\n"
+           "    uint ix = lane / (NW / NQ); uint il = (lane - ix * (NW / NQ)) * 8u; uint ib0 = sgitg * NQ + ix; uint in_row = input_row * p.in_dim; float gate0 = 0.0f; float gate1 = 0.0f; float up0 = 0.0f; float up1 = 0.0f;\n"
+           "    for (uint b = ib0; b < p.row_blocks; b += NSG * NQ) { float yl[16]; float sumy = 0.0f; uint in_off = in_row + b * 32u + il; for (uint i = 0u; i < 8u; i += 2u) { float x0 = input[in_off + i]; float x1 = input[in_off + i + 1u]; float x16 = input[in_off + 16u + i]; float x17 = input[in_off + 16u + i + 1u]; sumy += x0 + x1 + x16 + x17; yl[i] = x0; yl[i + 1u] = x1 / 256.0f; yl[i + 8u] = x16 / 16.0f; yl[i + 9u] = x17 / 4096.0f; } for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o >= p.out_dim) continue; uint off = o * p.row_blocks * 18u + b * 18u; ushort gate_bits = (ushort(weight_gate[off + 1u]) << 8) | ushort(weight_gate[off]); ushort up_bits = (ushort(weight_up[off + 1u]) << 8) | ushort(weight_up[off]); float d_gate = float(as_type<half>(gate_bits)); float d_up = float(as_type<half>(up_bits)); const device ushort *qs_gate = reinterpret_cast<const device ushort *>(weight_gate + off + 2u) + (il >> 1); const device ushort *qs_up = reinterpret_cast<const device ushort *>(weight_up + off + 2u) + (il >> 1); float qacc_gate = 0.0f; float qacc_up = 0.0f; for (uint i = 0u; i < 8u; i += 2u) { uint packed_gate = uint(qs_gate[i >> 1]); uint packed_up = uint(qs_up[i >> 1]); qacc_gate += yl[i] * float(packed_gate & 0x000Fu); qacc_gate += yl[i + 1u] * float(packed_gate & 0x0F00u); qacc_gate += yl[i + 8u] * float(packed_gate & 0x00F0u); qacc_gate += yl[i + 9u] * float(packed_gate & 0xF000u); qacc_up += yl[i] * float(packed_up & 0x000Fu); qacc_up += yl[i + 1u] * float(packed_up & 0x0F00u); qacc_up += yl[i + 8u] * float(packed_up & 0x00F0u); qacc_up += yl[i + 9u] * float(packed_up & 0xF000u); } if (row == 0u) { gate0 += d_gate * (qacc_gate - 8.0f * sumy); up0 += d_up * (qacc_up - 8.0f * sumy); } else { gate1 += d_gate * (qacc_gate - 8.0f * sumy); up1 += d_up * (qacc_up - 8.0f * sumy); } } }\n"
+           "    if (sgitg == 0u) { shmem[lane] = 0.0f; shmem[32u + lane] = 0.0f; shmem[64u + lane] = 0.0f; shmem[96u + lane] = 0.0f; } gate0 = simd_sum(gate0); gate1 = simd_sum(gate1); up0 = simd_sum(up0); up1 = simd_sum(up1); threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    if (lane == 0u) { shmem[sgitg] = gate0; shmem[32u + sgitg] = gate1; shmem[64u + sgitg] = up0; shmem[96u + sgitg] = up1; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    float total_gate0 = simd_sum(shmem[lane]); float total_gate1 = simd_sum(shmem[32u + lane]); float total_up0 = simd_sum(shmem[64u + lane]); float total_up1 = simd_sum(shmem[96u + lane]); if (lane == 0u && sgitg == 0u) { uint idx = route * p.out_dim + first_o; if (first_o < p.out_dim) { output[idx] = total_gate0; output_up[idx] = total_up0; } if (first_o + 1u < p.out_dim) { output[idx + 1u] = total_gate1; output_up[idx + 1u] = total_up1; } }\n"
            "}\n"
            // Q4_0 down projection per route; same expert resolution as the
            // gate/up kernel, dot math from termite_q4_0_linear_1x_reduce.
@@ -4832,13 +4847,21 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint row = 0u; row < NR0; ++row) { acc[row] = simd_sum(acc[row]); } if (lane == 0u) { uint idx = route * p.out_dim + first_o; for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o < p.out_dim) output[idx + row] = acc[row]; } }\n"
            "}\n"
            // Weighted rank-ordered combine, ported from the dovinmu
-           // termite_moe_reduce with one deliberate change: the multiply order
-           // here is (value * expert_scale) * route_weight, accumulated in
-           // rank order, matching this branch's CPU parity semantics
-           // (runCompactMoeChunkGrouped / llama.cpp ordering). The dovinmu
-           // original computed route_weight * scale * value, which rounds
-           // differently in f32.
+           // termite_moe_reduce with two deliberate changes:
+           //   1. Multiply order (value * expert_scale) * route_weight,
+           //      accumulated in rank order, matching this branch's CPU parity
+           //      semantics (runCompactMoeChunkGrouped / llama.cpp ordering).
+           //      The dovinmu original computed route_weight * scale * value.
+           //   2. fp contract(off): the STREAMED chain materialises each scale
+           //      (down*expert_scale, then *route_weight) and each add through
+           //      separate elementwise kernels, so every intermediate is rounded
+           //      to f32. This single fused kernel would otherwise fma-contract
+           //      `value + (t1*route_weight)`, dropping that rounding and drifting
+           //      ~1 ULP. Disabling contraction here restores the per-step
+           //      rounding and makes the combine bit-identical to the streamed
+           //      scale/scale/add sequence.
            "kernel void termite_moe_reduce(device const float *route_output [[buffer(0)]], device const uint *expert_ids [[buffer(1)]], device const float *route_weights [[buffer(2)]], device const float *expert_scale [[buffer(3)]], device float *output [[buffer(4)]], constant termite_metal_moe_reduce_params &p [[buffer(5)]], uint gid [[thread_position_in_grid]]) {\n"
+           "#pragma clang fp contract(off)\n"
            "    uint total = p.rows * p.dim; if (gid >= total) return; uint row = gid / p.dim; uint col = gid % p.dim; float value = 0.0f; uint route_base = row * p.top_k; for (uint k = 0u; k < p.top_k; ++k) { uint route = route_base + k; float scale = p.has_expert_scale != 0u ? expert_scale[expert_ids[route]] : 1.0f; value += (route_output[route * p.dim + col] * scale) * route_weights[route]; } output[gid] = value; }\n"
            "kernel void termite_q4_0_pair_activation_1x_reduce(device const float *input [[buffer(0)]], device const uchar *weight_gate [[buffer(1)]], device const uchar *weight_up [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    const uint NR0 = 4u; const uint NSG = 4u; const uint NQ = 16u; const uint NW = 32u; uint first_o = (tg.x * NSG + sgitg) * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
@@ -18628,12 +18651,18 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->antfly_q4_0_small_batch_pipeline = termite_metal_make_pipeline(device, library, @"antfly_q4_0_small_batch_msl_v1");
         runtime->q4_0_pair_pipeline = termite_metal_make_pipeline(device, library, @"termite_q4_0_pair_linear");
         runtime->q4_0_pair_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_q4_0_pair_linear_1x_reduce");
-        // MoE math lives in the precise library so router weights and the
-        // rank-ordered combine keep deterministic f32 rounding (same library
-        // choice as the dovinmu topk/gate-up/reduce kernels).
+        // The router top-k/softmax and the rank-ordered combine stay in the
+        // precise library so router weights and the combine keep deterministic
+        // f32 rounding (the combine must NOT fma-contract (v*scale)*weight into
+        // the running sum, matching the streamed scale/scale/add kernels).
+        // The gate/up and down DOT kernels, however, are built from the SAME
+        // `library` as the streamed pair/down kernels they must bit-match:
+        // identical math mode => identical fma-contraction => bit-identical
+        // reduction. The activation is de-fused (run as the precise
+        // activation_pipeline pass) so the gate/up kernel needs no precise math.
         runtime->moe_topk_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_moe_topk");
-        runtime->moe_q4_0_gate_up_reduce_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_moe_q4_0_gate_up_reduce");
-        runtime->moe_q4_0_down_reduce_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_moe_q4_0_down_reduce");
+        runtime->moe_q4_0_gate_up_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_moe_q4_0_gate_up_reduce");
+        runtime->moe_q4_0_down_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_moe_q4_0_down_reduce");
         runtime->moe_reduce_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_moe_reduce");
         runtime->q4_0_pair_activation_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_q4_0_pair_activation_1x_reduce");
         if (runtime->q4_0_pair_activation_fusion_enabled) {
@@ -24536,7 +24565,9 @@ int termite_metal_decode_runtime_moe_forward_q4_0_device(
     if (runtime->moe_topk_pipeline == nil ||
         runtime->moe_q4_0_gate_up_reduce_pipeline == nil ||
         runtime->moe_q4_0_down_reduce_pipeline == nil ||
-        runtime->moe_reduce_pipeline == nil) return -2;
+        runtime->moe_reduce_pipeline == nil ||
+        runtime->activation_pipeline == nil ||
+        runtime->multiply_pipeline == nil) return -2;
     if (termite_metal_decode_runtime_moe_q4_0_layer_arena_prepared(
             runtime, layer, num_experts, hidden_size, inter_size) == 0) return -3;
     if (total_rows == 0 || top_k == 0 || top_k > 8 || top_k > num_experts) return -4;
@@ -24652,9 +24683,51 @@ int termite_metal_decode_runtime_moe_forward_q4_0_device(
         [moe_encoder setBuffer:offsets_buffer offset:0 atIndex:3];
         [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:4];
         [moe_encoder setBytes:&gate_up_params length:sizeof(gate_up_params) atIndex:5];
-        // NR0=4, NSG=2: each 64-thread group covers 8 output elements.
-        [moe_encoder dispatchThreadgroups:MTLSizeMake((inter_size + 7u) / 8u, route_rows, 1)
-            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        // Raw up lands in the route-output buffer (reused as scratch; it is
+        // hidden-wide so it holds route_rows*inter_size floats and is not read
+        // until the down projection overwrites it).
+        [moe_encoder setBuffer:runtime->moe_route_output_buffer offset:0 atIndex:6];
+        // NR0=2, NSG=4: each 128-thread group cooperatively reduces 2 output
+        // elements (two-level simdgroup reduction) to bit-match the streamed
+        // termite_q4_0_pair_linear_1x_reduce accumulation order. shmem holds
+        // 4 partials * 32 lanes = 128 floats.
+        [moe_encoder setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
+        [moe_encoder dispatchThreadgroups:MTLSizeMake((inter_size + 1u) / 2u, route_rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // De-fused activation + elementwise multiply, matching the streamed
+        // chain bit-for-bit: precise termite_apply_activation_1x on the raw gate
+        // (in place), then the library termite_apply_multiply_1x of the
+        // activated gate by the raw up. The gated result overwrites the
+        // intermediate buffer and becomes the down projection's input.
+        termite_metal_apply_activation_params moe_act_params = {
+            .activation_kind = activation_kind,
+            .rows = (uint32_t)route_rows,
+            .dim = (uint32_t)inter_size,
+        };
+        const size_t moe_gated_total = route_rows * inter_size;
+        [moe_encoder setComputePipelineState:runtime->activation_pipeline];
+        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:0];
+        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:1];
+        [moe_encoder setBytes:&moe_act_params length:sizeof(moe_act_params) atIndex:2];
+        [moe_encoder dispatchThreads:MTLSizeMake(moe_gated_total, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, moe_gated_total), 1, 1)];
+        [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        termite_metal_apply_add_params moe_mul_params = {
+            .rows = (uint32_t)route_rows,
+            .dim = (uint32_t)inter_size,
+            .flags = 0u,
+            .reserved = 0u,
+        };
+        [moe_encoder setComputePipelineState:runtime->multiply_pipeline];
+        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:0];
+        [moe_encoder setBuffer:runtime->moe_route_output_buffer offset:0 atIndex:1];
+        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:2];
+        [moe_encoder setBytes:&moe_mul_params length:sizeof(moe_mul_params) atIndex:3];
+        [moe_encoder dispatchThreads:MTLSizeMake(moe_gated_total, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, moe_gated_total), 1, 1)];
         [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
         termite_metal_moe_q4_0_down_params down_params = {
@@ -24763,7 +24836,9 @@ int termite_metal_decode_runtime_moe_forward_q4_0_from_ids(
         route_weights == NULL || output_handle == NULL) return -1;
     if (runtime->moe_q4_0_gate_up_reduce_pipeline == nil ||
         runtime->moe_q4_0_down_reduce_pipeline == nil ||
-        runtime->moe_reduce_pipeline == nil) return -2;
+        runtime->moe_reduce_pipeline == nil ||
+        runtime->activation_pipeline == nil ||
+        runtime->multiply_pipeline == nil) return -2;
     if (termite_metal_decode_runtime_moe_q4_0_layer_arena_prepared(
             runtime, layer, num_experts, hidden_size, inter_size) == 0) return -3;
     if (total_rows == 0 || top_k == 0 || top_k > 8 || top_k > num_experts) return -4;
@@ -24863,8 +24938,47 @@ int termite_metal_decode_runtime_moe_forward_q4_0_from_ids(
         [moe_encoder setBuffer:offsets_buffer offset:0 atIndex:3];
         [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:4];
         [moe_encoder setBytes:&gate_up_params length:sizeof(gate_up_params) atIndex:5];
-        [moe_encoder dispatchThreadgroups:MTLSizeMake((inter_size + 7u) / 8u, route_rows, 1)
-            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        // Raw up lands in the route-output buffer (reused as scratch; it is
+        // hidden-wide so it holds route_rows*inter_size floats and is not read
+        // until the down projection overwrites it).
+        [moe_encoder setBuffer:runtime->moe_route_output_buffer offset:0 atIndex:6];
+        [moe_encoder setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
+        [moe_encoder dispatchThreadgroups:MTLSizeMake((inter_size + 1u) / 2u, route_rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // De-fused activation + elementwise multiply, matching the streamed
+        // chain bit-for-bit: precise termite_apply_activation_1x on the raw gate
+        // (in place), then the library termite_apply_multiply_1x of the
+        // activated gate by the raw up. The gated result overwrites the
+        // intermediate buffer and becomes the down projection's input.
+        termite_metal_apply_activation_params moe_act_params = {
+            .activation_kind = activation_kind,
+            .rows = (uint32_t)route_rows,
+            .dim = (uint32_t)inter_size,
+        };
+        const size_t moe_gated_total = route_rows * inter_size;
+        [moe_encoder setComputePipelineState:runtime->activation_pipeline];
+        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:0];
+        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:1];
+        [moe_encoder setBytes:&moe_act_params length:sizeof(moe_act_params) atIndex:2];
+        [moe_encoder dispatchThreads:MTLSizeMake(moe_gated_total, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, moe_gated_total), 1, 1)];
+        [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        termite_metal_apply_add_params moe_mul_params = {
+            .rows = (uint32_t)route_rows,
+            .dim = (uint32_t)inter_size,
+            .flags = 0u,
+            .reserved = 0u,
+        };
+        [moe_encoder setComputePipelineState:runtime->multiply_pipeline];
+        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:0];
+        [moe_encoder setBuffer:runtime->moe_route_output_buffer offset:0 atIndex:1];
+        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:2];
+        [moe_encoder setBytes:&moe_mul_params length:sizeof(moe_mul_params) atIndex:3];
+        [moe_encoder dispatchThreads:MTLSizeMake(moe_gated_total, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, moe_gated_total), 1, 1)];
         [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
         termite_metal_moe_q4_0_down_params down_params = {
@@ -25061,7 +25175,9 @@ int termite_metal_decode_runtime_moe_forward_q4_0_prerouted_host(
         route_weights == NULL || output == NULL) return -1;
     if (runtime->moe_q4_0_gate_up_reduce_pipeline == nil ||
         runtime->moe_q4_0_down_reduce_pipeline == nil ||
-        runtime->moe_reduce_pipeline == nil) return -2;
+        runtime->moe_reduce_pipeline == nil ||
+        runtime->activation_pipeline == nil ||
+        runtime->multiply_pipeline == nil) return -2;
     if (termite_metal_decode_runtime_moe_q4_0_layer_arena_prepared(
             runtime, layer, num_experts, hidden_size, inter_size) == 0) return -3;
     if (total_rows == 0 || top_k == 0 || top_k > 8 || top_k > num_experts) return -4;
@@ -25142,8 +25258,47 @@ int termite_metal_decode_runtime_moe_forward_q4_0_prerouted_host(
         [moe_encoder setBuffer:offsets_buffer offset:0 atIndex:3];
         [moe_encoder setBuffer:intermediate_buffer offset:0 atIndex:4];
         [moe_encoder setBytes:&gate_up_params length:sizeof(gate_up_params) atIndex:5];
-        [moe_encoder dispatchThreadgroups:MTLSizeMake((inter_size + 7u) / 8u, route_rows, 1)
-            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        // Raw up lands in the route-output buffer (reused as scratch; it is
+        // hidden-wide so it holds route_rows*inter_size floats and is not read
+        // until the down projection overwrites it).
+        [moe_encoder setBuffer:route_output_buffer offset:0 atIndex:6];
+        [moe_encoder setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
+        [moe_encoder dispatchThreadgroups:MTLSizeMake((inter_size + 1u) / 2u, route_rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // De-fused activation + elementwise multiply, matching the streamed
+        // chain bit-for-bit: precise termite_apply_activation_1x on the raw gate
+        // (in place), then the library termite_apply_multiply_1x of the
+        // activated gate by the raw up. The gated result overwrites the
+        // intermediate buffer and becomes the down projection's input.
+        termite_metal_apply_activation_params moe_act_params = {
+            .activation_kind = activation_kind,
+            .rows = (uint32_t)route_rows,
+            .dim = (uint32_t)inter_size,
+        };
+        const size_t moe_gated_total = route_rows * inter_size;
+        [moe_encoder setComputePipelineState:runtime->activation_pipeline];
+        [moe_encoder setBuffer:intermediate_buffer offset:0 atIndex:0];
+        [moe_encoder setBuffer:intermediate_buffer offset:0 atIndex:1];
+        [moe_encoder setBytes:&moe_act_params length:sizeof(moe_act_params) atIndex:2];
+        [moe_encoder dispatchThreads:MTLSizeMake(moe_gated_total, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, moe_gated_total), 1, 1)];
+        [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        termite_metal_apply_add_params moe_mul_params = {
+            .rows = (uint32_t)route_rows,
+            .dim = (uint32_t)inter_size,
+            .flags = 0u,
+            .reserved = 0u,
+        };
+        [moe_encoder setComputePipelineState:runtime->multiply_pipeline];
+        [moe_encoder setBuffer:intermediate_buffer offset:0 atIndex:0];
+        [moe_encoder setBuffer:route_output_buffer offset:0 atIndex:1];
+        [moe_encoder setBuffer:intermediate_buffer offset:0 atIndex:2];
+        [moe_encoder setBytes:&moe_mul_params length:sizeof(moe_mul_params) atIndex:3];
+        [moe_encoder dispatchThreads:MTLSizeMake(moe_gated_total, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, moe_gated_total), 1, 1)];
         [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
         termite_metal_moe_q4_0_down_params down_params = {
