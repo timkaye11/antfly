@@ -4135,6 +4135,43 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return getenvBool("ANTFLY_GEMMA4_DEVICE_MOE");
     }
 
+    const CompactDeviceRoutingMode = enum { off, full, partial };
+
+    /// Test env override of the device-routing policy: ANTFLY_GEMMA4_DEVICE_ROUTING
+    /// = off|full|partial. Null when unset or unrecognized.
+    fn deviceRoutingEnvOverride() ?CompactDeviceRoutingMode {
+        if (comptime @import("builtin").os.tag == .freestanding) return null;
+        const c = @cImport(@cInclude("stdlib.h"));
+        const value = c.getenv("ANTFLY_GEMMA4_DEVICE_ROUTING") orelse return null;
+        const slice = std.mem.span(value);
+        if (std.ascii.eqlIgnoreCase(slice, "off")) return .off;
+        if (std.ascii.eqlIgnoreCase(slice, "full")) return .full;
+        if (std.ascii.eqlIgnoreCase(slice, "partial")) return .partial;
+        return null;
+    }
+
+    /// Resolve the effective device-routing mode. The test env override wins,
+    /// then the legacy ANTFLY_GEMMA4_DEVICE_MOE full switch, then the frozen
+    /// contract's `device_routing` (auto = full at the 128-slot tier, else
+    /// partial). Default off keeps the streamed executor.
+    fn compactDeviceRoutingMode(self: *MetalCompute) CompactDeviceRoutingMode {
+        if (deviceRoutingEnvOverride()) |mode| return mode;
+        if (getenvBool("ANTFLY_GEMMA4_DEVICE_MOE")) return .full;
+        if (self.data.compact) |config| {
+            return switch (config.device_routing) {
+                .off => .off,
+                .full => .full,
+                .partial => .partial,
+                .auto => if (@as(usize, config.expert_cache_slots) == compact_expert_slot_capacity) .full else .partial,
+            };
+        }
+        return .off;
+    }
+
+    fn compactPartialDeviceRoutingEnabled(self: *MetalCompute) bool {
+        return self.compactDeviceRoutingMode() == .partial;
+    }
+
     const CompactFullArenaGeometry = struct {
         per_expert: usize,
         gate_bytes: usize,
@@ -4421,6 +4458,187 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!joined_step_frame) try self.submitAndWaitDecoderRuntimeFrame(runtime, &frame_active);
         self.compact_device_moe_layers += 1;
         return output;
+    }
+
+    /// Publish this layer's partial-residency pool arena as a device MoE layer
+    /// arena once: the shared pool no-copy buffer (routed through the cached
+    /// wrap so it is the same MTLBuffer the streamed slots use) plus an
+    /// all-sentinel per-expert offset table. Per-token, `set_offset` points the
+    /// routed experts at their resident slot sub-ranges. Returns true when the
+    /// layer arena is prepared and ready for the from-ids forward.
+    fn ensureCompactPoolDeviceArena(
+        self: *MetalCompute,
+        state: *gpu_hosted_store_mod.CompactRuntimeState,
+        request: *const ops.RunMoeBlockRequest,
+    ) !bool {
+        const layer = request.layer_index;
+        if (layer >= compact_expert_layer_count) return false;
+        if (layer >= metal_runtime.decoder_runtime_moe_layer_capacity) return false;
+        const num_experts = request.num_experts;
+        if (num_experts == 0 or num_experts > compact_expert_slot_capacity) return false;
+        if (metal_runtime.decoderRuntimeMoeLayerArenaPrepared(
+            self.provider_impl,
+            layer,
+            num_experts,
+            request.hidden_size,
+            request.inter_size,
+        )) return true;
+        // The pool is created on the first miss in the layer; a layer only
+        // reaches the all-resident device route after earlier misses filled it.
+        const pool = if (state.layer_pools[layer]) |*value| value else return false;
+        const geometry = compactFullArenaGeometry(request) orelse return false;
+        var offsets: [compact_expert_slot_capacity]u32 = undefined;
+        for (offsets[0..num_experts]) |*value| value.* = metal_runtime.moe_expert_slot_unmapped;
+        const projection_offsets = [3]usize{ 0, geometry.gate_bytes, geometry.gate_bytes * 2 };
+        return metal_runtime.decoderRuntimePrepareMoeQ40LayerArena(
+            self.provider_impl,
+            layer,
+            pool.data,
+            offsets[0..num_experts],
+            compact_expert_arena_bytes,
+            projection_offsets,
+            request.hidden_size,
+            request.inter_size,
+        ) catch false;
+    }
+
+    /// All-resident-layer device FFN from the CPU-selected route. Runs only in
+    /// the post-drain window (the router readback in begin flushed and waited,
+    /// so no in-flight frame references the offset table or route ring). Points
+    /// each routed expert at its resident slot sub-range, then encodes the
+    /// batched gate_up -> down -> reduce chain joined to the decode-step frame.
+    /// Returns null (fall back to streamed) on any not-ready condition.
+    fn tryFinishCompactPartialDeviceRoute(
+        self: *MetalCompute,
+        request: *const ops.RunMoeBlockRequest,
+        pending: *PendingCompactMoeRoute,
+        compact_timing: bool,
+    ) !?CT {
+        const state = self.data.compact_runtime orelse return null;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        if (!(try self.ensureCompactPoolDeviceArena(state, request))) return null;
+
+        // Drain-before-mutate invariant: the layer's router readback already
+        // submitted and waited on everything encoded since the previous drain,
+        // so nothing in flight references the offset table or route ring here.
+        std.debug.assert(!metal_runtime.hasSubmittedFrame(runtime));
+
+        // Point each routed expert at its current resident slot sub-range.
+        for (pending.plan.slice()) |entry| {
+            const offset: u32 = @intCast(entry.ref.slot * compact_expert_arena_bytes);
+            if (!metal_runtime.decoderRuntimeMoeLayerArenaSetOffset(
+                self.provider_impl,
+                request.layer_index,
+                entry.expert_index,
+                offset,
+            )) return null;
+        }
+
+        var input_device = try self.ownedDeviceMetalTensorFromCt(request.input);
+        defer input_device.deinit();
+        if (!input_device.isDevice() or input_device.elemCount() != request.hidden_size) return null;
+
+        var scale_device: ?MetalTensor = null;
+        defer if (scale_device) |*tensor| tensor.deinit();
+        if (request.expert_scale) |scale| {
+            scale_device = (try self.compactDeviceMoeScaleTensor(
+                scale,
+                request.layer_index,
+                request.num_experts,
+            )) orelse return null;
+        }
+
+        var ids: [8]u32 = undefined;
+        var weights: [8]f32 = undefined;
+        for (0..pending.route.count) |k| {
+            ids[k] = pending.route.indices[k];
+            weights[k] = pending.route.weights[k];
+        }
+
+        const joined_step_frame = self.decode_step_frame_active and metal_runtime.hasActiveFrame(runtime);
+        var frame_active = if (joined_step_frame) false else try self.beginDecoderRuntimeFrame(runtime);
+        if (!joined_step_frame and !frame_active) return null;
+        defer self.cancelDecoderRuntimeFrame(runtime, &frame_active);
+
+        for (pending.plan.slice()) |entry| pending.state.cache.beginUse(entry.ref) catch {};
+        defer for (pending.plan.slice()) |entry| pending.state.cache.endUse(entry.ref) catch {};
+
+        var output = (try metal_runtime.decoderRuntimeMoeForwardQ40FromIds(
+            self.provider_impl,
+            request.layer_index,
+            input_device,
+            ids[0..pending.route.count],
+            weights[0..pending.route.count],
+            1,
+            request.hidden_size,
+            request.inter_size,
+            request.num_experts,
+            request.top_k,
+            @intFromEnum(request.activation),
+            scale_device,
+        )) orelse return null;
+        errdefer output.deinit();
+        if (!joined_step_frame) try self.submitAndWaitDecoderRuntimeFrame(runtime, &frame_active);
+        self.compact_device_moe_layers += 1;
+
+        // Dual-execute verify (ANTFLY_GEMMA4_DEVICE_ROUTING_VERIFY): only when
+        // the device route ran standalone (the flag also disables the decode
+        // step frame) so both outputs are host-readable. Never changes tokens.
+        if (!joined_step_frame and getenvBool("ANTFLY_GEMMA4_DEVICE_ROUTING_VERIFY")) {
+            self.verifyCompactPartialDeviceRoute(request, pending, input_device, &output) catch {};
+        }
+        if (compact_timing) {
+            std.debug.print(
+                "gemma4_device_route_layer: layer={d} experts={d} joined_frame={}\n",
+                .{ request.layer_index, pending.route.count, joined_step_frame },
+            );
+        }
+        return try self.ctFromOwnedMetalTensor(output);
+    }
+
+    /// Debug dual-execute check: run the streamed per-slot chain for the same
+    /// route and bitwise-compare against the device from-ids output. Both are
+    /// standalone (verify disables the step frame), so each is host-readable.
+    /// Pure diagnostic — logs the divergence and never affects generation.
+    fn verifyCompactPartialDeviceRoute(
+        self: *MetalCompute,
+        request: *const ops.RunMoeBlockRequest,
+        pending: *PendingCompactMoeRoute,
+        input_device: MetalTensor,
+        device_output: *MetalTensor,
+    ) !void {
+        const expert_scales: ?[]f32 = if (request.expert_scale) |scale|
+            try toFloat32Op(@ptrCast(self), scale, self.allocator)
+        else
+            null;
+        defer if (expert_scales) |scales| self.allocator.free(scales);
+        var streamed = (try self.runCompactMoeRowPrepared(
+            request,
+            input_device,
+            pending.route,
+            &pending.route_slots,
+            expert_scales,
+            false,
+            0,
+            0,
+            pending.hits_before,
+            pending.misses_before,
+        )) orelse return;
+        defer streamed.deinit();
+        const dev_host = try device_output.toHostSlice();
+        const ref_host = try streamed.toHostSlice();
+        const n = @min(dev_host.len, ref_host.len);
+        var lanes_differ: usize = 0;
+        var max_abs: f32 = 0;
+        for (0..n) |i| {
+            const d = @abs(dev_host[i] - ref_host[i]);
+            if (@as(u32, @bitCast(dev_host[i])) != @as(u32, @bitCast(ref_host[i]))) lanes_differ += 1;
+            if (d > max_abs) max_abs = d;
+        }
+        std.debug.print(
+            "gemma4_device_route_verify: layer={d} lanes_differ={d}/{d} max_abs_diff={e}\n",
+            .{ request.layer_index, lanes_differ, n, max_abs },
+        );
     }
 
     /// Grouped-expert chunk execution: route every row, group the
@@ -4868,11 +5086,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return false;
         }
 
-        // Device-side MoE route (default OFF): with a fully resident layer
-        // arena the router logits stay on the GPU, so the readback flush,
-        // the CPU route selection, and the per-slot residency plan below are
-        // all skipped for this layer.
-        if (!self.compact_device_moe_bypass and deviceMoeEnabled() and
+        // Fully device-side MoE route (default OFF): with a 128/128 resident
+        // layer arena the router logits stay on the GPU, so the readback
+        // flush, the CPU route selection, and the per-slot residency plan
+        // below are all skipped for this layer. Partial-residency device
+        // routing keeps the CPU route source and branches in finish instead.
+        if (!self.compact_device_moe_bypass and self.compactDeviceRoutingMode() == .full and
             self.tryBeginCompactDeviceMoe(request))
         {
             return true;
@@ -4954,6 +5173,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return null;
         }
         const residency_ns = if (compact_timing) monotonicNowNs() - residency_started_at else 0;
+
+        // Partial-residency device route: for an all-resident layer, run the
+        // batched device FFN from the CPU-selected route instead of the
+        // streamed per-slot chain (which is ~50 tiny dispatches). Joined to the
+        // decode-step frame, so the next layer's router readback submits it.
+        // Any not-ready condition falls through to the streamed path below.
+        if (pending.plan.miss_count == 0 and self.compactPartialDeviceRoutingEnabled()) {
+            if (try self.tryFinishCompactPartialDeviceRoute(request, &pending, compact_timing)) |ct| {
+                return ct;
+            }
+        }
 
         const input_was_device = if (toBuf(request.input).metal_tensor) |tensor| tensor.isDevice() else false;
         var input_device = try self.ownedDeviceMetalTensorFromCt(request.input);
@@ -20664,6 +20894,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (self.data.compact_runtime == null) return false;
         if (getenvBool("ANTFLY_GEMMA4_DISABLE_DECODE_STEP_FRAME")) return false;
+        // Device-routing verify runs the device and streamed chains standalone
+        // and reads both back, which needs each MoE op outside the step frame.
+        if (getenvBool("ANTFLY_GEMMA4_DEVICE_ROUTING_VERIFY")) return false;
         if (self.decode_step_frame_active) return false;
         const runtime = self.provider_impl.raw_decode_runtime orelse return false;
         if (metal_runtime.hasActiveFrame(runtime) or metal_runtime.hasSubmittedFrame(runtime)) return false;

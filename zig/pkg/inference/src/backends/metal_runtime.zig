@@ -15123,6 +15123,31 @@ pub extern fn termite_metal_decode_runtime_moe_q4_0_layer_arena_prepared(
     hidden_size: usize,
     inter_size: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_moe_layer_arena_set_offset(
+    runtime: ?*RawMetalDecodeRuntime,
+    layer: usize,
+    expert_id: usize,
+    offset: u32,
+) c_int;
+pub extern fn termite_metal_decode_runtime_moe_forward_q4_0_from_ids(
+    runtime: ?*RawMetalDecodeRuntime,
+    layer: usize,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    expert_ids: [*c]const u32,
+    route_weights: [*c]const f32,
+    total_rows: usize,
+    hidden_size: usize,
+    inter_size: usize,
+    num_experts: usize,
+    top_k: usize,
+    activation_kind: u32,
+    addressing_mode: u32,
+    expert_scale_handle: ?*anyopaque,
+    expert_scale_offset: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_moe_forward_q4_0_device(
     runtime: ?*RawMetalDecodeRuntime,
     layer: usize,
@@ -19315,6 +19340,89 @@ pub fn decoderRuntimeMoeForwardQ40(
         input.deviceByteOffset(),
         router_logits.deviceHandle(),
         router_logits.deviceByteOffset(),
+        total_rows,
+        hidden_size,
+        inter_size,
+        num_experts,
+        top_k,
+        activation_kind,
+        moe_addressing_indirect,
+        if (expert_scale) |scale| scale.deviceHandle() else null,
+        if (expert_scale) |scale| scale.deviceByteOffset() else 0,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc != 0) {
+        output.deinit();
+        return null;
+    }
+    return output;
+}
+
+/// Point one expert at its byte offset (slot sub-range) in a prepared layer
+/// arena's shared offset table, or the unmapped sentinel. Incremental,
+/// idempotent, and only valid in the post-drain window (no in-flight frame may
+/// reference the table). Returns false on any precondition/bounds failure.
+pub fn decoderRuntimeMoeLayerArenaSetOffset(
+    self: anytype,
+    layer: usize,
+    expert_id: usize,
+    offset: u32,
+) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    return termite_metal_decode_runtime_moe_layer_arena_set_offset(
+        runtime,
+        layer,
+        expert_id,
+        offset,
+    ) == 0;
+}
+
+/// Device-side routed-expert MoE forward from a host-selected route
+/// (expert_ids + normalized weights) against a prepared layer arena: no device
+/// topk, no router readback. The host route is published into a shared ring
+/// and the gate_up -> down -> reduce chain runs with indirect addressing.
+/// Encodes into the active frame when one is open. Returns null on any
+/// precondition failure so callers can fall back to the streamed slot route.
+pub fn decoderRuntimeMoeForwardQ40FromIds(
+    self: anytype,
+    layer: usize,
+    input: MetalTensor,
+    expert_ids: []const u32,
+    route_weights: []const f32,
+    total_rows: usize,
+    hidden_size: usize,
+    inter_size: usize,
+    num_experts: usize,
+    top_k: usize,
+    activation_kind: u32,
+    expert_scale: ?MetalTensor,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (total_rows == 0 or hidden_size == 0 or inter_size == 0 or num_experts == 0) return null;
+    if (top_k == 0 or top_k > 8) return null;
+    if (!input.isDevice()) return null;
+    if (input.elemCount() < total_rows * hidden_size) return null;
+    if (expert_ids.len < total_rows * top_k or route_weights.len < total_rows * top_k) return null;
+    if (expert_scale) |scale| {
+        if (!scale.isDevice() or scale.elemCount() < num_experts) return null;
+    }
+    const shape = [_]i32{ @intCast(total_rows), @intCast(hidden_size) };
+    var output = try MetalTensor.deviceAllocate(
+        runtime,
+        total_rows * hidden_size * @sizeOf(f32),
+        .private,
+        &shape,
+    );
+    errdefer output.deinit();
+    const rc = termite_metal_decode_runtime_moe_forward_q4_0_from_ids(
+        runtime,
+        layer,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        expert_ids.ptr,
+        route_weights.ptr,
         total_rows,
         hidden_size,
         inter_size,

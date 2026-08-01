@@ -1192,6 +1192,12 @@ typedef struct termite_metal_decode_runtime {
     id<MTLBuffer> moe_route_weights_buffer;
     id<MTLBuffer> moe_intermediate_buffer;
     id<MTLBuffer> moe_route_output_buffer;
+    // Shared per-token route ring for the from-ids partial-residency device
+    // route: the host writes the CPU-selected expert ids and normalized route
+    // weights here in the post-drain window, and the FFN kernels read them in
+    // place of the device topk output.
+    id<MTLBuffer> moe_route_ids_ring;
+    id<MTLBuffer> moe_route_weights_ring;
     id<MTLBuffer> moe_layer_arena_buffers[TERMITE_METAL_MOE_LAYER_SLOT_CAPACITY];
     id<MTLBuffer> moe_layer_offsets_buffers[TERMITE_METAL_MOE_LAYER_SLOT_CAPACITY];
     id<MTLBuffer> i2s_qinput_buffer;
@@ -1229,6 +1235,8 @@ typedef struct termite_metal_decode_runtime {
     size_t moe_route_weights_capacity;
     size_t moe_intermediate_capacity;
     size_t moe_route_output_capacity;
+    size_t moe_route_ids_ring_capacity;
+    size_t moe_route_weights_ring_capacity;
     uint32_t moe_layer_expert_counts[TERMITE_METAL_MOE_LAYER_SLOT_CAPACITY];
     uint32_t moe_layer_expert_strides[TERMITE_METAL_MOE_LAYER_SLOT_CAPACITY];
     uint32_t moe_layer_gate_offsets[TERMITE_METAL_MOE_LAYER_SLOT_CAPACITY];
@@ -19442,6 +19450,10 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->moe_route_weights_buffer = nil;
     runtime->moe_intermediate_buffer = nil;
     runtime->moe_route_output_buffer = nil;
+    runtime->moe_route_ids_ring = nil;
+    runtime->moe_route_weights_ring = nil;
+    runtime->moe_route_ids_ring_capacity = 0;
+    runtime->moe_route_weights_ring_capacity = 0;
     for (size_t layer = 0; layer < TERMITE_METAL_MOE_LAYER_SLOT_CAPACITY; ++layer) {
         runtime->moe_layer_arena_buffers[layer] = nil;
         runtime->moe_layer_offsets_buffers[layer] = nil;
@@ -24454,11 +24466,12 @@ int termite_metal_decode_runtime_prepare_moe_q4_0_layer_arena(
     }
     if (!termite_metal_can_make_no_copy_buffer(mapped_raw, mapped_bytes)) return -7;
     @autoreleasepool {
-        id<MTLBuffer> arena_buffer = [runtime->device
-            newBufferWithBytesNoCopy:(void *)mapped_raw
-                              length:mapped_bytes
-                             options:MTLResourceStorageModeShared
-                         deallocator:nil];
+        // Route through the shared arena-buffer cache so exactly one MTLBuffer
+        // aliases each mapping: the partial-residency pool arena is also
+        // published (per slot) by the streamed route, and two no-copy buffers
+        // over the same pages would give the driver two hazard identities.
+        id<MTLBuffer> arena_buffer = termite_metal_decode_runtime_cached_expert_arena_buffer(
+            runtime, mapped_raw, mapped_bytes);
         if (arena_buffer == nil) return -8;
         id<MTLBuffer> offsets_buffer = [runtime->device
             newBufferWithBytes:expert_offsets
@@ -24684,6 +24697,213 @@ int termite_metal_decode_runtime_moe_forward_q4_0_device(
             threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->moe_reduce_pipeline, reduce_total), 1, 1)];
         // Trailing barrier: later planned dispatches read the caller-provided
         // output buffer without a registered hazard on this write.
+        if (!moe_encoder_owned) [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        termite_metal_end_scoped_compute_encoder(moe_encoder, moe_encoder_owned);
+        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
+    }
+}
+
+// Incrementally point one expert at its byte offset in a prepared layer
+// arena's shared offset table (or the unmapped sentinel). The partial-
+// residency device route calls this in the post-drain window to reflect the
+// current pool-slot residency of the experts it is about to run; it writes
+// only when the value actually changes. Bounds are validated against the
+// arena buffer so a bad offset can never make a kernel read out of range.
+int termite_metal_decode_runtime_moe_layer_arena_set_offset(
+    termite_metal_decode_runtime *runtime,
+    size_t layer,
+    size_t expert_id,
+    uint32_t offset
+) {
+    if (runtime == NULL || layer >= TERMITE_METAL_MOE_LAYER_SLOT_CAPACITY) return -1;
+    if (runtime->moe_layer_prepared[layer] == 0) return -2;
+    if (expert_id >= (size_t)runtime->moe_layer_expert_counts[layer]) return -3;
+    id<MTLBuffer> offsets_buffer = runtime->moe_layer_offsets_buffers[layer];
+    id<MTLBuffer> arena_buffer = runtime->moe_layer_arena_buffers[layer];
+    if (offsets_buffer == nil || arena_buffer == nil) return -4;
+    if (offset != TERMITE_METAL_MOE_EXPERT_SLOT_UNMAPPED) {
+        if ((offset % 2u) != 0u) return -5;
+        const size_t stride = (size_t)runtime->moe_layer_expert_strides[layer];
+        if ((size_t)offset > arena_buffer.length || stride > arena_buffer.length - (size_t)offset) return -5;
+    }
+    uint32_t *table = (uint32_t *)offsets_buffer.contents;
+    if (table[expert_id] != offset) table[expert_id] = offset;
+    return 0;
+}
+
+// Partial-residency device-side routed-expert forward for one prepared layer
+// arena, driven by a CPU-selected route (expert_ids + normalized weights, laid
+// out [total_rows][top_k]) instead of the device topk kernel. The host writes
+// the route into the shared route ring; the gate_up -> down -> reduce chain
+// runs against the layer arena with indirect addressing through the
+// incrementally maintained offset table (unmapped experts contribute zeros).
+// Encodes into the active frame when one is open (joins the decode-step frame
+// with no extra sync); standalone calls commit and wait. Mirrors
+// moe_forward_q4_0_device minus the topk stage.
+int termite_metal_decode_runtime_moe_forward_q4_0_from_ids(
+    termite_metal_decode_runtime *runtime,
+    size_t layer,
+    void *input_handle,
+    size_t input_offset,
+    const uint32_t *expert_ids,
+    const float *route_weights,
+    size_t total_rows,
+    size_t hidden_size,
+    size_t inter_size,
+    size_t num_experts,
+    size_t top_k,
+    uint32_t activation_kind,
+    uint32_t addressing_mode,
+    void *expert_scale_handle,
+    size_t expert_scale_offset,
+    void *output_handle,
+    size_t output_offset
+) {
+    if (runtime == NULL || input_handle == NULL || expert_ids == NULL ||
+        route_weights == NULL || output_handle == NULL) return -1;
+    if (runtime->moe_q4_0_gate_up_reduce_pipeline == nil ||
+        runtime->moe_q4_0_down_reduce_pipeline == nil ||
+        runtime->moe_reduce_pipeline == nil) return -2;
+    if (termite_metal_decode_runtime_moe_q4_0_layer_arena_prepared(
+            runtime, layer, num_experts, hidden_size, inter_size) == 0) return -3;
+    if (total_rows == 0 || top_k == 0 || top_k > 8 || top_k > num_experts) return -4;
+    if (total_rows > UINT32_MAX || hidden_size > UINT32_MAX || inter_size > UINT32_MAX ||
+        num_experts > UINT32_MAX) return -4;
+    if (addressing_mode != TERMITE_METAL_MOE_ADDRESSING_FLAT &&
+        addressing_mode != TERMITE_METAL_MOE_ADDRESSING_INDIRECT) return -4;
+
+    size_t route_rows = 0;
+    size_t ids_bytes = 0;
+    size_t weights_bytes = 0;
+    size_t intermediate_bytes = 0;
+    size_t route_output_bytes = 0;
+    size_t input_bytes = 0;
+    size_t output_bytes = 0;
+    if (!termite_metal_size_mul(total_rows, top_k, &route_rows) ||
+        route_rows > UINT32_MAX ||
+        !termite_metal_size_mul(route_rows, sizeof(uint32_t), &ids_bytes) ||
+        !termite_metal_size_mul(route_rows, sizeof(float), &weights_bytes) ||
+        !termite_metal_size_mul3(route_rows, inter_size, sizeof(float), &intermediate_bytes) ||
+        !termite_metal_size_mul3(route_rows, hidden_size, sizeof(float), &route_output_bytes) ||
+        !termite_metal_size_mul3(total_rows, hidden_size, sizeof(float), &input_bytes) ||
+        !termite_metal_size_mul3(total_rows, hidden_size, sizeof(float), &output_bytes))
+    {
+        return -5;
+    }
+    @autoreleasepool {
+        if (runtime->moe_route_ids_ring == nil || runtime->moe_route_ids_ring_capacity < ids_bytes) {
+            runtime->moe_route_ids_ring = [runtime->device newBufferWithLength:ids_bytes options:MTLResourceStorageModeShared];
+            runtime->moe_route_ids_ring_capacity = runtime->moe_route_ids_ring == nil ? 0 : ids_bytes;
+        }
+        if (runtime->moe_route_weights_ring == nil || runtime->moe_route_weights_ring_capacity < weights_bytes) {
+            runtime->moe_route_weights_ring = [runtime->device newBufferWithLength:weights_bytes options:MTLResourceStorageModeShared];
+            runtime->moe_route_weights_ring_capacity = runtime->moe_route_weights_ring == nil ? 0 : weights_bytes;
+        }
+        if (runtime->moe_intermediate_buffer == nil || runtime->moe_intermediate_capacity < intermediate_bytes) {
+            runtime->moe_intermediate_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
+            runtime->moe_intermediate_capacity = runtime->moe_intermediate_buffer == nil ? 0 : intermediate_bytes;
+        }
+        if (runtime->moe_route_output_buffer == nil || runtime->moe_route_output_capacity < route_output_bytes) {
+            runtime->moe_route_output_buffer = [runtime->device newBufferWithLength:route_output_bytes options:MTLResourceStorageModePrivate];
+            runtime->moe_route_output_capacity = runtime->moe_route_output_buffer == nil ? 0 : route_output_bytes;
+        }
+        if (runtime->moe_route_ids_ring == nil || runtime->moe_route_weights_ring == nil ||
+            runtime->moe_intermediate_buffer == nil || runtime->moe_route_output_buffer == nil) return -6;
+
+        // Publish the CPU route into the shared ring. Safe: the caller only
+        // reaches here in the post-drain window, so the previous frame that
+        // referenced the ring has already completed.
+        memcpy(runtime->moe_route_ids_ring.contents, expert_ids, ids_bytes);
+        memcpy(runtime->moe_route_weights_ring.contents, route_weights, weights_bytes);
+
+        id<MTLBuffer> input_buffer = (__bridge id<MTLBuffer>)input_handle;
+        id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
+        id<MTLBuffer> arena_buffer = runtime->moe_layer_arena_buffers[layer];
+        id<MTLBuffer> offsets_buffer = runtime->moe_layer_offsets_buffers[layer];
+        id<MTLBuffer> scale_buffer = expert_scale_handle == NULL
+            ? runtime->moe_route_weights_ring
+            : (__bridge id<MTLBuffer>)expert_scale_handle;
+        if (input_buffer == nil || output_buffer == nil || arena_buffer == nil ||
+            offsets_buffer == nil || scale_buffer == nil) return -7;
+        if (input_offset + input_bytes > input_buffer.length ||
+            output_offset + output_bytes > output_buffer.length ||
+            (expert_scale_handle != NULL &&
+             expert_scale_offset + num_experts * sizeof(float) > scale_buffer.length)) return -8;
+
+        bool frame_owned = true;
+        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (command_buffer == nil) return -9;
+        BOOL moe_encoder_owned = YES;
+        id<MTLComputeCommandEncoder> moe_encoder = termite_metal_scoped_compute_encoder_for(
+            runtime,
+            command_buffer,
+            TERMITE_METAL_COMPUTE_SOURCE_FFN,
+            &moe_encoder_owned);
+        if (moe_encoder == nil) return -10;
+        if (!moe_encoder_owned) [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        termite_metal_moe_q4_0_gate_up_params gate_up_params = {
+            .route_rows = (uint32_t)route_rows,
+            .total_rows = (uint32_t)total_rows,
+            .in_dim = (uint32_t)hidden_size,
+            .out_dim = (uint32_t)inter_size,
+            .row_blocks = (uint32_t)(hidden_size / 32),
+            .gate_offset = runtime->moe_layer_gate_offsets[layer],
+            .up_offset = runtime->moe_layer_up_offsets[layer],
+            .expert_stride = runtime->moe_layer_expert_strides[layer],
+            .expert_count = (uint32_t)num_experts,
+            .top_k = (uint32_t)top_k,
+            .activation_kind = activation_kind,
+            .addressing_mode = addressing_mode,
+        };
+        [moe_encoder setComputePipelineState:runtime->moe_q4_0_gate_up_reduce_pipeline];
+        [moe_encoder setBuffer:input_buffer offset:input_offset atIndex:0];
+        [moe_encoder setBuffer:arena_buffer offset:0 atIndex:1];
+        [moe_encoder setBuffer:runtime->moe_route_ids_ring offset:0 atIndex:2];
+        [moe_encoder setBuffer:offsets_buffer offset:0 atIndex:3];
+        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:4];
+        [moe_encoder setBytes:&gate_up_params length:sizeof(gate_up_params) atIndex:5];
+        [moe_encoder dispatchThreadgroups:MTLSizeMake((inter_size + 7u) / 8u, route_rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        termite_metal_moe_q4_0_down_params down_params = {
+            .route_rows = (uint32_t)route_rows,
+            .in_dim = (uint32_t)inter_size,
+            .out_dim = (uint32_t)hidden_size,
+            .row_blocks = (uint32_t)(inter_size / 32),
+            .down_offset = runtime->moe_layer_down_offsets[layer],
+            .expert_stride = runtime->moe_layer_expert_strides[layer],
+            .expert_count = (uint32_t)num_experts,
+            .addressing_mode = addressing_mode,
+        };
+        [moe_encoder setComputePipelineState:runtime->moe_q4_0_down_reduce_pipeline];
+        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:0];
+        [moe_encoder setBuffer:arena_buffer offset:0 atIndex:1];
+        [moe_encoder setBuffer:runtime->moe_route_ids_ring offset:0 atIndex:2];
+        [moe_encoder setBuffer:offsets_buffer offset:0 atIndex:3];
+        [moe_encoder setBuffer:runtime->moe_route_output_buffer offset:0 atIndex:4];
+        [moe_encoder setBytes:&down_params length:sizeof(down_params) atIndex:5];
+        [moe_encoder dispatchThreadgroups:MTLSizeMake((hidden_size + 15u) / 16u, route_rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        termite_metal_moe_reduce_params reduce_params = {
+            .rows = (uint32_t)total_rows,
+            .top_k = (uint32_t)top_k,
+            .dim = (uint32_t)hidden_size,
+            .has_expert_scale = expert_scale_handle == NULL ? 0u : 1u,
+        };
+        [moe_encoder setComputePipelineState:runtime->moe_reduce_pipeline];
+        [moe_encoder setBuffer:runtime->moe_route_output_buffer offset:0 atIndex:0];
+        [moe_encoder setBuffer:runtime->moe_route_ids_ring offset:0 atIndex:1];
+        [moe_encoder setBuffer:runtime->moe_route_weights_ring offset:0 atIndex:2];
+        [moe_encoder setBuffer:scale_buffer offset:expert_scale_handle == NULL ? 0 : expert_scale_offset atIndex:3];
+        [moe_encoder setBuffer:output_buffer offset:output_offset atIndex:4];
+        [moe_encoder setBytes:&reduce_params length:sizeof(reduce_params) atIndex:5];
+        const size_t reduce_total = total_rows * hidden_size;
+        [moe_encoder dispatchThreads:MTLSizeMake(reduce_total, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->moe_reduce_pipeline, reduce_total), 1, 1)];
         if (!moe_encoder_owned) [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         termite_metal_end_scoped_compute_encoder(moe_encoder, moe_encoder_owned);
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);

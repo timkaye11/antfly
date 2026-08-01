@@ -47,6 +47,16 @@ pub const CompactMemoryProfile = enum(u8) {
     compact_2gbs,
 };
 
+/// Device-side routed-expert execution policy for the compact profile.
+/// `off` keeps the streamed per-slot executor (CPU top-k, per-expert Q4_0
+/// kernels). `full` runs the fully device-side MoE against a 128/128 resident
+/// layer arena (mini/full-residency only). `partial` runs the device FFN from
+/// the CPU-selected route for all-resident layers on the partial-residency
+/// pool arena, falling back to streamed for layers with a miss. `auto`
+/// resolves to `full` when the budget derives 128 slots, else `partial`.
+/// Default `off`: the numerically-distinct device route is opt-in.
+pub const CompactDeviceRouting = enum(u8) { off, full, partial, auto };
+
 /// Caller-chosen half of the compact contract. Carried by value from the CLI
 /// or server through session creation; never transported through the process
 /// environment.
@@ -70,6 +80,8 @@ pub const CompactInferenceRequest = struct {
     /// `memory_budget_mb` for the enforced ceiling (slot derivation still
     /// follows the budget). Qualification runs must not set this.
     resident_ceiling_override_bytes: u64 = 0,
+    /// Device-side routed-expert execution policy. Default off (streamed).
+    device_routing: CompactDeviceRouting = .off,
 };
 
 /// Routed-expert geometry derived from model metadata at load time. The
@@ -125,6 +137,8 @@ pub const CompactInferenceConfig = struct {
     kv_budget_bytes: u64 = default_kv_budget_bytes,
     /// The compact profile budgets an FP16 KV cache.
     kv_dtype_f16: bool = true,
+    /// Device-side routed-expert execution policy (see CompactDeviceRouting).
+    device_routing: CompactDeviceRouting = .off,
     geometry: CompactExpertGeometry,
 
     /// Budget floor; requests naming a smaller nonzero budget fail closed.
@@ -237,6 +251,7 @@ pub fn buildCompactInferenceConfig(
         .preferred_prefill_rows = request.preferred_prefill_rows,
         .resident_ceiling_bytes = budget_bytes,
         .kv_budget_bytes = kv_budget_bytes,
+        .device_routing = request.device_routing,
         .geometry = geometry,
     };
     if (request.resident_ceiling_override_bytes != 0) {
