@@ -5174,12 +5174,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         const residency_ns = if (compact_timing) monotonicNowNs() - residency_started_at else 0;
 
-        // Partial-residency device route: for an all-resident layer, run the
-        // batched device FFN from the CPU-selected route instead of the
-        // streamed per-slot chain (which is ~50 tiny dispatches). Joined to the
-        // decode-step frame, so the next layer's router readback submits it.
-        // Any not-ready condition falls through to the streamed path below.
-        if (pending.plan.miss_count == 0 and self.compactPartialDeviceRoutingEnabled()) {
+        // Partial-residency device route (S3 + S4 miss repair): finishResident-
+        // ExpertRoute above already preads the miss experts into their pool
+        // slots and published them, so every routed expert is now resident. Run
+        // the batched device FFN from the CPU-selected route instead of the
+        // streamed per-slot chain (~50 tiny dispatches). Only the 8 routed
+        // experts' offset entries are updated (post-drain, pre-encode) so a
+        // repaired slot is never encoded against a stale/sentinel table entry.
+        // Joined to the decode-step frame; any not-ready condition falls
+        // through to the streamed path below.
+        if (self.compactPartialDeviceRoutingEnabled()) {
             if (try self.tryFinishCompactPartialDeviceRoute(request, &pending, compact_timing)) |ct| {
                 return ct;
             }
