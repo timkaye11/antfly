@@ -989,6 +989,19 @@ fn debugFirstToken(comptime fmt: []const u8, args: anytype) void {
     std.debug.print("first_token_debug: " ++ fmt ++ "\n", args);
 }
 
+/// Prompt-cache request trace, mirrored to the server-side gate
+/// (`TERMITE_SERVER_PROMPT_CACHE_TRACE`). Logs whether a request was eligible
+/// for prefix reuse, how many tokens attached, and how many blocks stored, so
+/// the warm-serving cache path can be reasoned about from a single run.
+fn promptCacheTraceEnabled() bool {
+    return platform.env.getenvBool("TERMITE_SERVER_PROMPT_CACHE_TRACE");
+}
+
+fn debugPromptCache(comptime fmt: []const u8, args: anytype) void {
+    if (!promptCacheTraceEnabled()) return;
+    std.debug.print("prompt_cache_trace: " ++ fmt ++ "\n", args);
+}
+
 fn debugGemma4Mtp(comptime fmt: []const u8, args: anytype) void {
     if (!enableGemma4MtpDebug()) return;
     std.debug.print("gemma4_mtp_debug: " ++ fmt ++ "\n", args);
@@ -3130,6 +3143,17 @@ pub const NativeGenerationPipeline = struct {
                 !self.gpt_config.isQwen35() and
                 decode_state.isPaged() and
                 decode_state.kv_manager == cache.managerPtr();
+            debugPromptCache(
+                "eligible={} key_present={} paged={} kv_manager_is_cache={} compact_session={} seq_len={}",
+                .{
+                    cache_eligible,
+                    config.prompt_cache_key != null,
+                    decode_state.isPaged(),
+                    decode_state.kv_manager == cache.managerPtr(),
+                    self.cb.compactSessionActive(),
+                    seq_len,
+                },
+            );
             if (cache_eligible) {
                 const page_size = cache.pageSize() orelse 0;
                 if (page_size > 0 and seq_len > page_size) {
@@ -3137,6 +3161,9 @@ pub const NativeGenerationPipeline = struct {
                         try decode_state.seedAttachedPrefix(hit.sequence_id, hit.token_count);
                         cached_prompt_tokens = hit.token_count;
                         prefill_ids = token_ids[cached_prompt_tokens..seq_len];
+                        debugPromptCache("attach hit matched_tokens={d} of seq_len={d} (page_size={d})", .{ hit.token_count, seq_len, page_size });
+                    } else {
+                        debugPromptCache("attach miss seq_len={d} page_size={d}", .{ seq_len, page_size });
                     }
                 }
             }
@@ -3166,7 +3193,13 @@ pub const NativeGenerationPipeline = struct {
             if (config.prompt_cache_enabled and prepared_multimodal_prompt == null and decode_state.kv_manager == cache.managerPtr()) {
                 if (config.prompt_cache_key) |cache_key| {
                     if (decode_state.sequence_id) |sequence_id| {
+                        const trace_cache = promptCacheTraceEnabled();
+                        const blocks_before = if (trace_cache) cache.stats().block_hash_cached_blocks else 0;
                         try cache.storeFromSequence(cache_key, token_ids[0..seq_len], sequence_id);
+                        if (trace_cache) debugPromptCache(
+                            "store key_len={d} prompt_tokens={d} blocks_before={d} blocks_after={d}",
+                            .{ cache_key.len, seq_len, blocks_before, cache.stats().block_hash_cached_blocks },
+                        );
                     }
                 }
             }

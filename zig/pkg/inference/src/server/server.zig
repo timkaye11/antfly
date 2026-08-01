@@ -268,6 +268,14 @@ fn generationKvSlidingTrimForced() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_KV_SLIDING_TRIM", false);
 }
 
+/// Gate for the prompt-cache request-path trace. When set, the server logs
+/// whether a request is eligible for prefix reuse and why (node cache on,
+/// key present, compact profile) so the warm-serving cache path can be
+/// diagnosed without a rebuild.
+fn promptCacheTraceEnabled() bool {
+    return platform.env.getenvBool("TERMITE_SERVER_PROMPT_CACHE_TRACE");
+}
+
 fn validateCacheCompactionRatio(ratio: ?f32) !void {
     if (ratio) |value| try (runtime.kv.compaction.CompactionConfig{ .target_ratio = value }).validate();
 }
@@ -5717,7 +5725,38 @@ pub const Node = struct {
         var active_kv_manager: *runtime.kv.manager.KvManager = &kv_manager;
         var active_kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null;
         var pool_id: runtime.kv.block.KvPoolId = undefined;
-        if (config.prompt_cache_enabled and (backend_kind == .native or backend_kind == .metal or backend_kind == .cuda) and
+        // Compact-profile models keep each layer's KV in a *per-sequence* device
+        // slot that the metal backend returns to a free pool the moment a
+        // request's sequence ends (see MetalKvStorage.releaseSequenceSlots: the
+        // next tenant "re-encodes from scratch"). The prompt cache retains only
+        // the pool's logical blocks (a CPU refcount) — not that device KV — so a
+        // reattached prefix points every gathered/paged-slot read at stale or
+        // recycled device memory. The result is byte-divergent output vs. the
+        // cold path plus enough device-slot churn to stall the serialized
+        // native-generation lock (observed as a client-timeout "hang" on
+        // replay). Until the metal device-KV store can retain cache-owned slots
+        // across sequences, compact serving requests must run the plain cold
+        // prefill path (private per-request pool, no prefix reuse): correct and
+        // deterministic beats a fast-but-wrong cache hit. Non-compact metal/
+        // native/cuda models are unaffected and keep full prefix reuse.
+        // TERMITE_COMPACT_PROMPT_CACHE_REUSE re-enables reuse for compact so the
+        // metal device-KV retention fix can be validated in place once it lands.
+        const compact_prompt_cache_unsupported =
+            self.model_manager.compactProfileForDir(model.model_dir) != null and
+            !platform.env.getenvBool("TERMITE_COMPACT_PROMPT_CACHE_REUSE");
+        if (promptCacheTraceEnabled()) std.log.info(
+            "prompt_cache_trace: request eligibility model={s} backend={s} node_cache_enabled={} key_present={} compact={} -> reuse={}",
+            .{
+                model.model_dir,
+                @tagName(backend_kind),
+                config.prompt_cache_enabled,
+                config.prompt_cache_key != null,
+                compact_prompt_cache_unsupported,
+                config.prompt_cache_enabled and !compact_prompt_cache_unsupported,
+            },
+        );
+        if (config.prompt_cache_enabled and !compact_prompt_cache_unsupported and
+            (backend_kind == .native or backend_kind == .metal or backend_kind == .cuda) and
             effective_compiled_partition_backend == null and
             effective_draft_model_name == null and
             config.cache_compaction_ratio == null)
