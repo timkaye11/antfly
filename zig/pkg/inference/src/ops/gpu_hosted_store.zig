@@ -111,6 +111,11 @@ pub const CompactExpertArena = struct {
     /// Physical pages returned to the OS while the mapping (and its device
     /// buffer) stays valid; must be recommitted before the next fill.
     decommitted: bool = false,
+    /// Pool-arena mode only (ANTFLY_GEMMA4_POOL_ARENA): the slot's sub-range
+    /// of the shared per-layer pool holds committed, ledger-charged pages.
+    /// Cleared when the slot is decommitted back to the OS. Unused (always
+    /// false) on the legacy per-slot-mapping route.
+    present: bool = false,
 };
 
 /// Full-residency backing for one MoE layer under the device-side MoE route
@@ -159,6 +164,15 @@ pub const CompactRuntimeState = struct {
     /// and the budget derives slots == expert_count.
     full_arenas: [compact_runtime_layer_capacity]CompactLayerFullArena =
         [_]CompactLayerFullArena{.{}} ** compact_runtime_layer_capacity,
+    /// Partial-residency pool arena (ANTFLY_GEMMA4_POOL_ARENA): one
+    /// page-aligned anonymous mapping per MoE layer that the streaming cache
+    /// carves into per-slot sub-ranges. Exactly one Metal no-copy buffer
+    /// aliases each mapping, so a partially resident layer can be served
+    /// device-side (offset-table indirection) while per-slot decommit still
+    /// reclaims individual evicted slots via `MmapRegion.decommitRange`. Null
+    /// until the first miss in the layer; sized to the resident slot tier.
+    layer_pools: [compact_runtime_layer_capacity]?c_file.MmapRegion =
+        [_]?c_file.MmapRegion{null} ** compact_runtime_layer_capacity,
     /// True under a compact memory profile: budget pressure rejects work.
     /// Opportunistic sessions keep the same machinery in report-only mode.
     enforcing: bool = false,
@@ -183,6 +197,10 @@ pub const CompactRuntimeState = struct {
         for (&self.full_arenas) |*full| {
             if (full.arena) |*arena| arena.deinit();
             full.* = .{};
+        }
+        for (&self.layer_pools) |*pool| {
+            if (pool.*) |*region| region.deinit();
+            pool.* = null;
         }
     }
 };

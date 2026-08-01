@@ -179,6 +179,28 @@ pub const MmapRegion = struct {
         advise(self.data.ptr, self.data.len, .free_reuse);
     }
 
+    /// Release the physical pages backing one sub-range of this region while
+    /// keeping the whole mapping — and any Metal no-copy buffer built over it
+    /// — valid. Used by the compact pool arena to reclaim a single evicted
+    /// expert slot without unmapping the shared per-layer buffer. `offset` and
+    /// `len` must be page-aligned; the compact expert slot stride is a whole
+    /// multiple of the 16 KiB page by construction, so per-slot decommit
+    /// affects exactly that slot's pages. Ranges outside the mapping are
+    /// clamped away.
+    pub fn decommitRange(self: *MmapRegion, offset: usize, len: usize) void {
+        if (len == 0 or offset >= self.data.len) return;
+        const end = @min(self.data.len, offset + len);
+        advise(self.data.ptr + offset, end - offset, .free_reusable);
+    }
+
+    /// Re-account one previously `decommitRange`-d sub-range before it is
+    /// refilled so Darwin's footprint bookkeeping stays exact.
+    pub fn recommitRange(self: *MmapRegion, offset: usize, len: usize) void {
+        if (len == 0 or offset >= self.data.len) return;
+        const end = @min(self.data.len, offset + len);
+        advise(self.data.ptr + offset, end - offset, .free_reuse);
+    }
+
     pub fn deinit(self: *MmapRegion) void {
         std.posix.munmap(self.data);
         if (self.fd >= 0) closeFd(self.fd);
@@ -513,6 +535,34 @@ test "MmapRegion maps file data correctly and adviseRandom does not crash" {
 
     // Data should still be readable after advice change
     try std.testing.expectEqualSlices(u8, payload, region.data[0..payload.len]);
+}
+
+test "MmapRegion decommitRange/recommitRange leave neighbouring pages intact" {
+    const page = std.heap.page_size_min;
+    // Three page-aligned "slots" in one anonymous mapping.
+    var region = try MmapRegion.initAnonymous(3 * page);
+    defer region.deinit();
+
+    @memset(region.data[0..page], 0xA1);
+    @memset(region.data[page .. 2 * page], 0xB2);
+    @memset(region.data[2 * page ..], 0xC3);
+
+    // Reclaim the middle slot; the outer slots keep their bytes and the
+    // mapping stays valid.
+    region.decommitRange(page, page);
+    try std.testing.expectEqual(@as(u8, 0xA1), region.data[0]);
+    try std.testing.expectEqual(@as(u8, 0xC3), region.data[2 * page]);
+
+    // Re-account and refill the middle slot in place.
+    region.recommitRange(page, page);
+    @memset(region.data[page .. 2 * page], 0xD4);
+    try std.testing.expectEqual(@as(u8, 0xD4), region.data[page]);
+    try std.testing.expectEqual(@as(u8, 0xA1), region.data[page - 1]);
+    try std.testing.expectEqual(@as(u8, 0xC3), region.data[2 * page]);
+
+    // Out-of-bounds ranges are clamped away without touching anything.
+    region.decommitRange(4 * page, page);
+    region.recommitRange(4 * page, page);
 }
 
 test "mmapTempCopy maps unlinked temp data" {

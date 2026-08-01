@@ -137,6 +137,29 @@ fn getenvBool(comptime name: [*:0]const u8) bool {
     return enabled;
 }
 
+/// Environment switches that default ON: true unless the caller set the
+/// variable to an explicit falsey value (0/false/no/off). Used for kill
+/// switches over otherwise-default-enabled behavior.
+fn getenvDefaultTrue(comptime name: [*:0]const u8) bool {
+    if (comptime @import("builtin").os.tag == .freestanding) return true;
+    const S = struct {
+        const env_name = name;
+        var cached: ?bool = null;
+    };
+    if (S.cached) |cached| return cached;
+    const c = @cImport(@cInclude("stdlib.h"));
+    const enabled = blk: {
+        const value = c.getenv(S.env_name) orelse break :blk true;
+        const slice = std.mem.span(value);
+        break :blk !(std.mem.eql(u8, slice, "0") or
+            std.ascii.eqlIgnoreCase(slice, "false") or
+            std.ascii.eqlIgnoreCase(slice, "no") or
+            std.ascii.eqlIgnoreCase(slice, "off"));
+    };
+    S.cached = enabled;
+    return enabled;
+}
+
 fn donatedSlotAttentionOnFrameEnabled() bool {
     return getenvBool("TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME") and
         !getenvBool("TERMITE_METAL_DISABLE_DONATED_SLOT_ATTENTION_ON_FRAME");
@@ -3562,6 +3585,90 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return .{ .gate = base, .up = base + 1, .down = base + 2 };
     }
 
+    /// Pool-arena kill switch (default ON). ANTFLY_GEMMA4_POOL_ARENA=0 keeps
+    /// the legacy per-slot anonymous mappings (one MTLBuffer each), which
+    /// cannot back partial-residency device routing.
+    fn poolArenaEnabled() bool {
+        return getenvDefaultTrue("ANTFLY_GEMMA4_POOL_ARENA");
+    }
+
+    /// Resident slot tier the pool arena is sized for: the configured
+    /// (maximum) expert-cache slots, or the full static capacity for
+    /// opportunistic sessions without a compact contract. The residency
+    /// ledger only ever downshifts the active tier, so this is a safe upper
+    /// bound on the highest slot index the streaming cache can populate.
+    fn compactPoolSlotCount(self: *MetalCompute) usize {
+        if (self.data.compact) |config| {
+            return @max(@as(usize, 1), @min(@as(usize, config.expert_cache_slots), compact_expert_slot_capacity));
+        }
+        return compact_expert_slot_capacity;
+    }
+
+    /// One page-aligned anonymous mapping per MoE layer, lazily created on the
+    /// first miss. Untouched pages never enter phys_footprint; committed slot
+    /// sub-ranges are charged to the ledger exactly as the legacy per-slot
+    /// mappings were.
+    fn ensureCompactLayerPool(
+        self: *MetalCompute,
+        state: *gpu_hosted_store_mod.CompactRuntimeState,
+        layer_index: usize,
+    ) !*c_file.MmapRegion {
+        if (state.layer_pools[layer_index] == null) {
+            const bytes = self.compactPoolSlotCount() * compact_expert_arena_bytes;
+            var pool = try c_file.MmapRegion.initAnonymous(bytes);
+            pool.adviseRandom();
+            state.layer_pools[layer_index] = pool;
+        }
+        return &state.layer_pools[layer_index].?;
+    }
+
+    /// Backing byte range for one resident-expert slot. In pool mode this is a
+    /// sub-range of the shared per-layer pool; on the legacy route it is the
+    /// slot's own anonymous mapping. Clears any stale layout, ensures the
+    /// pages are committed and charged to the ledger, and returns the writable
+    /// destination the expert loader fills.
+    fn reserveCompactSlotBacking(
+        self: *MetalCompute,
+        state: *gpu_hosted_store_mod.CompactRuntimeState,
+        layer_index: usize,
+        local_slot: usize,
+    ) ![]u8 {
+        const arena_state = state.arenaAt(layer_index, local_slot);
+        if (arena_state.layout) |*stale| {
+            stale.deinit();
+            arena_state.layout = null;
+        }
+        if (poolArenaEnabled()) {
+            const pool = try self.ensureCompactLayerPool(state, layer_index);
+            const offset = local_slot * compact_expert_arena_bytes;
+            if (offset + compact_expert_arena_bytes > pool.data.len) return error.CompactPoolSlotOutOfRange;
+            if (!arena_state.present) {
+                try state.ledger.reserve(.expert_pages, compact_expert_arena_bytes);
+                // Harmless on never-touched pages; required after a prior
+                // decommitRange so Darwin re-accounts the reclaimed slot.
+                pool.recommitRange(offset, compact_expert_arena_bytes);
+                arena_state.present = true;
+                arena_state.decommitted = false;
+            }
+            return pool.data[offset..][0..compact_expert_arena_bytes];
+        }
+        if (arena_state.arena == null) {
+            var arena = try c_file.MmapRegion.initAnonymous(compact_expert_arena_bytes);
+            state.ledger.reserve(.expert_pages, compact_expert_arena_bytes) catch |err| {
+                arena.deinit();
+                return err;
+            };
+            arena.adviseRandom();
+            arena_state.arena = arena;
+            arena_state.decommitted = false;
+        } else if (arena_state.decommitted) {
+            try state.ledger.reserve(.expert_pages, compact_expert_arena_bytes);
+            arena_state.arena.?.recommit();
+            arena_state.decommitted = false;
+        }
+        return arena_state.arena.?.data;
+    }
+
     /// Unpublish one evicted slot: clear the provider's three projection
     /// views, drop the layout, and decommit the arena's physical pages so
     /// the process footprint actually falls. The mapping and its no-copy
@@ -3588,6 +3695,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 state.decommitted_bytes +|= compact_expert_arena_bytes;
                 madvised = true;
             }
+        } else if (arena_state.present) {
+            // Pool-backed slot: reclaim just this slot's sub-range; the shared
+            // per-layer mapping and its one no-copy buffer stay live for the
+            // slots that remain resident.
+            if (state.layer_pools[layer_index]) |*pool| {
+                pool.decommitRange(local_slot * compact_expert_arena_bytes, compact_expert_arena_bytes);
+            }
+            arena_state.present = false;
+            arena_state.decommitted = true;
+            state.ledger.release(.expert_pages, compact_expert_arena_bytes);
+            state.decommitted_bytes +|= compact_expert_arena_bytes;
+            madvised = true;
         }
         state.evictions +|= 1;
         return madvised;
@@ -3791,7 +3910,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) !bool {
         const arena_state = state.arenaAt(layer_index, local_slot);
         const layout = if (arena_state.layout) |*value| value else return false;
-        const arena = if (arena_state.arena) |*value| value.data else return false;
+        // The published no-copy buffer aliases the whole backing mapping and
+        // the three linear-slot views index into it. On the legacy route that
+        // mapping is the slot's own arena (base offset 0); in pool mode it is
+        // the shared per-layer pool and the slot lives at its sub-range, so
+        // exactly one MTLBuffer aliases each pool mapping.
+        var arena: []const u8 = undefined;
+        var base_offset: usize = 0;
+        if (arena_state.arena) |*value| {
+            arena = value.data;
+        } else if (state.layer_pools[layer_index]) |*pool| {
+            arena = pool.data;
+            base_offset = local_slot * compact_expert_arena_bytes;
+        } else return false;
         const slots = residentExpertProjectionSlots(layer_index, local_slot);
         const descriptors = layout.descriptors;
         if (descriptors[0].rows != request.inter_size or descriptors[0].cols != request.hidden_size or
@@ -3805,7 +3936,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .{ slots.gate, slots.up, slots.down },
             .{ &layout.projections[0], &layout.projections[1], &layout.projections[2] },
             arena,
-            .{ descriptors[0].byte_offset, descriptors[1].byte_offset, descriptors[2].byte_offset },
+            .{
+                base_offset + descriptors[0].byte_offset,
+                base_offset + descriptors[1].byte_offset,
+                base_offset + descriptors[2].byte_offset,
+            },
             request.hidden_size,
             request.inter_size,
         );
@@ -3852,32 +3987,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 self.resident_expert_hits +|= 1;
                 continue;
             }
-            const arena_state = state.arenaAt(entry.ref.layer, entry.ref.slot);
-            if (arena_state.layout) |*stale| {
-                stale.deinit();
-                arena_state.layout = null;
-            }
-            if (arena_state.arena == null) {
-                var arena = try c_file.MmapRegion.initAnonymous(compact_expert_arena_bytes);
-                state.ledger.reserve(.expert_pages, compact_expert_arena_bytes) catch |err| {
-                    arena.deinit();
-                    return err;
-                };
-                arena.adviseRandom();
-                arena_state.arena = arena;
-                arena_state.decommitted = false;
-            } else if (arena_state.decommitted) {
-                try state.ledger.reserve(.expert_pages, compact_expert_arena_bytes);
-                arena_state.arena.?.recommit();
-                arena_state.decommitted = false;
-            }
+            const destination = try self.reserveCompactSlotBacking(state, entry.ref.layer, entry.ref.slot);
             const entries = self.compactMoeExpertEntries(entry.ref.layer, entry.expert_index) orelse {
                 pending.deinit();
                 return null;
             };
             requests[pending.miss_count] = .{
                 .entries = entries,
-                .destination = arena_state.arena.?.data,
+                .destination = destination,
             };
             pending.miss_plan_positions[pending.miss_count] = position;
             pending.miss_count += 1;
