@@ -53,8 +53,12 @@ pub const CompactMemoryProfile = enum(u8) {
 /// layer arena (mini/full-residency only). `partial` runs the device FFN from
 /// the CPU-selected route for all-resident layers on the partial-residency
 /// pool arena, falling back to streamed for layers with a miss. `auto`
-/// resolves to `full` when the budget derives 128 slots, else `partial`.
-/// Default `off`: the numerically-distinct device route is opt-in.
+/// resolves to `full` when the budget derives 128 slots, `partial` when the
+/// budget derives at least `device_routing_min_slots` (the residency point
+/// where device routing is measured faster than streamed), else `off` (at low
+/// residency the miss-repair I/O makes device routing slower, so auto keeps
+/// the streamed executor there). The device route is bit-exact with the
+/// streamed path, so `auto` never changes token output — only speed.
 pub const CompactDeviceRouting = enum(u8) { off, full, partial, auto };
 
 /// Caller-chosen half of the compact contract. Carried by value from the CLI
@@ -80,8 +84,10 @@ pub const CompactInferenceRequest = struct {
     /// `memory_budget_mb` for the enforced ceiling (slot derivation still
     /// follows the budget). Qualification runs must not set this.
     resident_ceiling_override_bytes: u64 = 0,
-    /// Device-side routed-expert execution policy. Default off (streamed).
-    device_routing: CompactDeviceRouting = .off,
+    /// Device-side routed-expert execution policy. Default auto: bit-exact
+    /// device routing engages at qualified residency (>= device_routing_min_slots),
+    /// streamed below; identical tokens either way.
+    device_routing: CompactDeviceRouting = .auto,
 };
 
 /// Routed-expert geometry derived from model metadata at load time. The
@@ -138,7 +144,7 @@ pub const CompactInferenceConfig = struct {
     /// The compact profile budgets an FP16 KV cache.
     kv_dtype_f16: bool = true,
     /// Device-side routed-expert execution policy (see CompactDeviceRouting).
-    device_routing: CompactDeviceRouting = .off,
+    device_routing: CompactDeviceRouting = .auto,
     geometry: CompactExpertGeometry,
 
     /// Budget floor; requests naming a smaller nonzero budget fail closed.
@@ -157,6 +163,13 @@ pub const CompactInferenceConfig = struct {
     /// capacity in gpu_hosted_store/metal_compute must cover the maximum.
     pub const min_expert_cache_slots: u8 = 4;
     pub const max_expert_cache_slots: u8 = 128;
+    /// Minimum derived slots/layer at which `device_routing = auto` engages the
+    /// (bit-exact) device route. Below this the expert hit rate is low enough
+    /// that per-layer miss-repair I/O makes device routing slower than the
+    /// streamed executor, so auto stays streamed. Empirical crossover: device
+    /// routing is faster at the 6 GiB tier (~45 slots) and slower at the 4 GiB
+    /// tier (~24 slots) on A4B. Correctness is unaffected either way.
+    pub const device_routing_min_slots: u8 = 45;
     /// Arena alignment shared with the Metal runtime's expert arenas.
     pub const expert_arena_alignment: u64 = 16 * 1024;
 
@@ -305,6 +318,10 @@ test "buildCompactInferenceConfig derives slots and KV share from the budget" {
     try std.testing.expectEqual(@as(u8, 24), mid.expert_cache_slots);
     try std.testing.expectEqual(@as(u64, 1024) * 1024 * 1024, mid.kv_budget_bytes);
 
+    // 6 GiB derives 45 slots — exactly the device-routing engagement floor.
+    const six = try buildCompactInferenceConfig(.{ .memory_budget_mb = 6144 }, good);
+    try std.testing.expectEqual(@as(u8, 45), six.expert_cache_slots);
+
     // 8 GiB derives 67 slots; 16 GiB saturates at the 128-slot capacity.
     const big = try buildCompactInferenceConfig(.{ .memory_budget_mb = 8192 }, good);
     try std.testing.expectEqual(@as(u8, 67), big.expert_cache_slots);
@@ -331,6 +348,24 @@ test "buildCompactInferenceConfig derives slots and KV share from the budget" {
         error.CompactProfileBudgetTooSmall,
         buildCompactInferenceConfig(.{ .memory_budget_mb = 1 }, good),
     );
+}
+
+test "device_routing auto default engages only at qualified residency" {
+    const good = qualified_compact_geometries[0];
+    // Default is auto (bit-exact device route; identical tokens either way).
+    try std.testing.expectEqual(
+        CompactDeviceRouting.auto,
+        (try buildCompactInferenceConfig(.{ .memory_budget_mb = 6144 }, good)).device_routing,
+    );
+    // The engagement threshold must cleanly separate the measured-slower low
+    // tiers (2 GiB=8, 4 GiB=24 slots) from the measured-faster tiers
+    // (6 GiB=45, 8 GiB=67). If slot derivation or the threshold drifts so a
+    // low tier crosses it, device routing would engage where it regresses.
+    const min_slots = CompactInferenceConfig.device_routing_min_slots;
+    try std.testing.expect((try buildCompactInferenceConfig(.{ .memory_budget_mb = 2048 }, good)).expert_cache_slots < min_slots);
+    try std.testing.expect((try buildCompactInferenceConfig(.{ .memory_budget_mb = 4096 }, good)).expert_cache_slots < min_slots);
+    try std.testing.expect((try buildCompactInferenceConfig(.{ .memory_budget_mb = 6144 }, good)).expert_cache_slots >= min_slots);
+    try std.testing.expect((try buildCompactInferenceConfig(.{ .memory_budget_mb = 8192 }, good)).expert_cache_slots >= min_slots);
 }
 
 test "buildCompactInferenceConfig validates request knobs fail-closed" {

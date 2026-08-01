@@ -4162,7 +4162,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .off => .off,
                 .full => .full,
                 .partial => .partial,
-                .auto => if (@as(usize, config.expert_cache_slots) == compact_expert_slot_capacity) .full else .partial,
+                .auto => blk: {
+                    const slots: usize = config.expert_cache_slots;
+                    if (slots == compact_expert_slot_capacity) break :blk .full;
+                    if (slots >= backend_contracts.CompactInferenceConfig.device_routing_min_slots) break :blk .partial;
+                    break :blk .off;
+                },
             };
         }
         return .off;
