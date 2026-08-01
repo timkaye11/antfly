@@ -695,6 +695,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     compact_gathered_span_fallbacks: u64 = 0,
     /// A6: gate the one-time loud warning to the first fallback per session.
     compact_gathered_span_fallback_warned: bool = false,
+    /// Workstream A' (instrument-first): monotonic decommit-round counter and a
+    /// one-shot residency-breakdown latch, both consumed only under
+    /// ANTFLY_GEMMA4_COMPACT_TIMING to measure whether an eviction round's
+    /// madvise actually reclaims phys_footprint and what NON-expert device
+    /// residency accounts for `resid`. No behavior change when the flag is off.
+    compact_decommit_round: u64 = 0,
+    compact_residency_breakdown_emitted: bool = false,
     compact_step_stats: CompactStepStats = .{},
     next_dynamic_layer_norm_slot: usize = metal_runtime.decoder_runtime_layer_norm_slot_capacity,
     next_dynamic_rms_norm_slot: usize = metal_runtime.decoder_runtime_rms_norm_slot_capacity,
@@ -3564,7 +3571,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         state: *gpu_hosted_store_mod.CompactRuntimeState,
         layer_index: usize,
         local_slot: usize,
-    ) void {
+    ) bool {
         const projections = residentExpertProjectionSlots(layer_index, local_slot);
         metal_runtime.clearRawLinearSlot(self.provider_impl, projections.gate);
         metal_runtime.clearRawLinearSlot(self.provider_impl, projections.up);
@@ -3572,15 +3579,108 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const arena_state = state.arenaAt(layer_index, local_slot);
         if (arena_state.layout) |*layout| layout.deinit();
         arena_state.layout = null;
+        var madvised = false;
         if (arena_state.arena) |*arena| {
             if (!arena_state.decommitted) {
                 arena.decommit();
                 arena_state.decommitted = true;
                 state.ledger.release(.expert_pages, compact_expert_arena_bytes);
                 state.decommitted_bytes +|= compact_expert_arena_bytes;
+                madvised = true;
             }
         }
         state.evictions +|= 1;
+        return madvised;
+    }
+
+    /// Workstream A' instrumentation: decommit a batch of evicted slots in one
+    /// pressure round and, under ANTFLY_GEMMA4_COMPACT_TIMING, sample the
+    /// Darwin phys_footprint immediately before and after the madvise batch so
+    /// we can see whether the freed expert arena bytes actually leave the
+    /// process footprint (H-base: reclaimed ~= madvised) or strand because a
+    /// referencing command buffer is still in flight (H-inflight: reclaimed
+    /// ~= 0 while frame_active/frame_submitted). Never changes eviction
+    /// behavior — the timing flag only adds two footprint samples and a print.
+    fn decommitCompactSlotBatch(
+        self: *MetalCompute,
+        state: *gpu_hosted_store_mod.CompactRuntimeState,
+        victims: []const gpu_hosted_store_mod.CompactSlotRef,
+    ) void {
+        if (victims.len == 0) return;
+        const timing = getenvBool("ANTFLY_GEMMA4_COMPACT_TIMING");
+        if (!timing) {
+            for (victims) |victim| _ = self.decommitCompactSlot(state, victim.layer, victim.slot);
+            return;
+        }
+        const runtime = self.provider_impl.raw_decode_runtime;
+        const round = self.compact_decommit_round;
+        self.compact_decommit_round +|= 1;
+        const frame_active = metal_runtime.hasActiveFrame(runtime);
+        const frame_submitted = metal_runtime.hasSubmittedFrame(runtime);
+        _ = state.ledger.samplePressure();
+        const footprint_before = state.ledger.snapshot().observed_footprint_bytes;
+        if (!self.compact_residency_breakdown_emitted) {
+            self.compact_residency_breakdown_emitted = true;
+            self.emitCompactResidencyBreakdown(footprint_before);
+        }
+        var madvised_slots: usize = 0;
+        for (victims) |victim| {
+            if (self.decommitCompactSlot(state, victim.layer, victim.slot)) madvised_slots += 1;
+        }
+        _ = state.ledger.samplePressure();
+        const footprint_after = state.ledger.snapshot().observed_footprint_bytes;
+        const mb: u64 = 1024 * 1024;
+        const madvised_bytes = madvised_slots * compact_expert_arena_bytes;
+        const reclaimed_bytes: i64 =
+            @as(i64, @intCast(footprint_before)) - @as(i64, @intCast(footprint_after));
+        std.debug.print(
+            "gemma4_compact_decommit: round={d} slots_freed={d} madvised_mb={d} footprint_before_mb={d} footprint_after_mb={d} reclaimed_mb={d} frame_active={} frame_submitted={}\n",
+            .{
+                round,
+                madvised_slots,
+                madvised_bytes / mb,
+                footprint_before / mb,
+                footprint_after / mb,
+                @divTrunc(reclaimed_bytes, @as(i64, @intCast(mb))),
+                frame_active,
+                frame_submitted,
+            },
+        );
+    }
+
+    /// Workstream A' one-shot breakdown: split the process footprint into the
+    /// tracked Metal device categories so `resid` (footprint - device_total)
+    /// can be attributed to legitimate NON-expert base weights (token
+    /// embeddings, attention projections, dense shared-FFN, norms) versus
+    /// truly unexplained residency (Metal driver / allocator overhead).
+    fn emitCompactResidencyBreakdown(self: *MetalCompute, footprint_bytes: u64) void {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return;
+        const snap = metal_runtime.runtimeMemorySnapshot(runtime);
+        const mb: u64 = 1024 * 1024;
+        const base_weights = snap.embedding_bytes + snap.norm_bytes + snap.dense_linear_bytes;
+        const device_total = snap.total_bytes;
+        const unexplained: i64 =
+            @as(i64, @intCast(footprint_bytes)) - @as(i64, @intCast(device_total));
+        std.debug.print(
+            "gemma4_compact_residency_breakdown: footprint_mb={d} device_total_mb={d} base_weights_mb={d} embedding_mb={d} norm_mb={d} dense_linear_mb={d} dense_qkv_packed_mb={d} expert_quant_mb={d} scratch_mb={d} scratch_pool_mb={d} attn_span_mb={d} hidden_mb={d} plan_mb={d} retained_mb={d} unexplained_mb={d}\n",
+            .{
+                footprint_bytes / mb,
+                device_total / mb,
+                base_weights / mb,
+                snap.embedding_bytes / mb,
+                snap.norm_bytes / mb,
+                snap.dense_linear_bytes / mb,
+                snap.dense_qkv_packed_bytes / mb,
+                snap.quant_linear_bytes / mb,
+                snap.scratch_bytes / mb,
+                snap.scratch_pool_bytes / mb,
+                snap.attention_span_bytes / mb,
+                snap.hidden_state_bytes / mb,
+                snap.graph_plan_bytes / mb,
+                snap.frame_retained_bytes / mb,
+                @divTrunc(unexplained, @as(i64, @intCast(mb))),
+            },
+        );
     }
 
     /// Release the Metal runtime's transient device pools (idle scratch-pool
@@ -3612,9 +3712,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         while (rounds < compact_expert_layer_count * compact_expert_slot_capacity) : (rounds += 1) {
             var evicted: [8]gpu_hosted_store_mod.CompactSlotRef = undefined;
             const count = state.cache.collectEvictions(evicted[0..]);
-            for (evicted[0..count]) |victim| {
-                self.decommitCompactSlot(state, victim.layer, victim.slot);
-            }
+            self.decommitCompactSlotBatch(state, evicted[0..count]);
             if (state.ledger.samplePressure() == .ok) return;
             if (count == 0) break;
         }
@@ -3638,9 +3736,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     while (true) {
                         const count = state.cache.collectStranded(stranded[0..]);
                         if (count == 0) break;
-                        for (stranded[0..count]) |victim| {
-                            self.decommitCompactSlot(state, victim.layer, victim.slot);
-                        }
+                        self.decommitCompactSlotBatch(state, stranded[0..count]);
                     }
                     if (state.ledger.samplePressure() != .hard) return;
                 }
