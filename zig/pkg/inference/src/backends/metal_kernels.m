@@ -961,6 +961,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> q4_0_pair_reduce_pipeline;
     id<MTLComputePipelineState> moe_topk_pipeline;
     id<MTLComputePipelineState> moe_q4_0_gate_up_reduce_pipeline;
+    id<MTLComputePipelineState> moe_activation_multiply_pipeline;
     id<MTLComputePipelineState> moe_q4_0_down_reduce_pipeline;
     id<MTLComputePipelineState> moe_reduce_pipeline;
     id<MTLComputePipelineState> q4_0_pair_activation_reduce_pipeline;
@@ -6769,6 +6770,22 @@ static NSString *termite_metal_shader_source(void) {
            "    uint total = p.rows * p.dim; if (gid >= total) return;\n"
            "    float y = termite_apply_activation_scalar(gate[gid], p.activation_kind);\n"
            "    output[gid] = y == 0.0f ? 0.0f : y * up[gid];\n"
+           "}\n"
+           // Bit-exact fusion of the de-fused device-MoE activation + multiply.
+           // Mirrors, in ONE precise pass, the two passes the streamed reference
+           // runs: precise termite_apply_activation_1x on the raw gate, then a
+           // plain library termite_apply_multiply_1x by the raw up. Compiled into
+           // precise_library so the gelu matches the streamed precise activation
+           // bit-for-bit; the trailing `activated * up` is a STANDALONE multiply
+           // (its own statement, no adjacent add), so it cannot FMA-contract and
+           // is bit-identical in any math mode. Deliberately NO `y == 0 ? 0`
+           // guard: the reference multiply computes a plain product, so the guard
+           // (which would flip signed-zero / non-finite lanes) must be absent to
+           // stay bit-for-bit.
+           "kernel void termite_moe_activation_multiply_1x(device const float *gate [[buffer(0)]], device const float *up [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_apply_activation_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    uint total = p.rows * p.dim; if (gid >= total) return;\n"
+           "    float activated = termite_apply_activation_scalar(gate[gid], p.activation_kind);\n"
+           "    output[gid] = activated * up[gid];\n"
            "}\n"
            "kernel void termite_apply_softmax_rows(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_apply_softmax_params &p [[buffer(2)]], threadgroup float *shmem [[threadgroup(0)]], uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
            "    if (row >= p.rows || p.dim == 0u) return;\n"
@@ -18662,6 +18679,10 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         // activation_pipeline pass) so the gate/up kernel needs no precise math.
         runtime->moe_topk_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_moe_topk");
         runtime->moe_q4_0_gate_up_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_moe_q4_0_gate_up_reduce");
+        // Precise: fuses the de-fused activation + multiply into one pass. The
+        // gelu matches the streamed precise activation; the trailing standalone
+        // `* up` multiply is bit-identical in any math mode.
+        runtime->moe_activation_multiply_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_moe_activation_multiply_1x");
         runtime->moe_q4_0_down_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_moe_q4_0_down_reduce");
         runtime->moe_reduce_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_moe_reduce");
         runtime->q4_0_pair_activation_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_q4_0_pair_activation_1x_reduce");
@@ -19265,6 +19286,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->q4_0_pair_reduce_pipeline = nil;
     runtime->moe_topk_pipeline = nil;
     runtime->moe_q4_0_gate_up_reduce_pipeline = nil;
+    runtime->moe_activation_multiply_pipeline = nil;
     runtime->moe_q4_0_down_reduce_pipeline = nil;
     runtime->moe_reduce_pipeline = nil;
     runtime->q4_0_pair_activation_reduce_pipeline = nil;
@@ -24566,8 +24588,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_device(
         runtime->moe_q4_0_gate_up_reduce_pipeline == nil ||
         runtime->moe_q4_0_down_reduce_pipeline == nil ||
         runtime->moe_reduce_pipeline == nil ||
-        runtime->activation_pipeline == nil ||
-        runtime->multiply_pipeline == nil) return -2;
+        runtime->moe_activation_multiply_pipeline == nil) return -2;
     if (termite_metal_decode_runtime_moe_q4_0_layer_arena_prepared(
             runtime, layer, num_experts, hidden_size, inter_size) == 0) return -3;
     if (total_rows == 0 || top_k == 0 || top_k > 8 || top_k > num_experts) return -4;
@@ -24696,38 +24717,28 @@ int termite_metal_decode_runtime_moe_forward_q4_0_device(
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        // De-fused activation + elementwise multiply, matching the streamed
-        // chain bit-for-bit: precise termite_apply_activation_1x on the raw gate
-        // (in place), then the library termite_apply_multiply_1x of the
-        // activated gate by the raw up. The gated result overwrites the
-        // intermediate buffer and becomes the down projection's input.
+        // Fused activation + elementwise multiply, matching the streamed chain
+        // bit-for-bit in ONE precise pass: precise gelu on the raw gate, then a
+        // STANDALONE `activated * up` multiply (its own statement, cannot
+        // FMA-contract, so bit-identical to the library plain multiply in any
+        // math mode). Gate is read from the intermediate buffer and the gated
+        // result overwrites it in place (each thread touches only its own lane),
+        // becoming the down projection's input. Replaces the prior de-fused pair
+        // (one precise activation pass + one library multiply pass) -> removes a
+        // dispatch and a barrier per MoE layer while staying bit-exact.
         termite_metal_apply_activation_params moe_act_params = {
             .activation_kind = activation_kind,
             .rows = (uint32_t)route_rows,
             .dim = (uint32_t)inter_size,
         };
         const size_t moe_gated_total = route_rows * inter_size;
-        [moe_encoder setComputePipelineState:runtime->activation_pipeline];
-        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:0];
-        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:1];
-        [moe_encoder setBytes:&moe_act_params length:sizeof(moe_act_params) atIndex:2];
+        [moe_encoder setComputePipelineState:runtime->moe_activation_multiply_pipeline];
+        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:0];   // gate (raw)
+        [moe_encoder setBuffer:runtime->moe_route_output_buffer offset:0 atIndex:1];   // up (raw)
+        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:2];   // gated out (in place)
+        [moe_encoder setBytes:&moe_act_params length:sizeof(moe_act_params) atIndex:3];
         [moe_encoder dispatchThreads:MTLSizeMake(moe_gated_total, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, moe_gated_total), 1, 1)];
-        [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-        termite_metal_apply_add_params moe_mul_params = {
-            .rows = (uint32_t)route_rows,
-            .dim = (uint32_t)inter_size,
-            .flags = 0u,
-            .reserved = 0u,
-        };
-        [moe_encoder setComputePipelineState:runtime->multiply_pipeline];
-        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:0];
-        [moe_encoder setBuffer:runtime->moe_route_output_buffer offset:0 atIndex:1];
-        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:2];
-        [moe_encoder setBytes:&moe_mul_params length:sizeof(moe_mul_params) atIndex:3];
-        [moe_encoder dispatchThreads:MTLSizeMake(moe_gated_total, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, moe_gated_total), 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->moe_activation_multiply_pipeline, moe_gated_total), 1, 1)];
         [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
         termite_metal_moe_q4_0_down_params down_params = {
@@ -24837,8 +24848,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_from_ids(
     if (runtime->moe_q4_0_gate_up_reduce_pipeline == nil ||
         runtime->moe_q4_0_down_reduce_pipeline == nil ||
         runtime->moe_reduce_pipeline == nil ||
-        runtime->activation_pipeline == nil ||
-        runtime->multiply_pipeline == nil) return -2;
+        runtime->moe_activation_multiply_pipeline == nil) return -2;
     if (termite_metal_decode_runtime_moe_q4_0_layer_arena_prepared(
             runtime, layer, num_experts, hidden_size, inter_size) == 0) return -3;
     if (total_rows == 0 || top_k == 0 || top_k > 8 || top_k > num_experts) return -4;
@@ -24947,38 +24957,28 @@ int termite_metal_decode_runtime_moe_forward_q4_0_from_ids(
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        // De-fused activation + elementwise multiply, matching the streamed
-        // chain bit-for-bit: precise termite_apply_activation_1x on the raw gate
-        // (in place), then the library termite_apply_multiply_1x of the
-        // activated gate by the raw up. The gated result overwrites the
-        // intermediate buffer and becomes the down projection's input.
+        // Fused activation + elementwise multiply, matching the streamed chain
+        // bit-for-bit in ONE precise pass: precise gelu on the raw gate, then a
+        // STANDALONE `activated * up` multiply (its own statement, cannot
+        // FMA-contract, so bit-identical to the library plain multiply in any
+        // math mode). Gate is read from the intermediate buffer and the gated
+        // result overwrites it in place (each thread touches only its own lane),
+        // becoming the down projection's input. Replaces the prior de-fused pair
+        // (one precise activation pass + one library multiply pass) -> removes a
+        // dispatch and a barrier per MoE layer while staying bit-exact.
         termite_metal_apply_activation_params moe_act_params = {
             .activation_kind = activation_kind,
             .rows = (uint32_t)route_rows,
             .dim = (uint32_t)inter_size,
         };
         const size_t moe_gated_total = route_rows * inter_size;
-        [moe_encoder setComputePipelineState:runtime->activation_pipeline];
-        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:0];
-        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:1];
-        [moe_encoder setBytes:&moe_act_params length:sizeof(moe_act_params) atIndex:2];
+        [moe_encoder setComputePipelineState:runtime->moe_activation_multiply_pipeline];
+        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:0];   // gate (raw)
+        [moe_encoder setBuffer:runtime->moe_route_output_buffer offset:0 atIndex:1];   // up (raw)
+        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:2];   // gated out (in place)
+        [moe_encoder setBytes:&moe_act_params length:sizeof(moe_act_params) atIndex:3];
         [moe_encoder dispatchThreads:MTLSizeMake(moe_gated_total, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, moe_gated_total), 1, 1)];
-        [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-        termite_metal_apply_add_params moe_mul_params = {
-            .rows = (uint32_t)route_rows,
-            .dim = (uint32_t)inter_size,
-            .flags = 0u,
-            .reserved = 0u,
-        };
-        [moe_encoder setComputePipelineState:runtime->multiply_pipeline];
-        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:0];
-        [moe_encoder setBuffer:runtime->moe_route_output_buffer offset:0 atIndex:1];
-        [moe_encoder setBuffer:runtime->moe_intermediate_buffer offset:0 atIndex:2];
-        [moe_encoder setBytes:&moe_mul_params length:sizeof(moe_mul_params) atIndex:3];
-        [moe_encoder dispatchThreads:MTLSizeMake(moe_gated_total, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, moe_gated_total), 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->moe_activation_multiply_pipeline, moe_gated_total), 1, 1)];
         [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
         termite_metal_moe_q4_0_down_params down_params = {
@@ -25176,8 +25176,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_prerouted_host(
     if (runtime->moe_q4_0_gate_up_reduce_pipeline == nil ||
         runtime->moe_q4_0_down_reduce_pipeline == nil ||
         runtime->moe_reduce_pipeline == nil ||
-        runtime->activation_pipeline == nil ||
-        runtime->multiply_pipeline == nil) return -2;
+        runtime->moe_activation_multiply_pipeline == nil) return -2;
     if (termite_metal_decode_runtime_moe_q4_0_layer_arena_prepared(
             runtime, layer, num_experts, hidden_size, inter_size) == 0) return -3;
     if (total_rows == 0 || top_k == 0 || top_k > 8 || top_k > num_experts) return -4;
@@ -25267,38 +25266,28 @@ int termite_metal_decode_runtime_moe_forward_q4_0_prerouted_host(
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        // De-fused activation + elementwise multiply, matching the streamed
-        // chain bit-for-bit: precise termite_apply_activation_1x on the raw gate
-        // (in place), then the library termite_apply_multiply_1x of the
-        // activated gate by the raw up. The gated result overwrites the
-        // intermediate buffer and becomes the down projection's input.
+        // Fused activation + elementwise multiply, matching the streamed chain
+        // bit-for-bit in ONE precise pass: precise gelu on the raw gate, then a
+        // STANDALONE `activated * up` multiply (its own statement, cannot
+        // FMA-contract, so bit-identical to the library plain multiply in any
+        // math mode). Gate is read from the intermediate buffer and the gated
+        // result overwrites it in place (each thread touches only its own lane),
+        // becoming the down projection's input. Replaces the prior de-fused pair
+        // (one precise activation pass + one library multiply pass) -> removes a
+        // dispatch and a barrier per MoE layer while staying bit-exact.
         termite_metal_apply_activation_params moe_act_params = {
             .activation_kind = activation_kind,
             .rows = (uint32_t)route_rows,
             .dim = (uint32_t)inter_size,
         };
         const size_t moe_gated_total = route_rows * inter_size;
-        [moe_encoder setComputePipelineState:runtime->activation_pipeline];
-        [moe_encoder setBuffer:intermediate_buffer offset:0 atIndex:0];
-        [moe_encoder setBuffer:intermediate_buffer offset:0 atIndex:1];
-        [moe_encoder setBytes:&moe_act_params length:sizeof(moe_act_params) atIndex:2];
+        [moe_encoder setComputePipelineState:runtime->moe_activation_multiply_pipeline];
+        [moe_encoder setBuffer:intermediate_buffer offset:0 atIndex:0];   // gate (raw)
+        [moe_encoder setBuffer:route_output_buffer offset:0 atIndex:1];   // up (raw)
+        [moe_encoder setBuffer:intermediate_buffer offset:0 atIndex:2];   // gated out (in place)
+        [moe_encoder setBytes:&moe_act_params length:sizeof(moe_act_params) atIndex:3];
         [moe_encoder dispatchThreads:MTLSizeMake(moe_gated_total, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->activation_pipeline, moe_gated_total), 1, 1)];
-        [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-        termite_metal_apply_add_params moe_mul_params = {
-            .rows = (uint32_t)route_rows,
-            .dim = (uint32_t)inter_size,
-            .flags = 0u,
-            .reserved = 0u,
-        };
-        [moe_encoder setComputePipelineState:runtime->multiply_pipeline];
-        [moe_encoder setBuffer:intermediate_buffer offset:0 atIndex:0];
-        [moe_encoder setBuffer:route_output_buffer offset:0 atIndex:1];
-        [moe_encoder setBuffer:intermediate_buffer offset:0 atIndex:2];
-        [moe_encoder setBytes:&moe_mul_params length:sizeof(moe_mul_params) atIndex:3];
-        [moe_encoder dispatchThreads:MTLSizeMake(moe_gated_total, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->multiply_pipeline, moe_gated_total), 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->moe_activation_multiply_pipeline, moe_gated_total), 1, 1)];
         [moe_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
         termite_metal_moe_q4_0_down_params down_params = {
