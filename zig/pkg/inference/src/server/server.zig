@@ -2915,6 +2915,7 @@ pub const Node = struct {
             else
                 null;
         var result = pipeline.generate(messages, .{ .max_tokens = max_tokens, .prefill_chunk_size = admitted_prefill_chunk }) catch |err| {
+            if (comptime build_options.enable_cuda) session_factory.drainCudaProfile(model.session);
             std.log.err("direct generator generation failed model={s} backend={s}: {s}", .{
                 model_name,
                 @tagName(model.session.backend()),
@@ -7449,6 +7450,9 @@ pub const Node = struct {
             @ptrCast(&stream_ctx),
             StreamCtx.onToken,
         ) catch |err| {
+            if (comptime build_options.enable_cuda) {
+                if (pipeline.session) |sess| session_factory.drainCudaProfile(sess);
+            }
             // Try to send an error event before closing
             writeInternalStreamError(&writer, "GENERATION_FAILED", err);
             writer.close() catch {};

@@ -69,6 +69,12 @@ fn debugGenerateSetup(comptime fmt: []const u8, args: anytype) void {
     std.debug.print("generate-setup: " ++ fmt ++ "\n", args);
 }
 
+fn drainCudaGenerationProfiles(target_session: backends.Session, draft_session: ?backends.Session) void {
+    if (comptime !build_options.enable_cuda) return;
+    session_factory.drainCudaProfile(target_session);
+    if (draft_session) |session| session_factory.drainCudaProfile(session);
+}
+
 fn shouldSkipAutoMtpDraftLoad(opts: Options, draft_cfg: gpt_mod.Config) bool {
     if (opts.speculation_policy != .auto) return false;
     if (!draft_cfg.gemma4_mtp_assistant) return false;
@@ -1021,13 +1027,20 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             config.prefill_chunk_size,
             &decode_state,
         ) catch |err| {
+            drainCudaGenerationProfiles(
+                model.session,
+                if (draft_model) |loaded_draft| loaded_draft.session else null,
+            );
             if (err == error.MemoryBudgetExceeded) {
                 printBudgetExceeded(model.session, &run_budget);
             }
             return err;
         };
         const finished_generate_at = std.Io.Timestamp.now(io, .awake);
-        if (comptime build_options.enable_cuda) session_factory.drainCudaProfile(model.session);
+        drainCudaGenerationProfiles(
+            model.session,
+            if (draft_model) |loaded_draft| loaded_draft.session else null,
+        );
         const cuda_stats_after_generate = if (comptime build_options.enable_cuda)
             session_factory.getCudaRuntimeStats(model.session)
         else
@@ -1099,6 +1112,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return;
     }
     var result = generateWithOptionalStreaming(&pipeline, &messages, config, opts.stream) catch |err| {
+        drainCudaGenerationProfiles(
+            model.session,
+            if (draft_model) |loaded_draft| loaded_draft.session else null,
+        );
         if (err == error.MemoryBudgetExceeded) {
             printBudgetExceeded(model.session, &run_budget);
         } else if (err == error.AudioInputTooLong) {
@@ -1109,7 +1126,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const finished_generate_at = std.Io.Timestamp.now(io, .awake);
     // Drain buffered per-op profile events (single host sync, off the hot path)
     // so the prefill/decode profile counters below reflect the whole request.
-    if (comptime build_options.enable_cuda) session_factory.drainCudaProfile(model.session);
+    drainCudaGenerationProfiles(
+        model.session,
+        if (draft_model) |loaded_draft| loaded_draft.session else null,
+    );
     const cuda_stats_after_generate = if (comptime build_options.enable_cuda)
         session_factory.getCudaRuntimeStats(model.session)
     else
@@ -5462,6 +5482,12 @@ fn generationKvBackendKind(backend: backends.BackendType) ?runtime.kv.pool.Backe
 fn cudaGemmaPrefillPrewarmEnabled() bool {
     if (envFlagEnabled("ANTFLY_INFERENCE_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
     if (envFlagEnabled("ANTFLY_INFERENCE_CUDA_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
+    if (platform.env.getenv("ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM")) |_| {
+        if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM", true)) return false;
+    }
+    if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM")) |_| {
+        if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM", true)) return false;
+    }
     return platform.env.getenvBoolDefault(
         "ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM",
         platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM", true),
@@ -8359,6 +8385,15 @@ test "cuda gemma prefill prewarm defaults on with bidirectional env overrides" {
     try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM", "1", 1));
     try std.testing.expect(cudaGemmaPrefillPrewarmEnabled());
     try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM", "0", 1));
+    try std.testing.expect(!cudaGemmaPrefillPrewarmEnabled());
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv("ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM"));
+
+    // Either explicit false wins when both enable variables are configured.
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM", "1", 1));
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM", "0", 1));
+    try std.testing.expect(!cudaGemmaPrefillPrewarmEnabled());
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM", "0", 1));
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM", "1", 1));
     try std.testing.expect(!cudaGemmaPrefillPrewarmEnabled());
     try std.testing.expectEqual(@as(c_int, 0), unsetenv("ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM"));
 

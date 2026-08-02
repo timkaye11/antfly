@@ -112,6 +112,7 @@ class PairBenchmarkAccountingTest(unittest.TestCase):
             "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE",
             "ANTFLY_GQA_PREFILL_PROFILE",
             "antfly_gqa_prefill_profile",
+            "ANTFLY_GQA_PREFILL_USE_RUNTIME_DEFAULT",
         ):
             env.pop(name, None)
         for suffix in ("FAST", "TILED", "MMA"):
@@ -216,6 +217,20 @@ class PairBenchmarkAccountingTest(unittest.TestCase):
         )
         summary = json.loads((output_dir / "paired_summary.json").read_text())
         self.assertEqual("required-fast", summary["comparison"]["antfly_gqa_prefill_profile"])
+
+    def test_gqa_prefill_profile_can_exercise_the_unset_runtime_default(self) -> None:
+        profile_log = self.root / "gqa-profile-runtime-default.log"
+        completed, output_dir = self.run_case(
+            GQA_PROFILE_LOG=str(profile_log),
+            ANTFLY_GQA_PREFILL_USE_RUNTIME_DEFAULT="1",
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(
+            ["unset"],
+            profile_log.read_text(encoding="utf-8").splitlines(),
+        )
+        summary = json.loads((output_dir / "paired_summary.json").read_text())
+        self.assertEqual("automatic", summary["comparison"]["antfly_gqa_prefill_profile"])
 
     def test_gqa_prefill_profile_preserves_explicit_legacy_bridge(self) -> None:
         profile_log = self.root / "gqa-profile-legacy.log"

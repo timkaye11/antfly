@@ -85,6 +85,41 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
                 )
                 self.assertEqual(profile, environment["ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE"])
 
+    def test_gqa_prefill_can_preserve_the_runtime_automatic_default(self):
+        environment = configured_environment(
+            ANTFLY_GQA_PREFILL_USE_RUNTIME_DEFAULT="1",
+        )
+        self.assertNotIn("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE", environment)
+
+        completed = wrapped_environment(
+            ANTFLY_GQA_PREFILL_USE_RUNTIME_DEFAULT="1",
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        wrapped = dict(line.split("=", 1) for line in completed.stdout.splitlines())
+        self.assertNotIn("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE", wrapped)
+
+    def test_gqa_runtime_default_rejects_explicit_profile_conflicts(self):
+        environment = os.environ.copy()
+        environment.update(
+            ANTFLY_GQA_PREFILL_USE_RUNTIME_DEFAULT="1",
+            ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE="required-fast",
+        )
+        completed = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; gemma4_qat_cuda_tuning_env 777',
+                "bash",
+                str(TUNING_SCRIPT),
+            ],
+            check=False,
+            capture_output=True,
+            env=environment,
+            text=True,
+        )
+        self.assertEqual(2, completed.returncode)
+        self.assertIn("conflicts with explicit GQA prefill configuration", completed.stderr)
+
     def test_gqa_prefill_rejects_unknown_typed_profile(self):
         environment = os.environ.copy()
         environment["ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE"] = "tiled-f16-typo"

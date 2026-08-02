@@ -305,6 +305,7 @@ class L4ReleaseGateTest(unittest.TestCase):
         self.assertNotIn("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE", profile)
         self.assertNotIn("ANTFLY_GQA_PREFILL_PROFILE", profile)
         self.assertNotIn("antfly_gqa_prefill_profile", profile)
+        self.assertEqual("1", profile["ANTFLY_GQA_PREFILL_USE_RUNTIME_DEFAULT"])
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION"])
         self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN"])
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD"])
@@ -355,6 +356,7 @@ class L4ReleaseGateTest(unittest.TestCase):
         # default is the automatic selector, so an inherited explicit profile
         # must be scrubbed rather than inherited into the release run.
         self.assertNotIn("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE", environment)
+        self.assertEqual("1", environment["ANTFLY_GQA_PREFILL_USE_RUNTIME_DEFAULT"])
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT"])
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_PAIR_ONLY"])
         self.assertEqual("1", environment["REQUIRE_LM_HEAD_ARGMAX"])

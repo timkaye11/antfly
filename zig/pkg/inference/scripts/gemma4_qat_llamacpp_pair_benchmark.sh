@@ -45,6 +45,8 @@ Environment overrides:
                           1 to benchmark experimental generated Q8_1 FFN decode (default: 0)
   ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE
                           canonical GQA prefill attention profile (default: required-fast)
+  ANTFLY_GQA_PREFILL_USE_RUNTIME_DEFAULT
+                          1 to leave the canonical profile unset and exercise the runtime automatic default
   ANTFLY_GQA_PREFILL_FAST
                           legacy boolean bridge for the fast row-batched GQA prefill
                           kernel; leave unset to keep the fail-closed required-fast default
@@ -312,7 +314,10 @@ tuning_value() {
   return 1
 }
 
-effective_gqa_prefill_profile="$(tuning_value ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE)"
+case "${ANTFLY_GQA_PREFILL_USE_RUNTIME_DEFAULT:-0}" in
+  1|true|yes|on) effective_gqa_prefill_profile=automatic ;;
+  *) effective_gqa_prefill_profile="$(tuning_value ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE)" ;;
+esac
 effective_generated_attention="$(tuning_value ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE)"
 effective_lm_head_argmax="$(tuning_value ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX)"
 effective_generated_q6_lm_head_argmax="$(tuning_value ANTFLY_INFERENCE_CUDA_GENERATED_Q6_K_Q8_1_LM_HEAD_ARGMAX)"

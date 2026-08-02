@@ -1065,6 +1065,32 @@ func TestInferenceGenerateRequest_OmitsSamplingAndSpeculationDefaults(t *testing
 	}
 }
 
+func TestClient_Generate_PreservesExplicitThinkingFalse(t *testing.T) {
+	var requests []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		requests = append(requests, request)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"target","choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`)
+	}))
+	defer server.Close()
+
+	client, err := NewInferenceClient(server.URL, nil)
+	require.NoError(t, err)
+	_, err = client.Generate(context.Background(), "target", []oapi.InferenceChatMessage{NewUserMessage("hello")}, nil)
+	require.NoError(t, err)
+	enableThinking := false
+	_, err = client.Generate(context.Background(), "target", []oapi.InferenceChatMessage{NewUserMessage("hello")}, &GenerateConfig{
+		EnableThinking: &enableThinking,
+	})
+	require.NoError(t, err)
+
+	require.Len(t, requests, 2)
+	assert.NotContains(t, requests[0], "chat_template_kwargs")
+	assert.Equal(t, map[string]any{"enable_thinking": false}, requests[1]["chat_template_kwargs"])
+}
+
 func TestClient_Generate_ExplicitSamplingZeroOverrides(t *testing.T) {
 	var requests []map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

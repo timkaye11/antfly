@@ -604,6 +604,10 @@ type GenerateConfig struct {
 	TopK int
 	// TopKOverride sends the exact value, including zero, and takes precedence over TopK.
 	TopKOverride           *int
+	// EnableThinking controls chat templates that expose the Hugging Face-
+	// compatible enable_thinking variable. Nil preserves the model default;
+	// a pointer to false explicitly opens the public final response channel.
+	EnableThinking         *bool
 	DraftModel             string
 	SpeculativeK           int
 	SpeculationPolicy      oapi.InferenceGenerateRequestSpeculationPolicy
@@ -670,6 +674,11 @@ func (c *InferenceClient) Generate(ctx context.Context, model string, messages [
 			req.TopK = config.TopKOverride
 		} else if config.TopK > 0 {
 			req.TopK = &config.TopK
+		}
+		if config.EnableThinking != nil {
+			req.ChatTemplateKwargs = oapi.InferenceGenerateChatTemplateKwargs{
+				EnableThinking: config.EnableThinking,
+			}
 		}
 		if config.DraftModel != "" {
 			req.DraftModel = config.DraftModel

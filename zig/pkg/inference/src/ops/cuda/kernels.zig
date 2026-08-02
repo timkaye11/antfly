@@ -26,8 +26,17 @@ const quant_matmul = @import("../../graph/quant_matmul.zig");
 const cuda_kernel_renderer = @import("../../graph/quant_kernel_cuda_renderer.zig");
 const quant_codec = @import("../../gguf/quant_codec.zig");
 const platform = @import("antfly_platform");
+
 const turboquant = @import("../../runtime/kv/turboquant.zig");
 const kv_pool_mod = @import("../../runtime/kv/pool.zig");
+
+// The portable bundle is compiled for compute_75. Its BF16 WMMA entry point is
+// retained as an empty compatibility symbol because CUDA cannot compile BF16
+// fragments for that target. Never expose that symbol to dispatch: Ampere+
+// devices JITing the portable PTX must use the working F16 WMMA fallback.
+fn bundledQ4_0TcHmmaBf16Supported(compute_major: i32, compute_minor: i32) bool {
+    return cuda_artifact.hasBf16WmmaCodeFor(compute_major, compute_minor);
+}
 
 pub const Q8ActivationEncoding = enum {
     /// Historical Antfly layout: half d, zero half, 32 signed values.
@@ -3458,7 +3467,10 @@ pub const KernelModule = struct {
         const linear_q8_0_bias_gelu_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_gelu_f32_tc_hmma");
         const linear_q8_0_bias_add_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_add_f32_tc_hmma");
         const linear_q4_0_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_0_f32_tc_hmma");
-        const linear_q4_0_f32_tc_hmma_bf16 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_f32_tc_hmma_bf16");
+        const linear_q4_0_f32_tc_hmma_bf16 = if (bundledQ4_0TcHmmaBf16Supported(ctx.info.compute_major, ctx.info.compute_minor))
+            loadOptionalFunction(ctx, module, "termite_linear_q4_0_f32_tc_hmma_bf16")
+        else
+            null;
         const linear_q4_0_bias_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_0_bias_f32_tc_hmma");
         const linear_q4_0_bias_gelu_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_0_bias_gelu_f32_tc_hmma");
         const linear_q4_0_bias_add_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_0_bias_add_f32_tc_hmma");
@@ -17624,6 +17636,19 @@ test "CUDA runtime JIT mappings cover complete artifact function bundles" {
     }
     try std.testing.expect(cuda_artifacts > 0);
     try std.testing.expect(attention_artifacts > 0);
+}
+
+test "bundled BF16 Q4_0 WMMA availability excludes compute-75 PTX fallbacks" {
+    if (cuda_artifact.uses_jit) {
+        try std.testing.expect(!bundledQ4_0TcHmmaBf16Supported(8, 9));
+    } else if (cuda_artifact.is_sm89) {
+        try std.testing.expect(bundledQ4_0TcHmmaBf16Supported(8, 9));
+        try std.testing.expect(!bundledQ4_0TcHmmaBf16Supported(9, 0));
+    } else {
+        try std.testing.expect(bundledQ4_0TcHmmaBf16Supported(8, 9));
+        try std.testing.expect(bundledQ4_0TcHmmaBf16Supported(12, 1));
+        try std.testing.expect(!bundledQ4_0TcHmmaBf16Supported(13, 0));
+    }
 }
 
 test "CUDA runtime JIT profile scope covers only Gemma4 production routes" {

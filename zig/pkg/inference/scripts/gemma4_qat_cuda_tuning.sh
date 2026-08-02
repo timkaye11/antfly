@@ -8,14 +8,27 @@ gemma4_qat_cuda_tuning_env() {
   local decode_graph_replay="${antfly_decode_graph_replay:-${ANTFLY_DECODE_GRAPH_REPLAY:-required}}"
   local q4_rows="${antfly_q4_0_q8_1_prefill_rows:-${ANTFLY_Q4_0_Q8_1_PREFILL_ROWS:-1}}"
   local gate_up_q8="${ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE:-${antfly_q4_0_gate_up_activation_q8_1_precompute:-${ANTFLY_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE:-0}}}"
-  # Prefer the typed profile consumed by the CUDA module.  The independent
+  # Prefer the typed profile consumed by the CUDA module. The independent
   # legacy booleans remain an input-only compatibility bridge; emitting a
   # single canonical value prevents ambiguous route combinations from reaching
-  # production.  With no legacy input, require the qualified fast route so a
-  # missing kernel cannot silently turn a performance run into a scalar one.
+  # production. Release qualification can explicitly preserve the runtime's
+  # unset automatic default instead of having this tuning wrapper replace it.
   local gqa_profile="${ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE:-${antfly_gqa_prefill_profile:-${ANTFLY_GQA_PREFILL_PROFILE:-}}}"
   local legacy_gqa_configured="${ANTFLY_INFERENCE_CUDA_GQA_PREFILL_FAST+x}${antfly_gqa_prefill_fast+x}${ANTFLY_GQA_PREFILL_FAST+x}${ANTFLY_INFERENCE_CUDA_GQA_PREFILL_TILED+x}${antfly_gqa_prefill_tiled+x}${ANTFLY_GQA_PREFILL_TILED+x}${ANTFLY_INFERENCE_CUDA_GQA_PREFILL_MMA+x}${antfly_gqa_prefill_mma+x}${ANTFLY_GQA_PREFILL_MMA+x}"
-  if [[ -z "$gqa_profile" ]]; then
+  local gqa_use_runtime_default="${ANTFLY_GQA_PREFILL_USE_RUNTIME_DEFAULT:-0}"
+  case "$gqa_use_runtime_default" in
+    1|true|yes|on) gqa_use_runtime_default=1 ;;
+    0|false|no|off) gqa_use_runtime_default=0 ;;
+    *)
+      echo "ANTFLY_GQA_PREFILL_USE_RUNTIME_DEFAULT must be a boolean" >&2
+      return 2
+      ;;
+  esac
+  if [[ "$gqa_use_runtime_default" -eq 1 && ( -n "$gqa_profile" || -n "$legacy_gqa_configured" ) ]]; then
+    echo "ANTFLY_GQA_PREFILL_USE_RUNTIME_DEFAULT conflicts with explicit GQA prefill configuration" >&2
+    return 2
+  fi
+  if [[ "$gqa_use_runtime_default" -eq 0 && -z "$gqa_profile" ]]; then
     if [[ -z "$legacy_gqa_configured" ]]; then
       gqa_profile=required-fast
     else
@@ -34,13 +47,15 @@ gemma4_qat_cuda_tuning_env() {
       esac
     fi
   fi
-  case "$gqa_profile" in
-    off|fast|required-fast|tiled|mma|tiled-f16-exact|required-tiled-f16-exact|tiled-f16-warp|required-tiled-f16-warp|flash-f16-sm89|required-flash-f16-sm89) ;;
-    *)
-      echo "invalid ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE=$gqa_profile" >&2
-      return 2
-      ;;
-  esac
+  if [[ "$gqa_use_runtime_default" -eq 0 ]]; then
+    case "$gqa_profile" in
+      off|fast|required-fast|tiled|mma|tiled-f16-exact|required-tiled-f16-exact|tiled-f16-warp|required-tiled-f16-warp|flash-f16-sm89|required-flash-f16-sm89) ;;
+      *)
+        echo "invalid ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE=$gqa_profile" >&2
+        return 2
+        ;;
+    esac
+  fi
   # Decode split-K is shape-specific (Gemma 4 E2B GQA 8:1 on SM89), so the
   # shared tuning profile must never enable it implicitly for E4B/12B or other
   # attention topologies. Versioned E2B qualification profiles opt in.
@@ -165,7 +180,6 @@ gemma4_qat_cuda_tuning_env() {
     ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_PRECOMPUTE=1
     ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE="$gate_up_q8"
     ANTFLY_INFERENCE_CUDA_Q4_0_Q8_1_PREFILL_ROWS="$q4_rows"
-    ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE="$gqa_profile"
     ANTFLY_INFERENCE_CUDA_GQA_DECODE_PROFILE="$gqa_decode_profile"
     ANTFLY_INFERENCE_CUDA_PLE_GATE_PREFILL_PROFILE="$ple_gate_prefill_profile"
     ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8=1
@@ -212,6 +226,10 @@ gemma4_qat_cuda_tuning_env() {
     ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT="$generated_e2b_ffn_exact"
     ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_PAIR_ONLY="$generated_e2b_ffn_pair_only"
   )
+
+  if [[ "$gqa_use_runtime_default" -eq 0 ]]; then
+    GEMMA4_QAT_CUDA_ENV+=(ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE="$gqa_profile")
+  fi
 
   case "$generated_attention_score_prework" in
     auto) ;;

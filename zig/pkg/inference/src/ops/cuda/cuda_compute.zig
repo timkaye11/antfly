@@ -4515,6 +4515,13 @@ test "CUDA tuned route gates promote the SM89 battery only on compute 8.9" {
     try std.testing.expectEqual(@as(usize, 8192), (CudaTunedRouteGates{}).linear_q8_1_tile4_w8_min_in_dim);
 }
 
+test "W4A16 prefill never preempts an available BF16 mirror route" {
+    try std.testing.expect(shouldTryQ4_0TcHmmaPrefill(true, 2, false));
+    try std.testing.expect(!shouldTryQ4_0TcHmmaPrefill(true, 2, true));
+    try std.testing.expect(!shouldTryQ4_0TcHmmaPrefill(true, 1, false));
+    try std.testing.expect(!shouldTryQ4_0TcHmmaPrefill(false, 512, false));
+}
+
 test "CUDA tuned route gates keep env overrides working in both directions" {
     const allocator = std.testing.allocator;
     var guards: [tuned_route_gate_test_env_names.len]TestEnvGuard = undefined;
@@ -10780,6 +10787,10 @@ fn missingTcSymbolFallback(err: anyerror) anyerror!bool {
     };
 }
 
+fn shouldTryQ4_0TcHmmaPrefill(enabled: bool, rows: usize, bf16_mirror_route_available: bool) bool {
+    return enabled and rows > 1 and !bf16_mirror_route_available;
+}
+
 fn launchQ8TcHmmaNoBias(
     self: *CudaCompute,
     variant: kernels_mod.QMatmulVariant,
@@ -11612,13 +11623,16 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
     errdefer device.free(&self.ctx);
     var prefill_profile_scope = beginPrefillProfile(self, prefillProfileCategoryForLinearNoBias(weight_tensor, rows, in_dim, out_dim), rows);
     defer if (prefill_profile_scope) |*scope| scope.end();
-    if (self.tuned_route_gates.q4_0_tc_hmma_prefill and rows > 1 and
+    const bf16_mirror = weightBf16MirrorForRows(self, weight_tensor, rows);
+    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill, rows, bf16_mirror != null) and
         try launchQ4_0TcHmmaNoBias(self, .tc_hmma, device, input_tensor.buffer, weight_tensor, rows, in_dim, out_dim))
     {
-        // W4A16 tensor-core prefill route took the launch (opt-in, takes
-        // priority over the BF16 mirror so the two can be A/B'd directly).
+        // W4A16 tensor-core prefill route (default on SM89). It DEFERS to the
+        // BF16 mirror when present: cuBLASLt BF16 is faster than this WMMA kernel
+        // AND equal quality, so the mirror wins when the user opted into its
+        // +VRAM; W4A16 is the win over DP4A when no mirror is attached (default).
         self.dispatch_stats.note(self.allocator, .linear_no_bias, .q4_0, .q4_tc_hmma, .none, .none, rows, in_dim, out_dim, 0);
-    } else if (weightBf16MirrorForRows(self, weight_tensor, rows)) |mirror_buffer| {
+    } else if (bf16_mirror) |mirror_buffer| {
         if (try tryCublasLtBf16Linear(self, device, input_tensor, mirror_buffer, rows, in_dim, out_dim)) {
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .bf16, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
         } else {
@@ -13142,17 +13156,18 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
     const k_weight_tensor = tensorFromCt(k_weight);
     const v_weight_tensor = tensorFromCt(v_weight);
     try ensureF32(input_tensor);
-    // W4A16 QKV: when the tensor-core packs are present, defer to the individual
-    // linearNoBias path (which routes Q4_0 prefill through tc_hmma) instead of
-    // the fused BF16-mirror triple.
-    if (self.tuned_route_gates.q4_0_tc_hmma_prefill and rows > 1 and
-        tcQuantBuffer(q_weight_tensor, .q4_0_hmma) != null and
-        tcQuantBuffer(k_weight_tensor, .q4_0_hmma) != null and
-        tcQuantBuffer(v_weight_tensor, .q4_0_hmma) != null) return null;
     const q_mirror = weightBf16MirrorForRows(self, q_weight_tensor, rows);
     const k_mirror = weightBf16MirrorForRows(self, k_weight_tensor, rows);
     const v_mirror = weightBf16MirrorForRows(self, v_weight_tensor, rows);
     const use_hybrid_bf16 = q_mirror != null and k_mirror != null and v_mirror != null;
+    // W4A16 QKV: when the tensor-core packs are present AND no BF16 mirror is
+    // attached, defer to the individual linearNoBias path (which routes Q4_0
+    // prefill through tc_hmma). When a mirror IS present, keep the fused
+    // BF16-mirror triple (cuBLASLt is faster + equal quality).
+    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill, rows, use_hybrid_bf16) and
+        tcQuantBuffer(q_weight_tensor, .q4_0_hmma) != null and
+        tcQuantBuffer(k_weight_tensor, .q4_0_hmma) != null and
+        tcQuantBuffer(v_weight_tensor, .q4_0_hmma) != null) return null;
     const q_weight_bf16 = if (use_hybrid_bf16) q_mirror.? else q_weight_tensor.buffer;
     const k_weight_bf16 = if (use_hybrid_bf16) k_mirror.? else k_weight_tensor.buffer;
     const v_weight_bf16 = if (use_hybrid_bf16) v_mirror.? else v_weight_tensor.buffer;
@@ -13721,13 +13736,14 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
     var prefill_profile_scope = beginPrefillProfile(self, if (use_bf16) .bf16_pair else null, rows);
     defer if (prefill_profile_scope) |*scope| scope.end();
 
-    if (self.tuned_route_gates.q4_0_tc_hmma_prefill and rows > 1 and
+    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill, rows, use_hybrid_bf16) and
         tcQuantBuffer(weight_a_tensor, .q4_0_hmma) != null and
         tcQuantBuffer(weight_b_tensor, .q4_0_hmma) != null and
         try launchQ4_0TcHmmaNoBias(self, .tc_hmma, device_a, input_tensor.buffer, weight_a_tensor, rows, in_dim, out_dim) and
         try launchQ4_0TcHmmaNoBias(self, .tc_hmma, device_b, input_tensor.buffer, weight_b_tensor, rows, in_dim, out_dim))
     {
-        // W4A16 tensor-core gate/up pair (opt-in, priority over the BF16 mirror).
+        // W4A16 tensor-core gate/up pair. Defers to the BF16 mirror pair when
+        // present (use_hybrid_bf16): cuBLASLt is faster + equal quality.
         self.dispatch_stats.note(self.allocator, .linear_no_bias, .q4_0, .q4_tc_hmma, .pair, .none, rows, in_dim, out_dim, 0);
     } else if (use_f16) {
         if (!try tryCublasLtF16LinearPair(
