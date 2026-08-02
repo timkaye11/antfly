@@ -600,7 +600,10 @@ pub const entries = [_]compiler.CatalogEntry{
     splitkOnlineDecodeEntry(256, compiler.first_decode_splitk_online_cuda_hd256_kernel_id),
     splitkOnlineDecodeEntry(512, compiler.first_decode_splitk_online_cuda_hd512_kernel_id),
 
-    // Qualified single-launch Flash-prefill topology. Runtime constraints can
+    // Promoted single-launch Flash-prefill topology for the qualified SM89
+    // Gemma 4 F16 geometry. The production runtime attempts it automatically
+    // whenever the full eligibility contract holds (rollback:
+    // ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE=off). Runtime constraints
     // express query length and total-length/prefix buckets; the exact page-16,
     // sliding/global policy, format tags, and SM89 contract remain owned by the
     // typed renderer plan and the fail-closed runtime selector.
@@ -1514,12 +1517,12 @@ test "catalog resolves qualified SM89 F16 Flash-prefill buckets" {
         try std.testing.expectEqual(cuda_renderer.generated_flash_prefill_query_tile, resolved.schedule.rows_per_block);
         try std.testing.expectEqual(@as(u16, @intCast(item.head_dim)), resolved.schedule.cols_per_block);
         try std.testing.expectEqual(item.dynamic_shared_bytes, resolved.schedule.resources.dynamic_shared_memory_bytes);
-        try std.testing.expect(!resolved.production_enabled);
+        try std.testing.expect(resolved.production_enabled);
 
         const artifact = compiler.generatedRegistryArtifactForKernel(resolved.target.backend, resolved.kernel_id) orelse
             return error.CatalogArtifactMissing;
-        try std.testing.expect(!artifact.production_enabled);
-        try std.testing.expect(!artifact.runtime_default_enabled);
+        try std.testing.expect(artifact.production_enabled);
+        try std.testing.expect(artifact.runtime_default_enabled);
         try std.testing.expect(compiler.cudaFlashPrefillArtifactRuntimeWired(artifact));
         try validateEntryAgainstArtifact(resolved, artifact);
     }

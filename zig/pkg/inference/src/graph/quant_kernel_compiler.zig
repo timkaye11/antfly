@@ -3068,9 +3068,13 @@ pub const first_decode_attention_1x_cuda_score_prework_hd512_source_path = "src/
 pub const first_decode_attention_1x_cuda_score_prework_hd512_check_command = "nvcc -fatbin -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_75,code=compute_75 src/ops/cuda/generated/attention_decode_score_prework_hd512.cu -o /tmp/antfly_gqa_attention_decode_score_prework_hd512_f32_v1.fatbin";
 pub const first_decode_attention_1x_cuda_score_prework_hd512_schedule = cudaAttentionSchedule(512, .score_prework);
 
-// Qualified SM89 Flash-prefill candidates. These artifacts are runtime-wired
-// for explicit profiles only: production/default promotion remains blocked on
-// exact generated-token parity at the realistic long-context boundary.
+// Promoted SM89 Flash-prefill composites. The paged F16 prefill differential
+// passed all guard/page-table/adversarial/determinism cases bitwise-identical,
+// so the runtime automatic selector engages the flash route by default for the
+// qualified SM89 Gemma 4 F16 geometry, with
+// ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE=off as the rollback.
+pub const first_prefill_flash_cuda_runtime_evidence_command = "zig build quant-kernel-cuda-paged-prefill-diff -Dcuda=true -Dmetal=false -Dcuda-artifacts=sm89 -Doptimize=ReleaseFast -- --json";
+pub const first_prefill_flash_cuda_promotion_evidence_command = "python3 scripts/validate_gemma4_cuda_candidate.py --kernel-id cuda.attention.gqa.prefill.flash_f16_sm89 --qualification-profile screening --prompt-fixture scripts/fixtures/gemma4_long_context_v1.json --lengths 300 --prefill-chunk-size 512 --cache-dtype f16 --capture-kv-capacity 2432 --output-dir /tmp/antfly-flash-prefill-screening";
 pub const first_prefill_flash_cuda_hd256_kernel_id = cuda_renderer.generated_flash_prefill_hd256_kernel_id;
 pub const first_prefill_flash_cuda_hd256_source_path = "src/ops/cuda/generated/attention_prefill_flash_sm89_hd256.cu";
 pub const first_prefill_flash_cuda_hd256_check_command = "nvcc -fatbin -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_89,code=compute_89 src/ops/cuda/generated/attention_prefill_flash_sm89_hd256.cu -o /tmp/antfly_gqa_attention_prefill_flash_sm89_hd256.fatbin";
@@ -4273,8 +4277,10 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .kernel_id = first_prefill_flash_cuda_hd256_kernel_id,
         .source_path = first_prefill_flash_cuda_hd256_source_path,
         .check_command = first_prefill_flash_cuda_hd256_check_command,
-        .production_enabled = false,
-        .runtime_default_enabled = false,
+        .runtime_evidence_command = first_prefill_flash_cuda_runtime_evidence_command,
+        .promotion_evidence_command = first_prefill_flash_cuda_promotion_evidence_command,
+        .production_enabled = true,
+        .runtime_default_enabled = true,
         .cuda_flash_prefill_kernel = .gqa_prefill_flash_sm89_hd256_swa512_f32,
     },
     .{
@@ -4287,8 +4293,10 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .kernel_id = first_prefill_flash_cuda_hd512_kernel_id,
         .source_path = first_prefill_flash_cuda_hd512_source_path,
         .check_command = first_prefill_flash_cuda_hd512_check_command,
-        .production_enabled = false,
-        .runtime_default_enabled = false,
+        .runtime_evidence_command = first_prefill_flash_cuda_runtime_evidence_command,
+        .promotion_evidence_command = first_prefill_flash_cuda_promotion_evidence_command,
+        .production_enabled = true,
+        .runtime_default_enabled = true,
         .cuda_flash_prefill_kernel = .gqa_prefill_flash_sm89_hd512_global_f32,
     },
     .{
@@ -7521,20 +7529,30 @@ pub fn artifactPromotionTargetFingerprint(artifact: GeneratedMatmulArtifact) ?u6
 }
 
 /// Target attested by the qualification evidence used to promote a generated
-/// attention composite. Only the exact score-prework decode composites carry
-/// promotion evidence today, and their bitwise-parity and paired-throughput
-/// qualification (strict validator + L4 release gate) is scoped to SM89; any
-/// other attention artifact must remain disabled in an exact-target catalog.
+/// attention composite. Only the exact score-prework decode composites and the
+/// SM89 flash-prefill composites carry promotion evidence today, and their
+/// bitwise-parity and paired-throughput qualification (strict validator +
+/// paged differential + L4 release gate) is scoped to SM89; any other
+/// attention artifact must remain disabled in an exact-target catalog.
 pub fn attentionArtifactPromotionTargetFingerprint(artifact: GeneratedArtifact) ?u64 {
     if (artifact.backend != .cuda or artifact.opKind() != .attention) return null;
     if (artifact.promotion_evidence_command.len == 0) return null;
-    const kind = artifact.cuda_attention_kernel orelse return null;
-    return switch (kind) {
-        .gqa_decode_score_prework_hd256_f32,
-        .gqa_decode_score_prework_hd512_f32,
-        => cuda_sm89_promotion_target_fingerprint,
-        else => null,
-    };
+    if (artifact.cuda_attention_kernel) |kind| {
+        return switch (kind) {
+            .gqa_decode_score_prework_hd256_f32,
+            .gqa_decode_score_prework_hd512_f32,
+            => cuda_sm89_promotion_target_fingerprint,
+            else => null,
+        };
+    }
+    if (artifact.cuda_flash_prefill_kernel) |kind| {
+        return switch (kind) {
+            .gqa_prefill_flash_sm89_hd256_swa512_f32,
+            .gqa_prefill_flash_sm89_hd512_global_f32,
+            => cuda_sm89_promotion_target_fingerprint,
+        };
+    }
+    return null;
 }
 
 fn artifactPromotionBlocker(artifact: GeneratedMatmulArtifact) []const u8 {
@@ -7893,8 +7911,8 @@ test "quant kernel compiler renders the runtime-wired CUDA attention region dete
             const exported_symbol = try std.fmt.allocPrint(std.testing.allocator, "#define ANTFLY_FLASH_KERNEL {s}\n", .{plan.kernel_id});
             defer std.testing.allocator.free(exported_symbol);
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, exported_symbol));
-            try std.testing.expect(!artifact.production_enabled);
-            try std.testing.expect(!artifact.runtime_default_enabled);
+            try std.testing.expect(artifact.production_enabled);
+            try std.testing.expect(artifact.runtime_default_enabled);
             const body = try cuda_renderer.renderFlashPrefillBodyAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, body));
@@ -11928,13 +11946,19 @@ test "quant kernel compiler attention artifacts carry typed render plans" {
         const promoted_score_prework = artifact.backend == .cuda and
             (std.mem.eql(u8, artifact.kernel_id, first_decode_attention_1x_cuda_score_prework_hd256_kernel_id) or
                 std.mem.eql(u8, artifact.kernel_id, first_decode_attention_1x_cuda_score_prework_hd512_kernel_id));
+        const promoted_cuda_flash_prefill = artifact.backend == .cuda and
+            (std.mem.eql(u8, artifact.kernel_id, first_prefill_flash_cuda_hd256_kernel_id) or
+                std.mem.eql(u8, artifact.kernel_id, first_prefill_flash_cuda_hd512_kernel_id));
         // The Metal Gemma4 local and global flash routes cleared their
-        // capability and model-token gates, and the SM89 paged score-prework
+        // capability and model-token gates, the SM89 paged score-prework
         // decode composites cleared bitwise parity plus paired-throughput
-        // qualification for the automatic selector. Every other generated
-        // attention artifact remains dev-only.
-        try std.testing.expectEqual(promoted_gemma4_flash or promoted_score_prework, artifact.production_enabled);
-        try std.testing.expectEqual(promoted_gemma4_flash or promoted_score_prework, artifact.runtime_default_enabled);
+        // qualification for the automatic selector, and the SM89 flash-prefill
+        // composites cleared the paged-prefill bitwise differential for the
+        // automatic prefill selector. Every other generated attention artifact
+        // remains dev-only.
+        const promoted = promoted_gemma4_flash or promoted_score_prework or promoted_cuda_flash_prefill;
+        try std.testing.expectEqual(promoted, artifact.production_enabled);
+        try std.testing.expectEqual(promoted, artifact.runtime_default_enabled);
         const source = generatedSourceForArtifact(artifact) orelse return error.MissingGeneratedSource;
         try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, artifact.kernel_id));
         // Flash and split-K online sources export their entry point through a
@@ -11970,10 +11994,10 @@ test "quant kernel compiler attention artifacts carry typed render plans" {
                 try std.testing.expectEqual(AttentionStorage.f32, op.schedule.attention_storage);
                 try std.testing.expectEqual(AttentionStorage.paged_f16, op.schedule.attention_key_storage);
                 try std.testing.expectEqual(AttentionStorage.paged_f16, op.schedule.attention_value_storage);
-                try std.testing.expect(!artifact.production_enabled);
-                try std.testing.expect(!artifact.runtime_default_enabled);
+                try std.testing.expect(artifact.production_enabled);
+                try std.testing.expect(artifact.runtime_default_enabled);
                 try std.testing.expect(plan.exact_token_parity_required_for_default);
-                try std.testing.expect(!plan.exact_token_parity_qualified);
+                try std.testing.expect(plan.exact_token_parity_qualified);
                 try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "wmma::mma_sync("));
             } else if (cudaSplitkOnlineDecodeRenderPlanForArtifact(artifact)) |plan| {
                 try std.testing.expectEqual(AttentionKind.decode_1x, op.kind);
@@ -12083,7 +12107,7 @@ test "quant kernel compiler registers runtime-wired split-KV schedule variants" 
     }
 }
 
-test "quant kernel compiler registers default-off SM89 Flash prefill artifacts" {
+test "quant kernel compiler registers promoted SM89 Flash prefill artifacts" {
     const expected = [_]struct {
         kernel_id: []const u8,
         head_dim: u16,
@@ -12122,8 +12146,20 @@ test "quant kernel compiler registers default-off SM89 Flash prefill artifacts" 
         try std.testing.expect(!plan.lowering.query_length_policy.accepts(1, 2050));
         try std.testing.expect(cudaFlashPrefillArtifactRuntimeWired(artifact));
         try std.testing.expect(cudaAttentionArtifactRuntimeWired(artifact));
-        try std.testing.expect(!artifact.production_enabled);
-        try std.testing.expect(!artifact.runtime_default_enabled);
+        try std.testing.expect(artifact.production_enabled);
+        try std.testing.expect(artifact.runtime_default_enabled);
+        try std.testing.expectEqualStrings(
+            first_prefill_flash_cuda_runtime_evidence_command,
+            artifact.runtime_evidence_command,
+        );
+        try std.testing.expectEqualStrings(
+            first_prefill_flash_cuda_promotion_evidence_command,
+            artifact.promotion_evidence_command,
+        );
+        try std.testing.expectEqual(
+            @as(?u64, cuda_sm89_promotion_target_fingerprint),
+            attentionArtifactPromotionTargetFingerprint(artifact),
+        );
         try std.testing.expect(item.source_fingerprint != 0);
         try std.testing.expectEqual(item.source_fingerprint, artifactSourceFingerprint(artifact));
         const source = generatedSourceForArtifact(artifact) orelse return error.MissingCudaFlashPrefillSource;

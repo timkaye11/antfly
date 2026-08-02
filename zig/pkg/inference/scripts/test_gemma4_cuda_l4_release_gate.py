@@ -297,6 +297,14 @@ class L4ReleaseGateTest(unittest.TestCase):
         self.assertNotIn("ANTFLY_GENERATED_ATTENTION_SCORE_PREWORK", profile)
         self.assertNotIn("ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK", profile)
         self.assertNotIn("antfly_generated_attention_score_prework", profile)
+        # The promoted flash-prefill default is the automatic selector,
+        # expressed by the GQA prefill profile being absent; the release
+        # environment scrub keeps it unset.  At the 256-token contract the
+        # flash query-length policy does not match, so automatic falls back to
+        # the fast prefill path -- the frozen behavior.
+        self.assertNotIn("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE", profile)
+        self.assertNotIn("ANTFLY_GQA_PREFILL_PROFILE", profile)
+        self.assertNotIn("antfly_gqa_prefill_profile", profile)
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION"])
         self.assertEqual("1", profile["ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN"])
         self.assertEqual("0", profile["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD"])
@@ -333,6 +341,7 @@ class L4ReleaseGateTest(unittest.TestCase):
             "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT": "1",
             "ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_PAIR_ONLY": "1",
             "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK": "1",
+            "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "required-flash-f16-sm89",
             "ANTFLY_EXPERIMENTAL_SWITCH": "1",
             "REQUIRE_LM_HEAD_ARGMAX": "0",
             "LLAMA_CACHE_TYPE_K": "q8_0",
@@ -342,6 +351,10 @@ class L4ReleaseGateTest(unittest.TestCase):
         # An inherited explicit score-prework override must not survive: the
         # release configuration is the automatic default (variable unset).
         self.assertNotIn("ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK", environment)
+        # Likewise for the GQA prefill profile: the promoted flash-prefill
+        # default is the automatic selector, so an inherited explicit profile
+        # must be scrubbed rather than inherited into the release run.
+        self.assertNotIn("ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE", environment)
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT"])
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_PAIR_ONLY"])
         self.assertEqual("1", environment["REQUIRE_LM_HEAD_ARGMAX"])

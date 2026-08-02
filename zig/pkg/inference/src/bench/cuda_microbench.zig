@@ -96,6 +96,51 @@ const q4_0_q8_1_lm_argmax_default_iterations: usize = 200;
 const q4_0_q8_1_lm_argmax_default_repeats: usize = 5;
 const q4_0_q8_1_lm_argmax_candidate_symbol = "antfly_q4_0_q8_1_argmax_rows_stage1_tile8_v1";
 
+// Gemma4 E2B QAT q4_0 prefill projection shapes for the W4A16 tensor-core
+// (tc_hmma) candidate. rows is filled per run from
+// q4_0_tc_hmma_e2b_row_counts.
+const q4_0_tc_hmma_e2b_dims = [_]Shape{
+    .{ .label = "E2B Q proj", .rows = 0, .in_dim = 1536, .out_dim = 2048 },
+    .{ .label = "E2B FFN gate/up", .rows = 0, .in_dim = 1536, .out_dim = 8960 },
+    .{ .label = "E2B FFN down", .rows = 0, .in_dim = 12288, .out_dim = 1536 },
+};
+const q4_0_tc_hmma_e2b_row_counts = [_]usize{ 64, 512 };
+const q4_0_tc_hmma_candidate_symbol = "termite_linear_q4_0_f32_tc_hmma";
+// BF16-fragment mirror of the f16 tensor-core kernel. Same q4_0_hmma packed
+// layout and launch geometry; bf16 has f32's exponent range so it stays exact
+// on Gemma's large activations where the f16 tile overflows. Timed alongside
+// the f16 candidate to confirm comparable tensor-core speed.
+const q4_0_tc_hmma_bf16_candidate_symbol = "termite_linear_q4_0_f32_tc_hmma_bf16";
+const q4_0_tc_hmma_generated_mm_symbol = "antfly_q4_0_mm_f32_v1";
+// Launch geometry contract of termite_qtc_hmma_tile (TERMITE_QTC_M/N/THREADS).
+const q4_0_tc_hmma_rows_per_tile: usize = 64;
+const q4_0_tc_hmma_cols_per_tile: usize = 32;
+const q4_0_tc_hmma_threads: usize = 256;
+const q4_0_tc_hmma_default_warmups: usize = 20;
+const q4_0_tc_hmma_default_iterations: usize = 200;
+const q4_0_tc_hmma_default_repeats: usize = 5;
+// f32 SIMT baselines share the quant-compiler q4_0 CPU-reference tolerance;
+// the tc_hmma candidate rounds activations and dequantized weights to f16, so
+// it gets a wider (still absolute) budget.
+const q4_0_tc_hmma_f32_tolerance_abs: f32 = 0.01;
+const q4_0_tc_hmma_candidate_tolerance_abs: f32 = 0.05;
+// bf16 keeps 3 fewer mantissa bits than f16 (8x coarser rounding for in-range
+// activations), so the bf16 tile gets a wider sanity budget. This is not a
+// precision target -- bf16's win is exponent range on Gemma-scale activations,
+// not in-range precision. maxAbsDiffFinite still hard-fails on NaN/inf, so a
+// broken or no-op kernel is caught regardless of this bound.
+const q4_0_tc_hmma_bf16_tolerance_abs: f32 = 0.5;
+// q4_0_hmma packed layout constants (see termite_q4_0_tc_value_at).
+const q4_0_tc_scale_bytes: usize = 2;
+const q4_0_tc_q_bytes: usize = 16;
+
+// Strided gate/up activation-multiply sanity target (fused [rows, 2F] input
+// from a concatenated gate|up GEMM vs the contiguous two-buffer kernel).
+const activation_multiply_strided_symbol = "termite_activation_multiply_fused_gate_up_f32";
+const activation_multiply_strided_row_counts = [_]usize{ 64, 512 };
+const activation_multiply_strided_f_dims = [_]usize{ 8960, 12288 };
+const activation_multiply_strided_activation: u32 = @intFromEnum(backend_contracts.DecoderRuntimeActivationKind.gelu_new);
+
 const q6_k_values_per_block: usize = 256;
 const q6_k_block_bytes: usize = 210;
 const q6_k_q8_1_lm_argmax_rows: usize = 1;
@@ -246,6 +291,8 @@ const Config = struct {
     text: []const u8 = "a photo of a document with audio metadata",
     full_iters: usize = 1,
     gemma4_shapes: bool = false,
+    q4_0_tc_hmma_e2b: bool = false,
+    activation_multiply_strided_e2b: bool = false,
     q4_0_q8_1_lm_argmax_e2b: bool = false,
     q6_k_q8_1_lm_argmax: bool = false,
     q4_0_q8_1_e2b_ffn_sm89_dir: ?[]const u8 = null,
@@ -283,6 +330,11 @@ const BenchModule = if (build_options.enable_cuda) struct {
     linear_q4_k_triple_bias_f32_tiled: cuda_driver.CUfunction = null,
     linear_q4_0_f32: cuda_driver.CUfunction = null,
     linear_q4_0_f32_tile4: cuda_driver.CUfunction = null,
+    linear_q4_0_f32_tc_hmma: cuda_driver.CUfunction = null,
+    linear_q4_0_f32_tc_hmma_bf16: cuda_driver.CUfunction = null,
+    generated_q4_0_mm_f32: cuda_driver.CUfunction = null,
+    activation_multiply_f32: cuda_driver.CUfunction = null,
+    activation_multiply_fused_gate_up_f32: cuda_driver.CUfunction = null,
     linear_q4_0_pair_nobias_f32_tile4_w4: cuda_driver.CUfunction = null,
     linear_q4_0_pair_activation_q8_1_e4b: cuda_driver.CUfunction = null,
     linear_q4_0_q8_1_e4b_down: cuda_driver.CUfunction = null,
@@ -342,6 +394,12 @@ const BenchModule = if (build_options.enable_cuda) struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_0_f32, module, "termite_linear_q4_0_f32"));
         var linear_q4_0_f32_tile4: cuda_driver.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_0_f32_tile4, module, "termite_linear_q4_0_f32_tile4"));
+        const linear_q4_0_f32_tc_hmma = loadOptional(ctx, module, q4_0_tc_hmma_candidate_symbol);
+        const linear_q4_0_f32_tc_hmma_bf16 = loadOptional(ctx, module, q4_0_tc_hmma_bf16_candidate_symbol);
+        const generated_q4_0_mm_f32 = loadOptional(ctx, module, q4_0_tc_hmma_generated_mm_symbol);
+        var activation_multiply_f32: cuda_driver.CUfunction = null;
+        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&activation_multiply_f32, module, "termite_activation_multiply_f32"));
+        const activation_multiply_fused_gate_up_f32 = loadOptional(ctx, module, activation_multiply_strided_symbol);
         var linear_q4_0_pair_nobias_f32_tile4_w4: cuda_driver.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_0_pair_nobias_f32_tile4_w4, module, "termite_linear_q4_0_pair_nobias_f32_tile4_w4"));
         var linear_q4_0_pair_activation_q8_1_e4b: cuda_driver.CUfunction = null;
@@ -384,6 +442,11 @@ const BenchModule = if (build_options.enable_cuda) struct {
             .linear_q4_k_triple_bias_f32_tiled = linear_q4_k_triple_bias_f32_tiled,
             .linear_q4_0_f32 = linear_q4_0_f32,
             .linear_q4_0_f32_tile4 = linear_q4_0_f32_tile4,
+            .linear_q4_0_f32_tc_hmma = linear_q4_0_f32_tc_hmma,
+            .linear_q4_0_f32_tc_hmma_bf16 = linear_q4_0_f32_tc_hmma_bf16,
+            .generated_q4_0_mm_f32 = generated_q4_0_mm_f32,
+            .activation_multiply_f32 = activation_multiply_f32,
+            .activation_multiply_fused_gate_up_f32 = activation_multiply_fused_gate_up_f32,
             .linear_q4_0_pair_nobias_f32_tile4_w4 = linear_q4_0_pair_nobias_f32_tile4_w4,
             .linear_q4_0_pair_activation_q8_1_e4b = linear_q4_0_pair_activation_q8_1_e4b,
             .linear_q4_0_q8_1_e4b_down = linear_q4_0_q8_1_e4b_down,
@@ -422,6 +485,11 @@ const BenchModule = if (build_options.enable_cuda) struct {
             self.linear_q4_k_triple_bias_f32_tiled = null;
             self.linear_q4_0_f32 = null;
             self.linear_q4_0_f32_tile4 = null;
+            self.linear_q4_0_f32_tc_hmma = null;
+            self.linear_q4_0_f32_tc_hmma_bf16 = null;
+            self.generated_q4_0_mm_f32 = null;
+            self.activation_multiply_f32 = null;
+            self.activation_multiply_fused_gate_up_f32 = null;
             self.linear_q4_0_pair_nobias_f32_tile4_w4 = null;
             self.linear_q4_0_pair_activation_q8_1_e4b = null;
             self.linear_q4_0_q8_1_e4b_down = null;
@@ -507,6 +575,14 @@ fn parseArgs(args: []const []const u8) !Config {
             seen_benchmark_option = true;
             seen_standard_benchmark_option = true;
             cfg.gemma4_shapes = true;
+        } else if (std.mem.eql(u8, arg, "--q4-0-tc-hmma-e2b")) {
+            if (cfg.q4_0_tc_hmma_e2b) return error.DuplicateQ4_0TcHmmaE2B;
+            seen_benchmark_option = true;
+            cfg.q4_0_tc_hmma_e2b = true;
+        } else if (std.mem.eql(u8, arg, "--activation-multiply-strided-e2b")) {
+            if (cfg.activation_multiply_strided_e2b) return error.DuplicateActivationMultiplyStridedE2B;
+            seen_benchmark_option = true;
+            cfg.activation_multiply_strided_e2b = true;
         } else if (std.mem.eql(u8, arg, "--q4-0-q8-1-lm-argmax-e2b")) {
             if (cfg.q4_0_q8_1_lm_argmax_e2b) return error.DuplicateQ4_0Q8_1LmArgmaxE2B;
             seen_benchmark_option = true;
@@ -607,6 +683,11 @@ fn parseArgs(args: []const []const u8) !Config {
         if (!seen_measure_iters) cfg.measure_iters = q4_0_q8_1_lm_argmax_default_iterations;
         if (!seen_repeat_runs) cfg.quant_compiler_repeat_runs = q4_0_q8_1_lm_argmax_default_repeats;
     }
+    if (cfg.q4_0_tc_hmma_e2b or cfg.activation_multiply_strided_e2b) {
+        if (!seen_warmup_iters) cfg.warmup_iters = q4_0_tc_hmma_default_warmups;
+        if (!seen_measure_iters) cfg.measure_iters = q4_0_tc_hmma_default_iterations;
+        if (!seen_repeat_runs) cfg.quant_compiler_repeat_runs = q4_0_tc_hmma_default_repeats;
+    }
     if (cfg.q6_k_q8_1_lm_argmax) {
         if (!seen_warmup_iters) cfg.warmup_iters = q6_k_q8_1_lm_argmax_default_warmups;
         if (!seen_measure_iters) cfg.measure_iters = q6_k_q8_1_lm_argmax_default_iterations;
@@ -622,6 +703,8 @@ fn parseArgs(args: []const []const u8) !Config {
     if (cfg.quant_compiler_lazy_target and cfg.quant_compiler_generated_ptx_path == null) return error.MissingGeneratedPtxPath;
     if (cfg.quant_compiler_lazy_target and (cfg.quant_compiler_q4_0_mmv_ptx_path != null or cfg.quant_compiler_q4_0_mm_ptx_path != null or cfg.quant_compiler_q4_0_pair_ptx_path != null or cfg.quant_compiler_q4_0_pair_q8_ptx_path != null or cfg.quant_compiler_q4_0_down_q8_ptx_path != null)) return error.QuantCompilerQ4_0ConflictsWithLazyTarget;
     const q4_0_target_count: usize = @as(usize, @intFromBool(cfg.quant_compiler_q4_0_mmv_ptx_path != null)) + @as(usize, @intFromBool(cfg.quant_compiler_q4_0_mm_ptx_path != null)) + @as(usize, @intFromBool(cfg.quant_compiler_q4_0_pair_ptx_path != null)) + @as(usize, @intFromBool(cfg.quant_compiler_q4_0_pair_q8_ptx_path != null)) + @as(usize, @intFromBool(cfg.quant_compiler_q4_0_down_q8_ptx_path != null));
+    if (cfg.q4_0_tc_hmma_e2b and (cfg.activation_multiply_strided_e2b or cfg.q4_0_q8_1_lm_argmax_e2b or cfg.q6_k_q8_1_lm_argmax or cfg.q4_0_q8_1_e2b_ffn_sm89_dir != null or cfg.quant_compiler_lazy_target or q4_0_target_count != 0 or cfg.quant_compiler_evidence_out_path != null or seen_standard_benchmark_option)) return error.Q4_0TcHmmaE2BConflictsWithOtherBenchmark;
+    if (cfg.activation_multiply_strided_e2b and (cfg.q4_0_q8_1_lm_argmax_e2b or cfg.q6_k_q8_1_lm_argmax or cfg.q4_0_q8_1_e2b_ffn_sm89_dir != null or cfg.quant_compiler_lazy_target or q4_0_target_count != 0 or cfg.quant_compiler_evidence_out_path != null or seen_standard_benchmark_option)) return error.ActivationMultiplyStridedE2BConflictsWithOtherBenchmark;
     if (cfg.q4_0_q8_1_lm_argmax_e2b and (cfg.q6_k_q8_1_lm_argmax or cfg.quant_compiler_lazy_target or q4_0_target_count != 0 or cfg.quant_compiler_evidence_out_path != null or cfg.gemma4_shapes or cfg.model_path != null or cfg.json_out_path != null)) return error.Q4_0Q8_1LmArgmaxE2BConflictsWithOtherBenchmark;
     if (cfg.q6_k_q8_1_lm_argmax and (cfg.quant_compiler_lazy_target or q4_0_target_count != 0 or cfg.quant_compiler_evidence_out_path != null or seen_standard_benchmark_option or cfg.q4_0_q8_1_e2b_ffn_sm89_dir != null)) return error.Q6KQ8_1LmArgmaxConflictsWithOtherBenchmark;
     if (cfg.q4_0_q8_1_e2b_ffn_sm89_dir != null and (cfg.q4_0_q8_1_lm_argmax_e2b or cfg.q6_k_q8_1_lm_argmax or cfg.quant_compiler_lazy_target or q4_0_target_count != 0 or cfg.quant_compiler_evidence_out_path != null or seen_standard_benchmark_option)) return error.Q4_0Q8_1E2BFfnSm89ConflictsWithOtherBenchmark;
@@ -713,6 +796,58 @@ test "cuda microbench E2B LM argmax mode defaults and gate are exact" {
     try validateQ4_0Q8_1LmArgmaxBenchmarkGate(false, false);
     try validateQ4_0Q8_1LmArgmaxBenchmarkGate(true, true);
     try std.testing.expectError(error.CudaKernelUnavailable, validateQ4_0Q8_1LmArgmaxBenchmarkGate(true, false));
+}
+
+test "cuda microbench q4_0 tc_hmma mode defaults and gate are exact" {
+    const defaults = try parseArgs(&.{"--q4-0-tc-hmma-e2b"});
+    try std.testing.expect(defaults.q4_0_tc_hmma_e2b);
+    try std.testing.expectEqual(q4_0_tc_hmma_default_warmups, defaults.warmup_iters);
+    try std.testing.expectEqual(q4_0_tc_hmma_default_iterations, defaults.measure_iters);
+    try std.testing.expectEqual(q4_0_tc_hmma_default_repeats, defaults.quant_compiler_repeat_runs);
+
+    const overridden = try parseArgs(&.{ "--q4-0-tc-hmma-e2b", "--warmup-iters", "7", "--measure-iters", "11", "--repeat-runs", "3" });
+    try std.testing.expectEqual(@as(usize, 7), overridden.warmup_iters);
+    try std.testing.expectEqual(@as(usize, 11), overridden.measure_iters);
+    try std.testing.expectEqual(@as(usize, 3), overridden.quant_compiler_repeat_runs);
+    try std.testing.expectError(error.DuplicateQ4_0TcHmmaE2B, parseArgs(&.{ "--q4-0-tc-hmma-e2b", "--q4-0-tc-hmma-e2b" }));
+    try std.testing.expectError(error.Q4_0TcHmmaE2BConflictsWithOtherBenchmark, parseArgs(&.{ "--q4-0-tc-hmma-e2b", "--gemma4-shapes" }));
+    try std.testing.expectError(error.Q4_0TcHmmaE2BConflictsWithOtherBenchmark, parseArgs(&.{ "--q4-0-tc-hmma-e2b", "--q4-0-q8-1-lm-argmax-e2b" }));
+    try std.testing.expectError(error.Q4_0TcHmmaE2BConflictsWithOtherBenchmark, parseArgs(&.{ "--q4-0-tc-hmma-e2b", "--activation-multiply-strided-e2b" }));
+
+    const strided = try parseArgs(&.{"--activation-multiply-strided-e2b"});
+    try std.testing.expect(strided.activation_multiply_strided_e2b);
+    try std.testing.expectEqual(q4_0_tc_hmma_default_warmups, strided.warmup_iters);
+    try std.testing.expectEqual(q4_0_tc_hmma_default_iterations, strided.measure_iters);
+    try std.testing.expectEqual(q4_0_tc_hmma_default_repeats, strided.quant_compiler_repeat_runs);
+    try std.testing.expectError(error.DuplicateActivationMultiplyStridedE2B, parseArgs(&.{ "--activation-multiply-strided-e2b", "--activation-multiply-strided-e2b" }));
+    try std.testing.expectError(error.ActivationMultiplyStridedE2BConflictsWithOtherBenchmark, parseArgs(&.{ "--activation-multiply-strided-e2b", "--gemma4-shapes" }));
+
+    try validateQ4_0TcHmmaBenchmarkGate(false, false);
+    try validateQ4_0TcHmmaBenchmarkGate(true, true);
+    try std.testing.expectError(error.CudaKernelUnavailable, validateQ4_0TcHmmaBenchmarkGate(true, false));
+    try validateActivationMultiplyStridedBenchmarkGate(true, true);
+    try std.testing.expectError(error.CudaKernelUnavailable, validateActivationMultiplyStridedBenchmarkGate(true, false));
+}
+
+test "cuda microbench q4_0 tc_hmma pack separates scales and quants" {
+    const allocator = std.testing.allocator;
+    const in_dim: usize = 256;
+    const out_dim: usize = 2;
+    const row_blocks = in_dim / q4_0_values_per_block;
+    const block_count = out_dim * row_blocks;
+    const raw = try allocator.alloc(u8, block_count * q4_0_block_bytes);
+    defer allocator.free(raw);
+    for (raw, 0..) |*byte, i| byte.* = @truncate(i * 7 + 3);
+
+    const packed_bytes = try packQ4_0TcHmmaWeights(allocator, raw, in_dim, out_dim);
+    defer allocator.free(packed_bytes);
+    try std.testing.expectEqual(block_count * q4_0_block_bytes, packed_bytes.len);
+    for (0..block_count) |block| {
+        try std.testing.expectEqualSlices(u8, raw[block * q4_0_block_bytes ..][0..q4_0_tc_scale_bytes], packed_bytes[block * q4_0_tc_scale_bytes ..][0..q4_0_tc_scale_bytes]);
+        try std.testing.expectEqualSlices(u8, raw[block * q4_0_block_bytes + q4_0_tc_scale_bytes ..][0..q4_0_tc_q_bytes], packed_bytes[block_count * q4_0_tc_scale_bytes + block * q4_0_tc_q_bytes ..][0..q4_0_tc_q_bytes]);
+    }
+    try std.testing.expectError(error.InvalidArgument, packQ4_0TcHmmaWeights(allocator, raw[0 .. raw.len - 1], in_dim, out_dim));
+    try std.testing.expectError(error.InvalidArgument, packQ4_0TcHmmaWeights(allocator, raw, in_dim + 1, out_dim));
 }
 
 test "cuda microbench Q6_K Q8_1 LM argmax mode defaults and gate are exact" {
@@ -818,6 +953,8 @@ fn printUsage() void {
         \\usage: antfly inference bench-cuda [--warmup-iters N] [--measure-iters N]
         \\                         [--model <clipclap-model-dir>] [--text <prompt>] [--full-iters N]
         \\                         [--gemma4-shapes] [--json-out PATH]
+        \\                         [--q4-0-tc-hmma-e2b]
+        \\                         [--activation-multiply-strided-e2b]
         \\                         [--q4-0-q8-1-lm-argmax-e2b] [--repeat-runs N]
         \\                         [--q6-k-q8-1-lm-argmax]
         \\                         [--q4-0-q8-1-e2b-ffn-sm89 CUBIN_DIR]
@@ -832,6 +969,12 @@ fn printUsage() void {
         \\
         \\Benchmarks CUDA Q4_K linear kernels on CLIP/CLAP-sized shapes.
         \\With --gemma4-shapes, also benchmarks Gemma4 Q8_0/Q4_K decode-sized matmuls.
+        \\With --q4-0-tc-hmma-e2b, compares the W4A16 tensor-core Q4_0 linear
+        \\(termite_linear_q4_0_f32_tc_hmma) against the SIMT q4_0 baselines at
+        \\Gemma4 E2B prefill shapes (rows 64/512). Defaults: 20 warmups, 200
+        \\iterations, 5 repeats.
+        \\With --activation-multiply-strided-e2b, sanity-compares the strided
+        \\fused gate/up activation multiply against the contiguous kernel.
         \\With --q4-0-q8-1-lm-argmax-e2b, compares complete E2B Q8_1 LM-head
         \\chains at 1536->262144. Defaults: 20 warmups, 200 iterations, 5 repeats.
         \\With --q6-k-q8-1-lm-argmax, compares complete Q6_K x Q8_1 LM-head
@@ -855,6 +998,14 @@ fn printUsage() void {
 }
 
 fn validateQ4_0Q8_1LmArgmaxBenchmarkGate(enabled: bool, candidate_available: bool) !void {
+    if (enabled and !candidate_available) return error.CudaKernelUnavailable;
+}
+
+fn validateQ4_0TcHmmaBenchmarkGate(enabled: bool, candidate_available: bool) !void {
+    if (enabled and !candidate_available) return error.CudaKernelUnavailable;
+}
+
+fn validateActivationMultiplyStridedBenchmarkGate(enabled: bool, candidate_available: bool) !void {
     if (enabled and !candidate_available) return error.CudaKernelUnavailable;
 }
 
@@ -882,6 +1033,30 @@ fn runKernelBench(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
             return err;
         };
         try benchQ4_0Q8_1E2BFfnSm89(allocator, io, &ctx, &module, cfg, cubin_dir);
+        return;
+    }
+
+    if (cfg.q4_0_tc_hmma_e2b) {
+        validateQ4_0TcHmmaBenchmarkGate(true, module.linear_q4_0_f32_tc_hmma != null) catch |err| {
+            print(
+                "CUDA E2B Q4_0 tc_hmma benchmark unavailable: missing symbol={s} artifact={s}\n",
+                .{ q4_0_tc_hmma_candidate_symbol, cuda_artifact.target },
+            );
+            return err;
+        };
+        try benchQ4_0TcHmmaE2B(allocator, &ctx, &module, cfg);
+        return;
+    }
+
+    if (cfg.activation_multiply_strided_e2b) {
+        validateActivationMultiplyStridedBenchmarkGate(true, module.activation_multiply_fused_gate_up_f32 != null) catch |err| {
+            print(
+                "CUDA strided activation-multiply benchmark unavailable: missing symbol={s} artifact={s}\n",
+                .{ activation_multiply_strided_symbol, cuda_artifact.target },
+            );
+            return err;
+        };
+        try benchActivationMultiplyStridedE2B(allocator, &ctx, &module, cfg);
         return;
     }
 
@@ -986,6 +1161,413 @@ fn runKernelBench(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
     if (cfg.gemma4_shapes) {
         try runGemma4KernelBench(allocator, io, &ctx, &module, cfg);
     }
+}
+
+// Host-side mirror of the q4_0_hmma packed layout consumed by
+// termite_q4_0_tc_value_at: scales region (block_count * 2 bytes of f16 LE
+// scales) followed by the quants region (block_count * 16 raw GGUF nibble
+// bytes), both indexed by block_index = col * row_blocks + block.
+fn packQ4_0TcHmmaWeights(allocator: std.mem.Allocator, raw: []const u8, in_dim: usize, out_dim: usize) ![]u8 {
+    if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidArgument;
+    const row_blocks = in_dim / q4_0_values_per_block;
+    const block_count = try std.math.mul(usize, out_dim, row_blocks);
+    if (raw.len != try std.math.mul(usize, block_count, q4_0_block_bytes)) return error.InvalidArgument;
+
+    const scales_bytes = try std.math.mul(usize, block_count, q4_0_tc_scale_bytes);
+    const q_bytes = try std.math.mul(usize, block_count, q4_0_tc_q_bytes);
+    const out = try allocator.alloc(u8, scales_bytes + q_bytes);
+    errdefer allocator.free(out);
+
+    for (0..block_count) |block| {
+        const src = raw[block * q4_0_block_bytes ..][0..q4_0_block_bytes];
+        @memcpy(out[block * q4_0_tc_scale_bytes ..][0..q4_0_tc_scale_bytes], src[0..2]);
+        @memcpy(out[scales_bytes + block * q4_0_tc_q_bytes ..][0..q4_0_tc_q_bytes], src[2..18]);
+    }
+    return out;
+}
+
+fn benchQ4_0TcHmmaE2B(
+    allocator: std.mem.Allocator,
+    ctx: *cuda_context.CudaContext,
+    module: *BenchModule,
+    cfg: Config,
+) !void {
+    print("CUDA E2B Q4_0 tc_hmma microbench: device={s} cc={d}.{d} warmup={d} measure={d} repeats={d}\n", .{
+        ctx.info.nameSlice(),
+        ctx.info.compute_major,
+        ctx.info.compute_minor,
+        cfg.warmup_iters,
+        cfg.measure_iters,
+        cfg.quant_compiler_repeat_runs,
+    });
+    print("candidate kernel={s} baselines=termite_linear_q4_0_f32,{s} tolerance_f32={d:.6} tolerance_tc={d:.6}\n", .{
+        q4_0_tc_hmma_candidate_symbol,
+        q4_0_tc_hmma_generated_mm_symbol,
+        q4_0_tc_hmma_f32_tolerance_abs,
+        q4_0_tc_hmma_candidate_tolerance_abs,
+    });
+    if (module.generated_q4_0_mm_f32 == null) {
+        print("baseline kernel={s} missing from artifact; skipping generated-mm comparison\n", .{q4_0_tc_hmma_generated_mm_symbol});
+    }
+    if (module.linear_q4_0_f32_tc_hmma_bf16 == null) {
+        print("bf16 candidate kernel={s} missing from artifact; reporting tc_hmma_bf16_ns=0 (regenerate CUDA artifacts to include it)\n", .{q4_0_tc_hmma_bf16_candidate_symbol});
+    } else {
+        print("bf16 candidate kernel={s} tolerance_bf16={d:.6}\n", .{ q4_0_tc_hmma_bf16_candidate_symbol, q4_0_tc_hmma_bf16_tolerance_abs });
+    }
+    for (q4_0_tc_hmma_e2b_row_counts) |rows| {
+        for (q4_0_tc_hmma_e2b_dims) |dims| {
+            try benchQ4_0TcHmmaShape(allocator, ctx, module, cfg, .{
+                .label = dims.label,
+                .rows = rows,
+                .in_dim = dims.in_dim,
+                .out_dim = dims.out_dim,
+            });
+        }
+    }
+}
+
+fn benchQ4_0TcHmmaShape(
+    allocator: std.mem.Allocator,
+    ctx: *cuda_context.CudaContext,
+    module: *BenchModule,
+    cfg: Config,
+    shape: Shape,
+) !void {
+    // The engine only packs tensor-core weights when in_dim % 256 == 0.
+    if (shape.in_dim == 0 or shape.in_dim % q4_k_values_per_block != 0) return error.InvalidArgument;
+
+    const input_count = try std.math.mul(usize, shape.rows, shape.in_dim);
+    const output_count = try std.math.mul(usize, shape.rows, shape.out_dim);
+    const row_blocks = shape.in_dim / q4_0_values_per_block;
+    const weight_bytes = try std.math.mul(usize, try std.math.mul(usize, shape.out_dim, row_blocks), q4_0_block_bytes);
+
+    const input_host = try allocator.alloc(f32, input_count);
+    defer allocator.free(input_host);
+    const weight_host = try allocator.alloc(u8, weight_bytes);
+    defer allocator.free(weight_host);
+    fillInput(input_host);
+    fillQ4_0Weights(weight_host);
+
+    const packed_host = try packQ4_0TcHmmaWeights(allocator, weight_host, shape.in_dim, shape.out_dim);
+    defer allocator.free(packed_host);
+
+    const has_cpu_reference = shape.out_dim <= quant_compiler_q4_0_max_reference_out_dim;
+    const reference_host = try allocator.alloc(f32, output_count);
+    defer allocator.free(reference_host);
+    if (has_cpu_reference) {
+        try quant_kernel_compiler.referenceMatmulNoBias(
+            allocator,
+            .q4_0,
+            weight_host,
+            input_host,
+            shape.rows,
+            shape.in_dim,
+            shape.out_dim,
+            reference_host,
+        );
+    }
+
+    var input = try cuda_buffer.DeviceBuffer.alloc(ctx, input_count * @sizeOf(f32));
+    defer input.free(ctx);
+    var weight = try cuda_buffer.DeviceBuffer.alloc(ctx, weight_host.len);
+    defer weight.free(ctx);
+    var weight_packed = try cuda_buffer.DeviceBuffer.alloc(ctx, packed_host.len);
+    defer weight_packed.free(ctx);
+    var output = try cuda_buffer.DeviceBuffer.alloc(ctx, output_count * @sizeOf(f32));
+    defer output.free(ctx);
+
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(input_host));
+    try weight.copyFromHost(ctx, weight_host);
+    try weight_packed.copyFromHost(ctx, packed_host);
+    try ctx.synchronize();
+
+    const simt_ns = try repeatCudaStep(allocator, ctx, cfg, launchQ4_0Baseline, .{ module.linear_q4_0_f32, ctx, QuantCompilerQ4_0Kind.mm, output, input, weight, shape.rows, shape.in_dim, shape.out_dim });
+    const simt_host = try allocator.alloc(f32, output_count);
+    defer allocator.free(simt_host);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(simt_host));
+    try ctx.synchronize();
+    const simt_cpu_max_abs_diff = if (has_cpu_reference) try maxAbsDiffFinite(simt_host, reference_host) else 0.0;
+    if (has_cpu_reference and simt_cpu_max_abs_diff > q4_0_tc_hmma_f32_tolerance_abs) return error.HandwrittenBaselineMismatch;
+
+    var generated_mm_ns: u64 = 0;
+    // antfly_q4_0_mm_f32_v1 serves only the rows_9_64 bucket; invoking it at
+    // larger row counts leaves the poisoned output uncovered (NaN) and is not a
+    // meaningful comparison. Skip it (generated_mm_ns=0 = not compared).
+    if (module.generated_q4_0_mm_f32 != null and shape.rows >= 9 and shape.rows <= 64) {
+        try poisonDeviceOutput(allocator, ctx, output, output_count);
+        generated_mm_ns = try repeatCudaStep(allocator, ctx, cfg, launchGeneratedQ4_0MmBaseline, .{ module.generated_q4_0_mm_f32, ctx, output, input, weight, shape.rows, shape.in_dim, shape.out_dim });
+        const generated_host = try allocator.alloc(f32, output_count);
+        defer allocator.free(generated_host);
+        try output.copyToHost(ctx, std.mem.sliceAsBytes(generated_host));
+        try ctx.synchronize();
+        const generated_simt_max_abs_diff = try maxAbsDiffFinite(generated_host, simt_host);
+        if (generated_simt_max_abs_diff > q4_0_tc_hmma_f32_tolerance_abs) return error.HandwrittenBaselineMismatch;
+    }
+
+    // Poison the shared output buffer so a candidate that silently
+    // early-returns cannot inherit the baseline's results and pass.
+    try poisonDeviceOutput(allocator, ctx, output, output_count);
+    const candidate_ns = try repeatCudaStep(allocator, ctx, cfg, launchQ4_0TcHmma, .{ module.linear_q4_0_f32_tc_hmma, ctx, output, input, weight_packed, shape.rows, shape.in_dim, shape.out_dim });
+    const candidate_host = try allocator.alloc(f32, output_count);
+    defer allocator.free(candidate_host);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(candidate_host));
+    try ctx.synchronize();
+
+    const candidate_simt_max_abs_diff = try maxAbsDiffFinite(candidate_host, simt_host);
+    if (candidate_simt_max_abs_diff > q4_0_tc_hmma_candidate_tolerance_abs) return error.GeneratedCandidateMismatch;
+    const candidate_cpu_max_abs_diff = if (has_cpu_reference) try maxAbsDiffFinite(candidate_host, reference_host) else 0.0;
+    if (has_cpu_reference and candidate_cpu_max_abs_diff > q4_0_tc_hmma_candidate_tolerance_abs) return error.GeneratedCandidateMismatch;
+
+    // BF16 tensor-core mirror. Identical q4_0_hmma packed weights, launch
+    // geometry, and host launcher as the f16 candidate; only the WMMA element
+    // type differs, so launchQ4_0TcHmma is reused verbatim. Optional in the
+    // artifact (present once the bf16 entry points are compiled in); when
+    // absent we report tc_hmma_bf16_ns=0 and skip the comparison.
+    var candidate_bf16_ns: u64 = 0;
+    var candidate_bf16_simt_max_abs_diff: f32 = 0.0;
+    var candidate_bf16_cpu_max_abs_diff: f32 = 0.0;
+    if (module.linear_q4_0_f32_tc_hmma_bf16 != null) {
+        try poisonDeviceOutput(allocator, ctx, output, output_count);
+        candidate_bf16_ns = try repeatCudaStep(allocator, ctx, cfg, launchQ4_0TcHmma, .{ module.linear_q4_0_f32_tc_hmma_bf16, ctx, output, input, weight_packed, shape.rows, shape.in_dim, shape.out_dim });
+        const candidate_bf16_host = try allocator.alloc(f32, output_count);
+        defer allocator.free(candidate_bf16_host);
+        try output.copyToHost(ctx, std.mem.sliceAsBytes(candidate_bf16_host));
+        try ctx.synchronize();
+        candidate_bf16_simt_max_abs_diff = try maxAbsDiffFinite(candidate_bf16_host, simt_host);
+        if (candidate_bf16_simt_max_abs_diff > q4_0_tc_hmma_bf16_tolerance_abs) return error.GeneratedCandidateMismatch;
+        candidate_bf16_cpu_max_abs_diff = if (has_cpu_reference) try maxAbsDiffFinite(candidate_bf16_host, reference_host) else 0.0;
+        if (has_cpu_reference and candidate_bf16_cpu_max_abs_diff > q4_0_tc_hmma_bf16_tolerance_abs) return error.GeneratedCandidateMismatch;
+    }
+
+    print("shape={s} rows={d} in={d} out={d} simt_ns={d} generated_mm_ns={d} tc_hmma_ns={d} tc_hmma_bf16_ns={d} speedup_vs_simt={d:.6} speedup_vs_generated_mm={d:.6} speedup_bf16_vs_simt={d:.6} speedup_bf16_vs_f16={d:.6} cpu_reference={} candidate_simt_max_abs_diff={d:.6} candidate_cpu_max_abs_diff={d:.6} bf16_candidate_simt_max_abs_diff={d:.6} bf16_candidate_cpu_max_abs_diff={d:.6}\n", .{
+        shape.label,
+        shape.rows,
+        shape.in_dim,
+        shape.out_dim,
+        simt_ns,
+        generated_mm_ns,
+        candidate_ns,
+        candidate_bf16_ns,
+        speedup(simt_ns, candidate_ns),
+        speedup(generated_mm_ns, candidate_ns),
+        speedup(simt_ns, candidate_bf16_ns),
+        speedup(candidate_ns, candidate_bf16_ns),
+        has_cpu_reference,
+        candidate_simt_max_abs_diff,
+        candidate_cpu_max_abs_diff,
+        candidate_bf16_simt_max_abs_diff,
+        candidate_bf16_cpu_max_abs_diff,
+    });
+}
+
+fn launchQ4_0TcHmma(
+    function: cuda_driver.CUfunction,
+    ctx: *cuda_context.CudaContext,
+    output: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight_packed: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) cuda_driver.Error!void {
+    if (in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+    try checkF32Bytes(output, try checkedMul(rows, out_dim));
+    try checkF32Bytes(input, try checkedMul(rows, in_dim));
+    const row_blocks = in_dim / q4_0_values_per_block;
+    try checkRawBytes(weight_packed, try checkedMul(try checkedMul(out_dim, row_blocks), q4_0_block_bytes));
+    var dst_ptr = output.ptr;
+    var input_ptr = input.ptr;
+    var weight_ptr = weight_packed.ptr;
+    var rows_u32 = try toU32(rows);
+    var in_dim_u32 = try toU32(in_dim);
+    var out_dim_u32 = try toU32(out_dim);
+    var params = [_]?*anyopaque{
+        @ptrCast(&dst_ptr),
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&in_dim_u32),
+        @ptrCast(&out_dim_u32),
+    };
+    try launch2d(
+        ctx,
+        function,
+        (out_dim + q4_0_tc_hmma_cols_per_tile - 1) / q4_0_tc_hmma_cols_per_tile,
+        (rows + q4_0_tc_hmma_rows_per_tile - 1) / q4_0_tc_hmma_rows_per_tile,
+        q4_0_tc_hmma_threads,
+        &params,
+    );
+}
+
+fn launchGeneratedQ4_0MmBaseline(
+    function: cuda_driver.CUfunction,
+    ctx: *cuda_context.CudaContext,
+    output: cuda_buffer.DeviceBuffer,
+    input: cuda_buffer.DeviceBuffer,
+    weight: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) cuda_driver.Error!void {
+    try validateQ4_0Buffers(output, input, weight, rows, in_dim, out_dim);
+    var dst_ptr = output.ptr;
+    var input_ptr = input.ptr;
+    var weight_ptr = weight.ptr;
+    var rows_u32 = try toU32(rows);
+    var in_dim_u32 = try toU32(in_dim);
+    var out_dim_u32 = try toU32(out_dim);
+    var params = [_]?*anyopaque{
+        @ptrCast(&input_ptr),
+        @ptrCast(&weight_ptr),
+        @ptrCast(&dst_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&in_dim_u32),
+        @ptrCast(&out_dim_u32),
+    };
+    try launch2d(ctx, function, (out_dim + 3) / 4, (rows + 7) / 8, 256, &params);
+}
+
+fn benchActivationMultiplyStridedE2B(
+    allocator: std.mem.Allocator,
+    ctx: *cuda_context.CudaContext,
+    module: *BenchModule,
+    cfg: Config,
+) !void {
+    print("CUDA strided activation-multiply microbench: device={s} warmup={d} measure={d} repeats={d} activation={d}\n", .{
+        ctx.info.nameSlice(),
+        cfg.warmup_iters,
+        cfg.measure_iters,
+        cfg.quant_compiler_repeat_runs,
+        activation_multiply_strided_activation,
+    });
+    print("candidate kernel={s} baseline kernel=termite_activation_multiply_f32\n", .{activation_multiply_strided_symbol});
+    for (activation_multiply_strided_row_counts) |rows| {
+        for (activation_multiply_strided_f_dims) |f| {
+            try benchActivationMultiplyStridedShape(allocator, ctx, module, cfg, rows, f);
+        }
+    }
+}
+
+fn benchActivationMultiplyStridedShape(
+    allocator: std.mem.Allocator,
+    ctx: *cuda_context.CudaContext,
+    module: *BenchModule,
+    cfg: Config,
+    rows: usize,
+    f: usize,
+) !void {
+    const count = try std.math.mul(usize, rows, f);
+    const fused_count = try std.math.mul(usize, count, 2);
+
+    const fused_host = try allocator.alloc(f32, fused_count);
+    defer allocator.free(fused_host);
+    fillInput(fused_host);
+    const gate_host = try allocator.alloc(f32, count);
+    defer allocator.free(gate_host);
+    const up_host = try allocator.alloc(f32, count);
+    defer allocator.free(up_host);
+    for (0..rows) |row| {
+        const fused_row = fused_host[row * 2 * f ..][0 .. 2 * f];
+        @memcpy(gate_host[row * f ..][0..f], fused_row[0..f]);
+        @memcpy(up_host[row * f ..][0..f], fused_row[f .. 2 * f]);
+    }
+
+    var fused = try cuda_buffer.DeviceBuffer.alloc(ctx, fused_count * @sizeOf(f32));
+    defer fused.free(ctx);
+    var gate = try cuda_buffer.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer gate.free(ctx);
+    var up = try cuda_buffer.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer up.free(ctx);
+    var contiguous_output = try cuda_buffer.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer contiguous_output.free(ctx);
+    var strided_output = try cuda_buffer.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer strided_output.free(ctx);
+
+    try fused.copyFromHost(ctx, std.mem.sliceAsBytes(fused_host));
+    try gate.copyFromHost(ctx, std.mem.sliceAsBytes(gate_host));
+    try up.copyFromHost(ctx, std.mem.sliceAsBytes(up_host));
+    try poisonDeviceOutput(allocator, ctx, contiguous_output, count);
+    try poisonDeviceOutput(allocator, ctx, strided_output, count);
+    try ctx.synchronize();
+
+    const contiguous_ns = try repeatCudaStep(allocator, ctx, cfg, launchActivationMultiplyContiguous, .{ module.activation_multiply_f32, ctx, contiguous_output, gate, up, count, activation_multiply_strided_activation });
+    const strided_ns = try repeatCudaStep(allocator, ctx, cfg, launchActivationMultiplyFusedGateUp, .{ module.activation_multiply_fused_gate_up_f32, ctx, strided_output, fused, rows, f, activation_multiply_strided_activation });
+
+    const contiguous_host = try allocator.alloc(f32, count);
+    defer allocator.free(contiguous_host);
+    const strided_host = try allocator.alloc(f32, count);
+    defer allocator.free(strided_host);
+    try contiguous_output.copyToHost(ctx, std.mem.sliceAsBytes(contiguous_host));
+    try strided_output.copyToHost(ctx, std.mem.sliceAsBytes(strided_host));
+    try ctx.synchronize();
+
+    // Both kernels evaluate act(gate) * up with identical per-element
+    // arithmetic, so the outputs must match exactly.
+    const max_abs_diff = try maxAbsDiffFinite(strided_host, contiguous_host);
+    if (max_abs_diff != 0.0) return error.StridedActivationMultiplyMismatch;
+
+    print("shape=gate/up rows={d} f={d} contiguous_ns={d} strided_ns={d} speedup={d:.6} max_abs_diff={d:.6}\n", .{
+        rows,
+        f,
+        contiguous_ns,
+        strided_ns,
+        speedup(contiguous_ns, strided_ns),
+        max_abs_diff,
+    });
+}
+
+fn launchActivationMultiplyContiguous(
+    function: cuda_driver.CUfunction,
+    ctx: *cuda_context.CudaContext,
+    output: cuda_buffer.DeviceBuffer,
+    gate: cuda_buffer.DeviceBuffer,
+    up: cuda_buffer.DeviceBuffer,
+    count: usize,
+    activation: u32,
+) cuda_driver.Error!void {
+    try checkF32Bytes(output, count);
+    try checkF32Bytes(gate, count);
+    try checkF32Bytes(up, count);
+    var dst_ptr = output.ptr;
+    var gate_ptr = gate.ptr;
+    var up_ptr = up.ptr;
+    var count_u32 = try toU32(count);
+    var activation_u32 = activation;
+    var params = [_]?*anyopaque{
+        @ptrCast(&dst_ptr),
+        @ptrCast(&gate_ptr),
+        @ptrCast(&up_ptr),
+        @ptrCast(&count_u32),
+        @ptrCast(&activation_u32),
+    };
+    try launch1d(ctx, function, count, &params);
+}
+
+fn launchActivationMultiplyFusedGateUp(
+    function: cuda_driver.CUfunction,
+    ctx: *cuda_context.CudaContext,
+    output: cuda_buffer.DeviceBuffer,
+    fused: cuda_buffer.DeviceBuffer,
+    rows: usize,
+    f: usize,
+    activation: u32,
+) cuda_driver.Error!void {
+    const count = try checkedMul(rows, f);
+    try checkF32Bytes(output, count);
+    try checkF32Bytes(fused, try checkedMul(count, 2));
+    var dst_ptr = output.ptr;
+    var fused_ptr = fused.ptr;
+    var rows_u32 = try toU32(rows);
+    var f_u32 = try toU32(f);
+    var activation_u32 = activation;
+    var params = [_]?*anyopaque{
+        @ptrCast(&dst_ptr),
+        @ptrCast(&fused_ptr),
+        @ptrCast(&rows_u32),
+        @ptrCast(&f_u32),
+        @ptrCast(&activation_u32),
+    };
+    try launch1d(ctx, function, count, &params);
 }
 
 fn benchQ4_0Q8_1LmArgmaxE2B(

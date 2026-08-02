@@ -748,6 +748,13 @@ fn configuredGqaDecodeProfile() driver_mod.Error!GqaDecodeProfile {
 
 const GqaPrefillProfile = enum {
     off,
+    /// Production default when ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE is
+    /// unset. The promoted flash-f16-sm89 route is attempted whenever every
+    /// eligibility condition passes (SM89, page-16 paged F16 storage,
+    /// sliding-window/global match, query-length policy, symbols loaded) and
+    /// otherwise the launch silently falls back to the historical unset (`off`)
+    /// behavior. `off` is the explicit rollback switch.
+    automatic,
     fast,
     required_fast,
     tiled,
@@ -762,6 +769,7 @@ const GqaPrefillProfile = enum {
     fn name(self: GqaPrefillProfile) []const u8 {
         return switch (self) {
             .off => "off",
+            .automatic => "automatic",
             .fast => "fast",
             .required_fast => "required-fast",
             .tiled => "tiled",
@@ -795,7 +803,7 @@ const GqaPrefillProfile = enum {
     }
 
     fn selectsFlashF16Sm89(self: GqaPrefillProfile) bool {
-        return self == .flash_f16_sm89 or self == .required_flash_f16_sm89;
+        return self == .automatic or self == .flash_f16_sm89 or self == .required_flash_f16_sm89;
     }
 };
 
@@ -855,7 +863,10 @@ fn resolveGqaPrefillProfile(
     if (legacy_fast) return .{ .profile = .fast, .source = .legacy };
     if (legacy_tiled) return .{ .profile = .tiled, .source = .legacy };
     if (legacy_mma) return .{ .profile = .mma, .source = .legacy };
-    return .{ .profile = .off, .source = .default };
+    // Unset resolves to the promoted automatic selector: flash-f16-sm89 when
+    // the full eligibility contract holds, the historical unset behavior
+    // otherwise. `off` remains the explicit rollback value.
+    return .{ .profile = .automatic, .source = .default };
 }
 
 fn configuredGqaPrefillProfile() driver_mod.Error!GqaPrefillProfileConfig {
@@ -2265,7 +2276,7 @@ pub const KernelModule = struct {
     gqa_attention_prefill_tiled_f16_warp_f32: driver_mod.CUfunction = null,
     gqa_attention_prefill_flash_sm89_hd256_f32: driver_mod.CUfunction = null,
     gqa_attention_prefill_flash_sm89_hd512_f32: driver_mod.CUfunction = null,
-    gqa_prefill_profile: GqaPrefillProfile = .off,
+    gqa_prefill_profile: GqaPrefillProfile = .automatic,
     // Resolved once at module load: the score-prework decision runs per layer
     // per decoded token and getenv is a linear scan of environ.
     gqa_score_prework_mode: GeneratedGqaScorePreworkMode = .automatic,
@@ -2316,6 +2327,12 @@ pub const KernelModule = struct {
     linear_q8_0_bias_f32_tc_hmma: driver_mod.CUfunction = null,
     linear_q8_0_bias_gelu_f32_tc_hmma: driver_mod.CUfunction = null,
     linear_q8_0_bias_add_f32_tc_hmma: driver_mod.CUfunction = null,
+    linear_q4_0_f32_tc_hmma: driver_mod.CUfunction = null,
+    linear_q4_0_f32_tc_hmma_bf16: driver_mod.CUfunction = null,
+    linear_q4_0_bias_f32_tc_hmma: driver_mod.CUfunction = null,
+    linear_q4_0_bias_gelu_f32_tc_hmma: driver_mod.CUfunction = null,
+    linear_q4_0_bias_add_f32_tc_hmma: driver_mod.CUfunction = null,
+    activation_multiply_fused_gate_up_f32: driver_mod.CUfunction = null,
     linear_q8_0_f32_tile4: driver_mod.CUfunction = null,
     linear_q8_0_gated_down_f32_tile4: driver_mod.CUfunction = null,
     quantize_f32_q8_1_rows: driver_mod.CUfunction = null,
@@ -3440,6 +3457,12 @@ pub const KernelModule = struct {
         const linear_q8_0_bias_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_f32_tc_hmma");
         const linear_q8_0_bias_gelu_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_gelu_f32_tc_hmma");
         const linear_q8_0_bias_add_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_add_f32_tc_hmma");
+        const linear_q4_0_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_0_f32_tc_hmma");
+        const linear_q4_0_f32_tc_hmma_bf16 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_f32_tc_hmma_bf16");
+        const linear_q4_0_bias_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_0_bias_f32_tc_hmma");
+        const linear_q4_0_bias_gelu_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_0_bias_gelu_f32_tc_hmma");
+        const linear_q4_0_bias_add_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_0_bias_add_f32_tc_hmma");
+        const activation_multiply_fused_gate_up_f32 = loadOptionalFunction(ctx, module, "termite_activation_multiply_fused_gate_up_f32");
         const quantize_f32_q8_1_rows = loadOptionalFunction(ctx, module, "termite_quantize_f32_q8_1_rows");
         const quantize_gated_f32_q8_1_rows = loadOptionalFunction(ctx, module, "termite_quantize_gated_f32_q8_1_rows");
         const quantize_f32_ggml_q8_1_rows = loadOptionalFunction(ctx, module, cuda_kernel_renderer.ggml_q8_1_quantize_rows_kernel_id);
@@ -3806,6 +3829,12 @@ pub const KernelModule = struct {
             .linear_q8_0_bias_f32_tc_hmma = linear_q8_0_bias_f32_tc_hmma,
             .linear_q8_0_bias_gelu_f32_tc_hmma = linear_q8_0_bias_gelu_f32_tc_hmma,
             .linear_q8_0_bias_add_f32_tc_hmma = linear_q8_0_bias_add_f32_tc_hmma,
+            .linear_q4_0_f32_tc_hmma = linear_q4_0_f32_tc_hmma,
+            .linear_q4_0_f32_tc_hmma_bf16 = linear_q4_0_f32_tc_hmma_bf16,
+            .linear_q4_0_bias_f32_tc_hmma = linear_q4_0_bias_f32_tc_hmma,
+            .linear_q4_0_bias_gelu_f32_tc_hmma = linear_q4_0_bias_gelu_f32_tc_hmma,
+            .linear_q4_0_bias_add_f32_tc_hmma = linear_q4_0_bias_add_f32_tc_hmma,
+            .activation_multiply_fused_gate_up_f32 = activation_multiply_fused_gate_up_f32,
             .quantize_f32_q8_1_rows = quantize_f32_q8_1_rows,
             .quantize_gated_f32_q8_1_rows = quantize_gated_f32_q8_1_rows,
             .quantize_f32_ggml_q8_1_rows = quantize_f32_ggml_q8_1_rows,
@@ -4093,7 +4122,7 @@ pub const KernelModule = struct {
             self.gqa_attention_prefill_tiled_f16_warp_f32 = null;
             self.gqa_attention_prefill_flash_sm89_hd256_f32 = null;
             self.gqa_attention_prefill_flash_sm89_hd512_f32 = null;
-            self.gqa_prefill_profile = .off;
+            self.gqa_prefill_profile = .automatic;
             self.gqa_score_prework_mode = .automatic;
             self.gqa_score_prework_consumer_mode = .serial;
             for (&self.gqa_prefill_route_log_words) |*word| word.store(0, .monotonic);
@@ -4133,6 +4162,12 @@ pub const KernelModule = struct {
             self.linear_q8_0_bias_f32_tc_hmma = null;
             self.linear_q8_0_bias_gelu_f32_tc_hmma = null;
             self.linear_q8_0_bias_add_f32_tc_hmma = null;
+            self.linear_q4_0_f32_tc_hmma = null;
+            self.linear_q4_0_f32_tc_hmma_bf16 = null;
+            self.linear_q4_0_bias_f32_tc_hmma = null;
+            self.linear_q4_0_bias_gelu_f32_tc_hmma = null;
+            self.linear_q4_0_bias_add_f32_tc_hmma = null;
+            self.activation_multiply_fused_gate_up_f32 = null;
             self.quantize_f32_q8_1_rows = null;
             self.quantize_gated_f32_q8_1_rows = null;
             self.quantize_f32_ggml_q8_1_rows = null;
@@ -4894,6 +4929,40 @@ pub const KernelModule = struct {
             @ptrCast(&activation_u32),
         };
         try launch1d(self.activation_multiply_f32, ctx, count, &params);
+    }
+
+    // Fused gate/up epilogue for a concatenated GEMM: `fused` is row-major
+    // [rows, 2*f] (gate columns then up columns per row); `dst` is [rows, f]
+    // with dst[r][c] = act(gate) * up. Consumes the same activation ids as
+    // launchActivationMultiplyF32.
+    pub fn launchActivationMultiplyFusedGateUpF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        fused: buffer_mod.DeviceBuffer,
+        rows: usize,
+        f: usize,
+        activation: u32,
+    ) driver_mod.Error!void {
+        const out_count = try checkedTensorElements(rows, f);
+        try checkBytes(dst, out_count);
+        try checkBytes(fused, try checkedTensorElements(rows, try checkedTensorElements(f, 2)));
+        if (out_count == 0) return;
+
+        const function = self.activation_multiply_fused_gate_up_f32 orelse return error.CudaSymbolMissing;
+        var dst_ptr = dst.ptr;
+        var fused_ptr = fused.ptr;
+        var rows_u32 = try toU32(rows);
+        var f_u32 = try toU32(f);
+        var activation_u32 = activation;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&fused_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&f_u32),
+            @ptrCast(&activation_u32),
+        };
+        try launch1d(function, ctx, out_count, &params);
     }
 
     pub fn launchActivationMultiplySliceLastDimF32(
@@ -10027,6 +10096,11 @@ pub const KernelModule = struct {
             self.gqa_attention_prefill_tiled_f16_exact_f32 != null,
             self.gqa_attention_prefill_tiled_f16_warp_f32 != null,
         );
+        // The automatic default and the explicit flash profiles share this
+        // selector. In `.automatic`, an ineligible or symbol-less request
+        // falls through silently and keeps the historical unset (`off`)
+        // launch topology; only the explicit `flash-f16-sm89` profile tags
+        // fallback launch kinds for telemetry.
         if (self.gqa_prefill_profile.selectsFlashF16Sm89() and q_seq_len > 1) {
             if (flash_prefill_launch == .prefill_flash_f16_sm89) {
                 function = flash_prefill_function.?;
@@ -10087,7 +10161,7 @@ pub const KernelModule = struct {
                         launch_kind = .prefill_tiled_f16_warp;
                     }
                 },
-                .flash_f16_sm89, .required_flash_f16_sm89 => {},
+                .automatic, .flash_f16_sm89, .required_flash_f16_sm89 => {},
             }
         }
         if (requiredGqaPrefillLaunch(self.gqa_prefill_profile)) |required_launch| {
@@ -11795,6 +11869,85 @@ pub const KernelModule = struct {
             @ptrCast(&out_dim_u32),
             null,
             null,
+        };
+        try launch2d(function, ctx, (out_dim + q_tc_hmma_cols - 1) / q_tc_hmma_cols, (rows + q_tc_hmma_rows - 1) / q_tc_hmma_rows, q_tc_hmma_threads, &params);
+    }
+
+    // W4A16 Q4_0 tensor-core linear (no bias). `weight_packed` is the q4_0_hmma
+    // layout (packQ4_0TensorCore): separated scales|quants, 18 bytes/block.
+    // Same launch geometry as the q8_0/q4_k tc_hmma kernels.
+    pub fn launchLinearQ4_0TcHmmaF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_packed: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_f32_tc_hmma orelse return error.CudaSymbolMissing;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_packed, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight_packed.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launch2d(function, ctx, (out_dim + q_tc_hmma_cols - 1) / q_tc_hmma_cols, (rows + q_tc_hmma_rows - 1) / q_tc_hmma_rows, q_tc_hmma_threads, &params);
+    }
+
+    // BF16-fragment variant of the Q4_0 tensor-core linear. Consumes the SAME
+    // q4_0_hmma packed layout; only the WMMA element type differs (bf16 has
+    // f32's exponent range, so it stays accurate on Gemma's large activations
+    // where the f16 kernel loses precision). Identical launch geometry.
+    pub fn launchLinearQ4_0TcHmmaBf16F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_packed: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_0_f32_tc_hmma_bf16 orelse return error.CudaSymbolMissing;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_packed, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight_packed.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
         };
         try launch2d(function, ctx, (out_dim + q_tc_hmma_cols - 1) / q_tc_hmma_cols, (rows + q_tc_hmma_rows - 1) / q_tc_hmma_rows, q_tc_hmma_threads, &params);
     }
@@ -17505,10 +17658,11 @@ test "CUDA runtime JIT profile scope covers only Gemma4 production routes" {
         try std.testing.expect(artifact.production_enabled);
         try std.testing.expect(liveRuntimeJitRoute(artifact) != null);
     }
-    // The runtime JIT owns the five promoted Q4_0 matmul routes. The two
-    // promoted score-prework attention composites ship in the prebuilt
-    // runtime module and deliberately stay outside JIT scope.
-    try std.testing.expectEqual(@as(usize, 7), production);
+    // The runtime JIT owns the five promoted Q4_0 matmul routes. The four
+    // promoted attention composites (two score-prework decode, two SM89
+    // flash-prefill) ship in the prebuilt runtime module and deliberately
+    // stay outside JIT scope.
+    try std.testing.expectEqual(@as(usize, 9), production);
     try std.testing.expectEqual(@as(usize, 5), production_matmul);
     try std.testing.expectEqual(production_matmul, selected);
 }
@@ -20679,6 +20833,9 @@ test "CUDA GQA prefill profile is canonical and legacy resolution is unambiguous
     }
     try std.testing.expect(parseGqaPrefillProfile("required_fast") == null);
     try std.testing.expect(parseGqaPrefillProfile("FAST") == null);
+    // Automatic is the unset default only; like the score-prework tri-state it
+    // is deliberately not an accepted explicit value.
+    try std.testing.expect(parseGqaPrefillProfile("automatic") == null);
 
     const canonical = try resolveGqaPrefillProfile("required-fast", true, true, true);
     try std.testing.expectEqual(GqaPrefillProfile.required_fast, canonical.profile);
@@ -20696,8 +20853,28 @@ test "CUDA GQA prefill profile is canonical and legacy resolution is unambiguous
     try std.testing.expectEqual(GqaPrefillProfile.fast, legacy.profile);
     try std.testing.expectEqual(GqaPrefillProfileSource.legacy, legacy.source);
     const defaults = try resolveGqaPrefillProfile(null, false, false, false);
-    try std.testing.expectEqual(GqaPrefillProfile.off, defaults.profile);
+    try std.testing.expectEqual(GqaPrefillProfile.automatic, defaults.profile);
     try std.testing.expectEqual(GqaPrefillProfileSource.default, defaults.source);
+    // The promoted automatic default attempts flash and never fails closed;
+    // explicit `off` remains the rollback with no flash selection.
+    try std.testing.expect(defaults.profile.selectsFlashF16Sm89());
+    try std.testing.expect(!defaults.profile.failClosed());
+    try std.testing.expect(!defaults.profile.selectsFast());
+    try std.testing.expect(!GqaPrefillProfile.off.selectsFlashF16Sm89());
+    try std.testing.expectEqual(
+        GqaAttentionLaunchKind.prefill_flash_f16_sm89,
+        selectGqaFlashPrefillLaunch(.automatic, .eligible, true),
+    );
+    try std.testing.expectEqual(
+        GqaAttentionLaunchKind.none,
+        selectGqaFlashPrefillLaunch(.automatic, .eligible, false),
+    );
+    try std.testing.expectEqual(
+        GqaAttentionLaunchKind.none,
+        selectGqaFlashPrefillLaunch(.automatic, .page_size_ineligible, true),
+    );
+    try std.testing.expect(optionalGqaFlashPrefillFallbackLaunch(.automatic, .page_size_ineligible, true) == null);
+    try std.testing.expect(optionalGqaFlashPrefillFallbackLaunch(.automatic, .eligible, false) == null);
 
     try std.testing.expectError(error.InvalidCudaState, resolveGqaPrefillProfile("auto", false, false, false));
     try std.testing.expectError(error.InvalidCudaState, resolveGqaPrefillProfile(null, true, true, false));

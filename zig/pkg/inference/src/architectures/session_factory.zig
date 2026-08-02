@@ -5294,6 +5294,96 @@ pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {
     };
 }
 
+/// Drain any buffered non-blocking CUDA op-profile events into the compute's
+/// stat counters. Call this after a request finishes (before reading stats) so
+/// the profiler's single host sync happens off the hot path. No-op when the
+/// session is not CUDA-backed or profiling is disabled.
+pub fn drainCudaProfile(session: Session) void {
+    if (comptime !build_options.enable_cuda) return;
+    if (session.vtable != &arch_vtable) return;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    switch (self.backend_type) {
+        .cuda => cuda_compute_mod.drainCudaProfile(&self.backend_data.cuda.compute),
+        else => {},
+    }
+}
+
+/// Shared formatter for the `cuda_prefill_profile_us:` telemetry line so the CLI
+/// and the HTTP server emit byte-identical output. Formats into `buf` (768 bytes
+/// is ample) and returns the written slice, WITHOUT a trailing newline.
+pub fn formatCudaPrefillProfileLine(buf: []u8, stats: CudaRuntimeStats) []const u8 {
+    if (comptime build_options.enable_cuda) {
+        return std.fmt.bufPrint(
+            buf,
+            "cuda_prefill_profile_us: events={d} q4_linear={d} q4_qkv={d} q4_pair={d} q4_gated_down={d} bf16_linear={d} bf16_qkv={d} bf16_pair={d} attention={d} ple_dense={d} staging={d} norm={d} rope={d} kv_write={d} elementwise={d} embedding={d}",
+            .{
+                stats.prefill_profile_events,
+                stats.prefill_profile_q4_linear_us,
+                stats.prefill_profile_q4_qkv_us,
+                stats.prefill_profile_q4_pair_us,
+                stats.prefill_profile_q4_gated_down_us,
+                stats.prefill_profile_bf16_linear_us,
+                stats.prefill_profile_bf16_qkv_us,
+                stats.prefill_profile_bf16_pair_us,
+                stats.prefill_profile_attention_us,
+                stats.prefill_profile_ple_dense_us,
+                stats.prefill_profile_staging_us,
+                stats.prefill_profile_norm_us,
+                stats.prefill_profile_rope_us,
+                stats.prefill_profile_kv_write_us,
+                stats.prefill_profile_elementwise_us,
+                stats.prefill_profile_embedding_us,
+            },
+        ) catch buf[0..0];
+    }
+    return buf[0..0];
+}
+
+/// True when either CUDA op-profile mode is enabled via env, i.e. there is a
+/// profile line worth draining and emitting.
+pub fn cudaOpProfileLoggingEnabled() bool {
+    if (comptime !build_options.enable_cuda) return false;
+    return cuda_compute_mod.cudaPrefillOpProfileEnabled() or cuda_compute_mod.cudaDecodeProfileEnabled();
+}
+
+/// Saturating per-field delta of two CUDA runtime-stat snapshots. Shared by the
+/// CLI and the server so a request's profile line reflects that request alone.
+pub fn cudaStatsDelta(after: CudaRuntimeStats, before: CudaRuntimeStats) CudaRuntimeStats {
+    if (comptime !build_options.enable_cuda) return after;
+    var delta = after;
+    inline for (std.meta.fields(CudaRuntimeStats)) |field| {
+        switch (@typeInfo(field.type)) {
+            .int => @field(delta, field.name) = @field(after, field.name) -| @field(before, field.name),
+            else => {},
+        }
+    }
+    return delta;
+}
+
+/// Shared formatter for the `cuda_decode_profile_us:` telemetry line (see
+/// formatCudaPrefillProfileLine). Returns the written slice, no trailing newline.
+pub fn formatCudaDecodeProfileLine(buf: []u8, stats: CudaRuntimeStats) []const u8 {
+    if (comptime build_options.enable_cuda) {
+        return std.fmt.bufPrint(
+            buf,
+            "cuda_decode_profile_us: events={d} qkv={d} gqa_attention={d} attention_output={d} attention_norm_residual={d} ffn_gate_up={d} ffn_gated_down={d} ffn_post_norm={d} lm_head_argmax={d} graph_replay={d}",
+            .{
+                stats.decode_profile_events,
+                stats.decode_profile_qkv_us,
+                stats.decode_profile_gqa_attention_us,
+                stats.decode_profile_attention_output_us,
+                stats.decode_profile_attention_norm_residual_us,
+                stats.decode_profile_ffn_gate_up_us,
+                stats.decode_profile_ffn_gated_down_us,
+                stats.decode_profile_ffn_post_norm_us,
+                stats.decode_profile_lm_head_argmax_us,
+                stats.decode_profile_graph_replay_us,
+            },
+        ) catch buf[0..0];
+    }
+    return buf[0..0];
+}
+
 pub const MetalExactJitDispatchStats = struct {
     q4_0_hits: u64 = 0,
     q4_k_hits: u64 = 0,

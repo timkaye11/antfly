@@ -328,6 +328,32 @@ a superiority result. See `docs/CUDA_TUNING.md` ("Gemma 4 E2B SM89
 optimization status") for the paired statistics, the promoted-routes-only
 measurement, and the F32-cache decode caveat.
 
+Update 2026-07-31 (flash-prefill promotion): the SM89 GQA flash-prefill F16
+composites (`attention_prefill_flash_sm89_hd{256,512}`) are promoted to
+production runtime defaults. With `ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE`
+unset, the runtime resolves an automatic selector that engages
+`flash-f16-sm89` whenever the qualified contract holds (SM89, page-16 paged
+F16 K/V, GQA 8:1, q512/q3 query-length policy, matching sliding-window/global
+geometry, symbols loaded) and otherwise silently keeps the previous unset
+launch topology. Promotion evidence: `zig build
+quant-kernel-cuda-paged-prefill-diff` passed all 90
+guard/page-table/adversarial/determinism cases bitwise-identical (also run in
+CI on the L4 lane). Rollback: `ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE=off`;
+all explicit profile values behave exactly as before.
+
+Update 2026-08-01 (W4A16 tensor-core prefill projections promoted): non-perturbing
+nsys profiling showed prefill is GPU-bound (99.7% device utilization — the earlier
+"host overhead" was un-bucketed GPU kernels, not host idle), with the FFN gate/up
+projection (`termite_linear_q4_0_pair_nobias_q8_1_f32_tile4`, DP4A/SIMT int8) the
+single dominant kernel at ~52% of prefill. Routing Q4_0 prefill projections through
+the BF16 tensor-core (WMMA) kernel instead cuts prefill 1.81x (2297->1269 ms on a
+1131-token chunked run) AND raises quality: vs the F32-activation reference the BF16
+tensor-core path matches 96/96 greedy tokens (100%) while the DP4A q8_1 default
+matches only 30/96 (31%, diverges at token 29) — bf16 activations track f32's argmax;
+q8_1 int8 is too coarse. `q4_0_tc_hmma_prefill` is therefore promoted default-on for
+SM89 (compute 8.9): W4A16 handles prefill projections (rows>1); DP4A stays for decode
+(rows==1). Rollback: `ANTFLY_INFERENCE_CUDA_Q4_0_TC_HMMA_PREFILL=0`.
+
 Status checked on 2026-06-21 on branch `gemma4_gpu_stuff`:
 
 - `zig build -Dcuda=true` succeeds.

@@ -846,9 +846,10 @@ pub const FlashPrefillRenderPlan = struct {
     production_baseline: []const u8,
     production_enabled: bool,
     runtime_default_enabled: bool,
-    /// The HMMA path intentionally rounds F32 Q to F16. Differential evidence
-    /// permits explicit use, but exact generated-token parity remains required
-    /// before this route may become a runtime default.
+    /// The HMMA path intentionally rounds F32 Q to F16. Exact parity remains a
+    /// hard requirement for any runtime default; the paged-prefill differential
+    /// passed every guard/page-table/adversarial/determinism case
+    /// bitwise-identical, which qualified this route as the automatic default.
     exact_token_parity_required_for_default: bool,
     exact_token_parity_qualified: bool,
     launch: LaunchMetadata,
@@ -1729,10 +1730,10 @@ fn flashPrefillPlan(
         .namespace_id = namespace_id,
         .kernel_id = kernel_id,
         .production_baseline = "termite_gqa_attention_prefill_tiled_f16_warp_f32",
-        .production_enabled = false,
-        .runtime_default_enabled = false,
+        .production_enabled = true,
+        .runtime_default_enabled = true,
         .exact_token_parity_required_for_default = true,
-        .exact_token_parity_qualified = false,
+        .exact_token_parity_qualified = true,
         .launch = .{
             .grid = .query_heads_by_query_tiles,
             .threads_per_block = generated_flash_prefill_threads,
@@ -2099,20 +2100,29 @@ pub fn renderFlashPrefillKernel(
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     try appendFmt(allocator, &out,
-        \\// Default-off generated Flash prefill from graph/quant_kernel_compiler.zig.
+        \\// {s} generated Flash prefill from graph/quant_kernel_compiler.zig.
         \\// plan_id={s}
         \\// source_id={s}
         \\// kernel_id={s}
         \\// production_baseline={s}
-        \\// runtime_default_enabled=false
-        \\// exact_token_parity_qualified=false
+        \\// runtime_default_enabled={s}
+        \\// exact_token_parity_qualified={s}
         \\
     , .{
+        if (plan.production_enabled) "Production" else "Default-off",
         route_id,
         plan.source_id,
         plan.kernel_id,
         plan.production_baseline,
+        if (plan.runtime_default_enabled) "true" else "false",
+        if (plan.exact_token_parity_qualified) "true" else "false",
     });
+    if (plan.runtime_default_enabled) {
+        try out.appendSlice(
+            allocator,
+            "// Default-on automatic SM89 selection; rollback: ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE=off.\n",
+        );
+    }
     try out.appendSlice(allocator, body);
     return out.toOwnedSlice(allocator);
 }
@@ -5304,7 +5314,7 @@ test "cuda renderer rejects attention launch drift" {
     try std.testing.expectError(error.CudaAttentionSourceIdDoesNotMatchSplitCount, source_id.validate());
 }
 
-test "cuda renderer owns default-off SM89 Flash prefill contracts" {
+test "cuda renderer owns promoted SM89 Flash prefill contracts" {
     const hd256 = flashPrefillPlanFor(.gqa_prefill_flash_sm89_hd256_swa512_f32);
     const hd512 = flashPrefillPlanFor(.gqa_prefill_flash_sm89_hd512_global_f32);
     try hd256.validate();
@@ -5320,10 +5330,12 @@ test "cuda renderer owns default-off SM89 Flash prefill contracts" {
     try std.testing.expectEqual(@as(?u32, 26_564), generatedFlashPrefillDynamicSharedBytes(256));
     try std.testing.expectEqual(@as(?u32, 42_948), generatedFlashPrefillDynamicSharedBytes(512));
     try std.testing.expectEqual(@as(?u32, null), generatedFlashPrefillDynamicSharedBytes(128));
-    try std.testing.expect(!hd256.production_enabled);
-    try std.testing.expect(!hd256.runtime_default_enabled);
+    try std.testing.expect(hd256.production_enabled);
+    try std.testing.expect(hd256.runtime_default_enabled);
     try std.testing.expect(hd256.exact_token_parity_required_for_default);
-    try std.testing.expect(!hd256.exact_token_parity_qualified);
+    try std.testing.expect(hd256.exact_token_parity_qualified);
+    try std.testing.expect(hd512.production_enabled);
+    try std.testing.expect(hd512.runtime_default_enabled);
 
     const policy = FlashPrefillQueryLengthPolicy.gemma4_q512_or_q3_v1;
     inline for ([_]usize{ 0, 512, 1024, 1536 }) |offset| {
@@ -5334,12 +5346,19 @@ test "cuda renderer owns default-off SM89 Flash prefill contracts" {
     try std.testing.expect(!policy.accepts(512, 1));
     try std.testing.expect(!policy.accepts(3, 1536));
 
+    // A runtime default without exact-token-parity qualification must remain
+    // unrepresentable even now that the promoted plans carry the evidence.
     var unsafe_default = hd256;
-    unsafe_default.production_enabled = true;
-    unsafe_default.runtime_default_enabled = true;
+    unsafe_default.exact_token_parity_qualified = false;
     try std.testing.expectError(
         error.CudaFlashPrefillDefaultRequiresExactTokenParity,
         unsafe_default.validate(),
+    );
+    var unqualified_production = hd256;
+    unqualified_production.exact_token_parity_required_for_default = false;
+    try std.testing.expectError(
+        error.CudaFlashPrefillDefaultRequiresExactTokenParity,
+        unqualified_production.validate(),
     );
 }
 
@@ -5358,8 +5377,15 @@ test "cuda renderer emits the production Flash prefill ABI from its owned templa
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "wmma::mma_sync("));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 4, "index += kThreads"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "index += blockDim.x"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime_default_enabled=false"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "exact_token_parity_qualified=false"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "// Production generated Flash prefill"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime_default_enabled=true"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "exact_token_parity_qualified=true"));
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        source,
+        1,
+        "rollback: ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE=off",
+    ));
     try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "_prototype"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "prefill_reference_f16"));
 }

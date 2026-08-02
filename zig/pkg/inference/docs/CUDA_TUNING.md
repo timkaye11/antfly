@@ -89,12 +89,21 @@ Six typed GQA prefill candidates are accepted for explicit experiments:
 `required-flash-f16-sm89`. The `required-` forms fail closed instead of using a
 different prefill route. The shared wrapper validates these exact lowercase
 values but continues to default to `required-fast`. Direct long-server
-overrides remain collect-only. The versioned SM89 warp and Flash execution
-profiles are also collect-only: warp has failed exact generated-token parity,
-and Flash has not yet passed the production end-to-end parity screen. Flash is
-additionally restricted to the qualified page-16 F16 KV, F32 query, GQA 8:1,
-q512/q3, SM89 contract and remains a runtime default-off candidate until exact
-generated-token parity is attested.
+overrides remain collect-only for the warp profile, which has failed exact
+generated-token parity.
+
+The SM89 Flash prefill route is promoted: with
+`ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE` unset, the runtime resolves the
+automatic selector, which engages `flash-f16-sm89` whenever the full
+eligibility contract holds (page-16 F16 KV, F32 query, GQA 8:1, the q512/q3
+query-length policy, matching sliding-window/global geometry, SM89, and loaded
+symbols) and otherwise silently keeps the previous unset launch topology.
+Promotion evidence is the paged-prefill differential
+(`zig build quant-kernel-cuda-paged-prefill-diff`), which passed all 90
+guard/page-table/adversarial/determinism cases bitwise-identical, plus the
+strict end-to-end candidate validator. Explicit profiles behave exactly as
+before; `ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE=off` is the rollback
+switch that restores the pre-promotion unset behavior.
 
 `ANTFLY_INFERENCE_CUDA_SM89_Q4_0_Q8_1=ggml-ffn-v1` selects the experimental
 single-row E2B GGML-Q8_1 FFN route. Its default is `off`, and qualification is
@@ -884,10 +893,13 @@ The promoted-routes-only production configuration is materially slower on the
 same workload class. In the tuned pair-harness CLI config (F16 caches, 512-row
 prefill chunks, a 1,457-token prompt, 511 greedy tokens) Antfly measured 76.7
 decode tokens/s with 5,002 ms median prefill versus `llama-completion` at 131.3
-tokens/s and 201 ms prompt eval. The delta to the frontier profile quantifies
-the still-unpromoted surface: `required-flash-f16-sm89` prefill, split-K
-decode, `ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL`, and the
-capture/readback extras in the reviewed flash profile environment. With F32 K/V
+tokens/s and 201 ms prompt eval. Those figures predate the 2026-07-31
+flash-prefill promotion: the SM89 flash prefill route is now a production
+runtime default through the automatic profile selector (unset
+`ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE`; rollback `off`). The remaining
+still-unpromoted surface is split-K decode,
+`ANTFLY_INFERENCE_CUDA_Q4_0_WEIGHTS_BF16_PREFILL`, and the capture/readback
+extras in the reviewed flash profile environment. With F32 K/V
 caches the same workload decodes at only 32 tokens/s: every score-prework
 selector is F16-only, so the automatic route is ineligible and F32 long-context
 comparisons measure the legacy decode path by construction.

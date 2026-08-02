@@ -124,7 +124,16 @@ FROZEN_PROFILE = {
     "REQUIRE_GENERATED_E2B_FFN": "0",
     "ANTFLY_Q4_0_Q8_1_PREFILL_ROWS": "1",
     "ANTFLY_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE": "0",
-    "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE": "required-fast",
+    # ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE is deliberately absent: the
+    # promoted production default is the automatic flash-prefill selector,
+    # expressed by leaving the variable unset.  release_environment() scrubs
+    # any inherited value, so absence here freezes the automatic default.
+    # This is coherent with the 256-token contract: at that shape the flash
+    # query-length policy (q512-aligned or q3) does not match, so the
+    # automatic selector falls back to the fast prefill path -- exactly the
+    # frozen behavior this gate certifies.  "off" is the explicit rollback and
+    # the required-* profiles are qualification overrides, neither of which is
+    # the release configuration.
     "ANTFLY_Q4_0_LINEAR_Q8_1_TILE4_W8_MIN_IN_DIM": "2048",
     "ANTFLY_Q4_0_LINEAR_Q8_1_ROWS8_C4": "1",
     "ANTFLY_Q4_0_PAIR_ACTIVATION_Q8_1_ROWS8_C2": "1",

@@ -1027,13 +1027,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             return err;
         };
         const finished_generate_at = std.Io.Timestamp.now(io, .awake);
+        if (comptime build_options.enable_cuda) session_factory.drainCudaProfile(model.session);
         const cuda_stats_after_generate = if (comptime build_options.enable_cuda)
             session_factory.getCudaRuntimeStats(model.session)
         else
             null;
         const cuda_generate_stats = if (comptime build_options.enable_cuda)
             if (cuda_stats_after_generate) |after|
-                if (cuda_stats_before_generate) |before| cudaStatsDelta(after, before) else null
+                if (cuda_stats_before_generate) |before| session_factory.cudaStatsDelta(after, before) else null
             else
                 null
         else
@@ -1106,6 +1107,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return err;
     };
     const finished_generate_at = std.Io.Timestamp.now(io, .awake);
+    // Drain buffered per-op profile events (single host sync, off the hot path)
+    // so the prefill/decode profile counters below reflect the whole request.
+    if (comptime build_options.enable_cuda) session_factory.drainCudaProfile(model.session);
     const cuda_stats_after_generate = if (comptime build_options.enable_cuda)
         session_factory.getCudaRuntimeStats(model.session)
     else
@@ -1116,14 +1120,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         null;
     const cuda_generate_stats = if (comptime build_options.enable_cuda)
         if (cuda_stats_after_generate) |after|
-            if (cuda_stats_before_generate) |before| cudaStatsDelta(after, before) else null
+            if (cuda_stats_before_generate) |before| session_factory.cudaStatsDelta(after, before) else null
         else
             null
     else
         null;
     const draft_cuda_generate_stats = if (comptime build_options.enable_cuda)
         if (draft_cuda_stats_after_generate) |after|
-            if (draft_cuda_stats_before_generate) |before| cudaStatsDelta(after, before) else null
+            if (draft_cuda_stats_before_generate) |before| session_factory.cudaStatsDelta(after, before) else null
         else
             null
     else
@@ -1720,38 +1724,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                             generate_stats.decoder_runtime_pinned_eviction_skips,
                         },
                     );
-                    print(
-                        "cuda_decode_profile_us: events={d} qkv={d} gqa_attention={d} attention_output={d} attention_norm_residual={d} ffn_gate_up={d} ffn_gated_down={d} ffn_post_norm={d} lm_head_argmax={d} graph_replay={d}\n",
-                        .{
-                            generate_stats.decode_profile_events,
-                            generate_stats.decode_profile_qkv_us,
-                            generate_stats.decode_profile_gqa_attention_us,
-                            generate_stats.decode_profile_attention_output_us,
-                            generate_stats.decode_profile_attention_norm_residual_us,
-                            generate_stats.decode_profile_ffn_gate_up_us,
-                            generate_stats.decode_profile_ffn_gated_down_us,
-                            generate_stats.decode_profile_ffn_post_norm_us,
-                            generate_stats.decode_profile_lm_head_argmax_us,
-                            generate_stats.decode_profile_graph_replay_us,
-                        },
-                    );
-                    print(
-                        "cuda_prefill_profile_us: events={d} q4_linear={d} q4_qkv={d} q4_pair={d} q4_gated_down={d} bf16_linear={d} bf16_qkv={d} bf16_pair={d} attention={d} ple_dense={d} staging={d} norm={d}\n",
-                        .{
-                            generate_stats.prefill_profile_events,
-                            generate_stats.prefill_profile_q4_linear_us,
-                            generate_stats.prefill_profile_q4_qkv_us,
-                            generate_stats.prefill_profile_q4_pair_us,
-                            generate_stats.prefill_profile_q4_gated_down_us,
-                            generate_stats.prefill_profile_bf16_linear_us,
-                            generate_stats.prefill_profile_bf16_qkv_us,
-                            generate_stats.prefill_profile_bf16_pair_us,
-                            generate_stats.prefill_profile_attention_us,
-                            generate_stats.prefill_profile_ple_dense_us,
-                            generate_stats.prefill_profile_staging_us,
-                            generate_stats.prefill_profile_norm_us,
-                        },
-                    );
+                    var cuda_profile_line_buf: [768]u8 = undefined;
+                    print("{s}\n", .{session_factory.formatCudaDecodeProfileLine(&cuda_profile_line_buf, generate_stats)});
+                    print("{s}\n", .{session_factory.formatCudaPrefillProfileLine(&cuda_profile_line_buf, generate_stats)});
                 }
                 print(
                     "cuda_eval_breakdown: requests={d} skipped_eager={d} forced_syncs={d}\n",
@@ -2738,18 +2713,6 @@ fn writeRawDecodeBenchJson(
 fn perToken(count: usize, tokens: usize) f64 {
     if (tokens == 0) return 0.0;
     return @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(tokens));
-}
-
-fn cudaStatsDelta(after: session_factory.CudaRuntimeStats, before: session_factory.CudaRuntimeStats) session_factory.CudaRuntimeStats {
-    if (comptime !build_options.enable_cuda) return;
-    var delta = after;
-    inline for (std.meta.fields(session_factory.CudaRuntimeStats)) |field| {
-        switch (@typeInfo(field.type)) {
-            .int => @field(delta, field.name) = @field(after, field.name) -| @field(before, field.name),
-            else => {},
-        }
-    }
-    return delta;
 }
 
 fn appendFmt(
@@ -5491,11 +5454,18 @@ fn generationKvBackendKind(backend: backends.BackendType) ?runtime.kv.pool.Backe
     };
 }
 
+// Promoted default: prefill residency prewarm is default-on. It is a pure
+// residency optimization guarded downstream to the CUDA backend and Gemma
+// non-MoE configs, and a failure never aborts generation. Explicit env values
+// keep overriding in both directions (the DISABLE variables and an explicit
+// `0` on either enable variable turn it off).
 fn cudaGemmaPrefillPrewarmEnabled() bool {
     if (envFlagEnabled("ANTFLY_INFERENCE_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
     if (envFlagEnabled("ANTFLY_INFERENCE_CUDA_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
-    return envFlagEnabled("ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM") or
-        envFlagEnabled("ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM");
+    return platform.env.getenvBoolDefault(
+        "ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM",
+        platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM", true),
+    );
 }
 
 fn prewarmCudaGemmaPrefillResidency(
@@ -8353,4 +8323,49 @@ test "live whole-model generation excludes all EOS tokens unless ignored" {
     try std.testing.expect(!liveWholeModelShouldStopOnEos(gpt_config, false, 4));
     try std.testing.expect(!liveWholeModelShouldStopOnEos(gpt_config, true, 7));
     try std.testing.expect(!liveWholeModelShouldStopOnEos(gpt_config, false, -1));
+}
+
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn unsetenv(name: [*:0]const u8) c_int;
+
+test "cuda gemma prefill prewarm defaults on with bidirectional env overrides" {
+    const allocator = std.testing.allocator;
+    const names = [_][:0]const u8{
+        "ANTFLY_INFERENCE_DISABLE_GEMMA_PREFILL_PREWARM",
+        "ANTFLY_INFERENCE_CUDA_DISABLE_GEMMA_PREFILL_PREWARM",
+        "ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM",
+        "ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM",
+    };
+    var saved: [names.len]?[:0]u8 = @splat(null);
+    defer for (names, saved) |name, value| {
+        if (value) |owned| {
+            _ = setenv(name.ptr, owned.ptr, 1);
+            allocator.free(owned);
+        } else {
+            _ = unsetenv(name.ptr);
+        }
+    };
+    for (names, &saved) |name, *slot| {
+        if (platform.env.getenv(name.ptr)) |value| slot.* = try allocator.dupeZ(u8, value);
+        _ = unsetenv(name.ptr);
+    }
+
+    // Unset: promoted default-on.
+    try std.testing.expect(cudaGemmaPrefillPrewarmEnabled());
+
+    // Explicit 0 on either enable variable disables.
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM", "0", 1));
+    try std.testing.expect(!cudaGemmaPrefillPrewarmEnabled());
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_CUDA_GEMMA_PREFILL_PREWARM", "1", 1));
+    try std.testing.expect(cudaGemmaPrefillPrewarmEnabled());
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM", "0", 1));
+    try std.testing.expect(!cudaGemmaPrefillPrewarmEnabled());
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv("ANTFLY_INFERENCE_GEMMA_PREFILL_PREWARM"));
+
+    // The DISABLE variables always win.
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_CUDA_DISABLE_GEMMA_PREFILL_PREWARM", "1", 1));
+    try std.testing.expect(!cudaGemmaPrefillPrewarmEnabled());
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv("ANTFLY_INFERENCE_CUDA_DISABLE_GEMMA_PREFILL_PREWARM"));
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_DISABLE_GEMMA_PREFILL_PREWARM", "1", 1));
+    try std.testing.expect(!cudaGemmaPrefillPrewarmEnabled());
 }

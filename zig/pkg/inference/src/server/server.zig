@@ -2907,6 +2907,13 @@ pub const Node = struct {
         if (timing != null) {
             std.log.info("direct generator starting generation model={s} backend={s}", .{ model_name, @tagName(model.session.backend()) });
         }
+        // Snapshot CUDA op-profile counters before generation so the emitted
+        // line below reflects this request alone (warmup/other requests excluded).
+        const cuda_profile_before: ?session_factory.CudaRuntimeStats =
+            if (comptime build_options.enable_cuda)
+                (if (session_factory.cudaOpProfileLoggingEnabled()) session_factory.getCudaRuntimeStats(model.session) else null)
+            else
+                null;
         var result = pipeline.generate(messages, .{ .max_tokens = max_tokens, .prefill_chunk_size = admitted_prefill_chunk }) catch |err| {
             std.log.err("direct generator generation failed model={s} backend={s}: {s}", .{
                 model_name,
@@ -2917,6 +2924,20 @@ pub const Node = struct {
         };
         const generated_at_ns = embedTimingNowNs();
         defer result.deinit();
+        // Drain buffered per-op profile events (single host sync, off the hot
+        // path) and emit the same lines the CLI prints, so profiling works
+        // against the warm server too.
+        if (comptime build_options.enable_cuda) {
+            if (cuda_profile_before) |before| {
+                session_factory.drainCudaProfile(model.session);
+                if (session_factory.getCudaRuntimeStats(model.session)) |after| {
+                    const profile_delta = session_factory.cudaStatsDelta(after, before);
+                    var cuda_profile_line_buf: [768]u8 = undefined;
+                    std.log.info("{s}", .{session_factory.formatCudaDecodeProfileLine(&cuda_profile_line_buf, profile_delta)});
+                    std.log.info("{s}", .{session_factory.formatCudaPrefillProfileLine(&cuda_profile_line_buf, profile_delta)});
+                }
+            }
+        }
         if (debug_metal_timing) {
             if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
                 runtime_model.printDebugTiming();
@@ -7410,6 +7431,18 @@ pub const Node = struct {
             return ctx.response.build();
         };
 
+        // Snapshot CUDA op-profile counters before generation so the emitted
+        // line below reflects this request alone. Mirrors the direct-generator
+        // path so per-op profiling works against the warm server's SSE route
+        // (the one the long-context benchmark harness uses). pipeline.session is
+        // optional here, so unwrap it before snapshotting.
+        const cuda_profile_before: ?session_factory.CudaRuntimeStats =
+            if (comptime build_options.enable_cuda) blk: {
+                if (!session_factory.cudaOpProfileLoggingEnabled()) break :blk null;
+                const sess = pipeline.session orelse break :blk null;
+                break :blk session_factory.getCudaRuntimeStats(sess);
+            } else null;
+
         var result = pipeline.generateStreaming(
             messages,
             config,
@@ -7422,6 +7455,22 @@ pub const Node = struct {
             return ctx.response.build();
         };
         defer result.deinit();
+
+        // Drain buffered per-op profile events (single host sync, off the hot
+        // path) and emit the same lines the CLI prints.
+        if (comptime build_options.enable_cuda) {
+            if (cuda_profile_before) |before| {
+                if (pipeline.session) |sess| {
+                    session_factory.drainCudaProfile(sess);
+                    if (session_factory.getCudaRuntimeStats(sess)) |after| {
+                        const profile_delta = session_factory.cudaStatsDelta(after, before);
+                        var cuda_profile_line_buf: [768]u8 = undefined;
+                        std.log.info("{s}", .{session_factory.formatCudaDecodeProfileLine(&cuda_profile_line_buf, profile_delta)});
+                        std.log.info("{s}", .{session_factory.formatCudaPrefillProfileLine(&cuda_profile_line_buf, profile_delta)});
+                    }
+                }
+            }
+        }
 
         if (stream_ctx.errored) {
             if (!builtin.is_test) std.log.err("inference request failed code=STREAM_WRITE_FAILED", .{});

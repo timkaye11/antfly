@@ -1860,6 +1860,29 @@ extern "C" __global__ void termite_activation_multiply_slice_last_dim_f32(
     dst[i] = termite_decoder_activation_f32(gate[i], activation) * source[row * source_cols + start + col];
 }
 
+// Strided gate/up activation multiply over the output of a concatenated
+// gate|up GEMM. `fused` is row-major [rows, 2*f]: within each row, columns
+// [0, f) hold the gate projection and columns [f, 2*f) hold the up
+// projection. dst is contiguous [rows, f] with
+// dst[r][c] = act(fused[r][c]) * fused[r][f + c]. Activation ids match
+// termite_activation_multiply_f32 (0/1 gelu tanh, 2 silu, 3 relu,
+// 4 quick gelu, else relu^2).
+extern "C" __global__ void termite_activation_multiply_fused_gate_up_f32(
+    float* dst,
+    const float* fused,
+    unsigned int rows,
+    unsigned int f,
+    unsigned int activation
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int count = rows * f;
+    if (i >= count) return;
+    unsigned int row = i / f;
+    unsigned int col = i - row * f;
+    const float* fused_row = fused + (size_t)row * (2u * f);
+    dst[i] = termite_decoder_activation_f32(fused_row[col], activation) * fused_row[f + col];
+}
+
 extern "C" __global__ void termite_embedding_lookup_f32(
     float* dst,
     const float* weight,
@@ -7370,7 +7393,7 @@ extern "C" __global__ void ANTFLY_SPLITK_ONLINE_KERNEL(
 #undef ANTFLY_SPLITK_ONLINE_KERNEL
 #undef ANTFLY_SPLITK_ONLINE_NAMESPACE
 
-// Opt-in generated attention candidate from graph/quant_kernel_compiler.zig.
+// Production generated attention route from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_gqa_attention_prefill_flash_sm89_hd256_swa512_f32_v1 plan_id=cuda/attention/prefill_flash/sm89/hd256/gqa8/page16/q512-or-q3/swa512/f32q-f16kv-hmma
 #define ANTFLY_FLASH_NAMESPACE antfly_flash_prefill_sm89_hd256_swa512_f32_v1
 #define ANTFLY_FLASH_KERNEL antfly_gqa_attention_prefill_flash_sm89_hd256_swa512_f32_v1
@@ -8212,7 +8235,7 @@ ANTFLY_FLASH_REFERENCE_KERNEL(
 #undef ANTFLY_FLASH_KERNEL
 #undef ANTFLY_FLASH_NAMESPACE
 
-// Opt-in generated attention candidate from graph/quant_kernel_compiler.zig.
+// Production generated attention route from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_gqa_attention_prefill_flash_sm89_hd512_global_f32_v1 plan_id=cuda/attention/prefill_flash/sm89/hd512/gqa8/page16/q512-or-q3/swa0/f32q-f16kv-hmma
 #define ANTFLY_FLASH_NAMESPACE antfly_flash_prefill_sm89_hd512_global_f32_v1
 #define ANTFLY_FLASH_KERNEL antfly_gqa_attention_prefill_flash_sm89_hd512_global_f32_v1
@@ -13747,7 +13770,122 @@ __device__ __forceinline__ half termite_q4_k_tc_value_at(
     return __float2half_rn(scale * (float)q - minv);
 }
 
-template <unsigned int MODE, bool Q4K>
+// q4_0_hmma packed device layout (mirrors q8_0_hmma: scales | quants).
+//
+// Host pack contract (to be implemented as packQ4_0TensorCore in
+// cuda_compute.zig): input is the raw GGUF Q4_0 byte stream for an
+// [out_dim, in_dim] weight, 18 bytes per 32-value block laid out row-major
+// by output column (block_index = col * row_blocks + block with
+// row_blocks = in_dim / 32; the engine additionally requires
+// in_dim % 256 == 0 for tensor-core packing eligibility). Raw block bytes:
+//   src[0..2)  f16 little-endian scale d
+//   src[2..18) 16 quant bytes; byte j holds element j in the low nibble and
+//              element j + 16 in the high nibble; value = (nibble - 8) * d
+// Packed output (block_count = out_dim * row_blocks):
+//   out[0                     .. block_count * 2)   scales: block_index * 2
+//                                                   is the f16 LE scale
+//                                                   (raw src[0..2) copied)
+//   out[block_count * 2       .. block_count * 18)  quants: block_count * 2
+//                                                   + block_index * 16 is
+//                                                   the 16 raw quant bytes
+//                                                   (raw src[2..18) copied,
+//                                                   nibble order unchanged)
+// Pack loop: for block in 0..block_count:
+//   copy raw[block*18 .. block*18+2)  -> out[block*2 .. block*2+2)
+//   copy raw[block*18+2 .. block*18+18) -> out[block_count*2 + block*16 ..)
+// Total packed size = block_count * 18 bytes.
+__device__ __forceinline__ half termite_q4_0_tc_value_at(
+    const unsigned char* packed,
+    unsigned int out_dim,
+    unsigned int col,
+    unsigned int row_blocks,
+    unsigned int k_abs
+) {
+    unsigned int block = k_abs / 32u;
+    unsigned int lane = k_abs & 31u;
+    unsigned int block_index = col * row_blocks + block;
+    unsigned int block_count = out_dim * row_blocks;
+    half d = termite_half_from_le(packed + block_index * 2u);
+    unsigned char packed_q = packed[block_count * 2u + block_index * 16u + (lane & 15u)];
+    int q = lane < 16u ? (int)(packed_q & 0x0fu) : (int)(packed_q >> 4u);
+    return __float2half_rn((float)(q - 8) * __half2float(d));
+}
+
+static constexpr unsigned int TERMITE_QTC_FMT_Q8_0 = 0u;
+static constexpr unsigned int TERMITE_QTC_FMT_Q4_K = 1u;
+static constexpr unsigned int TERMITE_QTC_FMT_Q4_0 = 2u;
+
+// Float-returning Q4_0 dequant for the bf16 tensor-core mirror. Identical math
+// to termite_q4_0_tc_value_at but the result stays in float so the caller
+// rounds once to the WMMA element type (maximizes precision).
+__device__ __forceinline__ float termite_q4_0_tc_value_at_f32(
+    const unsigned char* packed,
+    unsigned int out_dim,
+    unsigned int col,
+    unsigned int row_blocks,
+    unsigned int k_abs
+) {
+    unsigned int block = k_abs / 32u;
+    unsigned int lane = k_abs & 31u;
+    unsigned int block_index = col * row_blocks + block;
+    unsigned int block_count = out_dim * row_blocks;
+    half d = termite_half_from_le(packed + block_index * 2u);
+    unsigned char packed_q = packed[block_count * 2u + block_index * 16u + (lane & 15u)];
+    int q = lane < 16u ? (int)(packed_q & 0x0fu) : (int)(packed_q >> 4u);
+    return (float)(q - 8) * __half2float(d);
+}
+
+// WMMA element policy for termite_qtc_hmma_tile. The half specialization
+// reproduces the original tile code exactly (from_float == __float2half_rn,
+// load_b == the FMT dequant ternary), so the emitted code for the existing f16
+// Q8_0/Q4_K/Q4_0 tc_hmma kernels is byte-for-byte unchanged. The bf16
+// specialization exists because Gemma activations exceed f16's 65504 range;
+// __nv_bfloat16 shares f32's exponent range, so bf16*bf16 -> f32 WMMA stays
+// bit-close to the exact f32 mirror. bf16 is wired for Q4_0 only.
+template <typename WmmaElem>
+struct termite_qtc_tile_ops;
+
+template <>
+struct termite_qtc_tile_ops<half> {
+    static __device__ __forceinline__ half from_float(float x) {
+        return __float2half_rn(x);
+    }
+    template <unsigned int FMT>
+    static __device__ __forceinline__ half load_b(
+        const unsigned char* packed_weight,
+        unsigned int out_dim,
+        unsigned int col,
+        unsigned int row_blocks,
+        unsigned int k_abs
+    ) {
+        return FMT == TERMITE_QTC_FMT_Q4_K
+            ? termite_q4_k_tc_value_at(packed_weight, out_dim, col, row_blocks, k_abs)
+            : (FMT == TERMITE_QTC_FMT_Q4_0
+                ? termite_q4_0_tc_value_at(packed_weight, out_dim, col, row_blocks, k_abs)
+                : termite_q8_0_tc_value_at(packed_weight, out_dim, col, row_blocks, k_abs));
+    }
+};
+
+template <>
+struct termite_qtc_tile_ops<__nv_bfloat16> {
+    static __device__ __forceinline__ __nv_bfloat16 from_float(float x) {
+        return __float2bfloat16_rn(x);
+    }
+    // bf16 tensor-core path is Q4_0-only; dequantize in float, round once.
+    template <unsigned int FMT>
+    static __device__ __forceinline__ __nv_bfloat16 load_b(
+        const unsigned char* packed_weight,
+        unsigned int out_dim,
+        unsigned int col,
+        unsigned int row_blocks,
+        unsigned int k_abs
+    ) {
+        return __float2bfloat16_rn(
+            termite_q4_0_tc_value_at_f32(packed_weight, out_dim, col, row_blocks, k_abs));
+    }
+};
+
+template <unsigned int MODE, unsigned int FMT, typename WmmaElem = half>
 __device__ void termite_qtc_hmma_tile(
     float* dst,
     const float* input,
@@ -13765,10 +13903,10 @@ __device__ void termite_qtc_hmma_tile(
     unsigned int warp_n = warp >> 2;
     unsigned int row_base = blockIdx.y * TERMITE_QTC_M;
     unsigned int col_base = blockIdx.x * TERMITE_QTC_N;
-    unsigned int row_blocks = Q4K ? (in_dim / 256u) : (in_dim / 32u);
+    unsigned int row_blocks = FMT == TERMITE_QTC_FMT_Q4_K ? (in_dim / 256u) : (in_dim / 32u);
 
-    __shared__ half a_tile[TERMITE_QTC_M * TERMITE_QTC_K];
-    __shared__ half b_tile[TERMITE_QTC_K * TERMITE_QTC_N];
+    __shared__ WmmaElem a_tile[TERMITE_QTC_M * TERMITE_QTC_K];
+    __shared__ WmmaElem b_tile[TERMITE_QTC_K * TERMITE_QTC_N];
     __shared__ float c_tile[TERMITE_QTC_M * TERMITE_QTC_N];
 
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
@@ -13781,25 +13919,23 @@ __device__ void termite_qtc_hmma_tile(
             unsigned int row = row_base + local_row;
             unsigned int k_abs = k_base + local_k;
             float x = (row < rows && k_abs < in_dim) ? input[row * in_dim + k_abs] : 0.0f;
-            a_tile[i] = __float2half_rn(x);
+            a_tile[i] = termite_qtc_tile_ops<WmmaElem>::from_float(x);
         }
         for (unsigned int i = tid; i < TERMITE_QTC_K * TERMITE_QTC_N; i += TERMITE_QTC_THREADS) {
             unsigned int local_k = i / TERMITE_QTC_N;
             unsigned int local_col = i - local_k * TERMITE_QTC_N;
             unsigned int col = col_base + local_col;
             unsigned int k_abs = k_base + local_k;
-            half w = __float2half_rn(0.0f);
+            WmmaElem w = termite_qtc_tile_ops<WmmaElem>::from_float(0.0f);
             if (col < out_dim && k_abs < in_dim) {
-                w = Q4K
-                    ? termite_q4_k_tc_value_at(packed_weight, out_dim, col, row_blocks, k_abs)
-                    : termite_q8_0_tc_value_at(packed_weight, out_dim, col, row_blocks, k_abs);
+                w = termite_qtc_tile_ops<WmmaElem>::template load_b<FMT>(packed_weight, out_dim, col, row_blocks, k_abs);
             }
             b_tile[i] = w;
         }
         __syncthreads();
 
-        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, WmmaElem, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, WmmaElem, wmma::row_major> b_frag;
         wmma::load_matrix_sync(a_frag, a_tile + warp_m * 16u * TERMITE_QTC_K, TERMITE_QTC_K);
         wmma::load_matrix_sync(b_frag, b_tile + warp_n * 16u, TERMITE_QTC_N);
         wmma::mma_sync(acc, a_frag, b_frag, acc);
@@ -13834,7 +13970,7 @@ extern "C" __global__ void termite_linear_q8_0_f32_tc_hmma(
     unsigned int in_dim,
     unsigned int out_dim
 ) {
-    termite_qtc_hmma_tile<0u, false>(dst, input, packed_weight, nullptr, nullptr, rows, in_dim, out_dim);
+    termite_qtc_hmma_tile<0u, TERMITE_QTC_FMT_Q8_0>(dst, input, packed_weight, nullptr, nullptr, rows, in_dim, out_dim);
 }
 
 extern "C" __global__ void termite_linear_q8_0_bias_f32_tc_hmma(
@@ -13846,7 +13982,7 @@ extern "C" __global__ void termite_linear_q8_0_bias_f32_tc_hmma(
     unsigned int in_dim,
     unsigned int out_dim
 ) {
-    termite_qtc_hmma_tile<1u, false>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+    termite_qtc_hmma_tile<1u, TERMITE_QTC_FMT_Q8_0>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
 }
 
 extern "C" __global__ void termite_linear_q8_0_bias_gelu_f32_tc_hmma(
@@ -13858,7 +13994,7 @@ extern "C" __global__ void termite_linear_q8_0_bias_gelu_f32_tc_hmma(
     unsigned int in_dim,
     unsigned int out_dim
 ) {
-    termite_qtc_hmma_tile<2u, false>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+    termite_qtc_hmma_tile<2u, TERMITE_QTC_FMT_Q8_0>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
 }
 
 extern "C" __global__ void termite_linear_q8_0_bias_add_f32_tc_hmma(
@@ -13871,7 +14007,7 @@ extern "C" __global__ void termite_linear_q8_0_bias_add_f32_tc_hmma(
     unsigned int in_dim,
     unsigned int out_dim
 ) {
-    termite_qtc_hmma_tile<3u, false>(dst, input, packed_weight, bias, residual, rows, in_dim, out_dim);
+    termite_qtc_hmma_tile<3u, TERMITE_QTC_FMT_Q8_0>(dst, input, packed_weight, bias, residual, rows, in_dim, out_dim);
 }
 
 extern "C" __global__ void termite_linear_q4_k_f32_tc_hmma(
@@ -13882,7 +14018,7 @@ extern "C" __global__ void termite_linear_q4_k_f32_tc_hmma(
     unsigned int in_dim,
     unsigned int out_dim
 ) {
-    termite_qtc_hmma_tile<0u, true>(dst, input, packed_weight, nullptr, nullptr, rows, in_dim, out_dim);
+    termite_qtc_hmma_tile<0u, TERMITE_QTC_FMT_Q4_K>(dst, input, packed_weight, nullptr, nullptr, rows, in_dim, out_dim);
 }
 
 extern "C" __global__ void termite_linear_q4_k_bias_f32_tc_hmma(
@@ -13894,7 +14030,7 @@ extern "C" __global__ void termite_linear_q4_k_bias_f32_tc_hmma(
     unsigned int in_dim,
     unsigned int out_dim
 ) {
-    termite_qtc_hmma_tile<1u, true>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+    termite_qtc_hmma_tile<1u, TERMITE_QTC_FMT_Q4_K>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
 }
 
 extern "C" __global__ void termite_linear_q4_k_bias_gelu_f32_tc_hmma(
@@ -13906,7 +14042,7 @@ extern "C" __global__ void termite_linear_q4_k_bias_gelu_f32_tc_hmma(
     unsigned int in_dim,
     unsigned int out_dim
 ) {
-    termite_qtc_hmma_tile<2u, true>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+    termite_qtc_hmma_tile<2u, TERMITE_QTC_FMT_Q4_K>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
 }
 
 extern "C" __global__ void termite_linear_q4_k_bias_add_f32_tc_hmma(
@@ -13919,7 +14055,7 @@ extern "C" __global__ void termite_linear_q4_k_bias_add_f32_tc_hmma(
     unsigned int in_dim,
     unsigned int out_dim
 ) {
-    termite_qtc_hmma_tile<3u, true>(dst, input, packed_weight, bias, residual, rows, in_dim, out_dim);
+    termite_qtc_hmma_tile<3u, TERMITE_QTC_FMT_Q4_K>(dst, input, packed_weight, bias, residual, rows, in_dim, out_dim);
 }
 
 extern "C" __global__ void termite_linear_q4_k_bias_quick_gelu_f32_tc_hmma(
@@ -13931,7 +14067,7 @@ extern "C" __global__ void termite_linear_q4_k_bias_quick_gelu_f32_tc_hmma(
     unsigned int in_dim,
     unsigned int out_dim
 ) {
-    termite_qtc_hmma_tile<4u, true>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+    termite_qtc_hmma_tile<4u, TERMITE_QTC_FMT_Q4_K>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
 }
 
 extern "C" __global__ void termite_linear_q4_k_bias_relu_f32_tc_hmma(
@@ -13943,7 +14079,7 @@ extern "C" __global__ void termite_linear_q4_k_bias_relu_f32_tc_hmma(
     unsigned int in_dim,
     unsigned int out_dim
 ) {
-    termite_qtc_hmma_tile<5u, true>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+    termite_qtc_hmma_tile<5u, TERMITE_QTC_FMT_Q4_K>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
 }
 
 extern "C" __global__ void termite_linear_q4_k_triple_bias_f32_tc_hmma(
@@ -13965,7 +14101,7 @@ extern "C" __global__ void termite_linear_q4_k_triple_bias_f32_tc_hmma(
     float* dst = projection == 0u ? dst_a : (projection == 1u ? dst_b : dst_c);
     const unsigned char* packed_weight = projection == 0u ? packed_weight_a : (projection == 1u ? packed_weight_b : packed_weight_c);
     const float* bias = projection == 0u ? bias_a : (projection == 1u ? bias_b : bias_c);
-    termite_qtc_hmma_tile<1u, true>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+    termite_qtc_hmma_tile<1u, TERMITE_QTC_FMT_Q4_K>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
 }
 
 extern "C" __global__ void termite_linear_q4_k_pair_bias_f32_tc_hmma(
@@ -13984,7 +14120,117 @@ extern "C" __global__ void termite_linear_q4_k_pair_bias_f32_tc_hmma(
     float* dst = projection == 0u ? dst_a : dst_b;
     const unsigned char* packed_weight = projection == 0u ? packed_weight_a : packed_weight_b;
     const float* bias = projection == 0u ? bias_a : bias_b;
-    termite_qtc_hmma_tile<1u, true>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+    termite_qtc_hmma_tile<1u, TERMITE_QTC_FMT_Q4_K>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_0_f32_tc_hmma(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_qtc_hmma_tile<0u, TERMITE_QTC_FMT_Q4_0>(dst, input, packed_weight, nullptr, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_0_bias_f32_tc_hmma(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_qtc_hmma_tile<1u, TERMITE_QTC_FMT_Q4_0>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_0_bias_gelu_f32_tc_hmma(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_qtc_hmma_tile<2u, TERMITE_QTC_FMT_Q4_0>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_0_bias_add_f32_tc_hmma(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    const float* bias,
+    const float* residual,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_qtc_hmma_tile<3u, TERMITE_QTC_FMT_Q4_0>(dst, input, packed_weight, bias, residual, rows, in_dim, out_dim);
+}
+
+// BF16 tensor-core mirror of the Q4_0 tc_hmma linear set. Same signatures and
+// launch geometry as the f16 kernels above (block=256, grid.x=ceil(out_dim/32),
+// grid.y=ceil(rows/64), no dynamic smem); the only difference is the WMMA
+// element type. Consumes the identical q4_0_hmma packed layout. bf16 has f32's
+// exponent range, so these stay numerically close to the exact f32 mirror even
+// when Gemma activations exceed f16's 65504 limit.
+extern "C" __global__ void termite_linear_q4_0_f32_tc_hmma_bf16(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+#if __CUDA_ARCH__ >= 800
+    termite_qtc_hmma_tile<0u, TERMITE_QTC_FMT_Q4_0, __nv_bfloat16>(dst, input, packed_weight, nullptr, nullptr, rows, in_dim, out_dim);
+#endif
+}
+
+extern "C" __global__ void termite_linear_q4_0_bias_f32_tc_hmma_bf16(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+#if __CUDA_ARCH__ >= 800
+    termite_qtc_hmma_tile<1u, TERMITE_QTC_FMT_Q4_0, __nv_bfloat16>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+#endif
+}
+
+extern "C" __global__ void termite_linear_q4_0_bias_gelu_f32_tc_hmma_bf16(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    const float* bias,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+#if __CUDA_ARCH__ >= 800
+    termite_qtc_hmma_tile<2u, TERMITE_QTC_FMT_Q4_0, __nv_bfloat16>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+#endif
+}
+
+extern "C" __global__ void termite_linear_q4_0_bias_add_f32_tc_hmma_bf16(
+    float* dst,
+    const float* input,
+    const unsigned char* packed_weight,
+    const float* bias,
+    const float* residual,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+#if __CUDA_ARCH__ >= 800
+    termite_qtc_hmma_tile<3u, TERMITE_QTC_FMT_Q4_0, __nv_bfloat16>(dst, input, packed_weight, bias, residual, rows, in_dim, out_dim);
+#endif
 }
 
 template <unsigned int COLS, unsigned int MODE>

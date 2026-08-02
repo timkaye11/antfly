@@ -919,8 +919,11 @@ fn enableGenerationStageDebug() bool {
     return getenvBool("TERMITE_GEN_STAGE_DEBUG");
 }
 
+// Promoted default: the CUDA prefill-first-token path is default-on. The
+// route is still guarded by shouldUsePrefillFirstTokenPath (CUDA backend,
+// pure-greedy, non-speculative); explicit env values override both ways.
 fn enableCudaPrefillFirstToken() bool {
-    return getenvBool("ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN");
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN", true);
 }
 
 fn enableCudaPrefillGreedyToken() bool {
@@ -947,8 +950,12 @@ fn cudaReplayLastLogitsEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_REPLAY_LAST_LOGITS", true);
 }
 
+// Promoted default: pending-token readback overlaps the previous token's D2H
+// copy with the next decode step. Exact-output; still guarded by
+// shouldUseCudaPendingTokenReadback (CUDA, pure-greedy, no grammar/speculation
+// /graph runtime). Explicit env values override both ways.
 fn enableCudaGreedyPendingTokenReadback() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK", false);
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK", true);
 }
 
 fn shouldUseCudaPendingTokenReadback(
@@ -981,8 +988,11 @@ fn pendingTokenReadbackStreamingArgsValid(
     return !any_present or all_present;
 }
 
+// Promoted default: coalesce the whole prompt into the first-token prefill
+// chunk for prompts up to 2048 tokens (tuned profile value; previously 8).
+// Explicit env values override both ways; 0 disables coalescing.
 fn cudaPrefillFirstTokenCoalesceTokenLimit() usize {
-    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS") orelse 8;
+    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS") orelse 2048;
 }
 
 fn enableFirstTokenTrace() bool {
@@ -11627,6 +11637,69 @@ test "native generation pipeline rejects speculative decoding when draft require
 
     pipeline.draft_gpt_config = null;
     try std.testing.expect(!pipeline.speculativeUsesDeepSeekV4CompressedCache());
+}
+
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn unsetenv(name: [*:0]const u8) c_int;
+
+const PromotedEnvGuard = struct {
+    name: [:0]const u8,
+    saved: ?[:0]u8,
+
+    fn captureAndClear(allocator: std.mem.Allocator, name: [:0]const u8) !PromotedEnvGuard {
+        const saved: ?[:0]u8 = if (platform.env.getenv(name.ptr)) |value|
+            try allocator.dupeZ(u8, value)
+        else
+            null;
+        _ = unsetenv(name.ptr);
+        return .{ .name = name, .saved = saved };
+    }
+
+    fn restore(self: *PromotedEnvGuard, allocator: std.mem.Allocator) void {
+        if (self.saved) |value| {
+            _ = setenv(self.name.ptr, value.ptr, 1);
+            allocator.free(value);
+        } else {
+            _ = unsetenv(self.name.ptr);
+        }
+    }
+};
+
+test "cuda prefill scheduling knobs promote tuned defaults with bidirectional env overrides" {
+    const allocator = std.testing.allocator;
+    const names = [_][:0]const u8{
+        "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN",
+        "ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS",
+        "ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK",
+    };
+    var guards: [names.len]PromotedEnvGuard = undefined;
+    var guarded: usize = 0;
+    defer for (guards[0..guarded]) |*guard| guard.restore(allocator);
+    for (names) |name| {
+        guards[guarded] = try PromotedEnvGuard.captureAndClear(allocator, name);
+        guarded += 1;
+    }
+
+    // Unset: promoted defaults.
+    try std.testing.expect(enableCudaPrefillFirstToken());
+    try std.testing.expectEqual(@as(usize, 2048), cudaPrefillFirstTokenCoalesceTokenLimit());
+    try std.testing.expect(enableCudaGreedyPendingTokenReadback());
+
+    // Explicit 0 disables.
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN", "0", 1));
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS", "0", 1));
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK", "0", 1));
+    try std.testing.expect(!enableCudaPrefillFirstToken());
+    try std.testing.expectEqual(@as(usize, 0), cudaPrefillFirstTokenCoalesceTokenLimit());
+    try std.testing.expect(!enableCudaGreedyPendingTokenReadback());
+
+    // Explicit values enable/override.
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN", "1", 1));
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_CUDA_PREFILL_FIRST_TOKEN_COALESCE_TOKENS", "8", 1));
+    try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK", "1", 1));
+    try std.testing.expect(enableCudaPrefillFirstToken());
+    try std.testing.expectEqual(@as(usize, 8), cudaPrefillFirstTokenCoalesceTokenLimit());
+    try std.testing.expect(enableCudaGreedyPendingTokenReadback());
 }
 
 test "cuda prefill first token path supports multi-token pure greedy generation" {
