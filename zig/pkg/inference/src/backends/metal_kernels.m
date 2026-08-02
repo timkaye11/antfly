@@ -24567,6 +24567,31 @@ int termite_metal_decode_runtime_moe_q4_0_layer_arena_prepared(
     return 1;
 }
 
+// Unpublish a layer arena after the caller has drained every command buffer
+// that could reference it. The shared no-copy arena-buffer cache may retain
+// the mapping wrapper for later reuse; clearing this layer's strong references
+// and geometry prevents any subsequent MoE dispatch from observing reclaimed
+// page ranges or a partially updated offset table.
+int termite_metal_decode_runtime_reset_moe_q4_0_layer_arena(
+    termite_metal_decode_runtime *runtime,
+    size_t layer
+) {
+    if (runtime == NULL || layer >= TERMITE_METAL_MOE_LAYER_SLOT_CAPACITY) return -1;
+    @autoreleasepool {
+        runtime->moe_layer_prepared[layer] = 0;
+        runtime->moe_layer_arena_buffers[layer] = nil;
+        runtime->moe_layer_offsets_buffers[layer] = nil;
+        runtime->moe_layer_expert_counts[layer] = 0;
+        runtime->moe_layer_expert_strides[layer] = 0;
+        runtime->moe_layer_gate_offsets[layer] = 0;
+        runtime->moe_layer_up_offsets[layer] = 0;
+        runtime->moe_layer_down_offsets[layer] = 0;
+        runtime->moe_layer_hidden_sizes[layer] = 0;
+        runtime->moe_layer_inter_sizes[layer] = 0;
+        return 0;
+    }
+}
+
 // Fully device-side routed-expert forward for one prepared layer arena:
 // router logits -> top-k + softmax -> Q4_0 gate/up + gated activation ->
 // Q4_0 down -> weighted rank-ordered combine, with no host readback. Encodes

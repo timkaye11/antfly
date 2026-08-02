@@ -15,23 +15,20 @@
 """Measure warm serving TTFT for the Gemma 4 26B-A4B compact model.
 
 This drives the real ``antfly-inference`` HTTP server (no CLI shortcut) through
-a cold / replay / strict-extension / second-key / non-streaming sequence and
-reports time-to-first-token plus the prompt-cache accounting the server
-returns. It is stdlib-only.
+a cold / replay / strict-extension / second-prompt / non-streaming sequence and
+reports time-to-first-token plus prompt-cache accounting. It is stdlib-only.
 
-Prompt-cache facts this exercises (see MEMORY / server.zig):
-  * The node prompt cache defaults OFF; the serving config enables it.
-  * A request only caches when the node cache is on AND it carries a
-    ``prompt_cache_key`` (keyless requests never cache).
-  * Cache-on retains full KV for later prefix reuse; the per-request SWA ring
-    is disabled by design when a key is present (cache wins). This is expected.
-  * The ledger charges ``prompt_cache_kv`` for retained blocks; the retained
-    logical bytes surface as ``antfly_inference_prompt_cache_live_bytes``.
+Compact Metal prompt reuse defaults OFF for correctness: logical prompt-cache
+blocks do not yet retain the per-sequence device KV slots after a request ends.
+The default gate therefore proves deterministic cold serving, zero compact KV
+reuse, and the configured process-footprint ceiling. Passing
+``--experimental-compact-prompt-cache-reuse`` enables both the node cache and
+the explicitly unsafe runtime validation seam; that mode requires positive
+cache-hit evidence and exact repeated-prompt output before it can qualify.
 
-Warm-boot behaviour under test (Workstream C1): with the node cache enabled and
-the A4B model preloaded, the per-model cache pool + storage + device write hook
-are created at warm-ping time, so the FIRST user request under a key does not
-pay pool provisioning on its TTFT.
+Warm-boot behaviour under test: the A4B model is preloaded before the first
+request. Experimental reuse additionally provisions its cache pool at boot so
+the first keyed request does not hide provisioning in measured TTFT.
 
 TTFT definition: the server emits an initial ``role`` delta before generation,
 so wall-clock time-to-first-token is measured to the first SSE data event that
@@ -48,6 +45,8 @@ import subprocess
 import sys
 import tempfile
 import time
+
+from run_guarded_a4b import read_phys_footprint
 
 
 # ---------------------------------------------------------------------------
@@ -229,8 +228,13 @@ def nonstream_generate(host, port, body, timeout):
         raise RuntimeError(msg)
     obj = json.loads(raw)
     usage = obj.get("usage") or {}
+    choices = obj.get("choices") or []
+    choice = choices[0] if choices else {}
+    message = choice.get("message") if isinstance(choice, dict) else None
+    text = message.get("content") if isinstance(message, dict) else choice.get("text")
     return {
         "total_ms": total_ms,
+        "text": text,
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
         "cached_prompt_tokens": usage.get("cached_prompt_tokens"),
@@ -329,8 +333,20 @@ def main():
     default_bin = os.path.normpath(os.path.join(here, "..", "zig-out", "bin", "antfly-inference"))
 
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--model-dir", default="/Users/timkaye/Documents/af/models/gemma-4-26B-A4B-it-qat-q4_0-gguf")
+    ap.add_argument("--model-dir", required=True)
     ap.add_argument("--budget-mb", type=int, default=6144)
+    ap.add_argument(
+        "--device-routing",
+        choices=("off", "partial", "full", "auto"),
+        default="off",
+    )
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--max-phys-footprint-bytes",
+        type=int,
+        default=None,
+        help="server footprint gate; defaults to --budget-mb expressed in MiB",
+    )
     ap.add_argument("--port", type=int, default=8130)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--binary", default=default_bin)
@@ -338,6 +354,20 @@ def main():
     ap.add_argument("--prompt-words", type=int, default=850)
     ap.add_argument("--cache-mb", type=int, default=512)
     ap.add_argument("--min-tokens", type=int, default=64)
+    ap.add_argument(
+        "--experimental-compact-prompt-cache-reuse",
+        action="store_true",
+        help=(
+            "enable the compact Metal device-KV reuse experiment; default is the "
+            "correct cold-serving gate"
+        ),
+    )
+    ap.add_argument(
+        "--max-ttft-ms",
+        type=float,
+        default=0.0,
+        help="optional TTFT ceiling; 0 disables the performance gate",
+    )
     ap.add_argument("--request-timeout", type=float, default=300.0)
     ap.add_argument("--ready-timeout", type=float, default=900.0)
     ap.add_argument("--keep-server", action="store_true")
@@ -346,6 +376,13 @@ def main():
     ap.add_argument("--lock-dir", default="/tmp/a4b-run-lock")
     ap.add_argument("--no-lock", action="store_true")
     args = ap.parse_args()
+    if args.budget_mb < 2048 or args.seed < 0 or args.max_ttft_ms < 0:
+        ap.error(
+            "--budget-mb must be at least 2048; --seed and --max-ttft-ms "
+            "must be non-negative"
+        )
+    if args.max_phys_footprint_bytes is None:
+        args.max_phys_footprint_bytes = args.budget_mb * 1024 * 1024
 
     model_dir = os.path.abspath(args.model_dir)
     models_dir = os.path.dirname(model_dir)
@@ -359,6 +396,8 @@ def main():
 
     config = {
         "models_dir": models_dir,
+        "max_loaded_models": 1,
+        "allow_unknown_models": False,
         "max_concurrent_requests": 32,
         "preload": [{
             "kind": "generator",
@@ -366,9 +405,10 @@ def main():
             "backend": "metal",
             "memory_profile": "compact_2gbs",
             "memory_budget_mb": args.budget_mb,
+            "device_routing": args.device_routing,
         }],
         "prompt_cache": {
-            "enabled": True,
+            "enabled": args.experimental_compact_prompt_cache_reuse,
             "mode": "block_hash",
             "max_bytes_mb": args.cache_mb,
             "min_tokens": args.min_tokens,
@@ -392,25 +432,46 @@ def main():
 
     env = dict(os.environ)
     env["TERMITE_SERVER_GENERATE_TIMING"] = "1"
+    if args.experimental_compact_prompt_cache_reuse:
+        env["TERMITE_COMPACT_PROMPT_CACHE_REUSE"] = "1"
 
     proc = None
     result = {"config_path": cfg_path, "server_log": server_log_path, "model_dir": model_dir,
-              "budget_mb": args.budget_mb, "cases": {}}
+              "budget_mb": args.budget_mb, "device_routing": args.device_routing,
+              "seed": args.seed, "max_phys_footprint_bytes": args.max_phys_footprint_bytes,
+              "prompt_cache_mode": (
+                  "experimental_compact_reuse"
+                  if args.experimental_compact_prompt_cache_reuse
+                  else "cold_correctness"
+              ),
+              "peak_phys_footprint_bytes": 0, "cases": {}}
     try:
         print(f"[server] starting {args.binary} run --config {cfg_path} "
               f"--host {args.host} --port {args.port}", flush=True)
-        # The compact Gemma-4 26B-A4B is a newer architecture that the request
-        # path's compatibility gate flags as unknown even though the warm/preload
-        # loader accepts it; opt in so served requests resolve the same model.
         proc = subprocess.Popen(
             [args.binary, "run", "--config", cfg_path, "--host", args.host,
-             "--port", str(args.port), "--allow-unknown-models"],
+             "--port", str(args.port)],
             stdout=log_fh, stderr=subprocess.STDOUT, env=env,
+            start_new_session=True,
         )
         if not wait_for_health(proc, args.host, args.port, args.ready_timeout):
             tail = _tail_file(server_log_path, 60)
             raise RuntimeError(f"server did not become healthy; log tail:\n{tail}")
-        print("[server] healthy (warm complete, cache pool provisioned at boot)", flush=True)
+        print(
+            "[server] healthy (warm complete, prompt cache "
+            + ("experimental" if args.experimental_compact_prompt_cache_reuse else "disabled")
+            + ")",
+            flush=True,
+        )
+
+        def sample_server_footprint():
+            sampled = read_phys_footprint(proc.pid)
+            if sampled is not None:
+                result["peak_phys_footprint_bytes"] = max(
+                    result["peak_phys_footprint_bytes"], sampled[0], sampled[1]
+                )
+
+        sample_server_footprint()
 
         metrics_boot = scrape_prompt_cache_metrics(args.host, args.port)
         result["metrics_boot"] = metrics_boot
@@ -429,14 +490,17 @@ def main():
         )
 
         def gen_body(prompt, key, stream):
-            return {
+            body = {
                 "model": model_name,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": args.max_tokens,
                 "temperature": 0,
+                "seed": args.seed,
                 "stream": stream,
-                "prompt_cache_key": key,
             }
+            if args.experimental_compact_prompt_cache_reuse:
+                body["prompt_cache_key"] = key
+            return body
 
         k1 = "measure-k1"
         k2 = "measure-k2"
@@ -452,45 +516,58 @@ def main():
         # (a) COLD
         print("[case] cold (K1, fresh prompt)...", flush=True)
         cold = stream_case(p1, k1)
+        sample_server_footprint()
         result["cases"]["cold"] = cold
 
         # (b) REPLAY (identical prompt, same key)
         print("[case] replay (K1, identical prompt)...", flush=True)
         replay = stream_case(p1, k1)
+        sample_server_footprint()
         result["cases"]["replay"] = replay
 
         # (c) STRICT EXTENSION (same key, prompt + appended paragraph + question)
         print("[case] strict-extension (K1, prompt + appendix)...", flush=True)
         ext = stream_case(p1 + ext_para, k1)
+        sample_server_footprint()
         result["cases"]["strict_extension"] = ext
 
         # (d) SECOND KEY (different prompt) then K1 extension again (survives interleaving)
         print("[case] second-key (K2, different prompt)...", flush=True)
         second = stream_case(p2, k2)
+        sample_server_footprint()
         result["cases"]["second_key"] = second
 
         print("[case] strict-extension-after-interleave (K1)...", flush=True)
         ext2 = stream_case(p1 + ext_para2, k1)
+        sample_server_footprint()
         result["cases"]["strict_extension_interleaved"] = ext2
 
         # (e) NON-STREAMING replay asserting usage.cached_prompt_tokens in the body
         print("[case] non-streaming replay (K1)...", flush=True)
         nonstream = nonstream_case(p1, k1)
+        sample_server_footprint()
         result["cases"]["nonstream_replay"] = nonstream
 
         result["metrics_final"] = scrape_prompt_cache_metrics(args.host, args.port)
         result["generate_timing_ms"] = _extract_generate_timing(server_log_path)
 
         _assert_and_report(result, args)
+        if result["peak_phys_footprint_bytes"] == 0:
+            raise RuntimeError("server phys_footprint telemetry unavailable")
+        if result["peak_phys_footprint_bytes"] > args.max_phys_footprint_bytes:
+            raise RuntimeError(
+                f"server phys_footprint {result['peak_phys_footprint_bytes']} exceeds "
+                f"{args.max_phys_footprint_bytes}"
+            )
 
     finally:
         if proc is not None and not args.keep_server:
             print("[server] stopping...", flush=True)
-            proc.send_signal(signal.SIGTERM)
+            os.killpg(proc.pid, signal.SIGTERM)
             try:
                 proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
         log_fh.close()
         if not args.keep_server:
@@ -542,7 +619,6 @@ def _fmt(v, suffix=""):
 
 def _assert_and_report(result, args):
     cases = result["cases"]
-    gate_ms = 1200.0
 
     print("\n=== Serving TTFT summary ===")
     header = f"{'case':<32}{'ttft_ms':>10}{'total_ms':>10}{'cached_tok':>12}{'prompt_tok':>12}{'gen_tok':>9}"
@@ -582,33 +658,67 @@ def _assert_and_report(result, args):
     ext2 = cases["strict_extension_interleaved"]
     nonstream = cases["nonstream_replay"]
 
-    check("cold produced a first token", cold.get("ttft_ms") is not None)
-    check("replay cached_prompt_tokens > 0",
-          (replay.get("cached_prompt_tokens") or 0) > 0,
-          f"={replay.get('cached_prompt_tokens')}")
-    # replay should reuse most of the prompt (prompt - one page .. prompt)
-    pt = replay.get("prompt_tokens") or 0
-    ct = replay.get("cached_prompt_tokens") or 0
-    check("replay reused >= prompt-32 tokens", pt > 0 and ct >= max(0, pt - 32),
-          f"cached={ct} prompt={pt}")
-    check("strict-extension cached_prompt_tokens > 0",
-          (ext.get("cached_prompt_tokens") or 0) > 0,
-          f"={ext.get('cached_prompt_tokens')}")
-    check("second-key isolation: fresh key not fully cached",
-          (second.get("cached_prompt_tokens") or 0) == 0
-          or (second.get("cached_prompt_tokens") or 0) < (second.get("prompt_tokens") or 1),
-          f"cached={second.get('cached_prompt_tokens')} prompt={second.get('prompt_tokens')}")
-    check("K1 survives interleaving (extension still caches)",
-          (ext2.get("cached_prompt_tokens") or 0) > 0,
-          f"={ext2.get('cached_prompt_tokens')}")
-    check("non-streaming usage.cached_prompt_tokens > 0",
-          (nonstream.get("cached_prompt_tokens") or 0) > 0,
-          f"={nonstream.get('cached_prompt_tokens')}")
+    for name in order[:-1]:
+        check(f"{name} produced a first token", cases[name].get("ttft_ms") is not None)
 
-    ext_ttft = ext.get("ttft_ms")
-    gate_ok = ext_ttft is not None and ext_ttft <= gate_ms
-    check(f"GATE strict-extension TTFT <= {gate_ms:.0f} ms", gate_ok,
-          f"={_fmt(ext_ttft)} ms")
+    experimental = args.experimental_compact_prompt_cache_reuse
+    if experimental:
+        check("replay cached_prompt_tokens > 0",
+              (replay.get("cached_prompt_tokens") or 0) > 0,
+              f"={replay.get('cached_prompt_tokens')}")
+        # Replay should reuse most of the prompt (prompt - one page .. prompt).
+        pt = replay.get("prompt_tokens") or 0
+        ct = replay.get("cached_prompt_tokens") or 0
+        check("replay reused >= prompt-32 tokens", pt > 0 and ct >= max(0, pt - 32),
+              f"cached={ct} prompt={pt}")
+        check("strict-extension cached_prompt_tokens > 0",
+              (ext.get("cached_prompt_tokens") or 0) > 0,
+              f"={ext.get('cached_prompt_tokens')}")
+        check("second-key isolation: fresh key not fully cached",
+              second.get("cached_prompt_tokens") is not None
+              and second.get("prompt_tokens") is not None
+              and (second["cached_prompt_tokens"] == 0
+                   or second["cached_prompt_tokens"] < second["prompt_tokens"]),
+              f"cached={second.get('cached_prompt_tokens')} prompt={second.get('prompt_tokens')}")
+        check("K1 survives interleaving (extension still caches)",
+              (ext2.get("cached_prompt_tokens") or 0) > 0,
+              f"={ext2.get('cached_prompt_tokens')}")
+        check("non-streaming usage.cached_prompt_tokens > 0",
+              (nonstream.get("cached_prompt_tokens") or 0) > 0,
+              f"={nonstream.get('cached_prompt_tokens')}")
+        check("experimental replay output matches cold output",
+              bool(cold.get("text")) and cold.get("text") == replay.get("text"))
+        check("prompt-cache hit metric increased",
+              mb.get("block_hash_hits") is not None
+              and mf.get("block_hash_hits") is not None
+              and mf["block_hash_hits"] > mb["block_hash_hits"])
+        gate_case_name = "strict-extension"
+        gate_ttft = ext.get("ttft_ms")
+    else:
+        for name in order:
+            check(f"{name} reports zero cached prompt tokens",
+                  cases[name].get("cached_prompt_tokens") == 0,
+                  f"={cases[name].get('cached_prompt_tokens')}")
+        check("cold replay output is deterministic",
+              bool(cold.get("text")) and cold.get("text") == replay.get("text"))
+        check("streaming and non-streaming output agree",
+              bool(cold.get("text")) and cold.get("text") == nonstream.get("text"))
+        check("cold serving retains zero prompt-cache bytes",
+              mb.get("live_bytes") == 0 and mf.get("live_bytes") == 0,
+              f"boot={mb.get('live_bytes')} final={mf.get('live_bytes')}")
+        check("cold serving records no prompt-cache hits",
+              mb.get("block_hash_hits") is not None
+              and mf.get("block_hash_hits") == mb.get("block_hash_hits"),
+              f"boot={mb.get('block_hash_hits')} final={mf.get('block_hash_hits')}")
+        gate_case_name = "replay-cold"
+        gate_ttft = replay.get("ttft_ms")
+
+    if args.max_ttft_ms > 0:
+        gate_ok = gate_ttft is not None and gate_ttft <= args.max_ttft_ms
+        check(f"GATE {gate_case_name} TTFT <= {args.max_ttft_ms:.0f} ms", gate_ok,
+              f"={_fmt(gate_ttft)} ms")
+    else:
+        gate_ok = True
 
     print("\n=== Checks ===")
     all_ok = True
@@ -617,10 +727,12 @@ def _assert_and_report(result, args):
         print(f"  [{'PASS' if ok else 'FAIL'}] {name} {detail}")
 
     result["passed"] = all_ok
-    result["gate_strict_extension_ttft_ms"] = ext_ttft
+    result["gate_case"] = gate_case_name
+    result["gate_ttft_ms"] = gate_ttft
+    result["gate_limit_ms"] = args.max_ttft_ms
     result["gate_pass"] = gate_ok
 
-    if not gate_ok:
+    if args.max_ttft_ms > 0 and not gate_ok:
         print("\n=== GATE MISS: attribution from server generate_timing_ms ===")
         timing = result.get("generate_timing_ms", [])
         for line in timing[-6:]:

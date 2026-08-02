@@ -1928,9 +1928,10 @@ test "inference admission bridge charges combined native residency to resource m
     );
 }
 
-fn observePromptCacheResourceUsage(context: *anyopaque, current: *u64, next: u64) void {
+fn observePromptCacheResourceUsage(context: *anyopaque, current: *u64, next: u64) bool {
     const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
-    manager.observeUsage(.inference_prompt_cache, current, next);
+    manager.adjustUsage(.inference_prompt_cache, current, next) catch return false;
+    return true;
 }
 
 test "standalone prompt cache detaches resource observer before owner teardown" {
@@ -1939,13 +1940,14 @@ test "standalone prompt cache detaches resource observer before owner teardown" 
         alive: bool = true,
         callbacks_after_teardown: usize = 0,
 
-        fn update(context: *anyopaque, current: *u64, next: u64) void {
+        fn update(context: *anyopaque, current: *u64, next: u64) bool {
             const self: *@This() = @ptrCast(@alignCast(context));
             if (!self.alive) {
                 self.callbacks_after_teardown += 1;
-                return;
+                return false;
             }
-            self.manager.observeUsage(.inference_prompt_cache, current, next);
+            self.manager.adjustUsage(.inference_prompt_cache, current, next) catch return false;
+            return true;
         }
     };
 

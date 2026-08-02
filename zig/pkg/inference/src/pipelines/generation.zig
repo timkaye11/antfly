@@ -206,6 +206,9 @@ pub const GenerationConfig = struct {
     repetition_penalty: f32 = 1.0,
     frequency_penalty: f32 = 0,
     presence_penalty: f32 = 0,
+    /// Optional request-scoped sampling seed. The draw for each token is
+    /// derived from this value and the number of tokens already observed.
+    seed: ?u64 = null,
     prefill_chunk_size: usize = 0,
     /// Grammar constraint mode. null = no constraint, "json" = JSON mode.
     grammar: ?[]const u8 = null,
@@ -792,6 +795,7 @@ pub const OwnedBatchDecodeContext = struct {
 const SamplingPenaltyState = struct {
     counts: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     enabled: bool = true,
+    total_tokens: u64 = 0,
 
     fn init(enabled: bool) SamplingPenaltyState {
         return .{ .enabled = enabled };
@@ -807,8 +811,9 @@ const SamplingPenaltyState = struct {
     }
 
     fn noteToken(self: *SamplingPenaltyState, allocator: std.mem.Allocator, token_id: i64) !void {
-        if (!self.enabled) return;
         if (token_id < 0) return;
+        self.total_tokens +|= 1;
+        if (!self.enabled) return;
         const entry = try self.counts.getOrPut(allocator, @intCast(token_id));
         if (!entry.found_existing) entry.value_ptr.* = 0;
         entry.value_ptr.* += 1;
@@ -821,6 +826,7 @@ const SamplingPenaltyState = struct {
     fn clone(self: *const SamplingPenaltyState, allocator: std.mem.Allocator) !SamplingPenaltyState {
         var copy = SamplingPenaltyState.init(self.enabled);
         errdefer copy.deinit(allocator);
+        copy.total_tokens = self.total_tokens;
 
         var it = self.counts.iterator();
         while (it.next()) |entry| {
@@ -12733,7 +12739,17 @@ fn sample(logits: []const f32, config: GenerationConfig, penalty_state: *const S
     }
 
     // Step 6: Sample from the filtered distribution
+    if (config.seed) |seed| {
+        return activations.sampleFromProbsSeeded(working, samplingSeed(seed, penalty_state.total_tokens));
+    }
     return activations.sampleFromProbs(working);
+}
+
+fn samplingSeed(seed: u64, ordinal: u64) u64 {
+    var mixed = seed +% (ordinal *% 0x9E3779B97F4A7C15);
+    mixed = (mixed ^ (mixed >> 30)) *% 0xBF58476D1CE4E5B9;
+    mixed = (mixed ^ (mixed >> 27)) *% 0x94D049BB133111EB;
+    return mixed ^ (mixed >> 31);
 }
 
 /// Apply repetition, frequency, and presence penalties to raw logits.

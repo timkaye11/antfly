@@ -46,7 +46,9 @@ pub const Config = struct {
 
 pub const ResourceUsageObserver = struct {
     context: *anyopaque,
-    update: *const fn (context: *anyopaque, current: *u64, next: u64) void,
+    /// Atomically replace the cache's absolute reservation. Returns false
+    /// without changing `current` when growth is not admitted.
+    update: *const fn (context: *anyopaque, current: *u64, next: u64) bool,
 };
 
 pub const Stats = struct {
@@ -153,19 +155,24 @@ pub const PromptPrefixCache = struct {
                 old_observer.context == new_observer.context and old_observer.update == new_observer.update
             else
                 false;
-            if (!same_observer) old_observer.update(old_observer.context, &self.resource_accounted_bytes, 0);
+            if (!same_observer) _ = old_observer.update(old_observer.context, &self.resource_accounted_bytes, 0);
         }
         self.config = config;
         if (!config.enabled) self.activation_pending = false;
         self.evictToBudget();
-        self.updateResourceUsage();
+        while (!self.updateResourceUsage()) {
+            // Attaching or replacing an observer on a live cache must not
+            // leave previously retained entries unaccounted. Shrink until
+            // the new owner accepts the absolute reservation.
+            if (!self.evictOneLru()) break;
+        }
     }
 
     pub fn detachResourceUsageObserver(self: *PromptPrefixCache) void {
         spinLock(&self.mutex);
         defer self.mutex.unlock();
         if (self.config.resource_usage_observer) |observer| {
-            observer.update(observer.context, &self.resource_accounted_bytes, 0);
+            _ = observer.update(observer.context, &self.resource_accounted_bytes, 0);
         }
         self.config.resource_usage_observer = null;
         self.resource_accounted_bytes = 0;
@@ -326,6 +333,19 @@ pub const PromptPrefixCache = struct {
             return;
         }
 
+        const estimated_block_count = cacheable_tokens / page_size;
+        const bytes = self.estimateBytes(
+            namespace.len,
+            cacheable_tokens,
+            estimated_block_count,
+            if (self.storage == null) 0 else estimated_block_count,
+        );
+        if (!self.reserveResourceGrowth(bytes)) return;
+        var reservation_materialized = false;
+        defer if (!reservation_materialized) {
+            _ = self.updateResourceUsage();
+        };
+
         var blocks: std.ArrayListUnmanaged(block.KvBlockId) = .empty;
         defer blocks.deinit(self.allocator);
         try self.manager.retainSequencePrefixBlocks(sequence_id, cacheable_tokens, &blocks);
@@ -354,7 +374,6 @@ pub const PromptPrefixCache = struct {
         }
 
         self.tick += 1;
-        const bytes = self.estimateBytes(namespace.len, cacheable_tokens, owned_blocks.len, owned_storage_blocks.len);
         try self.entries.append(self.allocator, .{
             .namespace = owned_namespace,
             .tokens = owned_tokens,
@@ -365,8 +384,7 @@ pub const PromptPrefixCache = struct {
             .last_used = self.tick,
         });
         self.estimated_bytes += bytes;
-        self.updateResourceUsage();
-        self.evictToBudget();
+        reservation_materialized = true;
     }
 
     pub fn stats(self: *PromptPrefixCache) Stats {
@@ -470,6 +488,18 @@ pub const PromptPrefixCache = struct {
         const cacheable_tokens = (prompt_tokens.len / page_size) * page_size;
         if (cacheable_tokens < self.config.min_tokens) return;
 
+        // Reserve the worst-case new-block footprint before retaining any KV.
+        // Existing hashes make the final charge smaller; updateResourceUsage
+        // releases that excess after insertion. This stays correct even when
+        // admission evicts old hashes while making room.
+        const block_count = cacheable_tokens / page_size;
+        const per_block_bytes = self.estimateBytes(0, page_size, 1, if (self.storage == null) 0 else 1);
+        const growth_bytes = std.math.mul(usize, block_count, per_block_bytes) catch return;
+        if (!self.reserveResourceGrowth(growth_bytes)) return;
+        defer {
+            _ = self.updateResourceUsage();
+        }
+
         var blocks: std.ArrayListUnmanaged(block.KvBlockId) = .empty;
         defer blocks.deinit(self.allocator);
         try self.manager.retainSequencePrefixBlocks(sequence_id, cacheable_tokens, &blocks);
@@ -515,7 +545,7 @@ pub const PromptPrefixCache = struct {
             try self.insertBlockHashEntry(hash, token_block, blocks.items[idx], storage_block_id);
             current_done = true;
         }
-        self.evictToBudget();
+        _ = self.updateResourceUsage();
     }
 
     fn insertBlockHashEntry(
@@ -541,7 +571,6 @@ pub const PromptPrefixCache = struct {
             .last_used = self.tick,
         });
         self.estimated_bytes += bytes;
-        self.updateResourceUsage();
     }
 
     fn releaseRetainedBlockHashBlock(
@@ -647,38 +676,63 @@ pub const PromptPrefixCache = struct {
         }
     }
 
-    fn evictToBudget(self: *PromptPrefixCache) void {
+    fn evictOneLru(self: *PromptPrefixCache) bool {
         // ponytail: O(n) LRU scan, replace with an indexed queue if cache sizes get large.
-        while (self.estimated_bytes > self.config.max_bytes and (self.entries.items.len + self.block_hash_entries.items.len) > 0) {
-            var simple_victim: ?usize = null;
-            for (self.entries.items, 0..) |entry, idx| {
-                if (simple_victim == null or entry.last_used < self.entries.items[simple_victim.?].last_used) simple_victim = idx;
-            }
-            var block_victim: ?usize = null;
-            for (self.block_hash_entries.items, 0..) |entry, idx| {
-                if (block_victim == null or entry.last_used < self.block_hash_entries.items[block_victim.?].last_used) block_victim = idx;
-            }
-            if (simple_victim) |simple_idx| {
-                if (block_victim) |block_idx| {
-                    if (self.entries.items[simple_idx].last_used <= self.block_hash_entries.items[block_idx].last_used) {
-                        self.removeEntry(simple_idx);
-                    } else {
-                        self.removeBlockHashEntry(block_idx);
-                    }
-                } else {
+        var simple_victim: ?usize = null;
+        for (self.entries.items, 0..) |entry, idx| {
+            if (simple_victim == null or entry.last_used < self.entries.items[simple_victim.?].last_used) simple_victim = idx;
+        }
+        var block_victim: ?usize = null;
+        for (self.block_hash_entries.items, 0..) |entry, idx| {
+            if (block_victim == null or entry.last_used < self.block_hash_entries.items[block_victim.?].last_used) block_victim = idx;
+        }
+        if (simple_victim) |simple_idx| {
+            if (block_victim) |block_idx| {
+                if (self.entries.items[simple_idx].last_used <= self.block_hash_entries.items[block_idx].last_used) {
                     self.removeEntry(simple_idx);
+                } else {
+                    self.removeBlockHashEntry(block_idx);
                 }
-            } else if (block_victim) |block_idx| {
-                self.removeBlockHashEntry(block_idx);
             } else {
-                break;
+                self.removeEntry(simple_idx);
             }
+            return true;
+        }
+        if (block_victim) |block_idx| {
+            self.removeBlockHashEntry(block_idx);
+            return true;
+        }
+        return false;
+    }
+
+    fn evictToBudget(self: *PromptPrefixCache) void {
+        while (self.estimated_bytes > self.config.max_bytes) {
+            if (!self.evictOneLru()) break;
         }
     }
 
-    fn updateResourceUsage(self: *PromptPrefixCache) void {
-        const observer = self.config.resource_usage_observer orelse return;
-        observer.update(observer.context, &self.resource_accounted_bytes, @intCast(self.estimated_bytes));
+    /// Make room in both the cache-local target and the external compact
+    /// ledger before any new KV block is retained. Failure leaves the cache
+    /// at a valid (possibly smaller) state and causes the insertion to be
+    /// skipped; generation itself continues without caching.
+    fn reserveResourceGrowth(self: *PromptPrefixCache, additional_bytes: usize) bool {
+        if (additional_bytes > self.config.max_bytes) return false;
+        while (true) {
+            const local_target = std.math.add(usize, self.estimated_bytes, additional_bytes) catch return false;
+            if (local_target <= self.config.max_bytes) break;
+            if (!self.evictOneLru()) return false;
+        }
+        while (true) {
+            const target = std.math.add(usize, self.estimated_bytes, additional_bytes) catch return false;
+            const observer = self.config.resource_usage_observer orelse return true;
+            if (observer.update(observer.context, &self.resource_accounted_bytes, @intCast(target))) return true;
+            if (!self.evictOneLru()) return false;
+        }
+    }
+
+    fn updateResourceUsage(self: *PromptPrefixCache) bool {
+        const observer = self.config.resource_usage_observer orelse return true;
+        return observer.update(observer.context, &self.resource_accounted_bytes, @intCast(self.estimated_bytes));
     }
 
     fn clearEntries(self: *PromptPrefixCache) void {
@@ -703,7 +757,7 @@ pub const PromptPrefixCache = struct {
         self.allocator.free(entry.blocks);
         if (entry.storage_blocks.len > 0) self.allocator.free(entry.storage_blocks);
         self.estimated_bytes -|= entry.estimated_bytes;
-        self.updateResourceUsage();
+        _ = self.updateResourceUsage();
         _ = self.entries.swapRemove(idx);
         self.evictions += 1;
     }
@@ -716,7 +770,7 @@ pub const PromptPrefixCache = struct {
         }
         self.allocator.free(entry.tokens);
         self.estimated_bytes -|= entry.estimated_bytes;
-        self.updateResourceUsage();
+        _ = self.updateResourceUsage();
         _ = self.block_hash_index.remove(entry.hash);
         const last_idx = self.block_hash_entries.items.len - 1;
         _ = self.block_hash_entries.swapRemove(idx);
@@ -877,12 +931,13 @@ test "prompt cache reports retained bytes to resource observer" {
         last: u64 = 0,
         peak: u64 = 0,
 
-        fn update(context: *anyopaque, current: *u64, next: u64) void {
+        fn update(context: *anyopaque, current: *u64, next: u64) bool {
             const probe: *@This() = @ptrCast(@alignCast(context));
             current.* = next;
             probe.last = next;
             probe.peak = @max(probe.peak, next);
             probe.updates += 1;
+            return true;
         }
     };
 
@@ -894,7 +949,7 @@ test "prompt cache reports retained bytes to resource observer" {
         .enabled = true,
         .mode = .simple,
         .min_tokens = 2,
-        .max_bytes = 1,
+        .max_bytes = 1024,
         .resource_usage_observer = .{
             .context = &probe,
             .update = UsageProbe.update,
@@ -914,6 +969,8 @@ test "prompt cache reports retained bytes to resource observer" {
     try cache.storeFromSequence("", &.{ 1, 2 }, source_id);
 
     try std.testing.expect(probe.peak > 0);
+    try std.testing.expect(probe.last > 0);
+    cache.clearEntries();
     try std.testing.expectEqual(@as(u64, 0), probe.last);
     try std.testing.expect(probe.updates >= 2);
 }

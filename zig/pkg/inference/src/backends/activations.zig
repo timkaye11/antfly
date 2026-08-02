@@ -454,9 +454,8 @@ fn topPScalar(probs: []f32, p: f32) void {
 
 /// Sample from a probability distribution using cumulative sum.
 /// Accumulates partial sums in chunks for fast scanning.
-pub fn sampleFromProbs(probs: []const f32) usize {
-    // Use pointer address as entropy source — each call gets a different stack address
-    const seed: u64 = @as(u64, @intFromPtr(probs.ptr)) *% 0x9E3779B97F4A7C15 +% @as(u64, @intCast(probs.len));
+pub fn sampleFromProbsSeeded(probs: []const f32, seed: u64) usize {
+    if (probs.len == 0) return 0;
     var rng = std.Random.DefaultPrng.init(seed);
     const r = rng.random().float(f32);
 
@@ -480,6 +479,13 @@ pub fn sampleFromProbs(probs: []const f32) usize {
         if (cumsum >= r) return i;
     }
     return probs.len - 1;
+}
+
+pub fn sampleFromProbs(probs: []const f32) usize {
+    // Preserve a nondeterministic default for callers that did not request a
+    // seed. Generation request paths use sampleFromProbsSeeded instead.
+    const seed: u64 = @as(u64, @intFromPtr(probs.ptr)) *% 0x9E3779B97F4A7C15 +% @as(u64, @intCast(probs.len));
+    return sampleFromProbsSeeded(probs, seed);
 }
 
 // --- Vectorized helpers for sampling ---
@@ -922,4 +928,13 @@ test "sampleFromProbs distribution" {
     const probs = [_]f32{ 0.0, 0.0, 1.0, 0.0 };
     const idx = sampleFromProbs(&probs);
     try std.testing.expectEqual(@as(usize, 2), idx);
+}
+
+test "sampleFromProbsSeeded is deterministic" {
+    const probs = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
+    try std.testing.expectEqual(
+        sampleFromProbsSeeded(&probs, 42),
+        sampleFromProbsSeeded(&probs, 42),
+    );
+    try std.testing.expectEqual(@as(usize, 0), sampleFromProbsSeeded(&.{}, 42));
 }

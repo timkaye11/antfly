@@ -984,6 +984,7 @@ pub const BackendDebugTimingSnapshot = struct {
 };
 
 pub const CompactMemoryProfile = backend_contracts.CompactMemoryProfile;
+pub const CompactDeviceRouting = backend_contracts.CompactDeviceRouting;
 pub const CompactInferenceRequest = backend_contracts.CompactInferenceRequest;
 pub const CompactExpertGeometry = backend_contracts.CompactExpertGeometry;
 pub const CompactInferenceConfig = backend_contracts.CompactInferenceConfig;

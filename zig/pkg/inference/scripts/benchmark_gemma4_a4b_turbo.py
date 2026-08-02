@@ -12,7 +12,9 @@ optional ``--max-rss-bytes`` gate (0 = report-only).  On platforms without
 ``proc_pid_rusage`` the footprint records 0 and the run fails closed unless
 ``--allow-missing-footprint`` is passed.  A ``--max-decode-cv`` gate (default
 0.03) fails the run when either engine's decode throughput coefficient of
-variation exceeds it: CV <= 3% or no claim.
+variation exceeds it: CV <= 3% or no claim. Every measured run must also
+produce the same normalized generated text across and within engines; output
+divergence is rejected before throughput is summarized.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -48,6 +51,7 @@ TURBO_FOOTER_RE = re.compile(
     r"\[stop=.*?\s+prefill=(?P<prefill>\d+)tok\s+new=(?P<new>\d+)tok"
     r"\s+decode=(?P<decode>[0-9.]+)s\s+tok/s=(?P<rate>[0-9.]+)\]"
 )
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 # Legacy /usr/bin/time -l parsers.  Live runs no longer wrap engines in
 # /usr/bin/time (wall time is a monotonic clock around the child and RSS comes
 # from wait4 rusage), but the parse functions still accept optional time-style
@@ -166,6 +170,31 @@ def _ids(match: re.Match[str] | None, label: str) -> list[int]:
     return [int(value) for value in match.group("ids").split()]
 
 
+def _normalized_generated_text(text: str) -> str:
+    """Canonicalize transport-only differences without changing content."""
+    without_ansi = ANSI_ESCAPE_RE.sub("", text)
+    normalized_newlines = without_ansi.replace("\r\n", "\n").replace("\r", "\n")
+    return unicodedata.normalize("NFC", normalized_newlines).strip()
+
+
+def _output_hash(text: str) -> str:
+    return hashlib.sha256(_normalized_generated_text(text).encode("utf-8")).hexdigest()
+
+
+def _antfly_generated_text(stdout: str) -> str:
+    prompt_ids = ANTFLY_PROMPT_IDS_RE.search(stdout)
+    token_ids = ANTFLY_TOKEN_IDS_RE.search(stdout)
+    if prompt_ids is None or token_ids is None or token_ids.start() < prompt_ids.end():
+        raise BenchmarkError("cannot isolate Antfly generated text from token diagnostics")
+    return stdout[prompt_ids.end():token_ids.start()]
+
+
+def _turbo_generated_text(stdout: str) -> str:
+    # Turbo normally writes its footer to stderr, but accept stdout footers in
+    # recorded logs while hashing only the user-visible generated text.
+    return TURBO_FOOTER_RE.sub("", stdout)
+
+
 def _wall_and_rss(
     time_stderr: str, wall_ms: float | None, max_rss_bytes: int | None, label: str
 ) -> tuple[float, int]:
@@ -203,9 +232,7 @@ def parse_antfly(
     token_ids = _ids(ANTFLY_TOKEN_IDS_RE.search(combined), "Antfly output token ids")
     decode_ms = float(inner.group("decode"))
     total_ms = float(total.group("total"))
-    output_hash = hashlib.sha256(
-        (" ".join(str(value) for value in token_ids)).encode()
-    ).hexdigest()
+    output_hash = _output_hash(_antfly_generated_text(stdout))
     return Sample(
         engine="antfly",
         iteration=iteration,
@@ -213,7 +240,9 @@ def parse_antfly(
         output_tokens=len(token_ids),
         decode_ms=decode_ms,
         decode_tok_per_s=float(rate.group("rate")),
-        ttft_proxy_ms=max(0.0, total_ms - decode_ms),
+        # Use the same fresh-process wall-minus-decode proxy as Turbo. The
+        # engine-reported total is retained only as a parser completeness gate.
+        ttft_proxy_ms=max(0.0, wall_ms - decode_ms),
         wall_ms=wall_ms,
         max_rss_bytes=max_rss_bytes,
         peak_phys_footprint_bytes=peak_phys_footprint_bytes,
@@ -250,7 +279,7 @@ def parse_turbo(
         wall_ms=wall_ms,
         max_rss_bytes=max_rss_bytes,
         peak_phys_footprint_bytes=peak_phys_footprint_bytes,
-        output_sha256=hashlib.sha256(stdout.encode()).hexdigest(),
+        output_sha256=_output_hash(_turbo_generated_text(stdout)),
         log_path=str(log_path),
     )
 
@@ -341,6 +370,8 @@ def summarize(
     requested_tokens: int,
     *,
     max_phys_footprint_bytes: int = DEFAULT_MAX_PHYS_FOOTPRINT_BYTES,
+    antfly_max_phys_footprint_bytes: int | None = None,
+    turbo_max_phys_footprint_bytes: int | None = None,
     max_rss_bytes: int = 0,
     max_decode_cv: float = DEFAULT_MAX_DECODE_CV,
     allow_missing_footprint: bool = False,
@@ -354,6 +385,22 @@ def summarize(
     prompt_counts = {sample.prompt_tokens for sample in samples}
     if len(prompt_counts) != 1:
         raise BenchmarkError(f"prompt token counts differ across engines: {sorted(prompt_counts)}")
+    output_hashes = {
+        engine: {sample.output_sha256 for sample in engine_samples}
+        for engine, engine_samples in by_engine.items()
+    }
+    for engine, hashes in output_hashes.items():
+        if len(hashes) != 1:
+            raise BenchmarkError(
+                f"{engine} generated nondeterministic outputs across measured runs: {sorted(hashes)}"
+            )
+    antfly_output = next(iter(output_hashes["antfly"]))
+    turbo_output = next(iter(output_hashes["turbo"]))
+    if antfly_output != turbo_output:
+        raise BenchmarkError(
+            "generated outputs differ across engines; throughput is not a matched-workload comparison "
+            f"(antfly={antfly_output}, turbo={turbo_output})"
+        )
     footprint_notes: set[str] = set()
     for sample in samples:
         if sample.output_tokens != requested_tokens:
@@ -361,10 +408,17 @@ def summarize(
                 f"{sample.engine} emitted {sample.output_tokens}, expected {requested_tokens}"
             )
         if sample.peak_phys_footprint_bytes > 0:
-            if sample.peak_phys_footprint_bytes > max_phys_footprint_bytes:
+            engine_ceiling = (
+                antfly_max_phys_footprint_bytes
+                if sample.engine == "antfly" and antfly_max_phys_footprint_bytes is not None
+                else turbo_max_phys_footprint_bytes
+                if sample.engine == "turbo" and turbo_max_phys_footprint_bytes is not None
+                else max_phys_footprint_bytes
+            )
+            if sample.peak_phys_footprint_bytes > engine_ceiling:
                 raise BenchmarkError(
                     f"{sample.engine} phys_footprint {sample.peak_phys_footprint_bytes} "
-                    f"exceeds {max_phys_footprint_bytes}"
+                    f"exceeds {engine_ceiling}"
                 )
         elif not allow_missing_footprint:
             raise BenchmarkError(
@@ -420,14 +474,45 @@ def summarize(
             "output_tokens": requested_tokens,
             "memory_gate_primary": "peak_phys_footprint_bytes (proc_pid_rusage RUSAGE_INFO_V4)",
             "max_phys_footprint_bytes": max_phys_footprint_bytes,
+            "antfly_max_phys_footprint_bytes": antfly_max_phys_footprint_bytes,
+            "turbo_max_phys_footprint_bytes": turbo_max_phys_footprint_bytes,
             "max_rss_bytes": max_rss_bytes,
             "rss_role": "secondary telemetry" if max_rss_bytes == 0 else "secondary gate",
             "max_decode_cv": max_decode_cv,
             "footprint_notes": sorted(footprint_notes),
             "ttft_definition": "fresh-process wall time minus reported decode time",
+            "matched_output_sha256": antfly_output,
+            "output_contract": "NFC text, normalized newlines, surrounding whitespace removed",
         },
         "engines": engines,
         "samples": [asdict(sample) for sample in samples],
+    }
+
+
+def evaluate_performance_gate(
+    summary: dict,
+    min_antfly_decode_ratio: float,
+    require_antfly_win: bool,
+) -> dict:
+    """Return a serializable, explicit pass/fail record for speed claims."""
+    antfly = summary["engines"]["antfly"]
+    turbo = summary["engines"]["turbo"]
+    failures = []
+    if antfly["decode_ratio_vs_turbo"] < min_antfly_decode_ratio:
+        failures.append(
+            f"Antfly decode ratio {antfly['decode_ratio_vs_turbo']:.3f} is below "
+            f"{min_antfly_decode_ratio:.3f}"
+        )
+    if require_antfly_win and (
+        antfly["decode_ratio_vs_turbo"] <= 1.0
+        or antfly["median_ttft_proxy_ms"] >= turbo["median_ttft_proxy_ms"]
+    ):
+        failures.append("Antfly did not beat TurboFieldfare on decode and TTFT proxy")
+    return {
+        "passed": not failures,
+        "min_antfly_decode_ratio": min_antfly_decode_ratio,
+        "require_antfly_win": require_antfly_win,
+        "failures": failures,
     }
 
 
@@ -442,11 +527,17 @@ def command_lines(args: argparse.Namespace) -> dict[str, list[str]]:
             "metal",
             "--memory-profile",
             "2gbs",
+            "--memory-budget-mb",
+            str(args.antfly_memory_budget_mb),
+            "--compact-device-routing",
+            args.antfly_device_routing,
             "--raw-prompt",
             "--max-tokens",
             str(args.tokens),
             "--temperature",
             "0",
+            "--seed",
+            str(args.seed),
             "--ignore-eos",
             "--print-token-ids",
             "--print-prompt-token-ids",
@@ -462,6 +553,8 @@ def command_lines(args: argparse.Namespace) -> dict[str, list[str]]:
             str(args.tokens),
             "--temperature",
             "0",
+            "--seed",
+            str(args.seed),
         ],
     }
 
@@ -481,8 +574,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--turbo-model", required=True)
     parser.add_argument("--prompt", default="Hello")
     parser.add_argument("--tokens", type=int, default=32)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--lane",
+        choices=("compact-2g", "full-residency"),
+        default="compact-2g",
+        help="named benchmark contract recorded in summary.json",
+    )
+    parser.add_argument(
+        "--antfly-memory-budget-mb",
+        type=int,
+        default=None,
+        help="defaults to 2048 for compact-2g and 16384 for full-residency",
+    )
+    parser.add_argument(
+        "--antfly-device-routing",
+        choices=("off", "partial", "full", "auto"),
+        default=None,
+        help="defaults to off for compact-2g and full for full-residency",
+    )
     parser.add_argument("--warmups", type=int, default=1)
-    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--repeats", type=int, default=6)
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument(
         "--max-phys-footprint-bytes",
@@ -497,6 +609,18 @@ def main(argv: list[str] | None = None) -> int:
         help="secondary RSS ceiling; 0 records RSS without gating",
     )
     parser.add_argument(
+        "--antfly-max-phys-footprint-bytes",
+        type=int,
+        default=None,
+        help="Antfly-specific primary memory ceiling (overrides the shared ceiling)",
+    )
+    parser.add_argument(
+        "--turbo-max-phys-footprint-bytes",
+        type=int,
+        default=None,
+        help="Turbo-specific primary memory ceiling (overrides the shared ceiling)",
+    )
+    parser.add_argument(
         "--allow-missing-footprint",
         action="store_true",
         help="permit runs without proc_pid_rusage telemetry (RSS-only reporting)",
@@ -507,12 +631,29 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_MAX_DECODE_CV,
         help="fail when either engine's decode tok/s CV exceeds this (<=0 disables)",
     )
-    parser.add_argument("--min-antfly-decode-ratio", type=float, default=0.0)
+    parser.add_argument(
+        "--min-antfly-decode-ratio",
+        type=float,
+        default=0.95,
+        help="fail when Antfly is more than 5%% slower by median decode throughput",
+    )
     parser.add_argument("--require-antfly-win", action="store_true")
     parser.add_argument("--out-dir", default="")
     args = parser.parse_args(argv)
-    if args.tokens < 2 or args.warmups < 0 or args.repeats < 1:
-        parser.error("--tokens >= 2, --warmups >= 0, and --repeats >= 1 are required")
+    if args.tokens < 2 or args.warmups < 0 or args.repeats < 2:
+        parser.error("--tokens >= 2, --warmups >= 0, and --repeats >= 2 are required")
+    if args.seed < 0:
+        parser.error("--seed must be non-negative")
+    if args.antfly_memory_budget_mb is None:
+        args.antfly_memory_budget_mb = 2048 if args.lane == "compact-2g" else 16384
+    if args.antfly_device_routing is None:
+        args.antfly_device_routing = "off" if args.lane == "compact-2g" else "full"
+    if args.lane == "full-residency" and args.antfly_device_routing != "full":
+        parser.error("full-residency lane requires --antfly-device-routing full")
+    if args.antfly_memory_budget_mb < 2048:
+        parser.error("--antfly-memory-budget-mb must be at least 2048")
+    if args.antfly_max_phys_footprint_bytes is None:
+        args.antfly_max_phys_footprint_bytes = args.antfly_memory_budget_mb * 1024 * 1024
     try:
         args.antfly_bin = existing_path(args.antfly_bin, "Antfly binary")
         args.antfly_model = existing_path(args.antfly_model, "Antfly GGUF")
@@ -541,15 +682,26 @@ def main(argv: list[str] | None = None) -> int:
             samples,
             args.tokens,
             max_phys_footprint_bytes=args.max_phys_footprint_bytes,
+            antfly_max_phys_footprint_bytes=args.antfly_max_phys_footprint_bytes,
+            turbo_max_phys_footprint_bytes=args.turbo_max_phys_footprint_bytes,
             max_rss_bytes=args.max_rss_bytes,
             max_decode_cv=args.max_decode_cv,
             allow_missing_footprint=args.allow_missing_footprint,
         )
         summary["commands"] = commands
-        summary_path = out_dir / "summary.json"
-        summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+        summary["lane"] = args.lane
+        summary["seed"] = args.seed
         antfly = summary["engines"]["antfly"]
         turbo = summary["engines"]["turbo"]
+        performance_gate = evaluate_performance_gate(
+            summary,
+            args.min_antfly_decode_ratio,
+            args.require_antfly_win,
+        )
+        summary["performance_gate"] = performance_gate
+        summary["passed"] = performance_gate["passed"]
+        summary_path = out_dir / "summary.json"
+        summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
         print(
             f"antfly={antfly['median_decode_tok_per_s']:.3f} tok/s "
             f"turbo={turbo['median_decode_tok_per_s']:.3f} tok/s "
@@ -560,16 +712,8 @@ def main(argv: list[str] | None = None) -> int:
             f"turbo_footprint_mb={turbo['peak_phys_footprint_bytes'] / 1e6:.0f} "
             f"summary={summary_path}"
         )
-        if antfly["decode_ratio_vs_turbo"] < args.min_antfly_decode_ratio:
-            raise BenchmarkError(
-                f"Antfly decode ratio {antfly['decode_ratio_vs_turbo']:.3f} is below "
-                f"{args.min_antfly_decode_ratio:.3f}"
-            )
-        if args.require_antfly_win and (
-            antfly["decode_ratio_vs_turbo"] <= 1.0
-            or antfly["median_ttft_proxy_ms"] >= turbo["median_ttft_proxy_ms"]
-        ):
-            raise BenchmarkError("Antfly did not beat TurboFieldfare on decode and TTFT proxy")
+        if performance_gate["failures"]:
+            raise BenchmarkError("; ".join(performance_gate["failures"]))
         return 0
     except (BenchmarkError, subprocess.TimeoutExpired) as exc:
         print(f"benchmark error: {exc}", file=sys.stderr)

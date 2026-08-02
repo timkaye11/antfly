@@ -50,8 +50,8 @@ LLAMA_MARKERS = (
 )
 
 MATCHING_ROUTE_LINES = (
-    "layer0_routes: 7:0.600000 3:0.400000\n"
-    "layer1_routes: 9:0.700000 4:0.300000\n"
+    "layer0_routes: 3:0.600000 7:0.400000\n"
+    "layer1_routes: 4:0.700000 9:0.300000\n"
 )
 
 MATCHING_LOGIT_LINES = (
@@ -161,7 +161,7 @@ class ParityParserTests(unittest.TestCase):
         reference = [{"layer": 0, "top_k": 2, "expert_ids": [3, 7]}]
         antfly = MOD.parse_antfly_routes(
             "layer0_routes: 1:0.900000 2:0.100000\n"  # earlier decode step
-            "layer0_routes: 7:0.600000 3:0.400000\n"  # last line wins
+            "layer0_routes: 3:0.600000 7:0.400000\n"  # last line wins
         )
         self.assertEqual([], MOD.compare_route_sets("f16/x", reference, antfly))
 
@@ -173,7 +173,7 @@ class ParityParserTests(unittest.TestCase):
         antfly = MOD.parse_antfly_routes("layer0_routes: 3:0.500000 8:0.500000\n")
         failures = MOD.compare_route_sets("f16/x", reference, antfly)
         self.assertEqual(2, len(failures))
-        self.assertIn("expert set mismatch", failures[0])
+        self.assertIn("ordered expert mismatch", failures[0])
         self.assertIn("layer 1 routes missing", failures[1])
 
     def test_compare_logit_samples_tolerance(self) -> None:
@@ -210,7 +210,10 @@ class ParityParserTests(unittest.TestCase):
             "f16",
         )
         self.assertNotIn("--host-budget-mb", compact)
-        self.assertEqual(["--memory-profile", "2gbs"], compact[-2:])
+        self.assertEqual("2gbs", compact[compact.index("--memory-profile") + 1])
+        self.assertEqual("2048", compact[compact.index("--memory-budget-mb") + 1])
+        self.assertEqual("off", compact[compact.index("--compact-device-routing") + 1])
+        self.assertEqual("42", compact[compact.index("--seed") + 1])
         self.assertEqual("f16", compact[compact.index("--cache-dtype") + 1])
 
     def test_f32_compact_lane_widens_only_kv_budget(self) -> None:
@@ -480,6 +483,35 @@ class VerifyReferenceTests(unittest.TestCase):
             self.assertIn("output_tokens=2", stdout)
             self.assertIn("lanes=f16,f32", stdout)
 
+    def test_compare_compact_routes_records_exact_off_vs_full_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = RecordVerifyWorkspace(Path(temp_dir))
+            calls = []
+
+            def fake_run(command, environment, log_path, timeout):
+                calls.append(list(command))
+                Path(log_path).write_text("route log\n", encoding="utf-8")
+                return _antfly_output("f16")
+
+            out_dir = workspace.out_dir()
+            with _patched(_run=fake_run):
+                rc = MOD.main(
+                    [
+                        "compare-compact-routes",
+                        "--antfly-bin", str(workspace.antfly),
+                        "--model", str(workspace.model),
+                        "--out-dir", str(out_dir),
+                        "--tokens", "2",
+                    ]
+                )
+            self.assertEqual(0, rc)
+            self.assertEqual(2, len(calls))
+            self.assertEqual("off", calls[0][calls[0].index("--compact-device-routing") + 1])
+            self.assertEqual("full", calls[1][calls[1].index("--compact-device-routing") + 1])
+            summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(summary["passed"])
+            self.assertEqual(MOD.ROUTE_SUMMARY_SCHEMA, summary["schema"])
+
     def test_full_matrix_runs_three_engines_per_lane(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = RecordVerifyWorkspace(Path(temp_dir))
@@ -561,14 +593,14 @@ class VerifyReferenceTests(unittest.TestCase):
             workspace = RecordVerifyWorkspace(Path(temp_dir))
             bundle = workspace.write_bundle(routes=REFERENCE_ROUTES)
             mismatched = (
-                "layer0_routes: 7:0.600000 3:0.400000\n"
+                "layer0_routes: 3:0.600000 7:0.400000\n"
                 "layer1_routes: 5:0.700000 4:0.300000\n"  # 5 instead of 9
             )
             rc, out_dir, _, _, stderr = self._verify(
                 workspace, bundle, extra_for_lane=lambda lane: mismatched
             )
             self.assertEqual(1, rc)
-            self.assertIn("expert set mismatch", stderr)
+            self.assertIn("ordered expert mismatch", stderr)
             summary = self._summary(out_dir)
             self.assertFalse(summary["passed"])
             gates = summary["lanes"]["f16"]["engines"]["metal_compact"]["gates"]

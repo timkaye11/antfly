@@ -93,6 +93,7 @@ const Options = struct {
     temperature: f32 = 0,
     top_p: f32 = 0,
     top_k: i32 = 0,
+    seed: ?u64 = null,
     repetition_penalty: f32 = 1.0,
     prefill_chunk_size: usize = 0,
     draft_model: ?[]const u8 = null,
@@ -121,6 +122,7 @@ const Options = struct {
     /// compact profile.
     memory_budget_mb: usize = 0,
     expert_cache_slots: usize = 0,
+    compact_device_routing: ?session_factory.CompactDeviceRouting = null,
     compact_ceiling_mb: usize = 0,
     raw_prompt: bool = false,
     no_bos: bool = false,
@@ -380,6 +382,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .temperature = opts.temperature,
         .top_p = opts.top_p,
         .top_k = opts.top_k,
+        .seed = opts.seed,
         .repetition_penalty = opts.repetition_penalty,
         .prefill_chunk_size = opts.prefill_chunk_size,
         .draft_model = effective_draft_model,
@@ -5564,10 +5567,13 @@ fn tryRunLiveWholeModelExecutorGenerate(
         .repetition_penalty = config.repetition_penalty,
         .frequency_penalty = config.frequency_penalty,
         .presence_penalty = config.presence_penalty,
+        .seed = config.seed,
     };
     const use_runtime_token_decode = runtimeTokenDecodeEnabled();
     const use_greedy_decode = use_runtime_token_decode and runtime_caps.supports_greedy_decode and isPureGreedyConfig(config);
-    const use_sample_decode = use_runtime_token_decode and runtime_caps.supports_sample_decode and !use_greedy_decode;
+    // Explicit seeds use the host-visible logits path until backend sampling
+    // contracts carry request seeds end to end.
+    const use_sample_decode = use_runtime_token_decode and runtime_caps.supports_sample_decode and !use_greedy_decode and config.seed == null;
     const prefer_prefill_greedy_token = prefillGreedyTokenEnabled() and use_greedy_decode;
     var prefill_chunk_size = if (config.prefill_chunk_size > 0) config.prefill_chunk_size else prompt_ids.len;
     prefill_chunk_size = @max(@min(prefill_chunk_size, prompt_ids.len), 1);
@@ -6321,6 +6327,7 @@ fn serverGenerateRequest(opts: Options, messages: []const api.ChatMessage) api.G
         .temperature = opts.temperature,
         .top_p = opts.top_p,
         .top_k = opts.top_k,
+        .seed = if (opts.seed) |seed| @intCast(seed) else null,
         .repetition_penalty = opts.repetition_penalty,
         .stream = if (opts.stream) true else null,
         .draft_model = opts.draft_model,
@@ -6733,6 +6740,10 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingTopK;
             opts.top_k = try std.fmt.parseInt(i32, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--seed")) {
+            i += 1;
+            if (i >= args.len) return error.MissingSeed;
+            opts.seed = try std.fmt.parseInt(u64, args[i], 10);
         } else if (std.mem.eql(u8, arg, "--repetition-penalty")) {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
@@ -6902,6 +6913,11 @@ fn parseArgs(args: []const []const u8) !Options {
             {
                 return error.InvalidExpertCacheSlots;
             }
+        } else if (std.mem.eql(u8, arg, "--compact-device-routing")) {
+            i += 1;
+            if (i >= args.len) return error.MissingCompactDeviceRouting;
+            opts.compact_device_routing = parseCompactDeviceRouting(args[i]) orelse
+                return error.InvalidCompactDeviceRouting;
         } else if (std.mem.eql(u8, arg, "--server")) {
             i += 1;
             if (i >= args.len) return error.MissingServerUrl;
@@ -6969,6 +6985,7 @@ fn applyMemoryProfile(opts: *Options) !void {
     }
     const profile = opts.memory_profile orelse {
         if (opts.expert_cache_slots != 0) return error.ExpertCacheSlotsRequireMemoryProfile;
+        if (opts.compact_device_routing != null) return error.CompactDeviceRoutingRequiresMemoryProfile;
         return;
     };
     switch (profile) {
@@ -7021,7 +7038,16 @@ fn compactRequestFromOptions(opts: Options) ?session_factory.CompactInferenceReq
         .io_workers = 4,
         .preferred_prefill_rows = @intCast(opts.prefill_chunk_size),
         .resident_ceiling_override_bytes = @as(u64, opts.compact_ceiling_mb) * 1024 * 1024,
+        .device_routing = opts.compact_device_routing orelse .off,
     };
+}
+
+fn parseCompactDeviceRouting(value: []const u8) ?session_factory.CompactDeviceRouting {
+    if (std.mem.eql(u8, value, "off")) return .off;
+    if (std.mem.eql(u8, value, "partial")) return .partial;
+    if (std.mem.eql(u8, value, "full")) return .full;
+    if (std.mem.eql(u8, value, "auto")) return .auto;
+    return null;
 }
 
 fn parseBackendChoice(value: []const u8) ?BackendChoice {
@@ -7410,7 +7436,7 @@ fn metalEagerDenseMaxBytes() u64 {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--memory-profile <N>gb|<N>gbs|compact_2gbs] [--memory-budget-mb N] [--expert-cache-slots 4..128] [--compact-ceiling-mb N] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--memory-profile <N>gb|<N>gbs|compact_2gbs] [--memory-budget-mb N] [--expert-cache-slots 8..128] [--compact-device-routing off|partial|full|auto] [--compact-ceiling-mb N] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--seed N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
         \\  --stream prints generated text incrementally as token deltas arrive.
@@ -7425,7 +7451,8 @@ fn printUsage() void {
         \\  ignore-eos keeps generating after EOS for benchmark compatibility with engines that do not stop on the same EOG token set.
         \\  --memory-profile <N>gb|<N>gbs (e.g. 2gbs, 8gb, 12gbs; compact_2gbs is an alias for 2gbs) selects Metal eager compact MoE execution, four bounded expert readers, 128-token prefill chunks, FP16 KV, and an N GiB residency budget carried by value into session creation.
         \\  --memory-budget-mb N sets the compact residency budget in MiB directly (minimum 2048; implies the compact profile when --memory-profile is omitted).
-        \\  --expert-cache-slots 4..128 pins resident expert slots per layer for the compact profile (default: derived from the memory budget; routing still executes exactly top-8 experts).
+        \\  --expert-cache-slots 8..128 pins resident expert slots per layer for the compact profile (default: derived from the memory budget; routing executes exactly top-8 experts).
+        \\  --compact-device-routing off|partial|full|auto selects the compact Metal MoE route (default: off; full requires 128 resident slots and fails closed).
         \\  --compact-ceiling-mb N is a diagnostic override of the enforced resident ceiling; normal use sizes the contract with --memory-budget-mb instead.
         \\  Kernel-JIT options are local-only and bypass ANTFLY_INFERENCE_SERVER_URL; an explicit --server remains an error.
         \\  A qualified profile reloads matching package records from the selected cache before model publication; use mode on or required.
@@ -7830,6 +7857,16 @@ test "parseArgs accepts artifact dir" {
     try std.testing.expect(opts.raw_prompt);
 }
 
+test "parseArgs accepts deterministic sampling seed" {
+    const opts = try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--seed",
+        "42",
+    });
+    try std.testing.expectEqual(@as(?u64, 42), opts.seed);
+}
+
 test "parseArgs expands compact 2gbs memory profile" {
     const opts = try parseArgs(&.{
         "/tmp/model",
@@ -7858,6 +7895,7 @@ test "parseArgs expands compact 2gbs memory profile" {
     try std.testing.expectEqual(@as(u8, 0), compact_request.expert_cache_slots);
     try std.testing.expectEqual(@as(u8, 4), compact_request.io_workers);
     try std.testing.expectEqual(@as(u16, 128), compact_request.preferred_prefill_rows);
+    try std.testing.expectEqual(session_factory.CompactDeviceRouting.off, compact_request.device_routing);
     try std.testing.expect(compactRequestFromOptions(try parseArgs(&.{ "/tmp/model", "hello" })) == null);
 
     try std.testing.expectEqual(MemoryProfile.compact_2gbs, (try parseArgs(&.{
@@ -7886,7 +7924,20 @@ test "parseArgs expands compact 2gbs memory profile" {
     });
     try std.testing.expectEqual(@as(usize, 16), slots_16.expert_cache_slots);
 
-    // The explicit slot range is [4, 128] now, not the old {8, 12, 16}.
+    const full_routing = try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--memory-budget-mb",
+        "16384",
+        "--compact-device-routing",
+        "full",
+    });
+    try std.testing.expectEqual(
+        session_factory.CompactDeviceRouting.full,
+        compactRequestFromOptions(full_routing).?.device_routing,
+    );
+
+    // The explicit slot range is [8, 128], with arbitrary intermediate tiers.
     const slots_100 = try parseArgs(&.{
         "/tmp/model",
         "hello",
@@ -7903,7 +7954,7 @@ test "parseArgs expands compact 2gbs memory profile" {
         "--memory-profile",
         "2gbs",
         "--expert-cache-slots",
-        "3",
+        "7",
     }));
 
     try std.testing.expectError(error.InvalidExpertCacheSlots, parseArgs(&.{
@@ -7920,6 +7971,21 @@ test "parseArgs expands compact 2gbs memory profile" {
         "hello",
         "--expert-cache-slots",
         "8",
+    }));
+
+    try std.testing.expectError(error.CompactDeviceRoutingRequiresMemoryProfile, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--compact-device-routing",
+        "auto",
+    }));
+    try std.testing.expectError(error.InvalidCompactDeviceRouting, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--memory-profile",
+        "2gbs",
+        "--compact-device-routing",
+        "fastest",
     }));
 
     try std.testing.expectError(error.MemoryProfileRequiresMetal, parseArgs(&.{

@@ -53,6 +53,7 @@ from typing import Any
 PINNED_LLAMA_COMMIT = "32703b42d6d8a74336bf27613705cbc76e2363ee"
 REFERENCE_SCHEMA = "antfly.gemma4_a4b_reference.v1"
 SUMMARY_SCHEMA = "antfly.gemma4_a4b_parity.v3"
+ROUTE_SUMMARY_SCHEMA = "antfly.gemma4_a4b_route_parity.v1"
 LOGIT_SAMPLE_TOLERANCE = 0.01
 ROUTE_TOP_K_COMPARED = 8
 
@@ -227,21 +228,21 @@ def compare_route_sets(
     reference_routes: list[dict[str, Any]],
     antfly_routes: list[dict[str, Any]],
 ) -> list[str]:
-    """Compare top-8 expert ID sets per layer, last emitted line per layer."""
+    """Compare ordered top-8 expert IDs per layer, last emitted line per layer."""
     ref_order, ref_by_layer = _last_by_key(reference_routes, "layer")
     _, antfly_by_layer = _last_by_key(antfly_routes, "layer")
     failures: list[str] = []
     for layer in ref_order:
-        expected = set(ref_by_layer[layer]["expert_ids"][:ROUTE_TOP_K_COMPARED])
+        expected = ref_by_layer[layer]["expert_ids"][:ROUTE_TOP_K_COMPARED]
         antfly_route = antfly_by_layer.get(layer)
         if antfly_route is None:
             failures.append(f"{label} layer {layer} routes missing from Antfly output")
             continue
-        actual = set(antfly_route["expert_ids"][:ROUTE_TOP_K_COMPARED])
+        actual = antfly_route["expert_ids"][:ROUTE_TOP_K_COMPARED]
         if expected != actual:
             failures.append(
-                f"{label} layer {layer} expert set mismatch: "
-                f"reference={sorted(expected)} antfly={sorted(actual)}"
+                f"{label} layer {layer} ordered expert mismatch: "
+                f"reference={expected} antfly={actual}"
             )
     return failures
 
@@ -318,6 +319,9 @@ def _antfly_command(
     backend: str,
     compact: bool,
     cache_dtype: str,
+    memory_budget_mb: int = 2048,
+    device_routing: str = "off",
+    seed: int = 42,
 ) -> list[str]:
     command = [
         str(binary),
@@ -331,6 +335,8 @@ def _antfly_command(
         str(tokens),
         "--temperature",
         "0",
+        "--seed",
+        str(seed),
         "--cache-dtype",
         cache_dtype,
         "--ignore-eos",
@@ -339,7 +345,13 @@ def _antfly_command(
         "--print-timing",
     ]
     if compact:
-        command.extend(("--memory-profile", "2gbs"))
+        command.extend(
+            (
+                "--memory-profile", "2gbs",
+                "--memory-budget-mb", str(memory_budget_mb),
+                "--compact-device-routing", device_routing,
+            )
+        )
         if cache_dtype == "f32":
             # The production compact profile intentionally budgets an FP16 KV
             # cache.  The F32 lane is a correctness diagnostic, so explicitly
@@ -534,6 +546,9 @@ def _verify_engine(
     prompt: str,
     tokens: int,
     timeout: float,
+    memory_budget_mb: int,
+    device_routing: str,
+    seed: int,
 ) -> tuple[dict[str, Any], list[str], list[str]]:
     overrides: dict[str, str] = {}
     if label == "metal_canonical":
@@ -545,7 +560,18 @@ def _verify_engine(
     environment = dict(os.environ)
     environment.update(overrides)
 
-    command = _antfly_command(antfly, model, prompt, tokens, backend, compact, lane)
+    command = _antfly_command(
+        antfly,
+        model,
+        prompt,
+        tokens,
+        backend,
+        compact,
+        lane,
+        memory_budget_mb,
+        device_routing,
+        seed,
+    )
     log_path = lane_dir / f"{label}.log"
     output = _run(command, environment, log_path, timeout)
 
@@ -622,6 +648,9 @@ def _verify_engine(
         "cache_dtype_requested": requested,
         "cache_dtype_effective": effective,
         "cache_dtype_provenance": "Antfly cache_dtype_effective log",
+        "memory_budget_mb": memory_budget_mb if compact else None,
+        "device_routing": device_routing if compact else None,
+        "seed": seed,
         "prompt_token_ids": prompt_ids,
         "token_ids": token_ids,
         "gates": gates,
@@ -679,6 +708,9 @@ def verify_reference(args: argparse.Namespace) -> dict[str, Any]:
                 prompt=prompt,
                 tokens=tokens,
                 timeout=args.timeout,
+                memory_budget_mb=args.memory_budget_mb,
+                device_routing=args.device_routing,
+                seed=args.seed,
             )
             engine_results[label] = result
             lane_failures.extend(engine_failures)
@@ -736,6 +768,79 @@ def _reference_counts(reference: dict[str, Any]) -> tuple[int, int]:
     return len(lane_doc["prompt_token_ids"]), reference["tokens"]
 
 
+def compare_compact_routes(args: argparse.Namespace) -> dict[str, Any]:
+    """Compare streamed and full-resident compact routes without llama.cpp."""
+    antfly = _require_file(args.antfly_bin, "Antfly binary", executable=True)
+    model = _require_file(args.model, "GGUF model")
+    args.out_dir.mkdir(parents=True, exist_ok=False)
+    results: dict[str, dict[str, Any]] = {}
+    for route, budget in (("off", args.streamed_memory_budget_mb), ("full", args.full_memory_budget_mb)):
+        command = _antfly_command(
+            antfly,
+            model,
+            args.prompt,
+            args.tokens,
+            "metal",
+            True,
+            args.cache_dtype,
+            budget,
+            route,
+            args.seed,
+        )
+        log_path = args.out_dir / f"{route}.log"
+        output = _run(command, dict(os.environ), log_path, args.timeout)
+        prompt_ids, token_ids = parse_antfly_output(output)
+        requested, effective = parse_antfly_cache_dtype(output)
+        if requested != args.cache_dtype or effective != args.cache_dtype:
+            raise ParityError(
+                f"{route} cache dtype drifted: requested={requested} effective={effective}"
+            )
+        if len(token_ids) != args.tokens:
+            raise ParityError(
+                f"{route} emitted {len(token_ids)} token IDs, expected {args.tokens}: {log_path}"
+            )
+        results[route] = {
+            "command": command,
+            "log": str(log_path),
+            "memory_budget_mb": budget,
+            "prompt_token_ids": prompt_ids,
+            "token_ids": token_ids,
+            "cache_dtype_requested": requested,
+            "cache_dtype_effective": effective,
+        }
+    failures: list[str] = []
+    if results["off"]["prompt_token_ids"] != results["full"]["prompt_token_ids"]:
+        failures.append(
+            "prompt mismatch: "
+            + _first_difference(
+                results["off"]["prompt_token_ids"], results["full"]["prompt_token_ids"]
+            )
+        )
+    if results["off"]["token_ids"] != results["full"]["token_ids"]:
+        failures.append(
+            "output mismatch: "
+            + _first_difference(results["off"]["token_ids"], results["full"]["token_ids"])
+        )
+    summary = {
+        "schema": ROUTE_SUMMARY_SCHEMA,
+        "passed": not failures,
+        "model": str(model),
+        "model_sha256": _sha256(model),
+        "prompt": args.prompt,
+        "tokens": args.tokens,
+        "seed": args.seed,
+        "cache_dtype": args.cache_dtype,
+        "routes": results,
+        "failures": failures,
+    }
+    (args.out_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    if failures:
+        raise ParityError("; ".join(failures))
+    return summary
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -786,6 +891,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify.add_argument("--out-dir", type=Path, required=True)
     verify.add_argument("--timeout", type=float, default=300.0)
+    verify.add_argument("--memory-budget-mb", type=int, default=2048)
+    verify.add_argument(
+        "--device-routing",
+        choices=("off", "partial", "full", "auto"),
+        default="off",
+    )
+    verify.add_argument("--seed", type=int, default=42)
     verify.add_argument(
         "--full-matrix",
         action="store_true",
@@ -802,6 +914,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="rejected: verify-reference never launches llama.cpp",
     )
+    routes = subparsers.add_parser(
+        "compare-compact-routes",
+        help="compare exact tokens from streamed/off and full-resident compact routes",
+    )
+    routes.add_argument("--antfly-bin", type=Path, required=True)
+    routes.add_argument("--model", type=Path, required=True)
+    routes.add_argument("--out-dir", type=Path, required=True)
+    routes.add_argument("--prompt", default="Hello upon-")
+    routes.add_argument("--tokens", type=int, default=32)
+    routes.add_argument("--timeout", type=float, default=600.0)
+    routes.add_argument("--cache-dtype", choices=("f16", "f32"), default="f16")
+    routes.add_argument("--streamed-memory-budget-mb", type=int, default=2048)
+    routes.add_argument("--full-memory-budget-mb", type=int, default=16384)
+    routes.add_argument("--seed", type=int, default=42)
     return parser
 
 
@@ -816,6 +942,23 @@ def main(argv: list[str] | None = None) -> int:
             "oracle with record-reference and drop --llama-bin",
             file=sys.stderr,
         )
+        return 2
+    if args.command == "verify-reference" and (
+        args.memory_budget_mb < 2048 or args.seed < 0
+    ):
+        print(
+            "usage error: --memory-budget-mb must be at least 2048 and --seed must be non-negative",
+            file=sys.stderr,
+        )
+        return 2
+    if args.command == "compare-compact-routes" and (
+        args.tokens <= 0
+        or args.timeout <= 0
+        or args.seed < 0
+        or args.streamed_memory_budget_mb < 2048
+        or args.full_memory_budget_mb < 2048
+    ):
+        print("usage error: invalid compare-compact-routes limits", file=sys.stderr)
         return 2
     try:
         if args.command == "record-reference":
@@ -833,7 +976,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"routes={route_count} logit_samples={logit_count} "
                 f"bundle={args.out_dir}"
             )
-        else:
+        elif args.command == "verify-reference":
             summary = verify_reference(args)
             # Counts derive from the reference lanes carried in the summary; the
             # v2 tool crashed here with a KeyError by assuming a top-level
@@ -844,6 +987,13 @@ def main(argv: list[str] | None = None) -> int:
                 f"prompt_tokens={summary['prompt_tokens']} "
                 f"output_tokens={summary['tokens']} "
                 f"skipped_gates={len(summary['skipped_gates'])}"
+            )
+        else:
+            summary = compare_compact_routes(args)
+            print(
+                f"compact route parity passed: prompt_tokens="
+                f"{len(summary['routes']['off']['prompt_token_ids'])} "
+                f"output_tokens={summary['tokens']} summary={args.out_dir / 'summary.json'}"
             )
     except (ParityError, OSError, subprocess.SubprocessError, ValueError) as exc:
         print(f"parity error: {exc}", file=sys.stderr)

@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 SCRIPT = Path(__file__).with_name("benchmark_gemma4_a4b_turbo.py")
@@ -21,8 +22,9 @@ SPEC.loader.exec_module(MOD)
 
 ANTFLY_STDOUT = """\
 prompt_token_ids: 2 9259
-generate_timing_ms: prompt_format=0 tokenize=1 runtime_prepare=0 prefill=300 decode=700 text_decode=0 total=1001
+matched text
 token_ids: 1 2 3 4
+generate_timing_ms: prompt_format=0 tokenize=1 runtime_prepare=0 prefill=300 decode=700 text_decode=0 total=1001
 timing_ms: load_model=2000 prompt_prep=1 scheduler=0 backend_setup=4 decode_setup=0 generate=1002 total=3007
 decode_tok_per_s=5.714
 """
@@ -63,7 +65,7 @@ class BenchmarkGemma4A4BTurboTest(unittest.TestCase):
         antfly = MOD.parse_antfly(ANTFLY_STDOUT, time_stderr, 0, Path("a.log"))
         self.assertEqual(2, antfly.prompt_tokens)
         self.assertEqual(4, antfly.output_tokens)
-        self.assertEqual(2307.0, antfly.ttft_proxy_ms)
+        self.assertEqual(2400.0, antfly.ttft_proxy_ms)
         self.assertEqual(3100.0, antfly.wall_ms)
         self.assertEqual(1_900_000_000, antfly.max_rss_bytes)
         self.assertEqual(0, antfly.peak_phys_footprint_bytes)
@@ -73,10 +75,11 @@ class BenchmarkGemma4A4BTurboTest(unittest.TestCase):
         2.90 real         1.00 user         0.20 sys
           1800000000  maximum resident set size
 """
-        turbo = MOD.parse_turbo("text", turbo_stderr, 0, Path("t.log"))
+        turbo = MOD.parse_turbo("matched text\n", turbo_stderr, 0, Path("t.log"))
         self.assertEqual(2, turbo.prompt_tokens)
         self.assertEqual(4, turbo.output_tokens)
         self.assertEqual(2100.0, turbo.ttft_proxy_ms)
+        self.assertEqual(antfly.output_sha256, turbo.output_sha256)
 
     def test_parses_with_harness_measurements_and_no_time_output(self) -> None:
         antfly = MOD.parse_antfly(
@@ -91,10 +94,10 @@ class BenchmarkGemma4A4BTurboTest(unittest.TestCase):
         self.assertEqual(3100.0, antfly.wall_ms)
         self.assertEqual(1_850_000_000, antfly.max_rss_bytes)
         self.assertEqual(2_050_000_000, antfly.peak_phys_footprint_bytes)
-        self.assertEqual(2307.0, antfly.ttft_proxy_ms)
+        self.assertEqual(2400.0, antfly.ttft_proxy_ms)
 
         turbo = MOD.parse_turbo(
-            "[stop=length prefill=2tok new=4tok decode=0.80s tok/s=5.000]",
+            "matched text\n[stop=length prefill=2tok new=4tok decode=0.80s tok/s=5.000]",
             "",
             1,
             Path("t.log"),
@@ -104,6 +107,7 @@ class BenchmarkGemma4A4BTurboTest(unittest.TestCase):
         )
         self.assertEqual(2100.0, turbo.ttft_proxy_ms)
         self.assertEqual(1_950_000_000, turbo.peak_phys_footprint_bytes)
+        self.assertEqual(antfly.output_sha256, turbo.output_sha256)
 
     def test_missing_wall_or_rss_without_harness_values_fails(self) -> None:
         with self.assertRaises(MOD.BenchmarkError):
@@ -143,6 +147,42 @@ class BenchmarkGemma4A4BTurboTest(unittest.TestCase):
             2_200_000_000, summary["engines"]["antfly"]["peak_phys_footprint_bytes"]
         )
 
+    def test_summary_requires_deterministic_matched_generated_output(self) -> None:
+        mismatched = [
+            _sample("antfly", output_sha256="antfly-output"),
+            _sample("turbo", output_sha256="turbo-output"),
+        ]
+        with self.assertRaisesRegex(MOD.BenchmarkError, "generated outputs differ"):
+            MOD.summarize(mismatched, 4)
+
+        nondeterministic = [
+            _sample("antfly", iteration=0, output_sha256="a"),
+            _sample("antfly", iteration=1, output_sha256="b"),
+            _sample("turbo", iteration=0, output_sha256="a"),
+            _sample("turbo", iteration=1, output_sha256="a"),
+        ]
+        with self.assertRaisesRegex(MOD.BenchmarkError, "nondeterministic"):
+            MOD.summarize(nondeterministic, 4)
+
+    def test_performance_gate_is_explicit_and_serializable(self) -> None:
+        summary = MOD.summarize(
+            [_sample("antfly", rate=4.0), _sample("turbo", rate=5.0)],
+            4,
+        )
+        gate = MOD.evaluate_performance_gate(summary, 0.95, False)
+        self.assertFalse(gate["passed"])
+        self.assertIn("decode ratio", gate["failures"][0])
+
+        summary = MOD.summarize(
+            [_sample("antfly", rate=5.5), _sample("turbo", rate=5.0)],
+            4,
+        )
+        gate = MOD.evaluate_performance_gate(summary, 0.95, True)
+        # The synthetic samples have identical TTFT proxies, so a strict win
+        # still fails even though Antfly's decode median is higher.
+        self.assertFalse(gate["passed"])
+        self.assertTrue(gate["require_antfly_win"])
+
     def test_missing_footprint_requires_allow_flag_and_records_rss_only_note(self) -> None:
         samples = [
             _sample("antfly", footprint=0),
@@ -167,6 +207,29 @@ class BenchmarkGemma4A4BTurboTest(unittest.TestCase):
         self.assertEqual("secondary telemetry", summary["contract"]["rss_role"])
         with self.assertRaisesRegex(MOD.BenchmarkError, "RSS"):
             MOD.summarize(samples, 4, max_rss_bytes=2_000_000_000)
+
+    def test_engine_specific_footprint_ceilings(self) -> None:
+        samples = [
+            _sample("antfly", footprint=3_000_000_000),
+            _sample("turbo", rate=5.0, footprint=1_900_000_000),
+        ]
+        summary = MOD.summarize(
+            samples,
+            4,
+            antfly_max_phys_footprint_bytes=4_000_000_000,
+            turbo_max_phys_footprint_bytes=2_000_000_000,
+        )
+        self.assertEqual(
+            4_000_000_000,
+            summary["contract"]["antfly_max_phys_footprint_bytes"],
+        )
+        with self.assertRaisesRegex(MOD.BenchmarkError, "antfly phys_footprint"):
+            MOD.summarize(
+                samples,
+                4,
+                antfly_max_phys_footprint_bytes=2_500_000_000,
+                turbo_max_phys_footprint_bytes=2_000_000_000,
+            )
 
     def test_decode_cv_gate(self) -> None:
         samples = [
@@ -227,6 +290,25 @@ class BenchmarkGemma4A4BTurboTest(unittest.TestCase):
             stub.chmod(0o755)
             with self.assertRaisesRegex(MOD.BenchmarkError, "exited 3"):
                 MOD.run_sample("antfly", 0, ["/bin/sh", str(stub)], out_dir, 30.0)
+
+    def test_commands_record_budget_route_and_seed(self) -> None:
+        commands = MOD.command_lines(
+            SimpleNamespace(
+                antfly_bin="antfly",
+                antfly_model="model.gguf",
+                turbo_bin="turbo",
+                turbo_model="model.gturbo",
+                prompt="Hello",
+                tokens=32,
+                seed=42,
+                antfly_memory_budget_mb=16384,
+                antfly_device_routing="full",
+            )
+        )
+        self.assertIn("16384", commands["antfly"])
+        self.assertIn("full", commands["antfly"])
+        self.assertEqual("42", commands["antfly"][commands["antfly"].index("--seed") + 1])
+        self.assertEqual("42", commands["turbo"][commands["turbo"].index("--seed") + 1])
 
     def test_cli_fails_closed_when_turbo_artifacts_are_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

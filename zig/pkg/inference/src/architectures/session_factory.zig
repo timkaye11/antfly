@@ -1052,6 +1052,7 @@ pub fn createMetalSessionWithTaskOverrideAndKernelJitAndLoadContext(
 
 pub const CompactInferenceRequest = ops.CompactInferenceRequest;
 pub const CompactInferenceConfig = ops.CompactInferenceConfig;
+pub const CompactDeviceRouting = ops.CompactDeviceRouting;
 
 pub const MetalSessionOptions = struct {
     task_override: ?TaskOverride = null,
@@ -1547,14 +1548,16 @@ fn createGpuHostedSessionWithTaskOverride(
         const geometry = effective_config.geometry;
         const arena_bytes = std.mem.alignForward(u64, geometry.encoded_expert_bytes, 16 * 1024);
         const state = try allocator.create(gpu_hosted_store_mod.CompactRuntimeState);
+        var compact_ledger = if (enforcing)
+            runtime.moe.budget_ledger.ResidentBudgetLedger.init(
+                effective_config.resident_ceiling_bytes,
+                effective_config.safety_reserve_bytes,
+            )
+        else
+            runtime.moe.budget_ledger.ResidentBudgetLedger.init(std.math.maxInt(u64), 0);
+        compact_ledger.setProcessSamplerRequired(enforcing);
         state.* = .{
-            .ledger = if (enforcing)
-                runtime.moe.budget_ledger.ResidentBudgetLedger.init(
-                    effective_config.resident_ceiling_bytes,
-                    effective_config.safety_reserve_bytes,
-                )
-            else
-                runtime.moe.budget_ledger.ResidentBudgetLedger.init(std.math.maxInt(u64), 0),
+            .ledger = compact_ledger,
             .enforcing = enforcing,
         };
         state.cache.setActiveSlots(effective_config.expert_cache_slots);

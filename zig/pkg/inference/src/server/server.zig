@@ -100,6 +100,7 @@ const GenerateSpeculationOptions = struct {
 const GenerateNumericOptions = struct {
     max_tokens: i32,
     top_k: i32,
+    seed: ?u64,
 };
 
 const GenerateSamplingOptions = struct {
@@ -120,12 +121,13 @@ const GenerateSamplingError = error{
     InvalidPresencePenalty,
 };
 
-fn parseGenerateNumericOptions(max_tokens_raw: ?i64, top_k_raw: ?i64) !GenerateNumericOptions {
+fn parseGenerateNumericOptions(max_tokens_raw: ?i64, top_k_raw: ?i64, seed_raw: ?i64) !GenerateNumericOptions {
     const max_tokens = std.math.cast(i32, max_tokens_raw orelse 256) orelse return error.InvalidMaxTokens;
     if (max_tokens < 1) return error.InvalidMaxTokens;
     const top_k = std.math.cast(i32, top_k_raw orelse 0) orelse return error.InvalidTopK;
     if (top_k < 0) return error.InvalidTopK;
-    return .{ .max_tokens = max_tokens, .top_k = top_k };
+    const seed = if (seed_raw) |raw| std.math.cast(u64, raw) orelse return error.InvalidSeed else null;
+    return .{ .max_tokens = max_tokens, .top_k = top_k, .seed = seed };
 }
 
 fn parseGenerateSamplingOptions(
@@ -568,6 +570,40 @@ pub const NodeConfig = struct {
     allow_unknown_models: bool = false,
 };
 
+fn validateCompactServerTopology(config: NodeConfig) !void {
+    var compact_count: usize = 0;
+    for (config.preload) |model| {
+        if (model.memory_profile != null or model.memory_budget_mb != null or
+            model.expert_cache_slots != null or model.device_routing != null)
+        {
+            compact_count += 1;
+            if ((try compactRequestForWarmModel(model)) == null) return error.InvalidCompactProfile;
+            if (model.kind != .generator) return error.CompactProfileRequiresGenerator;
+        }
+    }
+    if (compact_count == 0) return;
+    if (compact_count != 1 or config.preload.len != 1 or config.max_loaded_models != 1) {
+        return error.CompactProfileRequiresExclusiveProcess;
+    }
+    if (config.allow_unknown_models) return error.CompactProfileDisallowsUnknownModels;
+}
+
+test "compact server topology requires one known generator model" {
+    const compact = [_]WarmModel{.{
+        .name = "m",
+        .memory_budget_mb = 2048,
+    }};
+    try validateCompactServerTopology(.{ .preload = &compact, .max_loaded_models = 1 });
+    try std.testing.expectError(error.CompactProfileRequiresExclusiveProcess, validateCompactServerTopology(.{
+        .preload = &compact,
+    }));
+    try std.testing.expectError(error.CompactProfileDisallowsUnknownModels, validateCompactServerTopology(.{
+        .preload = &compact,
+        .max_loaded_models = 1,
+        .allow_unknown_models = true,
+    }));
+}
+
 fn isLoopbackBindHost(host: []const u8) bool {
     const address = std.Io.net.IpAddress.parse(host, 0) catch return false;
     return switch (address) {
@@ -774,14 +810,18 @@ pub const WarmModel = struct {
     /// (minimum 2048). Omission keeps the 2048 MiB floor; setting it
     /// without `memory_profile` implies the compact profile.
     memory_budget_mb: ?u32 = null,
-    /// Resident routed-expert slots per MoE layer, in [4, 128]; omission
+    /// Resident routed-expert slots per MoE layer, in [8, 128]; omission
     /// means automatic budget-derived selection.
     expert_cache_slots: ?u8 = null,
+    /// Compact Metal MoE routing policy. Omission is conservative streamed
+    /// execution (`off`); `full` requires a 128-slot tier and fails closed.
+    device_routing: ?[]const u8 = null,
 };
 
 pub fn compactRequestForWarmModel(model: WarmModel) !?backends_mod.SessionManager.CompactRequest {
     if (model.memory_profile == null and model.memory_budget_mb == null) {
         if (model.expert_cache_slots != null) return error.ExpertCacheSlotsRequireMemoryProfile;
+        if (model.device_routing != null) return error.CompactDeviceRoutingRequiresMemoryProfile;
         return null;
     }
     if (model.memory_profile) |profile| {
@@ -805,10 +845,24 @@ pub fn compactRequestForWarmModel(model: WarmModel) !?backends_mod.SessionManage
     {
         return error.InvalidExpertCacheSlots;
     }
+    const device_routing: session_factory.CompactDeviceRouting = if (model.device_routing) |value|
+        if (std.mem.eql(u8, value, "off"))
+            .off
+        else if (std.mem.eql(u8, value, "partial"))
+            .partial
+        else if (std.mem.eql(u8, value, "full"))
+            .full
+        else if (std.mem.eql(u8, value, "auto"))
+            .auto
+        else
+            return error.InvalidCompactDeviceRouting
+    else
+        .off;
     return .{
         .profile = .compact_2gbs,
         .memory_budget_mb = budget,
         .expert_cache_slots = slots,
+        .device_routing = device_routing,
     };
 }
 
@@ -821,6 +875,7 @@ test "compactRequestForWarmModel maps profile, budget, and slots fail-closed" {
     })).?;
     try std.testing.expectEqual(@as(u32, 0), profiled.memory_budget_mb);
     try std.testing.expectEqual(@as(u8, 0), profiled.expert_cache_slots);
+    try std.testing.expectEqual(session_factory.CompactDeviceRouting.off, profiled.device_routing);
 
     // A budget alone implies the compact profile; explicit knobs pass
     // through by value.
@@ -828,10 +883,12 @@ test "compactRequestForWarmModel maps profile, budget, and slots fail-closed" {
         .name = "m",
         .memory_budget_mb = 8192,
         .expert_cache_slots = 100,
+        .device_routing = "partial",
     })).?;
     try std.testing.expect(budgeted.profile == .compact_2gbs);
     try std.testing.expectEqual(@as(u32, 8192), budgeted.memory_budget_mb);
     try std.testing.expectEqual(@as(u8, 100), budgeted.expert_cache_slots);
+    try std.testing.expectEqual(session_factory.CompactDeviceRouting.partial, budgeted.device_routing);
 
     try std.testing.expectError(error.InvalidMemoryProfile, compactRequestForWarmModel(.{
         .name = "m",
@@ -844,7 +901,7 @@ test "compactRequestForWarmModel maps profile, budget, and slots fail-closed" {
     try std.testing.expectError(error.InvalidExpertCacheSlots, compactRequestForWarmModel(.{
         .name = "m",
         .memory_profile = "2gbs",
-        .expert_cache_slots = 3,
+        .expert_cache_slots = 7,
     }));
     try std.testing.expectError(error.InvalidExpertCacheSlots, compactRequestForWarmModel(.{
         .name = "m",
@@ -854,6 +911,15 @@ test "compactRequestForWarmModel maps profile, budget, and slots fail-closed" {
     try std.testing.expectError(error.ExpertCacheSlotsRequireMemoryProfile, compactRequestForWarmModel(.{
         .name = "m",
         .expert_cache_slots = 8,
+    }));
+    try std.testing.expectError(error.CompactDeviceRoutingRequiresMemoryProfile, compactRequestForWarmModel(.{
+        .name = "m",
+        .device_routing = "auto",
+    }));
+    try std.testing.expectError(error.InvalidCompactDeviceRouting, compactRequestForWarmModel(.{
+        .name = "m",
+        .memory_profile = "2gbs",
+        .device_routing = "fastest",
     }));
 }
 
@@ -3212,6 +3278,7 @@ pub const Node = struct {
     /// any listener or request handler that can reach this Node.
     pub fn warmConfiguredModelsBeforeServing(self: *Node, allocator: std.mem.Allocator) !void {
         if (self.request_surfaces_published) return error.KernelJitStartupWindowClosed;
+        try validateCompactServerTopology(self.config);
         // A retry must earn readiness again. Otherwise a failed second warm
         // could leave a stale successful latch and permit route publication.
         self.startup_preloads_materialized = false;
@@ -4831,12 +4898,13 @@ pub const Node = struct {
         self.metrics.incRequest("generate");
         defer self.metrics.decActive();
 
-        const numeric = parseGenerateNumericOptions(body.max_tokens, body.top_k) catch |err| {
+        const numeric = parseGenerateNumericOptions(body.max_tokens, body.top_k, body.seed) catch |err| {
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = switch (err) {
                     error.InvalidMaxTokens => "max_tokens must be between 1 and 2147483647",
                     error.InvalidTopK => "top_k must be between 0 and 2147483647",
+                    error.InvalidSeed => "seed must be between 0 and 9223372036854775807",
                 },
             });
         };
@@ -5047,6 +5115,7 @@ pub const Node = struct {
             .temperature = sampling.temperature,
             .top_p = sampling.top_p,
             .top_k = numeric.top_k,
+            .seed = numeric.seed,
             .min_p = sampling.min_p,
             .repetition_penalty = sampling.repetition_penalty,
             .frequency_penalty = sampling.frequency_penalty,
@@ -6136,11 +6205,12 @@ pub const Node = struct {
     fn generateBatchUnsupportedReasonPreflight(body: api.GenerateRequest) ?api.GenerateBatchError {
         if (body.stream orelse false) return .{ .code = "UNSUPPORTED_STREAM", .message = "batch generation does not support stream=true", .retryable = false };
         if (body.tools != null or body.tool_choice != null) return .{ .code = "UNSUPPORTED_TOOLS", .message = "batch generation does not support tools yet", .retryable = false };
-        _ = parseGenerateNumericOptions(body.max_tokens, body.top_k) catch |err| return .{
+        _ = parseGenerateNumericOptions(body.max_tokens, body.top_k, body.seed) catch |err| return .{
             .code = "INVALID_REQUEST",
             .message = switch (err) {
                 error.InvalidMaxTokens => "max_tokens must be between 1 and 2147483647",
                 error.InvalidTopK => "top_k must be between 0 and 2147483647",
+                error.InvalidSeed => "seed must be between 0 and 9223372036854775807",
             },
             .retryable = false,
         };
@@ -6240,7 +6310,7 @@ pub const Node = struct {
         std.debug.assert(owned_grammar_out.* == null);
         var owned_grammar: ?[]u8 = null;
         errdefer if (owned_grammar) |grammar| allocator.free(grammar);
-        const numeric = try parseGenerateNumericOptions(body.max_tokens, body.top_k);
+        const numeric = try parseGenerateNumericOptions(body.max_tokens, body.top_k, body.seed);
         const sampling = try parseGenerateSamplingOptions(
             body.temperature,
             body.top_p,
@@ -6260,6 +6330,7 @@ pub const Node = struct {
             .temperature = sampling.temperature,
             .top_p = sampling.top_p,
             .top_k = numeric.top_k,
+            .seed = numeric.seed,
             .min_p = sampling.min_p,
             .repetition_penalty = sampling.repetition_penalty,
             .frequency_penalty = sampling.frequency_penalty,
@@ -10815,13 +10886,16 @@ test "generate queue units conservatively charge active draft requests" {
 }
 
 test "generate numeric options validate narrowing at the HTTP trust boundary" {
-    const defaults = try parseGenerateNumericOptions(null, null);
+    const defaults = try parseGenerateNumericOptions(null, null, null);
     try std.testing.expectEqual(@as(i32, 256), defaults.max_tokens);
     try std.testing.expectEqual(@as(i32, 0), defaults.top_k);
-    try std.testing.expectError(error.InvalidMaxTokens, parseGenerateNumericOptions(0, null));
-    try std.testing.expectError(error.InvalidMaxTokens, parseGenerateNumericOptions(std.math.maxInt(i64), null));
-    try std.testing.expectError(error.InvalidTopK, parseGenerateNumericOptions(null, -1));
-    try std.testing.expectError(error.InvalidTopK, parseGenerateNumericOptions(null, std.math.maxInt(i64)));
+    try std.testing.expectEqual(@as(?u64, null), defaults.seed);
+    try std.testing.expectError(error.InvalidMaxTokens, parseGenerateNumericOptions(0, null, null));
+    try std.testing.expectError(error.InvalidMaxTokens, parseGenerateNumericOptions(std.math.maxInt(i64), null, null));
+    try std.testing.expectError(error.InvalidTopK, parseGenerateNumericOptions(null, -1, null));
+    try std.testing.expectError(error.InvalidTopK, parseGenerateNumericOptions(null, std.math.maxInt(i64), null));
+    try std.testing.expectError(error.InvalidSeed, parseGenerateNumericOptions(null, null, -1));
+    try std.testing.expectEqual(@as(?u64, 42), (try parseGenerateNumericOptions(null, null, 42)).seed);
 }
 
 test "generate sampling options validate the HTTP trust boundary" {

@@ -332,7 +332,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     const ProviderImpl = MetalNativeProvider;
     const compact_expert_layer_count: usize = 30;
     // Static capacity for budget-derived slot counts: the memory budget can
-    // resolve anywhere in [4, 128] resident experts per layer, so the linear
+    // resolve anywhere in [8, 128] resident experts per layer, so the linear
     // slot map and arena table cover the maximum while the cache only scans
     // and allocates the configured active prefix.
     const compact_expert_slot_capacity: usize = 128;
@@ -514,6 +514,41 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (self.plan_released) return;
             self.plan_released = true;
             self.state.cache.releasePlan(&self.plan);
+        }
+    };
+
+    const CompactRouteUseGuard = struct {
+        state: *gpu_hosted_store_mod.CompactRuntimeState,
+        refs: [8]gpu_hosted_store_mod.CompactSlotRef = undefined,
+        count: usize = 0,
+
+        fn acquire(pending: *PendingCompactMoeRoute) !CompactRouteUseGuard {
+            var guard = CompactRouteUseGuard{ .state = pending.state };
+            errdefer guard.releaseNoFail();
+            for (pending.plan.slice()) |entry| {
+                try pending.state.cache.beginUse(entry.ref);
+                guard.refs[guard.count] = entry.ref;
+                guard.count += 1;
+            }
+            return guard;
+        }
+
+        fn release(self: *CompactRouteUseGuard) !void {
+            var failed = false;
+            while (self.count != 0) {
+                self.count -= 1;
+                self.state.cache.endUse(self.refs[self.count]) catch |err| {
+                    failed = true;
+                    std.log.err("compact expert in-flight release failed: {s}", .{@errorName(err)});
+                };
+            }
+            if (failed) return error.CompactMoePinReleaseFailed;
+        }
+
+        fn releaseNoFail(self: *CompactRouteUseGuard) void {
+            self.release() catch |err| {
+                std.log.err("compact expert pin cleanup failed: {s}", .{@errorName(err)});
+            };
         }
     };
 
@@ -707,6 +742,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// True while a token-scoped decode-step frame opened by
     /// beginDecodeStepFrameOp is live; endDecodeStepFrameOp clears it.
     decode_step_frame_active: bool = false,
+    /// In-flight slot references owned by the open token frame. Plan pins are
+    /// transferred here after encoding and are released only after the frame
+    /// fence (or cancellation) completes.
+    compact_frame_slot_refs: [compact_expert_layer_count * 8]gpu_hosted_store_mod.CompactSlotRef = undefined,
+    compact_frame_slot_ref_count: usize = 0,
     compact_frame_begins: u64 = 0,
     compact_frame_flushes: u64 = 0,
     /// Times compact soft pressure released transient device pools (idle
@@ -3046,6 +3086,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     pub fn deinit(self: *MetalCompute) void {
+        if (self.decode_step_frame_active) {
+            if (self.provider_impl.raw_decode_runtime) |runtime| {
+                metal_runtime.cancelFrame(runtime) catch |err| {
+                    std.log.err("compact decode frame cancellation failed during teardown: {s}", .{@errorName(err)});
+                };
+            }
+            self.decode_step_frame_active = false;
+        }
+        self.releaseCompactFrameUsesNoFail();
         self.clearActivePrefillFramePlan();
         self.clearPendingPrefillKvDeviceSeeds();
         self.resetBackendKvCache();
@@ -3669,11 +3718,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return arena_state.arena.?.data;
     }
 
-    /// Unpublish one evicted slot: clear the provider's three projection
-    /// views, drop the layout, and decommit the arena's physical pages so
-    /// the process footprint actually falls. The mapping and its no-copy
-    /// device buffer stay valid for the next occupant.
-    fn decommitCompactSlot(
+    /// Clear one slot's provider views and reclaim its physical pages. This is
+    /// the single ownership primitive shared by normal cache eviction and
+    /// full-residency transaction rollback; callers update their own cache
+    /// state before invoking it.
+    fn reclaimCompactSlotBacking(
         self: *MetalCompute,
         state: *gpu_hosted_store_mod.CompactRuntimeState,
         layer_index: usize,
@@ -3708,6 +3757,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             state.decommitted_bytes +|= compact_expert_arena_bytes;
             madvised = true;
         }
+        return madvised;
+    }
+
+    /// Unpublish one evicted slot and account the cache eviction. The mapping
+    /// and its no-copy device buffer stay valid for the next occupant.
+    fn decommitCompactSlot(
+        self: *MetalCompute,
+        state: *gpu_hosted_store_mod.CompactRuntimeState,
+        layer_index: usize,
+        local_slot: usize,
+    ) bool {
+        const madvised = self.reclaimCompactSlotBacking(state, layer_index, local_slot);
         state.evictions +|= 1;
         return madvised;
     }
@@ -3724,11 +3785,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self: *MetalCompute,
         state: *gpu_hosted_store_mod.CompactRuntimeState,
         victims: []const gpu_hosted_store_mod.CompactSlotRef,
-    ) void {
+    ) !void {
         if (victims.len == 0) return;
         const timing = getenvBool("ANTFLY_GEMMA4_COMPACT_TIMING");
         if (!timing) {
-            for (victims) |victim| _ = self.decommitCompactSlot(state, victim.layer, victim.slot);
+            for (victims) |victim| {
+                _ = self.decommitCompactSlot(state, victim.layer, victim.slot);
+                try state.cache.finalizeEviction(victim);
+            }
             return;
         }
         const runtime = self.provider_impl.raw_decode_runtime;
@@ -3745,6 +3809,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var madvised_slots: usize = 0;
         for (victims) |victim| {
             if (self.decommitCompactSlot(state, victim.layer, victim.slot)) madvised_slots += 1;
+            try state.cache.finalizeEviction(victim);
         }
         _ = state.ledger.samplePressure();
         const footprint_after = state.ledger.snapshot().observed_footprint_bytes;
@@ -3812,6 +3877,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (released > 0) self.compact_pool_trims +|= 1;
     }
 
+    fn sampleCompactPressure(
+        state: *gpu_hosted_store_mod.CompactRuntimeState,
+    ) !gpu_hosted_store_mod.CompactBudgetPressure {
+        const pressure = state.ledger.samplePressure();
+        const snapshot = state.ledger.snapshot();
+        if (snapshot.sampler_required and !snapshot.sampler_available) {
+            return error.CompactPressureSamplerUnavailable;
+        }
+        return pressure;
+    }
+
     /// React to residency pressure before growing the cache: soft pressure
     /// first drops transient device pools, then evicts and decommits cold
     /// experts (downshifting the automatic slot tier when that is not
@@ -3821,24 +3897,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self: *MetalCompute,
         state: *gpu_hosted_store_mod.CompactRuntimeState,
     ) !void {
-        if (state.ledger.samplePressure() == .ok) return;
+        if (try sampleCompactPressure(state) == .ok) return;
         // Transient pools are pure reuse caches: dropping them costs a later
         // reallocation but no model state, so they go before any expert
         // eviction.
         self.trimTransientDevicePools();
-        if (state.ledger.samplePressure() == .ok) return;
+        if (try sampleCompactPressure(state) == .ok) return;
         var rounds: usize = 0;
         while (rounds < compact_expert_layer_count * compact_expert_slot_capacity) : (rounds += 1) {
             var evicted: [8]gpu_hosted_store_mod.CompactSlotRef = undefined;
             const count = state.cache.collectEvictions(evicted[0..]);
-            self.decommitCompactSlotBatch(state, evicted[0..count]);
-            if (state.ledger.samplePressure() == .ok) return;
+            try self.decommitCompactSlotBatch(state, evicted[0..count]);
+            if (try sampleCompactPressure(state) == .ok) return;
             if (count == 0) break;
         }
-        if (state.ledger.samplePressure() != .hard) return;
+        if (try sampleCompactPressure(state) != .hard) return;
         // Automatic slot selection may downshift once per pressure event
         // before the session gives up: a monotonic three-quarters step with
-        // a floor of four slots (top-8 routing still needs a resident
+        // a floor of eight slots (one complete top-8 route must remain
         // working set). Only stranded above-count slots are drained so
         // in-count contents survive.
         if (self.data.compact) |config| {
@@ -3855,9 +3931,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     while (true) {
                         const count = state.cache.collectStranded(stranded[0..]);
                         if (count == 0) break;
-                        self.decommitCompactSlotBatch(state, stranded[0..count]);
+                        try self.decommitCompactSlotBatch(state, stranded[0..count]);
                     }
-                    if (state.ledger.samplePressure() != .hard) return;
+                    if (try sampleCompactPressure(state) != .hard) return;
                 }
             }
         }
@@ -4009,7 +4085,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 @min(@as(usize, 8), @max(@as(usize, 1), reader_count)),
             );
             for (pending.miss_plan_positions[0..pending.miss_count]) |position| {
-                state.cache.noteLoading(pending.plan.entries[position].ref) catch {};
+                try state.cache.noteLoading(pending.plan.entries[position].ref);
             }
         }
         return pending;
@@ -4041,7 +4117,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (!(try self.prepareResidentExpertSlot(state, request, entry.ref.layer, entry.ref.slot))) {
                 return false;
             }
-            state.cache.commitResident(entry.ref) catch return false;
+            try state.cache.commitResident(entry.ref);
             pending.committed_misses = miss_index + 1;
         }
         return true;
@@ -4138,8 +4214,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     const CompactDeviceRoutingMode = enum { off, full, partial };
 
     /// Test env override of the device-routing policy: ANTFLY_GEMMA4_DEVICE_ROUTING
-    /// = off|full|partial. Null when unset or unrecognized.
-    fn deviceRoutingEnvOverride() ?CompactDeviceRoutingMode {
+    /// = off|full|partial. Invalid non-empty values fail closed instead of
+    /// silently changing the production route.
+    fn deviceRoutingEnvOverride() !?CompactDeviceRoutingMode {
         if (comptime @import("builtin").os.tag == .freestanding) return null;
         const c = @cImport(@cInclude("stdlib.h"));
         const value = c.getenv("ANTFLY_GEMMA4_DEVICE_ROUTING") orelse return null;
@@ -4147,15 +4224,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (std.ascii.eqlIgnoreCase(slice, "off")) return .off;
         if (std.ascii.eqlIgnoreCase(slice, "full")) return .full;
         if (std.ascii.eqlIgnoreCase(slice, "partial")) return .partial;
-        return null;
+        return error.InvalidCompactDeviceRoutingOverride;
     }
 
     /// Resolve the effective device-routing mode. The test env override wins,
     /// then the legacy ANTFLY_GEMMA4_DEVICE_MOE full switch, then the frozen
     /// contract's `device_routing` (auto = full at the 128-slot tier, else
     /// partial). Default off keeps the streamed executor.
-    fn compactDeviceRoutingMode(self: *MetalCompute) CompactDeviceRoutingMode {
-        if (deviceRoutingEnvOverride()) |mode| return mode;
+    fn compactDeviceRoutingMode(self: *MetalCompute) !CompactDeviceRoutingMode {
+        if (try deviceRoutingEnvOverride()) |mode| return mode;
         if (getenvBool("ANTFLY_GEMMA4_DEVICE_MOE")) return .full;
         if (self.data.compact) |config| {
             return switch (config.device_routing) {
@@ -4173,8 +4250,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return .off;
     }
 
-    fn compactPartialDeviceRoutingEnabled(self: *MetalCompute) bool {
-        return self.compactDeviceRoutingMode() == .partial;
+    fn compactPartialDeviceRoutingEnabled(self: *MetalCompute) !bool {
+        return (try self.compactDeviceRoutingMode()) == .partial;
+    }
+
+    fn compactFullRoutingRequired(self: *const MetalCompute) bool {
+        return if (self.data.compact) |config| config.device_routing == .full else false;
     }
 
     const CompactFullArenaGeometry = struct {
@@ -4200,29 +4281,131 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
     }
 
-    fn releaseFailedFullLayerArena(
-        state: *gpu_hosted_store_mod.CompactRuntimeState,
-        full: *gpu_hosted_store_mod.CompactLayerFullArena,
-    ) void {
-        // Only safe before publication: a published arena backs a live
-        // no-copy device buffer and must stay mapped for the session.
-        std.debug.assert(!full.published);
-        if (full.arena) |*arena| arena.deinit();
-        full.arena = null;
-        if (full.charged_bytes != 0) {
-            state.ledger.release(.expert_pages, full.charged_bytes);
-            full.charged_bytes = 0;
+    fn compactFullLayoutMatches(
+        layout: *const tensor_store_mod.QuantizedExpertLayout,
+        request: *const ops.RunMoeBlockRequest,
+        geometry: CompactFullArenaGeometry,
+    ) bool {
+        const expected_offsets = [3]usize{ 0, geometry.gate_bytes, geometry.gate_bytes * 2 };
+        var matches = layout.encoded_bytes == geometry.per_expert;
+        for (layout.descriptors, 0..) |descriptor, index| {
+            const is_down = index == 2;
+            matches = matches and
+                descriptor.byte_offset == expected_offsets[index] and
+                descriptor.byte_len == (if (is_down) geometry.down_bytes else geometry.gate_bytes) and
+                descriptor.rows == (if (is_down) request.hidden_size else request.inter_size) and
+                descriptor.cols == (if (is_down) request.inter_size else request.hidden_size) and
+                metal_runtime.quantizedRuntimeLinearKind(&layout.projections[index]) == .q4_0;
         }
-        full.failed = true;
+        return matches;
     }
 
-    /// Load and publish the full-residency arena for one layer: every expert
-    /// read once (bounded parallel preads through the shared expert loader)
-    /// into a single page-aligned anonymous arena, charged whole to the
-    /// .expert_pages ledger, then published as one no-copy buffer plus the
-    /// expert byte-offset table. Only qualifies when the budget-derived slot
-    /// tier already covers the whole expert set. Any failure marks the layer
-    /// so the per-slot streaming route serves it without further retries.
+    const compact_full_load_batch_experts: usize = 8;
+
+    /// Full-layer publication mutates runtime pointers and cache-owned pages,
+    /// so every mutation boundary first drains any active/submitted frame.
+    /// The normal first-token full-load path may pay this once per newly
+    /// loaded layer; already-published steady-state layers do not drain.
+    fn drainCompactFullMutation(self: *MetalCompute) !void {
+        const runtime = self.provider_impl.raw_decode_runtime orelse
+            return error.CompactFullResidencyUnavailable;
+        if (metal_runtime.hasActiveFrame(runtime)) {
+            var active = true;
+            try self.submitAndWaitDecoderRuntimeFrame(runtime, &active);
+        }
+        if (metal_runtime.hasSubmittedFrame(runtime)) {
+            try metal_runtime.waitFrame(runtime);
+            try self.flushPendingPrefillKvDeviceSeeds();
+        }
+        if (metal_runtime.hasActiveFrame(runtime) or metal_runtime.hasSubmittedFrame(runtime)) {
+            return error.CompactFullResidencyDrainFailed;
+        }
+    }
+
+    /// Roll back one not-yet-published full-layer plan. Hits predate the
+    /// transaction and only lose their plan pin. Every miss is discarded and
+    /// reclaimed, including misses already committed before a later layout or
+    /// whole-layer publication failure.
+    fn rollbackCompactFullLayerPlan(
+        self: *MetalCompute,
+        state: *gpu_hosted_store_mod.CompactRuntimeState,
+        layer_index: usize,
+        plan: *const gpu_hosted_store_mod.CompactFullResidencyPlan,
+        committed: *const [compact_expert_slot_capacity]bool,
+    ) void {
+        if (!metal_runtime.decoderRuntimeResetMoeLayerArena(self.provider_impl, layer_index)) {
+            // Fail safe: retaining cache pins and committed pages is a leak,
+            // but reclaiming storage while Metal might still expose the arena
+            // would be a use-after-decommit. Leave ownership intact for
+            // session teardown; an enforcing caller will fail, while an
+            // automatic route can attempt its normal streamed fallback.
+            std.log.err(
+                "compact full rollback could not unpublish layer arena: layer={d}",
+                .{layer_index},
+            );
+            return;
+        }
+        for (plan.slice(), 0..) |ref, expert| {
+            if (!plan.needs_load[expert]) {
+                state.cache.releaseEntry(ref);
+                continue;
+            }
+            if (committed[expert]) {
+                if (!state.cache.discardSolePinnedResident(ref)) {
+                    std.log.err(
+                        "compact full rollback refused resident slot: layer={d} slot={d} generation={d}",
+                        .{ ref.layer, ref.slot, ref.generation },
+                    );
+                    continue;
+                }
+            } else {
+                state.cache.releaseFailed(ref);
+            }
+            _ = self.reclaimCompactSlotBacking(state, layer_index, expert);
+        }
+    }
+
+    /// Tear down every successfully published full layer after a later load,
+    /// pressure, or execution failure. Device work is drained first; runtime
+    /// arenas are unpublished before their generation-checked cache pins and
+    /// backing pages are released.
+    fn rollbackCompactFullResidency(
+        self: *MetalCompute,
+        state: *gpu_hosted_store_mod.CompactRuntimeState,
+    ) !void {
+        try self.drainCompactFullMutation();
+        var invariant_failed = false;
+        for (0..compact_expert_layer_count) |layer_index| {
+            const full = state.fullArenaAt(layer_index);
+            if (!full.published) continue;
+            if (!metal_runtime.decoderRuntimeResetMoeLayerArena(self.provider_impl, layer_index)) {
+                invariant_failed = true;
+                continue;
+            }
+            if (full.pins_held) {
+                for (0..full.expert_count) |expert| {
+                    const ref = gpu_hosted_store_mod.CompactSlotRef{
+                        .layer = @intCast(layer_index),
+                        .slot = @intCast(expert),
+                        .generation = full.slot_generations[expert],
+                    };
+                    if (!state.cache.discardSolePinnedResident(ref)) {
+                        invariant_failed = true;
+                        continue;
+                    }
+                    _ = self.reclaimCompactSlotBacking(state, layer_index, expert);
+                }
+            }
+            full.* = .{ .failed = true };
+        }
+        if (invariant_failed) return error.CompactFullResidencyRollbackInvariant;
+    }
+
+    /// Load and publish the full-residency view for one layer using the same
+    /// pool that backs streamed and partial routing. The cache is atomically
+    /// converted to identity order, missing experts are loaded into their
+    /// canonical slots, and the plan pins remain held for the session so
+    /// pressure eviction cannot invalidate the device arena.
     fn ensureCompactFullLayerArena(
         self: *MetalCompute,
         state: *gpu_hosted_store_mod.CompactRuntimeState,
@@ -4235,6 +4418,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (num_experts == 0 or num_experts > compact_expert_slot_capacity) return false;
         const full = state.fullArenaAt(layer_index);
         if (full.published) {
+            // One process-footprint sample per steady-state token bounds KV
+            // and backend growth without adding a syscall to all 30 layers.
+            if (layer_index == 0) try self.enforceCompactPressure(state);
             return full.expert_count == num_experts and
                 metal_runtime.decoderRuntimeMoeLayerArenaPrepared(
                     self.provider_impl,
@@ -4245,115 +4431,179 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 );
         }
         if (full.failed) return false;
-        // Full residency only: the active slot tier (and any explicit
-        // contract) must cover the entire expert set, otherwise the arena
-        // would exceed what the budget derived for this session.
+        if (!poolArenaEnabled()) return false;
         if (state.cache.activeSlots() != num_experts) return false;
         if (self.data.compact) |config| {
             if (@as(usize, config.expert_cache_slots) != num_experts) return false;
         }
         const geometry = compactFullArenaGeometry(request) orelse return false;
-        const total_bytes = geometry.per_expert * num_experts;
-        const arena_bytes = std.mem.alignForward(usize, total_bytes, compact_expert_arena_alignment);
-        if (arena_bytes > std.math.maxInt(u32)) {
+        if (compact_expert_arena_bytes > std.math.maxInt(u32) / num_experts) {
             full.failed = true;
             return false;
         }
 
-        if (full.arena == null) {
-            state.ledger.reserve(.expert_pages, arena_bytes) catch {
-                full.failed = true;
-                return false;
-            };
-            full.charged_bytes = arena_bytes;
-            var arena = c_file.MmapRegion.initAnonymous(arena_bytes) catch {
-                releaseFailedFullLayerArena(state, full);
-                return false;
-            };
-            arena.adviseRandom();
-            full.arena = arena;
+        // Prior full layers may be referenced by the open decode-step frame.
+        // Drain once before mutating this new layer so both local and global
+        // rollback can safely unpublish no-copy buffers and decommit pages.
+        try self.drainCompactFullMutation();
+        try self.enforceCompactPressure(state);
+        if (state.cache.activeSlots() != num_experts) {
+            full.failed = true;
+            return false;
         }
 
+        var residency_plan = state.cache.planFullResidency(layer_index, num_experts) catch return false;
+        var committed = [_]bool{false} ** compact_expert_slot_capacity;
+        var retain_plan_pins = false;
+        defer if (!retain_plan_pins)
+            self.rollbackCompactFullLayerPlan(
+                state,
+                layer_index,
+                &residency_plan,
+                &committed,
+            );
+        errdefer full.failed = true;
+
+        const pool = try self.ensureCompactLayerPool(state, layer_index);
         const compact_timing = getenvBool("ANTFLY_GEMMA4_COMPACT_TIMING");
         const load_started_at = if (compact_timing) monotonicNowNs() else 0;
-        const arena_data = full.arena.?.data;
-        const requests = try self.allocator.alloc(gpu_hosted_store_mod.ResidentExpertLoadRequest, num_experts);
-        defer self.allocator.free(requests);
+        var load_experts: [compact_expert_slot_capacity]u16 = undefined;
+        var request_count: usize = 0;
         for (0..num_experts) |expert| {
-            const entries = self.compactMoeExpertEntries(layer_index, @intCast(expert)) orelse {
-                releaseFailedFullLayerArena(state, full);
-                return false;
-            };
-            requests[expert] = .{
-                .entries = entries,
-                .destination = arena_data[expert * geometry.per_expert ..][0..geometry.per_expert],
-            };
+            if (!residency_plan.needs_load[expert]) continue;
+            load_experts[request_count] = @intCast(expert);
+            request_count += 1;
         }
-        const layouts = try self.allocator.alloc(?tensor_store_mod.QuantizedExpertLayout, num_experts);
-        defer {
-            for (layouts) |*layout| if (layout.*) |*value| value.deinit();
-            self.allocator.free(layouts);
-        }
-        @memset(layouts, null);
         const reader_count: usize = if (self.data.compact) |config| config.io_workers else 4;
-        gpu_hosted_store_mod.loadResidentExpertLayoutsParallel(
-            self.data,
-            requests,
-            layouts,
-            @min(@as(usize, 8), @max(@as(usize, 1), reader_count)),
-        ) catch {
-            releaseFailedFullLayerArena(state, full);
-            return false;
-        };
+        var load_cursor: usize = 0;
+        while (load_cursor < request_count) {
+            const batch_count = @min(compact_full_load_batch_experts, request_count - load_cursor);
+            try self.enforceCompactPressure(state);
 
-        // The kernels assume one uniform projection layout across experts.
-        const expected_offsets = [3]usize{ 0, geometry.gate_bytes, geometry.gate_bytes * 2 };
-        for (layouts) |*maybe_layout| {
-            const layout = if (maybe_layout.*) |*value| value else {
-                releaseFailedFullLayerArena(state, full);
-                return false;
-            };
-            var layout_ok = layout.encoded_bytes == geometry.per_expert;
-            for (layout.descriptors, 0..) |descriptor, index| {
-                const is_down = index == 2;
-                const expected_len = if (is_down) geometry.down_bytes else geometry.gate_bytes;
-                const expected_rows = if (is_down) request.hidden_size else request.inter_size;
-                const expected_cols = if (is_down) request.inter_size else request.hidden_size;
-                layout_ok = layout_ok and
-                    descriptor.byte_offset == expected_offsets[index] and
-                    descriptor.byte_len == expected_len and
-                    descriptor.rows == expected_rows and
-                    descriptor.cols == expected_cols and
-                    metal_runtime.quantizedRuntimeLinearKind(&layout.projections[index]) == .q4_0;
+            var growth_bytes: u64 = 0;
+            for (load_experts[load_cursor..][0..batch_count]) |expert_u16| {
+                const expert: usize = expert_u16;
+                if (!state.arenaAt(layer_index, expert).present) {
+                    growth_bytes +|= @as(u64, @intCast(compact_expert_arena_bytes));
+                }
             }
-            if (!layout_ok) {
-                releaseFailedFullLayerArena(state, full);
-                return false;
+            try state.ledger.admitGrowthWithinReserve(growth_bytes);
+
+            var requests: [compact_full_load_batch_experts]gpu_hosted_store_mod.ResidentExpertLoadRequest = undefined;
+            var layouts = [_]?tensor_store_mod.QuantizedExpertLayout{null} ** compact_full_load_batch_experts;
+            defer for (layouts[0..batch_count]) |*layout| {
+                if (layout.*) |*value| value.deinit();
+            };
+
+            for (0..batch_count) |batch_index| {
+                const expert: usize = load_experts[load_cursor + batch_index];
+                const arena_state = state.arenaAt(layer_index, expert);
+                if (arena_state.layout) |*stale| stale.deinit();
+                arena_state.layout = null;
+                const offset = expert * compact_expert_arena_bytes;
+                if (!arena_state.present) {
+                    try state.ledger.reserve(.expert_pages, compact_expert_arena_bytes);
+                    pool.recommitRange(offset, compact_expert_arena_bytes);
+                    arena_state.present = true;
+                    arena_state.decommitted = false;
+                }
+                const entries = self.compactMoeExpertEntries(layer_index, @intCast(expert)) orelse {
+                    full.failed = true;
+                    return false;
+                };
+                requests[batch_index] = .{
+                    .entries = entries,
+                    .destination = pool.data[offset..][0..compact_expert_arena_bytes],
+                };
+                try state.cache.noteLoading(residency_plan.refs[expert]);
+            }
+
+            try gpu_hosted_store_mod.loadResidentExpertLayoutsParallel(
+                self.data,
+                requests[0..batch_count],
+                layouts[0..batch_count],
+                @min(batch_count, @max(@as(usize, 1), reader_count)),
+            );
+            for (0..batch_count) |batch_index| {
+                const expert: usize = load_experts[load_cursor + batch_index];
+                const layout = layouts[batch_index] orelse
+                    return error.CompactFullResidencyLayoutMissing;
+                if (!compactFullLayoutMatches(&layout, request, geometry)) {
+                    return error.CompactFullResidencyLayoutMismatch;
+                }
+                const arena_state = state.arenaAt(layer_index, expert);
+                arena_state.layout = layout;
+                layouts[batch_index] = null;
+                if (!(try self.prepareResidentExpertSlot(state, request, layer_index, expert))) {
+                    return error.CompactFullResidencyPublicationFailed;
+                }
+                try state.cache.commitResident(residency_plan.refs[expert]);
+                committed[expert] = true;
+                self.resident_expert_load_bytes +|= arena_state.layout.?.encoded_bytes;
+            }
+            try self.enforceCompactPressure(state);
+            load_cursor += batch_count;
+        }
+
+        // Hits and freshly loaded slots must all expose the same qualified
+        // projection layout before the whole pool is published.
+        const expected_offsets = [3]usize{ 0, geometry.gate_bytes, geometry.gate_bytes * 2 };
+        for (0..num_experts) |expert| {
+            const layout = if (state.arenaAt(layer_index, expert).layout) |*value| value else {
+                return error.CompactFullResidencyLayoutMissing;
+            };
+            if (!compactFullLayoutMatches(layout, request, geometry)) {
+                return error.CompactFullResidencyLayoutMismatch;
             }
         }
-        self.resident_expert_load_bytes +|= @intCast(total_bytes);
 
         const offsets = try self.allocator.alloc(u32, num_experts);
         defer self.allocator.free(offsets);
-        for (offsets, 0..) |*value, expert| value.* = @intCast(expert * geometry.per_expert);
-        const published = metal_runtime.decoderRuntimePrepareMoeQ40LayerArena(
+        for (offsets, 0..) |*value, expert| value.* = @intCast(expert * compact_expert_arena_bytes);
+        var published = metal_runtime.decoderRuntimeMoeLayerArenaPrepared(
             self.provider_impl,
             layer_index,
-            arena_data,
-            offsets,
-            geometry.per_expert,
-            expected_offsets,
+            num_experts,
             request.hidden_size,
             request.inter_size,
-        ) catch false;
+        );
+        if (published) {
+            for (offsets, 0..) |offset, expert| {
+                if (!metal_runtime.decoderRuntimeMoeLayerArenaSetOffset(
+                    self.provider_impl,
+                    layer_index,
+                    expert,
+                    offset,
+                )) {
+                    published = false;
+                    break;
+                }
+            }
+        } else {
+            published = try metal_runtime.decoderRuntimePrepareMoeQ40LayerArena(
+                self.provider_impl,
+                layer_index,
+                pool.data,
+                offsets,
+                compact_expert_arena_bytes,
+                expected_offsets,
+                request.hidden_size,
+                request.inter_size,
+            );
+        }
         if (!published) {
-            releaseFailedFullLayerArena(state, full);
+            full.failed = true;
             return false;
         }
-        full.expert_stride = geometry.per_expert;
+        full.expert_stride = compact_expert_arena_bytes;
         full.projection_offsets = expected_offsets;
         full.expert_count = num_experts;
         full.published = true;
+        full.pins_held = true;
+        for (residency_plan.slice(), 0..) |ref, expert| {
+            full.slot_generations[expert] = ref.generation;
+        }
+        retain_plan_pins = true;
         self.resident_expert_whole_publications +|= 1;
         if (compact_timing) {
             std.debug.print(
@@ -4361,7 +4611,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .{
                     layer_index,
                     num_experts,
-                    total_bytes,
+                    num_experts * compact_expert_arena_bytes,
                     (monotonicNowNs() - load_started_at) / std.time.ns_per_ms,
                 },
             );
@@ -4375,13 +4625,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// ANTFLY_GEMMA4_DEVICE_MOE switch, an explicit device_routing=full contract,
     /// or device_routing=auto at the 128-slot residency tier. Any not-ready
     /// condition falls through to the streamed/partial route.
-    fn tryBeginCompactDeviceMoe(self: *MetalCompute, request: *const ops.RunMoeBlockRequest) bool {
+    fn tryBeginCompactDeviceMoe(self: *MetalCompute, request: *const ops.RunMoeBlockRequest) !bool {
         if (request.total != 1) return false;
         if (request.top_k == 0 or request.top_k > 8) return false;
         const state = self.data.compact_runtime orelse return false;
         if (!self.provider_impl.hasDecoderRuntime()) return false;
-        const ready = self.ensureCompactFullLayerArena(state, request) catch false;
-        if (!ready) return false;
+        const ready = self.ensureCompactFullLayerArena(state, request) catch |err| {
+            try self.rollbackCompactFullResidency(state);
+            return err;
+        };
+        if (!ready) {
+            try self.rollbackCompactFullResidency(state);
+            return false;
+        }
         self.pending_compact_device_moe_layer = request.layer_index;
         return true;
     }
@@ -4564,12 +4820,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
 
         const joined_step_frame = self.decode_step_frame_active and metal_runtime.hasActiveFrame(runtime);
+        if (joined_step_frame and !self.compactFrameHasCapacity(pending.plan.count)) {
+            return error.CompactMoeFramePinCapacityExceeded;
+        }
+        var route_use = try CompactRouteUseGuard.acquire(pending);
+        defer route_use.releaseNoFail();
         var frame_active = if (joined_step_frame) false else try self.beginDecoderRuntimeFrame(runtime);
         if (!joined_step_frame and !frame_active) return null;
         defer self.cancelDecoderRuntimeFrame(runtime, &frame_active);
-
-        for (pending.plan.slice()) |entry| pending.state.cache.beginUse(entry.ref) catch {};
-        defer for (pending.plan.slice()) |entry| pending.state.cache.endUse(entry.ref) catch {};
 
         var output = (try metal_runtime.decoderRuntimeMoeForwardQ40FromIds(
             self.provider_impl,
@@ -4594,6 +4852,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // step frame) so both outputs are host-readable. Never changes tokens.
         if (!joined_step_frame and getenvBool("ANTFLY_GEMMA4_DEVICE_ROUTING_VERIFY")) {
             self.verifyCompactPartialDeviceRoute(request, pending, input_device, &output) catch {};
+        }
+        if (joined_step_frame) {
+            try self.transferCompactRouteUsesToFrame(pending, &route_use);
+        } else {
+            try route_use.release();
+            pending.releaseAfterExecution();
         }
         if (compact_timing) {
             std.debug.print(
@@ -4840,8 +5104,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (!succeeded) self.resident_expert_fused_frame_fallbacks +|= 1;
         }
 
-        for (pending.plan.slice()) |entry| pending.state.cache.beginUse(entry.ref) catch {};
-        defer for (pending.plan.slice()) |entry| pending.state.cache.endUse(entry.ref) catch {};
+        var route_use = try CompactRouteUseGuard.acquire(pending);
+        defer route_use.releaseNoFail();
 
         var inputs_device: [8]?MetalTensor = [_]?MetalTensor{null} ** 8;
         defer for (&inputs_device) |*tensor| if (tensor.*) |*value| value.deinit();
@@ -4937,6 +5201,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 );
             }
         }
+        try route_use.release();
+        pending.releaseAfterExecution();
         self.resident_expert_fused_frame_successes +|= 1;
         succeeded = true;
         return true;
@@ -5099,10 +5365,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // flush, the CPU route selection, and the per-slot residency plan
         // below are all skipped for this layer. Partial-residency device
         // routing keeps the CPU route source and branches in finish instead.
-        if (!self.compact_device_moe_bypass and self.compactDeviceRoutingMode() == .full and
-            self.tryBeginCompactDeviceMoe(request))
-        {
-            return true;
+        if (!self.compact_device_moe_bypass and (try self.compactDeviceRoutingMode()) == .full) {
+            if (try self.tryBeginCompactDeviceMoe(request)) return true;
+            if (self.compactFullRoutingRequired()) return error.CompactFullResidencyUnavailable;
         }
 
         const compact_timing = getenvBool("ANTFLY_GEMMA4_COMPACT_TIMING");
@@ -5148,13 +5413,28 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (self.pending_compact_device_moe_layer) |device_layer| {
             self.pending_compact_device_moe_layer = null;
+            var full_rolled_back = false;
             if (device_layer == request.layer_index) {
-                if (self.runCompactDeviceMoeRow(request) catch null) |output| {
+                const device_output = self.runCompactDeviceMoeRow(request) catch |err| blk: {
+                    if (self.data.compact_runtime) |state| {
+                        try self.rollbackCompactFullResidency(state);
+                        full_rolled_back = true;
+                    }
+                    if (self.compactFullRoutingRequired()) return err;
+                    break :blk null;
+                };
+                if (device_output) |output| {
                     var owned = output;
                     errdefer owned.deinit();
                     return try self.ctFromOwnedMetalTensor(owned);
                 }
             }
+            if (!full_rolled_back) {
+                if (self.data.compact_runtime) |state| {
+                    try self.rollbackCompactFullResidency(state);
+                }
+            }
+            if (self.compactFullRoutingRequired()) return error.CompactFullDeviceExecutionFailed;
             // The device route failed after begin accepted it (or the finish
             // request does not match). Replay the whole begin/finish pair on
             // the per-slot streaming route; the bypass flag keeps the replay
@@ -5191,7 +5471,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // repaired slot is never encoded against a stale/sentinel table entry.
         // Joined to the decode-step frame; any not-ready condition falls
         // through to the streamed path below.
-        if (self.compactPartialDeviceRoutingEnabled()) {
+        if (try self.compactPartialDeviceRoutingEnabled()) {
             if (try self.tryFinishCompactPartialDeviceRoute(request, &pending, compact_timing)) |ct| {
                 return ct;
             }
@@ -5215,8 +5495,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             null;
         defer if (expert_scales) |scales| self.allocator.free(scales);
 
-        for (pending.plan.slice()) |entry| pending.state.cache.beginUse(entry.ref) catch {};
-        defer for (pending.plan.slice()) |entry| pending.state.cache.endUse(entry.ref) catch {};
+        const runtime = self.provider_impl.raw_decode_runtime;
+        const joined_step_frame = self.decode_step_frame_active and metal_runtime.hasActiveFrame(runtime);
+        if (joined_step_frame and !self.compactFrameHasCapacity(pending.plan.count)) {
+            if (mandatory) return error.CompactMoeFramePinCapacityExceeded;
+            return null;
+        }
+        var route_use = CompactRouteUseGuard.acquire(&pending) catch |err| {
+            if (mandatory) return err;
+            return null;
+        };
+        defer route_use.releaseNoFail();
         var output = (try self.runCompactMoeRowPrepared(
             request,
             input_device,
@@ -5233,6 +5522,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return null;
         };
         errdefer output.deinit();
+        if (joined_step_frame) {
+            try self.transferCompactRouteUsesToFrame(&pending, &route_use);
+        } else {
+            try route_use.release();
+            pending.releaseAfterExecution();
+        }
         return self.ctFromOwnedMetalTensor(output);
     }
 
@@ -20895,6 +21190,51 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.clearPendingPrefillKvDeviceSeeds();
     }
 
+    fn compactFrameHasCapacity(self: *const MetalCompute, additional: usize) bool {
+        return additional <= self.compact_frame_slot_refs.len -| self.compact_frame_slot_ref_count;
+    }
+
+    /// Move execution pins from a route-local guard to the token frame. The
+    /// route's plan pins can then be released immediately while the separate
+    /// in-flight pins remain held through the command-buffer fence.
+    fn transferCompactRouteUsesToFrame(
+        self: *MetalCompute,
+        pending: *PendingCompactMoeRoute,
+        guard: *CompactRouteUseGuard,
+    ) !void {
+        if (!self.compactFrameHasCapacity(guard.count)) return error.CompactMoeFramePinCapacityExceeded;
+        @memcpy(
+            self.compact_frame_slot_refs[self.compact_frame_slot_ref_count..][0..guard.count],
+            guard.refs[0..guard.count],
+        );
+        self.compact_frame_slot_ref_count += guard.count;
+        guard.count = 0;
+        pending.releaseAfterExecution();
+    }
+
+    fn releaseCompactFrameUses(self: *MetalCompute) !void {
+        var failed = false;
+        while (self.compact_frame_slot_ref_count != 0) {
+            self.compact_frame_slot_ref_count -= 1;
+            const ref = self.compact_frame_slot_refs[self.compact_frame_slot_ref_count];
+            const state = self.data.compact_runtime orelse {
+                failed = true;
+                continue;
+            };
+            state.cache.endUse(ref) catch |err| {
+                failed = true;
+                std.log.err("compact frame pin release failed: {s}", .{@errorName(err)});
+            };
+        }
+        if (failed) return error.CompactMoeFramePinReleaseFailed;
+    }
+
+    fn releaseCompactFrameUsesNoFail(self: *MetalCompute) void {
+        self.releaseCompactFrameUses() catch |err| {
+            std.log.err("compact frame pin cleanup failed: {s}", .{@errorName(err)});
+        };
+    }
+
     /// Token-scoped decode-step frame for the compact MoE eager path: hold
     /// one decoder-runtime frame open across a whole single-token decode
     /// step so every eager op joins one command buffer. Host readbacks
@@ -20910,6 +21250,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // and reads both back, which needs each MoE op outside the step frame.
         if (getenvBool("ANTFLY_GEMMA4_DEVICE_ROUTING_VERIFY")) return false;
         if (self.decode_step_frame_active) return false;
+        if (self.compact_frame_slot_ref_count != 0) return error.CompactMoeStaleFramePins;
         const runtime = self.provider_impl.raw_decode_runtime orelse return false;
         if (metal_runtime.hasActiveFrame(runtime) or metal_runtime.hasSubmittedFrame(runtime)) return false;
         if (!(try self.beginDecoderRuntimeFrame(runtime))) return false;
@@ -20936,9 +21277,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (!self.decode_step_frame_active) return;
         self.decode_step_frame_active = false;
-        const runtime = self.provider_impl.raw_decode_runtime orelse return;
+        const runtime = self.provider_impl.raw_decode_runtime orelse {
+            try self.releaseCompactFrameUses();
+            return;
+        };
         var active = metal_runtime.hasActiveFrame(runtime);
-        try self.submitAndWaitDecoderRuntimeFrame(runtime, &active);
+        self.submitAndWaitDecoderRuntimeFrame(runtime, &active) catch |err| {
+            self.releaseCompactFrameUsesNoFail();
+            return err;
+        };
+        try self.releaseCompactFrameUses();
         const snapshot = metal_runtime.runtimeMemorySnapshot(runtime);
         // The runtime's begin counter also increments on every flush-reopen,
         // so the per-step delta minus the step's own begin counts the
@@ -26239,6 +26587,71 @@ test "metal_compute: compact Gemma4 resident slots stay within runtime capacity"
     try std.testing.expect(last.down < MetalCompute.metal_runtime.decoder_runtime_linear_slot_capacity);
 }
 
+test "metal_compute: failed full-layer transaction reclaims committed and loading pages" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!MetalCompute.metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    if (!MetalCompute.poolArenaEnabled()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+
+    var state = gpu_hosted_store_mod.CompactRuntimeState{
+        .ledger = @import("../runtime/moe/budget_ledger.zig").ResidentBudgetLedger.init(
+            std.math.maxInt(u64),
+            0,
+        ),
+    };
+    defer state.deinitArenas();
+    state.cache.setActiveSlots(2);
+    var plan = try state.cache.planFullResidency(0, 2);
+    var committed = [_]bool{false} ** MetalCompute.compact_expert_slot_capacity;
+
+    for (plan.slice(), 0..) |ref, expert| {
+        const backing = try metal_compute.reserveCompactSlotBacking(&state, 0, expert);
+        backing[0] = @intCast(expert + 1);
+        try state.cache.noteLoading(ref);
+        if (expert == 0) {
+            try state.cache.commitResident(ref);
+            committed[expert] = true;
+        }
+    }
+    try std.testing.expectEqual(
+        @as(u64, 2 * MetalCompute.compact_expert_arena_bytes),
+        state.ledger.committedTotal(),
+    );
+
+    metal_compute.rollbackCompactFullLayerPlan(&state, 0, &plan, &committed);
+    const counts = state.cache.counts();
+    try std.testing.expectEqual(@as(usize, 0), counts.resident);
+    try std.testing.expectEqual(@as(usize, 0), counts.reserved_or_loading);
+    try std.testing.expectEqual(@as(u64, 0), state.ledger.committedTotal());
+    try std.testing.expect(!state.arenaAt(0, 0).present);
+    try std.testing.expect(!state.arenaAt(0, 1).present);
+
+    // The whole-model rollback uses retained generations to discard already
+    // published identity residents after a later-layer failure.
+    var published_plan = try state.cache.planFullResidency(0, 2);
+    for (published_plan.slice(), 0..) |ref, expert| {
+        _ = try metal_compute.reserveCompactSlotBacking(&state, 0, expert);
+        try state.cache.noteLoading(ref);
+        try state.cache.commitResident(ref);
+    }
+    const full = state.fullArenaAt(0);
+    full.published = true;
+    full.pins_held = true;
+    full.expert_count = 2;
+    for (published_plan.slice(), 0..) |ref, expert| {
+        full.slot_generations[expert] = ref.generation;
+    }
+    try metal_compute.rollbackCompactFullResidency(&state);
+    try std.testing.expectEqual(@as(u64, 0), state.ledger.committedTotal());
+    try std.testing.expect(state.fullArenaAt(0).failed);
+    try std.testing.expectEqual(@as(usize, 0), state.cache.counts().resident);
+}
+
 test "metal_compute: device MoE topk kernel matches the CPU route selector" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     const metal_runtime = MetalCompute.metal_runtime;
@@ -26351,7 +26764,7 @@ test "metal_compute: device MoE topk route selection is bit-exact to the CPU sel
         const r = logits[0 * num_experts ..][0..num_experts];
         for (r, 0..) |*v, i| v.* = -0.01 * @as(f32, @floatFromInt(i));
         const peaks = [_][2]f32{
-            .{ 11, 9.0 }, .{ 97, 8.5 }, .{ 3, 8.0 }, .{ 64, 7.5 },
+            .{ 11, 9.0 },  .{ 97, 8.5 }, .{ 3, 8.0 }, .{ 64, 7.5 },
             .{ 120, 7.0 }, .{ 42, 6.5 }, .{ 8, 6.0 }, .{ 77, 5.5 },
         };
         for (peaks) |p| r[@intFromFloat(p[0])] = p[1];
@@ -26748,6 +27161,21 @@ test "metal_compute: device MoE Q4_0 forward matches scalar reference and honors
         for (0..hidden) |i| {
             try std.testing.expectEqual(@as(f32, 0.0), output[i]);
         }
+        try std.testing.expectEqual(@as(c_int, 1), metal_runtime.termite_metal_decode_runtime_moe_q4_0_layer_arena_prepared(
+            runtime,
+            2,
+            num_experts,
+            hidden,
+            inter,
+        ));
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_reset_moe_q4_0_layer_arena(runtime, 2));
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_moe_q4_0_layer_arena_prepared(
+            runtime,
+            2,
+            num_experts,
+            hidden,
+            inter,
+        ));
     }
 }
 

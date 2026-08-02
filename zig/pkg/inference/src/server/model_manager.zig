@@ -3218,6 +3218,9 @@ pub const ModelManager = struct {
         model_dir: []const u8,
         request: backends.SessionManager.CompactRequest,
     ) !void {
+        if (self.compact_profiles.count() != 0 and !self.compact_profiles.contains(model_dir)) {
+            return error.CompactProfileRequiresExclusiveProcess;
+        }
         const key = try self.allocator.dupe(u8, model_dir);
         errdefer self.allocator.free(key);
         const entry = try self.compact_profiles.getOrPut(self.allocator, key);
@@ -3231,6 +3234,10 @@ pub const ModelManager = struct {
 
     pub fn compactProfileForDir(self: *const ModelManager, model_dir: []const u8) ?backends.SessionManager.CompactRequest {
         return self.compact_profiles.get(model_dir);
+    }
+
+    fn compactProcessAllowsModel(self: *const ModelManager, model_dir: []const u8) bool {
+        return self.compact_profiles.count() == 0 or self.compact_profiles.contains(model_dir);
     }
 
     fn loadManagedSessionWithAdmission(
@@ -3676,10 +3683,14 @@ pub const ModelManager = struct {
             request.memory_budget_mb
         else
             -1;
+        const profile_routing: i64 = if (compact_request) |request|
+            @intFromEnum(request.device_routing)
+        else
+            -1;
         const prefix = try std.fmt.allocPrint(
             self.allocator,
-            "{d}:{s}:{d}:compact={d}:budget={d}:",
-            .{ model_dir.len, model_dir, @intFromBool(cache_default_alias), profile_slots, profile_budget },
+            "{d}:{s}:{d}:compact={d}:budget={d}:routing={d}:",
+            .{ model_dir.len, model_dir, @intFromBool(cache_default_alias), profile_slots, profile_budget, profile_routing },
         );
         defer self.allocator.free(prefix);
         const key = try self.allocator.alloc(u8, prefix.len + preferred_backends.len);
@@ -3751,6 +3762,7 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
     ) !ModelHandle {
+        if (!self.compactProcessAllowsModel(model_dir)) return error.CompactProfileRequiresExclusiveProcess;
         const flight_key = try self.loadFlightKey(model_dir, preferred_backends, cache_default_alias);
         defer self.allocator.free(flight_key);
 
@@ -4183,12 +4195,13 @@ fn backendVariantCacheKeyWithProfile(
     backend: backends.BackendType,
 ) ![]u8 {
     if (self.compactProfileForDir(model_dir)) |request| {
-        return std.fmt.allocPrint(allocator, "{s}\nbackend={s}\nmemory_profile={s}\nmemory_budget_mb={d}\nexpert_cache_slots={d}", .{
+        return std.fmt.allocPrint(allocator, "{s}\nbackend={s}\nmemory_profile={s}\nmemory_budget_mb={d}\nexpert_cache_slots={d}\ndevice_routing={s}", .{
             model_dir,
             @tagName(backend),
             @tagName(request.profile),
             request.memory_budget_mb,
             request.expert_cache_slots,
+            @tagName(request.device_routing),
         });
     }
     return backendVariantCacheKey(allocator, model_dir, backend);
@@ -4314,7 +4327,6 @@ test "prompt cache charges retained bytes to the compact ledger observer" {
     const category = @intFromEnum(runtime.moe.budget_ledger.BudgetCategory.prompt_cache_kv);
     var snap = ledger.snapshot();
     try std.testing.expectEqual(live_bytes, snap.committed_by_category[category]);
-    try std.testing.expectEqual(@as(u64, 0), snap.prompt_cache_overcommit_bytes);
 
     // Evicting every entry walks the accounting back to zero.
     var tighter = cache.config;
@@ -4325,7 +4337,7 @@ test "prompt cache charges retained bytes to the compact ledger observer" {
     try std.testing.expectEqual(@as(u64, 0), snap.committed_by_category[category]);
 }
 
-test "prompt cache observer reports overcommit when the compact ceiling is tiny" {
+test "prompt cache skips retention when the compact ceiling rejects growth" {
     const allocator = std.testing.allocator;
     var ledger = runtime.moe.budget_ledger.ResidentBudgetLedger.init(16, 0);
     var cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
@@ -4353,14 +4365,13 @@ test "prompt cache observer reports overcommit when the compact ceiling is tiny"
     try cache.manager.appendTokens(source_id, 2);
     try cache.storeFromSequence("agent", &.{ 1, 2 }, source_id);
 
-    // The cache keeps the entry (its own budget allows it) while the ledger
-    // stays fail-closed and surfaces the unaccounted bytes.
-    const live_bytes: u64 = @intCast(cache.stats().live_bytes);
-    try std.testing.expect(live_bytes > 16);
+    // Admission happens before retention, so generation can continue without
+    // caching and no unaccounted KV remains live.
+    try std.testing.expectEqual(@as(usize, 0), cache.stats().live_entries);
+    try std.testing.expectEqual(@as(usize, 0), cache.stats().live_bytes);
     const category = @intFromEnum(runtime.moe.budget_ledger.BudgetCategory.prompt_cache_kv);
     const snap = ledger.snapshot();
     try std.testing.expectEqual(@as(u64, 0), snap.committed_by_category[category]);
-    try std.testing.expectEqual(live_bytes, snap.prompt_cache_overcommit_bytes);
     try std.testing.expect(snap.hard_limit_rejections >= 1);
 }
 
@@ -4374,8 +4385,9 @@ test "rebalance resolves the ledger observer per model" {
     }
 
     const NodeProbe = struct {
-        fn update(_: *anyopaque, current: *u64, next: u64) void {
+        fn update(_: *anyopaque, current: *u64, next: u64) bool {
             current.* = next;
+            return true;
         }
     };
     var compact_ledger = runtime.moe.budget_ledger.ResidentBudgetLedger.init(1 << 20, 0);

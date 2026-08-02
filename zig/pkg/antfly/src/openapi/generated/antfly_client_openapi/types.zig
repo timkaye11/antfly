@@ -4731,6 +4731,8 @@ pub const InferenceGenerateRequest = struct {
     top_p: ?f32 = null,
     /// Top-k sampling (inference extension, not in OpenAI API)
     top_k: ?i64 = null,
+    /// Optional deterministic sampling seed (inference extension)
+    seed: ?i64 = null,
     /// If true, partial message deltas will be sent as SSE events
     stream: ?bool = null,
     /// List of tools (functions) the model can call. Only supported by models with tool_call_format configured.
@@ -5027,8 +5029,10 @@ pub const InferenceModelRef = struct {
     memory_profile: ?[]const u8 = null,
     /// Total resident memory budget in MiB for the compact memory profile. The enforced footprint ceiling, the KV-cache share, and the automatic expert-cache slot count all derive from it. Omission keeps the 2048 MiB floor; values below the floor are rejected. Setting a budget without `memory_profile` implies the compact profile.
     memory_budget_mb: ?i64 = null,
-    /// Resident routed-expert cache slots per MoE layer under a compact memory profile. Omission derives the count from `memory_budget_mb`, downshifting under residency-ceiling pressure; explicit values pin it within [4, 128].
+    /// Resident routed-expert cache slots per MoE layer under a compact memory profile. Omission derives the count from `memory_budget_mb`, downshifting under residency-ceiling pressure; explicit values pin it within [8, 128].
     expert_cache_slots: ?i64 = null,
+    /// Compact Metal routed-expert policy. `off` is the conservative streamed default. `full` requires 128 resident slots and fails closed if every expert cannot be preloaded into the canonical per-layer pool. `auto` may select a lower qualified route and exposes route engagement through runtime telemetry counters.
+    device_routing: ?[]const u8 = null,
 };
 
 pub const InferenceModelsResponse = struct {

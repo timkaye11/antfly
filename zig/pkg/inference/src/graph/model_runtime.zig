@@ -215,6 +215,7 @@ pub const SamplingConfig = struct {
     repetition_penalty: f32 = 1.0,
     frequency_penalty: f32 = 0,
     presence_penalty: f32 = 0,
+    seed: ?u64 = null,
 
     pub fn isPureGreedy(self: SamplingConfig) bool {
         return self.temperature <= 0 and
@@ -426,6 +427,7 @@ pub const ForwardRequest = union(enum) {
 
 const SamplingPenaltyState = struct {
     counts: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    total_tokens: u64 = 0,
 
     fn deinit(self: *SamplingPenaltyState, allocator: std.mem.Allocator) void {
         self.counts.deinit(allocator);
@@ -441,6 +443,7 @@ const SamplingPenaltyState = struct {
         const entry = try self.counts.getOrPut(allocator, @intCast(token_id));
         if (!entry.found_existing) entry.value_ptr.* = 0;
         entry.value_ptr.* += 1;
+        self.total_tokens +|= 1;
     }
 
     fn isEmpty(self: *const SamplingPenaltyState) bool {
@@ -492,7 +495,17 @@ fn sample(logits: []const f32, config: SamplingConfig, penalty_state: *const Sam
     if (config.min_p > 0 and config.min_p < 1.0) {
         applyMinP(working, config.min_p);
     }
+    if (config.seed) |seed| {
+        return activations.sampleFromProbsSeeded(working, samplingSeed(seed, penalty_state.total_tokens));
+    }
     return activations.sampleFromProbs(working);
+}
+
+fn samplingSeed(seed: u64, ordinal: u64) u64 {
+    var mixed = seed +% (ordinal *% 0x9E3779B97F4A7C15);
+    mixed = (mixed ^ (mixed >> 30)) *% 0xBF58476D1CE4E5B9;
+    mixed = (mixed ^ (mixed >> 27)) *% 0x94D049BB133111EB;
+    return mixed ^ (mixed >> 31);
 }
 
 fn applyRepetitionPenalties(logits: []f32, penalty_state: *const SamplingPenaltyState, config: SamplingConfig) void {

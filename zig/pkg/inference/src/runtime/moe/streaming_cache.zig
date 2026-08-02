@@ -15,7 +15,7 @@
 //! Backend-neutral bookkeeping for the compact streaming routed-expert
 //! cache. This module owns slot *state* only: which expert occupies which
 //! per-layer slot, its lifecycle (empty -> reserved -> loading -> resident
-//! -> in_flight), LFU/recency accounting, generation counters, and pin
+//! -> in_flight / evicting), LFU/recency accounting, generation counters, and pin
 //! counts. Arena memory, file I/O, and device publication stay in the
 //! backend that instantiates the cache.
 //!
@@ -41,6 +41,10 @@ pub const SlotState = enum(u8) {
     resident,
     /// Resident and referenced by at least one in-flight device command.
     in_flight,
+    /// Chosen for eviction, but the backend has not yet unpublished device
+    /// views and decommitted the backing pages. The expert identity and
+    /// generation remain intact until `finalizeEviction` closes that gap.
+    evicting,
 };
 
 pub const SlotRef = struct {
@@ -88,6 +92,19 @@ pub fn StreamingExpertCache(comptime layer_count: usize, comptime slot_capacity:
 
             pub fn slice(self: *const RoutePlan) []const RoutePlanEntry {
                 return self.entries[0..self.count];
+            }
+        };
+
+        /// Atomic identity-layout plan used by the 128/128 device-resident
+        /// route. Existing identity residents are pinned as hits; every other
+        /// slot is reserved for replacement before the lock is released.
+        pub const FullResidencyPlan = struct {
+            refs: [slot_capacity]SlotRef = undefined,
+            needs_load: [slot_capacity]bool = [_]bool{false} ** slot_capacity,
+            count: usize = 0,
+
+            pub fn slice(self: *const FullResidencyPlan) []const SlotRef {
+                return self.refs[0..self.count];
             }
         };
 
@@ -160,6 +177,53 @@ pub fn StreamingExpertCache(comptime layer_count: usize, comptime slot_capacity:
             return plan;
         }
 
+        /// Reserve a whole layer in expert-id order without exposing a
+        /// partially rewritten mapping. Any pinned or transitional slot
+        /// refuses the conversion, so the caller can safely rewrite backing
+        /// bytes after this method returns.
+        pub fn planFullResidency(self: *Self, layer: usize, expert_count: usize) CacheError!FullResidencyPlan {
+            if (layer >= layer_count) return error.LayerOutOfRange;
+
+            self.lock();
+            defer self.unlock();
+            if (expert_count == 0 or expert_count > slot_capacity or expert_count != self.active_slots) {
+                return error.RouteTooWide;
+            }
+
+            for (0..expert_count) |local| {
+                const slot = &self.slots[flatIndex(layer, local)];
+                if (slot.pin_count != 0) return error.NoEvictableSlot;
+                switch (slot.state) {
+                    .empty, .resident => {},
+                    .reserved, .loading, .in_flight, .evicting => return error.NoEvictableSlot,
+                }
+            }
+
+            self.epoch += 1;
+            var plan = FullResidencyPlan{ .count = expert_count };
+            for (0..expert_count) |local| {
+                const slot = &self.slots[flatIndex(layer, local)];
+                const identity_resident = slot.state == .resident and slot.expert_index == local;
+                if (!identity_resident) {
+                    slot.state = .reserved;
+                    slot.expert_index = @intCast(local);
+                    slot.generation += 1;
+                    slot.use_count = 1;
+                    plan.needs_load[local] = true;
+                } else {
+                    slot.use_count +|= 1;
+                }
+                slot.last_access_epoch = self.epoch;
+                slot.pin_count = 1;
+                plan.refs[local] = .{
+                    .layer = @intCast(layer),
+                    .slot = @intCast(local),
+                    .generation = slot.generation,
+                };
+            }
+            return plan;
+        }
+
         fn planExpertLocked(self: *Self, layer: usize, expert: u16) CacheError!RoutePlanEntry {
             // Hit scan over the active tier.
             for (0..self.active_slots) |local| {
@@ -179,7 +243,7 @@ pub fn StreamingExpertCache(comptime layer_count: usize, comptime slot_capacity:
                     // A reserved/loading slot already owns this expert on
                     // behalf of another outstanding plan. Attaching would
                     // alias one read into two plans; refuse instead.
-                    .reserved, .loading => return error.ExpertPendingElsewhere,
+                    .reserved, .loading, .evicting => return error.ExpertPendingElsewhere,
                     .empty => {},
                 }
             }
@@ -210,7 +274,7 @@ pub fn StreamingExpertCache(comptime layer_count: usize, comptime slot_capacity:
                 switch (slot.state) {
                     .empty => return local,
                     .resident => {},
-                    .reserved, .loading, .in_flight => continue,
+                    .reserved, .loading, .in_flight, .evicting => continue,
                 }
                 if (best) |current| {
                     const current_slot = &self.slots[flatIndex(layer, current)];
@@ -316,6 +380,25 @@ pub fn StreamingExpertCache(comptime layer_count: usize, comptime slot_capacity:
             self.releaseEntryLocked(ref);
         }
 
+        /// Remove a resident slot whose sole pin is an owning full-residency
+        /// publication. The backend calls this only after draining device
+        /// work and unpublishing the whole-layer arena, immediately before it
+        /// reclaims the slot's backing pages. Returning false preserves the
+        /// slot on any invariant mismatch so cleanup can never decommit bytes
+        /// that the cache might still expose.
+        pub fn discardSolePinnedResident(self: *Self, ref: SlotRef) bool {
+            self.lock();
+            defer self.unlock();
+            const slot = self.slotPtrLocked(ref) catch return false;
+            if (slot.state != .resident or slot.pin_count != 1) return false;
+            slot.pin_count = 0;
+            slot.state = .empty;
+            slot.expert_index = invalid_expert;
+            slot.use_count = 0;
+            slot.last_access_epoch = 0;
+            return true;
+        }
+
         fn releaseEntryLocked(self: *Self, ref: SlotRef) void {
             const slot = self.slotPtrLocked(ref) catch return;
             if (slot.pin_count > 0) slot.pin_count -= 1;
@@ -325,7 +408,8 @@ pub fn StreamingExpertCache(comptime layer_count: usize, comptime slot_capacity:
         /// Evict up to `out.len` unpinned resident slots, coldest first
         /// (global LFU with recency tie-break), including slots stranded
         /// above a lowered active tier. Returns refs the caller must
-        /// decommit and unpublish; the bookkeeping is already cleared.
+        /// decommit and unpublish. Slots remain `evicting` and unavailable
+        /// until the caller invokes `finalizeEviction` after those operations.
         pub fn collectEvictions(self: *Self, out: []SlotRef) usize {
             self.lock();
             defer self.unlock();
@@ -359,10 +443,7 @@ pub fn StreamingExpertCache(comptime layer_count: usize, comptime slot_capacity:
                     .slot = @intCast(victim % slot_capacity),
                     .generation = slot.generation,
                 };
-                slot.state = .empty;
-                slot.expert_index = invalid_expert;
-                slot.use_count = 0;
-                slot.last_access_epoch = 0;
+                slot.state = .evicting;
                 produced += 1;
             }
             return produced;
@@ -383,19 +464,30 @@ pub fn StreamingExpertCache(comptime layer_count: usize, comptime slot_capacity:
                     .slot = @intCast(index % slot_capacity),
                     .generation = slot.generation,
                 };
-                slot.state = .empty;
-                slot.expert_index = invalid_expert;
-                slot.use_count = 0;
-                slot.last_access_epoch = 0;
+                slot.state = .evicting;
                 produced += 1;
             }
             return produced;
+        }
+
+        /// Complete an eviction after the backend has unpublished all device
+        /// views and reclaimed the slot's physical pages.
+        pub fn finalizeEviction(self: *Self, ref: SlotRef) CacheError!void {
+            self.lock();
+            defer self.unlock();
+            const slot = try self.slotPtrLocked(ref);
+            if (slot.state != .evicting or slot.pin_count != 0) return error.InvalidSlotState;
+            slot.state = .empty;
+            slot.expert_index = invalid_expert;
+            slot.use_count = 0;
+            slot.last_access_epoch = 0;
         }
 
         pub const Counts = struct {
             resident: usize = 0,
             in_flight: usize = 0,
             reserved_or_loading: usize = 0,
+            evicting: usize = 0,
         };
 
         pub fn counts(self: *Self) Counts {
@@ -407,6 +499,7 @@ pub fn StreamingExpertCache(comptime layer_count: usize, comptime slot_capacity:
                     .resident => result.resident += 1,
                     .in_flight => result.in_flight += 1,
                     .reserved, .loading => result.reserved_or_loading += 1,
+                    .evicting => result.evicting += 1,
                     .empty => {},
                 }
             }
@@ -535,4 +628,73 @@ test "streaming cache tier shrink strands slots for eviction and keeps planning 
     }
     // Expert 5 plus the surviving in-tier expert remain resident.
     try std.testing.expectEqual(@as(usize, 2), cache.counts().resident);
+}
+
+test "streaming cache keeps evictions unavailable until backend finalization" {
+    var cache = TestCache{};
+    var plan = try cache.planRoute(0, &.{1});
+    try commitPlan(&cache, &plan);
+    cache.releasePlan(&plan);
+
+    var victims: [1]SlotRef = undefined;
+    try std.testing.expectEqual(@as(usize, 1), cache.collectEvictions(&victims));
+    try std.testing.expectEqual(@as(usize, 1), cache.counts().evicting);
+    try std.testing.expectError(error.InvalidSlotState, cache.beginUse(victims[0]));
+    try cache.finalizeEviction(victims[0]);
+    try std.testing.expectEqual(@as(usize, 0), cache.counts().evicting);
+
+    const replacement = try cache.planRoute(0, &.{2});
+    try std.testing.expectEqual(victims[0].slot, replacement.entries[0].ref.slot);
+    try std.testing.expect(replacement.entries[0].ref.generation > victims[0].generation);
+    cache.releaseFailed(replacement.entries[0].ref);
+}
+
+test "streaming cache full residency plan installs identity slots atomically" {
+    var cache = TestCache{};
+    var initial = try cache.planRoute(0, &.{ 3, 1 });
+    try commitPlan(&cache, &initial);
+    cache.releasePlan(&initial);
+
+    var full = try cache.planFullResidency(0, 4);
+    try std.testing.expectEqual(@as(usize, 4), full.count);
+    for (full.slice(), 0..) |ref, expert| {
+        try std.testing.expectEqual(@as(u16, @intCast(expert)), ref.slot);
+        if (full.needs_load[expert]) {
+            try cache.noteLoading(ref);
+            try cache.commitResident(ref);
+        }
+        cache.releaseEntry(ref);
+    }
+
+    for (0..4) |expert| {
+        var hit = try cache.planRoute(0, &.{@intCast(expert)});
+        try std.testing.expectEqual(@as(usize, 0), hit.miss_count);
+        try std.testing.expectEqual(@as(u16, @intCast(expert)), hit.entries[0].ref.slot);
+        cache.releasePlan(&hit);
+    }
+}
+
+test "streaming cache discards only a sole pinned full resident" {
+    var cache = TestCache{};
+    var full = try cache.planFullResidency(0, 4);
+    for (full.slice()) |ref| {
+        try cache.noteLoading(ref);
+        try cache.commitResident(ref);
+    }
+
+    try std.testing.expect(cache.discardSolePinnedResident(full.refs[0]));
+    try std.testing.expect(!cache.discardSolePinnedResident(full.refs[0]));
+    try std.testing.expectEqual(@as(usize, 3), cache.counts().resident);
+
+    // An additional route-plan pin prevents destructive cleanup.
+    var extra = try cache.planRoute(0, &.{1});
+    try std.testing.expect(!cache.discardSolePinnedResident(full.refs[1]));
+    cache.releasePlan(&extra);
+    try std.testing.expect(cache.discardSolePinnedResident(full.refs[1]));
+
+    for (full.refs[2..full.count]) |ref| {
+        try std.testing.expect(cache.discardSolePinnedResident(ref));
+    }
+    try std.testing.expectEqual(@as(usize, 0), cache.counts().resident);
+    try std.testing.expectEqual(@as(usize, 0), cache.counts().reserved_or_loading);
 }

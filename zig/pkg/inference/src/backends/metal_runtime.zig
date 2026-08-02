@@ -15123,6 +15123,10 @@ pub extern fn termite_metal_decode_runtime_moe_q4_0_layer_arena_prepared(
     hidden_size: usize,
     inter_size: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_reset_moe_q4_0_layer_arena(
+    runtime: ?*RawMetalDecodeRuntime,
+    layer: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_moe_layer_arena_set_offset(
     runtime: ?*RawMetalDecodeRuntime,
     layer: usize,
@@ -19297,6 +19301,14 @@ pub fn decoderRuntimeMoeLayerArenaPrepared(
         hidden_size,
         inter_size,
     ) != 0;
+}
+
+/// Unpublish one MoE layer arena after all referencing device work has been
+/// drained. This invalidates the runtime geometry before the owning compact
+/// cache decommits any of the arena's page ranges.
+pub fn decoderRuntimeResetMoeLayerArena(self: anytype, layer: usize) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    return termite_metal_decode_runtime_reset_moe_q4_0_layer_arena(runtime, layer) == 0;
 }
 
 /// Fully device-side routed-expert MoE forward against a prepared layer
@@ -33971,7 +33983,7 @@ test "metal native flash prefill direct KV is bounded, counted, and disable-wins
     try std.testing.expectEqualSlices(f32, &direct_output, &paged_output);
 }
 
-test "metal native paged attention f16 single row uses 1x kernel across pages" {
+test "metal native paged attention f16 single row uses split GQA across pages" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
 
@@ -34072,7 +34084,8 @@ test "metal native paged attention f16 single row uses 1x kernel across pages" {
         out.deviceByteOffset(),
     ));
     const after = runtimeMemorySnapshot(runtime);
-    try std.testing.expect(after.paged_attention_1x_calls > before.paged_attention_1x_calls);
+    try std.testing.expectEqual(before.paged_attention_1x_calls, after.paged_attention_1x_calls);
+    try std.testing.expect(after.decode_gqa_split_calls > before.decode_gqa_split_calls);
 
     var expected: [q_dim]f32 = [_]f32{0.0} ** q_dim;
     const heads_per_group = num_heads / num_kv_heads;
@@ -34120,7 +34133,7 @@ test "metal native paged attention f16 single row uses 1x kernel across pages" {
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual, 0..) |exp, got, i| {
         if (!std.math.approxEqAbs(f32, exp, got, 1e-3)) {
-            std.debug.print("paged f16 1x attention mismatch idx={d} expected={d} got={d}\n", .{ i, exp, got });
+            std.debug.print("paged f16 split GQA attention mismatch idx={d} expected={d} got={d}\n", .{ i, exp, got });
             return error.TestUnexpectedResult;
         }
     }
@@ -34208,7 +34221,7 @@ test "metal native paged attention f16 single row uses 1x kernel across pages" {
     try std.testing.expectEqual(expected.len, incremental_actual.len);
     for (expected, incremental_actual, 0..) |exp, got, i| {
         if (!std.math.approxEqAbs(f32, exp, got, 1e-3)) {
-            std.debug.print("paged f16 incremental 1x attention mismatch idx={d} expected={d} got={d}\n", .{ i, exp, got });
+            std.debug.print("paged f16 incremental split GQA attention mismatch idx={d} expected={d} got={d}\n", .{ i, exp, got });
             return error.TestUnexpectedResult;
         }
     }

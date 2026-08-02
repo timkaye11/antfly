@@ -96,10 +96,12 @@ pub const compact_runtime_layer_capacity = 30;
 pub const compact_runtime_slot_capacity = 128;
 pub const CompactSlotRef = runtime.moe.streaming_cache.SlotRef;
 pub const CompactBudgetCategory = runtime.moe.budget_ledger.BudgetCategory;
+pub const CompactBudgetPressure = runtime.moe.budget_ledger.BudgetPressure;
 pub const CompactExpertCache = runtime.moe.streaming_cache.StreamingExpertCache(
     compact_runtime_layer_capacity,
     compact_runtime_slot_capacity,
 );
+pub const CompactFullResidencyPlan = CompactExpertCache.FullResidencyPlan;
 
 /// Backing memory for one resident-expert slot: a page-aligned anonymous
 /// arena published to the device as a no-copy buffer, plus the quantized
@@ -118,31 +120,27 @@ pub const CompactExpertArena = struct {
     present: bool = false,
 };
 
-/// Full-residency backing for one MoE layer under the device-side MoE route
-/// (ANTFLY_GEMMA4_DEVICE_MOE): a single page-aligned anonymous arena holding
-/// every expert of the layer contiguously in expert-id order, published to
-/// the device as one no-copy buffer plus a per-expert byte-offset table.
-/// Unlike per-slot arenas this arena is never evicted or decommitted for the
-/// session lifetime; the ledger carries the whole layer as .expert_pages.
-///
-/// Partial residency is deliberately out of scope: the per-slot streaming
-/// cache keeps each expert in its own anonymous arena, i.e. a separate
-/// MTLBuffer, and one bound weight buffer cannot span scattered buffers. The
-/// device kernels' offset-table indirection (with the 0xFFFFFFFF unmapped
-/// sentinel) is already shaped for that future, but serving a partially
-/// resident layer device-side needs argument buffers or indirect command
-/// buffers to bind per-expert buffers; until then partially resident layers
-/// stay on the per-slot streaming route.
+/// Full-residency metadata for one MoE layer. The backing storage is the same
+/// per-layer pool used by streamed and partial routing; this structure never
+/// owns memory. At the 128-slot tier the pool is rewritten once into identity
+/// order (expert N -> slot N) and published as the full device arena, avoiding
+/// a second ~12 GiB copy of expert weights.
 pub const CompactLayerFullArena = struct {
-    arena: ?c_file.MmapRegion = null,
-    /// Bytes charged to the ledger for the arena (page-aligned total).
-    charged_bytes: usize = 0,
     /// Bytes each expert region occupies inside the arena.
     expert_stride: usize = 0,
     /// Gate/up/down byte offsets relative to an expert's region start;
     /// identical for every expert by construction.
     projection_offsets: [3]usize = .{ 0, 0, 0 },
     expert_count: usize = 0,
+    /// One cache plan pin per identity slot is intentionally retained for the
+    /// session lifetime so pressure eviction cannot invalidate the published
+    /// full-layer arena.
+    pins_held: bool = false,
+    /// Cache generations captured with the retained identity-slot pins. They
+    /// make whole-model rollback generation-safe: stale cleanup can never
+    /// discard a slot that has since been reassigned.
+    slot_generations: [compact_runtime_slot_capacity]u64 =
+        [_]u64{0} ** compact_runtime_slot_capacity,
     /// Arena loaded and published to the decode runtime.
     published: bool = false,
     /// Load or publication failed once; the decode path stops retrying and
@@ -159,9 +157,8 @@ pub const CompactRuntimeState = struct {
     ledger: runtime.moe.budget_ledger.ResidentBudgetLedger,
     arenas: [compact_runtime_layer_capacity * compact_runtime_slot_capacity]CompactExpertArena =
         [_]CompactExpertArena{.{}} ** (compact_runtime_layer_capacity * compact_runtime_slot_capacity),
-    /// Per-layer full-residency arenas for the device-side MoE route.
-    /// Untouched (all-defaults) unless ANTFLY_GEMMA4_DEVICE_MOE is enabled
-    /// and the budget derives slots == expert_count.
+    /// Per-layer full-residency publication metadata. Backing bytes remain in
+    /// `layer_pools`; these entries never own a second mapping.
     full_arenas: [compact_runtime_layer_capacity]CompactLayerFullArena =
         [_]CompactLayerFullArena{.{}} ** compact_runtime_layer_capacity,
     /// Partial-residency pool arena (ANTFLY_GEMMA4_POOL_ARENA): one
@@ -194,10 +191,7 @@ pub const CompactRuntimeState = struct {
             if (slot.arena) |*arena| arena.deinit();
             slot.arena = null;
         }
-        for (&self.full_arenas) |*full| {
-            if (full.arena) |*arena| arena.deinit();
-            full.* = .{};
-        }
+        for (&self.full_arenas) |*full| full.* = .{};
         for (&self.layer_pools) |*pool| {
             if (pool.*) |*region| region.deinit();
             pool.* = null;

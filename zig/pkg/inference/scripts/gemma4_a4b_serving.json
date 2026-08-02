@@ -1,5 +1,7 @@
 {
-  "models_dir": "/Users/timkaye/Documents/af/models",
+  "models_dir": "./models",
+  "max_loaded_models": 1,
+  "allow_unknown_models": false,
   "max_concurrent_requests": 32,
   "preload": [
     {
@@ -7,11 +9,12 @@
       "name": "gemma-4-26B-A4B-it-qat-q4_0-gguf",
       "backend": "metal",
       "memory_profile": "compact_2gbs",
-      "memory_budget_mb": 6144
+      "memory_budget_mb": 2048,
+      "device_routing": "off"
     }
   ],
   "prompt_cache": {
-    "enabled": true,
+    "enabled": false,
     "mode": "block_hash",
     "max_bytes_mb": 512,
     "min_tokens": 64,
