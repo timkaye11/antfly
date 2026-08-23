@@ -354,6 +354,39 @@ fn executeNativePlannedNode(
         .fused_relu => try cb.relu(valueAt(values, inputs[0])),
         .fused_quick_gelu => try cb.quickGelu(valueAt(values, inputs[0])),
         .fused_softmax => |attrs| try cb.primSoftmax(valueAt(values, inputs[0]), attrs.dim),
+        .fused_linear_cross_entropy_loss => |attrs| blk: {
+            var out_shape_buf: [8]i64 = undefined;
+            const out_shape = fillShapeDims(graph, node_id, &out_shape_buf);
+            break :blk try cb.linearCrossEntropyLoss(&.{
+                .hidden = valueAt(values, inputs[0]),
+                .weight = valueAt(values, inputs[1]),
+                .labels = valueAt(values, inputs[2]),
+                .rows = attrs.rows,
+                .in_dim = attrs.in_dim,
+                .vocab_size = attrs.vocab_size,
+                .logit_softcap = attrs.logit_softcap,
+                .ignore_index = attrs.ignore_index,
+                .frozen_weight = attrs.frozen_weight,
+                .output_shape = out_shape,
+            });
+        },
+        .fused_linear_cross_entropy_backward => |attrs| blk: {
+            var hidden_shape_buf: [8]i64 = undefined;
+            const hidden_shape = fillShapeDims(graph, inputs[0], &hidden_shape_buf);
+            break :blk try cb.linearCrossEntropyBackward(&.{
+                .hidden = valueAt(values, inputs[0]),
+                .weight = valueAt(values, inputs[1]),
+                .labels = valueAt(values, inputs[2]),
+                .upstream = valueAt(values, inputs[3]),
+                .rows = attrs.rows,
+                .in_dim = attrs.in_dim,
+                .vocab_size = attrs.vocab_size,
+                .logit_softcap = attrs.logit_softcap,
+                .ignore_index = attrs.ignore_index,
+                .frozen_weight = attrs.frozen_weight,
+                .hidden_shape = hidden_shape,
+            });
+        },
         .fused_masked_bce_with_logits_loss => |attrs| blk: {
             var out_shape_buf: [8]i64 = undefined;
             const out_shape = fillShapeDims(graph, node_id, &out_shape_buf);

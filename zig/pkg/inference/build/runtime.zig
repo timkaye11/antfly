@@ -38,6 +38,9 @@ pub const BackendOptions = struct {
     link_libc: bool = true,
     skip_openapi: bool = false,
     inference_version: []const u8 = "dev",
+    /// Independent clean source commit embedded only for benchmark evidence.
+    /// `dev` means unattested and is rejected by benchmark admission.
+    benchmark_source_revision: []const u8 = "dev",
     enable_native_quant_dispatch_stats: bool = false,
 };
 
@@ -563,6 +566,7 @@ fn addCommonOptions(options: *std.Build.Step.Options, backend: BackendOptions) v
     options.addOption([]const u8, "wasm_memory_model", backend.wasm_memory_model);
     options.addOption(bool, "skip_openapi", backend.skip_openapi);
     options.addOption([]const u8, "inference_version", backend.inference_version);
+    options.addOption([]const u8, "benchmark_source_revision", backend.benchmark_source_revision);
 }
 
 fn addInferenceApiModule(

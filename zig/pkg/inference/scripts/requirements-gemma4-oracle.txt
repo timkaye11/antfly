@@ -1,0 +1,13 @@
+# Exact numerical dependencies for the Gemma4 HF/PEFT correctness oracle.
+#
+# Keep this file synchronized with gemma4_oracle.lock.json. The harness checks
+# installed distributions before importing torch/transformers and refuses to
+# run on version drift. Model snapshots are supplied separately and verified
+# locally; the harness never downloads a model.
+accelerate==1.14.0
+huggingface-hub==1.26.0
+numpy==2.4.2
+peft==0.19.1
+safetensors==0.7.0
+torch==2.10.0
+transformers==5.5.2

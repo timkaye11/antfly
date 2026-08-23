@@ -99,6 +99,119 @@ The drafter must use the same tokenizer vocabulary and special token ids as the
 target. Speculative decoding is currently native text-only generation; it is not
 enabled for multimodal prompts or the ONNX direct path.
 
+## Native CUDA Multimodal Inference
+
+Gemma 4 E2B and E4B GGUF bundles can run text, image, and audio generation through
+the native generation pipeline with `--backend cuda`. The external GGUF projector
+and language decoder share the selected CUDA compute backend; media decoding,
+aspect-ratio-preserving resize/resampling, and prompt assembly remain bounded host
+work. This is the native CUDA path, not the ONNX Runtime or `ortgenai` path.
+
+Use a model **directory** containing both the decoder GGUF and its matching
+`mmproj*.gguf` companion for multimodal requests. The loader validates the full
+projector tensor/shape contract, output width, supported modalities, and backend
+tensor types before admitting a server model. In particular, projectors are not
+interchangeable between E2B, E4B, or Unified/12B decoders.
+
+The friendly aliases pull Google's official QAT bundles and automatically select
+the Q8 projector when one is available:
+
+```sh
+antfly inference pull gemma4-e2b --models-dir .models
+antfly inference pull gemma4-e4b --models-dir .models
+```
+
+Use `antfly inference list .models` to obtain the installed model name or pass
+the concrete bundle directory to the CLI. Managed pulls include a stable suffix
+in their on-disk directory name, so scripts should not guess that path.
+
+Text and image smoke examples:
+
+```sh
+antfly inference generate \
+  /path/to/e2b-bundle \
+  "Write one sentence about ants." \
+  --backend cuda --max-tokens 32 --temperature 0 --disable-thinking --print-timing
+
+antfly inference generate \
+  /path/to/e2b-bundle \
+  "Describe the image precisely." --image /path/to/image.jpg \
+  --backend cuda --max-tokens 32 --temperature 0 --disable-thinking --print-timing
+
+antfly inference generate \
+  /path/to/e4b-bundle \
+  "Describe the image precisely." --image /path/to/image.jpg \
+  --backend cuda --max-tokens 32 --temperature 0 --disable-thinking --print-timing
+```
+
+For production serving on a 24 GiB-class GPU, preload both models and raise the
+generic admission defaults to cover the decoder plus projector peak estimate:
+
+```sh
+antfly inference run --models-dir .models \
+  --host-budget-mb 8000 --backend-budget-mb 18000 \
+  --combined-budget-mb 22000 --kv-budget-mb 1024 --scratch-budget-mb 2048 \
+  --preload-model generator:cuda:google/gemma-4-E2B-it-qat-q4_0-gguf:gguf \
+  --preload-model generator:cuda:google/gemma-4-E4B-it-qat-q4_0-gguf
+```
+
+The CUDA image projector keeps its hot path device-resident: patch convolution
+and token-major layout conversion, axial position addition, clipped dense
+projection, Q/K RMSNorm plus axial 2D RoPE, V RMSNorm, full bidirectional vision
+attention, spatial pooling/standardization, and the final projection all stay on
+the GPU. Projector weights are cached as backend-resident tensors for the life of
+the loaded model. Decoder multimodal prefill still writes KV for every row, but
+only the final hidden row is sent through the language-model head; this avoids a
+full `[prompt_rows, vocab]` logits download.
+
+The long-sequence vision path uses a token-major, head-dim-64 streaming-softmax
+CUDA kernel. It computes each Q/K dot once and does not materialize an
+`O(sequence^2)` score tensor. Set
+`ANTFLY_INFERENCE_CUDA_GEMMA4_VISION_ATTENTION=0` to restore the generic SDPA
+fallback for diagnosis. The fallback is correctness-compatible but is not a
+production latency path for Gemma 4 image grids above 512 patches.
+
+Projector matrices remain F32 by default. Setting
+`ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_BF16=1` stores and executes supported
+external projector weights as BF16. On the L4 qualification workload this cut
+projector H2D/resident storage by about 304 MiB and preserved the first eight
+greedy token IDs, but did not materially improve latency, so it remains an
+opt-in memory policy rather than the default.
+
+Measured on an NVIDIA L4 (`sm_89`), ReleaseFast, temperature zero, one 550x439
+PNG, and eight output tokens after warming the local files:
+
+| Model | Generate stage | Decoder prefill | 8-token decode | D2H |
+|---|---:|---:|---:|---:|
+| Gemma 4 E2B QAT Q4_0 | 1.352 s | 547 ms | 194 ms | 4.29 MB |
+| Gemma 4 E4B QAT Q4_0 | 1.819 s | 933 ms | 273 ms | 6.45 MB |
+
+The E2B image workload measured about 14.5 seconds before the dedicated vision
+attention path, after the earlier device-residency work. The remaining time in
+the table includes image decode/resize, projector execution, prompt assembly,
+decoder prefill, and decode. Text-only qualification produced coherent CUDA
+answers for both models; concise production requests should use
+`--disable-thinking` (or the equivalent request option) when private reasoning
+latency is not desired.
+
+These are warm-runtime numbers. Cold local storage on the qualification machine
+took several minutes to page in the E4B decoder and tens of seconds to page in
+its projector. Production deployments should preload models and keep the server
+session resident; cold file I/O is intentionally not included in the inference
+latency table. GGUF tokenizer EOS metadata is merged even when a minimal
+`config.json` sidecar is present, so E4B stops on its artifact-provided EOS
+instead of emitting padding/special tokens until the request cap.
+
+Audio projection still contains bounded host transforms and should be
+capacity-tested separately. Preload removes model/projector file I/O from the
+request path but does not cache per-image activations.
+
+Multimodal prompt caching and Gemma 4 MTP remain disabled; both require separate
+correctness and lifecycle contracts.
+The current E2B/E4B upstream text configs specify conventional causal attention
+for media tokens (`use_bidirectional_attention = null`), which the native path
+preserves.
+
 ## Chat REPL
 
 `antfly inference chat` is the ollama-style interactive path: it resolves a

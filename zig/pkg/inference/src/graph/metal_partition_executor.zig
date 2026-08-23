@@ -36,6 +36,7 @@ const weight_source_mod = @import("../models/weight_source.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
 const transpose_utils = @import("transpose_utils.zig");
 const runtime_slice = @import("runtime_slice.zig");
+const training_executor_policy = @import("training_executor_policy.zig");
 const metal_runtime_mod = if (build_options.enable_metal) @import("../backends/metal_runtime.zig") else struct {
     pub fn metalDeviceAvailable() bool {
         return false;
@@ -210,6 +211,11 @@ const RuntimeRegionKind = enum(u8) {
     lora_backward,
     low_rank_lora_backward,
     rank_adapter_backward,
+    gemma_gate_up_backward_input_sum,
+    gated_gelu_forward,
+    gated_gelu_backward,
+    masked_softmax,
+    softmax_backward,
     ffn_gelu_backward,
     q_linear,
     linear_qkv,
@@ -236,6 +242,11 @@ const RuntimeRegion = union(RuntimeRegionKind) {
     lora_backward: LoraBackwardPattern,
     low_rank_lora_backward: LowRankLoraBackwardPattern,
     rank_adapter_backward: RankAdapterBackwardPattern,
+    gemma_gate_up_backward_input_sum: GemmaGateUpBackwardInputSumPattern,
+    gated_gelu_forward: GatedGeluForwardPattern,
+    gated_gelu_backward: GatedGeluBackwardPattern,
+    masked_softmax: MaskedSoftmaxPattern,
+    softmax_backward: SoftmaxBackwardPattern,
     ffn_gelu_backward: FfnGeluBackwardPattern,
     q_linear: QLinearPattern,
     linear_qkv: LinearNoBiasQkvPattern,
@@ -311,6 +322,11 @@ const PreparedRuntimeRegion = union(RuntimeRegionKind) {
     lora_backward: void,
     low_rank_lora_backward: void,
     rank_adapter_backward: void,
+    gemma_gate_up_backward_input_sum: PreparedLinearPairRegion,
+    gated_gelu_forward: void,
+    gated_gelu_backward: void,
+    masked_softmax: void,
+    softmax_backward: void,
     ffn_gelu_backward: void,
     q_linear: PreparedLinearRegion,
     linear_qkv: PreparedQkvRegion,
@@ -1567,7 +1583,7 @@ pub const MetalPartitionExecutor = struct {
 
         // Phase-0 slot-bound output pool (persistent executor only). Binds
         // node outputs to fixed device buffers reused across steps.
-        const slot_bound_outputs = self.owned and cb.kind() == .metal and slotBoundOutputsEnabled();
+        const slot_bound_outputs = self.owned and cb.kind() == .metal and slotBoundOutputsEnabled(exec_ctx.options);
         if (slot_bound_outputs) self.ensureOutputPool(cb, buffer_plan) catch {};
         const eager_arena_outputs = self.owned and cb.kind() == .metal and metalEagerArenaEnabled();
         var eager_arena = MetalEagerArena{};
@@ -1733,6 +1749,16 @@ pub const MetalPartitionExecutor = struct {
         defer allocator.free(skipped_nodes);
         @memset(skipped_nodes, false);
 
+        // A fused pattern can materialize a consumer without materializing
+        // each producer's standalone value.  Track those pattern-owned
+        // interiors separately from `skipped_nodes`: the ordinary skip
+        // override must still re-execute a null-valued producer when a later
+        // consumer needs it, but it must not resurrect work whose only
+        // consumer was already written by the fusion.
+        const satisfied_fused_interiors = try allocator.alloc(bool, values.len);
+        defer allocator.free(satisfied_fused_interiors);
+        @memset(satisfied_fused_interiors, false);
+
         // Graph outputs must always be written to their value slots: they
         // escape the executor entirely (training extraction reads the loss
         // and LoRA gradients after partition teardown), so a fused pattern
@@ -1783,6 +1809,12 @@ pub const MetalPartitionExecutor = struct {
                     // values; protecting them would only widen the walk.
                     if (input_node.op == .parameter) continue;
                     if (isPreMaterializedConstantOp(input_node.op)) continue;
+                    // A small test model can make a weight transpose fit the
+                    // scalar-tail element bound. It is still linear setup,
+                    // not scalar loss plumbing: leave it unprotected so the
+                    // normal consumer-checked deferred-linear route can use
+                    // the stored weight directly (including native BF16).
+                    if (transposeSourceIsWeightParameter(graph, input_id)) continue;
                     const elems = input_node.output_shape.numElements() orelse continue;
                     if (elems > graph_output_scalar_tail_max_elems) continue;
                     elision_protected_nodes[input_index] = true;
@@ -1858,8 +1890,50 @@ pub const MetalPartitionExecutor = struct {
                 // Equivalent to valueReferencedAfterBoundary(graph, node_ids, node_pos, node_id)
                 // but O(1) via the precomputed last-reference-position + output flags.
                 const future_consumer = partition_is_output[i] or partition_last_ref_plus1[i] > node_pos + 1;
-                if (!protected_output and (region_pre_skipped or !future_consumer)) continue;
-                if (future_consumer and values[i] != null) continue;
+                const fused_interior_satisfied = i < satisfied_fused_interiors.len and satisfied_fused_interiors[i];
+                const can_remain_elided = skippedNodeCanRemainElided(
+                    protected_output,
+                    region_pre_skipped,
+                    fused_interior_satisfied,
+                    partition_is_output[i],
+                    future_consumer,
+                );
+                const materialized_ahead = values[i] != null;
+                if (can_remain_elided or (future_consumer and materialized_ahead)) {
+                    // Fused/runtime regions can execute a later graph node
+                    // while visiting an earlier position. Its ordinary
+                    // cleanup must happen only once the executor reaches the
+                    // node's true position; otherwise a shared activation can
+                    // be released before an intervening consumer executes.
+                    if (materialized_ahead) {
+                        try interpreter.cloneOutputIfAliasedInputWouldBeFreed(
+                            allocator,
+                            graph,
+                            cb,
+                            values,
+                            node_id,
+                            last_use,
+                            rt_map,
+                            donated,
+                        );
+                        _ = try freeExpiredInputs(
+                            allocator,
+                            graph,
+                            cb,
+                            values,
+                            value_device,
+                            node_id,
+                            device_id,
+                            last_use,
+                            null,
+                            runtime_region_plan,
+                            rt_map,
+                            donated,
+                            effective_exec_ctx,
+                        );
+                    }
+                    continue;
+                }
                 // A fused pattern / runtime region elided this node as
                 // fused-interior state, but its slot must escape the elided
                 // region (graph output/scalar tail, or a later unskipped
@@ -1927,6 +2001,11 @@ pub const MetalPartitionExecutor = struct {
                 chunk_executed,
                 last_use,
             );
+            if (defer_allowed and !node_elision_protected and shouldDeferElementwiseAddForAdd(graph, node_id, reachable, last_use, reachable_use_counts)) {
+                traceMetalValueLifetime("defer_elementwise_add_for_add3", node_id, @intCast(last_use[i]));
+                skipped_nodes[i] = true;
+                continue;
+            }
             if (defer_allowed and !node_elision_protected and shouldDeferScaleMulForAdd(graph, node_id, reachable, last_use, reachable_use_counts)) {
                 traceMetalValueLifetime("defer_scale_mul_for_add", node_id, @intCast(last_use[i]));
                 skipped_nodes[i] = true;
@@ -2000,6 +2079,8 @@ pub const MetalPartitionExecutor = struct {
                 effective_exec_ctx,
                 &exec_state,
                 skipped_nodes,
+                satisfied_fused_interiors,
+                elision_protected_nodes,
                 last_use,
                 rt_map,
                 donated,
@@ -2032,6 +2113,7 @@ pub const MetalPartitionExecutor = struct {
                     effective_exec_ctx,
                     &exec_state,
                     skipped_nodes,
+                    satisfied_fused_interiors,
                     elision_protected_nodes,
                     runtime_region_plan,
                     last_use,
@@ -2096,13 +2178,23 @@ pub const MetalPartitionExecutor = struct {
                         try tryExecuteMetalCommand(allocator, graph, cb, values, node_id, op_plan, &exec_state, output_hint, &attn_mask_cache, exec_ctx.stats, resident_input_cache_ptr)
                     else
                         null;
-                    // Free an unconsumed pooled-output view (op didn't take the hint).
+                    // `*Into` commands commonly return a new CT wrapper that
+                    // retains the hinted Metal allocation. Pointer identity is
+                    // therefore insufficient to tell whether the storage was
+                    // consumed. Account by backing allocation, while still
+                    // releasing the caller-owned hint wrapper when the command
+                    // returned a distinct CT.
                     if (output_hint) |hint| {
-                        const consumed = if (command_output_opt) |co| co == hint else false;
+                        const consumed = if (command_output_opt) |co|
+                            co == hint or metal_compute_mod.MetalCompute.debugSharesStorage(cb, co, hint)
+                        else
+                            false;
+                        const command_adopted_hint = if (command_output_opt) |co| co == hint else false;
                         switch (output_hint_source orelse .slot_bound_pool) {
                             .chunk_local => {
                                 if (consumed) {
                                     chunk_local_pool.recordConsumedHint();
+                                    if (!command_adopted_hint) cb.free(hint);
                                 } else {
                                     if (traceChunkLocalOutputHintsEnabled()) {
                                         const hinted_node = graph.node(node_id);
@@ -2118,13 +2210,14 @@ pub const MetalPartitionExecutor = struct {
                             .slot_bound_pool => {
                                 if (consumed) {
                                     slot_bound_consumed_total += 1;
+                                    if (!command_adopted_hint) cb.free(hint);
                                 } else {
                                     slot_bound_fallback_total += 1;
                                     cb.free(hint);
                                 }
                             },
                             .eager_arena => {
-                                if (!consumed) cb.free(hint);
+                                if (!command_adopted_hint) cb.free(hint);
                             },
                         }
                     }
@@ -2270,6 +2363,7 @@ pub const MetalPartitionExecutor = struct {
                 node_id,
                 device_id,
                 last_use,
+                null,
                 runtime_region_plan,
                 rt_map,
                 donated,
@@ -2305,6 +2399,7 @@ pub const MetalPartitionExecutor = struct {
                     rt_map,
                     donated,
                     effective_exec_ctx,
+                    null,
                 );
                 metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope) catch {};
                 planned_scope = metal_compute_mod.MetalCompute.PlannedGraphScope{};
@@ -2326,7 +2421,7 @@ pub const MetalPartitionExecutor = struct {
                 if (exec_ctx.stats) |stats| {
                     stats.metal_frame_chunk_boundaries += 1;
                     stats.metal_frame_chunk_promoted_values += promoted;
-                    stats.metal_frame_chunk_swept_values += swept + expired_free_stats.count;
+                    stats.metal_frame_chunk_swept_values += swept.count + expired_free_stats.count;
                 }
                 if (chunk_local_outputs) {
                     try chunk_local_pool.resetAfterChunk(allocator, cb, buffer_plan, values);
@@ -2363,6 +2458,7 @@ pub const MetalPartitionExecutor = struct {
                         rt_map,
                         donated,
                         effective_exec_ctx,
+                        null,
                     );
                     metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope) catch {};
                     planned_scope = metal_compute_mod.MetalCompute.PlannedGraphScope{};
@@ -2384,7 +2480,7 @@ pub const MetalPartitionExecutor = struct {
                     if (exec_ctx.stats) |stats| {
                         stats.metal_frame_chunk_boundaries += 1;
                         stats.metal_frame_chunk_promoted_values += promoted;
-                        stats.metal_frame_chunk_swept_values += swept;
+                        stats.metal_frame_chunk_swept_values += swept.count;
                     }
                     if (chunk_local_outputs) {
                         try chunk_local_pool.resetAfterChunk(allocator, cb, buffer_plan, values);
@@ -2401,6 +2497,45 @@ pub const MetalPartitionExecutor = struct {
         if (frame_active) {
             try metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope);
             planned_scope = metal_compute_mod.MetalCompute.PlannedGraphScope{};
+            // Fused/runtime regions can publish interior values that are no
+            // longer direct inputs of a later node, so the ordinary
+            // per-consumer release path never sees them. Retire those dead
+            // values while this frame's generation is still active. The
+            // completion-fenced Metal cache quarantines their backing buffers
+            // until the submitted frame completes; graph/partition outputs,
+            // caller-owned inputs, future-partition values, and live aliases
+            // remain untouched.
+            if (metalFinalFrameDeadValueSweepEnabled()) {
+                const final_node_pos = node_ids.len - 1;
+                const final_node_id = node_ids[final_node_pos];
+                const swept = try sweepExpiredValuesThroughNode(
+                    allocator,
+                    graph,
+                    cb,
+                    values,
+                    value_device,
+                    node_ids,
+                    final_node_pos,
+                    final_node_id,
+                    device_id,
+                    last_use,
+                    runtime_region_plan,
+                    rt_map,
+                    donated,
+                    effective_exec_ctx,
+                    partition_view,
+                );
+                if (exec_ctx.stats) |stats| {
+                    stats.metal_final_frame_swept_values += swept.count;
+                    stats.metal_final_frame_swept_bytes += swept.bytes;
+                }
+                if (traceMetalFinalFrameSweepEnabled()) {
+                    std.debug.print(
+                        "metal_final_frame_sweep: partition={d} values={d} logical_bytes={d}\n",
+                        .{ partition_index, swept.count, swept.bytes },
+                    );
+                }
+            }
             // Drain BEFORE copying graph outputs to owned storage. The
             // previous order encoded the owned-copy blits into the
             // partition's frame ahead of the submit, but runtime region
@@ -3139,7 +3274,7 @@ fn recordMetalCommandDispatchFamily(stats: *PartitionExecutor.ExecutionStats, gr
         .fused_gelu, .fused_gelu_exact, .fused_relu, .fused_silu, .fused_quick_gelu, .fused_sigmoid, .fused_tanh_act => {
             stats.metal_command_activation_dispatches += 1;
         },
-        .fused_gelu_backward, .fused_gelu_exact_backward, .fused_layer_norm_backward, .fused_disentangled_attention_backward, .fused_masked_bce_with_logits_backward => {
+        .fused_gelu_backward, .fused_gelu_exact_backward, .fused_layer_norm_backward, .fused_rms_norm_backward, .fused_disentangled_attention_backward, .fused_gqa_causal_attention_backward, .fused_masked_bce_with_logits_backward => {
             stats.metal_command_activation_backward_dispatches += 1;
         },
         else => stats.metal_command_other_dispatches += 1,
@@ -3366,6 +3501,13 @@ fn printMetalPartitionOpRuns(
     var longest = [_]LongOpRun{.{}} ** 12;
     var dot_shapes = [_]DotShapeRunSummary{.{}} ** 96;
     var dot_shapes_used: usize = 0;
+    var add_from_add: usize = 0;
+    var add_from_mul: usize = 0;
+    var mul_from_add: usize = 0;
+    var mul_from_mul: usize = 0;
+    var add3_structural: usize = 0;
+    var add3_inputs_live: usize = 0;
+    var add3_eligible: usize = 0;
 
     var reachable_nodes: usize = 0;
     var current_name: []const u8 = "";
@@ -3379,6 +3521,45 @@ fn printMetalPartitionOpRuns(
         reachable_nodes += 1;
         recordOpRunCount(&counts, &counts_used, name);
         recordDotShapeRunSummary(graph, node_ids, node_pos, reachable, last_use, &dot_shapes, &dot_shapes_used);
+        const consumer_tag = std.meta.activeTag(graph.node(node_id).op);
+        if (consumer_tag == .add or consumer_tag == .mul) {
+            for (graph.node(node_id).getInputs()) |input_id| {
+                if (input_id == null_node or input_id >= graph.nodeCount()) continue;
+                const input_index: usize = @intCast(input_id);
+                if (input_index >= reachable.len or !reachable[input_index]) continue;
+                const producer = graph.node(input_id);
+                if (!sameElementCount(producer.output_shape, graph.node(node_id).output_shape)) continue;
+                if (reachableUseCount(graph, input_id, reachable, 2) != 1) continue;
+                switch (producer.op) {
+                    .add => if (consumer_tag == .add) {
+                        add_from_add += 1;
+                        if (deferredElementwiseAdd(graph, input_id, graph.node(node_id).output_shape) != null) {
+                            const consumer = graph.node(node_id);
+                            const other_id = if (consumer.inputs[0] == input_id) consumer.inputs[1] else consumer.inputs[0];
+                            if (other_id != null_node and other_id < graph.nodeCount() and
+                                shapesEqual(graph.node(other_id).output_shape, consumer.output_shape))
+                            {
+                                add3_structural += 1;
+                                if (deferredProducerInputsLiveUntilConsumer(graph, input_id, node_id, last_use)) {
+                                    add3_inputs_live += 1;
+                                }
+                                if (shouldDeferElementwiseAddForAdd(graph, input_id, reachable, last_use, null)) {
+                                    add3_eligible += 1;
+                                }
+                            }
+                        }
+                    } else {
+                        mul_from_add += 1;
+                    },
+                    .mul => if (consumer_tag == .add) {
+                        add_from_mul += 1;
+                    } else {
+                        mul_from_mul += 1;
+                    },
+                    else => {},
+                }
+            }
+        }
 
         if (current_count == 0) {
             current_name = name;
@@ -3432,6 +3613,10 @@ fn printMetalPartitionOpRuns(
     }
     if (printed_runs == 0) std.debug.print("none", .{});
     std.debug.print("\n", .{});
+    std.debug.print(
+        "metal_partition_elementwise_chains: partition={d} add_from_add={d} add_from_mul={d} mul_from_add={d} mul_from_mul={d} add3_structural={d} add3_inputs_live={d} add3_eligible={d}\n",
+        .{ partition_index, add_from_add, add_from_mul, mul_from_add, mul_from_mul, add3_structural, add3_inputs_live, add3_eligible },
+    );
 
     std.debug.print("metal_partition_dot_shapes: partition={d} distinct_shapes={d} top=", .{ partition_index, dot_shapes_used });
     const dot_limit = @min(dot_shapes_used, 16);
@@ -3486,7 +3671,10 @@ fn traceMetalGraphNodesEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_GRAPH_EXECUTOR_TRACE_NODES", false);
 }
 
-fn slotBoundOutputsEnabled() bool {
+fn slotBoundOutputsEnabled(options: ?interpreter.ExecuteOptions) bool {
+    if (options) |opts| {
+        if (opts.metal_slot_bound_outputs) return true;
+    }
     return platform.env.getenvBoolDefault("TERMITE_METAL_SLOT_BOUND_OUTPUTS", false);
 }
 
@@ -3803,6 +3991,20 @@ fn graphOutputOwnedCopyDisabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_DISABLE_GRAPH_OUTPUT_OWNED_COPY", false);
 }
 
+/// Training partitions default to releasing dead graph intermediates before
+/// their final frame is submitted. This lets the completion-fenced Metal
+/// cache classify the buffers under the active generation instead of seeing
+/// an unsafe generation-0 release during outer executor teardown.
+fn metalFinalFrameDeadValueSweepEnabled() bool {
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_FINAL_FRAME_DEAD_VALUE_SWEEP", false)) return false;
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_FINAL_FRAME_DEAD_VALUE_SWEEP", false)) return true;
+    return training_executor_policy.enabled();
+}
+
+fn traceMetalFinalFrameSweepEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_FINAL_FRAME_DEAD_VALUE_SWEEP", false);
+}
+
 /// TERMITE_DISABLE_GRAPH_OUTPUT_ELISION_OVERRIDE=1 disables the
 /// graph-output/scalar-tail elision-override protection (no node is
 /// forced back into execution after a fused pattern or runtime region
@@ -3819,8 +4021,7 @@ fn metalPartitionPlannedScopeDisabled() bool {
 fn partitionViewCacheEnabled() bool {
     if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_PARTITION_VIEW_CACHE", false)) return false;
     if (platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_PARTITION_VIEW_CACHE", false)) return true;
-    return platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false) and
-        !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false);
+    return training_executor_policy.enabled();
 }
 
 fn tracePartitionViewCacheEnabled() bool {
@@ -3899,6 +4100,15 @@ fn traceMetalGraphFusionsEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_GRAPH_FUSIONS", false);
 }
 
+fn rmsNormBackwardResidualAddGraphFusionEnabled() bool {
+    // Research-only after the fixed-25 E2B qualification found a negligible
+    // wall-time change but a material lifetime-footprint regression. Keep the
+    // bit-exact kernel available for allocator-integrated experiments without
+    // widening the production default.
+    return platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_RMS_NORM_BACKWARD_RESIDUAL_ADD_FUSION", false) and
+        !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_RMS_NORM_BACKWARD_RESIDUAL_ADD_FUSION", false);
+}
+
 fn traceRuntimeRegionsEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_RUNTIME_REGIONS", false);
 }
@@ -3943,10 +4153,9 @@ fn headMlpForwardRuntimeRegionEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_HEAD_MLP_FORWARD_RUNTIME_REGION", false);
 }
 
-fn groupedHeadDotRuntimeCommandEnabled() bool {
+fn groupedMpsDotRuntimeCommandEnabled() bool {
     if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_GROUPED_HEAD_DOT", false)) return false;
-    return platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false) and
-        !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false);
+    return training_executor_policy.enabled();
 }
 
 /// When set, promote a gather's input operand to device residency before the
@@ -3991,22 +4200,49 @@ fn lowRankLoraBackwardRuntimeRegionEnabled() bool {
 fn rankAdapterBackwardRuntimeRegionEnabled() bool {
     if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_RANK_ADAPTER_BACKWARD_RUNTIME_REGION", false)) return false;
     if (platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_RANK_ADAPTER_BACKWARD_RUNTIME_REGION", false)) return true;
-    return platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false) and
-        !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false);
+    return training_executor_policy.enabled();
 }
 
 fn ffnGeluBackwardRuntimeRegionEnabled() bool {
     if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_FFN_GELU_BACKWARD_RUNTIME_REGION", false)) return false;
     if (platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_FFN_GELU_BACKWARD_RUNTIME_REGION", false)) return true;
-    return platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false) and
-        !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false);
+    return training_executor_policy.enabled();
+}
+
+fn gatedGeluBackwardRuntimeRegionEnabled() bool {
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_GATED_GELU_BACKWARD_FUSION", false)) return false;
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_GATED_GELU_BACKWARD_FUSION", false)) return true;
+    return training_executor_policy.enabled();
+}
+
+var gated_gelu_forward_fusion_enabled_cache: std.atomic.Value(u8) = .init(0);
+
+fn gatedGeluForwardFusionEnabled() bool {
+    const cached = gated_gelu_forward_fusion_enabled_cache.load(.acquire);
+    if (cached != 0) return cached == 2;
+    const enabled = !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_GATED_GELU_FORWARD_FUSION", false) and
+        (platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_GATED_GELU_FORWARD_FUSION", false) or
+            training_executor_policy.enabled());
+    gated_gelu_forward_fusion_enabled_cache.store(if (enabled) 2 else 1, .release);
+    return enabled;
+}
+
+fn maskedSoftmaxRuntimeRegionEnabled() bool {
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_MASKED_SOFTMAX_FUSION", false)) return false;
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_MASKED_SOFTMAX_FUSION", false)) return true;
+    return training_executor_policy.enabled();
+}
+
+fn softmaxBackwardRuntimeRegionEnabled() bool {
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_SOFTMAX_BACKWARD_FUSION", false)) return false;
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_SOFTMAX_BACKWARD_FUSION", false)) return true;
+    return training_executor_policy.enabled();
 }
 
 fn rank1DotSpecializationEnabled() bool {
     if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_RANK1_DOT_SPECIALIZATION", false)) return false;
     if (platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_RANK1_DOT_SPECIALIZATION", false)) return true;
-    return platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false) and
-        !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false);
+    return training_executor_policy.enabled();
 }
 
 fn rawLinearBiasPairRuntimeRegionEnabled() bool {
@@ -4026,8 +4262,29 @@ fn rawLinearBiasPairRuntimeRegionEnabled() bool {
 /// restores the previous behavior.
 fn rawLinearRuntimeRegionsSuppressedForTraining() bool {
     if (platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_RAW_LINEAR_RUNTIME_REGIONS_IN_TRAINING", false)) return false;
-    return platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false) and
-        !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false);
+    return training_executor_policy.enabled();
+}
+
+/// Narrow qualification gate for the owned-output Gemma 4 gate/up projection
+/// pair.  Unlike the broad raw-linear training override above, this admits only
+/// the two same-layer MLP projections whose BF16 Metal kernel and saved-forward
+/// lifetime contract have been qualified.  Every other raw training dot keeps
+/// the interpreter-equivalent command path.
+fn gemma4Bf16MlpForwardPairRuntimeRegionEnabled() bool {
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_GEMMA4_BF16_MLP_FUSION", false)) return false;
+    return platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_GEMMA4_BF16_MLP_FUSION", false);
+}
+
+/// Shapes covered by the Gemma 4 BF16 gate/up pair kernels. E2B widens its
+/// shared tail from 6144 to 12288, while E4B remains uniformly 10240 wide.
+/// Keep this gate tied to observed checkpoint geometries and the named Gemma
+/// matcher so unrelated aligned linears do not inherit the contract.
+fn gemma4Bf16MlpProjectionShapeQualified(hidden_size: usize, projection_size: usize) bool {
+    return switch (hidden_size) {
+        1536 => projection_size == 6144 or projection_size == 12288,
+        2560 => projection_size == 10240,
+        else => false,
+    };
 }
 
 fn gatedFfnGraphFusionDisabled() bool {
@@ -4037,6 +4294,76 @@ fn gatedFfnGraphFusionDisabled() bool {
 fn gatedFfnGraphFusionEnabled() bool {
     if (gatedFfnGraphFusionDisabled()) return false;
     return platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_GATED_FFN_GRAPH_FUSION", true);
+}
+
+/// The training graph must retain the gate, up, activation, and gated-product
+/// values for autodiff.  Keep this path opt-in until the Metal backend grows a
+/// native multi-output Gemma MLP entry point and the production qualification
+/// suite has established numerical parity for both LoRA and QLoRA.  The
+/// graph-side executor below deliberately publishes every saved value, so the
+/// opt-in path is correctness preserving while that backend contract evolves.
+fn gemmaGatedMlpTrainingGraphFusionEnabled() bool {
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_GEMMA_GATED_MLP_TRAINING_GRAPH_FUSION", false)) return false;
+    return platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_GEMMA_GATED_MLP_TRAINING_GRAPH_FUSION", false);
+}
+
+/// Qualification switch for the Gemma gate/up input-gradient pair. Rows=64
+/// use the exact tiled kernel; the qualified seq128/seq512 lanes use the same
+/// alignment-safe packed M64 simdgroup geometry as the standalone GEMMs.
+/// Product training enables those measured rows by default. The explicit
+/// enable override remains an experiment surface for other supported 64-row
+/// multiples; the disable override is the production rollback. Any matcher or
+/// runtime miss leaves the two dot_general operations plus add untouched.
+var gemma_gate_up_backward_input_sum_enabled_cache: std.atomic.Value(u8) = .init(0);
+
+const GemmaGateUpBackwardInputSumMode = enum(u8) {
+    uninitialized = 0,
+    auto = 1,
+    disabled = 2,
+    forced = 3,
+};
+
+fn gemmaGateUpBackwardInputSumMode() GemmaGateUpBackwardInputSumMode {
+    // Environment overrides are immutable for the process. Cache only that
+    // decision; product training enablement is scoped and must remain live.
+    const cached = gemma_gate_up_backward_input_sum_enabled_cache.load(.acquire);
+    if (cached != @intFromEnum(GemmaGateUpBackwardInputSumMode.uninitialized)) return @enumFromInt(cached);
+    const mode: GemmaGateUpBackwardInputSumMode = if (platform.env.getenvBoolDefault(
+        "TERMITE_METAL_DISABLE_GEMMA4_BF16_GATE_UP_BACKWARD_INPUT_SUM",
+        false,
+    ))
+        .disabled
+    else if (platform.env.getenvBoolDefault(
+        "TERMITE_METAL_ENABLE_GEMMA4_BF16_GATE_UP_BACKWARD_INPUT_SUM",
+        false,
+    ))
+        .forced
+    else
+        .auto;
+    gemma_gate_up_backward_input_sum_enabled_cache.store(@intFromEnum(mode), .release);
+    return mode;
+}
+
+fn gemmaGateUpBackwardInputSumGraphFusionEnabled() bool {
+    return switch (gemmaGateUpBackwardInputSumMode()) {
+        .uninitialized => unreachable,
+        .disabled => false,
+        .forced => true,
+        .auto => training_executor_policy.enabled(),
+    };
+}
+
+fn gemmaGateUpBackwardInputSumKernelSupportsRows(rows: usize) bool {
+    return rows == 64 or (rows >= 128 and rows % 64 == 0);
+}
+
+fn gemmaGateUpBackwardInputSumDefaultRowsQualified(rows: usize) bool {
+    return rows == 64 or rows == 128 or rows == 512;
+}
+
+fn gemmaGateUpBackwardInputSumRowsQualified(rows: usize) bool {
+    if (gemmaGateUpBackwardInputSumDefaultRowsQualified(rows)) return true;
+    return gemmaGateUpBackwardInputSumMode() == .forced and gemmaGateUpBackwardInputSumKernelSupportsRows(rows);
 }
 
 fn attentionOutputResidualGraphFusionDisabled() bool {
@@ -4094,7 +4421,13 @@ fn buildRuntimeRegionPlan(
     const rank_adapter_backward_enabled = rankAdapterBackwardRuntimeRegionEnabled();
     const low_rank_lora_backward_enabled = lowRankLoraBackwardRuntimeRegionEnabled();
     const lora_backward_enabled = loraBackwardRuntimeRegionEnabled();
+    const gemma_gate_up_backward_input_sum_enabled = gemmaGateUpBackwardInputSumGraphFusionEnabled();
+    const gated_gelu_forward_enabled = gatedGeluForwardFusionEnabled();
+    const gated_gelu_backward_enabled = gatedGeluBackwardRuntimeRegionEnabled();
+    const masked_softmax_enabled = maskedSoftmaxRuntimeRegionEnabled();
+    const softmax_backward_enabled = softmaxBackwardRuntimeRegionEnabled();
     const ffn_gelu_backward_enabled = ffnGeluBackwardRuntimeRegionEnabled();
+    const gemma4_bf16_mlp_forward_pair_enabled = gemma4Bf16MlpForwardPairRuntimeRegionEnabled();
     for (node_ids, 0..) |node_id, node_pos| {
         const i: usize = @intCast(node_id);
         if (i >= reachable.len or !reachable[i]) continue;
@@ -4130,6 +4463,16 @@ fn buildRuntimeRegionPlan(
                 markRawLinearBiasPairSkipped(skipped, pattern);
                 region_count += 1;
                 continue;
+            }
+        }
+        if (raw_linear_regions_suppressed and gemma4_bf16_mlp_forward_pair_enabled) {
+            if (matchRawLinearPairPattern(graph, node_ids, node_pos, reachable, last_use, skipped)) |pattern| {
+                if (isQualifiedGemma4Bf16MlpForwardPair(graph, pattern)) {
+                    regions[node_pos] = .{ .raw_linear_pair = pattern };
+                    markRawLinearPairSkipped(skipped, pattern);
+                    region_count += 1;
+                    continue;
+                }
             }
         }
         if (!raw_linear_regions_suppressed) {
@@ -4195,6 +4538,52 @@ fn buildRuntimeRegionPlan(
                 regions[node_pos] = .{ .lora_backward = pattern };
                 pre_skip_stats.add(markLoraBackwardPreSkipped(graph, reachable, skipped, pre_skipped_by_region, pattern));
                 markLoraBackwardSkipped(skipped, pattern);
+                region_count += 1;
+                continue;
+            }
+        }
+        if (gemma_gate_up_backward_input_sum_enabled) {
+            if (matchGemmaGateUpBackwardInputSumPattern(
+                graph,
+                node_ids,
+                node_pos,
+                reachable,
+                skipped,
+                &.{},
+            )) |pattern| {
+                regions[node_pos] = .{ .gemma_gate_up_backward_input_sum = pattern };
+                markGemmaGateUpBackwardInputSumRegionSkipped(skipped, pattern);
+                region_count += 1;
+                continue;
+            }
+        }
+        if (gated_gelu_forward_enabled) {
+            if (matchGatedGeluForwardPattern(graph, node_ids, node_pos, reachable, skipped)) |pattern| {
+                regions[node_pos] = .{ .gated_gelu_forward = pattern };
+                region_count += 1;
+                continue;
+            }
+        }
+        if (gated_gelu_backward_enabled) {
+            if (matchGatedGeluBackwardPattern(graph, node_ids, node_pos, reachable, skipped)) |pattern| {
+                regions[node_pos] = .{ .gated_gelu_backward = pattern };
+                markGatedGeluBackwardSkipped(skipped, pattern);
+                region_count += 1;
+                continue;
+            }
+        }
+        if (masked_softmax_enabled) {
+            if (matchMaskedSoftmaxPattern(graph, node_ids, node_pos, reachable, skipped)) |pattern| {
+                regions[node_pos] = .{ .masked_softmax = pattern };
+                markMaskedSoftmaxSkipped(skipped, pattern);
+                region_count += 1;
+                continue;
+            }
+        }
+        if (softmax_backward_enabled) {
+            if (matchSoftmaxBackwardPattern(graph, node_ids, node_pos, reachable, skipped)) |pattern| {
+                regions[node_pos] = .{ .softmax_backward = pattern };
+                markSoftmaxBackwardSkipped(skipped, pattern);
                 region_count += 1;
                 continue;
             }
@@ -5024,6 +5413,28 @@ fn markSkipped(skipped: []bool, node_id: NodeId) void {
     if (i < skipped.len) skipped[i] = true;
 }
 
+fn markSatisfiedFusedInterior(satisfied: []bool, node_id: NodeId) void {
+    const i: usize = @intCast(node_id);
+    if (i < satisfied.len) satisfied[i] = true;
+}
+
+/// Returns true when the executor can honor an existing skip without
+/// materializing the node at its ordinary graph position. Runtime regions own
+/// their pre-skipped values. Fused-interior ownership is narrower: it is set
+/// only after a fusion has written the skipped producer's sole consumer, and
+/// never exempts a graph output.
+fn skippedNodeCanRemainElided(
+    protected_output: bool,
+    region_pre_skipped: bool,
+    fused_interior_satisfied: bool,
+    partition_is_output: bool,
+    future_consumer: bool,
+) bool {
+    if (protected_output) return false;
+    if (region_pre_skipped) return true;
+    return (fused_interior_satisfied and !partition_is_output) or !future_consumer;
+}
+
 fn markLinearNoBiasQkvSkipped(skipped: []bool, pattern: LinearNoBiasQkvPattern) void {
     markSkipped(skipped, pattern.k_id);
     markSkipped(skipped, pattern.v_id);
@@ -5247,6 +5658,14 @@ fn recordGemmaRuntimeResidency(
     hit: bool,
 ) void {
     const category = classifyGemmaRuntimeResidencyNode(graph, node_id) orelse return;
+    recordGemmaRuntimeResidencyCategory(stats, category, hit);
+}
+
+fn recordGemmaRuntimeResidencyCategory(
+    stats: *PartitionExecutor.ExecutionStats,
+    category: GemmaRuntimeResidencyCategory,
+    hit: bool,
+) void {
     switch (category) {
         .qkv => if (hit) {
             stats.gemma_qkv_hits += 1;
@@ -5304,6 +5723,7 @@ fn tryExecuteFusedMetalGraphPattern(
     exec_ctx: PartitionExecutor.ExecutionContext,
     exec_state: *interpreter.ExecState,
     skipped_nodes: []bool,
+    satisfied_fused_interiors: []bool,
     elision_protected_nodes: []const bool,
     runtime_region_plan: RuntimeRegionPlan,
     last_use: []const u32,
@@ -5311,7 +5731,36 @@ fn tryExecuteFusedMetalGraphPattern(
     donated: std.AutoHashMapUnmanaged(NodeId, void),
 ) !bool {
     if (fusedPatternProbingDisabled(exec_ctx)) return false;
-    if (try tryExecuteGroupedHeadDotPattern(
+    if (try tryExecuteGemmaGateUpBackwardInputSumPattern(
+        graph,
+        cb,
+        values,
+        value_device,
+        node_ids,
+        node_pos,
+        reachable,
+        device_id,
+        skipped_nodes,
+        satisfied_fused_interiors,
+        elision_protected_nodes,
+        exec_ctx.stats,
+    )) return true;
+    if (try tryExecuteRmsNormBackwardResidualAddPattern(
+        graph,
+        cb,
+        values,
+        value_device,
+        node_ids,
+        node_pos,
+        reachable,
+        device_id,
+        skipped_nodes,
+        satisfied_fused_interiors,
+        elision_protected_nodes,
+        last_use,
+        exec_ctx.stats,
+    )) return true;
+    if (try tryExecuteGroupedMpsDotPattern(
         allocator,
         graph,
         cb,
@@ -5388,6 +5837,18 @@ fn tryExecuteFusedMetalGraphPattern(
         skipped_nodes,
         last_use,
     )) return true;
+    if (try tryExecuteGemmaGatedMlpTrainingPattern(
+        graph,
+        cb,
+        values,
+        value_device,
+        node_ids,
+        node_pos,
+        reachable,
+        device_id,
+        skipped_nodes,
+        exec_ctx.stats,
+    )) return true;
     if (try tryExecuteRmsNormGatedFfnResidualPattern(
         graph,
         cb,
@@ -5444,6 +5905,168 @@ fn tryExecuteFusedMetalGraphPattern(
     );
 }
 
+const RmsNormBackwardResidualAddPattern = struct {
+    backward_id: NodeId,
+    reshape_id: NodeId,
+    add_id: NodeId,
+    residual_id: NodeId,
+    input_id: NodeId,
+    weight_id: NodeId,
+    dy_id: NodeId,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+    residual_on_rhs: bool,
+};
+
+/// Fuse only the exact frozen-weight topology emitted by Gemma's residual
+/// gradient accumulation: RMSNormBackward -> metadata reshape -> same-shape
+/// add. Requiring adjacent partition positions makes the matcher O(1) on the
+/// 6k-node DPO backward graph and fail-closed if graph lowering changes.
+fn matchRmsNormBackwardResidualAddPattern(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    elision_protected_nodes: []const bool,
+    last_use: []const u32,
+) ?RmsNormBackwardResidualAddPattern {
+    if (node_pos + 2 >= node_ids.len) return null;
+    const backward_id = node_ids[node_pos];
+    if (!isReachableUnskippedNode(reachable, skipped_nodes, backward_id)) return null;
+    const backward_index: usize = @intCast(backward_id);
+    if (backward_index < elision_protected_nodes.len and elision_protected_nodes[backward_index]) return null;
+    const backward = graph.node(backward_id);
+    const attrs = switch (backward.op) {
+        .fused_rms_norm_backward => |value| value,
+        else => return null,
+    };
+    if (attrs.backward_weight_grad or attrs.dim == 0 or backward.num_inputs != 3) return null;
+    if (graphNodeIsOutput(graph, backward_id)) return null;
+
+    const reshape_id = node_ids[node_pos + 1];
+    if (!isReachableUnskippedNode(reachable, skipped_nodes, reshape_id)) return null;
+    const reshape_index: usize = @intCast(reshape_id);
+    if (reshape_index < elision_protected_nodes.len and elision_protected_nodes[reshape_index]) return null;
+    const reshape = graph.node(reshape_id);
+    if (std.meta.activeTag(reshape.op) != .reshape or reshape.num_inputs != 1 or reshape.inputs[0] != backward_id) return null;
+    if (graphNodeIsOutput(graph, reshape_id)) return null;
+
+    const add_id = node_ids[node_pos + 2];
+    if (!isReachableUnskippedNode(reachable, skipped_nodes, add_id)) return null;
+    const add = graph.node(add_id);
+    switch (add.op) {
+        .add, .fused_elem_add => {},
+        else => return null,
+    }
+    if (add.num_inputs != 2) return null;
+    const residual_id = if (add.inputs[0] == reshape_id)
+        add.inputs[1]
+    else if (add.inputs[1] == reshape_id)
+        add.inputs[0]
+    else
+        return null;
+    if (residual_id == null_node or residual_id >= graph.nodeCount()) return null;
+    if (!shapesEqual(reshape.output_shape, add.output_shape) or
+        !shapesEqual(graph.node(residual_id).output_shape, add.output_shape) or
+        add.output_shape.dtype != .f32)
+    {
+        return null;
+    }
+    const backward_elems = tensorElementCount(backward.output_shape) orelse return null;
+    const add_elems = tensorElementCount(add.output_shape) orelse return null;
+    const dim: usize = @intCast(attrs.dim);
+    if (backward_elems != add_elems or backward_elems % dim != 0) return null;
+    if (!nodeLastUseIs(last_use, backward_id, reshape_id) or !nodeLastUseIs(last_use, reshape_id, add_id)) return null;
+
+    return .{
+        .backward_id = backward_id,
+        .reshape_id = reshape_id,
+        .add_id = add_id,
+        .residual_id = residual_id,
+        .input_id = backward.inputs[0],
+        .weight_id = backward.inputs[1],
+        .dy_id = backward.inputs[2],
+        .rows = backward_elems / dim,
+        .dim = dim,
+        .eps = attrs.eps,
+        .residual_on_rhs = add.inputs[1] == residual_id,
+    };
+}
+
+fn tryExecuteRmsNormBackwardResidualAddPattern(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    device_id: DeviceId,
+    skipped_nodes: []bool,
+    satisfied_fused_interiors: []bool,
+    elision_protected_nodes: []const bool,
+    last_use: []const u32,
+    stats: ?*PartitionExecutor.ExecutionStats,
+) !bool {
+    if (node_pos >= node_ids.len) return false;
+    switch (graph.node(node_ids[node_pos]).op) {
+        .fused_rms_norm_backward => {},
+        else => return false,
+    }
+    if (!rmsNormBackwardResidualAddGraphFusionEnabled()) return false;
+    const pattern = matchRmsNormBackwardResidualAddPattern(
+        graph,
+        node_ids,
+        node_pos,
+        reachable,
+        skipped_nodes,
+        elision_protected_nodes,
+        last_use,
+    ) orelse return false;
+    if (valueFor(values, pattern.backward_id) != null or valueFor(values, pattern.add_id) != null) return false;
+    const input = valueFor(values, pattern.input_id) orelse return false;
+    const weight = valueFor(values, pattern.weight_id) orelse return false;
+    const dy = valueFor(values, pattern.dy_id) orelse return false;
+    const residual = valueFor(values, pattern.residual_id) orelse return false;
+    var output_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
+    const output_shape = try fillShapeDims(graph.node(pattern.add_id).output_shape, &output_shape_buf);
+    const output = (try metal_compute_mod.MetalCompute.rmsNormBackwardResidualAdd(
+        cb,
+        input,
+        weight,
+        dy,
+        residual,
+        pattern.dim,
+        pattern.eps,
+        pattern.residual_on_rhs,
+        output_shape,
+    )) orelse return false;
+
+    values[@intCast(pattern.backward_id)] = output;
+    values[@intCast(pattern.add_id)] = output;
+    value_device[@intCast(pattern.backward_id)] = device_id;
+    value_device[@intCast(pattern.add_id)] = device_id;
+    markSkipped(skipped_nodes, pattern.backward_id);
+    markSkipped(skipped_nodes, pattern.reshape_id);
+    markSkipped(skipped_nodes, pattern.add_id);
+    markSatisfiedFusedInterior(satisfied_fused_interiors, pattern.reshape_id);
+    if (stats) |s| {
+        recordMetalGraphRegion(s, .tail, 3);
+        s.fused_graph_pattern_dispatches += 1;
+        s.fused_graph_nodes_elided += 2;
+        recordGemmaRuntimeResidencyCategory(s, .residual_add, isMetalResidentOrQuantizedDescriptor(cb, output));
+    }
+    if (traceMetalGraphFusionsEnabled()) {
+        std.debug.print(
+            "metal_graph_fusion_trace: rms_norm_backward_residual_add executed backward={d} reshape={d} add={d} rows={d} dim={d} residual_on_rhs={}\n",
+            .{ pattern.backward_id, pattern.reshape_id, pattern.add_id, pattern.rows, pattern.dim, pattern.residual_on_rhs },
+        );
+    }
+    return true;
+}
+
 fn preparedRuntimeRegionMatches(region: RuntimeRegion, prepared: PreparedRuntimeRegion) bool {
     return std.meta.activeTag(region) == std.meta.activeTag(prepared);
 }
@@ -5463,6 +6086,11 @@ fn preparedRuntimeRegionSlotCount(prepared: PreparedRuntimeRegion) u64 {
         .lora_backward => 0,
         .low_rank_lora_backward => 0,
         .rank_adapter_backward => 0,
+        .gemma_gate_up_backward_input_sum => 2,
+        .gated_gelu_forward => 0,
+        .gated_gelu_backward => 0,
+        .masked_softmax => 0,
+        .softmax_backward => 0,
         .ffn_gelu_backward => 0,
         .q_linear => 1,
         .linear_qkv, .grouped_linear_qkv_slice, .packed_linear_qkv_slice => 3,
@@ -5960,6 +6588,21 @@ fn prepareRuntimeRegion(
         .lora_backward => .{ .lora_backward = {} },
         .low_rank_lora_backward => .{ .low_rank_lora_backward = {} },
         .rank_adapter_backward => .{ .rank_adapter_backward = {} },
+        .gemma_gate_up_backward_input_sum => |pattern| .{
+            .gemma_gate_up_backward_input_sum = (try prepareGemmaGateUpBackwardInputSumRegion(
+                graph,
+                cb,
+                values,
+                value_device,
+                device_id,
+                pattern,
+                stats,
+            )) orelse return null,
+        },
+        .gated_gelu_forward => .{ .gated_gelu_forward = {} },
+        .gated_gelu_backward => .{ .gated_gelu_backward = {} },
+        .masked_softmax => .{ .masked_softmax = {} },
+        .softmax_backward => .{ .softmax_backward = {} },
         .ffn_gelu_backward => .{ .ffn_gelu_backward = {} },
         .q_linear => |pattern| .{
             .q_linear = (try prepareQLinearRegion(cb, values, pattern, stats)) orelse return null,
@@ -6008,12 +6651,12 @@ fn tryExecutePlannedRuntimeRegion(
     exec_ctx: PartitionExecutor.ExecutionContext,
     exec_state: *interpreter.ExecState,
     skipped_nodes: []bool,
+    satisfied_fused_interiors: []bool,
+    elision_protected_nodes: []const bool,
     last_use: []const u32,
     rt_map: std.AutoHashMapUnmanaged(NodeId, CT),
     donated: std.AutoHashMapUnmanaged(NodeId, void),
 ) !bool {
-    _ = node_ids;
-    _ = node_pos;
     _ = reachable;
     const prepared = (try prepareRuntimeRegion(graph, cb, values, value_device, device_id, region, prepared_region, exec_ctx.stats)) orelse {
         if (std.meta.activeTag(region) != .none) {
@@ -6166,6 +6809,62 @@ fn tryExecutePlannedRuntimeRegion(
             pattern,
             skipped_nodes,
         ),
+        .gemma_gate_up_backward_input_sum => |pattern| executeGemmaGateUpBackwardInputSumPattern(
+            cb,
+            values,
+            value_device,
+            device_id,
+            skipped_nodes,
+            satisfied_fused_interiors,
+            exec_ctx.stats,
+            pattern,
+            switch (prepared) {
+                .gemma_gate_up_backward_input_sum => |slots| slots,
+                else => return false,
+            },
+        ),
+        .gated_gelu_forward => |pattern| executeGatedGeluForwardPattern(
+            graph,
+            cb,
+            values,
+            value_device,
+            device_id,
+            skipped_nodes,
+            exec_ctx.stats,
+            pattern,
+        ),
+        .gated_gelu_backward => |pattern| executeGatedGeluBackwardPattern(
+            graph,
+            cb,
+            values,
+            value_device,
+            device_id,
+            exec_ctx.stats,
+            pattern,
+            skipped_nodes,
+        ),
+        .masked_softmax => |pattern| executeMaskedSoftmaxPattern(
+            graph,
+            cb,
+            values,
+            value_device,
+            device_id,
+            exec_ctx.stats,
+            pattern,
+            skipped_nodes,
+        ),
+        .softmax_backward => |pattern| executeSoftmaxBackwardPattern(
+            graph,
+            cb,
+            values,
+            value_device,
+            device_id,
+            exec_ctx.stats,
+            pattern,
+            skipped_nodes,
+            satisfied_fused_interiors,
+            elision_protected_nodes,
+        ),
         .ffn_gelu_backward => |pattern| executeFfnGeluBackwardPattern(
             graph,
             cb,
@@ -6196,6 +6895,8 @@ fn tryExecutePlannedRuntimeRegion(
             cb,
             values,
             value_device,
+            node_ids,
+            node_pos,
             device_id,
             exec_ctx,
             skipped_nodes,
@@ -6214,6 +6915,8 @@ fn tryExecutePlannedRuntimeRegion(
             cb,
             values,
             value_device,
+            node_ids,
+            node_pos,
             device_id,
             exec_ctx,
             skipped_nodes,
@@ -6232,6 +6935,8 @@ fn tryExecutePlannedRuntimeRegion(
             cb,
             values,
             value_device,
+            node_ids,
+            node_pos,
             device_id,
             exec_ctx,
             skipped_nodes,
@@ -6250,6 +6955,8 @@ fn tryExecutePlannedRuntimeRegion(
             cb,
             values,
             value_device,
+            node_ids,
+            node_pos,
             device_id,
             exec_ctx,
             skipped_nodes,
@@ -6555,6 +7262,744 @@ fn matchAttentionOutputResidualPattern(
         .hidden_size = linear_attrs.out_dim,
         .eps = eps,
     };
+}
+
+const GemmaGateUpBackwardProjection = enum {
+    gate,
+    up,
+};
+
+const GemmaGateUpBackwardInputSumPattern = struct {
+    anchor_dot_id: NodeId,
+    first_dot_id: NodeId,
+    second_dot_id: NodeId,
+    first_input_id: NodeId,
+    second_input_id: NodeId,
+    first_weight_id: NodeId,
+    second_weight_id: NodeId,
+    add_id: NodeId,
+    rows: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+};
+
+fn gemmaGateUpBackwardInputSumElidedDot(pattern: GemmaGateUpBackwardInputSumPattern) NodeId {
+    return if (pattern.first_dot_id == pattern.anchor_dot_id)
+        pattern.second_dot_id
+    else
+        pattern.first_dot_id;
+}
+
+fn markGemmaGateUpBackwardInputSumRegionSkipped(skipped: []bool, pattern: GemmaGateUpBackwardInputSumPattern) void {
+    markSkipped(skipped, gemmaGateUpBackwardInputSumElidedDot(pattern));
+    markSkipped(skipped, pattern.add_id);
+}
+
+fn graphNodeIsOutput(graph: *const Graph, node_id: NodeId) bool {
+    for (graph.outputs.items) |output_id| {
+        if (output_id == node_id) return true;
+    }
+    return false;
+}
+
+fn prepareGemmaGateUpBackwardInputSumRegion(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    pattern: GemmaGateUpBackwardInputSumPattern,
+    stats: ?*PartitionExecutor.ExecutionStats,
+) !?PreparedLinearPairRegion {
+    _ = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, pattern.first_weight_id)) orelse return null;
+    _ = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, pattern.second_weight_id)) orelse return null;
+    const first_slot = (try ensurePreparedLinearSlot(
+        cb,
+        values,
+        pattern.first_weight_id,
+        pattern.hidden_size,
+        pattern.intermediate_size,
+        stats,
+    )) orelse return null;
+    const second_slot = (try ensurePreparedLinearSlot(
+        cb,
+        values,
+        pattern.second_weight_id,
+        pattern.hidden_size,
+        pattern.intermediate_size,
+        stats,
+    )) orelse return null;
+    if (first_slot == second_slot) return null;
+    return .{ .first_slot = first_slot, .second_slot = second_slot };
+}
+
+fn tryExecuteGemmaGateUpBackwardInputSumPattern(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    device_id: DeviceId,
+    skipped_nodes: []bool,
+    satisfied_fused_interiors: []bool,
+    elision_protected_nodes: []const bool,
+    stats: ?*PartitionExecutor.ExecutionStats,
+) !bool {
+    if (node_pos >= node_ids.len) return false;
+    // Avoid even the cached feature-flag load for the overwhelmingly common
+    // non-dot probes.
+    switch (graph.node(node_ids[node_pos]).op) {
+        .dot_general => {},
+        else => return false,
+    }
+    if (!gemmaGateUpBackwardInputSumGraphFusionEnabled()) return false;
+    const pattern = matchGemmaGateUpBackwardInputSumPattern(
+        graph,
+        node_ids,
+        node_pos,
+        reachable,
+        skipped_nodes,
+        elision_protected_nodes,
+    ) orelse return false;
+
+    return executeGemmaGateUpBackwardInputSumPattern(
+        cb,
+        values,
+        value_device,
+        device_id,
+        skipped_nodes,
+        satisfied_fused_interiors,
+        stats,
+        pattern,
+        null,
+    );
+}
+
+fn executeGemmaGateUpBackwardInputSumPattern(
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    skipped_nodes: []bool,
+    satisfied_fused_interiors: []bool,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    pattern: GemmaGateUpBackwardInputSumPattern,
+    prepared: ?PreparedLinearPairRegion,
+) !bool {
+    for ([_]NodeId{ pattern.anchor_dot_id, pattern.first_dot_id, pattern.second_dot_id, pattern.add_id }) |node_id| {
+        if (valueFor(values, node_id) != null) return false;
+    }
+    const first_input = valueFor(values, pattern.first_input_id) orelse return false;
+    const second_input = valueFor(values, pattern.second_input_id) orelse return false;
+    const output = if (prepared) |slots|
+        (try metal_compute_mod.MetalCompute.nativeBf16LinearBackwardInputPairSumPrepared(
+            cb,
+            first_input,
+            slots.first_slot,
+            second_input,
+            slots.second_slot,
+            pattern.rows,
+            pattern.hidden_size,
+            pattern.intermediate_size,
+        )) orelse return false
+    else blk: {
+        const first_weight = valueFor(values, pattern.first_weight_id) orelse return false;
+        const second_weight = valueFor(values, pattern.second_weight_id) orelse return false;
+        break :blk (try metal_compute_mod.MetalCompute.nativeBf16LinearBackwardInputPairSum(
+            cb,
+            first_input,
+            first_weight,
+            second_input,
+            second_weight,
+            pattern.rows,
+            pattern.hidden_size,
+            pattern.intermediate_size,
+        )) orelse return false;
+    };
+
+    values[@intCast(pattern.anchor_dot_id)] = output;
+    values[@intCast(pattern.add_id)] = output;
+    value_device[@intCast(pattern.anchor_dot_id)] = device_id;
+    value_device[@intCast(pattern.add_id)] = device_id;
+    const elided_dot_id = gemmaGateUpBackwardInputSumElidedDot(pattern);
+    markSkipped(skipped_nodes, pattern.anchor_dot_id);
+    markSkipped(skipped_nodes, elided_dot_id);
+    markSkipped(skipped_nodes, pattern.add_id);
+    // The pair kernel writes the add directly, so the other dot's individual
+    // value has no remaining semantic consumer.  Preserve that fact across
+    // the top-level skip override; otherwise static liveness sees the skipped
+    // add edge and redundantly re-executes this full GEMM.
+    markSatisfiedFusedInterior(satisfied_fused_interiors, elided_dot_id);
+
+    if (stats) |s| {
+        recordMetalGraphRegion(s, .ffn, 3);
+        s.fused_graph_pattern_dispatches += 1;
+        s.fused_graph_nodes_elided += 2;
+        // The matcher guarantees that this output is the fused `.add` node.
+        // Preserve the generic classifier's `.residual_add` accounting without
+        // recursively walking the full backward graph for every layer.
+        recordGemmaRuntimeResidencyCategory(s, .residual_add, isMetalResidentOrQuantizedDescriptor(cb, output));
+    }
+    if (traceMetalGraphFusionsEnabled()) {
+        std.debug.print(
+            "metal_graph_fusion_trace: gemma_gate_up_backward_input_sum executed anchor={d} first={d} second={d} add={d} rows={d} hidden={d} intermediate={d}\n",
+            .{ pattern.anchor_dot_id, pattern.first_dot_id, pattern.second_dot_id, pattern.add_id, pattern.rows, pattern.hidden_size, pattern.intermediate_size },
+        );
+    }
+    return true;
+}
+
+fn matchGemmaGateUpBackwardInputSumPattern(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    elision_protected_nodes: []const bool,
+) ?GemmaGateUpBackwardInputSumPattern {
+    if (node_pos >= node_ids.len) return null;
+    const anchor_dot_id = node_ids[node_pos];
+    if (!isReachableUnskippedNode(reachable, skipped_nodes, anchor_dot_id)) return null;
+    // The fusion materializes the sum, not either individual product. A dot
+    // that independently escapes as a graph output therefore cannot be an
+    // interior, even when the optional scalar-tail override is disabled.
+    if (graphNodeIsOutput(graph, anchor_dot_id)) return null;
+    const anchor_index: usize = @intCast(anchor_dot_id);
+    if (anchor_index < elision_protected_nodes.len and elision_protected_nodes[anchor_index]) return null;
+    const anchor = graph.node(anchor_dot_id);
+    const anchor_attrs = switch (anchor.op) {
+        .dot_general => |attrs| attrs,
+        else => return null,
+    };
+    if (!isLinearDotAttrs(anchor_attrs) or anchor.num_inputs < 2) return null;
+
+    // Reject all non-Gemma/non-target dots before the consumer scan below.
+    // In a Gemma training graph this reduces the enabled-path scan count from
+    // every contraction to only the gate/up base input-gradient candidates.
+    const anchor_weight_id = anchor.inputs[1];
+    if (anchor_weight_id == null_node) return null;
+    const anchor_weight = graph.node(anchor_weight_id);
+    if (std.meta.activeTag(anchor_weight.op) != .parameter) return null;
+    const anchor_weight_name = graph.parameterName(anchor_weight);
+    const anchor_role = gemmaGateUpBackwardProjectionForWeight(anchor_weight_name) orelse return null;
+    const anchor_suffix = if (anchor_role == .gate) gemma_mlp_gate_weight_suffix else gemma_mlp_up_weight_suffix;
+    _ = gemmaMlpLayerPrefix(anchor_weight_name, anchor_suffix) orelse return null;
+    const anchor_input_shape = graph.node(anchor.inputs[0]).output_shape;
+    if (anchor.output_shape.rank() != 2 or anchor_input_shape.rank() != 2 or anchor_weight.output_shape.rank() != 2) return null;
+    const anchor_rows = shapeDimUsize(anchor.output_shape, 0) orelse return null;
+    const anchor_hidden = shapeDimUsize(anchor.output_shape, 1) orelse return null;
+    if (!gemmaGateUpBackwardInputSumRowsQualified(anchor_rows)) return null;
+    const anchor_intermediate = shapeDimUsize(anchor_input_shape, 1) orelse return null;
+    if (!gemma4Bf16MlpProjectionShapeQualified(anchor_hidden, anchor_intermediate)) return null;
+
+    var add_id_opt: ?NodeId = null;
+    for (node_ids[node_pos + 1 ..]) |candidate_id| {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, candidate_id)) continue;
+        const candidate = graph.node(candidate_id);
+        switch (candidate.op) {
+            .add, .fused_elem_add => {},
+            else => continue,
+        }
+        if (candidate.num_inputs < 2 or
+            (candidate.inputs[0] != anchor_dot_id and candidate.inputs[1] != anchor_dot_id)) continue;
+        if (add_id_opt != null) return null;
+        add_id_opt = candidate_id;
+    }
+    const add_id = add_id_opt orelse return null;
+    const add = graph.node(add_id);
+    const other_dot_id = if (add.inputs[0] == anchor_dot_id) add.inputs[1] else add.inputs[0];
+    if (other_dot_id == null_node or !isReachableUnskippedNode(reachable, skipped_nodes, other_dot_id)) return null;
+    if (graphNodeIsOutput(graph, other_dot_id)) return null;
+    const other_index: usize = @intCast(other_dot_id);
+    if (other_index < elision_protected_nodes.len and elision_protected_nodes[other_index]) return null;
+    const other_pos = findNodePos(node_ids, other_dot_id) orelse return null;
+    const add_pos = findNodePos(node_ids, add_id) orelse return null;
+    if (other_pos <= node_pos or add_pos <= other_pos) return null;
+    const other = graph.node(other_dot_id);
+    const other_attrs = switch (other.op) {
+        .dot_general => |attrs| attrs,
+        else => return null,
+    };
+    if (!isLinearDotAttrs(other_attrs) or other.num_inputs < 2) return null;
+
+    const first_dot_id = add.inputs[0];
+    const second_dot_id = add.inputs[1];
+    const first_dot = graph.node(first_dot_id);
+    const second_dot = graph.node(second_dot_id);
+    if (first_dot.num_inputs < 2 or second_dot.num_inputs < 2) return null;
+    if (!first_dot.output_shape.eq(second_dot.output_shape) or !add.output_shape.eq(first_dot.output_shape)) return null;
+    if (!hasOnlyExpectedUses(graph, reachable, skipped_nodes, first_dot_id, &.{add_id}) or
+        !hasOnlyExpectedUses(graph, reachable, skipped_nodes, second_dot_id, &.{add_id})) return null;
+
+    const first_weight_id = first_dot.inputs[1];
+    const second_weight_id = second_dot.inputs[1];
+    if (first_weight_id == null_node or second_weight_id == null_node) return null;
+    const first_weight = graph.node(first_weight_id);
+    const second_weight = graph.node(second_weight_id);
+    if (std.meta.activeTag(first_weight.op) != .parameter or std.meta.activeTag(second_weight.op) != .parameter) return null;
+    const first_name = graph.parameterName(first_weight);
+    const second_name = graph.parameterName(second_weight);
+    const first_role = gemmaGateUpBackwardProjectionForWeight(first_name) orelse return null;
+    const second_role = gemmaGateUpBackwardProjectionForWeight(second_name) orelse return null;
+    if (first_role == second_role) return null;
+    const first_suffix = if (first_role == .gate) gemma_mlp_gate_weight_suffix else gemma_mlp_up_weight_suffix;
+    const second_suffix = if (second_role == .gate) gemma_mlp_gate_weight_suffix else gemma_mlp_up_weight_suffix;
+    const first_prefix = gemmaMlpLayerPrefix(first_name, first_suffix) orelse return null;
+    const second_prefix = gemmaMlpLayerPrefix(second_name, second_suffix) orelse return null;
+    if (!std.mem.eql(u8, first_prefix, second_prefix)) return null;
+
+    const output_shape = first_dot.output_shape;
+    const first_input_shape = graph.node(first_dot.inputs[0]).output_shape;
+    const second_input_shape = graph.node(second_dot.inputs[0]).output_shape;
+    if (output_shape.rank() != 2 or first_input_shape.rank() != 2 or second_input_shape.rank() != 2 or
+        first_weight.output_shape.rank() != 2 or second_weight.output_shape.rank() != 2) return null;
+    const rows = shapeDimUsize(output_shape, 0) orelse return null;
+    const hidden_size = shapeDimUsize(output_shape, 1) orelse return null;
+    const intermediate_size = shapeDimUsize(first_input_shape, 1) orelse return null;
+    // Admit only the production Gemma 4 E2B/E4B geometries. Broader shapes
+    // require their own parity/performance evidence rather than inheriting
+    // this gate merely because their dimensions are tile-aligned.
+    if (!gemmaGateUpBackwardInputSumRowsQualified(rows) or
+        !gemma4Bf16MlpProjectionShapeQualified(hidden_size, intermediate_size)) return null;
+    if (shapeDimUsize(first_input_shape, 0) != rows or
+        shapeDimUsize(second_input_shape, 0) != rows or
+        shapeDimUsize(second_input_shape, 1) != intermediate_size) return null;
+    for ([_]*const ml.graph.Node{ first_weight, second_weight }) |weight| {
+        if (shapeDimUsize(weight.output_shape, 0) != intermediate_size or
+            shapeDimUsize(weight.output_shape, 1) != hidden_size) return null;
+    }
+
+    return .{
+        .anchor_dot_id = anchor_dot_id,
+        .first_dot_id = first_dot_id,
+        .second_dot_id = second_dot_id,
+        .first_input_id = first_dot.inputs[0],
+        .second_input_id = second_dot.inputs[0],
+        .first_weight_id = first_weight_id,
+        .second_weight_id = second_weight_id,
+        .add_id = add_id,
+        .rows = rows,
+        .hidden_size = hidden_size,
+        .intermediate_size = intermediate_size,
+    };
+}
+
+fn gemmaGateUpBackwardProjectionForWeight(name: []const u8) ?GemmaGateUpBackwardProjection {
+    if (gemmaMlpLayerPrefix(name, gemma_mlp_gate_weight_suffix) != null) return .gate;
+    if (gemmaMlpLayerPrefix(name, gemma_mlp_up_weight_suffix) != null) return .up;
+    return null;
+}
+
+const GemmaGatedMlpTrainingPattern = struct {
+    gate_id: NodeId,
+    up_id: NodeId,
+    activation_id: NodeId,
+    multiply_id: NodeId,
+    down_id: NodeId,
+    input_id: NodeId,
+    gate_weight_id: NodeId,
+    up_weight_id: NodeId,
+    down_weight_id: NodeId,
+    activation: ops_mod.DecoderRuntimeActivationKind,
+    rows: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+
+    fn elidedNodeCount(_: GemmaGatedMlpTrainingPattern) u64 {
+        // The gate node anchors the region and still counts as the command at
+        // the current graph position.  The remaining four nodes are skipped.
+        return 4;
+    }
+};
+
+fn tryExecuteGemmaGatedMlpTrainingPattern(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    device_id: DeviceId,
+    skipped_nodes: []bool,
+    stats: ?*PartitionExecutor.ExecutionStats,
+) !bool {
+    if (!gemmaGatedMlpTrainingGraphFusionEnabled()) return false;
+    const pattern = matchGemmaGatedMlpTrainingPattern(
+        graph,
+        node_ids,
+        node_pos,
+        reachable,
+        skipped_nodes,
+    ) orelse return false;
+    return executeGemmaGatedMlpTrainingPattern(
+        graph,
+        cb,
+        values,
+        value_device,
+        device_id,
+        skipped_nodes,
+        stats,
+        pattern,
+    );
+}
+
+fn executeGemmaGatedMlpTrainingPattern(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    skipped_nodes: []bool,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    pattern: GemmaGatedMlpTrainingPattern,
+) !bool {
+    // Never replace an already-materialized saved activation.  Besides making
+    // rollback simple, this prevents the opt-in executor from invalidating a
+    // value that an earlier training runtime region intentionally produced.
+    for ([_]NodeId{ pattern.gate_id, pattern.up_id, pattern.activation_id, pattern.multiply_id, pattern.down_id }) |node_id| {
+        if (valueFor(values, node_id) != null) return traceGemmaGatedMlpTrainingDeclined("output_already_materialized", node_id);
+    }
+
+    const input = valueFor(values, pattern.input_id) orelse
+        return traceGemmaGatedMlpTrainingDeclined("missing_input", pattern.input_id);
+    const gate_weight = valueFor(values, pattern.gate_weight_id) orelse
+        return traceGemmaGatedMlpTrainingDeclined("missing_gate_weight", pattern.gate_weight_id);
+    const up_weight = valueFor(values, pattern.up_weight_id) orelse
+        return traceGemmaGatedMlpTrainingDeclined("missing_up_weight", pattern.up_weight_id);
+    const down_weight = valueFor(values, pattern.down_weight_id) orelse
+        return traceGemmaGatedMlpTrainingDeclined("missing_down_weight", pattern.down_weight_id);
+
+    var gate_value: ?CT = null;
+    var up_value: ?CT = null;
+    var activation_value: ?CT = null;
+    var multiply_value: ?CT = null;
+    var down_value: ?CT = null;
+    var committed = false;
+    defer if (!committed) {
+        // ComputeBackend operations used here produce owned outputs.  Keep all
+        // values private until the complete region succeeds, then publish them
+        // atomically below so a declined fusion leaves the scalar path intact.
+        if (down_value) |value| cb.free(value);
+        if (multiply_value) |value| cb.free(value);
+        if (activation_value) |value| cb.free(value);
+        if (up_value) |value| cb.free(value);
+        if (gate_value) |value| cb.free(value);
+    };
+
+    const pair = cb.linearNoBiasPair(
+        input,
+        gate_weight,
+        up_weight,
+        pattern.rows,
+        pattern.hidden_size,
+        pattern.intermediate_size,
+    ) catch |err| switch (err) {
+        error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return traceGemmaGatedMlpTrainingDeclined("gate_up_pair_unavailable", pattern.gate_id),
+        else => return err,
+    };
+    gate_value = pair.first;
+    up_value = pair.second;
+
+    activation_value = (try executeGemmaGatedMlpTrainingActivation(cb, pair.first, pattern.activation)) orelse
+        return traceGemmaGatedMlpTrainingDeclined("activation_unavailable", pattern.activation_id);
+    multiply_value = cb.multiply(activation_value.?, pair.second) catch |err| switch (err) {
+        error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return traceGemmaGatedMlpTrainingDeclined("multiply_unavailable", pattern.multiply_id),
+        else => return err,
+    };
+    down_value = cb.linearNoBias(
+        multiply_value.?,
+        down_weight,
+        pattern.rows,
+        pattern.intermediate_size,
+        pattern.hidden_size,
+    ) catch |err| switch (err) {
+        error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return traceGemmaGatedMlpTrainingDeclined("down_projection_unavailable", pattern.down_id),
+        else => return err,
+    };
+
+    values[@intCast(pattern.gate_id)] = gate_value.?;
+    values[@intCast(pattern.up_id)] = up_value.?;
+    values[@intCast(pattern.activation_id)] = activation_value.?;
+    values[@intCast(pattern.multiply_id)] = multiply_value.?;
+    values[@intCast(pattern.down_id)] = down_value.?;
+    value_device[@intCast(pattern.gate_id)] = device_id;
+    value_device[@intCast(pattern.up_id)] = device_id;
+    value_device[@intCast(pattern.activation_id)] = device_id;
+    value_device[@intCast(pattern.multiply_id)] = device_id;
+    value_device[@intCast(pattern.down_id)] = device_id;
+    markSkipped(skipped_nodes, pattern.up_id);
+    markSkipped(skipped_nodes, pattern.activation_id);
+    markSkipped(skipped_nodes, pattern.multiply_id);
+    markSkipped(skipped_nodes, pattern.down_id);
+    committed = true;
+
+    if (stats) |s| {
+        recordMetalGraphRegion(s, .ffn, 5);
+        s.fused_graph_pattern_dispatches += 1;
+        s.fused_graph_nodes_elided += pattern.elidedNodeCount();
+        s.metal_linear_pair_fusions += 1;
+        recordGemmaRuntimeResidency(s, graph, pattern.gate_id, isMetalResidentOrQuantizedDescriptor(cb, gate_value.?));
+        recordGemmaRuntimeResidency(s, graph, pattern.up_id, isMetalResidentOrQuantizedDescriptor(cb, up_value.?));
+        recordGemmaRuntimeResidency(s, graph, pattern.down_id, isMetalResidentOrQuantizedDescriptor(cb, down_value.?));
+    }
+    if (traceMetalGraphFusionsEnabled()) {
+        std.debug.print(
+            "metal_graph_fusion_trace: gemma_gated_mlp_training executed gate={d} up={d} activation={d} multiply={d} down={d} rows={d} hidden={d} intermediate={d} activation_kind={s}\n",
+            .{ pattern.gate_id, pattern.up_id, pattern.activation_id, pattern.multiply_id, pattern.down_id, pattern.rows, pattern.hidden_size, pattern.intermediate_size, @tagName(pattern.activation) },
+        );
+    }
+    return true;
+}
+
+fn executeGemmaGatedMlpTrainingActivation(
+    cb: *const ComputeBackend,
+    input: CT,
+    activation: ops_mod.DecoderRuntimeActivationKind,
+) !?CT {
+    return switch (activation) {
+        .gelu => cb.gelu(input) catch |err| switch (err) {
+            error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+            else => return err,
+        },
+        .gelu_exact => cb.geluExact(input) catch |err| switch (err) {
+            error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+            else => return err,
+        },
+        .relu => cb.relu(input) catch |err| switch (err) {
+            error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+            else => return err,
+        },
+        .silu => cb.silu(input) catch |err| switch (err) {
+            error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+            else => return err,
+        },
+        .quick_gelu => cb.quickGelu(input) catch |err| switch (err) {
+            error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+            else => return err,
+        },
+        else => null,
+    };
+}
+
+fn matchGemmaGatedMlpTrainingPattern(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?GemmaGatedMlpTrainingPattern {
+    if (node_pos >= node_ids.len) return null;
+    const gate_id = node_ids[node_pos];
+    if (!isReachableUnskippedNode(reachable, skipped_nodes, gate_id)) return null;
+    const gate = graph.node(gate_id);
+    const gate_attrs = switch (gate.op) {
+        .fused_linear_no_bias => |attrs| attrs,
+        else => return null,
+    };
+    if (gate_attrs.num_projections != 0 or gate_attrs.rows == 0 or gate_attrs.in_dim == 0 or gate_attrs.out_dim == 0) return null;
+    if (gate_attrs.out_dim < gate_attrs.in_dim) return null;
+    const gate_inputs = gate.getInputs();
+    if (gate_inputs.len < 2) return null;
+    const gate_weight_name = linearWeightParameterName(graph, gate) orelse return null;
+    const layer_prefix = gemmaMlpLayerPrefix(gate_weight_name, gemma_mlp_gate_weight_suffix) orelse return null;
+
+    const input_shape = graph.node(gate_inputs[0]).output_shape;
+    if (input_shape.rank() != 2 or
+        shapeDimUsize(input_shape, 0) != gate_attrs.rows or
+        shapeDimUsize(input_shape, 1) != gate_attrs.in_dim)
+    {
+        return null;
+    }
+    if (gate.output_shape.rank() != 2 or
+        shapeDimUsize(gate.output_shape, 0) != gate_attrs.rows or
+        shapeDimUsize(gate.output_shape, 1) != gate_attrs.out_dim)
+    {
+        return null;
+    }
+
+    const up_id = findUniqueGemmaMlpLinear(
+        graph,
+        node_ids,
+        node_pos + 1,
+        reachable,
+        skipped_nodes,
+        gate_inputs[0],
+        layer_prefix,
+        gemma_mlp_up_weight_suffix,
+        gate_attrs.rows,
+        gate_attrs.in_dim,
+        gate_attrs.out_dim,
+    ) orelse return null;
+    const activation_id = findUniqueReachableUnaryConsumer(
+        graph,
+        node_ids,
+        node_pos + 1,
+        reachable,
+        skipped_nodes,
+        gate_id,
+        &isSupportedGatedFfnActivation,
+    ) orelse return null;
+    const activation = activationKindForGraphNode(graph.node(activation_id)) orelse return null;
+    const activation_shape = graph.node(activation_id).output_shape;
+    if (!activation_shape.eq(gate.output_shape)) return null;
+
+    const multiply_id = findUniqueReachableBinaryConsumer(
+        graph,
+        node_ids,
+        node_pos + 1,
+        reachable,
+        skipped_nodes,
+        activation_id,
+        up_id,
+        &isMultiplyNode,
+    ) orelse return null;
+    if (!graph.node(multiply_id).output_shape.eq(gate.output_shape)) return null;
+    const multiply_pos = findNodePos(node_ids, multiply_id) orelse return null;
+    const down_id = findUniqueGemmaMlpLinear(
+        graph,
+        node_ids,
+        multiply_pos + 1,
+        reachable,
+        skipped_nodes,
+        multiply_id,
+        layer_prefix,
+        gemma_mlp_down_weight_suffix,
+        gate_attrs.rows,
+        gate_attrs.out_dim,
+        gate_attrs.in_dim,
+    ) orelse return null;
+    const down = graph.node(down_id);
+    if (down.output_shape.rank() != 2 or
+        shapeDimUsize(down.output_shape, 0) != gate_attrs.rows or
+        shapeDimUsize(down.output_shape, 1) != gate_attrs.in_dim)
+    {
+        return null;
+    }
+    const up_inputs = graph.node(up_id).getInputs();
+    const down_inputs = down.getInputs();
+    if (up_inputs.len < 2 or down_inputs.len < 2) return null;
+
+    return .{
+        .gate_id = gate_id,
+        .up_id = up_id,
+        .activation_id = activation_id,
+        .multiply_id = multiply_id,
+        .down_id = down_id,
+        .input_id = gate_inputs[0],
+        .gate_weight_id = gate_inputs[1],
+        .up_weight_id = up_inputs[1],
+        .down_weight_id = down_inputs[1],
+        .activation = activation,
+        .rows = gate_attrs.rows,
+        .hidden_size = gate_attrs.in_dim,
+        .intermediate_size = gate_attrs.out_dim,
+    };
+}
+
+const gemma_mlp_gate_weight_suffix = ".mlp.gate_proj.weight";
+const gemma_mlp_up_weight_suffix = ".mlp.up_proj.weight";
+const gemma_mlp_down_weight_suffix = ".mlp.down_proj.weight";
+
+fn gemmaMlpLayerPrefix(name: []const u8, suffix: []const u8) ?[]const u8 {
+    if (parseGemmaLayerIndex(name) == null) return null;
+    if (!std.mem.endsWith(u8, name, suffix) or name.len <= suffix.len) return null;
+    return name[0 .. name.len - suffix.len];
+}
+
+fn findUniqueGemmaMlpLinear(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    start_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    input_id: NodeId,
+    layer_prefix: []const u8,
+    weight_suffix: []const u8,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) ?NodeId {
+    if (start_pos >= node_ids.len) return null;
+    var found: ?NodeId = null;
+    for (node_ids[start_pos..]) |candidate_id| {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, candidate_id)) continue;
+        const candidate = graph.node(candidate_id);
+        const attrs = switch (candidate.op) {
+            .fused_linear_no_bias => |linear_attrs| linear_attrs,
+            else => continue,
+        };
+        if (attrs.num_projections != 0 or attrs.rows != rows or attrs.in_dim != in_dim or attrs.out_dim != out_dim) continue;
+        const inputs = candidate.getInputs();
+        if (inputs.len < 2 or inputs[0] != input_id) continue;
+        const weight_name = linearWeightParameterName(graph, candidate) orelse continue;
+        const candidate_prefix = gemmaMlpLayerPrefix(weight_name, weight_suffix) orelse continue;
+        if (!std.mem.eql(u8, layer_prefix, candidate_prefix)) continue;
+        if (found != null) return null;
+        found = candidate_id;
+    }
+    return found;
+}
+
+fn findUniqueReachableUnaryConsumer(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    start_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    input_id: NodeId,
+    predicate: *const fn (*const ml.graph.Node) bool,
+) ?NodeId {
+    if (start_pos >= node_ids.len) return null;
+    var found: ?NodeId = null;
+    for (node_ids[start_pos..]) |candidate_id| {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, candidate_id)) continue;
+        const candidate = graph.node(candidate_id);
+        if (!predicate(candidate)) continue;
+        const inputs = candidate.getInputs();
+        if (inputs.len < 1 or inputs[0] != input_id) continue;
+        if (found != null) return null;
+        found = candidate_id;
+    }
+    return found;
+}
+
+fn findUniqueReachableBinaryConsumer(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    start_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    lhs_id: NodeId,
+    rhs_id: NodeId,
+    predicate: *const fn (*const ml.graph.Node) bool,
+) ?NodeId {
+    if (start_pos >= node_ids.len) return null;
+    var found: ?NodeId = null;
+    for (node_ids[start_pos..]) |candidate_id| {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, candidate_id)) continue;
+        const candidate = graph.node(candidate_id);
+        if (!predicate(candidate)) continue;
+        const inputs = candidate.getInputs();
+        if (inputs.len < 2) continue;
+        if (!((inputs[0] == lhs_id and inputs[1] == rhs_id) or
+            (inputs[0] == rhs_id and inputs[1] == lhs_id))) continue;
+        if (found != null) return null;
+        found = candidate_id;
+    }
+    return found;
+}
+
+fn traceGemmaGatedMlpTrainingDeclined(reason: []const u8, node_id: NodeId) bool {
+    if (traceMetalGraphFusionsEnabled()) {
+        std.debug.print(
+            "metal_graph_fusion_trace: gemma_gated_mlp_training declined reason={s} node={d}\n",
+            .{ reason, node_id },
+        );
+    }
+    return false;
 }
 
 const GatedFfnResidualPattern = struct {
@@ -7784,6 +9229,29 @@ const RankAdapterBackwardPattern = struct {
     rank: usize,
 };
 
+const GatedGeluBackwardPattern = struct {
+    gate_upstream_mul_id: NodeId,
+    up_grad_mul_id: NodeId = null_node,
+    gelu_backward_id: NodeId,
+    upstream_id: NodeId,
+    gate_input_id: NodeId,
+    gate_activation_id: NodeId = null_node,
+    up_id: NodeId,
+    rows: usize,
+    dim: usize,
+    exact: bool = false,
+};
+
+const GatedGeluForwardPattern = struct {
+    activation_id: NodeId,
+    multiply_id: NodeId,
+    gate_input_id: NodeId,
+    up_id: NodeId,
+    rows: usize,
+    dim: usize,
+    activation: ops_mod.DecoderRuntimeActivationKind,
+};
+
 const FfnGeluBackwardPattern = struct {
     first_dot_id: NodeId,
     second_branch_dot_id: NodeId,
@@ -7794,6 +9262,28 @@ const FfnGeluBackwardPattern = struct {
     hidden_size: usize,
     intermediate_size: usize,
     exact: bool = false,
+};
+
+const MaskedSoftmaxPattern = struct {
+    add_id: NodeId,
+    output_id: NodeId,
+    scores_id: NodeId,
+    mask_id: NodeId,
+    rows: usize,
+    dim: usize,
+    mask_rows: usize,
+};
+
+const SoftmaxBackwardPattern = struct {
+    adj_times_output_id: NodeId,
+    reduce_id: NodeId,
+    broadcast_id: NodeId,
+    centered_id: NodeId,
+    output_id: NodeId,
+    softmax_output_id: NodeId,
+    upstream_id: NodeId,
+    rows: usize,
+    dim: usize,
 };
 
 const RuntimeDot2DInputs = struct {
@@ -7814,7 +9304,7 @@ const RuntimeDot2DResolvedRhs = struct {
     rhs_contract_axis: u32,
 };
 
-const GroupedHeadDotCandidate = struct {
+const GroupedMpsDotCandidate = struct {
     node_id: NodeId,
     lhs: CT,
     rhs: CT,
@@ -7823,6 +9313,27 @@ const GroupedHeadDotCandidate = struct {
     k: usize,
     rhs_contract_axis: u32,
 };
+
+fn publishLoraLinearValue(
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    node_id: NodeId,
+    device_id: DeviceId,
+    value: CT,
+) void {
+    const index: usize = @intCast(node_id);
+    if (values[index]) |previous| {
+        if (previous != value) {
+            const aliased = for (values, 0..) |maybe, other_index| {
+                if (other_index != index and maybe == previous) break true;
+            } else false;
+            if (!aliased) cb.free(previous);
+        }
+    }
+    values[index] = value;
+    value_device[index] = device_id;
+}
 
 fn executeLoraLinearPattern(
     graph: *const Graph,
@@ -7841,8 +9352,7 @@ fn executeLoraLinearPattern(
             error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return false,
             else => return err,
         };
-        values[@intCast(dropout_mul_id)] = masked;
-        value_device[@intCast(dropout_mul_id)] = device_id;
+        publishLoraLinearValue(cb, values, value_device, dropout_mul_id, device_id, masked);
         break :blk masked;
     } else valueFor(values, pattern.lora_input_id) orelse return false;
     const lora_a = valueFor(values, pattern.lora_a_id) orelse return false;
@@ -7862,22 +9372,18 @@ fn executeLoraLinearPattern(
             .out_dim = pattern.out_dim,
             .scale = scale_f32,
         })) |fused| {
-            values[@intCast(pattern.after_a_id)] = fused.after_a;
-            value_device[@intCast(pattern.after_a_id)] = device_id;
-            values[@intCast(pattern.after_b_id)] = fused.after_b;
-            value_device[@intCast(pattern.after_b_id)] = device_id;
+            publishLoraLinearValue(cb, values, value_device, pattern.after_a_id, device_id, fused.after_a);
+            publishLoraLinearValue(cb, values, value_device, pattern.after_b_id, device_id, fused.after_b);
             if (pattern.populate_scaled) {
                 const scaled = cb.multiply(fused.after_b, scale) catch |err| switch (err) {
                     error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
                     else => return err,
                 };
                 if (scaled) |scaled_tensor| {
-                    values[@intCast(pattern.scaled_id)] = scaled_tensor;
-                    value_device[@intCast(pattern.scaled_id)] = device_id;
+                    publishLoraLinearValue(cb, values, value_device, pattern.scaled_id, device_id, scaled_tensor);
                 }
             }
-            values[@intCast(pattern.add_id)] = fused.output;
-            value_device[@intCast(pattern.add_id)] = device_id;
+            publishLoraLinearValue(cb, values, value_device, pattern.add_id, device_id, fused.output);
 
             if (stats) |s| {
                 recordMetalGraphRegion(s, .ffn, 4);
@@ -7900,15 +9406,13 @@ fn executeLoraLinearPattern(
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return false,
         else => return err,
     };
-    values[@intCast(pattern.after_a_id)] = after_a;
-    value_device[@intCast(pattern.after_a_id)] = device_id;
+    publishLoraLinearValue(cb, values, value_device, pattern.after_a_id, device_id, after_a);
 
     const after_b = cb.linearNoBias(after_a, lora_b, pattern.rows, pattern.rank, pattern.out_dim) catch |err| switch (err) {
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return false,
         else => return err,
     };
-    values[@intCast(pattern.after_b_id)] = after_b;
-    value_device[@intCast(pattern.after_b_id)] = device_id;
+    publishLoraLinearValue(cb, values, value_device, pattern.after_b_id, device_id, after_b);
 
     const output = scaled_add: {
         if (try cb.decoderRuntimeApplyScaledAddScale(&.{
@@ -7923,8 +9427,7 @@ fn executeLoraLinearPattern(
                     error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => break :scaled_add out,
                     else => return err,
                 };
-                values[@intCast(pattern.scaled_id)] = scaled;
-                value_device[@intCast(pattern.scaled_id)] = device_id;
+                publishLoraLinearValue(cb, values, value_device, pattern.scaled_id, device_id, scaled);
             }
             break :scaled_add out;
         }
@@ -7934,8 +9437,7 @@ fn executeLoraLinearPattern(
             error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return false,
             else => return err,
         };
-        values[@intCast(pattern.scaled_id)] = scaled;
-        value_device[@intCast(pattern.scaled_id)] = device_id;
+        publishLoraLinearValue(cb, values, value_device, pattern.scaled_id, device_id, scaled);
 
         const out = cb.add(base, scaled) catch |err| switch (err) {
             error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return false,
@@ -7943,8 +9445,7 @@ fn executeLoraLinearPattern(
         };
         break :fallback out;
     };
-    values[@intCast(pattern.add_id)] = output;
-    value_device[@intCast(pattern.add_id)] = device_id;
+    publishLoraLinearValue(cb, values, value_device, pattern.add_id, device_id, output);
 
     if (stats) |s| {
         recordMetalGraphRegion(s, .ffn, 4);
@@ -8456,10 +9957,29 @@ fn executeLoraBackwardPattern(
     pattern: LoraBackwardPattern,
     skipped_nodes: []bool,
 ) !bool {
-    const input = valueFor(values, pattern.input_id) orelse return false;
-    const after_a = valueFor(values, pattern.after_a_id) orelse return false;
-    const lora_b = valueFor(values, pattern.lora_b_id) orelse return false;
-    const output_grad = valueFor(values, pattern.output_grad_id) orelse return false;
+    const input = valueFor(values, pattern.input_id) orelse {
+        traceLoraBackwardExecutionDecline("missing_input", pattern);
+        return false;
+    };
+    const after_a = valueFor(values, pattern.after_a_id) orelse {
+        traceLoraBackwardExecutionDecline("missing_after_a", pattern);
+        return false;
+    };
+    const lora_b = (try valueForOrMaterializeParameter(
+        graph,
+        cb,
+        values,
+        value_device,
+        device_id,
+        pattern.lora_b_id,
+    )) orelse {
+        traceLoraBackwardExecutionDecline("missing_lora_b", pattern);
+        return false;
+    };
+    const output_grad = valueFor(values, pattern.output_grad_id) orelse {
+        traceLoraBackwardExecutionDecline("missing_output_grad", pattern);
+        return false;
+    };
     const fused = (try cb.loraLinearBackward(&.{
         .input = input,
         .after_a = after_a,
@@ -8470,7 +9990,10 @@ fn executeLoraBackwardPattern(
         .rank = pattern.rank,
         .out_dim = pattern.out_dim,
         .scale = 1.0,
-    })) orelse return false;
+    })) orelse {
+        traceLoraBackwardExecutionDecline("backend_declined", pattern);
+        return false;
+    };
 
     values[@intCast(pattern.d_after_a_id)] = fused.grad_after_a;
     value_device[@intCast(pattern.d_after_a_id)] = device_id;
@@ -8497,6 +10020,14 @@ fn executeLoraBackwardPattern(
     return true;
 }
 
+fn traceLoraBackwardExecutionDecline(reason: []const u8, pattern: LoraBackwardPattern) void {
+    if (!traceMetalGraphFusionsEnabled()) return;
+    std.debug.print(
+        "metal_graph_fusion_trace: lora_backward_region declined reason={s} d_after_a={d} input={d} after_a={d} lora_b={d} output_grad={d} rows={d} in={d} rank={d} out={d}\n",
+        .{ reason, pattern.d_after_a_id, pattern.input_id, pattern.after_a_id, pattern.lora_b_id, pattern.output_grad_id, pattern.rows, pattern.in_dim, pattern.rank, pattern.out_dim },
+    );
+}
+
 fn executeLowRankLoraBackwardPattern(
     graph: *const Graph,
     cb: *const ComputeBackend,
@@ -8508,7 +10039,14 @@ fn executeLowRankLoraBackwardPattern(
     skipped_nodes: []bool,
 ) !bool {
     const after_a = valueFor(values, pattern.after_a_id) orelse return false;
-    const lora_b = valueFor(values, pattern.lora_b_id) orelse return false;
+    const lora_b = (try valueForOrMaterializeParameter(
+        graph,
+        cb,
+        values,
+        value_device,
+        device_id,
+        pattern.lora_b_id,
+    )) orelse return false;
     const output_grad = valueFor(values, pattern.output_grad_id) orelse return false;
     const fused = (try cb.loraLinearBackwardB(&.{
         .after_a = after_a,
@@ -8650,6 +10188,231 @@ fn traceRankAdapterBackwardExecutionDecline(reason: []const u8, pattern: RankAda
         "rank_adapter_backward_match: execution_declined reason={s} d_after_a={d} grad_a={d} grad_b={d} input={d} after_a={d} rhs_source={d} rhs_uses_transpose={} rows={d} in={d} rank={d} out={d}\n",
         .{ reason, pattern.d_after_a_id, pattern.grad_a_id, pattern.grad_b_id, pattern.input_id, pattern.after_a_id, pattern.rhs_source_id, pattern.rhs_uses_transpose_value, pattern.rows, pattern.in_dim, pattern.rank, pattern.out_dim },
     );
+}
+
+fn executeGatedGeluBackwardPattern(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    pattern: GatedGeluBackwardPattern,
+    skipped_nodes: []bool,
+) !bool {
+    const emits_up_grad = pattern.up_grad_mul_id != null_node;
+    if ((emits_up_grad and valueFor(values, pattern.up_grad_mul_id) != null) or
+        valueFor(values, pattern.gelu_backward_id) != null) return false;
+    const upstream = valueFor(values, pattern.upstream_id) orelse return false;
+    const gate_input = valueFor(values, pattern.gate_input_id) orelse return false;
+    const gate_activation = if (emits_up_grad) valueFor(values, pattern.gate_activation_id) else null;
+    const up = valueFor(values, pattern.up_id) orelse return false;
+    const result = cb.decoderRuntimeGatedGeluBackward(&.{
+        .upstream = upstream,
+        .gate_input = gate_input,
+        .gate_activation = gate_activation,
+        .emit_up_grad = emits_up_grad,
+        .up = up,
+        .dim = pattern.rows * pattern.dim,
+        .exact = pattern.exact,
+    }) catch |err| switch (err) {
+        error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return false,
+        else => return err,
+    } orelse return false;
+
+    if (emits_up_grad) {
+        const up_grad = result.up_grad orelse {
+            cb.free(result.gate_grad);
+            return false;
+        };
+        values[@intCast(pattern.up_grad_mul_id)] = up_grad;
+        value_device[@intCast(pattern.up_grad_mul_id)] = device_id;
+        markSkipped(skipped_nodes, pattern.up_grad_mul_id);
+    } else if (result.up_grad != null) {
+        cb.free(result.gate_grad);
+        if (result.up_grad) |up_grad| cb.free(up_grad);
+        return false;
+    }
+    values[@intCast(pattern.gelu_backward_id)] = result.gate_grad;
+    value_device[@intCast(pattern.gelu_backward_id)] = device_id;
+    markSkipped(skipped_nodes, pattern.gelu_backward_id);
+
+    if (stats) |s| {
+        const node_count: u64 = if (emits_up_grad) 3 else 2;
+        recordMetalGraphRegion(s, .ffn, node_count);
+        s.metal_ffn_gelu_backward_regions += 1;
+        s.fused_graph_pattern_dispatches += 1;
+        s.fused_graph_nodes_elided += node_count - 1;
+        if (emits_up_grad) {
+            const up_grad = valueFor(values, pattern.up_grad_mul_id).?;
+            recordGemmaRuntimeResidency(s, graph, pattern.up_grad_mul_id, isMetalResidentOrQuantizedDescriptor(cb, up_grad));
+        }
+    }
+    if (traceMetalGraphFusionsEnabled()) {
+        std.debug.print(
+            "metal_graph_fusion_trace: gated_gelu_backward executed gate_upstream={d} up_grad={d} gelu_backward={d} upstream={d} gate_input={d} gate_activation={d} up={d} rows={d} dim={d} exact={} emits_up_grad={}\n",
+            .{ pattern.gate_upstream_mul_id, pattern.up_grad_mul_id, pattern.gelu_backward_id, pattern.upstream_id, pattern.gate_input_id, pattern.gate_activation_id, pattern.up_id, pattern.rows, pattern.dim, pattern.exact, emits_up_grad },
+        );
+    }
+    return true;
+}
+
+fn executeGatedGeluForwardPattern(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    skipped_nodes: []bool,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    pattern: GatedGeluForwardPattern,
+) !bool {
+    if (valueFor(values, pattern.multiply_id) != null) return false;
+    const gate = valueFor(values, pattern.gate_input_id) orelse return false;
+    const up = valueFor(values, pattern.up_id) orelse return false;
+    const output = cb.decoderRuntimeApplyActivationMultiply(&.{
+        .gate = gate,
+        .up = up,
+        .kind = pattern.activation,
+        .rows = pattern.rows,
+        .dim = pattern.dim,
+    }) catch |err| switch (err) {
+        error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return false,
+        else => return err,
+    } orelse return false;
+
+    values[@intCast(pattern.multiply_id)] = output;
+    value_device[@intCast(pattern.multiply_id)] = device_id;
+    // Preserve a safe scalar fallback if the later fused backward declines:
+    // deferred-input materialization can reconstruct this activation on demand.
+    markSkipped(skipped_nodes, pattern.activation_id);
+    markSkipped(skipped_nodes, pattern.multiply_id);
+
+    if (stats) |s| {
+        recordMetalGraphRegion(s, .ffn, 2);
+        s.fused_graph_pattern_dispatches += 1;
+        s.fused_graph_nodes_elided += 1;
+        recordGemmaRuntimeResidency(s, graph, pattern.multiply_id, isMetalResidentOrQuantizedDescriptor(cb, output));
+    }
+    if (traceMetalGraphFusionsEnabled()) {
+        std.debug.print(
+            "metal_graph_fusion_trace: gated_gelu_forward executed activation={d} multiply={d} gate={d} up={d} rows={d} dim={d} activation_kind={s}\n",
+            .{ pattern.activation_id, pattern.multiply_id, pattern.gate_input_id, pattern.up_id, pattern.rows, pattern.dim, @tagName(pattern.activation) },
+        );
+    }
+    return true;
+}
+
+fn executeMaskedSoftmaxPattern(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    pattern: MaskedSoftmaxPattern,
+    skipped_nodes: []bool,
+) !bool {
+    if (valueFor(values, pattern.output_id) != null) return false;
+    const scores = valueFor(values, pattern.scores_id) orelse return false;
+    const mask = valueFor(values, pattern.mask_id) orelse return false;
+    const output = cb.decoderRuntimeApplyMaskedSoftmax(&.{
+        .scores = scores,
+        .mask = mask,
+        .rows = pattern.rows,
+        .dim = pattern.dim,
+        .mask_rows = pattern.mask_rows,
+    }) catch |err| switch (err) {
+        error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return false,
+        else => return err,
+    } orelse return false;
+
+    values[@intCast(pattern.output_id)] = output;
+    value_device[@intCast(pattern.output_id)] = device_id;
+    markMaskedSoftmaxSkipped(skipped_nodes, pattern);
+
+    if (stats) |s| {
+        recordMetalGraphRegion(s, .attention, 2);
+        s.fused_graph_pattern_dispatches += 1;
+        s.fused_graph_nodes_elided += 1;
+        recordGemmaRuntimeResidency(s, graph, pattern.output_id, isMetalResidentOrQuantizedDescriptor(cb, output));
+    }
+    if (traceMetalGraphFusionsEnabled()) {
+        std.debug.print(
+            "metal_graph_fusion_trace: masked_softmax executed add={d} output={d} scores={d} mask={d} rows={d} dim={d} mask_rows={d}\n",
+            .{ pattern.add_id, pattern.output_id, pattern.scores_id, pattern.mask_id, pattern.rows, pattern.dim, pattern.mask_rows },
+        );
+    }
+    return true;
+}
+
+fn executeSoftmaxBackwardPattern(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    device_id: DeviceId,
+    stats: ?*PartitionExecutor.ExecutionStats,
+    pattern: SoftmaxBackwardPattern,
+    skipped_nodes: []bool,
+    satisfied_fused_interiors: []bool,
+    elision_protected_nodes: []const bool,
+) !bool {
+    // The fusion only publishes `output_id`; its anchor and
+    // reduce/broadcast/centered interiors never receive standalone values.
+    // Output/scalar-tail protection can require any of those nodes to execute
+    // at its ordinary graph position, so decline the region up front instead
+    // of leaving a protected consumer with a null fused-interior input.
+    if (softmaxBackwardElisionIsProtected(pattern, elision_protected_nodes)) return false;
+    if (valueFor(values, pattern.output_id) != null) return false;
+    const softmax_output = valueFor(values, pattern.softmax_output_id) orelse return false;
+    const upstream = valueFor(values, pattern.upstream_id) orelse return false;
+    const input_grad = cb.decoderRuntimeApplySoftmaxBackward(&.{
+        .output = softmax_output,
+        .upstream_grad = upstream,
+        .rows = pattern.rows,
+        .dim = pattern.dim,
+    }) catch |err| switch (err) {
+        error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return false,
+        else => return err,
+    } orelse return false;
+
+    values[@intCast(pattern.output_id)] = input_grad;
+    value_device[@intCast(pattern.output_id)] = device_id;
+    markSoftmaxBackwardSkipped(skipped_nodes, pattern);
+    markSatisfiedFusedInterior(satisfied_fused_interiors, pattern.reduce_id);
+    markSatisfiedFusedInterior(satisfied_fused_interiors, pattern.broadcast_id);
+    markSatisfiedFusedInterior(satisfied_fused_interiors, pattern.centered_id);
+
+    if (stats) |s| {
+        recordMetalGraphRegion(s, .attention, 5);
+        s.fused_graph_pattern_dispatches += 1;
+        s.fused_graph_nodes_elided += 4;
+        recordGemmaRuntimeResidency(s, graph, pattern.output_id, isMetalResidentOrQuantizedDescriptor(cb, input_grad));
+    }
+    if (traceMetalGraphFusionsEnabled()) {
+        std.debug.print(
+            "metal_graph_fusion_trace: softmax_backward executed anchor={d} reduce={d} broadcast={d} centered={d} output={d} softmax={d} upstream={d} rows={d} dim={d}\n",
+            .{ pattern.adj_times_output_id, pattern.reduce_id, pattern.broadcast_id, pattern.centered_id, pattern.output_id, pattern.softmax_output_id, pattern.upstream_id, pattern.rows, pattern.dim },
+        );
+    }
+    return true;
+}
+
+fn softmaxBackwardElisionIsProtected(
+    pattern: SoftmaxBackwardPattern,
+    elision_protected_nodes: []const bool,
+) bool {
+    for ([_]NodeId{
+        pattern.adj_times_output_id,
+        pattern.reduce_id,
+        pattern.broadcast_id,
+        pattern.centered_id,
+    }) |node_id| {
+        const index: usize = @intCast(node_id);
+        if (index < elision_protected_nodes.len and elision_protected_nodes[index]) return true;
+    }
+    return false;
 }
 
 fn executeFfnGeluBackwardPattern(
@@ -8930,8 +10693,7 @@ fn executeFfnGeluBackwardChainPattern(
 ) !bool {
     if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_FFN_GELU_BACKWARD_CHAIN", false)) return false;
     if (!platform.env.getenvBoolDefault("TERMITE_METAL_ENABLE_FFN_GELU_BACKWARD_CHAIN", false) and
-        !(platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false) and
-            !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false)))
+        !training_executor_policy.enabled())
     {
         return false;
     }
@@ -9070,13 +10832,13 @@ fn runtimeDot2DRhs(
     };
 }
 
-fn groupedHeadDotCandidate(
+fn groupedMpsDotCandidate(
     graph: *const Graph,
     values: []?CT,
     node_id: NodeId,
     reachable: []const bool,
     skipped_nodes: []const bool,
-) !?GroupedHeadDotCandidate {
+) !?GroupedMpsDotCandidate {
     if (node_id == null_node or node_id >= graph.nodeCount()) return null;
     const raw_id: usize = @intCast(node_id);
     if (raw_id >= values.len) return null;
@@ -9088,13 +10850,23 @@ fn groupedHeadDotCandidate(
         .dot_general => |a| a,
         else => return null,
     };
-    if (!std.mem.eql(u8, commandSourceClassification(graph, node_id, 4).family, "head")) return null;
     if (node.output_shape.rank() != 2) return null;
     const m = shapeDimUsize(node.output_shape, 0) orelse return null;
     const n = shapeDimUsize(node.output_shape, 1) orelse return null;
     const dot = (try runtimeDot2DInputs(graph, values, node.getInputs(), attrs)) orelse return null;
-    // ponytail: exact production head-dot shape only; widen after the gate proves it helps.
-    if (m != 96 or n != 2304 or dot.k != 768) return null;
+    const family = commandSourceClassification(graph, node_id, 4).family;
+    // Preserve the exact production head-dot contract, and additionally admit
+    // only the rank-16 LoRA-A shapes already qualified by the narrow-N MPS
+    // route. Grouping does not change the GEMM implementation or arithmetic;
+    // it encodes independent MPS multiplications behind one planned-encoder
+    // transition. The narrow route has its own same-binary rollback so the
+    // broader historical head grouping remains independently available.
+    const is_head = std.mem.eql(u8, family, "head") and m == 96 and n == 2304 and dot.k == 768;
+    const is_rank16_lora_a =
+        !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_GROUPED_LORA_A_R16", false) and
+        std.mem.eql(u8, family, "lora_A") and
+        m >= 128 and n == 16 and dot.k >= 128;
+    if (!is_head and !is_rank16_lora_a) return null;
     return .{
         .node_id = node_id,
         .lhs = dot.lhs,
@@ -9106,7 +10878,7 @@ fn groupedHeadDotCandidate(
     };
 }
 
-fn tryExecuteGroupedHeadDotPattern(
+fn tryExecuteGroupedMpsDotPattern(
     allocator: std.mem.Allocator,
     graph: *const Graph,
     cb: *const ComputeBackend,
@@ -9121,19 +10893,23 @@ fn tryExecuteGroupedHeadDotPattern(
     runtime_region_plan: RuntimeRegionPlan,
     stats: ?*PartitionExecutor.ExecutionStats,
 ) !bool {
-    if (!groupedHeadDotRuntimeCommandEnabled() or metalPartitionRuntimeCommandsDisabled()) return false;
+    if (!groupedMpsDotRuntimeCommandEnabled() or metalPartitionRuntimeCommandsDisabled()) return false;
     if (node_pos >= node_ids.len) return false;
 
-    var candidates: [8]GroupedHeadDotCandidate = undefined;
-    const first = (try groupedHeadDotCandidate(graph, values, node_ids[node_pos], reachable, skipped_nodes)) orelse return false;
+    var candidates: [8]GroupedMpsDotCandidate = undefined;
+    const first = (try groupedMpsDotCandidate(graph, values, node_ids[node_pos], reachable, skipped_nodes)) orelse return false;
     if (std.meta.activeTag(runtime_region_plan.regionAt(node_pos, first.node_id, node_ids)) != .none) return false;
     candidates[0] = first;
     var count: usize = 1;
 
-    const scan_end = @min(node_ids.len, node_pos + 64);
+    // Gemma local/global attention variants place different amounts of shape
+    // plumbing between the Q and V LoRA-A dots. A 256-node window still stays
+    // within the current transformer layer in the qualified graphs, while a
+    // 64-node window missed ten otherwise-independent Q/V pairs at seq512.
+    const scan_end = @min(node_ids.len, node_pos + 256);
     var scan_pos = node_pos + 1;
     while (scan_pos < scan_end and count < candidates.len) : (scan_pos += 1) {
-        const candidate = (try groupedHeadDotCandidate(graph, values, node_ids[scan_pos], reachable, skipped_nodes)) orelse continue;
+        const candidate = (try groupedMpsDotCandidate(graph, values, node_ids[scan_pos], reachable, skipped_nodes)) orelse continue;
         if (candidate.m != first.m or candidate.n != first.n or candidate.k != first.k or candidate.rhs_contract_axis != first.rhs_contract_axis) continue;
         if (std.meta.activeTag(runtime_region_plan.regionAt(scan_pos, candidate.node_id, node_ids)) != .none) continue;
         const raw_id: usize = @intCast(candidate.node_id);
@@ -9176,9 +10952,11 @@ fn tryExecuteGroupedHeadDotPattern(
         s.fused_graph_nodes_elided += @intCast(count - 1);
         recordGemmaRuntimeResidency(s, graph, first.node_id, isMetalResidentOrQuantizedDescriptor(cb, result.outputs[0]));
     }
-    if (traceMetalGraphFusionsEnabled()) {
+    if (traceMetalGraphFusionsEnabled() or
+        platform.env.getenvBoolDefault("TERMITE_METAL_TRACE_GROUPED_MPS_DOT", false))
+    {
         std.debug.print(
-            "metal_graph_fusion_trace: grouped_head_dot executed first={d} count={d} m={d} n={d} k={d} rhs_axis={d}\n",
+            "metal_graph_fusion_trace: grouped_mps_dot executed first={d} count={d} m={d} n={d} k={d} rhs_axis={d}\n",
             .{ first.node_id, count, first.m, first.n, first.k, first.rhs_contract_axis },
         );
     }
@@ -10268,6 +12046,523 @@ fn markDebertaEncoderLoraLayerSkipped(skipped: []bool, pattern: DebertaEncoderLo
     if (pattern.layer_norm_id != null_node) markSkipped(skipped, pattern.layer_norm_id);
 }
 
+const GatedGeluBackwardSibling = struct {
+    up_grad_mul_id: NodeId,
+    gate_activation_id: NodeId,
+};
+
+fn matchGatedGeluForwardPattern(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?GatedGeluForwardPattern {
+    if (node_pos >= node_ids.len) return null;
+    const activation_id = node_ids[node_pos];
+    if (!isReachableUnskippedNode(reachable, skipped_nodes, activation_id) or
+        graphNodeIsOutput(graph, activation_id)) return null;
+    const activation_node = graph.node(activation_id);
+    const activation: ops_mod.DecoderRuntimeActivationKind = switch (activation_node.op) {
+        .fused_gelu => .gelu,
+        .fused_gelu_exact => .gelu_exact,
+        else => return null,
+    };
+    if (activation_node.num_inputs < 1) return null;
+    const shape = activation_node.output_shape;
+    if (shape.dtype != .f32 or shape.rank() != 2) return null;
+    const rows = shapeDimUsize(shape, 0) orelse return null;
+    const dim = shapeDimUsize(shape, 1) orelse return null;
+    if (rows <= 1 or dim < 256) return null;
+    const gate_input_id = activation_node.inputs[0];
+    if (gate_input_id == null_node or gate_input_id >= graph.nodeCount() or
+        !graph.node(gate_input_id).output_shape.eq(shape)) return null;
+
+    // Trainable gated blocks retain the activation only for d_up. Locate the
+    // already-qualified backward diamond so the forward product and d_up are
+    // never confused merely because both multiply the same activation.
+    var matched: ?GatedGeluForwardPattern = null;
+    for (node_ids[node_pos + 1 ..], node_pos + 1..) |candidate_id, candidate_pos| {
+        const backward = matchGatedGeluBackwardPattern(
+            graph,
+            node_ids,
+            candidate_pos,
+            reachable,
+            skipped_nodes,
+        ) orelse continue;
+        if (backward.up_grad_mul_id == null_node or
+            backward.gate_activation_id != activation_id or
+            backward.gate_input_id != gate_input_id) continue;
+        const multiply_id = findUniqueReachableBinaryConsumer(
+            graph,
+            node_ids,
+            node_pos + 1,
+            reachable,
+            skipped_nodes,
+            activation_id,
+            backward.up_id,
+            &isMultiplyNode,
+        ) orelse continue;
+        const multiply_pos = findNodePos(node_ids, multiply_id) orelse continue;
+        if (multiply_pos >= candidate_pos or
+            !graph.node(multiply_id).output_shape.eq(shape) or
+            !hasOnlyExpectedUses(graph, reachable, skipped_nodes, activation_id, &.{ multiply_id, backward.up_grad_mul_id }))
+        {
+            continue;
+        }
+        if (matched != null) return null;
+        matched = .{
+            .activation_id = activation_id,
+            .multiply_id = multiply_id,
+            .gate_input_id = gate_input_id,
+            .up_id = backward.up_id,
+            .rows = rows,
+            .dim = dim,
+            .activation = activation,
+        };
+        _ = candidate_id;
+    }
+    if (matched) |pattern| return pattern;
+
+    // Frozen gated branches have no d_up consumer. In that case a unique
+    // multiply is sufficient, provided the activation does not escape.
+    var multiply_id: NodeId = null_node;
+    var up_id: NodeId = null_node;
+    for (node_ids[node_pos + 1 ..]) |candidate_id| {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, candidate_id)) continue;
+        const candidate = graph.node(candidate_id);
+        if (!isMultiplyNode(candidate) or candidate.num_inputs != 2 or
+            !candidate.output_shape.eq(shape)) continue;
+        const inputs = candidate.getInputs();
+        const other_id = if (inputs[0] == activation_id)
+            inputs[1]
+        else if (inputs[1] == activation_id)
+            inputs[0]
+        else
+            continue;
+        if (other_id == null_node or other_id >= graph.nodeCount() or
+            !graph.node(other_id).output_shape.eq(shape)) continue;
+        if (multiply_id != null_node) return null;
+        multiply_id = candidate_id;
+        up_id = other_id;
+    }
+    if (multiply_id == null_node or
+        !hasOnlyExpectedUses(graph, reachable, skipped_nodes, activation_id, &.{multiply_id})) return null;
+    return .{
+        .activation_id = activation_id,
+        .multiply_id = multiply_id,
+        .gate_input_id = gate_input_id,
+        .up_id = up_id,
+        .rows = rows,
+        .dim = dim,
+        .activation = activation,
+    };
+}
+
+fn findGatedGeluBackwardSibling(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    expected_shape: Shape,
+    upstream_id: NodeId,
+    gate_input_id: NodeId,
+    exact: bool,
+) ?GatedGeluBackwardSibling {
+    if (node_pos + 1 >= node_ids.len) return null;
+    var found: ?GatedGeluBackwardSibling = null;
+    for (node_ids[node_pos + 1 ..]) |candidate_id| {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, candidate_id)) continue;
+        const candidate = graph.node(candidate_id);
+        if (!isMultiplyNode(candidate) or candidate.num_inputs != 2) continue;
+        if (!candidate.output_shape.eq(expected_shape)) continue;
+        const inputs = candidate.getInputs();
+        const gate_activation_id = if (inputs[0] == upstream_id)
+            inputs[1]
+        else if (inputs[1] == upstream_id)
+            inputs[0]
+        else
+            continue;
+        if (gate_activation_id == null_node or gate_activation_id >= graph.nodeCount()) continue;
+        const gate_activation = graph.node(gate_activation_id);
+        const activation_exact = switch (gate_activation.op) {
+            .fused_gelu => false,
+            .fused_gelu_exact => true,
+            else => continue,
+        };
+        if (activation_exact != exact or gate_activation.num_inputs < 1 or
+            gate_activation.inputs[0] != gate_input_id or
+            !gate_activation.output_shape.eq(expected_shape))
+        {
+            continue;
+        }
+        if (found != null) return null;
+        found = .{
+            .up_grad_mul_id = candidate_id,
+            .gate_activation_id = gate_activation_id,
+        };
+    }
+    return found;
+}
+
+fn matchGatedGeluBackwardPattern(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?GatedGeluBackwardPattern {
+    if (node_pos >= node_ids.len) return null;
+    const gate_upstream_mul_id = node_ids[node_pos];
+    if (!isReachableUnskippedNode(reachable, skipped_nodes, gate_upstream_mul_id)) return null;
+    const gate_upstream_mul = graph.node(gate_upstream_mul_id);
+    if (!isMultiplyNode(gate_upstream_mul) or gate_upstream_mul.num_inputs != 2) return null;
+    const shape = gate_upstream_mul.output_shape;
+    if (shape.dtype != .f32 or shape.rank() != 2) return null;
+    const rows = shapeDimUsize(shape, 0) orelse return null;
+    const dim = shapeDimUsize(shape, 1) orelse return null;
+    if (rows <= 1 or dim < 256) return null;
+
+    const gelu_backward_id = singleFfnGeluBackwardConsumer(graph, gate_upstream_mul_id, reachable, skipped_nodes) orelse return null;
+    if (!hasOnlyExpectedUses(graph, reachable, skipped_nodes, gate_upstream_mul_id, &.{gelu_backward_id})) return null;
+    const gelu_backward = graph.node(gelu_backward_id);
+    if (gelu_backward.num_inputs < 2 or gelu_backward.inputs[1] != gate_upstream_mul_id or
+        !gelu_backward.output_shape.eq(shape))
+    {
+        return null;
+    }
+    const exact = switch (gelu_backward.op) {
+        .fused_gelu_backward => false,
+        .fused_gelu_exact_backward => true,
+        else => return null,
+    };
+    const gate_input_id = gelu_backward.inputs[0];
+    if (gate_input_id == null_node or gate_input_id >= graph.nodeCount() or
+        !graph.node(gate_input_id).output_shape.eq(shape))
+    {
+        return null;
+    }
+
+    const mul_inputs = gate_upstream_mul.getInputs();
+    var matched: ?GatedGeluBackwardPattern = null;
+    for (0..2) |upstream_index| {
+        const upstream_id = mul_inputs[upstream_index];
+        const up_id = mul_inputs[1 - upstream_index];
+        if (upstream_id == null_node or up_id == null_node or
+            upstream_id >= graph.nodeCount() or up_id >= graph.nodeCount())
+        {
+            continue;
+        }
+        if (!graph.node(upstream_id).output_shape.eq(shape) or
+            !graph.node(up_id).output_shape.eq(shape))
+        {
+            continue;
+        }
+        const sibling = findGatedGeluBackwardSibling(
+            graph,
+            node_ids,
+            node_pos,
+            reachable,
+            skipped_nodes,
+            shape,
+            upstream_id,
+            gate_input_id,
+            exact,
+        ) orelse continue;
+        if (matched != null) return null;
+        matched = .{
+            .gate_upstream_mul_id = gate_upstream_mul_id,
+            .up_grad_mul_id = sibling.up_grad_mul_id,
+            .gelu_backward_id = gelu_backward_id,
+            .upstream_id = upstream_id,
+            .gate_input_id = gate_input_id,
+            .gate_activation_id = sibling.gate_activation_id,
+            .up_id = up_id,
+            .rows = rows,
+            .dim = dim,
+            .exact = exact,
+        };
+    }
+    if (matched) |pattern| return pattern;
+
+    // Frozen gated branches do not need d_up, so autodiff prunes the sibling
+    // multiply. The remaining `gelu_backward(gate, lhs * rhs)` is still safe
+    // to fuse: multiplication is commutative and neither input needs a
+    // semantic role once no up-gradient is published.
+    const upstream_id = mul_inputs[0];
+    const up_id = mul_inputs[1];
+    if (upstream_id == null_node or up_id == null_node or
+        upstream_id >= graph.nodeCount() or up_id >= graph.nodeCount() or
+        !graph.node(upstream_id).output_shape.eq(shape) or
+        !graph.node(up_id).output_shape.eq(shape))
+    {
+        return null;
+    }
+    return .{
+        .gate_upstream_mul_id = gate_upstream_mul_id,
+        .gelu_backward_id = gelu_backward_id,
+        .upstream_id = upstream_id,
+        .gate_input_id = gate_input_id,
+        .up_id = up_id,
+        .rows = rows,
+        .dim = dim,
+        .exact = exact,
+    };
+}
+
+fn markGatedGeluBackwardSkipped(skipped: []bool, pattern: GatedGeluBackwardPattern) void {
+    if (pattern.up_grad_mul_id != null_node) markSkipped(skipped, pattern.up_grad_mul_id);
+    markSkipped(skipped, pattern.gelu_backward_id);
+}
+
+fn matchMaskedSoftmaxPattern(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?MaskedSoftmaxPattern {
+    const add_id = node_ids[node_pos];
+    if (!isReachableUnskippedNode(reachable, skipped_nodes, add_id)) return null;
+    const add = graph.node(add_id);
+    switch (add.op) {
+        .add => {},
+        else => return null,
+    }
+    if (add.num_inputs < 2 or graphNodeIsOutput(graph, add_id)) return null;
+    const shape = add.output_shape;
+    if (shape.dtype != .f32 or shape.rank() != 4) return null;
+    const dim = shapeDimUsize(shape, 3) orelse return null;
+    const score_rows = shapeDimUsize(shape, 2) orelse return null;
+    if (dim == 0 or score_rows != dim) return null;
+    const elem_count_i64 = shape.numElements() orelse return null;
+    if (elem_count_i64 <= 0) return null;
+    const elem_count: usize = @intCast(elem_count_i64);
+    if (elem_count % dim != 0) return null;
+    const rows = elem_count / dim;
+
+    var scores_id: NodeId = null_node;
+    var mask_id: NodeId = null_node;
+    for (0..2) |score_index| {
+        const candidate_scores_id = add.inputs[score_index];
+        const candidate_mask_id = add.inputs[1 - score_index];
+        if (candidate_scores_id == null_node or candidate_mask_id == null_node) continue;
+        const candidate_scores = graph.node(candidate_scores_id);
+        switch (candidate_scores.op) {
+            .dot_general => {},
+            else => continue,
+        }
+        if (!candidate_scores.output_shape.eq(shape)) continue;
+        const candidate_mask = graph.node(candidate_mask_id);
+        switch (candidate_mask.op) {
+            .constant => {},
+            else => continue,
+        }
+        const mask_shape = candidate_mask.output_shape;
+        if (mask_shape.dtype != .f32 or mask_shape.rank() != 4) continue;
+        const mask_batch = shapeDimUsize(mask_shape, 0) orelse continue;
+        const mask_heads = shapeDimUsize(mask_shape, 1) orelse continue;
+        const mask_rows = shapeDimUsize(mask_shape, 2) orelse continue;
+        const mask_dim = shapeDimUsize(mask_shape, 3) orelse continue;
+        if (mask_batch != 1 or mask_heads != 1 or mask_rows != dim or mask_dim != dim) continue;
+        if (rows % mask_rows != 0) continue;
+        if (scores_id != null_node) return null;
+        scores_id = candidate_scores_id;
+        mask_id = candidate_mask_id;
+    }
+    if (scores_id == null_node or mask_id == null_node) return null;
+
+    const output_id = singleReachableConsumerForSoftmaxBackward(
+        graph,
+        node_ids,
+        node_pos + 1,
+        reachable,
+        skipped_nodes,
+        add_id,
+    ) orelse return null;
+    const output = graph.node(output_id);
+    const attrs = switch (output.op) {
+        .fused_softmax => |softmax_attrs| softmax_attrs,
+        else => return null,
+    };
+    if (output.num_inputs < 1 or output.inputs[0] != add_id or !output.output_shape.eq(shape)) return null;
+    if (attrs.dim != 0 and attrs.dim != dim) return null;
+
+    return .{
+        .add_id = add_id,
+        .output_id = output_id,
+        .scores_id = scores_id,
+        .mask_id = mask_id,
+        .rows = rows,
+        .dim = dim,
+        .mask_rows = dim,
+    };
+}
+
+fn markMaskedSoftmaxSkipped(skipped: []bool, pattern: MaskedSoftmaxPattern) void {
+    markSkipped(skipped, pattern.output_id);
+}
+
+fn singleReachableConsumerForSoftmaxBackward(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    start_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+    producer_id: NodeId,
+) ?NodeId {
+    if (start_pos >= node_ids.len) return null;
+    var found: ?NodeId = null;
+    for (node_ids[start_pos..]) |candidate_id| {
+        if (!isReachableUnskippedNode(reachable, skipped_nodes, candidate_id)) continue;
+        var consumes = false;
+        for (graph.node(candidate_id).getInputs()) |input_id| {
+            if (input_id == producer_id) {
+                consumes = true;
+                break;
+            }
+        }
+        if (!consumes) continue;
+        if (found != null) return null;
+        found = candidate_id;
+    }
+    return found;
+}
+
+fn matchSoftmaxBackwardPattern(
+    graph: *const Graph,
+    node_ids: []const NodeId,
+    node_pos: usize,
+    reachable: []const bool,
+    skipped_nodes: []const bool,
+) ?SoftmaxBackwardPattern {
+    const adj_times_output_id = node_ids[node_pos];
+    if (!isReachableUnskippedNode(reachable, skipped_nodes, adj_times_output_id)) return null;
+    const adj_times_output = graph.node(adj_times_output_id);
+    switch (adj_times_output.op) {
+        .mul => {},
+        else => return null,
+    }
+    if (adj_times_output.num_inputs < 2 or graphNodeIsOutput(graph, adj_times_output_id)) return null;
+    const shape = adj_times_output.output_shape;
+    if (shape.dtype != .f32) return null;
+    const rank: usize = @intCast(shape.rank());
+    if (rank == 0) return null;
+    const dim = shapeDimUsize(shape, rank - 1) orelse return null;
+    const elem_count_i64 = shape.numElements() orelse return null;
+    if (dim == 0 or elem_count_i64 <= 0) return null;
+    const elem_count: usize = @intCast(elem_count_i64);
+    if (elem_count % dim != 0) return null;
+    const rows = elem_count / dim;
+
+    var softmax_output_id: NodeId = null_node;
+    var upstream_id: NodeId = null_node;
+    for (0..2) |softmax_index| {
+        const candidate_softmax_id = adj_times_output.inputs[softmax_index];
+        const candidate_upstream_id = adj_times_output.inputs[1 - softmax_index];
+        if (candidate_softmax_id == null_node or candidate_upstream_id == null_node) continue;
+        const candidate_softmax = graph.node(candidate_softmax_id);
+        const attrs = switch (candidate_softmax.op) {
+            .fused_softmax => |softmax_attrs| softmax_attrs,
+            else => continue,
+        };
+        if (!candidate_softmax.output_shape.eq(shape) or !graph.node(candidate_upstream_id).output_shape.eq(shape)) continue;
+        if (attrs.dim != 0 and attrs.dim != dim) continue;
+        if (softmax_output_id != null_node) return null;
+        softmax_output_id = candidate_softmax_id;
+        upstream_id = candidate_upstream_id;
+    }
+    if (softmax_output_id == null_node or upstream_id == null_node) return null;
+
+    const reduce_id = singleReachableConsumerForSoftmaxBackward(
+        graph,
+        node_ids,
+        node_pos + 1,
+        reachable,
+        skipped_nodes,
+        adj_times_output_id,
+    ) orelse return null;
+    if (graphNodeIsOutput(graph, reduce_id)) return null;
+    const reduce = graph.node(reduce_id);
+    const reduce_attrs = switch (reduce.op) {
+        .reduce_sum => |attrs| attrs,
+        else => return null,
+    };
+    if (reduce.num_inputs < 1 or reduce.inputs[0] != adj_times_output_id or
+        reduce_attrs.num_axes != 1 or reduce_attrs.axes[0] != @as(u8, @intCast(rank - 1))) return null;
+
+    const broadcast_id = singleReachableConsumerForSoftmaxBackward(
+        graph,
+        node_ids,
+        node_pos + 1,
+        reachable,
+        skipped_nodes,
+        reduce_id,
+    ) orelse return null;
+    if (graphNodeIsOutput(graph, broadcast_id)) return null;
+    const broadcast = graph.node(broadcast_id);
+    const broadcast_attrs = switch (broadcast.op) {
+        .broadcast_in_dim => |attrs| attrs,
+        else => return null,
+    };
+    if (broadcast.num_inputs < 1 or broadcast.inputs[0] != reduce_id or
+        !broadcast.output_shape.eq(shape) or !broadcast_attrs.target_shape.eq(shape)) return null;
+
+    const centered_id = singleReachableConsumerForSoftmaxBackward(
+        graph,
+        node_ids,
+        node_pos + 1,
+        reachable,
+        skipped_nodes,
+        broadcast_id,
+    ) orelse return null;
+    if (graphNodeIsOutput(graph, centered_id)) return null;
+    const centered = graph.node(centered_id);
+    switch (centered.op) {
+        .sub => {},
+        else => return null,
+    }
+    if (centered.num_inputs < 2 or centered.inputs[0] != upstream_id or centered.inputs[1] != broadcast_id or
+        !centered.output_shape.eq(shape)) return null;
+
+    const output_id = singleReachableConsumerForSoftmaxBackward(
+        graph,
+        node_ids,
+        node_pos + 1,
+        reachable,
+        skipped_nodes,
+        centered_id,
+    ) orelse return null;
+    const output = graph.node(output_id);
+    switch (output.op) {
+        .mul => {},
+        else => return null,
+    }
+    if (output.num_inputs < 2 or !output.output_shape.eq(shape)) return null;
+    if (!((output.inputs[0] == softmax_output_id and output.inputs[1] == centered_id) or
+        (output.inputs[1] == softmax_output_id and output.inputs[0] == centered_id))) return null;
+
+    return .{
+        .adj_times_output_id = adj_times_output_id,
+        .reduce_id = reduce_id,
+        .broadcast_id = broadcast_id,
+        .centered_id = centered_id,
+        .output_id = output_id,
+        .softmax_output_id = softmax_output_id,
+        .upstream_id = upstream_id,
+        .rows = rows,
+        .dim = dim,
+    };
+}
+
+fn markSoftmaxBackwardSkipped(skipped: []bool, pattern: SoftmaxBackwardPattern) void {
+    markSkipped(skipped, pattern.reduce_id);
+    markSkipped(skipped, pattern.broadcast_id);
+    markSkipped(skipped, pattern.centered_id);
+    markSkipped(skipped, pattern.output_id);
+}
+
 fn matchFfnGeluBackwardPattern(
     graph: *const Graph,
     node_ids: []const NodeId,
@@ -10523,9 +12818,10 @@ fn matchLoraBackwardPattern(
     };
     if (!isLinearDotAttrs(d_after_attrs) or d_after_a.num_inputs < 2) return null;
     const output_grad_id = d_after_a.inputs[0];
-    const b_transpose_id = d_after_a.inputs[1];
-    if (output_grad_id == null_node or b_transpose_id == null_node) return null;
-    const lora_b_id = loraBParameterFromBackwardTranspose(graph, b_transpose_id) orelse return null;
+    const b_rhs_id = d_after_a.inputs[1];
+    if (output_grad_id == null_node or b_rhs_id == null_node) return null;
+    const lora_b_id = loraBParameterFromBackwardTranspose(graph, b_rhs_id) orelse return null;
+    const b_transpose_id = b_rhs_id;
 
     const output_grad_shape = graph.node(output_grad_id).output_shape;
     const d_after_shape = d_after_a.output_shape;
@@ -10583,9 +12879,14 @@ fn matchLowRankLoraBackwardPattern(
     };
     if (!isLinearDotAttrs(d_after_attrs) or d_after_a.num_inputs < 2) return null;
     const output_grad_id = d_after_a.inputs[0];
-    const b_transpose_id = d_after_a.inputs[1];
-    if (output_grad_id == null_node or b_transpose_id == null_node) return null;
-    const lora_b_id = loraBParameterFromBackwardTranspose(graph, b_transpose_id) orelse return null;
+    const b_rhs_id = d_after_a.inputs[1];
+    if (output_grad_id == null_node or b_rhs_id == null_node) return null;
+    const direct_b = isLoraParameter(graph, b_rhs_id, ".lora_B");
+    const lora_b_id = if (direct_b)
+        b_rhs_id
+    else
+        loraBParameterFromBackwardTranspose(graph, b_rhs_id) orelse return null;
+    const b_transpose_id = if (direct_b) null_node else b_rhs_id;
 
     const output_grad_shape = graph.node(output_grad_id).output_shape;
     const d_after_shape = d_after_a.output_shape;
@@ -10603,6 +12904,7 @@ fn matchLowRankLoraBackwardPattern(
     const after_a = graph.node(grad_b_match.after_a_id);
     switch (after_a.op) {
         .dot_general => {},
+        .fused_linear_no_bias => |attrs| if (attrs.num_projections != 0) return null,
         else => return null,
     }
 
@@ -12108,6 +14410,34 @@ fn matchRawLinearPairPattern(
     return null;
 }
 
+fn isQualifiedGemma4Bf16MlpForwardPair(
+    graph: *const Graph,
+    pattern: RawLinearPairPattern,
+) bool {
+    if (pattern.second.input_id != pattern.first.input_id or
+        pattern.second.rows != pattern.first.rows or
+        pattern.second.in_dim != pattern.first.in_dim or
+        pattern.second.out_dim != pattern.first.out_dim) return false;
+    if (pattern.second.weight_id == pattern.first.weight_id) return false;
+    if (pattern.first.rows < 64 or pattern.first.rows % 64 != 0) return false;
+    if (!gemma4Bf16MlpProjectionShapeQualified(pattern.first.in_dim, pattern.first.out_dim)) return false;
+
+    const first_weight = graph.node(pattern.first.weight_id);
+    const second_weight = graph.node(pattern.second.weight_id);
+    if (std.meta.activeTag(first_weight.op) != .parameter or
+        std.meta.activeTag(second_weight.op) != .parameter) return false;
+    const first_name = graph.parameterName(first_weight);
+    const second_name = graph.parameterName(second_weight);
+    const first_role = gemmaGateUpBackwardProjectionForWeight(first_name) orelse return false;
+    const second_role = gemmaGateUpBackwardProjectionForWeight(second_name) orelse return false;
+    if (first_role == second_role) return false;
+    const first_suffix = if (first_role == .gate) gemma_mlp_gate_weight_suffix else gemma_mlp_up_weight_suffix;
+    const second_suffix = if (second_role == .gate) gemma_mlp_gate_weight_suffix else gemma_mlp_up_weight_suffix;
+    const first_prefix = gemmaMlpLayerPrefix(first_name, first_suffix) orelse return false;
+    const second_prefix = gemmaMlpLayerPrefix(second_name, second_suffix) orelse return false;
+    return std.mem.eql(u8, first_prefix, second_prefix);
+}
+
 fn matchRawLinearBiasPairPattern(
     graph: *const Graph,
     node_ids: []const NodeId,
@@ -12449,6 +14779,8 @@ fn tryExecuteRmsNormGroupedLinearQkvSlicePattern(
         cb,
         values,
         value_device,
+        node_ids,
+        node_pos,
         device_id,
         exec_ctx,
         skipped_nodes,
@@ -12466,6 +14798,8 @@ fn executeRmsNormGroupedLinearQkvSlicePattern(
     cb: *const ComputeBackend,
     values: []?CT,
     value_device: []DeviceId,
+    node_ids: []const NodeId,
+    node_pos: usize,
     device_id: DeviceId,
     exec_ctx: PartitionExecutor.ExecutionContext,
     skipped_nodes: []bool,
@@ -12511,6 +14845,12 @@ fn executeRmsNormGroupedLinearQkvSlicePattern(
         pattern.norm_id,
         device_id,
         last_use,
+        .{
+            .node_ids = node_ids,
+            .node_pos = node_pos,
+            .skipped_nodes = skipped_nodes,
+            .executed_node_id = pattern.norm_id,
+        },
         null,
         rt_map,
         donated,
@@ -12525,6 +14865,12 @@ fn executeRmsNormGroupedLinearQkvSlicePattern(
         pattern.qkv.linear_id,
         device_id,
         last_use,
+        .{
+            .node_ids = node_ids,
+            .node_pos = node_pos,
+            .skipped_nodes = skipped_nodes,
+            .executed_node_id = pattern.qkv.linear_id,
+        },
         null,
         rt_map,
         donated,
@@ -12645,6 +14991,8 @@ fn tryExecuteGroupedLinearQkvSlicePattern(
         cb,
         values,
         value_device,
+        node_ids,
+        node_pos,
         device_id,
         exec_ctx,
         skipped_nodes,
@@ -12662,6 +15010,8 @@ fn executeGroupedLinearQkvSlicePattern(
     cb: *const ComputeBackend,
     values: []?CT,
     value_device: []DeviceId,
+    node_ids: []const NodeId,
+    node_pos: usize,
     device_id: DeviceId,
     exec_ctx: PartitionExecutor.ExecutionContext,
     skipped_nodes: []bool,
@@ -12728,6 +15078,12 @@ fn executeGroupedLinearQkvSlicePattern(
         pattern.linear_id,
         device_id,
         last_use,
+        .{
+            .node_ids = node_ids,
+            .node_pos = node_pos,
+            .skipped_nodes = skipped_nodes,
+            .executed_node_id = pattern.linear_id,
+        },
         null,
         rt_map,
         donated,
@@ -12749,6 +15105,8 @@ fn executePackedLinearQkvSlicePattern(
     cb: *const ComputeBackend,
     values: []?CT,
     value_device: []DeviceId,
+    node_ids: []const NodeId,
+    node_pos: usize,
     device_id: DeviceId,
     exec_ctx: PartitionExecutor.ExecutionContext,
     skipped_nodes: []bool,
@@ -12815,6 +15173,12 @@ fn executePackedLinearQkvSlicePattern(
         pattern.linear_id,
         device_id,
         last_use,
+        .{
+            .node_ids = node_ids,
+            .node_pos = node_pos,
+            .skipped_nodes = skipped_nodes,
+            .executed_node_id = pattern.linear_id,
+        },
         null,
         rt_map,
         donated,
@@ -13047,6 +15411,8 @@ fn tryExecuteLinearNoBiasQkvPattern(
         cb,
         values,
         value_device,
+        node_ids,
+        node_pos,
         device_id,
         exec_ctx,
         skipped_nodes,
@@ -13064,6 +15430,8 @@ fn executeLinearNoBiasQkvPattern(
     cb: *const ComputeBackend,
     values: []?CT,
     value_device: []DeviceId,
+    node_ids: []const NodeId,
+    node_pos: usize,
     device_id: DeviceId,
     exec_ctx: PartitionExecutor.ExecutionContext,
     skipped_nodes: []bool,
@@ -13156,6 +15524,12 @@ fn executeLinearNoBiasQkvPattern(
         pattern.k_id,
         device_id,
         last_use,
+        .{
+            .node_ids = node_ids,
+            .node_pos = node_pos,
+            .skipped_nodes = skipped_nodes,
+            .executed_node_id = pattern.k_id,
+        },
         null,
         rt_map,
         donated,
@@ -13170,6 +15544,12 @@ fn executeLinearNoBiasQkvPattern(
         pattern.v_id,
         device_id,
         last_use,
+        .{
+            .node_ids = node_ids,
+            .node_pos = node_pos,
+            .skipped_nodes = skipped_nodes,
+            .executed_node_id = pattern.v_id,
+        },
         null,
         rt_map,
         donated,
@@ -13405,6 +15785,12 @@ fn tryExecuteLinearNoBiasPairPattern(
         second_id,
         device_id,
         last_use,
+        .{
+            .node_ids = node_ids,
+            .node_pos = node_pos,
+            .skipped_nodes = skipped_nodes,
+            .executed_node_id = second_id,
+        },
         null,
         rt_map,
         donated,
@@ -13511,13 +15897,25 @@ fn layerIndexForWeightDepth(graph: *const Graph, weight_id: NodeId, depth: usize
 }
 
 fn parseGemmaLayerIndex(name: []const u8) ?usize {
-    const prefix = "model.layers.";
-    if (!std.mem.startsWith(u8, name, prefix)) return null;
-    const rest = name[prefix.len..];
-    var end: usize = 0;
-    while (end < rest.len and std.ascii.isDigit(rest[end])) : (end += 1) {}
-    if (end == 0) return null;
-    return std.fmt.parseUnsigned(usize, rest[0..end], 10) catch null;
+    // Gemma checkpoints in the wild use both the transformers text-only
+    // spelling and the canonical nested language-model spelling.  Keep graph
+    // matching aligned with the loader's normalized tensor-name contract.
+    const prefixes = [_][]const u8{
+        "model.language_model.layers.",
+        "language_model.model.layers.",
+        "language_model.layers.",
+        "model.layers.",
+        "layers.",
+    };
+    for (prefixes) |prefix| {
+        if (!std.mem.startsWith(u8, name, prefix)) continue;
+        const rest = name[prefix.len..];
+        var end: usize = 0;
+        while (end < rest.len and std.ascii.isDigit(rest[end])) : (end += 1) {}
+        if (end == 0 or end >= rest.len or rest[end] != '.') return null;
+        return std.fmt.parseUnsigned(usize, rest[0..end], 10) catch null;
+    }
+    return null;
 }
 
 fn parseDebertaLayerIndex(name: []const u8) ?usize {
@@ -13850,6 +16248,28 @@ fn tryExecuteMetalCommand(
                 else => return err,
             };
         },
+        .fused_gqa_causal_attention_backward => |attrs| blk: {
+            const q = valueFor(values, inputs[0]) orelse break :blk null;
+            const k = valueFor(values, inputs[1]) orelse break :blk null;
+            const v = valueFor(values, inputs[2]) orelse break :blk null;
+            const d_out = valueFor(values, inputs[3]) orelse break :blk null;
+            break :blk cb.gqaCausalAttentionBackward(
+                q,
+                k,
+                v,
+                d_out,
+                attrs.batch,
+                attrs.seq_len,
+                attrs.num_heads,
+                attrs.num_kv_heads,
+                attrs.head_dim,
+                attrs.sliding_window,
+                attrs.score_scale,
+            ) catch |err| switch (err) {
+                error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch, error.UnsupportedTensorType, error.InvalidAttentionShape => null,
+                else => return err,
+            };
+        },
         .reshape => |attrs| blk: {
             const input = valueFor(values, inputs[0]) orelse break :blk null;
             var dims_buf: [ml.graph.shape.max_rank]i64 = undefined;
@@ -13941,6 +16361,52 @@ fn tryExecuteMetalCommand(
         .reduce_mean => |attrs| try executeRuntimeReduce(graph, cb, values, inputs, attrs, .mean, output_hint, stats, resident_input_cache),
         .fused_softmax => |attrs| try executeRuntimeSoftmax(cb, values, inputs, attrs.dim),
         .fused_log_softmax => |attrs| try executeRuntimeLogSoftmax(cb, values, inputs, attrs.dim),
+        .fused_linear_cross_entropy_loss => |attrs| blk: {
+            const hidden = valueFor(values, inputs[0]) orelse break :blk null;
+            const weight = valueFor(values, inputs[1]) orelse break :blk null;
+            const labels = valueFor(values, inputs[2]) orelse break :blk null;
+            var out_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
+            const out_shape = try fillShapeDims(n.output_shape, &out_shape_buf);
+            break :blk cb.linearCrossEntropyLoss(&.{
+                .hidden = hidden,
+                .weight = weight,
+                .labels = labels,
+                .rows = attrs.rows,
+                .in_dim = attrs.in_dim,
+                .vocab_size = attrs.vocab_size,
+                .logit_softcap = attrs.logit_softcap,
+                .ignore_index = attrs.ignore_index,
+                .frozen_weight = attrs.frozen_weight,
+                .output_shape = out_shape,
+            }) catch |err| switch (err) {
+                error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch, error.UnsupportedTensorType => null,
+                else => return err,
+            };
+        },
+        .fused_linear_cross_entropy_backward => |attrs| blk: {
+            const hidden = valueFor(values, inputs[0]) orelse break :blk null;
+            const weight = valueFor(values, inputs[1]) orelse break :blk null;
+            const labels = valueFor(values, inputs[2]) orelse break :blk null;
+            const upstream = valueFor(values, inputs[3]) orelse break :blk null;
+            var hidden_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
+            const hidden_shape = try fillShapeDims(graph.node(inputs[0]).output_shape, &hidden_shape_buf);
+            break :blk cb.linearCrossEntropyBackward(&.{
+                .hidden = hidden,
+                .weight = weight,
+                .labels = labels,
+                .upstream = upstream,
+                .rows = attrs.rows,
+                .in_dim = attrs.in_dim,
+                .vocab_size = attrs.vocab_size,
+                .logit_softcap = attrs.logit_softcap,
+                .ignore_index = attrs.ignore_index,
+                .frozen_weight = attrs.frozen_weight,
+                .hidden_shape = hidden_shape,
+            }) catch |err| switch (err) {
+                error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch, error.UnsupportedTensorType => null,
+                else => return err,
+            };
+        },
         .fused_masked_bce_with_logits_loss => |attrs| blk: {
             const logits = valueFor(values, inputs[0]) orelse break :blk null;
             const labels = valueFor(values, inputs[1]) orelse break :blk null;
@@ -14020,6 +16486,15 @@ fn tryExecuteMetalCommand(
             };
         },
         .fused_rms_norm => |attrs| try executeRuntimeRmsNorm(cb, values, inputs, attrs.dim, attrs.eps, n.output_shape),
+        .fused_rms_norm_backward => |attrs| blk: {
+            const input = valueFor(values, inputs[0]) orelse break :blk null;
+            const weight = valueFor(values, inputs[1]) orelse break :blk null;
+            const dy = valueFor(values, inputs[2]) orelse break :blk null;
+            break :blk cb.rmsNormBackward(input, weight, dy, attrs.dim, attrs.eps, attrs.backward_weight_grad) catch |err| switch (err) {
+                error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch, error.UnsupportedTensorType => null,
+                else => return err,
+            };
+        },
         else => null,
     };
 }
@@ -14060,6 +16535,7 @@ fn executeRuntimeConstant(
         break :blk try cb.fromFloat32Shape(constant.data, shape_buf[0..rank]);
     } else try cb.fromFloat32(constant.data);
     errdefer cb.free(ct);
+    metal_compute_mod.MetalCompute.setStableContentIdentity(cb, ct, std.mem.sliceAsBytes(constant.data));
 
     if (isMetalDeviceResident(cb, ct)) return ct;
     if (try makeMetalDeviceResident(cb, ct)) |device_ct| {
@@ -14082,6 +16558,24 @@ fn executeRuntimeGqaCausalAttention(
     const v = valueFor(values, inputs[2]) orelse return null;
     const bias = valueFor(values, if (num_inputs > 3) inputs[3] else null_node);
     const kv_heads = if (attrs.num_kv_heads != 0) attrs.num_kv_heads else attrs.num_heads;
+
+    if (num_inputs == 3 and (attrs.score_scale != 0.0 or attrs.sliding_window != 0)) {
+        return cb.gqaCausalAttentionTraining(
+            q,
+            k,
+            v,
+            attrs.batch,
+            attrs.seq_len,
+            attrs.num_heads,
+            kv_heads,
+            attrs.head_dim,
+            attrs.sliding_window,
+            attrs.score_scale,
+        ) catch |err| switch (err) {
+            error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch, error.UnsupportedTensorType, error.InvalidAttentionShape => null,
+            else => return err,
+        };
+    }
 
     if (exec_state.options.attention) |base_attn| {
         var attn = base_attn;
@@ -14315,7 +16809,9 @@ fn executeRuntimeConvertDType(
     if (inputs.len != 1) return null;
     const input = valueFor(values, inputs[0]) orelse return null;
     if (graph.node(inputs[0]).output_shape.dtype == attrs.target) return input;
-    return cb.tryConvertDType(input, attrs.target) catch |err| switch (err) {
+    const input_resident = try temporaryMetalResidentValue(cb, input);
+    defer input_resident.deinit(cb);
+    return cb.tryConvertDType(input_resident.value, attrs.target) catch |err| switch (err) {
         error.UnsupportedOperation,
         error.UnsupportedPrimitiveOp,
         error.UnsupportedTensorType,
@@ -14667,7 +17163,7 @@ fn executeRuntimeDotGeneralHinted(
         if (attrs.num_contracting != 1 or attrs.num_batch != 0) break :try_hint;
         const lhs = valueFor(values, inputs[0]) orelse break :try_hint;
         const rhs = valueFor(values, inputs[1]) orelse break :try_hint;
-        if (!isMetalDeviceResident(cb, lhs) or !isMetalDeviceResident(cb, rhs)) break :try_hint;
+        if (!isMetalDeviceResident(cb, lhs)) break :try_hint;
         const lhs_shape = graph.node(inputs[0]).output_shape;
         const rhs_shape = graph.node(inputs[1]).output_shape;
         if (lhs_shape.rank() != 2 or rhs_shape.rank() != 2) break :try_hint;
@@ -14679,6 +17175,11 @@ fn executeRuntimeDotGeneralHinted(
         const rhs_k = positiveI64ToUsize(rhs_shape.dim(@intCast(rc))) orelse break :try_hint;
         const n = positiveI64ToUsize(rhs_shape.dim(@intCast(1 - @as(usize, rc)))) orelse break :try_hint;
         if (k != rhs_k) break :try_hint;
+        if (rc == 0) {
+            if (try metal_compute_mod.MetalCompute.nativeQuantizedLinearBackwardInputInto(cb, lhs, rhs, m, n, k, hint)) |out| return out;
+            if (try metal_compute_mod.MetalCompute.nativeBf16LinearBackwardInputInto(cb, lhs, rhs, m, n, k, hint)) |out| return out;
+        }
+        if (!isMetalDeviceResident(cb, rhs)) break :try_hint;
         if (try metal_compute_mod.MetalCompute.dotGeneral2DInto(cb, lhs, rhs, m, n, k, rc, hint)) |out| return out;
     }
     return executeRuntimeDotGeneral(graph, cb, values, inputs, attrs, op_plan);
@@ -14705,6 +17206,36 @@ fn executeRuntimeDotGeneral(
         return linear_output;
     }
     const rhs = valueFor(values, inputs[1]) orelse return null;
+    if (attrs.num_contracting == 1 and
+        attrs.num_batch == 0 and
+        lhs_shape.len == 2 and
+        rhs_shape.len == 2 and
+        lhs_contracting[0] == 1 and
+        rhs_contracting[0] == 0)
+    {
+        const rows = positiveI64ToUsize(lhs_shape[0]) orelse return null;
+        const forward_out_dim = positiveI64ToUsize(lhs_shape[1]) orelse return null;
+        const rhs_out_dim = positiveI64ToUsize(rhs_shape[0]) orelse return null;
+        const forward_in_dim = positiveI64ToUsize(rhs_shape[1]) orelse return null;
+        if (forward_out_dim == rhs_out_dim) {
+            if (try metal_compute_mod.MetalCompute.nativeQuantizedLinearBackwardInput(
+                cb,
+                lhs,
+                rhs,
+                rows,
+                forward_in_dim,
+                forward_out_dim,
+            )) |output| return output;
+            if (try metal_compute_mod.MetalCompute.nativeBf16LinearBackwardInput(
+                cb,
+                lhs,
+                rhs,
+                rows,
+                forward_in_dim,
+                forward_out_dim,
+            )) |output| return output;
+        }
+    }
     if (op_plan != null and attrs.num_contracting == 1 and attrs.num_batch == 0 and lhs_shape.len == 2 and rhs_shape.len == 2 and lhs_contracting[0] == 1 and rhs_contracting[0] == 1) {
         const rows = positiveI64ToUsize(lhs_shape[0]) orelse return null;
         const in_dim = positiveI64ToUsize(lhs_shape[1]) orelse return null;
@@ -15460,6 +17991,7 @@ fn executeRuntimeAdd(
     output_hint: ?CT,
 ) !?CT {
     const dim = tensorElementCount(output_shape) orelse return null;
+    if (try executeRuntimeAdd3FromDeferredAdd(graph, cb, values, inputs, output_shape, dim)) |result| return result;
     if (try executeRuntimeScaledAddFromDeferredMul(graph, cb, values, inputs, output_shape, dim)) |result| return result;
     if (try executeRuntimeMultiplyAddFromDeferredMul(graph, cb, values, inputs, output_shape, dim)) |result| return result;
     const lhs_operand = runtimeBinaryOperand(graph, values, inputs[0], output_shape) orelse return null;
@@ -15494,6 +18026,11 @@ const DeferredScaleMul = struct {
 };
 
 const DeferredElementwiseMul = struct {
+    lhs_id: NodeId,
+    rhs_id: NodeId,
+};
+
+const DeferredElementwiseAdd = struct {
     lhs_id: NodeId,
     rhs_id: NodeId,
 };
@@ -15596,6 +18133,84 @@ fn executeRuntimeMultiplyAddFromDeferredMul(
         return try executeDeferredElementwiseMultiplyAdd(cb, values, mul, addend, dim);
     }
     return null;
+}
+
+fn executeRuntimeAdd3FromDeferredAdd(
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    inputs: []const NodeId,
+    output_shape: ml.graph.Shape,
+    dim: usize,
+) !?CT {
+    if (inputs.len < 2) return null;
+    if (pendingDeferredElementwiseAdd(graph, values, inputs[0], output_shape)) |inner| {
+        const outer_other = valueFor(values, inputs[1]) orelse return null;
+        return try executeDeferredElementwiseAdd3(cb, values, inner, outer_other, false, dim);
+    }
+    if (pendingDeferredElementwiseAdd(graph, values, inputs[1], output_shape)) |inner| {
+        const outer_other = valueFor(values, inputs[0]) orelse return null;
+        return try executeDeferredElementwiseAdd3(cb, values, inner, outer_other, true, dim);
+    }
+    return null;
+}
+
+fn executeDeferredElementwiseAdd3(
+    cb: *const ComputeBackend,
+    values: []?CT,
+    inner: DeferredElementwiseAdd,
+    outer_other_input: CT,
+    inner_on_rhs: bool,
+    dim: usize,
+) !?CT {
+    var inner_lhs = valueFor(values, inner.lhs_id) orelse return null;
+    var inner_rhs = valueFor(values, inner.rhs_id) orelse return null;
+    var outer_other = outer_other_input;
+    var owned_inner_lhs: ?CT = null;
+    defer if (owned_inner_lhs) |ct| cb.free(ct);
+    var owned_inner_rhs: ?CT = null;
+    defer if (owned_inner_rhs) |ct| cb.free(ct);
+    var owned_outer_other: ?CT = null;
+    defer if (owned_outer_other) |ct| cb.free(ct);
+    if (cb.kind() == .metal) {
+        if (!isMetalDeviceResident(cb, inner_lhs)) {
+            if (try makeMetalDeviceResident(cb, inner_lhs)) |device| {
+                if (device != inner_lhs) owned_inner_lhs = device;
+                inner_lhs = device;
+            }
+        }
+        if (!isMetalDeviceResident(cb, inner_rhs)) {
+            if (try makeMetalDeviceResident(cb, inner_rhs)) |device| {
+                if (device != inner_rhs) owned_inner_rhs = device;
+                inner_rhs = device;
+            }
+        }
+        if (!isMetalDeviceResident(cb, outer_other)) {
+            if (try makeMetalDeviceResident(cb, outer_other)) |device| {
+                if (device != outer_other) owned_outer_other = device;
+                outer_other = device;
+            }
+        }
+        if (try metal_compute_mod.MetalCompute.add3(cb, inner_lhs, inner_rhs, outer_other, inner_on_rhs)) |output| {
+            return output;
+        }
+    }
+
+    const inner_value = cb.add(inner_lhs, inner_rhs) catch |err| switch (err) {
+        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return null,
+        else => return err,
+    };
+    defer cb.free(inner_value);
+    const output = if (inner_on_rhs)
+        cb.add(outer_other, inner_value)
+    else
+        cb.add(inner_value, outer_other);
+    const resolved = output catch |err| switch (err) {
+        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return null,
+        else => return err,
+    };
+    _ = dim;
+    return try promoteMetalOutputIfNeeded(cb, resolved);
 }
 
 fn executeDeferredElementwiseMultiplyAdd2(
@@ -15809,6 +18424,11 @@ fn pendingDeferredElementwiseMul(graph: *const Graph, values: []?CT, node_id: No
     return deferredElementwiseMul(graph, node_id, output_shape);
 }
 
+fn pendingDeferredElementwiseAdd(graph: *const Graph, values: []?CT, node_id: NodeId, output_shape: ml.graph.Shape) ?DeferredElementwiseAdd {
+    if (valueFor(values, node_id) != null) return null;
+    return deferredElementwiseAdd(graph, node_id, output_shape);
+}
+
 fn deferredScaleMul(graph: *const Graph, node_id: NodeId, output_shape: ml.graph.Shape) ?DeferredScaleMul {
     if (node_id == null_node or node_id >= graph.nodeCount()) return null;
     const node = graph.node(node_id);
@@ -15845,6 +18465,38 @@ fn deferredElementwiseMul(graph: *const Graph, node_id: NodeId, output_shape: ml
     if (isSameShapeElementwiseMul(graph, lhs_id, output_shape)) return null;
     if (isSameShapeElementwiseMul(graph, rhs_id, output_shape)) return null;
     return .{ .lhs_id = lhs_id, .rhs_id = rhs_id };
+}
+
+fn deferredElementwiseAdd(graph: *const Graph, node_id: NodeId, output_shape: ml.graph.Shape) ?DeferredElementwiseAdd {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return null;
+    const node = graph.node(node_id);
+    switch (node.op) {
+        .add, .fused_elem_add => {},
+        else => return null,
+    }
+    if (!shapesEqual(node.output_shape, output_shape) or node.output_shape.dtype != .f32 or node.num_inputs < 2) return null;
+    const lhs_id = node.inputs[0];
+    const rhs_id = node.inputs[1];
+    if (lhs_id == null_node or rhs_id == null_node or lhs_id >= graph.nodeCount() or rhs_id >= graph.nodeCount()) return null;
+    if (!shapesEqual(graph.node(lhs_id).output_shape, output_shape)) return null;
+    if (!shapesEqual(graph.node(rhs_id).output_shape, output_shape)) return null;
+    // Keep the fusion depth to one add. Otherwise a chain such as
+    // `((a + b) + c) + d` can defer both interior nodes before either has
+    // materialized, leaving the final add3 consumer without one of its
+    // operands. Longer chains need a dedicated n-ary execution plan.
+    if (isSameShapeElementwiseAdd(graph, lhs_id, output_shape)) return null;
+    if (isSameShapeElementwiseAdd(graph, rhs_id, output_shape)) return null;
+    return .{ .lhs_id = lhs_id, .rhs_id = rhs_id };
+}
+
+fn isSameShapeElementwiseAdd(graph: *const Graph, node_id: NodeId, output_shape: ml.graph.Shape) bool {
+    if (node_id == null_node or node_id >= graph.nodeCount()) return false;
+    const node = graph.node(node_id);
+    switch (node.op) {
+        .add, .fused_elem_add => {},
+        else => return false,
+    }
+    return shapesEqual(node.output_shape, output_shape);
 }
 
 fn isSameShapeElementwiseMul(graph: *const Graph, node_id: NodeId, output_shape: ml.graph.Shape) bool {
@@ -15889,6 +18541,51 @@ fn binaryBroadcastResultMatches(
         if (result_dim != output_dim) return false;
     }
     return true;
+}
+
+fn shouldDeferElementwiseAddForAdd(
+    graph: *const Graph,
+    node_id: NodeId,
+    reachable: []const bool,
+    last_use: []const u32,
+    use_counts: ?[]const u8,
+) bool {
+    if (platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_ADD3_FUSION", false)) return false;
+    const node_index: usize = @intCast(node_id);
+    if (node_index >= reachable.len or !reachable[node_index]) return false;
+    if (node_index >= last_use.len) return false;
+    const consumer_id: NodeId = @intCast(last_use[node_index]);
+    if (consumer_id == null_node or consumer_id >= graph.nodeCount()) return false;
+    const consumer_index: usize = @intCast(consumer_id);
+    if (consumer_index >= reachable.len or !reachable[consumer_index]) return false;
+    const consumer = graph.node(consumer_id);
+    switch (consumer.op) {
+        .add, .fused_elem_add => {},
+        else => return false,
+    }
+    if (consumer.num_inputs < 2 or (consumer.inputs[0] != node_id and consumer.inputs[1] != node_id)) return false;
+    const other_id = if (consumer.inputs[0] == node_id) consumer.inputs[1] else consumer.inputs[0];
+    if (other_id == null_node or other_id >= graph.nodeCount()) return false;
+    if (!shapesEqual(graph.node(other_id).output_shape, consumer.output_shape)) return false;
+    if (!hasSingleReachableConsumer(graph, node_id, reachable, use_counts)) return false;
+    if (deferredElementwiseAdd(graph, node_id, consumer.output_shape) == null) return false;
+
+    // The outer add can consume one lazy producer, not two producers owned by
+    // different fusion families. Prefer the established multiply-add path
+    // when the sibling mul will itself be deferred. Otherwise both slots are
+    // null at the consumer and neither add3 nor multiply-add has a materialized
+    // residual to consume (observed on the E4B attention backward graph).
+    if (shouldDeferScaleMulForAdd(graph, other_id, reachable, last_use, use_counts) or
+        shouldDeferElementwiseMulForAdd(graph, other_id, reachable, last_use, use_counts))
+    {
+        return false;
+    }
+
+    // An add3 command consumes exactly one deferred inner add. When both
+    // children structurally qualify, deterministically retain input 0 and
+    // materialize input 1 so execution cannot arrive with two null operands.
+    if (consumer.inputs[1] == node_id and deferredElementwiseAdd(graph, consumer.inputs[0], consumer.output_shape) != null) return false;
+    return deferredProducerInputsLiveUntilConsumer(graph, node_id, consumer_id, last_use);
 }
 
 fn shouldDeferScaleMulForAdd(
@@ -16342,6 +19039,47 @@ const ExpiredFreeStats = struct {
     bytes: u64 = 0,
 };
 
+const FusionCleanupFrontier = struct {
+    node_ids: []const NodeId,
+    node_pos: usize,
+    skipped_nodes: []const bool,
+    executed_node_id: NodeId,
+};
+
+/// An ahead-of-order fusion may execute `executed_node_id` before the loop
+/// reaches intervening consumers. Graph `last_use` is expressed as a node id,
+/// so it cannot by itself prove that those consumers already ran. Keep the
+/// input alive until every future-position consumer is either reached or has
+/// itself been materialized by the fusion.
+fn inputHasPendingConsumerAfterFusionFrontier(
+    graph: *const Graph,
+    values: []const ?CT,
+    input_id: NodeId,
+    frontier: FusionCleanupFrontier,
+) bool {
+    if (frontier.node_pos + 1 >= frontier.node_ids.len) return false;
+    for (frontier.node_ids[frontier.node_pos + 1 ..]) |candidate_id| {
+        if (candidate_id == frontier.executed_node_id) continue;
+        // Parameters and constants are materialized before traversal, so an
+        // ahead fusion can consume them even when their own graph position is
+        // still in the future. Releasing one here leaves that future node
+        // null and forces an interpreter rematerialization.
+        if (candidate_id == input_id) return true;
+        const candidate_index: usize = @intCast(candidate_id);
+        if (candidate_index < frontier.skipped_nodes.len and
+            frontier.skipped_nodes[candidate_index] and
+            candidate_index < values.len and
+            values[candidate_index] != null)
+        {
+            continue;
+        }
+        for (graph.node(candidate_id).getInputs()) |candidate_input_id| {
+            if (candidate_input_id == input_id) return true;
+        }
+    }
+    return false;
+}
+
 fn freeExpiredInputs(
     allocator: std.mem.Allocator,
     graph: *const Graph,
@@ -16351,6 +19089,7 @@ fn freeExpiredInputs(
     node_id: NodeId,
     device_id: DeviceId,
     last_use: []const u32,
+    fusion_frontier: ?FusionCleanupFrontier,
     runtime_region_plan: ?RuntimeRegionPlan,
     rt_map: std.AutoHashMapUnmanaged(NodeId, CT),
     donated: std.AutoHashMapUnmanaged(NodeId, void),
@@ -16365,6 +19104,12 @@ fn freeExpiredInputs(
         if (input_id == null_node or input_id >= values.len) continue;
         const input_index: usize = @intCast(input_id);
         if (last_use[input_index] != node_index) continue;
+        if (fusion_frontier) |frontier| {
+            if (inputHasPendingConsumerAfterFusionFrontier(graph, values, input_id, frontier)) {
+                traceMetalValueLifetime("free_expired_defer_pending_consumer", node_id, input_id);
+                continue;
+            }
+        }
         if (runtime_region_plan) |plan| {
             if (plan.needsAttentionInputAfterNode(input_id, node_id)) continue;
         }
@@ -16421,18 +19166,23 @@ fn sweepExpiredValuesThroughNode(
     rt_map: std.AutoHashMapUnmanaged(NodeId, CT),
     donated: std.AutoHashMapUnmanaged(NodeId, void),
     exec_ctx: PartitionExecutor.ExecutionContext,
-) !usize {
+    escape_view: ?buffer_plan_mod.PartitionBufferView,
+) !ExpiredFreeStats {
     var released = std.AutoHashMapUnmanaged(usize, void).empty;
     defer released.deinit(allocator);
 
-    var freed_count: usize = 0;
+    var stats = ExpiredFreeStats{};
     for (values, 0..) |maybe_ct, raw_id| {
         const ct = maybe_ct orelse continue;
         if (raw_id >= last_use.len) continue;
         const node_id: NodeId = @intCast(raw_id);
         const use_id = last_use[raw_id];
-        if (use_id == std.math.maxInt(u32)) continue;
+        if (!lastUseExpiredThroughNode(use_id, boundary_node_id)) continue;
+        // `node_ids` contains only the current partition. A value can have no
+        // later consumer in this slice yet still feed a future partition; the
+        // global last-use node id is the authoritative guard for that case.
         if (valueReferencedAfterBoundary(graph, node_ids, boundary_pos, node_id)) continue;
+        if (partitionValueEscapes(escape_view, node_id)) continue;
         if (runtime_region_plan) |plan| {
             if (plan.needsAttentionInputAfterNode(node_id, boundary_node_id)) continue;
         }
@@ -16451,7 +19201,10 @@ fn sweepExpiredValuesThroughNode(
             }
             const other_id: NodeId = @intCast(other_raw_id);
             const other_use = last_use[other_raw_id];
-            if (other_use == std.math.maxInt(u32) or valueReferencedAfterBoundary(graph, node_ids, boundary_pos, other_id)) {
+            if (!lastUseExpiredThroughNode(other_use, boundary_node_id) or
+                valueReferencedAfterBoundary(graph, node_ids, boundary_pos, other_id) or
+                partitionValueEscapes(escape_view, other_id))
+            {
                 has_live_alias = true;
                 break;
             }
@@ -16481,10 +19234,31 @@ fn sweepExpiredValuesThroughNode(
             cb.free(ct);
         }
         traceMetalValueLifetime("sweep_release", boundary_node_id, node_id);
-        freed_count += 1;
+        stats.count += 1;
+        stats.bytes += outputByteLen(graph.node(node_id).output_shape) orelse 0;
     }
 
-    return freed_count;
+    return stats;
+}
+
+fn partitionValueEscapes(
+    view: ?buffer_plan_mod.PartitionBufferView,
+    node_id: NodeId,
+) bool {
+    const partition_view = view orelse return false;
+    for (partition_view.slots) |slot_view| {
+        if (slot_view.slot.node_id != node_id) continue;
+        return partitionSlotRolesEscape(slot_view.roles);
+    }
+    return false;
+}
+
+fn partitionSlotRolesEscape(roles: buffer_plan_mod.PartitionSlotRoles) bool {
+    return roles.output or roles.graph_output or roles.transfer_source;
+}
+
+fn lastUseExpiredThroughNode(use_id: u32, boundary_node_id: NodeId) bool {
+    return use_id != std.math.maxInt(u32) and use_id <= @as(u32, @intCast(boundary_node_id));
 }
 
 fn promoteLiveValuesAcrossFrameBoundary(
@@ -16553,10 +19327,7 @@ fn valueReferencedAfterBoundary(
     }
     if (boundary_pos + 1 >= node_ids.len) return false;
     for (node_ids[boundary_pos + 1 ..]) |future_id| {
-        const future = graph.node(future_id);
-        for (future.getInputs()) |input_id| {
-            if (input_id == value_id) return true;
-        }
+        if (nodeReferencesValueDirectlyOrThroughDeferredWeightTranspose(graph, future_id, value_id)) return true;
     }
     return false;
 }
@@ -16572,10 +19343,23 @@ fn valueReferencedAtOrAfterPosition(
     }
     if (start_pos >= node_ids.len) return false;
     for (node_ids[start_pos..]) |future_id| {
-        const future = graph.node(future_id);
-        for (future.getInputs()) |input_id| {
-            if (input_id == value_id) return true;
-        }
+        if (nodeReferencesValueDirectlyOrThroughDeferredWeightTranspose(graph, future_id, value_id)) return true;
+    }
+    return false;
+}
+
+fn nodeReferencesValueDirectlyOrThroughDeferredWeightTranspose(
+    graph: *const Graph,
+    node_id: NodeId,
+    value_id: NodeId,
+) bool {
+    const node = graph.node(node_id);
+    for (node.getInputs()) |input_id| {
+        if (input_id == value_id) return true;
+        if (input_id == null_node or input_id >= graph.nodeCount()) continue;
+        if (!transposeSourceIsWeightParameter(graph, input_id)) continue;
+        if (!linearDotConsumesTranspose(graph, node_id, input_id)) continue;
+        if (sourceFromSimpleTranspose(graph, input_id) == value_id) return true;
     }
     return false;
 }
@@ -16782,12 +19566,708 @@ fn deinitEmptyMetalWeightStore(weight_store: *gpu_hosted_store_mod.WeightStore, 
     weight_store.lazy_weights.deinit(allocator);
 }
 
+test "metal partition executor matches Gemma gated MLP training contract" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 2;
+    const hidden: usize = 4;
+    const intermediate: usize = 8;
+    const input = try b.parameter("hidden", Shape.init(.f32, &.{ rows, hidden }));
+    const gate_weight = try b.parameter("model.layers.7.mlp.gate_proj.weight", Shape.init(.f32, &.{ intermediate, hidden }));
+    const gate = try b.linearNoBias(input, gate_weight, @intCast(rows), @intCast(hidden), @intCast(intermediate));
+    const gate_activation = try b.gelu(gate);
+    const up_weight = try b.parameter("model.layers.7.mlp.up_proj.weight", Shape.init(.f32, &.{ intermediate, hidden }));
+    const up = try b.linearNoBias(input, up_weight, @intCast(rows), @intCast(hidden), @intCast(intermediate));
+    const gated = try b.mul(gate_activation, up);
+    const down_weight = try b.parameter("model.layers.7.mlp.down_proj.weight", Shape.init(.f32, &.{ hidden, intermediate }));
+    const down = try b.linearNoBias(gated, down_weight, @intCast(rows), @intCast(intermediate), @intCast(hidden));
+    try g.markOutput(down);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+    const node_ids = try allocator.alloc(NodeId, @intCast(g.nodeCount()));
+    defer allocator.free(node_ids);
+    for (node_ids, 0..) |*node_id, i| node_id.* = @intCast(i);
+
+    const gate_pos = findNodePos(node_ids, gate) orelse return error.MissingGateNode;
+    const pattern = matchGemmaGatedMlpTrainingPattern(&g, node_ids, gate_pos, reachable, skipped) orelse
+        return error.ExpectedGemmaGatedMlpTrainingPattern;
+    try std.testing.expectEqual(gate, pattern.gate_id);
+    try std.testing.expectEqual(up, pattern.up_id);
+    try std.testing.expectEqual(gate_activation, pattern.activation_id);
+    try std.testing.expectEqual(gated, pattern.multiply_id);
+    try std.testing.expectEqual(down, pattern.down_id);
+    try std.testing.expectEqual(gate_weight, pattern.gate_weight_id);
+    try std.testing.expectEqual(up_weight, pattern.up_weight_id);
+    try std.testing.expectEqual(down_weight, pattern.down_weight_id);
+    try std.testing.expectEqual(ops_mod.DecoderRuntimeActivationKind.gelu, pattern.activation);
+    try std.testing.expectEqual(rows, pattern.rows);
+    try std.testing.expectEqual(hidden, pattern.hidden_size);
+    try std.testing.expectEqual(intermediate, pattern.intermediate_size);
+}
+
+test "gemma4 metal partition executor matches gated GELU backward without capturing forward product" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 2;
+    const dim: usize = 256;
+    const shape = Shape.init(.f32, &.{ rows, dim });
+    const gate_input = try b.parameter("gate_input", shape);
+    const up = try b.parameter("up", shape);
+    const upstream = try b.parameter("upstream", shape);
+    const gate_activation = try b.gelu(gate_input);
+    const forward_product = try b.mul(gate_activation, up);
+    const gate_upstream = try b.mul(upstream, up);
+    const up_grad = try b.mul(upstream, gate_activation);
+    const gate_grad = try g.addNode(.{
+        .op = .{ .fused_gelu_backward = {} },
+        .output_shape = shape,
+        .inputs = .{ gate_input, gate_upstream, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(forward_product);
+    try g.markOutput(up_grad);
+    try g.markOutput(gate_grad);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+    const node_ids = try allocator.alloc(NodeId, @intCast(g.nodeCount()));
+    defer allocator.free(node_ids);
+    for (node_ids, 0..) |*node_id, i| node_id.* = @intCast(i);
+
+    const forward_pos = findNodePos(node_ids, forward_product) orelse return error.MissingForwardProduct;
+    try std.testing.expect(matchGatedGeluBackwardPattern(&g, node_ids, forward_pos, reachable, skipped) == null);
+    const activation_pos = findNodePos(node_ids, gate_activation) orelse return error.MissingGateActivation;
+    const forward_pattern = matchGatedGeluForwardPattern(&g, node_ids, activation_pos, reachable, skipped) orelse
+        return error.ExpectedGatedGeluForwardPattern;
+    try std.testing.expectEqual(gate_activation, forward_pattern.activation_id);
+    try std.testing.expectEqual(forward_product, forward_pattern.multiply_id);
+    try std.testing.expectEqual(gate_input, forward_pattern.gate_input_id);
+    try std.testing.expectEqual(up, forward_pattern.up_id);
+    try std.testing.expectEqual(rows, forward_pattern.rows);
+    try std.testing.expectEqual(dim, forward_pattern.dim);
+    try std.testing.expectEqual(ops_mod.DecoderRuntimeActivationKind.gelu, forward_pattern.activation);
+    const gate_upstream_pos = findNodePos(node_ids, gate_upstream) orelse return error.MissingGateUpstream;
+    const pattern = matchGatedGeluBackwardPattern(&g, node_ids, gate_upstream_pos, reachable, skipped) orelse
+        return error.ExpectedGatedGeluBackwardPattern;
+    try std.testing.expectEqual(gate_upstream, pattern.gate_upstream_mul_id);
+    try std.testing.expectEqual(up_grad, pattern.up_grad_mul_id);
+    try std.testing.expectEqual(gate_grad, pattern.gelu_backward_id);
+    try std.testing.expectEqual(upstream, pattern.upstream_id);
+    try std.testing.expectEqual(gate_input, pattern.gate_input_id);
+    try std.testing.expectEqual(gate_activation, pattern.gate_activation_id);
+    try std.testing.expectEqual(up, pattern.up_id);
+    try std.testing.expectEqual(rows, pattern.rows);
+    try std.testing.expectEqual(dim, pattern.dim);
+    try std.testing.expect(!pattern.exact);
+
+    // Frozen PLE inputs prune d_up, leaving only the multiply feeding GELU
+    // backward. That two-node form must still match without claiming the
+    // retained forward activation as an output-producing sibling.
+    reachable[@intCast(up_grad)] = false;
+    const frozen_forward_pattern = matchGatedGeluForwardPattern(&g, node_ids, activation_pos, reachable, skipped) orelse
+        return error.ExpectedFrozenGatedGeluForwardPattern;
+    try std.testing.expectEqual(forward_product, frozen_forward_pattern.multiply_id);
+    try std.testing.expectEqual(up, frozen_forward_pattern.up_id);
+    const gate_only = matchGatedGeluBackwardPattern(&g, node_ids, gate_upstream_pos, reachable, skipped) orelse
+        return error.ExpectedGateOnlyGatedGeluBackwardPattern;
+    try std.testing.expectEqual(gate_upstream, gate_only.gate_upstream_mul_id);
+    try std.testing.expectEqual(null_node, gate_only.up_grad_mul_id);
+    try std.testing.expectEqual(gate_grad, gate_only.gelu_backward_id);
+    try std.testing.expectEqual(upstream, gate_only.upstream_id);
+    try std.testing.expectEqual(gate_input, gate_only.gate_input_id);
+    try std.testing.expectEqual(null_node, gate_only.gate_activation_id);
+    try std.testing.expectEqual(up, gate_only.up_id);
+}
+
+test "metal partition executor Gemma gated MLP matcher rejects mixed layers" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 1;
+    const hidden: usize = 4;
+    const intermediate: usize = 8;
+    const input = try b.parameter("hidden", Shape.init(.f32, &.{ rows, hidden }));
+    const gate_weight = try b.parameter("model.layers.3.mlp.gate_proj.weight", Shape.init(.f32, &.{ intermediate, hidden }));
+    const gate = try b.linearNoBias(input, gate_weight, @intCast(rows), @intCast(hidden), @intCast(intermediate));
+    const gate_activation = try b.silu(gate);
+    const up_weight = try b.parameter("model.layers.4.mlp.up_proj.weight", Shape.init(.f32, &.{ intermediate, hidden }));
+    const up = try b.linearNoBias(input, up_weight, @intCast(rows), @intCast(hidden), @intCast(intermediate));
+    const gated = try b.mul(gate_activation, up);
+    const down_weight = try b.parameter("model.layers.3.mlp.down_proj.weight", Shape.init(.f32, &.{ hidden, intermediate }));
+    const down = try b.linearNoBias(gated, down_weight, @intCast(rows), @intCast(intermediate), @intCast(hidden));
+    try g.markOutput(down);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+    const node_ids = try allocator.alloc(NodeId, @intCast(g.nodeCount()));
+    defer allocator.free(node_ids);
+    for (node_ids, 0..) |*node_id, i| node_id.* = @intCast(i);
+
+    const gate_pos = findNodePos(node_ids, gate) orelse return error.MissingGateNode;
+    try std.testing.expect(matchGemmaGatedMlpTrainingPattern(&g, node_ids, gate_pos, reachable, skipped) == null);
+}
+
+test "metal partition executor matches Gemma gate up backward input sum" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 64;
+    const hidden: usize = 1536;
+    const intermediate: usize = 6144;
+    const gate_grad = try b.parameter("gate_grad", Shape.init(.f32, &.{ rows, intermediate }));
+    const gate_weight = try b.parameter("model.layers.7.mlp.gate_proj.weight", Shape.init(.f32, &.{ intermediate, hidden }));
+    const gate_input_grad = try b.matmul(gate_grad, gate_weight);
+    const up_grad = try b.parameter("up_grad", Shape.init(.f32, &.{ rows, intermediate }));
+    const up_weight = try b.parameter("model.layers.7.mlp.up_proj.weight", Shape.init(.f32, &.{ intermediate, hidden }));
+    const up_input_grad = try b.matmul(up_grad, up_weight);
+    const input_grad = try b.add(gate_input_grad, up_input_grad);
+    try g.markOutput(input_grad);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+    const protected = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(protected);
+    @memset(protected, false);
+    const node_ids = try allocator.alloc(NodeId, @intCast(g.nodeCount()));
+    defer allocator.free(node_ids);
+    for (node_ids, 0..) |*node_id, i| node_id.* = @intCast(i);
+
+    const gate_pos = findNodePos(node_ids, gate_input_grad) orelse return error.MissingGateInputGrad;
+    const pattern = matchGemmaGateUpBackwardInputSumPattern(
+        &g,
+        node_ids,
+        gate_pos,
+        reachable,
+        skipped,
+        protected,
+    ) orelse return error.ExpectedGemmaGateUpBackwardInputSumPattern;
+    try std.testing.expectEqual(gate_input_grad, pattern.anchor_dot_id);
+    try std.testing.expectEqual(gate_input_grad, pattern.first_dot_id);
+    try std.testing.expectEqual(up_input_grad, pattern.second_dot_id);
+    try std.testing.expectEqual(gate_grad, pattern.first_input_id);
+    try std.testing.expectEqual(up_grad, pattern.second_input_id);
+    try std.testing.expectEqual(gate_weight, pattern.first_weight_id);
+    try std.testing.expectEqual(up_weight, pattern.second_weight_id);
+    try std.testing.expectEqual(input_grad, pattern.add_id);
+    try std.testing.expectEqual(rows, pattern.rows);
+    try std.testing.expectEqual(hidden, pattern.hidden_size);
+    try std.testing.expectEqual(intermediate, pattern.intermediate_size);
+    try std.testing.expectEqual(
+        GemmaRuntimeResidencyCategory.residual_add,
+        classifyGemmaRuntimeResidencyNode(&g, pattern.add_id) orelse return error.ExpectedGemmaResidualAddResidencyCategory,
+    );
+
+    protected[@intCast(gate_input_grad)] = true;
+    try std.testing.expect(matchGemmaGateUpBackwardInputSumPattern(
+        &g,
+        node_ids,
+        gate_pos,
+        reachable,
+        skipped,
+        protected,
+    ) == null);
+}
+
+test "metal partition executor rejects unsafe Gemma gate up backward input sums" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 64;
+    const hidden: usize = 1536;
+    const intermediate: usize = 12288;
+    const gate_grad = try b.parameter("gate_grad", Shape.init(.f32, &.{ rows, intermediate }));
+    const gate_weight = try b.parameter("model.layers.2.mlp.gate_proj.weight", Shape.init(.f32, &.{ intermediate, hidden }));
+    const gate_input_grad = try b.matmul(gate_grad, gate_weight);
+    const up_grad = try b.parameter("up_grad", Shape.init(.f32, &.{ rows, intermediate }));
+    const up_weight = try b.parameter("model.layers.3.mlp.up_proj.weight", Shape.init(.f32, &.{ intermediate, hidden }));
+    const up_input_grad = try b.matmul(up_grad, up_weight);
+    const input_grad = try b.add(gate_input_grad, up_input_grad);
+    try g.markOutput(input_grad);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+    const protected = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(protected);
+    @memset(protected, false);
+    const node_ids = try allocator.alloc(NodeId, @intCast(g.nodeCount()));
+    defer allocator.free(node_ids);
+    for (node_ids, 0..) |*node_id, i| node_id.* = @intCast(i);
+    const gate_pos = findNodePos(node_ids, gate_input_grad) orelse return error.MissingGateInputGrad;
+
+    try std.testing.expect(matchGemmaGateUpBackwardInputSumPattern(
+        &g,
+        node_ids,
+        gate_pos,
+        reachable,
+        skipped,
+        protected,
+    ) == null);
+}
+
+test "metal partition executor matches seq128 Gemma gate up backward input sum" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    // The production seq128 benchmark uses the alignment-safe packed M64
+    // sibling, so it must be admitted by the same strict Gemma role/shape
+    // matcher as the original rows=64 lane.
+    const rows: usize = 128;
+    const hidden: usize = 1536;
+    const intermediate: usize = 6144;
+    const gate_grad = try b.parameter("gate_grad", Shape.init(.f32, &.{ rows, intermediate }));
+    const gate_weight = try b.parameter("model.layers.7.mlp.gate_proj.weight", Shape.init(.f32, &.{ intermediate, hidden }));
+    const gate_input_grad = try b.matmul(gate_grad, gate_weight);
+    const up_grad = try b.parameter("up_grad", Shape.init(.f32, &.{ rows, intermediate }));
+    const up_weight = try b.parameter("model.layers.7.mlp.up_proj.weight", Shape.init(.f32, &.{ intermediate, hidden }));
+    const up_input_grad = try b.matmul(up_grad, up_weight);
+    const input_grad = try b.add(gate_input_grad, up_input_grad);
+    try g.markOutput(input_grad);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+    const protected = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(protected);
+    @memset(protected, false);
+    const node_ids = try allocator.alloc(NodeId, @intCast(g.nodeCount()));
+    defer allocator.free(node_ids);
+    for (node_ids, 0..) |*node_id, i| node_id.* = @intCast(i);
+    const gate_pos = findNodePos(node_ids, gate_input_grad) orelse return error.MissingGateInputGrad;
+
+    const pattern = matchGemmaGateUpBackwardInputSumPattern(
+        &g,
+        node_ids,
+        gate_pos,
+        reachable,
+        skipped,
+        protected,
+    ) orelse return error.ExpectedSeq128GemmaGateUpBackwardInputSumPattern;
+    try std.testing.expectEqual(rows, pattern.rows);
+    try std.testing.expectEqual(hidden, pattern.hidden_size);
+    try std.testing.expectEqual(intermediate, pattern.intermediate_size);
+
+    const region_skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(region_skipped);
+    @memset(region_skipped, false);
+    markGemmaGateUpBackwardInputSumRegionSkipped(region_skipped, pattern);
+    try std.testing.expect(!region_skipped[@intCast(pattern.anchor_dot_id)]);
+    try std.testing.expect(region_skipped[@intCast(pattern.second_dot_id)]);
+    try std.testing.expect(region_skipped[@intCast(pattern.add_id)]);
+
+    // The sum may escape, but neither individual product may independently
+    // escape because the fused kernel does not publish those values.
+    try g.markOutput(gate_input_grad);
+    try std.testing.expect(matchGemmaGateUpBackwardInputSumPattern(
+        &g,
+        node_ids,
+        gate_pos,
+        reachable,
+        skipped,
+        protected,
+    ) == null);
+}
+
+test "metal partition executor defaults Gemma gate up backward input sum only on qualified rows" {
+    try std.testing.expect(gemmaGateUpBackwardInputSumDefaultRowsQualified(64));
+    try std.testing.expect(gemmaGateUpBackwardInputSumDefaultRowsQualified(128));
+    try std.testing.expect(gemmaGateUpBackwardInputSumDefaultRowsQualified(512));
+    try std.testing.expect(!gemmaGateUpBackwardInputSumDefaultRowsQualified(256));
+    try std.testing.expect(!gemmaGateUpBackwardInputSumDefaultRowsQualified(2048));
+
+    try std.testing.expect(gemmaGateUpBackwardInputSumKernelSupportsRows(256));
+    try std.testing.expect(gemmaGateUpBackwardInputSumKernelSupportsRows(2048));
+    try std.testing.expect(!gemmaGateUpBackwardInputSumKernelSupportsRows(96));
+}
+
+test "metal partition executor qualifies E2B and E4B BF16 MLP projections" {
+    try std.testing.expect(gemma4Bf16MlpProjectionShapeQualified(1536, 6144));
+    try std.testing.expect(gemma4Bf16MlpProjectionShapeQualified(1536, 12288));
+    try std.testing.expect(gemma4Bf16MlpProjectionShapeQualified(2560, 10240));
+
+    try std.testing.expect(!gemma4Bf16MlpProjectionShapeQualified(1536, 10240));
+    try std.testing.expect(!gemma4Bf16MlpProjectionShapeQualified(2560, 6144));
+    try std.testing.expect(!gemma4Bf16MlpProjectionShapeQualified(2560, 20480));
+    try std.testing.expect(!gemma4Bf16MlpProjectionShapeQualified(2048, 8192));
+}
+
+test "metal partition executor keeps a satisfied fused interior elided" {
+    // Regression for the Gemma gate/up backward pair: the fusion writes the
+    // add directly, so static liveness must not resurrect the other dot just
+    // because that already-materialized add is a later graph node.
+    try std.testing.expect(skippedNodeCanRemainElided(false, false, true, false, true));
+
+    // Unowned future uses and graph outputs still force ordinary
+    // materialization, while protected scalar/output tails always win.
+    try std.testing.expect(!skippedNodeCanRemainElided(false, false, false, false, true));
+    try std.testing.expect(!skippedNodeCanRemainElided(false, false, true, true, true));
+    try std.testing.expect(!skippedNodeCanRemainElided(true, false, true, false, true));
+
+    // Preserve the established no-consumer and runtime-region skip contracts.
+    try std.testing.expect(skippedNodeCanRemainElided(false, false, false, false, false));
+    try std.testing.expect(skippedNodeCanRemainElided(false, true, false, false, true));
+}
+
+test "metal fusion cleanup preserves a pre-materialized input before its graph position" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 1, 3 }));
+    const first_weight = try b.parameter("first_weight", Shape.init(.f32, &.{ 2, 3 }));
+    const first = try b.linearNoBias(x, first_weight, 1, 3, 2);
+    const late_weight = try b.parameter("late_weight", Shape.init(.f32, &.{ 2, 3 }));
+    const second = try b.linearNoBias(x, late_weight, 1, 3, 2);
+
+    const node_count: usize = @intCast(g.nodeCount());
+    const node_ids = try allocator.alloc(NodeId, node_count);
+    defer allocator.free(node_ids);
+    for (node_ids, 0..) |*node_id, index| node_id.* = @intCast(index);
+    const values = try allocator.alloc(?CT, node_count);
+    defer allocator.free(values);
+    @memset(values, null);
+    const skipped = try allocator.alloc(bool, node_count);
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+    skipped[@intCast(second)] = true;
+
+    const first_pos = findNodePos(node_ids, first) orelse return error.MissingFirstLinear;
+    try std.testing.expect(inputHasPendingConsumerAfterFusionFrontier(
+        &g,
+        values,
+        late_weight,
+        .{
+            .node_ids = node_ids,
+            .node_pos = first_pos,
+            .skipped_nodes = skipped,
+            .executed_node_id = second,
+        },
+    ));
+}
+
+test "metal partition executor softmax backward declines protected elision" {
+    const pattern = SoftmaxBackwardPattern{
+        .adj_times_output_id = 0,
+        .reduce_id = 1,
+        .broadcast_id = 2,
+        .centered_id = 3,
+        .output_id = 4,
+        .softmax_output_id = 5,
+        .upstream_id = 6,
+        .rows = 2,
+        .dim = 4,
+    };
+    var protected = [_]bool{false} ** 7;
+    try std.testing.expect(!softmaxBackwardElisionIsProtected(pattern, &protected));
+
+    for ([_]NodeId{ pattern.adj_times_output_id, pattern.reduce_id, pattern.broadcast_id, pattern.centered_id }) |node_id| {
+        protected[@intCast(node_id)] = true;
+        try std.testing.expect(softmaxBackwardElisionIsProtected(pattern, &protected));
+        protected[@intCast(node_id)] = false;
+    }
+
+    // Inputs are consumed directly and the output is published by the fusion,
+    // so their protection does not invalidate the region.
+    protected[@intCast(pattern.softmax_output_id)] = true;
+    protected[@intCast(pattern.upstream_id)] = true;
+    protected[@intCast(pattern.output_id)] = true;
+    try std.testing.expect(!softmaxBackwardElisionIsProtected(pattern, &protected));
+}
+
+test "metal partition executor executes Gemma gated MLP contract and preserves saved values" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 1;
+    const hidden: usize = 2;
+    const intermediate: usize = 4;
+    const input_id = try b.parameter("hidden", Shape.init(.f32, &.{ rows, hidden }));
+    const gate_weight_id = try b.parameter("model.layers.0.mlp.gate_proj.weight", Shape.init(.f32, &.{ intermediate, hidden }));
+    const gate_id = try b.linearNoBias(input_id, gate_weight_id, @intCast(rows), @intCast(hidden), @intCast(intermediate));
+    const activation_id = try b.relu(gate_id);
+    const up_weight_id = try b.parameter("model.layers.0.mlp.up_proj.weight", Shape.init(.f32, &.{ intermediate, hidden }));
+    const up_id = try b.linearNoBias(input_id, up_weight_id, @intCast(rows), @intCast(hidden), @intCast(intermediate));
+    const multiply_id = try b.mul(activation_id, up_id);
+    const down_weight_id = try b.parameter("model.layers.0.mlp.down_proj.weight", Shape.init(.f32, &.{ hidden, intermediate }));
+    const down_id = try b.linearNoBias(multiply_id, down_weight_id, @intCast(rows), @intCast(intermediate), @intCast(hidden));
+    try g.markOutput(down_id);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+    const node_ids = try allocator.alloc(NodeId, @intCast(g.nodeCount()));
+    defer allocator.free(node_ids);
+    for (node_ids, 0..) |*node_id, i| node_id.* = @intCast(i);
+    const gate_pos = findNodePos(node_ids, gate_id) orelse return error.MissingGateNode;
+    const pattern = matchGemmaGatedMlpTrainingPattern(&g, node_ids, gate_pos, reachable, skipped) orelse
+        return error.ExpectedGemmaGatedMlpTrainingPattern;
+
+    var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitEmptyNativeWeightStore(&weight_store, allocator);
+    var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    var cb = compute.computeBackend();
+
+    const values = try allocator.alloc(?CT, @intCast(g.nodeCount()));
+    defer allocator.free(values);
+    @memset(values, null);
+    const value_device = try allocator.alloc(DeviceId, @intCast(g.nodeCount()));
+    defer allocator.free(value_device);
+    @memset(value_device, 0);
+
+    const input = try cb.fromFloat32Shape(&.{ 1.0, -2.0 }, &.{ rows, hidden });
+    defer cb.free(input);
+    const gate_weight = try cb.fromFloat32Shape(&.{
+        1.0,  0.0,
+        0.0,  1.0,
+        -1.0, 0.0,
+        0.0,  -1.0,
+    }, &.{ intermediate, hidden });
+    defer cb.free(gate_weight);
+    const up_weight = try cb.fromFloat32Shape(&.{
+        2.0, 0.0,
+        0.0, 3.0,
+        4.0, 0.0,
+        0.0, 5.0,
+    }, &.{ intermediate, hidden });
+    defer cb.free(up_weight);
+    const down_weight = try cb.fromFloat32Shape(&.{
+        1.0, 1.0, 1.0, 1.0,
+        2.0, 0.0, 0.0, 0.0,
+    }, &.{ hidden, intermediate });
+    defer cb.free(down_weight);
+    values[@intCast(input_id)] = input;
+    values[@intCast(gate_weight_id)] = gate_weight;
+    values[@intCast(up_weight_id)] = up_weight;
+    values[@intCast(down_weight_id)] = down_weight;
+
+    var stats: PartitionExecutor.ExecutionStats = .{};
+    try std.testing.expect(try executeGemmaGatedMlpTrainingPattern(
+        &g,
+        &cb,
+        values,
+        value_device,
+        0,
+        skipped,
+        &stats,
+        pattern,
+    ));
+    defer for ([_]NodeId{ gate_id, up_id, activation_id, multiply_id, down_id }) |node_id| {
+        if (values[@intCast(node_id)]) |value| cb.free(value);
+    };
+
+    try std.testing.expect(values[@intCast(gate_id)] != null);
+    try std.testing.expect(values[@intCast(up_id)] != null);
+    try std.testing.expect(values[@intCast(activation_id)] != null);
+    try std.testing.expect(values[@intCast(multiply_id)] != null);
+    try std.testing.expect(values[@intCast(down_id)] != null);
+    try std.testing.expect(!skipped[@intCast(gate_id)]);
+    try std.testing.expect(skipped[@intCast(up_id)]);
+    try std.testing.expect(skipped[@intCast(activation_id)]);
+    try std.testing.expect(skipped[@intCast(multiply_id)]);
+    try std.testing.expect(skipped[@intCast(down_id)]);
+    try std.testing.expectEqual(@as(u64, 1), stats.fused_graph_pattern_dispatches);
+    try std.testing.expectEqual(@as(u64, 4), stats.fused_graph_nodes_elided);
+    try std.testing.expectEqual(@as(u64, 1), stats.metal_linear_pair_fusions);
+
+    // Compare with the same operations dispatched independently.  This keeps
+    // the contract test independent of backend weight-layout conventions while
+    // still detecting reordered projections or a missing saved activation.
+    const reference_gate = try cb.linearNoBias(input, gate_weight, rows, hidden, intermediate);
+    defer cb.free(reference_gate);
+    const reference_up = try cb.linearNoBias(input, up_weight, rows, hidden, intermediate);
+    defer cb.free(reference_up);
+    const reference_activation = try cb.relu(reference_gate);
+    defer cb.free(reference_activation);
+    const reference_multiply = try cb.multiply(reference_activation, reference_up);
+    defer cb.free(reference_multiply);
+    const reference_down = try cb.linearNoBias(reference_multiply, down_weight, rows, intermediate, hidden);
+    defer cb.free(reference_down);
+
+    const output = try cb.toFloat32(values[@intCast(down_id)].?, allocator);
+    defer allocator.free(output);
+    const expected = try cb.toFloat32(reference_down, allocator);
+    defer allocator.free(expected);
+    try std.testing.expectEqual(@as(usize, hidden), output.len);
+    try std.testing.expectEqual(output.len, expected.len);
+    for (output, expected) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 1e-5);
+}
+
 test "metal partition executor computes frame chunk boundary positions" {
     try std.testing.expectEqual(@as(?usize, 3), currentFrameChunkBoundaryPos(10, 0, 4, 0));
     try std.testing.expectEqual(@as(?usize, 3), currentFrameChunkBoundaryPos(10, 2, 4, 2));
     try std.testing.expectEqual(@as(?usize, 7), currentFrameChunkBoundaryPos(10, 4, 4, 0));
     try std.testing.expectEqual(@as(?usize, 9), currentFrameChunkBoundaryPos(10, 8, 4, 0));
     try std.testing.expectEqual(@as(?usize, null), currentFrameChunkBoundaryPos(10, 0, 0, 0));
+}
+
+test "metal partition executor lora linear replaces an existing internal value without leaking" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 1;
+    const in_dim: usize = 2;
+    const rank: usize = 1;
+    const out_dim: usize = 2;
+    const input_id = try b.parameter("input", ml.graph.Shape.init(.f32, &.{ rows, in_dim }));
+    const base_weight_id = try b.parameter("base.weight", ml.graph.Shape.init(.f32, &.{ out_dim, in_dim }));
+    const base_id = try b.linearNoBias(input_id, base_weight_id, rows, in_dim, out_dim);
+    const lora_a_id = try b.parameter("base.weight.lora_A", ml.graph.Shape.init(.f32, &.{ rank, in_dim }));
+    const after_a_id = try b.linearNoBias(input_id, lora_a_id, rows, in_dim, rank);
+    const lora_b_id = try b.parameter("base.weight.lora_B", ml.graph.Shape.init(.f32, &.{ out_dim, rank }));
+    const after_b_id = try b.linearNoBias(after_a_id, lora_b_id, rows, rank, out_dim);
+    const scale_id = try b.scalarConst(.f32, 0.5);
+    const scaled_id = try b.mul(after_b_id, scale_id);
+    const add_id = try b.add(base_id, scaled_id);
+    try g.markOutput(add_id);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const skipped_nodes = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(skipped_nodes);
+    @memset(skipped_nodes, false);
+    const pattern = matchLoraLinearPattern(&g, &.{add_id}, 0, reachable, skipped_nodes) orelse
+        return error.ExpectedLoraLinearPattern;
+
+    var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitEmptyNativeWeightStore(&weight_store, allocator);
+    var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    var cb = compute.computeBackend();
+
+    const values = try allocator.alloc(?CT, @intCast(g.nodeCount()));
+    defer allocator.free(values);
+    @memset(values, null);
+    const value_device = try allocator.alloc(DeviceId, @intCast(g.nodeCount()));
+    defer allocator.free(value_device);
+    @memset(value_device, 0);
+
+    const input = try cb.fromFloat32Shape(&.{ 2.0, -1.0 }, &.{ rows, in_dim });
+    defer cb.free(input);
+    const base = try cb.fromFloat32Shape(&.{ 10.0, 20.0 }, &.{ rows, out_dim });
+    defer cb.free(base);
+    const lora_a = try cb.fromFloat32Shape(&.{ 3.0, 4.0 }, &.{ rank, in_dim });
+    defer cb.free(lora_a);
+    const lora_b = try cb.fromFloat32Shape(&.{ 5.0, 6.0 }, &.{ out_dim, rank });
+    defer cb.free(lora_b);
+    const scale = try cb.fromFloat32Shape(&.{0.5}, &.{});
+    defer cb.free(scale);
+    const stale_after_a = try cb.fromFloat32Shape(&.{123.0}, &.{ rows, rank });
+
+    values[@intCast(input_id)] = input;
+    values[@intCast(base_id)] = base;
+    values[@intCast(lora_a_id)] = lora_a;
+    values[@intCast(lora_b_id)] = lora_b;
+    values[@intCast(scale_id)] = scale;
+    values[@intCast(after_a_id)] = stale_after_a;
+
+    try std.testing.expect(try executeLoraLinearPattern(&g, &cb, values, value_device, 0, null, pattern));
+    defer for ([_]NodeId{ after_a_id, after_b_id, scaled_id, add_id }) |node_id| {
+        if (values[@intCast(node_id)]) |value| cb.free(value);
+    };
+
+    try std.testing.expect(values[@intCast(after_a_id)].? != stale_after_a);
+    const output = try cb.toFloat32(values[@intCast(add_id)].?, allocator);
+    defer allocator.free(output);
+    try std.testing.expectEqualSlices(f32, &.{ 15.0, 26.0 }, output);
+}
+
+test "metal partition executor matches low-rank LoRA backward with direct B rhs" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: i64 = 2;
+    const in_dim: i64 = 4;
+    const rank: i64 = 2;
+    const out_dim: i64 = 3;
+    const input_id = try b.parameter("input", ml.graph.Shape.init(.f32, &.{ rows, in_dim }));
+    const lora_a_id = try b.parameter("base.weight.lora_A", ml.graph.Shape.init(.f32, &.{ rank, in_dim }));
+    const after_a_id = try b.linearNoBias(input_id, lora_a_id, @intCast(rows), @intCast(in_dim), @intCast(rank));
+    const lora_b_id = try b.parameter("base.weight.lora_B", ml.graph.Shape.init(.f32, &.{ out_dim, rank }));
+    const output_grad_id = try b.parameter("output_grad", ml.graph.Shape.init(.f32, &.{ rows, out_dim }));
+
+    // This is the canonical form emitted by autodiff after cancelling
+    // transpose(transpose(B)): d_after_a = dY @ B.
+    const d_after_a_id = try b.matmul(output_grad_id, lora_b_id);
+    const input_t = try b.transpose(input_id, &.{ 1, 0 });
+    const grad_a_dot = try b.matmul(input_t, d_after_a_id);
+    const grad_a_id = try b.transpose(grad_a_dot, &.{ 1, 0 });
+    const after_a_t = try b.transpose(after_a_id, &.{ 1, 0 });
+    const grad_b_dot = try b.matmul(after_a_t, output_grad_id);
+    const grad_b_id = try b.transpose(grad_b_dot, &.{ 1, 0 });
+    try g.markOutput(grad_a_id);
+    try g.markOutput(grad_b_id);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const skipped_nodes = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(skipped_nodes);
+    @memset(skipped_nodes, false);
+    const node_ids = try allocator.alloc(NodeId, @intCast(g.nodeCount()));
+    defer allocator.free(node_ids);
+    for (node_ids, 0..) |*node_id, index| node_id.* = @intCast(index);
+
+    const d_after_attrs = switch (g.node(d_after_a_id).op) {
+        .dot_general => |attrs| attrs,
+        else => return error.ExpectedLowRankLoraBackwardDot,
+    };
+    try std.testing.expect(isLinearDotAttrs(d_after_attrs));
+    try std.testing.expect(isLoraParameter(&g, lora_b_id, ".lora_B"));
+    const grad_b_match = findLowRankLoraBackwardGradBTransposed(
+        &g,
+        reachable,
+        skipped_nodes,
+        output_grad_id,
+        @intCast(rows),
+        @intCast(out_dim),
+        @intCast(rank),
+    ) orelse return error.ExpectedLowRankLoraBackwardGradB;
+    try std.testing.expectEqual(grad_b_dot, grad_b_match.dot_id);
+    try std.testing.expect(onlyReachableConsumerIs(&g, grad_b_match.after_a_transpose_id, grad_b_match.dot_id, reachable, skipped_nodes));
+
+    const pattern = matchLowRankLoraBackwardPattern(&g, node_ids, @intCast(d_after_a_id), reachable, skipped_nodes) orelse
+        return error.ExpectedLowRankLoraBackwardPattern;
+    try std.testing.expectEqual(lora_b_id, pattern.lora_b_id);
+    try std.testing.expectEqual(null_node, pattern.b_transpose_id);
+    try std.testing.expectEqual(grad_b_dot, pattern.grad_b_dot_id);
 }
 
 test "metal partition executor consumes buffer plan and evaluates partition" {
@@ -17371,6 +20851,119 @@ test "metal partition executor fuses sibling no-bias linears into one pair comma
     defer allocator.free(raw);
     try std.testing.expectEqualSlices(f32, &[_]f32{ 4.0, 8.0 }, raw);
     try std.testing.expectEqual(@as(u64, 2), exec_stats.backend_command_dispatches);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.interpreter_fallbacks);
+}
+
+test "metal linear pair fusion preserves shared input for intervening consumer" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 1, 3 }));
+    const bias = try b.parameter("bias", ml.graph.Shape.init(.f32, &.{ 1, 3 }));
+    const w_a = try b.parameter("w_a", ml.graph.Shape.init(.f32, &.{ 2, 3 }));
+    const w_b = try b.parameter("w_b", ml.graph.Shape.init(.f32, &.{ 2, 3 }));
+    const shared = try b.add(x, bias);
+    const a = try b.linearNoBias(shared, w_a, 1, 3, 2);
+    // This consumer intentionally sits between the two pairable linears in
+    // graph order. The pair fusion executes `c` while visiting `a`, but must
+    // not retire `shared` until this node has consumed it.
+    const intervening = try b.silu(shared);
+    const c = try b.linearNoBias(shared, w_b, 1, 3, 2);
+    const out = try b.add(a, c);
+    try g.markOutput(intervening);
+    try g.markOutput(out);
+
+    const caps = [_]partition_mod.Capability{
+        .{ .backend = .metal, .priority = 10, .supports = &partition_mod.supportsAll },
+    };
+    var partition_plan = try partition_mod.partition(allocator, &g, &caps);
+    defer partition_plan.deinit();
+    var buffer_plan = try buffer_plan_mod.build(allocator, &g, &partition_plan, .{});
+    defer buffer_plan.deinit();
+
+    var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitEmptyNativeWeightStore(&weight_store, allocator);
+    var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    var cb = compute.computeBackend();
+
+    const count: usize = @intCast(g.nodeCount());
+    const values = try allocator.alloc(?CT, count);
+    defer allocator.free(values);
+    @memset(values, null);
+    const value_device = try allocator.alloc(DeviceId, count);
+    defer allocator.free(value_device);
+    @memset(value_device, 0);
+
+    const x_data = [_]f32{ 1.0, 2.0, 3.0 };
+    const bias_data = [_]f32{ 1.0, -1.0, 0.5 };
+    const w_a_data = [_]f32{
+        1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+    };
+    const w_b_data = [_]f32{
+        0.0, 0.0, 1.0,
+        1.0, 1.0, 1.0,
+    };
+    const x_ct = try cb.fromFloat32Shape(&x_data, &.{ 1, 3 });
+    defer cb.free(x_ct);
+    const bias_ct = try cb.fromFloat32Shape(&bias_data, &.{ 1, 3 });
+    defer cb.free(bias_ct);
+    const w_a_ct = try cb.fromFloat32Shape(&w_a_data, &.{ 2, 3 });
+    defer cb.free(w_a_ct);
+    const w_b_ct = try cb.fromFloat32Shape(&w_b_data, &.{ 2, 3 });
+    defer cb.free(w_b_ct);
+    values[@intCast(x)] = x_ct;
+    values[@intCast(bias)] = bias_ct;
+    values[@intCast(w_a)] = w_a_ct;
+    values[@intCast(w_b)] = w_b_ct;
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    const partition_index = partition_plan.node_assignment[out];
+    var exec_stats: PartitionExecutor.ExecutionStats = .{};
+    var exec = MetalPartitionExecutor.initBorrowed(allocator, &g, &cb);
+    try exec.partitionExecutor().execute(values, value_device, partition_plan.partitions[partition_index].node_ids, 0, .{
+        .allocator = allocator,
+        .graph = &g,
+        .backend = &cb,
+        .options = .{
+            .runtime_inputs = &.{
+                .{ .node_id = x, .value = x_ct },
+                .{ .node_id = bias, .value = bias_ct },
+                .{ .node_id = w_a, .value = w_a_ct },
+                .{ .node_id = w_b, .value = w_b_ct },
+            },
+        },
+        .reachable = reachable,
+        .last_use = last_use,
+        .partition_plan = &partition_plan,
+        .buffer_plan = &buffer_plan,
+        .stats = &exec_stats,
+    });
+
+    const out_ct = values[@intCast(out)].?;
+    defer cb.free(out_ct);
+    const out_raw = try cb.toFloat32(out_ct, allocator);
+    defer allocator.free(out_raw);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 5.5, 7.5 }, out_raw);
+
+    const intervening_ct = values[@intCast(intervening)].?;
+    defer cb.free(intervening_ct);
+    const intervening_raw = try cb.toFloat32(intervening_ct, allocator);
+    defer allocator.free(intervening_raw);
+    const shared_expected = [_]f32{ 2.0, 1.0, 3.5 };
+    for (shared_expected, intervening_raw) |input_value, actual| {
+        const expected = input_value / (1.0 + @exp(-input_value));
+        try expectApproxEqAbsOrRel(expected, actual, 1e-5, 0.0);
+    }
+
+    try std.testing.expect(values[@intCast(shared)] == null);
+    try std.testing.expectEqual(@as(u64, 1), exec_stats.metal_linear_pair_fusions);
     try std.testing.expectEqual(@as(u64, 0), exec_stats.interpreter_fallbacks);
 }
 
@@ -18009,6 +21602,53 @@ test "metal partition executor recognizes raw transposed linear dot graph region
     }
 }
 
+test "metal partition executor qualifies only same-layer Gemma raw gate up pair" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 128;
+    const hidden: usize = 1536;
+    const intermediate: usize = 6144;
+    const x = try b.parameter("hidden", ml.graph.Shape.init(.f32, &.{ rows, hidden }));
+    const gate_weight = try b.parameter("model.language_model.layers.7.mlp.gate_proj.weight", ml.graph.Shape.init(.bf16, &.{ intermediate, hidden }));
+    const up_weight = try b.parameter("model.language_model.layers.7.mlp.up_proj.weight", ml.graph.Shape.init(.bf16, &.{ intermediate, hidden }));
+    const mixed_layer_up_weight = try b.parameter("model.language_model.layers.8.mlp.up_proj.weight", ml.graph.Shape.init(.bf16, &.{ intermediate, hidden }));
+    const gate_weight_t = try b.transpose(gate_weight, &.{ 1, 0 });
+    const gate = try b.matmul(x, gate_weight_t);
+    const up_weight_t = try b.transpose(up_weight, &.{ 1, 0 });
+    const up = try b.matmul(x, up_weight_t);
+    try g.markOutput(gate);
+    try g.markOutput(up);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+    const skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+    const node_ids = [_]NodeId{ gate, up };
+
+    const pattern = matchRawLinearPairPattern(&g, &node_ids, 0, reachable, last_use, skipped) orelse
+        return error.ExpectedRawGemmaGateUpPair;
+    try std.testing.expect(isQualifiedGemma4Bf16MlpForwardPair(&g, pattern));
+
+    var mixed_layer = pattern;
+    mixed_layer.second.weight_id = mixed_layer_up_weight;
+    try std.testing.expect(!isQualifiedGemma4Bf16MlpForwardPair(&g, mixed_layer));
+
+    var same_role = pattern;
+    same_role.second.weight_id = gate_weight;
+    try std.testing.expect(!isQualifiedGemma4Bf16MlpForwardPair(&g, same_role));
+
+    var wrong_rows = pattern;
+    wrong_rows.first.rows = 96;
+    wrong_rows.second.rows = 96;
+    try std.testing.expect(!isQualifiedGemma4Bf16MlpForwardPair(&g, wrong_rows));
+}
+
 test "metal partition executor recognizes raw transposed linear dot plus bias graph region" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
@@ -18197,6 +21837,243 @@ test "metal partition executor transposed linear dot with multi-use transpose ma
             }
         }
     }
+}
+
+test "metal partition executor defers one same-shape add into add3" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+    const x = try b.parameter("x", shape);
+    const y = try b.parameter("y", shape);
+    const z = try b.parameter("z", shape);
+    const inner = try b.add(x, y);
+    const out = try b.add(inner, z);
+    try g.markOutput(out);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    try std.testing.expectEqual(@as(usize, 1), reachableUseCount(&g, inner, reachable, 2));
+    try std.testing.expect(deferredElementwiseAdd(&g, inner, g.node(out).output_shape) != null);
+    try std.testing.expect(shouldDeferElementwiseAddForAdd(&g, inner, reachable, last_use, null));
+}
+
+test "gemma4 metal partition executor matches adjacent frozen rms backward residual add" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const flat_shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+    const residual_shape = ml.graph.Shape.init(.f32, &.{ 1, 2, 3 });
+    const input = try b.parameter("input", flat_shape);
+    const weight = try b.parameter("weight", ml.graph.Shape.init(.f32, &.{3}));
+    const dy = try b.parameter("dy", flat_shape);
+    const residual = try b.parameter("residual", residual_shape);
+    const backward = try g.addNode(.{
+        .op = .{ .fused_rms_norm_backward = .{
+            .dim = 3,
+            .eps = 1e-6,
+            .backward_weight_grad = false,
+        } },
+        .output_shape = flat_shape,
+        .inputs = .{ input, weight, dy, null_node },
+        .num_inputs = 3,
+        .vjp_alternate = null_node,
+    });
+    const reshaped = try b.reshape(backward, residual_shape);
+    const output = try b.add(residual, reshaped);
+    try g.markOutput(output);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+    const skipped = try allocator.alloc(bool, g.nodeCount());
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+    const elision_protected = try allocator.alloc(bool, g.nodeCount());
+    defer allocator.free(elision_protected);
+    @memset(elision_protected, false);
+    const node_ids = try allocator.alloc(NodeId, g.nodeCount());
+    defer allocator.free(node_ids);
+    for (node_ids, 0..) |*node_id, index| node_id.* = @intCast(index);
+
+    const pattern = matchRmsNormBackwardResidualAddPattern(
+        &g,
+        node_ids,
+        @intCast(backward),
+        reachable,
+        skipped,
+        elision_protected,
+        last_use,
+    ) orelse return error.ExpectedRmsNormBackwardResidualAddPattern;
+    try std.testing.expectEqual(backward, pattern.backward_id);
+    try std.testing.expectEqual(reshaped, pattern.reshape_id);
+    try std.testing.expectEqual(output, pattern.add_id);
+    try std.testing.expectEqual(residual, pattern.residual_id);
+    try std.testing.expectEqual(@as(usize, 2), pattern.rows);
+    try std.testing.expectEqual(@as(usize, 3), pattern.dim);
+    try std.testing.expect(!pattern.residual_on_rhs);
+
+    // The graph-output elision override owns small scalar-tail producers.
+    // A fusion may not skip one of those nodes because the ordinary executor
+    // must still materialize the protected chain at its topological position.
+    elision_protected[@intCast(reshaped)] = true;
+    try std.testing.expect(matchRmsNormBackwardResidualAddPattern(
+        &g,
+        node_ids,
+        @intCast(backward),
+        reachable,
+        skipped,
+        elision_protected,
+        last_use,
+    ) == null);
+    elision_protected[@intCast(reshaped)] = false;
+
+    var attrs = switch (g.node(backward).op) {
+        .fused_rms_norm_backward => |value| value,
+        else => unreachable,
+    };
+    attrs.backward_weight_grad = true;
+    g.nodeMut(backward).op = .{ .fused_rms_norm_backward = attrs };
+    try std.testing.expect(matchRmsNormBackwardResidualAddPattern(
+        &g,
+        node_ids,
+        @intCast(backward),
+        reachable,
+        skipped,
+        elision_protected,
+        last_use,
+    ) == null);
+}
+
+test "metal partition executor does not defer multi-use add into add3" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+    const x = try b.parameter("x", shape);
+    const y = try b.parameter("y", shape);
+    const z = try b.parameter("z", shape);
+    const w = try b.parameter("w", shape);
+    const inner = try b.add(x, y);
+    const first = try b.add(inner, z);
+    const second = try b.add(inner, w);
+    try g.markOutput(first);
+    try g.markOutput(second);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    try std.testing.expectEqual(@as(usize, 2), reachableUseCount(&g, inner, reachable, 2));
+    try std.testing.expect(!shouldDeferElementwiseAddForAdd(&g, inner, reachable, last_use, null));
+}
+
+test "metal partition executor does not defer add3 with broadcast outer operand" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+    const x = try b.parameter("x", shape);
+    const y = try b.parameter("y", shape);
+    const scalar = try b.scalarConst(.f32, 1.0);
+    const inner = try b.add(x, y);
+    const out = try b.add(inner, scalar);
+    try g.markOutput(out);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    try std.testing.expect(!shouldDeferElementwiseAddForAdd(&g, inner, reachable, last_use, null));
+}
+
+test "metal partition executor defers only lhs when both add3 inputs qualify" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+    const x = try b.parameter("x", shape);
+    const y = try b.parameter("y", shape);
+    const z = try b.parameter("z", shape);
+    const w = try b.parameter("w", shape);
+    const lhs = try b.add(x, y);
+    const rhs = try b.add(z, w);
+    const out = try b.add(lhs, rhs);
+    try g.markOutput(out);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    try std.testing.expect(shouldDeferElementwiseAddForAdd(&g, lhs, reachable, last_use, null));
+    try std.testing.expect(!shouldDeferElementwiseAddForAdd(&g, rhs, reachable, last_use, null));
+}
+
+test "gemma4 metal partition executor keeps add materialized beside a deferred multiply" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+    const x = try b.parameter("x", shape);
+    const y = try b.parameter("y", shape);
+    const z = try b.parameter("z", shape);
+    const w = try b.parameter("w", shape);
+    const inner_add = try b.add(x, y);
+    const inner_mul = try b.mul(z, w);
+    const out = try b.add(inner_add, inner_mul);
+    try g.markOutput(out);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    try std.testing.expect(!shouldDeferElementwiseAddForAdd(&g, inner_add, reachable, last_use, null));
+    try std.testing.expect(shouldDeferElementwiseMulForAdd(&g, inner_mul, reachable, last_use, null));
+}
+
+test "metal partition executor limits add3 deferral to one chain level" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const shape = ml.graph.Shape.init(.f32, &.{ 2, 3 });
+    const x = try b.parameter("x", shape);
+    const y = try b.parameter("y", shape);
+    const z = try b.parameter("z", shape);
+    const w = try b.parameter("w", shape);
+    const first = try b.add(x, y);
+    const second = try b.add(first, z);
+    const out = try b.add(second, w);
+    try g.markOutput(out);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    try std.testing.expect(shouldDeferElementwiseAddForAdd(&g, first, reachable, last_use, null));
+    try std.testing.expect(!shouldDeferElementwiseAddForAdd(&g, second, reachable, last_use, null));
 }
 
 test "metal partition executor defers scalar scale mul only for single add consumer" {
@@ -18416,7 +22293,7 @@ test "metal partition executor recognizes production grouped head dot candidate"
     values[@intCast(x)] = @as(CT, @ptrCast(&x_sentinel));
     values[@intCast(w)] = @as(CT, @ptrCast(&w_sentinel));
 
-    const candidate = (try groupedHeadDotCandidate(&g, values, dot, reachable, skipped)) orelse return error.ExpectedGroupedHeadDotCandidate;
+    const candidate = (try groupedMpsDotCandidate(&g, values, dot, reachable, skipped)) orelse return error.ExpectedGroupedHeadDotCandidate;
     try std.testing.expectEqual(dot, candidate.node_id);
     try std.testing.expectEqual(@as(usize, 96), candidate.m);
     try std.testing.expectEqual(@as(usize, 2304), candidate.n);
@@ -18451,7 +22328,67 @@ test "metal partition executor declines grouped head dot candidate for non-head 
     values[@intCast(x)] = @as(CT, @ptrCast(&x_sentinel));
     values[@intCast(w)] = @as(CT, @ptrCast(&w_sentinel));
 
-    try std.testing.expect((try groupedHeadDotCandidate(&g, values, dot, reachable, skipped)) == null);
+    try std.testing.expect((try groupedMpsDotCandidate(&g, values, dot, reachable, skipped)) == null);
+}
+
+test "metal partition executor recognizes qualified grouped rank-16 LoRA-A dot candidate" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 512, 1536 }));
+    const w = try b.parameter("model.layers.0.self_attn.q_proj.lora_A", ml.graph.Shape.init(.f32, &.{ 16, 1536 }));
+    const w_t = try b.transpose(w, &.{ 1, 0 });
+    const dot = try b.matmul(x, w_t);
+    try g.markOutput(dot);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+    const values = try allocator.alloc(?CT, @intCast(g.nodeCount()));
+    defer allocator.free(values);
+    @memset(values, null);
+    var x_sentinel: u8 = 0;
+    var w_sentinel: u8 = 0;
+    values[@intCast(x)] = @as(CT, @ptrCast(&x_sentinel));
+    values[@intCast(w)] = @as(CT, @ptrCast(&w_sentinel));
+
+    const candidate = (try groupedMpsDotCandidate(&g, values, dot, reachable, skipped)) orelse return error.ExpectedGroupedLoraDotCandidate;
+    try std.testing.expectEqual(@as(usize, 512), candidate.m);
+    try std.testing.expectEqual(@as(usize, 16), candidate.n);
+    try std.testing.expectEqual(@as(usize, 1536), candidate.k);
+    try std.testing.expectEqual(@as(u32, 1), candidate.rhs_contract_axis);
+}
+
+test "metal partition executor declines grouped rank-16 dot for non-LoRA parameter" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 512, 1536 }));
+    const w = try b.parameter("model.layers.0.self_attn.q_proj.weight", ml.graph.Shape.init(.f32, &.{ 16, 1536 }));
+    const w_t = try b.transpose(w, &.{ 1, 0 });
+    const dot = try b.matmul(x, w_t);
+    try g.markOutput(dot);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const skipped = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(skipped);
+    @memset(skipped, false);
+    const values = try allocator.alloc(?CT, @intCast(g.nodeCount()));
+    defer allocator.free(values);
+    @memset(values, null);
+    var x_sentinel: u8 = 0;
+    var w_sentinel: u8 = 0;
+    values[@intCast(x)] = @as(CT, @ptrCast(&x_sentinel));
+    values[@intCast(w)] = @as(CT, @ptrCast(&w_sentinel));
+
+    try std.testing.expect((try groupedMpsDotCandidate(&g, values, dot, reachable, skipped)) == null);
 }
 
 test "metal partition executor defers both same shape multiply add inputs" {
@@ -18705,6 +22642,73 @@ test "metal partition executor chunk-safe transpose defer is limited to weight p
     try std.testing.expect(transposeSourceIsWeightParameter(&g, weight_t));
     try std.testing.expect(shouldDeferTransposeForLinearDot(&g, input_like_t, reachable, last_use));
     try std.testing.expect(!transposeSourceIsWeightParameter(&g, input_like_t));
+}
+
+test "metal partition executor keeps deferred weight source live across forced chunk boundary" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 2;
+    const in_dim: usize = 3;
+    const out_dim: usize = 4;
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ rows, in_dim }));
+    const weight = try b.parameter("encoder.layer.0.output.dense.weight", ml.graph.Shape.init(.f32, &.{ out_dim, in_dim }));
+    const weight_t = try b.transpose(weight, &.{ 1, 0 });
+    const intervening = try b.add(x, x);
+    const dot = try g.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 0,
+        } },
+        .output_shape = ml.graph.Shape.init(.f32, &.{ rows, out_dim }),
+        .inputs = .{ x, weight_t, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(dot);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    const node_ids = [_]NodeId{ x, weight, weight_t, intervening, dot };
+    const transpose_pos: usize = 2;
+    const boundary_pos = currentFrameChunkBoundaryPos(node_ids.len, transpose_pos, 2, 0) orelse
+        return error.ExpectedFrameChunkBoundary;
+    try std.testing.expectEqual(@as(usize, 3), boundary_pos);
+    try std.testing.expect(shouldDeferTransposeForLinearDot(&g, weight_t, reachable, last_use));
+    try std.testing.expect(transposeSourceIsWeightParameter(&g, weight_t));
+    try std.testing.expect(!deferredProducerConsumerStaysInFrameChunk(
+        &node_ids,
+        transpose_pos,
+        weight_t,
+        2,
+        0,
+        last_use,
+    ));
+    try std.testing.expect(valueReferencedAfterBoundary(&g, &node_ids, boundary_pos, weight));
+    try std.testing.expect(valueReferencedAfterBoundary(&g, &node_ids, boundary_pos, weight_t));
+    try std.testing.expect(!valueReferencedAfterBoundary(&g, &node_ids, boundary_pos + 1, weight));
+    try std.testing.expect(valueReferencedAtOrAfterPosition(&g, &node_ids, boundary_pos + 1, weight));
+}
+
+test "gemma4 metal partition executor final frame sweep preserves escaping and future values" {
+    try std.testing.expect(!partitionSlotRolesEscape(.{ .local = true }));
+    try std.testing.expect(partitionSlotRolesEscape(.{ .output = true }));
+    try std.testing.expect(partitionSlotRolesEscape(.{ .graph_output = true }));
+    try std.testing.expect(partitionSlotRolesEscape(.{ .transfer_source = true }));
+
+    const boundary: NodeId = 100;
+    try std.testing.expect(lastUseExpiredThroughNode(99, boundary));
+    try std.testing.expect(lastUseExpiredThroughNode(100, boundary));
+    try std.testing.expect(!lastUseExpiredThroughNode(101, boundary));
+    try std.testing.expect(!lastUseExpiredThroughNode(std.math.maxInt(u32), boundary));
 }
 
 test "metal partition executor rank adapter backward pre-skips safe internal transposes" {
@@ -21413,6 +25417,271 @@ test "metal partition executor resident gqa attention uses command path" {
     const raw = try cb.toFloat32(values[out_index].?, allocator);
     defer allocator.free(raw);
     try std.testing.expectEqualSlices(f32, &.{ 5.0, 6.0, 7.0, 8.0 }, raw);
+}
+
+test "metal partition executor routes lazy native BF16 backward input without fallback" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const rows: usize = 2;
+    const in_dim: usize = 4;
+    const out_dim: usize = 3;
+    const weight_name = "model.layers.0.self_attn.q_proj.weight";
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+    const output_grad_id = try b.parameter("output_grad", ml.graph.Shape.init(.f32, &.{ rows, out_dim }));
+    const weight_id = try b.parameter(weight_name, ml.graph.Shape.init(.f32, &.{ out_dim, in_dim }));
+    const input_grad_id = try b.matmul(output_grad_id, weight_id);
+    try g.markOutput(input_grad_id);
+
+    const descriptor_seeds = try partition_mod.allocTensorDescriptorSeeds(allocator, &g);
+    defer allocator.free(descriptor_seeds);
+    try partition_mod.seedAllUploadableResidency(descriptor_seeds, &g, .metal, 0);
+    var diagnostics = partition_mod.CapabilityDiagnostics{};
+    const caps = [_]partition_mod.Capability{
+        .{
+            .backend = .metal,
+            .priority = 10,
+            .supports = &metal_capabilities.supportsMetalEagerGraph,
+            .decide = &metal_capabilities.decideMetalEagerGraph,
+        },
+        .{ .backend = .native, .priority = 0, .supports = &partition_mod.supportsAll, .decide = &partition_mod.decideNative },
+    };
+    var partition_plan = try partition_mod.partitionWithOptions(allocator, &g, &caps, .{
+        .tensor_descs = descriptor_seeds,
+        .diagnostics = &diagnostics,
+    });
+    defer partition_plan.deinit();
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.count(.unsupported_op));
+    for (partition_plan.partitions) |part| try std.testing.expectEqual(contracts.BackendKind.metal, part.backend);
+
+    var buffer_plan = try buffer_plan_mod.build(allocator, &g, &partition_plan, .{});
+    defer buffer_plan.deinit();
+    try buffer_plan.validate(&g, &partition_plan);
+
+    var weight_words = [_]u16{
+        0x3f80, 0x4000, 0x0000, 0xbf80,
+        0x0000, 0x3f80, 0x4040, 0x4000,
+        0x4000, 0xbf80, 0x3f80, 0x3f00,
+    };
+    var weight_shape = [_]i64{ out_dim, in_dim };
+    var weight_store = initEmptyMetalWeightStore(allocator);
+    defer deinitEmptyMetalWeightStore(&weight_store, allocator);
+    try weight_store.lazy_weights.put(allocator, weight_name, .{
+        .tensor_ref = undefined,
+        .host_loaded = .{ .tensor = .{
+            .data = std.mem.sliceAsBytes(&weight_words),
+            .dtype = .bf16,
+            .shape = &weight_shape,
+            .name = weight_name,
+            .allocator = allocator,
+            .owns_data = false,
+            .owns_shape = false,
+        } },
+        .active_tier = .host,
+        .loaded_bytes = @sizeOf(@TypeOf(weight_words)),
+    });
+
+    var metal_compute = try metal_compute_mod.MetalCompute.init(allocator, &weight_store, null);
+    defer metal_compute.deinit();
+    var cb = metal_compute.computeBackend();
+    if (!cb.decoderRuntimeReady()) return error.SkipZigTest;
+
+    const count: usize = @intCast(g.nodeCount());
+    const values = try allocator.alloc(?CT, count);
+    defer allocator.free(values);
+    @memset(values, null);
+    const value_device = try allocator.alloc(DeviceId, count);
+    defer allocator.free(value_device);
+    @memset(value_device, 0);
+
+    const output_grad_data = [_]f32{ 1, 2, -1, 0.5, -2, 3 };
+    const output_grad_host = try cb.fromFloat32Shape(&output_grad_data, &.{ rows, out_dim });
+    defer cb.free(output_grad_host);
+    const output_grad = (try makeMetalDeviceResident(&cb, output_grad_host)) orelse return error.SkipZigTest;
+    defer cb.free(output_grad);
+    values[@intCast(output_grad_id)] = output_grad;
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    const runtime_before = cb.debugTimingSnapshot().provider;
+    var exec_stats: PartitionExecutor.ExecutionStats = .{};
+    const partition_index = partition_plan.node_assignment[input_grad_id];
+    var exec = MetalPartitionExecutor.initBorrowed(allocator, &g, &cb);
+    try exec.partitionExecutor().execute(values, value_device, partition_plan.partitions[partition_index].node_ids, 0, .{
+        .allocator = allocator,
+        .graph = &g,
+        .backend = &cb,
+        .options = .{
+            .runtime_inputs = &.{.{ .node_id = output_grad_id, .value = output_grad }},
+            .preserve_runtime_input_residency = true,
+        },
+        .reachable = reachable,
+        .last_use = last_use,
+        .partition_plan = &partition_plan,
+        .buffer_plan = &buffer_plan,
+        .materialize_boundary_outputs = false,
+        .stats = &exec_stats,
+    });
+
+    const input_grad = values[@intCast(input_grad_id)].?;
+    defer cb.free(input_grad);
+    const runtime_after = cb.debugTimingSnapshot().provider;
+    try std.testing.expect(isMetalDeviceResident(&cb, input_grad));
+    try std.testing.expectEqual(runtime_before.decoder_runtime_prepare_linear_calls + 1, runtime_after.decoder_runtime_prepare_linear_calls);
+    try std.testing.expectEqual(@as(u64, 1), exec_stats.backend_command_dispatches);
+    try std.testing.expectEqual(@as(u64, 1), exec_stats.descriptor_materializations);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.interpreter_fallbacks);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.graph_region_fallbacks);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.runtime_region_fallbacks);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.host_materialized_command_outputs);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.host_materialized_interpreter_outputs);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.host_materialized_pre_materialized_constant_outputs);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.host_materialized_runtime_region_outputs);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.host_materialized_unattributed_outputs);
+    try std.testing.expectEqual(exec_stats.host_materialized_parameter_outputs, exec_stats.host_materialized_outputs);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.boundary_output_materializations);
+
+    const actual = try cb.toFloat32(input_grad, allocator);
+    defer allocator.free(actual);
+    const expected = [_]f32{ -1, 5, 5, 2.5, 6.5, -4, -3, -3 };
+    for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-3);
+}
+
+test "gemma4 metal partition executor routes packed Q4_0 backward input without fallback" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const rows: usize = 2;
+    const in_dim: usize = 32;
+    const out_dim: usize = 3;
+    const weight_name = "model.layers.0.self_attn.q_proj.weight";
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+    const output_grad_id = try b.parameter("output_grad", ml.graph.Shape.init(.f32, &.{ rows, out_dim }));
+    const weight_id = try b.parameter(weight_name, ml.graph.Shape.init(.f32, &.{ out_dim, in_dim }));
+    const input_grad_id = try b.matmul(output_grad_id, weight_id);
+    try g.markOutput(input_grad_id);
+
+    const descriptor_seeds = try partition_mod.allocTensorDescriptorSeeds(allocator, &g);
+    defer allocator.free(descriptor_seeds);
+    try partition_mod.seedParameterResidency(descriptor_seeds, &g, output_grad_id, .metal, 0);
+    try std.testing.expect(try partition_mod.seedParameterQuantFormatByName(descriptor_seeds, &g, weight_name, .q4_0));
+    var diagnostics = partition_mod.CapabilityDiagnostics{};
+    const caps = [_]partition_mod.Capability{
+        .{
+            .backend = .metal,
+            .priority = 10,
+            .supports = &metal_capabilities.supportsMetalEagerGraph,
+            .decide = &metal_capabilities.decideMetalEagerGraph,
+        },
+        .{ .backend = .native, .priority = 0, .supports = &partition_mod.supportsAll, .decide = &partition_mod.decideNative },
+    };
+    var partition_plan = try partition_mod.partitionWithOptions(allocator, &g, &caps, .{
+        .tensor_descs = descriptor_seeds,
+        .diagnostics = &diagnostics,
+    });
+    defer partition_plan.deinit();
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.count(.unsupported_op));
+    for (partition_plan.partitions) |part| try std.testing.expectEqual(contracts.BackendKind.metal, part.backend);
+
+    var buffer_plan = try buffer_plan_mod.build(allocator, &g, &partition_plan, .{});
+    defer buffer_plan.deinit();
+    try buffer_plan.validate(&g, &partition_plan);
+
+    var dense_weight: [out_dim * in_dim]f32 = undefined;
+    for (&dense_weight, 0..) |*value, idx| {
+        const signed = @as(i32, @intCast((idx * 11 + idx / in_dim) % 29)) - 14;
+        value.* = @as(f32, @floatFromInt(signed)) / 17.0;
+    }
+    const weight_raw = try quantizeLinearRowsForTest(allocator, .q4_0, &dense_weight, out_dim, in_dim);
+    defer allocator.free(weight_raw);
+    const weight_shape = [_]i64{ out_dim, in_dim };
+
+    var weight_store = initEmptyMetalWeightStore(allocator);
+    defer deinitEmptyMetalWeightStore(&weight_store, allocator);
+    try putTestQuantizedWeight(allocator, &weight_store, weight_name, weight_raw, &weight_shape, .q4_0);
+
+    var metal_compute = try metal_compute_mod.MetalCompute.init(allocator, &weight_store, null);
+    defer metal_compute.deinit();
+    var cb = metal_compute.computeBackend();
+    if (!cb.decoderRuntimeReady()) return error.SkipZigTest;
+
+    const count: usize = @intCast(g.nodeCount());
+    const values = try allocator.alloc(?CT, count);
+    defer allocator.free(values);
+    @memset(values, null);
+    const value_device = try allocator.alloc(DeviceId, count);
+    defer allocator.free(value_device);
+    @memset(value_device, 0);
+
+    const output_grad_data = [_]f32{ 1, 2, -1, 0.5, -2, 3 };
+    const output_grad_host = try cb.fromFloat32Shape(&output_grad_data, &.{ rows, out_dim });
+    defer cb.free(output_grad_host);
+    const output_grad = (try makeMetalDeviceResident(&cb, output_grad_host)) orelse return error.SkipZigTest;
+    defer cb.free(output_grad);
+    values[@intCast(output_grad_id)] = output_grad;
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    const runtime_before = cb.debugTimingSnapshot().provider;
+    var exec_stats: PartitionExecutor.ExecutionStats = .{};
+    const partition_index = partition_plan.node_assignment[input_grad_id];
+    var exec = MetalPartitionExecutor.initBorrowed(allocator, &g, &cb);
+    try exec.partitionExecutor().execute(values, value_device, partition_plan.partitions[partition_index].node_ids, 0, .{
+        .allocator = allocator,
+        .graph = &g,
+        .backend = &cb,
+        .options = .{
+            .runtime_inputs = &.{.{ .node_id = output_grad_id, .value = output_grad }},
+            .preserve_runtime_input_residency = true,
+        },
+        .reachable = reachable,
+        .last_use = last_use,
+        .partition_plan = &partition_plan,
+        .buffer_plan = &buffer_plan,
+        .materialize_boundary_outputs = false,
+        .stats = &exec_stats,
+    });
+
+    const input_grad = values[@intCast(input_grad_id)].?;
+    defer cb.free(input_grad);
+    const runtime_after = cb.debugTimingSnapshot().provider;
+    try std.testing.expect(isMetalDeviceResident(&cb, input_grad));
+    try std.testing.expectEqual(runtime_before.decoder_runtime_prepare_linear_calls + 1, runtime_after.decoder_runtime_prepare_linear_calls);
+    try std.testing.expectEqual(@as(u64, 1), exec_stats.backend_command_dispatches);
+    try std.testing.expectEqual(@as(u64, 1), exec_stats.descriptor_materializations);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.interpreter_fallbacks);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.graph_region_fallbacks);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.runtime_region_fallbacks);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.host_materialized_outputs);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.boundary_output_materializations);
+
+    var dequantized_weight: [out_dim * in_dim]f32 = undefined;
+    try quant_codec.dequantizeToFloat32(.{ .known = .Q4_0 }, weight_raw, &dequantized_weight);
+    var expected: [rows * in_dim]f32 = @splat(0.0);
+    for (0..rows) |row| {
+        for (0..in_dim) |in_col| {
+            for (0..out_dim) |out_col| {
+                expected[row * in_dim + in_col] += output_grad_data[row * out_dim + out_col] * dequantized_weight[out_col * in_dim + in_col];
+            }
+        }
+    }
+    const actual = try cb.toFloat32(input_grad, allocator);
+    defer allocator.free(actual);
+    for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 4e-3);
 }
 
 fn putTestQuantizedWeight(

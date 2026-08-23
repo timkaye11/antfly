@@ -27,6 +27,7 @@ const Options = struct {
     base_model_dir: []const u8,
     output_root: []const u8,
     dataset_path: ?[]const u8 = null,
+    eval_dataset_path: ?[]const u8 = null,
     count: []const u8 = "16",
     max_examples: ?[]const u8 = null,
     eval_max_examples: ?[]const u8 = null,
@@ -41,6 +42,7 @@ const Options = struct {
     recursive_init: []const u8 = "average_residual_svd",
     backend: []const u8 = "native",
     split: []const u8 = "train",
+    eval_split: []const u8 = "eval",
     dry_run: bool = false,
 };
 
@@ -78,6 +80,12 @@ pub fn main(init: std.process.Init) !void {
         owned_dataset_path = try resolveCliPath(allocator, invocation_cwd, value);
         opts.dataset_path = owned_dataset_path;
     }
+    var owned_eval_dataset_path: ?[]const u8 = null;
+    defer if (owned_eval_dataset_path) |value| allocator.free(value);
+    if (opts.eval_dataset_path) |value| {
+        owned_eval_dataset_path = try resolveCliPath(allocator, invocation_cwd, value);
+        opts.eval_dataset_path = owned_eval_dataset_path;
+    }
 
     try runSweep(init, allocator, opts);
 }
@@ -93,6 +101,13 @@ fn runSweep(init: std.process.Init, allocator: std.mem.Allocator, opts: Options)
     else
         try std.fs.path.join(allocator, &.{ opts.output_root, "text_pilot.jsonl" });
     defer allocator.free(dataset_path);
+    const eval_dataset_path = if (opts.eval_dataset_path) |path|
+        try allocator.dupe(u8, path)
+    else if (opts.dataset_path != null)
+        try allocator.dupe(u8, dataset_path)
+    else
+        try std.fs.path.join(allocator, &.{ opts.output_root, "text_pilot_eval.jsonl" });
+    defer allocator.free(eval_dataset_path);
     const ranks = try parseCsv(allocator, opts.ranks_csv);
     defer allocator.free(ranks);
     const shared_block_sizes = try parseCsv(allocator, opts.shared_block_sizes_csv);
@@ -126,6 +141,8 @@ fn runSweep(init: std.process.Init, allocator: std.mem.Allocator, opts: Options)
             baseline_dir,
             "--dataset",
             dataset_path,
+            "--eval-dataset",
+            eval_dataset_path,
             "--count",
             opts.count,
             "--max-examples",
@@ -148,6 +165,8 @@ fn runSweep(init: std.process.Init, allocator: std.mem.Allocator, opts: Options)
             opts.backend,
             "--split",
             opts.split,
+            "--eval-split",
+            opts.eval_split,
         });
         if (opts.dry_run) try baseline_cmd.append(allocator, "--dry-run");
         try runCommand(init, allocator, "run-gemma4-lora-pilot-workflow", run_gemma4_lora_pilot_workflow.main, baseline_cmd.items, false);
@@ -163,6 +182,8 @@ fn runSweep(init: std.process.Init, allocator: std.mem.Allocator, opts: Options)
                     variant_dir,
                     "--dataset",
                     dataset_path,
+                    "--eval-dataset",
+                    eval_dataset_path,
                     "--count",
                     opts.count,
                     "--max-examples",
@@ -193,6 +214,8 @@ fn runSweep(init: std.process.Init, allocator: std.mem.Allocator, opts: Options)
                     opts.backend,
                     "--split",
                     opts.split,
+                    "--eval-split",
+                    opts.eval_split,
                 });
                 if (opts.dry_run) try recursive_cmd.append(allocator, "--dry-run");
                 try runCommand(init, allocator, "run-gemma4-recursive-lora-smoke-workflow", run_gemma4_recursive_lora_smoke_workflow.main, recursive_cmd.items, false);
@@ -313,6 +336,8 @@ fn parseOptions(args: *std.process.Args.Iterator) !Options {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--dataset")) {
             opts.dataset_path = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--eval-dataset")) {
+            opts.eval_dataset_path = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--count")) {
             opts.count = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--max-examples")) {
@@ -341,11 +366,16 @@ fn parseOptions(args: *std.process.Args.Iterator) !Options {
             opts.backend = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--split")) {
             opts.split = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--eval-split")) {
+            opts.eval_split = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--dry-run")) {
             opts.dry_run = true;
         } else {
             return usageError();
         }
+    }
+    if (!std.mem.eql(u8, opts.backend, "native") and !std.mem.eql(u8, opts.backend, "metal")) {
+        return usageError();
     }
     return opts;
 }
@@ -488,6 +518,7 @@ fn usageError() error{InvalidArguments} {
         \\
         \\Options:
         \\  --dataset PATH
+        \\  --eval-dataset PATH
         \\  --count N
         \\  --max-examples N
         \\  --eval-max-examples N
@@ -500,8 +531,9 @@ fn usageError() error{InvalidArguments} {
         \\  --teacher-temperatures CSV
         \\  --teacher-top-k N
         \\  --recursive-init NAME
-        \\  --backend auto|native
+        \\  --backend native|metal
         \\  --split NAME
+        \\  --eval-split NAME
         \\  --dry-run
         \\
     , .{});

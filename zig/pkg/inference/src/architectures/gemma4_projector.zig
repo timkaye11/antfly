@@ -265,7 +265,8 @@ fn encodeSingleAudio(
     defer subsampled.deinit(allocator);
 
     var hidden = subsampled.hidden;
-    errdefer cb.free(hidden);
+    var hidden_owned = true;
+    errdefer if (hidden_owned) cb.free(hidden);
     const positions = try audioRelativePositionEmbeddings(allocator, cfg);
     defer allocator.free(positions);
 
@@ -277,6 +278,7 @@ fn encodeSingleAudio(
 
     const output = try audioLinearWithBias(cb, allocator, store, hidden, "a.pre_encode.out", subsampled.seq_len, cfg.audio_hidden, cfg.output_hidden);
     cb.free(hidden);
+    hidden_owned = false;
     defer cb.free(output);
 
     const normed = try rmsNormNoScaleCt(cb, allocator, output, subsampled.seq_len, cfg.output_hidden, cfg.layer_norm_eps);
@@ -521,7 +523,8 @@ fn audioSubsample(
 
     var shape = [_]i32{ 1, 1, @intCast(features.frames), @intCast(features.mel_bins) };
     var hidden = try cb.fromFloat32Shape(masked_features, &shape);
-    errdefer cb.free(hidden);
+    var hidden_owned = true;
+    errdefer if (hidden_owned) cb.free(hidden);
     var mask = try allocator.dupe(bool, features.mask);
     errdefer allocator.free(mask);
     var height = features.frames;
@@ -543,19 +546,22 @@ fn audioSubsample(
 
         const conv = try cb.conv2d(hidden, weight, bias, 1, channels, out_channels, height, width, 3, 3, 2, 2, 1, 1, 1);
         cb.free(hidden);
+        hidden_owned = false;
         hidden = conv;
+        hidden_owned = true;
         const out_h = (height + 2 - 3) / 2 + 1;
         const out_w = (width + 2 - 3) / 2 + 1;
 
         const conv_data = try cb.toFloat32(hidden, allocator);
         cb.free(hidden);
+        hidden_owned = false;
         defer allocator.free(conv_data);
         var norm = try loadTensorF32(store, try fmt(&norm_buf, "a.conv1d.{d}.norm.weight", .{layer}));
         defer norm.deinit();
         try layerNormChannelsRelu(conv_data, 1, out_channels, out_h, out_w, norm.data, cfg.layer_norm_eps);
         shape = [_]i32{ 1, @intCast(out_channels), @intCast(out_h), @intCast(out_w) };
         hidden = try cb.fromFloat32Shape(conv_data, &shape);
-        errdefer cb.free(hidden);
+        hidden_owned = true;
 
         const next_mask = try subsampleMaskEveryOther(allocator, mask, out_h);
         allocator.free(mask);
@@ -567,10 +573,13 @@ fn audioSubsample(
 
     const flattened = try flattenAudioConvOutput(cb, allocator, hidden, height, width, channels);
     cb.free(hidden);
+    hidden_owned = false;
     hidden = flattened;
+    hidden_owned = true;
 
     const projected = try linearNoBiasMaybeClipped(cb, allocator, store, hidden, "a.input_projection", height, width * channels, cfg.audio_hidden);
     cb.free(hidden);
+    hidden_owned = false;
 
     return .{
         .hidden = projected,
@@ -629,15 +638,12 @@ fn encodeSingleImage(
     );
     defer allocator.free(pixel_values);
 
-    const patches = try patchEmbed(cb, allocator, store, cfg, pixel_values, geometry);
-    defer allocator.free(patches);
+    const patches = try patchEmbedCt(cb, allocator, store, cfg, pixel_values, geometry);
+    defer cb.free(patches);
 
-    const positioned = try addPositionEmbeddings(allocator, store, cfg, patches, geometry);
-    defer allocator.free(positioned);
-
-    const hidden_shape = [_]i32{ @intCast(geometry.grid_x * geometry.grid_y), @intCast(cfg.vision_hidden) };
-    var hidden = try cb.fromFloat32Shape(positioned, &hidden_shape);
-    errdefer cb.free(hidden);
+    var hidden = try addPositionEmbeddingsCt(cb, allocator, store, cfg, patches, geometry);
+    var hidden_owned = true;
+    errdefer if (hidden_owned) cb.free(hidden);
 
     for (0..cfg.block_count) |layer| {
         const next = try encoderBlock(cb, allocator, store, cfg, hidden, geometry, layer);
@@ -645,16 +651,9 @@ fn encodeSingleImage(
         hidden = next;
     }
 
-    const hidden_data = try cb.toFloat32(hidden, allocator);
+    const pooled_ct = try averagePoolSpatialCt(cb, allocator, store, hidden, cfg, geometry);
     cb.free(hidden);
-    defer allocator.free(hidden_data);
-
-    const pooled = try averagePoolSpatial(allocator, hidden_data, cfg, geometry);
-    defer allocator.free(pooled);
-    try applyOptionalStandardization(allocator, store, pooled, cfg);
-
-    const pooled_shape = [_]i32{ @intCast(geometry.tokenCount()), @intCast(cfg.vision_hidden) };
-    const pooled_ct = try cb.fromFloat32Shape(pooled, &pooled_shape);
+    hidden_owned = false;
     defer cb.free(pooled_ct);
     const normed_pooled = try rmsNormNoScaleCt(cb, allocator, pooled_ct, geometry.tokenCount(), cfg.vision_hidden, cfg.layer_norm_eps);
     defer cb.free(normed_pooled);
@@ -1410,11 +1409,22 @@ fn parseAudioConfig(file: *const gguf_format.File) !AudioConfig {
     const block_count: usize = @intCast(view.getU64("clip.audio.block_count") orelse return error.InvalidGgufProjector);
     const direct_unified = std.mem.eql(u8, projector_type, "gemma4ua") or
         (std.mem.eql(u8, projector_type, "gemma4uv") and block_count == 0);
+    const text_hidden: usize = @intCast(view.getU64("clip.audio.projection_dim") orelse return error.InvalidGgufProjector);
+    const audio_hidden: usize = @intCast(view.getU64("clip.audio.embedding_length") orelse return error.InvalidGgufProjector);
+    // The projection metadata is the decoder width, not necessarily the
+    // intermediate output width of the audio pre-encoder.  Production Gemma 4
+    // projectors encode the latter only in a.pre_encode.out.weight (for
+    // example, E4B uses 1024 -> 1536 -> 2560).  Derive it from that matrix so
+    // non-direct audio bundles do not incorrectly assume 1024 -> 2560.
+    const output_hidden = if (direct_unified)
+        text_hidden
+    else
+        inferLinearOutputDim(file, "a.pre_encode.out.weight", audio_hidden) orelse return error.InvalidGgufProjector;
 
     return .{
-        .text_hidden = @intCast(view.getU64("clip.audio.projection_dim") orelse return error.InvalidGgufProjector),
-        .audio_hidden = @intCast(view.getU64("clip.audio.embedding_length") orelse return error.InvalidGgufProjector),
-        .output_hidden = @intCast(view.getU64("clip.audio.projection_dim") orelse return error.InvalidGgufProjector),
+        .text_hidden = text_hidden,
+        .audio_hidden = audio_hidden,
+        .output_hidden = output_hidden,
         .intermediate_size = @intCast(view.getU64("clip.audio.feed_forward_length") orelse return error.InvalidGgufProjector),
         .block_count = block_count,
         .head_count = @intCast(view.getU64("clip.audio.attention.head_count") orelse return error.InvalidGgufProjector),
@@ -1424,6 +1434,18 @@ fn parseAudioConfig(file: *const gguf_format.File) !AudioConfig {
         .mel_bins = @intCast(view.getU64("clip.audio.num_mel_bins") orelse 128),
         .layer_norm_eps = view.getF32("clip.audio.attention.layer_norm_epsilon") orelse 1e-5,
     };
+}
+
+fn inferLinearOutputDim(file: *const gguf_format.File, name: []const u8, input_dim: usize) ?usize {
+    for (file.tensors) |tensor| {
+        if (!std.mem.eql(u8, tensor.name, name) or tensor.dimensions.len != 2) continue;
+        const d0 = std.math.cast(usize, tensor.dimensions[0]) orelse return null;
+        const d1 = std.math.cast(usize, tensor.dimensions[1]) orelse return null;
+        if (d0 == input_dim and d1 > 0) return d1;
+        if (d1 == input_dim and d0 > 0) return d0;
+        return null;
+    }
+    return null;
 }
 
 test "gemma4 unified projector metadata parses image and audio configs" {
@@ -1478,6 +1500,36 @@ test "gemma4 unified projector metadata parses image and audio configs" {
     try std.testing.expectEqual(@as(usize, 640), audio_cfg.audio_hidden);
     try std.testing.expectEqual(@as(usize, 640), audio_cfg.raw_samples_per_token);
     try std.testing.expect(audio_cfg.direct_unified);
+}
+
+test "gemma4 audio config derives pre-encoder output width from tensor shape" {
+    const allocator = std.testing.allocator;
+    const metadata = [_]gguf_format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "clip" } },
+        .{ .key = "clip.audio.projector_type", .value = .{ .string = "gemma4uv" } },
+        .{ .key = "clip.audio.projection_dim", .value = .{ .u32 = 2560 } },
+        .{ .key = "clip.audio.embedding_length", .value = .{ .u32 = 1024 } },
+        .{ .key = "clip.audio.feed_forward_length", .value = .{ .u32 = 4096 } },
+        .{ .key = "clip.audio.block_count", .value = .{ .u32 = 1 } },
+        .{ .key = "clip.audio.attention.head_count", .value = .{ .u32 = 8 } },
+    };
+    const pre_encode_dims = [_]u64{ 1024, 1536 };
+    const tensors = [_]@import("../gguf/writer.zig").TensorSpec{
+        .{
+            .name = "a.pre_encode.out.weight",
+            .dimensions = &pre_encode_dims,
+            .tensor_type = .{ .known = .F32 },
+        },
+    };
+    var layout = try @import("../gguf/writer.zig").buildLayout(allocator, &metadata, &tensors);
+    defer layout.deinit(allocator);
+    var parsed = try gguf_format.parse(allocator, layout.header_bytes);
+    defer parsed.deinit(allocator);
+
+    const cfg = try parseAudioConfig(&parsed);
+    try std.testing.expectEqual(@as(usize, 1024), cfg.audio_hidden);
+    try std.testing.expectEqual(@as(usize, 1536), cfg.output_hidden);
+    try std.testing.expectEqual(@as(usize, 2560), cfg.text_hidden);
 }
 
 test "gemma4 unified projector rejects invalid effective patch geometry" {
@@ -1646,14 +1698,14 @@ fn floorToMultiple(value: usize, multiple: usize) usize {
     return (value / multiple) * multiple;
 }
 
-fn patchEmbed(
+fn patchEmbedCt(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     store: *tensor_store_mod.GgufStore,
     cfg: Config,
     pixel_values: []const f32,
     geometry: Geometry,
-) ![]f32 {
+) !CT {
     const scaled_pixels = try allocator.dupe(f32, pixel_values);
     defer allocator.free(scaled_pixels);
     for (scaled_pixels) |*value| value.* = 2.0 * (value.* - 0.5);
@@ -1670,6 +1722,24 @@ fn patchEmbed(
     const pixel_shape = [_]i32{ 1, 3, @intCast(geometry.height), @intCast(geometry.width) };
     const pixels_ct = try cb.fromFloat32Shape(scaled_pixels, &pixel_shape);
     defer cb.free(pixels_ct);
+
+    if (try cb.conv2dToTokens(
+        pixels_ct,
+        patch_w,
+        bias_ct,
+        1,
+        3,
+        cfg.vision_hidden,
+        geometry.height,
+        geometry.width,
+        cfg.patch_size,
+        cfg.patch_size,
+        cfg.patch_size,
+        cfg.patch_size,
+        0,
+        0,
+        1,
+    )) |tokens| return tokens;
 
     const conv = try cb.conv2d(
         pixels_ct,
@@ -1695,13 +1765,54 @@ fn patchEmbed(
     const patch_count = geometry.grid_x * geometry.grid_y;
     if (conv_data.len != cfg.vision_hidden * patch_count) return error.InvalidPatchEmbeddingShape;
     const embedded = try allocator.alloc(f32, patch_count * cfg.vision_hidden);
+    defer allocator.free(embedded);
     for (0..cfg.vision_hidden) |channel| {
         const src_base = channel * patch_count;
         for (0..patch_count) |patch_idx| {
             embedded[patch_idx * cfg.vision_hidden + channel] = conv_data[src_base + patch_idx];
         }
     }
-    return embedded;
+    const embedded_shape = [_]i32{ @intCast(patch_count), @intCast(cfg.vision_hidden) };
+    return cb.fromFloat32Shape(embedded, &embedded_shape);
+}
+
+fn addPositionEmbeddingsCt(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    store: *tensor_store_mod.GgufStore,
+    cfg: Config,
+    patches: CT,
+    geometry: Geometry,
+) !CT {
+    var pos = try loadTensorF32(store, "v.position_embd.weight");
+    defer pos.deinit();
+    const hidden_first = pos.shape.len == 3 and
+        pos.shape[0] == @as(i64, @intCast(cfg.vision_hidden)) and
+        pos.shape[2] == 2;
+    const axis_first = pos.shape.len == 3 and
+        pos.shape[0] == 2 and
+        pos.shape[2] == @as(i64, @intCast(cfg.vision_hidden));
+    if (!hidden_first and !axis_first) return error.InvalidPositionEmbeddingShape;
+    const positions_per_axis: usize = @intCast(pos.shape[1]);
+    if (geometry.grid_x > positions_per_axis or geometry.grid_y > positions_per_axis) return error.InvalidPositionEmbeddingShape;
+    const position_ct = try loadedWeightCt(cb, allocator, store, "v.position_embd.weight", &pos);
+    defer cb.free(position_ct);
+    if (try cb.gemma4VisionAddPosition(
+        patches,
+        position_ct,
+        geometry.grid_y,
+        geometry.grid_x,
+        cfg.vision_hidden,
+        positions_per_axis,
+        hidden_first,
+    )) |positioned| return positioned;
+
+    const patch_data = try cb.toFloat32(patches, allocator);
+    defer allocator.free(patch_data);
+    const positioned = try addPositionEmbeddings(allocator, store, cfg, patch_data, geometry);
+    defer allocator.free(positioned);
+    const hidden_shape = [_]i32{ @intCast(geometry.grid_x * geometry.grid_y), @intCast(cfg.vision_hidden) };
+    return cb.fromFloat32Shape(positioned, &hidden_shape);
 }
 
 fn addPositionEmbeddings(
@@ -1890,7 +2001,7 @@ fn selfAttention(
     const head_dim = cfg.vision_hidden / cfg.head_count;
 
     var q = try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_q", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
-    errdefer cb.free(q);
+    defer cb.free(q);
     {
         const q_norm_w = try loadWeightCt(cb, allocator, store, try fmt(buf, "v.blk.{d}.attn_q_norm.weight", .{layer}));
         defer cb.free(q_norm_w);
@@ -1898,10 +2009,9 @@ fn selfAttention(
         cb.free(q);
         q = normed;
     }
-    defer cb.free(q);
 
     var k = try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_k", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
-    errdefer cb.free(k);
+    defer cb.free(k);
     {
         const k_norm_w = try loadWeightCt(cb, allocator, store, try fmt(buf, "v.blk.{d}.attn_k_norm.weight", .{layer}));
         defer cb.free(k_norm_w);
@@ -1909,21 +2019,23 @@ fn selfAttention(
         cb.free(k);
         k = normed;
     }
-    defer cb.free(k);
 
     var v = try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_v", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
-    errdefer cb.free(v);
+    defer cb.free(v);
     {
         const normed = try rmsNormHeadChunksNoScale(cb, allocator, v, total, cfg.vision_hidden, head_dim, cfg.layer_norm_eps);
         cb.free(v);
         v = normed;
     }
-    defer cb.free(v);
 
-    const mask = try allocator.alloc(i64, total);
-    defer allocator.free(mask);
-    @memset(mask, 1);
-    const attn = try cb.scaledDotProductAttention(q, k, v, mask, null, 1, total, cfg.head_count, head_dim);
+    const attn = if (try cb.gemma4VisionAttention(q, k, v, 1, total, cfg.head_count, head_dim)) |device_attention|
+        device_attention
+    else blk: {
+        const mask = try allocator.alloc(i64, total);
+        defer allocator.free(mask);
+        @memset(mask, 1);
+        break :blk try cb.scaledDotProductAttention(q, k, v, mask, null, 1, total, cfg.head_count, head_dim);
+    };
     defer cb.free(attn);
 
     return linearNoBiasMaybeClipped(cb, allocator, store, attn, try fmt(buf, "v.blk.{d}.attn_out", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
@@ -1942,6 +2054,10 @@ fn rmsNormHeadChunksAnd2dRope(
     rope_theta: f32,
     compensate_sdpa_scale: bool,
 ) !CT {
+    const output_scale: f32 = if (compensate_sdpa_scale) @sqrt(@as(f32, @floatFromInt(head_dim))) else 1.0;
+    if (try cb.rmsNormHeadsRope2d(input, weight, rows, hidden, head_dim, geometry.grid_x, eps, rope_theta, output_scale)) |device_result| {
+        return device_result;
+    }
     const input_data = try cb.toFloat32(input, allocator);
     defer allocator.free(input_data);
     const weight_data = try cb.toFloat32(weight, allocator);
@@ -1962,6 +2078,7 @@ fn rmsNormHeadChunksNoScale(
     head_dim: usize,
     eps: f32,
 ) !CT {
+    if (try cb.rmsNormBare(input, head_dim, eps)) |device_result| return device_result;
     const input_data = try cb.toFloat32(input, allocator);
     defer allocator.free(input_data);
     if (input_data.len != rows * hidden) return error.InvalidTensorShape;
@@ -2070,6 +2187,65 @@ fn averagePoolSpatial(
     return pooled;
 }
 
+fn averagePoolSpatialCt(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    store: *tensor_store_mod.GgufStore,
+    hidden: CT,
+    cfg: Config,
+    geometry: Geometry,
+) !CT {
+    var scale = loadTensorF32(store, "v.std_scale") catch |err| switch (err) {
+        error.TensorNotFound => null,
+        else => return err,
+    };
+    defer if (scale) |*tensor| tensor.deinit();
+    var bias = loadTensorF32(store, "v.std_bias") catch |err| switch (err) {
+        error.TensorNotFound => null,
+        else => return err,
+    };
+    defer if (bias) |*tensor| tensor.deinit();
+    if ((scale == null) != (bias == null)) return error.InvalidStandardizationTensorShape;
+    if (scale) |*tensor| if (tensor.data.len != cfg.vision_hidden) return error.InvalidStandardizationTensorShape;
+    if (bias) |*tensor| if (tensor.data.len != cfg.vision_hidden) return error.InvalidStandardizationTensorShape;
+
+    var scale_ct: ?CT = null;
+    defer if (scale_ct) |tensor| cb.free(tensor);
+    var bias_ct: ?CT = null;
+    defer if (bias_ct) |tensor| cb.free(tensor);
+    if (scale) |*tensor| scale_ct = try loadedWeightCt(cb, allocator, store, "v.std_scale", tensor);
+    if (bias) |*tensor| bias_ct = try loadedWeightCt(cb, allocator, store, "v.std_bias", tensor);
+
+    const output_scale = @sqrt(@as(f32, @floatFromInt(cfg.vision_hidden)));
+    if (try cb.gemma4VisionPool(
+        hidden,
+        scale_ct,
+        bias_ct,
+        geometry.grid_y,
+        geometry.grid_x,
+        cfg.vision_hidden,
+        cfg.spatial_merge_size,
+        output_scale,
+    )) |pooled| return pooled;
+
+    const hidden_data = try cb.toFloat32(hidden, allocator);
+    defer allocator.free(hidden_data);
+    const pooled = try averagePoolSpatial(allocator, hidden_data, cfg, geometry);
+    defer allocator.free(pooled);
+    if (scale) |*scale_tensor| {
+        const bias_tensor = &bias.?;
+        const rows = pooled.len / cfg.vision_hidden;
+        for (0..rows) |row| {
+            const base = row * cfg.vision_hidden;
+            for (0..cfg.vision_hidden) |h| {
+                pooled[base + h] = (pooled[base + h] - bias_tensor.data[h]) * scale_tensor.data[h];
+            }
+        }
+    }
+    const pooled_shape = [_]i32{ @intCast(geometry.tokenCount()), @intCast(cfg.vision_hidden) };
+    return cb.fromFloat32Shape(pooled, &pooled_shape);
+}
+
 fn rmsNormNoScaleCt(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -2127,9 +2303,37 @@ fn loadWeightCt(
 ) !CT {
     var tensor = try loadTensorF32(store, name);
     defer tensor.deinit();
+    return loadedWeightCt(cb, allocator, store, name, &tensor);
+}
+
+fn loadedWeightCt(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    store: *tensor_store_mod.GgufStore,
+    name: []const u8,
+    tensor: *const LoadedF32,
+) !CT {
+    const cache_key = try projectorCacheKey(allocator, store, name, "raw");
+    defer if (cache_key) |key| allocator.free(key);
+    if (cache_key) |key| {
+        if (try cb.externalF32WeightLookup(key)) |cached| return cached;
+    }
     const shape = try shapeI32(allocator, tensor.shape);
     defer allocator.free(shape);
+    if (cache_key) |key| {
+        if (try cb.externalF32WeightInsert(key, tensor.data, shape)) |cached| return cached;
+    }
     return cb.fromFloat32Shape(tensor.data, shape);
+}
+
+fn projectorCacheKey(
+    allocator: std.mem.Allocator,
+    store: *const tensor_store_mod.GgufStore,
+    name: []const u8,
+    layout: []const u8,
+) !?[]u8 {
+    const path = store.path orelse return null;
+    return try std.fmt.allocPrint(allocator, "gemma4-projector:{s}:{s}:{s}", .{ path, layout, name });
 }
 
 fn linearNoBiasMaybeClipped(
@@ -2165,11 +2369,13 @@ fn linearNoBiasMaybeClipped(
     var linear_input = input;
     var free_linear_input = false;
     if (input_min != null or input_max != null) {
-        const input_data = try cb.toFloat32(input, allocator);
-        defer allocator.free(input_data);
-        try applyClamp(input_data, rows, in_dim, if (input_min) |*t| t.data else null, if (input_max) |*t| t.data else null);
-        const input_shape = [_]i32{ @intCast(rows), @intCast(in_dim) };
-        linear_input = try cb.fromFloat32Shape(input_data, &input_shape);
+        linear_input = (try clampCt(cb, input, input_min, input_max, rows, in_dim)) orelse blk: {
+            const input_data = try cb.toFloat32(input, allocator);
+            defer allocator.free(input_data);
+            try applyClamp(input_data, rows, in_dim, if (input_min) |*t| t.data else null, if (input_max) |*t| t.data else null);
+            const input_shape = [_]i32{ @intCast(rows), @intCast(in_dim) };
+            break :blk try cb.fromFloat32Shape(input_data, &input_shape);
+        };
         free_linear_input = true;
     }
     defer if (free_linear_input) cb.free(linear_input);
@@ -2180,16 +2386,46 @@ fn linearNoBiasMaybeClipped(
     errdefer cb.free(output);
 
     if (output_min != null or output_max != null) {
-        const output_data = try cb.toFloat32(output, allocator);
-        defer allocator.free(output_data);
-        try applyClamp(output_data, rows, out_dim, if (output_min) |*t| t.data else null, if (output_max) |*t| t.data else null);
-        const output_shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
-        const clipped_output = try cb.fromFloat32Shape(output_data, &output_shape);
+        const clipped_output = (try clampCt(cb, output, output_min, output_max, rows, out_dim)) orelse blk: {
+            const output_data = try cb.toFloat32(output, allocator);
+            defer allocator.free(output_data);
+            try applyClamp(output_data, rows, out_dim, if (output_min) |*t| t.data else null, if (output_max) |*t| t.data else null);
+            const output_shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
+            break :blk try cb.fromFloat32Shape(output_data, &output_shape);
+        };
         cb.free(output);
         output = clipped_output;
     }
 
     return output;
+}
+
+fn clampCt(
+    cb: *const ComputeBackend,
+    input: CT,
+    maybe_min: ?LoadedF32,
+    maybe_max: ?LoadedF32,
+    rows: usize,
+    dim: usize,
+) !?CT {
+    const min_count = if (maybe_min) |tensor| tensor.data.len else 0;
+    const max_count = if (maybe_max) |tensor| tensor.data.len else 0;
+    if (min_count != 0) try validateClampLen(min_count, rows, dim);
+    if (max_count != 0) try validateClampLen(max_count, rows, dim);
+
+    var min_ct: ?CT = null;
+    defer if (min_ct) |tensor| cb.free(tensor);
+    var max_ct: ?CT = null;
+    defer if (max_ct) |tensor| cb.free(tensor);
+    if (maybe_min) |tensor| {
+        const shape = [_]i32{@intCast(tensor.data.len)};
+        min_ct = try cb.fromFloat32Shape(tensor.data, &shape);
+    }
+    if (maybe_max) |tensor| {
+        const shape = [_]i32{@intCast(tensor.data.len)};
+        max_ct = try cb.fromFloat32Shape(tensor.data, &shape);
+    }
+    return cb.clamp(input, min_ct, max_ct, rows, dim, min_count, max_count);
 }
 
 fn applyClamp(data: []f32, rows: usize, dim: usize, maybe_min: ?[]const f32, maybe_max: ?[]const f32) !void {
@@ -2224,6 +2460,20 @@ fn loadLinearWeightCt(
     in_dim: usize,
     out_dim: usize,
 ) !CT {
+    const bf16_layout = try std.fmt.allocPrint(allocator, "linear-bf16-{d}x{d}", .{ out_dim, in_dim });
+    defer allocator.free(bf16_layout);
+    const bf16_cache_key = try projectorCacheKey(allocator, store, name, bf16_layout);
+    defer if (bf16_cache_key) |key| allocator.free(key);
+    if (bf16_cache_key) |key| {
+        if (try cb.externalBf16WeightLookup(key)) |cached| return cached;
+    }
+    const f32_layout = try std.fmt.allocPrint(allocator, "linear-f32-{d}x{d}", .{ out_dim, in_dim });
+    defer allocator.free(f32_layout);
+    const f32_cache_key = try projectorCacheKey(allocator, store, name, f32_layout);
+    defer if (f32_cache_key) |key| allocator.free(key);
+    if (f32_cache_key) |key| {
+        if (try cb.externalF32WeightLookup(key)) |cached| return cached;
+    }
     var tensor = try loadTensorF32(store, name);
     defer tensor.deinit();
     if (tensor.shape.len != 2) return error.InvalidTensorShape;
@@ -2231,14 +2481,30 @@ fn loadLinearWeightCt(
     const cols: usize = @intCast(tensor.shape[1]);
     if (rows == out_dim and cols == in_dim) {
         const shape = [_]i32{ @intCast(out_dim), @intCast(in_dim) };
+        if (bf16_cache_key) |key| {
+            if (try cb.externalBf16WeightInsert(key, tensor.data, &shape)) |cached| return cached;
+        }
+        if (f32_cache_key) |key| {
+            if (try cb.externalF32WeightInsert(key, tensor.data, &shape)) |cached| return cached;
+        }
         return cb.fromFloat32Shape(tensor.data, &shape);
     }
     if (rows == in_dim and cols == out_dim) {
         const transposed = try transposeMatrix(allocator, tensor.data, in_dim, out_dim);
         defer allocator.free(transposed);
         const shape = [_]i32{ @intCast(out_dim), @intCast(in_dim) };
+        if (bf16_cache_key) |key| {
+            if (try cb.externalBf16WeightInsert(key, transposed, &shape)) |cached| return cached;
+        }
+        if (f32_cache_key) |key| {
+            if (try cb.externalF32WeightInsert(key, transposed, &shape)) |cached| return cached;
+        }
         return cb.fromFloat32Shape(transposed, &shape);
     }
+    std.log.err(
+        "projector linear tensor {s} has shape [{d}, {d}], expected [{d}, {d}] or [{d}, {d}]",
+        .{ name, rows, cols, out_dim, in_dim, in_dim, out_dim },
+    );
     return error.InvalidTensorShape;
 }
 

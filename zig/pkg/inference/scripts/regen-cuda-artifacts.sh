@@ -191,12 +191,21 @@ required_symbols=(
   termite_f32_to_i32
   termite_round_f32
   termite_primitive_transpose_2d_f32
+  termite_primitive_gather_bf16_f32
+  termite_primitive_transpose_u16
+  termite_primitive_transpose_2d_u16
   termite_add_bias_relu_rows_f32
   termite_add_weighted_scalars_f32
   termite_linear_bf16_weight_f32_tiled
+  termite_frozen_linear_bf16_weight_dx_f32_tiled
+  termite_linear_cross_entropy_loss_f32
+  termite_linear_cross_entropy_finalize_f32
+  termite_linear_cross_entropy_count_labels_f32
+  termite_linear_cross_entropy_grad_logits_f32
   termite_linear_f16_weight_f32_tiled
   termite_embedding_lookup_bf16_weight_f32
   termite_embedding_lookup_f16_weight_f32
+  termite_embedding_lookup_i32_bf16_weight_f32
   termite_embedding_lookup_i32_f16_weight_f32
   termite_attention_f32_block
   termite_attention_f32_bert_prefill_s256_hd64_q16
@@ -210,6 +219,11 @@ required_symbols=(
   termite_channel_scores_softmax_f32
   termite_channel_apply_f32
   termite_florence_vision_tail_sources_f32
+  termite_rms_norm_heads_rope_2d_f32
+  termite_clamp_f32
+  termite_gemma4_vision_pool_f32
+  termite_gemma4_vision_add_position_f32
+  termite_gemma4_vision_attention_hd64_f32
   termite_linear_q4_k_pair_bias_f32_tc_hmma
   termite_deberta_attention_f32
   termite_deberta_attention_fused_f32

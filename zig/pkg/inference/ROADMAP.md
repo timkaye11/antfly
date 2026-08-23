@@ -151,7 +151,8 @@ The Go binary continues to work — Zig is a drop-in replacement for the inferen
 
 - [ ] **Result caching**: `ResultCache` and singleflight primitives exist in `src/cache/` but are not wired into any handler. Go antfly inference has per-endpoint TTL caches with singleflight dedup for: embedding, sparse embedding, chunking, reranking, NER, reading, transcription.
 - [ ] **Dense binary serialization**: Go antfly inference defaults to `application/octet-stream` for `/api/embed` (LE float32 arrays). We always return JSON.
-- [ ] **Multimodal generation parity**: native multimodal generation is missing for models like Gemma 3; multimodal success coverage and streaming behavior still lag Go inference.
+- [x] **Native multimodal generation**: Gemma 3, Gemma 4, and Qwen-VL image-bearing prompts run through the native generation pipeline, including CUDA-backed projector/decoder execution where supported.
+- [ ] **Broader multimodal serving parity and performance**: add wider request-level success, streaming, multi-image/audio, cancellation, and warm-server coverage across supported model families. Gemma 4 CUDA image projection now keeps clipping, axial 2D RoPE, long-sequence attention, pooling, and projection device-resident; audio-transform residency and wider server/concurrency qualification remain.
 - [ ] **HuggingFace Hub download**: `antfly inference pull owner/model:variant` — HTTP client for hub.huggingface.co, token auth, variant selection, progress reporting, resume support. (`src/registry/download.zig`)
 - [ ] **Session pooling**: pool of N sessions per model for concurrent inference. (`src/backends/session_pool.zig`)
 - [ ] **Prometheus metrics**: request latency histograms, cache hit rates, model load/unload events. `/metrics` endpoint. (`src/server/metrics.zig`)

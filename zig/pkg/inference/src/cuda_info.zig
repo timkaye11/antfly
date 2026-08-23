@@ -182,7 +182,9 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
         print("capability_deberta_reranker: {}\n", .{compute.supportsProfile(.deberta_reranker)});
         print("capability_florence2: {}\n", .{compute.supportsProfile(.florence2)});
         print("capability_gliner2: {}\n", .{compute.supportsProfile(.gliner2)});
+        print("capability_gliner2_training: {}\n", .{compute.supportsProfile(.gliner2_training)});
         print("capability_gemma4: {}\n", .{compute.supportsProfile(.gemma4)});
+        print("capability_gemma4_training: {}\n", .{compute.supportsProfile(.gemma4_training)});
 
         if (smoke) {
             cuda_kernels.smokeFill(allocator) catch |err| {

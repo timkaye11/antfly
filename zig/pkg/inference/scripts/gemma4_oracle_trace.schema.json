@@ -1,0 +1,334 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://antfly.io/schemas/gemma4_oracle_trace.schema.json",
+  "title": "Antfly Gemma4 LoRA numerical trace",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "producer",
+    "oracle_lock_sha256",
+    "model",
+    "prepared",
+    "training",
+    "metrics",
+    "logit_probes",
+    "target_tensors",
+    "tensor_store",
+    "artifact"
+  ],
+  "properties": {
+    "schema_version": { "const": "antfly_gemma4_lora_trace/v1" },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "source_revision", "hardware"],
+      "properties": {
+        "name": { "enum": ["hf-peft", "antfly-zig-native", "antfly-zig-metal", "synthetic-test"] },
+        "version": { "type": "string", "minLength": 1 },
+        "source_revision": { "type": "string", "minLength": 1 },
+        "hardware": { "type": "object" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "name": { "const": "hf-peft" } }, "required": ["name"] },
+          "then": {
+            "properties": {
+              "hardware": {
+                "type": "object",
+                "required": ["torch_device", "dtype", "cuda_device", "cuda_runtime"],
+                "properties": {
+                  "torch_device": { "const": "cuda" },
+                  "dtype": { "const": "bfloat16" },
+                  "cuda_device": { "type": "string", "minLength": 1 },
+                  "cuda_runtime": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "name": { "const": "antfly-zig-native" } }, "required": ["name"] },
+          "then": {
+            "properties": {
+              "source_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+              "hardware": { "$ref": "#/$defs/zigNativeHardware" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "name": { "const": "antfly-zig-metal" } }, "required": ["name"] },
+          "then": {
+            "properties": {
+              "source_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+              "hardware": { "$ref": "#/$defs/zigMetalHardware" }
+            }
+          }
+        }
+      ]
+    },
+    "oracle_lock_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "model": { "$ref": "#/$defs/model" },
+    "prepared": { "$ref": "#/$defs/prepared" },
+    "training": { "$ref": "#/$defs/training" },
+    "metrics": { "$ref": "#/$defs/metrics" },
+    "logit_probes": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/logitProbe" }
+    },
+    "target_tensors": {
+      "type": "array",
+      "minItems": 2,
+      "items": { "$ref": "#/$defs/targetTensor" }
+    },
+    "tensor_store": { "$ref": "#/$defs/tensorStore" },
+    "artifact": { "$ref": "#/$defs/artifact" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "producer": {
+            "properties": { "name": { "const": "synthetic-test" } },
+            "required": ["name"]
+          }
+        },
+        "required": ["producer"]
+      },
+      "then": {
+        "properties": {
+          "tensor_store": { "properties": { "format": { "const": "inline-f64/v1" } } }
+        }
+      },
+      "else": {
+        "properties": {
+          "tensor_store": { "properties": { "format": { "const": "safetensors/v1" } } }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "repo_id", "revision", "local_artifact_sha256"],
+      "properties": {
+        "key": { "enum": ["gemma-4-E2B-it", "gemma-4-E4B-it"] },
+        "repo_id": { "type": "string" },
+        "revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "local_artifact_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+      }
+    },
+    "prepared": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "artifact_sha256", "example_index", "input_ids", "labels", "source_dataset_sha256", "source_split", "source_revision", "source_id", "source_group_id", "source_name", "source_record_sha256", "rendered_chat_sha256"],
+      "properties": {
+        "schema_version": { "const": "gemma4_prepared/v6" },
+        "artifact_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "example_index": { "type": "integer", "minimum": 0 },
+        "input_ids": { "$ref": "#/$defs/ints" },
+        "labels": { "$ref": "#/$defs/ints" },
+        "source_dataset_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "source_split": { "type": "string", "minLength": 1 },
+        "source_revision": { "type": "string", "minLength": 1 },
+        "source_id": { "type": "string", "minLength": 1 },
+        "source_group_id": { "type": "string", "minLength": 1 },
+        "source_name": { "type": "string", "minLength": 1 },
+        "source_record_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "rendered_chat_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "training": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "optimizer", "seed", "step", "rank", "alpha", "scale", "target_preset",
+        "learning_rate", "betas", "eps", "weight_decay", "max_grad_norm",
+        "grad_accum_steps", "supervised_token_normalization", "dropout", "use_cache"
+      ],
+      "properties": {
+        "optimizer": { "const": "adamw" },
+        "seed": { "type": "integer", "minimum": 0 },
+        "step": { "type": "integer", "minimum": 1 },
+        "rank": { "type": "integer", "minimum": 1 },
+        "alpha": { "type": "number", "exclusiveMinimum": 0 },
+        "scale": { "type": "number", "exclusiveMinimum": 0 },
+        "target_preset": { "enum": ["peft-qv", "text-all-linear"] },
+        "learning_rate": { "type": "number", "exclusiveMinimum": 0 },
+        "betas": { "type": "array", "prefixItems": [{"type":"number"},{"type":"number"}], "minItems": 2, "maxItems": 2 },
+        "eps": { "type": "number", "exclusiveMinimum": 0 },
+        "weight_decay": { "type": "number", "minimum": 0 },
+        "max_grad_norm": { "type": "number", "minimum": 0 },
+        "grad_accum_steps": { "const": 1 },
+        "supervised_token_normalization": { "const": "mean" },
+        "dropout": { "const": 0.0 },
+        "use_cache": { "const": false }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["loss", "loss_history", "grad_norm", "supervised_tokens"],
+      "properties": {
+        "loss": { "type": "number" },
+        "loss_history": { "type": "array", "minItems": 1, "items": {"type":"number"} },
+        "grad_norm": { "type": "number", "minimum": 0 },
+        "supervised_tokens": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "logitProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["predictor_position", "target_token_id", "token_ids", "values", "logsumexp"],
+      "properties": {
+        "predictor_position": { "type": "integer", "minimum": 0 },
+        "target_token_id": { "type": "integer", "minimum": 0 },
+        "token_ids": { "$ref": "#/$defs/ints" },
+        "values": { "$ref": "#/$defs/numbers" },
+        "logsumexp": { "type": "number" }
+      }
+    },
+    "targetTensor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["canonical_name", "source_name", "role", "shape", "gradient_expectation", "logical_tensors"],
+      "properties": {
+        "canonical_name": { "type": "string", "minLength": 1 },
+        "source_name": { "type": "string", "minLength": 1 },
+        "role": { "enum": ["lora_A", "lora_B"] },
+        "shape": { "type": "array", "minItems": 2, "items": {"type":"integer", "minimum":1} },
+        "gradient_expectation": { "enum": ["active", "zero-by-zero-b-initialization"] },
+        "logical_tensors": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["initial", "gradient", "updated", "optimizer_m", "optimizer_v"],
+          "properties": {
+            "initial": { "type": "string" },
+            "gradient": { "type": "string" },
+            "updated": { "type": "string" },
+            "optimizer_m": { "type": "string" },
+            "optimizer_v": { "type": "string" }
+          }
+        }
+      }
+    },
+    "tensorStore": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["format", "entries"],
+          "properties": {
+            "format": { "const": "inline-f64/v1" },
+            "entries": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": { "$ref": "#/$defs/inlineTensorEntry" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["format", "path", "sha256", "entries"],
+          "properties": {
+            "format": { "const": "safetensors/v1" },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+            },
+            "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            "entries": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": { "$ref": "#/$defs/externalTensorEntry" }
+            }
+          }
+        }
+      ]
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["adapter_config_semantics", "adapter_model_sha256", "tensor_inventory", "key_layout", "policy_source"],
+      "properties": {
+        "adapter_config_semantics": { "$ref": "#/$defs/adapterSemantics" },
+        "adapter_model_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "tensor_inventory": { "type": "array", "items": {"type":"string"}, "uniqueItems": true },
+        "key_layout": { "enum": ["stock-peft/v1", "antfly_gemma4_adapter_keys/v1"] },
+        "policy_source": { "enum": ["explicit-lock-policy", "antfly-finetune-manifest/v2", "antfly-peft-export/v1"] }
+      }
+    },
+    "adapterSemantics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["peft_type", "task_type", "r", "lora_alpha", "target_preset", "target_modules", "use_dora", "lora_dropout"],
+      "properties": {
+        "peft_type": { "const": "LORA" },
+        "task_type": { "const": "CAUSAL_LM" },
+        "r": { "type": "integer", "minimum": 1 },
+        "lora_alpha": { "type": "number", "exclusiveMinimum": 0 },
+        "target_preset": { "enum": ["peft-qv", "text-all-linear"] },
+        "target_modules": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+        "use_dora": { "const": false },
+        "lora_dropout": { "const": 0.0 }
+      }
+    },
+    "inlineTensorEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["shape", "dtype", "values"],
+      "properties": {
+        "shape": { "type": "array", "minItems": 1, "items": {"type":"integer", "minimum":1} },
+        "dtype": { "const": "float64" },
+        "values": { "$ref": "#/$defs/numbers" }
+      }
+    },
+    "externalTensorEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["shape", "dtype", "storage_key"],
+      "properties": {
+        "shape": { "type": "array", "minItems": 1, "items": {"type":"integer", "minimum":1} },
+        "dtype": { "const": "float32" },
+        "storage_key": { "type": "string", "minLength": 1 }
+      }
+    },
+    "zigNativeHardware": {
+      "type": "object",
+      "required": ["backend", "executable_sha256", "git_dirty", "platform", "machine", "os_version", "os_build", "chip", "memory_bytes"],
+      "properties": {
+        "backend": { "const": "native" },
+        "executable_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "git_dirty": { "const": false },
+        "platform": { "const": "Darwin" },
+        "machine": { "const": "arm64" },
+        "os_version": { "type": "string", "minLength": 1 },
+        "os_build": { "type": "string", "minLength": 1 },
+        "chip": { "type": "string", "minLength": 1 },
+        "memory_bytes": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "zigMetalHardware": {
+      "type": "object",
+      "required": ["backend", "executable_sha256", "git_dirty", "platform", "machine", "os_version", "os_build", "chip", "memory_bytes", "metal_device"],
+      "properties": {
+        "backend": { "const": "metal" },
+        "executable_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "git_dirty": { "const": false },
+        "platform": { "const": "Darwin" },
+        "machine": { "const": "arm64" },
+        "os_version": { "type": "string", "minLength": 1 },
+        "os_build": { "type": "string", "minLength": 1 },
+        "chip": { "type": "string", "minLength": 1 },
+        "memory_bytes": { "type": "integer", "minimum": 1 },
+        "metal_device": { "type": "string", "minLength": 1 }
+      }
+    },
+    "ints": { "type": "array", "minItems": 1, "items": {"type":"integer"} },
+    "numbers": { "type": "array", "minItems": 1, "items": {"type":"number"} }
+  }
+}

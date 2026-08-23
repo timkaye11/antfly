@@ -265,6 +265,8 @@ pub fn runFromIterator(
         return try pullModel(alloc, io, args);
     } else if (std.mem.eql(u8, command, "convert")) {
         return try inference.tabular.cli.convertMain(alloc, io, try collectArgs(alloc, args));
+    } else if (std.mem.eql(u8, command, "version")) {
+        printVersion();
     } else if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
         printUsage();
     } else {
@@ -813,6 +815,10 @@ fn parseHostPort(base_uri: []const u8) !struct { host: []const u8, port: u16 } {
     return .{ .host = host, .port = port };
 }
 
+fn printVersion() void {
+    std.debug.print("antfly inference v{s}\n", .{build_options.antfly_version});
+}
+
 fn printUsage() void {
     std.debug.print(
         \\usage: antfly inference <command> [options]
@@ -837,6 +843,7 @@ fn printUsage() void {
         \\  list        List available models
         \\  pull        Download a HuggingFace model, or pull a hosted tabular_model.json predictor URL
         \\  convert     Convert a native ML model (XGBoost/LightGBM/ONNX) to the antfly tabular IR
+        \\  version     Print version information
         \\
         \\Run options:
         \\  --host <addr>    Listen address (default: 127.0.0.1)

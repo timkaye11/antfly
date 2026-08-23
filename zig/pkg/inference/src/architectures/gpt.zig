@@ -1215,6 +1215,51 @@ pub fn forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(
     return result;
 }
 
+/// Forward all decoder rows needed to populate KV state, but apply the LM
+/// head only to the final row. This is the standard (no layer overrides)
+/// counterpart used by multimodal prefill, where image embeddings make the
+/// prompt wide but only its final logits can be sampled.
+pub fn forwardLastLogitsLastRowFromEmbeddings(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+) ![]f32 {
+    const hidden_result = try forwardFinalHiddenTensorFromEmbeddings(
+        cb,
+        allocator,
+        config,
+        hidden_input,
+        batch,
+        seq_len,
+        decode_context,
+        ple_vectors,
+    );
+    const hidden = hidden_result.hidden;
+    defer cb.free(hidden);
+
+    const last_hidden = if (hidden_result.total_rows == 1)
+        hidden
+    else
+        try cb.sliceRows2D(allocator, hidden, hidden_result.total_rows - 1, 1, config.hidden_size);
+    defer if (last_hidden != hidden) cb.free(last_hidden);
+
+    const lm_w = try getLmHeadWeight(cb, config);
+    defer cb.free(lm_w);
+    const logits = try cb.linearNoBias(last_hidden, lm_w, 1, config.hidden_size, config.vocab_size);
+    defer cb.free(logits);
+    try maybeDebugTensor(cb, allocator, "lm_head", logits);
+
+    const result = try cb.toFloat32(logits, allocator);
+    applyFinalLogitSoftcap(config, result);
+    maybeDebugTopLogits(result, config.vocab_size);
+    return result;
+}
+
 pub fn forwardFinalHiddenLastRowFromEmbeddingsWithLayer0Overrides(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,

@@ -252,6 +252,29 @@ pub const Config = struct {
         return self.intermediate_size;
     }
 
+    /// Reconcile Gemma 4 FFN widths with the checkpoint tensors. The HF
+    /// config does not describe whether shared-KV tail layers widen their
+    /// MLPs: E2B widens them, while E4B keeps the base width. Tensor shapes
+    /// are therefore authoritative whenever the weight store is available.
+    pub fn refineGemma4IntermediateSizes(
+        self: *Config,
+        base_intermediate_size: u32,
+        shared_intermediate_size: ?u32,
+    ) void {
+        if (self.family != .gemma or base_intermediate_size == 0) return;
+        self.intermediate_size = base_intermediate_size;
+        if (self.num_kv_shared_layers == 0) {
+            self.shared_layer_intermediate_size = 0;
+            return;
+        }
+        if (shared_intermediate_size) |shared_size| {
+            self.shared_layer_intermediate_size = if (shared_size == base_intermediate_size)
+                0
+            else
+                shared_size;
+        }
+    }
+
     pub fn expertIntermediateSize(self: Config) u32 {
         return if (self.expert_intermediate_size > 0) self.expert_intermediate_size else self.intermediate_size;
     }
@@ -894,9 +917,9 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     if (text_obj.get("attention_k_eq_v")) |v| if (jsonBool(v)) |val| {
         config.attention_k_eq_v = val;
     };
-    if (config.family == .gemma and config.num_kv_shared_layers > 0 and config.shared_layer_intermediate_size == 0) {
-        config.shared_layer_intermediate_size = config.intermediate_size * 2;
-    }
+    if (text_obj.get("shared_layer_intermediate_size")) |v| if (jsonU32(v)) |val| {
+        config.shared_layer_intermediate_size = val;
+    };
 
     // Gemma 4: Per-Layer Embeddings (PLE).
     if (text_obj.get("hidden_size_per_layer_input")) |v| if (jsonU32(v)) |val| {
@@ -2919,6 +2942,50 @@ test "parse gemma4 e2b config with layer_types and shared kv" {
     try std.testing.expectEqual(@as(u32, 1), config.maxKvHeads());
     try std.testing.expectEqual(@as(u32, 512), config.maxHeadDim());
     try std.testing.expectEqual(@as(usize, 512), config.maxKvWidthPerToken());
+}
+
+test "gemma4 checkpoint shapes distinguish widened E2B and uniform E4B tails" {
+    var e2b = Config{
+        .family = .gemma,
+        .hidden_size = 1536,
+        .intermediate_size = 6144,
+        .num_hidden_layers = 35,
+        .num_kv_shared_layers = 20,
+    };
+    e2b.refineGemma4IntermediateSizes(6144, 12288);
+    try std.testing.expectEqual(@as(u32, 6144), e2b.intermediateSize(14));
+    try std.testing.expectEqual(@as(u32, 12288), e2b.intermediateSize(15));
+
+    var e4b = Config{
+        .family = .gemma,
+        .hidden_size = 2560,
+        .intermediate_size = 10240,
+        .num_hidden_layers = 42,
+        .num_kv_shared_layers = 18,
+        // Exercise replacement of the historical blanket doubling guess.
+        .shared_layer_intermediate_size = 20480,
+    };
+    e4b.refineGemma4IntermediateSizes(10240, 10240);
+    try std.testing.expectEqual(@as(u32, 10240), e4b.intermediateSize(23));
+    try std.testing.expectEqual(@as(u32, 10240), e4b.intermediateSize(24));
+    try std.testing.expectEqual(@as(u32, 0), e4b.shared_layer_intermediate_size);
+}
+
+test "parse gemma4 explicit shared tail intermediate size" {
+    const config = try parseConfig(std.testing.allocator,
+        \\{
+        \\  "model_type": "gemma4",
+        \\  "text_config": {
+        \\    "hidden_size": 1536,
+        \\    "intermediate_size": 6144,
+        \\    "num_hidden_layers": 35,
+        \\    "num_kv_shared_layers": 20,
+        \\    "shared_layer_intermediate_size": 12288
+        \\  }
+        \\}
+    );
+    try std.testing.expectEqual(@as(u32, 12288), config.shared_layer_intermediate_size);
+    try std.testing.expectEqual(@as(u32, 12288), config.intermediateSize(15));
 }
 
 test "parse gguf metadata for gemma4 shared kv config" {

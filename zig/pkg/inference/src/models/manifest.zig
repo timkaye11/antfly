@@ -971,10 +971,16 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
         return;
     }
 
-    if (inferModelTypeFromTasks(manifest.tasks)) |task_model_type| {
-        manifest.model_type = task_model_type;
-        manifest.model_type_origin = .tasks;
-        return;
+    // An explicit model_manifest.json type is the bundle author's primary
+    // serving contract. Multi-capability generators commonly advertise both
+    // `generate` and `read`; task inference must not demote those bundles to a
+    // reader merely because `read` has higher heuristic priority below.
+    if (manifest.model_type_origin != .manifest) {
+        if (inferModelTypeFromTasks(manifest.tasks)) |task_model_type| {
+            manifest.model_type = task_model_type;
+            manifest.model_type_origin = .tasks;
+            return;
+        }
     }
 
     if (manifest.gliner_model_type.len > 0) {
@@ -1035,6 +1041,22 @@ fn inferModelTypeFromTasks(tasks: []const []const u8) ?ModelType {
         if (std.mem.eql(u8, task, "embed")) return .embedder;
     }
     return null;
+}
+
+test "explicit generator manifest wins over generate and read task inference" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    try parseModelManifestJson(
+        &manifest,
+        allocator,
+        "{\"type\":\"generator\",\"tasks\":[\"generate\",\"read\"],\"capabilities\":[\"text\",\"image\",\"audio\"]}",
+    );
+    try applyImplicitModelTypeHints(&manifest, "models/google/gemma-4-E4B-it-qat-q4_0-gguf");
+
+    try std.testing.expectEqual(ModelType.generator, manifest.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.manifest, manifest.model_type_origin);
 }
 
 fn inferGlinerModelType(manifest: *const ModelManifest, model_dir_path: []const u8) ?[]const u8 {

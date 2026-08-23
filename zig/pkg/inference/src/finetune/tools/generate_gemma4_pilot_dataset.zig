@@ -45,7 +45,10 @@ pub fn main(init: std.process.Init) !void {
     const out_path = args.next() orelse return usage();
     const count_arg = args.next() orelse "100";
     const split = args.next() orelse "train";
+    const start_index_arg = args.next() orelse "0";
+    if (args.next() != null) return usage();
     const count = try std.fmt.parseUnsigned(usize, count_arg, 10);
+    const start_index = try std.fmt.parseUnsigned(usize, start_index_arg, 10);
     if (count == 0) return error.InvalidPilotExampleCount;
 
     const file = try compat.cwd().createFile(compat.io(), out_path, .{ .truncate = true });
@@ -53,13 +56,15 @@ pub fn main(init: std.process.Init) !void {
 
     var buf: [4096]u8 = undefined;
     var writer = file.writer(init.io, &buf);
-    for (0..count) |idx| {
+    for (0..count) |offset| {
+        const idx = std.math.add(usize, start_index, offset) catch return error.PilotExampleIndexOverflow;
         const prompt = prompts[idx % prompts.len];
         const noun = nouns[idx % nouns.len];
-        const variant = (idx * 17 + 11) % 997;
-        const id = try std.fmt.allocPrint(allocator, "pilot-{d:0>4}", .{idx + 1});
+        const variant = ((idx % 997) * 17 + 11) % 997;
+        const ordinal = std.math.add(usize, idx, 1) catch return error.PilotExampleIndexOverflow;
+        const id = try std.fmt.allocPrint(allocator, "pilot-{d:0>4}", .{ordinal});
         defer allocator.free(id);
-        const user_content = try std.fmt.allocPrint(allocator, "{s} {d}.", .{ prompt, idx + 1 });
+        const user_content = try std.fmt.allocPrint(allocator, "{s} {d}.", .{ prompt, ordinal });
         defer allocator.free(user_content);
         const assistant_content = try std.fmt.allocPrint(allocator, "{s}-{d:0>3}", .{ noun, variant });
         defer allocator.free(assistant_content);
@@ -83,9 +88,10 @@ pub fn main(init: std.process.Init) !void {
 
 fn usage() error{InvalidArguments} {
     std.debug.print(
-        \\usage: generate-gemma4-pilot-dataset <out_jsonl> [count=100] [split=train]
+        \\usage: generate-gemma4-pilot-dataset <out_jsonl> [count=100] [split=train] [start_index=0]
         \\
         \\Creates a deterministic Gemma chat JSONL dataset for bounded LoRA pilot runs.
+        \\Use a disjoint start_index when generating held-out evaluation data.
         \\
     , .{});
     return error.InvalidArguments;

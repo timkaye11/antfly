@@ -407,7 +407,8 @@ pub const ModelRegistry = struct {
         capabilities_csv: ?[]const u8,
         projector_selection: download.ProjectorSelection,
     ) !void {
-        const ref = try ModelRef.parse(ref_str);
+        const resolved_ref = resolveFriendlyRef(ref_str) orelse ref_str;
+        const ref = try ModelRef.parse(resolved_ref);
         const resolved_models_dir = try resolveModelsDirForWriteAlloc(self.allocator, io, self.models_dir);
         defer self.allocator.free(resolved_models_dir);
 
@@ -434,7 +435,15 @@ pub const ModelRegistry = struct {
             .callback = ProgressPrinter.onProgress,
             .context = &progress,
         });
-        try self.writePulledModelManifest(io, transaction.staging, tasks_csv, capabilities_csv);
+        var staged_manifest = try manifest_mod.loadFromManagedPlanDir(self.allocator, transaction.staging);
+        defer staged_manifest.deinit();
+        const defaults = pullManifestDefaults(ref, staged_manifest.gguf_projector_path != null);
+        try self.writePulledModelManifest(
+            io,
+            transaction.staging,
+            tasks_csv orelse if (defaults) |value| value.tasks else null,
+            capabilities_csv orelse if (defaults) |value| value.capabilities else null,
+        );
         try download.completeManagedDownload(self.allocator, io, transaction.staging);
         try transaction.commit(io);
     }
@@ -685,6 +694,37 @@ pub const ModelRegistry = struct {
         }
     }
 };
+
+const PullManifestDefaults = struct {
+    tasks: []const u8,
+    capabilities: []const u8,
+};
+
+fn pullManifestDefaults(ref: ModelRef, has_projector: bool) ?PullManifestDefaults {
+    if (!std.ascii.eqlIgnoreCase(ref.owner, "google")) return null;
+    if (std.ascii.eqlIgnoreCase(ref.name, "gemma-4-E2B-it-qat-q4_0-gguf") or
+        std.ascii.eqlIgnoreCase(ref.name, "gemma-4-E4B-it-qat-q4_0-gguf"))
+    {
+        return .{
+            .tasks = "generate",
+            .capabilities = if (has_projector) "text,image,audio" else "text",
+        };
+    }
+    return null;
+}
+
+test "official Gemma 4 QAT pull capabilities follow downloaded projector inventory" {
+    const e2b = try ModelRef.parse("google/gemma-4-E2B-it-qat-q4_0-gguf:gguf");
+    const defaults = pullManifestDefaults(e2b, true).?;
+    try std.testing.expectEqualStrings("generate", defaults.tasks);
+    try std.testing.expectEqualStrings("text,image,audio", defaults.capabilities);
+    const text_only = pullManifestDefaults(e2b, false).?;
+    try std.testing.expectEqualStrings("generate", text_only.tasks);
+    try std.testing.expectEqualStrings("text", text_only.capabilities);
+
+    const unrelated = try ModelRef.parse("owner/model:gguf");
+    try std.testing.expect(pullManifestDefaults(unrelated, true) == null);
+}
 
 fn resolvedEntryKind(dir: Dir, io: Io, entry: Dir.Entry) !std.Io.File.Kind {
     if (entry.kind != .unknown) return entry.kind;
@@ -1085,6 +1125,14 @@ fn synthesizePulledModelManifestJsonInternal(
     }
     try appendInferredCapabilities(allocator, &manifest, tasks.items, &capabilities);
     if (capabilities_csv) |csv| try appendCsvCapabilities(allocator, &capabilities, csv);
+    if (manifest_type == .generator) {
+        if (taskListContains(capabilities.items, "image")) {
+            try appendUniqueOwnedString(allocator, &inputs, "image");
+        }
+        if (taskListContains(capabilities.items, "audio")) {
+            try appendUniqueOwnedString(allocator, &inputs, "audio");
+        }
+    }
 
     const sparse_3d_output_layout = inferredSparse3DOutputLayout(&manifest);
 
@@ -1322,7 +1370,7 @@ test "pull manifest synthesis operates on private staging and remains receipted"
     });
 
     var registry = ModelRegistry.init(allocator, model_dir);
-    try registry.writePulledModelManifest(io, model_dir, "generate", null);
+    try registry.writePulledModelManifest(io, model_dir, "generate", "text,image,audio");
     var plan = try managed_receipt.loadValidatedPlan(allocator, io, model_dir);
     defer plan.deinit();
     try std.testing.expect(plan.find("model_manifest.json") != null);
@@ -1331,6 +1379,12 @@ test "pull manifest synthesis operates on private staging and remains receipted"
     var manifest = try manifest_mod.loadFromDir(allocator, model_dir);
     defer manifest.deinit();
     try std.testing.expectEqual(manifest_mod.ModelType.generator, manifest.model_type);
+    try std.testing.expect(manifest.hasCapability("text"));
+    try std.testing.expect(manifest.hasCapability("image"));
+    try std.testing.expect(manifest.hasCapability("audio"));
+    try std.testing.expect(manifest.hasInput("text"));
+    try std.testing.expect(manifest.hasInput("image"));
+    try std.testing.expect(manifest.hasInput("audio"));
 }
 
 test "managed discovery recognizes receipted nested payloads" {
@@ -1500,7 +1554,7 @@ test "synthesized pulled manifest keeps generate read gguf as generator" {
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"type\":\"generator\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"tasks\":[\"generate\",\"read\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"capabilities\":[\"text\",\"image\",\"audio\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"inputs\":[\"text\",\"image\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"inputs\":[\"text\",\"image\",\"audio\"]") != null);
 }
 
 test "synthesized pulled manifest treats rerank-named sequence classifiers as rerankers" {

@@ -3225,6 +3225,13 @@ pub const NativeGenerationPipeline = struct {
             defer allocator.free(audio_clips);
             debugGenerationStage("multimodal collected images={d} audio={d}", .{ images.len, audio_clips.len });
 
+            // Projectors execute through the shared model backend and may
+            // populate its resident external-weight cache. Keep that work
+            // under the same model lock as decoder execution so concurrent
+            // server requests cannot race CUDA allocations or cache inserts.
+            if (self.execution_lock) |mutex| platform.sync.lockYielding(mutex);
+            defer if (self.execution_lock) |mutex| mutex.unlock();
+
             if (self.gguf_projector_path) |projector_path| {
                 if (projector_format_mod.isAntfly(try projector_format_mod.detectPath(allocator, projector_path))) {
                     if (has_audio) return error.NativeAudioGenerationNotImplemented;
@@ -5129,7 +5136,12 @@ pub const NativeGenerationPipeline = struct {
         defer if (ple_vectors) |vectors| self.cb.free(vectors);
         var decode_context = decode_runtime.makeDecodeContext(seq_len, seq_len);
         decode_context.attn_or_mask = prepared.attn_or_mask;
-        const logits = try gpt_arch.forwardFromEmbeddings(
+        // Multimodal prefill only samples from the final prompt position.  Do
+        // not project every image/text row through the (large) vocabulary
+        // head and then download the full logits matrix just to retain its
+        // tail.  Keep the decoder/KV work over all rows, slice the final
+        // hidden row on device, and run the LM head for that row alone.
+        const last_logits = try gpt_arch.forwardLastLogitsLastRowFromEmbeddings(
             &self.cb,
             self.allocator,
             self.gpt_config,
@@ -5139,11 +5151,10 @@ pub const NativeGenerationPipeline = struct {
             &decode_context,
             ple_vectors,
         );
-        defer self.allocator.free(logits);
         if (self.scheduler) |scheduler| {
             if (self.scheduler_lease) |lease| scheduler.notePrefillProgress(lease, seq_len, seq_len);
         }
-        return try self.allocator.dupe(f32, logits[(seq_len - 1) * self.gpt_config.vocab_size ..][0..self.gpt_config.vocab_size]);
+        return last_logits;
     }
 
     const DecodeResult = struct {

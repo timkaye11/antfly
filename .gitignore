@@ -90,6 +90,7 @@ scripts/__pycache__/
 # Local inference benchmark inputs, outputs, and runtime lock directories
 /.benchmark-assets/
 /.benchmark-results/
+/unsloth_compiled_cache/
 /zig/group-*/
 
 # TLA+ model checker state directories

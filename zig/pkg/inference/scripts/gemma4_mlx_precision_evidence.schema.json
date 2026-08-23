@@ -1,0 +1,235 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://antfly.io/schemas/gemma4_mlx_precision_evidence.schema.json",
+  "title": "Runtime precision evidence for one MLX-LM Gemma4 LoRA benchmark sample",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "framework", "oracle_lock_sha256", "sample_binding", "runner", "native_runtime", "verified", "not_asserted", "comparison_policy", "observations"],
+  "properties": {
+    "schema_version": { "const": "antfly_gemma4_mlx_precision_evidence/v1" },
+    "framework": { "const": "mlx-lm" },
+    "oracle_lock_sha256": { "$ref": "#/$defs/sha256" },
+    "sample_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["campaign_id", "run_id", "repetition", "sequence_index", "command_sha256", "semantic_contract_sha256", "sample_payload_sha256"],
+      "properties": {
+        "campaign_id": { "type": "string", "minLength": 1 },
+        "run_id": { "type": "string", "minLength": 1 },
+        "repetition": { "type": "integer", "minimum": 0 },
+        "sequence_index": { "type": "integer", "minimum": 0 },
+        "command_sha256": { "$ref": "#/$defs/sha256" },
+        "semantic_contract_sha256": { "$ref": "#/$defs/sha256" },
+        "sample_payload_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "runner": { "$ref": "#/$defs/producerSource" },
+    "native_runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mlx_source_revision", "mlx_lm_source_revision", "native_artifact_inventory_sha256", "build_attestation_sha256", "build_command_sha256", "precision_policy_sha256"],
+      "properties": {
+        "mlx_source_revision": { "const": "68cf2fddd8de5edd8ab3d926391772b2e2cedad8" },
+        "mlx_lm_source_revision": { "const": "ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd" },
+        "native_artifact_inventory_sha256": { "$ref": "#/$defs/sha256" },
+        "build_attestation_sha256": { "$ref": "#/$defs/sha256" },
+        "build_command_sha256": { "$ref": "#/$defs/sha256" },
+        "precision_policy_sha256": { "const": "sha256:77b05f6b6c7fe42878da859d9b883cd39fccb373ac9e665c8fd07572ffbd2595" }
+      }
+    },
+    "verified": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_model_storage_dtype", "lora_parameter_storage_dtype", "gradient_storage_dtype", "optimizer_moment_storage_dtype", "loss_tensor_dtype", "loss_reduction_input_dtype"],
+      "properties": {
+        "base_model_storage_dtype": { "const": "bfloat16" },
+        "lora_parameter_storage_dtype": { "const": "float32" },
+        "gradient_storage_dtype": { "const": "float32" },
+        "optimizer_moment_storage_dtype": { "const": "float32" },
+        "loss_tensor_dtype": { "const": "float32" },
+        "loss_reduction_input_dtype": { "const": "float32" }
+      }
+    },
+    "not_asserted": {
+      "type": "array",
+      "prefixItems": [
+        { "const": "activation_dtype" },
+        { "const": "matmul_accumulator_dtype" }
+      ],
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "comparison_policy": { "const": "diagnostic-only-until-all-comparison-critical-dtypes-are-runtime-proven" },
+    "observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_model_storage", "lora_parameter_storage", "gradient_storage", "optimizer_moment_storage", "loss"],
+      "properties": {
+        "base_model_storage": {
+          "allOf": [
+            { "$ref": "#/$defs/tensorInventory" },
+            { "properties": {
+              "evidence_kind": { "const": "materialized-parameter-inventory" },
+              "dtype": { "const": "bfloat16" },
+              "tensors": { "items": { "properties": { "dtype": { "const": "bfloat16" } } } }
+            } }
+          ]
+        },
+        "lora_parameter_storage": {
+          "allOf": [
+            { "$ref": "#/$defs/tensorInventory" },
+            { "properties": {
+              "evidence_kind": { "const": "materialized-trainable-parameter-inventory" },
+              "dtype": { "const": "float32" },
+              "tensors": { "items": { "properties": { "dtype": { "const": "float32" } } } }
+            } }
+          ]
+        },
+        "gradient_storage": { "$ref": "#/$defs/gradientInventory" },
+        "optimizer_moment_storage": { "$ref": "#/$defs/momentInventory" },
+        "loss": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["evidence_kind", "loss_tensor_dtype", "reduction_input_dtype"],
+          "properties": {
+            "evidence_kind": { "const": "evaluated-training-loss-graph" },
+            "loss_tensor_dtype": { "const": "float32" },
+            "reduction_input_dtype": { "const": "float32" }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "producerSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "relative_path", "source_revision", "source_tree", "source_clean", "source_sha256", "files", "manifest_sha256"],
+      "properties": {
+        "schema_version": { "const": "antfly_gemma4_benchmark_producer_source/v1" },
+        "relative_path": { "const": "zig/pkg/inference/scripts/run_gemma4_lora_mlx_benchmark.py" },
+        "source_revision": { "$ref": "#/$defs/revision" },
+        "source_tree": { "$ref": "#/$defs/revision" },
+        "source_clean": { "const": true },
+        "source_sha256": { "$ref": "#/$defs/sha256" },
+        "files": {
+          "type": "array",
+          "prefixItems": [
+            { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/bench_gemma4_lora_mlx_zig.py" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/build_and_attest_gemma4_mlx.py" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/gemma4_oracle.lock.json" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/gemma4_oracle_contract.py" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/requirements-gemma4-mlx-reference.txt" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/run_antfly_gemma4_lora_benchmark.py" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/run_gemma4_lora_benchmark_campaign.py" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/run_gemma4_lora_mlx_benchmark.py" } } }] }
+          ],
+          "minItems": 8,
+          "maxItems": 8
+        },
+        "manifest_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "producerSourceFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relative_path", "source_sha256"],
+      "properties": {
+        "relative_path": { "type": "string", "minLength": 1 },
+        "source_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "shape": {
+      "type": "array",
+      "items": { "type": "integer", "minimum": 1 }
+    },
+    "tensor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "dtype", "shape"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "dtype": { "enum": ["bfloat16", "float32"] },
+        "shape": { "$ref": "#/$defs/shape" }
+      }
+    },
+    "tensorInventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence_kind", "dtype", "tensor_count", "inventory_sha256", "tensors"],
+      "properties": {
+        "evidence_kind": { "type": "string", "minLength": 1 },
+        "dtype": { "enum": ["bfloat16", "float32"] },
+        "tensor_count": { "type": "integer", "minimum": 1 },
+        "inventory_sha256": { "$ref": "#/$defs/sha256" },
+        "tensors": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/tensor" } }
+      }
+    },
+    "gradientStage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage", "inventory_sha256", "tensors"],
+      "properties": {
+        "stage": { "enum": ["raw", "accumulated", "clipped"] },
+        "inventory_sha256": { "$ref": "#/$defs/sha256" },
+        "tensors": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "allOf": [
+              { "$ref": "#/$defs/tensor" },
+              { "properties": { "dtype": { "const": "float32" } } }
+            ]
+          }
+        }
+      }
+    },
+    "gradientInventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence_kind", "dtype", "tensor_count", "stages"],
+      "properties": {
+        "evidence_kind": { "const": "compiled-gradient-tree-inventory" },
+        "dtype": { "const": "float32" },
+        "tensor_count": { "type": "integer", "minimum": 1 },
+        "stages": {
+          "type": "array",
+          "prefixItems": [
+            { "allOf": [{ "$ref": "#/$defs/gradientStage" }, { "properties": { "stage": { "const": "raw" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/gradientStage" }, { "properties": { "stage": { "const": "accumulated" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/gradientStage" }, { "properties": { "stage": { "const": "clipped" } } }] }
+          ],
+          "minItems": 3,
+          "maxItems": 3
+        }
+      }
+    },
+    "moment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "parameter_name", "role", "dtype", "shape"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "parameter_name": { "type": "string", "minLength": 1 },
+        "role": { "enum": ["m", "v"] },
+        "dtype": { "const": "float32" },
+        "shape": { "$ref": "#/$defs/shape" }
+      }
+    },
+    "momentInventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence_kind", "dtype", "parameter_count", "moment_tensor_count", "inventory_sha256", "moments"],
+      "properties": {
+        "evidence_kind": { "const": "materialized-post-cold-adamw-moment-inventory" },
+        "dtype": { "const": "float32" },
+        "parameter_count": { "type": "integer", "minimum": 1 },
+        "moment_tensor_count": { "type": "integer", "minimum": 2 },
+        "inventory_sha256": { "$ref": "#/$defs/sha256" },
+        "moments": { "type": "array", "minItems": 2, "items": { "$ref": "#/$defs/moment" } }
+      }
+    }
+  }
+}

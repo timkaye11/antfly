@@ -153,6 +153,11 @@ pub const ExecuteOptions = struct {
     /// backends reuse them without allocating.
     donate: ?[]const bool = null,
 
+    /// Permit internal ops to consume their last-use input buffers in place.
+    /// Explicit parameter-override callers can disable this when zero-copy
+    /// views may alias caller-owned runtime inputs across executions.
+    allow_buffer_donation: bool = true,
+
     /// Attention context for GQA paged/causal attention nodes.
     /// The interpreter auto-increments layer_index for each
     /// successive attention node encountered during execution.
@@ -193,6 +198,12 @@ pub const ExecuteOptions = struct {
     /// aligned with the direct interpreter, where labels, masks, and borrowed
     /// weights stay in the representation supplied by the caller.
     preserve_runtime_input_residency: bool = false,
+
+    /// Bind eligible Metal command outputs to the compiler's reusable
+    /// allocation IDs. This is scoped to the compiled session rather than a
+    /// process-global environment mutation, so concurrent trainers can choose
+    /// their own workspace policy safely.
+    metal_slot_bound_outputs: bool = false,
 };
 
 /// Result of graph execution. Caller owns the output tensors and must
@@ -292,6 +303,18 @@ fn nullCtAliases(values: []?CT, needle: CT) void {
     for (values) |*value| {
         if (value.* == needle) value.* = null;
     }
+}
+
+fn isBorrowedRuntimeCt(
+    rt_values: []const ?CT,
+    donated_values: []const bool,
+    needle: CT,
+) bool {
+    for (rt_values, 0..) |maybe_value, index| {
+        const value = maybe_value orelse continue;
+        if (value == needle and !donated_values[index]) return true;
+    }
+    return false;
 }
 
 fn graphExecTraceEnabled() bool {
@@ -798,6 +821,14 @@ pub fn execute(
                 const input_idx: usize = @intCast(input_id);
                 if (rt_values[input_idx] != null and !donated_values[input_idx]) continue;
                 if (values[input_id]) |ct| {
+                    // A pass-through/view node can carry the exact handle of
+                    // a caller-owned runtime tensor even though that alias
+                    // node is not itself present in rt_values. Protect by CT
+                    // identity across every runtime slot, not only by node ID.
+                    if (isBorrowedRuntimeCt(rt_values, donated_values, ct)) {
+                        values[input_idx] = null;
+                        continue;
+                    }
                     if (values[i]) |out_ct| {
                         if (ct == out_ct and canKeepAliasedOutput(n.op)) {
                             values[input_id] = null;
@@ -871,6 +902,7 @@ pub fn execute(
         // Free any remaining handles (parameters, donated inputs, or
         // intermediates that weren't caught by liveness-based freeing)
         const ct = values[i].?;
+        if (isBorrowedRuntimeCt(rt_values, donated_values, ct)) continue;
         nullCtAliases(values, ct);
         cb.free(ct);
     }
@@ -1212,6 +1244,7 @@ pub const ExecState = struct {
     moe_grouped: ?MoeGroupedState = null,
 
     pub fn isLastUseBy(self: *const ExecState, input_id: NodeId, node_id: NodeId) bool {
+        if (!self.options.allow_buffer_donation) return false;
         const idx: usize = @intCast(input_id);
         return idx < self.last_use.len and self.last_use[idx] == node_id;
     }
@@ -2099,6 +2132,10 @@ pub fn executeNode(
             return cb.rmsNorm(V.get(ins[0]), V.get(ins[1]), attrs.dim, attrs.eps);
         },
 
+        .fused_rms_norm_backward => |attrs| {
+            return (try cb.rmsNormBackward(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), attrs.dim, attrs.eps, attrs.backward_weight_grad)) orelse error.UnsupportedPrimitiveOp;
+        },
+
         .fused_gelu => {
             if (state.isLastUseBy(ins[0], node_id) and !isNonDonatedRuntimeInput(state.options, ins[0])) {
                 if (try cb.unaryConsume(.gelu, V.get(ins[0]))) |consumed| return consumed;
@@ -2182,6 +2219,73 @@ pub fn executeNode(
                 if (try cb.multiplyConsumeLeft(V.get(ins[0]), V.get(ins[1]))) |consumed| return consumed;
             }
             return cb.multiply(V.get(ins[0]), V.get(ins[1]));
+        },
+
+        .fused_linear_cross_entropy_loss => |attrs| {
+            if (!attrs.frozen_weight) return error.UnsupportedPrimitiveOp;
+            var output_shape_buf: [8]i64 = undefined;
+            const output_shape = fillShapeDims(graph, node_id, &output_shape_buf);
+            return cb.linearCrossEntropyLoss(&.{
+                .hidden = V.get(ins[0]),
+                .weight = V.get(ins[1]),
+                .labels = V.get(ins[2]),
+                .rows = attrs.rows,
+                .in_dim = attrs.in_dim,
+                .vocab_size = attrs.vocab_size,
+                .logit_softcap = attrs.logit_softcap,
+                .ignore_index = attrs.ignore_index,
+                .frozen_weight = attrs.frozen_weight,
+                .output_shape = output_shape,
+            });
+        },
+
+        .fused_linear_cross_entropy_backward => |attrs| {
+            if (!attrs.frozen_weight) return error.UnsupportedPrimitiveOp;
+            var hidden_shape_buf: [8]i64 = undefined;
+            const hidden_shape = fillShapeDims(graph, ins[0], &hidden_shape_buf);
+            return cb.linearCrossEntropyBackward(&.{
+                .hidden = V.get(ins[0]),
+                .weight = V.get(ins[1]),
+                .labels = V.get(ins[2]),
+                .upstream = V.get(ins[3]),
+                .rows = attrs.rows,
+                .in_dim = attrs.in_dim,
+                .vocab_size = attrs.vocab_size,
+                .logit_softcap = attrs.logit_softcap,
+                .ignore_index = attrs.ignore_index,
+                .frozen_weight = attrs.frozen_weight,
+                .hidden_shape = hidden_shape,
+            });
+        },
+
+        .fused_selected_tied_head_logits => |attrs| {
+            if (!attrs.frozen_weight) return error.UnsupportedPrimitiveOp;
+            var output_shape_buf: [8]i64 = undefined;
+            const output_shape = fillShapeDims(graph, node_id, &output_shape_buf);
+            return cb.selectedTiedHeadLogits(&.{
+                .hidden = V.get(ins[0]),
+                .weight = V.get(ins[1]),
+                .token_ids = V.get(ins[2]),
+                .in_dim = attrs.in_dim,
+                .vocab_size = attrs.vocab_size,
+                .frozen_weight = attrs.frozen_weight,
+                .output_shape = output_shape,
+            });
+        },
+
+        .fused_selected_tied_head_backward => |attrs| {
+            if (!attrs.frozen_weight) return error.UnsupportedPrimitiveOp;
+            var hidden_shape_buf: [8]i64 = undefined;
+            const hidden_shape = fillShapeDims(graph, node_id, &hidden_shape_buf);
+            return cb.selectedTiedHeadBackward(&.{
+                .weight = V.get(ins[0]),
+                .token_ids = V.get(ins[1]),
+                .upstream = V.get(ins[2]),
+                .in_dim = attrs.in_dim,
+                .vocab_size = attrs.vocab_size,
+                .frozen_weight = attrs.frozen_weight,
+                .hidden_shape = hidden_shape,
+            });
         },
 
         .fused_masked_bce_with_logits_loss => |attrs| {
@@ -2329,6 +2433,21 @@ pub fn executeNode(
         },
 
         .fused_gqa_causal_attention => |attrs| {
+            if (n.num_inputs == 3 and (attrs.score_scale != 0.0 or attrs.sliding_window != 0)) {
+                if (try cb.gqaCausalAttentionTraining(
+                    V.get(ins[0]),
+                    V.get(ins[1]),
+                    V.get(ins[2]),
+                    attrs.batch,
+                    attrs.seq_len,
+                    attrs.num_heads,
+                    attrs.num_kv_heads,
+                    attrs.head_dim,
+                    attrs.sliding_window,
+                    attrs.score_scale,
+                )) |training_result| return training_result;
+                return error.UnsupportedOperation;
+            }
             // If an attention context is provided, route through
             // gqaPagedAttention with auto-incremented layer_index.
             if (state.options.attention) |base_attn| {
@@ -2362,6 +2481,23 @@ pub fn executeNode(
                 attrs.num_kv_heads,
                 attrs.head_dim,
             );
+        },
+
+        .fused_gqa_causal_attention_backward => |attrs| {
+            if (try cb.gqaCausalAttentionBackward(
+                V.get(ins[0]),
+                V.get(ins[1]),
+                V.get(ins[2]),
+                V.get(ins[3]),
+                attrs.batch,
+                attrs.seq_len,
+                attrs.num_heads,
+                attrs.num_kv_heads,
+                attrs.head_dim,
+                attrs.sliding_window,
+                attrs.score_scale,
+            )) |packed_result| return packed_result;
+            return error.UnsupportedOperation;
         },
 
         .fused_disentangled_attention => |attrs| {

@@ -50,6 +50,7 @@ const partition_mod = @import("partition.zig");
 const buffer_plan_mod = @import("buffer_plan.zig");
 const metal_capabilities = @import("metal_capabilities.zig");
 const metal_partition_executor = @import("metal_partition_executor.zig");
+const training_executor_policy = @import("training_executor_policy.zig");
 const device_mesh = @import("device_mesh.zig");
 const multi_executor = @import("multi_executor.zig");
 const io_compat = @import("../io/compat.zig");
@@ -92,6 +93,10 @@ pub const TrainStepProfile = struct {
     /// step fell back to the regular compiled path. Always a static string.
     graph_executor_fallback_reason: ?[]const u8 = null,
     graph_executor_partitions: u64 = 0,
+    graph_executor_runtime_input_transfers: u64 = 0,
+    graph_executor_device_resident_transfers: u64 = 0,
+    graph_executor_native_partitions: u64 = 0,
+    graph_executor_unsupported_ops: u64 = 0,
     graph_executor_command_dispatches: u64 = 0,
     graph_executor_planned_dispatches: u64 = 0,
     graph_executor_interpreter_fallbacks: u64 = 0,
@@ -108,6 +113,8 @@ pub const TrainStepProfile = struct {
     graph_executor_metal_frame_chunk_boundaries: u64 = 0,
     graph_executor_metal_frame_chunk_promoted_values: u64 = 0,
     graph_executor_metal_frame_chunk_swept_values: u64 = 0,
+    graph_executor_metal_final_frame_swept_values: u64 = 0,
+    graph_executor_metal_final_frame_swept_bytes: u64 = 0,
     graph_executor_metal_chunk_local_output_peak_bytes: u64 = 0,
     graph_executor_metal_chunk_local_output_live_bytes: u64 = 0,
     graph_executor_metal_chunk_local_output_allocations: u64 = 0,
@@ -215,6 +222,8 @@ pub const TrainStepProfile = struct {
     metal_runtime_reuse_pool_peak_slots: u64 = 0,
     metal_runtime_reuse_alloc_delta: u64 = 0,
     metal_runtime_reuse_hit_delta: u64 = 0,
+    metal_gemma4_bf16_gate_up_fused_calls: u64 = 0,
+    metal_gemma4_bf16_gate_up_backward_input_sum_fused_calls: u64 = 0,
     metal_last_frame_compute_encoders: u64 = 0,
     metal_last_frame_blit_encoders: u64 = 0,
     metal_last_frame_planned_scopes: u64 = 0,
@@ -254,6 +263,20 @@ pub const TrainStepProfile = struct {
     cuda_exact_gelu_backward_calls: u64 = 0,
     cuda_training_input_uploads: u64 = 0,
     cuda_training_input_upload_bytes: u64 = 0,
+    /// Backend-neutral transfer counters. CUDA-specific aliases above remain
+    /// for report compatibility, while these fields make the same evidence
+    /// available to strict Metal training and future device backends.
+    training_runtime_h2d_bytes: u64 = 0,
+    training_runtime_d2h_bytes: u64 = 0,
+    training_runtime_input_uploads: u64 = 0,
+    training_runtime_input_upload_bytes: u64 = 0,
+    metal_linear_cross_entropy_forward_calls: u64 = 0,
+    metal_linear_cross_entropy_backward_calls: u64 = 0,
+    metal_linear_cce_forward_calls: u64 = 0,
+    metal_linear_cce_backward_calls: u64 = 0,
+    metal_linear_cce_forward_state_hits: u64 = 0,
+    metal_linear_cce_forward_state_misses: u64 = 0,
+    metal_linear_cce_peak_scratch_bytes: u64 = 0,
 };
 
 pub fn recordTrainingRuntimeProfile(
@@ -265,10 +288,17 @@ pub fn recordTrainingRuntimeProfile(
     profile.cuda_device_frees = after.device_frees -| before.device_frees;
     profile.cuda_h2d_bytes = after.h2d_bytes -| before.h2d_bytes;
     profile.cuda_d2h_bytes = after.d2h_bytes -| before.d2h_bytes;
-    // The backend retains a lifetime maximum. Clamp it to this step's total
-    // so a checkpoint download between steps cannot poison later hot-step
-    // telemetry with a stale large transfer.
-    profile.cuda_largest_d2h_transfer_bytes = @min(after.largest_d2h_transfer_bytes, profile.cuda_d2h_bytes);
+    // The backend retains a lifetime maximum. A large sampling/checkpoint
+    // read before this interval must not turn two later f32 scalar reads into
+    // a fictitious 8-byte transfer. The monotonic oversized-transfer count
+    // makes the strict interval classification exact at the f32 boundary.
+    const saw_new_oversized_d2h = after.d2h_transfers_larger_than_f32 > before.d2h_transfers_larger_than_f32;
+    profile.cuda_largest_d2h_transfer_bytes = if (profile.cuda_d2h_bytes == 0)
+        0
+    else if (saw_new_oversized_d2h)
+        @min(after.largest_d2h_transfer_bytes, profile.cuda_d2h_bytes)
+    else
+        @min(profile.cuda_d2h_bytes, @sizeOf(f32));
     profile.cuda_to_float32_calls = after.to_float32_calls -| before.to_float32_calls;
     profile.cuda_download_alloc_calls = after.download_alloc_calls -| before.download_alloc_calls;
     profile.cuda_stream_synchronizations = after.stream_synchronizations -| before.stream_synchronizations;
@@ -282,6 +312,43 @@ pub fn recordTrainingRuntimeProfile(
     profile.cuda_exact_gelu_backward_calls = after.exact_gelu_backward_calls -| before.exact_gelu_backward_calls;
     profile.cuda_training_input_uploads = after.training_input_uploads -| before.training_input_uploads;
     profile.cuda_training_input_upload_bytes = after.training_input_upload_bytes -| before.training_input_upload_bytes;
+    profile.training_runtime_h2d_bytes = after.h2d_bytes -| before.h2d_bytes;
+    profile.training_runtime_d2h_bytes = after.d2h_bytes -| before.d2h_bytes;
+    profile.training_runtime_input_uploads = after.training_input_uploads -| before.training_input_uploads;
+    profile.training_runtime_input_upload_bytes = after.training_input_upload_bytes -| before.training_input_upload_bytes;
+    profile.metal_linear_cross_entropy_forward_calls = after.linear_cross_entropy_forward_calls -| before.linear_cross_entropy_forward_calls;
+    profile.metal_linear_cross_entropy_backward_calls = after.linear_cross_entropy_backward_calls -| before.linear_cross_entropy_backward_calls;
+    profile.metal_linear_cce_forward_calls = after.linear_cce_forward_calls -| before.linear_cce_forward_calls;
+    profile.metal_linear_cce_backward_calls = after.linear_cce_backward_calls -| before.linear_cce_backward_calls;
+    profile.metal_linear_cce_forward_state_hits = after.linear_cce_forward_state_hits -| before.linear_cce_forward_state_hits;
+    profile.metal_linear_cce_forward_state_misses = after.linear_cce_forward_state_misses -| before.linear_cce_forward_state_misses;
+    profile.metal_linear_cce_peak_scratch_bytes = after.linear_cce_peak_scratch_bytes;
+}
+
+test "gemma4 training runtime profile distinguishes two f32 reads from one oversized read" {
+    const stale_large_read = 1024 * 1024;
+    const before = ops_mod.TrainingRuntimeStats{
+        .d2h_bytes = stale_large_read,
+        .largest_d2h_transfer_bytes = stale_large_read,
+        .d2h_transfers_larger_than_f32 = 1,
+    };
+
+    var scalar_profile = TrainStepProfile{};
+    recordTrainingRuntimeProfile(&scalar_profile, before, .{
+        .d2h_bytes = stale_large_read + 2 * @sizeOf(f32),
+        .largest_d2h_transfer_bytes = stale_large_read,
+        .d2h_transfers_larger_than_f32 = 1,
+    });
+    try std.testing.expectEqual(@as(u64, 2 * @sizeOf(f32)), scalar_profile.cuda_d2h_bytes);
+    try std.testing.expectEqual(@as(u64, @sizeOf(f32)), scalar_profile.cuda_largest_d2h_transfer_bytes);
+
+    var oversized_profile = TrainStepProfile{};
+    recordTrainingRuntimeProfile(&oversized_profile, before, .{
+        .d2h_bytes = stale_large_read + 2 * @sizeOf(f32),
+        .largest_d2h_transfer_bytes = stale_large_read,
+        .d2h_transfers_larger_than_f32 = 2,
+    });
+    try std.testing.expectEqual(@as(u64, 2 * @sizeOf(f32)), oversized_profile.cuda_largest_d2h_transfer_bytes);
 }
 
 pub const CheckpointSummary = struct {
@@ -298,7 +365,128 @@ pub const TrainStepOptions = struct {
     trainable_params: ?[]const []const u8 = null,
     checkpoint_config: ?checkpoint.CheckpointConfig = null,
     emit_checkpoint_analysis: bool = false,
+    /// Reuse compiler-planned Metal output allocations across executions.
+    /// The buffer plan still rejects graph/partition outputs and overlapping
+    /// live ranges; this flag only promotes that existing plan into persistent
+    /// executor-owned storage.
+    metal_slot_bound_outputs: bool = false,
 };
+
+const LossGraphClone = struct {
+    graph: Graph,
+    id_map: []NodeId,
+
+    fn deinit(self: *LossGraphClone) void {
+        const allocator = self.graph.allocator;
+        self.graph.deinit();
+        allocator.free(self.id_map);
+        self.* = undefined;
+    }
+};
+
+/// Clone only nodes reachable from `loss_node`. Fused nodes keep their forward
+/// opcode, while VJP-alternate links are cleared because evaluation never
+/// differentiates the clone. This keeps the evaluation graph both smaller than
+/// the template and independent from the trainer-owned graph's lifetime.
+fn cloneReachableLossGraph(
+    allocator: std.mem.Allocator,
+    source: *const Graph,
+    loss_node: NodeId,
+) !LossGraphClone {
+    if (loss_node == null_node or loss_node >= source.nodeCount()) return error.InvalidLossNode;
+
+    const node_count: usize = @intCast(source.nodeCount());
+    const redirect = try allocator.alloc(NodeId, node_count);
+    defer allocator.free(redirect);
+    for (redirect, 0..) |*target, index| target.* = @intCast(index);
+    for (source.nodes.items, 0..) |source_node, source_index| {
+        if (source_node.op == .fused_gqa_causal_attention and source_node.vjp_alternate != null_node) {
+            redirect[source_index] = source_node.vjp_alternate;
+        }
+    }
+
+    // LoRA injection may make an alternate reference combined-weight nodes
+    // with higher source IDs. Traverse dependencies explicitly instead of
+    // assuming source-ID order, and record a dependency-first clone order.
+    // Other fused ops retain their forward opcode as before.
+    const redirected_loss = redirect[loss_node];
+    const visit_state = try allocator.alloc(u8, node_count);
+    defer allocator.free(visit_state);
+    @memset(visit_state, 0);
+    var clone_order = std.ArrayListUnmanaged(NodeId).empty;
+    defer clone_order.deinit(allocator);
+    try lossCloneTopoVisit(allocator, source, redirect, visit_state, &clone_order, redirected_loss);
+
+    const id_map = try allocator.alloc(NodeId, source.nodeCount());
+    errdefer allocator.free(id_map);
+    @memset(id_map, null_node);
+
+    var graph = Graph.init(allocator);
+    errdefer graph.deinit();
+    try graph.string_table.appendSlice(allocator, source.string_table.items);
+    try graph.constant_pool.appendSlice(allocator, source.constant_pool.items);
+
+    for (clone_order.items) |source_id| {
+        var node = source.node(source_id).*;
+        for (0..node.num_inputs) |input_index| {
+            const source_input = node.inputs[input_index];
+            if (source_input == null_node) continue;
+            const mapped = id_map[redirect[source_input]];
+            if (mapped == null_node) return error.InvalidGraphTopology;
+            node.inputs[input_index] = mapped;
+        }
+        node.vjp_alternate = null_node;
+        id_map[source_id] = try graph.addNode(node);
+    }
+
+    for (redirect, 0..) |target, source_index| {
+        if (target != source_index) id_map[source_index] = id_map[target];
+    }
+
+    for (source.parameters.items) |source_parameter| {
+        const mapped = id_map[source_parameter];
+        if (mapped != null_node) try graph.parameters.append(allocator, mapped);
+    }
+    try graph.markOutput(id_map[redirected_loss]);
+    return .{ .graph = graph, .id_map = id_map };
+}
+
+pub fn graphHasFusedGqaForwardAlternate(graph: *const Graph) bool {
+    for (graph.nodes.items) |node| {
+        if (node.op == .fused_gqa_causal_attention and node.vjp_alternate != null_node) return true;
+    }
+    return false;
+}
+
+fn lossCloneTopoVisit(
+    allocator: std.mem.Allocator,
+    source: *const Graph,
+    redirect: []const NodeId,
+    visit_state: []u8,
+    clone_order: *std.ArrayListUnmanaged(NodeId),
+    source_id: NodeId,
+) !void {
+    if (source_id == null_node or source_id >= source.nodeCount()) return error.InvalidGraphTopology;
+    switch (visit_state[source_id]) {
+        2 => return,
+        1 => return error.InvalidGraphTopology,
+        else => {},
+    }
+    visit_state[source_id] = 1;
+    for (source.node(source_id).getInputs()) |source_input| {
+        if (source_input == null_node or source_input >= redirect.len) continue;
+        try lossCloneTopoVisit(
+            allocator,
+            source,
+            redirect,
+            visit_state,
+            clone_order,
+            redirect[source_input],
+        );
+    }
+    visit_state[source_id] = 2;
+    try clone_order.append(allocator, source_id);
+}
 
 fn beginOwnedExecutionFrame(cb: *const ComputeBackend) !bool {
     if (cb.decoderRuntimeHasActiveFrame()) return false;
@@ -341,6 +529,8 @@ fn recordMetalDebugProfile(
     profile.metal_runtime_reuse_pool_peak_slots = after.metal_runtime_reuse_pool_peak_slots;
     profile.metal_runtime_reuse_alloc_delta = deltaU64(before.metal_runtime_reuse_alloc_count, after.metal_runtime_reuse_alloc_count);
     profile.metal_runtime_reuse_hit_delta = deltaU64(before.metal_runtime_reuse_hit_count, after.metal_runtime_reuse_hit_count);
+    profile.metal_gemma4_bf16_gate_up_fused_calls = deltaU64(before.metal_runtime_gemma4_bf16_gate_up_fused_calls, after.metal_runtime_gemma4_bf16_gate_up_fused_calls);
+    profile.metal_gemma4_bf16_gate_up_backward_input_sum_fused_calls = deltaU64(before.metal_runtime_gemma4_bf16_gate_up_backward_input_sum_fused_calls, after.metal_runtime_gemma4_bf16_gate_up_backward_input_sum_fused_calls);
     profile.metal_last_frame_compute_encoders = after.metal_runtime_last_frame_compute_encoder_count;
     profile.metal_last_frame_blit_encoders = after.metal_runtime_last_frame_blit_encoder_count;
     profile.metal_last_frame_planned_scopes = after.metal_runtime_last_frame_planned_compute_scope_count;
@@ -362,6 +552,23 @@ fn recordMetalDebugProfile(
     profile.metal_deberta_attention_gemm_calls = deltaU64(before.metal_runtime_deberta_attention_gemm_calls, after.metal_runtime_deberta_attention_gemm_calls);
     profile.metal_deberta_attention_gemm_fallbacks = deltaU64(before.metal_runtime_deberta_attention_gemm_fallbacks, after.metal_runtime_deberta_attention_gemm_fallbacks);
     profile.metal_deberta_attention_legacy_calls = deltaU64(before.metal_runtime_deberta_attention_legacy_calls, after.metal_runtime_deberta_attention_legacy_calls);
+}
+
+test "gemma4 Metal debug profile attributes BF16 gate-up fusion calls" {
+    const before = ops_mod.NativeQuantTimingStats{
+        .metal_runtime_gemma4_bf16_gate_up_fused_calls = 3,
+        .metal_runtime_gemma4_bf16_gate_up_backward_input_sum_fused_calls = 11,
+    };
+    const after = ops_mod.NativeQuantTimingStats{
+        .metal_runtime_gemma4_bf16_gate_up_fused_calls = 8,
+        .metal_runtime_gemma4_bf16_gate_up_backward_input_sum_fused_calls = 18,
+    };
+    var profile: TrainStepProfile = .{};
+
+    recordMetalDebugProfile(&profile, before, after);
+
+    try std.testing.expectEqual(@as(u64, 5), profile.metal_gemma4_bf16_gate_up_fused_calls);
+    try std.testing.expectEqual(@as(u64, 7), profile.metal_gemma4_bf16_gate_up_backward_input_sum_fused_calls);
 }
 
 fn cancelOwnedExecutionFrame(cb: *const ComputeBackend, active: *bool) void {
@@ -399,6 +606,7 @@ pub const CompiledTrainSession = struct {
     cached_cuda_graph_executor_plan: ?CachedCudaGraphExecutorPlan = null,
     cached_cuda_constants: std.AutoHashMapUnmanaged(NodeId, CT) = .empty,
     cached_cuda_constants_backend: ?*const ComputeBackend = null,
+    metal_slot_bound_outputs: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -500,6 +708,100 @@ pub const CompiledTrainSession = struct {
             .param_grads = param_grads,
             .analysis = analysis,
             .build_profile = profile,
+            .metal_slot_bound_outputs = options.metal_slot_bound_outputs,
+        };
+    }
+
+    /// Build a reusable forward-loss session without constructing an autodiff
+    /// graph. Evaluation only needs the scalar loss; carrying every parameter
+    /// gradient as an output retains the full backward graph and can multiply
+    /// peak memory for large language models.
+    pub fn initLossOnly(
+        allocator: std.mem.Allocator,
+        graph: *const Graph,
+        loss_node: NodeId,
+    ) !CompiledTrainSession {
+        var profile: TrainStepProfile = .{};
+        profile.peak_resident_bytes = currentResidentBytes();
+        const build_start = nowNs();
+
+        var cloned = try cloneReachableLossGraph(allocator, graph, loss_node);
+        errdefer cloned.deinit();
+        const analysis = try interpreter.CachedAnalysis.compute(allocator, &cloned.graph);
+        errdefer {
+            var mutable_analysis = analysis;
+            mutable_analysis.deinit(allocator);
+        }
+        profile.total_ns = elapsedNs(build_start);
+        profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
+
+        const empty_names = try allocator.alloc([]const u8, 0);
+        errdefer allocator.free(empty_names);
+        const empty_grads = try allocator.alloc(NodeId, 0);
+        errdefer allocator.free(empty_grads);
+
+        return .{
+            .allocator = allocator,
+            .graph = cloned.graph,
+            .id_map = cloned.id_map,
+            .wrt_names = empty_names,
+            .param_grads = empty_grads,
+            .analysis = analysis,
+            .build_profile = profile,
+        };
+    }
+
+    /// Derive a reusable loss-only session from a compiled training session.
+    /// The parent graph has already gone through lowering and any custom-VJP
+    /// forward rewrites, so the pruned evaluator is numerically identical to
+    /// the forward portion of training. Its ID map is composed back to the
+    /// original source graph so ordinary TrainerInput bindings remain valid.
+    pub fn initLossOnlyFromCompiled(
+        allocator: std.mem.Allocator,
+        parent: *const CompiledTrainSession,
+    ) !CompiledTrainSession {
+        if (parent.loss_output_index >= parent.graph.outputs.items.len) return error.InvalidLossNode;
+
+        var profile: TrainStepProfile = .{};
+        profile.peak_resident_bytes = currentResidentBytes();
+        const build_start = nowNs();
+        const parent_loss = parent.graph.outputs.items[parent.loss_output_index];
+        var cloned = try cloneReachableLossGraph(allocator, &parent.graph, parent_loss);
+        errdefer cloned.deinit();
+
+        const composed_id_map = try allocator.alloc(NodeId, parent.id_map.len);
+        errdefer allocator.free(composed_id_map);
+        for (parent.id_map, 0..) |parent_id, source_id| {
+            composed_id_map[source_id] = if (parent_id == null_node or parent_id >= cloned.id_map.len)
+                null_node
+            else
+                cloned.id_map[parent_id];
+        }
+        allocator.free(cloned.id_map);
+        cloned.id_map = composed_id_map;
+
+        const analysis = try interpreter.CachedAnalysis.compute(allocator, &cloned.graph);
+        errdefer {
+            var mutable_analysis = analysis;
+            mutable_analysis.deinit(allocator);
+        }
+        profile.total_ns = elapsedNs(build_start);
+        profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
+
+        const empty_names = try allocator.alloc([]const u8, 0);
+        errdefer allocator.free(empty_names);
+        const empty_grads = try allocator.alloc(NodeId, 0);
+        errdefer allocator.free(empty_grads);
+
+        return .{
+            .allocator = allocator,
+            .graph = cloned.graph,
+            .id_map = cloned.id_map,
+            .wrt_names = empty_names,
+            .param_grads = empty_grads,
+            .analysis = analysis,
+            .build_profile = profile,
+            .metal_slot_bound_outputs = parent.metal_slot_bound_outputs,
         };
     }
 
@@ -526,6 +828,7 @@ pub const CompiledTrainSession = struct {
         assignments: []device_mesh.DeviceId,
         partitioned: bool,
         unsupported_ops: usize = 0,
+        native_partitions: usize = 0,
 
         fn deinit(self: *CachedMetalGraphExecutorPlan) void {
             self.buffer_plan.deinit();
@@ -553,7 +856,7 @@ pub const CompiledTrainSession = struct {
         cb: *const ComputeBackend,
         runtime_inputs: ?std.AutoHashMapUnmanaged(NodeId, CT),
     ) !TrainStepResult {
-        return self.executeInternal(cb, runtime_inputs, false);
+        return self.executeInternal(cb, runtime_inputs, false, false);
     }
 
     pub fn executeDeviceGradients(
@@ -561,7 +864,30 @@ pub const CompiledTrainSession = struct {
         cb: *const ComputeBackend,
         runtime_inputs: ?std.AutoHashMapUnmanaged(NodeId, CT),
     ) !TrainStepResult {
-        return self.executeInternal(cb, runtime_inputs, true);
+        return self.executeInternal(cb, runtime_inputs, true, false);
+    }
+
+    /// Materialize backend-owned immutable graph state before the measured
+    /// execution interval. CUDA constants are uploaded once and retained by
+    /// the compiled session; subsequent calls are transfer-free.
+    pub fn prepareBackend(self: *CompiledTrainSession, cb: *const ComputeBackend) !void {
+        if (cb.kind() == .cuda) try self.ensureCachedCudaConstants(cb);
+    }
+
+    pub fn backendPrepared(self: *const CompiledTrainSession, cb: *const ComputeBackend) bool {
+        return cb.kind() != .cuda or self.cached_cuda_constants_backend == cb;
+    }
+
+    /// Execute through the compiled session's cached analysis without first
+    /// attempting the multi-device graph executor. This is used for explicit
+    /// per-call parameter overrides, whose tensors must not be retained or
+    /// partially consumed by a failed executor attempt before fallback.
+    pub fn executeDirect(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+        runtime_inputs: ?std.AutoHashMapUnmanaged(NodeId, CT),
+    ) !TrainStepResult {
+        return self.executeInternal(cb, runtime_inputs, false, true);
     }
 
     fn executeInternal(
@@ -569,6 +895,7 @@ pub const CompiledTrainSession = struct {
         cb: *const ComputeBackend,
         runtime_inputs: ?std.AutoHashMapUnmanaged(NodeId, CT),
         retain_device_gradients: bool,
+        force_direct: bool,
     ) !TrainStepResult {
         const total_start = nowNs();
         var profile: TrainStepProfile = .{};
@@ -610,14 +937,25 @@ pub const CompiledTrainSession = struct {
         );
         maybeDumpGraphNodes(&self.graph);
 
+        if (force_direct) {
+            return try self.executeWithDirectInterpreter(
+                cb,
+                rt_slice,
+                retain_device_gradients,
+                total_start,
+                profile,
+                false,
+            );
+        }
+
         if (trainingGraphExecutorParityNodeIds()) |node_ids_raw| {
             if (!try self.runSelectedNodeParityDiagnostic(cb, rt_slice, node_ids_raw)) {
                 return error.TrainingGraphExecutorParityMismatch;
             }
         }
 
-        if (trainingGraphExecutorParityCheckEnabled() and cb.kind() == .metal and platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false) and !platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false)) {
-            var direct_result = try self.executeWithDirectInterpreter(cb, rt_slice, retain_device_gradients, nowNs(), .{});
+        if (trainingGraphExecutorParityCheckEnabled() and cb.kind() == .metal and training_executor_policy.enabled()) {
+            var direct_result = try self.executeWithDirectInterpreter(cb, rt_slice, retain_device_gradients, nowNs(), .{}, true);
             errdefer direct_result.deinit();
             const graph_result_opt = try self.executeWithSingleMetalGraphExecutor(cb, rt_slice, retain_device_gradients, total_start, execute_start, &profile);
             var graph_result = graph_result_opt orelse return error.TrainingGraphExecutorUnavailable;
@@ -639,7 +977,7 @@ pub const CompiledTrainSession = struct {
 
         // Keep the partial profile (plan cache counters, fallback reason) so
         // step rows still report why the graph executor was not used.
-        return try self.executeWithDirectInterpreter(cb, rt_slice, retain_device_gradients, total_start, profile);
+        return try self.executeWithDirectInterpreter(cb, rt_slice, retain_device_gradients, total_start, profile, true);
     }
 
     fn runSelectedNodeParityDiagnostic(
@@ -649,7 +987,7 @@ pub const CompiledTrainSession = struct {
         node_ids_raw: []const u8,
     ) !bool {
         if (cb.kind() != .metal) return error.TrainingGraphExecutorParityDiagnosticRequiresMetal;
-        if (!platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false)) return error.TrainingGraphExecutorUnavailable;
+        if (!training_executor_policy.enabled()) return error.TrainingGraphExecutorUnavailable;
 
         const selected = try parseParityNodeIds(self.allocator, node_ids_raw, self.graph.nodeCount());
         defer self.allocator.free(selected);
@@ -742,6 +1080,7 @@ pub const CompiledTrainSession = struct {
                 .skip_metal_fused_patterns = trainingGraphExecutorSkipMetalFusedPatterns(),
                 .collect_partition_stats = false,
                 .preserve_runtime_input_residency = true,
+                .metal_slot_bound_outputs = self.metal_slot_bound_outputs,
             },
         );
         defer graph_result.deinit(&mesh);
@@ -819,6 +1158,7 @@ pub const CompiledTrainSession = struct {
         retain_device_gradients: bool,
         total_start: u64,
         initial_profile: TrainStepProfile,
+        allow_buffer_donation: bool,
     ) !TrainStepResult {
         var profile = initial_profile;
         const training_runtime_before = cb.trainingRuntimeStats();
@@ -833,7 +1173,11 @@ pub const CompiledTrainSession = struct {
             self.allocator,
             &self.graph,
             cb,
-            .{ .runtime_inputs = runtime_inputs, .cached_analysis = self.analysis },
+            .{
+                .runtime_inputs = runtime_inputs,
+                .cached_analysis = self.analysis,
+                .allow_buffer_donation = allow_buffer_donation,
+            },
         );
         // Arm cleanup before the fallible end-scope/submit calls below, otherwise an
         // error from either leaks exec_result's output CTs / device buffers.
@@ -938,10 +1282,11 @@ pub const CompiledTrainSession = struct {
         profile: *TrainStepProfile,
     ) !?TrainStepResult {
         if (cb.kind() != .metal) return null;
-        if (!platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false)) return null;
-        if (platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false)) return null;
+        if (!training_executor_policy.enabled()) return null;
 
         const cached = try self.cachedMetalGraphExecutorPlan(cb, profile);
+        profile.graph_executor_unsupported_ops = @intCast(cached.unsupported_ops);
+        profile.graph_executor_native_partitions = @intCast(cached.native_partitions);
         if (retain_device_gradients and !self.planKeepsGradientOutputsOnMetal(&cached.base_plan)) {
             profile.graph_executor_fallback_reason = "gradient_output_on_native_partition";
             std.debug.print(
@@ -980,6 +1325,7 @@ pub const CompiledTrainSession = struct {
                 .skip_metal_fused_patterns = trainingGraphExecutorSkipMetalFusedPatterns(),
                 .collect_partition_stats = true,
                 .preserve_runtime_input_residency = true,
+                .metal_slot_bound_outputs = self.metal_slot_bound_outputs,
             },
         ) catch |err| switch (err) {
             error.MissingRuntimeInput => {
@@ -998,6 +1344,8 @@ pub const CompiledTrainSession = struct {
         recordMetalDebugProfile(profile, metal_debug_before, cb.debugTimingSnapshot().provider);
         profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
         profile.graph_executor_partitions = multi_result.stats.partitions_executed;
+        profile.graph_executor_runtime_input_transfers = multi_result.stats.runtime_input_transfers;
+        profile.graph_executor_device_resident_transfers = multi_result.stats.device_resident_transfers;
         profile.graph_executor_command_dispatches = multi_result.stats.backend_command_dispatches;
         profile.graph_executor_planned_dispatches = multi_result.stats.planned_operator_dispatches;
         profile.graph_executor_interpreter_fallbacks = multi_result.stats.interpreter_fallbacks;
@@ -1019,6 +1367,8 @@ pub const CompiledTrainSession = struct {
         profile.graph_executor_metal_frame_chunk_boundaries = multi_result.stats.metal_frame_chunk_boundaries;
         profile.graph_executor_metal_frame_chunk_promoted_values = multi_result.stats.metal_frame_chunk_promoted_values;
         profile.graph_executor_metal_frame_chunk_swept_values = multi_result.stats.metal_frame_chunk_swept_values;
+        profile.graph_executor_metal_final_frame_swept_values = multi_result.stats.metal_final_frame_swept_values;
+        profile.graph_executor_metal_final_frame_swept_bytes = multi_result.stats.metal_final_frame_swept_bytes;
         profile.graph_executor_metal_chunk_local_output_peak_bytes = multi_result.stats.metal_chunk_local_output_peak_bytes;
         profile.graph_executor_metal_chunk_local_output_live_bytes = multi_result.stats.metal_chunk_local_output_live_bytes;
         profile.graph_executor_metal_chunk_local_output_allocations = multi_result.stats.metal_chunk_local_output_allocations;
@@ -1135,8 +1485,7 @@ pub const CompiledTrainSession = struct {
         profile: *TrainStepProfile,
     ) !?TrainStepResult {
         if (cb.kind() != .cuda) return null;
-        if (!platform.env.getenvBoolDefault("TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR", false)) return null;
-        if (platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false)) return null;
+        if (!training_executor_policy.enabled()) return null;
 
         const runtime_before = cb.trainingRuntimeStats();
         const cached = try self.cachedCudaGraphExecutorPlan(profile);
@@ -1169,6 +1518,8 @@ pub const CompiledTrainSession = struct {
         profile.execute_ns = elapsedNs(execute_start);
         profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
         profile.graph_executor_partitions = multi_result.stats.partitions_executed;
+        profile.graph_executor_runtime_input_transfers = multi_result.stats.runtime_input_transfers;
+        profile.graph_executor_device_resident_transfers = multi_result.stats.device_resident_transfers;
         profile.graph_executor_command_dispatches = multi_result.stats.backend_command_dispatches;
         profile.graph_executor_planned_dispatches = multi_result.stats.planned_operator_dispatches;
         profile.graph_executor_interpreter_fallbacks = multi_result.stats.interpreter_fallbacks;
@@ -1220,8 +1571,10 @@ pub const CompiledTrainSession = struct {
 
         const assignments = try self.allocator.alloc(device_mesh.DeviceId, base_plan.partitions.len);
         errdefer self.allocator.free(assignments);
+        var native_partitions: usize = 0;
         for (base_plan.partitions, 0..) |part, idx| {
             assignments[idx] = if (part.backend == .native) 1 else 0;
+            if (part.backend == .native) native_partitions += 1;
         }
 
         self.cached_metal_graph_executor_plan = .{
@@ -1230,6 +1583,7 @@ pub const CompiledTrainSession = struct {
             .assignments = assignments,
             .partitioned = partitioned,
             .unsupported_ops = diagnostics.count(.unsupported_op),
+            .native_partitions = native_partitions,
         };
         profile.graph_executor_plan_build_ns += elapsedNs(plan_start);
         return &self.cached_metal_graph_executor_plan.?;
@@ -1814,10 +2168,15 @@ var graph_node_dump_done: bool = false;
 /// `"1031,1033,1035"`) to print, once per process, the definition of the
 /// selected nodes in the compiled training graph: op, output shape, inputs
 /// (id/op/shape, parameter names) and the full dot_general / transpose
-/// attribute configuration.
+/// attribute configuration. Set `TERMITE_DUMP_GRAPH_MIN_NODES` when the same
+/// process also executes a smaller evaluation graph before the training graph.
 fn maybeDumpGraphNodes(graph: *const Graph) void {
     if (graph_node_dump_done) return;
     const raw = platform.env.getenv("TERMITE_DUMP_GRAPH_NODES") orelse return;
+    if (platform.env.getenv("TERMITE_DUMP_GRAPH_MIN_NODES")) |raw_min| {
+        const min_nodes = std.fmt.parseUnsigned(usize, raw_min, 10) catch 0;
+        if (graph.nodeCount() < min_nodes) return;
+    }
     graph_node_dump_done = true;
     var parts = std.mem.splitScalar(u8, raw, ',');
     while (parts.next()) |part_raw| {
@@ -2662,6 +3021,123 @@ test "CompiledTrainSession can retain gradient tensors without host extraction" 
     defer allocator.free(w_data);
     try std.testing.expectEqual(@as(usize, 12), w_data.len);
     try std.testing.expect(result.device_gradients.get("bias") != null);
+}
+
+test "gemma4 CompiledTrainSession loss-only evaluation emits no gradient graph or outputs" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const x = try bld.parameter("x", Shape.init(.f32, &.{ 2, 2 }));
+    const w = try bld.parameter("w", Shape.init(.f32, &.{ 2, 2 }));
+    const y = try bld.linearNoBias(x, w, 2, 2, 2);
+    const loss = try bld.reduceSum(y, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    var session = try CompiledTrainSession.initLossOnly(allocator, &g, loss);
+    defer session.deinit();
+    try std.testing.expectEqual(@as(usize, 1), session.graph.outputs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), session.wrt_names.len);
+    try std.testing.expectEqual(@as(usize, 0), session.param_grads.len);
+    try std.testing.expect(session.graph.nodeCount() < g.nodeCount());
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb = compute.computeBackend();
+    const x_ct = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+    defer cb.free(x_ct);
+    const w_ct = try cb.fromFloat32Shape(&.{ 1, 0, 0, 1 }, &.{ 2, 2 });
+    defer cb.free(w_ct);
+    var rt = std.AutoHashMapUnmanaged(NodeId, CT){};
+    defer rt.deinit(allocator);
+    try rt.put(allocator, x, x_ct);
+    try rt.put(allocator, w, w_ct);
+
+    var result = try session.executeDirect(&cb, rt);
+    defer result.deinit();
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), result.loss, 1.0e-6);
+    try std.testing.expectEqual(@as(usize, 0), result.gradients.count());
+    try std.testing.expectEqual(@as(usize, 0), result.device_gradients.count());
+}
+
+test "CompiledTrainSession loss-only evaluation redirects fused GQA forward alternate" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const q_shape = Shape.init(.f32, &.{ 3, 8 });
+    const kv_shape = Shape.init(.f32, &.{ 3, 4 });
+    const q = try bld.parameter("q", q_shape);
+    const k = try bld.parameter("k", kv_shape);
+    const v = try bld.parameter("v", kv_shape);
+    const q_flat = try bld.reshape(q, Shape.init(.f32, &.{24}));
+    const q_view = try bld.reshape(q_flat, q_shape);
+    const alternate = try bld.add(q_view, q_view);
+    const fused = try g.addNode(.{
+        .op = .{ .fused_gqa_causal_attention = .{
+            .batch = 1,
+            .seq_len = 3,
+            .kv_seq_len = 3,
+            .num_heads = 4,
+            .num_kv_heads = 2,
+            .head_dim = 2,
+            .score_scale = 1.0,
+            .sliding_window = 0,
+        } },
+        .output_shape = q_shape,
+        .inputs = .{ q, k, v, null_node },
+        .num_inputs = 3,
+        .vjp_alternate = alternate,
+    });
+    const loss = try bld.reduceSum(fused, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    var session = try CompiledTrainSession.initLossOnly(allocator, &g, loss);
+    defer session.deinit();
+    try std.testing.expect(session.id_map[fused] == session.id_map[alternate]);
+    for (0..session.graph.nodeCount()) |index| {
+        try std.testing.expect(std.meta.activeTag(session.graph.node(@intCast(index)).op) != .fused_gqa_causal_attention);
+    }
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb = compute.computeBackend();
+    const q_values = [_]f32{1.0} ** 24;
+    const q_ct = try cb.fromFloat32Shape(&q_values, &.{ 3, 8 });
+    defer cb.free(q_ct);
+    var rt = std.AutoHashMapUnmanaged(NodeId, CT){};
+    defer rt.deinit(allocator);
+    try rt.put(allocator, q, q_ct);
+
+    var first = try session.executeDirect(&cb, rt);
+    defer first.deinit();
+    try std.testing.expectApproxEqAbs(@as(f32, 48.0), first.loss, 1.0e-6);
+
+    var second = try session.executeDirect(&cb, rt);
+    defer second.deinit();
+    try std.testing.expectApproxEqAbs(@as(f32, 48.0), second.loss, 1.0e-6);
+    const q_after = try cb.toFloat32(q_ct, allocator);
+    defer allocator.free(q_after);
+    for (q_after) |value| try std.testing.expectEqual(@as(f32, 1.0), value);
+
+    var compiled_training = try CompiledTrainSession.init(allocator, &g, loss, .{
+        .trainable_params = &.{"q"},
+    });
+    defer compiled_training.deinit();
+    var derived_eval = try CompiledTrainSession.initLossOnlyFromCompiled(allocator, &compiled_training);
+    defer derived_eval.deinit();
+    try std.testing.expect(derived_eval.id_map[q] != null_node);
+    for (0..derived_eval.graph.nodeCount()) |index| {
+        try std.testing.expect(std.meta.activeTag(derived_eval.graph.node(@intCast(index)).op) != .fused_gqa_causal_attention);
+        try std.testing.expect(std.meta.activeTag(derived_eval.graph.node(@intCast(index)).op) != .fused_gqa_causal_attention_backward);
+    }
+    var derived_result = try derived_eval.executeDirect(&cb, rt);
+    defer derived_result.deinit();
+    try std.testing.expectApproxEqAbs(@as(f32, 48.0), derived_result.loss, 1.0e-6);
 }
 
 test "trainStep on linear-gelu chain" {

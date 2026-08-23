@@ -65,7 +65,13 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
         if (n.op == .fused_gelu or n.op == .fused_gelu_exact or n.op == .fused_softmax) continue;
         // Fused disentangled attention keeps its fused forward kernel and is
         // differentiated by a custom VJP rule (not vjp_alternate lowering).
-        if (n.op == .fused_disentangled_attention or n.op == .fused_disentangled_attention_backward) continue;
+        if (n.op == .fused_disentangled_attention or
+            n.op == .fused_disentangled_attention_backward or
+            n.op == .fused_gqa_causal_attention or
+            n.op == .fused_gqa_causal_attention_backward)
+        {
+            continue;
+        }
         if (n.op.isFused() and n.vjp_alternate != null_node) {
             redirect[i] = n.vjp_alternate;
         }
@@ -78,6 +84,16 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
 
     for (graph.outputs.items) |out_id| {
         markReachable(graph, reachable, redirect, redirect[out_id]);
+    }
+    // A fused GQA node is differentiated as one op, but may carry a proven
+    // primitive forward alternate that the compiled graph will execute after
+    // its custom VJP has been built. Keep that otherwise-unreferenced
+    // decomposition in the lowered graph.
+    for (0..count) |i| {
+        if (!reachable[i]) continue;
+        const n = graph.node(@intCast(i));
+        if (n.op != .fused_gqa_causal_attention or n.vjp_alternate == null_node) continue;
+        markReachable(graph, reachable, redirect, n.vjp_alternate);
     }
 
     // Step 3: Collect reachable node IDs and compute their redirected
@@ -133,6 +149,15 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
                 }
             }
         }
+        if (n.op == .fused_gqa_causal_attention and n.vjp_alternate != null_node) {
+            const alternate = redirect[n.vjp_alternate];
+            if (alternate < count and reachable[alternate]) {
+                // Synthetic ordering edge: the execution rewrite replaces
+                // uses of this fused node with its alternate, so the alternate
+                // must precede the fused node and every original consumer.
+                in_degree[tmp_idx[old_id]] += 1;
+            }
+        }
     }
 
     var queue = std.ArrayListUnmanaged(u32).empty;
@@ -169,6 +194,15 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
                     }
                 }
             }
+            if (n.op == .fused_gqa_causal_attention and n.vjp_alternate != null_node) {
+                const alternate = redirect[n.vjp_alternate];
+                if (alternate == old_id) {
+                    in_degree[succ_pos] -= 1;
+                    if (in_degree[succ_pos] == 0) {
+                        try queue.append(allocator, @intCast(succ_pos));
+                    }
+                }
+            }
         }
     }
 
@@ -199,7 +233,11 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
             }
         }
 
-        new_node.vjp_alternate = null_node;
+        new_node.vjp_alternate = if (old_node.op == .fused_gqa_causal_attention and
+            old_node.vjp_alternate != null_node)
+            id_map[old_node.vjp_alternate]
+        else
+            null_node;
         _ = try new_graph.addNode(new_node);
     }
 
@@ -263,8 +301,8 @@ test "lower replaces fused linear with primitives" {
         try std.testing.expect(n.op.isPrimitive());
     }
 
-    // Should have: 3 params + transpose + matmul + add = 6 nodes
-    try std.testing.expectEqual(@as(u32, 6), lowered.graph.nodeCount());
+    // Should have: 3 params + direct dot_general + add = 5 nodes.
+    try std.testing.expectEqual(@as(u32, 5), lowered.graph.nodeCount());
 
     // Output should be the add node
     try std.testing.expectEqual(@as(usize, 1), lowered.graph.outputs.items.len);

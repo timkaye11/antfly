@@ -1,0 +1,589 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://antfly.io/schemas/gemma4_mlx_benchmark.schema.json",
+  "title": "One fresh-process Gemma4 LoRA same-Mac benchmark sample",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "framework", "oracle_lock_sha256", "campaign_id", "run_id", "repetition", "sequence_index", "implementation", "process", "hardware", "case", "semantic_contract", "protocol", "metrics"],
+  "allOf": [
+    {
+      "if": { "properties": { "framework": { "const": "mlx-lm" } }, "required": ["framework"] },
+      "then": { "required": ["precision_evidence"] },
+      "else": { "not": { "required": ["precision_evidence"] } }
+    },
+    {
+      "if": { "properties": { "framework": { "const": "mlx-lm" } }, "required": ["framework"] },
+      "then": {
+        "properties": {
+          "implementation": {
+            "required": ["mlx", "mlx_lm", "python"],
+            "not": { "required": ["antfly"] },
+            "properties": {
+              "producer_source": {
+                "properties": {
+                  "relative_path": { "const": "zig/pkg/inference/scripts/run_gemma4_lora_mlx_benchmark.py" }
+                }
+              }
+            }
+          },
+          "metrics": {
+            "not": { "required": ["execution_evidence"] },
+            "properties": {
+              "memory": {
+                "properties": {
+                  "framework_allocator_peak_bytes": { "type": "integer", "minimum": 1 },
+                  "framework_allocator_peak_source": { "const": "mlx-metal-get-peak-memory" }
+                }
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "implementation": {
+            "required": ["antfly"],
+            "not": { "anyOf": [{"required": ["mlx"]}, {"required": ["mlx_lm"]}, {"required": ["python"]}] },
+            "properties": {
+              "producer_source": {
+                "properties": {
+                  "relative_path": { "const": "zig/pkg/inference/scripts/run_antfly_gemma4_lora_benchmark.py" }
+                }
+              }
+            }
+          },
+          "metrics": {
+            "required": ["execution_evidence"],
+            "properties": {
+              "memory": {
+                "properties": {
+                  "framework_allocator_peak_bytes": { "const": null },
+                  "framework_allocator_peak_source": { "const": "antfly-metal-allocator-unavailable" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "case": { "properties": { "model_key": { "const": "gemma-4-E2B-it" } } }
+        }
+      },
+      "then": {
+        "properties": {
+          "case": { "properties": { "revision": { "const": "3e22461f65e89153144f8adb70e3b8c2cc9845a7" } } }
+        }
+      },
+      "else": {
+        "properties": {
+          "case": { "properties": { "revision": { "const": "ee0ef6023621cff504d758262d4e04895a5af4a2" } } }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "schema_version": { "const": "antfly_gemma4_lora_benchmark_sample/v5" },
+    "framework": { "enum": ["antfly-zig-metal", "mlx-lm"] },
+    "oracle_lock_sha256": { "$ref": "#/$defs/sha256" },
+    "campaign_id": { "type": "string", "minLength": 1 },
+    "run_id": { "type": "string", "minLength": 1 },
+    "repetition": { "type": "integer", "minimum": 0 },
+    "sequence_index": { "type": "integer", "minimum": 0 },
+    "precision_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "relative_path", "artifact_sha256"],
+      "properties": {
+        "schema_version": { "const": "antfly_gemma4_mlx_precision_evidence_reference/v1" },
+        "relative_path": { "type": "string", "pattern": "^[^/\\\\]+\\.precision\\.json$" },
+        "artifact_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "implementation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command_sha256", "producer_source"],
+      "properties": {
+        "command_sha256": { "$ref": "#/$defs/sha256" },
+        "producer_source": { "$ref": "#/$defs/producerSource" },
+        "antfly": { "$ref": "#/$defs/executableSource" },
+        "mlx": { "$ref": "#/$defs/mlxNativeSource" },
+        "mlx_lm": { "$ref": "#/$defs/packageSource" },
+        "python": { "$ref": "#/$defs/pythonRuntime" }
+      },
+      "oneOf": [
+        { "required": ["antfly"], "not": { "anyOf": [{"required": ["mlx"]}, {"required": ["mlx_lm"]}, {"required": ["python"]}] } },
+        { "required": ["mlx", "mlx_lm", "python"], "not": { "required": ["antfly"] } }
+      ]
+    },
+    "process": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pid", "started_unix_ns"],
+      "properties": {
+        "pid": { "type": "integer", "minimum": 1 },
+        "started_unix_ns": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "hardware": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform", "machine", "chip", "memory_bytes", "os_version", "os_build", "metal_device"],
+      "properties": {
+        "platform": { "const": "Darwin" },
+        "machine": { "const": "arm64" },
+        "chip": { "type": "string", "minLength": 1 },
+        "memory_bytes": { "type": "integer", "minimum": 1 },
+        "os_version": { "type": "string", "minLength": 1 },
+        "os_build": { "type": "string", "minLength": 1 },
+        "metal_device": { "type": "string", "minLength": 1 }
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model_key", "revision", "local_artifact_sha256", "target_preset", "rank", "alpha", "sequence_length", "grad_accum", "microbatch", "prepared", "initial_adapter", "target_inventory"],
+      "properties": {
+        "model_key": { "enum": ["gemma-4-E2B-it", "gemma-4-E4B-it"] },
+        "revision": { "$ref": "#/$defs/revision" },
+        "local_artifact_sha256": { "$ref": "#/$defs/sha256" },
+        "target_preset": { "enum": ["peft-qv", "text-all-linear"] },
+        "rank": { "const": 16 },
+        "alpha": { "const": 32.0 },
+        "sequence_length": { "enum": [128, 512, 2048] },
+        "grad_accum": { "enum": [1, 4] },
+        "microbatch": { "const": 1 },
+        "prepared": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema_version", "artifact_sha256", "example_index", "source_dataset_sha256", "source_record_sha256", "rendered_chat_sha256", "workload_sha256"],
+          "properties": {
+            "schema_version": { "const": "gemma4_prepared/v6" },
+            "artifact_sha256": { "$ref": "#/$defs/sha256" },
+            "example_index": { "type": "integer", "minimum": 0 },
+            "source_dataset_sha256": { "$ref": "#/$defs/hex64" },
+            "source_record_sha256": { "$ref": "#/$defs/hex64" },
+            "rendered_chat_sha256": { "$ref": "#/$defs/hex64" },
+            "workload_sha256": { "$ref": "#/$defs/sha256" }
+          }
+        },
+        "initial_adapter": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema_version", "semantic_sha256", "tensor_count", "tensor_dtype"],
+          "properties": {
+            "schema_version": { "const": "antfly_gemma4_initial_adapter_semantics/v1" },
+            "semantic_sha256": { "$ref": "#/$defs/sha256" },
+            "tensor_count": { "type": "integer", "minimum": 2 },
+            "tensor_dtype": { "const": "float32" }
+          }
+        },
+        "target_inventory": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema_version", "sha256", "module_count", "canonical_modules"],
+          "properties": {
+            "schema_version": { "const": "antfly_gemma4_target_inventory/v1" },
+            "sha256": { "$ref": "#/$defs/sha256" },
+            "module_count": { "type": "integer", "minimum": 1 },
+            "canonical_modules": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "type": "string", "pattern": "^model\\." }
+            }
+          }
+        }
+      }
+    },
+    "semantic_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "sha256", "precision", "optimizer", "determinism", "runtime", "memory"],
+      "properties": {
+        "schema_version": { "const": "antfly_gemma4_lora_benchmark_semantics/v3" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "precision": { "$ref": "#/$defs/benchmarkPrecision" },
+        "optimizer": { "$ref": "#/$defs/benchmarkOptimizer" },
+        "determinism": { "$ref": "#/$defs/benchmarkDeterminism" },
+        "runtime": { "$ref": "#/$defs/benchmarkRuntime" },
+        "memory": { "$ref": "#/$defs/benchmarkMemory" }
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fresh_process", "cold_optimizer_steps", "cold_step_mutates_optimizer_state", "first_steady_steps", "warmup_steps", "measured_steps", "explicit_device_sync", "sync_point", "timed_unit"],
+      "properties": {
+        "fresh_process": { "const": true },
+        "cold_optimizer_steps": { "const": 1 },
+        "cold_step_mutates_optimizer_state": { "const": true },
+        "first_steady_steps": { "const": 1 },
+        "warmup_steps": { "const": 3 },
+        "measured_steps": { "const": 20 },
+        "explicit_device_sync": { "const": true },
+        "sync_point": { "const": "after-optimizer-update-before-timer-stop-every-window" },
+        "timed_unit": { "const": "optimizer-step-including-grad-accumulation" }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["load_seconds", "cold_compile_and_step_seconds", "first_steady_step_seconds", "step_seconds", "input_tokens", "supervised_tokens", "memory"],
+      "properties": {
+        "load_seconds": { "type": "number", "minimum": 0 },
+        "cold_compile_and_step_seconds": { "type": "number", "exclusiveMinimum": 0 },
+        "first_steady_step_seconds": { "type": "number", "exclusiveMinimum": 0 },
+        "step_seconds": { "type": "array", "minItems": 20, "maxItems": 20, "items": {"type":"number", "exclusiveMinimum":0} },
+        "input_tokens": { "type": "integer", "minimum": 1 },
+        "supervised_tokens": { "type": "integer", "minimum": 1 },
+        "execution_evidence": { "$ref": "#/$defs/zigExecutionEvidence" },
+        "memory": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["process_peak_phys_footprint_bytes", "sampler_interval_ms", "sampler_sample_count", "framework_allocator_peak_bytes", "framework_allocator_peak_source", "system_deltas"],
+          "properties": {
+            "process_peak_phys_footprint_bytes": { "type": "integer", "minimum": 1 },
+            "sampler_interval_ms": { "const": 10 },
+            "sampler_sample_count": { "type": "integer", "minimum": 2 },
+            "framework_allocator_peak_bytes": { "type": ["integer", "null"], "minimum": 1 },
+            "framework_allocator_peak_source": { "enum": ["mlx-metal-get-peak-memory", "antfly-metal-allocator-unavailable"] },
+            "system_deltas": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["swapins_bytes", "swapouts_bytes", "pageins_bytes", "pageouts_bytes", "pressure_available_percent_delta"],
+              "properties": {
+                "swapins_bytes": { "const": 0 },
+                "swapouts_bytes": { "const": 0 },
+                "pageins_bytes": { "const": 0 },
+                "pageouts_bytes": { "const": 0 },
+                "pressure_available_percent_delta": { "type": "number", "minimum": -5.0, "maximum": 100 }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "hex64": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "zigExecutionEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "optimizer_steps"],
+      "properties": {
+        "schema_version": { "const": "antfly_gemma4_zig_execution_evidence/v2" },
+        "optimizer_steps": {
+          "type": "array",
+          "minItems": 25,
+          "maxItems": 25,
+          "items": { "$ref": "#/$defs/zigOptimizerStepEvidence" }
+        }
+      }
+    },
+    "zigOptimizerStepEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "phase", "phase_evidence", "command_plan_evidence"],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0, "maximum": 24 },
+        "phase": { "enum": ["cold", "first", "warmup", "measured"] },
+        "phase_evidence": { "$ref": "#/$defs/zigPhaseEvidence" },
+        "command_plan_evidence": { "$ref": "#/$defs/zigCommandPlanEvidence" }
+      }
+    },
+    "zigPhaseEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["graph_build_ns", "runtime_input_ns", "train_step_ns", "compile_ns", "autodiff_ns", "execute_ns", "extract_ns", "optimizer_update_ns", "device_optimizer_ns", "total_ns", "metal_frame_wait_ns", "metal_frame_gpu_ns", "graph_executor_plan_build_ns", "graph_executor_buffer_plan_build_ns"],
+      "properties": {
+        "graph_build_ns": { "type": "integer", "minimum": 0 },
+        "runtime_input_ns": { "type": "integer", "minimum": 0 },
+        "train_step_ns": { "type": "integer", "minimum": 0 },
+        "compile_ns": { "type": "integer", "minimum": 0 },
+        "autodiff_ns": { "type": "integer", "minimum": 0 },
+        "execute_ns": { "type": "integer", "minimum": 0 },
+        "extract_ns": { "type": "integer", "minimum": 0 },
+        "optimizer_update_ns": { "type": "integer", "minimum": 0 },
+        "device_optimizer_ns": { "type": "integer", "minimum": 0 },
+        "total_ns": { "type": "integer", "minimum": 0 },
+        "metal_frame_wait_ns": { "type": "integer", "minimum": 0 },
+        "metal_frame_gpu_ns": { "type": "integer", "minimum": 0 },
+        "graph_executor_plan_build_ns": { "type": "integer", "minimum": 0 },
+        "graph_executor_buffer_plan_build_ns": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "zigCommandPlanEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["graph_executor_partitions", "graph_executor_command_dispatches", "graph_executor_planned_dispatches", "graph_executor_runtime_region_dispatches", "graph_executor_runtime_region_active_regions", "graph_executor_runtime_region_covered_nodes", "graph_executor_runtime_region_elided_nodes", "graph_executor_runtime_region_plan_compiles", "graph_executor_runtime_region_plan_reuses", "graph_executor_plan_cache_hits", "graph_executor_plan_cache_misses", "metal_lora_backward_regions", "metal_low_rank_lora_backward_regions", "metal_rank_adapter_backward_regions", "metal_ffn_gelu_backward_regions", "metal_head_mlp_forward_regions", "metal_head_mlp_backward_regions", "metal_gemma4_bf16_gate_up_fused_calls", "metal_gemma4_bf16_gate_up_backward_input_sum_fused_calls", "metal_linear_cce_forward_calls", "metal_linear_cce_backward_calls", "metal_linear_cce_forward_state_hits", "metal_linear_cce_forward_state_misses", "metal_linear_cce_peak_scratch_bytes", "metal_command_dot_general_dispatches", "metal_command_head_dot_dispatches", "metal_command_transpose_dispatches", "metal_command_gather_dispatches", "metal_command_reduce_dispatches", "metal_command_elementwise_dispatches", "metal_command_activation_dispatches", "metal_command_activation_backward_dispatches", "metal_command_other_dispatches", "metal_last_frame_compute_encoders", "metal_last_frame_blit_encoders", "metal_last_frame_planned_scopes", "metal_last_frame_planned_barriers", "metal_last_frame_planned_command_ops"],
+      "properties": {
+        "graph_executor_partitions": { "type": "integer", "minimum": 1 },
+        "graph_executor_command_dispatches": { "type": "integer", "minimum": 1 },
+        "graph_executor_planned_dispatches": { "type": "integer", "minimum": 0 },
+        "graph_executor_runtime_region_dispatches": { "type": "integer", "minimum": 0 },
+        "graph_executor_runtime_region_active_regions": { "type": "integer", "minimum": 0 },
+        "graph_executor_runtime_region_covered_nodes": { "type": "integer", "minimum": 0 },
+        "graph_executor_runtime_region_elided_nodes": { "type": "integer", "minimum": 0 },
+        "graph_executor_runtime_region_plan_compiles": { "type": "integer", "minimum": 0 },
+        "graph_executor_runtime_region_plan_reuses": { "type": "integer", "minimum": 0 },
+        "graph_executor_plan_cache_hits": { "type": "integer", "minimum": 0 },
+        "graph_executor_plan_cache_misses": { "type": "integer", "minimum": 0 },
+        "metal_lora_backward_regions": { "type": "integer", "minimum": 0 },
+        "metal_low_rank_lora_backward_regions": { "type": "integer", "minimum": 0 },
+        "metal_rank_adapter_backward_regions": { "type": "integer", "minimum": 0 },
+        "metal_ffn_gelu_backward_regions": { "type": "integer", "minimum": 0 },
+        "metal_head_mlp_forward_regions": { "type": "integer", "minimum": 0 },
+        "metal_head_mlp_backward_regions": { "type": "integer", "minimum": 0 },
+        "metal_gemma4_bf16_gate_up_fused_calls": { "type": "integer", "minimum": 0 },
+        "metal_gemma4_bf16_gate_up_backward_input_sum_fused_calls": { "type": "integer", "minimum": 0 },
+        "metal_linear_cce_forward_calls": { "type": "integer", "minimum": 0 },
+        "metal_linear_cce_backward_calls": { "type": "integer", "minimum": 0 },
+        "metal_linear_cce_forward_state_hits": { "type": "integer", "minimum": 0 },
+        "metal_linear_cce_forward_state_misses": { "type": "integer", "minimum": 0 },
+        "metal_linear_cce_peak_scratch_bytes": { "type": "integer", "minimum": 0 },
+        "metal_command_dot_general_dispatches": { "type": "integer", "minimum": 0 },
+        "metal_command_head_dot_dispatches": { "type": "integer", "minimum": 0 },
+        "metal_command_transpose_dispatches": { "type": "integer", "minimum": 0 },
+        "metal_command_gather_dispatches": { "type": "integer", "minimum": 0 },
+        "metal_command_reduce_dispatches": { "type": "integer", "minimum": 0 },
+        "metal_command_elementwise_dispatches": { "type": "integer", "minimum": 0 },
+        "metal_command_activation_dispatches": { "type": "integer", "minimum": 0 },
+        "metal_command_activation_backward_dispatches": { "type": "integer", "minimum": 0 },
+        "metal_command_other_dispatches": { "type": "integer", "minimum": 0 },
+        "metal_last_frame_compute_encoders": { "type": "integer", "minimum": 0 },
+        "metal_last_frame_blit_encoders": { "type": "integer", "minimum": 0 },
+        "metal_last_frame_planned_scopes": { "type": "integer", "minimum": 0 },
+        "metal_last_frame_planned_barriers": { "type": "integer", "minimum": 0 },
+        "metal_last_frame_planned_command_ops": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "producerSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "relative_path", "source_revision", "source_tree", "source_clean", "source_sha256", "files", "manifest_sha256"],
+      "properties": {
+        "schema_version": { "const": "antfly_gemma4_benchmark_producer_source/v1" },
+        "relative_path": { "enum": ["zig/pkg/inference/scripts/run_antfly_gemma4_lora_benchmark.py", "zig/pkg/inference/scripts/run_gemma4_lora_mlx_benchmark.py"] },
+        "source_revision": { "$ref": "#/$defs/revision" },
+        "source_tree": { "$ref": "#/$defs/revision" },
+        "source_clean": { "const": true },
+        "source_sha256": { "$ref": "#/$defs/sha256" },
+        "files": {
+          "type": "array",
+          "prefixItems": [
+            { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/bench_gemma4_lora_mlx_zig.py" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/build_and_attest_gemma4_mlx.py" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/gemma4_oracle.lock.json" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/gemma4_oracle_contract.py" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/requirements-gemma4-mlx-reference.txt" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/run_antfly_gemma4_lora_benchmark.py" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/run_gemma4_lora_benchmark_campaign.py" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/producerSourceFile" }, { "properties": { "relative_path": { "const": "zig/pkg/inference/scripts/run_gemma4_lora_mlx_benchmark.py" } } }] }
+          ],
+          "minItems": 8,
+          "maxItems": 8
+        },
+        "manifest_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "producerSourceFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relative_path", "source_sha256"],
+      "properties": {
+        "relative_path": { "type": "string", "minLength": 1 },
+        "source_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "packageSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "source_revision", "source_clean"],
+      "properties": {
+        "version": { "const": "0.31.3" },
+        "source_revision": { "const": "ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd" },
+        "source_clean": { "const": true }
+      }
+    },
+    "mlxNativeSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "source_revision", "source_clean", "native_artifact_inventory", "build_attestation"],
+      "properties": {
+        "version": { "const": "0.31.2" },
+        "source_revision": { "const": "68cf2fddd8de5edd8ab3d926391772b2e2cedad8" },
+        "source_clean": { "const": true },
+        "native_artifact_inventory": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema_version", "sha256", "loaded_core_path", "artifacts"],
+          "properties": {
+            "schema_version": { "const": "antfly_mlx_native_artifact_inventory/v2" },
+            "sha256": { "$ref": "#/$defs/sha256" },
+            "loaded_core_path": { "type": "string", "pattern": "^/" },
+            "artifacts": {
+              "type": "array",
+              "prefixItems": [
+                { "allOf": [{ "$ref": "#/$defs/nativeArtifact" }, { "properties": { "role": { "const": "jaccl-runtime-dylib" }, "relative_path": { "pattern": "(?:^|/)libjaccl\\.dylib$" } } }] },
+                { "allOf": [{ "$ref": "#/$defs/nativeArtifact" }, { "properties": { "role": { "const": "metal-library" }, "relative_path": { "pattern": "(?:^|/)mlx\\.metallib$" } } }] },
+                { "allOf": [{ "$ref": "#/$defs/nativeArtifact" }, { "properties": { "role": { "const": "python-extension" }, "relative_path": { "pattern": "(?:^|/)core\\..+\\.so$" } } }] },
+                { "allOf": [{ "$ref": "#/$defs/nativeArtifact" }, { "properties": { "role": { "const": "runtime-dylib" }, "relative_path": { "pattern": "(?:^|/)libmlx\\.dylib$" } } }] }
+              ],
+              "minItems": 4,
+              "maxItems": 4
+            }
+          }
+        },
+        "build_attestation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema_version", "path", "sha256", "source_revision", "source_clean", "native_artifact_inventory_sha256", "build_command_sha256", "precision_policy_sha256"],
+          "properties": {
+            "schema_version": { "const": "antfly_mlx_native_build_attestation/v1" },
+            "path": { "type": "string", "pattern": "^/" },
+            "sha256": { "$ref": "#/$defs/sha256" },
+            "source_revision": { "const": "68cf2fddd8de5edd8ab3d926391772b2e2cedad8" },
+            "source_clean": { "const": true },
+            "native_artifact_inventory_sha256": { "$ref": "#/$defs/sha256" },
+            "build_command_sha256": { "$ref": "#/$defs/sha256" },
+            "precision_policy_sha256": { "const": "sha256:77b05f6b6c7fe42878da859d9b883cd39fccb373ac9e665c8fd07572ffbd2595" }
+          }
+        }
+      }
+    },
+    "nativeArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "relative_path", "size_bytes", "sha256"],
+      "properties": {
+        "role": { "enum": ["jaccl-runtime-dylib", "metal-library", "python-extension", "runtime-dylib"] },
+        "relative_path": { "type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$" },
+        "size_bytes": { "type": "integer", "minimum": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "benchmarkPrecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verified", "not_asserted", "comparison_policy"],
+      "properties": {
+        "verified": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["base_model_storage_dtype", "lora_parameter_storage_dtype", "gradient_storage_dtype", "optimizer_moment_storage_dtype", "loss_tensor_dtype", "loss_reduction_input_dtype"],
+          "properties": {
+            "base_model_storage_dtype": { "const": "bfloat16" },
+            "lora_parameter_storage_dtype": { "const": "float32" },
+            "gradient_storage_dtype": { "const": "float32" },
+            "optimizer_moment_storage_dtype": { "const": "float32" },
+            "loss_tensor_dtype": { "const": "float32" },
+            "loss_reduction_input_dtype": { "const": "float32" }
+          }
+        },
+        "not_asserted": {
+          "type": "array",
+          "prefixItems": [
+            { "const": "activation_dtype" },
+            { "const": "matmul_accumulator_dtype" }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "comparison_policy": { "const": "diagnostic-only-until-all-comparison-critical-dtypes-are-runtime-proven" }
+      }
+    },
+    "benchmarkOptimizer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "learning_rate", "schedule", "betas", "eps", "bias_correction", "weight_decay", "weight_decay_scope", "gradient_clip_kind", "gradient_clip_max_norm", "gradient_clip_epsilon", "gradient_clip_order", "gradient_accumulation_reduction", "partial_accumulation_windows", "gradient_accumulation_steps"],
+      "properties": {
+        "name": { "const": "adamw" },
+        "learning_rate": { "const": 0.001 },
+        "schedule": { "const": "constant-no-warmup" },
+        "betas": { "type": "array", "prefixItems": [{"const": 0.9}, {"const": 0.999}], "minItems": 2, "maxItems": 2 },
+        "eps": { "const": 1e-8 },
+        "bias_correction": { "const": true },
+        "weight_decay": { "const": 0.01 },
+        "weight_decay_scope": { "const": "all-and-only-lora-a-and-lora-b-parameters" },
+        "gradient_clip_kind": { "const": "global-l2-norm" },
+        "gradient_clip_max_norm": { "const": 1.0 },
+        "gradient_clip_epsilon": { "const": 1e-6 },
+        "gradient_clip_order": { "const": "after-accumulation-before-adamw-update" },
+        "gradient_accumulation_reduction": { "const": "arithmetic-mean-of-per-microbatch-mean-supervised-token-gradients" },
+        "partial_accumulation_windows": { "const": "forbidden" },
+        "gradient_accumulation_steps": { "enum": [1, 4] }
+      }
+    },
+    "benchmarkDeterminism": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seed", "sample_order", "dropout", "lora_a_initializer", "lora_b_initializer", "initial_adapter_policy"],
+      "properties": {
+        "seed": { "const": 42 },
+        "sample_order": { "const": "fixed-prepared-workload-order-without-shuffle" },
+        "dropout": { "const": 0.0 },
+        "lora_a_initializer": { "const": "kaiming-uniform-a-sqrt5-fan-in" },
+        "lora_b_initializer": { "const": "zeros" },
+        "initial_adapter_policy": { "const": "load-byte-equivalent-canonical-f32-semantics" }
+      }
+    },
+    "benchmarkRuntime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attention_kv_cache", "activation_checkpointing", "training_checkpoint_io", "compiled_graph_cache", "compile_policy", "filesystem_cache_policy", "per_step_device_sync"],
+      "properties": {
+        "attention_kv_cache": { "const": false },
+        "activation_checkpointing": { "const": false },
+        "training_checkpoint_io": { "const": "disabled" },
+        "compiled_graph_cache": { "const": "enabled-process-local-shape-keyed" },
+        "compile_policy": { "const": "lazy-first-full-optimizer-window-included-in-cold-metric" },
+        "filesystem_cache_policy": { "const": "not-flushed-between-alternating-fresh-processes" },
+        "per_step_device_sync": { "const": "after-optimizer-update-before-timer-stop-every-window" }
+      }
+    },
+    "benchmarkMemory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["process_peak_definition", "sampler_interval_ms", "framework_allocator_peak", "system_delta_source", "system_delta_window", "maximum_swapins_bytes", "maximum_swapouts_bytes", "maximum_pageins_bytes", "maximum_pageouts_bytes", "minimum_pressure_available_percent_delta"],
+      "properties": {
+        "process_peak_definition": { "const": "maximum-darwin-proc-pid-rusage-v4-ri-phys-footprint-sample" },
+        "sampler_interval_ms": { "const": 10 },
+        "framework_allocator_peak": { "const": "separate-diagnostic-not-cross-framework-gate" },
+        "system_delta_source": { "const": "darwin-vm-stat-pages-and-memory-pressure-before-after" },
+        "system_delta_window": { "const": "measured-optimizer-steps-only" },
+        "maximum_swapins_bytes": { "const": 0 },
+        "maximum_swapouts_bytes": { "const": 0 },
+        "maximum_pageins_bytes": { "const": 0 },
+        "maximum_pageouts_bytes": { "const": 0 },
+        "minimum_pressure_available_percent_delta": { "const": -5.0 }
+      }
+    },
+    "executableSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "source_revision", "source_clean", "executable_sha256"],
+      "properties": {
+        "version": { "type": "string", "minLength": 1 },
+        "source_revision": { "$ref": "#/$defs/revision" },
+        "source_clean": { "const": true },
+        "executable_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "pythonRuntime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "executable", "executable_sha256"],
+      "properties": {
+        "version": { "type": "string", "pattern": "^3\\.12\\.[0-9]+(?:[-+][A-Za-z0-9.]+)?$" },
+        "executable": { "type": "string", "pattern": "^/" },
+        "executable_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

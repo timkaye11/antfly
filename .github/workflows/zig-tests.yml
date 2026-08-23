@@ -35,6 +35,7 @@ jobs:
     runs-on: arc-antfly-standard
     outputs:
       zig_tests: ${{ steps.detect.outputs.zig_tests }}
+      gemma4_training: ${{ steps.detect.outputs.gemma4_training }}
       e2e: ${{ steps.detect.outputs.e2e }}
       model_check: ${{ steps.detect.outputs.model_check }}
       trace_validate: ${{ steps.detect.outputs.trace_validate }}
@@ -64,6 +65,7 @@ jobs:
             fi
             {
               echo "zig_tests=true"
+              echo "gemma4_training=true"
               echo "e2e=true"
               echo "model_check=true"
               echo "trace_validate=true"
@@ -77,6 +79,7 @@ jobs:
             echo "zig_tests=false" >> "$GITHUB_OUTPUT"
             if [[ "${{ github.event.schedule }}" == "0 3 * * 0" ]]; then
               {
+                echo "gemma4_training=true"
                 echo "e2e=false"
                 echo "model_check=true"
                 echo "trace_validate=true"
@@ -85,6 +88,7 @@ jobs:
               } >> "$GITHUB_OUTPUT"
             else
               {
+                echo "gemma4_training=false"
                 echo "e2e=true"
                 echo "model_check=false"
                 echo "trace_validate=false"
@@ -102,6 +106,7 @@ jobs:
           else
             {
               echo "zig_tests=true"
+              echo "gemma4_training=true"
               echo "e2e=true"
               echo "model_check=true"
               echo "trace_validate=true"
@@ -123,6 +128,33 @@ jobs:
             echo "zig_tests=false" >> "$GITHUB_OUTPUT"
           else
             echo "zig_tests=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if git diff --quiet "$base" "${{ github.sha }}" -- \
+            ':(glob)zig/lib/ml/src/graph/**' \
+            zig/pkg/inference/build.zig \
+            ':(glob)zig/pkg/inference/build/finetune/**' \
+            zig/pkg/inference/src/architectures/gemma_graph.zig \
+            zig/pkg/inference/src/architectures/session_factory.zig \
+            ':(glob)zig/pkg/inference/src/backends/metal_*' \
+            zig/pkg/inference/src/finetune/artifact_publication.zig \
+            ':(glob)zig/pkg/inference/src/finetune/gemma4*' \
+            ':(glob)zig/pkg/inference/src/finetune/test/test_gemma4*' \
+            zig/pkg/inference/src/finetune/real_autodiff_trainer.zig \
+            zig/pkg/inference/src/finetune/recipe.zig \
+            ':(glob)zig/pkg/inference/src/graph/**' \
+            ':(glob)zig/pkg/inference/src/gemma*_test_root.zig' \
+            ':(glob)zig/pkg/inference/scripts/*gemma4*' \
+            ':(glob)zig/pkg/inference/testdata/gemma4_oracle/**' \
+            zig/pkg/inference/docs/finetuning/GEMMA4.md \
+            zig/pkg/inference/docs/finetuning/GEMMA4_ORACLE.md \
+            zig/pkg/inference/src/inference_internal.zig \
+            zig/pkg/inference/src/ops/metal_compute.zig \
+            .github/workflows/zig-tests.yml
+          then
+            echo "gemma4_training=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "gemma4_training=true" >> "$GITHUB_OUTPUT"
           fi
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
@@ -567,6 +599,73 @@ jobs:
           ANTFLY_TLA_MODEL_CHECK: ${{ needs.changes.outputs.model_check }}
           ANTFLY_TLA_TRACE_VALIDATE: ${{ needs.changes.outputs.trace_validate }}
         run: scripts/ci/zig-tla-verify.sh
+
+  gemma4-metal-training-tests:
+    name: gemma4-metal-training / macos-arm64-gpu
+    needs: changes
+    if: needs.changes.outputs.gemma4_training == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 3 * * 0')
+    runs-on: macos-15-xlarge
+    timeout-minutes: 120
+    env:
+      ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/antfly-gemma4-metal-zig-local
+      ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/antfly-gemma4-metal-zig-global
+      TERMITE_REQUIRE_METAL_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up pinned Gemma4 benchmark Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Verify Metal device
+        run: system_profiler SPDisplaysDataType
+
+      - name: Validate Gemma4 oracle contracts
+        working-directory: zig/pkg/inference
+        run: |
+          set -euo pipefail
+          python3 scripts/compare_gemma4_lora_hf_zig.py validate-lock
+          python3 -m unittest discover -v -s scripts -p 'test_*gemma4*py'
+          fixture_dir="$(mktemp -d "${RUNNER_TEMP}/gemma4-oracle-contract.XXXXXX")"
+          trap 'rm -rf "$fixture_dir"' EXIT
+          python3 scripts/generate_gemma4_oracle_fixture.py \
+            --output "$fixture_dir/fixture.jsonl" \
+            --manifest "$fixture_dir/fixture.manifest.json" \
+            --train-count 8 --eval-count 4 --test-count 4
+          python3 scripts/generate_gemma4_oracle_fixture.py \
+            --output "$fixture_dir/fixture.jsonl" \
+            --manifest "$fixture_dir/fixture.manifest.json" \
+            --train-count 8 --eval-count 4 --test-count 4 --check
+
+      - name: Run Gemma4 Metal Debug gates
+        working-directory: zig/pkg/inference
+        run: |
+          zig build test-gemma4-finetune -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=Debug --summary all
+          zig build test-gemma-graph -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=Debug --summary all
+          zig build test -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=Debug -Druntime-test-filter=true -- \
+            --test-filter "backend deinit destroys only explicitly owned wrappers" \
+            --test-filter "lora linear replaces an existing internal value without leaking" \
+            --test-filter "owning tensor host mirror"
+
+      - name: Run Gemma4 Metal ReleaseSafe gates
+        working-directory: zig/pkg/inference
+        run: |
+          zig build test-gemma4-finetune -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=ReleaseSafe --summary all
+          zig build test-gemma-graph -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=ReleaseSafe --summary all
+
+      - name: Run packaged-optimization Metal lifecycle smoke
+        working-directory: zig/pkg/inference
+        run: |
+          zig build test-gemma4-finetune -j1 -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -Doptimize=ReleaseFast --summary all
 
   zig-full-tests:
     name: zig-full / x86_64

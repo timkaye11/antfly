@@ -1,0 +1,53 @@
+{
+  "schema_version": "antfly_gemma4_grpo_benchmark_case/v1",
+  "name": "gemma4-e2b-ranked-one-token-grpo-seq128",
+  "model_key": "gemma-4-E2B-it",
+  "target_preset": "peft-qv",
+  "sequence_length": 128,
+  "rank": 16,
+  "alpha": 32,
+  "learning_rate": 0.0001,
+  "optimizer": {
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "epsilon": 1e-8,
+    "weight_decay": 0.01,
+    "max_grad_norm": 1.0
+  },
+  "protocol": {
+    "cold": 1,
+    "first": 1,
+    "warmup": 3,
+    "measured": 20
+  },
+  "sampling": {
+    "mode": "deterministic-ranked-top-k",
+    "group_size": 2,
+    "max_completion_tokens": 1,
+    "expected_initial_token_ids": [7001, 711]
+  },
+  "grpo": {
+    "clip_epsilon": 0.2,
+    "kl_coef": 0.04,
+    "advantage_epsilon": 1e-8,
+    "normalize_advantage": true
+  },
+  "reward": {
+    "mode": "prefix-match",
+    "target": "France",
+    "token_contract": [
+      {
+        "token_id": 7001,
+        "decoded_text": " France",
+        "reward": 1.0
+      },
+      {
+        "token_id": 711,
+        "decoded_text": " not",
+        "reward": 0.0
+      }
+    ]
+  },
+  "rendered_prompt": "The capital of France is",
+  "prompt_token_ids": [818, 5279, 529, 7001, 563]
+}

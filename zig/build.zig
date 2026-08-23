@@ -1456,6 +1456,11 @@ pub fn build(b: *std.Build) void {
     else
         null;
     const antfly_version = b.option([]const u8, "antfly-version", "Antfly version string") orelse "dev";
+    const benchmark_source_revision = b.option(
+        []const u8,
+        "benchmark-source-revision",
+        "Clean 40-hex source commit embedded for fail-closed benchmark attestation",
+    ) orelse "dev";
     const lite_local_inference_runtime = b.option(bool, "lite-local-inference-runtime", "Advertise an embedded local inference runtime in Antfly Lite status") orelse false;
     if (inference_enable_onnx) {
         const inference_onnx_available = pathExists(b, b.fmt("{s}/include/onnxruntime_c_api.h", .{inference_onnx_root})) and
@@ -1903,6 +1908,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = link_libc,
             .skip_openapi = false,
             .inference_version = antfly_version,
+            .benchmark_source_revision = benchmark_source_revision,
         },
         .shared = .{
             .json = json_mod,
@@ -2362,6 +2368,7 @@ pub fn build(b: *std.Build) void {
     inference_wasm_build_options.addOption(bool, "link_libc", false);
     inference_wasm_build_options.addOption(bool, "skip_openapi", false);
     inference_wasm_build_options.addOption([]const u8, "inference_version", antfly_version);
+    inference_wasm_build_options.addOption([]const u8, "benchmark_source_revision", benchmark_source_revision);
     inference_wasm_build_options.addOption([]const u8, "wasm_memory_model", "wasm32");
     const inference_wasm_build_options_mod = inference_wasm_build_options.createModule();
 

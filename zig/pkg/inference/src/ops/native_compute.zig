@@ -4402,6 +4402,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .layerNormConsumeInput = &layerNormConsumeInputOp,
     .layerNormBackward = &layerNormBackwardOp,
     .rmsNorm = &rmsNormOp,
+    .rmsNormBackward = &rmsNormBackwardOp,
     .rmsNormConsumeInput = &rmsNormConsumeInputOp,
     .gelu = &geluOp,
     .geluNew = &geluNewOp,
@@ -4437,6 +4438,8 @@ pub const vtable_impl = ComputeBackend.VTable{
     .rope = &ropeOp,
     .ropePerItem = &ropePerItemOp,
     .gqaCausalAttention = &gqaCausalAttentionOp,
+    .gqaCausalAttentionTraining = &gqaCausalAttentionTrainingOp,
+    .gqaCausalAttentionBackward = &gqaCausalAttentionBackwardOp,
     .gqaPagedAttention = &gqaPagedAttentionOp,
     .fromFloat32 = &fromFloat32Op,
     .fromFloat32Shape = &fromFloat32ShapeOp,
@@ -4479,6 +4482,8 @@ pub const vtable_impl = ComputeBackend.VTable{
     .logSoftmaxConsume = &logSoftmaxConsumeOp,
     .softmaxOp = &primSoftmaxOp,
     .logSoftmaxOp = &primLogSoftmaxOp,
+    .linearCrossEntropyLoss = &linearCrossEntropyLossOp,
+    .linearCrossEntropyBackward = &linearCrossEntropyBackwardOp,
     .maskedBceWithLogitsLoss = &maskedBceWithLogitsLossOp,
     .maskedBceWithLogitsBackward = &maskedBceWithLogitsBackwardOp,
 };
@@ -6127,6 +6132,52 @@ fn layerNormBackwardOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dy: CT, 
     @memcpy(packed_grads[0 .. rows * dim], grads.dx[0 .. rows * dim]);
     @memcpy(packed_grads[rows * dim .. (rows + 1) * dim], grads.dgamma[0..dim]);
     @memcpy(packed_grads[(rows + 1) * dim .. (rows + 2) * dim], grads.dbeta[0..dim]);
+    return self.makeBuf(packed_grads, true);
+}
+
+/// `fused_rms_norm_backward` reference implementation. Returns d_input and,
+/// when requested, one reduced d_weight row.
+fn rmsNormBackwardOp(ctx: *anyopaque, input: CT, weight: CT, dy: CT, dim: usize, eps: f32, compute_weight_grad: bool) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const in_data = getData(input);
+    const weight_data = getData(weight);
+    const dy_data = getData(dy);
+    if (dim == 0 or in_data.len % dim != 0) return error.InvalidTensorShape;
+    if (weight_data.len < dim or dy_data.len != in_data.len) return error.InvalidTensorShape;
+    const rows = in_data.len / dim;
+
+    const output_rows = rows + @intFromBool(compute_weight_grad);
+    const packed_grads = try self.allocator.alloc(f32, output_rows * dim);
+    errdefer self.allocator.free(packed_grads);
+    const dx = packed_grads[0 .. rows * dim];
+    const dweight = if (compute_weight_grad) packed_grads[rows * dim .. (rows + 1) * dim] else null;
+    if (dweight) |gradient| @memset(gradient, 0.0);
+
+    const inv_dim = 1.0 / @as(f32, @floatFromInt(dim));
+    for (0..rows) |row| {
+        const row_base = row * dim;
+        var sum_sq: f32 = 0.0;
+        for (0..dim) |col| {
+            const x = in_data[row_base + col];
+            sum_sq += x * x;
+        }
+        const inv_rms = 1.0 / @sqrt(sum_sq * inv_dim + eps);
+
+        var mean_gx: f32 = 0.0;
+        for (0..dim) |col| {
+            const idx = row_base + col;
+            mean_gx += dy_data[idx] * weight_data[col] * in_data[idx];
+            if (dweight) |gradient| gradient[col] += dy_data[idx] * in_data[idx] * inv_rms;
+        }
+        mean_gx *= inv_dim;
+        const inv_rms_cubed = inv_rms * inv_rms * inv_rms;
+        for (0..dim) |col| {
+            const idx = row_base + col;
+            const g = dy_data[idx] * weight_data[col];
+            dx[idx] = inv_rms * g - in_data[idx] * inv_rms_cubed * mean_gx;
+        }
+    }
+
     return self.makeBuf(packed_grads, true);
 }
 
@@ -35401,6 +35452,78 @@ test "fused_layer_norm backward matches finite differences (multi-row)" {
     try layerNormBackwardFiniteDiffCase(5, 6, 1e-5, 0xBADF00D);
 }
 
+fn rmsNormBackwardFiniteDiffCase(rows: usize, dim: usize, eps: f32, seed: u64) !void {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+
+    const x = try allocator.alloc(f32, rows * dim);
+    defer allocator.free(x);
+    const weight = try allocator.alloc(f32, dim);
+    defer allocator.free(weight);
+    const dy = try allocator.alloc(f32, rows * dim);
+    defer allocator.free(dy);
+    for (x) |*v| v.* = rnd.floatNorm(f32);
+    for (weight) |*v| v.* = 1.0 + rnd.floatNorm(f32) * 0.3;
+    for (dy) |*v| v.* = rnd.floatNorm(f32);
+
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    const x_ct = try compute.makeBuf(x, false);
+    defer freeTensor(&compute, x_ct);
+    const weight_ct = try compute.makeBuf(weight, false);
+    defer freeTensor(&compute, weight_ct);
+    const dy_ct = try compute.makeBuf(dy, false);
+    defer freeTensor(&compute, dy_ct);
+    const out_ct = try rmsNormBackwardOp(&compute, x_ct, weight_ct, dy_ct, dim, eps, true);
+    defer freeTensor(&compute, out_ct);
+    const packed_data = getData(out_ct);
+
+    const lossFn = struct {
+        fn f(a: std.mem.Allocator, xx: []const f32, ww: []const f32, dd: []const f32, d: usize, e: f32) !f32 {
+            const tmp = try a.dupe(f32, xx);
+            defer a.free(tmp);
+            activations_mod.rmsNorm(tmp, ww, d, e);
+            var loss: f32 = 0.0;
+            for (tmp, dd) |out, grad| loss += out * grad;
+            return loss;
+        }
+    }.f;
+
+    const h: f32 = 1e-3;
+    const Param = struct { buf: []f32, grad: []const f32, name: []const u8 };
+    const params = [_]Param{
+        .{ .buf = x, .grad = packed_data[0 .. rows * dim], .name = "dx" },
+        .{ .buf = weight, .grad = packed_data[rows * dim .. (rows + 1) * dim], .name = "dweight" },
+    };
+    for (params) |param| {
+        for (param.buf, 0..) |*elem, idx| {
+            const original = elem.*;
+            elem.* = original + h;
+            const loss_plus = try lossFn(allocator, x, weight, dy, dim, eps);
+            elem.* = original - h;
+            const loss_minus = try lossFn(allocator, x, weight, dy, dim, eps);
+            elem.* = original;
+            const numerical = (loss_plus - loss_minus) / (2.0 * h);
+            const analytical = param.grad[idx];
+            const denom = @max(@as(f32, 1.0), @max(@abs(numerical), @abs(analytical)));
+            const relative_error = @abs(numerical - analytical) / denom;
+            if (relative_error > 2e-2) {
+                std.debug.print("rms_norm backward mismatch {s}[{d}] num={d} ana={d} rel={d}\n", .{ param.name, idx, numerical, analytical, relative_error });
+                return error.RmsNormBackwardFiniteDiffMismatch;
+            }
+        }
+    }
+}
+
+test "fused_rms_norm backward matches finite differences (single row)" {
+    try rmsNormBackwardFiniteDiffCase(1, 8, 1e-5, 0xA4B);
+}
+
+test "fused_rms_norm backward matches finite differences (multi-row)" {
+    try rmsNormBackwardFiniteDiffCase(5, 6, 1e-5, 0xC0FFEE);
+}
+
 test "DeBERTa backward matches finite differences (all keys valid)" {
     const allocator = std.testing.allocator;
     const batch = 1;
@@ -36023,6 +36146,169 @@ fn gqaCausalAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias
     const bias: ?[]f32 = if (attn_bias_ct) |b| getData(b) else null;
 
     return gqaAttentionSlices(self, Q, K, V, bias, null, 0, null, seq_len, batch, seq_len, seq_len, 0, 0, num_heads, num_kv_heads, head_dim);
+}
+
+fn effectiveGqaTrainingScale(head_dim: usize, score_scale: f32) f32 {
+    return if (score_scale != 0.0)
+        score_scale
+    else
+        1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+}
+
+fn gqaCausalAttentionTrainingOp(
+    ctx: *anyopaque,
+    q_ct: CT,
+    k_ct: CT,
+    v_ct: CT,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sliding_window: usize,
+    score_scale: f32,
+) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (batch == 0 or seq_len == 0 or num_heads == 0 or num_kv_heads == 0 or head_dim == 0 or num_heads % num_kv_heads != 0) {
+        return error.InvalidAttentionShape;
+    }
+    const q = getData(q_ct);
+    const k = getData(k_ct);
+    const v = getData(v_ct);
+    const q_width = num_heads * head_dim;
+    const kv_width = num_kv_heads * head_dim;
+    if (q.len != batch * seq_len * q_width or k.len != batch * seq_len * kv_width or v.len != k.len) {
+        return error.InvalidAttentionShape;
+    }
+
+    const output = try self.allocator.alloc(f32, q.len);
+    errdefer self.allocator.free(output);
+    const probs = try self.allocator.alloc(f32, seq_len);
+    defer self.allocator.free(probs);
+    const heads_per_group = num_heads / num_kv_heads;
+    const scale = effectiveGqaTrainingScale(head_dim, score_scale);
+    for (0..batch) |b| {
+        for (0..num_heads) |h| {
+            const kv_h = h / heads_per_group;
+            for (0..seq_len) |qi| {
+                const first_k = if (sliding_window != 0 and qi + 1 > sliding_window) qi + 1 - sliding_window else 0;
+                const q_base = (b * seq_len + qi) * q_width + h * head_dim;
+                var best = -std.math.inf(f32);
+                for (first_k..qi + 1) |ki| {
+                    const k_base = (b * seq_len + ki) * kv_width + kv_h * head_dim;
+                    var dot: f32 = 0.0;
+                    for (0..head_dim) |d| dot += q[q_base + d] * k[k_base + d];
+                    best = @max(best, dot * scale);
+                }
+                var denom: f32 = 0.0;
+                for (first_k..qi + 1) |ki| {
+                    const k_base = (b * seq_len + ki) * kv_width + kv_h * head_dim;
+                    var dot: f32 = 0.0;
+                    for (0..head_dim) |d| dot += q[q_base + d] * k[k_base + d];
+                    const p = @exp(dot * scale - best);
+                    probs[ki] = p;
+                    denom += p;
+                }
+                const inv_denom = if (denom > 0.0) 1.0 / denom else 0.0;
+                const out_base = q_base;
+                @memset(output[out_base .. out_base + head_dim], 0.0);
+                for (first_k..qi + 1) |ki| {
+                    const v_base = (b * seq_len + ki) * kv_width + kv_h * head_dim;
+                    const p = probs[ki] * inv_denom;
+                    for (0..head_dim) |d| output[out_base + d] += p * v[v_base + d];
+                }
+            }
+        }
+    }
+    return self.makeBuf(output, true);
+}
+
+fn gqaCausalAttentionBackwardOp(
+    ctx: *anyopaque,
+    q_ct: CT,
+    k_ct: CT,
+    v_ct: CT,
+    d_out_ct: CT,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sliding_window: usize,
+    score_scale: f32,
+) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (batch == 0 or seq_len == 0 or num_heads == 0 or num_kv_heads == 0 or head_dim == 0 or num_heads % num_kv_heads != 0) {
+        return error.InvalidAttentionShape;
+    }
+    const q = getData(q_ct);
+    const k = getData(k_ct);
+    const v = getData(v_ct);
+    const d_out = getData(d_out_ct);
+    const q_width = num_heads * head_dim;
+    const kv_width = num_kv_heads * head_dim;
+    const q_count = batch * seq_len * q_width;
+    const kv_count = batch * seq_len * kv_width;
+    if (q.len != q_count or d_out.len != q_count or k.len != kv_count or v.len != kv_count) {
+        return error.InvalidAttentionShape;
+    }
+
+    const packed_grads = try self.allocator.alloc(f32, q_count + 2 * kv_count);
+    errdefer self.allocator.free(packed_grads);
+    @memset(packed_grads, 0.0);
+    const probs = try self.allocator.alloc(f32, seq_len);
+    defer self.allocator.free(probs);
+    const d_probs = try self.allocator.alloc(f32, seq_len);
+    defer self.allocator.free(d_probs);
+    const heads_per_group = num_heads / num_kv_heads;
+    const scale = effectiveGqaTrainingScale(head_dim, score_scale);
+    const dk_offset = q_count;
+    const dv_offset = q_count + kv_count;
+
+    for (0..batch) |b| {
+        for (0..num_heads) |h| {
+            const kv_h = h / heads_per_group;
+            for (0..seq_len) |qi| {
+                const first_k = if (sliding_window != 0 and qi + 1 > sliding_window) qi + 1 - sliding_window else 0;
+                const q_base = (b * seq_len + qi) * q_width + h * head_dim;
+                var best = -std.math.inf(f32);
+                for (first_k..qi + 1) |ki| {
+                    const k_base = (b * seq_len + ki) * kv_width + kv_h * head_dim;
+                    var dot: f32 = 0.0;
+                    for (0..head_dim) |d| dot += q[q_base + d] * k[k_base + d];
+                    best = @max(best, dot * scale);
+                }
+                var denom: f32 = 0.0;
+                for (first_k..qi + 1) |ki| {
+                    const k_base = (b * seq_len + ki) * kv_width + kv_h * head_dim;
+                    var dot: f32 = 0.0;
+                    for (0..head_dim) |d| dot += q[q_base + d] * k[k_base + d];
+                    probs[ki] = @exp(dot * scale - best);
+                    denom += probs[ki];
+                }
+                const inv_denom = if (denom > 0.0) 1.0 / denom else 0.0;
+                var row_dot: f32 = 0.0;
+                for (first_k..qi + 1) |ki| {
+                    const v_base = (b * seq_len + ki) * kv_width + kv_h * head_dim;
+                    probs[ki] *= inv_denom;
+                    var dp: f32 = 0.0;
+                    for (0..head_dim) |d| dp += d_out[q_base + d] * v[v_base + d];
+                    d_probs[ki] = dp;
+                    row_dot += probs[ki] * dp;
+                }
+                for (first_k..qi + 1) |ki| {
+                    const kv_base = (b * seq_len + ki) * kv_width + kv_h * head_dim;
+                    const ds = probs[ki] * (d_probs[ki] - row_dot);
+                    for (0..head_dim) |d| {
+                        packed_grads[q_base + d] += scale * ds * k[kv_base + d];
+                        packed_grads[dk_offset + kv_base + d] += scale * ds * q[q_base + d];
+                        packed_grads[dv_offset + kv_base + d] += probs[ki] * d_out[q_base + d];
+                    }
+                }
+            }
+        }
+    }
+    return self.makeBuf(packed_grads, true);
 }
 
 fn attentionSinkScores(sink: AttentionSinkMetadata, num_heads: usize) !?[]const f32 {
@@ -38942,6 +39228,120 @@ fn bceSigmoid(x: f32) f32 {
         const e = @exp(x);
         break :blk e / (1.0 + e);
     };
+}
+
+fn linearCrossEntropyLabel(raw: f32, vocab_size: usize, ignore_index: i32) !?usize {
+    if (!std.math.isFinite(raw)) return error.InvalidLabel;
+    const rounded = @round(raw);
+    if (@abs(raw - rounded) > 1e-3) return error.InvalidLabel;
+    const label: i64 = @intFromFloat(rounded);
+    if (label == ignore_index) return null;
+    if (label < 0 or label >= vocab_size) return error.InvalidLabel;
+    return @intCast(label);
+}
+
+fn linearCrossEntropyLogit(raw: f32, softcap: f32) f32 {
+    return if (softcap > 0.0) softcap * std.math.tanh(raw / softcap) else raw;
+}
+
+fn validateLinearCrossEntropy(
+    hidden: []const f32,
+    weight: []const f32,
+    labels: []const f32,
+    rows: usize,
+    in_dim: usize,
+    vocab_size: usize,
+    logit_softcap: f32,
+    frozen_weight: bool,
+) !void {
+    if (!frozen_weight) return error.LinearCrossEntropyRequiresFrozenWeight;
+    if (rows == 0 or in_dim == 0 or vocab_size == 0) return error.ShapeMismatch;
+    if (hidden.len != rows * in_dim or weight.len != vocab_size * in_dim or labels.len != rows) return error.ShapeMismatch;
+    if (logit_softcap < 0.0 or !std.math.isFinite(logit_softcap)) return error.InvalidLogitSoftcap;
+}
+
+fn linearCrossEntropyLossOp(ctx: *anyopaque, request: *const ops.LinearCrossEntropyRequest) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const hidden = getData(request.hidden);
+    const weight = getData(request.weight);
+    const labels = getData(request.labels);
+    try validateLinearCrossEntropy(hidden, weight, labels, request.rows, request.in_dim, request.vocab_size, request.logit_softcap, request.frozen_weight);
+
+    const logits = try self.allocator.alloc(f32, request.vocab_size);
+    defer self.allocator.free(logits);
+    var loss: f32 = 0.0;
+    var valid_rows: usize = 0;
+    for (0..request.rows) |row| {
+        const label = (try linearCrossEntropyLabel(labels[row], request.vocab_size, request.ignore_index)) orelse continue;
+        valid_rows += 1;
+        var max_logit = -std.math.inf(f32);
+        for (0..request.vocab_size) |vocab| {
+            var raw: f32 = 0.0;
+            for (0..request.in_dim) |d| raw += hidden[row * request.in_dim + d] * weight[vocab * request.in_dim + d];
+            logits[vocab] = linearCrossEntropyLogit(raw, request.logit_softcap);
+            max_logit = @max(max_logit, logits[vocab]);
+        }
+        var sum_exp: f32 = 0.0;
+        for (logits) |logit| sum_exp += @exp(logit - max_logit);
+        loss += max_logit + @log(sum_exp) - logits[label];
+    }
+
+    const output = try self.allocator.alloc(f32, 1);
+    output[0] = if (valid_rows == 0) 0.0 else loss / @as(f32, @floatFromInt(valid_rows));
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    return self.withLogicalShape(result, request.output_shape);
+}
+
+fn linearCrossEntropyBackwardOp(ctx: *anyopaque, request: *const ops.LinearCrossEntropyBackwardRequest) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const hidden = getData(request.hidden);
+    const weight = getData(request.weight);
+    const labels = getData(request.labels);
+    const upstream = getData(request.upstream);
+    try validateLinearCrossEntropy(hidden, weight, labels, request.rows, request.in_dim, request.vocab_size, request.logit_softcap, request.frozen_weight);
+    if (upstream.len != 1) return error.ShapeMismatch;
+
+    var valid_rows: usize = 0;
+    for (labels) |raw| if ((try linearCrossEntropyLabel(raw, request.vocab_size, request.ignore_index)) != null) {
+        valid_rows += 1;
+    };
+    const output = try self.allocator.alloc(f32, hidden.len);
+    @memset(output, 0.0);
+    if (valid_rows != 0) {
+        const logits = try self.allocator.alloc(f32, request.vocab_size);
+        defer self.allocator.free(logits);
+        const raw_logits = try self.allocator.alloc(f32, request.vocab_size);
+        defer self.allocator.free(raw_logits);
+        const loss_scale = upstream[0] / @as(f32, @floatFromInt(valid_rows));
+        for (0..request.rows) |row| {
+            const label = (try linearCrossEntropyLabel(labels[row], request.vocab_size, request.ignore_index)) orelse continue;
+            var max_logit = -std.math.inf(f32);
+            for (0..request.vocab_size) |vocab| {
+                var raw: f32 = 0.0;
+                for (0..request.in_dim) |d| raw += hidden[row * request.in_dim + d] * weight[vocab * request.in_dim + d];
+                raw_logits[vocab] = raw;
+                logits[vocab] = linearCrossEntropyLogit(raw, request.logit_softcap);
+                max_logit = @max(max_logit, logits[vocab]);
+            }
+            var sum_exp: f32 = 0.0;
+            for (logits) |logit| sum_exp += @exp(logit - max_logit);
+            for (0..request.vocab_size) |vocab| {
+                var d_logit = @exp(logits[vocab] - max_logit) / sum_exp;
+                if (vocab == label) d_logit -= 1.0;
+                if (request.logit_softcap > 0.0) {
+                    const t = std.math.tanh(raw_logits[vocab] / request.logit_softcap);
+                    d_logit *= 1.0 - t * t;
+                }
+                for (0..request.in_dim) |d| {
+                    output[row * request.in_dim + d] += loss_scale * d_logit * weight[vocab * request.in_dim + d];
+                }
+            }
+        }
+    }
+    const result = try self.makeBuf(output, true);
+    errdefer freeTensor(self, result);
+    return self.withLogicalShape(result, request.hidden_shape);
 }
 
 fn maskedBceWithLogitsLossOp(ctx: *anyopaque, request: *const ops.MaskedBceWithLogitsRequest) anyerror!CT {

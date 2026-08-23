@@ -175,6 +175,10 @@ fn traceOutputsEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_GRAPH_EXECUTOR_TRACE_OUTPUTS", false);
 }
 
+fn traceCudaNodeTransfersEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_GRAPH_EXECUTOR_TRACE_CUDA_NODE_TRANSFERS", false);
+}
+
 fn tensorShapeI32(allocator: std.mem.Allocator, shape: []const i64) ![]i32 {
     const out = try allocator.alloc(i32, shape.len);
     errdefer allocator.free(out);
@@ -233,6 +237,7 @@ pub fn executeMultiDevice(
             value_device[@intCast(ri.node_id)] = 0;
         }
     }
+    errdefer cleanupExecutionValuesOnError(values, value_device, mesh, options.runtime_inputs, donated);
 
     // Compute reachable + last_use (or use cached).
     const have_cache = options.cached_analysis != null;
@@ -386,7 +391,48 @@ pub fn executeMultiDevice(
                 // Skip placeholders.
                 if (graph.node(node_id).op == .fused_from_float32) continue;
 
-                values[i] = try executeNode(graph, cb, values, node_id, &exec_state);
+                const cuda_transfer_before = if (part.backend == .cuda and traceCudaNodeTransfersEnabled())
+                    cb.trainingRuntimeStats()
+                else
+                    null;
+                values[i] = executeNode(graph, cb, values, node_id, &exec_state) catch |err| {
+                    if (part.backend == .cuda and traceCudaNodeTransfersEnabled()) {
+                        const node = graph.node(node_id);
+                        std.debug.print(
+                            "graph_executor_cuda_node_error: node={} op={s} shape={any} err={s}\n",
+                            .{ node_id, @tagName(std.meta.activeTag(node.op)), node.output_shape, @errorName(err) },
+                        );
+                        for (node.getInputs(), 0..) |input_id, input_index| {
+                            const input_node = graph.node(input_id);
+                            std.debug.print(
+                                "graph_executor_cuda_node_error_input: index={} node={} op={s} shape={any}\n",
+                                .{ input_index, input_id, @tagName(std.meta.activeTag(input_node.op)), input_node.output_shape },
+                            );
+                        }
+                    }
+                    return err;
+                };
+                if (cuda_transfer_before) |before| {
+                    const after = cb.trainingRuntimeStats();
+                    const h2d = after.h2d_bytes -| before.h2d_bytes;
+                    const d2h = after.d2h_bytes -| before.d2h_bytes;
+                    const to_float32 = after.to_float32_calls -| before.to_float32_calls;
+                    const downloads = after.download_alloc_calls -| before.download_alloc_calls;
+                    if (h2d != 0 or d2h != 0 or to_float32 != 0 or downloads != 0) {
+                        std.debug.print(
+                            "graph_executor_cuda_node_transfer: node={} op={s} shape={any} h2d={} d2h={} to_float32={} downloads={}\n",
+                            .{
+                                node_id,
+                                @tagName(std.meta.activeTag(graph.node(node_id).op)),
+                                graph.node(node_id).output_shape,
+                                h2d,
+                                d2h,
+                                to_float32,
+                                downloads,
+                            },
+                        );
+                    }
+                }
                 if (collect_stats) {
                     if (part.backend == .cuda) {
                         exec_stats.planned_operator_dispatches += 1;
@@ -531,6 +577,38 @@ fn isBorrowedRuntimeInputValue(
         if (ri.node_id == node_id and ri.value == value) return true;
     }
     return false;
+}
+
+fn cleanupExecutionValuesOnError(
+    values: []?CT,
+    value_device: []const DeviceId,
+    mesh: *const DeviceMesh,
+    runtime_inputs: ?[]const RuntimeInput,
+    donated: std.AutoHashMapUnmanaged(NodeId, void),
+) void {
+    for (values, 0..) |value_opt, index| {
+        const value = value_opt orelse continue;
+        var borrowed = false;
+        if (runtime_inputs) |inputs| {
+            for (inputs) |input| {
+                if (!donated.contains(input.node_id) and input.value == value) {
+                    borrowed = true;
+                    break;
+                }
+            }
+        }
+        if (borrowed) continue;
+
+        var duplicate = false;
+        for (values[0..index]) |previous| {
+            if (previous != null and previous.? == value) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        if (mesh.device(value_device[index])) |entry| entry.backend.free(value);
+    }
 }
 
 fn tracePartitionsEnabled() bool {

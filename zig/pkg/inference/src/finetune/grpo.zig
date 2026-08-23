@@ -37,6 +37,19 @@ pub const GRPOConfig = struct {
     normalize_advantage: bool = true,
 };
 
+pub fn validateConfig(config: GRPOConfig) !void {
+    if (config.group_size < 2) return error.InvalidGroupSize;
+    if (!std.math.isFinite(config.clip_epsilon) or config.clip_epsilon <= 0.0) {
+        return error.InvalidClipEpsilon;
+    }
+    if (!std.math.isFinite(config.kl_coef) or config.kl_coef < 0.0) {
+        return error.InvalidKlCoefficient;
+    }
+    if (!std.math.isFinite(config.advantage_eps) or config.advantage_eps <= 0.0) {
+        return error.InvalidAdvantageEpsilon;
+    }
+}
+
 pub const Completion = struct {
     prompt_idx: usize,
     tokens: []const i32,
@@ -71,6 +84,7 @@ pub fn scoreGroup(
     var any = false;
     for (completions, 0..) |c, i| {
         rewards[i] = try rewarder.score(c.prompt_idx, c.tokens);
+        if (!std.math.isFinite(rewards[i])) return error.NonFiniteReward;
         advantages[i] = 0;
         if (!any or c.prompt_idx > max_prompt) {
             max_prompt = c.prompt_idx;
@@ -91,7 +105,8 @@ pub fn computeAdvantages(
     ga: *GroupAdvantages,
     completions: []const Completion,
     config: GRPOConfig,
-) void {
+) !void {
+    try validateConfig(config);
     const n = completions.len;
     if (n == 0) return;
 
@@ -130,6 +145,7 @@ pub fn computeAdvantages(
                 } else {
                     ga.advantages[i] = @floatCast(centered);
                 }
+                if (!std.math.isFinite(ga.advantages[i])) return error.NonFiniteAdvantage;
             }
         }
     }
@@ -156,8 +172,14 @@ pub fn grpoLoss(
     advantages: []const f32,
     config: GRPOConfig,
 ) !GRPOLossResult {
+    try validateConfig(config);
     var total_tokens: usize = 0;
-    for (completions) |c| total_tokens += c.tokens.len;
+    for (completions) |c| {
+        if (c.old_logps.len != c.tokens.len or c.ref_logps.len != c.tokens.len) {
+            return error.LogpLenMismatch;
+        }
+        total_tokens = std.math.add(usize, total_tokens, c.tokens.len) catch return error.TooManyTokens;
+    }
 
     if (new_logps.len != total_tokens) return error.LogpLenMismatch;
     if (advantages.len != completions.len) return error.AdvLenMismatch;
@@ -189,13 +211,18 @@ pub fn grpoLoss(
     var off: usize = 0;
     for (completions, 0..) |c, ci| {
         const adv: f32 = advantages[ci];
+        if (!std.math.isFinite(adv)) return error.NonFiniteAdvantage;
         var t: usize = 0;
         while (t < c.tokens.len) : (t += 1) {
             const new_lp = new_logps[off + t];
             const old_lp = c.old_logps[t];
             const ref_lp = c.ref_logps[t];
+            if (!std.math.isFinite(new_lp) or !std.math.isFinite(old_lp) or !std.math.isFinite(ref_lp)) {
+                return error.NonFiniteLogprob;
+            }
 
             const ratio = @exp(new_lp - old_lp);
+            if (!std.math.isFinite(ratio)) return error.NonFiniteProbabilityRatio;
             const pg_1 = ratio * adv;
             const clipped_ratio = std.math.clamp(ratio, 1.0 - eps, 1.0 + eps);
             const pg_2 = clipped_ratio * adv;
@@ -208,6 +235,7 @@ pub fn grpoLoss(
             // KL k3: exp(ref - new) - (ref - new) - 1
             const diff = ref_lp - new_lp;
             const exp_diff = @exp(diff);
+            if (!std.math.isFinite(exp_diff)) return error.NonFiniteKlTerm;
             const k3 = exp_diff - diff - 1.0;
             kl_sum += kl * k3;
 
@@ -242,6 +270,13 @@ pub fn grpoLoss(
     const kl_loss: f32 = @floatCast(kl_sum / @as(f64, n_f));
     const loss: f32 = pg_loss + kl_loss;
     const clip_fraction: f32 = @as(f32, @floatFromInt(clipped_count)) / n_f;
+    if (!std.math.isFinite(loss) or
+        !std.math.isFinite(pg_loss) or
+        !std.math.isFinite(kl_loss) or
+        !std.math.isFinite(clip_fraction))
+    {
+        return error.NonFiniteGrpoLoss;
+    }
 
     return GRPOLossResult{
         .loss = loss,
@@ -307,7 +342,7 @@ test "computeAdvantages equal rewards -> zero" {
     defer ga.deinit();
 
     const cfg = GRPOConfig{};
-    computeAdvantages(&ga, &comps, cfg);
+    try computeAdvantages(&ga, &comps, cfg);
     for (ga.advantages) |a| try testing.expectApproxEqAbs(@as(f32, 0), a, 1e-6);
 }
 
@@ -361,7 +396,7 @@ test "computeAdvantages two-completion group [1,3] -> [-1,+1]" {
     defer ga.deinit();
 
     const cfg = GRPOConfig{};
-    computeAdvantages(&ga, &comps, cfg);
+    try computeAdvantages(&ga, &comps, cfg);
     try testing.expectApproxEqAbs(@as(f32, -1.0), ga.advantages[0], 1e-4);
     try testing.expectApproxEqAbs(@as(f32, 1.0), ga.advantages[1], 1e-4);
 }
@@ -385,6 +420,38 @@ test "grpoLoss zero when ratio=1, adv=0, ref=new" {
     try testing.expectApproxEqAbs(@as(f32, 0), res.kl_loss, 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0), res.clip_fraction, 1e-6);
     for (res.grad_new_logps) |g| try testing.expectApproxEqAbs(@as(f32, 0), g, 1e-6);
+}
+
+test "GRPO rejects invalid config, malformed logprobs, and non-finite values" {
+    try testing.expectError(error.InvalidGroupSize, validateConfig(.{ .group_size = 1 }));
+    try testing.expectError(error.InvalidClipEpsilon, validateConfig(.{ .clip_epsilon = 0.0 }));
+    try testing.expectError(error.InvalidKlCoefficient, validateConfig(.{ .kl_coef = -0.1 }));
+    try testing.expectError(error.InvalidAdvantageEpsilon, validateConfig(.{ .advantage_eps = std.math.nan(f32) }));
+
+    const tokens = [_]i32{ 1, 2 };
+    const short_logps = [_]f32{-0.1};
+    const malformed = [_]Completion{.{
+        .prompt_idx = 0,
+        .tokens = &tokens,
+        .old_logps = &short_logps,
+        .ref_logps = &short_logps,
+    }};
+    try testing.expectError(
+        error.LogpLenMismatch,
+        grpoLoss(testing.allocator, &malformed, &.{ -0.1, -0.2 }, &.{0.0}, .{}),
+    );
+
+    const finite_logps = [_]f32{ -0.1, -0.2 };
+    const valid = [_]Completion{.{
+        .prompt_idx = 0,
+        .tokens = &tokens,
+        .old_logps = &finite_logps,
+        .ref_logps = &finite_logps,
+    }};
+    try testing.expectError(
+        error.NonFiniteLogprob,
+        grpoLoss(testing.allocator, &valid, &.{ std.math.nan(f32), -0.2 }, &.{0.0}, .{}),
+    );
 }
 
 fn lossOnly(

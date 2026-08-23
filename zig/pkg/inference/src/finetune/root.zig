@@ -54,6 +54,7 @@ pub const gemma_multimodal_data = @import("gemma_multimodal_data.zig");
 pub const gemma4 = @import("gemma4.zig");
 pub const gemma4_real_autodiff = @import("gemma4_real_autodiff.zig");
 pub const gemma4_multimodal_real_autodiff = @import("gemma4_multimodal_real_autodiff.zig");
+pub const gemma4_train_command = @import("gemma4_train_command.zig");
 pub const qwen2_real_autodiff = @import("qwen2_real_autodiff.zig");
 pub const recipe = @import("recipe.zig");
 

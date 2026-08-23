@@ -73,6 +73,7 @@ pub fn supportsMetalEagerGraph(op: OpCode) bool {
         .fused_linear_no_bias_pair,
         .fused_layer_norm,
         .fused_rms_norm,
+        .fused_rms_norm_backward,
         .fused_gelu,
         .fused_gelu_exact,
         .fused_gelu_backward,
@@ -91,6 +92,7 @@ pub fn supportsMetalEagerGraph(op: OpCode) bool {
         .fused_zero_tensor,
         .fused_rope,
         .fused_gqa_causal_attention,
+        .fused_gqa_causal_attention_backward,
         .reshape,
         .transpose,
         .broadcast_in_dim,
@@ -103,6 +105,8 @@ pub fn supportsMetalEagerGraph(op: OpCode) bool {
         .fused_sdpa,
         .fused_softmax,
         .fused_log_softmax,
+        .fused_linear_cross_entropy_loss,
+        .fused_linear_cross_entropy_backward,
         .fused_masked_bce_with_logits_loss,
         .fused_masked_bce_with_logits_backward,
         .fused_conv1d,
@@ -123,7 +127,9 @@ pub fn decideMetalEagerGraph(query: CapabilityQuery) CapabilityDecision {
         return CapabilityDecision.reject(.missing_quant_kernel);
     }
     const packed_quant_metadata_view = metalPackedQuantMetadataView(query);
-    const quant_plan = if (nodeHasPackedQuantInput(query) and !packed_quant_metadata_view) blk: {
+    const quantized_backward_input = metalQuantizedBackwardInputSupported(query);
+    const quantized_linear_ce = metalLinearCrossEntropyPackedWeightSupported(query);
+    const quant_plan = if (nodeHasPackedQuantInput(query) and !packed_quant_metadata_view and !quantized_backward_input and !quantized_linear_ce) blk: {
         const plan = metalQuantizedLinearPlan(query) orelse
             metalQuantizedDotGeneralPlan(query) orelse
             return CapabilityDecision.reject(.missing_quant_kernel);
@@ -253,6 +259,65 @@ fn metalQuantizedDotGeneralPlan(query: CapabilityQuery) ?quant_matmul.Plan {
     });
 }
 
+/// Frozen-linear backward input has the logical form
+/// `output_grad[rows,out] @ weight[out,in]`. The packed GGUF bytes still use
+/// the forward `[out,in]` row layout, so this cannot reuse a forward quantized
+/// matmul operator plan. The executor dispatches the dedicated packed-weight
+/// backward kernel for this exact contract.
+fn metalQuantizedBackwardInputSupported(query: CapabilityQuery) bool {
+    const attrs = switch (query.op) {
+        .dot_general => |attrs| attrs,
+        else => return false,
+    };
+    if (attrs.num_contracting != 1 or attrs.num_batch != 0) return false;
+    if (attrs.lhs_contracting[0] != 1 or attrs.rhs_contracting[0] != 0) return false;
+    const lhs_shape = nodeInputShape(query, 0) orelse return false;
+    const rhs_shape = nodeInputShape(query, 1) orelse return false;
+    const output_shape = query.graph.node(query.node_id).output_shape;
+    if (lhs_shape.rank() != 2 or rhs_shape.rank() != 2 or output_shape.rank() != 2) return false;
+    if (lhs_shape.dtype != .f32 or output_shape.dtype != .f32) return false;
+    const rows = positiveShapeDim(lhs_shape, 0) orelse return false;
+    const out_dim = positiveShapeDim(lhs_shape, 1) orelse return false;
+    const rhs_out_dim = positiveShapeDim(rhs_shape, 0) orelse return false;
+    const in_dim = positiveShapeDim(rhs_shape, 1) orelse return false;
+    if (out_dim != rhs_out_dim) return false;
+    if (output_shape.dim(0) != @as(i64, @intCast(rows)) or output_shape.dim(1) != @as(i64, @intCast(in_dim))) return false;
+
+    const descs = query.tensor_descs orelse return false;
+    if (inputDesc(descs, query.graph.node(query.node_id).inputs[0])) |activation_desc| {
+        if (activation_desc.isPackedQuant()) return false;
+    }
+    const format = packedQuantInputFormat(descs, query.graph.node(query.node_id).inputs[1]) orelse return false;
+    const values_per_block = format.valuesPerBlock() orelse return false;
+    if (in_dim % values_per_block != 0) return false;
+    return switch (format) {
+        .q4_0, .q4_k, .q6_k => true,
+        else => false,
+    };
+}
+
+fn metalLinearCrossEntropyPackedWeightSupported(query: CapabilityQuery) bool {
+    const attrs = switch (query.op) {
+        .fused_linear_cross_entropy_loss => |attrs| attrs,
+        .fused_linear_cross_entropy_backward => |attrs| attrs,
+        else => return false,
+    };
+    if (!attrs.frozen_weight or attrs.rows == 0 or attrs.in_dim == 0 or attrs.vocab_size == 0) return false;
+    const descs = query.tensor_descs orelse return false;
+    const inputs = query.graph.node(query.node_id).getInputs();
+    if (inputs.len < 3) return false;
+    if (inputDesc(descs, inputs[0])) |activation_desc| {
+        if (activation_desc.isPackedQuant()) return false;
+    }
+    const format = packedQuantInputFormat(descs, inputs[1]) orelse return false;
+    const values_per_block = format.valuesPerBlock() orelse return false;
+    if (attrs.in_dim % values_per_block != 0) return false;
+    return switch (format) {
+        .q4_0, .q4_k, .q6_k => true,
+        else => false,
+    };
+}
+
 fn metalQuantizedRowPlan(query: CapabilityQuery) ?quant_matmul.RowOpPlan {
     const descs = query.tensor_descs orelse return null;
     const n = query.graph.node(query.node_id);
@@ -327,10 +392,44 @@ fn metalEagerGraphNodeHasSupportedResidentShape(query: CapabilityQuery) bool {
         .argmax => metalArgmaxHasResidentShape(query),
         .fused_sdpa => metalSdpaHasResidentShape(query),
         .fused_gqa_causal_attention => metalGqaCausalAttentionHasResidentShape(query),
+        .fused_gqa_causal_attention_backward => metalGqaCausalAttentionBackwardHasResidentShape(query),
         .fused_softmax, .fused_log_softmax => metalSoftmaxHasResidentShape(query),
+        .fused_linear_cross_entropy_loss, .fused_linear_cross_entropy_backward => metalLinearCrossEntropyHasResidentShape(query),
         .convert_dtype => metalConvertDTypeHasResidentShape(query),
         else => true,
     };
+}
+
+fn metalLinearCrossEntropyHasResidentShape(query: CapabilityQuery) bool {
+    const attrs = switch (query.op) {
+        .fused_linear_cross_entropy_loss => |attrs| attrs,
+        .fused_linear_cross_entropy_backward => |attrs| attrs,
+        else => return false,
+    };
+    if (!attrs.frozen_weight or attrs.rows == 0 or attrs.in_dim == 0 or attrs.vocab_size == 0) return false;
+    if (!std.math.isFinite(attrs.logit_softcap) or attrs.logit_softcap < 0.0) return false;
+    const hidden = nodeInputShape(query, 0) orelse return false;
+    const weight = nodeInputShape(query, 1) orelse return false;
+    const labels = nodeInputShape(query, 2) orelse return false;
+    const output = query.graph.node(query.node_id).output_shape;
+    if (hidden.dtype != .f32 or weight.dtype != .f32 or labels.dtype != .f32 or output.dtype != .f32) return false;
+    if (hidden.rank() != 2 or weight.rank() != 2 or (labels.rank() != 1 and labels.rank() != 2)) return false;
+    if (hidden.dim(0) != @as(i64, @intCast(attrs.rows)) or hidden.dim(1) != @as(i64, @intCast(attrs.in_dim))) return false;
+    if (weight.dim(0) != @as(i64, @intCast(attrs.vocab_size)) or weight.dim(1) != @as(i64, @intCast(attrs.in_dim))) return false;
+    const label_elems = shapeElementCount(labels) orelse return false;
+    if (label_elems != @as(u64, attrs.rows)) return false;
+    switch (query.op) {
+        .fused_linear_cross_entropy_loss => return (shapeElementCount(output) orelse return false) == 1,
+        .fused_linear_cross_entropy_backward => {
+            const upstream = nodeInputShape(query, 3) orelse return false;
+            const upstream_elems = shapeElementCount(upstream) orelse return false;
+            const output_elems = shapeElementCount(output) orelse return false;
+            const hidden_elems = shapeElementCount(hidden) orelse return false;
+            return upstream.dtype == .f32 and upstream_elems == 1 and
+                output.rank() == hidden.rank() and output_elems == hidden_elems;
+        },
+        else => unreachable,
+    }
 }
 
 fn metalConvertDTypeHasResidentShape(query: CapabilityQuery) bool {
@@ -401,7 +500,7 @@ fn metalDotGeneralHasResidentShape(query: CapabilityQuery) bool {
     if (attrs.num_batch != 0) return metalBatchedDotGeneralHasResidentShape(attrs, lhs_shape, rhs_shape, output_shape);
     if (lhs_shape.rank() != 2 or rhs_shape.rank() != 2 or output_shape.rank() != 2) return false;
     if (lhs_shape.dtype != .f32 or output_shape.dtype != .f32) return false;
-    if (attrs.lhs_contracting[0] != 1) return false;
+    if (attrs.lhs_contracting[0] != 0 and attrs.lhs_contracting[0] != 1) return false;
     if (attrs.rhs_contracting[0] != 0 and attrs.rhs_contracting[0] != 1) return false;
     const rhs_dense_f32 = rhs_shape.dtype == .f32;
     const rhs_quant = blk: {
@@ -412,8 +511,9 @@ fn metalDotGeneralHasResidentShape(query: CapabilityQuery) bool {
             quant_matmul.packedFormatDescriptor(rhs_desc.quant_format orelse return false).supported();
     };
     if (!rhs_dense_f32 and !rhs_quant) return false;
-    const m = positiveShapeDim(lhs_shape, 0) orelse return false;
-    const k = positiveShapeDim(lhs_shape, 1) orelse return false;
+    const lhs_axis: usize = @intCast(attrs.lhs_contracting[0]);
+    const m = positiveShapeDim(lhs_shape, 1 - lhs_axis) orelse return false;
+    const k = positiveShapeDim(lhs_shape, lhs_axis) orelse return false;
     const rhs_axis: usize = @intCast(attrs.rhs_contracting[0]);
     const rhs_k = positiveShapeDim(rhs_shape, rhs_axis) orelse return false;
     const n = positiveShapeDim(rhs_shape, 1 - rhs_axis) orelse return false;
@@ -760,6 +860,33 @@ fn metalGqaCausalAttentionHasResidentShape(query: CapabilityQuery) bool {
         if (bias_elems != shared_bias_len and bias_elems != batched_bias_len and bias_elems != broadcast_head_bias_len) return false;
     }
     return true;
+}
+
+fn metalGqaCausalAttentionBackwardHasResidentShape(query: CapabilityQuery) bool {
+    const attrs = switch (query.op) {
+        .fused_gqa_causal_attention_backward => |attrs| attrs,
+        else => return false,
+    };
+    if (attrs.batch == 0 or attrs.seq_len == 0 or attrs.num_heads == 0 or attrs.num_kv_heads == 0 or
+        attrs.head_dim == 0 or attrs.num_heads % attrs.num_kv_heads != 0) return false;
+    const q_expected = checkedMul(
+        checkedMul(@as(u64, attrs.batch), @as(u64, attrs.num_heads)),
+        checkedMul(@as(u64, attrs.seq_len), @as(u64, attrs.head_dim)),
+    );
+    const kv_expected = checkedMul(
+        checkedMul(@as(u64, attrs.batch), @as(u64, attrs.num_kv_heads)),
+        checkedMul(@as(u64, attrs.seq_len), @as(u64, attrs.head_dim)),
+    );
+    if (q_expected == 0 or q_expected == std.math.maxInt(u64) or
+        kv_expected == 0 or kv_expected == std.math.maxInt(u64)) return false;
+    for (0..4) |input_index| {
+        const input_shape = nodeInputShape(query, input_index) orelse return false;
+        if (input_shape.dtype != .f32) return false;
+        const expected = if (input_index == 1 or input_index == 2) kv_expected else q_expected;
+        if (shapeElementCount(input_shape) != expected) return false;
+    }
+    const output = query.graph.node(query.node_id).output_shape;
+    return output.dtype == .f32 and shapeElementCount(output) == q_expected + 2 * kv_expected;
 }
 
 fn nodeInputShape(query: CapabilityQuery, index: usize) ?ml.graph.Shape {

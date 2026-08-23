@@ -189,6 +189,7 @@ fn inspectGemma4ClipContract(
         if (!direct and
             (block_count == 0 or head_count == 0 or intermediate == 0 or audio_hidden % head_count != 0))
             return error.InvalidProjectorContract;
+        const validator = TensorValidator.init(file);
         const projection_input = if (direct)
             try requiredPositiveU32WithFallback(
                 view,
@@ -196,9 +197,9 @@ fn inspectGemma4ClipContract(
                 "clip.audio.embedding_length",
             )
         else
-            projection_dim;
+            try validator.matrixOutputDim("a.pre_encode.out.weight", audio_hidden);
         try validateGemma4AudioTensorShapes(
-            TensorValidator.init(file),
+            validator,
             view,
             projection_dim,
             audio_hidden,
@@ -317,6 +318,19 @@ const TensorValidator = struct {
         {
             return error.InvalidProjectorContract;
         }
+    }
+
+    fn matrixOutputDim(self: TensorValidator, name: []const u8, input_dim: u32) !u32 {
+        const tensor = try self.require(name);
+        if (tensor.dimensions.len != 2) return error.InvalidProjectorContract;
+        const output_dim = if (tensor.dimensions[0] == input_dim)
+            tensor.dimensions[1]
+        else if (tensor.dimensions[1] == input_dim)
+            tensor.dimensions[0]
+        else
+            return error.InvalidProjectorContract;
+        if (output_dim == 0 or output_dim > std.math.maxInt(u32)) return error.InvalidProjectorContract;
+        return @intCast(output_dim);
     }
 
     /// Raw backend linear weights are loaded without a runtime transpose. GGUF
@@ -577,8 +591,8 @@ fn validateGemma4AudioTensorShapes(
     try validator.requireConv2d("a.conv1d.1.weight", 3, 3, 128, 32, true);
     try validator.requireVector("a.conv1d.1.norm.weight", 32);
     try validator.requireMatrix("a.input_projection.weight", input_projection, audio_hidden);
-    try validator.requireMatrix("a.pre_encode.out.weight", audio_hidden, projection_dim);
-    try validator.requireVector("a.pre_encode.out.bias", projection_dim);
+    try validator.requireMatrix("a.pre_encode.out.weight", audio_hidden, projection_input);
+    try validator.requireVector("a.pre_encode.out.bias", projection_input);
 
     const head_dim = audio_hidden / head_count;
     const doubled_hidden = try checkedProjectorDimension(audio_hidden, 2);
@@ -886,13 +900,13 @@ test "contract inspection accepts regular Gemma 4 audio projection width transit
         .{ .key = "clip.audio.num_mel_bins", .value = .{ .u32 = 8 } },
     };
     const dims_hidden = [_]u64{4};
-    const dims_projection = [_]u64{6};
+    const dims_preencode_output = [_]u64{5};
     const dims_head = [_]u64{2};
     const dims_hidden_matrix = [_]u64{ 4, 4 };
     const dims_up = [_]u64{ 4, 8 };
     const dims_down = [_]u64{ 8, 4 };
-    const dims_terminal = [_]u64{ 6, 6 };
-    const dims_preencode = [_]u64{ 4, 6 };
+    const dims_terminal = [_]u64{ 5, 6 };
+    const dims_preencode = [_]u64{ 4, 5 };
     const dims_input_projection = [_]u64{ 64, 4 };
     const dims_conv0 = [_]u64{ 3, 3, 1, 128 };
     const dims_conv1 = [_]u64{ 3, 3, 128, 32 };
@@ -907,7 +921,7 @@ test "contract inspection accepts regular Gemma 4 audio projection width transit
         .{ .name = "a.conv1d.1.norm.weight", .dimensions = &dims_conv1_norm, .tensor_type = .{ .known = .F32 } },
         .{ .name = "a.input_projection.weight", .dimensions = &dims_input_projection, .tensor_type = .{ .known = .F32 } },
         .{ .name = "a.pre_encode.out.weight", .dimensions = &dims_preencode, .tensor_type = .{ .known = .F32 } },
-        .{ .name = "a.pre_encode.out.bias", .dimensions = &dims_projection, .tensor_type = .{ .known = .F32 } },
+        .{ .name = "a.pre_encode.out.bias", .dimensions = &dims_preencode_output, .tensor_type = .{ .known = .F32 } },
         .{ .name = "a.blk.0.ffn_norm.weight", .dimensions = &dims_hidden, .tensor_type = .{ .known = .F32 } },
         .{ .name = "a.blk.0.ffn_up.weight", .dimensions = &dims_up, .tensor_type = .{ .known = .F32 } },
         .{ .name = "a.blk.0.ffn_down.weight", .dimensions = &dims_down, .tensor_type = .{ .known = .F32 } },
