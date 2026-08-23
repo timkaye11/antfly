@@ -39,6 +39,15 @@ pub const Builder = struct {
     /// false (default), it attaches the decomposed primitive subgraph and
     /// lowering replaces the fused op with it (current behavior).
     fuse_layer_norm_backward: bool = false,
+    /// When true, `rmsNorm` stays fused through lowering and autodiff emits
+    /// one custom `fused_rms_norm_backward` op instead of expanding the
+    /// elementwise/reduction VJP. Default-off so other graph consumers keep
+    /// their existing lowering behavior.
+    fuse_rms_norm_backward: bool = false,
+    /// When true, Gemma-style GQA stays fused through lowering and autodiff
+    /// emits a packed custom backward instead of materializing expanded K/V,
+    /// attention probabilities, and the primitive batched-dot VJP graph.
+    fuse_gqa_attention_backward: bool = false,
 
     pub fn init(graph: *Graph) Builder {
         return .{ .graph = graph };
@@ -461,17 +470,19 @@ pub const Builder = struct {
 
     /// Fused RMS normalization: x * rsqrt(mean(x^2) + eps) * weight.
     pub fn rmsNorm(self: *Builder, input: NodeId, weight: NodeId, dim: u32, eps: f32) !NodeId {
-        // Decomposed: x_sq -> mean -> + eps -> rsqrt -> * x -> * weight
         const in_shape = self.graph.node(input).output_shape;
-        const last_axis: u8 = in_shape.rank() - 1;
-        const x_sq = try self.mul(input, input);
-        const mean_sq = try self.reduceMean(x_sq, &.{last_axis});
-        const eps_node = try self.scalarConst(in_shape.dtype, eps);
-        const mean_plus_eps = try self.add(mean_sq, eps_node);
-        const inv_rms = try self.rsqrt(mean_plus_eps);
-        const inv_rms_bc = try self.broadcastReduced(inv_rms, in_shape);
-        const normed = try self.mul(input, inv_rms_bc);
-        const decomposed = try self.mul(normed, weight);
+        const decomposed: NodeId = if (self.fuse_rms_norm_backward) null_node else blk: {
+            // Decomposed: x_sq -> mean -> + eps -> rsqrt -> * x -> * weight.
+            const last_axis: u8 = in_shape.rank() - 1;
+            const x_sq = try self.mul(input, input);
+            const mean_sq = try self.reduceMean(x_sq, &.{last_axis});
+            const eps_node = try self.scalarConst(in_shape.dtype, eps);
+            const mean_plus_eps = try self.add(mean_sq, eps_node);
+            const inv_rms = try self.rsqrt(mean_plus_eps);
+            const inv_rms_bc = try self.broadcastReduced(inv_rms, in_shape);
+            const normed = try self.mul(input, inv_rms_bc);
+            break :blk try self.mul(normed, weight);
+        };
 
         const fused = try self.graph.addNode(.{
             .op = .{ .fused_rms_norm = .{ .dim = dim, .eps = eps } },
@@ -697,6 +708,51 @@ pub const Builder = struct {
             .op = .{ .fused_masked_bce_with_logits_loss = attrs },
             .output_shape = out_shape,
             .inputs = .{ logits, labels, mask, null_node },
+            .num_inputs = 3,
+            .vjp_alternate = null_node,
+        });
+    }
+
+    /// Fused sparse-label linear cross-entropy for a frozen vocabulary head.
+    ///
+    /// `hidden` is [rows, in_dim], `weight` is [vocab_size, in_dim], and
+    /// `labels` is either [rows] or [rows, 1]. Labels are integer-valued f32
+    /// values because finetuning target tensors currently use the model's f32
+    /// graph input convention. The result is a scalar mean over non-ignored
+    /// rows. This op never materializes [rows, vocab_size] logits.
+    ///
+    /// The caller must explicitly set `attrs.frozen_weight = true`. This is a
+    /// fail-closed declaration that the custom VJP may return d_hidden only;
+    /// use `linearNoBias` plus `crossEntropyLoss` when d_weight is required.
+    pub fn linearCrossEntropyLoss(
+        self: *Builder,
+        hidden: NodeId,
+        weight: NodeId,
+        labels: NodeId,
+        attrs: node_mod.LinearCrossEntropyAttrs,
+    ) !NodeId {
+        if (!attrs.frozen_weight) return error.LinearCrossEntropyRequiresFrozenWeight;
+        if (attrs.logit_softcap < 0.0 or !std.math.isFinite(attrs.logit_softcap)) return error.InvalidLogitSoftcap;
+
+        const hidden_shape = self.graph.node(hidden).output_shape;
+        const weight_shape = self.graph.node(weight).output_shape;
+        const labels_shape = self.graph.node(labels).output_shape;
+        if (hidden_shape.rank() != 2 or weight_shape.rank() != 2) return error.ShapeMismatch;
+        if (labels_shape.rank() != 1 and labels_shape.rank() != 2) return error.ShapeMismatch;
+        if (labels_shape.rank() == 2 and labels_shape.dim(1) != 1) return error.ShapeMismatch;
+        if (hidden_shape.dtype != .f32 or weight_shape.dtype != .f32 or labels_shape.dtype != .f32) return error.DTypeMismatch;
+        if (hidden_shape.dim(0) <= 0 or hidden_shape.dim(1) <= 0 or weight_shape.dim(0) <= 0) return error.ShapeMismatch;
+        if (hidden_shape.dim(0) != labels_shape.dim(0) or hidden_shape.dim(1) != weight_shape.dim(1)) return error.ShapeMismatch;
+
+        const rows = std.math.cast(u32, hidden_shape.dim(0)) orelse return error.ShapeMismatch;
+        const in_dim = std.math.cast(u32, hidden_shape.dim(1)) orelse return error.ShapeMismatch;
+        const vocab_size = std.math.cast(u32, weight_shape.dim(0)) orelse return error.ShapeMismatch;
+        if (attrs.rows != rows or attrs.in_dim != in_dim or attrs.vocab_size != vocab_size) return error.ShapeMismatch;
+
+        return self.graph.addNode(.{
+            .op = .{ .fused_linear_cross_entropy_loss = attrs },
+            .output_shape = Shape.scalar(hidden_shape.dtype),
+            .inputs = .{ hidden, weight, labels, null_node },
             .num_inputs = 3,
             .vjp_alternate = null_node,
         });
@@ -1202,6 +1258,38 @@ test "Builder.crossEntropyLoss produces scalar" {
 
     // Cross-entropy loss should produce a scalar
     try std.testing.expectEqual(@as(i64, 1), loss_node.output_shape.numElements() orelse 0);
+}
+
+test "Builder.linearCrossEntropyLoss validates frozen sparse contract" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const hidden = try b.parameter("hidden", Shape.init(.f32, &.{ 3, 4 }));
+    const weight = try b.parameter("weight", Shape.init(.f32, &.{ 5, 4 }));
+    const labels = try b.parameter("labels", Shape.init(.f32, &.{ 3, 1 }));
+    const attrs = node_mod.LinearCrossEntropyAttrs{
+        .rows = 3,
+        .in_dim = 4,
+        .vocab_size = 5,
+        .logit_softcap = 30.0,
+        .ignore_index = -100,
+        .frozen_weight = true,
+    };
+    const loss = try b.linearCrossEntropyLoss(hidden, weight, labels, attrs);
+    const loss_node = g.node(loss);
+    try std.testing.expectEqual(.fused_linear_cross_entropy_loss, std.meta.activeTag(loss_node.op));
+    try std.testing.expectEqual(@as(u8, 0), loss_node.output_shape.rank());
+    try std.testing.expectEqual(@as(i64, 1), loss_node.output_shape.numElements().?);
+    try std.testing.expectEqual(null_node, loss_node.vjp_alternate);
+
+    var unfrozen = attrs;
+    unfrozen.frozen_weight = false;
+    try std.testing.expectError(
+        error.LinearCrossEntropyRequiresFrozenWeight,
+        b.linearCrossEntropyLoss(hidden, weight, labels, unfrozen),
+    );
 }
 
 test "Builder.mseLoss produces scalar" {

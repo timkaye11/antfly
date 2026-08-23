@@ -1,0 +1,108 @@
+{
+  "schema_version": "antfly_gemma4_contract_cases/v1",
+  "cases": [
+    {
+      "name": "plain",
+      "messages": [
+        {"role": "user", "content": "Return the exact code word {{code_word}}."},
+        {"role": "assistant", "content": "{{code_word}}"}
+      ]
+    },
+    {
+      "name": "system",
+      "messages": [
+        {"role": "system", "content": "Be concise and preserve punctuation."},
+        {"role": "user", "content": "Reply exactly: ready, {{nonce}}."},
+        {"role": "assistant", "content": "ready, {{nonce}}."}
+      ]
+    },
+    {
+      "name": "multiturn",
+      "messages": [
+        {"role": "user", "content": "Remember {{code_word}}."},
+        {"role": "assistant", "content": "Stored."},
+        {"role": "user", "content": "What did I ask you to remember?"},
+        {"role": "assistant", "content": "{{code_word}}"}
+      ]
+    },
+    {
+      "name": "tool_call",
+      "tools": [
+        {
+          "name": "weather_lookup",
+          "description": "Return current weather for one city.",
+          "input_schema": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"]
+          }
+        }
+      ],
+      "messages": [
+        {"role": "user", "content": "What is the weather in {{city}}?"},
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_{{nonce}}",
+              "type": "function",
+              "function": {"name": "weather_lookup", "arguments": "{\"city\":\"{{city}}\"}"}
+            }
+          ]
+        },
+        {"role": "tool", "tool_call_id": "call_{{nonce}}", "name": "weather_lookup", "content": "{\"temperature_c\":21}"},
+        {"role": "assistant", "content": "It is 21 C in {{city}}."}
+      ]
+    },
+    {
+      "name": "parallel_tool_calls",
+      "tools": [
+        {
+          "name": "lookup",
+          "description": "Look up one key.",
+          "input_schema": {
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"]
+          }
+        }
+      ],
+      "messages": [
+        {"role": "user", "content": "Look up keys alpha and beta."},
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {"id": "call_a_{{nonce}}", "type": "function", "function": {"name": "lookup", "arguments": "{\"key\":\"alpha\"}"}},
+            {"id": "call_b_{{nonce}}", "type": "function", "function": {"name": "lookup", "arguments": "{\"key\":\"beta\"}"}}
+          ]
+        },
+        {"role": "tool", "tool_call_id": "call_a_{{nonce}}", "name": "lookup", "content": "A"},
+        {"role": "tool", "tool_call_id": "call_b_{{nonce}}", "name": "lookup", "content": "B"},
+        {"role": "assistant", "content": "alpha=A; beta=B"}
+      ]
+    },
+    {
+      "name": "unicode",
+      "messages": [
+        {"role": "user", "content": "Preserve exactly: café | café | 東京 | مرحبا | 👩🏽‍💻."},
+        {"role": "assistant", "content": "café | café | 東京 | مرحبا | 👩🏽‍💻"}
+      ]
+    },
+    {
+      "name": "escaped_json",
+      "messages": [
+        {"role": "user", "content": "Return JSON with quote, slash, and newline escapes for {{nonce}}."},
+        {"role": "assistant", "content": "{\"quote\":\"\\\"\",\"slash\":\"\\\\\",\"line\":\"a\\nb\",\"id\":\"{{nonce}}\"}"}
+      ]
+    },
+    {
+      "name": "boundary_payload",
+      "messages": [
+        {"role": "user", "content": "Echo this payload: {{boundary_payload}}"},
+        {"role": "assistant", "content": "{{boundary_payload}}"}
+      ]
+    }
+  ]
+}

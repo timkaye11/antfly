@@ -183,7 +183,11 @@ pub const MultimodalCtx = struct {
             const name = try prefixedModelName(&name_buf, self.graph_config, "model.embed_tokens.weight");
             break :blk try bld.parameter(name, Shape.init(.f32, &.{ @as(i64, @intCast(self.graph_config.vocab_size)), @as(i64, @intCast(hidden_size)) }));
         } else try bld.parameter("lm_head.weight", Shape.init(.f32, &.{ @as(i64, @intCast(self.graph_config.vocab_size)), @as(i64, @intCast(hidden_size)) }));
-        const logits = try bld.linearNoBias(hidden_flat, lm_head_w, total_rows, hidden_size, self.graph_config.vocab_size);
+        const raw_logits = try bld.linearNoBias(hidden_flat, lm_head_w, total_rows, hidden_size, self.graph_config.vocab_size);
+        const logits = if (self.graph_config.final_logit_softcapping > 0.0) blk: {
+            const scale = try bld.scalarConst(.f32, self.graph_config.final_logit_softcapping);
+            break :blk try bld.mul(try bld.tanhOp(try bld.div(raw_logits, scale)), scale);
+        } else raw_logits;
         self.lm_logits = logits;
         return logits;
     }
@@ -425,6 +429,7 @@ pub fn initializeTrainerFromAdapterDir(
     bootstrap_example: *const gemma4.PreparedExampleInput,
     seq_len: u32,
 ) !void {
+    try gemma4.validateLoRAAdapterInventory(allocator, adapter_model_dir);
     var bootstrap = try makeTrainerInputForExample(allocator, ctx, bootstrap_example, seq_len);
     defer bootstrap.deinit(allocator);
     try trainer.ensureGraphBuilt(bootstrap.trainer_input);
@@ -538,8 +543,7 @@ pub fn materializeTeacherTopKTargets(
     const graph_config = try gemma4_real.loadGraphConfig(allocator, base_model_dir);
     const vocab_size: usize = @intCast(graph_config.vocab_size);
     if (options.top_k > vocab_size) return error.InvalidTeacherTopK;
-    const seq_len = prepared.max_seq_len;
-    if (seq_len == 0) return error.InvalidPreparedInputLength;
+    const seq_len: usize = @intCast(try gemma4.validatePreparedSequenceAdmission(prepared.*, graph_config.max_position_embeddings));
 
     var backend = try gemma4_real.loadBackendForModelDir(allocator, base_model_dir, backend_kind);
     defer backend.deinit();
@@ -597,6 +601,7 @@ pub fn materializeTeacherTopKTargets(
         summary.supervised_tokens_seen += example.num_supervised_tokens;
     }
     summary.examples_seen = limit;
+    try gemma4.refreshPreparedExamplesFingerprint(allocator, prepared);
     return summary;
 }
 
@@ -682,7 +687,15 @@ fn runPreparedExamples(
         }
         total_weighted_loss += @as(f64, step.loss) * weight;
         total_weighted_grad_norm += @as(f64, step.grad_norm) * weight;
+        gemma4_real.recordStepExecutionEvidence(&metrics, step);
         if (step.optimizer_stepped) metrics.optimizer_steps += 1;
+    }
+
+    if (mode == .train) {
+        if (try trainer.flushAccumulatedGradients()) |_| {
+            metrics.optimizer_steps += 1;
+            if (trainer.config.strict_metal_execution) metrics.metal_optimizer_steps += 1;
+        }
     }
 
     if (metrics.supervised_tokens_seen > 0) {

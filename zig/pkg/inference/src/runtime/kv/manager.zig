@@ -251,6 +251,18 @@ pub const KvManager = struct {
         return seq_state.block_table.tokenCount(storage.config.page_size_tokens);
     }
 
+    /// Returns the number of sequence lifetimes that still own KV references.
+    /// Checkpoint callers use this as a quiescence proof after draining the
+    /// backend: inactive slots and their retained allocation capacity are not
+    /// live cache state and therefore do not need serialization.
+    pub fn activeSequenceCount(self: *const KvManager) usize {
+        var count: usize = 0;
+        for (self.sequences.items) |sequence| {
+            if (sequence.active) count += 1;
+        }
+        return count;
+    }
+
     /// Number of additional blocks the sequence will need to hold an
     /// `additional_tokens` extension beyond its current tail. This is the
     /// per-item KV-block cost the scheduler consults to admit pending work
@@ -742,13 +754,16 @@ test "manager releases shared prefix blocks by refcount" {
     const source_id = try manager.attachSequence(pool_id);
     try manager.appendTokens(source_id, 4);
     const derived_id = try manager.attachSequenceWithSharedPrefix(pool_id, source_id, 4);
+    try std.testing.expectEqual(@as(usize, 2), manager.activeSequenceCount());
 
     try manager.releaseSequence(derived_id);
+    try std.testing.expectEqual(@as(usize, 1), manager.activeSequenceCount());
     const pool = manager.getPool(pool_id).?;
     try std.testing.expectEqual(@as(u32, 1), pool.blockInfo(0).?.refcount);
     try std.testing.expectEqual(@as(u32, 1), pool.blockInfo(1).?.refcount);
 
     try manager.releaseSequence(source_id);
+    try std.testing.expectEqual(@as(usize, 0), manager.activeSequenceCount());
     try std.testing.expectEqual(@as(u32, 0), pool.blockInfo(0).?.refcount);
     try std.testing.expectEqual(@as(u32, 0), pool.blockInfo(1).?.refcount);
 }

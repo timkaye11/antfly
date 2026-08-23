@@ -1,0 +1,55 @@
+{
+  "schema_version": "antfly_gemma4_dpo_benchmark_case/v1",
+  "name": "gemma4-e2b-one-token-preference-seq128",
+  "model_key": "gemma-4-E2B-it",
+  "target_preset": "peft-qv",
+  "sequence_length": 128,
+  "beta": 0.1,
+  "learning_rate": 0.0001,
+  "optimizer": {
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "epsilon": 1e-8,
+    "weight_decay": 0.01,
+    "max_grad_norm": 1.0
+  },
+  "protocol": {
+    "cold": 1,
+    "first": 1,
+    "warmup": 3,
+    "measured": 20
+  },
+  "rendered_prompt": "<bos><|turn>user\nAnswer with one word: yes or no?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+  "prompt_token_ids": [
+    2,
+    105,
+    2364,
+    107,
+    7925,
+    607,
+    886,
+    3658,
+    236787,
+    11262,
+    653,
+    951,
+    236881,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    100,
+    45518,
+    107,
+    101
+  ],
+  "chosen": {
+    "text": "yes",
+    "token_ids": [4443]
+  },
+  "rejected": {
+    "text": "no",
+    "token_ids": [1904]
+  }
+}

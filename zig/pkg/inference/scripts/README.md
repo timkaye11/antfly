@@ -5,6 +5,105 @@ points. The model documentation owns the detailed commands and acceptance
 criteria. This index identifies the small set of scripts an operator normally
 starts with.
 
+## Gemma4 Metal interrupted/resumed acceptance
+
+`qualify_gemma4_metal_resume.py` runs a real strict-Metal Gemma4 LoRA job
+uninterrupted, kills an identical job immediately after a durable epoch-boundary
+checkpoint, resumes it in a fresh output directory, and publishes a PASS only
+when the final adapter is byte-identical and the post-resume optimizer trajectory
+matches with zero native/interpreter fallback. The output root must not already
+exist.
+
+```bash
+python3 zig/pkg/inference/scripts/qualify_gemma4_metal_resume.py \
+  --binary zig/zig-out/bin/antfly \
+  --model /path/to/gemma4-model \
+  --adapter /path/to/seed-adapter \
+  --train-prepared /path/to/train-prepared.json \
+  --eval-prepared /path/to/eval-prepared.json \
+  --output-dir /path/to/new/qualification-root
+```
+
+`--model` may also be one pinned decoder `.gguf` file. That research lane must
+be admitted explicitly with `--experimental-gguf-qlora`; the harness then
+binds `ANTFLY_EXPERIMENTAL_GEMMA4_GGUF_QLORA=1` into the reported contract,
+hashes and snapshots the GGUF as an immutable input, and accepts the absence of
+standalone tokenizer sidecars only when both final adapter bundles omit them.
+
+`qualify_gemma4_preference_resume.py` is the DPO/GRPO counterpart. It runs one
+uninterrupted job, sends SIGTERM to a second process only after its
+content-addressed epoch sidecar and checkpoint are durable, and resumes that
+checkpoint in a third immutable root. A PASS requires byte-identical final
+checkpoint and adapter trees, exact training and discrete evaluation traces,
+and only the documented narrow terminal Metal GRPO KL tolerances. Use
+`--direct-gguf-training` for the explicitly experimental canonical E2B GGUF
+lane. Use `--incremental-kv`, `--incremental-kv-clone-prompt-tail`, and
+`--incremental-kv-shadow-exact` for the SafeTensors paged sampler. Direct GGUF
+plus incremental KV is intentionally rejected because that composition has not
+preserved the canonical token trajectory.
+
+Both preference qualifiers load
+`../src/finetune/gemma4_preference_environment.policy`, remove every inherited
+`TERMITE_*` and `ANTFLY_GEMMA4_*` override, install only its strict Metal
+bindings, and record the policy SHA-256 plus sanitizer contract. The product
+binary embeds the same policy and rejects unreviewed semantic/debug controls
+during recipe planning, before any run manifest or report can be created.
+
+`qualify_gemma4_preference_quality_campaign.py` runs a minimum three-seed,
+minimum four-epoch DPO or GRPO quality gate through the public recipe CLI. Each
+typed seed also selects a deterministic permutation of the same immutable
+training-row multiset; every run must complete the exact optimizer horizon,
+change the adapter, publish a distinct final adapter digest, and pass held-out
+floors. The seed adapter is fixed across runs, so this proves RNG/data-order
+robustness rather than independent-initialization coverage. Its output root
+must not already exist. The campaign fails fast at the first seed that misses a
+floor, preserves that run's immutable artifacts and a `status = "fail"`
+campaign report, and does not run later seeds. A failed predeclared floor is
+negative evidence; do not weaken it after observing the result.
+
+`materialize_gemma4_grpo_boolq.py` converts pinned Google BoolQ Parquet train
+and validation files into balanced, disjoint `text-grpo` JSONL artifacts. It
+rejects prompt truncation, binds the full dataset revision and file hashes,
+opens Gemma4's `final` response channel, verifies that the `yes`/`no` target is
+exactly one token, admits an explicit 1-32-token rollout budget, and records the
+exact tokenizer and materializer identities for a replayable real-data GRPO
+campaign.
+
+`run_gemma4_grpo_boolq_mlx_parity.py` consumes that manifest plus a completed
+Antfly acceptance root and runs an offline, provenance-locked MLX comparison.
+It separates exact Antfly trace replay from native MLX rollout, checks
+candidate/reward behavior independently from optimizer-level numerical drift,
+and requires the batched scorer's policy-first/frozen-reference execution
+order when the acceptance advertises that mode.
+
+`run_gemma4_grpo_boolq_mlx_multitoken.py` is the stricter multi-token E2B/E4B
+campaign runner. It accepts the qualified GRPO v4/v2 reports and the newer
+v5/v3 reports carrying incremental-KV telemetry, requires a complete
+KL-control trace, replays Antfly's exact completions in one MLX lane, and runs
+an independent deterministic MLX rollout in another. Every divergent candidate
+is sampled, scored, and differentiated at physical batch size one, then
+token-normalized gradients are accumulated, clipped once, and applied as one
+group update. A `1e-4` sampling/rescore gate and raw-K3 `train_max_kl` budget
+fail before accepting a result. Its output always keeps broad GRPO performance
+parity and long-horizon quality parity outside the claim boundary.
+
+`validate_gemma4_grpo_incremental_kv_parity.py` compares one completed
+incremental-KV campaign with its qualified full-prefix baseline. It requires
+exact train/eval reward-trace, KL-control-trace, and final-adapter hashes plus
+one canonical prompt prefill per group, nonzero paged reuse, device-resident
+ranked selection, exact completion rescoring, and zero host-logit fallbacks.
+The output path must not already exist.
+
+The segmented prompt-tail clone lane uses the same validator and exact artifact
+gate. `ANTFLY_GEMMA4_GRPO_BATCH_MULTI_TOKEN_BACKWARD=1` is a separate,
+default-off research control; optionally cap it with
+`ANTFLY_GEMMA4_GRPO_MULTI_TOKEN_BACKWARD_MAX_BATCH`. Reports identify the
+physical batch size and physical micro-batches per group. Do not use this lane
+for release evidence: bounded E2B/E4B probes reduced backward time but failed
+the byte-identical adapter and peak-memory promotion gates. See
+`../docs/finetuning/GEMMA4.md` for the retained artifacts and the
+segment-aware/ragged-attention follow-up.
+
 ## GLiNER2 fine-tuning
 
 Primary entry points:

@@ -647,6 +647,159 @@ pub const MetalKvStorage = struct {
         );
     }
 
+    fn cloneSequenceTail(
+        ctx: *anyopaque,
+        clone: storage_runtime.DeviceKvSequenceTailClone,
+    ) anyerror!void {
+        const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        const page_size: usize = clone.page_size_tokens;
+        if (page_size == 0 or page_size != self.page_size_tokens) return error.InvalidKvShape;
+        if (clone.tail_token_count == 0 or clone.tail_token_count >= page_size) return error.InvalidKvShape;
+        if (clone.total_token_count <= clone.tail_token_count) return error.InvalidKvShape;
+        const aligned_prefix_tokens = clone.total_token_count - clone.tail_token_count;
+        if (aligned_prefix_tokens % page_size != 0) return error.InvalidKvShape;
+        const expected_blocks = std.math.divCeil(usize, clone.total_token_count, page_size) catch return error.InvalidKvShape;
+        if (clone.source_logical_blocks.len != expected_blocks or clone.destination_logical_blocks.len != expected_blocks) {
+            return error.InvalidKvShape;
+        }
+        const tail_block_index = expected_blocks - 1;
+        const source_tail_block = clone.source_logical_blocks[tail_block_index];
+        const destination_tail_block = clone.destination_logical_blocks[tail_block_index];
+        if (source_tail_block == destination_tail_block) return error.InvalidPagedKvState;
+
+        const value_element_bytes: usize = if (self.format == .f16) @sizeOf(u16) else @sizeOf(f32);
+        const source_tail_start = std.math.mul(usize, @as(usize, source_tail_block), page_size) catch return error.KvCapacityTooSmall;
+        const destination_tail_start = std.math.mul(usize, @as(usize, destination_tail_block), page_size) catch return error.KvCapacityTooSmall;
+        const source_capacity = std.math.add(usize, source_tail_start, page_size) catch return error.KvCapacityTooSmall;
+        const destination_capacity = std.math.add(usize, destination_tail_start, page_size) catch return error.KvCapacityTooSmall;
+        const required_capacity = @max(source_capacity, destination_capacity);
+
+        const source_layers = try self.allocator.alloc(u32, clone.num_layers_packed);
+        defer self.allocator.free(source_layers);
+        var source_layer_count: usize = 0;
+        var binding_iterator = self.slot_map.iterator();
+        while (binding_iterator.next()) |entry| {
+            if (entry.key_ptr.sequence_id != clone.source_sequence_id) continue;
+            if (entry.key_ptr.layer_index >= clone.num_layers_packed or source_layer_count >= source_layers.len) {
+                return error.InvalidLayerIndex;
+            }
+            source_layers[source_layer_count] = entry.key_ptr.layer_index;
+            source_layer_count += 1;
+        }
+        if (source_layer_count == 0) return error.DeviceReadFallback;
+
+        for (source_layers[0..source_layer_count]) |layer_index| {
+            const source_key = SlotKey{
+                .sequence_id = clone.source_sequence_id,
+                .layer_index = layer_index,
+            };
+            const source_binding = self.slot_map.get(source_key) orelse return error.DeviceReadFallback;
+            if (source_binding.ring_page_count != 0 or source_binding.ownsSlot()) return error.DeviceReadFallback;
+            if (!source_binding.covers(clone.total_token_count)) return error.DeviceReadFallback;
+            const source_info = try self.slotInfo(source_binding.slot);
+            const key_row_bytes = source_info.key_row_bytes;
+            const value_row_stride = source_info.v_row_stride;
+            if (key_row_bytes == 0 or value_row_stride == 0) return error.InvalidKvShape;
+            const key_bytes = std.math.mul(usize, clone.tail_token_count, key_row_bytes) catch return error.KvCapacityTooSmall;
+            const value_row_bytes = std.math.mul(usize, value_row_stride, value_element_bytes) catch return error.KvCapacityTooSmall;
+            const value_bytes = std.math.mul(usize, clone.tail_token_count, value_row_bytes) catch return error.KvCapacityTooSmall;
+
+            const destination_binding = try self.acquireBinding(
+                .{
+                    .sequence_id = clone.destination_sequence_id,
+                    .layer_index = layer_index,
+                },
+                0,
+                true,
+            );
+            if (destination_binding.slot != source_binding.slot or destination_binding.ownsSlot()) return error.DeviceWriteFallback;
+            if (traceKvGather()) std.debug.print(
+                "kv-clone: src_seq={d} dst_seq={d} layer={d} slot={d} src_block={d} dst_block={d} tail={d} written={d} current_capacity={d} required_capacity={d} key_row_bytes={d} value_row_stride={d}\n",
+                .{
+                    clone.source_sequence_id,
+                    clone.destination_sequence_id,
+                    layer_index,
+                    destination_binding.slot,
+                    source_tail_block,
+                    destination_tail_block,
+                    clone.tail_token_count,
+                    source_binding.written_tokens,
+                    self.slot_buffer_capacity_tokens[destination_binding.slot],
+                    required_capacity,
+                    key_row_bytes,
+                    value_row_stride,
+                },
+            );
+            try self.reserveSlotCapacity(
+                destination_binding.slot,
+                required_capacity,
+                page_size,
+                0,
+                key_row_bytes,
+                value_row_stride,
+            );
+            const info = try self.slotInfo(destination_binding.slot);
+            if (info.key_row_bytes != key_row_bytes or info.v_row_stride != value_row_stride) return error.DeviceWriteFallback;
+            const key_handle = info.encoded_key_handle orelse return error.DeviceWriteFallback;
+            const value_handle = info.v_handle orelse return error.DeviceWriteFallback;
+            const source_key_offset = std.math.mul(usize, source_tail_start, key_row_bytes) catch return error.KvCapacityTooSmall;
+            const destination_key_offset = std.math.mul(usize, destination_tail_start, key_row_bytes) catch return error.KvCapacityTooSmall;
+            const source_value_offset = std.math.mul(usize, source_tail_start, value_row_bytes) catch return error.KvCapacityTooSmall;
+            const destination_value_offset = std.math.mul(usize, destination_tail_start, value_row_bytes) catch return error.KvCapacityTooSmall;
+            const copy_rc = metal_runtime.termite_metal_buffer_copy_pair(
+                self.runtime,
+                key_handle,
+                source_key_offset,
+                key_handle,
+                destination_key_offset,
+                key_bytes,
+                value_handle,
+                source_value_offset,
+                value_handle,
+                destination_value_offset,
+                value_bytes,
+            );
+            if (copy_rc != 0) {
+                if (traceKvGather()) std.debug.print(
+                    "kv-clone-failed: src_seq={d} dst_seq={d} layer={d} rc={d} key_capacity={d} value_capacity={d} src_key_offset={d} dst_key_offset={d} key_bytes={d} src_value_offset={d} dst_value_offset={d} value_bytes={d}\n",
+                    .{
+                        clone.source_sequence_id,
+                        clone.destination_sequence_id,
+                        layer_index,
+                        copy_rc,
+                        info.encoded_key_capacity,
+                        info.v_capacity,
+                        source_key_offset,
+                        destination_key_offset,
+                        key_bytes,
+                        source_value_offset,
+                        destination_value_offset,
+                        value_bytes,
+                    },
+                );
+                return error.DeviceWriteFallback;
+            }
+
+            destination_binding.physical_base_tokens = std.math.mul(
+                usize,
+                @as(usize, clone.destination_logical_blocks[0]),
+                page_size,
+            ) catch return error.KvCapacityTooSmall;
+            destination_binding.logical_contiguous = true;
+            for (clone.destination_logical_blocks, 0..) |block_id, block_index| {
+                const block_start = std.math.mul(usize, @as(usize, block_id), page_size) catch return error.KvCapacityTooSmall;
+                const expected_delta = std.math.mul(usize, block_index, page_size) catch return error.KvCapacityTooSmall;
+                const expected = std.math.add(usize, destination_binding.physical_base_tokens, expected_delta) catch return error.KvCapacityTooSmall;
+                if (block_start != expected) {
+                    destination_binding.logical_contiguous = false;
+                    break;
+                }
+            }
+            destination_binding.written_tokens = clone.total_token_count;
+            destination_binding.position_offset = source_binding.position_offset;
+        }
+    }
+
     fn commitLayerKvDeviceWrite(
         ctx: *anyopaque,
         commit: storage_runtime.DeviceKvLayerWriteCommit,
@@ -972,6 +1125,7 @@ const hook_vtable: storage_runtime.DeviceWriteHook.VTable = .{
     .pagedLayerKvDevice = MetalKvStorage.pagedLayerKvDevice,
     .reserveLayerKvDevice = MetalKvStorage.reserveLayerKvDevice,
     .commitLayerKvDeviceWrite = MetalKvStorage.commitLayerKvDeviceWrite,
+    .cloneSequenceTail = MetalKvStorage.cloneSequenceTail,
     .truncateSequence = MetalKvStorage.truncateSequenceOp,
     .releaseSequence = MetalKvStorage.releaseSequenceOp,
     .deinit = MetalKvStorage.hookDeinit,
@@ -1084,7 +1238,9 @@ test "Metal paged KV keeps layer-global pages across source sequence release" {
         .backend = .metal,
         .dtype = .f32,
         .page_size_tokens = 2,
-        .num_layers_packed = 2,
+        // Layer 2 intentionally has no binding, matching shared-KV Gemma
+        // layers that reuse another layer's materialized cache.
+        .num_layers_packed = 3,
         .num_kv_heads = 1,
         .head_dim = 2,
     });
@@ -1165,4 +1321,238 @@ test "Metal paged KV keeps layer-global pages across source sequence release" {
         try std.testing.expectEqualSlices(f32, &expected_v, gathered.v);
     }
     try storage.releaseSequence(derived_id);
+}
+
+test "Metal paged KV clones private prompt tails for every destination in one frame" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const runtime = metal_runtime.termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_decode_runtime_destroy(runtime);
+    if (metal_runtime.termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+
+    var storage = try storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = .metal,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        // Deliberately leave one configured layer without a materialized
+        // source binding. Hybrid/shared-KV graphs do not necessarily publish
+        // a distinct binding for every packed layer.
+        .num_layers_packed = 3,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    });
+    defer storage.deinit();
+    const metal_storage = try MetalKvStorage.create(allocator, runtime, .f32, 1, 2, 2);
+    storage.setDeviceWriteHook(metal_storage.deviceWriteHook());
+
+    const prompt_bytes = 6 * @sizeOf(f32);
+    const k_handle = metal_runtime.termite_metal_buffer_alloc(runtime, prompt_bytes, 0) orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_buffer_release(k_handle);
+    const v_handle = metal_runtime.termite_metal_buffer_alloc(runtime, prompt_bytes, 0) orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_buffer_release(v_handle);
+
+    const source_id = try storage.attachSequence(storage.poolId());
+    try storage.appendTokens(source_id, 3);
+    const source_layers = [_]struct { k: [6]f32, v: [6]f32 }{
+        .{ .k = .{ 1, 2, 3, 4, 5, 6 }, .v = .{ 11, 12, 13, 14, 15, 16 } },
+        .{ .k = .{ 21, 22, 23, 24, 25, 26 }, .v = .{ 31, 32, 33, 34, 35, 36 } },
+    };
+    for (source_layers, 0..) |layer, layer_index| {
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(runtime, k_handle, 0, &layer.k, prompt_bytes));
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(runtime, v_handle, 0, &layer.v, prompt_bytes));
+        try storage.writeLayerKvSuffixDevice(.{
+            .sequence_id = source_id,
+            .layer_index = layer_index,
+            .total_token_count = 3,
+            .suffix_token_count = 3,
+            .position_offset = 0,
+            .num_kv_heads = 1,
+            .head_dim = 2,
+        }, .{ .handle = k_handle, .byte_offset = 0, .byte_len = prompt_bytes }, .{ .handle = v_handle, .byte_offset = 0, .byte_len = prompt_bytes });
+    }
+
+    var retained: std.ArrayListUnmanaged(block.KvBlockId) = .empty;
+    defer retained.deinit(allocator);
+    try storage.retainSequencePrefixBlocks(source_id, 2, &retained);
+    var destination_ids: [3]storage_runtime.SequenceId = undefined;
+    for (&destination_ids) |*destination_id| {
+        destination_id.* = try storage.attachSequenceWithRetainedBlocks(storage.poolId(), retained.items, 2);
+        try storage.appendTokens(destination_id.*, 1);
+    }
+    storage.releaseRetainedBlocks(retained.items);
+
+    // Match the GRPO sampler: all private-tail copies are encoded into one
+    // active frame, including any geometric global-slot growth they trigger.
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_begin_frame(runtime));
+    for (destination_ids) |destination_id| {
+        try storage.cloneSequenceTailDevice(source_id, destination_id, 1);
+    }
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_submit_frame(runtime));
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_wait_frame(runtime));
+
+    for (destination_ids) |destination_id| {
+        const destination_table = storage.blockTable(destination_id).?;
+        for (source_layers, 0..) |layer, layer_index| {
+            const binding = metal_storage.slot_map.get(.{
+                .sequence_id = destination_id,
+                .layer_index = @intCast(layer_index),
+            }).?;
+            const info = try metal_storage.slotInfo(binding.slot);
+            var gathered_k: [6]f32 = undefined;
+            var gathered_v: [6]f32 = undefined;
+            for (0..3) |token_index| {
+                const block_index = token_index / 2;
+                const token_offset = token_index % 2;
+                const physical_token = @as(usize, destination_table.blocks.items[block_index]) * 2 + token_offset;
+                const byte_offset = physical_token * 2 * @sizeOf(f32);
+                try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(
+                    runtime,
+                    info.encoded_key_handle,
+                    byte_offset,
+                    gathered_k[token_index * 2 ..][0..2].ptr,
+                    2 * @sizeOf(f32),
+                ));
+                try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(
+                    runtime,
+                    info.v_handle,
+                    byte_offset,
+                    gathered_v[token_index * 2 ..][0..2].ptr,
+                    2 * @sizeOf(f32),
+                ));
+            }
+            try std.testing.expectEqualSlices(f32, &layer.k, &gathered_k);
+            try std.testing.expectEqualSlices(f32, &layer.v, &gathered_v);
+        }
+        try storage.releaseSequence(destination_id);
+    }
+
+    try storage.releaseSequence(source_id);
+}
+
+test "Metal paged KV clone uses materialized Gemma4 E2B layer geometry" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const runtime = metal_runtime.termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_decode_runtime_destroy(runtime);
+    if (metal_runtime.termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+
+    const layer_count: usize = 15;
+    const token_count: usize = 109;
+    const shared_tokens: usize = 96;
+    const tail_tokens: usize = token_count - shared_tokens;
+    const row_width: usize = 256;
+    const page_size: u16 = 16;
+    var storage = try storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = .metal,
+        .dtype = .f32,
+        .page_size_tokens = page_size,
+        .num_layers_packed = @intCast(layer_count),
+        .num_kv_heads = 1,
+        // Gemma4 advertises the wider global-attention geometry at the pool
+        // level while most materialized sliding layers use 256-wide rows.
+        .head_dim = 512,
+    });
+    defer storage.deinit();
+    const metal_storage = try MetalKvStorage.create(allocator, runtime, .f32, 1, 512, page_size);
+    storage.setDeviceWriteHook(metal_storage.deviceWriteHook());
+
+    const row_count = token_count * row_width;
+    const prompt_bytes = row_count * @sizeOf(f32);
+    const k_values = try allocator.alloc(f32, row_count);
+    defer allocator.free(k_values);
+    const v_values = try allocator.alloc(f32, row_count);
+    defer allocator.free(v_values);
+    const k_handle = metal_runtime.termite_metal_buffer_alloc(runtime, prompt_bytes, 0) orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_buffer_release(k_handle);
+    const v_handle = metal_runtime.termite_metal_buffer_alloc(runtime, prompt_bytes, 0) orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_buffer_release(v_handle);
+
+    const source_id = try storage.attachSequence(storage.poolId());
+    try storage.appendTokens(source_id, token_count);
+    for (0..layer_count) |layer_index| {
+        for (k_values, v_values, 0..) |*k, *v, element_index| {
+            const marker: u32 = @intCast(layer_index * row_count + element_index);
+            k.* = @floatFromInt(marker);
+            v.* = -@as(f32, @floatFromInt(marker + 1));
+        }
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(runtime, k_handle, 0, k_values.ptr, prompt_bytes));
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(runtime, v_handle, 0, v_values.ptr, prompt_bytes));
+        try storage.writeLayerKvSuffixDevice(.{
+            .sequence_id = source_id,
+            .layer_index = layer_index,
+            .total_token_count = token_count,
+            .suffix_token_count = token_count,
+            .position_offset = 0,
+            .num_kv_heads = 1,
+            .head_dim = @intCast(row_width),
+        }, .{ .handle = k_handle, .byte_offset = 0, .byte_len = prompt_bytes }, .{ .handle = v_handle, .byte_offset = 0, .byte_len = prompt_bytes });
+    }
+
+    var retained: std.ArrayListUnmanaged(block.KvBlockId) = .empty;
+    defer retained.deinit(allocator);
+    try storage.retainSequencePrefixBlocks(source_id, shared_tokens, &retained);
+    var destination_ids: [3]storage_runtime.SequenceId = undefined;
+    for (&destination_ids) |*destination_id| {
+        destination_id.* = try storage.attachSequenceWithRetainedBlocks(storage.poolId(), retained.items, shared_tokens);
+        try storage.appendTokens(destination_id.*, tail_tokens);
+    }
+    storage.releaseRetainedBlocks(retained.items);
+
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_begin_frame(runtime));
+    for (destination_ids) |destination_id| {
+        try storage.cloneSequenceTailDevice(source_id, destination_id, tail_tokens);
+    }
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_submit_frame(runtime));
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_wait_frame(runtime));
+
+    // The production fan-out source is itself a non-contiguous candidate
+    // sequence, not the canonical contiguous prompt. Exercise that second-hop
+    // source explicitly with a fresh destination binding.
+    try storage.retainSequencePrefixBlocks(source_id, shared_tokens, &retained);
+    const fanout_id = try storage.attachSequenceWithRetainedBlocks(storage.poolId(), retained.items, shared_tokens);
+    storage.releaseRetainedBlocks(retained.items);
+    try storage.appendTokens(fanout_id, tail_tokens);
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_begin_frame(runtime));
+    try storage.cloneSequenceTailDevice(destination_ids[0], fanout_id, tail_tokens);
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_submit_frame(runtime));
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_wait_frame(runtime));
+
+    const tail_elems = tail_tokens * row_width;
+    const tail_bytes = tail_elems * @sizeOf(f32);
+    const gathered_k = try allocator.alloc(f32, tail_elems);
+    defer allocator.free(gathered_k);
+    const gathered_v = try allocator.alloc(f32, tail_elems);
+    defer allocator.free(gathered_v);
+    const expected_k = try allocator.alloc(f32, tail_elems);
+    defer allocator.free(expected_k);
+    const expected_v = try allocator.alloc(f32, tail_elems);
+    defer allocator.free(expected_v);
+    for (destination_ids) |destination_id| {
+        const destination_table = storage.blockTable(destination_id).?;
+        const destination_tail_block = destination_table.blocks.items[destination_table.blocks.items.len - 1];
+        const byte_offset = @as(usize, destination_tail_block) * @as(usize, page_size) * row_width * @sizeOf(f32);
+        for (0..layer_count) |layer_index| {
+            for (expected_k, expected_v, 0..) |*k, *v, element_index| {
+                const marker: u32 = @intCast(layer_index * row_count + shared_tokens * row_width + element_index);
+                k.* = @floatFromInt(marker);
+                v.* = -@as(f32, @floatFromInt(marker + 1));
+            }
+            const binding = metal_storage.slot_map.get(.{
+                .sequence_id = destination_id,
+                .layer_index = @intCast(layer_index),
+            }).?;
+            const info = try metal_storage.slotInfo(binding.slot);
+            try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(runtime, info.encoded_key_handle, byte_offset, gathered_k.ptr, tail_bytes));
+            try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(runtime, info.v_handle, byte_offset, gathered_v.ptr, tail_bytes));
+            try std.testing.expectEqualSlices(f32, expected_k, gathered_k);
+            try std.testing.expectEqualSlices(f32, expected_v, gathered_v);
+        }
+        try storage.releaseSequence(destination_id);
+    }
+    try storage.releaseSequence(fanout_id);
+    try storage.releaseSequence(source_id);
 }

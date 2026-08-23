@@ -332,6 +332,54 @@ fn evalNode(
                 return out;
             }
 
+            // 4D attention matmul: batch/head axes 0 and 1, with one
+            // free and one contracting axis in the final two positions.
+            if (a_shape.rank() == 4 and b_shape.rank() == 4 and attrs.num_batch == 2 and attrs.num_contracting == 1 and
+                attrs.lhs_batch[0] == 0 and attrs.lhs_batch[1] == 1 and
+                attrs.rhs_batch[0] == 0 and attrs.rhs_batch[1] == 1)
+            {
+                const lc = attrs.lhs_contracting[0];
+                const rc = attrs.rhs_contracting[0];
+                if ((lc == 2 or lc == 3) and (rc == 2 or rc == 3)) {
+                    const batch0: usize = @intCast(a_shape.dim(0));
+                    const batch1: usize = @intCast(a_shape.dim(1));
+                    const contract: usize = @intCast(a_shape.dim(lc));
+                    const m: usize = @intCast(a_shape.dim(if (lc == 2) 3 else 2));
+                    const nn: usize = @intCast(b_shape.dim(if (rc == 2) 3 else 2));
+                    const a_d2: usize = @intCast(a_shape.dim(2));
+                    const a_d3: usize = @intCast(a_shape.dim(3));
+                    const b_d2: usize = @intCast(b_shape.dim(2));
+                    const b_d3: usize = @intCast(b_shape.dim(3));
+                    const out = try allocator.alloc(f32, batch0 * batch1 * m * nn);
+                    @memset(out, 0);
+                    for (0..batch0) |b0| {
+                        for (0..batch1) |b1| {
+                            const a_batch_base = (b0 * batch1 + b1) * a_d2 * a_d3;
+                            const b_batch_base = (b0 * batch1 + b1) * b_d2 * b_d3;
+                            const out_batch_base = (b0 * batch1 + b1) * m * nn;
+                            for (0..m) |mi| {
+                                for (0..nn) |ni| {
+                                    var sum: f32 = 0;
+                                    for (0..contract) |ki| {
+                                        const a_idx = a_batch_base + if (lc == 3)
+                                            mi * a_d3 + ki
+                                        else
+                                            ki * a_d3 + mi;
+                                        const b_idx = b_batch_base + if (rc == 2)
+                                            ki * b_d3 + ni
+                                        else
+                                            ni * b_d3 + ki;
+                                        sum += a[a_idx] * b[b_idx];
+                                    }
+                                    out[out_batch_base + mi * nn + ni] = sum;
+                                }
+                            }
+                        }
+                    }
+                    return out;
+                }
+            }
+
             // 2D matmul (no batch dims).
             if (a_shape.rank() != 2 or b_shape.rank() != 2) {
                 const out = try allocator.alloc(f32, out_elems);
@@ -446,6 +494,28 @@ fn evalNode(
             return out;
         },
 
+        .fused_linear_cross_entropy_loss => |attrs| {
+            return evalLinearCrossEntropy(
+                allocator,
+                getVal(node_vals, ins[0]),
+                getVal(node_vals, ins[1]),
+                getVal(node_vals, ins[2]),
+                null,
+                attrs,
+            );
+        },
+
+        .fused_linear_cross_entropy_backward => |attrs| {
+            return evalLinearCrossEntropy(
+                allocator,
+                getVal(node_vals, ins[0]),
+                getVal(node_vals, ins[1]),
+                getVal(node_vals, ins[2]),
+                scalarVal(node_vals, ins[3]),
+                attrs,
+            );
+        },
+
         .fused_rope => |attrs| {
             // Half-split rotation used by the builder/autodiff.
             //   input shape: [..., seq, head_dim]
@@ -504,6 +574,101 @@ fn evalNode(
             return out;
         },
     }
+}
+
+/// Reference semantics for the graph-native frozen-head linear CE ops. This
+/// intentionally recomputes logits in backward, matching the memory-bounded
+/// backend contract instead of retaining a [rows, vocab] activation.
+fn evalLinearCrossEntropy(
+    allocator: std.mem.Allocator,
+    hidden: []const f32,
+    weight: []const f32,
+    labels: []const f32,
+    upstream: ?f32,
+    attrs: node_mod.LinearCrossEntropyAttrs,
+) ![]f32 {
+    if (!attrs.frozen_weight) return error.LinearCrossEntropyRequiresFrozenWeight;
+    const rows: usize = attrs.rows;
+    const in_dim: usize = attrs.in_dim;
+    const vocab_size: usize = attrs.vocab_size;
+    if (hidden.len != rows * in_dim or weight.len != vocab_size * in_dim or labels.len != rows) return error.ShapeMismatch;
+
+    var valid_rows: usize = 0;
+    for (labels) |raw_label| {
+        const label = try indexValue(raw_label);
+        if (label == attrs.ignore_index) continue;
+        if (label < 0 or label >= vocab_size) return error.LabelOutOfRange;
+        valid_rows += 1;
+    }
+    const normalizer: f32 = if (valid_rows == 0) 1.0 else @floatFromInt(valid_rows);
+
+    if (upstream) |adj| {
+        const grad_hidden = try allocator.alloc(f32, hidden.len);
+        @memset(grad_hidden, 0.0);
+        if (valid_rows == 0) return grad_hidden;
+
+        const logits = try allocator.alloc(f32, vocab_size);
+        defer allocator.free(logits);
+        const raw_logits = try allocator.alloc(f32, vocab_size);
+        defer allocator.free(raw_logits);
+        for (0..rows) |row| {
+            const label = try indexValue(labels[row]);
+            if (label == attrs.ignore_index) continue;
+            var max_logit = -std.math.inf(f32);
+            for (0..vocab_size) |vocab| {
+                var raw: f32 = 0.0;
+                for (0..in_dim) |d| raw += hidden[row * in_dim + d] * weight[vocab * in_dim + d];
+                raw_logits[vocab] = raw;
+                const logit = if (attrs.logit_softcap > 0.0)
+                    attrs.logit_softcap * std.math.tanh(raw / attrs.logit_softcap)
+                else
+                    raw;
+                logits[vocab] = logit;
+                max_logit = @max(max_logit, logit);
+            }
+            var sum_exp: f32 = 0.0;
+            for (logits) |logit| sum_exp += @exp(logit - max_logit);
+            const scale = adj / normalizer;
+            for (0..vocab_size) |vocab| {
+                var d_logit = @exp(logits[vocab] - max_logit) / sum_exp;
+                if (vocab == label) d_logit -= 1.0;
+                if (attrs.logit_softcap > 0.0) {
+                    const t = std.math.tanh(raw_logits[vocab] / attrs.logit_softcap);
+                    d_logit *= 1.0 - t * t;
+                }
+                for (0..in_dim) |d| {
+                    grad_hidden[row * in_dim + d] += scale * d_logit * weight[vocab * in_dim + d];
+                }
+            }
+        }
+        return grad_hidden;
+    }
+
+    const result = try allocator.alloc(f32, 1);
+    result[0] = 0.0;
+    if (valid_rows == 0) return result;
+    const logits = try allocator.alloc(f32, vocab_size);
+    defer allocator.free(logits);
+    for (0..rows) |row| {
+        const label = try indexValue(labels[row]);
+        if (label == attrs.ignore_index) continue;
+        var max_logit = -std.math.inf(f32);
+        for (0..vocab_size) |vocab| {
+            var raw: f32 = 0.0;
+            for (0..in_dim) |d| raw += hidden[row * in_dim + d] * weight[vocab * in_dim + d];
+            const logit = if (attrs.logit_softcap > 0.0)
+                attrs.logit_softcap * std.math.tanh(raw / attrs.logit_softcap)
+            else
+                raw;
+            logits[vocab] = logit;
+            max_logit = @max(max_logit, logit);
+        }
+        var sum_exp: f32 = 0.0;
+        for (logits) |logit| sum_exp += @exp(logit - max_logit);
+        result[0] += max_logit + @log(sum_exp) - logits[@intCast(label)];
+    }
+    result[0] /= normalizer;
+    return result;
 }
 
 // ── gather / scatter_add reference semantics ──────────────────────────
@@ -1078,6 +1243,93 @@ test "grad_check cross_entropy_loss" {
     try std.testing.expect(max_err < tolerance);
 }
 
+test "fused frozen linear cross entropy matches dense loss and d_hidden" {
+    const allocator = std.testing.allocator;
+    const rows = 3;
+    const in_dim = 2;
+    const vocab_size = 3;
+    const softcap: f32 = 2.5;
+    const p_hidden = [_]f32{ 0.2, -0.4, 1.1, 0.3, -0.7, 0.8 };
+    const p_weight = [_]f32{ 0.5, -0.2, -0.3, 0.9, 0.7, 0.1 };
+    const sparse_labels = [_]f32{ 1.0, -100.0, 0.0 };
+    const dense_targets = [_]f32{
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0,
+        1.0, 0.0, 0.0,
+    };
+
+    var fused_graph = Graph.init(allocator);
+    defer fused_graph.deinit();
+    var fused_builder = Builder.init(&fused_graph);
+    const fused_hidden = try fused_builder.parameter("hidden", Shape.init(.f32, &.{ rows, in_dim }));
+    const fused_weight = try fused_builder.parameter("weight", Shape.init(.f32, &.{ vocab_size, in_dim }));
+    const fused_labels = try fused_builder.tensorConst(&sparse_labels, Shape.init(.f32, &.{ rows, 1 }));
+    const fused_loss = try fused_builder.linearCrossEntropyLoss(fused_hidden, fused_weight, fused_labels, .{
+        .rows = rows,
+        .in_dim = in_dim,
+        .vocab_size = vocab_size,
+        .logit_softcap = softcap,
+        .ignore_index = -100,
+        .frozen_weight = true,
+    });
+    try fused_graph.markOutput(fused_loss);
+    var fused_grad = try autodiff_mod.gradient(allocator, &fused_graph, fused_loss, &.{fused_hidden});
+    defer fused_grad.deinit();
+    try fused_grad.graph.outputs.append(allocator, fused_grad.param_grads[0]);
+    var fused_eval = try eval(allocator, &fused_grad.graph, &.{ &p_hidden, &p_weight });
+    defer fused_eval.deinit();
+
+    var dense_graph = Graph.init(allocator);
+    defer dense_graph.deinit();
+    var dense_builder = Builder.init(&dense_graph);
+    const dense_hidden = try dense_builder.parameter("hidden", Shape.init(.f32, &.{ rows, in_dim }));
+    const dense_weight = try dense_builder.parameter("weight", Shape.init(.f32, &.{ vocab_size, in_dim }));
+    const targets = try dense_builder.tensorConst(&dense_targets, Shape.init(.f32, &.{ rows, vocab_size }));
+    const raw_logits = try dense_builder.linearNoBias(dense_hidden, dense_weight, rows, in_dim, vocab_size);
+    const cap = try dense_builder.scalarConst(.f32, softcap);
+    const logits = try dense_builder.mul(try dense_builder.tanhOp(try dense_builder.div(raw_logits, cap)), cap);
+    const dense_mean_all_rows = try dense_builder.crossEntropyLoss(logits, targets);
+    const valid_rescale = try dense_builder.scalarConst(.f32, 1.5); // rows / non-ignored rows
+    const dense_loss = try dense_builder.mul(dense_mean_all_rows, valid_rescale);
+    try dense_graph.markOutput(dense_loss);
+    var dense_grad = try autodiff_mod.gradient(allocator, &dense_graph, dense_loss, &.{dense_hidden});
+    defer dense_grad.deinit();
+    try dense_grad.graph.outputs.append(allocator, dense_grad.param_grads[0]);
+    var dense_eval = try eval(allocator, &dense_grad.graph, &.{ &p_hidden, &p_weight });
+    defer dense_eval.deinit();
+
+    try std.testing.expectApproxEqAbs(dense_eval.values[0][0], fused_eval.values[0][0], 1e-5);
+    try std.testing.expectEqual(dense_eval.values[1].len, fused_eval.values[1].len);
+    for (dense_eval.values[1], fused_eval.values[1]) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 2e-5);
+    }
+}
+
+test "grad_check fused frozen linear cross entropy with ignored label" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const hidden = try b.parameter("hidden", Shape.init(.f32, &.{ 3, 2 }));
+    const weight = try b.parameter("weight", Shape.init(.f32, &.{ 3, 2 }));
+    const labels = try b.tensorConst(&[_]f32{ 1.0, -100.0, 0.0 }, Shape.init(.f32, &.{ 3, 1 }));
+    const loss = try b.linearCrossEntropyLoss(hidden, weight, labels, .{
+        .rows = 3,
+        .in_dim = 2,
+        .vocab_size = 3,
+        .logit_softcap = 2.5,
+        .ignore_index = -100,
+        .frozen_weight = true,
+    });
+    try g.markOutput(loss);
+
+    const p_hidden = [_]f32{ 0.2, -0.4, 1.1, 0.3, -0.7, 0.8 };
+    const p_weight = [_]f32{ 0.5, -0.2, -0.3, 0.9, 0.7, 0.1 };
+    const max_err = try checkGradients(allocator, &g, loss, &.{hidden}, &.{ &p_hidden, &p_weight }, 1e-3);
+    try std.testing.expect(max_err < 5e-3);
+}
+
 test "grad_check mse_loss" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
@@ -1150,6 +1402,53 @@ test "grad_check softmax @ y (batched dot)" {
     const pv = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
 
     const max_err = try checkGradients(allocator, &g, loss, &.{ x, v }, &.{ &px, &pv }, 1e-3);
+    try std.testing.expect(max_err < tolerance);
+}
+
+test "grad_check rank4 attention dots with two batch axes" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const shape = Shape.init(.f32, &.{ 1, 2, 2, 2 });
+    const q = try b.parameter("q", shape);
+    const k = try b.parameter("k", shape);
+    const v = try b.parameter("v", shape);
+    const scores = try g.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 3, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 3, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 2,
+        } },
+        .output_shape = shape,
+        .inputs = .{ q, k, null_node, null_node },
+        .num_inputs = 2,
+    });
+    const mixed = try g.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 3, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 2, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 2,
+        } },
+        .output_shape = shape,
+        .inputs = .{ scores, v, null_node, null_node },
+        .num_inputs = 2,
+    });
+    const loss = try b.reduceSum(mixed, &.{ 0, 1, 2, 3 });
+    try g.markOutput(loss);
+
+    const pq = [_]f32{ 0.1, 0.2, -0.3, 0.4, 0.5, -0.6, 0.7, 0.8 };
+    const pk = [_]f32{ 0.9, -0.2, 0.3, 0.6, -0.5, 0.4, 0.2, 0.7 };
+    const pv = [_]f32{ -0.4, 0.8, 0.5, 0.1, 0.6, -0.3, 0.9, 0.2 };
+
+    const max_err = try checkGradients(allocator, &g, loss, &.{ q, k, v }, &.{ &pq, &pk, &pv }, 1e-3);
     try std.testing.expect(max_err < tolerance);
 }
 

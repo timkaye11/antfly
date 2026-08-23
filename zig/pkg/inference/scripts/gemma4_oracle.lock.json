@@ -1,0 +1,344 @@
+{
+  "schema_version": "antfly_gemma4_oracle_lock/v3",
+  "lock_policy": {
+    "network_access": "forbidden-during-run",
+    "model_loading": "local-files-only",
+    "unknown_fields": "reject",
+    "comparison_input": "exact-antfly-input-ids-and-labels",
+    "prepared_schema": "gemma4_prepared/v6",
+    "label_ignore_index": -100,
+    "causal_label_shift": 1,
+    "loss_reduction": "sum-over-supervised-tokens-then-divide-by-supervised-token-count"
+  },
+  "models": {
+    "gemma-4-E2B-it": {
+      "repo_id": "google/gemma-4-E2B-it",
+      "revision": "3e22461f65e89153144f8adb70e3b8c2cc9845a7",
+      "architecture": "Gemma4ForConditionalGeneration",
+      "files": {
+        "chat_template.jinja": {
+          "size": 18569,
+          "git_blob_sha1": "fbe3b59b625cd1b8850ea592d4203df6ec04684b"
+        },
+        "config.json": {
+          "size": 4954,
+          "git_blob_sha1": "923b5e9405e7d319572b0c1b1a89291512262aa3"
+        },
+        "model.safetensors": {
+          "size": 10246621918,
+          "sha256": "2db5482b20d746879bb3ef79b5203e9075a2e2b98f54ec7c2f281c1477ddc550"
+        },
+        "tokenizer.json": {
+          "size": 32169626,
+          "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+        },
+        "tokenizer_config.json": {
+          "size": 3082,
+          "git_blob_sha1": "6068e357379d36f823c377e30efb101fa2c67fe4"
+        }
+      }
+    },
+    "gemma-4-E4B-it": {
+      "repo_id": "google/gemma-4-E4B-it",
+      "revision": "ee0ef6023621cff504d758262d4e04895a5af4a2",
+      "architecture": "Gemma4ForConditionalGeneration",
+      "files": {
+        "chat_template.jinja": {
+          "size": 18569,
+          "git_blob_sha1": "fbe3b59b625cd1b8850ea592d4203df6ec04684b"
+        },
+        "config.json": {
+          "size": 5145,
+          "git_blob_sha1": "d68960fdcce766f2bfe41436325a8a483a74d125"
+        },
+        "model.safetensors": {
+          "size": 15992595884,
+          "sha256": "cfbd3d2f1cd71bd471c37fe2bf8546d5028d41e5736f64e1ca6c6b8893125503"
+        },
+        "tokenizer.json": {
+          "size": 32169626,
+          "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+        },
+        "tokenizer_config.json": {
+          "size": 3082,
+          "git_blob_sha1": "6068e357379d36f823c377e30efb101fa2c67fe4"
+        }
+      }
+    }
+  },
+  "python_oracle": {
+    "python": "3.12",
+    "packages": {
+      "accelerate": "1.14.0",
+      "huggingface-hub": "1.26.0",
+      "numpy": "2.4.2",
+      "peft": "0.19.1",
+      "safetensors": "0.7.0",
+      "torch": "2.10.0",
+      "transformers": "5.5.2"
+    },
+    "source_revisions": {
+      "peft": "ba6a19060d6ab54a87538a6e77e3e4d5a907375b",
+      "transformers": "52d24b018e7aa12264b68ae2e162f9aadb26005b"
+    },
+    "execution": {
+      "attention_implementation": "eager",
+      "device": "cuda",
+      "dropout": 0.0,
+      "dtype": "bfloat16",
+      "gradient_dtype": "float32",
+      "optimizer_state_dtype": "float32",
+      "use_cache": false,
+      "deterministic_algorithms": true
+    }
+  },
+  "mlx_reference": {
+    "python": "3.12",
+    "packages": {
+      "mlx": "0.31.2",
+      "mlx-lm": "0.31.3",
+      "numpy": "2.4.2"
+    },
+    "source_revisions": {
+      "mlx": "68cf2fddd8de5edd8ab3d926391772b2e2cedad8",
+      "mlx-lm": "ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd"
+    },
+    "native_runtime": {
+      "extension_module": "mlx.core",
+      "artifact_roles": [
+        "jaccl-runtime-dylib",
+        "metal-library",
+        "python-extension",
+        "runtime-dylib"
+      ],
+      "minimum_macos_sdk_version": "26.2",
+      "build_attestation_schema_version": "antfly_mlx_native_build_attestation/v1",
+      "precision_policy_sha256": "sha256:77b05f6b6c7fe42878da859d9b883cd39fccb373ac9e665c8fd07572ffbd2595"
+    },
+    "role": "same-mac-performance-reference-only",
+    "minimum_fresh_processes": 5,
+    "warmup_steps": 3,
+    "measured_steps": 20,
+    "required_platform": "Darwin",
+    "required_machine": "arm64"
+  },
+  "target_presets": {
+    "peft-qv": [
+      "q_proj",
+      "v_proj"
+    ],
+    "text-all-linear": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj",
+      "per_layer_input.inp_gate",
+      "per_layer_input.proj",
+      "per_layer_input.per_layer_model_proj"
+    ]
+  },
+  "target_inventory": {
+    "gemma-4-E2B-it": {
+      "peft-qv": {
+        "q_proj": 35,
+        "v_proj": 15
+      },
+      "text-all-linear": {
+        "q_proj": 35,
+        "k_proj": 15,
+        "v_proj": 15,
+        "o_proj": 35,
+        "gate_proj": 35,
+        "up_proj": 35,
+        "down_proj": 35,
+        "per_layer_input.inp_gate": 35,
+        "per_layer_input.proj": 35,
+        "per_layer_input.per_layer_model_proj": 1
+      }
+    },
+    "gemma-4-E4B-it": {
+      "peft-qv": {
+        "q_proj": 42,
+        "v_proj": 24
+      },
+      "text-all-linear": {
+        "q_proj": 42,
+        "k_proj": 24,
+        "v_proj": 24,
+        "o_proj": 42,
+        "gate_proj": 42,
+        "up_proj": 42,
+        "down_proj": 42,
+        "per_layer_input.inp_gate": 42,
+        "per_layer_input.proj": 42,
+        "per_layer_input.per_layer_model_proj": 1
+      }
+    }
+  },
+  "training_contract": {
+    "optimizer": "adamw",
+    "seed": 42,
+    "steps": [1, 2, 8],
+    "learning_rate": 0.001,
+    "betas": [0.9, 0.999],
+    "eps": 1e-8,
+    "weight_decay": 0.01,
+    "max_grad_norm": 1.0,
+    "grad_accum_steps": 1,
+    "supervised_token_normalization": "mean"
+  },
+  "benchmark_contract": {
+    "schema_version": "antfly_gemma4_lora_benchmark_semantics/v3",
+    "precision": {
+      "verified": {
+        "base_model_storage_dtype": "bfloat16",
+        "lora_parameter_storage_dtype": "float32",
+        "gradient_storage_dtype": "float32",
+        "optimizer_moment_storage_dtype": "float32",
+        "loss_tensor_dtype": "float32",
+        "loss_reduction_input_dtype": "float32"
+      },
+      "not_asserted": [
+        "activation_dtype",
+        "matmul_accumulator_dtype"
+      ],
+      "comparison_policy": "diagnostic-only-until-all-comparison-critical-dtypes-are-runtime-proven"
+    },
+    "optimizer": {
+      "name": "adamw",
+      "learning_rate": 0.001,
+      "schedule": "constant-no-warmup",
+      "betas": [0.9, 0.999],
+      "eps": 1e-8,
+      "bias_correction": true,
+      "weight_decay": 0.01,
+      "weight_decay_scope": "all-and-only-lora-a-and-lora-b-parameters",
+      "gradient_clip_kind": "global-l2-norm",
+      "gradient_clip_max_norm": 1.0,
+      "gradient_clip_epsilon": 1e-6,
+      "gradient_clip_order": "after-accumulation-before-adamw-update",
+      "gradient_accumulation_reduction": "arithmetic-mean-of-per-microbatch-mean-supervised-token-gradients",
+      "partial_accumulation_windows": "forbidden"
+    },
+    "determinism": {
+      "seed": 42,
+      "sample_order": "fixed-prepared-workload-order-without-shuffle",
+      "dropout": 0.0,
+      "lora_a_initializer": "kaiming-uniform-a-sqrt5-fan-in",
+      "lora_b_initializer": "zeros",
+      "initial_adapter_policy": "load-byte-equivalent-canonical-f32-semantics"
+    },
+    "runtime": {
+      "attention_kv_cache": false,
+      "activation_checkpointing": false,
+      "training_checkpoint_io": "disabled",
+      "compiled_graph_cache": "enabled-process-local-shape-keyed",
+      "compile_policy": "lazy-first-full-optimizer-window-included-in-cold-metric",
+      "filesystem_cache_policy": "not-flushed-between-alternating-fresh-processes",
+      "per_step_device_sync": "after-optimizer-update-before-timer-stop-every-window"
+    },
+    "memory": {
+      "process_peak_definition": "maximum-darwin-proc-pid-rusage-v4-ri-phys-footprint-sample",
+      "sampler_interval_ms": 10,
+      "framework_allocator_peak": "separate-diagnostic-not-cross-framework-gate",
+      "system_delta_source": "darwin-vm-stat-pages-and-memory-pressure-before-after",
+      "system_delta_window": "measured-optimizer-steps-only",
+      "maximum_swapins_bytes": 0,
+      "maximum_swapouts_bytes": 0,
+      "maximum_pageins_bytes": 0,
+      "maximum_pageouts_bytes": 0,
+      "minimum_pressure_available_percent_delta": -5.0
+    }
+  },
+  "tolerance_profiles": {
+    "tiny-f32": {
+      "loss_abs": 1e-06,
+      "loss_rel": 1e-06,
+      "grad_norm_abs": 1e-06,
+      "grad_norm_rel": 1e-06,
+      "logits_max_abs": 1e-05,
+      "logits_rel_l2": 1e-05,
+      "logits_cosine_min": 0.999999,
+      "gradient_max_abs": 1e-05,
+      "gradient_rel_l2": 1e-05,
+      "gradient_cosine_min": 0.999999,
+      "state_max_abs": 1e-05,
+      "state_rel_l2": 1e-05,
+      "state_cosine_min": 0.999999
+    },
+    "native-metal-bf16": {
+      "loss_abs": 0.001,
+      "loss_rel": 0.001,
+      "grad_norm_abs": 0.005,
+      "grad_norm_rel": 0.005,
+      "logits_max_abs": 0.02,
+      "logits_rel_l2": 0.001,
+      "logits_cosine_min": 0.9999,
+      "gradient_max_abs": 0.02,
+      "gradient_rel_l2": 0.001,
+      "gradient_cosine_min": 0.99999,
+      "state_max_abs": 0.02,
+      "state_rel_l2": 0.005,
+      "state_cosine_min": 0.9999
+    },
+    "hf-zig-bf16": {
+      "loss_abs": 0.005,
+      "loss_rel": 0.005,
+      "grad_norm_abs": 0.02,
+      "grad_norm_rel": 0.02,
+      "logits_max_abs": 0.05,
+      "logits_rel_l2": 0.005,
+      "logits_cosine_min": 0.9999,
+      "gradient_max_abs": 0.05,
+      "gradient_rel_l2": 0.01,
+      "gradient_cosine_min": 0.999,
+      "state_max_abs": 0.05,
+      "state_rel_l2": 0.02,
+      "state_cosine_min": 0.999
+    },
+    "resume": {
+      "loss_abs": 1e-07,
+      "loss_rel": 1e-07,
+      "grad_norm_abs": 1e-07,
+      "grad_norm_rel": 1e-07,
+      "logits_max_abs": 1e-06,
+      "logits_rel_l2": 1e-06,
+      "logits_cosine_min": 0.9999999,
+      "gradient_max_abs": 1e-06,
+      "gradient_rel_l2": 1e-06,
+      "gradient_cosine_min": 0.9999999,
+      "state_max_abs": 1e-06,
+      "state_rel_l2": 1e-06,
+      "state_cosine_min": 0.9999999
+    }
+  },
+  "performance_gate": {
+    "minimum_geomean_throughput_ratio": 0.8,
+    "minimum_cell_throughput_ratio": 0.7,
+    "maximum_peak_memory_ratio": 1.15,
+    "maximum_regression_fraction": 0.05,
+    "primary_sequence_lengths": [
+      128,
+      512,
+      2048
+    ],
+    "gradient_accumulation": [
+      1,
+      4
+    ],
+    "microbatch": 1,
+    "rank": 16,
+    "alpha": 32.0
+  },
+  "references": {
+    "gemma4_model_docs": "https://huggingface.co/docs/transformers/model_doc/gemma4",
+    "gemma_tuning": "https://ai.google.dev/gemma/docs/tune",
+    "peft_checkpoint_format": "https://huggingface.co/docs/peft/main/en/developer_guides/checkpoint",
+    "peft_0_19_1_release": "https://github.com/huggingface/peft/releases/tag/v0.19.1",
+    "transformers_5_5_2_release": "https://github.com/huggingface/transformers/releases/tag/v5.5.2",
+    "mlx_lm_lora": "https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md"
+  }
+}

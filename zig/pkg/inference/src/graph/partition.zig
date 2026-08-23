@@ -136,6 +136,8 @@ pub const PartitionExecutor = struct {
         metal_frame_chunk_boundaries: u64 = 0,
         metal_frame_chunk_promoted_values: u64 = 0,
         metal_frame_chunk_swept_values: u64 = 0,
+        metal_final_frame_swept_values: u64 = 0,
+        metal_final_frame_swept_bytes: u64 = 0,
         metal_chunk_local_output_peak_bytes: u64 = 0,
         metal_chunk_local_output_live_bytes: u64 = 0,
         metal_chunk_local_output_allocations: u64 = 0,
@@ -1233,6 +1235,7 @@ pub fn supportsAttention(op: OpCode) bool {
     return switch (op) {
         .fused_causal_self_attention,
         .fused_gqa_causal_attention,
+        .fused_gqa_causal_attention_backward,
         .fused_sdpa,
         .fused_cross_attention,
         .fused_rope,

@@ -4108,7 +4108,7 @@ test "fuse detects SDPA pattern: 4D dynamic additive bias is preserved" {
             try std.testing.expectEqual(@as(u32, 64), attrs.head_dim);
             const node = result.graph.node(@intCast(idx));
             try std.testing.expectEqual(@as(u8, 4), node.num_inputs);
-            try std.testing.expectEqual(bias_bcast, node.inputs[3]);
+            try std.testing.expectEqual(result.id_map[bias_bcast], node.inputs[3]);
             found_sdpa = true;
             break;
         }

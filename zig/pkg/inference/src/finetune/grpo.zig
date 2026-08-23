@@ -37,6 +37,57 @@ pub const GRPOConfig = struct {
     normalize_advantage: bool = true,
 };
 
+pub const AdaptiveKLConfig = struct {
+    target: f32,
+    horizon: f32,
+    min_coef: f32,
+    max_coef: f32,
+};
+
+/// Proportional KL controller used by the original RLHF/PPO recipe and TRL.
+/// `horizon` is measured in admitted optimizer groups in Antfly. Callers use
+/// the coefficient returned by `value` for the current group, then call
+/// `update` with that group's unweighted mean K3 divergence to obtain the
+/// coefficient for the next group.
+pub const AdaptiveKLController = struct {
+    value: f32,
+    config: AdaptiveKLConfig,
+
+    pub fn init(initial_coef: f32, config: AdaptiveKLConfig) !AdaptiveKLController {
+        if (!std.math.isFinite(initial_coef) or initial_coef < 0.0 or
+            !std.math.isFinite(config.target) or config.target <= 0.0 or
+            !std.math.isFinite(config.horizon) or config.horizon <= 0.0 or
+            !std.math.isFinite(config.min_coef) or config.min_coef < 0.0 or
+            !std.math.isFinite(config.max_coef) or config.max_coef < config.min_coef or
+            initial_coef < config.min_coef or initial_coef > config.max_coef)
+        {
+            return error.InvalidAdaptiveKlConfig;
+        }
+        return .{ .value = initial_coef, .config = config };
+    }
+
+    pub fn update(self: *AdaptiveKLController, current_mean_kl: f32, admitted_groups: usize) !f32 {
+        if (!std.math.isFinite(current_mean_kl) or current_mean_kl < 0.0 or admitted_groups == 0) {
+            return error.InvalidAdaptiveKlObservation;
+        }
+        const ratio = @as(f64, current_mean_kl) / @as(f64, self.config.target);
+        const proportional_error = std.math.clamp(ratio - 1.0, -0.2, 0.2);
+        const multiplier = 1.0 + proportional_error *
+            @as(f64, @floatFromInt(admitted_groups)) / @as(f64, self.config.horizon);
+        if (!std.math.isFinite(multiplier) or multiplier <= 0.0) {
+            return error.InvalidAdaptiveKlUpdate;
+        }
+        const updated = @as(f64, self.value) * multiplier;
+        if (!std.math.isFinite(updated)) return error.InvalidAdaptiveKlUpdate;
+        self.value = @floatCast(std.math.clamp(
+            updated,
+            @as(f64, self.config.min_coef),
+            @as(f64, self.config.max_coef),
+        ));
+        return self.value;
+    }
+};
+
 pub const Completion = struct {
     prompt_idx: usize,
     tokens: []const i32,
@@ -139,6 +190,7 @@ pub const GRPOLossResult = struct {
     loss: f32,
     pg_loss: f32,
     kl_loss: f32,
+    mean_kl: f32,
     clip_fraction: f32,
     grad_new_logps: []f32,
     allocator: std.mem.Allocator,
@@ -171,6 +223,7 @@ pub fn grpoLoss(
             .loss = 0,
             .pg_loss = 0,
             .kl_loss = 0,
+            .mean_kl = 0,
             .clip_fraction = 0,
             .grad_new_logps = grad,
             .allocator = allocator,
@@ -183,6 +236,7 @@ pub fn grpoLoss(
     const kl = config.kl_coef;
 
     var pg_sum: f64 = 0;
+    var raw_kl_sum: f64 = 0;
     var kl_sum: f64 = 0;
     var clipped_count: usize = 0;
 
@@ -207,8 +261,14 @@ pub fn grpoLoss(
 
             // KL k3: exp(ref - new) - (ref - new) - 1
             const diff = ref_lp - new_lp;
-            const exp_diff = @exp(diff);
-            const k3 = exp_diff - diff - 1.0;
+            if (!std.math.isFinite(diff) or diff > 80.0) return error.GrpoKlLogRatioOutOfRange;
+            // expm1 keeps K3 and its gradient stable when the policy remains
+            // close to the reference: exp(diff) - diff - 1 is otherwise a
+            // cancellation-prone subtraction around zero.
+            const expm1_diff = std.math.expm1(diff);
+            if (!std.math.isFinite(expm1_diff)) return error.GrpoKlLogRatioOutOfRange;
+            const k3 = @max(expm1_diff - diff, 0.0);
+            raw_kl_sum += k3;
             kl_sum += kl * k3;
 
             // Gradient w.r.t. new_lp.
@@ -231,7 +291,7 @@ pub fn grpoLoss(
             //                   = -exp(ref - new) + 1
             //                   = 1 - exp(ref - new)
             //   Loss contribution is +kl_coef * k3, so grad is +kl_coef * (1 - exp_diff).
-            const g_kl: f32 = kl * (1.0 - exp_diff);
+            const g_kl: f32 = -kl * expm1_diff;
 
             grad[off + t] = (g_pg + g_kl) * inv_n;
         }
@@ -240,6 +300,7 @@ pub fn grpoLoss(
 
     const pg_loss: f32 = @floatCast(pg_sum / @as(f64, n_f));
     const kl_loss: f32 = @floatCast(kl_sum / @as(f64, n_f));
+    const mean_kl: f32 = @floatCast(raw_kl_sum / @as(f64, n_f));
     const loss: f32 = pg_loss + kl_loss;
     const clip_fraction: f32 = @as(f32, @floatFromInt(clipped_count)) / n_f;
 
@@ -247,6 +308,7 @@ pub fn grpoLoss(
         .loss = loss,
         .pg_loss = pg_loss,
         .kl_loss = kl_loss,
+        .mean_kl = mean_kl,
         .clip_fraction = clip_fraction,
         .grad_new_logps = grad,
         .allocator = allocator,
@@ -383,8 +445,55 @@ test "grpoLoss zero when ratio=1, adv=0, ref=new" {
     try testing.expectApproxEqAbs(@as(f32, 0), res.loss, 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0), res.pg_loss, 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0), res.kl_loss, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0), res.mean_kl, 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0), res.clip_fraction, 1e-6);
     for (res.grad_new_logps) |g| try testing.expectApproxEqAbs(@as(f32, 0), g, 1e-6);
+}
+
+test "grpoLoss exposes unweighted stable mean K3 when beta is zero" {
+    const alloc = testing.allocator;
+    const tokens = [_]i32{1};
+    const old = [_]f32{-1.0};
+    const reference = [_]f32{-0.5};
+    const completions = [_]Completion{
+        .{ .prompt_idx = 0, .tokens = &tokens, .old_logps = &old, .ref_logps = &reference },
+    };
+    const new_logps = [_]f32{-1.0};
+    const advantages = [_]f32{0.0};
+
+    var result = try grpoLoss(
+        alloc,
+        &completions,
+        &new_logps,
+        &advantages,
+        .{ .kl_coef = 0.0 },
+    );
+    defer result.deinit();
+
+    const expected = std.math.expm1(@as(f32, 0.5)) - 0.5;
+    try testing.expectApproxEqAbs(expected, result.mean_kl, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), result.kl_loss, 1e-6);
+}
+
+test "adaptive KL controller is bounded and updates the next-group coefficient" {
+    var controller = try AdaptiveKLController.init(0.04, .{
+        .target = 0.01,
+        .horizon = 100.0,
+        .min_coef = 0.001,
+        .max_coef = 0.05,
+    });
+    const below_target = try controller.update(0.0, 1);
+    try testing.expectApproxEqAbs(@as(f32, 0.03992), below_target, 1e-7);
+    const above_target = try controller.update(1.0, 1);
+    try testing.expect(above_target > below_target);
+
+    var upper = try AdaptiveKLController.init(0.05, .{
+        .target = 0.01,
+        .horizon = 1.0,
+        .min_coef = 0.001,
+        .max_coef = 0.05,
+    });
+    try testing.expectEqual(@as(f32, 0.05), try upper.update(1.0, 1));
 }
 
 fn lossOnly(

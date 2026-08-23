@@ -2,6 +2,27 @@
 
 antfly-inference-zig supports training and fine-tuning through reverse-mode automatic differentiation on the graph IR. Features are implemented in Zig and run on CPU (BLAS), Apple Silicon (Metal/MLX), or supported NVIDIA GPUs through the CUDA backend. CUDA is only a runtime/build dependency when that backend is selected; the native and Metal paths do not require it.
 
+The same-Mac harness now has separate fresh-process MLX-LM and Antfly runners
+with a shared locked optimizer, workload, adapter, synchronization, memory,
+and precision-evidence contract. Both runners have completed the same
+diagnostic-only E2B sequence-128/rank-16/accumulation-1 cell. After the guarded
+64-row simdgroup BF16 pass and the current eight-row sparse-loss vocabulary
+projection batching, Antfly measured `0.470017 s` mean step time and
+`1,808,025,952` bytes peak physical footprint; MLX-LM measured `0.263396 s`
+and `11,497,430,816` bytes. Thus MLX is `1.784x` faster in that bounded cell
+while using `6.359x` the process footprint. On the exact sequence-512 cell,
+Antfly measured `1.466469 s` and `6,023,989,768` bytes versus MLX-LM's
+`0.990706 s` and `15,999,361,256` bytes: MLX is `1.480x` faster while using
+`2.656x` the footprint. The vocabulary batching is byte-identical to the
+one-row rollback after one and five eight-target updates and after one
+fifteen-target update. Both frameworks'
+samples incurred paging, came from diagnostic producers, and do not form the
+locked alternating multi-repeat matrix. The simdgroup path also introduces
+small mixed-precision update drift and is not exact numerical parity. The MLX
+runner still marks comparison-critical dtype surfaces `not_asserted`, so the
+full release comparator rejects these samples. Treat the ratios as optimization
+guidance, not release evidence.
+
 ---
 
 ## Unified Recipes
@@ -23,17 +44,14 @@ All recipes use the same top-level sections:
   "recipe": "lora-sft",
   "model": {
     "path": "/models/gemma4",
-    "family": "gemma4",
-    "projector_path": "/models/gemma4/mmproj.gguf"
+    "family": "gemma4"
   },
   "dataset": {
-    "path": "/data/chat.jsonl",
     "train_path": "/data/train.jsonl",
     "eval_path": "/data/eval.jsonl",
     "train_split": "train",
     "eval_split": "eval",
-    "train_cache_path": "/runs/gemma4/train_cache.json",
-    "eval_cache_path": "/runs/gemma4/eval_cache.json",
+    "eval_cache_path": "/runs/gemma4/prepared_eval_inputs.json",
     "max_examples": 128,
     "eval_max_examples": 64,
     "max_seq_len": 512
@@ -42,26 +60,16 @@ All recipes use the same top-level sections:
     "path": "/runs/gemma4/adapter-bootstrap",
     "rank": 16,
     "alpha": 32,
-    "target_preset": "all-linear",
+    "target_preset": "text-all-linear",
     "scaling": "standard",
     "init_lora_weights": "default",
-    "use_dora": false,
-    "layer_name": "model.layers.0"
+    "use_dora": false
   },
   "optimizer": {
     "learning_rate": 0.0002,
     "epochs": 2,
     "gradient_accumulation_steps": 4,
     "max_grad_norm": 1.0
-  },
-  "preference": {
-    "beta": 0.1
-  },
-  "grpo": {
-    "group_size": 8,
-    "clip_epsilon": 0.2,
-    "kl_coef": 0.04,
-    "normalize_advantage": true
   },
   "eval": {
     "max_examples": 64
@@ -72,26 +80,79 @@ All recipes use the same top-level sections:
     "prepared_path": "/runs/gemma4/prepared_inputs.json",
     "trained_adapter_dir": "/runs/gemma4/adapter-trained"
   },
-  "backend": "auto"
+  "backend": "native"
 }
 ```
 
-Supported recipe names are `sft`, `lora-sft`, `qlora-sft`, `dpo`, `grpo`, `reranker`, and `vlm-retrieval`. The parser accepts unknown future fields so recipe files can grow without breaking older runners.
+Supported recipe names across all families are `sft`, `lora-sft`, `qlora-sft`,
+`dpo`, `grpo`, `reranker`, and `vlm-retrieval`. Gemma4 supervised training
+currently admits only `lora-sft`; its full SFT and public `qlora-sft` recipe
+spellings fail closed. A separately gated direct-GGUF research lane is
+available to the typed Gemma4 LoRA command with
+`ANTFLY_EXPERIMENTAL_GEMMA4_GGUF_QLORA=1`. It is not an alias for a promoted
+QLoRA recipe.
+Recipe parsing is strict: unknown fields are errors rather than silently
+defaulting a misspelled option.
+
+Gemma4 `dpo` and `grpo` are optimizer-backed LoRA routes over BF16
+SafeTensors bases. `backend = "metal"` selects the strict compiled-device
+trainer and never falls back to native execution. Same-base Gemma4 DPO
+precomputes frozen reference logprobs through the exact policy graph with LoRA
+zeroed. Gemma4 GRPO uses the same compiled policy graph with immutable
+zero-valued LoRA device bindings for its frozen reference. Initial
+sampling/rescore and zero-adapter policy/reference parity are fail-closed.
+Public packed-GGUF QLoRA remains fail-closed. DPO and GRPO recipes may opt into
+the explicitly experimental canonical full-prefix E2B GGUF lane with
+`model.allow_direct_gguf_training = true`; direct-GGUF GRPO combined with
+incremental KV is rejected because its paged Q4_0 decoder has not preserved the
+canonical token trajectory.
+
+DPO and GRPO recipes must declare their intent explicitly. Use
+`execution.mode = "train"` with `text-preference` /
+`rendered-text-preference` or `text-grpo` / `rendered-text-grpo` and an adapter
+configuration for real optimizer-backed training. Use
+`execution.mode = "score"` only with the precomputed `scalar-logprobs` or
+`token-logprobs` fixture formats. There is no default mode or format: missing
+fields fail during planning, score mode rejects adapter and optimizer intent,
+and train mode cannot fall through to a metrics-only implementation. Gemma4
+preference training requires a separate held-out JSONL file plus explicit
+task thresholds. Token-identical train/eval prompts fail before evaluation,
+the held-out report is written before adapter publication, and a failed gate
+leaves the trained-adapter output unpublished.
+
+For DPO, configure `eval.dpo_minimums.accuracy` and
+`eval.dpo_minimums.max_loss`. For GRPO, configure
+`eval.grpo_minimums.mean_reward`, `top_rank_mean_reward`,
+`positive_reward_group_rate`, and `max_kl_loss`. The top-rank metric scores the
+first (highest-ranked) completion in each group; positive-group coverage is the
+fraction of held-out groups containing at least one reward greater than zero.
+Requiring all three reward gates prevents many rewards concentrated in one
+easy group, or low-ranked variants alone, from masquerading as held-out
+quality. The
+normalized training report fingerprints both dataset files, the evaluation
+report, and every published adapter artifact. These thresholds are an
+admission mechanism, not universal defaults; production recipes must set them
+from a pinned baseline and task-specific acceptance study.
 
 ### LoRA Defaults
 
 Recipe-level LoRA defaults are intentionally PEFT-like:
 
-- SFT, QLoRA, VLM retrieval, and encoder/reranker LoRA bootstrap at `rank = 16`, `alpha = 32`.
+- Supported rank-16 LoRA routes bootstrap at `rank = 16`, `alpha = 32` unless a
+  family-specific contract says otherwise.
 - GRPO adapter-training routes default to `rank = 8`, `alpha = 32`; raise rank for larger policy tasks after an eval sweep justifies the extra adapter capacity.
 - Scaling is standard LoRA `alpha / rank`. Recipe `adapter.scaling` currently accepts only `standard` aliases; rank-stabilized scaling is not enabled in the graph trainer path.
-- Gemma4 defaults to `target_preset = "all-linear"`, which expands to attention and MLP linear patterns. Explicit `target_modules` override the preset.
+- Gemma4 defaults to `target_preset = "text-all-linear"`, which resolves exact
+  text attention, MLP, and PLE linear paths. `peft-qv` is the smaller baseline.
+  Providing both a preset and explicit target modules is an error.
 - GLiNER2 LoRA defaults match the upstream Python GLiNER2 LoRA surface:
   `rank = 16`, `alpha = 32`, `lora_dropout = 0`, and target groups
   `encoder,span_rep,classifier,count_embed,count_pred`. The encoder group
   expands to query/key/value plus dense encoder projections.
 - Qwen/ColQwen optimizer-backed routes default to their all-linear target module lists. They also accept `target_preset = "all-linear"`, `attention-only`, or `mlp-only`; `moe-experts` is rejected until expert-aware rank and routing policy is wired through those bootstraps.
-- `init_lora_weights` and `use_dora` are currently Gemma4-only recipe knobs.
+- Gemma4 recipes currently admit standard LoRA initialization only. DoRA,
+  PiSSA, LoftQ, EVA, and LoRA-GA fail closed until their graph, adjusted-base,
+  or initializer-stat artifact contracts are wired end to end.
 
 For learning-rate selection, do not copy full-finetune LRs directly. Start LoRA sweeps around `1e-4`, `3e-4`, and `1e-3` with the real target metric, then keep the smallest rank/target set that passes. Smaller micro-batches plus gradient accumulation are usually a better first move than shrinking rank below the defaults.
 
@@ -523,14 +584,14 @@ dataset-wide raw-label union is not a valid contextual-slot schema.
 
 | Recipe | Family | Current route |
 |--------|--------|---------------|
-| `lora-sft`, `qlora-sft` | `gemma4` | `prepare-gemma4-lora-inputs` → `bootstrap-gemma4-lora` → `train-eval-gemma4-lora-bundle` |
+| `lora-sft` | `gemma4` | prepare train → prepare disjoint eval → bootstrap exact adapter inventory → train/eval with `--eval-prepared`; full `sft` and `qlora-sft` are typed errors |
 | `lora-sft`, `qlora-sft` | `gliner2` | `train-gliner2-autodiff` (real full-encoder autodiff training; the cached probe-surrogate bundle route was removed) |
 | `lora-sft`, `qlora-sft` | `layoutlmv3` | `bootstrap-layoutlmv3-lora` → `train-eval-layoutlmv3-lora-sequence` or `train-eval-layoutlmv3-lora-token` → optional `materialize-layoutlmv3-checkpoint` |
-| `sft` | supported LoRA families | same route as the family `lora-sft` adapter while full-weight SFT backends are still family-specific |
+| `sft` | supported non-Gemma LoRA families | same route as the family `lora-sft` adapter while full-weight SFT backends are still family-specific |
 | `dpo` | scalar preference fixtures | direct internal `preference_loss.zig` adapter over `dataset.format = "scalar-logprobs"` JSONL |
-| `dpo` | decoder models with local weights | direct internal `preference_harness.zig` adapter over `dataset.format = "text-preference"` or `"rendered-text-preference"` JSONL with `model.path` and optional `model.reference_path`; Gemma4, Qwen2, ColQwen2, and Qwen3.5 text recipes now also have optimizer-backed adapter-training paths |
+| `dpo` | decoder models with local weights | direct internal `preference_harness.zig` adapter over `dataset.format = "text-preference"` or `"rendered-text-preference"` JSONL with `model.path` and optional `model.reference_path`; Gemma4 has native and strict-Metal optimizer-backed LoRA paths, exact same-graph base-reference caching, chosen/rejected gradient accumulation kept in one preference unit, and required disjoint held-out gates; Qwen2, ColQwen2, and Qwen3.5 text recipes also have optimizer-backed adapter-training paths |
 | `grpo` | scalar/token fixtures | direct internal `grpo.zig` adapter over `dataset.format = "token-logprobs"` JSONL |
-| `grpo` | decoder models with local weights | direct internal adapter over `dataset.format = "text-grpo"` or `"rendered-text-grpo"` JSONL with deterministic decoder sampling, reward modes including `exact-match`, `exact-match-ci`, and `prefix-match`, and optional `model.reference_path`; Gemma4, Qwen2, ColQwen2, and Qwen3.5 text recipes now also have optimizer-backed adapter-training paths, and Gemma4 also has a multimodal path |
+| `grpo` | decoder models with local weights | direct internal adapter over `dataset.format = "text-grpo"` or `"rendered-text-grpo"` JSONL with deterministic ranked sampling, decoded-text and token-level rewards, and optional `model.reference_path`; Gemma4 has native and strict-Metal optimizer-backed LoRA paths, required disjoint held-out gates, typed weighted reward providers, and rejects runs with no reward-derived advantage or no policy gradient; Qwen2, ColQwen2, and Qwen3.5 text recipes retain their optimizer-backed legacy-reward paths |
 | `reranker` | `reranker` | `prepare-reranker-pooled-cache` → `train-eval-reranker-head-cached` → optional `materialize-reranker-head` |
 | `lora-sft`, `qlora-sft` | `reranker` | `bootstrap-reranker-lora` → `prepare-reranker-top-layer-cache` → `train-eval-reranker-lora-top-layer-cached-surrogate` → optional `materialize-reranker-lora` |
 | `vlm-retrieval` | `colqwen2` | `prepare-colqwen2-inputs` → `bootstrap-colqwen2-lora` → `train-eval-colqwen2-lora-bundle` |
@@ -558,6 +619,143 @@ Every non-dry run also writes:
 - `<artifacts.root>/training_report.json` with the normalized final status, per-step execution records, dataset fingerprints, backend build metadata, optimizer summary, and final artifact checksums
 
 Direct DPO and GRPO adapters also write `artifacts.report_path`, or `<artifacts.root>/dpo_report.json` / `<artifacts.root>/grpo_report.json` when no explicit report path is provided.
+Their report schemas are `antfly_inference_finetune_dpo_report/v6` and
+`antfly_inference_finetune_grpo_report/v6`; both bind the resolved
+`execution_mode` and `dataset_format`. Training reports additionally name the
+published adapter directory, while score reports leave it null. The normalized
+training report fingerprints both the bootstrap and trained adapter trees for
+train mode, making a missing or unchanged publication visible to automation.
+Gemma4 train reports also embed the passing held-out summary and checksum a
+separate `dpo_evaluation_report.json` or `grpo_evaluation_report.json`; the
+GRPO evaluation schema is `antfly_inference_finetune_grpo_evaluation/v3`. The
+evaluator uses the live post-update policy and the immutable zero-LoRA
+same-graph reference. Evaluation failure remains visible in the normalized
+failed run report but prevents `adapter-trained` publication.
+The trained-adapter target must not exist when a Gemma4 preference run starts,
+so a stale bundle from an older failed or successful run cannot be mistaken for
+the current job's publication.
+Optimizer-backed Gemma4 reports include the actual policy backend plus optimizer
+and micro-batch step counts. GRPO reports also include reward mean and standard
+deviation, raw mean K3, weighted KL loss, frozen-reference mode and scoring
+time, initial ranked token IDs and policy/reference logprobs, sampling/rescore
+parity, and KL-controller telemetry, so a mechanically healthy but
+reward-degenerate, reference-drifted, or KL-unsafe run is visible. Every train
+attempt atomically writes `grpo_kl_control_trace.jsonl`; a raw-KL budget breach
+is recorded there and rejects the group before optimizer mutation.
+The v6/v3 reports additionally carry nullable incremental-KV telemetry. The
+production default leaves it null; an opted-in research run must account for
+prompt/tail prefills, paged decode, exact completion rescoring, resident ranked
+selection, page reuse, cache geometry, and any host-logit fallback.
+Gemma4 DPO reports additionally include `policy_scoring_mode`,
+`training_microbatch_mode`, `metal_buffer_reuse_mode`, `reference_mode`,
+reference-precompute time, completion-fenced Metal workspace statistics, and
+initial zero-adapter policy/reference logprob parity. The v5 report also binds
+the pair sequence-length policy, logical/scheduled/fixed branch rows, avoided
+padding, pair-shared weighted-target policy, unique training signatures, and
+graph-cache snapshots after initialization, reference precompute, initial
+per-signature parity, training, and held-out evaluation. Publication fails if
+the zero-adapter policy/reference check drifts on any admitted bucket graph
+signature. Metal DPO enables the
+completion-fenced workspace by default and sizes it to 9/16 of the device's
+`recommendedMaxWorkingSetSize`, rounded down to MiB. Set
+`ANTFLY_GEMMA4_DPO_COMPLETION_FENCED_CACHE=0` for the fail-safe rollback. The
+generic Metal runtime remains opt-in; `TERMITE_METAL_COMPLETION_CACHE_MAX_MB`,
+`TERMITE_METAL_COMPLETION_CACHE_MAX_BUFFER_MB`, and
+`TERMITE_METAL_COMPLETION_CACHE_MAX_SLOTS` are diagnostic overrides rather
+than recipe-level tuning requirements.
+
+The exact qualified E2B topology also defaults to planned-encoder-fenced
+same-frame private-buffer reuse. Set
+`ANTFLY_GEMMA4_DPO_IN_FRAME_BUFFER_REUSE=0` to restore the qualified rollback.
+E4B and unknown Gemma4 shapes remain fail-closed unless that variable is
+explicitly set to `1` for research. The report records the effective policy so
+benchmark and release evidence cannot silently mix the two modes.
+
+Optimizer-backed Gemma4 DPO/GRPO epoch checkpoints have a second atomic
+contract: `gemma4_{dpo,grpo}_trainer_state.safetensors` is not published until
+its content-addressed
+`*.preference-state-<sha256>.json` sidecar is durable. The sidecar restores the
+exact accumulated task metrics; GRPO also restores reward-trace state, raw-KL
+aggregates, the adaptive controller coefficient/counters, and diagnostic
+sampling parity. Report v6 names and hashes that sidecar. The v5 run
+fingerprint binds the model, adapter inventory and payload, train/eval data,
+optimizer and reward configuration, graph/scheduling controls, and the resolved
+`antfly_gemma4_metal_numerical_policy/v2` contract. That contract includes
+sparse-loss chunk geometry, linear-CCE tile size, eager LoRA/dot/quant routes,
+BF16 kernels, and training-executor fusion routes. A rollback environment
+change therefore rejects resume instead of silently changing the numerical
+trajectory. Any Gemma/Metal preference environment name not on the attested
+allowlist fails before model or optimizer mutation, so a newly introduced
+debug switch cannot silently enter a product run. Attested boolean overrides
+must use canonical `0`/`1` values (presence-only kill switches require `1`),
+preventing Zig and Objective-C environment parsers from interpreting aliases
+differently. Activation-checkpoint
+interval/recursion and the exact GRPO backward batch size are bound explicitly.
+Checkpointed GRPO rejects custom reward trace/exchange paths so a resumed run
+cannot alias the interrupted run's mutable artifacts.
+
+Terminal DPO/GRPO admission is one-way. The training backend is drained, final
+trainables are synchronized to host, optimizer/device graph state is retired,
+and a separately initialized backend receives an exact trainable snapshot with
+both private-buffer reuse tiers disabled. The report attests
+`terminal-device-drained-host-weight-snapshot-fresh-backend-private-buffer-reuse-disabled`.
+A training step after this boundary is rejected.
+
+The real process-kill qualifier is
+`scripts/qualify_gemma4_preference_resume.py` (qualification schema v2). It
+requires byte-identical final adapters and training checkpoints, exact
+content-addressed sidecars, exact training metrics, exact
+completion/reward/KL-control traces, exact discrete held-out behavior, and an
+identical Metal numerical policy. It opens the standalone evaluation report
+and every reported trace, verifies each path and SHA-256 against the immutable
+run root, and then compares their semantic contents. It also rejects symlink
+leaves and input/output overlap, validates the complete adapter directory and
+manifest, requires every immutable companion file to match the seed, and
+independently proves that the trained tensor payload changed. DPO terminal
+metrics remain exact. Repeated fresh-process GRPO evaluation demonstrated small Metal
+forward-reduction variation despite identical adapters and completion traces,
+so the independent held-out `kl_loss` and `mean_kl` fields use explicit
+absolute bounds of `1e-6` and `1e-5`. The standalone report's derived total
+`loss`, which includes weighted KL, uses the same `1e-6` bound while
+`pg_loss` and every discrete field remain exact. Those bounds are far below
+the campaign's `0.004` KL admission ceiling and are emitted with the observed
+deltas in the qualification report.
+
+The 2026-08-21 recovery-boundary source snapshot was rebuilt as the
+29,795,824-byte ReleaseFast Metal binary
+`/private/tmp/antfly-gemma4-preference-boundaries-release-20260821-v11/bin/antfly-inference`
+(SHA-256
+`b6b8cd957cee34058ffd0cae3a1a9ca0794ba8ad7562647253775b1bb0540304`).
+All four same-binary real interruption campaigns passed the v5 fingerprint and
+v2 numerical-policy qualifier:
+
+- E2B DPO: exact recovery; adapter SHA-256
+  `3e690f8bff46af295028328d46fcdaee6f484f04cf57d82ce2feafd5005555bd`;
+  held-out loss/accuracy `0.68912619 / 0.60`.
+- E4B DPO: exact recovery; adapter SHA-256
+  `657bbd8f89b738cdd6453e147955eb099da53e6b25ad3778fabb2c324071df78`;
+  held-out loss/accuracy `0.64424115 / 0.80`.
+- E2B GRPO: 16 groups, 64 completions, 16 optimizer steps; adapter
+  SHA-256 `43e6d637a316b38247737c5e3879843e5576b95ed1c81655850f91962666a787`;
+  terminal `kl_loss`/`mean_kl` deltas `1.13e-7 / 2.81e-6`.
+- E4B GRPO: 16 groups, 64 completions, 16 optimizer steps; adapter
+  SHA-256 `0efbf1ad76f9e145382c18aaa24813d081220e8ceb373988bf33b0967e92a8c7`;
+  terminal `kl_loss`/`mean_kl` deltas `9.59e-9 / 2.40e-7`.
+
+The reports for that recovery snapshot are the `qualification_report.json`
+files under
+`/private/tmp/antfly-gemma4-{e2b,e4b}-{dpo,grpo}-preference-resume-acceptance-20260821-v11/`.
+They bind the same binary digest, reject symlinks and input/output overlap, and
+verify the complete adapter tree independently of the report. The prior E2B
+GRPO `v2`, E4B GRPO `v2`, E2B DPO `v2`, and E4B DPO `v4` roots remain
+historical regression evidence because their v9/v7/v6 binaries predate this
+fingerprint/policy boundary; E4B DPO additionally lacked numerical-policy
+attestation. Incremental-KV GRPO now checkpoints only cumulative sampler
+telemetry at a drained, zero-live-sequence epoch boundary; transient KV pages
+are rebuilt after resume. Canonical full-prefix direct-GGUF DPO/GRPO remains an
+explicitly admitted E2B research lane, while direct-GGUF GRPO plus incremental
+KV is fail-closed after its Q4_0 paged decoder changed the canonical token
+trajectory.
 
 The scalar DPO input format remains JSONL with precomputed logprob rows:
 
@@ -571,7 +769,81 @@ Model-backed DPO also accepts text preference rows:
 {"prompt":"Answer with one word: yes or no?","chosen":"yes","rejected":"no"}
 ```
 
-Use `dataset.format = "text-preference"` to treat `prompt` as user content and apply the model chat template when one exists, or `dataset.format = "rendered-text-preference"` when `prompt` is already the final rendered decoder prompt. `model.reference_path` is optional; when omitted, the runner reuses `model.path` as the reference model.
+Use `dataset.format = "text-preference"` to treat `prompt` as user content and
+apply the model chat template when one exists, or
+`dataset.format = "rendered-text-preference"` when `prompt` is already the
+final rendered decoder prompt. `model.reference_path` is optional; when
+omitted, the runner reuses `model.path` as the reference model. The current
+optimizer-backed Gemma4 DPO route admits only that same-base reference. An
+explicit different Gemma4 reference directory fails closed instead of silently
+scoring through a graph with different semantics.
+
+Gemma4 DPO keeps fixed pair padding by default. A training recipe can opt into
+pair-safe scheduling with `runtime.sequence_length_bucket_quantum`, optional
+`runtime.sequence_length_bucket_min`, and
+`runtime.graph_cache_capacity` (default 4, maximum 8). The scheduler computes one rounded
+shape from the maximum logical chosen/rejected row and uses that same sequence
+length and the pair's maximum weighted-target bucket for frozen-reference
+precompute, both policy branches, backward, and held-out evaluation. It never
+truncates or independently schedules the two sides. A cache capacity without a
+quantum is rejected. GRPO does not accept these fields: its prompt/completion
+groups require a separate group-safe scheduling and canonical-rescore gate.
+
+For a fixed-protocol performance probe, set
+`ANTFLY_GEMMA4_DPO_BENCHMARK=1`. The recipe must produce exactly 25 optimizer
+updates: one cold update, one first steady update, three warmups, and 20
+measured updates. The DPO report then includes every duration and loss plus the
+measured median and mean. This is a diagnostic contract, not a general training
+setting.
+
+The qualified E2B sequence-128 one-token fast path coalesces a shared-prompt
+chosen/rejected pair into one sparse policy score, one sparse frozen-reference
+score, and one weighted backward microbatch. Five final Metal repetitions were
+byte-identical and measured `0.760557 s/update` median-of-medians, down from
+`1.846122 s/update` for the prior pair path (`2.427x` faster). Pinned MLX-LM
+measured `0.520192 s/update`, so Antfly remains `46.21%` slower, while Antfly's
+`3,656,355,992`-byte peak process footprint is `71.40%` below MLX-LM's
+`12,782,264,168` bytes. The later graph-liveness repair and fixed-25
+sequence-512 qualification replaced the coarse DPO-wide reuse guard: the exact
+E2B topology now enables planned-encoder-fenced reuse by default. Multi-token
+and non-shared-prompt pairs retain the general sequence path. These one-token
+numbers remain bounded diagnostic evidence, not E4B or broad release-campaign
+qualification.
+
+For real multi-token DPO parity, use
+`scripts/materialize_gemma4_dpo_hf_parity.py` to create a provenance-bound
+Antfly JSONL plus an exact-token MLX case. Its `--bucket-occurrence 1` mode
+creates a deterministic disjoint holdout from the same pinned source. Run the
+matched MLX training side with `scripts/run_gemma4_dpo_mlx_benchmark.py` and a
+strict `--mlx-build-attestation` produced by
+`scripts/build_and_attest_gemma4_mlx.py`, then score the Antfly and MLX adapters
+under one runtime with `scripts/evaluate_gemma4_dpo_adapters_mlx.py`. Pass the
+same attestation to both commands. The bounded 2026-08-17
+UltraFeedback result achieved identical five-row holdout decisions and equal
+`0.6` accuracy. The first uniform-loss route compiled the live policy's
+loss-only scoring forwards and measured `6.55229 s/update` median. The current
+general multi-token Metal route additionally executes each chosen/rejected
+sequence exactly once for its raw summed-logprob gradient, detaches the first
+device gradient set, combines both sets on device with the host DPO
+coefficients, and performs one optimizer flush. It defaults on when logical
+gradient accumulation is one and the adapter is non-recursive; set
+`ANTFLY_GEMMA4_DPO_DETACHED_GRADIENTS=0` for the qualified rollback.
+
+The 2026-08-21 matched reprofile used five pinned UltraFeedback pairs for five
+epochs (25 optimizer updates), sequence maximum 512, rank-16/alpha-32 Q/V
+LoRA, and one fresh process per row. Pair-safe Q128/min256 scheduling reduced
+Antfly E2B median/mean update time from `2.4951 / 2.8161 s` to
+`1.8727 / 2.0616 s`; matched MLX-LM measured `1.5354 / 1.4590 s`, while
+Antfly used `56.17%` less peak physical memory. E4B fixed scheduling measured
+`32.9120 / 38.0635 s` for Antfly versus `37.3854 / 38.4071 s` for MLX-LM,
+with `18.26%` lower Antfly peak memory. The optimized E4B Q128 comparison is
+the important remaining boundary: Antfly measured `26.6671 / 34.3067 s`
+versus MLX-LM's `15.3322 / 16.3493 s`, and the two used effectively equal peak
+memory. The E2B Q128 adapters agreed on all five disjoint holdout decisions;
+the expanded E4B Q128 gate agreed on 22 of 25 (`0.88`) with `0.60`/`0.64`
+accuracy. That is bounded behavioral parity, not exact or broad quality parity.
+Fixed scheduling remains the default and rollback; Q128/min256 is an explicit
+throughput policy. See `GEMMA4.md` for hashes, protocol, artifacts, and limits.
 
 The current direct GRPO input is JSONL with token-level rows:
 
@@ -589,12 +861,142 @@ Use `dataset.format = "text-grpo"` to treat `prompt` as user content and apply t
 
 - `grpo.group_size`
 - `grpo.max_completion_tokens`
-- `grpo.reward_mode = "exact-match"`, `"exact-match-ci"`, or `"prefix-match"`
+- `grpo.train_max_kl` (raw mean token K3 hard stop; default `0.1`)
+- `grpo.adaptive_kl`, with required `target_kl` and `kl_horizon`
+- optional `grpo.min_kl_coef` / `grpo.max_kl_coef` bounds (defaults `0.001` / `1.0`)
+- `grpo.reward_mode = "exact-match"`, `"exact-match-ci"`, `"prefix-match"`, `"token-exact-match"`, or `"token-prefix-match"`
 - optional `model.reference_path`
 
-`exact-match-ci` is trimmed ASCII case-insensitive equality.
+The hard KL budget applies even when adaptive control is disabled. Adaptive
+mode uses the current `kl_coef` for the admitted group, then updates the
+coefficient for the next group with a bounded proportional error around
+`target_kl`; it does not retroactively change the current loss. Partial
+adaptive configurations fail validation, `target_kl` must remain below
+`train_max_kl`, and no rejected group may mutate optimizer state.
 
-For Gemma4 multimodal GRPO, add `model.projector_path` and use prompt rows with media placeholders plus `image_paths` / `audio_paths`. The current optimizer-backed multimodal route reuses the Gemma projector-backed autodiff path and requires the reference path to stay on the same base model directory.
+Gemma4 training additionally accepts a typed `reward` object. It supersedes
+the legacy single `grpo.reward_mode`; configuring both is an error. Built-in
+providers use the same five modes and can be combined with nonnegative weights
+under `weighted-mean` or `weighted-sum` aggregation:
+
+```json
+{
+  "reward": {
+    "aggregation": "weighted-mean",
+    "providers": [
+      {"name":"exact","kind":"builtin","mode":"exact-match","weight":0.75},
+      {"name":"format","kind":"builtin","mode":"prefix-match","weight":0.25}
+    ]
+  }
+}
+```
+
+An `external-command` provider must name an absolute executable and its exact
+`sha256:` digest. Antfly invokes it directly without a shell or inherited
+environment, passes a versioned JSON request-file path as the final argument,
+enforces a 10–60000 ms timeout and optional reward bounds, and accepts only a
+finite JSON response shaped as `{"reward":0.5,"evidence":"..."}`. The
+executable hash is checked before model/bootstrap work, immediately before
+every call, and again after the process exits. `reward.failure_policy` currently
+admits only `"fail"`; timeout, nonzero exit, malformed output, digest drift,
+or out-of-range reward aborts the job rather than substituting a score.
+Requests, responses, stderr,
+provider-level scores, aggregate scores, and content digests are retained under
+the artifact root. Do not put secrets in prompts unless that audit retention
+policy is acceptable.
+
+A `model-command` provider uses the same no-shell, empty-environment process
+boundary, but it cannot be configured as an unlabelled generic verifier. It
+requires absolute paths and `sha256:` identities for the reward-model artifact,
+tokenizer, chat template, and calibration dataset, explicit `min_reward` and
+`max_reward`, a `max_input_tokens` ceiling, and `max_batch_size = 1` (the only
+batching policy implemented by the current per-completion exchange). Antfly
+hashes all five executable/model inputs before model/bootstrap loading,
+immediately before every score, and after every score. The v2 request carries
+the pinned identities and ceilings. A successful response must attest the four
+artifact digests and the actual positive input-token count:
+
+```json
+{
+  "reward": 0.73,
+  "evidence": "calibrated helpfulness logit",
+  "input_tokens": 384,
+  "model_sha256": "sha256:...",
+  "tokenizer_sha256": "sha256:...",
+  "chat_template_sha256": "sha256:...",
+  "calibration_dataset_sha256": "sha256:..."
+}
+```
+
+Missing or mismatched attestations and token-limit overruns fail the job. The
+attested identities, limits, measured token count, exchange-file digests, and
+score are copied into each train/eval trace record. This is the production
+integration contract for a pinned local reward-model runner; it is deliberately
+not an implicit network service or an assertion that Antfly ships a universal
+reward model. The subprocess boundary is covered by an integration test that
+executes a pinned command with an empty environment, validates its v2 request
+and response attestations, and rejects a nonzero exit and an out-of-bounds
+score. Failed external/model calls append a versioned
+`antfly_inference_grpo_reward_failure/v1` record with provider identity, error,
+exchange paths, and every available content digest before the run aborts.
+
+Every Gemma4 GRPO train/eval completion is recorded in separate JSONL traces
+(`grpo_reward_trace.jsonl` and `grpo_evaluation_reward_trace.jsonl` by
+default). Trace and verifier-exchange digests are included in the normalized
+artifact ledger, making the reward calculation replayable rather than an
+unattributed scalar. At most 32 providers and 16 static arguments per external
+provider are admitted. In-memory trace construction is fail-closed at 64 MiB
+by default; set `reward.max_trace_bytes` explicitly within the supported
+1 KiB–1 GiB range for a bounded larger campaign.
+
+`exact-match` is trimmed byte equality; it does not award a partial substring
+reward. `exact-match-ci` is trimmed ASCII case-insensitive equality. Token
+reward modes tokenize the trimmed `target` and compare token IDs directly,
+which is useful for format and control-token objectives that intentionally
+disappear during normal decoding. Empty targets fail closed. Optimizer-backed Gemma4 GRPO also
+requires at least one nonzero reward-derived advantage and a nonzero policy
+gradient before it can publish an adapter; a KL-only update is not accepted as
+a successful GRPO run. An explicit `model.reference_path` different from the
+policy base fails closed; the compiled zero-LoRA reference is valid only for
+the same base graph and weights.
+
+For the fixed E2B performance diagnostic, set
+`ANTFLY_GEMMA4_GRPO_BENCHMARK=1`. The recipe must produce exactly 25 complete
+groups: one cold group, one first steady group, three warmups, and 20 measured
+groups. The GRPO report records the complete loss/reward/parity telemetry for
+each group plus measured median and mean duration. The checked-in workload is
+`testdata/gemma4_grpo_e2b_seq128_benchmark.json`, with the corresponding
+single-row CLI dataset in
+`testdata/gemma4_grpo_e2b_seq128_benchmark.jsonl`. The pinned MLX-LM side is
+`scripts/run_gemma4_grpo_mlx_benchmark.py`.
+
+The optimized 2026-08-17 same-Mac E2B rank-16 Q/V diagnostic measured a
+five-run median-of-medians of `0.773689 s` per group for Antfly and `0.629479 s`
+for pinned MLX-LM. Antfly is now `22.91%` slower (`1.229x` duration), down from
+the first matched Antfly baseline of `3.692312 s`. Antfly's timed peak process
+footprint was `1,871,007,776` bytes versus MLX-LM's `11,767,013,080` bytes, an
+`84.10%` reduction. All five Antfly runs emitted the same complete loss
+trajectory and byte-identical adapter payload. Both frameworks selected initial
+tokens `[7001, 711]`, produced rewards `[1, 0]`, passed exact within-framework
+sampling/reference parity, and completed 25 optimizer updates.
+
+The speedup comes from one shared ranked prompt forward, sampling-logprob
+reuse, a bounded exact reference cache (two misses and 48 hits), one coalesced
+one-token group update, and a sparse selected-row projection. The Metal buffer
+allocator now fences a reused private buffer only when an active planned
+encoder proves the dependency and otherwise allocates fresh; this removed
+intermittent recycled-logit trajectories while retaining the low-memory result.
+
+This is not exact cross-framework numerical parity. The initial second-token
+base logprob differs by `0.110549`, the 25-step loss-trajectory MAE is
+`0.287661`, and the final loss delta is `0.327514`. The benchmark therefore
+qualifies the command path, repeatability, and bounded workload performance; it
+does not establish broad GRPO quality parity or a framework-only kernel ratio.
+
+Gemma4 multimodal GRPO remains an internal research lane. Public production
+recipes reject `model.projector_path` until the same disjoint evaluator and
+reward-evidence contract covers prepared media prompts; text-only GRPO is the
+admitted recipe surface.
 
 ### Remaining Task List
 
@@ -637,13 +1039,117 @@ Completed:
 35. Added Qwen3.5/Chandra fine-tune readiness gating so unified recipes no longer infer those models as Qwen2 or route adapter training through the Qwen2 autodiff graph.
 36. Added the first Qwen3.5 training graph slice: full-attention text layers now build with gated `q_proj`, Qwen3.5 `1 + weight` RMSNorm, and partial-RoPE metadata, while linear-attention layers fail explicitly.
 37. Added Qwen3.5 linear-attention graph IR and routed text SFT/DPO/GRPO adapter recipes through the Qwen autodiff trainer.
+38. Made Gemma4 DPO and GRPO honor the requested native or strict-Metal recipe backend for both policy training and reference scoring, with pair/group-safe accumulation and optimizer-step evidence in reports.
+39. Added deterministic synthetic Gemma4 DPO/GRPO execute cases, token-level GRPO rewards, owned reward-target storage, reward-distribution telemetry, and a fail-closed no-advantage/no-policy-gradient publication gate.
+40. Qualified one-step BF16 LoRA DPO and GRPO on real Gemma4 E2B and E4B artifacts through the Metal recipe route, including changed adapter payloads and non-degenerate GRPO rewards.
+41. Added exact compiled-graph frozen-reference caching and zero-adapter parity gates for Gemma4 DPO, resident device-weight policy scoring, preference-unit gradient scaling, and a matched 25-update E2B MLX benchmark contract.
+42. Replaced the eager Gemma4 text-GRPO reference with immutable zero-LoRA bindings on the compiled policy graph, added fail-closed sampling/reference parity and a 25-group benchmark protocol, and qualified the matched E2B Metal/MLX diagnostic above.
+43. Optimized the locked one-token GRPO path with shared ranked sampling, on-policy logprob reuse, an exact bounded reference cache, coalesced sparse-row gradients, and alignment-safe Metal projection; then made in-frame private-buffer reuse barrier-safe and qualified five byte-identical 25-group trajectories at `0.773689 s` median-of-medians and `1.871 GB` peak physical footprint.
+44. Optimized identical-prompt one-token Gemma4 DPO by sharing policy/reference projection and coalescing opposing gradients into one sparse weighted row. Five final E2B runs produced identical trajectories and adapters at `0.760557 s/update` median-of-medians (`2.427x` faster than the prior Antfly pair path); at that checkpoint DPO fail-safely disabled the unresolved Metal reuse pool and recorded that policy in the report.
+45. Routed general multi-token Gemma4 DPO policy scoring through cached pruned loss-only compiled sessions. Two byte-identical 25-update UltraFeedback runs measured a conservative `6.55229 s/update` median (`6.05%` below the eager-score fused path), retained exact initial base-reference parity, and matched all MLX preference decisions on training and disjoint holdout rows.
+46. Replaced redundant general multi-token policy scoring/backward with exact detached chosen/rejected device gradients and one optimizer flush, coalesced qualified rank-16 LoRA-A MPS dots, and added conservative exact-order add3 fusion. The exact final binary's 25-update sequence-512 run measured `5.05956 s/update` median and `14.744 GB` peak physical footprint, retained deterministic adapter bytes, and matched every MLX preference decision on both the five-row training set and disjoint holdout.
+47. Replaced the dominant decomposed Gemma4 attention VJP with a compact saved-value-aware path using five batched MPS contractions plus fused pack, softmax-VJP, and compact-KV reduction kernels. The exact E2B topology is now default-on with a kill switch: the final same-binary sequence-512 DPO gate improved median/mean by `9.75%/10.50%`, used `14.622 GB` peak footprint, reproduced three byte-identical 25-step trajectories, and retained full preference-decision agreement with MLX. E4B remains fail-closed on the decomposed graph because its superficially faster compact 25-step run diverged to update cosine `0.807816` and relative L2 `0.661817`.
+48. Repaired ahead-of-order fusion liveness, scoped the in-frame and completion-fenced Metal reuse policies as one drained-boundary transaction, and promoted planned-encoder-fenced reuse only for the exact E2B topology. Three alternating fixed-25 candidates, a same-hot-path rollback, and the final no-override run had identical loss arrays and adapter bytes. The final binary measured `2.53610 s/update` median and `8.759 GB` peak footprint: `37.98%` faster and `40.10%` lower-memory than rollback, only `23.13%` behind MLX median time, and `54.25%` below MLX peak memory. E4B reproduced its rollback adapter with in-frame reuse disabled.
+49. Traced the remaining E2B backward graph and implemented a bit-exact frozen-RMSNorm residual-add fusion with protected-output lifetime guards. All `138` expected chosen/rejected chains fused, and one-step plus fixed-25 adapters stayed byte-identical, but the measured gain was only `0.08%/0.12%` median/mean while lifetime footprint rose `4.90%`. The route is therefore research-only and default-off until its output write is integrated with a proven buffer-plan or last-use residual allocation.
+50. Replaced that rejected standalone output with a destructive final-use residual write, explicit same-encoder barrier, byte-range-aware alias proof, and chained-fusion coverage. The same-binary fixed-25 gate retained the canonical loss vector and adapter, removed exactly `6,900` Metal allocation requests, reduced lifetime peak by `203,587,560` bytes (`2.32%`) and completion-cache peak by `176,685,056` bytes (`3.26%`), and was throughput-neutral. The E2B route is production-default with an explicit disable switch.
+51. Made DPO/GRPO execution intent explicit and fail-closed: `execution.mode = "train"` can no longer fall through to precomputed scoring, score mode rejects ignored training fields, Gemma4 preference recipes receive family/backend/adapter/artifact preflight parity, v2 task reports bind mode and format, normalized reports fingerprint bootstrap and trained adapters, and publication requires a finite changed LoRA parameter set. The native frozen-reference path now selects the exact per-row weighted target layout instead of sending fused-CE ignore-index padding through a vocabulary gather; ReleaseFast synthetic Gemma4 DPO and GRPO each completed one optimizer step and published a changed adapter.
+52. Added mandatory disjoint held-out DPO/GRPO evaluation with explicit task thresholds, pre-publication gating, v3 task reports, evaluation artifacts, and normalized dataset/artifact fingerprints. A forced DPO quality failure wrote its failed report while leaving the trained adapter unpublished.
+53. Added typed deterministic GRPO reward composition and pinned external-command verifiers with no shell or inherited environment, bounded timeouts/rewards, preflight plus pre/post-call executable hash checks, and replayable train/eval request, response, evidence, and checksum traces. A ReleaseFast synthetic run combined one built-in and one external provider across training and held-out evaluation.
+54. Extended the GRPO reward contract with a pinned `model-command` provider: v2 requests bind model, tokenizer, template, calibration, token, and batch identities; responses must attest those inputs; invocation, timeout, malformed response, and out-of-range failures now emit structured checksum-bound failure traces. A real `/bin/sh` subprocess integration test covers success, nonzero exit, and bounds rejection without an inherited environment.
+55. Qualified final-binary real process-kill/resume for E2B and E4B BF16 Metal LoRA with byte-identical adapters and exact post-boundary trajectories. The explicitly admitted official E2B Q4_0 GGUF lane also passed exact paired optimizer repeatability and process-kill/resume after selecting the deterministic graph-visible decomposed vocabulary loss; public `qlora-sft` remains fail-closed.
+56. Added a provenance-pinned `google/boolq` GRPO materializer and completed a real E2B Metal acceptance cell: eight updates over a bounded real train slice published a changed adapter, then all 64 disjoint held-out rows passed mean reward `0.36328125`, top-ranked reward `0.703125`, positive-group rate `1.0`, and KL `5.83758e-7`. Preserved 64- and 192-update campaigns failed closed with KL `1.62371584e9`, establishing that long-horizon GRPO stability remains a release blocker rather than hiding it behind the bounded pass.
+57. Closed the bounded E2B GRPO parity gate through the final public ReleaseFast CLI. A process-scoped, frame-drained BF16 mmap row-staging guard removed cross-runtime Metal trajectory drift without changing ordinary serving policy; the final adapter and train/eval traces are byte-identical to the accepted trajectory. The pinned MLX comparison passes every behavioral bound but not numerical parity: MLX is `7.411x` faster, while Antfly uses `69.208%` less peak physical memory in this exact 8-update/64-eval BoolQ cell.
+58. Replaced one-token GRPO's per-candidate policy/reference forwards with shared-prompt ranked scoring, batched initial policy rescore, and phase-separated policy/reference evaluation. A direct device axis-0 gather now selects sparse hidden rows without inserting ephemeral activations into the pointer-keyed embedding cache; the legacy device-table fallback also rejects pointer-only hits. The final public E2B BoolQ run retained the exact canonical adapter and train/eval traces at `70.81 s`, `4.378x` faster than the previous Antfly acceptance. Fresh pinned MLX behavioral parity passed at `43.0698 s`, leaving a `1.644x` runtime gap while Antfly used `69.324%` less peak physical memory.
+59. Promoted alignment-safe sparse-row projection across multi-token GRPO sampling plus policy/reference rescoring under one default-on rollback switch. Real pinned BoolQ E2B two- and four-token cells and an E4B four-token cell retained byte-identical reward traces and adapters versus full projection, including variable `[4, 4, 3]` completion lengths and exact-zero within-mode sampling/rescore parity. E2B wall time improved `15.1%` and `5.3%`; the noisy E4B two-run median improved `7.1%`. The promotion-build E4B same-binary comparison cut maximum RSS `48.3%` and peak physical footprint `6.4%`. Whole-transformer completion batching remains default-off because real Metal parity failed by up to `0.010498047`.
+60. Added raw-K3 train-time admission and an optional bounded proportional KL controller to text and multimodal Gemma4 GRPO, with v4/v2 train/eval reports and an atomic per-group control trace. Pinned real BoolQ E2B and E4B campaigns each completed 8 four-token groups plus 16 disjoint held-out groups, while matched MLX trace-replay and native-rollout lanes kept physical candidate batch size one and zero sampling/rescore drift. Antfly remained `3.591x/2.707x` slower for E2B train/eval and `3.345x/2.037x` slower for E4B, while using `61.86%` and `64.72%` less peak physical memory. Reward behavior passed the bounded comparison, but adapter-delta cosine was only `0.5336`/`0.5987`; both artifacts therefore retain the explicit `bounded-campaign-with-measured-drift` classification and reject broad performance or long-horizon quality parity claims.
+61. Added opt-in prompt-prefill and paged incremental KV reuse for sparse multi-token Gemma4 GRPO, live Q/V LoRA decode, device-resident ranked selection, v5/v3 telemetry, and an exact full-prefix comparison gate. Real pinned E2B and E4B campaigns matched the baseline train reward trace, held-out reward trace, KL-control trace, and final adapter byte-for-byte with zero host-logit fallback. Fresh matched MLX reprofiling measured Antfly at `5.663x/5.574x` E2B train/eval and `4.993x/4.427x` E4B; the incremental Antfly lane itself was `1.569x/1.895x` and `1.524x/2.065x` slower than full-prefix. It therefore remains default-off pending a batched or compiled decoder that passes the same exact gate and beats rollback.
+62. Replaced per-candidate prompt-tail replay with one canonical tail prefill plus in-frame KV cloning. Exact real BoolQ E2B/E4B campaigns retained byte-identical adapters and train/eval/KL traces while reducing incremental sampling by `9.3-15.8%` in training and `11.1-13.0%` in evaluation. An Unsloth-inspired independent-row multi-token backward lane reduced one-group backward time by `36.5-55.2%` on E2B and `28.5%` on E4B, but increased peak physical memory and changed adapter bytes by about `2e-7` max elementwise, so it remains default-off. The existing sequence packer cannot be enabled for Gemma until the graph consumes segment masks and reset positions; the production target is a `cu_seqlens`-driven ragged/segment-aware GQA path with exact E2B/E4B rollback gates.
+63. Added opt-in pair-safe DPO length scheduling with one shared rounded chosen/rejected shape, pair-shared weighted-target buckets, bounded graph caching, report provenance, and fail-closed GRPO exclusion. On the final ReleaseFast binary, Q128/min256 improved Antfly median update time by `1.332x` on E2B and `1.234x` on E4B. A fresh matched MLX-LM reprofile found Antfly fixed E4B `11.97%` faster by median and effectively tied by mean with `18.26%` less peak memory, but MLX-LM's Q128 path remained `1.739x/2.098x` faster by median/mean with equal memory. Common-oracle disjoint quality gates passed bounded behavior at `1.0` E2B and `0.88` E4B Q128 decision agreement; exact and broad quality parity remain explicitly unclaimed.
+64. Production-hardened the bucketed preference surface after review: DPO graph-signature telemetry and DPO/GRPO train/eval overlap checks are now hash-indexed linear passes instead of quadratic scans, bucketed DPO defaults to the qualified four-graph cache rather than the unqualified eight-graph maximum, and every distinct bucket graph signature receives a zero-adapter policy/reference parity check before optimizer mutation. DPO MLX training report v3 and shared-oracle evaluation v2 reject unknown model keys, verify and recheck the complete model/input surface, package versions, clean source revisions, closed four-artifact native runtime, loaded dylibs, and strict native-build attestation before publishing outputs.
+65. Closed the preference recovery/evaluation boundary with report v6,
+    content-addressed aggregate sidecars, resolved Metal numerical-policy
+    fingerprints, and fresh-backend terminal evaluation. Real SIGTERM/resume
+    campaigns passed on E2B and E4B DPO/GRPO with byte-identical adapters and
+    exact training/discrete traces. The GRPO qualifier v2 records narrowly
+    bounded terminal-only Metal KL deltas after repeated identical-checkpoint
+    replays proved the residual variation is in GPU forward evaluation rather
+    than checkpoint restoration. At that snapshot, direct-GGUF preference and
+    checkpointed incremental-KV GRPO remained explicit fail-closed boundaries.
+66. Hardened the final preference qualification boundary after audit. The v5
+    run fingerprint and v2 Metal numerical policy now bind sparse-loss/CCE
+    geometry, eager LoRA/dot/quant routes, and graph-executor fusion routes;
+    unknown policy environment names and non-canonical values fail before
+    model or optimizer mutation. The qualifier now canonicalizes its inherited
+    environment, rejects symlink leaves and input/output overlap, verifies the
+    complete adapter tree and manifest, preserves immutable seed companions,
+    and independently requires a changed adapter tensor. Rebuilt the final
+    source as one ReleaseFast Metal binary and passed all four same-binary real
+    E2B/E4B DPO/GRPO SIGTERM/resume campaigns: DPO recovered exactly; GRPO
+    recovered exactly outside the documented terminal derived-loss/KL bounds.
+    The prior v9/v7/v6 artifacts remain historical regression evidence.
+67. Rebuilt the audited source as one ReleaseFast Metal binary and ran
+    three-seed, eight-epoch quality campaigns from fixed E2B/E4B seed adapters.
+    E2B and E4B DPO passed all 120 optimizer updates with distinct final
+    adapters and positive held-out margins; E2B GRPO passed all 192 updates,
+    held-out reward/KL floors, and zero host-logit fallback. E4B GRPO completed
+    64 healthy updates at seed 17 but failed the predeclared held-out top-rank
+    floor (`0.0625 < 0.125`), so the harness stopped without weakening the
+    threshold. Canonical direct-GGUF E2B DPO and GRPO also reproduced their
+    interruption/resume adapter digests. SafeTensors E2B/E4B incremental-KV
+    GRPO passed epoch-boundary recovery with exact adapters, exact terminal KL
+    values in the final runs, complete cumulative telemetry, and zero host
+    fallback; public `qlora-sft` and direct-GGUF plus incremental-KV GRPO remain
+    fail-closed. A final-source fixed/Q128 same-Mac reprofile found MLX faster
+    in all four E2B/E4B DPO cells. Antfly retained `31.19-39.64%` lower E2B
+    peak memory and `17.00%` lower fixed-E4B memory; E4B Q128 was `1.990x`
+    slower by median and `1.19%` higher-memory. This supersedes the prior
+    one-sample fixed-E4B timing lead without claiming a process distribution.
+68. Closed the two P1 public preference boundaries found in final review.
+    Mutable recipe paths now canonicalize their deepest existing filesystem
+    ancestor before overlap checks, so a not-yet-created output below a symlink
+    into an immutable input fails before plan or artifact publication. Product
+    admission and both Python qualifiers share one typed, SHA-256-bound
+    environment policy; qualification strips all inherited `TERMITE_*` and
+    `ANTFLY_GEMMA4_*` overrides, while the product explicitly rejects the
+    graph-output ownership/elision, host-mirror resync, and paged-KV kill
+    switches. Exact-source Debug, ReleaseSafe, and ReleaseFast gates each
+    selected 284 tests (282 pass, two optional fixture skips); graph gates pass
+    7/7 in both checked modes, lifecycle passes 4/4, and public ReleaseFast
+    probes reject both P1 cases without creating output artifacts. The known
+    E4B GRPO quality miss and direct-GGUF/incremental-KV rejection remain
+    unchanged.
 
 Remaining:
 
-1. Add real-weight one-step smoke coverage for Qwen3.5 text SFT/DPO/GRPO on CPU and MLX/Metal.
-2. Add execute-path verification for the broader Qwen-family text-decoder routes, including ColQwen2 if we keep that path.
-3. Add Chandra multimodal training data preparation with dynamic image-token expansion before enabling multimodal fine-tune recipes.
-4. Add more GRPO reward modes if we need tasks beyond exact, exact-match-ci, and prefix matching.
+1. Profile and coarsen the larger sequence-512 projection/normalization regions now that the RMSNorm-backward residual chain no longer allocates standalone outputs. Keep the compact attention VJP and in-frame reuse E2B-only until numerically stable E4B implementations pass multi-step trajectory and shared-oracle gates.
+2. Turn the exact-but-slower incremental-KV GRPO lane into a real speedup: integrate live LoRA into a compiled paged decoder, and eliminate the per-completion canonical rescore only after its logprobs are bit-exact. In parallel, add length-bucketed independent rows and then a `cu_seqlens`-driven ragged/segment-aware Gemma attention path with block isolation and per-segment RoPE reset for SFT, DPO scoring/backward, and GRPO rescoring/backward. Preserve deterministic ranked ordering and optimizer boundaries, require the existing exact E2B/E4B artifact gate, and beat the full-prefix/unpacked rollback on both models. Keep dense independent-row GRPO batching research-only until a predeclared tolerance-based quality gate justifies its higher memory and changed reduction order.
+3. Close the optimized E4B DPO gap with a bounded-memory compiled whole-pair
+   objective or segment-aware packed chosen/rejected graph. In the final-source
+   refresh, fixed E4B is `1.224x/1.241x` slower than MLX by median/mean while
+   retaining `17.00%` lower peak memory. Q128 is `1.990x/2.663x` slower and
+   uses `1.19%` more peak memory despite improving Antfly's fixed median by
+   `1.341x`. Preserve pair semantics, optimizer order, stable reductions, and
+   the fixed rollback while removing short-shape launch/graph overhead. Then
+   run the five-process alternating distribution gate. The matched eight-group
+   E4B multi-token GRPO cell is complete; extend it only after diagnosing the
+   failed predeclared long-horizon top-rank quality floor.
+4. Add real-weight one-step smoke coverage for Qwen3.5 text SFT/DPO/GRPO on CPU and MLX/Metal.
+5. Add execute-path verification for the broader Qwen-family text-decoder routes, including ColQwen2 if we keep that path.
+6. Add Chandra multimodal training data preparation with dynamic image-token expansion before enabling multimodal fine-tune recipes.
+7. Qualify a pinned real reward model through the new `model-command` contract,
+   including calibration-quality gates, repeated deterministic scores, bounded
+   RSS/latency, and a real train/eval campaign. The contract and fail-closed
+   artifact/resource attestations are implemented; no universal reward-model
+   checkpoint is bundled.
+8. Extend the completed three-seed/eight-epoch E2B/E4B UltraFeedback DPO and
+   E2B BoolQ GRPO absolute-floor gates with independent adapter
+   initializations, baseline-relative held-out gates, larger disjoint datasets,
+   additional tasks, and an explicit throughput/RSS distribution against
+   MLX/HF. E4B GRPO remains blocked: seed 17 completed its 64-update horizon
+   with bounded KL and nonzero reward, but repeated the same reward trajectory
+   across epochs and missed the predeclared top-rank floor. Diagnose that
+   under-learning without post-hoc threshold relaxation before running the
+   remaining seeds.
 
 ---
 
@@ -1311,20 +1817,46 @@ Adapters are saved in PEFT-compatible format
 
 ### Gemma4 LoRA
 
-This section documents the Gemma family backend commands. Prefer a recipe for
-normal use:
+Gemma4 E2B/E4B LoRA is an experimental, single-device, text-only lane. It is
+not production-ready. The authoritative current-state, validation, and release
+gate document is [GEMMA4.md](GEMMA4.md); this section is only the command and
+data-schema index.
+
+The recipe planner and convenience workflows now use the mandatory four-step
+held-out-eval contract:
 
 ```sh
 antfly inference finetune run recipe_gemma4_lora.json
 antfly inference finetune run recipe_gemma4_lora.json --dry-run
 ```
 
-Three-step pipeline: dataset preparation, tokenization, then train/eval. Gemma now supports two training modes:
-- `--trainer surrogate`: legacy bounded surrogate-gradient training
-- `--trainer autodiff`: real token-level causal-LM LoRA training for Gemma text configs, including Gemma4 sliding-attention and shared-KV variants
-- Multimodal Gemma prepared inputs can now be produced through `prepare-gemma4-lora-inputs --gguf-projector <projector.gguf>`, which expands image/audio placeholder runs before tokenization and records media references for the real-autodiff trainer
+The supported-intent flow has four steps: prepare training inputs, prepare a
+separate evaluation artifact, bootstrap the adapter, then train/evaluate with
+`--eval-prepared`. `--trainer auto` is an autodiff alias; it never falls back to
+surrogate training. The legacy explicit surrogate spelling returns a typed
+unsupported error and is not a runnable public mode.
 
-Adapters are saved in PEFT-compatible format (`task_type = "CAUSAL_LM"`).
+Public prepare/train paths reject multimodal/projector inputs before backend
+work. Historical multimodal tools remain diagnostic only and are not an
+accepted training lane.
+
+New adapter directories contain a public-schema `adapter_config.json`
+(`task_type = "CAUSAL_LM"`) and the Antfly-only
+`antfly_finetune_manifest.json` sidecar. The Safetensors payload currently uses
+Antfly's weight-qualified tensor keys, so do not describe the raw training
+bundle as directly interchangeable. Export a standard `peft-qv` or
+`text-all-linear` artifact through the public immutable conversion boundary:
+
+```sh
+antfly inference finetune adapter export gemma4-peft \
+  --model <base_model_dir> --adapter <trained_adapter_dir> \
+  --out <new_peft_adapter_dir>
+```
+
+The export preserves F32 payload bytes, emits stock PEFT tensor keys, and adds
+a hash-bound `antfly_peft_export.json` sidecar. A pinned structural smoke test
+loads, saves, and reloads the result with PEFT at exact tensor and logit
+equality. Real E2B/E4B numerical interoperability remains a release gate.
 
 #### Chat Dataset Contract
 
@@ -1336,7 +1868,8 @@ Each `gemma_chat/v1` JSONL row may include:
 - `split`: optional split name
 - `messages`: ordered turns with `role` in `system|user|assistant|tool`
 - `tools`: optional tool specifications for provenance/documentation
-- `metadata`: optional fields such as `policy_version` and `source`
+- `metadata`: optional fields such as `policy_version`, `source`, and
+  `group_id` (or the accepted `group` alias)
 
 Assistant turns may include `tool_calls`, and tool turns may include `tool_call_id` plus `name`. On the Gemma rendering path:
 - assistant text and assistant tool-call blocks are supervised
@@ -1372,18 +1905,27 @@ The multimodal preparation path now accepts the same `messages` contract for tex
 
 The current multimodal converter still materializes a flat CSV (`image,prompt,response`) artifact, so it shares the conversation schema at ingestion time while keeping the existing output contract.
 
-**Step 2 — tokenize examples:**
+**Prepare training and evaluation inputs separately:**
 ```
 usage: prepare-gemma4-lora-inputs <model_dir> <dataset_path> <split|-> <out_summary_json> [options]
 
   --max-examples N    Maximum number of examples to prepare (default: 0 = all)
   --max-seq-len N     Maximum sequence length in tokens (default: 512)
+  --dataset-revision R Immutable source revision (default: resolved split digest)
 ```
 
-#### Prepared Inputs v2/v3
+Run this command once for the training source and once for a genuinely disjoint
+evaluation source/split. The training command requires the second artifact via
+`--eval-prepared`. Sequence admission is currently bounded to
+`1..min(model context, 2048)` before backend construction.
 
-`prepare-gemma4-lora-inputs` now emits a richer prepared-input summary for chat/tool datasets. Each prepared example records:
-- legacy prompt/response token views for compatibility with the current surrogate trainer
+#### Prepared Inputs v6
+
+`prepare-gemma4-lora-inputs` emits `gemma4_prepared/v6`. It uses causal
+generation tokenization: the rendered chat owns one literal BOS, no implicit
+EOS is appended, and every assistant turn is supervised even when the
+tokenizer does not expose offsets. Each prepared example records:
+- legacy prompt/response token views for format compatibility
 - full rendered `input_ids`
 - `labels` with non-assistant and tool-response tokens masked to the ignore label
 - `num_input_tokens`
@@ -1392,19 +1934,29 @@ usage: prepare-gemma4-lora-inputs <model_dir> <dataset_path> <split|-> <out_summ
 - `has_tool_calls`
 - `has_tool_messages`
 - optional `policy_version`
+- source id and group id
+- canonical source-record and rendered-chat SHA-256 digests
+- content digests for every referenced image or audio payload
 
-The summary also records aggregate metadata:
-- `schema_version = "gemma4_prepared/v2"` for text/chat datasets
-- `schema_version = "gemma4_prepared/v3"` for multimodal datasets with image/audio placeholder accounting
+The summary also records:
+- base-artifact, tokenizer-asset, and chat-template identity digests
+- source dataset path/content digest, split, and immutable revision
+- a schema-aware canonical prepared-example digest
 - `max_input_tokens`
 - `max_supervised_tokens`
 - `examples_with_tool_calls`
 - `examples_with_tool_messages`
 - `examples_with_multiturn`
 
-The loader only accepts these supported prepared schemas and rejects unknown versions at load time.
-
-This prepared artifact now feeds both Gemma trainer modes. The surrogate path still reads the legacy prompt/response views, while the autodiff path trains directly from `input_ids + labels`.
+The loader recomputes sequence, supervision, modality, and aggregate counters;
+validates vocabulary bounds; and compares train/eval identities to the selected
+model and adapter. It rejects prepared-token, canonical source-row, and group
+overlap. Prepared and standalone eval JSON are file-synced and atomically
+published without replacement. They remain whole-buffer artifacts with a 128
+MiB load ceiling, so streaming immutable shards are still required for
+production-scale datasets. `gemma4_prepared/v4` and `/v5` are read for
+migration/inspection compatibility but are rejected by the production trainer;
+only v6 supplies the causal-tokenization contract used by release evidence.
 
 **Optional — materialize teacher targets:**
 ```
@@ -1419,6 +1971,10 @@ usage: materialize-gemma4-teacher-targets <base_model_dir> <prepared_inputs_json
 This tool runs the full Gemma4 teacher model over prepared inputs and writes sparse row-major `teacher_top_k_token_ids` and `teacher_top_k_probs` into the output prepared-input JSON. For multimodal prepared inputs, pass `--gguf-projector <projector.gguf>` unless the prepared summary records a valid projector path. The autodiff trainer consumes those soft targets when present, which is the first distillation path for recursive LoRA compression.
 Teacher probabilities are produced after applying `--temperature`, and the trainer applies the standard distillation `T^2` loss scale from each example's `teacher_temperature`.
 
+This utility does not yet bind the supplied teacher model to the prepared
+artifact's model provenance. Treat teacher-target materialization as
+experimental until the teacher/base digest is validated and persisted.
+
 **Optional — materialize compressed recursive base:**
 ```text
 usage: materialize-gemma4-recursive-base <base_model_dir> <recursive_adapter_dir> <out_dir> [options]
@@ -1432,7 +1988,7 @@ For the recursive compression path, the bounded smoke workflow is:
 usage: run-gemma4-recursive-lora-smoke-workflow <base_model_dir> <output_root> [options]
 ```
 
-The corresponding build step is `zig build run-gemma4-recursive-lora-smoke-workflow -- <base_model_dir> <output_root> ...`. It bootstraps a recursive LoRA adapter, materializes teacher targets, trains/evaluates with the autodiff trainer, and validates that recursive and teacher metadata survive the round trip.
+The corresponding developer build step is `zig build run-gemma4-recursive-lora-smoke-workflow -- <base_model_dir> <output_root> ...`. Its current implementation prepares a distinct evaluation dataset/artifact and passes it to the typed training operation. It remains experimental until the integrated tests and pinned real-model recursive campaign pass.
 Successful real runs write `<output_root>/recursive_smoke_results.json` with adapter sizes, before/after loss, teacher coverage, elapsed time, and supervised-token throughput.
 For Gemma4 E2B, use `--recursive-shared-block-size 5`; the text stack has 35 layers and the local/full attention pattern repeats every five layers. The current recursive smoke defaults to attention-only targets (`q_proj,k_proj,v_proj,o_proj`) because E2B MLP weights become double-wide after layer 15.
 
@@ -1452,39 +2008,129 @@ usage: analyze-gemma4-recursive-lora-sweep <comparison_json> <out_dir> [options]
 
 The build step is `zig build analyze-gemma4-recursive-lora-sweep -- <comparison_json> <out_dir> ...`. It writes `recursive_lora_sweep_decision.json` and `.md` using explicit loss, adapter-size, compressed-base-size, teacher-coverage, and throughput thresholds.
 
-**Step 3 — train/eval:**
+**Step 4 — train/eval (canonical public interface):**
 ```
-usage: train-eval-gemma4-lora-bundle <base_model_dir> <adapter_model_dir>
-    <prepared_inputs_json> <out_dir> [options]
+antfly inference finetune train gemma4-lora \
+  --model <base_model_dir> --adapter <adapter_model_dir> \
+  --train-prepared <prepared_train.json> --eval-prepared <prepared_eval.json> \
+  --out <out_dir> --backend native|metal [options]
 
 Flags:
-  --trainer auto|surrogate|autodiff   Trainer implementation (default: auto)
+  --trainer auto|autodiff       Trainer implementation (default: autodiff; auto is an autodiff alias)
   --lr, --learning-rate <f>     Learning rate (default: 0.001)
   --max-examples <n>            Max examples per epoch (default: 32)
+  --eval-max-examples <n>       Max examples for before/after evaluation
   --epochs <n>                  Number of epochs (default: 1)
-  --layer-name, --layer <str>   Scope to layer name
+  --layer-name, --layer <str>   Rejected by the autodiff trainer until scoped semantics are implemented
   --max-grad-norm <f>           Gradient norm clipping threshold (default: 1.0, 0=disabled)
   --grad-accum <n>              Gradient accumulation steps (default: 1)
-  --llrd-decay <f>              Surrogate-only layer-wise LR decay (default: 1.0=disabled)
-  --schedule-free               Surrogate-only Schedule-Free AdamW (default: false)
-  --backend auto|mlx|native       Compute backend (default: auto)
+  --activation-checkpoint-interval <n>  Recompute every N layer boundaries
+  --sequence-length-bucket-quantum <n>  Opt in to independent-row text SFT buckets
+  --sequence-length-bucket-min <n>      Minimum scheduled row length (default: one quantum)
+  --graph-cache-capacity <n>            Retained bucket graphs (auto 4, maximum 8)
+  --llrd-decay <f>              Rejected by autodiff unless left at 1.0
+  --schedule-free               Rejected by autodiff
+  --backend native|metal        Required; there is no automatic backend fallback
 ```
 
 Trainer mode behavior:
-- `auto` selects `autodiff` for currently supported Gemma text configs and falls back to `surrogate` for unsupported architecture variants
-- `autodiff` currently supports Gemma4 sliding-attention, per-layer RoPE, omitted `v_proj` on full-attention layers, and shared-KV donor reuse
-- `autodiff` also supports multimodal Gemma training when the prepared artifact includes media references and the train/eval command is given `--gguf-projector <projector.gguf>`; the trainer feeds projected soft-token embeddings through an internal `__input_embeddings` placeholder while continuing to train only the Gemma decoder/LoRA path
-- `autodiff` still rejects MoE, PLE, and non-RoPE Gemma configs
+- `auto` is retained only as an alias for `autodiff`; it never falls back to a
+  successful surrogate run
+- `autodiff` supports the Gemma4 text graph contract, including PLE,
+  sliding/full attention, per-layer GQA/RoPE, and shared-KV donor reuse
+- compiled Metal evaluation uses a loss-only graph and does not allocate
+  gradients or Adam moments
+- independent-row length buckets are text LoRA-SFT-only and default off; they
+  preserve sample order, causal isolation, and RoPE origins while recording
+  avoided padding and bounded graph-cache telemetry
+- public multimodal/projector training is rejected before backend work
+- MoE and non-RoPE Gemma configs remain unsupported
 - `autodiff` uses token-level next-token cross-entropy over the prepared `labels` mask, including assistant tool-call output while masking tool responses
-- `autodiff` reuses the incoming Gemma PEFT adapter bundle as initialization and writes the trained adapters back out in the same bundle format
+- `autodiff` reuses the incoming Gemma adapter bundle as initialization and
+  writes the trained adapters back out with PEFT config semantics plus an
+  Antfly provenance/key-format sidecar
 
-Default LoRA target modules: `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`
+Default Gemma4 selection: exact `text-all-linear` paths. Use `peft-qv` for the
+smaller Q/V baseline. Exact paths and the preset are persisted in the Antfly
+sidecar; standard PEFT fields remain in `adapter_config.json`.
 
 Outputs:
-- `<out_dir>/adapter_model.safetensors` (PEFT format)
+- `<out_dir>/adapter_model.safetensors` (Antfly weight-qualified keys)
 - `<out_dir>/adapter_config.json` with `task_type = "CAUSAL_LM"`
-- `<out_dir>/train_eval_report.json` — `before`, per-epoch `epoch_history`, `after` metrics for the selected trainer
+- `<out_dir>/antfly_finetune_manifest.json` with model provenance, target
+  policy, and tensor-key format
+- `<out_dir>/train_eval_report.json` — `before`, per-epoch `epoch_history`,
+  `after`, whole-run `phase_timing`, and bounded `graph_cache` metrics for the
+  selected trainer. Each epoch records monotonic wall time, example/token/update
+  rates, and its graph-cache delta without introducing an extra GPU
+  synchronization.
 - `<out_dir>/training_config.json` and `<out_dir>/training_report.json`
+- `<out_dir>/run_manifest.json` — closed completion ledger with the size and
+  SHA-256 digest of every other regular root payload
+
+For stock PEFT deployment, export the completed directory to a new path with
+`adapter export gemma4-peft`. The destination contains
+`adapter_model.safetensors`, `adapter_config.json`, and
+`antfly_peft_export.json`; the source training artifact is unchanged.
+
+`<out_dir>` must not exist. The adapter and every report are written to a
+sibling staging directory and published together with one no-replace rename.
+Gemma4 Metal train and eval select the strict training executor themselves; no
+executor environment opt-in is required by the public CLI. Explicit diagnostic
+disable/parity flags remain fail-closed. Every step rejects native/unsupported
+partitions, interpreter/runtime fallback, true host outputs, undeclared or
+graph-execution uploads, explicit runtime-input transfers,
+gather/reduce/cache promotions, or non-resident gradients before optimizer
+mutation. Stored BF16
+Safetensors use the dedicated device-only frozen-linear input-gradient kernel;
+autodiff prunes frozen base-weight gradients that cannot reach a requested
+LoRA parameter. The default eight-row sparse vocabulary-loss chunk additionally
+selects an exact-arithmetic M8/N32/K64 Metal input-gradient tile only for its
+large aligned BF16 shape; other shapes retain the generic route. Diagnostic
+operators can force the generic route with
+`TERMITE_METAL_DISABLE_BF16_BACKWARD_SMALL_ROWS=1`. Packed Q4_0, Q4_K, and
+Q6_K frozen-linear input gradients now
+pass direct runtime and graph-executor tests without host dequantization, but
+whole-model GGUF training and the Gemma4 `qlora-sft` recipe remain fail-closed
+for public recipes until a real parity, memory, and task-quality campaign
+passes. The experimental direct-GGUF E2B lane now completes exact Metal
+optimizer and interrupted/resumed trajectories; it automatically selects the
+graph-visible decomposed vocabulary loss because the fused wrapper around a
+quantized tied head was not repeatable. Stored F16 remains outside the
+documented production contract. See
+[GEMMA4.md](GEMMA4.md) for the authoritative release gates.
+
+Standalone loss-only evaluation is available as:
+
+```sh
+antfly inference finetune eval gemma4-lora \
+  --model <base_model_dir> --adapter <adapter_dir> \
+  --prepared <prepared_eval.json> --out <eval.json> --backend native|metal
+```
+
+It validates the same model/adapter/prepared contracts and atomically publishes
+an immutable report without allocating gradients or Adam moments.
+
+Activation checkpointing is recomputation only. The low-level trainer can now
+save/inspect/restore weights, Adam state, incomplete accumulation, counters,
+and caller-owned epoch/cursor/RNG progress, including resident Metal slot
+restoration. The Gemma4 CLI exposes `--checkpoint-path`,
+`--checkpoint-every-epochs`, and `--resume`; recipes expose one mutable
+epoch-boundary state through `checkpoint.every_epochs` and
+`checkpoint.resume_path` while rejecting `keep_last`. Resume binds the exact
+run fingerprint, including the selected fused/decomposed loss-graph mode, and
+must publish to a new immutable output directory. On 2026-08-19, the final
+ReleaseFast binary passed real process-kill/resume qualifications for E2B and
+E4B BF16 SafeTensors with byte-identical final adapters and exact post-boundary
+loss/gradient trajectories. The explicit direct-GGUF E2B Q4_0 lane passed the
+same gate. Evidence is retained at
+`/private/tmp/antfly-gemma4-e2b-resume-acceptance-20260819-v3`,
+`/private/tmp/antfly-gemma4-e4b-resume-acceptance-20260819-v2`, and
+`/private/tmp/antfly-gemma4-e2b-gguf-qlora-resume-acceptance-20260819-v3`.
+
+For the pinned HF/PEFT correctness oracle, same-Mac MLX-LM performance harness,
+and Unsloth's separate CUDA-only comparison role, see
+[GEMMA4_ORACLE.md](GEMMA4_ORACLE.md).
 
 ---
 

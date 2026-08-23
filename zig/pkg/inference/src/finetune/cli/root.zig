@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const recipe = @import("../recipe.zig");
+const gemma4_train_command = @import("../gemma4_train_command.zig");
 const analyze_gemma4_recursive_lora_sweep = @import("../tools/analyze_gemma4_recursive_lora_sweep.zig");
 const bootstrap_colqwen2_lora = @import("../tools/bootstrap_colqwen2_lora.zig");
 const bootstrap_gemma4_lora = @import("../tools/bootstrap_gemma4_lora.zig");
@@ -29,6 +30,7 @@ const eval_gliner2_autodiff_adapter_dataset = @import("../tools/eval_gliner2_aut
 const eval_gliner2_boundary_head = @import("../eval/eval_gliner2_top_layer_boundary_head.zig");
 const eval_gliner2_boundary_task_head = @import("../eval/eval_gliner2_top_layer_boundary_task_head.zig");
 const eval_reranker_checkpoint = @import("../eval/eval_reranker_checkpoint.zig");
+const export_gemma4_peft = @import("../tools/export_gemma4_peft.zig");
 const generate_gemma4_multimodal_pilot_dataset = @import("../tools/generate_gemma4_multimodal_pilot_dataset.zig");
 const generate_gemma4_pilot_dataset = @import("../tools/generate_gemma4_pilot_dataset.zig");
 const inspect_colqwen2_checkpoint = @import("../tools/inspect_colqwen2_checkpoint.zig");
@@ -115,6 +117,7 @@ const commands = [_]Command{
     .{ .domain = "adapter", .action = "bootstrap", .subject = "layoutlmv3", .adapter_argv0 = "bootstrap-layoutlmv3-lora", .main_fn = bootstrap_layoutlmv3_lora.main },
     .{ .domain = "adapter", .action = "bootstrap", .subject = "reranker", .adapter_argv0 = "bootstrap-reranker-lora", .main_fn = bootstrap_reranker_lora.main },
     .{ .domain = "adapter", .action = "compose", .subject = "lora", .adapter_argv0 = "compose-lora-adapters", .main_fn = compose_lora_adapters.main },
+    .{ .domain = "adapter", .action = "export", .subject = "gemma4-peft", .adapter_argv0 = "export-gemma4-peft", .main_fn = export_gemma4_peft.main },
     .{ .domain = "adapter", .action = "inspect", .subject = "gemma4", .adapter_argv0 = "inspect-gemma4-lora-bundle", .main_fn = inspect_gemma4_lora_bundle.main },
     .{ .domain = "adapter", .action = "inspect", .subject = "gliner2", .adapter_argv0 = "inspect-gliner2-lora-bundle", .main_fn = inspect_gliner2_lora_bundle.main },
     .{ .domain = "adapter", .action = "inspect", .subject = "gliner2-checkpoint", .adapter_argv0 = "inspect-gliner2-checkpoint", .main_fn = inspect_gliner2_checkpoint.main },
@@ -170,6 +173,10 @@ pub fn main(init: std.process.Init, args: []const []const u8) !void {
         usage();
         return;
     }
+    if (args.len > 1 and isHelp(args[args.len - 1])) {
+        if (!printContextualHelp(args[0 .. args.len - 1])) return usageError();
+        return;
+    }
 
     const domain = args[0];
     if (std.mem.eql(u8, domain, "run") or std.mem.eql(u8, domain, "smoke-fast")) {
@@ -196,6 +203,31 @@ fn dispatch(
     subject: []const u8,
     args: []const []const u8,
 ) !void {
+    // Gemma4 commands use typed entrypoints so in-process dispatch never
+    // mutates `std.process.Init` or reparses a fabricated process argv.
+    if (std.mem.eql(u8, domain, "train") and std.mem.eql(u8, action, "run") and std.mem.eql(u8, subject, "gemma4-lora")) {
+        return gemma4_train_command.runFromArgs(init.gpa, init.io, args);
+    }
+    if (std.mem.eql(u8, domain, "eval") and std.mem.eql(u8, action, "run") and std.mem.eql(u8, subject, "gemma4-lora")) {
+        return gemma4_train_command.runEvalFromArgs(init.gpa, init.io, args);
+    }
+    if (std.mem.eql(u8, domain, "adapter") and std.mem.eql(u8, action, "validate") and std.mem.eql(u8, subject, "gemma4")) {
+        return gemma4_train_command.runValidateAdapterFromArgs(init.gpa, init.io, args);
+    }
+    if (std.mem.eql(u8, domain, "adapter") and std.mem.eql(u8, action, "bootstrap") and std.mem.eql(u8, subject, "gemma4")) {
+        return bootstrap_gemma4_lora.runFromArgs(init.gpa, init.io, args);
+    }
+    if (std.mem.eql(u8, domain, "adapter") and std.mem.eql(u8, action, "export") and std.mem.eql(u8, subject, "gemma4-peft")) {
+        return export_gemma4_peft.runFromArgs(init.gpa, init.io, args);
+    }
+    if (std.mem.eql(u8, domain, "dataset") and std.mem.eql(u8, action, "prepare") and
+        (std.mem.eql(u8, subject, "gemma4-lora") or std.mem.eql(u8, subject, "gemma4")))
+    {
+        var normalized = try normalizeGemma4PrepareArgs(init.gpa, args);
+        defer normalized.deinit(init.gpa);
+        return runCommand(init, "prepare-gemma4-lora-inputs", prepare_gemma4_lora_inputs.main, normalized.items);
+    }
+
     for (commands) |command| {
         if (std.mem.eql(u8, command.domain, domain) and
             std.mem.eql(u8, command.action, action) and
@@ -221,12 +253,82 @@ fn dispatch(
     return usageError();
 }
 
+fn normalizeGemma4PrepareArgs(allocator: std.mem.Allocator, args: []const []const u8) !std.ArrayListUnmanaged([]const u8) {
+    var model: ?[]const u8 = null;
+    var dataset: ?[]const u8 = null;
+    var split: ?[]const u8 = null;
+    var out: ?[]const u8 = null;
+    var options = std.ArrayListUnmanaged([]const u8).empty;
+    defer options.deinit(allocator);
+    var named_interface = false;
+    var positional_count: usize = 0;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--model")) {
+            named_interface = true;
+            i += 1;
+            if (i >= args.len or model != null) return usageError();
+            model = args[i];
+        } else if (std.mem.eql(u8, arg, "--dataset")) {
+            named_interface = true;
+            i += 1;
+            if (i >= args.len or dataset != null) return usageError();
+            dataset = args[i];
+        } else if (std.mem.eql(u8, arg, "--split")) {
+            named_interface = true;
+            i += 1;
+            if (i >= args.len or split != null) return usageError();
+            split = args[i];
+        } else if (std.mem.eql(u8, arg, "--out")) {
+            named_interface = true;
+            i += 1;
+            if (i >= args.len or out != null) return usageError();
+            out = args[i];
+        } else if (std.mem.eql(u8, arg, "--gguf-projector")) {
+            return error.Gemma4MultimodalFinetuningNotSupported;
+        } else if (std.mem.eql(u8, arg, "--max-examples") or
+            std.mem.eql(u8, arg, "--max-seq-len") or
+            std.mem.eql(u8, arg, "--dataset-revision"))
+        {
+            i += 1;
+            if (i >= args.len) return usageError();
+            try options.appendSlice(allocator, &.{ arg, args[i] });
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            return usageError();
+        } else if (!named_interface) {
+            switch (positional_count) {
+                0 => model = arg,
+                1 => dataset = arg,
+                2 => split = arg,
+                3 => out = arg,
+                else => return usageError(),
+            }
+            positional_count += 1;
+        } else {
+            return usageError();
+        }
+    }
+
+    var normalized = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer normalized.deinit(allocator);
+    try normalized.appendSlice(allocator, &.{
+        model orelse return usageError(),
+        dataset orelse return usageError(),
+        split orelse return usageError(),
+        out orelse return usageError(),
+    });
+    try normalized.appendSlice(allocator, options.items);
+    return normalized;
+}
+
 fn normalizeGemma4PilotArgs(allocator: std.mem.Allocator, args: []const []const u8) !std.ArrayListUnmanaged([]const u8) {
     if (args.len == 0) return usageError();
 
     const out = args[0];
     var count: ?[]const u8 = null;
     var split: ?[]const u8 = null;
+    var start_index: ?[]const u8 = null;
     var positional: usize = 0;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -238,11 +340,18 @@ fn normalizeGemma4PilotArgs(allocator: std.mem.Allocator, args: []const []const 
             i += 1;
             if (i >= args.len) return usageError();
             split = args[i];
+        } else if (std.mem.eql(u8, args[i], "--start-index")) {
+            i += 1;
+            if (i >= args.len) return usageError();
+            start_index = args[i];
         } else if (positional == 0) {
             count = args[i];
             positional += 1;
         } else if (positional == 1) {
             split = args[i];
+            positional += 1;
+        } else if (positional == 2) {
+            start_index = args[i];
             positional += 1;
         } else {
             return usageError();
@@ -255,6 +364,11 @@ fn normalizeGemma4PilotArgs(allocator: std.mem.Allocator, args: []const []const 
     if (count) |value| try normalized.append(allocator, value);
     if (split) |value| {
         if (count == null) try normalized.append(allocator, "100");
+        try normalized.append(allocator, value);
+    }
+    if (start_index) |value| {
+        if (count == null) try normalized.append(allocator, "100");
+        if (split == null) try normalized.append(allocator, "train");
         try normalized.append(allocator, value);
     }
     return normalized;
@@ -336,6 +450,116 @@ fn isHelp(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "help");
 }
 
+fn printContextualHelp(command_path: []const []const u8) bool {
+    if (command_path.len == 0) {
+        usage();
+        return true;
+    }
+    if (command_path.len == 1) {
+        const domain = command_path[0];
+        if (std.mem.eql(u8, domain, "run") or std.mem.eql(u8, domain, "smoke-fast")) {
+            recipe.usage();
+            return true;
+        }
+        return printDomainUsage(domain);
+    }
+
+    const domain = command_path[0];
+    if (std.mem.eql(u8, domain, "train") or std.mem.eql(u8, domain, "eval") or std.mem.eql(u8, domain, "workflow")) {
+        var subject_index: usize = 1;
+        if (std.mem.eql(u8, command_path[1], "run")) {
+            if (command_path.len == 2) return printDomainUsage(domain);
+            subject_index = 2;
+        }
+        if (subject_index >= command_path.len or subject_index + 1 != command_path.len) return false;
+        const subject = command_path[subject_index];
+        if (std.mem.eql(u8, domain, "train") and std.mem.eql(u8, subject, "gemma4-lora")) {
+            gemma4_train_command.printTrainUsage();
+            return true;
+        }
+        if (std.mem.eql(u8, domain, "eval") and std.mem.eql(u8, subject, "gemma4-lora")) {
+            gemma4_train_command.printEvalUsage();
+            return true;
+        }
+        for (commands) |command| {
+            if (std.mem.eql(u8, command.domain, domain) and
+                std.mem.eql(u8, command.action, "run") and
+                std.mem.eql(u8, command.subject, subject))
+            {
+                std.debug.print("usage: antfly inference finetune {s} {s} [options]\n", .{ domain, subject });
+                return true;
+            }
+        }
+        return false;
+    }
+    if (command_path.len == 3) {
+        const action = command_path[1];
+        const subject = command_path[2];
+        if (std.mem.eql(u8, domain, "adapter") and std.mem.eql(u8, action, "bootstrap") and std.mem.eql(u8, subject, "gemma4")) {
+            bootstrap_gemma4_lora.printUsage();
+            return true;
+        }
+        if (std.mem.eql(u8, domain, "adapter") and std.mem.eql(u8, action, "validate") and std.mem.eql(u8, subject, "gemma4")) {
+            gemma4_train_command.printValidateAdapterUsage();
+            return true;
+        }
+        if (std.mem.eql(u8, domain, "adapter") and std.mem.eql(u8, action, "export") and std.mem.eql(u8, subject, "gemma4-peft")) {
+            export_gemma4_peft.printUsage();
+            return true;
+        }
+        if (std.mem.eql(u8, domain, "dataset") and std.mem.eql(u8, action, "prepare") and
+            (std.mem.eql(u8, subject, "gemma4") or std.mem.eql(u8, subject, "gemma4-lora")))
+        {
+            printGemma4PrepareUsage();
+            return true;
+        }
+        for (commands) |command| {
+            if (std.mem.eql(u8, command.domain, domain) and
+                std.mem.eql(u8, command.action, action) and
+                std.mem.eql(u8, command.subject, subject))
+            {
+                std.debug.print("usage: antfly inference finetune {s} {s} {s} [options]\n", .{ domain, action, subject });
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn printDomainUsage(domain: []const u8) bool {
+    if (std.mem.eql(u8, domain, "train")) {
+        std.debug.print(
+            \\usage: antfly inference finetune train <task> [options]
+            \\production task: gemma4-lora
+            \\run `antfly inference finetune train gemma4-lora --help` for required inputs.
+            \\
+        , .{});
+        return true;
+    }
+    if (std.mem.eql(u8, domain, "eval")) {
+        std.debug.print(
+            \\usage: antfly inference finetune eval <task> [options]
+            \\production task: gemma4-lora
+            \\
+        , .{});
+        return true;
+    }
+    if (std.mem.eql(u8, domain, "dataset") or std.mem.eql(u8, domain, "adapter") or std.mem.eql(u8, domain, "workflow")) {
+        std.debug.print("usage: antfly inference finetune {s} <action> <subject> [options]\n", .{domain});
+        return true;
+    }
+    return false;
+}
+
+fn printGemma4PrepareUsage() void {
+    std.debug.print(
+        \\usage: antfly inference finetune dataset prepare gemma4-lora --model <dir> \\
+        \\       --dataset <jsonl-or-manifest> --split <name|-> --out <prepared.json> [options]
+        \\options: --max-examples N --max-seq-len N --dataset-revision <immutable-id>
+        \\
+    , .{});
+}
+
 fn usageError() error{InvalidArguments} {
     usage();
     return error.InvalidArguments;
@@ -353,7 +577,8 @@ fn usage() void {
         \\  antfly inference finetune adapter bootstrap <family> ...
         \\  antfly inference finetune adapter inspect <family> ...
         \\  antfly inference finetune adapter materialize <family> ...
-        \\  antfly inference finetune adapter validate gliner2-run ...
+        \\  antfly inference finetune adapter validate <gemma4|gliner2-run> ...
+        \\  antfly inference finetune adapter export gemma4-peft ...
         \\  antfly inference finetune adapter compose lora ...
         \\  antfly inference finetune train <task> ...
         \\  antfly inference finetune eval <task> ...
@@ -362,9 +587,12 @@ fn usage() void {
         \\examples:
         \\  antfly inference finetune run /tmp/recipe.json
         \\  antfly inference finetune dataset generate gemma4-pilot /tmp/pilot.jsonl --count 1000 --split train
-        \\  antfly inference finetune dataset prepare gemma4-lora /models/gemma4 /tmp/pilot.jsonl train /tmp/prepared.json
-        \\  antfly inference finetune adapter bootstrap gemma4 /models/gemma4 /tmp/adapter --rank 16 --alpha 32 --target-preset all-linear
-        \\  antfly inference finetune train gemma4-lora /models/gemma4 /tmp/adapter /tmp/prepared.json /tmp/out --trainer autodiff
+        \\  antfly inference finetune dataset prepare gemma4-lora --model /models/gemma4 --dataset /tmp/train.jsonl --split train --out /tmp/train-prepared.json
+        \\  antfly inference finetune adapter bootstrap gemma4 --model /models/gemma4 --out /tmp/adapter --rank 16 --alpha 32 --target-preset text-all-linear
+        \\  antfly inference finetune train gemma4-lora --model /models/gemma4 --adapter /tmp/adapter --train-prepared /tmp/train-prepared.json --eval-prepared /tmp/eval-prepared.json --out /tmp/out --backend metal
+        \\  antfly inference finetune eval gemma4-lora --model /models/gemma4 --adapter /tmp/out --prepared /tmp/test-prepared.json --out /tmp/eval.json --backend metal
+        \\  antfly inference finetune adapter validate gemma4 --model /models/gemma4 --adapter /tmp/out
+        \\  antfly inference finetune adapter export gemma4-peft --model /models/gemma4 --adapter /tmp/out --out /tmp/out-peft
         \\  antfly inference finetune workflow gemma4-pilot text /models/gemma4 /tmp/pilot-run --count 1000 --backend native
         \\
     , .{});
@@ -372,6 +600,34 @@ fn usage() void {
 
 test "finetune cli command table has entries" {
     try std.testing.expect(commands.len > 0);
+}
+
+test "finetune contextual help covers the production Gemma4 path" {
+    try std.testing.expect(printContextualHelp(&.{"train"}));
+    try std.testing.expect(printContextualHelp(&.{ "train", "gemma4-lora" }));
+    try std.testing.expect(printContextualHelp(&.{ "eval", "run", "gemma4-lora" }));
+    try std.testing.expect(printContextualHelp(&.{ "dataset", "prepare", "gemma4-lora" }));
+    try std.testing.expect(printContextualHelp(&.{ "adapter", "bootstrap", "gemma4" }));
+    try std.testing.expect(printContextualHelp(&.{ "adapter", "validate", "gemma4" }));
+    try std.testing.expect(printContextualHelp(&.{ "adapter", "export", "gemma4-peft" }));
+    try std.testing.expect(!printContextualHelp(&.{ "train", "unknown" }));
+}
+
+test "gemma4 prepare canonical flags normalize to the legacy adapter boundary" {
+    var normalized = try normalizeGemma4PrepareArgs(std.testing.allocator, &.{
+        "--dataset", "train.jsonl", "--out", "prepared.json", "--model", "gemma4", "--split", "train", "--max-seq-len", "1024", "--dataset-revision", "rev-1",
+    });
+    defer normalized.deinit(std.testing.allocator);
+    const expected = [_][]const u8{ "gemma4", "train.jsonl", "train", "prepared.json", "--max-seq-len", "1024", "--dataset-revision", "rev-1" };
+    try std.testing.expectEqual(expected.len, normalized.items.len);
+    for (expected, normalized.items) |want, actual| try std.testing.expectEqualStrings(want, actual);
+}
+
+test "gemma4 public prepare rejects media projection before command dispatch" {
+    try std.testing.expectError(
+        error.Gemma4MultimodalFinetuningNotSupported,
+        normalizeGemma4PrepareArgs(std.testing.allocator, &.{ "gemma4", "train.jsonl", "train", "prepared.json", "--gguf-projector", "projector.gguf" }),
+    );
 }
 
 test "finetune cli command table has unique canonical commands and adapter argv labels" {

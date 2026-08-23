@@ -1,5 +1,6 @@
 {
   "recipe": "grpo",
+  "execution": { "mode": "train" },
   "model": {
     "path": "/tmp/termite-models/colqwen2",
     "reference_path": "/tmp/termite-models/colqwen2",

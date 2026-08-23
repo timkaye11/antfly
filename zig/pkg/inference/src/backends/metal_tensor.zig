@@ -325,8 +325,8 @@ fn noteDeviceOwnedCreate(handle: *anyopaque, byte_len: usize, dims: []const i32)
     if (limit > 0 and owned_alloc_trace_count < limit and byte_len >= traceOwnedAllocMinBytes()) {
         owned_alloc_trace_count += 1;
         std.debug.print(
-            "metal_owned_alloc_trace: bytes={d} live={d} peak={d} new_peak={} dims=[",
-            .{ byte_len, memory_stats.device_owned_live_bytes, memory_stats.device_owned_peak_live_bytes, memory_stats.device_owned_peak_live_bytes > previous_peak },
+            "metal_owned_alloc_trace: handle={*} bytes={d} live={d} peak={d} new_peak={} context={s} dims=[",
+            .{ handle, byte_len, memory_stats.device_owned_live_bytes, memory_stats.device_owned_peak_live_bytes, memory_stats.device_owned_peak_live_bytes > previous_peak, owned_alloc_context },
         );
         for (dims, 0..) |dim, i| {
             if (i != 0) std.debug.print(",", .{});

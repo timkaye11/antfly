@@ -235,6 +235,10 @@ pub const LinearAttrs = struct {
 pub const NormAttrs = struct {
     dim: u32,
     eps: f32,
+    /// Backward-only hint. Forward norms ignore this field. When false, an
+    /// RMSNorm backward may return only d_input and skip the reduced weight
+    /// gradient row.
+    backward_weight_grad: bool = true,
 };
 
 pub const AttentionAttrs = struct {
@@ -244,6 +248,12 @@ pub const AttentionAttrs = struct {
     num_heads: u32,
     num_kv_heads: u32 = 0,
     head_dim: u32,
+    /// Zero selects the backend's conventional 1/sqrt(head_dim) scale.
+    /// Training graphs can provide the model's exact score scale explicitly.
+    score_scale: f32 = 0.0,
+    /// Zero means full causal attention; otherwise retain only this many
+    /// causal key positions, including the current token.
+    sliding_window: u32 = 0,
     layer_index: u32 = std.math.maxInt(u32),
     skip_kv_write: bool = false,
 };
@@ -370,6 +380,26 @@ pub const MaskedBceWithLogitsAttrs = struct {
     reduction: MaskedBceReduction = .mean,
 };
 
+/// Contract for a memory-bounded hard-label language-model loss:
+///
+///   logits = hidden @ weight^T
+///   logits = softcap * tanh(logits / softcap)  // when softcap > 0
+///   loss   = mean(-log_softmax(logits)[label])
+///
+/// Rows whose label equals `ignore_index` do not contribute to the numerator
+/// or denominator. If every row is ignored, the loss and d_hidden are zero.
+/// The fused backward intentionally produces d_hidden only; callers must keep
+/// the projection weight frozen and use the decomposed dense loss when a
+/// projection-weight gradient is required.
+pub const LinearCrossEntropyAttrs = struct {
+    rows: u32,
+    in_dim: u32,
+    vocab_size: u32,
+    logit_softcap: f32 = 0.0,
+    ignore_index: i32 = -100,
+    frozen_weight: bool = false,
+};
+
 // ── Node ───────────────────────────────────────────────────────────────
 
 /// Discriminated union of all ops in the graph IR.
@@ -417,6 +447,7 @@ pub const OpCode = union(enum) {
     fused_layer_norm: NormAttrs,
     fused_layer_norm_backward: NormAttrs,
     fused_rms_norm: NormAttrs,
+    fused_rms_norm_backward: NormAttrs,
     fused_gelu: void,
     fused_gelu_exact: void,
     fused_gelu_backward: void,
@@ -434,6 +465,7 @@ pub const OpCode = union(enum) {
     fused_causal_self_attention: AttentionAttrs,
     fused_cross_attention: CrossAttentionAttrs,
     fused_gqa_causal_attention: AttentionAttrs,
+    fused_gqa_causal_attention_backward: AttentionAttrs,
     fused_disentangled_attention: AttentionAttrs,
     fused_disentangled_attention_backward: AttentionAttrs,
     fused_relative_position_bias: RelativePositionBiasAttrs,
@@ -455,6 +487,8 @@ pub const OpCode = union(enum) {
     fused_argmax_last_row: ArgmaxAttrs,
     fused_softmax: SoftmaxAttrs,
     fused_log_softmax: SoftmaxAttrs,
+    fused_linear_cross_entropy_loss: LinearCrossEntropyAttrs,
+    fused_linear_cross_entropy_backward: LinearCrossEntropyAttrs,
     fused_masked_bce_with_logits_loss: MaskedBceWithLogitsAttrs,
     fused_masked_bce_with_logits_backward: MaskedBceWithLogitsAttrs,
 

@@ -83,9 +83,15 @@ pub const LoRAAdapter = struct {
     adapters: std.ArrayListUnmanaged(AdapterInfo),
     /// Owned name strings.
     name_arena: std.ArrayListUnmanaged(u8),
+    /// Base parameter names are separate allocations because they originate
+    /// in the cloned graph's string table and must remain valid if that graph
+    /// is replaced. Separate allocations also avoid slice invalidation if the
+    /// packed LoRA name arena grows.
+    owned_base_names: std.ArrayListUnmanaged([]u8),
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *LoRAAdapter) void {
+        freeOwnedStrings(self.allocator, &self.owned_base_names);
         self.adapters.deinit(self.allocator);
         self.name_arena.deinit(self.allocator);
     }
@@ -124,6 +130,7 @@ pub fn injectLoRA(
     var adapter = LoRAAdapter{
         .adapters = .empty,
         .name_arena = .empty,
+        .owned_base_names = .empty,
         .allocator = allocator,
     };
     errdefer adapter.deinit();
@@ -299,8 +306,21 @@ pub fn injectLoRA(
 
         if (adapter_nodes.is_new) {
             const new_index = adapter.adapters.items.len;
+            // Adapter metadata must not borrow the parameter name from the
+            // cloned graph. Callers are allowed to replace or destroy that
+            // graph (for example, while topologically sorting a training
+            // graph) while retaining the adapter inventory. Keep every name
+            // in the adapter-owned arena so runtime adapter lookup cannot
+            // observe a dangling base_name slice.
+            const owned_base_name = try allocator.dupe(u8, weight_name);
+            errdefer allocator.free(owned_base_name);
+            try adapter.owned_base_names.append(allocator, owned_base_name);
+            errdefer {
+                const removed = adapter.owned_base_names.pop().?;
+                std.debug.assert(removed.ptr == owned_base_name.ptr);
+            }
             try adapter.adapters.append(allocator, .{
-                .base_name = weight_name,
+                .base_name = owned_base_name,
                 .lora_a_name = adapter_nodes.a_name,
                 .lora_b_name = adapter_nodes.b_name,
                 .lora_a_id = adapter_nodes.lora_a,
@@ -513,6 +533,8 @@ test "injectLoRA adds adapter parameters" {
     try std.testing.expectEqualStrings("attn.q_proj.weight", info.base_name);
     try std.testing.expectEqualStrings("attn.q_proj.weight.lora_A", info.lora_a_name);
     try std.testing.expectEqualStrings("attn.q_proj.weight.lora_B", info.lora_b_name);
+    try std.testing.expectEqual(@as(usize, 1), result.adapter.owned_base_names.items.len);
+    try std.testing.expect(info.base_name.ptr == result.adapter.owned_base_names.items[0].ptr);
 
     // lora_A shape should be [rank=2, in_dim=4]
     const a_node = result.graph.node(info.lora_a_id);

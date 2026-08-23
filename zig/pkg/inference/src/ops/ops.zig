@@ -144,6 +144,36 @@ pub const MaskedBceWithLogitsBackwardRequest = struct {
     logits_shape: []const i64,
 };
 
+/// Exact hard-label CE over `hidden @ weight^T` without exposing the logits
+/// tensor. The vocabulary projection must be frozen: the paired backward API
+/// returns d_hidden only.
+pub const LinearCrossEntropyRequest = struct {
+    hidden: CT,
+    weight: CT,
+    labels: CT,
+    rows: usize,
+    in_dim: usize,
+    vocab_size: usize,
+    logit_softcap: f32,
+    ignore_index: i32,
+    frozen_weight: bool,
+    output_shape: []const i64,
+};
+
+pub const LinearCrossEntropyBackwardRequest = struct {
+    hidden: CT,
+    weight: CT,
+    labels: CT,
+    upstream: CT,
+    rows: usize,
+    in_dim: usize,
+    vocab_size: usize,
+    logit_softcap: f32,
+    ignore_index: i32,
+    frozen_weight: bool,
+    hidden_shape: []const i64,
+};
+
 pub const LoraLinearBranchResult = struct {
     after_a: CT,
     after_b: CT,
@@ -496,7 +526,12 @@ pub const DecoderRuntimeApplyLinearPairRequest = backend_contracts.DecoderRuntim
 pub const DecoderRuntimeApplyLinearQkvRequest = backend_contracts.DecoderRuntimeApplyLinearQkvRequest;
 pub const DecoderRuntimeActivationKind = backend_contracts.DecoderRuntimeActivationKind;
 pub const DecoderRuntimeApplyActivationRequest = backend_contracts.DecoderRuntimeApplyActivationRequest;
+pub const DecoderRuntimeApplyActivationMultiplyRequest = backend_contracts.DecoderRuntimeApplyActivationMultiplyRequest;
 pub const DecoderRuntimeApplyGeluBackwardRequest = backend_contracts.DecoderRuntimeApplyGeluBackwardRequest;
+pub const DecoderRuntimeApplyMaskedSoftmaxRequest = backend_contracts.DecoderRuntimeApplyMaskedSoftmaxRequest;
+pub const DecoderRuntimeApplySoftmaxBackwardRequest = backend_contracts.DecoderRuntimeApplySoftmaxBackwardRequest;
+pub const DecoderRuntimeGatedGeluBackwardRequest = backend_contracts.DecoderRuntimeGatedGeluBackwardRequest;
+pub const DecoderRuntimeGatedGeluBackwardResult = backend_contracts.DecoderRuntimeGatedGeluBackwardResult;
 pub const DecoderRuntimeFfnGeluBackwardChainRequest = backend_contracts.DecoderRuntimeFfnGeluBackwardChainRequest;
 pub const DecoderRuntimeFfnGeluBackwardChainResult = backend_contracts.DecoderRuntimeFfnGeluBackwardChainResult;
 pub const DecoderRuntimeFfnGeluBackwardOutputResult = backend_contracts.DecoderRuntimeFfnGeluBackwardOutputResult;
@@ -675,6 +710,8 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_dense_qkv_packed_fallbacks: u64 = 0,
     metal_runtime_dense_pair_packed_calls: u64 = 0,
     metal_runtime_dense_pair_packed_fallbacks: u64 = 0,
+    metal_runtime_gemma4_bf16_gate_up_fused_calls: u64 = 0,
+    metal_runtime_gemma4_bf16_gate_up_backward_input_sum_fused_calls: u64 = 0,
     metal_runtime_mps_dense_linear_standalone_calls: u64 = 0,
     metal_runtime_mps_dense_linear_active_frame_calls: u64 = 0,
     metal_runtime_mps_dense_linear_standalone_wait_nanos: u64 = 0,
@@ -1067,8 +1104,8 @@ pub const BackendDebugTimingSnapshot = struct {
     quant: QuantExecutionTimingStats = .{},
 };
 
-/// Backend-neutral counters for one compiled training step. CUDA populates
-/// these from its driver/runtime accounting; other backends return zeros.
+/// Backend-neutral counters for one compiled training step. Device backends
+/// populate the counters they can measure from their runtime accounting.
 pub const TrainingRuntimeStats = struct {
     device_allocations: u64 = 0,
     device_frees: u64 = 0,
@@ -1086,6 +1123,13 @@ pub const TrainingRuntimeStats = struct {
     packed_attention_backward_calls: u64 = 0,
     exact_gelu_forward_calls: u64 = 0,
     exact_gelu_backward_calls: u64 = 0,
+    linear_cross_entropy_forward_calls: u64 = 0,
+    linear_cross_entropy_backward_calls: u64 = 0,
+    linear_cce_forward_calls: u64 = 0,
+    linear_cce_backward_calls: u64 = 0,
+    linear_cce_forward_state_hits: u64 = 0,
+    linear_cce_forward_state_misses: u64 = 0,
+    linear_cce_peak_scratch_bytes: u64 = 0,
     training_input_uploads: u64 = 0,
     training_input_upload_bytes: u64 = 0,
 };
@@ -1176,6 +1220,26 @@ pub const ComputeBackend = struct {
 
     pub fn decoderRuntimePopPlannedComputeBarrierSuppression(self: *const ComputeBackend) !void {
         const op = self.vtable.decoderRuntimePopPlannedComputeBarrierSuppression orelse return;
+        return op(self.ptr);
+    }
+
+    pub fn decoderRuntimePushPlannedEncoderCoalescingSuppression(self: *const ComputeBackend) !bool {
+        const op = self.vtable.decoderRuntimePushPlannedEncoderCoalescingSuppression orelse return false;
+        return op(self.ptr);
+    }
+
+    pub fn decoderRuntimePopPlannedEncoderCoalescingSuppression(self: *const ComputeBackend) !void {
+        const op = self.vtable.decoderRuntimePopPlannedEncoderCoalescingSuppression orelse return;
+        return op(self.ptr);
+    }
+
+    pub fn decoderRuntimePushBf16EmbeddingRowStagingSuppression(self: *const ComputeBackend) !bool {
+        const op = self.vtable.decoderRuntimePushBf16EmbeddingRowStagingSuppression orelse return false;
+        return op(self.ptr);
+    }
+
+    pub fn decoderRuntimePopBf16EmbeddingRowStagingSuppression(self: *const ComputeBackend) !void {
+        const op = self.vtable.decoderRuntimePopBf16EmbeddingRowStagingSuppression orelse return;
         return op(self.ptr);
     }
 
@@ -1282,6 +1346,15 @@ pub const ComputeBackend = struct {
         /// frame whose caller has stronger model-specific ordering knowledge.
         decoderRuntimePushPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
         decoderRuntimePopPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+        /// Temporarily force ordered per-scope encoders. Eager training graphs
+        /// use this around runtime-bound inputs whose storage changes between
+        /// repeated executions; compiled and serving paths remain coalesced.
+        decoderRuntimePushPlannedEncoderCoalescingSuppression: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
+        decoderRuntimePopPlannedEncoderCoalescingSuppression: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+        /// Temporarily force the full mmap-backed BF16 embedding-table path on
+        /// one runtime while mixed eager/compiled GRPO ownership is active.
+        decoderRuntimePushBf16EmbeddingRowStagingSuppression: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
+        decoderRuntimePopBf16EmbeddingRowStagingSuppression: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 
         convertDType: ?*const fn (ctx: *anyopaque, tensor: CT, target: GraphDType) anyerror!?CT = null,
 
@@ -1641,6 +1714,11 @@ pub const ComputeBackend = struct {
         /// RMS normalization: x * rsqrt(mean(x^2) + eps) * weight. No bias, no mean subtraction.
         rmsNorm: *const fn (ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT,
 
+        /// Backward of `fused_rms_norm` over the last axis. Returns d_input
+        /// rows and, when `compute_weight_grad` is true, one reduced d_weight
+        /// row. Optional; graphs only emit this op when explicitly requested.
+        rmsNormBackward: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, dy: CT, dim: usize, eps: f32, compute_weight_grad: bool) anyerror!CT = null,
+
         /// RMS normalization without learned weights:
         /// x * rsqrt(mean(x^2) + eps). Backends may implement this to avoid
         /// constructing an all-ones weight tensor on hot paths.
@@ -1896,6 +1974,15 @@ pub const ComputeBackend = struct {
         /// attn_bias: optional additive bias, or null.
         /// Returns: [batch*seq, num_heads*head_dim].
         gqaCausalAttention: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize) anyerror!CT,
+
+        /// Differentiable dense-causal GQA with an exact model-provided score
+        /// scale and optional sliding window. Optional because only training
+        /// backends need to implement this contract.
+        gqaCausalAttentionTraining: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, sliding_window: usize, score_scale: f32) anyerror!?CT = null,
+
+        /// Packed VJP for gqaCausalAttentionTraining. Returns D-wide rows
+        /// [dQ; dK; dV], where the row counts are B*S*H, B*S*KV, B*S*KV.
+        gqaCausalAttentionBackward: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, dO: CT, batch: usize, seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, sliding_window: usize, score_scale: f32) anyerror!?CT = null,
 
         /// Backend entry point for paged or streaming GQA attention.
         /// Current dense backends may fall back to gqaCausalAttention until
@@ -2246,9 +2333,23 @@ pub const ComputeBackend = struct {
         /// Apply an activation inside the backend-owned decoder runtime.
         decoderRuntimeApplyActivation: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyActivationRequest) anyerror!?CT = null,
 
+        /// Apply activation(gate) * up inside one backend runtime dispatch.
+        decoderRuntimeApplyActivationMultiply: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyActivationMultiplyRequest) anyerror!?CT = null,
+
         /// Apply tanh-approx GELU backward inside the backend runtime:
         /// output = upstream_grad * d/dx(gelu(input)).
         decoderRuntimeApplyGeluBackward: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyGeluBackwardRequest) anyerror!?CT = null,
+
+        /// Apply a repeated attention-mask tile and row-wise softmax inside
+        /// one backend runtime dispatch.
+        decoderRuntimeApplyMaskedSoftmax: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyMaskedSoftmaxRequest) anyerror!?CT = null,
+
+        /// Apply the row-wise softmax VJP inside the backend runtime.
+        decoderRuntimeApplySoftmaxBackward: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplySoftmaxBackwardRequest) anyerror!?CT = null,
+
+        /// Fuse the two elementwise branches and GELU derivative for the
+        /// backward of `gelu(gate) * up`, returning d_gate and d_up.
+        decoderRuntimeGatedGeluBackward: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeGatedGeluBackwardRequest) anyerror!?DecoderRuntimeGatedGeluBackwardResult = null,
 
         /// Execute the hot DeBERTa FFN backward strip as one backend runtime
         /// unit while returning each graph-visible intermediate.
@@ -2396,6 +2497,11 @@ pub const ComputeBackend = struct {
         /// Log-softmax along last dimension: x - max - log(sum(exp(x-max))).
         /// `last_dim_size` is the size of the last dimension (not an axis index).
         logSoftmaxOp: ?*const fn (ctx: *anyopaque, input: CT, last_dim_size: u32) anyerror!CT = null,
+        /// Frozen-head hard-label linear cross-entropy. Backends must not
+        /// materialize or retain a public [rows, vocab_size] result.
+        linearCrossEntropyLoss: ?*const fn (ctx: *anyopaque, request: *const LinearCrossEntropyRequest) anyerror!CT = null,
+        /// d_hidden for frozen-head hard-label linear cross-entropy.
+        linearCrossEntropyBackward: ?*const fn (ctx: *anyopaque, request: *const LinearCrossEntropyBackwardRequest) anyerror!CT = null,
         /// GLiNER-style masked BCE-with-logits scalar loss.
         maskedBceWithLogitsLoss: ?*const fn (ctx: *anyopaque, request: *const MaskedBceWithLogitsRequest) anyerror!CT = null,
         /// Gradient of masked BCE-with-logits with respect to logits.
@@ -3126,6 +3232,11 @@ pub const ComputeBackend = struct {
         return self.vtable.rmsNorm(self.ptr, input, weight, dim, eps);
     }
 
+    pub fn rmsNormBackward(self: *const ComputeBackend, input: CT, weight: CT, dy: CT, dim: usize, eps: f32, compute_weight_grad: bool) !?CT {
+        if (self.vtable.rmsNormBackward) |f| return try f(self.ptr, input, weight, dy, dim, eps, compute_weight_grad);
+        return null;
+    }
+
     pub fn rmsNormBare(self: *const ComputeBackend, input: CT, dim: usize, eps: f32) !?CT {
         if (self.vtable.rmsNormBare) |f| return f(self.ptr, input, dim, eps);
         return null;
@@ -3558,6 +3669,16 @@ pub const ComputeBackend = struct {
 
     pub fn gqaCausalAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize) !CT {
         return self.vtable.gqaCausalAttention(self.ptr, Q, K, V, attn_bias, batch, seq_len, num_heads, num_kv_heads, head_dim);
+    }
+
+    pub fn gqaCausalAttentionTraining(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, sliding_window: usize, score_scale: f32) !?CT {
+        const op = self.vtable.gqaCausalAttentionTraining orelse return null;
+        return op(self.ptr, Q, K, V, batch, seq_len, num_heads, num_kv_heads, head_dim, sliding_window, score_scale);
+    }
+
+    pub fn gqaCausalAttentionBackward(self: *const ComputeBackend, Q: CT, K: CT, V: CT, dO: CT, batch: usize, seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, sliding_window: usize, score_scale: f32) !?CT {
+        const op = self.vtable.gqaCausalAttentionBackward orelse return null;
+        return op(self.ptr, Q, K, V, dO, batch, seq_len, num_heads, num_kv_heads, head_dim, sliding_window, score_scale);
     }
 
     pub fn gqaPagedAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, attn_bias: ?CT, attention: AttentionContext, batch: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize) !CT {
@@ -4177,8 +4298,36 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    pub fn decoderRuntimeApplyActivationMultiply(self: *const ComputeBackend, request: *const DecoderRuntimeApplyActivationMultiplyRequest) !?CT {
+        if (self.vtable.decoderRuntimeApplyActivationMultiply) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
     pub fn decoderRuntimeApplyGeluBackward(self: *const ComputeBackend, request: *const DecoderRuntimeApplyGeluBackwardRequest) !?CT {
         if (self.vtable.decoderRuntimeApplyGeluBackward) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeApplyMaskedSoftmax(self: *const ComputeBackend, request: *const DecoderRuntimeApplyMaskedSoftmaxRequest) !?CT {
+        if (self.vtable.decoderRuntimeApplyMaskedSoftmax) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeApplySoftmaxBackward(self: *const ComputeBackend, request: *const DecoderRuntimeApplySoftmaxBackwardRequest) !?CT {
+        if (self.vtable.decoderRuntimeApplySoftmaxBackward) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeGatedGeluBackward(self: *const ComputeBackend, request: *const DecoderRuntimeGatedGeluBackwardRequest) !?DecoderRuntimeGatedGeluBackwardResult {
+        if (self.vtable.decoderRuntimeGatedGeluBackward) |op| {
             return op(self.ptr, request);
         }
         return null;
@@ -4466,6 +4615,14 @@ pub const ComputeBackend = struct {
     }
     pub fn primLogSoftmax(self: *const ComputeBackend, input: CT, dim: u32) !CT {
         if (self.vtable.logSoftmaxOp) |f| return f(self.ptr, input, dim);
+        return error.UnsupportedPrimitiveOp;
+    }
+    pub fn linearCrossEntropyLoss(self: *const ComputeBackend, request: *const LinearCrossEntropyRequest) !CT {
+        if (self.vtable.linearCrossEntropyLoss) |f| return f(self.ptr, request);
+        return error.UnsupportedPrimitiveOp;
+    }
+    pub fn linearCrossEntropyBackward(self: *const ComputeBackend, request: *const LinearCrossEntropyBackwardRequest) !CT {
+        if (self.vtable.linearCrossEntropyBackward) |f| return f(self.ptr, request);
         return error.UnsupportedPrimitiveOp;
     }
     pub fn maskedBceWithLogitsLoss(self: *const ComputeBackend, request: *const MaskedBceWithLogitsRequest) !CT {

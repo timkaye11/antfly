@@ -1,5 +1,6 @@
 {
   "recipe": "dpo",
+  "execution": { "mode": "score" },
   "model": {
     "name": "scalar-logprob-smoke",
     "family": "preference"
@@ -10,10 +11,6 @@
   },
   "preference": {
     "beta": 0.1
-  },
-  "optimizer": {
-    "epochs": 1,
-    "learning_rate": 0.0
   },
   "artifacts": {
     "root": "/tmp/termite-dpo-recipe-smoke"

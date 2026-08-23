@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://antfly.io/schemas/gemma4_benchmark_campaign.schema.json",
+  "title": "Closed serial Gemma4 LoRA benchmark campaign ledger",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "campaign_id",
+    "created_unix_ns",
+    "completed_unix_ns",
+    "plan",
+    "orchestrator",
+    "run_count",
+    "runs"
+  ],
+  "properties": {
+    "schema_version": { "const": "antfly_gemma4_lora_benchmark_campaign_manifest/v1" },
+    "status": { "const": "complete" },
+    "campaign_id": { "$ref": "#/$defs/identifier" },
+    "created_unix_ns": { "type": "integer", "minimum": 1 },
+    "completed_unix_ns": { "type": "integer", "minimum": 1 },
+    "plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "cell_count", "repetitions_per_cell"],
+      "properties": {
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "cell_count": { "type": "integer", "minimum": 1 },
+        "repetitions_per_cell": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "orchestrator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "relative_path", "source_sha256"],
+      "properties": {
+        "schema_version": { "const": "antfly_gemma4_lora_benchmark_campaign_orchestrator/v1" },
+        "relative_path": { "const": "zig/pkg/inference/scripts/run_gemma4_lora_benchmark_campaign.py" },
+        "source_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "run_count": { "type": "integer", "minimum": 2 },
+    "runs": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "cell_id",
+          "framework",
+          "repetition",
+          "sequence_index",
+          "run_id",
+          "argv",
+          "argv_sha256",
+          "started_unix_ns",
+          "completed_unix_ns",
+          "sample"
+        ],
+        "properties": {
+          "cell_id": { "$ref": "#/$defs/identifier" },
+          "framework": { "enum": ["antfly-zig-metal", "mlx-lm"] },
+          "repetition": { "type": "integer", "minimum": 0 },
+          "sequence_index": { "type": "integer", "minimum": 0 },
+          "run_id": { "$ref": "#/$defs/identifier" },
+          "argv": {
+            "type": "array",
+            "minItems": 12,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "argv_sha256": { "$ref": "#/$defs/sha256" },
+          "started_unix_ns": { "type": "integer", "minimum": 1 },
+          "completed_unix_ns": { "type": "integer", "minimum": 1 },
+          "sample": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["relative_path", "sha256", "size_bytes"],
+            "properties": {
+              "relative_path": {
+                "type": "string",
+              "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[A-Za-z0-9._/-]+\\.json$"
+              },
+              "sha256": { "$ref": "#/$defs/sha256" },
+              "size_bytes": { "type": "integer", "minimum": 1 }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  }
+}

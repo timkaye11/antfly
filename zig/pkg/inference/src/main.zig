@@ -250,7 +250,13 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    return try runFromArgs(init, allocator, "antfly inference", args[1..]);
+    // The standalone binary is normally invoked as `antfly-inference <cmd>`,
+    // while the installed product exposes `antfly inference <cmd>`. Accept
+    // the latter spelling here as well so local/packaged inference binaries
+    // exercise the identical typed CLI (and benchmark self-fingerprinting)
+    // without a wrapper process.
+    const command_args = if (std.mem.eql(u8, args[1], "inference")) args[2..] else args[1..];
+    return try runFromArgs(init, allocator, "antfly inference", command_args);
 }
 
 pub fn runFromArgs(

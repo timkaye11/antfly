@@ -499,11 +499,64 @@ pub const DecoderRuntimeApplyActivationRequest = struct {
     dim: usize,
 };
 
+/// Fused gated activation used by GeGLU-style feed-forward blocks:
+/// `output = activation(gate) * up`.
+pub const DecoderRuntimeApplyActivationMultiplyRequest = struct {
+    gate: CT,
+    up: CT,
+    kind: DecoderRuntimeActivationKind,
+    rows: usize,
+    dim: usize,
+};
+
 pub const DecoderRuntimeApplyGeluBackwardRequest = struct {
     input: CT,
     upstream_grad: CT,
     dim: usize,
     exact: bool = false,
+};
+
+/// Fused attention mask add and row-wise softmax. `mask` is a dense
+/// `[mask_rows, dim]` tile repeated across the score rows.
+pub const DecoderRuntimeApplyMaskedSoftmaxRequest = struct {
+    scores: CT,
+    mask: CT,
+    rows: usize,
+    dim: usize,
+    mask_rows: usize,
+};
+
+/// Fused attention softmax VJP along the last dimension:
+/// `d_input = output * (upstream_grad - sum(upstream_grad * output))`.
+pub const DecoderRuntimeApplySoftmaxBackwardRequest = struct {
+    output: CT,
+    upstream_grad: CT,
+    rows: usize,
+    dim: usize,
+};
+
+/// Fused backward of `gelu(gate) * up`. The gate output is
+/// `d_gate = gelu'(gate) * upstream * up`. When the retained forward
+/// activation is supplied, the backend also publishes
+/// `d_up = upstream * gate_activation` with the unfused graph's exact inputs.
+pub const DecoderRuntimeGatedGeluBackwardRequest = struct {
+    upstream: CT,
+    gate_input: CT,
+    /// Present when the graph also needs the gradient for the gated block's
+    /// `up` input. Frozen branches may omit it so the backend only publishes
+    /// the gate gradient.
+    gate_activation: ?CT = null,
+    /// Request d_up even when the forward activation was elided. Backends may
+    /// recompute GELU from gate_input inside the fused backward dispatch.
+    emit_up_grad: bool = false,
+    up: CT,
+    dim: usize,
+    exact: bool = false,
+};
+
+pub const DecoderRuntimeGatedGeluBackwardResult = struct {
+    gate_grad: CT,
+    up_grad: ?CT = null,
 };
 
 pub const DecoderRuntimeFfnGeluBackwardChainRequest = struct {

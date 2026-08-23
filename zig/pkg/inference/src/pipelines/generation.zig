@@ -2052,6 +2052,92 @@ pub const NativeDecodeState = struct {
         };
     }
 
+    /// Attach a new decode state to the complete KV pages of an existing
+    /// state. A partial tail is deliberately excluded: the caller must replay
+    /// it with appendPrefillChunk so no candidate can observe another
+    /// candidate's writable tail page.
+    pub fn attachSharedPagedPrefix(
+        self: *NativeDecodeState,
+        source: *const NativeDecodeState,
+        shared_token_count: usize,
+    ) !void {
+        if (!self.isPaged() or !source.isPaged()) return error.PagedKvRequired;
+        if (self.sequence_id != null) return error.KvSequenceAlreadyAttached;
+        if (self.kv_manager.? != source.kv_manager.?) return error.KvManagerMismatch;
+        if (self.pool_id.? != source.pool_id.?) return error.InvalidPoolId;
+        const storage = self.kv_storage orelse return error.KvStorageRequired;
+        const source_storage = source.kv_storage orelse return error.KvStorageRequired;
+        if (storage != source_storage) return error.KvStorageMismatch;
+        const source_id = source.sequence_id orelse return error.KvSequenceNotAttached;
+        if (shared_token_count > source.total_tokens) return error.KvCapacityTooSmall;
+
+        const pool = self.kv_manager.?.getPool(self.pool_id.?) orelse return error.InvalidPoolId;
+        const page_size: usize = pool.config.page_size_tokens;
+        if (page_size == 0 or shared_token_count % page_size != 0) return error.InvalidKvShape;
+
+        const manager_sequence_id = try self.kv_manager.?.attachSequenceWithSharedPrefix(
+            self.pool_id.?,
+            source_id,
+            shared_token_count,
+        );
+        var manager_sequence_owned = true;
+        errdefer if (manager_sequence_owned) self.kv_manager.?.releaseSequence(manager_sequence_id) catch {};
+
+        var retained_storage_blocks: std.ArrayListUnmanaged(runtime.kv.block.KvBlockId) = .empty;
+        defer retained_storage_blocks.deinit(self.allocator);
+        try storage.retainSequencePrefixBlocks(source_id, shared_token_count, &retained_storage_blocks);
+        defer storage.releaseRetainedBlocks(retained_storage_blocks.items);
+
+        const storage_sequence_id = try storage.attachSequenceWithRetainedBlocks(
+            storage.poolId(),
+            retained_storage_blocks.items,
+            shared_token_count,
+        );
+        var storage_sequence_owned = true;
+        errdefer if (storage_sequence_owned) storage.releaseSequence(storage_sequence_id) catch {};
+        if (storage_sequence_id != manager_sequence_id) return error.KvSequenceIdentityMismatch;
+
+        self.sequence_id = manager_sequence_id;
+        self.total_tokens = shared_token_count;
+        self.kv_compacted = false;
+        self.syncPagedKvViewForPrefill();
+        manager_sequence_owned = false;
+        storage_sequence_owned = false;
+    }
+
+    /// Populate this sequence's already-reserved private partial page from an
+    /// exact device-side clone of `source`. Complete pages must already be
+    /// shared through `attachSharedPagedPrefix`; only the unaligned tail is
+    /// copied so future candidate writes remain disjoint.
+    pub fn clonePagedTailFrom(
+        self: *NativeDecodeState,
+        source: *const NativeDecodeState,
+        tail_token_count: usize,
+    ) !void {
+        if (!self.isPaged() or !source.isPaged()) return error.PagedKvRequired;
+        if (self.kv_manager.? != source.kv_manager.?) return error.KvManagerMismatch;
+        if (self.pool_id.? != source.pool_id.?) return error.InvalidPoolId;
+        const storage = self.kv_storage orelse return error.KvStorageRequired;
+        const source_storage = source.kv_storage orelse return error.KvStorageRequired;
+        if (storage != source_storage) return error.KvStorageMismatch;
+        const destination_id = self.sequence_id orelse return error.KvSequenceNotAttached;
+        const source_id = source.sequence_id orelse return error.KvSequenceNotAttached;
+        if (self.total_tokens != source.total_tokens) return error.InvalidPagedKvState;
+
+        const manager_source = self.kv_manager.?.blockTable(source_id) orelse return error.InvalidPagedKvState;
+        const manager_destination = self.kv_manager.?.blockTable(destination_id) orelse return error.InvalidPagedKvState;
+        const storage_source = storage.blockTable(source_id) orelse return error.InvalidPagedKvState;
+        const storage_destination = storage.blockTable(destination_id) orelse return error.InvalidPagedKvState;
+        if (!std.mem.eql(runtime.kv.block.KvBlockId, manager_source.blocks.items, storage_source.blocks.items) or
+            !std.mem.eql(runtime.kv.block.KvBlockId, manager_destination.blocks.items, storage_destination.blocks.items))
+        {
+            return error.KvSequenceIdentityMismatch;
+        }
+        try storage.cloneSequenceTailDevice(source_id, destination_id, tail_token_count);
+        self.kv_compacted = false;
+        self.syncPagedKvViewForPrefill();
+    }
+
     fn lockPagedKv(self: *const NativeDecodeState) ?*std.atomic.Mutex {
         const mutex = self.kv_lock orelse return null;
         platform.sync.lockYielding(mutex);
@@ -2745,6 +2831,10 @@ pub fn buildOwnedBatchDecodeContext(
             .kv_storage = first_ctx.kv_storage,
             .kv_batch = batch,
             .moe_runtime = first_ctx.moe_runtime,
+            // Gemma4's layer-spec cache is model-shape metadata rather than
+            // sequence state. Retaining the first compatible state's cache
+            // lets a decode microbatch reuse the prepared runtime inventory.
+            .gemma4_layer_spec_cache = first_ctx.gemma4_layer_spec_cache,
         },
     };
 }
@@ -11924,6 +12014,41 @@ test "native decode state chunked prefill appends incrementally" {
     try std.testing.expectEqual(@as(usize, 5), manager.tokenCount(state.sequence_id.?).?);
 }
 
+test "gemma4 GRPO native decode state shares only complete prompt pages" {
+    const allocator = std.testing.allocator;
+    const pool_config: runtime.kv.pool.KvPoolConfig = .{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 4,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 8,
+    };
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+    const pool_id = try manager.addPool(pool_config);
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, pool_config);
+    defer storage.deinit();
+
+    var source = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    source.kv_storage = &storage;
+    defer source.deinit();
+    try source.notePrefill(5);
+
+    var candidate = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    candidate.kv_storage = &storage;
+    defer candidate.deinit();
+    try std.testing.expectError(error.InvalidKvShape, candidate.attachSharedPagedPrefix(&source, 5));
+    try candidate.attachSharedPagedPrefix(&source, 4);
+    try std.testing.expectEqual(@as(usize, 4), candidate.total_tokens);
+    try std.testing.expectEqual(@as(usize, 4), manager.tokenCount(candidate.sequence_id.?).?);
+    try std.testing.expectEqual(@as(usize, 4), storage.tokenCount(candidate.sequence_id.?).?);
+    try candidate.appendPrefillChunk(1);
+    try std.testing.expectEqual(@as(usize, 5), candidate.total_tokens);
+    try std.testing.expectEqual(@as(usize, 5), manager.tokenCount(candidate.sequence_id.?).?);
+    try std.testing.expectEqual(@as(usize, 5), storage.tokenCount(candidate.sequence_id.?).?);
+}
+
 test "direct paged prefill OOM retry rolls back its exact reservation" {
     const allocator = std.testing.allocator;
     var manager = runtime.kv.manager.KvManager.init(allocator);
@@ -12644,7 +12769,7 @@ test "native decode state can disable an initialized SWA ring policy" {
     try std.testing.expectEqual(@as(usize, 0), state.kv_max_inflight_tokens);
 }
 
-test "owned batch decode context captures per-item kv bindings" {
+test "gemma4 owned batch decode context captures per-item kv bindings" {
     const allocator = std.testing.allocator;
     var manager = runtime.kv.manager.KvManager.init(allocator);
     defer manager.deinit();
@@ -12700,6 +12825,7 @@ test "owned batch decode context captures per-item kv bindings" {
     try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.context.kv_storage);
     try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.kv_batch.?[0].kv_storage);
     try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.kv_batch.?[0].kv_cache.kv_storage);
+    try std.testing.expectEqual(@as(?*gpt_arch.Gemma4LayerSpecCache, &first.gemma4_layer_spec_cache), owned.context.gemma4_layer_spec_cache);
 }
 
 test "mixed batch decode context captures per-item overrides" {

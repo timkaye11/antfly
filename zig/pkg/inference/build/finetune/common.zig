@@ -26,6 +26,7 @@ pub const Import = enum {
     termite_c_file,
     inference_finetune_data,
     inference_finetune_tokenizer_batch,
+    inference_audio,
     inference_hf_tokenizer,
     inference_internal,
     termite_io_compat,
@@ -48,6 +49,7 @@ pub const Context = struct {
     ml_mod: *std.Build.Module,
     onnx_graph_mod: *std.Build.Module,
     inference_internal_mod: *std.Build.Module,
+    inference_audio_mod: *std.Build.Module,
     inference_tokenizer_mod: *std.Build.Module,
     inference_hf_tokenizer_mod: *std.Build.Module,
     antfly_image_mod: *std.Build.Module,
@@ -91,6 +93,7 @@ pub const Context = struct {
                 mod.addImport("inference_hf_tokenizer", ctx.inference_hf_tokenizer_mod);
                 break :blk mod;
             },
+            .inference_audio => ctx.inference_audio_mod,
             .inference_hf_tokenizer => ctx.inference_hf_tokenizer_mod,
             .inference_internal => ctx.inference_internal_mod,
             .termite_io_compat => ctx.b.createModule(.{

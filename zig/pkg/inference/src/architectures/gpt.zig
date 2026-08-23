@@ -480,6 +480,40 @@ pub const Gemma4LayerSpecCache = struct {
     }
 };
 
+/// Optional eager-forward adapter hook used by training-time rollout. The
+/// callback receives a completed frozen projection and may return a replacement
+/// that includes the live adapter delta. Inputs and the frozen output remain
+/// borrowed during the callback; ownership of a non-null replacement passes to
+/// the caller.
+pub const RuntimeLinearAdapter = struct {
+    context: *anyopaque,
+    applyFn: *const fn (
+        context: *anyopaque,
+        cb: *const ComputeBackend,
+        allocator: std.mem.Allocator,
+        base_name: []const u8,
+        input: CT,
+        base_output: CT,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) anyerror!?CT,
+
+    pub fn apply(
+        self: RuntimeLinearAdapter,
+        cb: *const ComputeBackend,
+        allocator: std.mem.Allocator,
+        base_name: []const u8,
+        input: CT,
+        base_output: CT,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) !?CT {
+        return self.applyFn(self.context, cb, allocator, base_name, input, base_output, rows, in_dim, out_dim);
+    }
+};
+
 pub const DecodeContext = struct {
     pub const AttentionMode = enum {
         full_recompute,
@@ -528,6 +562,7 @@ pub const DecodeContext = struct {
     moe_runtime: ?*runtime.moe.runtime.MoeRuntime = null,
     qwen35_linear_cache: ?*Qwen35LinearCache = null,
     gemma4_layer_spec_cache: ?*Gemma4LayerSpecCache = null,
+    runtime_linear_adapter: ?RuntimeLinearAdapter = null,
     input_ids: ?[]const i64 = null,
 
     pub fn usesPagedKv(self: DecodeContext) bool {
@@ -695,6 +730,47 @@ pub fn forwardLastLogitsWithCudaReplay(
     decode_context: ?*const DecodeContext,
     replay_label: []const u8,
 ) ![]f32 {
+    const logits = try forwardLastLogitsTensorWithCudaReplay(
+        cb,
+        allocator,
+        config,
+        input_ids,
+        batch,
+        seq_len,
+        decode_context,
+        replay_label,
+    );
+    defer cb.free(logits);
+
+    const result = try cb.toFloat32(logits, allocator);
+    applyFinalLogitSoftcap(config, result);
+    maybeDebugTopLogits(result, config.vocab_size);
+    return result;
+}
+
+fn lastLogitProjectionRows(batch: usize, query_seq_len: usize) usize {
+    return if (query_seq_len == 1) batch else 1;
+}
+
+test "gemma4 batched paged decode preserves one lm-head row per candidate" {
+    try std.testing.expectEqual(@as(usize, 4), lastLogitProjectionRows(4, 1));
+    try std.testing.expectEqual(@as(usize, 1), lastLogitProjectionRows(1, 96));
+}
+
+/// Device-resident counterpart of `forwardLastLogitsWithCudaReplay`. Callers
+/// that only need a ranked token can keep the vocab row on the accelerator and
+/// avoid a full f32 download. Final-logit softcap is intentionally left to the
+/// host-returning wrapper; it is monotonic and therefore cannot change rank.
+pub fn forwardLastLogitsTensorWithCudaReplay(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    replay_label: []const u8,
+) !CT {
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
     const total_rows = batch * query_seq_len;
     const hidden = try forwardHiddenTensorWithCudaReplay(
@@ -709,23 +785,25 @@ pub fn forwardLastLogitsWithCudaReplay(
     );
     defer cb.free(hidden);
 
-    const last_hidden = if (total_rows == 1)
+    // A one-token paged decode may carry several independent KV-backed
+    // sequences in the batch dimension. In that case every hidden row is the
+    // last query row for its sequence and the LM head must preserve all rows.
+    // The older path sliced the final row unconditionally, silently collapsing
+    // a decode microbatch to one candidate.
+    const last_hidden = if (query_seq_len == 1)
         hidden
     else
         try cb.sliceRows2D(allocator, hidden, total_rows - 1, 1, config.hidden_size);
     defer if (last_hidden != hidden) cb.free(last_hidden);
+    const last_hidden_rows = lastLogitProjectionRows(batch, query_seq_len);
 
     const lm_w = try getLmHeadWeight(cb, config);
     defer cb.free(lm_w);
 
-    const logits = try cb.linearNoBias(last_hidden, lm_w, 1, config.hidden_size, config.vocab_size);
-    defer cb.free(logits);
+    const logits = try cb.linearNoBias(last_hidden, lm_w, last_hidden_rows, config.hidden_size, config.vocab_size);
+    errdefer cb.free(logits);
     try maybeDebugTensor(cb, allocator, "lm_head", logits);
-
-    const result = try cb.toFloat32(logits, allocator);
-    applyFinalLogitSoftcap(config, result);
-    maybeDebugTopLogits(result, config.vocab_size);
-    return result;
+    return logits;
 }
 
 pub fn forwardHiddenOnlyWithCudaReplay(
@@ -4855,6 +4933,10 @@ fn decoderBlock(
     var mlp_up_slot = decoderOverrideLayerSlot(raw_overrides.mlp_up_slots, layer);
     var mlp_sub_norm_slot = decoderOverrideLayerSlot(raw_overrides.mlp_sub_norm_slots, layer);
     var mlp_down_slot = decoderOverrideLayerSlot(raw_overrides.mlp_down_slots, layer);
+    // Whole-block and fused-QKV routes own Q/V internally, so an eager adapter
+    // hook could not observe or replace those projections. Keep every other
+    // prepared slot: norms, K, attention output, and the complete FFN remain
+    // eligible for the production decoder-runtime kernels.
     if (disablePreparedDecoderSlotsDebug()) {
         attn_norm_slot = null;
         attn_q_slot = null;
@@ -4870,6 +4952,10 @@ fn decoderBlock(
         mlp_up_slot = null;
         mlp_sub_norm_slot = null;
         mlp_down_slot = null;
+    } else if (decode_context != null and decode_context.?.runtime_linear_adapter != null) {
+        attn_q_slot = null;
+        attn_v_slot = null;
+        fused_qkv_linear_slot = null;
     }
     // --- Self-attention sublayer ---
     // Pre-norm
@@ -5118,11 +5204,11 @@ fn decoderBlock(
             .in_dim = hidden_size,
             .out_dim = q_dim + kv_dim * 2,
         })) orelse break :blk blk_fallback: {
-            const q = try attnProject(cb, allocator, config, normed, total, hidden_size, num_heads * head_dim, layer, "q", &name_buf);
+            const q = try attnProject(cb, allocator, config, normed, total, hidden_size, num_heads * head_dim, layer, "q", decode_context, &name_buf);
             errdefer cb.free(q);
-            const k = try attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", &name_buf);
+            const k = try attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", decode_context, &name_buf);
             errdefer cb.free(k);
-            const projected_v = try attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "v", &name_buf);
+            const projected_v = try attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "v", decode_context, &name_buf);
             break :blk_fallback .{ .q = q, .k = k, .v = projected_v };
         };
         defer cb.free(fused_qkv);
@@ -5172,9 +5258,9 @@ fn decoderBlock(
                 .input = normed,
                 .in_dim = hidden_size,
                 .out_dim = q_projection_dim,
-            })) orelse try attnProject(cb, allocator, config, normed, total, hidden_size, @intCast(q_projection_dim), layer, "q", &name_buf)
+            })) orelse try attnProject(cb, allocator, config, normed, total, hidden_size, @intCast(q_projection_dim), layer, "q", decode_context, &name_buf)
         else
-            try attnProject(cb, allocator, config, normed, total, hidden_size, @intCast(q_projection_dim), layer, "q", &name_buf);
+            try attnProject(cb, allocator, config, normed, total, hidden_size, @intCast(q_projection_dim), layer, "q", decode_context, &name_buf);
         const q, const q_gate: ?CT = if (q_projection_dim == q_dim) .{ q_projected, null } else split_q: {
             defer cb.free(q_projected);
             const q_main = try cb.sliceLastDim(q_projected, 0, q_dim);
@@ -5192,14 +5278,14 @@ fn decoderBlock(
                 .input = normed,
                 .in_dim = hidden_size,
                 .out_dim = num_kv_heads * head_dim,
-            })) orelse try attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", &name_buf);
+            })) orelse try attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", decode_context, &name_buf);
             errdefer cb.free(k_local);
             const v_local = (try cb.decoderRuntimeApplyLinear(&.{
                 .slot = attn_v_slot.?,
                 .input = normed,
                 .in_dim = hidden_size,
                 .out_dim = num_kv_heads * head_dim,
-            })) orelse try attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "v", &name_buf);
+            })) orelse try attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "v", decode_context, &name_buf);
             break :blk_kv .{ k_local, false, v_local };
         } else if (attn_k_slot != null and attn_v_slot != null and config.family != .gemma) blk_kv: {
             const kv = (try cb.decoderRuntimeApplyLinearPair(&.{
@@ -5208,7 +5294,7 @@ fn decoderBlock(
                 .input = normed,
                 .in_dim = hidden_size,
                 .out_dim = num_kv_heads * head_dim,
-            })) orelse try attnProjectPair(cb, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", &name_buf);
+            })) orelse try attnProjectPair(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", decode_context, &name_buf);
             break :blk_kv .{ kv.first, false, kv.second };
         } else if (config.family == .gemma and !config.layerOmitsVProj(layer)) blk_kv: {
             if (attn_k_slot != null and attn_v_slot != null) {
@@ -5218,18 +5304,37 @@ fn decoderBlock(
                     .input = normed,
                     .in_dim = hidden_size,
                     .out_dim = num_kv_heads * head_dim,
-                })) orelse try attnProjectPair(cb, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", &name_buf);
+                })) orelse try attnProjectPair(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", decode_context, &name_buf);
                 break :blk_kv .{ kv.first, false, kv.second };
             }
-            const kv = try attnProjectPair(cb, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", &name_buf);
+            if (attn_k_slot) |slot| {
+                const k_local = (try cb.decoderRuntimeApplyLinear(&.{
+                    .slot = slot,
+                    .input = normed,
+                    .in_dim = hidden_size,
+                    .out_dim = num_kv_heads * head_dim,
+                })) orelse try attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", decode_context, &name_buf);
+                errdefer cb.free(k_local);
+                const v_local = try attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "v", decode_context, &name_buf);
+                break :blk_kv .{ k_local, false, v_local };
+            }
+            const kv = try attnProjectPair(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", decode_context, &name_buf);
             break :blk_kv .{ kv.first, false, kv.second };
         } else if (config.family == .bitnet) blk_kv: {
-            const kv = try attnProjectPair(cb, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", &name_buf);
+            const kv = try attnProjectPair(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", "v", decode_context, &name_buf);
             break :blk_kv .{ kv.first, false, kv.second };
         } else blk_kv: {
-            const k_local = try attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", &name_buf);
+            const k_local = if (attn_k_slot) |slot|
+                (try cb.decoderRuntimeApplyLinear(&.{
+                    .slot = slot,
+                    .input = normed,
+                    .in_dim = hidden_size,
+                    .out_dim = num_kv_heads * head_dim,
+                })) orelse try attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", decode_context, &name_buf)
+            else
+                try attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "k", decode_context, &name_buf);
             errdefer cb.free(k_local);
-            const projected_v = attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "v", &name_buf);
+            const projected_v = attnProject(cb, allocator, config, normed, total, hidden_size, num_kv_heads * head_dim, layer, "v", decode_context, &name_buf);
             break :blk_kv if (projected_v) |v|
                 .{ k_local, false, v }
             else |err| switch (err) {
@@ -6013,7 +6118,7 @@ pub fn debugAttentionProject(
     proj: []const u8,
     buf: *[256]u8,
 ) !CT {
-    return attnProject(cb, allocator, config, input, total, in_dim, out_dim, layer, proj, buf);
+    return attnProject(cb, allocator, config, input, total, in_dim, out_dim, layer, proj, null, buf);
 }
 
 pub fn debugAttentionOutputProject(
@@ -9307,6 +9412,7 @@ fn attnProject(
     out_dim: u32,
     layer: usize,
     proj: []const u8, // "q", "k", "v"
+    decode_context: ?*const DecodeContext,
     buf: *[256]u8,
 ) !CT {
     switch (config.family) {
@@ -9315,7 +9421,19 @@ fn attnProject(
             const w = try getModelWeight(cb, config, name);
             defer cb.free(w);
             const projected = try cb.linearNoBias(input, w, total, in_dim, out_dim);
-            return projected;
+            errdefer cb.free(projected);
+            return maybeApplyRuntimeLinearAdapter(
+                cb,
+                allocator,
+                config,
+                decode_context,
+                name,
+                input,
+                projected,
+                total,
+                in_dim,
+                out_dim,
+            );
         },
         .qwen2 => {
             // Qwen2 q/k/v_proj carry biases (unlike LLaMA/Mistral/Gemma).
@@ -9395,6 +9513,7 @@ fn attnProject(
 
 fn attnProjectPair(
     cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
     config: Config,
     input: CT,
     total: usize,
@@ -9403,6 +9522,7 @@ fn attnProjectPair(
     layer: usize,
     proj_a: []const u8,
     proj_b: []const u8,
+    decode_context: ?*const DecodeContext,
     buf: *[256]u8,
 ) !ops.LinearNoBiasPairResult {
     switch (config.family) {
@@ -9415,10 +9535,71 @@ fn attnProjectPair(
             const w_b = try getModelWeight(cb, config, name_b);
             defer cb.free(w_b);
             debug_timing_stats.attention_project_pair_calls += 1;
-            return cb.linearNoBiasPair(input, w_a, w_b, total, in_dim, out_dim);
+            var result = try cb.linearNoBiasPair(input, w_a, w_b, total, in_dim, out_dim);
+            errdefer {
+                cb.free(result.first);
+                cb.free(result.second);
+            }
+            result.first = try maybeApplyRuntimeLinearAdapter(
+                cb,
+                allocator,
+                config,
+                decode_context,
+                name_a,
+                input,
+                result.first,
+                total,
+                in_dim,
+                out_dim,
+            );
+            result.second = try maybeApplyRuntimeLinearAdapter(
+                cb,
+                allocator,
+                config,
+                decode_context,
+                name_b,
+                input,
+                result.second,
+                total,
+                in_dim,
+                out_dim,
+            );
+            return result;
         },
         else => return error.UnsupportedTensorType,
     }
+}
+
+fn maybeApplyRuntimeLinearAdapter(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    decode_context: ?*const DecodeContext,
+    unprefixed_base_name: []const u8,
+    input: CT,
+    base_output: CT,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !CT {
+    const adapter = if (decode_context) |ctx| ctx.runtime_linear_adapter orelse return base_output else return base_output;
+    var prefixed_buf: [256]u8 = undefined;
+    const base_name = try maybePrefixedModelName(config, unprefixed_base_name, &prefixed_buf);
+    const replacement = try adapter.apply(
+        cb,
+        allocator,
+        base_name,
+        input,
+        base_output,
+        rows,
+        in_dim,
+        out_dim,
+    );
+    if (replacement) |adapted| {
+        cb.free(base_output);
+        return adapted;
+    }
+    return base_output;
 }
 
 /// Split a fused c_attn weight [3*hidden, hidden] into Q/K/V chunks and project.

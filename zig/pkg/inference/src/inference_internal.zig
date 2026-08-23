@@ -56,6 +56,7 @@ pub const finetune = struct {
     pub const layoutlmv3 = @import("finetune/layoutlmv3.zig");
     pub const gemma4_real_autodiff = @import("finetune/gemma4_real_autodiff.zig");
     pub const gemma4_multimodal_real_autodiff = @import("finetune/gemma4_multimodal_real_autodiff.zig");
+    pub const gemma4_train_command = @import("finetune/gemma4_train_command.zig");
     pub const text_encoder_boundary = @import("finetune/text_encoder_boundary.zig");
     pub const gliner2_real_autodiff = @import("finetune/gliner2_real_autodiff.zig");
     pub const real_autodiff_trainer = @import("finetune/real_autodiff_trainer.zig");
