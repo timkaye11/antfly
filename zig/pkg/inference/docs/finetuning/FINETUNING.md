@@ -1430,15 +1430,19 @@ usage: materialize-gemma4-teacher-targets <base_model_dir> <prepared_inputs_json
   --top-k N              Teacher tokens per row (default: 8)
   --temperature F        Temperature applied before top-k softmax (default: 1.0)
   --max-examples N       Maximum examples to materialize (default: 0 = all)
-  --backend native|mlx   Teacher inference backend (default: native)
+  --backend native       Teacher inference backend (default: native)
 ```
 
 This tool runs the full Gemma4 teacher model over prepared inputs and writes sparse row-major `teacher_top_k_token_ids` and `teacher_top_k_probs` into the output prepared-input JSON. For multimodal prepared inputs, pass `--gguf-projector <projector.gguf>` unless the prepared summary records a valid projector path. The autodiff trainer consumes those soft targets when present, which is the first distillation path for recursive LoRA compression.
-Teacher probabilities are produced after applying `--temperature`, and the trainer applies the standard distillation `T^2` loss scale from each example's `teacher_temperature`.
+Teacher probabilities are produced after dividing teacher logits by `--temperature`. The trainer divides student logits by the same per-example temperature and applies the standard distillation `T^2` loss scale.
 
-This utility does not yet bind the supplied teacher model to the prepared
-artifact's model provenance. Treat teacher-target materialization as
-experimental until the teacher/base digest is validated and persisted.
+This foundation intentionally supports same-base distillation only. Before
+constructing the teacher graph, materialization fingerprints the selected
+teacher and requires its base, tokenizer, and chat-template digests to match the
+prepared artifact. Those teacher digests are persisted; multimodal targets also
+bind the prepared projector digest. Loading or training from unbound or
+mismatched teacher targets fails closed. Cross-model distillation requires a
+future explicit schema rather than silently weakening this contract.
 
 **Optional — materialize compressed recursive base:**
 ```text

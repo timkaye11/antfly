@@ -1106,6 +1106,7 @@ fn runAutodiff(
         },
         .prepared_dataset = .{
             .schema_version = prepared.schema_version,
+            .prepared_examples_sha256 = prepared.prepared_examples_sha256,
             .examples_seen = prepared.examples_seen,
             .max_seq_len = prepared.max_seq_len,
             .max_input_tokens = prepared.max_input_tokens,
@@ -1117,6 +1118,12 @@ fn runAutodiff(
             .examples_with_audio = prepared.examples_with_audio,
             .examples_truncated = prepared.examples_truncated,
             .max_turns_dropped = prepared.max_turns_dropped,
+        },
+        .teacher_provenance = .{
+            .base_model_sha256 = prepared.teacher_base_model_sha256,
+            .tokenizer_sha256 = prepared.teacher_tokenizer_sha256,
+            .chat_template_sha256 = prepared.teacher_chat_template_sha256,
+            .gguf_projector_sha256 = prepared.teacher_gguf_projector_sha256,
         },
         .evaluation_dataset = .{
             .schema_version = eval_prepared.schema_version,
@@ -1182,15 +1189,17 @@ fn evaluateAutodiff(
     gguf_projector_sha256: ?[]const u8,
 ) !gemma4_real.CausalLmMetrics {
     const execution_policy = autodiffExecutionPolicy(backend_kind);
-    const bootstrap = gemma4_real.findFirstSupervisedExample(examples) orelse return error.NoTrainingData;
+    const limit = if (max_examples > 0 and max_examples < examples.len) max_examples else examples.len;
+    const selected_examples = examples[0..limit];
+    const bootstrap = gemma4_real.findFirstSupervisedExample(selected_examples) orelse return error.NoEvaluationData;
+    const selected_seq_len: u32 = @intCast(limitExampleSeqLen(selected_examples, graph_config));
     var backend = try gemma4_real.loadBackendForModelDir(allocator, base_model_dir, backend_kind);
     defer backend.deinit();
-    const is_multimodal = countMultimodalExamples(examples) > 0;
+    const is_multimodal = countMultimodalExamples(selected_examples) > 0;
     var adapter_inspect = try finetune.inspectCheckpoint(allocator, adapter_model_dir);
     defer finetune.freeInspectionSummary(allocator, &adapter_inspect);
     const recursive_shared_block_size = adapter_inspect.recursive_shared_block_size;
 
-    const limit = if (max_examples > 0 and max_examples < examples.len) max_examples else examples.len;
     const eval_accum_steps: u32 = @intCast(@min(limit + 1, @as(usize, std.math.maxInt(u32))));
 
     var trainer = try real_autodiff.RealAutodiffTrainer.init(allocator, backend.backendPtr(), .{
@@ -1221,15 +1230,15 @@ fn evaluateAutodiff(
             &ctx,
             adapter_model_dir,
             bootstrap,
-            @intCast(limitExampleSeqLen(examples, graph_config)),
+            selected_seq_len,
         );
         return gemma4_mm_real.evaluatePreparedExamples(
             allocator,
             &trainer,
             &ctx,
-            examples,
-            max_examples,
-            @intCast(limitExampleSeqLen(examples, graph_config)),
+            selected_examples,
+            0,
+            selected_seq_len,
         );
     } else {
         var ctx = if (recursive_shared_block_size) |shared_block_size|
@@ -1242,15 +1251,15 @@ fn evaluateAutodiff(
             &ctx,
             adapter_model_dir,
             bootstrap,
-            @intCast(limitExampleSeqLen(examples, graph_config)),
+            selected_seq_len,
         );
         return gemma4_real.evaluatePreparedExamples(
             allocator,
             &trainer,
             &ctx,
-            examples,
-            max_examples,
-            @intCast(limitExampleSeqLen(examples, graph_config)),
+            selected_examples,
+            0,
+            selected_seq_len,
         );
     }
 }
@@ -1265,6 +1274,16 @@ fn limitExampleSeqLen(
         if (example.num_input_tokens > max_len) max_len = example.num_input_tokens;
     }
     return max_len;
+}
+
+test "gemma4 eval graph sizing only inspects the selected example slice" {
+    const examples = [_]finetune.PreparedExampleInput{
+        .{ .mode = .instruction, .prompt_input_ids = &.{}, .response_input_ids = &.{}, .num_prompt_tokens = 0, .num_response_tokens = 0, .num_input_tokens = 16 },
+        .{ .mode = .instruction, .prompt_input_ids = &.{}, .response_input_ids = &.{}, .num_prompt_tokens = 0, .num_response_tokens = 0, .num_input_tokens = 2048 },
+    };
+    const config = gemma_graph.Config{ .family = .gemma };
+    try std.testing.expectEqual(@as(usize, 16), limitExampleSeqLen(examples[0..1], config));
+    try std.testing.expectEqual(@as(usize, 2048), limitExampleSeqLen(&examples, config));
 }
 
 fn runSurrogate(

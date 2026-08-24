@@ -1,8 +1,9 @@
 # Gemma4 E2B/E4B LoRA Fine-Tuning
 
 > Status: experimental, single-device, text-only, and not production-ready.
-> The focused Linux ReleaseSafe source gates are green. Strict Metal execution
-> still requires the macOS GPU CI gate and a bounded real-model first-step run.
+> The focused CPU and synthetic strict-Metal source gates are green locally.
+> The dedicated macOS GPU workflow still must pass in CI, and a bounded
+> real-model first-step run remains required.
 
 The current Zig path implements the text causal-LM graph, sparse loss, LoRA
 optimizer, evaluation, and artifact pipeline intended for Gemma4 E2B and E4B
@@ -10,8 +11,9 @@ models. It prepares Gemma4 chat data, bootstraps a strict LoRA adapter
 inventory, requires a distinct evaluation artifact, and selects the native or
 Metal backend. Device-only BF16 frozen linears and embedding gathers, rank-4
 attention VJPs, and a strict synthetic optimizer step have focused test
-coverage. Real-model first-step acceptance and the strict Metal CI gate remain
-open, so this is an implementation contract rather than a readiness claim.
+coverage. Real-model first-step acceptance and a successful required Metal CI
+run remain open, so this is an implementation contract rather than a readiness
+claim.
 
 MLX, distributed training, multimodal/projector training, and Gemma4 MoE models
 are outside the supported path described here.
@@ -40,6 +42,9 @@ are outside the supported path described here.
   selected base artifact, tokenizer assets, and chat-template identity. Adapter
   bootstrap records the same identities and a closed, exact A/B target
   inventory.
+- Sparse teacher targets carry their temperature and are accepted only when
+  their persisted base/tokenizer/template provenance matches the prepared
+  student artifact. Multimodal targets additionally bind the projector digest.
 
 ## Text Training Flow
 
@@ -132,9 +137,12 @@ declared source split.
 
 The provenance chain is not yet complete outside the primary training
 admission. Generic adapter save/load/materialize does not consistently preserve
-or validate these identities, teacher-target materialization does not bind its
-teacher model to the prepared base, and the final report does not yet hash every
-input and published payload. These are release blockers, not optional metadata
+or validate these identities, and the final report does not yet hash every
+input and published payload. Teacher-target materialization is intentionally
+same-base only: it fingerprints and validates the teacher before graph
+construction, persists the teacher identity, and exposes it in the final
+training report. Broader cross-model distillation needs an explicit future
+schema. The remaining gaps are release blockers, not optional metadata
 improvements.
 
 Sequence length is admitted before graph/backend construction and is currently
@@ -223,11 +231,10 @@ agree.
 
 These guarantees are visibility-atomic, not yet power-loss durable. The shared
 publisher does not fsync staged files, the staging directory, or its parent.
-Prepared JSON is still written directly, and the public trainer bundle saver
-retains a separate check-then-rename path with a late-collision race. The
-`materialize-gemma4-lora --eval` wrapper also publishes before its post-merge
-evaluation succeeds. Those entry points must not be used as durable production
-transactions yet.
+Prepared JSON is still written directly. The public trainer bundle saver uses
+the shared no-replace publisher, but the `materialize-gemma4-lora --eval`
+wrapper still publishes before its post-merge evaluation succeeds. That wrapper
+must not be used as a durable production transaction yet.
 
 Full-model materialization is deliberately fail-closed while it uses the
 legacy whole-model F32 implementation. It accepts only a monolithic
@@ -275,11 +282,12 @@ focused local tests had passed for:
 ### Current integrated verification
 
 The current branch adds prepared-input v4 provenance, mandatory separate eval,
-sequence admission, closed adapter inventories, shared no-replace publication,
-loss-only compiled Metal evaluation, extra strict-executor telemetry, and
-in-place restoration of resident Metal optimizer slots. A proposed macOS
-`macos-15-xlarge` workflow runs the synthetic Gemma4 Debug, ReleaseSafe, and
-ReleaseFast gates with missing Metal treated as a failure.
+sequence admission, closed adapter inventories, teacher-target provenance,
+shared no-replace publication, loss-only compiled Metal evaluation, extra
+strict-executor telemetry, and in-place restoration of resident Metal optimizer
+slots. The included macOS `macos-15-xlarge` workflow runs the synthetic Gemma4
+Debug, ReleaseSafe, and ReleaseFast gates with missing Metal treated as a
+failure.
 
 The current integrated source passes the following Linux ReleaseSafe gates with
 Metal, CUDA, ONNX, and PJRT disabled:
@@ -289,9 +297,16 @@ zig build test-gemma4-finetune
 zig build test-gemma-graph
 ```
 
-`test-gemma4-finetune` selected 161 tests: 157 passed and four platform or
+`test-gemma4-finetune` selected 165 tests: 161 passed and four platform or
 optional-fixture tests skipped. `test-gemma-graph` passed all six tests. Neither
 result exercises a Metal device.
+
+On a local Apple M4, the strict-Metal `test-gemma4-finetune` gate passed in
+Debug, ReleaseSafe, and ReleaseFast: 173 tests selected, 171 passed, and two
+artifact-dependent tests skipped in each mode. The synthetic CLI check performed
+one real Metal optimizer step with a finite nonzero gradient and zero true host
+outputs. The Debug and ReleaseSafe Metal graph gates passed all six tests, and
+the focused Debug lifecycle gate passed all four matching tests.
 
 The macOS job is a synthetic real-GPU gate, not an E2B/E4B scale gate. It must
 run successfully in CI and be made required in repository branch protection;
@@ -315,17 +330,15 @@ donation and is not a standalone causal-LM acceptance artifact.
 ## Production Roadmap and Release Gates
 
 1. **Finish dataset and artifact identity.** Persist dataset/split provenance,
-   bind teacher targets to their teacher/base identity, preserve provenance in
-   generic adapter saves, and record training/eval/config/adapter payload
-   digests in the immutable run report.
+   preserve provenance in generic adapter saves, and record
+   training/eval/config/adapter payload digests in the immutable run report.
 2. **Make the supported boundary honest.** Reject multimodal examples before
-   publication/backend work until that lane is separately accepted. Size the
-   eval graph from the selected `--eval-max-examples` slice, not the entire eval
-   artifact, and gate every recorded strict-Metal promotion counter.
-3. **Complete artifact transactions.** Replace the direct trainer-saver rename,
-   make prepared data immutable and streaming/sharded, evaluate materialized
-   output before publication, and add file/directory/parent fsync plus stale
-   staging recovery and failure injection.
+   publication/backend work until that lane is separately accepted, and gate
+   every recorded strict-Metal promotion counter.
+3. **Complete artifact transactions.** Make prepared data immutable and
+   streaming/sharded, evaluate materialized output before publication, and add
+   file/directory/parent fsync plus stale staging recovery and failure
+   injection.
 4. **Implement durable Gemma4 checkpoint/resume.** The low-level Metal restore
    now overwrites resident optimizer slots, but the CLI/recipe still need
    atomic adapter/optimizer/step/accumulation/epoch/cursor/RNG checkpoints. A

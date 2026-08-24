@@ -17,6 +17,7 @@ const build_options = @import("build_options");
 const ml = @import("ml");
 const c_file = @import("../util/c_file.zig");
 const gemma_graph = @import("../architectures/gemma_graph.zig");
+const artifact_publication = @import("artifact_publication.zig");
 const real_autodiff = @import("real_autodiff_trainer.zig");
 const gemma4 = @import("gemma4.zig");
 const compat = @import("../io/compat.zig");
@@ -198,8 +199,12 @@ pub const GemmaAutodiffCtx = struct {
         const teacher_top_k: u32 = if (target_columns == sparse_target_columns)
             0
         else blk: {
-            if ((target_columns - 1) % 2 != 0) return error.InvalidTeacherDistillationTargets;
-            break :blk (target_columns - 1) / 2;
+            if (target_columns < sparse_teacher_fixed_columns or
+                (target_columns - sparse_teacher_fixed_columns) % 2 != 0)
+            {
+                return error.InvalidTeacherDistillationTargets;
+            }
+            break :blk (target_columns - sparse_teacher_fixed_columns) / 2;
         };
 
         const hidden_flat = try bld.reshape(forward_output, Shape.init(.f32, &.{ @as(i64, @intCast(total_rows)), @as(i64, @intCast(hidden_size)) }));
@@ -207,8 +212,9 @@ pub const GemmaAutodiffCtx = struct {
         const predictor_rows = try bld.reshape(predictor_rows_2d, Shape.init(.f32, &.{@as(i64, @intCast(supervised_rows))}));
         const supervised_hidden = try bld.embeddingLookup(hidden_flat, predictor_rows, supervised_rows, hidden_size);
         const labels = if (teacher_top_k == 0) try bld.sliceLastDim(targets, 1, 2) else null;
-        const teacher_ids = if (teacher_top_k > 0) try bld.sliceLastDim(targets, 1, 1 + teacher_top_k) else null;
-        const teacher_probs = if (teacher_top_k > 0) try bld.sliceLastDim(targets, 1 + teacher_top_k, target_columns) else null;
+        const teacher_temperatures = if (teacher_top_k > 0) try bld.sliceLastDim(targets, 1, 2) else null;
+        const teacher_ids = if (teacher_top_k > 0) try bld.sliceLastDim(targets, 2, 2 + teacher_top_k) else null;
+        const teacher_probs = if (teacher_top_k > 0) try bld.sliceLastDim(targets, 2 + teacher_top_k, target_columns) else null;
         const lm_head_w = try self.buildLmHeadWeight(bld, hidden_size);
 
         const vocab_size: usize = @intCast(self.graph_config.vocab_size);
@@ -224,7 +230,12 @@ pub const GemmaAutodiffCtx = struct {
             const chunk_rows = end - start;
             const hidden_chunk = try sliceRows2d(bld, supervised_hidden, start, end, hidden_size);
             const raw_logits = try bld.linearNoBias(hidden_chunk, lm_head_w, chunk_rows, hidden_size, self.graph_config.vocab_size);
-            const logits = try self.applyFinalLogitSoftcap(bld, raw_logits);
+            const unscaled_logits = try self.applyFinalLogitSoftcap(bld, raw_logits);
+            const logits = if (teacher_top_k > 0) blk: {
+                const temperature_chunk = try sliceRows2d(bld, teacher_temperatures.?, start, end, 1);
+                const temperature_bc = try broadcast2d(bld, temperature_chunk, chunk_rows, self.graph_config.vocab_size);
+                break :blk try bld.div(unscaled_logits, temperature_bc);
+            } else unscaled_logits;
             const dense_targets = if (teacher_top_k == 0) blk: {
                 const label_chunk = try sliceRows2d(bld, labels.?, start, end, 1);
                 break :blk try oneHotTargets(bld, label_chunk, vocab_row, chunk_rows, self.graph_config.vocab_size);
@@ -296,6 +307,7 @@ pub const GemmaAutodiffCtx = struct {
 };
 
 const sparse_target_columns: i64 = 2;
+const sparse_teacher_fixed_columns: u32 = 2;
 const sparse_loss_chunk_rows: u32 = 1;
 
 fn sliceRows2d(bld: *Builder, input: NodeId, start: u32, end: u32, columns: u32) !NodeId {
@@ -465,7 +477,7 @@ fn makeTrainerInputForExampleWeighted(
         token_scale_override == null and
         teacher_fields_present;
     const sparse_teacher_columns = if (sparse_teacher_targets)
-        try std.math.add(usize, 1, try std.math.mul(usize, 2, example.teacher_top_k))
+        try std.math.add(usize, sparse_teacher_fixed_columns, try std.math.mul(usize, 2, example.teacher_top_k))
     else
         0;
     const targets_shape = if (sparse_hard_targets)
@@ -687,7 +699,7 @@ fn fillSparseTeacherTopKTargets(
     example: *const gemma4.PreparedExampleInput,
 ) !void {
     const top_k = example.teacher_top_k;
-    const expected_columns = std.math.add(usize, 1, std.math.mul(usize, 2, top_k) catch return error.InvalidTeacherDistillationTargets) catch
+    const expected_columns = std.math.add(usize, sparse_teacher_fixed_columns, std.math.mul(usize, 2, top_k) catch return error.InvalidTeacherDistillationTargets) catch
         return error.InvalidTeacherDistillationTargets;
     if (top_k == 0 or target_columns != expected_columns) return error.InvalidTeacherDistillationTargets;
     if (example.teacher_top_k_token_ids.len != example.teacher_top_k_probs.len) return error.InvalidTeacherDistillationTargets;
@@ -722,9 +734,10 @@ fn fillSparseTeacherTopKTargets(
 
         const target_base = active_row * target_columns;
         targets[target_base] = @floatFromInt(row - 1);
+        targets[target_base + 1] = temperature;
         for (0..top_k) |ki| {
-            targets[target_base + 1 + ki] = @floatFromInt(example.teacher_top_k_token_ids[teacher_base + ki]);
-            targets[target_base + 1 + top_k + ki] = distillation_scale * (example.teacher_top_k_probs[teacher_base + ki] / prob_sum);
+            targets[target_base + 2 + ki] = @floatFromInt(example.teacher_top_k_token_ids[teacher_base + ki]);
+            targets[target_base + 2 + top_k + ki] = distillation_scale * (example.teacher_top_k_probs[teacher_base + ki] / prob_sum);
         }
         active_row += 1;
     }
@@ -746,6 +759,10 @@ pub fn materializeTeacherTopKTargets(
     if (gemma4.preparedExamplesHaveMedia(prepared.examples)) return error.MultimodalTeacherMaterializationNotYetSupported;
     if (options.top_k == 0) return error.InvalidTeacherTopK;
     if (!std.math.isFinite(options.temperature) or options.temperature <= 0) return error.InvalidTeacherTemperature;
+
+    var teacher_provenance = try gemma4.fingerprintGemma4Model(allocator, base_model_dir);
+    defer teacher_provenance.deinit(allocator);
+    try gemma4.validatePreparedModelProvenance(prepared.*, teacher_provenance);
 
     const graph_config = try loadGraphConfig(allocator, base_model_dir);
     const vocab_size: usize = @intCast(graph_config.vocab_size);
@@ -797,6 +814,9 @@ pub fn materializeTeacherTopKTargets(
     }
     summary.examples_seen = limit;
     try gemma4.refreshPreparedExamplesFingerprint(allocator, prepared);
+    if (gemma4.preparedExamplesHaveTeacherTargets(prepared.examples)) {
+        try gemma4.bindPreparedTeacherProvenance(allocator, prepared, teacher_provenance, null);
+    }
     return summary;
 }
 
@@ -1372,26 +1392,22 @@ const GemmaBundleWriteSpec = struct {
     special_tokens_map_path: ?[]const u8 = null,
 };
 
-var gemma_bundle_publication_nonce: std.atomic.Value(u64) = .init(0);
-
 fn writeAndPublishGemmaBundle(
     allocator: std.mem.Allocator,
     out_dir: []const u8,
     tensors: []const WriteTensorF32,
     spec: GemmaBundleWriteSpec,
 ) !void {
-    const parent_dir = std.fs.path.dirname(out_dir) orelse ".";
-    try compat.cwd().createDirPath(compat.io(), parent_dir);
+    var publication = artifact_publication.ImmutableDirectoryPublication.init(allocator, compat.io(), out_dir) catch |err| switch (err) {
+        error.Gemma4RunOutputAlreadyExists => return error.GemmaBundleOutputAlreadyExists,
+        else => return err,
+    };
+    defer publication.deinit();
+    try publication.createStaging();
 
-    const staging_dir = try uniqueGemmaBundleSiblingPath(allocator, out_dir, "staging");
-    defer allocator.free(staging_dir);
-    try compat.cwd().createDir(compat.io(), staging_dir, .default_dir);
-    var staging_published = false;
-    defer if (!staging_published) compat.cwd().deleteTree(compat.io(), staging_dir) catch {};
-
-    const adapter_checkpoint_path = try std.fs.path.join(allocator, &.{ staging_dir, gemma4.adapter_checkpoint_file_name });
+    const adapter_checkpoint_path = try std.fs.path.join(allocator, &.{ publication.staging_dir, gemma4.adapter_checkpoint_file_name });
     defer allocator.free(adapter_checkpoint_path);
-    const adapter_config_path = try std.fs.path.join(allocator, &.{ staging_dir, gemma4.adapter_config_file_name });
+    const adapter_config_path = try std.fs.path.join(allocator, &.{ publication.staging_dir, gemma4.adapter_config_file_name });
     defer allocator.free(adapter_config_path);
 
     try writeHeaderAndTensorsF32(allocator, adapter_checkpoint_path, tensors);
@@ -1407,45 +1423,16 @@ fn writeAndPublishGemmaBundle(
         spec.target_modules,
         spec.recursive_config,
     );
-    try copySupportingArtifactIfPresent(allocator, spec.tokenizer_config_path, staging_dir, gemma4.tokenizer_config_file_name);
-    try copySupportingArtifactIfPresent(allocator, spec.tokenizer_path, staging_dir, gemma4.tokenizer_file_name);
-    try copySupportingArtifactIfPresent(allocator, spec.special_tokens_map_path, staging_dir, gemma4.special_tokens_map_file_name);
+    try copySupportingArtifactIfPresent(allocator, spec.tokenizer_config_path, publication.staging_dir, gemma4.tokenizer_config_file_name);
+    try copySupportingArtifactIfPresent(allocator, spec.tokenizer_path, publication.staging_dir, gemma4.tokenizer_file_name);
+    try copySupportingArtifactIfPresent(allocator, spec.special_tokens_map_path, publication.staging_dir, gemma4.special_tokens_map_file_name);
 
-    try gemma4.validateLoRAAdapterInventory(allocator, staging_dir);
+    try gemma4.validateLoRAAdapterInventory(allocator, publication.staging_dir);
 
-    try publishStagedGemmaBundle(staging_dir, out_dir);
-    staging_published = true;
-}
-
-fn uniqueGemmaBundleSiblingPath(
-    allocator: std.mem.Allocator,
-    destination: []const u8,
-    label: []const u8,
-) ![]u8 {
-    const nonce = gemma_bundle_publication_nonce.fetchAdd(1, .monotonic);
-    const leaf = try std.fmt.allocPrint(
-        allocator,
-        ".{s}.gemma-bundle-{s}-{d}-{d}",
-        .{ std.fs.path.basename(destination), label, std.posix.system.getpid(), nonce },
-    );
-    defer allocator.free(leaf);
-    return std.fs.path.join(allocator, &.{ std.fs.path.dirname(destination) orelse ".", leaf });
-}
-
-fn pathExists(path: []const u8) !bool {
-    compat.cwd().access(compat.io(), path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return false,
+    publication.publish() catch |err| switch (err) {
+        error.Gemma4RunOutputAlreadyExists => return error.GemmaBundleOutputAlreadyExists,
         else => return err,
     };
-    return true;
-}
-
-fn publishStagedGemmaBundle(
-    staging_dir: []const u8,
-    out_dir: []const u8,
-) !void {
-    if (try pathExists(out_dir)) return error.GemmaBundleOutputAlreadyExists;
-    try std.Io.Dir.rename(compat.cwd(), staging_dir, compat.cwd(), out_dir, compat.io());
 }
 
 fn mapTrainerSlotNameToGemmaAdapterTensor(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
@@ -1844,14 +1831,21 @@ test "gemma4 sparse teacher loss never constructs a sequence by vocabulary targe
     defer graph.deinit();
     var bld = Builder.init(&graph);
     const hidden = try bld.parameter("hidden", Shape.init(.f32, &.{ 1, 4, 16 }));
-    const targets = try bld.parameter("targets", Shape.init(.f32, &.{ 2, 5 }));
+    const targets = try bld.parameter("targets", Shape.init(.f32, &.{ 2, 6 }));
 
     const loss = try GemmaAutodiffCtx.buildLoss(@ptrCast(&ctx), &bld, hidden, targets);
     try std.testing.expectEqual(@as(i64, 1), graph.node(loss).output_shape.numElements().?);
+    var saw_temperature_divide = false;
     for (0..graph.nodeCount()) |idx| {
-        const shape = graph.node(@intCast(idx)).output_shape;
+        const node = graph.node(@intCast(idx));
+        const shape = node.output_shape;
         try std.testing.expect(!(shape.rank() == 2 and shape.dim(0) == 4 and shape.dim(1) == 32));
+        switch (node.op) {
+            .div => saw_temperature_divide = true,
+            else => {},
+        }
     }
+    try std.testing.expect(saw_temperature_divide);
 }
 
 test "gemma4 loadGraphConfig supports a GGUF manifest directory" {
@@ -1957,10 +1951,10 @@ test "gemma4 teacher soft targets are sparse and aligned to causal predictor row
     defer owned.deinit(allocator);
 
     try std.testing.expectEqual(@as(i64, 2), owned.trainer_input.targets_shape.dim(0));
-    try std.testing.expectEqual(@as(i64, 5), owned.trainer_input.targets_shape.dim(1));
+    try std.testing.expectEqual(@as(i64, 6), owned.trainer_input.targets_shape.dim(1));
     try std.testing.expectEqualSlices(f32, &.{
-        1.0, 7.0, 8.0,  0.75, 0.25,
-        2.0, 9.0, 10.0, 0.2,  0.8,
+        1.0, 1.0, 7.0, 8.0,  0.75, 0.25,
+        2.0, 1.0, 9.0, 10.0, 0.2,  0.8,
     }, owned.targets);
 }
 
@@ -1987,7 +1981,7 @@ test "gemma4 dense and sparse teacher targets reject infinite values" {
         .teacher_temperature = std.math.inf(f32),
     };
     var dense_targets = [_]f32{0} ** 16;
-    var sparse_targets = [_]f32{0} ** 3;
+    var sparse_targets = [_]f32{0} ** 4;
 
     try std.testing.expectError(
         error.InvalidTeacherTemperature,
@@ -1995,7 +1989,7 @@ test "gemma4 dense and sparse teacher targets reject infinite values" {
     );
     try std.testing.expectError(
         error.InvalidTeacherTemperature,
-        fillSparseTeacherTopKTargets(&sparse_targets, 3, 2, 8, &example),
+        fillSparseTeacherTopKTargets(&sparse_targets, 4, 2, 8, &example),
     );
 
     example.teacher_temperature = 1.0;
@@ -2006,7 +2000,7 @@ test "gemma4 dense and sparse teacher targets reject infinite values" {
     );
     try std.testing.expectError(
         error.InvalidTeacherDistillationTargets,
-        fillSparseTeacherTopKTargets(&sparse_targets, 3, 2, 8, &example),
+        fillSparseTeacherTopKTargets(&sparse_targets, 4, 2, 8, &example),
     );
 }
 
@@ -2057,7 +2051,7 @@ test "gemma4 makeTrainerInputForTokenLogprobGrads aligns completion weights with
     for (final_row) |value| try std.testing.expectEqual(@as(f32, 0.0), value);
 }
 
-test "gemma4 makeTrainerInputForExample scales teacher soft targets by temperature squared" {
+test "gemma4 teacher targets carry temperature and standard distillation scale" {
     const allocator = std.testing.allocator;
     var ctx = GemmaAutodiffCtx.init(.{
         .family = .gemma,
@@ -2105,5 +2099,19 @@ test "gemma4 makeTrainerInputForExample scales teacher soft targets by temperatu
     var owned = try makeTrainerInputForExample(allocator, &ctx, &ex, 2);
     defer owned.deinit(allocator);
 
-    try std.testing.expectEqualSlices(f32, &.{ 0.0, 5.0, 6.0, 1.0, 3.0 }, owned.targets);
+    try std.testing.expectEqualSlices(f32, &.{ 0.0, 2.0, 5.0, 6.0, 1.0, 3.0 }, owned.targets);
+
+    // For T=2 the expected student-logit gradient is
+    // T * (softmax(student_logits / T) - teacher_probs). Verify the formula
+    // differs from the old T^2-scaled, untempered gradient, including direction.
+    const student_logits = [_]f32{ 1.0, -1.0 };
+    const teacher_distribution = [_]f32{ 0.8, 0.2 };
+    const temperature: f32 = 2.0;
+    const tempered_p0 = @exp(student_logits[0] / temperature) /
+        (@exp(student_logits[0] / temperature) + @exp(student_logits[1] / temperature));
+    const correct_gradient0 = temperature * (tempered_p0 - teacher_distribution[0]);
+    const untempered_p0 = @exp(student_logits[0]) / (@exp(student_logits[0]) + @exp(student_logits[1]));
+    const old_gradient0 = temperature * temperature * (untempered_p0 - teacher_distribution[0]);
+    try std.testing.expect(correct_gradient0 < 0.0);
+    try std.testing.expect(old_gradient0 > 0.0);
 }

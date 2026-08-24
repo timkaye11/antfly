@@ -168,6 +168,10 @@ pub const PreparedInputsSummary = struct {
     base_model_sha256: ?[]const u8 = null,
     tokenizer_sha256: ?[]const u8 = null,
     chat_template_sha256: ?[]const u8 = null,
+    teacher_base_model_sha256: ?[]const u8 = null,
+    teacher_tokenizer_sha256: ?[]const u8 = null,
+    teacher_chat_template_sha256: ?[]const u8 = null,
+    teacher_gguf_projector_sha256: ?[]const u8 = null,
     prepared_examples_sha256: ?[]const u8 = null,
     max_seq_len: usize = 512,
     max_prompt_tokens: usize = 0,
@@ -2019,6 +2023,10 @@ pub fn freePreparedInputsSummary(allocator: std.mem.Allocator, summary: *const P
     if (summary.base_model_sha256) |p| allocator.free(p);
     if (summary.tokenizer_sha256) |p| allocator.free(p);
     if (summary.chat_template_sha256) |p| allocator.free(p);
+    if (summary.teacher_base_model_sha256) |p| allocator.free(p);
+    if (summary.teacher_tokenizer_sha256) |p| allocator.free(p);
+    if (summary.teacher_chat_template_sha256) |p| allocator.free(p);
+    if (summary.teacher_gguf_projector_sha256) |p| allocator.free(p);
     if (summary.prepared_examples_sha256) |p| allocator.free(p);
     for (summary.examples) |*item| freePreparedExampleInput(allocator, item);
     allocator.free(summary.examples);
@@ -2422,6 +2430,78 @@ pub fn preparedExamplesHaveMedia(examples: []const PreparedExampleInput) bool {
     return false;
 }
 
+pub fn preparedExamplesHaveTeacherTargets(examples: []const PreparedExampleInput) bool {
+    for (examples) |example| {
+        if (example.teacher_top_k != 0 or
+            example.teacher_top_k_token_ids.len != 0 or
+            example.teacher_top_k_probs.len != 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fn bindPreparedTeacherProvenance(
+    allocator: std.mem.Allocator,
+    summary: *PreparedInputsSummary,
+    actual: ModelProvenance,
+    teacher_projector_sha256: ?[]const u8,
+) !void {
+    try validatePreparedModelProvenance(summary.*, actual);
+
+    const base_digest = try allocator.dupe(u8, actual.base_model_sha256);
+    errdefer allocator.free(base_digest);
+    const tokenizer_digest = try allocator.dupe(u8, actual.tokenizer_sha256);
+    errdefer allocator.free(tokenizer_digest);
+    const chat_digest = try allocator.dupe(u8, actual.chat_template_sha256);
+    errdefer allocator.free(chat_digest);
+    const projector_digest = if (teacher_projector_sha256) |digest| try allocator.dupe(u8, digest) else null;
+    errdefer if (projector_digest) |digest| allocator.free(digest);
+
+    if (summary.teacher_base_model_sha256) |old| allocator.free(old);
+    if (summary.teacher_tokenizer_sha256) |old| allocator.free(old);
+    if (summary.teacher_chat_template_sha256) |old| allocator.free(old);
+    if (summary.teacher_gguf_projector_sha256) |old| allocator.free(old);
+    summary.teacher_base_model_sha256 = base_digest;
+    summary.teacher_tokenizer_sha256 = tokenizer_digest;
+    summary.teacher_chat_template_sha256 = chat_digest;
+    summary.teacher_gguf_projector_sha256 = projector_digest;
+}
+
+pub fn validatePreparedTeacherProvenance(summary: PreparedInputsSummary) !void {
+    const has_targets = preparedExamplesHaveTeacherTargets(summary.examples);
+    const has_any_provenance = summary.teacher_base_model_sha256 != null or
+        summary.teacher_tokenizer_sha256 != null or
+        summary.teacher_chat_template_sha256 != null or
+        summary.teacher_gguf_projector_sha256 != null;
+    if (!has_targets and !has_any_provenance) return;
+    if (!has_targets) return error.UnexpectedPreparedTeacherProvenance;
+
+    const teacher_base = summary.teacher_base_model_sha256 orelse return error.PreparedTeacherProvenanceRequired;
+    const teacher_tokenizer = summary.teacher_tokenizer_sha256 orelse return error.PreparedTeacherProvenanceRequired;
+    const teacher_chat = summary.teacher_chat_template_sha256 orelse return error.PreparedTeacherProvenanceRequired;
+    try validateSha256Hex(teacher_base);
+    try validateSha256Hex(teacher_tokenizer);
+    try validateSha256Hex(teacher_chat);
+
+    const prepared_base = summary.base_model_sha256 orelse return error.PreparedInputsProvenanceRequired;
+    const prepared_tokenizer = summary.tokenizer_sha256 orelse return error.PreparedInputsProvenanceRequired;
+    const prepared_chat = summary.chat_template_sha256 orelse return error.PreparedInputsProvenanceRequired;
+    if (!std.mem.eql(u8, teacher_base, prepared_base)) return error.PreparedTeacherBaseModelMismatch;
+    if (!std.mem.eql(u8, teacher_tokenizer, prepared_tokenizer)) return error.PreparedTeacherTokenizerMismatch;
+    if (!std.mem.eql(u8, teacher_chat, prepared_chat)) return error.PreparedTeacherChatTemplateMismatch;
+
+    if (preparedExamplesHaveMedia(summary.examples)) {
+        const teacher_projector = summary.teacher_gguf_projector_sha256 orelse return error.PreparedTeacherProjectorProvenanceRequired;
+        const prepared_projector = summary.gguf_projector_sha256 orelse return error.MissingPreparedProjectorFingerprint;
+        try validateSha256Hex(teacher_projector);
+        if (!std.mem.eql(u8, teacher_projector, prepared_projector)) return error.PreparedTeacherProjectorMismatch;
+    } else if (summary.teacher_gguf_projector_sha256 != null) {
+        return error.UnexpectedPreparedTeacherProjectorProvenance;
+    }
+}
+
 pub fn validatePreparedArtifactIntegrity(
     allocator: std.mem.Allocator,
     summary: PreparedInputsSummary,
@@ -2437,6 +2517,7 @@ pub fn validatePreparedArtifactIntegrity(
     try validateSha256Hex(chat_digest);
     try validateSha256Hex(examples_digest);
     try validatePreparedAggregates(summary);
+    try validatePreparedTeacherProvenance(summary);
     const actual = try fingerprintPreparedExamplesAlloc(allocator, summary.examples);
     defer allocator.free(actual);
     if (!std.mem.eql(u8, examples_digest, actual)) return error.PreparedInputsFingerprintMismatch;
@@ -3425,6 +3506,10 @@ fn clonePreparedInputsSummary(allocator: std.mem.Allocator, source: *const Prepa
         .base_model_sha256 = try dupeOptionalString(allocator, source.base_model_sha256),
         .tokenizer_sha256 = try dupeOptionalString(allocator, source.tokenizer_sha256),
         .chat_template_sha256 = try dupeOptionalString(allocator, source.chat_template_sha256),
+        .teacher_base_model_sha256 = try dupeOptionalString(allocator, source.teacher_base_model_sha256),
+        .teacher_tokenizer_sha256 = try dupeOptionalString(allocator, source.teacher_tokenizer_sha256),
+        .teacher_chat_template_sha256 = try dupeOptionalString(allocator, source.teacher_chat_template_sha256),
+        .teacher_gguf_projector_sha256 = try dupeOptionalString(allocator, source.teacher_gguf_projector_sha256),
         .prepared_examples_sha256 = try dupeOptionalString(allocator, source.prepared_examples_sha256),
         .max_seq_len = source.max_seq_len,
         .max_prompt_tokens = source.max_prompt_tokens,
@@ -3863,6 +3948,54 @@ test "Gemma4 training sequence admission is bounded before graph construction" {
     if (std.math.maxInt(usize) > std.math.maxInt(u32)) {
         try std.testing.expectError(error.PreparedSequenceLengthOverflow, validateTrainingSequenceLength(@as(usize, std.math.maxInt(u32)) + 1, std.math.maxInt(u32)));
     }
+}
+
+test "teacher targets require same-base provenance and bind multimodal projector provenance" {
+    var teacher_ids = [_]i32{7};
+    var teacher_probs = [_]f32{1.0};
+    var examples = [_]PreparedExampleInput{.{
+        .mode = .instruction,
+        .prompt_input_ids = &.{},
+        .response_input_ids = &.{},
+        .num_prompt_tokens = 0,
+        .num_response_tokens = 0,
+        .teacher_top_k_token_ids = &teacher_ids,
+        .teacher_top_k_probs = &teacher_probs,
+        .teacher_top_k = 1,
+    }};
+    const base_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const tokenizer_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const chat_sha = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const other_sha = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    var summary = PreparedInputsSummary{
+        .artifact_family_version = artifact_family_version,
+        .model_dir = "/model",
+        .schema_version = prepared_schema_v4,
+        .max_examples = 1,
+        .examples_seen = 1,
+        .base_model_sha256 = base_sha,
+        .tokenizer_sha256 = tokenizer_sha,
+        .chat_template_sha256 = chat_sha,
+        .examples = &examples,
+    };
+
+    try std.testing.expectError(error.PreparedTeacherProvenanceRequired, validatePreparedTeacherProvenance(summary));
+    summary.teacher_base_model_sha256 = base_sha;
+    summary.teacher_tokenizer_sha256 = tokenizer_sha;
+    summary.teacher_chat_template_sha256 = chat_sha;
+    try validatePreparedTeacherProvenance(summary);
+
+    summary.teacher_base_model_sha256 = other_sha;
+    try std.testing.expectError(error.PreparedTeacherBaseModelMismatch, validatePreparedTeacherProvenance(summary));
+    summary.teacher_base_model_sha256 = base_sha;
+
+    examples[0].image_paths = &.{"image.png"};
+    summary.gguf_projector_sha256 = other_sha;
+    try std.testing.expectError(error.PreparedTeacherProjectorProvenanceRequired, validatePreparedTeacherProvenance(summary));
+    summary.teacher_gguf_projector_sha256 = other_sha;
+    try validatePreparedTeacherProvenance(summary);
+    summary.teacher_gguf_projector_sha256 = base_sha;
+    try std.testing.expectError(error.PreparedTeacherProjectorMismatch, validatePreparedTeacherProvenance(summary));
 }
 
 test "prepared v4 integrity detects content mutation and heldout overlap" {

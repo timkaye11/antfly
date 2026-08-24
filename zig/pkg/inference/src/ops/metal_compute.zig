@@ -11852,6 +11852,30 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         in_dim: usize,
         out_dim: usize,
     ) anyerror!ops.LinearNoBiasPairResult {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input_buf = toBuf(input);
+        if (self.provider_impl.hasDecoderRuntime() and
+            !bufHasAnyQuantizedStorage(input_buf))
+        {
+            // Both projections consume the same activation. Upload it once so
+            // the dynamic linear slots return device-resident outputs instead
+            // of materializing each fused runtime result on the host.
+            var device_input_tensor = try self.ownedDeviceMetalTensorFromCt(input);
+            const device_input = self.ctFromOwnedMetalTensor(device_input_tensor) catch |err| {
+                device_input_tensor.deinit();
+                return err;
+            };
+            defer freeOp(ctx, device_input);
+
+            const first = try linearNoBiasOp(ctx, device_input, weight_a, rows, in_dim, out_dim);
+            errdefer freeOp(ctx, first);
+            const second = try linearNoBiasOp(ctx, device_input, weight_b, rows, in_dim, out_dim);
+            return .{
+                .first = first,
+                .second = second,
+            };
+        }
+
         const first = try linearNoBiasOp(ctx, input, weight_a, rows, in_dim, out_dim);
         errdefer freeOp(ctx, first);
         const second = try linearNoBiasOp(ctx, input, weight_b, rows, in_dim, out_dim);

@@ -538,7 +538,21 @@ pub fn materializeTeacherTopKTargets(
     options: gemma4_real.TeacherTopKOptions,
 ) !gemma4_real.TeacherTopKSummary {
     if (options.top_k == 0) return error.InvalidTeacherTopK;
-    if (options.temperature <= 0 or std.math.isNan(options.temperature)) return error.InvalidTeacherTemperature;
+    if (!std.math.isFinite(options.temperature) or options.temperature <= 0) return error.InvalidTeacherTemperature;
+
+    var teacher_provenance = try gemma4.fingerprintGemma4Model(allocator, base_model_dir);
+    defer teacher_provenance.deinit(allocator);
+    try gemma4.validatePreparedModelProvenance(prepared.*, teacher_provenance);
+    var projector_fingerprint = try gemma4.fingerprintProjectorFile(allocator, gguf_projector_path);
+    defer gemma4.freeProjectorFingerprint(allocator, &projector_fingerprint);
+    if (!std.mem.eql(u8, gguf_projector_sha256, projector_fingerprint.sha256)) return error.ProjectorFingerprintMismatch;
+    const prepared_projector_sha256 = prepared.gguf_projector_sha256 orelse return error.MissingPreparedProjectorFingerprint;
+    const prepared_projector_size = prepared.gguf_projector_size_bytes orelse return error.MissingPreparedProjectorFingerprint;
+    if (!std.mem.eql(u8, prepared_projector_sha256, projector_fingerprint.sha256) or
+        prepared_projector_size != projector_fingerprint.size_bytes)
+    {
+        return error.PreparedProjectorFingerprintMismatch;
+    }
 
     const graph_config = try gemma4_real.loadGraphConfig(allocator, base_model_dir);
     const vocab_size: usize = @intCast(graph_config.vocab_size);
@@ -553,7 +567,7 @@ pub fn materializeTeacherTopKTargets(
         backend.backendPtr(),
         graph_config,
         gguf_projector_path,
-        gguf_projector_sha256,
+        projector_fingerprint.sha256,
         tokenizer,
     );
     defer ctx.deinit();
@@ -602,6 +616,9 @@ pub fn materializeTeacherTopKTargets(
     }
     summary.examples_seen = limit;
     try gemma4.refreshPreparedExamplesFingerprint(allocator, prepared);
+    if (gemma4.preparedExamplesHaveTeacherTargets(prepared.examples)) {
+        try gemma4.bindPreparedTeacherProvenance(allocator, prepared, teacher_provenance, projector_fingerprint.sha256);
+    }
     return summary;
 }
 

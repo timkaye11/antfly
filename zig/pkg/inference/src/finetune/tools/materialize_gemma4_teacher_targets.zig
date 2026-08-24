@@ -57,19 +57,14 @@ pub fn main(init: std.process.Init) !void {
     defer finetune.freePreparedInputsSummary(allocator, &prepared);
 
     const has_multimodal = finetune.preparedExamplesHaveMedia(prepared.examples);
-    var maybe_projector_fingerprint: ?finetune.ProjectorFingerprint = null;
-    defer if (maybe_projector_fingerprint) |*fp| finetune.freeProjectorFingerprint(allocator, fp);
     const summary = if (has_multimodal) blk: {
         const projector_path = gguf_projector_path orelse prepared.gguf_projector_path orelse return error.MissingGgufProjector;
-        maybe_projector_fingerprint = try finetune.fingerprintProjectorFile(allocator, projector_path);
-        if (prepared.gguf_projector_sha256) |expected_sha| {
-            if (!std.mem.eql(u8, expected_sha, maybe_projector_fingerprint.?.sha256)) return error.PreparedProjectorFingerprintMismatch;
-        }
+        const projector_sha256 = prepared.gguf_projector_sha256 orelse return error.MissingPreparedProjectorFingerprint;
         break :blk try gemma4_mm_real.materializeTeacherTopKTargets(
             allocator,
             base_model_dir,
             projector_path,
-            maybe_projector_fingerprint.?.sha256,
+            projector_sha256,
             &prepared,
             backend,
             opts,
@@ -94,7 +89,10 @@ pub fn main(init: std.process.Init) !void {
         .backend = @tagName(backend),
         .multimodal = has_multimodal,
         .gguf_projector_path = if (has_multimodal) (gguf_projector_path orelse prepared.gguf_projector_path) else null,
-        .gguf_projector_sha256 = if (maybe_projector_fingerprint) |fp| fp.sha256 else null,
+        .teacher_base_model_sha256 = prepared.teacher_base_model_sha256,
+        .teacher_tokenizer_sha256 = prepared.teacher_tokenizer_sha256,
+        .teacher_chat_template_sha256 = prepared.teacher_chat_template_sha256,
+        .teacher_gguf_projector_sha256 = prepared.teacher_gguf_projector_sha256,
         .summary = summary,
     }, .{ .whitespace = .indent_2 }, &writer.interface);
     try writer.interface.writeByte('\n');
