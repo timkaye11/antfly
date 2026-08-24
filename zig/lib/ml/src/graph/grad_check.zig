@@ -332,6 +332,54 @@ fn evalNode(
                 return out;
             }
 
+            // 4D attention matmul: batch/head axes 0 and 1, with one
+            // free and one contracting axis in the final two positions.
+            if (a_shape.rank() == 4 and b_shape.rank() == 4 and attrs.num_batch == 2 and attrs.num_contracting == 1 and
+                attrs.lhs_batch[0] == 0 and attrs.lhs_batch[1] == 1 and
+                attrs.rhs_batch[0] == 0 and attrs.rhs_batch[1] == 1)
+            {
+                const lc = attrs.lhs_contracting[0];
+                const rc = attrs.rhs_contracting[0];
+                if ((lc == 2 or lc == 3) and (rc == 2 or rc == 3)) {
+                    const batch0: usize = @intCast(a_shape.dim(0));
+                    const batch1: usize = @intCast(a_shape.dim(1));
+                    const contract: usize = @intCast(a_shape.dim(lc));
+                    const m: usize = @intCast(a_shape.dim(if (lc == 2) 3 else 2));
+                    const nn: usize = @intCast(b_shape.dim(if (rc == 2) 3 else 2));
+                    const a_d2: usize = @intCast(a_shape.dim(2));
+                    const a_d3: usize = @intCast(a_shape.dim(3));
+                    const b_d2: usize = @intCast(b_shape.dim(2));
+                    const b_d3: usize = @intCast(b_shape.dim(3));
+                    const out = try allocator.alloc(f32, batch0 * batch1 * m * nn);
+                    @memset(out, 0);
+                    for (0..batch0) |b0| {
+                        for (0..batch1) |b1| {
+                            const a_batch_base = (b0 * batch1 + b1) * a_d2 * a_d3;
+                            const b_batch_base = (b0 * batch1 + b1) * b_d2 * b_d3;
+                            const out_batch_base = (b0 * batch1 + b1) * m * nn;
+                            for (0..m) |mi| {
+                                for (0..nn) |ni| {
+                                    var sum: f32 = 0;
+                                    for (0..contract) |ki| {
+                                        const a_idx = a_batch_base + if (lc == 3)
+                                            mi * a_d3 + ki
+                                        else
+                                            ki * a_d3 + mi;
+                                        const b_idx = b_batch_base + if (rc == 2)
+                                            ki * b_d3 + ni
+                                        else
+                                            ni * b_d3 + ki;
+                                        sum += a[a_idx] * b[b_idx];
+                                    }
+                                    out[out_batch_base + mi * nn + ni] = sum;
+                                }
+                            }
+                        }
+                    }
+                    return out;
+                }
+            }
+
             // 2D matmul (no batch dims).
             if (a_shape.rank() != 2 or b_shape.rank() != 2) {
                 const out = try allocator.alloc(f32, out_elems);
@@ -1150,6 +1198,53 @@ test "grad_check softmax @ y (batched dot)" {
     const pv = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
 
     const max_err = try checkGradients(allocator, &g, loss, &.{ x, v }, &.{ &px, &pv }, 1e-3);
+    try std.testing.expect(max_err < tolerance);
+}
+
+test "grad_check rank4 attention dots with two batch axes" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const shape = Shape.init(.f32, &.{ 1, 2, 2, 2 });
+    const q = try b.parameter("q", shape);
+    const k = try b.parameter("k", shape);
+    const v = try b.parameter("v", shape);
+    const scores = try g.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 3, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 3, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 2,
+        } },
+        .output_shape = shape,
+        .inputs = .{ q, k, null_node, null_node },
+        .num_inputs = 2,
+    });
+    const mixed = try g.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 3, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 2, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 2,
+        } },
+        .output_shape = shape,
+        .inputs = .{ scores, v, null_node, null_node },
+        .num_inputs = 2,
+    });
+    const loss = try b.reduceSum(mixed, &.{ 0, 1, 2, 3 });
+    try g.markOutput(loss);
+
+    const pq = [_]f32{ 0.1, 0.2, -0.3, 0.4, 0.5, -0.6, 0.7, 0.8 };
+    const pk = [_]f32{ 0.9, -0.2, 0.3, 0.6, -0.5, 0.4, 0.2, 0.7 };
+    const pv = [_]f32{ -0.4, 0.8, 0.5, 0.1, 0.6, -0.3, 0.9, 0.2 };
+
+    const max_err = try checkGradients(allocator, &g, loss, &.{ q, k, v }, &.{ &pq, &pk, &pv }, 1e-3);
     try std.testing.expect(max_err < tolerance);
 }
 

@@ -13,10 +13,8 @@
 // limitations under the License.
 
 const std = @import("std");
-const command = @import("inference_internal").finetune.gemma4_train_command;
+const command = @import("train/run_gemma4_recursive_lora_sweep.zig");
 
 pub fn main(init: std.process.Init) !void {
     return command.main(init);
 }
-
-pub const runFromArgs = command.runFromArgs;

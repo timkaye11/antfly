@@ -12,11 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const std = @import("std");
-const command = @import("inference_internal").finetune.gemma4_train_command;
+const gemma_graph = @import("architectures/gemma_graph.zig");
 
-pub fn main(init: std.process.Init) !void {
-    return command.main(init);
+test {
+    _ = gemma_graph;
 }
-
-pub const runFromArgs = command.runFromArgs;

@@ -1484,6 +1484,7 @@ pub fn build(b: *std.Build) void {
         .ml_mod = ml_mod,
         .onnx_graph_mod = onnx_graph_mod,
         .inference_internal_mod = inference_internal_mod,
+        .inference_audio_mod = inference_audio_mod,
         .inference_tokenizer_mod = inference_tokenizer_mod,
         .inference_hf_tokenizer_mod = inference_hf_tokenizer_mod,
         .antfly_image_mod = antfly_image_mod,
@@ -1539,6 +1540,20 @@ pub fn build(b: *std.Build) void {
     });
     const test_bin_step = b.step("test-bin", "Build unit test binary without running");
     test_bin_step.dependOn(&install_tests.step);
+
+    const gemma_graph_tests = b.addTest(.{
+        .name = "gemma-graph-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gemma_graph_test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = &.{ "gemma graph", "buildForwardGraph" },
+    });
+    gemma_graph_tests.root_module.addImport("ml", ml_mod);
+    const run_gemma_graph_tests = b.addRunArtifact(gemma_graph_tests);
+    const gemma_graph_test_step = b.step("test-gemma-graph", "Run focused Gemma training graph contract tests");
+    gemma_graph_test_step.dependOn(&run_gemma_graph_tests.step);
 
     const wasm_compute_tests = b.addTest(.{
         .name = "wasm-compute-tests",

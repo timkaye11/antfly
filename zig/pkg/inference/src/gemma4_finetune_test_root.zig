@@ -13,10 +13,14 @@
 // limitations under the License.
 
 const std = @import("std");
-const command = @import("inference_internal").finetune.gemma4_train_command;
+const gemma_graph = @import("architectures/gemma_graph.zig");
+const gemma4_train_command = @import("finetune/gemma4_train_command.zig");
+const gemma4_bf16_cli = @import("finetune/test/test_gemma4_bf16_cli.zig");
+const recipe = @import("finetune/recipe.zig");
 
-pub fn main(init: std.process.Init) !void {
-    return command.main(init);
+test "gemma4 finetune embedded regressions are linked into the focused gate" {
+    std.testing.refAllDecls(gemma_graph);
+    std.testing.refAllDecls(gemma4_train_command);
+    std.testing.refAllDecls(gemma4_bf16_cli);
+    std.testing.refAllDecls(recipe);
 }
-
-pub const runFromArgs = command.runFromArgs;

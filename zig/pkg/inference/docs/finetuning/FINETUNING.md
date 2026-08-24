@@ -23,17 +23,14 @@ All recipes use the same top-level sections:
   "recipe": "lora-sft",
   "model": {
     "path": "/models/gemma4",
-    "family": "gemma4",
-    "projector_path": "/models/gemma4/mmproj.gguf"
+    "family": "gemma4"
   },
   "dataset": {
-    "path": "/data/chat.jsonl",
     "train_path": "/data/train.jsonl",
     "eval_path": "/data/eval.jsonl",
     "train_split": "train",
     "eval_split": "eval",
-    "train_cache_path": "/runs/gemma4/train_cache.json",
-    "eval_cache_path": "/runs/gemma4/eval_cache.json",
+    "eval_cache_path": "/runs/gemma4/prepared_eval_inputs.json",
     "max_examples": 128,
     "eval_max_examples": 64,
     "max_seq_len": 512
@@ -42,26 +39,16 @@ All recipes use the same top-level sections:
     "path": "/runs/gemma4/adapter-bootstrap",
     "rank": 16,
     "alpha": 32,
-    "target_preset": "all-linear",
+    "target_preset": "text-all-linear",
     "scaling": "standard",
     "init_lora_weights": "default",
-    "use_dora": false,
-    "layer_name": "model.layers.0"
+    "use_dora": false
   },
   "optimizer": {
     "learning_rate": 0.0002,
     "epochs": 2,
     "gradient_accumulation_steps": 4,
     "max_grad_norm": 1.0
-  },
-  "preference": {
-    "beta": 0.1
-  },
-  "grpo": {
-    "group_size": 8,
-    "clip_epsilon": 0.2,
-    "kl_coef": 0.04,
-    "normalize_advantage": true
   },
   "eval": {
     "max_examples": 64
@@ -72,26 +59,35 @@ All recipes use the same top-level sections:
     "prepared_path": "/runs/gemma4/prepared_inputs.json",
     "trained_adapter_dir": "/runs/gemma4/adapter-trained"
   },
-  "backend": "auto"
+  "backend": "native"
 }
 ```
 
-Supported recipe names are `sft`, `lora-sft`, `qlora-sft`, `dpo`, `grpo`, `reranker`, and `vlm-retrieval`. The parser accepts unknown future fields so recipe files can grow without breaking older runners.
+Supported recipe names across all families are `sft`, `lora-sft`, `qlora-sft`,
+`dpo`, `grpo`, `reranker`, and `vlm-retrieval`. Gemma4 supervised training
+currently admits only `lora-sft`; its full SFT and QLoRA spellings fail closed.
+Recipe parsing is strict: unknown fields are errors rather than silently
+defaulting a misspelled option.
 
 ### LoRA Defaults
 
 Recipe-level LoRA defaults are intentionally PEFT-like:
 
-- SFT, QLoRA, VLM retrieval, and encoder/reranker LoRA bootstrap at `rank = 16`, `alpha = 32`.
+- Supported rank-16 LoRA routes bootstrap at `rank = 16`, `alpha = 32` unless a
+  family-specific contract says otherwise.
 - GRPO adapter-training routes default to `rank = 8`, `alpha = 32`; raise rank for larger policy tasks after an eval sweep justifies the extra adapter capacity.
 - Scaling is standard LoRA `alpha / rank`. Recipe `adapter.scaling` currently accepts only `standard` aliases; rank-stabilized scaling is not enabled in the graph trainer path.
-- Gemma4 defaults to `target_preset = "all-linear"`, which expands to attention and MLP linear patterns. Explicit `target_modules` override the preset.
+- Gemma4 defaults to `target_preset = "text-all-linear"`, which resolves exact
+  text attention, MLP, and PLE linear paths. `peft-qv` is the smaller baseline.
+  Providing both a preset and explicit target modules is an error.
 - GLiNER2 LoRA defaults match the upstream Python GLiNER2 LoRA surface:
   `rank = 16`, `alpha = 32`, `lora_dropout = 0`, and target groups
   `encoder,span_rep,classifier,count_embed,count_pred`. The encoder group
   expands to query/key/value plus dense encoder projections.
 - Qwen/ColQwen optimizer-backed routes default to their all-linear target module lists. They also accept `target_preset = "all-linear"`, `attention-only`, or `mlp-only`; `moe-experts` is rejected until expert-aware rank and routing policy is wired through those bootstraps.
-- `init_lora_weights` and `use_dora` are currently Gemma4-only recipe knobs.
+- Gemma4 recipes currently admit standard LoRA initialization only. DoRA,
+  PiSSA, LoftQ, EVA, and LoRA-GA fail closed until their graph, adjusted-base,
+  or initializer-stat artifact contracts are wired end to end.
 
 For learning-rate selection, do not copy full-finetune LRs directly. Start LoRA sweeps around `1e-4`, `3e-4`, and `1e-3` with the real target metric, then keep the smallest rank/target set that passes. Smaller micro-batches plus gradient accumulation are usually a better first move than shrinking rank below the defaults.
 
@@ -523,10 +519,10 @@ dataset-wide raw-label union is not a valid contextual-slot schema.
 
 | Recipe | Family | Current route |
 |--------|--------|---------------|
-| `lora-sft`, `qlora-sft` | `gemma4` | `prepare-gemma4-lora-inputs` → `bootstrap-gemma4-lora` → `train-eval-gemma4-lora-bundle` |
+| `lora-sft` | `gemma4` | prepare train → prepare disjoint eval → bootstrap exact adapter inventory → train/eval with `--eval-prepared`; full `sft` and `qlora-sft` are typed errors |
 | `lora-sft`, `qlora-sft` | `gliner2` | `train-gliner2-autodiff` (real full-encoder autodiff training; the cached probe-surrogate bundle route was removed) |
 | `lora-sft`, `qlora-sft` | `layoutlmv3` | `bootstrap-layoutlmv3-lora` → `train-eval-layoutlmv3-lora-sequence` or `train-eval-layoutlmv3-lora-token` → optional `materialize-layoutlmv3-checkpoint` |
-| `sft` | supported LoRA families | same route as the family `lora-sft` adapter while full-weight SFT backends are still family-specific |
+| `sft` | supported non-Gemma LoRA families | same route as the family `lora-sft` adapter while full-weight SFT backends are still family-specific |
 | `dpo` | scalar preference fixtures | direct internal `preference_loss.zig` adapter over `dataset.format = "scalar-logprobs"` JSONL |
 | `dpo` | decoder models with local weights | direct internal `preference_harness.zig` adapter over `dataset.format = "text-preference"` or `"rendered-text-preference"` JSONL with `model.path` and optional `model.reference_path`; Gemma4, Qwen2, ColQwen2, and Qwen3.5 text recipes now also have optimizer-backed adapter-training paths |
 | `grpo` | scalar/token fixtures | direct internal `grpo.zig` adapter over `dataset.format = "token-logprobs"` JSONL |
@@ -1311,18 +1307,28 @@ Adapters are saved in PEFT-compatible format
 
 ### Gemma4 LoRA
 
-This section documents the Gemma family backend commands. Prefer a recipe for
-normal use:
+Gemma4 E2B/E4B LoRA is an experimental, single-device, text-only lane. It is
+not production-ready. The authoritative current-state, validation, and release
+gate document is [GEMMA4.md](GEMMA4.md); this section is only the command and
+data-schema index.
+
+Prefer a recipe once the current four-step recipe tests and convenience
+workflows have been migrated to the mandatory held-out-eval contract:
 
 ```sh
 antfly inference finetune run recipe_gemma4_lora.json
 antfly inference finetune run recipe_gemma4_lora.json --dry-run
 ```
 
-Three-step pipeline: dataset preparation, tokenization, then train/eval. Gemma now supports two training modes:
-- `--trainer surrogate`: legacy bounded surrogate-gradient training
-- `--trainer autodiff`: real token-level causal-LM LoRA training for Gemma text configs, including Gemma4 sliding-attention and shared-KV variants
-- Multimodal Gemma prepared inputs can now be produced through `prepare-gemma4-lora-inputs --gguf-projector <projector.gguf>`, which expands image/audio placeholder runs before tokenization and records media references for the real-autodiff trainer
+The supported-intent flow has four steps: prepare training inputs, prepare a
+separate evaluation artifact, bootstrap the adapter, then train/evaluate with
+`--eval-prepared`. `--trainer auto` is an autodiff alias; it never falls back to
+surrogate training. The explicit surrogate spelling is diagnostic-only.
+
+The lower-level command still contains an experimental multimodal route, but it
+is outside the text-only production contract and performs host work that strict
+Metal telemetry does not fully cover. Do not use it as an accepted training
+lane.
 
 Adapters are saved in PEFT-compatible format (`task_type = "CAUSAL_LM"`).
 
@@ -1372,7 +1378,7 @@ The multimodal preparation path now accepts the same `messages` contract for tex
 
 The current multimodal converter still materializes a flat CSV (`image,prompt,response`) artifact, so it shares the conversation schema at ingestion time while keeping the existing output contract.
 
-**Step 2 — tokenize examples:**
+**Prepare training and evaluation inputs separately:**
 ```
 usage: prepare-gemma4-lora-inputs <model_dir> <dataset_path> <split|-> <out_summary_json> [options]
 
@@ -1380,9 +1386,14 @@ usage: prepare-gemma4-lora-inputs <model_dir> <dataset_path> <split|-> <out_summ
   --max-seq-len N     Maximum sequence length in tokens (default: 512)
 ```
 
-#### Prepared Inputs v2/v3
+Run this command once for the training source and once for a genuinely disjoint
+evaluation source/split. The training command requires the second artifact via
+`--eval-prepared`. Sequence admission is currently bounded to
+`1..min(model context, 2048)` before backend construction.
 
-`prepare-gemma4-lora-inputs` now emits a richer prepared-input summary for chat/tool datasets. Each prepared example records:
+#### Prepared Inputs v4
+
+`prepare-gemma4-lora-inputs` emits `gemma4_prepared/v4`. Each prepared example records:
 - legacy prompt/response token views for compatibility with the current surrogate trainer
 - full rendered `input_ids`
 - `labels` with non-assistant and tool-response tokens masked to the ignore label
@@ -1393,18 +1404,22 @@ usage: prepare-gemma4-lora-inputs <model_dir> <dataset_path> <split|-> <out_summ
 - `has_tool_messages`
 - optional `policy_version`
 
-The summary also records aggregate metadata:
-- `schema_version = "gemma4_prepared/v2"` for text/chat datasets
-- `schema_version = "gemma4_prepared/v3"` for multimodal datasets with image/audio placeholder accounting
+The summary also records:
+- base-artifact, tokenizer-asset, and chat-template identity digests
+- a canonical prepared-example digest
 - `max_input_tokens`
 - `max_supervised_tokens`
 - `examples_with_tool_calls`
 - `examples_with_tool_messages`
 - `examples_with_multiturn`
 
-The loader only accepts these supported prepared schemas and rejects unknown versions at load time.
-
-This prepared artifact now feeds both Gemma trainer modes. The surrogate path still reads the legacy prompt/response views, while the autodiff path trains directly from `input_ids + labels`.
+The production-intent autodiff loader requires v4 integrity and compares both
+train/eval identities to the selected model and adapter. It rejects exact
+prepared-token overlap. It does not yet record source-row, dataset/split, or
+media-content hashes, so an external source-level disjointness audit is still
+required for held-out quality claims. Prepared JSON also remains a whole-buffer
+artifact with a 128 MiB load ceiling and direct-write publication; use fresh
+paths until streaming immutable shards are implemented.
 
 **Optional — materialize teacher targets:**
 ```
@@ -1419,6 +1434,10 @@ usage: materialize-gemma4-teacher-targets <base_model_dir> <prepared_inputs_json
 This tool runs the full Gemma4 teacher model over prepared inputs and writes sparse row-major `teacher_top_k_token_ids` and `teacher_top_k_probs` into the output prepared-input JSON. For multimodal prepared inputs, pass `--gguf-projector <projector.gguf>` unless the prepared summary records a valid projector path. The autodiff trainer consumes those soft targets when present, which is the first distillation path for recursive LoRA compression.
 Teacher probabilities are produced after applying `--temperature`, and the trainer applies the standard distillation `T^2` loss scale from each example's `teacher_temperature`.
 
+This utility does not yet bind the supplied teacher model to the prepared
+artifact's model provenance. Treat teacher-target materialization as
+experimental until the teacher/base digest is validated and persisted.
+
 **Optional — materialize compressed recursive base:**
 ```text
 usage: materialize-gemma4-recursive-base <base_model_dir> <recursive_adapter_dir> <out_dir> [options]
@@ -1432,7 +1451,7 @@ For the recursive compression path, the bounded smoke workflow is:
 usage: run-gemma4-recursive-lora-smoke-workflow <base_model_dir> <output_root> [options]
 ```
 
-The corresponding build step is `zig build run-gemma4-recursive-lora-smoke-workflow -- <base_model_dir> <output_root> ...`. It bootstraps a recursive LoRA adapter, materializes teacher targets, trains/evaluates with the autodiff trainer, and validates that recursive and teacher metadata survive the round trip.
+The corresponding build step is `zig build run-gemma4-recursive-lora-smoke-workflow -- <base_model_dir> <output_root> ...`. Its current implementation has not yet been migrated to the mandatory `--eval-prepared` input and is therefore not an accepted runnable workflow. After migration it is intended to bootstrap a recursive LoRA adapter, materialize teacher targets, train/evaluate with the autodiff trainer, and validate that recursive and teacher metadata survive the round trip.
 Successful real runs write `<output_root>/recursive_smoke_results.json` with adapter sizes, before/after loss, teacher coverage, elapsed time, and supervised-token throughput.
 For Gemma4 E2B, use `--recursive-shared-block-size 5`; the text stack has 35 layers and the local/full attention pattern repeats every five layers. The current recursive smoke defaults to attention-only targets (`q_proj,k_proj,v_proj,o_proj`) because E2B MLP weights become double-wide after layer 15.
 
@@ -1452,39 +1471,64 @@ usage: analyze-gemma4-recursive-lora-sweep <comparison_json> <out_dir> [options]
 
 The build step is `zig build analyze-gemma4-recursive-lora-sweep -- <comparison_json> <out_dir> ...`. It writes `recursive_lora_sweep_decision.json` and `.md` using explicit loss, adapter-size, compressed-base-size, teacher-coverage, and throughput thresholds.
 
-**Step 3 — train/eval:**
+**Step 4 — train/eval:**
 ```
 usage: train-eval-gemma4-lora-bundle <base_model_dir> <adapter_model_dir>
     <prepared_inputs_json> <out_dir> [options]
 
 Flags:
-  --trainer auto|surrogate|autodiff   Trainer implementation (default: auto)
+  --trainer auto|surrogate|autodiff   Trainer implementation (default: autodiff; auto is an autodiff alias)
   --lr, --learning-rate <f>     Learning rate (default: 0.001)
   --max-examples <n>            Max examples per epoch (default: 32)
+  --eval-prepared <path>        Required separate prepared evaluation artifact
+  --eval-max-examples <n>       Max examples for before/after evaluation
   --epochs <n>                  Number of epochs (default: 1)
-  --layer-name, --layer <str>   Scope to layer name
+  --layer-name, --layer <str>   Rejected by the autodiff trainer until scoped semantics are implemented
   --max-grad-norm <f>           Gradient norm clipping threshold (default: 1.0, 0=disabled)
   --grad-accum <n>              Gradient accumulation steps (default: 1)
-  --llrd-decay <f>              Surrogate-only layer-wise LR decay (default: 1.0=disabled)
-  --schedule-free               Surrogate-only Schedule-Free AdamW (default: false)
-  --backend auto|mlx|native       Compute backend (default: auto)
+  --activation-checkpoint-interval <n>  Recompute every N layer boundaries
+  --llrd-decay <f>              Rejected by autodiff unless left at 1.0
+  --schedule-free               Rejected by autodiff
+  --backend native|metal        Required; there is no automatic backend fallback
 ```
 
 Trainer mode behavior:
-- `auto` selects `autodiff` for currently supported Gemma text configs and falls back to `surrogate` for unsupported architecture variants
-- `autodiff` currently supports Gemma4 sliding-attention, per-layer RoPE, omitted `v_proj` on full-attention layers, and shared-KV donor reuse
-- `autodiff` also supports multimodal Gemma training when the prepared artifact includes media references and the train/eval command is given `--gguf-projector <projector.gguf>`; the trainer feeds projected soft-token embeddings through an internal `__input_embeddings` placeholder while continuing to train only the Gemma decoder/LoRA path
-- `autodiff` still rejects MoE, PLE, and non-RoPE Gemma configs
+- `auto` is retained only as an alias for `autodiff`; it never falls back to a
+  successful surrogate run
+- `autodiff` supports the Gemma4 text graph contract, including PLE,
+  sliding/full attention, per-layer GQA/RoPE, and shared-KV donor reuse
+- compiled Metal evaluation uses a loss-only graph and does not allocate
+  gradients or Adam moments
+- multimodal/projector training remains experimental, performs host work
+  outside complete strict-step telemetry, and is outside the supported lane
+- MoE and non-RoPE Gemma configs remain unsupported
 - `autodiff` uses token-level next-token cross-entropy over the prepared `labels` mask, including assistant tool-call output while masking tool responses
 - `autodiff` reuses the incoming Gemma PEFT adapter bundle as initialization and writes the trained adapters back out in the same bundle format
 
-Default LoRA target modules: `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`
+Default Gemma4 selection: exact `text-all-linear` paths. Use `peft-qv` for the
+smaller Q/V baseline. The resolved paths are persisted in the adapter config.
 
 Outputs:
 - `<out_dir>/adapter_model.safetensors` (PEFT format)
 - `<out_dir>/adapter_config.json` with `task_type = "CAUSAL_LM"`
 - `<out_dir>/train_eval_report.json` — `before`, per-epoch `epoch_history`, `after` metrics for the selected trainer
 - `<out_dir>/training_config.json` and `<out_dir>/training_report.json`
+
+`<out_dir>` must not exist. The adapter and every report are written to a
+sibling staging directory and published together with one no-replace rename.
+For Metal, `TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR=1` is required; every step
+rejects native/unsupported partitions, interpreter/runtime fallback, true host
+outputs, explicit runtime-input transfer, or non-resident gradients before
+optimizer mutation. Some recorded gather/reduce/cache promotion counters are
+not yet strict-gated, so this is not a complete no-host proof. Stored BF16
+Safetensors use the dedicated device-only frozen-linear input-gradient kernel;
+autodiff prunes frozen base-weight gradients that cannot reach a requested
+LoRA parameter. Stored F16 and GGUF backward remain fail-closed. See
+[GEMMA4.md](GEMMA4.md) for the authoritative release gates.
+
+Activation checkpointing is recomputation only. Durable Gemma4 checkpoint and
+resume are not exposed by the CLI or recipe yet, even though low-level restored
+Metal optimizer slots now retain device residency.
 
 ---
 

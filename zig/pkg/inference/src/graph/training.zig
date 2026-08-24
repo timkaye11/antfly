@@ -92,6 +92,10 @@ pub const TrainStepProfile = struct {
     /// step fell back to the regular compiled path. Always a static string.
     graph_executor_fallback_reason: ?[]const u8 = null,
     graph_executor_partitions: u64 = 0,
+    graph_executor_runtime_input_transfers: u64 = 0,
+    graph_executor_device_resident_transfers: u64 = 0,
+    graph_executor_native_partitions: u64 = 0,
+    graph_executor_unsupported_ops: u64 = 0,
     graph_executor_command_dispatches: u64 = 0,
     graph_executor_planned_dispatches: u64 = 0,
     graph_executor_interpreter_fallbacks: u64 = 0,
@@ -300,6 +304,64 @@ pub const TrainStepOptions = struct {
     emit_checkpoint_analysis: bool = false,
 };
 
+const LossGraphClone = struct {
+    graph: Graph,
+    id_map: []NodeId,
+
+    fn deinit(self: *LossGraphClone) void {
+        const allocator = self.graph.allocator;
+        self.graph.deinit();
+        allocator.free(self.id_map);
+        self.* = undefined;
+    }
+};
+
+/// Clone only nodes reachable from `loss_node`. Fused nodes keep their forward
+/// opcode, while VJP-alternate links are cleared because evaluation never
+/// differentiates the clone. This keeps the evaluation graph both smaller than
+/// the template and independent from the trainer-owned graph's lifetime.
+fn cloneReachableLossGraph(
+    allocator: std.mem.Allocator,
+    source: *const Graph,
+    loss_node: NodeId,
+) !LossGraphClone {
+    if (loss_node == null_node or loss_node >= source.nodeCount()) return error.InvalidLossNode;
+
+    const targets = [_]NodeId{loss_node};
+    const reachable = try interpreter.computeReachableFromNodes(allocator, source, &targets);
+    defer allocator.free(reachable);
+
+    const id_map = try allocator.alloc(NodeId, source.nodeCount());
+    errdefer allocator.free(id_map);
+    @memset(id_map, null_node);
+
+    var graph = Graph.init(allocator);
+    errdefer graph.deinit();
+    try graph.string_table.appendSlice(allocator, source.string_table.items);
+    try graph.constant_pool.appendSlice(allocator, source.constant_pool.items);
+
+    for (source.nodes.items, 0..) |source_node, source_index| {
+        if (!reachable[source_index]) continue;
+        var node = source_node;
+        for (0..node.num_inputs) |input_index| {
+            const source_input = node.inputs[input_index];
+            if (source_input == null_node) continue;
+            const mapped = id_map[source_input];
+            if (mapped == null_node) return error.InvalidGraphTopology;
+            node.inputs[input_index] = mapped;
+        }
+        node.vjp_alternate = null_node;
+        id_map[source_index] = try graph.addNode(node);
+    }
+
+    for (source.parameters.items) |source_parameter| {
+        const mapped = id_map[source_parameter];
+        if (mapped != null_node) try graph.parameters.append(allocator, mapped);
+    }
+    try graph.markOutput(id_map[loss_node]);
+    return .{ .graph = graph, .id_map = id_map };
+}
+
 fn beginOwnedExecutionFrame(cb: *const ComputeBackend) !bool {
     if (cb.decoderRuntimeHasActiveFrame()) return false;
     return try cb.decoderRuntimeBeginFrame();
@@ -503,6 +565,45 @@ pub const CompiledTrainSession = struct {
         };
     }
 
+    /// Build a reusable forward-loss session without constructing an autodiff
+    /// graph. Evaluation only needs the scalar loss; carrying every parameter
+    /// gradient as an output retains the full backward graph and can multiply
+    /// peak memory for large language models.
+    pub fn initLossOnly(
+        allocator: std.mem.Allocator,
+        graph: *const Graph,
+        loss_node: NodeId,
+    ) !CompiledTrainSession {
+        var profile: TrainStepProfile = .{};
+        profile.peak_resident_bytes = currentResidentBytes();
+        const build_start = nowNs();
+
+        var cloned = try cloneReachableLossGraph(allocator, graph, loss_node);
+        errdefer cloned.deinit();
+        const analysis = try interpreter.CachedAnalysis.compute(allocator, &cloned.graph);
+        errdefer {
+            var mutable_analysis = analysis;
+            mutable_analysis.deinit(allocator);
+        }
+        profile.total_ns = elapsedNs(build_start);
+        profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
+
+        const empty_names = try allocator.alloc([]const u8, 0);
+        errdefer allocator.free(empty_names);
+        const empty_grads = try allocator.alloc(NodeId, 0);
+        errdefer allocator.free(empty_grads);
+
+        return .{
+            .allocator = allocator,
+            .graph = cloned.graph,
+            .id_map = cloned.id_map,
+            .wrt_names = empty_names,
+            .param_grads = empty_grads,
+            .analysis = analysis,
+            .build_profile = profile,
+        };
+    }
+
     pub fn deinit(self: *CompiledTrainSession) void {
         if (self.cached_metal_graph_executor_plan) |*cached| cached.deinit();
         if (self.cached_cuda_graph_executor_plan) |*cached| cached.deinit();
@@ -526,6 +627,7 @@ pub const CompiledTrainSession = struct {
         assignments: []device_mesh.DeviceId,
         partitioned: bool,
         unsupported_ops: usize = 0,
+        native_partitions: usize = 0,
 
         fn deinit(self: *CachedMetalGraphExecutorPlan) void {
             self.buffer_plan.deinit();
@@ -942,6 +1044,8 @@ pub const CompiledTrainSession = struct {
         if (platform.env.getenvBoolDefault("TERMITE_DISABLE_TRAINING_GRAPH_EXECUTOR", false)) return null;
 
         const cached = try self.cachedMetalGraphExecutorPlan(cb, profile);
+        profile.graph_executor_unsupported_ops = @intCast(cached.unsupported_ops);
+        profile.graph_executor_native_partitions = @intCast(cached.native_partitions);
         if (retain_device_gradients and !self.planKeepsGradientOutputsOnMetal(&cached.base_plan)) {
             profile.graph_executor_fallback_reason = "gradient_output_on_native_partition";
             std.debug.print(
@@ -998,6 +1102,8 @@ pub const CompiledTrainSession = struct {
         recordMetalDebugProfile(profile, metal_debug_before, cb.debugTimingSnapshot().provider);
         profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
         profile.graph_executor_partitions = multi_result.stats.partitions_executed;
+        profile.graph_executor_runtime_input_transfers = multi_result.stats.runtime_input_transfers;
+        profile.graph_executor_device_resident_transfers = multi_result.stats.device_resident_transfers;
         profile.graph_executor_command_dispatches = multi_result.stats.backend_command_dispatches;
         profile.graph_executor_planned_dispatches = multi_result.stats.planned_operator_dispatches;
         profile.graph_executor_interpreter_fallbacks = multi_result.stats.interpreter_fallbacks;
@@ -1169,6 +1275,8 @@ pub const CompiledTrainSession = struct {
         profile.execute_ns = elapsedNs(execute_start);
         profile.peak_resident_bytes = @max(profile.peak_resident_bytes, currentResidentBytes());
         profile.graph_executor_partitions = multi_result.stats.partitions_executed;
+        profile.graph_executor_runtime_input_transfers = multi_result.stats.runtime_input_transfers;
+        profile.graph_executor_device_resident_transfers = multi_result.stats.device_resident_transfers;
         profile.graph_executor_command_dispatches = multi_result.stats.backend_command_dispatches;
         profile.graph_executor_planned_dispatches = multi_result.stats.planned_operator_dispatches;
         profile.graph_executor_interpreter_fallbacks = multi_result.stats.interpreter_fallbacks;
@@ -1220,8 +1328,10 @@ pub const CompiledTrainSession = struct {
 
         const assignments = try self.allocator.alloc(device_mesh.DeviceId, base_plan.partitions.len);
         errdefer self.allocator.free(assignments);
+        var native_partitions: usize = 0;
         for (base_plan.partitions, 0..) |part, idx| {
             assignments[idx] = if (part.backend == .native) 1 else 0;
+            if (part.backend == .native) native_partitions += 1;
         }
 
         self.cached_metal_graph_executor_plan = .{
@@ -1230,6 +1340,7 @@ pub const CompiledTrainSession = struct {
             .assignments = assignments,
             .partitioned = partitioned,
             .unsupported_ops = diagnostics.count(.unsupported_op),
+            .native_partitions = native_partitions,
         };
         profile.graph_executor_plan_build_ns += elapsedNs(plan_start);
         return &self.cached_metal_graph_executor_plan.?;
@@ -2662,6 +2773,45 @@ test "CompiledTrainSession can retain gradient tensors without host extraction" 
     defer allocator.free(w_data);
     try std.testing.expectEqual(@as(usize, 12), w_data.len);
     try std.testing.expect(result.device_gradients.get("bias") != null);
+}
+
+test "CompiledTrainSession loss-only evaluation emits no gradient graph or outputs" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const x = try bld.parameter("x", Shape.init(.f32, &.{ 2, 2 }));
+    const w = try bld.parameter("w", Shape.init(.f32, &.{ 2, 2 }));
+    const y = try bld.linearNoBias(x, w, 2, 2, 2);
+    const loss = try bld.reduceSum(y, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    var session = try CompiledTrainSession.initLossOnly(allocator, &g, loss);
+    defer session.deinit();
+    try std.testing.expectEqual(@as(usize, 1), session.graph.outputs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), session.wrt_names.len);
+    try std.testing.expectEqual(@as(usize, 0), session.param_grads.len);
+    try std.testing.expect(session.graph.nodeCount() < g.nodeCount());
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb = compute.computeBackend();
+    const x_ct = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+    defer cb.free(x_ct);
+    const w_ct = try cb.fromFloat32Shape(&.{ 1, 0, 0, 1 }, &.{ 2, 2 });
+    defer cb.free(w_ct);
+    var rt = std.AutoHashMapUnmanaged(NodeId, CT){};
+    defer rt.deinit(allocator);
+    try rt.put(allocator, x, x_ct);
+    try rt.put(allocator, w, w_ct);
+
+    var result = try session.execute(&cb, rt);
+    defer result.deinit();
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), result.loss, 1.0e-6);
+    try std.testing.expectEqual(@as(usize, 0), result.gradients.count());
+    try std.testing.expectEqual(@as(usize, 0), result.device_gradients.count());
 }
 
 test "trainStep on linear-gelu chain" {

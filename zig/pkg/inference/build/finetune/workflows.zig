@@ -14,7 +14,7 @@
 
 const common = @import("common.zig");
 
-const workflow_imports = &.{ .termite_io_compat, .termite_c_file };
+const gemma4_workflow_imports = &.{ .antfly_platform, .inference_internal };
 
 const workflow_commands = [_]common.CommandSpec{
     .{
@@ -40,24 +40,24 @@ const workflow_commands = [_]common.CommandSpec{
     },
     .{
         .name = "run-gemma4-lora-pilot-workflow",
-        .root_source_file = "src/finetune/train/run_gemma4_lora_pilot_workflow.zig",
+        .root_source_file = "src/finetune/run_gemma4_lora_pilot_workflow.zig",
         .description = "Run a larger single-device Gemma4 LoRA text or multimodal pilot workflow",
-        .imports = workflow_imports,
-        .link_libc = true,
+        .imports = gemma4_workflow_imports,
+        .native_link = .default,
     },
     .{
         .name = "run-gemma4-recursive-lora-smoke-workflow",
-        .root_source_file = "src/finetune/train/run_gemma4_recursive_lora_smoke_workflow.zig",
+        .root_source_file = "src/finetune/run_gemma4_recursive_lora_smoke_workflow.zig",
         .description = "Run a bounded Gemma4 recursive LoRA distillation smoke workflow",
-        .imports = workflow_imports,
-        .link_libc = true,
+        .imports = gemma4_workflow_imports,
+        .native_link = .default,
     },
     .{
         .name = "run-gemma4-recursive-lora-sweep",
-        .root_source_file = "src/finetune/train/run_gemma4_recursive_lora_sweep.zig",
+        .root_source_file = "src/finetune/run_gemma4_recursive_lora_sweep.zig",
         .description = "Run Gemma4 baseline-vs-recursive LoRA comparison sweep",
-        .imports = workflow_imports,
-        .link_libc = true,
+        .imports = gemma4_workflow_imports,
+        .native_link = .default,
     },
     .{
         .name = "run-layoutlmv3-lora-smoke-workflow",

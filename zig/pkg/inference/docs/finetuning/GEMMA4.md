@@ -1,51 +1,362 @@
-# Gemma4 Single-Device Pilot Plan
+# Gemma4 E2B/E4B LoRA Fine-Tuning
 
-This plan gates Gemma4 LoRA fine-tuning before distributed MLX work. The target is repeatable evidence from one-device text and multimodal pilots, not maximum throughput.
+> Status: experimental, single-device, text-only, and not production-ready.
+> The focused Linux ReleaseSafe source gates are green. Strict Metal execution
+> still requires the macOS GPU CI gate and a bounded real-model first-step run.
 
-## Text Pilot
+The current Zig path implements the text causal-LM graph, sparse loss, LoRA
+optimizer, evaluation, and artifact pipeline intended for Gemma4 E2B and E4B
+models. It prepares Gemma4 chat data, bootstraps a strict LoRA adapter
+inventory, requires a distinct evaluation artifact, and selects the native or
+Metal backend. Device-only BF16 frozen linears and embedding gathers, rank-4
+attention VJPs, and a strict synthetic optimizer step have focused test
+coverage. Real-model first-step acceptance and the strict Metal CI gate remain
+open, so this is an implementation contract rather than a readiness claim.
 
-Default command:
+MLX, distributed training, multimodal/projector training, and Gemma4 MoE models
+are outside the supported path described here.
 
-```sh
-zig build run-gemma4-lora-pilot-workflow -- text /Users/tim/models/gemma-4-e2b-it /tmp/gemma4-text-pilot --count 1000 --backend mlx --epochs 1
+## Implemented Scope
+
+- `gemma_chat/v1` supervised fine-tuning data, including system, multi-turn,
+  tool-call, and tool-result messages.
+- The same Gemma4 turn/channel wire format used by inference. Loss spans cover
+  assistant final-channel payloads and the turn terminator, not the role or
+  thought-channel prompt.
+- Dense E2B/E4B graph contracts including PLE, sliding/full attention,
+  per-layer GQA, shared KV layers, tied embeddings, Gemma4 scaling, and
+  softcapping.
+- Real LoRA optimizer steps and before/after evaluation on an explicitly chosen
+  `native` or `metal` backend. Autodiff requires a separately prepared
+  evaluation artifact and rejects exact prepared-example overlap.
+- Adapter bootstrap from monolithic or sharded Hugging Face Safetensors and
+  GGUF tensor metadata, with exact target paths persisted in the adapter
+  contract. Sharded bootstrap validates the complete index and shard set;
+  production-scale merged-model materialization is not implemented.
+- Memory-bounded sparse causal targets. The current loss graph projects a small
+  number of supervised rows at a time instead of owning a full
+  `[sequence, vocabulary]` activation.
+- Prepared-input schema `gemma4_prepared/v4` binds tokenized examples to the
+  selected base artifact, tokenizer assets, and chat-template identity. Adapter
+  bootstrap records the same identities and a closed, exact A/B target
+  inventory.
+
+## Text Training Flow
+
+Run commands from `zig/pkg/inference`. A dataset row can be as small as:
+
+```json
+{"schema":"gemma_chat/v1","messages":[{"role":"user","content":"Reply briefly."},{"role":"assistant","content":"Okay."}]}
 ```
 
-Recommended larger run:
+Use the explicit four-step flow so training data, held-out data, and adapter
+inventory are auditable. `TRAIN_DATA` and `EVAL_DATA` must be genuinely
+disjoint datasets or splits; evaluation is not a prefix replay of training.
 
 ```sh
-zig build run-gemma4-lora-pilot-workflow -- text /Users/tim/models/gemma-4-e2b-it /tmp/gemma4-text-pilot-10k --count 10000 --max-examples 10000 --eval-max-examples 128 --backend mlx --epochs 2
+BASE=/path/to/gemma-4-E2B-it-bf16
+TRAIN_DATA=/path/to/train.jsonl
+EVAL_DATA=/path/to/eval.jsonl
+RUN=/path/to/gemma4-lora-run
+
+mkdir -p "$RUN"
+
+zig build prepare-gemma4-lora-inputs -- \
+  "$BASE" "$TRAIN_DATA" train "$RUN/prepared_train.json" \
+  --max-examples 1000 --max-seq-len 512
+
+zig build prepare-gemma4-lora-inputs -- \
+  "$BASE" "$EVAL_DATA" eval "$RUN/prepared_eval.json" \
+  --max-examples 128 --max-seq-len 512
+
+zig build bootstrap-gemma4-lora -- \
+  "$BASE" "$RUN/adapter_seed" \
+  --rank 16 --alpha 32 --target-preset peft-qv
+
+zig build train-eval-gemma4-lora-bundle -- \
+  "$BASE" "$RUN/adapter_seed" "$RUN/prepared_train.json" "$RUN/train_native" \
+  --eval-prepared "$RUN/prepared_eval.json" \
+  --trainer autodiff --backend native \
+  --lr 0.0003 --max-examples 1000 --eval-max-examples 128 \
+  --epochs 1 --max-grad-norm 1.0 --grad-accum 1
 ```
 
-Acceptance gates:
-- `training_config.json` records `trainer=autodiff` and `selected_backend=mlx`.
-- `train_eval_report.json` has before/after eval with `optimizer_steps=0`.
-- Epoch history sees the requested examples and nonzero supervised tokens.
-- Adapter artifacts exist: `adapter_model.safetensors`, `adapter_config.json`, and run contract outputs.
-- No unbounded memory growth across at least two epochs.
+The backend flag and `--eval-prepared` are required; there is no implicit
+backend fallback or training-data eval fallback.
+`--trainer auto` is only a compatibility alias for `autodiff` and never falls
+back to surrogate training. The final primary training directory and adapter
+bootstrap directory must not already exist and are published with no-replace
+semantics. Prepared JSON files do not yet have the same immutable publication
+contract; use fresh paths.
 
-## Multimodal Pilot
+The Metal path admits rank-2 BF16 Safetensors weights. Autodiff cancels the
+linear VJP's redundant double transpose, and Metal computes `dX = dY @ W`
+directly from the persistent BF16 forward-weight slot with f32 accumulation.
+It neither creates a transposed weight nor materializes a full-model f32 copy.
+Native BF16 embedding tables also use a device-index gather, and autodiff
+propagates q/k/v gradients through Gemma4's rank-4 two-batch-axis attention
+contractions.
+Rank-2 F16 Safetensors and packed GGUF bases remain rejected before backend
+construction. Metal also requires `TERMITE_ENABLE_TRAINING_GRAPH_EXECUTOR=1`.
+Parity diagnostics, native partitions, unsupported operations,
+interpreter/runtime fallbacks, host-materialized graph outputs, explicit
+runtime-input transfers, and non-device gradients fail the step before gradient
+accumulation or optimizer mutation. Additional promotion telemetry is not yet
+fully gated, as detailed below. Compiled Metal evaluation uses a loss-only graph
+with resident weights and no gradient or Adam-state allocation.
 
-Default generated dataset command:
+`--activation-checkpoint-interval N` enables graph activation recomputation at
+layer boundaries. It is a memory-control mechanism, not durable training
+checkpoint/resume.
+
+## Data, Provenance, and Sequence Admission
+
+Newly prepared artifacts use `gemma4_prepared/v4`. The current source records:
+
+- a digest of the selected model artifact set, including a Safetensors index
+  and its shards when present;
+- tokenizer-asset and chat-template identity digests;
+- a canonical digest of the prepared token/label examples; and
+- the prepared artifact family and schema versions.
+
+Training recomputes those identities against the selected base, validates the
+adapter's recorded base/tokenizer/chat identities, and requires a separate eval
+artifact. It rejects exact overlap based on the prepared token arrays and media
+paths. This is useful integrity protection, but it is not yet proof of
+source-dataset disjointness: the format does not record canonical source-row,
+dataset/split, or media-content hashes. Preparing the same source row with
+different truncation or renamed media can therefore evade the overlap check.
+Do not use current before/after loss as a held-out quality gate without an
+external source-level split audit.
+
+The provenance chain is not yet complete outside the primary training
+admission. Generic adapter save/load/materialize does not consistently preserve
+or validate these identities, teacher-target materialization does not bind its
+teacher model to the prepared base, and the final report does not yet hash every
+input and published payload. Prepared integrity also does not recompute every
+aggregate counter; media counters can still influence text-versus-multimodal
+routing. These are release blockers, not optional metadata improvements.
+
+Sequence length is admitted before graph/backend construction and is currently
+bounded to `1..min(model_max_position_embeddings, 2048)`. The 2048 limit is a
+temporary safety ceiling, not a claim that every admitted E2B/E4B sequence fits
+the available device memory. Prepared JSON is still a single whole-buffer
+artifact with a 128 MiB load ceiling; streaming/sharded prepared data is an open
+production requirement.
+
+The pilot and recursive convenience workflows have not yet been migrated to
+the mandatory `--eval-prepared` contract. Use the explicit commands above (or
+an updated four-step recipe) until those call sites and their tests are fixed.
+
+## Target Presets
+
+Pass the preset explicitly even though `text-all-linear` is the bootstrap
+default. This keeps experiments and acceptance artifacts self-describing.
+
+| Preset | Exact selection | Intended use |
+| --- | --- | --- |
+| `peft-qv` | Available `q_proj` and `v_proj` tensors | Small PEFT-compatible baseline with the lowest adapter and optimizer footprint |
+| `text-all-linear` | Available Q/K/V/O, gate/up/down, and Gemma4 PLE input-gate/projection tensors | Higher-capacity text tuning after the Q/V baseline is correct and memory-safe |
+
+Target discovery understands both Hugging Face Safetensors names and GGUF
+names. E2B and E4B do not expose identical inventories because their layer and
+shared-tail layouts differ; bootstrap records the resolved tensor paths rather
+than relying on a fixed count. Missing or conflicting selections fail instead
+of silently training a partial adapter. Artifact selection is deterministic:
+monolithic Safetensors, then a Safetensors index, then GGUF.
+
+## Fail-Closed Contract
+
+The supported training lane deliberately rejects ambiguous or degraded runs:
+
+- Autodiff requires `--backend native|metal`; omission returns
+  `MissingBackend` before model artifacts are opened.
+- GGUF autodiff and Metal rank-2 F16 Safetensors are rejected before prepared
+  inputs or output artifacts are opened. Rank-2 BF16 Safetensors are admitted
+  through the dedicated device-only input-gradient path. A host-dequant
+  fallback is intentionally not provided.
+- Metal requires the training graph executor explicitly enabled. Every eval
+  and train step records executor partitions/dispatches and rejects native or
+  unsupported partitions, diagnostic direct execution, interpreter/runtime
+  fallback, true host outputs, explicit runtime-input transfers, or
+  non-resident gradients before mutation. Gather/reduce/resident-cache
+  promotion counters are recorded but are not all strict-gated yet, so the
+  current report is not a complete proof of zero host-to-device promotion.
+- `auto` resolves to real autodiff. Surrogate behavior requires the explicit
+  diagnostic-only `--trainer surrogate` spelling; production recipes reject
+  that spelling.
+- Adapter target patterns are strict. Missing, empty, unknown, or conflicting
+  target selections are errors.
+- Unsupported graph/model configurations and malformed Gemma4 tool-call wire
+  data return typed errors rather than being rewritten approximately.
+- The production-intent lane is text-only. The lower-level command still
+  contains an experimental multimodal route whose projector/embedding host
+  round trips occur outside strict-step telemetry; do not treat that route as
+  admitted until it fails closed or receives a separate end-to-end contract.
+- Layer-scoped autodiff, layer-wise LR decay, and schedule-free autodiff are
+  rejected until their semantics are implemented and tested.
+- DoRA training and PiSSA/LoftQ initialization are rejected until the graph and
+  adjusted-base artifact semantics are implemented. Generic save/materialize
+  also rejects recursive adapters that cannot be represented as one merged
+  base.
+- Gemma4 recipes admit only `lora-sft`. Full `sft`, `qlora-sft`, and declared
+  optimizer/eval/checkpoint/runtime/algorithm/artifact options that the command
+  cannot honor fail with typed errors rather than being silently ignored.
+  Unknown JSON fields are errors, and bootstrap/trained output directories must
+  be normalized, disjoint leaves. `model.name` is retained as report metadata;
+  it does not select the checkpoint.
+
+An accepted training epoch must report finite loss, nonzero supervised tokens,
+and `optimizer_steps > 0`. Before/after evaluation intentionally performs no
+updates, so evaluation records may correctly report zero optimizer steps; that
+is not evidence that training succeeded.
+
+## Artifact Publication and Materialization
+
+The current source stages and no-replace-publishes bootstrap adapters, generic
+adapter saves, the bounded legacy merge path, recursive compressed-base output,
+and the primary autodiff adapter-plus-report directory. Adapter publication
+validates a closed inventory: each configured exact target has one A/B pair,
+unconfigured tensors are rejected, and DoRA metadata and magnitude tensors must
+agree.
+
+These guarantees are visibility-atomic, not yet power-loss durable. The shared
+publisher does not fsync staged files, the staging directory, or its parent.
+Prepared JSON is still written directly, and the public trainer bundle saver
+retains a separate check-then-rename path with a late-collision race. The
+`materialize-gemma4-lora --eval` wrapper also publishes before its post-merge
+evaluation succeeds. Those entry points must not be used as durable production
+transactions yet.
+
+Full-model materialization is deliberately fail-closed while it uses the
+legacy whole-model F32 implementation. It accepts only a monolithic
+Safetensors checkpoint of at most 64 MiB and rejects GGUF, sharded
+Safetensors, and larger files. This prevents an E2B/E4B OOM but also means
+production-scale E2B/E4B materialization is unavailable until a streaming,
+dtype-preserving, sharded writer is implemented.
+
+## BF16 Correctness and Q4 Deployment Lanes
+
+Keep precision concerns separated until quantized training has its own parity
+and quality evidence.
+
+| Lane | Base artifact | Purpose | Current release posture |
+| --- | --- | --- | --- |
+| BF16 correctness | Unquantized BF16 Safetensors | Establish native forward, loss, gradient, optimizer-update, and adapter-save correctness, then compare the stored-weight Metal kernel | The BF16 frozen-linear kernel and admission gate are component-tested; full E2B/E4B first-step acceptance is open |
+| Q4 deployment | QAT Q4 GGUF used by serving | Prove target-name compatibility, adapter loading/application, memory bounds, and post-training generation quality on the deployed base | Deployment validation only; direct Q4/QLoRA training is not yet an accepted correctness lane |
+
+The loaders may accept a Q4 GGUF and bootstrap adapter targets from its tensor
+headers. That capability alone is not proof that QLoRA training is numerically
+correct or production-ready. Promote direct quantized-base training only after
+it matches the BF16 reference within declared loss, gradient, update, and task
+quality tolerances.
+
+## Validation Status
+
+### Previously passing focused evidence
+
+Before the newest provenance, held-out-eval, publication, and resume hardening,
+focused local tests had passed for:
+
+- Gemma4 forward-graph construction, PLE naming, attention/activation scaling,
+  shared KV, omitted-V contracts, and E2B/E4B target inventory rules;
+- sparse causal targets and supervised-row LM-head projection;
+- selected-artifact GGUF rejection, Metal BF16 admission, F16 rejection, and
+  adapter rank/alpha/initializer/DoRA admission;
+- BF16 frozen-linear backward-input parity, lazy-parameter compiled dispatch,
+  WRT-aware frozen-`dW` pruning, device BF16 embedding gather, and rank-4
+  attention VJPs;
+- exact Gemma4 chat/channel spans and production tool-parser round trips; and
+- a deterministic one-layer BF16 strict-Metal CLI step with one Metal optimizer
+  update, a nonzero saved LoRA B tensor, zero then-known fallback counters, and
+  immutable whole-run publication.
+
+### Current integrated verification
+
+The current branch adds prepared-input v4 provenance, mandatory separate eval,
+sequence admission, closed adapter inventories, shared no-replace publication,
+loss-only compiled Metal evaluation, extra strict-executor telemetry, and
+in-place restoration of resident Metal optimizer slots. A proposed macOS
+`macos-15-xlarge` workflow runs the synthetic Gemma4 Debug, ReleaseSafe, and
+ReleaseFast gates with missing Metal treated as a failure.
+
+The current integrated source passes the following Linux ReleaseSafe gates with
+Metal, CUDA, ONNX, and PJRT disabled:
 
 ```sh
-zig build run-gemma4-lora-pilot-workflow -- multimodal /Users/tim/models/gemma-4-e2b-it /tmp/gemma4-mm-pilot --projector /Users/tim/models/gemma-4-e2b-it/mmproj-gemma-4-E2B-it-bf16.gguf --image-path /tmp/gemma4-mm-smoke/images/red.png --count 100 --backend mlx --epochs 1
+zig build test-gemma4-finetune
+zig build test-gemma-graph
 ```
 
-Use `--dataset <jsonl>` for a real image dataset. The JSONL should use `gemma_chat/v1` rows with image content parts; the workflow still verifies projector fingerprinting and cache reporting.
+`test-gemma4-finetune` selected 161 tests: 157 passed and four platform or
+optional-fixture tests skipped. `test-gemma-graph` passed all six tests. Neither
+result exercises a Metal device.
 
-Acceptance gates:
-- Prepared artifact contains `gguf_projector_sha256` and `gguf_projector_size_bytes`.
-- Training fails early with `ProjectorFingerprintMismatch` if a different projector is supplied.
-- Report includes `projected_media_cache_entries`, `projected_media_cache_hits`, and `projected_media_cache_misses`.
-- `examples_with_media`, image counts, and image soft-token counts match the prepared data.
-- MLX train/eval completes with before/after eval `optimizer_steps=0`.
+The macOS job is a synthetic real-GPU gate, not an E2B/E4B scale gate. It must
+run successfully in CI and be made required in repository branch protection;
+workflow source alone is not evidence that either has happened.
 
-## Task List Before Distributed MLX
+A bounded live E2B QAT Q4 GGUF run (one example, sequence length 32, rank 2,
+Q/V targets) passed dataset generation, exact 50-module bootstrap, tokenizer
+preparation, and Metal graph admission. It then failed before the first
+optimizer update when autodiff requested a transpose of a quantized base
+weight (`UnsupportedTensorType`). The trainer now rejects GGUF autodiff earlier
+with `GgufAutodiffBackwardNotYetSupported`; this is the expected open
+QLoRA-backward gate, not a successful Q4 training result. The same workflow
+passed its Metal dry run. No full dense BF16 E2B or E4B artifact was available
+for the real-model correctness lane. The BF16 stored-weight component gate is
+implemented and the strict synthetic CLI step passed in the earlier tested
+snapshot, but neither is a substitute for that real-model acceptance run. The
+locally available BF16 Gemma4 assistant checkpoint is an MTP draft that requires
+target-model KV
+donation and is not a standalone causal-LM acceptance artifact.
 
-1. Run the 1k text pilot and archive `prepared.json`, `training_config.json`, and `train_eval_report.json`.
-2. Run the 100-image multimodal pilot with repeated media to verify cache behavior.
-3. Run a real multimodal pilot with unique images to measure projection cost and memory pressure.
-4. Run a 10k text pilot for at least two epochs to validate longer single-device stability.
-5. Add persistent projected-media cache artifacts if multimodal projection dominates runtime.
-6. Add checkpoint/resume cadence for long-running jobs.
-7. Only then start distributed MLX, using the single-device reports as baseline loss/throughput references.
+## Production Roadmap and Release Gates
+
+1. **Restore one green product contract.** Migrate pilot/recursive workflows and
+   recipe tests to the mandatory train/eval artifacts, confirm the last
+   compile-time failure is resolved, and pass the focused Gemma4 Debug and
+   ReleaseSafe gates from a clean branch before adding more kernels.
+2. **Finish dataset and artifact identity.** Persist canonical source-row,
+   dataset/split, and media-content hashes; recompute every prepared aggregate;
+   bind teacher targets to their teacher/base identity; preserve provenance in
+   generic adapter saves; and record training/eval/config/adapter payload
+   digests in the immutable run report.
+3. **Make the supported boundary honest.** Reject multimodal examples before
+   publication/backend work until that lane is separately accepted. Size the
+   eval graph from the selected `--eval-max-examples` slice, not the entire eval
+   artifact, and gate every recorded strict-Metal promotion counter.
+4. **Complete artifact transactions.** Replace the direct trainer-saver rename,
+   make prepared data immutable and streaming/sharded, evaluate materialized
+   output before publication, and add file/directory/parent fsync plus stale
+   staging recovery and failure injection.
+5. **Implement durable Gemma4 checkpoint/resume.** The low-level Metal restore
+   now overwrites resident optimizer slots, but the CLI/recipe still need
+   atomic adapter/optimizer/step/accumulation/epoch/cursor/RNG checkpoints. A
+   real Metal interrupted-and-resumed trajectory must match uninterrupted
+   training within declared tolerances.
+6. **Bound production-shape compute.** Add autodiff-capable fused/chunked Metal
+   attention and fused sparse LM-head cross-entropy. Prove native parity and
+   peak-memory bounds at the intended E2B/E4B sequence lengths.
+7. **Real E2B acceptance.** On a pinned BF16 artifact and disjoint, fingerprinted
+   dataset, pass native-versus-Metal first-step loss/per-target-gradient/update
+   parity, deterministic overfit, bounded multi-epoch training, resume, adapter
+   reload, and held-out quality thresholds.
+8. **Real E4B acceptance.** Repeat the E2B gates at E4B scale with sequences and
+   target presets that exercise shared KV, PLE, and the larger
+   adapter/optimizer footprint without fallback or unbounded growth.
+9. **Deployment and materialization.** Implement a streaming, dtype-preserving,
+   sharded writer; then apply accepted BF16-trained adapters to pinned E2B/E4B
+   QAT Q4 serving artifacts and require fingerprint, exact-token, quality,
+   memory, and repeated-generation gates.
+10. **Optional direct Q4/QLoRA training.** Only after the BF16 lane is accepted,
+    add packed-weight backward-input kernels and prove forward, gradient,
+    optimizer, memory, and task-quality parity without host dequantization.
+    Until then, direct training on GGUF remains unsupported.
+
+Finally, run the macOS real-GPU workflow, make it a required branch-protection
+check, and archive its artifacts. Keep separate opt-in gates for pinned real
+E2B/E4B models because the synthetic runner job is not a production-scale test.
+
+Do not call the path production-ready until every gate above has a reproducible
+artifact, pinned model/dataset provenance, and an explicit pass threshold.

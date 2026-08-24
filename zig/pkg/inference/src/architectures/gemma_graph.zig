@@ -201,11 +201,12 @@ fn buildPleVectors(
     const num_layers_i: i64 = @intCast(config.num_hidden_layers);
     const ple_total_i: i64 = ple_dim_i * num_layers_i;
 
-    // Token path: embed_tokens_per_layer(input_ids) * sqrt(ple_dim)
+    // Token path: embed_tokens_per_layer(input_ids) * sqrt(ple_dim).
+    // Use the canonical names produced by the HF/GGUF tensor normalizers.
     const token_embd_w = try parameterNamed(
         bld,
         config,
-        "model.embed_tokens_per_layer.weight",
+        "model.per_layer_input.per_layer_token_embd.weight",
         Shape.init(.f32, &.{ @as(i64, @intCast(config.vocab_size)), ple_total_i }),
     );
     const flat_ids = try bld.reshape(input_ids, Shape.init(.f32, &.{total_i}));
@@ -218,17 +219,18 @@ fn buildPleVectors(
     const model_proj_w = try parameterNamed(
         bld,
         config,
-        "model.per_layer_model_projection.weight",
+        "model.per_layer_input.per_layer_model_proj.weight",
         Shape.init(.f32, &.{ ple_total_i, hidden_i }),
     );
     const model_proj = try bld.linearNoBias(hidden_flat, model_proj_w, @intCast(total_i), @intCast(hidden_i), @intCast(ple_total_i));
 
     // RMSNorm: reshape [total, ple_total] -> [total*num_layers, ple_dim] -> norm -> reshape back
-    const proj_norm_w = try parameterNamed(
+    const proj_norm_w = try adjustedNormWeight(
         bld,
         config,
-        "model.per_layer_projection_norm.weight",
+        "model.per_layer_input.per_layer_proj_norm.weight",
         Shape.init(.f32, &.{ple_dim_i}),
+        config.norm_weight_offset,
     );
     const proj_flat = try bld.reshape(model_proj, Shape.init(.f32, &.{ total_i * num_layers_i, ple_dim_i }));
     const proj_normed_flat = try bld.rmsNorm(proj_flat, proj_norm_w, @intCast(config.ple_hidden_size), config.norm_eps);
@@ -268,30 +270,45 @@ fn applyPleInGraph(
 
     // Gate: hidden -> ple_dim, then activation
     var name_buf: [256]u8 = undefined;
-    const gate_name = std.fmt.bufPrint(&name_buf, "model.layers.{d}.per_layer_input_gate.weight", .{layer_ref.physical}) catch return error.NameTooLong;
+    const gate_name = std.fmt.bufPrint(&name_buf, "model.layers.{d}.per_layer_input.inp_gate.weight", .{layer_ref.physical}) catch return error.NameTooLong;
     const gate_w = try parameterNamed(bld, config, gate_name, Shape.init(.f32, &.{ ple_dim_i, hidden_i }));
     const gate_proj = try bld.linearNoBias(hidden_flat, gate_w, @intCast(total_i), @intCast(hidden_i), @intCast(ple_dim_i));
-    // Gemma uses gelu activation for PLE gate
-    const gate = try bld.gelu(gate_proj);
+    const gate = try applyActivation(bld, config, gate_proj);
 
     // Gated: gate * ple_layer
     const gated = try bld.mul(gate, ple_layer);
 
     // Project back: ple_dim -> hidden_size
     var proj_buf: [256]u8 = undefined;
-    const proj_name = std.fmt.bufPrint(&proj_buf, "model.layers.{d}.per_layer_projection.weight", .{layer_ref.physical}) catch return error.NameTooLong;
+    const proj_name = std.fmt.bufPrint(&proj_buf, "model.layers.{d}.per_layer_input.proj.weight", .{layer_ref.physical}) catch return error.NameTooLong;
     const proj_w = try parameterNamed(bld, config, proj_name, Shape.init(.f32, &.{ hidden_i, ple_dim_i }));
     const projected = try bld.linearNoBias(gated, proj_w, @intCast(total_i), @intCast(ple_dim_i), @intCast(hidden_i));
 
     // Post-norm
     var norm_buf: [256]u8 = undefined;
-    const norm_name = std.fmt.bufPrint(&norm_buf, "model.layers.{d}.post_per_layer_input_norm.weight", .{layer_ref.physical}) catch return error.NameTooLong;
-    const post_norm_w = try parameterNamed(bld, config, norm_name, Shape.init(.f32, &.{hidden_i}));
+    const norm_name = std.fmt.bufPrint(&norm_buf, "model.layers.{d}.per_layer_input.post_norm.weight", .{layer_ref.physical}) catch return error.NameTooLong;
+    const post_norm_w = try adjustedNormWeight(bld, config, norm_name, Shape.init(.f32, &.{hidden_i}), config.norm_weight_offset);
     const normed = try bld.rmsNorm(projected, post_norm_w, @intCast(hidden_i), config.norm_eps);
 
     // Residual: reshape normed back to 3D and add to hidden
     const normed_3d = try bld.reshape(normed, hidden_shape);
     return bld.add(hidden, normed_3d);
+}
+
+fn applyLayerOutputScaleInGraph(
+    bld: *Builder,
+    config: Config,
+    hidden: NodeId,
+    layer_ref: LayerRef,
+) !NodeId {
+    var name_buf: [256]u8 = undefined;
+    const scale_name = std.fmt.bufPrint(
+        &name_buf,
+        "model.layers.{d}.per_layer_input.layer_output_scale.weight",
+        .{layer_ref.physical},
+    ) catch return error.NameTooLong;
+    const scale_w = try parameterNamed(bld, config, scale_name, Shape.init(.f32, &.{1}));
+    return bld.mul(hidden, scale_w);
 }
 
 fn decoderLayer(
@@ -358,9 +375,16 @@ fn decoderLayer(
         try applyPleInGraph(bld, config, ffn_residual, ple, hidden_i, layer_ref)
     else
         ffn_residual;
+    // Gemma 4 applies layer_scalar after the complete decoder block, including
+    // the PLE residual. PLE is the unambiguous Gemma 4 discriminator available
+    // to this mandatory-parameter graph; older Gemma variants have no scale.
+    const layer_output = if (config.hasPle())
+        try applyLayerOutputScaleInGraph(bld, config, post_ple, layer_ref)
+    else
+        post_ple;
 
     return .{
-        .hidden = post_ple,
+        .hidden = layer_output,
         .produced_kv = attn.produced_kv,
     };
 }
@@ -467,7 +491,7 @@ fn selfAttention(
         .inputs = .{ q_rope, k_expanded, null_node, null_node },
         .num_inputs = 2,
     });
-    const inv_sqrt_d = try bld.scalarConst(.f32, if (config.global_head_dim > 0) 1.0 else 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim_u))));
+    const inv_sqrt_d = try bld.scalarConst(.f32, attentionScoreScale(config, parameter_layer));
     const scaled_scores = try bld.mul(scores, inv_sqrt_d);
     const masked_scores = try bld.add(scaled_scores, layer_mask);
     const probs = try bld.softmax(masked_scores);
@@ -555,11 +579,20 @@ fn gatedMlp(
 
 fn applyActivation(bld: *Builder, config: Config, input: NodeId) !NodeId {
     return switch (config.activation) {
-        .gelu, .gelu_new => bld.gelu(input),
+        .gelu => bld.geluExact(input),
+        .gelu_new => bld.gelu(input),
         .silu => bld.silu(input),
         .relu => bld.relu(input),
         else => error.UnsupportedGemmaActivation,
     };
+}
+
+fn attentionScoreScale(config: Config, layer: usize) f32 {
+    // Gemma 4's attention contract uses a scale of 1.0. Older Gemma variants
+    // use the conventional inverse square-root head dimension.
+    if (config.global_head_dim > 0) return 1.0;
+    const head_dim = config.effectiveHeadDimForLayer(layer);
+    return 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 }
 
 fn applyRopeAndHeadNorm(
@@ -834,7 +867,138 @@ fn parameterNameCount(graph: *const Graph, name: []const u8) usize {
     return count;
 }
 
-test "buildForwardGraph: gemma4 sliding and shared-kv config compiles" {
+fn parameterNodeByName(graph: *const Graph, name: []const u8) ?NodeId {
+    for (graph.parameters.items) |param_id| {
+        const param = graph.node(param_id);
+        if (std.mem.eql(u8, graph.parameterName(param), name)) return param_id;
+    }
+    return null;
+}
+
+fn parameterFeedsOp(graph: *const Graph, name: []const u8, tag: std.meta.Tag(node_mod.OpCode)) bool {
+    for (graph.parameters.items) |param_id| {
+        const param = graph.node(param_id);
+        if (!std.mem.eql(u8, graph.parameterName(param), name)) continue;
+        for (graph.nodes.items) |node| {
+            if (std.meta.activeTag(node.op) != tag) continue;
+            for (node.getInputs()) |input| {
+                if (input == param_id) return true;
+            }
+        }
+    }
+    return false;
+}
+
+test "gemma graph PLE matches normalized runtime parameter contract" {
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var bld = Builder.init(&graph);
+
+    const cfg = Config{
+        .family = .gemma,
+        .hidden_size = 16,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 4,
+        .global_head_dim = 4,
+        .num_global_key_value_heads = 2,
+        .intermediate_size = 32,
+        .vocab_size = 64,
+        .position_encoding = .rope,
+        .norm_type = .rms_norm,
+        .activation = .gelu_new,
+        .norm_eps = 1e-6,
+        .norm_weight_offset = 1.0,
+        .ple_hidden_size = 4,
+        .sliding_window = 4,
+        .sliding_window_pattern = 2,
+    };
+
+    const test_input_ids = try bld.parameter("test_input_ids", Shape.init(.f32, &.{ 1, 2 }));
+    const test_cos = try bld.parameter("test_cos", Shape.init(.f32, &.{ 2, 2 }));
+    const test_sin = try bld.parameter("test_sin", Shape.init(.f32, &.{ 2, 2 }));
+    const result = try buildForwardGraph(&bld, cfg, 1, 2, .{
+        .input_ids = test_input_ids,
+        .rope_cos = test_cos,
+        .rope_sin = test_sin,
+    });
+    try std.testing.expect(result.output_node != null_node);
+
+    const token_embd = parameterNodeByName(&graph, "model.per_layer_input.per_layer_token_embd.weight");
+    const model_proj = parameterNodeByName(&graph, "model.per_layer_input.per_layer_model_proj.weight");
+    const proj_norm = parameterNodeByName(&graph, "model.per_layer_input.per_layer_proj_norm.weight");
+    const layer_gate = parameterNodeByName(&graph, "model.layers.0.per_layer_input.inp_gate.weight");
+    const layer_proj = parameterNodeByName(&graph, "model.layers.0.per_layer_input.proj.weight");
+    const post_norm = parameterNodeByName(&graph, "model.layers.0.per_layer_input.post_norm.weight");
+    const output_scale = parameterNodeByName(&graph, "model.layers.0.per_layer_input.layer_output_scale.weight");
+    try std.testing.expect(token_embd != null);
+    try std.testing.expect(model_proj != null);
+    try std.testing.expect(proj_norm != null);
+    try std.testing.expect(layer_gate != null);
+    try std.testing.expect(layer_proj != null);
+    try std.testing.expect(post_norm != null);
+    try std.testing.expect(output_scale != null);
+
+    try std.testing.expectEqual(@as(i64, 64), graph.node(token_embd.?).output_shape.dim(0));
+    try std.testing.expectEqual(@as(i64, 8), graph.node(token_embd.?).output_shape.dim(1));
+    try std.testing.expectEqual(@as(i64, 8), graph.node(model_proj.?).output_shape.dim(0));
+    try std.testing.expectEqual(@as(i64, 16), graph.node(model_proj.?).output_shape.dim(1));
+    try std.testing.expectEqual(@as(i64, 4), graph.node(proj_norm.?).output_shape.dim(0));
+    try std.testing.expectEqual(@as(i64, 4), graph.node(layer_gate.?).output_shape.dim(0));
+    try std.testing.expectEqual(@as(i64, 16), graph.node(layer_gate.?).output_shape.dim(1));
+    try std.testing.expectEqual(@as(i64, 16), graph.node(layer_proj.?).output_shape.dim(0));
+    try std.testing.expectEqual(@as(i64, 4), graph.node(layer_proj.?).output_shape.dim(1));
+    try std.testing.expectEqual(@as(i64, 16), graph.node(post_norm.?).output_shape.dim(0));
+    try std.testing.expectEqual(@as(i64, 1), graph.node(output_scale.?).output_shape.dim(0));
+
+    try std.testing.expect(parameterFeedsOp(&graph, "model.per_layer_input.per_layer_proj_norm.weight", .add));
+    try std.testing.expect(parameterFeedsOp(&graph, "model.layers.0.per_layer_input.post_norm.weight", .add));
+    try std.testing.expect(parameterFeedsOp(&graph, "model.layers.0.per_layer_input.layer_output_scale.weight", .mul));
+
+    try std.testing.expectEqual(@as(usize, 0), parameterNameCount(&graph, "model.embed_tokens_per_layer.weight"));
+    try std.testing.expectEqual(@as(usize, 0), parameterNameCount(&graph, "model.per_layer_model_projection.weight"));
+    try std.testing.expectEqual(@as(usize, 0), parameterNameCount(&graph, "model.layers.0.per_layer_input_gate.weight"));
+}
+
+test "gemma graph activation and attention scales match runtime" {
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var bld = Builder.init(&graph);
+    const input = try bld.parameter("input", Shape.init(.f32, &.{ 1, 4 }));
+
+    const exact = try applyActivation(&bld, .{ .activation = .gelu }, input);
+    const approximate = try applyActivation(&bld, .{ .activation = .gelu_new }, input);
+    try std.testing.expectEqual(
+        @as(std.meta.Tag(node_mod.OpCode), .fused_gelu_exact),
+        std.meta.activeTag(graph.node(exact).op),
+    );
+    try std.testing.expectEqual(
+        @as(std.meta.Tag(node_mod.OpCode), .fused_gelu),
+        std.meta.activeTag(graph.node(approximate).op),
+    );
+
+    const legacy = Config{
+        .family = .gemma,
+        .hidden_size = 16,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 4,
+    };
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), attentionScoreScale(legacy, 0), 1e-6);
+
+    var gemma4 = legacy;
+    gemma4.global_head_dim = 8;
+    gemma4.num_global_key_value_heads = 2;
+    gemma4.sliding_window = 4;
+    gemma4.sliding_window_pattern = 2;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), attentionScoreScale(gemma4, 0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), attentionScoreScale(gemma4, 1), 1e-6);
+}
+
+test "buildForwardGraph: gemma4 sliding shared-kv and omitted-v contract" {
     const allocator = std.testing.allocator;
     var graph = Graph.init(allocator);
     defer graph.deinit();
@@ -862,7 +1026,8 @@ test "buildForwardGraph: gemma4 sliding and shared-kv config compiles" {
         .rope_local_theta = 10_000.0,
         .rope_partial_factor = 0.5,
         .rope_dim_override = 2,
-        .num_kv_shared_layers = 1,
+        .num_kv_shared_layers = 2,
+        .attention_k_eq_v = true,
     };
 
     const test_input_ids = try bld.parameter("test_input_ids", Shape.init(.f32, &.{ 1, 4 }));
@@ -879,4 +1044,25 @@ test "buildForwardGraph: gemma4 sliding and shared-kv config compiles" {
     try std.testing.expectEqual(@as(i64, 1), out_shape.dim(0));
     try std.testing.expectEqual(@as(i64, 4), out_shape.dim(1));
     try std.testing.expectEqual(@as(i64, 32), out_shape.dim(2));
+
+    // Non-shared sliding layer owns K/V. Non-shared global attention aliases
+    // V to its pre-RoPE K projection. Shared tail layers own Q/O only and reuse
+    // the last donor of the matching attention type.
+    try std.testing.expect(parameterNameCount(&graph, "model.layers.0.self_attn.k_proj.weight") > 0);
+    try std.testing.expect(parameterNameCount(&graph, "model.layers.0.self_attn.v_proj.weight") > 0);
+    try std.testing.expect(parameterNameCount(&graph, "model.layers.1.self_attn.k_proj.weight") > 0);
+    try std.testing.expectEqual(@as(usize, 0), parameterNameCount(&graph, "model.layers.1.self_attn.v_proj.weight"));
+    try std.testing.expectEqual(@as(usize, 0), parameterNameCount(&graph, "model.layers.2.self_attn.k_proj.weight"));
+    try std.testing.expectEqual(@as(usize, 0), parameterNameCount(&graph, "model.layers.2.self_attn.v_proj.weight"));
+    try std.testing.expectEqual(@as(usize, 0), parameterNameCount(&graph, "model.layers.3.self_attn.k_proj.weight"));
+    try std.testing.expectEqual(@as(usize, 0), parameterNameCount(&graph, "model.layers.3.self_attn.v_proj.weight"));
+    try std.testing.expect(parameterNameCount(&graph, "model.layers.2.self_attn.q_proj.weight") > 0);
+    try std.testing.expect(parameterNameCount(&graph, "model.layers.3.self_attn.o_proj.weight") > 0);
+
+    const sliding_q = parameterNodeByName(&graph, "model.layers.0.self_attn.q_proj.weight").?;
+    const global_q = parameterNodeByName(&graph, "model.layers.1.self_attn.q_proj.weight").?;
+    const global_k = parameterNodeByName(&graph, "model.layers.1.self_attn.k_proj.weight").?;
+    try std.testing.expectEqual(@as(i64, 16), graph.node(sliding_q).output_shape.dim(0));
+    try std.testing.expectEqual(@as(i64, 32), graph.node(global_q).output_shape.dim(0));
+    try std.testing.expectEqual(@as(i64, 16), graph.node(global_k).output_shape.dim(0));
 }

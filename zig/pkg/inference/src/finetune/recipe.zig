@@ -30,7 +30,7 @@ const reranker_head = @import("reranker_head.zig");
 const reranker_lora = @import("reranker_lora.zig");
 const reranker = @import("reranker.zig");
 const preference_harness = @import("preference_harness.zig");
-const train_eval_gemma4_lora_bundle = @import("train/train_eval_gemma4_lora_bundle.zig");
+const train_eval_gemma4_lora_bundle = @import("gemma4_train_command.zig");
 const train_eval_layoutlmv3_lora_sequence = @import("train/train_eval_layoutlmv3_lora_sequence.zig");
 const train_eval_layoutlmv3_lora_token = @import("train/train_eval_layoutlmv3_lora_token.zig");
 const train_eval_colqwen2_lora_bundle = @import("train/train_eval_colqwen2_lora_bundle.zig");
@@ -54,6 +54,7 @@ const default_lora_rank: usize = 16;
 const default_policy_lora_rank: usize = 8;
 const default_lora_alpha: f32 = 32.0;
 const default_lora_target_preset = "all-linear";
+const default_gemma4_lora_target_preset = "text-all-linear";
 
 const qwen_attention_lora_target_modules = [_][]const u8{ "q_proj", "k_proj", "v_proj", "o_proj" };
 const qwen_mlp_lora_target_modules = [_][]const u8{ "gate_proj", "up_proj", "down_proj" };
@@ -493,7 +494,7 @@ pub fn loadRecipe(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !s
     defer allocator.free(raw);
     return std.json.parseFromSlice(Recipe, allocator, raw, .{
         .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
+        .ignore_unknown_fields = false,
     });
 }
 
@@ -541,9 +542,11 @@ fn runFastSmoke(allocator: std.mem.Allocator, io: std.Io, args: []const []const 
     };
 
     var results = try allocator.alloc(FastSmokeCaseResult, cases.len);
-    defer freeFastSmokeResults(allocator, results);
+    var initialized_results: usize = 0;
+    defer freeFastSmokeResults(allocator, results, initialized_results);
     for (cases, 0..) |case, idx| {
         results[idx] = try runFastSmokeCase(allocator, io, out_root, case);
+        initialized_results += 1;
     }
 
     const overall = blk: {
@@ -663,8 +666,9 @@ fn runFastSmokeCase(
     };
 }
 
-fn freeFastSmokeResults(allocator: std.mem.Allocator, results: []FastSmokeCaseResult) void {
-    for (results) |result| {
+fn freeFastSmokeResults(allocator: std.mem.Allocator, results: []FastSmokeCaseResult, initialized_results: usize) void {
+    std.debug.assert(initialized_results <= results.len);
+    for (results[0..initialized_results]) |result| {
         if (result.manifest_path) |path| allocator.free(path);
         if (result.training_report_path) |path| allocator.free(path);
     }
@@ -712,23 +716,39 @@ fn resolveOptionalCwdPath(allocator: std.mem.Allocator, io: std.Io, maybe_path: 
 }
 
 fn resolveCwdPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
+    return resolvePathFromDir(allocator, io, std.Io.Dir.cwd(), path);
+}
+
+fn resolvePathFromDir(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) ![]const u8 {
     if (path.len == 0 or std.fs.path.isAbsolute(path)) return try allocator.dupe(u8, path);
-    if (cwdPathExists(io, path)) return try allocator.dupe(u8, path);
+    if (dirPathExists(dir, io, path)) return try allocator.dupe(u8, path);
 
     const package_prefix = "pkg/inference/";
     if (std.mem.startsWith(u8, path, package_prefix)) {
         const package_relative = path[package_prefix.len..];
-        if (cwdPathExists(io, package_relative)) return try allocator.dupe(u8, package_relative);
+        if (dirPathExists(dir, io, package_relative)) return try allocator.dupe(u8, package_relative);
+
+        const repo_relative = try std.fs.path.join(allocator, &.{ "zig", path });
+        if (dirPathExists(dir, io, repo_relative)) return repo_relative;
+        allocator.free(repo_relative);
     } else {
-        const repo_relative = try std.fs.path.join(allocator, &.{ package_prefix[0 .. package_prefix.len - 1], path });
-        if (cwdPathExists(io, repo_relative)) return repo_relative;
+        const package_relative = try std.fs.path.join(allocator, &.{ package_prefix[0 .. package_prefix.len - 1], path });
+        if (dirPathExists(dir, io, package_relative)) return package_relative;
+        allocator.free(package_relative);
+
+        const repo_relative = try std.fs.path.join(allocator, &.{ "zig", package_prefix[0 .. package_prefix.len - 1], path });
+        if (dirPathExists(dir, io, repo_relative)) return repo_relative;
         allocator.free(repo_relative);
     }
     return try allocator.dupe(u8, path);
 }
 
 fn cwdPathExists(io: std.Io, path: []const u8) bool {
-    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return dirPathExists(std.Io.Dir.cwd(), io, path);
+}
+
+fn dirPathExists(dir: std.Io.Dir, io: std.Io, path: []const u8) bool {
+    dir.access(io, path, .{}) catch return false;
     return true;
 }
 
@@ -1116,6 +1136,14 @@ pub fn buildPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     const kind = try parseKind(recipe.recipe orelse recipe.kind orelse return error.MissingRecipeKind);
     const family = recipe.model.family orelse try inferFamily(recipe);
 
+    if (eqlAny(family, &.{ "gemma4", "gemma" })) {
+        switch (kind) {
+            .sft => return error.Gemma4FullSftNotYetSupported,
+            .qlora_sft => return error.Gemma4QLoRANotYetSupported,
+            else => {},
+        }
+    }
+
     return switch (kind) {
         .sft, .lora_sft, .qlora_sft => try buildLoraSftPlan(allocator, recipe, family),
         .dpo => try buildDpoPlan(allocator, recipe),
@@ -1153,13 +1181,166 @@ fn buildQwen35TextSftPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     }) };
 }
 
+fn validateGemma4LoraRecipeContract(recipe: Recipe, adapter: AdapterConfig) !void {
+    if (recipe.model.reference_path != null) return error.UnsupportedGemma4ModelOption;
+
+    if (recipe.dataset.cache_path != null or
+        recipe.dataset.train_cache_path != null or
+        recipe.dataset.format != null or
+        recipe.dataset.labels != null)
+    {
+        return error.UnsupportedGemma4DatasetOption;
+    }
+    if (evalDatasetPath(recipe) == null) return error.MissingEvaluationDataset;
+    _ = try gemma4.validateTrainingSequenceLength(recipe.dataset.max_seq_len orelse 512, std.math.maxInt(u32));
+
+    const rank = adapterRank(adapter, .lora_sft);
+    if (rank == 0 or rank > std.math.maxInt(u32)) return error.InvalidLoRARank;
+    const alpha = adapterAlpha(adapter);
+    if (!std.math.isFinite(alpha) or alpha <= 0) return error.InvalidLoRAAlpha;
+    if (adapter.dropout != null or adapter.layer_name != null or adapter.quantization != null) {
+        return error.UnsupportedGemma4AdapterOption;
+    }
+    if (adapter.use_dora orelse false) return error.DoRAAutodiffNotYetSupported;
+    try gemma4.validateLoRAInitializerBaseCompatibility(adapter.init_lora_weights);
+    if (adapter.init_lora_weights) |initializer| {
+        if (eqlName(initializer, "eva") or
+            eqlName(initializer, "lora-ga") or
+            eqlName(initializer, "loraga") or
+            eqlName(initializer, "lora_ga"))
+        {
+            return error.Gemma4RecipeInitializerStatsNotYetSupported;
+        }
+    }
+
+    if (recipe.optimizer.weight_decay != null or
+        recipe.optimizer.lr_scheduler != null or
+        recipe.optimizer.warmup_ratio != null or
+        recipe.optimizer.warmup_steps != null or
+        recipe.optimizer.num_cycles != null or
+        recipe.optimizer.max_steps != null or
+        recipe.optimizer.micro_batch_size != null or
+        recipe.optimizer.llrd_decay != null or
+        (recipe.optimizer.schedule_free orelse false))
+    {
+        return error.UnsupportedGemma4OptimizerOption;
+    }
+
+    if (recipe.eval) |eval| {
+        if (eval.every_epochs != null or
+            eval.batch_size != null or
+            eval.early_stopping_patience != null or
+            eval.improvement_threshold != null or
+            eval.backend != null or
+            eval.entity_minimums != null or
+            eval.full_task_minimums != null)
+        {
+            return error.UnsupportedGemma4EvalOption;
+        }
+    }
+
+    if (recipe.checkpoint) |checkpoint| {
+        if (checkpoint.every_epochs != null or checkpoint.keep_last != null or checkpoint.resume_path != null) {
+            return error.UnsupportedGemma4CheckpointOption;
+        }
+    }
+    if (recipe.runtime) |runtime| {
+        if (runtime.compiled_required != null or runtime.graph_cache_capacity != null) {
+            return error.UnsupportedGemma4RuntimeOption;
+        }
+    }
+    if (recipe.trainer) |trainer| {
+        if (!std.mem.eql(u8, trainer, "autodiff") and !std.mem.eql(u8, trainer, "auto")) {
+            return error.UnsupportedGemma4Trainer;
+        }
+    }
+
+    if (recipe.preference.beta != null or
+        recipe.preference.simpo_gamma != null or
+        recipe.preference.sft_lambda != null or
+        recipe.preference.ipo_tau != null or
+        recipe.grpo.group_size != null or
+        recipe.grpo.clip_epsilon != null or
+        recipe.grpo.kl_coef != null or
+        recipe.grpo.advantage_eps != null or
+        recipe.grpo.normalize_advantage != null or
+        recipe.grpo.max_completion_tokens != null or
+        recipe.grpo.reward_mode != null)
+    {
+        return error.UnsupportedGemma4AlgorithmOption;
+    }
+
+    if (recipe.artifacts.materialized_dir != null or
+        recipe.artifacts.validation_report_path != null or
+        recipe.artifacts.evaluation_report_path != null or
+        recipe.artifacts.reload_report_path != null or
+        recipe.artifacts.report_path != null)
+    {
+        return error.UnsupportedGemma4ArtifactOption;
+    }
+}
+
+fn pathIsSameOrWithin(parent: []const u8, path: []const u8) bool {
+    if (std.mem.eql(u8, parent, path)) return true;
+    if (parent.len == 0 or path.len <= parent.len or !std.mem.startsWith(u8, path, parent)) return false;
+    if (std.fs.path.isSep(parent[parent.len - 1])) return true;
+    return std.fs.path.isSep(path[parent.len]);
+}
+
+fn validateGemma4ArtifactDirectories(
+    allocator: std.mem.Allocator,
+    recipe: Recipe,
+    prepared_path: []const u8,
+    eval_prepared_path: []const u8,
+    bootstrap_dir: []const u8,
+    trained_dir: []const u8,
+) !void {
+    const resolved_bootstrap = try std.fs.path.resolve(allocator, &.{bootstrap_dir});
+    defer allocator.free(resolved_bootstrap);
+    const resolved_trained = try std.fs.path.resolve(allocator, &.{trained_dir});
+    defer allocator.free(resolved_trained);
+    if (pathIsSameOrWithin(resolved_bootstrap, resolved_trained) or
+        pathIsSameOrWithin(resolved_trained, resolved_bootstrap))
+    {
+        return error.Gemma4BootstrapAndTrainingOutputConflict;
+    }
+
+    const artifact_root = recipe.artifacts.root orelse "antfly-inference-finetune-out";
+    const resolved_root = try std.fs.path.resolve(allocator, &.{artifact_root});
+    defer allocator.free(resolved_root);
+    if (pathIsSameOrWithin(resolved_bootstrap, resolved_root) or
+        pathIsSameOrWithin(resolved_trained, resolved_root))
+    {
+        return error.Gemma4OutputConflictsWithArtifactRoot;
+    }
+
+    const planned_files = [_]?[]const u8{
+        prepared_path,
+        eval_prepared_path,
+        recipe.artifacts.manifest_path,
+    };
+    for (planned_files) |maybe_path| {
+        const path = maybe_path orelse continue;
+        const resolved = try std.fs.path.resolve(allocator, &.{path});
+        defer allocator.free(resolved);
+        if (pathIsSameOrWithin(resolved_bootstrap, resolved) or
+            pathIsSameOrWithin(resolved_trained, resolved))
+        {
+            return error.Gemma4OutputContainsPlannedArtifact;
+        }
+    }
+}
+
 fn buildGemma4LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     const model_path = recipe.model.path orelse return error.MissingModelPath;
     const dataset_path = trainDatasetPath(recipe) orelse return error.MissingDatasetPath;
-    const prepared_path = recipe.artifacts.prepared_path orelse recipe.dataset.prepared_path orelse try defaultArtifactPath(allocator, recipe, "prepared_inputs.json");
-    const bootstrap_dir = adapterBootstrapDir(recipe) orelse try defaultArtifactPath(allocator, recipe, "adapter-bootstrap");
-    const trained_dir = recipe.artifacts.trained_adapter_dir orelse recipe.artifacts.adapter_dir orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
     const adapter = recipe.adapter orelse AdapterConfig{};
+    const prepared_path = recipe.artifacts.prepared_path orelse recipe.dataset.prepared_path orelse try defaultArtifactPath(allocator, recipe, "prepared_inputs.json");
+    const eval_prepared_path = recipe.dataset.eval_cache_path orelse try defaultArtifactPath(allocator, recipe, "prepared_eval_inputs.json");
+    const bootstrap_dir = adapter.path orelse try defaultArtifactPath(allocator, recipe, "adapter-bootstrap");
+    const trained_dir = recipe.artifacts.trained_adapter_dir orelse recipe.artifacts.adapter_dir orelse try defaultArtifactPath(allocator, recipe, "adapter-trained");
+    try validateGemma4LoraRecipeContract(recipe, adapter);
+    try validateGemma4ArtifactDirectories(allocator, recipe, prepared_path, eval_prepared_path, bootstrap_dir, trained_dir);
 
     var steps: std.ArrayList(Step) = .empty;
     errdefer freeSteps(allocator, steps.items);
@@ -1181,6 +1362,23 @@ fn buildGemma4LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     }
     try steps.append(allocator, .{ .name = "prepare", .argv = try prepare_argv.toOwnedSlice(allocator) });
 
+    var prepare_eval_argv: std.ArrayList([]const u8) = .empty;
+    try appendMany(allocator, &prepare_eval_argv, &.{
+        "prepare-gemma4-lora-inputs",
+        model_path,
+        evalDatasetPath(recipe).?,
+        if (recipe.eval) |eval| eval.split orelse recipe.dataset.eval_split orelse "-" else recipe.dataset.eval_split orelse "-",
+        eval_prepared_path,
+        "--max-examples",
+        try fmtInt(allocator, evalMaxExamples(recipe) orelse 0),
+        "--max-seq-len",
+        try fmtInt(allocator, recipe.dataset.max_seq_len orelse 512),
+    });
+    if (recipe.model.projector_path) |path| {
+        try appendMany(allocator, &prepare_eval_argv, &.{ "--gguf-projector", path });
+    }
+    try steps.append(allocator, .{ .name = "prepare-eval", .argv = try prepare_eval_argv.toOwnedSlice(allocator) });
+
     var bootstrap_argv: std.ArrayList([]const u8) = .empty;
     try appendMany(allocator, &bootstrap_argv, &.{
         "bootstrap-gemma4-lora",
@@ -1190,6 +1388,10 @@ fn buildGemma4LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     try appendGemmaBootstrapAdapterArgs(allocator, &bootstrap_argv, adapter, .lora_sft);
     try steps.append(allocator, .{ .name = "bootstrap-adapter", .argv = try bootstrap_argv.toOwnedSlice(allocator) });
 
+    const backend = recipe.backend orelse return error.MissingBackend;
+    if (!std.mem.eql(u8, backend, "native") and !std.mem.eql(u8, backend, "metal")) {
+        return error.UnsupportedBackend;
+    }
     var train_argv: std.ArrayList([]const u8) = .empty;
     try appendMany(allocator, &train_argv, &.{
         "train-eval-gemma4-lora-bundle",
@@ -1201,16 +1403,15 @@ fn buildGemma4LoraPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
         try fmtFloat(allocator, recipe.optimizer.learning_rate orelse 0.001),
         "--max-examples",
         try fmtInt(allocator, recipe.dataset.max_examples orelse 32),
+        "--eval-prepared",
+        eval_prepared_path,
         "--epochs",
         try fmtInt(allocator, recipe.optimizer.epochs orelse 1),
     });
-    if (recipe.eval) |eval| if (eval.max_examples) |max| try appendMany(allocator, &train_argv, &.{ "--eval-max-examples", try fmtInt(allocator, max) });
-    if (adapter.layer_name) |layer| try appendMany(allocator, &train_argv, &.{ "--layer-name", layer });
+    if (evalMaxExamples(recipe)) |max| try appendMany(allocator, &train_argv, &.{ "--eval-max-examples", try fmtInt(allocator, max) });
     if (recipe.optimizer.gradient_accumulation_steps) |steps_count| try appendMany(allocator, &train_argv, &.{ "--grad-accum", try fmtInt(allocator, steps_count) });
     if (recipe.optimizer.max_grad_norm) |norm| try appendMany(allocator, &train_argv, &.{ "--max-grad-norm", try fmtFloat(allocator, norm) });
-    if (recipe.optimizer.llrd_decay) |decay| try appendMany(allocator, &train_argv, &.{ "--llrd-decay", try fmtFloat(allocator, decay) });
-    if (recipe.optimizer.schedule_free orelse false) try train_argv.append(allocator, "--schedule-free");
-    if (recipe.backend) |backend| try appendMany(allocator, &train_argv, &.{ "--backend", backend });
+    try appendMany(allocator, &train_argv, &.{ "--backend", backend });
     if (recipe.trainer) |trainer| try appendMany(allocator, &train_argv, &.{ "--trainer", trainer });
     if (recipe.model.projector_path) |path| try appendMany(allocator, &train_argv, &.{ "--gguf-projector", path });
     try steps.append(allocator, .{ .name = "train-eval", .argv = try train_argv.toOwnedSlice(allocator) });
@@ -1989,7 +2190,12 @@ fn validateAdapterTargetSelection(adapter: AdapterConfig) !void {
 fn validateGemmaAdapterOptions(adapter: AdapterConfig) !void {
     try validateAdapterScaling(adapter);
     try validateAdapterTargetSelection(adapter);
-    if (adapter.target_modules == null) _ = try parseAdapterTargetPreset(adapter.target_preset orelse default_lora_target_preset);
+    if (adapter.target_modules == null) {
+        const name = adapter.target_preset orelse default_gemma4_lora_target_preset;
+        if (gemma4.parseGemma4LoRATargetPreset(name) == null and peft.parseTargetPreset(name) == null) {
+            return error.UnsupportedLoRATargetPreset;
+        }
+    }
 }
 
 fn validateNonGemmaAdapterOptions(adapter: AdapterConfig) !void {
@@ -2008,9 +2214,14 @@ fn parseAdapterTargetPreset(name: []const u8) !peft.TargetPreset {
     return peft.parseTargetPreset(name) orelse error.UnsupportedLoRATargetPreset;
 }
 
-fn gemmaTargetPreset(adapter: AdapterConfig) !?peft.TargetPreset {
+fn gemma4TargetPreset(adapter: AdapterConfig) ?gemma4.Gemma4LoRATargetPreset {
     if (adapter.target_modules != null) return null;
-    return try parseAdapterTargetPreset(adapter.target_preset orelse default_lora_target_preset);
+    return gemma4.parseGemma4LoRATargetPreset(adapter.target_preset orelse default_gemma4_lora_target_preset);
+}
+
+fn gemmaLegacyTargetPreset(adapter: AdapterConfig) !?peft.TargetPreset {
+    if (adapter.target_modules != null or gemma4TargetPreset(adapter) != null) return null;
+    return try parseAdapterTargetPreset(adapter.target_preset orelse default_gemma4_lora_target_preset);
 }
 
 fn adapterTargetModulesForQwen(adapter: AdapterConfig, default_target_modules: []const []const u8) ![]const []const u8 {
@@ -2045,8 +2256,11 @@ fn appendGemmaBootstrapAdapterArgs(
     if (adapter.target_modules) |modules| {
         try appendTargetModulesCsv(allocator, list, modules);
     } else {
-        _ = try parseAdapterTargetPreset(adapter.target_preset orelse default_lora_target_preset);
-        try appendMany(allocator, list, &.{ "--target-preset", adapter.target_preset orelse default_lora_target_preset });
+        const preset = adapter.target_preset orelse default_gemma4_lora_target_preset;
+        if (gemma4.parseGemma4LoRATargetPreset(preset) == null and peft.parseTargetPreset(preset) == null) {
+            return error.UnsupportedLoRATargetPreset;
+        }
+        try appendMany(allocator, list, &.{ "--target-preset", preset });
     }
     if (adapter.layer_name) |layer| try appendMany(allocator, list, &.{ "--layer-name", layer });
     if (adapter.use_dora orelse false) try list.append(allocator, "--use-dora");
@@ -2568,6 +2782,7 @@ fn runDirectBootstrapGemma4Lora(allocator: std.mem.Allocator, io: std.Io, argv_i
     var base_model_name_or_path: ?[]const u8 = null;
     var layer_name: ?[]const u8 = null;
     var target_preset: ?peft.TargetPreset = null;
+    var gemma4_target_preset: ?gemma4.Gemma4LoRATargetPreset = null;
     var target_modules: ?[]const []const u8 = null;
     defer if (target_modules) |modules| allocator.free(modules);
     var use_dora = false;
@@ -2596,7 +2811,11 @@ fn runDirectBootstrapGemma4Lora(allocator: std.mem.Allocator, io: std.Io, argv_i
         } else if (std.mem.eql(u8, arg, "--target-preset")) {
             i += 1;
             if (i >= argv_in.len) return error.InvalidArguments;
-            target_preset = peft.parseTargetPreset(argv_in[i]) orelse return error.InvalidArguments;
+            if (gemma4.parseGemma4LoRATargetPreset(argv_in[i])) |preset| {
+                gemma4_target_preset = preset;
+            } else {
+                target_preset = peft.parseTargetPreset(argv_in[i]) orelse return error.InvalidArguments;
+            }
         } else if (std.mem.eql(u8, arg, "--target-modules")) {
             if (target_modules != null) return error.InvalidArguments;
             i += 1;
@@ -2620,8 +2839,10 @@ fn runDirectBootstrapGemma4Lora(allocator: std.mem.Allocator, io: std.Io, argv_i
             return error.InvalidArguments;
         }
     }
-    if (target_modules != null and target_preset != null) return error.InvalidArguments;
-    const effective_target_preset = if (target_modules == null) target_preset orelse .all_linear else null;
+    const selection_count = @intFromBool(target_modules != null) +
+        @intFromBool(target_preset != null) +
+        @intFromBool(gemma4_target_preset != null);
+    if (selection_count > 1) return error.InvalidArguments;
 
     var summary = try gemma4.bootstrapLoRABundle(allocator, model_dir, out_dir, .{
         .rank = rank,
@@ -2629,7 +2850,8 @@ fn runDirectBootstrapGemma4Lora(allocator: std.mem.Allocator, io: std.Io, argv_i
         .base_model_name_or_path = base_model_name_or_path,
         .layer_name = layer_name,
         .target_modules = target_modules,
-        .target_preset = effective_target_preset,
+        .target_preset = target_preset,
+        .gemma4_target_preset = gemma4_target_preset,
         .use_dora = use_dora,
         .init_lora_weights = init_lora_weights,
     });
@@ -3683,7 +3905,8 @@ fn runOptimizerBackedGemmaDpo(
             .alpha = adapterAlpha(adapter),
             .base_model_name_or_path = adapter.base_model_name_or_path,
             .target_modules = adapter.target_modules,
-            .target_preset = try gemmaTargetPreset(adapter),
+            .gemma4_target_preset = gemma4TargetPreset(adapter),
+            .target_preset = try gemmaLegacyTargetPreset(adapter),
             .use_dora = adapter.use_dora orelse false,
             .init_lora_weights = adapter.init_lora_weights,
         });
@@ -4104,7 +4327,8 @@ fn runOptimizerBackedGemmaGrpo(
             .alpha = adapterAlpha(adapter),
             .base_model_name_or_path = adapter.base_model_name_or_path,
             .target_modules = adapter.target_modules,
-            .target_preset = try gemmaTargetPreset(adapter),
+            .gemma4_target_preset = gemma4TargetPreset(adapter),
+            .target_preset = try gemmaLegacyTargetPreset(adapter),
             .use_dora = adapter.use_dora orelse false,
             .init_lora_weights = adapter.init_lora_weights,
         });
@@ -5581,6 +5805,21 @@ test "recipe kind accepts taxonomy spellings" {
     try std.testing.expectEqual(RecipeKind.vlm_retrieval, try parseKind("vlm-retrieval"));
 }
 
+test "gemma4 recipe loading rejects unknown fields" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "recipe.json",
+        .data =
+        \\{"recipe":"lora-sft","model":{"path":"mystery","familly":"gemma4"}}
+        ,
+    });
+    const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "recipe.json" });
+    defer allocator.free(path);
+    try std.testing.expectError(error.UnknownField, loadRecipe(allocator, std.testing.io, path));
+}
+
 test "family inference keeps qwen3_5 and colqwen distinct from qwen2" {
     try std.testing.expectEqualStrings("qwen3_5", inferFamilyFromModelPath("/models/datalab-to/chandra-ocr-2").?);
     try std.testing.expectEqualStrings("qwen3_5", inferFamilyFromModelPath("/models/Qwen3.5-VL").?);
@@ -5634,64 +5873,393 @@ test "qwen3_5 text preference recipes route to qwen autodiff planner" {
     try std.testing.expect(try shouldRunOptimizerBackedQwen2Grpo(grpo_recipe, "text-grpo"));
 }
 
-test "gemma4 lora recipe builds prepare bootstrap train plan" {
+test "gemma4 lora recipe builds disjoint prepare bootstrap train plan" {
     const recipe = Recipe{
         .recipe = "lora-sft",
         .model = .{ .path = "/models/gemma4", .family = "gemma4" },
-        .dataset = .{ .path = "/data/train.jsonl", .max_examples = 4 },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl", .max_examples = 4 },
         .adapter = .{ .rank = 4, .alpha = 8 },
         .optimizer = .{ .learning_rate = 0.0002, .epochs = 2 },
         .artifacts = .{ .root = "/tmp/out" },
+        .backend = "native",
     };
     const plan = try buildPlan(std.heap.page_allocator, recipe);
     defer freePlan(std.heap.page_allocator, plan);
-    try std.testing.expectEqual(@as(usize, 3), plan.steps.len);
+    try std.testing.expectEqual(@as(usize, 4), plan.steps.len);
     try std.testing.expectEqualStrings("prepare-gemma4-lora-inputs", plan.steps[0].argv[0]);
-    try std.testing.expectEqualStrings("bootstrap-gemma4-lora", plan.steps[1].argv[0]);
-    try std.testing.expectEqualStrings("train-eval-gemma4-lora-bundle", plan.steps[2].argv[0]);
+    try std.testing.expectEqualStrings("prepare-gemma4-lora-inputs", plan.steps[1].argv[0]);
+    try std.testing.expectEqualStrings("/data/eval.jsonl", plan.steps[1].argv[2]);
+    try std.testing.expectEqualStrings("bootstrap-gemma4-lora", plan.steps[2].argv[0]);
+    try std.testing.expectEqualStrings("train-eval-gemma4-lora-bundle", plan.steps[3].argv[0]);
+    try expectArgValue(plan.steps[3].argv, "--eval-prepared", plan.steps[1].argv[4]);
 }
 
-test "gemma4 lora recipe defaults to all-linear rank16 alpha32" {
+test "gemma4 lora recipe requires a held-out evaluation dataset" {
     const recipe = Recipe{
         .recipe = "lora-sft",
         .model = .{ .path = "/models/gemma4", .family = "gemma4" },
         .dataset = .{ .path = "/data/train.jsonl" },
         .artifacts = .{ .root = "/tmp/out" },
+        .backend = "native",
     };
-    const plan = try buildPlan(std.heap.page_allocator, recipe);
-    defer freePlan(std.heap.page_allocator, plan);
-    try std.testing.expectEqualStrings("16", plan.steps[1].argv[3]);
-    try std.testing.expectEqualStrings("32", plan.steps[1].argv[4]);
-    try std.testing.expectEqualStrings("--target-preset", plan.steps[1].argv[5]);
-    try std.testing.expectEqualStrings("all-linear", plan.steps[1].argv[6]);
+    try std.testing.expectError(error.MissingEvaluationDataset, buildPlan(std.heap.page_allocator, recipe));
 }
 
-test "gemma4 lora recipe passes explicit adapter knobs" {
+test "gemma4 lora recipe defaults to text-all-linear rank16 alpha32" {
     const recipe = Recipe{
         .recipe = "lora-sft",
         .model = .{ .path = "/models/gemma4", .family = "gemma4" },
-        .dataset = .{ .path = "/data/train.jsonl" },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl" },
+        .artifacts = .{ .root = "/tmp/out" },
+        .backend = "native",
+    };
+    const plan = try buildPlan(std.heap.page_allocator, recipe);
+    defer freePlan(std.heap.page_allocator, plan);
+    try std.testing.expectEqualStrings("16", plan.steps[2].argv[3]);
+    try std.testing.expectEqualStrings("32", plan.steps[2].argv[4]);
+    try std.testing.expectEqualStrings("--target-preset", plan.steps[2].argv[5]);
+    try std.testing.expectEqualStrings("text-all-linear", plan.steps[2].argv[6]);
+}
+
+test "gemma4 lora recipe wires the supported heldout example limit" {
+    const recipe = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl", .eval_max_examples = 3 },
+        .artifacts = .{ .root = "/tmp/out" },
+        .backend = "native",
+    };
+    const plan = try buildPlan(std.heap.page_allocator, recipe);
+    defer freePlan(std.heap.page_allocator, plan);
+    try expectArgValue(plan.steps[3].argv, "--eval-max-examples", "3");
+}
+
+test "gemma4 bootstrap presets execute through runPlan" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root);
+    const model_dir = try std.fs.path.join(allocator, &.{ root, "model" });
+    defer allocator.free(model_dir);
+    try std.Io.Dir.cwd().createDirPath(io, model_dir);
+
+    const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
+    defer allocator.free(config_path);
+    try writeTextFile(io, config_path,
+        \\{"model_type":"gemma4","text_config":{"hidden_size":3,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":3,"intermediate_size":4,"vocab_size":4}}
+    );
+
+    const checkpoint_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
+    defer allocator.free(checkpoint_path);
+    try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
+        .{ .name = "model.layers.0.self_attn.q_proj.weight", .shape = &.{ 2, 3 }, .data = try makeFilledF32(allocator, 6, 0.1) },
+        .{ .name = "model.layers.0.self_attn.k_proj.weight", .shape = &.{ 2, 3 }, .data = try makeFilledF32(allocator, 6, 0.2) },
+        .{ .name = "model.layers.0.self_attn.v_proj.weight", .shape = &.{ 2, 3 }, .data = try makeFilledF32(allocator, 6, 0.3) },
+        .{ .name = "model.layers.0.self_attn.o_proj.weight", .shape = &.{ 2, 3 }, .data = try makeFilledF32(allocator, 6, 0.4) },
+        .{ .name = "model.layers.0.mlp.gate_proj.weight", .shape = &.{ 2, 3 }, .data = try makeFilledF32(allocator, 6, 0.5) },
+        .{ .name = "model.layers.0.mlp.up_proj.weight", .shape = &.{ 2, 3 }, .data = try makeFilledF32(allocator, 6, 0.6) },
+        .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = &.{ 2, 3 }, .data = try makeFilledF32(allocator, 6, 0.7) },
+    });
+
+    const dataset_path = try std.fs.path.join(allocator, &.{ root, "train.jsonl" });
+    defer allocator.free(dataset_path);
+    try writeTextFile(io, dataset_path, "{}\n");
+
+    const cases = [_]struct {
+        name: []const u8,
+        requested_preset: ?[]const u8,
+        expected_preset: []const u8,
+        expected_target_count: usize,
+    }{
+        .{ .name = "default", .requested_preset = null, .expected_preset = "text-all-linear", .expected_target_count = 7 },
+        .{ .name = "peft-qv", .requested_preset = "peft-qv", .expected_preset = "peft-qv", .expected_target_count = 2 },
+    };
+
+    for (cases) |case| {
+        const case_root = try std.fs.path.join(allocator, &.{ root, case.name });
+        defer allocator.free(case_root);
+        const recipe = Recipe{
+            .recipe = "lora-sft",
+            .model = .{ .path = model_dir, .family = "gemma4" },
+            .dataset = .{ .path = dataset_path, .eval_path = dataset_path },
+            .adapter = .{ .rank = 1, .alpha = 2, .target_preset = case.requested_preset },
+            .artifacts = .{ .root = case_root },
+            .backend = "native",
+        };
+
+        var plan_arena = std.heap.ArenaAllocator.init(allocator);
+        defer plan_arena.deinit();
+        const generated_plan = try buildPlan(plan_arena.allocator(), recipe);
+        const bootstrap_plan = Plan{ .steps = generated_plan.steps[2..3] };
+        try std.testing.expectEqualStrings("--target-preset", bootstrap_plan.steps[0].argv[5]);
+        try std.testing.expectEqualStrings(case.expected_preset, bootstrap_plan.steps[0].argv[6]);
+
+        const manifest_path = try manifestPath(allocator, recipe);
+        defer allocator.free(manifest_path);
+        const training_config_path = try defaultArtifactPath(allocator, recipe, "training_config.json");
+        defer allocator.free(training_config_path);
+        const training_report_path = try defaultArtifactPath(allocator, recipe, "training_report.json");
+        defer allocator.free(training_report_path);
+        try runPlan(allocator, io, ".", recipe, bootstrap_plan, manifest_path, training_config_path, training_report_path);
+        try expectRunStatusFile(allocator, io, manifest_path, "succeeded");
+
+        const adapter_config_path = try std.fs.path.join(allocator, &.{ bootstrap_plan.steps[0].argv[2], gemma4.adapter_config_file_name });
+        defer allocator.free(adapter_config_path);
+        const raw = try readFileMax(allocator, io, adapter_config_path, 1024 * 1024);
+        defer allocator.free(raw);
+        const parsed = try std.json.parseFromSlice(struct {
+            target_preset: []const u8,
+            target_modules: []const []const u8,
+        }, allocator, raw, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case.expected_preset, parsed.value.target_preset);
+        try std.testing.expectEqual(case.expected_target_count, parsed.value.target_modules.len);
+    }
+}
+
+test "gemma4 lora recipe passes supported explicit adapter knobs" {
+    const recipe = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl" },
         .adapter = .{
             .target_modules = &.{ "q_proj", "v_proj" },
             .init_lora_weights = "default",
-            .use_dora = true,
         },
         .artifacts = .{ .root = "/tmp/out" },
+        .backend = "metal",
     };
     const plan = try buildPlan(std.heap.page_allocator, recipe);
     defer freePlan(std.heap.page_allocator, plan);
-    try std.testing.expectEqualStrings("--target-modules", plan.steps[1].argv[5]);
-    try std.testing.expectEqualStrings("q_proj,v_proj", plan.steps[1].argv[6]);
-    try std.testing.expectEqualStrings("--use-dora", plan.steps[1].argv[7]);
-    try std.testing.expectEqualStrings("--init-lora-weights", plan.steps[1].argv[8]);
-    try std.testing.expectEqualStrings("default", plan.steps[1].argv[9]);
+    try std.testing.expectEqualStrings("--target-modules", plan.steps[2].argv[5]);
+    try std.testing.expectEqualStrings("q_proj,v_proj", plan.steps[2].argv[6]);
+    try std.testing.expectEqualStrings("--init-lora-weights", plan.steps[2].argv[7]);
+    try std.testing.expectEqualStrings("default", plan.steps[2].argv[8]);
+}
+
+test "gemma4 recipe kinds fail closed when the requested training semantics are unavailable" {
+    const base = Recipe{
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl" },
+        .artifacts = .{ .root = "/tmp/out" },
+        .backend = "native",
+    };
+    var full_sft = base;
+    full_sft.recipe = "sft";
+    try std.testing.expectError(error.Gemma4FullSftNotYetSupported, buildPlan(std.heap.page_allocator, full_sft));
+
+    var qlora = base;
+    qlora.recipe = "qlora-sft";
+    try std.testing.expectError(error.Gemma4QLoRANotYetSupported, buildPlan(std.heap.page_allocator, qlora));
+}
+
+test "gemma4 lora recipe rejects options the trainer cannot honor" {
+    const base = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl" },
+        .artifacts = .{ .root = "/tmp/out" },
+        .backend = "native",
+    };
+
+    var recipe = base;
+    recipe.model.reference_path = "/models/reference";
+    try std.testing.expectError(error.UnsupportedGemma4ModelOption, buildPlan(std.heap.page_allocator, recipe));
+
+    recipe = base;
+    recipe.dataset.format = "messages";
+    try std.testing.expectError(error.UnsupportedGemma4DatasetOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.dataset.cache_path = "/tmp/cache";
+    try std.testing.expectError(error.UnsupportedGemma4DatasetOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.dataset.train_cache_path = "/tmp/train-cache";
+    try std.testing.expectError(error.UnsupportedGemma4DatasetOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.dataset.labels = "labels";
+    try std.testing.expectError(error.UnsupportedGemma4DatasetOption, buildPlan(std.heap.page_allocator, recipe));
+
+    recipe = base;
+    recipe.adapter = .{ .dropout = 0.05 };
+    try std.testing.expectError(error.UnsupportedGemma4AdapterOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.adapter = .{ .layer_name = "model.layers.0" };
+    try std.testing.expectError(error.UnsupportedGemma4AdapterOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.adapter = .{ .quantization = "nf4" };
+    try std.testing.expectError(error.UnsupportedGemma4AdapterOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.adapter = .{ .use_dora = true };
+    try std.testing.expectError(error.DoRAAutodiffNotYetSupported, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.adapter = .{ .init_lora_weights = "pissa" };
+    try std.testing.expectError(error.LoRAInitializerRequiresAdjustedBase, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.adapter = .{ .init_lora_weights = "eva" };
+    try std.testing.expectError(error.Gemma4RecipeInitializerStatsNotYetSupported, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.adapter = .{ .init_lora_weights = "lora-ga" };
+    try std.testing.expectError(error.Gemma4RecipeInitializerStatsNotYetSupported, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.adapter = .{ .rank = 0 };
+    try std.testing.expectError(error.InvalidLoRARank, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.adapter = .{ .alpha = 0 };
+    try std.testing.expectError(error.InvalidLoRAAlpha, buildPlan(std.heap.page_allocator, recipe));
+
+    recipe = base;
+    recipe.optimizer.weight_decay = 0;
+    try std.testing.expectError(error.UnsupportedGemma4OptimizerOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.optimizer.lr_scheduler = "cosine";
+    try std.testing.expectError(error.UnsupportedGemma4OptimizerOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.optimizer.warmup_steps = 10;
+    try std.testing.expectError(error.UnsupportedGemma4OptimizerOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.optimizer.warmup_ratio = 0.1;
+    try std.testing.expectError(error.UnsupportedGemma4OptimizerOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.optimizer.num_cycles = 1;
+    try std.testing.expectError(error.UnsupportedGemma4OptimizerOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.optimizer.max_steps = 100;
+    try std.testing.expectError(error.UnsupportedGemma4OptimizerOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.optimizer.micro_batch_size = 2;
+    try std.testing.expectError(error.UnsupportedGemma4OptimizerOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.optimizer.llrd_decay = 0.9;
+    try std.testing.expectError(error.UnsupportedGemma4OptimizerOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.optimizer.schedule_free = true;
+    try std.testing.expectError(error.UnsupportedGemma4OptimizerOption, buildPlan(std.heap.page_allocator, recipe));
+
+    recipe = base;
+    recipe.eval = .{ .every_epochs = 1 };
+    try std.testing.expectError(error.UnsupportedGemma4EvalOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.eval = .{ .batch_size = 2 };
+    try std.testing.expectError(error.UnsupportedGemma4EvalOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.eval = .{ .early_stopping_patience = 2 };
+    try std.testing.expectError(error.UnsupportedGemma4EvalOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.eval = .{ .improvement_threshold = 0.01 };
+    try std.testing.expectError(error.UnsupportedGemma4EvalOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.eval = .{ .backend = "metal" };
+    try std.testing.expectError(error.UnsupportedGemma4EvalOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.checkpoint = .{ .resume_path = "/tmp/checkpoint" };
+    try std.testing.expectError(error.UnsupportedGemma4CheckpointOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.checkpoint = .{ .every_epochs = 1 };
+    try std.testing.expectError(error.UnsupportedGemma4CheckpointOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.checkpoint = .{ .keep_last = 2 };
+    try std.testing.expectError(error.UnsupportedGemma4CheckpointOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.runtime = .{ .compiled_required = true };
+    try std.testing.expectError(error.UnsupportedGemma4RuntimeOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.runtime = .{ .graph_cache_capacity = 4 };
+    try std.testing.expectError(error.UnsupportedGemma4RuntimeOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.trainer = "surrogate";
+    try std.testing.expectError(error.UnsupportedGemma4Trainer, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.preference.beta = 0.1;
+    try std.testing.expectError(error.UnsupportedGemma4AlgorithmOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.grpo.group_size = 4;
+    try std.testing.expectError(error.UnsupportedGemma4AlgorithmOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.artifacts.materialized_dir = "/tmp/merged";
+    try std.testing.expectError(error.UnsupportedGemma4ArtifactOption, buildPlan(std.heap.page_allocator, recipe));
+    recipe = base;
+    recipe.artifacts.report_path = "/tmp/report.json";
+    try std.testing.expectError(error.UnsupportedGemma4ArtifactOption, buildPlan(std.heap.page_allocator, recipe));
+}
+
+test "gemma4 recipe keeps bootstrap and immutable training outputs distinct" {
+    const base = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl" },
+        .backend = "native",
+    };
+
+    var artifact_only = base;
+    artifact_only.artifacts = .{ .root = "/tmp/out", .adapter_dir = "/tmp/out/final-adapter" };
+    const plan = try buildPlan(std.heap.page_allocator, artifact_only);
+    defer freePlan(std.heap.page_allocator, plan);
+    try std.testing.expectEqualStrings("/tmp/out/adapter-bootstrap", plan.steps[2].argv[2]);
+    try std.testing.expectEqualStrings("/tmp/out/final-adapter", plan.steps[3].argv[4]);
+
+    var conflict = base;
+    conflict.adapter = .{ .path = "/tmp/out/same" };
+    conflict.artifacts = .{ .trained_adapter_dir = "/tmp/out/same" };
+    try std.testing.expectError(
+        error.Gemma4BootstrapAndTrainingOutputConflict,
+        buildPlan(std.heap.page_allocator, conflict),
+    );
+
+    var normalized_conflict = base;
+    normalized_conflict.adapter = .{ .path = "/tmp/out/seed/../same" };
+    normalized_conflict.artifacts = .{ .trained_adapter_dir = "/tmp/out/same" };
+    try std.testing.expectError(
+        error.Gemma4BootstrapAndTrainingOutputConflict,
+        buildPlan(std.heap.page_allocator, normalized_conflict),
+    );
+
+    var ancestor_conflict = base;
+    ancestor_conflict.adapter = .{ .path = "/tmp/out/seed" };
+    ancestor_conflict.artifacts = .{ .root = "/tmp/out", .trained_adapter_dir = "/tmp/out" };
+    try std.testing.expectError(
+        error.Gemma4BootstrapAndTrainingOutputConflict,
+        buildPlan(std.heap.page_allocator, ancestor_conflict),
+    );
+
+    var root_conflict = base;
+    root_conflict.adapter = .{ .path = "/tmp/seed-outside" };
+    root_conflict.artifacts = .{ .root = "/tmp/out", .trained_adapter_dir = "/tmp/out" };
+    try std.testing.expectError(
+        error.Gemma4OutputConflictsWithArtifactRoot,
+        buildPlan(std.heap.page_allocator, root_conflict),
+    );
+
+    var prepared_conflict = base;
+    prepared_conflict.adapter = .{ .path = "/tmp/seed-outside" };
+    prepared_conflict.artifacts = .{
+        .prepared_path = "/tmp/final/prepared.json",
+        .trained_adapter_dir = "/tmp/final",
+    };
+    try std.testing.expectError(
+        error.Gemma4OutputContainsPlannedArtifact,
+        buildPlan(std.heap.page_allocator, prepared_conflict),
+    );
+
+    var manifest_conflict = base;
+    manifest_conflict.adapter = .{ .path = "/tmp/seed-outside" };
+    manifest_conflict.artifacts = .{
+        .manifest_path = "/tmp/final/manifest.json",
+        .trained_adapter_dir = "/tmp/final",
+    };
+    try std.testing.expectError(
+        error.Gemma4OutputContainsPlannedArtifact,
+        buildPlan(std.heap.page_allocator, manifest_conflict),
+    );
 }
 
 test "gemma4 lora recipe rejects conflicting target selectors" {
     const recipe = Recipe{
         .recipe = "lora-sft",
         .model = .{ .path = "/models/gemma4", .family = "gemma4" },
-        .dataset = .{ .path = "/data/train.jsonl" },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl" },
         .adapter = .{
             .target_preset = "all-linear",
             .target_modules = &.{"q_proj"},
@@ -5699,6 +6267,16 @@ test "gemma4 lora recipe rejects conflicting target selectors" {
         .artifacts = .{ .root = "/tmp/out" },
     };
     try std.testing.expectError(error.ConflictingLoRATargetSelection, buildPlan(std.heap.page_allocator, recipe));
+}
+
+test "gemma4 lora recipe requires an explicit execution backend" {
+    const recipe = Recipe{
+        .recipe = "lora-sft",
+        .model = .{ .path = "/models/gemma4", .family = "gemma4" },
+        .dataset = .{ .path = "/data/train.jsonl", .eval_path = "/data/eval.jsonl" },
+        .artifacts = .{ .root = "/tmp/out" },
+    };
+    try std.testing.expectError(error.MissingBackend, buildPlan(std.heap.page_allocator, recipe));
 }
 
 test "qwen adapter target presets map to supported module sets" {
@@ -6019,16 +6597,15 @@ test "vlm retrieval routes colqwen2 prepared inputs" {
     try std.testing.expectEqualStrings("/data/colqwen-examples.jsonl", plan.steps[0].argv[3]);
 }
 
-test "sft dpo grpo recipes build runnable plans" {
+test "gemma4 full sft fails closed while dpo and grpo build runnable plans" {
     const base = Recipe{
         .model = .{ .path = "/models/gemma4", .family = "gemma4" },
         .dataset = .{ .path = "/data/train.jsonl" },
+        .backend = "native",
     };
     var sft = base;
     sft.recipe = "sft";
-    const sft_plan = try buildPlan(std.heap.page_allocator, sft);
-    defer freePlan(std.heap.page_allocator, sft_plan);
-    try std.testing.expectEqualStrings("prepare-gemma4-lora-inputs", sft_plan.steps[0].argv[0]);
+    try std.testing.expectError(error.Gemma4FullSftNotYetSupported, buildPlan(std.heap.page_allocator, sft));
 
     var dpo = base;
     dpo.recipe = "dpo";
@@ -6072,6 +6649,62 @@ test "fast smoke resolves checked-in testdata from current package cwd" {
     const path = try resolveCwdPath(allocator, std.testing.io, "pkg/inference/testdata/recipe_gemma4_lora.json");
     defer allocator.free(path);
     try std.testing.expect(cwdPathExists(std.testing.io, path));
+}
+
+test "fast smoke result cleanup handles an error after an initialized prefix" {
+    const Harness = struct {
+        fn makeResult(allocator: std.mem.Allocator, index: usize) !FastSmokeCaseResult {
+            const manifest_path = try std.fmt.allocPrint(allocator, "/tmp/manifest-{d}.json", .{index});
+            errdefer allocator.free(manifest_path);
+            const training_report_path = try std.fmt.allocPrint(allocator, "/tmp/report-{d}.json", .{index});
+            return .{
+                .name = "case",
+                .recipe_path = "recipe.json",
+                .mode = .execute,
+                .status = .succeeded,
+                .manifest_path = manifest_path,
+                .training_report_path = training_report_path,
+            };
+        }
+
+        fn failAfter(allocator: std.mem.Allocator, initialized_before_error: usize) !void {
+            var results = try allocator.alloc(FastSmokeCaseResult, initialized_before_error + 1);
+            var initialized_results: usize = 0;
+            defer freeFastSmokeResults(allocator, results, initialized_results);
+            while (initialized_results < initialized_before_error) : (initialized_results += 1) {
+                results[initialized_results] = try makeResult(allocator, initialized_results);
+            }
+            return error.InjectedFastSmokeFailure;
+        }
+    };
+
+    try std.testing.expectError(error.InjectedFastSmokeFailure, Harness.failAfter(std.testing.allocator, 2));
+}
+
+test "fast smoke fixture resolution supports repo root and inference directory" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "zig/pkg/inference/testdata");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "zig/pkg/inference/testdata/recipe.json",
+        .data = "{}",
+    });
+
+    const requested = "pkg/inference/testdata/recipe.json";
+    const from_repo_root = try resolvePathFromDir(allocator, io, tmp.dir, requested);
+    defer allocator.free(from_repo_root);
+    try std.testing.expectEqualStrings("zig/pkg/inference/testdata/recipe.json", from_repo_root);
+    try std.testing.expect(dirPathExists(tmp.dir, io, from_repo_root));
+
+    var inference_dir = try tmp.dir.openDir(io, "zig/pkg/inference", .{});
+    defer inference_dir.close(io);
+    const from_inference_dir = try resolvePathFromDir(allocator, io, inference_dir, requested);
+    defer allocator.free(from_inference_dir);
+    try std.testing.expectEqualStrings("testdata/recipe.json", from_inference_dir);
+    try std.testing.expect(dirPathExists(inference_dir, io, from_inference_dir));
 }
 
 test "direct command adapter registry covers reranker family steps" {

@@ -30,6 +30,14 @@ const tests = [_]common.TestSpec{
         .native_link = .default,
     },
     .{
+        .step_name = "test-gemma4-finetune",
+        .root_source_file = "src/gemma4_finetune_test_root.zig",
+        .description = "Run focused Gemma4 finetune data, adapter, recipe, and autodiff regressions",
+        .imports = &.{ .antfly_image, .antfly_platform, .build_options, .jinja, .ml, .onnx_graph, .pjrt, .protobuf, .inference_audio, .inference_hf_tokenizer, .inference_linalg, .inference_tokenizer },
+        .native_link = .default,
+        .filters = &.{ "gemma4", "gemma graph", "buildForwardGraph" },
+    },
+    .{
         .step_name = "test-gliner2-data",
         .root_source_file = "src/finetune/test/test_gliner2_data.zig",
         .description = "Run isolated GLiNER2 finetune data tests",

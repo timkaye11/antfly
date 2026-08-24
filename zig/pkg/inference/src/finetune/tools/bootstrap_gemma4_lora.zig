@@ -34,6 +34,7 @@ pub fn main(init: std.process.Init) !void {
     var base_model_name_or_path: ?[]const u8 = null;
     var layer_name: ?[]const u8 = null;
     var target_preset: ?peft.TargetPreset = null;
+    var gemma4_target_preset: ?finetune.Gemma4LoRATargetPreset = null;
     var target_modules: ?[]const []const u8 = null;
     defer if (target_modules) |modules| allocator.free(modules);
     var use_dora = false;
@@ -56,7 +57,11 @@ pub fn main(init: std.process.Init) !void {
             layer_name = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--target-preset")) {
             const preset_name = args.next() orelse return usageError();
-            target_preset = peft.parseTargetPreset(preset_name) orelse return usageError();
+            if (finetune.parseGemma4LoRATargetPreset(preset_name)) |preset| {
+                gemma4_target_preset = preset;
+            } else {
+                target_preset = peft.parseTargetPreset(preset_name) orelse return usageError();
+            }
         } else if (std.mem.eql(u8, arg, "--target-modules")) {
             if (target_modules != null) return usageError();
             target_modules = try parseTargetModules(allocator, args.next() orelse return usageError());
@@ -81,8 +86,10 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    if (target_modules != null and target_preset != null) return usageError();
-    const effective_target_preset = if (target_modules == null) target_preset orelse .all_linear else null;
+    const selection_count = @intFromBool(target_modules != null) +
+        @intFromBool(target_preset != null) +
+        @intFromBool(gemma4_target_preset != null);
+    if (selection_count > 1) return usageError();
 
     var summary = try finetune.bootstrapLoRABundle(allocator, model_dir, out_dir, .{
         .rank = rank,
@@ -90,7 +97,8 @@ pub fn main(init: std.process.Init) !void {
         .base_model_name_or_path = base_model_name_or_path,
         .layer_name = layer_name,
         .target_modules = target_modules,
-        .target_preset = effective_target_preset,
+        .target_preset = target_preset,
+        .gemma4_target_preset = gemma4_target_preset,
         .use_dora = use_dora,
         .init_lora_weights = init_lora_weights,
         .eva_stats_path = eva_stats_path,
@@ -110,11 +118,11 @@ fn usageError() error{InvalidArguments} {
     std.debug.print(
         \\usage: bootstrap-gemma4-lora <model_dir> <out_dir> [rank] [alpha] [base_model_name_or_path]
         \\       [--rank <n>] [--alpha <float>]
-        \\       [--layer-name <substring>] [--target-preset all-linear|attention-only|mlp-only|moe-experts]
+        \\       [--layer-name <substring>] [--target-preset text-all-linear|peft-qv|all-linear|attention-only|mlp-only]
         \\       [--target-modules q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]
         \\       [--use-dora] [--init-lora-weights default|pissa|eva|lora-ga|loftq|loftq-nf4]
         \\       [--eva-stats <safetensors>] [--lora-ga-stats <safetensors>]
-        \\example: bootstrap-gemma4-lora /tmp/gemma4-base /tmp/gemma4-lora 16 32 google/gemma-4 --target-preset all-linear
+        \\example: bootstrap-gemma4-lora /tmp/gemma4-base /tmp/gemma4-lora 16 32 google/gemma-4 --target-preset text-all-linear
         \\EVA stats tensors are named <base_tensor>.eva_activation_covariance with shape [in,in].
         \\LoRA-GA stats tensors are named <base_tensor>.lora_ga_gradient with shape [out,in].
         \\

@@ -1783,6 +1783,12 @@ pub const MetalPartitionExecutor = struct {
                     // values; protecting them would only widen the walk.
                     if (input_node.op == .parameter) continue;
                     if (isPreMaterializedConstantOp(input_node.op)) continue;
+                    // A small test model can make a weight transpose fit the
+                    // scalar-tail element bound. It is still linear setup,
+                    // not scalar loss plumbing: leave it unprotected so the
+                    // normal consumer-checked deferred-linear route can use
+                    // the stored weight directly (including native BF16).
+                    if (transposeSourceIsWeightParameter(graph, input_id)) continue;
                     const elems = input_node.output_shape.numElements() orelse continue;
                     if (elems > graph_output_scalar_tail_max_elems) continue;
                     elision_protected_nodes[input_index] = true;
@@ -7824,6 +7830,27 @@ const GroupedHeadDotCandidate = struct {
     rhs_contract_axis: u32,
 };
 
+fn publishLoraLinearValue(
+    cb: *const ComputeBackend,
+    values: []?CT,
+    value_device: []DeviceId,
+    node_id: NodeId,
+    device_id: DeviceId,
+    value: CT,
+) void {
+    const index: usize = @intCast(node_id);
+    if (values[index]) |previous| {
+        if (previous != value) {
+            const aliased = for (values, 0..) |maybe, other_index| {
+                if (other_index != index and maybe == previous) break true;
+            } else false;
+            if (!aliased) cb.free(previous);
+        }
+    }
+    values[index] = value;
+    value_device[index] = device_id;
+}
+
 fn executeLoraLinearPattern(
     graph: *const Graph,
     cb: *const ComputeBackend,
@@ -7841,8 +7868,7 @@ fn executeLoraLinearPattern(
             error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return false,
             else => return err,
         };
-        values[@intCast(dropout_mul_id)] = masked;
-        value_device[@intCast(dropout_mul_id)] = device_id;
+        publishLoraLinearValue(cb, values, value_device, dropout_mul_id, device_id, masked);
         break :blk masked;
     } else valueFor(values, pattern.lora_input_id) orelse return false;
     const lora_a = valueFor(values, pattern.lora_a_id) orelse return false;
@@ -7862,22 +7888,18 @@ fn executeLoraLinearPattern(
             .out_dim = pattern.out_dim,
             .scale = scale_f32,
         })) |fused| {
-            values[@intCast(pattern.after_a_id)] = fused.after_a;
-            value_device[@intCast(pattern.after_a_id)] = device_id;
-            values[@intCast(pattern.after_b_id)] = fused.after_b;
-            value_device[@intCast(pattern.after_b_id)] = device_id;
+            publishLoraLinearValue(cb, values, value_device, pattern.after_a_id, device_id, fused.after_a);
+            publishLoraLinearValue(cb, values, value_device, pattern.after_b_id, device_id, fused.after_b);
             if (pattern.populate_scaled) {
                 const scaled = cb.multiply(fused.after_b, scale) catch |err| switch (err) {
                     error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
                     else => return err,
                 };
                 if (scaled) |scaled_tensor| {
-                    values[@intCast(pattern.scaled_id)] = scaled_tensor;
-                    value_device[@intCast(pattern.scaled_id)] = device_id;
+                    publishLoraLinearValue(cb, values, value_device, pattern.scaled_id, device_id, scaled_tensor);
                 }
             }
-            values[@intCast(pattern.add_id)] = fused.output;
-            value_device[@intCast(pattern.add_id)] = device_id;
+            publishLoraLinearValue(cb, values, value_device, pattern.add_id, device_id, fused.output);
 
             if (stats) |s| {
                 recordMetalGraphRegion(s, .ffn, 4);
@@ -7900,15 +7922,13 @@ fn executeLoraLinearPattern(
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return false,
         else => return err,
     };
-    values[@intCast(pattern.after_a_id)] = after_a;
-    value_device[@intCast(pattern.after_a_id)] = device_id;
+    publishLoraLinearValue(cb, values, value_device, pattern.after_a_id, device_id, after_a);
 
     const after_b = cb.linearNoBias(after_a, lora_b, pattern.rows, pattern.rank, pattern.out_dim) catch |err| switch (err) {
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return false,
         else => return err,
     };
-    values[@intCast(pattern.after_b_id)] = after_b;
-    value_device[@intCast(pattern.after_b_id)] = device_id;
+    publishLoraLinearValue(cb, values, value_device, pattern.after_b_id, device_id, after_b);
 
     const output = scaled_add: {
         if (try cb.decoderRuntimeApplyScaledAddScale(&.{
@@ -7923,8 +7943,7 @@ fn executeLoraLinearPattern(
                     error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => break :scaled_add out,
                     else => return err,
                 };
-                values[@intCast(pattern.scaled_id)] = scaled;
-                value_device[@intCast(pattern.scaled_id)] = device_id;
+                publishLoraLinearValue(cb, values, value_device, pattern.scaled_id, device_id, scaled);
             }
             break :scaled_add out;
         }
@@ -7934,8 +7953,7 @@ fn executeLoraLinearPattern(
             error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return false,
             else => return err,
         };
-        values[@intCast(pattern.scaled_id)] = scaled;
-        value_device[@intCast(pattern.scaled_id)] = device_id;
+        publishLoraLinearValue(cb, values, value_device, pattern.scaled_id, device_id, scaled);
 
         const out = cb.add(base, scaled) catch |err| switch (err) {
             error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => return false,
@@ -7943,8 +7961,7 @@ fn executeLoraLinearPattern(
         };
         break :fallback out;
     };
-    values[@intCast(pattern.add_id)] = output;
-    value_device[@intCast(pattern.add_id)] = device_id;
+    publishLoraLinearValue(cb, values, value_device, pattern.add_id, device_id, output);
 
     if (stats) |s| {
         recordMetalGraphRegion(s, .ffn, 4);
@@ -14315,7 +14332,9 @@ fn executeRuntimeConvertDType(
     if (inputs.len != 1) return null;
     const input = valueFor(values, inputs[0]) orelse return null;
     if (graph.node(inputs[0]).output_shape.dtype == attrs.target) return input;
-    return cb.tryConvertDType(input, attrs.target) catch |err| switch (err) {
+    const input_resident = try temporaryMetalResidentValue(cb, input);
+    defer input_resident.deinit(cb);
+    return cb.tryConvertDType(input_resident.value, attrs.target) catch |err| switch (err) {
         error.UnsupportedOperation,
         error.UnsupportedPrimitiveOp,
         error.UnsupportedTensorType,
@@ -14667,7 +14686,7 @@ fn executeRuntimeDotGeneralHinted(
         if (attrs.num_contracting != 1 or attrs.num_batch != 0) break :try_hint;
         const lhs = valueFor(values, inputs[0]) orelse break :try_hint;
         const rhs = valueFor(values, inputs[1]) orelse break :try_hint;
-        if (!isMetalDeviceResident(cb, lhs) or !isMetalDeviceResident(cb, rhs)) break :try_hint;
+        if (!isMetalDeviceResident(cb, lhs)) break :try_hint;
         const lhs_shape = graph.node(inputs[0]).output_shape;
         const rhs_shape = graph.node(inputs[1]).output_shape;
         if (lhs_shape.rank() != 2 or rhs_shape.rank() != 2) break :try_hint;
@@ -14679,6 +14698,10 @@ fn executeRuntimeDotGeneralHinted(
         const rhs_k = positiveI64ToUsize(rhs_shape.dim(@intCast(rc))) orelse break :try_hint;
         const n = positiveI64ToUsize(rhs_shape.dim(@intCast(1 - @as(usize, rc)))) orelse break :try_hint;
         if (k != rhs_k) break :try_hint;
+        if (rc == 0) {
+            if (try metal_compute_mod.MetalCompute.nativeBf16LinearBackwardInputInto(cb, lhs, rhs, m, n, k, hint)) |out| return out;
+        }
+        if (!isMetalDeviceResident(cb, rhs)) break :try_hint;
         if (try metal_compute_mod.MetalCompute.dotGeneral2DInto(cb, lhs, rhs, m, n, k, rc, hint)) |out| return out;
     }
     return executeRuntimeDotGeneral(graph, cb, values, inputs, attrs, op_plan);
@@ -14705,6 +14728,28 @@ fn executeRuntimeDotGeneral(
         return linear_output;
     }
     const rhs = valueFor(values, inputs[1]) orelse return null;
+    if (attrs.num_contracting == 1 and
+        attrs.num_batch == 0 and
+        lhs_shape.len == 2 and
+        rhs_shape.len == 2 and
+        lhs_contracting[0] == 1 and
+        rhs_contracting[0] == 0)
+    {
+        const rows = positiveI64ToUsize(lhs_shape[0]) orelse return null;
+        const forward_out_dim = positiveI64ToUsize(lhs_shape[1]) orelse return null;
+        const rhs_out_dim = positiveI64ToUsize(rhs_shape[0]) orelse return null;
+        const forward_in_dim = positiveI64ToUsize(rhs_shape[1]) orelse return null;
+        if (forward_out_dim == rhs_out_dim) {
+            if (try metal_compute_mod.MetalCompute.nativeBf16LinearBackwardInput(
+                cb,
+                lhs,
+                rhs,
+                rows,
+                forward_in_dim,
+                forward_out_dim,
+            )) |output| return output;
+        }
+    }
     if (op_plan != null and attrs.num_contracting == 1 and attrs.num_batch == 0 and lhs_shape.len == 2 and rhs_shape.len == 2 and lhs_contracting[0] == 1 and rhs_contracting[0] == 1) {
         const rows = positiveI64ToUsize(lhs_shape[0]) orelse return null;
         const in_dim = positiveI64ToUsize(lhs_shape[1]) orelse return null;
@@ -16553,10 +16598,7 @@ fn valueReferencedAfterBoundary(
     }
     if (boundary_pos + 1 >= node_ids.len) return false;
     for (node_ids[boundary_pos + 1 ..]) |future_id| {
-        const future = graph.node(future_id);
-        for (future.getInputs()) |input_id| {
-            if (input_id == value_id) return true;
-        }
+        if (nodeReferencesValueDirectlyOrThroughDeferredWeightTranspose(graph, future_id, value_id)) return true;
     }
     return false;
 }
@@ -16572,10 +16614,23 @@ fn valueReferencedAtOrAfterPosition(
     }
     if (start_pos >= node_ids.len) return false;
     for (node_ids[start_pos..]) |future_id| {
-        const future = graph.node(future_id);
-        for (future.getInputs()) |input_id| {
-            if (input_id == value_id) return true;
-        }
+        if (nodeReferencesValueDirectlyOrThroughDeferredWeightTranspose(graph, future_id, value_id)) return true;
+    }
+    return false;
+}
+
+fn nodeReferencesValueDirectlyOrThroughDeferredWeightTranspose(
+    graph: *const Graph,
+    node_id: NodeId,
+    value_id: NodeId,
+) bool {
+    const node = graph.node(node_id);
+    for (node.getInputs()) |input_id| {
+        if (input_id == value_id) return true;
+        if (input_id == null_node or input_id >= graph.nodeCount()) continue;
+        if (!transposeSourceIsWeightParameter(graph, input_id)) continue;
+        if (!linearDotConsumesTranspose(graph, node_id, input_id)) continue;
+        if (sourceFromSimpleTranspose(graph, input_id) == value_id) return true;
     }
     return false;
 }
@@ -16788,6 +16843,78 @@ test "metal partition executor computes frame chunk boundary positions" {
     try std.testing.expectEqual(@as(?usize, 7), currentFrameChunkBoundaryPos(10, 4, 4, 0));
     try std.testing.expectEqual(@as(?usize, 9), currentFrameChunkBoundaryPos(10, 8, 4, 0));
     try std.testing.expectEqual(@as(?usize, null), currentFrameChunkBoundaryPos(10, 0, 0, 0));
+}
+
+test "metal partition executor lora linear replaces an existing internal value without leaking" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 1;
+    const in_dim: usize = 2;
+    const rank: usize = 1;
+    const out_dim: usize = 2;
+    const input_id = try b.parameter("input", ml.graph.Shape.init(.f32, &.{ rows, in_dim }));
+    const base_weight_id = try b.parameter("base.weight", ml.graph.Shape.init(.f32, &.{ out_dim, in_dim }));
+    const base_id = try b.linearNoBias(input_id, base_weight_id, rows, in_dim, out_dim);
+    const lora_a_id = try b.parameter("base.weight.lora_A", ml.graph.Shape.init(.f32, &.{ rank, in_dim }));
+    const after_a_id = try b.linearNoBias(input_id, lora_a_id, rows, in_dim, rank);
+    const lora_b_id = try b.parameter("base.weight.lora_B", ml.graph.Shape.init(.f32, &.{ out_dim, rank }));
+    const after_b_id = try b.linearNoBias(after_a_id, lora_b_id, rows, rank, out_dim);
+    const scale_id = try b.scalarConst(.f32, 0.5);
+    const scaled_id = try b.mul(after_b_id, scale_id);
+    const add_id = try b.add(base_id, scaled_id);
+    try g.markOutput(add_id);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const skipped_nodes = try allocator.alloc(bool, @intCast(g.nodeCount()));
+    defer allocator.free(skipped_nodes);
+    @memset(skipped_nodes, false);
+    const pattern = matchLoraLinearPattern(&g, &.{add_id}, 0, reachable, skipped_nodes) orelse
+        return error.ExpectedLoraLinearPattern;
+
+    var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitEmptyNativeWeightStore(&weight_store, allocator);
+    var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    var cb = compute.computeBackend();
+
+    const values = try allocator.alloc(?CT, @intCast(g.nodeCount()));
+    defer allocator.free(values);
+    @memset(values, null);
+    const value_device = try allocator.alloc(DeviceId, @intCast(g.nodeCount()));
+    defer allocator.free(value_device);
+    @memset(value_device, 0);
+
+    const input = try cb.fromFloat32Shape(&.{ 2.0, -1.0 }, &.{ rows, in_dim });
+    defer cb.free(input);
+    const base = try cb.fromFloat32Shape(&.{ 10.0, 20.0 }, &.{ rows, out_dim });
+    defer cb.free(base);
+    const lora_a = try cb.fromFloat32Shape(&.{ 3.0, 4.0 }, &.{ rank, in_dim });
+    defer cb.free(lora_a);
+    const lora_b = try cb.fromFloat32Shape(&.{ 5.0, 6.0 }, &.{ out_dim, rank });
+    defer cb.free(lora_b);
+    const scale = try cb.fromFloat32Shape(&.{0.5}, &.{});
+    defer cb.free(scale);
+    const stale_after_a = try cb.fromFloat32Shape(&.{123.0}, &.{ rows, rank });
+
+    values[@intCast(input_id)] = input;
+    values[@intCast(base_id)] = base;
+    values[@intCast(lora_a_id)] = lora_a;
+    values[@intCast(lora_b_id)] = lora_b;
+    values[@intCast(scale_id)] = scale;
+    values[@intCast(after_a_id)] = stale_after_a;
+
+    try std.testing.expect(try executeLoraLinearPattern(&g, &cb, values, value_device, 0, null, pattern));
+    defer for ([_]NodeId{ after_a_id, after_b_id, scaled_id, add_id }) |node_id| {
+        if (values[@intCast(node_id)]) |value| cb.free(value);
+    };
+
+    try std.testing.expect(values[@intCast(after_a_id)].? != stale_after_a);
+    const output = try cb.toFloat32(values[@intCast(add_id)].?, allocator);
+    defer allocator.free(output);
+    try std.testing.expectEqualSlices(f32, &.{ 15.0, 26.0 }, output);
 }
 
 test "metal partition executor consumes buffer plan and evaluates partition" {
@@ -18705,6 +18832,60 @@ test "metal partition executor chunk-safe transpose defer is limited to weight p
     try std.testing.expect(transposeSourceIsWeightParameter(&g, weight_t));
     try std.testing.expect(shouldDeferTransposeForLinearDot(&g, input_like_t, reachable, last_use));
     try std.testing.expect(!transposeSourceIsWeightParameter(&g, input_like_t));
+}
+
+test "metal partition executor keeps deferred weight source live across forced chunk boundary" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const rows: usize = 2;
+    const in_dim: usize = 3;
+    const out_dim: usize = 4;
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ rows, in_dim }));
+    const weight = try b.parameter("encoder.layer.0.output.dense.weight", ml.graph.Shape.init(.f32, &.{ out_dim, in_dim }));
+    const weight_t = try b.transpose(weight, &.{ 1, 0 });
+    const intervening = try b.add(x, x);
+    const dot = try g.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 0,
+        } },
+        .output_shape = ml.graph.Shape.init(.f32, &.{ rows, out_dim }),
+        .inputs = .{ x, weight_t, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(dot);
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    const node_ids = [_]NodeId{ x, weight, weight_t, intervening, dot };
+    const transpose_pos: usize = 2;
+    const boundary_pos = currentFrameChunkBoundaryPos(node_ids.len, transpose_pos, 2, 0) orelse
+        return error.ExpectedFrameChunkBoundary;
+    try std.testing.expectEqual(@as(usize, 3), boundary_pos);
+    try std.testing.expect(shouldDeferTransposeForLinearDot(&g, weight_t, reachable, last_use));
+    try std.testing.expect(transposeSourceIsWeightParameter(&g, weight_t));
+    try std.testing.expect(!deferredProducerConsumerStaysInFrameChunk(
+        &node_ids,
+        transpose_pos,
+        weight_t,
+        2,
+        0,
+        last_use,
+    ));
+    try std.testing.expect(valueReferencedAfterBoundary(&g, &node_ids, boundary_pos, weight));
+    try std.testing.expect(valueReferencedAfterBoundary(&g, &node_ids, boundary_pos, weight_t));
+    try std.testing.expect(!valueReferencedAfterBoundary(&g, &node_ids, boundary_pos + 1, weight));
+    try std.testing.expect(valueReferencedAtOrAfterPosition(&g, &node_ids, boundary_pos + 1, weight));
 }
 
 test "metal partition executor rank adapter backward pre-skips safe internal transposes" {
@@ -21413,6 +21594,141 @@ test "metal partition executor resident gqa attention uses command path" {
     const raw = try cb.toFloat32(values[out_index].?, allocator);
     defer allocator.free(raw);
     try std.testing.expectEqualSlices(f32, &.{ 5.0, 6.0, 7.0, 8.0 }, raw);
+}
+
+test "metal partition executor routes lazy native BF16 backward input without fallback" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const rows: usize = 2;
+    const in_dim: usize = 4;
+    const out_dim: usize = 3;
+    const weight_name = "model.layers.0.self_attn.q_proj.weight";
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+    const output_grad_id = try b.parameter("output_grad", ml.graph.Shape.init(.f32, &.{ rows, out_dim }));
+    const weight_id = try b.parameter(weight_name, ml.graph.Shape.init(.f32, &.{ out_dim, in_dim }));
+    const input_grad_id = try b.matmul(output_grad_id, weight_id);
+    try g.markOutput(input_grad_id);
+
+    const descriptor_seeds = try partition_mod.allocTensorDescriptorSeeds(allocator, &g);
+    defer allocator.free(descriptor_seeds);
+    try partition_mod.seedAllUploadableResidency(descriptor_seeds, &g, .metal, 0);
+    var diagnostics = partition_mod.CapabilityDiagnostics{};
+    const caps = [_]partition_mod.Capability{
+        .{
+            .backend = .metal,
+            .priority = 10,
+            .supports = &metal_capabilities.supportsMetalEagerGraph,
+            .decide = &metal_capabilities.decideMetalEagerGraph,
+        },
+        .{ .backend = .native, .priority = 0, .supports = &partition_mod.supportsAll, .decide = &partition_mod.decideNative },
+    };
+    var partition_plan = try partition_mod.partitionWithOptions(allocator, &g, &caps, .{
+        .tensor_descs = descriptor_seeds,
+        .diagnostics = &diagnostics,
+    });
+    defer partition_plan.deinit();
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.count(.unsupported_op));
+    for (partition_plan.partitions) |part| try std.testing.expectEqual(contracts.BackendKind.metal, part.backend);
+
+    var buffer_plan = try buffer_plan_mod.build(allocator, &g, &partition_plan, .{});
+    defer buffer_plan.deinit();
+    try buffer_plan.validate(&g, &partition_plan);
+
+    var weight_words = [_]u16{
+        0x3f80, 0x4000, 0x0000, 0xbf80,
+        0x0000, 0x3f80, 0x4040, 0x4000,
+        0x4000, 0xbf80, 0x3f80, 0x3f00,
+    };
+    var weight_shape = [_]i64{ out_dim, in_dim };
+    var weight_store = initEmptyMetalWeightStore(allocator);
+    defer deinitEmptyMetalWeightStore(&weight_store, allocator);
+    try weight_store.lazy_weights.put(allocator, weight_name, .{
+        .tensor_ref = undefined,
+        .host_loaded = .{ .tensor = .{
+            .data = std.mem.sliceAsBytes(&weight_words),
+            .dtype = .bf16,
+            .shape = &weight_shape,
+            .name = weight_name,
+            .allocator = allocator,
+            .owns_data = false,
+            .owns_shape = false,
+        } },
+        .active_tier = .host,
+        .loaded_bytes = @sizeOf(@TypeOf(weight_words)),
+    });
+
+    var metal_compute = try metal_compute_mod.MetalCompute.init(allocator, &weight_store, null);
+    defer metal_compute.deinit();
+    var cb = metal_compute.computeBackend();
+    if (!cb.decoderRuntimeReady()) return error.SkipZigTest;
+
+    const count: usize = @intCast(g.nodeCount());
+    const values = try allocator.alloc(?CT, count);
+    defer allocator.free(values);
+    @memset(values, null);
+    const value_device = try allocator.alloc(DeviceId, count);
+    defer allocator.free(value_device);
+    @memset(value_device, 0);
+
+    const output_grad_data = [_]f32{ 1, 2, -1, 0.5, -2, 3 };
+    const output_grad_host = try cb.fromFloat32Shape(&output_grad_data, &.{ rows, out_dim });
+    defer cb.free(output_grad_host);
+    const output_grad = (try makeMetalDeviceResident(&cb, output_grad_host)) orelse return error.SkipZigTest;
+    defer cb.free(output_grad);
+    values[@intCast(output_grad_id)] = output_grad;
+
+    const reachable = try interpreter.computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try interpreter.computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+
+    const runtime_before = cb.debugTimingSnapshot().provider;
+    var exec_stats: PartitionExecutor.ExecutionStats = .{};
+    const partition_index = partition_plan.node_assignment[input_grad_id];
+    var exec = MetalPartitionExecutor.initBorrowed(allocator, &g, &cb);
+    try exec.partitionExecutor().execute(values, value_device, partition_plan.partitions[partition_index].node_ids, 0, .{
+        .allocator = allocator,
+        .graph = &g,
+        .backend = &cb,
+        .options = .{
+            .runtime_inputs = &.{.{ .node_id = output_grad_id, .value = output_grad }},
+            .preserve_runtime_input_residency = true,
+        },
+        .reachable = reachable,
+        .last_use = last_use,
+        .partition_plan = &partition_plan,
+        .buffer_plan = &buffer_plan,
+        .materialize_boundary_outputs = false,
+        .stats = &exec_stats,
+    });
+
+    const input_grad = values[@intCast(input_grad_id)].?;
+    defer cb.free(input_grad);
+    const runtime_after = cb.debugTimingSnapshot().provider;
+    try std.testing.expect(isMetalDeviceResident(&cb, input_grad));
+    try std.testing.expectEqual(runtime_before.decoder_runtime_prepare_linear_calls + 1, runtime_after.decoder_runtime_prepare_linear_calls);
+    try std.testing.expectEqual(@as(u64, 1), exec_stats.backend_command_dispatches);
+    try std.testing.expectEqual(@as(u64, 1), exec_stats.descriptor_materializations);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.interpreter_fallbacks);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.graph_region_fallbacks);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.runtime_region_fallbacks);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.host_materialized_command_outputs);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.host_materialized_interpreter_outputs);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.host_materialized_pre_materialized_constant_outputs);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.host_materialized_runtime_region_outputs);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.host_materialized_unattributed_outputs);
+    try std.testing.expectEqual(exec_stats.host_materialized_parameter_outputs, exec_stats.host_materialized_outputs);
+    try std.testing.expectEqual(@as(u64, 0), exec_stats.boundary_output_materializations);
+
+    const actual = try cb.toFloat32(input_grad, allocator);
+    defer allocator.free(actual);
+    const expected = [_]f32{ -1, 5, 5, 2.5, 6.5, -4, -3, -3 };
+    for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-3);
 }
 
 fn putTestQuantizedWeight(

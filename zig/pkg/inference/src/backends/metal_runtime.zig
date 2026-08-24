@@ -2492,6 +2492,37 @@ fn quantizedEmbeddingRows(storage: *const QuantizedStorage, dim: usize) ?usize {
     return rows_from_shape;
 }
 
+fn prepareNativeBf16EmbeddingTable(
+    runtime: *RawMetalDecodeRuntime,
+    bytes: []const u8,
+    mmap_source_bytes: ?[]const u8,
+    expected_bytes: usize,
+    rows: usize,
+    dim: usize,
+) bool {
+    if (mmap_source_bytes) |mapped| {
+        if (mappedDenseRawSpan(bytes, mapped, expected_bytes, @alignOf(u16))) |span| {
+            const mapped_rc = termite_metal_decode_runtime_prepare_embedding_table_bf16_no_copy_region(
+                runtime,
+                span.base_ptr,
+                span.base_len,
+                span.weight_offset,
+                span.weight_len,
+                rows,
+                dim,
+            );
+            if (mapped_rc == 0) return true;
+        }
+    }
+    return termite_metal_decode_runtime_prepare_embedding_table_bf16(
+        runtime,
+        bytes.ptr,
+        bytes.len,
+        rows,
+        dim,
+    ) == 0;
+}
+
 pub fn decoderRuntimeNativeBf16EmbeddingLookup(
     self: anytype,
     bytes: []const u8,
@@ -2576,6 +2607,45 @@ pub fn decoderRuntimeNativeBf16EmbeddingLookup(
         output.deviceByteOffset(),
     );
     return finishDeviceOutput(&output, lookup_rc);
+}
+
+pub fn decoderRuntimeNativeBf16GatherAxis0F32IndicesDevice(
+    self: anytype,
+    bytes: []const u8,
+    mmap_source_bytes: ?[]const u8,
+    indices: MetalTensor,
+    rows: usize,
+    dim: usize,
+    output_shape: []const i32,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or !indices.isDevice()) return null;
+    const total = indices.elemCount();
+    if (total == 0 or rows == 0 or dim == 0) return null;
+    const table_elems = std.math.mul(usize, rows, dim) catch return null;
+    const expected_bytes = std.math.mul(usize, table_elems, @sizeOf(u16)) catch return null;
+    if (bytes.len < expected_bytes) return null;
+    if (!prepareNativeBf16EmbeddingTable(runtime, bytes, mmap_source_bytes, expected_bytes, rows, dim)) return null;
+
+    const output_elems = std.math.mul(usize, total, dim) catch return null;
+    const output_bytes = std.math.mul(usize, output_elems, @sizeOf(f32)) catch return null;
+    var output = try MetalTensor.deviceAllocate(runtime, output_bytes, .private, output_shape);
+    errdefer output.deinit();
+    const rc = termite_metal_decode_runtime_gather_axis0_bf16_f32_indices_device(
+        runtime,
+        indices.deviceHandle(),
+        indices.deviceByteOffset(),
+        rows,
+        dim,
+        total,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc != 0) {
+        output.deinit();
+        return null;
+    }
+    return output;
 }
 
 pub fn decoderRuntimeApplyRope(self: anytype, request: anytype) !?MetalTensor {
@@ -7822,6 +7892,78 @@ pub fn decoderRuntimeApplyLinear(self: anytype, request: anytype) !?MetalTensor 
 
     const out_shape = [_]i32{ 1, @intCast(request.out_dim) };
     return MetalTensor.owned(output, &out_shape);
+}
+
+pub fn decoderRuntimeApplyLinearBackwardInputBf16(self: anytype, request: anytype) !?MetalTensor {
+    return decoderRuntimeApplyLinearBackwardInputBf16Impl(self, request, null);
+}
+
+pub fn decoderRuntimeApplyLinearBackwardInputBf16Into(
+    self: anytype,
+    request: anytype,
+    output_override: MetalTensor,
+) !?MetalTensor {
+    return decoderRuntimeApplyLinearBackwardInputBf16Impl(self, request, output_override);
+}
+
+fn decoderRuntimeApplyLinearBackwardInputBf16Impl(
+    self: anytype,
+    request: anytype,
+    output_override: ?MetalTensor,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (request.rows == 0 or request.in_dim == 0 or request.out_dim == 0) return null;
+    if (request.slot >= decoder_runtime_linear_slot_capacity) return null;
+    if (!self.raw_linear_slots_prepared[request.slot] or self.raw_linear_slot_kinds[request.slot] != .dense) return null;
+    if (self.raw_linear_slot_in_dims[request.slot] != request.in_dim or
+        self.raw_linear_slot_out_dims[request.slot] != request.out_dim) return null;
+    if (!request.input.isDevice() or request.input.ndim() != 2) return null;
+    if (@as(usize, @intCast(request.input.dim(0))) != request.rows or
+        @as(usize, @intCast(request.input.dim(1))) != request.out_dim) return null;
+    const input_elements = std.math.mul(usize, request.rows, request.out_dim) catch return null;
+    const output_elements = std.math.mul(usize, request.rows, request.in_dim) catch return null;
+    if (request.input.elemCount() != input_elements) return null;
+
+    const out_shape = [_]i32{ @intCast(request.rows), @intCast(request.in_dim) };
+    if (output_override) |override| {
+        if (!override.isDevice() or override.ndim() != 2 or override.elemCount() != output_elements) return null;
+        if (@as(usize, @intCast(override.dim(0))) != request.rows or
+            @as(usize, @intCast(override.dim(1))) != request.in_dim) return null;
+        const rc = termite_metal_decode_runtime_apply_linear_backward_input_bf16_device(
+            runtime,
+            request.slot,
+            request.input.deviceHandle(),
+            request.input.deviceByteOffset(),
+            request.rows,
+            request.in_dim,
+            request.out_dim,
+            override.deviceHandle(),
+            override.deviceByteOffset(),
+        );
+        if (rc != 0) return null;
+        return override;
+    }
+
+    const output_bytes = std.math.mul(usize, output_elements, @sizeOf(f32)) catch return null;
+    var output_device = try MetalTensor.deviceAllocate(runtime, output_bytes, .private, &out_shape);
+    errdefer output_device.deinit();
+    const rc = termite_metal_decode_runtime_apply_linear_backward_input_bf16_device(
+        runtime,
+        request.slot,
+        request.input.deviceHandle(),
+        request.input.deviceByteOffset(),
+        request.rows,
+        request.in_dim,
+        request.out_dim,
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+    );
+    if (rc != 0) {
+        output_device.deinit();
+        return null;
+    }
+    return output_device;
 }
 
 pub fn decoderRuntimeApplyLinearPair(self: anytype, request: anytype) !?RuntimeLinearPairResult {
@@ -16070,6 +16212,16 @@ pub extern fn termite_metal_decode_runtime_embedding_lookup_bf16_prepared_device
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_gather_axis0_bf16_f32_indices_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    indices_handle: ?*anyopaque,
+    indices_offset: usize,
+    rows: usize,
+    cols: usize,
+    index_count: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_quant_embedding_lookup_prepared_device(
     runtime: ?*RawMetalDecodeRuntime,
     format: u32,
@@ -16648,6 +16800,17 @@ pub extern fn termite_metal_decode_runtime_apply_linear_multi_row(
     output: [*c]f32,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_apply_linear_multi_row_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_apply_linear_backward_input_bf16_device(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
     input_handle: ?*anyopaque,
@@ -35799,6 +35962,48 @@ test "metal native decoder runtime bf16 embedding lookup from mmap region" {
     }, out);
 }
 
+test "metal native BF16 gather releases output after dispatch failure" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    const table_words = [_]u16{ 0x3f80, 0x4000, 0x4040, 0x4080 };
+    var indices_owner = try MetalTensor.deviceAllocateFresh(runtime, @sizeOf(f32), .private, &.{1});
+    defer indices_owner.deinit();
+    var invalid_indices = MetalTensor.deviceBorrowed(
+        @ptrCast(runtime),
+        indices_owner.deviceHandle().?,
+        std.math.maxInt(usize),
+        @sizeOf(f32),
+        &.{1},
+    );
+    defer invalid_indices.deinit();
+
+    const before = metal_tensor.memoryStatsSnapshot();
+    const output = try decoderRuntimeNativeBf16GatherAxis0F32IndicesDevice(
+        &provider,
+        std.mem.sliceAsBytes(&table_words),
+        null,
+        invalid_indices,
+        2,
+        2,
+        &.{ 1, 2 },
+    );
+    if (output) |value| {
+        var unexpected = value;
+        unexpected.deinit();
+        return error.ExpectedNull;
+    }
+    const after = metal_tensor.memoryStatsSnapshot();
+    try std.testing.expectEqual(before.device_owned_live_bytes, after.device_owned_live_bytes);
+    try std.testing.expectEqual(before.device_owned_buffers_created + 1, after.device_owned_buffers_created);
+    try std.testing.expectEqual(before.device_owned_buffers_released + 1, after.device_owned_buffers_released);
+}
+
 test "metal native decoder runtime bf16 embedding lookup stages mmap rows" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
@@ -37403,6 +37608,99 @@ test "metal native decoder runtime bf16 multi-row linear matches identity projec
             try std.testing.expectApproxEqAbs(input_data[row * hidden_size + col], actual[row * out_dim + col], 1e-3);
         }
     }
+}
+
+test "metal native decoder runtime bf16 linear backward input crosses every tile boundary" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+
+    // Kernel tiles are rows=8, input columns=16, reduction=32.
+    const rows: usize = 9;
+    const in_dim: usize = 17;
+    const out_dim: usize = 35;
+    const palette = [_]f32{ -1.0, -0.5, 0.25, 0.75, 1.0, 1.5, 2.0 };
+    var bf16_weight_words: [out_dim * in_dim]u16 = undefined;
+    for (&bf16_weight_words, 0..) |*word, i| {
+        const bits: u32 = @bitCast(palette[(i * 5 + i / in_dim) % palette.len]);
+        word.* = @truncate(bits >> 16);
+    }
+    const bf16_weight_bytes = std.mem.sliceAsBytes(&bf16_weight_words);
+    const bias_data = [_]f32{0.0} ** out_dim;
+    var linear_bias = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(out_dim)});
+    defer linear_bias.deinit();
+
+    var dummy_weight_value = [_]f32{0.0};
+    const dummy_weight = MetalTensor.borrowed(dummy_weight_value[0..].ptr, 1, &[_]i32{0});
+    var prep_stats: ops.NativeQuantTimingStats = .{};
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .slot = 0,
+        .weight = dummy_weight,
+        .bias = linear_bias,
+        .quantized_storage = null,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .retain_dense_fallback = false,
+        .dense_bf16_bytes = bf16_weight_bytes,
+        .dense_bf16_no_copy_safe = false,
+    }, &prep_stats));
+
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    var output_grad_data: [rows * out_dim]f32 = undefined;
+    for (&output_grad_data, 0..) |*value, i| value.* = palette[(i * 3 + i / out_dim) % palette.len];
+    var output_grad = try testDeviceTensorFromSlice(runtime, &output_grad_data, &[_]i32{ @intCast(rows), @intCast(out_dim) });
+    defer output_grad.deinit();
+
+    var input_grad = (try decoderRuntimeApplyLinearBackwardInputBf16(&provider, .{
+        .slot = 0,
+        .input = output_grad,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+    })) orelse return error.UnexpectedNull;
+    defer input_grad.deinit();
+    try std.testing.expect(input_grad.isDevice());
+    try std.testing.expectEqual(@as(usize, 2), input_grad.ndim());
+    try std.testing.expectEqual(@as(i32, @intCast(rows)), input_grad.dim(0));
+    try std.testing.expectEqual(@as(i32, @intCast(in_dim)), input_grad.dim(1));
+
+    var input_grad_mut = input_grad;
+    const actual = try tensorHostSlice(&input_grad_mut);
+    var expected: [rows * in_dim]f32 = @splat(0.0);
+    for (0..rows) |row| {
+        for (0..in_dim) |in_col| {
+            for (0..out_dim) |out_col| {
+                const word = bf16_weight_words[out_col * in_dim + in_col];
+                const weight: f32 = @bitCast(@as(u32, word) << 16);
+                expected[row * in_dim + in_col] += output_grad_data[row * out_dim + out_col] * weight;
+            }
+        }
+    }
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-3);
+
+    var pooled = try MetalTensor.deviceAllocate(runtime, rows * in_dim * @sizeOf(f32), .private, &[_]i32{ @intCast(rows), @intCast(in_dim) });
+    var pooled_result = (decoderRuntimeApplyLinearBackwardInputBf16Into(&provider, .{
+        .slot = 0,
+        .input = output_grad,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+    }, pooled) catch |err| {
+        pooled.deinit();
+        return err;
+    }) orelse {
+        pooled.deinit();
+        return error.UnexpectedNull;
+    };
+    defer pooled_result.deinit();
+    try std.testing.expectEqual(pooled.deviceHandle(), pooled_result.deviceHandle());
+    const pooled_actual = try tensorHostSlice(&pooled_result);
+    for (expected, pooled_actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-3);
 }
 
 test "metal native decoder runtime f16 MPS linear transitions from planned encoder" {

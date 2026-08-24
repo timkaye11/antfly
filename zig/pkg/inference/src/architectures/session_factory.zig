@@ -2677,12 +2677,73 @@ pub fn ggufInspectionSupportsBackend(report: GgufInspectionReport, backend: Back
 }
 
 fn normalizeWeightKey(store_kind: tensor_store_mod.StoreKind, arch_config: ArchConfig, key: []const u8, buf: *[256]u8) ![]const u8 {
-    if (store_kind != .gguf) return key;
     return switch (arch_config) {
-        .gpt => |cfg| normalizeGgufGptWeightKey(cfg, key, buf) orelse key,
+        .gpt => |cfg| blk: {
+            if (store_kind == .gguf) {
+                if (normalizeGgufGptWeightKey(cfg, key, buf)) |normalized| break :blk normalized;
+            }
+            if (cfg.family == .gemma) {
+                if (canonicalizeGemma4LegacyWeightKey(key, buf)) |normalized| break :blk normalized;
+            }
+            break :blk key;
+        },
         .bert => bert.normalizeGgufWeightKey(key, buf) orelse key,
         else => key,
     };
+}
+
+/// Canonicalize the exact legacy Gemma 4 PLE names emitted by older HF
+/// checkpoints. The recognized roots mirror supported Gemma text wrappers;
+/// unrelated suffix matches are intentionally ignored.
+pub fn canonicalizeGemma4LegacyWeightKey(key: []const u8, buf: *[256]u8) ?[]const u8 {
+    const prefixes = [_][]const u8{
+        "vlm.model.language_model.",
+        "model.language_model.",
+        "language_model.model.",
+        "language_model.",
+        "model.",
+        "",
+    };
+    for (prefixes) |prefix| {
+        const relative = if (prefix.len == 0)
+            key
+        else if (std.mem.startsWith(u8, key, prefix))
+            key[prefix.len..]
+        else
+            continue;
+
+        const canonical_relative = if (std.mem.eql(u8, relative, "embed_tokens_per_layer.weight"))
+            "per_layer_input.per_layer_token_embd.weight"
+        else if (std.mem.eql(u8, relative, "per_layer_model_projection.weight"))
+            "per_layer_input.per_layer_model_proj.weight"
+        else if (std.mem.eql(u8, relative, "per_layer_projection_norm.weight"))
+            "per_layer_input.per_layer_proj_norm.weight"
+        else {
+            const layers_prefix = "layers.";
+            if (!std.mem.startsWith(u8, relative, layers_prefix)) continue;
+            const after_layers = relative[layers_prefix.len..];
+            const layer_end = std.mem.indexOfScalar(u8, after_layers, '.') orelse continue;
+            const layer_text = after_layers[0..layer_end];
+            if (layer_text.len == 0) continue;
+            const layer = std.fmt.parseInt(usize, layer_text, 10) catch continue;
+            const legacy_suffix = after_layers[layer_end + 1 ..];
+
+            const canonical_suffix = if (std.mem.eql(u8, legacy_suffix, "per_layer_input_gate.weight"))
+                "per_layer_input.inp_gate.weight"
+            else if (std.mem.eql(u8, legacy_suffix, "per_layer_projection.weight"))
+                "per_layer_input.proj.weight"
+            else if (std.mem.eql(u8, legacy_suffix, "post_per_layer_input_norm.weight"))
+                "per_layer_input.post_norm.weight"
+            else if (std.mem.eql(u8, legacy_suffix, "layer_scalar"))
+                "per_layer_input.layer_output_scale.weight"
+            else
+                continue;
+
+            return std.fmt.bufPrint(buf, "{s}layers.{d}.{s}", .{ prefix, layer, canonical_suffix }) catch null;
+        };
+        return std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, canonical_relative }) catch null;
+    }
+    return null;
 }
 
 fn refineGemma4AttentionKEqualVFromGgufTensors(config: *gpt_mod.Config, file: *const gguf_mod.format.File) void {
@@ -2812,9 +2873,11 @@ fn normalizeGgufGptWeightKey(config: gpt_mod.Config, key: []const u8, buf: *[256
     if (std.mem.eql(u8, key, "output.weight")) return "lm_head.weight";
 
     // Gemma 4 PLE: global tensors.
-    if (std.mem.eql(u8, key, "per_layer_token_embd.weight")) return "model.per_layer_input.per_layer_token_embd.weight";
-    if (std.mem.eql(u8, key, "per_layer_model_proj.weight")) return "model.per_layer_input.per_layer_model_proj.weight";
-    if (std.mem.eql(u8, key, "per_layer_proj_norm.weight")) return "model.per_layer_input.per_layer_proj_norm.weight";
+    if (config.family == .gemma) {
+        if (std.mem.eql(u8, key, "per_layer_token_embd.weight")) return "model.per_layer_input.per_layer_token_embd.weight";
+        if (std.mem.eql(u8, key, "per_layer_model_proj.weight")) return "model.per_layer_input.per_layer_model_proj.weight";
+        if (std.mem.eql(u8, key, "per_layer_proj_norm.weight")) return "model.per_layer_input.per_layer_proj_norm.weight";
+    }
 
     if (!std.mem.startsWith(u8, key, "blk.")) return null;
 
@@ -2949,17 +3012,19 @@ fn normalizeGgufGptWeightKey(config: gpt_mod.Config, key: []const u8, buf: *[256
         return std.fmt.bufPrint(buf, "model.layers.{d}.block_sparse_moe.shared_expert.up_proj.weight", .{layer}) catch null;
     }
     // Gemma 4 PLE: per-layer tensors.
-    if (std.mem.eql(u8, suffix, "inp_gate.weight")) {
-        return std.fmt.bufPrint(buf, "model.layers.{d}.per_layer_input.inp_gate.weight", .{layer}) catch null;
-    }
-    if (std.mem.eql(u8, suffix, "proj.weight")) {
-        return std.fmt.bufPrint(buf, "model.layers.{d}.per_layer_input.proj.weight", .{layer}) catch null;
-    }
-    if (std.mem.eql(u8, suffix, "layer_output_scale.weight")) {
-        return std.fmt.bufPrint(buf, "model.layers.{d}.per_layer_input.layer_output_scale.weight", .{layer}) catch null;
-    }
-    if (std.mem.eql(u8, suffix, "post_norm.weight")) {
-        return std.fmt.bufPrint(buf, "model.layers.{d}.per_layer_input.post_norm.weight", .{layer}) catch null;
+    if (config.family == .gemma) {
+        if (std.mem.eql(u8, suffix, "inp_gate.weight")) {
+            return std.fmt.bufPrint(buf, "model.layers.{d}.per_layer_input.inp_gate.weight", .{layer}) catch null;
+        }
+        if (std.mem.eql(u8, suffix, "proj.weight")) {
+            return std.fmt.bufPrint(buf, "model.layers.{d}.per_layer_input.proj.weight", .{layer}) catch null;
+        }
+        if (std.mem.eql(u8, suffix, "layer_output_scale.weight")) {
+            return std.fmt.bufPrint(buf, "model.layers.{d}.per_layer_input.layer_output_scale.weight", .{layer}) catch null;
+        }
+        if (std.mem.eql(u8, suffix, "post_norm.weight")) {
+            return std.fmt.bufPrint(buf, "model.layers.{d}.per_layer_input.post_norm.weight", .{layer}) catch null;
+        }
     }
     return null;
 }
@@ -4084,7 +4149,7 @@ fn makeMetalHostedComputeBackend(
             self.metal_jit_scope,
             self.kernel_jit_load_context,
         );
-    return compute.computeBackend();
+    return compute.ownedComputeBackend();
 }
 
 fn initGpuHostedPrefetch(self: *ArchSession) !void {
@@ -5395,6 +5460,137 @@ pub fn loadGptConfigFromModelDir(
         .gpt => |cfg| cfg,
         else => error.InvalidModelForGeneration,
     };
+}
+
+/// Load GPT architecture metadata from a model directory without constructing
+/// a tensor store, building a compatibility report, or reading tensor payloads.
+/// GGUF inputs use the structural parser so tokenizer arrays are skipped while
+/// tensor headers remain available for config refinement.
+pub fn loadGptConfigMetadataFromModelDir(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+) !gpt_mod.Config {
+    var mf = try manifest_mod.loadListingFromDir(allocator, model_dir);
+    defer mf.deinit();
+
+    const arch_config = if (mf.usesGgufWeights()) blk: {
+        const gguf_path = mf.gguf_path orelse return error.MissingModelWeights;
+        var mapped = try c_file.MmapRegion.init(allocator, gguf_path);
+        defer mapped.deinit();
+
+        var file = try gguf_mod.format.parseStructure(allocator, mapped.data);
+        defer file.deinit(allocator);
+        try gguf_mod.format.validateTensorDataRanges(&file, mapped.data.len);
+        const parsed_prefix_len = std.math.cast(usize, file.data_region_offset) orelse mapped.data.len;
+        mapped.adviseSequentialPrefix(@min(parsed_prefix_len, mapped.data.len));
+
+        break :blk try detectArchitectureWithGgufFile(allocator, model_dir, mf, &file);
+    } else try detectArchitecture(allocator, model_dir, mf);
+
+    return switch (arch_config) {
+        .gpt => |cfg| cfg,
+        else => error.UnsupportedModelArchitecture,
+    };
+}
+
+test "metadata-only GPT config loader reads safetensors config" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data =
+        \\{
+        \\  "model_type": "gemma4",
+        \\  "text_config": {
+        \\    "hidden_size": 1536,
+        \\    "num_hidden_layers": 35,
+        \\    "num_attention_heads": 8,
+        \\    "num_key_value_heads": 4,
+        \\    "head_dim": 256,
+        \\    "intermediate_size": 6144,
+        \\    "vocab_size": 262144
+        \\  }
+        \\}
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = "" });
+    const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(model_dir);
+
+    const config = try loadGptConfigMetadataFromModelDir(allocator, model_dir);
+    try std.testing.expectEqual(gpt_mod.ModelFamily.gemma, config.family);
+    try std.testing.expectEqual(@as(u32, 1536), config.hidden_size);
+    try std.testing.expectEqual(@as(u32, 35), config.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 262144), config.vocab_size);
+}
+
+test "metadata-only GPT config loader refines GGUF-only config from tensor headers" {
+    const allocator = std.testing.allocator;
+    const metadata = [_]gguf_mod.format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "gemma4" } },
+        .{ .key = "gemma4.embedding_length", .value = .{ .u32 = 4 } },
+        .{ .key = "gemma4.block_count", .value = .{ .u32 = 2 } },
+        .{ .key = "gemma4.attention.head_count", .value = .{ .u32 = 2 } },
+        .{ .key = "gemma4.attention.head_count_kv", .value = .{ .u32 = 1 } },
+        .{ .key = "gemma4.attention.key_length", .value = .{ .u32 = 4 } },
+        .{ .key = "gemma4.feed_forward_length", .value = .{ .u32 = 16 } },
+        .{ .key = "gemma4.context_length", .value = .{ .u32 = 128 } },
+        .{ .key = "gemma4.attention.kv_shared_layer_count", .value = .{ .u32 = 1 } },
+    };
+    const embedding_dims = [_]u64{ 8, 16 };
+    const tensors = [_]gguf_mod.writer.TensorSpec{.{
+        .name = "token_embd.weight",
+        .dimensions = &embedding_dims,
+        .tensor_type = .{ .known = .F16 },
+    }};
+    var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &tensors);
+    defer layout.deinit(allocator);
+
+    var raw = std.ArrayListUnmanaged(u8).empty;
+    defer raw.deinit(allocator);
+    try raw.appendSlice(allocator, layout.header_bytes);
+    const data_region_offset = std.mem.alignForward(usize, layout.header_bytes.len, @intCast(layout.alignment));
+    try raw.appendNTimes(allocator, 0, data_region_offset - layout.header_bytes.len);
+    try raw.appendNTimes(allocator, 0, 8 * 16 * @sizeOf(f16));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.gguf", .data = raw.items });
+    const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(model_dir);
+
+    const config = try loadGptConfigMetadataFromModelDir(allocator, model_dir);
+    try std.testing.expectEqual(gpt_mod.ModelFamily.gemma, config.family);
+    try std.testing.expectEqual(@as(u32, 8), config.hidden_size);
+    try std.testing.expectEqual(@as(u32, 16), config.vocab_size);
+    try std.testing.expectEqual(@as(u32, 1), config.num_kv_shared_layers);
+    try std.testing.expect(config.weight_tying);
+}
+
+test "metadata-only GPT config loader rejects non-GPT architectures" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data =
+        \\{
+        \\  "model_type": "bert",
+        \\  "hidden_size": 384,
+        \\  "num_hidden_layers": 6,
+        \\  "num_attention_heads": 6
+        \\}
+        ,
+    });
+    const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(model_dir);
+
+    try std.testing.expectError(
+        error.UnsupportedModelArchitecture,
+        loadGptConfigMetadataFromModelDir(allocator, model_dir),
+    );
 }
 
 pub fn getWeightExportSource(session: Session) ?export_source_mod.Source {
@@ -6944,6 +7140,91 @@ test "gemma gguf ffn norm maps to pre-feedforward layernorm" {
         .family = .gemma,
     }, "blk.0.ffn_norm.weight", &buf).?;
     try std.testing.expectEqualStrings("model.layers.0.pre_feedforward_layernorm.weight", mapped);
+}
+
+test "gemma4 legacy PLE aliases normalize for safetensors and gguf" {
+    const Alias = struct {
+        legacy: []const u8,
+        canonical: []const u8,
+    };
+    const aliases = [_]Alias{
+        .{ .legacy = "model.embed_tokens_per_layer.weight", .canonical = "model.per_layer_input.per_layer_token_embd.weight" },
+        .{ .legacy = "model.per_layer_model_projection.weight", .canonical = "model.per_layer_input.per_layer_model_proj.weight" },
+        .{ .legacy = "model.per_layer_projection_norm.weight", .canonical = "model.per_layer_input.per_layer_proj_norm.weight" },
+        .{ .legacy = "model.layers.2.per_layer_input_gate.weight", .canonical = "model.layers.2.per_layer_input.inp_gate.weight" },
+        .{ .legacy = "model.layers.2.per_layer_projection.weight", .canonical = "model.layers.2.per_layer_input.proj.weight" },
+        .{ .legacy = "model.layers.2.post_per_layer_input_norm.weight", .canonical = "model.layers.2.per_layer_input.post_norm.weight" },
+        .{ .legacy = "model.layers.2.layer_scalar", .canonical = "model.layers.2.per_layer_input.layer_output_scale.weight" },
+    };
+    const gemma: ArchConfig = .{ .gpt = .{ .family = .gemma } };
+
+    for (aliases) |alias| {
+        var safetensors_buf: [256]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            alias.canonical,
+            try normalizeWeightKey(.safetensors, gemma, alias.legacy, &safetensors_buf),
+        );
+
+        var gguf_buf: [256]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            alias.canonical,
+            try normalizeWeightKey(.gguf, gemma, alias.legacy, &gguf_buf),
+        );
+    }
+
+    const wrapped: ArchConfig = .{ .gpt = .{
+        .family = .gemma,
+        .weight_prefix = "model.language_model",
+    } };
+    var wrapped_buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "model.language_model.layers.7.per_layer_input.layer_output_scale.weight",
+        try normalizeWeightKey(
+            .safetensors,
+            wrapped,
+            "model.language_model.layers.7.layer_scalar",
+            &wrapped_buf,
+        ),
+    );
+
+    var canonical_buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "model.layers.2.per_layer_input.inp_gate.weight",
+        try normalizeWeightKey(
+            .safetensors,
+            gemma,
+            "model.layers.2.per_layer_input.inp_gate.weight",
+            &canonical_buf,
+        ),
+    );
+
+    var near_match_buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "model.layers.2.layer_scalar.weight",
+        try normalizeWeightKey(
+            .safetensors,
+            gemma,
+            "model.layers.2.layer_scalar.weight",
+            &near_match_buf,
+        ),
+    );
+
+    const llama: ArchConfig = .{ .gpt = .{ .family = .llama } };
+    var llama_safetensors_buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "model.layers.2.layer_scalar",
+        try normalizeWeightKey(
+            .safetensors,
+            llama,
+            "model.layers.2.layer_scalar",
+            &llama_safetensors_buf,
+        ),
+    );
+    var llama_gguf_buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "blk.2.inp_gate.weight",
+        try normalizeWeightKey(.gguf, llama, "blk.2.inp_gate.weight", &llama_gguf_buf),
+    );
 }
 
 test "large GPU-hosted lazy quant budget floor widens host and backend limits" {

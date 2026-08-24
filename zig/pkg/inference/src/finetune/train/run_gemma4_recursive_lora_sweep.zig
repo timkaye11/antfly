@@ -347,6 +347,9 @@ fn parseOptions(args: *std.process.Args.Iterator) !Options {
             return usageError();
         }
     }
+    if (!std.mem.eql(u8, opts.backend, "native") and !std.mem.eql(u8, opts.backend, "metal")) {
+        return usageError();
+    }
     return opts;
 }
 
@@ -500,7 +503,7 @@ fn usageError() error{InvalidArguments} {
         \\  --teacher-temperatures CSV
         \\  --teacher-top-k N
         \\  --recursive-init NAME
-        \\  --backend auto|native
+        \\  --backend native|metal
         \\  --split NAME
         \\  --dry-run
         \\

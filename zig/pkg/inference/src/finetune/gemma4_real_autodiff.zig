@@ -17,14 +17,14 @@ const build_options = @import("build_options");
 const ml = @import("ml");
 const c_file = @import("../util/c_file.zig");
 const gemma_graph = @import("../architectures/gemma_graph.zig");
-const gpt_model = @import("../models/gpt.zig");
 const real_autodiff = @import("real_autodiff_trainer.zig");
 const gemma4 = @import("gemma4.zig");
 const compat = @import("../io/compat.zig");
 const graph_input_binder = @import("graph_input_binder.zig");
 const weight_source_mod = @import("../models/weight_source.zig");
 const SafetensorsSource = weight_source_mod.SafetensorsSource;
-const native_compute = @import("../ops/native_compute.zig");
+const session_factory = @import("../architectures/session_factory.zig");
+const Session = @import("../backends/session.zig").Session;
 const ops_mod = @import("../ops/ops.zig");
 const interpreter = @import("../graph/interpreter.zig");
 const Tensor = @import("../backends/tensor.zig").Tensor;
@@ -62,7 +62,31 @@ pub const CausalLmMetrics = struct {
     average_loss: f64 = 0,
     mean_grad_norm: f64 = 0,
     optimizer_steps: usize = 0,
+    graph_executor_steps: u64 = 0,
+    graph_executor_fallback_steps: u64 = 0,
+    graph_executor_partitions: u64 = 0,
+    graph_executor_command_dispatches: u64 = 0,
+    graph_executor_native_partitions: u64 = 0,
+    graph_executor_unsupported_ops: u64 = 0,
+    graph_executor_interpreter_fallbacks: u64 = 0,
+    graph_executor_runtime_region_dispatches: u64 = 0,
+    graph_executor_true_host_outputs: u64 = 0,
+    metal_optimizer_steps: u64 = 0,
 };
+
+pub fn recordStepExecutionEvidence(metrics: *CausalLmMetrics, step: real_autodiff.StepResult) void {
+    const profile = step.profile;
+    if (profile.graph_executor_partitions > 0) metrics.graph_executor_steps += 1;
+    if (profile.graph_executor_fallback_reason != null) metrics.graph_executor_fallback_steps += 1;
+    metrics.graph_executor_partitions += profile.graph_executor_partitions;
+    metrics.graph_executor_command_dispatches += profile.graph_executor_command_dispatches;
+    metrics.graph_executor_native_partitions += profile.graph_executor_native_partitions;
+    metrics.graph_executor_unsupported_ops += profile.graph_executor_unsupported_ops;
+    metrics.graph_executor_interpreter_fallbacks += profile.graph_executor_interpreter_fallbacks;
+    metrics.graph_executor_runtime_region_dispatches += profile.graph_executor_runtime_region_dispatches;
+    metrics.graph_executor_true_host_outputs += profile.graph_executor_true_host_outputs;
+    if (step.optimizer_stepped and profile.optimizer_backend == .metal) metrics.metal_optimizer_steps += 1;
+}
 
 pub const TeacherTopKOptions = struct {
     top_k: usize = 8,
@@ -78,46 +102,27 @@ pub const TeacherTopKSummary = struct {
     temperature: f32 = 1.0,
 };
 
-pub const BackendKind = enum { native };
+pub const BackendKind = enum {
+    native,
+    metal,
+
+    pub fn label(self: BackendKind) []const u8 {
+        return @tagName(self);
+    }
+};
 
 pub const LoadedBackend = struct {
-    allocator: std.mem.Allocator,
     kind: BackendKind,
     compute_backend: ComputeBackend,
-    native_ws: ?native_compute.WeightStore = null,
-    native_engine: ?*native_compute.NativeCompute = null,
-    safetensors_source: ?*SafetensorsSource = null,
+    session: Session,
 
     pub fn backendPtr(self: *LoadedBackend) *const ComputeBackend {
-        self.compute_backend = switch (self.kind) {
-            .native => blk: {
-                const engine = self.native_engine.?;
-                engine.data = &self.native_ws.?;
-                break :blk engine.computeBackend();
-            },
-        };
         return &self.compute_backend;
     }
 
     pub fn deinit(self: *LoadedBackend) void {
-        switch (self.kind) {
-            .native => if (self.native_engine) |engine| {
-                engine.data = &self.native_ws.?;
-                var cb = engine.computeBackend();
-                cb.deinit();
-            },
-        }
-        if (self.safetensors_source) |src| src.weightSource().deinit();
-        if (self.native_ws) |*ws| {
-            native_compute.deinitPrefetchQueue(ws);
-            var it = ws.resident_weights.iterator();
-            while (it.next()) |entry| {
-                self.allocator.free(entry.key_ptr.*);
-                entry.value_ptr.deinit();
-            }
-            ws.resident_weights.deinit(self.allocator);
-            ws.lazy_weights.deinit(self.allocator);
-        }
+        self.compute_backend.deinit();
+        self.session.close();
         self.* = undefined;
     }
 };
@@ -164,8 +169,85 @@ pub const GemmaAutodiffCtx = struct {
         targets: ml.graph.NodeId,
     ) anyerror!ml.graph.NodeId {
         const self: *GemmaAutodiffCtx = @ptrCast(@alignCast(ctx_opaque));
+        const target_shape = bld.graph.node(targets).output_shape;
+        if (target_shape.rank() == 2 and target_shape.dim(1) != self.graph_config.vocab_size) {
+            return self.buildSparseCausalLoss(bld, forward_output, targets);
+        }
         const logits = try self.buildLogits(bld, forward_output);
         return bld.crossEntropyLoss(logits, targets);
+    }
+
+    /// Memory-bounded causal LM loss. `targets` is [M, 2], containing
+    /// [predictor_row, token_id] pairs for the M supervised tokens. The tied
+    /// vocabulary projection is evaluated a few supervised rows at a time so
+    /// the graph never owns a [sequence, vocabulary] activation.
+    fn buildSparseCausalLoss(
+        self: *GemmaAutodiffCtx,
+        bld: *Builder,
+        forward_output: NodeId,
+        targets: NodeId,
+    ) !NodeId {
+        const out_shape = bld.graph.node(forward_output).output_shape;
+        const total_rows: u32 = @intCast(out_shape.dim(0) * out_shape.dim(1));
+        const hidden_size: u32 = @intCast(out_shape.dim(2));
+        const target_shape = bld.graph.node(targets).output_shape;
+        const supervised_rows: u32 = @intCast(target_shape.dim(0));
+        const target_columns: u32 = @intCast(target_shape.dim(1));
+        if (supervised_rows == 0) return error.NoSupervisedTokens;
+        if (target_columns < sparse_target_columns) return error.InvalidTeacherDistillationTargets;
+        const teacher_top_k: u32 = if (target_columns == sparse_target_columns)
+            0
+        else blk: {
+            if ((target_columns - 1) % 2 != 0) return error.InvalidTeacherDistillationTargets;
+            break :blk (target_columns - 1) / 2;
+        };
+
+        const hidden_flat = try bld.reshape(forward_output, Shape.init(.f32, &.{ @as(i64, @intCast(total_rows)), @as(i64, @intCast(hidden_size)) }));
+        const predictor_rows_2d = try bld.sliceLastDim(targets, 0, 1);
+        const predictor_rows = try bld.reshape(predictor_rows_2d, Shape.init(.f32, &.{@as(i64, @intCast(supervised_rows))}));
+        const supervised_hidden = try bld.embeddingLookup(hidden_flat, predictor_rows, supervised_rows, hidden_size);
+        const labels = if (teacher_top_k == 0) try bld.sliceLastDim(targets, 1, 2) else null;
+        const teacher_ids = if (teacher_top_k > 0) try bld.sliceLastDim(targets, 1, 1 + teacher_top_k) else null;
+        const teacher_probs = if (teacher_top_k > 0) try bld.sliceLastDim(targets, 1 + teacher_top_k, target_columns) else null;
+        const lm_head_w = try self.buildLmHeadWeight(bld, hidden_size);
+
+        const vocab_size: usize = @intCast(self.graph_config.vocab_size);
+        const vocab_ids = try bld.graph.allocator.alloc(f32, vocab_size);
+        defer bld.graph.allocator.free(vocab_ids);
+        for (vocab_ids, 0..) |*value, idx| value.* = @floatFromInt(idx);
+        const vocab_row = try bld.tensorConst(vocab_ids, Shape.init(.f32, &.{ 1, @as(i64, @intCast(vocab_size)) }));
+
+        var total_loss: ?NodeId = null;
+        var start: u32 = 0;
+        while (start < supervised_rows) : (start += sparse_loss_chunk_rows) {
+            const end = @min(start + sparse_loss_chunk_rows, supervised_rows);
+            const chunk_rows = end - start;
+            const hidden_chunk = try sliceRows2d(bld, supervised_hidden, start, end, hidden_size);
+            const raw_logits = try bld.linearNoBias(hidden_chunk, lm_head_w, chunk_rows, hidden_size, self.graph_config.vocab_size);
+            const logits = try self.applyFinalLogitSoftcap(bld, raw_logits);
+            const dense_targets = if (teacher_top_k == 0) blk: {
+                const label_chunk = try sliceRows2d(bld, labels.?, start, end, 1);
+                break :blk try oneHotTargets(bld, label_chunk, vocab_row, chunk_rows, self.graph_config.vocab_size);
+            } else blk: {
+                const id_chunk = try sliceRows2d(bld, teacher_ids.?, start, end, teacher_top_k);
+                const prob_chunk = try sliceRows2d(bld, teacher_probs.?, start, end, teacher_top_k);
+                var mixed: ?NodeId = null;
+                for (0..teacher_top_k) |ki| {
+                    const label = try bld.sliceLastDim(id_chunk, @intCast(ki), @intCast(ki + 1));
+                    const probability = try bld.sliceLastDim(prob_chunk, @intCast(ki), @intCast(ki + 1));
+                    const one_hot = try oneHotTargets(bld, label, vocab_row, chunk_rows, self.graph_config.vocab_size);
+                    const probability_bc = try broadcast2d(bld, probability, chunk_rows, self.graph_config.vocab_size);
+                    const weighted = try bld.mul(one_hot, probability_bc);
+                    mixed = if (mixed) |acc| try bld.add(acc, weighted) else weighted;
+                }
+                break :blk mixed orelse return error.InvalidTeacherDistillationTargets;
+            };
+            const chunk_loss = try bld.crossEntropyLoss(logits, dense_targets);
+            const weight = try bld.scalarConst(.f32, @as(f32, @floatFromInt(chunk_rows)) / @as(f32, @floatFromInt(supervised_rows)));
+            const weighted = try bld.mul(chunk_loss, weight);
+            total_loss = if (total_loss) |acc| try bld.add(acc, weighted) else weighted;
+        }
+        return total_loss.?;
     }
 
     pub fn buildLogits(
@@ -178,14 +260,27 @@ pub const GemmaAutodiffCtx = struct {
         const hidden_size: u32 = @intCast(out_shape.dim(2));
 
         const hidden_flat = try bld.reshape(forward_output, Shape.init(.f32, &.{ @as(i64, @intCast(total_rows)), @as(i64, @intCast(hidden_size)) }));
-        const lm_head_w = if (self.graph_config.weight_tying) blk: {
-            var name_buf: [256]u8 = undefined;
-            const name = try prefixedModelName(&name_buf, self.graph_config, "model.embed_tokens.weight");
-            break :blk try bld.parameter(name, Shape.init(.f32, &.{ @as(i64, @intCast(self.graph_config.vocab_size)), @as(i64, @intCast(hidden_size)) }));
-        } else try bld.parameter("lm_head.weight", Shape.init(.f32, &.{ @as(i64, @intCast(self.graph_config.vocab_size)), @as(i64, @intCast(hidden_size)) }));
-        const logits = try bld.linearNoBias(hidden_flat, lm_head_w, total_rows, hidden_size, self.graph_config.vocab_size);
+        const lm_head_w = try self.buildLmHeadWeight(bld, hidden_size);
+        const raw_logits = try bld.linearNoBias(hidden_flat, lm_head_w, total_rows, hidden_size, self.graph_config.vocab_size);
+        const logits = try self.applyFinalLogitSoftcap(bld, raw_logits);
         self.lm_logits = logits;
         return logits;
+    }
+
+    fn applyFinalLogitSoftcap(self: *GemmaAutodiffCtx, bld: *Builder, logits: NodeId) !NodeId {
+        const softcap = self.graph_config.final_logit_softcapping;
+        if (softcap <= 0.0) return logits;
+        const scale = try bld.scalarConst(.f32, softcap);
+        return bld.mul(try bld.tanhOp(try bld.div(logits, scale)), scale);
+    }
+
+    fn buildLmHeadWeight(self: *GemmaAutodiffCtx, bld: *Builder, hidden_size: u32) !NodeId {
+        if (self.graph_config.weight_tying) {
+            var name_buf: [256]u8 = undefined;
+            const name = try prefixedModelName(&name_buf, self.graph_config, "model.embed_tokens.weight");
+            return bld.parameter(name, Shape.init(.f32, &.{ @as(i64, @intCast(self.graph_config.vocab_size)), @as(i64, @intCast(hidden_size)) }));
+        }
+        return bld.parameter("lm_head.weight", Shape.init(.f32, &.{ @as(i64, @intCast(self.graph_config.vocab_size)), @as(i64, @intCast(hidden_size)) }));
     }
 
     pub fn remapGraphNodes(ctx_opaque: *anyopaque, id_map: []const NodeId) anyerror!void {
@@ -200,6 +295,53 @@ pub const GemmaAutodiffCtx = struct {
     }
 };
 
+const sparse_target_columns: i64 = 2;
+const sparse_loss_chunk_rows: u32 = 1;
+
+fn sliceRows2d(bld: *Builder, input: NodeId, start: u32, end: u32, columns: u32) !NodeId {
+    var attrs = ml.graph.node.SliceAttrs{};
+    attrs.num_axes = 2;
+    attrs.starts[0] = start;
+    attrs.starts[1] = 0;
+    attrs.limits[0] = end;
+    attrs.limits[1] = columns;
+    attrs.strides[0] = 1;
+    attrs.strides[1] = 1;
+    return bld.graph.addNode(.{
+        .op = .{ .slice = attrs },
+        .output_shape = Shape.init(.f32, &.{ @as(i64, @intCast(end - start)), @as(i64, @intCast(columns)) }),
+        .inputs = .{ input, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node },
+        .num_inputs = 1,
+    });
+}
+
+fn broadcast2d(bld: *Builder, input: NodeId, rows: u32, columns: u32) !NodeId {
+    const shape = Shape.init(.f32, &.{ @as(i64, @intCast(rows)), @as(i64, @intCast(columns)) });
+    var attrs = ml.graph.node.BroadcastAttrs{ .target_shape = shape };
+    attrs.broadcast_axes[0] = 0;
+    attrs.broadcast_axes[1] = 1;
+    attrs.num_axes = 2;
+    return bld.graph.addNode(.{
+        .op = .{ .broadcast_in_dim = attrs },
+        .output_shape = shape,
+        .inputs = .{ input, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node },
+        .num_inputs = 1,
+    });
+}
+
+fn oneHotTargets(bld: *Builder, labels: NodeId, vocab_row: NodeId, rows: u32, vocab_size: u32) !NodeId {
+    const labels_bc = try broadcast2d(bld, labels, rows, vocab_size);
+    const vocab_bc = try broadcast2d(bld, vocab_row, rows, vocab_size);
+    const diff = try bld.absOp(try bld.sub(labels_bc, vocab_bc));
+    const half = try bld.scalarConst(.f32, 0.5);
+    return bld.graph.addNode(.{
+        .op = .{ .less_than = {} },
+        .output_shape = Shape.init(.f32, &.{ @as(i64, @intCast(rows)), @as(i64, @intCast(vocab_size)) }),
+        .inputs = .{ diff, half, ml.graph.null_node, ml.graph.null_node },
+        .num_inputs = 2,
+    });
+}
+
 fn prefixedModelName(buf: *[256]u8, config: gemma_graph.Config, name: []const u8) ![]const u8 {
     if (config.weight_prefix.len == 0 or !std.mem.startsWith(u8, name, "model.")) return name;
     return std.fmt.bufPrint(buf, "{s}.{s}", .{ config.weight_prefix, name["model.".len..] }) catch error.NameTooLong;
@@ -209,6 +351,7 @@ pub const OwnedTrainerInput = struct {
     input_ids: []i64,
     attention_mask: []f32,
     targets: []f32,
+    supervised_tokens: usize,
     trainer_input: real_autodiff.TrainerInput,
 
     pub fn deinit(self: *OwnedTrainerInput, allocator: std.mem.Allocator) void {
@@ -220,11 +363,7 @@ pub const OwnedTrainerInput = struct {
 };
 
 pub fn loadGraphConfig(allocator: std.mem.Allocator, model_dir: []const u8) !gemma_graph.Config {
-    const config_path = try std.fs.path.join(allocator, &.{ model_dir, gemma4.hf_config_file_name });
-    defer allocator.free(config_path);
-    const config_bytes = try c_file.readFile(allocator, config_path);
-    defer allocator.free(config_bytes);
-    const config = try gpt_model.parseConfig(allocator, config_bytes);
+    const config = try session_factory.loadGptConfigMetadataFromModelDir(allocator, model_dir);
     try gemma_graph.validateConfig(config);
     return config;
 }
@@ -234,38 +373,17 @@ pub fn loadBackendForModelDir(
     model_dir: []const u8,
     backend_kind: BackendKind,
 ) !LoadedBackend {
-    _ = backend_kind;
-    const st_path = try std.fs.path.join(allocator, &.{ model_dir, gemma4.checkpoint_file_name });
-    defer allocator.free(st_path);
-
-    var native_ws = native_compute.WeightStore{
-        .allocator = allocator,
-        .resident_weights = .{},
-        .lazy_weights = .{},
+    const session = switch (backend_kind) {
+        .native => try session_factory.createNativeSession(allocator, model_dir),
+        .metal => try session_factory.createMetalSession(allocator, model_dir),
     };
-    var safetensors_source = try SafetensorsSource.initAbsolute(allocator, st_path);
-    errdefer safetensors_source.weightSource().deinit();
-    const ws = safetensors_source.weightSource();
-    const names = try ws.listNames(allocator);
-    defer allocator.free(names);
-    for (names) |name| {
-        const lw = try ws.getTensor(name);
-        errdefer {
-            var doomed = lw;
-            doomed.deinit();
-        }
-        try native_ws.resident_weights.put(allocator, try allocator.dupe(u8, name), lw);
-    }
-    const native_engine = try allocator.create(native_compute.NativeCompute);
-    native_engine.* = native_compute.NativeCompute.init(allocator, &native_ws, null);
-    const compute_backend = native_engine.computeBackend();
+    errdefer session.close();
+    const compute_backend = try session_factory.getComputeBackend(session, allocator);
+    errdefer compute_backend.deinit();
     return .{
-        .allocator = allocator,
-        .kind = .native,
+        .kind = backend_kind,
         .compute_backend = compute_backend,
-        .native_ws = native_ws,
-        .native_engine = native_engine,
-        .safetensors_source = safetensors_source,
+        .session = session,
     };
 }
 
@@ -313,6 +431,8 @@ fn makeTrainerInputForExampleWeighted(
     const seq_len_usize: usize = @intCast(seq_len);
     const vocab_size: usize = @intCast(ctx.graph_config.vocab_size);
     const rows = seq_len_usize;
+    const valid_tokens = try validatePreparedExample(example, rows, vocab_size);
+    if (valid_tokens == 0) return error.NoSupervisedTokens;
 
     const input_ids = try allocator.alloc(i64, rows);
     errdefer allocator.free(input_ids);
@@ -327,33 +447,71 @@ fn makeTrainerInputForExampleWeighted(
         attention_mask[i] = 1.0;
     }
 
-    const targets = try allocator.alloc(f32, rows * vocab_size);
+    const label_limit = @min(example.labels.len, usable);
+    if (token_scales) |scales| {
+        if (scales.len != valid_tokens) return error.GradientShapeMismatch;
+    }
+
+    const teacher_fields_present = example.teacher_top_k != 0 or
+        example.teacher_top_k_token_ids.len != 0 or
+        example.teacher_top_k_probs.len != 0;
+    if (teacher_fields_present and !exampleHasTeacherTargets(example))
+        return error.InvalidTeacherDistillationTargets;
+
+    const sparse_hard_targets = token_scales == null and
+        token_scale_override == null and
+        !teacher_fields_present;
+    const sparse_teacher_targets = token_scales == null and
+        token_scale_override == null and
+        teacher_fields_present;
+    const sparse_teacher_columns = if (sparse_teacher_targets)
+        try std.math.add(usize, 1, try std.math.mul(usize, 2, example.teacher_top_k))
+    else
+        0;
+    const targets_shape = if (sparse_hard_targets)
+        Shape.init(.f32, &.{ @as(i64, @intCast(valid_tokens)), sparse_target_columns })
+    else if (sparse_teacher_targets)
+        Shape.init(.f32, &.{ @as(i64, @intCast(valid_tokens)), @as(i64, @intCast(sparse_teacher_columns)) })
+    else
+        Shape.init(.f32, &.{ @as(i64, @intCast(rows)), @as(i64, @intCast(vocab_size)) });
+    const target_elements = if (sparse_hard_targets)
+        valid_tokens * @as(usize, @intCast(sparse_target_columns))
+    else if (sparse_teacher_targets)
+        valid_tokens * sparse_teacher_columns
+    else
+        rows * vocab_size;
+    const targets = try allocator.alloc(f32, target_elements);
     errdefer allocator.free(targets);
     @memset(targets, 0.0);
 
-    const use_teacher_targets = token_scales == null and token_scale_override == null;
-    const filled_teacher_targets = use_teacher_targets and try fillTeacherTopKTargets(targets, rows, vocab_size, example);
-    if (!filled_teacher_targets) {
-        var valid_tokens: usize = 0;
-        for (0..@min(example.labels.len, rows)) |i| {
-            if (example.labels[i] != -100) valid_tokens += 1;
+    if (sparse_hard_targets) {
+        var supervised_idx: usize = 0;
+        for (1..label_limit) |i| {
+            const label = example.labels[i];
+            if (label < 0) continue;
+            const token_idx: usize = @intCast(label);
+            if (token_idx >= vocab_size) return error.LabelOutOfRange;
+            // Decoder row i-1 predicts token i. Store only the rows that
+            // participate in SFT so host and device memory stay O(tokens),
+            // independent of vocabulary size.
+            targets[supervised_idx * 2] = @floatFromInt(i - 1);
+            targets[supervised_idx * 2 + 1] = @floatFromInt(token_idx);
+            supervised_idx += 1;
         }
-        if (token_scales) |scales| {
-            if (scales.len != valid_tokens) return error.GradientShapeMismatch;
-        }
-        const default_row_scale: f32 = token_scale_override orelse if (valid_tokens == 0)
-            0.0
-        else
+    } else if (sparse_teacher_targets) {
+        try fillSparseTeacherTopKTargets(targets, sparse_teacher_columns, rows, vocab_size, example);
+    } else {
+        const default_row_scale: f32 = token_scale_override orelse
             @as(f32, @floatFromInt(rows)) / @as(f32, @floatFromInt(valid_tokens));
 
         var supervised_idx: usize = 0;
-        for (0..@min(example.labels.len, rows)) |i| {
+        for (1..label_limit) |i| {
             const label = example.labels[i];
             if (label < 0) continue;
             const idx: usize = @intCast(label);
             if (idx >= vocab_size) return error.LabelOutOfRange;
             const row_scale = if (token_scales) |scales| scales[supervised_idx] else default_row_scale;
-            targets[i * vocab_size + idx] = row_scale;
+            targets[(i - 1) * vocab_size + idx] = row_scale;
             supervised_idx += 1;
         }
     }
@@ -362,6 +520,7 @@ fn makeTrainerInputForExampleWeighted(
         .input_ids = input_ids,
         .attention_mask = attention_mask,
         .targets = targets,
+        .supervised_tokens = valid_tokens,
         .trainer_input = .{
             .ctx = @ptrCast(ctx),
             .build_forward = &GemmaAutodiffCtx.buildForward,
@@ -369,13 +528,39 @@ fn makeTrainerInputForExampleWeighted(
             .input_ids = input_ids,
             .attention_mask = attention_mask,
             .targets = targets,
-            .targets_shape = Shape.init(.f32, &.{ @as(i64, @intCast(rows)), @as(i64, @intCast(vocab_size)) }),
+            .targets_shape = targets_shape,
             .batch = 1,
             .seq_len = seq_len,
             .bind_arch_inputs = null,
             .remap_graph_nodes = &GemmaAutodiffCtx.remapGraphNodes,
         },
     };
+}
+
+fn validatePreparedExample(
+    example: *const gemma4.PreparedExampleInput,
+    rows: usize,
+    vocab_size: usize,
+) !usize {
+    if (example.labels.len != example.input_ids.len) return error.InvalidPreparedExampleShape;
+    const usable = @min(example.input_ids.len, rows);
+    if (example.num_input_tokens > usable) return error.PreparedExampleExceedsSequenceLength;
+
+    for (example.input_ids[0..usable]) |token_id| {
+        if (token_id < 0 or @as(usize, @intCast(token_id)) >= vocab_size) return error.InputTokenOutOfRange;
+    }
+
+    var supervised_tokens: usize = 0;
+    for (example.labels, 0..) |label, row| {
+        if (label == -100) continue;
+        if (label < 0) return error.InvalidPreparedLabel;
+        if (row == 0) return error.InvalidCausalLabel;
+        if (@as(usize, @intCast(label)) >= vocab_size) return error.LabelOutOfRange;
+        if (row >= usable) return error.PreparedExampleExceedsSequenceLength;
+        supervised_tokens += 1;
+    }
+    if (supervised_tokens != example.num_supervised_tokens) return error.SupervisedTokenCountMismatch;
+    return supervised_tokens;
 }
 
 pub fn makeTrainerInputForLogprobCoeff(
@@ -464,34 +649,85 @@ pub fn fillTeacherTopKTargets(
     if (teacher_rows < @min(example.labels.len, rows)) return error.InvalidTeacherDistillationTargets;
 
     var active_rows: usize = 0;
-    for (0..@min(example.labels.len, rows)) |row| {
+    for (1..@min(example.labels.len, rows)) |row| {
         if (example.labels[row] != -100) active_rows += 1;
     }
     if (active_rows == 0) return false;
     const temperature = example.teacher_temperature;
-    if (temperature <= 0 or std.math.isNan(temperature)) return error.InvalidTeacherTemperature;
+    if (!std.math.isFinite(temperature) or temperature <= 0) return error.InvalidTeacherTemperature;
     const distillation_scale = temperature * temperature;
     const row_scale = (@as(f32, @floatFromInt(rows)) / @as(f32, @floatFromInt(active_rows))) * distillation_scale;
 
-    for (0..@min(example.labels.len, rows)) |row| {
+    for (1..@min(example.labels.len, rows)) |row| {
         if (example.labels[row] == -100) continue;
-        const base = row * top_k;
+        const base = (row - 1) * top_k;
         var prob_sum: f32 = 0.0;
         for (0..top_k) |ki| {
             const prob = example.teacher_top_k_probs[base + ki];
-            if (prob < 0 or std.math.isNan(prob)) return error.InvalidTeacherDistillationTargets;
+            if (!std.math.isFinite(prob) or prob < 0) return error.InvalidTeacherDistillationTargets;
             prob_sum += prob;
         }
-        if (prob_sum <= 0) return error.InvalidTeacherDistillationTargets;
+        if (!std.math.isFinite(prob_sum) or prob_sum <= 0) return error.InvalidTeacherDistillationTargets;
         for (0..top_k) |ki| {
             const token_id = example.teacher_top_k_token_ids[base + ki];
             if (token_id < 0) continue;
             const idx: usize = @intCast(token_id);
             if (idx >= vocab_size) return error.LabelOutOfRange;
-            targets[row * vocab_size + idx] += row_scale * (example.teacher_top_k_probs[base + ki] / prob_sum);
+            targets[(row - 1) * vocab_size + idx] += row_scale * (example.teacher_top_k_probs[base + ki] / prob_sum);
         }
     }
     return true;
+}
+
+fn fillSparseTeacherTopKTargets(
+    targets: []f32,
+    target_columns: usize,
+    rows: usize,
+    vocab_size: usize,
+    example: *const gemma4.PreparedExampleInput,
+) !void {
+    const top_k = example.teacher_top_k;
+    const expected_columns = std.math.add(usize, 1, std.math.mul(usize, 2, top_k) catch return error.InvalidTeacherDistillationTargets) catch
+        return error.InvalidTeacherDistillationTargets;
+    if (top_k == 0 or target_columns != expected_columns) return error.InvalidTeacherDistillationTargets;
+    if (example.teacher_top_k_token_ids.len != example.teacher_top_k_probs.len) return error.InvalidTeacherDistillationTargets;
+    if (example.teacher_top_k_token_ids.len % top_k != 0) return error.InvalidTeacherDistillationTargets;
+    const teacher_rows = example.teacher_top_k_token_ids.len / top_k;
+    if (teacher_rows == 0 or teacher_rows < @min(example.labels.len, rows)) return error.InvalidTeacherDistillationTargets;
+
+    var active_rows: usize = 0;
+    for (1..@min(example.labels.len, rows)) |row| {
+        if (example.labels[row] != -100) active_rows += 1;
+    }
+    if (active_rows == 0 or targets.len != active_rows * target_columns) return error.InvalidTeacherDistillationTargets;
+    const temperature = example.teacher_temperature;
+    if (!std.math.isFinite(temperature) or temperature <= 0) return error.InvalidTeacherTemperature;
+    const distillation_scale = temperature * temperature;
+
+    var active_row: usize = 0;
+    for (1..@min(example.labels.len, rows)) |row| {
+        if (example.labels[row] == -100) continue;
+        // Decoder row `row - 1` predicts label token `row`, so read and
+        // supervise the teacher distribution from that predictor row.
+        const teacher_base = (row - 1) * top_k;
+        var prob_sum: f32 = 0.0;
+        for (0..top_k) |ki| {
+            const prob = example.teacher_top_k_probs[teacher_base + ki];
+            if (!std.math.isFinite(prob) or prob < 0) return error.InvalidTeacherDistillationTargets;
+            const token_id = example.teacher_top_k_token_ids[teacher_base + ki];
+            if (token_id < 0 or @as(usize, @intCast(token_id)) >= vocab_size) return error.LabelOutOfRange;
+            prob_sum += prob;
+        }
+        if (!std.math.isFinite(prob_sum) or prob_sum <= 0) return error.InvalidTeacherDistillationTargets;
+
+        const target_base = active_row * target_columns;
+        targets[target_base] = @floatFromInt(row - 1);
+        for (0..top_k) |ki| {
+            targets[target_base + 1 + ki] = @floatFromInt(example.teacher_top_k_token_ids[teacher_base + ki]);
+            targets[target_base + 1 + top_k + ki] = distillation_scale * (example.teacher_top_k_probs[teacher_base + ki] / prob_sum);
+        }
+        active_row += 1;
+    }
 }
 
 fn exampleHasTeacherTargets(example: *const gemma4.PreparedExampleInput) bool {
@@ -509,13 +745,12 @@ pub fn materializeTeacherTopKTargets(
 ) !TeacherTopKSummary {
     if (prepared.examples_with_images > 0 or prepared.examples_with_audio > 0) return error.MultimodalTeacherMaterializationNotYetSupported;
     if (options.top_k == 0) return error.InvalidTeacherTopK;
-    if (options.temperature <= 0 or std.math.isNan(options.temperature)) return error.InvalidTeacherTemperature;
+    if (!std.math.isFinite(options.temperature) or options.temperature <= 0) return error.InvalidTeacherTemperature;
 
     const graph_config = try loadGraphConfig(allocator, base_model_dir);
     const vocab_size: usize = @intCast(graph_config.vocab_size);
     if (options.top_k > vocab_size) return error.InvalidTeacherTopK;
-    const seq_len = prepared.max_seq_len;
-    if (seq_len == 0) return error.InvalidPreparedInputLength;
+    const seq_len: usize = @intCast(try gemma4.validatePreparedSequenceAdmission(prepared.*, graph_config.max_position_embeddings));
 
     var backend = try loadBackendForModelDir(allocator, base_model_dir, backend_kind);
     defer backend.deinit();
@@ -561,6 +796,7 @@ pub fn materializeTeacherTopKTargets(
         summary.supervised_tokens_seen += example.num_supervised_tokens;
     }
     summary.examples_seen = limit;
+    try gemma4.refreshPreparedExamplesFingerprint(allocator, prepared);
     return summary;
 }
 
@@ -687,6 +923,9 @@ pub fn initializeTrainerFromAdapterDir(
     bootstrap_example: *const gemma4.PreparedExampleInput,
     seq_len: u32,
 ) !void {
+    // Fail before graph/backend mutation if the adapter config and checkpoint
+    // do not describe the same exact A/B/DoRA target inventory.
+    try gemma4.validateLoRAAdapterInventory(allocator, adapter_model_dir);
     var bootstrap = try makeTrainerInputForExample(allocator, ctx, bootstrap_example, seq_len);
     defer bootstrap.deinit(allocator);
     try trainer.ensureGraphBuilt(bootstrap.trainer_input);
@@ -754,24 +993,40 @@ fn runPreparedExamples(
     var total_weighted_teacher_temperature: f64 = 0;
 
     for (examples[0..limit]) |*example| {
-        if (example.num_supervised_tokens == 0) continue;
+        const effective_supervised_tokens = try validatePreparedExample(
+            example,
+            @intCast(seq_len),
+            @intCast(ctx.graph_config.vocab_size),
+        );
+        if (effective_supervised_tokens == 0) continue;
         var input = try makeTrainerInputForExample(allocator, ctx, example, seq_len);
         defer input.deinit(allocator);
         const step = switch (mode) {
             .train => try trainer.step(input.trainer_input),
             .eval => try trainer.evaluate(input.trainer_input),
         };
-        const weight: f64 = @floatFromInt(example.num_supervised_tokens);
+        const weight: f64 = @floatFromInt(input.supervised_tokens);
         metrics.examples_seen += 1;
-        metrics.supervised_tokens_seen += example.num_supervised_tokens;
+        metrics.supervised_tokens_seen += input.supervised_tokens;
         if (exampleHasTeacherTargets(example)) {
             metrics.teacher_examples_seen += 1;
-            metrics.teacher_supervised_tokens_seen += example.num_supervised_tokens;
+            metrics.teacher_supervised_tokens_seen += input.supervised_tokens;
             total_weighted_teacher_temperature += @as(f64, example.teacher_temperature) * weight;
         }
         total_weighted_loss += @as(f64, step.loss) * weight;
         total_weighted_grad_norm += @as(f64, step.grad_norm) * weight;
+        recordStepExecutionEvidence(&metrics, step);
         if (step.optimizer_stepped) metrics.optimizer_steps += 1;
+    }
+
+    // Do not discard the final partial accumulation window at an epoch
+    // boundary. Besides preserving every example's gradient, this leaves the
+    // trainer in the only state that can be checkpointed safely.
+    if (mode == .train) {
+        if (try trainer.flushAccumulatedGradients()) |_| {
+            metrics.optimizer_steps += 1;
+            if (trainer.config.strict_metal_execution) metrics.metal_optimizer_steps += 1;
+        }
     }
 
     if (metrics.supervised_tokens_seen > 0) {
@@ -787,19 +1042,15 @@ fn runPreparedExamples(
 
 pub fn saveTrainerAsGemmaBundle(
     allocator: std.mem.Allocator,
-    trainer: *const real_autodiff.RealAutodiffTrainer,
+    trainer: *real_autodiff.RealAutodiffTrainer,
     base_model_dir: []const u8,
     adapter_model_dir: []const u8,
     out_dir: []const u8,
 ) !void {
+    try trainer.syncDeviceTrainablesToHost();
+
     var adapter_inspect = try gemma4.inspectCheckpoint(allocator, adapter_model_dir);
     defer gemma4.freeInspectionSummary(allocator, &adapter_inspect);
-
-    try compat.cwd().createDirPath(compat.io(), out_dir);
-    const adapter_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, gemma4.adapter_checkpoint_file_name });
-    defer allocator.free(adapter_checkpoint_path);
-    const adapter_config_path = try std.fs.path.join(allocator, &.{ out_dir, gemma4.adapter_config_file_name });
-    defer allocator.free(adapter_config_path);
 
     var tensors = std.ArrayList(WriteTensorF32).empty;
     defer tensors.deinit(allocator);
@@ -814,36 +1065,50 @@ pub fn saveTrainerAsGemmaBundle(
         owned_shapes.deinit(allocator);
     }
 
+    const slot_count = trainer.lora_params.items.len;
+    try tensors.ensureTotalCapacity(allocator, slot_count);
+    try owned_names.ensureTotalCapacity(allocator, slot_count);
+    try owned_shapes.ensureTotalCapacity(allocator, slot_count);
+
     for (trainer.lora_params.items) |slot| {
-        const mapped_name = try mapTrainerSlotNameToGemmaAdapterTensor(allocator, slot.name);
-        errdefer allocator.free(mapped_name);
-        const dims = try dimsToUsize(allocator, slot.dims);
-        errdefer allocator.free(dims);
-        try owned_names.append(allocator, mapped_name);
-        try owned_shapes.append(allocator, dims);
-        try tensors.append(allocator, .{
-            .name = mapped_name,
-            .shape = dims,
+        const owned = blk: {
+            const mapped_name = try mapTrainerSlotNameToGemmaAdapterTensor(allocator, slot.name);
+            errdefer allocator.free(mapped_name);
+            const dims = try dimsToUsize(allocator, slot.dims);
+            break :blk .{ .name = mapped_name, .dims = dims };
+        };
+        owned_names.appendAssumeCapacity(owned.name);
+        owned_shapes.appendAssumeCapacity(owned.dims);
+        tensors.appendAssumeCapacity(.{
+            .name = owned.name,
+            .shape = owned.dims,
             .data = slot.weights,
         });
     }
 
-    try writeHeaderAndTensorsF32(allocator, adapter_checkpoint_path, tensors.items);
     const base_name = adapter_inspect.base_model_name_or_path orelse base_model_dir;
     const rank = adapter_inspect.lora_rank orelse return error.MissingAdapterConfig;
     const alpha = @as(f32, @floatCast(adapter_inspect.lora_alpha orelse return error.MissingAdapterConfig));
     const target_modules = adapter_inspect.target_modules orelse gemma4.default_lora_target_modules[0..];
-    try writeAdapterConfigJson(allocator, adapter_config_path, base_name, rank, alpha, target_modules, .{
-        .enabled = adapter_inspect.recursive_lora_enabled,
-        .source_num_layers = adapter_inspect.recursive_source_num_layers orelse 0,
-        .shared_block_size = adapter_inspect.recursive_shared_block_size orelse 0,
-        .loop_count = adapter_inspect.recursive_loop_count orelse 0,
-        .init_strategy = adapter_inspect.recursive_init_strategy orelse "average_residual_svd",
+    try writeAndPublishGemmaBundle(allocator, out_dir, tensors.items, .{
+        .base_model_name_or_path = base_name,
+        .base_model_sha256 = adapter_inspect.base_model_sha256,
+        .tokenizer_sha256 = adapter_inspect.tokenizer_sha256,
+        .chat_template_sha256 = adapter_inspect.chat_template_sha256,
+        .rank = rank,
+        .alpha = alpha,
+        .target_modules = target_modules,
+        .recursive_config = .{
+            .enabled = adapter_inspect.recursive_lora_enabled,
+            .source_num_layers = adapter_inspect.recursive_source_num_layers orelse 0,
+            .shared_block_size = adapter_inspect.recursive_shared_block_size orelse 0,
+            .loop_count = adapter_inspect.recursive_loop_count orelse 0,
+            .init_strategy = adapter_inspect.recursive_init_strategy orelse "average_residual_svd",
+        },
+        .tokenizer_config_path = adapter_inspect.tokenizer_config_path,
+        .tokenizer_path = adapter_inspect.tokenizer_path,
+        .special_tokens_map_path = adapter_inspect.special_tokens_map_path,
     });
-
-    try copySupportingArtifactIfPresent(allocator, adapter_inspect.tokenizer_config_path, out_dir, gemma4.tokenizer_config_file_name);
-    try copySupportingArtifactIfPresent(allocator, adapter_inspect.tokenizer_path, out_dir, gemma4.tokenizer_file_name);
-    try copySupportingArtifactIfPresent(allocator, adapter_inspect.special_tokens_map_path, out_dir, gemma4.special_tokens_map_file_name);
 }
 
 pub fn sequenceLogprobForExample(
@@ -853,7 +1118,10 @@ pub fn sequenceLogprobForExample(
     example: *const gemma4.PreparedExampleInput,
     seq_len: u32,
 ) !f32 {
-    var owned = try makeTrainerInputForExample(allocator, ctx, example, seq_len);
+    // Scoring needs the full vocabulary logits node. Force the dense graph
+    // signature used by preference training; ordinary SFT uses the bounded
+    // sparse-loss graph and intentionally does not materialize this tensor.
+    var owned = try makeTrainerInputForExampleScaled(allocator, ctx, example, seq_len, 1.0);
     defer owned.deinit(allocator);
     try trainer.ensureGraphBuilt(owned.trainer_input);
 
@@ -923,12 +1191,13 @@ pub fn sequenceLogprobForExample(
     const vocab_size: usize = @intCast(ctx.graph_config.vocab_size);
     var sum_logp: f32 = 0.0;
     const rows = @min(example.labels.len, @as(usize, @intCast(seq_len)));
-    for (0..rows) |row_idx| {
+    for (1..rows) |row_idx| {
         const label = example.labels[row_idx];
         if (label < 0) continue;
         const token_idx: usize = @intCast(label);
         if (token_idx >= vocab_size) return error.LabelOutOfRange;
-        const row = logits[row_idx * vocab_size ..][0..vocab_size];
+        const predictor_row = row_idx - 1;
+        const row = logits[predictor_row * vocab_size ..][0..vocab_size];
         sum_logp += logProbAtToken(row, token_idx);
     }
     return sum_logp;
@@ -1089,6 +1358,96 @@ const WriteTensorF32 = struct {
     data: []const f32,
 };
 
+const GemmaBundleWriteSpec = struct {
+    base_model_name_or_path: []const u8,
+    base_model_sha256: ?[]const u8 = null,
+    tokenizer_sha256: ?[]const u8 = null,
+    chat_template_sha256: ?[]const u8 = null,
+    rank: usize,
+    alpha: f32,
+    target_modules: []const []const u8,
+    recursive_config: @import("recursive_lora.zig").Config = .{},
+    tokenizer_config_path: ?[]const u8 = null,
+    tokenizer_path: ?[]const u8 = null,
+    special_tokens_map_path: ?[]const u8 = null,
+};
+
+var gemma_bundle_publication_nonce: std.atomic.Value(u64) = .init(0);
+
+fn writeAndPublishGemmaBundle(
+    allocator: std.mem.Allocator,
+    out_dir: []const u8,
+    tensors: []const WriteTensorF32,
+    spec: GemmaBundleWriteSpec,
+) !void {
+    const parent_dir = std.fs.path.dirname(out_dir) orelse ".";
+    try compat.cwd().createDirPath(compat.io(), parent_dir);
+
+    const staging_dir = try uniqueGemmaBundleSiblingPath(allocator, out_dir, "staging");
+    defer allocator.free(staging_dir);
+    try compat.cwd().createDir(compat.io(), staging_dir, .default_dir);
+    var staging_published = false;
+    defer if (!staging_published) compat.cwd().deleteTree(compat.io(), staging_dir) catch {};
+
+    const adapter_checkpoint_path = try std.fs.path.join(allocator, &.{ staging_dir, gemma4.adapter_checkpoint_file_name });
+    defer allocator.free(adapter_checkpoint_path);
+    const adapter_config_path = try std.fs.path.join(allocator, &.{ staging_dir, gemma4.adapter_config_file_name });
+    defer allocator.free(adapter_config_path);
+
+    try writeHeaderAndTensorsF32(allocator, adapter_checkpoint_path, tensors);
+    try writeAdapterConfigJson(
+        allocator,
+        adapter_config_path,
+        spec.base_model_name_or_path,
+        spec.base_model_sha256,
+        spec.tokenizer_sha256,
+        spec.chat_template_sha256,
+        spec.rank,
+        spec.alpha,
+        spec.target_modules,
+        spec.recursive_config,
+    );
+    try copySupportingArtifactIfPresent(allocator, spec.tokenizer_config_path, staging_dir, gemma4.tokenizer_config_file_name);
+    try copySupportingArtifactIfPresent(allocator, spec.tokenizer_path, staging_dir, gemma4.tokenizer_file_name);
+    try copySupportingArtifactIfPresent(allocator, spec.special_tokens_map_path, staging_dir, gemma4.special_tokens_map_file_name);
+
+    try gemma4.validateLoRAAdapterInventory(allocator, staging_dir);
+
+    try publishStagedGemmaBundle(staging_dir, out_dir);
+    staging_published = true;
+}
+
+fn uniqueGemmaBundleSiblingPath(
+    allocator: std.mem.Allocator,
+    destination: []const u8,
+    label: []const u8,
+) ![]u8 {
+    const nonce = gemma_bundle_publication_nonce.fetchAdd(1, .monotonic);
+    const leaf = try std.fmt.allocPrint(
+        allocator,
+        ".{s}.gemma-bundle-{s}-{d}-{d}",
+        .{ std.fs.path.basename(destination), label, std.posix.system.getpid(), nonce },
+    );
+    defer allocator.free(leaf);
+    return std.fs.path.join(allocator, &.{ std.fs.path.dirname(destination) orelse ".", leaf });
+}
+
+fn pathExists(path: []const u8) !bool {
+    compat.cwd().access(compat.io(), path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn publishStagedGemmaBundle(
+    staging_dir: []const u8,
+    out_dir: []const u8,
+) !void {
+    if (try pathExists(out_dir)) return error.GemmaBundleOutputAlreadyExists;
+    try std.Io.Dir.rename(compat.cwd(), staging_dir, compat.cwd(), out_dir, compat.io());
+}
+
 fn mapTrainerSlotNameToGemmaAdapterTensor(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     if (try mapUseSiteTrainerSlotNameToLoopTensor(allocator, name)) |mapped| return mapped;
     if (std.mem.endsWith(u8, name, ".lora_A")) {
@@ -1166,6 +1525,9 @@ fn writeAdapterConfigJson(
     allocator: std.mem.Allocator,
     path: []const u8,
     base_model_name_or_path: []const u8,
+    base_model_sha256: ?[]const u8,
+    tokenizer_sha256: ?[]const u8,
+    chat_template_sha256: ?[]const u8,
     rank: usize,
     alpha: f32,
     target_modules: []const []const u8,
@@ -1176,6 +1538,9 @@ fn writeAdapterConfigJson(
     if (recursive_config.enabled) {
         try std.json.Stringify.value(.{
             .base_model_name_or_path = base_model_name_or_path,
+            .antfly_base_model_sha256 = base_model_sha256,
+            .antfly_tokenizer_sha256 = tokenizer_sha256,
+            .antfly_chat_template_sha256 = chat_template_sha256,
             .peft_type = "LORA",
             .task_type = "CAUSAL_LM",
             .r = rank,
@@ -1192,6 +1557,9 @@ fn writeAdapterConfigJson(
     } else {
         try std.json.Stringify.value(.{
             .base_model_name_or_path = base_model_name_or_path,
+            .antfly_base_model_sha256 = base_model_sha256,
+            .antfly_tokenizer_sha256 = tokenizer_sha256,
+            .antfly_chat_template_sha256 = chat_template_sha256,
             .peft_type = "LORA",
             .task_type = "CAUSAL_LM",
             .r = rank,
@@ -1216,7 +1584,87 @@ fn copySupportingArtifactIfPresent(
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = dst_path, .data = contents });
 }
 
-test "makeTrainerInputForExample builds masked one-hot targets" {
+test "gemma4 bundle publication preserves immutable output and publishes fresh directory" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root);
+    const out_dir = try std.fs.path.join(allocator, &.{ root, "trained" });
+    defer allocator.free(out_dir);
+    try compat.cwd().createDirPath(compat.io(), out_dir);
+
+    const checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, gemma4.adapter_checkpoint_file_name });
+    defer allocator.free(checkpoint_path);
+    const config_path = try std.fs.path.join(allocator, &.{ out_dir, gemma4.adapter_config_file_name });
+    defer allocator.free(config_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = checkpoint_path, .data = "known-good-checkpoint" });
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = config_path, .data = "known-good-config" });
+
+    const missing_support_path = try std.fs.path.join(allocator, &.{ root, "missing-tokenizer-config.json" });
+    defer allocator.free(missing_support_path);
+    const a_data = [_]f32{ 1.0, 2.0 };
+    const b_data = [_]f32{ 0.0, 0.0 };
+    const tensors = [_]WriteTensorF32{
+        .{
+            .name = "model.layers.0.self_attn.q_proj.weight.lora_A.weight",
+            .shape = &.{ 1, 2 },
+            .data = &a_data,
+        },
+        .{
+            .name = "model.layers.0.self_attn.q_proj.weight.lora_B.weight",
+            .shape = &.{ 2, 1 },
+            .data = &b_data,
+        },
+    };
+    const base_spec = GemmaBundleWriteSpec{
+        .base_model_name_or_path = "base-model",
+        .rank = 1,
+        .alpha = 1,
+        .target_modules = &.{"model.layers.0.self_attn.q_proj"},
+    };
+    var failed = false;
+    writeAndPublishGemmaBundle(allocator, out_dir, &tensors, .{
+        .base_model_name_or_path = base_spec.base_model_name_or_path,
+        .rank = base_spec.rank,
+        .alpha = base_spec.alpha,
+        .target_modules = base_spec.target_modules,
+        .tokenizer_config_path = missing_support_path,
+    }) catch {
+        failed = true;
+    };
+    try std.testing.expect(failed);
+
+    const preserved_checkpoint = try c_file.readFile(allocator, checkpoint_path);
+    defer allocator.free(preserved_checkpoint);
+    try std.testing.expectEqualStrings("known-good-checkpoint", preserved_checkpoint);
+    const preserved_config = try c_file.readFile(allocator, config_path);
+    defer allocator.free(preserved_config);
+    try std.testing.expectEqualStrings("known-good-config", preserved_config);
+
+    try std.testing.expectError(
+        error.GemmaBundleOutputAlreadyExists,
+        writeAndPublishGemmaBundle(allocator, out_dir, &tensors, base_spec),
+    );
+    const still_preserved_checkpoint = try c_file.readFile(allocator, checkpoint_path);
+    defer allocator.free(still_preserved_checkpoint);
+    try std.testing.expectEqualStrings("known-good-checkpoint", still_preserved_checkpoint);
+    const still_preserved_config = try c_file.readFile(allocator, config_path);
+    defer allocator.free(still_preserved_config);
+    try std.testing.expectEqualStrings("known-good-config", still_preserved_config);
+
+    const fresh_out_dir = try std.fs.path.join(allocator, &.{ root, "trained-fresh" });
+    defer allocator.free(fresh_out_dir);
+    try writeAndPublishGemmaBundle(allocator, fresh_out_dir, &tensors, base_spec);
+    var inspection = try gemma4.inspectCheckpoint(allocator, fresh_out_dir);
+    defer gemma4.freeInspectionSummary(allocator, &inspection);
+    try std.testing.expect(inspection.has_adapter_weights);
+    try std.testing.expectEqual(@as(?usize, 1), inspection.lora_rank);
+    try std.testing.expectEqualStrings("base-model", inspection.base_model_name_or_path.?);
+}
+
+test "gemma4 makeTrainerInputForExample builds bounded sparse causal targets" {
     const allocator = std.testing.allocator;
     var ctx = GemmaAutodiffCtx.init(.{
         .family = .gemma,
@@ -1227,6 +1675,91 @@ test "makeTrainerInputForExample builds masked one-hot targets" {
         .attention_head_dim = 4,
         .intermediate_size = 32,
         .vocab_size = 32,
+        .position_encoding = .rope,
+        .norm_type = .rms_norm,
+        .activation = .gelu_new,
+        .norm_eps = 1e-6,
+        .norm_weight_offset = 1.0,
+        .final_logit_softcapping = 30.0,
+    });
+    var prompt_input_ids = [_]i32{ 1, 2 };
+    var response_input_ids = [_]i32{ 3, 4 };
+    var input_ids = [_]i32{ 1, 2, 3, 4 };
+    var labels = [_]i32{ -100, -100, 3, 4 };
+    const ex = gemma4.PreparedExampleInput{
+        .mode = .instruction,
+        .prompt_input_ids = prompt_input_ids[0..],
+        .response_input_ids = response_input_ids[0..],
+        .num_prompt_tokens = 2,
+        .num_response_tokens = 2,
+        .input_ids = input_ids[0..],
+        .labels = labels[0..],
+        .num_input_tokens = 4,
+        .num_supervised_tokens = 2,
+    };
+
+    var owned = try makeTrainerInputForExample(allocator, &ctx, &ex, 4);
+    defer owned.deinit(allocator);
+
+    try std.testing.expectEqual(@as(i64, 1), owned.input_ids[0]);
+    try std.testing.expectEqual(@as(usize, 4), owned.targets.len);
+    try std.testing.expectEqual(@as(u8, 2), owned.trainer_input.targets_shape.rank());
+    try std.testing.expectEqual(@as(i64, 2), owned.trainer_input.targets_shape.dim(0));
+    try std.testing.expectEqual(sparse_target_columns, owned.trainer_input.targets_shape.dim(1));
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, 3.0, 2.0, 4.0 }, owned.targets);
+}
+
+test "gemma4 prepared examples reject malformed labels and count drift" {
+    const allocator = std.testing.allocator;
+    var ctx = GemmaAutodiffCtx.init(.{
+        .family = .gemma,
+        .hidden_size = 16,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 4,
+        .intermediate_size = 32,
+        .vocab_size = 32,
+        .position_encoding = .rope,
+        .norm_type = .rms_norm,
+        .activation = .gelu_new,
+        .norm_eps = 1e-6,
+        .norm_weight_offset = 1.0,
+    });
+    var input_ids = [_]i32{ 1, 2, 3, 4 };
+    var labels = [_]i32{ -100, -100, 3, 4 };
+    var ex = gemma4.PreparedExampleInput{
+        .mode = .instruction,
+        .prompt_input_ids = input_ids[0..2],
+        .response_input_ids = input_ids[2..4],
+        .num_prompt_tokens = 2,
+        .num_response_tokens = 2,
+        .input_ids = input_ids[0..],
+        .labels = labels[0..],
+        .num_input_tokens = 4,
+        .num_supervised_tokens = 2,
+    };
+
+    labels[2] = -1;
+    try std.testing.expectError(error.InvalidPreparedLabel, makeTrainerInputForExample(allocator, &ctx, &ex, 4));
+    labels[2] = 32;
+    try std.testing.expectError(error.LabelOutOfRange, makeTrainerInputForExample(allocator, &ctx, &ex, 4));
+    labels[2] = 3;
+    ex.num_supervised_tokens = 1;
+    try std.testing.expectError(error.SupervisedTokenCountMismatch, makeTrainerInputForExample(allocator, &ctx, &ex, 4));
+}
+
+test "gemma4 sparse causal targets do not scale with vocabulary size" {
+    const allocator = std.testing.allocator;
+    var ctx = GemmaAutodiffCtx.init(.{
+        .family = .gemma,
+        .hidden_size = 16,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 4,
+        .intermediate_size = 32,
+        .vocab_size = 262_144,
         .position_encoding = .rope,
         .norm_type = .rms_norm,
         .activation = .gelu_new,
@@ -1251,14 +1784,87 @@ test "makeTrainerInputForExample builds masked one-hot targets" {
 
     var owned = try makeTrainerInputForExample(allocator, &ctx, &ex, 4);
     defer owned.deinit(allocator);
-
-    try std.testing.expectEqual(@as(i64, 1), owned.input_ids[0]);
-    try std.testing.expectEqual(@as(f32, 0.0), owned.targets[0]);
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), owned.targets[2 * 32 + 3], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), owned.targets[3 * 32 + 4], 1e-6);
+    try std.testing.expectEqual(@as(usize, 4), owned.targets.len);
 }
 
-test "makeTrainerInputForTokenLogprobGrads builds per-token weighted targets" {
+test "gemma4 sparse causal loss graph projects only supervised rows" {
+    const allocator = std.testing.allocator;
+    var ctx = GemmaAutodiffCtx.init(.{
+        .family = .gemma,
+        .hidden_size = 16,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 4,
+        .intermediate_size = 32,
+        .vocab_size = 32,
+        .position_encoding = .rope,
+        .norm_type = .rms_norm,
+        .activation = .gelu_new,
+        .norm_eps = 1e-6,
+        .norm_weight_offset = 1.0,
+        .final_logit_softcapping = 30.0,
+    });
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var bld = Builder.init(&graph);
+    const hidden = try bld.parameter("hidden", Shape.init(.f32, &.{ 1, 4, 16 }));
+    const targets = try bld.parameter("targets", Shape.init(.f32, &.{ 2, sparse_target_columns }));
+
+    const loss = try GemmaAutodiffCtx.buildLoss(@ptrCast(&ctx), &bld, hidden, targets);
+    try std.testing.expectEqual(@as(i64, 1), graph.node(loss).output_shape.numElements().?);
+    var saw_tanh = false;
+    for (0..graph.nodeCount()) |idx| {
+        switch (graph.node(@intCast(idx)).op) {
+            .tanh => saw_tanh = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_tanh);
+}
+
+test "gemma4 sparse teacher loss never constructs a sequence by vocabulary target" {
+    const allocator = std.testing.allocator;
+    var ctx = GemmaAutodiffCtx.init(.{
+        .family = .gemma,
+        .hidden_size = 16,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 4,
+        .intermediate_size = 32,
+        .vocab_size = 32,
+        .position_encoding = .rope,
+        .norm_type = .rms_norm,
+        .activation = .gelu_new,
+        .norm_eps = 1e-6,
+        .norm_weight_offset = 1.0,
+    });
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var bld = Builder.init(&graph);
+    const hidden = try bld.parameter("hidden", Shape.init(.f32, &.{ 1, 4, 16 }));
+    const targets = try bld.parameter("targets", Shape.init(.f32, &.{ 2, 5 }));
+
+    const loss = try GemmaAutodiffCtx.buildLoss(@ptrCast(&ctx), &bld, hidden, targets);
+    try std.testing.expectEqual(@as(i64, 1), graph.node(loss).output_shape.numElements().?);
+    for (0..graph.nodeCount()) |idx| {
+        const shape = graph.node(@intCast(idx)).output_shape;
+        try std.testing.expect(!(shape.rank() == 2 and shape.dim(0) == 4 and shape.dim(1) == 32));
+    }
+}
+
+test "gemma4 loadGraphConfig supports a GGUF manifest directory" {
+    const raw_path = std.c.getenv("ANTFLY_GEMMA4_FINETUNE_TEST_MODEL") orelse
+        return error.SkipZigTest;
+    const config = try loadGraphConfig(std.testing.allocator, std.mem.span(raw_path));
+    try std.testing.expect(config.family == .gemma);
+    try std.testing.expect(config.hidden_size > 0);
+    try std.testing.expect(config.num_hidden_layers > 0);
+    try std.testing.expect(config.vocab_size > 0);
+}
+
+test "gemma4 makeTrainerInputForTokenLogprobGrads builds per-token weighted targets" {
     const allocator = std.testing.allocator;
     var ctx = GemmaAutodiffCtx.init(.{
         .family = .gemma,
@@ -1294,11 +1900,11 @@ test "makeTrainerInputForTokenLogprobGrads builds per-token weighted targets" {
     var owned = try makeTrainerInputForTokenLogprobGrads(allocator, &ctx, &ex, 4, &.{ 0.25, -0.5 });
     defer owned.deinit(allocator);
 
-    try std.testing.expectApproxEqAbs(@as(f32, -1.0), owned.targets[2 * 32 + 3], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), owned.targets[3 * 32 + 4], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), owned.targets[1 * 32 + 3], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), owned.targets[2 * 32 + 4], 1e-6);
 }
 
-test "makeTrainerInputForExample builds sparse teacher soft targets" {
+test "gemma4 teacher soft targets are sparse and aligned to causal predictor rows" {
     const allocator = std.testing.allocator;
     var ctx = GemmaAutodiffCtx.init(.{
         .family = .gemma,
@@ -1308,7 +1914,7 @@ test "makeTrainerInputForExample builds sparse teacher soft targets" {
         .num_key_value_heads = 2,
         .attention_head_dim = 4,
         .intermediate_size = 32,
-        .vocab_size = 32,
+        .vocab_size = 262_144,
         .position_encoding = .rope,
         .norm_type = .rms_norm,
         .activation = .gelu_new,
@@ -1321,15 +1927,15 @@ test "makeTrainerInputForExample builds sparse teacher soft targets" {
     var labels = [_]i32{ -100, -100, 3, 4 };
     var teacher_ids = [_]i32{
         0, 0,
-        0, 0,
         7, 8,
         9, 10,
+        0, 0,
     };
     var teacher_probs = [_]f32{
         0.0,  0.0,
-        0.0,  0.0,
         0.75, 0.25,
         0.2,  0.8,
+        0.0,  0.0,
     };
     const ex = gemma4.PreparedExampleInput{
         .mode = .instruction,
@@ -1350,17 +1956,61 @@ test "makeTrainerInputForExample builds sparse teacher soft targets" {
     var owned = try makeTrainerInputForExample(allocator, &ctx, &ex, 4);
     defer owned.deinit(allocator);
 
-    try std.testing.expectEqual(@as(f32, 0.0), owned.targets[0 * 32 + 0]);
-    try std.testing.expectEqual(@as(f32, 0.0), owned.targets[1 * 32 + 0]);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.5), owned.targets[2 * 32 + 7], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), owned.targets[2 * 32 + 8], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.4), owned.targets[3 * 32 + 9], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.6), owned.targets[3 * 32 + 10], 1e-6);
-    try std.testing.expectEqual(@as(f32, 0.0), owned.targets[2 * 32 + 3]);
-    try std.testing.expectEqual(@as(f32, 0.0), owned.targets[3 * 32 + 4]);
+    try std.testing.expectEqual(@as(i64, 2), owned.trainer_input.targets_shape.dim(0));
+    try std.testing.expectEqual(@as(i64, 5), owned.trainer_input.targets_shape.dim(1));
+    try std.testing.expectEqualSlices(f32, &.{
+        1.0, 7.0, 8.0,  0.75, 0.25,
+        2.0, 9.0, 10.0, 0.2,  0.8,
+    }, owned.targets);
 }
 
-test "makeTrainerInputForTokenLogprobGrads keeps prompt rows zero and aligns completion weights" {
+test "gemma4 dense and sparse teacher targets reject infinite values" {
+    var prompt_input_ids = [_]i32{1};
+    var response_input_ids = [_]i32{2};
+    var input_ids = [_]i32{ 1, 2 };
+    var labels = [_]i32{ -100, 2 };
+    var teacher_ids = [_]i32{ 3, 0 };
+    var teacher_probs = [_]f32{ 0.5, 0.0 };
+    var example = gemma4.PreparedExampleInput{
+        .mode = .instruction,
+        .prompt_input_ids = prompt_input_ids[0..],
+        .response_input_ids = response_input_ids[0..],
+        .num_prompt_tokens = 1,
+        .num_response_tokens = 1,
+        .input_ids = input_ids[0..],
+        .labels = labels[0..],
+        .num_input_tokens = 2,
+        .num_supervised_tokens = 1,
+        .teacher_top_k_token_ids = teacher_ids[0..],
+        .teacher_top_k_probs = teacher_probs[0..],
+        .teacher_top_k = 1,
+        .teacher_temperature = std.math.inf(f32),
+    };
+    var dense_targets = [_]f32{0} ** 16;
+    var sparse_targets = [_]f32{0} ** 3;
+
+    try std.testing.expectError(
+        error.InvalidTeacherTemperature,
+        fillTeacherTopKTargets(&dense_targets, 2, 8, &example),
+    );
+    try std.testing.expectError(
+        error.InvalidTeacherTemperature,
+        fillSparseTeacherTopKTargets(&sparse_targets, 3, 2, 8, &example),
+    );
+
+    example.teacher_temperature = 1.0;
+    teacher_probs[0] = std.math.inf(f32);
+    try std.testing.expectError(
+        error.InvalidTeacherDistillationTargets,
+        fillTeacherTopKTargets(&dense_targets, 2, 8, &example),
+    );
+    try std.testing.expectError(
+        error.InvalidTeacherDistillationTargets,
+        fillSparseTeacherTopKTargets(&sparse_targets, 3, 2, 8, &example),
+    );
+}
+
+test "gemma4 makeTrainerInputForTokenLogprobGrads aligns completion weights with predictor rows" {
     const allocator = std.testing.allocator;
     var ctx = GemmaAutodiffCtx.init(.{
         .family = .gemma,
@@ -1396,16 +2046,18 @@ test "makeTrainerInputForTokenLogprobGrads keeps prompt rows zero and aligns com
     var owned = try makeTrainerInputForTokenLogprobGrads(allocator, &ctx, &ex, 6, &.{ 0.25, -0.5, 1.5 });
     defer owned.deinit(allocator);
 
-    for (0..3) |row_idx| {
+    for (0..2) |row_idx| {
         const row = owned.targets[row_idx * 32 ..][0..32];
         for (row) |value| try std.testing.expectEqual(@as(f32, 0.0), value);
     }
-    try std.testing.expectApproxEqAbs(@as(f32, -1.5), owned.targets[3 * 32 + 5], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 3.0), owned.targets[4 * 32 + 7], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, -9.0), owned.targets[5 * 32 + 9], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.5), owned.targets[2 * 32 + 5], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), owned.targets[3 * 32 + 7], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -9.0), owned.targets[4 * 32 + 9], 1e-6);
+    const final_row = owned.targets[5 * 32 ..][0..32];
+    for (final_row) |value| try std.testing.expectEqual(@as(f32, 0.0), value);
 }
 
-test "makeTrainerInputForExample scales teacher soft targets by temperature squared" {
+test "gemma4 makeTrainerInputForExample scales teacher soft targets by temperature squared" {
     const allocator = std.testing.allocator;
     var ctx = GemmaAutodiffCtx.init(.{
         .family = .gemma,
@@ -1427,12 +2079,12 @@ test "makeTrainerInputForExample scales teacher soft targets by temperature squa
     var input_ids = [_]i32{ 1, 2 };
     var labels = [_]i32{ -100, 2 };
     var teacher_ids = [_]i32{
-        0, 0,
         5, 6,
+        0, 0,
     };
     var teacher_probs = [_]f32{
-        0.0,  0.0,
         0.25, 0.75,
+        0.0,  0.0,
     };
     const ex = gemma4.PreparedExampleInput{
         .mode = .instruction,
@@ -1453,6 +2105,5 @@ test "makeTrainerInputForExample scales teacher soft targets by temperature squa
     var owned = try makeTrainerInputForExample(allocator, &ctx, &ex, 2);
     defer owned.deinit(allocator);
 
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), owned.targets[1 * 32 + 5], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 6.0), owned.targets[1 * 32 + 6], 1e-6);
+    try std.testing.expectEqualSlices(f32, &.{ 0.0, 5.0, 6.0, 1.0, 3.0 }, owned.targets);
 }

@@ -12,16 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Gemma4 text-only LoRA finetuning module.
-//
-// Follows the same surrogate-gradient pattern as colqwen2.zig:
-//   1. offline tokenization  (prepare-gemma4-lora-inputs)
-//   2. surrogate gradient training (train-eval-gemma4-lora-bundle)
-//
-// The surrogate score hashes prompt/response token IDs into synthetic feature
-// rows per LoRA layer, then uses a deterministic probe vector to measure the
-// layer's response. The training loss is 0.5*(score - 1)^2, pushing the model
-// to fit each given response.
+// Gemma4 LoRA data, adapter, and artifact contracts. Production training uses
+// the real causal-LM autodiff path in gemma4_real_autodiff.zig through
+// gemma4_train_command.zig. The legacy surrogate helpers in this file remain
+// available only behind the command's explicit diagnostic trainer mode.
 const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
@@ -50,13 +44,21 @@ const native_compute = @import("../ops/native_compute.zig");
 const gemma_data = @import("gemma_data.zig");
 const gemma_chat_data = @import("gemma_chat_data.zig");
 const chat_template = @import("chat_template.zig");
+const artifact_publication = @import("artifact_publication.zig");
 const gemma4_mm = @import("../architectures/gemma4_multimodal.zig");
 const gemma4_projector = @import("../architectures/gemma4_projector.zig");
+const session_factory = @import("../architectures/session_factory.zig");
 const model_manager_mod = @import("../server/model_manager.zig");
 
 pub const artifact_family_version = "gemma4_lora/v1alpha1";
 pub const prepared_schema_v2 = "gemma4_prepared/v2";
 pub const prepared_schema_v3 = "gemma4_prepared/v3";
+pub const prepared_schema_v4 = "gemma4_prepared/v4";
+/// Until the Metal attention training graph is chunked, admitting longer
+/// sequences can create an unbounded quadratic allocation. Keep this explicit
+/// and versioned rather than relying on allocator failure as input admission.
+pub const max_training_seq_len: usize = 2048;
+pub const prepared_chat_template_identity = "antfly_gemma_chat/v1";
 pub const checkpoint_file_name = "model.safetensors";
 pub const adapter_checkpoint_file_name = "adapter_model.safetensors";
 pub const hf_config_file_name = "config.json";
@@ -64,6 +66,12 @@ pub const adapter_config_file_name = "adapter_config.json";
 pub const tokenizer_config_file_name = "tokenizer_config.json";
 pub const tokenizer_file_name = "tokenizer.json";
 pub const special_tokens_map_file_name = "special_tokens_map.json";
+
+// The legacy merge implementation converts base tensors to f32 and builds a
+// complete output buffer. Keep it available for small diagnostic fixtures,
+// but fail closed before admitting production-sized or multi-file models.
+// E2B/E4B materialization must use the forthcoming streaming writer.
+pub const legacy_materialize_max_checkpoint_bytes: u64 = 64 * 1024 * 1024;
 
 pub const default_lora_target_modules = [_][]const u8{
     "q_proj",
@@ -75,6 +83,28 @@ pub const default_lora_target_modules = [_][]const u8{
     "down_proj",
 };
 
+/// PEFT-style compatibility inventory for query/value-only LoRA.
+pub const peft_qv_lora_target_modules = [_][]const u8{
+    "q_proj",
+    "v_proj",
+};
+
+/// The complete trainable text-linear inventory for dense Gemma 4 E-models.
+/// The PLE aliases are intentionally specific so a bare `proj` never selects
+/// an encoder or projector tensor.
+pub const text_all_linear_lora_target_modules = [_][]const u8{
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "per_layer_input.inp_gate",
+    "per_layer_input.proj",
+    "per_layer_input.per_layer_model_proj",
+};
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -84,6 +114,19 @@ pub const Variant = enum {
     adapter_only,
     incomplete,
 };
+
+pub const Gemma4LoRATargetPreset = enum {
+    /// Hugging Face PEFT compatibility: query and value projections only.
+    peft_qv,
+    /// Every available text transformer and PLE linear in the checkpoint.
+    text_all_linear,
+};
+
+pub fn parseGemma4LoRATargetPreset(name: []const u8) ?Gemma4LoRATargetPreset {
+    if (std.mem.eql(u8, name, "peft-qv") or std.mem.eql(u8, name, "peft_qv")) return .peft_qv;
+    if (std.mem.eql(u8, name, "text-all-linear") or std.mem.eql(u8, name, "text_all_linear")) return .text_all_linear;
+    return null;
+}
 
 pub const PreparedExampleInput = struct {
     mode: gemma_data.Mode,
@@ -121,6 +164,10 @@ pub const PreparedInputsSummary = struct {
     max_examples: usize,
     examples_seen: usize,
     tokenizer_class: ?[]const u8 = null,
+    base_model_sha256: ?[]const u8 = null,
+    tokenizer_sha256: ?[]const u8 = null,
+    chat_template_sha256: ?[]const u8 = null,
+    prepared_examples_sha256: ?[]const u8 = null,
     max_seq_len: usize = 512,
     max_prompt_tokens: usize = 0,
     max_response_tokens: usize = 0,
@@ -150,6 +197,19 @@ pub const ProjectorFingerprint = struct {
     path: []const u8,
     sha256: []const u8,
     size_bytes: u64,
+};
+
+pub const ModelProvenance = struct {
+    base_model_sha256: []const u8,
+    tokenizer_sha256: []const u8,
+    chat_template_sha256: []const u8,
+
+    pub fn deinit(self: *ModelProvenance, allocator: std.mem.Allocator) void {
+        allocator.free(self.base_model_sha256);
+        allocator.free(self.tokenizer_sha256);
+        allocator.free(self.chat_template_sha256);
+        self.* = undefined;
+    }
 };
 
 const PrepareMediaKind = enum { image, audio };
@@ -202,6 +262,7 @@ pub const Config = struct {
     num_hidden_layers: ?usize = null,
     num_attention_heads: ?usize = null,
     vocab_size: ?usize = null,
+    max_position_embeddings: ?usize = null,
     torch_dtype: ?[]const u8 = null,
     dtype: ?[]const u8 = null,
     text_config: ?TextConfig = null,
@@ -213,12 +274,16 @@ pub const TextConfig = struct {
     num_hidden_layers: ?usize = null,
     num_attention_heads: ?usize = null,
     vocab_size: ?usize = null,
+    max_position_embeddings: ?usize = null,
     dtype: ?[]const u8 = null,
     torch_dtype: ?[]const u8 = null,
 };
 
 pub const AdapterConfig = struct {
     base_model_name_or_path: ?[]const u8 = null,
+    antfly_base_model_sha256: ?[]const u8 = null,
+    antfly_tokenizer_sha256: ?[]const u8 = null,
+    antfly_chat_template_sha256: ?[]const u8 = null,
     peft_type: ?[]const u8 = null,
     task_type: ?[]const u8 = null,
     r: ?usize = null,
@@ -248,6 +313,9 @@ pub const InspectionSummary = struct {
     tokenizer_path: ?[]const u8 = null,
     special_tokens_map_path: ?[]const u8 = null,
     base_model_name_or_path: ?[]const u8 = null,
+    base_model_sha256: ?[]const u8 = null,
+    tokenizer_sha256: ?[]const u8 = null,
+    chat_template_sha256: ?[]const u8 = null,
     model_type: ?[]const u8 = null,
     hidden_size: ?usize = null,
     num_hidden_layers: ?usize = null,
@@ -256,6 +324,7 @@ pub const InspectionSummary = struct {
     torch_dtype: ?[]const u8 = null,
     tokenizer_class: ?[]const u8 = null,
     tokenizer_model_max_length: ?usize = null,
+    max_position_embeddings: ?usize = null,
     lora_rank: ?usize = null,
     lora_alpha: ?f64 = null,
     peft_type: ?[]const u8 = null,
@@ -314,6 +383,9 @@ pub const BootstrapOptions = struct {
     alpha: f32 = 32.0,
     base_model_name_or_path: ?[]const u8 = null,
     target_modules: ?[]const []const u8 = null,
+    /// Gemma 4-specific strict presets. This is separate from the legacy
+    /// cross-model PEFT presets so existing callers remain source-compatible.
+    gemma4_target_preset: ?Gemma4LoRATargetPreset = null,
     target_preset: ?peft.TargetPreset = null,
     use_dora: bool = false,
     init_lora_weights: ?[]const u8 = null,
@@ -394,6 +466,7 @@ pub const LoRABundleInspectionSummary = struct {
     target_preset: ?[]const u8 = null,
     use_dora: ?bool = null,
     init_lora_weights: ?[]const u8 = null,
+    recursive_lora_enabled: bool = false,
     resolved_tensor_count: usize = 0,
     trainable_parameter_count: usize = 0,
     dora_magnitude_tensor_count: usize = 0,
@@ -437,6 +510,8 @@ pub const LoadedLoRABundle = struct {
     base_model_name_or_path: ?[]const u8 = null,
     lora_rank: usize,
     lora_alpha: f32,
+    use_dora: bool = false,
+    recursive_lora_enabled: bool = false,
     target_modules: []const []const u8,
     layers: []LoadedLoRALayer,
 
@@ -507,8 +582,26 @@ pub fn resolveArtifactPaths(allocator: std.mem.Allocator, input: []const u8) !Ar
         .special_tokens_map_path = try optionalPathInDir(allocator, model_dir, special_tokens_map_file_name),
     };
 
+    // Match ModelManifest's selected-artifact order: a canonical dense file
+    // wins over a sharded index, which wins over an auto-detected GGUF.
+    if (paths.checkpoint_path == null) {
+        for (manifest_mod.safetensors_candidates) |candidate| {
+            paths.checkpoint_path = try optionalPathInDir(allocator, model_dir, candidate);
+            if (paths.checkpoint_path != null) break;
+        }
+    }
+    if (paths.checkpoint_path == null) {
+        for (manifest_mod.safetensors_index_candidates) |candidate| {
+            paths.checkpoint_path = try optionalPathInDir(allocator, model_dir, candidate);
+            if (paths.checkpoint_path != null) break;
+        }
+    }
+
     if (stat.kind == .file) {
         if (std.mem.eql(u8, std.fs.path.basename(input), checkpoint_file_name)) {
+            if (paths.checkpoint_path) |p| allocator.free(p);
+            paths.checkpoint_path = try allocator.dupe(u8, input);
+        } else if (std.mem.endsWith(u8, input, ".safetensors.index.json")) {
             if (paths.checkpoint_path) |p| allocator.free(p);
             paths.checkpoint_path = try allocator.dupe(u8, input);
         } else if (std.mem.endsWith(u8, input, ".gguf")) {
@@ -576,6 +669,9 @@ pub fn inspectCheckpoint(allocator: std.mem.Allocator, input: []const u8) !Inspe
         .tokenizer_path = try dupeOptionalString(allocator, paths.tokenizer_path),
         .special_tokens_map_path = try dupeOptionalString(allocator, paths.special_tokens_map_path),
         .base_model_name_or_path = if (adapter_config) |ac| try dupeOptionalString(allocator, ac.base_model_name_or_path) else null,
+        .base_model_sha256 = if (adapter_config) |ac| try dupeOptionalString(allocator, ac.antfly_base_model_sha256) else null,
+        .tokenizer_sha256 = if (adapter_config) |ac| try dupeOptionalString(allocator, ac.antfly_tokenizer_sha256) else null,
+        .chat_template_sha256 = if (adapter_config) |ac| try dupeOptionalString(allocator, ac.antfly_chat_template_sha256) else null,
         .model_type = if (text_config) |tc|
             try dupeOptionalString(allocator, tc.model_type orelse if (config) |c| c.model_type else null)
         else if (config) |c|
@@ -599,6 +695,7 @@ pub fn inspectCheckpoint(allocator: std.mem.Allocator, input: []const u8) !Inspe
             if (v <= 0 or v > @as(f64, @floatFromInt(std.math.maxInt(usize)))) break :blk null;
             break :blk @intFromFloat(v);
         } else null,
+        .max_position_embeddings = if (text_config) |tc| tc.max_position_embeddings orelse if (config) |c| c.max_position_embeddings else null else if (config) |c| c.max_position_embeddings else null,
         .lora_rank = if (adapter_config) |ac| ac.r else null,
         .lora_alpha = if (adapter_config) |ac| ac.lora_alpha else null,
         .peft_type = if (adapter_config) |ac| try dupeOptionalString(allocator, ac.peft_type) else null,
@@ -632,6 +729,9 @@ pub fn freeInspectionSummary(allocator: std.mem.Allocator, summary: *InspectionS
     if (summary.tokenizer_path) |p| allocator.free(p);
     if (summary.special_tokens_map_path) |p| allocator.free(p);
     if (summary.base_model_name_or_path) |p| allocator.free(p);
+    if (summary.base_model_sha256) |p| allocator.free(p);
+    if (summary.tokenizer_sha256) |p| allocator.free(p);
+    if (summary.chat_template_sha256) |p| allocator.free(p);
     if (summary.model_type) |p| allocator.free(p);
     if (summary.torch_dtype) |p| allocator.free(p);
     if (summary.tokenizer_class) |p| allocator.free(p);
@@ -657,19 +757,18 @@ pub fn bootstrapLoRABundle(
     out_dir: []const u8,
     options: BootstrapOptions,
 ) !BootstrapSummary {
+    if (options.rank == 0 or options.rank > std.math.maxInt(u32)) return error.InvalidLoRARank;
+    if (!std.math.isFinite(options.alpha) or options.alpha <= 0) return error.InvalidLoRAAlpha;
+    try validateLoRAInitializerBaseCompatibility(options.init_lora_weights);
     var inspect = try inspectCheckpoint(allocator, model_input);
     defer freeInspectionSummary(allocator, &inspect);
 
     const checkpoint_path = inspect.checkpoint_path orelse inspect.gguf_path orelse return error.MissingMergedCheckpoint;
-    if (options.rank == 0) return error.InvalidLoRARank;
     const recursive_config = try makeRecursiveConfig(inspect, options);
     try recursive_lora.validate(recursive_config);
 
-    const requested_modules = options.target_modules orelse if (options.target_preset) |preset|
-        peft.targetPresetPatterns(preset)
-    else
-        default_lora_target_modules[0..];
-    const all_resolved_tensors = try inferLoRATargetTensorsForModelInput(allocator, model_input, checkpoint_path, requested_modules, options.target_preset);
+    const target_selection = try resolveBootstrapTargetSelection(options);
+    const all_resolved_tensors = try inferLoRATargetTensorsForModelInput(allocator, model_input, checkpoint_path, target_selection);
     defer freeLoRATargetTensors(allocator, all_resolved_tensors);
     var filtered = std.ArrayListUnmanaged(LoRATargetTensor).empty;
     errdefer {
@@ -692,16 +791,28 @@ pub fn bootstrapLoRABundle(
             .output_dim = item.output_dim,
         });
     }
+    try validateExplicitTargetSelection(target_selection, filtered.items);
     const resolved_tensors = try filtered.toOwnedSlice(allocator);
     errdefer freeLoRATargetTensors(allocator, resolved_tensors);
     if (resolved_tensors.len == 0) return error.NoLoRATargetTensorsResolved;
 
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    // Persist exact module paths from the selected checkpoint schema. This
+    // prevents substring presets from later selecting multimodal encoders and
+    // records shared-KV omissions exactly as they existed at bootstrap time.
+    const resolved_target_modules = try resolvedTargetModulePaths(allocator, resolved_tensors);
+    errdefer {
+        for (resolved_target_modules) |item| allocator.free(item);
+        allocator.free(resolved_target_modules);
+    }
 
-    const adapter_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_checkpoint_file_name });
-    errdefer allocator.free(adapter_checkpoint_path);
-    const adapter_config_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_config_file_name });
-    errdefer allocator.free(adapter_config_path);
+    var publication = try artifact_publication.ImmutableDirectoryPublication.init(allocator, compat.io(), out_dir);
+    defer publication.deinit();
+    try publication.createStaging();
+
+    const staging_adapter_checkpoint_path = try std.fs.path.join(allocator, &.{ publication.staging_dir, adapter_checkpoint_file_name });
+    defer allocator.free(staging_adapter_checkpoint_path);
+    const staging_adapter_config_path = try std.fs.path.join(allocator, &.{ publication.staging_dir, adapter_config_file_name });
+    defer allocator.free(staging_adapter_config_path);
 
     const base_model_name_or_path = if (options.base_model_name_or_path) |v|
         try allocator.dupe(u8, v)
@@ -711,37 +822,69 @@ pub fn bootstrapLoRABundle(
         try allocator.dupe(u8, inspect.model_dir);
     errdefer allocator.free(base_model_name_or_path);
 
-    try writeBootstrapAdapterCheckpointAtomic(allocator, adapter_checkpoint_path, checkpoint_path, resolved_tensors, options.rank, options.use_dora, options.init_lora_weights, options.eva_stats_path, options.lora_ga_stats_path, recursive_config);
-    try writeAdapterConfigJson(allocator, adapter_config_path, .{
+    var provenance = try fingerprintGemma4Model(allocator, inspect.model_dir);
+    defer provenance.deinit(allocator);
+
+    try writeBootstrapAdapterCheckpointAtomic(allocator, staging_adapter_checkpoint_path, checkpoint_path, resolved_tensors, options.rank, options.use_dora, options.init_lora_weights, options.eva_stats_path, options.lora_ga_stats_path, recursive_config);
+    try writeAdapterConfigJson(allocator, staging_adapter_config_path, .{
         .base_model_name_or_path = base_model_name_or_path,
+        .base_model_sha256 = provenance.base_model_sha256,
+        .tokenizer_sha256 = provenance.tokenizer_sha256,
+        .chat_template_sha256 = provenance.chat_template_sha256,
         .rank = options.rank,
         .alpha = options.alpha,
-        .target_modules = requested_modules,
-        .target_preset = if (options.target_preset) |preset| targetPresetName(preset) else null,
+        .target_modules = resolved_target_modules,
+        .target_preset = targetSelectionPresetName(target_selection),
         .use_dora = options.use_dora,
         .init_lora_weights = options.init_lora_weights,
         .recursive_lora = recursive_config,
     });
-    try copySupportingArtifactIfPresent(allocator, inspect.tokenizer_config_path, out_dir, tokenizer_config_file_name);
-    try copySupportingArtifactIfPresent(allocator, inspect.tokenizer_path, out_dir, tokenizer_file_name);
-    try copySupportingArtifactIfPresent(allocator, inspect.special_tokens_map_path, out_dir, special_tokens_map_file_name);
+    try copySupportingArtifactIfPresent(allocator, inspect.tokenizer_config_path, publication.staging_dir, tokenizer_config_file_name);
+    try copySupportingArtifactIfPresent(allocator, inspect.tokenizer_path, publication.staging_dir, tokenizer_file_name);
+    try copySupportingArtifactIfPresent(allocator, inspect.special_tokens_map_path, publication.staging_dir, special_tokens_map_file_name);
+
+    // Validate the completed staged artifact before it becomes visible.
+    try validateLoRAAdapterInventory(allocator, publication.staging_dir);
+
+    const published_adapter_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_checkpoint_file_name });
+    errdefer allocator.free(published_adapter_checkpoint_path);
+    const published_adapter_config_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_config_file_name });
+    errdefer allocator.free(published_adapter_config_path);
+    const summary_artifact_family = try allocator.dupe(u8, artifact_family_version);
+    errdefer allocator.free(summary_artifact_family);
+    const summary_model_dir = try allocator.dupe(u8, inspect.model_dir);
+    errdefer allocator.free(summary_model_dir);
+    const summary_output_dir = try allocator.dupe(u8, out_dir);
+    errdefer allocator.free(summary_output_dir);
+    const summary_checkpoint_path = try allocator.dupe(u8, checkpoint_path);
+    errdefer allocator.free(summary_checkpoint_path);
+    const summary_target_preset = try dupeOptionalString(allocator, targetSelectionPresetName(target_selection));
+    errdefer if (summary_target_preset) |value| allocator.free(value);
+    const summary_init = try dupeOptionalString(allocator, options.init_lora_weights);
+    errdefer if (summary_init) |value| allocator.free(value);
+    const summary_eva = try dupeOptionalString(allocator, options.eva_stats_path);
+    errdefer if (summary_eva) |value| allocator.free(value);
+    const summary_lora_ga = try dupeOptionalString(allocator, options.lora_ga_stats_path);
+    errdefer if (summary_lora_ga) |value| allocator.free(value);
+
+    try publication.publish();
 
     return .{
-        .artifact_family_version = try allocator.dupe(u8, artifact_family_version),
-        .model_dir = try allocator.dupe(u8, inspect.model_dir),
-        .output_dir = try allocator.dupe(u8, out_dir),
-        .checkpoint_path = try allocator.dupe(u8, checkpoint_path),
-        .adapter_checkpoint_path = adapter_checkpoint_path,
-        .adapter_config_path = adapter_config_path,
+        .artifact_family_version = summary_artifact_family,
+        .model_dir = summary_model_dir,
+        .output_dir = summary_output_dir,
+        .checkpoint_path = summary_checkpoint_path,
+        .adapter_checkpoint_path = published_adapter_checkpoint_path,
+        .adapter_config_path = published_adapter_config_path,
         .base_model_name_or_path = base_model_name_or_path,
         .lora_rank = options.rank,
         .lora_alpha = options.alpha,
-        .target_modules = try dupeStringSlice(allocator, requested_modules),
-        .target_preset = if (options.target_preset) |preset| try allocator.dupe(u8, targetPresetName(preset)) else null,
+        .target_modules = resolved_target_modules,
+        .target_preset = summary_target_preset,
         .use_dora = options.use_dora,
-        .init_lora_weights = try dupeOptionalString(allocator, options.init_lora_weights),
-        .eva_stats_path = try dupeOptionalString(allocator, options.eva_stats_path),
-        .lora_ga_stats_path = try dupeOptionalString(allocator, options.lora_ga_stats_path),
+        .init_lora_weights = summary_init,
+        .eva_stats_path = summary_eva,
+        .lora_ga_stats_path = summary_lora_ga,
         .resolved_tensors = resolved_tensors,
     };
 }
@@ -800,15 +943,13 @@ pub fn materializeRecursiveCompressedBase(
         .loop_count = loop_count,
         .init_strategy = adapter_inspect.recursive_init_strategy orelse "average_residual_svd",
     });
+    try validateLoRAAdapterInventory(allocator, adapter_model_input);
 
     const checkpoint_path = base_inspect.checkpoint_path orelse return error.MissingMergedCheckpoint;
     if (base_inspect.gguf_path != null) return error.UnsupportedRecursiveCompressedBaseSource;
 
-    try compat.cwd().createDirPath(compat.io(), out_dir);
-    const compressed_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, checkpoint_file_name });
-    errdefer allocator.free(compressed_checkpoint_path);
-    const metadata_path = try std.fs.path.join(allocator, &.{ out_dir, options.metadata_file_name });
-    errdefer allocator.free(metadata_path);
+    var publication = try artifact_publication.ImmutableDirectoryPublication.init(allocator, compat.io(), out_dir);
+    defer publication.deinit();
 
     var access = try openTensorAccessForFile(allocator, checkpoint_path);
     defer access.deinit();
@@ -846,10 +987,18 @@ pub fn materializeRecursiveCompressedBase(
     }
     if (raw_tensors.items.len == 0) return error.NoTensorsSelected;
 
-    try writeHeaderAndRawTensors(allocator, compressed_checkpoint_path, raw_tensors.items);
-    try copyCompressedBaseSupportFiles(allocator, base_inspect.model_dir, out_dir);
+    try publication.createStaging();
+    const staging_checkpoint_path = try std.fs.path.join(allocator, &.{ publication.staging_dir, checkpoint_file_name });
+    defer allocator.free(staging_checkpoint_path);
+    const staging_metadata_path = try std.fs.path.join(allocator, &.{ publication.staging_dir, options.metadata_file_name });
+    defer allocator.free(staging_metadata_path);
+    const published_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, checkpoint_file_name });
+    errdefer allocator.free(published_checkpoint_path);
+
+    try writeHeaderAndRawTensors(allocator, staging_checkpoint_path, raw_tensors.items);
+    try copyCompressedBaseSupportFiles(allocator, base_inspect.model_dir, publication.staging_dir);
     const source_checkpoint_bytes = try c_file.fileSize(allocator, checkpoint_path);
-    const compressed_checkpoint_bytes = try c_file.fileSize(allocator, compressed_checkpoint_path);
+    const compressed_checkpoint_bytes = try c_file.fileSize(allocator, staging_checkpoint_path);
     const compression_ratio = if (source_checkpoint_bytes == 0)
         0
     else
@@ -857,11 +1006,11 @@ pub fn materializeRecursiveCompressedBase(
 
     try writeRecursiveCompressedBaseMetadata(
         allocator,
-        metadata_path,
+        staging_metadata_path,
         base_inspect.model_dir,
         adapter_inspect.model_dir,
         checkpoint_path,
-        compressed_checkpoint_path,
+        published_checkpoint_path,
         source_num_layers,
         shared_block_size,
         loop_count,
@@ -872,14 +1021,28 @@ pub fn materializeRecursiveCompressedBase(
         compression_ratio,
     );
 
+    const summary_artifact_family = try allocator.dupe(u8, artifact_family_version);
+    errdefer allocator.free(summary_artifact_family);
+    const summary_base_model_dir = try allocator.dupe(u8, base_inspect.model_dir);
+    errdefer allocator.free(summary_base_model_dir);
+    const summary_adapter_model_dir = try allocator.dupe(u8, adapter_inspect.model_dir);
+    errdefer allocator.free(summary_adapter_model_dir);
+    const summary_output_dir = try allocator.dupe(u8, out_dir);
+    errdefer allocator.free(summary_output_dir);
+    const summary_source_checkpoint_path = try allocator.dupe(u8, checkpoint_path);
+    errdefer allocator.free(summary_source_checkpoint_path);
+    const published_metadata_path = try std.fs.path.join(allocator, &.{ out_dir, options.metadata_file_name });
+    errdefer allocator.free(published_metadata_path);
+    try publication.publish();
+
     return .{
-        .artifact_family_version = try allocator.dupe(u8, artifact_family_version),
-        .base_model_dir = try allocator.dupe(u8, base_inspect.model_dir),
-        .adapter_model_dir = try allocator.dupe(u8, adapter_inspect.model_dir),
-        .output_dir = try allocator.dupe(u8, out_dir),
-        .source_checkpoint_path = try allocator.dupe(u8, checkpoint_path),
-        .compressed_checkpoint_path = compressed_checkpoint_path,
-        .metadata_path = metadata_path,
+        .artifact_family_version = summary_artifact_family,
+        .base_model_dir = summary_base_model_dir,
+        .adapter_model_dir = summary_adapter_model_dir,
+        .output_dir = summary_output_dir,
+        .source_checkpoint_path = summary_source_checkpoint_path,
+        .compressed_checkpoint_path = published_checkpoint_path,
+        .metadata_path = published_metadata_path,
         .source_num_layers = source_num_layers,
         .shared_block_size = shared_block_size,
         .loop_count = loop_count,
@@ -906,6 +1069,91 @@ pub fn freeRecursiveCompressedBaseSummary(allocator: std.mem.Allocator, summary:
 // Load / save LoRA bundle
 // ---------------------------------------------------------------------------
 
+/// Validate the adapter checkpoint as a closed inventory. Every configured
+/// target must resolve to adapter tensors, every tensor must be configured,
+/// A/B tensors must be paired, and DoRA magnitude tensors must match
+/// `use_dora`. This deliberately rejects permissive suffix-only inventories:
+/// production artifacts persist exact module paths.
+pub fn validateLoRAAdapterInventory(
+    allocator: std.mem.Allocator,
+    adapter_model_input: []const u8,
+) !void {
+    var inspected = try inspectCheckpoint(allocator, adapter_model_input);
+    defer freeInspectionSummary(allocator, &inspected);
+    const checkpoint_path = inspected.adapter_checkpoint_path orelse return error.MissingAdapterCheckpoint;
+    const configured_targets = inspected.target_modules orelse return error.MissingAdapterTargetInventory;
+    if (configured_targets.len == 0) return error.NoLoRATargetTensorsResolved;
+
+    for (configured_targets, 0..) |target, idx| {
+        if (target.len == 0 or tensorModulePath(target) != null) return error.InvalidAdapterTargetModule;
+        for (configured_targets[0..idx]) |prior| {
+            if (std.mem.eql(u8, prior, target)) return error.DuplicateAdapterTargetModule;
+        }
+    }
+
+    var access = try openTensorAccessForFile(allocator, checkpoint_path);
+    defer access.deinit();
+    const names = try access.listNames(allocator);
+    defer allocator.free(names);
+
+    var resolved_targets = std.ArrayListUnmanaged([]const u8).empty;
+    defer resolved_targets.deinit(allocator);
+    var adapter_a_count: usize = 0;
+    var adapter_b_count: usize = 0;
+
+    for (names) |name| {
+        if (parseLoRAAdapterTensorName(name)) |parsed| {
+            const counterpart = if (parsed.loop_index) |loop_idx|
+                switch (parsed.kind) {
+                    .a => try recursive_lora.formatLoopAdapterTensorName(allocator, parsed.base_tensor_base_name, loop_idx, .b),
+                    .b => try recursive_lora.formatLoopAdapterTensorName(allocator, parsed.base_tensor_base_name, loop_idx, .a),
+                }
+            else
+                try std.fmt.allocPrint(
+                    allocator,
+                    "{s}.{s}.weight",
+                    .{ parsed.base_tensor_base_name, if (parsed.kind == .a) "lora_B" else "lora_A" },
+                );
+            defer allocator.free(counterpart);
+            if (!stringSliceContains(names, counterpart)) return error.MissingAdapterPair;
+
+            if (parsed.kind == .a) adapter_a_count += 1 else adapter_b_count += 1;
+            const module_path = tensorModulePath(parsed.base_tensor_base_name) orelse return error.InvalidLoRATargetTensorName;
+            if (!stringSliceContains(resolved_targets.items, module_path)) {
+                try resolved_targets.append(allocator, module_path);
+            }
+            continue;
+        }
+        if (parseDoRAMagnitudeTensorName(name) != null) continue;
+        return error.UnexpectedAdapterTensor;
+    }
+
+    if (adapter_a_count == 0 or resolved_targets.items.len == 0) return error.NoLoRATargetTensorsResolved;
+    if (adapter_a_count != adapter_b_count) return error.MissingAdapterPair;
+
+    const use_dora = inspected.use_dora orelse false;
+    for (resolved_targets.items) |module_path| {
+        const base_tensor_name = try std.fmt.allocPrint(allocator, "{s}.weight", .{module_path});
+        defer allocator.free(base_tensor_name);
+        const magnitude_name = try doraMagnitudeTensorName(allocator, base_tensor_name);
+        defer allocator.free(magnitude_name);
+        if (stringSliceContains(names, magnitude_name) != use_dora) return error.AdapterDoRAConfigMismatch;
+    }
+    for (names) |name| {
+        const base_tensor_name = parseDoRAMagnitudeTensorName(name) orelse continue;
+        const module_path = tensorModulePath(base_tensor_name) orelse return error.InvalidLoRATargetTensorName;
+        if (!stringSliceContains(resolved_targets.items, module_path)) return error.UnexpectedAdapterDoRATensor;
+    }
+
+    if (configured_targets.len != resolved_targets.items.len) return error.AdapterTargetInventoryMismatch;
+    for (configured_targets) |configured| {
+        if (!stringSliceContains(resolved_targets.items, configured)) return error.AdapterTargetInventoryMismatch;
+    }
+    for (resolved_targets.items) |resolved| {
+        if (!stringSliceContains(configured_targets, resolved)) return error.AdapterTargetInventoryMismatch;
+    }
+}
+
 pub fn inspectLoRABundle(
     allocator: std.mem.Allocator,
     base_model_input: []const u8,
@@ -915,6 +1163,7 @@ pub fn inspectLoRABundle(
     defer freeInspectionSummary(allocator, &base_inspect);
     var adapter_inspect = try inspectCheckpoint(allocator, adapter_model_input);
     defer freeInspectionSummary(allocator, &adapter_inspect);
+    try validateLoRAAdapterInventory(allocator, adapter_model_input);
 
     const base_checkpoint_path = base_inspect.checkpoint_path orelse base_inspect.gguf_path orelse return error.MissingMergedCheckpoint;
     const adapter_checkpoint_path = adapter_inspect.adapter_checkpoint_path orelse return error.MissingAdapterCheckpoint;
@@ -923,6 +1172,8 @@ pub fn inspectLoRABundle(
     defer base_access.deinit();
     var adapter_access = try openTensorAccessForFile(allocator, adapter_checkpoint_path);
     defer adapter_access.deinit();
+    const base_names = try base_access.listNames(allocator);
+    defer allocator.free(base_names);
 
     var tensors: std.ArrayListUnmanaged(LoRATensorSummary) = .empty;
     errdefer {
@@ -947,7 +1198,8 @@ pub fn inspectLoRABundle(
         defer adapter_a.deinit();
         var adapter_b = adapter_access.getRecord(allocator, adapter_b_name) catch return error.MissingAdapterPair;
         defer adapter_b.deinit();
-        var base = base_access.getRecord(allocator, base_tensor_name) catch return error.MissingBaseTensorForAdapter;
+        const source_base_tensor_name = sourceTensorNameForCanonicalAdapterBase(base_names, base_tensor_name) orelse return error.MissingBaseTensorForAdapter;
+        var base = base_access.getRecord(allocator, source_base_tensor_name) catch return error.MissingBaseTensorForAdapter;
         defer base.deinit();
         if (adapter_a.descriptor.shape.len != 2 or adapter_b.descriptor.shape.len != 2 or base.descriptor.shape.len != 2) return error.InvalidAdapterTensorShape;
         if (adapter_a.descriptor.shape[1] != base.descriptor.shape[1]) return error.AdapterInputDimMismatch;
@@ -1019,6 +1271,7 @@ pub fn inspectLoRABundle(
         .target_preset = try dupeOptionalString(allocator, adapter_inspect.target_preset),
         .use_dora = adapter_inspect.use_dora,
         .init_lora_weights = try dupeOptionalString(allocator, adapter_inspect.init_lora_weights),
+        .recursive_lora_enabled = adapter_inspect.recursive_lora_enabled,
         .resolved_tensor_count = tensors.items.len,
         .trainable_parameter_count = trainable_parameter_count,
         .dora_magnitude_tensor_count = dora_magnitude_tensor_count,
@@ -1046,6 +1299,63 @@ pub fn freeLoRABundleInspectionSummary(allocator: std.mem.Allocator, summary: *L
     summary.* = undefined;
 }
 
+fn validateGenericLoRABundleInspection(inspected: LoRABundleInspectionSummary) !void {
+    try validateLoRAInitializerBaseCompatibility(inspected.init_lora_weights);
+    if (inspected.recursive_lora_enabled) return error.RecursiveLoRANotSupportedByGenericLifecycle;
+
+    const rank = inspected.lora_rank orelse return error.MissingAdapterConfig;
+    const alpha = inspected.lora_alpha orelse return error.MissingAdapterConfig;
+    if (rank == 0 or rank > std.math.maxInt(u32)) return error.InvalidLoRARank;
+    if (!std.math.isFinite(alpha) or alpha <= 0 or alpha > std.math.floatMax(f32)) return error.InvalidLoRAAlpha;
+
+    const use_dora = inspected.use_dora orelse false;
+    for (inspected.tensors) |tensor| {
+        if (tensor.loop_index != null) return error.RecursiveLoRANotSupportedByGenericLifecycle;
+        if (tensor.rank != rank) return error.AdapterConfigRankMismatch;
+        if ((tensor.dora_magnitude_tensor_name != null) != use_dora) return error.AdapterDoRAConfigMismatch;
+    }
+}
+
+fn validateGenericLoadedLoRABundle(bundle: *const LoadedLoRABundle) !void {
+    if (bundle.recursive_lora_enabled) return error.RecursiveLoRANotSupportedByGenericLifecycle;
+    if (bundle.lora_rank == 0 or bundle.lora_rank > std.math.maxInt(u32)) return error.InvalidLoRARank;
+    if (!std.math.isFinite(bundle.lora_alpha) or bundle.lora_alpha <= 0) return error.InvalidLoRAAlpha;
+
+    if (bundle.target_modules.len == 0 or bundle.layers.len == 0) return error.NoLoRATargetTensorsResolved;
+    var resolved_target_count: usize = 0;
+    for (bundle.layers, 0..) |layer, layer_idx| {
+        const parsed = parseLoRAAdapterTensorName(layer.adapter_a_tensor_name) orelse return error.InvalidLoRATargetTensorName;
+        if (parsed.loop_index != null) return error.RecursiveLoRANotSupportedByGenericLifecycle;
+        if (layer.rank != bundle.lora_rank) return error.AdapterConfigRankMismatch;
+        const has_magnitude_name = layer.dora_magnitude_tensor_name != null;
+        const has_magnitude = layer.dora_magnitude != null;
+        if (has_magnitude_name != has_magnitude or has_magnitude != bundle.use_dora) return error.AdapterDoRAConfigMismatch;
+
+        const module_path = tensorModulePath(layer.base_tensor_name) orelse return error.InvalidLoRATargetTensorName;
+        if (!stringSliceContains(bundle.target_modules, module_path)) return error.AdapterTargetInventoryMismatch;
+        for (bundle.layers[0..layer_idx]) |prior| {
+            if (std.mem.eql(u8, prior.base_tensor_name, layer.base_tensor_name)) return error.DuplicateAdapterTargetTensor;
+        }
+        resolved_target_count += 1;
+    }
+    if (resolved_target_count != bundle.target_modules.len) return error.AdapterTargetInventoryMismatch;
+    for (bundle.target_modules, 0..) |target, target_idx| {
+        if (target.len == 0 or tensorModulePath(target) != null) return error.InvalidAdapterTargetModule;
+        for (bundle.target_modules[0..target_idx]) |prior| {
+            if (std.mem.eql(u8, prior, target)) return error.DuplicateAdapterTargetModule;
+        }
+        var found = false;
+        for (bundle.layers) |layer| {
+            const module_path = tensorModulePath(layer.base_tensor_name) orelse return error.InvalidLoRATargetTensorName;
+            if (std.mem.eql(u8, target, module_path)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return error.AdapterTargetInventoryMismatch;
+    }
+}
+
 pub fn loadLoRABundle(
     allocator: std.mem.Allocator,
     base_model_input: []const u8,
@@ -1063,7 +1373,7 @@ pub fn loadLoRABundleScoped(
     var inspected = try inspectLoRABundle(allocator, base_model_input, adapter_model_input);
     defer freeLoRABundleInspectionSummary(allocator, &inspected);
 
-    if (inspected.lora_rank == null or inspected.lora_alpha == null) return error.MissingAdapterConfig;
+    try validateGenericLoRABundleInspection(inspected);
 
     var scoped_tensor_count: usize = 0;
     for (inspected.tensors) |ts| {
@@ -1091,6 +1401,8 @@ pub fn loadLoRABundleScoped(
     defer base_access.deinit();
     var adapter_access = try openTensorAccessForFile(allocator, inspected.adapter_checkpoint_path);
     defer adapter_access.deinit();
+    const base_names = try base_access.listNames(allocator);
+    defer allocator.free(base_names);
 
     for (inspected.tensors) |ts| {
         if (!layerMatchesScope(ts.base_tensor_name, layer_name)) continue;
@@ -1098,7 +1410,8 @@ pub fn loadLoRABundleScoped(
         defer a_tensor.deinit();
         var b_tensor = try loadTensorAsF32(allocator, adapter_access, ts.adapter_b_tensor_name);
         defer b_tensor.deinit();
-        var base_tensor = try loadTensorAsF32(allocator, base_access, ts.base_tensor_name);
+        const source_base_tensor_name = sourceTensorNameForCanonicalAdapterBase(base_names, ts.base_tensor_name) orelse return error.MissingBaseTensorForAdapter;
+        var base_tensor = try loadTensorAsF32(allocator, base_access, source_base_tensor_name);
         defer base_tensor.deinit();
         if (a_tensor.shape.len != 2 or b_tensor.shape.len != 2 or base_tensor.shape.len != 2) {
             return error.InvalidAdapterTensorShape;
@@ -1156,15 +1469,60 @@ pub fn loadLoRABundleScoped(
         .base_model_name_or_path = try dupeOptionalString(allocator, inspected.base_model_name_or_path),
         .lora_rank = inspected.lora_rank.?,
         .lora_alpha = @floatCast(inspected.lora_alpha.?),
-        .target_modules = if (inspected.target_modules) |items|
+        .use_dora = inspected.use_dora orelse false,
+        .recursive_lora_enabled = inspected.recursive_lora_enabled,
+        .target_modules = if (layer_name != null)
+            try resolvedTargetModulesForLoadedLayers(allocator, layers)
+        else if (inspected.target_modules) |items|
             try dupeStringSlice(allocator, items)
         else
-            try dupeStringSlice(allocator, default_lora_target_modules[0..]),
+            unreachable,
         .layers = layers,
     };
 }
 
+fn resolvedTargetModulesForLoadedLayers(
+    allocator: std.mem.Allocator,
+    layers: []const LoadedLoRALayer,
+) ![][]const u8 {
+    const targets = try allocator.alloc([]const u8, layers.len);
+    errdefer allocator.free(targets);
+    var built: usize = 0;
+    errdefer for (targets[0..built]) |target| allocator.free(target);
+    for (layers, 0..) |layer, idx| {
+        const module_path = tensorModulePath(layer.base_tensor_name) orelse return error.InvalidLoRATargetTensorName;
+        targets[idx] = try allocator.dupe(u8, module_path);
+        built += 1;
+    }
+    std.mem.sort([]const u8, targets, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    return targets;
+}
+
 pub fn saveLoRABundle(bundle: *const LoadedLoRABundle, out_dir: []const u8) !void {
+    const allocator = bundle.allocator;
+    try validateGenericLoadedLoRABundle(bundle);
+    var publication = try artifact_publication.ImmutableDirectoryPublication.init(allocator, compat.io(), out_dir);
+    defer publication.deinit();
+    try publication.createStaging();
+    try writeLoRABundleContents(bundle, publication.staging_dir);
+    try validateLoRAAdapterInventory(allocator, publication.staging_dir);
+    try publication.publish();
+}
+
+/// Write a validated bundle into a caller-owned private staging directory.
+/// Whole-run publication uses this so the adapter and reports are exposed by
+/// one final rename.
+pub fn saveLoRABundleToStaging(bundle: *const LoadedLoRABundle, staging_dir: []const u8) !void {
+    try validateGenericLoadedLoRABundle(bundle);
+    try writeLoRABundleContents(bundle, staging_dir);
+    try validateLoRAAdapterInventory(bundle.allocator, staging_dir);
+}
+
+fn writeLoRABundleContents(bundle: *const LoadedLoRABundle, out_dir: []const u8) !void {
     const allocator = bundle.allocator;
     try compat.cwd().createDirPath(compat.io(), out_dir);
 
@@ -1241,7 +1599,7 @@ pub fn saveLoRABundle(bundle: *const LoadedLoRABundle, out_dir: []const u8) !voi
         .rank = bundle.lora_rank,
         .alpha = bundle.lora_alpha,
         .target_modules = bundle.target_modules,
-        .use_dora = bundleHasDoRA(bundle),
+        .use_dora = bundle.use_dora,
     });
 }
 
@@ -1251,12 +1609,17 @@ pub fn materializeMergedModel(
     adapter_model_dir: []const u8,
     out_dir: []const u8,
 ) !MaterializeSummary {
-    var bundle = try loadLoRABundle(allocator, base_model_dir, adapter_model_dir);
-    defer bundle.deinit();
-
     var base_paths = try resolveArtifactPaths(allocator, base_model_dir);
     defer base_paths.deinit();
     const base_checkpoint_path = base_paths.checkpoint_path orelse base_paths.gguf_path orelse return error.MissingMergedCheckpoint;
+    const source_checkpoint_bytes = try c_file.fileSize(allocator, base_checkpoint_path);
+    try validateLegacyMaterializationSource(base_checkpoint_path, source_checkpoint_bytes);
+
+    var bundle = try loadLoRABundle(allocator, base_model_dir, adapter_model_dir);
+    defer bundle.deinit();
+
+    var publication = try artifact_publication.ImmutableDirectoryPublication.init(allocator, compat.io(), out_dir);
+    defer publication.deinit();
     var base_access = try openTensorAccessForFile(allocator, base_checkpoint_path);
     defer base_access.deinit();
     const base_names = try base_access.listNames(allocator);
@@ -1296,44 +1659,64 @@ pub fn materializeMergedModel(
         defer allocator.free(hf_weight);
         transpose2DF32(hf_weight, merged_weight, layer.input_dim, layer.output_dim);
 
+        const source_base_tensor_name = sourceTensorNameForCanonicalAdapterBase(base_names, layer.base_tensor_name) orelse return error.MissingBaseTensorForAdapter;
         const shape = [_]i64{ @as(i64, @intCast(layer.output_dim)), @as(i64, @intCast(layer.input_dim)) };
-        const tensor = try Tensor.initFloat32(allocator, layer.base_tensor_name, &shape, hf_weight);
-        try merged.put(allocator, try allocator.dupe(u8, layer.base_tensor_name), tensor);
+        const tensor = try Tensor.initFloat32(allocator, source_base_tensor_name, &shape, hf_weight);
+        try merged.put(allocator, try allocator.dupe(u8, source_base_tensor_name), tensor);
     }
 
-    try compat.cwd().createDirPath(compat.io(), out_dir);
-    const output_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, checkpoint_file_name });
-    errdefer allocator.free(output_checkpoint_path);
+    try publication.createStaging();
+    const staging_checkpoint_path = try std.fs.path.join(allocator, &.{ publication.staging_dir, checkpoint_file_name });
+    defer allocator.free(staging_checkpoint_path);
     const bytes = try buildMergedSafetensorsFile(allocator, base_access, base_names, &merged);
     defer allocator.free(bytes);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = output_checkpoint_path, .data = bytes });
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = staging_checkpoint_path, .data = bytes });
 
-    try copySupportingArtifactIfPresent(allocator, base_paths.config_path, out_dir, hf_config_file_name);
-    try copySupportingArtifactIfPresent(allocator, base_paths.tokenizer_config_path, out_dir, tokenizer_config_file_name);
-    try copySupportingArtifactIfPresent(allocator, base_paths.tokenizer_path, out_dir, tokenizer_file_name);
-    try copySupportingArtifactIfPresent(allocator, base_paths.special_tokens_map_path, out_dir, special_tokens_map_file_name);
+    try copySupportingArtifactIfPresent(allocator, base_paths.config_path, publication.staging_dir, hf_config_file_name);
+    try copySupportingArtifactIfPresent(allocator, base_paths.tokenizer_config_path, publication.staging_dir, tokenizer_config_file_name);
+    try copySupportingArtifactIfPresent(allocator, base_paths.tokenizer_path, publication.staging_dir, tokenizer_file_name);
+    try copySupportingArtifactIfPresent(allocator, base_paths.special_tokens_map_path, publication.staging_dir, special_tokens_map_file_name);
 
     var adapter_paths = try resolveArtifactPaths(allocator, adapter_model_dir);
     defer adapter_paths.deinit();
-    try copySupportingArtifactIfPresent(allocator, adapter_paths.tokenizer_config_path, out_dir, tokenizer_config_file_name);
-    try copySupportingArtifactIfPresent(allocator, adapter_paths.tokenizer_path, out_dir, tokenizer_file_name);
-    try copySupportingArtifactIfPresent(allocator, adapter_paths.special_tokens_map_path, out_dir, special_tokens_map_file_name);
+    try copySupportingArtifactIfPresent(allocator, adapter_paths.tokenizer_config_path, publication.staging_dir, tokenizer_config_file_name);
+    try copySupportingArtifactIfPresent(allocator, adapter_paths.tokenizer_path, publication.staging_dir, tokenizer_file_name);
+    try copySupportingArtifactIfPresent(allocator, adapter_paths.special_tokens_map_path, publication.staging_dir, special_tokens_map_file_name);
 
     var copied_base_tensor_count: usize = 0;
     for (base_names) |name| {
         if (!merged.contains(name)) copied_base_tensor_count += 1;
     }
 
+    const summary_artifact_family = try allocator.dupe(u8, artifact_family_version);
+    errdefer allocator.free(summary_artifact_family);
+    const summary_base_model_dir = try allocator.dupe(u8, bundle.base_model_dir);
+    errdefer allocator.free(summary_base_model_dir);
+    const summary_adapter_model_dir = try allocator.dupe(u8, bundle.adapter_model_dir);
+    errdefer allocator.free(summary_adapter_model_dir);
+    const summary_output_dir = try allocator.dupe(u8, out_dir);
+    errdefer allocator.free(summary_output_dir);
+    const published_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, checkpoint_file_name });
+    errdefer allocator.free(published_checkpoint_path);
+    try publication.publish();
+
     return .{
-        .artifact_family_version = try allocator.dupe(u8, artifact_family_version),
-        .base_model_dir = try allocator.dupe(u8, bundle.base_model_dir),
-        .adapter_model_dir = try allocator.dupe(u8, bundle.adapter_model_dir),
-        .output_dir = try allocator.dupe(u8, out_dir),
-        .output_checkpoint_path = output_checkpoint_path,
+        .artifact_family_version = summary_artifact_family,
+        .base_model_dir = summary_base_model_dir,
+        .adapter_model_dir = summary_adapter_model_dir,
+        .output_dir = summary_output_dir,
+        .output_checkpoint_path = published_checkpoint_path,
         .merged_lora_tensor_count = bundle.layers.len,
         .merged_dora_tensor_count = merged_dora_tensor_count,
         .copied_base_tensor_count = copied_base_tensor_count,
     };
+}
+
+fn validateLegacyMaterializationSource(checkpoint_path: []const u8, checkpoint_bytes: u64) !void {
+    if (std.mem.endsWith(u8, checkpoint_path, ".gguf")) return error.Gemma4GgufMaterializationUnsupported;
+    if (std.mem.endsWith(u8, checkpoint_path, ".safetensors.index.json")) return error.Gemma4MaterializationRequiresStreaming;
+    if (!std.mem.endsWith(u8, checkpoint_path, ".safetensors")) return error.UnsupportedMaterializationSource;
+    if (checkpoint_bytes > legacy_materialize_max_checkpoint_bytes) return error.Gemma4MaterializationRequiresStreaming;
 }
 
 pub fn freeMaterializeSummary(allocator: std.mem.Allocator, summary: *MaterializeSummary) void {
@@ -1440,6 +1823,13 @@ pub fn prepareInputsFromChatData(
     max_examples: usize,
     max_seq_len: usize,
 ) !PreparedInputsSummary {
+    var inspection = try inspectCheckpoint(allocator, model_dir);
+    defer freeInspectionSummary(allocator, &inspection);
+    const model_max_positions = inspection.max_position_embeddings orelse return error.MissingModelContextLength;
+    _ = try validateTrainingSequenceLength(max_seq_len, model_max_positions);
+    var provenance = try fingerprintGemma4Model(allocator, model_dir);
+    defer provenance.deinit(allocator);
+
     var loaded_tokenizer = try loadGemmaTokenizerForModelDir(allocator, model_dir);
     defer loaded_tokenizer.deinit(allocator);
     const tok = loaded_tokenizer.tokenizer();
@@ -1466,9 +1856,13 @@ pub fn prepareInputsFromChatData(
     var summary = PreparedInputsSummary{
         .artifact_family_version = try allocator.dupe(u8, artifact_family_version),
         .model_dir = try allocator.dupe(u8, model_dir),
+        .schema_version = prepared_schema_v4,
         .max_examples = max_examples,
         .examples_seen = limit,
         .tokenizer_class = try dupeOptionalString(allocator, tokenizer_class),
+        .base_model_sha256 = try allocator.dupe(u8, provenance.base_model_sha256),
+        .tokenizer_sha256 = try allocator.dupe(u8, provenance.tokenizer_sha256),
+        .chat_template_sha256 = try allocator.dupe(u8, provenance.chat_template_sha256),
         .max_seq_len = max_seq_len,
         .examples = prepared[0..0],
     };
@@ -1493,6 +1887,8 @@ pub fn prepareInputsFromChatData(
         summary.max_turns_dropped = @max(summary.max_turns_dropped, item.turns_dropped_from_left);
     }
 
+    summary.prepared_examples_sha256 = try fingerprintPreparedExamplesAlloc(allocator, summary.examples);
+
     return summary;
 }
 
@@ -1504,6 +1900,13 @@ pub fn prepareMultimodalInputsFromChatData(
     max_examples: usize,
     max_seq_len: usize,
 ) !PreparedInputsSummary {
+    var inspection = try inspectCheckpoint(allocator, model_dir);
+    defer freeInspectionSummary(allocator, &inspection);
+    const model_max_positions = inspection.max_position_embeddings orelse return error.MissingModelContextLength;
+    _ = try validateTrainingSequenceLength(max_seq_len, model_max_positions);
+    var provenance = try fingerprintGemma4Model(allocator, model_dir);
+    defer provenance.deinit(allocator);
+
     var loaded_tokenizer = try loadGemmaTokenizerForModelDir(allocator, model_dir);
     defer loaded_tokenizer.deinit(allocator);
     const tok = loaded_tokenizer.tokenizer();
@@ -1531,13 +1934,16 @@ pub fn prepareMultimodalInputsFromChatData(
     var summary = PreparedInputsSummary{
         .artifact_family_version = try allocator.dupe(u8, artifact_family_version),
         .model_dir = try allocator.dupe(u8, model_dir),
-        .schema_version = prepared_schema_v3,
+        .schema_version = prepared_schema_v4,
         .gguf_projector_path = try allocator.dupe(u8, projector_fingerprint.path),
         .gguf_projector_sha256 = try allocator.dupe(u8, projector_fingerprint.sha256),
         .gguf_projector_size_bytes = projector_fingerprint.size_bytes,
         .max_examples = max_examples,
         .examples_seen = limit,
         .tokenizer_class = try dupeOptionalString(allocator, tokenizer_class),
+        .base_model_sha256 = try allocator.dupe(u8, provenance.base_model_sha256),
+        .tokenizer_sha256 = try allocator.dupe(u8, provenance.tokenizer_sha256),
+        .chat_template_sha256 = try allocator.dupe(u8, provenance.chat_template_sha256),
         .max_seq_len = max_seq_len,
         .examples = prepared[0..0],
     };
@@ -1577,6 +1983,8 @@ pub fn prepareMultimodalInputsFromChatData(
         summary.max_turns_dropped = @max(summary.max_turns_dropped, item.turns_dropped_from_left);
     }
 
+    summary.prepared_examples_sha256 = try fingerprintPreparedExamplesAlloc(allocator, summary.examples);
+
     return summary;
 }
 
@@ -1588,7 +1996,10 @@ pub fn loadPreparedInputsSummary(allocator: std.mem.Allocator, path: []const u8)
     const parsed = try std.json.parseFromSliceLeaky(PreparedInputsSummaryFile, arena.allocator(), raw, .{
         .ignore_unknown_fields = true,
     });
-    return try clonePreparedInputsSummary(allocator, &parsed.summary);
+    var summary = try clonePreparedInputsSummary(allocator, &parsed.summary);
+    errdefer freePreparedInputsSummary(allocator, &summary);
+    try validatePreparedArtifactIntegrity(allocator, summary);
+    return summary;
 }
 
 pub fn savePreparedInputsSummary(allocator: std.mem.Allocator, path: []const u8, summary: PreparedInputsSummary) !void {
@@ -1604,6 +2015,10 @@ pub fn freePreparedInputsSummary(allocator: std.mem.Allocator, summary: *const P
     if (summary.gguf_projector_path) |p| allocator.free(p);
     if (summary.gguf_projector_sha256) |p| allocator.free(p);
     if (summary.tokenizer_class) |p| allocator.free(p);
+    if (summary.base_model_sha256) |p| allocator.free(p);
+    if (summary.tokenizer_sha256) |p| allocator.free(p);
+    if (summary.chat_template_sha256) |p| allocator.free(p);
+    if (summary.prepared_examples_sha256) |p| allocator.free(p);
     for (summary.examples) |*item| freePreparedExampleInput(allocator, item);
     allocator.free(summary.examples);
 }
@@ -1632,6 +2047,310 @@ pub fn sha256HexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]const 
     hasher.final(&digest);
     const hex = std.fmt.bytesToHex(digest, .lower);
     return allocator.dupe(u8, &hex);
+}
+
+fn hashLength(hasher: *std.crypto.hash.sha2.Sha256, value: usize) void {
+    var encoded: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, @intCast(value), .little);
+    hasher.update(&encoded);
+}
+
+fn hashBytes(hasher: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
+    hashLength(hasher, bytes.len);
+    hasher.update(bytes);
+}
+
+fn hashUsize(hasher: *std.crypto.hash.sha2.Sha256, value: usize) void {
+    hashLength(hasher, value);
+}
+
+fn hashI32Slice(hasher: *std.crypto.hash.sha2.Sha256, values: []const i32) void {
+    hashLength(hasher, values.len);
+    for (values) |value| {
+        var encoded: [4]u8 = undefined;
+        std.mem.writeInt(u32, &encoded, @bitCast(value), .little);
+        hasher.update(&encoded);
+    }
+}
+
+fn hashUsizeSlice(hasher: *std.crypto.hash.sha2.Sha256, values: []const usize) void {
+    hashLength(hasher, values.len);
+    for (values) |value| hashUsize(hasher, value);
+}
+
+fn hashF32Slice(hasher: *std.crypto.hash.sha2.Sha256, values: []const f32) void {
+    hashLength(hasher, values.len);
+    for (values) |value| {
+        var encoded: [4]u8 = undefined;
+        std.mem.writeInt(u32, &encoded, @bitCast(value), .little);
+        hasher.update(&encoded);
+    }
+}
+
+fn hashStringSlice(hasher: *std.crypto.hash.sha2.Sha256, values: []const []const u8) void {
+    hashLength(hasher, values.len);
+    for (values) |value| hashBytes(hasher, value);
+}
+
+fn updatePreparedExampleHash(
+    hasher: *std.crypto.hash.sha2.Sha256,
+    example: *const PreparedExampleInput,
+    include_training_targets: bool,
+) void {
+    hashUsize(hasher, @intFromEnum(example.mode));
+    hashI32Slice(hasher, example.prompt_input_ids);
+    hashI32Slice(hasher, example.response_input_ids);
+    hashI32Slice(hasher, example.input_ids);
+    hashStringSlice(hasher, example.image_paths);
+    hashStringSlice(hasher, example.audio_paths);
+    hashUsizeSlice(hasher, example.image_token_counts);
+    hashUsizeSlice(hasher, example.audio_token_counts);
+    if (!include_training_targets) return;
+    hashI32Slice(hasher, example.labels);
+    hashUsize(hasher, example.num_prompt_tokens);
+    hashUsize(hasher, example.num_response_tokens);
+    hashUsize(hasher, example.num_input_tokens);
+    hashUsize(hasher, example.num_supervised_tokens);
+    hashUsize(hasher, example.turn_count);
+    hashUsize(hasher, @intFromBool(example.has_tool_calls));
+    hashUsize(hasher, @intFromBool(example.has_tool_messages));
+    hashI32Slice(hasher, example.teacher_top_k_token_ids);
+    hashF32Slice(hasher, example.teacher_top_k_probs);
+    hashUsize(hasher, example.teacher_top_k);
+    hashF32Slice(hasher, &.{example.teacher_temperature});
+    hashUsize(hasher, @intFromBool(example.was_truncated));
+    hashUsize(hasher, example.turns_dropped_from_left);
+    hashBytes(hasher, example.policy_version orelse "");
+}
+
+fn preparedExampleIdentityDigest(example: *const PreparedExampleInput) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hashBytes(&hasher, "gemma4_prepared_example_identity/v1");
+    updatePreparedExampleHash(&hasher, example, false);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+pub fn fingerprintPreparedExamplesAlloc(
+    allocator: std.mem.Allocator,
+    examples: []const PreparedExampleInput,
+) ![]const u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hashBytes(&hasher, "gemma4_prepared_examples/v1");
+    hashLength(&hasher, examples.len);
+    for (examples) |*example| updatePreparedExampleHash(&hasher, example, true);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return allocator.dupe(u8, &hex);
+}
+
+pub fn refreshPreparedExamplesFingerprint(
+    allocator: std.mem.Allocator,
+    summary: *PreparedInputsSummary,
+) !void {
+    const digest = try fingerprintPreparedExamplesAlloc(allocator, summary.examples);
+    if (summary.prepared_examples_sha256) |old| allocator.free(old);
+    summary.prepared_examples_sha256 = digest;
+}
+
+fn hashFileInto(
+    hasher: *std.crypto.hash.sha2.Sha256,
+    allocator: std.mem.Allocator,
+    role: []const u8,
+    path: []const u8,
+) !void {
+    var mapped = try c_file.MmapRegion.init(allocator, path);
+    defer mapped.deinit();
+    hashBytes(hasher, role);
+    hashBytes(hasher, std.fs.path.basename(path));
+    hashBytes(hasher, mapped.data);
+}
+
+fn finishHashAlloc(
+    allocator: std.mem.Allocator,
+    hasher: *std.crypto.hash.sha2.Sha256,
+) ![]const u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return allocator.dupe(u8, &hex);
+}
+
+pub fn fingerprintGemma4Model(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+) !ModelProvenance {
+    var paths = try resolveArtifactPaths(allocator, model_dir);
+    defer paths.deinit();
+
+    var base_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hashBytes(&base_hasher, "gemma4_base_model/v1");
+    if (paths.config_path) |path|
+        try hashFileInto(&base_hasher, allocator, "config", path)
+    else
+        hashBytes(&base_hasher, "config_absent");
+    if (paths.checkpoint_path) |checkpoint_path| {
+        const is_index = std.mem.endsWith(u8, checkpoint_path, ".safetensors.index.json");
+        var dependencies = try safetensors.inspectArtifactDependencies(
+            allocator,
+            if (is_index) null else checkpoint_path,
+            if (is_index) checkpoint_path else null,
+        );
+        defer dependencies.deinit();
+        std.sort.heap([]u8, dependencies.paths, {}, struct {
+            fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
+                const lhs_base = std.fs.path.basename(lhs);
+                const rhs_base = std.fs.path.basename(rhs);
+                const order = std.mem.order(u8, lhs_base, rhs_base);
+                return if (order == .eq) std.mem.lessThan(u8, lhs, rhs) else order == .lt;
+            }
+        }.lessThan);
+        for (dependencies.paths) |path| try hashFileInto(&base_hasher, allocator, "safetensors", path);
+    } else if (paths.gguf_path) |path| {
+        try hashFileInto(&base_hasher, allocator, "gguf", path);
+    } else return error.MissingMergedCheckpoint;
+    const base_digest = try finishHashAlloc(allocator, &base_hasher);
+    errdefer allocator.free(base_digest);
+
+    var tokenizer_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hashBytes(&tokenizer_hasher, "gemma4_tokenizer/v1");
+    var tokenizer_file_count: usize = 0;
+    const tokenizer_candidates = [_][]const u8{
+        tokenizer_file_name,
+        "tokenizer.model",
+        tokenizer_config_file_name,
+        special_tokens_map_file_name,
+        "added_tokens.json",
+    };
+    for (tokenizer_candidates) |file_name| {
+        const path = try std.fs.path.join(allocator, &.{ model_dir, file_name });
+        defer allocator.free(path);
+        if (!isRegularFilePath(path)) continue;
+        try hashFileInto(&tokenizer_hasher, allocator, "tokenizer_asset", path);
+        tokenizer_file_count += 1;
+    }
+    // Some GGUF bundles embed their tokenizer. The selected decoder digest is
+    // then also the exact tokenizer identity without reading the GGUF twice.
+    if (tokenizer_file_count == 0) hashBytes(&tokenizer_hasher, base_digest);
+    const tokenizer_digest = try finishHashAlloc(allocator, &tokenizer_hasher);
+    errdefer allocator.free(tokenizer_digest);
+    const chat_digest = try sha256HexAlloc(allocator, prepared_chat_template_identity);
+    errdefer allocator.free(chat_digest);
+
+    return .{
+        .base_model_sha256 = base_digest,
+        .tokenizer_sha256 = tokenizer_digest,
+        .chat_template_sha256 = chat_digest,
+    };
+}
+
+pub fn populatePreparedProvenance(
+    allocator: std.mem.Allocator,
+    summary: *PreparedInputsSummary,
+    model_dir: []const u8,
+) !void {
+    var provenance = try fingerprintGemma4Model(allocator, model_dir);
+    defer provenance.deinit(allocator);
+    if (summary.base_model_sha256) |old| allocator.free(old);
+    if (summary.tokenizer_sha256) |old| allocator.free(old);
+    if (summary.chat_template_sha256) |old| allocator.free(old);
+    summary.base_model_sha256 = try allocator.dupe(u8, provenance.base_model_sha256);
+    summary.tokenizer_sha256 = try allocator.dupe(u8, provenance.tokenizer_sha256);
+    summary.chat_template_sha256 = try allocator.dupe(u8, provenance.chat_template_sha256);
+    summary.schema_version = prepared_schema_v4;
+    try refreshPreparedExamplesFingerprint(allocator, summary);
+}
+
+fn validateSha256Hex(value: []const u8) !void {
+    if (value.len != std.crypto.hash.sha2.Sha256.digest_length * 2) return error.InvalidPreparedFingerprint;
+    for (value) |byte| if (!std.ascii.isHex(byte)) return error.InvalidPreparedFingerprint;
+}
+
+pub fn validatePreparedArtifactIntegrity(
+    allocator: std.mem.Allocator,
+    summary: PreparedInputsSummary,
+) !void {
+    if (!std.mem.eql(u8, summary.artifact_family_version, artifact_family_version)) return error.UnsupportedArtifactFamily;
+    if (!std.mem.eql(u8, summary.schema_version, prepared_schema_v4)) return error.PreparedInputsProvenanceRequired;
+    const base_digest = summary.base_model_sha256 orelse return error.PreparedInputsProvenanceRequired;
+    const tokenizer_digest = summary.tokenizer_sha256 orelse return error.PreparedInputsProvenanceRequired;
+    const chat_digest = summary.chat_template_sha256 orelse return error.PreparedInputsProvenanceRequired;
+    const examples_digest = summary.prepared_examples_sha256 orelse return error.PreparedInputsProvenanceRequired;
+    try validateSha256Hex(base_digest);
+    try validateSha256Hex(tokenizer_digest);
+    try validateSha256Hex(chat_digest);
+    try validateSha256Hex(examples_digest);
+    const actual = try fingerprintPreparedExamplesAlloc(allocator, summary.examples);
+    defer allocator.free(actual);
+    if (!std.mem.eql(u8, examples_digest, actual)) return error.PreparedInputsFingerprintMismatch;
+}
+
+pub fn validatePreparedModelProvenance(
+    summary: PreparedInputsSummary,
+    actual: ModelProvenance,
+) !void {
+    const base_digest = summary.base_model_sha256 orelse return error.PreparedInputsProvenanceRequired;
+    const tokenizer_digest = summary.tokenizer_sha256 orelse return error.PreparedInputsProvenanceRequired;
+    const chat_digest = summary.chat_template_sha256 orelse return error.PreparedInputsProvenanceRequired;
+    if (!std.mem.eql(u8, base_digest, actual.base_model_sha256)) return error.PreparedBaseModelMismatch;
+    if (!std.mem.eql(u8, tokenizer_digest, actual.tokenizer_sha256)) return error.PreparedTokenizerMismatch;
+    if (!std.mem.eql(u8, chat_digest, actual.chat_template_sha256)) return error.PreparedChatTemplateMismatch;
+}
+
+pub fn validateAdapterModelProvenance(
+    inspected: InspectionSummary,
+    actual: ModelProvenance,
+) !void {
+    const base_digest = inspected.base_model_sha256 orelse return error.AdapterProvenanceRequired;
+    const tokenizer_digest = inspected.tokenizer_sha256 orelse return error.AdapterProvenanceRequired;
+    const chat_digest = inspected.chat_template_sha256 orelse return error.AdapterProvenanceRequired;
+    if (!std.mem.eql(u8, base_digest, actual.base_model_sha256)) return error.AdapterBaseModelMismatch;
+    if (!std.mem.eql(u8, tokenizer_digest, actual.tokenizer_sha256)) return error.AdapterTokenizerMismatch;
+    if (!std.mem.eql(u8, chat_digest, actual.chat_template_sha256)) return error.AdapterChatTemplateMismatch;
+}
+
+pub fn validatePreparedEvalDisjoint(
+    allocator: std.mem.Allocator,
+    training_examples: []const PreparedExampleInput,
+    eval_examples: []const PreparedExampleInput,
+) !void {
+    if (eval_examples.len == 0) return error.NoEvaluationData;
+    var training = std.AutoHashMapUnmanaged([std.crypto.hash.sha2.Sha256.digest_length]u8, void).empty;
+    defer training.deinit(allocator);
+    try training.ensureTotalCapacity(allocator, @intCast(training_examples.len));
+    for (training_examples) |*example| training.putAssumeCapacity(preparedExampleIdentityDigest(example), {});
+    for (eval_examples) |*example| {
+        if (training.contains(preparedExampleIdentityDigest(example))) return error.TrainingEvaluationOverlap;
+    }
+}
+
+pub fn validateTrainingSequenceLength(max_seq_len: usize, model_max_position_embeddings: usize) !u32 {
+    if (max_seq_len == 0) return error.InvalidPreparedSequenceLength;
+    if (max_seq_len > std.math.maxInt(u32)) return error.PreparedSequenceLengthOverflow;
+    if (model_max_position_embeddings == 0) return error.InvalidModelContextLength;
+    if (max_seq_len > model_max_position_embeddings) return error.PreparedSequenceExceedsModelContext;
+    if (max_seq_len > max_training_seq_len) return error.PreparedSequenceExceedsTrainingLimit;
+    return @intCast(max_seq_len);
+}
+
+pub fn validatePreparedSequenceAdmission(
+    summary: PreparedInputsSummary,
+    model_max_position_embeddings: u32,
+) !u32 {
+    const seq_len = try validateTrainingSequenceLength(summary.max_seq_len, model_max_position_embeddings);
+    if (summary.examples_seen != summary.examples.len) return error.PreparedSummaryMismatch;
+    var actual_max_input: usize = 0;
+    var actual_max_supervised: usize = 0;
+    for (summary.examples) |example| {
+        if (example.input_ids.len != example.num_input_tokens or example.labels.len != example.num_input_tokens) return error.PreparedSummaryMismatch;
+        if (example.num_input_tokens > summary.max_seq_len) return error.PreparedSequenceExceedsDeclaredLength;
+        actual_max_input = @max(actual_max_input, example.num_input_tokens);
+        actual_max_supervised = @max(actual_max_supervised, example.num_supervised_tokens);
+    }
+    if (actual_max_input != summary.max_input_tokens or actual_max_supervised != summary.max_supervised_tokens) return error.PreparedSummaryMismatch;
+    return seq_len;
 }
 
 // ---------------------------------------------------------------------------
@@ -2538,6 +3257,10 @@ fn clonePreparedInputsSummary(allocator: std.mem.Allocator, source: *const Prepa
         .max_examples = source.max_examples,
         .examples_seen = source.examples_seen,
         .tokenizer_class = try dupeOptionalString(allocator, source.tokenizer_class),
+        .base_model_sha256 = try dupeOptionalString(allocator, source.base_model_sha256),
+        .tokenizer_sha256 = try dupeOptionalString(allocator, source.tokenizer_sha256),
+        .chat_template_sha256 = try dupeOptionalString(allocator, source.chat_template_sha256),
+        .prepared_examples_sha256 = try dupeOptionalString(allocator, source.prepared_examples_sha256),
         .max_seq_len = source.max_seq_len,
         .max_prompt_tokens = source.max_prompt_tokens,
         .max_response_tokens = source.max_response_tokens,
@@ -2557,6 +3280,7 @@ fn clonePreparedInputsSummary(allocator: std.mem.Allocator, source: *const Prepa
 fn normalizePreparedSchemaVersion(schema_version: []const u8) ![]const u8 {
     if (std.mem.eql(u8, schema_version, prepared_schema_v2)) return prepared_schema_v2;
     if (std.mem.eql(u8, schema_version, prepared_schema_v3)) return prepared_schema_v3;
+    if (std.mem.eql(u8, schema_version, prepared_schema_v4)) return prepared_schema_v4;
     return error.UnsupportedPreparedInputsSchema;
 }
 
@@ -2799,22 +3523,20 @@ fn layerMatchesScope(layer_base_tensor_name: []const u8, layer_name: ?[]const u8
 }
 
 fn parseGemma4LayerIndex(tensor_name: []const u8) ?usize {
-    const prefix = "model.layers.";
-    if (std.mem.indexOf(u8, tensor_name, prefix)) |idx| {
-        const digits = tensor_name[idx + prefix.len ..];
+    if (parseGemma4TextLayerTensorName(tensor_name)) |parsed| return parsed.layer_index;
+
+    // Preserve adapter/checkpoint compatibility with names that add an outer
+    // PEFT prefix (for example `base_model.model.model.layers.*`). Target
+    // inventory discovery itself uses the stricter text-root parser above.
+    for ([_][]const u8{ "model.layers.", "blk." }) |prefix| {
+        const prefix_index = std.mem.indexOf(u8, tensor_name, prefix) orelse continue;
+        const digits = tensor_name[prefix_index + prefix.len ..];
         var end: usize = 0;
         while (end < digits.len and std.ascii.isDigit(digits[end])) : (end += 1) {}
-        if (end == 0) return null;
+        if (end == 0) continue;
         return std.fmt.parseUnsigned(usize, digits[0..end], 10) catch null;
     }
-
-    const gguf_prefix = "blk.";
-    const gguf_idx = std.mem.indexOf(u8, tensor_name, gguf_prefix) orelse return null;
-    const digits = tensor_name[gguf_idx + gguf_prefix.len ..];
-    var end: usize = 0;
-    while (end < digits.len and std.ascii.isDigit(digits[end])) : (end += 1) {}
-    if (end == 0) return null;
-    return std.fmt.parseUnsigned(usize, digits[0..end], 10) catch null;
+    return null;
 }
 
 fn keepTensorInRecursiveCompressedBase(tensor_name: []const u8, shared_block_size: usize) bool {
@@ -2930,10 +3652,77 @@ test "validateMultimodalExampleShape catches placeholder mismatch" {
 test "normalizePreparedSchemaVersion accepts supported versions" {
     try std.testing.expectEqualStrings(prepared_schema_v2, try normalizePreparedSchemaVersion(prepared_schema_v2));
     try std.testing.expectEqualStrings(prepared_schema_v3, try normalizePreparedSchemaVersion(prepared_schema_v3));
+    try std.testing.expectEqualStrings(prepared_schema_v4, try normalizePreparedSchemaVersion(prepared_schema_v4));
 }
 
 test "normalizePreparedSchemaVersion rejects unknown version" {
     try std.testing.expectError(error.UnsupportedPreparedInputsSchema, normalizePreparedSchemaVersion("gemma4_prepared/v999"));
+}
+
+test "Gemma4 training sequence admission is bounded before graph construction" {
+    try std.testing.expectEqual(@as(u32, 1), try validateTrainingSequenceLength(1, 4096));
+    try std.testing.expectEqual(@as(u32, max_training_seq_len), try validateTrainingSequenceLength(max_training_seq_len, 4096));
+    try std.testing.expectError(error.InvalidPreparedSequenceLength, validateTrainingSequenceLength(0, 4096));
+    try std.testing.expectError(error.InvalidModelContextLength, validateTrainingSequenceLength(1, 0));
+    try std.testing.expectError(error.PreparedSequenceExceedsModelContext, validateTrainingSequenceLength(65, 64));
+    try std.testing.expectError(error.PreparedSequenceExceedsTrainingLimit, validateTrainingSequenceLength(max_training_seq_len + 1, 4096));
+    if (std.math.maxInt(usize) > std.math.maxInt(u32)) {
+        try std.testing.expectError(error.PreparedSequenceLengthOverflow, validateTrainingSequenceLength(@as(usize, std.math.maxInt(u32)) + 1, std.math.maxInt(u32)));
+    }
+}
+
+test "prepared v4 integrity detects content mutation and heldout overlap" {
+    const allocator = std.testing.allocator;
+    var train_ids = [_]i32{ 1, 2, 3 };
+    var train_labels = [_]i32{ -100, -100, 3 };
+    var eval_ids = [_]i32{ 4, 5, 6 };
+    var eval_labels = [_]i32{ -100, -100, 6 };
+    var train_examples = [_]PreparedExampleInput{.{
+        .mode = .instruction,
+        .prompt_input_ids = train_ids[0..2],
+        .response_input_ids = train_ids[2..],
+        .num_prompt_tokens = 2,
+        .num_response_tokens = 1,
+        .input_ids = &train_ids,
+        .labels = &train_labels,
+        .num_input_tokens = 3,
+        .num_supervised_tokens = 1,
+    }};
+    var eval_examples = [_]PreparedExampleInput{.{
+        .mode = .instruction,
+        .prompt_input_ids = eval_ids[0..2],
+        .response_input_ids = eval_ids[2..],
+        .num_prompt_tokens = 2,
+        .num_response_tokens = 1,
+        .input_ids = &eval_ids,
+        .labels = &eval_labels,
+        .num_input_tokens = 3,
+        .num_supervised_tokens = 1,
+    }};
+    const digest = try fingerprintPreparedExamplesAlloc(allocator, &train_examples);
+    defer allocator.free(digest);
+    const valid = PreparedInputsSummary{
+        .artifact_family_version = artifact_family_version,
+        .model_dir = "/model",
+        .schema_version = prepared_schema_v4,
+        .base_model_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .tokenizer_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .chat_template_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        .prepared_examples_sha256 = digest,
+        .max_examples = 1,
+        .examples_seen = 1,
+        .max_seq_len = 3,
+        .max_input_tokens = 3,
+        .max_supervised_tokens = 1,
+        .examples = &train_examples,
+    };
+    try validatePreparedArtifactIntegrity(allocator, valid);
+    _ = try validatePreparedSequenceAdmission(valid, 16);
+    try validatePreparedEvalDisjoint(allocator, &train_examples, &eval_examples);
+    try std.testing.expectError(error.TrainingEvaluationOverlap, validatePreparedEvalDisjoint(allocator, &train_examples, &train_examples));
+
+    train_ids[2] = 9;
+    try std.testing.expectError(error.PreparedInputsFingerprintMismatch, validatePreparedArtifactIntegrity(allocator, valid));
 }
 
 const TestWhitespaceTokenizer = struct {
@@ -2974,16 +3763,66 @@ const WriteTensorRaw = struct {
     raw_bytes: []const u8,
 };
 
+const BootstrapTargetSelection = union(enum) {
+    gemma4: Gemma4LoRATargetPreset,
+    legacy: peft.TargetPreset,
+    explicit: []const []const u8,
+};
+
+const Gemma4TextLinearKind = enum {
+    q_proj,
+    k_proj,
+    v_proj,
+    o_proj,
+    gate_proj,
+    up_proj,
+    down_proj,
+    ple_input_gate,
+    ple_projection,
+    ple_model_projection,
+};
+
+const Gemma4TextLayerTensorName = struct {
+    layer_index: usize,
+    suffix: []const u8,
+    is_gguf: bool,
+};
+
+fn resolveBootstrapTargetSelection(options: BootstrapOptions) !BootstrapTargetSelection {
+    const selection_count = @intFromBool(options.target_modules != null) +
+        @intFromBool(options.gemma4_target_preset != null) +
+        @intFromBool(options.target_preset != null);
+    if (selection_count > 1) return error.ConflictingLoRATargetSelection;
+    if (options.target_modules) |modules| return .{ .explicit = modules };
+    if (options.gemma4_target_preset) |preset| return .{ .gemma4 = preset };
+    if (options.target_preset) |preset| return .{ .legacy = preset };
+    return .{ .gemma4 = .text_all_linear };
+}
+
+pub fn gemma4LoRATargetPresetName(preset: Gemma4LoRATargetPreset) []const u8 {
+    return switch (preset) {
+        .peft_qv => "peft-qv",
+        .text_all_linear => "text-all-linear",
+    };
+}
+
+fn targetSelectionPresetName(selection: BootstrapTargetSelection) ?[]const u8 {
+    return switch (selection) {
+        .gemma4 => |preset| gemma4LoRATargetPresetName(preset),
+        .legacy => |preset| targetPresetName(preset),
+        .explicit => null,
+    };
+}
+
 fn inferLoRATargetTensorsForModelInput(
     allocator: std.mem.Allocator,
     model_input: []const u8,
     weights_path: []const u8,
-    requested_modules: []const []const u8,
-    target_preset: ?peft.TargetPreset,
+    selection: BootstrapTargetSelection,
 ) ![]LoRATargetTensor {
     _ = model_input;
     if (!std.mem.endsWith(u8, weights_path, ".gguf")) {
-        return inferLoRATargetTensors(weights_path, allocator, requested_modules, target_preset);
+        return inferLoRATargetTensors(weights_path, allocator, selection);
     }
 
     var targets: std.ArrayListUnmanaged(LoRATargetTensor) = .empty;
@@ -3003,8 +3842,8 @@ fn inferLoRATargetTensorsForModelInput(
 
     for (access.store.parsed.tensors) |tensor| {
         const tensor_name = tensor.name;
-        const module_name = moduleNameForTensorWithPreset(tensor_name, target_preset) orelse continue;
-        if (!targetMatchesRequest(tensor_name, module_name, requested_modules, target_preset)) continue;
+        const module_name = moduleNameForTensorWithSelection(tensor_name, selection) orelse continue;
+        if (!targetMatchesSelection(tensor_name, selection)) continue;
         if (tensor.dimensions.len != 2) continue;
         try targets.append(allocator, .{
             .tensor_name = try allocator.dupe(u8, tensor_name),
@@ -3019,17 +3858,19 @@ fn inferLoRATargetTensorsForModelInput(
             return std.mem.lessThan(u8, a.tensor_name, b.tensor_name);
         }
     }.lt);
+    try validateExplicitTargetSelection(selection, targets.items);
     return targets.toOwnedSlice(allocator);
 }
 
 fn inferLoRATargetTensors(
     checkpoint_path: []const u8,
     allocator: std.mem.Allocator,
-    requested_modules: []const []const u8,
-    target_preset: ?peft.TargetPreset,
+    selection: BootstrapTargetSelection,
 ) ![]LoRATargetTensor {
-    var reader = try safetensors.MMapReader.openFileAbsolute(allocator, checkpoint_path);
-    defer reader.deinit();
+    var access = try openTensorAccessForFile(allocator, checkpoint_path);
+    defer access.deinit();
+    const names = try access.listNames(allocator);
+    defer allocator.free(names);
 
     var targets: std.ArrayListUnmanaged(LoRATargetTensor) = .empty;
     errdefer {
@@ -3040,18 +3881,17 @@ fn inferLoRATargetTensors(
         targets.deinit(allocator);
     }
 
-    var it = reader.header.tensors.iterator();
-    while (it.next()) |entry| {
-        const tensor_name = entry.key_ptr.*;
-        const module_name = moduleNameForTensorWithPreset(tensor_name, target_preset) orelse continue;
-        if (!targetMatchesRequest(tensor_name, module_name, requested_modules, target_preset)) continue;
-        const info = entry.value_ptr.*;
-        if (info.shape.len != 2) continue;
+    for (names) |tensor_name| {
+        const module_name = moduleNameForTensorWithSelection(tensor_name, selection) orelse continue;
+        if (!targetMatchesSelection(tensor_name, selection)) continue;
+        var record = try access.getRecord(allocator, tensor_name);
+        defer record.deinit();
+        if (record.descriptor.shape.len != 2) continue;
         try targets.append(allocator, .{
             .tensor_name = try allocator.dupe(u8, tensor_name),
             .module_name = try allocator.dupe(u8, module_name),
-            .output_dim = @intCast(info.shape[0]),
-            .input_dim = @intCast(info.shape[1]),
+            .output_dim = @intCast(record.descriptor.shape[0]),
+            .input_dim = @intCast(record.descriptor.shape[1]),
         });
     }
 
@@ -3060,48 +3900,270 @@ fn inferLoRATargetTensors(
             return std.mem.lessThan(u8, a.tensor_name, b.tensor_name);
         }
     }.lt);
+    try validateExplicitTargetSelection(selection, targets.items);
     return targets.toOwnedSlice(allocator);
 }
 
 fn moduleNameForTensor(tensor_name: []const u8) ?[]const u8 {
-    const ordered_modules = [_][]const u8{
-        "q_proj",    "k_proj",  "v_proj",    "o_proj",
-        "gate_proj", "up_proj", "down_proj",
-    };
-    inline for (ordered_modules) |module_name| {
-        const dot_suffix = "." ++ module_name ++ ".weight";
-        const slash_suffix = "/" ++ module_name ++ "/weight";
-        if (std.mem.endsWith(u8, tensor_name, dot_suffix)) return module_name;
-        if (std.mem.endsWith(u8, tensor_name, slash_suffix)) return module_name;
+    const kind = gemma4TextLinearKindForTensor(tensor_name) orelse return null;
+    return gemma4TextLinearKindName(kind);
+}
+
+fn moduleNameForTensorWithSelection(tensor_name: []const u8, selection: BootstrapTargetSelection) ?[]const u8 {
+    switch (selection) {
+        .legacy => |preset| if (preset == .moe_experts and isGemma4TextLayerTensor(tensor_name) and peft.matchesMoEExpertTensor(tensor_name)) return "moe_expert",
+        else => {},
     }
-    const gguf_aliases = [_]struct { suffix: []const u8, module_name: []const u8 }{
-        .{ .suffix = ".attn_q.weight", .module_name = "q_proj" },
-        .{ .suffix = ".attn_k.weight", .module_name = "k_proj" },
-        .{ .suffix = ".attn_v.weight", .module_name = "v_proj" },
-        .{ .suffix = ".attn_output.weight", .module_name = "o_proj" },
-        .{ .suffix = ".ffn_gate.weight", .module_name = "gate_proj" },
-        .{ .suffix = ".ffn_up.weight", .module_name = "up_proj" },
-        .{ .suffix = ".ffn_down.weight", .module_name = "down_proj" },
+    return moduleNameForTensor(tensor_name);
+}
+
+fn targetMatchesSelection(tensor_name: []const u8, selection: BootstrapTargetSelection) bool {
+    const maybe_kind = gemma4TextLinearKindForTensor(tensor_name);
+    return switch (selection) {
+        .gemma4 => |preset| if (maybe_kind) |kind| switch (preset) {
+            .peft_qv => kind == .q_proj or kind == .v_proj,
+            .text_all_linear => true,
+        } else false,
+        .legacy => |preset| switch (preset) {
+            .all_linear => maybe_kind != null,
+            .attention_only => if (maybe_kind) |kind| isAttentionLinearKind(kind) else false,
+            .mlp_only => if (maybe_kind) |kind| isMlpLinearKind(kind) else false,
+            .moe_experts => isGemma4TextLayerTensor(tensor_name) and peft.matchesMoEExpertTensor(tensor_name),
+        },
+        .explicit => |requested_modules| if (maybe_kind) |kind| blk: {
+            for (requested_modules) |requested| {
+                if (explicitTargetMatchesTensor(requested, tensor_name, kind)) break :blk true;
+            }
+            break :blk false;
+        } else false,
     };
-    inline for (gguf_aliases) |alias| {
-        if (std.mem.endsWith(u8, tensor_name, alias.suffix)) return alias.module_name;
+}
+
+fn gemma4TextLinearKindForTensor(tensor_name: []const u8) ?Gemma4TextLinearKind {
+    var canonical_buf: [256]u8 = undefined;
+    const canonical_name = session_factory.canonicalizeGemma4LegacyWeightKey(tensor_name, &canonical_buf) orelse tensor_name;
+    if (isGemma4PleModelProjectionTensor(canonical_name)) return .ple_model_projection;
+
+    const parsed = parseGemma4TextLayerTensorName(canonical_name) orelse return null;
+    const suffix = parsed.suffix;
+    if (std.mem.eql(u8, suffix, "self_attn.q_proj.weight") or parsed.is_gguf and std.mem.eql(u8, suffix, "attn_q.weight")) return .q_proj;
+    if (std.mem.eql(u8, suffix, "self_attn.k_proj.weight") or parsed.is_gguf and std.mem.eql(u8, suffix, "attn_k.weight")) return .k_proj;
+    if (std.mem.eql(u8, suffix, "self_attn.v_proj.weight") or parsed.is_gguf and std.mem.eql(u8, suffix, "attn_v.weight")) return .v_proj;
+    if (std.mem.eql(u8, suffix, "self_attn.o_proj.weight") or parsed.is_gguf and std.mem.eql(u8, suffix, "attn_output.weight")) return .o_proj;
+    if (std.mem.eql(u8, suffix, "mlp.gate_proj.weight") or parsed.is_gguf and std.mem.eql(u8, suffix, "ffn_gate.weight")) return .gate_proj;
+    if (std.mem.eql(u8, suffix, "mlp.up_proj.weight") or parsed.is_gguf and std.mem.eql(u8, suffix, "ffn_up.weight")) return .up_proj;
+    if (std.mem.eql(u8, suffix, "mlp.down_proj.weight") or parsed.is_gguf and std.mem.eql(u8, suffix, "ffn_down.weight")) return .down_proj;
+    if (std.mem.eql(u8, suffix, "per_layer_input.inp_gate.weight") or parsed.is_gguf and std.mem.eql(u8, suffix, "inp_gate.weight")) return .ple_input_gate;
+    if (std.mem.eql(u8, suffix, "per_layer_input.proj.weight") or parsed.is_gguf and std.mem.eql(u8, suffix, "proj.weight")) return .ple_projection;
+    return null;
+}
+
+fn gemma4TextLinearKindName(kind: Gemma4TextLinearKind) []const u8 {
+    return switch (kind) {
+        .q_proj => "q_proj",
+        .k_proj => "k_proj",
+        .v_proj => "v_proj",
+        .o_proj => "o_proj",
+        .gate_proj => "gate_proj",
+        .up_proj => "up_proj",
+        .down_proj => "down_proj",
+        .ple_input_gate => "per_layer_input.inp_gate",
+        .ple_projection => "per_layer_input.proj",
+        .ple_model_projection => "per_layer_input.per_layer_model_proj",
+    };
+}
+
+fn isAttentionLinearKind(kind: Gemma4TextLinearKind) bool {
+    return switch (kind) {
+        .q_proj, .k_proj, .v_proj, .o_proj => true,
+        else => false,
+    };
+}
+
+fn isMlpLinearKind(kind: Gemma4TextLinearKind) bool {
+    return switch (kind) {
+        .gate_proj, .up_proj, .down_proj => true,
+        else => false,
+    };
+}
+
+fn isGemma4PleModelProjectionTensor(tensor_name: []const u8) bool {
+    const names = [_][]const u8{
+        "per_layer_model_proj.weight",
+        "model.per_layer_input.per_layer_model_proj.weight",
+        "model.language_model.per_layer_input.per_layer_model_proj.weight",
+        "language_model.model.per_layer_input.per_layer_model_proj.weight",
+        "language_model.per_layer_input.per_layer_model_proj.weight",
+        "vlm.model.language_model.per_layer_input.per_layer_model_proj.weight",
+    };
+    inline for (names) |name| {
+        if (std.mem.eql(u8, tensor_name, name)) return true;
+    }
+    return false;
+}
+
+fn parseGemma4TextLayerTensorName(tensor_name: []const u8) ?Gemma4TextLayerTensorName {
+    const normalized_prefixes = [_][]const u8{
+        "model.language_model.layers.",
+        "language_model.model.layers.",
+        "language_model.layers.",
+        "model.layers.",
+        "layers.",
+    };
+    inline for (normalized_prefixes) |prefix| {
+        if (parseGemma4TextLayerTensorAfterPrefix(tensor_name, prefix, false)) |parsed| return parsed;
+    }
+    return parseGemma4TextLayerTensorAfterPrefix(tensor_name, "blk.", true);
+}
+
+fn parseGemma4TextLayerTensorAfterPrefix(
+    tensor_name: []const u8,
+    prefix: []const u8,
+    is_gguf: bool,
+) ?Gemma4TextLayerTensorName {
+    if (!std.mem.startsWith(u8, tensor_name, prefix)) return null;
+    const rest = tensor_name[prefix.len..];
+    const separator = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
+    if (separator == 0 or separator + 1 >= rest.len) return null;
+    const layer_index = std.fmt.parseInt(usize, rest[0..separator], 10) catch return null;
+    return .{
+        .layer_index = layer_index,
+        .suffix = rest[separator + 1 ..],
+        .is_gguf = is_gguf,
+    };
+}
+
+fn isGemma4TextLayerTensor(tensor_name: []const u8) bool {
+    return parseGemma4TextLayerTensorName(tensor_name) != null;
+}
+
+fn explicitTargetMatchesTensor(
+    requested: []const u8,
+    tensor_name: []const u8,
+    kind: Gemma4TextLinearKind,
+) bool {
+    if (std.mem.eql(u8, requested, gemma4TextLinearKindName(kind))) return true;
+    if (std.mem.eql(u8, requested, tensor_name)) return true;
+    if (tensorModulePath(tensor_name)) |module_path| {
+        if (std.mem.eql(u8, requested, module_path)) return true;
+    }
+    var normalized_buf: [256]u8 = undefined;
+    if (normalizedTargetModulePathInBuffer(tensor_name, &normalized_buf)) |normalized| {
+        if (std.mem.eql(u8, requested, normalized)) return true;
+    }
+    return switch (kind) {
+        .ple_input_gate => std.mem.eql(u8, requested, "inp_gate") or std.mem.eql(u8, requested, "per_layer_input_gate"),
+        .ple_projection => std.mem.eql(u8, requested, "per_layer_projection"),
+        .ple_model_projection => std.mem.eql(u8, requested, "per_layer_model_proj") or std.mem.eql(u8, requested, "per_layer_model_projection"),
+        else => false,
+    };
+}
+
+fn validateExplicitTargetSelection(
+    selection: BootstrapTargetSelection,
+    targets: []const LoRATargetTensor,
+) !void {
+    const requested_modules = switch (selection) {
+        .explicit => |modules| modules,
+        else => return,
+    };
+    if (requested_modules.len == 0) return error.NoLoRATargetTensorsResolved;
+    for (requested_modules) |requested| {
+        var found = false;
+        for (targets) |target| {
+            const kind = gemma4TextLinearKindForTensor(target.tensor_name) orelse continue;
+            if (explicitTargetMatchesTensor(requested, target.tensor_name, kind)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return error.UnknownLoRATargetModule;
+    }
+}
+
+fn resolvedTargetModulePaths(
+    allocator: std.mem.Allocator,
+    targets: []const LoRATargetTensor,
+) ![][]const u8 {
+    const paths = try allocator.alloc([]const u8, targets.len);
+    errdefer allocator.free(paths);
+    var built: usize = 0;
+    errdefer for (paths[0..built]) |path| allocator.free(path);
+    for (targets, 0..) |target, idx| {
+        paths[idx] = try normalizedTargetModulePath(allocator, target.tensor_name);
+        built += 1;
+    }
+    std.mem.sort([]const u8, paths, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    return paths;
+}
+
+fn normalizedTargetModulePath(allocator: std.mem.Allocator, tensor_name: []const u8) ![]const u8 {
+    var buf: [256]u8 = undefined;
+    const module_path = normalizedTargetModulePathInBuffer(tensor_name, &buf) orelse return error.InvalidLoRATargetTensorName;
+    return allocator.dupe(u8, module_path);
+}
+
+fn canonicalAdapterBaseTensorName(allocator: std.mem.Allocator, source_tensor_name: []const u8) ![]u8 {
+    const module_path = try normalizedTargetModulePath(allocator, source_tensor_name);
+    defer allocator.free(module_path);
+    return std.fmt.allocPrint(allocator, "{s}.weight", .{module_path});
+}
+
+fn sourceTensorNameForCanonicalAdapterBase(
+    source_tensor_names: []const []const u8,
+    canonical_base_tensor_name: []const u8,
+) ?[]const u8 {
+    for (source_tensor_names) |source_name| {
+        if (std.mem.eql(u8, source_name, canonical_base_tensor_name)) return source_name;
+    }
+
+    const canonical_module_path = tensorModulePath(canonical_base_tensor_name) orelse return null;
+    for (source_tensor_names) |source_name| {
+        var normalized_buf: [256]u8 = undefined;
+        const normalized_module_path = normalizedTargetModulePathInBuffer(source_name, &normalized_buf) orelse continue;
+        if (std.mem.eql(u8, normalized_module_path, canonical_module_path)) return source_name;
     }
     return null;
 }
 
-fn moduleNameForTensorWithPreset(tensor_name: []const u8, target_preset: ?peft.TargetPreset) ?[]const u8 {
-    if (target_preset == .moe_experts and peft.matchesMoEExpertTensor(tensor_name)) return "moe_expert";
-    return moduleNameForTensor(tensor_name);
+fn normalizedTargetModulePathInBuffer(tensor_name: []const u8, buf: *[256]u8) ?[]const u8 {
+    if (session_factory.canonicalizeGemma4LegacyWeightKey(tensor_name, buf)) |canonical| {
+        return tensorModulePath(canonical);
+    }
+
+    const kind = gemma4TextLinearKindForTensor(tensor_name);
+    if (kind) |linear_kind| {
+        if (parseGemma4TextLayerTensorName(tensor_name)) |parsed| {
+            if (parsed.is_gguf) {
+                const normalized_suffix = switch (linear_kind) {
+                    .q_proj => "self_attn.q_proj",
+                    .k_proj => "self_attn.k_proj",
+                    .v_proj => "self_attn.v_proj",
+                    .o_proj => "self_attn.o_proj",
+                    .gate_proj => "mlp.gate_proj",
+                    .up_proj => "mlp.up_proj",
+                    .down_proj => "mlp.down_proj",
+                    .ple_input_gate => "per_layer_input.inp_gate",
+                    .ple_projection => "per_layer_input.proj",
+                    .ple_model_projection => unreachable,
+                };
+                return std.fmt.bufPrint(buf, "model.layers.{d}.{s}", .{ parsed.layer_index, normalized_suffix }) catch null;
+            }
+        } else if (linear_kind == .ple_model_projection and std.mem.eql(u8, tensor_name, "per_layer_model_proj.weight")) {
+            return "model.per_layer_input.per_layer_model_proj";
+        }
+    }
+    return tensorModulePath(tensor_name);
 }
 
-fn targetMatchesRequest(
-    tensor_name: []const u8,
-    module_name: []const u8,
-    requested_modules: []const []const u8,
-    target_preset: ?peft.TargetPreset,
-) bool {
-    if (target_preset) |preset| return peft.matchesTargetPreset(tensor_name, preset);
-    return stringSliceContains(requested_modules, module_name);
+fn tensorModulePath(tensor_name: []const u8) ?[]const u8 {
+    if (std.mem.endsWith(u8, tensor_name, ".weight")) return tensor_name[0 .. tensor_name.len - ".weight".len];
+    if (std.mem.endsWith(u8, tensor_name, "/weight")) return tensor_name[0 .. tensor_name.len - "/weight".len];
+    return null;
 }
 
 const LoRAAdapterTensorKind = enum { a, b };
@@ -3134,6 +4196,14 @@ fn parseLoRAAdapterTensorName(tensor_name: []const u8) ?ParsedLoRAAdapterTensorN
         return .{ .base_tensor_base_name = base, .module_name = module, .kind = .b };
     }
     return null;
+}
+
+fn parseDoRAMagnitudeTensorName(tensor_name: []const u8) ?[]const u8 {
+    const suffix = ".lora_magnitude_vector.weight";
+    if (!std.mem.endsWith(u8, tensor_name, suffix)) return null;
+    const base = tensor_name[0 .. tensor_name.len - suffix.len];
+    if (tensorModulePath(base) == null) return null;
+    return base;
 }
 
 fn writeBootstrapAdapterCheckpoint(
@@ -3191,6 +4261,9 @@ fn writeBootstrapAdapterCheckpoint(
 
     var tensor_idx: usize = 0;
     for (resolved_tensors) |target| {
+        const adapter_base_tensor_name = try canonicalAdapterBaseTensorName(allocator, target.tensor_name);
+        defer allocator.free(adapter_base_tensor_name);
+
         var base_tensor: ?Tensor = null;
         if (needs_base_tensor) {
             base_tensor = try loadTensorAsF32(allocator, base_access.?, target.tensor_name);
@@ -3244,14 +4317,14 @@ fn writeBootstrapAdapterCheckpoint(
 
         for (0..loop_count) |loop_idx| {
             const a_name = if (recursive_config.enabled)
-                try recursive_lora.formatLoopAdapterTensorName(allocator, target.tensor_name, loop_idx, .a)
+                try recursive_lora.formatLoopAdapterTensorName(allocator, adapter_base_tensor_name, loop_idx, .a)
             else
-                try std.fmt.allocPrint(allocator, "{s}.lora_A.weight", .{target.tensor_name});
+                try std.fmt.allocPrint(allocator, "{s}.lora_A.weight", .{adapter_base_tensor_name});
             errdefer allocator.free(a_name);
             const b_name = if (recursive_config.enabled)
-                try recursive_lora.formatLoopAdapterTensorName(allocator, target.tensor_name, loop_idx, .b)
+                try recursive_lora.formatLoopAdapterTensorName(allocator, adapter_base_tensor_name, loop_idx, .b)
             else
-                try std.fmt.allocPrint(allocator, "{s}.lora_B.weight", .{target.tensor_name});
+                try std.fmt.allocPrint(allocator, "{s}.lora_B.weight", .{adapter_base_tensor_name});
             errdefer allocator.free(b_name);
             try owned_names.append(allocator, a_name);
             try owned_names.append(allocator, b_name);
@@ -3267,7 +4340,7 @@ fn writeBootstrapAdapterCheckpoint(
             const magnitude_data = try buildDoraMagnitudeFromBaseRowMajor(allocator, base.asFloat32(), target.output_dim, target.input_dim);
             try owned_data.append(allocator, magnitude_data);
 
-            const magnitude_name = try doraMagnitudeTensorName(allocator, target.tensor_name);
+            const magnitude_name = try doraMagnitudeTensorName(allocator, adapter_base_tensor_name);
             try owned_names.append(allocator, magnitude_name);
 
             const magnitude_shape = try allocator.dupe(usize, &.{target.output_dim});
@@ -3327,6 +4400,18 @@ fn parseLoRAInitKind(value: ?[]const u8) !LoRAInitKind {
     if (std.mem.eql(u8, text, "loftq-nf4")) return .loftq_nf4;
     if (std.mem.eql(u8, text, "loftq")) return .loftq_nf4;
     return error.UnsupportedLoRAInitializer;
+}
+
+pub fn validateLoRAInitializerBaseCompatibility(value: ?[]const u8) !void {
+    const text = value orelse return;
+    if (startsWithIgnoreCase(text, "pissa") or startsWithIgnoreCase(text, "loftq")) {
+        return error.LoRAInitializerRequiresAdjustedBase;
+    }
+    _ = try parseLoRAInitKind(text);
+}
+
+fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
+    return value.len >= prefix.len and std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
 }
 
 fn buildInitialLoRAFactors(
@@ -3485,6 +4570,9 @@ fn writeHeaderAndRawTensors(allocator: std.mem.Allocator, path: []const u8, tens
 
 const AdapterConfigWriteOptions = struct {
     base_model_name_or_path: []const u8,
+    base_model_sha256: ?[]const u8 = null,
+    tokenizer_sha256: ?[]const u8 = null,
+    chat_template_sha256: ?[]const u8 = null,
     rank: usize,
     alpha: f32,
     target_modules: []const []const u8,
@@ -3504,6 +4592,9 @@ fn writeAdapterConfigJson(
     if (options.recursive_lora.enabled) {
         try std.json.Stringify.value(.{
             .base_model_name_or_path = options.base_model_name_or_path,
+            .antfly_base_model_sha256 = options.base_model_sha256,
+            .antfly_tokenizer_sha256 = options.tokenizer_sha256,
+            .antfly_chat_template_sha256 = options.chat_template_sha256,
             .peft_type = "LORA",
             .task_type = "CAUSAL_LM",
             .r = options.rank,
@@ -3523,6 +4614,9 @@ fn writeAdapterConfigJson(
     } else {
         try std.json.Stringify.value(.{
             .base_model_name_or_path = options.base_model_name_or_path,
+            .antfly_base_model_sha256 = options.base_model_sha256,
+            .antfly_tokenizer_sha256 = options.tokenizer_sha256,
+            .antfly_chat_template_sha256 = options.chat_template_sha256,
             .peft_type = "LORA",
             .task_type = "CAUSAL_LM",
             .r = options.rank,
@@ -3534,13 +4628,6 @@ fn writeAdapterConfigJson(
         }, .{ .whitespace = .indent_2 }, &buffer.writer);
     }
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = buffer.written() });
-}
-
-fn bundleHasDoRA(bundle: *const LoadedLoRABundle) bool {
-    for (bundle.layers) |layer| {
-        if (layer.dora_magnitude != null) return true;
-    }
-    return false;
 }
 
 fn targetPresetName(preset: peft.TargetPreset) []const u8 {
@@ -3775,6 +4862,7 @@ fn denseRecordDType(encoding: tensor_access.Encoding) ?DType {
 
 fn openTensorAccessForFile(allocator: std.mem.Allocator, path: []const u8) !tensor_access.TensorAccess {
     if (std.mem.endsWith(u8, path, ".index.json")) {
+        try safetensors.validateArtifactSet(allocator, null, path);
         const access = try tensor_access.ShardedSafetensorsAccess.initAbsolute(allocator, path);
         return access.tensorAccess();
     }
@@ -3951,18 +5039,472 @@ test "findDecoderGgufPathInDir rejects ambiguous decoder ggufs" {
     try std.testing.expectError(error.AmbiguousDecoderGguf, findDecoderGgufPathInDir(allocator, model_dir));
 }
 
-test "gemma4 lora initializer frontend uses real EVA LoRA-GA and LoftQ paths" {
+test "gemma4 E2B and E4B presets follow shared-KV text schemas" {
+    try std.testing.expectEqual(@as(usize, 50), try syntheticGemma4PresetTargetCount(35, 15, .peft_qv));
+    try std.testing.expectEqual(@as(usize, 276), try syntheticGemma4PresetTargetCount(35, 15, .text_all_linear));
+    try std.testing.expectEqual(@as(usize, 66), try syntheticGemma4PresetTargetCount(42, 24, .peft_qv));
+    try std.testing.expectEqual(@as(usize, 343), try syntheticGemma4PresetTargetCount(42, 24, .text_all_linear));
+
+    const all = BootstrapTargetSelection{ .gemma4 = .text_all_linear };
+    try std.testing.expect(targetMatchesSelection("model.language_model.layers.3.self_attn.q_proj.weight", all));
+    try std.testing.expect(!targetMatchesSelection("model.vision_tower.layers.3.self_attn.q_proj.weight", all));
+    try std.testing.expect(!targetMatchesSelection("model.embed_tokens.weight", all));
+    try std.testing.expect(!targetMatchesSelection("model.layers.3.input_layernorm.weight", all));
+    try std.testing.expect(!targetMatchesSelection("lm_head.weight", all));
+}
+
+test "gemma4 bootstrap persists exact targets and rejects unknown explicit modules" {
+    const allocator = std.testing.allocator;
+    const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gemma4_strict_targets_test_{d}", .{std.posix.system.getpid()});
+    defer allocator.free(root);
+    compat.cwd().deleteTree(compat.io(), root) catch {};
+    try compat.cwd().createDirPath(compat.io(), root);
+    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+
+    const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
+    defer allocator.free(checkpoint_path);
+    const values = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
+        .{ .name = "model.layers.0.self_attn.q_proj.weight", .shape = &.{ 2, 3 }, .data = &values },
+        .{ .name = "model.layers.0.self_attn.k_proj.weight", .shape = &.{ 2, 3 }, .data = &values },
+        .{ .name = "model.layers.0.self_attn.v_proj.weight", .shape = &.{ 2, 3 }, .data = &values },
+        .{ .name = "model.layers.1.self_attn.q_proj.weight", .shape = &.{ 2, 3 }, .data = &values },
+        .{ .name = "model.layers.1.self_attn.o_proj.weight", .shape = &.{ 2, 3 }, .data = &values },
+        .{ .name = "model.layers.1.mlp.gate_proj.weight", .shape = &.{ 2, 3 }, .data = &values },
+        .{ .name = "model.layers.1.mlp.up_proj.weight", .shape = &.{ 2, 3 }, .data = &values },
+        .{ .name = "model.layers.1.mlp.down_proj.weight", .shape = &.{ 2, 3 }, .data = &values },
+        .{ .name = "model.layers.1.per_layer_input.inp_gate.weight", .shape = &.{ 2, 3 }, .data = &values },
+        .{ .name = "model.layers.1.per_layer_input.proj.weight", .shape = &.{ 2, 3 }, .data = &values },
+        .{ .name = "model.per_layer_input.per_layer_model_proj.weight", .shape = &.{ 2, 3 }, .data = &values },
+        .{ .name = "model.vision_tower.layers.0.self_attn.q_proj.weight", .shape = &.{ 2, 3 }, .data = &values },
+        .{ .name = "model.embed_tokens.weight", .shape = &.{ 2, 3 }, .data = &values },
+        .{ .name = "model.layers.0.input_layernorm.weight", .shape = &.{ 2, 3 }, .data = &values },
+        .{ .name = "lm_head.weight", .shape = &.{ 2, 3 }, .data = &values },
+    });
+
+    const out_dir = try std.fs.path.join(allocator, &.{ root, "adapter" });
+    defer allocator.free(out_dir);
+    var summary = try bootstrapLoRABundle(allocator, root, out_dir, .{
+        .rank = 1,
+        .gemma4_target_preset = .peft_qv,
+    });
+    defer freeBootstrapSummary(allocator, &summary);
+
+    try std.testing.expectEqual(@as(usize, 3), summary.resolved_tensors.len);
+    try std.testing.expectEqual(@as(usize, 3), summary.target_modules.len);
+    try std.testing.expectEqualStrings("peft-qv", summary.target_preset.?);
+    try std.testing.expectEqualStrings("model.layers.0.self_attn.q_proj", summary.target_modules[0]);
+    try std.testing.expectEqualStrings("model.layers.0.self_attn.v_proj", summary.target_modules[1]);
+    try std.testing.expectEqualStrings("model.layers.1.self_attn.q_proj", summary.target_modules[2]);
+
+    var inspected = try inspectCheckpoint(allocator, out_dir);
+    defer freeInspectionSummary(allocator, &inspected);
+    try std.testing.expectEqual(@as(usize, 3), inspected.target_module_count);
+    try std.testing.expectEqualStrings(summary.target_modules[2], inspected.target_modules.?[2]);
+
+    const published_before = try c_file.readFile(allocator, summary.adapter_checkpoint_path);
+    defer allocator.free(published_before);
+    try std.testing.expectError(error.Gemma4RunOutputAlreadyExists, bootstrapLoRABundle(allocator, root, out_dir, .{
+        .rank = 1,
+        .gemma4_target_preset = .peft_qv,
+    }));
+    const published_after = try c_file.readFile(allocator, summary.adapter_checkpoint_path);
+    defer allocator.free(published_after);
+    try std.testing.expectEqualSlices(u8, published_before, published_after);
+
+    const unknown = [_][]const u8{ "q_proj", "lm_head" };
+    const unknown_out = try std.fs.path.join(allocator, &.{ root, "unknown" });
+    defer allocator.free(unknown_out);
+    try std.testing.expectError(error.UnknownLoRATargetModule, bootstrapLoRABundle(allocator, root, unknown_out, .{
+        .rank = 1,
+        .target_modules = unknown[0..],
+    }));
+
+    const empty = [_][]const u8{};
+    try std.testing.expectError(error.NoLoRATargetTensorsResolved, bootstrapLoRABundle(allocator, root, unknown_out, .{
+        .rank = 1,
+        .target_modules = empty[0..],
+    }));
+
+    const qv = [_][]const u8{ "q_proj", "v_proj" };
+    try std.testing.expectError(error.UnknownLoRATargetModule, bootstrapLoRABundle(allocator, root, unknown_out, .{
+        .rank = 1,
+        .layer_name = "model.layers.1",
+        .target_modules = qv[0..],
+    }));
+}
+
+test "gemma4 sharded safetensors bootstrap succeeds and legacy materialize fails closed" {
+    const allocator = std.testing.allocator;
+    const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gemma4_sharded_lifecycle_test_{d}", .{std.posix.system.getpid()});
+    defer allocator.free(root);
+    compat.cwd().deleteTree(compat.io(), root) catch {};
+    try compat.cwd().createDirPath(compat.io(), root);
+    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+
+    const shard_a_path = try std.fs.path.join(allocator, &.{ root, "model-00001-of-00002.safetensors" });
+    defer allocator.free(shard_a_path);
+    const shard_b_path = try std.fs.path.join(allocator, &.{ root, "model-00002-of-00002.safetensors" });
+    defer allocator.free(shard_b_path);
+    const q_values = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const norm_values = [_]f32{ 7, 8 };
+    try writeHeaderAndTensorsF32(allocator, shard_a_path, &.{.{
+        .name = "model.layers.0.self_attn.q_proj.weight",
+        .shape = &.{ 2, 3 },
+        .data = &q_values,
+    }});
+    try writeHeaderAndTensorsF32(allocator, shard_b_path, &.{.{
+        .name = "model.layers.0.input_layernorm.weight",
+        .shape = &.{2},
+        .data = &norm_values,
+    }});
+    const index_path = try std.fs.path.join(allocator, &.{ root, "model.safetensors.index.json" });
+    defer allocator.free(index_path);
+    try compat.cwd().writeFile(compat.io(), .{
+        .sub_path = index_path,
+        .data =
+        \\{"weight_map":{
+        \\  "model.layers.0.self_attn.q_proj.weight":"model-00001-of-00002.safetensors",
+        \\  "model.layers.0.input_layernorm.weight":"model-00002-of-00002.safetensors"
+        \\}}
+        ,
+    });
+
+    var paths = try resolveArtifactPaths(allocator, root);
+    defer paths.deinit();
+    try std.testing.expectEqualStrings(index_path, paths.checkpoint_path.?);
+
+    const adapter_dir = try std.fs.path.join(allocator, &.{ root, "adapter" });
+    defer allocator.free(adapter_dir);
+    const target_modules = [_][]const u8{"q_proj"};
+    var bootstrap = try bootstrapLoRABundle(allocator, root, adapter_dir, .{
+        .rank = 1,
+        .alpha = 1,
+        .target_modules = &target_modules,
+    });
+    defer freeBootstrapSummary(allocator, &bootstrap);
+    try std.testing.expectEqual(@as(usize, 1), bootstrap.resolved_tensors.len);
+    try std.testing.expectEqualStrings(index_path, bootstrap.checkpoint_path);
+
+    const merged_dir = try std.fs.path.join(allocator, &.{ root, "merged" });
+    defer allocator.free(merged_dir);
+    try std.testing.expectError(
+        error.Gemma4MaterializationRequiresStreaming,
+        materializeMergedModel(allocator, root, adapter_dir, merged_dir),
+    );
+    try std.testing.expectError(error.FileNotFound, compat.cwd().access(compat.io(), merged_dir, .{}));
+}
+
+test "gemma4 HF legacy PLE aliases bootstrap and materialize with canonical trainer identities" {
+    const allocator = std.testing.allocator;
+    const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gemma4_hf_ple_alias_test_{d}", .{std.posix.system.getpid()});
+    defer allocator.free(root);
+    compat.cwd().deleteTree(compat.io(), root) catch {};
+    try compat.cwd().createDirPath(compat.io(), root);
+    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+
+    const base_dir = try std.fs.path.join(allocator, &.{ root, "base" });
+    defer allocator.free(base_dir);
+    const adapter_dir = try std.fs.path.join(allocator, &.{ root, "adapter" });
+    defer allocator.free(adapter_dir);
+    const merged_dir = try std.fs.path.join(allocator, &.{ root, "merged" });
+    defer allocator.free(merged_dir);
+    try compat.cwd().createDirPath(compat.io(), base_dir);
+
+    const config_path = try std.fs.path.join(allocator, &.{ base_dir, hf_config_file_name });
+    defer allocator.free(config_path);
+    try compat.cwd().writeFile(compat.io(), .{
+        .sub_path = config_path,
+        .data =
+        \\{
+        \\  "model_type": "gemma4",
+        \\  "text_config": {
+        \\    "hidden_size": 3,
+        \\    "num_hidden_layers": 1,
+        \\    "num_attention_heads": 1,
+        \\    "num_key_value_heads": 1,
+        \\    "head_dim": 3,
+        \\    "intermediate_size": 4,
+        \\    "vocab_size": 4,
+        \\    "hidden_size_per_layer_input": 2
+        \\  }
+        \\}
+        ,
+    });
+
+    const aliases = [_]struct {
+        legacy: []const u8,
+        canonical: []const u8,
+    }{
+        .{ .legacy = "model.language_model.embed_tokens_per_layer.weight", .canonical = "model.language_model.per_layer_input.per_layer_token_embd.weight" },
+        .{ .legacy = "model.language_model.per_layer_model_projection.weight", .canonical = "model.language_model.per_layer_input.per_layer_model_proj.weight" },
+        .{ .legacy = "model.language_model.per_layer_projection_norm.weight", .canonical = "model.language_model.per_layer_input.per_layer_proj_norm.weight" },
+        .{ .legacy = "model.language_model.layers.0.per_layer_input_gate.weight", .canonical = "model.language_model.layers.0.per_layer_input.inp_gate.weight" },
+        .{ .legacy = "model.language_model.layers.0.per_layer_projection.weight", .canonical = "model.language_model.layers.0.per_layer_input.proj.weight" },
+        .{ .legacy = "model.language_model.layers.0.post_per_layer_input_norm.weight", .canonical = "model.language_model.layers.0.per_layer_input.post_norm.weight" },
+        .{ .legacy = "model.language_model.layers.0.layer_scalar", .canonical = "model.language_model.layers.0.per_layer_input.layer_output_scale.weight" },
+    };
+    const values_8 = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const values_6 = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const values_2 = [_]f32{ 1, 2 };
+    const values_3 = [_]f32{ 1, 2, 3 };
+    const values_1 = [_]f32{1};
+    const checkpoint_path = try std.fs.path.join(allocator, &.{ base_dir, checkpoint_file_name });
+    defer allocator.free(checkpoint_path);
+    try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
+        .{ .name = aliases[0].legacy, .shape = &.{ 4, 2 }, .data = &values_8 },
+        .{ .name = aliases[1].legacy, .shape = &.{ 2, 3 }, .data = &values_6 },
+        .{ .name = aliases[2].legacy, .shape = &.{2}, .data = &values_2 },
+        .{ .name = aliases[3].legacy, .shape = &.{ 2, 3 }, .data = &values_6 },
+        .{ .name = aliases[4].legacy, .shape = &.{ 3, 2 }, .data = &values_6 },
+        .{ .name = aliases[5].legacy, .shape = &.{3}, .data = &values_3 },
+        .{ .name = aliases[6].legacy, .shape = &.{1}, .data = &values_1 },
+    });
+
+    // Trainer backends request canonical graph names. Session construction must
+    // make every legacy base tensor available under that canonical identity.
+    const session = try session_factory.createNativeSession(allocator, base_dir);
+    defer session.close();
+    var compute_backend = try session_factory.getComputeBackend(session, allocator);
+    defer compute_backend.deinit();
+    for (aliases) |alias| {
+        const weight = try compute_backend.getWeight(alias.canonical);
+        compute_backend.free(weight);
+    }
+
+    var bootstrap = try bootstrapLoRABundle(allocator, base_dir, adapter_dir, .{
+        .rank = 1,
+        .alpha = 1,
+        .gemma4_target_preset = .text_all_linear,
+    });
+    defer freeBootstrapSummary(allocator, &bootstrap);
+    try std.testing.expectEqual(@as(usize, 3), bootstrap.resolved_tensors.len);
+    try std.testing.expectEqual(@as(usize, 3), bootstrap.target_modules.len);
+    try std.testing.expectEqualStrings("model.language_model.layers.0.per_layer_input.inp_gate", bootstrap.target_modules[0]);
+    try std.testing.expectEqualStrings("model.language_model.layers.0.per_layer_input.proj", bootstrap.target_modules[1]);
+    try std.testing.expectEqualStrings("model.language_model.per_layer_input.per_layer_model_proj", bootstrap.target_modules[2]);
+
+    var adapter_paths = try resolveArtifactPaths(allocator, adapter_dir);
+    defer adapter_paths.deinit();
+    var adapter_reader = try safetensors.MMapReader.openFileAbsolute(allocator, adapter_paths.adapter_checkpoint_path.?);
+    defer adapter_reader.deinit();
+    for (bootstrap.target_modules) |module_name| {
+        var name_buf: [256]u8 = undefined;
+        const trainer_lookup = try std.fmt.bufPrint(&name_buf, "{s}.weight.lora_A.weight", .{module_name});
+        try std.testing.expect(adapter_reader.header.tensors.contains(trainer_lookup));
+    }
+
+    var materialized = try materializeMergedModel(allocator, base_dir, adapter_dir, merged_dir);
+    defer freeMaterializeSummary(allocator, &materialized);
+    try std.testing.expectEqual(@as(usize, 3), materialized.merged_lora_tensor_count);
+    try std.testing.expectEqual(@as(usize, 4), materialized.copied_base_tensor_count);
+
+    var merged_reader = try safetensors.MMapReader.openFileAbsolute(allocator, materialized.output_checkpoint_path);
+    defer merged_reader.deinit();
+    var source_access = try openTensorAccessForFile(allocator, checkpoint_path);
+    defer source_access.deinit();
+    var merged_access = try openTensorAccessForFile(allocator, materialized.output_checkpoint_path);
+    defer merged_access.deinit();
+    for (aliases) |alias| {
+        try std.testing.expect(merged_reader.header.tensors.contains(alias.legacy));
+        try std.testing.expect(!merged_reader.header.tensors.contains(alias.canonical));
+
+        var source_tensor = try loadTensorAsF32(allocator, source_access, alias.legacy);
+        defer source_tensor.deinit();
+        var merged_tensor = try loadTensorAsF32(allocator, merged_access, alias.legacy);
+        defer merged_tensor.deinit();
+        try std.testing.expectEqualSlices(i64, source_tensor.shape, merged_tensor.shape);
+        try std.testing.expectEqualSlices(f32, source_tensor.asFloat32(), merged_tensor.asFloat32());
+    }
+}
+
+test "gemma4 GGUF bootstrap keys align with graph trainer lookups" {
+    const allocator = std.testing.allocator;
+    const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gemma4_gguf_adapter_keys_test_{d}", .{std.posix.system.getpid()});
+    defer allocator.free(root);
+    compat.cwd().deleteTree(compat.io(), root) catch {};
+    try compat.cwd().createDirPath(compat.io(), root);
+    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+
+    const raw_q_name = "blk.34.attn_q.weight";
+    const target = LoRATargetTensor{
+        .tensor_name = raw_q_name,
+        .module_name = "q_proj",
+        .input_dim = 3,
+        .output_dim = 2,
+    };
+
+    const standard_path = try std.fs.path.join(allocator, &.{ root, "standard.safetensors" });
+    defer allocator.free(standard_path);
+    try writeBootstrapAdapterCheckpoint(
+        allocator,
+        standard_path,
+        "unused-base.safetensors",
+        &.{target},
+        1,
+        false,
+        null,
+        null,
+        null,
+        .{},
+    );
+    var standard = try safetensors.MMapReader.openFileAbsolute(allocator, standard_path);
+    defer standard.deinit();
+
+    // initializeTrainerFromAdapterDir appends `.weight` to these graph slot
+    // names. Bootstrap must therefore emit the resulting canonical keys.
+    const graph_a_slot = "model.layers.34.self_attn.q_proj.weight.lora_A";
+    const graph_b_slot = "model.layers.34.self_attn.q_proj.weight.lora_B";
+    const trainer_a_lookup = try std.fmt.allocPrint(allocator, "{s}.weight", .{graph_a_slot});
+    defer allocator.free(trainer_a_lookup);
+    const trainer_b_lookup = try std.fmt.allocPrint(allocator, "{s}.weight", .{graph_b_slot});
+    defer allocator.free(trainer_b_lookup);
+    try std.testing.expect(standard.header.tensors.contains(trainer_a_lookup));
+    try std.testing.expect(standard.header.tensors.contains(trainer_b_lookup));
+    try std.testing.expect(!standard.header.tensors.contains("blk.34.attn_q.weight.lora_A.weight"));
+
+    // Exercise raw-source lookup and canonical recursive/DoRA persistence in
+    // one pass: DoRA has to read the base tensor by its original GGUF key.
+    const base_path = try std.fs.path.join(allocator, &.{ root, "raw-source.safetensors" });
+    defer allocator.free(base_path);
+    try writeHeaderAndTensorsF32(allocator, base_path, &.{.{
+        .name = raw_q_name,
+        .shape = &.{ 2, 3 },
+        .data = &.{ 1, 2, 3, 4, 5, 6 },
+    }});
+    const recursive_dora_path = try std.fs.path.join(allocator, &.{ root, "recursive-dora.safetensors" });
+    defer allocator.free(recursive_dora_path);
+    try writeBootstrapAdapterCheckpoint(
+        allocator,
+        recursive_dora_path,
+        base_path,
+        &.{target},
+        1,
+        true,
+        null,
+        null,
+        null,
+        .{
+            .enabled = true,
+            .source_num_layers = 70,
+            .shared_block_size = 35,
+            .loop_count = 2,
+        },
+    );
+    var recursive_dora = try safetensors.MMapReader.openFileAbsolute(allocator, recursive_dora_path);
+    defer recursive_dora.deinit();
+    try std.testing.expect(recursive_dora.header.tensors.contains("model.layers.34.self_attn.q_proj.weight.loop_0.lora_A.weight"));
+    try std.testing.expect(recursive_dora.header.tensors.contains("model.layers.34.self_attn.q_proj.weight.loop_1.lora_B.weight"));
+    try std.testing.expect(recursive_dora.header.tensors.contains("model.layers.34.self_attn.q_proj.weight.lora_magnitude_vector.weight"));
+
+    const ple_gate = try canonicalAdapterBaseTensorName(allocator, "blk.34.inp_gate.weight");
+    defer allocator.free(ple_gate);
+    const ple_projection = try canonicalAdapterBaseTensorName(allocator, "blk.34.proj.weight");
+    defer allocator.free(ple_projection);
+    const ple_model_projection = try canonicalAdapterBaseTensorName(allocator, "per_layer_model_proj.weight");
+    defer allocator.free(ple_model_projection);
+    try std.testing.expectEqualStrings("model.layers.34.per_layer_input.inp_gate.weight", ple_gate);
+    try std.testing.expectEqualStrings("model.layers.34.per_layer_input.proj.weight", ple_projection);
+    try std.testing.expectEqualStrings("model.per_layer_input.per_layer_model_proj.weight", ple_model_projection);
+
+    const base_dir = try std.fs.path.join(allocator, &.{ root, "base" });
+    defer allocator.free(base_dir);
+    const adapter_dir = try std.fs.path.join(allocator, &.{ root, "adapter" });
+    defer allocator.free(adapter_dir);
+    const merged_dir = try std.fs.path.join(allocator, &.{ root, "merged" });
+    defer allocator.free(merged_dir);
+    try compat.cwd().createDirPath(compat.io(), base_dir);
+    try compat.cwd().createDirPath(compat.io(), adapter_dir);
+
+    const bundle_base_path = try std.fs.path.join(allocator, &.{ base_dir, checkpoint_file_name });
+    defer allocator.free(bundle_base_path);
+    try writeHeaderAndTensorsF32(allocator, bundle_base_path, &.{.{
+        .name = raw_q_name,
+        .shape = &.{ 2, 3 },
+        .data = &.{ 1, 2, 3, 4, 5, 6 },
+    }});
+    const bundle_adapter_path = try std.fs.path.join(allocator, &.{ adapter_dir, adapter_checkpoint_file_name });
+    defer allocator.free(bundle_adapter_path);
+    try writeBootstrapAdapterCheckpoint(allocator, bundle_adapter_path, bundle_base_path, &.{target}, 1, false, null, null, null, .{});
+    const bundle_config_path = try std.fs.path.join(allocator, &.{ adapter_dir, adapter_config_file_name });
+    defer allocator.free(bundle_config_path);
+    try writeAdapterConfigJson(allocator, bundle_config_path, .{
+        .base_model_name_or_path = base_dir,
+        .rank = 1,
+        .alpha = 1,
+        .target_modules = &.{"model.layers.34.self_attn.q_proj"},
+    });
+
+    var bundle_inspection = try inspectLoRABundle(allocator, base_dir, adapter_dir);
+    defer freeLoRABundleInspectionSummary(allocator, &bundle_inspection);
+    try std.testing.expectEqual(@as(usize, 1), bundle_inspection.resolved_tensor_count);
+    try std.testing.expectEqualStrings("model.layers.34.self_attn.q_proj.weight", bundle_inspection.tensors[0].base_tensor_name);
+
+    var materialized = try materializeMergedModel(allocator, base_dir, adapter_dir, merged_dir);
+    defer freeMaterializeSummary(allocator, &materialized);
+    var merged_reader = try safetensors.MMapReader.openFileAbsolute(allocator, materialized.output_checkpoint_path);
+    defer merged_reader.deinit();
+    try std.testing.expect(merged_reader.header.tensors.contains(raw_q_name));
+    try std.testing.expect(!merged_reader.header.tensors.contains("model.layers.34.self_attn.q_proj.weight"));
+}
+
+fn syntheticGemma4PresetTargetCount(
+    layer_count: usize,
+    kv_projection_layer_count: usize,
+    preset: Gemma4LoRATargetPreset,
+) !usize {
+    var count: usize = 0;
+    const selection = BootstrapTargetSelection{ .gemma4 = preset };
+    const common_suffixes = [_][]const u8{
+        "attn_q.weight",
+        "attn_output.weight",
+        "ffn_gate.weight",
+        "ffn_up.weight",
+        "ffn_down.weight",
+        "inp_gate.weight",
+        "proj.weight",
+    };
+    for (0..layer_count) |layer| {
+        for (common_suffixes) |suffix| {
+            var name_buf: [96]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "blk.{d}.{s}", .{ layer, suffix });
+            if (targetMatchesSelection(name, selection)) count += 1;
+        }
+        if (layer < kv_projection_layer_count) {
+            for ([_][]const u8{ "attn_k.weight", "attn_v.weight" }) |suffix| {
+                var name_buf: [96]u8 = undefined;
+                const name = try std.fmt.bufPrint(&name_buf, "blk.{d}.{s}", .{ layer, suffix });
+                if (targetMatchesSelection(name, selection)) count += 1;
+            }
+        }
+    }
+    if (targetMatchesSelection("per_layer_model_proj.weight", selection)) count += 1;
+    return count;
+}
+
+test "gemma4 initializer frontend rejects residual-adjusted bootstrap and keeps EVA LoRA-GA paths" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidLoRARank, bootstrapLoRABundle(allocator, "missing-base", "missing-out", .{ .rank = 0 }));
+    if (comptime @bitSizeOf(usize) > @bitSizeOf(u32)) {
+        try std.testing.expectError(error.InvalidLoRARank, bootstrapLoRABundle(allocator, "missing-base", "missing-out", .{ .rank = @as(usize, std.math.maxInt(u32)) + 1 }));
+    }
+    try std.testing.expectError(error.InvalidLoRAAlpha, bootstrapLoRABundle(allocator, "missing-base", "missing-out", .{ .alpha = 0 }));
+    try std.testing.expectError(error.InvalidLoRAAlpha, bootstrapLoRABundle(allocator, "missing-base", "missing-out", .{ .alpha = std.math.nan(f32) }));
+    try std.testing.expectError(error.InvalidLoRAAlpha, bootstrapLoRABundle(allocator, "missing-base", "missing-out", .{ .alpha = std.math.inf(f32) }));
+    try std.testing.expectError(
+        error.LoRAInitializerRequiresAdjustedBase,
+        bootstrapLoRABundle(allocator, "missing-base", "missing-out", .{ .init_lora_weights = "pissa" }),
+    );
+    try std.testing.expectError(
+        error.LoRAInitializerRequiresAdjustedBase,
+        bootstrapLoRABundle(allocator, "missing-base", "missing-out", .{ .init_lora_weights = "loftq-nf4" }),
+    );
+
     try std.testing.expectEqual(LoRAInitKind.eva, try parseLoRAInitKind("eva"));
     try std.testing.expectEqual(LoRAInitKind.lora_ga, try parseLoRAInitKind("lora-ga"));
     try std.testing.expectEqual(LoRAInitKind.lora_ga, try parseLoRAInitKind("loraga"));
     try std.testing.expectEqual(LoRAInitKind.lora_ga, try parseLoRAInitKind("lora_ga"));
-    try std.testing.expectEqual(LoRAInitKind.loftq_nf4, try parseLoRAInitKind("loftq"));
 
-    const allocator = std.testing.allocator;
-    const base = [_]f32{
-        1.0, 0.0, 0.0,
-        0.0, 2.0, 0.0,
-    };
     const eva_cov = [_]f32{
         4.0, 0.0, 0.0,
         0.0, 1.0, 0.0,
@@ -3982,18 +5524,320 @@ test "gemma4 lora initializer frontend uses real EVA LoRA-GA and LoftQ paths" {
         allocator.free(lora_ga.a);
         allocator.free(lora_ga.b);
     }
-    const loftq = try buildInitialLoRAFactors(allocator, .loftq_nf4, &base, null, null, 2, 3, 1);
-    defer {
-        allocator.free(loftq.a);
-        allocator.free(loftq.b);
-    }
     try std.testing.expectEqual(@as(usize, 3), eva.a.len);
     try std.testing.expectEqual(@as(usize, 2), eva.b.len);
     try std.testing.expectEqual(@as(usize, 3), lora_ga.a.len);
     try std.testing.expectEqual(@as(usize, 2), lora_ga.b.len);
-    try std.testing.expectEqual(@as(usize, 3), loftq.a.len);
-    try std.testing.expectEqual(@as(usize, 2), loftq.b.len);
     try std.testing.expectError(error.MissingInitializerStats, buildInitialLoRAFactors(allocator, .eva, null, null, null, 2, 3, 1));
+}
+
+test "gemma4 adapter inventory is exact paired and DoRA closed" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const adapter_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "adapter" });
+    defer allocator.free(adapter_dir);
+    try compat.cwd().createDirPath(compat.io(), adapter_dir);
+    const checkpoint_path = try std.fs.path.join(allocator, &.{ adapter_dir, adapter_checkpoint_file_name });
+    defer allocator.free(checkpoint_path);
+    const config_path = try std.fs.path.join(allocator, &.{ adapter_dir, adapter_config_file_name });
+    defer allocator.free(config_path);
+
+    const module = "model.layers.0.self_attn.q_proj";
+    const a_name = module ++ ".weight.lora_A.weight";
+    const b_name = module ++ ".weight.lora_B.weight";
+    const magnitude_name = module ++ ".weight.lora_magnitude_vector.weight";
+    const a_data = [_]f32{ 1, 0 };
+    const b_data = [_]f32{ 0, 1 };
+    try writeAdapterConfigJson(allocator, config_path, .{
+        .base_model_name_or_path = "base",
+        .rank = 1,
+        .alpha = 1,
+        .target_modules = &.{module},
+    });
+
+    try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{.{ .name = a_name, .shape = &.{ 1, 2 }, .data = &a_data }});
+    try std.testing.expectError(error.MissingAdapterPair, validateLoRAAdapterInventory(allocator, adapter_dir));
+
+    try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{.{ .name = b_name, .shape = &.{ 2, 1 }, .data = &b_data }});
+    try std.testing.expectError(error.MissingAdapterPair, validateLoRAAdapterInventory(allocator, adapter_dir));
+
+    try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
+        .{ .name = a_name, .shape = &.{ 1, 2 }, .data = &a_data },
+        .{ .name = b_name, .shape = &.{ 2, 1 }, .data = &b_data },
+    });
+    try validateLoRAAdapterInventory(allocator, adapter_dir);
+
+    try writeAdapterConfigJson(allocator, config_path, .{
+        .base_model_name_or_path = "base",
+        .rank = 1,
+        .alpha = 1,
+        .target_modules = &.{"model.layers.0.self_attn.k_proj"},
+    });
+    try std.testing.expectError(error.AdapterTargetInventoryMismatch, validateLoRAAdapterInventory(allocator, adapter_dir));
+
+    try writeAdapterConfigJson(allocator, config_path, .{
+        .base_model_name_or_path = "base",
+        .rank = 1,
+        .alpha = 1,
+        .target_modules = &.{ module, module },
+    });
+    try std.testing.expectError(error.DuplicateAdapterTargetModule, validateLoRAAdapterInventory(allocator, adapter_dir));
+
+    try writeAdapterConfigJson(allocator, config_path, .{
+        .base_model_name_or_path = "base",
+        .rank = 1,
+        .alpha = 1,
+        .target_modules = &.{module},
+        .use_dora = true,
+    });
+    try std.testing.expectError(error.AdapterDoRAConfigMismatch, validateLoRAAdapterInventory(allocator, adapter_dir));
+
+    try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
+        .{ .name = a_name, .shape = &.{ 1, 2 }, .data = &a_data },
+        .{ .name = b_name, .shape = &.{ 2, 1 }, .data = &b_data },
+        .{ .name = magnitude_name, .shape = &.{2}, .data = &b_data },
+    });
+    try validateLoRAAdapterInventory(allocator, adapter_dir);
+
+    try writeAdapterConfigJson(allocator, config_path, .{
+        .base_model_name_or_path = "base",
+        .rank = 1,
+        .alpha = 1,
+        .target_modules = &.{module},
+        .use_dora = false,
+    });
+    try std.testing.expectError(error.AdapterDoRAConfigMismatch, validateLoRAAdapterInventory(allocator, adapter_dir));
+
+    try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
+        .{ .name = a_name, .shape = &.{ 1, 2 }, .data = &a_data },
+        .{ .name = b_name, .shape = &.{ 2, 1 }, .data = &b_data },
+        .{ .name = "optimizer.moment", .shape = &.{1}, .data = &.{0} },
+    });
+    try std.testing.expectError(error.UnexpectedAdapterTensor, validateLoRAAdapterInventory(allocator, adapter_dir));
+}
+
+test "gemma4 legacy materialization admission is bounded and fail closed" {
+    try validateLegacyMaterializationSource("model.safetensors", legacy_materialize_max_checkpoint_bytes);
+    try std.testing.expectError(
+        error.Gemma4MaterializationRequiresStreaming,
+        validateLegacyMaterializationSource("model.safetensors", legacy_materialize_max_checkpoint_bytes + 1),
+    );
+    try std.testing.expectError(
+        error.Gemma4MaterializationRequiresStreaming,
+        validateLegacyMaterializationSource("model.safetensors.index.json", 1),
+    );
+    try std.testing.expectError(
+        error.Gemma4GgufMaterializationUnsupported,
+        validateLegacyMaterializationSource("model.gguf", 1),
+    );
+    try std.testing.expectError(error.UnsupportedMaterializationSource, validateLegacyMaterializationSource("model.bin", 1));
+}
+
+test "gemma4 external adjusted-base initializers cannot load or materialize" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root);
+    const base_dir = try std.fs.path.join(allocator, &.{ root, "base" });
+    defer allocator.free(base_dir);
+    const adapter_dir = try std.fs.path.join(allocator, &.{ root, "adapter" });
+    defer allocator.free(adapter_dir);
+    try compat.cwd().createDirPath(compat.io(), base_dir);
+    try compat.cwd().createDirPath(compat.io(), adapter_dir);
+
+    const tensor_name = "model.layers.0.self_attn.q_proj.weight";
+    const base_path = try std.fs.path.join(allocator, &.{ base_dir, checkpoint_file_name });
+    defer allocator.free(base_path);
+    try writeHeaderAndTensorsF32(allocator, base_path, &.{.{
+        .name = tensor_name,
+        .shape = &.{ 2, 2 },
+        .data = &.{ 1, 0, 0, 1 },
+    }});
+    const adapter_path = try std.fs.path.join(allocator, &.{ adapter_dir, adapter_checkpoint_file_name });
+    defer allocator.free(adapter_path);
+    try writeBootstrapAdapterCheckpoint(allocator, adapter_path, base_path, &.{.{
+        .tensor_name = tensor_name,
+        .module_name = "q_proj",
+        .input_dim = 2,
+        .output_dim = 2,
+    }}, 1, false, null, null, null, .{});
+    const config_path = try std.fs.path.join(allocator, &.{ adapter_dir, adapter_config_file_name });
+    defer allocator.free(config_path);
+
+    const cases = [_]struct { initializer: []const u8, out_name: []const u8 }{
+        .{ .initializer = "pissa", .out_name = "pissa-out" },
+        .{ .initializer = "loftq-nf4", .out_name = "loftq-out" },
+    };
+    for (cases) |case| {
+        try writeAdapterConfigJson(allocator, config_path, .{
+            .base_model_name_or_path = base_dir,
+            .rank = 1,
+            .alpha = 1,
+            .target_modules = &.{"model.layers.0.self_attn.q_proj"},
+            .init_lora_weights = case.initializer,
+        });
+        try std.testing.expectError(
+            error.LoRAInitializerRequiresAdjustedBase,
+            loadLoRABundleScoped(allocator, base_dir, adapter_dir, null),
+        );
+
+        const out_dir = try std.fs.path.join(allocator, &.{ root, case.out_name });
+        defer allocator.free(out_dir);
+        try compat.cwd().createDirPath(compat.io(), out_dir);
+        const sentinel_path = try std.fs.path.join(allocator, &.{ out_dir, "sentinel.txt" });
+        defer allocator.free(sentinel_path);
+        try compat.cwd().writeFile(compat.io(), .{ .sub_path = sentinel_path, .data = "preserve" });
+        try std.testing.expectError(
+            error.LoRAInitializerRequiresAdjustedBase,
+            materializeMergedModel(allocator, base_dir, adapter_dir, out_dir),
+        );
+
+        const sentinel = try compat.cwd().readFileAlloc(compat.io(), sentinel_path, allocator, .limited(16));
+        defer allocator.free(sentinel);
+        try std.testing.expectEqualStrings("preserve", sentinel);
+        const output_checkpoint = try std.fs.path.join(allocator, &.{ out_dir, checkpoint_file_name });
+        defer allocator.free(output_checkpoint);
+        try std.testing.expect(!isRegularFilePath(output_checkpoint));
+    }
+}
+
+test "gemma4 generic bundle lifecycle rejects inconsistent and recursive adapters before save" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root);
+    const base_dir = try std.fs.path.join(allocator, &.{ root, "base" });
+    defer allocator.free(base_dir);
+    const adapter_dir = try std.fs.path.join(allocator, &.{ root, "adapter" });
+    defer allocator.free(adapter_dir);
+    const out_dir = try std.fs.path.join(allocator, &.{ root, "out" });
+    defer allocator.free(out_dir);
+    try compat.cwd().createDirPath(compat.io(), base_dir);
+    try compat.cwd().createDirPath(compat.io(), adapter_dir);
+    try compat.cwd().createDirPath(compat.io(), out_dir);
+
+    const tensor_name = "model.layers.0.self_attn.q_proj.weight";
+    const target_modules = [_][]const u8{"model.layers.0.self_attn.q_proj"};
+    const target = LoRATargetTensor{
+        .tensor_name = tensor_name,
+        .module_name = "q_proj",
+        .input_dim = 2,
+        .output_dim = 2,
+    };
+    const base_path = try std.fs.path.join(allocator, &.{ base_dir, checkpoint_file_name });
+    defer allocator.free(base_path);
+    try writeHeaderAndTensorsF32(allocator, base_path, &.{.{
+        .name = tensor_name,
+        .shape = &.{ 2, 2 },
+        .data = &.{ 1, 0, 0, 1 },
+    }});
+    const adapter_path = try std.fs.path.join(allocator, &.{ adapter_dir, adapter_checkpoint_file_name });
+    defer allocator.free(adapter_path);
+    try writeBootstrapAdapterCheckpoint(allocator, adapter_path, base_path, &.{target}, 1, false, null, null, null, .{});
+    const config_path = try std.fs.path.join(allocator, &.{ adapter_dir, adapter_config_file_name });
+    defer allocator.free(config_path);
+
+    try writeAdapterConfigJson(allocator, config_path, .{
+        .base_model_name_or_path = base_dir,
+        .rank = 0,
+        .alpha = 1,
+        .target_modules = &target_modules,
+    });
+    try std.testing.expectError(error.InvalidLoRARank, loadLoRABundle(allocator, base_dir, adapter_dir));
+
+    try writeAdapterConfigJson(allocator, config_path, .{
+        .base_model_name_or_path = base_dir,
+        .rank = 2,
+        .alpha = 1,
+        .target_modules = &target_modules,
+    });
+    try std.testing.expectError(error.AdapterConfigRankMismatch, loadLoRABundle(allocator, base_dir, adapter_dir));
+
+    try writeAdapterConfigJson(allocator, config_path, .{
+        .base_model_name_or_path = base_dir,
+        .rank = 1,
+        .alpha = 0,
+        .target_modules = &target_modules,
+    });
+    try std.testing.expectError(error.InvalidLoRAAlpha, loadLoRABundle(allocator, base_dir, adapter_dir));
+
+    try writeAdapterConfigJson(allocator, config_path, .{
+        .base_model_name_or_path = base_dir,
+        .rank = 1,
+        .alpha = 1,
+        .target_modules = &target_modules,
+        .use_dora = true,
+    });
+    try std.testing.expectError(error.AdapterDoRAConfigMismatch, loadLoRABundle(allocator, base_dir, adapter_dir));
+
+    try writeAdapterConfigJson(allocator, config_path, .{
+        .base_model_name_or_path = base_dir,
+        .rank = 1,
+        .alpha = 1,
+        .target_modules = &target_modules,
+        .recursive_lora = .{
+            .enabled = true,
+            .source_num_layers = 2,
+            .shared_block_size = 1,
+            .loop_count = 2,
+        },
+    });
+    const sentinel_path = try std.fs.path.join(allocator, &.{ out_dir, "sentinel.txt" });
+    defer allocator.free(sentinel_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = sentinel_path, .data = "preserve" });
+    try std.testing.expectError(
+        error.RecursiveLoRANotSupportedByGenericLifecycle,
+        materializeMergedModel(allocator, base_dir, adapter_dir, out_dir),
+    );
+    const sentinel = try compat.cwd().readFileAlloc(compat.io(), sentinel_path, allocator, .limited(16));
+    defer allocator.free(sentinel);
+    try std.testing.expectEqualStrings("preserve", sentinel);
+
+    try writeBootstrapAdapterCheckpoint(allocator, adapter_path, base_path, &.{target}, 1, true, null, null, null, .{});
+    try writeAdapterConfigJson(allocator, config_path, .{
+        .base_model_name_or_path = base_dir,
+        .rank = 1,
+        .alpha = 1,
+        .target_modules = &target_modules,
+    });
+    try std.testing.expectError(error.AdapterDoRAConfigMismatch, loadLoRABundle(allocator, base_dir, adapter_dir));
+
+    try writeAdapterConfigJson(allocator, config_path, .{
+        .base_model_name_or_path = base_dir,
+        .rank = 1,
+        .alpha = 1,
+        .target_modules = &target_modules,
+        .use_dora = true,
+    });
+    var bundle = try loadLoRABundle(allocator, base_dir, adapter_dir);
+    defer bundle.deinit();
+
+    const published_dir = try std.fs.path.join(allocator, &.{ root, "published" });
+    defer allocator.free(published_dir);
+    try saveLoRABundle(&bundle, published_dir);
+    const published_adapter_path = try std.fs.path.join(allocator, &.{ published_dir, adapter_checkpoint_file_name });
+    defer allocator.free(published_adapter_path);
+    const published_before = try c_file.readFile(allocator, published_adapter_path);
+    defer allocator.free(published_before);
+    try std.testing.expectError(error.Gemma4RunOutputAlreadyExists, saveLoRABundle(&bundle, published_dir));
+    const published_after = try c_file.readFile(allocator, published_adapter_path);
+    defer allocator.free(published_after);
+    try std.testing.expectEqualSlices(u8, published_before, published_after);
+
+    bundle.recursive_lora_enabled = true;
+    try std.testing.expectError(
+        error.RecursiveLoRANotSupportedByGenericLifecycle,
+        saveLoRABundle(&bundle, out_dir),
+    );
+    const saved_adapter_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_checkpoint_file_name });
+    defer allocator.free(saved_adapter_path);
+    try std.testing.expect(!isRegularFilePath(saved_adapter_path));
 }
 
 test "gemma4 bootstrap EVA and LoRA-GA require and consume stats files" {
@@ -4087,8 +5931,7 @@ test "gemma4 moe expert preset targets only expert parameter tensors" {
     const targets = try inferLoRATargetTensors(
         checkpoint_path,
         allocator,
-        peft.targetPresetPatterns(.moe_experts),
-        .moe_experts,
+        .{ .legacy = .moe_experts },
     );
     defer freeLoRATargetTensors(allocator, targets);
 

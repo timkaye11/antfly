@@ -112,6 +112,26 @@ pub fn gradient(
     defer allocator.free(adjoints);
     @memset(adjoints, null_node);
 
+    // Mark the forward nodes that depend on a requested differentiation
+    // target. Backward work outside those paths cannot contribute to any
+    // requested gradient (for example, a frozen base weight in a LoRA
+    // linear), so do not expand its adjoint.
+    const depends_on_wrt = try allocator.alloc(bool, forward_count);
+    defer allocator.free(depends_on_wrt);
+    @memset(depends_on_wrt, false);
+    for (lowered_wrt) |lw| {
+        if (lw < forward_count) depends_on_wrt[lw] = true;
+    }
+    for (0..forward_count) |node_index| {
+        if (depends_on_wrt[node_index]) continue;
+        for (g.node(@intCast(node_index)).getInputs()) |input| {
+            if (input < forward_count and depends_on_wrt[input]) {
+                depends_on_wrt[node_index] = true;
+                break;
+            }
+        }
+    }
+
     // Seed: dL/d(loss) = 1.0
     const loss_shape = g.node(lowered_loss).output_shape;
     adjoints[lowered_loss] = try b.scalarConst(loss_shape.dtype, 1.0);
@@ -120,7 +140,7 @@ pub fn gradient(
     var i: u32 = forward_count;
     while (i > 0) {
         i -= 1;
-        if (adjoints[i] == null_node) continue;
+        if (adjoints[i] == null_node or !depends_on_wrt[i]) continue;
 
         // IMPORTANT: copy node data before VJP computation, because
         // VJP rules add new nodes to the graph which can reallocate
@@ -128,13 +148,13 @@ pub fn gradient(
         const n_copy = g.node(i).*;
         const adj = adjoints[i];
 
-        try applyVjp(&b, g, &n_copy, i, adj, adjoints);
+        try applyVjp(&b, g, &n_copy, i, adj, adjoints, depends_on_wrt);
     }
 
     // Step 4: Collect parameter gradients.
     const param_grads = try allocator.alloc(NodeId, wrt.len);
     for (lowered_wrt, 0..) |lw, idx| {
-        param_grads[idx] = adjoints[lw]; // null_node if no gradient flows
+        param_grads[idx] = if (lw < adjoints.len) adjoints[lw] else null_node;
     }
 
     return .{
@@ -166,6 +186,7 @@ fn applyVjp(
     node_id: NodeId,
     adj: NodeId,
     adjoints: []NodeId,
+    depends_on_wrt: []const bool,
 ) !void {
     const ins = n.getInputs();
     switch (n.op) {
@@ -530,13 +551,21 @@ fn applyVjp(
                 const rhs_ax = attrs.rhs_contracting[0];
                 if (lhs_ax == 1 and rhs_ax == 0) {
                     // Y = A @ B → dA = dY @ B^T, dB = A^T @ dY
-                    const bt = try b.transpose(ins[1], &.{ 1, 0 });
-                    const grad_a = try b.matmul(adj_for_dot, bt);
-                    try accumulate(b, adjoints, ins[0], grad_a);
+                    if (depends_on_wrt[ins[0]]) {
+                        const grad_a = if (transpose2dSource(g, ins[1])) |source|
+                            try b.matmul(adj_for_dot, source)
+                        else blk: {
+                            const bt = try b.transpose(ins[1], &.{ 1, 0 });
+                            break :blk try b.matmul(adj_for_dot, bt);
+                        };
+                        try accumulate(b, adjoints, ins[0], grad_a);
+                    }
 
-                    const at = try b.transpose(ins[0], &.{ 1, 0 });
-                    const grad_b = try b.matmul(at, adj_for_dot);
-                    try accumulate(b, adjoints, ins[1], grad_b);
+                    if (depends_on_wrt[ins[1]]) {
+                        const at = try b.transpose(ins[0], &.{ 1, 0 });
+                        const grad_b = try b.matmul(at, adj_for_dot);
+                        try accumulate(b, adjoints, ins[1], grad_b);
+                    }
                 }
             } else if (attrs.num_contracting == 1 and attrs.num_batch == 1 and a_shape.rank() == 3 and b_shape.rank() == 3) {
                 // 3D batched matmul with batch dim 0.
@@ -558,18 +587,66 @@ fn applyVjp(
                 _ = b_free;
 
                 // dA = adj @ B^T (contract adj's last dim with B's free dim)
-                const bt = try b.transpose(ins[1], &.{ 0, 2, 1 });
-                const grad_a_raw = try batchedDotGeneral3D(b, adj, bt);
-                // If A's layout isn't [batch, free, contract], transpose back.
-                const grad_a = if (lc == 1) try b.transpose(grad_a_raw, &.{ 0, 2, 1 }) else grad_a_raw;
-                try accumulate(b, adjoints, ins[0], grad_a);
+                if (depends_on_wrt[ins[0]]) {
+                    const bt = try b.transpose(ins[1], &.{ 0, 2, 1 });
+                    const grad_a_raw = try batchedDotGeneral3D(b, adj, bt);
+                    // If A's layout isn't [batch, free, contract], transpose back.
+                    const grad_a = if (lc == 1) try b.transpose(grad_a_raw, &.{ 0, 2, 1 }) else grad_a_raw;
+                    try accumulate(b, adjoints, ins[0], grad_a);
+                }
 
                 // dB = A^T @ adj (contract A's free dim with adj's first non-batch dim)
-                const at = try b.transpose(ins[0], &.{ 0, 2, 1 });
-                const grad_b_raw = try batchedDotGeneral3D(b, at, adj);
-                // If B's layout isn't [batch, free, contract], transpose back.
-                const grad_b = if (rc == 1) grad_b_raw else try b.transpose(grad_b_raw, &.{ 0, 2, 1 });
-                try accumulate(b, adjoints, ins[1], grad_b);
+                if (depends_on_wrt[ins[1]]) {
+                    const at = try b.transpose(ins[0], &.{ 0, 2, 1 });
+                    const grad_b_raw = try batchedDotGeneral3D(b, at, adj);
+                    // If B's layout isn't [batch, free, contract], transpose back.
+                    const grad_b = if (rc == 1) grad_b_raw else try b.transpose(grad_b_raw, &.{ 0, 2, 1 });
+                    try accumulate(b, adjoints, ins[1], grad_b);
+                }
+            } else if (attrs.num_contracting == 1 and attrs.num_batch == 2 and a_shape.rank() == 4 and b_shape.rank() == 4 and
+                attrs.lhs_batch[0] == 0 and attrs.lhs_batch[1] == 1 and
+                attrs.rhs_batch[0] == 0 and attrs.rhs_batch[1] == 1)
+            {
+                // Transformer attention keeps batch and head as separate
+                // batch axes. The remaining two axes form a matrix, with
+                // the contracting axis in either position:
+                //
+                //   scores: [B,H,Q,D] @ [B,H,K,D] -> [B,H,Q,K]
+                //   values: [B,H,Q,K] @ [B,H,K,D] -> [B,H,Q,D]
+                //
+                // Normalize each VJP operand to standard [B,H,M,K] @
+                // [B,H,K,N] layout, then transpose the result back only
+                // when the requested input stores its contracting axis
+                // before its free axis.
+                const lc = attrs.lhs_contracting[0];
+                const rc = attrs.rhs_contracting[0];
+                if ((lc == 2 or lc == 3) and (rc == 2 or rc == 3)) {
+                    if (depends_on_wrt[ins[0]]) {
+                        const rhs_for_grad = if (rc == 2)
+                            try b.transpose(ins[1], &.{ 0, 1, 3, 2 })
+                        else
+                            ins[1];
+                        const grad_a_raw = try batchedDotGeneral4D(b, adj_for_dot, rhs_for_grad);
+                        const grad_a = if (lc == 3)
+                            grad_a_raw
+                        else
+                            try b.transpose(grad_a_raw, &.{ 0, 1, 3, 2 });
+                        try accumulate(b, adjoints, ins[0], grad_a);
+                    }
+
+                    if (depends_on_wrt[ins[1]]) {
+                        const lhs_for_grad = if (lc == 3)
+                            try b.transpose(ins[0], &.{ 0, 1, 3, 2 })
+                        else
+                            ins[0];
+                        const grad_b_raw = try batchedDotGeneral4D(b, lhs_for_grad, adj_for_dot);
+                        const grad_b = if (rc == 2)
+                            grad_b_raw
+                        else
+                            try b.transpose(grad_b_raw, &.{ 0, 1, 3, 2 });
+                        try accumulate(b, adjoints, ins[1], grad_b);
+                    }
+                }
             }
         },
 
@@ -771,6 +848,32 @@ fn batchedDotGeneral3D(b: *Builder, lhs: NodeId, rhs: NodeId) !NodeId {
     });
 }
 
+/// Emit a 4D batched matmul with batch/head axes 0 and 1:
+/// [B, H, M, K] x [B, H, K, N] -> [B, H, M, N].
+fn batchedDotGeneral4D(b: *Builder, lhs: NodeId, rhs: NodeId) !NodeId {
+    const lhs_shape = b.graph.node(lhs).output_shape;
+    const rhs_shape = b.graph.node(rhs).output_shape;
+    const out_shape = Shape.init(lhs_shape.dtype, &.{
+        lhs_shape.dim(0),
+        lhs_shape.dim(1),
+        lhs_shape.dim(2),
+        rhs_shape.dim(3),
+    });
+    return b.graph.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 3, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 2, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 2,
+        } },
+        .output_shape = out_shape,
+        .inputs = .{ lhs, rhs, null_node, null_node },
+        .num_inputs = 2,
+    });
+}
+
 /// Reduce a gradient to match a smaller (broadcast source) shape.
 /// When z = op(x, y) and y was broadcast from a smaller shape,
 /// d_y must sum along the broadcast dimensions.
@@ -866,6 +969,23 @@ fn sliceConcatAdjoint(
         .inputs = .{ adj, null_node, null_node, null_node },
         .num_inputs = 1,
     });
+}
+
+/// Return X when node is exactly transpose(X, [1, 0]) over rank-2 tensors.
+/// This lets matmul VJPs emit dY @ X instead of dY @ transpose(transpose(X)).
+fn transpose2dSource(g: *const Graph, node_id: NodeId) ?NodeId {
+    const n = g.node(node_id);
+    if (n.output_shape.rank() != 2 or n.num_inputs != 1) return null;
+
+    const attrs = switch (n.op) {
+        .transpose => |attrs| attrs,
+        else => return null,
+    };
+    if (attrs.num_axes != 2 or attrs.perm[0] != 1 or attrs.perm[1] != 0) return null;
+
+    const source = n.inputs[0];
+    if (source == null_node or g.node(source).output_shape.rank() != 2) return null;
+    return source;
 }
 
 fn zeroConstLike(b: *Builder, shape: Shape) !NodeId {
@@ -1113,6 +1233,220 @@ test "gradient of matmul (linear)" {
     // Both should have gradients (matmul VJP)
     try std.testing.expect(result.param_grads[0] != null_node);
     try std.testing.expect(result.param_grads[1] != null_node);
+}
+
+test "rank4 two-batch dot VJP emits attention gradients and prunes frozen rhs" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const q_shape = Shape.init(.f32, &.{ 1, 2, 3, 4 });
+    const k_shape = Shape.init(.f32, &.{ 1, 2, 5, 4 });
+    const q = try b.parameter("q", q_shape);
+    const k = try b.parameter("k", k_shape);
+    const scores = try g.addNode(.{
+        .op = .{ .dot_general = .{
+            .lhs_contracting = .{ 3, 0, 0, 0, 0, 0, 0, 0 },
+            .rhs_contracting = .{ 3, 0, 0, 0, 0, 0, 0, 0 },
+            .lhs_batch = .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .rhs_batch = .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .num_contracting = 1,
+            .num_batch = 2,
+        } },
+        .output_shape = Shape.init(.f32, &.{ 1, 2, 3, 5 }),
+        .inputs = .{ q, k, null_node, null_node },
+        .num_inputs = 2,
+    });
+    const loss = try b.reduceSum(scores, &.{ 0, 1, 2, 3 });
+    try g.markOutput(loss);
+
+    var both = try gradient(allocator, &g, loss, &.{ q, k });
+    defer both.deinit();
+    try std.testing.expect(both.param_grads[0] != null_node);
+    try std.testing.expect(both.param_grads[1] != null_node);
+    try std.testing.expect(both.graph.node(both.param_grads[0]).output_shape.eq(q_shape));
+    try std.testing.expect(both.graph.node(both.param_grads[1]).output_shape.eq(k_shape));
+
+    const dq_attrs = switch (both.graph.node(both.param_grads[0]).op) {
+        .dot_general => |attrs| attrs,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expectEqual(@as(u8, 2), dq_attrs.num_batch);
+    try std.testing.expectEqual(@as(u8, 3), dq_attrs.lhs_contracting[0]);
+    try std.testing.expectEqual(@as(u8, 2), dq_attrs.rhs_contracting[0]);
+
+    // Rebuild with K frozen. The depends_on_wrt mask must avoid emitting
+    // the otherwise-required dK transpose/dot branch.
+    var q_only = try gradient(allocator, &g, loss, &.{q});
+    defer q_only.deinit();
+    try std.testing.expect(q_only.param_grads[0] != null_node);
+    for (0..q_only.graph.nodeCount()) |node_index| {
+        const node = q_only.graph.node(@intCast(node_index));
+        if (node.op != .parameter) {
+            try std.testing.expect(!node.output_shape.eq(k_shape));
+        }
+    }
+}
+
+test "linear input gradient cancels double transpose" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const x = try bld.parameter("x", Shape.init(.bf16, &.{ 2, 4 }));
+    const w = try bld.parameter("w", Shape.init(.bf16, &.{ 3, 4 }));
+    const y = try bld.linearNoBias(x, w, 2, 4, 3);
+    const loss = try bld.reduceSum(y, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    var result = try gradient(allocator, &g, loss, &.{x});
+    defer result.deinit();
+
+    const dx = result.graph.node(result.param_grads[0]);
+    const dot_attrs = switch (dx.op) {
+        .dot_general => |attrs| attrs,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expectEqual(@as(u8, 1), dot_attrs.num_contracting);
+    try std.testing.expectEqual(@as(u8, 1), dot_attrs.lhs_contracting[0]);
+    try std.testing.expectEqual(@as(u8, 0), dot_attrs.rhs_contracting[0]);
+    try std.testing.expectEqual(DType.bf16, dx.output_shape.dtype);
+    try std.testing.expectEqual(result.id_map[w], dx.inputs[1]);
+    try std.testing.expectEqual(.parameter, std.meta.activeTag(result.graph.node(dx.inputs[1]).op));
+}
+
+test "LoRA linear backward prunes frozen base weight gradient" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const x_shape = Shape.init(.f32, &.{ 2, 4 });
+    const base_weight_shape = Shape.init(.f32, &.{ 5, 4 });
+    const lora_a_shape = Shape.init(.f32, &.{ 2, 4 });
+    const lora_b_shape = Shape.init(.f32, &.{ 5, 2 });
+    const input_seed = try bld.parameter("input_seed", x_shape);
+    const input_scale = try bld.scalarConst(.f32, 1.0);
+    const x = try bld.mul(input_seed, input_scale);
+    const base_weight = try bld.parameter("base_weight", base_weight_shape);
+    const lora_a = try bld.parameter("lora_a", lora_a_shape);
+    const lora_b = try bld.parameter("lora_b", lora_b_shape);
+
+    const base = try bld.linearNoBias(x, base_weight, 2, 4, 5);
+    const lora_down = try bld.linearNoBias(x, lora_a, 2, 4, 2);
+    const lora_up = try bld.linearNoBias(lora_down, lora_b, 2, 2, 5);
+    const combined = try bld.add(base, lora_up);
+    const loss = try bld.reduceSum(combined, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    // Request the upstream seed rather than x itself. This proves the
+    // dependency mask preserves dX transitively for earlier LoRA layers.
+    var result = try gradient(allocator, &g, loss, &.{ input_seed, lora_a, lora_b });
+    defer result.deinit();
+
+    try std.testing.expect(result.param_grads[0] != null_node);
+    try std.testing.expect(result.param_grads[1] != null_node);
+    try std.testing.expect(result.param_grads[2] != null_node);
+    try std.testing.expect(result.graph.node(result.param_grads[0]).output_shape.eq(x_shape));
+    try std.testing.expect(result.graph.node(result.param_grads[1]).output_shape.eq(lora_a_shape));
+    try std.testing.expect(result.graph.node(result.param_grads[2]).output_shape.eq(lora_b_shape));
+
+    const lowered_base_weight = result.id_map[base_weight];
+    var saw_base_input_gradient = false;
+    var saw_frozen_base_weight_gradient = false;
+    for (0..result.graph.nodeCount()) |node_index| {
+        const node = result.graph.node(@intCast(node_index));
+        switch (node.op) {
+            .dot_general => {
+                if (node.output_shape.eq(x_shape) and node.inputs[1] == lowered_base_weight) {
+                    saw_base_input_gradient = true;
+                }
+            },
+            .transpose => {
+                if (!node.output_shape.eq(base_weight_shape)) continue;
+                const source = result.graph.node(node.inputs[0]);
+                if (source.output_shape.eq(Shape.init(.f32, &.{ 4, 5 })) and source.op == .dot_general) {
+                    saw_frozen_base_weight_gradient = true;
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_base_input_gradient);
+    try std.testing.expect(!saw_frozen_base_weight_gradient);
+}
+
+test "gradient returns null for a disconnected requested parameter" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const used = try bld.parameter("used", Shape.init(.f32, &.{2}));
+    const disconnected = try bld.parameter("disconnected", Shape.init(.f32, &.{2}));
+    const loss = try bld.reduceSum(used, &.{0});
+    try g.markOutput(loss);
+
+    var result = try gradient(allocator, &g, loss, &.{disconnected});
+    defer result.deinit();
+    try std.testing.expectEqual(null_node, result.param_grads[0]);
+}
+
+test "linear input gradient double-transpose cancellation is numerical" {
+    const allocator = std.testing.allocator;
+    const weights = [_]f32{
+        1.0,  2.0,  3.0,  4.0,
+        5.0,  6.0,  7.0,  8.0,
+        -1.0, -2.0, -3.0, -4.0,
+    };
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+
+    const x = try bld.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    const w = try bld.tensorConst(&weights, Shape.init(.f32, &.{ 3, 4 }));
+    const y = try bld.linearNoBias(x, w, 2, 4, 3);
+    const loss = try bld.reduceSum(y, &.{ 0, 1 });
+    try g.markOutput(loss);
+
+    var result = try gradient(allocator, &g, loss, &.{x});
+    defer result.deinit();
+
+    const dx = result.graph.node(result.param_grads[0]);
+    const rhs = result.graph.node(dx.inputs[1]);
+    const constant = switch (rhs.op) {
+        .constant => |attrs| attrs,
+        else => return error.TestExpectedEqual,
+    };
+    const direct_weights = result.graph.constantData(constant.data_offset, constant.data_len);
+
+    const x_values = [_]f32{ 0.2, -0.4, 0.6, -0.8, 1.0, -1.2, 1.4, -1.6 };
+    const epsilon: f32 = 1e-3;
+    for (x_values, 0..) |_, x_index| {
+        var x_plus = x_values;
+        var x_minus = x_values;
+        x_plus[x_index] += epsilon;
+        x_minus[x_index] -= epsilon;
+
+        var plus_loss: f32 = 0;
+        var minus_loss: f32 = 0;
+        for (0..2) |row| {
+            for (0..3) |out_col| {
+                for (0..4) |in_col| {
+                    plus_loss += x_plus[row * 4 + in_col] * weights[out_col * 4 + in_col];
+                    minus_loss += x_minus[row * 4 + in_col] * weights[out_col * 4 + in_col];
+                }
+            }
+        }
+        const numerical = (plus_loss - minus_loss) / (2.0 * epsilon);
+
+        const in_col = x_index % 4;
+        var direct: f32 = 0;
+        for (0..3) |out_col| direct += direct_weights[out_col * 4 + in_col];
+        try std.testing.expectApproxEqAbs(numerical, direct, 1e-2);
+    }
 }
 
 test "gradient through fused rmsNorm (lowered)" {

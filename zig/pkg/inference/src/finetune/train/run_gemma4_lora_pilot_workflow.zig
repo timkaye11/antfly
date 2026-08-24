@@ -230,7 +230,7 @@ fn runPilot(init: std.process.Init, allocator: std.mem.Allocator, opts: Options)
         try requireFile(trained_adapter_path);
         try requireContains(allocator, config_path, "\"trainer\": \"autodiff");
         if (!(fileContains(allocator, config_path, opts.backend) catch false)) return error.TrainingBackendMismatch;
-        try requireContains(allocator, report_path, "\"optimizer_steps\": 0");
+        try requirePositiveOptimizerSteps(allocator, report_path);
         if (opts.mode == .multimodal) {
             try requireContains(allocator, prepared_path, "\"gguf_projector_sha256\"");
             try requireContains(allocator, report_path, "\"projected_media_cache_entries\"");
@@ -315,6 +315,9 @@ fn parseOptions(args: *std.process.Args.Iterator) !Options {
             return usageError();
         }
     }
+    if (!std.mem.eql(u8, opts.backend, "native") and !std.mem.eql(u8, opts.backend, "metal")) {
+        return usageError();
+    }
     return opts;
 }
 
@@ -373,6 +376,25 @@ fn fileContains(allocator: std.mem.Allocator, path: []const u8, needle: []const 
     return std.mem.indexOf(u8, bytes, needle) != null;
 }
 
+fn requirePositiveOptimizerSteps(allocator: std.mem.Allocator, path: []const u8) !void {
+    const bytes = try c_file.readFile(allocator, path);
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+
+    const root = if (parsed.value == .object) parsed.value.object else return error.InvalidTrainingReport;
+    const history = root.get("epoch_history") orelse return error.InvalidTrainingReport;
+    if (history != .array or history.array.items.len == 0) return error.NoOptimizerSteps;
+    for (history.array.items) |epoch| {
+        if (epoch != .object) return error.InvalidTrainingReport;
+        const steps = epoch.object.get("optimizer_steps") orelse return error.InvalidTrainingReport;
+        if (steps == .integer and steps.integer > 0) return;
+    }
+
+    std.debug.print("training report recorded no optimizer update: {s}\n", .{path});
+    return error.NoOptimizerSteps;
+}
+
 fn invocationCwd() ?[]const u8 {
     return platform.env.getenv("ANTFLY_WORKFLOW_CWD");
 }
@@ -405,7 +427,7 @@ fn usageError() error{InvalidArguments} {
         \\  --recursive-init NAME
         \\  --teacher-top-k N
         \\  --teacher-temperature F
-        \\  --backend auto|native
+        \\  --backend native|metal
         \\  --split NAME
         \\  --dry-run
         \\
