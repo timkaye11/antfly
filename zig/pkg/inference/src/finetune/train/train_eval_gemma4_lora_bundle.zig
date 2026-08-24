@@ -20,3 +20,4 @@ pub fn main(init: std.process.Init) !void {
 }
 
 pub const runFromArgs = command.runFromArgs;
+pub const appendAutodiffCliArgs = command.appendAutodiffCliArgs;

@@ -152,6 +152,7 @@ pub const PreparedExampleInput = struct {
     was_truncated: bool = false,
     turns_dropped_from_left: usize = 0,
     policy_version: ?[]const u8 = null,
+    source_identity_sha256: ?[]const u8 = null,
 };
 
 pub const PreparedInputsSummary = struct {
@@ -2092,6 +2093,59 @@ fn hashStringSlice(hasher: *std.crypto.hash.sha2.Sha256, values: []const []const
     for (values) |value| hashBytes(hasher, value);
 }
 
+fn hashOptionalBytes(hasher: *std.crypto.hash.sha2.Sha256, value: ?[]const u8) void {
+    hashBytes(hasher, value orelse "");
+}
+
+fn hashGemmaChatSource(
+    hasher: *std.crypto.hash.sha2.Sha256,
+    example: gemma_chat_data.Example,
+    image_bytes: []const []const u8,
+    audio_bytes: []const []const u8,
+) void {
+    hashBytes(hasher, "gemma4_source_identity/v1");
+    hashOptionalBytes(hasher, example.id);
+    hashOptionalBytes(hasher, example.metadata.source);
+    hashOptionalBytes(hasher, example.metadata.policy_version);
+    hashLength(hasher, example.messages.len);
+    for (example.messages) |message| {
+        hashUsize(hasher, @intFromEnum(message.role));
+        hashBytes(hasher, message.content);
+        hashOptionalBytes(hasher, message.tool_call_id);
+        hashOptionalBytes(hasher, message.name);
+        hashLength(hasher, message.tool_calls.len);
+        for (message.tool_calls) |call| {
+            hashBytes(hasher, call.id);
+            hashBytes(hasher, call.name);
+            hashBytes(hasher, call.arguments_json);
+        }
+    }
+    hashLength(hasher, example.tools.len);
+    for (example.tools) |tool| {
+        hashBytes(hasher, tool.name);
+        hashOptionalBytes(hasher, tool.description);
+        hashOptionalBytes(hasher, tool.input_schema_json);
+    }
+    hashLength(hasher, image_bytes.len);
+    for (image_bytes) |bytes| hashBytes(hasher, bytes);
+    hashLength(hasher, audio_bytes.len);
+    for (audio_bytes) |bytes| hashBytes(hasher, bytes);
+}
+
+fn fingerprintGemmaChatSourceAlloc(
+    allocator: std.mem.Allocator,
+    example: gemma_chat_data.Example,
+    image_bytes: []const []const u8,
+    audio_bytes: []const []const u8,
+) ![]const u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hashGemmaChatSource(&hasher, example, image_bytes, audio_bytes);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return allocator.dupe(u8, &hex);
+}
+
 fn updatePreparedExampleHash(
     hasher: *std.crypto.hash.sha2.Sha256,
     example: *const PreparedExampleInput,
@@ -2121,12 +2175,15 @@ fn updatePreparedExampleHash(
     hashUsize(hasher, @intFromBool(example.was_truncated));
     hashUsize(hasher, example.turns_dropped_from_left);
     hashBytes(hasher, example.policy_version orelse "");
+    hashBytes(hasher, example.source_identity_sha256 orelse "");
 }
 
-fn preparedExampleIdentityDigest(example: *const PreparedExampleInput) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+fn preparedExampleSourceIdentityDigest(example: *const PreparedExampleInput) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    const source_identity = example.source_identity_sha256 orelse return error.PreparedSourceIdentityRequired;
+    try validateSha256Hex(source_identity);
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hashBytes(&hasher, "gemma4_prepared_example_identity/v1");
-    updatePreparedExampleHash(&hasher, example, false);
+    hashBytes(&hasher, "gemma4_source_overlap/v1");
+    hashBytes(&hasher, source_identity);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
     return digest;
@@ -2251,21 +2308,118 @@ pub fn populatePreparedProvenance(
     summary: *PreparedInputsSummary,
     model_dir: []const u8,
 ) !void {
+    try validatePreparedAggregates(summary.*);
     var provenance = try fingerprintGemma4Model(allocator, model_dir);
     defer provenance.deinit(allocator);
-    if (summary.base_model_sha256) |old| allocator.free(old);
-    if (summary.tokenizer_sha256) |old| allocator.free(old);
-    if (summary.chat_template_sha256) |old| allocator.free(old);
-    summary.base_model_sha256 = try allocator.dupe(u8, provenance.base_model_sha256);
-    summary.tokenizer_sha256 = try allocator.dupe(u8, provenance.tokenizer_sha256);
-    summary.chat_template_sha256 = try allocator.dupe(u8, provenance.chat_template_sha256);
+
+    const base_model_sha256 = try allocator.dupe(u8, provenance.base_model_sha256);
+    errdefer allocator.free(base_model_sha256);
+    const tokenizer_sha256 = try allocator.dupe(u8, provenance.tokenizer_sha256);
+    errdefer allocator.free(tokenizer_sha256);
+    const chat_template_sha256 = try allocator.dupe(u8, provenance.chat_template_sha256);
+    errdefer allocator.free(chat_template_sha256);
+    const prepared_examples_sha256 = try fingerprintPreparedExamplesAlloc(allocator, summary.examples);
+    errdefer allocator.free(prepared_examples_sha256);
+
+    const old_base_model_sha256 = summary.base_model_sha256;
+    const old_tokenizer_sha256 = summary.tokenizer_sha256;
+    const old_chat_template_sha256 = summary.chat_template_sha256;
+    const old_prepared_examples_sha256 = summary.prepared_examples_sha256;
+    summary.base_model_sha256 = base_model_sha256;
+    summary.tokenizer_sha256 = tokenizer_sha256;
+    summary.chat_template_sha256 = chat_template_sha256;
+    summary.prepared_examples_sha256 = prepared_examples_sha256;
     summary.schema_version = prepared_schema_v4;
-    try refreshPreparedExamplesFingerprint(allocator, summary);
+    if (old_base_model_sha256) |old| allocator.free(old);
+    if (old_tokenizer_sha256) |old| allocator.free(old);
+    if (old_chat_template_sha256) |old| allocator.free(old);
+    if (old_prepared_examples_sha256) |old| allocator.free(old);
 }
 
 fn validateSha256Hex(value: []const u8) !void {
     if (value.len != std.crypto.hash.sha2.Sha256.digest_length * 2) return error.InvalidPreparedFingerprint;
     for (value) |byte| if (!std.ascii.isHex(byte)) return error.InvalidPreparedFingerprint;
+}
+
+const PreparedAggregates = struct {
+    max_prompt_tokens: usize = 0,
+    max_response_tokens: usize = 0,
+    max_input_tokens: usize = 0,
+    max_supervised_tokens: usize = 0,
+    examples_with_tool_calls: usize = 0,
+    examples_with_tool_messages: usize = 0,
+    examples_with_multiturn: usize = 0,
+    examples_with_images: usize = 0,
+    examples_with_audio: usize = 0,
+    examples_truncated: usize = 0,
+    max_turns_dropped: usize = 0,
+};
+
+fn recomputePreparedAggregates(examples: []const PreparedExampleInput) !PreparedAggregates {
+    var aggregates = PreparedAggregates{};
+    for (examples) |example| {
+        const source_identity = example.source_identity_sha256 orelse return error.PreparedSourceIdentityRequired;
+        try validateSha256Hex(source_identity);
+        const declared_input_tokens = std.math.add(usize, example.num_prompt_tokens, example.num_response_tokens) catch
+            return error.PreparedSummaryMismatch;
+        if (example.prompt_input_ids.len != example.num_prompt_tokens or
+            example.response_input_ids.len != example.num_response_tokens or
+            example.input_ids.len != example.num_input_tokens or
+            example.labels.len != example.num_input_tokens or
+            declared_input_tokens != example.num_input_tokens)
+        {
+            return error.PreparedSummaryMismatch;
+        }
+        var supervised_tokens: usize = 0;
+        for (example.labels) |label| {
+            if (label != -100) supervised_tokens += 1;
+        }
+        if (supervised_tokens != example.num_supervised_tokens) return error.PreparedSummaryMismatch;
+        if (example.image_paths.len != example.image_token_counts.len or
+            example.audio_paths.len != example.audio_token_counts.len)
+        {
+            return error.PreparedSummaryMismatch;
+        }
+
+        aggregates.max_prompt_tokens = @max(aggregates.max_prompt_tokens, example.num_prompt_tokens);
+        aggregates.max_response_tokens = @max(aggregates.max_response_tokens, example.num_response_tokens);
+        aggregates.max_input_tokens = @max(aggregates.max_input_tokens, example.num_input_tokens);
+        aggregates.max_supervised_tokens = @max(aggregates.max_supervised_tokens, example.num_supervised_tokens);
+        if (example.has_tool_calls) aggregates.examples_with_tool_calls += 1;
+        if (example.has_tool_messages) aggregates.examples_with_tool_messages += 1;
+        if (example.turn_count > 2) aggregates.examples_with_multiturn += 1;
+        if (example.image_paths.len > 0) aggregates.examples_with_images += 1;
+        if (example.audio_paths.len > 0) aggregates.examples_with_audio += 1;
+        if (example.was_truncated) aggregates.examples_truncated += 1;
+        aggregates.max_turns_dropped = @max(aggregates.max_turns_dropped, example.turns_dropped_from_left);
+    }
+    return aggregates;
+}
+
+fn validatePreparedAggregates(summary: PreparedInputsSummary) !void {
+    if (summary.examples_seen != summary.examples.len) return error.PreparedSummaryMismatch;
+    const actual = try recomputePreparedAggregates(summary.examples);
+    if (summary.max_prompt_tokens != actual.max_prompt_tokens or
+        summary.max_response_tokens != actual.max_response_tokens or
+        summary.max_input_tokens != actual.max_input_tokens or
+        summary.max_supervised_tokens != actual.max_supervised_tokens or
+        summary.examples_with_tool_calls != actual.examples_with_tool_calls or
+        summary.examples_with_tool_messages != actual.examples_with_tool_messages or
+        summary.examples_with_multiturn != actual.examples_with_multiturn or
+        summary.examples_with_images != actual.examples_with_images or
+        summary.examples_with_audio != actual.examples_with_audio or
+        summary.examples_truncated != actual.examples_truncated or
+        summary.max_turns_dropped != actual.max_turns_dropped)
+    {
+        return error.PreparedSummaryMismatch;
+    }
+}
+
+pub fn preparedExamplesHaveMedia(examples: []const PreparedExampleInput) bool {
+    for (examples) |example| {
+        if (example.image_paths.len > 0 or example.audio_paths.len > 0) return true;
+    }
+    return false;
 }
 
 pub fn validatePreparedArtifactIntegrity(
@@ -2282,6 +2436,7 @@ pub fn validatePreparedArtifactIntegrity(
     try validateSha256Hex(tokenizer_digest);
     try validateSha256Hex(chat_digest);
     try validateSha256Hex(examples_digest);
+    try validatePreparedAggregates(summary);
     const actual = try fingerprintPreparedExamplesAlloc(allocator, summary.examples);
     defer allocator.free(actual);
     if (!std.mem.eql(u8, examples_digest, actual)) return error.PreparedInputsFingerprintMismatch;
@@ -2320,9 +2475,9 @@ pub fn validatePreparedEvalDisjoint(
     var training = std.AutoHashMapUnmanaged([std.crypto.hash.sha2.Sha256.digest_length]u8, void).empty;
     defer training.deinit(allocator);
     try training.ensureTotalCapacity(allocator, @intCast(training_examples.len));
-    for (training_examples) |*example| training.putAssumeCapacity(preparedExampleIdentityDigest(example), {});
+    for (training_examples) |*example| training.putAssumeCapacity(try preparedExampleSourceIdentityDigest(example), {});
     for (eval_examples) |*example| {
-        if (training.contains(preparedExampleIdentityDigest(example))) return error.TrainingEvaluationOverlap;
+        if (training.contains(try preparedExampleSourceIdentityDigest(example))) return error.TrainingEvaluationOverlap;
     }
 }
 
@@ -2340,7 +2495,7 @@ pub fn validatePreparedSequenceAdmission(
     model_max_position_embeddings: u32,
 ) !u32 {
     const seq_len = try validateTrainingSequenceLength(summary.max_seq_len, model_max_position_embeddings);
-    if (summary.examples_seen != summary.examples.len) return error.PreparedSummaryMismatch;
+    try validatePreparedAggregates(summary);
     var actual_max_input: usize = 0;
     var actual_max_supervised: usize = 0;
     for (summary.examples) |example| {
@@ -2767,6 +2922,8 @@ fn tokenizeChatExample(
     example: gemma_chat_data.Example,
     max_seq_len: usize,
 ) !PreparedExampleInput {
+    const source_identity_sha256 = try fingerprintGemmaChatSourceAlloc(allocator, example, &.{}, &.{});
+    errdefer allocator.free(source_identity_sha256);
     const selected = try selectRenderableGemmaMessageWindow(allocator, tok, example, max_seq_len);
     defer allocator.free(selected.messages);
 
@@ -2880,6 +3037,7 @@ fn tokenizeChatExample(
         .was_truncated = selected.turns_dropped_from_left > 0 or encoded.ids.len == max_seq_len and selected.messages.len < example.messages.len,
         .turns_dropped_from_left = selected.turns_dropped_from_left,
         .policy_version = try dupeOptionalString(allocator, example.metadata.policy_version),
+        .source_identity_sha256 = source_identity_sha256,
     };
 }
 
@@ -2898,6 +3056,8 @@ fn tokenizeMultimodalChatExample(
     defer freeMediaBytes(allocator, image_bytes);
     const audio_bytes = try loadMediaBytes(allocator, example.audio_paths);
     defer freeMediaBytes(allocator, audio_bytes);
+    const source_identity_sha256 = try fingerprintGemmaChatSourceAlloc(allocator, example, image_bytes, audio_bytes);
+    errdefer allocator.free(source_identity_sha256);
 
     const image_token_counts = try prepareMediaTokenCounts(allocator, media_token_cache, .image, &cb, gguf_projector_path, gguf_projector_sha256, image_bytes);
     defer allocator.free(image_token_counts);
@@ -2913,8 +3073,11 @@ fn tokenizeMultimodalChatExample(
     defer freeExpandedMultimodalExample(allocator, &expanded);
 
     var prepared = try tokenizeChatExample(allocator, tok, expanded, max_seq_len);
+    errdefer freePreparedExampleInput(allocator, &prepared);
     prepared.image_token_counts = try cloneUsizeSlice(allocator, image_token_counts);
     prepared.audio_token_counts = try cloneUsizeSlice(allocator, audio_token_counts);
+    if (prepared.source_identity_sha256) |expanded_identity| allocator.free(expanded_identity);
+    prepared.source_identity_sha256 = source_identity_sha256;
     return prepared;
 }
 
@@ -3208,6 +3371,7 @@ fn freePreparedExampleInput(allocator: std.mem.Allocator, item: *const PreparedE
     if (item.teacher_top_k_token_ids.len > 0) allocator.free(item.teacher_top_k_token_ids);
     if (item.teacher_top_k_probs.len > 0) allocator.free(item.teacher_top_k_probs);
     if (item.policy_version) |p| allocator.free(p);
+    if (item.source_identity_sha256) |p| allocator.free(p);
 }
 
 fn clonePreparedInputsSummary(allocator: std.mem.Allocator, source: *const PreparedInputsSummary) !PreparedInputsSummary {
@@ -3243,6 +3407,7 @@ fn clonePreparedInputsSummary(allocator: std.mem.Allocator, source: *const Prepa
             .was_truncated = item.was_truncated,
             .turns_dropped_from_left = item.turns_dropped_from_left,
             .policy_version = try dupeOptionalString(allocator, item.policy_version),
+            .source_identity_sha256 = try dupeOptionalString(allocator, item.source_identity_sha256),
         };
         cloned_count += 1;
     }
@@ -3649,6 +3814,35 @@ test "validateMultimodalExampleShape catches placeholder mismatch" {
     try std.testing.expectError(error.ImagePlaceholderCountMismatch, validateMultimodalExampleShape(ex));
 }
 
+test "Gemma4 source identity survives media path changes and binds media content" {
+    const allocator = std.testing.allocator;
+    var messages = [_]gemma_chat_data.Message{
+        .{ .role = .user, .content = "Describe <|image|>" },
+        .{ .role = .assistant, .content = "A marker" },
+    };
+    const first = gemma_chat_data.Example{
+        .id = "row-17",
+        .messages = &messages,
+        .image_paths = &.{"images/original.png"},
+    };
+    const renamed = gemma_chat_data.Example{
+        .id = "row-17",
+        .messages = &messages,
+        .image_paths = &.{"renamed/copy.png"},
+    };
+    const same_media = [_][]const u8{"identical media bytes"};
+    const changed_media = [_][]const u8{"different media bytes"};
+    const first_digest = try fingerprintGemmaChatSourceAlloc(allocator, first, &same_media, &.{});
+    defer allocator.free(first_digest);
+    const renamed_digest = try fingerprintGemmaChatSourceAlloc(allocator, renamed, &same_media, &.{});
+    defer allocator.free(renamed_digest);
+    const changed_digest = try fingerprintGemmaChatSourceAlloc(allocator, renamed, &changed_media, &.{});
+    defer allocator.free(changed_digest);
+
+    try std.testing.expectEqualStrings(first_digest, renamed_digest);
+    try std.testing.expect(!std.mem.eql(u8, first_digest, changed_digest));
+}
+
 test "normalizePreparedSchemaVersion accepts supported versions" {
     try std.testing.expectEqualStrings(prepared_schema_v2, try normalizePreparedSchemaVersion(prepared_schema_v2));
     try std.testing.expectEqualStrings(prepared_schema_v3, try normalizePreparedSchemaVersion(prepared_schema_v3));
@@ -3687,6 +3881,7 @@ test "prepared v4 integrity detects content mutation and heldout overlap" {
         .labels = &train_labels,
         .num_input_tokens = 3,
         .num_supervised_tokens = 1,
+        .source_identity_sha256 = "1111111111111111111111111111111111111111111111111111111111111111",
     }};
     var eval_examples = [_]PreparedExampleInput{.{
         .mode = .instruction,
@@ -3698,10 +3893,11 @@ test "prepared v4 integrity detects content mutation and heldout overlap" {
         .labels = &eval_labels,
         .num_input_tokens = 3,
         .num_supervised_tokens = 1,
+        .source_identity_sha256 = "2222222222222222222222222222222222222222222222222222222222222222",
     }};
     const digest = try fingerprintPreparedExamplesAlloc(allocator, &train_examples);
     defer allocator.free(digest);
-    const valid = PreparedInputsSummary{
+    var valid = PreparedInputsSummary{
         .artifact_family_version = artifact_family_version,
         .model_dir = "/model",
         .schema_version = prepared_schema_v4,
@@ -3712,6 +3908,8 @@ test "prepared v4 integrity detects content mutation and heldout overlap" {
         .max_examples = 1,
         .examples_seen = 1,
         .max_seq_len = 3,
+        .max_prompt_tokens = 2,
+        .max_response_tokens = 1,
         .max_input_tokens = 3,
         .max_supervised_tokens = 1,
         .examples = &train_examples,
@@ -3719,7 +3917,12 @@ test "prepared v4 integrity detects content mutation and heldout overlap" {
     try validatePreparedArtifactIntegrity(allocator, valid);
     _ = try validatePreparedSequenceAdmission(valid, 16);
     try validatePreparedEvalDisjoint(allocator, &train_examples, &eval_examples);
-    try std.testing.expectError(error.TrainingEvaluationOverlap, validatePreparedEvalDisjoint(allocator, &train_examples, &train_examples));
+    eval_examples[0].source_identity_sha256 = train_examples[0].source_identity_sha256;
+    try std.testing.expectError(error.TrainingEvaluationOverlap, validatePreparedEvalDisjoint(allocator, &train_examples, &eval_examples));
+
+    valid.examples_with_images = 1;
+    try std.testing.expectError(error.PreparedSummaryMismatch, validatePreparedArtifactIntegrity(allocator, valid));
+    valid.examples_with_images = 0;
 
     train_ids[2] = 9;
     try std.testing.expectError(error.PreparedInputsFingerprintMismatch, validatePreparedArtifactIntegrity(allocator, valid));

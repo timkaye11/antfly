@@ -38,6 +38,7 @@ const Options = struct {
     output_root: []const u8,
     adapter_dir: ?[]const u8 = null,
     dataset_path: ?[]const u8 = null,
+    eval_dataset_path: ?[]const u8 = null,
     projector_path: ?[]const u8 = null,
     image_path: ?[]const u8 = null,
     count: ?usize = null,
@@ -55,6 +56,7 @@ const Options = struct {
     teacher_temperature: []const u8 = "1.0",
     backend: []const u8 = "native",
     split: []const u8 = "train",
+    eval_split: []const u8 = "eval",
     dry_run: bool = false,
 };
 
@@ -82,6 +84,12 @@ pub fn main(init: std.process.Init) !void {
         owned_dataset_path = try resolveCliPath(allocator, invocation_cwd, value);
         opts.dataset_path = owned_dataset_path;
     }
+    var owned_eval_dataset_path: ?[]const u8 = null;
+    defer if (owned_eval_dataset_path) |value| allocator.free(value);
+    if (opts.eval_dataset_path) |value| {
+        owned_eval_dataset_path = try resolveCliPath(allocator, invocation_cwd, value);
+        opts.eval_dataset_path = owned_eval_dataset_path;
+    }
     var owned_projector_path: ?[]const u8 = null;
     defer if (owned_projector_path) |value| allocator.free(value);
     if (opts.projector_path) |value| {
@@ -105,6 +113,8 @@ fn runPilot(init: std.process.Init, allocator: std.mem.Allocator, opts: Options)
     };
     const max_examples = opts.max_examples orelse count;
     const eval_max_examples = opts.eval_max_examples orelse @min(max_examples, @as(usize, 32));
+    if (max_examples == 0) return error.InvalidPilotMaxExamples;
+    if (eval_max_examples == 0) return error.InvalidPilotEvaluationMaxExamples;
 
     const adapter_dir = if (opts.adapter_dir) |path|
         try allocator.dupe(u8, path)
@@ -117,9 +127,18 @@ fn runPilot(init: std.process.Init, allocator: std.mem.Allocator, opts: Options)
     else
         try std.fs.path.join(allocator, &.{ opts.output_root, if (opts.mode == .text) "text_pilot.jsonl" else "multimodal_pilot.jsonl" });
     defer allocator.free(dataset_path);
+    const eval_dataset_path = if (opts.eval_dataset_path) |path|
+        try allocator.dupe(u8, path)
+    else if (opts.dataset_path != null)
+        try allocator.dupe(u8, dataset_path)
+    else
+        try std.fs.path.join(allocator, &.{ opts.output_root, if (opts.mode == .text) "text_pilot.eval.jsonl" else "multimodal_pilot.eval.jsonl" });
+    defer allocator.free(eval_dataset_path);
 
     const prepared_path = try std.fs.path.join(allocator, &.{ opts.output_root, "prepared.json" });
     defer allocator.free(prepared_path);
+    const eval_prepared_path = try std.fs.path.join(allocator, &.{ opts.output_root, "prepared.eval.json" });
+    defer allocator.free(eval_prepared_path);
     const teacher_prepared_path = try std.fs.path.join(allocator, &.{ opts.output_root, "prepared.teacher.json" });
     defer allocator.free(teacher_prepared_path);
     const train_out_name = try std.fmt.allocPrint(allocator, "train_out_{s}", .{opts.backend});
@@ -152,6 +171,23 @@ fn runPilot(init: std.process.Init, allocator: std.mem.Allocator, opts: Options)
         std.debug.print("using existing dataset: {s}\n", .{dataset_path});
     }
 
+    if (!fileExists(eval_dataset_path)) {
+        if (opts.eval_dataset_path != null or opts.dataset_path != null) return error.MissingEvaluationDataset;
+        const eval_count_arg = try std.fmt.allocPrint(allocator, "{d}", .{eval_max_examples});
+        defer allocator.free(eval_count_arg);
+        const eval_start_index_arg = try std.fmt.allocPrint(allocator, "{d}", .{count});
+        defer allocator.free(eval_start_index_arg);
+        if (opts.mode == .text) {
+            const cmd = [_][]const u8{ eval_dataset_path, eval_count_arg, opts.eval_split, eval_start_index_arg };
+            try runCommand(init, allocator, "generate-gemma4-pilot-dataset", generate_gemma4_pilot_dataset.main, &cmd, opts.dry_run);
+        } else {
+            const cmd = [_][]const u8{ eval_dataset_path, eval_count_arg, opts.image_path.?, opts.eval_split, eval_start_index_arg };
+            try runCommand(init, allocator, "generate-gemma4-multimodal-pilot-dataset", generate_gemma4_multimodal_pilot_dataset.main, &cmd, opts.dry_run);
+        }
+    } else if (!std.mem.eql(u8, eval_dataset_path, dataset_path)) {
+        std.debug.print("using existing evaluation dataset: {s}\n", .{eval_dataset_path});
+    }
+
     const adapter_config_path = try std.fs.path.join(allocator, &.{ adapter_dir, "adapter_config.json" });
     defer allocator.free(adapter_config_path);
     const adapter_weights_path = try std.fs.path.join(allocator, &.{ adapter_dir, "adapter_model.safetensors" });
@@ -169,6 +205,8 @@ fn runPilot(init: std.process.Init, allocator: std.mem.Allocator, opts: Options)
 
     const max_examples_arg = try std.fmt.allocPrint(allocator, "{d}", .{max_examples});
     defer allocator.free(max_examples_arg);
+    const eval_max_examples_arg = try std.fmt.allocPrint(allocator, "{d}", .{eval_max_examples});
+    defer allocator.free(eval_max_examples_arg);
     const max_seq_len_arg = try std.fmt.allocPrint(allocator, "{d}", .{opts.max_seq_len});
     defer allocator.free(max_seq_len_arg);
     var prepare_cmd = std.ArrayListUnmanaged([]const u8).empty;
@@ -176,6 +214,12 @@ fn runPilot(init: std.process.Init, allocator: std.mem.Allocator, opts: Options)
     try prepare_cmd.appendSlice(allocator, &.{ opts.base_model_dir, dataset_path, opts.split, prepared_path, "--max-examples", max_examples_arg, "--max-seq-len", max_seq_len_arg });
     if (opts.mode == .multimodal) try prepare_cmd.appendSlice(allocator, &.{ "--gguf-projector", opts.projector_path.? });
     try runCommand(init, allocator, "prepare-gemma4-lora-inputs", prepare_gemma4_lora_inputs.main, prepare_cmd.items, opts.dry_run);
+
+    var eval_prepare_cmd = std.ArrayListUnmanaged([]const u8).empty;
+    defer eval_prepare_cmd.deinit(allocator);
+    try eval_prepare_cmd.appendSlice(allocator, &.{ opts.base_model_dir, eval_dataset_path, opts.eval_split, eval_prepared_path, "--max-examples", eval_max_examples_arg, "--max-seq-len", max_seq_len_arg });
+    if (opts.mode == .multimodal) try eval_prepare_cmd.appendSlice(allocator, &.{ "--gguf-projector", opts.projector_path.? });
+    try runCommand(init, allocator, "prepare-gemma4-lora-inputs", prepare_gemma4_lora_inputs.main, eval_prepare_cmd.items, opts.dry_run);
 
     const train_prepared_path = if (opts.teacher_top_k) |teacher_top_k| blk: {
         var teacher_cmd = std.ArrayListUnmanaged([]const u8).empty;
@@ -186,39 +230,28 @@ fn runPilot(init: std.process.Init, allocator: std.mem.Allocator, opts: Options)
         break :blk teacher_prepared_path;
     } else prepared_path;
 
-    const eval_max_examples_arg = try std.fmt.allocPrint(allocator, "{d}", .{eval_max_examples});
-    defer allocator.free(eval_max_examples_arg);
     const epochs_arg = try std.fmt.allocPrint(allocator, "{d}", .{opts.epochs});
     defer allocator.free(epochs_arg);
     var train_cmd = std.ArrayListUnmanaged([]const u8).empty;
     defer train_cmd.deinit(allocator);
-    try train_cmd.appendSlice(allocator, &.{
-        opts.base_model_dir,
-        adapter_dir,
-        train_prepared_path,
-        train_out_dir,
-        "--trainer",
-        "autodiff",
-        "--backend",
-        opts.backend,
-        "--max-examples",
-        max_examples_arg,
-        "--eval-max-examples",
-        eval_max_examples_arg,
-        "--epochs",
-        epochs_arg,
-        "--lr",
-        opts.learning_rate,
-        "--max-grad-norm",
-        "1.0",
-        "--grad-accum",
-        "1",
+    try train_eval_gemma4_lora_bundle.appendAutodiffCliArgs(allocator, &train_cmd, .{
+        .base_model_dir = opts.base_model_dir,
+        .adapter_dir = adapter_dir,
+        .train_prepared_path = train_prepared_path,
+        .eval_prepared_path = eval_prepared_path,
+        .output_dir = train_out_dir,
+        .backend = opts.backend,
+        .max_examples = max_examples_arg,
+        .eval_max_examples = eval_max_examples_arg,
+        .epochs = epochs_arg,
+        .learning_rate = opts.learning_rate,
+        .gguf_projector_path = if (opts.mode == .multimodal) opts.projector_path.? else null,
     });
-    if (opts.mode == .multimodal) try train_cmd.appendSlice(allocator, &.{ "--gguf-projector", opts.projector_path.? });
     try runCommand(init, allocator, "train-eval-gemma4-lora-bundle", train_eval_gemma4_lora_bundle.main, train_cmd.items, opts.dry_run);
 
     if (!opts.dry_run) {
         try requireFile(prepared_path);
+        try requireFile(eval_prepared_path);
         if (opts.teacher_top_k != null) {
             try requireFile(teacher_prepared_path);
             try requireContains(allocator, teacher_prepared_path, "\"teacher_top_k\"");
@@ -244,14 +277,16 @@ fn runPilot(init: std.process.Init, allocator: std.mem.Allocator, opts: Options)
         \\pilot_complete: true
         \\mode: {s}
         \\dataset: {s}
+        \\eval_dataset: {s}
         \\prepared: {s}
+        \\eval_prepared: {s}
         \\teacher_prepared: {s}
         \\adapter_seed: {s}
         \\train_out: {s}
         \\report: {s}
         \\config: {s}
         \\
-    , .{ @tagName(opts.mode), dataset_path, prepared_path, train_prepared_path, adapter_dir, train_out_dir, report_path, config_path });
+    , .{ @tagName(opts.mode), dataset_path, eval_dataset_path, prepared_path, eval_prepared_path, train_prepared_path, adapter_dir, train_out_dir, report_path, config_path });
     try writer.interface.flush();
 }
 
@@ -275,6 +310,8 @@ fn parseOptions(args: *std.process.Args.Iterator) !Options {
             opts.adapter_dir = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--dataset")) {
             opts.dataset_path = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--eval-dataset")) {
+            opts.eval_dataset_path = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--projector") or std.mem.eql(u8, arg, "--gguf-projector")) {
             opts.projector_path = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--image-path")) {
@@ -309,6 +346,8 @@ fn parseOptions(args: *std.process.Args.Iterator) !Options {
             opts.backend = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--split")) {
             opts.split = args.next() orelse return usageError();
+        } else if (std.mem.eql(u8, arg, "--eval-split")) {
+            opts.eval_split = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--dry-run")) {
             opts.dry_run = true;
         } else {
@@ -412,6 +451,7 @@ fn usageError() error{InvalidArguments} {
         \\Options:
         \\  --adapter-dir PATH       Existing or generated LoRA seed adapter dir.
         \\  --dataset PATH           Existing Gemma chat JSONL dataset.
+        \\  --eval-dataset PATH      Held-out Gemma chat JSONL dataset; defaults to --dataset.
         \\  --projector PATH         Gemma4 GGUF projector. Required for multimodal mode.
         \\  --image-path PATH        Image used when generating a multimodal pilot dataset.
         \\  --count N                Generated dataset size.
@@ -429,6 +469,7 @@ fn usageError() error{InvalidArguments} {
         \\  --teacher-temperature F
         \\  --backend native|metal
         \\  --split NAME
+        \\  --eval-split NAME        Held-out split to prepare (default: eval).
         \\  --dry-run
         \\
     , .{});

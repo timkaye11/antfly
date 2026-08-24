@@ -41,7 +41,10 @@ pub fn main(init: std.process.Init) !void {
     const count_arg = args.next() orelse return usage();
     const image_path = args.next() orelse return usage();
     const split = args.next() orelse "train";
+    const start_index_arg = args.next() orelse "0";
+    if (args.next() != null) return usage();
     const count = try std.fmt.parseUnsigned(usize, count_arg, 10);
+    const start_index = try std.fmt.parseUnsigned(usize, start_index_arg, 10);
     if (count == 0) return error.InvalidPilotExampleCount;
 
     const file = try compat.cwd().createFile(compat.io(), out_path, .{ .truncate = true });
@@ -49,7 +52,8 @@ pub fn main(init: std.process.Init) !void {
 
     var buf: [4096]u8 = undefined;
     var writer = file.writer(init.io, &buf);
-    for (0..count) |idx| {
+    for (0..count) |offset| {
+        const idx = std.math.add(usize, start_index, offset) catch return error.PilotExampleIndexOverflow;
         const prompt = prompts[idx % prompts.len];
         const label = labels[idx % labels.len];
         const variant = (idx * 31 + 7) % 997;
@@ -85,7 +89,7 @@ fn writeJsonString(writer: anytype, value: []const u8) !void {
 
 fn usage() error{InvalidArguments} {
     std.debug.print(
-        \\usage: generate-gemma4-multimodal-pilot-dataset <out_jsonl> <count> <image_path> [split=train]
+        \\usage: generate-gemma4-multimodal-pilot-dataset <out_jsonl> <count> <image_path> [split=train] [start_index=0]
         \\
         \\Creates deterministic Gemma chat JSONL rows with one image content part per example.
         \\

@@ -1403,6 +1403,7 @@ evaluation source/split. The training command requires the second artifact via
 - `has_tool_calls`
 - `has_tool_messages`
 - optional `policy_version`
+- a canonical source identity over the untruncated row and ordered media bytes
 
 The summary also records:
 - base-artifact, tokenizer-asset, and chat-template identity digests
@@ -1414,12 +1415,13 @@ The summary also records:
 - `examples_with_multiturn`
 
 The production-intent autodiff loader requires v4 integrity and compares both
-train/eval identities to the selected model and adapter. It rejects exact
-prepared-token overlap. It does not yet record source-row, dataset/split, or
-media-content hashes, so an external source-level disjointness audit is still
-required for held-out quality claims. Prepared JSON also remains a whole-buffer
-artifact with a 128 MiB load ceiling and direct-write publication; use fresh
-paths until streaming immutable shards are implemented.
+train/eval identities to the selected model and adapter. It recomputes every
+summary aggregate, derives multimodal routing from the examples, and rejects
+source overlap even when truncation or media paths differ. Dataset/split
+provenance is not yet persisted, so an external split audit remains required
+for release-quality claims. Prepared JSON also remains a whole-buffer artifact
+with a 128 MiB load ceiling and direct-write publication; use fresh paths until
+streaming immutable shards are implemented.
 
 **Optional — materialize teacher targets:**
 ```
@@ -1451,7 +1453,7 @@ For the recursive compression path, the bounded smoke workflow is:
 usage: run-gemma4-recursive-lora-smoke-workflow <base_model_dir> <output_root> [options]
 ```
 
-The corresponding build step is `zig build run-gemma4-recursive-lora-smoke-workflow -- <base_model_dir> <output_root> ...`. Its current implementation has not yet been migrated to the mandatory `--eval-prepared` input and is therefore not an accepted runnable workflow. After migration it is intended to bootstrap a recursive LoRA adapter, materialize teacher targets, train/evaluate with the autodiff trainer, and validate that recursive and teacher metadata survive the round trip.
+The corresponding build step is `zig build run-gemma4-recursive-lora-smoke-workflow -- <base_model_dir> <output_root> ...`. It prepares a separate evaluation artifact, passes it through the mandatory `--eval-prepared` input, bootstraps a recursive LoRA adapter, materializes teacher targets, trains/evaluates with the autodiff trainer, and validates that recursive and teacher metadata survive the round trip. For custom data, provide a distinct `eval` split or `--eval-dataset` and `--eval-split` through the pilot workflow.
 Successful real runs write `<output_root>/recursive_smoke_results.json` with adapter sizes, before/after loss, teacher coverage, elapsed time, and supervised-token throughput.
 For Gemma4 E2B, use `--recursive-shared-block-size 5`; the text stack has 35 layers and the local/full attention pattern repeats every five layers. The current recursive smoke defaults to attention-only targets (`q_proj,k_proj,v_proj,o_proj`) because E2B MLP weights become double-wide after layer 15.
 

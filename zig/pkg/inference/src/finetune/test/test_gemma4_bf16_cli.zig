@@ -302,6 +302,7 @@ test "gemma4 BF16 strict Metal CLI publishes one real optimizer step" {
         .labels = &labels,
         .num_input_tokens = input_ids.len,
         .num_supervised_tokens = 1,
+        .source_identity_sha256 = "1111111111111111111111111111111111111111111111111111111111111111",
     }};
     var eval_prompt_ids = [_]i32{ 6, 7, 8 };
     var eval_response_ids = [_]i32{9};
@@ -317,6 +318,7 @@ test "gemma4 BF16 strict Metal CLI publishes one real optimizer step" {
         .labels = &eval_labels,
         .num_input_tokens = eval_input_ids.len,
         .num_supervised_tokens = 1,
+        .source_identity_sha256 = "2222222222222222222222222222222222222222222222222222222222222222",
     }};
     var provenance = try finetune.fingerprintGemma4Model(allocator, base_dir);
     defer provenance.deinit(allocator);
@@ -335,6 +337,8 @@ test "gemma4 BF16 strict Metal CLI publishes one real optimizer step" {
         .max_examples = 1,
         .examples_seen = 1,
         .max_seq_len = input_ids.len,
+        .max_prompt_tokens = prompt_ids.len,
+        .max_response_tokens = response_ids.len,
         .max_input_tokens = input_ids.len,
         .max_supervised_tokens = 1,
         .examples = &examples,
@@ -350,6 +354,8 @@ test "gemma4 BF16 strict Metal CLI publishes one real optimizer step" {
         .max_examples = 1,
         .examples_seen = 1,
         .max_seq_len = eval_input_ids.len,
+        .max_prompt_tokens = eval_prompt_ids.len,
+        .max_response_tokens = eval_response_ids.len,
         .max_input_tokens = eval_input_ids.len,
         .max_supervised_tokens = 1,
         .examples = &eval_examples,

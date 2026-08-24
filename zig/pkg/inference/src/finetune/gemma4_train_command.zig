@@ -38,6 +38,52 @@ const pjrt_mod = if (build_options.enable_pjrt) @import("pjrt") else struct {
 
 const TrainerMode = enum { auto, surrogate, autodiff };
 
+pub const AutodiffCliInvocation = struct {
+    base_model_dir: []const u8,
+    adapter_dir: []const u8,
+    train_prepared_path: []const u8,
+    eval_prepared_path: []const u8,
+    output_dir: []const u8,
+    backend: []const u8,
+    max_examples: []const u8,
+    eval_max_examples: []const u8,
+    epochs: []const u8,
+    learning_rate: []const u8,
+    gguf_projector_path: ?[]const u8 = null,
+};
+
+pub fn appendAutodiffCliArgs(
+    allocator: std.mem.Allocator,
+    command: *std.ArrayListUnmanaged([]const u8),
+    invocation: AutodiffCliInvocation,
+) !void {
+    try command.appendSlice(allocator, &.{
+        invocation.base_model_dir,
+        invocation.adapter_dir,
+        invocation.train_prepared_path,
+        invocation.output_dir,
+        "--trainer",
+        "autodiff",
+        "--backend",
+        invocation.backend,
+        "--max-examples",
+        invocation.max_examples,
+        "--eval-prepared",
+        invocation.eval_prepared_path,
+        "--eval-max-examples",
+        invocation.eval_max_examples,
+        "--epochs",
+        invocation.epochs,
+        "--lr",
+        invocation.learning_rate,
+        "--max-grad-norm",
+        "1.0",
+        "--grad-accum",
+        "1",
+    });
+    if (invocation.gguf_projector_path) |path| try command.appendSlice(allocator, &.{ "--gguf-projector", path });
+}
+
 const AutodiffEpochSummary = struct {
     examples_seen: usize = 0,
     supervised_tokens_seen: usize = 0,
@@ -102,6 +148,36 @@ const MultimodalPreparedStats = struct {
     total_image_soft_tokens: usize = 0,
     total_audio_soft_tokens: usize = 0,
 };
+
+test "gemma4 autodiff CLI invocation wires a distinct heldout prepared artifact" {
+    const allocator = std.testing.allocator;
+    var command = std.ArrayListUnmanaged([]const u8).empty;
+    defer command.deinit(allocator);
+    try appendAutodiffCliArgs(allocator, &command, .{
+        .base_model_dir = "/base",
+        .adapter_dir = "/adapter",
+        .train_prepared_path = "/run/prepared.json",
+        .eval_prepared_path = "/run/prepared.eval.json",
+        .output_dir = "/run/train_out_native",
+        .backend = "native",
+        .max_examples = "8",
+        .eval_max_examples = "2",
+        .epochs = "1",
+        .learning_rate = "0.0003",
+    });
+
+    var maybe_eval_flag: ?usize = null;
+    for (command.items, 0..) |arg, idx| {
+        if (std.mem.eql(u8, arg, "--eval-prepared")) {
+            maybe_eval_flag = idx;
+            break;
+        }
+    }
+    const eval_flag = maybe_eval_flag orelse return error.MissingEvaluationPreparedInputs;
+    try std.testing.expect(eval_flag + 1 < command.items.len);
+    try std.testing.expectEqualStrings("/run/prepared.eval.json", command.items[eval_flag + 1]);
+    try std.testing.expect(!std.mem.eql(u8, command.items[2], command.items[eval_flag + 1]));
+}
 
 const ReportContext = struct {
     prepared_inputs_path: []const u8,
@@ -776,6 +852,7 @@ test "gemma4 autodiff rejects a real DoRA bootstrap before backend and output mu
         .labels = &labels,
         .num_input_tokens = 2,
         .num_supervised_tokens = 1,
+        .source_identity_sha256 = "1111111111111111111111111111111111111111111111111111111111111111",
     }};
     var provenance = try finetune.fingerprintGemma4Model(allocator, root);
     defer provenance.deinit(allocator);
@@ -792,6 +869,8 @@ test "gemma4 autodiff rejects a real DoRA bootstrap before backend and output mu
         .max_examples = 1,
         .examples_seen = 1,
         .max_seq_len = 2,
+        .max_prompt_tokens = 1,
+        .max_response_tokens = 1,
         .max_input_tokens = 2,
         .max_supervised_tokens = 1,
         .examples = &examples,
@@ -842,8 +921,8 @@ fn runAutodiff(
     defer publication.deinit();
 
     const bootstrap = gemma4_real.findFirstSupervisedExample(prepared.examples) orelse return error.NoTrainingData;
-    const is_multimodal = prepared.examples_with_images > 0 or prepared.examples_with_audio > 0;
-    const eval_is_multimodal = eval_prepared.examples_with_images > 0 or eval_prepared.examples_with_audio > 0;
+    const is_multimodal = finetune.preparedExamplesHaveMedia(prepared.examples);
+    const eval_is_multimodal = finetune.preparedExamplesHaveMedia(eval_prepared.examples);
     if ((is_multimodal or eval_is_multimodal) and opts.gguf_projector_path == null) return error.MissingGgufProjector;
     var maybe_projector_fingerprint: ?finetune.ProjectorFingerprint = null;
     defer if (maybe_projector_fingerprint) |*fp| finetune.freeProjectorFingerprint(allocator, fp);
@@ -1198,7 +1277,7 @@ fn runSurrogate(
     prepared: finetune.PreparedInputsSummary,
     opts: CliOptions,
 ) !void {
-    if (prepared.examples_with_images > 0 or prepared.examples_with_audio > 0) return error.MultimodalRequiresAutodiffTrainer;
+    if (finetune.preparedExamplesHaveMedia(prepared.examples)) return error.MultimodalRequiresAutodiffTrainer;
 
     const backend_ptr: ?*const ComputeBackend = null;
 

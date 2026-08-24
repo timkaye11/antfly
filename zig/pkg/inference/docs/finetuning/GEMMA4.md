@@ -121,21 +121,21 @@ Newly prepared artifacts use `gemma4_prepared/v4`. The current source records:
 
 Training recomputes those identities against the selected base, validates the
 adapter's recorded base/tokenizer/chat identities, and requires a separate eval
-artifact. It rejects exact overlap based on the prepared token arrays and media
-paths. This is useful integrity protection, but it is not yet proof of
-source-dataset disjointness: the format does not record canonical source-row,
-dataset/split, or media-content hashes. Preparing the same source row with
-different truncation or renamed media can therefore evade the overlap check.
-Do not use current before/after loss as a held-out quality gate without an
-external source-level split audit.
+artifact. Every prepared example carries a canonical source identity derived
+from its row id, source metadata, untruncated messages/tools, and ordered media
+contents. Train/eval overlap checks use that identity, so changing truncation or
+renaming an unchanged media file cannot bypass the held-out gate. The loader
+also recomputes every declared aggregate and derives text-versus-multimodal
+routing directly from the examples. Dataset and split provenance are not yet
+persisted, so release-quality reports still require an external audit of the
+declared source split.
 
 The provenance chain is not yet complete outside the primary training
 admission. Generic adapter save/load/materialize does not consistently preserve
 or validate these identities, teacher-target materialization does not bind its
 teacher model to the prepared base, and the final report does not yet hash every
-input and published payload. Prepared integrity also does not recompute every
-aggregate counter; media counters can still influence text-versus-multimodal
-routing. These are release blockers, not optional metadata improvements.
+input and published payload. These are release blockers, not optional metadata
+improvements.
 
 Sequence length is admitted before graph/backend construction and is currently
 bounded to `1..min(model_max_position_embeddings, 2048)`. The 2048 limit is a
@@ -144,9 +144,10 @@ the available device memory. Prepared JSON is still a single whole-buffer
 artifact with a 128 MiB load ceiling; streaming/sharded prepared data is an open
 production requirement.
 
-The pilot and recursive convenience workflows have not yet been migrated to
-the mandatory `--eval-prepared` contract. Use the explicit commands above (or
-an updated four-step recipe) until those call sites and their tests are fixed.
+The pilot and recursive convenience workflows prepare a separate held-out
+artifact and pass it through the mandatory `--eval-prepared` contract. Generated
+pilots create deterministic non-overlapping train/eval datasets. With a custom
+dataset, use an `eval` split or pass `--eval-dataset` and `--eval-split`.
 
 ## Target Presets
 
@@ -313,43 +314,38 @@ donation and is not a standalone causal-LM acceptance artifact.
 
 ## Production Roadmap and Release Gates
 
-1. **Restore one green product contract.** Migrate pilot/recursive workflows and
-   recipe tests to the mandatory train/eval artifacts, confirm the last
-   compile-time failure is resolved, and pass the focused Gemma4 Debug and
-   ReleaseSafe gates from a clean branch before adding more kernels.
-2. **Finish dataset and artifact identity.** Persist canonical source-row,
-   dataset/split, and media-content hashes; recompute every prepared aggregate;
-   bind teacher targets to their teacher/base identity; preserve provenance in
-   generic adapter saves; and record training/eval/config/adapter payload
+1. **Finish dataset and artifact identity.** Persist dataset/split provenance,
+   bind teacher targets to their teacher/base identity, preserve provenance in
+   generic adapter saves, and record training/eval/config/adapter payload
    digests in the immutable run report.
-3. **Make the supported boundary honest.** Reject multimodal examples before
+2. **Make the supported boundary honest.** Reject multimodal examples before
    publication/backend work until that lane is separately accepted. Size the
    eval graph from the selected `--eval-max-examples` slice, not the entire eval
    artifact, and gate every recorded strict-Metal promotion counter.
-4. **Complete artifact transactions.** Replace the direct trainer-saver rename,
+3. **Complete artifact transactions.** Replace the direct trainer-saver rename,
    make prepared data immutable and streaming/sharded, evaluate materialized
    output before publication, and add file/directory/parent fsync plus stale
    staging recovery and failure injection.
-5. **Implement durable Gemma4 checkpoint/resume.** The low-level Metal restore
+4. **Implement durable Gemma4 checkpoint/resume.** The low-level Metal restore
    now overwrites resident optimizer slots, but the CLI/recipe still need
    atomic adapter/optimizer/step/accumulation/epoch/cursor/RNG checkpoints. A
    real Metal interrupted-and-resumed trajectory must match uninterrupted
    training within declared tolerances.
-6. **Bound production-shape compute.** Add autodiff-capable fused/chunked Metal
+5. **Bound production-shape compute.** Add autodiff-capable fused/chunked Metal
    attention and fused sparse LM-head cross-entropy. Prove native parity and
    peak-memory bounds at the intended E2B/E4B sequence lengths.
-7. **Real E2B acceptance.** On a pinned BF16 artifact and disjoint, fingerprinted
+6. **Real E2B acceptance.** On a pinned BF16 artifact and disjoint, fingerprinted
    dataset, pass native-versus-Metal first-step loss/per-target-gradient/update
    parity, deterministic overfit, bounded multi-epoch training, resume, adapter
    reload, and held-out quality thresholds.
-8. **Real E4B acceptance.** Repeat the E2B gates at E4B scale with sequences and
+7. **Real E4B acceptance.** Repeat the E2B gates at E4B scale with sequences and
    target presets that exercise shared KV, PLE, and the larger
    adapter/optimizer footprint without fallback or unbounded growth.
-9. **Deployment and materialization.** Implement a streaming, dtype-preserving,
+8. **Deployment and materialization.** Implement a streaming, dtype-preserving,
    sharded writer; then apply accepted BF16-trained adapters to pinned E2B/E4B
    QAT Q4 serving artifacts and require fingerprint, exact-token, quality,
    memory, and repeated-generation gates.
-10. **Optional direct Q4/QLoRA training.** Only after the BF16 lane is accepted,
+9. **Optional direct Q4/QLoRA training.** Only after the BF16 lane is accepted,
     add packed-weight backward-input kernels and prove forward, gradient,
     optimizer, memory, and task-quality parity without host dequantization.
     Until then, direct training on GGUF remains unsupported.

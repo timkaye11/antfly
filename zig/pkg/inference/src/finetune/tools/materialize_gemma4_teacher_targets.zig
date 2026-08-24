@@ -56,7 +56,7 @@ pub fn main(init: std.process.Init) !void {
     var prepared = try finetune.loadPreparedInputsSummary(allocator, prepared_inputs_path);
     defer finetune.freePreparedInputsSummary(allocator, &prepared);
 
-    const has_multimodal = prepared.examples_with_images > 0 or prepared.examples_with_audio > 0;
+    const has_multimodal = finetune.preparedExamplesHaveMedia(prepared.examples);
     var maybe_projector_fingerprint: ?finetune.ProjectorFingerprint = null;
     defer if (maybe_projector_fingerprint) |*fp| finetune.freeProjectorFingerprint(allocator, fp);
     const summary = if (has_multimodal) blk: {

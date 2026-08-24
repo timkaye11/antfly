@@ -743,7 +743,7 @@ pub fn materializeTeacherTopKTargets(
     backend_kind: BackendKind,
     options: TeacherTopKOptions,
 ) !TeacherTopKSummary {
-    if (prepared.examples_with_images > 0 or prepared.examples_with_audio > 0) return error.MultimodalTeacherMaterializationNotYetSupported;
+    if (gemma4.preparedExamplesHaveMedia(prepared.examples)) return error.MultimodalTeacherMaterializationNotYetSupported;
     if (options.top_k == 0) return error.InvalidTeacherTopK;
     if (!std.math.isFinite(options.temperature) or options.temperature <= 0) return error.InvalidTeacherTemperature;
 
