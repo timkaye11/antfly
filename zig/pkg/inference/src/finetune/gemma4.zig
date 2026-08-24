@@ -72,6 +72,7 @@ pub const hf_config_file_name = "config.json";
 pub const adapter_config_file_name = "adapter_config.json";
 pub const adapter_manifest_file_name = "antfly_finetune_manifest.json";
 pub const adapter_manifest_schema_v2 = "antfly_gemma4_finetune/v2";
+pub const adapter_manifest_schema_v3 = "antfly_gemma4_finetune/v3";
 pub const adapter_tensor_key_format_v1 = "antfly_gemma4_adapter_keys/v1";
 pub const stock_peft_tensor_key_format_v1 = "stock-peft/v1";
 pub const peft_export_manifest_file_name = "antfly_peft_export.json";
@@ -79,12 +80,6 @@ pub const peft_export_manifest_schema_v1 = "antfly_gemma4_peft_export/v1";
 pub const tokenizer_config_file_name = "tokenizer_config.json";
 pub const tokenizer_file_name = "tokenizer.json";
 pub const special_tokens_map_file_name = "special_tokens_map.json";
-
-// The legacy merge implementation converts base tensors to f32 and builds a
-// complete output buffer. Keep it available for small diagnostic fixtures,
-// but fail closed before admitting production-sized or multi-file models.
-// E2B/E4B materialization must use the forthcoming streaming writer.
-pub const legacy_materialize_max_checkpoint_bytes: u64 = 64 * 1024 * 1024;
 
 pub const default_lora_target_modules = [_][]const u8{
     "q_proj",
@@ -355,6 +350,9 @@ pub const AdapterManifest = struct {
     use_dora: bool = false,
     use_rslora: bool = false,
     initializer: ?[]const u8 = null,
+    /// Seed for the deterministic adapter initializer. Version-2 manifests
+    /// predate this field; version-3 manifests must bind it explicitly.
+    initialization_seed: ?u64 = null,
     recursive_lora: ?recursive_lora.Config = null,
 };
 
@@ -403,6 +401,7 @@ pub const InspectionSummary = struct {
     fan_in_fan_out: ?bool = null,
     modules_to_save_count: usize = 0,
     init_lora_weights: ?[]const u8 = null,
+    initialization_seed: ?u64 = null,
     recursive_lora_enabled: bool = false,
     recursive_source_num_layers: ?usize = null,
     recursive_shared_block_size: ?usize = null,
@@ -460,6 +459,9 @@ pub const BootstrapOptions = struct {
     target_preset: ?peft.TargetPreset = null,
     use_dora: bool = false,
     init_lora_weights: ?[]const u8 = null,
+    /// Zero preserves the original deterministic initialization exactly.
+    /// Non-zero values produce independent, reproducible LoRA-A tensors.
+    initialization_seed: u64 = 0,
     eva_stats_path: ?[]const u8 = null,
     lora_ga_stats_path: ?[]const u8 = null,
     layer_name: ?[]const u8 = null,
@@ -481,6 +483,7 @@ pub const BootstrapSummary = struct {
     target_preset: ?[]const u8 = null,
     use_dora: bool = false,
     init_lora_weights: ?[]const u8 = null,
+    initialization_seed: u64 = 0,
     eva_stats_path: ?[]const u8 = null,
     lora_ga_stats_path: ?[]const u8 = null,
     resolved_tensors: []LoRATargetTensor,
@@ -568,6 +571,7 @@ pub const LoRABundleInspectionSummary = struct {
     target_preset: ?[]const u8 = null,
     use_dora: ?bool = null,
     init_lora_weights: ?[]const u8 = null,
+    initialization_seed: ?u64 = null,
     recursive_lora_enabled: bool = false,
     resolved_tensor_count: usize = 0,
     trainable_parameter_count: usize = 0,
@@ -612,6 +616,7 @@ pub const LoadedLoRABundle = struct {
     base_model_name_or_path: ?[]const u8 = null,
     lora_rank: usize,
     lora_alpha: f32,
+    initialization_seed: ?u64 = null,
     use_dora: bool = false,
     recursive_lora_enabled: bool = false,
     target_modules: []const []const u8,
@@ -761,10 +766,17 @@ pub fn inspectCheckpoint(allocator: std.mem.Allocator, input: []const u8) !Inspe
     const adapter_config = if (parsed_adapter) |*p| &p.value else null;
     const adapter_manifest = if (parsed_adapter_manifest) |*p| &p.value else null;
     if (adapter_manifest) |manifest| {
-        if (!std.mem.eql(u8, manifest.schema_version, adapter_manifest_schema_v2) or
+        const is_v2 = std.mem.eql(u8, manifest.schema_version, adapter_manifest_schema_v2);
+        const is_v3 = std.mem.eql(u8, manifest.schema_version, adapter_manifest_schema_v3);
+        if ((!is_v2 and !is_v3) or
             !std.mem.eql(u8, manifest.status, "complete") or
             !std.mem.eql(u8, manifest.artifact_family_version, artifact_family_version) or
             !std.mem.eql(u8, manifest.tensor_key_format, adapter_tensor_key_format_v1))
+        {
+            return error.InvalidAdapterManifest;
+        }
+        if ((is_v2 and manifest.initialization_seed != null) or
+            (is_v3 and manifest.initialization_seed == null))
         {
             return error.InvalidAdapterManifest;
         }
@@ -893,6 +905,7 @@ pub fn inspectCheckpoint(allocator: std.mem.Allocator, input: []const u8) !Inspe
             try dupeOptionalString(allocator, try adapterInitializerName(ac.init_lora_weights))
         else
             null,
+        .initialization_seed = if (adapter_manifest) |manifest| manifest.initialization_seed else null,
         .recursive_lora_enabled = if (recursive_config) |rc| rc.enabled else false,
         .recursive_source_num_layers = if (recursive_config) |rc| if (rc.enabled) rc.source_num_layers else null else null,
         .recursive_shared_block_size = if (recursive_config) |rc| if (rc.enabled) rc.shared_block_size else null else null,
@@ -1024,7 +1037,7 @@ pub fn bootstrapLoRABundle(
     var provenance = try fingerprintGemma4Model(allocator, inspect.model_dir);
     defer provenance.deinit(allocator);
 
-    try writeBootstrapAdapterCheckpointAtomic(allocator, staging_adapter_checkpoint_path, checkpoint_path, resolved_tensors, options.rank, options.use_dora, options.init_lora_weights, options.eva_stats_path, options.lora_ga_stats_path, recursive_config);
+    try writeBootstrapAdapterCheckpointAtomic(allocator, staging_adapter_checkpoint_path, checkpoint_path, resolved_tensors, options.rank, options.use_dora, options.init_lora_weights, options.initialization_seed, options.eva_stats_path, options.lora_ga_stats_path, recursive_config);
     const adapter_write_options = AdapterConfigWriteOptions{
         .base_model_name_or_path = base_model_name_or_path,
         .base_model_sha256 = provenance.base_model_sha256,
@@ -1036,6 +1049,7 @@ pub fn bootstrapLoRABundle(
         .target_preset = persisted_target_preset,
         .use_dora = options.use_dora,
         .init_lora_weights = options.init_lora_weights,
+        .initialization_seed = options.initialization_seed,
         .recursive_lora = recursive_config,
     };
     try writeAdapterConfigJson(allocator, staging_adapter_config_path, adapter_write_options);
@@ -1084,6 +1098,7 @@ pub fn bootstrapLoRABundle(
         .target_preset = summary_target_preset,
         .use_dora = options.use_dora,
         .init_lora_weights = summary_init,
+        .initialization_seed = options.initialization_seed,
         .eva_stats_path = summary_eva,
         .lora_ga_stats_path = summary_lora_ga,
         .resolved_tensors = resolved_tensors,
@@ -1706,6 +1721,7 @@ pub fn inspectLoRABundle(
         .target_preset = try dupeOptionalString(allocator, adapter_inspect.target_preset),
         .use_dora = adapter_inspect.use_dora,
         .init_lora_weights = try dupeOptionalString(allocator, adapter_inspect.init_lora_weights),
+        .initialization_seed = adapter_inspect.initialization_seed,
         .recursive_lora_enabled = adapter_inspect.recursive_lora_enabled,
         .resolved_tensor_count = tensors.items.len,
         .trainable_parameter_count = trainable_parameter_count,
@@ -1986,6 +2002,7 @@ pub fn loadLoRABundleScoped(
         .base_model_name_or_path = try dupeOptionalString(allocator, inspected.base_model_name_or_path),
         .lora_rank = inspected.lora_rank.?,
         .lora_alpha = @floatCast(inspected.lora_alpha.?),
+        .initialization_seed = inspected.initialization_seed,
         .use_dora = inspected.use_dora orelse false,
         .recursive_lora_enabled = inspected.recursive_lora_enabled,
         .target_modules = if (layer_name != null)
@@ -2126,6 +2143,7 @@ fn writeLoRABundleContents(bundle: *const LoadedLoRABundle, out_dir: []const u8)
         .alpha = bundle.lora_alpha,
         .target_modules = bundle.target_modules,
         .use_dora = bundle.use_dora,
+        .initialization_seed = bundle.initialization_seed,
     };
     try writeAdapterConfigJson(allocator, adapter_config_path, write_options);
     try writeAdapterManifestJson(allocator, adapter_manifest_path, write_options);
@@ -2140,65 +2158,43 @@ pub fn materializeMergedModel(
     var base_paths = try resolveArtifactPaths(allocator, base_model_dir);
     defer base_paths.deinit();
     const base_checkpoint_path = base_paths.checkpoint_path orelse base_paths.gguf_path orelse return error.MissingMergedCheckpoint;
-    const source_checkpoint_bytes = try c_file.fileSize(allocator, base_checkpoint_path);
-    try validateLegacyMaterializationSource(base_checkpoint_path, source_checkpoint_bytes);
+    try validateMaterializationSource(base_checkpoint_path);
 
-    var bundle = try loadLoRABundle(allocator, base_model_dir, adapter_model_dir);
-    defer bundle.deinit();
+    var inspected = try inspectLoRABundle(allocator, base_model_dir, adapter_model_dir);
+    defer freeLoRABundleInspectionSummary(allocator, &inspected);
+    try validateGenericLoRABundleInspection(inspected);
 
     var publication = try artifact_publication.ImmutableDirectoryPublication.init(allocator, compat.io(), out_dir);
     defer publication.deinit();
     var base_access = try openTensorAccessForFile(allocator, base_checkpoint_path);
     defer base_access.deinit();
+    var adapter_access = try openTensorAccessForFile(allocator, inspected.adapter_checkpoint_path);
+    defer adapter_access.deinit();
     const base_names = try base_access.listNames(allocator);
     defer allocator.free(base_names);
 
-    var merged = std.StringArrayHashMapUnmanaged(Tensor){};
-    defer {
-        var it = merged.iterator();
-        while (it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit();
-        }
-        merged.deinit(allocator);
-    }
-
-    var merged_dora_tensor_count: usize = 0;
-    for (bundle.layers) |layer| {
-        const merged_weight = try allocator.alloc(f32, layer.base_weight.len);
-        defer allocator.free(merged_weight);
-        const base_matrix = lora.Matrix{ .rows = layer.input_dim, .cols = layer.output_dim, .data = layer.base_weight };
-        const adapter_a = lora.Matrix{ .rows = layer.input_dim, .cols = layer.rank, .data = layer.adapter_a };
-        const adapter_b = lora.Matrix{ .rows = layer.rank, .cols = layer.output_dim, .data = layer.adapter_b };
-        if (layer.dora_magnitude) |magnitude| {
-            lora.doraMergeInto(.{
-                .base = base_matrix,
-                .adapter_a = adapter_a,
-                .adapter_b = adapter_b,
-                .magnitude = magnitude,
-                .alpha = bundle.lora_alpha,
-            }, merged_weight);
-            merged_dora_tensor_count += 1;
-        } else {
-            lora.mergeInto(base_matrix, adapter_a, adapter_b, bundle.lora_alpha, merged_weight);
-        }
-
-        const hf_weight = try allocator.alloc(f32, merged_weight.len);
-        defer allocator.free(hf_weight);
-        transpose2DF32(hf_weight, merged_weight, layer.input_dim, layer.output_dim);
-
-        const source_base_tensor_name = sourceTensorNameForCanonicalAdapterBase(base_names, layer.base_tensor_name) orelse return error.MissingBaseTensorForAdapter;
-        const shape = [_]i64{ @as(i64, @intCast(layer.output_dim)), @as(i64, @intCast(layer.input_dim)) };
-        const tensor = try Tensor.initFloat32(allocator, source_base_tensor_name, &shape, hf_weight);
-        try merged.put(allocator, try allocator.dupe(u8, source_base_tensor_name), tensor);
+    var materialized_targets = std.StringHashMapUnmanaged(usize).empty;
+    defer materialized_targets.deinit(allocator);
+    for (inspected.tensors, 0..) |tensor, index| {
+        const source_name = sourceTensorNameForCanonicalAdapterBase(base_names, tensor.base_tensor_name) orelse
+            return error.MissingBaseTensorForAdapter;
+        const result = try materialized_targets.getOrPut(allocator, source_name);
+        if (result.found_existing) return error.DuplicateAdapterTargetTensor;
+        result.value_ptr.* = index;
     }
 
     try publication.createStaging();
     const staging_checkpoint_path = try std.fs.path.join(allocator, &.{ publication.staging_dir, checkpoint_file_name });
     defer allocator.free(staging_checkpoint_path);
-    const bytes = try buildMergedSafetensorsFile(allocator, base_access, base_names, &merged);
-    defer allocator.free(bytes);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = staging_checkpoint_path, .data = bytes });
+    try writeStreamingMergedSafetensors(
+        allocator,
+        base_access,
+        adapter_access,
+        base_names,
+        &materialized_targets,
+        inspected,
+        staging_checkpoint_path,
+    );
 
     try copySupportingArtifactIfPresent(allocator, base_paths.config_path, publication.staging_dir, hf_config_file_name);
     try copySupportingArtifactIfPresent(allocator, base_paths.tokenizer_config_path, publication.staging_dir, tokenizer_config_file_name);
@@ -2211,16 +2207,11 @@ pub fn materializeMergedModel(
     try copySupportingArtifactIfPresent(allocator, adapter_paths.tokenizer_path, publication.staging_dir, tokenizer_file_name);
     try copySupportingArtifactIfPresent(allocator, adapter_paths.special_tokens_map_path, publication.staging_dir, special_tokens_map_file_name);
 
-    var copied_base_tensor_count: usize = 0;
-    for (base_names) |name| {
-        if (!merged.contains(name)) copied_base_tensor_count += 1;
-    }
-
     const summary_artifact_family = try allocator.dupe(u8, artifact_family_version);
     errdefer allocator.free(summary_artifact_family);
-    const summary_base_model_dir = try allocator.dupe(u8, bundle.base_model_dir);
+    const summary_base_model_dir = try allocator.dupe(u8, inspected.base_model_dir);
     errdefer allocator.free(summary_base_model_dir);
-    const summary_adapter_model_dir = try allocator.dupe(u8, bundle.adapter_model_dir);
+    const summary_adapter_model_dir = try allocator.dupe(u8, inspected.adapter_model_dir);
     errdefer allocator.free(summary_adapter_model_dir);
     const summary_output_dir = try allocator.dupe(u8, out_dir);
     errdefer allocator.free(summary_output_dir);
@@ -2234,17 +2225,275 @@ pub fn materializeMergedModel(
         .adapter_model_dir = summary_adapter_model_dir,
         .output_dir = summary_output_dir,
         .output_checkpoint_path = published_checkpoint_path,
-        .merged_lora_tensor_count = bundle.layers.len,
-        .merged_dora_tensor_count = merged_dora_tensor_count,
-        .copied_base_tensor_count = copied_base_tensor_count,
+        .merged_lora_tensor_count = inspected.tensors.len,
+        .merged_dora_tensor_count = inspected.dora_magnitude_tensor_count,
+        .copied_base_tensor_count = base_names.len - inspected.tensors.len,
     };
 }
 
-fn validateLegacyMaterializationSource(checkpoint_path: []const u8, checkpoint_bytes: u64) !void {
+fn writeStreamingMergedSafetensors(
+    allocator: std.mem.Allocator,
+    base_access: tensor_access.TensorAccess,
+    adapter_access: tensor_access.TensorAccess,
+    base_names: [][]const u8,
+    materialized_targets: *const std.StringHashMapUnmanaged(usize),
+    inspected: LoRABundleInspectionSummary,
+    output_path: []const u8,
+) !void {
+    const ordered_names = try allocator.dupe([]const u8, base_names);
+    defer allocator.free(ordered_names);
+    std.mem.sort([]const u8, ordered_names, {}, struct {
+        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+            return std.mem.lessThan(u8, lhs, rhs);
+        }
+    }.lessThan);
+
+    var header: std.Io.Writer.Allocating = .init(allocator);
+    defer header.deinit();
+    const writer = &header.writer;
+    try writer.writeAll("{\"__metadata__\":{\"format\":\"antfly-gemma4-lora-merged\"}");
+    var offset: u64 = 0;
+    for (ordered_names) |name| {
+        var record = try base_access.getRecord(allocator, name);
+        defer record.deinit();
+        const dtype = switch (record.descriptor.encoding) {
+            .dense => |value| value,
+            .gguf => return error.Gemma4GgufMaterializationUnsupported,
+        };
+        if (materialized_targets.contains(name) and
+            dtype != .f32 and dtype != .f16 and dtype != .bf16)
+        {
+            return error.UnsupportedMaterializedTensorType;
+        }
+        try writer.writeByte(',');
+        try writeSafetensorsJsonString(writer, name);
+        try writer.print(":{{\"dtype\":\"{s}\",\"shape\":[", .{dtypeName(dtype)});
+        for (record.descriptor.shape, 0..) |dim, dim_index| {
+            if (dim_index != 0) try writer.writeByte(',');
+            try writer.print("{d}", .{dim});
+        }
+        const end = std.math.add(u64, offset, @intCast(record.descriptor.byte_len)) catch
+            return error.MaterializedCheckpointTooLarge;
+        try writer.print("],\"data_offsets\":[{d},{d}]}}", .{ offset, end });
+        offset = end;
+    }
+    try writer.writeByte('}');
+    while (header.written().len % 8 != 0) try writer.writeByte(' ');
+
+    const io = compat.io();
+    var file = try compat.cwd().createFile(io, output_path, .{ .truncate = true });
+    defer file.close(io);
+    var length_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &length_bytes, header.written().len, .little);
+    try file.writeStreamingAll(io, &length_bytes);
+    try file.writeStreamingAll(io, header.written());
+
+    const alpha: f32 = @floatCast(inspected.lora_alpha orelse return error.MissingAdapterConfig);
+    for (ordered_names) |name| {
+        var record = try base_access.getRecord(allocator, name);
+        defer record.deinit();
+        if (materialized_targets.get(name)) |target_index| {
+            const dtype = switch (record.descriptor.encoding) {
+                .dense => |value| value,
+                .gguf => return error.Gemma4GgufMaterializationUnsupported,
+            };
+            try writeMergedLoRATensor(
+                allocator,
+                io,
+                &file,
+                base_access,
+                adapter_access,
+                inspected.tensors[target_index],
+                name,
+                dtype,
+                alpha,
+            );
+        } else {
+            if (record.raw_bytes.len != record.descriptor.byte_len) return error.InvalidTensorByteLength;
+            try writeFileBytesChunked(io, &file, record.raw_bytes);
+        }
+    }
+    try validateStreamingMaterializedCheckpoint(
+        allocator,
+        base_access,
+        ordered_names,
+        materialized_targets,
+        output_path,
+    );
+}
+
+fn writeMergedLoRATensor(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    file: *std.Io.File,
+    base_access: tensor_access.TensorAccess,
+    adapter_access: tensor_access.TensorAccess,
+    target: LoRATensorSummary,
+    source_base_tensor_name: []const u8,
+    output_dtype: DType,
+    alpha: f32,
+) !void {
+    var base_tensor = try loadTensorAsF32(allocator, base_access, source_base_tensor_name);
+    defer base_tensor.deinit();
+    var a_tensor = try loadTensorAsF32(allocator, adapter_access, target.adapter_a_tensor_name);
+    defer a_tensor.deinit();
+    var b_tensor = try loadTensorAsF32(allocator, adapter_access, target.adapter_b_tensor_name);
+    defer b_tensor.deinit();
+    if (base_tensor.shape.len != 2 or
+        base_tensor.shape[0] != @as(i64, @intCast(target.output_dim)) or
+        base_tensor.shape[1] != @as(i64, @intCast(target.input_dim)))
+    {
+        return error.InvalidAdapterTensorShape;
+    }
+
+    const base_weight = try allocator.alloc(f32, target.input_dim * target.output_dim);
+    defer allocator.free(base_weight);
+    transpose2DF32(base_weight, base_tensor.asFloat32(), target.output_dim, target.input_dim);
+    const adapter_a = try allocator.alloc(f32, target.input_dim * target.rank);
+    defer allocator.free(adapter_a);
+    transpose2DF32(adapter_a, a_tensor.asFloat32(), target.rank, target.input_dim);
+    const adapter_b = try allocator.alloc(f32, target.rank * target.output_dim);
+    defer allocator.free(adapter_b);
+    transpose2DF32(adapter_b, b_tensor.asFloat32(), target.output_dim, target.rank);
+
+    var magnitude_tensor: ?Tensor = if (target.dora_magnitude_tensor_name) |name|
+        try loadTensorAsF32(allocator, adapter_access, name)
+    else
+        null;
+    defer if (magnitude_tensor) |*tensor| tensor.deinit();
+    const merged_weight = try allocator.alloc(f32, base_weight.len);
+    defer allocator.free(merged_weight);
+    const base_matrix = lora.Matrix{ .rows = target.input_dim, .cols = target.output_dim, .data = base_weight };
+    const a_matrix = lora.Matrix{ .rows = target.input_dim, .cols = target.rank, .data = adapter_a };
+    const b_matrix = lora.Matrix{ .rows = target.rank, .cols = target.output_dim, .data = adapter_b };
+    if (magnitude_tensor) |*magnitude| {
+        if (magnitude.shape.len != 1 or magnitude.shape[0] != @as(i64, @intCast(target.output_dim))) {
+            return error.InvalidAdapterTensorShape;
+        }
+        lora.doraMergeInto(.{
+            .base = base_matrix,
+            .adapter_a = a_matrix,
+            .adapter_b = b_matrix,
+            .magnitude = magnitude.asFloat32(),
+            .alpha = alpha,
+        }, merged_weight);
+    } else {
+        lora.mergeInto(base_matrix, a_matrix, b_matrix, alpha, merged_weight);
+    }
+
+    const hf_weight = try allocator.alloc(f32, merged_weight.len);
+    defer allocator.free(hf_weight);
+    transpose2DF32(hf_weight, merged_weight, target.input_dim, target.output_dim);
+    try writeF32ValuesAsDType(allocator, io, file, hf_weight, output_dtype);
+}
+
+fn writeF32ValuesAsDType(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    file: *std.Io.File,
+    values: []const f32,
+    dtype: DType,
+) !void {
+    if (dtype != .f32 and dtype != .f16 and dtype != .bf16) return error.UnsupportedMaterializedTensorType;
+    const element_bytes = dtype.byteSize();
+    const chunk_elements = @max(@as(usize, 1), (1024 * 1024) / element_bytes);
+    const buffer = try allocator.alloc(u8, chunk_elements * element_bytes);
+    defer allocator.free(buffer);
+    var start: usize = 0;
+    while (start < values.len) {
+        const end = @min(start + chunk_elements, values.len);
+        for (values[start..end], 0..) |value, index| {
+            if (!std.math.isFinite(value)) return error.NonFiniteMaterializedTensor;
+            const byte_offset = index * element_bytes;
+            switch (dtype) {
+                .f32 => std.mem.writeInt(u32, buffer[byte_offset..][0..4], @bitCast(value), .little),
+                .f16 => {
+                    const half: f16 = @floatCast(value);
+                    if (!std.math.isFinite(half)) return error.MaterializedTensorDtypeOverflow;
+                    std.mem.writeInt(u16, buffer[byte_offset..][0..2], @bitCast(half), .little);
+                },
+                .bf16 => std.mem.writeInt(u16, buffer[byte_offset..][0..2], roundF32ToBf16Bits(value), .little),
+                else => unreachable,
+            }
+        }
+        try file.writeStreamingAll(io, buffer[0 .. (end - start) * element_bytes]);
+        start = end;
+    }
+}
+
+fn roundF32ToBf16Bits(value: f32) u16 {
+    const bits: u32 = @bitCast(value);
+    const rounding_bias: u32 = 0x7fff + ((bits >> 16) & 1);
+    return @intCast((bits +% rounding_bias) >> 16);
+}
+
+fn validateStreamingMaterializedCheckpoint(
+    allocator: std.mem.Allocator,
+    base_access: tensor_access.TensorAccess,
+    ordered_names: []const []const u8,
+    materialized_targets: *const std.StringHashMapUnmanaged(usize),
+    output_path: []const u8,
+) !void {
+    var output_access = try openTensorAccessForFile(allocator, output_path);
+    defer output_access.deinit();
+    const output_names = try output_access.listNames(allocator);
+    defer allocator.free(output_names);
+    if (output_names.len != ordered_names.len) return error.MaterializedTensorInventoryMismatch;
+    for (ordered_names) |name| {
+        var source = try base_access.getRecord(allocator, name);
+        defer source.deinit();
+        var output = output_access.getRecord(allocator, name) catch return error.MaterializedTensorInventoryMismatch;
+        defer output.deinit();
+        if (!std.mem.eql(i64, source.descriptor.shape, output.descriptor.shape) or
+            source.descriptor.byte_len != output.descriptor.byte_len or
+            denseRecordDType(source.descriptor.encoding) != denseRecordDType(output.descriptor.encoding))
+        {
+            return error.MaterializedTensorMetadataMismatch;
+        }
+        if (materialized_targets.contains(name)) {
+            try validateFiniteMaterializedTensor(output);
+        } else if (!std.mem.eql(u8, source.raw_bytes, output.raw_bytes)) {
+            return error.MaterializedUntouchedTensorMismatch;
+        }
+    }
+}
+
+fn validateFiniteMaterializedTensor(record: tensor_access.Record) !void {
+    const dtype = denseRecordDType(record.descriptor.encoding) orelse return error.UnsupportedMaterializedTensorType;
+    if (dtype != .f32 and dtype != .f16 and dtype != .bf16) return error.UnsupportedMaterializedTensorType;
+    if (record.raw_bytes.len % dtype.byteSize() != 0) return error.InvalidTensorByteLength;
+    var offset: usize = 0;
+    while (offset < record.raw_bytes.len) : (offset += dtype.byteSize()) {
+        const value: f32 = switch (dtype) {
+            .f32 => @bitCast(std.mem.readInt(u32, record.raw_bytes[offset..][0..4], .little)),
+            .f16 => @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, record.raw_bytes[offset..][0..2], .little)))),
+            .bf16 => @bitCast(@as(u32, std.mem.readInt(u16, record.raw_bytes[offset..][0..2], .little)) << 16),
+            else => unreachable,
+        };
+        if (!std.math.isFinite(value)) return error.NonFiniteMaterializedTensor;
+    }
+}
+
+fn writeSafetensorsJsonString(writer: *std.Io.Writer, value: []const u8) !void {
+    try writer.writeByte('"');
+    for (value) |byte| switch (byte) {
+        '"' => try writer.writeAll("\\\""),
+        '\\' => try writer.writeAll("\\\\"),
+        '\n' => try writer.writeAll("\\n"),
+        '\r' => try writer.writeAll("\\r"),
+        '\t' => try writer.writeAll("\\t"),
+        else => try writer.writeByte(byte),
+    };
+    try writer.writeByte('"');
+}
+
+fn validateMaterializationSource(checkpoint_path: []const u8) !void {
     if (std.mem.endsWith(u8, checkpoint_path, ".gguf")) return error.Gemma4GgufMaterializationUnsupported;
-    if (std.mem.endsWith(u8, checkpoint_path, ".safetensors.index.json")) return error.Gemma4MaterializationRequiresStreaming;
-    if (!std.mem.endsWith(u8, checkpoint_path, ".safetensors")) return error.UnsupportedMaterializationSource;
-    if (checkpoint_bytes > legacy_materialize_max_checkpoint_bytes) return error.Gemma4MaterializationRequiresStreaming;
+    if (!std.mem.endsWith(u8, checkpoint_path, ".safetensors") and
+        !std.mem.endsWith(u8, checkpoint_path, ".safetensors.index.json"))
+    {
+        return error.UnsupportedMaterializationSource;
+    }
 }
 
 pub fn freeMaterializeSummary(allocator: std.mem.Allocator, summary: *MaterializeSummary) void {
@@ -5612,6 +5861,34 @@ fn writeBootstrapAdapterCheckpoint(
     lora_ga_stats_path: ?[]const u8,
     recursive_config: recursive_lora.Config,
 ) !void {
+    return writeBootstrapAdapterCheckpointSeeded(
+        allocator,
+        output_path,
+        base_checkpoint_path,
+        resolved_tensors,
+        rank,
+        use_dora,
+        init_lora_weights,
+        0,
+        eva_stats_path,
+        lora_ga_stats_path,
+        recursive_config,
+    );
+}
+
+fn writeBootstrapAdapterCheckpointSeeded(
+    allocator: std.mem.Allocator,
+    output_path: []const u8,
+    base_checkpoint_path: []const u8,
+    resolved_tensors: []const LoRATargetTensor,
+    rank: usize,
+    use_dora: bool,
+    init_lora_weights: ?[]const u8,
+    initialization_seed: u64,
+    eva_stats_path: ?[]const u8,
+    lora_ga_stats_path: ?[]const u8,
+    recursive_config: recursive_lora.Config,
+) !void {
     const init_kind = try parseLoRAInitKind(init_lora_weights);
     const loop_count = if (recursive_config.enabled) recursive_config.loop_count else 1;
     const tensors_per_target: usize = (2 * loop_count) + if (use_dora) @as(usize, 1) else 0;
@@ -5689,7 +5966,7 @@ fn writeBootstrapAdapterCheckpoint(
         }
         defer if (lora_ga_stats_tensor) |*tensor| tensor.deinit();
 
-        const init = try buildInitialLoRAFactors(
+        const init = try buildInitialLoRAFactorsSeeded(
             allocator,
             init_kind,
             if (base_tensor) |tensor| tensor.asFloat32() else null,
@@ -5698,6 +5975,7 @@ fn writeBootstrapAdapterCheckpoint(
             target.output_dim,
             target.input_dim,
             rank,
+            deriveLoRAInitializationSeed(initialization_seed, target.tensor_name),
         );
         const a_data = init.a;
         const b_data = init.b;
@@ -5756,6 +6034,7 @@ fn writeBootstrapAdapterCheckpointAtomic(
     rank: usize,
     use_dora: bool,
     init_lora_weights: ?[]const u8,
+    initialization_seed: u64,
     eva_stats_path: ?[]const u8,
     lora_ga_stats_path: ?[]const u8,
     recursive_config: recursive_lora.Config,
@@ -5765,7 +6044,7 @@ fn writeBootstrapAdapterCheckpointAtomic(
     compat.cwd().deleteFile(compat.io(), tmp_path) catch {};
     errdefer compat.cwd().deleteFile(compat.io(), tmp_path) catch {};
 
-    try writeBootstrapAdapterCheckpoint(
+    try writeBootstrapAdapterCheckpointSeeded(
         allocator,
         tmp_path,
         base_checkpoint_path,
@@ -5773,6 +6052,7 @@ fn writeBootstrapAdapterCheckpointAtomic(
         rank,
         use_dora,
         init_lora_weights,
+        initialization_seed,
         eva_stats_path,
         lora_ga_stats_path,
         recursive_config,
@@ -5818,10 +6098,34 @@ fn buildInitialLoRAFactors(
     input_dim: usize,
     rank: usize,
 ) !InitialLoRAFactors {
+    return buildInitialLoRAFactorsSeeded(
+        allocator,
+        init_kind,
+        base_weight,
+        eva_activation_covariance,
+        lora_ga_gradient,
+        output_dim,
+        input_dim,
+        rank,
+        0,
+    );
+}
+
+fn buildInitialLoRAFactorsSeeded(
+    allocator: std.mem.Allocator,
+    init_kind: LoRAInitKind,
+    base_weight: ?[]const f32,
+    eva_activation_covariance: ?[]const f32,
+    lora_ga_gradient: ?[]const f32,
+    output_dim: usize,
+    input_dim: usize,
+    rank: usize,
+    initialization_seed: u64,
+) !InitialLoRAFactors {
     switch (init_kind) {
         .default => {
             return .{
-                .a = try buildDeterministicLoraA(allocator, rank, input_dim),
+                .a = try buildDeterministicLoraA(allocator, rank, input_dim, initialization_seed),
                 .b = try buildZeroF32(allocator, output_dim * rank),
             };
         },
@@ -5973,6 +6277,7 @@ pub const AdapterConfigWriteOptions = struct {
     target_preset: ?[]const u8 = null,
     use_dora: bool = false,
     init_lora_weights: ?[]const u8 = null,
+    initialization_seed: ?u64 = null,
     recursive_lora: recursive_lora.Config = .{},
 };
 
@@ -6026,7 +6331,10 @@ pub fn writeAdapterManifestJson(
     var buffer: std.Io.Writer.Allocating = .init(allocator);
     defer buffer.deinit();
     try std.json.Stringify.value(AdapterManifest{
-        .schema_version = adapter_manifest_schema_v2,
+        .schema_version = if (options.initialization_seed == null)
+            adapter_manifest_schema_v2
+        else
+            adapter_manifest_schema_v3,
         .status = "complete",
         .artifact_family_version = artifact_family_version,
         .tensor_key_format = adapter_tensor_key_format_v1,
@@ -6043,6 +6351,7 @@ pub fn writeAdapterManifestJson(
         .use_dora = options.use_dora,
         .use_rslora = false,
         .initializer = options.init_lora_weights,
+        .initialization_seed = options.initialization_seed,
         .recursive_lora = if (options.recursive_lora.enabled) options.recursive_lora else null,
     }, .{ .whitespace = .indent_2 }, &buffer.writer);
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = buffer.written() });
@@ -6188,74 +6497,6 @@ fn loadInitializerStatsTensor(
     return error.MissingInitializerStats;
 }
 
-fn buildMergedSafetensorsFile(
-    allocator: std.mem.Allocator,
-    base_access: tensor_access.TensorAccess,
-    base_names: [][]const u8,
-    merged: *const std.StringArrayHashMapUnmanaged(Tensor),
-) ![]u8 {
-    var ordered_names = try allocator.alloc([]const u8, base_names.len + merged.count());
-    defer allocator.free(ordered_names);
-    var count: usize = 0;
-    for (base_names) |name| {
-        ordered_names[count] = name;
-        count += 1;
-    }
-    var it_merged = merged.iterator();
-    while (it_merged.next()) |entry| {
-        if (!stringSliceContains(base_names, entry.key_ptr.*)) {
-            ordered_names[count] = entry.key_ptr.*;
-            count += 1;
-        }
-    }
-    std.mem.sort([]const u8, ordered_names[0..count], {}, struct {
-        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
-            return std.mem.lessThan(u8, lhs, rhs);
-        }
-    }.lessThan);
-
-    var header_buf: std.Io.Writer.Allocating = .init(allocator);
-    defer header_buf.deinit();
-    try header_buf.writer.writeByte('{');
-    var data_parts = std.ArrayListUnmanaged([]const u8).empty;
-    defer data_parts.deinit(allocator);
-    var owned_records = std.ArrayListUnmanaged(Tensor).empty;
-    defer {
-        for (owned_records.items) |*tensor| tensor.deinit();
-        owned_records.deinit(allocator);
-    }
-    var offset: u64 = 0;
-    for (ordered_names[0..count], 0..) |name, idx| {
-        var tensor: Tensor = undefined;
-        if (merged.get(name)) |existing| {
-            tensor = existing;
-        } else {
-            tensor = try loadTensorAsF32(allocator, base_access, name);
-            try owned_records.append(allocator, tensor);
-        }
-        const byte_len = tensor.data.len;
-        if (idx != 0) try header_buf.writer.writeByte(',');
-        try header_buf.writer.print("\"{s}\":{{\"dtype\":\"{s}\",\"shape\":[", .{ name, dtypeName(tensor.dtype) });
-        for (tensor.shape, 0..) |dim, dim_idx| {
-            if (dim_idx != 0) try header_buf.writer.writeByte(',');
-            try header_buf.writer.print("{}", .{dim});
-        }
-        try header_buf.writer.print("],\"data_offsets\":[{},{}]}}", .{ offset, offset + byte_len });
-        try data_parts.append(allocator, tensor.data);
-        offset += byte_len;
-    }
-    try header_buf.writer.writeByte('}');
-
-    var file = std.ArrayListUnmanaged(u8).empty;
-    errdefer file.deinit(allocator);
-    var len_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &len_buf, header_buf.written().len, .little);
-    try file.appendSlice(allocator, &len_buf);
-    try file.appendSlice(allocator, header_buf.written());
-    for (data_parts.items) |part| try file.appendSlice(allocator, part);
-    return try file.toOwnedSlice(allocator);
-}
-
 fn dtypeName(dtype: DType) []const u8 {
     return switch (dtype) {
         .f32 => "F32",
@@ -6305,13 +6546,38 @@ fn transpose2DF32(out: []f32, input: []const f32, rows: usize, cols: usize) void
     }
 }
 
-fn buildDeterministicLoraA(allocator: std.mem.Allocator, rows: usize, cols: usize) ![]f32 {
+fn deriveLoRAInitializationSeed(seed: u64, tensor_name: []const u8) u64 {
+    if (seed == 0) return 0;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var seed_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &seed_bytes, seed, .little);
+    hasher.update(&seed_bytes);
+    hasher.update(tensor_name);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return std.mem.readInt(u64, digest[0..8], .little);
+}
+
+fn splitMix64(value: u64) u64 {
+    var z = value +% 0x9e37_79b9_7f4a_7c15;
+    z = (z ^ (z >> 30)) *% 0xbf58_476d_1ce4_e5b9;
+    z = (z ^ (z >> 27)) *% 0x94d0_49bb_1331_11eb;
+    return z ^ (z >> 31);
+}
+
+fn buildDeterministicLoraA(allocator: std.mem.Allocator, rows: usize, cols: usize, initialization_seed: u64) ![]f32 {
     const data = try allocator.alloc(f32, rows * cols);
     for (0..rows) |row| {
         for (0..cols) |col| {
             const idx = row * cols + col;
-            const angle: f32 = @floatFromInt((row + 1) * (col + 3));
-            data[idx] = @sin(angle * 0.013) * 0.01;
+            if (initialization_seed == 0) {
+                const angle: f32 = @floatFromInt((row + 1) * (col + 3));
+                data[idx] = @sin(angle * 0.013) * 0.01;
+            } else {
+                const mixed = splitMix64(initialization_seed +% @as(u64, @intCast(idx)));
+                const unit = @as(f32, @floatFromInt(mixed >> 40)) / 16_777_215.0;
+                data[idx] = (unit * 2.0 - 1.0) * 0.01;
+            }
         }
     }
     return data;
@@ -6811,7 +7077,7 @@ test "gemma4 PEFT export preserves payloads and publishes stock tensor keys" {
     );
 }
 
-test "gemma4 sharded safetensors bootstrap succeeds and legacy materialize fails closed" {
+test "gemma4 sharded safetensors bootstrap and streaming materialization preserve dtypes" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gemma4_sharded_lifecycle_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
@@ -6824,12 +7090,20 @@ test "gemma4 sharded safetensors bootstrap succeeds and legacy materialize fails
     defer allocator.free(shard_a_path);
     const shard_b_path = try std.fs.path.join(allocator, &.{ root, "model-00002-of-00002.safetensors" });
     defer allocator.free(shard_b_path);
-    const q_values = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const q_values = [_]u16{
+        roundF32ToBf16Bits(1),
+        roundF32ToBf16Bits(2),
+        roundF32ToBf16Bits(3),
+        roundF32ToBf16Bits(4),
+        roundF32ToBf16Bits(5),
+        roundF32ToBf16Bits(6),
+    };
     const norm_values = [_]f32{ 7, 8 };
-    try writeHeaderAndTensorsF32(allocator, shard_a_path, &.{.{
+    try writeHeaderAndRawTensors(allocator, shard_a_path, &.{.{
         .name = "model.layers.0.self_attn.q_proj.weight",
         .shape = &.{ 2, 3 },
-        .data = &q_values,
+        .dtype = .bf16,
+        .raw_bytes = std.mem.asBytes(&q_values),
     }});
     try writeHeaderAndTensorsF32(allocator, shard_b_path, &.{.{
         .name = "model.layers.0.input_layernorm.weight",
@@ -6864,13 +7138,41 @@ test "gemma4 sharded safetensors bootstrap succeeds and legacy materialize fails
     try std.testing.expectEqual(@as(usize, 1), bootstrap.resolved_tensors.len);
     try std.testing.expectEqualStrings(index_path, bootstrap.checkpoint_path);
 
+    const trained_adapter_dir = try std.fs.path.join(allocator, &.{ root, "trained-adapter" });
+    defer allocator.free(trained_adapter_dir);
+    var trained_bundle = try loadLoRABundle(allocator, root, adapter_dir);
+    defer trained_bundle.deinit();
+    @memset(trained_bundle.layers[0].adapter_a, 1.0);
+    @memset(trained_bundle.layers[0].adapter_b, 0.5);
+    try saveLoRABundle(&trained_bundle, trained_adapter_dir);
+    var trained_inspection = try inspectCheckpoint(allocator, trained_adapter_dir);
+    defer freeInspectionSummary(allocator, &trained_inspection);
+    try std.testing.expectEqual(@as(?u64, 0), trained_inspection.initialization_seed);
+
     const merged_dir = try std.fs.path.join(allocator, &.{ root, "merged" });
     defer allocator.free(merged_dir);
-    try std.testing.expectError(
-        error.Gemma4MaterializationRequiresStreaming,
-        materializeMergedModel(allocator, root, adapter_dir, merged_dir),
-    );
-    try std.testing.expectError(error.FileNotFound, compat.cwd().access(compat.io(), merged_dir, .{}));
+    var materialized = try materializeMergedModel(allocator, root, trained_adapter_dir, merged_dir);
+    defer freeMaterializeSummary(allocator, &materialized);
+    try std.testing.expectEqual(@as(usize, 1), materialized.merged_lora_tensor_count);
+    try std.testing.expectEqual(@as(usize, 1), materialized.copied_base_tensor_count);
+
+    var merged_access = try openTensorAccessForFile(allocator, materialized.output_checkpoint_path);
+    defer merged_access.deinit();
+    var merged_q = try merged_access.getRecord(allocator, "model.layers.0.self_attn.q_proj.weight");
+    defer merged_q.deinit();
+    try std.testing.expectEqual(DType.bf16, denseRecordDType(merged_q.descriptor.encoding).?);
+    const expected_q_values = [_]u16{
+        roundF32ToBf16Bits(1.5),
+        roundF32ToBf16Bits(2.5),
+        roundF32ToBf16Bits(3.5),
+        roundF32ToBf16Bits(4.5),
+        roundF32ToBf16Bits(5.5),
+        roundF32ToBf16Bits(6.5),
+    };
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&expected_q_values), merged_q.raw_bytes);
+    var merged_norm = try merged_access.getRecord(allocator, "model.layers.0.input_layernorm.weight");
+    defer merged_norm.deinit();
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&norm_values), merged_norm.raw_bytes);
 }
 
 test "gemma4 HF legacy PLE aliases bootstrap and materialize with canonical trainer identities" {
@@ -7325,6 +7627,7 @@ test "gemma4 adapter config stays PEFT compatible and sidecar binds provenance" 
         .alpha = 2,
         .target_modules = &.{module},
         .target_preset = "peft-qv",
+        .initialization_seed = 17,
     };
     try writeAdapterConfigJson(allocator, config_path, options);
     try writeAdapterManifestJson(allocator, manifest_path, options);
@@ -7342,6 +7645,7 @@ test "gemma4 adapter config stays PEFT compatible and sidecar binds provenance" 
     try std.testing.expectEqualStrings(options.tokenizer_sha256.?, inspected.tokenizer_sha256.?);
     try std.testing.expectEqualStrings(options.chat_template_sha256.?, inspected.chat_template_sha256.?);
     try std.testing.expectEqualStrings("peft-qv", inspected.target_preset.?);
+    try std.testing.expectEqual(@as(?u64, 17), inspected.initialization_seed);
     try std.testing.expect(inspected.init_lora_weights == null);
     try validateLoRAAdapterInventory(allocator, adapter_dir);
 
@@ -7366,21 +7670,32 @@ test "gemma4 adapter config stays PEFT compatible and sidecar binds provenance" 
     try std.testing.expectError(error.AdapterManifestConfigMismatch, inspectCheckpoint(allocator, adapter_dir));
 }
 
-test "gemma4 legacy materialization admission is bounded and fail closed" {
-    try validateLegacyMaterializationSource("model.safetensors", legacy_materialize_max_checkpoint_bytes);
-    try std.testing.expectError(
-        error.Gemma4MaterializationRequiresStreaming,
-        validateLegacyMaterializationSource("model.safetensors", legacy_materialize_max_checkpoint_bytes + 1),
-    );
-    try std.testing.expectError(
-        error.Gemma4MaterializationRequiresStreaming,
-        validateLegacyMaterializationSource("model.safetensors.index.json", 1),
-    );
+test "gemma4 deterministic initializer supports independent seeded adapters" {
+    const allocator = std.testing.allocator;
+    const legacy = try buildDeterministicLoraA(allocator, 2, 3, 0);
+    defer allocator.free(legacy);
+    try std.testing.expectApproxEqAbs(@sin(@as(f32, 3) * 0.013) * 0.01, legacy[0], 1e-8);
+
+    const first = try buildDeterministicLoraA(allocator, 2, 3, 17);
+    defer allocator.free(first);
+    const repeated = try buildDeterministicLoraA(allocator, 2, 3, 17);
+    defer allocator.free(repeated);
+    const other = try buildDeterministicLoraA(allocator, 2, 3, 42);
+    defer allocator.free(other);
+    try std.testing.expectEqualSlices(f32, first, repeated);
+    try std.testing.expect(!std.mem.eql(f32, first, other));
+    try std.testing.expect(deriveLoRAInitializationSeed(17, "layer.0.weight") !=
+        deriveLoRAInitializationSeed(17, "layer.1.weight"));
+}
+
+test "gemma4 streaming materialization admits single and sharded safetensors" {
+    try validateMaterializationSource("model.safetensors");
+    try validateMaterializationSource("model.safetensors.index.json");
     try std.testing.expectError(
         error.Gemma4GgufMaterializationUnsupported,
-        validateLegacyMaterializationSource("model.gguf", 1),
+        validateMaterializationSource("model.gguf"),
     );
-    try std.testing.expectError(error.UnsupportedMaterializationSource, validateLegacyMaterializationSource("model.bin", 1));
+    try std.testing.expectError(error.UnsupportedMaterializationSource, validateMaterializationSource("model.bin"));
 }
 
 test "gemma4 external adjusted-base initializers cannot load or materialize" {

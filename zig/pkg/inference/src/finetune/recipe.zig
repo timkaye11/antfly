@@ -125,6 +125,7 @@ pub const AdapterConfig = struct {
     target_preset: ?[]const u8 = null,
     target_modules: ?[]const []const u8 = null,
     init_lora_weights: ?[]const u8 = null,
+    initialization_seed: ?u64 = null,
     use_dora: ?bool = null,
     scaling: ?[]const u8 = null,
 };
@@ -293,6 +294,9 @@ pub const FullTaskEvalMinimums = struct {
 pub const DpoEvalMinimums = struct {
     accuracy: f64,
     max_loss: f64,
+    min_accuracy_improvement: ?f64 = null,
+    min_reward_margin_improvement: ?f64 = null,
+    min_loss_improvement: ?f64 = null,
 };
 
 pub const GrpoEvalMinimums = struct {
@@ -300,6 +304,9 @@ pub const GrpoEvalMinimums = struct {
     top_rank_mean_reward: f64,
     positive_reward_group_rate: f64,
     max_kl_loss: f64,
+    min_mean_reward_improvement: ?f64 = null,
+    min_top_rank_mean_reward_improvement: ?f64 = null,
+    min_positive_reward_group_rate_improvement: ?f64 = null,
 };
 
 pub const EvalConfig = struct {
@@ -614,6 +621,8 @@ const DpoReport = struct {
     checkpoint_resume: ?PreferenceCheckpointResumeSummary = null,
     metal_numerical_policy: ?GemmaMetalNumericalPolicy = null,
     evaluation_execution_policy: ?[]const u8 = null,
+    baseline_evaluation: ?DpoEvaluationSummary = null,
+    baseline_relative: ?DpoBaselineRelativeSummary = null,
     evaluation: ?DpoEvaluationSummary = null,
     trained_adapter_dir: ?[]const u8 = null,
 };
@@ -626,6 +635,31 @@ const DpoEvaluationSummary = struct {
     accuracy: f32,
     passed: bool,
 };
+
+const DpoBaselineRelativeSummary = struct {
+    accuracy_improvement: f32,
+    reward_margin_improvement: f32,
+    loss_improvement: f32,
+    passed: bool,
+};
+
+fn compareDpoToBaseline(
+    baseline: DpoEvaluationSummary,
+    evaluation: DpoEvaluationSummary,
+    minimums: DpoEvalMinimums,
+) DpoBaselineRelativeSummary {
+    const accuracy_improvement = evaluation.accuracy - baseline.accuracy;
+    const reward_margin_improvement = evaluation.mean_reward_margin - baseline.mean_reward_margin;
+    const loss_improvement = baseline.loss - evaluation.loss;
+    return .{
+        .accuracy_improvement = accuracy_improvement,
+        .reward_margin_improvement = reward_margin_improvement,
+        .loss_improvement = loss_improvement,
+        .passed = accuracy_improvement >= minimums.min_accuracy_improvement.? and
+            reward_margin_improvement >= minimums.min_reward_margin_improvement.? and
+            loss_improvement >= minimums.min_loss_improvement.?,
+    };
+}
 
 const DpoEvaluationReport = struct {
     schema_version: []const u8 = "antfly_inference_finetune_dpo_evaluation/v2",
@@ -778,6 +812,8 @@ const GrpoReport = struct {
     reward_pipeline: ?RewardPipelineTelemetry = null,
     metal_numerical_policy: ?GemmaMetalNumericalPolicy = null,
     evaluation_execution_policy: ?[]const u8 = null,
+    baseline_evaluation: ?GrpoEvaluationSummary = null,
+    baseline_relative: ?GrpoBaselineRelativeSummary = null,
     evaluation: ?GrpoEvaluationSummary = null,
     trained_adapter_dir: ?[]const u8 = null,
 };
@@ -905,6 +941,31 @@ const GrpoEvaluationSummary = struct {
     loop_seconds: ?f64 = null,
     passed: bool,
 };
+
+const GrpoBaselineRelativeSummary = struct {
+    mean_reward_improvement: f32,
+    top_rank_mean_reward_improvement: f32,
+    positive_reward_group_rate_improvement: f32,
+    passed: bool,
+};
+
+fn compareGrpoToBaseline(
+    baseline: GrpoEvaluationSummary,
+    evaluation: GrpoEvaluationSummary,
+    minimums: GrpoEvalMinimums,
+) GrpoBaselineRelativeSummary {
+    const mean_reward_improvement = evaluation.mean_reward - baseline.mean_reward;
+    const top_rank_mean_reward_improvement = evaluation.top_rank_mean_reward - baseline.top_rank_mean_reward;
+    const positive_reward_group_rate_improvement = evaluation.positive_reward_group_rate - baseline.positive_reward_group_rate;
+    return .{
+        .mean_reward_improvement = mean_reward_improvement,
+        .top_rank_mean_reward_improvement = top_rank_mean_reward_improvement,
+        .positive_reward_group_rate_improvement = positive_reward_group_rate_improvement,
+        .passed = mean_reward_improvement >= minimums.min_mean_reward_improvement.? and
+            top_rank_mean_reward_improvement >= minimums.min_top_rank_mean_reward_improvement.? and
+            positive_reward_group_rate_improvement >= minimums.min_positive_reward_group_rate_improvement.?,
+    };
+}
 
 const GrpoEvaluationReport = struct {
     schema_version: []const u8 = "antfly_inference_finetune_grpo_evaluation/v3",
@@ -2679,6 +2740,18 @@ fn validateGemma4PreferenceEvaluationContract(
             if (!std.math.isFinite(minimums.max_loss) or minimums.max_loss < 0.0) {
                 return error.InvalidDpoEvaluationMinimums;
             }
+            const relative_count = @intFromBool(minimums.min_accuracy_improvement != null) +
+                @intFromBool(minimums.min_reward_margin_improvement != null) +
+                @intFromBool(minimums.min_loss_improvement != null);
+            if (relative_count != 0 and relative_count != 3) return error.IncompleteDpoBaselineRelativeMinimums;
+            if (minimums.min_accuracy_improvement) |value| {
+                if (!std.math.isFinite(value) or value < 0.0 or
+                    !std.math.isFinite(minimums.min_reward_margin_improvement.?) or minimums.min_reward_margin_improvement.? < 0.0 or
+                    !std.math.isFinite(minimums.min_loss_improvement.?) or minimums.min_loss_improvement.? < 0.0)
+                {
+                    return error.InvalidDpoEvaluationMinimums;
+                }
+            }
         },
         .grpo => {
             if (recipe.model.projector_path != null) return error.Gemma4MultimodalPreferenceEvaluationNotYetSupported;
@@ -2691,6 +2764,18 @@ fn validateGemma4PreferenceEvaluationContract(
                 !std.math.isFinite(minimums.max_kl_loss) or minimums.max_kl_loss < 0.0)
             {
                 return error.InvalidGrpoEvaluationMinimums;
+            }
+            const relative_count = @intFromBool(minimums.min_mean_reward_improvement != null) +
+                @intFromBool(minimums.min_top_rank_mean_reward_improvement != null) +
+                @intFromBool(minimums.min_positive_reward_group_rate_improvement != null);
+            if (relative_count != 0 and relative_count != 3) return error.IncompleteGrpoBaselineRelativeMinimums;
+            if (minimums.min_mean_reward_improvement) |value| {
+                if (!std.math.isFinite(value) or value < 0.0 or
+                    !std.math.isFinite(minimums.min_top_rank_mean_reward_improvement.?) or minimums.min_top_rank_mean_reward_improvement.? < 0.0 or
+                    !std.math.isFinite(minimums.min_positive_reward_group_rate_improvement.?) or minimums.min_positive_reward_group_rate_improvement.? < 0.0)
+                {
+                    return error.InvalidGrpoEvaluationMinimums;
+                }
             }
         },
     }
@@ -4888,6 +4973,17 @@ fn preferenceEvaluationReportPath(
     return defaultArtifactPath(allocator, recipe, switch (task) {
         .dpo => "dpo_evaluation_report.json",
         .grpo => "grpo_evaluation_report.json",
+    });
+}
+
+fn preferenceBaselineEvaluationReportPath(
+    allocator: std.mem.Allocator,
+    recipe: Recipe,
+    task: PreferenceTask,
+) ![]const u8 {
+    return defaultArtifactPath(allocator, recipe, switch (task) {
+        .dpo => "dpo_baseline_evaluation_report.json",
+        .grpo => "grpo_baseline_evaluation_report.json",
     });
 }
 
@@ -7891,6 +7987,7 @@ fn runOptimizerBackedGemmaDpo(
             .target_preset = try gemmaLegacyTargetPreset(adapter),
             .use_dora = adapter.use_dora orelse false,
             .init_lora_weights = adapter.init_lora_weights,
+            .initialization_seed = adapter.initialization_seed orelse 0,
         });
         defer gemma4.freeBootstrapSummary(allocator, &bootstrap);
     };
@@ -8039,6 +8136,29 @@ fn runOptimizerBackedGemmaDpo(
         !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_LINEAR_CCE", false);
     const bootstrap_example = gemma4_real_autodiff.findFirstSupervisedExample(chosen_prepared.examples) orelse return error.NoTrainingData;
     try gemma4_real_autodiff.initializeTrainerFromAdapterDir(allocator, &trainer, &ctx, bootstrap_dir, bootstrap_example, @intCast(max_seq_len));
+
+    const dpo_minimums = recipe.eval.?.dpo_minimums.?;
+    const dpo_baseline_report_path = if (dpo_minimums.min_accuracy_improvement != null)
+        try preferenceBaselineEvaluationReportPath(allocator, recipe, .dpo)
+    else
+        null;
+    defer if (dpo_baseline_report_path) |path| allocator.free(path);
+    const baseline_evaluation: ?DpoEvaluationSummary = if (dpo_baseline_report_path) |path|
+        try evaluateGemmaDpoHeldout(
+            allocator,
+            io,
+            recipe,
+            tokenizer_model,
+            samples.samples,
+            &trainer,
+            &ctx,
+            base_model_dir,
+            backend_kind,
+            path,
+            false,
+        )
+    else
+        null;
 
     var dpo_execution_flags: u64 = 0;
     if (coalesce_single_token_pairs) dpo_execution_flags |= @as(u64, 1) << 0;
@@ -8636,10 +8756,17 @@ fn runOptimizerBackedGemmaDpo(
             base_model_dir,
             backend_kind,
             evaluation_report_path,
+            true,
         );
         graph_cache_after_evaluation = evaluation_trainer.graphCacheStats();
         break :evaluation summary;
     };
+
+    const baseline_relative: ?DpoBaselineRelativeSummary = if (baseline_evaluation) |baseline| relative: {
+        const summary = compareDpoToBaseline(baseline, evaluation, dpo_minimums);
+        if (!summary.passed) return error.DpoBaselineRelativeEvaluationGateFailed;
+        break :relative summary;
+    } else null;
 
     try gemma4_real_autodiff.saveTrainerAsGemmaBundle(allocator, &trainer, base_model_dir, bootstrap_dir, trained_dir);
     try validatePublishedAdapterChanged(allocator, io, bootstrap_dir, trained_dir);
@@ -8762,6 +8889,8 @@ fn runOptimizerBackedGemmaDpo(
         },
         .metal_numerical_policy = metal_numerical_policy,
         .evaluation_execution_policy = canonical_preference_evaluation_policy,
+        .baseline_evaluation = baseline_evaluation,
+        .baseline_relative = baseline_relative,
         .evaluation = evaluation,
         .trained_adapter_dir = trained_dir,
     });
@@ -8779,6 +8908,7 @@ fn evaluateGemmaDpoHeldout(
     base_model_dir: []const u8,
     backend_kind: gemma4_real_autodiff.BackendKind,
     report_path: []const u8,
+    enforce_minimums: bool,
 ) !DpoEvaluationSummary {
     const eval_path = evalDatasetPath(recipe) orelse return error.MissingPreferenceEvaluationDataset;
     const minimums = recipe.eval.?.dpo_minimums orelse return error.MissingDpoEvaluationMinimums;
@@ -8969,14 +9099,14 @@ fn evaluateGemmaDpoHeldout(
         .reference_mode = if (coalesce) "compiled-zero-lora-shared-prompt-single-row" else "compiled-zero-lora",
         .sequence_length_policy = sequence_length_policy,
     });
-    if (!passed) return error.DpoEvaluationGateFailed;
+    if (!passed and enforce_minimums) return error.DpoEvaluationGateFailed;
     return .{
         .report_path = report_path,
         .examples = samples.samples.len,
         .loss = result.loss,
         .mean_reward_margin = result.mean_reward_margin,
         .accuracy = result.accuracy,
-        .passed = true,
+        .passed = passed,
     };
 }
 
@@ -9319,6 +9449,7 @@ fn runOptimizerBackedGemmaGrpo(
             .target_preset = try gemmaLegacyTargetPreset(adapter),
             .use_dora = adapter.use_dora orelse false,
             .init_lora_weights = adapter.init_lora_weights,
+            .initialization_seed = adapter.initialization_seed orelse 0,
         });
         defer gemma4.freeBootstrapSummary(allocator, &bootstrap);
     };
@@ -9578,6 +9709,49 @@ fn runOptimizerBackedGemmaGrpo(
     defer frozen_lora.deinit();
     var reference_cache = GemmaGrpoReferenceCache.init(allocator, 1024);
     defer reference_cache.deinit();
+
+    const grpo_minimums = recipe.eval.?.grpo_minimums.?;
+    const grpo_baseline_report_path = if (grpo_minimums.min_mean_reward_improvement != null)
+        try preferenceBaselineEvaluationReportPath(allocator, recipe, .grpo)
+    else
+        null;
+    defer if (grpo_baseline_report_path) |path| allocator.free(path);
+    const grpo_baseline_reward_trace_path = if (grpo_baseline_report_path != null)
+        try defaultArtifactPath(allocator, recipe, "grpo_baseline_evaluation_reward_trace.jsonl")
+    else
+        null;
+    defer if (grpo_baseline_reward_trace_path) |path| allocator.free(path);
+    const grpo_baseline_exchange_dir = if (grpo_baseline_report_path != null)
+        try defaultArtifactPath(allocator, recipe, "grpo-baseline-reward-verifier-exchanges")
+    else
+        null;
+    defer if (grpo_baseline_exchange_dir) |path| allocator.free(path);
+    var baseline_recipe = recipe;
+    var baseline_reward = recipe.reward orelse RewardConfig{};
+    if (grpo_baseline_reward_trace_path) |path| baseline_reward.evaluation_trace_path = path;
+    if (grpo_baseline_exchange_dir) |path| baseline_reward.exchange_dir = path;
+    if (grpo_baseline_report_path != null) baseline_recipe.reward = baseline_reward;
+    const baseline_evaluation: ?GrpoEvaluationSummary = if (grpo_baseline_report_path) |path|
+        try evaluateGemmaGrpoHeldout(
+            allocator,
+            io,
+            baseline_recipe,
+            tokenizer_model,
+            prompt_batch.prompts,
+            &trainer,
+            &ctx,
+            null,
+            &frozen_lora,
+            max_seq_len,
+            group_size,
+            max_completion_tokens,
+            backend_kind,
+            path,
+            false,
+        )
+    else
+        null;
+
     var reward_pipeline = try RewardPipeline.init(
         allocator,
         io,
@@ -10309,8 +10483,15 @@ fn runOptimizerBackedGemmaGrpo(
             max_completion_tokens,
             backend_kind,
             evaluation_report_path,
+            true,
         );
     };
+
+    const baseline_relative: ?GrpoBaselineRelativeSummary = if (baseline_evaluation) |baseline| relative: {
+        const summary = compareGrpoToBaseline(baseline, evaluation, grpo_minimums);
+        if (!summary.passed) return error.GrpoBaselineRelativeEvaluationGateFailed;
+        break :relative summary;
+    } else null;
 
     try gemma4_real_autodiff.saveTrainerAsGemmaBundle(allocator, &trainer, base_model_dir, bootstrap_dir, trained_dir);
     try validatePublishedAdapterChanged(allocator, io, bootstrap_dir, trained_dir);
@@ -10412,6 +10593,8 @@ fn runOptimizerBackedGemmaGrpo(
         .reward_pipeline = reward_pipeline.telemetry(),
         .metal_numerical_policy = metal_numerical_policy,
         .evaluation_execution_policy = canonical_preference_evaluation_policy,
+        .baseline_evaluation = baseline_evaluation,
+        .baseline_relative = baseline_relative,
         .evaluation = evaluation,
         .trained_adapter_dir = trained_dir,
     });
@@ -10433,6 +10616,7 @@ fn evaluateGemmaGrpoHeldout(
     max_completion_tokens: usize,
     backend_kind: gemma4_real_autodiff.BackendKind,
     report_path: []const u8,
+    enforce_minimums: bool,
 ) !GrpoEvaluationSummary {
     const eval_path = evalDatasetPath(recipe) orelse return error.MissingPreferenceEvaluationDataset;
     const minimums = recipe.eval.?.grpo_minimums orelse return error.MissingGrpoEvaluationMinimums;
@@ -10826,7 +11010,7 @@ fn evaluateGemmaGrpoHeldout(
         .loop_seconds = loop_seconds,
         .reward_pipeline = reward_pipeline.telemetry(),
     });
-    if (!passed) return error.GrpoEvaluationGateFailed;
+    if (!passed and enforce_minimums) return error.GrpoEvaluationGateFailed;
     return .{
         .report_path = report_path,
         .groups = total_groups,
@@ -10841,7 +11025,7 @@ fn evaluateGemmaGrpoHeldout(
         .reference_scoring_seconds = total_reference_scoring_seconds,
         .reward_loss_seconds = total_reward_loss_seconds,
         .loop_seconds = loop_seconds,
-        .passed = true,
+        .passed = passed,
     };
 }
 
@@ -11985,6 +12169,62 @@ test "gemma4 preference gradient accumulation preserves complete DPO pairs and G
     try scalePreferenceUnitGradients(&grpo_gradients, 4);
     try std.testing.expectEqualSlices(f32, &.{ -1.0, 0.0, 1.0 }, &grpo_gradients);
     try std.testing.expectError(error.InvalidGradientAccumulationSteps, scalePreferenceUnitGradients(&dpo_gradients, 0));
+}
+
+test "gemma4 preference baseline-relative gates require strict heldout improvement" {
+    const dpo_baseline = DpoEvaluationSummary{
+        .report_path = "baseline",
+        .examples = 40,
+        .loss = 0.7,
+        .mean_reward_margin = 0.0,
+        .accuracy = 0.5,
+        .passed = false,
+    };
+    var dpo_final = dpo_baseline;
+    dpo_final.report_path = "final";
+    dpo_final.loss = 0.6;
+    dpo_final.mean_reward_margin = 0.1;
+    dpo_final.accuracy = 0.6;
+    const dpo_minimums = DpoEvalMinimums{
+        .accuracy = 0.4,
+        .max_loss = 1.0,
+        .min_accuracy_improvement = 0.05,
+        .min_reward_margin_improvement = 0.05,
+        .min_loss_improvement = 0.05,
+    };
+    try std.testing.expect(compareDpoToBaseline(dpo_baseline, dpo_final, dpo_minimums).passed);
+    dpo_final.accuracy = 0.5;
+    try std.testing.expect(!compareDpoToBaseline(dpo_baseline, dpo_final, dpo_minimums).passed);
+
+    const grpo_baseline = GrpoEvaluationSummary{
+        .report_path = "baseline",
+        .groups = 64,
+        .completions = 256,
+        .mean_reward = 0.1,
+        .top_rank_mean_reward = 0.1,
+        .positive_reward_group_rate = 0.5,
+        .reward_stddev = 0.3,
+        .kl_loss = 0.0,
+        .mean_kl = 0.0,
+        .passed = false,
+    };
+    var grpo_final = grpo_baseline;
+    grpo_final.report_path = "final";
+    grpo_final.mean_reward = 0.2;
+    grpo_final.top_rank_mean_reward = 0.25;
+    grpo_final.positive_reward_group_rate = 0.75;
+    const grpo_minimums = GrpoEvalMinimums{
+        .mean_reward = 0.125,
+        .top_rank_mean_reward = 0.125,
+        .positive_reward_group_rate = 0.75,
+        .max_kl_loss = 0.004,
+        .min_mean_reward_improvement = 0.05,
+        .min_top_rank_mean_reward_improvement = 0.05,
+        .min_positive_reward_group_rate_improvement = 0.05,
+    };
+    try std.testing.expect(compareGrpoToBaseline(grpo_baseline, grpo_final, grpo_minimums).passed);
+    grpo_final.top_rank_mean_reward = 0.1;
+    try std.testing.expect(!compareGrpoToBaseline(grpo_baseline, grpo_final, grpo_minimums).passed);
 }
 
 test "compiled DPO loss inversion recovers reward margin" {

@@ -259,7 +259,7 @@
         "adapter_model_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
         "tensor_inventory": { "type": "array", "items": {"type":"string"}, "uniqueItems": true },
         "key_layout": { "enum": ["stock-peft/v1", "antfly_gemma4_adapter_keys/v1"] },
-        "policy_source": { "enum": ["explicit-lock-policy", "antfly-finetune-manifest/v2", "antfly-peft-export/v1"] }
+        "policy_source": { "enum": ["explicit-lock-policy", "antfly-finetune-manifest/v2", "antfly-finetune-manifest/v3", "antfly-peft-export/v1"] }
       }
     },
     "adapterSemantics": {

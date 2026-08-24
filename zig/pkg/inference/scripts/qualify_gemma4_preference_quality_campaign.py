@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Run a pinned multi-seed, long-horizon Gemma4 preference quality gate.
 
-Each seed is bound into the typed trainer/RNG contract and defines a
-deterministic permutation of the exact same training JSONL rows. The model,
-seed adapter, held-out dataset, non-seed optimizer settings, and binary remain
-fixed. Every seed must complete real optimizer-backed Metal training and pass
-the recipe's held-out quality gates. The initialized adapter remains fixed, so
-this measures training-seed and data-order robustness rather than pretending
-to be independent model-initialization coverage.
+Each seed is bound into three independent, reproducible dimensions: Gemma4
+LoRA initialization, the typed trainer/RNG contract, and a deterministic
+permutation of the exact same training JSONL rows. The campaign bootstraps a
+fresh seed-bound adapter for every run from the pinned model and template
+adapter configuration. Every seed must complete real optimizer-backed Metal
+training and pass the recipe's held-out quality gates.
 """
 
 from __future__ import annotations
@@ -27,7 +26,7 @@ from typing import Any, Mapping, Sequence
 import qualify_gemma4_preference_resume as resume_qualifier
 
 
-SCHEMA_VERSION = "antfly_gemma4_preference_quality_campaign/v1"
+SCHEMA_VERSION = "antfly_gemma4_preference_quality_campaign/v2"
 
 
 class ContractError(RuntimeError):
@@ -188,10 +187,105 @@ def _dataset_path(recipe: Mapping[str, Any], field: str) -> Path:
         raise ContractError(str(exc)) from exc
 
 
+def _adapter_bootstrap_spec(adapter: Path) -> dict[str, Any]:
+    config = _load_json(adapter / "adapter_config.json", "template adapter config")
+    rank = _integer(config.get("r"), "template adapter config.r", 1)
+    alpha = _finite(config.get("lora_alpha"), "template adapter config.lora_alpha")
+    if alpha <= 0.0:
+        raise ContractError("template adapter alpha must be positive")
+    raw_targets = config.get("target_modules")
+    if not isinstance(raw_targets, list) or not raw_targets:
+        raise ContractError("template adapter must contain exact target_modules")
+    targets: list[str] = []
+    for index, value in enumerate(raw_targets):
+        if not isinstance(value, str) or not value.strip():
+            raise ContractError(
+                f"template adapter target_modules[{index}] must be non-empty"
+            )
+        targets.append(value)
+    if len(set(targets)) != len(targets):
+        raise ContractError("template adapter target_modules must be unique")
+    if config.get("use_dora", False) is not False:
+        raise ContractError("independent-initialization campaign does not admit DoRA")
+    initializer = config.get("init_lora_weights", True)
+    if initializer is not True and initializer != "default":
+        raise ContractError(
+            "independent-initialization campaign requires standard LoRA initialization"
+        )
+    return {"rank": rank, "alpha": alpha, "target_modules": targets}
+
+
+def _bootstrap_seed_adapter(
+    binary: Path,
+    model: Path,
+    template_spec: Mapping[str, Any],
+    seed: int,
+    adapter_path: Path,
+    env: Mapping[str, str],
+    log_root: Path,
+    timeout: float,
+) -> dict[str, Any]:
+    command = [
+        str(binary),
+        "inference",
+        "finetune",
+        "adapter",
+        "bootstrap",
+        "gemma4",
+        "--model",
+        str(model),
+        "--out",
+        str(adapter_path),
+        "--rank",
+        str(template_spec["rank"]),
+        "--alpha",
+        format(float(template_spec["alpha"]), ".17g"),
+        "--target-modules",
+        ",".join(template_spec["target_modules"]),
+        "--initialization-seed",
+        str(seed),
+    ]
+    execution = _run(command, env, log_root, timeout)
+    evidence = resume_qualifier._adapter_tree_evidence(
+        adapter_path, f"seed-{seed} initialized adapter"
+    )
+    manifest_path = adapter_path / "antfly_finetune_manifest.json"
+    manifest = _load_json(manifest_path, f"seed-{seed} initialized adapter manifest")
+    if manifest.get("schema_version") != "antfly_gemma4_finetune/v3":
+        raise ContractError("seeded bootstrap did not publish a v3 adapter manifest")
+    if manifest.get("status") != "complete":
+        raise ContractError("seeded bootstrap manifest is incomplete")
+    if _integer(
+        manifest.get("initialization_seed"), "adapter manifest.initialization_seed"
+    ) != seed:
+        raise ContractError("seeded bootstrap manifest attests the wrong seed")
+    config = _load_json(
+        adapter_path / "adapter_config.json", f"seed-{seed} initialized adapter config"
+    )
+    if (
+        _integer(config.get("r"), "initialized adapter config.r", 1)
+        != template_spec["rank"]
+        or _finite(config.get("lora_alpha"), "initialized adapter config.lora_alpha")
+        != template_spec["alpha"]
+        or config.get("target_modules") != template_spec["target_modules"]
+    ):
+        raise ContractError("seeded bootstrap drifted from the template adapter config")
+    return {
+        "initialization_seed": seed,
+        "path": str(adapter_path),
+        "adapter_model_sha256": evidence["adapter_model_sha256"],
+        "adapter_tree": evidence["files"],
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": resume_qualifier._sha256(manifest_path),
+        "execution": execution,
+    }
+
+
 def _variant(
     base: Mapping[str, Any],
     task: str,
     seed: int,
+    adapter_path: Path,
     train_path: Path,
     run_root: Path,
     epochs: int,
@@ -216,6 +310,10 @@ def _variant(
     if allow_direct_gguf_training:
         model["allow_direct_gguf_training"] = True
     recipe["model"] = model
+    adapter = dict(_mapping(recipe.get("adapter"), "recipe.adapter"))
+    adapter["path"] = str(adapter_path)
+    adapter["initialization_seed"] = seed
+    recipe["adapter"] = adapter
     recipe["artifacts"] = {
         "root": str(run_root),
         "trained_adapter_dir": str(run_root / "adapter-trained"),
@@ -262,7 +360,8 @@ def _validate_run(
     expected_optimizer_steps: int,
     expected_epochs: int,
     expected_train_path: Path,
-    seed_adapter_sha256: str,
+    expected_seed_adapter_path: Path,
+    expected_seed_adapter: Mapping[str, Any],
     quality_gates: Mapping[str, float],
 ) -> dict[str, Any]:
     report_path = run_root / f"{task}_report.json"
@@ -310,6 +409,20 @@ def _validate_run(
         raise ContractError("outer training report attests the wrong epoch horizon")
     if _integer(realized_optimizer.get("seed"), "realized optimizer.seed") != expected_seed:
         raise ContractError("outer training report attests the wrong typed training seed")
+    realized_adapter = _mapping(
+        realized_recipe.get("adapter"), "outer training recipe.adapter"
+    )
+    realized_adapter_path = realized_adapter.get("path")
+    if (
+        not isinstance(realized_adapter_path, str)
+        or Path(realized_adapter_path).resolve() != expected_seed_adapter_path.resolve()
+    ):
+        raise ContractError("outer training report attests the wrong initialized adapter")
+    if _integer(
+        realized_adapter.get("initialization_seed"),
+        "realized adapter.initialization_seed",
+    ) != expected_seed:
+        raise ContractError("outer training report attests the wrong initialization seed")
     realized_dataset = _mapping(
         realized_recipe.get("dataset"), "outer training recipe.dataset"
     )
@@ -324,15 +437,41 @@ def _validate_run(
         or manifest.get("status") != "succeeded"
     ):
         raise ContractError("recipe run manifest did not succeed")
+    current_seed_adapter = resume_qualifier._adapter_tree_evidence(
+        expected_seed_adapter_path, "initialized adapter after training"
+    )
+    if (
+        current_seed_adapter["adapter_model_sha256"]
+        != expected_seed_adapter["adapter_model_sha256"]
+        or current_seed_adapter["files"] != expected_seed_adapter["adapter_tree"]
+    ):
+        raise ContractError("training command changed its initialized adapter input")
     trained = resume_qualifier._adapter_tree_evidence(
         run_root / "adapter-trained", "trained adapter"
     )
-    if trained["adapter_model_sha256"] == seed_adapter_sha256:
+    if (
+        trained["adapter_model_sha256"]
+        == expected_seed_adapter["adapter_model_sha256"]
+    ):
         raise ContractError("trained adapter is byte-identical to the seed adapter")
 
     common_metrics = {
         "train_loss": _finite(report.get("loss"), "report.loss"),
     }
+    baseline = _mapping(report.get("baseline_evaluation"), "report.baseline_evaluation")
+    baseline_relative = _mapping(
+        report.get("baseline_relative"), "report.baseline_relative"
+    )
+    if baseline_relative.get("passed") is not True:
+        raise ContractError("baseline-relative held-out evaluation did not pass")
+    expected_baseline_path = run_root / f"{task}_baseline_evaluation_report.json"
+    baseline_report_path = baseline.get("report_path")
+    if (
+        not isinstance(baseline_report_path, str)
+        or Path(baseline_report_path).resolve() != expected_baseline_path.resolve()
+        or not expected_baseline_path.is_file()
+    ):
+        raise ContractError("baseline evaluation report path escaped the campaign run")
     if task == "dpo":
         metrics = {
             **common_metrics,
@@ -342,6 +481,28 @@ def _validate_run(
             "eval_reward_margin": _finite(
                 evaluation.get("mean_reward_margin"), "evaluation.mean_reward_margin"
             ),
+            "baseline_eval_loss": _nonnegative(
+                baseline.get("loss"), "baseline_evaluation.loss"
+            ),
+            "baseline_eval_accuracy": _probability(
+                baseline.get("accuracy"), "baseline_evaluation.accuracy"
+            ),
+            "baseline_eval_reward_margin": _finite(
+                baseline.get("mean_reward_margin"),
+                "baseline_evaluation.mean_reward_margin",
+            ),
+            "eval_accuracy_improvement": _finite(
+                baseline_relative.get("accuracy_improvement"),
+                "baseline_relative.accuracy_improvement",
+            ),
+            "eval_reward_margin_improvement": _finite(
+                baseline_relative.get("reward_margin_improvement"),
+                "baseline_relative.reward_margin_improvement",
+            ),
+            "eval_loss_improvement": _finite(
+                baseline_relative.get("loss_improvement"),
+                "baseline_relative.loss_improvement",
+            ),
         }
         if metrics["eval_accuracy"] < quality_gates["min_eval_accuracy"]:
             raise ContractError("held-out DPO accuracy is below the campaign floor")
@@ -349,6 +510,13 @@ def _validate_run(
             raise ContractError("held-out DPO loss exceeds the campaign ceiling")
         if metrics["eval_reward_margin"] < quality_gates["min_eval_reward_margin"]:
             raise ContractError("held-out DPO reward margin is below the campaign floor")
+        for metric_name, gate_name in (
+            ("eval_accuracy_improvement", "min_eval_accuracy_improvement"),
+            ("eval_reward_margin_improvement", "min_eval_reward_margin_improvement"),
+            ("eval_loss_improvement", "min_eval_loss_improvement"),
+        ):
+            if metrics[metric_name] < quality_gates[gate_name]:
+                raise ContractError(f"held-out DPO {metric_name} is below the baseline-relative floor")
     else:
         metrics = {
             **common_metrics,
@@ -369,6 +537,29 @@ def _validate_run(
                 evaluation.get("kl_loss"), "evaluation.kl_loss"
             ),
             "eval_mean_kl": _nonnegative(evaluation.get("mean_kl"), "evaluation.mean_kl"),
+            "baseline_eval_mean_reward": _finite(
+                baseline.get("mean_reward"), "baseline_evaluation.mean_reward"
+            ),
+            "baseline_eval_top_rank_mean_reward": _finite(
+                baseline.get("top_rank_mean_reward"),
+                "baseline_evaluation.top_rank_mean_reward",
+            ),
+            "baseline_eval_positive_reward_group_rate": _probability(
+                baseline.get("positive_reward_group_rate"),
+                "baseline_evaluation.positive_reward_group_rate",
+            ),
+            "eval_mean_reward_improvement": _finite(
+                baseline_relative.get("mean_reward_improvement"),
+                "baseline_relative.mean_reward_improvement",
+            ),
+            "eval_top_rank_mean_reward_improvement": _finite(
+                baseline_relative.get("top_rank_mean_reward_improvement"),
+                "baseline_relative.top_rank_mean_reward_improvement",
+            ),
+            "eval_positive_reward_group_rate_improvement": _finite(
+                baseline_relative.get("positive_reward_group_rate_improvement"),
+                "baseline_relative.positive_reward_group_rate_improvement",
+            ),
         }
         if metrics["eval_mean_reward"] < quality_gates["min_eval_mean_reward"]:
             raise ContractError("held-out GRPO mean reward is below the campaign floor")
@@ -378,6 +569,19 @@ def _validate_run(
             raise ContractError("held-out GRPO positive-group rate is below the campaign floor")
         if metrics["eval_kl_loss"] > quality_gates["max_eval_kl_loss"]:
             raise ContractError("held-out GRPO KL loss exceeds the campaign ceiling")
+        for metric_name, gate_name in (
+            ("eval_mean_reward_improvement", "min_eval_mean_reward_improvement"),
+            (
+                "eval_top_rank_mean_reward_improvement",
+                "min_eval_top_rank_mean_reward_improvement",
+            ),
+            (
+                "eval_positive_reward_group_rate_improvement",
+                "min_eval_positive_reward_group_rate_improvement",
+            ),
+        ):
+            if metrics[metric_name] < quality_gates[gate_name]:
+                raise ContractError(f"held-out GRPO {metric_name} is below the baseline-relative floor")
         kl_control = _mapping(report.get("kl_control"), "report.kl_control")
         if _integer(kl_control.get("admitted_groups"), "kl_control.admitted_groups") != expected_units:
             raise ContractError("KL controller did not admit the complete long horizon")
@@ -402,6 +606,10 @@ def _validate_run(
         "outer_training_report": {
             "path": str(training_report_path),
             "sha256": resume_qualifier._sha256(training_report_path),
+        },
+        "baseline_evaluation_report": {
+            "path": str(expected_baseline_path),
+            "sha256": resume_qualifier._sha256(expected_baseline_path),
         },
         "recipe_run_manifest": {
             "path": str(manifest_path),
@@ -451,9 +659,12 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
     if not isinstance(model_value, str) or not isinstance(adapter_value, str):
         raise ContractError("campaign requires pinned model and seed-adapter paths")
     model = resume_qualifier._closed_immutable_path(Path(model_value), "model")
-    adapter = resume_qualifier._closed_immutable_path(Path(adapter_value), "seed adapter")
-    if not adapter.is_dir():
-        raise ContractError("seed adapter must be a directory")
+    template_adapter = resume_qualifier._closed_immutable_path(
+        Path(adapter_value), "template adapter"
+    )
+    if not template_adapter.is_dir():
+        raise ContractError("template adapter must be a directory")
+    template_adapter_spec = _adapter_bootstrap_spec(template_adapter)
     reference_value = model_config.get("reference_path")
     if reference_value is not None:
         if not isinstance(reference_value, str):
@@ -465,7 +676,7 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             raise ContractError("preference campaign requires model and reference paths to match")
         model_config["reference_path"] = str(reference)
     model_config["path"] = str(model)
-    adapter_config["path"] = str(adapter)
+    adapter_config["path"] = str(template_adapter)
     if model.is_file() and not args.allow_direct_gguf_training:
         raise ContractError("direct GGUF campaign requires --allow-direct-gguf-training")
     if args.allow_direct_gguf_training and not model.is_file():
@@ -513,6 +724,9 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             "min_eval_accuracy": args.min_dpo_eval_accuracy,
             "max_eval_loss": args.max_dpo_eval_loss,
             "min_eval_reward_margin": args.min_dpo_eval_reward_margin,
+            "min_eval_accuracy_improvement": args.min_dpo_eval_accuracy_improvement,
+            "min_eval_reward_margin_improvement": args.min_dpo_eval_reward_margin_improvement,
+            "min_eval_loss_improvement": args.min_dpo_eval_loss_improvement,
         }
         if task == "dpo"
         else {
@@ -520,6 +734,9 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             "min_eval_top_rank_mean_reward": args.min_grpo_eval_top_rank_mean_reward,
             "min_eval_positive_reward_group_rate": args.min_grpo_eval_positive_reward_group_rate,
             "max_eval_kl_loss": args.max_grpo_eval_kl_loss,
+            "min_eval_mean_reward_improvement": args.min_grpo_eval_mean_reward_improvement,
+            "min_eval_top_rank_mean_reward_improvement": args.min_grpo_eval_top_rank_mean_reward_improvement,
+            "min_eval_positive_reward_group_rate_improvement": args.min_grpo_eval_positive_reward_group_rate_improvement,
         }
     )
     if any(not math.isfinite(value) for value in quality_gates.values()):
@@ -527,12 +744,58 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
     if task == "dpo":
         _probability(quality_gates["min_eval_accuracy"], "minimum DPO eval accuracy")
         _nonnegative(quality_gates["max_eval_loss"], "maximum DPO eval loss")
+        _nonnegative(
+            quality_gates["min_eval_accuracy_improvement"],
+            "minimum DPO eval accuracy improvement",
+        )
+        _nonnegative(
+            quality_gates["min_eval_reward_margin_improvement"],
+            "minimum DPO eval reward-margin improvement",
+        )
+        _nonnegative(
+            quality_gates["min_eval_loss_improvement"],
+            "minimum DPO eval loss improvement",
+        )
+        dpo_minimums = dict(
+            _mapping(base["eval"].get("dpo_minimums"), "recipe.eval.dpo_minimums")
+        )
+        dpo_minimums.update(
+            {
+                "accuracy": quality_gates["min_eval_accuracy"],
+                "max_loss": quality_gates["max_eval_loss"],
+                "min_accuracy_improvement": quality_gates["min_eval_accuracy_improvement"],
+                "min_reward_margin_improvement": quality_gates["min_eval_reward_margin_improvement"],
+                "min_loss_improvement": quality_gates["min_eval_loss_improvement"],
+            }
+        )
+        base["eval"]["dpo_minimums"] = dpo_minimums
     else:
         _probability(
             quality_gates["min_eval_positive_reward_group_rate"],
             "minimum GRPO positive-reward group rate",
         )
         _nonnegative(quality_gates["max_eval_kl_loss"], "maximum GRPO eval KL loss")
+        for name in (
+            "min_eval_mean_reward_improvement",
+            "min_eval_top_rank_mean_reward_improvement",
+            "min_eval_positive_reward_group_rate_improvement",
+        ):
+            _nonnegative(quality_gates[name], name)
+        grpo_minimums = dict(
+            _mapping(base["eval"].get("grpo_minimums"), "recipe.eval.grpo_minimums")
+        )
+        grpo_minimums.update(
+            {
+                "mean_reward": quality_gates["min_eval_mean_reward"],
+                "top_rank_mean_reward": quality_gates["min_eval_top_rank_mean_reward"],
+                "positive_reward_group_rate": quality_gates["min_eval_positive_reward_group_rate"],
+                "max_kl_loss": quality_gates["max_eval_kl_loss"],
+                "min_mean_reward_improvement": quality_gates["min_eval_mean_reward_improvement"],
+                "min_top_rank_mean_reward_improvement": quality_gates["min_eval_top_rank_mean_reward_improvement"],
+                "min_positive_reward_group_rate_improvement": quality_gates["min_eval_positive_reward_group_rate_improvement"],
+            }
+        )
+        base["eval"]["grpo_minimums"] = grpo_minimums
 
     output_root = args.output_dir.expanduser().resolve()
     if output_root.exists():
@@ -541,7 +804,7 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
         "binary": binary,
         "base_recipe": recipe_path,
         "model": model,
-        "adapter": adapter,
+        "template_adapter": template_adapter,
         "train_dataset": train_path,
         "eval_dataset": eval_path,
     }
@@ -552,8 +815,6 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
         name: resume_qualifier._tree_snapshot(path)
         for name, path in immutable_roots.items()
     }
-    seed_adapter = resume_qualifier._adapter_tree_evidence(adapter, "seed adapter")
-
     output_root.mkdir(parents=True)
     inputs_root = output_root / "inputs"
     recipes_root = output_root / "recipes"
@@ -565,8 +826,31 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
     env = resume_qualifier._strict_environment()
 
     runs: list[dict[str, Any]] = []
+    initialized_adapters: list[dict[str, Any]] = []
     dataset_digests: set[str] = set()
     try:
+        initialized_adapter_digests: set[str] = set()
+        initialized_adapter_by_seed: dict[int, dict[str, Any]] = {}
+        for seed in args.seeds:
+            initialized = _bootstrap_seed_adapter(
+                binary,
+                model,
+                template_adapter_spec,
+                seed,
+                inputs_root / f"adapter-seed-{seed}",
+                env,
+                inputs_root / f"bootstrap-seed-{seed}",
+                args.timeout_seconds,
+            )
+            digest = initialized["adapter_model_sha256"]
+            if digest in initialized_adapter_digests:
+                raise ContractError(
+                    "two initialization seeds produced the same adapter checkpoint"
+                )
+            initialized_adapter_digests.add(digest)
+            initialized_adapter_by_seed[seed] = initialized
+            initialized_adapters.append(initialized)
+
         for seed in args.seeds:
             seed_name = f"seed-{seed}"
             seeded_train = inputs_root / f"{seed_name}.jsonl"
@@ -582,6 +866,7 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
                 base,
                 task,
                 seed,
+                Path(initialized_adapter_by_seed[seed]["path"]),
                 seeded_train,
                 run_root,
                 args.epochs,
@@ -605,13 +890,15 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
                 expected_optimizer_steps,
                 args.epochs,
                 seeded_train,
-                seed_adapter["adapter_model_sha256"],
+                Path(initialized_adapter_by_seed[seed]["path"]),
+                initialized_adapter_by_seed[seed],
                 quality_gates,
             )
             runs.append(
                 {
                     "seed": seed,
-                    "seed_dimension": "typed-training-seed-plus-deterministic-row-order",
+                    "seed_dimension": "adapter-initialization-plus-typed-training-seed-plus-deterministic-row-order",
+                    "initialized_adapter": initialized_adapter_by_seed[seed],
                     "training_dataset_path": str(seeded_train),
                     "training_dataset_sha256": dataset_digest,
                     "recipe_path": str(variant_path),
@@ -633,7 +920,7 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             "task": task,
             "contract": {
                 "backend": "metal",
-                "seed_dimension": "typed-training-seed-plus-deterministic-row-order",
+                "seed_dimension": "adapter-initialization-plus-typed-training-seed-plus-deterministic-row-order",
                 "seeds": args.seeds,
                 "epochs": args.epochs,
                 "examples_per_epoch": examples_per_epoch,
@@ -643,6 +930,12 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
                 "expected_optimizer_steps": expected_optimizer_steps,
                 "allow_direct_gguf_training": args.allow_direct_gguf_training,
                 "quality_gates": quality_gates,
+                "initialization": {
+                    "producer": "antfly inference finetune adapter bootstrap gemma4",
+                    "manifest_schema": "antfly_gemma4_finetune/v3",
+                    "template_adapter_config": template_adapter_spec,
+                    "distinct_adapter_checkpoints": len(initialized_adapter_digests),
+                },
                 "environment_policy_sha256": resume_qualifier.ENVIRONMENT_POLICY_SHA256,
                 "strict_metal_environment": resume_qualifier.STRICT_METAL_ENV,
                 "sanitized_environment_prefixes": list(
@@ -663,6 +956,7 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
                 for name, path in immutable_roots.items()
             },
             "runs": runs,
+            "initialized_adapters": initialized_adapters,
             "quality_summary": _metric_summary(runs),
         }
         _write_json(output_root / "campaign_report.json", report)
@@ -673,6 +967,7 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             "status": "fail",
             "task": task,
             "error": str(exc),
+            "initialized_adapters": initialized_adapters,
             "completed_runs": runs,
         }
         try:
@@ -695,6 +990,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-dpo-eval-accuracy", type=float, default=0.4)
     parser.add_argument("--max-dpo-eval-loss", type=float, default=1.0)
     parser.add_argument("--min-dpo-eval-reward-margin", type=float, default=0.0)
+    parser.add_argument("--min-dpo-eval-accuracy-improvement", type=float, default=1e-6)
+    parser.add_argument(
+        "--min-dpo-eval-reward-margin-improvement", type=float, default=1e-6
+    )
+    parser.add_argument("--min-dpo-eval-loss-improvement", type=float, default=1e-6)
     parser.add_argument("--min-grpo-eval-mean-reward", type=float, default=0.125)
     parser.add_argument(
         "--min-grpo-eval-top-rank-mean-reward", type=float, default=0.125
@@ -703,6 +1003,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--min-grpo-eval-positive-reward-group-rate", type=float, default=0.75
     )
     parser.add_argument("--max-grpo-eval-kl-loss", type=float, default=0.004)
+    parser.add_argument(
+        "--min-grpo-eval-mean-reward-improvement", type=float, default=1e-6
+    )
+    parser.add_argument(
+        "--min-grpo-eval-top-rank-mean-reward-improvement",
+        type=float,
+        default=1e-6,
+    )
+    parser.add_argument(
+        "--min-grpo-eval-positive-reward-group-rate-improvement",
+        type=float,
+        default=1e-6,
+    )
     return parser.parse_args(argv)
 
 

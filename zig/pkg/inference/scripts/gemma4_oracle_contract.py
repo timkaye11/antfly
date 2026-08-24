@@ -53,7 +53,12 @@ BENCHMARK_PRODUCER_RELATIVE_PATHS = (
     "zig/pkg/inference/scripts/run_gemma4_lora_mlx_benchmark.py",
 )
 PREPARED_SCHEMA_VERSION = "gemma4_prepared/v6"
-ANTFLY_ADAPTER_MANIFEST_SCHEMA_VERSION = "antfly_gemma4_finetune/v2"
+ANTFLY_ADAPTER_MANIFEST_SCHEMA_V2 = "antfly_gemma4_finetune/v2"
+ANTFLY_ADAPTER_MANIFEST_SCHEMA_V3 = "antfly_gemma4_finetune/v3"
+ANTFLY_ADAPTER_MANIFEST_SCHEMA_VERSIONS = (
+    ANTFLY_ADAPTER_MANIFEST_SCHEMA_V2,
+    ANTFLY_ADAPTER_MANIFEST_SCHEMA_V3,
+)
 ANTFLY_ADAPTER_KEY_FORMAT = "antfly_gemma4_adapter_keys/v1"
 STOCK_PEFT_KEY_FORMAT = "stock-peft/v1"
 ANTFLY_PEFT_EXPORT_MANIFEST_SCHEMA_VERSION = "antfly_gemma4_peft_export/v1"
@@ -1820,6 +1825,7 @@ def validate_trace(
     if artifact["policy_source"] not in (
         "explicit-lock-policy",
         "antfly-finetune-manifest/v2",
+        "antfly-finetune-manifest/v3",
         "antfly-peft-export/v1",
     ):
         raise ContractError("artifact target policy source is unsupported")
@@ -2159,9 +2165,23 @@ def _read_antfly_adapter_manifest(adapter_dir: Path) -> dict[str, Any] | None:
         "target_preset", "rank", "alpha", "use_dora", "use_rslora", "initializer", "recursive_lora",
         "tensor_key_format", "adapter_checkpoint_sha256", "adapter_checkpoint_size_bytes",
     )
-    require_exact_keys(manifest, fields, where="antfly_finetune_manifest")
-    if manifest["schema_version"] != ANTFLY_ADAPTER_MANIFEST_SCHEMA_VERSION:
+    schema_version = manifest.get("schema_version")
+    if schema_version not in ANTFLY_ADAPTER_MANIFEST_SCHEMA_VERSIONS:
         raise ContractError("unsupported Antfly adapter manifest schema")
+    if schema_version == ANTFLY_ADAPTER_MANIFEST_SCHEMA_V3:
+        require_exact_keys(manifest, fields + ("initialization_seed",), where="antfly_finetune_manifest")
+        _require_int(manifest["initialization_seed"], "manifest.initialization_seed", minimum=0)
+    else:
+        # Older v2 artifacts omit the field. Writers that share the current
+        # typed manifest may serialize it as null; accept only that equivalent.
+        allowed = set(fields) | {"initialization_seed"}
+        unknown = sorted(set(manifest) - allowed)
+        missing = sorted(set(fields) - set(manifest))
+        if unknown or missing or manifest.get("initialization_seed") is not None:
+            raise ContractError(
+                "antfly_finetune_manifest keys do not match v2 "
+                f"(missing={missing}, unknown={unknown})"
+            )
     if manifest["tensor_key_format"] != ANTFLY_ADAPTER_KEY_FORMAT:
         raise ContractError(
             "Antfly adapter manifest tensor_key_format must be "
@@ -2298,7 +2318,7 @@ def read_adapter_config(adapter_dir: Path, *, target_preset: str | None = None) 
         ):
             raise ContractError("Antfly adapter manifest and PEFT config disagree")
         resolved_preset = manifest["target_preset"]
-        policy_source = "antfly-finetune-manifest/v2"
+        policy_source = f"antfly-finetune-manifest/{manifest['schema_version'].rsplit('/', 1)[-1]}"
         provenance = {
             "base_model_sha256": manifest["base_model_sha256"],
             "tokenizer_sha256": manifest["tokenizer_sha256"],
@@ -2307,6 +2327,7 @@ def read_adapter_config(adapter_dir: Path, *, target_preset: str | None = None) 
             "adapter_checkpoint_sha256": manifest["adapter_checkpoint_sha256"],
             "adapter_checkpoint_size_bytes": manifest["adapter_checkpoint_size_bytes"],
             "manifest_sha256": prefixed_sha256(adapter_dir.expanduser().resolve() / "antfly_finetune_manifest.json"),
+            "initialization_seed": manifest.get("initialization_seed"),
         }
     elif export_manifest is not None:
         if target_preset is not None and target_preset != export_manifest["target_preset"]:
@@ -2419,7 +2440,10 @@ def inspect_adapter_artifact(adapter_dir: Path, *, target_preset: str | None = N
     if len(layouts) != 1:
         raise ContractError(f"adapter mixes tensor key layouts: {sorted(layouts)}")
     key_layout = next(iter(layouts))
-    has_internal_manifest = config["policy_source"] == "antfly-finetune-manifest/v2"
+    has_internal_manifest = config["policy_source"] in (
+        "antfly-finetune-manifest/v2",
+        "antfly-finetune-manifest/v3",
+    )
     if has_internal_manifest and key_layout != ANTFLY_ADAPTER_KEY_FORMAT:
         raise ContractError("Antfly manifest declares internal keys but checkpoint uses stock PEFT keys")
     if not has_internal_manifest and key_layout != STOCK_PEFT_KEY_FORMAT:

@@ -8,8 +8,10 @@
 > regresses throughput. Canonical direct-GGUF E2B SFT/DPO/GRPO remains an
 > experimental research surface, and public QLoRA remains fail-closed. This is
 > not a blanket production-ready claim: independent-initialization and
-> baseline-relative quality, required CI, deployment materialization, and GGUF
-> task-parity gates remain.
+> baseline-relative gate machinery is implemented but has not yet produced a
+> replacement E2B/E4B campaign; required CI, real production-scale deployment
+> materialization evidence, full HF numerical parity, repeated performance,
+> and GGUF task-parity gates remain.
 
 The current Zig path implements the text causal-LM graph, sparse loss, LoRA
 optimizer, evaluation, and artifact pipeline intended for Gemma4 E2B and E4B
@@ -28,11 +30,14 @@ fresh-process GPU evaluation variation. The standalone report's derived total
 loss tracks the weighted-KL tolerance while its policy-gradient loss remains
 exact. Three-seed/eight-epoch absolute-floor campaigns pass for E2B/E4B DPO and
 E2B GRPO; E4B GRPO completes healthy optimizer work but fails held-out top-rank
-quality. These results establish bounded data-order robustness, not independent
-initialization, baseline-relative improvement, multi-task convergence,
-repeated distribution-level performance, or required-CI acceptance. This
-remains an implementation and qualification contract rather than a blanket
-readiness claim.
+quality. Those archived results establish bounded data-order robustness only.
+The current qualifier now creates a distinct deterministically seeded adapter
+per run and requires held-out improvement over that run's initialized adapter,
+but the E2B/E4B campaigns must be rerun before claiming independent-
+initialization or baseline-relative quality. Multi-task convergence, repeated
+distribution-level performance, and required-CI acceptance also remain open.
+This remains an implementation and qualification contract rather than a
+blanket readiness claim.
 
 Distributed training, multimodal/projector training, public GGUF QLoRA recipes,
 and Gemma4 MoE models are outside the supported path described here. Q4_0,
@@ -62,8 +67,10 @@ backend.
   contract. Target discovery is graph-aware: checkpoint-present K/V weights
   from shared-KV tail layers, omitted-V layers, and out-of-range layers are
   excluded, and an explicit request for one of those inert tensors fails
-  closed. Sharded bootstrap validates the complete index and shard set;
-  production-scale merged-model materialization is not implemented.
+  closed. Sharded bootstrap validates the complete index and shard set. Merged
+  deployment export accepts monolithic or sharded Safetensors and streams
+  untouched tensors byte-for-byte while materializing one adapted weight at a
+  time in its original F32/F16/BF16 dtype.
 - Memory-bounded sparse causal targets. The graph never owns a dense
   `[sequence, vocabulary]` target. Strict-Metal hard-label training uses the
   frozen tied-head fused linear cross-entropy primitive, which returns a
@@ -78,7 +85,9 @@ backend.
 - `adapter_config.json` stays inside the public PEFT LoRA schema. Antfly-only
   provenance, exact target policy, recursive metadata, and the internal tensor
   key format live in the strict `antfly_finetune_manifest.json` sidecar. The
-  sidecar also binds the adapter checkpoint byte size and SHA-256 digest.
+  sidecar also binds the adapter checkpoint byte size and SHA-256 digest. V3
+  manifests additionally bind the deterministic initialization seed, which is
+  preserved by generic bundle save and trained-adapter publication.
 - `adapter export gemma4-peft` validates a standard preset adapter against the
   exact base provenance, preserves every F32 tensor payload byte, translates
   only Antfly's internal tensor names into stock PEFT names, and atomically
@@ -399,7 +408,7 @@ is not evidence that training succeeded.
 ## Artifact Publication and Materialization
 
 The current source stages and no-replace-publishes bootstrap adapters, generic
-adapter saves, the bounded legacy merge path, recursive compressed-base output,
+adapter saves, the streaming merged-model path, recursive compressed-base output,
 and the primary autodiff adapter-plus-report directory. Prepared and standalone
 eval JSON are written to an exclusive sibling temporary, file-synced, renamed
 without replacement, and followed by a parent-directory sync. Adapter
@@ -415,12 +424,17 @@ are a different contract from immutable final artifacts. The legacy
 can target the staged artifact and complete before publication. Power-loss
 failure injection and stale-staging recovery remain open.
 
-Full-model materialization is deliberately fail-closed while it uses the
-legacy whole-model F32 implementation. It accepts only a monolithic
-Safetensors checkpoint of at most 64 MiB and rejects GGUF, sharded
-Safetensors, and larger files. This prevents an E2B/E4B OOM but also means
-production-scale E2B/E4B materialization is unavailable until a streaming,
-dtype-preserving, sharded writer is implemented.
+Full-model materialization now accepts monolithic or sharded Safetensors input,
+sorts one deterministic output inventory, copies every untouched payload
+byte-for-byte, and merges only one LoRA/DoRA target at a time. Adapted weights
+are accumulated in F32 and encoded back to the source F32, F16, or BF16 dtype.
+Before no-replace publication, the staged checkpoint is reopened and checked
+for exact inventory, shapes, dtypes, byte lengths, finite merged values, and
+unchanged non-target payloads. Synthetic sharded BF16 coverage proves the
+streaming and dtype-preservation contract; a pinned full E2B/E4B export,
+reload/generation comparison, disk-footprint measurement, and serving-quality
+gate remain required deployment evidence. GGUF merged export remains
+unsupported.
 
 ## Checkpoint and Resume Status
 
@@ -475,7 +489,7 @@ and quality evidence.
 
 | Lane | Base artifact | Purpose | Current release posture |
 | --- | --- | --- | --- |
-| BF16 correctness | Unquantized BF16 Safetensors | Establish native forward, loss, gradient, optimizer-update, and adapter-save correctness, then compare the stored-weight Metal kernel | Final-binary E2B and E4B Metal jobs pass process-kill/resume with byte-identical adapters. Three-seed/eight-epoch E2B/E4B DPO and E2B GRPO pass bounded absolute quality floors; E4B GRPO fails the predeclared top-rank floor, so baseline-relative quality, independent initialization, distribution-level performance, and required CI remain open |
+| BF16 correctness | Unquantized BF16 Safetensors | Establish native forward, loss, gradient, optimizer-update, and adapter-save correctness, then compare the stored-weight Metal kernel | Final-binary E2B and E4B Metal jobs pass process-kill/resume with byte-identical adapters. Three-seed/eight-epoch E2B/E4B DPO and E2B GRPO pass historical bounded absolute quality floors; E4B GRPO fails the predeclared top-rank floor. Independent-initialization and baseline-relative gates are implemented but await replacement campaigns; full HF parity, distribution-level performance, and required CI remain open |
 | Q4 deployment / QLoRA substrate | QAT Q4 GGUF used by serving | Prove target-name compatibility, adapter loading/application, memory bounds, and post-training generation quality on the deployed base | Packed Q4_0/Q4_K/Q6_K `dX` kernels pass without host dequantization, and explicitly gated canonical E2B Q4_0 SFT/DPO/GRPO lanes pass optimizer and process-kill/resume gates. Public `qlora-sft`, E4B GGUF, memory, parity, and task-quality gates remain fail-closed; direct-GGUF plus incremental-KV GRPO is separately rejected |
 
 The loaders may accept a Q4 GGUF and bootstrap adapter targets from its tensor
@@ -2861,10 +2875,11 @@ post-exit race. The interrupted E4B Q128 root has no wrapper report and remains
 excluded. Both incomplete roots were preserved, and accepted reruns used new
 immutable `v2` roots.
 
-These campaigns establish bounded RNG/data-order robustness, not independent
-initialization: all three seeds start from the same adapter. They use small,
-fixed row sets and absolute floors, not baseline-relative improvement,
-multi-task convergence, or a five-process performance distribution. The
+These archived campaigns establish bounded RNG/data-order robustness only:
+all three historical seeds start from the same adapter and use absolute floors.
+The current campaign contract replaces that design with independently seeded
+adapter bootstrap plus strict baseline-relative held-out gates, but no archived
+result is retroactively upgraded; the pinned campaigns must be rerun. The
 historical E2B high-learning-rate GRPO collapse remains valid negative
 evidence. None of these results enables public `qlora-sft` or broad E4B GRPO
 quality claims.
@@ -2918,8 +2933,8 @@ incremental-KV GRPO.
    predeclared top-rank floor. Next run pinned HF/PEFT one-, two-, and
    eight-step traces against Zig native and Metal for both target presets,
    prove semantic adapter equality after explicit key translation, diagnose
-   E4B GRPO under-learning, and add independent initialization plus
-   baseline-relative multi-task release thresholds.
+   E4B GRPO under-learning, and run the newly implemented independent-
+   initialization and baseline-relative thresholds across the release matrix.
 3. **Finish optional-lane provenance.** Bind teacher targets to their
    teacher/base identity and extend the closed run ledger when optional
    artifacts are admitted.
@@ -2956,18 +2971,19 @@ incremental-KV GRPO.
    and report dispersion before making a stable performance claim.
 8. **Real E2B acceptance.** Pinned BF16 DPO/GRPO now pass bounded
    three-seed/eight-epoch absolute quality floors and exact epoch-boundary
-   recovery. Add independent initialization, baseline-relative held-out gates,
-   larger disjoint datasets, adapter-reload generation, and the remaining
+   recovery. Rerun the new independent-initialization and baseline-relative
+   held-out gates, then add larger disjoint datasets, adapter-reload generation, and the remaining
    native-versus-Metal/HF per-target parity cells before a broad claim.
 9. **Real E4B acceptance.** Pinned BF16 DPO passes the bounded multi-seed gate
    and incremental GRPO recovery is exact, but GRPO misses its predeclared
    top-rank quality floor. Diagnose that failure, then repeat the broader E2B
    gates with sequences and target presets that exercise shared KV, PLE, and
    the larger adapter/optimizer footprint without fallback or unbounded growth.
-10. **Deployment and materialization.** Implement a streaming, dtype-preserving,
-   sharded writer; then apply accepted BF16-trained adapters to pinned E2B/E4B
-   QAT Q4 serving artifacts and require fingerprint, exact-token, quality,
-   memory, and repeated-generation gates.
+10. **Deployment and materialization.** The streaming, dtype-preserving writer
+    now accepts sharded Safetensors and validates its staged output. Apply
+    accepted BF16-trained adapters to pinned E2B/E4B bases and require full
+    reload, fingerprint, exact-token, quality, disk/memory, and repeated-
+    generation gates; separately design any QAT-Q4/GGUF merge contract.
 11. **Finish optional direct Q4/QLoRA qualification.** The pinned official E2B
     Q4_0 inventory now passes strict optimizer and process-kill/resume gates for
     canonical SFT/DPO/GRPO without host dequantization. Direct-GGUF GRPO plus

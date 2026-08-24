@@ -338,7 +338,8 @@ class Gemma4OracleContractTest(unittest.TestCase):
                 "modules_to_save": None,
                 "init_lora_weights": True,
             }), encoding="utf-8")
-            (adapter / "antfly_finetune_manifest.json").write_text(json.dumps({
+            manifest_path = adapter / "antfly_finetune_manifest.json"
+            manifest_payload = {
                 "schema_version": "antfly_gemma4_finetune/v2",
                 "status": "complete",
                 "artifact_family_version": "gemma4_lora/v1alpha1",
@@ -357,7 +358,8 @@ class Gemma4OracleContractTest(unittest.TestCase):
                 "use_rslora": False,
                 "initializer": None,
                 "recursive_lora": None,
-            }), encoding="utf-8")
+            }
+            manifest_path.write_text(json.dumps(manifest_payload), encoding="utf-8")
             result = read_adapter_config(adapter)
             self.assertEqual("peft-qv", result["target_preset"])
             self.assertEqual("antfly-finetune-manifest/v2", result["policy_source"])
@@ -366,7 +368,14 @@ class Gemma4OracleContractTest(unittest.TestCase):
             with self.assertRaisesRegex(ContractError, "conflicts"):
                 read_adapter_config(adapter, target_preset="text-all-linear")
 
-            (adapter / "antfly_finetune_manifest.json").unlink()
+            manifest_payload["schema_version"] = "antfly_gemma4_finetune/v3"
+            manifest_payload["initialization_seed"] = 17
+            manifest_path.write_text(json.dumps(manifest_payload), encoding="utf-8")
+            seeded = read_adapter_config(adapter)
+            self.assertEqual("antfly-finetune-manifest/v3", seeded["policy_source"])
+            self.assertEqual(17, seeded["provenance"]["initialization_seed"])
+
+            manifest_path.unlink()
             with self.assertRaisesRegex(ContractError, "requires an explicit target preset"):
                 read_adapter_config(adapter)
             stock = read_adapter_config(adapter, target_preset="peft-qv")

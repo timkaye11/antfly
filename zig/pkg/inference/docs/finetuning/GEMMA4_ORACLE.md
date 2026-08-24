@@ -88,12 +88,15 @@ Antfly and stock PEFT do not currently serialize identical tensor names:
 | Comparator identity | `model.layers.N.self_attn.q_proj:lora_A` |
 
 An Antfly artifact must include `antfly_finetune_manifest.json` with schema
-`antfly_gemma4_finetune/v2` and
+`antfly_gemma4_finetune/v2` or `antfly_gemma4_finetune/v3` and
 `tensor_key_format: antfly_gemma4_adapter_keys/v1`. The sidecar owns the target
 preset and base-model/tokenizer/chat-template provenance; `adapter_config.json`
 remains a stock PEFT configuration. It also binds the exact
 `adapter_model.safetensors` byte size and SHA-256 digest; validation recomputes
-both before accepting the artifact. A stock PEFT artifact has no sidecar, so
+both before accepting the artifact. V3 additionally requires the deterministic
+adapter-initialization seed, carries it into oracle inspection provenance, and
+is the required form for independent-initialization quality campaigns. A stock
+PEFT artifact has no sidecar, so
 the caller must supply `--target-preset` explicitly. An artifact produced by
 `antfly inference finetune adapter export gemma4-peft` remains a stock-key
 PEFT checkpoint, but also carries `antfly_peft_export.json`. The oracle

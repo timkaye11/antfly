@@ -51,15 +51,28 @@ during recipe planning, before any run manifest or report can be created.
 
 `qualify_gemma4_preference_quality_campaign.py` runs a minimum three-seed,
 minimum four-epoch DPO or GRPO quality gate through the public recipe CLI. Each
-typed seed also selects a deterministic permutation of the same immutable
-training-row multiset; every run must complete the exact optimizer horizon,
-change the adapter, publish a distinct final adapter digest, and pass held-out
-floors. The seed adapter is fixed across runs, so this proves RNG/data-order
-robustness rather than independent-initialization coverage. Its output root
-must not already exist. The campaign fails fast at the first seed that misses a
-floor, preserves that run's immutable artifacts and a `status = "fail"`
-campaign report, and does not run later seeds. A failed predeclared floor is
-negative evidence; do not weaken it after observing the result.
+typed seed now produces a fresh adapter through the public Gemma4 bootstrap,
+binds the initialization seed in a v3 Antfly manifest, and selects a
+deterministic permutation of the same immutable training-row multiset. The
+campaign rejects duplicate initial adapter checkpoints, requires every run to
+complete the exact optimizer horizon, change its adapter, publish a distinct
+final adapter digest, and pass held-out floors. Each run evaluates its fresh
+initialized adapter before training and also requires strict held-out accuracy,
+loss, and margin improvement for DPO or reward improvements for GRPO. Baseline
+and final evaluation reports are digest-bound into the campaign report. Its
+output root must not already exist. The campaign fails fast at the first seed
+that misses a floor, preserves that run's immutable artifacts and a
+`status = "fail"` campaign report, and does not run later seeds. A failed
+predeclared floor is negative evidence; do not weaken it after observing the
+result.
+
+`materialize-gemma4-lora` merges a validated standard LoRA/DoRA adapter into a
+monolithic deployment Safetensors file. The writer accepts monolithic or
+sharded Safetensors bases, streams untouched tensor bytes exactly, materializes
+only one adapted weight at a time, re-encodes it in the source F32/F16/BF16
+dtype, validates the staged inventory, metadata, finite merged values, and
+untouched payloads, then publishes the output directory without replacement.
+GGUF materialization remains unsupported.
 
 `materialize_gemma4_grpo_boolq.py` converts pinned Google BoolQ Parquet train
 and validation files into balanced, disjoint `text-grpo` JSONL artifacts. It

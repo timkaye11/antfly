@@ -47,6 +47,7 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
         base = {
             "recipe": "grpo",
             "model": {"path": "/model.gguf", "family": "gemma4"},
+            "adapter": {"path": "/template-adapter"},
             "dataset": {"path": "/train.jsonl", "eval_path": "/eval.jsonl"},
             "optimizer": {"epochs": 2, "learning_rate": 1e-7},
             "checkpoint": {"every_epochs": 1},
@@ -56,6 +57,7 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
             base,
             "grpo",
             991,
+            Path("/adapter-991"),
             Path("/seeded.jsonl"),
             Path("/run"),
             8,
@@ -66,6 +68,8 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
         self.assertEqual(variant["optimizer"]["epochs"], 8)
         self.assertEqual(variant["optimizer"]["seed"], 991)
         self.assertEqual(variant["optimizer"]["learning_rate"], 5e-8)
+        self.assertEqual(variant["adapter"]["path"], "/adapter-991")
+        self.assertEqual(variant["adapter"]["initialization_seed"], 991)
         self.assertTrue(variant["model"]["allow_direct_gguf_training"])
         self.assertNotIn("checkpoint", variant)
         self.assertEqual(variant["artifacts"]["root"], "/run")
@@ -75,6 +79,7 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
         base = {
             "recipe": "dpo",
             "model": {"path": "/model", "family": "gemma4"},
+            "adapter": {"path": "/template-adapter"},
             "dataset": {
                 "path": "/train.jsonl",
                 "train_path": "/train.jsonl",
@@ -86,6 +91,7 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
             base,
             "dpo",
             42,
+            Path("/adapter-42"),
             Path("/seeded.jsonl"),
             Path("/run"),
             8,
@@ -94,6 +100,34 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
         )
         self.assertEqual(variant["dataset"]["path"], "/seeded.jsonl")
         self.assertEqual(variant["dataset"]["train_path"], "/seeded.jsonl")
+
+    def test_template_adapter_bootstrap_spec_is_strict_and_peft_compatible(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            adapter = Path(temporary)
+            config = {
+                "r": 8,
+                "lora_alpha": 16.0,
+                "target_modules": ["model.layers.0.self_attn.q_proj"],
+                "init_lora_weights": True,
+                "use_dora": False,
+            }
+            (adapter / "adapter_config.json").write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+            self.assertEqual(
+                campaign._adapter_bootstrap_spec(adapter),
+                {
+                    "rank": 8,
+                    "alpha": 16.0,
+                    "target_modules": ["model.layers.0.self_attn.q_proj"],
+                },
+            )
+            config["init_lora_weights"] = "eva"
+            (adapter / "adapter_config.json").write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(campaign.ContractError, "standard LoRA"):
+                campaign._adapter_bootstrap_spec(adapter)
 
     def test_dataset_path_uses_runtime_precedence_and_rejects_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

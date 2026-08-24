@@ -3419,6 +3419,7 @@ pub fn saveTrainerAsGemmaBundle(
         .alpha = alpha,
         .target_modules = target_modules,
         .target_preset = adapter_inspect.target_preset,
+        .initialization_seed = adapter_inspect.initialization_seed,
         .recursive_config = .{
             .enabled = adapter_inspect.recursive_lora_enabled,
             .source_num_layers = adapter_inspect.recursive_source_num_layers orelse 0,
@@ -4108,6 +4109,7 @@ const GemmaBundleWriteSpec = struct {
     alpha: f32,
     target_modules: []const []const u8,
     target_preset: ?[]const u8 = null,
+    initialization_seed: ?u64 = null,
     recursive_config: @import("recursive_lora.zig").Config = .{},
     tokenizer_config_path: ?[]const u8 = null,
     tokenizer_path: ?[]const u8 = null,
@@ -4144,6 +4146,7 @@ fn writeAndPublishGemmaBundle(
         .alpha = spec.alpha,
         .target_modules = spec.target_modules,
         .target_preset = spec.target_preset,
+        .initialization_seed = spec.initialization_seed,
         .recursive_lora = spec.recursive_config,
     };
     try gemma4.writeAdapterConfigJson(allocator, adapter_config_path, adapter_write_options);

@@ -56,6 +56,7 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
     defer if (target_modules) |modules| allocator.free(modules);
     var use_dora = false;
     var init_lora_weights: ?[]const u8 = null;
+    var initialization_seed: u64 = 0;
     var eva_stats_path: ?[]const u8 = null;
     var lora_ga_stats_path: ?[]const u8 = null;
     var recursive_shared_block_size: ?usize = null;
@@ -112,6 +113,10 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
             i += 1;
             if (i >= argv.len) return usageError();
             init_lora_weights = argv[i];
+        } else if (std.mem.eql(u8, arg, "--initialization-seed")) {
+            i += 1;
+            if (i >= argv.len) return usageError();
+            initialization_seed = try std.fmt.parseUnsigned(u64, argv[i], 10);
         } else if (std.mem.eql(u8, arg, "--eva-stats")) {
             i += 1;
             if (i >= argv.len) return usageError();
@@ -167,6 +172,7 @@ pub fn runFromArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
             .gemma4_target_preset = gemma4_target_preset,
             .use_dora = use_dora,
             .init_lora_weights = init_lora_weights,
+            .initialization_seed = initialization_seed,
             .eva_stats_path = eva_stats_path,
             .lora_ga_stats_path = lora_ga_stats_path,
             .recursive_shared_block_size = recursive_shared_block_size,
@@ -201,6 +207,7 @@ pub fn printUsage() void {
         \\usage: antfly inference finetune adapter bootstrap gemma4 --model <dir> --out <dir> \\
         \\       --target-preset text-all-linear|peft-qv
         \\       [--rank <n>] [--alpha <float>]
+        \\       [--initialization-seed <u64>]
         \\       [--target-modules q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]
         \\
         \\Legacy positional form (deprecated for one release):
