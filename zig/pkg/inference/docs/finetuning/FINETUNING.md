@@ -588,10 +588,10 @@ dataset-wide raw-label union is not a valid contextual-slot schema.
 | `lora-sft`, `qlora-sft` | `gliner2` | `train-gliner2-autodiff` (real full-encoder autodiff training; the cached probe-surrogate bundle route was removed) |
 | `lora-sft`, `qlora-sft` | `layoutlmv3` | `bootstrap-layoutlmv3-lora` → `train-eval-layoutlmv3-lora-sequence` or `train-eval-layoutlmv3-lora-token` → optional `materialize-layoutlmv3-checkpoint` |
 | `sft` | supported non-Gemma LoRA families | same route as the family `lora-sft` adapter while full-weight SFT backends are still family-specific |
-| `dpo` | scalar preference fixtures | direct internal `preference_loss.zig` adapter over `dataset.format = "scalar-logprobs"` JSONL |
-| `dpo` | decoder models with local weights | direct internal `preference_harness.zig` adapter over `dataset.format = "text-preference"` or `"rendered-text-preference"` JSONL with `model.path` and optional `model.reference_path`; Gemma4 has native and strict-Metal optimizer-backed LoRA paths, exact same-graph base-reference caching, chosen/rejected gradient accumulation kept in one preference unit, and required disjoint held-out gates; Qwen2, ColQwen2, and Qwen3.5 text recipes also have optimizer-backed adapter-training paths |
+| `dpo` | scalar preference fixtures | direct internal `preference_loss.zig` adapter over `dataset.format = "scalar-logprobs"` JSONL; paired sigmoid DPO, cDPO label smoothing, IPO, and reference-free SimPO share the same typed loss contract |
+| `dpo` | decoder models with local weights | direct internal `preference_harness.zig` adapter over `dataset.format = "text-preference"` or `"rendered-text-preference"` JSONL with `model.path` and optional `model.reference_path`; Gemma4 has native and strict-Metal optimizer-backed LoRA paths, paired sigmoid DPO/cDPO, length-normalized IPO, reference-free SimPO, a frozen initial-adapter reference when initialization is not base-equivalent, chosen/rejected gradient accumulation kept in one preference unit, and required disjoint held-out gates; ORPO/CPO/KTO remain typed unsupported errors until their distinct differentiable or unpaired data contracts exist; Qwen2, ColQwen2, and Qwen3.5 text recipes also have optimizer-backed adapter-training paths |
 | `grpo` | scalar/token fixtures | direct internal `grpo.zig` adapter over `dataset.format = "token-logprobs"` JSONL |
-| `grpo` | decoder models with local weights | direct internal adapter over `dataset.format = "text-grpo"` or `"rendered-text-grpo"` JSONL with deterministic ranked sampling, decoded-text and token-level rewards, and optional `model.reference_path`; Gemma4 has native and strict-Metal optimizer-backed LoRA paths, required disjoint held-out gates, typed weighted reward providers, and rejects runs with no reward-derived advantage or no policy gradient; Qwen2, ColQwen2, and Qwen3.5 text recipes retain their optimizer-backed legacy-reward paths |
+| `grpo` | decoder models with local weights | direct internal adapter over `dataset.format = "text-grpo"` or `"rendered-text-grpo"` JSONL with resume-stable seeded categorical sampling, temperature/top-p/top-k filtering, decoded-text and token-level rewards, and optional `model.reference_path`; Gemma4 has native and strict-Metal optimizer-backed LoRA paths, group/no reward scaling, GRPO/BNPO/DR-GRPO/DAPO reductions, asymmetric clipping, truncated-completion masking, required disjoint held-out gates, typed weighted reward providers, and fail-closed zero-variance, non-finite, and KL-budget handling; multi-group fixture scoring implements batch reward scaling, but model training rejects it until prompt groups share a true rollout batch; Qwen2, ColQwen2, and Qwen3.5 text recipes retain their optimizer-backed legacy-reward paths |
 | `reranker` | `reranker` | `prepare-reranker-pooled-cache` → `train-eval-reranker-head-cached` → optional `materialize-reranker-head` |
 | `lora-sft`, `qlora-sft` | `reranker` | `bootstrap-reranker-lora` → `prepare-reranker-top-layer-cache` → `train-eval-reranker-lora-top-layer-cached-surrogate` → optional `materialize-reranker-lora` |
 | `vlm-retrieval` | `colqwen2` | `prepare-colqwen2-inputs` → `bootstrap-colqwen2-lora` → `train-eval-colqwen2-lora-bundle` |
@@ -619,15 +619,17 @@ Every non-dry run also writes:
 - `<artifacts.root>/training_report.json` with the normalized final status, per-step execution records, dataset fingerprints, backend build metadata, optimizer summary, and final artifact checksums
 
 Direct DPO and GRPO adapters also write `artifacts.report_path`, or `<artifacts.root>/dpo_report.json` / `<artifacts.root>/grpo_report.json` when no explicit report path is provided.
-Their report schemas are `antfly_inference_finetune_dpo_report/v6` and
-`antfly_inference_finetune_grpo_report/v6`; both bind the resolved
+Their report schemas are `antfly_inference_finetune_dpo_report/v7` and
+`antfly_inference_finetune_grpo_report/v7`; both bind the resolved
 `execution_mode` and `dataset_format`. Training reports additionally name the
 published adapter directory, while score reports leave it null. The normalized
 training report fingerprints both the bootstrap and trained adapter trees for
 train mode, making a missing or unchanged publication visible to automation.
 Gemma4 train reports also embed the passing held-out summary and checksum a
 separate `dpo_evaluation_report.json` or `grpo_evaluation_report.json`; the
-GRPO evaluation schema is `antfly_inference_finetune_grpo_evaluation/v3`. The
+DPO and GRPO evaluation schemas are
+`antfly_inference_finetune_dpo_evaluation/v3` and
+`antfly_inference_finetune_grpo_evaluation/v4`. The
 evaluator uses the live post-update policy and the immutable zero-LoRA
 same-graph reference. Evaluation failure remains visible in the normalized
 failed run report but prevents `adapter-trained` publication.
@@ -1122,7 +1124,7 @@ Completed:
 Remaining:
 
 1. Profile and coarsen the larger sequence-512 projection/normalization regions now that the RMSNorm-backward residual chain no longer allocates standalone outputs. Keep the compact attention VJP and in-frame reuse E2B-only until numerically stable E4B implementations pass multi-step trajectory and shared-oracle gates.
-2. Turn the exact-but-slower incremental-KV GRPO lane into a real speedup: integrate live LoRA into a compiled paged decoder, and eliminate the per-completion canonical rescore only after its logprobs are bit-exact. In parallel, add length-bucketed independent rows and then a `cu_seqlens`-driven ragged/segment-aware Gemma attention path with block isolation and per-segment RoPE reset for SFT, DPO scoring/backward, and GRPO rescoring/backward. Preserve deterministic ranked ordering and optimizer boundaries, require the existing exact E2B/E4B artifact gate, and beat the full-prefix/unpacked rollback on both models. Keep dense independent-row GRPO batching research-only until a predeclared tolerance-based quality gate justifies its higher memory and changed reduction order.
+2. Turn the exact-but-slower incremental-KV GRPO lane into a real speedup: integrate live LoRA into a compiled paged decoder, and eliminate the per-completion canonical rescore only after its logprobs are bit-exact. In parallel, add length-bucketed independent rows and then a `cu_seqlens`-driven ragged/segment-aware Gemma attention path with block isolation and per-segment RoPE reset for SFT, DPO scoring/backward, and GRPO rescoring/backward. Preserve seeded categorical distribution semantics, resume-stable RNG stream identity, selected-token validation, and optimizer boundaries; replace historical byte-identical ranked-completion gates with predeclared statistical quality gates plus exact same-seed replay and interruption/resume checks. Require E2B/E4B evidence and beat the full-prefix/unpacked rollback on both models. Keep dense independent-row GRPO batching research-only until a predeclared tolerance-based quality gate justifies its higher memory and changed reduction order.
 3. Close the optimized E4B DPO gap with a bounded-memory compiled whole-pair
    objective or segment-aware packed chosen/rejected graph. In the final-source
    refresh, fixed E4B is `1.224x/1.241x` slower than MLX by median/mean while

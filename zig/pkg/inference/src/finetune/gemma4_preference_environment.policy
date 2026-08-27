@@ -1,4 +1,4 @@
-# Gemma4 preference-training environment policy, version 1.
+# Gemma4 preference-training environment policy, version 2.
 #
 # Directives:
 #   scope-prefix PREFIX
@@ -15,6 +15,10 @@
 # This file is embedded by the Zig product boundary and read directly by the
 # Python qualification harnesses. Keep semantic/debug controls here instead of
 # maintaining language-specific allowlists.
+#
+# GRPO sampling/objective controls and DPO loss/label-smoothing controls are
+# deliberately typed recipe fields, not environment overrides, so their values
+# are fingerprinted and resume-safe.
 
 scope-prefix TERMITE_METAL_
 scope-prefix TERMITE_GEMMA4_

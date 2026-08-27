@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Run a provenance-locked real-BoolQ Gemma4 GRPO parity campaign in MLX.
 
-The campaign has two complementary lanes starting from the exact Antfly seed
-adapter:
+The legacy campaign has two complementary lanes starting from the exact
+Antfly seed adapter:
 
-* ``trace_replay`` uses Antfly's recorded ranked completion groups. This holds
+* ``trace_replay`` uses Antfly's recorded completion groups. This holds
   prompts, tokens, rewards, update order, optimizer, and reference semantics
   fixed so adapter-update differences are attributable to the implementation.
-* ``native_rollout`` lets MLX select its own ranked top-k groups. This measures
-  the end-to-end behavior users actually get and reports candidate overlap with
-  the Antfly campaign instead of silently forcing agreement.
+* ``native_rollout`` implements the retired ranked top-k sampler. The loader
+  fails closed for stochastic Antfly evidence until this lane implements
+  matching seeded categorical sampling and statistical behavioral gates.
 
 The runner is offline-only. It consumes a pinned BoolQ materialization and a
 completed Antfly acceptance root, and imports MLX lazily so contract tests need
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import array
+from collections import Counter
 import hashlib
 import json
 import math
@@ -46,6 +47,7 @@ GRPO_REPORT_SCHEMA_VERSIONS = frozenset(
         "antfly_inference_finetune_grpo_report/v4",
         "antfly_inference_finetune_grpo_report/v5",
         "antfly_inference_finetune_grpo_report/v6",
+        "antfly_inference_finetune_grpo_report/v7",
     }
 )
 GRPO_EVAL_SCHEMA_VERSIONS = frozenset(
@@ -53,9 +55,10 @@ GRPO_EVAL_SCHEMA_VERSIONS = frozenset(
         "antfly_inference_finetune_grpo_evaluation/v1",
         "antfly_inference_finetune_grpo_evaluation/v2",
         "antfly_inference_finetune_grpo_evaluation/v3",
+        "antfly_inference_finetune_grpo_evaluation/v4",
     }
 )
-GRPO_KL_TRACE_SCHEMA_VERSION = "antfly_inference_grpo_kl_control_trace/v1"
+GRPO_KL_TRACE_SCHEMA_VERSION = "antfly_inference_grpo_kl_control_trace/v2"
 ANTFLY_LEGACY_REFERENCE_MODE = "compiled-zero-lora"
 ANTFLY_BATCHED_REFERENCE_MODE = "compiled-zero-lora-shared-prompt-candidate-row"
 ANTFLY_PHASED_EVALUATION_ORDER = (
@@ -79,7 +82,7 @@ FIXED_OPTIMIZER = {
 FIXED_GRPO = {
     "clip_epsilon": 0.2,
     "kl_coef": 0.04,
-    "advantage_epsilon": 1.0e-8,
+    "advantage_epsilon": 1.0e-4,
 }
 BEHAVIORAL_PARITY_LIMITS = {
     "max_baseline_mean_reward_abs_delta": 1.0 / 512.0,
@@ -506,8 +509,6 @@ def load_trace(
     )
     if any(len(group.completions) != group_size for group in result):
         raise BoolQParityContractError(f"{phase} reward trace group size drifted")
-    if any(len(set(group.token_ids)) != group_size for group in result):
-        raise BoolQParityContractError(f"{phase} reward trace contains duplicate ranked tokens")
     return result
 
 
@@ -539,6 +540,7 @@ def require_v4_kl_control(root: Path, train_report: Mapping[str, Any]) -> None:
         "antfly_inference_finetune_grpo_report/v4",
         "antfly_inference_finetune_grpo_report/v5",
         "antfly_inference_finetune_grpo_report/v6",
+        "antfly_inference_finetune_grpo_report/v7",
     }:
         return
     mean_kl = train_report.get("mean_kl")
@@ -577,6 +579,7 @@ def require_v4_kl_control(root: Path, train_report: Mapping[str, Any]) -> None:
             or row.get("group_index") != index
             or row.get("optimizer_steps_before") != index
             or row.get("status") != "admitted"
+            or row.get("budget_policy") != "skip_group"
             or isinstance(observed, bool)
             or not isinstance(observed, (int, float))
             or not math.isfinite(float(observed))
@@ -587,6 +590,19 @@ def require_v4_kl_control(root: Path, train_report: Mapping[str, Any]) -> None:
             or float(observed) > float(budget)
         ):
             raise BoolQParityContractError("Antfly GRPO v4 KL admission trace drifted")
+
+
+def require_native_rollout_sampler_compatibility(
+    train_report: Mapping[str, Any],
+) -> None:
+    mode = train_report.get("sampling_mode")
+    if isinstance(mode, str) and "ranked" in mode:
+        return
+    raise BoolQParityContractError(
+        "MLX native_rollout still implements the retired deterministic ranked sampler; "
+        "stochastic Antfly evidence is eligible only after the MLX lane implements "
+        "seeded categorical temperature/top-p/top-k sampling and statistical gates"
+    )
 
 
 def load_acceptance(root: Path, manifest: Mapping[str, Any]) -> AcceptanceEvidence:
@@ -607,15 +623,50 @@ def load_acceptance(root: Path, manifest: Mapping[str, Any]) -> AcceptanceEviden
     }
     if any(train_report.get(key) != value for key, value in expected_counts.items()):
         raise BoolQParityContractError("Antfly training counts differ from the fixed campaign")
+    if train_report.get("schema_version") == "antfly_inference_finetune_grpo_report/v7":
+        if (
+            train_report.get("optimizer_groups") != FIXED_TRAIN_GROUPS
+            or train_report.get("zero_reward_std_groups") != 0
+            or train_report.get("all_truncated_groups") != 0
+            or train_report.get("kl_rejected_groups") != 0
+            or float(train_report.get("frac_reward_zero_std", -1.0)) != 0.0
+            or float(train_report.get("frac_kl_rejected", -1.0)) != 0.0
+            or train_report.get("loss_type") != "bnpo"
+            or train_report.get("scale_rewards") != "group"
+            or float(train_report.get("epsilon_low", 0.0)) != FIXED_GRPO["clip_epsilon"]
+            or float(train_report.get("epsilon_high", 0.0)) != FIXED_GRPO["clip_epsilon"]
+            or train_report.get("max_completion_tokens") != FIXED_MAX_COMPLETION_TOKENS
+            or train_report.get("mask_truncated_completions") is not False
+            or train_report.get("num_iterations") != 1
+        ):
+            raise BoolQParityContractError("Antfly GRPO v7 objective semantics drifted")
+        truncated = train_report.get("truncated_completions")
+        truncated_fraction = train_report.get("frac_completions_truncated")
+        if (
+            isinstance(truncated, bool)
+            or not isinstance(truncated, int)
+            or not 0 <= truncated <= expected_counts["completions"]
+            or not isinstance(truncated_fraction, (int, float))
+            or not math.isclose(
+                float(truncated_fraction),
+                truncated / expected_counts["completions"],
+                rel_tol=0.0,
+                abs_tol=1e-7,
+            )
+        ):
+            raise BoolQParityContractError("Antfly truncated-completion telemetry drifted")
     if train_report.get("policy_backend") != "metal":
         raise BoolQParityContractError("Antfly parity evidence must use Metal")
     if eval_report.get("schema_version") not in GRPO_EVAL_SCHEMA_VERSIONS:
         raise BoolQParityContractError("Antfly GRPO evaluation schema drifted")
     if eval_report.get("status") != "passed" or eval_report.get("groups") != FIXED_EVAL_GROUPS:
         raise BoolQParityContractError("Antfly held-out campaign did not pass")
+    if eval_report.get("mask_truncated_completions") is not False:
+        raise BoolQParityContractError("Antfly evaluation truncation policy drifted")
     if eval_report.get("schema_version") in {
         "antfly_inference_finetune_grpo_evaluation/v2",
         "antfly_inference_finetune_grpo_evaluation/v3",
+        "antfly_inference_finetune_grpo_evaluation/v4",
     }:
         eval_mean_kl = eval_report.get("mean_kl")
         if (
@@ -627,6 +678,7 @@ def load_acceptance(root: Path, manifest: Mapping[str, Any]) -> AcceptanceEviden
             raise BoolQParityContractError("Antfly GRPO v2 evaluation KL is invalid")
     require_antfly_reference_contract(train_report, eval_report)
     require_v4_kl_control(evidence_root, train_report)
+    require_native_rollout_sampler_compatibility(train_report)
 
     recipe = config.get("recipe")
     if not isinstance(recipe, dict):
@@ -664,6 +716,10 @@ def load_acceptance(root: Path, manifest: Mapping[str, Any]) -> AcceptanceEviden
         or abs(float(grpo.get("clip_epsilon", 0.0)) - FIXED_GRPO["clip_epsilon"]) > 1.0e-6
         or abs(float(grpo.get("kl_coef", 0.0)) - FIXED_GRPO["kl_coef"]) > 1.0e-6
         or grpo.get("normalize_advantage") is not True
+        or grpo.get("loss_type") not in (None, "bnpo")
+        or grpo.get("scale_rewards") not in (None, "group")
+        or grpo.get("epsilon_high") not in (None, FIXED_GRPO["clip_epsilon"])
+        or grpo.get("mask_truncated_completions") not in (None, False)
     ):
         raise BoolQParityContractError("Antfly GRPO contract drifted")
 
@@ -695,7 +751,11 @@ def normalized_advantages(rewards: Sequence[float], epsilon: float) -> list[floa
     if not rewards:
         raise BoolQParityContractError("cannot normalize an empty reward group")
     mean = statistics.mean(rewards)
-    variance = sum((reward - mean) ** 2 for reward in rewards) / len(rewards)
+    variance = (
+        sum((reward - mean) ** 2 for reward in rewards) / (len(rewards) - 1)
+        if len(rewards) > 1
+        else 0.0
+    )
     denominator = math.sqrt(variance) + epsilon
     return [(reward - mean) / denominator for reward in rewards]
 
@@ -705,13 +765,15 @@ def exact_match_ci(decoded_text: str, target: str) -> float:
 
 
 def candidate_overlap(actual: Sequence[int], expected: Sequence[int]) -> Mapping[str, Any]:
-    if not actual or len(actual) != len(expected) or len(set(actual)) != len(actual) or len(set(expected)) != len(expected):
-        raise BoolQParityContractError("candidate groups must be non-empty distinct equal-length rankings")
-    overlap = len(set(actual) & set(expected))
+    if not actual or len(actual) != len(expected):
+        raise BoolQParityContractError("candidate groups must be non-empty and equal-length")
+    actual_counts = Counter(actual)
+    expected_counts = Counter(expected)
+    overlap = sum((actual_counts & expected_counts).values())
     return {
         "overlap": overlap,
         "recall": overlap / len(expected),
-        "exact_set": set(actual) == set(expected),
+        "exact_set": actual_counts == expected_counts,
         "exact_order": tuple(actual) == tuple(expected),
         "top1_match": actual[0] == expected[0],
     }

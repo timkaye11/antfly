@@ -400,6 +400,7 @@ def _validate_run(
     expected_seed: int,
     expected_units: int,
     expected_optimizer_steps: int,
+    gradient_accumulation_steps: int,
     expected_epochs: int,
     expected_train_path: Path,
     expected_seed_adapter_path: Path,
@@ -409,7 +410,8 @@ def _validate_run(
 ) -> dict[str, Any]:
     report_path = run_root / f"{task}_report.json"
     report = _load_json(report_path, f"{task} report")
-    if report.get("schema_version") != f"antfly_inference_finetune_{task}_report/v6":
+    expected_schema = f"antfly_inference_finetune_{task}_report/v7"
+    if report.get("schema_version") != expected_schema:
         raise ContractError(f"{task} report has unsupported schema")
     if report.get("execution_mode") != "train" or report.get("policy_backend") != "metal":
         raise ContractError("campaign run was not optimizer-backed Metal training")
@@ -434,9 +436,57 @@ def _validate_run(
     unit_field = "examples" if task == "dpo" else "groups"
     if _integer(report.get(unit_field), f"report.{unit_field}", 1) != expected_units:
         raise ContractError(f"report.{unit_field} does not cover the full horizon")
-    if _integer(report.get("optimizer_steps"), "report.optimizer_steps", 1) != expected_optimizer_steps:
-        raise ContractError("report.optimizer_steps does not cover the exact long horizon")
-    if _integer(report.get("micro_batch_steps"), "report.micro_batch_steps", 1) < expected_units:
+    minimum_micro_batch_units = expected_units
+    realized_optimizer_steps = expected_optimizer_steps
+    if task == "grpo":
+        optimizer_groups = _integer(
+            report.get("optimizer_groups"), "report.optimizer_groups", 1
+        )
+        zero_groups = _integer(
+            report.get("zero_reward_std_groups"),
+            "report.zero_reward_std_groups",
+        )
+        all_truncated_groups = _integer(
+            report.get("all_truncated_groups"), "report.all_truncated_groups"
+        )
+        kl_rejected_groups = _integer(
+            report.get("kl_rejected_groups"), "report.kl_rejected_groups"
+        )
+        if (
+            optimizer_groups
+            + zero_groups
+            + all_truncated_groups
+            + kl_rejected_groups
+            != expected_units
+        ):
+            raise ContractError("GRPO admitted and skipped groups do not cover the horizon")
+        reported_fraction = _probability(
+            report.get("frac_reward_zero_std"), "report.frac_reward_zero_std"
+        )
+        if not math.isclose(
+            reported_fraction,
+            zero_groups / expected_units,
+            rel_tol=0.0,
+            abs_tol=1e-7,
+        ):
+            raise ContractError("GRPO zero-variance group fraction is inconsistent")
+        reported_kl_fraction = _probability(
+            report.get("frac_kl_rejected"), "report.frac_kl_rejected"
+        )
+        if not math.isclose(
+            reported_kl_fraction,
+            kl_rejected_groups / expected_units,
+            rel_tol=0.0,
+            abs_tol=1e-7,
+        ):
+            raise ContractError("GRPO KL-rejected group fraction is inconsistent")
+        realized_optimizer_steps = (
+            optimizer_groups + gradient_accumulation_steps - 1
+        ) // gradient_accumulation_steps
+        minimum_micro_batch_units = optimizer_groups
+    if _integer(report.get("optimizer_steps"), "report.optimizer_steps", 1) != realized_optimizer_steps:
+        raise ContractError("report.optimizer_steps does not cover the admitted long horizon")
+    if _integer(report.get("micro_batch_steps"), "report.micro_batch_steps", 1) < minimum_micro_batch_units:
         raise ContractError("report.micro_batch_steps is shorter than the long horizon")
 
     training_report_path = run_root / "training_report.json"
@@ -1012,6 +1062,7 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
                 seed,
                 expected_units,
                 expected_optimizer_steps,
+                gradient_accumulation_steps,
                 args.epochs,
                 seeded_train,
                 Path(initialized_adapter_by_seed[seed]["path"]),

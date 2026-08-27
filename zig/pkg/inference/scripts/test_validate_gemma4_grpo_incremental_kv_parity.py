@@ -15,8 +15,8 @@ SPEC.loader.exec_module(gate)
 
 
 class IncrementalKvParityGateTests(unittest.TestCase):
-    def test_accepts_checkpoint_report_schema_v6(self) -> None:
-        self.assertIn("antfly_inference_finetune_grpo_report/v6", gate.TRAIN_SCHEMAS)
+    def test_accepts_stochastic_sampling_report_schema_v7(self) -> None:
+        self.assertIn("antfly_inference_finetune_grpo_report/v7", gate.TRAIN_SCHEMAS)
 
     def test_accepts_exact_qualified_telemetry(self) -> None:
         report = {
@@ -28,8 +28,9 @@ class IncrementalKvParityGateTests(unittest.TestCase):
                 "max_prompt_tail_batch_size": 1,
                 "decode_forwards": 88,
                 "exact_logprob_rescore_forwards": 32,
-                "resident_ranked_token_selections": 248,
+                "resident_ranked_token_selections": 0,
                 "host_logit_fallbacks": 0,
+                "host_logit_sampling_rows": 96,
                 "shared_prompt_tokens": 1024,
                 "reused_candidate_prompt_tokens": 1024,
                 "cache_page_tokens": 16,
@@ -55,8 +56,9 @@ class IncrementalKvParityGateTests(unittest.TestCase):
                 "max_prompt_tail_batch_size": 1,
                 "decode_forwards": 88,
                 "exact_logprob_rescore_forwards": 32,
-                "resident_ranked_token_selections": 120,
+                "resident_ranked_token_selections": 0,
                 "host_logit_fallbacks": 0,
+                "host_logit_sampling_rows": 96,
                 "shared_prompt_tokens": 0,
                 "reused_candidate_prompt_tokens": 0,
                 "cache_page_tokens": 16,
@@ -89,8 +91,9 @@ class IncrementalKvParityGateTests(unittest.TestCase):
                 "max_decode_batch_size": 4,
                 "active_candidate_batching": True,
                 "exact_logprob_rescore_forwards": 32,
-                "resident_ranked_token_selections": 248,
+                "resident_ranked_token_selections": 0,
                 "host_logit_fallbacks": 0,
+                "host_logit_sampling_rows": 96,
                 "shared_prompt_tokens": 1024,
                 "reused_candidate_prompt_tokens": 1024,
                 "cache_page_tokens": 16,
@@ -130,8 +133,9 @@ class IncrementalKvParityGateTests(unittest.TestCase):
                 "prompt_tail_cloning": True,
                 "decode_forwards": 24,
                 "exact_logprob_rescore_forwards": 32,
-                "resident_ranked_token_selections": 248,
+                "resident_ranked_token_selections": 0,
                 "host_logit_fallbacks": 0,
+                "host_logit_sampling_rows": 96,
                 "shared_prompt_tokens": 1024,
                 "reused_candidate_prompt_tokens": 1024,
                 "cache_page_tokens": 16,
@@ -171,8 +175,9 @@ class IncrementalKvParityGateTests(unittest.TestCase):
                 "prompt_tail_cloning": True,
                 "decode_forwards": 24,
                 "exact_logprob_rescore_forwards": 32,
-                "resident_ranked_token_selections": 248,
+                "resident_ranked_token_selections": 0,
                 "host_logit_fallbacks": 0,
+                "host_logit_sampling_rows": 96,
                 "shared_prompt_tokens": 1024,
                 "reused_candidate_prompt_tokens": 1024,
                 "cache_page_tokens": 16,

@@ -17,11 +17,26 @@ import run_gemma4_grpo_boolq_mlx_parity as parity  # noqa: E402
 
 
 class BoolQGrpoMlxParityTests(unittest.TestCase):
-    def test_accepts_checkpoint_report_schema_v6(self) -> None:
+    def test_accepts_stochastic_report_schema_v7(self) -> None:
         self.assertIn(
-            "antfly_inference_finetune_grpo_report/v6",
+            "antfly_inference_finetune_grpo_report/v7",
             parity.GRPO_REPORT_SCHEMA_VERSIONS,
         )
+        self.assertIn(
+            "antfly_inference_finetune_grpo_evaluation/v4",
+            parity.GRPO_EVAL_SCHEMA_VERSIONS,
+        )
+
+    def test_native_rollout_fails_closed_for_stochastic_antfly_sampling(self) -> None:
+        parity.require_native_rollout_sampler_compatibility(
+            {"sampling_mode": "shared-prompt-ranked-sparse-row"}
+        )
+        with self.assertRaisesRegex(
+            parity.BoolQParityContractError, "retired deterministic ranked sampler"
+        ):
+            parity.require_native_rollout_sampler_compatibility(
+                {"sampling_mode": "shared-prompt-seeded-categorical-sparse-row"}
+            )
 
     def test_exact_match_ci_is_trimmed_but_not_substring_match(self) -> None:
         self.assertEqual(1.0, parity.exact_match_ci(" Yes ", "yes"))
@@ -29,12 +44,12 @@ class BoolQGrpoMlxParityTests(unittest.TestCase):
         self.assertEqual(0.0, parity.exact_match_ci("yesterday", "yes"))
         self.assertEqual(0.0, parity.exact_match_ci("not", "no"))
 
-    def test_normalized_advantages_match_population_variance_contract(self) -> None:
-        values = parity.normalized_advantages([1.0, 1.0, 0.0, 0.0], 1.0e-8)
-        self.assertAlmostEqual(1.0, values[0], places=6)
-        self.assertAlmostEqual(1.0, values[1], places=6)
-        self.assertAlmostEqual(-1.0, values[2], places=6)
-        self.assertAlmostEqual(-1.0, values[3], places=6)
+    def test_normalized_advantages_match_unbiased_variance_contract(self) -> None:
+        values = parity.normalized_advantages([1.0, 1.0, 0.0, 0.0], 1.0e-4)
+        self.assertAlmostEqual(0.865875, values[0], places=6)
+        self.assertAlmostEqual(0.865875, values[1], places=6)
+        self.assertAlmostEqual(-0.865875, values[2], places=6)
+        self.assertAlmostEqual(-0.865875, values[3], places=6)
         self.assertAlmostEqual(0.0, sum(values), places=7)
 
     def test_candidate_overlap_distinguishes_set_order_and_top1(self) -> None:
@@ -89,7 +104,7 @@ class BoolQGrpoMlxParityTests(unittest.TestCase):
             ):
                 parity.load_trace(path, phase="train", expected_groups=2, group_size=2)
 
-    def test_trace_loader_rejects_duplicate_ranked_tokens(self) -> None:
+    def test_trace_loader_accepts_duplicate_stochastic_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "trace.jsonl"
             rows = [
@@ -104,10 +119,10 @@ class BoolQGrpoMlxParityTests(unittest.TestCase):
             path.write_text(
                 "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
             )
-            with self.assertRaisesRegex(
-                parity.BoolQParityContractError, "duplicate ranked tokens"
-            ):
-                parity.load_trace(path, phase="train", expected_groups=1, group_size=2)
+            groups = parity.load_trace(
+                path, phase="train", expected_groups=1, group_size=2
+            )
+            self.assertEqual((7, 7), groups[0].token_ids)
 
     def _materialization(self, root: Path) -> Path:
         train = root / "train.jsonl"
@@ -209,6 +224,7 @@ class BoolQGrpoMlxParityTests(unittest.TestCase):
                     "group_index": index,
                     "optimizer_steps_before": index,
                     "status": "admitted",
+                    "budget_policy": "skip_group",
                     "mean_kl": 0.001,
                     "train_max_kl": 0.1,
                 }

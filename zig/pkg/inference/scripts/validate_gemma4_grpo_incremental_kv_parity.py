@@ -21,10 +21,12 @@ TRAIN_SCHEMAS = {
     "antfly_inference_finetune_grpo_report/v4",
     "antfly_inference_finetune_grpo_report/v5",
     "antfly_inference_finetune_grpo_report/v6",
+    "antfly_inference_finetune_grpo_report/v7",
 }
 EVAL_SCHEMAS = {
     "antfly_inference_finetune_grpo_evaluation/v2",
     "antfly_inference_finetune_grpo_evaluation/v3",
+    "antfly_inference_finetune_grpo_evaluation/v4",
 }
 EXACT_FILES = (
     "grpo_reward_trace.jsonl",
@@ -38,6 +40,21 @@ TRAIN_SEMANTIC_FIELDS = (
     "completions",
     "tokens",
     "groups",
+    "optimizer_groups",
+    "zero_reward_std_groups",
+    "all_truncated_groups",
+    "kl_rejected_groups",
+    "frac_reward_zero_std",
+    "truncated_completions",
+    "frac_completions_truncated",
+    "mask_truncated_completions",
+    "frac_kl_rejected",
+    "loss_type",
+    "scale_rewards",
+    "epsilon_low",
+    "epsilon_high",
+    "max_completion_tokens",
+    "num_iterations",
     "loss",
     "pg_loss",
     "kl_loss",
@@ -48,6 +65,8 @@ TRAIN_SEMANTIC_FIELDS = (
     "policy_backend",
     "optimizer_steps",
     "micro_batch_steps",
+    "training_seed",
+    "sampling",
     "policy_logprob_mode",
     "policy_rescore_completions",
     "training_microbatch_mode",
@@ -63,6 +82,11 @@ EVAL_SEMANTIC_FIELDS = (
     "groups",
     "completions",
     "tokens",
+    "zero_reward_std_groups",
+    "frac_reward_zero_std",
+    "truncated_completions",
+    "frac_completions_truncated",
+    "mask_truncated_completions",
     "prompt_overlap_count",
     "mean_reward",
     "top_rank_mean_reward",
@@ -76,6 +100,7 @@ EVAL_SEMANTIC_FIELDS = (
     "minimums",
     "reference_mode",
     "execution_order",
+    "sampling",
 )
 
 
@@ -138,6 +163,7 @@ def require_incremental_telemetry(
         "exact_logprob_rescore_forwards",
         "resident_ranked_token_selections",
         "host_logit_fallbacks",
+        "host_logit_sampling_rows",
         "shared_prompt_tokens",
         "reused_candidate_prompt_tokens",
         "cache_page_tokens",
@@ -154,13 +180,19 @@ def require_incremental_telemetry(
         raise ParityError(f"{label} did not execute incremental decode forwards")
     if telemetry["exact_logprob_rescore_forwards"] != expected_completions:
         raise ParityError(f"{label} did not exactly rescore every incremental completion")
-    # Selecting rank r requires r+1 resident argmax passes with progressively
-    # suppressed winners. The dispatch count therefore exceeds the generated
-    # token count whenever candidates use ranks above zero.
-    if telemetry["resident_ranked_token_selections"] < expected_tokens:
-        raise ParityError(f"{label} did not rank every generated token on device")
+    if telemetry["resident_ranked_token_selections"] != 0:
+        raise ParityError(f"{label} used the retired deterministic ranked-token path")
     if telemetry["host_logit_fallbacks"] != 0:
-        raise ParityError(f"{label} downloaded eager logits to the host")
+        raise ParityError(f"{label} used an unqualified host-logit fallback")
+    # Every completion owns its first token, but a shared prompt produces one
+    # common first-token distribution per group. Every later token owns one
+    # distribution row. This identity proves that host-side categorical
+    # sampling neither omitted nor repeated a logical decision.
+    expected_sampling_rows = expected_tokens - expected_completions + expected_groups
+    if expected_sampling_rows < expected_groups:
+        raise ParityError(f"{label} completion/token geometry is invalid")
+    if telemetry["host_logit_sampling_rows"] != expected_sampling_rows:
+        raise ParityError(f"{label} host categorical-sampling row accounting drifted")
     if telemetry["shared_prompt_tokens"] == 0 or telemetry["reused_candidate_prompt_tokens"] == 0:
         raise ParityError(f"{label} did not reuse aligned prompt pages")
     if telemetry["cache_page_tokens"] != 16 or telemetry.get("cache_dtype") != "f32":
@@ -222,13 +254,17 @@ def validate(
     if candidate_train.get("schema_version") not in {
         "antfly_inference_finetune_grpo_report/v5",
         "antfly_inference_finetune_grpo_report/v6",
+        "antfly_inference_finetune_grpo_report/v7",
     }:
         raise ParityError("candidate train report must use an incremental-KV v5/v6 schema")
     if baseline_eval.get("schema_version") not in EVAL_SCHEMAS:
         raise ParityError("baseline evaluation report schema is unsupported")
-    if candidate_eval.get("schema_version") != "antfly_inference_finetune_grpo_evaluation/v3":
-        raise ParityError("candidate evaluation report must use the incremental-KV v3 schema")
-    if candidate_train.get("sampling_mode") != "shared-page-prompt-ranked-incremental-kv":
+    if candidate_eval.get("schema_version") not in {
+        "antfly_inference_finetune_grpo_evaluation/v3",
+        "antfly_inference_finetune_grpo_evaluation/v4",
+    }:
+        raise ParityError("candidate evaluation report must use an incremental-KV v3/v4 schema")
+    if candidate_train.get("sampling_mode") != "shared-page-prompt-seeded-categorical-incremental-kv":
         raise ParityError("candidate did not report the incremental KV sampling mode")
 
     require_equal(

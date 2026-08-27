@@ -12,11 +12,24 @@ import run_gemma4_grpo_boolq_mlx_multitoken as campaign
 
 
 class Gemma4GrpoBoolQMultiTokenTests(unittest.TestCase):
-    def test_accepts_checkpoint_report_schema_v6(self) -> None:
+    def test_accepts_stochastic_report_schema_v7(self) -> None:
         self.assertIn(
-            "antfly_inference_finetune_grpo_report/v6",
+            "antfly_inference_finetune_grpo_report/v7",
             campaign.GRPO_REPORT_SCHEMA_VERSIONS,
         )
+        self.assertIn(
+            "antfly_inference_finetune_grpo_evaluation/v4",
+            campaign.GRPO_EVAL_SCHEMA_VERSIONS,
+        )
+
+    def test_shared_native_rollout_guard_rejects_stochastic_sampler_drift(self) -> None:
+        with self.assertRaisesRegex(
+            campaign.legacy.BoolQParityContractError,
+            "retired deterministic ranked sampler",
+        ):
+            campaign.legacy.require_native_rollout_sampler_compatibility(
+                {"sampling_mode": "shared-prompt-seeded-categorical"}
+            )
 
     def test_campaign_shape_requires_a_real_multi_token_matrix(self) -> None:
         campaign.CampaignSpec("gemma-4-E2B-it", 8, 16, 4, 4).validate()

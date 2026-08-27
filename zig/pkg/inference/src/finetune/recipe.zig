@@ -62,6 +62,7 @@ const print = std.debug.print;
 const default_lora_rank: usize = 16;
 const default_policy_lora_rank: usize = 8;
 const default_lora_alpha: f32 = 32.0;
+const default_grpo_max_completion_tokens: usize = 16;
 const default_lora_target_preset = "all-linear";
 const default_gemma4_lora_target_preset = "text-all-linear";
 
@@ -266,19 +267,110 @@ pub const OptimizerConfig = struct {
 };
 
 pub const PreferenceConfig = struct {
+    /// `sigmoid` (default), `ipo`, or `simpo`. ORPO/CPO require a
+    /// differentiable auxiliary SFT term and KTO requires unpaired data, so
+    /// those names fail closed in the paired Gemma4 recipe path.
+    loss_type: ?[]const u8 = null,
     beta: ?f32 = null,
+    label_smoothing: ?f32 = null,
     simpo_gamma: ?f32 = null,
     sft_lambda: ?f32 = null,
     ipo_tau: ?f32 = null,
 };
 
+const DpoLossType = enum {
+    sigmoid,
+    ipo,
+    simpo,
+};
+
+const ResolvedDpoObjectiveConfig = struct {
+    loss_type: DpoLossType,
+    preference: preference_loss.PreferenceConfig,
+
+    fn logprobAggregation(self: ResolvedDpoObjectiveConfig) []const u8 {
+        return switch (self.loss_type) {
+            .sigmoid => "sum",
+            .ipo, .simpo => "completion-token-mean",
+        };
+    }
+
+    fn needsReference(self: ResolvedDpoObjectiveConfig) bool {
+        return self.loss_type != .simpo;
+    }
+};
+
+fn resolveDpoObjectiveConfig(config: PreferenceConfig) !ResolvedDpoObjectiveConfig {
+    const raw_loss_type = config.loss_type orelse "sigmoid";
+    const loss_type: DpoLossType = if (eqlName(raw_loss_type, "sigmoid") or eqlName(raw_loss_type, "dpo"))
+        .sigmoid
+    else if (eqlName(raw_loss_type, "ipo"))
+        .ipo
+    else if (eqlName(raw_loss_type, "simpo") or eqlName(raw_loss_type, "sigmoid_norm"))
+        .simpo
+    else if (eqlAny(raw_loss_type, &.{ "orpo", "cpo", "kto" }))
+        return error.DpoLossTypeNotYetSupported
+    else
+        return error.InvalidDpoLossType;
+
+    const beta = config.beta orelse 0.1;
+    if (!std.math.isFinite(beta) or beta <= 0.0) return error.InvalidDpoBeta;
+    const label_smoothing = config.label_smoothing orelse 0.0;
+    if (!std.math.isFinite(label_smoothing) or label_smoothing < 0.0 or label_smoothing >= 0.5) {
+        return error.InvalidDpoLabelSmoothing;
+    }
+    if (loss_type != .sigmoid and label_smoothing != 0.0) {
+        return error.DpoLabelSmoothingRequiresSigmoid;
+    }
+    if (config.sft_lambda != null) return error.DpoSftAuxiliaryLossNotYetSupported;
+
+    const simpo_gamma = config.simpo_gamma orelse 0.5;
+    if (!std.math.isFinite(simpo_gamma) or simpo_gamma < 0.0) return error.InvalidSimpoGamma;
+    const ipo_tau = config.ipo_tau orelse 0.1;
+    if (!std.math.isFinite(ipo_tau) or ipo_tau <= 0.0) return error.InvalidIpoTau;
+    switch (loss_type) {
+        .sigmoid => if (config.simpo_gamma != null or config.ipo_tau != null) {
+            return error.DpoOptionNotUsedByLoss;
+        },
+        .ipo => if (config.simpo_gamma != null) return error.DpoOptionNotUsedByLoss,
+        .simpo => if (config.ipo_tau != null) return error.DpoOptionNotUsedByLoss,
+    }
+
+    return .{
+        .loss_type = loss_type,
+        .preference = .{
+            .kind = switch (loss_type) {
+                .sigmoid => .dpo,
+                .ipo => .ipo,
+                .simpo => .simpo,
+            },
+            .beta = beta,
+            .label_smoothing = label_smoothing,
+            .simpo_gamma = simpo_gamma,
+            .ipo_tau = ipo_tau,
+        },
+    };
+}
+
+pub const GrpoSamplingConfig = struct {
+    temperature: ?f32 = null,
+    top_p: ?f32 = null,
+    /// Zero disables top-k filtering.
+    top_k: ?usize = null,
+};
+
 pub const GrpoConfig = struct {
     group_size: ?usize = null,
+    /// Lower PPO clip bound (`1 - clip_epsilon`).
     clip_epsilon: ?f32 = null,
+    /// Optional asymmetric upper PPO clip bound (`1 + epsilon_high`).
+    epsilon_high: ?f32 = null,
     kl_coef: ?f32 = null,
     /// Fail before optimizer mutation when the unweighted mean token K3
     /// divergence for a sampled group exceeds this bound. Defaults to 0.1.
     train_max_kl: ?f32 = null,
+    /// `skip_group` (default) or `abort`.
+    train_max_kl_policy: ?[]const u8 = null,
     /// Enables a proportional controller for `kl_coef`. The target and
     /// horizon are required when this is true; coefficient bounds are
     /// optional and default to [0.001, 1.0].
@@ -288,13 +380,123 @@ pub const GrpoConfig = struct {
     min_kl_coef: ?f32 = null,
     max_kl_coef: ?f32 = null,
     advantage_eps: ?f32 = null,
+    /// Legacy alias. False is equivalent to `scale_rewards = "none"`.
     normalize_advantage: ?bool = null,
+    /// `group` (default), `batch`, or `none`.
+    scale_rewards: ?[]const u8 = null,
+    /// `grpo`, `bnpo` (default), `dr_grpo`, or `dapo`.
+    loss_type: ?[]const u8 = null,
     max_completion_tokens: ?usize = null,
+    /// Exclude non-EOS completions that exhaust the generation budget from
+    /// the policy/KL loss while retaining them in reward normalization.
+    mask_truncated_completions: ?bool = null,
+    sampling: ?GrpoSamplingConfig = null,
     reward_mode: ?[]const u8 = null,
 };
 
+const ResolvedGrpoSamplingConfig = struct {
+    temperature: f32,
+    top_p: f32,
+    top_k: usize,
+};
+
+fn resolveGrpoSamplingConfig(config: GrpoConfig) !ResolvedGrpoSamplingConfig {
+    const sampling = config.sampling orelse GrpoSamplingConfig{};
+    const temperature = sampling.temperature orelse 1.0;
+    const top_p = sampling.top_p orelse 1.0;
+    const top_k = sampling.top_k orelse 0;
+    if (!std.math.isFinite(temperature) or temperature <= 0.0) {
+        return error.InvalidGrpoSamplingTemperature;
+    }
+    if (!std.math.isFinite(top_p) or top_p <= 0.0 or top_p > 1.0) {
+        return error.InvalidGrpoSamplingTopP;
+    }
+    return .{ .temperature = temperature, .top_p = top_p, .top_k = top_k };
+}
+
+const ResolvedGrpoObjectiveConfig = struct {
+    loss_type: grpo.LossType,
+    scale_rewards: grpo.RewardScale,
+    epsilon_low: f32,
+    epsilon_high: f32,
+    max_completion_tokens: usize,
+    mask_truncated_completions: bool,
+};
+
+fn parseGrpoLossType(value: []const u8) !grpo.LossType {
+    return std.meta.stringToEnum(grpo.LossType, value) orelse
+        error.InvalidGrpoLossType;
+}
+
+fn parseGrpoRewardScale(value: []const u8) !grpo.RewardScale {
+    return std.meta.stringToEnum(grpo.RewardScale, value) orelse
+        error.InvalidGrpoRewardScale;
+}
+
+fn resolveGrpoObjectiveConfig(config: GrpoConfig, requested_gradient_accumulation_steps: u32) !ResolvedGrpoObjectiveConfig {
+    const epsilon_low = config.clip_epsilon orelse 0.2;
+    const epsilon_high = config.epsilon_high orelse epsilon_low;
+    if (!std.math.isFinite(epsilon_low) or epsilon_low <= 0.0 or epsilon_low > 1.0 or
+        !std.math.isFinite(epsilon_high) or epsilon_high <= 0.0 or epsilon_high > 1.0)
+    {
+        return error.InvalidGrpoClipEpsilon;
+    }
+    const loss_type = try parseGrpoLossType(config.loss_type orelse "bnpo");
+    if (loss_type == .dapo and requested_gradient_accumulation_steps != 1) {
+        // Exact DAPO normalization spans every active token in an accumulation
+        // window. The current product loop materializes one group at a time,
+        // so only a one-group window has a truthful global denominator.
+        return error.GrpoDapoRequiresUnitGradientAccumulation;
+    }
+    const legacy_normalize = config.normalize_advantage orelse true;
+    const scale_rewards = if (config.scale_rewards) |value|
+        try parseGrpoRewardScale(value)
+    else if (legacy_normalize)
+        grpo.RewardScale.group
+    else
+        grpo.RewardScale.none;
+    if (config.scale_rewards != null and !legacy_normalize and scale_rewards != .none) {
+        return error.ConflictingGrpoRewardScale;
+    }
+    const max_completion_tokens = config.max_completion_tokens orelse default_grpo_max_completion_tokens;
+    if (max_completion_tokens == 0) return error.InvalidMaxCompletionTokens;
+    return .{
+        .loss_type = loss_type,
+        .scale_rewards = scale_rewards,
+        .epsilon_low = epsilon_low,
+        .epsilon_high = epsilon_high,
+        .max_completion_tokens = max_completion_tokens,
+        .mask_truncated_completions = config.mask_truncated_completions orelse false,
+    };
+}
+
+fn resolveGrpoCoreConfig(recipe: Recipe) !grpo.GRPOConfig {
+    const objective = try resolveGrpoObjectiveConfig(
+        recipe.grpo,
+        recipe.optimizer.gradient_accumulation_steps orelse 1,
+    );
+    return .{
+        .group_size = recipe.grpo.group_size orelse 2,
+        .clip_epsilon = objective.epsilon_low,
+        .epsilon_high = objective.epsilon_high,
+        .kl_coef = recipe.grpo.kl_coef orelse 0.04,
+        .advantage_eps = recipe.grpo.advantage_eps orelse 1e-4,
+        .scale_rewards = objective.scale_rewards,
+        .loss_type = objective.loss_type,
+        .max_completion_tokens = objective.max_completion_tokens,
+        .mask_truncated_completions = objective.mask_truncated_completions,
+        .normalize_advantage = true,
+    };
+}
+
 const ResolvedGrpoKlControl = struct {
+    const BudgetPolicy = enum {
+        skip_group,
+        abort,
+    };
+
     train_max_kl: f32,
+    budget_policy: BudgetPolicy,
     adaptive: bool,
     target_kl: ?f32,
     kl_horizon: ?f32,
@@ -307,6 +509,10 @@ fn resolveGrpoKlControl(config: GrpoConfig) !ResolvedGrpoKlControl {
     if (!std.math.isFinite(train_max_kl) or train_max_kl <= 0.0) {
         return error.InvalidGrpoTrainKlBudget;
     }
+    const budget_policy = std.meta.stringToEnum(
+        ResolvedGrpoKlControl.BudgetPolicy,
+        config.train_max_kl_policy orelse "skip_group",
+    ) orelse return error.InvalidGrpoTrainKlPolicy;
 
     const adaptive = config.adaptive_kl orelse false;
     if (!adaptive) {
@@ -317,6 +523,7 @@ fn resolveGrpoKlControl(config: GrpoConfig) !ResolvedGrpoKlControl {
         }
         return .{
             .train_max_kl = train_max_kl,
+            .budget_policy = budget_policy,
             .adaptive = false,
             .target_kl = null,
             .kl_horizon = null,
@@ -340,6 +547,7 @@ fn resolveGrpoKlControl(config: GrpoConfig) !ResolvedGrpoKlControl {
     }
     return .{
         .train_max_kl = train_max_kl,
+        .budget_policy = budget_policy,
         .adaptive = true,
         .target_kl = target_kl,
         .kl_horizon = kl_horizon,
@@ -707,7 +915,7 @@ const GemmaMetalNumericalPolicy = struct {
 };
 
 const DpoReport = struct {
-    schema_version: []const u8 = "antfly_inference_finetune_dpo_report/v6",
+    schema_version: []const u8 = "antfly_inference_finetune_dpo_report/v7",
     execution_mode: []const u8,
     dataset_format: []const u8,
     examples: usize,
@@ -715,6 +923,9 @@ const DpoReport = struct {
     mean_reward_margin: f32,
     accuracy: f32,
     beta: f32,
+    loss_type: []const u8 = "sigmoid",
+    logprob_aggregation: []const u8 = "sum",
+    label_smoothing: f32 = 0.0,
     training_seed: u64 = 42,
     policy_backend: ?[]const u8 = null,
     optimizer_steps: ?u64 = null,
@@ -816,7 +1027,7 @@ fn compareDpoToBaseline(
 }
 
 const DpoEvaluationReport = struct {
-    schema_version: []const u8 = "antfly_inference_finetune_dpo_evaluation/v2",
+    schema_version: []const u8 = "antfly_inference_finetune_dpo_evaluation/v3",
     status: []const u8,
     dataset_path: []const u8,
     dataset_fingerprint: PathFingerprint,
@@ -829,6 +1040,9 @@ const DpoEvaluationReport = struct {
     loss: f32,
     mean_reward_margin: f32,
     accuracy: f32,
+    loss_type: []const u8 = "sigmoid",
+    logprob_aggregation: []const u8 = "sum",
+    label_smoothing: f32 = 0.0,
     minimums: DpoEvalMinimums,
     reference_mode: []const u8,
     sequence_length_policy: ?DpoPairLengthPolicyTelemetry = null,
@@ -928,13 +1142,37 @@ const SftReport = struct {
     trained_adapter_dir: []const u8,
 };
 
+const GrpoSamplingSummary = struct {
+    algorithm: []const u8 = "seeded-categorical-temperature-top-k-top-p",
+    temperature: f32,
+    top_p: f32,
+    top_k: usize,
+    stream_derivation: []const u8 = "run-seed-domain-epoch-group-completion/v1",
+    first_completion_greedy: bool,
+};
+
 const GrpoReport = struct {
-    schema_version: []const u8 = "antfly_inference_finetune_grpo_report/v6",
+    schema_version: []const u8 = "antfly_inference_finetune_grpo_report/v7",
     execution_mode: []const u8,
     dataset_format: []const u8,
     completions: usize,
     tokens: usize,
     groups: usize,
+    optimizer_groups: ?usize = null,
+    zero_reward_std_groups: ?usize = null,
+    all_truncated_groups: ?usize = null,
+    kl_rejected_groups: ?usize = null,
+    frac_reward_zero_std: ?f32 = null,
+    truncated_completions: usize = 0,
+    frac_completions_truncated: f32 = 0.0,
+    mask_truncated_completions: bool = false,
+    frac_kl_rejected: ?f32 = null,
+    loss_type: []const u8 = "bnpo",
+    scale_rewards: []const u8 = "group",
+    epsilon_low: f32 = 0.2,
+    epsilon_high: f32 = 0.2,
+    max_completion_tokens: usize = default_grpo_max_completion_tokens,
+    num_iterations: usize = 1,
     loss: f32,
     pg_loss: f32,
     kl_loss: f32,
@@ -947,6 +1185,7 @@ const GrpoReport = struct {
     optimizer_steps: ?u64 = null,
     micro_batch_steps: ?u64 = null,
     sampling_mode: ?[]const u8 = null,
+    sampling: ?GrpoSamplingSummary = null,
     policy_logprob_mode: ?[]const u8 = null,
     policy_rescore_completions: ?usize = null,
     training_microbatch_mode: ?[]const u8 = null,
@@ -1022,7 +1261,12 @@ const GrpoCheckpointAggregates = struct {
     total_mean_kl: f64,
     total_clip_fraction: f64,
     total_groups: usize,
+    optimizer_groups: usize = 0,
+    zero_reward_std_groups: usize = 0,
+    all_truncated_groups: usize = 0,
+    kl_rejected_groups: usize = 0,
     total_completions: usize,
+    truncated_completions: usize = 0,
     total_tokens: usize,
     total_reward: f64,
     total_reward_squared: f64,
@@ -1106,6 +1350,11 @@ const GrpoEvaluationSummary = struct {
     report_path: []const u8,
     groups: usize,
     completions: usize,
+    zero_reward_std_groups: usize = 0,
+    frac_reward_zero_std: f32 = 0.0,
+    truncated_completions: usize = 0,
+    frac_completions_truncated: f32 = 0.0,
+    mask_truncated_completions: bool = false,
     mean_reward: f32,
     top_rank_mean_reward: f32,
     positive_reward_group_rate: f32,
@@ -1154,7 +1403,7 @@ fn compareGrpoToBaseline(
 }
 
 const GrpoEvaluationReport = struct {
-    schema_version: []const u8 = "antfly_inference_finetune_grpo_evaluation/v3",
+    schema_version: []const u8 = "antfly_inference_finetune_grpo_evaluation/v4",
     status: []const u8,
     dataset_path: []const u8,
     dataset_fingerprint: PathFingerprint,
@@ -1165,6 +1414,11 @@ const GrpoEvaluationReport = struct {
     groups: usize,
     completions: usize,
     tokens: usize,
+    zero_reward_std_groups: usize = 0,
+    frac_reward_zero_std: f32 = 0.0,
+    truncated_completions: usize = 0,
+    frac_completions_truncated: f32 = 0.0,
+    mask_truncated_completions: bool = false,
     prompt_overlap_count: usize,
     mean_reward: f32,
     top_rank_mean_reward: f32,
@@ -1177,6 +1431,7 @@ const GrpoEvaluationReport = struct {
     clip_fraction: f32,
     minimums: GrpoEvalMinimums,
     reference_mode: []const u8,
+    sampling: ?GrpoSamplingSummary = null,
     execution_order: ?[]const u8 = null,
     sampling_seconds: ?f64 = null,
     incremental_kv: ?gemma4_real_autodiff.GrpoIncrementalKvTelemetry = null,
@@ -1204,6 +1459,7 @@ const GrpoInitialLogprobParity = struct {
 
 const GrpoKlControlTelemetry = struct {
     mode: []const u8,
+    budget_policy: []const u8,
     train_max_kl: f32,
     target_kl: ?f32,
     kl_horizon: ?f32,
@@ -1212,18 +1468,20 @@ const GrpoKlControlTelemetry = struct {
     min_kl_coef: ?f32,
     max_kl_coef: ?f32,
     admitted_groups: usize,
+    rejected_groups: usize,
     max_observed_mean_kl: f32,
     trace_path: []const u8,
     trace_digest: ?[]const u8,
 };
 
 const GrpoKlTraceRecord = struct {
-    schema_version: []const u8 = "antfly_inference_grpo_kl_control_trace/v1",
+    schema_version: []const u8 = "antfly_inference_grpo_kl_control_trace/v2",
     group_index: usize,
     epoch_index: usize,
     prompt_index: usize,
     optimizer_steps_before: u64,
     status: []const u8,
+    budget_policy: []const u8,
     mean_kl: f32,
     weighted_kl_loss: f32,
     train_max_kl: f32,
@@ -1243,6 +1501,7 @@ const GrpoKlControl = struct {
     trace: std.ArrayList(u8) = .empty,
     trace_digest: ?[]const u8 = null,
     admitted_groups: usize = 0,
+    rejected_groups: usize = 0,
     max_observed_mean_kl: f32 = 0.0,
     finished: bool = false,
 
@@ -1282,10 +1541,11 @@ const GrpoKlControl = struct {
         self: *GrpoKlControl,
         current_kl_coef: f32,
         admitted_groups: usize,
+        rejected_groups: usize,
         max_observed_mean_kl: f32,
         trace: []const u8,
     ) !void {
-        if (self.finished or self.trace.items.len != 0 or self.admitted_groups != 0 or
+        if (self.finished or self.trace.items.len != 0 or self.admitted_groups != 0 or self.rejected_groups != 0 or
             !std.math.isFinite(current_kl_coef) or current_kl_coef < 0.0 or
             !std.math.isFinite(max_observed_mean_kl) or max_observed_mean_kl < 0.0 or
             trace.len > 16 * 1024 * 1024)
@@ -1305,6 +1565,7 @@ const GrpoKlControl = struct {
         try self.trace.appendSlice(self.allocator, trace);
         self.current_kl_coef = current_kl_coef;
         self.admitted_groups = admitted_groups;
+        self.rejected_groups = rejected_groups;
         self.max_observed_mean_kl = max_observed_mean_kl;
     }
 
@@ -1318,10 +1579,14 @@ const GrpoKlControl = struct {
         optimizer_steps_before: u64,
         mean_kl: f32,
         weighted_kl_loss: f32,
-    ) !f32 {
+    ) !?f32 {
+        if (!std.math.isFinite(mean_kl) or mean_kl < 0.0 or
+            !std.math.isFinite(weighted_kl_loss))
+        {
+            return error.NonFiniteGrpoKlObservation;
+        }
         const coefficient_before = self.current_kl_coef;
-        const admitted = std.math.isFinite(mean_kl) and mean_kl >= 0.0 and
-            mean_kl <= self.resolved.train_max_kl;
+        const admitted = mean_kl <= self.resolved.train_max_kl;
         var coefficient_after = coefficient_before;
         if (admitted) {
             self.max_observed_mean_kl = @max(self.max_observed_mean_kl, mean_kl);
@@ -1334,7 +1599,13 @@ const GrpoKlControl = struct {
             .epoch_index = epoch_index,
             .prompt_index = prompt_index,
             .optimizer_steps_before = optimizer_steps_before,
-            .status = if (admitted) "admitted" else "budget-exceeded",
+            .status = if (admitted)
+                "admitted"
+            else if (self.resolved.budget_policy == .skip_group)
+                "budget-exceeded-skipped"
+            else
+                "budget-exceeded-abort",
+            .budget_policy = @tagName(self.resolved.budget_policy),
             .mean_kl = mean_kl,
             .weighted_kl_loss = weighted_kl_loss,
             .train_max_kl = self.resolved.train_max_kl,
@@ -1347,8 +1618,12 @@ const GrpoKlControl = struct {
                 "grpo rejected optimizer group {d}: raw mean KL {d:.8} exceeds train_max_kl {d:.8}; no optimizer mutation was admitted\n",
                 .{ group_index, mean_kl, self.resolved.train_max_kl },
             );
-            try self.finish();
-            return error.GrpoTrainKlBudgetExceeded;
+            if (self.resolved.budget_policy == .abort) {
+                try self.finish();
+                return error.GrpoTrainKlBudgetExceeded;
+            }
+            self.rejected_groups += 1;
+            return null;
         }
         self.admitted_groups += 1;
         self.current_kl_coef = coefficient_after;
@@ -1376,7 +1651,8 @@ const GrpoKlControl = struct {
 
     fn telemetry(self: *const GrpoKlControl) GrpoKlControlTelemetry {
         return .{
-            .mode = if (self.resolved.adaptive) "adaptive" else "fixed-with-hard-budget",
+            .mode = if (self.resolved.adaptive) "adaptive" else "fixed",
+            .budget_policy = @tagName(self.resolved.budget_policy),
             .train_max_kl = self.resolved.train_max_kl,
             .target_kl = self.resolved.target_kl,
             .kl_horizon = self.resolved.kl_horizon,
@@ -1385,6 +1661,7 @@ const GrpoKlControl = struct {
             .min_kl_coef = self.resolved.min_kl_coef,
             .max_kl_coef = self.resolved.max_kl_coef,
             .admitted_groups = self.admitted_groups,
+            .rejected_groups = self.rejected_groups,
             .max_observed_mean_kl = self.max_observed_mean_kl,
             .trace_path = self.trace_path,
             .trace_digest = self.trace_digest,
@@ -2402,14 +2679,18 @@ fn validateGemma4LoraRecipeContract(recipe: Recipe, adapter: AdapterConfig) !voi
         }
     }
 
-    if (recipe.preference.beta != null or
+    if (recipe.preference.loss_type != null or
+        recipe.preference.beta != null or
+        recipe.preference.label_smoothing != null or
         recipe.preference.simpo_gamma != null or
         recipe.preference.sft_lambda != null or
         recipe.preference.ipo_tau != null or
         recipe.grpo.group_size != null or
         recipe.grpo.clip_epsilon != null or
+        recipe.grpo.epsilon_high != null or
         recipe.grpo.kl_coef != null or
         recipe.grpo.train_max_kl != null or
+        recipe.grpo.train_max_kl_policy != null or
         recipe.grpo.adaptive_kl != null or
         recipe.grpo.target_kl != null or
         recipe.grpo.kl_horizon != null or
@@ -2417,7 +2698,11 @@ fn validateGemma4LoraRecipeContract(recipe: Recipe, adapter: AdapterConfig) !voi
         recipe.grpo.max_kl_coef != null or
         recipe.grpo.advantage_eps != null or
         recipe.grpo.normalize_advantage != null or
+        recipe.grpo.scale_rewards != null or
+        recipe.grpo.loss_type != null or
         recipe.grpo.max_completion_tokens != null or
+        recipe.grpo.mask_truncated_completions != null or
+        recipe.grpo.sampling != null or
         recipe.grpo.reward_mode != null or
         recipe.reward != null)
     {
@@ -2665,15 +2950,13 @@ fn validateGemma4PreferenceTrainingRecipeContract(
 
     switch (task) {
         .dpo => {
-            const beta = recipe.preference.beta orelse 0.1;
-            if (!std.math.isFinite(beta) or beta <= 0) return error.InvalidDpoBeta;
-            if (recipe.preference.simpo_gamma != null or
-                recipe.preference.sft_lambda != null or
-                recipe.preference.ipo_tau != null or
-                recipe.grpo.group_size != null or
+            _ = try resolveDpoObjectiveConfig(recipe.preference);
+            if (recipe.grpo.group_size != null or
                 recipe.grpo.clip_epsilon != null or
+                recipe.grpo.epsilon_high != null or
                 recipe.grpo.kl_coef != null or
                 recipe.grpo.train_max_kl != null or
+                recipe.grpo.train_max_kl_policy != null or
                 recipe.grpo.adaptive_kl != null or
                 recipe.grpo.target_kl != null or
                 recipe.grpo.kl_horizon != null or
@@ -2681,7 +2964,11 @@ fn validateGemma4PreferenceTrainingRecipeContract(
                 recipe.grpo.max_kl_coef != null or
                 recipe.grpo.advantage_eps != null or
                 recipe.grpo.normalize_advantage != null or
+                recipe.grpo.scale_rewards != null or
+                recipe.grpo.loss_type != null or
                 recipe.grpo.max_completion_tokens != null or
+                recipe.grpo.mask_truncated_completions != null or
+                recipe.grpo.sampling != null or
                 recipe.grpo.reward_mode != null or
                 recipe.reward != null)
             {
@@ -2689,7 +2976,9 @@ fn validateGemma4PreferenceTrainingRecipeContract(
             }
         },
         .grpo => {
-            if (recipe.preference.beta != null or
+            if (recipe.preference.loss_type != null or
+                recipe.preference.beta != null or
+                recipe.preference.label_smoothing != null or
                 recipe.preference.simpo_gamma != null or
                 recipe.preference.sft_lambda != null or
                 recipe.preference.ipo_tau != null)
@@ -2698,17 +2987,16 @@ fn validateGemma4PreferenceTrainingRecipeContract(
             }
             const group_size = recipe.grpo.group_size orelse 2;
             if (group_size < 2) return error.InvalidGrpoGroupSize;
-            const max_completion_tokens = recipe.grpo.max_completion_tokens orelse 4;
-            if (max_completion_tokens == 0) return error.InvalidMaxCompletionTokens;
-            const clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2;
-            if (!std.math.isFinite(clip_epsilon) or clip_epsilon <= 0 or clip_epsilon > 1) {
-                return error.InvalidGrpoClipEpsilon;
-            }
+            _ = try resolveGrpoObjectiveConfig(
+                recipe.grpo,
+                recipe.optimizer.gradient_accumulation_steps orelse 1,
+            );
             const kl_coef = recipe.grpo.kl_coef orelse 0.04;
             if (!std.math.isFinite(kl_coef) or kl_coef < 0) return error.InvalidGrpoKlCoefficient;
             _ = try resolveGrpoKlControl(recipe.grpo);
-            const advantage_eps = recipe.grpo.advantage_eps orelse 1e-8;
+            const advantage_eps = recipe.grpo.advantage_eps orelse 1e-4;
             if (!std.math.isFinite(advantage_eps) or advantage_eps <= 0) return error.InvalidGrpoAdvantageEpsilon;
+            _ = try resolveGrpoSamplingConfig(recipe.grpo);
             try validateRewardPipelineConfig(recipe);
         },
     }
@@ -3546,7 +3834,8 @@ fn validatePreferenceExecutionContract(recipe: Recipe, task: PreferenceTask, mod
             if (recipe.checkpoint != null or recipe.runtime != null or recipe.trainer != null) {
                 return error.TrainingOptionRequiresTrainMode;
             }
-            if (recipe.grpo.train_max_kl != null or recipe.grpo.adaptive_kl != null or
+            if (recipe.grpo.train_max_kl != null or recipe.grpo.train_max_kl_policy != null or
+                recipe.grpo.adaptive_kl != null or
                 recipe.grpo.target_kl != null or recipe.grpo.kl_horizon != null or
                 recipe.grpo.min_kl_coef != null or recipe.grpo.max_kl_coef != null)
             {
@@ -3570,11 +3859,14 @@ fn buildDpoPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     const format = recipe.dataset.format orelse return error.MissingDatasetFormat;
     const mode = try parsePreferenceExecutionMode(recipe);
     try validatePreferenceExecutionContract(recipe, .dpo, mode, format);
+    const objective = try resolveDpoObjectiveConfig(recipe.preference);
     if (recipe.reward != null) return error.RewardConfigurationOnlySupportedForGrpo;
     if (mode == .train) {
         const family = recipe.model.family orelse try inferFamily(recipe);
         if (eqlAny(family, &.{ "gemma4", "gemma" })) {
             try validateGemma4PreferenceTrainingRecipeContract(allocator, recipe, .dpo);
+        } else if (objective.loss_type != .sigmoid or objective.preference.label_smoothing != 0.0) {
+            return error.DpoLossTypeNotSupportedForFamily;
         }
     }
     return .{ .steps = try allocator.dupe(Step, &.{
@@ -3591,6 +3883,18 @@ fn buildGrpoPlan(allocator: std.mem.Allocator, recipe: Recipe) !Plan {
     const format = recipe.dataset.format orelse return error.MissingDatasetFormat;
     const mode = try parsePreferenceExecutionMode(recipe);
     try validatePreferenceExecutionContract(recipe, .grpo, mode, format);
+    const objective = try resolveGrpoObjectiveConfig(
+        recipe.grpo,
+        recipe.optimizer.gradient_accumulation_steps orelse 1,
+    );
+    if (mode == .train and objective.scale_rewards == .batch) {
+        // Every current model-backed path samples and scores one prompt group
+        // at a time. Claiming batch reward scaling here would silently reduce
+        // to group scaling. Keep the multi-group core implementation available
+        // to score fixtures, but fail closed for training until prompt groups
+        // share one explicit rollout batch.
+        return error.GrpoBatchRewardScalingRequiresBatchedGroups;
+    }
     if (recipe.reward != null) {
         if (mode != .train) return error.TypedRewardPipelineRequiresGemma4Training;
         const family = recipe.model.family orelse try inferFamily(recipe);
@@ -4607,14 +4911,27 @@ const PreferenceFingerprintPolicy = struct {
     metal_sparse_loss_chunk_rows: ?u32 = null,
     metal_linear_cce_tile_vocab: ?usize = null,
     dpo_beta: ?f32 = null,
+    dpo_loss_type: ?[]const u8 = null,
+    dpo_label_smoothing: ?f32 = null,
+    dpo_simpo_gamma: ?f32 = null,
+    dpo_ipo_tau: ?f32 = null,
+    dpo_initial_adapter_reference: ?bool = null,
     dpo_activation_checkpoint_layer_interval: ?u32 = null,
     dpo_activation_checkpoint_recursive: ?bool = null,
     grpo_group_size: ?usize = null,
     grpo_backward_batch_size: ?usize = null,
     grpo_max_completion_tokens: ?usize = null,
+    grpo_sampling_temperature: ?f32 = null,
+    grpo_sampling_top_p: ?f32 = null,
+    grpo_sampling_top_k: ?usize = null,
+    grpo_loss_type: ?[]const u8 = null,
+    grpo_scale_rewards: ?[]const u8 = null,
+    grpo_mask_truncated_completions: ?bool = null,
     grpo_clip_epsilon: ?f32 = null,
+    grpo_epsilon_high: ?f32 = null,
     grpo_kl_coef: ?f32 = null,
     grpo_train_max_kl: ?f32 = null,
+    grpo_train_max_kl_policy: ?[]const u8 = null,
     grpo_adaptive_kl: ?bool = null,
     grpo_target_kl: ?f32 = null,
     grpo_kl_horizon: ?f32 = null,
@@ -4745,11 +5062,43 @@ fn gemmaPreferenceRunFingerprint(
     preferenceHashOptionalU64(&hasher, policy.metal_sparse_loss_chunk_rows);
     preferenceHashOptionalU64(&hasher, policy.metal_linear_cce_tile_vocab);
     preferenceHashOptionalF32(&hasher, policy.dpo_beta);
+    if (task == .dpo and
+        (policy.dpo_loss_type != null or
+            policy.dpo_label_smoothing != null or
+            policy.dpo_simpo_gamma != null or
+            policy.dpo_ipo_tau != null or
+            policy.dpo_initial_adapter_reference != null))
+    {
+        // Keep the established base-equivalent unsmoothed sigmoid identity
+        // byte-for-byte stable. Any new objective or non-base initial
+        // reference extends the domain and cannot resume an old checkpoint.
+        preferenceHashField(&hasher, "dpo-objective-and-reference/v1");
+        preferenceHashOptionalField(&hasher, policy.dpo_loss_type);
+        preferenceHashOptionalF32(&hasher, policy.dpo_label_smoothing);
+        preferenceHashOptionalF32(&hasher, policy.dpo_simpo_gamma);
+        preferenceHashOptionalF32(&hasher, policy.dpo_ipo_tau);
+        preferenceHashOptionalBool(&hasher, policy.dpo_initial_adapter_reference);
+    }
     preferenceHashOptionalU64(&hasher, policy.dpo_activation_checkpoint_layer_interval);
     preferenceHashOptionalBool(&hasher, policy.dpo_activation_checkpoint_recursive);
     preferenceHashOptionalU64(&hasher, policy.grpo_group_size);
     preferenceHashOptionalU64(&hasher, policy.grpo_backward_batch_size);
     preferenceHashOptionalU64(&hasher, policy.grpo_max_completion_tokens);
+    if (task == .grpo) {
+        // This extension intentionally invalidates checkpoints produced by the
+        // former deterministic rank-enumeration sampler without perturbing DPO
+        // v5 identities.
+        preferenceHashField(&hasher, "stochastic-grpo-sampling/v1");
+        preferenceHashOptionalF32(&hasher, policy.grpo_sampling_temperature);
+        preferenceHashOptionalF32(&hasher, policy.grpo_sampling_top_p);
+        preferenceHashOptionalU64(&hasher, policy.grpo_sampling_top_k);
+        preferenceHashField(&hasher, "grpo-objective/v1");
+        preferenceHashOptionalField(&hasher, policy.grpo_loss_type);
+        preferenceHashOptionalField(&hasher, policy.grpo_scale_rewards);
+        preferenceHashOptionalF32(&hasher, policy.grpo_epsilon_high);
+        preferenceHashOptionalBool(&hasher, policy.grpo_mask_truncated_completions);
+        preferenceHashOptionalField(&hasher, policy.grpo_train_max_kl_policy);
+    }
     preferenceHashOptionalF32(&hasher, policy.grpo_clip_epsilon);
     preferenceHashOptionalF32(&hasher, policy.grpo_kl_coef);
     preferenceHashOptionalF32(&hasher, policy.grpo_train_max_kl);
@@ -4926,7 +5275,12 @@ fn loadPreferenceCheckpointState(
     }
     if (state.grpo) |aggregate| {
         if (aggregate.diagnostic_first_token_count > aggregate.diagnostic_first_tokens.len or
-            aggregate.kl_admitted_groups != aggregate.total_groups or
+            aggregate.optimizer_groups > aggregate.total_groups or
+            aggregate.zero_reward_std_groups > aggregate.total_groups - aggregate.optimizer_groups or
+            aggregate.all_truncated_groups > aggregate.total_groups - aggregate.optimizer_groups - aggregate.zero_reward_std_groups or
+            aggregate.kl_rejected_groups != aggregate.total_groups - aggregate.optimizer_groups - aggregate.zero_reward_std_groups - aggregate.all_truncated_groups or
+            aggregate.truncated_completions > aggregate.total_completions or
+            aggregate.kl_admitted_groups != aggregate.optimizer_groups or
             aggregate.policy_rescore_completions > aggregate.total_completions or
             aggregate.reward_call_index != aggregate.total_completions or
             aggregate.reward_external_calls > aggregate.reward_call_index or
@@ -5948,6 +6302,9 @@ const DecoderGrpoSampler = struct {
     model: *model_manager_mod.LoadedModel,
     max_seq_len: usize,
     max_completion_tokens: usize,
+    sampling: ResolvedGrpoSamplingConfig,
+    run_seed: u64,
+    groups_sampled: usize = 0,
 
     fn sample(
         ctx: *anyopaque,
@@ -5965,10 +6322,19 @@ const DecoderGrpoSampler = struct {
         var cb = try session_factory.getComputeBackend(self.model.session, self.allocator);
         defer cb.deinit();
 
-        const top_rank_cap: usize = @min(num_samples, 8);
         const eos_id = self.model.getTokenizer().specialTokens().sep_id;
+        const group_seed = gemma4_real_autodiff.deriveGrpoSamplingGroupSeed(
+            self.run_seed,
+            gemma_grpo_evaluation_sampling_domain,
+            0,
+            self.groups_sampled,
+        );
+        self.groups_sampled += 1;
 
         for (0..num_samples) |sample_idx| {
+            var rng = std.Random.DefaultPrng.init(
+                gemma4_real_autodiff.deriveGrpoCompletionSamplingSeed(group_seed, sample_idx),
+            );
             var seq = std.ArrayListUnmanaged(i64).empty;
             defer seq.deinit(allocator);
             try seq.ensureTotalCapacity(allocator, prompt.len + self.max_completion_tokens);
@@ -5985,7 +6351,18 @@ const DecoderGrpoSampler = struct {
                 defer self.allocator.free(logits);
                 const vocab_size: usize = @intCast(gpt_config.vocab_size);
                 const row = logits[(seq.items.len - 1) * vocab_size ..][0..vocab_size];
-                const token_id = try selectRankedTokenFromLogits(allocator, row, sample_idx % top_rank_cap);
+                const token_id: i32 = @intCast(try gemma4_real_autodiff.sampleGrpoTokenFromLogits(
+                    allocator,
+                    row,
+                    .{
+                        .seed = group_seed,
+                        .temperature = self.sampling.temperature,
+                        .top_p = if (sample_idx == 0) 1.0 else self.sampling.top_p,
+                        .top_k = if (sample_idx == 0) 1 else self.sampling.top_k,
+                        .first_completion_greedy = sample_idx == 0,
+                    },
+                    rng.random().float(f64),
+                ));
                 const token_logp = logProbAtToken(row, token_id);
                 try completion.append(allocator, token_id);
                 try old_logps.append(allocator, token_logp);
@@ -6728,16 +7105,11 @@ fn runDirectDpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, report
     const format = recipe.dataset.format orelse return error.MissingDatasetFormat;
     const mode = try parsePreferenceExecutionMode(recipe);
     try validatePreferenceExecutionContract(recipe, .dpo, mode, format);
+    const objective = try resolveDpoObjectiveConfig(recipe.preference);
     if (std.mem.eql(u8, format, "scalar-logprobs")) {
         const batch = try loadDpoScalarJsonl(allocator, io, path);
         defer batch.deinit(allocator);
-        var result = try preference_loss.pairedPreferenceLoss(allocator, batch.batch(), .{
-            .kind = .dpo,
-            .beta = recipe.preference.beta orelse 0.1,
-            .simpo_gamma = recipe.preference.simpo_gamma orelse 0.5,
-            .sft_lambda = recipe.preference.sft_lambda orelse 1.0,
-            .ipo_tau = recipe.preference.ipo_tau orelse 0.1,
-        });
+        var result = try preference_loss.pairedPreferenceLoss(allocator, batch.batch(), objective.preference);
         defer result.deinit();
         try writeJsonFile(allocator, io, report_path, DpoReport{
             .execution_mode = "score",
@@ -6746,7 +7118,10 @@ fn runDirectDpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, report
             .loss = result.loss,
             .mean_reward_margin = result.mean_reward_margin,
             .accuracy = result.accuracy,
-            .beta = recipe.preference.beta orelse 0.1,
+            .beta = objective.preference.beta,
+            .loss_type = @tagName(objective.loss_type),
+            .logprob_aggregation = objective.logprobAggregation(),
+            .label_smoothing = objective.preference.label_smoothing,
         });
         print("dpo report: {s}\n", .{report_path});
         return;
@@ -6805,11 +7180,11 @@ fn runDirectDpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, report
         .call = DecoderLogprobScorer.modelForward,
     }, samples.samples, .{
         .pref = .{
-            .kind = .dpo,
-            .beta = recipe.preference.beta orelse 0.1,
-            .simpo_gamma = recipe.preference.simpo_gamma orelse 0.5,
-            .sft_lambda = recipe.preference.sft_lambda orelse 1.0,
-            .ipo_tau = recipe.preference.ipo_tau orelse 0.1,
+            .kind = objective.preference.kind,
+            .beta = objective.preference.beta,
+            .label_smoothing = objective.preference.label_smoothing,
+            .simpo_gamma = objective.preference.simpo_gamma,
+            .ipo_tau = objective.preference.ipo_tau,
         },
         .reference_from_disabled_adapter = false,
     });
@@ -6821,7 +7196,10 @@ fn runDirectDpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, report
         .loss = result.loss,
         .mean_reward_margin = result.mean_reward_margin,
         .accuracy = result.accuracy,
-        .beta = recipe.preference.beta orelse 0.1,
+        .beta = objective.preference.beta,
+        .loss_type = @tagName(objective.loss_type),
+        .logprob_aggregation = objective.logprobAggregation(),
+        .label_smoothing = objective.preference.label_smoothing,
     });
     print("dpo report: {s}\n", .{report_path});
 }
@@ -7075,6 +7453,47 @@ const GemmaDpoReferenceCache = struct {
         self.* = undefined;
     }
 };
+
+fn initUnusedGemmaDpoReferenceCache(
+    allocator: std.mem.Allocator,
+    examples: usize,
+    base_equivalent_policy: bool,
+) !GemmaDpoReferenceCache {
+    const chosen_logps = try allocator.alloc(f32, examples);
+    errdefer allocator.free(chosen_logps);
+    const rejected_logps = try allocator.alloc(f32, examples);
+    @memset(chosen_logps, 0.0);
+    @memset(rejected_logps, 0.0);
+    return .{
+        .allocator = allocator,
+        .chosen_logps = chosen_logps,
+        .rejected_logps = rejected_logps,
+        .precompute_seconds = 0.0,
+        .base_equivalent_policy = base_equivalent_policy,
+    };
+}
+
+fn gemmaDpoReferenceMode(base_equivalent: bool, coalesced: bool) []const u8 {
+    if (base_equivalent) {
+        return if (coalesced)
+            "frozen-base-equivalent-initial-adapter-shared-prompt-single-row"
+        else
+            "frozen-base-equivalent-initial-adapter";
+    }
+    return if (coalesced)
+        "frozen-initial-adapter-snapshot-shared-prompt-single-row"
+    else
+        "frozen-initial-adapter-snapshot";
+}
+
+fn gemmaDpoObjectiveReferenceMode(
+    objective: ResolvedDpoObjectiveConfig,
+    base_equivalent: bool,
+    coalesced: bool,
+) []const u8 {
+    if (!objective.needsReference()) return "not-used-reference-free-simpo";
+    return gemmaDpoReferenceMode(base_equivalent, coalesced);
+}
 
 const GemmaGrpoReferenceCache = struct {
     const Entry = GrpoReferenceCacheCheckpointEntry;
@@ -7402,20 +7821,20 @@ fn sampleGemmaGrpoCompletionGroup(
     prompt: []const i32,
     seq_len: u32,
     max_completion_tokens: usize,
-    rank_cap: usize,
+    sampling: gemma4_real_autodiff.GrpoSamplingOptions,
     eos_token_id: ?i32,
     sparse_multi_token_projection: bool,
     out_tokens: []std.ArrayList(i32),
     out_logps: []std.ArrayList(f32),
 ) !void {
-    const sampler = incremental_sampler orelse return gemma4_real_autodiff.sampleCompletionGroupRanked(
+    const sampler = incremental_sampler orelse return gemma4_real_autodiff.sampleCompletionGroup(
         allocator,
         trainer,
         ctx,
         prompt,
         seq_len,
         max_completion_tokens,
-        rank_cap,
+        sampling,
         eos_token_id,
         sparse_multi_token_projection,
         out_tokens,
@@ -7442,14 +7861,14 @@ fn sampleGemmaGrpoCompletionGroup(
             tokens.* = .empty;
             logps.* = .empty;
         }
-        try gemma4_real_autodiff.sampleCompletionGroupRanked(
+        try gemma4_real_autodiff.sampleCompletionGroup(
             allocator,
             trainer,
             ctx,
             prompt,
             seq_len,
             max_completion_tokens,
-            rank_cap,
+            sampling,
             eos_token_id,
             sparse_multi_token_projection,
             baseline_tokens,
@@ -7457,11 +7876,11 @@ fn sampleGemmaGrpoCompletionGroup(
         );
     }
 
-    try sampler.sampleCompletionGroupRanked(
+    try sampler.sampleCompletionGroup(
         prompt,
         seq_len,
         max_completion_tokens,
-        rank_cap,
+        sampling,
         eos_token_id,
         out_tokens,
         out_logps,
@@ -7529,6 +7948,9 @@ fn sampleGemmaGrpoCompletionGroup(
         }
     }
 }
+
+const gemma_grpo_training_sampling_domain: u64 = 0x4752504f54524149;
+const gemma_grpo_evaluation_sampling_domain: u64 = 0x4752504f4556414c;
 
 /// Replace sampler-local log-probabilities with the authoritative sparse
 /// sequence-wide policy scorer for the same already-selected tokens.  The
@@ -7679,20 +8101,17 @@ fn canonicalCompiledSamplingGroupPolicyLogps(
     prompt: []const i32,
     sampled_tokens: []const std.ArrayList(i32),
     seq_len: u32,
-    rank_cap: usize,
 ) !CompletionGroupLogps {
-    if (rank_cap == 0) return error.InvalidCompletionRankCap;
     var logps = try CompletionGroupLogps.init(allocator, sampled_tokens);
     errdefer logps.deinit();
-    for (sampled_tokens, logps.rows, 0..) |tokens, row, completion_idx| {
-        try gemma4_real_autodiff.tokenLogprobsForPromptCompletionSparseRowsCanonicalRanked(
+    for (sampled_tokens, logps.rows) |tokens, row| {
+        try gemma4_real_autodiff.tokenLogprobsForPromptCompletionSparseRowsCanonical(
             allocator,
             trainer,
             ctx,
             prompt,
             tokens.items,
             seq_len,
-            completion_idx % rank_cap,
             row,
         );
     }
@@ -8083,6 +8502,7 @@ fn validateGemmaDpoInitialBucketSignatureParity(
     seq_len: u32,
     coalesce_single_token_pairs: bool,
     buckets: ?gemma4_real_autodiff.SequenceLengthBuckets,
+    enforce_policy_reference_parity: bool,
 ) !?DpoInitialBucketSignatureParity {
     if (buckets == null) return null;
     if (chosen_examples.len == 0 or
@@ -8156,13 +8576,13 @@ fn validateGemmaDpoInitialBucketSignatureParity(
 
     var parity = result orelse return error.DpoBatchAlignmentMismatch;
     parity.graph_signatures_checked = seen.count();
-    if (parity.base_equivalent_policy and parity.max_abs_error > 1e-4) {
+    if (enforce_policy_reference_parity and parity.max_abs_error > 1e-4) {
         return error.GemmaDpoInitialReferenceParityMismatch;
     }
     return parity;
 }
 
-fn precomputeGemmaDpoBaseReferenceCache(
+fn precomputeGemmaDpoReferenceCache(
     allocator: std.mem.Allocator,
     trainer: *real_autodiff.RealAutodiffTrainer,
     ctx: *gemma4_real_autodiff.GemmaAutodiffCtx,
@@ -8171,12 +8591,10 @@ fn precomputeGemmaDpoBaseReferenceCache(
     seq_len: u32,
     coalesce_single_token_pairs: bool,
     buckets: ?gemma4_real_autodiff.SequenceLengthBuckets,
+    reference_lora: *const gemma4_real_autodiff.FrozenBaseLoraBindings,
+    reference_base_equivalent: bool,
 ) !GemmaDpoReferenceCache {
     if (chosen_examples.len != rejected_examples.len) return error.DpoBatchAlignmentMismatch;
-
-    const base_equivalent_policy = gemmaLoraAdapterIsBaseEquivalent(trainer);
-    var frozen_lora = try gemma4_real_autodiff.FrozenBaseLoraBindings.init(allocator, trainer);
-    defer frozen_lora.deinit();
 
     const chosen_logps = try allocator.alloc(f32, chosen_examples.len);
     errdefer allocator.free(chosen_logps);
@@ -8198,7 +8616,7 @@ fn precomputeGemmaDpoBaseReferenceCache(
                 &candidate_tokens,
                 schedule.sequence_length,
                 &pair_logps,
-                &frozen_lora,
+                reference_lora,
             );
             chosen_logps[idx] = pair_logps[0];
             rejected_logps[idx] = pair_logps[1];
@@ -8210,7 +8628,7 @@ fn precomputeGemmaDpoBaseReferenceCache(
                     ctx,
                     chosen,
                     seq_len,
-                    &frozen_lora,
+                    reference_lora,
                 )
             else
                 try gemma4_real_autodiff.sequenceLogprobForExampleFrozenBaseScheduled(
@@ -8220,10 +8638,10 @@ fn precomputeGemmaDpoBaseReferenceCache(
                     chosen,
                     schedule.sequence_length,
                     schedule.weighted_target_rows,
-                    &frozen_lora,
+                    reference_lora,
                 );
             if (platform.env.getenvBoolDefault("ANTFLY_GEMMA4_PREFERENCE_TRACE", false)) {
-                print("gemma4 dpo frozen lora after chosen: max_abs_prefix={d:.9}\n", .{try frozen_lora.debugMaxAbsPrefix(8)});
+                print("gemma4 dpo reference lora after chosen: max_abs_prefix={d:.9}\n", .{try reference_lora.debugMaxAbsPrefix(8)});
             }
             rejected_logps[idx] = if (buckets == null)
                 try gemma4_real_autodiff.sequenceLogprobForExampleFrozenBase(
@@ -8232,7 +8650,7 @@ fn precomputeGemmaDpoBaseReferenceCache(
                     ctx,
                     rejected,
                     seq_len,
-                    &frozen_lora,
+                    reference_lora,
                 )
             else
                 try gemma4_real_autodiff.sequenceLogprobForExampleFrozenBaseScheduled(
@@ -8242,10 +8660,10 @@ fn precomputeGemmaDpoBaseReferenceCache(
                     rejected,
                     schedule.sequence_length,
                     schedule.weighted_target_rows,
-                    &frozen_lora,
+                    reference_lora,
                 );
             if (platform.env.getenvBoolDefault("ANTFLY_GEMMA4_PREFERENCE_TRACE", false)) {
-                print("gemma4 dpo frozen lora after rejected: max_abs_prefix={d:.9}\n", .{try frozen_lora.debugMaxAbsPrefix(8)});
+                print("gemma4 dpo reference lora after rejected: max_abs_prefix={d:.9}\n", .{try reference_lora.debugMaxAbsPrefix(8)});
             }
         }
     }
@@ -8256,7 +8674,7 @@ fn precomputeGemmaDpoBaseReferenceCache(
         .chosen_logps = chosen_logps,
         .rejected_logps = rejected_logps,
         .precompute_seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s,
-        .base_equivalent_policy = base_equivalent_policy,
+        .base_equivalent_policy = reference_base_equivalent,
     };
 }
 
@@ -8268,6 +8686,7 @@ fn runOptimizerBackedGemmaDpo(
     report_path: []const u8,
 ) !void {
     const base_model_dir = recipe.model.path orelse return error.MissingModelPath;
+    const dpo_objective = try resolveDpoObjectiveConfig(recipe.preference);
     const adapter = recipe.adapter orelse AdapterConfig{};
     const bootstrap_dir_config = adapter.path;
     const bootstrap_dir = bootstrap_dir_config orelse try defaultArtifactPath(allocator, recipe, "adapter-bootstrap");
@@ -8353,6 +8772,11 @@ fn runOptimizerBackedGemmaDpo(
     const pair_objective_requested = backend_kind == .metal and
         !coalesce_single_token_pairs and
         platform.env.getenvBoolDefault("ANTFLY_GEMMA4_DPO_PAIR_GRAPH", false);
+    if (pair_objective_requested and
+        (dpo_objective.loss_type != .sigmoid or dpo_objective.preference.label_smoothing != 0.0))
+    {
+        return error.DpoCompiledPairObjectiveRequiresUnsmoothSigmoid;
+    }
     const batch2_pair_forward_requested = pair_objective_requested and
         platform.env.getenvBoolDefault("ANTFLY_GEMMA4_DPO_BATCH2_FORWARD_GRAPH", false);
     const detached_pair_gradients_requested = backend_kind == .metal and
@@ -8455,6 +8879,12 @@ fn runOptimizerBackedGemmaDpo(
         !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_LINEAR_CCE", false);
     const bootstrap_example = gemma4_real_autodiff.findFirstSupervisedExample(chosen_prepared.examples) orelse return error.NoTrainingData;
     try gemma4_real_autodiff.initializeTrainerFromAdapterDir(allocator, &trainer, &ctx, bootstrap_dir, bootstrap_example, @intCast(max_seq_len));
+    const dpo_reference_base_equivalent = gemmaLoraAdapterIsBaseEquivalent(&trainer);
+    var dpo_reference_lora = if (dpo_reference_base_equivalent)
+        try gemma4_real_autodiff.FrozenBaseLoraBindings.init(allocator, &trainer)
+    else
+        try gemma4_real_autodiff.FrozenBaseLoraBindings.initSnapshot(allocator, &trainer);
+    defer dpo_reference_lora.deinit();
 
     const dpo_minimums = recipe.eval.?.dpo_minimums.?;
     const dpo_baseline_report_path = if (dpo_minimums.min_accuracy_improvement != null)
@@ -8475,6 +8905,8 @@ fn runOptimizerBackedGemmaDpo(
             backend_kind,
             path,
             false,
+            &dpo_reference_lora,
+            dpo_reference_base_equivalent,
         )
     else
         null;
@@ -8522,7 +8954,21 @@ fn runOptimizerBackedGemmaDpo(
             .metal_numerical_policy_flags = if (metal_numerical_policy) |policy| policy.fingerprint_flags else 0,
             .metal_sparse_loss_chunk_rows = if (metal_numerical_policy) |policy| policy.sparse_loss_chunk_rows else null,
             .metal_linear_cce_tile_vocab = if (metal_numerical_policy) |policy| policy.linear_cce_tile_vocab else null,
-            .dpo_beta = recipe.preference.beta orelse 0.1,
+            .dpo_beta = dpo_objective.preference.beta,
+            .dpo_loss_type = if (dpo_objective.loss_type == .sigmoid) null else @tagName(dpo_objective.loss_type),
+            .dpo_label_smoothing = if (dpo_objective.preference.label_smoothing == 0.0)
+                null
+            else
+                dpo_objective.preference.label_smoothing,
+            .dpo_simpo_gamma = if (dpo_objective.loss_type == .simpo)
+                dpo_objective.preference.simpo_gamma
+            else
+                null,
+            .dpo_ipo_tau = if (dpo_objective.loss_type == .ipo)
+                dpo_objective.preference.ipo_tau
+            else
+                null,
+            .dpo_initial_adapter_reference = if (dpo_reference_base_equivalent) null else true,
             .dpo_activation_checkpoint_layer_interval = if (dpo_checkpoint_config) |cfg| cfg.layer_interval else null,
             .dpo_activation_checkpoint_recursive = if (dpo_checkpoint_config) |cfg| cfg.recursive_recompute_dependencies else null,
         },
@@ -8584,29 +9030,42 @@ fn runOptimizerBackedGemmaDpo(
     var benchmark: ?DpoBenchmarkRecorder = if (benchmark_enabled) try DpoBenchmarkRecorder.init(allocator) else null;
     defer if (benchmark) |*recorder| recorder.deinit();
 
-    var reference_cache = try precomputeGemmaDpoBaseReferenceCache(
-        allocator,
-        &trainer,
-        &ctx,
-        chosen_prepared.examples,
-        rejected_prepared.examples,
-        @intCast(max_seq_len),
-        coalesce_single_token_pairs,
-        length_buckets,
-    );
+    var reference_cache = if (dpo_objective.needsReference())
+        try precomputeGemmaDpoReferenceCache(
+            allocator,
+            &trainer,
+            &ctx,
+            chosen_prepared.examples,
+            rejected_prepared.examples,
+            @intCast(max_seq_len),
+            coalesce_single_token_pairs,
+            length_buckets,
+            &dpo_reference_lora,
+            dpo_reference_base_equivalent,
+        )
+    else
+        try initUnusedGemmaDpoReferenceCache(
+            allocator,
+            chosen_prepared.examples.len,
+            dpo_reference_base_equivalent,
+        );
     defer reference_cache.deinit();
     const graph_cache_after_reference_precompute = trainer.graphCacheStats();
-    const observed_bucket_signature_parity = try validateGemmaDpoInitialBucketSignatureParity(
-        allocator,
-        &trainer,
-        &ctx,
-        chosen_prepared.examples,
-        rejected_prepared.examples,
-        &reference_cache,
-        @intCast(max_seq_len),
-        coalesce_single_token_pairs,
-        length_buckets,
-    );
+    const observed_bucket_signature_parity: ?DpoInitialBucketSignatureParity = if (dpo_objective.needsReference())
+        try validateGemmaDpoInitialBucketSignatureParity(
+            allocator,
+            &trainer,
+            &ctx,
+            chosen_prepared.examples,
+            rejected_prepared.examples,
+            &reference_cache,
+            @intCast(max_seq_len),
+            coalesce_single_token_pairs,
+            length_buckets,
+            start_epoch == 0,
+        )
+    else
+        null;
     const graph_cache_after_initial_bucket_signature_parity = trainer.graphCacheStats();
 
     const restored_dpo_aggregates = if (loaded_dpo_state) |*state| state.parsed.value.dpo else null;
@@ -8760,7 +9219,7 @@ fn runOptimizerBackedGemmaDpo(
             single_rc[0] = reference_cache.chosen_logps[sample_idx];
             single_rr[0] = reference_cache.rejected_logps[sample_idx];
 
-            if (examples_seen == 0) {
+            if (examples_seen == 0 and dpo_objective.needsReference()) {
                 const max_abs_error = @max(
                     @abs(policy_chosen - single_rc[0]),
                     @abs(policy_rejected - single_rr[0]),
@@ -8787,7 +9246,7 @@ fn runOptimizerBackedGemmaDpo(
                         },
                     );
                 }
-                if (reference_cache.base_equivalent_policy and max_abs_error > 1e-4) {
+                if (max_abs_error > 1e-4) {
                     return error.GemmaDpoInitialReferenceParityMismatch;
                 }
             }
@@ -8805,7 +9264,7 @@ fn runOptimizerBackedGemmaDpo(
                     dpo_pair_graph_mode,
                     single_rc[0],
                     single_rr[0],
-                    recipe.preference.beta orelse 0.1,
+                    dpo_objective.preference.beta,
                 );
                 defer pair_input.deinit(allocator);
                 const pair_step = try trainer.step(pair_input.trainer_input);
@@ -8827,13 +9286,7 @@ fn runOptimizerBackedGemmaDpo(
                     .chosen_lengths = single_cl[0..1],
                     .rejected_lengths = single_rl[0..1],
                     .sft_chosen_loss = single_sft[0..1],
-                }, .{
-                    .kind = .dpo,
-                    .beta = recipe.preference.beta orelse 0.1,
-                    .simpo_gamma = recipe.preference.simpo_gamma orelse 0.5,
-                    .sft_lambda = recipe.preference.sft_lambda orelse 1.0,
-                    .ipo_tau = recipe.preference.ipo_tau orelse 0.1,
-                });
+                }, dpo_objective.preference);
                 defer step_result.deinit();
                 if (!coalesce_single_token_pairs) {
                     try scalePreferenceUnitGradients(step_result.grad_chosen, 2);
@@ -9063,6 +9516,12 @@ fn runOptimizerBackedGemmaDpo(
             bootstrap_example,
             @intCast(max_seq_len),
         );
+        const evaluation_reference_base_equivalent = gemmaLoraAdapterIsBaseEquivalent(&evaluation_trainer);
+        var evaluation_reference_lora = if (evaluation_reference_base_equivalent)
+            try gemma4_real_autodiff.FrozenBaseLoraBindings.init(allocator, &evaluation_trainer)
+        else
+            try gemma4_real_autodiff.FrozenBaseLoraBindings.initSnapshot(allocator, &evaluation_trainer);
+        defer evaluation_reference_lora.deinit();
         try evaluation_trainer.initializeTerminalEvaluationFromHostSnapshot(&trainer);
         const summary = try evaluateGemmaDpoHeldout(
             allocator,
@@ -9076,6 +9535,8 @@ fn runOptimizerBackedGemmaDpo(
             backend_kind,
             evaluation_report_path,
             true,
+            &evaluation_reference_lora,
+            evaluation_reference_base_equivalent,
         );
         graph_cache_after_evaluation = evaluation_trainer.graphCacheStats();
         break :evaluation summary;
@@ -9127,7 +9588,10 @@ fn runOptimizerBackedGemmaDpo(
         .loss = @floatCast(total_loss / denom),
         .mean_reward_margin = @floatCast(total_margin / denom),
         .accuracy = @floatCast(total_accuracy / denom),
-        .beta = recipe.preference.beta orelse 0.1,
+        .beta = dpo_objective.preference.beta,
+        .loss_type = @tagName(dpo_objective.loss_type),
+        .logprob_aggregation = dpo_objective.logprobAggregation(),
+        .label_smoothing = dpo_objective.preference.label_smoothing,
         .training_seed = recipe.optimizer.seed orelse 42,
         .policy_backend = @tagName(backend_kind),
         .optimizer_steps = trainer.optimizerSteps(),
@@ -9180,7 +9644,11 @@ fn runOptimizerBackedGemmaDpo(
         else
             "disabled-for-dpo-run",
         .metal_completion_cache = completion_cache_telemetry,
-        .reference_mode = if (coalesce_single_token_pairs) "compiled-base-cache-shared-prompt-single-row" else "device-reduced-base-cache",
+        .reference_mode = gemmaDpoObjectiveReferenceMode(
+            dpo_objective,
+            reference_cache.base_equivalent_policy,
+            coalesce_single_token_pairs,
+        ),
         .reference_precompute_seconds = reference_cache.precompute_seconds,
         .initial_logprob_parity = initial_logprob_parity,
         .initial_bucket_signature_parity = initial_bucket_signature_parity,
@@ -9228,7 +9696,10 @@ fn evaluateGemmaDpoHeldout(
     backend_kind: gemma4_real_autodiff.BackendKind,
     report_path: []const u8,
     enforce_minimums: bool,
+    reference_lora: *const gemma4_real_autodiff.FrozenBaseLoraBindings,
+    reference_base_equivalent: bool,
 ) !DpoEvaluationSummary {
+    const dpo_objective = try resolveDpoObjectiveConfig(recipe.preference);
     const eval_path = evalDatasetPath(recipe) orelse return error.MissingPreferenceEvaluationDataset;
     const minimums = recipe.eval.?.dpo_minimums orelse return error.MissingDpoEvaluationMinimums;
     var eval_recipe = recipe;
@@ -9254,8 +9725,15 @@ fn evaluateGemmaDpoHeldout(
             .loss = 0.0,
             .mean_reward_margin = 0.0,
             .accuracy = 0.0,
+            .loss_type = @tagName(dpo_objective.loss_type),
+            .logprob_aggregation = dpo_objective.logprobAggregation(),
+            .label_smoothing = dpo_objective.preference.label_smoothing,
             .minimums = minimums,
-            .reference_mode = "compiled-zero-lora",
+            .reference_mode = gemmaDpoObjectiveReferenceMode(
+                dpo_objective,
+                reference_base_equivalent,
+                false,
+            ),
         });
         return error.PreferenceTrainEvalPromptOverlap;
     }
@@ -9296,16 +9774,25 @@ fn evaluateGemmaDpoHeldout(
         @intCast(trainer.graphCacheStats().capacity),
         "heldout-dataset-one-pass",
     );
-    var reference = try precomputeGemmaDpoBaseReferenceCache(
-        allocator,
-        trainer,
-        ctx,
-        chosen.examples,
-        rejected.examples,
-        @intCast(max_seq_len),
-        coalesce,
-        length_buckets,
-    );
+    var reference = if (dpo_objective.needsReference())
+        try precomputeGemmaDpoReferenceCache(
+            allocator,
+            trainer,
+            ctx,
+            chosen.examples,
+            rejected.examples,
+            @intCast(max_seq_len),
+            coalesce,
+            length_buckets,
+            reference_lora,
+            reference_base_equivalent,
+        )
+    else
+        try initUnusedGemmaDpoReferenceCache(
+            allocator,
+            chosen.examples.len,
+            reference_base_equivalent,
+        );
     defer reference.deinit();
 
     const policy_chosen = try allocator.alloc(f32, samples.samples.len);
@@ -9391,13 +9878,7 @@ fn evaluateGemmaDpoHeldout(
         .chosen_lengths = chosen_lengths,
         .rejected_lengths = rejected_lengths,
         .sft_chosen_loss = sft_loss,
-    }, .{
-        .kind = .dpo,
-        .beta = recipe.preference.beta orelse 0.1,
-        .simpo_gamma = recipe.preference.simpo_gamma orelse 0.5,
-        .sft_lambda = recipe.preference.sft_lambda orelse 1.0,
-        .ipo_tau = recipe.preference.ipo_tau orelse 0.1,
-    });
+    }, dpo_objective.preference);
     defer result.deinit();
 
     const passed = @as(f64, result.accuracy) >= minimums.accuracy and
@@ -9414,8 +9895,15 @@ fn evaluateGemmaDpoHeldout(
         .loss = result.loss,
         .mean_reward_margin = result.mean_reward_margin,
         .accuracy = result.accuracy,
+        .loss_type = @tagName(dpo_objective.loss_type),
+        .logprob_aggregation = dpo_objective.logprobAggregation(),
+        .label_smoothing = dpo_objective.preference.label_smoothing,
         .minimums = minimums,
-        .reference_mode = if (coalesce) "compiled-zero-lora-shared-prompt-single-row" else "compiled-zero-lora",
+        .reference_mode = gemmaDpoObjectiveReferenceMode(
+            dpo_objective,
+            reference_base_equivalent,
+            coalesce,
+        ),
         .sequence_length_policy = sequence_length_policy,
     });
     if (!passed and enforce_minimums) return error.DpoEvaluationGateFailed;
@@ -9697,6 +10185,12 @@ fn parseTextRewardMode(value: []const u8) !TextRewardMode {
     return error.UnsupportedRewardMode;
 }
 
+fn isGrpoCompletionTruncated(completion_tokens: []const i32, eos_token_id: ?i32) bool {
+    if (completion_tokens.len == 0) return false;
+    const eos_id = eos_token_id orelse return true;
+    return completion_tokens[completion_tokens.len - 1] != eos_id;
+}
+
 fn runOptimizerBackedGemmaGrpo(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -9722,7 +10216,13 @@ fn runOptimizerBackedGemmaGrpo(
     const execution_policy = train_eval_gemma4_lora_bundle.autodiffExecutionPolicy(backend_kind);
     const max_seq_len = recipe.dataset.max_seq_len orelse 128;
     const group_size = recipe.grpo.group_size orelse 2;
-    const max_completion_tokens = recipe.grpo.max_completion_tokens orelse 4;
+    const max_completion_tokens = recipe.grpo.max_completion_tokens orelse default_grpo_max_completion_tokens;
+    const resolved_sampling = try resolveGrpoSamplingConfig(recipe.grpo);
+    const resolved_objective = try resolveGrpoObjectiveConfig(
+        recipe.grpo,
+        recipe.optimizer.gradient_accumulation_steps orelse 1,
+    );
+    const training_seed = recipe.optimizer.seed orelse 42;
     if (group_size < 2) return error.InvalidGrpoGroupSize;
     if (max_completion_tokens == 0) return error.InvalidMaxCompletionTokens;
     const coalesce_single_token_groups = max_completion_tokens == 1;
@@ -9936,7 +10436,7 @@ fn runOptimizerBackedGemmaGrpo(
         adapter_inspect.recursive_lora_enabled,
         backend_kind,
         .{
-            .seed = recipe.optimizer.seed orelse 42,
+            .seed = training_seed,
             .max_examples = recipe.dataset.max_examples orelse 32,
             .max_seq_len = max_seq_len,
             .epochs = epochs,
@@ -9954,15 +10454,23 @@ fn runOptimizerBackedGemmaGrpo(
             .grpo_group_size = group_size,
             .grpo_backward_batch_size = multi_token_backward_batch_size,
             .grpo_max_completion_tokens = max_completion_tokens,
-            .grpo_clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
+            .grpo_sampling_temperature = resolved_sampling.temperature,
+            .grpo_sampling_top_p = resolved_sampling.top_p,
+            .grpo_sampling_top_k = resolved_sampling.top_k,
+            .grpo_loss_type = @tagName(resolved_objective.loss_type),
+            .grpo_scale_rewards = @tagName(resolved_objective.scale_rewards),
+            .grpo_mask_truncated_completions = resolved_objective.mask_truncated_completions,
+            .grpo_clip_epsilon = resolved_objective.epsilon_low,
+            .grpo_epsilon_high = resolved_objective.epsilon_high,
             .grpo_kl_coef = recipe.grpo.kl_coef orelse 0.04,
             .grpo_train_max_kl = resolved_kl_control.train_max_kl,
+            .grpo_train_max_kl_policy = @tagName(resolved_kl_control.budget_policy),
             .grpo_adaptive_kl = resolved_kl_control.adaptive,
             .grpo_target_kl = resolved_kl_control.target_kl,
             .grpo_kl_horizon = resolved_kl_control.kl_horizon,
             .grpo_min_kl_coef = resolved_kl_control.min_kl_coef,
             .grpo_max_kl_coef = resolved_kl_control.max_kl_coef,
-            .grpo_advantage_eps = recipe.grpo.advantage_eps orelse 1e-8,
+            .grpo_advantage_eps = recipe.grpo.advantage_eps orelse 1e-4,
             .grpo_normalize_advantage = recipe.grpo.normalize_advantage orelse true,
             .reward_configuration_digest = reward_configuration_digest,
         },
@@ -10112,13 +10620,7 @@ fn runOptimizerBackedGemmaGrpo(
         .ctx = &reward_pipeline,
         .call = RewardPipeline.score,
     };
-    var cfg = grpo.GRPOConfig{
-        .group_size = group_size,
-        .clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
-        .kl_coef = recipe.grpo.kl_coef orelse 0.04,
-        .advantage_eps = recipe.grpo.advantage_eps orelse 1e-8,
-        .normalize_advantage = recipe.grpo.normalize_advantage orelse true,
-    };
+    var cfg = try resolveGrpoCoreConfig(recipe);
     var kl_control = try GrpoKlControl.init(allocator, io, recipe);
     defer kl_control.deinit();
     errdefer kl_control.finish() catch {};
@@ -10133,6 +10635,7 @@ fn runOptimizerBackedGemmaGrpo(
         try kl_control.restoreCheckpoint(
             state.kl_current_coef,
             state.kl_admitted_groups,
+            state.kl_rejected_groups,
             state.kl_max_observed_mean,
             state.kl_trace,
         );
@@ -10145,7 +10648,12 @@ fn runOptimizerBackedGemmaGrpo(
     var total_mean_kl: f64 = if (restored_grpo_aggregates) |state| state.total_mean_kl else 0.0;
     var total_clip_fraction: f64 = if (restored_grpo_aggregates) |state| state.total_clip_fraction else 0.0;
     var total_groups: usize = if (restored_grpo_aggregates) |state| state.total_groups else 0;
+    var optimizer_groups: usize = if (restored_grpo_aggregates) |state| state.optimizer_groups else 0;
+    var zero_reward_std_groups: usize = if (restored_grpo_aggregates) |state| state.zero_reward_std_groups else 0;
+    var all_truncated_groups: usize = if (restored_grpo_aggregates) |state| state.all_truncated_groups else 0;
+    var kl_rejected_groups: usize = if (restored_grpo_aggregates) |state| state.kl_rejected_groups else 0;
     var total_completions: usize = if (restored_grpo_aggregates) |state| state.total_completions else 0;
+    var truncated_completions: usize = if (restored_grpo_aggregates) |state| state.truncated_completions else 0;
     var total_tokens: usize = if (restored_grpo_aggregates) |state| state.total_tokens else 0;
     var total_reward: f64 = if (restored_grpo_aggregates) |state| state.total_reward else 0.0;
     var total_reward_squared: f64 = if (restored_grpo_aggregates) |state| state.total_reward_squared else 0.0;
@@ -10164,7 +10672,6 @@ fn runOptimizerBackedGemmaGrpo(
     var diagnostic_reference_first_token_logps: [8]f32 = if (restored_grpo_aggregates) |state| state.diagnostic_reference_first_token_logps else @splat(0.0);
     var diagnostic_first_token_count: usize = if (restored_grpo_aggregates) |state| state.diagnostic_first_token_count else 0;
 
-    const top_rank_cap: usize = @min(group_size, 8);
     const eos_id = tokenizer_view.tokenizer.specialTokens().sep_id;
     var epoch_idx: usize = start_epoch;
     while (epoch_idx < epochs) : (epoch_idx += 1) {
@@ -10207,7 +10714,17 @@ fn runOptimizerBackedGemmaGrpo(
                 prompt,
                 @intCast(max_seq_len),
                 max_completion_tokens,
-                top_rank_cap,
+                .{
+                    .seed = gemma4_real_autodiff.deriveGrpoSamplingGroupSeed(
+                        training_seed,
+                        gemma_grpo_training_sampling_domain,
+                        epoch_idx,
+                        prompt_idx,
+                    ),
+                    .temperature = resolved_sampling.temperature,
+                    .top_p = resolved_sampling.top_p,
+                    .top_k = resolved_sampling.top_k,
+                },
                 if (eos_id >= 0) eos_id else null,
                 sparse_multi_token,
                 sampled_token_lists,
@@ -10272,7 +10789,6 @@ fn runOptimizerBackedGemmaGrpo(
                     prompt,
                     sampled_token_lists,
                     @intCast(max_seq_len),
-                    top_rank_cap,
                 );
                 total_policy_rescore_seconds += @as(f64, @floatFromInt(platform.time.monotonicNs() - rescore_started_ns)) / std.time.ns_per_s;
                 policy_rescore_completions += group_size;
@@ -10443,6 +10959,10 @@ fn runOptimizerBackedGemmaGrpo(
                     .tokens = tokens_owned,
                     .old_logps = old_logps_owned,
                     .ref_logps = ref_logps_owned,
+                    .truncated = isGrpoCompletionTruncated(
+                        tokens_owned,
+                        if (eos_id >= 0) eos_id else null,
+                    ),
                 });
                 total_tokens += tokens_owned.len;
                 group_token_count += tokens_owned.len;
@@ -10488,6 +11008,20 @@ fn runOptimizerBackedGemmaGrpo(
             const group_reward_denom = @as(f64, @floatFromInt(@max(ga.rewards.len, 1)));
             const group_mean_reward = group_reward / group_reward_denom;
             const group_reward_variance = @max(group_reward_squared / group_reward_denom - group_mean_reward * group_mean_reward, 0.0);
+            const logical_group_index = total_groups;
+            total_groups += 1;
+            total_completions += completions.items.len;
+            truncated_completions += countTruncatedGrpoCompletions(completions.items);
+            if (!grpo.rewardsHaveVariation(ga.rewards)) {
+                zero_reward_std_groups += 1;
+                if (benchmark_enabled) return error.GrpoBenchmarkZeroRewardStdGroup;
+                continue;
+            }
+            if (!hasActiveGrpoCompletion(completions.items, cfg.mask_truncated_completions)) {
+                all_truncated_groups += 1;
+                if (benchmark_enabled) return error.GrpoBenchmarkAllCompletionsTruncated;
+                continue;
+            }
 
             var loss_result = try grpo.grpoLoss(allocator, completions.items, flat_new_logps.items, ga.advantages, cfg);
             defer loss_result.deinit();
@@ -10495,22 +11029,25 @@ fn runOptimizerBackedGemmaGrpo(
                 if (gradient != 0.0) saw_nonzero_policy_gradient = true;
             }
 
-            const next_kl_coef = try kl_control.observe(
-                total_groups,
+            const next_kl_coef = (try kl_control.observe(
+                logical_group_index,
                 epoch_idx,
                 prompt_idx,
                 trainer.optimizerSteps(),
                 loss_result.mean_kl,
                 loss_result.kl_loss,
-            );
+            )) orelse {
+                kl_rejected_groups += 1;
+                if (benchmark_enabled) return error.GrpoBenchmarkKlRejectedGroup;
+                continue;
+            };
 
             total_loss += loss_result.loss;
             total_pg_loss += loss_result.pg_loss;
             total_kl_loss += loss_result.kl_loss;
             total_mean_kl += loss_result.mean_kl;
             total_clip_fraction += loss_result.clip_fraction;
-            total_groups += 1;
-            total_completions += completions.items.len;
+            optimizer_groups += 1;
 
             const backward_started_ns = platform.time.monotonicNs();
             if (coalesce_single_token_groups) {
@@ -10642,7 +11179,12 @@ fn runOptimizerBackedGemmaGrpo(
                             .total_mean_kl = total_mean_kl,
                             .total_clip_fraction = total_clip_fraction,
                             .total_groups = total_groups,
+                            .optimizer_groups = optimizer_groups,
+                            .zero_reward_std_groups = zero_reward_std_groups,
+                            .all_truncated_groups = all_truncated_groups,
+                            .kl_rejected_groups = kl_rejected_groups,
                             .total_completions = total_completions,
+                            .truncated_completions = truncated_completions,
                             .total_tokens = total_tokens,
                             .total_reward = total_reward,
                             .total_reward_squared = total_reward_squared,
@@ -10718,7 +11260,12 @@ fn runOptimizerBackedGemmaGrpo(
                     .total_mean_kl = total_mean_kl,
                     .total_clip_fraction = total_clip_fraction,
                     .total_groups = total_groups,
+                    .optimizer_groups = optimizer_groups,
+                    .zero_reward_std_groups = zero_reward_std_groups,
+                    .all_truncated_groups = all_truncated_groups,
+                    .kl_rejected_groups = kl_rejected_groups,
                     .total_completions = total_completions,
+                    .truncated_completions = truncated_completions,
                     .total_tokens = total_tokens,
                     .total_reward = total_reward,
                     .total_reward_squared = total_reward_squared,
@@ -10881,7 +11428,7 @@ fn runOptimizerBackedGemmaGrpo(
     );
     defer if (grpo_checkpoint_artifact) |*artifact| artifact.deinit(allocator);
 
-    const denom = @as(f64, @floatFromInt(@max(total_groups, 1)));
+    const denom = @as(f64, @floatFromInt(@max(optimizer_groups, 1)));
     const reward_denom = @as(f64, @floatFromInt(@max(total_completions, 1)));
     const mean_reward = total_reward / reward_denom;
     const reward_variance = @max(total_reward_squared / reward_denom - mean_reward * mean_reward, 0.0);
@@ -10891,6 +11438,28 @@ fn runOptimizerBackedGemmaGrpo(
         .completions = total_completions,
         .tokens = total_tokens,
         .groups = total_groups,
+        .optimizer_groups = optimizer_groups,
+        .zero_reward_std_groups = zero_reward_std_groups,
+        .all_truncated_groups = all_truncated_groups,
+        .kl_rejected_groups = kl_rejected_groups,
+        .frac_reward_zero_std = @floatCast(
+            @as(f64, @floatFromInt(zero_reward_std_groups)) /
+                @as(f64, @floatFromInt(@max(total_groups, 1))),
+        ),
+        .truncated_completions = truncated_completions,
+        .frac_completions_truncated = @floatCast(
+            @as(f64, @floatFromInt(truncated_completions)) / reward_denom,
+        ),
+        .mask_truncated_completions = resolved_objective.mask_truncated_completions,
+        .frac_kl_rejected = @floatCast(
+            @as(f64, @floatFromInt(kl_rejected_groups)) /
+                @as(f64, @floatFromInt(@max(total_groups, 1))),
+        ),
+        .loss_type = @tagName(resolved_objective.loss_type),
+        .scale_rewards = @tagName(resolved_objective.scale_rewards),
+        .epsilon_low = resolved_objective.epsilon_low,
+        .epsilon_high = resolved_objective.epsilon_high,
+        .max_completion_tokens = resolved_objective.max_completion_tokens,
         .loss = @floatCast(total_loss / denom),
         .pg_loss = @floatCast(total_pg_loss / denom),
         .kl_loss = @floatCast(total_kl_loss / denom),
@@ -10898,22 +11467,28 @@ fn runOptimizerBackedGemmaGrpo(
         .clip_fraction = @floatCast(total_clip_fraction / denom),
         .mean_reward = @floatCast(mean_reward),
         .reward_stddev = @floatCast(@sqrt(reward_variance)),
-        .training_seed = recipe.optimizer.seed orelse 42,
+        .training_seed = training_seed,
         .policy_backend = @tagName(backend_kind),
         .optimizer_steps = trainer.optimizerSteps(),
         .micro_batch_steps = trainer.microBatchSteps(),
         .sampling_mode = if (coalesce_single_token_groups)
-            "shared-prompt-ranked-sparse-row"
+            "shared-prompt-seeded-categorical-sparse-row"
         else if (incremental_kv_sampler != null)
-            "shared-page-prompt-ranked-incremental-kv"
+            "shared-page-prompt-seeded-categorical-incremental-kv"
         else if (compiled_sampling_requested)
-            "compiled-shared-prompt-ranked-sparse-row-each-step"
+            "compiled-shared-prompt-seeded-categorical-sparse-row-each-step"
         else if (sparse_multi_token)
-            "shared-prompt-ranked-sparse-row-each-step"
+            "shared-prompt-seeded-categorical-sparse-row-each-step"
         else
-            "shared-prompt-ranked",
+            "shared-prompt-seeded-categorical",
+        .sampling = .{
+            .temperature = resolved_sampling.temperature,
+            .top_p = resolved_sampling.top_p,
+            .top_k = resolved_sampling.top_k,
+            .first_completion_greedy = false,
+        },
         .policy_logprob_mode = if (compiled_sampling_requested)
-            "compiled-token-selection-with-eager-per-completion-token-validated-logprob-rescore"
+            "compiled-token-selection-with-eager-per-completion-canonical-logprob-rescore"
         else if (batch_single_token_group_scoring)
             "sampling-logprob-reuse-with-batched-initial-rescore"
         else if (batch_multi_token_group_scoring)
@@ -11053,13 +11628,9 @@ fn evaluateGemmaGrpoHeldout(
     }
 
     const rewarder = grpo.Rewarder{ .ctx = &reward_pipeline, .call = RewardPipeline.score };
-    const cfg = grpo.GRPOConfig{
-        .group_size = group_size,
-        .clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
-        .kl_coef = recipe.grpo.kl_coef orelse 0.04,
-        .advantage_eps = recipe.grpo.advantage_eps orelse 1e-8,
-        .normalize_advantage = recipe.grpo.normalize_advantage orelse true,
-    };
+    const cfg = try resolveGrpoCoreConfig(recipe);
+    const resolved_sampling = try resolveGrpoSamplingConfig(recipe.grpo);
+    const evaluation_seed = recipe.optimizer.seed orelse 42;
     const coalesce = max_completion_tokens == 1;
     const batch_single_token_group_scoring = coalesce and
         platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GRPO_BATCH_SINGLE_TOKEN_SCORING", true);
@@ -11068,7 +11639,6 @@ fn evaluateGemmaGrpoHeldout(
         backend_kind == .metal and
         !batch_multi_token_group_scoring and
         gemmaGrpoSparseMultiTokenEnabled();
-    const top_rank_cap: usize = @min(group_size, 8);
     const eos_id = tokenizer_view.tokenizer.specialTokens().sep_id;
     var reference_cache = GemmaGrpoReferenceCache.init(allocator, 1024);
     defer reference_cache.deinit();
@@ -11081,6 +11651,8 @@ fn evaluateGemmaGrpoHeldout(
     var total_reward_squared: f64 = 0.0;
     var total_top_rank_reward: f64 = 0.0;
     var groups_with_positive_reward: usize = 0;
+    var zero_reward_std_groups: usize = 0;
+    var truncated_completions: usize = 0;
     var total_groups: usize = 0;
     var total_completions: usize = 0;
     var total_tokens: usize = 0;
@@ -11130,7 +11702,18 @@ fn evaluateGemmaGrpoHeldout(
                 prompt,
                 @intCast(max_seq_len),
                 max_completion_tokens,
-                top_rank_cap,
+                .{
+                    .seed = gemma4_real_autodiff.deriveGrpoSamplingGroupSeed(
+                        evaluation_seed,
+                        gemma_grpo_evaluation_sampling_domain,
+                        0,
+                        prompt_idx,
+                    ),
+                    .temperature = resolved_sampling.temperature,
+                    .top_p = resolved_sampling.top_p,
+                    .top_k = resolved_sampling.top_k,
+                    .first_completion_greedy = true,
+                },
                 if (eos_id >= 0) eos_id else null,
                 sparse_multi_token,
                 sampled_tokens,
@@ -11180,7 +11763,18 @@ fn evaluateGemmaGrpoHeldout(
                 prompt,
                 @intCast(max_seq_len),
                 max_completion_tokens,
-                top_rank_cap,
+                .{
+                    .seed = gemma4_real_autodiff.deriveGrpoSamplingGroupSeed(
+                        evaluation_seed,
+                        gemma_grpo_evaluation_sampling_domain,
+                        0,
+                        prompt_idx,
+                    ),
+                    .temperature = resolved_sampling.temperature,
+                    .top_p = resolved_sampling.top_p,
+                    .top_k = resolved_sampling.top_k,
+                    .first_completion_greedy = true,
+                },
                 if (eos_id >= 0) eos_id else null,
                 sparse_multi_token,
                 sampled_tokens,
@@ -11302,6 +11896,10 @@ fn evaluateGemmaGrpoHeldout(
                 .tokens = tokens_owned,
                 .old_logps = policy_logps_owned,
                 .ref_logps = reference_logps_owned,
+                .truncated = isGrpoCompletionTruncated(
+                    tokens_owned,
+                    if (eos_id >= 0) eos_id else null,
+                ),
             });
             total_tokens += tokens_owned.len;
         }
@@ -11309,6 +11907,8 @@ fn evaluateGemmaGrpoHeldout(
         const reward_loss_started_ns = platform.time.monotonicNs();
         var advantages = try grpo.scoreGroup(allocator, rewarder, completions.items);
         defer advantages.deinit();
+        truncated_completions += countTruncatedGrpoCompletions(completions.items);
+        if (!grpo.rewardsHaveVariation(advantages.rewards)) zero_reward_std_groups += 1;
         grpo.computeAdvantages(&advantages, completions.items, cfg);
         if (advantages.rewards.len == 0) return error.EmptyCompletionGroup;
         total_top_rank_reward += advantages.rewards[0];
@@ -11358,6 +11958,15 @@ fn evaluateGemmaGrpoHeldout(
         .groups = total_groups,
         .completions = total_completions,
         .tokens = total_tokens,
+        .zero_reward_std_groups = zero_reward_std_groups,
+        .frac_reward_zero_std = @floatCast(
+            @as(f64, @floatFromInt(zero_reward_std_groups)) / group_denom,
+        ),
+        .truncated_completions = truncated_completions,
+        .frac_completions_truncated = @floatCast(
+            @as(f64, @floatFromInt(truncated_completions)) / completion_denom,
+        ),
+        .mask_truncated_completions = cfg.mask_truncated_completions,
         .prompt_overlap_count = 0,
         .mean_reward = @floatCast(mean_reward),
         .top_rank_mean_reward = @floatCast(top_rank_mean_reward),
@@ -11377,6 +11986,12 @@ fn evaluateGemmaGrpoHeldout(
             "compiled-zero-lora-sparse-completion-rows"
         else
             "compiled-zero-lora",
+        .sampling = .{
+            .temperature = resolved_sampling.temperature,
+            .top_p = resolved_sampling.top_p,
+            .top_k = resolved_sampling.top_k,
+            .first_completion_greedy = true,
+        },
         .execution_order = if (batch_single_token_group_scoring)
             "policy-sampling-pass-then-frozen-reference-pass"
         else if (batch_multi_token_group_scoring)
@@ -11397,6 +12012,15 @@ fn evaluateGemmaGrpoHeldout(
         .report_path = report_path,
         .groups = total_groups,
         .completions = total_completions,
+        .zero_reward_std_groups = zero_reward_std_groups,
+        .frac_reward_zero_std = @floatCast(
+            @as(f64, @floatFromInt(zero_reward_std_groups)) / group_denom,
+        ),
+        .truncated_completions = truncated_completions,
+        .frac_completions_truncated = @floatCast(
+            @as(f64, @floatFromInt(truncated_completions)) / completion_denom,
+        ),
+        .mask_truncated_completions = cfg.mask_truncated_completions,
         .mean_reward = @floatCast(mean_reward),
         .top_rank_mean_reward = @floatCast(top_rank_mean_reward),
         .positive_reward_group_rate = @floatCast(positive_reward_group_rate),
@@ -11449,6 +12073,9 @@ fn runOptimizerBackedQwen2Grpo(
     dataset_path: []const u8,
     report_path: []const u8,
 ) !void {
+    if (recipe.grpo.mask_truncated_completions orelse false) {
+        return error.GrpoTruncationMaskRequiresGemma4TextTrainer;
+    }
     const base_model_dir = recipe.model.path orelse return error.MissingModelPath;
     const adapter = recipe.adapter orelse AdapterConfig{};
     const bootstrap_dir_config = adapter.path;
@@ -11461,7 +12088,7 @@ fn runOptimizerBackedQwen2Grpo(
     const backend_kind: qwen2_real_autodiff.BackendKind = .native;
     const max_seq_len = recipe.dataset.max_seq_len orelse 128;
     const group_size = recipe.grpo.group_size orelse 2;
-    const max_completion_tokens = recipe.grpo.max_completion_tokens orelse 4;
+    const max_completion_tokens = recipe.grpo.max_completion_tokens orelse default_grpo_max_completion_tokens;
     const reward_mode = try parseTextRewardMode(recipe.grpo.reward_mode orelse "exact-match");
     const family = recipe.model.family orelse try inferFamily(recipe);
     const default_target_modules = qwenLoraTargetModulesForFamily(family);
@@ -11548,13 +12175,7 @@ fn runOptimizerBackedQwen2Grpo(
         .ctx = &rewarder_ctx,
         .call = TextRewardCtx.score,
     };
-    const cfg = grpo.GRPOConfig{
-        .group_size = group_size,
-        .clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
-        .kl_coef = recipe.grpo.kl_coef orelse 0.04,
-        .advantage_eps = recipe.grpo.advantage_eps orelse 1e-8,
-        .normalize_advantage = recipe.grpo.normalize_advantage orelse true,
-    };
+    const cfg = try resolveGrpoCoreConfig(recipe);
 
     var total_loss: f64 = 0.0;
     var total_pg_loss: f64 = 0.0;
@@ -11562,6 +12183,7 @@ fn runOptimizerBackedQwen2Grpo(
     var total_clip_fraction: f64 = 0.0;
     var total_groups: usize = 0;
     var total_completions: usize = 0;
+    var truncated_completions: usize = 0;
     var total_tokens: usize = 0;
 
     const top_rank_cap: usize = @min(group_size, 8);
@@ -11624,6 +12246,10 @@ fn runOptimizerBackedQwen2Grpo(
                     .tokens = tokens_owned,
                     .old_logps = old_logps_owned,
                     .ref_logps = ref_logps_owned,
+                    .truncated = isGrpoCompletionTruncated(
+                        tokens_owned,
+                        if (eos_id >= 0) eos_id else null,
+                    ),
                 });
                 total_tokens += tokens_owned.len;
             }
@@ -11642,6 +12268,7 @@ fn runOptimizerBackedQwen2Grpo(
             total_clip_fraction += loss_result.clip_fraction;
             total_groups += 1;
             total_completions += completions.items.len;
+            truncated_completions += countTruncatedGrpoCompletions(completions.items);
 
             var token_offset: usize = 0;
             for (completions.items) |completion| {
@@ -11665,6 +12292,15 @@ fn runOptimizerBackedQwen2Grpo(
         .completions = total_completions,
         .tokens = total_tokens,
         .groups = total_groups,
+        .truncated_completions = truncated_completions,
+        .frac_completions_truncated = @as(f32, @floatFromInt(truncated_completions)) /
+            @as(f32, @floatFromInt(@max(total_completions, 1))),
+        .loss_type = @tagName(cfg.loss_type),
+        .scale_rewards = @tagName(cfg.scale_rewards),
+        .epsilon_low = cfg.clip_epsilon,
+        .epsilon_high = cfg.epsilon_high orelse cfg.clip_epsilon,
+        .max_completion_tokens = cfg.max_completion_tokens,
+        .mask_truncated_completions = cfg.mask_truncated_completions,
         .loss = @floatCast(total_loss / denom),
         .pg_loss = @floatCast(total_pg_loss / denom),
         .kl_loss = @floatCast(total_kl_loss / denom),
@@ -11690,6 +12326,9 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
     max_completion_tokens: usize,
     reward_mode: TextRewardMode,
 ) !void {
+    if (recipe.grpo.mask_truncated_completions orelse false) {
+        return error.Gemma4MultimodalGrpoTruncationMaskNotSupported;
+    }
     const projector_path = recipe.model.projector_path orelse return error.MissingGgufProjector;
     if (!std.mem.eql(u8, reference_path, base_model_dir)) return error.UnsupportedReferencePath;
     const execution_policy = train_eval_gemma4_lora_bundle.autodiffExecutionPolicy(backend_kind);
@@ -11771,13 +12410,7 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
         .ctx = &rewarder_ctx,
         .call = TextRewardCtx.score,
     };
-    var cfg = grpo.GRPOConfig{
-        .group_size = group_size,
-        .clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
-        .kl_coef = recipe.grpo.kl_coef orelse 0.04,
-        .advantage_eps = recipe.grpo.advantage_eps orelse 1e-8,
-        .normalize_advantage = recipe.grpo.normalize_advantage orelse true,
-    };
+    var cfg = try resolveGrpoCoreConfig(recipe);
     var kl_control = try GrpoKlControl.init(allocator, io, recipe);
     defer kl_control.deinit();
     errdefer kl_control.finish() catch {};
@@ -11789,6 +12422,7 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
     var total_clip_fraction: f64 = 0.0;
     var total_groups: usize = 0;
     var total_completions: usize = 0;
+    var truncated_completions: usize = 0;
     var total_tokens: usize = 0;
     var total_reward: f64 = 0.0;
     var total_reward_squared: f64 = 0.0;
@@ -11847,6 +12481,10 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
                     .tokens = tokens_owned,
                     .old_logps = old_logps_owned,
                     .ref_logps = ref_logps_owned,
+                    .truncated = isGrpoCompletionTruncated(
+                        tokens_owned,
+                        if (eos_id >= 0) eos_id else null,
+                    ),
                 });
                 total_tokens += tokens_owned.len;
             }
@@ -11867,14 +12505,14 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
             for (loss_result.grad_new_logps) |gradient| {
                 if (gradient != 0.0) saw_nonzero_policy_gradient = true;
             }
-            const next_kl_coef = try kl_control.observe(
+            const next_kl_coef = (try kl_control.observe(
                 total_groups,
                 epoch_idx,
                 prompt_idx,
                 trainer.optimizerSteps(),
                 loss_result.mean_kl,
                 loss_result.kl_loss,
-            );
+            )) orelse return error.Gemma4MultimodalGrpoKlSkipNotSupported;
             try scalePreferenceUnitGradients(loss_result.grad_new_logps, group_size);
 
             total_loss += loss_result.loss;
@@ -11884,6 +12522,7 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
             total_clip_fraction += loss_result.clip_fraction;
             total_groups += 1;
             total_completions += completions.items.len;
+            truncated_completions += countTruncatedGrpoCompletions(completions.items);
 
             var token_offset: usize = 0;
             for (completions.items) |completion| {
@@ -11924,6 +12563,15 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
         .completions = total_completions,
         .tokens = total_tokens,
         .groups = total_groups,
+        .truncated_completions = truncated_completions,
+        .frac_completions_truncated = @as(f32, @floatFromInt(truncated_completions)) /
+            @as(f32, @floatFromInt(@max(total_completions, 1))),
+        .loss_type = @tagName(cfg.loss_type),
+        .scale_rewards = @tagName(cfg.scale_rewards),
+        .epsilon_low = cfg.clip_epsilon,
+        .epsilon_high = cfg.epsilon_high orelse cfg.clip_epsilon,
+        .max_completion_tokens = cfg.max_completion_tokens,
+        .mask_truncated_completions = cfg.mask_truncated_completions,
         .loss = @floatCast(total_loss / denom),
         .pg_loss = @floatCast(total_pg_loss / denom),
         .kl_loss = @floatCast(total_kl_loss / denom),
@@ -12819,7 +13467,7 @@ test "gemma4 GRPO KL control persists admitted and rejected pre-update decisions
     };
 
     var admitted = try GrpoKlControl.init(allocator, std.testing.io, control_recipe);
-    const coefficient_after = try admitted.observe(0, 0, 0, 0, 0.0, 0.0);
+    const coefficient_after = (try admitted.observe(0, 0, 0, 0, 0.0, 0.0)).?;
     try std.testing.expect(coefficient_after < 0.04);
     try admitted.finish();
     try std.testing.expectEqual(@as(usize, 1), admitted.telemetry().admitted_groups);
@@ -12834,15 +13482,23 @@ test "gemma4 GRPO KL control persists admitted and rejected pre-update decisions
 
     var rejected = try GrpoKlControl.init(allocator, std.testing.io, control_recipe);
     defer rejected.deinit();
-    try std.testing.expectError(
-        error.GrpoTrainKlBudgetExceeded,
-        rejected.observe(0, 0, 0, 0, 0.1001, 0.004004),
-    );
+    try std.testing.expectEqual(@as(?f32, null), try rejected.observe(0, 0, 0, 0, 0.1001, 0.004004));
+    try rejected.finish();
     try std.testing.expectEqual(@as(usize, 0), rejected.telemetry().admitted_groups);
+    try std.testing.expectEqual(@as(usize, 1), rejected.telemetry().rejected_groups);
     try std.testing.expect(rejected.telemetry().trace_digest != null);
     const rejected_trace = try readFileMax(allocator, std.testing.io, rejected.trace_path, 64 * 1024);
     defer allocator.free(rejected_trace);
-    try std.testing.expect(std.mem.indexOf(u8, rejected_trace, "\"status\":\"budget-exceeded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rejected_trace, "\"status\":\"budget-exceeded-skipped\"") != null);
+
+    var abort_recipe = control_recipe;
+    abort_recipe.grpo.train_max_kl_policy = "abort";
+    var aborted = try GrpoKlControl.init(allocator, std.testing.io, abort_recipe);
+    defer aborted.deinit();
+    try std.testing.expectError(
+        error.GrpoTrainKlBudgetExceeded,
+        aborted.observe(0, 0, 0, 0, 0.1001, 0.004004),
+    );
 }
 
 test "gemma4 GRPO KL checkpoint restores an exact adaptive continuation" {
@@ -12873,6 +13529,7 @@ test "gemma4 GRPO KL checkpoint restores an exact adaptive continuation" {
     try resumed.restoreCheckpoint(
         uninterrupted.current_kl_coef,
         uninterrupted.admitted_groups,
+        uninterrupted.rejected_groups,
         uninterrupted.max_observed_mean_kl,
         uninterrupted.trace.items,
     );
@@ -12930,6 +13587,7 @@ const GrpoScalarRow = struct {
     ref_logps: []const f32,
     new_logps: []const f32,
     reward: f32,
+    truncated: bool = false,
 };
 
 const GrpoBatchOwned = struct {
@@ -12955,13 +13613,8 @@ fn runDirectGrpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, repor
     if (std.mem.eql(u8, format, "token-logprobs")) {
         var batch = try loadGrpoScalarJsonl(allocator, io, path);
         defer batch.deinit();
-        const cfg = grpo.GRPOConfig{
-            .group_size = recipe.grpo.group_size orelse 8,
-            .clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
-            .kl_coef = recipe.grpo.kl_coef orelse 0.04,
-            .advantage_eps = recipe.grpo.advantage_eps orelse 1e-8,
-            .normalize_advantage = recipe.grpo.normalize_advantage orelse true,
-        };
+        var cfg = try resolveGrpoCoreConfig(recipe);
+        cfg.group_size = recipe.grpo.group_size orelse 8;
         var ga = grpo.GroupAdvantages{
             .allocator = allocator,
             .rewards = try allocator.dupe(f32, batch.rewards),
@@ -12979,6 +13632,15 @@ fn runDirectGrpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, repor
             .completions = batch.completions.len,
             .tokens = batch.new_logps.len,
             .groups = ga.num_groups,
+            .loss_type = @tagName(cfg.loss_type),
+            .scale_rewards = @tagName(cfg.scale_rewards),
+            .epsilon_low = cfg.clip_epsilon,
+            .epsilon_high = cfg.epsilon_high orelse cfg.clip_epsilon,
+            .max_completion_tokens = cfg.max_completion_tokens,
+            .truncated_completions = countTruncatedGrpoCompletions(batch.completions),
+            .frac_completions_truncated = @as(f32, @floatFromInt(countTruncatedGrpoCompletions(batch.completions))) /
+                @as(f32, @floatFromInt(@max(batch.completions.len, 1))),
+            .mask_truncated_completions = cfg.mask_truncated_completions,
             .loss = result.loss,
             .pg_loss = result.pg_loss,
             .kl_loss = result.kl_loss,
@@ -13029,7 +13691,9 @@ fn runDirectGrpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, repor
         .allocator = allocator,
         .model = policy_model,
         .max_seq_len = recipe.dataset.max_seq_len orelse 128,
-        .max_completion_tokens = recipe.grpo.max_completion_tokens orelse 4,
+        .max_completion_tokens = recipe.grpo.max_completion_tokens orelse default_grpo_max_completion_tokens,
+        .sampling = try resolveGrpoSamplingConfig(recipe.grpo),
+        .run_seed = recipe.optimizer.seed orelse 42,
     };
     var policy_scorer = DecoderLogprobScorer{
         .allocator = allocator,
@@ -13048,6 +13712,10 @@ fn runDirectGrpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, repor
         .mode = reward_mode,
     };
 
+    const core_cfg = try resolveGrpoCoreConfig(recipe);
+    if (core_cfg.mask_truncated_completions) {
+        return error.GrpoTruncationMaskNotSupportedForModelScore;
+    }
     var result = try preference_harness.grpoStep(allocator, prompt_batch.prompts, .{
         .ctx = &sampler,
         .call = DecoderGrpoSampler.sample,
@@ -13061,13 +13729,7 @@ fn runDirectGrpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, repor
         .ctx = &rewarder_ctx,
         .call = TextRewardCtx.score,
     }, .{
-        .grpo = .{
-            .group_size = recipe.grpo.group_size orelse 2,
-            .clip_epsilon = recipe.grpo.clip_epsilon orelse 0.2,
-            .kl_coef = recipe.grpo.kl_coef orelse 0.04,
-            .advantage_eps = recipe.grpo.advantage_eps orelse 1e-8,
-            .normalize_advantage = recipe.grpo.normalize_advantage orelse true,
-        },
+        .grpo = core_cfg,
         .num_prompts = prompt_batch.prompts.len,
     });
     defer result.deinit();
@@ -13077,6 +13739,12 @@ fn runDirectGrpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, repor
         .completions = prompt_batch.prompts.len * (recipe.grpo.group_size orelse 2),
         .tokens = result.grad_new_logps.len,
         .groups = prompt_batch.prompts.len,
+        .loss_type = @tagName(core_cfg.loss_type),
+        .scale_rewards = @tagName(core_cfg.scale_rewards),
+        .epsilon_low = core_cfg.clip_epsilon,
+        .epsilon_high = core_cfg.epsilon_high orelse core_cfg.clip_epsilon,
+        .max_completion_tokens = core_cfg.max_completion_tokens,
+        .mask_truncated_completions = core_cfg.mask_truncated_completions,
         .loss = result.loss,
         .pg_loss = result.pg_loss,
         .kl_loss = result.kl_loss,
@@ -13111,6 +13779,7 @@ fn loadGrpoScalarJsonl(allocator: std.mem.Allocator, io: std.Io, path: []const u
             .tokens = row.tokens,
             .old_logps = row.old_logps,
             .ref_logps = row.ref_logps,
+            .truncated = row.truncated,
         });
         try new_logps.appendSlice(allocator, row.new_logps);
         try rewards.append(allocator, row.reward);
@@ -13218,7 +13887,7 @@ fn loadGemmaGrpoPreparedPrompts(
     }
 
     const max_seq_len = recipe.dataset.max_seq_len orelse 128;
-    const max_completion_tokens = recipe.grpo.max_completion_tokens orelse 4;
+    const max_completion_tokens = recipe.grpo.max_completion_tokens orelse default_grpo_max_completion_tokens;
     if (max_completion_tokens == 0 or max_completion_tokens >= max_seq_len) return error.NoCompletionBudget;
     const prompt_max_seq_len = max_seq_len - max_completion_tokens;
     for (rows.items, 0..) |row, idx| {
@@ -13256,7 +13925,7 @@ fn tokenizeGrpoPrompt(
 ) ![]const i32 {
     const tokenizer = tokenizer_view.tokenizer;
     const max_seq_len = recipe.dataset.max_seq_len orelse 128;
-    const max_completion_tokens = recipe.grpo.max_completion_tokens orelse 4;
+    const max_completion_tokens = recipe.grpo.max_completion_tokens orelse default_grpo_max_completion_tokens;
     if (max_completion_tokens == 0 or max_completion_tokens >= max_seq_len) return error.NoCompletionBudget;
     const prompt_max_seq_len = max_seq_len - max_completion_tokens;
     const render_prompt = !std.mem.eql(u8, recipe.dataset.format orelse "text-grpo", "rendered-text-grpo");
@@ -13290,6 +13959,22 @@ fn countGrpoGroups(completions: []const grpo.Completion) usize {
         any = true;
     }
     return if (any) max_prompt + 1 else 0;
+}
+
+fn countTruncatedGrpoCompletions(completions: []const grpo.Completion) usize {
+    var count: usize = 0;
+    for (completions) |completion| {
+        if (completion.truncated) count += 1;
+    }
+    return count;
+}
+
+fn hasActiveGrpoCompletion(completions: []const grpo.Completion, mask_truncated: bool) bool {
+    if (!mask_truncated) return completions.len != 0;
+    for (completions) |completion| {
+        if (!completion.truncated) return true;
+    }
+    return false;
 }
 
 fn selectRankedTokenFromLogits(allocator: std.mem.Allocator, logits: []const f32, rank: usize) !i32 {
@@ -14692,6 +15377,42 @@ test "gemma4 preference training preflight rejects ignored and conflicting optio
     try std.testing.expectError(error.Gemma4BootstrapAndTrainingOutputConflict, buildPlan(std.heap.page_allocator, conflicting_outputs));
 }
 
+test "gemma4 DPO objective resolver admits only gradient-complete paired modes" {
+    const sigmoid = try resolveDpoObjectiveConfig(.{});
+    try std.testing.expectEqual(DpoLossType.sigmoid, sigmoid.loss_type);
+    try std.testing.expectEqual(preference_loss.PreferenceLoss.dpo, sigmoid.preference.kind);
+    try std.testing.expectEqualStrings("sum", sigmoid.logprobAggregation());
+
+    const smoothed = try resolveDpoObjectiveConfig(.{ .label_smoothing = 0.1 });
+    try std.testing.expectEqual(@as(f32, 0.1), smoothed.preference.label_smoothing);
+
+    const ipo = try resolveDpoObjectiveConfig(.{ .loss_type = "ipo", .ipo_tau = 0.2 });
+    try std.testing.expectEqual(DpoLossType.ipo, ipo.loss_type);
+    try std.testing.expectEqual(preference_loss.PreferenceLoss.ipo, ipo.preference.kind);
+    try std.testing.expectEqualStrings("completion-token-mean", ipo.logprobAggregation());
+
+    const simpo = try resolveDpoObjectiveConfig(.{ .loss_type = "simpo", .simpo_gamma = 0.3 });
+    try std.testing.expectEqual(DpoLossType.simpo, simpo.loss_type);
+    try std.testing.expect(!simpo.needsReference());
+
+    try std.testing.expectError(
+        error.InvalidDpoLabelSmoothing,
+        resolveDpoObjectiveConfig(.{ .label_smoothing = 0.5 }),
+    );
+    try std.testing.expectError(
+        error.DpoLabelSmoothingRequiresSigmoid,
+        resolveDpoObjectiveConfig(.{ .loss_type = "ipo", .label_smoothing = 0.1 }),
+    );
+    try std.testing.expectError(
+        error.DpoLossTypeNotYetSupported,
+        resolveDpoObjectiveConfig(.{ .loss_type = "orpo" }),
+    );
+    try std.testing.expectError(
+        error.DpoLossTypeNotYetSupported,
+        resolveDpoObjectiveConfig(.{ .loss_type = "kto" }),
+    );
+}
+
 test "gemma4 GRPO reward and group contracts fail during planning" {
     const valid = Recipe{
         .recipe = "grpo",
@@ -14765,9 +15486,85 @@ test "gemma4 GRPO reward and group contracts fail during planning" {
     bad_group.grpo.group_size = 1;
     try std.testing.expectError(error.InvalidGrpoGroupSize, buildPlan(std.heap.page_allocator, bad_group));
 
+    var stochastic = valid;
+    stochastic.grpo.sampling = .{ .temperature = 0.8, .top_p = 0.95, .top_k = 64 };
+    const stochastic_plan = try buildPlan(std.heap.page_allocator, stochastic);
+    defer freePlan(std.heap.page_allocator, stochastic_plan);
+    const resolved_sampling = try resolveGrpoSamplingConfig(stochastic.grpo);
+    try std.testing.expectEqual(@as(f32, 0.8), resolved_sampling.temperature);
+    try std.testing.expectEqual(@as(f32, 0.95), resolved_sampling.top_p);
+    try std.testing.expectEqual(@as(usize, 64), resolved_sampling.top_k);
+
+    var objective = valid;
+    objective.grpo.loss_type = "dr_grpo";
+    objective.grpo.scale_rewards = "none";
+    objective.grpo.epsilon_high = 0.28;
+    objective.grpo.mask_truncated_completions = true;
+    const objective_plan = try buildPlan(std.heap.page_allocator, objective);
+    defer freePlan(std.heap.page_allocator, objective_plan);
+    const resolved_objective = try resolveGrpoObjectiveConfig(objective.grpo, 1);
+    try std.testing.expectEqual(grpo.LossType.dr_grpo, resolved_objective.loss_type);
+    try std.testing.expectEqual(grpo.RewardScale.none, resolved_objective.scale_rewards);
+    try std.testing.expectEqual(@as(f32, 0.28), resolved_objective.epsilon_high);
+    try std.testing.expect(resolved_objective.mask_truncated_completions);
+
+    var batch_scaled_training = valid;
+    batch_scaled_training.grpo.scale_rewards = "batch";
+    try std.testing.expectError(
+        error.GrpoBatchRewardScalingRequiresBatchedGroups,
+        buildPlan(std.heap.page_allocator, batch_scaled_training),
+    );
+
+    var invalid_loss_type = valid;
+    invalid_loss_type.grpo.loss_type = "made-up";
+    try std.testing.expectError(
+        error.InvalidGrpoLossType,
+        buildPlan(std.heap.page_allocator, invalid_loss_type),
+    );
+
+    var invalid_scale = valid;
+    invalid_scale.grpo.scale_rewards = "local";
+    try std.testing.expectError(
+        error.InvalidGrpoRewardScale,
+        buildPlan(std.heap.page_allocator, invalid_scale),
+    );
+
+    var accumulated_dapo = valid;
+    accumulated_dapo.grpo.loss_type = "dapo";
+    accumulated_dapo.optimizer.gradient_accumulation_steps = 2;
+    try std.testing.expectError(
+        error.GrpoDapoRequiresUnitGradientAccumulation,
+        buildPlan(std.heap.page_allocator, accumulated_dapo),
+    );
+
+    var bad_temperature = valid;
+    bad_temperature.grpo.sampling = .{ .temperature = 0.0 };
+    try std.testing.expectError(
+        error.InvalidGrpoSamplingTemperature,
+        buildPlan(std.heap.page_allocator, bad_temperature),
+    );
+
+    var bad_top_p = valid;
+    bad_top_p.grpo.sampling = .{ .top_p = 1.01 };
+    try std.testing.expectError(
+        error.InvalidGrpoSamplingTopP,
+        buildPlan(std.heap.page_allocator, bad_top_p),
+    );
+
     const default_kl = try resolveGrpoKlControl(valid.grpo);
     try std.testing.expectEqual(@as(f32, 0.1), default_kl.train_max_kl);
+    try std.testing.expectEqual(
+        ResolvedGrpoKlControl.BudgetPolicy.skip_group,
+        default_kl.budget_policy,
+    );
     try std.testing.expect(!default_kl.adaptive);
+
+    var bad_kl_policy = valid;
+    bad_kl_policy.grpo.train_max_kl_policy = "halve_lr";
+    try std.testing.expectError(
+        error.InvalidGrpoTrainKlPolicy,
+        buildPlan(std.heap.page_allocator, bad_kl_policy),
+    );
 
     var incomplete_adaptive_kl = valid;
     incomplete_adaptive_kl.grpo.adaptive_kl = true;

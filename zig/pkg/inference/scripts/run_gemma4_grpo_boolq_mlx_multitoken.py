@@ -6,8 +6,9 @@ materialization that produced it. It executes two MLX lanes from the identical
 seed adapter:
 
 * ``trace_replay`` trains on Antfly's exact completion sequences and rewards;
-* ``native_rollout`` performs the same deterministic ranked multi-token rollout
-  independently in MLX.
+* ``native_rollout`` is the retired deterministic ranked multi-token rollout.
+  The acceptance loader fails closed for stochastic Antfly reports until this
+  lane has a matching categorical sampler and statistical behavioral gates.
 
 Both lanes use a frozen base-equivalent reference, one optimizer update per
 completion group, token-normalized GRPO loss, the same hard raw-K3 KL budget,
@@ -36,18 +37,20 @@ SCRIPT_DIR = SCRIPT_PATH.parent
 RESULT_SCHEMA_VERSION = "antfly_gemma4_grpo_boolq_mlx_multitoken/v1"
 MATERIALIZATION_SCHEMA_VERSION = "antfly_gemma4_grpo_boolq_materialization/v1"
 REWARD_TRACE_SCHEMA_VERSION = "antfly_inference_grpo_reward_trace/v1"
-KL_TRACE_SCHEMA_VERSION = "antfly_inference_grpo_kl_control_trace/v1"
+KL_TRACE_SCHEMA_VERSION = "antfly_inference_grpo_kl_control_trace/v2"
 GRPO_REPORT_SCHEMA_VERSIONS = frozenset(
     {
         "antfly_inference_finetune_grpo_report/v4",
         "antfly_inference_finetune_grpo_report/v5",
         "antfly_inference_finetune_grpo_report/v6",
+        "antfly_inference_finetune_grpo_report/v7",
     }
 )
 GRPO_EVAL_SCHEMA_VERSIONS = frozenset(
     {
         "antfly_inference_finetune_grpo_evaluation/v2",
         "antfly_inference_finetune_grpo_evaluation/v3",
+        "antfly_inference_finetune_grpo_evaluation/v4",
     }
 )
 MODEL_KEYS = ("gemma-4-E2B-it", "gemma-4-E4B-it")
@@ -64,7 +67,7 @@ OPTIMIZER = {
 GRPO = {
     "clip_epsilon": 0.2,
     "initial_kl_coef": 0.04,
-    "advantage_epsilon": 1.0e-8,
+    "advantage_epsilon": 1.0e-4,
     "train_max_kl": 0.1,
     "target_kl": 0.01,
     "kl_horizon": 100.0,
@@ -185,7 +188,11 @@ def normalized_advantages(rewards: Sequence[float], epsilon: float) -> list[floa
     if not rewards:
         raise MultiTokenParityError("cannot normalize an empty reward group")
     mean = statistics.mean(rewards)
-    variance = sum((reward - mean) ** 2 for reward in rewards) / len(rewards)
+    variance = (
+        sum((reward - mean) ** 2 for reward in rewards) / (len(rewards) - 1)
+        if len(rewards) > 1
+        else 0.0
+    )
     denominator = math.sqrt(variance) + epsilon
     return [(reward - mean) / denominator for reward in rewards]
 
@@ -309,8 +316,6 @@ def load_trace(
     for group in result:
         if len(group.completions) != group_size:
             raise MultiTokenParityError(f"{phase} reward trace group size drifted")
-        if len(set(group.sequences)) != group_size or len(set(group.first_token_ids)) != group_size:
-            raise MultiTokenParityError(f"{phase} ranked completion group is not distinct")
     return result
 
 
@@ -424,7 +429,12 @@ def validate_kl_trace(root: Path, report: Mapping[str, Any], spec: CampaignSpec)
     telemetry = report.get("kl_control")
     if not isinstance(telemetry, dict):
         raise MultiTokenParityError("Antfly adaptive KL telemetry is missing")
-    if telemetry.get("mode") != "adaptive" or telemetry.get("admitted_groups") != spec.train_groups:
+    if (
+        telemetry.get("mode") != "adaptive"
+        or telemetry.get("budget_policy") != "skip_group"
+        or telemetry.get("admitted_groups") != spec.train_groups
+        or telemetry.get("rejected_groups") != 0
+    ):
         raise MultiTokenParityError("Antfly adaptive KL telemetry counts drifted")
     for field, expected in (
         ("train_max_kl", GRPO["train_max_kl"]),
@@ -451,6 +461,7 @@ def validate_kl_trace(root: Path, report: Mapping[str, Any], spec: CampaignSpec)
             or row.get("schema_version") != KL_TRACE_SCHEMA_VERSION
             or row.get("group_index") != index
             or row.get("status") != "admitted"
+            or row.get("budget_policy") != "skip_group"
         ):
             raise MultiTokenParityError("Antfly KL trace decision/order drifted")
         before = finite_float(row.get("kl_coef_before"), "kl_coef_before")
@@ -479,6 +490,10 @@ def load_acceptance(
     eval_report = load_json(evidence_root / "grpo_evaluation_report.json", "Antfly GRPO evaluation report")
     if train_report.get("schema_version") not in GRPO_REPORT_SCHEMA_VERSIONS:
         raise MultiTokenParityError("Antfly GRPO report is not the adaptive-KL schema")
+    try:
+        legacy.require_native_rollout_sampler_compatibility(train_report)
+    except legacy.BoolQParityContractError as exc:
+        raise MultiTokenParityError(str(exc)) from exc
     if eval_report.get("schema_version") not in GRPO_EVAL_SCHEMA_VERSIONS:
         raise MultiTokenParityError("Antfly GRPO evaluation is not the raw-KL schema")
     if train_report.get("execution_mode") != "train" or train_report.get("dataset_format") != "rendered-text-grpo":
@@ -494,8 +509,42 @@ def load_acceptance(
         raise MultiTokenParityError("Antfly campaign must run on Metal")
     if eval_report.get("status") != "passed" or eval_report.get("groups") != spec.eval_groups:
         raise MultiTokenParityError("Antfly held-out campaign did not pass")
+    if eval_report.get("mask_truncated_completions") is not False:
+        raise MultiTokenParityError("Antfly evaluation truncation policy drifted")
     if train_report.get("mean_kl") is None or eval_report.get("mean_kl") is None:
         raise MultiTokenParityError("Antfly raw KL metrics are missing")
+    if train_report.get("schema_version") == "antfly_inference_finetune_grpo_report/v7":
+        if (
+            train_report.get("optimizer_groups") != spec.train_groups
+            or train_report.get("zero_reward_std_groups") != 0
+            or train_report.get("all_truncated_groups") != 0
+            or train_report.get("kl_rejected_groups") != 0
+            or float(train_report.get("frac_reward_zero_std", -1.0)) != 0.0
+            or float(train_report.get("frac_kl_rejected", -1.0)) != 0.0
+            or train_report.get("loss_type") != "bnpo"
+            or train_report.get("scale_rewards") != "group"
+            or float(train_report.get("epsilon_low", 0.0)) != GRPO["clip_epsilon"]
+            or float(train_report.get("epsilon_high", 0.0)) != GRPO["clip_epsilon"]
+            or train_report.get("max_completion_tokens") != spec.max_completion_tokens
+            or train_report.get("mask_truncated_completions") is not False
+            or train_report.get("num_iterations") != 1
+        ):
+            raise MultiTokenParityError("Antfly GRPO v7 objective semantics drifted")
+        truncated = train_report.get("truncated_completions")
+        truncated_fraction = train_report.get("frac_completions_truncated")
+        if (
+            isinstance(truncated, bool)
+            or not isinstance(truncated, int)
+            or not 0 <= truncated <= expected_counts["completions"]
+            or not isinstance(truncated_fraction, (int, float))
+            or not math.isclose(
+                float(truncated_fraction),
+                truncated / expected_counts["completions"],
+                rel_tol=0.0,
+                abs_tol=1e-7,
+            )
+        ):
+            raise MultiTokenParityError("Antfly truncated-completion telemetry drifted")
     recipe = config.get("recipe")
     if not isinstance(recipe, dict):
         raise MultiTokenParityError("Antfly normalized recipe is missing")
@@ -539,7 +588,14 @@ def load_acceptance(
         ("max_kl_coef", GRPO["max_kl_coef"]),
     ):
         require_close(grpo.get(field), expected, f"grpo.{field}")
-    if grpo.get("adaptive_kl") is not True or grpo.get("normalize_advantage") is not True:
+    if (
+        grpo.get("adaptive_kl") is not True
+        or grpo.get("normalize_advantage") is not True
+        or grpo.get("loss_type") not in (None, "bnpo")
+        or grpo.get("scale_rewards") not in (None, "group")
+        or grpo.get("epsilon_high") not in (None, GRPO["clip_epsilon"])
+        or grpo.get("mask_truncated_completions") not in (None, False)
+    ):
         raise MultiTokenParityError("Antfly adaptive/advantage policy drifted")
     validate_kl_trace(evidence_root, train_report, spec)
     train_trace_path = evidence_root / "grpo_reward_trace.jsonl"

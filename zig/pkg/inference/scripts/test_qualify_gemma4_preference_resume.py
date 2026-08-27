@@ -50,8 +50,9 @@ def incremental_telemetry(epoch):
         "max_decode_batch_size": 4 if epoch else 0,
         "active_candidate_batching": True,
         "exact_logprob_rescore_forwards": epoch * 4,
-        "resident_ranked_token_selections": epoch * 8,
+        "resident_ranked_token_selections": 0,
         "host_logit_fallbacks": 0,
+        "host_logit_sampling_rows": epoch,
         "shared_prompt_tokens": epoch * 16,
         "reused_candidate_prompt_tokens": epoch * 16,
         "cache_page_tokens": 16,
@@ -74,7 +75,11 @@ def write_checkpoint(epoch):
            if task == "dpo" else {
                "total_loss": float(epoch), "total_pg_loss": float(epoch), "total_kl_loss": 0.0,
                "total_mean_kl": 0.0, "total_clip_fraction": 0.0, "total_groups": epoch,
-               "total_completions": epoch * 4, "total_tokens": epoch * 4,
+               "optimizer_groups": epoch, "zero_reward_std_groups": 0,
+               "all_truncated_groups": 0,
+               "kl_rejected_groups": 0,
+               "total_completions": epoch * 4, "truncated_completions": 0,
+               "total_tokens": epoch * 4,
                "total_reward": float(epoch), "total_reward_squared": float(epoch),
                "saw_nonzero_reward_advantage": True, "saw_nonzero_policy_gradient": True,
                "initial_sampling_rescore_max_abs_error": 0.0,
@@ -195,7 +200,7 @@ if task == "grpo":
         "sha256:" + hashlib.sha256(evaluation_reward_trace_path.read_bytes()).hexdigest()
     )
 common = {
-    "schema_version": f"antfly_inference_finetune_{task}_report/v6",
+    "schema_version": f"antfly_inference_finetune_{task}_report/v7",
     "execution_mode": "train", "dataset_format": "text-preference" if task == "dpo" else "text-grpo",
     "policy_backend": "metal", "optimizer_steps": epochs, "micro_batch_steps": epochs * (2 if task == "dpo" else 4),
     "initial_logprob_parity": {"max_abs_error": 0.0}, "checkpoint_resume": checkpoint_summary,
@@ -206,37 +211,59 @@ common = {
 evaluation = {"report_path": str(root / f"{task}-evaluation.json"), "passed": True}
 if task == "dpo":
     report = {**common, "examples": epochs, "loss": 0.5, "mean_reward_margin": 0.1,
-              "accuracy": 1.0, "beta": 0.1, "policy_scoring_mode": "compiled",
+              "accuracy": 1.0, "beta": 0.1, "loss_type": "sigmoid",
+              "logprob_aggregation": "sum", "label_smoothing": 0.0,
+              "reference_mode": "frozen-base-equivalent-initial-adapter",
+              "policy_scoring_mode": "compiled",
               "training_microbatch_mode": "paired", "initial_bucket_signature_parity": {"max_abs_error": 0.0},
               "sequence_length_policy": {"mode": "fixed"},
               "evaluation": {**evaluation, "examples": epochs, "loss": 0.4,
-                             "mean_reward_margin": 0.1, "accuracy": 1.0}}
+                             "mean_reward_margin": 0.1, "accuracy": 1.0,
+                             "loss_type": "sigmoid", "logprob_aggregation": "sum",
+                             "label_smoothing": 0.0,
+                             "reference_mode": "frozen-base-equivalent-initial-adapter"}}
 else:
     report = {**common, "completions": epochs * 4, "tokens": epochs * 4, "groups": epochs,
+              "optimizer_groups": epochs, "zero_reward_std_groups": 0,
+              "all_truncated_groups": 0,
+              "kl_rejected_groups": 0,
+              "frac_reward_zero_std": 0.0, "frac_kl_rejected": 0.0,
+              "truncated_completions": 0, "frac_completions_truncated": 0.0,
+              "mask_truncated_completions": False,
+              "loss_type": "bnpo", "scale_rewards": "group",
+              "epsilon_low": 0.2, "epsilon_high": 0.2,
+              "max_completion_tokens": 4, "num_iterations": 1,
               "loss": 0.5, "pg_loss": 0.5, "kl_loss": 0.0, "mean_kl": 0.0,
               "clip_fraction": 0.0, "mean_reward": 0.5, "reward_stddev": 0.5,
               "policy_rescore_completions": (epochs * 4 if compiled_sampling_enabled else 4),
-              "sampling_mode": ("compiled-shared-prompt-ranked-sparse-row-each-step"
-                                if compiled_sampling_enabled else "ranked"),
+              "sampling_mode": ("compiled-shared-prompt-seeded-categorical-sparse-row-each-step"
+                                if compiled_sampling_enabled else "seeded-categorical"),
+              "sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": 0,
+                           "seed_derivation": "splitmix64-run-domain-epoch-group-completion"},
               "policy_logprob_mode": (
-                  "compiled-token-selection-with-eager-per-completion-token-validated-logprob-rescore"
+                  "compiled-token-selection-with-eager-per-completion-canonical-logprob-rescore"
                   if compiled_sampling_enabled else "reuse"
               ),
               "training_microbatch_mode": "per-completion", "training_microbatch_batch_size": 1,
               "training_physical_micro_batches_per_group": 4, "reference_mode": "frozen",
               "kl_control": {"mode": "adaptive", "final_kl_coef": 0.04,
+                             "budget_policy": "skip_group", "admitted_groups": epochs,
+                             "rejected_groups": 0,
                              "trace_path": str(kl_trace_path), "trace_digest": kl_trace_sha256},
               "reward_pipeline": {"providers": 1, "configuration_digest": "sha256:" + "e" * 64,
                                   "trace_path": str(reward_trace_path),
                                   "trace_digest": reward_trace_sha256},
               "incremental_kv": incremental_telemetry(epochs) if incremental_enabled else None,
               "evaluation": {**evaluation, "groups": epochs, "completions": epochs * 4,
+                             "zero_reward_std_groups": 0, "frac_reward_zero_std": 0.0,
+                             "truncated_completions": 0, "frac_completions_truncated": 0.0,
+                             "mask_truncated_completions": False,
                              "mean_reward": 0.5, "top_rank_mean_reward": 0.5,
                              "positive_reward_group_rate": 1.0, "reward_stddev": 0.5,
                              "kl_loss": 0.0, "mean_kl": 0.0, "sampling_seconds": 1.0}}
 report_path.write_text(json.dumps(report))
 evaluation_report = {
-    "schema_version": f"antfly_inference_finetune_{task}_evaluation/v{'2' if task == 'dpo' else '3'}",
+    "schema_version": f"antfly_inference_finetune_{task}_evaluation/v{'3' if task == 'dpo' else '4'}",
     "status": "passed",
     "dataset_path": str(recipe["dataset"]["eval_path"]),
     "policy_backend": "metal",
@@ -252,6 +279,11 @@ if task == "grpo":
     evaluation_report.update({
         "groups": epochs,
         "completions": epochs * 4,
+        "zero_reward_std_groups": 0,
+        "frac_reward_zero_std": 0.0,
+        "truncated_completions": 0,
+        "frac_completions_truncated": 0.0,
+        "mask_truncated_completions": False,
         "mean_reward": 0.5,
         "top_rank_mean_reward": 0.5,
         "positive_reward_group_rate": 1.0,
@@ -348,6 +380,8 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
             "artifacts": {"root": str(self.root / "unused")},
             "backend": "metal",
         }
+        if task == "grpo":
+            recipe["grpo"] = {"max_completion_tokens": 4}
         path = self.root / f"{task}.recipe.json"
         path.write_text(json.dumps(recipe), encoding="utf-8")
         return path

@@ -2115,11 +2115,52 @@ pub const GrpoIncrementalKvTelemetry = struct {
     exact_logprob_rescore_forwards: usize = 0,
     resident_ranked_token_selections: usize = 0,
     host_logit_fallbacks: usize = 0,
+    host_logit_sampling_rows: usize = 0,
     shared_prompt_tokens: usize = 0,
     reused_candidate_prompt_tokens: usize = 0,
     cache_page_tokens: usize = 0,
     cache_dtype: []const u8 = "f32",
 };
+
+/// Typed sampling policy for GRPO rollouts. `seed` identifies one prompt
+/// group; each completion receives a separately derived stream so an early EOS
+/// in one completion cannot perturb any sibling completion.
+pub const GrpoSamplingOptions = struct {
+    seed: u64,
+    temperature: f32 = 1.0,
+    top_p: f32 = 1.0,
+    /// Zero disables top-k filtering.
+    top_k: usize = 0,
+    /// Evaluation keeps its historical greedy-quality metric by making the
+    /// first completion greedy. Product training leaves this false.
+    first_completion_greedy: bool = false,
+};
+
+fn mixGrpoSamplingSeed(value: u64) u64 {
+    var mixed = value +% 0x9e3779b97f4a7c15;
+    mixed = (mixed ^ (mixed >> 30)) *% 0xbf58476d1ce4e5b9;
+    mixed = (mixed ^ (mixed >> 27)) *% 0x94d049bb133111eb;
+    return mixed ^ (mixed >> 31);
+}
+
+/// Derive a stable group seed from the run seed and logical position. The
+/// caller supplies a distinct domain for training and evaluation. Because the
+/// result is position-derived rather than process-state-derived, epoch-boundary
+/// checkpoint resume reproduces the exact same streams.
+pub fn deriveGrpoSamplingGroupSeed(
+    run_seed: u64,
+    domain: u64,
+    epoch_index: usize,
+    group_index: usize,
+) u64 {
+    var seed = mixGrpoSamplingSeed(run_seed ^ domain);
+    seed = mixGrpoSamplingSeed(seed ^ @as(u64, @intCast(epoch_index)));
+    return mixGrpoSamplingSeed(seed ^ @as(u64, @intCast(group_index)));
+}
+
+pub fn deriveGrpoCompletionSamplingSeed(group_seed: u64, completion_index: usize) u64 {
+    return mixGrpoSamplingSeed(group_seed ^ @as(u64, @intCast(completion_index)));
+}
 
 /// Exactness-first GRPO rollout sampler. One candidate performs the canonical
 /// prompt prefill; every other candidate retains its complete KV pages and
@@ -2238,7 +2279,9 @@ pub const GrpoIncrementalKvSampler = struct {
             !std.mem.eql(u8, telemetry.cache_dtype, "f32") or
             telemetry.active_candidate_batching != self.batch_active_candidates or
             telemetry.prompt_tail_cloning != self.clone_prompt_tails or
-            telemetry.host_logit_fallbacks > telemetry.resident_ranked_token_selections or
+            telemetry.resident_ranked_token_selections != 0 or
+            telemetry.host_logit_fallbacks != 0 or
+            telemetry.host_logit_sampling_rows < expected_groups or
             telemetry.prompt_tail_clone_tokens < telemetry.prompt_tail_clone_candidates or
             telemetry.reused_candidate_prompt_tokens < telemetry.shared_prompt_tokens)
         {
@@ -2256,6 +2299,7 @@ pub const GrpoIncrementalKvSampler = struct {
                 telemetry.exact_logprob_rescore_forwards != 0 or
                 telemetry.resident_ranked_token_selections != 0 or
                 telemetry.host_logit_fallbacks != 0 or
+                telemetry.host_logit_sampling_rows != 0 or
                 telemetry.shared_prompt_tokens != 0 or
                 telemetry.reused_candidate_prompt_tokens != 0))
         {
@@ -2427,12 +2471,12 @@ pub const GrpoIncrementalKvSampler = struct {
         return ranked[clamped_rank];
     }
 
-    pub fn sampleCompletionGroupRanked(
+    pub fn sampleCompletionGroup(
         self: *GrpoIncrementalKvSampler,
         prompt: []const i32,
         seq_len: usize,
         max_completion_tokens: usize,
-        rank_cap: usize,
+        sampling: GrpoSamplingOptions,
         eos_token_id: ?i32,
         out_tokens: []std.ArrayList(i32),
         out_logps: []std.ArrayList(f32),
@@ -2441,13 +2485,18 @@ pub const GrpoIncrementalKvSampler = struct {
         if (prompt.len >= seq_len) return error.NoCompletionBudget;
         if (max_completion_tokens == 0) return error.EmptyCompletion;
         if (out_tokens.len == 0 or out_tokens.len != out_logps.len) return error.InvalidCompletionGroup;
-        if (rank_cap == 0) return error.InvalidCompletionRankCap;
+        try validateGrpoSamplingOptions(sampling);
         for (out_tokens, out_logps) |tokens, logps| {
             if (tokens.items.len != 0 or logps.items.len != 0) return error.NonEmptyCompletionOutput;
         }
 
         errdefer self.cancelFrameAfterError();
         const group_size = out_tokens.len;
+        const rngs = try self.allocator.alloc(std.Random.DefaultPrng, group_size);
+        defer self.allocator.free(rngs);
+        for (rngs, 0..) |*rng, completion_idx| {
+            rng.* = std.Random.DefaultPrng.init(deriveGrpoCompletionSamplingSeed(sampling.seed, completion_idx));
+        }
         const states = try self.allocator.alloc(generation.NativeDecodeState, group_size);
         defer self.allocator.free(states);
         var initialized_states: usize = 0;
@@ -2628,12 +2677,24 @@ pub const GrpoIncrementalKvSampler = struct {
         defer self.allocator.free(decode_inputs);
 
         const vocab_size: usize = @intCast(self.config.vocab_size);
-        const ranked_count = @min(@min(rank_cap, group_size), vocab_size);
-        const ranked_tokens = try self.allocator.alloc(usize, ranked_count);
-        defer self.allocator.free(ranked_tokens);
-        try self.selectTopRankedTokensResident(first_logits, ranked_tokens);
+        if (self.trainer.compute_backend.decoderRuntimeHasActiveFrame()) try self.drainFrame();
+        const first_host_logits = try self.trainer.compute_backend.toFloat32(first_logits, self.allocator);
+        defer self.allocator.free(first_host_logits);
+        if (first_host_logits.len < vocab_size) return error.InvalidLogitsShape;
+        self.telemetry.host_logit_sampling_rows += 1;
+        const first_row = first_host_logits[0..vocab_size];
         for (0..group_size) |completion_idx| {
-            const token_id = ranked_tokens[@min(completion_idx % rank_cap, ranked_count - 1)];
+            var completion_sampling = sampling;
+            if (sampling.first_completion_greedy and completion_idx == 0) {
+                completion_sampling.top_k = 1;
+                completion_sampling.top_p = 1.0;
+            }
+            const token_id = try sampleGrpoTokenFromLogits(
+                self.allocator,
+                first_row,
+                completion_sampling,
+                rngs[completion_idx].random().float(f64),
+            );
             try out_tokens[completion_idx].append(self.allocator, @intCast(token_id));
             try out_logps[completion_idx].append(self.allocator, 0.0);
             if (eos_token_id) |eos_id| {
@@ -2682,8 +2743,24 @@ pub const GrpoIncrementalKvSampler = struct {
                 self.telemetry.decode_forwards += 1;
                 self.telemetry.decode_forward_candidates += active_count;
                 self.telemetry.max_decode_batch_size = @max(self.telemetry.max_decode_batch_size, active_count);
+                if (self.trainer.compute_backend.decoderRuntimeHasActiveFrame()) try self.drainFrame();
+                const host_logits = try self.trainer.compute_backend.toFloat32(logits, self.allocator);
+                defer self.allocator.free(host_logits);
+                if (host_logits.len < active_count * vocab_size) return error.InvalidLogitsShape;
+                self.telemetry.host_logit_sampling_rows += active_count;
                 for (active_indices[0..active_count], 0..) |completion_idx, row_index| {
-                    const token_id = try self.selectRankedTokenResident(logits, row_index, completion_idx % rank_cap);
+                    var completion_sampling = sampling;
+                    if (sampling.first_completion_greedy and completion_idx == 0) {
+                        completion_sampling.top_k = 1;
+                        completion_sampling.top_p = 1.0;
+                    }
+                    const row = host_logits[row_index * vocab_size ..][0..vocab_size];
+                    const token_id = try sampleGrpoTokenFromLogits(
+                        self.allocator,
+                        row,
+                        completion_sampling,
+                        rngs[completion_idx].random().float(f64),
+                    );
                     try out_tokens[completion_idx].append(self.allocator, @intCast(token_id));
                     try out_logps[completion_idx].append(self.allocator, 0.0);
                     if (eos_token_id) |eos_id| {
@@ -2709,7 +2786,22 @@ pub const GrpoIncrementalKvSampler = struct {
                     self.telemetry.decode_forwards += 1;
                     self.telemetry.decode_forward_candidates += 1;
                     self.telemetry.max_decode_batch_size = @max(self.telemetry.max_decode_batch_size, 1);
-                    const token_id = try self.selectRankedTokenResident(logits, 0, completion_idx % rank_cap);
+                    if (self.trainer.compute_backend.decoderRuntimeHasActiveFrame()) try self.drainFrame();
+                    const host_logits = try self.trainer.compute_backend.toFloat32(logits, self.allocator);
+                    defer self.allocator.free(host_logits);
+                    if (host_logits.len < vocab_size) return error.InvalidLogitsShape;
+                    self.telemetry.host_logit_sampling_rows += 1;
+                    var completion_sampling = sampling;
+                    if (sampling.first_completion_greedy and completion_idx == 0) {
+                        completion_sampling.top_k = 1;
+                        completion_sampling.top_p = 1.0;
+                    }
+                    const token_id = try sampleGrpoTokenFromLogits(
+                        self.allocator,
+                        host_logits[0..vocab_size],
+                        completion_sampling,
+                        rngs[completion_idx].random().float(f64),
+                    );
                     try out_tokens[completion_idx].append(self.allocator, @intCast(token_id));
                     try out_logps[completion_idx].append(self.allocator, 0.0);
                     if (eos_token_id) |eos_id| {
@@ -2719,7 +2811,7 @@ pub const GrpoIncrementalKvSampler = struct {
             }
         }
 
-        try self.drainFrame();
+        if (self.trainer.compute_backend.decoderRuntimeHasActiveFrame()) try self.drainFrame();
         self.telemetry.groups += 1;
         for (out_tokens) |tokens| {
             if (tokens.items.len == 0) return error.EmptyCompletion;
@@ -2727,18 +2819,18 @@ pub const GrpoIncrementalKvSampler = struct {
     }
 };
 
-/// Samples a ranked completion group while sharing the prompt-only forward pass.
-/// Every completion uses `completion_idx % rank_cap` at each decoding step, which
-/// preserves the deterministic diversity contract of `sampleCompletionRanked`.
-/// Once prefixes diverge, subsequent decoding steps execute independently.
-pub fn sampleCompletionGroupRanked(
+/// Samples a stochastic completion group while sharing the prompt-only forward
+/// pass. Each completion owns a position-derived RNG stream, so siblings remain
+/// deterministic even when their EOS positions differ. Once prefixes diverge,
+/// subsequent decoding steps execute independently.
+pub fn sampleCompletionGroup(
     allocator: std.mem.Allocator,
     trainer: *real_autodiff.RealAutodiffTrainer,
     ctx: *GemmaAutodiffCtx,
     prompt: []const i32,
     seq_len: u32,
     max_completion_tokens: usize,
-    rank_cap: usize,
+    sampling: GrpoSamplingOptions,
     eos_token_id: ?i32,
     sparse_multi_token_projection: bool,
     out_tokens: []std.ArrayList(i32),
@@ -2748,12 +2840,17 @@ pub fn sampleCompletionGroupRanked(
     if (prompt.len >= seq_len) return error.NoCompletionBudget;
     if (max_completion_tokens == 0) return error.EmptyCompletion;
     if (out_tokens.len == 0 or out_tokens.len != out_logps.len) return error.InvalidCompletionGroup;
-    if (rank_cap == 0) return error.InvalidCompletionRankCap;
+    try validateGrpoSamplingOptions(sampling);
     for (out_tokens, out_logps) |tokens, logps| {
         if (tokens.items.len != 0 or logps.items.len != 0) return error.NonEmptyCompletionOutput;
     }
 
     const group_size = out_tokens.len;
+    const rngs = try allocator.alloc(std.Random.DefaultPrng, group_size);
+    defer allocator.free(rngs);
+    for (rngs, 0..) |*rng, completion_idx| {
+        rng.* = std.Random.DefaultPrng.init(deriveGrpoCompletionSamplingSeed(sampling.seed, completion_idx));
+    }
     const sequences = try allocator.alloc(std.ArrayList(i32), group_size);
     defer allocator.free(sequences);
     var initialized_sequences: usize = 0;
@@ -2782,13 +2879,19 @@ pub fn sampleCompletionGroupRanked(
                 logits[0..vocab_size]
             else
                 logits[(prompt.len - 1) * vocab_size ..][0..vocab_size];
-            const ranked_count = @min(@min(rank_cap, group_size), vocab_size);
-            const ranked_tokens = try allocator.alloc(usize, ranked_count);
-            defer allocator.free(ranked_tokens);
-            try selectTopRankedTokens(allocator, row, ranked_tokens);
             const log_z = logNormalizer(row);
             for (0..group_size) |completion_idx| {
-                const token_id = ranked_tokens[@min(completion_idx % rank_cap, ranked_count - 1)];
+                var completion_sampling = sampling;
+                if (sampling.first_completion_greedy and completion_idx == 0) {
+                    completion_sampling.top_k = 1;
+                    completion_sampling.top_p = 1.0;
+                }
+                const token_id = try sampleGrpoTokenFromLogits(
+                    allocator,
+                    row,
+                    completion_sampling,
+                    rngs[completion_idx].random().float(f64),
+                );
                 const token_logp = logProbAtTokenWithNormalizer(row, token_id, log_z);
                 try out_tokens[completion_idx].append(allocator, @intCast(token_id));
                 try out_logps[completion_idx].append(allocator, token_logp);
@@ -2819,7 +2922,17 @@ pub fn sampleCompletionGroupRanked(
                 logits[0..vocab_size]
             else
                 logits[(seq.items.len - 1) * vocab_size ..][0..vocab_size];
-            const token_id = try selectRankedToken(allocator, row, completion_idx % rank_cap);
+            var completion_sampling = sampling;
+            if (sampling.first_completion_greedy and completion_idx == 0) {
+                completion_sampling.top_k = 1;
+                completion_sampling.top_p = 1.0;
+            }
+            const token_id = try sampleGrpoTokenFromLogits(
+                allocator,
+                row,
+                completion_sampling,
+                rngs[completion_idx].random().float(f64),
+            );
             const token_logp = logProbAtToken(row, token_id);
             try out_tokens[completion_idx].append(allocator, @intCast(token_id));
             try out_logps[completion_idx].append(allocator, token_logp);
@@ -3567,6 +3680,32 @@ pub const FrozenBaseLoraBindings = struct {
         };
     }
 
+    /// Capture the trainer's current LoRA tensors into immutable device
+    /// bindings. DPO uses this when training continues from a non-zero SFT
+    /// adapter: the reference must be the initial policy, not the raw base and
+    /// not the later, mutated live policy.
+    pub fn initSnapshot(
+        allocator: std.mem.Allocator,
+        trainer: *real_autodiff.RealAutodiffTrainer,
+    ) !FrozenBaseLoraBindings {
+        try trainer.syncDeviceTrainablesToHost();
+        const values = try allocator.alloc(CT, trainer.lora_params.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (values[0..initialized]) |value| trainer.compute_backend.free(value);
+            allocator.free(values);
+        }
+        for (trainer.lora_params.items, 0..) |slot, idx| {
+            values[idx] = try trainer.compute_backend.fromFloat32Shape(slot.weights, slot.dims);
+            initialized += 1;
+        }
+        return .{
+            .allocator = allocator,
+            .compute_backend = trainer.compute_backend,
+            .values = values,
+        };
+    }
+
     pub fn deinit(self: *FrozenBaseLoraBindings) void {
         for (self.values) |value| self.compute_backend.free(value);
         self.allocator.free(self.values);
@@ -4197,6 +4336,111 @@ fn selectTopRankedTokens(
         entry_count = new_count;
     }
     for (entries, 0..) |entry, idx| out_token_ids[idx] = entry.idx;
+}
+
+fn validateGrpoSamplingOptions(options: GrpoSamplingOptions) !void {
+    if (!std.math.isFinite(options.temperature) or options.temperature <= 0.0) {
+        return error.InvalidGrpoSamplingTemperature;
+    }
+    if (!std.math.isFinite(options.top_p) or options.top_p <= 0.0 or options.top_p > 1.0) {
+        return error.InvalidGrpoSamplingTopP;
+    }
+}
+
+/// Sample a categorical token after temperature, top-k, and nucleus filtering.
+/// The returned token log-probability is deliberately computed elsewhere from
+/// the unmodified policy logits: sampling controls exploration, while GRPO's
+/// old/new-policy ratio remains bound to the model policy itself.
+pub fn sampleGrpoTokenFromLogits(
+    allocator: std.mem.Allocator,
+    logits: []const f32,
+    options: GrpoSamplingOptions,
+    random_unit: f64,
+) !usize {
+    if (logits.len == 0) return error.EmptyLogits;
+    try validateGrpoSamplingOptions(options);
+    if (!std.math.isFinite(random_unit) or random_unit < 0.0 or random_unit >= 1.0) {
+        return error.InvalidGrpoSamplingDraw;
+    }
+    for (logits) |logit| {
+        if (!std.math.isFinite(logit)) return error.NonFiniteGrpoSamplingLogit;
+    }
+
+    if (options.top_k == 1) {
+        var best_token: usize = 0;
+        for (logits[1..], 1..) |logit, token_id| {
+            if (logit > logits[best_token]) best_token = token_id;
+        }
+        return best_token;
+    }
+
+    const temperature: f64 = options.temperature;
+    if (options.top_k == 0 and options.top_p == 1.0) {
+        var max_logit = logits[0];
+        for (logits[1..]) |logit| max_logit = @max(max_logit, logit);
+        var total: f64 = 0.0;
+        for (logits) |logit| total += @exp(@as(f64, logit - max_logit) / temperature);
+        if (!std.math.isFinite(total) or total <= 0.0) return error.InvalidGrpoSamplingDistribution;
+        const threshold = random_unit * total;
+        var cumulative: f64 = 0.0;
+        for (logits, 0..) |logit, token_id| {
+            cumulative += @exp(@as(f64, logit - max_logit) / temperature);
+            if (cumulative > threshold) return token_id;
+        }
+        return logits.len - 1;
+    }
+
+    const Candidate = struct {
+        token_id: usize,
+        logit: f32,
+    };
+    const candidates = try allocator.alloc(Candidate, logits.len);
+    defer allocator.free(candidates);
+    for (logits, 0..) |logit, token_id| {
+        candidates[token_id] = .{ .token_id = token_id, .logit = logit };
+    }
+    std.mem.sort(Candidate, candidates, {}, struct {
+        fn lessThan(_: void, lhs: Candidate, rhs: Candidate) bool {
+            if (lhs.logit != rhs.logit) return lhs.logit > rhs.logit;
+            return lhs.token_id < rhs.token_id;
+        }
+    }.lessThan);
+
+    const top_k_count = if (options.top_k == 0) candidates.len else @min(options.top_k, candidates.len);
+    const filtered = candidates[0..top_k_count];
+    const max_logit = filtered[0].logit;
+    var filtered_total: f64 = 0.0;
+    for (filtered) |candidate| {
+        filtered_total += @exp(@as(f64, candidate.logit - max_logit) / temperature);
+    }
+    if (!std.math.isFinite(filtered_total) or filtered_total <= 0.0) {
+        return error.InvalidGrpoSamplingDistribution;
+    }
+
+    var retained_count = filtered.len;
+    if (options.top_p < 1.0) {
+        const nucleus_threshold = @as(f64, options.top_p) * filtered_total;
+        var nucleus_total: f64 = 0.0;
+        for (filtered, 0..) |candidate, idx| {
+            nucleus_total += @exp(@as(f64, candidate.logit - max_logit) / temperature);
+            if (nucleus_total >= nucleus_threshold) {
+                retained_count = idx + 1;
+                break;
+            }
+        }
+    }
+
+    var retained_total: f64 = 0.0;
+    for (filtered[0..retained_count]) |candidate| {
+        retained_total += @exp(@as(f64, candidate.logit - max_logit) / temperature);
+    }
+    const sample_threshold = random_unit * retained_total;
+    var cumulative: f64 = 0.0;
+    for (filtered[0..retained_count]) |candidate| {
+        cumulative += @exp(@as(f64, candidate.logit - max_logit) / temperature);
+        if (cumulative > sample_threshold) return candidate.token_id;
+    }
+    return filtered[retained_count - 1].token_id;
 }
 
 fn logProbAtToken(logits: []const f32, token_id: usize) f32 {
@@ -5130,6 +5374,68 @@ test "gemma4 ranked token selection returns deterministic top k" {
     try std.testing.expectEqualSlices(usize, &.{ 1, 3, 4, 0 }, &ranked);
     try std.testing.expectEqual(@as(usize, 1), try selectRankedToken(std.testing.allocator, &logits, 0));
     try std.testing.expectEqual(@as(usize, 2), try selectRankedToken(std.testing.allocator, &logits, 99));
+}
+
+test "gemma4 GRPO categorical sampling is seeded filtered and finite" {
+    const logits = [_]f32{ 3.0, 2.0, 1.0, 0.0 };
+    const options = GrpoSamplingOptions{
+        .seed = 17,
+        .temperature = 0.8,
+        .top_p = 0.95,
+        .top_k = 3,
+    };
+    var first = std.Random.DefaultPrng.init(deriveGrpoCompletionSamplingSeed(options.seed, 0));
+    var replay = std.Random.DefaultPrng.init(deriveGrpoCompletionSamplingSeed(options.seed, 0));
+    for (0..16) |_| {
+        const first_token = try sampleGrpoTokenFromLogits(
+            std.testing.allocator,
+            &logits,
+            options,
+            first.random().float(f64),
+        );
+        const replay_token = try sampleGrpoTokenFromLogits(
+            std.testing.allocator,
+            &logits,
+            options,
+            replay.random().float(f64),
+        );
+        try std.testing.expectEqual(first_token, replay_token);
+        try std.testing.expect(first_token < 3);
+    }
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try sampleGrpoTokenFromLogits(std.testing.allocator, &logits, .{
+            .seed = 0,
+            .top_k = 1,
+        }, 0.999999),
+    );
+    try std.testing.expectError(
+        error.InvalidGrpoSamplingTemperature,
+        sampleGrpoTokenFromLogits(std.testing.allocator, &logits, .{
+            .seed = 0,
+            .temperature = 0.0,
+        }, 0.5),
+    );
+    try std.testing.expectError(
+        error.InvalidGrpoSamplingTopP,
+        sampleGrpoTokenFromLogits(std.testing.allocator, &logits, .{
+            .seed = 0,
+            .top_p = 1.1,
+        }, 0.5),
+    );
+}
+
+test "gemma4 GRPO group seeds bind logical resume position" {
+    const run_seed: u64 = 42;
+    const domain: u64 = 0x4752504f54524149;
+    const seed = deriveGrpoSamplingGroupSeed(run_seed, domain, 3, 7);
+    try std.testing.expectEqual(seed, deriveGrpoSamplingGroupSeed(run_seed, domain, 3, 7));
+    try std.testing.expect(seed != deriveGrpoSamplingGroupSeed(run_seed, domain, 4, 7));
+    try std.testing.expect(seed != deriveGrpoSamplingGroupSeed(run_seed, domain, 3, 8));
+    try std.testing.expect(
+        deriveGrpoCompletionSamplingSeed(seed, 0) != deriveGrpoCompletionSamplingSeed(seed, 1),
+    );
 }
 
 test "gemma4 multi-token GRPO predictor rows preserve flattened batch ownership" {

@@ -1,20 +1,24 @@
 # Gemma4 E2B/E4B LoRA Fine-Tuning
 
-> Status: production-candidate for the explicitly qualified single-device,
-> text-only BF16 LoRA-SFT and DPO lanes. Independent-initialization,
-> baseline-relative E2B DPO passes three seeds over eight epochs. Historical
-> E2B GRPO passes its bounded absolute-floor gate, but the restart-safe compiled
-> sampler remains default-off and quality-blocked: current seed-17 fail-fast
-> campaigns at learning rates `5e-7`, `7.5e-7`, and `1e-6` complete safely but
-> do not improve held-out reward over their initialized baseline. E4B GRPO also
-> misses its predeclared top-rank floor and remains quality-blocked. Exact
-> incremental KV reuse is experimental and default-off because the first serial
-> implementation regresses throughput. Canonical direct-GGUF E2B SFT/DPO/GRPO
-> remains an experimental research surface, and public QLoRA remains
-> fail-closed. This is not a blanket production-ready claim: required hosted
-> CI, a fresh-host zero-paging attestation, E4B memory/performance and quality,
-> full HF numerical parity, repeated performance, and GGUF task-parity gates
-> remain.
+> Status: production-candidate only for the previously attested exact-source,
+> single-device text-only BF16 LoRA-SFT and sigmoid-DPO lanes. The current
+> algorithm-hardening source changes the GRPO sampling distribution from ranked
+> selection to resume-stable seeded categorical sampling and expands DPO to
+> cDPO, IPO, and SimPO with report schema v7. Those changes intentionally
+> invalidate promotion by inheritance: the current source needs fresh
+> interruption/resume, multi-seed quality, native/Metal/HF-or-MLX correctness,
+> and performance evidence before release. Historical baseline-relative E2B
+> DPO passed three seeds over eight epochs; historical E2B GRPO remained
+> default-off and quality-blocked, and E4B GRPO missed its top-rank floor.
+> Exact incremental KV reuse remains experimental and slower than rollback.
+> Canonical direct-GGUF SFT/DPO/GRPO remains a research surface, and public
+> QLoRA remains fail-closed. Required hosted CI, a fresh-host zero-paging
+> attestation, E4B memory/performance and quality, full HF numerical parity,
+> repeated performance, and GGUF task-parity gates remain open.
+
+All performance and quality artifacts below remain valid historical evidence
+for the exact source and binaries they name. They do not attest the current
+algorithm-hardening diff unless a section explicitly says so.
 
 The current Zig path implements the text causal-LM graph, sparse loss, LoRA
 optimizer, evaluation, and artifact pipeline intended for Gemma4 E2B and E4B
@@ -3120,9 +3124,74 @@ Promotion status therefore remains **default-off candidate**, not production
 default. Exact E2B resume and materialized reload are closed. Remaining
 promotion blockers are baseline-relative E2B GRPO quality, E4B GRPO quality and
 memory/performance evidence, a clean fresh-host zero-paging run, and the hosted
-`gemma4-metal-training / macos-arm64-gpu` CI gate on an immutable commit. The
-current 24 GiB host already has swap allocated and only about 5 GiB of free
-disk, so it is not an admissible machine for E4B or fresh-host attestation.
+`gemma4-metal-training / macos-arm64-gpu` CI gate on an immutable commit.
+During that campaign the 24 GiB host already had swap allocated and only about
+5 GiB free, so it was not admissible for E4B or fresh-host attestation. Current
+free space is lower, as recorded below.
+
+## Algorithm Hardening Candidate (2026-08-26)
+
+The current source closes the highest-risk semantic gaps identified in the
+production review. It is an implementation candidate, not a promoted release:
+
+- Gemma4 GRPO now samples from a seeded categorical distribution with typed
+  temperature, top-p, and top-k filtering. SplitMix-derived logical streams
+  bind seed, epoch, group, completion, and token position, so interruption and
+  resume recreate the same samples without depending on process state. Duplicate
+  samples are valid. Reports record the exact sampling controls and selected
+  token/log-probability evidence.
+- Zero-variance reward groups, groups with every completion masked as
+  truncated, non-finite loss inputs, and KL-budget violations cannot silently
+  mutate the optimizer. KL overflow skips the group by default or aborts under
+  an explicit policy. Reports and checkpoints carry group counts and fractions.
+- GRPO exposes group/no reward scaling, GRPO/BNPO/DR-GRPO/DAPO loss reductions,
+  asymmetric `epsilon_high`, and whole-completion truncation masking. The core
+  implements batch scaling for multi-group score fixtures, while model training
+  rejects it until prompt groups share a real rollout batch. DAPO rejects
+  gradient accumulation greater than one until a truthful cross-group
+  active-token denominator exists.
+- DPO exposes sigmoid DPO, conservative label smoothing, length-normalized IPO,
+  and reference-free SimPO. A non-base-equivalent initial adapter is snapshotted
+  as the frozen reference instead of accidentally comparing the policy to the
+  raw base. ORPO/CPO/KTO remain typed unsupported errors because the paired
+  trainer does not yet provide their differentiable auxiliary-SFT or unpaired
+  contracts. DPO report/evaluation schemas are v7/v3.
+- A final partial gradient-accumulation window is renormalized from the
+  configured `1/N` micro-batch scale to its actual `1/M` mean before norm,
+  clipping, and AdamW. The Metal path folds that correction into norm and
+  optimizer scaling without adding a gradient-buffer rewrite command.
+- The historical MLX GRPO comparators implement ranked candidate selection.
+  They now fail closed when handed a stochastic Antfly report rather than
+  presenting candidate-set overlap as native-rollout parity. A replacement
+  comparator must implement the same categorical sampler or use predeclared
+  distribution-level gates.
+
+The stable Zig `0.16.0` focused gate selects 300 tests: 298 pass and the same
+two optional local-model fixtures skip. The direct preference-loss suite passes
+analytic and finite-difference checks for cDPO, IPO, and SimPO. The targeted
+Python resume/parity suite passes 66 tests, and the complete offline Gemma4
+Python suite passes 604 tests. The installed
+`0.16.0-dev.3144+ac6fb0b59` compiler still crashes while compiling the focused
+root and remains rejected as a release toolchain.
+
+One real E2B diagnostic reached the strict Metal trainer with the new sampler.
+Its first two-group input correctly failed `NoGrpoLearningSignal` because every
+reward was equal. A disjoint two-group retry completed one optimizer group from
+16 sampled completions and 63 completion tokens, with one zero-variance group,
+zero sampling/rescore and policy/reference consistency errors, and a passing
+held-out result (`0.1875` mean reward, `0.75` top-rank reward, `0.75` positive
+group rate). Training sampling, policy rescore, reference scoring, and backward
+took approximately `22.17 s`, `3.66 s`, `6.89 s`, and `9.35 s`; held-out
+sampling and reference scoring took `43.68 s` and `13.23 s`. This proves the
+real path executes and learns, not that it is competitive or release-qualified.
+
+This host is currently inadmissible for promotion: the data volume has about
+`0.9 GiB` free and system swap is already allocated (`3072 MiB` total,
+approximately `1512 MiB` used). Do not run E4B, repeated performance, or
+zero-paging release campaigns here. The next release evidence must come from a
+clean immutable source revision on a fresh host with sufficient disk, followed
+by three-seed E2B and E4B DPO/GRPO quality, exact resume, cross-framework
+correctness, and same-workload performance distributions.
 
 ## Production Roadmap and Release Gates
 

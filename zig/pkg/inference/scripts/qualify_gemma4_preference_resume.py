@@ -58,10 +58,10 @@ ENVIRONMENT_POLICY_PATH = (
 )
 COMPILED_GRPO_SAMPLING_ENV = "ANTFLY_GEMMA4_GRPO_COMPILED_SAMPLING"
 COMPILED_GRPO_SAMPLING_MODE = (
-    "compiled-shared-prompt-ranked-sparse-row-each-step"
+    "compiled-shared-prompt-seeded-categorical-sparse-row-each-step"
 )
 COMPILED_GRPO_POLICY_LOGPROB_MODE = (
-    "compiled-token-selection-with-eager-per-completion-token-validated-logprob-rescore"
+    "compiled-token-selection-with-eager-per-completion-canonical-logprob-rescore"
 )
 
 
@@ -821,7 +821,20 @@ def _semantic_report_view(report: Mapping[str, Any], task: str) -> dict[str, Any
     if task == "dpo":
         return {
             **common,
-            **{field: report.get(field) for field in ("examples", "loss", "mean_reward_margin", "accuracy", "beta")},
+            **{
+                field: report.get(field)
+                for field in (
+                    "examples",
+                    "loss",
+                    "mean_reward_margin",
+                    "accuracy",
+                    "beta",
+                    "loss_type",
+                    "logprob_aggregation",
+                    "label_smoothing",
+                    "reference_mode",
+                )
+            },
             "policy_scoring_mode": report.get("policy_scoring_mode"),
             "training_microbatch_mode": report.get("training_microbatch_mode"),
             "initial_bucket_signature_parity": report.get("initial_bucket_signature_parity"),
@@ -832,6 +845,86 @@ def _semantic_report_view(report: Mapping[str, Any], task: str) -> dict[str, Any
     kl_control.pop("trace_path", None)
     reward_pipeline = dict(_mapping(report.get("reward_pipeline"), "report.reward_pipeline"))
     reward_pipeline.pop("trace_path", None)
+    groups = _integer(report.get("groups"), "report.groups", 1)
+    optimizer_groups = _integer(
+        report.get("optimizer_groups"), "report.optimizer_groups"
+    )
+    zero_reward_std_groups = _integer(
+        report.get("zero_reward_std_groups"), "report.zero_reward_std_groups"
+    )
+    all_truncated_groups = _integer(
+        report.get("all_truncated_groups"), "report.all_truncated_groups"
+    )
+    kl_rejected_groups = _integer(
+        report.get("kl_rejected_groups"), "report.kl_rejected_groups"
+    )
+    if (
+        optimizer_groups
+        + zero_reward_std_groups
+        + all_truncated_groups
+        + kl_rejected_groups
+        != groups
+    ):
+        raise ContractError("GRPO admitted and skipped groups do not cover the horizon")
+    frac_reward_zero_std = _finite_number(
+        report.get("frac_reward_zero_std"), "report.frac_reward_zero_std"
+    )
+    if not 0.0 <= frac_reward_zero_std <= 1.0 or not math.isclose(
+        frac_reward_zero_std,
+        zero_reward_std_groups / groups,
+        rel_tol=0.0,
+        abs_tol=1e-7,
+    ):
+        raise ContractError("GRPO zero-variance group fraction is inconsistent")
+    frac_kl_rejected = _finite_number(
+        report.get("frac_kl_rejected"), "report.frac_kl_rejected"
+    )
+    if not 0.0 <= frac_kl_rejected <= 1.0 or not math.isclose(
+        frac_kl_rejected,
+        kl_rejected_groups / groups,
+        rel_tol=0.0,
+        abs_tol=1e-7,
+    ):
+        raise ContractError("GRPO KL-rejected group fraction is inconsistent")
+    completions = _integer(report.get("completions"), "report.completions", 1)
+    truncated_completions = _integer(
+        report.get("truncated_completions"),
+        "report.truncated_completions",
+    )
+    if truncated_completions > completions:
+        raise ContractError("GRPO truncated completion count exceeds completions")
+    frac_completions_truncated = _finite_number(
+        report.get("frac_completions_truncated"),
+        "report.frac_completions_truncated",
+    )
+    if not 0.0 <= frac_completions_truncated <= 1.0 or not math.isclose(
+        frac_completions_truncated,
+        truncated_completions / completions,
+        rel_tol=0.0,
+        abs_tol=1e-7,
+    ):
+        raise ContractError("GRPO truncated completion fraction is inconsistent")
+    mask_truncated_completions = report.get("mask_truncated_completions")
+    if not isinstance(mask_truncated_completions, bool):
+        raise ContractError("report.mask_truncated_completions must be boolean")
+    if all_truncated_groups and not mask_truncated_completions:
+        raise ContractError("GRPO all-truncated groups require truncation masking")
+    sampling = dict(_mapping(report.get("sampling"), "report.sampling"))
+    loss_type = report.get("loss_type")
+    if loss_type not in {"grpo", "bnpo", "dr_grpo", "dapo"}:
+        raise ContractError("report.loss_type is unsupported")
+    scale_rewards = report.get("scale_rewards")
+    if scale_rewards not in {"group", "batch", "none"}:
+        raise ContractError("report.scale_rewards is unsupported")
+    epsilon_low = _finite_number(report.get("epsilon_low"), "report.epsilon_low")
+    epsilon_high = _finite_number(report.get("epsilon_high"), "report.epsilon_high")
+    if not 0.0 < epsilon_low <= 1.0 or not 0.0 < epsilon_high <= 1.0:
+        raise ContractError("GRPO clip bounds are outside (0, 1]")
+    max_completion_tokens = _integer(
+        report.get("max_completion_tokens"), "report.max_completion_tokens", 1
+    )
+    if _integer(report.get("num_iterations"), "report.num_iterations", 1) != 1:
+        raise ContractError("only truthful single-iteration GRPO reports are qualified")
     return {
         **common,
         **{
@@ -839,7 +932,6 @@ def _semantic_report_view(report: Mapping[str, Any], task: str) -> dict[str, Any
             for field in (
                 "completions",
                 "tokens",
-                "groups",
                 "loss",
                 "pg_loss",
                 "kl_loss",
@@ -856,6 +948,23 @@ def _semantic_report_view(report: Mapping[str, Any], task: str) -> dict[str, Any
                 "reference_mode",
             )
         },
+        "groups": groups,
+        "optimizer_groups": optimizer_groups,
+        "zero_reward_std_groups": zero_reward_std_groups,
+        "all_truncated_groups": all_truncated_groups,
+        "kl_rejected_groups": kl_rejected_groups,
+        "frac_reward_zero_std": frac_reward_zero_std,
+        "truncated_completions": truncated_completions,
+        "frac_completions_truncated": frac_completions_truncated,
+        "mask_truncated_completions": mask_truncated_completions,
+        "frac_kl_rejected": frac_kl_rejected,
+        "sampling": sampling,
+        "loss_type": loss_type,
+        "scale_rewards": scale_rewards,
+        "epsilon_low": epsilon_low,
+        "epsilon_high": epsilon_high,
+        "max_completion_tokens": max_completion_tokens,
+        "num_iterations": 1,
         "kl_control": kl_control,
         "reward_pipeline": reward_pipeline,
         "incremental_kv": report.get("incremental_kv"),
@@ -1004,7 +1113,7 @@ def _validate_report_artifacts(
     if evaluation_path != expected_evaluation_path.expanduser().resolve(strict=True):
         raise ContractError("main report names the wrong standalone evaluation report")
     evaluation = dict(_load_json(evaluation_path, "standalone evaluation report"))
-    expected_schema = f"antfly_inference_finetune_{task}_evaluation/v{'2' if task == 'dpo' else '3'}"
+    expected_schema = f"antfly_inference_finetune_{task}_evaluation/v{'3' if task == 'dpo' else '4'}"
     if evaluation.get("schema_version") != expected_schema:
         raise ContractError(f"expected {expected_schema} standalone evaluation report")
     if evaluation.get("status") != "passed" or evaluation.get("policy_backend") != "metal":
@@ -1094,7 +1203,7 @@ def _validate_outputs(
 ) -> dict[str, Any]:
     uninterrupted = _load_json(uninterrupted_root / f"{task}_report.json", "uninterrupted report")
     resumed = _load_json(resumed_root / f"{task}_report.json", "resumed report")
-    expected_schema = f"antfly_inference_finetune_{task}_report/v6"
+    expected_schema = f"antfly_inference_finetune_{task}_report/v7"
     if uninterrupted.get("schema_version") != expected_schema or resumed.get("schema_version") != expected_schema:
         raise ContractError(f"expected {expected_schema} reports")
     if uninterrupted.get("policy_backend") != "metal" or resumed.get("policy_backend") != "metal":
@@ -1494,6 +1603,29 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             "incremental_kv.host_logit_fallbacks",
         ) != 0:
             raise ContractError("incremental-KV qualification used a host-logit fallback")
+        if _integer(
+            semantic_incremental.get("resident_ranked_token_selections"),
+            "incremental_kv.resident_ranked_token_selections",
+        ) != 0:
+            raise ContractError("incremental-KV qualification used the retired ranked sampler")
+        expected_completions = _integer(
+            parity.get("semantic_report", {}).get("completions"),
+            "parity.semantic_report.completions",
+            1,
+        )
+        expected_tokens = _integer(
+            parity.get("semantic_report", {}).get("tokens"),
+            "parity.semantic_report.tokens",
+            expected_completions,
+        )
+        expected_sampling_rows = expected_tokens - expected_completions + expected_groups
+        if _integer(
+            semantic_incremental.get("host_logit_sampling_rows"),
+            "incremental_kv.host_logit_sampling_rows",
+        ) != expected_sampling_rows:
+            raise ContractError(
+                "incremental-KV categorical-sampling row accounting drifted"
+            )
         for checkpoint_name in ("uninterrupted_final", "resumed_final"):
             checkpoint_telemetry = _mapping(
                 {

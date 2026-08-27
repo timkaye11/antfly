@@ -1981,7 +1981,6 @@ pub const RealAutodiffTrainer = struct {
         }
     }
 
-    /// Apply a final, incomplete accumulation window. Match the pinned
     /// Register a parameter-name prefix whose optimizer step is gated on
     /// per-window task presence (see `conditional_optimizer_families`).
     /// Families start absent each accumulation window; callers mark presence
@@ -2055,30 +2054,55 @@ pub const RealAutodiffTrainer = struct {
         @memset(slot.grad_accum, 0);
     }
 
-    /// upstream trainer: every micro-batch was divided by the configured
-    /// accumulation count, and a partial flush keeps that divisor.
+    fn partialAccumulationRenormalization(configured_steps: u32, micro_batches: u32) !f32 {
+        const configured = @max(configured_steps, 1);
+        if (micro_batches == 0 or micro_batches > configured) return error.InvalidGradientAccumulationState;
+        return @as(f32, @floatFromInt(configured)) /
+            @as(f32, @floatFromInt(micro_batches));
+    }
+
+    fn renormalizePartialHostAccumulation(self: *RealAutodiffTrainer, scale: f32) void {
+        if (scale == 1.0) return;
+        for (self.lora_params.items) |*slot| {
+            for (slot.grad_accum) |*value| value.* *= scale;
+        }
+        for (self.regular_params.items) |*slot| {
+            for (slot.grad_accum) |*value| value.* *= scale;
+        }
+    }
+
+    /// Apply a final, incomplete accumulation window. Every micro-batch is
+    /// accumulated with the configured 1/N scale. A final M<N window is
+    /// renormalized by N/M so the optimizer sees its actual mean.
     pub fn flushAccumulatedGradients(self: *RealAutodiffTrainer) !?FlushResult {
         if (self.accum_count == 0) return null;
 
         const micro_batches = self.accum_count;
         const use_device_optimizer = self.deviceOptimizerRequested();
         try self.reduceAccumulatedGradients(use_device_optimizer);
+        const accumulation_scale = try partialAccumulationRenormalization(
+            self.config.grad_accum_steps,
+            micro_batches,
+        );
+        if (!use_device_optimizer) self.renormalizePartialHostAccumulation(accumulation_scale);
 
         self.optimizer_state.step_count = @intCast(self.optimizer_step_count + 1);
         const learning_rate = self.config.lr_schedule.lr(@intCast(self.optimizer_step_count));
         var grad_norm: f32 = undefined;
         if (use_device_optimizer) {
             const accumulated_norm = try self.deviceGlobalGradNorm();
-            grad_norm = accumulated_norm;
+            grad_norm = accumulated_norm * accumulation_scale;
+            if (!std.math.isFinite(grad_norm)) return error.NonFiniteGradientNorm;
             const clip_scale = if (self.config.max_grad_norm > 0.0 and grad_norm > self.config.max_grad_norm)
-                self.config.max_grad_norm / (grad_norm + 1e-6)
+                accumulation_scale * self.config.max_grad_norm / (grad_norm + 1e-6)
             else
-                1.0;
+                accumulation_scale;
             try self.stepDeviceAdamW(learning_rate, clip_scale);
             for (self.lora_params.items) |*slot| @memset(slot.grad_accum, 0);
             for (self.regular_params.items) |*slot| @memset(slot.grad_accum, 0);
         } else {
             grad_norm = self.globalGradNorm();
+            if (!std.math.isFinite(grad_norm)) return error.NonFiniteGradientNorm;
             if (self.config.max_grad_norm > 0.0 and grad_norm > self.config.max_grad_norm) {
                 const clip_scale = self.config.max_grad_norm / (grad_norm + 1e-6);
                 for (self.lora_params.items) |*slot| {
@@ -4947,7 +4971,21 @@ test "RealAutodiffTrainer: reduce_device_grads hook type wiring" {
     try testing.expect(trainer.config.reduce_device_grads != null);
 }
 
-test "RealAutodiffTrainer: partial accumulation flush keeps upstream configured divisor" {
+test "gemma4 partial accumulation renormalization uses the actual micro-batch count" {
+    try testing.expectEqual(@as(f32, 1.0), try RealAutodiffTrainer.partialAccumulationRenormalization(4, 4));
+    try testing.expectEqual(@as(f32, 2.0), try RealAutodiffTrainer.partialAccumulationRenormalization(4, 2));
+    try testing.expectEqual(@as(f32, 1.0), try RealAutodiffTrainer.partialAccumulationRenormalization(0, 1));
+    try testing.expectError(
+        error.InvalidGradientAccumulationState,
+        RealAutodiffTrainer.partialAccumulationRenormalization(4, 0),
+    );
+    try testing.expectError(
+        error.InvalidGradientAccumulationState,
+        RealAutodiffTrainer.partialAccumulationRenormalization(4, 5),
+    );
+}
+
+test "gemma4 RealAutodiffTrainer: partial accumulation flush renormalizes and rejects non-finite norm" {
     const allocator = testing.allocator;
     const dummy_cb: *const ComputeBackend = @ptrFromInt(@alignOf(ComputeBackend));
 
@@ -4964,7 +5002,8 @@ test "RealAutodiffTrainer: partial accumulation flush keeps upstream configured 
     weights[0] = 0.0;
     const grad_accum = try allocator.alloc(f32, 1);
     // Two micro-batch gradients summing to 8 were accumulated with the
-    // configured 1/4 scale. Upstream flushes the stored value as-is.
+    // configured 1/4 scale. The partial flush rescales by 4/2, recovering the
+    // actual two-example mean of 4.
     grad_accum[0] = 2.0;
     const dims = try allocator.dupe(i32, &.{1});
     const name = try allocator.dupe(u8, "x.lora_A");
@@ -4986,11 +5025,17 @@ test "RealAutodiffTrainer: partial accumulation flush keeps upstream configured 
     const result = (try trainer.flushAccumulatedGradients()).?;
     try testing.expectEqual(@as(u32, 2), result.micro_batches);
     try testing.expectEqual(@as(u64, 1), result.optimizer_step);
-    try testing.expectApproxEqAbs(@as(f32, 2.0), result.grad_norm, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 4.0), result.grad_norm, 1e-6);
     // AdamW with beta1=beta2=0 and eps=1 updates by g/(|g|+1).
-    try testing.expectApproxEqAbs(@as(f32, -2.0 / 3.0), weights[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, -4.0 / 5.0), weights[0], 1e-6);
     try testing.expectEqual(@as(f32, 0.0), grad_accum[0]);
     try testing.expect((try trainer.flushAccumulatedGradients()) == null);
+
+    const weight_before_nonfinite = weights[0];
+    grad_accum[0] = std.math.nan(f32);
+    trainer.accum_count = 1;
+    try testing.expectError(error.NonFiniteGradientNorm, trainer.flushAccumulatedGradients());
+    try testing.expectEqual(weight_before_nonfinite, weights[0]);
 }
 
 test "RealAutodiffTrainer: training state round-trips weights moments and counters" {

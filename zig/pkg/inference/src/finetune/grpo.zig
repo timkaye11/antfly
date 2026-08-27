@@ -29,11 +29,35 @@ pub const Rewarder = struct {
     }
 };
 
+pub const RewardScale = enum {
+    group,
+    batch,
+    none,
+};
+
+pub const LossType = enum {
+    grpo,
+    bnpo,
+    dr_grpo,
+    dapo,
+};
+
 pub const GRPOConfig = struct {
     group_size: usize = 8,
     clip_epsilon: f32 = 0.2,
+    epsilon_high: ?f32 = null,
     kl_coef: f32 = 0.04,
-    advantage_eps: f32 = 1e-8,
+    advantage_eps: f32 = 1e-4,
+    scale_rewards: RewardScale = .group,
+    loss_type: LossType = .bnpo,
+    /// Required by Dr. GRPO's constant denominator. DAPO is equivalent to
+    /// BNPO only for one logical group; callers must enforce that admission.
+    max_completion_tokens: usize = 0,
+    /// Exclude every token from a completion that exhausted its generation
+    /// budget without producing EOS. Rewards still include the completion so
+    /// group-relative advantages retain the sampled population semantics.
+    mask_truncated_completions: bool = false,
+    /// Legacy compatibility switch. False maps to `scale_rewards = .none`.
     normalize_advantage: bool = true,
 };
 
@@ -93,6 +117,7 @@ pub const Completion = struct {
     tokens: []const i32,
     old_logps: []const f32,
     ref_logps: []const f32,
+    truncated: bool = false,
 };
 
 pub const GroupAdvantages = struct {
@@ -146,6 +171,25 @@ pub fn computeAdvantages(
     const n = completions.len;
     if (n == 0) return;
 
+    const reward_scale: RewardScale = if (config.normalize_advantage)
+        config.scale_rewards
+    else
+        .none;
+    var batch_std: f64 = 0.0;
+    if (reward_scale == .batch and ga.rewards.len > 1) {
+        var reward_sum: f64 = 0.0;
+        for (ga.rewards) |reward| reward_sum += reward;
+        const reward_mean = reward_sum / @as(f64, @floatFromInt(ga.rewards.len));
+        var variance_sum: f64 = 0.0;
+        for (ga.rewards) |reward| {
+            const delta = @as(f64, reward) - reward_mean;
+            variance_sum += delta * delta;
+        }
+        batch_std = @sqrt(
+            variance_sum / @as(f64, @floatFromInt(ga.rewards.len - 1)),
+        );
+    }
+
     var g: usize = 0;
     while (g < ga.num_groups) : (g += 1) {
         var count: usize = 0;
@@ -160,7 +204,7 @@ pub fn computeAdvantages(
         const mean: f64 = sum / @as(f64, @floatFromInt(count));
 
         var std_val: f64 = 0;
-        if (config.normalize_advantage) {
+        if (reward_scale == .group) {
             var var_sum: f64 = 0;
             for (completions, 0..) |c, i| {
                 if (c.prompt_idx == g) {
@@ -168,14 +212,21 @@ pub fn computeAdvantages(
                     var_sum += d * d;
                 }
             }
-            const variance = var_sum / @as(f64, @floatFromInt(count));
+            // Match the canonical GRPO implementations' unbiased sample
+            // standard deviation. A singleton group has no reward variation
+            // and therefore receives exactly zero centered advantage below.
+            const variance = if (count > 1)
+                var_sum / @as(f64, @floatFromInt(count - 1))
+            else
+                0.0;
             std_val = @sqrt(variance);
         }
 
         for (completions, 0..) |c, i| {
             if (c.prompt_idx == g) {
                 const centered = @as(f64, ga.rewards[i]) - mean;
-                if (config.normalize_advantage) {
+                if (reward_scale != .none) {
+                    if (reward_scale == .batch) std_val = batch_std;
                     const denom = std_val + @as(f64, config.advantage_eps);
                     ga.advantages[i] = @floatCast(centered / denom);
                 } else {
@@ -184,6 +235,18 @@ pub fn computeAdvantages(
             }
         }
     }
+}
+
+/// Exact reward-variation predicate used to skip groups that cannot produce a
+/// policy-gradient signal. Reward providers are required to emit finite f32s;
+/// equality is therefore stable across checkpoint resume and report replay.
+pub fn rewardsHaveVariation(rewards: []const f32) bool {
+    if (rewards.len < 2) return false;
+    const first = rewards[0];
+    for (rewards[1..]) |reward| {
+        if (reward != first) return true;
+    }
+    return false;
 }
 
 pub const GRPOLossResult = struct {
@@ -209,7 +272,14 @@ pub fn grpoLoss(
     config: GRPOConfig,
 ) !GRPOLossResult {
     var total_tokens: usize = 0;
-    for (completions) |c| total_tokens += c.tokens.len;
+    var active_tokens: usize = 0;
+    for (completions) |c| {
+        if (c.tokens.len == 0) return error.EmptyCompletion;
+        total_tokens += c.tokens.len;
+        if (!config.mask_truncated_completions or !c.truncated) {
+            active_tokens += c.tokens.len;
+        }
+    }
 
     if (new_logps.len != total_tokens) return error.LogpLenMismatch;
     if (advantages.len != completions.len) return error.AdvLenMismatch;
@@ -218,7 +288,7 @@ pub fn grpoLoss(
     errdefer allocator.free(grad);
     @memset(grad, 0);
 
-    if (total_tokens == 0) {
+    if (active_tokens == 0) {
         return GRPOLossResult{
             .loss = 0,
             .pg_loss = 0,
@@ -230,9 +300,22 @@ pub fn grpoLoss(
         };
     }
 
-    const n_f: f32 = @floatFromInt(total_tokens);
-    const inv_n: f32 = 1.0 / n_f;
-    const eps = config.clip_epsilon;
+    const n_f: f32 = @floatFromInt(active_tokens);
+    const eps_low = config.clip_epsilon;
+    const eps_high = config.epsilon_high orelse eps_low;
+    if (!std.math.isFinite(eps_low) or eps_low <= 0.0 or eps_low > 1.0 or
+        !std.math.isFinite(eps_high) or eps_high <= 0.0 or eps_high > 1.0)
+    {
+        return error.InvalidGrpoClipEpsilon;
+    }
+    if (config.loss_type == .dr_grpo) {
+        if (config.max_completion_tokens == 0) return error.InvalidMaxCompletionTokens;
+        for (completions) |completion| {
+            if (completion.tokens.len > config.max_completion_tokens) {
+                return error.CompletionExceedsConfiguredMaximum;
+            }
+        }
+    }
     const kl = config.kl_coef;
 
     var pg_sum: f64 = 0;
@@ -243,21 +326,28 @@ pub fn grpoLoss(
     var off: usize = 0;
     for (completions, 0..) |c, ci| {
         const adv: f32 = advantages[ci];
+        const completion_masked = config.mask_truncated_completions and c.truncated;
+        const token_weight: f32 = switch (config.loss_type) {
+            .grpo => 1.0 / (@as(f32, @floatFromInt(completions.len)) * @as(f32, @floatFromInt(c.tokens.len))),
+            .bnpo, .dapo => 1.0 / n_f,
+            .dr_grpo => 1.0 / (@as(f32, @floatFromInt(completions.len)) * @as(f32, @floatFromInt(config.max_completion_tokens))),
+        };
         var t: usize = 0;
         while (t < c.tokens.len) : (t += 1) {
+            if (completion_masked) continue;
             const new_lp = new_logps[off + t];
             const old_lp = c.old_logps[t];
             const ref_lp = c.ref_logps[t];
 
             const ratio = @exp(new_lp - old_lp);
             const pg_1 = ratio * adv;
-            const clipped_ratio = std.math.clamp(ratio, 1.0 - eps, 1.0 + eps);
+            const clipped_ratio = std.math.clamp(ratio, 1.0 - eps_low, 1.0 + eps_high);
             const pg_2 = clipped_ratio * adv;
 
             // -min(pg_1, pg_2)
             const chosen = if (pg_1 < pg_2) pg_1 else pg_2;
             const pg_token = -chosen;
-            pg_sum += pg_token;
+            pg_sum += @as(f64, pg_token) * @as(f64, token_weight);
 
             // KL k3: exp(ref - new) - (ref - new) - 1
             const diff = ref_lp - new_lp;
@@ -269,7 +359,7 @@ pub fn grpoLoss(
             if (!std.math.isFinite(expm1_diff)) return error.GrpoKlLogRatioOutOfRange;
             const k3 = @max(expm1_diff - diff, 0.0);
             raw_kl_sum += k3;
-            kl_sum += kl * k3;
+            kl_sum += @as(f64, kl * k3) * @as(f64, token_weight);
 
             // Gradient w.r.t. new_lp.
             //
@@ -293,13 +383,13 @@ pub fn grpoLoss(
             //   Loss contribution is +kl_coef * k3, so grad is +kl_coef * (1 - exp_diff).
             const g_kl: f32 = -kl * expm1_diff;
 
-            grad[off + t] = (g_pg + g_kl) * inv_n;
+            grad[off + t] = (g_pg + g_kl) * token_weight;
         }
         off += c.tokens.len;
     }
 
-    const pg_loss: f32 = @floatCast(pg_sum / @as(f64, n_f));
-    const kl_loss: f32 = @floatCast(kl_sum / @as(f64, n_f));
+    const pg_loss: f32 = @floatCast(pg_sum);
+    const kl_loss: f32 = @floatCast(kl_sum);
     const mean_kl: f32 = @floatCast(raw_kl_sum / @as(f64, n_f));
     const loss: f32 = pg_loss + kl_loss;
     const clip_fraction: f32 = @as(f32, @floatFromInt(clipped_count)) / n_f;
@@ -406,7 +496,7 @@ fn indexedReward(
     return v;
 }
 
-test "computeAdvantages two-completion group [1,3] -> [-1,+1]" {
+test "computeAdvantages uses unbiased reward standard deviation" {
     const alloc = testing.allocator;
     const values = [_]f32{ 1.0, 3.0 };
     var ctx = IndexedRewardCtx{ .values = &values };
@@ -424,8 +514,63 @@ test "computeAdvantages two-completion group [1,3] -> [-1,+1]" {
 
     const cfg = GRPOConfig{};
     computeAdvantages(&ga, &comps, cfg);
-    try testing.expectApproxEqAbs(@as(f32, -1.0), ga.advantages[0], 1e-4);
-    try testing.expectApproxEqAbs(@as(f32, 1.0), ga.advantages[1], 1e-4);
+    const expected = @as(f32, @floatCast(1.0 / @sqrt(2.0)));
+    try testing.expectApproxEqAbs(-expected, ga.advantages[0], 1e-4);
+    try testing.expectApproxEqAbs(expected, ga.advantages[1], 1e-4);
+    try testing.expect(rewardsHaveVariation(ga.rewards));
+}
+
+test "uniform reward groups are explicitly zero variance without NaN" {
+    const rewards = [_]f32{ 0.5, 0.5, 0.5, 0.5 };
+    try testing.expect(!rewardsHaveVariation(&rewards));
+    const tokens = [_]i32{1};
+    const logps = [_]f32{-0.5};
+    const completions = [_]Completion{
+        .{ .prompt_idx = 0, .tokens = &tokens, .old_logps = &logps, .ref_logps = &logps },
+        .{ .prompt_idx = 0, .tokens = &tokens, .old_logps = &logps, .ref_logps = &logps },
+        .{ .prompt_idx = 0, .tokens = &tokens, .old_logps = &logps, .ref_logps = &logps },
+        .{ .prompt_idx = 0, .tokens = &tokens, .old_logps = &logps, .ref_logps = &logps },
+    };
+    var advantages = GroupAdvantages{
+        .allocator = testing.allocator,
+        .rewards = try testing.allocator.dupe(f32, &rewards),
+        .advantages = try testing.allocator.alloc(f32, rewards.len),
+        .num_groups = 1,
+    };
+    defer advantages.deinit();
+    @memset(advantages.advantages, std.math.nan(f32));
+    computeAdvantages(&advantages, &completions, .{});
+    for (advantages.advantages) |advantage| {
+        try testing.expectEqual(@as(f32, 0.0), advantage);
+        try testing.expect(std.math.isFinite(advantage));
+    }
+}
+
+test "computeAdvantages supports batch and none reward scaling" {
+    const rewards = [_]f32{ 0.0, 2.0, 10.0, 14.0 };
+    const tokens = [_]i32{1};
+    const logps = [_]f32{-0.5};
+    const completions = [_]Completion{
+        .{ .prompt_idx = 0, .tokens = &tokens, .old_logps = &logps, .ref_logps = &logps },
+        .{ .prompt_idx = 0, .tokens = &tokens, .old_logps = &logps, .ref_logps = &logps },
+        .{ .prompt_idx = 1, .tokens = &tokens, .old_logps = &logps, .ref_logps = &logps },
+        .{ .prompt_idx = 1, .tokens = &tokens, .old_logps = &logps, .ref_logps = &logps },
+    };
+    var advantages = GroupAdvantages{
+        .allocator = testing.allocator,
+        .rewards = try testing.allocator.dupe(f32, &rewards),
+        .advantages = try testing.allocator.alloc(f32, rewards.len),
+        .num_groups = 2,
+    };
+    defer advantages.deinit();
+
+    computeAdvantages(&advantages, &completions, .{ .scale_rewards = .none });
+    try testing.expectEqualSlices(f32, &.{ -1.0, 1.0, -2.0, 2.0 }, advantages.advantages);
+
+    computeAdvantages(&advantages, &completions, .{ .scale_rewards = .batch });
+    const batch_std = @sqrt(@as(f32, 131.0 / 3.0));
+    try testing.expectApproxEqAbs(-1.0 / (batch_std + 1e-4), advantages.advantages[0], 1e-6);
+    try testing.expectApproxEqAbs(2.0 / (batch_std + 1e-4), advantages.advantages[3], 1e-6);
 }
 
 test "grpoLoss zero when ratio=1, adv=0, ref=new" {
@@ -473,6 +618,119 @@ test "grpoLoss exposes unweighted stable mean K3 when beta is zero" {
     const expected = std.math.expm1(@as(f32, 0.5)) - 0.5;
     try testing.expectApproxEqAbs(expected, result.mean_kl, 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0.0), result.kl_loss, 1e-6);
+}
+
+test "grpoLoss implements documented normalization modes" {
+    const alloc = testing.allocator;
+    const short_tokens = [_]i32{1};
+    const long_tokens = [_]i32{ 2, 3, 4 };
+    const short_logps = [_]f32{-1.0};
+    const long_logps = [_]f32{ -1.0, -1.0, -1.0 };
+    const completions = [_]Completion{
+        .{ .prompt_idx = 0, .tokens = &short_tokens, .old_logps = &short_logps, .ref_logps = &short_logps },
+        .{ .prompt_idx = 0, .tokens = &long_tokens, .old_logps = &long_logps, .ref_logps = &long_logps },
+    };
+    const new_logps = [_]f32{ -1.0, -1.0, -1.0, -1.0 };
+    const advantages = [_]f32{ 1.0, 1.0 };
+
+    var sequence = try grpoLoss(alloc, &completions, &new_logps, &advantages, .{ .loss_type = .grpo });
+    defer sequence.deinit();
+    try testing.expectApproxEqAbs(@as(f32, -1.0), sequence.pg_loss, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, -0.5), sequence.grad_new_logps[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, -1.0 / 6.0), sequence.grad_new_logps[1], 1e-6);
+
+    var batch = try grpoLoss(alloc, &completions, &new_logps, &advantages, .{ .loss_type = .bnpo });
+    defer batch.deinit();
+    try testing.expectApproxEqAbs(@as(f32, -1.0), batch.pg_loss, 1e-6);
+    for (batch.grad_new_logps) |gradient| {
+        try testing.expectApproxEqAbs(@as(f32, -0.25), gradient, 1e-6);
+    }
+
+    var dapo = try grpoLoss(alloc, &completions, &new_logps, &advantages, .{ .loss_type = .dapo });
+    defer dapo.deinit();
+    try testing.expectApproxEqAbs(batch.pg_loss, dapo.pg_loss, 1e-6);
+
+    var dimension_reduced = try grpoLoss(alloc, &completions, &new_logps, &advantages, .{
+        .loss_type = .dr_grpo,
+        .max_completion_tokens = 4,
+    });
+    defer dimension_reduced.deinit();
+    try testing.expectApproxEqAbs(@as(f32, -0.5), dimension_reduced.pg_loss, 1e-6);
+    for (dimension_reduced.grad_new_logps) |gradient| {
+        try testing.expectApproxEqAbs(@as(f32, -0.125), gradient, 1e-6);
+    }
+}
+
+test "grpoLoss masks every token from truncated completions" {
+    const alloc = testing.allocator;
+    const truncated_tokens = [_]i32{ 1, 2 };
+    const terminated_tokens = [_]i32{ 3, 4 };
+    const logps = [_]f32{ -1.0, -1.0 };
+    const completions = [_]Completion{
+        .{
+            .prompt_idx = 0,
+            .tokens = &truncated_tokens,
+            .old_logps = &logps,
+            .ref_logps = &logps,
+            .truncated = true,
+        },
+        .{
+            .prompt_idx = 0,
+            .tokens = &terminated_tokens,
+            .old_logps = &logps,
+            .ref_logps = &logps,
+        },
+    };
+    const new_logps = [_]f32{ -1.0, -1.0, -1.0, -1.0 };
+    const advantages = [_]f32{ 1.0, -1.0 };
+
+    var result = try grpoLoss(alloc, &completions, &new_logps, &advantages, .{
+        .loss_type = .bnpo,
+        .mask_truncated_completions = true,
+    });
+    defer result.deinit();
+    try testing.expectApproxEqAbs(@as(f32, 1.0), result.pg_loss, 1e-6);
+    try testing.expectEqual(@as(f32, 0.0), result.grad_new_logps[0]);
+    try testing.expectEqual(@as(f32, 0.0), result.grad_new_logps[1]);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), result.grad_new_logps[2], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), result.grad_new_logps[3], 1e-6);
+
+    const all_truncated = [_]Completion{
+        .{
+            .prompt_idx = 0,
+            .tokens = &truncated_tokens,
+            .old_logps = &logps,
+            .ref_logps = &logps,
+            .truncated = true,
+        },
+    };
+    var empty = try grpoLoss(alloc, &all_truncated, logps[0..], &[_]f32{1.0}, .{
+        .mask_truncated_completions = true,
+    });
+    defer empty.deinit();
+    try testing.expectEqual(@as(f32, 0.0), empty.loss);
+    for (empty.grad_new_logps) |gradient| try testing.expectEqual(@as(f32, 0.0), gradient);
+}
+
+test "grpoLoss uses asymmetric high clipping" {
+    const alloc = testing.allocator;
+    const tokens = [_]i32{1};
+    const old_logps = [_]f32{0.0};
+    const ref_logps = [_]f32{@log(@as(f32, 1.25))};
+    const completions = [_]Completion{
+        .{ .prompt_idx = 0, .tokens = &tokens, .old_logps = &old_logps, .ref_logps = &ref_logps },
+    };
+    const new_logps = [_]f32{@log(@as(f32, 1.25))};
+    const advantages = [_]f32{1.0};
+    var result = try grpoLoss(alloc, &completions, &new_logps, &advantages, .{
+        .clip_epsilon = 0.2,
+        .epsilon_high = 0.1,
+        .kl_coef = 0.0,
+    });
+    defer result.deinit();
+    try testing.expectApproxEqAbs(@as(f32, -1.1), result.pg_loss, 1e-6);
+    try testing.expectEqual(@as(f32, 0.0), result.grad_new_logps[0]);
+    try testing.expectEqual(@as(f32, 1.0), result.clip_fraction);
 }
 
 test "adaptive KL controller is bounded and updates the next-group coefficient" {
