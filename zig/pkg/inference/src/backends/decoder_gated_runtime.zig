@@ -961,6 +961,15 @@ fn layerHasOwnKvWeights(gpt_config: gpt_mod.Config, layer: usize) bool {
     return !gpt_config.layerSharesKv(layer);
 }
 
+fn configuredLayerSlidingWindow(gpt_config: gpt_mod.Config, layer: usize, disabled: bool) usize {
+    if (disabled or !gpt_config.layerUsesSlidingAttention(layer)) return 0;
+    return gpt_config.sliding_window;
+}
+
+fn directRuntimeLayerSlidingWindow(gpt_config: gpt_mod.Config, layer: usize) usize {
+    return configuredLayerSlidingWindow(gpt_config, layer, getenvBool("TERMITE_DISABLE_SLIDING_ATTENTION"));
+}
+
 pub fn fillDenseQwen3LayerSpecs(
     gpt_config: gpt_mod.Config,
     configured_layer_count: usize,
@@ -2162,6 +2171,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             var attention = gpt_arch.attentionContextFromDecode(decode_context);
             attention.layer_index = kv_layer_index;
             attention.skip_kv_write = shares_kv;
+            attention.sliding_window = directRuntimeLayerSlidingWindow(gpt_config, layer);
             const rope_dim: usize = gpt_config.layerRopeActiveDim(layer);
             const rope_theta = gpt_config.layerRopeEffectiveTheta(layer);
 
@@ -2681,6 +2691,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             var attention_seed = gpt_arch.attentionContextFromDecode(decode_context);
             attention_seed.layer_index = kv_layer_index;
             attention_seed.skip_kv_write = shares_kv;
+            attention_seed.sliding_window = directRuntimeLayerSlidingWindow(gpt_config, layer);
             const seed_k = try prepareKeyForPagedPrefillSeed(
                 cb,
                 gpt_config,
@@ -2772,6 +2783,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             var attention = gpt_arch.attentionContextFromDecode(decode_context);
             attention.layer_index = kv_layer_index;
             attention.skip_kv_write = true;
+            attention.sliding_window = directRuntimeLayerSlidingWindow(gpt_config, layer);
 
             const q_block = blk: {
                 if (gpt_config.global_head_dim != 0 and gpt_config.position_encoding == .rope) {
@@ -2967,6 +2979,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             var attention = gpt_arch.attentionContextFromDecode(decode_context);
             attention.layer_index = kv_layer_index;
             attention.skip_kv_write = shares_kv;
+            attention.sliding_window = directRuntimeLayerSlidingWindow(gpt_config, layer);
             const block_started_at = monotonicNowNs();
             if (try cb.runGatedDecoderBlock(&.{
                 .q = q_for_attn,
@@ -3105,6 +3118,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             var attention = gpt_arch.attentionContextFromDecode(decode_context);
             attention.layer_index = kv_layer_index;
             attention.skip_kv_write = shares_kv;
+            attention.sliding_window = directRuntimeLayerSlidingWindow(gpt_config, layer);
             const q_block = blk: {
                 if (gpt_config.global_head_dim != 0 and gpt_config.position_encoding == .rope) {
                     const scale: f32 = @sqrt(@as(f32, @floatFromInt(head_dim)));
@@ -6616,6 +6630,20 @@ test "direct gemma runtime allows gemma4-style global head configs without share
     shared_kv.num_kv_shared_layers = 2;
     try std.testing.expect(supportsDirectGemmaRuntime(shared_kv, shared_kv.num_hidden_layers, &decode_context));
     try std.testing.expect(supportsDirectGemmaRuntime(shared_kv, shared_kv.num_hidden_layers, &prefill_context));
+}
+
+test "direct gemma runtime preserves per-layer sliding attention policy" {
+    const config: gpt_mod.Config = .{
+        .family = .gemma,
+        .num_hidden_layers = 6,
+        .sliding_window = 512,
+        .sliding_window_pattern = 5,
+    };
+
+    try std.testing.expectEqual(@as(usize, 512), configuredLayerSlidingWindow(config, 0, false));
+    try std.testing.expectEqual(@as(usize, 512), configuredLayerSlidingWindow(config, 4, false));
+    try std.testing.expectEqual(@as(usize, 0), configuredLayerSlidingWindow(config, 5, false));
+    try std.testing.expectEqual(@as(usize, 0), configuredLayerSlidingWindow(config, 0, true));
 }
 
 test "gemma4 shared kv layers do not own decode runtime kv weights" {

@@ -38,11 +38,14 @@ const train_eval_colqwen2_lora_bundle = @import("train/train_eval_colqwen2_lora_
 const train_eval_reranker_lora_top_layer_cached_surrogate = @import("train/train_eval_reranker_lora_top_layer_cached_surrogate.zig");
 const generation = @import("../pipelines/generation.zig");
 const model_manager_mod = @import("../server/model_manager.zig");
+const manifest_mod = @import("../models/manifest.zig");
 const backends = @import("../backends/backends.zig");
 const session_factory = @import("../architectures/session_factory.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const native_backend_choice = @import("../native_backend_choice.zig");
 const tokenizer_mod = @import("inference_tokenizer");
+const hf_tokenizer_mod = @import("inference_hf_tokenizer");
+const sentencepiece_mod = tokenizer_mod.sentencepiece;
 const compat = @import("../io/compat.zig");
 const c_file = @import("../util/c_file.zig");
 const command_registry = @import("command_registry.zig");
@@ -83,6 +86,118 @@ const PreferenceExecutionMode = enum {
 const PreferenceTask = enum {
     dpo,
     grpo,
+};
+
+/// Tokenization and prompt rendering are the only inference-model services
+/// needed by optimizer-backed preference training. Keep that narrow contract
+/// explicit so training does not instantiate a second decoder session beside
+/// its dedicated autodiff backend.
+const PreferenceTokenizerView = struct {
+    tokenizer: tokenizer_mod.Tokenizer,
+    add_bos_token: bool,
+    bos_token: []const u8,
+    chat_tmpl: ?*generation.ChatTemplate,
+
+    fn fromLoadedModel(model: *model_manager_mod.LoadedModel) @This() {
+        return .{
+            .tokenizer = model.getTokenizer(),
+            .add_bos_token = model.manifest.add_bos_token,
+            .bos_token = model.manifest.bos_token,
+            .chat_tmpl = model.chat_tmpl,
+        };
+    }
+
+    fn renderPrompt(self: @This(), allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
+        const messages = [_]generation.Message{
+            .{ .role = "user", .content = prompt },
+        };
+        if (self.chat_tmpl) |tmpl| return tmpl.apply(allocator, &messages, true);
+        return generation.formatMessages(allocator, &messages);
+    }
+};
+
+const OwnedPreferenceTokenizer = struct {
+    allocator: std.mem.Allocator,
+    manifest: manifest_mod.ModelManifest,
+    hf_tok: ?*hf_tokenizer_mod.HfTokenizer = null,
+    sp_tok: ?*sentencepiece_mod.Processor = null,
+    chat_tmpl: ?*generation.ChatTemplate = null,
+
+    fn init(allocator: std.mem.Allocator, model_dir: []const u8) !@This() {
+        const manifest = try manifest_mod.loadFromDir(allocator, model_dir);
+        var result = @This(){
+            .allocator = allocator,
+            .manifest = manifest,
+        };
+        var result_owned = true;
+        errdefer if (result_owned) result.deinit();
+
+        const tokenizer_type = if (model_manager_mod.shouldPreferSentencePieceOverride(manifest, model_dir, allocator))
+            manifest_mod.TokenizerType.sentencepiece
+        else
+            manifest.tokenizer_type orelse return error.NoTokenizerFound;
+        switch (tokenizer_type) {
+            .huggingface => result.hf_tok = try model_manager_mod.loadHuggingFaceTokenizerFromDirOrGguf(
+                allocator,
+                model_dir,
+                manifest.gguf_path,
+            ),
+            .sentencepiece => {
+                const tokenizer = try model_manager_mod.loadSentencePieceTokenizerFromDirOrGguf(
+                    allocator,
+                    model_dir,
+                    manifest.gguf_path,
+                );
+                result.sp_tok = tokenizer;
+                if (model_manager_mod.shouldEnableGemmaSentencePieceCompat(manifest, model_dir, allocator)) {
+                    tokenizer.setPreserveInlineSpecialsAfterLiteralBos(true);
+                }
+                try model_manager_mod.loadSentencePieceAddedTokens(model_dir, allocator, tokenizer);
+            },
+        }
+
+        if (manifest.chat_template) |source| {
+            const tmpl = try allocator.create(generation.ChatTemplate);
+            tmpl.* = generation.ChatTemplate.init(
+                allocator,
+                source,
+                manifest.bos_token,
+                manifest.eos_token,
+                manifest.unk_token,
+                manifest.pad_token,
+            ) catch |err| {
+                allocator.destroy(tmpl);
+                return err;
+            };
+            result.chat_tmpl = tmpl;
+        }
+
+        result_owned = false;
+        return result;
+    }
+
+    fn view(self: *@This()) PreferenceTokenizerView {
+        return .{
+            .tokenizer = if (self.hf_tok) |tokenizer| tokenizer.tokenizer() else self.sp_tok.?.tokenizer(),
+            .add_bos_token = self.manifest.add_bos_token,
+            .bos_token = self.manifest.bos_token,
+            .chat_tmpl = self.chat_tmpl,
+        };
+    }
+
+    fn deinit(self: *@This()) void {
+        if (self.chat_tmpl) |tmpl| {
+            tmpl.deinit();
+            self.allocator.destroy(tmpl);
+        }
+        if (self.hf_tok) |tokenizer| tokenizer.deinitSelf();
+        if (self.sp_tok) |tokenizer| {
+            tokenizer.deinit();
+            self.allocator.destroy(tokenizer);
+        }
+        self.manifest.deinit();
+        self.* = undefined;
+    }
 };
 
 pub const ModelConfig = struct {
@@ -638,10 +753,35 @@ const DpoEvaluationSummary = struct {
 
 const DpoBaselineRelativeSummary = struct {
     accuracy_improvement: f32,
+    accuracy_required_improvement: f32,
+    accuracy_requirement_saturated: bool,
     reward_margin_improvement: f32,
     loss_improvement: f32,
+    loss_required_improvement: f32,
+    loss_requirement_saturated: bool,
     passed: bool,
 };
+
+const BoundedImprovementRequirement = struct {
+    effective_minimum: f32,
+    saturated: bool,
+};
+
+fn boundedIncreaseRequirement(baseline: f32, requested: f64, ceiling: f32) BoundedImprovementRequirement {
+    const headroom = @max(0.0, @as(f64, ceiling) - @as(f64, baseline));
+    return .{
+        .effective_minimum = @floatCast(@min(requested, headroom)),
+        .saturated = requested > headroom,
+    };
+}
+
+fn boundedDecreaseRequirement(baseline: f32, requested: f64, floor: f32) BoundedImprovementRequirement {
+    const headroom = @max(0.0, @as(f64, baseline) - @as(f64, floor));
+    return .{
+        .effective_minimum = @floatCast(@min(requested, headroom)),
+        .saturated = requested > headroom,
+    };
+}
 
 fn compareDpoToBaseline(
     baseline: DpoEvaluationSummary,
@@ -651,13 +791,27 @@ fn compareDpoToBaseline(
     const accuracy_improvement = evaluation.accuracy - baseline.accuracy;
     const reward_margin_improvement = evaluation.mean_reward_margin - baseline.mean_reward_margin;
     const loss_improvement = baseline.loss - evaluation.loss;
+    const accuracy_requirement = boundedIncreaseRequirement(
+        baseline.accuracy,
+        minimums.min_accuracy_improvement.?,
+        1.0,
+    );
+    const loss_requirement = boundedDecreaseRequirement(
+        baseline.loss,
+        minimums.min_loss_improvement.?,
+        0.0,
+    );
     return .{
         .accuracy_improvement = accuracy_improvement,
+        .accuracy_required_improvement = accuracy_requirement.effective_minimum,
+        .accuracy_requirement_saturated = accuracy_requirement.saturated,
         .reward_margin_improvement = reward_margin_improvement,
         .loss_improvement = loss_improvement,
-        .passed = accuracy_improvement >= minimums.min_accuracy_improvement.? and
+        .loss_required_improvement = loss_requirement.effective_minimum,
+        .loss_requirement_saturated = loss_requirement.saturated,
+        .passed = accuracy_improvement >= accuracy_requirement.effective_minimum and
             reward_margin_improvement >= minimums.min_reward_margin_improvement.? and
-            loss_improvement >= minimums.min_loss_improvement.?,
+            loss_improvement >= loss_requirement.effective_minimum,
     };
 }
 
@@ -830,6 +984,10 @@ const PreferenceCheckpointResumeSummary = struct {
     restored_micro_batch_steps: u64,
     restored_optimizer_steps: u64,
     restored_accumulation_micro_batches: u32,
+    /// True when compiled sampling crossed a cache-empty checkpoint boundary.
+    /// Uninterrupted continuation retires live plans after publication; a
+    /// resumed process retires its bootstrap plan after restoring state.
+    compiled_sampling_execution_cache_retired: bool = false,
 };
 
 const DpoCheckpointAggregates = struct {
@@ -840,6 +998,20 @@ const DpoCheckpointAggregates = struct {
     total_accuracy: f64,
     initial_logprob_parity: ?DpoInitialLogprobParity = null,
     initial_bucket_signature_parity: ?DpoInitialBucketSignatureParity = null,
+};
+
+const GrpoReferenceCacheCheckpointEntry = struct {
+    prompt_idx: usize,
+    completion_tokens: []const i32,
+    reference_logps: []const f32,
+};
+
+const GrpoReferenceCacheCheckpoint = struct {
+    capacity: usize,
+    next_evict: usize,
+    hits: usize,
+    misses: usize,
+    entries: []const GrpoReferenceCacheCheckpointEntry,
 };
 
 const GrpoCheckpointAggregates = struct {
@@ -873,6 +1045,11 @@ const GrpoCheckpointAggregates = struct {
     reward_external_calls: usize,
     reward_external_failures: usize,
     reward_trace: []const u8,
+    /// Frozen-reference values are derived, but their exact f32 bytes are part
+    /// of the optimizer trajectory. Persist the bounded cache so a resumed
+    /// process does not recompute those values through a different Metal
+    /// allocation/session history.
+    reference_cache: ?GrpoReferenceCacheCheckpoint = null,
     /// Cumulative exact-sampler counters. Live KV pages are intentionally not
     /// serialized; checkpoints are admitted only after the sampler proves all
     /// logical and device sequence lifetimes have ended.
@@ -946,6 +1123,8 @@ const GrpoBaselineRelativeSummary = struct {
     mean_reward_improvement: f32,
     top_rank_mean_reward_improvement: f32,
     positive_reward_group_rate_improvement: f32,
+    positive_reward_group_rate_required_improvement: f32,
+    positive_reward_group_rate_requirement_saturated: bool,
     passed: bool,
 };
 
@@ -957,13 +1136,20 @@ fn compareGrpoToBaseline(
     const mean_reward_improvement = evaluation.mean_reward - baseline.mean_reward;
     const top_rank_mean_reward_improvement = evaluation.top_rank_mean_reward - baseline.top_rank_mean_reward;
     const positive_reward_group_rate_improvement = evaluation.positive_reward_group_rate - baseline.positive_reward_group_rate;
+    const positive_reward_group_rate_requirement = boundedIncreaseRequirement(
+        baseline.positive_reward_group_rate,
+        minimums.min_positive_reward_group_rate_improvement.?,
+        1.0,
+    );
     return .{
         .mean_reward_improvement = mean_reward_improvement,
         .top_rank_mean_reward_improvement = top_rank_mean_reward_improvement,
         .positive_reward_group_rate_improvement = positive_reward_group_rate_improvement,
+        .positive_reward_group_rate_required_improvement = positive_reward_group_rate_requirement.effective_minimum,
+        .positive_reward_group_rate_requirement_saturated = positive_reward_group_rate_requirement.saturated,
         .passed = mean_reward_improvement >= minimums.min_mean_reward_improvement.? and
             top_rank_mean_reward_improvement >= minimums.min_top_rank_mean_reward_improvement.? and
-            positive_reward_group_rate_improvement >= minimums.min_positive_reward_group_rate_improvement.?,
+            positive_reward_group_rate_improvement >= positive_reward_group_rate_requirement.effective_minimum,
     };
 }
 
@@ -2740,10 +2926,14 @@ fn validateGemma4PreferenceEvaluationContract(
             if (!std.math.isFinite(minimums.max_loss) or minimums.max_loss < 0.0) {
                 return error.InvalidDpoEvaluationMinimums;
             }
-            const relative_count = @intFromBool(minimums.min_accuracy_improvement != null) +
-                @intFromBool(minimums.min_reward_margin_improvement != null) +
-                @intFromBool(minimums.min_loss_improvement != null);
-            if (relative_count != 0 and relative_count != 3) return error.IncompleteDpoBaselineRelativeMinimums;
+            const has_accuracy_improvement = minimums.min_accuracy_improvement != null;
+            const has_reward_margin_improvement = minimums.min_reward_margin_improvement != null;
+            const has_loss_improvement = minimums.min_loss_improvement != null;
+            if ((has_accuracy_improvement or has_reward_margin_improvement or has_loss_improvement) and
+                !(has_accuracy_improvement and has_reward_margin_improvement and has_loss_improvement))
+            {
+                return error.IncompleteDpoBaselineRelativeMinimums;
+            }
             if (minimums.min_accuracy_improvement) |value| {
                 if (!std.math.isFinite(value) or value < 0.0 or
                     !std.math.isFinite(minimums.min_reward_margin_improvement.?) or minimums.min_reward_margin_improvement.? < 0.0 or
@@ -2765,10 +2955,14 @@ fn validateGemma4PreferenceEvaluationContract(
             {
                 return error.InvalidGrpoEvaluationMinimums;
             }
-            const relative_count = @intFromBool(minimums.min_mean_reward_improvement != null) +
-                @intFromBool(minimums.min_top_rank_mean_reward_improvement != null) +
-                @intFromBool(minimums.min_positive_reward_group_rate_improvement != null);
-            if (relative_count != 0 and relative_count != 3) return error.IncompleteGrpoBaselineRelativeMinimums;
+            const has_mean_reward_improvement = minimums.min_mean_reward_improvement != null;
+            const has_top_rank_mean_reward_improvement = minimums.min_top_rank_mean_reward_improvement != null;
+            const has_positive_group_improvement = minimums.min_positive_reward_group_rate_improvement != null;
+            if ((has_mean_reward_improvement or has_top_rank_mean_reward_improvement or has_positive_group_improvement) and
+                !(has_mean_reward_improvement and has_top_rank_mean_reward_improvement and has_positive_group_improvement))
+            {
+                return error.IncompleteGrpoBaselineRelativeMinimums;
+            }
             if (minimums.min_mean_reward_improvement) |value| {
                 if (!std.math.isFinite(value) or value < 0.0 or
                     !std.math.isFinite(minimums.min_top_rank_mean_reward_improvement.?) or minimums.min_top_rank_mean_reward_improvement.? < 0.0 or
@@ -6584,7 +6778,13 @@ fn runDirectDpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, report
     else
         try model_manager.loadFromDir(reference_path);
 
-    var samples = try loadDpoTextPreferenceSamples(allocator, io, path, recipe, policy_model);
+    var samples = try loadDpoTextPreferenceSamples(
+        allocator,
+        io,
+        path,
+        recipe,
+        PreferenceTokenizerView.fromLoadedModel(policy_model),
+    );
     defer samples.deinit();
 
     var policy_scorer = DecoderLogprobScorer{
@@ -6828,10 +7028,11 @@ fn tokenizeSftTextRow(
     completion: []const u8,
     max_seq_len: usize,
 ) !gemma4.PreparedExampleInput {
-    const tokenizer = model.getTokenizer();
+    const tokenizer_view = PreferenceTokenizerView.fromLoadedModel(model);
+    const tokenizer = tokenizer_view.tokenizer;
     const render_prompt = !std.mem.eql(u8, recipe.dataset.format orelse "text-sft", "rendered-text-sft");
     const prompt_text = if (render_prompt)
-        try renderDpoPrompt(allocator, model, prompt)
+        try tokenizer_view.renderPrompt(allocator, prompt)
     else
         try allocator.dupe(u8, prompt);
     defer allocator.free(prompt_text);
@@ -6841,8 +7042,8 @@ fn tokenizeSftTextRow(
         allocator,
         prompt_text,
         max_seq_len,
-        model.manifest.add_bos_token,
-        model.manifest.bos_token,
+        tokenizer_view.add_bos_token,
+        tokenizer_view.bos_token,
     );
     defer prompt_encoded.deinit();
 
@@ -6876,11 +7077,7 @@ const GemmaDpoReferenceCache = struct {
 };
 
 const GemmaGrpoReferenceCache = struct {
-    const Entry = struct {
-        prompt_idx: usize,
-        completion_tokens: []i32,
-        reference_logps: []f32,
-    };
+    const Entry = GrpoReferenceCacheCheckpointEntry;
 
     allocator: std.mem.Allocator,
     capacity: usize,
@@ -6897,12 +7094,76 @@ const GemmaGrpoReferenceCache = struct {
     }
 
     fn deinit(self: *GemmaGrpoReferenceCache) void {
+        self.clear();
+        self.entries.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn clear(self: *GemmaGrpoReferenceCache) void {
         for (self.entries.items) |entry| {
             self.allocator.free(entry.completion_tokens);
             self.allocator.free(entry.reference_logps);
         }
-        self.entries.deinit(self.allocator);
-        self.* = undefined;
+        self.entries.clearRetainingCapacity();
+        self.next_evict = 0;
+        self.hits = 0;
+        self.misses = 0;
+    }
+
+    fn checkpoint(self: *const GemmaGrpoReferenceCache) GrpoReferenceCacheCheckpoint {
+        return .{
+            .capacity = self.capacity,
+            .next_evict = self.next_evict,
+            .hits = self.hits,
+            .misses = self.misses,
+            .entries = self.entries.items,
+        };
+    }
+
+    fn restoreCheckpoint(
+        self: *GemmaGrpoReferenceCache,
+        snapshot: GrpoReferenceCacheCheckpoint,
+        prompt_count: usize,
+    ) !void {
+        if (self.entries.items.len != 0 or self.hits != 0 or self.misses != 0 or self.next_evict != 0) {
+            return error.GrpoReferenceCacheAlreadyStarted;
+        }
+        if (snapshot.capacity != self.capacity or snapshot.entries.len > snapshot.capacity) {
+            return error.InvalidPreferenceCheckpointState;
+        }
+        if ((snapshot.capacity == 0 and snapshot.next_evict != 0) or
+            (snapshot.entries.len < snapshot.capacity and snapshot.next_evict != 0) or
+            (snapshot.entries.len == snapshot.capacity and snapshot.capacity != 0 and snapshot.next_evict >= snapshot.capacity))
+        {
+            return error.InvalidPreferenceCheckpointState;
+        }
+
+        for (snapshot.entries, 0..) |entry, entry_idx| {
+            if (entry.prompt_idx >= prompt_count or
+                entry.completion_tokens.len == 0 or
+                entry.completion_tokens.len != entry.reference_logps.len)
+            {
+                return error.InvalidPreferenceCheckpointState;
+            }
+            for (entry.reference_logps) |logp| {
+                if (!std.math.isFinite(logp)) return error.InvalidPreferenceCheckpointState;
+            }
+            for (snapshot.entries[0..entry_idx]) |previous| {
+                if (entry.prompt_idx == previous.prompt_idx and
+                    std.mem.eql(i32, entry.completion_tokens, previous.completion_tokens))
+                {
+                    return error.InvalidPreferenceCheckpointState;
+                }
+            }
+        }
+
+        errdefer self.clear();
+        for (snapshot.entries) |entry| {
+            try self.insert(entry.prompt_idx, entry.completion_tokens, entry.reference_logps);
+        }
+        self.next_evict = snapshot.next_evict;
+        self.hits = snapshot.hits;
+        self.misses = snapshot.misses;
     }
 
     fn lookup(
@@ -7212,19 +7473,16 @@ fn sampleGemmaGrpoCompletionGroup(
     // sparse, sequence-wide graph used by the legacy sampler. This retains
     // incremental KV for token selection and replaces N per-token full-prefix
     // forwards with one exact full-sequence rescore per completion.
-    for (out_tokens, out_logps) |tokens, *logps| {
-        if (tokens.items.len != logps.items.len) return error.GrpoIncrementalKvLogprobParityFailed;
-        try gemma4_real_autodiff.tokenLogprobsForPromptCompletionSparseRows(
-            allocator,
-            trainer,
-            ctx,
-            prompt,
-            tokens.items,
-            seq_len,
-            logps.items,
-        );
-        sampler.telemetry.exact_logprob_rescore_forwards += 1;
-    }
+    try canonicalizeGemmaGrpoCompletionGroupLogps(
+        allocator,
+        trainer,
+        ctx,
+        prompt,
+        seq_len,
+        out_tokens,
+        out_logps,
+    );
+    sampler.telemetry.exact_logprob_rescore_forwards += out_tokens.len;
 
     if (shadow_tokens) |baseline_tokens| {
         const baseline_logps = shadow_logps.?;
@@ -7269,6 +7527,36 @@ fn sampleGemmaGrpoCompletionGroup(
                 }
             }
         }
+    }
+}
+
+/// Replace sampler-local log-probabilities with the authoritative sparse
+/// sequence-wide policy scorer for the same already-selected tokens.  The
+/// incremental-KV route uses this for every group because paged decode has a
+/// different reduction order. The scorer is explicitly eager so enabling the
+/// compiled sampler cannot make this canonicalization reuse the drifting
+/// output session.
+fn canonicalizeGemmaGrpoCompletionGroupLogps(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *gemma4_real_autodiff.GemmaAutodiffCtx,
+    prompt: []const i32,
+    seq_len: u32,
+    out_tokens: []const std.ArrayList(i32),
+    out_logps: []std.ArrayList(f32),
+) !void {
+    if (out_tokens.len != out_logps.len) return error.GrpoLogprobCanonicalizationShapeMismatch;
+    for (out_tokens, out_logps) |tokens, *logps| {
+        if (tokens.items.len != logps.items.len) return error.GrpoLogprobCanonicalizationShapeMismatch;
+        try gemma4_real_autodiff.tokenLogprobsForPromptCompletionSparseRowsCanonical(
+            allocator,
+            trainer,
+            ctx,
+            prompt,
+            tokens.items,
+            seq_len,
+            logps.items,
+        );
     }
 }
 
@@ -7374,6 +7662,39 @@ fn batchedMultiTokenGroupPolicyLogps(
     )) {
         logps.deinit();
         return null;
+    }
+    return logps;
+}
+
+/// Score every already-selected completion through the explicitly eager,
+/// restart-stable sparse policy graph. Keep batch=1 here: the matched control
+/// and compiled campaigns are bit-exact at that geometry, while a batch-wide
+/// rescore changes tied-head reduction order enough to move log-probs by 2e-2.
+/// Compiled sampling remains responsible for the many per-token selection
+/// forwards, so this adds one sequence-wide rescore per completion.
+fn canonicalCompiledSamplingGroupPolicyLogps(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *gemma4_real_autodiff.GemmaAutodiffCtx,
+    prompt: []const i32,
+    sampled_tokens: []const std.ArrayList(i32),
+    seq_len: u32,
+    rank_cap: usize,
+) !CompletionGroupLogps {
+    if (rank_cap == 0) return error.InvalidCompletionRankCap;
+    var logps = try CompletionGroupLogps.init(allocator, sampled_tokens);
+    errdefer logps.deinit();
+    for (sampled_tokens, logps.rows, 0..) |tokens, row, completion_idx| {
+        try gemma4_real_autodiff.tokenLogprobsForPromptCompletionSparseRowsCanonicalRanked(
+            allocator,
+            trainer,
+            ctx,
+            prompt,
+            tokens.items,
+            seq_len,
+            completion_idx % rank_cap,
+            row,
+        );
     }
     return logps;
 }
@@ -7992,13 +8313,11 @@ fn runOptimizerBackedGemmaDpo(
         defer gemma4.freeBootstrapSummary(allocator, &bootstrap);
     };
 
-    var session_manager = backends.SessionManager.init(allocator);
-    native_backend_choice.configureSessionPreference(&session_manager, execution.session_choice);
-    var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
-    defer model_manager.deinit();
-    const tokenizer_model = try model_manager.loadFromDir(base_model_dir);
+    var tokenizer_assets = try OwnedPreferenceTokenizer.init(allocator, base_model_dir);
+    defer tokenizer_assets.deinit();
+    const tokenizer_view = tokenizer_assets.view();
 
-    var samples = try loadDpoTextPreferenceSamples(allocator, io, dataset_path, recipe, tokenizer_model);
+    var samples = try loadDpoTextPreferenceSamples(allocator, io, dataset_path, recipe, tokenizer_view);
     defer samples.deinit();
 
     var chosen_prepared = try prepareGemmaDpoPreparedExamplesFromSamples(allocator, base_model_dir, samples.samples, max_examples, max_seq_len, .chosen);
@@ -8148,7 +8467,7 @@ fn runOptimizerBackedGemmaDpo(
             allocator,
             io,
             recipe,
-            tokenizer_model,
+            tokenizer_view,
             samples.samples,
             &trainer,
             &ctx,
@@ -8749,7 +9068,7 @@ fn runOptimizerBackedGemmaDpo(
             allocator,
             io,
             recipe,
-            tokenizer_model,
+            tokenizer_view,
             samples.samples,
             &evaluation_trainer,
             &evaluation_ctx,
@@ -8901,7 +9220,7 @@ fn evaluateGemmaDpoHeldout(
     allocator: std.mem.Allocator,
     io: std.Io,
     recipe: Recipe,
-    tokenizer_model: *model_manager_mod.LoadedModel,
+    tokenizer_view: PreferenceTokenizerView,
     train_samples: []const preference_harness.PreferenceSample,
     trainer: *real_autodiff.RealAutodiffTrainer,
     ctx: *gemma4_real_autodiff.GemmaAutodiffCtx,
@@ -8914,7 +9233,7 @@ fn evaluateGemmaDpoHeldout(
     const minimums = recipe.eval.?.dpo_minimums orelse return error.MissingDpoEvaluationMinimums;
     var eval_recipe = recipe;
     eval_recipe.dataset.max_examples = evalMaxExamples(recipe);
-    var samples = try loadDpoTextPreferenceSamples(allocator, io, eval_path, eval_recipe, tokenizer_model);
+    var samples = try loadDpoTextPreferenceSamples(allocator, io, eval_path, eval_recipe, tokenizer_view);
     defer samples.deinit();
     const dataset_fingerprint = try fingerprintPath(allocator, io, "eval_dataset", eval_path);
     defer if (dataset_fingerprint.digest) |digest| allocator.free(digest);
@@ -9168,7 +9487,13 @@ fn runOptimizerBackedQwen2Dpo(
     defer model_manager.deinit();
     const reference_model = try model_manager.loadFromDir(reference_path);
 
-    var samples = try loadDpoTextPreferenceSamples(allocator, io, dataset_path, recipe, reference_model);
+    var samples = try loadDpoTextPreferenceSamples(
+        allocator,
+        io,
+        dataset_path,
+        recipe,
+        PreferenceTokenizerView.fromLoadedModel(reference_model),
+    );
     defer samples.deinit();
 
     var chosen_prepared = try prepareGemmaDpoPreparedExamplesFromSamples(allocator, base_model_dir, samples.samples, max_examples, max_seq_len, .chosen);
@@ -9414,6 +9739,9 @@ fn runOptimizerBackedGemmaGrpo(
         backend_kind == .metal and
         !batch_multi_token_group_scoring and
         gemmaGrpoSparseMultiTokenEnabled();
+    const compiled_sampling_requested = !coalesce_single_token_groups and
+        backend_kind == .metal and
+        platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GRPO_COMPILED_SAMPLING", false);
     const physical_micro_batches_per_group: usize = if (coalesce_single_token_groups)
         1
     else if (batch_multi_token_group_backward)
@@ -9474,14 +9802,11 @@ fn runOptimizerBackedGemmaGrpo(
         return;
     }
 
-    var session_manager = backends.SessionManager.init(allocator);
-    native_backend_choice.configureSessionPreference(&session_manager, execution.session_choice);
-    var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
-    defer model_manager.deinit();
+    var tokenizer_assets = try OwnedPreferenceTokenizer.init(allocator, base_model_dir);
+    defer tokenizer_assets.deinit();
+    const tokenizer_view = tokenizer_assets.view();
 
-    const tokenizer_model = try model_manager.loadFromDir(base_model_dir);
-
-    var prompt_batch = try loadGrpoTextPrompts(allocator, io, dataset_path, recipe, tokenizer_model);
+    var prompt_batch = try loadGrpoTextPrompts(allocator, io, dataset_path, recipe, tokenizer_view);
     defer prompt_batch.deinit();
     const epochs = recipe.optimizer.epochs orelse 1;
     const benchmark_enabled = platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GRPO_BENCHMARK", false);
@@ -9510,7 +9835,7 @@ fn runOptimizerBackedGemmaGrpo(
         .sharing = if (adapter_inspect.recursive_lora_enabled) .by_use else .by_weight,
     };
 
-    const grpo_graph_cache_capacity: u8 = if (batch_multi_token_group_backward) 2 else 1;
+    const grpo_graph_cache_capacity: u8 = if (batch_multi_token_group_backward or compiled_sampling_requested) 2 else 1;
     var trainer = try real_autodiff.RealAutodiffTrainer.init(allocator, backend.backendPtr(), .{
         .lora = lora_config,
         .optimizer = .{},
@@ -9572,6 +9897,9 @@ fn runOptimizerBackedGemmaGrpo(
     try gemma4_real_autodiff.initializeTrainerFromAdapterDir(allocator, &trainer, &ctx, bootstrap_dir, &bootstrap_example, @intCast(max_seq_len));
 
     const incremental_kv_enabled = gemmaGrpoIncrementalKvEnabled(recipe);
+    if (incremental_kv_enabled and compiled_sampling_requested) {
+        return error.Gemma4GrpoCompiledSamplingConflictsWithIncrementalKv;
+    }
     if (incremental_kv_enabled and !sparse_multi_token) {
         return error.Gemma4GrpoIncrementalKvRequiresSparseMultiToken;
     }
@@ -9593,6 +9921,7 @@ fn runOptimizerBackedGemmaGrpo(
     if (incremental_kv_clone_prompt_tail) grpo_execution_flags |= @as(u64, 1) << 7;
     if (incremental_kv_shadow_exact) grpo_execution_flags |= @as(u64, 1) << 8;
     if (ctx.enable_fused_gqa_attention_backward) grpo_execution_flags |= @as(u64, 1) << 9;
+    if (compiled_sampling_requested) grpo_execution_flags |= @as(u64, 1) << 10;
     const metal_numerical_policy = resolveGemmaMetalNumericalPolicy(backend_kind, &ctx);
     const grpo_run_fingerprint = try gemmaPreferenceRunFingerprint(
         allocator,
@@ -9655,6 +9984,7 @@ fn runOptimizerBackedGemmaGrpo(
     defer if (loaded_grpo_state) |*state| state.deinit(allocator);
     var start_epoch: usize = 0;
     var initial_adapter_digest = trainerLoRAParameterDigest(&trainer);
+    var compiled_sampling_execution_cache_retired = false;
     if (grpo_resume_enabled) {
         const path = grpo_checkpoint_path orelse return error.CheckpointPathRequired;
         grpo_restored = try trainer.loadTrainingCheckpoint(path, &grpo_run_fingerprint);
@@ -9670,6 +10000,10 @@ fn runOptimizerBackedGemmaGrpo(
             return error.InvalidPreferenceCheckpointState;
         if (start_epoch > epochs) return error.CheckpointBeyondRequestedEpochCount;
         initial_adapter_digest = loaded_grpo_state.?.parsed.value.grpo.?.initial_adapter_digest;
+        if (compiled_sampling_requested) {
+            try trainer.retireExecutionCachesAtCheckpointBoundary();
+            compiled_sampling_execution_cache_retired = true;
+        }
     }
 
     var incremental_kv_sampler: ?gemma4_real_autodiff.GrpoIncrementalKvSampler = if (incremental_kv_requested)
@@ -9709,6 +10043,16 @@ fn runOptimizerBackedGemmaGrpo(
     defer frozen_lora.deinit();
     var reference_cache = GemmaGrpoReferenceCache.init(allocator, 1024);
     defer reference_cache.deinit();
+    if (restored_grpo_aggregates) |state| {
+        if (state.reference_cache) |checkpoint| {
+            try reference_cache.restoreCheckpoint(checkpoint, prompt_batch.prompts.len);
+        } else if (compiled_sampling_requested) {
+            // Compiled Metal reference values are stable while cached, but a
+            // fresh process is not admitted to recompute an omitted cache and
+            // silently change the optimizer trajectory.
+            return error.CompiledGrpoReferenceCacheCheckpointRequired;
+        }
+    }
 
     const grpo_minimums = recipe.eval.?.grpo_minimums.?;
     const grpo_baseline_report_path = if (grpo_minimums.min_mean_reward_improvement != null)
@@ -9736,7 +10080,7 @@ fn runOptimizerBackedGemmaGrpo(
             allocator,
             io,
             baseline_recipe,
-            tokenizer_model,
+            tokenizer_view,
             prompt_batch.prompts,
             &trainer,
             &ctx,
@@ -9756,7 +10100,7 @@ fn runOptimizerBackedGemmaGrpo(
         allocator,
         io,
         recipe,
-        tokenizer_model.getTokenizer(),
+        tokenizer_view.tokenizer,
         prompt_batch.prompt_texts,
         prompt_batch.targets,
         .train,
@@ -9821,7 +10165,7 @@ fn runOptimizerBackedGemmaGrpo(
     var diagnostic_first_token_count: usize = if (restored_grpo_aggregates) |state| state.diagnostic_first_token_count else 0;
 
     const top_rank_cap: usize = @min(group_size, 8);
-    const eos_id = tokenizer_model.getTokenizer().specialTokens().sep_id;
+    const eos_id = tokenizer_view.tokenizer.specialTokens().sep_id;
     var epoch_idx: usize = start_epoch;
     while (epoch_idx < epochs) : (epoch_idx += 1) {
         for (prompt_batch.prompts, 0..) |prompt, prompt_idx| {
@@ -9893,7 +10237,7 @@ fn runOptimizerBackedGemmaGrpo(
                 );
                 total_reference_scoring_seconds += @as(f64, @floatFromInt(platform.time.monotonicNs() - reference_started_ns)) / std.time.ns_per_s;
 
-                if (!captured_initial_logprob_parity) {
+                if (!captured_initial_logprob_parity and !compiled_sampling_requested) {
                     const candidate_token_ids = try allocator.alloc(i32, group_size);
                     defer allocator.free(candidate_token_ids);
                     for (sampled_token_lists, candidate_token_ids) |tokens, *token_id| {
@@ -9919,6 +10263,20 @@ fn runOptimizerBackedGemmaGrpo(
 
             var multi_token_policy_rescore_logps: ?CompletionGroupLogps = null;
             defer if (multi_token_policy_rescore_logps) |*values| values.deinit();
+            if (compiled_sampling_requested) {
+                const rescore_started_ns = platform.time.monotonicNs();
+                multi_token_policy_rescore_logps = try canonicalCompiledSamplingGroupPolicyLogps(
+                    allocator,
+                    &trainer,
+                    &ctx,
+                    prompt,
+                    sampled_token_lists,
+                    @intCast(max_seq_len),
+                    top_rank_cap,
+                );
+                total_policy_rescore_seconds += @as(f64, @floatFromInt(platform.time.monotonicNs() - rescore_started_ns)) / std.time.ns_per_s;
+                policy_rescore_completions += group_size;
+            }
             var multi_token_reference_logps: ?CompletionGroupLogps = null;
             defer if (multi_token_reference_logps) |*values| values.deinit();
             if (batch_multi_token_group_scoring) {
@@ -9936,7 +10294,7 @@ fn runOptimizerBackedGemmaGrpo(
                 );
                 total_reference_scoring_seconds += @as(f64, @floatFromInt(platform.time.monotonicNs() - reference_started_ns)) / std.time.ns_per_s;
 
-                if (!captured_initial_logprob_parity) {
+                if (!captured_initial_logprob_parity and !compiled_sampling_requested) {
                     const rescore_started_ns = platform.time.monotonicNs();
                     multi_token_policy_rescore_logps = try batchedMultiTokenGroupPolicyLogps(
                         allocator,
@@ -9967,7 +10325,11 @@ fn runOptimizerBackedGemmaGrpo(
                 errdefer allocator.free(old_logps_owned);
                 const new_logps_owned = try allocator.alloc(f32, tokens_owned.len);
                 defer allocator.free(new_logps_owned);
-                if (!captured_initial_logprob_parity) {
+                if (compiled_sampling_requested) {
+                    const canonical_logps = multi_token_policy_rescore_logps orelse
+                        return error.CompiledGrpoCanonicalLogprobsMissing;
+                    @memcpy(new_logps_owned, canonical_logps.rows[completion_idx]);
+                } else if (!captured_initial_logprob_parity) {
                     if (single_token_policy_rescore_logps) |batched_logps| {
                         if (new_logps_owned.len != 1) return error.ExpectedSingleTokenCompletion;
                         new_logps_owned[0] = batched_logps[completion_idx];
@@ -10070,6 +10432,7 @@ fn runOptimizerBackedGemmaGrpo(
                     group_sampling_rescore_max_abs_error = @max(group_sampling_rescore_max_abs_error, @abs(old_logp - new_logp));
                     group_policy_reference_max_abs_error = @max(group_policy_reference_max_abs_error, @abs(new_logp - ref_logp));
                 }
+                if (compiled_sampling_requested) @memcpy(old_logps_owned, new_logps_owned);
                 if (diagnostic_slot) |slot| {
                     diagnostic_policy_first_token_logps[slot] = new_logps_owned[0];
                     diagnostic_reference_first_token_logps[slot] = ref_logps_owned[0];
@@ -10085,7 +10448,7 @@ fn runOptimizerBackedGemmaGrpo(
                 group_token_count += tokens_owned.len;
             }
 
-            if (!captured_initial_logprob_parity) {
+            if (!captured_initial_logprob_parity and !compiled_sampling_requested) {
                 if (group_sampling_rescore_max_abs_error > 1e-4) {
                     print("grpo sampling-rescore parity mismatch: max_abs_error={d:.9} tolerance=0.000100000 batched_multi={} sparse_multi={}\n", .{
                         group_sampling_rescore_max_abs_error,
@@ -10094,7 +10457,15 @@ fn runOptimizerBackedGemmaGrpo(
                     });
                     return error.GrpoSamplingRescoreParityMismatch;
                 }
-                if (current_base_equivalent_policy and group_policy_reference_max_abs_error > 1e-4) return error.GrpoInitialReferenceParityMismatch;
+            }
+            if (!captured_initial_logprob_parity) {
+                if (current_base_equivalent_policy and group_policy_reference_max_abs_error > 1e-4) {
+                    print("grpo initial policy-reference parity mismatch: max_abs_error={d:.9} tolerance=0.000100000 compiled_sampling={}\n", .{
+                        group_policy_reference_max_abs_error,
+                        compiled_sampling_requested,
+                    });
+                    return error.GrpoInitialReferenceParityMismatch;
+                }
                 initial_sampling_rescore_max_abs_error = group_sampling_rescore_max_abs_error;
                 initial_policy_reference_max_abs_error = group_policy_reference_max_abs_error;
                 captured_initial_logprob_parity = true;
@@ -10294,10 +10665,15 @@ fn runOptimizerBackedGemmaGrpo(
                             .reward_external_calls = reward_pipeline.external_calls,
                             .reward_external_failures = reward_pipeline.external_failures,
                             .reward_trace = reward_pipeline.trace.items,
+                            .reference_cache = reference_cache.checkpoint(),
                             .incremental_kv = checkpoint_incremental_kv,
                         },
                     },
                 );
+                if (compiled_sampling_requested and completed_epochs < epochs) {
+                    try trainer.retireExecutionCachesAtCheckpointBoundary();
+                    compiled_sampling_execution_cache_retired = true;
+                }
             }
         }
     }
@@ -10365,6 +10741,7 @@ fn runOptimizerBackedGemmaGrpo(
                     .reward_external_calls = reward_pipeline.external_calls,
                     .reward_external_failures = reward_pipeline.external_failures,
                     .reward_trace = reward_pipeline.trace.items,
+                    .reference_cache = reference_cache.checkpoint(),
                     .incremental_kv = checkpoint_incremental_kv,
                 },
             },
@@ -10472,7 +10849,7 @@ fn runOptimizerBackedGemmaGrpo(
             allocator,
             io,
             recipe,
-            tokenizer_model,
+            tokenizer_view,
             prompt_batch.prompts,
             &evaluation_trainer,
             &evaluation_ctx,
@@ -10529,11 +10906,15 @@ fn runOptimizerBackedGemmaGrpo(
             "shared-prompt-ranked-sparse-row"
         else if (incremental_kv_sampler != null)
             "shared-page-prompt-ranked-incremental-kv"
+        else if (compiled_sampling_requested)
+            "compiled-shared-prompt-ranked-sparse-row-each-step"
         else if (sparse_multi_token)
             "shared-prompt-ranked-sparse-row-each-step"
         else
             "shared-prompt-ranked",
-        .policy_logprob_mode = if (batch_single_token_group_scoring)
+        .policy_logprob_mode = if (compiled_sampling_requested)
+            "compiled-token-selection-with-eager-per-completion-token-validated-logprob-rescore"
+        else if (batch_single_token_group_scoring)
             "sampling-logprob-reuse-with-batched-initial-rescore"
         else if (batch_multi_token_group_scoring)
             "sampling-logprob-reuse-with-batched-completion-row-initial-rescore"
@@ -10589,6 +10970,7 @@ fn runOptimizerBackedGemmaGrpo(
             .restored_micro_batch_steps = grpo_restored.micro_batch_steps,
             .restored_optimizer_steps = grpo_restored.optimizer_steps,
             .restored_accumulation_micro_batches = grpo_restored.accumulation_micro_batches,
+            .compiled_sampling_execution_cache_retired = compiled_sampling_execution_cache_retired,
         },
         .reward_pipeline = reward_pipeline.telemetry(),
         .metal_numerical_policy = metal_numerical_policy,
@@ -10605,7 +10987,7 @@ fn evaluateGemmaGrpoHeldout(
     allocator: std.mem.Allocator,
     io: std.Io,
     recipe: Recipe,
-    tokenizer_model: *model_manager_mod.LoadedModel,
+    tokenizer_view: PreferenceTokenizerView,
     train_prompts: []const []const i32,
     trainer: *real_autodiff.RealAutodiffTrainer,
     ctx: *gemma4_real_autodiff.GemmaAutodiffCtx,
@@ -10622,7 +11004,7 @@ fn evaluateGemmaGrpoHeldout(
     const minimums = recipe.eval.?.grpo_minimums orelse return error.MissingGrpoEvaluationMinimums;
     var eval_recipe = recipe;
     eval_recipe.dataset.max_examples = evalMaxExamples(recipe);
-    var prompt_batch = try loadGrpoTextPrompts(allocator, io, eval_path, eval_recipe, tokenizer_model);
+    var prompt_batch = try loadGrpoTextPrompts(allocator, io, eval_path, eval_recipe, tokenizer_view);
     defer prompt_batch.deinit();
     const dataset_fingerprint = try fingerprintPath(allocator, io, "eval_dataset", eval_path);
     defer if (dataset_fingerprint.digest) |digest| allocator.free(digest);
@@ -10632,7 +11014,7 @@ fn evaluateGemmaGrpoHeldout(
         allocator,
         io,
         recipe,
-        tokenizer_model.getTokenizer(),
+        tokenizer_view.tokenizer,
         prompt_batch.prompt_texts,
         prompt_batch.targets,
         .evaluation,
@@ -10687,7 +11069,7 @@ fn evaluateGemmaGrpoHeldout(
         !batch_multi_token_group_scoring and
         gemmaGrpoSparseMultiTokenEnabled();
     const top_rank_cap: usize = @min(group_size, 8);
-    const eos_id = tokenizer_model.getTokenizer().specialTokens().sep_id;
+    const eos_id = tokenizer_view.tokenizer.specialTokens().sep_id;
     var reference_cache = GemmaGrpoReferenceCache.init(allocator, 1024);
     defer reference_cache.deinit();
     var total_loss: f64 = 0.0;
@@ -11107,7 +11489,13 @@ fn runOptimizerBackedQwen2Grpo(
     else
         try model_manager.loadFromDir(reference_path);
 
-    var prompt_batch = try loadGrpoTextPrompts(allocator, io, dataset_path, recipe, tokenizer_model);
+    var prompt_batch = try loadGrpoTextPrompts(
+        allocator,
+        io,
+        dataset_path,
+        recipe,
+        PreferenceTokenizerView.fromLoadedModel(tokenizer_model),
+    );
     defer prompt_batch.deinit();
 
     const graph_config = try qwen2_real_autodiff.loadGraphConfig(allocator, base_model_dir);
@@ -11307,14 +11695,9 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
     const execution_policy = train_eval_gemma4_lora_bundle.autodiffExecutionPolicy(backend_kind);
     const grad_accum_steps = try preferenceGradAccumSteps(recipe.optimizer.gradient_accumulation_steps orelse 1, group_size);
 
-    var session_manager = backends.SessionManager.init(allocator);
-    native_backend_choice.configureSessionPreference(&session_manager, switch (backend_kind) {
-        .native => .native,
-        .metal => .metal,
-    });
-    var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
-    defer model_manager.deinit();
-    const tokenizer_model = try model_manager.loadFromDir(base_model_dir);
+    var tokenizer_assets = try OwnedPreferenceTokenizer.init(allocator, base_model_dir);
+    defer tokenizer_assets.deinit();
+    const tokenizer_view = tokenizer_assets.view();
 
     var prompt_batch = try loadGemmaGrpoPreparedPrompts(allocator, io, dataset_path, recipe, base_model_dir, projector_path);
     defer prompt_batch.deinit();
@@ -11380,7 +11763,7 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
 
     var rewarder_ctx = TextRewardCtx{
         .allocator = allocator,
-        .tokenizer = tokenizer_model.getTokenizer(),
+        .tokenizer = tokenizer_view.tokenizer,
         .targets = prompt_batch.targets,
         .mode = reward_mode,
     };
@@ -11413,7 +11796,7 @@ fn runOptimizerBackedGemmaMultimodalGrpo(
     var saw_nonzero_policy_gradient = false;
 
     const top_rank_cap: usize = @min(group_size, 8);
-    const eos_id = tokenizer_model.getTokenizer().specialTokens().sep_id;
+    const eos_id = tokenizer_view.tokenizer.specialTokens().sep_id;
     const epochs = recipe.optimizer.epochs orelse 1;
     var epoch_idx: usize = 0;
     while (epoch_idx < epochs) : (epoch_idx += 1) {
@@ -11762,7 +12145,7 @@ fn loadDpoTextPreferenceSamples(
     io: std.Io,
     path: []const u8,
     recipe: Recipe,
-    policy_model: *model_manager_mod.LoadedModel,
+    tokenizer_view: PreferenceTokenizerView,
 ) !DpoPreferenceSamplesOwned {
     const raw = try readFileMax(allocator, io, path, 256 * 1024 * 1024);
     defer allocator.free(raw);
@@ -11786,7 +12169,7 @@ fn loadDpoTextPreferenceSamples(
 
     const samples = try arena_alloc.alloc(preference_harness.PreferenceSample, rows.items.len);
     for (rows.items, 0..) |row, idx| {
-        const tokenized = try tokenizeDpoTextRow(arena_alloc, policy_model, recipe, row);
+        const tokenized = try tokenizeDpoTextRow(arena_alloc, tokenizer_view, recipe, row);
         samples[idx] = .{
             .prompt_tokens = tokenized.prompt_tokens,
             .chosen_tokens = tokenized.chosen_tokens,
@@ -11808,15 +12191,15 @@ const TokenizedPreferenceRow = struct {
 
 fn tokenizeDpoTextRow(
     allocator: std.mem.Allocator,
-    model: *model_manager_mod.LoadedModel,
+    tokenizer_view: PreferenceTokenizerView,
     recipe: Recipe,
     row: DpoTextRow,
 ) !TokenizedPreferenceRow {
-    const tokenizer = model.getTokenizer();
+    const tokenizer = tokenizer_view.tokenizer;
     const max_seq_len = recipe.dataset.max_seq_len orelse 2048;
     const render_prompt = !std.mem.eql(u8, recipe.dataset.format orelse "text-preference", "rendered-text-preference");
     const prompt_text = if (render_prompt)
-        try renderDpoPrompt(allocator, model, row.prompt)
+        try tokenizer_view.renderPrompt(allocator, row.prompt)
     else
         try allocator.dupe(u8, row.prompt);
     defer allocator.free(prompt_text);
@@ -11826,8 +12209,8 @@ fn tokenizeDpoTextRow(
         allocator,
         prompt_text,
         max_seq_len,
-        model.manifest.add_bos_token,
-        model.manifest.bos_token,
+        tokenizer_view.add_bos_token,
+        tokenizer_view.bos_token,
     );
     defer prompt_encoded.deinit();
 
@@ -11847,14 +12230,6 @@ fn tokenizeDpoTextRow(
         .chosen_tokens = chosen_tokens,
         .rejected_tokens = rejected_tokens,
     };
-}
-
-fn renderDpoPrompt(allocator: std.mem.Allocator, model: *model_manager_mod.LoadedModel, prompt: []const u8) ![]u8 {
-    const messages = [_]generation.Message{
-        .{ .role = "user", .content = prompt },
-    };
-    if (model.chat_tmpl) |tmpl| return tmpl.apply(allocator, &messages, true);
-    return generation.formatMessages(allocator, &messages);
 }
 
 fn tokenizeCompletion(
@@ -12196,6 +12571,21 @@ test "gemma4 preference baseline-relative gates require strict heldout improveme
     dpo_final.accuracy = 0.5;
     try std.testing.expect(!compareDpoToBaseline(dpo_baseline, dpo_final, dpo_minimums).passed);
 
+    var saturated_dpo_baseline = dpo_baseline;
+    saturated_dpo_baseline.accuracy = 1.0;
+    saturated_dpo_baseline.loss = 0.0;
+    var saturated_dpo_final = saturated_dpo_baseline;
+    saturated_dpo_final.report_path = "saturated-final";
+    saturated_dpo_final.mean_reward_margin = 0.1;
+    const saturated_dpo = compareDpoToBaseline(saturated_dpo_baseline, saturated_dpo_final, dpo_minimums);
+    try std.testing.expect(saturated_dpo.passed);
+    try std.testing.expect(saturated_dpo.accuracy_requirement_saturated);
+    try std.testing.expectEqual(@as(f32, 0.0), saturated_dpo.accuracy_required_improvement);
+    try std.testing.expect(saturated_dpo.loss_requirement_saturated);
+    try std.testing.expectEqual(@as(f32, 0.0), saturated_dpo.loss_required_improvement);
+    saturated_dpo_final.accuracy = 0.99;
+    try std.testing.expect(!compareDpoToBaseline(saturated_dpo_baseline, saturated_dpo_final, dpo_minimums).passed);
+
     const grpo_baseline = GrpoEvaluationSummary{
         .report_path = "baseline",
         .groups = 64,
@@ -12225,6 +12615,18 @@ test "gemma4 preference baseline-relative gates require strict heldout improveme
     try std.testing.expect(compareGrpoToBaseline(grpo_baseline, grpo_final, grpo_minimums).passed);
     grpo_final.top_rank_mean_reward = 0.1;
     try std.testing.expect(!compareGrpoToBaseline(grpo_baseline, grpo_final, grpo_minimums).passed);
+
+    var saturated_grpo_baseline = grpo_baseline;
+    saturated_grpo_baseline.positive_reward_group_rate = 1.0;
+    var saturated_grpo_final = grpo_final;
+    saturated_grpo_final.top_rank_mean_reward = 0.25;
+    saturated_grpo_final.positive_reward_group_rate = 1.0;
+    const saturated_grpo = compareGrpoToBaseline(saturated_grpo_baseline, saturated_grpo_final, grpo_minimums);
+    try std.testing.expect(saturated_grpo.passed);
+    try std.testing.expect(saturated_grpo.positive_reward_group_rate_requirement_saturated);
+    try std.testing.expectEqual(@as(f32, 0.0), saturated_grpo.positive_reward_group_rate_required_improvement);
+    saturated_grpo_final.positive_reward_group_rate = 0.99;
+    try std.testing.expect(!compareGrpoToBaseline(saturated_grpo_baseline, saturated_grpo_final, grpo_minimums).passed);
 }
 
 test "compiled DPO loss inversion recovers reward margin" {
@@ -12612,7 +13014,13 @@ fn runDirectGrpo(allocator: std.mem.Allocator, io: std.Io, recipe: Recipe, repor
     else
         try model_manager.loadFromDir(reference_path);
 
-    var prompt_batch = try loadGrpoTextPrompts(allocator, io, path, recipe, policy_model);
+    var prompt_batch = try loadGrpoTextPrompts(
+        allocator,
+        io,
+        path,
+        recipe,
+        PreferenceTokenizerView.fromLoadedModel(policy_model),
+    );
     defer prompt_batch.deinit();
 
     const reward_mode = try parseTextRewardMode(recipe.grpo.reward_mode orelse "exact-match");
@@ -12722,7 +13130,7 @@ fn loadGrpoTextPrompts(
     io: std.Io,
     path: []const u8,
     recipe: Recipe,
-    policy_model: *model_manager_mod.LoadedModel,
+    tokenizer_view: PreferenceTokenizerView,
 ) !GrpoPromptBatchOwned {
     const raw = try readFileMax(allocator, io, path, 256 * 1024 * 1024);
     defer allocator.free(raw);
@@ -12748,7 +13156,7 @@ fn loadGrpoTextPrompts(
     const prompt_texts = try aa.alloc([]const u8, rows.items.len);
     const targets = try aa.alloc([]const u8, rows.items.len);
     for (rows.items, 0..) |row, idx| {
-        const tokenized_prompt = try tokenizeGrpoPrompt(aa, policy_model, recipe, row.prompt);
+        const tokenized_prompt = try tokenizeGrpoPrompt(aa, tokenizer_view, recipe, row.prompt);
         prompts[idx] = tokenized_prompt;
         prompt_texts[idx] = try aa.dupe(u8, row.prompt);
         // parseFromSliceLeaky may borrow string storage from `raw`, which is
@@ -12842,18 +13250,18 @@ fn loadGemmaGrpoPreparedPrompts(
 
 fn tokenizeGrpoPrompt(
     allocator: std.mem.Allocator,
-    model: *model_manager_mod.LoadedModel,
+    tokenizer_view: PreferenceTokenizerView,
     recipe: Recipe,
     prompt: []const u8,
 ) ![]const i32 {
-    const tokenizer = model.getTokenizer();
+    const tokenizer = tokenizer_view.tokenizer;
     const max_seq_len = recipe.dataset.max_seq_len orelse 128;
     const max_completion_tokens = recipe.grpo.max_completion_tokens orelse 4;
     if (max_completion_tokens == 0 or max_completion_tokens >= max_seq_len) return error.NoCompletionBudget;
     const prompt_max_seq_len = max_seq_len - max_completion_tokens;
     const render_prompt = !std.mem.eql(u8, recipe.dataset.format orelse "text-grpo", "rendered-text-grpo");
     const prompt_text = if (render_prompt)
-        try renderDpoPrompt(allocator, model, prompt)
+        try tokenizer_view.renderPrompt(allocator, prompt)
     else
         try allocator.dupe(u8, prompt);
     defer allocator.free(prompt_text);
@@ -12863,8 +13271,8 @@ fn tokenizeGrpoPrompt(
         allocator,
         prompt_text,
         prompt_max_seq_len,
-        model.manifest.add_bos_token,
-        model.manifest.bos_token,
+        tokenizer_view.add_bos_token,
+        tokenizer_view.bos_token,
     );
     defer encoded.deinit();
     const prompt_len = countAttentionMask(encoded.attention_mask);
@@ -13045,6 +13453,33 @@ test "gemma4 recipe loading rejects unknown fields" {
     try std.testing.expectError(error.UnknownField, loadRecipe(allocator, std.testing.io, path));
 }
 
+test "gemma4 preference tokenizer loads without constructing decoder weights" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+    try writeOwnedTextFile(allocator, std.testing.io, try std.fs.path.join(allocator, &.{ model_dir, "config.json" }),
+        \\{"model_type":"gemma4_text","hidden_size":32,"num_hidden_layers":1,"num_attention_heads":4,"num_key_value_heads":2,"attention_head_dim":8,"intermediate_size":64,"vocab_size":13}
+    );
+    try writeOwnedSyntheticPreferenceTokenizerArtifact(allocator, std.testing.io, model_dir, "tokenizer.json");
+    try writeOwnedSyntheticPreferenceTokenizerArtifact(allocator, std.testing.io, model_dir, "tokenizer_config.json");
+    try writeOwnedTextFile(allocator, std.testing.io, try std.fs.path.join(allocator, &.{ model_dir, "special_tokens_map.json" }),
+        \\{"bos_token":"<bos>","eos_token":"<eos>","pad_token":"<pad>"}
+    );
+
+    // Deliberately omit model.safetensors: this loader is the preference
+    // trainer's tokenizer-only path and must not instantiate a decoder.
+    var tokenizer_assets = try OwnedPreferenceTokenizer.init(allocator, model_dir);
+    defer tokenizer_assets.deinit();
+    const view = tokenizer_assets.view();
+    try std.testing.expectEqual(@as(usize, 13), view.tokenizer.vocabSize());
+    const rendered = try view.renderPrompt(allocator, "answer yes");
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "answer yes") != null);
+}
+
 test "gemma4 DPO benchmark recorder enforces and summarizes the fixed protocol" {
     var recorder = try DpoBenchmarkRecorder.init(std.testing.allocator);
     defer recorder.deinit();
@@ -13146,6 +13581,21 @@ test "gemma4 GRPO reference cache uses exact keys and bounded eviction" {
     try std.testing.expectEqual(@as(usize, 2), telemetry.entries);
     try std.testing.expectEqual(@as(usize, 1), telemetry.hits);
     try std.testing.expectEqual(@as(usize, 2), telemetry.misses);
+
+    var restored = GemmaGrpoReferenceCache.init(std.testing.allocator, 2);
+    defer restored.deinit();
+    try restored.restoreCheckpoint(cache.checkpoint(), 2);
+    try std.testing.expectEqualDeep(telemetry, restored.telemetry());
+    var restored_output: [1]f32 = undefined;
+    try std.testing.expect(try restored.lookup(1, &.{13}, &restored_output));
+    try std.testing.expectEqualSlices(f32, &.{-0.4}, &restored_output);
+
+    var wrong_capacity = GemmaGrpoReferenceCache.init(std.testing.allocator, 1);
+    defer wrong_capacity.deinit();
+    try std.testing.expectError(
+        error.InvalidPreferenceCheckpointState,
+        wrong_capacity.restoreCheckpoint(cache.checkpoint(), 2),
+    );
 }
 
 test "family inference keeps qwen3_5 and colqwen distinct from qwen2" {
@@ -14043,11 +14493,23 @@ test "gemma4 full sft fails closed while dpo and grpo build runnable plans" {
     dpo.execution.mode = "train";
     dpo.dataset.format = "text-preference";
     dpo.dataset.eval_path = "/data/eval-preferences.jsonl";
-    dpo.eval = .{ .dpo_minimums = .{ .accuracy = 0.5, .max_loss = 2.0 } };
+    dpo.eval = .{ .dpo_minimums = .{
+        .accuracy = 0.5,
+        .max_loss = 2.0,
+        .min_accuracy_improvement = 0.01,
+        .min_reward_margin_improvement = 0.01,
+        .min_loss_improvement = 0.01,
+    } };
     dpo.adapter = .{ .rank = 8, .alpha = 16 };
     const dpo_plan = try buildPlan(std.heap.page_allocator, dpo);
     defer freePlan(std.heap.page_allocator, dpo_plan);
     try std.testing.expectEqual(StepKind.direct_dpo, dpo_plan.steps[0].kind);
+    var incomplete_dpo = dpo;
+    incomplete_dpo.eval.?.dpo_minimums.?.min_loss_improvement = null;
+    try std.testing.expectError(
+        error.IncompleteDpoBaselineRelativeMinimums,
+        buildPlan(std.heap.page_allocator, incomplete_dpo),
+    );
 
     var grpo_recipe = base;
     grpo_recipe.recipe = "grpo";
@@ -14059,11 +14521,20 @@ test "gemma4 full sft fails closed while dpo and grpo build runnable plans" {
         .top_rank_mean_reward = 0.25,
         .positive_reward_group_rate = 0.25,
         .max_kl_loss = 1.0,
+        .min_mean_reward_improvement = 0.01,
+        .min_top_rank_mean_reward_improvement = 0.01,
+        .min_positive_reward_group_rate_improvement = 0.01,
     } };
     grpo_recipe.adapter = .{ .rank = 8, .alpha = 16 };
     const grpo_plan = try buildPlan(std.heap.page_allocator, grpo_recipe);
     defer freePlan(std.heap.page_allocator, grpo_plan);
     try std.testing.expectEqual(StepKind.direct_grpo, grpo_plan.steps[0].kind);
+    var incomplete_grpo = grpo_recipe;
+    incomplete_grpo.eval.?.grpo_minimums.?.min_top_rank_mean_reward_improvement = null;
+    try std.testing.expectError(
+        error.IncompleteGrpoBaselineRelativeMinimums,
+        buildPlan(std.heap.page_allocator, incomplete_grpo),
+    );
 }
 
 test "gemma4 preference recipes require explicit execution intent and dataset format" {

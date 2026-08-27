@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import qualify_gemma4_preference_quality_campaign as campaign
 
@@ -42,6 +44,20 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
             campaign._probability(1.01, "rate")
         with self.assertRaisesRegex(campaign.ContractError, "non-negative"):
             campaign._nonnegative(-0.01, "loss")
+
+    def test_bounded_improvement_requirements_preserve_saturated_metrics(self) -> None:
+        self.assertEqual(
+            (0.0, True),
+            campaign._bounded_increase_requirement(1.0, 1e-6, 1.0),
+        )
+        self.assertEqual(
+            (1e-6, False),
+            campaign._bounded_increase_requirement(0.75, 1e-6, 1.0),
+        )
+        self.assertEqual(
+            (0.0, True),
+            campaign._bounded_decrease_requirement(0.0, 1e-6, 0.0),
+        )
 
     def test_variant_binds_horizon_order_and_direct_gguf_admission(self) -> None:
         base = {
@@ -101,6 +117,54 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
         self.assertEqual(variant["dataset"]["path"], "/seeded.jsonl")
         self.assertEqual(variant["dataset"]["train_path"], "/seeded.jsonl")
 
+    def test_compiled_sampling_cli_forces_incremental_runtime_out_of_variants(self) -> None:
+        args = campaign.parse_args(
+            [
+                "--binary",
+                "/antfly",
+                "--recipe",
+                "/recipe.json",
+                "--output-dir",
+                "/out",
+                "--compiled-sampling",
+            ]
+        )
+        self.assertTrue(args.compiled_sampling)
+        base = {
+            "recipe": "grpo",
+            "model": {"path": "/model", "family": "gemma4"},
+            "adapter": {"path": "/template-adapter"},
+            "dataset": {"path": "/train.jsonl", "eval_path": "/eval.jsonl"},
+            "optimizer": {"epochs": 2},
+            "runtime": {
+                "grpo_incremental_kv": True,
+                "grpo_incremental_kv_batch_active": True,
+                "grpo_incremental_kv_clone_prompt_tail": True,
+                "grpo_incremental_kv_shadow_exact": True,
+            },
+        }
+        campaign.resume_qualifier._apply_compiled_sampling_recipe_contract(
+            base, "grpo", True
+        )
+        variant = campaign._variant(
+            base,
+            "grpo",
+            17,
+            Path("/adapter-17"),
+            Path("/seeded.jsonl"),
+            Path("/run"),
+            8,
+            None,
+            False,
+        )
+        self.assertFalse(variant["runtime"]["grpo_incremental_kv"])
+        for field in (
+            "grpo_incremental_kv_batch_active",
+            "grpo_incremental_kv_clone_prompt_tail",
+            "grpo_incremental_kv_shadow_exact",
+        ):
+            self.assertNotIn(field, variant["runtime"])
+
     def test_template_adapter_bootstrap_spec_is_strict_and_peft_compatible(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             adapter = Path(temporary)
@@ -128,6 +192,61 @@ class PreferenceQualityCampaignTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(campaign.ContractError, "standard LoRA"):
                 campaign._adapter_bootstrap_spec(adapter)
+
+    def test_seed_bootstrap_accepts_v3_manifest_through_shared_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            adapter = root / "adapter-seed-17"
+            target_modules = ["model.layers.0.self_attn.q_proj"]
+            payload = b"seeded-adapter"
+
+            def fake_run(command, _env, _log_root, _timeout):
+                self.assertEqual(command[command.index("--initialization-seed") + 1], "17")
+                adapter.mkdir()
+                (adapter / "adapter_model.safetensors").write_bytes(payload)
+                (adapter / "adapter_config.json").write_text(
+                    json.dumps(
+                        {
+                            "r": 8,
+                            "lora_alpha": 16.0,
+                            "target_modules": target_modules,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (adapter / "antfly_finetune_manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "antfly_gemma4_finetune/v3",
+                            "status": "complete",
+                            "adapter_checkpoint_sha256": hashlib.sha256(
+                                payload
+                            ).hexdigest(),
+                            "adapter_checkpoint_size_bytes": len(payload),
+                            "initialization_seed": 17,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return {"command": command, "returncode": 0}
+
+            with mock.patch.object(campaign, "_run", side_effect=fake_run):
+                evidence = campaign._bootstrap_seed_adapter(
+                    Path("/fake/antfly"),
+                    Path("/model"),
+                    {"rank": 8, "alpha": 16.0, "target_modules": target_modules},
+                    17,
+                    adapter,
+                    {},
+                    root / "bootstrap-seed-17",
+                    1.0,
+                )
+
+            self.assertEqual(evidence["initialization_seed"], 17)
+            self.assertEqual(
+                evidence["adapter_model_sha256"],
+                "sha256:" + hashlib.sha256(payload).hexdigest(),
+            )
 
     def test_dataset_path_uses_runtime_precedence_and_rejects_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

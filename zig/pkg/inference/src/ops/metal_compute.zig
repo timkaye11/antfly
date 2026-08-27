@@ -294,6 +294,31 @@ fn enableActiveCompressedQuantBlock() bool {
         !getenvBool("TERMITE_METAL_DISABLE_ACTIVE_COMPRESSED_Q80_BLOCK");
 }
 
+fn shouldRouteGatedDecoderBlockToF32Kv(
+    has_ple: bool,
+    has_compressed_key_format: bool,
+    compressed_block_slots_supported: bool,
+    frame_active: bool,
+    active_compressed_block_enabled: bool,
+) bool {
+    // The compressed monolithic block is valid only when every downstream
+    // projection has a supported quantized slot. Dense BF16/F16/F32 models,
+    // mixed-slot models, and PLE requests use the paged device block instead.
+    return has_ple or
+        !has_compressed_key_format or
+        !compressed_block_slots_supported or
+        (frame_active and !active_compressed_block_enabled);
+}
+
+test "gemma4 metal_compute: dense and PLE paged decode route around quantized block" {
+    try std.testing.expect(shouldRouteGatedDecoderBlockToF32Kv(false, true, false, true, true));
+    try std.testing.expect(shouldRouteGatedDecoderBlockToF32Kv(true, true, true, true, true));
+    try std.testing.expect(shouldRouteGatedDecoderBlockToF32Kv(false, false, false, true, true));
+    try std.testing.expect(shouldRouteGatedDecoderBlockToF32Kv(false, true, true, true, false));
+    try std.testing.expect(!shouldRouteGatedDecoderBlockToF32Kv(false, true, true, true, true));
+    try std.testing.expect(!shouldRouteGatedDecoderBlockToF32Kv(false, true, true, false, true));
+}
+
 fn disableActivePagedGatedBlockDebug() bool {
     return getenvBool("TERMITE_METAL_DISABLE_ACTIVE_PAGED_GATED_BLOCK");
 }
@@ -18162,6 +18187,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .max_inflight_tokens = kv.max_inflight_tokens,
             .allow_swa_ring = kv.allow_swa_ring,
         };
+        if (getenvBool("TERMITE_METAL_TRACE_KV_GATHER")) std.debug.print(
+            "metal-paged-kv-suffix-attempt: seq={d} layer={d} total={d} suffix={d} sliding={d} max_inflight={d} allow_ring={} k_bytes={d} v_bytes={d}\n",
+            .{ write.sequence_id, write.layer_index, write.total_token_count, write.suffix_token_count, write.sliding_window, write.max_inflight_tokens, write.allow_swa_ring, k_tensor.deviceByteLen(), v_tensor.deviceByteLen() },
+        );
         storage.writeLayerKvSuffixDevice(
             write,
             .{
@@ -18178,7 +18207,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             error.DeviceWriteUnsupported,
             error.DeviceWriteFormatUnsupported,
             error.DeviceWriteFallback,
-            => return false,
+            => {
+                if (getenvBool("TERMITE_METAL_TRACE_KV_GATHER")) std.debug.print(
+                    "metal-paged-kv-suffix-fallback: seq={d} layer={d} error={s}\n",
+                    .{ write.sequence_id, write.layer_index, @errorName(err) },
+                );
+                return false;
+            },
             else => return err,
         };
         return true;
@@ -18199,6 +18234,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var prefix_attention = attention;
         prefix_attention.kv_sequence_len = prior_tokens;
         prefix_attention.query_sequence_len = prior_tokens;
+        // Ring-backed SWA KV is deliberately not representable as one
+        // contiguous device span. A paged view is sufficient proof that the
+        // committed prefix is already resident, and avoids forcing the ring
+        // through the forbidden contiguous-gather fallback.
+        if (try pagedKvLayerFromDeviceHook(prefix_attention, num_kv_heads, head_dim)) |_| {
+            return true;
+        }
         if (try gatherFullKvFromDeviceHook(prefix_attention, num_kv_heads, head_dim)) |prefix| {
             var owned_prefix = prefix;
             owned_prefix.deinit();
@@ -19713,9 +19755,36 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return self.ctFromOwnedMetalTensor(tensor);
         }
         const format_opt = directAttentionSpanFormat(&source.kv_storage, request.num_kv_heads, request.head_dim);
-        if (frame_active and format_opt != null and !enableActiveCompressedQuantBlock()) {
+        const active_compressed_block_enabled = enableActiveCompressedQuantBlock();
+        const compressed_block_slots_supported = format_opt != null and
+            metal_runtime.supportsDirectPagedGatedDecoderBlockSlots(self.provider_impl, .{
+                .layer_index = attention.layer_index,
+                .num_heads = request.num_heads,
+                .head_dim = request.head_dim,
+                .hidden_size = request.hidden_size,
+                .intermediate_size = request.intermediate_size,
+                .attention_linear_slot = request.attention_linear_slot,
+                .gate_ffn_linear_slot = request.gate_ffn_linear_slot,
+                .up_ffn_linear_slot = request.up_ffn_linear_slot,
+                .down_ffn_linear_slot = request.down_ffn_linear_slot,
+                .has_ple = request.ple != null,
+                .ple_gate_linear_slot = request.ple_gate_linear_slot,
+                .ple_proj_linear_slot = request.ple_proj_linear_slot,
+                .ple_post_norm_slot = request.ple_post_norm_slot,
+                .ple_hidden_size = request.ple_hidden_size,
+            });
+        const active_frame_f32_reroute = frame_active and format_opt != null and !active_compressed_block_enabled;
+        if (shouldRouteGatedDecoderBlockToF32Kv(
+            request.ple != null,
+            format_opt != null,
+            compressed_block_slots_supported,
+            frame_active,
+            active_compressed_block_enabled,
+        )) {
             self.timing_stats.f32_kv_gated_block_calls += 1;
-            self.timing_stats.compressed_block_active_frame_f32_reroutes += 1;
+            if (active_frame_f32_reroute) {
+                self.timing_stats.compressed_block_active_frame_f32_reroutes += 1;
+            }
             const tensor = (try self.runGatedDecoderBlockF32KvDevice(request, source)) orelse {
                 self.timing_stats.f32_kv_gated_block_nulls += 1;
                 return null;
@@ -19723,15 +19792,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.timing_stats.f32_kv_gated_block_successes += 1;
             return self.ctFromOwnedMetalTensor(tensor);
         }
-        const format = format_opt orelse {
-            self.timing_stats.f32_kv_gated_block_calls += 1;
-            const tensor = (try self.runGatedDecoderBlockF32KvDevice(request, source)) orelse {
-                self.timing_stats.f32_kv_gated_block_nulls += 1;
-                return null;
-            };
-            self.timing_stats.f32_kv_gated_block_successes += 1;
-            return self.ctFromOwnedMetalTensor(tensor);
-        };
+        const format = format_opt.?;
         if (request.ple != null) return null;
         if (metal_runtime.decoderRuntimeLinearSlotPrepared(self.provider_impl, request.attention_linear_slot, request.num_heads * request.head_dim, request.hidden_size) == false) return null;
         if (metal_runtime.decoderRuntimeLinearSlotPrepared(self.provider_impl, request.gate_ffn_linear_slot, request.hidden_size, request.intermediate_size) == false) return null;
@@ -20700,6 +20761,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const shape_i32 = try self.binaryResultShape(a_buf, b_buf);
         defer self.allocator.free(shape_i32);
         return denseBuf(self.allocator, output, true, shape_i32);
+    }
+
+    fn multiplyScalarOp(ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const input_buf = toBuf(input);
+        if (bufHasAnyQuantizedStorage(input_buf) or hasHostView(input_buf)) return null;
+        return self.applyDecodeQueryScaleDevice(input, scale);
     }
 
     fn geluOp(ctx: *anyopaque, input: CT) anyerror!CT {
@@ -24249,7 +24317,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .input = hidden,
                 .hidden_size = request.hidden_size,
                 .eps = request.norm_eps,
-            })) orelse return error.UnsupportedOperation;
+            })) orelse {
+                if (metalPrefillTraceRequested()) std.debug.print(
+                    "prefill-trace: metal-prefill-frame-execute unsupported=rms-norm layer={d} slot={d}\n",
+                    .{ layer_index, layer.attn_pre_norm_slot },
+                );
+                return error.UnsupportedOperation;
+            };
             defer freeOp(ctx, attn_normed);
             try self.maybeDumpDecodeStageCt("prefill-attn-norm", layer_index, attn_normed, request.hidden_size);
 
@@ -24314,7 +24388,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     .layer_end = layer_dispatch.window.layer_end,
                 },
                 .graph_plan_tail_vocab_size = request.vocab_size,
-            })) orelse return error.UnsupportedOperation;
+            })) orelse {
+                if (metalPrefillTraceRequested()) std.debug.print(
+                    "prefill-trace: metal-prefill-frame-execute unsupported=gated-block layer={d}\n",
+                    .{layer_index},
+                );
+                return error.UnsupportedOperation;
+            };
             if (owns_hidden) freeOp(ctx, prev_hidden);
             hidden = block_hidden;
             owns_hidden = true;
@@ -25367,7 +25447,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const weight = dense_weight orelse MetalTensor.borrowed((&dummy_weight_value)[0..1].ptr, 0, &dummy_weight_shape);
         var bias = try self.ownedMetalTensorFromCt(request.bias);
         defer bias.deinit();
-        return metal_runtime.decoderRuntimePrepareLinear(self.provider_impl, .{
+        const prepared = try metal_runtime.decoderRuntimePrepareLinear(self.provider_impl, .{
             .weight = weight,
             .bias = bias,
             .quantized_storage = runtime_quantized_storage,
@@ -25384,7 +25464,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .dense_f16_bytes = dense_f16_bytes,
             .dense_bf16_bytes = dense_bf16_bytes,
             .dense_bf16_no_copy_safe = dense_bf16_no_copy_safe,
+            .dense_bf16_mmap_source_bytes = weight_buf.native_dense_mmap_source_bytes,
         }, &self.timing_stats);
+        if (prepared and
+            (dense_f16_bytes != null or dense_bf16_bytes != null) and
+            !weight_buf.native_dense_bytes_owned and
+            weight_buf.native_dense_mmap_source_bytes != null and
+            !metal_runtime.decoderRuntimeLinearSlotBorrowsDenseWeight(self.provider_impl, request.slot))
+        {
+            if (weight_buf.lazy_entry) |entry| {
+                if (self.data.tensor_store) |store| {
+                    // Private dense uploads synchronously wait for their blit
+                    // before returning. The mmap remains valid, so release its
+                    // clean source pages now and fault them back only if a
+                    // later CPU consumer genuinely needs this tensor.
+                    store.discardTensorFileCache(entry.tensor_ref.name);
+                }
+            }
+        }
+        return prepared;
     }
 
     fn decoderRuntimeLinearSlotPreparedOp(ctx: *anyopaque, slot: usize, in_dim: usize, out_dim: usize) bool {
@@ -26748,6 +26846,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.runGatedDecoderBlock = runGatedDecoderBlockOp;
         vt.add = addOp;
         vt.multiply = multiplyOp;
+        vt.multiplyScalar = multiplyScalarOp;
         vt.debugTimingSnapshot = debugTimingSnapshotOp;
         vt.directFamilyTimingSnapshot = directFamilyTimingSnapshotOp;
         vt.resetDebugTimingStats = resetDebugTimingStatsOp;
@@ -27814,6 +27913,107 @@ test "metal_compute: metal kv geometric growth preserves f32 pages inside and ou
     defer allocator.free(native_rows.v);
     try std.testing.expectEqualSlices(f32, native_rows.k, metal_rows.k);
     try std.testing.expectEqualSlices(f32, native_rows.v, metal_rows.v);
+}
+
+test "metal_compute: ring-backed paged decode accepts existing device prefix" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const num_kv_heads: usize = 2;
+    const head_dim: usize = 8;
+    const row_width = num_kv_heads * head_dim;
+    const prefix_tokens: usize = 21;
+    const total_tokens = prefix_tokens + 1;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    var storage = try runtime_root.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = .metal,
+        .dtype = .f32,
+        .page_size_tokens = 8,
+        .num_layers_packed = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+        .sliding_window_size = 32,
+        .store_cpu_bytes = false,
+    });
+    defer storage.deinit();
+    try metal_cb.provisionKvDeviceWriteHook(&storage);
+
+    const pool_id = storage.poolId();
+    const sequence_id = try storage.attachSequence(pool_id);
+    try storage.appendTokens(sequence_id, total_tokens);
+
+    var prefix_k: [prefix_tokens * row_width]f32 = undefined;
+    var prefix_v: [prefix_tokens * row_width]f32 = undefined;
+    for (&prefix_k, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 31)) - 15)) / 13.0;
+    for (&prefix_v, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 37)) - 18)) / 17.0;
+    const prefix_shape = [_]i32{ @intCast(prefix_tokens), @intCast(row_width) };
+    const prefix_k_host = try metal_cb.fromFloat32Shape(&prefix_k, &prefix_shape);
+    defer metal_cb.free(prefix_k_host);
+    const prefix_v_host = try metal_cb.fromFloat32Shape(&prefix_v, &prefix_shape);
+    defer metal_cb.free(prefix_v_host);
+    var prefix_k_device = try metal_compute.ownedDeviceMetalTensorFromCt(prefix_k_host);
+    defer prefix_k_device.deinit();
+    var prefix_v_device = try metal_compute.ownedDeviceMetalTensorFromCt(prefix_v_host);
+    defer prefix_v_device.deinit();
+
+    try storage.writeLayerKvSuffixDevice(
+        .{
+            .sequence_id = sequence_id,
+            .layer_index = 0,
+            .total_token_count = prefix_tokens,
+            .suffix_token_count = prefix_tokens,
+            .position_offset = 0,
+            .num_kv_heads = @intCast(num_kv_heads),
+            .head_dim = @intCast(head_dim),
+            .sliding_window = 32,
+            .max_inflight_tokens = 8,
+            .allow_swa_ring = true,
+        },
+        .{
+            .handle = prefix_k_device.deviceHandle() orelse return error.TestUnexpectedResult,
+            .byte_offset = prefix_k_device.deviceByteOffset(),
+            .byte_len = prefix_k_device.deviceByteLen(),
+        },
+        .{
+            .handle = prefix_v_device.deviceHandle() orelse return error.TestUnexpectedResult,
+            .byte_offset = prefix_v_device.deviceByteOffset(),
+            .byte_len = prefix_v_device.deviceByteLen(),
+        },
+    );
+
+    const table = storage.blockTable(sequence_id) orelse return error.TestUnexpectedResult;
+    const attention: ops.AttentionContext = .{
+        .mode = .paged_decode,
+        .total_sequence_len = total_tokens,
+        .query_sequence_len = 1,
+        .kv_sequence_len = total_tokens,
+        .sliding_window = 32,
+        .kv_cache = .{
+            .sequence_id = sequence_id,
+            .pool_id = pool_id,
+            .logical_block_count = table.len(),
+            .tail_tokens = table.tail_tokens,
+            .logical_blocks = table.blocks.items,
+            .kv_storage = &storage,
+        },
+        .kv_storage = &storage,
+        .layer_index = 0,
+    };
+
+    var prefix_attention = attention;
+    prefix_attention.query_sequence_len = prefix_tokens;
+    prefix_attention.kv_sequence_len = prefix_tokens;
+    const paged_prefix = (try MetalCompute.pagedKvLayerFromDeviceHook(prefix_attention, num_kv_heads, head_dim)) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(paged_prefix.ring_page_count > 0);
+    try std.testing.expect(try metal_compute.ensurePagedKvDevicePrefixFromBackendCache(attention, num_kv_heads, head_dim));
 }
 
 test "metal_compute: paged decode attention matches native on metal device f32 cache across pages" {
@@ -29743,6 +29943,39 @@ test "metal_compute: multiply keeps device scalar rhs broadcast resident" {
     const out_data = try metal_cb.toFloat32(out, allocator);
     defer allocator.free(out_data);
     try std.testing.expectEqualSlices(f32, &.{ 2, 4, 6, 8, 10, 12 }, out_data);
+}
+
+test "metal_compute: multiplyScalar keeps active-frame Gemma query resident" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const input_host = try metal_cb.fromFloat32Shape(&.{ 1, -2, 3, -4 }, &.{ 1, 4 });
+    defer metal_cb.free(input_host);
+    const input_mt = try metal_compute.ownedDeviceMetalTensorFromCt(input_host);
+    const input = try metal_compute.ctFromOwnedMetalTensor(input_mt);
+    defer metal_cb.free(input);
+
+    try std.testing.expect(try metal_cb.decoderRuntimeBeginFrame());
+    defer if (metal_cb.decoderRuntimeHasActiveFrame()) metal_cb.decoderRuntimeCancelFrame() catch {};
+    const out = (try metal_cb.multiplyScalar(input, 2.0)) orelse return error.TestUnexpectedResult;
+    defer metal_cb.free(out);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, out));
+
+    try metal_cb.decoderRuntimeSubmitAndWaitFrame();
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 4 }, out_shape);
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqualSlices(f32, &.{ 2, -4, 6, -8 }, out_data);
 }
 
 test "metal_compute: transpose moving singleton device axes is metadata-only" {

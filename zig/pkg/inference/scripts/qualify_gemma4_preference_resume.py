@@ -33,6 +33,8 @@ CHECKPOINT_SCHEMA_VERSION = 2
 CHECKPOINT_FIELD_COUNT = 18
 CHECKPOINT_FLOAT_COUNT = CHECKPOINT_FIELD_COUNT * 4
 STATE_SCHEMA_VERSION = "antfly_gemma4_preference_checkpoint_state/v1"
+ADAPTER_MANIFEST_SCHEMA_V2 = "antfly_gemma4_finetune/v2"
+ADAPTER_MANIFEST_SCHEMA_V3 = "antfly_gemma4_finetune/v3"
 CANONICAL_EVALUATION_POLICY = (
     "terminal-device-drained-host-weight-snapshot-fresh-backend-private-buffer-reuse-disabled"
 )
@@ -53,6 +55,13 @@ ENVIRONMENT_POLICY_PATH = (
     / "src"
     / "finetune"
     / "gemma4_preference_environment.policy"
+)
+COMPILED_GRPO_SAMPLING_ENV = "ANTFLY_GEMMA4_GRPO_COMPILED_SAMPLING"
+COMPILED_GRPO_SAMPLING_MODE = (
+    "compiled-shared-prompt-ranked-sparse-row-each-step"
+)
+COMPILED_GRPO_POLICY_LOGPROB_MODE = (
+    "compiled-token-selection-with-eager-per-completion-token-validated-logprob-rescore"
 )
 
 
@@ -172,6 +181,33 @@ def _strict_environment(
     return result
 
 
+def _apply_compiled_sampling_recipe_contract(
+    recipe: dict[str, Any], task: str, enabled: bool
+) -> None:
+    if not enabled:
+        return
+    if task != "grpo":
+        raise ContractError("--compiled-sampling is valid only for GRPO")
+    runtime_value = recipe.get("runtime")
+    runtime = (
+        dict(_mapping(runtime_value, "recipe.runtime"))
+        if runtime_value is not None
+        else {}
+    )
+    runtime["grpo_incremental_kv"] = False
+    # These fields are refinements of the parent incremental-KV switch.  The
+    # recipe contract rejects them when the parent is disabled even if their
+    # values are false, so compiled sampling must remove inherited refinements
+    # instead of merely turning them off.
+    for field in (
+        "grpo_incremental_kv_batch_active",
+        "grpo_incremental_kv_clone_prompt_tail",
+        "grpo_incremental_kv_shadow_exact",
+    ):
+        runtime.pop(field, None)
+    recipe["runtime"] = runtime
+
+
 METAL_NUMERICAL_POLICY_BOOLEAN_FIELDS = (
     "fused_rms_norm_backward",
     "fused_gqa_attention_backward",
@@ -230,6 +266,7 @@ METAL_NUMERICAL_POLICY_BOOLEAN_FIELDS = (
     "add3_fusion",
 )
 ADAPTER_MANIFEST_IDENTITY_FIELDS = (
+    "schema_version",
     "artifact_family_version",
     "tensor_key_format",
     "base_model_name_or_path",
@@ -243,6 +280,7 @@ ADAPTER_MANIFEST_IDENTITY_FIELDS = (
     "use_dora",
     "use_rslora",
     "initializer",
+    "initialization_seed",
     "recursive_lora",
 )
 
@@ -415,11 +453,25 @@ def _adapter_tree_evidence(root: Path, where: str) -> dict[str, Any]:
         resolved / "antfly_finetune_manifest.json",
         f"{where} antfly_finetune_manifest.json",
     )
-    if (
-        manifest.get("schema_version") != "antfly_gemma4_finetune/v2"
-        or manifest.get("status") != "complete"
-    ):
-        raise ContractError(f"{where}: adapter manifest is not complete Gemma 4 v2")
+    schema_version = manifest.get("schema_version")
+    if schema_version not in {
+        ADAPTER_MANIFEST_SCHEMA_V2,
+        ADAPTER_MANIFEST_SCHEMA_V3,
+    }:
+        raise ContractError(f"{where}: unsupported Gemma 4 adapter manifest schema")
+    if manifest.get("status") != "complete":
+        raise ContractError(f"{where}: Gemma 4 adapter manifest is not complete")
+    initialization_seed = manifest.get("initialization_seed")
+    if schema_version == ADAPTER_MANIFEST_SCHEMA_V2:
+        if initialization_seed is not None:
+            raise ContractError(
+                f"{where}: Gemma 4 v2 adapter manifest must not carry an initialization seed"
+            )
+    else:
+        _integer(
+            initialization_seed,
+            f"{where} adapter manifest.initialization_seed",
+        )
     checkpoint = files["adapter_model.safetensors"]
     if manifest.get("adapter_checkpoint_sha256") != checkpoint["sha256"].removeprefix(
         "sha256:"
@@ -1038,6 +1090,7 @@ def _validate_outputs(
     task: str,
     checkpoint_path: Path,
     expected_resume_epoch: int,
+    compiled_sampling: bool = False,
 ) -> dict[str, Any]:
     uninterrupted = _load_json(uninterrupted_root / f"{task}_report.json", "uninterrupted report")
     resumed = _load_json(resumed_root / f"{task}_report.json", "resumed report")
@@ -1066,6 +1119,31 @@ def _validate_outputs(
         raise ContractError("resumed report has the wrong durable checkpoint epoch")
     if fingerprint != checkpoint["run_fingerprint_sha256"]:
         raise ContractError("resumed report and checkpoint fingerprints differ")
+    uninterrupted_cache_retired = uninterrupted_resume.get(
+        "compiled_sampling_execution_cache_retired", False
+    )
+    resumed_cache_retired = resumed_resume.get(
+        "compiled_sampling_execution_cache_retired", False
+    )
+    if not isinstance(uninterrupted_cache_retired, bool) or not isinstance(
+        resumed_cache_retired, bool
+    ):
+        raise ContractError(
+            "compiled-sampling execution-cache retirement attestation must be boolean"
+        )
+    if compiled_sampling:
+        if not uninterrupted_cache_retired:
+            raise ContractError(
+                "uninterrupted compiled sampling did not retire its checkpoint cache"
+            )
+        if not resumed_cache_retired:
+            raise ContractError(
+                "resumed compiled sampling did not retire its bootstrap cache"
+            )
+    elif uninterrupted_cache_retired or resumed_cache_retired:
+        raise ContractError(
+            "non-compiled qualification unexpectedly retired a compiled-sampling cache"
+        )
     expected = _semantic_report_view(uninterrupted, task)
     actual = _semantic_report_view(resumed, task)
     terminal_metal_float_comparison = _compare_semantic_reports(expected, actual, task)
@@ -1108,6 +1186,10 @@ def _validate_outputs(
         "terminal_evaluation_artifact_float_comparison": (
             terminal_evaluation_artifact_float_comparison
         ),
+        "compiled_sampling_execution_cache_retirement": {
+            "uninterrupted": uninterrupted_cache_retired,
+            "resumed": resumed_cache_retired,
+        },
         "verified_artifacts": {
             "uninterrupted": uninterrupted_artifacts["evidence"],
             "resumed": resumed_artifacts["evidence"],
@@ -1134,6 +1216,13 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
         raise ContractError("interrupt epoch must be between 1 and epochs-1")
     if args.timeout_seconds <= 0 or args.poll_seconds <= 0:
         raise ContractError("timeouts must be positive")
+    compiled_sampling = bool(getattr(args, "compiled_sampling", False))
+    if compiled_sampling and task != "grpo":
+        raise ContractError("--compiled-sampling is valid only for GRPO")
+    if compiled_sampling and args.incremental_kv:
+        raise ContractError(
+            "compiled GRPO sampling conflicts with incremental-KV qualification"
+        )
 
     model_config = dict(_mapping(base_recipe.get("model"), "recipe.model"))
     model_value = model_config.get("path")
@@ -1161,6 +1250,10 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             "direct GGUF GRPO plus incremental KV is not qualified; "
             "use canonical direct-GGUF GRPO or incremental-KV GRPO with safetensors"
         )
+    if direct_gguf_training and compiled_sampling:
+        raise ContractError(
+            "compiled GRPO sampling is not qualified for direct GGUF training"
+        )
     if direct_gguf_training:
         model_config["allow_direct_gguf_training"] = True
     base_recipe["model"] = model_config
@@ -1177,6 +1270,9 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             }
         )
         base_recipe["runtime"] = runtime
+    _apply_compiled_sampling_recipe_contract(
+        base_recipe, task, compiled_sampling
+    )
     adapter_config = dict(_mapping(base_recipe.get("adapter"), "recipe.adapter"))
     adapter_value = adapter_config.get("path")
     if not isinstance(adapter_value, str):
@@ -1282,6 +1378,9 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
     input_evidence["adapter"]["files"] = seed_adapter_evidence["files"]
     env = _strict_environment()
     effective_contract_env = dict(STRICT_METAL_ENV)
+    if compiled_sampling:
+        env[COMPILED_GRPO_SAMPLING_ENV] = "1"
+        effective_contract_env[COMPILED_GRPO_SAMPLING_ENV] = "1"
     if args.experimental_gguf_qlora:
         env["ANTFLY_EXPERIMENTAL_GEMMA4_GGUF_QLORA"] = "1"
         effective_contract_env["ANTFLY_EXPERIMENTAL_GEMMA4_GGUF_QLORA"] = "1"
@@ -1332,8 +1431,36 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
         task,
         interrupted_checkpoint,
         args.interrupt_after_epoch,
+        compiled_sampling,
     )
     parity.update(exact_checkpoint_parity)
+    if compiled_sampling:
+        semantic_report = _mapping(
+            parity.get("semantic_report"), "parity.semantic_report"
+        )
+        if semantic_report.get("sampling_mode") != COMPILED_GRPO_SAMPLING_MODE:
+            raise ContractError(
+                "compiled-sampling qualification did not execute the compiled GRPO sampling mode"
+            )
+        if semantic_report.get("policy_logprob_mode") != COMPILED_GRPO_POLICY_LOGPROB_MODE:
+            raise ContractError(
+                "compiled-sampling qualification did not use canonical eager policy log-probs"
+            )
+        if _integer(
+            semantic_report.get("policy_rescore_completions"),
+            "parity.semantic_report.policy_rescore_completions",
+        ) != _integer(
+            semantic_report.get("completions"),
+            "parity.semantic_report.completions",
+            1,
+        ):
+            raise ContractError(
+                "compiled-sampling qualification did not canonically rescore every completion"
+            )
+        if semantic_report.get("incremental_kv") is not None:
+            raise ContractError(
+                "compiled-sampling qualification unexpectedly emitted incremental-KV telemetry"
+            )
     report_training_seed = _integer(
         parity.get("semantic_report", {}).get("training_seed"),
         "parity.semantic_report.training_seed",
@@ -1412,6 +1539,7 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
             "incremental_kv_batch_active": args.incremental_kv and not args.incremental_kv_serial,
             "incremental_kv_clone_prompt_tail": args.incremental_kv_clone_prompt_tail,
             "incremental_kv_shadow_exact": args.incremental_kv_shadow_exact,
+            "compiled_sampling": compiled_sampling,
             "environment_policy_sha256": ENVIRONMENT_POLICY_SHA256,
             "strict_metal_environment": effective_contract_env,
             "sanitized_environment_prefixes": list(SANITIZED_ENV_PREFIXES),
@@ -1474,6 +1602,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--incremental-kv-shadow-exact",
         action="store_true",
         help="run the exact legacy sampler for the first group",
+    )
+    parser.add_argument(
+        "--compiled-sampling",
+        action="store_true",
+        help=(
+            "qualify the default-off compiled multi-token GRPO sampler; "
+            "incremental KV and direct GGUF are rejected"
+        ),
     )
     return parser.parse_args(argv)
 

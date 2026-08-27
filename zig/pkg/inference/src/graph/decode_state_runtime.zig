@@ -32,6 +32,18 @@ pub const DecodeStateRuntime = struct {
         };
     }
 
+    pub fn initPagedWithStorage(
+        allocator: std.mem.Allocator,
+        kv_manager: *runtime.kv.manager.KvManager,
+        kv_storage: *runtime.kv.storage_runtime.KvStorageRuntime,
+        pool_id: runtime.kv.block.KvPoolId,
+        shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
+    ) DecodeStateRuntime {
+        var result = initPaged(allocator, kv_manager, pool_id, shared_moe_cache);
+        result.state.kv_storage = kv_storage;
+        return result;
+    }
+
     pub fn deinit(self: *DecodeStateRuntime) void {
         self.state.deinit();
     }
@@ -124,7 +136,7 @@ test "decode state runtime paged prefill and decode step" {
     var manager = runtime.kv.manager.KvManager.init(allocator);
     defer manager.deinit();
 
-    const pool_id = try manager.addPool(.{
+    const pool_config: runtime.kv.pool.KvPoolConfig = .{
         .backend = .native,
         .dtype = .f16,
         .page_size_tokens = 16,
@@ -132,14 +144,19 @@ test "decode state runtime paged prefill and decode step" {
         .num_kv_heads = 2,
         .head_dim = 8,
         .sliding_window_size = null,
-    });
+    };
+    const pool_id = try manager.addPool(pool_config);
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, pool_config);
+    defer storage.deinit();
 
-    var ds = DecodeStateRuntime.initPaged(allocator, &manager, pool_id, null);
+    var ds = DecodeStateRuntime.initPagedWithStorage(allocator, &manager, &storage, pool_id, null);
     defer ds.deinit();
 
     const prefill_ctx = try ds.preparePrefill(4, 4, .paged_prefill);
     try std.testing.expectEqual(@as(usize, 4), ds.currentTokenCount());
     try std.testing.expectEqual(@as(usize, 4), prefill_ctx.kv_sequence_len);
+    try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), prefill_ctx.kv_storage);
+    try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), prefill_ctx.kv_cache.?.kv_storage);
 
     const step = try ds.beginDecodeStep(4, .paged_decode);
     try std.testing.expectEqual(@as(usize, 5), step.seq_len);

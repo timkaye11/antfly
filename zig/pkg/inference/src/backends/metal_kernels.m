@@ -1277,6 +1277,7 @@ typedef struct termite_metal_decode_runtime {
     size_t rms_norm_hidden_sizes[TERMITE_METAL_RMS_NORM_SLOT_CAPACITY];
     uint8_t rms_norm_slot_prepared[TERMITE_METAL_RMS_NORM_SLOT_CAPACITY];
     id<MTLBuffer> linear_weight_buffers[TERMITE_METAL_LINEAR_SLOT_CAPACITY];
+    size_t linear_weight_offsets[TERMITE_METAL_LINEAR_SLOT_CAPACITY];
     id<MTLBuffer> linear_weight_f16_mirror_buffers[TERMITE_METAL_LINEAR_SLOT_CAPACITY];
     id<MTLBuffer> linear_bias_buffers[TERMITE_METAL_LINEAR_SLOT_CAPACITY];
     MPSMatrixMultiplication *linear_mps_mm[TERMITE_METAL_LINEAR_SLOT_CAPACITY];
@@ -11632,6 +11633,9 @@ static int termite_metal_decode_runtime_ensure_dense_qkv_packed_weight(
         !termite_metal_size_mul(kv_out_dim, sizeof(float), &kv_bias_bytes) ||
         !termite_metal_size_mul(kv_bias_bytes, 2u, &twice_kv_bias_bytes) ||
         !termite_metal_size_add(q_bias_bytes, twice_kv_bias_bytes, &packed_bias_bytes)) return -1;
+    if (!termite_metal_buffer_range_valid(runtime->linear_weight_buffers[q_slot], runtime->linear_weight_offsets[q_slot], q_bytes) ||
+        !termite_metal_buffer_range_valid(runtime->linear_weight_buffers[k_slot], runtime->linear_weight_offsets[k_slot], kv_bytes) ||
+        !termite_metal_buffer_range_valid(runtime->linear_weight_buffers[v_slot], runtime->linear_weight_offsets[v_slot], kv_bytes)) return -1;
     if (runtime->dense_qkv_packed_weight_buffers[q_slot] != nil &&
         runtime->dense_qkv_packed_weight_buffers[q_slot].length >= packed_bytes &&
         runtime->dense_qkv_packed_bias_buffers[q_slot] != nil &&
@@ -11662,9 +11666,9 @@ static int termite_metal_decode_runtime_ensure_dense_qkv_packed_weight(
     if (packed == nil || packed_bias == nil) return -2;
     id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
     if (blit == nil) return -3;
-    [blit copyFromBuffer:runtime->linear_weight_buffers[q_slot] sourceOffset:0 toBuffer:packed destinationOffset:0 size:q_bytes];
-    [blit copyFromBuffer:runtime->linear_weight_buffers[k_slot] sourceOffset:0 toBuffer:packed destinationOffset:q_bytes size:kv_bytes];
-    [blit copyFromBuffer:runtime->linear_weight_buffers[v_slot] sourceOffset:0 toBuffer:packed destinationOffset:q_bytes + kv_bytes size:kv_bytes];
+    [blit copyFromBuffer:runtime->linear_weight_buffers[q_slot] sourceOffset:runtime->linear_weight_offsets[q_slot] toBuffer:packed destinationOffset:0 size:q_bytes];
+    [blit copyFromBuffer:runtime->linear_weight_buffers[k_slot] sourceOffset:runtime->linear_weight_offsets[k_slot] toBuffer:packed destinationOffset:q_bytes size:kv_bytes];
+    [blit copyFromBuffer:runtime->linear_weight_buffers[v_slot] sourceOffset:runtime->linear_weight_offsets[v_slot] toBuffer:packed destinationOffset:q_bytes + kv_bytes size:kv_bytes];
     [blit copyFromBuffer:runtime->linear_bias_buffers[q_slot] sourceOffset:0 toBuffer:packed_bias destinationOffset:0 size:q_bias_bytes];
     [blit copyFromBuffer:runtime->linear_bias_buffers[k_slot] sourceOffset:0 toBuffer:packed_bias destinationOffset:q_bias_bytes size:kv_bias_bytes];
     [blit copyFromBuffer:runtime->linear_bias_buffers[v_slot] sourceOffset:0 toBuffer:packed_bias destinationOffset:q_bias_bytes + kv_bias_bytes size:kv_bias_bytes];
@@ -11727,6 +11731,8 @@ static int termite_metal_decode_runtime_ensure_dense_pair_packed_weight(
     const size_t packed_bytes = projection_bytes * 2;
     const size_t bias_bytes = out_dim * sizeof(float);
     const size_t packed_bias_bytes = bias_bytes * 2;
+    if (!termite_metal_buffer_range_valid(runtime->linear_weight_buffers[a_slot], runtime->linear_weight_offsets[a_slot], projection_bytes) ||
+        !termite_metal_buffer_range_valid(runtime->linear_weight_buffers[b_slot], runtime->linear_weight_offsets[b_slot], projection_bytes)) return -1;
     if (runtime->dense_pair_packed_weight_buffers[a_slot] != nil &&
         runtime->dense_pair_packed_weight_buffers[a_slot].length >= packed_bytes &&
         runtime->dense_pair_packed_bias_buffers[a_slot] != nil &&
@@ -11742,8 +11748,8 @@ static int termite_metal_decode_runtime_ensure_dense_pair_packed_weight(
     if (packed == nil || packed_bias == nil) return -2;
     id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
     if (blit == nil) return -3;
-    [blit copyFromBuffer:runtime->linear_weight_buffers[a_slot] sourceOffset:0 toBuffer:packed destinationOffset:0 size:projection_bytes];
-    [blit copyFromBuffer:runtime->linear_weight_buffers[b_slot] sourceOffset:0 toBuffer:packed destinationOffset:projection_bytes size:projection_bytes];
+    [blit copyFromBuffer:runtime->linear_weight_buffers[a_slot] sourceOffset:runtime->linear_weight_offsets[a_slot] toBuffer:packed destinationOffset:0 size:projection_bytes];
+    [blit copyFromBuffer:runtime->linear_weight_buffers[b_slot] sourceOffset:runtime->linear_weight_offsets[b_slot] toBuffer:packed destinationOffset:projection_bytes size:projection_bytes];
     [blit copyFromBuffer:runtime->linear_bias_buffers[a_slot] sourceOffset:0 toBuffer:packed_bias destinationOffset:0 size:bias_bytes];
     [blit copyFromBuffer:runtime->linear_bias_buffers[b_slot] sourceOffset:0 toBuffer:packed_bias destinationOffset:bias_bytes size:bias_bytes];
     [blit endEncoding];
@@ -12106,6 +12112,7 @@ int termite_metal_decode_runtime_clear_linear_slot(termite_metal_decode_runtime 
     if (slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -2;
 
     runtime->linear_weight_buffers[slot] = nil;
+    runtime->linear_weight_offsets[slot] = 0;
     runtime->linear_weight_f16_mirror_buffers[slot] = nil;
     runtime->linear_bias_buffers[slot] = nil;
     runtime->linear_in_dims[slot] = 0;
@@ -22065,6 +22072,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     }
     for (size_t slot = 0; slot < TERMITE_METAL_LINEAR_SLOT_CAPACITY; ++slot) {
         runtime->linear_weight_buffers[slot] = nil;
+        runtime->linear_weight_offsets[slot] = 0;
         runtime->linear_weight_f16_mirror_buffers[slot] = nil;
         runtime->linear_bias_buffers[slot] = nil;
         runtime->linear_in_dims[slot] = 0;
@@ -26859,6 +26867,7 @@ int termite_metal_decode_runtime_prepare_linear(
         id<MTLBuffer> bias_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, bias, bias_bytes);
         if (weight_buffer == nil || bias_buffer == nil) return -4;
         runtime->linear_weight_buffers[slot] = weight_buffer;
+        runtime->linear_weight_offsets[slot] = 0;
         runtime->linear_weight_f16_mirror_buffers[slot] = nil;
         runtime->linear_bias_buffers[slot] = bias_buffer;
         runtime->linear_in_dims[slot] = in_dim;
@@ -26885,6 +26894,16 @@ int termite_metal_decode_runtime_prefer_linear_mps(
     runtime->linear_weight_dtypes[slot] = TERMITE_METAL_DENSE_LINEAR_DTYPE_F32_MPS;
     return 0;
 }
+
+uint32_t termite_metal_decode_runtime_linear_slot_dense_dtype(
+    termite_metal_decode_runtime *runtime,
+    size_t slot
+) {
+    if (runtime == NULL || slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return UINT32_MAX;
+    if (runtime->linear_slot_prepared[slot] == 0) return UINT32_MAX;
+    return runtime->linear_weight_dtypes[slot];
+}
+
 int termite_metal_decode_runtime_prepare_linear_f16(
     termite_metal_decode_runtime *runtime,
     size_t slot,
@@ -26907,6 +26926,7 @@ int termite_metal_decode_runtime_prepare_linear_f16(
         id<MTLBuffer> bias_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, bias, bias_bytes);
         if (weight_buffer == nil || bias_buffer == nil) return -5;
         runtime->linear_weight_buffers[slot] = weight_buffer;
+        runtime->linear_weight_offsets[slot] = 0;
         runtime->linear_weight_f16_mirror_buffers[slot] = nil;
         runtime->linear_bias_buffers[slot] = bias_buffer;
         runtime->linear_in_dims[slot] = in_dim;
@@ -26943,6 +26963,55 @@ int termite_metal_decode_runtime_prepare_linear_bf16(
         id<MTLBuffer> bias_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, bias, bias_bytes);
         if (weight_buffer == nil || bias_buffer == nil) return -5;
         runtime->linear_weight_buffers[slot] = weight_buffer;
+        runtime->linear_weight_offsets[slot] = 0;
+        runtime->linear_weight_f16_mirror_buffers[slot] = nil;
+        runtime->linear_bias_buffers[slot] = bias_buffer;
+        runtime->linear_in_dims[slot] = in_dim;
+        runtime->linear_out_dims[slot] = out_dim;
+        runtime->linear_slot_prepared[slot] = 1;
+        runtime->linear_weight_dtypes[slot] = TERMITE_METAL_DENSE_LINEAR_DTYPE_BF16;
+        runtime->linear_mps_mm[slot] = nil;
+        runtime->linear_mps_mm_rows[slot] = 0;
+        termite_metal_decode_runtime_invalidate_dense_qkv_pack_slot(runtime, slot);
+        termite_metal_decode_runtime_invalidate_q8_qkv_pack_slot(runtime, slot);
+        termite_metal_decode_runtime_invalidate_dense_pair_pack_slot(runtime, slot);
+        termite_metal_decode_runtime_clear_quant_linear_descriptor(runtime, slot);
+        return 0;
+    }
+}
+
+int termite_metal_decode_runtime_prepare_linear_bf16_no_copy_region(
+    termite_metal_decode_runtime *runtime,
+    size_t slot,
+    const uint8_t *mapped_raw,
+    size_t mapped_bytes,
+    size_t weight_offset,
+    size_t weight_bytes,
+    const float *bias,
+    size_t in_dim,
+    size_t out_dim
+) {
+    if (runtime == NULL || mapped_raw == NULL || bias == NULL) return -1;
+    if (runtime->device == nil || runtime->queue == nil || runtime->library == nil) return -2;
+    if (slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || in_dim == 0 || out_dim == 0) return -3;
+    size_t expected_weight_bytes = 0;
+    if (!termite_metal_size_mul3(in_dim, out_dim, sizeof(uint16_t), &expected_weight_bytes)) return -4;
+    if (weight_bytes < expected_weight_bytes) return -4;
+    if (weight_offset > mapped_bytes || expected_weight_bytes > mapped_bytes - weight_offset) return -5;
+    if (weight_offset % _Alignof(uint16_t) != 0) return -5;
+    if (!termite_metal_can_make_no_copy_buffer(mapped_raw, mapped_bytes)) return -5;
+    @autoreleasepool {
+        const size_t bias_bytes = out_dim * sizeof(float);
+        id<MTLBuffer> weight_buffer = [runtime->device
+            newBufferWithBytesNoCopy:(void *)mapped_raw
+                              length:mapped_bytes
+                             options:MTLResourceStorageModeShared
+                         deallocator:nil];
+        if (weight_buffer == nil) return -6;
+        id<MTLBuffer> bias_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, bias, bias_bytes);
+        if (bias_buffer == nil) return -7;
+        runtime->linear_weight_buffers[slot] = weight_buffer;
+        runtime->linear_weight_offsets[slot] = weight_offset;
         runtime->linear_weight_f16_mirror_buffers[slot] = nil;
         runtime->linear_bias_buffers[slot] = bias_buffer;
         runtime->linear_in_dims[slot] = in_dim;
@@ -26968,36 +27037,16 @@ int termite_metal_decode_runtime_prepare_linear_bf16_no_copy(
     size_t in_dim,
     size_t out_dim
 ) {
-    if (runtime == NULL || weight == NULL || bias == NULL) return -1;
-    if (runtime->device == nil || runtime->queue == nil || runtime->library == nil) return -2;
-    if (slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || in_dim == 0 || out_dim == 0) return -3;
-    const size_t expected_weight_bytes = in_dim * out_dim * sizeof(uint16_t);
-    if (weight_bytes < expected_weight_bytes) return -4;
-    @autoreleasepool {
-        const size_t bias_bytes = out_dim * sizeof(float);
-        id<MTLBuffer> weight_buffer = [runtime->device
-            newBufferWithBytesNoCopy:(void *)weight
-                              length:expected_weight_bytes
-                             options:MTLResourceStorageModeShared
-                         deallocator:nil];
-        if (weight_buffer == nil) return -5;
-        id<MTLBuffer> bias_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, bias, bias_bytes);
-        if (bias_buffer == nil) return -6;
-        runtime->linear_weight_buffers[slot] = weight_buffer;
-        runtime->linear_weight_f16_mirror_buffers[slot] = nil;
-        runtime->linear_bias_buffers[slot] = bias_buffer;
-        runtime->linear_in_dims[slot] = in_dim;
-        runtime->linear_out_dims[slot] = out_dim;
-        runtime->linear_slot_prepared[slot] = 1;
-        runtime->linear_weight_dtypes[slot] = TERMITE_METAL_DENSE_LINEAR_DTYPE_BF16;
-        runtime->linear_mps_mm[slot] = nil;
-        runtime->linear_mps_mm_rows[slot] = 0;
-        termite_metal_decode_runtime_invalidate_dense_qkv_pack_slot(runtime, slot);
-        termite_metal_decode_runtime_invalidate_q8_qkv_pack_slot(runtime, slot);
-        termite_metal_decode_runtime_invalidate_dense_pair_pack_slot(runtime, slot);
-        termite_metal_decode_runtime_clear_quant_linear_descriptor(runtime, slot);
-        return 0;
-    }
+    return termite_metal_decode_runtime_prepare_linear_bf16_no_copy_region(
+        runtime,
+        slot,
+        weight,
+        weight_bytes,
+        0,
+        weight_bytes,
+        bias,
+        in_dim,
+        out_dim);
 }
 
 int termite_metal_decode_runtime_prepare_linear_bias(
@@ -27271,7 +27320,7 @@ int termite_metal_decode_runtime_apply_linear(
                 : (use_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline));
         [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:input_buffer offset:0 atIndex:0];
-        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:0 atIndex:1];
+        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] atIndex:1];
         [encoder setBuffer:runtime->linear_bias_buffers[slot] offset:0 atIndex:2];
         [encoder setBuffer:output_buffer offset:0 atIndex:3];
         [encoder setBytes:&params length:sizeof(params) atIndex:4];
@@ -27412,7 +27461,7 @@ int termite_metal_decode_runtime_apply_linear_multi_row(
 	        if (use_bf16_simdgroup_m64_packed) runtime->bf16_forward_simdgroup_m64_packed_calls += 1;
 	        [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:input_buffer offset:0 atIndex:0];
-        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:0 atIndex:1];
+        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] atIndex:1];
         [encoder setBuffer:runtime->linear_bias_buffers[slot] offset:0 atIndex:2];
         [encoder setBuffer:output_buffer offset:0 atIndex:3];
         [encoder setBytes:&params length:sizeof(params) atIndex:4];
@@ -27498,7 +27547,7 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
             const size_t weight_element_bytes = mps_weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F16 ? sizeof(uint16_t) : sizeof(float);
             const size_t weight_bytes = out_dim * in_dim * weight_element_bytes;
             const size_t bias_bytes = out_dim * sizeof(float);
-            if (weight_bytes <= runtime->linear_weight_buffers[slot].length &&
+            if (termite_metal_buffer_range_valid(runtime->linear_weight_buffers[slot], runtime->linear_weight_offsets[slot], weight_bytes) &&
                 bias_bytes <= runtime->linear_bias_buffers[slot].length)
             {
                 const bool frame_owned = (runtime->active_frame_cb == nil);
@@ -27519,7 +27568,7 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
                                                                                         rowBytes:out_dim * sizeof(float)
                                                                                         dataType:MPSDataTypeFloat32];
                 MPSMatrix *left = [[MPSMatrix alloc] initWithBuffer:input_buffer offset:input_offset descriptor:left_desc];
-                MPSMatrix *right = [[MPSMatrix alloc] initWithBuffer:runtime->linear_weight_buffers[slot] offset:0 descriptor:right_desc];
+                MPSMatrix *right = [[MPSMatrix alloc] initWithBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] descriptor:right_desc];
                 MPSMatrix *result = [[MPSMatrix alloc] initWithBuffer:output_buffer offset:output_offset descriptor:result_desc];
                 MPSMatrixMultiplication *mm = termite_metal_decode_runtime_cached_mps_mm(runtime, slot, rows, in_dim, out_dim);
                 if (left == nil || right == nil || result == nil || mm == nil) return -10;
@@ -27645,7 +27694,7 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
             prefix_params.rows = (uint32_t)bf16_m64_prefix_rows;
             [encoder setComputePipelineState:runtime->linear_bf16_multi_row_simdgroup_m64_packed_pipeline];
             [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
-            [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:0 atIndex:1];
+            [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] atIndex:1];
             [encoder setBuffer:runtime->linear_bias_buffers[slot] offset:0 atIndex:2];
             [encoder setBuffer:output_buffer offset:output_offset atIndex:3];
             [encoder setBytes:&prefix_params length:sizeof(prefix_params) atIndex:4];
@@ -27658,7 +27707,7 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
             tail_params.rows = (uint32_t)tail_rows;
             [encoder setComputePipelineState:runtime->linear_bf16_multi_row_simdgroup_pipeline];
             [encoder setBuffer:input_buffer offset:input_offset + bf16_m64_prefix_rows * in_dim * sizeof(float) atIndex:0];
-            [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:0 atIndex:1];
+            [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] atIndex:1];
             [encoder setBuffer:runtime->linear_bias_buffers[slot] offset:0 atIndex:2];
             [encoder setBuffer:output_buffer offset:output_offset + bf16_m64_prefix_rows * out_dim * sizeof(float) atIndex:3];
             [encoder setBytes:&tail_params length:sizeof(tail_params) atIndex:4];
@@ -27690,7 +27739,7 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
 	        if (use_bf16_simdgroup_m64_packed) runtime->bf16_forward_simdgroup_m64_packed_calls += 1;
 	        [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
-        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:0 atIndex:1];
+        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] atIndex:1];
         [encoder setBuffer:runtime->linear_bias_buffers[slot] offset:0 atIndex:2];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:3];
         [encoder setBytes:&params length:sizeof(params) atIndex:4];
@@ -27765,7 +27814,7 @@ int termite_metal_decode_runtime_apply_linear_backward_input_bf16_device(
     if (!termite_metal_size_mul(input_elements, sizeof(float), &input_bytes) ||
         !termite_metal_size_mul(output_elements, sizeof(float), &output_bytes) ||
         !termite_metal_size_mul(weight_elements, sizeof(uint16_t), &weight_bytes)) return -8;
-    if (weight_bytes > runtime->linear_weight_buffers[slot].length) return -9;
+    if (!termite_metal_buffer_range_valid(runtime->linear_weight_buffers[slot], runtime->linear_weight_offsets[slot], weight_bytes)) return -9;
     @autoreleasepool {
         id<MTLBuffer> input_buffer = (__bridge id<MTLBuffer>)input_handle;
         id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
@@ -27790,7 +27839,7 @@ int termite_metal_decode_runtime_apply_linear_backward_input_bf16_device(
                 input_offset,
                 input_bytes,
                 runtime->linear_weight_buffers[slot],
-                0,
+                runtime->linear_weight_offsets[slot],
                 weight_bytes,
                 output_buffer,
                 output_offset,
@@ -27851,7 +27900,7 @@ int termite_metal_decode_runtime_apply_linear_backward_input_bf16_device(
             prefix_params.rows = (uint32_t)m64_prefix_rows;
             [encoder setComputePipelineState:runtime->linear_backward_input_bf16_simdgroup_m64_packed_pipeline];
             [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
-            [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:0 atIndex:1];
+            [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] atIndex:1];
             [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
             [encoder setBytes:&prefix_params length:sizeof(prefix_params) atIndex:3];
             [encoder setThreadgroupMemoryLength:8192u atIndex:0];
@@ -27863,7 +27912,7 @@ int termite_metal_decode_runtime_apply_linear_backward_input_bf16_device(
             tail_params.rows = (uint32_t)tail_rows;
             [encoder setComputePipelineState:runtime->linear_backward_input_bf16_simdgroup_pipeline];
             [encoder setBuffer:input_buffer offset:input_offset + m64_prefix_rows * out_dim * sizeof(float) atIndex:0];
-            [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:0 atIndex:1];
+            [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] atIndex:1];
             [encoder setBuffer:output_buffer offset:output_offset + m64_prefix_rows * in_dim * sizeof(float) atIndex:2];
             [encoder setBytes:&tail_params length:sizeof(tail_params) atIndex:3];
             [encoder setThreadgroupMemoryLength:8192u atIndex:0];
@@ -27892,7 +27941,7 @@ int termite_metal_decode_runtime_apply_linear_backward_input_bf16_device(
             false);
         [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
-        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:0 atIndex:1];
+        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] atIndex:1];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
         if (use_small_rows) {
@@ -27963,8 +28012,8 @@ int termite_metal_decode_runtime_apply_linear_backward_input_bf16_pair_sum_devic
     if (!termite_metal_size_mul(input_elements, sizeof(float), &input_bytes) ||
         !termite_metal_size_mul(output_elements, sizeof(float), &output_bytes) ||
         !termite_metal_size_mul(weight_elements, sizeof(uint16_t), &weight_bytes)) return -8;
-    if (weight_bytes > runtime->linear_weight_buffers[first_slot].length ||
-        weight_bytes > runtime->linear_weight_buffers[second_slot].length) return -9;
+    if (!termite_metal_buffer_range_valid(runtime->linear_weight_buffers[first_slot], runtime->linear_weight_offsets[first_slot], weight_bytes) ||
+        !termite_metal_buffer_range_valid(runtime->linear_weight_buffers[second_slot], runtime->linear_weight_offsets[second_slot], weight_bytes)) return -9;
 
     @autoreleasepool {
         id<MTLBuffer> first_input_buffer = (__bridge id<MTLBuffer>)first_input_handle;
@@ -27986,9 +28035,9 @@ int termite_metal_decode_runtime_apply_linear_backward_input_bf16_pair_sum_devic
         }
         termite_metal_planned_encoder_range accesses[5];
         if (termite_metal_planned_range_make(first_input_buffer, first_input_offset, input_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -13) != 0 ||
-            termite_metal_planned_range_make(first_weight_buffer, 0, weight_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -13) != 0 ||
+            termite_metal_planned_range_make(first_weight_buffer, runtime->linear_weight_offsets[first_slot], weight_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -13) != 0 ||
             termite_metal_planned_range_make(second_input_buffer, second_input_offset, input_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[2], -13) != 0 ||
-            termite_metal_planned_range_make(second_weight_buffer, 0, weight_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[3], -13) != 0 ||
+            termite_metal_planned_range_make(second_weight_buffer, runtime->linear_weight_offsets[second_slot], weight_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[3], -13) != 0 ||
             termite_metal_planned_range_make(output_buffer, output_offset, output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[4], -13) != 0 ||
             termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 5, -13) != 0)
         {
@@ -28021,9 +28070,9 @@ int termite_metal_decode_runtime_apply_linear_backward_input_bf16_pair_sum_devic
             false);
         [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:first_input_buffer offset:first_input_offset atIndex:0];
-        [encoder setBuffer:first_weight_buffer offset:0 atIndex:1];
+        [encoder setBuffer:first_weight_buffer offset:runtime->linear_weight_offsets[first_slot] atIndex:1];
         [encoder setBuffer:second_input_buffer offset:second_input_offset atIndex:2];
-        [encoder setBuffer:second_weight_buffer offset:0 atIndex:3];
+        [encoder setBuffer:second_weight_buffer offset:runtime->linear_weight_offsets[second_slot] atIndex:3];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:4];
         [encoder setBytes:&params length:sizeof(params) atIndex:5];
         if (use_simdgroup_m64_packed) {
@@ -28258,7 +28307,7 @@ int termite_metal_decode_runtime_apply_dense_mlp2_device(
 	            false);
 	        [first_encoder setComputePipelineState:first_pipeline];
         [first_encoder setBuffer:input_buffer offset:input_offset atIndex:0];
-        [first_encoder setBuffer:runtime->linear_weight_buffers[first_linear_slot] offset:0 atIndex:1];
+        [first_encoder setBuffer:runtime->linear_weight_buffers[first_linear_slot] offset:runtime->linear_weight_offsets[first_linear_slot] atIndex:1];
         [first_encoder setBuffer:runtime->linear_bias_buffers[first_linear_slot] offset:0 atIndex:2];
         [first_encoder setBuffer:first_output_buffer offset:0 atIndex:3];
         [first_encoder setBytes:&first_params length:sizeof(first_params) atIndex:4];
@@ -28324,7 +28373,7 @@ int termite_metal_decode_runtime_apply_dense_mlp2_device(
 	            false);
 	        [second_encoder setComputePipelineState:second_pipeline];
         [second_encoder setBuffer:activated_buffer offset:0 atIndex:0];
-        [second_encoder setBuffer:runtime->linear_weight_buffers[second_linear_slot] offset:0 atIndex:1];
+        [second_encoder setBuffer:runtime->linear_weight_buffers[second_linear_slot] offset:runtime->linear_weight_offsets[second_linear_slot] atIndex:1];
         [second_encoder setBuffer:runtime->linear_bias_buffers[second_linear_slot] offset:0 atIndex:2];
         [second_encoder setBuffer:output_buffer offset:output_offset atIndex:3];
         [second_encoder setBytes:&second_params length:sizeof(second_params) atIndex:4];
@@ -28540,7 +28589,7 @@ int termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
 	                        false);
 	                    [first_encoder setComputePipelineState:first_pipeline];
                     [first_encoder setBuffer:input_buffer offset:input_offset atIndex:0];
-                    [first_encoder setBuffer:runtime->linear_weight_buffers[first_linear_slot] offset:0 atIndex:1];
+                    [first_encoder setBuffer:runtime->linear_weight_buffers[first_linear_slot] offset:runtime->linear_weight_offsets[first_linear_slot] atIndex:1];
                     [first_encoder setBuffer:runtime->linear_bias_buffers[first_linear_slot] offset:0 atIndex:2];
                     [first_encoder setBuffer:first_linear_output_buffer offset:0 atIndex:3];
                     [first_encoder setBytes:&first_params length:sizeof(first_params) atIndex:4];
@@ -28626,7 +28675,7 @@ int termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
 	                            false);
 	                        [second_encoder setComputePipelineState:second_pipeline];
                         [second_encoder setBuffer:activated_buffer offset:0 atIndex:0];
-                        [second_encoder setBuffer:runtime->linear_weight_buffers[second_linear_slot] offset:0 atIndex:1];
+                        [second_encoder setBuffer:runtime->linear_weight_buffers[second_linear_slot] offset:runtime->linear_weight_offsets[second_linear_slot] atIndex:1];
                         [second_encoder setBuffer:runtime->linear_bias_buffers[second_linear_slot] offset:0 atIndex:2];
                         [second_encoder setBuffer:projected_buffer offset:0 atIndex:3];
                         [second_encoder setBytes:&second_params length:sizeof(second_params) atIndex:4];
@@ -28707,7 +28756,7 @@ int termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
                                                                                      rowBytes:intermediate_size * sizeof(float)
                                                                                      dataType:MPSDataTypeFloat32];
         MPSMatrix *first_left = [[MPSMatrix alloc] initWithBuffer:input_buffer offset:input_offset descriptor:first_left_desc];
-        MPSMatrix *first_right = [[MPSMatrix alloc] initWithBuffer:runtime->linear_weight_buffers[first_linear_slot] offset:0 descriptor:first_right_desc];
+        MPSMatrix *first_right = [[MPSMatrix alloc] initWithBuffer:runtime->linear_weight_buffers[first_linear_slot] offset:runtime->linear_weight_offsets[first_linear_slot] descriptor:first_right_desc];
         MPSMatrix *first_result = [[MPSMatrix alloc] initWithBuffer:first_output_buffer offset:0 descriptor:first_result_desc];
         MPSMatrixMultiplication *first_mm = termite_metal_decode_runtime_cached_mps_mm(runtime, first_linear_slot, rows, hidden_size, intermediate_size);
         if (first_left == nil || first_right == nil || first_result == nil || first_mm == nil) {
@@ -28750,7 +28799,7 @@ int termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
                                                                                       rowBytes:hidden_size * sizeof(float)
                                                                                       dataType:MPSDataTypeFloat32];
         MPSMatrix *second_left = [[MPSMatrix alloc] initWithBuffer:activated_buffer offset:0 descriptor:second_left_desc];
-        MPSMatrix *second_right = [[MPSMatrix alloc] initWithBuffer:runtime->linear_weight_buffers[second_linear_slot] offset:0 descriptor:second_right_desc];
+        MPSMatrix *second_right = [[MPSMatrix alloc] initWithBuffer:runtime->linear_weight_buffers[second_linear_slot] offset:runtime->linear_weight_offsets[second_linear_slot] descriptor:second_right_desc];
         MPSMatrix *second_result = [[MPSMatrix alloc] initWithBuffer:projected_buffer offset:0 descriptor:second_result_desc];
         MPSMatrixMultiplication *second_mm = termite_metal_decode_runtime_cached_mps_mm(runtime, second_linear_slot, rows, intermediate_size, hidden_size);
         if (second_left == nil || second_right == nil || second_result == nil || second_mm == nil) {
@@ -28922,7 +28971,7 @@ int termite_metal_decode_runtime_apply_dense_linear_layer_norm_device(
 	                    false);
 	                [linear_encoder setComputePipelineState:linear_pipeline];
                 [linear_encoder setBuffer:input_buffer offset:input_offset atIndex:0];
-                [linear_encoder setBuffer:runtime->linear_weight_buffers[linear_slot] offset:0 atIndex:1];
+                [linear_encoder setBuffer:runtime->linear_weight_buffers[linear_slot] offset:runtime->linear_weight_offsets[linear_slot] atIndex:1];
                 [linear_encoder setBuffer:runtime->linear_bias_buffers[linear_slot] offset:0 atIndex:2];
                 [linear_encoder setBuffer:projected_buffer offset:0 atIndex:3];
                 [linear_encoder setBytes:&linear_params length:sizeof(linear_params) atIndex:4];
@@ -28998,7 +29047,7 @@ int termite_metal_decode_runtime_apply_dense_linear_layer_norm_device(
                                                                                 rowBytes:hidden_size * sizeof(float)
                                                                                 dataType:MPSDataTypeFloat32];
         MPSMatrix *left = [[MPSMatrix alloc] initWithBuffer:input_buffer offset:input_offset descriptor:left_desc];
-        MPSMatrix *right = [[MPSMatrix alloc] initWithBuffer:runtime->linear_weight_buffers[linear_slot] offset:0 descriptor:right_desc];
+        MPSMatrix *right = [[MPSMatrix alloc] initWithBuffer:runtime->linear_weight_buffers[linear_slot] offset:runtime->linear_weight_offsets[linear_slot] descriptor:right_desc];
         MPSMatrix *result = [[MPSMatrix alloc] initWithBuffer:projected_buffer offset:0 descriptor:result_desc];
         MPSMatrixMultiplication *mm = termite_metal_decode_runtime_cached_mps_mm(runtime, linear_slot, rows, in_dim, hidden_size);
         if (left == nil || right == nil || result == nil || mm == nil) return -12;
@@ -31653,7 +31702,7 @@ int termite_metal_decode_runtime_apply_linear_pair_slots(
         if (encoder_a == nil) return -11;
         [encoder_a setComputePipelineState:runtime->linear_pipeline];
         [encoder_a setBuffer:input_buffer offset:0 atIndex:0];
-        [encoder_a setBuffer:runtime->linear_weight_buffers[slot_a] offset:0 atIndex:1];
+        [encoder_a setBuffer:runtime->linear_weight_buffers[slot_a] offset:runtime->linear_weight_offsets[slot_a] atIndex:1];
         [encoder_a setBuffer:runtime->linear_bias_buffers[slot_a] offset:0 atIndex:2];
         [encoder_a setBuffer:output_a_buffer offset:0 atIndex:3];
         [encoder_a setBytes:&params length:sizeof(params) atIndex:4];
@@ -31668,7 +31717,7 @@ int termite_metal_decode_runtime_apply_linear_pair_slots(
         if (encoder_b == nil) return -12;
         [encoder_b setComputePipelineState:runtime->linear_pipeline];
         [encoder_b setBuffer:input_buffer offset:0 atIndex:0];
-        [encoder_b setBuffer:runtime->linear_weight_buffers[slot_b] offset:0 atIndex:1];
+        [encoder_b setBuffer:runtime->linear_weight_buffers[slot_b] offset:runtime->linear_weight_offsets[slot_b] atIndex:1];
         [encoder_b setBuffer:runtime->linear_bias_buffers[slot_b] offset:0 atIndex:2];
         [encoder_b setBuffer:output_b_buffer offset:0 atIndex:3];
         [encoder_b setBytes:&params length:sizeof(params) atIndex:4];
@@ -31749,15 +31798,16 @@ int termite_metal_decode_runtime_apply_linear_pair_slots_device(
             const size_t bias_bytes = out_dim * sizeof(float);
             if (a_weight_buffer == nil || b_weight_buffer == nil ||
                 a_bias_buffer == nil || b_bias_buffer == nil ||
-                a_weight_buffer.length < weight_bytes || b_weight_buffer.length < weight_bytes ||
+                !termite_metal_buffer_range_valid(a_weight_buffer, runtime->linear_weight_offsets[slot_a], weight_bytes) ||
+                !termite_metal_buffer_range_valid(b_weight_buffer, runtime->linear_weight_offsets[slot_b], weight_bytes) ||
                 a_bias_buffer.length < bias_bytes || b_bias_buffer.length < bias_bytes)
             {
                 return -13;
             }
             termite_metal_planned_encoder_range accesses[7];
             if (termite_metal_planned_range_make(input_buffer, input_offset, input_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -13) != 0 ||
-                termite_metal_planned_range_make(a_weight_buffer, 0, weight_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -13) != 0 ||
-                termite_metal_planned_range_make(b_weight_buffer, 0, weight_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[2], -13) != 0 ||
+                termite_metal_planned_range_make(a_weight_buffer, runtime->linear_weight_offsets[slot_a], weight_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -13) != 0 ||
+                termite_metal_planned_range_make(b_weight_buffer, runtime->linear_weight_offsets[slot_b], weight_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[2], -13) != 0 ||
                 termite_metal_planned_range_make(a_bias_buffer, 0, bias_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[3], -13) != 0 ||
                 termite_metal_planned_range_make(b_bias_buffer, 0, bias_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[4], -13) != 0 ||
                 termite_metal_planned_range_make(output_a_buffer, output_a_offset, output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[5], -13) != 0 ||
@@ -31789,8 +31839,8 @@ int termite_metal_decode_runtime_apply_linear_pair_slots_device(
                 false);
             [encoder setComputePipelineState:runtime->gemma4_bf16_gate_up_simdgroup_m64_pipeline];
             [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
-            [encoder setBuffer:a_weight_buffer offset:0 atIndex:1];
-            [encoder setBuffer:b_weight_buffer offset:0 atIndex:2];
+            [encoder setBuffer:a_weight_buffer offset:runtime->linear_weight_offsets[slot_a] atIndex:1];
+            [encoder setBuffer:b_weight_buffer offset:runtime->linear_weight_offsets[slot_b] atIndex:2];
             [encoder setBuffer:a_bias_buffer offset:0 atIndex:3];
             [encoder setBuffer:b_bias_buffer offset:0 atIndex:4];
             [encoder setBuffer:output_a_buffer offset:output_a_offset atIndex:5];
@@ -31823,7 +31873,7 @@ int termite_metal_decode_runtime_apply_linear_pair_slots_device(
                 -13) != 0) return -13;
         [encoder_a setComputePipelineState:runtime->linear_pipeline];
         [encoder_a setBuffer:input_buffer offset:input_offset atIndex:0];
-        [encoder_a setBuffer:runtime->linear_weight_buffers[slot_a] offset:0 atIndex:1];
+        [encoder_a setBuffer:runtime->linear_weight_buffers[slot_a] offset:runtime->linear_weight_offsets[slot_a] atIndex:1];
         [encoder_a setBuffer:runtime->linear_bias_buffers[slot_a] offset:0 atIndex:2];
         [encoder_a setBuffer:output_a_buffer offset:output_a_offset atIndex:3];
         [encoder_a setBytes:&params length:sizeof(params) atIndex:4];
@@ -31851,7 +31901,7 @@ int termite_metal_decode_runtime_apply_linear_pair_slots_device(
                 -14) != 0) return -14;
         [encoder_b setComputePipelineState:runtime->linear_pipeline];
         [encoder_b setBuffer:input_buffer offset:input_offset atIndex:0];
-        [encoder_b setBuffer:runtime->linear_weight_buffers[slot_b] offset:0 atIndex:1];
+        [encoder_b setBuffer:runtime->linear_weight_buffers[slot_b] offset:runtime->linear_weight_offsets[slot_b] atIndex:1];
         [encoder_b setBuffer:runtime->linear_bias_buffers[slot_b] offset:0 atIndex:2];
         [encoder_b setBuffer:output_b_buffer offset:output_b_offset atIndex:3];
         [encoder_b setBytes:&params length:sizeof(params) atIndex:4];
@@ -31918,7 +31968,7 @@ int termite_metal_decode_runtime_apply_linear_qkv_slots(
         const BOOL use_q_reduce = q_out_dim >= 128;
         [q_encoder setComputePipelineState:(use_q_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         [q_encoder setBuffer:input_buffer offset:0 atIndex:0];
-        [q_encoder setBuffer:runtime->linear_weight_buffers[q_slot] offset:0 atIndex:1];
+        [q_encoder setBuffer:runtime->linear_weight_buffers[q_slot] offset:runtime->linear_weight_offsets[q_slot] atIndex:1];
         [q_encoder setBuffer:runtime->linear_bias_buffers[q_slot] offset:0 atIndex:2];
         [q_encoder setBuffer:q_output_buffer offset:0 atIndex:3];
         [q_encoder setBytes:&q_params length:sizeof(q_params) atIndex:4];
@@ -31934,7 +31984,7 @@ int termite_metal_decode_runtime_apply_linear_qkv_slots(
         const BOOL use_kv_reduce = kv_out_dim >= 128;
         [k_encoder setComputePipelineState:(use_kv_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         [k_encoder setBuffer:input_buffer offset:0 atIndex:0];
-        [k_encoder setBuffer:runtime->linear_weight_buffers[k_slot] offset:0 atIndex:1];
+        [k_encoder setBuffer:runtime->linear_weight_buffers[k_slot] offset:runtime->linear_weight_offsets[k_slot] atIndex:1];
         [k_encoder setBuffer:runtime->linear_bias_buffers[k_slot] offset:0 atIndex:2];
         [k_encoder setBuffer:k_output_buffer offset:0 atIndex:3];
         [k_encoder setBytes:&kv_params length:sizeof(kv_params) atIndex:4];
@@ -31949,7 +31999,7 @@ int termite_metal_decode_runtime_apply_linear_qkv_slots(
         if (v_encoder == nil) return -13;
         [v_encoder setComputePipelineState:(use_kv_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         [v_encoder setBuffer:input_buffer offset:0 atIndex:0];
-        [v_encoder setBuffer:runtime->linear_weight_buffers[v_slot] offset:0 atIndex:1];
+        [v_encoder setBuffer:runtime->linear_weight_buffers[v_slot] offset:runtime->linear_weight_offsets[v_slot] atIndex:1];
         [v_encoder setBuffer:runtime->linear_bias_buffers[v_slot] offset:0 atIndex:2];
         [v_encoder setBuffer:v_output_buffer offset:0 atIndex:3];
         [v_encoder setBytes:&kv_params length:sizeof(kv_params) atIndex:4];
@@ -32043,7 +32093,7 @@ int termite_metal_decode_runtime_apply_linear_qkv_slots_device(
                 -14) != 0) return -14;
         [q_encoder setComputePipelineState:(use_q_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         [q_encoder setBuffer:input_buffer offset:input_offset atIndex:0];
-        [q_encoder setBuffer:runtime->linear_weight_buffers[q_slot] offset:0 atIndex:1];
+        [q_encoder setBuffer:runtime->linear_weight_buffers[q_slot] offset:runtime->linear_weight_offsets[q_slot] atIndex:1];
         [q_encoder setBuffer:runtime->linear_bias_buffers[q_slot] offset:0 atIndex:2];
         [q_encoder setBuffer:q_output_buffer offset:q_output_offset atIndex:3];
         [q_encoder setBytes:&q_params length:sizeof(q_params) atIndex:4];
@@ -32072,7 +32122,7 @@ int termite_metal_decode_runtime_apply_linear_qkv_slots_device(
                 -15) != 0) return -15;
         [k_encoder setComputePipelineState:(use_kv_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         [k_encoder setBuffer:input_buffer offset:input_offset atIndex:0];
-        [k_encoder setBuffer:runtime->linear_weight_buffers[k_slot] offset:0 atIndex:1];
+        [k_encoder setBuffer:runtime->linear_weight_buffers[k_slot] offset:runtime->linear_weight_offsets[k_slot] atIndex:1];
         [k_encoder setBuffer:runtime->linear_bias_buffers[k_slot] offset:0 atIndex:2];
         [k_encoder setBuffer:k_output_buffer offset:k_output_offset atIndex:3];
         [k_encoder setBytes:&kv_params length:sizeof(kv_params) atIndex:4];
@@ -32100,7 +32150,7 @@ int termite_metal_decode_runtime_apply_linear_qkv_slots_device(
                 -16) != 0) return -16;
         [v_encoder setComputePipelineState:(use_kv_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         [v_encoder setBuffer:input_buffer offset:input_offset atIndex:0];
-        [v_encoder setBuffer:runtime->linear_weight_buffers[v_slot] offset:0 atIndex:1];
+        [v_encoder setBuffer:runtime->linear_weight_buffers[v_slot] offset:runtime->linear_weight_offsets[v_slot] atIndex:1];
         [v_encoder setBuffer:runtime->linear_bias_buffers[v_slot] offset:0 atIndex:2];
         [v_encoder setBuffer:v_output_buffer offset:v_output_offset atIndex:3];
         [v_encoder setBytes:&kv_params length:sizeof(kv_params) atIndex:4];
@@ -32434,15 +32484,16 @@ int termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_device(
             const size_t bias_bytes = out_dim * sizeof(float);
             if (a_weight_buffer == nil || b_weight_buffer == nil ||
                 a_bias_buffer == nil || b_bias_buffer == nil ||
-                a_weight_buffer.length < weight_bytes || b_weight_buffer.length < weight_bytes ||
+                !termite_metal_buffer_range_valid(a_weight_buffer, runtime->linear_weight_offsets[a_slot], weight_bytes) ||
+                !termite_metal_buffer_range_valid(b_weight_buffer, runtime->linear_weight_offsets[b_slot], weight_bytes) ||
                 a_bias_buffer.length < bias_bytes || b_bias_buffer.length < bias_bytes)
             {
                 return -14;
             }
             termite_metal_planned_encoder_range accesses[7];
             if (termite_metal_planned_range_make(input_buffer, input_offset, input_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -15) != 0 ||
-                termite_metal_planned_range_make(a_weight_buffer, 0, weight_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -15) != 0 ||
-                termite_metal_planned_range_make(b_weight_buffer, 0, weight_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[2], -15) != 0 ||
+                termite_metal_planned_range_make(a_weight_buffer, runtime->linear_weight_offsets[a_slot], weight_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -15) != 0 ||
+                termite_metal_planned_range_make(b_weight_buffer, runtime->linear_weight_offsets[b_slot], weight_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[2], -15) != 0 ||
                 termite_metal_planned_range_make(a_bias_buffer, 0, bias_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[3], -15) != 0 ||
                 termite_metal_planned_range_make(b_bias_buffer, 0, bias_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[4], -15) != 0 ||
                 termite_metal_planned_range_make(a_output_buffer, 0, output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[5], -15) != 0 ||
@@ -32474,8 +32525,8 @@ int termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_device(
                 false);
             [encoder setComputePipelineState:runtime->gemma4_bf16_gate_up_simdgroup_m64_pipeline];
             [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
-            [encoder setBuffer:a_weight_buffer offset:0 atIndex:1];
-            [encoder setBuffer:b_weight_buffer offset:0 atIndex:2];
+            [encoder setBuffer:a_weight_buffer offset:runtime->linear_weight_offsets[a_slot] atIndex:1];
+            [encoder setBuffer:b_weight_buffer offset:runtime->linear_weight_offsets[b_slot] atIndex:2];
             [encoder setBuffer:a_bias_buffer offset:0 atIndex:3];
             [encoder setBuffer:b_bias_buffer offset:0 atIndex:4];
             [encoder setBuffer:a_output_buffer offset:0 atIndex:5];
@@ -32976,7 +33027,7 @@ static int termite_metal_encode_dense_linear_on_encoder(
             : (use_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline));
     [encoder setComputePipelineState:pipeline];
     [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
-    [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:0 atIndex:1];
+    [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] atIndex:1];
     [encoder setBuffer:runtime->linear_bias_buffers[slot] offset:0 atIndex:2];
     [encoder setBuffer:output_buffer offset:output_offset atIndex:3];
     [encoder setBytes:&params length:sizeof(params) atIndex:4];
@@ -33424,7 +33475,7 @@ int termite_metal_decode_runtime_apply_layer_norm_linear(
         const BOOL use_reduce = out_dim >= 128;
         [linear_encoder setComputePipelineState:(use_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         [linear_encoder setBuffer:hidden_buffer offset:0 atIndex:0];
-        [linear_encoder setBuffer:runtime->linear_weight_buffers[linear_slot] offset:0 atIndex:1];
+        [linear_encoder setBuffer:runtime->linear_weight_buffers[linear_slot] offset:runtime->linear_weight_offsets[linear_slot] atIndex:1];
         [linear_encoder setBuffer:runtime->linear_bias_buffers[linear_slot] offset:0 atIndex:2];
         [linear_encoder setBuffer:output_buffer offset:0 atIndex:3];
         [linear_encoder setBuffer:linear_params_buffer offset:0 atIndex:4];
@@ -34675,7 +34726,7 @@ int termite_metal_decode_runtime_apply_rms_norm_linear(
         const BOOL use_reduce = out_dim >= 128;
         [linear_encoder setComputePipelineState:(use_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         [linear_encoder setBuffer:hidden_buffer offset:0 atIndex:0];
-        [linear_encoder setBuffer:runtime->linear_weight_buffers[linear_slot] offset:0 atIndex:1];
+        [linear_encoder setBuffer:runtime->linear_weight_buffers[linear_slot] offset:runtime->linear_weight_offsets[linear_slot] atIndex:1];
         [linear_encoder setBuffer:runtime->linear_bias_buffers[linear_slot] offset:0 atIndex:2];
         [linear_encoder setBuffer:output_buffer offset:0 atIndex:3];
         [linear_encoder setBuffer:linear_params_buffer offset:0 atIndex:4];
@@ -35234,7 +35285,7 @@ int termite_metal_decode_runtime_apply_layer_norm_linear_sample_device(
         const BOOL use_reduce = out_dim >= 128;
         [linear_encoder setComputePipelineState:(use_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         [linear_encoder setBuffer:hidden_buffer offset:0 atIndex:0];
-        [linear_encoder setBuffer:runtime->linear_weight_buffers[linear_slot] offset:0 atIndex:1];
+        [linear_encoder setBuffer:runtime->linear_weight_buffers[linear_slot] offset:runtime->linear_weight_offsets[linear_slot] atIndex:1];
         [linear_encoder setBuffer:runtime->linear_bias_buffers[linear_slot] offset:0 atIndex:2];
         [linear_encoder setBuffer:runtime->sample_logits_buffer offset:0 atIndex:3];
         [linear_encoder setBuffer:linear_params_buffer offset:0 atIndex:4];
@@ -35344,7 +35395,7 @@ int termite_metal_decode_runtime_apply_rms_norm_linear_sample_device(
         const BOOL use_reduce = out_dim >= 128;
         [linear_encoder setComputePipelineState:(use_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         [linear_encoder setBuffer:hidden_buffer offset:0 atIndex:0];
-        [linear_encoder setBuffer:runtime->linear_weight_buffers[linear_slot] offset:0 atIndex:1];
+        [linear_encoder setBuffer:runtime->linear_weight_buffers[linear_slot] offset:runtime->linear_weight_offsets[linear_slot] atIndex:1];
         [linear_encoder setBuffer:runtime->linear_bias_buffers[linear_slot] offset:0 atIndex:2];
         [linear_encoder setBuffer:runtime->sample_logits_buffer offset:0 atIndex:3];
         [linear_encoder setBuffer:linear_params_buffer offset:0 atIndex:4];
@@ -35716,7 +35767,8 @@ static id<MTLBuffer> termite_metal_linear_cce_ensure_f16_weight_mirror(
     size_t mirror_bytes = 0;
     if (!termite_metal_size_mul(in_dim, out_dim, &element_count) ||
         !termite_metal_size_mul(element_count, sizeof(uint16_t), &mirror_bytes) ||
-        element_count > UINT32_MAX || mirror_bytes > runtime->linear_weight_buffers[slot].length) return nil;
+        element_count > UINT32_MAX ||
+        !termite_metal_buffer_range_valid(runtime->linear_weight_buffers[slot], runtime->linear_weight_offsets[slot], mirror_bytes)) return nil;
     id<MTLBuffer> mirror = [runtime->device newBufferWithLength:mirror_bytes options:MTLResourceStorageModePrivate];
     if (mirror == nil) return nil;
     termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
@@ -35726,7 +35778,7 @@ static id<MTLBuffer> termite_metal_linear_cce_ensure_f16_weight_mirror(
     if (encoder == nil) return nil;
     const uint32_t count = (uint32_t)element_count;
     [encoder setComputePipelineState:runtime->linear_bf16_to_f16_pipeline];
-    [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:0 atIndex:0];
+    [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] atIndex:0];
     [encoder setBuffer:mirror offset:0 atIndex:1];
     [encoder setBytes:&count length:sizeof(count) atIndex:2];
     [encoder dispatchThreads:MTLSizeMake(element_count, 1, 1)
@@ -35847,7 +35899,7 @@ static void termite_metal_encode_linear_cce_bf16_projection_tile(
         runtime->bf16_forward_simdgroup_m64_packed_calls += 1;
         [encoder setComputePipelineState:runtime->linear_bf16_multi_row_simdgroup_m64_packed_pipeline];
         [encoder setBuffer:hidden_buffer offset:hidden_offset atIndex:0];
-        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:weight_offset atIndex:1];
+        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] + weight_offset atIndex:1];
         [encoder setBuffer:runtime->linear_bias_buffers[slot] offset:bias_offset atIndex:2];
         [encoder setBuffer:logits_buffer offset:logits_offset atIndex:3];
         [encoder setBytes:&linear_params length:sizeof(linear_params) atIndex:4];
@@ -35875,7 +35927,7 @@ static void termite_metal_encode_linear_cce_bf16_projection_tile(
         prefix_params.rows = (uint32_t)prefix_rows;
         [encoder setComputePipelineState:runtime->linear_bf16_multi_row_simdgroup_m64_packed_pipeline];
         [encoder setBuffer:hidden_buffer offset:hidden_offset atIndex:0];
-        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:weight_offset atIndex:1];
+        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] + weight_offset atIndex:1];
         [encoder setBuffer:runtime->linear_bias_buffers[slot] offset:bias_offset atIndex:2];
         [encoder setBuffer:logits_buffer offset:logits_offset atIndex:3];
         [encoder setBytes:&prefix_params length:sizeof(prefix_params) atIndex:4];
@@ -35888,7 +35940,7 @@ static void termite_metal_encode_linear_cce_bf16_projection_tile(
         tail_params.rows = (uint32_t)tail_rows;
         [encoder setComputePipelineState:runtime->linear_bf16_multi_row_simdgroup_pipeline];
         [encoder setBuffer:hidden_buffer offset:hidden_offset + prefix_rows * in_dim * sizeof(float) atIndex:0];
-        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:weight_offset atIndex:1];
+        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] + weight_offset atIndex:1];
         [encoder setBuffer:runtime->linear_bias_buffers[slot] offset:bias_offset atIndex:2];
         [encoder setBuffer:logits_buffer offset:logits_offset + prefix_rows * tile_vocab_size * sizeof(float) atIndex:3];
         [encoder setBytes:&tail_params length:sizeof(tail_params) atIndex:4];
@@ -35913,7 +35965,7 @@ static void termite_metal_encode_linear_cce_bf16_projection_tile(
             false);
         [encoder setComputePipelineState:runtime->linear_bf16_multi_row_simdgroup_pipeline];
         [encoder setBuffer:hidden_buffer offset:hidden_offset atIndex:0];
-        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:weight_offset atIndex:1];
+        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] + weight_offset atIndex:1];
         [encoder setBuffer:runtime->linear_bias_buffers[slot] offset:bias_offset atIndex:2];
         [encoder setBuffer:logits_buffer offset:logits_offset atIndex:3];
         [encoder setBytes:&linear_params length:sizeof(linear_params) atIndex:4];
@@ -35925,7 +35977,7 @@ static void termite_metal_encode_linear_cce_bf16_projection_tile(
 
     [encoder setComputePipelineState:runtime->linear_bf16_multi_row_shared_reduce_pipeline];
     [encoder setBuffer:hidden_buffer offset:hidden_offset atIndex:0];
-    [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:weight_offset atIndex:1];
+    [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] + weight_offset atIndex:1];
     [encoder setBuffer:runtime->linear_bias_buffers[slot] offset:bias_offset atIndex:2];
     [encoder setBuffer:logits_buffer offset:logits_offset atIndex:3];
     [encoder setBytes:&linear_params length:sizeof(linear_params) atIndex:4];
@@ -35990,7 +36042,7 @@ static void termite_metal_encode_linear_cce_bf16_backward_tile(
             false);
         [encoder setComputePipelineState:m64_pipeline];
         [encoder setBuffer:grad_logits_buffer offset:0 atIndex:0];
-        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:weight_offset atIndex:1];
+        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] + weight_offset atIndex:1];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
         [encoder setThreadgroupMemoryLength:8192u atIndex:0];
@@ -36016,7 +36068,7 @@ static void termite_metal_encode_linear_cce_bf16_backward_tile(
         prefix_params.rows = (uint32_t)prefix_rows;
         [encoder setComputePipelineState:m64_pipeline];
         [encoder setBuffer:grad_logits_buffer offset:0 atIndex:0];
-        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:weight_offset atIndex:1];
+        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] + weight_offset atIndex:1];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [encoder setBytes:&prefix_params length:sizeof(prefix_params) atIndex:3];
         [encoder setThreadgroupMemoryLength:8192u atIndex:0];
@@ -36029,7 +36081,7 @@ static void termite_metal_encode_linear_cce_bf16_backward_tile(
         [encoder setComputePipelineState:simdgroup_pipeline];
         const size_t grad_element_bytes = grad_is_f16 ? sizeof(uint16_t) : sizeof(float);
         [encoder setBuffer:grad_logits_buffer offset:prefix_rows * tile_vocab_size * grad_element_bytes atIndex:0];
-        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:weight_offset atIndex:1];
+        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] + weight_offset atIndex:1];
         [encoder setBuffer:output_buffer offset:output_offset + prefix_rows * in_dim * sizeof(float) atIndex:2];
         [encoder setBytes:&tail_params length:sizeof(tail_params) atIndex:3];
         [encoder setThreadgroupMemoryLength:8192u atIndex:0];
@@ -36053,7 +36105,7 @@ static void termite_metal_encode_linear_cce_bf16_backward_tile(
             false);
         [encoder setComputePipelineState:simdgroup_pipeline];
         [encoder setBuffer:grad_logits_buffer offset:0 atIndex:0];
-        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:weight_offset atIndex:1];
+        [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] + weight_offset atIndex:1];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
         [encoder setThreadgroupMemoryLength:8192u atIndex:0];
@@ -36064,7 +36116,7 @@ static void termite_metal_encode_linear_cce_bf16_backward_tile(
 
     [encoder setComputePipelineState:runtime->linear_backward_input_bf16_small_m8_n32_k64_pipeline];
     [encoder setBuffer:grad_logits_buffer offset:0 atIndex:0];
-    [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:weight_offset atIndex:1];
+    [encoder setBuffer:runtime->linear_weight_buffers[slot] offset:runtime->linear_weight_offsets[slot] + weight_offset atIndex:1];
     [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
     [encoder setBytes:&params length:sizeof(params) atIndex:3];
     [encoder dispatchThreadgroups:MTLSizeMake((in_dim + 31u) / 32u, (rows + 7u) / 8u, 1)
@@ -36265,7 +36317,8 @@ static int termite_metal_validate_linear_cce_bf16(
     if (!termite_metal_size_mul(vocab_size, in_dim, &weight_elements) ||
         !termite_metal_size_mul(weight_elements, sizeof(uint16_t), &weight_bytes) ||
         !termite_metal_size_mul(vocab_size, sizeof(float), &bias_bytes)) return -7;
-    if (weight_bytes > runtime->linear_weight_buffers[slot].length || bias_bytes > runtime->linear_bias_buffers[slot].length) return -8;
+    if (!termite_metal_buffer_range_valid(runtime->linear_weight_buffers[slot], runtime->linear_weight_offsets[slot], weight_bytes) ||
+        bias_bytes > runtime->linear_bias_buffers[slot].length) return -8;
     return 0;
 }
 
@@ -44619,7 +44672,7 @@ int termite_metal_decode_runtime_apply_linear_activation_linear_residual(
         if (first_linear_encoder == nil) return -12;
         [first_linear_encoder setComputePipelineState:runtime->linear_pipeline];
         [first_linear_encoder setBuffer:input_buffer offset:0 atIndex:0];
-        [first_linear_encoder setBuffer:runtime->linear_weight_buffers[first_linear_slot] offset:0 atIndex:1];
+        [first_linear_encoder setBuffer:runtime->linear_weight_buffers[first_linear_slot] offset:runtime->linear_weight_offsets[first_linear_slot] atIndex:1];
         [first_linear_encoder setBuffer:runtime->linear_bias_buffers[first_linear_slot] offset:0 atIndex:2];
         [first_linear_encoder setBuffer:first_output_buffer offset:0 atIndex:3];
         [first_linear_encoder setBuffer:first_linear_params_buffer offset:0 atIndex:4];
@@ -44645,7 +44698,7 @@ int termite_metal_decode_runtime_apply_linear_activation_linear_residual(
         if (second_linear_encoder == nil) return -14;
         [second_linear_encoder setComputePipelineState:runtime->linear_pipeline];
         [second_linear_encoder setBuffer:activated_buffer offset:0 atIndex:0];
-        [second_linear_encoder setBuffer:runtime->linear_weight_buffers[second_linear_slot] offset:0 atIndex:1];
+        [second_linear_encoder setBuffer:runtime->linear_weight_buffers[second_linear_slot] offset:runtime->linear_weight_offsets[second_linear_slot] atIndex:1];
         [second_linear_encoder setBuffer:runtime->linear_bias_buffers[second_linear_slot] offset:0 atIndex:2];
         [second_linear_encoder setBuffer:second_output_buffer offset:0 atIndex:3];
         [second_linear_encoder setBuffer:second_linear_params_buffer offset:0 atIndex:4];
@@ -44763,7 +44816,7 @@ int termite_metal_decode_runtime_apply_linear_pair_activation_multiply_linear_re
         if (gate_linear_encoder == nil) return -17;
         [gate_linear_encoder setComputePipelineState:runtime->linear_pipeline];
         [gate_linear_encoder setBuffer:input_buffer offset:0 atIndex:0];
-        [gate_linear_encoder setBuffer:runtime->linear_weight_buffers[gate_linear_slot] offset:0 atIndex:1];
+        [gate_linear_encoder setBuffer:runtime->linear_weight_buffers[gate_linear_slot] offset:runtime->linear_weight_offsets[gate_linear_slot] atIndex:1];
         [gate_linear_encoder setBuffer:runtime->linear_bias_buffers[gate_linear_slot] offset:0 atIndex:2];
         [gate_linear_encoder setBuffer:gate_output_buffer offset:0 atIndex:3];
         [gate_linear_encoder setBuffer:pair_linear_params_buffer offset:0 atIndex:4];
@@ -44777,7 +44830,7 @@ int termite_metal_decode_runtime_apply_linear_pair_activation_multiply_linear_re
         if (up_linear_encoder == nil) return -18;
         [up_linear_encoder setComputePipelineState:runtime->linear_pipeline];
         [up_linear_encoder setBuffer:input_buffer offset:0 atIndex:0];
-        [up_linear_encoder setBuffer:runtime->linear_weight_buffers[up_linear_slot] offset:0 atIndex:1];
+        [up_linear_encoder setBuffer:runtime->linear_weight_buffers[up_linear_slot] offset:runtime->linear_weight_offsets[up_linear_slot] atIndex:1];
         [up_linear_encoder setBuffer:runtime->linear_bias_buffers[up_linear_slot] offset:0 atIndex:2];
         [up_linear_encoder setBuffer:up_output_buffer offset:0 atIndex:3];
         [up_linear_encoder setBuffer:pair_linear_params_buffer offset:0 atIndex:4];
@@ -44813,7 +44866,7 @@ int termite_metal_decode_runtime_apply_linear_pair_activation_multiply_linear_re
         if (down_linear_encoder == nil) return -21;
         [down_linear_encoder setComputePipelineState:runtime->linear_pipeline];
         [down_linear_encoder setBuffer:gated_buffer offset:0 atIndex:0];
-        [down_linear_encoder setBuffer:runtime->linear_weight_buffers[down_linear_slot] offset:0 atIndex:1];
+        [down_linear_encoder setBuffer:runtime->linear_weight_buffers[down_linear_slot] offset:runtime->linear_weight_offsets[down_linear_slot] atIndex:1];
         [down_linear_encoder setBuffer:runtime->linear_bias_buffers[down_linear_slot] offset:0 atIndex:2];
         [down_linear_encoder setBuffer:projected_buffer offset:0 atIndex:3];
         [down_linear_encoder setBuffer:down_linear_params_buffer offset:0 atIndex:4];
@@ -49223,7 +49276,7 @@ static int termite_metal_decode_runtime_encode_attention_block_prefix(
             const BOOL use_reduce = hidden_size >= 128;
             [encoder setComputePipelineState:(use_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
             [encoder setBuffer:current_buffer offset:current_offset atIndex:0];
-            [encoder setBuffer:runtime->linear_weight_buffers[attention_linear_slot] offset:0 atIndex:1];
+            [encoder setBuffer:runtime->linear_weight_buffers[attention_linear_slot] offset:runtime->linear_weight_offsets[attention_linear_slot] atIndex:1];
             [encoder setBuffer:runtime->linear_bias_buffers[attention_linear_slot] offset:0 atIndex:2];
             [encoder setBuffer:tmp_b offset:0 atIndex:3];
             [encoder setBuffer:params_buffer offset:0 atIndex:4];
@@ -49409,7 +49462,7 @@ static int termite_metal_decode_runtime_encode_dense_ffn_residual(
         if (first_linear_encoder == nil) return -11;
         [first_linear_encoder setComputePipelineState:runtime->linear_pipeline];
         [first_linear_encoder setBuffer:input_buffer offset:0 atIndex:0];
-        [first_linear_encoder setBuffer:runtime->linear_weight_buffers[first_linear_slot] offset:0 atIndex:1];
+        [first_linear_encoder setBuffer:runtime->linear_weight_buffers[first_linear_slot] offset:runtime->linear_weight_offsets[first_linear_slot] atIndex:1];
         [first_linear_encoder setBuffer:runtime->linear_bias_buffers[first_linear_slot] offset:0 atIndex:2];
         [first_linear_encoder setBuffer:first_output_buffer offset:0 atIndex:3];
         [first_linear_encoder setBuffer:first_linear_params_buffer offset:0 atIndex:4];
@@ -49429,7 +49482,7 @@ static int termite_metal_decode_runtime_encode_dense_ffn_residual(
         if (second_linear_encoder == nil) return -13;
         [second_linear_encoder setComputePipelineState:runtime->linear_pipeline];
         [second_linear_encoder setBuffer:activated_buffer offset:0 atIndex:0];
-        [second_linear_encoder setBuffer:runtime->linear_weight_buffers[second_linear_slot] offset:0 atIndex:1];
+        [second_linear_encoder setBuffer:runtime->linear_weight_buffers[second_linear_slot] offset:runtime->linear_weight_offsets[second_linear_slot] atIndex:1];
         [second_linear_encoder setBuffer:runtime->linear_bias_buffers[second_linear_slot] offset:0 atIndex:2];
         [second_linear_encoder setBuffer:second_output_buffer offset:0 atIndex:3];
         [second_linear_encoder setBuffer:second_linear_params_buffer offset:0 atIndex:4];
@@ -49510,8 +49563,8 @@ static int termite_metal_decode_runtime_encode_gated_ffn_residual(
             if (pair_linear_encoder == nil) return -12;
             [pair_linear_encoder setComputePipelineState:runtime->linear_pair_reduce_pipeline];
             [pair_linear_encoder setBuffer:input_buffer offset:input_offset atIndex:0];
-            [pair_linear_encoder setBuffer:runtime->linear_weight_buffers[gate_linear_slot] offset:0 atIndex:1];
-            [pair_linear_encoder setBuffer:runtime->linear_weight_buffers[up_linear_slot] offset:0 atIndex:2];
+            [pair_linear_encoder setBuffer:runtime->linear_weight_buffers[gate_linear_slot] offset:runtime->linear_weight_offsets[gate_linear_slot] atIndex:1];
+            [pair_linear_encoder setBuffer:runtime->linear_weight_buffers[up_linear_slot] offset:runtime->linear_weight_offsets[up_linear_slot] atIndex:2];
             [pair_linear_encoder setBuffer:runtime->linear_bias_buffers[gate_linear_slot] offset:0 atIndex:3];
             [pair_linear_encoder setBuffer:runtime->linear_bias_buffers[up_linear_slot] offset:0 atIndex:4];
             [pair_linear_encoder setBuffer:gate_output_buffer offset:0 atIndex:5];
@@ -49524,7 +49577,7 @@ static int termite_metal_decode_runtime_encode_gated_ffn_residual(
             if (gate_linear_encoder == nil) return -12;
             [gate_linear_encoder setComputePipelineState:runtime->linear_pipeline];
             [gate_linear_encoder setBuffer:input_buffer offset:input_offset atIndex:0];
-            [gate_linear_encoder setBuffer:runtime->linear_weight_buffers[gate_linear_slot] offset:0 atIndex:1];
+            [gate_linear_encoder setBuffer:runtime->linear_weight_buffers[gate_linear_slot] offset:runtime->linear_weight_offsets[gate_linear_slot] atIndex:1];
             [gate_linear_encoder setBuffer:runtime->linear_bias_buffers[gate_linear_slot] offset:0 atIndex:2];
             [gate_linear_encoder setBuffer:gate_output_buffer offset:0 atIndex:3];
             [gate_linear_encoder setBuffer:pair_linear_params_buffer offset:0 atIndex:4];
@@ -49535,7 +49588,7 @@ static int termite_metal_decode_runtime_encode_gated_ffn_residual(
             if (up_linear_encoder == nil) return -13;
             [up_linear_encoder setComputePipelineState:runtime->linear_pipeline];
             [up_linear_encoder setBuffer:input_buffer offset:input_offset atIndex:0];
-            [up_linear_encoder setBuffer:runtime->linear_weight_buffers[up_linear_slot] offset:0 atIndex:1];
+            [up_linear_encoder setBuffer:runtime->linear_weight_buffers[up_linear_slot] offset:runtime->linear_weight_offsets[up_linear_slot] atIndex:1];
             [up_linear_encoder setBuffer:runtime->linear_bias_buffers[up_linear_slot] offset:0 atIndex:2];
             [up_linear_encoder setBuffer:up_output_buffer offset:0 atIndex:3];
             [up_linear_encoder setBuffer:pair_linear_params_buffer offset:0 atIndex:4];
@@ -49582,7 +49635,7 @@ static int termite_metal_decode_runtime_encode_gated_ffn_residual(
         const BOOL use_down_reduce = hidden_size >= 128;
         [down_linear_encoder setComputePipelineState:(use_down_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         [down_linear_encoder setBuffer:down_input_buffer offset:0 atIndex:0];
-        [down_linear_encoder setBuffer:runtime->linear_weight_buffers[down_linear_slot] offset:0 atIndex:1];
+        [down_linear_encoder setBuffer:runtime->linear_weight_buffers[down_linear_slot] offset:runtime->linear_weight_offsets[down_linear_slot] atIndex:1];
         [down_linear_encoder setBuffer:runtime->linear_bias_buffers[down_linear_slot] offset:0 atIndex:2];
         [down_linear_encoder setBuffer:projected_buffer offset:0 atIndex:3];
         [down_linear_encoder setBuffer:down_linear_params_buffer offset:0 atIndex:4];
@@ -50240,7 +50293,7 @@ int termite_metal_decode_runtime_apply_attention_gated_block_q_slot(
         const BOOL use_q_reduce = attention_input_size >= 128;
         [q_encoder setComputePipelineState:(use_q_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         [q_encoder setBuffer:input_buffer offset:0 atIndex:0];
-        [q_encoder setBuffer:runtime->linear_weight_buffers[q_linear_slot] offset:0 atIndex:1];
+        [q_encoder setBuffer:runtime->linear_weight_buffers[q_linear_slot] offset:runtime->linear_weight_offsets[q_linear_slot] atIndex:1];
         [q_encoder setBuffer:runtime->linear_bias_buffers[q_linear_slot] offset:0 atIndex:2];
         [q_encoder setBuffer:q_buffer offset:0 atIndex:3];
         [q_encoder setBytes:&q_params length:sizeof(q_params) atIndex:4];
@@ -50804,7 +50857,7 @@ int termite_metal_decode_runtime_apply_attention_gated_block_q_slot_device(
         const BOOL use_q_reduce = attention_input_size >= 128;
         [q_encoder setComputePipelineState:(use_q_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         [q_encoder setBuffer:input_buffer offset:attention_input_offset atIndex:0];
-        [q_encoder setBuffer:runtime->linear_weight_buffers[q_linear_slot] offset:0 atIndex:1];
+        [q_encoder setBuffer:runtime->linear_weight_buffers[q_linear_slot] offset:runtime->linear_weight_offsets[q_linear_slot] atIndex:1];
         [q_encoder setBuffer:runtime->linear_bias_buffers[q_linear_slot] offset:0 atIndex:2];
         [q_encoder setBuffer:q_buffer offset:0 atIndex:3];
         [q_encoder setBytes:&q_params length:sizeof(q_params) atIndex:4];
@@ -51015,7 +51068,7 @@ int termite_metal_decode_runtime_apply_attention_gated_block_q_slot_device_kv_de
         const BOOL use_q_reduce = attention_input_size >= 128;
         [q_encoder setComputePipelineState:(use_q_reduce ? runtime->linear_reduce_pipeline : runtime->linear_pipeline)];
         [q_encoder setBuffer:input_buffer offset:attention_input_offset atIndex:0];
-        [q_encoder setBuffer:runtime->linear_weight_buffers[q_linear_slot] offset:0 atIndex:1];
+        [q_encoder setBuffer:runtime->linear_weight_buffers[q_linear_slot] offset:runtime->linear_weight_offsets[q_linear_slot] atIndex:1];
         [q_encoder setBuffer:runtime->linear_bias_buffers[q_linear_slot] offset:0 atIndex:2];
         [q_encoder setBuffer:q_buffer offset:0 atIndex:3];
         [q_encoder setBytes:&q_params length:sizeof(q_params) atIndex:4];

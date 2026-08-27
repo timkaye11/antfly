@@ -167,7 +167,7 @@ pub const SafetensorsStore = struct {
         .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
-        .discardTensorFileCache = &discardTensorFileCacheNoop,
+        .discardTensorFileCache = @ptrCast(&discardTensorFileCacheImpl),
         .ggufFile = @ptrCast(&ggufFileImpl),
         .deinit = @ptrCast(&deinitSelf),
     };
@@ -230,6 +230,16 @@ pub const SafetensorsStore = struct {
         return null;
     }
 
+    fn discardTensorFileCacheImpl(self: *SafetensorsStore, name: []const u8) void {
+        const meta = self.source.reader.header.tensors.get(name) orelse return;
+        const region = if (self.source.reader.mmap_region) |*mapped| mapped else return;
+        const data_offset = std.math.cast(usize, self.source.reader.data_offset) orelse return;
+        const tensor_offset = std.math.cast(usize, meta.data_start) orelse return;
+        const tensor_len = std.math.cast(usize, meta.data_end - meta.data_start) orelse return;
+        const absolute_offset = std.math.add(usize, data_offset, tensor_offset) catch return;
+        region.discardFileRange(absolute_offset, tensor_len);
+    }
+
     fn ggufFileImpl(_: *SafetensorsStore) ?*const gguf_mod.format.File {
         return null;
     }
@@ -252,7 +262,7 @@ pub const ShardedSafetensorsStore = struct {
         .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
-        .discardTensorFileCache = &discardTensorFileCacheNoop,
+        .discardTensorFileCache = @ptrCast(&discardTensorFileCacheImpl),
         .ggufFile = @ptrCast(&ggufFileImpl),
         .deinit = @ptrCast(&deinitSelf),
     };
@@ -312,6 +322,16 @@ pub const ShardedSafetensorsStore = struct {
 
     fn loadQuantizedStorageRefImpl(_: *ShardedSafetensorsStore, _: *const LazyTensorRef) !?weight_source_mod.QuantizedStorage {
         return null;
+    }
+
+    fn discardTensorFileCacheImpl(self: *ShardedSafetensorsStore, name: []const u8) void {
+        const resolved = self.source.findTensorMeta(name) catch return;
+        const region = if (resolved.reader.mmap_region) |*mapped| mapped else return;
+        const data_offset = std.math.cast(usize, resolved.reader.data_offset) orelse return;
+        const tensor_offset = std.math.cast(usize, resolved.meta.data_start) orelse return;
+        const tensor_len = std.math.cast(usize, resolved.meta.data_end - resolved.meta.data_start) orelse return;
+        const absolute_offset = std.math.add(usize, data_offset, tensor_offset) catch return;
+        region.discardFileRange(absolute_offset, tensor_len);
     }
 
     fn ggufFileImpl(_: *ShardedSafetensorsStore) ?*const gguf_mod.format.File {
@@ -1253,7 +1273,7 @@ test "safetensors tensor store preserves f16 dtype" {
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&values), loaded.tensor.data);
 }
 
-test "safetensors tensor store describes absolute byte ranges" {
+test "gemma4 safetensors tensor store describes absolute byte ranges and survives discard" {
     const allocator = std.testing.allocator;
 
     const json =
@@ -1293,6 +1313,13 @@ test "safetensors tensor store describes absolute byte ranges" {
     try std.testing.expectEqual(DType.bf16, range.dtype);
     try std.testing.expectEqual(@as(i64, 2), range.shape[0]);
     try std.testing.expectEqual(@as(i64, 2), range.shape[1]);
+
+    store.discardTensorFileCache("weights");
+    var tensor_ref = try store.describeTensor(allocator, "weights");
+    defer tensor_ref.deinit(allocator);
+    var loaded = try store.loadTensorRef(&tensor_ref);
+    defer loaded.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, loaded.tensor.data);
 }
 
 test "open gguf tensor store from manifest" {

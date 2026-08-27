@@ -44,6 +44,7 @@ const RuntimeContext = struct {
     cb: ops.ComputeBackend,
     gpt_config: gpt_mod.Config,
     kv_manager: runtime.kv.manager.KvManager,
+    kv_storage: runtime.kv.storage_runtime.KvStorageRuntime,
     pool_id: runtime.kv.block.KvPoolId,
     decode_runtime: decode_state_runtime.DecodeStateRuntime,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
@@ -75,7 +76,7 @@ const RuntimeContext = struct {
         const kv_dtype = kv_dtype_override orelse session_factory.recommendedKvDTypeForSession(session, backend_kind);
         const sliding_window_size = gpt_config.kvPoolSlidingWindowSize(false);
 
-        const pool_id = try kv_manager.addPool(.{
+        const kv_pool_config: runtime.kv.pool.KvPoolConfig = .{
             .backend = backend_kind,
             .dtype = kv_dtype,
             .page_size_tokens = 16,
@@ -83,7 +84,11 @@ const RuntimeContext = struct {
             .num_kv_heads = gpt_config.maxKvHeads(),
             .head_dim = gpt_config.maxHeadDim(),
             .sliding_window_size = sliding_window_size,
-        });
+        };
+        const pool_id = try kv_manager.addPool(kv_pool_config);
+        var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config);
+        errdefer kv_storage.deinit();
+        try cb.provisionKvDeviceWriteHook(&kv_storage);
 
         const ctx = try allocator.create(RuntimeContext);
         ctx.* = .{
@@ -91,13 +96,15 @@ const RuntimeContext = struct {
             .cb = cb,
             .gpt_config = gpt_config,
             .kv_manager = kv_manager,
+            .kv_storage = kv_storage,
             .pool_id = pool_id,
             .decode_runtime = undefined,
             .shared_moe_cache = shared_moe_cache,
         };
-        ctx.decode_runtime = decode_state_runtime.DecodeStateRuntime.initPaged(
+        ctx.decode_runtime = decode_state_runtime.DecodeStateRuntime.initPagedWithStorage(
             allocator,
             &ctx.kv_manager,
+            &ctx.kv_storage,
             pool_id,
             shared_moe_cache,
         );
@@ -106,9 +113,10 @@ const RuntimeContext = struct {
 
     fn resetState(self: *RuntimeContext) !void {
         self.decode_runtime.deinit();
-        self.decode_runtime = decode_state_runtime.DecodeStateRuntime.initPaged(
+        self.decode_runtime = decode_state_runtime.DecodeStateRuntime.initPagedWithStorage(
             self.allocator,
             &self.kv_manager,
+            &self.kv_storage,
             self.pool_id,
             self.shared_moe_cache,
         );
@@ -116,6 +124,7 @@ const RuntimeContext = struct {
 
     fn deinit(self: *RuntimeContext) void {
         self.decode_runtime.deinit();
+        self.kv_storage.deinit();
         self.kv_manager.deinit();
         self.cb.deinit();
         self.allocator.destroy(self);

@@ -22,6 +22,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 
+const supports_madvise_discard = switch (builtin.os.tag) {
+    .driverkit, .ios, .linux, .maccatalyst, .macos, .tvos, .visionos, .watchos => true,
+    else => false,
+};
+
 pub const link_libc = build_options.link_libc;
 
 pub const c = if (build_options.link_libc) PosixC else struct {};
@@ -150,22 +155,34 @@ pub const MmapRegion = struct {
     }
 
     /// Release clean pages for a consumed file-backed range. The mapping stays
-    /// valid: a later access faults the bytes back from the file. This is an
-    /// advisory Linux optimization and deliberately cannot fail allocation or
-    /// inference when a kernel/filesystem declines either hint.
+    /// valid: a later access faults the bytes back from the file. Only complete
+    /// runtime pages wholly contained in the requested range are advised, so
+    /// packed neighboring tensors cannot lose a shared boundary page. This is
+    /// advisory and deliberately cannot fail inference when the OS declines it.
     pub fn discardFileRange(self: *MmapRegion, offset: usize, len: usize) void {
         if (!comptime build_options.link_libc) return;
-        if (comptime builtin.os.tag != .linux) return;
+        if (!comptime supports_madvise_discard) return;
         if (offset >= self.data.len or len == 0) return;
 
         const clamped_len = @min(len, self.data.len - offset);
-        advise(self.data.ptr + offset, clamped_len, .dont_need);
-        _ = c.posix_fadvise(
-            self.fd,
-            @intCast(offset),
-            @intCast(clamped_len),
-            c.POSIX_FADV_DONTNEED,
-        );
+        const page_size = std.heap.pageSize();
+        const mapping_start = @intFromPtr(self.data.ptr);
+        const requested_start = std.math.add(usize, mapping_start, offset) catch return;
+        const requested_end = std.math.add(usize, requested_start, clamped_len) catch return;
+        const aligned_start = std.mem.alignForward(usize, requested_start, page_size);
+        const aligned_end = std.mem.alignBackward(usize, requested_end, page_size);
+        if (aligned_start >= aligned_end) return;
+
+        const advised_len = aligned_end - aligned_start;
+        advise(@ptrFromInt(aligned_start), advised_len, .dont_need);
+        if (comptime builtin.os.tag == .linux) {
+            _ = c.posix_fadvise(
+                self.fd,
+                @intCast(aligned_start - mapping_start),
+                @intCast(advised_len),
+                c.POSIX_FADV_DONTNEED,
+            );
+        }
     }
 
     pub fn deinit(self: *MmapRegion) void {
@@ -178,7 +195,7 @@ pub const MmapRegion = struct {
         // envelope even though the evicted model owns no live memory. Both
         // hints are best effort and affect only clean file-backed pages:
         // anonymous, dirty, writeback, and still-shared pages remain charged.
-        if (comptime build_options.link_libc and builtin.os.tag == .linux) {
+        if (comptime build_options.link_libc and supports_madvise_discard) {
             advise(self.data.ptr, mapped_len, .dont_need);
         }
         std.posix.munmap(self.data);
@@ -448,12 +465,12 @@ fn advise(ptr: [*]u8, len: usize, advice: Advice) void {
             .random => c.MADV_RANDOM,
             .dont_need => c.MADV_DONTNEED,
         };
-        const page_size = std.heap.page_size_min;
+        const page_size = std.heap.pageSize();
         const start = @intFromPtr(ptr);
         const aligned_start = std.mem.alignBackward(usize, start, page_size);
         const prefix = start - aligned_start;
         const advised_len = len + prefix;
-        const aligned_ptr: *align(page_size) anyopaque = @ptrFromInt(aligned_start);
+        const aligned_ptr: *align(std.heap.page_size_min) anyopaque = @ptrFromInt(aligned_start);
         _ = c.madvise(aligned_ptr, advised_len, c_advice);
     }
 }
@@ -525,6 +542,30 @@ test "MmapRegion advice preserves readable mapped data" {
     // the mapping or change the file-backed contents.
     region.discardFileRange(7, 13);
     try std.testing.expectEqualSlices(u8, payload, region.data[0..payload.len]);
+}
+
+test "gemma4 MmapRegion discard keeps page-aligned interior readable" {
+    if (!comptime build_options.link_libc or !supports_madvise_discard) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const page_size = std.heap.pageSize();
+    const payload = try allocator.alloc(u8, page_size * 3);
+    defer allocator.free(payload);
+    for (payload, 0..) |*byte, index| byte.* = @truncate(index *% 131);
+
+    const path = try std.fmt.allocPrint(allocator, "/tmp/termite_mmap_discard_test_{d}", .{std.posix.system.getpid()});
+    defer allocator.free(path);
+    {
+        var file = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{ .truncate = true });
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, payload);
+    }
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, path) catch {};
+
+    var region = try MmapRegion.init(allocator, path);
+    defer region.deinit();
+    region.discardFileRange(page_size / 2, page_size * 2);
+    try std.testing.expectEqualSlices(u8, payload, region.data);
 }
 
 test "mmapTempCopy maps unlinked temp data" {

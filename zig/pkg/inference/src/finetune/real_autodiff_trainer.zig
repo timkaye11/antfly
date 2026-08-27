@@ -713,6 +713,8 @@ pub const RealAutodiffTrainer = struct {
     coord: ?*TrainingMemoryCoordinator = null,
     compiled_session: ?training.CompiledTrainSession = null,
     compiled_eval_session: ?training.CompiledTrainSession = null,
+    compiled_output_session: ?training.CompiledTrainSession = null,
+    compiled_output_source_node: ?NodeId = null,
     graph_signature: ?GraphSignature = null,
     graph_context_state: ?*anyopaque = null,
     inactive_graphs: std.ArrayListUnmanaged(CachedGraphState) = .empty,
@@ -865,12 +867,15 @@ pub const RealAutodiffTrainer = struct {
         graph_state: GraphState,
         compiled_session: ?training.CompiledTrainSession,
         compiled_eval_session: ?training.CompiledTrainSession,
+        compiled_output_session: ?training.CompiledTrainSession,
+        compiled_output_source_node: ?NodeId,
         graph_context_state: ?*anyopaque,
         last_used: u64,
 
         fn deinit(self: *CachedGraphState, trainer: *RealAutodiffTrainer) void {
             if (self.compiled_session) |*session| session.deinit();
             if (self.compiled_eval_session) |*session| session.deinit();
+            if (self.compiled_output_session) |*session| session.deinit();
             if (self.signature.deinit_graph_context) |deinit_context| {
                 deinit_context(self.graph_context_state, trainer.allocator);
             }
@@ -975,6 +980,8 @@ pub const RealAutodiffTrainer = struct {
             self.graph_state = cached.graph_state;
             self.compiled_session = cached.compiled_session;
             self.compiled_eval_session = cached.compiled_eval_session;
+            self.compiled_output_session = cached.compiled_output_session;
+            self.compiled_output_source_node = cached.compiled_output_source_node;
             self.runtime_input_cache = .{};
             self.graph_signature = cached.signature;
             self.graph_context_state = cached.graph_context_state;
@@ -1060,12 +1067,16 @@ pub const RealAutodiffTrainer = struct {
             .graph_state = self.graph_state.?,
             .compiled_session = self.compiled_session,
             .compiled_eval_session = self.compiled_eval_session,
+            .compiled_output_session = self.compiled_output_session,
+            .compiled_output_source_node = self.compiled_output_source_node,
             .graph_context_state = self.graph_context_state,
             .last_used = self.graph_cache_clock,
         });
         self.graph_state = null;
         self.compiled_session = null;
         self.compiled_eval_session = null;
+        self.compiled_output_session = null;
+        self.compiled_output_source_node = null;
         self.runtime_input_cache = .{};
         self.graph_context_state = null;
         self.graph_signature = null;
@@ -1091,6 +1102,32 @@ pub const RealAutodiffTrainer = struct {
             .resident_signatures = self.inactive_graphs.items.len + @intFromBool(self.graph_state != null),
             .peak_resident_signatures = self.graph_cache_peak_entries,
         };
+    }
+
+    /// Retire graph, compiled-session, and runtime-input caches at a durable
+    /// optimizer checkpoint without touching trainable weights, accumulated
+    /// gradients, Adam moments, or counters. A tensor checkpoint cannot carry
+    /// backend execution plans into a fresh process, so uninterrupted
+    /// continuation must cross the same cache-empty boundary for exact resume.
+    pub fn retireExecutionCachesAtCheckpointBoundary(self: *RealAutodiffTrainer) !void {
+        if (self.terminal_evaluation_only) return error.TrainerIsTerminalEvaluationOnly;
+        if (self.accum_count != 0) return error.CheckpointDuringGradientAccumulation;
+        if (self.compute_backend.kind() == .metal) {
+            try self.compute_backend.decoderRuntimeSubmitAndWaitFrame();
+            if (self.compute_backend.decoderRuntimeHasActiveFrame()) {
+                return error.CheckpointExecutionCacheSynchronizationFailed;
+            }
+        }
+
+        self.retireExecutionCaches();
+    }
+
+    fn retireExecutionCaches(self: *RealAutodiffTrainer) void {
+        const resident_entries = self.inactive_graphs.items.len + @intFromBool(self.graph_state != null);
+        self.deinitActiveGraph();
+        for (self.inactive_graphs.items) |*entry| entry.deinit(self);
+        self.inactive_graphs.clearRetainingCapacity();
+        self.graph_cache_evictions +%= resident_entries;
     }
 
     /// Make terminal held-out evaluation a function of the final host-visible
@@ -1219,6 +1256,9 @@ pub const RealAutodiffTrainer = struct {
         self.compiled_session = null;
         if (self.compiled_eval_session) |*session| session.deinit();
         self.compiled_eval_session = null;
+        if (self.compiled_output_session) |*session| session.deinit();
+        self.compiled_output_session = null;
+        self.compiled_output_source_node = null;
         self.deinitRuntimeInputCache();
         if (self.graph_signature) |signature| {
             if (signature.deinit_graph_context) |deinit_context| {
@@ -1333,6 +1373,33 @@ pub const RealAutodiffTrainer = struct {
                 },
             );
         }
+        return true;
+    }
+
+    /// Build and cache a forward-only compiled session for one source-graph
+    /// output. GRPO sampling uses this for its sparse logits row so repeated
+    /// candidate forwards share the graph executor's cached plan instead of
+    /// rebuilding and draining an eager interpreter traversal every time.
+    pub fn ensureCompiledOutputSessionBuilt(
+        self: *RealAutodiffTrainer,
+        output_node: NodeId,
+    ) !bool {
+        const gs = &(self.graph_state orelse return error.GraphNotBuilt);
+        if (output_node == null_node or output_node >= gs.graph.nodeCount()) {
+            return error.InvalidCompiledOutputNode;
+        }
+        if (self.compiled_output_session != null and self.compiled_output_source_node == output_node) {
+            return true;
+        }
+        if (self.compiled_output_session) |*session| session.deinit();
+        self.compiled_output_session = null;
+        self.compiled_output_source_node = null;
+        self.compiled_output_session = try training.CompiledTrainSession.initForwardOutputOnly(
+            self.allocator,
+            &gs.graph,
+            output_node,
+        );
+        self.compiled_output_source_node = output_node;
         return true;
     }
 
@@ -1592,6 +1659,7 @@ pub const RealAutodiffTrainer = struct {
     pub fn benchmarkHasExecutedGraph(self: *const RealAutodiffTrainer) bool {
         return self.compiled_session != null or
             self.compiled_eval_session != null or
+            self.compiled_output_session != null or
             self.step_count != 0 or
             self.optimizer_step_count != 0;
     }
@@ -2869,6 +2937,48 @@ pub const RealAutodiffTrainer = struct {
         try self.ensureDeviceOptimizerSlots();
         for (self.lora_params.items) |*slot| try self.uploadRestoredOptimizerSlot(slot);
         for (self.regular_params.items) |*slot| try self.uploadRestoredOptimizerSlot(slot);
+        // A restored weight is consumed by the next forward pass, while Adam
+        // moments are first consumed only by the next optimizer dispatch. Do
+        // not let an apparently correct forward mask an outstanding private-
+        // buffer upload for m/v/grad_accum. Loading a checkpoint is a durable
+        // device-state boundary: every restored slot must be visible before
+        // the caller can build or execute another graph.
+        try self.compute_backend.trainingSynchronize();
+        try self.validateRestoredDeviceOptimizerState();
+    }
+
+    fn validateRestoredDeviceOptimizerState(self: *RealAutodiffTrainer) !void {
+        for (self.lora_params.items) |*slot| try self.validateRestoredDeviceOptimizerSlot(slot);
+        for (self.regular_params.items) |*slot| try self.validateRestoredDeviceOptimizerSlot(slot);
+    }
+
+    fn validateRestoredDeviceOptimizerSlot(self: *RealAutodiffTrainer, slot: *ParamSlot) !void {
+        const state = self.optimizer_state.param_states.get(slot.name) orelse return error.MissingOptimizerState;
+        const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
+        if (!try self.restoredDeviceTensorMatches(device.weight, slot.weights)) {
+            return error.RestoredDeviceWeightMismatch;
+        }
+        if (!try self.restoredDeviceTensorMatches(device.m, state.m)) {
+            return error.RestoredDeviceFirstMomentMismatch;
+        }
+        if (!try self.restoredDeviceTensorMatches(device.v, state.v)) {
+            return error.RestoredDeviceSecondMomentMismatch;
+        }
+        if (!try self.restoredDeviceTensorMatches(device.grad_accum, slot.grad_accum)) {
+            return error.RestoredDeviceGradientAccumMismatch;
+        }
+    }
+
+    fn restoredDeviceTensorMatches(
+        self: *RealAutodiffTrainer,
+        tensor: CT,
+        expected: []const f32,
+    ) !bool {
+        const actual = try self.compute_backend.toFloat32(tensor, self.allocator);
+        defer self.allocator.free(actual);
+        self.device_optimizer_transfers += 1;
+        return actual.len == expected.len and
+            std.mem.eql(u8, std.mem.sliceAsBytes(actual), std.mem.sliceAsBytes(expected));
     }
 
     fn uploadRestoredOptimizerSlot(self: *RealAutodiffTrainer, slot: *ParamSlot) !void {
@@ -4555,6 +4665,12 @@ test "RealAutodiffTrainer: bounded shape cache shares trainables and isolates co
         gs_a.loss_node,
         .{ .trainable_params = &trainable },
     );
+    trainer.compiled_output_session = try training.CompiledTrainSession.initOutputOnly(
+        allocator,
+        &gs_a.graph,
+        gs_a.loss_node,
+    );
+    trainer.compiled_output_source_node = gs_a.loss_node;
     trainer.runtime_input_cache.input_ids.dims = try allocator.dupe(i32, &.{ 1, 2 });
     trainer.runtime_input_cache.input_ids.elem_count = 2;
 
@@ -4576,6 +4692,8 @@ test "RealAutodiffTrainer: bounded shape cache shares trainables and isolates co
     try trainer.ensureGraphBuilt(input_b);
     try testing.expectEqual(@as(usize, 1), trainer.inactive_graphs.items.len);
     try testing.expect(trainer.compiled_session == null);
+    try testing.expect(trainer.compiled_output_session == null);
+    try testing.expect(trainer.compiled_output_source_node == null);
     try testing.expectEqual(@as(usize, 0), trainer.runtime_input_cache.input_ids.dims.len);
     try testing.expectEqual(@as(f32, 3.25), trainer.lora_params.items[0].weights[0]);
     try testing.expectEqual(@as(u64, 7), trainer.step_count);
@@ -4586,6 +4704,8 @@ test "RealAutodiffTrainer: bounded shape cache shares trainables and isolates co
     trainer.runtime_input_cache.input_ids.elem_count = 4;
     try trainer.ensureGraphBuilt(input_a);
     try testing.expect(trainer.compiled_session != null);
+    try testing.expect(trainer.compiled_output_session != null);
+    try testing.expectEqual(trainer.graph_state.?.loss_node, trainer.compiled_output_source_node.?);
     try testing.expectEqual(@as(usize, 0), trainer.runtime_input_cache.input_ids.dims.len);
     try testing.expectEqual(@as(u32, 2), ctx.active_seq_len);
     try testing.expectEqual(@as(f32, 3.25), trainer.lora_params.items[0].weights[0]);
@@ -4612,6 +4732,19 @@ test "RealAutodiffTrainer: bounded shape cache shares trainables and isolates co
     try testing.expectEqual(@as(u32, 4), trainer.inactive_graphs.items[0].signature.seq_len);
     try testing.expectEqual(@as(u32, 6), trainer.graph_signature.?.seq_len);
     try testing.expectEqualStrings("test.linear.weight.lora_A", trainer.lora_params.items[0].name);
+
+    const evictions_before = trainer.graph_cache_evictions;
+    trainer.retireExecutionCaches();
+    try testing.expect(trainer.graph_state == null);
+    try testing.expect(trainer.graph_signature == null);
+    try testing.expect(trainer.compiled_session == null);
+    try testing.expect(trainer.compiled_eval_session == null);
+    try testing.expect(trainer.compiled_output_session == null);
+    try testing.expectEqual(@as(usize, 0), trainer.inactive_graphs.items.len);
+    try testing.expectEqual(evictions_before + 2, trainer.graph_cache_evictions);
+    try testing.expectEqual(@as(f32, 3.25), trainer.lora_params.items[0].weights[0]);
+    try testing.expectEqual(@as(u64, 7), trainer.step_count);
+    try testing.expectEqual(@as(u64, 3), trainer.optimizer_step_count);
 }
 
 test "gemma4 RealAutodiffTrainer: runtime LoRA inventory survives active graph retirement" {

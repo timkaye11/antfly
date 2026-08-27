@@ -208,7 +208,13 @@ pub const MetalKvStorage = struct {
         paged: bool,
     ) !*SlotBinding {
         if (self.slot_map.getPtr(key)) |binding| {
-            if (binding.ring_page_count != ring_page_count) return error.DeviceWriteFallback;
+            if (binding.ring_page_count != ring_page_count) {
+                if (traceKvGather()) std.debug.print(
+                    "kv-binding-policy-mismatch: seq={d} layer={d} existing_ring_pages={d} requested_ring_pages={d} paged={}\n",
+                    .{ key.sequence_id, key.layer_index, binding.ring_page_count, ring_page_count, paged },
+                );
+                return error.DeviceWriteFallback;
+            }
             return binding;
         }
 

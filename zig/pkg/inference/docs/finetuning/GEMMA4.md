@@ -1,17 +1,20 @@
 # Gemma4 E2B/E4B LoRA Fine-Tuning
 
 > Status: production-candidate for the explicitly qualified single-device,
-> text-only BF16 LoRA-SFT and DPO lanes. E2B GRPO passes a bounded
-> three-seed/eight-epoch absolute-floor gate; E4B GRPO misses its predeclared
-> top-rank floor and remains quality-blocked. Exact incremental KV reuse is
-> experimental and default-off because the first serial implementation
-> regresses throughput. Canonical direct-GGUF E2B SFT/DPO/GRPO remains an
-> experimental research surface, and public QLoRA remains fail-closed. This is
-> not a blanket production-ready claim: independent-initialization and
-> baseline-relative gate machinery is implemented but has not yet produced a
-> replacement E2B/E4B campaign; required CI, real production-scale deployment
-> materialization evidence, full HF numerical parity, repeated performance,
-> and GGUF task-parity gates remain.
+> text-only BF16 LoRA-SFT and DPO lanes. Independent-initialization,
+> baseline-relative E2B DPO passes three seeds over eight epochs. Historical
+> E2B GRPO passes its bounded absolute-floor gate, but the restart-safe compiled
+> sampler remains default-off and quality-blocked: current seed-17 fail-fast
+> campaigns at learning rates `5e-7`, `7.5e-7`, and `1e-6` complete safely but
+> do not improve held-out reward over their initialized baseline. E4B GRPO also
+> misses its predeclared top-rank floor and remains quality-blocked. Exact
+> incremental KV reuse is experimental and default-off because the first serial
+> implementation regresses throughput. Canonical direct-GGUF E2B SFT/DPO/GRPO
+> remains an experimental research surface, and public QLoRA remains
+> fail-closed. This is not a blanket production-ready claim: required hosted
+> CI, a fresh-host zero-paging attestation, E4B memory/performance and quality,
+> full HF numerical parity, repeated performance, and GGUF task-parity gates
+> remain.
 
 The current Zig path implements the text causal-LM graph, sparse loss, LoRA
 optimizer, evaluation, and artifact pipeline intended for Gemma4 E2B and E4B
@@ -31,13 +34,14 @@ loss tracks the weighted-KL tolerance while its policy-gradient loss remains
 exact. Three-seed/eight-epoch absolute-floor campaigns pass for E2B/E4B DPO and
 E2B GRPO; E4B GRPO completes healthy optimizer work but fails held-out top-rank
 quality. Those archived results establish bounded data-order robustness only.
-The current qualifier now creates a distinct deterministically seeded adapter
-per run and requires held-out improvement over that run's initialized adapter,
-but the E2B/E4B campaigns must be rerun before claiming independent-
-initialization or baseline-relative quality. Multi-task convergence, repeated
-distribution-level performance, and required-CI acceptance also remain open.
-This remains an implementation and qualification contract rather than a
-blanket readiness claim.
+The current qualifier creates a distinct deterministically seeded adapter per
+run and requires held-out improvement over that run's initialized adapter. E2B
+DPO passes that stronger gate. E2B GRPO does not: the final restart-safe binary
+fails closed at seed 17 across the bounded learning-rate sweep documented
+below, and E4B has not been rerun under the stronger contract. Multi-task
+convergence, repeated distribution-level performance, and required-CI
+acceptance also remain open. This remains an implementation and qualification
+contract rather than a blanket readiness claim.
 
 Distributed training, multimodal/projector training, public GGUF QLoRA recipes,
 and Gemma4 MoE models are outside the supported path described here. Q4_0,
@@ -489,7 +493,7 @@ and quality evidence.
 
 | Lane | Base artifact | Purpose | Current release posture |
 | --- | --- | --- | --- |
-| BF16 correctness | Unquantized BF16 Safetensors | Establish native forward, loss, gradient, optimizer-update, and adapter-save correctness, then compare the stored-weight Metal kernel | Final-binary E2B and E4B Metal jobs pass process-kill/resume with byte-identical adapters. Three-seed/eight-epoch E2B/E4B DPO and E2B GRPO pass historical bounded absolute quality floors; E4B GRPO fails the predeclared top-rank floor. Independent-initialization and baseline-relative gates are implemented but await replacement campaigns; full HF parity, distribution-level performance, and required CI remain open |
+| BF16 correctness | Unquantized BF16 Safetensors | Establish native forward, loss, gradient, optimizer-update, and adapter-save correctness, then compare the stored-weight Metal kernel | Final-binary E2B and E4B Metal jobs pass process-kill/resume with byte-identical adapters. Three-seed/eight-epoch E2B/E4B DPO and E2B GRPO pass historical bounded absolute quality floors; E4B GRPO fails the predeclared top-rank floor. Independent-initialization, baseline-relative E2B DPO passes, while restart-safe compiled E2B GRPO fails its current seed-17 learning-rate sweep and E4B has not been rerun under the stronger contract. Full HF parity, distribution-level performance, and required CI remain open |
 | Q4 deployment / QLoRA substrate | QAT Q4 GGUF used by serving | Prove target-name compatibility, adapter loading/application, memory bounds, and post-training generation quality on the deployed base | Packed Q4_0/Q4_K/Q6_K `dX` kernels pass without host dequantization, and explicitly gated canonical E2B Q4_0 SFT/DPO/GRPO lanes pass optimizer and process-kill/resume gates. Public `qlora-sft`, E4B GGUF, memory, parity, and task-quality gates remain fail-closed; direct-GGUF plus incremental-KV GRPO is separately rejected |
 
 The loaders may accept a Q4 GGUF and bootstrap adapter targets from its tensor
@@ -2918,6 +2922,208 @@ output manifest, report, adapter, or model subdirectory. These fixes do not
 change the preserved E4B GRPO quality failure or enable direct-GGUF plus
 incremental-KV GRPO.
 
+## E2B Preference Performance Candidate (2026-08-26)
+
+This pass treated performance as a correctness-constrained release gate. It
+used the retained ReleaseFast rollback binary for DPO A/B tests and a separately
+frozen candidate binary for GRPO. Every accepted comparison used the same E2B
+BF16 model, rank-16 / alpha-32 Q/V adapter, sequence length 128, data order,
+seed, and update/evaluation schedule. All benchmark processes reported zero
+swap-in and swap-out. The host already had system swap allocated before the
+campaign, so these runs are diagnostic evidence rather than a fresh-host
+zero-paging release attestation.
+
+The fixed-shape 25-update DPO control had a `2.473715 s` median update. Four
+behaviorally exact candidates did not improve it:
+
+| DPO candidate | Median update | Change from control | Decision |
+| --- | ---: | ---: | --- |
+| Coalesced gradient snapshot | `2.478296 s` | `+0.18%` | reject |
+| Ping-pong gradient buffers | `2.478647 s` | `+0.20%` | reject |
+| Slot-bound outputs | `2.520215 s` | `+1.88%` | reject; lower footprint did not offset the regression |
+| BF16 gate/up MLP pair | `2.559719 s` | `+3.48%` | reject |
+
+No DPO optimization from this pass is promoted. The closest pinned same-Mac
+MLX comparisons above remain `1.216x` to `1.221x` faster on E2B, so the next
+DPO target is graph-region and command-boundary coarsening around the branch
+forward/backward path, not another output-buffer lifetime variant.
+
+For GRPO, the candidate adds a forward-output-only compiled session that keeps
+the inference fused-GQA opcode, captures the complete first output explicitly,
+and caches that session with the trainer. It is gated by
+`ANTFLY_GEMMA4_GRPO_COMPILED_SAMPLING=1`, admitted only for multi-token Metal
+sampling, conflicts with incremental KV, changes the execution fingerprint,
+and is off by default. The first implementation redirected fused GQA to its
+training/VJP alternate and correctly failed initial policy/reference parity;
+the admitted candidate preserves the original forward opcode. A separate
+cached-direct experiment reached `50,338,567,152` peak physical bytes and
+terminated without publishing a result, so it is rejected.
+
+The largest matched A/B used eight training groups and sixteen held-out groups:
+
+| E2B GRPO metric | Control | Compiled sampling | Result |
+| --- | ---: | ---: | ---: |
+| End-to-end wall time | `226.68 s` | `178.36 s` | `21.32%` faster (`1.271x`) |
+| Training sampling | `43.225250 s` | `26.355352 s` | `39.03%` faster |
+| Policy rescore | `1.970764 s` | `1.323338 s` | `32.85%` faster |
+| Backward/update | `38.055118 s` | `38.282704 s` | effectively flat |
+| Held-out evaluation loop | `119.541959 s` | `88.403845 s` | `26.05%` faster |
+| Peak physical footprint | `5,530,913,480` | `5,671,013,160` bytes | `2.53%` higher |
+
+Both paths produced adapter SHA-256
+`8985cf51ff52b93f8d026ed4cc210a190096a6a45f897b37a57f27e5de1f6448`.
+Their training reward trace, evaluation reward trace, and KL-control trace were
+byte-identical at SHA-256
+`03e3ffe47ddfab31e4525df9c9db6df5b65335c9b225b9b1cee865fb6d590714`,
+`2f13d36195139ef8db751b5560d0e1d2ef8fd31c9467d2b5ec7d0be35bd55a75`,
+and `2928c08feca474ae9de7e9d3ed384cb2a7213bbef32609e6a49917090c077473`.
+Training KL/loss was exactly equal; held-out mean KL differed by
+`9.2408845e-7`, while reward aggregates remained exact. Initial
+policy/rescore and policy/reference maximum errors were zero.
+
+The benchmarked candidate is frozen at
+`/private/tmp/antfly-gemma4-opt-20260826/compiled-sampling-345c515b/bin/antfly-inference`,
+binary SHA-256
+`e6137279b66a305ee8f293a6dc58b0430020c73027fcd880bc8fbddd5f380b38`,
+with benchmark-source patch digest
+`345c515b544bf0185cf90a5a5c92b961dd86e5fa3d8f4dfd283290a1c5d988e0`.
+The immutable A/B roots are
+`/private/tmp/antfly-gemma4-opt-20260826/grpo-e2b-control-8x16-r1` and
+`/private/tmp/antfly-gemma4-opt-20260826/grpo-e2b-compiled-8x16-r1`.
+
+The `56071123...` / `9b61c4e6...` snapshot and two-update smoke were the first
+in-process candidate. A later fresh-process interruption/resume qualification
+found a compatibility defect that the matched same-process A/B could not see:
+selected tokens and rewards remained exact, but raw compiled log-probabilities
+changed after execution-cache recreation and changed the optimizer trajectory.
+The earlier table remains useful historical performance evidence, but that
+raw-log-probability candidate is not promotable.
+
+### Restart-safe compiled GRPO qualification
+
+The corrected path keeps compiled multi-token selection, then explicitly
+rescores every selected completion through the restart-stable eager sparse
+policy graph at batch size one. It verifies every selected token at its
+expected ranked position and uses those canonical eager values for both GRPO
+old-policy and current-policy log-probabilities. Batch-wide eager rescoring was
+rejected because tied-head reduction geometry changed log-probabilities by
+approximately `0.022267`. The report mode is
+`compiled-token-selection-with-eager-per-completion-token-validated-logprob-rescore`.
+Checkpoint restore also recreates the frozen-reference cache, retires both
+uninterrupted and resumed compiled execution caches, and synchronizes and
+byte-validates restored Metal weight, optimizer, and gradient-accumulator
+state before the next graph.
+
+The full two-epoch E2B interruption/resume qualifier passed 16 groups and 64
+completions. All 64 completions were eagerly rescored. Uninterrupted and
+resumed runs produced adapter SHA-256
+`43e6d637a316b38247737c5e3879843e5576b95ed1c81655850f91962666a787`,
+training checkpoint SHA-256
+`936f03e81589c1e3af59c6bc043226959300042a1a03c42e0608977a9c27172c`,
+and checkpoint-sidecar SHA-256
+`89f54c9945f531ed3c12ad4bcaf42be92f51c1bf2f891a2aa3a8ed83d70f1280`.
+Adapter, checkpoint, reward, and KL-control trajectories were exact. The only
+non-exact values were the separately admitted fresh-backend terminal Metal
+derived KL/loss values, which passed their narrow absolute bounds. The terminal
+evaluation passed at mean/top-rank reward `0.34375 / 0.5625` and positive-group
+rate `1.0`. Qualification report SHA-256 is
+`503382159f640cd936fc69655765b1187ec261c486325a5eca8adce5ad1b6fd8`;
+the retained root is
+`/private/tmp/antfly-gemma4-opt-20260826/compiled-resume-e2b-token-shadow-full-r23`.
+
+The matched corrected eight-group/16-holdout benchmark is still faster than
+the eager Antfly control, but the correctness rescore makes the real remaining
+gap visible:
+
+| E2B GRPO metric | Eager control | Restart-safe compiled | Result |
+| --- | ---: | ---: | ---: |
+| End-to-end wall time | `226.68 s` | `189.46 s` | `16.42%` faster (`1.196x`) |
+| Training sampling | `43.225250 s` | `26.111656 s` | `39.59%` faster |
+| Policy rescore | `1.970764 s` | `15.011305 s` | correctness cost; 32/32 completions |
+| Backward/update | `38.055118 s` | `38.260600 s` | effectively flat |
+| Held-out evaluation loop | `119.541959 s` | `87.347253 s` | `26.93%` faster |
+
+The corrected result is `6.22%` slower than the non-promotable raw-log-prob
+compiled result. Its training phases total `93.538358 s` versus pinned MLX
+`27.769290 s` (`3.368x` slower), and evaluation is `87.347253 s` versus MLX
+`38.714746 s` (`2.256x` slower). Its GRPO report and adapter SHA-256 values are
+`3bf07b18e63707a755a311986258ea7c7b3e4e8401f2f79d3aa2df9ab60bb076`
+and `d8c40074fa0a3e3d9784276c8ad19eea415377c8456f1904d05821eb6a59627c`;
+the retained root is
+`/private/tmp/antfly-gemma4-opt-20260826/grpo-e2b-token-shadow-8x16-r24`.
+The next safe performance target is reuse of the eager batch-one execution
+plan/session without changing allocation or reduction geometry. Raw compiled
+log-probabilities are not an acceptable optimization target.
+
+The exact-resume adapter was then materialized into the pinned E2B base. The
+streaming merge copied and verified 1,961 base tensors, merged 50 LoRA tensors,
+and published a `10,246,621,942`-byte model with SHA-256
+`c04ffd7255c8fd189243ceeb7cc7b2b34b969afd714157b88c8a9747296c1919`.
+Three independent fresh-process Metal reloads on the same deterministic prompt
+all emitted token ID `1904` (`no`), stopped after one token, reproduced the
+same attention dispatch, and reported zero process swaps. Their combined
+semantic digest is
+`4bfd387aa897cae44acad9e90e4b8e624e31e6f3fc16777d2c6db79c060aa068`.
+The retained materialized model is
+`/private/tmp/antfly-gemma4-opt-20260826/materialized-e2b-qualified-grpo-v14-r1`;
+the token-ID timing records are the three
+`materialized-generation-tokenids-v14-r1-run*.json` files in the same campaign
+root.
+
+The restart-safe executable-source diff, excluding this status document, is
+SHA-256
+`73b72f8a94351ff2c1c6ef8c3ea10fb38e70f40e8cb91927952090a5bf5f492f`.
+Stable Zig 0.16.0 produced ReleaseFast binary SHA-256
+`74d71f175cc70005db84adc48d43186a3a60e33b9067d18e49237f1a4b8f6af6`;
+a fresh rebuild was byte-identical to the frozen binary. Debug, ReleaseSafe,
+and ReleaseFast each selected 295 focused Gemma4 tests, passed 293, and skipped
+the same two optional local-model fixtures. Dedicated Debug and ReleaseSafe
+Gemma graph gates passed. The Python Gemma4 discovery suite passed all 602
+tests, including the localhost warm-server case outside the socket-restricted
+sandbox. `zig fmt --check` and `git diff --check` are clean. The installed
+`0.16.0-dev.3144+ac6fb0b59` snapshot crashes on this tree and is not accepted
+as a release toolchain.
+
+The exact final binary passes the stronger independent-initialization E2B DPO
+campaign for all three seeds at eight epochs and learning rate `1e-5`.
+Held-out accuracy is
+`0.60-0.80`, loss is `0.663723-0.687369`, and reward margin is
+`0.013310-0.062920`, all improved from each seed's initialized baseline. Its
+campaign report SHA-256 is
+`b6c3e5f12b1e5805a0dd63a4710d7239776ea3224e11e693ab9ab23989d1a208`;
+the root is
+`/private/tmp/antfly-gemma4-opt-20260826/quality-e2b-dpo-lr1e5-74d71f17-r1`.
+The three final adapter SHA-256 values are
+`6adf382f5d90e786aa8db6034e8fa11a298f32440baba8d0a135faed40635f56`,
+`3f1df992a18daaf9251cffb37fc7c698650c92243ad7750a51e24d032ddf628d`,
+and `d8d02816fbe0dae2e6a00df2100165c416091fdf08baff69ac4d89cd069cce4b`.
+
+The equivalent current-binary E2B GRPO gate remains negative evidence. The
+seed-17 fail-fast campaigns at `5e-7`, `7.5e-7`, and `1e-6` all completed 64
+optimizer groups without a KL-budget rejection, but baseline and final
+mean/top-rank/positive-group rewards stayed exactly
+`0.34375 / 0.5625 / 1.0`. At `1e-6`, training reward finally rose from
+`0.28125` to `0.3125` in epoch eight, but held-out reward did not move; only
+two lower-ranked zero-reward completions exchanged order. Held-out KL loss was
+`0.0000847082` against the `0.004` ceiling, and maximum training mean KL was
+`0.00453018` against the hard `0.1` budget. No failed run published an adapter,
+and seeds 42/991 correctly did not run. Campaign report SHA-256 values are
+`e951237500a305e5fdcae549e47a1bd7639347374028197e53006ad52d81037c`,
+`873fc0daff9440cd9f3173eaf403059a499dcf0825f938f63a076e66968f991d`,
+and `9b3ef1a87009f20f1b1b2bc3e922b2c5ca21617a977343db5b49196b4a452882`.
+The gates were not weakened after observing the result, and learning rate is
+not raised past the historical `1e-6` stability boundary. The next quality
+experiment must increase representative train/evaluation resolution or use a
+predeclared longer-horizon schedule, not tune against these 16 holdout groups.
+
+Promotion status therefore remains **default-off candidate**, not production
+default. Exact E2B resume and materialized reload are closed. Remaining
+promotion blockers are baseline-relative E2B GRPO quality, E4B GRPO quality and
+memory/performance evidence, a clean fresh-host zero-paging run, and the hosted
+`gemma4-metal-training / macos-arm64-gpu` CI gate on an immutable commit. The
+current 24 GiB host already has swap allocated and only about 5 GiB of free
+disk, so it is not an admissible machine for E4B or fresh-host attestation.
+
 ## Production Roadmap and Release Gates
 
 1. **Keep one green product contract.** Compile the typed CLI, four-step
@@ -2930,11 +3136,12 @@ incremental-KV GRPO.
    UltraFeedback DPO and BoolQ GRPO comparisons are archived with disjoint
    evaluation and matched MLX evidence. Three-seed/eight-epoch absolute-floor
    campaigns now pass for E2B/E4B DPO and E2B GRPO; E4B GRPO fails its
-   predeclared top-rank floor. Next run pinned HF/PEFT one-, two-, and
-   eight-step traces against Zig native and Metal for both target presets,
-   prove semantic adapter equality after explicit key translation, diagnose
-   E4B GRPO under-learning, and run the newly implemented independent-
-   initialization and baseline-relative thresholds across the release matrix.
+   predeclared top-rank floor. Independent-initialization, baseline-relative
+   E2B DPO passes; the current compiled E2B GRPO sweep fails at seed 17 without
+   held-out reward improvement. Next predeclare a more representative GRPO
+   train/evaluation resolution or longer horizon, diagnose E4B under-learning,
+   and run pinned HF/PEFT one-, two-, and eight-step traces against Zig native
+   and Metal for both target presets.
 3. **Finish optional-lane provenance.** Bind teacher targets to their
    teacher/base identity and extend the closed run ledger when optional
    artifacts are admitted.
@@ -2966,13 +3173,16 @@ incremental-KV GRPO.
    E2B/E4B DPO matrix and four-token GRPO diagnostics now establish bounded
    single-process baselines. The final-source refresh finds MLX faster in all
    four DPO cells; Antfly retains a material memory advantage except at E4B
-   Q128, where footprint is effectively tied and slightly worse. Repeat the
-   DPO matrix as an alternating five-process distribution on the pinned host
-   and report dispersion before making a stable performance claim.
-8. **Real E2B acceptance.** Pinned BF16 DPO/GRPO now pass bounded
-   three-seed/eight-epoch absolute quality floors and exact epoch-boundary
-   recovery. Rerun the new independent-initialization and baseline-relative
-   held-out gates, then add larger disjoint datasets, adapter-reload generation, and the remaining
+   Q128, where footprint is effectively tied and slightly worse. Restart-safe
+   compiled E2B GRPO is `1.196x` faster than eager Antfly but remains `3.368x`
+   behind MLX in training phases. Reuse the exact eager batch-one rescore plan,
+   and repeat the DPO matrix as an alternating five-process distribution on the
+   pinned host before making a stable performance claim.
+8. **Real E2B acceptance.** Pinned BF16 DPO/GRPO pass bounded historical
+   absolute quality floors and exact epoch-boundary recovery. Baseline-relative
+   DPO passes three independently initialized seeds; compiled GRPO remains
+   blocked after the current safe seed-17 sweep. Increase the predeclared
+   disjoint dataset or horizon resolution, then add the remaining
    native-versus-Metal/HF per-target parity cells before a broad claim.
 9. **Real E4B acceptance.** Pinned BF16 DPO passes the bounded multi-seed gate
    and incremental GRPO recovery is exact, but GRPO misses its predeclared
@@ -2980,10 +3190,11 @@ incremental-KV GRPO.
    gates with sequences and target presets that exercise shared KV, PLE, and
    the larger adapter/optimizer footprint without fallback or unbounded growth.
 10. **Deployment and materialization.** The streaming, dtype-preserving writer
-    now accepts sharded Safetensors and validates its staged output. Apply
-    accepted BF16-trained adapters to pinned E2B/E4B bases and require full
-    reload, fingerprint, exact-token, quality, disk/memory, and repeated-
-    generation gates; separately design any QAT-Q4/GGUF merge contract.
+    now accepts sharded Safetensors and validates its staged output. The
+    restart-qualified E2B GRPO adapter passes streaming merge and three
+    deterministic fresh-process reloads. Repeat the quality, disk/memory, and
+    repeated-generation gates with a baseline-relative quality-accepted GRPO
+    adapter and on E4B; separately design any QAT-Q4/GGUF merge contract.
 11. **Finish optional direct Q4/QLoRA qualification.** The pinned official E2B
     Q4_0 inventory now passes strict optimizer and process-kill/resume gates for
     canonical SFT/DPO/GRPO without host dequantization. Direct-GGUF GRPO plus

@@ -4857,6 +4857,35 @@ pub const ModelManager = struct {
         return limits;
     }
 
+    fn applyModelAdmissionOverrides(
+        widened_limits: runtime.tier.memory.Limits,
+        operator_overrides: runtime.tier.memory.Limits,
+    ) runtime.tier.memory.Limits {
+        return runtime.tier.memory.applyLimitOverrides(widened_limits, operator_overrides);
+    }
+
+    /// Apply architecture-derived large-model floors before operator-provided
+    /// hard overrides. This keeps default admission compatible with an
+    /// indivisible lazy weight while preserving explicit deployment limits as
+    /// authoritative fail-closed policy.
+    fn admissionLimitsForModelDir(
+        self: *const ModelManager,
+        backend_runtime: backends.BackendRuntime,
+        model_dir: []const u8,
+    ) !runtime.tier.memory.Limits {
+        var limits = runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
+            admissionBackendClassForRuntime(backend_runtime),
+            self.process_memory_limit_bytes,
+        );
+        limits = try session_factory.widenBudgetLimitsForModelPath(
+            self.allocator,
+            model_dir,
+            limits,
+            backend_runtime.backend,
+        );
+        return applyModelAdmissionOverrides(limits, self.admission_limit_overrides);
+    }
+
     /// Lazily loaded composite-model components participate in the same
     /// process-wide admission accounting as the primary session. Reserve their
     /// construction peak immediately before import, then retain only completed
@@ -6999,7 +7028,10 @@ fn loadSessionForPreferredBackends(
                 continue;
             };
             resident_amounts = admission_plan.resident;
-            admission_limits = manager.admissionLimitsForBackend(backend_runtime);
+            admission_limits = manager.admissionLimitsForModelDir(backend_runtime, model_dir) catch |err| {
+                rememberPreferredLoadError(&first_err, err);
+                continue;
+            };
             if (admittedSessionCudaLimit(
                 backend_runtime,
                 resident_amounts,
@@ -7524,6 +7556,30 @@ test "serving admission applies the node-wide host-memory override" {
         @as(usize, 100),
         manager.resource_domain.?.admission_limits.combined_limit_bytes,
     );
+}
+
+test "gemma4 model admission preserves explicit operator limits after automatic widening" {
+    const widened = runtime.tier.memory.Limits{
+        .host_limit_bytes = 21 * 1024 * 1024 * 1024 / 4,
+        .backend_limit_bytes = 12 * 1024 * 1024 * 1024,
+        .combined_limit_bytes = 18 * 1024 * 1024 * 1024,
+        .kv_limit_bytes = 1024,
+        .scratch_limit_bytes = 2048,
+    };
+    try std.testing.expectEqual(
+        widened,
+        ModelManager.applyModelAdmissionOverrides(widened, .{}),
+    );
+
+    const explicit = ModelManager.applyModelAdmissionOverrides(widened, .{
+        .host_limit_bytes = 4 * 1024 * 1024 * 1024,
+        .combined_limit_bytes = 16 * 1024 * 1024 * 1024,
+    });
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024 * 1024), explicit.host_limit_bytes);
+    try std.testing.expectEqual(widened.backend_limit_bytes, explicit.backend_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 16 * 1024 * 1024 * 1024), explicit.combined_limit_bytes);
+    try std.testing.expectEqual(widened.kv_limit_bytes, explicit.kv_limit_bytes);
+    try std.testing.expectEqual(widened.scratch_limit_bytes, explicit.scratch_limit_bytes);
 }
 
 test "shouldPreferNativeSession prefers native GLiNER weights" {

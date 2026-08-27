@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const platform = @import("antfly_platform");
 const ml = @import("ml");
 const c_file = @import("../util/c_file.zig");
 const gemma_graph = @import("../architectures/gemma_graph.zig");
@@ -1707,6 +1708,8 @@ pub fn tokenLogprobsForPromptCompletion(
         out_logps,
         null,
         false,
+        false,
+        null,
     );
 }
 
@@ -1729,6 +1732,65 @@ pub fn tokenLogprobsForPromptCompletionSparseRows(
         out_logps,
         null,
         true,
+        false,
+        null,
+    );
+}
+
+/// Restart-stable policy scorer used to canonicalize log-probabilities after
+/// compiled GRPO token selection. This deliberately bypasses the compiled
+/// output session even when that sampler is enabled; otherwise the rescore
+/// inherits the same allocation-history drift it is meant to remove.
+pub fn tokenLogprobsForPromptCompletionSparseRowsCanonical(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *GemmaAutodiffCtx,
+    prompt: []const i32,
+    completion: []const i32,
+    seq_len: u32,
+    out_logps: []f32,
+) !void {
+    return tokenLogprobsForPromptCompletionWithBindings(
+        allocator,
+        trainer,
+        ctx,
+        prompt,
+        completion,
+        seq_len,
+        out_logps,
+        null,
+        true,
+        true,
+        null,
+    );
+}
+
+/// Canonical eager rescore plus an exact token-selection shadow. Every token
+/// must occupy the rank requested from the compiled sampler for its current
+/// prefix; the returned log-probability is then safe to use as GRPO's
+/// authoritative old/new policy value.
+pub fn tokenLogprobsForPromptCompletionSparseRowsCanonicalRanked(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *GemmaAutodiffCtx,
+    prompt: []const i32,
+    completion: []const i32,
+    seq_len: u32,
+    expected_rank: usize,
+    out_logps: []f32,
+) !void {
+    return tokenLogprobsForPromptCompletionWithBindings(
+        allocator,
+        trainer,
+        ctx,
+        prompt,
+        completion,
+        seq_len,
+        out_logps,
+        null,
+        true,
+        true,
+        expected_rank,
     );
 }
 
@@ -1752,6 +1814,8 @@ pub fn tokenLogprobsForPromptCompletionFrozenBase(
         out_logps,
         frozen_lora,
         false,
+        false,
+        null,
     );
 }
 
@@ -1775,6 +1839,8 @@ pub fn tokenLogprobsForPromptCompletionSparseRowsFrozenBase(
         out_logps,
         frozen_lora,
         true,
+        false,
+        null,
     );
 }
 
@@ -1932,6 +1998,8 @@ fn tokenLogprobsForPromptCompletionWithBindings(
     out_logps: []f32,
     frozen_lora: ?*const FrozenBaseLoraBindings,
     sparse_rows: bool,
+    force_eager_policy: bool,
+    expected_rank: ?usize,
 ) !void {
     if (completion.len != out_logps.len) return error.LogpLenMismatch;
     if (prompt.len == 0) return error.EmptyPrompt;
@@ -1943,11 +2011,25 @@ fn tokenLogprobsForPromptCompletionWithBindings(
     defer allocator.free(joined);
     const vocab_size: usize = @intCast(ctx.graph_config.vocab_size);
     if (!sparse_rows) {
-        const logits = try executeLogitsForInputIds(allocator, trainer, ctx, joined, seq_len, frozen_lora);
+        const logits = try executeLogitsForInputIdsConfigured(
+            allocator,
+            trainer,
+            ctx,
+            joined,
+            seq_len,
+            null,
+            frozen_lora,
+            force_eager_policy,
+        );
         defer allocator.free(logits);
         for (completion, 0..) |token_id, comp_idx| {
             const predictor_row = prompt.len + comp_idx - 1;
             const row = logits[predictor_row * vocab_size ..][0..vocab_size];
+            if (expected_rank) |rank| {
+                if (try selectRankedToken(allocator, row, rank) != @as(usize, @intCast(token_id))) {
+                    return error.CompiledGrpoCanonicalTokenParityFailed;
+                }
+            }
             out_logps[comp_idx] = logProbAtToken(row, @intCast(token_id));
         }
         return;
@@ -1960,7 +2042,7 @@ fn tokenLogprobsForPromptCompletionWithBindings(
         const predictor_rows = try allocator.alloc(usize, end - start);
         defer allocator.free(predictor_rows);
         for (predictor_rows, 0..) |*row, local_idx| row.* = prompt.len + start + local_idx - 1;
-        const logits = try executeSparseLogitsForInputIdsAtRows(
+        const logits = try executeLogitsForInputIdsConfigured(
             allocator,
             trainer,
             ctx,
@@ -1968,10 +2050,16 @@ fn tokenLogprobsForPromptCompletionWithBindings(
             seq_len,
             predictor_rows,
             frozen_lora,
+            force_eager_policy,
         );
         defer allocator.free(logits);
         for (completion[start..end], 0..) |token_id, local_idx| {
             const row = logits[local_idx * vocab_size ..][0..vocab_size];
+            if (expected_rank) |rank| {
+                if (try selectRankedToken(allocator, row, rank) != @as(usize, @intCast(token_id))) {
+                    return error.CompiledGrpoCanonicalTokenParityFailed;
+                }
+            }
             out_logps[start + local_idx] = logProbAtToken(row, @intCast(token_id));
         }
         start = end;
@@ -3764,6 +3852,7 @@ fn executeLogitsForInputIds(
         seq_len,
         null,
         frozen_lora,
+        false,
     );
 }
 
@@ -3805,6 +3894,7 @@ fn executeSparseLogitsForInputIdsAtRows(
         seq_len,
         predictor_rows,
         frozen_lora,
+        false,
     );
 }
 
@@ -3816,6 +3906,7 @@ fn executeLogitsForInputIdsConfigured(
     seq_len: u32,
     selected_predictor_rows: ?[]const usize,
     frozen_lora: ?*const FrozenBaseLoraBindings,
+    force_eager_policy: bool,
 ) ![]f32 {
     const batches = [_][]const i32{raw_input_ids};
     return executeLogitsForInputIdBatchesConfigured(
@@ -3826,6 +3917,7 @@ fn executeLogitsForInputIdsConfigured(
         seq_len,
         selected_predictor_rows,
         frozen_lora,
+        force_eager_policy,
     );
 }
 
@@ -3846,6 +3938,7 @@ fn executeSparseLogitsForInputIdBatchAtRows(
         seq_len,
         predictor_rows,
         frozen_lora,
+        false,
     );
 }
 
@@ -3857,6 +3950,7 @@ fn executeLogitsForInputIdBatchesConfigured(
     seq_len: u32,
     selected_predictor_rows: ?[]const usize,
     frozen_lora: ?*const FrozenBaseLoraBindings,
+    force_eager_policy: bool,
 ) ![]f32 {
     const rows: usize = @intCast(seq_len);
     if (raw_input_id_batches.len == 0) return error.EmptyPrompt;
@@ -3964,6 +4058,37 @@ fn executeLogitsForInputIdBatchesConfigured(
     const targets_ct = try graph_input_binder.bindF32(trainer.compute_backend, allocator, targets_placeholder, targets);
     try putOwnedLogitsRuntimeInput(allocator, trainer.compute_backend, &rt, &owned_runtime_values, gs.targets_node, targets_ct);
     try bindTrainerLogitsTrainables(allocator, trainer, &rt, &owned_runtime_values, frozen_lora);
+
+    // The GRPO candidate keeps the exact batch-1 transformer and sparse-row
+    // projection geometry, but executes it through a reusable forward-only
+    // compiled session. The legacy sampler rebuilt an eager interpreter
+    // traversal, suppressed planned encoder coalescing, drained Metal twice,
+    // and discarded its plan for every candidate token. Keep frozen-reference
+    // scoring on its separately qualified path and fail closed if the requested
+    // live-policy session cannot stay entirely on the strict Metal graph
+    // executor.
+    const compiled_sampling = !force_eager_policy and
+        frozen_lora == null and
+        trainer.compute_backend.kind() == .metal and
+        platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GRPO_COMPILED_SAMPLING", false);
+    if (compiled_sampling) {
+        _ = try trainer.ensureCompiledOutputSessionBuilt(logits_node);
+        var result = try trainer.compiled_output_session.?.executePrimaryOutput(
+            trainer.compute_backend,
+            rt,
+        );
+        defer result.deinit();
+        if (result.profile.graph_executor_partitions == 0 or
+            result.profile.graph_executor_native_partitions != 0 or
+            result.profile.graph_executor_unsupported_ops != 0 or
+            result.profile.graph_executor_interpreter_fallbacks != 0)
+        {
+            return error.StrictMetalCompiledSamplingUnavailable;
+        }
+        const values = result.primary_output orelse return error.MissingCompiledSamplingOutput;
+        result.primary_output = null;
+        return values;
+    }
 
     const saved_outputs = try allocator.dupe(NodeId, gs.graph.outputs.items);
     defer {

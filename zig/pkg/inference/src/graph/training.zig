@@ -57,6 +57,10 @@ const io_compat = @import("../io/compat.zig");
 
 pub const TrainStepResult = struct {
     loss: f32,
+    /// Complete first graph output retained only for explicit forward-output
+    /// sessions. Ordinary loss/training calls leave this null and continue to
+    /// expose the scalar `loss` above.
+    primary_output: ?[]f32 = null,
     gradients: std.StringHashMapUnmanaged([]f32), // param_name -> gradient f32 data
     device_gradients: std.StringHashMapUnmanaged(CT) = .{},
     profile: TrainStepProfile = .{},
@@ -65,6 +69,8 @@ pub const TrainStepResult = struct {
     compute_backend: ?*const ComputeBackend = null,
 
     pub fn deinit(self: *TrainStepResult) void {
+        if (self.primary_output) |values| self.allocator.free(values);
+        self.primary_output = null;
         var it = self.gradients.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -351,14 +357,16 @@ const LossGraphClone = struct {
     }
 };
 
-/// Clone only nodes reachable from `loss_node`. Fused nodes keep their forward
-/// opcode, while VJP-alternate links are cleared because evaluation never
-/// differentiates the clone. This keeps the evaluation graph both smaller than
-/// the template and independent from the trainer-owned graph's lifetime.
+/// Clone only nodes reachable from `loss_node`. When requested, fused GQA is
+/// redirected to its differentiable training-forward alternate; otherwise the
+/// original forward opcode is retained. VJP-alternate links are cleared because
+/// the clone is forward-only. This keeps it smaller than the template and
+/// independent from the trainer-owned graph's lifetime.
 fn cloneReachableLossGraph(
     allocator: std.mem.Allocator,
     source: *const Graph,
     loss_node: NodeId,
+    redirect_vjp_forward_alternates: bool,
 ) !LossGraphClone {
     if (loss_node == null_node or loss_node >= source.nodeCount()) return error.InvalidLossNode;
 
@@ -366,9 +374,11 @@ fn cloneReachableLossGraph(
     const redirect = try allocator.alloc(NodeId, node_count);
     defer allocator.free(redirect);
     for (redirect, 0..) |*target, index| target.* = @intCast(index);
-    for (source.nodes.items, 0..) |source_node, source_index| {
-        if (source_node.op == .fused_gqa_causal_attention and source_node.vjp_alternate != null_node) {
-            redirect[source_index] = source_node.vjp_alternate;
+    if (redirect_vjp_forward_alternates) {
+        for (source.nodes.items, 0..) |source_node, source_index| {
+            if (source_node.op == .fused_gqa_causal_attention and source_node.vjp_alternate != null_node) {
+                redirect[source_index] = source_node.vjp_alternate;
+            }
         }
     }
 
@@ -574,6 +584,7 @@ pub const CompiledTrainSession = struct {
     cached_cuda_constants: std.AutoHashMapUnmanaged(NodeId, CT) = .empty,
     cached_cuda_constants_backend: ?*const ComputeBackend = null,
     metal_slot_bound_outputs: bool = false,
+    capture_primary_output: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -688,11 +699,49 @@ pub const CompiledTrainSession = struct {
         graph: *const Graph,
         loss_node: NodeId,
     ) !CompiledTrainSession {
+        return initOutputOnly(allocator, graph, loss_node);
+    }
+
+    /// Build a reusable forward-only session for one arbitrary graph output.
+    /// This uses the same reachable-graph clone as scalar evaluation, including
+    /// training-forward alternates, but does not require the output to be a
+    /// scalar loss.
+    pub fn initOutputOnly(
+        allocator: std.mem.Allocator,
+        graph: *const Graph,
+        output_node: NodeId,
+    ) !CompiledTrainSession {
+        return initOutputOnlyConfigured(allocator, graph, output_node, true);
+    }
+
+    /// Build a reusable forward-output session while preserving the source
+    /// graph's original forward opcodes. Inference sampling uses this form so
+    /// a fused forward does not silently change to its numerically distinct
+    /// training/VJP alternate.
+    pub fn initForwardOutputOnly(
+        allocator: std.mem.Allocator,
+        graph: *const Graph,
+        output_node: NodeId,
+    ) !CompiledTrainSession {
+        return initOutputOnlyConfigured(allocator, graph, output_node, false);
+    }
+
+    fn initOutputOnlyConfigured(
+        allocator: std.mem.Allocator,
+        graph: *const Graph,
+        output_node: NodeId,
+        redirect_vjp_forward_alternates: bool,
+    ) !CompiledTrainSession {
         var profile: TrainStepProfile = .{};
         profile.peak_resident_bytes = currentResidentBytes();
         const build_start = nowNs();
 
-        var cloned = try cloneReachableLossGraph(allocator, graph, loss_node);
+        var cloned = try cloneReachableLossGraph(
+            allocator,
+            graph,
+            output_node,
+            redirect_vjp_forward_alternates,
+        );
         errdefer cloned.deinit();
         const analysis = try interpreter.CachedAnalysis.compute(allocator, &cloned.graph);
         errdefer {
@@ -733,7 +782,7 @@ pub const CompiledTrainSession = struct {
         profile.peak_resident_bytes = currentResidentBytes();
         const build_start = nowNs();
         const parent_loss = parent.graph.outputs.items[parent.loss_output_index];
-        var cloned = try cloneReachableLossGraph(allocator, &parent.graph, parent_loss);
+        var cloned = try cloneReachableLossGraph(allocator, &parent.graph, parent_loss, true);
         errdefer cloned.deinit();
 
         const composed_id_map = try allocator.alloc(NodeId, parent.id_map.len);
@@ -832,6 +881,21 @@ pub const CompiledTrainSession = struct {
         runtime_inputs: ?std.AutoHashMapUnmanaged(NodeId, CT),
     ) !TrainStepResult {
         return self.executeInternal(cb, runtime_inputs, true, false);
+    }
+
+    /// Execute a forward-output session and retain the complete first output
+    /// in `TrainStepResult.primary_output`. The capture flag is scoped to this
+    /// call so ordinary training and scalar evaluation do not allocate or
+    /// retain another host buffer.
+    pub fn executePrimaryOutput(
+        self: *CompiledTrainSession,
+        cb: *const ComputeBackend,
+        runtime_inputs: ?std.AutoHashMapUnmanaged(NodeId, CT),
+    ) !TrainStepResult {
+        if (self.capture_primary_output) return error.PrimaryOutputCaptureAlreadyActive;
+        self.capture_primary_output = true;
+        defer self.capture_primary_output = false;
+        return self.executeInternal(cb, runtime_inputs, false, false);
     }
 
     /// Execute through the compiled session's cached analysis without first
@@ -1157,7 +1221,8 @@ pub const CompiledTrainSession = struct {
             "interpreter",
         );
         const loss_data = try cb.toFloat32(exec_result.outputs[self.loss_output_index], self.allocator);
-        defer self.allocator.free(loss_data);
+        var loss_data_owned = true;
+        defer if (loss_data_owned) self.allocator.free(loss_data);
         if (loss_data.len == 0) {
             const loss_output_node = self.graph.outputs.items[self.loss_output_index];
             std.debug.print(
@@ -1167,6 +1232,11 @@ pub const CompiledTrainSession = struct {
             return error.EmptyLossOutput;
         }
         const loss_value: f32 = loss_data[0];
+        const primary_output: ?[]f32 = if (self.capture_primary_output) output: {
+            loss_data_owned = false;
+            break :output loss_data;
+        } else null;
+        errdefer if (primary_output) |values| self.allocator.free(values);
 
         var gradients = std.StringHashMapUnmanaged([]f32){};
         var device_gradients = std.StringHashMapUnmanaged(CT){};
@@ -1220,6 +1290,7 @@ pub const CompiledTrainSession = struct {
 
         return .{
             .loss = loss_value,
+            .primary_output = primary_output,
             .gradients = gradients,
             .device_gradients = device_gradients,
             .profile = profile,
@@ -1768,7 +1839,8 @@ pub const CompiledTrainSession = struct {
         );
         const loss_device = mesh.device(multi_result.output_devices[self.loss_output_index]) orelse return error.DeviceNotFound;
         const loss_data = try loss_device.backend.toFloat32(outputs[self.loss_output_index], self.allocator);
-        defer self.allocator.free(loss_data);
+        var loss_data_owned = true;
+        defer if (loss_data_owned) self.allocator.free(loss_data);
         const loss_output_node = self.graph.outputs.items[self.loss_output_index];
         if (loss_data.len == 0) {
             std.debug.print(
@@ -1795,6 +1867,11 @@ pub const CompiledTrainSession = struct {
             },
         );
         const loss_value: f32 = loss_data[0];
+        const primary_output: ?[]f32 = if (self.capture_primary_output) output: {
+            loss_data_owned = false;
+            break :output loss_data;
+        } else null;
+        errdefer if (primary_output) |values| self.allocator.free(values);
 
         var gradients = std.StringHashMapUnmanaged([]f32){};
         var device_gradients = std.StringHashMapUnmanaged(CT){};
@@ -1869,6 +1946,7 @@ pub const CompiledTrainSession = struct {
 
         return .{
             .loss = loss_value,
+            .primary_output = primary_output,
             .gradients = gradients,
             .device_gradients = device_gradients,
             .profile = profile.*,
@@ -3014,8 +3092,21 @@ test "gemma4 CompiledTrainSession loss-only evaluation emits no gradient graph o
     var result = try session.executeDirect(&cb, rt);
     defer result.deinit();
     try std.testing.expectApproxEqAbs(@as(f32, 10.0), result.loss, 1.0e-6);
+    try std.testing.expect(result.primary_output == null);
     try std.testing.expectEqual(@as(usize, 0), result.gradients.count());
     try std.testing.expectEqual(@as(usize, 0), result.device_gradients.count());
+
+    var output_session = try CompiledTrainSession.initOutputOnly(allocator, &g, y);
+    defer output_session.deinit();
+    var output_result = try output_session.executePrimaryOutput(&cb, rt);
+    defer output_result.deinit();
+    const values = output_result.primary_output orelse return error.MissingPrimaryOutput;
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0, 3.0, 4.0 }, values);
+    try std.testing.expectEqual(@as(f32, 1.0), output_result.loss);
+
+    var ordinary_output_result = try output_session.executeDirect(&cb, rt);
+    defer ordinary_output_result.deinit();
+    try std.testing.expect(ordinary_output_result.primary_output == null);
 }
 
 test "CompiledTrainSession loss-only evaluation redirects fused GQA forward alternate" {
@@ -3058,6 +3149,15 @@ test "CompiledTrainSession loss-only evaluation redirects fused GQA forward alte
     for (0..session.graph.nodeCount()) |index| {
         try std.testing.expect(std.meta.activeTag(session.graph.node(@intCast(index)).op) != .fused_gqa_causal_attention);
     }
+
+    var forward_session = try CompiledTrainSession.initForwardOutputOnly(allocator, &g, fused);
+    defer forward_session.deinit();
+    try std.testing.expect(forward_session.id_map[fused] != null_node);
+    try std.testing.expect(forward_session.id_map[alternate] == null_node);
+    try std.testing.expectEqual(
+        std.meta.activeTag(g.node(fused).op),
+        std.meta.activeTag(forward_session.graph.node(forward_session.id_map[fused]).op),
+    );
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);

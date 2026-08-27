@@ -68,6 +68,48 @@ def _probability(value: Any, where: str) -> float:
     return result
 
 
+def _bounded_increase_requirement(
+    baseline: float, requested: float, ceiling: float
+) -> tuple[float, bool]:
+    headroom = max(0.0, ceiling - baseline)
+    return min(requested, headroom), requested > headroom
+
+
+def _bounded_decrease_requirement(
+    baseline: float, requested: float, floor: float
+) -> tuple[float, bool]:
+    headroom = max(0.0, baseline - floor)
+    return min(requested, headroom), requested > headroom
+
+
+def _verify_bounded_requirement(
+    baseline_relative: Mapping[str, Any],
+    field_prefix: str,
+    effective_minimum: float,
+    saturated: bool,
+) -> None:
+    reported_minimum = _nonnegative(
+        baseline_relative.get(f"{field_prefix}_required_improvement"),
+        f"baseline_relative.{field_prefix}_required_improvement",
+    )
+    if not math.isclose(
+        reported_minimum,
+        effective_minimum,
+        rel_tol=1e-6,
+        abs_tol=1e-12,
+    ):
+        raise ContractError(
+            f"baseline_relative.{field_prefix} effective requirement mismatch"
+        )
+    reported_saturated = baseline_relative.get(
+        f"{field_prefix}_requirement_saturated"
+    )
+    if not isinstance(reported_saturated, bool) or reported_saturated != saturated:
+        raise ContractError(
+            f"baseline_relative.{field_prefix} saturation mismatch"
+        )
+
+
 def _load_json(path: Path, where: str) -> Mapping[str, Any]:
     try:
         return _mapping(json.loads(path.read_text(encoding="utf-8")), where)
@@ -363,6 +405,7 @@ def _validate_run(
     expected_seed_adapter_path: Path,
     expected_seed_adapter: Mapping[str, Any],
     quality_gates: Mapping[str, float],
+    compiled_sampling: bool,
 ) -> dict[str, Any]:
     report_path = run_root / f"{task}_report.json"
     report = _load_json(report_path, f"{task} report")
@@ -370,6 +413,15 @@ def _validate_run(
         raise ContractError(f"{task} report has unsupported schema")
     if report.get("execution_mode") != "train" or report.get("policy_backend") != "metal":
         raise ContractError("campaign run was not optimizer-backed Metal training")
+    if compiled_sampling:
+        if report.get("sampling_mode") != resume_qualifier.COMPILED_GRPO_SAMPLING_MODE:
+            raise ContractError(
+                "compiled-sampling campaign did not execute the compiled GRPO sampling mode"
+            )
+        if report.get("incremental_kv") is not None:
+            raise ContractError(
+                "compiled-sampling campaign unexpectedly emitted incremental-KV telemetry"
+            )
     if _integer(report.get("training_seed"), "report.training_seed") != expected_seed:
         raise ContractError("campaign report attests the wrong typed training seed")
     evaluation = _mapping(report.get("evaluation"), "report.evaluation")
@@ -495,6 +547,10 @@ def _validate_run(
                 baseline_relative.get("accuracy_improvement"),
                 "baseline_relative.accuracy_improvement",
             ),
+            "eval_accuracy_required_improvement": _nonnegative(
+                baseline_relative.get("accuracy_required_improvement"),
+                "baseline_relative.accuracy_required_improvement",
+            ),
             "eval_reward_margin_improvement": _finite(
                 baseline_relative.get("reward_margin_improvement"),
                 "baseline_relative.reward_margin_improvement",
@@ -503,6 +559,10 @@ def _validate_run(
                 baseline_relative.get("loss_improvement"),
                 "baseline_relative.loss_improvement",
             ),
+            "eval_loss_required_improvement": _nonnegative(
+                baseline_relative.get("loss_required_improvement"),
+                "baseline_relative.loss_required_improvement",
+            ),
         }
         if metrics["eval_accuracy"] < quality_gates["min_eval_accuracy"]:
             raise ContractError("held-out DPO accuracy is below the campaign floor")
@@ -510,13 +570,37 @@ def _validate_run(
             raise ContractError("held-out DPO loss exceeds the campaign ceiling")
         if metrics["eval_reward_margin"] < quality_gates["min_eval_reward_margin"]:
             raise ContractError("held-out DPO reward margin is below the campaign floor")
-        for metric_name, gate_name in (
-            ("eval_accuracy_improvement", "min_eval_accuracy_improvement"),
-            ("eval_reward_margin_improvement", "min_eval_reward_margin_improvement"),
-            ("eval_loss_improvement", "min_eval_loss_improvement"),
+        accuracy_required, accuracy_saturated = _bounded_increase_requirement(
+            metrics["baseline_eval_accuracy"],
+            quality_gates["min_eval_accuracy_improvement"],
+            1.0,
+        )
+        loss_required, loss_saturated = _bounded_decrease_requirement(
+            metrics["baseline_eval_loss"],
+            quality_gates["min_eval_loss_improvement"],
+            0.0,
+        )
+        _verify_bounded_requirement(
+            baseline_relative, "accuracy", accuracy_required, accuracy_saturated
+        )
+        _verify_bounded_requirement(
+            baseline_relative, "loss", loss_required, loss_saturated
+        )
+        if metrics["eval_accuracy_improvement"] < accuracy_required:
+            raise ContractError(
+                "held-out DPO eval_accuracy_improvement is below the effective baseline-relative floor"
+            )
+        if (
+            metrics["eval_reward_margin_improvement"]
+            < quality_gates["min_eval_reward_margin_improvement"]
         ):
-            if metrics[metric_name] < quality_gates[gate_name]:
-                raise ContractError(f"held-out DPO {metric_name} is below the baseline-relative floor")
+            raise ContractError(
+                "held-out DPO eval_reward_margin_improvement is below the baseline-relative floor"
+            )
+        if metrics["eval_loss_improvement"] < loss_required:
+            raise ContractError(
+                "held-out DPO eval_loss_improvement is below the effective baseline-relative floor"
+            )
     else:
         metrics = {
             **common_metrics,
@@ -560,6 +644,12 @@ def _validate_run(
                 baseline_relative.get("positive_reward_group_rate_improvement"),
                 "baseline_relative.positive_reward_group_rate_improvement",
             ),
+            "eval_positive_reward_group_rate_required_improvement": _nonnegative(
+                baseline_relative.get(
+                    "positive_reward_group_rate_required_improvement"
+                ),
+                "baseline_relative.positive_reward_group_rate_required_improvement",
+            ),
         }
         if metrics["eval_mean_reward"] < quality_gates["min_eval_mean_reward"]:
             raise ContractError("held-out GRPO mean reward is below the campaign floor")
@@ -575,13 +665,31 @@ def _validate_run(
                 "eval_top_rank_mean_reward_improvement",
                 "min_eval_top_rank_mean_reward_improvement",
             ),
-            (
-                "eval_positive_reward_group_rate_improvement",
-                "min_eval_positive_reward_group_rate_improvement",
-            ),
         ):
             if metrics[metric_name] < quality_gates[gate_name]:
                 raise ContractError(f"held-out GRPO {metric_name} is below the baseline-relative floor")
+        positive_rate_required, positive_rate_saturated = (
+            _bounded_increase_requirement(
+                metrics["baseline_eval_positive_reward_group_rate"],
+                quality_gates[
+                    "min_eval_positive_reward_group_rate_improvement"
+                ],
+                1.0,
+            )
+        )
+        _verify_bounded_requirement(
+            baseline_relative,
+            "positive_reward_group_rate",
+            positive_rate_required,
+            positive_rate_saturated,
+        )
+        if (
+            metrics["eval_positive_reward_group_rate_improvement"]
+            < positive_rate_required
+        ):
+            raise ContractError(
+                "held-out GRPO positive-group improvement is below the effective baseline-relative floor"
+            )
         kl_control = _mapping(report.get("kl_control"), "report.kl_control")
         if _integer(kl_control.get("admitted_groups"), "kl_control.admitted_groups") != expected_units:
             raise ContractError("KL controller did not admit the complete long horizon")
@@ -651,6 +759,9 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
         not math.isfinite(args.learning_rate) or args.learning_rate <= 0
     ):
         raise ContractError("learning rate must be finite and positive")
+    compiled_sampling = bool(getattr(args, "compiled_sampling", False))
+    if compiled_sampling and task != "grpo":
+        raise ContractError("--compiled-sampling is valid only for GRPO")
 
     model_config = dict(_mapping(base.get("model"), "recipe.model"))
     adapter_config = dict(_mapping(base.get("adapter"), "recipe.adapter"))
@@ -681,6 +792,10 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
         raise ContractError("direct GGUF campaign requires --allow-direct-gguf-training")
     if args.allow_direct_gguf_training and not model.is_file():
         raise ContractError("--allow-direct-gguf-training requires a direct GGUF model")
+    if compiled_sampling and args.allow_direct_gguf_training:
+        raise ContractError(
+            "compiled GRPO sampling is not qualified for direct GGUF training"
+        )
     train_path = _dataset_path(base, "train")
     eval_path = _dataset_path(base, "eval")
     dataset_config = dict(_mapping(base.get("dataset"), "recipe.dataset"))
@@ -697,6 +812,9 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
     base["adapter"] = adapter_config
     base["dataset"] = dataset_config
     base["eval"] = eval_config
+    resume_qualifier._apply_compiled_sampling_recipe_contract(
+        base, task, compiled_sampling
+    )
     rows = _jsonl_rows(train_path)
     configured_max = _mapping(base.get("dataset"), "recipe.dataset").get("max_examples")
     examples_per_epoch = min(
@@ -824,6 +942,12 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
     runs_root.mkdir()
 
     env = resume_qualifier._strict_environment()
+    effective_contract_env = dict(resume_qualifier.STRICT_METAL_ENV)
+    if compiled_sampling:
+        env[resume_qualifier.COMPILED_GRPO_SAMPLING_ENV] = "1"
+        effective_contract_env[
+            resume_qualifier.COMPILED_GRPO_SAMPLING_ENV
+        ] = "1"
 
     runs: list[dict[str, Any]] = []
     initialized_adapters: list[dict[str, Any]] = []
@@ -893,6 +1017,7 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
                 Path(initialized_adapter_by_seed[seed]["path"]),
                 initialized_adapter_by_seed[seed],
                 quality_gates,
+                compiled_sampling,
             )
             runs.append(
                 {
@@ -929,7 +1054,9 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
                 "gradient_accumulation_steps": gradient_accumulation_steps,
                 "expected_optimizer_steps": expected_optimizer_steps,
                 "allow_direct_gguf_training": args.allow_direct_gguf_training,
+                "compiled_sampling": compiled_sampling,
                 "quality_gates": quality_gates,
+                "bounded_improvement_policy": "requested-minimum-capped-by-valid-metric-headroom-with-non-regression-at-boundary",
                 "initialization": {
                     "producer": "antfly inference finetune adapter bootstrap gemma4",
                     "manifest_schema": "antfly_gemma4_finetune/v3",
@@ -937,7 +1064,7 @@ def qualify(args: argparse.Namespace) -> Mapping[str, Any]:
                     "distinct_adapter_checkpoints": len(initialized_adapter_digests),
                 },
                 "environment_policy_sha256": resume_qualifier.ENVIRONMENT_POLICY_SHA256,
-                "strict_metal_environment": resume_qualifier.STRICT_METAL_ENV,
+                "strict_metal_environment": effective_contract_env,
                 "sanitized_environment_prefixes": list(
                     resume_qualifier.SANITIZED_ENV_PREFIXES
                 ),
@@ -987,6 +1114,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--timeout-seconds", type=float, default=3600.0)
     parser.add_argument("--allow-direct-gguf-training", action="store_true")
+    parser.add_argument(
+        "--compiled-sampling",
+        action="store_true",
+        help=(
+            "qualify the default-off compiled multi-token GRPO sampler; "
+            "incremental KV and direct GGUF are forced out of the recipe contract"
+        ),
+    )
     parser.add_argument("--min-dpo-eval-accuracy", type=float, default=0.4)
     parser.add_argument("--max-dpo-eval-loss", type=float, default=1.0)
     parser.add_argument("--min-dpo-eval-reward-margin", type=float, default=0.0)

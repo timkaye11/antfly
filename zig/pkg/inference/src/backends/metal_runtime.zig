@@ -867,6 +867,14 @@ pub const RawLinearSlotKind = enum(u8) {
     quantized,
 };
 
+const RawDenseLinearDtype = enum(u32) {
+    f32 = 0,
+    bf16 = 1,
+    f32_mps = 2,
+    f16 = 3,
+    _,
+};
+
 pub const CompressedKeyFormat = enum {
     polar4,
     turbo3,
@@ -1503,6 +1511,13 @@ pub fn decoderRuntimeLinearSlotPrepared(self: anytype, slot: usize, in_dim: usiz
     return self.raw_linear_slots_prepared[slot] and
         self.raw_linear_slot_in_dims[slot] == in_dim and
         self.raw_linear_slot_out_dims[slot] == out_dim;
+}
+
+pub fn decoderRuntimeLinearSlotBorrowsDenseWeight(self: anytype, slot: usize) bool {
+    if (slot >= decoder_runtime_linear_slot_capacity) return false;
+    return self.raw_linear_slots_prepared[slot] and
+        self.raw_linear_slot_kinds[slot] == .dense and
+        self.raw_linear_slot_borrows_dense_weight[slot];
 }
 
 pub fn noteDecoderRuntimeFamilyPrepared(self: anytype, kv_tokens: usize) void {
@@ -9302,8 +9317,26 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
             request.dense_bf16_no_copy_safe
         else
             false;
-        var rc: c_int = if (use_no_copy)
-            termite_metal_decode_runtime_prepare_linear_bf16_no_copy(
+        const mmap_source_bytes: ?[]const u8 = if (@hasField(@TypeOf(request), "dense_bf16_mmap_source_bytes"))
+            request.dense_bf16_mmap_source_bytes
+        else
+            @as(?[]const u8, null);
+        var used_no_copy = false;
+        var rc: c_int = if (use_no_copy) blk: {
+            const no_copy_rc = if (mmap_source_bytes) |mapped| mapped_blk: {
+                const span = mappedDenseRawSpan(bytes, mapped, expected_bf16_bytes, @alignOf(u16)) orelse break :mapped_blk @as(c_int, -1);
+                break :mapped_blk termite_metal_decode_runtime_prepare_linear_bf16_no_copy_region(
+                    runtime,
+                    request.slot,
+                    span.base_ptr,
+                    span.base_len,
+                    span.weight_offset,
+                    span.weight_len,
+                    bias_base,
+                    request.in_dim,
+                    request.out_dim,
+                );
+            } else termite_metal_decode_runtime_prepare_linear_bf16_no_copy(
                 runtime,
                 request.slot,
                 bytes.ptr,
@@ -9311,9 +9344,10 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
                 bias_base,
                 request.in_dim,
                 request.out_dim,
-            )
-        else
-            -1;
+            );
+            used_no_copy = no_copy_rc == 0;
+            break :blk no_copy_rc;
+        } else -1;
         if (rc != 0) {
             rc = termite_metal_decode_runtime_prepare_linear_bf16(
                 runtime,
@@ -9330,6 +9364,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         self.raw_linear_slot_kinds[request.slot] = .dense;
         self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
         self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
+        self.raw_linear_slot_borrows_dense_weight[request.slot] = used_no_copy;
         return true;
     }
 
@@ -17707,6 +17742,10 @@ pub extern fn termite_metal_decode_runtime_prefer_linear_mps(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_linear_slot_dense_dtype(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+) u32;
 pub extern fn termite_metal_decode_runtime_prepare_linear_f16(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
@@ -17729,6 +17768,17 @@ pub extern fn termite_metal_decode_runtime_prepare_linear_bf16_no_copy(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
     weight: [*c]const u8,
+    weight_bytes: usize,
+    bias: [*c]const f32,
+    in_dim: usize,
+    out_dim: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_prepare_linear_bf16_no_copy_region(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    mapped_raw: [*c]const u8,
+    mapped_bytes: usize,
+    weight_offset: usize,
     weight_bytes: usize,
     bias: [*c]const f32,
     in_dim: usize,
@@ -21495,7 +21545,7 @@ fn mappedDenseRawSpan(bytes: []const u8, mapped: []const u8, expected_bytes: usi
     const source_offset = ptr_value - mapped_base;
     if (source_offset > mapped.len or expected_bytes > mapped.len - source_offset) return null;
 
-    const page_size = std.heap.page_size_min;
+    const page_size = std.heap.pageSize();
     const aligned_start = ptr_value - (ptr_value % page_size);
     if (aligned_start < mapped_base) return null;
     const weight_offset = ptr_value - aligned_start;
@@ -21505,7 +21555,8 @@ fn mappedDenseRawSpan(bytes: []const u8, mapped: []const u8, expected_bytes: usi
     const end_padding = if (raw_end % page_size == 0) 0 else page_size - (raw_end % page_size);
     const aligned_end = std.math.add(usize, raw_end, end_padding) catch return null;
     const mapped_end = std.math.add(usize, mapped_base, mapped.len) catch return null;
-    if (aligned_end > mapped_end or aligned_end <= aligned_start) return null;
+    const mapped_page_end = std.mem.alignForward(usize, mapped_end, page_size);
+    if (aligned_end > mapped_page_end or aligned_end <= aligned_start) return null;
 
     return .{
         .base_ptr = @as([*]const u8, @ptrFromInt(aligned_start)),
@@ -21520,7 +21571,7 @@ fn mappedQuantRawSpan(storage: *const QuantizedStorage, raw_bytes: []const u8, o
     if (raw_bytes.len == 0) return null;
     if (raw_bytes.ptr != storage.raw_bytes.ptr or raw_bytes.len != storage.raw_bytes.len) return null;
 
-    const page_size = std.heap.page_size_min;
+    const page_size = std.heap.pageSize();
     const ptr_value = @intFromPtr(raw_bytes.ptr);
     if (ptr_value % page_size == 0 and raw_bytes.len % page_size == 0) {
         return .{
@@ -22160,6 +22211,7 @@ pub fn clearRawLinearSlot(self: anytype, slot: usize) void {
     self.raw_linear_slot_kinds[slot] = .none;
     self.raw_linear_slot_in_dims[slot] = 0;
     self.raw_linear_slot_out_dims[slot] = 0;
+    self.raw_linear_slot_borrows_dense_weight[slot] = false;
     self.raw_linear_slot_runtime_prepared_kind[slot] = .none;
     setRuntimeQuantMappedDisabled(self, slot, false);
     setRuntimeQuantPrepareMode(self, slot, .none);
@@ -23662,6 +23714,22 @@ pub fn tryApplyDenseRuntimeLinearPair(
         }
         second_device.deinit();
         first_device.deinit();
+
+        // The packed BF16 pair kernel is deliberately restricted to the
+        // qualified multi-row Gemma training shapes.  Autoregressive decode
+        // reaches this API with one row, where both independent BF16 device
+        // linears are supported.  Preserve the pair contract without forcing
+        // the caller to abandon the active Metal frame.
+        var first = (try tryApplyDenseRuntimeLinear(self, slot_a, input, rows, in_dim, out_dim)) orelse return null;
+        errdefer first.deinit();
+        const second = (try tryApplyDenseRuntimeLinear(self, slot_b, input, rows, in_dim, out_dim)) orelse {
+            first.deinit();
+            return null;
+        };
+        return .{
+            .first = first,
+            .second = second,
+        };
     }
 
     if (frame_active) return null;
@@ -23765,7 +23833,13 @@ pub fn tryApplyDenseRuntimeLinearQkv(
         q_device.deinit();
     }
     if (rows != 1 and input.isDevice()) {
-        if (frame_active and !getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED")) {
+        // The packed QKV kernel currently supports F32/F16 weights only. BF16
+        // slots use the regular multi-row Metal kernel below so a planned
+        // prefill remains entirely on-device instead of declining the layer.
+        if (frame_active and
+            !getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED") and
+            denseRuntimeLinearQkvPackedSupported(runtime, q_slot, k_slot, v_slot))
+        {
             var q_handle: ?*anyopaque = null;
             var k_handle: ?*anyopaque = null;
             var v_handle: ?*anyopaque = null;
@@ -23867,6 +23941,23 @@ pub fn tryApplyDenseRuntimeLinearQkv(
         .first = MetalTensor.owned(q_out, &q_shape),
         .second = MetalTensor.owned(k_out, &kv_shape),
         .third = MetalTensor.owned(v_out, &kv_shape),
+    };
+}
+
+fn denseRuntimeLinearQkvPackedSupported(
+    runtime: *RawMetalDecodeRuntime,
+    q_slot: usize,
+    k_slot: usize,
+    v_slot: usize,
+) bool {
+    const q_dtype: RawDenseLinearDtype = @enumFromInt(termite_metal_decode_runtime_linear_slot_dense_dtype(runtime, q_slot));
+    const k_dtype: RawDenseLinearDtype = @enumFromInt(termite_metal_decode_runtime_linear_slot_dense_dtype(runtime, k_slot));
+    const v_dtype: RawDenseLinearDtype = @enumFromInt(termite_metal_decode_runtime_linear_slot_dense_dtype(runtime, v_slot));
+    if (q_dtype != k_dtype or q_dtype != v_dtype) return false;
+    return switch (q_dtype) {
+        .f32, .f32_mps, .f16 => true,
+        .bf16 => false,
+        else => false,
     };
 }
 
@@ -38534,7 +38625,7 @@ test "metal native decoder runtime batched multi-row argmax matches per-row" {
     try std.testing.expect(!hasActiveFrame(runtime));
 }
 
-test "metal native decoder runtime can prepare bf16 linear without copying model-owned bytes" {
+test "gemma4 metal native decoder runtime falls back to private copy for unaligned bf16 bytes" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
 
@@ -38569,6 +38660,7 @@ test "metal native decoder runtime can prepare bf16 linear without copying model
         .dense_bf16_bytes = bf16_weight_bytes,
         .dense_bf16_no_copy_safe = true,
     }, &prep_stats));
+    try std.testing.expect(!decoderRuntimeLinearSlotBorrowsDenseWeight(&provider, 0));
 
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
     const input_data = [_]f32{ 1.0, -2.0, 0.5, 3.0 };
@@ -38589,6 +38681,117 @@ test "metal native decoder runtime can prepare bf16 linear without copying model
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), actual[0], 1e-3);
     try std.testing.expectApproxEqAbs(@as(f32, -2.0), actual[1], 1e-3);
     try std.testing.expectApproxEqAbs(@as(f32, 1.25), actual[2], 1e-3);
+}
+
+test "gemma4 metal native decoder runtime borrows unaligned bf16 tensor from mmap region" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const page_size = std.heap.pageSize();
+    const hidden_size: usize = 4;
+    const out_dim: usize = 3;
+    const weight_offset: usize = 64;
+    const bf16_weight_words = [_]u16{
+        0x3f80, 0x0000, 0x0000, 0x0000,
+        0x0000, 0x3f80, 0x0000, 0x0000,
+        0x3f00, 0x3f00, 0x3f00, 0x3f00,
+    };
+    const bf16_weight_bytes = std.mem.sliceAsBytes(&bf16_weight_words);
+    const payload = try std.testing.allocator.alloc(u8, page_size * 2);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 0);
+    @memcpy(payload[weight_offset..][0..bf16_weight_bytes.len], bf16_weight_bytes);
+
+    var region = try c_file.mmapTempCopy(std.testing.allocator, "termite-bf16-linear-offset-test", payload);
+    defer region.deinit();
+    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(region.data.ptr) % page_size);
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+
+    const bias_data = [_]f32{ 0.0, 0.0, 0.0 };
+    var linear_bias = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(out_dim)});
+    defer linear_bias.deinit();
+    var dummy_weight_value = [_]f32{0.0};
+    const dummy_weight = MetalTensor.borrowed(dummy_weight_value[0..].ptr, 1, &[_]i32{0});
+    var prep_stats: ops.NativeQuantTimingStats = .{};
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .slot = 0,
+        .weight = dummy_weight,
+        .bias = linear_bias,
+        .quantized_storage = null,
+        .in_dim = hidden_size,
+        .out_dim = out_dim,
+        .retain_dense_fallback = false,
+        .dense_bf16_bytes = region.data[weight_offset..][0..bf16_weight_bytes.len],
+        .dense_bf16_no_copy_safe = true,
+        .dense_bf16_mmap_source_bytes = region.data,
+    }, &prep_stats));
+    try std.testing.expect(decoderRuntimeLinearSlotBorrowsDenseWeight(&provider, 0));
+
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const input_data = [_]f32{ 1.0, -2.0, 0.5, 3.0 };
+    var input = try testDeviceTensorFromSlice(runtime, &input_data, &[_]i32{ 1, @intCast(hidden_size) });
+    defer input.deinit();
+    var output = (try decoderRuntimeApplyLinear(&provider, .{
+        .slot = 0,
+        .input = input,
+        .in_dim = hidden_size,
+        .out_dim = out_dim,
+    })) orelse return error.UnexpectedNull;
+    defer output.deinit();
+
+    var output_mut = output;
+    const actual = try tensorHostSlice(&output_mut);
+    try std.testing.expectEqual(@as(usize, out_dim), actual.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), actual[0], 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, -2.0), actual[1], 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.25), actual[2], 1e-3);
+}
+
+test "gemma4 metal native decoder runtime records page-aligned bf16 no-copy ownership" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const page_size = std.heap.pageSize();
+    const in_dim: usize = 128;
+    const out_dim: usize = page_size / (in_dim * @sizeOf(u16));
+    const weight_bytes = try std.heap.page_allocator.alloc(u8, page_size);
+    defer std.heap.page_allocator.free(weight_bytes);
+    @memset(weight_bytes, 0);
+    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(weight_bytes.ptr) % page_size);
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+
+    const bias_data = try std.testing.allocator.alloc(f32, out_dim);
+    defer std.testing.allocator.free(bias_data);
+    @memset(bias_data, 0.0);
+    var linear_bias = try MetalTensor.ownedCloneFrom(bias_data, &[_]i32{@intCast(out_dim)});
+    defer linear_bias.deinit();
+
+    var dummy_weight_value = [_]f32{0.0};
+    const dummy_weight = MetalTensor.borrowed(dummy_weight_value[0..].ptr, 1, &[_]i32{0});
+    var prep_stats: ops.NativeQuantTimingStats = .{};
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .slot = 1,
+        .weight = dummy_weight,
+        .bias = linear_bias,
+        .quantized_storage = null,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .retain_dense_fallback = false,
+        .dense_bf16_bytes = weight_bytes,
+        .dense_bf16_no_copy_safe = true,
+    }, &prep_stats));
+    try std.testing.expect(decoderRuntimeLinearSlotBorrowsDenseWeight(&provider, 1));
+
+    clearRawLinearSlot(&provider, 1);
+    try std.testing.expect(!decoderRuntimeLinearSlotBorrowsDenseWeight(&provider, 1));
 }
 
 test "metal native decoder runtime f16 linear matches host reference" {
@@ -38924,7 +39127,7 @@ test "metal native decoder runtime f16 BERT fused paths match decomposed device 
     try Compare.close("ffn-layer-norm", try tensorHostSlice(&ffn_reference), try tensorHostSlice(&fused_ffn));
 }
 
-test "metal native decoder runtime bf16 multi-row linear matches identity projection" {
+test "metal native decoder runtime bf16 multi-row linear planned qkv and single-row pair match identity projection" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
 
@@ -38956,17 +39159,19 @@ test "metal native decoder runtime bf16 multi-row linear matches identity projec
     var dummy_weight_value = [_]f32{0.0};
     const dummy_weight = MetalTensor.borrowed(dummy_weight_value[0..].ptr, 1, &[_]i32{0});
     var prep_stats: ops.NativeQuantTimingStats = .{};
-    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
-        .slot = 0,
-        .weight = dummy_weight,
-        .bias = linear_bias,
-        .quantized_storage = null,
-        .in_dim = hidden_size,
-        .out_dim = out_dim,
-        .retain_dense_fallback = false,
-        .dense_bf16_bytes = bf16_weight_bytes,
-        .dense_bf16_no_copy_safe = true,
-    }, &prep_stats));
+    for (0..3) |slot| {
+        try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+            .slot = slot,
+            .weight = dummy_weight,
+            .bias = linear_bias,
+            .quantized_storage = null,
+            .in_dim = hidden_size,
+            .out_dim = out_dim,
+            .retain_dense_fallback = false,
+            .dense_bf16_bytes = bf16_weight_bytes,
+            .dense_bf16_no_copy_safe = true,
+        }, &prep_stats));
+    }
 
     const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
     const input_data = try allocator.alloc(f32, rows * hidden_size);
@@ -38993,6 +39198,79 @@ test "metal native decoder runtime bf16 multi-row linear matches identity projec
     for (0..rows) |row| {
         for (0..out_dim) |col| {
             try std.testing.expectApproxEqAbs(input_data[row * hidden_size + col], actual[row * out_dim + col], 1e-3);
+        }
+    }
+
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    try beginPlannedComputeScope(runtime, @intFromEnum(ComputeSource.layer), .layer);
+    var planned_qkv = (try tryApplyDenseRuntimeLinearQkv(
+        &provider,
+        0,
+        1,
+        2,
+        input,
+        rows,
+        hidden_size,
+        out_dim,
+        out_dim,
+    )) orelse return error.UnexpectedNull;
+    defer planned_qkv.first.deinit();
+    defer planned_qkv.second.deinit();
+    defer planned_qkv.third.deinit();
+    try endPlannedComputeScope(runtime);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+
+    const qkv_stats = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 0), qkv_stats.dense_qkv_packed_calls);
+    inline for (.{
+        &planned_qkv.first,
+        &planned_qkv.second,
+        &planned_qkv.third,
+    }) |projection| {
+        const projected = try tensorHostSlice(projection);
+        try std.testing.expectEqual(rows * out_dim, projected.len);
+        for (0..rows) |row| {
+            for (0..out_dim) |col| {
+                try std.testing.expectApproxEqAbs(
+                    input_data[row * hidden_size + col],
+                    projected[row * out_dim + col],
+                    1e-3,
+                );
+            }
+        }
+    }
+
+    var single_input = try testDeviceTensorFromSlice(
+        runtime,
+        input_data[0..hidden_size],
+        &[_]i32{ 1, @intCast(hidden_size) },
+    );
+    defer single_input.deinit();
+
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    try beginPlannedComputeScope(runtime, @intFromEnum(ComputeSource.layer), .layer);
+    var single_pair = (try decoderRuntimeApplyLinearPair(&provider, .{
+        .slot_a = 0,
+        .slot_b = 1,
+        .input = single_input,
+        .in_dim = hidden_size,
+        .out_dim = out_dim,
+    })) orelse return error.UnexpectedNull;
+    defer single_pair.first.deinit();
+    defer single_pair.second.deinit();
+    try endPlannedComputeScope(runtime);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+
+    inline for (.{ &single_pair.first, &single_pair.second }) |projection| {
+        try std.testing.expect(projection.isDevice());
+        const projected = try tensorHostSlice(projection);
+        try std.testing.expectEqual(out_dim, projected.len);
+        for (0..out_dim) |col| {
+            try std.testing.expectApproxEqAbs(input_data[col], projected[col], 1e-3);
         }
     }
 }

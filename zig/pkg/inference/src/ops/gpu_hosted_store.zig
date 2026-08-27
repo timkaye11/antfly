@@ -286,6 +286,7 @@ fn expectedDenseCacheBytes(
     data: *const WeightStore,
     entry: *const LazyWeightEntry,
     quantized_storage: ?*const QuantizedStorage,
+    store_kind: tensor_store_mod.StoreKind,
 ) !usize {
     if (quantized_storage) |storage| {
         var element_count: usize = 1;
@@ -317,7 +318,17 @@ fn expectedDenseCacheBytes(
         return std.math.mul(usize, entry.tensor_ref.byte_len, 2) catch
             error.MemoryBudgetExceeded;
     }
+    // Safetensors loads are borrowed slices of the store's stable mmap. The
+    // mapping is owned for the session lifetime and does not allocate another
+    // host copy per lazy tensor. Charging every slice here double-counts the
+    // same model artifact and can reject a large indivisible embedding table
+    // before the mmap-aware Metal row-staging path gets a chance to run.
+    if (store_kind == .safetensors) return 0;
     return entry.tensor_ref.byte_len;
+}
+
+fn ownedDenseCacheBytes(loaded: *const LoadedWeight) usize {
+    return if (loaded.tensor.owns_data) loaded.tensor.data.len else 0;
 }
 
 pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEntry) !void {
@@ -369,7 +380,7 @@ pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEn
         storage
     else
         null;
-    const expected_bytes = try expectedDenseCacheBytes(data, entry, quantized_storage);
+    const expected_bytes = try expectedDenseCacheBytes(data, entry, quantized_storage, tensor_store.kind());
     var cache_reserved_bytes: usize = 0;
     if (data.tier_cache) |*tier_cache| {
         tier_cache.reserve(.host, expected_bytes) catch |err| {
@@ -397,8 +408,8 @@ pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEn
     if (data.jina_lora_adapter) |adapter| {
         try adapter.mergeIntoLoadedWeight(entry.tensor_ref.name, &entry.host_loaded.?);
     }
-    entry.loaded_bytes = entry.host_loaded.?.tensor.data.len;
-    entry.active_tier = if (entry.loaded_bytes == 0) .disk else .host;
+    entry.loaded_bytes = ownedDenseCacheBytes(&entry.host_loaded.?);
+    entry.active_tier = .host;
     if (data.tier_cache) |*tier_cache| {
         if (entry.loaded_bytes > cache_reserved_bytes) {
             const additional = entry.loaded_bytes - cache_reserved_bytes;
@@ -412,6 +423,49 @@ pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEn
             cache_reserved_bytes = entry.loaded_bytes;
         }
     }
+}
+
+test "gemma4 gpu hosted cache does not charge borrowed safetensors mmap views" {
+    const shape = [_]i64{ 4, 8 };
+    var borrowed_bytes = [_]u8{0} ** 64;
+    var loaded = LoadedWeight{
+        .tensor = .{
+            .data = &borrowed_bytes,
+            .dtype = .bf16,
+            .shape = &shape,
+            .name = "weight",
+            .allocator = std.testing.allocator,
+            .owns_data = false,
+            .owns_shape = false,
+            .mmap_source_bytes = &borrowed_bytes,
+        },
+    };
+    defer loaded.deinit();
+
+    const store = WeightStore{
+        .allocator = std.testing.allocator,
+        .prefix = "",
+        .lazy_weights = .empty,
+    };
+    const entry = LazyWeightEntry{
+        .tensor_ref = .{
+            .name = "weight",
+            .byte_len = borrowed_bytes.len,
+        },
+    };
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try expectedDenseCacheBytes(&store, &entry, null, .safetensors),
+    );
+    try std.testing.expectEqual(@as(usize, 0), ownedDenseCacheBytes(&loaded));
+
+    const owned_values = [_]f32{ 1, 2, 3, 4 };
+    var owned = LoadedWeight{
+        .tensor = try Tensor.initFloat32(std.testing.allocator, "owned", &.{ 2, 2 }, &owned_values),
+    };
+    defer owned.deinit();
+    try std.testing.expectEqual(@as(usize, 4 * @sizeOf(f32)), ownedDenseCacheBytes(&owned));
 }
 
 test "jina adapter names map base weight to PEFT LoRA tensors" {

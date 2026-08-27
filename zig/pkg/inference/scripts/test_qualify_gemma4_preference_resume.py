@@ -33,6 +33,7 @@ boundary = checkpoint_cfg["every_epochs"]
 resume = "resume_path" in checkpoint_cfg
 fingerprint = "sha256:" + "a" * 64
 incremental_enabled = recipe.get("runtime", {}).get("grpo_incremental_kv", False)
+compiled_sampling_enabled = os.environ.get("ANTFLY_GEMMA4_GRPO_COMPILED_SAMPLING") == "1"
 
 def incremental_telemetry(epoch):
     return {
@@ -139,6 +140,9 @@ checkpoint_summary = {
     "restored_micro_batch_steps": boundary * (2 if task == "dpo" else 4) if resume else 0,
     "restored_optimizer_steps": boundary if resume else 0,
     "restored_accumulation_micro_batches": 0,
+    "compiled_sampling_execution_cache_retired": (
+        task == "grpo" and compiled_sampling_enabled
+    ),
 }
 evaluation_report_path = pathlib.Path(recipe["artifacts"]["evaluation_report_path"])
 numerical_policy_boolean_fields = (
@@ -211,7 +215,13 @@ else:
     report = {**common, "completions": epochs * 4, "tokens": epochs * 4, "groups": epochs,
               "loss": 0.5, "pg_loss": 0.5, "kl_loss": 0.0, "mean_kl": 0.0,
               "clip_fraction": 0.0, "mean_reward": 0.5, "reward_stddev": 0.5,
-              "policy_rescore_completions": 4, "sampling_mode": "ranked", "policy_logprob_mode": "reuse",
+              "policy_rescore_completions": (epochs * 4 if compiled_sampling_enabled else 4),
+              "sampling_mode": ("compiled-shared-prompt-ranked-sparse-row-each-step"
+                                if compiled_sampling_enabled else "ranked"),
+              "policy_logprob_mode": (
+                  "compiled-token-selection-with-eager-per-completion-token-validated-logprob-rescore"
+                  if compiled_sampling_enabled else "reuse"
+              ),
               "training_microbatch_mode": "per-completion", "training_microbatch_batch_size": 1,
               "training_physical_micro_batches_per_group": 4, "reference_mode": "frozen",
               "kl_control": {"mode": "adaptive", "final_kl_coef": 0.04,
@@ -294,6 +304,35 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_adapter_tree_evidence_accepts_seeded_v3_manifest(self) -> None:
+        manifest_path = self.adapter / "antfly_finetune_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["schema_version"] = "antfly_gemma4_finetune/v3"
+        manifest["initialization_seed"] = 17
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        evidence = qualifier._adapter_tree_evidence(self.adapter, "seed adapter")
+
+        self.assertEqual(
+            evidence["manifest_identity"]["schema_version"],
+            "antfly_gemma4_finetune/v3",
+        )
+        self.assertEqual(evidence["manifest_identity"]["initialization_seed"], 17)
+
+    def test_adapter_tree_evidence_enforces_schema_specific_seed_contract(self) -> None:
+        manifest_path = self.adapter / "antfly_finetune_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["initialization_seed"] = 17
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(qualifier.ContractError, "must not carry"):
+            qualifier._adapter_tree_evidence(self.adapter, "v2 adapter")
+
+        manifest["schema_version"] = "antfly_gemma4_finetune/v3"
+        manifest.pop("initialization_seed")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(qualifier.ContractError, "expected integer"):
+            qualifier._adapter_tree_evidence(self.adapter, "v3 adapter")
+
     def write_recipe(self, task: str) -> Path:
         recipe = {
             "recipe": task,
@@ -328,6 +367,7 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
             incremental_kv_serial=False,
             incremental_kv_clone_prompt_tail=False,
             incremental_kv_shadow_exact=False,
+            compiled_sampling=False,
         )
 
     def test_numerical_policy_fields_match_zig_report_schema(self) -> None:
@@ -360,6 +400,7 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
             "TERMITE_DISABLE_PAGED_KV": "1",
             "TERMITE_METAL_DISABLE_LINEAR_CCE": "1",
             "ANTFLY_GEMMA4_GRPO_INCREMENTAL_KV": "0",
+            "ANTFLY_GEMMA4_GRPO_COMPILED_SAMPLING": "1",
             "ANTFLY_GEMMA4_PREFERENCE_TRACE": "1",
             "ANTFLY_EXPERIMENTAL_GEMMA4_GGUF_QLORA": "1",
         }
@@ -481,6 +522,67 @@ class PreferenceResumeQualificationTest(unittest.TestCase):
         )
         generated = json.loads(Path(report["recipes"]["resumed"]).read_text())
         self.assertTrue(generated["runtime"]["grpo_incremental_kv"])
+
+    def test_grpo_compiled_sampling_resume_is_explicit_attested_and_non_incremental(self) -> None:
+        args = self.args("grpo")
+        args.compiled_sampling = True
+        recipe = json.loads(args.recipe.read_text(encoding="utf-8"))
+        recipe["runtime"] = {
+            "grpo_incremental_kv": True,
+            "grpo_incremental_kv_batch_active": True,
+            "grpo_incremental_kv_clone_prompt_tail": True,
+            "grpo_incremental_kv_shadow_exact": True,
+        }
+        args.recipe.write_text(json.dumps(recipe), encoding="utf-8")
+
+        report = qualifier.qualify(args)
+
+        self.assertTrue(report["contract"]["compiled_sampling"])
+        self.assertEqual(
+            report["contract"]["strict_metal_environment"][
+                qualifier.COMPILED_GRPO_SAMPLING_ENV
+            ],
+            "1",
+        )
+        self.assertEqual(
+            report["parity"]["semantic_report"]["sampling_mode"],
+            qualifier.COMPILED_GRPO_SAMPLING_MODE,
+        )
+        self.assertEqual(
+            report["parity"]["semantic_report"]["policy_logprob_mode"],
+            qualifier.COMPILED_GRPO_POLICY_LOGPROB_MODE,
+        )
+        self.assertEqual(
+            report["parity"]["semantic_report"]["completions"],
+            report["parity"]["semantic_report"]["policy_rescore_completions"],
+        )
+        self.assertEqual(
+            {
+                "uninterrupted": True,
+                "resumed": True,
+            },
+            report["parity"][
+                "compiled_sampling_execution_cache_retirement"
+            ],
+        )
+        generated = json.loads(Path(report["recipes"]["resumed"]).read_text())
+        self.assertFalse(generated["runtime"]["grpo_incremental_kv"])
+        self.assertNotIn("grpo_incremental_kv_batch_active", generated["runtime"])
+        self.assertNotIn("grpo_incremental_kv_clone_prompt_tail", generated["runtime"])
+        self.assertNotIn("grpo_incremental_kv_shadow_exact", generated["runtime"])
+
+    def test_compiled_sampling_compositions_fail_closed(self) -> None:
+        dpo = self.args("dpo")
+        dpo.compiled_sampling = True
+        with self.assertRaisesRegex(qualifier.ContractError, "valid only for GRPO"):
+            qualifier.qualify(dpo)
+
+        incremental = self.args("grpo")
+        incremental.compiled_sampling = True
+        incremental.incremental_kv = True
+        incremental.output_dir = self.root / "compiled-incremental-conflict"
+        with self.assertRaisesRegex(qualifier.ContractError, "conflicts with incremental-KV"):
+            qualifier.qualify(incremental)
 
     def test_direct_gguf_incremental_kv_composition_fails_closed(self) -> None:
         gguf = self.root / "model.gguf"
